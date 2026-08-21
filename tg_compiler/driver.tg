@@ -18,6 +18,12 @@ use std::env::{args}
 use std::bench::{BenchCase, bench_case_new}
 use std::process::{run_command}
 
+# ONE canonical TOML implementation: the pkg_manager TomlParser (parse_toml)
+# — the package system's parser — is the single authority for the driver's
+# project manifests (load_project), lockfiles (parse_lockfile) and workspace
+# manifests (load_workspace). The former hand-rolled line parsers are gone.
+use tg_compiler::pkg_manager::{parse_toml, TomlValue}
+
 use tg_compiler::token::{Token, Span}
 use tg_compiler::lexer::{tokenize}
 use tg_compiler::ast::{
@@ -38,7 +44,6 @@ use tg_compiler::trait_resolve::{monomorphize_program, mono_cache_new}
 use tg_compiler::mode::{Mode, ModeConfig, config_for_mode}
 use tg_compiler::version::{VERSION}
 
-extern def libc_system(cmd: String) -> Int
 extern def strdup(s: Ptr[u8]) -> String
 
 # Home directory helper
@@ -200,6 +205,24 @@ def parse_args(argv: Vec[String]) -> Result[CompilerOptions, String]
         return Result::Err("Missing argument for --target")
       end
       opts.target_triple = Option::Some(argv[i].clone())
+    elsif arg == "--panic-strategy" then
+      # STATE A (abort-only): panic=abort is the ONLY stable panic
+      # strategy. The unwind/catch machinery is experimental and carries
+      # no cleanup guarantees (no unwind cleanup edges exist), so a
+      # stable build never selects it — an explicit request for
+      # panic=unwind is REJECTED here, at the option boundary.
+      i = i + 1
+      if i >= argv.len() then
+        return Result::Err("Missing argument for --panic-strategy (expected abort; unwind is rejected — abort-only is the only stable panic strategy)")
+      end
+      let panic_strat = argv[i].clone()
+      if panic_strat == "abort" then
+        ()
+      elsif panic_strat == "unwind" then
+        return Result::Err("--panic-strategy unwind is rejected: panic=abort is the ONLY stable panic strategy (the unwind/catch machinery is experimental, carries no cleanup guarantees, and is never selectable in a stable build)")
+      else
+        return Result::Err("Unknown panic strategy: " + panic_strat + " (abort is the only stable strategy; unwind is rejected)")
+      end
     elsif arg == "--json" then
       opts.json_diagnostics = true
     elsif arg == "--no-color" then
@@ -328,6 +351,21 @@ def parse_startup_compile_args(skip_subcommand: Bool) -> Result[CompilerOptions,
         return Result::Err("Missing argument for --target")
       end
       opts.target_triple = Option::Some(raw_arg_copy(i))
+    elsif arg == "--panic-strategy" then
+      # STATE A (abort-only): the startup-compile entry enforces the same
+      # rejection as the full CLI — panic=unwind is never selectable.
+      i = i + 1
+      if i >= argc then
+        return Result::Err("Missing argument for --panic-strategy (expected abort; unwind is rejected — abort-only is the only stable panic strategy)")
+      end
+      let panic_strat2 = raw_arg_copy(i)
+      if panic_strat2 == "abort" then
+        ()
+      elsif panic_strat2 == "unwind" then
+        return Result::Err("--panic-strategy unwind is rejected: panic=abort is the ONLY stable panic strategy (the unwind/catch machinery is experimental, carries no cleanup guarantees, and is never selectable in a stable build)")
+      else
+        return Result::Err("Unknown panic strategy: " + panic_strat2 + " (abort is the only stable strategy; unwind is rejected)")
+      end
     elsif arg == "--json" then
       opts.json_diagnostics = true
     elsif arg == "-h" || arg == "--help" then
@@ -389,6 +427,8 @@ def print_help() -> Unit
   println("                     aarch64 REQUIRES the ARMv8.1 LSE atomics (LDADDAL/CASAL/SWPAL —")
   println("                     Apple Silicon, Neoverse, Cortex-A75+; see asm.tg's target feature")
   println("                     table; the ldaxr/stlxr LL/SC fallback is the future portable mode)")
+  println("  --panic-strategy <S>  abort (the ONLY stable strategy; unwind is rejected —")
+  println("                     the unwind/catch machinery is experimental and never selectable)")
   println("  --pgo-gen[=PATH]     Instrument binary for profile generation")
   println("  --pgo-use[=PATH]     Optimize using previously collected profile data")
   println("  --json               Emit diagnostics in JSON format")
@@ -735,16 +775,18 @@ end
 def STDOUT_FILENO() -> Int = 1
 
 def execute_binary(path: String) -> Int
-  # Execute the compiled binary using libc system() call.
-  # Returns the exit code from the executed program.
-  unsafe "FFI system call" do
-    let exit_code = libc_system(path.clone())
-    # system() returns -1 on error, otherwise the exit status
-    if exit_code < 0 then
-      1
-    else
-      exit_code
-    end
+  # Run the compiled binary through the ARGV-based process API — never a
+  # shell string. A path containing spaces/quotes is ONE argv element and
+  # no shell metacharacter is ever interpreted. Command::status forwards
+  # the child's exit code exactly (WEXITSTATUS) and maps a signal
+  # termination to the shell convention 128+sig — the same status a
+  # `tg run` from a shell would observe.
+  var command = std::process::Command::new(path)
+  match command.status()
+  when Result::Ok(code) then code
+  when Result::Err(e) then
+    eprintln("error: cannot execute '" + path + "': " + e)
+    127
   end
 end
 
@@ -1041,8 +1083,9 @@ def compile_and_run_tests(opts: CompilerOptions, file: String, source: String, t
   var ri = 0
   while ri < tests.len() do
     let t = tests[ri]
-    let cmd = exe_path.clone() + " " + t.name.clone()
-    let exit_code = bootstrap_call_system(cmd)
+    var test_args: Vec[String] = Vec::new()
+    test_args.push(t.name.clone())
+    let exit_code = bootstrap_call_argv(exe_path.clone(), test_args)
     let passed = exit_code == 0
     let message = if passed then "" else "test exited with code " + exit_code.to_string() end
     results.push(TestResult {
@@ -1064,7 +1107,7 @@ def compile_and_run_file_main(opts: CompilerOptions, file: String) -> Result[Vec
     return Result::Err("compilation failed: " + e)
   end
   let exe_path = get_output_path(&opts, file.clone(), "")
-  let exit_code = bootstrap_call_system(exe_path.clone())
+  let exit_code = bootstrap_call_argv(exe_path.clone(), Vec::new())
   var results = Vec::new()
   let passed = exit_code == 0
   let message = if passed then "" else "test exited with code " + exit_code.to_string() end
@@ -1142,14 +1185,18 @@ def cmd_fmt(argv: Vec[String]) -> Int
       check_only = true
     elsif arg == "--indent" then
       i = i + 1
-      if i < argv.len() then
-        config.indent_width = argv[i].parse_uint().unwrap_or(2)
+      if i >= argv.len() then
+        eprintln("error: missing value for --indent")
+        return 1
       end
+      config.indent_width = argv[i].parse_uint().unwrap_or(2)
     elsif arg == "--line-width" then
       i = i + 1
-      if i < argv.len() then
-        config.max_line_width = argv[i].parse_uint().unwrap_or(100)
+      if i >= argv.len() then
+        eprintln("error: missing value for --line-width")
+        return 1
       end
+      config.max_line_width = argv[i].parse_uint().unwrap_or(100)
     elsif arg == "-h" || arg == "--help" then
       println("Usage: tg fmt [OPTIONS] [FILES]...")
       println("Format Tangerine source files")
@@ -1159,7 +1206,10 @@ def cmd_fmt(argv: Vec[String]) -> Int
       println("  --indent <N>     Indentation width (default: 2)")
       println("  --line-width <N> Maximum line width (default: 100)")
       return 0
-    elsif !arg.starts_with("-") then
+    elsif arg.starts_with("-") then
+      eprintln("error: unknown option '" + arg + "' for `tg fmt` (try `tg fmt --help`)")
+      return 1
+    else
       files.push(arg.clone())
     end
     i = i + 1
@@ -1219,19 +1269,25 @@ def cmd_lint(argv: Vec[String]) -> Int
     let arg = argv[i]
     if arg == "--deny" then
       i = i + 1
-      if i < argv.len() then
-        config.denied.push(argv[i].clone())
+      if i >= argv.len() then
+        eprintln("error: missing value for --deny")
+        return 1
       end
+      config.denied.push(argv[i].clone())
     elsif arg == "--allow" then
       i = i + 1
-      if i < argv.len() then
-        config.allowed.push(argv[i].clone())
+      if i >= argv.len() then
+        eprintln("error: missing value for --allow")
+        return 1
       end
+      config.allowed.push(argv[i].clone())
     elsif arg == "--warn" then
       i = i + 1
-      if i < argv.len() then
-        config.warned.push(argv[i].clone())
+      if i >= argv.len() then
+        eprintln("error: missing value for --warn")
+        return 1
       end
+      config.warned.push(argv[i].clone())
     elsif arg == "--json" then
       config.json_output = true
     elsif arg == "-h" || arg == "--help" then
@@ -1244,7 +1300,10 @@ def cmd_lint(argv: Vec[String]) -> Int
       println("  --warn <LINT>    Warn on a lint")
       println("  --json           Output diagnostics as JSON")
       return 0
-    elsif !arg.starts_with("-") then
+    elsif arg.starts_with("-") then
+      eprintln("error: unknown option '" + arg + "' for `tg lint` (try `tg lint --help`)")
+      return 1
+    else
       files.push(arg.clone())
     end
     i = i + 1
@@ -1295,17 +1354,24 @@ def cmd_doc(argv: Vec[String]) -> Int
     let arg = argv[i]
     if arg == "--output" || arg == "-o" then
       i = i + 1
-      if i < argv.len() then
-        config.output_dir = argv[i].clone()
+      if i >= argv.len() then
+        eprintln("error: missing value for " + arg)
+        return 1
       end
+      config.output_dir = argv[i].clone()
     elsif arg == "--format" then
       i = i + 1
-      if i < argv.len() then
-        if argv[i] == "html" then
-          config.format = DocFormat::Html
-        elsif argv[i] == "markdown" || argv[i] == "md" then
-          config.format = DocFormat::Markdown
-        end
+      if i >= argv.len() then
+        eprintln("error: missing value for --format")
+        return 1
+      end
+      if argv[i] == "html" then
+        config.format = DocFormat::Html
+      elsif argv[i] == "markdown" || argv[i] == "md" then
+        config.format = DocFormat::Markdown
+      else
+        eprintln("error: unknown format '" + argv[i] + "' (expected html or markdown)")
+        return 1
       end
     elsif arg == "--private" then
       config.include_private = true
@@ -1318,7 +1384,10 @@ def cmd_doc(argv: Vec[String]) -> Int
       println("  --format <FMT>      Output format: html, markdown (default: html)")
       println("  --private           Include private items")
       return 0
-    elsif !arg.starts_with("-") then
+    elsif arg.starts_with("-") then
+      eprintln("error: unknown option '" + arg + "' for `tg doc` (try `tg doc --help`)")
+      return 1
+    else
       files.push(arg.clone())
     end
     i = i + 1
@@ -1439,9 +1508,11 @@ def cmd_bench(argv: Vec[String]) -> Int
       match compile_file(&opts, file.clone())
       when Result::Ok(_) then
         let exe_path = get_output_path(&opts, file.clone(), "")
-        let cmd = exe_path + " --run-bench " + bench.name.clone()
+        var bench_args: Vec[String] = Vec::new()
+        bench_args.push("--run-bench".to_string())
+        bench_args.push(bench.name.clone())
         let t0 = std::time::Instant::now()
-        let exit_code = bootstrap_call_system(cmd)
+        let exit_code = bootstrap_call_argv(exe_path, bench_args)
         let elapsed = t0.elapsed()
         if exit_code == 0 then
           ok_count = ok_count + 1
@@ -1474,21 +1545,28 @@ def cmd_bench(argv: Vec[String]) -> Int
   end
 
   if config.json_output then
-    println("{")
-    println("  \"benchmarks\": [")
+    # STRICT RFC 8259 JSON: no comments, no unescaped strings, no NaN/Inf
+    # numbers, and every array element separated by a comma. The whole
+    # document is built as ONE string (a `python3 -m json.tool` parse is
+    # the contract test's oracle). Numeric timing values are never emitted
+    # (a wall-clock Float can be NaN/Inf on an interrupted measurement).
+    var json_out = "{\n  \"benchmarks\": ["
     var ri = 0
     while ri < results.len() do
       let r = results[ri]
+      if ri > 0 then
+        json_out = json_out + ","
+      end
       let status = match r.1
       when BenchOutcome::Passed(_) then "\"ok\""
-      when BenchOutcome::Failed(msg) then "\"failed\"" + " /* " + msg + " */"
+      when BenchOutcome::Failed(msg) then "\"failed\", \"message\": \"" + json_escape(msg) + "\""
       when BenchOutcome::Skipped then "\"skipped\""
       end
-      println("    {\"name\": \"" + r.0 + "\", \"status\": " + status + "}")
+      json_out = json_out + "\n    {\"name\": \"" + json_escape(r.0) + "\", \"status\": " + status + "}"
       ri = ri + 1
     end
-    println("  ]")
-    println("}")
+    json_out = json_out + "\n  ]\n}"
+    println(json_out)
   else
     println("")
     println("bench result: " + ok_count.to_string() + "/" + total.to_string() + " ok")
@@ -1570,9 +1648,185 @@ end
 # Subcommand: repl
 # 
 
+# The bounded REPL (the reviewer's preferred shape): every input entry is
+# COMPILED AND RUN through the driver's existing machinery (parse ->
+# type-check -> resource check -> MIR -> codegen -> link -> execute) as its
+# own process — the language's real evaluation path. State is the session's
+# input buffer: a multi-line entry accumulates until its block structure is
+# complete (the parser's trailing `expected 'end'` diagnostic at EOF), then
+# evaluates as one unit. A runtime failure in one entry never corrupts the
+# subsequent state: each evaluation is a fresh process and the buffer is
+# cleared after every completed entry. Expression entries are wrapped as the
+# body of `def main() -> Int` and their result is the exit code, printed as
+# `=> <code>`; statement/program entries run and print their own output.
+
+def repl_help_text() -> String
+  ":help          - Show this help\n:quit, :q      - Exit the REPL\n:clear         - Discard the current multi-line buffer"
+end
+
+# A buffer is COMPLETE when the parser accepts it, or when its failure is a
+# trailing `expected 'end'` at EOF (an unterminated block — keep reading
+# continuation lines). Any other parse failure is the entry being complete
+# (the diagnostics are reported when the entry evaluates).
+def repl_buffer_complete(buffer: String) -> Bool
+  let lex_result = tokenize(buffer.clone(), "<repl>")
+  let parse_out = parse(lex_result)
+  if !diag_has_errors(&parse_out.diagnostics) then
+    return true
+  end
+  let diags = parse_out.diagnostics
+  let last = diags[diags.len() - 1]
+  if last.message == "expected 'end'" then
+    match last.span
+    when Option::Some(sp) then
+      if sp.start + 2 >= buffer.len() then
+        return false
+      end
+    when Option::None then ()
+    end
+  end
+  true
+end
+
+# An entry that already starts with a top-level item is a complete program
+# (it must define `main` to run — a missing main is reported as the entry's
+# compile error). Anything else is wrapped as the body of `def main() -> Int`.
+def repl_is_full_program(s: String) -> Bool
+  s.starts_with("def ") || s.starts_with("pub ") || s.starts_with("struct ") ||
+  s.starts_with("enum ") || s.starts_with("trait ") || s.starts_with("impl ") ||
+  s.starts_with("module ") || s.starts_with("use ") || s.starts_with("extern") ||
+  s.starts_with("edition ") || s.starts_with("@") || s.starts_with("rationale") ||
+  s.starts_with("capability ") || s.starts_with("effect ") || s.starts_with("type ") ||
+  s.starts_with("const ") || s.starts_with("static ")
+end
+
+def repl_last_line(s: String) -> String
+  match s.rfind("\n")
+  when Option::Some(pos) then s.slice(pos + 1, s.len())
+  when Option::None then s
+  end
+end
+
+# A trailing line that begins with a statement form (a `let` binding, a
+# control-flow statement, a print call, ...) has no expression result —
+# evaluate it as a Unit main. A trailing expression is the entry's result
+# (wrapped as `def main() -> Int`, the exit code printed as `=> <code>`).
+def repl_statement_start(s: String) -> Bool
+  let t = s.trim()
+  t.starts_with("let ") || t.starts_with("var ") || t.starts_with("while ") ||
+  t.starts_with("for ") || t.starts_with("if ") || t.starts_with("match ") ||
+  t.starts_with("loop") || t.starts_with("return") || t.starts_with("next") ||
+  t.starts_with("break") || t.starts_with("unsafe") || t.starts_with("defer") ||
+  t.starts_with("guard ") || t.starts_with("try") || t.starts_with("with ") ||
+  t.starts_with("handle ") || t.starts_with("use ") || t.starts_with("println(") ||
+  t.starts_with("print(") || t.starts_with("eprintln(") || t.starts_with("eprint(")
+end
+
+def repl_wrap_entry(entry: String) -> String
+  if repl_is_full_program(entry) then
+    entry
+  elsif repl_statement_start(repl_last_line(entry)) then
+    "def main()\n" + entry + "\nend\n"
+  else
+    "def main() -> Int\n" + entry + "\nend\n"
+  end
+end
+
+# Compile + run ONE entry through the driver's machinery. Returns the text
+# to print (the `=> <code>` result for expression entries, the compile
+# diagnostics on failure, "" when the entry produced no result line).
+def repl_eval_source(entry: String, entry_no: Int) -> String
+  let trimmed = entry.trim()
+  if trimmed.is_empty() then
+    return ""
+  end
+  let wrapped = repl_wrap_entry(trimmed)
+  let repl_dir = "build/.tg_repl"
+  let path = repl_dir + "/entry_" + entry_no.to_string() + ".tg"
+  match write_file(path.clone(), wrapped)
+  when Result::Err(e) then
+    return "error: cannot write REPL entry: " + e
+  when Result::Ok(_) then ()
+  end
+  var opts = default_options()
+  match compile_file(&opts, path.clone())
+  when Result::Err(e) then
+    e
+  when Result::Ok(_) then
+    let exe_path = get_output_path(&opts, path, "")
+    let code = execute_binary(exe_path)
+    if repl_is_full_program(trimmed) then
+      ""
+    elsif repl_statement_start(repl_last_line(trimmed)) then
+      ""
+    else
+      "=> " + code.to_string()
+    end
+  end
+end
+
 def cmd_repl(argv: Vec[String]) -> Int
-  println("REPL is unavailable in bootstrap builds.")
-  1
+  let repl_dir = "build/.tg_repl"
+  match mkdir_p(repl_dir.clone())
+  when Result::Ok(_) then ()
+  when Result::Err(e) then
+    println("error: cannot create REPL work directory '" + repl_dir + "': " + e)
+    return 1
+  end
+  println("Tangerine REPL v" + VERSION)
+  println("Type :help for help, :quit to exit")
+  println("")
+  var buffer = ""
+  var entry_no = 0
+  var running = true
+  while running do
+    print(if buffer.is_empty() then "tg> " else "...> " end)
+    let line = read_line_impl()
+    if line.is_empty() then
+      # EOF: flush the pending multi-line entry (a piped session evaluates
+      # its final incomplete entry), then exit.
+      if !buffer.is_empty() then
+        let result = repl_eval_source(buffer.clone(), entry_no)
+        entry_no = entry_no + 1
+        buffer = ""
+        if !result.is_empty() then
+          println(result)
+        end
+      end
+      break
+    end
+    if buffer.is_empty() then
+      if line == ":quit" || line == ":q" then
+        running = false
+        next
+      elsif line == ":help" then
+        println(repl_help_text())
+        next
+      elsif line == ":clear" then
+        buffer = ""
+        println("REPL state cleared.")
+        next
+      elsif line.starts_with(":") then
+        println("Unknown command: " + line)
+        println("Type :help for available commands.")
+        next
+      end
+    end
+    # Multi-line accumulation: an entry is complete when its block
+    # structure balances; the buffer is cleared after every completed
+    # entry, so a failed evaluation never leaks into the next entry.
+    buffer = buffer + line + "\n"
+    if repl_buffer_complete(buffer.clone()) then
+      let result = repl_eval_source(buffer.clone(), entry_no)
+      entry_no = entry_no + 1
+      buffer = ""
+      if !result.is_empty() then
+        println(result)
+      end
+    end
+  end
+  println("Goodbye!")
+  0
 end
 
 # 
@@ -1953,15 +2207,22 @@ def current_time() -> Int
   now.tv.tv_sec as Int
 end
 
-def bootstrap_call_system(cmd: String) -> Int
-  # Use the safe std::process::Command API instead of raw FFI system().
-  # Split the command string at the first space to get program + args.
-  var command = std::process::Command::new("sh".to_string())
-  command.arg("-c".as_str_view())
-  command.arg(cmd.as_str_view())
+# Run a program with an ARGV vector through the safe std::process::Command
+# API — the replacement for the former `sh -c` string path (the shell
+# quoting/injection hazard). Program names, test names and bench names are
+# passed as separate argv elements: a name containing spaces, quotes or
+# shell metacharacters is a single argument, never a command. The status
+# forwards the exact exit code; a signal termination maps to 128+sig.
+def bootstrap_call_argv(program: String, args: Vec[String]) -> Int
+  var command = std::process::Command::new(program)
+  for a in args do
+    command = command.arg(a.as_str_view())
+  end
   match command.status()
-  when Result::Ok(status) then status.code
-  when Result::Err(_) then 127
+  when Result::Ok(code) then code
+  when Result::Err(e) then
+    eprintln("error: cannot run '" + program + "': " + e)
+    127
   end
 end
 
@@ -1991,143 +2252,217 @@ end
 # 
 
 def load_project(path: String) -> Result[Project, String]
-  # Parse a Tangerine.toml project manifest file.
+  # Parse a Tangerine.toml project manifest through the ONE canonical TOML
+  # implementation (pkg_manager::parse_toml — the same parser the package
+  # system uses; the driver's former line-by-line parser is removed).
   # Expected format:
-  #   [project]
+  #   [package]            (the legacy [project] spelling is also accepted)
   #   name = "my_app"
   #   version = "0.1.0"
-  #   
+  #
   #   [sources]
   #   files = ["src/main.tg", "src/lib.tg"]
-  #   
+  #
   #   [dependencies]
-  #   http = { version = "1.0", path = "../http" }
-  
+  #   http = "1.0"
+  #   http2 = { version = "1.0", path = "../http" }
+
   let manifest_path = if path.ends_with("Tangerine.toml") then
     path.clone()
   else
     path.clone() + "/Tangerine.toml"
   end
-  
+
   match read_file(manifest_path.clone())
+  when Result::Err(e) then
+    Result::Err("Cannot read project manifest '" + manifest_path + "': " + e)
   when Result::Ok(content) then
-    # Simple TOML-like parser for the project manifest
+    let toml = match parse_toml(content)
+    when Result::Err(e) then
+      return Result::Err("Cannot parse project manifest '" + manifest_path + "': " + e.to_string())
+    when Result::Ok(t) then t
+    end
+
     var name = "untitled"
     var version = "0.0.0"
     var sources = Vec::new()
     var deps = Vec::new()
     var output_dir = "build"
-    var section = ""
-    var in_sources_array = false
-    
-    for line in content.lines() do
-      let trimmed = line.trim()
-      
-      # Skip comments and empty lines
-      if trimmed.is_empty() || trimmed.starts_with("#") then
-        next
-      end
-      
-      # Section headers
-      if trimmed.starts_with("[") && trimmed.ends_with("]") then
-        section = trimmed.slice(1, trimmed.len() - 1)
-        in_sources_array = false
-        next
-      end
-      
-      # Check if we're inside a multi-line sources array
-      if in_sources_array then
-        if trimmed.starts_with("]") then
-          in_sources_array = false
-          next
-        end
-        var entry = trimmed.to_string()
-        if entry.ends_with(",") then
-          entry = entry.slice(0, entry.len() - 1)
-        end
-        entry = entry.trim()
-        var cleaned = ""
-        var i = 0
-        while i < entry.len() do
-          let ch = entry.char_at(i)
-          if ch != '"' then
-            cleaned = cleaned + ch.to_string()
+
+    # The [package]/[project] table.
+    match toml.get("package")
+    when Option::Some(v) then
+      match v.as_table()
+      when Option::Some(t) then
+        match t.get("name")
+        when Option::Some(n) then
+          match n.as_str()
+          when Option::Some(s) then name = s
+          when Option::None then ()
           end
-          i = i + 1
+        when Option::None then ()
         end
-        entry = cleaned.trim()
-        if !entry.is_empty() then
-          sources.push(entry.to_string())
+        match t.get("version")
+        when Option::Some(vv) then
+          match vv.as_str()
+          when Option::Some(s) then version = s
+          when Option::None then ()
+          end
+        when Option::None then ()
         end
-        next
+        match t.get("output_dir")
+        when Option::Some(od) then
+          match od.as_str()
+          when Option::Some(s) then output_dir = s
+          when Option::None then ()
+          end
+        when Option::None then ()
+        end
+      when Option::None then ()
       end
-      
-      # Key-value pairs
-      let parts = trimmed.split("=")
-      if parts.len() >= 2 then
-        let key = parts[0].trim()
-        let val = parts[1].trim()
-        
-        if section == "project" then
-          if key == "name" then name = val.trim_matches('"').to_string() end
-          if key == "version" then version = val.trim_matches('"').to_string() end
-          if key == "output_dir" then output_dir = val.trim_matches('"').to_string() end
+    when Option::None then ()
+    end
+
+    # The legacy [project] spelling (same keys).
+    match toml.get("project")
+    when Option::Some(v) then
+      match v.as_table()
+      when Option::Some(t) then
+        match t.get("name")
+        when Option::Some(n) then
+          match n.as_str()
+          when Option::Some(s) then name = s
+          when Option::None then ()
+          end
+        when Option::None then ()
         end
-        
-        if section == "sources" then
-          if key == "files" then
-            if val.starts_with("[") then
-              var rest = val.slice(1, val.len())
-              var closed = false
-              while rest.ends_with("]") && rest.len() > 0 do
-                rest = rest.slice(0, rest.len() - 1)
-                closed = true
-              end
-              for entry in rest.split(",") do
-                var src = entry.trim().to_string()
-                if src.ends_with(",") && src.len() > 0 then
-                  src = src.slice(0, src.len() - 1)
-                end
-                src = src.trim()
-                var cleaned = ""
-                var j = 0
-                while j < src.len() do
-                  let ch = src.char_at(j)
-                  if ch != '"' then
-                    cleaned = cleaned + ch.to_string()
-                  end
-                  j = j + 1
-                end
-                src = cleaned.trim()
-                if !src.is_empty() then
-                  sources.push(src.to_string())
-                end
-              end
-              if !closed then
-                in_sources_array = true
+        match t.get("version")
+        when Option::Some(vv) then
+          match vv.as_str()
+          when Option::Some(s) then version = s
+          when Option::None then ()
+          end
+        when Option::None then ()
+        end
+        match t.get("output_dir")
+        when Option::Some(od) then
+          match od.as_str()
+          when Option::Some(s) then output_dir = s
+          when Option::None then ()
+          end
+        when Option::None then ()
+        end
+      when Option::None then ()
+      end
+    when Option::None then ()
+    end
+
+    # The [sources] files array.
+    match toml.get("sources")
+    when Option::Some(v) then
+      match v.as_table()
+      when Option::Some(t) then
+        match t.get("files")
+        when Option::Some(fv) then
+          match fv.as_array()
+          when Option::Some(arr) then
+            for f in arr do
+              match f.as_str()
+              when Option::Some(s) then sources.push(s)
+              when Option::None then ()
               end
             end
+          when Option::None then ()
+          end
+        when Option::None then ()
+        end
+      when Option::None then ()
+      end
+    when Option::None then ()
+    end
+
+    # The [dependencies] table: `name = "version"` or the inline-table form
+    # `name = { version = "1.0", path = "../http", optional = true, ... }`.
+    match toml.get("dependencies")
+    when Option::Some(v) then
+      match v.as_table()
+      when Option::Some(t) then
+        for entry in t do
+          let dep_name = entry.key
+          match entry.value
+          when TomlValue::Str(s) then
+            deps.push(Dependency {
+              name: dep_name,
+              version: s.clone(),
+              requirement: Option::Some(s),
+              registry: Option::None,
+              features: Array::new(),
+              optional: false,
+              dev_only: false,
+              path: Option::None,
+              git: Option::None
+            })
+          when TomlValue::Table(itable) then
+            var req = "*".to_string()
+            var dep_path = Option::None
+            var dep_git = Option::None
+            var dep_registry = Option::None
+            var optional = false
+            match itable.get("version")
+            when Option::Some(ver_v) then
+              match ver_v.as_str()
+              when Option::Some(s) then req = s
+              when Option::None then ()
+              end
+            when Option::None then ()
+            end
+            match itable.get("path")
+            when Option::Some(p_v) then
+              match p_v.as_str()
+              when Option::Some(s) then dep_path = Option::Some(s)
+              when Option::None then ()
+              end
+            when Option::None then ()
+            end
+            match itable.get("git")
+            when Option::Some(g_v) then
+              match g_v.as_str()
+              when Option::Some(s) then dep_git = Option::Some(s)
+              when Option::None then ()
+              end
+            when Option::None then ()
+            end
+            match itable.get("registry")
+            when Option::Some(r_v) then
+              match r_v.as_str()
+              when Option::Some(s) then dep_registry = Option::Some(s)
+              when Option::None then ()
+              end
+            when Option::None then ()
+            end
+            match itable.get("optional")
+            when Option::Some(TomlValue::Bool(b)) then optional = b
+            when _ then ()
+            end
+            deps.push(Dependency {
+              name: dep_name,
+              version: req.clone(),
+              requirement: Option::Some(req),
+              registry: dep_registry,
+              features: Array::new(),
+              optional: optional,
+              dev_only: false,
+              path: dep_path,
+              git: dep_git
+            })
+          when _ then ()
           end
         end
-        
-        if section == "dependencies" then
-          # Simple dependency parsing (name = "version")
-          let version_str = val.trim_matches('"')
-          deps.push(Dependency {
-            name: key.to_string(),
-            version: version_str.to_string(),
-            requirement: Option::Some(version_str.to_string()),
-            registry: Option::None,
-            features: Array::new(),
-            optional: false,
-            dev_only: false,
-            path: Option::None,
-            git: Option::None
-          })
-        end
+      when Option::None then ()
       end
+    when Option::None then ()
     end
-    
+
     # Default: if no sources specified, look for src/main.tg
     if sources.is_empty() then
       sources.push("src/main.tg".to_string())
@@ -2140,8 +2475,6 @@ def load_project(path: String) -> Result[Project, String]
       sources: sources,
       output_dir: output_dir.to_string()
     })
-  when Result::Err(e) then
-    Result::Err("Cannot read project manifest '" + manifest_path + "': " + e)
   end
 end
 
@@ -2414,7 +2747,7 @@ def load_lockfile(path: str) -> Option[DriverLockfile]
 end
 
 def parse_lockfile(content: String) -> Option[DriverLockfile]
-  # Format:
+  # Format (the canonical TOML emitted by write_lockfile):
   #   # This file is auto-generated by tg. Do not edit.
   #   [[package]]
   #   name = "http"
@@ -2422,21 +2755,73 @@ def parse_lockfile(content: String) -> Option[DriverLockfile]
   #   source = "path:../http"
   #   checksum = "abc123"
   #   dependencies = ["core", "io"]
-  
+  #
+  # Parsed through the ONE canonical TOML implementation (pkg_manager::parse_toml).
+
+  let toml = match parse_toml(content)
+  when Result::Ok(t) then t
+  when Result::Err(_) then return Option::None
+  end
+
   var packages = Vec::new()
-  var current_name = "".to_string()
-  var current_version = "".to_string()
-  var current_source = "".to_string()
-  var current_checksum = "".to_string()
-  var current_deps = Vec::new()
-  var in_package = false
-  
-  for line in content.lines() do
-    let trimmed = line.trim()
-    
-    if trimmed == "[[package]]" then
-      # Flush previous package
-      if in_package && !current_name.is_empty() then
+
+  match toml.get("package")
+  when Option::Some(TomlValue::Array(pkg_vals)) then
+    for pkg_val in pkg_vals do
+      var current_name = "".to_string()
+      var current_version = "".to_string()
+      var current_source = "".to_string()
+      var current_checksum = "".to_string()
+      var current_deps = Vec::new()
+
+      match pkg_val.as_table()
+      when Option::Some(t) then
+        match t.get("name")
+        when Option::Some(v) then
+          match v.as_str()
+          when Option::Some(s) then current_name = s
+          when Option::None then ()
+          end
+        when Option::None then ()
+        end
+        match t.get("version")
+        when Option::Some(v) then
+          match v.as_str()
+          when Option::Some(s) then current_version = s
+          when Option::None then ()
+          end
+        when Option::None then ()
+        end
+        match t.get("source")
+        when Option::Some(v) then
+          match v.as_str()
+          when Option::Some(s) then current_source = s
+          when Option::None then ()
+          end
+        when Option::None then ()
+        end
+        match t.get("checksum")
+        when Option::Some(v) then
+          match v.as_str()
+          when Option::Some(s) then current_checksum = s
+          when Option::None then ()
+          end
+        when Option::None then ()
+        end
+        match t.get("dependencies")
+        when Option::Some(TomlValue::Array(dep_vals)) then
+          for d in dep_vals do
+            match d.as_str()
+            when Option::Some(s) then current_deps.push(s)
+            when Option::None then ()
+            end
+          end
+        when _ then ()
+        end
+      when Option::None then ()
+      end
+
+      if !current_name.is_empty() then
         packages.push(DriverLockEntry {
           name: current_name.clone(),
           version: current_version.clone(),
@@ -2445,52 +2830,10 @@ def parse_lockfile(content: String) -> Option[DriverLockfile]
           dependencies: current_deps.clone()
         })
       end
-      current_name = "".to_string()
-      current_version = "".to_string()
-      current_source = "".to_string()
-      current_checksum = "".to_string()
-      current_deps = Vec::new()
-      in_package = true
-      next
     end
-    
-    if !in_package || trimmed.is_empty() || trimmed.starts_with("#") then
-      next
-    end
-    
-    match trimmed.split_once("=")
-    when Option::Some(kv) then
-      let key = kv.0.trim()
-      let val = kv.1.trim().trim_matches('"')
-      
-      if key == "name" then current_name = val.to_string() end
-      if key == "version" then current_version = val.to_string() end
-      if key == "source" then current_source = val.to_string() end
-      if key == "checksum" then current_checksum = val.to_string() end
-      if key == "dependencies" then
-        let arr = val.trim_matches('[').trim_matches(']')
-        for dep_name in arr.split(",") do
-          let d = dep_name.trim().trim_matches('"')
-          if !d.is_empty() then
-            current_deps.push(d.to_string())
-          end
-        end
-      end
-    when Option::None then ()
-    end
+  when _ then ()
   end
-  
-  # Flush last package
-  if in_package && !current_name.is_empty() then
-    packages.push(DriverLockEntry {
-      name: current_name.clone(),
-      version: current_version.clone(),
-      source: current_source.clone(),
-      checksum: current_checksum.clone(),
-      dependencies: current_deps.clone()
-    })
-  end
-  
+
   Option::Some(DriverLockfile {
     packages: packages,
     metadata: Map::new(),
@@ -2557,78 +2900,80 @@ struct Workspace
 end
 
 def load_workspace(path: String) -> Result[Workspace, String]
-  # Parse a workspace Tangerine.toml with [workspace] section.
+  # Parse a workspace Tangerine.toml with [workspace] through the ONE
+  # canonical TOML implementation (pkg_manager::parse_toml).
   let manifest_path = if path.ends_with("Tangerine.toml") then
     path.clone()
   else
     path.clone() + "/Tangerine.toml"
   end
-  
+
   match read_file(manifest_path.clone())
+  when Result::Err(e) then
+    Result::Err("Cannot read workspace manifest: " + e)
   when Result::Ok(content) then
+    let toml = match parse_toml(content)
+    when Result::Err(e) then
+      return Result::Err("Cannot parse workspace manifest '" + manifest_path + "': " + e.to_string())
+    when Result::Ok(t) then t
+    end
+
     var members = Vec::new()
     var default_members = Vec::new()
-    var section = ""
     var is_workspace = false
-    
-    for line in content.lines() do
-      let trimmed = line.trim()
-      if trimmed.is_empty() || trimmed.starts_with("#") then
-        next
-      end
-      
-      if trimmed.starts_with("[") && trimmed.ends_with("]") then
-        section = trimmed.slice(1, trimmed.len() - 1)
-        if section == "workspace" then is_workspace = true end
-        next
-      end
-      
-      if section == "workspace" then
-        match trimmed.split_once("=")
-        when Option::Some(kv) then
-          let key = kv.0.trim()
-          let val = kv.1.trim()
-          
-          if key == "members" then
-            let arr = val.trim_matches('[').trim_matches(']')
-            for entry in arr.split(",") do
-              let m = entry.trim().trim_matches('"')
-              if !m.is_empty() then
-                members.push(m.to_string())
+
+    match toml.get("workspace")
+    when Option::Some(v) then
+      match v.as_table()
+      when Option::Some(t) then
+        is_workspace = true
+        match t.get("members")
+        when Option::Some(mv) then
+          match mv.as_array()
+          when Option::Some(arr) then
+            for m in arr do
+              match m.as_str()
+              when Option::Some(s) then members.push(s)
+              when Option::None then ()
               end
             end
-          end
-          
-          if key == "default-members" then
-            let arr = val.trim_matches('[').trim_matches(']')
-            for entry in arr.split(",") do
-              let m = entry.trim().trim_matches('"')
-              if !m.is_empty() then
-                default_members.push(m.to_string())
-              end
-            end
+          when Option::None then ()
           end
         when Option::None then ()
         end
+        match t.get("default-members")
+        when Option::Some(mv) then
+          match mv.as_array()
+          when Option::Some(arr) then
+            for m in arr do
+              match m.as_str()
+              when Option::Some(s) then default_members.push(s)
+              when Option::None then ()
+              end
+            end
+          when Option::None then ()
+          end
+        when Option::None then ()
+        end
+      when Option::None then ()
       end
+    when Option::None then ()
     end
-    
+
     if !is_workspace then
       return Result::Err("No [workspace] section in " + manifest_path)
     end
-    
+
     if default_members.is_empty() then
       default_members = members.clone()
     end
-    
+
     Result::Ok(Workspace {
       root: path.clone(),
       members: members,
       default_members: default_members,
       shared_output: path + "/build"
     })
-  when Result::Err(e) then
-    Result::Err("Cannot read workspace manifest: " + e)
   end
 end
 
@@ -3375,7 +3720,7 @@ def agent_diff(argv: Vec[String]) -> Int
   if diag_has_errors(&old_diags) then
     return 1
   end
-  let new_parse = parse(tokenize(new_source))
+  let new_parse = parse(tokenize(new_source, ""))
   let new_ast = new_parse.program
   let new_diags = new_parse.diagnostics
   if diag_has_errors(&new_diags) then
@@ -4568,7 +4913,7 @@ end
 def lsp_check_document(inout server: LspServer, uri: String) -> Unit
   match server.documents.get(uri.clone())
   when Option::Some(content) then
-    let tokens = tokenize(content)
+    let tokens = tokenize(content, uri.clone())
     let parse_out = parse(tokens)
     var ast = parse_out.program
     let parse_diags = parse_out.diagnostics

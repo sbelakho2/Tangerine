@@ -1,40 +1,69 @@
 ## Tangerine Standard Library — std::collections
 ## Array, Map, Set, Iterator traits
 
+use std::core::{Option, Result, panic}
+use std::alloc::{ArcStrong, ArcInnerWeak, alloc, alloc_array, dealloc_array, ptr_copy}
+
 # ———————————————————————————————————————————————————————————————
-# Slice[T] — ownership contract (DECIDED, reviewer's no-general-borrow model)
+# THE SAFE VIEW MODEL (DECIDED — the reviewer's shared/pinned backing;
+# the raw {ptr,len} views become unsafe/FFI-only)
 # ———————————————————————————————————————————————————————————————
-# Slice[T] is a COMPILER-SCOPED VIEW:
-#     Slice[T] = { ptr: Ptr[T], len: UInt }
-# a plain two-field aggregate laid out as a 16-byte inline value
-# ({ptr @ 0, len @ 8} — the layout authority's slice_view_layout in
-# tg_compiler/layout_engine.tg, the same shape as StrView/FfiSlice).
+# THE SAFE SLICE = THE SHARED/PINNED FORM:
+#     SliceBacking[T] = { ptr: Ptr[T], len: UInt, offset: UInt }
+#                       — the PINNED BACKING: the pinned buffer (ptr) plus
+#                         the view window's offset/len. The backing owns a
+#                         pinned allocation that holds the window's
+#                         elements, so the backing ITSELF keeps the
+#                         underlying storage alive.
+#     Slice[T] (the safe form, declared as SharedSlice below) =
+#         { inner: Arc[SliceBacking[T]] }  — the Arc-CLASS {ptr,len}:
+#         one pointer-sized Arc handle to the pinned backing record.
 #
-#   owns    = false   — the view holds NO memory; it borrows the backing
-#                       buffer of a Vec/Array/String/fixed array.
-#   drop    = none    — a Slice local needs no destruction and is never in
-#                       the resource checker's owning-container class.
-#   bit copy= yes     — copying the {ptr,len} words is structurally valid;
-#                       the type-copyability engine treats Slice as
-#                       bit-copyable regardless of T.
-#   escape  = enforced by the safe access model: safe Slice values are
-#             access-scoped and non-escaping — the checker rejects a Slice
-#             returned from a function, stored into longer-lived state
-#             (fields/containers/statics), or captured into an escaping
-#             closure, and rejects mutating/reallocating the backing buffer
-# while a view of it is live (the registry + the
-#             IterationPlan mutation scan).
+#   owns    = true    — the view shares the backing through the Arc: the
+#                       backing (and its pinned buffer) stays alive exactly
+#                       as long as ANY view of it lives. The view SURVIVES
+#                       the original owner's drop, and the owner's
+#                       capacity-changing mutations NEVER move it — the
+#                       backing is the separate pinned allocation (the
+#                       mutation allocates a fresh pinned backing for the
+#                       new buffer; the views keep the old one alive).
+#   drop    = the Arc's drop — the backing's deinit releases the pinned
+#             allocation when the last Arc dies. The view is an ordinary
+#             OWNING value in the resource checker: no escape tracking,
+#             no access-scoping — it can be returned, stored in fields/
+#             containers, captured, and outlive its source.
+#   bit copy= no      — the Arc handle is NOT bit-copyable; the shared
+#                       view is moved/cloned (Arc::clone).
+#   layout  = the safe Slice is 8 bytes: { inner: Arc @ 0 } — the
+#             Arc-class handle. The backing record is 24 bytes:
+#             { ptr @ 0, len @ 8, offset @ 16 }.
 #
-# A Slice is NEVER a pointer to a heap {ptr,len,cap} Vec header: it carries
-# no capacity, and no compiler path reads a Slice through HeapVecHeader
-# offsets. The slice operations (len/get/iter/first/last/is_empty) address
-# elements at ptr + i * size_of(T) with the concrete element size from the
-# layout.
+# THE RAW VIEW = UnsafeSlice[T] (the compiler's Slice builtin, exposed
+# under its explicit unsafe/FFI spelling):
+#     UnsafeSlice[T] = { ptr: Ptr[T], len: UInt } — the 16-byte borrowed
+#     {ptr,len} fat value. owns=false, drop=none, bit-copyable. It is the
+#     FFI/unsafe-only form: SAFE CODE CANNOT PRODUCE IT (no safe API
+#     returns it in an escaping position; the opaque builtin cannot be
+#     constructed). Its ESCAPES are the P0-SL-rejected cases — the
+#     checker rejects a raw view returned from a function, stored into
+#     longer-lived state (fields/containers/statics/consts), or captured
+#     into an escaping closure, and rejects mutating/reallocating the
+#     backing buffer while a raw view of it is live (the registry + the
+#     IterationPlan mutation scan). The only raw views safe code ever
+#     sees are the compiler-scoped LOOP-CONSUMED iterable forms
+#     (chars/bytes/split/iter/keys/values — consumed by the enclosing
+#     for-loop, never storable) and the compiler-manufactured literal
+#     coercion behind vec!.
+#
+# The safe APIs return the SHARED form (Vec::as_slice, String::as_str_view);
+# the FFI surfaces use the raw form (FfiSlice in std::ffi — mmap/embedded
+# as_slice). The conversions are explicit: the pin operations
+# (slice_pin / str_view_pin) copy the window into the pinned backing.
 # ———————————————————————————————————————————————————————————————
-# SliceMut[T] — the MUTABLE view { ptr: PtrMut[T], len: UInt } — the
-# systems-Read buffer contract (std::io)
+# SliceMut[T] — the MUTABLE io-scoped view { ptr: PtrMut[T], len: UInt } —
+# the systems-Read buffer contract (std::io)
 # ———————————————————————————————————————————————————————————————
-# SliceMut is the mutable twin of Slice[T]: a non-owning 16-byte
+# SliceMut is the raw mutable buffer form: a non-owning 16-byte
 # {ptr @ 0, len @ 8} fat value whose `len` UNAMBIGUOUSLY denotes the
 # WRITABLE EXTENT — the number of elements the receiver may fill. The
 # Read trait is
@@ -45,8 +74,10 @@
 # TCP read can never request zero bytes after a clear, because the
 # view onto the buffer's capacity is the writable extent.
 #
-#   owns    = false   — the view holds NO memory (like Slice/StrView);
-#                       it must not outlive its backing buffer.
+#   owns    = false   — the io view holds NO memory; it is the raw
+#                       mutable buffer projection of the io layer
+#                       (borrowed for the duration of the call — the io
+#                       views never outlive their backing Vec).
 #   drop    = none    — the {ptr,len} words are bit-copyable; no
 #                       destructor, no clone.
 #   len     = the writable extent in ELEMENTS (UInt). There is no
@@ -102,6 +133,97 @@ impl[T] SliceMut[T]
   unsafe def write(self: Self, index: Int, value: T) -> Unit
     let elem = size_of[T]() as Int
     write_ptr((self.ptr as Int + index * elem) as PtrMut[T], value)
+  end
+end
+# ———————————————————————————————————————————————————————————————
+# The SHARED/PINNED slice — SliceBacking[T] + SharedSlice[T]
+# (the safe Slice; the contract header above)
+# ———————————————————————————————————————————————————————————————
+
+# The PINNED BACKING — the pinned buffer plus the window's offset/len.
+# The backing owns a pinned allocation holding the window's elements, so
+# the backing keeps the underlying storage alive for as long as ANY Arc
+# to it lives — the view survives the original owner's drop, and the
+# owner's capacity-changing mutations never move it (the backing is the
+# separate pinned allocation).
+struct SliceBacking[T]
+  ptr: Ptr[T]
+  len: UInt
+  offset: UInt
+end
+
+# The SHARED/PINNED VIEW — the Arc-class {ptr,len}: one Arc handle to the
+# pinned backing record (the 8-byte layout: { inner: Arc @ 0 }).
+struct SharedSlice[T]
+  inner: ArcStrong[SliceBacking[T]]
+end
+
+# Pin the window [offset, offset + count) of the buffer at `ptr` into a
+# FRESH pinned allocation. The pin copies the window — the pinned record
+# is self-contained, so the view can never dangle (no lifetime inference:
+# the Arc is the backing's keep-alive, nothing else). The offset records
+# the window's start within the pinned buffer at pin time.
+def slice_pin[T](ptr: Ptr[T], count: UInt, offset: UInt) -> SharedSlice[T]
+  var buf: Ptr[T] = Ptr::null()
+  if count > 0 then
+    let bytes = (count as Int * size_of[T]() as Int) as UInt
+    buf = alloc_array[u8](bytes).cast[T]()
+    ptr_copy(ptr.cast[u8](), buf.cast[u8](), bytes)
+  end
+  let inner = alloc[ArcInnerWeak[SliceBacking[T]]]()
+  if inner.is_null() then
+    panic("slice_pin: out of memory")
+  end
+  inner.write(ArcInnerWeak {
+    refcount: 1,
+    weak_count: 0,
+    data: SliceBacking { ptr: buf, len: count, offset: offset }
+  })
+  SharedSlice { inner: ArcStrong { ptr: inner } }
+end
+
+impl[T] SliceBacking[T]
+  # The backing owns the pinned allocation: when the LAST view's Arc
+  # drops, the deinit releases the pinned buffer (the compiler's single
+  # destruction protocol — the Arc's drop_in_place runs this hook first).
+  def deinit(sink self: Self) -> Unit
+    if !self.ptr.is_null() then
+      let bytes = (self.len as Int * size_of[T]() as Int) as UInt
+      dealloc_array[u8](self.ptr.cast[u8](), bytes)
+    end
+  end
+end
+
+impl[T] SharedSlice[T]
+  def len(self: Self) -> UInt
+    self.inner.ptr.as_mut().data.len
+  end
+
+  def is_empty(self: Self) -> Bool
+    self.len() == 0
+  end
+
+  # The sub-view [start, start + len): a fresh pinned backing holds the
+  # sub-window (the pin copies; the sub-view is self-contained and shares
+  # nothing with the parent except the element values).
+  def sub(self: Self, start: Int, len: UInt) -> SharedSlice[T]
+    let b = self.inner.ptr.as_mut().data
+    let elem = size_of[T]() as Int
+    slice_pin((b.ptr as Int + (b.offset as Int + start) * elem) as Ptr[T], len, start as UInt)
+  end
+end
+
+impl[T: Copy] SharedSlice[T]
+  # The pinned element read — safe: the backing owns the pinned buffer,
+  # so the view can never dangle. Out-of-range reads TRAP (the std OOB
+  # policy, like Array::get).
+  def get(self: Self, index: Int) -> T
+    let b = self.inner.ptr.as_mut().data
+    let elem = size_of[T]() as Int
+    if index < 0 || index >= b.len as Int then
+      panic("SharedSlice::get: index out of bounds")
+    end
+    *((b.ptr as Int + (b.offset as Int + index) * elem) as Ptr[T])
   end
 end
 # ———————————————————————————————————————————————————————————————
@@ -627,6 +749,15 @@ impl[T: Copy] Array[T]
 
   def extend(inout self: Self, other: Array[T]) -> Unit inout
     __intrinsic_array_extend(self, other)
+  end
+
+  # The SAFE VIEW: pins the window [0, len) into a fresh pinned backing and
+  # returns the SHARED/PINNED Slice (the Arc-class view). The view survives
+  # this array's drop and its capacity-changing mutations — the backing is
+  # the separate pinned allocation. The pin copies the window; the view is
+  # immutable and never dangles (no lifetime inference).
+  def as_slice(self: Self) -> SharedSlice[T]
+    slice_pin(self.as_ptr(), self.len() as UInt, 0)
   end
 
   # EXPLICITLY UNSAFE: constructs the raw-storage projection iterator

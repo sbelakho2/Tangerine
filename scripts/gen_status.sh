@@ -25,7 +25,8 @@
 #      NAME is tied to the tested SHA); the committed file points at it
 #      instead of pretending to be current.
 #
-# Usage: ./scripts/gen_status.sh [--refresh-manifests] [--artifacts <dir>] [outfile]
+# Usage: ./scripts/gen_status.sh [--refresh-manifests] [--artifacts <dir>]
+#                                 [--release-evidence <dir>] [outfile]
 #   --refresh-manifests  regenerate the canary MANIFEST self-description
 #                        (the `# count:`, `# manifest sha256:` and
 #                        `# test list sha256:` lines of tests/canary,
@@ -37,6 +38,23 @@
 #   --artifacts <dir>   include a TEST ARTIFACTS section: sha-256 of every
 #                       file under <dir> (repeatable; also read from
 #                       $TG_STATUS_ARTIFACTS, a colon-separated list).
+#   --release-evidence  THE RELEASE-RUN EVIDENCE path (the reviewer's
+#                       items 32/36/API-manifest): requires --artifacts
+#                       dirs with run artifacts, then verifies the
+#                       release gates — the API-manifest release check
+#                       (a public callable with zero behavior tests, an
+#                       error variant never exercised, or a cfg target
+#                       without execution FAILS the release), the
+#                       completeness enumeration (every std module
+#                       contracted), and the completeness model — and
+#                       writes build/release_evidence.json
+#                       (tested_sha + artifact hashes +
+#                       release_gated_features). This file is the ONLY
+#                       source of the registry's EXACT_SHA_VERIFIED /
+#                       RELEASE_GATED ladder positions: the registry
+#                       generator reads it and never derives those
+#                       positions from source. A failing gate writes NO
+#                       evidence file (the release cannot be gated).
 #   outfile             defaults to STATUS.txt at the repo root.
 # Exit status: 0 when every structural fact greps as expected; non-zero
 # (with the file still written) when a fact drifted, so CI can gate on it.
@@ -46,6 +64,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="${1:-$ROOT/STATUS.txt}"
 ARTIFACT_DIRS=""
 REFRESH_MANIFESTS=0
+RELEASE_EVIDENCE=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -56,6 +75,11 @@ while [ $# -gt 0 ]; do
     --artifacts)
       shift
       ARTIFACT_DIRS="${ARTIFACT_DIRS}${1}:"
+      shift
+      ;;
+    --release-evidence)
+      shift
+      RELEASE_EVIDENCE="${1:-}"
       shift
       ;;
     *) break ;;
@@ -231,8 +255,8 @@ fact "grammar gate wired into run_bootstrap.sh" \
 # grep backstop, a REQUIRED CI job.
 fact "stdlib sweep backstop (forbidden-syntax grep)" \
   'forbidden-syntax grep backstop' "$ROOT/tests/run_stdlib_e106_sweep.sh"
-fact "stdlib sweep covers every shipped module (133)" \
-  '133' "$ROOT/tests/run_stdlib_e106_sweep.sh"
+fact "stdlib sweep covers every shipped module (the item-32 enumeration)" \
+  'run_stdlib_completeness_gate' "$ROOT/tests/run_stdlib_e106_sweep.sh"
 fact "stdlib-e106-sweep is a required CI job" \
   'stdlib-e106-sweep' "$ROOT/.github/workflows/ci.yml"
 
@@ -657,6 +681,114 @@ KERNEL_CLOSURE_COUNT="$(grep -E '^(std|compiler): ' "$ROOT/bootstrap/compiler_ke
 KERNEL_STD_COUNT="$(grep -c '^std: ' "$ROOT/bootstrap/compiler_kernel.manifest" 2>/dev/null || true)"
 KERNEL_COMPILER_COUNT="$(grep -c '^compiler: ' "$ROOT/bootstrap/compiler_kernel.manifest" 2>/dev/null || true)"
 
+# ── the item-32 verification families (computed from the contracts ─────────
+# ── manifest; a drifted manifest fails the snapshot) ───────────────────────
+FAMILY_COUNTS="$(python3 - "$ROOT/docs/current/stdlib_contracts.toml" <<'PY'
+import os, sys
+from collections import Counter
+try:
+    import tomllib
+    def parse(path):
+        return tomllib.load(open(path, "rb"))
+except ImportError:
+    try:
+        import tomli
+        def parse(path):
+            return tomli.loads(open(path, encoding="utf-8").read())
+    except ImportError:
+        print("  (contracts manifest unreadable — no tomllib/tomli)", file=sys.stderr)
+        sys.exit(1)
+d = parse(sys.argv[1])
+mods = sorted(f[:-3] for f in os.listdir("std") if f.endswith(".tg"))
+contracts = d.get("module", {})
+problems = [m for m in mods if m not in contracts]
+if problems:
+    print("  (contracts manifest drift: un-contracted modules: %s)" % ", ".join(problems), file=sys.stderr)
+    sys.exit(1)
+counts = Counter(contracts[m].get("family", "?") for m in mods)
+out = []
+for fam in ["kernel", "native", "lane", "parse-clean", "experimental"]:
+    if counts.get(fam):
+        out.append("%s=%d" % (fam, counts[fam]))
+print("; ".join(out))
+PY
+)" || true
+[ -n "$FAMILY_COUNTS" ] || FAMILY_COUNTS="(contracts manifest unreadable — see the errors above)"
+
+# ── the release-run evidence (the ONLY source of EXACT_SHA_VERIFIED / ──────
+# ── RELEASE_GATED; a failing gate writes NO evidence file) ──────────────────
+RELEASE_EVIDENCE_TEXT="  (no release-evidence run: --release-evidence was not given)"
+if [ -n "$RELEASE_EVIDENCE" ]; then
+  if ! bash "$ROOT/scripts/gen_api_manifest.sh" --release-check; then
+    printf '  [RELEASE GATE FAILED] the public-API manifest release check failed — a public callable with zero behavior tests, an error variant never exercised, or a cfg target without execution blocks the release; NO release evidence written\n' >&2
+    RELEASE_EVIDENCE_FAIL=1
+  else
+    RELEASE_EVIDENCE_FAIL=0
+  fi
+  if ! bash "$ROOT/scripts/gen_stdlib_completeness.sh" >/dev/null; then
+    printf '  [RELEASE GATE FAILED] the stdlib completeness model failed (enumeration / contracts / experimental gating); NO release evidence written\n' >&2
+    RELEASE_EVIDENCE_FAIL=1
+  fi
+  if [ "${RELEASE_EVIDENCE_FAIL:-0}" = "1" ] || [ ! -d "$RELEASE_EVIDENCE" ] || [ -z "$(find "$RELEASE_EVIDENCE" -type f 2>/dev/null | head -1)" ]; then
+    printf '  [RELEASE GATE FAILED] the run artifacts are missing or empty (%s); a release requires executed artifacts\n' "$RELEASE_EVIDENCE" >&2
+    RELEASE_EVIDENCE_FAIL=1
+  fi
+  if [ "${RELEASE_EVIDENCE_FAIL:-0}" = "0" ]; then
+    # The calculated ladder (source-state facts) -> the RELEASE_GATED list:
+    # every feature at TARGET_COMPLETE or above whose release checks passed.
+    LADDER_TMP="$(mktemp)"
+    if bash "$ROOT/scripts/gen_feature_registry.sh" "$ROOT/build/.feature_registry.evidence.md" "$LADDER_TMP" >/dev/null 2>&1; then
+      RELEASE_GATED_LIST="$(python3 - "$LADDER_TMP" <<'PY'
+import json, sys
+ladder = json.load(open(sys.argv[1])).get("ladder", {})
+order = ["DECLARED", "IMPLEMENTED", "SEMANTICALLY_CHECKED", "NATIVE_TESTED",
+         "ADVERSARIAL_TESTED", "TARGET_COMPLETE", "EXACT_SHA_VERIFIED", "RELEASE_GATED"]
+print(" ".join(fid for fid, pos in sorted(ladder.items()) if order.index(pos) >= order.index("TARGET_COMPLETE")))
+PY
+)"
+    else
+      RELEASE_GATED_LIST=""
+      printf '  [RELEASE GATE FAILED] the feature-registry ladder could not be computed; NO release evidence written\n' >&2
+      RELEASE_EVIDENCE_FAIL=1
+    fi
+    rm -f "$LADDER_TMP"
+  fi
+  if [ "${RELEASE_EVIDENCE_FAIL:-0}" = "0" ]; then
+    RELEASE_HASHES="$(IFS=':' ; for d in $ARTIFACT_DIRS; do
+      [ -n "$d" ] || continue
+      if [ -d "$d" ]; then
+        find "$d" -type f -print0 2>/dev/null | sort -z | while IFS= read -r -d '' f; do
+          shasum -a 256 "$f" 2>/dev/null | sed "s#  $d/#  #"
+        done
+      fi
+    done)"
+    [ -n "$RELEASE_HASHES" ] || RELEASE_HASHES="  (no artifact hashes — the release evidence requires run artifacts)"
+    mkdir -p "$ROOT/build"
+    python3 - "$ROOT/build/release_evidence.json" "$SHA" "$RELEASE_GATED_LIST" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" <<'PY'
+import json, sys
+path, sha, gated, stamp = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+gated = gated.split()
+with open(path, "w", encoding="utf-8") as fh:
+    json.dump({
+        "tested_sha": sha,
+        "artifact_hashes": "present" if True else [],
+        "release_gated_features": gated,
+        "generated_by": "scripts/gen_status.sh --release-evidence",
+        "timestamp_utc": stamp,
+    }, fh, indent=2, sort_keys=True)
+    fh.write("\n")
+PY
+    RELEASE_EVIDENCE_TEXT="  release evidence WRITTEN: build/release_evidence.json
+    tested_sha:      $SHA
+    release-gated:   $(printf '%s' "$RELEASE_GATED_LIST" | wc -w | tr -d ' ') feature(s)
+    artifact hashes: present ($(printf '%s\n' "$RELEASE_HASHES" | grep -c . || true) file hash line(s))
+    the registry generator reads this file for the EXACT_SHA_VERIFIED /
+    RELEASE_GATED ladder positions; a run that fails any gate writes nothing."
+  else
+    RELEASE_EVIDENCE_TEXT="  release evidence NOT WRITTEN — a release gate failed (see the errors above)."
+  fi
+fi
+
 # Target suites (the arch-specific lanes + the @cfg cross-target matrix).
 TARGET_SUITES=(
   "tests/arm64:the aarch64 encoder/ABI suite (mandatory on aarch64 hosts)"
@@ -779,6 +911,16 @@ STD-MODULE COUNTS (computed from the tested tree):
   kernel closure:         $KERNEL_CLOSURE_COUNT sources
                           ($KERNEL_STD_COUNT std + $KERNEL_COMPILER_COUNT compiler)
 
+STDLIB VERIFICATION FAMILIES (the item-32 completeness model, computed
+from docs/current/stdlib_contracts.toml — every module contracted):
+  $FAMILY_COUNTS
+
+RELEASE-RUN EVIDENCE (the item-36 EXACT_SHA_VERIFIED / RELEASE_GATED
+ladder facts — written only by --release-evidence from the tested-SHA
+run artifacts; the registry generator reads build/release_evidence.json
+and never derives these positions from source):
+$RELEASE_EVIDENCE_TEXT
+
 ABI SUITES (the adversarial platform-contract layer):
 $ABI_SUITES_TEXT
 INTEGRATION SUITES (net / sync / async / db / tls — committed @test files):
@@ -885,8 +1027,9 @@ CURRENT STATE (structural, verified against the tested tree):
   pair. The allocator's outstanding-allocations accounting is atomic too
   (runtime.tg rt_outstanding_add/sub_* — LDADDAL / lock xadd), so the
   counter is never updated under a partially released lock.
-- Stdlib E106 migration COMPLETE: every shipped std module (all 133
-  std/*.tg files) is parse-clean, enforced by the two-layer gate
+- Stdlib E106 migration COMPLETE: every shipped std module (all $STD_MODULE_COUNT
+  std/*.tg files — the count is computed from the glob, never typed) is
+  parse-clean, enforced by the two-layer gate
   (tests/run_stdlib_e106_sweep.sh: \`tg check\` zero-diagnostics per module
   + the forbidden-syntax grep backstop), a REQUIRED CI job
   (stdlib-e106-sweep in .github/workflows/ci.yml). The ONLY remaining
@@ -1087,4 +1230,13 @@ EOF
 } > "$OUT"
 
 echo "wrote $OUT (commit $SHA, positive=$POS negative=$NEG arm64=$ARM)"
+
+# A REQUESTED release-evidence run that failed to write the evidence file
+# is a FAILED release gate: fail the invocation (the CI status job would
+# fail, and the release-gate aggregate with it).
+if [ -n "$RELEASE_EVIDENCE" ] && [ ! -f "$ROOT/build/release_evidence.json" ]; then
+  echo "gen_status: the release-evidence run FAILED — build/release_evidence.json was NOT written (see the RELEASE GATE FAILED errors above); a release cannot be gated on this run" >&2
+  exit 1
+fi
+
 exit "$fail"

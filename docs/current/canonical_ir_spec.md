@@ -144,7 +144,33 @@ SwitchInt terminators with an `otherwise` target cover all cases not explicitly 
 
 ## Verifier
 
-The MIR verifier (`verify_mir()` in mir.tg) validates invariants INV-MIR-001 through INV-MIR-006.
+The MIR verifier (`verify_mir()` in mir.tg) enforces the CURRENT seven-
+invariant schema (the machine-readable source is
+[`compiler_pipeline.toml`](compiler_pipeline.toml), rendered as
+[`pipeline_stages.md`](pipeline_stages.md) — this section must agree with
+the generated doc):
+
+| # | Invariant | Description |
+|---|-----------|-------------|
+| 1 | type concreteness | no `Type::Param` / `Type::Var` in MirTypeDef fields or variants; every Named type in a type definition keys a canonical TypeId in the deinit-plan table |
+| 2 | callee resolution | every MirFnItem callee names a lowered function or a known intrinsic |
+| 3 | structural validity | every function has ≥ 1 block, all block/local ids reference real entries (block ids are DISJOINT — the exactly-one-terminator rule), the entry block exists |
+| 4 | projection correctness | FieldId owner matches the projected TypeId (a missing FieldId is an ICE at the lowering site) |
+| 5 | cleanup soundness | deinit plans and edge actions agree with the block frames |
+| 6 | switch-discriminant contract | a MirSwitchInt discriminant is an integer-like scalar, its target values are pairwise distinct, and every value is a DECLARED variant discriminant when the discriminant type is an enum |
+| 7 | reachable placeholder rule | a reachable block ending in the MirUnreachable placeholder is rejected |
+
+(The former INV-MIR-001…009 list above is the historical structural
+enumeration; the live verifier schema is the seven invariants above.)
+
+`verify_mir` runs at EVERY boundary: post-lower, post-mono
+(unconditional — the generic substitution is a transformative boundary
+every build re-proves), after EVERY transformative optimizer pass (the
+verify-everything policy: debug/CI), post-opt, and IMMEDIATELY BEFORE
+codegen (the final firewall re-proves the exact IR instance codegen
+receives). The MIR completeness oracle (`run_mir_completeness_oracle`)
+runs alongside it at every boundary, proving every substituted type has a
+COMPUTABLE layout under the fail-closed `layout_of_concrete`.
 
 Verifier returns `Vec[String]` of error messages. An empty vector means the MIR is valid.
 
@@ -155,7 +181,7 @@ Verifier returns `Vec[String]` of error messages. An empty vector means the MIR 
 | Consumer | What it reads | Source file |
 |----------|--------------|-------------|
 | Optimizer | MirProgram (transforms in place) | mir.tg |
-| Codegen | MirProgram → instruction selection + register allocation | codegen.tg |
+| Codegen | MirProgram → instruction selection + register-targeted direct emission (the inline per-function `RegAllocState` — `alloc_reg`/`free_reg`/`alloc_reg_or_spill`; there is NO standalone register-allocation pass) | codegen.tg |
 | Pretty-printer | MirProgram → human-readable text | mir.tg |
 | PGO instrumenter | MirProgram (adds counters) | mir.tg |
 | Async transformer | MirFunction (generates state machine) | mir.tg |
@@ -187,7 +213,7 @@ Verifier returns `Vec[String]` of error messages. An empty vector means the MIR 
 | AST (typed) | Non-canonical | Verified at type-check boundary |
 | AST (access/resource-checked) | Non-canonical | Verified at access/resource-check boundary |
 | MIR (lowered from AST) | **CANONICAL** | Verified by MIR verifier |
-| MIR (optimized) | **CANONICAL** | Should be re-verified (Stage 5 work) |
+| MIR (optimized) | **CANONICAL** | Re-verified post-opt AND immediately before codegen (the verify-everything policy + the final firewall) — the former "(Stage 5 work)" note is resolved |
 | CodeBuffer (from codegen) | Non-canonical | Not independently verified |
 
 All non-canonical IRs are consumed only by the immediately following stage.

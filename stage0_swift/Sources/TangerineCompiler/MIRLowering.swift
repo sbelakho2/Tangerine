@@ -2715,20 +2715,46 @@ public final class MIRLowering {
     static func parseInt(_ s: String) -> Int {
         let clean = s.replacingOccurrences(of: "_", with: "")
             .trimmingCharacters(in: .whitespaces)
-        // Strip type suffixes like u8, u16, u32, u64, i32, i64
+        // Strip type suffixes like u8, u16, u32, u64, i32, i64, and the
+        // bare u/i spellings (u, i, 8_u).
         let stripped: String
-        if let r = clean.range(of: #"(u8|u16|u32|u64|i8|i16|i32|i64)$"#, options: .regularExpression) {
+        if let r = clean.range(of: #"(?:_)?[ui](?:8|16|32|64)?$"#, options: .regularExpression) {
             stripped = String(clean[clean.startIndex..<r.lowerBound])
         } else {
             stripped = clean
         }
+        let parsed: Int?
+        let radix: Int
         if stripped.hasPrefix("0x") || stripped.hasPrefix("0X") {
-            return Int(stripped.dropFirst(2), radix: 16) ?? 0
+            parsed = Int(stripped.dropFirst(2), radix: 16)
+            radix = 16
         } else if stripped.hasPrefix("0b") || stripped.hasPrefix("0B") {
-            return Int(stripped.dropFirst(2), radix: 2) ?? 0
+            parsed = Int(stripped.dropFirst(2), radix: 2)
+            radix = 2
         } else if stripped.hasPrefix("0o") || stripped.hasPrefix("0O") {
-            return Int(stripped.dropFirst(2), radix: 8) ?? 0
+            parsed = Int(stripped.dropFirst(2), radix: 8)
+            radix = 8
+        } else {
+            parsed = Int(stripped)
+            radix = 10
         }
-        return Int(stripped) ?? 0
+        if let parsed = parsed {
+            return parsed
+        }
+        // The unsigned domain (the kernel's u64 hash constants exceed
+        // Int64.max): preserve the bit pattern instead of silently
+        // truncating to 0 (INV-PARSE-003 — the E9030 gate admits exactly
+        // the magnitudes that fit UInt64).
+        let digits = stripped.hasPrefix("0x") || stripped.hasPrefix("0X")
+            ? String(stripped.dropFirst(2))
+            : (stripped.hasPrefix("0b") || stripped.hasPrefix("0B")
+                ? String(stripped.dropFirst(2))
+                : (stripped.hasPrefix("0o") || stripped.hasPrefix("0O")
+                    ? String(stripped.dropFirst(2))
+                    : stripped))
+        if let unsigned = UInt64(digits, radix: radix) {
+            return Int(bitPattern: UInt(truncatingIfNeeded: unsigned))
+        }
+        return 0
     }
 }

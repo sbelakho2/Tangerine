@@ -608,7 +608,7 @@ deprecated when no pass consumes it.
 | `-W` / `--warn-all` | `warn_all` | **deprecated, inert** — no pass reads it; `tg lint` uses its own `LintConfig` |
 | `-Werror` | `deny_warnings` | **deprecated, inert** — no pass reads it; the linter's `--deny` rules are the warning-policy application point |
 | `-g` | `debug_info` | **deprecated, inert** — no pass reads it |
-| `--check` | `check_only` | **deprecated, inert** — `--check` is kept for CLI compatibility; `tg check` / `StopAfter::Semantic` is the real gate |
+| `--check` | `check_only` | **deprecated, inert** — `--check` is kept for CLI compatibility; `tg check` / `StopAfter::Mir` is the real gate (the driver's `cmd_check` sets `stop_after = StopAfter::Mir` — MIR lowered AND verified; the internal `StopAfter::Semantic` is never the `tg check` stop) |
 | `warn_unused` (default `true`) | — | **deprecated, inert** — no pass reads it |
 
 The flags that do have a responsible pass are the pipeline controls
@@ -815,30 +815,33 @@ end
 ## Secure Types
 
 Tangerine provides **sealed wrapper types** that prevent injection attacks at the
-type level. These types cannot be constructed from raw strings — only through
-validated constructors that enforce security invariants.
+type level. The sealed constructors are the only way to build these types, and
+the constructors validate their input at runtime.
+
+**Module status: experimental** — the wrappers scope what code can accidentally
+do with the value (the sealed API); the Secret zeroization guarantees are the
+future production behavior, not the current implementation.
 
 ```tangerine
-use std::secure_types::{sql_query, SqlParam, html_escape, url_parse, path_parse}
+use std::secure_types::{sql_query, SqlParam, html_escape, safe_url_parse, path_parse}
 
 # SQL — parameterized queries only, no string interpolation
-let query = sql_query("SELECT * FROM users WHERE id = $1", [SqlParam::Int(42)])?
-# query is SqlQuery — cannot be constructed from a raw string
+let query = sql_query("SELECT * FROM users WHERE id = $1".to_string(), Vec::from([SqlParam::Int(42)]))
+# query is a Result[SqlQuery, String] — the template is validated at construction
 
 # HTML — auto-escapes, XSS-safe
 let safe = html_escape("<script>alert('xss')</script>")
-# safe.value == "&lt;script&gt;alert(&#39;xss&#39;)&lt;/script&gt;"
 
-# URLs — blocks javascript: and vbscript: schemes
-let url = url_parse("https://example.com/api")?
-# url_parse("javascript:alert(1)") → Err(...)
+# URLs — the built-in parser blocks javascript: and vbscript: schemes
+let url = safe_url_parse("https://example.com/api")
+# safe_url_parse("javascript:alert(1)") → Err(...)
 
 # File paths — rejects traversal attacks
-let path = path_parse("data/reports/q1.csv")?
+let path = path_parse("data/reports/q1.csv")
 # path_parse("../../etc/passwd") → Err(...)
 ```
 
-See `std/secure_types.tg` for `SqlQuery`, `HtmlSafe`, `Url`, `SafePath`, and
+See `std/secure_types.tg` for `SqlQuery`, `HtmlSafe`, `SafeUrl`, `SafePath`, and
 `HeaderValue`.
 
 ## Taint Tracking
@@ -1813,12 +1816,12 @@ let cwd = current_dir()?
 ### Secure Types (`std/secure_types`)
 
 ```tangerine
-use std::secure_types::{sql_query, SqlParam, html_escape, url_parse, path_parse}
+use std::secure_types::{sql_query, SqlParam, html_escape, safe_url_parse, path_parse}
 
-let query = sql_query("SELECT * FROM users WHERE id = $1", [SqlParam::Int(1)])?
+let query = sql_query("SELECT * FROM users WHERE id = $1".to_string(), Vec::from([SqlParam::Int(1)]))
 let safe_html = html_escape("<b>hello</b>")
-let url = url_parse("https://example.com")?
-let path = path_parse("data/report.csv")?
+let url = safe_url_parse("https://example.com")
+let path = path_parse("data/report.csv")
 ```
 
 ### Taint Tracking (`std/taint`)

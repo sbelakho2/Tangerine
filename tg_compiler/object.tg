@@ -174,13 +174,35 @@ def validate_object_file(obj: ObjectFile, target: AsmTarget, entry: String) -> R
     return Result::Err("entry symbol not found: " + entry)
   end
 
-  # Relocation offsets must lie within the code/data section sizes.
+  # Relocation offsets must lie within the code/data section sizes, WIDTH-
+  # AWARE (the reviewer's item 13): a relocation PATCHES `width` bytes at
+  # its offset, so the last legal site is len - width — an offset == len
+  # or an offset in (len - width, len) would make the patch write past the
+  # section. The addition is OVERFLOW-SAFE by subtraction (width > len -
+  # offset, with offset <= len guaranteeing a non-negative difference —
+  # never offset + width, which could wrap).
   let relocs = object_relocations_clone(obj)
   var ri = 0
   while ri < relocs.len() do
     let r = relocs[ri]
-    if r.offset < 0 || r.offset > text_len then
-      return Result::Err("relocation offset out of text range for symbol " + r.symbol)
+    let rwidth = relocation_patch_width(&r.kind)
+    if !relocation_fits_section(&r.offset, rwidth, text_len) then
+      return Result::Err("relocation offset out of text range for symbol " + r.symbol + " (offset " + r.offset.to_string() + " + patch width " + rwidth.to_string() + " exceeds text length " + text_len.to_string() + ")")
+    end
+    # (item 13 — the unknown-symbol class): every relocation must name a
+    # symbol the object actually carries (a defined symbol in some section
+    # or an explicitly classified extern). A relocation for a symbol the
+    # object never declares is a structural corruption — fail closed, the
+    # linker never guesses a target for it.
+    var reloc_sym_known = false
+    var si2 = 0
+    let syms2 = object_symbols_clone(obj)
+    while si2 < syms2.len() do
+      if syms2[si2].name == r.symbol then reloc_sym_known = true end
+      si2 = si2 + 1
+    end
+    if !reloc_sym_known then
+      return Result::Err("relocation names unknown symbol " + r.symbol + " (no symbol table entry carries it)")
     end
     ri = ri + 1
   end
@@ -188,13 +210,142 @@ def validate_object_file(obj: ObjectFile, target: AsmTarget, entry: String) -> R
   let drelocs = object_data_relocations_clone(obj)
   while ddi < drelocs.len() do
     let dr = drelocs[ddi]
-    if dr.offset < 0 || dr.offset > data_len then
-      return Result::Err("data relocation offset out of data range for symbol " + dr.symbol)
+    let drwidth = relocation_patch_width(&dr.kind)
+    if !relocation_fits_section(&dr.offset, drwidth, data_len) then
+      return Result::Err("data relocation offset out of data range for symbol " + dr.symbol + " (offset " + dr.offset.to_string() + " + patch width " + drwidth.to_string() + " exceeds data length " + data_len.to_string() + ")")
+    end
+    var dr_sym_known = false
+    var di3 = 0
+    let dsyms = object_symbols_clone(obj)
+    while di3 < dsyms.len() do
+      if dsyms[di3].name == dr.symbol then dr_sym_known = true end
+      di3 = di3 + 1
+    end
+    if !dr_sym_known then
+      return Result::Err("data relocation names unknown symbol " + dr.symbol + " (no symbol table entry carries it)")
     end
     ddi = ddi + 1
   end
 
+  # (item 13 — the AArch64 ADRP/ADD pair invariants): the ADRP/ADD address
+  # materialization is a PAIR — the ADR_PREL_PG_HI21 (page-relative) at
+  # offset O and its ADD_ABS_LO12_NC (lo12) immediately after it at O + 4,
+  # BOTH for the same symbol. A page relocation without its lo12 partner
+  # (or with a partner for a different symbol) leaves the address
+  # computation with the wrong low bits — a silent corruption class. The
+  # Mach-O output maps these to the ARM64_RELOC_PAGE21 / PAGEOFF12 pair,
+  # which is validated under the same rule.
+  match obj.target.arch
+  when Arch::AArch64 then
+    match validate_aarch64_adrp_add_pairs(&relocs)
+    when Option::Some(pair_err) then
+      return Result::Err(pair_err)
+    when Option::None then ()
+    end
+  when _ then ()
+  end
+
   Result::Ok(())
+end
+
+# The patch width (bytes) of a relocation kind: 8 for the absolute-64
+# kinds, 4 for every instruction-word / 32-bit kind. A kind outside the
+# known table is treated as 4 (the widest known instruction relocation);
+# the width only ever makes the bounds check STRICTER (fail closed).
+def relocation_patch_width(kind: RelocKind) -> Int
+  match kind
+  when RelocKind::R_X86_64_64 then 8
+  when RelocKind::R_AARCH64_ABS64 then 8
+  when _ then 4
+  end
+end
+
+# Overflow-safe membership of the patch [offset, offset + width) in a
+# section of `len` bytes: offset must be non-negative, offset <= len, and
+# width <= len - offset (the subtraction cannot underflow once offset <=
+# len; no offset + width addition is ever performed).
+def relocation_fits_section(offset: Int, width: Int, len: Int) -> Bool
+  if offset < 0 then
+    false
+  elsif width < 0 then
+    false
+  elsif offset > len then
+    false
+  elsif width > len - offset then
+    false
+  else
+    true
+  end
+end
+
+# The AArch64 ADRP/ADD pair invariant over ONE object's text relocations.
+# Returns Some(error) on the first violation:
+#   - an ADR_PREL_PG_HI21 (or ARM64_RELOC_PAGE21) at offset O must be
+#     followed by the matching lo12 relocation (ADD_ABS_LO12_NC /
+#     ARM64_RELOC_PAGEOFF12) at O + 4 naming the SAME symbol;
+#   - an ADD_ABS_LO12_NC (or ARM64_RELOC_PAGEOFF12) at offset O must be
+#     preceded by the matching page relocation at O - 4 naming the SAME
+#     symbol.
+# The relocations of one object are emitted in offset order by codegen, so
+# index adjacency mirrors offset adjacency; the exact offset delta is
+# still checked (a pair split by an unrelated relocation is a violation).
+def validate_aarch64_adrp_add_pairs(relocs: Vec[Relocation]) -> Option[String]
+  var i = 0
+  while i < relocs.len() do
+    let r = relocs[i]
+    let is_adrp = match r.kind
+    when RelocKind::R_AARCH64_ADR_PREL_PG_HI21 then true
+    when RelocKind::ARM64_RELOC_PAGE21 then true
+    when _ then false
+    end
+    let is_lo12 = match r.kind
+    when RelocKind::R_AARCH64_ADD_ABS_LO12_NC then true
+    when RelocKind::ARM64_RELOC_PAGEOFF12 then true
+    when _ then false
+    end
+    if is_adrp then
+      if i + 1 >= relocs.len() then
+        return Option::Some("AArch64 ADRP relocation at offset " + r.offset.to_string() + " for symbol " + r.symbol.clone() + " has no lo12 partner (the ADRP/ADD pair is incomplete)")
+      end
+      let nxt = relocs[i + 1]
+      let nxt_is_lo12 = match nxt.kind
+      when RelocKind::R_AARCH64_ADD_ABS_LO12_NC then true
+      when RelocKind::ARM64_RELOC_PAGEOFF12 then true
+      when _ then false
+      end
+      if !nxt_is_lo12 then
+        return Option::Some("AArch64 ADRP relocation at offset " + r.offset.to_string() + " for symbol " + r.symbol.clone() + " is not followed by a lo12 relocation (the ADRP/ADD pair is broken by an unrelated relocation)")
+      end
+      if nxt.offset != r.offset + 4 then
+        return Option::Some("AArch64 ADRP/ADD pair offset invariant violated: ADRP at offset " + r.offset.to_string() + " is paired with its lo12 at offset " + nxt.offset.to_string() + " (expected " + (r.offset + 4).to_string() + ")")
+      end
+      if nxt.symbol != r.symbol then
+        return Option::Some("AArch64 ADRP/ADD pair symbol invariant violated: ADRP at offset " + r.offset.to_string() + " names symbol " + r.symbol.clone() + " but its lo12 partner names " + nxt.symbol.clone())
+      end
+      i = i + 1
+    elsif is_lo12 then
+      if i - 1 < 0 then
+        return Option::Some("AArch64 lo12 relocation at offset " + r.offset.to_string() + " for symbol " + r.symbol.clone() + " has no preceding ADRP (the ADRP/ADD pair is incomplete)")
+      end
+      let prv = relocs[i - 1]
+      let prv_is_adrp = match prv.kind
+      when RelocKind::R_AARCH64_ADR_PREL_PG_HI21 then true
+      when RelocKind::ARM64_RELOC_PAGE21 then true
+      when _ then false
+      end
+      if !prv_is_adrp then
+        return Option::Some("AArch64 lo12 relocation at offset " + r.offset.to_string() + " for symbol " + r.symbol.clone() + " is not preceded by an ADRP relocation (the ADRP/ADD pair is broken by an unrelated relocation)")
+      end
+      if r.offset != prv.offset + 4 then
+        return Option::Some("AArch64 ADRP/ADD pair offset invariant violated: lo12 at offset " + r.offset.to_string() + " is paired with its ADRP at offset " + prv.offset.to_string() + " (expected " + (prv.offset + 4).to_string() + ")")
+      end
+      if r.symbol != prv.symbol then
+        return Option::Some("AArch64 ADRP/ADD pair symbol invariant violated: lo12 at offset " + r.offset.to_string() + " names symbol " + r.symbol.clone() + " but its ADRP partner names " + prv.symbol.clone())
+      end
+    end
+    i = i + 1
+  end
+  Option::None
 end
 
 def format_target(t: AsmTarget) -> String

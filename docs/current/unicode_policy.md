@@ -197,41 +197,52 @@ See §2.4 — confusable detection is enabled by default.
 
 ### 7.1 std::unicode Module
 
+The character-property functions delegate to the SAME generated UCD tables
+the lexer consumes (Unicode 16.0.0 DerivedCoreProperties XID_Start /
+XID_Continue BMP ranges — see §9.3 for the sharing design). The
+normalization functions implement the documented subset (the precomposed
+Latin-1/Latin Extended-A pairs and the Hangul syllables); the lexer's
+identifier_nfc is the complete NFC oracle.
+
 ```tangerine
 module std::unicode
 
-# Normalization
+# Normalization (the documented subset)
 def nfc(s: String) -> String
 def nfd(s: String) -> String
 def nfkc(s: String) -> String
 def nfkd(s: String) -> String
 
-# Properties
+# Properties (the shared UCD tables)
 def is_alphabetic(c: Char) -> Bool
 def is_numeric(c: Char) -> Bool
+def is_digit(c: Char) -> Bool
 def is_alphanumeric(c: Char) -> Bool
 def is_whitespace(c: Char) -> Bool
 def is_uppercase(c: Char) -> Bool
 def is_lowercase(c: Char) -> Bool
+def is_xid_start(cp: Int) -> Bool
+def is_xid_continue(cp: Int) -> Bool
 
-# Case mapping
+# Case mapping (the documented BMP ranges)
 def to_uppercase(s: String) -> String
 def to_lowercase(s: String) -> String
 def to_titlecase(s: String) -> String
 
-# Grapheme iteration
-def graphemes(s: String) -> Iterator[String]
+# Grapheme iteration (the simplified UAX#29 subset)
+def graphemes(s: String) -> GraphemeIterator
 
 # Width calculation
 def display_width(s: String) -> UInt
 
-# Collation
+# Collation (a simple case-insensitive codepoint sort key)
 def collate(a: String, b: String, locale: Locale) -> Ordering
 ```
 
 ### 7.2 Locale Support
-Tangerine uses CLDR for locale data. Supported locales are documented
-in `std::locale`.
+The `collate` locale parameter is accepted for API compatibility; the
+weights are NOT CLDR-tailored (the sort key is the documented codepoint
+key). Supported locales are documented in `std::locale`.
 
 ---
 
@@ -249,7 +260,9 @@ newer Unicode version:
 ## 9. Implementation Notes
 
 ### 9.1 Lexer
-- Uses `std::unicode::is_xid_start()` and `is_xid_continue()` for identifier scanning.
+- The lexer's own UCD-derived tables drive identifier scanning
+  (the XID_Start / XID_Continue BMP ranges); `std::unicode` delegates
+  to the SAME generated data (see §9.3).
 - Normalizes identifiers to NFC before symbol table insertion.
 
 ### 9.2 Performance
@@ -257,12 +270,19 @@ newer Unicode version:
 - Grapheme iteration: O(n) using state machine from UAX29.
 - Display width: O(n) using East Asian Width + emoji properties.
 
-### 9.3 Dependencies
-The compiler bundles pre-computed Unicode tables (derived from UCD) for:
-- XID_Start / XID_Continue
-- NFC normalization quick-check
-- Grapheme break properties
-- East Asian Width
+### 9.3 Dependencies — the shared table design
+The compiler bundles pre-computed Unicode tables (derived from UCD
+16.0.0, DerivedCoreProperties.txt) for:
+- XID_Start / XID_Continue (the BMP ranges — the identifier authority)
+
+The SAME generated ranges are compiled into `tg_compiler/lexer.tg` (the
+kernel closure, which cannot import a std data module) and into
+`std::unicode.tg`; the differential suite tests/unicode_shared_data_test.tg
+pins the two copies to identical behavior on EVERY BMP scalar, so a
+drift between the lexer and the std fails CI. The std additionally
+carries its own documented tables for the numeric Nd ranges, the
+White_Space set, the simplified grapheme-break subset, and the East
+Asian Width W/F ranges.
 
 ---
 

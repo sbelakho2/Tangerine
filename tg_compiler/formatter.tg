@@ -21,17 +21,19 @@ use std::io::{print, println, eprintln}
 use tg_compiler::lexer::{tokenize}
 use tg_compiler::parser::{parse, diag_has_errors}
 use tg_compiler::ast::{Program, Item, ItemKind, Expr, ExprKind, Stmt, StmtKind,
-                        FunctionDecl, FnBody, Param, TypeExpr, TypeExprKind,
-                        Pattern, PatternKind, MatchArm, Block, ClosureParam, GuardElse,
+                        FunctionDecl, FnBody, FunctionSig, Param, ParamTypeExpr, TypeExpr, TypeExprKind,
+                        Pattern, PatternKind, MatchArm, MatchExpr, IfStmt, ForStmt, CatchArm,
+                        Block, ClosureParam, GuardElse,
                         Visibility, Attribute, GenericParam, AccessConvention, BinOp, UnOp,
-                        StructDecl, EnumDecl, TraitDecl, TraitMethod, AssocType,
+                        StructDecl, EnumDecl, TraitDecl, TraitMethod, AssocType, FieldDecl,
+                        VariantDecl, WherePredicate,
                         ImplDecl, AssocTypeImpl, ConstDecl, StaticDecl,
                         ModuleDecl, UseDecl, TypeAliasDecl, ExternBlock,
                         ExternItem, ExternFn, ExternStatic,
                         MacroDecl, CapabilityDecl, EffectDecl, RationaleBlock, EditionDecl,
                         NominalKind, EffectHandler, HandlerArm,
                         make_block, make_stmt, make_expr}
-use tg_compiler::token::{Token, TokenKind, Span}
+use tg_compiler::token::{Token, TokenKind, Span, parsed_int_spelling, parsed_float_spelling}
 
 # ———————————————————————————————————————————————————————————————
 # Configuration
@@ -80,7 +82,11 @@ def default_format_config() -> FormatConfig
     newline_before_end: true,
     remove_trailing_whitespace: true,
     ensure_final_newline: true,
-    sort_imports: true,
+    # sort_imports defaults to FALSE: the "sort" is an identity today and
+    # the import-move-to-front reorder breaks the semantic-equivalence
+    # gate (parse(original) == parse(format(original))) for files whose
+    # imports are not leading — item order must be preserved.
+    sort_imports: false,
     group_imports: true
   }
 end
@@ -1163,6 +1169,17 @@ def format_rationale(inout f: Formatter, r: RationaleBlock) -> Unit
   f.emit(escape_string_content(&r.title).as_str())
   f.emit("\"")
   f.emit_newline()
+  # The parser folds the objective + every why/description line into body
+  # (newline-joined). When body carries content beyond the title, re-emit
+  # it as ONE description line (the `\n` escapes round-trip through the
+  # string literal) so parse(format(original)) keeps the same body — the
+  # semantic-equivalence gate's requirement.
+  if r.body != r.title && !r.body.is_empty() then
+    f.emit("description: \"")
+    f.emit(escape_string_content(&r.body).as_str())
+    f.emit("\"")
+    f.emit_newline()
+  end
   match r.author
   when Option::Some(author) then
     f.emit("author: \"")
@@ -1194,9 +1211,9 @@ end
 def format_expr(inout f: Formatter, expr: Expr) -> Unit
   match expr.kind
   when ExprKind::ExprIntLit(n) then
-    f.emit(n.to_string().as_str())
+    f.emit(parsed_int_spelling(&n).as_str())
   when ExprKind::ExprFloatLit(n) then
-    f.emit(n.to_string().as_str())
+    f.emit(parsed_float_spelling(&n).as_str())
   when ExprKind::ExprStringLit(s) then
     f.emit("\"")
     f.emit(escape_string_content(&s).as_str())
@@ -1472,6 +1489,22 @@ def format_expr(inout f: Formatter, expr: Expr) -> Unit
     format_block(f, &block)
     f.dedent()
     f.emit("end")
+  when ExprKind::ExprUnsafe(justification, block) then
+    # The justification label is part of the AST (unsafe "reason" do/end) —
+    # emitting it is required for the semantic-equivalence gate.
+    f.emit("unsafe")
+    match justification
+    when Option::Some(reason) then
+      f.emit(" \"")
+      f.emit(escape_string_content(&reason).as_str())
+      f.emit("\"")
+    when Option::None then ()
+    end
+    f.emit_newline()
+    f.indent()
+    format_block(f, &block)
+    f.dedent()
+    f.emit("end")
   when ExprKind::ExprAwait(inner) then
     # await is a prefix operator; parenthesize operands that would otherwise
     # bind looser on reparse (await x + 1 must not become (await x) + 1).
@@ -1675,8 +1708,15 @@ def format_stmt(inout f: Formatter, stmt: Stmt) -> Unit
     end
   when StmtKind::StmtContinue then
     f.emit("next")
-  when StmtKind::StmtUnsafe(_reason, body) then
+  when StmtKind::StmtUnsafe(justification, body) then
     f.emit("unsafe")
+    match justification
+    when Option::Some(reason) then
+      f.emit(" \"")
+      f.emit(escape_string_content(&reason).as_str())
+      f.emit("\"")
+    when Option::None then ()
+    end
     f.emit_newline()
     f.indent()
     format_block(f, &body)
@@ -1711,7 +1751,9 @@ def format_stmt(inout f: Formatter, stmt: Stmt) -> Unit
       when Option::None then ()
       end
     when GuardElse::Continue then
-      f.emit("continue")
+      # The dialect's continue keyword is `next` (TokenKind::Next) — the
+      # emitted form must re-lex to the same token.
+      f.emit("next")
     when GuardElse::Panic(msg) then
       f.emit("panic(\"")
       f.emit(escape_string_content(&msg).as_str())
@@ -1933,6 +1975,11 @@ def format_type_expr(inout f: Formatter, ty: TypeExpr) -> Unit
     f.emit("PtrMut[")
     format_type_expr(f, &inner)
     f.emit("]")
+  when TypeExprKind::Ref(inner, mutable) then
+    # Reference types appear in extern ABI contexts (`extern def f(x: &K)`);
+    # the parser accepts them there and only there.
+    if mutable then f.emit("&mut ") else f.emit("&") end
+    format_type_expr(f, &inner)
   when TypeExprKind::Fn(params, ret) then
     f.emit("(")
     var first = true
@@ -2003,6 +2050,8 @@ def fmt_type_expr_to_string(ty: TypeExpr) -> String
     "Ptr[" + fmt_type_expr_to_string(&inner) + "]"
   when TypeExprKind::PtrMut(inner) then
     "PtrMut[" + fmt_type_expr_to_string(&inner) + "]"
+  when TypeExprKind::Ref(inner, mutable) then
+    if mutable then "&mut " + fmt_type_expr_to_string(&inner) else "&" + fmt_type_expr_to_string(&inner) end
   when TypeExprKind::Fn(params, ret) then
     var s = "("
     var first = true
@@ -2177,4 +2226,850 @@ def format_lines_fallback(source: String, config: FormatConfig) -> String
   end
   
   output
+end
+
+# ———————————————————————————————————————————————————————————————
+# The Formatter Gate: semantic equivalence + idempotence
+# ———————————————————————————————————————————————————————————————
+# format_invariant_check(source) is the tool-proof gate the reviewer's
+# item 6 demands, asserted over the compiler/std/test tree by
+# tests/run_formatter_gate.sh:
+#
+#   parse(original)                       — must succeed (else skipped)
+#   parse(format(original))               — must succeed
+#   gate_sig(parse(original))
+#       == gate_sig(parse(format(original)))   — SEMANTIC EQUIVALENCE:
+#          the structural signature below is an order-sensitive,
+#          span/node_id-insensitive shape+content walk — two programs with
+#          the same signature are structurally the same program
+#   format(format(original)) == format(original) — IDEMPOTENCE
+
+# The signature walkers: every node kind contributes its tag and payload;
+# a construct the emitter dropped or altered changes the signature of the
+# re-parsed program, so the gate fails.
+
+def gate_sig_vis(vis: Visibility, inout out: String) -> Unit
+  match vis
+  when Visibility::Public then out = out + "pub"
+  when Visibility::Private then out = out + "priv"
+  when Visibility::Default then out = out + "def"
+  end
+end
+
+def gate_sig_convention(conv: AccessConvention, inout out: String) -> Unit
+  match conv
+  when AccessConvention::Let then out = out + "let"
+  when AccessConvention::Inout then out = out + "inout"
+  when AccessConvention::Sink then out = out + "sink"
+  when AccessConvention::Set then out = out + "set"
+  end
+end
+
+def gate_sig_generic_params(params: Vec[GenericParam], inout out: String) -> Unit
+  out = out + "g(" + params.len().to_string() + ")"
+  for gp in params do
+    out = out + gp.name.clone() + ":"
+    for bound in gp.bounds do
+      gate_sig_type_expr(&bound, &mut out)
+    end
+    match gp.default
+    when Option::Some(d) then
+      out = out + "="
+      gate_sig_expr(&d, &mut out)
+    when Option::None then ()
+    end
+  end
+end
+
+def gate_sig_params(params: Vec[Param], inout out: String) -> Unit
+  out = out + "p(" + params.len().to_string() + ")"
+  for param in params do
+    gate_sig_convention(param.convention, &mut out)
+    out = out + param.name.clone() + ":"
+    match param.ty
+    when Option::Some(ty) then gate_sig_type_expr(&ty, &mut out)
+    when Option::None then out = out + "-"
+    end
+    match param.default
+    when Option::Some(d) then
+      out = out + "="
+      gate_sig_expr(&d, &mut out)
+    when Option::None then ()
+    end
+  end
+end
+
+def gate_sig_where_clause(clauses: Vec[WherePredicate], inout out: String) -> Unit
+  out = out + "w(" + clauses.len().to_string() + ")"
+  for clause in clauses do
+    gate_sig_type_expr(&clause.ty, &mut out)
+    out = out + ":"
+    for bound in clause.bounds do
+      gate_sig_type_expr(&bound, &mut out)
+    end
+  end
+end
+
+def gate_sig_function(func: FunctionDecl, inout out: String) -> Unit
+  gate_sig_vis(func.vis, &mut out)
+  out = out + "fn:" + func.name.clone()
+  if func.is_async then out = out + "async" end
+  if func.is_unsafe then out = out + "unsafe" end
+  if func.is_const then out = out + "const" end
+  if func.is_inline then out = out + "inline" end
+  if func.is_pure then out = out + "pure" end
+  gate_sig_generic_params(func.generic_params, &mut out)
+  gate_sig_params(func.params, &mut out)
+  match func.ret_type
+  when Option::Some(ty) then
+    out = out + "->"
+    gate_sig_type_expr(&ty, &mut out)
+  when Option::None then out = out + "->-"
+  end
+  gate_sig_where_clause(func.where_clause, &mut out)
+  out = out + "e(" + func.effects.len().to_string() + ")"
+  for eff in func.effects do
+    out = out + eff
+  end
+  match func.body
+  when FnBody::FnBlock(block) then gate_sig_block(&block, &mut out)
+  when FnBody::FnExpr(expr) then
+    out = out + "="
+    gate_sig_expr(&expr, &mut out)
+  when FnBody::FnExtern(name) then out = out + "extern:" + name
+  when FnBody::FnNone then out = out + "none"
+  end
+end
+
+def gate_sig_block(block: Block, inout out: String) -> Unit
+  out = out + "{"
+  for stmt in block.stmts do
+    gate_sig_stmt(stmt, &mut out)
+  end
+  out = out + "}"
+end
+
+def gate_sig_if(if_stmt: IfStmt, inout out: String) -> Unit
+  out = out + "if:"
+  gate_sig_expr(&if_stmt.cond, &mut out)
+  gate_sig_block(&if_stmt.then_block, &mut out)
+  out = out + "elsif(" + if_stmt.elsif_branches.len().to_string() + ")"
+  for (econd, ebody) in if_stmt.elsif_branches do
+    gate_sig_expr(&econd, &mut out)
+    gate_sig_block(&ebody, &mut out)
+  end
+  match if_stmt.else_block
+  when Option::Some(e) then
+    out = out + "else"
+    gate_sig_block(&e, &mut out)
+  when Option::None then ()
+  end
+end
+
+def gate_sig_match(m: MatchExpr, inout out: String) -> Unit
+  out = out + "match:"
+  gate_sig_expr(&m.scrutinee, &mut out)
+  out = out + "arms(" + m.arms.len().to_string() + ")"
+  for arm in m.arms do
+    gate_sig_pattern(&arm.pattern, &mut out)
+    match arm.guard_expr
+    when Option::Some(g) then
+      out = out + "if"
+      gate_sig_expr(&g, &mut out)
+    when Option::None then ()
+    end
+    gate_sig_block(&arm.body, &mut out)
+  end
+end
+
+def gate_sig_stmt(stmt: Stmt, inout out: String) -> Unit
+  match stmt.kind
+  when StmtKind::StmtLet(pattern, ty_opt, init, is_mut) then
+    out = out + "let" + if is_mut then "mut" else "" end
+    gate_sig_pattern(&pattern, &mut out)
+    match ty_opt
+    when Option::Some(ty) then
+      out = out + ":"
+      gate_sig_type_expr(&ty, &mut out)
+    when Option::None then ()
+    end
+    out = out + "="
+    gate_sig_expr(&init, &mut out)
+  when StmtKind::StmtAssign(target, value) then
+    out = out + "assign:"
+    gate_sig_expr(&target, &mut out)
+    out = out + "="
+    gate_sig_expr(&value, &mut out)
+  when StmtKind::StmtCompoundAssign(op, target, value) then
+    out = out + "opassign:" + binop_symbol(op)
+    gate_sig_expr(&target, &mut out)
+    gate_sig_expr(&value, &mut out)
+  when StmtKind::StmtIf(if_stmt) then gate_sig_if(&if_stmt, &mut out)
+  when StmtKind::StmtMatch(m) then gate_sig_match(&m, &mut out)
+  when StmtKind::StmtWhile(cond, body) then
+    out = out + "while:"
+    gate_sig_expr(&cond, &mut out)
+    gate_sig_block(&body, &mut out)
+  when StmtKind::StmtFor(for_stmt) then
+    out = out + "for:"
+    gate_sig_pattern(&for_stmt.pattern, &mut out)
+    out = out + "in"
+    gate_sig_expr(&for_stmt.iter, &mut out)
+    gate_sig_block(&for_stmt.body, &mut out)
+  when StmtKind::StmtLoop(body) then
+    out = out + "loop"
+    gate_sig_block(&body, &mut out)
+  when StmtKind::StmtReturn(val) then
+    out = out + "return"
+    match val
+    when Option::Some(v) then
+      out = out + ":"
+      gate_sig_expr(&v, &mut out)
+    when Option::None then ()
+    end
+  when StmtKind::StmtBreak(val) then
+    out = out + "break"
+    match val
+    when Option::Some(v) then
+      out = out + ":"
+      gate_sig_expr(&v, &mut out)
+    when Option::None then ()
+    end
+  when StmtKind::StmtContinue then out = out + "next"
+  when StmtKind::StmtExpr(expr) then gate_sig_expr(&expr, &mut out)
+  when StmtKind::StmtUnsafe(reason, body) then
+    out = out + "unsafe"
+    match reason
+    when Option::Some(r) then out = out + ":" + r
+    when Option::None then ()
+    end
+    gate_sig_block(&body, &mut out)
+  when StmtKind::StmtDefer(body) then
+    out = out + "defer"
+    gate_sig_block(&body, &mut out)
+  when StmtKind::StmtGuard(cond, else_action) then
+    out = out + "guard:"
+    gate_sig_expr(&cond, &mut out)
+    out = out + "else"
+    match else_action
+    when GuardElse::Return(val_opt) then
+      out = out + "return"
+      match val_opt
+      when Option::Some(v) then gate_sig_expr(&v, &mut out)
+      when Option::None then ()
+      end
+    when GuardElse::Break(val_opt) then
+      out = out + "break"
+      match val_opt
+      when Option::Some(v) then gate_sig_expr(&v, &mut out)
+      when Option::None then ()
+      end
+    when GuardElse::Continue then out = out + "next"
+    when GuardElse::Panic(msg) then out = out + "panic:" + msg
+    end
+  when StmtKind::StmtTry(body, catches, finally_opt) then
+    out = out + "try"
+    gate_sig_block(&body, &mut out)
+    out = out + "catch(" + catches.len().to_string() + ")"
+    for catch_arm in catches do
+      gate_sig_pattern(&catch_arm.pattern, &mut out)
+      gate_sig_block(&catch_arm.body, &mut out)
+    end
+    match finally_opt
+    when Option::Some(fin) then
+      out = out + "finally"
+      gate_sig_block(&fin, &mut out)
+    when Option::None then ()
+    end
+  when StmtKind::StmtWith(expr, pat, body) then
+    out = out + "with"
+    gate_sig_pattern(&pat, &mut out)
+    out = out + "="
+    gate_sig_expr(&expr, &mut out)
+    gate_sig_block(&body, &mut out)
+  when StmtKind::StmtHandleWith(expr, handlers) then
+    out = out + "handle"
+    gate_sig_expr(&expr, &mut out)
+    out = out + "with(" + handlers.len().to_string() + ")"
+    for handler in handlers do
+      out = out + ":" + handler.effect_name.clone() + "(" + handler.arms.len().to_string() + ")"
+      for arm in handler.arms do
+        out = out + arm.operation.clone() + "(" + arm.params.len().to_string() + ")"
+        for p in arm.params do
+          gate_sig_pattern(&p, &mut out)
+        end
+        gate_sig_block(&arm.body, &mut out)
+      end
+    end
+  end
+end
+
+def gate_sig_pattern(pat: Pattern, inout out: String) -> Unit
+  match pat.kind
+  when PatternKind::Wildcard then out = out + "_"
+  when PatternKind::Ident(name, is_mut) then
+    out = out + if is_mut then "mut" else "" end + "id:" + name
+  when PatternKind::Literal(lit) then
+    out = out + "lit:"
+    gate_sig_expr(&lit, &mut out)
+  when PatternKind::Tuple(pats) then
+    out = out + "tuple(" + pats.len().to_string() + ")"
+    for p in pats do
+      gate_sig_pattern(&p, &mut out)
+    end
+  when PatternKind::Array(pats) then
+    out = out + "arrpat(" + pats.len().to_string() + ")"
+    for p in pats do
+      gate_sig_pattern(&p, &mut out)
+    end
+  when PatternKind::Struct(path, fields) then
+    out = out + "structpat:" + path.segments.join("::") + "(" + fields.len().to_string() + ")"
+    for (field_name, field_pat) in fields do
+      out = out + field_name + ":"
+      gate_sig_pattern(&field_pat, &mut out)
+    end
+  when PatternKind::Variant(path, pats) then
+    out = out + "variant:" + path.segments.join("::") + "(" + pats.len().to_string() + ")"
+    for p in pats do
+      gate_sig_pattern(&p, &mut out)
+    end
+  when PatternKind::Or(pats) then
+    out = out + "or(" + pats.len().to_string() + ")"
+    for p in pats do
+      gate_sig_pattern(&p, &mut out)
+    end
+  when PatternKind::Range(start, end_val, inclusive) then
+    out = out + "range" + if inclusive then "=" else "" end
+    match start
+    when Option::Some(s) then gate_sig_expr(&s, &mut out)
+    when Option::None then ()
+    end
+    match end_val
+    when Option::Some(e) then gate_sig_expr(&e, &mut out)
+    when Option::None then ()
+    end
+  end
+end
+
+def gate_sig_type_expr(ty: TypeExpr, inout out: String) -> Unit
+  match ty.kind
+  when TypeExprKind::Named(name, args) then
+    out = out + "T:" + name + "(" + args.len().to_string() + ")"
+    for a in args do
+      gate_sig_type_expr(&a, &mut out)
+    end
+  when TypeExprKind::Unit then out = out + "Unit"
+  when TypeExprKind::Never then out = out + "Never"
+  when TypeExprKind::Tuple(elems) then
+    out = out + "Tup(" + elems.len().to_string() + ")"
+    for e in elems do
+      gate_sig_type_expr(&e, &mut out)
+    end
+  when TypeExprKind::Array(elem, size) then
+    out = out + "Arr["
+    gate_sig_type_expr(&elem, &mut out)
+    match size
+    when Option::Some(size_expr) then
+      out = out + ";"
+      gate_sig_expr(&size_expr, &mut out)
+    when Option::None then ()
+    end
+    out = out + "]"
+  when TypeExprKind::Slice(elem) then
+    out = out + "Slice["
+    gate_sig_type_expr(&elem, &mut out)
+    out = out + "]"
+  when TypeExprKind::Ptr(inner) then
+    out = out + "Ptr["
+    gate_sig_type_expr(&inner, &mut out)
+    out = out + "]"
+  when TypeExprKind::PtrMut(inner) then
+    out = out + "PtrMut["
+    gate_sig_type_expr(&inner, &mut out)
+    out = out + "]"
+  when TypeExprKind::Ref(inner, mutable) then
+    out = out + if mutable then "&mut" else "&" end
+    gate_sig_type_expr(&inner, &mut out)
+  when TypeExprKind::Fn(params, ret) then
+    out = out + "Fn(" + params.len().to_string() + ")"
+    for p in params do
+      gate_sig_convention(p.convention, &mut out)
+      gate_sig_type_expr(&p.ty, &mut out)
+    end
+    out = out + "->"
+    gate_sig_type_expr(&ret, &mut out)
+  when TypeExprKind::Async(inner) then
+    out = out + "async"
+    gate_sig_type_expr(&inner, &mut out)
+  when TypeExprKind::Effect(name, inner) then
+    out = out + "effect:" + name
+    gate_sig_type_expr(&inner, &mut out)
+  when TypeExprKind::Path(path) then out = out + "TPath:" + path.segments.join("::")
+  when TypeExprKind::Infer then out = out + "_"
+  end
+end
+
+def gate_sig_expr(expr: Expr, inout out: String) -> Unit
+  match expr.kind
+  when ExprKind::ExprIntLit(n) then
+    out = out + "int(" + parsed_int_spelling(&n) + ")"
+  when ExprKind::ExprFloatLit(n) then
+    out = out + "float(" + parsed_float_spelling(&n) + ")"
+  when ExprKind::ExprStringLit(s) then
+    out = out + "str(" + escape_string_content(&s) + ")"
+  when ExprKind::ExprCharLit(c) then
+    out = out + "char(" + escape_char_content(c) + ")"
+  when ExprKind::ExprBoolLit(b) then
+    out = out + if b then "true" else "false" end
+  when ExprKind::ExprNilLit then out = out + "nil"
+  when ExprKind::ExprArrayLit(elems) then
+    out = out + "arr(" + elems.len().to_string() + ")"
+    for e in elems do
+      gate_sig_expr(&e, &mut out)
+    end
+  when ExprKind::ExprTupleLit(elems) then
+    out = out + "tup(" + elems.len().to_string() + ")"
+    for e in elems do
+      gate_sig_expr(&e, &mut out)
+    end
+  when ExprKind::ExprStructLit(path, fields) then
+    out = out + "struct:" + path.segments.join("::") + "(" + fields.len().to_string() + ")"
+    for (field_name, field_value) in fields do
+      out = out + field_name + ":"
+      gate_sig_expr(&field_value, &mut out)
+    end
+  when ExprKind::ExprMapLit(entries) then
+    out = out + "map(" + entries.len().to_string() + ")"
+    for (key, value) in entries do
+      gate_sig_expr(&key, &mut out)
+      out = out + "=>"
+      gate_sig_expr(&value, &mut out)
+    end
+  when ExprKind::ExprIdent(name) then out = out + "id:" + name
+  when ExprKind::ExprPath(path) then out = out + "path:" + path.segments.join("::")
+  when ExprKind::ExprSelfRef then out = out + "self"
+  when ExprKind::ExprBinaryOp(op, left, right) then
+    out = out + "("
+    gate_sig_expr(left, &mut out)
+    out = out + binop_symbol(op)
+    gate_sig_expr(right, &mut out)
+    out = out + ")"
+  when ExprKind::ExprUnaryOp(op, operand) then
+    out = out + "(" + unop_symbol(op)
+    gate_sig_expr(operand, &mut out)
+    out = out + ")"
+  when ExprKind::ExprFieldAccess(obj, field) then
+    gate_sig_expr(obj, &mut out)
+    out = out + "." + field
+  when ExprKind::ExprMethodCall(receiver, method, type_args, args) then
+    gate_sig_expr(receiver, &mut out)
+    out = out + "." + method + "(" + type_args.len().to_string() + "," + args.len().to_string() + ")"
+    for ta in type_args do
+      gate_sig_type_expr(&ta, &mut out)
+    end
+    for a in args do
+      gate_sig_expr(&a, &mut out)
+    end
+  when ExprKind::ExprIndex(arr, idx) then
+    gate_sig_expr(arr, &mut out)
+    out = out + "["
+    gate_sig_expr(idx, &mut out)
+    out = out + "]"
+  when ExprKind::ExprCall(callee, args) then
+    gate_sig_expr(callee, &mut out)
+    out = out + "(" + args.len().to_string() + ")"
+    for a in args do
+      gate_sig_expr(&a, &mut out)
+    end
+  when ExprKind::ExprClosure(params, ret_ty, body) then
+    out = out + "|"
+    for param in params do
+      gate_sig_pattern(&param.pat, &mut out)
+      match param.ty
+      when Option::Some(param_ty) then
+        out = out + ":"
+        gate_sig_type_expr(&param_ty, &mut out)
+      when Option::None then ()
+      end
+    end
+    out = out + "|"
+    match ret_ty
+    when Option::Some(ret_type) then
+      out = out + "->"
+      gate_sig_type_expr(&ret_type, &mut out)
+    when Option::None then ()
+    end
+    gate_sig_expr(body, &mut out)
+  when ExprKind::ExprAccess(inner) then
+    out = out + "&"
+    gate_sig_expr(inner, &mut out)
+  when ExprKind::ExprRawDeref(inner) then
+    out = out + "*"
+    gate_sig_expr(inner, &mut out)
+  when ExprKind::ExprIf(if_stmt) then gate_sig_if(&if_stmt, &mut out)
+  when ExprKind::ExprMatch(m) then gate_sig_match(&m, &mut out)
+  when ExprKind::ExprBlock(block) then
+    out = out + "do"
+    gate_sig_block(&block, &mut out)
+    out = out + "end"
+  when ExprKind::ExprUnsafe(justification, block) then
+    out = out + "unsafe"
+    match justification
+    when Option::Some(reason) then out = out + ":" + reason
+    when Option::None then ()
+    end
+    gate_sig_block(&block, &mut out)
+    out = out + "end"
+  when ExprKind::ExprAsync(block) then
+    out = out + "async"
+    gate_sig_block(&block, &mut out)
+    out = out + "end"
+  when ExprKind::ExprAwait(inner) then
+    out = out + "await"
+    gate_sig_expr(inner, &mut out)
+  when ExprKind::ExprTry(inner) then
+    gate_sig_expr(inner, &mut out)
+    out = out + "?"
+  when ExprKind::ExprRange(start_opt, end_opt, inclusive) then
+    out = out + "range" + if inclusive then "=" else "" end
+    match start_opt
+    when Option::Some(s) then gate_sig_expr(&s, &mut out)
+    when Option::None then ()
+    end
+    match end_opt
+    when Option::Some(e) then gate_sig_expr(&e, &mut out)
+    when Option::None then ()
+    end
+  when ExprKind::ExprCast(val, ty) then
+    gate_sig_expr(val, &mut out)
+    out = out + "as"
+    gate_sig_type_expr(&ty, &mut out)
+  when ExprKind::ExprTypeCheck(val, ty) then
+    gate_sig_expr(val, &mut out)
+    out = out + "is"
+    gate_sig_type_expr(&ty, &mut out)
+  when ExprKind::ExprComptime(block) then
+    out = out + "comptime"
+    gate_sig_block(&block, &mut out)
+    out = out + "end"
+  when ExprKind::ExprEnumVariant(path, args) then
+    out = out + "enumvar:" + path.segments.join("::") + "(" + args.len().to_string() + ")"
+    for a in args do
+      gate_sig_expr(&a, &mut out)
+    end
+  when ExprKind::ExprAssign(target, value) then
+    gate_sig_expr(target, &mut out)
+    out = out + "="
+    gate_sig_expr(value, &mut out)
+  when ExprKind::ExprPipe(left, right) then
+    gate_sig_expr(left, &mut out)
+    out = out + "|>"
+    gate_sig_expr(right, &mut out)
+  when ExprKind::ExprMacroCall(name, args) then
+    out = out + "macro!" + name + "(" + args.len().to_string() + ")"
+    for a in args do
+      gate_sig_expr(&a, &mut out)
+    end
+  when ExprKind::ExprError(msg) then out = out + "err:" + msg
+  end
+end
+
+def gate_sig_item(item: Item, inout out: String) -> Unit
+  out = out + "attrs(" + item.attrs.len().to_string() + ")"
+  for attr in item.attrs do
+    out = out + "@" + attr.name.clone() + "(" + attr.args.len().to_string() + ")"
+    for a in attr.args do
+      out = out + a
+    end
+  end
+  match item.kind
+  when ItemKind::ItemUse(u) then
+    out = out + "use"
+    gate_sig_vis(u.vis, &mut out)
+    out = out + ":" + u.path.segments.join("::")
+    if u.glob then out = out + "::*" end
+    match u.names
+    when Option::Some(names) then
+      out = out + "::{" + names.len().to_string() + "}"
+      for n in names do
+        out = out + n
+      end
+    when Option::None then ()
+    end
+    match u.alias_name
+    when Option::Some(alias_name) then out = out + "as" + alias_name
+    when Option::None then ()
+    end
+  when ItemKind::ItemFunction(func) then gate_sig_function(func, &mut out)
+  when ItemKind::ItemStruct(s) then
+    gate_sig_vis(s.vis, &mut out)
+    out = out + "struct:" + s.name.clone()
+    match s.kind
+    when NominalKind::Value then ()
+    when NominalKind::Resource then out = out + "resource"
+    end
+    gate_sig_generic_params(s.generic_params, &mut out)
+    out = out + "fields(" + s.fields.len().to_string() + ")"
+    for fld in s.fields do
+      gate_sig_vis(fld.vis, &mut out)
+      out = out + fld.name.clone() + ":"
+      gate_sig_type_expr(&fld.ty, &mut out)
+      match fld.default
+      when Option::Some(d) then
+        out = out + "="
+        gate_sig_expr(&d, &mut out)
+      when Option::None then ()
+      end
+    end
+    out = out + "derives(" + s.derives.len().to_string() + ")"
+    for d in s.derives do
+      out = out + d
+    end
+    out = out + "methods(" + s.methods.len().to_string() + ")"
+    for m in s.methods do
+      gate_sig_function(m, &mut out)
+    end
+  when ItemKind::ItemEnum(e) then
+    gate_sig_vis(e.vis, &mut out)
+    out = out + "enum:" + e.name.clone()
+    gate_sig_generic_params(e.generic_params, &mut out)
+    out = out + "variants(" + e.variants.len().to_string() + ")"
+    for v in e.variants do
+      out = out + v.name.clone() + "(" + v.fields.len().to_string() + ")"
+      for fty in v.fields do
+        gate_sig_type_expr(&fty, &mut out)
+      end
+      out = out + "names(" + v.field_names.len().to_string() + ")"
+      for fn_opt in v.field_names do
+        match fn_opt
+        when Option::Some(n) then out = out + n
+        when Option::None then out = out + "-"
+        end
+      end
+      match v.discriminant
+      when Option::Some(d) then
+        out = out + "="
+        gate_sig_expr(&d, &mut out)
+      when Option::None then ()
+      end
+    end
+    out = out + "derives(" + e.derives.len().to_string() + ")"
+    for d in e.derives do
+      out = out + d
+    end
+  when ItemKind::ItemTrait(t) then
+    gate_sig_vis(t.vis, &mut out)
+    out = out + "trait:" + t.name.clone()
+    gate_sig_generic_params(t.generic_params, &mut out)
+    out = out + "super(" + t.super_traits.len().to_string() + ")"
+    for st in t.super_traits do
+      gate_sig_type_expr(&st, &mut out)
+    end
+    out = out + "methods(" + t.methods.len().to_string() + ")"
+    for m in t.methods do
+      out = out + m.sig.name.clone()
+      gate_sig_generic_params(m.sig.generic_params, &mut out)
+      gate_sig_params(m.sig.params, &mut out)
+      match m.sig.ret_type
+      when Option::Some(ty) then
+        out = out + "->"
+        gate_sig_type_expr(&ty, &mut out)
+      when Option::None then ()
+      end
+      match m.default_body
+      when FnBody::FnBlock(block) then gate_sig_block(&block, &mut out)
+      when FnBody::FnExpr(expr) then
+        out = out + "="
+        gate_sig_expr(&expr, &mut out)
+      when _ then ()
+      end
+    end
+    out = out + "assoc(" + t.assoc_types.len().to_string() + ")"
+    for at in t.assoc_types do
+      out = out + at.name.clone() + ":bounds(" + at.bounds.len().to_string() + ")"
+      for bound in at.bounds do
+        gate_sig_type_expr(&bound, &mut out)
+      end
+      match at.default
+      when Option::Some(ty) then
+        out = out + "="
+        gate_sig_type_expr(&ty, &mut out)
+      when Option::None then ()
+      end
+    end
+  when ItemKind::ItemImpl(imp) then
+    gate_sig_vis(imp.vis, &mut out)
+    out = out + "impl"
+    gate_sig_generic_params(imp.generic_params, &mut out)
+    match imp.trait_name
+    when Option::Some(tname) then out = out + "for:" + tname
+    when Option::None then ()
+    end
+    for ta in imp.trait_type_args do
+      gate_sig_type_expr(&ta, &mut out)
+    end
+    gate_sig_type_expr(&imp.for_type, &mut out)
+    gate_sig_type_expr(&imp.self_type, &mut out)
+    gate_sig_where_clause(imp.where_clause, &mut out)
+    out = out + "methods(" + imp.methods.len().to_string() + ")"
+    for m in imp.methods do
+      gate_sig_function(m, &mut out)
+    end
+    out = out + "assoc(" + imp.assoc_types.len().to_string() + ")"
+    for at in imp.assoc_types do
+      out = out + at.name.clone() + ":"
+      gate_sig_type_expr(&at.ty, &mut out)
+    end
+  when ItemKind::ItemModule(m) then
+    gate_sig_vis(m.vis, &mut out)
+    out = out + "module:" + m.name.clone()
+    if m.is_inline then out = out + "inline" end
+    out = out + "items(" + m.items.len().to_string() + ")"
+    for inner in m.items do
+      gate_sig_item(&inner, &mut out)
+    end
+  when ItemKind::ItemMacro(mac) then
+    gate_sig_vis(mac.vis, &mut out)
+    out = out + "macro:" + mac.name.clone() + "(" + mac.params.len().to_string() + ")"
+    for p in mac.params do
+      out = out + p.name.clone()
+    end
+    gate_sig_block(&mac.body, &mut out)
+  when ItemKind::ItemTypeAlias(ta) then
+    gate_sig_vis(ta.vis, &mut out)
+    out = out + "type:" + ta.name.clone()
+    gate_sig_generic_params(ta.generic_params, &mut out)
+    out = out + "="
+    gate_sig_type_expr(&ta.ty, &mut out)
+  when ItemKind::ItemConst(c) then
+    gate_sig_vis(c.vis, &mut out)
+    out = out + "const:" + c.name.clone()
+    match c.ty
+    when Option::Some(ty) then
+      out = out + ":"
+      gate_sig_type_expr(&ty, &mut out)
+    when Option::None then ()
+    end
+    out = out + "="
+    gate_sig_expr(&c.value, &mut out)
+  when ItemKind::ItemStatic(s) then
+    gate_sig_vis(s.vis, &mut out)
+    out = out + "static:" + s.name.clone()
+    if s.is_mut then out = out + "mut" end
+    out = out + ":"
+    gate_sig_type_expr(&s.ty, &mut out)
+    out = out + "="
+    gate_sig_expr(&s.value, &mut out)
+  when ItemKind::ItemCapabilityDecl(c) then
+    gate_sig_vis(c.vis, &mut out)
+    out = out + "capability:" + c.name.clone()
+    match c.parent
+    when Option::Some(parent) then out = out + ":" + parent
+    when Option::None then ()
+    end
+    out = out + "perms(" + c.permissions.len().to_string() + ")"
+    for p in c.permissions do
+      out = out + p
+    end
+  when ItemKind::ItemEffectDecl(e) then
+    gate_sig_vis(e.vis, &mut out)
+    out = out + "effect:" + e.name.clone()
+    match e.parent
+    when Option::Some(parent) then out = out + ":" + parent
+    when Option::None then ()
+    end
+  when ItemKind::ItemRationaleBlock(r) then
+    out = out + "rationale:" + r.title.clone() + "|" + r.body.clone() + "|"
+    match r.author
+    when Option::Some(author) then out = out + "author:" + author
+    when Option::None then ()
+    end
+    out = out + "tags(" + r.tags.len().to_string() + ")"
+    for tag in r.tags do
+      out = out + tag
+    end
+  when ItemKind::ItemEditionDecl(ed) then
+    out = out + "edition:" + ed.version.clone()
+  when ItemKind::ItemExternBlock(ext) then
+    out = out + "extern"
+    match ext.abi
+    when Option::Some(abi) then out = out + ":" + abi
+    when Option::None then ()
+    end
+    out = out + "items(" + ext.items.len().to_string() + ")"
+    for item in ext.items do
+      match item
+      when ExternItem::Function(efn) then
+        out = out + "fnextern:" + efn.name.clone()
+        gate_sig_generic_params(efn.generic_params, &mut out)
+        gate_sig_params(efn.params, &mut out)
+        match efn.ret_type
+        when Option::Some(ty) then
+          out = out + "->"
+          gate_sig_type_expr(&ty, &mut out)
+        when Option::None then ()
+        end
+      when ExternItem::Static(es) then
+        out = out + "staticextern:" + es.name.clone()
+        if es.is_mut then out = out + "mut" end
+        out = out + ":"
+        gate_sig_type_expr(&es.ty, &mut out)
+      end
+    end
+  end
+end
+
+# The full structural signature of a parsed program.
+def gate_signature(program: Program) -> String
+  var out = ""
+  gate_sig_program(&program, &mut out)
+  out
+end
+
+def gate_sig_program(program: Program, inout out: String) -> Unit
+  out = out + "P(" + program.items.len().to_string() + "){"
+  for item in program.items do
+    gate_sig_item(&item, &mut out)
+  end
+  out = out + "}"
+end
+
+# The tool-proof gate for one source: Result::Ok(()) when the source holds
+# the invariants, Result::Err(description) on a violation. A source that
+# does not parse is NOT part of the gate (Result::Ok — the harness counts
+# it as skipped).
+pub def format_invariant_check(source: String) -> Result[Unit, String]
+  let lex_result = tokenize(source.clone(), "")
+  let parse_out = parse(lex_result)
+  if diag_has_errors(&parse_out.diagnostics) then
+    return Result::Ok(())
+  end
+  let original = parse_out.program
+
+  let formatted = match format_source(source.clone(), default_format_config())
+  when Result::Err(e) then return Result::Err("format failed: " + e)
+  when Result::Ok(f) then f
+  end
+
+  let lex2 = tokenize(formatted.clone(), "")
+  let parse2 = parse(lex2)
+  if diag_has_errors(&parse2.diagnostics) then
+    return Result::Err("formatted output does not reparse")
+  end
+
+  let original_sig = gate_signature(original)
+  let formatted_sig = gate_signature(parse2.program)
+  if original_sig != formatted_sig then
+    return Result::Err("semantic-equivalence violation: parse(original) != parse(format(original))")
+  end
+
+  let reformatted = match format_source(formatted.clone(), default_format_config())
+  when Result::Err(e) then return Result::Err("reformat failed: " + e)
+  when Result::Ok(f) then f
+  end
+  if reformatted != formatted then
+    return Result::Err("idempotence violation: format(format(original)) != format(original)")
+  end
+
+  Result::Ok(())
 end

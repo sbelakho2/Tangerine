@@ -1,6 +1,8 @@
 # Tangerine Standard Library — std::core
 # Primitives, Option, Result, fundamental traits, prelude
 
+use std::alloc::{ArcStrong, ArcInnerWeak, alloc, alloc_array, dealloc_array, ptr_copy}
+
 enum Option[T]
   Some(T)
   None
@@ -305,7 +307,8 @@ end
 # NEVER the owned String type: a raw static data pointer must never be
 # typed as an owned String-object handle. The conversion to an OWNED String
 # is the explicit typed coercion: String::from_static (the literal path)
-# and String::from_str_view (the borrowed-view path) — and the compiler
+# and String::from_str_view (the shared-view path — the view pins a
+# snapshot, so the copy is always valid) — and the compiler
 # emits that coercion at EVERY place a String is promised, driven by the
 # DESTINATION's field/parameter/slot type: the aggregate construction paths
 # (struct/enum fields — Some("x"), S { name: "x" } — tuple elements ("x",
@@ -331,25 +334,110 @@ end
 # destructor is compiler-owned (the String drop), so source-level
 # `drop(s)` on a String value still routes through the same glue.
 # The argv/environment strings handed to the program by the OS are
-# BORROWED (never freed, never mutated) and are exposed as StrView;
+# BORROWED (never freed, never mutated) and are exposed through the
+# SHARED StrView (the views PIN their process-lifetime blocks into the
+# pinned backing — see std::env / std::args);
 # String::from_cstr / String::from_str_view / String::from_static produce
 # the OWNED String (an owning copy) when an owned value is required.
 # ———————————————————————————————————————————————————————————————
-# StrView — ownership contract (DECIDED, ):
-# StrView = non-owning UTF-8 view (trivially copyable, must not outlive its
-# source).
-# The view is a 16-byte fat value: { ptr: Ptr[u8], len: UInt }. It owns
-# NOTHING — no drop, no clone, no allocation. needs_drop=false and
-# is_trivially_copyable=true follow automatically from the compiler's
-# structural walk (is_trivially_copyable_walk / type_props_walk in
-# tg_compiler/types.tg: Ptr -> bit-copyable no-ownership, UInt -> primitive,
-# user struct fields recurse — verified). A StrView must not outlive its
-# source: the owned String it was derived from, an interned literal, or the
-# OS argv/environment block. String::as_str_view borrows the owned buffer;
-# String::from_str_view CLONES the view's bytes into an owned buffer.
-struct StrView
+# StrView — ownership contract (DECIDED — the shared/pinned backing, the
+# safe-view model; the raw {ptr,len} byte view is unsafe/FFI-only)
+# ———————————————————————————————————————————————————————————————
+# StrView is the SAFE SHARED/PINNED UTF-8 view — the StrView twin of the
+# safe Slice:
+#     StrViewBacking = { ptr: Ptr[u8], len: UInt, offset: UInt }
+#                      — the PINNED BYTE BACKING: the pinned byte buffer
+#                        (ptr) plus the view window's offset/len. The
+#                        backing owns a pinned allocation holding the
+#                        window's bytes, so the backing ITSELF keeps the
+#                        underlying storage alive.
+#     StrView        = { inner: Arc[StrViewBacking] } — the Arc-class
+#                      handle: one pointer-sized Arc to the pinned byte
+#                      backing (the 8-byte layout: { inner: Arc @ 0 }).
+#
+# The view SURVIVES its source's drop (the Arc keeps the pinned backing
+# alive), and the source's mutations never move it (the backing is the
+# separate pinned allocation). The backing's deinit releases the pinned
+# bytes when the last Arc dies. StrView is an ordinary OWNING value: it
+# can be returned, stored (Vec[StrView], struct fields), and captured —
+# no escape tracking, no access-scoping, no lifetime inference.
+#
+# Construction pins a SNAPSHOT of the window: String::as_str_view pins the
+# owned String's bytes; the OS argv/environment views (std::env /
+# std::args) pin their process-lifetime blocks through str_view_pin.
+# String::from_str_view CLONES the pinned bytes into an owned String.
+# The raw byte view (UnsafeSlice[u8] / FfiSlice — the 16-byte {ptr,len}
+# borrowed form) is the unsafe/FFI-only spelling; safe code cannot produce
+# it.
+struct StrViewBacking
   ptr: Ptr[u8]
   len: UInt
+  offset: UInt
+end
+
+struct StrView
+  inner: ArcStrong[StrViewBacking]
+end
+
+# Pin the window [offset, offset + len) of the byte buffer at `ptr` into a
+# FRESH pinned allocation (the pin copies the window — the pinned record
+# is self-contained, so the view can never dangle). The offset records the
+# window's start within the pinned buffer at pin time.
+def str_view_pin(ptr: Ptr[u8], len: UInt, offset: UInt) -> StrView
+  var buf: Ptr[u8] = Ptr::null()
+  if len > 0 then
+    buf = alloc_array[u8](len)
+    ptr_copy(ptr, buf, len)
+  end
+  let inner = alloc[ArcInnerWeak[StrViewBacking]]()
+  if inner.is_null() then
+    panic("str_view_pin: out of memory")
+  end
+  inner.write(ArcInnerWeak {
+    refcount: 1,
+    weak_count: 0,
+    data: StrViewBacking { ptr: buf, len: len, offset: offset }
+  })
+  StrView { inner: ArcStrong { ptr: inner } }
+end
+
+impl StrViewBacking
+  # The backing owns the pinned bytes: when the LAST view's Arc drops, the
+  # deinit releases the pinned allocation (the compiler's single
+  # destruction protocol — the Arc's drop_in_place runs this hook first).
+  def deinit(sink self: Self) -> Unit
+    if !self.ptr.is_null() then
+      dealloc_array[u8](self.ptr, self.len)
+    end
+  end
+end
+
+impl StrView
+  def len(self: Self) -> UInt
+    self.inner.ptr.as_mut().data.len
+  end
+
+  def is_empty(self: Self) -> Bool
+    self.len() == 0
+  end
+
+  # The pinned bytes of the view (read-only): valid for as long as this
+  # view lives — the Arc keeps the pinned backing alive (the String::as_ptr
+  # contract, extended to the shared view).
+  def ptr(self: Self) -> Ptr[u8]
+    self.inner.ptr.as_mut().data.ptr
+  end
+
+  def offset(self: Self) -> UInt
+    self.inner.ptr.as_mut().data.offset
+  end
+
+  # The sub-view [start, start + len): a fresh pinned backing holds the
+  # sub-window (the pin copies; the sub-view is self-contained).
+  def sub(self: Self, start: Int, len: UInt) -> StrView
+    let b = self.inner.ptr.as_mut().data
+    str_view_pin((b.ptr as Int + b.offset as Int + start) as Ptr[u8], len, start as UInt)
+  end
 end
 # ———————————————————————————————————————————————————————————————
 # Concurrency properties — NO user-implementable marker impls
@@ -493,13 +581,11 @@ impl String
     __intrinsic_string_as_ptr(self)
   end
 
-  # The owned buffer as a NON-OWNING view (borrows, copies nothing). The
-  # returned StrView must not outlive this String.
+  # The SHARED/PINNED view of the owned bytes: pins a snapshot of the
+  # buffer into the pinned backing. The returned StrView SURVIVES this
+  # String's drop and its growth — the Arc keeps the pinned backing alive.
   def as_str_view(self: Self) -> StrView
-    StrView {
-      ptr: self.as_ptr(),
-      len: self.len() as UInt
-    }
+    str_view_pin(self.as_ptr(), self.len() as UInt, 0)
   end
 end
 
@@ -552,6 +638,10 @@ impl str
   end
 end
 
+# EXPERIMENTAL (unstable): catch an unwinding panic. Under the stable
+# abort-only strategy a panicking closure aborts the process, so this can
+# never observe a panic; it exists only for the experimental unwind
+# machinery.
 def catch_panic[T](f: fn() -> T) -> Option[String]
   match catch_unwind(f)
   when Result::Ok(_) then Option::None
@@ -571,27 +661,40 @@ def panic(msg: String) -> Never
     line: 0,
     column: 0
   }
-  panic_unwind(info)
+  # STATE A (the stable panic strategy — ABORT-ONLY): the process
+  # terminates immediately after the panic hook runs. No unwinding, no
+  # catch, no resumption exists on the stable path — a panicking program
+  # ends. The resource-safety statement follows directly: with abort, the
+  # process ends, so there is NO partial destruction to reason about — the
+  # cleanup contract is "the process terminates; whatever the OS reclaims
+  # is reclaimed by the OS". The compiler rejects any request for a stable
+  # panic=unwind strategy (see the driver's --panic-strategy validation),
+  # and the unwind/catch APIs below are EXPERIMENTAL (unstable) surfaces
+  # that must not be relied on for cleanup claims.
+  match _panic_hook
+  when Option::Some(hook) then hook(info.clone())
+  when Option::None then default_panic_hook(info.clone())
+  end
+  __intrinsic_abort()
 end
 
 # ———————————————————————————————————————————————————————————————
-# Panic / Unwind Infrastructure
+# Panic / Unwind Infrastructure (EXPERIMENTAL — not part of the stable std)
 # ———————————————————————————————————————————————————————————————
 #
-# Supports two panic strategies selected at compile time:
-#   - abort (default): process terminates immediately
-#   - unwind: stack frames are unwound, destructors run, catch_unwind catches
+# STATE A (abort-only) is the ONLY stable panic strategy: `panic` aborts
+# the process after the hook runs. The machinery below (catch_unwind,
+# catch_panic, resume_unwind, try_invoke, panic_unwind, begin_unwind) is
+# EXPERIMENTAL/UNSTABLE: it is kept for API compatibility (std::bench and
+# std::web_ext use it), it is not part of the stable std contract, and it
+# makes NO cleanup claims. Under the stable abort-only strategy a panicking
+# closure terminates the process — catch_unwind can never observe a panic.
 #
-# The runtime maintains a thread-local chain of "catch frames" pushed by
-# catch_unwind.  On panic, if unwind is enabled the runtime walks the
-# chain, invokes Drop on every local, and resumes at the closest frame.
-# If no frame exists, it aborts.
-#
-# NOTE (ownership): the unwind path does NOT yet carry semantic cleanup
+# NOTE (ownership): the unwind path does NOT carry semantic cleanup
 # edges — generated MirDeinit chains run only on normal control flow. A
 # panic that unwinds through a frame skips resource finalizers. Until the
-# unwind cleanup edge is implemented, panic=unwind must not be used for
-# programs with live owned resources (default remains abort).
+# unwind cleanup edge is implemented, the unwind machinery must not be used
+# for programs with live owned resources (the stable strategy is abort).
 
 struct PanicInfo
   message: String
@@ -653,8 +756,10 @@ static mut _catch_frame_stack: Vec[CatchFrame] = Vec::new()
 @thread_local
 static mut _current_panic: Option[PanicPayload] = Option::None
 
-# Invoke a closure, catching any panic.
-# Returns Result::Ok(value) on success, Result::Err(payload_msg) on panic.
+# EXPERIMENTAL (unstable): invoke a closure, catching any panic under the
+# experimental unwind machinery. Returns Result::Ok(value) on success,
+# Result::Err(payload_msg) on panic. Under the stable abort-only strategy
+# a panicking closure aborts the process — this can never return Err.
 def catch_unwind[T](f: fn() -> T) -> Result[T, String]
   let frame_id = _catch_frame_stack.len()
   _catch_frame_stack.push(CatchFrame { id: frame_id, active: true })
@@ -703,7 +808,9 @@ def begin_unwind(payload: PanicPayload) -> Unit
   __intrinsic_abort()
 end
 
-# Panic entry point (called by the `panic` intrinsic when strategy = unwind)
+# EXPERIMENTAL (unstable): the unwind-strategy panic entry (the stable
+# `panic` no longer calls this — under STATE A it aborts directly). This
+# remains only for the experimental unwind machinery.
 def panic_unwind(info: PanicInfo) -> Unit
   # Invoke the panic hook
   match _panic_hook
@@ -717,7 +824,9 @@ end
 extern def __intrinsic_longjmp(frame_id: Int) -> Unit
 extern def __intrinsic_abort() -> Unit
 
-# Convenience: resume_unwind re-panics with a payload (useful after catch_unwind)
+# EXPERIMENTAL (unstable): re-panic with a payload (useful after
+# catch_unwind under the experimental unwind machinery). Not part of the
+# stable std; under the stable abort-only strategy this aborts the process.
 def resume_unwind(msg: String) -> Unit
   begin_unwind(PanicPayload::Message(msg))
 end
@@ -1110,16 +1219,17 @@ impl String
     result
   end
 
-  # Clone a StrView's bytes into a NEW OWNED String buffer (the view
-  # borrows; the result owns — same ownership contract as every String
+  # Clone a StrView's PINNED bytes into a NEW OWNED String buffer (the
+  # view is the shared/pinned form — its Arc keeps the pinned backing
+  # alive; the result owns — same ownership contract as every String
   # constructor). The OS-argv/environment views (the CStringView path)
-  # convert through here when an owning value is required; the view must
-  # stay alive for the duration of the copy.
+  # convert through here when an owning value is required; the pinned
+  # backing guarantees the bytes stay valid for the duration of the copy.
   def from_str_view(self: StrView) -> String
     var result = String::new()
     var i = 0
-    while i < self.len do
-      let byte = *(self.ptr.offset(i))
+    while i < self.len() do
+      let byte = *(self.ptr().offset(i))
       result.push(byte as Char)
       i = i + 1
     end

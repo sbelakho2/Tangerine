@@ -1,0 +1,102 @@
+# tests/rand_entropy_test.tg — the system entropy contract (reviewer
+# item 27).
+#
+# system_random_bytes' getrandom path is the OFFSET LOOP:
+#   n > 0  -> the chunk advances the offset (offset += n) and the loop
+#            fills the rest of the buffer;
+#   n < 0  -> EINTR (the retryable transient) is retried, bounded by
+#            MAX_GETRANDOM_RETRIES — a persistent failure falls back to
+#            /dev/urandom per the contract;
+#   n == 0 -> the ZERO-PROGRESS ERROR, never the offset += 0 spin
+#            (the same guard protects the /dev/urandom path).
+#
+# GATE Y — the fault-injection tests: the module-level replay hook
+# (__tg_rand_fault_active / __tg_rand_fault_seq / __tg_rand_fault_next)
+# replays the mocked getrandom sequence deterministically — no real
+# syscalls involved. Entry semantics: > 0 = a short read of that many
+# bytes, -1 = the injected EINTR, -2 = "the rest", 0 = zero progress.
+# The replayed reads fill the deterministic pattern (index + 1) % 256,
+# so the full initialization is provable byte by byte.
+
+use std::core::{Vec, String, Unit, Result, Option, UInt, Int}
+use std::test::*
+use std::rand::{
+  system_random_bytes, getrandom_syscall,
+  __tg_rand_fault_active, __tg_rand_fault_seq, __tg_rand_fault_next
+}
+
+def arm_replay(seq: [Int]) -> Unit
+  __tg_rand_fault_active = true
+  __tg_rand_fault_seq = Vec::new()
+  var i = 0
+  while i < seq.len() do
+    __tg_rand_fault_seq.push(seq[i])
+    i = i + 1
+  end
+  __tg_rand_fault_next = 0
+end
+
+# THE MOCKED SEQUENCE (Gate Y): 2 bytes, EINTR, 3 bytes, the rest — the
+# FULL initialization of a 32-byte buffer. The EINTR entry is consumed
+# WITHOUT advancing the buffer (the retry shape); the short reads
+# advance the offset; "the rest" fills the remainder. Every byte must
+# carry the replayed pattern — a short-read gap would leave zeros.
+@test
+def test_getrandom_short_read_eintr_rest_completes_init() -> Unit
+  arm_replay([2, -1, 3, -2])
+  mut bytes: [u8; 32] = [0u8; 32]
+  let r = system_random_bytes(&mut bytes)
+  __tg_rand_fault_active = false
+
+  assert_ok(r)
+  var i = 0
+  while i < 32 do
+    assert_eq(bytes[i], ((i + 1) % 256) as u8)
+    i = i + 1
+  end
+  # All four entries were consumed: 2 (short read), -1 (EINTR retried),
+  # 3 (short read), -2 (the rest).
+  assert_eq(__tg_rand_fault_next, 4)
+end
+
+# The zero-progress outcome is the ERROR, not the loop: the syscall
+# makes no progress, returns the error immediately, and the queue is
+# NOT consumed further.
+@test
+def test_getrandom_zero_progress_is_error_not_loop() -> Unit
+  arm_replay([0])
+  mut bytes: [u8; 16] = [0u8; 16]
+  let r = getrandom_syscall(&mut bytes)
+  __tg_rand_fault_active = false
+
+  match r
+  when Result::Err(_) then ()
+  when Result::Ok(_) then assert_false(true)
+  end
+  assert_eq(__tg_rand_fault_next, 1)
+end
+
+# The persistent-EINTR bound: MAX_GETRANDOM_RETRIES consecutive EINTR
+# outcomes fail the syscall (the fallback contract then routes
+# system_random_bytes to /dev/urandom) — a wedged RNG can never spin
+# the retry forever.
+@test
+def test_getrandom_persistent_eintr_is_bounded() -> Unit
+  arm_replay([-1, -1, -1, -1, -1, -1, -1, -1])
+  mut bytes: [u8; 16] = [0u8; 16]
+  let r = getrandom_syscall(&mut bytes)
+  __tg_rand_fault_active = false
+
+  match r
+  when Result::Err(_) then ()
+  when Result::Ok(_) then assert_false(true)
+  end
+  assert_eq(__tg_rand_fault_next, 8)
+end
+
+# The fault hook defaults to OFF: the armed flag's false default is the
+# contract — a normal run never sees the injected outcomes.
+@test
+def test_rand_fault_hook_defaults_off() -> Unit
+  assert_false(__tg_rand_fault_active)
+end

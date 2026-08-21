@@ -977,6 +977,13 @@ struct JoinHandle
   # keeps the executor (and the task's results and join waiters) alive
   # even after the spawning Executor is dropped or moved.
   executor: Arc[ExecutorInner]
+  # THE REGISTER-ONCE WAITER ID (the async closure): the handle's OWN join
+  # waiter registration — set at the FIRST Pending poll (a re-poll while
+  # the task is still running never appends a duplicate waiter), cleared
+  # never (the registration lives until the task's completion detaches the
+  # waiter vector, or the handle's Drop unregisters the exact entry). The
+  # id comes from the executor's next_waiter_id allocator.
+  waiter_id: Option[UInt]
 end
 
 impl JoinHandle
@@ -987,6 +994,37 @@ impl JoinHandle
     when Option::Some(TaskState::Cancelled) then true
     when Option::Some(TaskState::Failed) then true
     when _ then false
+    end
+  end
+
+  # THE OBSERVER CLONE (the Gate V multi-observer form): a clone is a NEW
+  # observer of the same task — it shares the task id and the executor Arc
+  # clone, but it starts with NO registered waiter (waiter_id: None — its
+  # first Pending poll registers its OWN join waiter exactly once, and its
+  # own Drop unregisters it).
+  def clone(self: JoinHandle) -> JoinHandle
+    JoinHandle {
+      task_id: self.task_id,
+      executor: self.executor.clone(),
+      waiter_id: Option::None
+    }
+  end
+end
+
+impl Drop for JoinHandle
+  def drop(inout self: JoinHandle) -> Unit
+    # THE DROP UNREGISTER: an observer that leaves before the task's
+    # completion removes its OWN waiter entry by the waiter id — the
+    # task's completion never wakes a dropped observer's stale waker, and
+    # the waiter map holds no dead registration (after every handle to a
+    # finished task drops, the map is empty).
+    match self.waiter_id
+    when Option::Some(id) then
+      unsafe "executor inner access — the handle's Arc clone keeps the executor alive" do
+        let exec = self.executor.ptr.as_mut()
+        exec.unregister_join_waiter(self.task_id, id)
+      end
+    when Option::None then ()
     end
   end
 end
@@ -1002,29 +1040,36 @@ impl Future for JoinHandle
   def poll(inout self, inout cx: Context) -> Poll[Result[Unit, String]]
     unsafe "executor inner access — the handle's Arc clone keeps the executor alive" do
       let exec = self.executor.ptr.as_mut()
-      match exec.task_results.remove(&self.task_id)
-      when Option::Some(_) then
+      # THE NON-CONSUMPTIVE COMPLETION (the async closure): the terminal
+      # TaskState is the authoritative completion — the poll completes on
+      # the terminal state and NEVER consumes the ()-result marker
+      # destructively. The old task_results.remove let the FIRST handle
+      # consume the marker and left every OTHER observer of the same task
+      # stuck Pending forever (its re-poll saw the Completed state with no
+      # marker and re-registered a waiter that nothing would ever wake) —
+      # the multi-observer form: all N handles to the same task become
+      # Ready, each observing the same terminal state.
+      match exec.task_states.get(&self.task_id)
+      when Option::Some(TaskState::Completed) then
         Poll::Ready(Result::Ok(()))
-      when Option::None then
-        # The terminal states: the cancelled/failed task's join completes
-        # with the error (the finish_task path woke this poll — a handle
-        # that registered a waiter before the cancellation is re-polled
-        # and observes the terminal state here).
-        match exec.task_states.get(&self.task_id)
-        when Option::Some(TaskState::Cancelled) then
-          let cancel_result: Result[Unit, String] = Result::Err("task cancelled".to_string())
-          Poll::Ready(cancel_result)
-        when Option::Some(TaskState::Failed) then
-          let fail_result: Result[Unit, String] = Result::Err("task failed".to_string())
-          Poll::Ready(fail_result)
-        when _ then
-          # Register interest: APPEND this handle's waiter to the task's
-          # waiter vector (the completion detaches the whole vector and
-          # wakes every member — a second handle to the same task never
-          # overwrites this registration).
-          exec.register_join_waiter(self.task_id, cx.waker.clone())
-          Poll::Pending
+      when Option::Some(TaskState::Cancelled) then
+        let cancel_result: Result[Unit, String] = Result::Err("task cancelled".to_string())
+        Poll::Ready(cancel_result)
+      when Option::Some(TaskState::Failed) then
+        let fail_result: Result[Unit, String] = Result::Err("task failed".to_string())
+        Poll::Ready(fail_result)
+      when _ then
+        # Register interest ONCE — the waiter_id guard: a re-poll while
+        # the task is still running never appends a duplicate waiter (the
+        # old form appended a waiter on EVERY Pending poll). The id comes
+        # from the executor's next_waiter_id allocator and is how the
+        # handle's Drop unregisters the exact entry.
+        if self.waiter_id.is_none() then
+          let id = exec.alloc_waiter_id()
+          exec.register_join_waiter_with_id(self.task_id, id, cx.waker.clone())
+          self.waiter_id = Option::Some(id)
         end
+        Poll::Pending
       end
     end
   end
@@ -1124,6 +1169,15 @@ struct ExecutorInner
   # reactor/the cooperative waiter lists — a worker never touches those.
   external_wake_queue: Mutex[Vec[UInt]]
   external_wake_cond: Condvar
+  # THE EXTERNAL-PENDING COUNT (the async closure): the wakes enqueued
+  # into the external inbox but not yet drained. Incremented at the
+  # external_wake enqueue, decremented at the drain — both under the
+  # queue's lock, so the count is coherent with the inbox contents. The
+  # deterministic run's deadlock verdict consults it: an empty ready
+  # queue + empty timer heap is a deadlock ONLY when the count is zero —
+  # a nonzero count means a blocking-pool worker's wake is in flight
+  # (the pool completes in REAL time) and the executor must not stop.
+  external_pending: UInt
 end
 
 # The Executor is a thin Arc wrapper over the inner — the public API
@@ -1239,7 +1293,8 @@ def executor_new() -> Executor
       virtual_time: Instant::now(),
       rand_state: 0,
       external_wake_queue: Mutex::new(Vec::new()),
-      external_wake_cond: Condvar::new()
+      external_wake_cond: Condvar::new(),
+      external_pending: 0
     })
   }
 end
@@ -1272,7 +1327,8 @@ impl Executor
     
     JoinHandle {
       task_id: id,
-      executor: self.inner.clone()
+      executor: self.inner.clone(),
+      waiter_id: Option::None
     }
   end
   
@@ -1297,7 +1353,8 @@ impl Executor
     
     JoinHandle {
       task_id: id,
-      executor: self.inner.clone()
+      executor: self.inner.clone(),
+      waiter_id: Option::None
     }
   end
   
@@ -1355,19 +1412,34 @@ impl Executor
 
           # Advance virtual time or block on I/O/timers
           if inner.deterministic then
+            # THE CANCELLED-ROOT PRUNING before the next virtual
+            # deadline (the async closure): check_timers_deterministic's
+            # loop pops the lazy-cancelled roots unconditionally, so the
+            # next deadline is chosen from a LIVE root — a cancelled
+            # entry can never set the clock (the old timer_heap[0] read
+            # could pick a cancelled root and advance virtual_time to a
+            # deadline that must never drive the run).
+            inner.check_timers_deterministic()
             if !inner.timer_heap.is_empty() then
               # Advance to next timer
               let min_entry = inner.timer_heap[0]
               inner.virtual_time = min_entry.deadline
               inner.check_timers_deterministic()
             else
-              # Drain the external inbox before the deadlock verdict: the
-              # blocking pool completes in REAL time, so a worker's wake
-              # may be in flight even though the ready queue was empty.
-              inner.drain_external_wakes()
-              # No ready tasks and no timers in deterministic mode == deadlock or finished
-              if inner.ready_queue.is_empty() then
-                inner.running = false
+              # THE DEADLOCK VERDICT — the external-pending guard
+              # (the async closure): the blocking pool completes in REAL
+              # time, so the empty ready queue + empty timer heap is a
+              # deadlock ONLY when no external wake is in flight. A
+              # worker's wake enqueued since the loop-top drain (the
+              # external_pending count > 0) means work is still
+              # progressing — the executor must NOT stop: the loop-top
+              # drain of the next iteration delivers the wake and the
+              # task resumes.
+              if inner.external_pending == 0 then
+                inner.drain_external_wakes()
+                if inner.ready_queue.is_empty() && inner.external_pending == 0 then
+                  inner.running = false
+                end
               end
             end
           else
@@ -1494,6 +1566,10 @@ impl ExecutorInner
   def external_wake(inout self, task_id: UInt) -> Unit
     let mut guard = self.external_wake_queue.lock()
     guard.push(task_id)
+    # THE EXTERNAL-PENDING INCREMENT (the async closure): counted under
+    # the same lock as the push — the count is coherent with the inbox
+    # contents, so the deterministic deadlock verdict can rely on it.
+    self.external_pending = self.external_pending + 1
     drop(guard)
     self.external_wake_cond.notify_one()
   end
@@ -1506,6 +1582,11 @@ impl ExecutorInner
     let mut pending = Vec::new()
     while !guard.is_empty() do
       pending.push(guard.remove(0))
+      # THE EXTERNAL-PENDING DECREMENT (the async closure): one per
+      # drained wake, under the same lock as the enqueue's increment.
+      if self.external_pending > 0 then
+        self.external_pending = self.external_pending - 1
+      end
     end
     drop(guard)
     for task_id in pending do
@@ -1555,21 +1636,25 @@ impl ExecutorInner
     # ready task or re-polling a finished one. A CANCELLED entry (the
     # owning future was dropped, or the task was cancelled) is skipped
     # lazily — it can never wake its task.
+    #
+    # THE CANCELLED-ROOT PRUNING (the async closure): a lazy-cancelled
+    # entry AT THE HEAP ROOT is popped unconditionally — REGARDLESS of
+    # its deadline. The cancelled root must never be chosen as the next
+    # virtual deadline (the run loop reads the root to advance the
+    # clock): pruning it here keeps the virtual time driven only by
+    # LIVE deadlines.
     loop do
-      match timer_heap_peek_deadline(&self.timer_heap)
-      when Option::Some(deadline) then
-        if deadline <= self.virtual_time then
-          match timer_heap_pop_min(&mut self.timer_heap)
-          when Option::Some(entry) then
-            if !entry.cancelled then
-              self.wake_task(entry.task)
-            end
-          when Option::None then break
-          end
-        else
-          break
-        end
-      when Option::None then break
+      if self.timer_heap.is_empty() then
+        break
+      end
+      let root = self.timer_heap[0]
+      if root.cancelled then
+        let _ = timer_heap_pop_min(&mut self.timer_heap)
+      elsif root.deadline <= self.virtual_time then
+        let entry = timer_heap_pop_min(&mut self.timer_heap).unwrap()
+        self.wake_task(entry.task)
+      else
+        break
       end
     end
   end
@@ -1669,17 +1754,51 @@ impl ExecutorInner
   # a unique WaiterId, so each member of the vector is distinguishable
   # and the terminal paths wake every member of the vector exactly once.
   def register_join_waiter(inout self, task_id: UInt, waker: Waker) -> Unit
+    let id = self.alloc_waiter_id()
+    self.register_join_waiter_with_id(task_id, id, waker)
+  end
+
+  # Register a join waiter with a CALLER-ALLOCATED id: the JoinHandle's
+  # register-once poll allocates the id itself (the handle stores it in
+  # waiter_id and the Drop unregisters the exact entry with it). The
+  # append is the same multi-waiter never-overwrite push.
+  def register_join_waiter_with_id(inout self, task_id: UInt, id: UInt, waker: Waker) -> Unit
     let waiter = JoinWaiter {
-      id: self.next_waiter_id,
+      id: id,
       waker: waker
     }
-    self.next_waiter_id = self.next_waiter_id + 1
     match self.join_waiters.get_mut(&task_id)
     when Option::Some(waiters) then waiters.push(waiter)
     when Option::None then
       let mut fresh = Vec::new()
       fresh.push(waiter)
       let _ = self.join_waiters.insert(task_id, fresh)
+    end
+  end
+
+  # THE DROP-TIME UNREGISTER: a handle that leaves before the task's
+  # completion removes its OWN waiter entry (matched by the waiter id) —
+  # the completion's detach never wakes a dropped observer's stale waker.
+  # The task's waiter vector is taken out, the matching entry is dropped,
+  # and the vector goes back in only if waiters remain (an emptied entry
+  # leaves the map — after every handle to a finished task drops, the
+  # waiter map is empty). Single-owner discipline (the same confinement
+  # the join_waiters map documents): the handle's Drop runs on the owner
+  # thread, never concurrently with a registration or the detach.
+  def unregister_join_waiter(inout self, task_id: UInt, waiter_id: UInt) -> Unit
+    match self.join_waiters.remove(&task_id)
+    when Option::Some(waiters) then
+      mut kept = Vec::new()
+      while waiters.len() > 0 do
+        let waiter = waiters.remove(0)
+        if waiter.id != waiter_id then
+          kept.push(waiter)
+        end
+      end
+      if kept.len() > 0 then
+        let _ = self.join_waiters.insert(task_id, kept)
+      end
+    when Option::None then ()
     end
   end
 
@@ -2086,6 +2205,16 @@ struct Receiver[T]
 end
 
 pub def channel[T](capacity: UInt) -> (Sender[T], Receiver[T])
+  # THE ZERO-CAPACITY REJECTION (the async closure): channel(0) is
+  # rejected with the explicit error — a zero-capacity bounded channel
+  # would deadlock the cooperative runtime (a sender with no buffer
+  # slot can only progress when the receiver polls, and a receiver can
+  # only poll when the executor advances it — the real rendezvous
+  # semantics are the documented future work). The bounded channel
+  # requires capacity >= 1.
+  if capacity == 0 then
+    panic("channel: capacity must be >= 1 (zero-capacity rendezvous channels are not supported)")
+  end
   let inner = Arc::new(ChannelInner[T] {
     buffer: VecDeque[T]::new(),
     capacity: capacity,
@@ -2416,7 +2545,7 @@ pub def join[A: Future, B: Future](a: A, b: B) -> JoinFuture[A, B]
     a: a, b: b,
     a_result: Option::None,
     b_result: Option::None
-  end
+  }
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -3050,6 +3179,13 @@ impl CancellationToken
   # check and the registration push (see the race note above — a child
   # registered during the parent's cancellation always observes the
   # cancelled state).
+  #
+  # THE LATE-CHILD FIX (the async closure): when the parent is ALREADY
+  # cancelled, the child is created ALREADY CANCELLED and is NOT
+  # inserted into the parent's children vector — the insertion would be
+  # a leak (the cancelled parent's detach-and-propagate already ran, so
+  # the dead child would sit in the vector forever, and the next
+  # cancel() — an idempotent no-op flag swap — would never reach it).
   def child(self: CancellationToken) -> CancellationToken
     let c = cancellation_token_new()
     let inner = self.inner.ptr.as_ref()
@@ -3057,8 +3193,9 @@ impl CancellationToken
     let mut guard = inner.children.lock()
     if inner.cancelled.load() then
       c_inner.cancelled.store(true)
+    else
+      guard.push(c.inner.clone())
     end
-    guard.push(c.inner.clone())
     c
   end
 

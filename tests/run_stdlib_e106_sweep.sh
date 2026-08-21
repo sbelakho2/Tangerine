@@ -5,7 +5,15 @@
 # (reviewer item 16) behind docs/current/stdlib_reference.md "Completeness
 # Status".
 #
-# Every shipped std module (std/*.tg, currently 133 files) must:
+# THE COMPLETENESS GATE RUNS FIRST: tests/run_stdlib_completeness_gate.sh
+# (the reviewer item 32 automated enumeration — every std/*.tg file must
+# have a contract entry in docs/current/stdlib_contracts.toml with a
+# family + proof tests; a new std file FAILS until it receives one; the
+# completeness doc and the public-API manifest are regenerated and the
+# committed artifacts are diffed). It is compiler-free, so it runs before
+# the binary check below.
+#
+# Then every shipped std module (std/*.tg, currently 131 files) must:
 #   1. PASS `tg check` — the driver's check command (driver.tg cmd_check,
 #      stop_after = StopAfter::Mir) runs the FULL semantic pipeline per
 #      module: lex/parse, the imported-dependency merge, the @cfg target
@@ -57,6 +65,14 @@ set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # shellcheck source=scripts/bootstrap_helpers.sh
 source "$ROOT/scripts/bootstrap_helpers.sh"
+
+# ── the item-32 completeness gate (enumeration + contracts + generated
+# ── model + public-API manifest) — REQUIRED, runs before any module check.
+if ! bash "$ROOT/tests/run_stdlib_completeness_gate.sh"; then
+  bh_err "e106 sweep: the stdlib completeness gate FAILED (an un-contracted module, a drifted completeness model, or a broken public-API extraction)"
+  exit 1
+fi
+bh_log "e106 sweep: stdlib completeness gate OK (enumeration + contracts + generated model + API manifest)"
 
 COMPILER="${1:-$ROOT/build/tg_stage2}"
 SCRATCH="${2:-$ROOT/build/.stdlib_e106_sweep}"

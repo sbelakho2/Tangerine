@@ -92,6 +92,11 @@ admin.get("/dashboard", dashboard)
 
 ## Middleware
 
+There is deliberately **no recovery middleware**: the panic state is
+ABORT-ONLY (a panic aborts the process; there is no catch/panic-recovery
+machinery), so a catch-based recovery middleware cannot be implemented.
+The honest recovery policy is process restart by the supervisor.
+
 ### Built-in Middleware
 
 ```tangerine

@@ -1144,6 +1144,7 @@ public final class Parser {
             } else if case .integer(let value) = peekKind() {
                 let span = currentSpan
                 advance()
+                checkIntegerLiteralRange(value, span: span)
                 args.append(.constExpr(.intLit(value, span), span))
             } else {
                 args.append(parseTypeExpr())
@@ -3103,6 +3104,7 @@ public final class Parser {
         switch peekKind() {
         case .integer(let s):
             advance()
+            checkIntegerLiteralRange(s, span: start)
             return .intLit(s, start)
 
         case .float(let s):
@@ -4531,6 +4533,7 @@ public final class Parser {
         // Literal patterns
         if case .integer(let s) = peekKind() {
             advance()
+            checkIntegerLiteralRange(s, span: start)
             let litExpr = Expr.intLit(s, start)
             return checkOrPattern(.literal(litExpr, start.merged(with: currentSpan)), start: start)
         }
@@ -4802,5 +4805,22 @@ public final class Parser {
         }
         cursor = saved
         return result
+    }
+
+    // MARK: - INV-PARSE-003 gate (E9030)
+
+    /// Rejects integer literals whose magnitude does not fit the host Int
+    /// range. The literal is carried as a string through the AST; without
+    /// this gate an overflowing literal would silently truncate to 0 at MIR
+    /// lowering (MIRLowering.parseInt `?? 0`).
+    private func checkIntegerLiteralRange(_ literal: String, span: Span) {
+        if !NumericLiteralGuard.fitsHostRange(literal) {
+            diagnostics.error(
+                code: "E9030",
+                message: "integer literal '\(literal)' does not fit the host integer range (UInt64 domain) (INV-PARSE-003)",
+                span: span,
+                stage: .parser
+            )
+        }
     }
 }

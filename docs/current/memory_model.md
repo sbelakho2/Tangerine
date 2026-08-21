@@ -248,6 +248,17 @@ terminators carrying the place, the **verified** registered deinit name
 (fail-closed: an unverifiable name panics at plan construction), and
 target/unwind.
 
+**The abort-path resource statement (STATE A — panic=abort):** the
+destruction protocol above runs ONLY on normal control flow. A panic
+terminates the process after the panic hook (`__intrinsic_abort`); the
+abort path runs NO finalizers, NO defers, and NO structural cleanup — it
+does not unwind. No partial-destruction claim is made: the contract is
+"the process ends; whatever the OS reclaims is reclaimed by the OS".
+Code that must observe cleanup must use `Result` for recoverable failure
+and must not rely on panic paths (see error_handling.md §Panic and
+Unrecoverable Errors). The compiler rejects `--panic-strategy unwind`;
+the catch/unwind APIs are experimental and make no cleanup claims.
+
 ### 4.4 Partial moves: the place-level registry and the masked glue
 
 There **is** per-place partial-move state. The checker's pattern-binding
@@ -351,8 +362,12 @@ move/sink (transfer).
   trivially copyable.
 - **No:** `String` and `str` (the owned String — a bit-copy would
   duplicate the owned buffer without the required clone), the builtin
-  containers (Vec/Array/Map/Set/Slice — including Vec's registered shape
+  containers (Vec/Array/Map/Set — including Vec's registered shape
   `{ ptr: Ptr[T], len, cap }`, whose Ptr field must not be walked),
+  the RAW Slice view (UnsafeSlice — the builtin Slice's `{ptr,len}` words
+  are structurally copyable but the view borrows; the raw view is
+  unsafe/FFI-only), the SAFE shared/pinned views (SharedSlice/StrView —
+  the ArcStrong field makes them owning, never bit-copyable),
   the owning smart pointers (Box/Rc by LangItems id; UniquePtr/WeakRc/
   ArcStrong/WeakArc by name), resources and capabilities
   (`TypeKind::Resource`/`Capability` are never bit-copyable), closures,
@@ -539,8 +554,10 @@ are **gone**. The shape is:
   allocator's per-class free list). `requires_drop_glue=true` for the
   String split; there is no unbounded arena growth for long-running
   apps.
-  **Literals are the static StrView**: a string literal expression lowers
-  to the interned static bytes behind a raw label; the conversion to an
+  **Literals are the static string view**: a string literal expression
+  lowers to the interned static bytes behind a raw label (the MIR
+  internal `Type::StaticStrPtr` — distinct from the shared StrView, the
+  std's Arc-backed view); the conversion to an
   owned String is the explicit owned clone (`String::from_static`, the
   `string_from_static` intrinsic) and the compiler inserts it at every
   owned-String demand site (by-value String parameters — the
@@ -594,18 +611,47 @@ are **gone**. The shape is:
   **`Tuple(Vec[Type])`**; **`Var(TypeVarId)`**; **`Param(String)`**;
   **`Error`**.
 - **`Slice`** is a registered builtin Opaque generic Adt (the LangItems
-  `slice` id is the special-behavior selector) — the non-owning 16-byte
-  `{ ptr: Ptr[T], len: UInt }` view over heap data (`slice_view_layout`
-  in layout_engine.tg; the contract in std/collections.tg). `str` is the
-  registered string escape spelling (`__intrinsic_string_as_str`),
+  `slice` id is the special-behavior selector) — the **RAW view**: the
+  16-byte borrowed `{ ptr: Ptr[T], len: UInt }` fat value
+  (`slice_view_layout` in layout_engine.tg), source-spelled
+  **`UnsafeSlice[T]`** (the registered name stays `Slice` for the
+  name-based layout/MIR matching). The raw view is the **unsafe/FFI-only
+  form**: safe code cannot produce it, and its escapes are the P0-SL-
+  rejected cases (the escape channels in types.tg + the live-view
+  registry in resource_check.tg). The only raw views safe code ever sees
+  are the compiler-scoped loop-consumed iterable forms (chars/bytes/
+  split/iter/keys/values — consumed by the enclosing for-loop) and the
+  compiler-manufactured literal coercion behind `vec!`.
+  **The SAFE Slice is the shared/pinned form** — the std-declared
+  `SharedSlice[T] { inner: ArcStrong[SliceBacking[T]] }` (std/collections.tg;
+  the reviewer's shared/pinned backing — no lifetime inference). The
+  backing record = the pinned buffer + the window's offset/len:
+  `SliceBacking[T] = { ptr: Ptr[T] @ 0, len: UInt @ 8, offset: UInt @ 16 }`
+  (24 bytes). The Arc keeps the pinned backing alive: the view **survives
+  the original owner's drop**, and the owner's capacity-changing
+  mutations never move it (the backing is the separate pinned allocation
+  — the mutation allocates a fresh pinned backing for the new buffer, the
+  views keep the old one alive). **Actual layout: the safe Slice value is
+  8 bytes — one pointer-sized Arc handle `{ inner @ 0 }` (the Arc-class
+  `{ptr,len}`: the handle to the 16-byte-shaped pinned record); the raw
+  view is 16 bytes `{ ptr @ 0, len @ 8 }`.** The pin operations
+  (`slice_pin` / `str_view_pin`) copy the window into the pinned
+  allocation; the backing's deinit releases it when the last Arc dies.
+  The shared forms are ordinary owning values (no escape tracking). `str`
+  is the registered string escape spelling (`__intrinsic_string_as_str`),
   mapping to the `String` primitive. **The String/StrView distinction is
-  implemented**: `StrView` (std/core.tg) is the non-owning
-  `{ ptr: Ptr[u8], len: UInt }` view — bit-copyable, no drop, no clone —
-  that borrows string data (owned `String` buffers, interned literals, OS
-  argv); `String::as_str_view` borrows, `String::from_str_view` clones
-  into an owned `String`. The hash/eq dispatch selects the view through
-  the LangItems `str_view` TypeId (mono.tg's key selection), with a
-  name-selection fallback only for a snapshot that lacks the
+  implemented**: `StrView` (std/core.tg) is the SAFE shared/pinned
+  UTF-8 view — `StrView { inner: ArcStrong[StrViewBacking] }` (8 bytes),
+  with `StrViewBacking = { ptr: Ptr[u8] @ 0, len: UInt @ 8, offset: UInt @
+  16 }` (24 bytes — the pinned byte backing + the offset/len). The StrView
+  survives its source String's drop and growth (the pinned byte backing
+  keeps the bytes alive; the backing's deinit releases them at the last
+  Arc's drop). `String::as_str_view` pins the owned String's bytes;
+  `String::from_str_view` clones the pinned bytes into an owned `String`.
+  The raw byte view (16-byte `{ptr,len}`) exists only as the unsafe/FFI
+  form (`UnsafeSlice[u8]` / `FfiSlice`). The hash/eq dispatch selects the
+  view through the LangItems `str_view` TypeId (mono.tg's key selection),
+  with a name-selection fallback only for a snapshot that lacks the
   registration; `str` maps to the `String` primitive.
 
 Normalization at unification: aliases resolve to their underlying type,
@@ -905,6 +951,7 @@ compiler-owned structural field cleanup — exactly once.
 | Zero-inference fail-closed: unsolved generic parameters are hard errors; the monomorphizer performs no inference | types.tg / mono.tg §13 |
 | LangItems built once, structurally unique; semantic identity by DefId/TypeId/TraitId — never strings | types.tg / ids.tg §8 |
 | String is the OWNED String object: one pointer to the 32-byte {data,len,cap,stride} header; the string_* intrinsics dispatch to the String ABI (`_tg_string_*`), never the Array ABI; literals are the static StrView and convert to owned Strings via `string_from_static` at every owned-String demand site (by-value String params, String destinations, Vec[String] literals, concat, to_string, clone); the destructor `_tg_string_drop` frees object + buffer through `_tg_mem_free` (per-class free-list reclaim) | runtime.tg "String Object Runtime"; codegen.tg `resolve_intrinsic_id` / `string_abi_intrinsic_name`; mir.tg `mir_call_arg_needs_owned_string` / `lower_string_literal_to_owned`; std/core.tg String contract + `impl Clone/Eq/Hash for String` |
+| THE SAFE VIEW MODEL: the safe Slice/StrView are the SHARED/PINNED forms — `SharedSlice[T] { inner: ArcStrong[SliceBacking[T]] }` / `StrView { inner: ArcStrong[StrViewBacking] }` — the Arc-class `{ptr,len}`: 8-byte Arc handle to the 24-byte pinned backing `{ ptr @ 0, len @ 8, offset @ 16 }` (the pinned buffer + the window's offset/len). The backing keeps the storage alive (the view survives the owner's drop and its capacity-changing mutations — the backing is the separate pinned allocation); the backing's deinit releases the pinned allocation at the last Arc's drop. The shared forms need NO escape tracking (ordinary owning values). The RAW view — the builtin Slice (16-byte `{ ptr @ 0, len @ 8 }`), source-spelled UnsafeSlice — is unsafe/FFI-only: safe code cannot produce it; its escapes are the P0-SL-rejected cases (return/store/capture channels in types.tg; the live-view registry + IterationPlan mutation scan in resource_check.tg). Safe APIs return the shared form (Vec::as_slice / String::as_str_view — pin-copies); FFI surfaces use the raw form (FfiSlice); the for-loop iterable forms stay compiler-scoped and loop-consumed | std/collections.tg "THE SAFE VIEW MODEL"; std/core.tg StrView contract; types.tg `is_slice_view_type_of` / `is_shared_view_type_of` / `check_no_escaping_slice`; resource_check.tg `slice_views` registry / `check_slice_view_backing_mutation` |
 | Type-property graph algorithm with inline-recursion diagnostics; memoized per concrete args | types.tg §7 |
 | Monomorphization: seen-set, MAX_MONO_INSTANCES, residual-param aborts | mono.tg §13 |
 | Map/set ownership ops: every key-operating map/set intrinsic site injects the CONCRETE `Hash::hash` / `Eq::eq` dispatch calls (core-ABI gates by declared param count; kernel key types dispatch to the runtime helpers) — the impls are reached and specialized with zero inference | mono.tg `inject_map_dispatch_calls` / `apply_dispatch_injection`; codegen.tg `map_hash_dispatch_label` / `map_eq_dispatch_label` |

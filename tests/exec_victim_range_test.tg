@@ -1,0 +1,162 @@
+# tests/exec_victim_range_test.tg — the steal-victim range suite (reviewer
+# item 15).
+#
+# THE VICTIM RANGE (the fix in std/exec.tg): the steal victim was picked
+# as random_range(0, len - 1) — the upper bound EXCLUSIVE — so the LAST
+# worker (index len - 1) was never chosen as a victim. The fix: the full
+# random_range(0, len) worker range.
+#
+# The suite: a producer task fills ITS OWN local queue (the
+# submit-affinity path — a task running on worker w submits into worker
+# w's local queue), records its worker index, and parks on a gate. The
+# OTHER worker — idle, its own queue and the global queue empty — must
+# STEAL the leaves for the round to complete. When the producer lands on
+# the LAST worker (worker 1 of 2), the other worker's steal counter
+# proves the fix: the old range could never choose that victim, and the
+# leaves would sit in the parked producer's queue forever. Rounds where
+# the producer lands on a non-last worker are skipped and repeated
+# (bounded) — under the fix the last-worker round ALWAYS completes; a
+# regression fails the bounded spins instead of hanging CI.
+
+use std::core::{Option, Int, Bool, Unit, Vec, u64}
+use std::test::*
+use std::exec::{Executor, TaskPriority}
+use std::sync::{Arc, Mutex, AtomicBool}
+use std::thread::{Thread, yield_now}
+
+const LEAVES_PER_PRODUCER: Int = 32
+const MAX_ROUNDS: Int = 8
+const MAX_SPINS: Int = 3000000
+
+def bump(counter: Arc[Mutex[Int]]) -> Unit
+  let mut g = counter.lock()
+  *g = *g + 1
+  drop(g)
+end
+
+def spin_until_completed(exec: Executor, target: Int) -> Bool
+  var spins = 0
+  while spins < MAX_SPINS do
+    if exec.debug_completed_count() >= target then
+      return true
+    end
+    spins = spins + 1
+    yield_now()
+  end
+  false
+end
+
+# Wait until the producer recorded its worker index; returns it (-1 when
+# the bounded spin expired — the caller's assert fails the test).
+def spin_until_producer_index(slot: Arc[Mutex[Option[Int]]]) -> Int
+  var spins = 0
+  while spins < MAX_SPINS do
+    let mut g = slot.lock()
+    if g.is_some() then
+      match g.take()
+      when Option::Some(idx) then return idx
+      when Option::None then ()
+      end
+    end
+    drop(g)
+    spins = spins + 1
+    yield_now()
+  end
+  -1
+end
+
+@test
+def test_last_worker_is_a_steal_victim() -> Unit
+  let exec = assert_ok(Executor::new(2))
+  let counter = Arc::new(Mutex::new(0))
+  var saw_last_worker = false
+  var completed_target = 0
+  
+  var round = 0
+  while round < MAX_ROUNDS do
+    let index_slot: Arc[Mutex[Option[Int]]] = Arc::new(Mutex::new(Option::None))
+    let gate = Arc::new(AtomicBool::new(false))
+    let exec_producer = Executor { inner: exec.inner.clone() }
+    let c = counter.clone()
+    let islot = index_slot.clone()
+    let g = gate.clone()
+    
+    let _ = exec.submit(Box::new(move || {
+      # 1. Identify my worker index (my thread id vs the executor's
+      #    thread ids) and fill MY OWN local queue with leaves (the
+      #    submit-affinity path: the submissions from a worker task land
+      #    in that worker's local queue).
+      unsafe "executor inner access — the producer's Arc clone keeps the executor alive" do
+        let inner = exec_producer.inner.ptr.as_mut()
+        let current = Thread::current()
+        var my_index = -1
+        var w = 0
+        while w < inner.workers.len() do
+          if inner.threads[w].thread.id() == current.id() then
+            my_index = w
+            break
+          end
+          w = w + 1
+        end
+        let e = Executor { inner: exec_producer.inner.clone() }
+        var k = 0
+        while k < LEAVES_PER_PRODUCER do
+          let c1 = c.clone()
+          e.submit(Box::new(move || { bump(c1) }), TaskPriority::Normal)
+          k = k + 1
+        end
+        let mut sg = islot.lock()
+        *sg = Option::Some(my_index)
+        drop(sg)
+      end
+      # 2. Park until the round gate opens — while parked, my local
+      #    queue is the ONLY source of work for the other worker.
+      while !gate.load() do
+        yield_now()
+      end
+      # 3. The producer itself executes exactly once too.
+      bump(c)
+    }), TaskPriority::Normal)
+    
+    # The deterministic handshake: the producer recorded its index after
+    # filling its queue.
+    let idx = spin_until_producer_index(index_slot)
+    assert_true(idx >= 0)
+    
+    if idx == 1 then
+      # THE COVERAGE ROUND: the producer is on the LAST worker (worker
+      # 1) and parked. The other worker (worker 0) must STEAL all 32
+      # leaves — the old victim range (0, len - 1) could never choose
+      # this victim, and the leaves would never run.
+      assert_true(spin_until_completed(exec, completed_target + LEAVES_PER_PRODUCER))
+      let stats = exec.stats()
+      assert_eq(stats.steals_per_worker[0], LEAVES_PER_PRODUCER as u32)
+      # The leaves ran exactly once — all through the steals.
+      let g = counter.lock()
+      assert_eq(*g, completed_target + LEAVES_PER_PRODUCER)
+      drop(g)
+      saw_last_worker = true
+    end
+    
+    # Open the gate; the producer completes (33rd task of the round).
+    gate.ptr.as_ref().store(true)
+    assert_true(spin_until_completed(exec, completed_target + LEAVES_PER_PRODUCER + 1))
+    completed_target = completed_target + LEAVES_PER_PRODUCER + 1
+    
+    if saw_last_worker then
+      break
+    end
+    round = round + 1
+  end
+  
+  # The producer must land on the last worker at least once within the
+  # bounded rounds (p(miss) = 1/2^8 with 2 workers).
+  assert(saw_last_worker, "victim test: the producer never ran on the last worker")
+  
+  # Every completed task bumped exactly once.
+  let g = counter.lock()
+  assert_eq(*g, completed_target)
+  drop(g)
+  assert_true(exec.conservation_ok())
+  exec.shutdown()
+end

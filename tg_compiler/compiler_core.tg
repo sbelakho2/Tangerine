@@ -19,11 +19,12 @@ use tg_compiler::ast::{
   AssocTypeImpl, EffectHandler, HandlerArm, ContractClause, FunctionSig
 }
 use tg_compiler::parser::{parse, diag_has_errors, diag_macro_expansion_depth_exceeded, diag_macro_ambiguity}
-use tg_compiler::types::{type_check, type_check_strict, type_check_typed, type_env_new, TypeError, extract_import_paths, TypeEnv}
+use tg_compiler::types::{type_check, type_check_strict, type_check_typed, type_env_new, TypeError, extract_import_paths, TypeEnv, Type}
 use tg_compiler::resolver::{resolve_names, ResolutionError}
 use tg_compiler::access_check::{access_check, AccessError}
 use tg_compiler::resource_check::{resource_check, build_typed_cfg, ResourceError, AnalyzedProgram, analysis_context_new}
 use tg_compiler::mir::{lower_to_mir, MirProgram, MirFunction, optimize_mir, optimize_mir_verified, pretty_print_mir, instrument_for_pgo, verify_mir}
+use tg_compiler::layout_engine::{layout_engine_new, layout_engine_register_types, layout_of_concrete, LayoutEngine, LayoutError}
 use tg_compiler::codegen::{generate_native, generate_executable, generate_object_file, detect_host_target}
 use tg_compiler::asm::{AsmTarget, Arch, OsAbi}
 use tg_compiler::mono::{monomorphize_program, mono_cache_new}
@@ -255,6 +256,80 @@ pub def driver_lower_to_mir(ast: Program, analyzed: Option[AnalyzedProgram]) -> 
   when Option::Some(ap) then lower_to_mir(ast, ap)
   when Option::None then Result::Err("MIR lowering requires an analyzed program")
   end
+end
+
+# ———————————————————————————————————————————————————————————————
+# The completeness oracles (the reviewer's item 8)
+# ———————————————————————————————————————————————————————————————
+#
+# The MIR-side oracle, run AFTER monomorphization (and again after
+# optimization, immediately before codegen). Its mandate: for an ACCEPTED
+# program, no placeholder may survive in the IR that reaches codegen —
+#   (a) unknown LAYOUT — every type recorded in a function signature, a
+#       local, or a static must have a computable concrete layout under
+#       the fail-closed layout_of_concrete (Var/Error/Param/unregistered
+#       named types all fail closed here, before codegen could guess);
+#   (b) placeholder symbol / MIR — the unresolved-callee and placeholder-
+#       terminator mirrors are enforced by verify_mir (the caller runs
+#       verify_mir BEFORE this oracle at every boundary; a violation of
+#       either is the same internal-failure class).
+# The typecheck-side oracle (run_semantic_completeness_oracle, types.tg)
+# covers the typed channels before lowering; this oracle covers the
+# concrete IR after generic substitution.
+def run_mir_completeness_oracle(mir: MirProgram, target: AsmTarget) -> Vec[String]
+  var errors = Vec::new()
+  var engine = layout_engine_new(target)
+  layout_engine_register_types(&mut engine, mir.types)
+  for td in mir.types do
+    let nominal_ty = Type::Adt(td.id.clone(), Vec::new())
+    match layout_of_concrete(&mut engine, &nominal_ty)
+    when Result::Ok(_) then ()
+    when Result::Err(e) then
+      errors.push("MIR completeness oracle: type `" + td.name.clone() + "` has no computable layout: " + layout_error_message(&e))
+    end
+  end
+  for f in mir.functions do
+    let fn_what = "fn " + f.name.clone()
+    var pi = 0
+    while pi < f.params.len() do
+      let pty = f.params[pi].ty.clone()
+      match layout_of_concrete(&mut engine, &pty)
+      when Result::Ok(_) then ()
+      when Result::Err(e) then
+        errors.push("MIR completeness oracle: " + fn_what.clone() + " parameter type has no computable layout: " + layout_error_message(&e))
+      end
+      pi = pi + 1
+    end
+    let rty = f.ret_type.clone()
+    match layout_of_concrete(&mut engine, &rty)
+    when Result::Ok(_) then ()
+    when Result::Err(e) then
+      errors.push("MIR completeness oracle: " + fn_what.clone() + " return type has no computable layout: " + layout_error_message(&e))
+    end
+    var li = 0
+    while li < f.locals.len() do
+      let lty = f.locals[li].ty.clone()
+      match layout_of_concrete(&mut engine, &lty)
+      when Result::Ok(_) then ()
+      when Result::Err(e) then
+        errors.push("MIR completeness oracle: " + fn_what.clone() + " local _" + f.locals[li].id.id.to_string() + " type has no computable layout: " + layout_error_message(&e))
+      end
+      li = li + 1
+    end
+  end
+  for st in mir.statics do
+    let sty = st.ty.clone()
+    match layout_of_concrete(&mut engine, &sty)
+    when Result::Ok(_) then ()
+    when Result::Err(e) then
+      errors.push("MIR completeness oracle: static `" + st.name.clone() + "` type has no computable layout: " + layout_error_message(&e))
+    end
+  end
+  errors
+end
+
+def layout_error_message(e: LayoutError) -> String
+  e.message
 end
 
 # Use Diagnostic definition from parser
@@ -1527,20 +1602,34 @@ pub def compile_file_core(path: String, opts: CompilerOptions, inout emitter: Di
   if opts.verbose then
   end
 
-  # Verify MIR invariants after monomorphization. The post-mono verification
-  # is a TRANSFORMATIVE-PASS boundary (monomorphization rewrites the
-  # program): under the verify-everything policy (the debug/CI builds —
-  # mir_verify_everything) it runs; the release policy verifies only the
-  # construction and the final IR (the post-opt check below).
+  # The ONE target resolution for the whole compile: resolved once here (an
+  # explicit --target triple wins, otherwise the host target is detected) and
+  # threaded through the MIR completeness oracle (the layout authority for
+  # the post-mono and pre-codegen audits) and codegen. No phase resolves a
+  # target on its own.
+  let target = resolve_codegen_target(opts)
+
+  # Verify MIR invariants after monomorphization. The post-mono
+  # verification is UNCONDITIONAL (the reviewer's item-11 firewall: the
+  # generic substitution is a transformative boundary every build — debug
+  # and release — must re-prove), followed by the item-8 MIR completeness
+  # oracle: every type in the substituted IR must have a computable layout.
+  # The per-pass optimizer checkpoints below remain gated on the
+  # verify-everything policy (the debug/CI builds).
   let verify_everything = mir_verify_everything(opts)
-  if verify_everything then
-    let post_mono_errs = verify_mir(&mir)
-    if !post_mono_errs.is_empty() then
-      for e in post_mono_errs do
-        eprintln("MIR verifier (post-mono): " + e)
-      end
-      return Result::Err("MIR verification failed after monomorphization")
+  let post_mono_errs = verify_mir(&mir)
+  if !post_mono_errs.is_empty() then
+    for e in post_mono_errs do
+      eprintln("MIR verifier (post-mono): " + e)
     end
+    return Result::Err("MIR verification failed after monomorphization")
+  end
+  let post_mono_oracle = run_mir_completeness_oracle(&mir, target)
+  if !post_mono_oracle.is_empty() then
+    for e in post_mono_oracle do
+      eprintln("MIR completeness oracle (post-mono): " + e)
+    end
+    return Result::Err("MIR completeness oracle failed after monomorphization")
   end
 
   match opts.dump_phase
@@ -1619,6 +1708,18 @@ pub def compile_file_core(path: String, opts: CompilerOptions, inout emitter: Di
     return Result::Err("MIR verification failed after optimization")
   end
 
+  # The item-8 MIR completeness oracle after the final optimization: the
+  # optimizer can only transform a layout-complete IR into another
+  # layout-complete IR; a violation here is an optimizer bug caught before
+  # codegen.
+  let post_opt_oracle = run_mir_completeness_oracle(&mir, target)
+  if !post_opt_oracle.is_empty() then
+    for e in post_opt_oracle do
+      eprintln("MIR completeness oracle (post-opt): " + e)
+    end
+    return Result::Err("MIR completeness oracle failed after optimization")
+  end
+
   if opts.emit_mir then
     print_mir(&mir)
     return Result::Ok(())
@@ -1635,8 +1736,28 @@ pub def compile_file_core(path: String, opts: CompilerOptions, inout emitter: Di
   if opts.verbose then
     println("  Generating native code...")
   end
-  
-  let target = resolve_codegen_target(opts)
+
+  # The FINAL firewall, immediately before codegen (the reviewer's item-11
+  # checklist): the verifier and the completeness oracle re-prove the exact
+  # IR instance codegen receives — a corruption introduced between the
+  # post-opt checkpoint and this point (or any pass the checkpoint policy
+  # skipped) is caught here, and the verifier violation is the ICE class
+  # (the IR that reached this boundary is compiler-internal by
+  # construction).
+  let pre_codegen_errs = verify_mir(&mir)
+  if !pre_codegen_errs.is_empty() then
+    for e in pre_codegen_errs do
+      eprintln("MIR verifier (pre-codegen): " + e)
+    end
+    return Result::Err("MIR verification failed immediately before codegen")
+  end
+  let pre_codegen_oracle = run_mir_completeness_oracle(&mir, target)
+  if !pre_codegen_oracle.is_empty() then
+    for e in pre_codegen_oracle do
+      eprintln("MIR completeness oracle (pre-codegen): " + e)
+    end
+    return Result::Err("MIR completeness oracle failed immediately before codegen")
+  end
   
   match opts.emit
   when EmitMode::Object then

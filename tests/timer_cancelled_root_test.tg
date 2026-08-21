@@ -1,0 +1,93 @@
+# tests/timer_cancelled_root_test.tg — the cancelled-root pruning
+# (reviewer item 16): a lazy-cancelled timer entry AT THE HEAP ROOT must
+# never be chosen as the next virtual deadline. check_timers_deterministic
+# pops the cancelled roots unconditionally (regardless of their
+# deadline), so the virtual clock is driven only by LIVE deadlines — the
+# old loop peeked the deadline first and left a future-dated cancelled
+# root in place, distorting the next-deadline choice.
+
+use std::core::{Vec, String, Unit, Result, Option}
+use std::test::*
+use std::time::{Instant, Duration}
+use std::async::{Future, Waker, Context, Poll, TaskState}
+
+# THE PRUNING: the heap root is a CANCELLED entry with an EARLIER
+# deadline than the live entry. The check pops the cancelled root even
+# though its deadline is in the future — the live entry becomes the root
+# and the virtual clock never advanced to the cancelled deadline.
+@test
+def test_timer_cancelled_root_pruned_before_next_deadline() -> Unit
+  let mut exec = std::async::executor_new()
+  exec.set_deterministic(1u64)
+
+  unsafe "executor inner access — the timer heap is executor state" do
+    let exec_inner = exec.inner.ptr.as_mut()
+    let t0 = exec_inner.virtual_time
+
+    # The cancelled entry with the EARLIER deadline: registered, then
+    # cancelled (the owning future dropped) — it sits at the heap root.
+    let cancelled_id = exec_inner.register_timer(t0.add(Duration::from_millis(100)), 701)
+    exec_inner.cancel_timer(cancelled_id)
+
+    # The live entry with the LATER deadline.
+    let live_id = exec_inner.register_timer(t0.add(Duration::from_millis(200)), 702)
+
+    # The heap root IS the cancelled entry (its deadline is the minimum).
+    assert_eq(exec_inner.timer_heap.len(), 2)
+    assert_eq(exec_inner.timer_heap[0].cancelled, true)
+
+    # THE PRUNING: the check pops the cancelled root REGARDLESS of its
+    # (future) deadline — the old loop compared the deadline first and
+    # left the cancelled root in place.
+    exec_inner.check_timers_deterministic()
+
+    # The live entry is now the root, the cancelled entry is gone, and
+    # the virtual clock NEVER advanced to the cancelled deadline.
+    assert_eq(exec_inner.timer_heap.len(), 1)
+    assert_eq(exec_inner.timer_heap[0].id, live_id)
+    assert_eq(exec_inner.timer_heap[0].cancelled, false)
+    assert_eq(exec_inner.virtual_time == t0, true)
+  end
+end
+
+# THE RUN-LEVEL PRUNING: the deterministic run loop calls
+# check_timers_deterministic BEFORE choosing the next virtual deadline —
+# a cancelled root present at the empty-quadrant decision is pruned
+# first, so the executor's clock advances only to the LIVE deadline and
+# the live timer fires.
+@test
+def test_timer_cancelled_root_never_sets_the_run_clock() -> Unit
+  let mut exec = std::async::executor_new()
+  exec.set_deterministic(1u64)
+
+  # The task: a 200ms deterministic sleep (its live timer).
+  let handle = exec.spawn(async {
+    std::async::sleep_millis(200).await
+  })
+  let task_id = handle.task_id
+
+  # The task's first poll registers the live 200ms timer.
+  exec.poll_task(task_id)
+
+  # Plant a CANCELLED timer with an EARLIER deadline at the heap root
+  # (a dropped sleep future's lazy-cancelled entry).
+  unsafe "executor inner access — the timer heap is executor state" do
+    let exec_inner = exec.inner.ptr.as_mut()
+    let t0 = exec_inner.virtual_time
+    let stale_id = exec_inner.register_timer(t0.add(Duration::from_millis(50)), 703)
+    exec_inner.cancel_timer(stale_id)
+  end
+  assert_eq(exec.inner.ptr.as_ref().timer_heap[0].cancelled, true)
+
+  # THE RUN: the loop's first check prunes the cancelled root; the next
+  # deadline is the LIVE 200ms entry — the clock advances to it and the
+  # sleep completes. The executor never advanced to the cancelled 50ms
+  # deadline.
+  exec.run()
+
+  match exec.inner.ptr.as_ref().task_states.get(&task_id)
+  when Option::Some(TaskState::Completed) then ()
+  when _ then assert_false(true)
+  end
+  assert_eq(exec.inner.ptr.as_ref().timer_heap.is_empty(), true)
+end

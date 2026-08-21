@@ -1,12 +1,12 @@
 use std::core::{Option}
 use std::collections::{Vec, Map, Set}
-use tg_compiler::token::{Span}
+use tg_compiler::token::{Span, parsed_int_to_host}
 use tg_compiler::ast::{
   Program, Item, ItemKind, FunctionDecl, FnBody, TraitMethod, ExternItem,
   Block, Stmt, StmtKind, Expr, ExprKind, Pattern, PatternKind, Param,
   AccessConvention, GuardElse, MatchExpr, IfStmt, ForStmt, ClosureParam
 }
-use tg_compiler::types::{Type, TypeKind, ParamType, AccessEffect, TypedProgram, TypeId, TypeEnv, type_properties_of, TypeDef, TypeDefKind, FieldInfo, VariantInfo, LangItems, ImplInfo, TraitRefTemplate, fn_owner_key, fn_owner_key_of_item, is_trivially_copyable, is_slice_view_type_of, finalizer_kind_of_callable, FunctionCleanupTable, FunctionCleanup, ScopeId, DeferId, AssignExactDrop, function_cleanup_table_new, crate_module_path_of, def_id_kind_of, ProjectionKey, ProjectionChain, projection_chain_of, projection_key_eq, place_move_path_of, TypedExprKind, chain_contains_key}
+use tg_compiler::types::{Type, TypeKind, ParamType, AccessEffect, TypedProgram, TypeId, TypeEnv, type_properties_of, TypeDef, TypeDefKind, FieldInfo, VariantInfo, LangItems, ImplInfo, TraitRefTemplate, fn_owner_key, fn_owner_key_of_item, is_trivially_copyable, is_slice_view_type_of, is_shared_view_type_of, finalizer_kind_of_callable, FunctionCleanupTable, FunctionCleanup, ScopeId, DeferId, AssignExactDrop, function_cleanup_table_new, crate_module_path_of, def_id_kind_of, ProjectionKey, ProjectionChain, projection_chain_of, projection_key_eq, place_move_path_of, TypedExprKind, chain_contains_key}
 use tg_compiler::resolver::{module_path_of_item_resolver, def_kind_of, ResolvedNames}
 use tg_compiler::access_check::{AccessError}
 use tg_compiler::ids::{DefId, DefKind, LocalId, TraitId, FinalizerKind, generic_param_table_new, NodeId, AccessId, CfgEdgeId, CallableId, FieldId}
@@ -525,8 +525,9 @@ end
 #                     state walk never allocates block ids). The
 #                     uniqueness invariant (validate_cfg_blocks) guards
 #                     the domain.
-#   slice_views    — view local id -> SliceViewInfo (the live Slice-view
-#                     registry, mutation-while-live authority).
+#   slice_views    — view local id -> SliceViewInfo (the live RAW-view
+#                     registry, mutation-while-live authority — the
+#                     shared/pinned forms are never registered).
 # access_registry — CfgEdgeId (the edge's index in the ONE
 #                     TypedCFG edge list) -> the AccessIds the access
 #                     checker opened on THAT edge, in registration order.
@@ -641,9 +642,17 @@ def block_frames_get(ctx: AnalysisContext, block_id: Int) -> Option[(ResFrame, R
 end
 
 # ———————————————————————————————————————————————————————————————
-# the live Slice-view registry is AnalysisContext state
+# THE RAW-VIEW REGISTRY (the P0-SL rules) — AnalysisContext state
 # (context.slice_views — view local id -> backing place; the ITERATION_PLANS
-# convention — no reset protocol).
+# convention — no reset protocol). The registry polices ONLY the RAW
+# {ptr,len} views (the compiler's Slice builtin — source-spelled
+# UnsafeSlice): the SAFE shared/pinned forms (SharedSlice/StrView — the
+# Arc-class views) are ordinary OWNING values whose backing owns — they
+# need NO escape tracking and are never registered here. The raw views
+# are unsafe/FFI-only (safe code cannot produce them); the only raw views
+# safe code ever sees are the compiler-scoped loop-consumed iterable
+# forms and the vec! literal coercion, and the mutation-while-live rule
+# below keeps even those from outliving their backing buffer.
 struct SliceViewInfo
   backing_root: Int
   backing_fields: Vec[String]
@@ -717,15 +726,18 @@ def slice_view_backing(ctx: AnalysisContext, typed: TypedProgram, value: Expr) -
   end
 end
 
-# (channel d): register a let-bound Slice view local (the value's
-# type is the Slice view and the pattern binds exactly one ident) under
-# its backing place, so the mutation-while-live rule can protect the
-# backing while the view local is live. Skip registrations without a
-# place-like root (a temporary view has no backing to protect).
+# (channel d): register a let-bound RAW Slice view local (the value's
+# type is the raw view — the Slice builtin / UnsafeSlice — and the
+# pattern binds exactly one ident) under its backing place, so the
+# mutation-while-live rule can protect the backing while the raw view
+# local is live. The SAFE shared/pinned forms (SharedSlice/StrView — the
+# Arc-backed views) are explicitly EXCLUDED: the backing owns, so they
+# need no escape tracking. Skip registrations without a place-like root
+# (a temporary view has no backing to protect).
 def register_slice_view_local(inout ctx: AnalysisContext, inout env: TypeEnv, typed: TypedProgram, pattern: Pattern, value: Expr) -> Unit
   match typed.expr_types.get(value.node_id)
   when Option::Some(vt) then
-    if is_slice_view_type_of(env, &vt) then
+    if !is_shared_view_type_of(env, &vt) && is_slice_view_type_of(env, &vt) then
       var binding_ids = Vec::new()
       collect_pattern_binding_ids(typed, pattern, &mut binding_ids)
       if binding_ids.len() == 1 then
@@ -740,11 +752,13 @@ def register_slice_view_local(inout ctx: AnalysisContext, inout env: TypeEnv, ty
   end
 end
 
-# (channel d): the mutation-while-view-live check — every live
-# registered view's backing place is scanned against the statement with
-# the IterationPlan mutation machinery (plan_stmt_mutates_place — the
-# projected-iteration conflict rule); a match means the statement mutates/
-# reallocates a buffer a live Slice local views. Reported ONCE per
+# (channel d): the mutation-while-raw-view-live check — every live
+# registered RAW view's backing place is scanned against the statement
+# with the IterationPlan mutation machinery (plan_stmt_mutates_place —
+# the projected-iteration conflict rule); a match means the statement
+# mutates/reallocates a buffer a live raw-view local views. The SAFE
+# shared/pinned forms are never registered, so mutating their source is
+# always allowed (the pinned backing is unaffected). Reported ONCE per
 # statement (the first offending view's name).
 def check_slice_view_backing_mutation(ctx: AnalysisContext, typed: TypedProgram, stmt: Stmt, inout errors: Vec[ResourceError]) -> Unit
   var reported = false
@@ -753,7 +767,7 @@ def check_slice_view_backing_mutation(ctx: AnalysisContext, typed: TypedProgram,
       if plan_stmt_mutates_place(typed, stmt, info.backing_root, &info.backing_fields) then
         reported = true
         errors.push(ResourceError {
-          message: "cannot mutate the backing buffer of `" + binding_name(typed, view_id) + "`: the local holds a live Slice view of that buffer (a Slice must not outlive its backing)",
+          message: "cannot mutate the backing buffer of `" + binding_name(typed, view_id) + "`: the local holds a live raw Slice view (UnsafeSlice) of that buffer (a raw {ptr,len} view must not outlive its backing — use the shared/pinned form: Vec::as_slice / String::as_str_view)",
           span: stmt.span
         })
       end
@@ -3996,17 +4010,19 @@ def check_terminator_stmt(program: Program, typed: TypedProgram, inout env: Type
 end
 
 def check_stmt(program: Program, typed: TypedProgram, inout env: TypeEnv, inout ctx: AnalysisContext, stmt: Stmt, loop_outer: Vec[Int], inout frame: ResFrame, inout errors: Vec[ResourceError], inout finalize_plan: FunctionCleanupTable, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock], inout current_loop_entry: Vec[Int], inout defer_chain: Vec[Int]) -> Unit
- # (channel d): the mutation-while-view-live check runs per
-  # statement — a live Slice local's backing buffer cannot be
+ # (channel d): the mutation-while-raw-view-live check runs per
+  # statement — a live RAW-view local's backing buffer cannot be
   # mutated/reallocated by this statement (the IterationPlan mutation
-  # machinery scans the statement against every live view's backing).
+  # machinery scans the statement against every live raw view's backing;
+  # the shared/pinned forms are never registered — their pinned backing
+  # is unaffected by the owner's mutations).
   check_slice_view_backing_mutation(ctx, typed, stmt, errors)
   match stmt.kind
   when StmtKind::StmtLet(pattern, _, value, _) then
     check_expr(program, typed, env, ctx, &value, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
     transfer_consume(env, typed, &value, loop_outer, frame, errors, finalize_plan)
     bind_pattern(env, typed, &pattern, stmt.span, frame, errors)
- # (channel d): a let-bound Slice view local is registered under
+ # (channel d): a let-bound RAW view local is registered under
     # its backing place — live until its scope exits (the scope-boundary
     # cleanup protocol removes it).
     register_slice_view_local(ctx, env, typed, &pattern, &value)
@@ -4294,7 +4310,7 @@ end
 # the caller can attach them to the scope's exiting edges (they are
 # finalized exactly when the deferred code RUNS, never at registration).
 def check_defer_body(program: Program, typed: TypedProgram, inout env: TypeEnv, inout ctx: AnalysisContext, body: Block, loop_outer: Vec[Int], inout frame: ResFrame, inout errors: Vec[ResourceError], inout finalize_plan: FunctionCleanupTable, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock], inout current_loop_entry: Vec[Int], inout defer_chain: Vec[Int]) -> Vec[Int]
- # (channel d): the defer body is a scope boundary for slice views
+ # (channel d): the defer body is a scope boundary for raw views
   # (its statements are checked once at registration; views bound inside
   # are registration-time artifacts — removed after the check).
   let body_view_keys = slice_views_snapshot_keys(ctx)
@@ -5749,7 +5765,7 @@ def check_loop_body(program: Program, typed: TypedProgram, inout env: TypeEnv, i
   if body_key != 0 then
     defer_chain.push(-body_key)
   end
- # (channel d): the loop body is a scope boundary for slice views —
+ # (channel d): the loop body is a scope boundary for raw views —
   # a view bound inside the body dies with the iteration; the snapshot
   # removes the body-bound views after the run (the loop body has no
   # exit_scope of its own).
@@ -7153,7 +7169,7 @@ end
 # The constant integer index of an expression (the AST integer literal).
 def typed_const_index(typed: TypedProgram, expr: Expr) -> Option[Int]
   match expr.kind
-  when ExprKind::ExprIntLit(v) then Option::Some(v)
+  when ExprKind::ExprIntLit(v) then Option::Some(parsed_int_to_host(&v))
   when _ then Option::None
   end
 end

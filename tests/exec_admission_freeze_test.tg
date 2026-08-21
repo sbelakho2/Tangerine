@@ -1,0 +1,190 @@
+# tests/exec_admission_freeze_test.tg — the admission-freeze suite (Gate U,
+# reviewer item 15).
+#
+# THE ADMISSION RACE: the old submit ran its Running-check and then
+# enqueued WITHOUT any lock — a submit could pass the check, get
+# descheduled, and enqueue AFTER the shutdown reached quiescence (the
+# task stranded after the join, invisible to the drain). The fix is the
+# admission protocol in std/exec.tg: the submit holds the admission
+# mutex across its check-and-enqueue, and the shutdown's
+# Running -> Draining transition happens under the SAME mutex — a submit
+# after the transition is rejected (the panic), a submit before it is
+# fully admitted and drained.
+#
+# The Gate U freeze: the test-only barrier inside submit (the
+# test_submit_freeze fields + the Executor::debug_freeze_submit helpers)
+# parks the submitter between its admission check and its enqueue — the
+# guard is dropped at the barrier, so the shutdown can transition in
+# between. The two legal interleavings:
+#   (a) the release BEFORE any shutdown — the submitter re-checks under
+#       the lock, still Running, enqueues; the task is FULLY ADMITTED
+#       and drains.
+#   (b) the shutdown BETWEEN the check and the release — the submitter
+#       re-checks under the lock, sees the non-Running state, and is
+#       REJECTED (the panic, caught on the submitter thread) — no TaskId
+#       allocated, nothing enqueued.
+# Only these two outcomes exist — never the third (an enqueue after the
+# quiescence). Both interleavings are bounded spins — a broken admission
+# protocol FAILS the test instead of hanging CI.
+
+use std::core::{Option, Result, String, Int, Bool, Unit, u64, Vec, catch_unwind}
+use std::test::*
+use std::exec::{Executor, TaskPriority}
+use std::sync::{Arc, Mutex}
+use std::thread::{spawn, yield_now}
+
+const MAX_SPINS: Int = 2000000
+
+def spin_until_freeze_reached(exec: Executor) -> Bool
+  var spins = 0
+  while spins < MAX_SPINS do
+    if exec.debug_freeze_reached() then
+      return true
+    end
+    spins = spins + 1
+    yield_now()
+  end
+  false
+end
+
+def spin_until_completed(exec: Executor, target: Int) -> Bool
+  var spins = 0
+  while spins < MAX_SPINS do
+    if exec.debug_completed_count() >= target then
+      return true
+    end
+    spins = spins + 1
+    yield_now()
+  end
+  false
+end
+
+# (a) The release BEFORE the shutdown transition: the submitter re-checks
+# under the admission lock, still Running, and enqueues — the task is
+# fully admitted and drained.
+@test
+def test_admission_freeze_admitted_before_transition_is_drained() -> Unit
+  let exec = assert_ok(Executor::new(1))
+  let counter = Arc::new(Mutex::new(0))
+  let slot: Arc[Mutex[Option[Result[u64, String]]]] = Arc::new(Mutex::new(Option::None))
+  let exec_submitter = Executor { inner: exec.inner.clone() }
+  let c = counter.clone()
+  let s = slot.clone()
+  
+  # Arm the Gate U freeze: the next submit parks after its admission
+  # check (the guard dropped).
+  exec.debug_freeze_submit()
+  
+  let mut submitter = spawn(move || {
+    let outcome = catch_unwind(move || {
+      let c1 = c.clone()
+      exec_submitter.submit(Box::new(move || {
+        let mut g = c1.lock()
+        *g = *g + 1
+        drop(g)
+      }), TaskPriority::Normal)
+    })
+    let mut g = s.lock()
+    *g = Option::Some(outcome)
+    drop(g)
+  })
+  
+  # The submitter passed the admission check and parked at the freeze
+  # barrier (the deterministic handshake).
+  assert_true(spin_until_freeze_reached(exec))
+  
+  # The release BEFORE any shutdown: the re-check under the lock still
+  # sees Running — the submit is fully admitted and enqueued.
+  exec.debug_release_submit_freeze()
+  
+  # The admitted task really runs (the worker drains it).
+  assert_true(spin_until_completed(exec, 1))
+  let g = counter.lock()
+  assert_eq(*g, 1)
+  drop(g)
+  
+  assert_ok(submitter.join())
+  
+  # The submit returned a real TaskId and never panicked.
+  let mut g = slot.lock()
+  let outcome = g.take()
+  drop(g)
+  match outcome
+  when Option::Some(inner) then
+    match inner
+    when Result::Ok(id) then assert_true(id >= 1 as u64)
+    when Result::Err(msg) then panic("admission freeze: the admitted submit panicked: " + msg)
+    end
+  when Option::None then
+    panic("admission freeze: the submitter did not finish")
+  end
+  
+  # The ledger: the single task Completed, conserved.
+  assert_eq(exec.debug_task_count(3), 1)
+  assert_eq(exec.debug_task_count(0), 0)
+  assert_eq(exec.debug_task_count(1), 0)
+  assert_true(exec.conservation_ok())
+  exec.debug_unfreeze_submit()
+  exec.shutdown()
+end
+
+# (b) The shutdown BETWEEN the check and the release: the submitter
+# re-checks under the admission lock, sees the non-Running state, and is
+# REJECTED — no TaskId allocated, nothing enqueued. The rejection panic
+# fires AFTER the admission guard dropped (the reject path drops the
+# guard first) — the mutex is never poisoned, so the executor stays
+# usable for the post-panic ledger reads.
+@test
+def test_admission_freeze_rejected_after_transition_never_enqueued() -> Unit
+  let exec = assert_ok(Executor::new(1))
+  let slot: Arc[Mutex[Option[Result[u64, String]]]] = Arc::new(Mutex::new(Option::None))
+  let exec_submitter = Executor { inner: exec.inner.clone() }
+  let s = slot.clone()
+  
+  exec.debug_freeze_submit()
+  
+  let mut submitter = spawn(move || {
+    let outcome = catch_unwind(move || {
+      exec_submitter.submit(Box::new(move || { let _ = 0; }), TaskPriority::Normal)
+    })
+    let mut g = s.lock()
+    *g = Option::Some(outcome)
+    drop(g)
+  })
+  
+  assert_true(spin_until_freeze_reached(exec))
+  
+  # THE SHUTDOWN IN BETWEEN: the Running -> Draining transition happens
+  # under the admission mutex — the submitter dropped the guard at the
+  # barrier, so the transition proceeds; the drain completes (nothing
+  # queued) and the executor reaches Stopped.
+  exec.shutdown()
+  
+  # The release AFTER the transition: the submitter re-acquires the
+  # admission lock, re-checks — non-Running — and is REJECTED.
+  exec.debug_release_submit_freeze()
+  
+  assert_ok(submitter.join())
+  
+  let mut g = slot.lock()
+  let outcome = g.take()
+  drop(g)
+  match outcome
+  when Option::Some(inner) then
+    match inner
+    when Result::Err(msg) then assert_contains(msg, "submit rejected")
+    when Result::Ok(_) then panic("admission freeze: the submit was admitted after the shutdown transition")
+    end
+  when Option::None then
+    panic("admission freeze: the submitter did not finish")
+  end
+  
+  # Nothing was enqueued, nothing ran, nothing was allocated: the ledger
+  # is empty and conserved (the admission guard was dropped before the
+  # rejection panic — the executor is not poisoned).
+  assert_eq(exec.debug_completed_count(), 0)
+  assert_eq(exec.debug_task_count(0), 0)
+  assert_eq(exec.debug_task_count(1), 0)
+  assert_eq(exec.debug_task_count(3), 0)
+  assert_true(exec.conservation_ok())
+end

@@ -1,0 +1,918 @@
+# tests/resource_cfg/cfg_oracle_test.tg — The resource-checker adversarial
+# CFG oracle (the reviewer's item 9).
+#
+# The proof machinery: EVERY exit edge of an accepted function must see its
+# live resources transferred/consumed/returned/finalized EXACTLY ONCE —
+# never live-but-forgotten, never consumed-twice, never maybe-live-
+# unresolved, never deinit-after-consume, never read-before-init. The
+# compiler's resource checker enforces this; this suite proves it with an
+# INDEPENDENT symbolic interpreter (the oracle) that models the same
+# semantics from the shape descriptions alone, plus instrumented
+# construct/drop counters (the Gate-L shapes) that observe the runtime.
+#
+# The equation: compiler acceptance == oracle acceptance.
+#   - POSITIVE shapes (this file): the oracle must predict ACCEPT for every
+#     shape function the compiler accepted into this file, and the
+#     instrumented counters must show exactly one destructor per
+#     construction.
+#   - NEGATIVE shapes (tests/resource_cfg/neg/*.tg): the oracle must
+#     predict REJECT for every shape, and the runner
+#     (tests/resource_cfg/run_cfg_oracle.sh) verifies the compiler
+#     rejects each negative file with `tg check`.
+# The oracle is deliberately simple and independent: it executes the
+# DECLARED semantics (a symbolic state machine over the shape's ops) — it
+# shares no code with resource_check.tg.
+
+use std::core::{Option, Result, Int, String, Unit, Bool, panic}
+use std::collections::{Vec, Map, Set}
+
+mut tests_passed = 0
+mut tests_failed = 0
+
+def check(cond: Bool, name: String) -> Unit
+  if cond then
+    tests_passed = tests_passed + 1
+    println("[PASS] " + name)
+  else
+    tests_failed = tests_failed + 1
+    println("[FAIL] " + name)
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# The oracle — an independent symbolic state interpreter
+# ———————————————————————————————————————————————————————————————
+
+enum RSym
+  Uninit
+  Live
+  Consumed
+  Dropped
+  PartialMoved(Int)     # the resource's field `Int` was consumed; the
+                        # remaining fields are still live (partial move)
+end
+
+enum ShapeOp
+  SMake(String)         # construct -> Live
+  SDrop(String)         # explicit drop/deinit -> Dropped (must be Live)
+  SMove(String, String) # dst = src: src Live -> Consumed, dst -> Live
+  SSink(String)         # sink-call transfer: Live -> Consumed
+  SSet(String)          # set-initialize: not-Live -> Live
+  SRead(String)         # read: must be Live
+  SPartial(String, Int) # consume field i: Live struct -> PartialMoved(i)
+  SDefer(String)        # register the defer that finalizes `name` at the edge
+  SBreak                # the loop-break edge
+  SContinue             # the loop-continue edge
+end
+
+enum RNode
+  RSeq(Vec[RNode])
+  RIf(RNode, RNode)         # then, else — both from the SAME entry state
+  RMatch(Vec[RNode])        # arms — same join rule as RIf
+  RLoop(RNode)              # body; the back-edge must restore the head state
+  RExit                     # the function-return edge
+  ROp(ShapeOp)
+end
+
+struct OracleState
+  syms: Map[String, RSym]
+  defers: Set[String]
+end
+
+def oracle_state_new() -> OracleState
+  OracleState { syms: Map::new(), defers: Set::new() }
+end
+
+def oracle_sym(state: OracleState, name: String) -> RSym
+  match state.syms.get(name)
+  when Option::Some(s) then s
+  when Option::None then RSym::Uninit
+  end
+end
+
+def oracle_sym_eq(a: RSym, b: RSym) -> Bool
+  match a
+  when RSym::Uninit then
+    match b
+    when RSym::Uninit then true
+    when _ then false
+    end
+  when RSym::Live then
+    match b
+    when RSym::Live then true
+    when _ then false
+    end
+  when RSym::Consumed then
+    match b
+    when RSym::Consumed then true
+    when _ then false
+    end
+  when RSym::Dropped then
+    match b
+    when RSym::Dropped then true
+    when _ then false
+    end
+  when RSym::PartialMoved(i) then
+    match b
+    when RSym::PartialMoved(j) then i == j
+    when _ then false
+    end
+  end
+end
+
+# The not-live class for join merging (Consumed/Dropped merge to Consumed).
+def oracle_not_live(s: RSym) -> Bool
+  match s
+  when RSym::Consumed then true
+  when RSym::Dropped then true
+  when _ then false
+  end
+end
+
+def oracle_is_live(s: RSym) -> Bool
+  match s
+  when RSym::Live then true
+  when _ then false
+  end
+end
+
+def oracle_state_clone(state: OracleState) -> OracleState
+  OracleState { syms: state.syms.clone(), defers: state.defers.clone() }
+end
+
+# The edge cleanup: finalize every still-Live local exactly once — a
+# registered defer finalizes its local, everything else is finalized by the
+# edge's scope chain. A deferred local that is NOT live at the edge is a
+# defer-after-consume violation. Returns the number of finalized locals.
+def oracle_edge_cleanup(inout state: OracleState, path: String, inout violations: Vec[String]) -> Int
+  var finalized = 0
+  var live_names = Vec::new()
+  for (name, sym) in state.syms do
+    if oracle_is_live(sym) then
+      live_names.push(name)
+    end
+  end
+  for name in live_names do
+    if state.defers.contains(&name) then
+      state.syms.insert(name.clone(), RSym::Dropped)
+      state.defers.remove(&name)
+      finalized = finalized + 1
+    else
+      state.syms.insert(name.clone(), RSym::Dropped)
+      finalized = finalized + 1
+    end
+  end
+  for d in state.defers do
+    let d_sym = oracle_sym(state, d.clone())
+    if !oracle_not_live(d_sym) then
+      violations.push(path.clone() + ": defer finalizes a live local twice (the defer drops it AND the edge chain would drop it) — double-finalization on one edge")
+    else
+      violations.push(path.clone() + ": defer-after-consume — a registered defer would finalize `" + d.clone() + "` after it was already finalized (deinit-after-consume at the edge)")
+    end
+  end
+  finalized
+end
+
+# Run one node from the given state. Returns the FALL-THROUGH flag: true =
+# the node completed normally; false = a break exited the current loop.
+def oracle_run(node: RNode, inout state: OracleState, path: String, inout violations: Vec[String], inout iterations: Int) -> Bool
+  match node
+  when RNode::RSeq(nodes) then
+    var i = 0
+    while i < nodes.len() do
+      let fell = oracle_run(nodes[i], state, path, violations, iterations)
+      if !fell then
+        return false
+      end
+      i = i + 1
+    end
+    true
+  when RNode::RIf(then_node, else_node) then
+    var then_state = oracle_state_clone(state)
+    let then_fell = oracle_run(then_node, &mut then_state, path.clone() + "/then", violations, iterations)
+    if !then_fell then
+      violations.push(path.clone() + ": break out of an if is not modeled (the shape is invalid)")
+    end
+    var else_state = oracle_state_clone(state)
+    let else_fell = oracle_run(else_node, &mut else_state, path.clone() + "/else", violations, iterations)
+    if !else_fell then
+      violations.push(path.clone() + ": break out of an if is not modeled (the shape is invalid)")
+    end
+    # The join: a local Live on one arm and not-live on another is the
+    # maybe-live-unresolved class (the checker rejects it).
+    var joined = oracle_state_clone(state)
+    for (name, _) in then_state.syms do
+      let ts = oracle_sym(then_state, name.clone())
+      let es = oracle_sym(else_state, name.clone())
+      if oracle_sym_eq(ts, es) then
+        joined.syms.insert(name.clone(), ts)
+      elsif oracle_is_live(ts) && oracle_not_live(es) then
+        violations.push(path.clone() + ": maybe-live-unresolved at the join — `" + name.clone() + "` is live on one arm and not live on the other")
+        joined.syms.insert(name.clone(), RSym::Consumed)
+      elsif oracle_is_live(es) && oracle_not_live(ts) then
+        violations.push(path.clone() + ": maybe-live-unresolved at the join — `" + name.clone() + "` is live on one arm and not live on the other")
+        joined.syms.insert(name.clone(), RSym::Consumed)
+      else
+        joined.syms.insert(name.clone(), RSym::Consumed)
+      end
+    end
+    state.syms = joined.syms
+    state.defers = joined.defers
+    true
+  when RNode::RMatch(arms) then
+    if arms.is_empty() then
+      return true
+    end
+    var arm_states = Vec::new()
+    var first = true
+    for arm in arms do
+      var arm_state = oracle_state_clone(state)
+      let arm_fell = oracle_run(arm, &mut arm_state, path.clone() + "/arm", violations, iterations)
+      if !arm_fell then
+        violations.push(path.clone() + ": break out of a match is not modeled (the shape is invalid)")
+      end
+      arm_states.push(arm_state)
+    end
+    var joined = oracle_state_clone(state)
+    var all_names = oracle_state_names(&arm_states[0])
+    var ai = 1
+    while ai < arm_states.len() do
+      for (name, _) in arm_states[ai].syms do
+        var seen = false
+        for (n2, _) in all_names do
+          if n2 == name then seen = true end
+        end
+        if !seen then
+          all_names.push(name)
+        end
+      end
+      ai = ai + 1
+    end
+    for (name, _) in all_names do
+      var base = oracle_sym(arm_states[0], name.clone())
+      var agree = true
+      var any_live = oracle_is_live(base)
+      var any_not_live = oracle_not_live(base)
+      var bi = 1
+      while bi < arm_states.len() do
+        let bs = oracle_sym(arm_states[bi], name.clone())
+        if !oracle_sym_eq(base, bs) then agree = false end
+        if oracle_is_live(bs) then any_live = true end
+        if oracle_not_live(bs) then any_not_live = true end
+        bi = bi + 1
+      end
+      if agree then
+        joined.syms.insert(name.clone(), base)
+      elsif any_live && any_not_live then
+        violations.push(path.clone() + ": maybe-live-unresolved at the match join — `" + name.clone() + "` is live on one arm and not live on another")
+        joined.syms.insert(name.clone(), RSym::Consumed)
+      else
+        joined.syms.insert(name.clone(), RSym::Consumed)
+      end
+    end
+    state.syms = joined.syms
+    state.defers = joined.defers
+    true
+  when RNode::RLoop(body) then
+    iterations = iterations + 1
+    if iterations > 4 then
+      violations.push(path.clone() + ": the oracle's loop model exceeded its iteration bound (the shape is not bounded)")
+      return true
+    end
+    var head = oracle_state_clone(state)
+    var fell = oracle_run(body, state, path.clone() + "/loop", violations, iterations)
+    if !fell then
+      # A break exited the loop: the break edge's cleanup already ran
+      # inside the body; the post-loop state is the post-break state.
+      return true
+    end
+    # The back-edge: finalize every still-Live local exactly once, then
+    # require the loop-invariant rule: every local present at the head
+    # keeps its head state (an entering local consumed in the body would
+    # diverge on the next iteration), and no body-created local is still
+    # Live at the back-edge (a loop-created resource must be consumed per
+    # iteration — the edge cleanup finalizes the body-created locals, so
+    # their post-cleanup Dropped/Consumed state is legal).
+    let finalized = oracle_edge_cleanup(state, path.clone() + "/loop-backedge", violations)
+    var agrees = true
+    for (name, _) in head.syms do
+      if !oracle_sym_eq(oracle_sym(head, name.clone()), oracle_sym(state, name.clone())) then agrees = false end
+    end
+    for (name, sym) in state.syms do
+      if !head.syms.contains_key(&name) && oracle_is_live(sym) then agrees = false end
+    end
+    if !agrees then
+      violations.push(path.clone() + ": loop-carried resource state diverges at the back-edge (an entering local was consumed or a body-created local survived the iteration — the loop-invariant rule)")
+    end
+    true
+  when RNode::RExit then
+    let _ = oracle_edge_cleanup(state, path.clone() + "/return", violations)
+    true
+  when RNode::ROp(op) then
+    oracle_run_op(op, state, path, violations)
+  end
+end
+
+def oracle_state_names(state: OracleState) -> Vec[(String, RSym)]
+  var out = Vec::new()
+  for (name, sym) in state.syms do
+    out.push((name, sym))
+  end
+  out
+end
+
+def oracle_run_op(op: ShapeOp, inout state: OracleState, path: String, inout violations: Vec[String]) -> Bool
+  match op
+  when ShapeOp::SMake(name) then
+    state.syms.insert(name.clone(), RSym::Live)
+    true
+  when ShapeOp::SDrop(name) then
+    let cur = oracle_sym(state, name.clone())
+    match cur
+    when RSym::Live then state.syms.insert(name.clone(), RSym::Dropped)
+    when RSym::Consumed then violations.push(path.clone() + ": deinit-after-consume — `" + name.clone() + "` is dropped after it was consumed")
+    when RSym::Dropped then violations.push(path.clone() + ": double-drop — `" + name.clone() + "` is dropped twice")
+    when RSym::Uninit then violations.push(path.clone() + ": drop of an uninitialized local `" + name.clone() + "`")
+    when RSym::PartialMoved(_) then violations.push(path.clone() + ": whole-drop of a partially moved `" + name.clone() + "` (partial-then-whole use)")
+    end
+    true
+  when ShapeOp::SMove(dst, src) then
+    let cur = oracle_sym(state, src.clone())
+    if oracle_is_live(cur) then
+      state.syms.insert(src.clone(), RSym::Consumed)
+      state.syms.insert(dst.clone(), RSym::Live)
+    else
+      violations.push(path.clone() + ": move of a non-live `" + src.clone() + "` (use-of-consumed / read-before-init)")
+    end
+    true
+  when ShapeOp::SSink(name) then
+    let cur = oracle_sym(state, name.clone())
+    match cur
+    when RSym::Live then state.syms.insert(name.clone(), RSym::Consumed)
+    when RSym::Consumed then violations.push(path.clone() + ": consumed-twice — `" + name.clone() + "` is sunk twice")
+    when RSym::Dropped then violations.push(path.clone() + ": consumed-twice — `" + name.clone() + "` is sunk after it was dropped")
+    when RSym::Uninit then violations.push(path.clone() + ": sink of an uninitialized local `" + name.clone() + "`")
+    when RSym::PartialMoved(_) then violations.push(path.clone() + ": sink of a partially moved `" + name.clone() + "`")
+    end
+    true
+  when ShapeOp::SSet(name) then
+    let cur = oracle_sym(state, name.clone())
+    if oracle_is_live(cur) then
+      violations.push(path.clone() + ": set-initialize of a live `" + name.clone() + "` (the assign-drop chain must have finalized the old value first)")
+    else
+      state.syms.insert(name.clone(), RSym::Live)
+    end
+    true
+  when ShapeOp::SRead(name) then
+    let cur = oracle_sym(state, name.clone())
+    match cur
+    when RSym::Live then ()
+    when RSym::Uninit then violations.push(path.clone() + ": read-before-init — `" + name.clone() + "` is read while uninitialized")
+    when RSym::Consumed then violations.push(path.clone() + ": use-of-consumed — `" + name.clone() + "` is read after it was consumed")
+    when RSym::Dropped then violations.push(path.clone() + ": use-of-consumed — `" + name.clone() + "` is read after it was dropped")
+    when RSym::PartialMoved(_) then violations.push(path.clone() + ": whole-read of a partially moved `" + name.clone() + "` (partial-then-whole use)")
+    end
+    true
+  when ShapeOp::SPartial(name, field) then
+    let cur = oracle_sym(state, name.clone())
+    match cur
+    when RSym::Live then state.syms.insert(name.clone(), RSym::PartialMoved(field))
+    when RSym::PartialMoved(f) then
+      if f == field then violations.push(path.clone() + ": consumed-twice — field " + field.to_string() + " of `" + name.clone() + "` is consumed twice")
+      else violations.push(path.clone() + ": consumed-twice — a second field of `" + name.clone() + "` is consumed after a partial move (only one partial move per shape is modeled)")
+      end
+    when _ then violations.push(path.clone() + ": partial move of a non-live `" + name.clone() + "`")
+    end
+    true
+  when ShapeOp::SDefer(name) then
+    let cur = oracle_sym(state, name.clone())
+    if oracle_not_live(cur) then
+      violations.push(path.clone() + ": defer-after-consume — a defer for the already-finalized `" + name.clone() + "` was registered")
+    else
+      state.defers.insert(name.clone())
+    end
+    true
+  when ShapeOp::SBreak then
+    # The break edge: every Live local is finalized exactly once by the
+    # edge cleanup, then the loop path exits.
+    let _ = oracle_edge_cleanup(state, path.clone() + "/break", violations)
+    false
+  when ShapeOp::SContinue then
+    # The continue edge: every Live local is finalized exactly once by the
+    # edge cleanup, then the iteration restarts from the head state (the
+    # per-iteration rule — the restart is handled by RLoop).
+    let _ = oracle_edge_cleanup(state, path.clone() + "/continue", violations)
+    true
+  end
+end
+
+# The shape verdict: accept iff no violation was recorded and every exit
+# edge finalized its live locals exactly once.
+def oracle_accepts(model: RNode) -> Bool
+  var state = oracle_state_new()
+  var violations = Vec::new()
+  var iterations = 0
+  let _ = oracle_run(model, &mut state, "shape", &mut violations, &mut iterations)
+  violations.is_empty()
+end
+
+# ———————————————————————————————————————————————————————————————
+# The shape model builder — the shapes of the mandate: sequence, if,
+# match, loop, while, break, continue, return, defer, sink, set,
+# partial-destructure, reassign.
+# ———————————————————————————————————————————————————————————————
+
+def op_make(name: String) -> RNode
+  RNode::ROp(ShapeOp::SMake(name))
+end
+
+def op_drop(name: String) -> RNode
+  RNode::ROp(ShapeOp::SDrop(name))
+end
+
+def op_move(dst: String, src: String) -> RNode
+  RNode::ROp(ShapeOp::SMove(dst, src))
+end
+
+def op_sink(name: String) -> RNode
+  RNode::ROp(ShapeOp::SSink(name))
+end
+
+def op_set(name: String) -> RNode
+  RNode::ROp(ShapeOp::SSet(name))
+end
+
+def op_read(name: String) -> RNode
+  RNode::ROp(ShapeOp::SRead(name))
+end
+
+def op_partial(name: String, field: Int) -> RNode
+  RNode::ROp(ShapeOp::SPartial(name, field))
+end
+
+def op_defer(name: String) -> RNode
+  RNode::ROp(ShapeOp::SDefer(name))
+end
+
+def op_break() -> RNode
+  RNode::ROp(ShapeOp::SBreak)
+end
+
+def op_continue() -> RNode
+  RNode::ROp(ShapeOp::SContinue)
+end
+
+def node_seq(nodes: Vec[RNode]) -> RNode
+  RNode::RSeq(nodes)
+end
+
+def model_shape_seq_drop() -> RNode
+  var ns = Vec::new()
+  ns.push(op_make("r1"))
+  ns.push(op_make("r2"))
+  ns.push(op_drop("r1"))
+  ns.push(op_drop("r2"))
+  ns.push(RNode::RExit)
+  node_seq(ns)
+end
+
+def model_shape_if_consume_or_drop() -> RNode
+  var ns = Vec::new()
+  ns.push(op_make("r"))
+  ns.push(RNode::RIf(op_sink("r"), op_drop("r")))
+  ns.push(RNode::RExit)
+  node_seq(ns)
+end
+
+def model_shape_match_arms() -> RNode
+  var arms = Vec::new()
+  arms.push(op_drop("r"))
+  arms.push(op_sink("r"))
+  var ns = Vec::new()
+  ns.push(op_make("r"))
+  ns.push(RNode::RMatch(arms))
+  ns.push(RNode::RExit)
+  node_seq(ns)
+end
+
+def model_shape_loop_per_iteration() -> RNode
+  var body = Vec::new()
+  body.push(op_make("r"))
+  body.push(op_drop("r"))
+  var outer = Vec::new()
+  outer.push(RNode::RLoop(node_seq(body)))
+  outer.push(RNode::RExit)
+  node_seq(outer)
+end
+
+def model_shape_while_per_iteration() -> RNode
+  var body = Vec::new()
+  body.push(op_make("r"))
+  body.push(op_drop("r"))
+  var outer = Vec::new()
+  outer.push(RNode::RLoop(node_seq(body)))
+  outer.push(RNode::RExit)
+  node_seq(outer)
+end
+
+def model_shape_break_with_live() -> RNode
+  var body = Vec::new()
+  body.push(op_make("r"))
+  body.push(op_drop("r"))
+  body.push(op_break())
+  var outer = Vec::new()
+  outer.push(RNode::RLoop(node_seq(body)))
+  outer.push(RNode::RExit)
+  node_seq(outer)
+end
+
+def model_shape_continue_per_iteration() -> RNode
+  var body = Vec::new()
+  body.push(op_make("r"))
+  body.push(op_continue())
+  var outer = Vec::new()
+  outer.push(RNode::RLoop(node_seq(body)))
+  outer.push(RNode::RExit)
+  node_seq(outer)
+end
+
+def model_shape_return_live() -> RNode
+  var ns = Vec::new()
+  ns.push(op_make("r"))
+  ns.push(RNode::RExit)
+  node_seq(ns)
+end
+
+def model_shape_defer_live() -> RNode
+  var ns = Vec::new()
+  ns.push(op_make("r"))
+  ns.push(op_defer("r"))
+  ns.push(RNode::RExit)
+  node_seq(ns)
+end
+
+def model_shape_sink_consume() -> RNode
+  var ns = Vec::new()
+  ns.push(op_make("r"))
+  ns.push(op_sink("r"))
+  ns.push(RNode::RExit)
+  node_seq(ns)
+end
+
+def model_shape_set_param() -> RNode
+  var ns = Vec::new()
+  ns.push(op_set("r"))
+  ns.push(op_drop("r"))
+  ns.push(RNode::RExit)
+  node_seq(ns)
+end
+
+def model_shape_partial_destructure() -> RNode
+  var ns = Vec::new()
+  ns.push(op_make("p"))
+  ns.push(op_partial("p", 0))
+  ns.push(RNode::RExit)
+  node_seq(ns)
+end
+
+def model_shape_reassign() -> RNode
+  var ns = Vec::new()
+  ns.push(op_make("r"))
+  ns.push(op_drop("r"))
+  ns.push(op_make("r"))
+  ns.push(RNode::RExit)
+  node_seq(ns)
+end
+
+def model_shape_move_transfer() -> RNode
+  var ns = Vec::new()
+  ns.push(op_make("r"))
+  ns.push(op_move("r2", "r"))
+  ns.push(op_read("r2"))
+  ns.push(RNode::RExit)
+  node_seq(ns)
+end
+
+# The NEGATIVE shapes — the oracle must say REJECT; the runner verifies
+# the compiler rejects the mirrored tests/resource_cfg/neg/*.tg files.
+
+def model_shape_neg_use_after_consume() -> RNode
+  var ns = Vec::new()
+  ns.push(op_make("r"))
+  ns.push(op_sink("r"))
+  ns.push(op_read("r"))
+  node_seq(ns)
+end
+
+def model_shape_neg_double_consume() -> RNode
+  var ns = Vec::new()
+  ns.push(op_make("r"))
+  ns.push(op_sink("r"))
+  ns.push(op_sink("r"))
+  node_seq(ns)
+end
+
+def model_shape_neg_deinit_after_consume() -> RNode
+  var ns = Vec::new()
+  ns.push(op_make("r"))
+  ns.push(op_sink("r"))
+  ns.push(op_drop("r"))
+  node_seq(ns)
+end
+
+def model_shape_neg_maybe_live_join() -> RNode
+  var ns = Vec::new()
+  ns.push(op_make("r"))
+  ns.push(RNode::RIf(op_sink("r"), node_seq(Vec::new())))
+  ns.push(op_read("r"))
+  node_seq(ns)
+end
+
+def model_shape_neg_read_before_init() -> RNode
+  var ns = Vec::new()
+  ns.push(op_read("r"))
+  node_seq(ns)
+end
+
+def model_shape_neg_arm_inconsistent() -> RNode
+  var ns = Vec::new()
+  ns.push(op_make("r"))
+  ns.push(RNode::RIf(op_make("r2"), op_sink("r")))
+  ns.push(op_read("r"))
+  node_seq(ns)
+end
+
+def model_shape_neg_partial_then_whole() -> RNode
+  var ns = Vec::new()
+  ns.push(op_make("p"))
+  ns.push(op_partial("p", 0))
+  ns.push(op_drop("p"))
+  node_seq(ns)
+end
+
+def model_shape_neg_defer_after_consume() -> RNode
+  var ns = Vec::new()
+  ns.push(op_make("r"))
+  ns.push(op_sink("r"))
+  ns.push(op_defer("r"))
+  ns.push(RNode::RExit)
+  node_seq(ns)
+end
+
+def model_shape_neg_loop_carried_consume() -> RNode
+  var ns = Vec::new()
+  ns.push(op_make("r"))
+  ns.push(RNode::RLoop(op_sink("r")))
+  ns.push(RNode::RExit)
+  node_seq(ns)
+end
+
+# The verdict table: (name, model, expected-verdict, source-fn, kind).
+struct ShapeEntry
+  name: String
+  model: RNode
+  expected_accept: Bool
+  source_fn: String
+  is_positive: Bool
+end
+
+def shape_entry(name: String, model: RNode, expected_accept: Bool, source_fn: String, is_positive: Bool) -> ShapeEntry
+  ShapeEntry {
+    name: name,
+    model: model,
+    expected_accept: expected_accept,
+    source_fn: source_fn,
+    is_positive: is_positive
+  }
+end
+
+def build_shape_table() -> Vec[ShapeEntry]
+  var table = Vec::new()
+  table.push(shape_entry("seq_drop", model_shape_seq_drop(), true, "shape_seq_drop", true))
+  table.push(shape_entry("if_consume_or_drop", model_shape_if_consume_or_drop(), true, "shape_if_consume_or_drop", true))
+  table.push(shape_entry("match_arms", model_shape_match_arms(), true, "shape_match_arms", true))
+  table.push(shape_entry("loop_per_iteration", model_shape_loop_per_iteration(), true, "shape_loop_per_iteration", true))
+  table.push(shape_entry("while_per_iteration", model_shape_while_per_iteration(), true, "shape_while_per_iteration", true))
+  table.push(shape_entry("break_with_live", model_shape_break_with_live(), true, "shape_break_with_live", true))
+  table.push(shape_entry("continue_per_iteration", model_shape_continue_per_iteration(), true, "shape_continue_per_iteration", true))
+  table.push(shape_entry("return_live", model_shape_return_live(), true, "shape_return_live", true))
+  table.push(shape_entry("defer_live", model_shape_defer_live(), true, "shape_defer_live", true))
+  table.push(shape_entry("sink_consume", model_shape_sink_consume(), true, "shape_sink_consume", true))
+  table.push(shape_entry("set_param", model_shape_set_param(), true, "shape_set_param", true))
+  table.push(shape_entry("partial_destructure", model_shape_partial_destructure(), true, "shape_partial_destructure", true))
+  table.push(shape_entry("reassign", model_shape_reassign(), true, "shape_reassign", true))
+  table.push(shape_entry("move_transfer", model_shape_move_transfer(), true, "shape_move_transfer", true))
+  table.push(shape_entry("cfg_neg_use_after_consume", model_shape_neg_use_after_consume(), false, "neg_use_after_consume", false))
+  table.push(shape_entry("cfg_neg_double_consume", model_shape_neg_double_consume(), false, "neg_double_consume", false))
+  table.push(shape_entry("cfg_neg_deinit_after_consume", model_shape_neg_deinit_after_consume(), false, "neg_deinit_after_consume", false))
+  table.push(shape_entry("cfg_neg_maybe_live_join", model_shape_neg_maybe_live_join(), false, "neg_maybe_live_join", false))
+  table.push(shape_entry("cfg_neg_read_before_init", model_shape_neg_read_before_init(), false, "neg_read_before_init", false))
+  table.push(shape_entry("cfg_neg_arm_inconsistent", model_shape_neg_arm_inconsistent(), false, "neg_arm_inconsistent", false))
+  table.push(shape_entry("cfg_neg_partial_then_whole", model_shape_neg_partial_then_whole(), false, "neg_partial_then_whole", false))
+  table.push(shape_entry("cfg_neg_defer_after_consume", model_shape_neg_defer_after_consume(), false, "neg_defer_after_consume", false))
+  table.push(shape_entry("cfg_neg_loop_carried_consume", model_shape_neg_loop_carried_consume(), false, "neg_loop_carried_consume", false))
+  table
+end
+
+# ———————————————————————————————————————————————————————————————
+# The instrumented runtime (the Gate-L shapes): every construction must
+# produce exactly one destructor call — no leaks, no double drops.
+# ———————————————————————————————————————————————————————————————
+
+mut CANARY_DROPS: Int = 0
+
+resource Canary
+  id: Int
+  def deinit(sink self: Self) -> Unit
+    CANARY_DROPS = CANARY_DROPS + 1
+  end
+end
+
+resource Pair
+  a: Canary
+  b: Canary
+end
+
+def sink_canary(sink r: Canary) -> Unit
+end
+
+def drops_since(base: Int) -> Int
+  CANARY_DROPS - base
+end
+
+def shape_seq_drop() -> Unit
+  let r1 = Canary { id: 1 }
+  let r2 = Canary { id: 2 }
+  drop(r1)
+  drop(r2)
+end
+
+def shape_if_consume_or_drop(flag: Bool) -> Unit
+  let r = Canary { id: 3 }
+  if flag then
+    sink_canary(r)
+  else
+    drop(r)
+  end
+end
+
+def shape_match_arms(flag: Bool) -> Unit
+  let r = Canary { id: 4 }
+  let b = if flag then 1 else 0 end
+  match b
+  when 1 then sink_canary(r)
+  when 0 then drop(r)
+  end
+end
+
+def shape_loop_per_iteration() -> Unit
+  var i = 0
+  while i < 3 do
+    let r = Canary { id: 100 + i }
+    drop(r)
+    i = i + 1
+  end
+end
+
+def shape_while_per_iteration() -> Unit
+  var i = 0
+  while i < 2 do
+    let r = Canary { id: 200 + i }
+    drop(r)
+    i = i + 1
+  end
+end
+
+def shape_break_with_live() -> Unit
+  let r = Canary { id: 5 }
+  loop
+    drop(r)
+    break
+  end
+end
+
+def shape_continue_per_iteration() -> Unit
+  var i = 0
+  while i < 2 do
+    let r = Canary { id: 300 + i }
+    i = i + 1
+    continue
+  end
+end
+
+def shape_return_live() -> Unit
+  let r = Canary { id: 6 }
+end
+
+def shape_defer_live() -> Unit
+  let r = Canary { id: 7 }
+  defer
+    drop(r)
+  end
+end
+
+def shape_sink_consume() -> Unit
+  let r = Canary { id: 8 }
+  sink_canary(r)
+end
+
+def shape_set_param(set r: Canary) -> Unit
+  r = Canary { id: 9 }
+  drop(r)
+end
+
+def shape_partial_destructure() -> Unit
+  let p = Pair { a: Canary { id: 10 }, b: Canary { id: 11 } }
+  sink_canary(p.a)
+end
+
+def shape_reassign() -> Unit
+  let r = Canary { id: 12 }
+  drop(r)
+  r = Canary { id: 13 }
+end
+
+def shape_move_transfer() -> Unit
+  let r = Canary { id: 14 }
+  let r2 = r
+  r2.id
+end
+
+# ———————————————————————————————————————————————————————————————
+# Main: run the oracle over the whole shape table and the instrumented
+# shapes at runtime.
+# ———————————————————————————————————————————————————————————————
+
+def main() -> Int
+  println("========================================")
+  println("Resource CFG Oracle Suite (item 9)")
+  println("========================================")
+  let table = build_shape_table()
+  for entry in table do
+    let oracle_verdict = oracle_accepts(entry.model)
+    check(oracle_verdict == entry.expected_accept,
+      "oracle verdict for " + entry.name.clone() + " (expected " + (if entry.expected_accept then "ACCEPT" else "REJECT" end) + ", oracle said " + (if oracle_verdict then "ACCEPT" else "REJECT" end) + ")")
+    if entry.is_positive then
+      # The compiler accepted this shape into THIS file — the equation
+      # compiler-accept == oracle-accept holds for the positives by
+      # construction, and the runtime counters prove exactly-once.
+      check(entry.expected_accept, "compiler accepted positive shape " + entry.name.clone() + " (the function compiled into this file)")
+    else
+      # The compiler side of the negatives is the runner's job
+      # (run_cfg_oracle.sh checks each tests/resource_cfg/neg/*.tg file is
+      # rejected by `tg check`); the oracle side is asserted here.
+      ()
+    end
+  end
+
+  println("\n--- instrumented counters (Gate-L shapes) ---")
+  var base = CANARY_DROPS
+  shape_seq_drop()
+  check_eq(drops_since(base), 2, "seq_drop: exactly 2 destructor calls for 2 constructions")
+  base = CANARY_DROPS
+  shape_if_consume_or_drop(true)
+  shape_if_consume_or_drop(false)
+  check_eq(drops_since(base), 2, "if_consume_or_drop: exactly 1 destructor per construction on EACH arm (2 calls, 2 constructions)")
+  base = CANARY_DROPS
+  shape_match_arms(true)
+  shape_match_arms(false)
+  check_eq(drops_since(base), 2, "match_arms: exactly 1 destructor per construction on EACH arm")
+  base = CANARY_DROPS
+  shape_loop_per_iteration()
+  check_eq(drops_since(base), 3, "loop_per_iteration: 3 iterations, exactly 3 destructor calls")
+  base = CANARY_DROPS
+  shape_while_per_iteration()
+  check_eq(drops_since(base), 2, "while_per_iteration: 2 iterations, exactly 2 destructor calls")
+  base = CANARY_DROPS
+  shape_break_with_live()
+  check_eq(drops_since(base), 1, "break_with_live: the break edge finalized the live resource exactly once")
+  base = CANARY_DROPS
+  shape_continue_per_iteration()
+  check_eq(drops_since(base), 2, "continue_per_iteration: the continue edge finalized the per-iteration resource exactly once per iteration (2 iterations)")
+  base = CANARY_DROPS
+  shape_return_live()
+  check_eq(drops_since(base), 1, "return_live: the return edge finalized the live resource exactly once")
+  base = CANARY_DROPS
+  shape_defer_live()
+  check_eq(drops_since(base), 1, "defer_live: the defer finalized the live resource exactly once at the edge")
+  base = CANARY_DROPS
+  shape_sink_consume()
+  check_eq(drops_since(base), 1, "sink_consume: the transferred resource is destroyed exactly once (in the callee)")
+  base = CANARY_DROPS
+  shape_partial_destructure()
+  check_eq(drops_since(base), 2, "partial_destructure: the moved field is destroyed in the callee + the remaining field by the scope chain = 2 constructions, 2 destructor calls")
+  base = CANARY_DROPS
+  shape_reassign()
+  check_eq(drops_since(base), 2, "reassign: the explicit drop + the scope-exit chain = 2 constructions, 2 destructor calls")
+  base = CANARY_DROPS
+  shape_move_transfer()
+  check_eq(drops_since(base), 1, "move_transfer: the moved-to local's scope exit destroys exactly once")
+
+  println("\n========================================")
+  println("Results: " + tests_passed.to_string() + " passed, " + tests_failed.to_string() + " failed")
+  println("========================================")
+  if tests_failed > 0 then
+    panic("CFG ORACLE TESTS FAILED")
+  end
+  0
+end

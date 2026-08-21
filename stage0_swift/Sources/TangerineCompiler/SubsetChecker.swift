@@ -217,6 +217,13 @@ public final class SubsetChecker {
         case .assocBinding(_, let value, _):
             checkTypeExpr(value)
         case .dynTrait(let inner, _), .implTrait(let inner, _):
+            // INV-TYPE-010 / INV-ABI-007 scoping action: trait objects are
+            // NOT in the bootstrap subset. The kernel compiles without any
+            // type-position dyn/impl (the stage3 parser desugars both to the
+            // plain trait type — no trait-object TYPE exists in the
+            // dialect), so rejecting the surface here removes it from the
+            // bootstrap callable entirely.
+            reject("E9032", "trait-object types (dyn Trait / impl Trait in type position) are not available in the bootstrap subset", inner.span)
             checkTypeExpr(inner)
         case .bounded(let base, let bounds, _):
             checkTypeExpr(base)

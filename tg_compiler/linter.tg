@@ -16,38 +16,512 @@ use std::io::{eprintln}
 use tg_compiler::lexer::{tokenize}
 use tg_compiler::parser::{parse, diag_has_errors}
 use tg_compiler::ast::{Program, Item, ItemKind, Expr, ExprKind, Stmt, StmtKind,
-                        FunctionDecl, FnBody, Param, TypeExpr, Pattern,
-                        Block, Visibility, Annotation, AnnotationArg,
-                        StructDecl, EnumDecl, TraitDecl, ImplDecl}
+                        FunctionDecl, FunctionSig, FnBody, Param, TypeExpr, TypeExprKind, Pattern,
+                        PatternKind, Block, Visibility, Annotation, AnnotationArg,
+                        StructDecl, EnumDecl, TraitDecl, ImplDecl, UseDecl, ConstDecl,
+                        StaticDecl, TypeAliasDecl, ModuleDecl, ExternBlock, ExternItem,
+                        MacroDecl, MatchExpr, IfStmt, ForStmt, CatchArm, GuardElse}
 use tg_compiler::token::{Token, TokenKind, Span}
+# (semantic lints): the typed-program payload — the analyzed program
+# (resolutions: call_targets / expr_resolutions / type_def_ids / item_defs)
+# the DefId-reachability passes consume. The source-string heuristics are
+# removed; the AST reference sets are the fallback when the full analysis
+# cannot run on a file.
+use tg_compiler::compiler_core::{default_options, analyze_source}
+use tg_compiler::resolver::{ResolvedNames, ResolvedExprKind}
+use tg_compiler::ids::{def_id_numeric}
 
 # ———————————————————————————————————————————————————————————————
 # Helper Functions
 # ———————————————————————————————————————————————————————————————
 
-# Count occurrences of a name identifier within source text
-def count_name_occurrences(source: String, name: String) -> Int
-  var count = 0
-  var pos = 0
-  let name_len = name.len()
-  while pos + name_len <= source.len() do
-    if source.slice(pos, pos + name_len) == name.clone() then
-      # Check word boundaries (not part of larger identifier)
-      let before_ok = pos == 0 || !is_ident_char(source.char_at(pos - 1))
-      let after_ok = pos + name_len >= source.len() || !is_ident_char(source.char_at(pos + name_len))
-      if before_ok && after_ok then
-        count = count + 1
-      end
-      pos = pos + name_len
-    else
-      pos = pos + 1
-    end
+# (semantic lints): the AST reference walkers below REPLACE the former
+# source-text occurrence counters (count_name_occurrences /
+# count_occurrences — the source-string heuristics that matched comments
+# and string payloads). The reference sets are derived from the PROGRAM
+# structure: expression identifiers, path segments, method names, type
+# names, and pattern identifiers.
+
+def collect_program_references(program: Program, inout refs: Set[String]) -> Unit
+  for item in program.items do
+    collect_item_references(&item, refs)
   end
-  count
 end
 
-def is_ident_char(c: Char) -> Bool
-  (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
+def collect_item_references(item: Item, inout refs: Set[String]) -> Unit
+  match item.kind
+  when ItemKind::ItemFunction(func) then
+    collect_fn_references(func, refs)
+  when ItemKind::ItemStruct(s) then
+    for fld in s.fields do
+      collect_type_refs(&fld.ty, refs)
+      match fld.default
+      when Option::Some(d) then collect_expr_refs(&d, refs)
+      when Option::None then ()
+      end
+    end
+    for m in s.methods do
+      collect_fn_references(m, refs)
+    end
+  when ItemKind::ItemEnum(e) then
+    for v in e.variants do
+      for fty in v.fields do
+        collect_type_refs(&fty, refs)
+      end
+      match v.discriminant
+      when Option::Some(d) then collect_expr_refs(&d, refs)
+      when Option::None then ()
+      end
+    end
+  when ItemKind::ItemTrait(t) then
+    for st in t.super_traits do
+      collect_type_refs(&st, refs)
+    end
+    for m in t.methods do
+      collect_fn_sig_refs(&m.sig, refs)
+      match m.default_body
+      when FnBody::FnBlock(block) then collect_block_refs(&block, refs)
+      when FnBody::FnExpr(expr) then collect_expr_refs(&expr, refs)
+      when _ then ()
+      end
+    end
+  when ItemKind::ItemImpl(imp) then
+    collect_type_refs(&imp.for_type, refs)
+    collect_type_refs(&imp.self_type, refs)
+    for ta in imp.trait_type_args do
+      collect_type_refs(&ta, refs)
+    end
+    match imp.trait_name
+    when Option::Some(tn) then refs.insert(tn)
+    when Option::None then ()
+    end
+    for m in imp.methods do
+      collect_fn_references(m, refs)
+    end
+  when ItemKind::ItemModule(m) then
+    for inner in m.items do
+      collect_item_references(&inner, refs)
+    end
+  when ItemKind::ItemConst(c) then
+    match c.ty
+    when Option::Some(ty) then collect_type_refs(&ty, refs)
+    when Option::None then ()
+    end
+    collect_expr_refs(&c.value, refs)
+  when ItemKind::ItemStatic(s) then
+    collect_type_refs(&s.ty, refs)
+    collect_expr_refs(&s.value, refs)
+  when ItemKind::ItemTypeAlias(ta) then
+    collect_type_refs(&ta.ty, refs)
+  when ItemKind::ItemExternBlock(ext) then
+    for item2 in ext.items do
+      match item2
+      when ExternItem::Function(efn) then
+        for p in efn.params do
+          match p.ty
+          when Option::Some(ty) then collect_type_refs(&ty, refs)
+          when Option::None then ()
+          end
+        end
+        match efn.ret_type
+        when Option::Some(ty) then collect_type_refs(&ty, refs)
+        when Option::None then ()
+        end
+      when ExternItem::Static(es) then
+        collect_type_refs(&es.ty, refs)
+      end
+    end
+  when ItemKind::ItemMacro(mac) then
+    collect_block_refs(&mac.body, refs)
+  when _ then ()
+  end
+end
+
+def collect_fn_references(func: FunctionDecl, inout refs: Set[String]) -> Unit
+  for param in func.params do
+    match param.ty
+    when Option::Some(ty) then collect_type_refs(&ty, refs)
+    when Option::None then ()
+    end
+    match param.default
+    when Option::Some(d) then collect_expr_refs(&d, refs)
+    when Option::None then ()
+    end
+  end
+  match func.ret_type
+  when Option::Some(ty) then collect_type_refs(&ty, refs)
+  when Option::None then ()
+  end
+  for clause in func.where_clause do
+    collect_type_refs(&clause.ty, refs)
+    for bound in clause.bounds do
+      collect_type_refs(&bound, refs)
+    end
+  end
+  match func.body
+  when FnBody::FnBlock(block) then collect_block_refs(&block, refs)
+  when FnBody::FnExpr(expr) then collect_expr_refs(&expr, refs)
+  when _ then ()
+  end
+end
+
+def collect_fn_sig_refs(sig: FunctionSig, inout refs: Set[String]) -> Unit
+  for param in sig.params do
+    match param.ty
+    when Option::Some(ty) then collect_type_refs(&ty, refs)
+    when Option::None then ()
+    end
+  end
+  match sig.ret_type
+  when Option::Some(ty) then collect_type_refs(&ty, refs)
+  when Option::None then ()
+  end
+end
+
+def collect_block_refs(block: Block, inout refs: Set[String]) -> Unit
+  for stmt in block.stmts do
+    collect_stmt_refs(stmt, refs)
+  end
+end
+
+def collect_stmt_refs(stmt: Stmt, inout refs: Set[String]) -> Unit
+  match stmt.kind
+  when StmtKind::StmtExpr(expr) then collect_expr_refs(&expr, refs)
+  when StmtKind::StmtLet(pattern, ty_opt, init, _) then
+    collect_pattern_refs(&pattern, refs)
+    match ty_opt
+    when Option::Some(ty) then collect_type_refs(&ty, refs)
+    when Option::None then ()
+    end
+    collect_expr_refs(&init, refs)
+  when StmtKind::StmtAssign(target, value) then
+    collect_expr_refs(&target, refs)
+    collect_expr_refs(&value, refs)
+  when StmtKind::StmtCompoundAssign(_, target, value) then
+    collect_expr_refs(&target, refs)
+    collect_expr_refs(&value, refs)
+  when StmtKind::StmtIf(if_stmt) then collect_if_refs(&if_stmt, refs)
+  when StmtKind::StmtMatch(m) then collect_match_refs(&m, refs)
+  when StmtKind::StmtWhile(cond, body) then
+    collect_expr_refs(&cond, refs)
+    collect_block_refs(&body, refs)
+  when StmtKind::StmtFor(for_stmt) then
+    collect_pattern_refs(&for_stmt.pattern, refs)
+    collect_expr_refs(&for_stmt.iter, refs)
+    collect_block_refs(&for_stmt.body, refs)
+  when StmtKind::StmtLoop(body) then collect_block_refs(&body, refs)
+  when StmtKind::StmtReturn(val) then
+    match val
+    when Option::Some(v) then collect_expr_refs(&v, refs)
+    when Option::None then ()
+    end
+  when StmtKind::StmtBreak(val) then
+    match val
+    when Option::Some(v) then collect_expr_refs(&v, refs)
+    when Option::None then ()
+    end
+  when StmtKind::StmtContinue then ()
+  when StmtKind::StmtUnsafe(_, body) then collect_block_refs(&body, refs)
+  when StmtKind::StmtDefer(body) then collect_block_refs(&body, refs)
+  when StmtKind::StmtGuard(cond, else_action) then
+    collect_expr_refs(&cond, refs)
+    match else_action
+    when GuardElse::Return(val_opt) then
+      match val_opt
+      when Option::Some(v) then collect_expr_refs(&v, refs)
+      when Option::None then ()
+      end
+    when GuardElse::Break(val_opt) then
+      match val_opt
+      when Option::Some(v) then collect_expr_refs(&v, refs)
+      when Option::None then ()
+      end
+    when _ then ()
+    end
+  when StmtKind::StmtTry(body, catches, finally_opt) then
+    collect_block_refs(&body, refs)
+    for catch_arm in catches do
+      collect_pattern_refs(&catch_arm.pattern, refs)
+      collect_block_refs(&catch_arm.body, refs)
+    end
+    match finally_opt
+    when Option::Some(fin) then collect_block_refs(&fin, refs)
+    when Option::None then ()
+    end
+  when StmtKind::StmtWith(expr, pat, body) then
+    collect_expr_refs(&expr, refs)
+    collect_pattern_refs(&pat, refs)
+    collect_block_refs(&body, refs)
+  when StmtKind::StmtHandleWith(expr, handlers) then
+    collect_expr_refs(&expr, refs)
+    for handler in handlers do
+      for arm in handler.arms do
+        for p in arm.params do
+          collect_pattern_refs(&p, refs)
+        end
+        collect_block_refs(&arm.body, refs)
+      end
+    end
+  end
+end
+
+def collect_if_refs(if_stmt: IfStmt, inout refs: Set[String]) -> Unit
+  collect_expr_refs(&if_stmt.cond, refs)
+  collect_block_refs(&if_stmt.then_block, refs)
+  for (econd, ebody) in if_stmt.elsif_branches do
+    collect_expr_refs(&econd, refs)
+    collect_block_refs(&ebody, refs)
+  end
+  match if_stmt.else_block
+  when Option::Some(e) then collect_block_refs(&e, refs)
+  when Option::None then ()
+  end
+end
+
+def collect_match_refs(m: MatchExpr, inout refs: Set[String]) -> Unit
+  collect_expr_refs(&m.scrutinee, refs)
+  for arm in m.arms do
+    collect_pattern_refs(&arm.pattern, refs)
+    match arm.guard_expr
+    when Option::Some(g) then collect_expr_refs(&g, refs)
+    when Option::None then ()
+    end
+    collect_block_refs(&arm.body, refs)
+  end
+end
+
+def collect_pattern_refs(pattern: Pattern, inout refs: Set[String]) -> Unit
+  match pattern.kind
+  when PatternKind::Ident(name, _) then refs.insert(name)
+  when PatternKind::Literal(lit) then collect_expr_refs(&lit, refs)
+  when PatternKind::Tuple(pats) then
+    for p in pats do
+      collect_pattern_refs(&p, refs)
+    end
+  when PatternKind::Array(pats) then
+    for p in pats do
+      collect_pattern_refs(&p, refs)
+    end
+  when PatternKind::Struct(path, fields) then
+    for seg in path.segments do
+      refs.insert(seg)
+    end
+    for (_, field_pat) in fields do
+      collect_pattern_refs(&field_pat, refs)
+    end
+  when PatternKind::Variant(path, pats) then
+    for seg in path.segments do
+      refs.insert(seg)
+    end
+    for p in pats do
+      collect_pattern_refs(&p, refs)
+    end
+  when PatternKind::Or(pats) then
+    for p in pats do
+      collect_pattern_refs(&p, refs)
+    end
+  when PatternKind::Range(start, end_val, _) then
+    match start
+    when Option::Some(s) then collect_expr_refs(&s, refs)
+    when Option::None then ()
+    end
+    match end_val
+    when Option::Some(e) then collect_expr_refs(&e, refs)
+    when Option::None then ()
+    end
+  when _ then ()
+  end
+end
+
+def collect_type_refs(ty: TypeExpr, inout refs: Set[String]) -> Unit
+  match ty.kind
+  when TypeExprKind::Named(name, args) then
+    refs.insert(name)
+    for a in args do
+      collect_type_refs(&a, refs)
+    end
+  when TypeExprKind::Tuple(elems) then
+    for e in elems do
+      collect_type_refs(&e, refs)
+    end
+  when TypeExprKind::Array(elem, size) then
+    collect_type_refs(&elem, refs)
+    match size
+    when Option::Some(size_expr) then collect_expr_refs(&size_expr, refs)
+    when Option::None then ()
+    end
+  when TypeExprKind::Slice(elem) then collect_type_refs(&elem, refs)
+  when TypeExprKind::Ptr(inner) then collect_type_refs(&inner, refs)
+  when TypeExprKind::PtrMut(inner) then collect_type_refs(&inner, refs)
+  when TypeExprKind::Ref(inner, _) then collect_type_refs(&inner, refs)
+  when TypeExprKind::Fn(params, ret) then
+    for p in params do
+      collect_type_refs(&p.ty, refs)
+    end
+    collect_type_refs(&ret, refs)
+  when TypeExprKind::Async(inner) then collect_type_refs(&inner, refs)
+  when TypeExprKind::Effect(_, inner) then collect_type_refs(&inner, refs)
+  when TypeExprKind::Path(path) then
+    for seg in path.segments do
+      refs.insert(seg)
+    end
+  when _ then ()
+  end
+end
+
+def collect_expr_refs(expr: Expr, inout refs: Set[String]) -> Unit
+  match expr.kind
+  when ExprKind::ExprIdent(name) then refs.insert(name)
+  when ExprKind::ExprPath(path) then
+    for seg in path.segments do
+      refs.insert(seg)
+    end
+  when ExprKind::ExprArrayLit(elems) then
+    for e in elems do
+      collect_expr_refs(&e, refs)
+    end
+  when ExprKind::ExprTupleLit(elems) then
+    for e in elems do
+      collect_expr_refs(&e, refs)
+    end
+  when ExprKind::ExprStructLit(path, fields) then
+    for seg in path.segments do
+      refs.insert(seg)
+    end
+    for (_, field_value) in fields do
+      collect_expr_refs(&field_value, refs)
+    end
+  when ExprKind::ExprMapLit(entries) then
+    for (key, value) in entries do
+      collect_expr_refs(&key, refs)
+      collect_expr_refs(&value, refs)
+    end
+  when ExprKind::ExprBinaryOp(_, left, right) then
+    collect_expr_refs(left, refs)
+    collect_expr_refs(right, refs)
+  when ExprKind::ExprUnaryOp(_, operand) then
+    collect_expr_refs(operand, refs)
+  when ExprKind::ExprFieldAccess(obj, _) then
+    collect_expr_refs(obj, refs)
+  when ExprKind::ExprMethodCall(receiver, method, type_args, args) then
+    collect_expr_refs(receiver, refs)
+    refs.insert(method)
+    for ta in type_args do
+      collect_type_refs(&ta, refs)
+    end
+    for a in args do
+      collect_expr_refs(&a, refs)
+    end
+  when ExprKind::ExprIndex(arr, idx) then
+    collect_expr_refs(arr, refs)
+    collect_expr_refs(idx, refs)
+  when ExprKind::ExprCall(callee, args) then
+    collect_expr_refs(callee, refs)
+    for a in args do
+      collect_expr_refs(&a, refs)
+    end
+  when ExprKind::ExprClosure(params, ret_ty, body) then
+    for param in params do
+      collect_pattern_refs(&param.pat, refs)
+      match param.ty
+      when Option::Some(param_ty) then collect_type_refs(&param_ty, refs)
+      when Option::None then ()
+      end
+    end
+    match ret_ty
+    when Option::Some(ret_type) then collect_type_refs(&ret_type, refs)
+    when Option::None then ()
+    end
+    collect_expr_refs(body, refs)
+  when ExprKind::ExprAccess(inner) then
+    collect_expr_refs(inner, refs)
+  when ExprKind::ExprRawDeref(inner) then
+    collect_expr_refs(inner, refs)
+  when ExprKind::ExprIf(if_stmt) then collect_if_refs(&if_stmt, refs)
+  when ExprKind::ExprMatch(m) then collect_match_refs(&m, refs)
+  when ExprKind::ExprBlock(block) then collect_block_refs(&block, refs)
+  when ExprKind::ExprUnsafe(_, block) then collect_block_refs(&block, refs)
+  when ExprKind::ExprAsync(block) then collect_block_refs(&block, refs)
+  when ExprKind::ExprAwait(inner) then collect_expr_refs(inner, refs)
+  when ExprKind::ExprTry(inner) then collect_expr_refs(inner, refs)
+  when ExprKind::ExprRange(start_opt, end_opt, _) then
+    match start_opt
+    when Option::Some(s) then collect_expr_refs(&s, refs)
+    when Option::None then ()
+    end
+    match end_opt
+    when Option::Some(e) then collect_expr_refs(&e, refs)
+    when Option::None then ()
+    end
+  when ExprKind::ExprCast(val, ty) then
+    collect_expr_refs(val, refs)
+    collect_type_refs(&ty, refs)
+  when ExprKind::ExprTypeCheck(val, ty) then
+    collect_expr_refs(val, refs)
+    collect_type_refs(&ty, refs)
+  when ExprKind::ExprComptime(block) then collect_block_refs(&block, refs)
+  when ExprKind::ExprEnumVariant(path, args) then
+    for seg in path.segments do
+      refs.insert(seg)
+    end
+    for a in args do
+      collect_expr_refs(&a, refs)
+    end
+  when ExprKind::ExprAssign(target, value) then
+    collect_expr_refs(target, refs)
+    collect_expr_refs(value, refs)
+  when ExprKind::ExprPipe(left, right) then
+    collect_expr_refs(left, refs)
+    collect_expr_refs(right, refs)
+  when ExprKind::ExprMacroCall(_, args) then
+    for a in args do
+      collect_expr_refs(&a, refs)
+    end
+  when _ then ()
+  end
+end
+
+# (semantic lints): the typed-program DefId reachability — every call
+# target, DefId-carrying expression resolution and type definition
+# recorded by the resolver/type checker. An item whose DefId appears in
+# this set is referenced. The resolutions snapshot is cloned once per file
+# (ResolvedNames: Clone — compiler_core clones it when building the
+# AnalyzedProgram); the analyzed program itself is never held by the
+# linter.
+def collect_referenced_defs(resolutions: ResolvedNames, inout refs: Set[Int]) -> Unit
+  for (_, did) in resolutions.call_targets.entries() do
+    refs.insert(def_id_numeric(did))
+  end
+  for (_, resolved) in resolutions.expr_resolutions.entries() do
+    match resolved.kind
+    when ResolvedExprKind::Function(did) then refs.insert(def_id_numeric(did))
+    when ResolvedExprKind::Method(did) then refs.insert(def_id_numeric(did))
+    when ResolvedExprKind::Constant(did) then refs.insert(def_id_numeric(did))
+    when ResolvedExprKind::Static(did) then refs.insert(def_id_numeric(did))
+    when _ then ()
+    end
+  end
+  for (_, did) in resolutions.type_def_ids.entries() do
+    refs.insert(def_id_numeric(did))
+  end
+end
+
+# An item is referenced: on the typed path, one of the item's DefIds
+# (resolutions.item_defs — the item-index keyed table) appears in the
+# resolver's reference tables; on the AST path, its name appears in the
+# program-wide reference set.
+def lint_item_referenced(inout ctx: LintContext, item_index: Int, name: String) -> Bool
+  match ctx.item_def_numerics.get(item_index)
+  when Option::Some(defs) then
+    for n in defs do
+      if ctx.referenced_defs.contains(n) then
+        return true
+      end
+    end
+    false
+  when Option::None then
+    ctx.referenced_names.contains(name)
+  end
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -116,6 +590,19 @@ struct LintContext
   diagnostics: Vec[LintDiagnostic]
   config: LintConfig
   suppressed: Set[String]          # Currently active #[allow] overrides
+  # (semantic lints): the typed-program-DERIVED data — the source-string
+  # heuristics are removed. When the full analysis (resolve + type-check +
+  # access + resource) runs on the file, `referenced_defs` holds the
+  # resolver's DefId reachability (call targets, DefId-carrying expression
+  # resolutions, type definitions) and `item_def_numerics` maps each item
+  # index to its DefId numerics (the item_defs table) — the dead_code
+  # pass's typed path. When the analysis cannot run (e.g. a fragment that
+  # fails the access/resource checks) the AST reference sets are the
+  # fallback; the linter still reports on the file.
+  referenced_names: Set[String]
+  referenced_defs: Set[Int]
+  item_def_numerics: Map[Int, Vec[Int]]
+  current_item_index: Int
 end
 
 def lint_context_new(file: String, source: String, config: LintConfig) -> LintContext
@@ -124,7 +611,11 @@ def lint_context_new(file: String, source: String, config: LintConfig) -> LintCo
     source: source,
     diagnostics: Vec::new(),
     config: config,
-    suppressed: Set::new()
+    suppressed: Set::new(),
+    referenced_names: Set::new(),
+    referenced_defs: Set::new(),
+    item_def_numerics: Map::new(),
+    current_item_index: 0
   }
 end
 
@@ -413,10 +904,13 @@ impl LintPass for UnusedImportsLint
       match u.names
       when Option::Some(names) then
         for imported_name in names do
-          # Count occurrences of the imported name in source
-          let count = count_name_occurrences(&ctx.source, &imported_name)
-          if count <= 1 then
-            # Import name appears only once (in the use statement itself) — unused
+          # SEMANTIC check: the imported name is used iff the program's AST
+          # references it (an expression identifier, a path segment, a
+          # method name, a type name, a pattern identifier). The former
+          # source-text occurrence count is GONE — it matched comments,
+          # string payloads and unrelated identifiers.
+          if !ctx.referenced_names.contains(imported_name) then
+            # Import name appears only in the use statement itself — unused
             ctx.emit(
               "unused_imports".to_string(),
               LintLevel::Warning,
@@ -464,9 +958,13 @@ impl LintPass for DeadCodeLint
     match item.kind
     when ItemKind::ItemFunction(func) then
       if func.vis != Visibility::Public && func.name != "main" then
-        # Check if function name appears elsewhere in the source
-        let count = count_occurrences(&ctx.source, func.name.clone())
-        if count <= 1 then
+        # SEMANTIC reachability: on the typed path, the item's DefId
+        # appears in the resolver's reference tables (call targets,
+        # DefId-carrying expression resolutions, type definitions); on the
+        # AST path, the name appears in the program-wide reference set.
+        # The former source-text occurrence count is GONE — it matched
+        # comments, string payloads and unrelated identifiers.
+        if !lint_item_referenced(ctx, ctx.current_item_index, func.name.clone()) then
           ctx.emit(
             "dead_code".to_string(),
             LintLevel::Warning,
@@ -477,8 +975,7 @@ impl LintPass for DeadCodeLint
       end
     when ItemKind::ItemStruct(s) then
       if s.vis != Visibility::Public then
-        let count = count_occurrences(&ctx.source, s.name.clone())
-        if count <= 1 then
+        if !lint_item_referenced(ctx, ctx.current_item_index, s.name.clone()) then
           ctx.emit(
             "dead_code".to_string(),
             LintLevel::Warning,
@@ -805,16 +1302,25 @@ impl LintPass for LargeFunctionLint
   end
   
   def check_function(self, inout ctx: LintContext, func: FunctionDecl) -> Unit
-    # Use function span for size estimation since body_span not available
-    let span_size = func.span.end_pos - func.span.start
-    # Estimate lines from span size (rough: 40 chars per line average)
-    let estimated_lines = span_size / 40
+    # EXACT line count over the function's source span — the former
+    # span/40 estimate is GONE (it misclassified long single-line
+    # functions and short dense ones).
+    let source_len = ctx.source.len()
+    let end_pos = if func.span.end_pos <= source_len then func.span.end_pos else source_len end
+    var lines: UInt = 1
+    var i = func.span.start
+    while i < end_pos do
+      if ctx.source.char_at(i) == '\n' then
+        lines = lines + 1
+      end
+      i = i + 1
+    end
     
-    if estimated_lines > self.max_lines then
+    if lines > self.max_lines then
       ctx.emit(
         "large_function".to_string(),
         LintLevel::Warning,
-        "function `" + func.name + "` is too long (~" + estimated_lines.to_string() + " lines, max " + self.max_lines.to_string() + ")",
+        "function `" + func.name + "` is too long (" + lines.to_string() + " lines, max " + self.max_lines.to_string() + ")",
         func.span
       )
     end
@@ -987,30 +1493,6 @@ def to_snake_case(name: String) -> String
   result
 end
 
-def count_occurrences(source: String, name: String) -> UInt
-  var count: UInt = 0
-  var pos: UInt = 0
-  
-  while pos < source.len() do
-    match source.index_of_from(name.clone(), pos)
-    when Option::Some(idx) then
-      # Check it's a word boundary (not part of a larger identifier)
-      let before_ok = idx == 0 || !source.char_at(idx - 1).is_alphanumeric()
-      let after_pos = idx + name.len()
-      let after_ok = after_pos >= source.len() || !source.char_at(after_pos).is_alphanumeric()
-      
-      if before_ok && after_ok then
-        count = count + 1
-      end
-      
-      pos = idx + 1
-    when Option::None then break
-    end
-  end
-  
-  count
-end
-
 # ———————————————————————————————————————————————————————————————
 # Lint Runner
 # ———————————————————————————————————————————————————————————————
@@ -1049,12 +1531,32 @@ def lint_file(path: String, config: LintConfig) -> Result[Vec[LintDiagnostic], S
 end
 
 def lint_source(file: String, source: String, config: LintConfig) -> Result[Vec[LintDiagnostic], String]
-  let tokens = tokenize(source.clone())
+  let tokens = tokenize(source.clone(), file.clone())
   let parse_out = parse(tokens)
   if diag_has_errors(&parse_out.diagnostics) then
     Result::Err("Parse error: " + parse_out.diagnostics[0].message)
   else
     var ctx = lint_context_new(file, source, duplicate_lint_config(config))
+    # (semantic lints): the program-wide AST reference set — the passes
+    # consult it instead of source-text occurrence counts. The typed
+    # semantic data (the resolver's DefId reachability + the item-index ->
+    # DefId table) is attached when the full analysis runs (a file that
+    # fails the access/resource checks keeps the AST fallback — the
+    # linter still reports on it).
+    collect_program_references(&parse_out.program, &mut ctx.referenced_names)
+    match analyze_source(ctx.source.clone(), ctx.file.clone(), default_options())
+    when Result::Ok(analyzed) then
+      let resolutions_snapshot = analyzed.resolutions.clone()
+      collect_referenced_defs(resolutions_snapshot.clone(), &mut ctx.referenced_defs)
+      for (idx, defs) in resolutions_snapshot.item_defs.entries() do
+        var nums: Vec[Int] = Vec::new()
+        for did in defs do
+          nums.push(def_id_numeric(did))
+        end
+        ctx.item_def_numerics.insert(idx, nums)
+      end
+    when Result::Err(_) then ()
+    end
     let runner = lint_runner_new()
     run_lint_runner(&runner, &parse_out.program, &mut ctx)
     Result::Ok(ctx.diagnostics)
@@ -1071,7 +1573,14 @@ def list_lints() -> Vec[(String, String, LintLevel)]
 end
 
 def run_lint_runner(runner: LintRunner, ast: Program, inout ctx: LintContext) -> Unit
+  var item_index = 0
   for item in ast.items do
+    # (semantic lints): the current item's position in the parsed program
+    # — the key the resolver's item_defs table records the item's DefIds
+    # under (the analyzed program's item order matches the parsed
+    # program's: analyze_source analyzes the same single file).
+    ctx.current_item_index = item_index
+
     # Check for #[allow] annotations
     for attr in item.attrs do
       if attr.name == "allow" then
@@ -1122,6 +1631,7 @@ def run_lint_runner(runner: LintRunner, ast: Program, inout ctx: LintContext) ->
         end
       end
     end
+    item_index = item_index + 1
   end
 end
 

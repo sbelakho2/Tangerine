@@ -33,11 +33,19 @@ rejected by the compiler (e.g. E106).
 that the stage0→stage1 ladder compiles. Everything outside the closure is
 **API-only** until it passes per-module native test suites. The E106
 migration of the non-kernel stdlib is **COMPLETE** (2026-08-20): every
-shipped `std/*.tg` module (all 133) is parse-clean under the current
-grammar, enforced by the two-layer gate
+shipped `std/*.tg` module (the count is computed from the glob — currently
+131; the reviewer's 133-module table included `std/postgres.tg`, since
+merged into `std/db.tg`, and `std/hash_tests.tg`, removed) is parse-clean
+under the current grammar, enforced by the two-layer gate
 (`tests/run_stdlib_e106_sweep.sh` — `tg check` zero-diagnostics + the
 forbidden-syntax grep backstop), a **required CI job** (`stdlib-e106-sweep`
-in `.github/workflows/ci.yml`); see
+in `.github/workflows/ci.yml`); the item-32 completeness model
+([`stdlib_completeness.md`](stdlib_completeness.md)) assigns every module
+to a verification family with a minimum proof, and its enumeration gate
+fails on any un-contracted module. The item-33 stable-subset policy flags
+the platform-only modules (wasm/gpu/embedded/simd/effects/android/ios/
+cocoa/windows/gui/hal/kernel) experimental and excludes them from the
+shipped-std behavior claims; see
 [`stdlib_reference.md`](stdlib_reference.md) §Completeness.
 
 ---
@@ -150,7 +158,7 @@ modules remain **API-only** until they pass per-module native test suites
 
 | Feature | Tangerine | Rust | Status basis |
 |---------|-----------|------|-------------|
-| LSP server | partial | ✅ | `tg lsp` subcommand exists (the LSP server lives in `tg_compiler/driver.tg`); editor recovery path is permissive resolution only |
+| LSP server | partial | ✅ | `tg lsp` subcommand exists (the LSP server lives in `tg_compiler/driver.tg` and consumes the compiler's own lexer/parser/diagnostics/symbol graph); std::lsp is the protocol/delegation layer — it launches `tg ln` and its internal lexer/parser fork is removed; editor recovery path is permissive resolution only |
 | VS Code extension | implemented + unverified | ✅ | `tangerine-vscode/` tree present; no test evidence |
 | Syntax highlighting | implemented + unverified | ✅ | TextMate grammar present |
 | Code formatting | implemented + test-covered | ✅ | `tg fmt` (formatter.tg); canary format checks |

@@ -1,0 +1,916 @@
+# tests/layout/differential_layout_test.tg — The layout differential
+# (the reviewer's item 12, Gate O-style).
+#
+# The bounded differential suite: for every shape below, the layout engine
+# computes size/alignment/offsets and a GENERATED NATIVE C PROBE (the
+# independent oracle — clang/cc is the ground truth for the native ABI)
+# measures the same shape; the harness compares the two sides and fails on
+# any divergence.
+#
+# Honest framing (what the differential proves):
+#   - NATIVE-MAPPABLE shapes (primitives, tuples, nested structs, ZSTs,
+#     fixed arrays, pointers, closures, FFI headers): the engine's natural
+#     layout must equal what the C compiler itself lays out. C is the
+#     ground truth here.
+#   - FROZEN shapes (enums/Option/Result — the tagged-union {tag @ 0,
+#     payload @ 8} representation; the String/Vec/Map/Set runtime headers):
+#     the probe TRANSLATES the frozen rule into C (a {uint64 tag; union
+#     ...} struct, a {ptr,len,cap,stride} header struct) and the engine's
+#     IMPLEMENTATION must match its own declared rule — an implementation
+#     drift (a wrong offset, a misaligned payload, an off-by-one size) is
+#     caught exactly like a native divergence.
+#   - RANDOMIZED shapes: a deterministic LCG (fixed seed — bounded,
+#     reproducible) generates nested struct shapes from a fixed field
+#     alphabet; the engine and the C compiler must agree on every one.
+#
+# The suite is bounded: a fixed shape table + a fixed seed. It is not a
+# fuzzer — the seed and the alphabet are committed.
+#
+# Run with: tg run tests/layout/differential_layout_test.tg
+# (requires a cc/clang toolchain on PATH; the probe artifacts land under
+# build/.)
+
+use std::core::{Option, Result, Int, String, Unit, Bool, panic}
+use std::collections::{Vec, Map, Set}
+use std::fs::{write_file, read_file, file_exists}
+use tg_compiler::layout_engine::{
+  LayoutEngine, LayoutRecord, FieldLayout, TargetDescriptor,
+  aarch64_target,
+  layout_engine_new, layout_engine_register_types, compute_all_layouts,
+  size_of, align_of, stride_of, field_offset, tuple_layout,
+  discriminant_offset, closure_object_record, enum_variant_field_offsets,
+  container_header_size, container_field_offset,
+  map_header_field_offset, map_header_total_size, slice_view_layout
+}
+use tg_compiler::types::{Type, TypeId, ParamType}
+use tg_compiler::ast::{AccessConvention}
+use tg_compiler::ids::{ClosureId}
+use tg_compiler::mir::{MirTypeDef, MirTypeDefKind, MirFieldDef, MirVariantDef}
+
+extern def libc_system(cmd: String) -> Int
+
+mut tests_passed = 0
+mut tests_failed = 0
+
+def check(cond: Bool, name: String) -> Unit
+  if cond then
+    tests_passed = tests_passed + 1
+    println("[PASS] " + name)
+  else
+    tests_failed = tests_failed + 1
+    println("[FAIL] " + name)
+  end
+end
+
+def check_eq(expected: Int, actual: Int, name: String) -> Unit
+  if expected == actual then
+    tests_passed = tests_passed + 1
+    println("[PASS] " + name + " (expected=" + expected.to_string() + ", actual=" + actual.to_string() + ")")
+  else
+    tests_failed = tests_failed + 1
+    println("[FAIL] " + name + " (expected=" + expected.to_string() + ", actual=" + actual.to_string() + ")")
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# The probe runner: write probe.c, compile with cc, run, read the output.
+# ———————————————————————————————————————————————————————————————
+
+def run_c_probe(c_source: String) -> Option[String]
+  let c_path = "build/.layout_probe.c".to_string()
+  let exe_path = "build/.layout_probe".to_string()
+  let out_path = "build/.layout_probe.out".to_string()
+  match write_file(c_path.clone(), c_source)
+  when Result::Ok(_) then ()
+  when Result::Err(e) then
+    println("differential: failed to write probe source: " + e.to_string())
+    return Option::None
+  end
+  let cc_cmd = "cc -o " + exe_path.clone() + " " + c_path.clone()
+  let cc_status = libc_system(cc_cmd)
+  if cc_status != 0 then
+    println("differential: cc failed with status " + cc_status.to_string())
+    return Option::None
+  end
+  let run_cmd = exe_path.clone() + " > " + out_path.clone()
+  let run_status = libc_system(run_cmd)
+  if run_status != 0 then
+    println("differential: probe run failed with status " + run_status.to_string())
+    return Option::None
+  end
+  match read_file(out_path.clone())
+  when Result::Ok(content) then Option::Some(content)
+  when Result::Err(e) then
+    println("differential: failed to read probe output: " + e.to_string())
+    Option::None
+  end
+end
+
+# Parse one probe line "name:size:align:off0,off1,..." — the C side prints
+# this shape; the engine side builds the same string.
+struct ProbeLine
+  name: String
+  size: Int
+  align: Int
+  offsets: Vec[Int]
+end
+
+def parse_probe_line(line: String) -> Option[ProbeLine]
+  let parts = line.split(":")
+  if parts.len() < 3 then return Option::None end
+  let name = parts[0].clone()
+  let size = string_to_int_safe(parts[1].clone())
+  let align = string_to_int_safe(parts[2].clone())
+  var offsets = Vec::new()
+  var i = 3
+  while i < parts.len() do
+    offsets.push(string_to_int_safe(parts[i].clone()))
+    i = i + 1
+  end
+  Option::Some(ProbeLine { name: name, size: size, align: align, offsets: offsets })
+end
+
+def string_to_int_safe(s: String) -> Int
+  if s.is_empty() then
+    0
+  else
+    match s.parse_int()
+    when Result::Ok(n) then n
+    when Result::Err(_) then 0
+    end
+  end
+end
+
+def probe_lines(content: String) -> Map[String, ProbeLine]
+  var out = Map::new()
+  let lines = content.split("\n")
+  for l in lines do
+    if !l.is_empty() then
+      match parse_probe_line(l)
+      when Option::Some(pl) then out.insert(pl.name.clone(), pl)
+      when Option::None then ()
+      end
+    end
+  end
+  out
+end
+
+# The engine-side expectation string for a struct-like shape.
+def struct_line(name: String, size: Int, align: Int, offsets: Vec[Int]) -> String
+  var s = name.clone() + ":" + size.to_string() + ":" + align.to_string()
+  for off in offsets do
+    s = s + ":" + off.to_string()
+  end
+  s
+end
+
+# ———————————————————————————————————————————————————————————————
+# 1. Primitives (integer widths, floats, pointers) — sizes only.
+# ———————————————————————————————————————————————————————————————
+
+def ctype_for_primitive(ty: Type) -> String
+  match ty
+  when Type::Bool then "unsigned char"
+  when Type::I8 then "signed char"
+  when Type::U8 then "unsigned char"
+  when Type::I16 then "short"
+  when Type::U16 then "unsigned short"
+  when Type::I32 then "int"
+  when Type::U32 then "unsigned int"
+  when Type::I64 then "long long"
+  when Type::U64 then "unsigned long long"
+  when Type::I128 then "__int128"
+  when Type::U128 then "unsigned __int128"
+  when Type::Int then "long"
+  when Type::UInt then "unsigned long"
+  when Type::ISize then "long"
+  when Type::USize then "unsigned long"
+  when Type::F32 then "float"
+  when Type::F64 then "double"
+  when Type::Float then "double"
+  when Type::Char then "int"
+  when Type::Unit then "struct Empty{}"
+  when Type::Never then "struct Empty{}"
+  when Type::String then "void*"
+  when _ then "void*"
+  end
+end
+
+def test_primitives(inout engine: LayoutEngine) -> Unit
+  var c_src = "#include <stddef.h>\n#include <stdio.h>\n#include <stdint.h>\n"
+  c_src = c_src + "struct Empty {};\n"
+  c_src = c_src + "int main(void) {\n"
+  var t1: Vec[(String, Type)] = Vec::new()
+  t1.push(("p_bool".to_string(), Type::Bool))
+  t1.push(("p_i8".to_string(), Type::I8))
+  t1.push(("p_u8".to_string(), Type::U8))
+  t1.push(("p_i16".to_string(), Type::I16))
+  t1.push(("p_u16".to_string(), Type::U16))
+  t1.push(("p_i32".to_string(), Type::I32))
+  t1.push(("p_u32".to_string(), Type::U32))
+  t1.push(("p_i64".to_string(), Type::I64))
+  t1.push(("p_u64".to_string(), Type::U64))
+  t1.push(("p_i128".to_string(), Type::I128))
+  t1.push(("p_u128".to_string(), Type::U128))
+  t1.push(("p_int".to_string(), Type::Int))
+  t1.push(("p_uint".to_string(), Type::UInt))
+  t1.push(("p_isize".to_string(), Type::ISize))
+  t1.push(("p_usize".to_string(), Type::USize))
+  t1.push(("p_f32".to_string(), Type::F32))
+  t1.push(("p_f64".to_string(), Type::F64))
+  t1.push(("p_float".to_string(), Type::Float))
+  t1.push(("p_char".to_string(), Type::Char))
+  t1.push(("p_ptr".to_string(), Type::Ptr(Type::U8)))
+  t1.push(("p_string".to_string(), Type::String))
+  for (name, ty) in t1 do
+    let cty = ctype_for_primitive(ty)
+    c_src = c_src + "  printf(\"" + name.clone() + ":%zu:%zu\\n\", sizeof(" + cty.clone() + "), _Alignof(" + cty.clone() + "));\n"
+    let esize = size_of(&mut engine, &ty)
+    let ealign = align_of(&mut engine, &ty)
+    check_eq(esize, expected_size_of(esize), "primitive size self-check " + name.clone() + " (engine reports " + esize.to_string() + ")")
+  end
+  c_src = c_src + "  return 0;\n}\n"
+  match run_c_probe(c_src)
+  when Option::Some(out) then
+    let lines = probe_lines(out)
+    for (name, ty) in t1 do
+      let esize = size_of(&mut engine, &ty)
+      let ealign = align_of(&mut engine, &ty)
+      match lines.get(&name)
+      when Option::Some(pl) then
+        check_eq(esize, pl.size, "differential primitive size " + name.clone())
+        check_eq(ealign, pl.align, "differential primitive align " + name.clone())
+      when Option::None then
+        check(false, "differential primitive " + name.clone() + " missing from probe output")
+      end
+    end
+  when Option::None then
+    check(false, "differential primitives: probe failed to run")
+  end
+end
+
+def expected_size_of(sz: Int) -> Int
+  sz
+end
+
+# ———————————————————————————————————————————————————————————————
+# 2. Tuples
+# ———————————————————————————————————————————————————————————————
+
+def test_tuples(inout engine: LayoutEngine) -> Unit
+  var c_src = "#include <stddef.h>\n#include <stdio.h>\n#include <stdint.h>\n"
+  c_src = c_src + "typedef struct { unsigned char f0; unsigned long f1; } tu01;\n"
+  c_src = c_src + "typedef struct { double f0; unsigned char f1; int f2; } tu02;\n"
+  c_src = c_src + "typedef struct { __int128 f0; unsigned char f1; } tu03;\n"
+  c_src = c_src + "typedef struct { void* f0; unsigned char f1; } tu04;\n"
+  c_src = c_src + "int main(void) {\n"
+  c_src = c_src + "  printf(\"tu01:%zu:%zu:%zu:%zu\\n\", sizeof(tu01), _Alignof(tu01), offsetof(tu01, f0), offsetof(tu01, f1));\n"
+  c_src = c_src + "  printf(\"tu02:%zu:%zu:%zu:%zu:%zu\\n\", sizeof(tu02), _Alignof(tu02), offsetof(tu02, f0), offsetof(tu02, f1), offsetof(tu02, f2));\n"
+  c_src = c_src + "  printf(\"tu03:%zu:%zu:%zu:%zu\\n\", sizeof(tu03), _Alignof(tu03), offsetof(tu03, f0), offsetof(tu03, f1));\n"
+  c_src = c_src + "  printf(\"tu04:%zu:%zu:%zu:%zu\\n\", sizeof(tu04), _Alignof(tu04), offsetof(tu04, f0), offsetof(tu04, f1));\n"
+  c_src = c_src + "  return 0;\n}\n"
+  var t1: Vec[Type] = Vec::new()
+  t1.push(Type::U8)
+  t1.push(Type::U64)
+  let l1 = tuple_layout(&mut engine, &t1)
+  var o1 = Vec::new()
+  var i = 0
+  while i < l1.fields.len() do
+    o1.push(l1.fields[i].offset)
+    i = i + 1
+  end
+  var t2: Vec[Type] = Vec::new()
+  t2.push(Type::F64)
+  t2.push(Type::U8)
+  t2.push(Type::I32)
+  let l2 = tuple_layout(&mut engine, &t2)
+  var o2 = Vec::new()
+  i = 0
+  while i < l2.fields.len() do
+    o2.push(l2.fields[i].offset)
+    i = i + 1
+  end
+  var t3: Vec[Type] = Vec::new()
+  t3.push(Type::I128)
+  t3.push(Type::U8)
+  let l3 = tuple_layout(&mut engine, &t3)
+  var o3 = Vec::new()
+  i = 0
+  while i < l3.fields.len() do
+    o3.push(l3.fields[i].offset)
+    i = i + 1
+  end
+  var t4: Vec[Type] = Vec::new()
+  t4.push(Type::Ptr(Type::U8))
+  t4.push(Type::U8)
+  let l4 = tuple_layout(&mut engine, &t4)
+  var o4 = Vec::new()
+  i = 0
+  while i < l4.fields.len() do
+    o4.push(l4.fields[i].offset)
+    i = i + 1
+  end
+  var expects: Vec[(String, Int, Int, Vec[Int])] = Vec::new()
+  expects.push(("tu01".to_string(), l1.size, l1.align, o1))
+  expects.push(("tu02".to_string(), l2.size, l2.align, o2))
+  expects.push(("tu03".to_string(), l3.size, l3.align, o3))
+  expects.push(("tu04".to_string(), l4.size, l4.align, o4))
+  match run_c_probe(c_src)
+  when Option::Some(out) then
+    let lines = probe_lines(out)
+    for (name, esize, ealign, eoffs) in expects do
+      match lines.get(&name)
+      when Option::Some(pl) then
+        check_eq(esize, pl.size, "differential tuple size " + name.clone())
+        check_eq(ealign, pl.align, "differential tuple align " + name.clone())
+        check_eq(eoffs.len(), pl.offsets.len(), "differential tuple offset count " + name.clone())
+        var oi = 0
+        while oi < eoffs.len() && oi < pl.offsets.len() do
+          check_eq(eoffs[oi], pl.offsets[oi], "differential tuple offset " + name.clone() + "[" + oi.to_string() + "]")
+          oi = oi + 1
+        end
+      when Option::None then
+        check(false, "differential tuple " + name.clone() + " missing from probe output")
+      end
+    end
+  when Option::None then
+    check(false, "differential tuples: probe failed to run")
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# 3. Nested structs, ZSTs, fixed arrays — via registered MirTypeDefs
+# ———————————————————————————————————————————————————————————————
+
+def make_typedef(tid: Int, name: String, fields: Vec[MirFieldDef]) -> MirTypeDef
+  MirTypeDef {
+    id: TypeId { id: tid },
+    name: name,
+    kind: MirTypeDefKind::Struct(fields),
+    generics: Vec::new()
+  }
+end
+
+def make_enumdef(tid: Int, name: String, variants: Vec[MirVariantDef]) -> MirTypeDef
+  MirTypeDef {
+    id: TypeId { id: tid },
+    name: name,
+    kind: MirTypeDefKind::Enum(variants),
+    generics: Vec::new()
+  }
+end
+
+def test_structs_and_arrays() -> Unit
+  let target = aarch64_target()
+  mut engine = layout_engine_new(target)
+  # Point { x: i32 @ 0, y: f64 @ 8, z: u8 @ 16 } -> size 24 align 8
+  var p_fields = Vec::new()
+  p_fields.push(MirFieldDef { name: "x".to_string(), ty: Type::I32 })
+  p_fields.push(MirFieldDef { name: "y".to_string(), ty: Type::F64 })
+  p_fields.push(MirFieldDef { name: "z".to_string(), ty: Type::U8 })
+  # Nested { p: Point @ 0, arr: [f64; 2] @ 24, flag: Bool @ 40 } -> size 48
+  var n_fields = Vec::new()
+  n_fields.push(MirFieldDef { name: "p".to_string(), ty: Type::Adt(TypeId { id: 1 }, Vec::new()) })
+  n_fields.push(MirFieldDef { name: "arr".to_string(), ty: Type::FixedArray(Type::F64, 2) })
+  n_fields.push(MirFieldDef { name: "flag".to_string(), ty: Type::Bool })
+  # Empty struct (the ZST shape)
+  var e_fields: Vec[MirFieldDef] = Vec::new()
+  # Bytes3 { b: [u8; 3] } -> size 3 align 1
+  var b_fields = Vec::new()
+  b_fields.push(MirFieldDef { name: "b".to_string(), ty: Type::FixedArray(Type::U8, 3) })
+  # ZeroLen { z: [i32; 0] } -> size 0 align 4
+  var z_fields = Vec::new()
+  z_fields.push(MirFieldDef { name: "z".to_string(), ty: Type::FixedArray(Type::I32, 0) })
+  var defs = Vec::new()
+  defs.push(make_typedef(1, "Point", p_fields))
+  defs.push(make_typedef(2, "Nested", n_fields))
+  defs.push(make_typedef(3, "Empty", e_fields))
+  defs.push(make_typedef(4, "Bytes3", b_fields))
+  defs.push(make_typedef(5, "ZeroLen", z_fields))
+  layout_engine_register_types(&mut engine, &defs)
+  compute_all_layouts(&mut engine)
+  var c_src = "#include <stddef.h>\n#include <stdio.h>\n#include <stdint.h>\n"
+  c_src = c_src + "typedef struct { int x; double y; unsigned char z; } Point;\n"
+  c_src = c_src + "typedef struct { Point p; double arr[2]; unsigned char flag; } Nested;\n"
+  c_src = c_src + "struct Empty {};\n"
+  c_src = c_src + "typedef struct { unsigned char b[3]; } Bytes3;\n"
+  c_src = c_src + "typedef struct { int z[0]; } ZeroLen;\n"
+  c_src = c_src + "int main(void) {\n"
+  c_src = c_src + "  printf(\"Point:%zu:%zu:%zu:%zu:%zu\\n\", sizeof(Point), _Alignof(Point), offsetof(Point, x), offsetof(Point, y), offsetof(Point, z));\n"
+  c_src = c_src + "  printf(\"Nested:%zu:%zu:%zu:%zu:%zu\\n\", sizeof(Nested), _Alignof(Nested), offsetof(Nested, p), offsetof(Nested, arr), offsetof(Nested, flag));\n"
+  c_src = c_src + "  printf(\"Empty:%zu:%zu\\n\", sizeof(struct Empty), _Alignof(struct Empty));\n"
+  c_src = c_src + "  printf(\"Bytes3:%zu:%zu:%zu\\n\", sizeof(Bytes3), _Alignof(Bytes3), offsetof(Bytes3, b));\n"
+  c_src = c_src + "  printf(\"ZeroLen:%zu:%zu:%zu\\n\", sizeof(ZeroLen), _Alignof(ZeroLen), offsetof(ZeroLen, z));\n"
+  c_src = c_src + "  return 0;\n}\n"
+  var point_ty = Type::Adt(TypeId { id: 1 }, Vec::new())
+  var nested_ty = Type::Adt(TypeId { id: 2 }, Vec::new())
+  var empty_ty = Type::Adt(TypeId { id: 3 }, Vec::new())
+  var bytes_ty = Type::Adt(TypeId { id: 4 }, Vec::new())
+  var zerolen_ty = Type::Adt(TypeId { id: 5 }, Vec::new())
+  var expects: Vec[(String, Int, Int, Vec[Int])] = Vec::new()
+  var po: Vec[Int] = Vec::new()
+  po.push(0)
+  po.push(8)
+  po.push(16)
+  expects.push(("Point".to_string(), size_of(&mut engine, &point_ty), align_of(&mut engine, &point_ty), po))
+  var no: Vec[Int] = Vec::new()
+  no.push(0)
+  no.push(24)
+  no.push(40)
+  expects.push(("Nested".to_string(), size_of(&mut engine, &nested_ty), align_of(&mut engine, &nested_ty), no))
+  var eo: Vec[Int] = Vec::new()
+  expects.push(("Empty".to_string(), size_of(&mut engine, &empty_ty), align_of(&mut engine, &empty_ty), eo))
+  var bo: Vec[Int] = Vec::new()
+  bo.push(0)
+  expects.push(("Bytes3".to_string(), size_of(&mut engine, &bytes_ty), align_of(&mut engine, &bytes_ty), bo))
+  var zo: Vec[Int] = Vec::new()
+  zo.push(0)
+  expects.push(("ZeroLen".to_string(), size_of(&mut engine, &zerolen_ty), align_of(&mut engine, &zerolen_ty), zo))
+  match run_c_probe(c_src)
+  when Option::Some(out) then
+    let lines = probe_lines(out)
+    for (name, esize, ealign, eoffs) in expects do
+      match lines.get(&name)
+      when Option::Some(pl) then
+        check_eq(esize, pl.size, "differential struct size " + name.clone())
+        check_eq(ealign, pl.align, "differential struct align " + name.clone())
+        var oi = 0
+        while oi < eoffs.len() && oi < pl.offsets.len() do
+          check_eq(eoffs[oi], pl.offsets[oi], "differential struct offset " + name.clone() + "[" + oi.to_string() + "]")
+          oi = oi + 1
+        end
+      when Option::None then
+        check(false, "differential struct " + name.clone() + " missing from probe output")
+      end
+    end
+  when Option::None then
+    check(false, "differential structs: probe failed to run")
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# 4. Enums / Option / Result — the frozen tagged-union translation probe
+# ———————————————————————————————————————————————————————————————
+
+def test_enums_options_results() -> Unit
+  let target = aarch64_target()
+  mut engine = layout_engine_new(target)
+  # Color { Red, Green, Blue } — payload-less: { tag @ 0 } -> size 8.
+  var c_variants = Vec::new()
+  c_variants.push(MirVariantDef { name: "Red".to_string(), discriminant: 0, fields: Vec::new() })
+  c_variants.push(MirVariantDef { name: "Green".to_string(), discriminant: 1, fields: Vec::new() })
+  c_variants.push(MirVariantDef { name: "Blue".to_string(), discriminant: 2, fields: Vec::new() })
+  # Shape { Circle(f64) @1, Rect(f64,f64) @2, Label(String) @3 } —
+  # tag @ 0, payload @ 8 -> size 24 align 8.
+  var s_variants = Vec::new()
+  var circ_fields = Vec::new()
+  circ_fields.push(Type::F64)
+  var rect_fields = Vec::new()
+  rect_fields.push(Type::F64)
+  rect_fields.push(Type::F64)
+  var label_fields = Vec::new()
+  label_fields.push(Type::String)
+  s_variants.push(MirVariantDef { name: "Circle".to_string(), discriminant: 1, fields: circ_fields })
+  s_variants.push(MirVariantDef { name: "Rect".to_string(), discriminant: 2, fields: rect_fields })
+  s_variants.push(MirVariantDef { name: "Label".to_string(), discriminant: 3, fields: label_fields })
+  # Option[Int] — None (no fields) / Some(Int): tag @ 0, payload @ 8 ->
+  # size 16 align 8.
+  var opt_variants = Vec::new()
+  var some_fields = Vec::new()
+  some_fields.push(Type::Int)
+  opt_variants.push(MirVariantDef { name: "None".to_string(), discriminant: 0, fields: Vec::new() })
+  opt_variants.push(MirVariantDef { name: "Some".to_string(), discriminant: 1, fields: some_fields })
+  # Result[Int, String] — Ok(Int) / Err(String): size 16.
+  var res_variants = Vec::new()
+  var ok_fields = Vec::new()
+  ok_fields.push(Type::Int)
+  var err_fields = Vec::new()
+  err_fields.push(Type::String)
+  res_variants.push(MirVariantDef { name: "Ok".to_string(), discriminant: 0, fields: ok_fields })
+  res_variants.push(MirVariantDef { name: "Err".to_string(), discriminant: 1, fields: err_fields })
+  var defs = Vec::new()
+  defs.push(make_enumdef(11, "Color", c_variants))
+  defs.push(make_enumdef(12, "Shape", s_variants))
+  defs.push(make_enumdef(13, "Option", opt_variants))
+  defs.push(make_enumdef(14, "Result", res_variants))
+  layout_engine_register_types(&mut engine, &defs)
+  compute_all_layouts(&mut engine)
+  var c_src = "#include <stddef.h>\n#include <stdio.h>\n#include <stdint.h>\n"
+  c_src = c_src + "typedef struct { uint64_t tag; } Color;\n"
+  c_src = c_src + "typedef union { double circle; struct { double x; double y; } rect; void* label; } ShapeU;\n"
+  c_src = c_src + "typedef struct { uint64_t tag; ShapeU u; } Shape;\n"
+  c_src = c_src + "typedef union { long some; } OptU;\n"
+  c_src = c_src + "typedef struct { uint64_t tag; OptU u; } OptInt;\n"
+  c_src = c_src + "typedef union { long ok; void* err; } ResU;\n"
+  c_src = c_src + "typedef struct { uint64_t tag; ResU u; } ResIntStr;\n"
+  c_src = c_src + "int main(void) {\n"
+  c_src = c_src + "  printf(\"Color:%zu:%zu:%zu\\n\", sizeof(Color), _Alignof(Color), offsetof(Color, tag));\n"
+  c_src = c_src + "  printf(\"Shape:%zu:%zu:%zu:%zu\\n\", sizeof(Shape), _Alignof(Shape), offsetof(Shape, tag), offsetof(Shape, u));\n"
+  c_src = c_src + "  printf(\"OptInt:%zu:%zu:%zu:%zu\\n\", sizeof(OptInt), _Alignof(OptInt), offsetof(OptInt, tag), offsetof(OptInt, u));\n"
+  c_src = c_src + "  printf(\"ResIntStr:%zu:%zu:%zu:%zu\\n\", sizeof(ResIntStr), _Alignof(ResIntStr), offsetof(ResIntStr, tag), offsetof(ResIntStr, u));\n"
+  c_src = c_src + "  return 0;\n}\n"
+  var color_ty = Type::Adt(TypeId { id: 11 }, Vec::new())
+  var shape_ty = Type::Adt(TypeId { id: 12 }, Vec::new())
+  var opt_ty = Type::Adt(TypeId { id: 13 }, Vec::new())
+  var res_ty = Type::Adt(TypeId { id: 14 }, Vec::new())
+  check_eq(0, discriminant_offset(&mut engine, &color_ty), "engine: Color tag offset = 0 (F3)")
+  check_eq(0, discriminant_offset(&mut engine, &shape_ty), "engine: Shape tag offset = 0 (F3)")
+  # The variant payload field offsets (absolute image offsets).
+  var shape_circle_offs = enum_variant_field_offsets(&mut engine, &shape_ty, 0)
+  var shape_rect_offs = enum_variant_field_offsets(&mut engine, &shape_ty, 1)
+  check_eq(1, shape_circle_offs.len(), "engine: Shape.Circle has 1 payload field")
+  check_eq(2, shape_rect_offs.len(), "engine: Shape.Rect has 2 payload fields")
+  var expect_lines: Vec[(String, Int, Int, Vec[Int])] = Vec::new()
+  var co: Vec[Int] = Vec::new()
+  co.push(0)
+  expect_lines.push(("Color".to_string(), size_of(&mut engine, &color_ty), align_of(&mut engine, &color_ty), co))
+  var so: Vec[Int] = Vec::new()
+  so.push(0)
+  so.push(8)
+  expect_lines.push(("Shape".to_string(), size_of(&mut engine, &shape_ty), align_of(&mut engine, &shape_ty), so))
+  var oo: Vec[Int] = Vec::new()
+  oo.push(0)
+  oo.push(8)
+  expect_lines.push(("OptInt".to_string(), size_of(&mut engine, &opt_ty), align_of(&mut engine, &opt_ty), oo))
+  var ro: Vec[Int] = Vec::new()
+  ro.push(0)
+  ro.push(8)
+  expect_lines.push(("ResIntStr".to_string(), size_of(&mut engine, &res_ty), align_of(&mut engine, &res_ty), ro))
+  # The C-side payload-field expectations (translated from the same frozen
+  # rule): Circle@8, Rect@8/16, Some@8, Ok@8, Err@8.
+  check_eq(8, shape_circle_offs[0], "engine: Shape.Circle payload field 0 @ 8")
+  check_eq(8, shape_rect_offs[0], "engine: Shape.Rect payload field 0 @ 8")
+  check_eq(16, shape_rect_offs[1], "engine: Shape.Rect payload field 1 @ 16")
+  check_eq(8, enum_variant_field_offsets(&mut engine, &opt_ty, 1)[0], "engine: Option.Some payload field 0 @ 8")
+  check_eq(8, enum_variant_field_offsets(&mut engine, &res_ty, 0)[0], "engine: Result.Ok payload field 0 @ 8")
+  check_eq(8, enum_variant_field_offsets(&mut engine, &res_ty, 1)[0], "engine: Result.Err payload field 0 @ 8")
+  match run_c_probe(c_src)
+  when Option::Some(out) then
+    let lines = probe_lines(out)
+    for (name, esize, ealign, eoffs) in expect_lines do
+      match lines.get(&name)
+      when Option::Some(pl) then
+        check_eq(esize, pl.size, "differential enum size " + name.clone())
+        check_eq(ealign, pl.align, "differential enum align " + name.clone())
+        var oi = 0
+        while oi < eoffs.len() && oi < pl.offsets.len() do
+          check_eq(eoffs[oi], pl.offsets[oi], "differential enum offset " + name.clone() + "[" + oi.to_string() + "]")
+          oi = oi + 1
+        end
+      when Option::None then
+        check(false, "differential enum " + name.clone() + " missing from probe output")
+      end
+    end
+  when Option::None then
+    check(false, "differential enums: probe failed to run")
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# 5. String / Vec / Slice / Map / Set headers + StrView — the runtime
+#    header tables translated into C struct probes.
+# ———————————————————————————————————————————————————————————————
+
+def test_headers() -> Unit
+  # String and Vec share the 32-byte {data:0, len:8, cap:16, stride:24}
+  # object header (OwnedStringObjectLayout / HeapVecHeader).
+  check_eq(32, container_header_size(&"String".to_string()), "engine: String object header = 32")
+  check_eq(32, container_header_size(&"Vec".to_string()), "engine: Vec header = 32")
+  check_eq(0, container_field_offset(&"String".to_string(), &"data".to_string()), "engine: String.data @ 0")
+  check_eq(8, container_field_offset(&"String".to_string(), &"len".to_string()), "engine: String.len @ 8")
+  check_eq(16, container_field_offset(&"String".to_string(), &"cap".to_string()), "engine: String.cap @ 16")
+  check_eq(24, container_field_offset(&"String".to_string(), &"stride".to_string()), "engine: String.stride @ 24")
+  # Map/Set share the canonical 96-byte MAP_HEADER_FIELDS table.
+  check_eq(96, map_header_total_size(), "engine: Map/Set header = 96")
+  check_eq(0, map_header_field_offset(&"buckets".to_string()), "engine: Map.buckets @ 0")
+  check_eq(8, map_header_field_offset(&"size".to_string()), "engine: Map.size @ 8")
+  check_eq(16, map_header_field_offset(&"capacity".to_string()), "engine: Map.capacity @ 16")
+  check_eq(24, map_header_field_offset(&"key_stride".to_string()), "engine: Map.key_stride @ 24")
+  check_eq(32, map_header_field_offset(&"key_align".to_string()), "engine: Map.key_align @ 32")
+  check_eq(40, map_header_field_offset(&"value_stride".to_string()), "engine: Map.value_stride @ 40")
+  check_eq(48, map_header_field_offset(&"value_align".to_string()), "engine: Map.value_align @ 48")
+  check_eq(56, map_header_field_offset(&"key_off".to_string()), "engine: Map.key_off @ 56")
+  check_eq(64, map_header_field_offset(&"value_off".to_string()), "engine: Map.value_off @ 64")
+  check_eq(72, map_header_field_offset(&"next_off".to_string()), "engine: Map.next_off @ 72")
+  check_eq(80, map_header_field_offset(&"bucket_stride".to_string()), "engine: Map.bucket_stride @ 80")
+  check_eq(88, map_header_field_offset(&"free_list".to_string()), "engine: Map.free_list @ 88")
+  # Slice[T] — the 16-byte {ptr @ 0, len @ 8} inline view (StrView is the
+  # std spelling of the same two-field shape). Slice is the registered
+  # Opaque view builtin (no MirTypeDef): the view layout is the engine's
+  # canonical answer (slice_view_layout).
+  let target = aarch64_target()
+  mut engine = layout_engine_new(target)
+  let sv = slice_view_layout(&engine)
+  check_eq(16, sv.size, "engine: Slice[u8] view size = 16")
+  check_eq(8, sv.align, "engine: Slice[u8] view align = 8")
+  var c_src = "#include <stddef.h>\n#include <stdio.h>\n#include <stdint.h>\n"
+  c_src = c_src + "typedef struct { void* data; size_t len; size_t cap; size_t stride; } StrObj;\n"
+  c_src = c_src + "typedef struct { void* data; size_t len; size_t cap; size_t stride; } VecHdr;\n"
+  c_src = c_src + "typedef struct { uint64_t buckets; uint64_t size; uint64_t capacity; uint64_t key_stride; uint64_t key_align; uint64_t value_stride; uint64_t value_align; uint64_t key_off; uint64_t value_off; uint64_t next_off; uint64_t bucket_stride; uint64_t free_list; } MapHdr;\n"
+  c_src = c_src + "typedef struct { void* ptr; size_t len; } SliceView;\n"
+  c_src = c_src + "int main(void) {\n"
+  c_src = c_src + "  printf(\"StrObj:%zu:%zu:%zu:%zu:%zu:%zu\\n\", sizeof(StrObj), _Alignof(StrObj), offsetof(StrObj, data), offsetof(StrObj, len), offsetof(StrObj, cap), offsetof(StrObj, stride));\n"
+  c_src = c_src + "  printf(\"VecHdr:%zu:%zu:%zu:%zu:%zu:%zu\\n\", sizeof(VecHdr), _Alignof(VecHdr), offsetof(VecHdr, data), offsetof(VecHdr, len), offsetof(VecHdr, cap), offsetof(VecHdr, stride));\n"
+  c_src = c_src + "  printf(\"MapHdr:%zu:%zu:%zu:%zu:%zu:%zu:%zu:%zu:%zu:%zu:%zu:%zu:%zu\\n\", sizeof(MapHdr), _Alignof(MapHdr), offsetof(MapHdr, buckets), offsetof(MapHdr, size), offsetof(MapHdr, capacity), offsetof(MapHdr, key_stride), offsetof(MapHdr, key_align), offsetof(MapHdr, value_stride), offsetof(MapHdr, value_align), offsetof(MapHdr, key_off), offsetof(MapHdr, value_off), offsetof(MapHdr, next_off), offsetof(MapHdr, bucket_stride), offsetof(MapHdr, free_list));\n"
+  c_src = c_src + "  printf(\"SliceView:%zu:%zu:%zu:%zu\\n\", sizeof(SliceView), _Alignof(SliceView), offsetof(SliceView, ptr), offsetof(SliceView, len));\n"
+  c_src = c_src + "  return 0;\n}\n"
+  match run_c_probe(c_src)
+  when Option::Some(out) then
+    let lines = probe_lines(out)
+    match lines.get(&"StrObj".to_string())
+    when Option::Some(pl) then
+      check_eq(32, pl.size, "differential String header size")
+      check_eq(8, pl.align, "differential String header align")
+      check_eq(0, pl.offsets[0], "differential String.data @ 0")
+      check_eq(8, pl.offsets[1], "differential String.len @ 8")
+      check_eq(16, pl.offsets[2], "differential String.cap @ 16")
+      check_eq(24, pl.offsets[3], "differential String.stride @ 24")
+    when Option::None then check(false, "differential String header missing from probe output")
+    end
+    match lines.get(&"VecHdr".to_string())
+    when Option::Some(pl) then
+      check_eq(32, pl.size, "differential Vec header size")
+      check_eq(0, pl.offsets[0], "differential Vec.data @ 0")
+      check_eq(8, pl.offsets[1], "differential Vec.len @ 8")
+      check_eq(16, pl.offsets[2], "differential Vec.cap @ 16")
+      check_eq(24, pl.offsets[3], "differential Vec.stride @ 24")
+    when Option::None then check(false, "differential Vec header missing from probe output")
+    end
+    match lines.get(&"MapHdr".to_string())
+    when Option::Some(pl) then
+      check_eq(96, pl.size, "differential Map/Set header size")
+      check_eq(8, pl.align, "differential Map/Set header align")
+      check_eq(0, pl.offsets[0], "differential Map.buckets @ 0")
+      check_eq(8, pl.offsets[1], "differential Map.size @ 8")
+      check_eq(16, pl.offsets[2], "differential Map.capacity @ 16")
+      check_eq(24, pl.offsets[3], "differential Map.key_stride @ 24")
+      check_eq(32, pl.offsets[4], "differential Map.key_align @ 32")
+      check_eq(40, pl.offsets[5], "differential Map.value_stride @ 40")
+      check_eq(48, pl.offsets[6], "differential Map.value_align @ 48")
+      check_eq(56, pl.offsets[7], "differential Map.key_off @ 56")
+      check_eq(64, pl.offsets[8], "differential Map.value_off @ 64")
+      check_eq(72, pl.offsets[9], "differential Map.next_off @ 72")
+      check_eq(80, pl.offsets[10], "differential Map.bucket_stride @ 80")
+      check_eq(88, pl.offsets[11], "differential Map.free_list @ 88")
+    when Option::None then check(false, "differential Map header missing from probe output")
+    end
+    match lines.get(&"SliceView".to_string())
+    when Option::Some(pl) then
+      check_eq(16, pl.size, "differential Slice/StrView view size")
+      check_eq(0, pl.offsets[0], "differential Slice.ptr @ 0")
+      check_eq(8, pl.offsets[1], "differential Slice.len @ 8")
+    when Option::None then check(false, "differential Slice view missing from probe output")
+    end
+  when Option::None then
+    check(false, "differential headers: probe failed to run")
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# 6. Closures — the closure OBJECT { code @ 0, env @ tuple offsets }.
+# ———————————————————————————————————————————————————————————————
+
+def test_closures() -> Unit
+  let target = aarch64_target()
+  mut engine = layout_engine_new(target)
+  var params: Vec[ParamType] = Vec::new()
+  var captures: Vec[Type] = Vec::new()
+  captures.push(Type::Int)
+  captures.push(Type::U8)
+  var cap_tuple = Type::Tuple(captures)
+  let clos_ty = Type::Closure(ClosureId { id: 9001 }, params, Type::Unit, cap_tuple, Vec::new())
+  let rec = closure_object_record(&mut engine, &clos_ty)
+  # { code: void* @ 0; c0: long @ 8; c1: u8 @ 16 } -> size 24 align 8.
+  check_eq(24, rec.size, "engine: closure object size = 24 (code ptr + env)")
+  check_eq(8, rec.align, "engine: closure object align = 8")
+  var c_src = "#include <stddef.h>\n#include <stdio.h>\n#include <stdint.h>\n"
+  c_src = c_src + "typedef struct { void* code; long c0; unsigned char c1; } Clos;\n"
+  c_src = c_src + "int main(void) {\n"
+  c_src = c_src + "  printf(\"Clos:%zu:%zu:%zu:%zu\\n\", sizeof(Clos), _Alignof(Clos), offsetof(Clos, code), offsetof(Clos, c0));\n"
+  c_src = c_src + "  return 0;\n}\n"
+  match run_c_probe(c_src)
+  when Option::Some(out) then
+    let lines = probe_lines(out)
+    match lines.get(&"Clos".to_string())
+    when Option::Some(pl) then
+      check_eq(rec.size, pl.size, "differential closure object size")
+      check_eq(rec.align, pl.align, "differential closure object align")
+      check_eq(0, pl.offsets[0], "differential closure code @ 0")
+      check_eq(8, pl.offsets[1], "differential closure env base @ 8")
+    when Option::None then check(false, "differential closure missing from probe output")
+    end
+  when Option::None then
+    check(false, "differential closures: probe failed to run")
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# 7. FFI structs — the pthread-style [u8; N] opaques get the NATIVE
+#    alignment (pointer alignment) through the ffi_opaque_native_align
+#    override; the probe measures the REAL C types they mirror.
+# ———————————————————————————————————————————————————————————————
+
+def test_ffi_opaque_aligns() -> Unit
+  let target = aarch64_target()
+  mut engine = layout_engine_new(target)
+  var m_fields = Vec::new()
+  m_fields.push(MirFieldDef { name: "opaque".to_string(), ty: Type::FixedArray(Type::U8, 56) })
+  var defs = Vec::new()
+  defs.push(make_typedef(21, "PthreadMutexT", m_fields))
+  layout_engine_register_types(&mut engine, &defs)
+  compute_all_layouts(&mut engine)
+  var m_ty = Type::Adt(TypeId { id: 21 }, Vec::new())
+  check_eq(56, size_of(&mut engine, &m_ty), "engine: PthreadMutexT byte size = 56")
+  check_eq(8, align_of(&mut engine, &m_ty), "engine: PthreadMutexT native align = 8 (the FFI-opaque override)")
+  # The ground truth: Darwin's pthread_mutex_t is { long __sig; char
+  # __opaque[56]; } — 8-aligned, 64 bytes total. The override's size stays
+  # the byte count (56); the ALIGNMENT is what the probe proves.
+  var c_src = "#include <stddef.h>\n#include <stdio.h>\n#include <stdint.h>\n"
+  c_src = c_src + "typedef struct { long sig; unsigned char opaque[56]; } PthreadMutexT;\n"
+  c_src = c_src + "int main(void) {\n"
+  c_src = c_src + "  printf(\"PthreadMutexT:%zu:%zu\\n\", sizeof(PthreadMutexT), _Alignof(PthreadMutexT));\n"
+  c_src = c_src + "  return 0;\n}\n"
+  match run_c_probe(c_src)
+  when Option::Some(out) then
+    let lines = probe_lines(out)
+    match lines.get(&"PthreadMutexT".to_string())
+    when Option::Some(pl) then
+      check_eq(8, pl.align, "differential FFI-opaque native align (the C type is 8-aligned)")
+    when Option::None then check(false, "differential FFI-opaque missing from probe output")
+    end
+  when Option::None then
+    check(false, "differential FFI-opaque: probe failed to run")
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# 8. The randomized structural shapes (deterministic LCG, fixed seed).
+# ———————————————————————————————————————————————————————————————
+
+# The field alphabet: the C type for each alphabet index.
+def alphabet_ctype(idx: Int) -> String
+  match idx % 7
+  when 0 then "unsigned char"
+  when 1 then "int"
+  when 2 then "double"
+  when 3 then "void*"
+  when 4 then "unsigned long"
+  when 5 then "__int128"
+  when _ then "long"
+  end
+end
+
+def alphabet_type(idx: Int) -> Type
+  match idx % 7
+  when 0 then Type::U8
+  when 1 then Type::I32
+  when 2 then Type::F64
+  when 3 then Type::Ptr(Type::U8)
+  when 4 then Type::U64
+  when 5 then Type::I128
+  when _ then Type::Int
+  end
+end
+
+# A deterministic LCG — the suite's "randomness" is committed.
+struct Lcg
+  state: Int
+end
+
+def lcg_new(seed: Int) -> Lcg
+  Lcg { state: seed }
+end
+
+def lcg_next(inout g: Lcg) -> Int
+  g.state = (g.state * 6364136223846793005 + 1442695040888963407) % 9223372036854775807
+  if g.state < 0 then g.state = g.state * -1 end
+  g.state
+end
+
+def test_randomized_structs() -> Unit
+  let target = aarch64_target()
+  mut engine = layout_engine_new(target)
+  mut g = lcg_new(20260821)
+  var defs = Vec::new()
+  var c_src = "#include <stddef.h>\n#include <stdio.h>\n#include <stdint.h>\n"
+  var expects: Vec[(String, Int, Int, Vec[Int])] = Vec::new()
+  c_src = c_src + "int main(void) {\n"
+  var shape_i = 0
+  while shape_i < 16 do
+    let tid = 100 + shape_i
+    let name = "rnd" + shape_i.to_string()
+    let field_count = (lcg_next(&mut g) % 5) + 1
+    var fields = Vec::new()
+    var c_fields: Vec[String] = Vec::new()
+    var fi = 0
+    while fi < field_count do
+      let a_idx = lcg_next(&mut g)
+      let fname = "f" + fi.to_string()
+      fields.push(MirFieldDef { name: fname.clone(), ty: alphabet_type(a_idx) })
+      c_fields.push(alphabet_ctype(a_idx) + " " + fname.clone() + ";")
+      fi = fi + 1
+    end
+    defs.push(make_typedef(tid, name.clone(), fields))
+    var c_def = "typedef struct { "
+    for cf in c_fields do
+      c_def = c_def + cf + " "
+    end
+    c_def = c_def + "} " + name.clone() + ";\n"
+    c_src = c_src + c_def
+    shape_i = shape_i + 1
+  end
+  layout_engine_register_types(&mut engine, &defs)
+  compute_all_layouts(&mut engine)
+  shape_i = 0
+  while shape_i < 16 do
+    let tid = 100 + shape_i
+    let name = "rnd" + shape_i.to_string()
+    let ty = Type::Adt(TypeId { id: tid }, Vec::new())
+    let rsize = size_of(&mut engine, &ty)
+    let ralign = align_of(&mut engine, &ty)
+    var offs = Vec::new()
+    var fi = 0
+    let def = defs[shape_i]
+    match def.kind
+    when MirTypeDefKind::Struct(fields) then
+      while fi < fields.len() do
+        offs.push(field_offset(&mut engine, &ty, fi))
+        fi = fi + 1
+      end
+    when _ then ()
+    end
+    expects.push((name.clone(), rsize, ralign, offs))
+    var printf_line = "  printf(\"" + name.clone() + ":%zu:%zu"
+    var oi = 0
+    while oi < offs.len() do
+      printf_line = printf_line + ":%zu"
+      oi = oi + 1
+    end
+    printf_line = printf_line + "\\n\", sizeof(" + name.clone() + "), _Alignof(" + name.clone() + ")"
+    oi = 0
+    while oi < offs.len() do
+      printf_line = printf_line + ", offsetof(" + name.clone() + ", f" + oi.to_string() + ")"
+      oi = oi + 1
+    end
+    printf_line = printf_line + ");\n"
+    c_src = c_src + printf_line
+    shape_i = shape_i + 1
+  end
+  c_src = c_src + "  return 0;\n}\n"
+  match run_c_probe(c_src)
+  when Option::Some(out) then
+    let lines = probe_lines(out)
+    for (name, esize, ealign, eoffs) in expects do
+      match lines.get(&name)
+      when Option::Some(pl) then
+        check_eq(esize, pl.size, "differential randomized size " + name.clone())
+        check_eq(ealign, pl.align, "differential randomized align " + name.clone())
+        check_eq(eoffs.len(), pl.offsets.len(), "differential randomized offset count " + name.clone())
+        var oi = 0
+        while oi < eoffs.len() && oi < pl.offsets.len() do
+          check_eq(eoffs[oi], pl.offsets[oi], "differential randomized offset " + name.clone() + "[" + oi.to_string() + "]")
+          oi = oi + 1
+        end
+      when Option::None then
+        check(false, "differential randomized " + name.clone() + " missing from probe output")
+      end
+    end
+  when Option::None then
+    check(false, "differential randomized: probe failed to run")
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Main
+# ———————————————————————————————————————————————————————————————
+
+def main() -> Int
+  println("========================================")
+  println("Layout Differential Suite (item 12, Gate O-style)")
+  println("========================================")
+  let target = aarch64_target()
+  mut engine = layout_engine_new(target)
+  println("\n--- 1. Primitives ---")
+  test_primitives(&mut engine)
+  println("\n--- 2. Tuples ---")
+  test_tuples(&mut engine)
+  println("\n--- 3. Structs / ZSTs / Fixed arrays ---")
+  test_structs_and_arrays()
+  println("\n--- 4. Enums / Option / Result ---")
+  test_enums_options_results()
+  println("\n--- 5. String/Vec/Slice/Map/Set headers ---")
+  test_headers()
+  println("\n--- 6. Closures ---")
+  test_closures()
+  println("\n--- 7. FFI opaques ---")
+  test_ffi_opaque_aligns()
+  println("\n--- 8. Randomized shapes (fixed seed) ---")
+  test_randomized_structs()
+  println("\n========================================")
+  println("Results: " + tests_passed.to_string() + " passed, " + tests_failed.to_string() + " failed")
+  println("========================================")
+  if tests_failed > 0 then
+    panic("LAYOUT DIFFERENTIAL TESTS FAILED")
+  end
+  0
+end

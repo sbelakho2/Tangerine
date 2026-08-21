@@ -341,6 +341,24 @@ end
 
 ## Panic and Unrecoverable Errors
 
+> **STATE A — panic=abort is the ONLY stable panic strategy.** A panic
+> runs the panic hook and then terminates the process immediately
+> (`__intrinsic_abort`). There is no unwinding, no catch, no resumption on
+> the stable path. The compiler REJECTS any request for a stable
+> panic=unwind (`--panic-strategy unwind` is an option-boundary error —
+> see driver.tg's parse_args). The `catch_unwind`/`catch_panic`/
+> `resume_unwind`/`try_invoke` APIs in std/core.tg are EXPERIMENTAL
+> (unstable) surfaces kept for API compatibility; they are not part of the
+> stable std contract and make no cleanup claims.
+>
+> **Resource safety with abort:** because the process ends at the panic
+> site, there is no partial destruction to reason about — the cleanup
+> contract is "the process terminates; whatever the OS reclaims is
+> reclaimed by the OS". NO partial-destruction claim is made: the abort
+> path does NOT run resource finalizers, does NOT run defers, and does NOT
+> unwind any stack. Code that must observe cleanup must not rely on panic
+> paths (use `Result` for recoverable failure).
+
 For truly unrecoverable situations:
 
 ```tangerine
@@ -358,6 +376,12 @@ let config = load_config().expect("config file must exist")
 debug_assert(count >= 0, "count must be non-negative")
 ```
 
+A panicking program prints the hook's diagnostic ("thread panicked at
+'<message>'") to stderr and terminates with the abort trap — the process
+exit is non-zero and the stack is not unwound. The panic hook
+(`set_panic_hook`/`take_panic_hook`) runs BEFORE the abort and is the only
+user code the abort path executes.
+
 ### Panic vs. Errors Decision Guide
 
 | Use `Result` when... | Use `panic!` when... |
@@ -366,6 +390,7 @@ debug_assert(count >= 0, "count must be non-negative")
 | Caller can meaningfully recover | Continuing would cause undefined behavior |
 | External input may be invalid | Internal logic error |
 | Error is part of API contract | Index out of bounds in debug mode |
+| Cleanup must run before the program ends | The process should end NOW (abort-only) |
 
 ---
 

@@ -23,14 +23,14 @@ next stage's input, and no stage re-runs the work of an earlier stage.
 | 4 | Macro expansion | `expand_macros(program, diags)` | compiler_core.tg | `Program` (macro-free AST) |
 | 5 | Node-ID assignment | `assign_node_ids(program)` | ast.tg | the globally unique semantic node ids keying every downstream map |
 | 6 | Name resolution | `resolve_names(program)` | resolver.tg | `ResolvedNames` (`call_targets`, `item_defs`, `method_defs`, `module_symbols`, `def_kinds`, `stable_ids`) |
-| 7 | Type checking | `type_check_typed(&mut env, &ast, &res)` | types.tg | `TypedProgram` (flat maps + `typed_exprs` Typed-HIR) |
+| 7 | Type checking | `type_check_typed(&mut env, &ast, &res)` | types.tg | `TypedProgram` (flat maps + `typed_exprs` Typed-HIR); the item-8 semantic completeness oracle runs at the tail (`run_semantic_completeness_oracle` — the ICE-oracle for any accepted program with a residual placeholder) |
 | 8 | Access checking | `access_check(&ast, &typed)` | access_check.tg | `TypedProgram.access_effects` |
 | 9 | Resource checking | `resource_check(&ast, &typed)` | resource_check.tg | `CfgEdge`/`CfgEdgeKind` model; `TypedProgram.finalize_plan` + `edge_cleanup` |
 | 10 | MIR lowering | `driver_lower_to_mir(&ast, &typed)` | mir.tg | `MirProgram` (CFG with semantic projections) |
-| 11 | MIR verification | `verify_mir(&mir)` | mir.tg | the verifier invariant set (runs after lower, mono, and opt) |
-| 12 | Monomorphization | `monomorphize_program(&mut mir, &mut mono_cache)` | mono.tg | `MonoCache` + `InstanceId` work queue |
+| 11 | MIR verification | `verify_mir(&mir)` | mir.tg | the verifier invariant set (runs after lower, after mono — UNCONDITIONALLY, after EVERY transformative optimizer pass under the verify-everything policy, after opt, and IMMEDIATELY BEFORE codegen) |
+| 12 | Monomorphization | `monomorphize_program(&mut mir, &mut mono_cache)` | mono.tg | `MonoCache` + `InstanceId` work queue; the item-8 MIR completeness oracle runs right after (`run_mir_completeness_oracle` — every substituted type must have a computable layout) |
 | 13 | MIR optimization | `optimize_mir(&mut mir, opt_level)` | mir.tg | `MirProgram` (transformed) |
-| 14 | Code generation | `generate_object_file` / `generate_executable` | codegen.tg | layout/`Repr` table + `IntrinsicId` dispatch |
+| 14 | Code generation | `generate_object_file` / `generate_executable` | codegen.tg | layout/`Repr` table + `IntrinsicId` dispatch; preceded by the final firewall (verify_mir + `run_mir_completeness_oracle`) |
 
 PGO (instrumentation `instrument_for_pgo` / profile load `apply_pgo_profile`,
 mir.tg) is an OPTIONAL, flag-gated sub-step of stage 13: `--pgo-gen` instruments
@@ -49,9 +49,21 @@ pass then continues through MIR/mono/optimize/codegen.
 
 ### Early Exit Points
 
+> The machine-readable stage facts (the stage order, the stopping points,
+> the verifier's schema) live in [`compiler_pipeline.toml`](compiler_pipeline.toml),
+> rendered as [`pipeline_stages.md`](pipeline_stages.md) by
+> `scripts/gen_spec_docs.sh` (the CI evidence-gate diff-gates both — a
+> stale hand-edited stage fact cannot merge). The list below must agree
+> with that generated doc.
+
 - `--dump-phase tokens|ast`: after stages 1/2 (debug dumps, not compilations).
-- `tg check` / `StopAfter::Semantic`: after stage 9 (semantic verification).
-- `StopAfter::Mir` / `--dump-phase mir-lowered`: after stage 11 (MIR lowered AND verified).
+- `tg check` / `StopAfter::Mir`: after stage 11 (MIR lowered AND verified —
+  the driver's `cmd_check` sets `check_only = true; stop_after =
+  StopAfter::Mir`; the OLD "stops at StopAfter::Semantic" wording was
+  WRONG — `tg check` never stops at stage 9).
+- `StopAfter::Semantic`: after stage 9 — reachable through the internal
+  `CompilerOptions` only, NOT through the `tg check` CLI.
+- `--dump-phase mir-lowered`: after stage 11 (MIR lowered AND verified).
 - `--emit-mir` / `--dump-phase mir-opt`: after stage 13 (optimized and verified).
 - `EmitMode::Object` + `StopAfter::Object`: after stage 14 object emission.
 - Any error in stages 2, 4–9, 11, 12, 14 causes a hard stop.
@@ -76,10 +88,10 @@ representation read-only.
 | 8 | Access checking | `access_check` is the only authority over per-call access effects (Modify/Consume/Initialize exclusivity), recorded in `TypedProgram.access_effects` | resource checker, MIR |
 | 9 | Resource checking | `resource_check` is the only authority over the CFG edge model (`CfgEdge`/`CfgEdgeKind` + the per-edge action sequences), the per-function `finalize_plan` (fn owner key → local ids) and the per-edge `edge_cleanup` map (`"edge::<kind>::<source id>"` keys). MIR consumes these instead of re-deriving ownership | MIR cleanup emission |
 | 10 | MIR lowering | `lower_to_mir` is the only producer of the `MirProgram` CFG; semantic projections (`Projection::Field(FieldId)` / variant identity) are resolved BY ID from the typed program (`typed_field_projection`) — a missing FieldId is an ICE at the lowering site | mono, optimizer, codegen |
-| 11 | MIR verification | `verify_mir` is the single authority over the MIR invariant set and runs at EVERY boundary: post-lower, post-mono, post-opt — a verified MIR that passes is the only MIR that continues | (a gate, not a transform) |
+| 11 | MIR verification | `verify_mir` is the single authority over the MIR invariant set and runs at EVERY boundary: post-lower, post-mono (unconditional — the generic substitution is a transformative boundary every build re-proves), after EVERY transformative optimizer pass (the verify-everything policy: debug/CI), post-opt, and IMMEDIATELY BEFORE codegen (the final firewall re-proves the exact IR instance codegen receives) — a verified MIR that passes is the only MIR that continues | (a gate, not a transform) |
 | 12 | Monomorphization | `monomorphize_program` is the only authority for instance identity (`InstanceId` = `CallableId` wrapping the DefId + the concrete substitutions), the mangled emission name (`instance_key` / `mangle_name`), and the work queue. ZERO-INFERENCE: the instance payload is the ONLY source of type arguments — a call with a generic base and no solved instance FAILS CLOSED (error, never inference) | optimizer, codegen (emission names) |
 | 13 | Optimization | `optimize_mir` is the only authority for MIR transformations, gated by opt_level; it must never change observable semantics | codegen |
-| 14 | Code generation | `generate_object_file`/`generate_executable` are the only authorities for instruction selection, register allocation, the layout/`Repr` table (layout_engine.tg), and intrinsic dispatch (`IntrinsicId` in codegen.tg) | linker, runtime |
+| 14 | Code generation | `generate_object_file`/`generate_executable` are the only authorities for instruction selection, the register-targeted DIRECT EMISSION (the inline per-function register state `RegAllocState` — `alloc_reg`/`free_reg`/`alloc_reg_or_spill` in codegen.tg; NOT a standalone register-allocation pass — see invariants.md INV-OPT-006), the layout/`Repr` table (layout_engine.tg), and intrinsic dispatch (`IntrinsicId` in codegen.tg) | linker, runtime |
 
 ---
 
@@ -169,19 +181,67 @@ recorded ERROR — the monomorphizer fails closed, never guesses.
 `Type::Var` in MirTypeDef fields or variants; every Named type in a type
 definition keys a canonical TypeId in the deinit-plan table; (2) callee
 resolution — every MirFnItem callee names a lowered function or a known
-intrinsic; (3) structural validity — every function has ≥ 1 block, all block/
-local ids reference real entries; (4) projection correctness — FieldId owner
-matches the projected TypeId; (5) cleanup soundness — deinit plans and edge
-actions agree with the block frames. Runs post-lower, post-mono, and post-opt;
-violations abort the compilation.
+intrinsic; (3) structural validity — every function has ≥ 1 block, all
+block/local ids reference real entries (block ids are DISJOINT — the
+exactly-one-terminator rule), the entry block exists; (4) projection
+correctness — FieldId owner matches the projected TypeId; (5) cleanup
+soundness — deinit plans and edge actions agree with the block frames;
+(6) the switch-discriminant contract — a MirSwitchInt discriminant is an
+integer-like scalar, its target values are pairwise distinct, and every
+value is a DECLARED variant discriminant when the discriminant type is an
+enum (an impossible enum discriminant is rejected); (7) the reachable
+placeholder rule — a reachable block ending in the MirUnreachable
+placeholder is rejected. Runs post-lower, post-mono (unconditional),
+post-opt, per optimizer pass (verify-everything policy), and immediately
+before codegen; violations abort the compilation.
+
+### The completeness oracles (the reviewer's item 8)
+
+Two oracles implement the ICE distinction — USER MISTAKES get the stable
+diagnostics (the checker's E-codes, recorded before either oracle runs);
+the IMPOSSIBLE POST-TYPECHECK STATE (an accepted program with a residual
+placeholder) is the internal invariant failure, recorded as an ICE-class
+error that aborts compilation:
+
+1. `run_semantic_completeness_oracle` (types.tg, at the tail of
+   `type_check_typed` — AFTER the typecheck, BEFORE the lowering). It
+   audits the accepted TypedProgram's channels: Type::Error / unresolved
+   Type::Var / Param-in-concrete-position (the extended
+   `verify_codegen_readiness` — every recorded channel: expr types, the
+   typed-HIR records, local bindings, fn signatures, static types, solved
+   generic-call substitutions, alias inners, struct/enum field tables,
+   deinit plans); UNKNOWN DefId (every call target and finalizer DefId
+   must be a resolver-registered symbol); UNKNOWN FieldId / VariantId
+   (every typed field/variant identity in the typed-HIR tree, the typed
+   patterns, the flat maps, and the deinit plans must name an existing
+   field/variant of its owner); MISSING ACCESS EFFECT (every typed call's
+   receiver and arguments carry the recorded per-node effect); MISSING
+   OBLIGATION SOLUTION (every registered trait impl is backed by its
+   trait contract); UNKNOWN TypeId (the unknown-layout precursor — every
+   named type the channels reference is registered).
+2. `run_mir_completeness_oracle` (compiler_core.tg, right after
+   monomorphization, again after optimization, and immediately before
+   codegen). It proves every type in the substituted IR — function
+   signatures, locals, statics, and the registered type definitions —
+   has a COMPUTABLE LAYOUT under the fail-closed `layout_of_concrete`
+   (Var/Error/Param/unregistered named types all fail closed). The
+   placeholder-symbol/MIR mirrors are the verifier's checks (2)(3)(7)
+   above, which run alongside the oracle at every boundary.
 
 ### The layout/Repr table (stage 14, codegen)
 
 `enum Repr` (layout_engine.tg): `Immediate` (primitives/Unit/Never), `RawPtr`
-(Ptr/PtrMut/Box/Rc/RefInternal), `StringPtr` (String — 8-byte raw pointer to
-null-terminated UTF-8, no inline header), `HeapVecHeader` (Vec/Array/Slice —
-heap `{ptr:0, len:8, cap:16}`), `HeapMapHeader` (Map — `{buckets:0, len:8,
-cap:16}`), `HeapSetHeader` (Set — map-backed, same 24-byte map header),
+(Ptr/PtrMut/Box/Rc/RefInternal), `StringPtr` (String — 8-byte handle to the
+32-byte OWNED String object `{data:0, len:8, cap:16, stride:24}` — no inline
+header on the VALUE, but the pointee is the stride-carrying String object;
+see the generated [`stabilized_layout_tables.md`](stabilized_layout_tables.md)),
+`HeapVecHeader` (Vec/Array — heap `{data:0, len:8, cap:16, stride:24}`, 32
+bytes; the RAW Slice view (UnsafeSlice) is NOT a heap
+header — it is the 16-byte inline `{ptr:0, len:8}` view, and the SAFE Slice
+is the 8-byte Arc-class handle to the 24-byte pinned backing
+`{ptr:0, len:8, offset:16}` — memory_model.md §9), `HeapMapHeader` (Map — the
+96-byte runtime header, `map_header_total_size`), `HeapSetHeader` (Set —
+map-backed, same 96-byte map header),
 `Inline` (structs, tagged enums, tuples, FixedArray — `[T; N]` is inline element
 storage, `n == 0` legal), `TaggedPtr` (reserved), `OpaquePtr` (Option/Result/
 Dyn/Effect/Function/unknown). `type_repr` is THE single decision function; every
@@ -233,9 +293,10 @@ intrinsic is a verifier error before codegen ever sees it.
 | Access-checked | VERIFIED at boundary | access errors hard-stop |
 | Resource-checked | VERIFIED at boundary | resource errors hard-stop; finalize/edge plans are the ownership authority |
 | MIR (lowered) | VERIFIED at boundary | `verify_mir` runs post-lower |
-| MIR (monomorphized) | VERIFIED at boundary | `verify_mir` runs post-mono; zero-inference failures hard-stop |
-| MIR (optimized) | VERIFIED at boundary | `verify_mir` runs post-opt |
-| CodeBuffer / object | UNVERIFIED | linker fails on structural errors |
+| MIR (monomorphized) | VERIFIED at boundary | `verify_mir` runs post-mono UNCONDITIONALLY; `run_mir_completeness_oracle` proves layout availability; zero-inference failures hard-stop |
+| MIR (optimized) | VERIFIED at boundary | `verify_mir` runs post-opt (+ per-pass checkpoints under the verify-everything policy); `run_mir_completeness_oracle` re-proves layout availability |
+| MIR (pre-codegen) | VERIFIED at boundary | the final firewall: `verify_mir` + `run_mir_completeness_oracle` immediately before codegen |
+| CodeBuffer / object | UNVERIFIED | linker fails on structural errors (the width-aware relocation bounds + the AArch64 ADRP/ADD pair invariants in `validate_object_file` fail the link) |
 | Executable | UNVERIFIED | runtime behavior is the final arbiter |
 
 ### Trust Gap Analysis
@@ -262,6 +323,7 @@ The former gaps are CLOSED by design:
 | Ownership weakening | No | access/resource checkers are strict; MIR consumes the plans, never re-derives |
 | Generic type-argument inference at mono | No | ZERO-INFERENCE: unsolved instances fail closed |
 | PGO profile load silent fallback | No | `--pgo-use` with a failed read is a hard error |
-| Unknown-type layout fallback | No | the layout engine computes every field offset; unknowns are errors (see stabilized_subset.md F8 removal) |
+| Unknown-type layout fallback | No | the layout engine computes every field offset; unknowns are errors (see stabilized_subset.md F8 removal); the item-8 MIR completeness oracle + codegen's `layout_of_concrete` fail closed |
+| Relocation bounds fallback | No | `validate_object_file` is width-aware (offset + patch width, overflow-safe) and enforces the AArch64 ADRP/ADD pair invariants; an out-of-bounds or unpaired relocation fails the link |
 
 No fallback path bypasses the normal stages in the self-hosted pipeline.

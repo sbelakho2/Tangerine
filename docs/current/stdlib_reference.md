@@ -13,14 +13,28 @@ This document provides a comprehensive reference for all modules in the Tangerin
 > public module to parse, type-check, compile, link, and pass native tests
 > on every advertised Tier-1 target. The current state:
 
-1. **Bootstrap closure (implemented-unverified):** the 14 std modules in
+1. **The completeness model (the reviewer's item 32):** every shipped
+   `std/*.tg` module belongs to exactly one verification family with a
+   minimum proof — the machine-readable contract lives in
+   `docs/current/stdlib_contracts.toml`, the rendered model in
+   [the Stdlib Completeness Model](stdlib_completeness.md), and the
+   automated enumeration gate (`tests/run_stdlib_completeness_gate.sh`,
+   run first by the E106 sweep — a REQUIRED CI job) fails on any
+   un-contracted module: **a new `std/*.tg` file fails the gate until it
+   receives a contract + proof tests.** The module count is computed
+   from the `std/*.tg` glob, never typed (the reviewer's table enumerated
+   133; the current tree enumerates 131 — `std/postgres.tg` was merged
+   into `std/db.tg` and `std/hash_tests.tg` was removed in earlier
+   waves).
+2. **Bootstrap closure (implemented-unverified):** the 14 std modules in
    `bootstrap/compiler_kernel.manifest` (`alloc`, `args`, `bench`,
    `collections`, `core`, `env`, `ffi`, `fmt`, `fs`, `gfx_errors`, `io`,
    `process`, `taint`, `time`) are compiled by every stage of the bootstrap
    ladder. They have no per-module native test suites.
-2. **E106 migration COMPLETE (parse-clean, CI-verified):** every shipped
-   std module (all 133 `std/*.tg` files — the 14 kernel modules in
-   `bootstrap/compiler_kernel.manifest` plus the 119 non-kernel modules) is
+3. **E106 migration COMPLETE (parse-clean, CI-verified):** every shipped
+   std module (all `std/*.tg` files — the count is computed, currently
+   131: the 14 kernel modules in
+   `bootstrap/compiler_kernel.manifest` plus the 117 non-kernel modules) is
    free of every forbidden syntax class: zero `-> &T` / `-> &mut T`
    returns, zero nested `&` in generic args (`Option[&T]`, `Vec[&T]`,
    `Option<&T>`), zero `&T`-typed fields/consts/let-annotations, zero
@@ -43,7 +57,17 @@ This document provides a comprehensive reference for all modules in the Tangerin
    reference sections below still describe declared surfaces, not
    verified behavior — the modules remain **API-only** until they pass
    per-module native test suites.
-3. **Kernel remainder:** `std/collections.tg` (in the closure) keeps 5
+4. **The experimental exclusion (the reviewer's item 33 stable-subset
+   policy):** the platform-only modules whose targets are
+   unsupported/API-only — `wasm`, `wasm_js`, `gpu`, `gpu_metal`,
+   `gpu_vulkan`, `gpu_webgpu`, `gfx_gpu`, `hal`, `embedded`, `simd`,
+   `effects`, `android`, `ios`, `cocoa`, `windows`, `gui`, `kernel` —
+   are flagged experimental in the feature registry (`experimental =
+   true` rows with the affected modules listed in `modules = [...]`),
+   carry the parse-clean minimum proof only, and are **explicitly
+   excluded from the shipped-std behavior claims**. The shipped claim
+   covers the non-experimental modules only.
+5. **Kernel remainder:** `std/collections.tg` (in the closure) keeps 5
    record-visit extern signatures (`__intrinsic_map_visit_*`,
    `__intrinsic_set_visit_*`) with `Option[&K]`/`&V` returns. They parse
    only through the extern-declaration exception
@@ -95,9 +119,10 @@ access model. The conversion classes:
 
 Remaining reference-typed positions in std: **zero** outside the
 documented `__intrinsic_` extern-ABI exception. The sweep gate
-`tests/run_stdlib_e106_sweep.sh` asserts every shipped module (all 133)
-checks clean AND passes the forbidden-syntax grep backstop; the gate is a
-**required CI job** (`stdlib-e106-sweep` in `.github/workflows/ci.yml`).
+`tests/run_stdlib_e106_sweep.sh` asserts every shipped module (the
+computed `std/*.tg` count — currently 131) checks clean AND passes the
+forbidden-syntax grep backstop; the gate is a **required CI job**
+(`stdlib-e106-sweep` in `.github/workflows/ci.yml`).
 
 ---
 
@@ -897,16 +922,20 @@ let deps = graph.query_dependencies("my_module::my_function");
 
 ### `std/secure_types` - Secure Wrappers
 
-Zero-cost secure wrappers for sensitive data including `Secret`, `SqlQuery`, and `HtmlSafe` (TG-GFX-UI-SPEC-001 v0.1).
+Sealed wrappers for sensitive data including `Secret`, `SqlQuery`, `HtmlSafe`, `SafeUrl`, and `SafePath`.
+**Module status: experimental** — the wrappers scope what code can accidentally do with the value; the Secret zeroization guarantees are the FUTURE production behavior (volatile/non-elidable zero-on-drop is not implemented today).
 
 ```tangerine
-use std::secure_types::{Secret, sql_query, html_escape}
+use std::secure_types::{Secret, sql_query, html_escape, safe_url_parse, path_parse}
 
 let password = Secret::new("p@ssword".to_string());
-# password is not displayable or loggable
+# password is not reachable through the type's public surface (only the
+# capability-gated expose() returns it)
 
-let q = sql_query("SELECT * FROM users WHERE id = $1".to_string(), [SqlParam::Int(1)].to_vec())?;
-let html = html_escape(&"<script>".to_string()); # "&lt;script&gt;"
+let q = sql_query("SELECT * FROM users WHERE id = $1".to_string(), Vec::from([SqlParam::Int(1)]));
+let html = html_escape("<script>".to_string()); # "&lt;script&gt;"
+let url = safe_url_parse("https://example.com"); # Result — the built-in parser
+let path = path_parse("data/report.csv");        # Result — traversal-rejecting
 ```
 
 #### How it fails
@@ -918,14 +947,15 @@ let html = html_escape(&"<script>".to_string()); # "&lt;script&gt;"
 - `Secret::expose` requires the `Unsafe` capability.
 - `SqlQuery` prevents SQL injection by enforcing parameterized templates at construction time.
 - `HtmlSafe` prevents XSS by requiring explicit escaping or trusted-source marking.
+- `SafeUrl` validation is PARSER-BASED: the built-in split_url blocks the javascript:/vbscript: schemes; it is not the full RFC 3986 grammar.
 
 #### Performance
-- Most secure types are zero-cost wrappers that are elided at runtime after verification.
-- Memory for `Secret` types is zeroed automatically when dropped.
+- The wrappers are plain structs — no runtime indirection beyond the sealed constructors.
+- Memory for `Secret` types is NOT zeroed when dropped (the zeroization is the future production behavior).
 
 #### Compatibility
-- Consistent security properties across all platforms.
-- Path and URL validation rules follow RFC and platform standards.
+- The sealed construction and validation behavior is platform-independent.
+- `SafeUrl`/`SafePath` validation follows the built-in parser rules documented above, not a platform URL library.
 
 ---
 

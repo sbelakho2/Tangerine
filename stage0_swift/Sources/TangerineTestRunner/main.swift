@@ -530,7 +530,10 @@ test("enabled features: types") {
     try assertClean("def f(x: &Int, y: &mut Int, z: *Int) -> (Int, Int)\n  (0, 0)\nend")
     try assertClean("def f(x: [Int; 3]) -> [Int]\n  x\nend")
     try assertClean("def f() -> Option[Int]\n  let x: Int? = None\n  x\nend")
-    try assertClean("def f(x: &dyn Display) -> Int\n  0\nend\ntrait Display\n  def show(&self) -> String\nend")
+    // Trait objects are scoped out of the bootstrap subset (E9032 —
+    // INV-TYPE-010/INV-ABI-007 scoping action): type-position dyn/impl is
+    // rejected, so the former "clean" assertion is a rejection now.
+    try assertRejects("def f(x: &dyn Display) -> Int\n  0\nend\ntrait Display\n  def show(&self) -> String\nend", code: "E9032")
 }
 
 test("enabled features: attributes produce correct AST") {
@@ -718,7 +721,7 @@ test("codegen.tg consumes canonical MIR, not raw AST") {
 print("\n=== Suite 8: Invariant Catalog ===")
 
 test("invariants document exists with all required stage prefixes") {
-    let path = "\(repoRoot)/docs/invariants.md"
+    let path = "\(repoRoot)/docs/current/invariants.md"
     try assertTrue(FileManager.default.fileExists(atPath: path), "docs/invariants.md not found")
     let content = try String(contentsOfFile: path, encoding: .utf8)
     let requiredPrefixes = ["INV-PARSE-", "INV-RESOLVE-", "INV-TYPE-", "INV-OWN-",
@@ -729,7 +732,7 @@ test("invariants document exists with all required stage prefixes") {
 }
 
 test("invariant catalog has at least 50 rows with tabular format") {
-    let path = "\(repoRoot)/docs/invariants.md"
+    let path = "\(repoRoot)/docs/current/invariants.md"
     let content = try String(contentsOfFile: path, encoding: .utf8)
     let lines = content.components(separatedBy: "\n").filter { $0.contains("INV-") && $0.contains("|") }
     try assertTrue(lines.count >= 50, "Expected at least 50 invariant rows, got \(lines.count)")
@@ -755,7 +758,7 @@ test("parser E-codes are stable and valid") {
 }
 
 test("each stage has at least 3 invariants") {
-    let path = "\(repoRoot)/docs/invariants.md"
+    let path = "\(repoRoot)/docs/current/invariants.md"
     let content = try String(contentsOfFile: path, encoding: .utf8)
     for prefix in ["INV-PARSE", "INV-RESOLVE", "INV-TYPE", "INV-OWN", "INV-LOWER", "INV-MIR", "INV-OPT", "INV-CODEGEN", "INV-ABI"] {
         let count = content.components(separatedBy: prefix).count - 1
@@ -7079,6 +7082,261 @@ test("42.14: Artifacts property") {
     ctrl.recordArtifact(name: "x", hash: 42)
     try assertEqual(ctrl.artifacts.count, 1, "1 artifact after recording")
     try assertEqual(ctrl.artifacts["x"], 42, "Hash must match")
+}
+
+// ============================================================================
+// Suite 43: Differential normalizers (reviewer item 6)
+// ============================================================================
+print("\n=== Suite 43: Differential normalizers ===")
+
+test("43.1: stage0 token stream — keywords/idents/literals") {
+    let lex = """
+    1:1  'def'
+    1:5  identifier 'main'
+    1:9  '('
+    1:10  ')'
+    1:12  '->'
+    1:15  identifier 'Int'
+    2:3  'let'
+    2:7  identifier 'x'
+    2:14  '='
+    2:16  integer '1'
+    3:3  string literal
+    3:10  'end'
+    4:1  end of file
+    """
+    let stream = Stage0Normalizer.tokens(lexOutput: lex)
+    try assertEqual(stream, ["def", "ident:main", "(", ")", "->", "ident:Int", "let", "ident:x", "=", "int", "str", "end", "eof"], "canonical stage0 token stream")
+}
+
+test("43.2: stage0 &mut fusion") {
+    let lex = "1:1  '&'\n1:2  'mut'\n1:5  identifier 'x'\n2:1  end of file\n"
+    let stream = Stage0Normalizer.tokens(lexOutput: lex)
+    try assertEqual(stream, ["&mut", "ident:x", "eof"], "& + mut fuse to &mut")
+}
+
+test("43.3: stage0 ast item kinds") {
+    let dump = """
+    Program
+    ModulePath tmp::probe
+      Fn main
+        Returns:
+          Type(Int)
+      Struct Point
+      Enum Color
+      Impl Display for Point
+      Use std::core
+      Const MAX
+      Static LIMIT
+      TypeAlias Name
+      Module geometry
+      Cap Net
+      Effect Console
+      Macro m
+      Edition 2026
+      Test roundtrip
+      Rationale
+      Extern "C"
+    """
+    let kinds = Stage0Normalizer.astItemKinds(dumpOutput: dump)
+    try assertEqual(kinds, ["fn", "struct", "enum", "impl", "use", "const", "static", "type-alias", "module", "capability", "effect", "macro", "edition", "test", "rationale", "extern"], "canonical stage0 item kinds")
+}
+
+test("43.4: stage3 token stream — spans stripped, Newline dropped") {
+    let dump = """
+    Tokens:
+      Def @ 0..3
+      Ident("main") @ 4..8
+      LParen @ 8..9
+      RParen @ 9..10
+      Arrow @ 11..13
+      Ident("Int") @ 14..17
+      Newline @ 17..18
+      IntLit(1) @ 0..1
+      StringLit("hi") @ 0..4
+      Eof @ 10..10
+    """
+    let stream = Stage3Normalizer.tokens(dumpOutput: dump)
+    try assertEqual(stream, ["def", "ident:main", "(", ")", "->", "ident:Int", "int", "str", "eof"], "canonical stage3 token stream")
+}
+
+test("43.5: stage3 ast item kinds") {
+    let dump = """
+    AST:
+    Program with 3 items
+      Item: ItemFunction
+      Item: ItemStruct
+      Item: ItemEnum
+    """
+    let kinds = Stage3Normalizer.astItemKinds(dumpOutput: dump)
+    try assertEqual(kinds, ["fn", "struct", "enum"], "canonical stage3 item kinds")
+}
+
+test("43.6: comparison verdicts") {
+    try assertEqual(DifferentialCompare.streams(["a", "b"], ["a", "b"], phase: .tokens), .match)
+    let divergent = DifferentialCompare.streams(["a", "b"], ["a", "c"], phase: .tokens)
+    if case .divergent(let detail) = divergent {
+        try assertTrue(detail.contains("index 1"), "first-diff detail")
+    } else {
+        throw AssertionError(description: "expected divergent, got \(divergent)")
+    }
+    let gap = DifferentialCompare.streams(["??:X"], ["??:X"], phase: .tokens)
+    if case .normalizationGap = gap {
+        // ok
+    } else {
+        throw AssertionError(description: "expected gap, got \(gap)")
+    }
+}
+
+test("43.7: corpus manifest parsing") {
+    let text = """
+    # comment
+    [case]
+    file = corpus/01_defs_arith.tg
+    coverage = "defs, arith"
+    parity = "tokens, ast"
+
+    [case]
+    file = negative/neg_int_overflow.tg
+    coverage = "neg-int-overflow"
+    expect = "E9030"
+    parity = ""
+    """
+    let cases = try CorpusManifest.parse(contents: text)
+    try assertEqual(cases.count, 2, "two cases")
+    try assertEqual(cases[0].file, "corpus/01_defs_arith.tg")
+    try assertEqual(cases[0].coverage, ["defs", "arith"])
+    try assertEqual(cases[0].parity, [.tokens, .ast])
+    try assertEqual(cases[0].expect, nil)
+    try assertEqual(cases[1].expect, "E9030")
+    try assertEqual(cases[1].parity, [], "empty parity allowed for negative cases")
+}
+
+test("43.8: corpus manifest rejects malformed input") {
+    let bad = "[case]\nfile = x.tg\nparity = tokens\n"
+    do {
+        _ = try CorpusManifest.parse(contents: bad)
+        throw AssertionError(description: "expected parse failure for missing coverage")
+    } catch {}
+}
+
+// ============================================================================
+// Suite 44: Semantic gates (INV-PARSE-002/003, INV-TYPE-010)
+// ============================================================================
+print("\n=== Suite 44: Semantic gates ===")
+
+test("44.1: NumericLiteralGuard host range — valid") {
+    try assertTrue(NumericLiteralGuard.fitsHostRange("0"), "zero")
+    try assertTrue(NumericLiteralGuard.fitsHostRange("9223372036854775807"), "Int64.max")
+    try assertTrue(NumericLiteralGuard.fitsHostRange("1_000_000"), "separators")
+    try assertTrue(NumericLiteralGuard.fitsHostRange("0x7FFFFFFFFFFFFFFF"), "hex max")
+    try assertTrue(NumericLiteralGuard.fitsHostRange("0b1010"), "binary")
+    try assertTrue(NumericLiteralGuard.fitsHostRange("0o777"), "octal")
+    try assertTrue(NumericLiteralGuard.fitsHostRange("255u8"), "suffix")
+    try assertTrue(NumericLiteralGuard.fitsHostRange("18446744073709551615u64"), "u64 max magnitude is host-parseable")
+    try assertTrue(NumericLiteralGuard.fitsHostRange("0xcbf29ce484222325"), "FNV-1a basis (kernel u64 hash constant)")
+    try assertTrue(NumericLiteralGuard.fitsHostRange("0u"), "bare unsigned suffix")
+    try assertTrue(NumericLiteralGuard.fitsHostRange("8_i"), "separator-before-suffix spelling")
+}
+
+test("44.2: NumericLiteralGuard host range — overflow rejected") {
+    try assertTrue(NumericLiteralGuard.fitsHostRange("9223372036854775808"), "2^63 fits the UInt64 magnitude domain")
+    try assertTrue(NumericLiteralGuard.fitsHostRange("0xFFFFFFFFFFFFFFFF"), "2^64 - 1 is the UInt64 max magnitude")
+    try assertFalse(NumericLiteralGuard.fitsHostRange("18446744073709551616"), "2^64")
+    try assertFalse(NumericLiteralGuard.fitsHostRange("0x10000000000000000"), "2^64 in hex")
+    try assertFalse(NumericLiteralGuard.fitsHostRange("18446744073709551616u64"), "u64 max + 1")
+}
+
+test("44.3: E9030 fires at parse time (INV-PARSE-003)") {
+    let codes = checkSubset("def main() -> Int\n  let x = 18446744073709551616\n  x\nend")
+    try assertContains(codes, "E9030", "overflow literal must be rejected at parse")
+    let cleanCodes = checkSubset("def main() -> Int\n  let h = 0xcbf29ce484222325\n  let x = 0u\n  h\nend")
+    try assertEqual(cleanCodes, [], "kernel u64-domain literals stay clean: \(cleanCodes)")
+}
+
+test("44.4: E9029 UTF-8 gate (INV-PARSE-002)") {
+    let invalidBytes = Data([0x64, 0x65, 0x66, 0x20, 0x6D, 0x61, 0x69, 0x6E, 0x28, 0x29, 0x0A, 0xFF, 0xFE, 0x0A, 0x65, 0x6E, 0x64, 0x0A])
+    let path = (NSTemporaryDirectory() as NSString).appendingPathComponent("tg_not_utf8_test.tg")
+    try invalidBytes.write(to: URL(fileURLWithPath: path))
+    switch SourceLoader.load(path: path) {
+    case .success:
+        throw AssertionError(description: "invalid UTF-8 file must not load")
+    case .failure(let error):
+        if case .notUTF8 = error {
+            // ok — the E9029 gate fired
+        } else {
+            throw AssertionError(description: "expected notUTF8, got \(error)")
+        }
+    }
+}
+
+test("44.5: E9032 dyn/impl trait rejection (INV-TYPE-010/INV-ABI-007)") {
+    let dynCodes = checkSubset("trait D\n  def show(self: Self) -> String\nend\ndef f(x: dyn D) -> String\n  x.show()\nend")
+    try assertContains(dynCodes, "E9032", "dyn trait type must be rejected")
+    let implCodes = checkSubset("trait I\n  def n(self: Self) -> Int\nend\ndef f(x: impl I) -> Int\n  0\nend")
+    try assertContains(implCodes, "E9032", "impl trait type must be rejected")
+}
+
+// ============================================================================
+// Suite 45: Mutation tests for the invariant gates
+// ============================================================================
+print("\n=== Suite 45: Mutation tests ===")
+
+test("45.1: V0001 inverted-span mutation is detected (INV-PARSE-007/008)") {
+    // Mutation: a synthetic AST node whose span is inverted (start > end).
+    // The span-order verifier must detect and report it.
+    let inverted = Span(start: 10, end: 4, fileID: 0)
+    let sig = FunctionSig(name: "mutated", span: inverted)
+    let fnDecl = FunctionDecl(sig: sig, clauses: [], body: .signatureOnly, span: inverted)
+    let item = Item(kind: .function(fnDecl), span: inverted)
+    let program = Program(items: [item], span: inverted)
+    let diags = DiagnosticBag()
+    let verifier = ASTVerifier(diagnostics: diags)
+    verifier.verify(program)
+    let codes = diags.diagnostics.map(\.code)
+    try assertContains(codes, "V0001", "inverted span must be reported")
+}
+
+test("45.2: well-ordered spans stay clean (INV-PARSE-007)") {
+    // Positive control: a normal program produces no V0001.
+    let (program, diags) = parseSource("def main() -> Int\n  0\nend")
+    try assertFalse(diags.hasErrors, "baseline parse")
+    let verifier = ASTVerifier(diagnostics: diags)
+    verifier.verify(program)
+    try assertFalse(diags.hasErrors, "no span violations on well-formed source")
+}
+
+test("45.3: E9030 mutation — digit appended to max literal (INV-PARSE-003)") {
+    // Mutation: UInt64.max with one more digit must flip the gate.
+    try assertTrue(NumericLiteralGuard.fitsHostRange("18446744073709551615"))
+    try assertFalse(NumericLiteralGuard.fitsHostRange("18446744073709551615" + "0"))
+    // Mutation: FNV basis with one more hex digit must flip the gate.
+    try assertTrue(NumericLiteralGuard.fitsHostRange("0xcbf29ce484222325"))
+    try assertFalse(NumericLiteralGuard.fitsHostRange("0xcbf29ce484222325" + "0"))
+}
+
+test("45.4: E9030 mutation — suffix truncation must not bypass the gate") {
+    // Mutation: an overflowing magnitude with a narrow suffix (u8) must
+    // still be rejected at the host-range level.
+    try assertFalse(NumericLiteralGuard.fitsHostRange("18446744073709551616u8"))
+}
+
+test("45.5: E9029 mutation — truncated multibyte sequence (INV-PARSE-002)") {
+    // Mutation: a UTF-8 string literal whose content is a truncated
+    // 3-byte sequence (0xE2 0x82) — the byte-level gate must reject.
+    let bytes = Data([0x64, 0x65, 0x66, 0x20, 0x6D, 0x61, 0x69, 0x6E, 0x28, 0x29, 0x0A, 0x20, 0x20, 0x6C, 0x65, 0x74, 0x20, 0x73, 0x20, 0x3D, 0x20, 0x22, 0xE2, 0x82, 0x22, 0x0A, 0x65, 0x6E, 0x64, 0x0A])
+    let path = (NSTemporaryDirectory() as NSString).appendingPathComponent("tg_truncated_utf8_test.tg")
+    try bytes.write(to: URL(fileURLWithPath: path))
+    switch SourceLoader.load(path: path) {
+    case .success:
+        throw AssertionError(description: "truncated multibyte sequence must not load")
+    case .failure(let error):
+        if case .notUTF8 = error {
+            // ok
+        } else {
+            throw AssertionError(description: "expected notUTF8, got \(error)")
+        }
+    }
 }
 
 // ============================================================================

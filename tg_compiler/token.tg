@@ -8,7 +8,8 @@
 # - Modern control flow (async, await, defer, try, catch)
 # - Compile-time features (comptime, const, static, type)
 
-use std::core::{Option, Result}
+use std::core::{Option, Result, panic, __intrinsic_pow, __intrinsic_int_to_float}
+use std::collections::{Vec}
 
 # ———————————————————————————————————————————————————————————————
 # Source Location
@@ -25,6 +26,8 @@ def span_new(start: Int, end_pos: Int) -> Span
 end
 
 def span_to_line_col(span: Span, source: String) -> (Int, Int, Int, Int)
+  # The Unicode line semantics: LF -> line+1, CRLF -> line+1 (one break,
+  # both bytes), CR alone -> line+1 (the CR is a line ending).
   mut start_line = 1
   mut start_col = 1
   mut end_line = 1
@@ -38,7 +41,15 @@ def span_to_line_col(span: Span, source: String) -> (Int, Int, Int, Int)
     if i == span.end_pos then
       break
     end
-    if source.char_at(i) == '\n' then
+    let c = source.char_at(i)
+    if c == '\r' then
+      end_line = end_line + 1
+      end_col = 1
+      if i + 1 < source.len() && source.char_at(i + 1) == '\n' then
+        # the CRLF pair is ONE line break: consume the LF here
+        i = i + 1
+      end
+    elsif c == '\n' then
       end_line = end_line + 1
       end_col = 1
     else
@@ -68,13 +79,341 @@ def span_merge(a: Span, b: Span) -> Span
 end
 
 # ———————————————————————————————————————————————————————————————
+# Numeric Literal Payloads — the lossless pre-typing representation
+# ———————————————————————————————————————————————————————————————
+# The LEXER preserves the literal's digits — arbitrary precision, never
+# converted to the host Int — and the TYPE CHECKER alone decides whether
+# the literal fits its target type (the suffix's exact range, the
+# inferred Int range; the overflow is ONE stable diagnostic, never a
+# fabricated 0/0.0). The host-value helpers below exist ONLY for the
+# MIR/const-eval consumers that materialize a checker-accepted literal;
+# the lexer never calls them.
+
+struct ParsedIntegerLiteral
+  sign: Int                 # +1 at lex time (unary minus is a separate token; the checker folds the sign)
+  radix: UInt               # 10, 16, 2, or 8
+  magnitude: Vec[u8]        # the digits, most-significant first, each digit < radix — the arbitrary precision
+  explicit_suffix: Option[String]
+  source_span: Span
+end
+
+struct ParsedFloatLiteral
+  significand: String       # the digit text (integer and fraction digits with '.', separators stripped)
+  exponent: String          # the exponent digit text with its sign ("" when absent)
+  has_exponent: Bool
+  explicit_suffix: Option[String]
+  source_span: Span
+  value: Option[Float]      # the host f64 parse; None when the value does not parse finitely (overflow) — fail-closed, never a fabricated 0.0
+end
+
+# The host-Int value of an integer literal (wrapping accumulation — the
+# two's-complement bit pattern; exact for literals whose magnitude fits
+# the host Int, the wrapped bit pattern for the unsigned-typed cases the
+# checker accepted against the unsigned range).
+def parsed_int_to_host(p: ParsedIntegerLiteral) -> Int
+  mut result = 0
+  let rad = p.radix as Int
+  for d in p.magnitude do
+    result = result * rad + (d as Int)
+  end
+  if p.sign < 0 then 0 - result else result end
+end
+
+# Whether the literal's magnitude fits the host Int — the fail-closed
+# pre-check: every accumulation step is guarded before the multiply, so a
+# magnitude beyond the host range is DETECTED (never silently wrapped).
+def parsed_int_fits_host(p: ParsedIntegerLiteral) -> Bool
+  mut result = 0
+  let rad = p.radix as Int
+  for d in p.magnitude do
+    let dv = d as Int
+    if dv > 0 && result > (9223372036854775807 - dv) / rad then
+      return false
+    end
+    result = result * rad + dv
+  end
+  true
+end
+
+def parsed_int_is_zero(p: ParsedIntegerLiteral) -> Bool
+  p.magnitude.len() == 1 && p.magnitude[0] == 0u8
+end
+
+# The literal's digits as text in their own radix (never the host value).
+def parsed_int_magnitude_text(p: ParsedIntegerLiteral) -> String
+  mut s = ""
+  for d in p.magnitude do
+    let v = d as Int
+    let c = if v < 10 then (('0' as Int) + v) as Char else (('a' as Int) + v - 10) as Char end
+    s = s + c.to_string()
+  end
+  s
+end
+
+# The literal's source spelling (radix prefix + digits + suffix) — the
+# faithful form for the formatter (never the host conversion).
+def parsed_int_spelling(p: ParsedIntegerLiteral) -> String
+  let prefix = match p.radix
+    when 16 then "0x"
+    when 2 then "0b"
+    when 8 then "0o"
+    when _ then ""
+  end
+  let mut s = prefix + parsed_int_magnitude_text(p)
+  match p.explicit_suffix
+  when Option::Some(sfx) then s + sfx
+  when Option::None then s
+  end
+end
+
+# The float literal's source spelling (significand + exponent + suffix).
+def parsed_float_spelling(p: ParsedFloatLiteral) -> String
+  let mut s = p.significand
+  if p.has_exponent then
+    s = s + "e" + p.exponent
+  end
+  match p.explicit_suffix
+  when Option::Some(sfx) then s + sfx
+  when Option::None then s
+  end
+end
+
+# The magnitude as a canonical DECIMAL digit string — arbitrary precision
+# (the radix digits are re-based into decimal via digit-array arithmetic;
+# string-based, never overflows).
+def parsed_int_decimal(p: ParsedIntegerLiteral) -> String
+  mut dec = Vec::from([0u8])
+  let rad = p.radix as Int
+  for d in p.magnitude do
+    dec = decimal_mul_add(dec, rad, d as Int)
+  end
+  decimal_digits_to_string(dec)
+end
+
+# dec (little-endian decimal digits) * radix + add — digit-array arithmetic.
+def decimal_mul_add(dec: Vec[u8], radix: Int, add: Int) -> Vec[u8]
+  mut out = Vec::new()
+  for d in dec do
+    out.push(d)
+  end
+  mut carry = add
+  mut i = 0
+  while i < out.len() do
+    let v = (out[i] as Int) * radix + carry
+    out[i] = (v % 10) as u8
+    carry = v / 10
+    i = i + 1
+  end
+  while carry > 0 do
+    out.push((carry % 10) as u8)
+    carry = carry / 10
+  end
+  out
+end
+
+def decimal_digits_to_string(dec: Vec[u8]) -> String
+  mut s = ""
+  var i = dec.len()
+  while i > 0 do
+    i = i - 1
+    s = s + (((('0' as Int) + (dec[i] as Int)) as Char).to_string())
+  end
+  s
+end
+
+# Whether the parsed float is a FINITE f64 value (not None, not ±inf, not
+# NaN) — the checker's fail-closed overflow gate.
+def parsed_float_finite(p: ParsedFloatLiteral) -> Bool
+  match p.value
+  when Option::Some(f) then
+    let bits = f.to_bits()
+    let biased_exp = bits & 0x7FF0000000000000
+    biased_exp != 0x7FF0000000000000
+  when Option::None then false
+  end
+end
+
+# The host Float of a checker-accepted float literal. Fail-closed: a
+# non-finite value is a checker-rejected literal (compilation already
+# aborted) — never a fabricated 0.0.
+def parsed_float_to_host(p: ParsedFloatLiteral) -> Float
+  match p.value
+  when Option::Some(f) then
+    if parsed_float_finite(p) then
+      f
+    else
+      panic("internal error: parsed_float_to_host on a non-finite float literal (the checker rejected it)")
+    end
+  when Option::None then
+    panic("internal error: parsed_float_to_host on an unparsed float literal (the checker rejected it)")
+  end
+end
+
+# The significand digit string and the TOTAL decimal exponent (the
+# exponent of the digit string as an integer, the decimal point folded in)
+# — the arbitrary-precision float form the range gates compare against the
+# f32/f64 maxima.
+def parsed_float_digits_and_exp(p: ParsedFloatLiteral) -> (String, Int)
+  let digits = p.significand.replace(".", "")
+  let int_part_len = match p.significand.find(".")
+    when Option::Some(dot_pos) then dot_pos
+    when Option::None then p.significand.len()
+  end
+  mut exp_val = 0
+  var neg_exp = false
+  var e0 = 0
+  if p.exponent.len() > 0 && p.exponent.char_at(0) == '-' then
+    neg_exp = true
+    e0 = 1
+  elsif p.exponent.len() > 0 && p.exponent.char_at(0) == '+' then
+    e0 = 1
+  end
+  let exp_body = p.exponent.slice(e0, p.exponent.len())
+  if exp_body.len() > 9 then
+    # the exponent beyond Int precision — the sign alone decides the order
+    if neg_exp then
+      return (digits, -1000000000)
+    else
+      return (digits, 1000000000)
+    end
+  end
+  var ei = 0
+  while ei < exp_body.len() do
+    exp_val = exp_val * 10 + ((exp_body.char_at(ei) as Int) - ('0' as Int))
+    ei = ei + 1
+  end
+  if neg_exp then exp_val = 0 - exp_val end
+  (digits, exp_val + (int_part_len - digits.len()))
+end
+
+# Whether the exact decimal magnitude exceeds the f64 maximum
+# (1.7976931348623157e308) OR the materialized value is not finite — the
+# fail-closed overflow gate (1e309 is the overflow, never a silent inf).
+def parsed_float_f64_overflow(p: ParsedFloatLiteral) -> Bool
+  let (digits, total_exp) = parsed_float_digits_and_exp(p)
+  if decimal_float_strings_gt(digits, total_exp, "17976931348623157", 292) then
+    true
+  else
+    !parsed_float_finite(p)
+  end
+end
+
+# Whether the exact decimal magnitude exceeds the f32 maximum
+# (3.40282346638528859812e38) — decided by the significand/exponent
+# STRINGS (arbitrary precision), never the host Float.
+def parsed_float_f32_overflow(p: ParsedFloatLiteral) -> Bool
+  let (digits, total_exp) = parsed_float_digits_and_exp(p)
+  decimal_float_strings_gt(digits, total_exp, "340282346638528859811704183484516925440", 0)
+end
+
+# The f64 value from the significand/exponent STRINGS (the runtime's
+# parse_float does not support exponents — this conversion does: the
+# 17-digit rounded mantissa times the power of ten). None on the overflow
+# side (beyond f64 finite range) — fail-closed, never a fabricated 0.0;
+# the underflow side legitimately rounds to 0.0.
+def parsed_float_value_of(significand: String, exponent: String) -> Option[Float]
+  let digits = significand.replace(".", "")
+  var start_idx = 0
+  while start_idx < digits.len() - 1 && digits.char_at(start_idx) == '0' do
+    start_idx = start_idx + 1
+  end
+  let body = digits.slice(start_idx, digits.len())
+  if body.len() == 0 then
+    return Option::Some(0.0)
+  end
+  let int_part_len = match significand.find(".")
+    when Option::Some(dot_pos) then dot_pos
+    when Option::None then significand.len()
+  end
+  mut exp_val = 0
+  var neg_exp = false
+  var e0 = 0
+  if exponent.len() > 0 && exponent.char_at(0) == '-' then
+    neg_exp = true
+    e0 = 1
+  elsif exponent.len() > 0 && exponent.char_at(0) == '+' then
+    e0 = 1
+  end
+  let exp_body = exponent.slice(e0, exponent.len())
+  if exp_body.len() > 9 then
+    return Option::None
+  end
+  var ei = 0
+  while ei < exp_body.len() do
+    exp_val = exp_val * 10 + ((exp_body.char_at(ei) as Int) - ('0' as Int))
+    ei = ei + 1
+  end
+  if neg_exp then exp_val = 0 - exp_val end
+  let total_exp = exp_val + (int_part_len - digits.len())
+  mut mant = 0
+  mut di = 0
+  while di < 17 do
+    let dv = if di < body.len() then (body.char_at(di) as Int) - ('0' as Int) else 0 end
+    mant = mant * 10 + dv
+    di = di + 1
+  end
+  if body.len() > 17 && body.char_at(17) >= '5' then
+    mant = mant + 1
+  end
+  let final_exp = total_exp + body.len() - 17
+  if final_exp > 308 then
+    return Option::None
+  end
+  let f_mant = __intrinsic_int_to_float(mant)
+  if final_exp < -324 then
+    return Option::Some(0.0)
+  end
+  let f_pow = __intrinsic_pow(10.0, __intrinsic_int_to_float(final_exp))
+  Option::Some(f_mant * f_pow)
+end
+
+# strict > for value = digits × 10^exp (both normalized, arbitrary
+# precision digit-string comparison).
+def decimal_float_strings_gt(digits1: String, exp1: Int, digits2: String, exp2: Int) -> Bool
+  let d1 = strip_trailing_zeros(digits1)
+  let d2 = strip_trailing_zeros(digits2)
+  mut len1 = d1.len()
+  mut len2 = d2.len()
+  mut e1 = exp1
+  mut e2 = exp2
+  if len1 < len2 then
+    e1 = e1 - (len2 - len1)
+    len1 = len2
+  elsif len2 < len1 then
+    e2 = e2 - (len1 - len2)
+    len2 = len1
+  end
+  if e1 != e2 then
+    return e1 > e2
+  end
+  mut ci = 0
+  while ci < len1 do
+    let c1 = d1.char_at(ci) as Int
+    let c2 = d2.char_at(ci) as Int
+    if c1 != c2 then
+      return c1 > c2
+    end
+    ci = ci + 1
+  end
+  false
+end
+
+def strip_trailing_zeros(s: String) -> String
+  var end_idx = s.len()
+  while end_idx > 1 && s.char_at(end_idx - 1) == '0' do
+    end_idx = end_idx - 1
+  end
+  s.slice(0, end_idx)
+end
+
+# ———————————————————————————————————————————————————————————————
 # Token Kinds
 # ———————————————————————————————————————————————————————————————
 
 enum TokenKind
   # Literals
-  IntLit(Int)
-  FloatLit(Float)
+  IntLit(ParsedIntegerLiteral)
+  FloatLit(ParsedFloatLiteral)
   StringLit(String)
   CharLit(Char)
   

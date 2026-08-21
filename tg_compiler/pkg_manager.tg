@@ -55,6 +55,12 @@ struct TomlParser
   pos: Int
 end
 
+# Insert `value` at the dotted `key_path` inside `target`, creating the
+# intermediate tables as needed. The descent is the current-dialect
+# OWNERSHIP navigation: each intermediate value is REMOVED from its parent
+# (Map::remove — the value is never copied; Map::get requires V: Copy and
+# the dialect has no first-class &mut locals), recursed into, and
+# re-inserted — the tree's identity is preserved at every level.
 def insert_dotted_toml_value(inout target: Map[String, TomlValue], key_path: Array[String], index: Int, sink value: TomlValue) -> Result[Unit, PkgError]
   let segment = key_path[index].clone()
   let is_last = index == key_path.len() - 1
@@ -67,72 +73,110 @@ def insert_dotted_toml_value(inout target: Map[String, TomlValue], key_path: Arr
     target.insert(segment.clone(), TomlValue::Table(Map::new()))
   end
 
-  match target.get_mut(&segment)
-  when Option::Some(existing) then
-    match existing
-    when TomlValue::Table(next_table) then
-      insert_dotted_toml_value(next_table, key_path, index + 1, value)
-    when _ then
+  match target.remove(segment.clone())
+  when Option::Some(TomlValue::Table(mut next_table)) then
+    let r = insert_dotted_toml_value(&mut next_table, key_path, index + 1, value)
+    target.insert(segment, TomlValue::Table(next_table))
+    r
+  when Option::Some(TomlValue::Array(mut arr)) then
+    # A dotted key under an [[array-of-tables]] header descends into the
+    # array's LAST table (the active table of the header).
+    if arr.len() == 0 then
+      target.insert(segment, TomlValue::Array(arr))
       Err(PkgError::ParseError("dotted key collision".to_string()))
+    else
+      let last_idx = arr.len() - 1
+      match arr.remove(last_idx)
+      when TomlValue::Table(mut last_table) then
+        let r = insert_dotted_toml_value(&mut last_table, key_path, index + 1, value)
+        arr.push(TomlValue::Table(last_table))
+        target.insert(segment, TomlValue::Array(arr))
+        r
+      when other then
+        arr.push(other)
+        target.insert(segment, TomlValue::Array(arr))
+        Err(PkgError::ParseError("dotted key collision".to_string()))
+      end
     end
+  when Option::Some(_) then
+    Err(PkgError::ParseError("dotted key collision".to_string()))
   when Option::None then
     Err(PkgError::ParseError("dotted key collision".to_string()))
   end
 end
 
-def ensure_array_table_segment(inout current_table: Map[String, TomlValue], segment: String) -> Result[Map[String, TomlValue], PkgError]
-  if !current_table.contains_key(segment) then
-    current_table.insert(segment.clone(), TomlValue::Array(Array::new()))
-  end
-  match current_table.get_mut(segment)
-  when Option::Some(TomlValue::Array(arr)) then
-    arr.push(TomlValue::Table(Map::new()))
-    let last_idx = arr.len() - 1
-    match arr[last_idx]
-    when TomlValue::Table(t) then
-      Ok(t)
-    when _ then
-      Err(PkgError::ParseError("expected table in array".to_string()))
-    end
-  when _ then
-    Err(PkgError::ParseError("expected array for [[".to_string()))
-  end
+# Ensure the table skeleton at `path` inside `root` (the intermediate tables
+# created as needed). The leaf is prepared but NOT returned: the current
+# dialect has no first-class &mut locals (E106), so the parse loop's
+# navigation state is the active table's PATH, and every bare key-value is
+# routed through insert_dotted_toml_value under that path — the descent
+# re-inserts owned tables at every level.
+#
+#   [x]      — a regular table at x (reused when it already exists; when x
+#              is an [[array-of-tables]], the LAST element stays the active
+#              table, exactly like the removed ensure_regular_table_segment).
+#   [[x]]    — a new empty table APPENDED to the array at x (the array is
+#              created when missing; a non-array x is a hard error).
+def ensure_toml_table_path(inout root: Map[String, TomlValue], path: Array[String], is_array_table: Bool) -> Result[Unit, PkgError]
+  ensure_toml_table_path_at(&mut root, &path, 0, is_array_table)
 end
 
-def ensure_regular_table_segment(inout current_table: Map[String, TomlValue], segment: String) -> Result[Map[String, TomlValue], PkgError]
-  if !current_table.contains_key(segment) then
-    current_table.insert(segment.clone(), TomlValue::Table(Map::new()))
+def ensure_toml_table_path_at(inout table: Map[String, TomlValue], path: Array[String], index: Int, is_array_table: Bool) -> Result[Unit, PkgError]
+  if index >= path.len() then
+    return Ok(())
   end
-  match current_table.get_mut(segment)
-  when Option::Some(TomlValue::Table(t)) then
-    Ok(t)
-  when Option::Some(TomlValue::Array(arr)) then
-    let last_idx = arr.len() - 1
-    match arr[last_idx]
-    when TomlValue::Table(t) then
-      Ok(t)
-    when _ then
-      Err(PkgError::ParseError("expected table".to_string()))
+  let segment = path[index].clone()
+  let is_last = index == path.len() - 1
+  if !table.contains_key(&segment) then
+    if is_last && is_array_table then
+      table.insert(segment.clone(), TomlValue::Array(Array::new()))
+    else
+      table.insert(segment.clone(), TomlValue::Table(Map::new()))
     end
-  when _ then
+  end
+
+  match table.remove(segment.clone())
+  when Option::Some(TomlValue::Table(mut inner)) then
+    let r = if is_last then
+      if is_array_table then
+        Err(PkgError::ParseError("expected array for [[".to_string()))
+      else
+        Ok(())
+      end
+    else
+      ensure_toml_table_path_at(&mut inner, path, index + 1, is_array_table)
+    end
+    table.insert(segment, TomlValue::Table(inner))
+    r
+  when Option::Some(TomlValue::Array(mut arr)) then
+    if is_last then
+      if is_array_table then
+        arr.push(TomlValue::Table(Map::new()))
+      end
+      table.insert(segment, TomlValue::Array(arr))
+      Ok(())
+    elsif arr.len() == 0 then
+      table.insert(segment, TomlValue::Array(arr))
+      Err(PkgError::ParseError("key exists but is not a table".to_string()))
+    else
+      let last_idx = arr.len() - 1
+      match arr.remove(last_idx)
+      when TomlValue::Table(mut inner) then
+        let r = ensure_toml_table_path_at(&mut inner, path, index + 1, is_array_table)
+        arr.push(TomlValue::Table(inner))
+        table.insert(segment, TomlValue::Array(arr))
+        r
+      when other then
+        arr.push(other)
+        table.insert(segment, TomlValue::Array(arr))
+        Err(PkgError::ParseError("key exists but is not a table".to_string()))
+      end
+    end
+  when Option::Some(_) then
+    Err(PkgError::ParseError("key exists but is not a table".to_string()))
+  when Option::None then
     Err(PkgError::ParseError("key exists but is not a table".to_string()))
   end
-end
-
-def ensure_toml_table_path(inout root: Map[String, TomlValue], path: Array[String], is_array_table: Bool) -> Result[Map[String, TomlValue], PkgError]
-  mut current_table = root
-  var seg_i = 0
-  while seg_i < path.len() do
-    let segment = path[seg_i]
-    let is_last = seg_i == path.len() - 1
-    if is_last && is_array_table then
-      current_table = ensure_array_table_segment(current_table, segment)?
-    else
-      current_table = ensure_regular_table_segment(current_table, segment)?
-    end
-    seg_i = seg_i + 1
-  end
-  Ok(current_table)
 end
 
 impl TomlParser
@@ -142,8 +186,13 @@ impl TomlParser
 end
 
 def toml_parser_parse(inout parser: TomlParser) -> Result[TomlValue, PkgError]
-    mut root: Map[String, TomlValue] = Map::new()
-    mut current_table: &mut Map[String, TomlValue] = root
+  mut root: Map[String, TomlValue] = Map::new()
+  # The ACTIVE table's path within root ([] = the root itself). The cursor
+  # is a PATH, never a &mut reference: the current dialect has no
+  # first-class &mut locals (E106), so every bare key-value is routed under
+  # the full path (current_path ++ key_path) through the ownership descent
+  # of insert_dotted_toml_value.
+  mut current_path: Array[String] = Array::new()
 
   while parser.pos < parser.src.len() do
     parser.skip_whitespace_and_newlines()
@@ -175,7 +224,8 @@ def toml_parser_parse(inout parser: TomlParser) -> Result[TomlValue, PkgError]
         parser.expect(']')?
       end
 
-      current_table = ensure_toml_table_path(&mut root, &path, is_array_table)?
+      ensure_toml_table_path(&mut root, &path, is_array_table)?
+      current_path = path
       next
     end
 
@@ -184,15 +234,19 @@ def toml_parser_parse(inout parser: TomlParser) -> Result[TomlValue, PkgError]
       next
     end
 
-    ## Key-value pair
+    ## Key-value pair — routed through the active table's path
     let key_path = parser.parse_key_path()?
     parser.skip_ws()
     parser.expect('=')?
     parser.skip_ws()
     let value = parser.parse_value()?
 
-    ## Navigate dotted key path
-    insert_dotted_toml_value(current_table, &key_path, 0, value.clone())?
+    ## The FULL path is the active table's path followed by the key path
+    var full_path = current_path.clone()
+    for k in key_path do
+      full_path.push(k)
+    end
+    insert_dotted_toml_value(&mut root, &full_path, 0, value)?
     parser.skip_ws()
     ## optional comment after value
     if parser.pos < parser.src.len() && parser.peek() == '#' then
@@ -669,6 +723,39 @@ impl Lockfile
     lockfile_from_content(content.to_string())
   end
 
+  # Lockfile INTEGRITY verification: the supported schema version, no
+  # duplicate (name, version) entries, no empty names, and a checksum on
+  # every registry-sourced package (the cryptographic verification's
+  # precondition — ensure_cached refuses to extract an archive whose
+  # SHA-256 does not match the recorded checksum). install() verifies
+  # every lockfile it reads AND every lockfile it generates, so a
+  # corrupted or hand-edited lockfile is rejected before any download or
+  # extraction.
+  pub def verify(self: Self) -> Result[Unit, PkgError]
+    if self.version != 1 then
+      return Result::Err(PkgError::ParseError("unsupported lockfile version: " + self.version.to_string()))
+    end
+    var seen: Set[String] = Set::new()
+    for pkg in self.packages do
+      if pkg.name.is_empty() then
+        return Result::Err(PkgError::ParseError("lockfile package with empty name"))
+      end
+      let key = pkg.name.clone() + "@" + pkg.version.to_string()
+      if seen.contains(&key) then
+        return Result::Err(PkgError::ParseError("duplicate lockfile entry: " + key))
+      end
+      seen.insert(key)
+      match pkg.source
+      when PackageSource::Registry(_) then
+        if pkg.checksum.is_empty() then
+          return Result::Err(PkgError::ParseError("registry package missing checksum: " + pkg.name.clone() + "@" + pkg.version.to_string()))
+        end
+      when _ then ()
+      end
+    end
+    Ok(())
+  end
+
   pub def serialize(self: Self) -> String
     var out = String::new()
     out = out + "# Tangerine lockfile v" + self.version.to_string() + "\n"
@@ -882,7 +969,20 @@ impl Resolver
         dependencies: deps,
       })
     end
+    # DETERMINISTIC lockfile generation: the resolver's Map iteration order
+    # is not reproducible, so the entries are sorted by (name, version)
+    # before serialization — the same manifest + registry state produces
+    # byte-identical lockfiles on every run (offline reproducibility).
+    entries.sort_by(|a, b| _locked_pkg_lt(a, b))
     Ok(entries)
+  end
+end
+
+def _locked_pkg_lt(a: LockedPackage, b: LockedPackage) -> Bool
+  if a.name != b.name then
+    a.name < b.name
+  else
+    a.version < b.version
   end
 end
 
@@ -956,7 +1056,13 @@ impl PkgManager
   pub def install(inout self, registry: Box[dyn Registry]) -> Result[Unit, PkgError]
     let lockfile = if fs::path_exists(self.lockfile_path.clone()) then
       match Lockfile::read_from_file(&self.lockfile_path)
-      when Result::Ok(lockfile) then lockfile
+      when Result::Ok(lockfile) then
+        # Lockfile INTEGRITY: a corrupted/hand-edited lockfile is rejected
+        # here, before any download or extraction.
+        match lockfile.verify()
+        when Result::Ok(_) then lockfile
+        when Result::Err(e) then return Result::Err(e)
+        end
       when Result::Err(e) then return Result::Err(e)
       end
     else
@@ -971,6 +1077,13 @@ impl PkgManager
       when Result::Err(e) then return Result::Err(e)
       end
       let lf = Lockfile { packages: locked, metadata: Map::new(), version: 1 }
+      ## The generated lockfile is verified before it is written: a
+      ## resolution that produced duplicate entries or registry packages
+      ## without checksums is never published.
+      match lf.verify()
+      when Result::Ok(_) then ()
+      when Result::Err(e) then return Result::Err(e)
+      end
       match lf.write_to_file(&self.lockfile_path)
       when Result::Ok(_) then ()
       when Result::Err(e) then return Result::Err(e)
@@ -1318,6 +1431,22 @@ impl Project
   end
 end
 
+## An archive entry name is SAFE iff it stays inside the destination
+## directory: not absolute, no backslashes (the Windows escape), no `..`
+## path segment (a parent-escape: `../x`, `a/../b`), and not empty. A
+## malicious package cannot write outside the cache directory through the
+## extraction — the traversal is REJECTED, not sanitized.
+def _tar_entry_name_safe(name: String) -> Bool
+  if name.is_empty() then return false end
+  if name.starts_with("/") then return false end
+  if name.contains("\\") then return false end
+  let parts = name.split("/")
+  for part in parts do
+    if part == ".." then return false end
+  end
+  true
+end
+
 ## Extract a tar.gz archive into the given directory.
 ## Implements minimal tar header parsing (POSIX ustar) and DEFLATE/gzip decompression.
 def _extract_tar_gz(data: Array[u8], dest: str) -> Result[Unit, PkgError]
@@ -1342,6 +1471,12 @@ def _extract_tar_gz(data: Array[u8], dest: str) -> Result[Unit, PkgError]
 
     ## Extract file name (offset 0, 100 bytes)
     let name = _tar_string(header, 0, 100)
+    ## PATH/ARCHIVE TRAVERSAL PROTECTION: every entry name must stay
+    ## inside the destination — an absolute path, a `..` segment or a
+    ## backslash escape is rejected before any write (fail-closed).
+    if !_tar_entry_name_safe(&name) then
+      return Err(PkgError::ParseError("archive entry escapes the destination: " + name))
+    end
     ## Extract file size (offset 124, 12 bytes, octal)
     let size = _tar_octal(header, 124, 12)
     ## Extract type flag (offset 156, 1 byte)

@@ -1,0 +1,151 @@
+# tests/deterministic_gate_w_test.tg — the deterministic external work
+# (reviewer item 16, Gate W): a blocking worker executes in REAL time
+# while the deterministic executor's ready queue and timer heap are
+# empty. The deadlock verdict must not fire while the worker's wake is
+# in flight: the external_pending count (incremented at the external_wake
+# enqueue, decremented at the drain) guards the verdict — a nonzero count
+# means the blocking pool's wake is on its way (the empty queues are NOT
+# a deadlock), the executor keeps running, the loop-top drain delivers
+# the wake, and the task resumes with the worker's result.
+
+use std::core::{Vec, String, Unit, Result, Option}
+use std::test::*
+use std::sync::{Arc, Mutex}
+use std::thread::{spawn, thread_sleep_ms}
+use std::async::{Future, Waker, Context, Poll, TaskState}
+
+# THE GATE W TASK: its FIRST poll holds the executor's iteration open in
+# REAL time (the worker thread completes during that span — its wake is
+# enqueued while the executor is still inside the poll), then it waits
+# Pending. The SECOND poll (after the wake's delivery) observes the
+# worker's flag and completes.
+struct GateWTask
+  flag: Arc[Mutex[Bool]]
+  first_poll: Bool
+end
+
+impl Future for GateWTask
+  type Output = ()
+
+  def poll(inout self, inout cx: Context) -> Poll[()]
+    if !self.first_poll then
+      # THE REAL-TIME SPAN: the worker sleeps 100ms real time and
+      # enqueues its wake while this poll blocks — by the time the
+      # executor reaches the deadlock verdict, the wake is in flight
+      # (external_pending == 1 with empty queues).
+      self.first_poll = true
+      thread_sleep_ms(200)
+      Poll::Pending
+    else
+      let g = self.flag.lock()
+      let done = *g
+      drop(g)
+      if done then Poll::Ready(()) else Poll::Pending end
+    end
+  end
+end
+
+# THE DETERMINISTIC EXTERNAL WORK (Gate W): the worker sleeps REAL time;
+# the deterministic executor sees the empty ready queue + empty timer
+# heap with the external wake in flight — the deadlock verdict is
+# deferred, the wake is drained, the task resumes and completes with the
+# worker's result.
+@test
+def test_gate_w_deterministic_external_work() -> Unit
+  let mut exec = std::async::executor_new()
+  exec.set_deterministic(1u64)
+
+  let flag = Arc::new(Mutex::new(false))
+  let handle = exec.spawn(GateWTask { flag: flag.clone(), first_poll: false })
+  let task_id = handle.task_id
+
+  # THE BLOCKING WORKER: sleeps real time, publishes the result into the
+  # shared flag, then enqueues the wake through the external-wake bridge
+  # — the ONLY executor interaction the worker makes (the blocking-pool
+  # protocol: publish first, wake after).
+  let worker_flag = flag.clone()
+  let worker_inner = exec.inner.clone()
+  let worker = spawn(move || {
+    thread_sleep_ms(100)
+    let mut g = worker_flag.lock()
+    *g = true
+    drop(g)
+    unsafe "the worker path — the external-wake inbox only" do
+      let exec_inner = worker_inner.ptr.as_mut()
+      exec_inner.external_wake(task_id)
+    end
+    0
+  })
+
+  # THE RUN: the task's first poll blocks 200ms real time — the worker's
+  # wake (at 100ms) lands while the executor is inside that poll. The
+  # executor then reaches the deadlock verdict with the empty ready
+  # queue + empty timer heap and the external wake in flight — the
+  # external-pending guard defers the verdict, the loop-top drain
+  # delivers the wake, the task resumes and completes.
+  exec.run()
+
+  # The result: the task reached the terminal Completed state and the
+  # worker's flag is set.
+  match exec.inner.ptr.as_ref().task_states.get(&task_id)
+  when Option::Some(TaskState::Completed) then ()
+  when _ then assert_false(true)
+  end
+  let g = flag.lock()
+  let done = *g
+  drop(g)
+  assert_true(done)
+
+  # THE TRACKING INVARIANTS: the wake was delivered (the external
+  # pending count is back to zero — decremented at the drain — and the
+  # inbox is empty).
+  assert_eq(exec.inner.ptr.as_ref().external_pending, 0)
+  let inbox_len = unsafe "read-only check of the external inbox" do
+    let exec_inner = exec.inner.ptr.as_ref()
+    exec_inner.external_wake_queue.lock().len()
+  end
+  assert_eq(inbox_len, 0)
+
+  assert_ok(worker.join())
+end
+
+# THE GUARD ITSELF: the verdict state primed directly — the wake is
+# enqueued (external_pending == 1) BEFORE the run, and the executor must
+# NOT declare the deadlock: the loop-top drain delivers the in-flight
+# wake, the task resumes and completes.
+@test
+def test_gate_w_verdict_deferred_while_wake_in_flight() -> Unit
+  let mut exec = std::async::executor_new()
+  exec.set_deterministic(1u64)
+
+  let flag = Arc::new(Mutex::new(false))
+  let handle = exec.spawn(GateWTask { flag: flag.clone(), first_poll: false })
+  let task_id = handle.task_id
+
+  # The first poll: the REAL-time span, then Pending — the task waits.
+  exec.poll_task(task_id)
+
+  # THE IN-FLIGHT WAKE: the worker's completion is replayed directly
+  # (the pool protocol — publish the result first, then enqueue the
+  # external wake) — the inbox now holds the wake and external_pending
+  # == 1 while the ready queue and the timer heap are empty: the exact
+  # state the deterministic deadlock verdict must defer.
+  let mut g = flag.lock()
+  *g = true
+  drop(g)
+  unsafe "the worker path — the external-wake inbox only" do
+    let exec_inner = exec.inner.ptr.as_mut()
+    exec_inner.external_wake(task_id)
+  end
+  assert_eq(exec.inner.ptr.as_ref().external_pending, 1)
+
+  # The run: the executor drains the in-flight wake, resumes the task
+  # (the second poll observes the published flag), and completes it.
+  exec.run()
+
+  match exec.inner.ptr.as_ref().task_states.get(&task_id)
+  when Option::Some(TaskState::Completed) then ()
+  when _ then assert_false(true)
+  end
+  assert_eq(exec.inner.ptr.as_ref().external_pending, 0)
+end

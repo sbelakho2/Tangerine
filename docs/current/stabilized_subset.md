@@ -3,6 +3,14 @@
 This document defines the layout-affecting features that are **FROZEN** during stabilization.
 These values MUST NOT change. Any bug in these values is a bug in the layout engine.
 
+> **The tables below are GENERATED EVIDENCE.** The machine-readable layout
+> facts live in [`abi_schema.toml`](abi_schema.toml) (`[layout.frozen]`),
+> rendered as [`stabilized_layout_tables.md`](stabilized_layout_tables.md)
+> by `scripts/gen_spec_docs.sh`; the CI evidence-gate job regenerates and
+> diff-gates the generated tables, so a stale hand-edited frozen value
+> cannot merge. The tables below are kept in agreement with the generated
+> document (the F-numbers match).
+
 ## F1: Primitive Sizes (FROZEN)
 
 | Type | Size (bytes) | Alignment |
@@ -23,23 +31,30 @@ These values MUST NOT change. Any bug in these values is a bug in the layout eng
 ## F2: Container ABI (FROZEN)
 
 One pointer-width handle (8 bytes) per container value, pointing at the heap
-header listed. `repr_header_size` / `container_header_size` in
-tg_compiler/layout_engine.tg is the single source of these numbers.
+object listed. `repr_header_size` / `container_header_size` in
+tg_compiler/layout_engine.tg is the single source of these numbers; the
+Wave-A safe views (StrView / SharedSlice) are the 8-byte Arc-class handles
+to the 24-byte pinned backings.
 
-| Container | Handle ABI (Repr) | Heap Header | Fields |
+| Container | Handle ABI (Repr) | Heap Object | Fields |
 |-----------|-------------------|-------------|--------|
-| String | StringPtr (8) | none — raw pointer to null-terminated UTF-8, NO inline header | — |
-| Vec[T] / Array[T] | HeapVecHeader (8) | 24 | data(0), len(8), cap(16) |
-| Slice[T] | HeapVecHeader (8) | 24 (borrowed — no ownership) | data(0), len(8), cap(16) |
-| Map[K,V] / HashMap[K,V] | HeapMapHeader (8) | 24 | buckets(0), len(8), cap(16) — no hash_fn/eq_fn fields in the actual header |
-| Set[T] / HashSet[T] | HeapSetHeader (8) | 24 — Set is MAP-BACKED: the Set header IS the Map header (`_tg_set_*` tail-calls the map helpers) | buckets(0), len(8), cap(16) |
+| String | StringPtr (8) | 32 — the OWNED String object (no inline header on the VALUE; the pointee is the stride-carrying object) | data(0), len(8), cap(16), stride(24) |
+| Vec[T] / Array[T] | HeapVecHeader (8) | 32 — the stride-carrying heap vector header | data(0), len(8), cap(16), stride(24) |
+| UnsafeSlice[T] (the raw view, source-spelled `Slice[T]` in the compiler) | Inline (16-byte fat value) | none — the non-owning borrowed `{ptr, len}` view, never a heap header | ptr(0), len(8) |
+| SharedSlice[T] (the SAFE Slice) | 8-byte Arc-class handle `{ inner: ArcStrong[SliceBacking[T]] }` | 24 — the pinned backing | ptr(0), len(8), offset(16) |
+| Map[K,V] / HashMap[K,V] | HeapMapHeader (8) | 96 — the runtime's actual Map header (`map_header_total_size`) | buckets(0), size(8), capacity(16), key_stride(24), key_align(32), value_stride(40), value_align(48), key_off(56), value_off(64), next_off(72), bucket_stride(80), free_list(88) |
+| Set[T] / HashSet[T] | HeapSetHeader (8) | 96 — Set is MAP-BACKED: the Set header IS the Map header (`_tg_set_*` tail-calls the map helpers) | same as Map |
 | FixedArray[T, N] ([T; N]) | Inline (0 — part of the enclosing value) | none — inline element storage | n elements, stride = align_up(size, align); n == 0 is a legal zero-length array |
-| StrView | Inline (16-byte fat value) | none | ptr(0), len(8) — non-owning view, trivially copyable |
+| StrView (the SAFE string view) | 8-byte Arc-class handle `{ inner: ArcStrong[StrViewBacking] }` | 24 — the pinned backing | ptr(0), len(8), offset(16) |
 
 Historical facts REMOVED: the obsolete 48-byte Map header (hash_fn/eq_fn/aux)
 and the 32-byte Set header (map/size/aux) no longer describe any layout; the
-runtime Map header is the 24-byte `{buckets, len, cap}` shape, and Set shares
-it. HashMap/HashSet are name-level aliases of Map/Set (same Repr, same header).
+runtime Map header is the 96-byte `{buckets, size, capacity, ...}` shape, and
+Set shares it. HashMap/HashSet are name-level aliases of Map/Set (same Repr,
+same header). The former 24-byte `{ptr,len,cap}` Vec/Slice descriptions are
+also STALE: the heap vector header is the 32-byte stride-carrying shape, the
+raw Slice is a 16-byte inline view, and the SAFE Slice/StrView are the
+8-byte Arc-class handles to the pinned backings.
 
 ## F3: Enum Layout (FROZEN)
 
@@ -70,16 +85,22 @@ there is no `*const T` / `*mut T` spelling in the dialect.
 
 ## F5: Fat-Value Layout (FROZEN)
 
-The fat-value forms (a 16-byte `{ptr, len}` pair — StrView, Slice):
+The fat-value form (the 16-byte `{ptr, len}` pair) is the RAW VIEW only —
+`UnsafeSlice[T]` (`slice_view_layout`):
 ```text
 +------------------+------------------+
 | Data Pointer (8) | Length (8)       |
 +------------------+------------------+
 ^ offset 0         ^ offset 8
 ```
-StrView is `struct StrView { ptr: Ptr[u8], len: UInt }` (std/core.tg): a
-non-owning UTF-8 view, needs_drop=false and is_trivially_copyable=true by the
-compiler's structural walk (Ptr + UInt fields), and MUST NOT outlive its source.
+The SAFE views are NOT fat values: `StrView` and `SharedSlice[T]` are the
+8-byte Arc-class handles (`{ inner: ArcStrong[StrViewBacking] }` /
+`{ inner: ArcStrong[SliceBacking[T]] }`) to the 24-byte pinned backings
+`{ ptr@0, len@8, offset@16 }` (std/core.tg / std/collections.tg; the Wave-A
+safe-view authority). The views SURVIVE their source's drop — the Arc keeps
+the pinned backing alive. The old "StrView = 16-byte {ptr, len} fat value"
+description is STALE; the 16-byte form survives only as the internal raw
+view and the FFI FfiStr/FfiSlice.
 
 ## F6: Struct Layout Rules (FROZEN)
 
@@ -122,16 +143,22 @@ any gap as a compiler bug (ICE), not a silent offset.
   vector: one 8-byte handle, 24-byte `{ptr, len, cap}` header.
 - `[T; N]` is the distinct `Type::FixedArray` form: inline storage, count in
   the type, never a handle (F7).
-- `Slice[T]` is the borrowed heap-vector view: HeapVecHeader shape, no
-  ownership (bit-copyable).
+- `Slice[T]` (the raw view, source-spelled `UnsafeSlice[T]`) is the 16-byte
+  borrowed `{ptr, len}` view (`slice_view_layout`) — the unsafe/FFI-only
+  form, never a heap header. The SAFE Slice is the shared/pinned form:
+  `SharedSlice[T] { inner: ArcStrong[SliceBacking[T]] }` — the 8-byte
+  Arc-class handle to the 24-byte pinned backing
+  `{ ptr @ 0, len @ 8, offset @ 16 }` (std/collections.tg; memory_model.md §9).
 - `Box[T]` / `Rc[T]` are RawPtr handles with ownership (move / shared refcount).
 
 ### Ptr-based access
 
 All raw memory access goes through `Ptr[T]` (read) and `PtrMut[T]`
 (read-write): 8 bytes, no ownership, trivially copyable, no drop. `String`
-exposes `as_ptr()` for its owned buffer; `StrView` carries `{ptr, len}` as the
-non-owning view. Access markers (`&x` places) are checker-managed access operations and never appear
+exposes `as_ptr()` for its owned buffer. `StrView` is the shared/pinned
+UTF-8 view: the 8-byte Arc-class handle `{ inner: ArcStrong[StrViewBacking] }`
+to the 24-byte pinned byte backing `{ ptr @ 0, len @ 8, offset @ 16 }`
+(std/core.tg; memory_model.md §9). Access markers (`&x` places) are checker-managed access operations and never appear
 in layout tables; `&T`/`&mut T` in type position is the E106 hard error.
 
 ### LangItems
@@ -172,7 +199,11 @@ ArcStrong, WeakArc).
 - **Move** = ownership transfer, the default for non-Copy values; moves transfer
   buffers, never duplicate them.
 - **Drop** = destruction via the trait method or the standalone sink `drop`.
-  String/StrView have no drop: String is arena-managed, StrView owns nothing.
+  `String` HAS a drop: the MIR `DeinitPlan::String` emits `_tg_string_drop`,
+  which frees BOTH the 32-byte owned String object and its buffer (real-heap
+  allocation — never the bump arena; memory_model.md §9). `StrView`/`SharedSlice`
+  drop the Arc handle (the pinned backing is freed when the last Arc dies);
+  `UnsafeSlice`/`CStringPtr` are the raw borrowed forms and own nothing.
 
 ---
 

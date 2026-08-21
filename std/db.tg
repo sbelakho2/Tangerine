@@ -2435,64 +2435,113 @@ end
 
 use std::sync::{Arc, Mutex, Condvar}
 
-struct Pool[C]
-  connections: Mutex[Vec[C]]
+# THE ARC-OWNED POOL (the raw-pointer design removed — the ownership
+# closure):
+# the pool state lives in an Arc-owned PoolInner. The pooled handle holds
+# its OWN Arc clone of the inner, so the reviewer's lifetime scenario —
+# `pooled = pool.get(); drop(pool); use pooled` — is safe: the pool can
+# be dropped while a connection is checked out, and the checked-out
+# connection is returned into the STILL-ALIVE inner when the handle
+# drops; the inner (and the idle connections it owns) is released when
+# the LAST Arc clone (the pool's or a pooled handle's) goes away. No
+# handle ever holds a raw pointer into a caller-owned pool.
+#
+# THE COUNT LIVES UNDER THE LOCK: current_size (the number of
+# connections the pool has created) is a field of the Mutex-protected
+# PoolState — the max_size bound is decided INSIDE the lock, so the
+# "max simultaneously created <= max_size" property holds under any
+# number of concurrent getters (Gate X: max_size=4, 64 threads).
+# current_size is incremented ONLY when a connection is actually created
+# — a factory failure returns the error WITHOUT incrementing (the
+# factory-failure consistency: a failed create leaves the pool fully
+# usable and the count exact).
+#
+# THE SHUTDOWN-WITH-CHECKED-OUT CONTRACT (documented): dropping the Pool
+# with connections still checked out is SAFE — the checked-out
+# PooledConnections keep the inner alive (their Arc clones); the
+# connections they return are pushed into the inner's idle list; the
+# inner's Drop then runs the idle connections' destruction (and the
+# still-checked-out connections drop with their handles). The pool's
+# Drop never touches a checked-out connection.
+struct PoolInner[C]
+  state: Mutex[PoolState[C]]
   max_size: UInt
-  current_size: UInt
   create_fn: fn() -> Result[C, DbError]
   available: Condvar
 end
 
+struct PoolState[C]
+  idle: Vec[C]
+  current_size: UInt
+end
+
+struct Pool[C]
+  inner: Arc[PoolInner[C]]
+end
+
 impl[C] Pool[C] where C: Connection
   def new(max_size: UInt, create_fn: fn() -> Result[C, DbError]) -> Result[Pool[C], DbError]
-    var conns = Vec::new()
-    
-    # Create initial connection
-    conns.push(create_fn()?)
-    
-    Result::Ok(Pool {
-      connections: Mutex::new(conns),
+    if max_size == 0 then
+      return Result::Err(DbError::Internal("pool max_size must be at least 1".to_string()))
+    end
+    var idle = Vec::new()
+    idle.push(create_fn()?)
+    let inner = Arc::new(PoolInner[C] {
+      state: Mutex::new(PoolState[C] {
+        idle: idle,
+        current_size: 1
+      }),
       max_size: max_size,
-      current_size: 1,
       create_fn: create_fn,
       available: Condvar::new()
     })
+    Result::Ok(Pool { inner: inner })
   end
   
   def get(self: Pool[C]) -> Result[PooledConnection[C], DbError]
-    var guard = self.connections.lock()
-    
-    loop
-      if let Option::Some(conn) = guard.pop() then
+    let inner = self.inner.clone()
+    var guard = inner.ptr.as_ref().state.lock()
+    loop do
+      if let Option::Some(conn) = guard.get_mut().idle.pop() then
         return Result::Ok(PooledConnection {
           conn: Option::Some(conn),
-          pool: self as Ptr[Pool[C]]
+          inner: inner.clone()
         })
       end
       
-      if self.current_size < self.max_size then
-        let conn = (self.create_fn)()?
-        # Note: Would need interior mutability for current_size
-        return Result::Ok(PooledConnection {
-          conn: Option::Some(conn),
-          pool: self as Ptr[Pool[C]]
-        })
+      # The max_size enforcement under the lock: a new connection is
+      # created ONLY while the created count is below the bound.
+      if guard.get_mut().current_size < inner.ptr.as_ref().max_size then
+        match (inner.ptr.as_ref().create_fn)()
+        when Result::Ok(conn) then
+          # The count increments EXACTLY on a successful create.
+          guard.get_mut().current_size = guard.get_mut().current_size + 1
+          return Result::Ok(PooledConnection {
+            conn: Option::Some(conn),
+            inner: inner.clone()
+          })
+        when Result::Err(e) then
+          # The factory failure consistency: no increment, the lock is
+          # released on return, and a later get() may retry.
+          return Result::Err(e)
+        end
       end
       
-      guard = self.available.wait(guard)
+      guard = inner.ptr.as_ref().available.wait(guard)
     end
   end
   
   def return_conn(self: Pool[C], sink conn: C) -> Unit
-    var guard = self.connections.lock()
-    guard.push(conn)
-    self.available.notify_one()
+    let inner = self.inner.clone()
+    var guard = inner.ptr.as_ref().state.lock()
+    guard.get_mut().idle.push(conn)
+    inner.ptr.as_ref().available.notify_one()
   end
 end
 
 struct PooledConnection[C]
   conn: Option[C]
-  pool: Ptr[Pool[C]]
+  inner: Arc[PoolInner[C]]
 end
 
 impl[C] PooledConnection[C] where C: Connection
@@ -2514,7 +2563,10 @@ end
 impl[C] Drop for PooledConnection[C] where C: Connection
   def drop(inout self: PooledConnection[C]) -> Unit
     if let Option::Some(conn) = self.conn.take() then
-      self.pool.as_ref().return_conn(conn)
+      # The handle's Arc clone keeps the pool inner alive for the
+      # return — dropping the Pool while this handle lives is safe.
+      let pool = Pool { inner: self.inner.clone() }
+      pool.return_conn(conn)
     end
   end
 end

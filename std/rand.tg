@@ -37,14 +37,136 @@ end
 # ═══════════════════════════════════════════════════════════════
 # System Entropy Source
 # ═══════════════════════════════════════════════════════════════
+# THE SHORT-READ / EINTR / ZERO-PROGRESS CONTRACT (the entropy closure):
+# the getrandom syscall fills in bounded chunks and is interrupted like
+# any syscall — a single call never guarantees the full request:
+#   n > 0  -> the chunk advanced the buffer: offset += n, loop continues
+#   n < 0  -> EINTR (the retryable transient): retry, bounded by
+#             MAX_GETRANDOM_RETRIES so a persistent failure (e.g. a
+#             platform without the syscall) can never spin forever
+#   n == 0 -> ZERO PROGRESS: the ERROR, never a loop
+# A persistent syscall failure falls back to /dev/urandom per the
+# contract; a urandom zero-progress read is the error too (the
+# offset += 0 spin is impossible).
+
+# The thread-local errno accessor (libc): macOS/BSD expose __error(),
+# Linux/Android expose __errno_location(). Both return a pointer to the
+# calling thread's errno. The @cfg gates pick the symbol per target.
+@cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))
+@ffi("c")
+extern def __error() -> PtrMut[i32]
+end
+
+@cfg(any(target_os = "linux", target_os = "android"))
+@ffi("c")
+extern def __errno_location() -> PtrMut[i32]
+end
+
+# EINTR (4) — the retryable transient of getrandom.
+const EINTR: Int = 4
+
+# The EINTR-retry bound: a persistent negative return (ENOSYS on a
+# platform without the syscall, a wedged RNG, ...) retries this many
+# times and then falls back per the contract.
+const MAX_GETRANDOM_RETRIES: UInt = 8
+
+def errno_is_eintr() -> Bool
+  @cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))
+  return unsafe "the thread-local errno read" do (*__error()) == EINTR end
+  @cfg(any(target_os = "linux", target_os = "android"))
+  return unsafe "the thread-local errno read" do (*__errno_location()) == EINTR end
+  # The unknown platforms: no accessor — a negative return is treated as
+  # the retryable transient (bounded) and falls back on persistence.
+  return false
+end
+
+# THE FAULT-INJECTION HOOK (the deterministic entropy tests — Gate Y):
+# when __tg_rand_fault_active is set, getrandom_syscall replays the
+# queued outcomes instead of the real syscall — no real syscalls
+# involved, deterministic on every platform. Each queue entry:
+#   > 0  a short read of that many bytes (capped at the remaining
+#        request)
+#   -1   the injected EINTR (the entry is consumed WITHOUT advancing the
+#        buffer — the retry shape is exercised)
+#   -2   "the rest" (the full remaining request)
+#   0    the injected zero-progress error
+# The replayed "reads" fill the deterministic pattern (index + 1) % 256,
+# so a test can prove the FULL initialization byte by byte.
+mut __tg_rand_fault_active: Bool = false
+mut __tg_rand_fault_seq: Vec[Int] = Vec::new()
+mut __tg_rand_fault_next: UInt = 0
+
+def __tg_rand_replay_fill(inout buf: [u8], start: UInt, count: UInt) -> Unit
+  var i = start
+  while i < start + count do
+    buf[i] = ((i + 1) % 256) as u8
+    i = i + 1
+  end
+end
+
+def getrandom_syscall_replay(inout buf: [u8]) -> Result[Unit, String]
+  mut offset: UInt = 0
+  mut retries: UInt = 0
+  while offset < buf.len() do
+    if __tg_rand_fault_next >= __tg_rand_fault_seq.len() then
+      return Result::Err("getrandom: the injected fault queue is exhausted".to_string())
+    end
+    let outcome = __tg_rand_fault_seq[__tg_rand_fault_next]
+    __tg_rand_fault_next = __tg_rand_fault_next + 1
+    if outcome > 0 then
+      __tg_rand_replay_fill(buf, offset, outcome as UInt)
+      offset = offset + (outcome as UInt)
+      retries = 0
+    elsif outcome == 0 then
+      # The zero-progress error, never the loop.
+      return Result::Err("getrandom: zero progress (injected)".to_string())
+    elsif outcome == -2 then
+      # "The rest": the full remaining request.
+      __tg_rand_replay_fill(buf, offset, buf.len() - offset)
+      offset = buf.len()
+    else
+      # The injected EINTR: retry, bounded exactly like the real path.
+      retries = retries + 1
+      if retries >= MAX_GETRANDOM_RETRIES then
+        return Result::Err("getrandom: persistent failure (injected EINTR)".to_string())
+      end
+    end
+  end
+  Result::Ok(())
+end
 
 def getrandom_syscall(inout buf: [u8]) -> Result[Unit, String]
-  let ret = getrandom(buf.as_mut_ptr(), buf.len() as UInt, 0)
-  if ret < 0 then
-    Result::Err("getrandom syscall failed".to_string())
-  else
-    Result::Ok(())
+  if __tg_rand_fault_active then
+    return getrandom_syscall_replay(buf)
   end
+  mut offset: UInt = 0
+  mut retries: UInt = 0
+  while offset < buf.len() do
+    let ret = getrandom(buf.as_mut_ptr().add(offset), (buf.len() - offset) as UInt, 0)
+    if ret > 0 then
+      # The short-read contract: n > 0 advances the offset; the loop
+      # keeps filling from the next byte until the buffer is full.
+      offset = offset + (ret as UInt)
+      retries = 0
+    elsif ret == 0 then
+      # The zero-progress guard: a getrandom call that makes no progress
+      # is the ERROR — never the offset += 0 spin.
+      return Result::Err("getrandom: zero progress".to_string())
+    else
+      # ret < 0 — EINTR is the retryable transient: retry. A persistent
+      # failure retries MAX_GETRANDOM_RETRIES times and falls back per
+      # the contract (system_random_bytes -> /dev/urandom).
+      if errno_is_eintr() then
+        retries = retries + 1
+        if retries >= MAX_GETRANDOM_RETRIES then
+          return Result::Err("getrandom: persistent failure".to_string())
+        end
+      else
+        return Result::Err("getrandom syscall failed".to_string())
+      end
+    end
+  end
+  Result::Ok(())
 end
 
 def read_urandom(inout buf: [u8]) -> Result[Unit, String]
@@ -60,6 +182,11 @@ def read_urandom(inout buf: [u8]) -> Result[Unit, String]
     if ret < 0 then
       let _ = close(fd)
       return Result::Err("Failed to read from /dev/urandom".to_string())
+    elsif ret == 0 then
+      # The /dev/urandom zero-progress guard: EOF/zero-length reads must
+      # never spin the offset += 0 loop — the error, not the loop.
+      let _ = close(fd)
+      return Result::Err("Failed to read from /dev/urandom: zero progress".to_string())
     end
     offset = offset + (ret as UInt)
   end
@@ -70,14 +197,13 @@ end
 
 # Try getrandom first, fall back to /dev/urandom
 def system_random_bytes(inout buf: [u8]) -> Result[Unit, String]
-  # Try getrandom first (Linux 3.17+)
-  let ret = getrandom(buf.as_mut_ptr(), buf.len() as UInt, 0)
-  if ret >= 0 then
-    return Result::Ok(())
+  # Try getrandom first (Linux 3.17+): the offset loop inside
+  # getrandom_syscall handles the short reads and the EINTR retries; a
+  # persistent syscall failure falls back to /dev/urandom.
+  match getrandom_syscall(buf)
+  when Result::Ok(_) then Result::Ok(())
+  when Result::Err(_) then read_urandom(buf)
   end
-  
-  # Fallback to /dev/urandom
-  read_urandom(buf)
 end
 
 # ═══════════════════════════════════════════════════════════════

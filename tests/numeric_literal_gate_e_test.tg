@@ -1,0 +1,453 @@
+# tests/numeric_literal_gate_e_test.tg — Gate E: the numeric-literal
+# conversion fail-closed gate (lexer + type checker) and the property test.
+#
+# The P0 contract under test: the lexer NEVER converts a literal to the
+# host Int/Float (the digit strings are preserved — the arbitrary-precision
+# magnitude), the type checker ALONE decides whether a literal fits its
+# target type (the suffix's exact range, the inferred Int range, the float
+# finite/f32 gates), and a malformed or overflowing literal NEVER silently
+# becomes 0/0.0 — the overflow is ONE stable diagnostic.
+#
+# The Gate E table (each spelling -> the exact expected behavior):
+#   0                                   -> the value 0 (the magnitude [0])
+#   -0                                  -> the value 0 (the unary minus folds)
+#   1_000                               -> 1000 (the separators are language-grade)
+#   0xff                                -> 255 (the radix magnitude preserved)
+#   0b1010                              -> 10
+#   0o777                               -> 511
+#   255u8                               -> VALID (the exact u8 range)
+#   256u8                               -> the overflow diagnostic for `u8`
+#   127i8                               -> VALID
+#   128i8                               -> the overflow diagnostic for `i8`
+#   -128i8                              -> VALID (the folded sign)
+#   -129i8                              -> the overflow diagnostic for `i8`
+#   18446744073709551615u64 (u64 max)   -> VALID (arbitrary-precision range)
+#   18446744073709551616u64 (u64 max+1) -> the overflow diagnostic for `u64`
+#   170141183460469231731687303715884105727i128 (i128 max) -> VALID
+#   -170141183460469231731687303715884105728i128 (i128 min) -> VALID
+#   1.0                                 -> VALID (the significand preserved)
+#   1e308                               -> VALID
+#   1e309                               -> the overflow diagnostic for `f64`
+#   1e / 1e+                            -> the lexical "expected digits after exponent"
+#   1__0 / 1_ / 0x_1                    -> the lexical "invalid digit separator"
+#
+# Property test form (REPORTED): the Tangerine in-process harness — the
+# test GENERATES spellings deterministically (digit count, radix, valid
+# separator placements) and compares the lexer's arbitrary-precision
+# magnitude against an INDEPENDENT reference computed inside this test
+# file (a from-scratch decimal digit-array accumulator), plus the host
+# value when the magnitude fits the host Int. No external harness.
+
+use std::collections::{Vec}
+use std::test::*
+use tg_compiler::lexer::{tokenize}
+use tg_compiler::token::{TokenKind, ParsedIntegerLiteral, ParsedFloatLiteral, parsed_int_to_host, parsed_int_fits_host, parsed_int_decimal, parsed_int_is_zero}
+use tg_compiler::parser::{parse}
+use tg_compiler::ast::{assign_node_ids}
+use tg_compiler::types::{type_check}
+
+# ———————————————————————————————————————————————————————————————
+# Harness helpers
+# ———————————————————————————————————————————————————————————————
+
+def lex_errors(spelling: String) -> Vec[String]
+  let r = tokenize(spelling, "gate_e.tg")
+  let mut msgs = Vec::new()
+  for e in r.errors do
+    let (msg, _span) = e
+    msgs.push(msg)
+  end
+  msgs
+end
+
+def errors_contain(errs: Vec[String], needle: String) -> Bool
+  for e in errs do
+    if e.contains(&needle) then
+      return true
+    end
+  end
+  false
+end
+
+def first_int_lit(spelling: String) -> Option[ParsedIntegerLiteral]
+  let r = tokenize(spelling, "gate_e.tg")
+  for t in r.tokens do
+    match t.kind
+    when TokenKind::IntLit(p) then return Option::Some(p)
+    when _ then ()
+    end
+  end
+  Option::None
+end
+
+def first_float_lit(spelling: String) -> Option[ParsedFloatLiteral]
+  let r = tokenize(spelling, "gate_e.tg")
+  for t in r.tokens do
+    match t.kind
+    when TokenKind::FloatLit(p) then return Option::Some(p)
+    when _ then ()
+    end
+  end
+  Option::None
+end
+
+def assert_suffix(p: ParsedIntegerLiteral, expected: String) -> Unit
+  match p.explicit_suffix
+  when Option::Some(s) then assert_eq(s, expected)
+  when Option::None then assert_true(false, "the literal's suffix must be a real token field")
+  end
+end
+
+def check_errors(snippet: String) -> Vec[String]
+  let lex_result = tokenize(snippet, "gate_e_check.tg")
+  let parsed = parse(lex_result)
+  let mut program = parsed.program
+  assign_node_ids(&mut program)
+  let errs = type_check(program)
+  let mut msgs = Vec::new()
+  for e in errs do
+    msgs.push(e.message)
+  end
+  msgs
+end
+
+def snippet_of(body: String) -> String
+  "def main() -> Int\n  " + body + "\n  0\nend\n"
+end
+
+def expect_check_clean(body: String, label: String) -> Unit
+  let errs = check_errors(snippet_of(body))
+  assert_true(!errors_contain(errs, "out of range"), label + " must be in range")
+end
+
+def expect_check_overflow(body: String, target: String, label: String) -> Unit
+  let errs = check_errors(snippet_of(body))
+  assert_true(errors_contain(errs, "integer literal out of range for type `" + target + "`"),
+    label + " must overflow `" + target + "`")
+end
+
+# ———————————————————————————————————————————————————————————————
+# Gate E — the lexer rows (the magnitude-preserving forms)
+# ———————————————————————————————————————————————————————————————
+
+@test
+def test_gate_e_zero_and_neg_zero() -> Unit
+  # 0 -> the value 0; -0 -> the unary minus folding onto the literal 0 —
+  # never a fabricated value.
+  let p = assert_some(first_int_lit("0"))
+  assert_true(parsed_int_is_zero(&p), "0's magnitude must be zero")
+  assert_eq(parsed_int_to_host(&p), 0)
+  let pn = assert_some(first_int_lit("-0"))
+  assert_true(parsed_int_is_zero(&pn), "-0's magnitude must be zero")
+  assert_eq(parsed_int_to_host(&pn), 0)
+  expect_check_clean("let x = -0", "-0")
+end
+
+@test
+def test_gate_e_separator_1000() -> Unit
+  # 1_000 -> the magnitude 1000 (the separator is between digits).
+  let p = assert_some(first_int_lit("1_000"))
+  assert_eq(parsed_int_to_host(&p), 1000)
+  assert_eq(parsed_int_decimal(&p), "1000")
+  assert_eq(lex_errors("1_000").len(), 0)
+end
+
+@test
+def test_gate_e_radix_literals() -> Unit
+  let hex = assert_some(first_int_lit("0xff"))
+  assert_true(hex.radix == 16, "0xff must carry radix 16")
+  assert_eq(parsed_int_to_host(&hex), 255)
+  assert_eq(parsed_int_decimal(&hex), "255")
+  let bin = assert_some(first_int_lit("0b1010"))
+  assert_true(bin.radix == 2, "0b1010 must carry radix 2")
+  assert_eq(parsed_int_to_host(&bin), 10)
+  let oct = assert_some(first_int_lit("0o777"))
+  assert_true(oct.radix == 8, "0o777 must carry radix 8")
+  assert_eq(parsed_int_to_host(&oct), 511)
+end
+
+@test
+def test_gate_e_underscore_separator_radix() -> Unit
+  # separators between digits of a radix literal
+  let hex = assert_some(first_int_lit("0xFF_FF"))
+  assert_eq(parsed_int_to_host(&hex), 65535)
+  let bin = assert_some(first_int_lit("0b1010_1010"))
+  assert_eq(parsed_int_to_host(&bin), 170)
+  let oct = assert_some(first_int_lit("0o1_777"))
+  assert_eq(parsed_int_to_host(&oct), 1023)
+end
+
+@test
+def test_gate_e_suffix_field_and_ranges() -> Unit
+  # 255u8 -> VALID; the suffix is a REAL token field; 256u8 -> overflow.
+  let ok = assert_some(first_int_lit("255u8"))
+  assert_suffix(ok, "u8")
+  assert_eq(parsed_int_to_host(&ok), 255)
+  expect_check_clean("let x = 255u8", "255u8")
+  let p256 = assert_some(first_int_lit("256u8"))
+  assert_suffix(p256, "u8")
+  assert_eq(parsed_int_to_host(&p256), 256)
+  expect_check_overflow("let x = 256u8", "u8", "256u8")
+  let h = assert_some(first_int_lit("0xffu8"))
+  assert_suffix(h, "u8")
+  assert_eq(parsed_int_to_host(&h), 255)
+end
+
+@test
+def test_gate_e_i8_folded_signs() -> Unit
+  # 127i8 VALID; 128i8 overflow; -128i8 VALID (the checker folds the
+  # negation into the range decision); -129i8 overflow.
+  expect_check_clean("let x = 127i8", "127i8")
+  expect_check_overflow("let x = 128i8", "i8", "128i8")
+  expect_check_clean("let x = -128i8", "-128i8")
+  expect_check_overflow("let x = -129i8", "i8", "-129i8")
+  let p = assert_some(first_int_lit("-128i8"))
+  assert_suffix(p, "i8")
+  assert_eq(parsed_int_to_host(&p), 128)
+end
+
+@test
+def test_gate_e_u64_max_and_max_plus_one() -> Unit
+  # u64 max VALID (the arbitrary-precision range — the magnitude survives
+  # the lexer, never a host overflow or a 0 fallback); max+1 overflow.
+  let p = assert_some(first_int_lit("18446744073709551615u64"))
+  assert_suffix(p, "u64")
+  assert_eq(parsed_int_decimal(&p), "18446744073709551615")
+  expect_check_clean("let x = 18446744073709551615u64", "u64 max")
+  expect_check_overflow("let x = 18446744073709551616u64", "u64", "u64 max+1")
+  let h = assert_some(first_int_lit("0xffff_ffff_ffff_ffffu64"))
+  assert_eq(parsed_int_decimal(&h), "18446744073709551615")
+end
+
+@test
+def test_gate_e_i128_min_and_max() -> Unit
+  # i128 min/max VALID (the exact i128 range — magnitudes far beyond the
+  # host Int); i128 max+1 overflow.
+  expect_check_clean("let x = 170141183460469231731687303715884105727i128", "i128 max")
+  expect_check_clean("let x = -170141183460469231731687303715884105728i128", "i128 min")
+  expect_check_overflow("let x = 170141183460469231731687303715884105728i128", "i128", "i128 max+1")
+  let p = assert_some(first_int_lit("170141183460469231731687303715884105727i128"))
+  assert_suffix(p, "i128")
+  assert_eq(parsed_int_decimal(&p), "170141183460469231731687303715884105727")
+end
+
+@test
+def test_gate_e_inferred_int_range() -> Unit
+  # the inferred Int range: an unsuffixed literal beyond the host Int is
+  # the overflow (fail-closed, never a silent wrap); a context target is
+  # range-checked at unification (300 in a u8 slot is the overflow).
+  expect_check_clean("let x = 9223372036854775807", "Int max")
+  expect_check_overflow("let x = 9223372036854775808", "Int", "Int max+1")
+  expect_check_overflow("let x: u8 = 300", "u8", "300 in a u8 slot")
+  expect_check_clean("let x: u8 = 255", "255 in a u8 slot")
+end
+
+@test
+def test_gate_e_floats() -> Unit
+  # 1.0 VALID (the significand preserved exactly); 1e308 VALID;
+  # 1e309 the overflow diagnostic (never a silent inf, never 0.0).
+  let f = assert_some(first_float_lit("1.0"))
+  assert_eq(f.significand, "1.0")
+  assert_eq(f.exponent, "")
+  expect_check_clean("let x = 1.0", "1.0")
+  let fe = assert_some(first_float_lit("1e308"))
+  assert_eq(fe.significand, "1")
+  assert_eq(fe.exponent, "308")
+  expect_check_clean("let x = 1e308", "1e308")
+  let f9 = assert_some(first_float_lit("1e309"))
+  assert_eq(f9.significand, "1")
+  assert_eq(f9.exponent, "309")
+  let ferrs = check_errors(snippet_of("let x = 1e309"))
+  assert_true(errors_contain(ferrs, "float literal out of range for type `f64`"), "1e309 must overflow f64")
+  let fneg = assert_some(first_float_lit("1.5e-3"))
+  assert_eq(fneg.significand, "1.5")
+  assert_eq(fneg.exponent, "-3")
+  expect_check_clean("let x = 1.5e-3", "1.5e-3")
+end
+
+@test
+def test_gate_e_malformed_exponents() -> Unit
+  # 1e / 1e+ -> the lexical "expected digits after exponent" — and NO
+  # literal token is produced (fail-closed, never a 0.0).
+  let e1 = lex_errors("1e")
+  assert_true(errors_contain(e1, "expected digits after exponent"), "1e must be rejected")
+  let e2 = lex_errors("1e+")
+  assert_true(errors_contain(e2, "expected digits after exponent"), "1e+ must be rejected")
+  let e3 = lex_errors("1e-")
+  assert_true(errors_contain(e3, "expected digits after exponent"), "1e- must be rejected")
+  assert_true(first_float_lit("1e").is_none(), "1e must not produce a float token")
+  assert_true(first_float_lit("1e+").is_none(), "1e+ must not produce a float token")
+end
+
+@test
+def test_gate_e_misplaced_separators() -> Unit
+  # 1__0 / 1_ / 0x_1 -> the lexical "invalid digit separator" — and NO
+  # literal token (never a 0 fallback).
+  let e1 = lex_errors("1__0")
+  assert_true(errors_contain(e1, "invalid digit separator"), "1__0 must be rejected")
+  let e2 = lex_errors("1_")
+  assert_true(errors_contain(e2, "invalid digit separator"), "1_ must be rejected")
+  let e3 = lex_errors("0x_1")
+  assert_true(errors_contain(e3, "invalid digit separator"), "0x_1 must be rejected")
+  let e4 = lex_errors("1e_5")
+  assert_true(errors_contain(e4, "invalid digit separator"), "1e_5 must be rejected")
+  let e5 = lex_errors("1e5_")
+  assert_true(errors_contain(e5, "invalid digit separator"), "1e5_ must be rejected")
+  let e6 = lex_errors("1.5_")
+  assert_true(errors_contain(e6, "invalid digit separator"), "1.5_ must be rejected")
+  let e7 = lex_errors("0b_1010")
+  assert_true(errors_contain(e7, "invalid digit separator"), "0b_1010 must be rejected")
+  assert_true(first_int_lit("1__0").is_none(), "1__0 must not produce an int token")
+  assert_true(first_int_lit("1_").is_none(), "1_ must not produce an int token")
+  assert_true(first_int_lit("0x_1").is_none(), "0x_1 must not produce an int token")
+  let e8 = lex_errors("0x")
+  assert_true(errors_contain(e8, "expected hex digits after 0x"), "0x must be rejected")
+end
+
+# ———————————————————————————————————————————————————————————————
+# The property test: generated spellings vs the arbitrary-precision
+# reference (the reference is an INDEPENDENT decimal digit-array
+# accumulator implemented in this file — never the compiler's helpers).
+# The spellings are generated deterministically from the case indices
+# (digit count, radix, valid separator placements).
+# ———————————————————————————————————————————————————————————————
+
+def digit_value_of(c: Char) -> Int
+  if c >= '0' && c <= '9' then
+    (c as Int) - ('0' as Int)
+  elsif c >= 'a' && c <= 'f' then
+    (c as Int) - ('a' as Int) + 10
+  else
+    0
+  end
+end
+
+def radix_digit_char(radix: Int, v: Int) -> String
+  if v < 10 then
+    (((('0' as Int) + v) as Char).to_string())
+  else
+    (((('a' as Int) + v - 10) as Char).to_string())
+  end
+end
+
+def radix_prefix(radix: Int) -> String
+  if radix == 16 then "0x"
+  elsif radix == 2 then "0b"
+  elsif radix == 8 then "0o"
+  else "" end
+end
+
+def reverse_string(s: String) -> String
+  mut out = ""
+  var i = s.len()
+  while i > 0 do
+    i = i - 1
+    out = out + s.char_at(i).to_string()
+  end
+  out
+end
+
+# The independent reference: decimal digit-array multiplication by the
+# radix plus the digit, carried in a STRING of decimal digits (a different
+# representation than the compiler's Vec[u8] accumulation).
+def ref_accumulate(clean: String, radix: Int) -> String
+  mut dec = "0"
+  var i = 0
+  while i < clean.len() do
+    let d = digit_value_of(clean.char_at(i))
+    let mut rev = reverse_string(dec)
+    mut carry = d
+    var j = 0
+    while j < rev.len() do
+      let v = ((rev.char_at(j) as Int) - ('0' as Int)) * radix + carry
+      rev = rev.slice(0, j) + (((v % 10) as Char).to_string()) + rev.slice(j + 1, rev.len())
+      carry = v / 10
+      j = j + 1
+    end
+    while carry > 0 do
+      rev = rev + (((carry % 10) as Char).to_string())
+      carry = carry / 10
+    end
+    dec = reverse_string(rev)
+    i = i + 1
+  end
+  dec
+end
+
+def ref_decimal_to_host(dec: String) -> Int
+  mut v = 0
+  var i = 0
+  while i < dec.len() do
+    v = v * 10 + ((dec.char_at(i) as Int) - ('0' as Int))
+    i = i + 1
+  end
+  v
+end
+
+@test
+def test_property_generated_spellings_vs_reference() -> Unit
+  mut case = 0
+  while case < 300 do
+    let radix = [10, 16, 2, 8][case % 4]
+    let num_digits = 1 + ((case * 13 + 7) % 40)
+    mut digits = ""
+    var vi = 0
+    while vi < num_digits do
+      let d = (case * 17 + vi * 5 + radix * 3) % radix
+      digits = digits + radix_digit_char(radix, d)
+      vi = vi + 1
+    end
+    # place separators only BETWEEN digits, never doubled, never trailing
+    mut spelling = ""
+    mut prev_inserted = false
+    var si = 0
+    while si < num_digits do
+      if si > 0 && ((case * 11 + si * 7 + 3) % 3 == 0) && !prev_inserted then
+        spelling = spelling + "_"
+        prev_inserted = true
+      else
+        prev_inserted = false
+      end
+      spelling = spelling + digits.char_at(si).to_string()
+      si = si + 1
+    end
+    let src = radix_prefix(radix) + spelling
+    let p = assert_some(first_int_lit(src))
+    assert_eq(lex_errors(src).len(), 0)
+    let clean = spelling.replace("_", "")
+    let ref_dec = ref_accumulate(clean, radix)
+    assert_eq(parsed_int_decimal(&p), ref_dec)
+    if parsed_int_fits_host(&p) then
+      assert_eq(parsed_int_to_host(&p), ref_decimal_to_host(ref_dec))
+    end
+    case = case + 1
+  end
+end
+
+@test
+def test_property_fixed_boundary_spellings() -> Unit
+  # fixed boundary spellings through the same reference
+  let fixed = [
+    "0", "00", "1", "9", "10", "99", "100", "1_0_0", "0_1",
+    "255", "256", "65535", "65536", "4294967295", "4294967296",
+    "9223372036854775807", "9223372036854775808",
+    "18446744073709551615", "18446744073709551616",
+    "170141183460469231731687303715884105727",
+    "170141183460469231731687303715884105728",
+    "0xff", "0xffff", "0xff_ff", "0xffffffff", "0xffffffffffffffff",
+    "0x1_0000_0000", "0x7fff_ffff_ffff_ffff",
+    "0b1010", "0b1_0000", "0b1111_1111_1111_1111_1111_1111_1111_1111",
+    "0o777", "0o1_000", "0o7777_7777"
+  ]
+  for src in fixed do
+    let p = assert_some(first_int_lit(src))
+    assert_eq(lex_errors(src).len(), 0)
+    let clean = src.replace("_", "").replace("0x", "").replace("0b", "").replace("0o", "")
+    let radix = if src.starts_with("0x") then 16 elsif src.starts_with("0b") then 2 elsif src.starts_with("0o") then 8 else 10 end
+    let ref_dec = ref_accumulate(clean, radix)
+    assert_eq(parsed_int_decimal(&p), ref_dec)
+    if parsed_int_fits_host(&p) then
+      assert_eq(parsed_int_to_host(&p), ref_decimal_to_host(ref_dec))
+    end
+  end
+end

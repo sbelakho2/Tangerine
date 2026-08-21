@@ -316,11 +316,18 @@ public final class ASTVerifier {
     }
 
     private func verifySpan(_ span: Span, context: String) {
-        if span.fileID == -1 { return } // synthetic spans allowed
-        if span.start > span.end {
+        // INV-PARSE-007 (well-ordered spans) and INV-PARSE-008 (inverted
+        // spans are detected and reported) share this assertion: a
+        // non-synthetic span must satisfy 0 <= start <= end. Synthetic
+        // spans (fileID -1) are excluded.
+        if span.fileID == -1 { return }
+        if !span.isWellOrdered {
+            let reason = span.start < 0
+                ? "span start (\(span.start)) is negative"
+                : "span start (\(span.start)) > end (\(span.end))"
             diagnostics.error(
                 code: "V0001",
-                message: "INV-PARSE-008 violated: span start (\(span.start)) > end (\(span.end)) in \(context)",
+                message: "INV-PARSE-007/INV-PARSE-008 violated: \(reason) in \(context)",
                 span: span,
                 stage: .parser
             )

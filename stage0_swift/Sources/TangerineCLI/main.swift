@@ -103,6 +103,8 @@ struct TangerineCLI {
                 exit(1)
             }
             cmdCompile(targetFiles: targetFiles, outputPath: outputPath, trace: trace, targetTriple: targetTriple)
+        case "diff":
+            cmdDiff(args: Array(args.dropFirst(2)))
         case "version":
             print("tg_stage0 0.1.0 (Swift bootstrap)")
         case "help":
@@ -131,14 +133,27 @@ struct TangerineCLI {
           depmap <dir>     Build stdlib dependency map from a directory of .tg files
           selfhost [--trace] [--dry-run]  Self-host: parse+lower+merge+interpret tg_compiler
           compile <file> [-o output] [--trace]  Compile .tg to native binary via self-hosted compiler
+          diff --corpus <dir> [--stage3-bin <path>] [--probe] [--self-check] [--no-stage3]
+                           Stage0-vs-stage3 differential parity harness
           version          Print version info
           help             Print this help message
         """)
     }
 
+    /// Loads a source file through the E9029 UTF-8 gate (INV-PARSE-002).
+    /// On failure the diagnostic is printed to stderr and nil is returned.
+    static func loadSourceOrReport(_ path: String) -> String? {
+        switch SourceLoader.load(path: path) {
+        case .success(let source):
+            return source
+        case .failure(let error):
+            fputs("\(error)\n", stderr)
+            return nil
+        }
+    }
+
     static func cmdLex(path: String) {
-        guard let source = try? String(contentsOfFile: path, encoding: .utf8) else {
-            fputs("error: cannot read file '\(path)'\n", stderr)
+        guard let source = loadSourceOrReport(path) else {
             exit(1)
         }
         let sourceMap = SourceMap()
@@ -163,8 +178,7 @@ struct TangerineCLI {
     }
 
     static func cmdParse(path: String) {
-        guard let source = try? String(contentsOfFile: path, encoding: .utf8) else {
-            fputs("error: cannot read file '\(path)'\n", stderr)
+        guard let source = loadSourceOrReport(path) else {
             exit(1)
         }
         let sourceMap = SourceMap()
@@ -198,8 +212,7 @@ struct TangerineCLI {
     }
 
     static func cmdCheck(path: String) {
-        guard let source = try? String(contentsOfFile: path, encoding: .utf8) else {
-            fputs("error: cannot read file '\(path)'\n", stderr)
+        guard let source = loadSourceOrReport(path) else {
             exit(1)
         }
         let sourceMap = SourceMap()
@@ -253,8 +266,7 @@ struct TangerineCLI {
         var totalFiles = 0
         for file in files {
             totalFiles += 1
-            guard let source = try? String(contentsOfFile: file, encoding: .utf8) else {
-                fputs("error: cannot read '\(file)'\n", stderr)
+            guard let source = loadSourceOrReport(file) else {
                 totalErrors += 1
                 continue
             }
@@ -295,8 +307,7 @@ struct TangerineCLI {
     }
 
     static func cmdDump(path: String) {
-        guard let source = try? String(contentsOfFile: path, encoding: .utf8) else {
-            fputs("error: cannot read file '\(path)'\n", stderr)
+        guard let source = loadSourceOrReport(path) else {
             exit(1)
         }
         let sourceMap = SourceMap()
@@ -311,14 +322,19 @@ struct TangerineCLI {
             fputs(diags.render(sourceMap: sourceMap) + "\n", stderr)
             exit(1)
         }
+        let verifier = ASTVerifier(diagnostics: diags)
+        verifier.verify(program)
+        if diags.hasErrors {
+            fputs(diags.render(sourceMap: sourceMap) + "\n", stderr)
+            exit(1)
+        }
 
         let dumper = ASTDumper()
         print(dumper.dump(program))
     }
 
     static func cmdHash(path: String) {
-        guard let source = try? String(contentsOfFile: path, encoding: .utf8) else {
-            fputs("error: cannot read file '\(path)'\n", stderr)
+        guard let source = loadSourceOrReport(path) else {
             exit(1)
         }
         let sourceMap = SourceMap()
@@ -329,6 +345,12 @@ struct TangerineCLI {
         let parser = Parser(tokens: tokens, source: source, fileID: fileID, diagnostics: diags, modulePath: Parser.modulePath(fromFile: path))
         let program = parser.parseProgram()
 
+        if diags.hasErrors {
+            fputs(diags.render(sourceMap: sourceMap) + "\n", stderr)
+            exit(1)
+        }
+        let verifier = ASTVerifier(diagnostics: diags)
+        verifier.verify(program)
         if diags.hasErrors {
             fputs(diags.render(sourceMap: sourceMap) + "\n", stderr)
             exit(1)
@@ -340,8 +362,7 @@ struct TangerineCLI {
     }
 
     static func cmdLower(path: String) {
-        guard let source = try? String(contentsOfFile: path, encoding: .utf8) else {
-            fputs("error: cannot read file '\(path)'\n", stderr)
+        guard let source = loadSourceOrReport(path) else {
             exit(1)
         }
         let sourceMap = SourceMap()
@@ -352,6 +373,12 @@ struct TangerineCLI {
         let parser = Parser(tokens: tokens, source: source, fileID: fileID, diagnostics: diags, modulePath: Parser.modulePath(fromFile: path))
         let program = parser.parseProgram()
 
+        if diags.hasErrors {
+            fputs(diags.render(sourceMap: sourceMap) + "\n", stderr)
+            exit(1)
+        }
+        let verifier = ASTVerifier(diagnostics: diags)
+        verifier.verify(program)
         if diags.hasErrors {
             fputs(diags.render(sourceMap: sourceMap) + "\n", stderr)
             exit(1)
@@ -371,8 +398,7 @@ struct TangerineCLI {
         let fm = FileManager.default
 
         func parseProgram(file: String) -> Program? {
-            guard let source = try? String(contentsOfFile: file, encoding: .utf8) else {
-                fputs("error: cannot read file '\(file)'\n", stderr)
+            guard let source = loadSourceOrReport(file) else {
                 return nil
             }
             let sourceMap = SourceMap()
@@ -647,8 +673,8 @@ struct TangerineCLI {
         var stageHashes: [String: UInt64] = [:]
 
         for file in files {
-            guard let source = try? String(contentsOfFile: file, encoding: .utf8) else {
-                fputs("  SKIP \(file): cannot read\n", stderr)
+            guard let source = loadSourceOrReport(file) else {
+                fputs("  SKIP \(file)\n", stderr)
                 errorCount += 1
                 continue
             }
@@ -978,6 +1004,288 @@ struct TangerineCLI {
             rewrite($0, moduleKey: moduleKey, catalog: catalog)
         }
         return MirStatic(name: staticValue.name, type: staticValue.type, initializer: initializer, isMutable: staticValue.isMutable)
+    }
+
+    // MARK: - Differential harness (reviewer item 6)
+
+    /// Stage0-vs-stage3 differential parity harness.
+    ///
+    /// Modes:
+    ///   default       full differential: probe the stage3 binary's dump
+    ///                 support, run the corpus gates (parse + span + subset
+    ///                 under the stage0 front end), then compare the
+    ///                 normalized token/AST projections per case.
+    ///   --self-check  stage0-side only: corpus gates + normalization, no
+    ///                 stage3 binary required (used by CI pre-flights).
+    ///   --probe       probe the stage3 binary's --dump-tokens/--dump-ast
+    ///                 support and exit 0/1.
+    ///   --no-stage3   skip stage3 comparisons (gates only).
+    ///
+    /// Exit: 0 = all compared phases matched and gates clean; 1 = a
+    /// divergence or normalization gap; 2 = stage3 probe failure (when the
+    /// stage3 binary cannot dump, parity cannot be claimed — the run fails
+    /// honestly instead of skipping); 3 = a corpus gate failure.
+    static func cmdDiff(args: [String]) {
+        var corpusDir = "tests/differential"
+        var stage3Bin: String? = nil
+        var probeOnly = false
+        var selfCheck = false
+        var noStage3 = false
+        var i = 0
+        while i < args.count {
+            let arg = args[i]
+            if arg == "--corpus" && i + 1 < args.count {
+                corpusDir = args[i + 1]
+                i += 2
+            } else if arg == "--stage3-bin" && i + 1 < args.count {
+                stage3Bin = args[i + 1]
+                i += 2
+            } else if arg == "--probe" {
+                probeOnly = true
+                i += 1
+            } else if arg == "--self-check" {
+                selfCheck = true
+                i += 1
+            } else if arg == "--no-stage3" {
+                noStage3 = true
+                i += 1
+            } else {
+                fputs("error: unknown diff option '\(arg)'\n", stderr)
+                exit(2)
+            }
+        }
+
+        let fm = FileManager.default
+        let manifestPath = (corpusDir as NSString).appendingPathComponent("corpus.manifest")
+        guard let manifestText = try? String(contentsOfFile: manifestPath, encoding: .utf8) else {
+            fputs("error: cannot read corpus manifest '\(manifestPath)'\n", stderr)
+            exit(2)
+        }
+        let cases: [CorpusCase]
+        do {
+            cases = try CorpusManifest.parse(contents: manifestText)
+        } catch {
+            fputs("error: \(error)\n", stderr)
+            exit(2)
+        }
+        if cases.isEmpty {
+            fputs("error: corpus manifest '\(manifestPath)' declares no cases\n", stderr)
+            exit(2)
+        }
+
+        // Stage3 binary resolution: --stage3-bin > TG_STAGE3_BIN >
+        // build/tg_stage1 (the ladder's stage1).
+        let resolvedStage3 = stage3Bin ?? ProcessInfo.processInfo.environment["TG_STAGE3_BIN"] ?? "build/tg_stage1"
+
+        // Probe the stage3 dump surface before any comparison.
+        let probe: Stage3ProbeResult = probeStage3(bin: resolvedStage3, fm: fm)
+        if probeOnly {
+            print("\(resolvedStage3): \(probe)")
+            if case .ok = probe {
+                exit(0)
+            }
+            exit(1)
+        }
+        if !noStage3 && !selfCheck {
+            if case .failure(let reason) = probe {
+                fputs("error: stage3 binary '\(resolvedStage3)' cannot dump: \(reason)\n", stderr)
+                fputs("error: semantic parity cannot be claimed against a front end that cannot dump; rebuild the ladder (dump hooks landed in a14eeca) and re-run\n", stderr)
+            }
+        }
+
+        var results: [DifferentialCaseResult] = []
+        var gateFailures: [String] = []
+        var coverageReport: [String: [String]] = [:]
+
+        for c in cases {
+            let fullPath = (corpusDir as NSString).appendingPathComponent(c.file)
+            guard fm.fileExists(atPath: fullPath) else {
+                gateFailures.append("\(c.file): corpus file missing")
+                continue
+            }
+            let source: String
+            switch SourceLoader.load(path: fullPath) {
+            case .success(let s): source = s
+            case .failure(let error):
+                // Map the load failure to its gate code so negative cases
+                // can assert it exactly (E9029 = not UTF-8).
+                var loadCodes: [String] = []
+                if case .notUTF8 = error { loadCodes = ["E9029"] }
+                validateGateOutcome(file: c.file, expect: c.expect, codes: loadCodes, detail: "\(error)", failures: &gateFailures)
+                continue
+            }
+            coverageReport[c.file] = c.coverage
+
+            let sourceMap = SourceMap()
+            let fileID = sourceMap.addFile(name: fullPath, source: source)
+            let diags = DiagnosticBag()
+            let lexer = Lexer(source: source, fileID: fileID, diagnostics: diags)
+            let tokens = lexer.lex()
+            let parser = Parser(tokens: tokens, source: source, fileID: fileID, diagnostics: diags, modulePath: Parser.modulePath(fromFile: fullPath))
+            let program = parser.parseProgram()
+            if !diags.hasErrors {
+                let verifier = ASTVerifier(diagnostics: diags)
+                verifier.verify(program)
+            }
+            if !diags.hasErrors {
+                let checker = SubsetChecker(diagnostics: diags)
+                checker.check(program)
+            }
+            let codes = Array(Set(diags.diagnostics.map(\.code))).sorted()
+            if let expect = c.expect {
+                // Negative case: the gate must produce EXACTLY the expected
+                // code (and nothing else) — a wrong or missing code is a
+                // gate failure.
+                validateGateOutcome(file: c.file, expect: expect, codes: codes, detail: nil, failures: &gateFailures)
+                continue
+            }
+            if !codes.isEmpty {
+                gateFailures.append("\(c.file): stage0 gate rejects (\(codes.joined(separator: ",")))")
+                continue
+            }
+
+            let lexText = Stage0DumpFormatter.lexLines(tokens: tokens, sourceMap: sourceMap)
+            let stage0Tokens = Stage0Normalizer.tokens(lexOutput: lexText)
+            let stage0AST = Stage0Normalizer.astItemKinds(dumpOutput: ASTDumper().dump(program))
+
+            for phase in c.parity {
+                if noStage3 || selfCheck {
+                    // Self-check mode: verify the stage0 side normalizes
+                    // without vocabulary gaps.
+                    let stream = phase == .tokens ? stage0Tokens : stage0AST
+                    let gap = stream.first { $0.hasPrefix("??:") }
+                    if let gap = gap {
+                        results.append(DifferentialCaseResult(
+                            file: c.file, phase: phase,
+                            verdict: .normalizationGap(detail: "stage0 projection: \(gap)")))
+                    } else {
+                        results.append(DifferentialCaseResult(
+                            file: c.file, phase: phase, verdict: .match))
+                    }
+                    continue
+                }
+                guard case .ok = probe else { continue }
+                let stage3Output = runStage3(bin: resolvedStage3, file: fullPath, phase: phase, fm: fm)
+                let stage3Stream: [String]
+                switch stage3Output {
+                case .success(let text):
+                    stage3Stream = phase == .tokens
+                        ? Stage3Normalizer.tokens(dumpOutput: text)
+                        : Stage3Normalizer.astItemKinds(dumpOutput: text)
+                case .failure(let error):
+                    results.append(DifferentialCaseResult(
+                        file: c.file, phase: phase,
+                        verdict: .normalizationGap(detail: "stage3 run failed: \(error)")))
+                    continue
+                }
+                let stage0Stream = phase == .tokens ? stage0Tokens : stage0AST
+                let verdict = DifferentialCompare.streams(stage0Stream, stage3Stream, phase: phase)
+                results.append(DifferentialCaseResult(file: c.file, phase: phase, verdict: verdict))
+            }
+        }
+
+        let report = DifferentialReport(
+            results: results,
+            corpusGateFailures: gateFailures,
+            stage3Probe: (noStage3 || selfCheck) ? nil : probe
+        )
+        print(report.description)
+        print("\nCoverage per corpus file:")
+        for (file, tags) in coverageReport.sorted(by: { $0.key < $1.key }) {
+            print("  \(file): \(tags.joined(separator: ", "))")
+        }
+
+        if !gateFailures.isEmpty {
+            exit(3)
+        }
+        if !(noStage3 || selfCheck) {
+            if case .failure = probe {
+                exit(2)
+            }
+        }
+        if !report.divergent.isEmpty || !report.gaps.isEmpty {
+            exit(1)
+        }
+        print("\nStatus: ALL MATCH")
+    }
+
+    private static func validateGateOutcome(file: String, expect: String?, codes: [String], detail: String?, failures: inout [String]) {
+        guard let expect = expect else {
+            failures.append("\(file): gate rejected without a declared expectation: \(detail ?? codes.joined(separator: ","))")
+            return
+        }
+        let extras = codes.filter { $0 != expect }
+        if !codes.contains(expect) {
+            failures.append("\(file): expected gate code \(expect), got \(codes.isEmpty ? (detail ?? "none") : codes.joined(separator: ","))")
+        } else if !extras.isEmpty {
+            failures.append("\(file): expected ONLY \(expect), also got \(extras.joined(separator: ","))")
+        }
+    }
+
+    private static func probeStage3(bin: String, fm: FileManager) -> Stage3ProbeResult {
+        guard fm.fileExists(atPath: bin) else {
+            return .failure(reason: "binary not found: \(bin)")
+        }
+        let probeSource = "def main() -> Int\n  0\nend\n"
+        let probeDir = NSTemporaryDirectory()
+        let probePath = (probeDir as NSString).appendingPathComponent("tg_diff_probe.tg")
+        do {
+            try probeSource.write(toFile: probePath, atomically: true, encoding: .utf8)
+        } catch {
+            return .failure(reason: "cannot write probe file: \(error)")
+        }
+        let tokensProbe = runStage3(bin: bin, file: probePath, phase: .tokens, fm: fm)
+        let astProbe = runStage3(bin: bin, file: probePath, phase: .ast, fm: fm)
+        let tokensOK: Bool
+        switch tokensProbe {
+        case .success(let text): tokensOK = text.contains("Tokens:")
+        case .failure: tokensOK = false
+        }
+        let astOK: Bool
+        switch astProbe {
+        case .success(let text): astOK = text.contains("AST:")
+        case .failure: astOK = false
+        }
+        if tokensOK || astOK {
+            return .ok(tokens: tokensOK, ast: astOK)
+        }
+        return .failure(reason: "neither `check --dump-tokens/--dump-ast` nor `compile --dump-tokens/--dump-ast` produced dump markers (the binary predates the dump hooks — a14eeca)")
+    }
+
+    private enum Stage3Run {
+        case success(String)
+        case failure(String)
+    }
+
+    private static func runStage3(bin: String, file: String, phase: DifferentialPhase, fm: FileManager) -> Stage3Run {
+        let flag = phase == .tokens ? "--dump-tokens" : "--dump-ast"
+        // The dump hooks exist on BOTH stage3 entries: the bootstrap entry
+        // accepts them under `compile` (bootstrap_main.tg), the full driver
+        // under `check` (driver.tg). Try `check` first, then `compile`.
+        let marker = phase == .tokens ? "Tokens:" : "AST:"
+        for shape in (0..<2) {
+            let args = shape == 0
+                ? ["check", file, flag]
+                : ["compile", file, flag]
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: bin)
+            process.arguments = args
+            let pipe = Pipe()
+            process.standardOutput = pipe
+            process.standardError = pipe
+            do {
+                try process.run()
+            } catch {
+                return .failure("cannot launch \(bin): \(error)")
+            }
+            process.waitUntilExit()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            let text = String(data: data, encoding: .utf8) ?? ""
+            if process.terminationStatus == 0 && text.contains(marker) {
+                return .success(text)
+            }
+        }
+        return .failure("neither `check \(flag)` nor `compile \(flag)` produced the dump marker")
     }
 
     // MARK: - Compile via Self-Hosted Compiler

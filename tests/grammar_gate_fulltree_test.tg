@@ -1,0 +1,464 @@
+# tests/grammar_gate_fulltree_test.tg — the full-tree dialect-cleanliness
+# canary (the in-language twin of scripts/run_selfhost_grammar_gate.sh).
+#
+# The bootstrap closure (bootstrap/compiler_kernel.manifest) proves only its
+# own 23 compiler files; the non-kernel tools (driver, linter, pkg_manager,
+# formatter, docgen, bindgen, lib, registry, refactor, template, wasm_target,
+# agentic, ...) are compiled by the full product (main.tg pulls the driver,
+# which imports the tools), so a stale tool file breaks the product even when
+# the kernel closure is clean.
+#
+# This test reads EVERY tg_compiler/*.tg (the gate's generalized full-tree
+# scan) and asserts the tree is free of:
+#   - the legacy parameter spellings (the E100/E106 forms: `mut x:` /
+#     `&x:` / `&mut x:` / `move x:` / `own x:` prefixes, `x: &T` /
+#     `x: &mut T` type-position markers, `fn(&T)` / `fn(mut T)` fn-type
+#     params, `-> &T` returns, `&self` / `&mut self` receivers);
+#   - first-class `&mut`-typed locals (`x: &mut T` — the E106 marker class);
+#   - the stale lexer API (a 1-argument `tokenize(source)` call — the
+#     current lexer exposes only `tokenize(source, file)` plus the
+#     1-argument `lex(source)` wrapper).
+#
+# The scan mirrors the gate's awk: `#` line comments, "..." string literals
+# and '...' char literals are stripped before matching, so ABI documentation
+# and string payloads cannot trip it. Run with the repo root as the working
+# directory: `tg test tests/grammar_gate_fulltree_test.tg`.
+
+use std::collections::{Vec}
+use std::fs::{list_directory, read_to_string}
+use std::test::*
+
+# ———————————————————————————————————————————————————————————————
+# Character helpers
+# ———————————————————————————————————————————————————————————————
+
+def is_space(c: Char) -> Bool
+  c == ' ' || c == '\t'
+end
+
+def is_ident_char(c: Char) -> Bool
+  c.is_alphanumeric() || c == '_'
+end
+
+def starts_with_at(s: String, i: Int, needle: String) -> Bool
+  if i + needle.len() > s.len() then return false end
+  var k = 0
+  while k < needle.len() do
+    if s.char_at(i + k) != needle.char_at(k) then return false end
+    k = k + 1
+  end
+  true
+end
+
+# ———————————————————————————————————————————————————————————————
+# The gate's sanitize: strip `#` line comments, "..." string literals
+# and '...' char literals (the sanitized line is what the patterns match).
+# ———————————————————————————————————————————————————————————————
+
+def sanitize_line(line: String) -> String
+  mut out = String::new()
+  mut in_str = false
+  mut i = 0
+  while i < line.len() do
+    let c = line.char_at(i)
+    if in_str then
+      if c == '\\' then
+        i = i + 2
+        next
+      end
+      if c == '"' then
+        in_str = false
+      end
+      i = i + 1
+      next
+    end
+    if c == '"' then
+      in_str = true
+      out.push('"')
+      out.push('"')
+      i = i + 1
+      next
+    end
+    if c == '\'' then
+      i = i + 1
+      while i < line.len() do
+        let cc = line.char_at(i)
+        if cc == '\\' then
+          i = i + 2
+          next
+        end
+        if cc == '\'' then
+          i = i + 1
+          break
+        end
+        i = i + 1
+      end
+      next
+    end
+    if c == '#' then
+      break
+    end
+    out.push(c)
+    i = i + 1
+  end
+  out
+end
+
+# ———————————————————————————————————————————————————————————————
+# The gate's per-line checks (returns "" when the line is clean)
+# ———————————————————————————————————————————————————————————————
+
+def raw_is_extern_intrinsic(raw: String) -> Bool
+  var i = 0
+  while i < raw.len() && is_space(raw.char_at(i)) do
+    i = i + 1
+  end
+  if starts_with_at(raw, i, "extern def __intrinsic_") then return true end
+  if starts_with_at(raw, i, "extern static __intrinsic_") then return true end
+  false
+end
+
+def raw_is_tokenize_def(raw: String) -> Bool
+  var i = 0
+  while i < raw.len() && is_space(raw.char_at(i)) do
+    i = i + 1
+  end
+  if starts_with_at(raw, i, "pub ") then i = i + 4 end
+  while i < raw.len() && is_space(raw.char_at(i)) do
+    i = i + 1
+  end
+  if starts_with_at(raw, i, "def ") then
+    var j = i + 4
+    while j < raw.len() && is_space(raw.char_at(j)) do
+      j = j + 1
+    end
+    starts_with_at(raw, j, "tokenize")
+  else
+    false
+  end
+end
+
+def skip_spaces(s: String, i: Int) -> Int
+  var j = i
+  while j < s.len() && is_space(s.char_at(j)) do
+    j = j + 1
+  end
+  j
+end
+
+def legacy_reason(line: String, raw: String) -> String
+  var i = 0
+
+  # 1. `x: &T` / `x: &mut T` — the type-position marker (a first-class
+  #    `&mut`-typed local is the same marker class and is rejected with it).
+  i = 0
+  while i < line.len() do
+    if line.char_at(i) == ':' then
+      var j = skip_spaces(line, i + 1)
+      if j < line.len() && line.char_at(j) == '&' then
+        var k = j + 1
+        if starts_with_at(line, k, "mut") then
+          k = k + 3
+        end
+        k = skip_spaces(line, k)
+        if k < line.len() && (is_ident_char(line.char_at(k)) || line.char_at(k) == '<') then
+          return "legacy reference parameter marker (`: &T` / `: &mut T`)"
+        end
+      end
+    end
+    i = i + 1
+  end
+
+  # 2. `-> &T` return-position reference (extern __intrinsic ABI lines are
+  #    exempt — there the reference IS the legal address ABI).
+  if !raw_is_extern_intrinsic(raw) then
+    i = 0
+    while i + 1 < line.len() do
+      if line.char_at(i) == '-' && line.char_at(i + 1) == '>' then
+        var j = skip_spaces(line, i + 2)
+        if j < line.len() && line.char_at(j) == '&' then
+          return "legacy reference return type (`-> &T`)"
+        end
+      end
+      i = i + 1
+    end
+  end
+
+  # 3a. fn-type reference parameter: `fn(&T)` / `fn(&mut T)`.
+  # 3b. fn-type convention prefix: `fn(mut T)` / `fn(move T)` / `fn(own T)`.
+  i = 0
+  while i + 1 < line.len() do
+    if line.char_at(i) == 'f' && line.char_at(i + 1) == 'n' &&
+       (i == 0 || !is_ident_char(line.char_at(i - 1))) then
+      var j = skip_spaces(line, i + 2)
+      if j < line.len() && line.char_at(j) == '(' then
+        var k = skip_spaces(line, j + 1)
+        if k < line.len() && line.char_at(k) == '&' then
+          return "legacy fn-type reference parameter (`fn(&T)` / `fn(&mut T)`)"
+        end
+        if starts_with_at(line, k, "mut") || starts_with_at(line, k, "move") ||
+           starts_with_at(line, k, "own") then
+          var m = skip_spaces(line, k + 3)
+          if m < line.len() && (is_ident_char(line.char_at(m)) || line.char_at(m) == '<') then
+            return "legacy fn-type convention prefix (`fn(mut T)` / `fn(move T)` / `fn(own T)`)"
+          end
+        end
+      end
+    end
+    i = i + 1
+  end
+
+  # 4a. parameter prefix `&x:` / `&mut x:` — the `&name: Type` shape
+  #     (the `: [^: \t]` tail keeps qualified-path call arguments like
+  #     `f(&tg_compiler::ids::LocalId { id: ... })` from matching).
+  i = 0
+  while i < line.len() do
+    if line.char_at(i) == '(' || line.char_at(i) == ',' then
+      var j = skip_spaces(line, i + 1)
+      if j < line.len() && line.char_at(j) == '&' then
+        var k = j + 1
+        if starts_with_at(line, k, "mut") then
+          k = k + 3
+        end
+        k = skip_spaces(line, k)
+        if k < line.len() && line.char_at(k) >= 'a' && line.char_at(k) <= 'z' then
+          var m = k + 1
+          while m < line.len() && is_ident_char(line.char_at(m)) do
+            m = m + 1
+          end
+          if m < line.len() && line.char_at(m) == ':' && m + 1 < line.len() &&
+             !is_space(line.char_at(m + 1)) && line.char_at(m + 1) != ':' then
+            return "legacy parameter prefix (`&x:` / `&mut x:`)"
+          end
+        end
+      end
+    end
+    i = i + 1
+  end
+
+  # 4b. parameter prefix `mut x:` / `move x:` / `own x:` (the `([(,])`
+  #     anchor keeps the legal statement-local `mut x: T = ...` from
+  #     matching; `when Option::Some(mut p)` patterns never match — the
+  #     binding is not followed by `:`).
+  i = 0
+  while i < line.len() do
+    if line.char_at(i) == '(' || line.char_at(i) == ',' then
+      var j = skip_spaces(line, i + 1)
+      if starts_with_at(line, j, "mut") || starts_with_at(line, j, "move") ||
+         starts_with_at(line, j, "own") then
+        var k = skip_spaces(line, j + 3)
+        if k < line.len() && line.char_at(k) >= 'a' && line.char_at(k) <= 'z' then
+          var m = k + 1
+          while m < line.len() && is_ident_char(line.char_at(m)) do
+            m = m + 1
+          end
+          if m < line.len() && line.char_at(m) == ':' && m + 1 < line.len() &&
+             !is_space(line.char_at(m + 1)) && line.char_at(m + 1) != ':' then
+            return "legacy parameter prefix (`mut x:` / `move x:` / `own x:`)"
+          end
+        end
+      end
+    end
+    i = i + 1
+  end
+
+  # 5. legacy receivers `&self` / `&mut self` (expression access markers
+  #    like `&self.ptr` remain legal and are NOT matched).
+  i = 0
+  while i < line.len() do
+    if line.char_at(i) == '(' || line.char_at(i) == ',' then
+      var j = skip_spaces(line, i + 1)
+      if j < line.len() && line.char_at(j) == '&' then
+        var k = j + 1
+        if starts_with_at(line, k, "mut") then
+          k = k + 3
+        end
+        k = skip_spaces(line, k)
+        if starts_with_at(line, k, "self") then
+          var m = skip_spaces(line, k + 4)
+          if m >= line.len() || line.char_at(m) == ',' || line.char_at(m) == ')' ||
+             line.char_at(m) == ':' then
+            return "legacy receiver (`&self` / `&mut self`)"
+          end
+        end
+      end
+    end
+    i = i + 1
+  end
+
+  # 6. the stale lexer API: `tokenize(<single-argument>)` — the current
+  #    lexer exposes only `tokenize(source, file)` plus the 1-argument
+  #    `lex(source)` wrapper. `tokenize()` (zero args) never matches and a
+  #    2-argument call never matches (a top-level comma in the call body);
+  #    a `def tokenize(...)` line is a definition, never a call.
+  if !raw_is_tokenize_def(raw) then
+    i = 0
+    while i + 7 < line.len() do
+      if starts_with_at(line, i, "tokenize") && (i == 0 || !is_ident_char(line.char_at(i - 1))) then
+        var j = skip_spaces(line, i + 8)
+        if j < line.len() && line.char_at(j) == '(' then
+          var k = skip_spaces(line, j + 1)
+          if k < line.len() && line.char_at(k) != ')' && line.char_at(k) != '(' &&
+             line.char_at(k) != ',' then
+            mut depth = 0
+            mut has_comma = false
+            mut closed = false
+            var m = k
+            while m < line.len() do
+              let c = line.char_at(m)
+              if c == '(' then
+                depth = depth + 1
+              elsif c == ')' then
+                if depth == 0 then
+                  closed = true
+                  break
+                end
+                depth = depth - 1
+              elsif c == ',' && depth == 0 then
+                has_comma = true
+              end
+              m = m + 1
+            end
+            if closed && !has_comma then
+              return "stale lexer API (1-argument `tokenize(...)`; use `tokenize(source, file)` or `lex(source)`)"
+            end
+          end
+        end
+      end
+      i = i + 1
+    end
+  end
+
+  ""
+end
+
+# ———————————————————————————————————————————————————————————————
+# The per-file scan (returns the first violation, "" when clean)
+# ———————————————————————————————————————————————————————————————
+
+def scan_content(path: String, content: String) -> String
+  var first_violation = ""
+  var line_start = 0
+  var line_no = 1
+  var i = 0
+  while i <= content.len() do
+    if i == content.len() || content.char_at(i) == '\n' then
+      let raw_line = content.slice(line_start, i)
+      let clean = sanitize_line(raw_line)
+      if clean.len() > 0 then
+        let reason = legacy_reason(clean, raw_line)
+        if reason.len() > 0 && first_violation.len() == 0 then
+          first_violation = path + ":" + line_no.to_string() + ": " + reason
+        end
+      end
+      line_start = i + 1
+      line_no = line_no + 1
+    end
+    i = i + 1
+  end
+  first_violation
+end
+
+def scan_file(path: String) -> String
+  match read_to_string(path.clone())
+  when Result::Ok(content) then
+    scan_content(path, content)
+  when Result::Err(e) then
+    "unreadable: " + path + ": " + e.to_string()
+  end
+end
+
+def join_violations(vs: Vec[String]) -> String
+  var out = ""
+  for v in vs do
+    if out.len() > 0 then
+      out = out + "; "
+    end
+    out = out + v
+  end
+  out
+end
+
+def list_has(entries: Vec[String], needle: String) -> Bool
+  for e in entries do
+    if e == needle then
+      return true
+    end
+  end
+  false
+end
+
+# ———————————————————————————————————————————————————————————————
+# The tests
+# ———————————————————————————————————————————————————————————————
+
+@test
+def test_full_tree_is_dialect_clean() -> Unit
+  var scanned = 0
+  var violations: Vec[String] = Vec::new()
+
+  match list_directory("tg_compiler")
+  when Result::Ok(entries) then
+    for name in entries do
+      if name.ends_with(".tg") then
+        scanned = scanned + 1
+        let v = scan_file("tg_compiler/" + name)
+        if v.len() > 0 then
+          violations.push(v)
+        end
+      end
+    end
+  when Result::Err(e) then
+    assert(false, "cannot list tg_compiler/: " + e.to_string())
+  end
+
+  assert(scanned >= 49, "the full-tree scan must cover every tg_compiler/*.tg (scanned " + scanned.to_string() + ")")
+  assert(violations.is_empty(), "legacy forms / stale lexer API calls found in the tool tree: " + join_violations(&violations))
+end
+
+@test
+def test_kernel_closure_present() -> Unit
+  let kernel_files = [
+    "access_check.tg", "resource_check.tg", "asm.tg", "ast.tg",
+    "bootstrap_main.tg", "codegen.tg", "compiler_core.tg", "ids.tg",
+    "layout_engine.tg", "lexer.tg", "lib_kernel.tg", "linker.tg", "mir.tg",
+    "mode.tg", "mono.tg", "object.tg", "parser.tg", "resolver.tg",
+    "runtime.tg", "token.tg", "trait_resolve.tg", "types.tg", "version.tg"
+  ]
+  match list_directory("tg_compiler")
+  when Result::Ok(entries) then
+    var missing: Vec[String] = Vec::new()
+    for f in kernel_files do
+      if !list_has(&entries, f) then
+        missing.push(f)
+      end
+    end
+    assert(missing.is_empty(), "kernel closure files missing from tg_compiler/: " + join_violations(&missing))
+  when Result::Err(e) then
+    assert(false, "cannot list tg_compiler/: " + e.to_string())
+  end
+end
+
+@test
+def test_non_kernel_tools_present() -> Unit
+  let tool_files = [
+    "agentic.tg", "bindgen.tg", "cap_baseline.tg", "context_pack.tg",
+    "coverage.tg", "cqs.tg", "cross_compile.tg", "debugger.tg", "docgen.tg",
+    "driver.tg", "empty.tg", "formatter.tg", "hello.tg", "hello_minimal.tg",
+    "layout_descriptor.tg", "lib.tg", "linter.tg", "main.tg", "pkg_manager.tg",
+    "refactor.tg", "registry.tg", "return0.tg", "symbol_graph.tg",
+    "template.tg", "util.tg", "wasm_target.tg"
+  ]
+  match list_directory("tg_compiler")
+  when Result::Ok(entries) then
+    var missing: Vec[String] = Vec::new()
+    for f in tool_files do
+      if !list_has(&entries, f) then
+        missing.push(f)
+      end
+    end
+    assert(missing.is_empty(), "non-kernel tool files missing from tg_compiler/: " + join_violations(&missing))
+  when Result::Err(e) then
+    assert(false, "cannot list tg_compiler/: " + e.to_string())
+  end
+end

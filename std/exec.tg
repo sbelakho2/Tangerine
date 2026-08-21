@@ -6,7 +6,7 @@
 #   - Work stealing for load balancing
 #   - Task prioritization
 #   - Graceful shutdown
-#   - Async/await support
+#   - Async/await support (via std::async's runtime — the block_on delegation)
 #
 # Example:
 #   use std::exec::{Executor, spawn, block_on}
@@ -31,6 +31,7 @@
 use std::core::{Option, Result, String, Bool, Int, UInt, Unit, panic}
 use std::collections::{Vec, Map, Queue, RingBuffer}
 use std::sync::{Mutex, Condvar, AtomicU32, AtomicBool, Arc}
+use std::async::{Future}
 use std::thread::{Thread, spawn}
 use std::time::{Duration, Instant}
 
@@ -84,7 +85,6 @@ struct Task
   priority: TaskPriority
   state: AtomicU32  # TaskState as atomic
   func: Box[dyn FnOnce()]
-  waker: Option[Waker]
   created_at: Instant
 end
 
@@ -229,6 +229,30 @@ struct ExecutorInner
   # Task notification
   task_available: Arc[Condvar]
   
+  # THE ADMISSION MUTEX (the admission race): every
+  # submit holds this mutex across its lifecycle check + enqueue, and the
+  # shutdown's Running -> Draining/Cancelling transition happens under
+  # the SAME mutex — a submit that acquired the lock after the transition
+  # is rejected (nothing enqueued), a submit that acquired it before is
+  # fully admitted and drained (the transition cannot interleave with its
+  # enqueue). The old check-then-enqueue (no lock) let a submit pass the
+  # check, get descheduled, and enqueue after the shutdown reached
+  # quiescence — the task stranded after the join.
+  admission: Mutex[Unit]
+  
+  # THE GATE U TEST-FREEZE BARRIER (the admission-freeze test hook — the
+  # always-on debug instrumentation, the same spirit as the ledger): when
+  # test_submit_freeze is set, a submit parks after its admission check
+  # (the guard dropped — the shutdown can transition in between) until
+  # test_submit_freeze_release is set; test_submit_freeze_reached is the
+  # deterministic handshake (the submit parked at the barrier). The two
+  # legal outcomes: the submit re-checks under the lock and is admitted
+  # (drained) or rejected (panics) — never an enqueue after the
+  # quiescence.
+  test_submit_freeze: AtomicBool
+  test_submit_freeze_reached: AtomicBool
+  test_submit_freeze_release: AtomicBool
+  
   # Statistics
   total_tasks_submitted: AtomicU32
   total_tasks_completed: AtomicU32
@@ -280,6 +304,10 @@ def Executor::new(thread_count: Int) -> Result[Executor, String]
       state: state,
       active_tasks: AtomicU32::new(0),
       task_available: task_available,
+      admission: Mutex::new(()),
+      test_submit_freeze: AtomicBool::new(false),
+      test_submit_freeze_reached: AtomicBool::new(false),
+      test_submit_freeze_release: AtomicBool::new(false),
       total_tasks_submitted: AtomicU32::new(0),
       total_tasks_completed: AtomicU32::new(0),
       next_task_id: AtomicU32::new(1),
@@ -294,11 +322,19 @@ def Executor::new(thread_count: Int) -> Result[Executor, String]
   Result::Ok(executor)
 end
 
-def Executor::new_default() -> Result[Executor, String]
-  # Use number of CPU cores or default
+## The validated default thread count: the CPU count when positive, the
+## DEFAULT_THREAD_COUNT constant otherwise — NEVER 0 (Executor::new
+## rejects a thread count below 1; the old global_executor lazy init
+## called init_global_executor(0) — "use default" — which built an
+## invalid zero-thread executor whose Err was ignored and whose unwrap
+## panicked).
+def _default_thread_count_validated() -> Int
   let cpu_count = std::env::cpu_count()
-  let thread_count = if cpu_count > 0 then cpu_count else DEFAULT_THREAD_COUNT() end
-  Executor::new(thread_count)
+  if cpu_count > 0 then cpu_count else DEFAULT_THREAD_COUNT() end
+end
+
+def Executor::new_default() -> Result[Executor, String]
+  Executor::new(_default_thread_count_validated())
 end
 
 def Executor::start_workers(inout self: Executor) -> Unit
@@ -414,7 +450,11 @@ def find_task(
     # Finally, try to steal from other workers
     var steal_attempts = 0
     while steal_attempts < STEAL_ATTEMPTS() do
-      var victim_idx = std::rand::random_range(0, inner.workers.len() as Int - 1)
+      # THE VICTIM RANGE (): random_range's upper bound
+      # is EXCLUSIVE — the old (0, len - 1) never chose the LAST worker
+      # (index len - 1). The full worker range (0, len) makes every
+      # worker — the last one included — a possible victim.
+      var victim_idx = std::rand::random_range(0, inner.workers.len() as Int)
       
       if victim_idx != worker_id then
         let stolen = inner.workers[victim_idx].local_queue.steal(2)
@@ -449,6 +489,21 @@ def find_task(
 end
 
 ## Execute a single task
+##
+## THE PANIC TERMINALITY (the State-A
+## choice): the task's closure may panic, and the panic can strike at any
+## point between the active-count increment below and the completion
+## bookkeeping. The dialect's panic state is ABORT-ONLY for a worker
+## thread (a panic unwinds only through a catch_unwind frame on the SAME
+## thread; the worker has none): a panicking task ABORTS THE PROCESS, so
+## the ledger's consistency is irrelevant post-abort — there is no
+## observable "task stuck at Running with the active count never
+## decremented" state to recover. The executor deliberately does NOT
+## catch-unwind and record a Failed ledger transition: the dialect's
+## unwind path skips resource finalizers (the mutex guards would be left
+## held), and the abort contract needs no recovery. The Failed ledger
+## state remains the invariant hook for a future catch-panic execution
+## path — never a live transition under the abort contract.
 def execute_task(
   task: Task,
   executor: Arc[ExecutorInner],
@@ -469,8 +524,9 @@ def execute_task(
   # Set task state to running
   task.state.store(1)  # TaskState::Running
   
-  # Execute the task
-  # Note: In a real implementation, we'd catch panics here
+  # Execute the task — a panic ABORTS the process (the documented
+  # State-A terminality above): no catch here, no ledger bookkeeping
+  # after the abort.
   task.func.call()
   
   # Update statistics — through the worker's Arc clone (the inner's
@@ -606,9 +662,11 @@ def _debug_ledger_cancelled(inner: PtrMut[ExecutorInner], task_id: u64) -> Unit
 end
 
 ## Mark a TaskId as Failed — the terminal transition for a task that
-## panicked during execution (the hook for a catch-panic execution path;
-## the executor does not catch panics today, the state is part of the
-## invariant).
+## panicked during execution. Under the reviewer's State-A choice (the
+## abort-only panic contract — see execute_task), a live task panic
+## ABORTS the process, so the executor never records Failed at runtime;
+## the state is the invariant hook for a future catch-panic execution
+## path.
 def _debug_ledger_failed(inner: PtrMut[ExecutorInner], task_id: u64) -> Unit
   var guard = inner.debug_task_states.lock()
   match guard.get(task_id)
@@ -696,14 +754,45 @@ end
 def Executor::submit(self: Executor, func: Box[dyn FnOnce()], priority: TaskPriority) -> u64
   unsafe "executor inner access — the Arc clone keeps the inner alive" do
     let inner = self.inner.ptr.as_mut()
-    # THE LIFECYCLE GATE: a submission that arrives after the Running
-    # state is REJECTED (the panic) — the Draining/Cancelling states
-    # accept no new work (the graceful drain runs only the work queued
-    # before the transition; the Cancelling drain removes the rest). The
-    # rejection happens BEFORE any TaskId is allocated or the ledger is
-    # touched.
+    # THE ADMISSION PROTOCOL (the admission race):
+    # the lifecycle check AND the enqueue happen under the admission
+    # mutex — the same lock the shutdown's Running -> Draining/Cancelling
+    # transition takes. A submission that acquires the lock AFTER the
+    # transition is REJECTED (the panic — before any TaskId is allocated
+    # or the ledger is touched); a submission that acquired the lock
+    # BEFORE the transition is fully admitted — the transition cannot
+    # interleave with its enqueue, so the task is always drained. The old
+    # check-then-enqueue (no lock) had the race: a submit could pass the
+    # check, get descheduled, and enqueue after the shutdown reached
+    # quiescence — the task stranded after the join. The rejection
+    # panics AFTER the guard dropped (the decision is made under the
+    # lock, and the state never returns to Running, so the rejection is
+    # final) — the admission mutex is never poisoned by a reject-path
+    # panic.
+    var guard = inner.admission.lock()
     if inner.state.load() != _exec_state_running() then
+      drop(guard)
       panic("executor is shutting down: submit rejected")
+    end
+    # THE GATE U TEST-FREEZE BARRIER (the admission-freeze test hook):
+    # when armed, the submit drops the guard after its check and parks
+    # until the release — the deterministic deschedule between the check
+    # and the enqueue. The test places a shutdown in between; after the
+    # release the submit re-acquires the lock and RE-CHECKS: a submit
+    # that re-acquires first is admitted and drained, one that arrives
+    # after the transition is rejected — only these two legal outcomes,
+    # never an enqueue after the quiescence.
+    if inner.test_submit_freeze.load() then
+      drop(guard)
+      inner.test_submit_freeze_reached.store(true)
+      while !inner.test_submit_freeze_release.load() do
+        std::thread::yield_now()
+      end
+      guard = inner.admission.lock()
+      if inner.state.load() != _exec_state_running() then
+        drop(guard)
+        panic("executor is shutting down: submit rejected")
+      end
     end
     let task_id = inner.next_task_id.fetch_add(1) as u64
     
@@ -712,7 +801,6 @@ def Executor::submit(self: Executor, func: Box[dyn FnOnce()], priority: TaskPrio
       priority: priority,
       state: AtomicU32::new(0),  # TaskState::Pending
       func: func,
-      waker: Option::None,
       created_at: Instant::now()
     }
     
@@ -756,6 +844,11 @@ def Executor::submit(self: Executor, func: Box[dyn FnOnce()], priority: TaskPrio
       enqueue_global_by_priority(inner, task)
     end
     
+    # The enqueue is complete — the admission critical section ends (a
+    # task admitted before the shutdown transition is already in a queue
+    # when the transition happens); the notification follows.
+    drop(guard)
+    
     # Notify waiting workers
     inner.task_available.notify_one()
     
@@ -765,18 +858,6 @@ end
 
 ## Submit a task that returns a value
 def Executor::submit_with_result[T: Transferable](self: Executor, func: fn() -> T, priority: TaskPriority) -> JoinHandle[T]
-  # THE LIFECYCLE GATE — the same rejection contract as submit: no new
-  # work after the Running state.
-  unsafe "executor inner access — the Arc clone keeps the inner alive" do
-    let inner = self.inner.ptr.as_mut()
-    if inner.state.load() != _exec_state_running() then
-      panic("executor is shutting down: submit rejected")
-    end
-  end
-  let task_id = unsafe "executor inner access — the Arc clone keeps the inner alive" do
-    let inner = self.inner.ptr.as_mut()
-    inner.next_task_id.fetch_add(1) as u64
-  end
   let result = Arc::new(Mutex::new(Option::None[T]))
   let completed = Arc::new(Condvar::new())
   
@@ -790,28 +871,47 @@ def Executor::submit_with_result[T: Transferable](self: Executor, func: fn() -> 
     completed_clone.notify_all()
   end
   
-  let task = Task {
-    id: task_id,
-    priority: priority,
-    state: AtomicU32::new(0),
-    func: Box::new(wrapper),
-    waker: Option::None,
-    created_at: Instant::now()
-  }
-  
-  unsafe "executor inner access — the Arc clone keeps the inner alive" do
+  let task_id = unsafe "executor inner access — the Arc clone keeps the inner alive" do
     let inner = self.inner.ptr.as_mut()
+    # THE ADMISSION PROTOCOL — the same rejection contract as submit: the
+    # lifecycle check, the TaskId allocation, the ledger, and the enqueue
+    # ALL run under the admission mutex — a submit that acquires the lock
+    # after the shutdown transition is rejected (the panic — nothing
+    # enqueued), a submit that acquired it before is fully admitted and
+    # drained (the transition cannot interleave with its enqueue). The
+    # old two-gap shape (a check, then a separate enqueue) let a
+    # submission slip its enqueue past the transition. The rejection
+    # panics AFTER the guard dropped — the mutex is never poisoned.
+    var guard = inner.admission.lock()
+    if inner.state.load() != _exec_state_running() then
+      drop(guard)
+      panic("executor is shutting down: submit rejected")
+    end
+    let id = inner.next_task_id.fetch_add(1) as u64
+    
+    let task = Task {
+      id: id,
+      priority: priority,
+      state: AtomicU32::new(0),
+      func: Box::new(wrapper),
+      created_at: Instant::now()
+    }
+    
     # The ledger first — the duplicate-TaskId fatal before the task can
     # reach the queue.
-    _debug_ledger_submit(inner, task_id)
+    _debug_ledger_submit(inner, id)
     inner.total_tasks_submitted.fetch_add(1)
     
-    # Add to global queue
-    _debug_ledger_queued(inner, task_id)
-    var guard = inner.global_queue.lock()
-    guard.enqueue(task)
+    # Add to global queue — under the admission mutex.
+    _debug_ledger_queued(inner, id)
+    var gq = inner.global_queue.lock()
+    gq.enqueue(task)
+    drop(gq)
+    drop(guard)
     
     inner.task_available.notify_one()
+    
+    id
   end
   
   # The handle keeps the executor alive through its OWN Arc clone — the
@@ -836,10 +936,12 @@ impl[T] JoinHandle[T]
   ## cancelled BEFORE it can run — the result cell is never published,
   ## so the join polls the ledger: a task whose ledger state is
   ## Cancelled (or Failed) resolves to None. The same terminal
-  ## resolution applies when the executor reached the Stopped state
-  ## without the task completing (a task stranded by a submission that
-  ## raced the drain). The wait is bounded (the 5ms ledger recheck) —
-  ## every JoinHandle reaches the terminal state under either shutdown.
+  ## resolution is the defense-in-depth for a task cancelled under the
+  ## Cancelling drain (the admission protocol closed the old
+  ## strand-after-quiescence race: a submit is either rejected before
+  ## any TaskId allocation or fully admitted and drained). The wait is
+  ## bounded (the 5ms ledger recheck) — every JoinHandle reaches the
+  ## terminal state under either shutdown.
   def join(self: JoinHandle[T]) -> Option[T]
     var guard = self.result.lock()
     while guard.is_none() do
@@ -885,19 +987,32 @@ end
 # ═══════════════════════════════════════════════════════════════
 
 ## Shutdown the executor gracefully — the Running -> Draining -> Stopped
-## state machine. The transition is a SINGLE compare-and-swap: a
+## state machine. The transition is a SINGLE compare-and-swap under the
+## ADMISSION MUTEX (the admission protocol): a
 ## concurrent second shutdown (or shutdown_now) loses the transition and
-## returns immediately (the winner joins the threads). Under Draining the
-## workers KEEP PROCESSING — the worker loop exits only when the queues
-## are empty AND the active count is 0 (every queued task runs — the
-## graceful drain, never a stop-flag abandon) — then the workers are
-## joined, the state reaches Stopped, and the TaskId conservation
-## invariant is checked at the quiescence (a violation is the internal
-## fatal error).
+## returns immediately (the winner joins the threads), and no submit can
+## slip an enqueue past the transition — a submit that acquired the lock
+## before it has already enqueued (it is drained), a submit that acquires
+## it after is rejected. Under Draining the workers KEEP PROCESSING — the
+## worker loop exits only when the queues are empty AND the active count
+## is 0 (every queued task runs — the graceful drain, never a stop-flag
+## abandon) — then the workers are joined, the state reaches Stopped, and
+## the TaskId conservation invariant is checked at the quiescence (a
+## violation is the internal fatal error).
 def Executor::shutdown(inout self: Executor) -> Unit
   unsafe "executor inner access — the Arc clone keeps the inner alive" do
     let inner = self.inner.ptr.as_mut()
+    # The cheap early-out BEFORE the admission lock: a shut-down executor
+    # returns without touching the lock (the Drop path never blocks).
+    if inner.state.load() == _exec_state_stopped() then
+      return
+    end
+    # THE ADMISSION PROTOCOL: the Running -> Draining transition happens
+    # under the admission mutex — the same lock every submit holds across
+    # its check-and-enqueue.
+    let guard = inner.admission.lock()
     let old = inner.state.compare_and_swap(_exec_state_running(), _exec_state_draining())
+    drop(guard)
     if old != _exec_state_running() then
       return
     end
@@ -924,22 +1039,33 @@ def Executor::shutdown(inout self: Executor) -> Unit
 end
 
 ## Shutdown the executor immediately — the Running -> Cancelling ->
-## Stopped state machine. The single CAS transition (a concurrent second
-## shutdown loses and returns). The Cancelling state: the submit gate
-## rejects every new submission; ALL queued tasks are removed from every
-## queue (the global queue + each worker's local queue) and marked
-## Cancelled in the ledger (the terminal transition — the closures drop
-## with the Tasks); the running tasks — non-cooperative closures that
-## cannot observe a mid-run cancellation signal — run to completion, and
-## every JoinHandle reaches the terminal state under either shutdown
-## (the join resolves a Cancelled task to None — see JoinHandle::join).
-## The old stub comment ("we'd have cancellation support") is gone: the
-## cancellation IS the ledger mark + the TaskState signal + the join's
-## terminal resolution.
+## Stopped state machine. The single CAS transition under the ADMISSION
+## MUTEX (the admission protocol, the same contract
+## as shutdown: no submit can slip an enqueue past the transition). A
+## concurrent second shutdown loses the transition and returns. The
+## Cancelling state: the submit gate rejects every new submission; ALL
+## queued tasks are removed from every queue (the global queue + each
+## worker's local queue) and marked Cancelled in the ledger (the
+## terminal transition — the closures drop with the Tasks); the running
+## tasks — non-cooperative closures that cannot observe a mid-run
+## cancellation signal — run to completion, and every JoinHandle reaches
+## the terminal state under either shutdown (the join resolves a
+## Cancelled task to None — see JoinHandle::join). The old stub comment
+## ("we'd have cancellation support") is gone: the cancellation IS the
+## ledger mark + the TaskState signal + the join's terminal resolution.
 def Executor::shutdown_now(inout self: Executor) -> Unit
   unsafe "executor inner access — the Arc clone keeps the inner alive" do
     let inner = self.inner.ptr.as_mut()
+    # The cheap early-out BEFORE the admission lock: a shut-down executor
+    # returns without touching the lock.
+    if inner.state.load() == _exec_state_stopped() then
+      return
+    end
+    # THE ADMISSION PROTOCOL: the Running -> Cancelling transition
+    # happens under the admission mutex.
+    let guard = inner.admission.lock()
     let old = inner.state.compare_and_swap(_exec_state_running(), _exec_state_cancelling())
+    drop(guard)
     if old != _exec_state_running() then
       return
     end
@@ -1082,135 +1208,66 @@ def Executor::debug_inject_duplicate_submit(self: Executor, task_id: u64) -> Uni
   end
 end
 
+## THE GATE U TEST-FREEZE CONTROLS (the admission
+## freeze): arm the freeze — the next submit parks after its admission
+## check (the guard dropped, so a shutdown can transition in between)
+## until released; the reached probe is the deterministic handshake (the
+## submit parked at the barrier).
+def Executor::debug_freeze_submit(self: Executor) -> Unit
+  unsafe "executor inner access — the Arc clone keeps the inner alive" do
+    let inner = self.inner.ptr.as_mut()
+    inner.test_submit_freeze.store(true)
+    inner.test_submit_freeze_reached.store(false)
+    inner.test_submit_freeze_release.store(false)
+  end
+end
+
+## The handshake: true when the frozen submit has parked at the barrier
+## (its admission check ran under the lock, the guard is dropped).
+def Executor::debug_freeze_reached(self: Executor) -> Bool
+  unsafe "executor inner access — the Arc clone keeps the inner alive" do
+    let inner = self.inner.ptr.as_mut()
+    inner.test_submit_freeze_reached.load()
+  end
+end
+
+## Release the parked submitter (it re-acquires the admission lock and
+## re-checks the lifecycle state).
+def Executor::debug_release_submit_freeze(self: Executor) -> Unit
+  unsafe "executor inner access — the Arc clone keeps the inner alive" do
+    let inner = self.inner.ptr.as_mut()
+    inner.test_submit_freeze_release.store(true)
+  end
+end
+
+## Disarm the freeze (the release flag stays — only the arm is cleared).
+def Executor::debug_unfreeze_submit(self: Executor) -> Unit
+  unsafe "executor inner access — the Arc clone keeps the inner alive" do
+    let inner = self.inner.ptr.as_mut()
+    inner.test_submit_freeze.store(false)
+  end
+end
+
 # ═══════════════════════════════════════════════════════════════
-# Async/Await Support
+# Async/Await Support (the delegation to std::async's runtime)
 # ═══════════════════════════════════════════════════════════════
+#
+# THE DUPLICATE PSEUDO-ASYNC RUNTIME IS GONE ():
+# std::exec previously carried its OWN Future/Poll/Waker/Sleep/block_on
+# family — a placeholder runtime whose poll loop never integrated with
+# the executor (the block_on busy-yielded, the Sleep re-woke itself on
+# every poll, the spawn_future awaited the future inside a plain
+# closure). The async runtime is std::async's — the cooperative
+# executor, the timer heap, the reactor, the Waker — and std::exec
+# CONSUMES it: the block_on entrypoint delegates straight into
+# std::async::block_on, so exec's API surface is preserved without a
+# second runtime. The Task's waker slot (the exec-owned Waker) is gone
+# with the family.
 
-## Future trait for async operations
-trait Future[T]
-  def poll(inout self: Self, inout cx: Context) -> Poll[T]
-end
-
-enum Poll[T]
-  Ready(T)
-  Pending
-end
-
-struct Context
-  waker: Waker
-end
-
-struct Waker
-  task_id: u64
-  # The waker holds its OWN Arc clone of the executor inner — the future
-  # keeps the executor alive even after the spawning Executor is dropped
-  # or moved.
-  executor: Arc[ExecutorInner]
-end
-
-impl Waker
-  def wake(self: Waker) -> Unit
-    unsafe "executor inner access — the waker's Arc clone keeps the executor alive" do
-      let inner = self.executor.ptr.as_mut()
-      inner.task_available.notify_one()
-    end
-  end
-  
-  def wake_by_ref(self: Waker) -> Unit
-    unsafe "executor inner access — the waker's Arc clone keeps the executor alive" do
-      let inner = self.executor.ptr.as_mut()
-      inner.task_available.notify_one()
-    end
-  end
-end
-
-## A simple future that wraps a value
-struct Ready[T]
-  value: Option[T]
-end
-
-impl[T] Future[T] for Ready[T]
-  def poll(inout self: Ready[T], inout _cx: Context) -> Poll[T]
-    match self.value.take()
-    when Option::Some(v) then Poll::Ready(v)
-    when Option::None then Poll::Ready(Default::default())
-    end
-  end
-end
-
-def ready[T](value: T) -> Ready[T]
-  Ready { value: Option::Some(value) }
-end
-
-## A future that completes after a duration
-struct Sleep
-  deadline: Instant
-  completed: Bool
-end
-
-impl Future[Unit] for Sleep
-  def poll(inout self: Sleep, inout cx: Context) -> Poll[Unit]
-    if self.completed then
-      return Poll::Ready(())
-    end
-    
-    if Instant::now() >= self.deadline then
-      self.completed = true
-      Poll::Ready(())
-    else
-      # Register waker for later notification
-      # In a real implementation, we'd use a timer wheel
-      cx.waker.wake_by_ref()
-      Poll::Pending
-    end
-  end
-end
-
-def sleep(duration: Duration) -> Sleep
-  Sleep {
-    deadline: Instant::now() + duration,
-    completed: false
-  }
-end
-
-## Spawn a future onto the executor
-def spawn_future[T: Transferable](future: impl Future[T] + Transferable) -> JoinHandle[T]
-  match GLOBAL_EXECUTOR.clone()
-  when Option::Some(exec) then
-    let executor = Executor { inner: exec }
-    executor.submit_with_result(|| {
-      # This would need a proper async runtime to work
-      # For now, this is a placeholder
-      future.await
-    }, TaskPriority::Normal)
-  when Option::None then
-    # Create default executor if needed
-    let exec = Executor::new_default()
-    match exec
-    when Result::Ok(e) then
-      GLOBAL_EXECUTOR = Option::Some(e.inner.clone())
-      spawn_future(future)
-    when Result::Err(_) then
-      panic("Failed to create executor")
-    end
-  end
-end
-
-## Block on a future until completion
-def block_on[T](future: impl Future[T]) -> T
-  # Create a simple single-threaded executor for blocking
-  var f = future
-  let waker = Waker { task_id: 0, executor: Arc::null() }
-  var cx = Context { waker: waker }
-  
-  loop do
-    match f.poll(&mut cx)
-    when Poll::Ready(value) then return value
-    when Poll::Pending then
-      # In a real implementation, we'd wait for IO or timer events
-      std::thread::yield_now()
-    end
-  end
+## Block on a future until completion — the delegation into std::async's
+## runtime (the single async runtime in the standard library).
+def block_on[F: Future](future: F) -> F::Output
+  std::async::block_on(future)
 end
 
 # ═══════════════════════════════════════════════════════════════
@@ -1233,8 +1290,22 @@ def global_executor() -> Arc[ExecutorInner]
   match GLOBAL_EXECUTOR.clone()
   when Option::Some(exec) then exec
   when Option::None then
-    init_global_executor(0)  # Use default
-    GLOBAL_EXECUTOR.clone().unwrap()
+    # THE VALIDATED DEFAULT (): the lazy init uses the
+    # validated default size — never 0 (the old init_global_executor(0)
+    # "use default" built an invalid zero-thread executor whose Err was
+    # silently IGNORED, and the unwrap on the unset global panicked
+    # without the error message). The init error now PROPAGATES as the
+    # panic message; the unwrap is gone.
+    match init_global_executor(_default_thread_count_validated())
+    when Result::Ok(()) then
+      match GLOBAL_EXECUTOR.clone()
+      when Option::Some(exec) then exec
+      when Option::None then
+        panic("global executor: init reported success but no executor installed")
+      end
+    when Result::Err(e) then
+      panic("global executor init failed: " + e)
+    end
   end
 end
 
@@ -1263,27 +1334,41 @@ def par_for_each[T](items: [T], func: fn(T) -> Unit) -> Unit
   
   if count == 0 then return end
   
-  let completed = Arc::new(AtomicU32::new(0))
+  # THE PREDICATE MUTEX + CONDVAR PAIRING (): the
+  # completed count lives UNDER the real Mutex — the predicate — and the
+  # Condvar is only the signal. The old code used the Condvar itself as
+  # the predicate mutex (all_done.lock() — a Condvar has no lock): the
+  # waiter could not check the completion predicate under any mutex, so
+  # the final notify could be lost. The correct pairing: the waiter
+  # checks the predicate under the mutex and waits on the condvar only
+  # when the predicate is false (the wait atomically releases the mutex
+  # while blocked); the notifier increments under the mutex and signals
+  # after releasing it — no lost wakeup.
+  let done = Arc::new(Mutex::new(0))
   let all_done = Arc::new(Condvar::new())
   
   for item in items do
-    let completed_clone = completed.clone()
+    let done_clone = done.clone()
     let all_done_clone = all_done.clone()
     
     executor.submit(Box::new(move || {
       func(item)
-      let remaining = completed_clone.fetch_add(1) + 1
-      if remaining == count as u32 then
+      var g = done_clone.lock()
+      *g = *g + 1
+      let finished = *g
+      drop(g)
+      if finished == count then
         all_done_clone.notify_all()
       end
     }), TaskPriority::Normal)
   end
   
-  # Wait for all tasks to complete
-  var guard = all_done.lock()
-  while completed.load() < count as u32 do
+  # Wait for all tasks to complete — the predicate under the mutex.
+  var guard = done.lock()
+  while *guard < count do
     guard = all_done.wait(guard)
   end
+  drop(guard)
 end
 
 ## Parallel map
@@ -1296,26 +1381,35 @@ def par_map[T: Transferable, U: Transferable](items: [T], func: fn(T) -> U) -> V
   end
   
   let results: Arc[Mutex[Vec[Option[U]]]] = Arc::new(Mutex::new(Vec::new()))
-  var guard = results.lock()
-  guard.resize(count, Option::None)
+  var rguard = results.lock()
+  rguard.resize(count, Option::None)
+  drop(rguard)
   
-  let completed = Arc::new(AtomicU32::new(0))
+  # THE PREDICATE MUTEX + CONDVAR PAIRING () — the same
+  # fix as par_for_each: the completed count under the real Mutex, the
+  # Condvar as the signal only (the old all_done.lock() used the condvar
+  # as a nonexistent predicate mutex).
+  let done = Arc::new(Mutex::new(0))
   let all_done = Arc::new(Condvar::new())
   
   var i = 0
   for item in items do
     let idx = i
     let results_clone = results.clone()
-    let completed_clone = completed.clone()
+    let done_clone = done.clone()
     let all_done_clone = all_done.clone()
     
     executor.submit(Box::new(move || {
       let value = func(item)
       var guard = results_clone.lock()
       guard[idx] = Option::Some(value)
+      drop(guard)
       
-      let remaining = completed_clone.fetch_add(1) + 1
-      if remaining == count as u32 then
+      var g = done_clone.lock()
+      *g = *g + 1
+      let finished = *g
+      drop(g)
+      if finished == count then
         all_done_clone.notify_all()
       end
     }), TaskPriority::Normal)
@@ -1323,11 +1417,12 @@ def par_map[T: Transferable, U: Transferable](items: [T], func: fn(T) -> U) -> V
     i = i + 1
   end
   
-  # Wait for all tasks to complete
-  var guard = all_done.lock()
-  while completed.load() < count as u32 do
+  # Wait for all tasks to complete — the predicate under the mutex.
+  var guard = done.lock()
+  while *guard < count do
     guard = all_done.wait(guard)
   end
+  drop(guard)
   
   # Collect results
   var output: Vec[U] = Vec::with_capacity(count)
@@ -1338,6 +1433,7 @@ def par_map[T: Transferable, U: Transferable](items: [T], func: fn(T) -> U) -> V
     when Option::None then ()
     end
   end
+  drop(guard)
   
   output
 end
@@ -1363,10 +1459,15 @@ def par_fold[T: Transferable, U: Transferable + Clone](
   let num_chunks = (count + chunk_size - 1) / chunk_size
   
   let partial_results: Arc[Mutex[Vec[Option[U]]]] = Arc::new(Mutex::new(Vec::new()))
-  var guard = partial_results.lock()
-  guard.resize(num_chunks, Option::None)
+  var pguard = partial_results.lock()
+  pguard.resize(num_chunks, Option::None)
+  drop(pguard)
   
-  let completed = Arc::new(AtomicU32::new(0))
+  # THE PREDICATE MUTEX + CONDVAR PAIRING () — the same
+  # fix as par_for_each/par_map: the completed chunk count under the real
+  # Mutex, the Condvar as the signal only (the old all_done.lock() used
+  # the condvar as a nonexistent predicate mutex).
+  let done = Arc::new(Mutex::new(0))
   let all_done = Arc::new(Condvar::new())
   
   var chunk_start = 0
@@ -1378,7 +1479,7 @@ def par_fold[T: Transferable, U: Transferable + Clone](
     let idx = chunk_idx
     
     let partial_results_clone = partial_results.clone()
-    let completed_clone = completed.clone()
+    let done_clone = done.clone()
     let all_done_clone = all_done.clone()
     let identity_clone = identity.clone()
     
@@ -1390,11 +1491,15 @@ def par_fold[T: Transferable, U: Transferable + Clone](
         i = i + 1
       end
       
-      var guard = partial_results_clone.lock()
-      guard[idx] = Option::Some(acc)
+      var pguard = partial_results_clone.lock()
+      pguard[idx] = Option::Some(acc)
+      drop(pguard)
       
-      let remaining = completed_clone.fetch_add(1) + 1
-      if remaining == num_chunks as u32 then
+      var g = done_clone.lock()
+      *g = *g + 1
+      let finished = *g
+      drop(g)
+      if finished == num_chunks then
         all_done_clone.notify_all()
       end
     }), TaskPriority::Normal)
@@ -1403,21 +1508,23 @@ def par_fold[T: Transferable, U: Transferable + Clone](
     chunk_idx = chunk_idx + 1
   end
   
-  # Wait for all chunks to complete
-  var guard = all_done.lock()
-  while completed.load() < num_chunks as u32 do
-    guard = all_done.wait(guard)
+  # Wait for all chunks to complete — the predicate under the mutex.
+  var dguard = done.lock()
+  while *dguard < num_chunks do
+    dguard = all_done.wait(dguard)
   end
+  drop(dguard)
   
   # Merge partial results
   var result = identity
-  let guard = partial_results.lock()
-  for opt in guard.iter() do
+  let pguard2 = partial_results.lock()
+  for opt in pguard2.iter() do
     match opt
     when Option::Some(v) then result = merge(result, v)
     when Option::None then ()
     end
   end
+  drop(pguard2)
   
   result
 end

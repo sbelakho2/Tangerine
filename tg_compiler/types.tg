@@ -9,7 +9,7 @@
 use std::core::{Option, Result, panic}
 use std::collections::{Vec, Map, Set}
 use std::fs::{read_file}
-use tg_compiler::token::{Span, span_dummy}
+use tg_compiler::token::{Span, span_dummy, ParsedIntegerLiteral, ParsedFloatLiteral, parsed_int_to_host, parsed_int_fits_host, parsed_int_decimal, parsed_int_is_zero, parsed_float_finite, parsed_float_f32_overflow, parsed_float_f64_overflow}
 use tg_compiler::lexer::{tokenize}
 use tg_compiler::parser::{parse, diag_has_errors}
 use tg_compiler::resolver::{ResolvedNames, def_id_of_item, def_kind_of, module_qualified_key, lookup_module_callable}
@@ -19,7 +19,7 @@ use tg_compiler::ids::{
   IntrinsicId, FinalizerKind,
   generic_param_table_new, generic_param_id_numeric, generic_param_id_eq,
   fresh_synthetic_owner, intern_generic_param, generic_param_name_of,
-  generic_param_name_from,
+  generic_param_name_from, def_id_numeric,
   effect_registry_new, intern_module_effect, effect_id_of_name,
   effect_id_eq, effect_name_of_id, effect_vec_eq,
   EFFECT_IO, EFFECT_FILE, EFFECT_ASYNC,
@@ -828,10 +828,14 @@ end
 # Map/Set), keyed by the LangItems TypeId (the typed program's canonical
 # snapshot — never the registered name; a snapshot missing an id fails
 # CLOSED to Trivial/structural, matching the pre-existing name fallback
-# behavior for an unregistered name). Slice is deliberately NOT here as an
-# owning container: Slice[T] is the {ptr,len} view (owns=false, drop=none)
-# and its plan is Trivial. Returns Trivial for anything else; the caller
-# falls back to the structural walk.
+# behavior for an unregistered name). The RAW Slice (UnsafeSlice) is
+# deliberately NOT here as an owning container: the raw view is the
+# {ptr,len} view (owns=false, drop=none) and its plan is Trivial. The
+# SAFE shared/pinned forms (SharedSlice/StrView — the Arc-class views) are
+# std-declared structs and flow through the structural walk: the Arc
+# field's registered Drop owns the destruction (the backing's deinit
+# releases the pinned allocation). Returns Trivial for anything else; the
+# caller falls back to the structural walk.
 def nominal_container_plan(typed: TypedProgram, tid: TypeId, type_name: String, args: Vec[Type], depth: Int, inout visited: Set[Int], inout errors: Vec[TypeError]) -> DeinitPlan
   let li = typed.lang_items
   if li.option != -1 && tid.id == li.option && args.len() >= 1 then
@@ -839,13 +843,15 @@ def nominal_container_plan(typed: TypedProgram, tid: TypeId, type_name: String, 
   elsif li.result != -1 && tid.id == li.result && args.len() >= 2 then
     DeinitPlan::Result(build_deinit_plan(typed, &args[0], depth + 1, visited, errors), build_deinit_plan(typed, &args[1], depth + 1, visited, errors))
   elsif li.slice != -1 && tid.id == li.slice then
-    # Slice[T] — the compiler-scoped VIEW { ptr: Ptr[T], len: UInt }:
-    # owns=false, drop=none. A Slice local needs NO destruction regardless
-    # of the element type (the element's ownership lives in the backing
-    # container the view borrows). The view must not outlive its backing
-    # buffer — the escape constraint is enforced by the safe access model
-    # (the resource checker's IterationPlan projected-access enforcement is
-    # the eventual mechanism).
+    # UnsafeSlice[T] — the RAW view { ptr: Ptr[T], len: UInt }:
+    # owns=false, drop=none. A raw-view local needs NO destruction
+    # regardless of the element type (the element's ownership lives in the
+    # backing buffer the view borrows). The raw view must not outlive its
+    # backing — the escape constraint is enforced by the P0-SL rules
+    # (the raw view's escape channels in the type checker + the resource
+    # checker's live-view registry / IterationPlan mutation scan). The
+    # SAFE shared/pinned form (SharedSlice — the Arc-class view) is NOT
+    # this arm: its Arc field's Drop owns the destruction.
     DeinitPlan::Trivial
   elsif ((li.array != -1 && tid.id == li.array) || (li.vec != -1 && tid.id == li.vec)) && args.len() >= 1 then
     DeinitPlan::Array(build_deinit_plan(typed, &args[0], depth + 1, visited, errors))
@@ -1427,6 +1433,15 @@ struct TypeEnv
   # is exactly the state the snapshot env needs (the engine reads this
   # table on the checker env only, never on the snapshot).
   place_move_states: Map[Int, Map[String, PlaceMoveState]] = Map::new()
+ # (literal-range authority): per literal node id — the literal's
+  # lossless form, the range TARGET (the suffix's concrete type, or Int for
+  # the inferred default), and the NEGATION COUNT (each enclosing unary
+  # minus the parser wraps around the literal — the folded sign decides the
+  # exact signed range). The RANGE DECISION is made here, at the
+  # end-of-check pass (resolve_pending_literal_ranges): only the checker
+  # decides whether the literal fits its target type, the overflow is ONE
+  # stable diagnostic, and a literal never silently becomes 0.
+  pending_literal_ranges: Map[Int, PendingLiteralRange] = Map::new()
   # per pattern node id — the resolved variant identity (owner TypeId
   # id, variant index) for enum-variant patterns, threaded from the pattern
   # checker so downstream consumers resolve variants by identity, not name.
@@ -1872,6 +1887,17 @@ struct TypeError
   message: String
   span: Span
   code: Option[String]
+end
+
+# The pending literal-range record: the lossless literal form, the range
+# target type (the suffix's concrete type, or Int when unsuffixed), the
+# literal's span, and the negation count folded from the enclosing unary
+# minus chain (an ODD count flips the sign).
+struct PendingLiteralRange
+  lit: ParsedIntegerLiteral
+  target_ty: Type
+  span: Span
+  neg_count: Int
 end
 
 enum AccessEffect
@@ -3893,6 +3919,19 @@ def type_env_new() -> TypeEnv
   register_builtin_generic_named(&mut env, "Array", array_ids, TypeDefKind::Opaque)
   let slice_ids = begin_builtin_generic(&mut env, Vec::from(["T".to_string()]))
   register_builtin_generic_named(&mut env, "Slice", slice_ids, TypeDefKind::Opaque)
+  # The RAW {ptr,len} view's EXPLICIT UNSAFE/FFI spelling: "UnsafeSlice[T]"
+  # in source resolves to the SAME builtin TypeId as the registered
+  # "Slice" (the registered name must stay "Slice" — the layout engine's
+  # is_slice_view_tid and the MIR's "Slice" arms match the TypeDef name
+  # by id, and they are not editable here). The safe Slice is the
+  # std-declared SHARED/PINNED form (SharedSlice — the Arc-class
+  # { inner: Arc[SliceBacking[T]] } in std/collections.tg): the raw view
+  # is unsafe/FFI-only and safe code cannot produce it (the P0-SL escape
+  # machinery below polices the raw view's escapes).
+  match env.type_name_index.get("Slice")
+  when Option::Some(slice_idx) then env.type_name_index.insert("UnsafeSlice".to_string(), slice_idx)
+  when Option::None then ()
+  end
   let map_ids = begin_builtin_generic(&mut env, Vec::from(["K".to_string(), "V".to_string()]))
   register_builtin_generic_named(&mut env, "Map", map_ids, TypeDefKind::Opaque)
   let set_ids = begin_builtin_generic(&mut env, Vec::from(["T".to_string()]))
@@ -5746,12 +5785,16 @@ def unify(inout env: TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
   # literal expression) is compatible with any concrete integer type
   # (UInt, i8..u128, isize/usize) — the unifier's coercion rule BINDS the
   # literal to the concrete type, and the literal type is eliminated (the
-  # resolved type never remains IntLiteral). The ordinary semantic
-  # Type::Int is EXACT — it falls through to the exact-match arms below
-  # (Int vs u8 is a type mismatch, never a silent coercion).
-  if (is_int_literal_type(&a) && is_integer_type(&b)) ||
-     (is_int_literal_type(&b) && is_integer_type(&a)) then
-    true
+  # resolved type never remains IntLiteral). The COERCION is range-checked
+  # against the concrete target (int_literal_unify_range_check — a
+  # host-representable literal that cannot fit the target is the ONE
+  # stable overflow diagnostic; it never silently truncates). The ordinary
+  # semantic Type::Int is EXACT — it falls through to the exact-match
+  # arms below (Int vs u8 is a type mismatch, never a silent coercion).
+  if is_int_literal_type(&a) && is_integer_type(&b) then
+    int_literal_unify_range_check(env, &a, &b, span)
+  elsif is_int_literal_type(&b) && is_integer_type(&a) then
+    int_literal_unify_range_check(env, &b, &a, span)
   elsif is_never_type(&a) || is_never_type(&b) then
     # Never is the bottom type: it unifies with any type.
     true
@@ -6550,8 +6593,9 @@ def type_check_program_env(inout env: TypeEnv, program: Program) -> Unit
           when Option::None then Type::Unit
           end
  # (channel a): an extern declaration whose return type is
-          # (or contains) the Slice view would let the view escape across
-          # the FFI boundary — rejected at the signature registration.
+          # (or contains) the RAW Slice view (UnsafeSlice) would let the
+          # raw view escape across the FFI boundary — rejected at the
+          # signature registration.
           check_no_escaping_slice(env, &ret_ty, ef.span, "returned from an extern function")
           pop_scope(env)
  # record the extern declaration's typed signature under the
@@ -6623,6 +6667,12 @@ def type_check_program_env(inout env: TypeEnv, program: Program) -> Unit
   # analyzer in std::effects is tooling).
   env.check_ctx = "effect-set-check"
   check_effect_sets(env)
+  
+ # (literal range authority): the end-of-check range decisions — every
+  # integer literal against its target's exact bounds (the suffix type,
+  # or the inferred Int), with the folded negation sign. Runs on BOTH
+  # paths (permissive type_check and the typed compilation entry).
+  resolve_pending_literal_ranges(env)
   
   pop_scope(env)
 end
@@ -6774,8 +6824,8 @@ def collect_enum_type_def(inout env: TypeEnv, e: EnumDecl, module_path: Vec[Stri
     while j < e.variants[i].fields.len() do
       let vfield_ty = resolve_type_expr(env, &e.variants[i].fields[j])
  # (channel b): an enum variant field whose type is (or
-      # contains) the Slice view is longer-lived state holding a view —
-      # rejected.
+      # contains) the RAW Slice view (UnsafeSlice) is longer-lived state
+      # holding a raw view — rejected.
       check_no_escaping_slice(env, &vfield_ty, e.variants[i].fields[j].span, "stored in an enum variant field")
       ftypes.push(vfield_ty)
       j = j + 1
@@ -6844,7 +6894,8 @@ def collect_type_def(inout env: TypeEnv, item: Item, module_path: Vec[String]) -
       # out of the Vec produces a corrupted TypeExpr payload.
       let ty = resolve_type_expr(env, &s.fields[i].ty)
  # (channel b): a struct field whose type is (or contains) the
-      # Slice view is longer-lived state holding a view — rejected.
+      # RAW Slice view (UnsafeSlice) is longer-lived state holding a raw
+      # view — rejected.
       check_no_escaping_slice(env, &ty, s.fields[i].span, "stored in a struct field")
       fields.push(FieldInfo { name: s.fields[i].name, ty: ty, is_public: true })
       i = i + 1
@@ -7177,8 +7228,9 @@ def check_item(inout env: TypeEnv, program: Program, item: Item, item_idx: Int) 
     when Option::Some(ty_expr) then resolve_type_expr(env, &ty_expr)
     when Option::None then fresh_type_var(env)
     end
- # (channel b): a const whose type is (or contains) the Slice
-    # view is program-lifetime state holding a view — rejected.
+ # (channel b): a const whose type is (or contains) the RAW Slice
+    # view (UnsafeSlice) is program-lifetime state holding a raw view —
+    # rejected.
     check_no_escaping_slice(env, &const_ty, c.span, "stored in a const")
     let value_ty = check_expr(env, &c.value)
     unify(env, value_ty, const_ty, c.span)
@@ -7188,8 +7240,9 @@ def check_item(inout env: TypeEnv, program: Program, item: Item, item_idx: Int) 
     env.check_ctx = "static:" + s.name
     push_scope(env)
     let static_ty = resolve_type_expr(env, &s.ty)
- # (channel b): a static whose type is (or contains) the Slice
-    # view is program-lifetime state holding a view — rejected.
+ # (channel b): a static whose type is (or contains) the RAW Slice
+    # view (UnsafeSlice) is program-lifetime state holding a raw view —
+    # rejected.
     check_no_escaping_slice(env, &static_ty, s.span, "stored in a static")
     let value_ty = check_expr(env, &s.value)
     unify(env, value_ty, static_ty, s.span)
@@ -7599,45 +7652,78 @@ def record_where_predicate_bounds(inout env: TypeEnv, where_clause: Vec[WherePre
 end
 
 # ———————————————————————————————————————————————————————————————
-# SLICE SAFETY — the access-scoped / non-escapable view enforcement
+# SLICE SAFETY — the shared/pinned safe views + the RAW view's
+# unsafe/FFI-only escape enforcement (the P0-SL rules)
 # ———————————————————————————————————————————————————————————————
-# Slice[T] is the compiler-scoped VIEW { ptr: Ptr[T], len: UInt } (std
-# ownership contract — std/collections.tg): a safe Slice must NOT outlive
-# its backing buffer. Tangerine avoids lifetime parameters — the
-# enforcement makes safe Slice VALUES access-scoped / non-escapable at the
-# four escape channels:
-#   (a) RETURN   — a Slice-typed value must not be returned from a
+# THE SAFE VIEW MODEL (reviewer's shared/pinned backing — the safe-view
+# model; std contract in std/collections.tg / std/core.tg):
+#   - The SAFE Slice is the SHARED/PINNED form — the std-declared
+#     SharedSlice[T] { inner: Arc[SliceBacking[T]] } (the Arc-class
+#     {ptr,len}: the backing = the pinned buffer + the window's
+#     offset/len). The Arc keeps the pinned backing alive — the view
+#     SURVIVES the original owner's drop and the owner's capacity-changing
+#     mutations (the backing is the separate pinned allocation). The safe
+#     StrView is the same class (StrView { inner: Arc[StrViewBacking] }).
+#     The shared forms are ordinary OWNING values: the resource checker
+#     tracks them like any Arc-backed value (owns_state=true,
+#     requires_drop_glue via the Arc's Drop) — NO escape tracking, no
+#     access-scoping, no lifetime inference. They can be returned, stored
+#     in fields/containers/statics, and captured.
+#   - The RAW view is the compiler's Slice BUILTIN — the 16-byte borrowed
+#     { ptr: Ptr[T], len: UInt } fat value, source-spelled UnsafeSlice[T]
+#     (the registered name stays "Slice" for the name-based layout/MIR
+#     matching). It is the UNSAFE/FFI-ONLY form: safe code cannot produce
+#     it (the opaque builtin has no constructor; no safe API returns it in
+#     an escaping position). The ONLY raw views safe code ever sees are
+#     the compiler-scoped LOOP-CONSUMED iterable forms (chars/bytes/split/
+#     iter/keys/values — builtin method results consumed by the enclosing
+#     for-loop) and the compiler-manufactured literal coercion behind
+#     vec!, and the checker keeps them access-scoped / non-escapable at
+#     the four escape channels:
+#   (a) RETURN   — a raw-view-typed value must not be returned from a
 #                  function: the declared return type is checked at every
 #                  callable declaration (free functions, impl/struct
 #                  methods, extern functions, closure annotations);
-#   (b) STORE    — a Slice must not be stored into longer-lived state:
+#   (b) STORE    — a raw view must not be stored into longer-lived state:
 #                  struct fields, enum variant fields, statics, consts,
 #                  and the aggregate literals (array/tuple elements) that
 #                  would hold the view;
-#   (c) CAPTURE  — a Slice must not be captured into an escaping closure:
-#                  the closure capture record is checked at the capture
-#                  site;
-#   (d) MUTATION — a Slice-typed local's backing (the owner place the
-#                  slice was derived from) cannot be mutated/reallocated
+#   (c) CAPTURE  — a raw view must not be captured into an escaping
+#                  closure: the closure capture record is checked at the
+#                  capture site;
+#   (d) MUTATION — a raw-view-typed local's backing (the owner place the
+#                  view was derived from) cannot be mutated/reallocated
 #                  while the view local is live: enforced in the resource
 # checker (there) via the IterationPlan mutation
 #                  machinery (plan_stmt_mutates_place) over the live-view
 #                  registry.
-# The std's Slice APIs keep working: the view-producing forms
-# (chars/bytes/split/iter/... — builtin method results) and the view
-# PARAMETERS are access-scoped (the view lives only for the enclosing
-# expression/call); the slice-view results that MUST escape are routed
-# through the OWNED forms in the kernel (std's as_bytes/bytes/split
-# declare the owned Vec results; as_str_view results stay call-scoped
-# arguments; for-loop iterables are consumed by the loop).
+# The view-producing forms that MUST escape are routed through the OWNED/
+# SHARED forms in the kernel: std's as_bytes/bytes/split declare the owned
+# Vec results; Vec::as_slice / String::as_str_view return the SHARED
+# (pinned-backing) forms; for-loop iterables are consumed by the loop.
 # The containment walk is the single type_contains_slice_view predicate —
-# the Slice BUILTIN (LangItems id) in any stored position (Adt arguments,
-# tuples, fixed arrays, references, effects). Type::Param / Type::Var fail
-# OPEN (false): a generic instantiation is checked at the concrete use
-# sites.
+# the raw Slice BUILTIN (LangItems id) in any stored position (Adt
+# arguments, tuples, fixed arrays, references, effects). Type::Param /
+# Type::Var fail OPEN (false): a generic instantiation is checked at the
+# concrete use sites.
 pub def is_slice_view_type_of(env: TypeEnv, ty: Type) -> Bool
   match ty
   when Type::Adt(tid, _) then tid.id == env.lang_items.slice
+  when _ then false
+  end
+end
+
+# The SAFE SHARED/PINNED view forms (the std-declared Arc-class views) —
+# the resource checker's live-view registry must NEVER treat them as raw
+# views: the backing owns, so they need no escape tracking. Selected by
+# the std type names (SharedSlice / StrView — the std-declared Adt names).
+pub def is_shared_view_type_of(env: TypeEnv, ty: Type) -> Bool
+  match ty
+  when Type::Adt(tid, _) then
+    match get_type_by_id_ref(env, tid)
+    when Option::Some(td) then td.name == "SharedSlice" || td.name == "StrView"
+    when Option::None then false
+    end
   when _ then false
   end
 end
@@ -7671,13 +7757,14 @@ def type_contains_slice_view(env: TypeEnv, ty: Type) -> Bool
   end
 end
 
-# reject a type that holds a Slice view in stored / longer-lived
+# reject a type that holds the RAW Slice view in stored / longer-lived
 # state at the channel's declaration site. `what` renders the channel in
 # the diagnostic ("returned from a function", "stored in a struct field",
-#...).
+#...). The SAFE shared/pinned forms (SharedSlice/StrView — the Arc-backed
+# views) are ordinary owning values and never reach this rejection.
 def check_no_escaping_slice(inout env: TypeEnv, ty: Type, span: Span, what: String) -> Unit
   if type_contains_slice_view(env, ty) then
-    type_add_error(env, "safe Slice cannot be " + what + ": the view borrows its backing buffer and must not outlive it (convert to the owned form: Vec/Array/String)", span)
+    type_add_error(env, "the raw Slice view (UnsafeSlice[T]) cannot be " + what + ": the raw {ptr,len} view is unsafe/FFI-only and must not outlive its backing buffer (use the shared/pinned form: Vec::as_slice / String::as_str_view — the Arc-backed Slice/StrView)", span)
   end
 end
 
@@ -7739,9 +7826,10 @@ def check_function(inout env: TypeEnv, f: FunctionDecl, owner_key: String, f_own
   when Option::Some(ty_expr) then resolve_type_expr(env, &ty_expr)
   when Option::None then Type::Unit
   end
- # (channel a): a safe Slice must not be RETURNED from a function —
-  # the declared return type is rejected when it is (or contains) the
-  # Slice view.
+ # (channel a): a RAW Slice view (UnsafeSlice) must not be RETURNED from
+  # a function — the declared return type is rejected when it is (or
+  # contains) the raw view (the shared/pinned Slice — SharedSlice — is an
+  # ordinary owning value and passes freely).
   check_no_escaping_slice(env, &ret_type, f.span, "returned from a function")
  # record the function's typed signature under the SAME owner key (the
   # MIR reads the declaration's parameter/return types from this record —
@@ -8596,9 +8684,10 @@ def check_impl(inout env: TypeEnv, i: ImplDecl, method_keys: Vec[String]) -> Uni
     when Option::Some(ty_expr) then resolve_type_expr(env, &ty_expr)
     when Option::None then Type::Unit
     end
- # (channel a): a safe Slice must not be RETURNED from a method —
-    # the declared return type is rejected when it is (or contains) the
-    # Slice view.
+ # (channel a): a RAW Slice view (UnsafeSlice) must not be RETURNED from
+    # a method — the declared return type is rejected when it is (or
+    # contains) the raw view (the shared/pinned Slice — SharedSlice — is
+    # an ordinary owning value and passes freely).
     check_no_escaping_slice(env, &ret_type, m.span, "returned from a function")
 
  # every `return expr` in the body unifies immediately with the
@@ -10283,7 +10372,7 @@ end
 
 # The receiver-side collection test for the collection-method
 # classification: the heap-vector Adt (the registered name "Array"), the
-# std Vec struct, and the Slice view.
+# std Vec struct, and the raw Slice view (UnsafeSlice — the builtin).
 def router_receiver_is_collection(receiver_named: String) -> Bool
   receiver_named == "Array" || receiver_named == "Vec" || receiver_named == "Slice"
 end
@@ -10655,6 +10744,16 @@ end
 # "unsupported: use X instead" diagnostic — never a silent backend panic
 # (the recorded error aborts compilation before codegen; the codegen arms
 # for these ids are the defensive last line only).
+# (THE INTRINSIC-NAME GATE — the phantom closure): an explicit __intrinsic_*
+# call whose name the semantic router does NOT classify is a HARD compile
+# error — a phantom intrinsic name can never silently type-check (the
+# resolver's synthetic DefKind::Intrinsic registration is metadata only;
+# the classification is the ONE implementation authority). The
+# gate_pending_intrinsic_name exemption is the enumerated set of legacy
+# phantoms that predate the gate — each is flagged by
+# scripts/check_intrinsic_closure.sh as a known exception and must be
+# resolved; every OTHER unknown name fails compilation here, before
+# MIR/codegen.
 def record_intrinsic_classification(
   inout env: TypeEnv,
   call_node_id: Int,
@@ -10702,9 +10801,93 @@ def record_intrinsic_classification(
         type_add_error(env, "unsupported: `array_replace` is not implemented as an intrinsic — use the std Array methods instead", span)
       when _ then ()
       end
-    when Option::None then ()
+    when Option::None then
+      # THE INTRINSIC-NAME GATE (the phantom closure): an explicit
+      # __intrinsic_* call that the semantic router does not classify is
+      # the hard compile error — the unknown intrinsic never reaches
+      # MIR/codegen (where it would panic as an unresolved callee).
+      # The effective classification mirrors codegen's
+      # bare_intrinsic_name: the __intrinsic_ prefix is stripped and the
+      # bare name re-runs the router (intrinsic_bare_name + the same
+      # typed facts). A name whose call target is a DECLARED callable
+      # (an extern-declared intrinsic name — the runtime symbol surface
+      # — or a user definition carrying the prefix) is implemented.
+      # Everything else is the phantom: the hard error.
+      if is_explicit then
+        if !gate_pending_intrinsic_name(&callee_name) then
+          let gate_ok =
+            intrinsic_bare_name_classifies(&callee_name, receiver_ty, &type_bare_name_of(env, receiver_ty), needle_ty, &type_bare_name_of(env, needle_ty), orig_fn_name, receiver_is_string, needle_is_string) ||
+            call_target_is_declared_callable(env, call_node_id)
+          if !gate_ok then
+            type_add_error(env, "unknown intrinsic `" + callee_name + "`: the name is not in the semantic intrinsic classification (intrinsic_id_of_call) and has no declared implementation — remove the call or implement the intrinsic", span)
+          end
+        end
+      end
     end
   end
+end
+
+# The effective classification for a PREFIXED intrinsic name: the
+# __intrinsic_ prefix is stripped (the same normalization codegen's
+# bare_intrinsic_name applies) and the bare name runs the semantic
+# router over the SAME typed facts. True when the stripped name is a
+# classified intrinsic — the call is implemented by the router's
+# lowering even though the prefixed spelling is not a router key.
+def intrinsic_bare_name_classifies(
+  callee_name: String,
+  receiver_ty: Type,
+  receiver_named: String,
+  needle_ty: Type,
+  needle_named: String,
+  orig_fn_name: String,
+  receiver_is_string: Bool,
+  needle_is_string: Bool
+) -> Bool
+  if callee_name.len() < 12 then return false end
+  if !callee_name.starts_with("__intrinsic_") then return false end
+  let stripped = callee_name.slice(12, callee_name.len())
+  match intrinsic_id_of_call(stripped, receiver_ty, &receiver_named, needle_ty, &needle_named, orig_fn_name, receiver_is_string, needle_is_string)
+  when Option::Some(_) then true
+  when Option::None then false
+  end
+end
+
+# The declared-callable test for the intrinsic-name gate: the call
+# target's DefKind. An extern-declared intrinsic name resolves to its
+# extern DefId (DefKind::Function — the runtime provides the symbol); a
+# user definition carrying the __intrinsic_ prefix is a Function too
+# (its own body is the implementation). The SYNTHETIC runtime-intrinsic
+# registration (DefKind::Intrinsic — the resolver's no-candidate
+# fallback) marks the un-declared names: implemented by nothing unless
+# the router classifies them.
+def call_target_is_declared_callable(env: TypeEnv, call_node_id: Int) -> Bool
+  match env.typed_call_targets.get(call_node_id)
+  when Option::Some(did) then
+    match env.resolutions
+    when Option::Some(res) then
+      match def_kind_of(&res, &did)
+      when Option::Some(k) then
+        k == DefKind::Function || k == DefKind::Constant || k == DefKind::Static
+      when Option::None then false
+      end
+    when Option::None then false
+    end
+  when Option::None then false
+  end
+end
+
+# The GATE-PENDING exemption list (the phantom closure): the legacy phantom
+# intrinsic names that predate the intrinsic-name gate. Each entry is
+# flagged by scripts/check_intrinsic_closure.sh as a known exception and
+# MUST be resolved (implemented or removed) in a later round. The list is
+# deliberately tiny — the ONLY prelude-reachable legacy phantom is
+# std/taint.tg's `__intrinsic_regex_match` (its owning module is outside
+# the current scope) — and must NEVER grow: a new intrinsic name
+# goes through the classification (intrinsic_id_of_call), never through
+# this list.
+def gate_pending_intrinsic_name(name: String) -> Bool
+  if name == "__intrinsic_regex_match" then return true end
+  false
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -10856,11 +11039,14 @@ def is_named_trivially_copyable(env: TypeEnv, tid: TypeId, args: Vec[Type], inou
        tid.id == env.lang_items.set then
       return false
     end
-    # Slice[T] — compiler-scoped view (reviewer's no-general-borrow model):
+    # UnsafeSlice[T] — the RAW view (the reviewer's no-general-borrow model;
+    # safe Slice = the shared/pinned SharedSlice — the Arc-class form):
     # { ptr: Ptr[T], len: UInt }, owns=false, drop=none. Bit-copy is
     # structurally possible: the view holds a raw pointer (bit-copyable) and
     # a length; the element type's ownership lives in the owning container
-    # the view borrows, never in the view. (Mirror of the std's StrView.)
+    # the view borrows, never in the view. The raw view is unsafe/FFI-only
+    # — its escapes are the P0-SL-rejected cases. (Mirror of the old
+    # StrView shape; the safe StrView is now the Arc-backed shared form.)
     if tid.id == env.lang_items.slice then
       return true
     end
@@ -12303,12 +12489,15 @@ def type_named_props(inout env: TypeEnv, tid: TypeId, args: Vec[Type], inout vis
         if tp.is_deferred || ep.is_deferred then props.is_deferred = true end
       end
     elsif tid.id == env.lang_items.slice then
-      # Slice[T] — the compiler-scoped VIEW { ptr: Ptr[T], len: UInt }:
-      # owns=false, drop=none, not linear, contains no capability (the view
-      # holds no payload — the capability lives in the backing container).
-      # The element type's ownership lives in the backing container, never
-      # in the view; nothing here walks the args (mirror of the
-      # Ptr/StaticStrPtr classification).
+      # UnsafeSlice[T] — the RAW view { ptr: Ptr[T], len: UInt }:
+      # owns=false, drop=none, not linear, contains no capability (the raw
+      # view holds no payload — the capability lives in the backing
+      # buffer). The element type's ownership lives in the backing buffer,
+      # never in the view; nothing here walks the args (mirror of the
+      # Ptr/StaticStrPtr classification). The SAFE shared/pinned form
+      # (SharedSlice/StrView — the Arc-class views) is NOT this arm: the
+      # std-declared struct's Arc field owns, and the structural walk
+      # applies.
       ()
     elsif (env.lang_items.ptr != -1 && tid.id == env.lang_items.ptr) ||
           (env.lang_items.ptr_mut != -1 && tid.id == env.lang_items.ptr_mut) then
@@ -13289,15 +13478,274 @@ def is_async_marker(name: String) -> Bool
   false
 end
 
+# ———————————————————————————————————————————————————————————————
+# Literal Range Authority — the checker's range decisions
+# ———————————————————————————————————————————————————————————————
+# ONLY the checker decides whether a literal fits its target type: the
+# suffix's exact type range (u8/i8/u64/u128/...), the inferred Int range,
+# the float finite/f32 gates. The overflow is ONE stable diagnostic and
+# the literal is NEVER silently rewritten to 0/0.0.
+
+# The suffix -> concrete integer type resolution (the u8/i8/... distinct
+# semantics of the literal's explicit_suffix field).
+def integer_literal_suffix_type(sfx: String) -> Option[Type]
+  match sfx
+  when "u8" then Option::Some(Type::U8)
+  when "u16" then Option::Some(Type::U16)
+  when "u32" then Option::Some(Type::U32)
+  when "u64" then Option::Some(Type::U64)
+  when "u128" then Option::Some(Type::U128)
+  when "i8" then Option::Some(Type::I8)
+  when "i16" then Option::Some(Type::I16)
+  when "i32" then Option::Some(Type::I32)
+  when "i64" then Option::Some(Type::I64)
+  when "i128" then Option::Some(Type::I128)
+  when "usize" then Option::Some(Type::USize)
+  when "isize" then Option::Some(Type::ISize)
+  when "u" then Option::Some(Type::UInt)
+  when "i" then Option::Some(Type::Int)
+  when _ then Option::None
+  end
+end
+
+# The (lo, hi) bounds of an integer type as DECIMAL strings (the
+# arbitrary-precision comparison bounds — Int is the 64-bit host type,
+# UInt/usize/isize are 64-bit).
+def integer_type_bounds(ty: Type) -> (String, String)
+  match ty
+  when Type::U8 then ("0", "255")
+  when Type::U16 then ("0", "65535")
+  when Type::U32 then ("0", "4294967295")
+  when Type::U64 then ("0", "18446744073709551615")
+  when Type::U128 then ("0", "340282366920938463463374607431768211455")
+  when Type::I8 then ("-128", "127")
+  when Type::I16 then ("-32768", "32767")
+  when Type::I32 then ("-2147483648", "2147483647")
+  when Type::I64 then ("-9223372036854775808", "9223372036854775807")
+  when Type::I128 then ("-170141183460469231731687303715884105728", "170141183460469231731687303715884105727")
+  when Type::USize then ("0", "18446744073709551615")
+  when Type::ISize then ("-9223372036854775808", "9223372036854775807")
+  when Type::UInt then ("0", "18446744073709551615")
+  when Type::Int then ("-9223372036854775808", "9223372036854775807")
+  when _ then ("0", "9223372036854775807")
+  end
+end
+
+# The diagnostic name of an integer type (the suffix spellings).
+def integer_type_name(ty: Type) -> String
+  match ty
+  when Type::U8 then "u8"
+  when Type::U16 then "u16"
+  when Type::U32 then "u32"
+  when Type::U64 then "u64"
+  when Type::U128 then "u128"
+  when Type::I8 then "i8"
+  when Type::I16 then "i16"
+  when Type::I32 then "i32"
+  when Type::I64 then "i64"
+  when Type::I128 then "i128"
+  when Type::USize then "usize"
+  when Type::ISize then "isize"
+  when Type::UInt then "UInt"
+  when Type::Int then "Int"
+  when _ then "integer"
+  end
+end
+
+def strip_leading_zeros(s: String) -> String
+  var start_idx = 0
+  while start_idx < s.len() - 1 && s.char_at(start_idx) == '0' do
+    start_idx = start_idx + 1
+  end
+  s.slice(start_idx, s.len())
+end
+
+def decimal_magnitude_cmp(a: String, b: String) -> Int
+  if a.len() != b.len() then
+    if a.len() > b.len() then 1 else -1 end
+  else
+    var i = 0
+    while i < a.len() do
+      let ca = a.char_at(i) as Int
+      let cb = b.char_at(i) as Int
+      if ca != cb then
+        if ca > cb then return 1 else return -1 end
+      end
+      i = i + 1
+    end
+    0
+  end
+end
+
+# Signed decimal string comparison (-1 / 0 / 1).
+def signed_decimal_cmp(a: String, b: String) -> Int
+  let a_neg = a.len() > 0 && a.char_at(0) == '-'
+  let b_neg = b.len() > 0 && b.char_at(0) == '-'
+  if a_neg != b_neg then
+    if a_neg then -1 else 1 end
+  else
+    let a_mag = if a_neg then a.slice(1, a.len()) else a end
+    let b_mag = if b_neg then b.slice(1, b.len()) else b end
+    let mag_cmp = decimal_magnitude_cmp(strip_leading_zeros(a_mag), strip_leading_zeros(b_mag))
+    if a_neg then 0 - mag_cmp else mag_cmp end
+  end
+end
+
+# The signed decimal value of a literal with the negation folded.
+def literal_signed_decimal(p: ParsedIntegerLiteral, negated: Bool) -> String
+  if parsed_int_is_zero(p) then
+    "0"
+  else
+    let neg = (p.sign < 0) != negated
+    if neg then "-" + parsed_int_decimal(p) else parsed_int_decimal(p) end
+  end
+end
+
+# The exact integer range decision — the magnitude (arbitrary precision)
+# against the target's decimal bounds; false records the ONE stable
+# overflow diagnostic.
+def check_integer_literal_range(env: TypeEnv, p: ParsedIntegerLiteral, negated: Bool, ty: Type, span: Span) -> Bool
+  let (lo, hi) = integer_type_bounds(ty)
+  let value = literal_signed_decimal(p, negated)
+  if signed_decimal_cmp(value, lo) < 0 || signed_decimal_cmp(value, hi) > 0 then
+    type_add_error(env, "integer literal out of range for type `" + integer_type_name(ty) + "`", span)
+    false
+  else
+    true
+  end
+end
+
+# The float range decision: the exact decimal magnitude against the
+# f64 maximum (or the non-finite materialized value — the 1e309 overflow,
+# never a silent inf) and the f32 exact magnitude gate.
+def check_float_literal_range(env: TypeEnv, p: ParsedFloatLiteral, is_f32: Bool, span: Span) -> Bool
+  if parsed_float_f64_overflow(p) then
+    type_add_error(env, "float literal out of range for type `" + (if is_f32 then "f32" else "f64") + "`", span)
+    false
+  elsif is_f32 && parsed_float_f32_overflow(p) then
+    type_add_error(env, "float literal out of range for type `f32`", span)
+    false
+  else
+    true
+  end
+end
+
+# (literal-range resolution): the end-of-check pass that makes the
+# checker's range decisions — every recorded literal is checked against
+# its target's exact bounds (the folded negation flips the sign); the
+# overflow is the ONE stable diagnostic; a literal NEVER silently becomes
+# 0/0.0.
+def resolve_pending_literal_ranges(inout env: TypeEnv) -> Unit
+  let entries = env.pending_literal_ranges.entries()
+  var i = 0
+  while i < entries.len() do
+    let rec = entries[i].1
+    let negated = (rec.neg_count % 2) == 1
+    let _ = check_integer_literal_range(env, rec.lit, negated, rec.target_ty, rec.span)
+    i = i + 1
+  end
+  env.pending_literal_ranges.clear()
+end
+
+# The unify-time range check: an IntLiteral meeting a CONCRETE integer
+# type through the coercion rule is range-checked against that type —
+# exact for host-representable values (a negative payload is skipped: it
+# is a negated literal or the wrapped pattern of a huge magnitude whose
+# range the pending pass decides). The overflow is the same ONE stable
+# diagnostic — a literal never silently truncates into the target type.
+def int_literal_unify_range_check(inout env: TypeEnv, lit: Type, concrete: Type, span: Span) -> Bool
+  match lit
+  when Type::IntLiteral(v) then
+    if v < 0 then
+      true
+    else
+      let hi = match concrete
+        when Type::U8 then 255
+        when Type::U16 then 65535
+        when Type::U32 then 4294967295
+        when Type::U64 then 9223372036854775807
+        when Type::U128 then 9223372036854775807
+        when Type::I8 then 127
+        when Type::I16 then 32767
+        when Type::I32 then 2147483647
+        when Type::I64 then 9223372036854775807
+        when Type::I128 then 9223372036854775807
+        when Type::USize then 9223372036854775807
+        when Type::ISize then 9223372036854775807
+        when Type::UInt then 9223372036854775807
+        when Type::Int then 9223372036854775807
+        when _ then 9223372036854775807
+      end
+      if v <= hi then
+        true
+      else
+        type_add_error(env, "integer literal out of range for type `" + integer_type_name(concrete) + "`", span)
+        false
+      end
+    end
+  when _ then true
+  end
+end
+
+# The bottommost integer literal of a unary-minus chain (the node id of
+# the literal at the end of an arbitrary Neg wrapping).
+def literal_bottom_of_neg_chain(expr: Expr) -> Option[Int]
+  match expr.kind
+  when ExprKind::ExprIntLit(_) then Option::Some(expr.node_id)
+  when ExprKind::ExprUnaryOp(UnOp::Neg, inner) then literal_bottom_of_neg_chain(inner)
+  when _ then Option::None
+  end
+end
+
 def check_expr(inout env: TypeEnv, expr: Expr) -> Type
   let result = match expr.kind
-  when ExprKind::ExprIntLit(n) then
- # the integer literal produces the inference-only IntLiteral
-    # type carrying the value (coercible to any concrete integer type;
-    # eliminated after coercion — the resolved type never remains
-    # IntLiteral).
-    Type::IntLiteral(n)
-  when ExprKind::ExprFloatLit(_) then Type::Float
+  when ExprKind::ExprIntLit(p) then
+   # (literal range authority): EVERY integer literal records its lossless
+    # form and its range TARGET — the suffix's concrete type, or the
+    # inferred Int — in the pending table; the end-of-check pass
+    # (resolve_pending_literal_ranges) makes the exact range decision (ONE
+    # stable diagnostic, never a silent 0). The produced type stays the
+    # inference-only IntLiteral (coercible to any concrete integer type;
+    # eliminated after coercion) carrying the host value when the
+    # magnitude fits the host Int, and the WRAPPED bit pattern otherwise
+    # (the unsigned-typed cases the pass accepts — the range authority is
+    # the magnitude, never the host conversion).
+    match p.explicit_suffix
+    when Option::Some(sfx) then
+      match integer_literal_suffix_type(sfx)
+      when Option::Some(ty) then
+        env.pending_literal_ranges.insert(expr.node_id, PendingLiteralRange { lit: p, target_ty: ty, span: expr.span, neg_count: 0 })
+        Type::IntLiteral(parsed_int_to_host(&p))
+      when Option::None then
+        type_add_error(env, "invalid integer literal suffix `" + sfx + "`", expr.span)
+        Type::Error
+      end
+    when Option::None then
+      if parsed_int_fits_host(&p) then
+        env.pending_literal_ranges.insert(expr.node_id, PendingLiteralRange { lit: p, target_ty: Type::Int, span: expr.span, neg_count: 0 })
+        Type::IntLiteral(parsed_int_to_host(&p))
+      else
+        # the inferred-Int range decision: a magnitude beyond the host
+        # range is the overflow — fail-closed, never a silent wrap.
+        type_add_error(env, "integer literal out of range for type `Int`", expr.span)
+        Type::Error
+      end
+    end
+  when ExprKind::ExprFloatLit(p) then
+   # (float range authority): the significand/exponent STRINGS preserved
+    # by the lexer decide the range (the f64 finite gate, the f32 exact
+    # magnitude gate) — 1e309 is the overflow diagnostic, never a silent
+    # inf/0.0; the f32 suffix yields Type::F32, f64/unsuffixed Float.
+    match p.explicit_suffix
+    when Option::Some(sfx) then
+      if sfx == "f32" then
+        if check_float_literal_range(env, &p, true, expr.span) then Type::F32 else Type::Error end
+      else
+        if check_float_literal_range(env, &p, false, expr.span) then Type::Float else Type::Error end
+      end
+    when Option::None then
+      if check_float_literal_range(env, &p, false, expr.span) then Type::Float else Type::Error end
+    end
   when ExprKind::ExprStringLit(_) then Type::String
   when ExprKind::ExprCharLit(_) then Type::Char
   when ExprKind::ExprBoolLit(_) then Type::Bool
@@ -13399,6 +13847,14 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
  # (IntrinsicId at check time): attach the semantic classification of
     # an intrinsic call (the __intrinsic_* family — the resolver registered
     # their DefIds — and the builtin-container method names) per call node.
+    # The call target is recorded FIRST (typed_call_targets — the
+    # resolver's DefId under the callee node bridged to the call-node
+    # key): the intrinsic-name gate reads the target's DefKind to
+    # distinguish the DECLARED intrinsic externs (DefKind::Function — the
+    # runtime symbol surface) from the synthetic runtime-intrinsic
+    # registrations (DefKind::Intrinsic — the names the runtime does NOT
+    # provide, the gate's target).
+    record_typed_call_target(env, &func, expr.node_id)
     match callee_ident_name(&func)
     when Option::Some(cname) then
       let call_recv = if arg_types.len() > 0 then arg_types[0].clone() else Type::Unit end
@@ -13648,7 +14104,6 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
         ri = ri + 1
       end
     end
-    record_typed_call_target(env, &func, expr.node_id)
     match callee_ident_name(&func)
     when Option::Some(cname) then
       if is_async_marker(&cname) then
@@ -13935,7 +14390,8 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
         ai = ai + 1
       end
       # (channel b): an array/vec literal whose element type is (or
-      # contains) the Slice view stores the view in a container — rejected.
+      # contains) the RAW Slice view (UnsafeSlice) stores the raw view in a
+      # container — rejected.
       check_no_escaping_slice(env, &elem_type, expr.span, "stored in a container (array/vec literal element)")
       # The generic array literal is the heap-vector Adt form (the named
       # Array[T]); a FixedArray-typed literal is produced when the literal
@@ -13958,7 +14414,8 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
     while i < elems.len() do
       let elem_ty = check_expr(env, &elems[i])
       # (channel b): a tuple literal whose element type is (or
-      # contains) the Slice view stores the view in a container — rejected.
+      # contains) the RAW Slice view (UnsafeSlice) stores the raw view in a
+      # container — rejected.
       check_no_escaping_slice(env, &elem_ty, elems[i].span, "stored in a container (tuple literal element)")
       types.push(elem_ty)
       i = i + 1
@@ -14142,16 +14599,17 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
     # (the closure_captures record); nodes = capture-node id -> effect.
     let scan = scan_closure_captures(env, &params, &body)
  # (channel c): a captured local whose type is (or contains) the
-    # Slice view must not be captured into the closure — the closure env
-    # would hold the view past its backing buffer's lifetime (the capture
-    # would also escape under channel b as stored state).
+    # The RAW Slice view must not be captured into the closure — the
+    # closure env would hold the raw view past its backing buffer's
+    # lifetime (the capture would also escape under channel b as stored
+    # state).
     let cap_entries = scan.uses.entries()
     var cei = 0
     while cei < cap_entries.len() do
       match env.typed_local_bindings.get(cap_entries[cei].0)
       when Option::Some(cap_lb) then
         if type_contains_slice_view(env, &cap_lb.ty) then
-          type_add_error(env, "cannot capture a safe Slice into a closure: the view borrows its backing buffer and must not outlive it (capture the owned clone instead)", body.span)
+          type_add_error(env, "cannot capture a raw Slice view (UnsafeSlice[T]) into a closure: the raw {ptr,len} view is unsafe/FFI-only and must not outlive its backing buffer (capture the shared/pinned form — Vec::as_slice / String::as_str_view — or the owned clone instead)", body.span)
         end
       when Option::None then ()
       end
@@ -14692,9 +15150,11 @@ def resolve_field_type(inout env: TypeEnv, recv_type: Type, field: String, span:
     match get_type_by_id_ref(env, &tid)
     when Option::Some(td) then
       # The Slice/Array Adt field surface mirrors the dropped canonical
-      # Type::Slice/Type::Array arms, selected by LangItems TypeId. Slice is
-      # the two-field VIEW { ptr: Ptr[T], len: UInt } — len is its only
-      # accessor field (there is NO capacity on a view).
+      # Type::Slice/Type::Array arms, selected by LangItems TypeId. The raw
+      # Slice (UnsafeSlice) is the two-field VIEW { ptr: Ptr[T], len: UInt }
+      # — len is its only accessor field (there is NO capacity on a view).
+      # (The SAFE shared/pinned Slice — SharedSlice — is a std-declared
+      # struct and takes the structural field path below.)
       if tid.id == env.lang_items.slice then
         if field == "len" then Type::Int
         else fresh_type_var(env)
@@ -15985,8 +16445,21 @@ def check_unary_op(inout env: TypeEnv, op: UnOp, inner: Expr, span: Span) -> Typ
   
   match op
   when UnOp::Neg then
- # negating an integer literal keeps the literal form (the
-    # negated value is carried); negating any other value keeps its type.
+   # (literal range authority): each enclosing unary minus folds into the
+    # bottommost literal's pending negation count, so the end-of-check
+    # pass decides the EXACT signed range — -128i8 is valid, -129i8 is
+    # the overflow, --128i8 is the overflow (even count restores the
+    # positive value). The literal form is preserved (the negated value
+    # is carried); negating any other value keeps its type.
+    match literal_bottom_of_neg_chain(&inner)
+    when Option::Some(bottom_id) then
+      match env.pending_literal_ranges.get(bottom_id)
+      when Option::Some(rec) then
+        env.pending_literal_ranges.insert(bottom_id, PendingLiteralRange { lit: rec.lit, target_ty: rec.target_ty, span: rec.span, neg_count: rec.neg_count + 1 })
+      when Option::None then ()
+      end
+    when Option::None then ()
+    end
     match inner_type
     when Type::IntLiteral(v) then Type::IntLiteral(0 - v)
     when _ then inner_type
@@ -16018,9 +16491,17 @@ end
 # non-constant form fails CLOSED (Option::None) — the [T; N] site reports
 # "fixed array size must be a constant" and the const collector records
 # nothing for the declaration.
+# The maximum fixed-array element count the compiler accepts: 2^26
+# elements (67,108,864) — the user-input bound that keeps the layout
+# engine's count * stride arithmetic far below the Int overflow domain
+# (2^26 * 16 bytes = 2^30 < 2^63) and bounds inline storage to a
+# non-absurd size. The bound is enforced at the [T; N] type-annotation
+# site (resolve_type_expr's FixedArray arm) with a stable diagnostic.
+def MAX_FIXED_ARRAY_ELEMS() -> Int = 67108864
+
 def eval_const_size_expr(env: TypeEnv, expr: Expr) -> Option[Int]
   match expr.kind
-  when ExprKind::ExprIntLit(n) then Option::Some(n)
+  when ExprKind::ExprIntLit(n) then Option::Some(parsed_int_to_host(&n))
   when ExprKind::ExprIdent(name) then
     match env.const_values.get(module_qualified_key(&env.current_module_path, &name))
     when Option::Some(n) then Option::Some(n)
@@ -16052,9 +16533,17 @@ def eval_const_size_expr(env: TypeEnv, expr: Expr) -> Option[Int]
       match eval_const_size_expr(env, &rhs)
       when Option::Some(b) then
         match op
-        when BinOp::Add then Option::Some(a + b)
-        when BinOp::Sub then Option::Some(a - b)
-        when BinOp::Mul then Option::Some(a * b)
+        when BinOp::Add then
+          # (item-12 audit): the const-size arithmetic is FAIL-CLOSED — an
+          # overflowing addition/multiplication returns None (the caller
+          # reports the size as not a constant) instead of wrapping into a
+          # wrong FixedArray count that would silently reach the layout
+          # engine.
+          if a >= 0 && b >= 0 && a <= 9223372036854775807 - b then Option::Some(a + b) else Option::None end
+        when BinOp::Sub then
+          if a >= b then Option::Some(a - b) else Option::None end
+        when BinOp::Mul then
+          if a >= 0 && b >= 0 && (a == 0 || b <= 9223372036854775807 / a) then Option::Some(a * b) else Option::None end
         when BinOp::Div then if b != 0 then Option::Some(a / b) else Option::None end
         when BinOp::Mod then if b != 0 then Option::Some(a % b) else Option::None end
         when _ then Option::None
@@ -16284,6 +16773,16 @@ def resolve_type_expr(inout env: TypeEnv, te: TypeExpr) -> Type
       type_add_error(env, "fixed array size must be a constant", te.span)
       0
     end
+    # (item-12 audit): the fixed-array count is the ONE user-controlled
+    # magnitude that flows into the layout engine's size arithmetic. It is
+    # BOUNDED here with a stable diagnostic — a negative or out-of-range
+    # count is a user mistake, never a layout-engine overflow (the engine's
+    # own checked arithmetic remains as the internal fail-closed backstop).
+    if size_n < 0 then
+      type_add_error(env, "fixed array size must not be negative (got " + size_n.to_string() + ")", te.span)
+    elsif size_n > MAX_FIXED_ARRAY_ELEMS() then
+      type_add_error(env, "fixed array size " + size_n.to_string() + " exceeds the maximum supported length " + MAX_FIXED_ARRAY_ELEMS().to_string(), te.span)
+    end
     Type::FixedArray(elem_type, size_n)
   when TypeExprKind::Slice(elem) then
     let elem_type = resolve_type_expr(env, &elem)
@@ -16470,7 +16969,7 @@ def resolve_imports(inout env: TypeEnv, program: Program, inout loaded: Set[Stri
       loaded.insert(path.clone())
       match std::fs::read_file(path.clone())
       when Result::Ok(source) then
-        let tokens = tokenize(source)
+        let tokens = tokenize(source, import_path.clone())
         let dep_parse = parse(tokens)
         let dep_ast = dep_parse.program
         # Recurse: resolve this file's own imports first
@@ -16621,70 +17120,619 @@ end
 # function and codegen resolves at monomorphization. The MIR verifier
 # already rejects Param leaking into non-generic functions.
 def verify_codegen_readiness(inout env: TypeEnv) -> Unit
-  let entries = env.typed_expr_types.entries()
-  var i = 0
-  while i < entries.len() do
-    let node_id = entries[i].0
-    let ty = entries[i].1
+  # The FULL type-channel coverage (the reviewer's item-8 oracle, channel
+  # half): every recorded channel that reaches a codegenable TypedProgram
+  # is scanned for Type::Error and unresolved Type::Var (ALWAYS illegal in
+  # an accepted program — their presence means an error was not recorded or
+  # a substitution was lost) and for Type::Param in the channels where a
+  # CONCRETE type is required (the solved generic-call substitutions the
+  # monomorphizer consumes with zero inference, and the static/const
+  # declared types — a static is never a generic template).
+  #
+  # Coverage table (channel -> allow_param):
+  #   typed_expr_types            -> true  (generic fn templates carry Param)
+  #   typed_exprs (node ty)       -> true  (same body-expr domain)
+  #   typed_local_bindings        -> true  (locals of generic templates)
+  #   typed_fn_signatures         -> true  (generic declaration signatures)
+  #   typed_static_types          -> FALSE (statics are never generic)
+  #   typed_call_instances        -> FALSE (solved substitutions are concrete
+  #                                          by the ZERO-INFERENCE contract)
+  #   type_aliases (inner)        -> true  (generic aliases are legal)
+  #   type_fields (struct fields) -> true  (generic struct fields carry Param)
+  #   type_variants (enum fields) -> true  (generic enum payloads)
+  #   deinit_plans (subst types)  -> true  (plans carry concrete identity;
+  #                                          Error/Var is the flag that matters)
+  var chan_i = 0
+  var entries = env.typed_expr_types.entries()
+  while chan_i < entries.len() do
+    let node_id = entries[chan_i].0
+    let ty = entries[chan_i].1
     var has_error = false
     var has_var = false
-    scan_codegen_type(env, &ty, &mut has_error, &mut has_var)
+    var has_param = false
+    scan_codegen_type(env, &ty, &mut has_error, &mut has_var, &mut has_param, true)
     if has_error then
       type_add_error(env, "unresolved Type::Error in the type of expression node " + node_id.to_string() + " would reach MIR/codegen", Span { file: "", start: 0, end_pos: 0 })
     end
     if has_var then
       type_add_error(env, "unresolved inference variable (Type::Var) in the type of expression node " + node_id.to_string() + " would reach MIR/codegen", Span { file: "", start: 0, end_pos: 0 })
     end
-    i = i + 1
+    chan_i = chan_i + 1
+  end
+  for (te_id, te) in env.typed_exprs do
+    var he = false
+    var hv = false
+    var hp = false
+    scan_codegen_type(env, &te.ty, &mut he, &mut hv, &mut hp, true)
+    if he then
+      type_add_error(env, "unresolved Type::Error in the typed-HIR record of expression node " + te_id.to_string() + " would reach MIR/codegen", Span { file: "", start: 0, end_pos: 0 })
+    end
+    if hv then
+      type_add_error(env, "unresolved inference variable (Type::Var) in the typed-HIR record of expression node " + te_id.to_string() + " would reach MIR/codegen", Span { file: "", start: 0, end_pos: 0 })
+    end
+  end
+  for (lid, lb) in env.typed_local_bindings do
+    var he = false
+    var hv = false
+    var hp = false
+    scan_codegen_type(env, &lb.ty, &mut he, &mut hv, &mut hp, true)
+    if he then
+      type_add_error(env, "unresolved Type::Error in the type of local binding " + lid.to_string() + " would reach MIR/codegen", Span { file: "", start: 0, end_pos: 0 })
+    end
+    if hv then
+      type_add_error(env, "unresolved inference variable (Type::Var) in the type of local binding " + lid.to_string() + " would reach MIR/codegen", Span { file: "", start: 0, end_pos: 0 })
+    end
+  end
+  for (sig_key, sig) in env.typed_fn_signatures do
+    var si = 0
+    while si < sig.params.len() do
+      var he = false
+      var hv = false
+      var hp = false
+      scan_codegen_type(env, &sig.params[si].ty, &mut he, &mut hv, &mut hp, true)
+      if he then
+        type_add_error(env, "unresolved Type::Error in the parameter type of signature `" + sig_key + "` would reach MIR/codegen", Span { file: "", start: 0, end_pos: 0 })
+      end
+      if hv then
+        type_add_error(env, "unresolved inference variable (Type::Var) in the parameter type of signature `" + sig_key + "` would reach MIR/codegen", Span { file: "", start: 0, end_pos: 0 })
+      end
+      si = si + 1
+    end
+    var he = false
+    var hv = false
+    var hp = false
+    scan_codegen_type(env, &sig.ret_type, &mut he, &mut hv, &mut hp, true)
+    if he then
+      type_add_error(env, "unresolved Type::Error in the return type of signature `" + sig_key + "` would reach MIR/codegen", Span { file: "", start: 0, end_pos: 0 })
+    end
+    if hv then
+      type_add_error(env, "unresolved inference variable (Type::Var) in the return type of signature `" + sig_key + "` would reach MIR/codegen", Span { file: "", start: 0, end_pos: 0 })
+    end
+  end
+  for (st_key, st_ty) in env.typed_static_types do
+    var he = false
+    var hv = false
+    var hp = false
+    scan_codegen_type(env, &st_ty, &mut he, &mut hv, &mut hp, false)
+    if he then
+      type_add_error(env, "unresolved Type::Error in the declared type of static `" + st_key + "` would reach MIR/codegen", Span { file: "", start: 0, end_pos: 0 })
+    end
+    if hv then
+      type_add_error(env, "unresolved inference variable (Type::Var) in the declared type of static `" + st_key + "` would reach MIR/codegen", Span { file: "", start: 0, end_pos: 0 })
+    end
+    if hp then
+      type_add_error(env, "generic parameter (Type::Param) in the declared type of static `" + st_key + "` would reach MIR/codegen (a static is never a generic template)", Span { file: "", start: 0, end_pos: 0 })
+    end
+  end
+  for (inst_node, inst_args) in env.typed_call_instances do
+    var ai = 0
+    while ai < inst_args.len() do
+      var he = false
+      var hv = false
+      var hp = false
+      scan_codegen_type(env, &inst_args[ai], &mut he, &mut hv, &mut hp, false)
+      if he then
+        type_add_error(env, "unresolved Type::Error in the solved generic-call substitution of node " + inst_node.to_string() + " would reach MIR/codegen", Span { file: "", start: 0, end_pos: 0 })
+      end
+      if hv then
+        type_add_error(env, "unresolved inference variable (Type::Var) in the solved generic-call substitution of node " + inst_node.to_string() + " would reach MIR/codegen", Span { file: "", start: 0, end_pos: 0 })
+      end
+      if hp then
+        type_add_error(env, "generic parameter (Type::Param) in the solved generic-call substitution of node " + inst_node.to_string() + " would reach MIR/codegen (ZERO-INFERENCE: the substitution must be fully concrete)", Span { file: "", start: 0, end_pos: 0 })
+      end
+      ai = ai + 1
+    end
+  end
+  for (alias_tid, alias_inner) in env.type_aliases do
+    var he = false
+    var hv = false
+    var hp = false
+    scan_codegen_type(env, &alias_inner, &mut he, &mut hv, &mut hp, true)
+    if he then
+      type_add_error(env, "unresolved Type::Error in the alias inner of type#" + alias_tid.to_string() + " would reach MIR/codegen", Span { file: "", start: 0, end_pos: 0 })
+    end
+    if hv then
+      type_add_error(env, "unresolved inference variable (Type::Var) in the alias inner of type#" + alias_tid.to_string() + " would reach MIR/codegen", Span { file: "", start: 0, end_pos: 0 })
+    end
+  end
+  for (tf_tid, tf_shape) in env.type_fields do
+    var fi = 0
+    while fi < tf_shape.len() do
+      var he = false
+      var hv = false
+      var hp = false
+      scan_codegen_type(env, &tf_shape[fi].1, &mut he, &mut hv, &mut hp, true)
+      if he then
+        type_add_error(env, "unresolved Type::Error in a field of type#" + tf_tid.to_string() + " would reach MIR/codegen", Span { file: "", start: 0, end_pos: 0 })
+      end
+      if hv then
+        type_add_error(env, "unresolved inference variable (Type::Var) in a field of type#" + tf_tid.to_string() + " would reach MIR/codegen", Span { file: "", start: 0, end_pos: 0 })
+      end
+      fi = fi + 1
+    end
+  end
+  for (tv_tid, tv_shape) in env.type_variants do
+    var vi = 0
+    while vi < tv_shape.len() do
+      var fii = 0
+      while fii < tv_shape[vi].1.len() do
+        var he = false
+        var hv = false
+        var hp = false
+        scan_codegen_type(env, &tv_shape[vi].1[fii], &mut he, &mut hv, &mut hp, true)
+        if he then
+          type_add_error(env, "unresolved Type::Error in a variant payload of type#" + tv_tid.to_string() + " would reach MIR/codegen", Span { file: "", start: 0, end_pos: 0 })
+        end
+        if hv then
+          type_add_error(env, "unresolved inference variable (Type::Var) in a variant payload of type#" + tv_tid.to_string() + " would reach MIR/codegen", Span { file: "", start: 0, end_pos: 0 })
+        end
+        fii = fii + 1
+      end
+      vi = vi + 1
+    end
+  end
+  for (dp_tid, dp) in env.deinit_plans do
+    var he = false
+    var hv = false
+    scan_deinit_plan_types(env, &dp, &mut he, &mut hv)
+    if he then
+      type_add_error(env, "unresolved Type::Error in the deinit plan of type#" + dp_tid.to_string() + " would reach MIR/codegen", Span { file: "", start: 0, end_pos: 0 })
+    end
+    if hv then
+      type_add_error(env, "unresolved inference variable (Type::Var) in the deinit plan of type#" + dp_tid.to_string() + " would reach MIR/codegen", Span { file: "", start: 0, end_pos: 0 })
+    end
   end
 end
 
-def scan_codegen_type(env: TypeEnv, ty: Type, inout has_error: Bool, inout has_var: Bool) -> Unit
-  match ty
-  when Type::Error then
-    has_error = true
-  when Type::Var(id) then
-    # A var with a substitution entry is pending inference that resolved to
-    # concrete state; chase it. A var with NO entry would stay unresolved in
-    # the codegenable program — rejected.
-    match env.subst.get(id)
-    when Option::Some(resolved) then
-      scan_codegen_type(env, &resolved, has_error, has_var)
+def scan_deinit_plan_types(env: TypeEnv, plan: DeinitPlan, inout has_error: Bool, inout has_var: Bool) -> Unit
+  match plan
+  when DeinitPlan::Trivial then ()
+  when DeinitPlan::Call(inst) then
+    for t in inst.substs do scan_codegen_type(env, &t, has_error, has_var, false, true) end
+  when DeinitPlan::UserFinalizer(inst, inner) then
+    for t in inst.substs do scan_codegen_type(env, &t, has_error, has_var, false, true) end
+    scan_deinit_plan_types(env, inner, has_error, has_var)
+  when DeinitPlan::Aggregate(plans) then
+    for p in plans do scan_deinit_plan_types(env, p, has_error, has_var) end
+  when DeinitPlan::Enum(entries_map) then
+    for (_, payload) in entries_map do
+      let inner_plans = payload.1
+      for p in inner_plans do scan_deinit_plan_types(env, p, has_error, has_var) end
+    end
+  when DeinitPlan::Array(inner) then scan_deinit_plan_types(env, inner, has_error, has_var)
+  when DeinitPlan::Set(inner) then scan_deinit_plan_types(env, inner, has_error, has_var)
+  when DeinitPlan::Box(inner) then scan_deinit_plan_types(env, inner, has_error, has_var)
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# The semantic completeness oracle (the reviewer's item 8)
+# ———————————————————————————————————————————————————————————————
+#
+# The distinction this oracle enforces:
+#   - USER MISTAKES are recorded by the checker itself with the stable
+#     diagnostics (the E-codes, the "cannot infer type parameter" errors,
+#     the "must be a constant" errors, ...) and abort compilation through
+#     TypeCheckResult.errors BEFORE any oracle runs.
+#   - The IMPOSSIBLE POST-TYPECHECK STATE — an ACCEPTED program whose
+#     recorded semantic channels still carry a placeholder — is an
+#     INTERNAL INVARIANT FAILURE (the ICE): the checkers claim to have
+#     accepted the program, so any residual placeholder proves a checker
+#     channel lost a record. The oracle records ICE-class TypeErrors
+#     (code "ICE") that abort compilation before MIR lowering.
+#
+# The oracle covers, for an accepted program:
+#   1. Type::Error / unresolved Type::Var / Param-in-concrete-position —
+#      verify_codegen_readiness (the channel scan above).
+#   2. UNKNOWN DefId — every recorded call target and finalizer DefId must
+#      be a resolver-registered symbol (module_symbols).
+#   3. UNKNOWN FieldId / VariantId — every typed field/variant identity in
+#      the typed-HIR tree, the typed patterns, the flat field_targets, the
+#      pattern_variant_resolutions, and the deinit plans must name an
+#      existing field/variant of its OWNER type.
+#   4. MISSING ACCESS EFFECT — every typed call node's receiver and every
+#      call argument must carry the recorded per-node access effect.
+#   5. MISSING OBLIGATION SOLUTION — every registered trait impl must be
+#      backed by its trait's declared contract (validate-first-register-
+#      second), so no impl with an unknown trait silently skips
+#      conformance validation.
+#   6. UNKNOWN LAYOUT (typecheck side) — every named TypeId the channels
+#      reference must be a registered nominal (type_kinds); the full layout
+#      availability is the MIR oracle (run_mir_completeness_oracle) + the
+#      layout engine's fail-closed layout_of_concrete at codegen.
+#   7. PLACEHOLDER SYMBOL / MIR — the MIR-side mirrors (placeholder
+#      terminators, unresolved callees) are the MIR verifier's checks that
+#      run at the MIR boundary; the typecheck side is (2)-(6) above.
+
+def run_semantic_completeness_oracle(inout env: TypeEnv, typed: TypedProgram) -> Unit
+  var findings: Vec[String] = Vec::new()
+  # (2) the DefId registry — the numeric flattening of every resolver-
+  # registered symbol (module_symbols values).
+  var known_defs: Set[Int] = Set::new()
+  match env.resolutions
+  when Option::Some(res) then
+    for (_, sym_did) in res.module_symbols do
+      known_defs.insert(def_id_numeric(&sym_did))
+    end
+  when Option::None then
+    findings.push("internal error: the semantic completeness oracle cannot run without the resolved symbol table (env.resolutions is empty at the end of type checking)")
+  end
+  for (call_node, call_did) in typed.call_targets do
+    if !known_defs.contains(def_id_numeric(&call_did)) then
+      findings.push("internal error: call node " + call_node.to_string() + " records a DefId (module " + call_did.module.id.to_string() + ", index " + call_did.index.to_string() + ") the resolver never registered (unknown DefId would reach MIR/codegen)")
+    end
+  end
+  for (finalizer_tid, finalizer_callable) in typed.deinit_targets do
+    if !known_defs.contains(def_id_numeric(&finalizer_callable.def)) then
+      findings.push("internal error: type#" + finalizer_tid.to_string() + " registers a finalizer DefId (module " + finalizer_callable.def.module.id.to_string() + ", index " + finalizer_callable.def.index.to_string() + ") the resolver never registered (unknown DefId would reach MIR/codegen)")
+    end
+  end
+  # (3) the typed-HIR tree walk — field/variant identities + access effects.
+  for (_, te) in env.typed_exprs do
+    oracle_walk_typed_expr(env, typed, te, &mut findings)
+  end
+  for (_, tp) in env.typed_patterns do
+    oracle_walk_typed_pattern(typed, tp, &mut findings)
+  end
+  # the flat field_targets index (belt over the tree).
+  for (field_node, fid) in typed.field_targets do
+    oracle_check_field_id(typed, &fid, "flat field_targets of node " + field_node.to_string(), &mut findings)
+  end
+  # the pattern_variant_resolutions index ((TypeId, variant index)).
+  for (pat_node, pv) in env.pattern_variant_resolutions do
+    let owner_tid = pv.0
+    let variant_idx = pv.1
+    match typed.type_variants.get(owner_tid)
+    when Option::Some(vshape) then
+      if variant_idx < 0 || variant_idx >= vshape.len() then
+        findings.push("internal error: pattern node " + pat_node.to_string() + " resolves variant index " + variant_idx.to_string() + " of type#" + owner_tid.to_string() + " which has " + vshape.len().to_string() + " variants (unknown VariantId would reach MIR/codegen)")
+      end
     when Option::None then
-      has_var = true
+      findings.push("internal error: pattern node " + pat_node.to_string() + " resolves a variant of unknown type#" + owner_tid.to_string() + " (unknown VariantId would reach MIR/codegen)")
     end
-  when Type::Adt(_, args) then
-    var i = 0
-    while i < args.len() do
-      scan_codegen_type(env, &args[i], has_error, has_var)
-      i = i + 1
+  end
+  # the deinit plans' variant identities.
+  for (_, dp) in typed.deinit_plans do
+    oracle_scan_deinit_plan(typed, &dp, &mut findings)
+  end
+  # (5) the trait-contract obligation backstop.
+  var impl_i = 0
+  while impl_i < env.impls.len() do
+    let imp = env.impls[impl_i]
+    if imp.trait_id.id != -1 then
+      match env.trait_contracts.get(imp.trait_id.id)
+      when Option::Some(_) then ()
+      when Option::None then
+        findings.push("internal error: impl of trait#" + imp.trait_id.id.to_string() + " (" + imp.trait_name + ") has no declared trait contract — its obligations would silently skip conformance validation (missing obligation solution)")
+      end
     end
-  when Type::FnPtr(params, ret, _) then
-    var i = 0
-    while i < params.len() do
-      scan_codegen_type(env, &params[i].ty, has_error, has_var)
-      i = i + 1
+    impl_i = impl_i + 1
+  end
+  # (6) the named-TypeId registry (the unknown-layout precursor).
+  for (tf_tid, _) in typed.type_fields do
+    if !typed.type_kinds.contains_key(&tf_tid) then
+      findings.push("internal error: struct fields are recorded for unknown type#" + tf_tid.to_string() + " (no type kind — an unknown TypeId can never have a layout)")
     end
-    scan_codegen_type(env, &ret, has_error, has_var)
-  when Type::Closure(_, params, ret, captures, _) then
-    var i = 0
-    while i < params.len() do
-      scan_codegen_type(env, &params[i].ty, has_error, has_var)
-      i = i + 1
+  end
+  for (tv_tid, _) in typed.type_variants do
+    if !typed.type_kinds.contains_key(&tv_tid) then
+      findings.push("internal error: enum variants are recorded for unknown type#" + tv_tid.to_string() + " (no type kind — an unknown TypeId can never have a layout)")
     end
-    scan_codegen_type(env, &ret, has_error, has_var)
-    scan_codegen_type(env, &captures, has_error, has_var)
-  when Type::RefInternal(inner, _) then scan_codegen_type(env, &inner, has_error, has_var)
-  when Type::Ptr(inner) then scan_codegen_type(env, &inner, has_error, has_var)
-  when Type::PtrMut(inner) then scan_codegen_type(env, &inner, has_error, has_var)
-  when Type::Effect(_, inner) then scan_codegen_type(env, &inner, has_error, has_var)
-  when Type::Tuple(elems) then
-    var i = 0
-    while i < elems.len() do
-      scan_codegen_type(env, &elems[i], has_error, has_var)
-      i = i + 1
+  end
+  for (dp_tid, _) in typed.deinit_plans do
+    if !typed.type_kinds.contains_key(&dp_tid) then
+      findings.push("internal error: a deinit plan is recorded for unknown type#" + dp_tid.to_string() + " (no type kind — an unknown TypeId can never have a layout)")
     end
-  when _ then ()
+  end
+  var fi = 0
+  while fi < findings.len() do
+    type_add_error(env, findings[fi].clone(), Span { file: "", start: 0, end_pos: 0 }, "ICE")
+    fi = fi + 1
+  end
+end
+
+def oracle_walk_typed_expr(inout env: TypeEnv, typed: TypedProgram, te: TypedExpr, inout findings: Vec[String]) -> Unit
+  match te.kind
+  when TypedExprKind::Local(_) then ()
+  when TypedExprKind::Global(_) then ()
+  when TypedExprKind::SelfRef then ()
+  when TypedExprKind::Literal(_) then ()
+  when TypedExprKind::Path(_) then ()
+  when TypedExprKind::BinaryOp(_, left, right) then
+    oracle_walk_typed_expr(env, typed, &left, findings)
+    oracle_walk_typed_expr(env, typed, &right, findings)
+  when TypedExprKind::UnaryOp(_, operand) then oracle_walk_typed_expr(env, typed, &operand, findings)
+  when TypedExprKind::Index(base, index) then
+    oracle_walk_typed_expr(env, typed, &base, findings)
+    oracle_walk_typed_expr(env, typed, &index, findings)
+  when TypedExprKind::Cast(value, _) then oracle_walk_typed_expr(env, typed, &value, findings)
+  when TypedExprKind::TypeCheck(value, _) then oracle_walk_typed_expr(env, typed, &value, findings)
+  when TypedExprKind::RawDeref(inner) then oracle_walk_typed_expr(env, typed, &inner, findings)
+  when TypedExprKind::Access(inner) then oracle_walk_typed_expr(env, typed, &inner, findings)
+  when TypedExprKind::Range(start_opt, end_opt, _) then
+    match start_opt
+    when Option::Some(s) then oracle_walk_typed_expr(env, typed, &s, findings)
+    when Option::None then ()
+    end
+    match end_opt
+    when Option::Some(e) then oracle_walk_typed_expr(env, typed, &e, findings)
+    when Option::None then ()
+    end
+  when TypedExprKind::Await(inner) then oracle_walk_typed_expr(env, typed, &inner, findings)
+  when TypedExprKind::Try(inner) then oracle_walk_typed_expr(env, typed, &inner, findings)
+  when TypedExprKind::Pipe(lhs, rhs) then
+    oracle_walk_typed_expr(env, typed, &lhs, findings)
+    oracle_walk_typed_expr(env, typed, &rhs, findings)
+  when TypedExprKind::Assign(target, value) then
+    oracle_walk_typed_expr(env, typed, &target, findings)
+    oracle_walk_typed_expr(env, typed, &value, findings)
+  when TypedExprKind::ArrayLit(elems) then
+    for e in elems do oracle_walk_typed_expr(env, typed, &e, findings) end
+  when TypedExprKind::TupleLit(elems) then
+    for e in elems do oracle_walk_typed_expr(env, typed, &e, findings) end
+  when TypedExprKind::StructLit(_, fields) then
+    for (_, fe) in fields do oracle_walk_typed_expr(env, typed, &fe, findings) end
+  when TypedExprKind::MapLit(pairs) then
+    for (k, v) in pairs do
+      oracle_walk_typed_expr(env, typed, &k, findings)
+      oracle_walk_typed_expr(env, typed, &v, findings)
+    end
+  when TypedExprKind::Call(tc) then
+    match tc.callee
+    when TypedCallee::Def(callable) then
+      match typed.call_targets.get(te.id)
+      when Option::Some(_) then ()
+      when Option::None then
+        findings.push("internal error: call node " + te.id.to_string() + " carries a typed Def callee but no call_targets entry (missing callee identity would reach MIR/codegen)")
+      end
+    when TypedCallee::Closure then ()
+    end
+    match tc.receiver_effect
+    when Option::Some(_) then ()
+    when Option::None then
+      match tc.receiver
+      when Option::Some(_) then
+        findings.push("internal error: call node " + te.id.to_string() + " has a receiver but no recorded receiver access effect (missing access effect would reach MIR/codegen)")
+      when Option::None then ()
+      end
+    end
+    match tc.receiver
+    when Option::Some(recv) then oracle_walk_typed_expr(env, typed, &recv, findings)
+    when Option::None then ()
+    end
+    for arg in tc.args do
+      match env.typed_access_effects.get(arg.value.id)
+      when Option::Some(_) then ()
+      when Option::None then
+        findings.push("internal error: call node " + te.id.to_string() + " argument node " + arg.value.id.to_string() + " has no recorded access effect (missing access effect would reach MIR/codegen)")
+      end
+      oracle_walk_typed_expr(env, typed, &arg.value, findings)
+    end
+  when TypedExprKind::Field(tf) then
+    oracle_check_field_id(typed, &tf.field, "field access of node " + te.id.to_string(), findings)
+    oracle_walk_typed_expr(env, typed, &tf.base, findings)
+  when TypedExprKind::TupleIndex(base, _, _) then oracle_walk_typed_expr(env, typed, &base, findings)
+  when TypedExprKind::Variant(tv) then
+    oracle_check_variant_id(typed, &tv.variant, "variant construction of node " + te.id.to_string(), findings)
+    for a in tv.args do oracle_walk_typed_expr(env, typed, &a, findings) end
+  when TypedExprKind::StaticPathCall(_, args) then
+    for a in args do oracle_walk_typed_expr(env, typed, &a, findings) end
+  when TypedExprKind::MacroCall(_, args) then
+    for a in args do oracle_walk_typed_expr(env, typed, &a, findings) end
+  when TypedExprKind::Closure(_, body) then
+    oracle_walk_typed_expr(env, typed, &body, findings)
+  when TypedExprKind::If(cond, then_block, elsif_branches, else_block) then
+    oracle_walk_typed_expr(env, typed, &cond, findings)
+    for s in then_block do oracle_walk_typed_stmt(env, typed, s, findings) end
+    for (econd, eblock) in elsif_branches do
+      oracle_walk_typed_expr(env, typed, &econd, findings)
+      for s in eblock do oracle_walk_typed_stmt(env, typed, s, findings) end
+    end
+    match else_block
+    when Option::Some(eb) then
+      for s in eb do oracle_walk_typed_stmt(env, typed, s, findings) end
+    when Option::None then ()
+    end
+  when TypedExprKind::Match(scrutinee, arms) then
+    oracle_walk_typed_expr(env, typed, &scrutinee, findings)
+    for arm in arms do
+      oracle_walk_typed_pattern(typed, arm.pattern, findings)
+      match arm.guard_expr
+      when Option::Some(g) then oracle_walk_typed_expr(env, typed, &g, findings)
+      when Option::None then ()
+      end
+      for s in arm.body do oracle_walk_typed_stmt(env, typed, s, findings) end
+    end
+  when TypedExprKind::Block(stmts) then
+    for s in stmts do oracle_walk_typed_stmt(env, typed, s, findings) end
+  when TypedExprKind::Unsafe(_, body) then
+    for s in body do oracle_walk_typed_stmt(env, typed, s, findings) end
+  when TypedExprKind::Async(stmts) then
+    for s in stmts do oracle_walk_typed_stmt(env, typed, s, findings) end
+  when TypedExprKind::Comptime(stmts) then
+    for s in stmts do oracle_walk_typed_stmt(env, typed, s, findings) end
+  end
+end
+
+def oracle_walk_typed_stmt(inout env: TypeEnv, typed: TypedProgram, ts: TypedStmt, inout findings: Vec[String]) -> Unit
+  match ts.kind
+  when TypedStmtKind::Let(pat, value, _) then
+    oracle_walk_typed_pattern(typed, pat, findings)
+    oracle_walk_typed_expr(env, typed, &value, findings)
+  when TypedStmtKind::Assign(target, value) then
+    oracle_walk_typed_expr(env, typed, &target, findings)
+    oracle_walk_typed_expr(env, typed, &value, findings)
+  when TypedStmtKind::CompoundAssign(_, target, value) then
+    oracle_walk_typed_expr(env, typed, &target, findings)
+    oracle_walk_typed_expr(env, typed, &value, findings)
+  when TypedStmtKind::If(cond, then_block, elsif_branches, else_block) then
+    oracle_walk_typed_expr(env, typed, &cond, findings)
+    for s in then_block do oracle_walk_typed_stmt(env, typed, s, findings) end
+    for (econd, eblock) in elsif_branches do
+      oracle_walk_typed_expr(env, typed, &econd, findings)
+      for s in eblock do oracle_walk_typed_stmt(env, typed, s, findings) end
+    end
+    match else_block
+    when Option::Some(eb) then
+      for s in eb do oracle_walk_typed_stmt(env, typed, s, findings) end
+    when Option::None then ()
+    end
+  when TypedStmtKind::Match(scrutinee, arms) then
+    oracle_walk_typed_expr(env, typed, &scrutinee, findings)
+    for arm in arms do
+      oracle_walk_typed_pattern(typed, arm.pattern, findings)
+      match arm.guard_expr
+      when Option::Some(g) then oracle_walk_typed_expr(env, typed, &g, findings)
+      when Option::None then ()
+      end
+      for s in arm.body do oracle_walk_typed_stmt(env, typed, s, findings) end
+    end
+  when TypedStmtKind::While(cond, body) then
+    oracle_walk_typed_expr(env, typed, &cond, findings)
+    for s in body do oracle_walk_typed_stmt(env, typed, s, findings) end
+  when TypedStmtKind::For(_, pat, iter, body) then
+    oracle_walk_typed_pattern(typed, pat, findings)
+    oracle_walk_typed_expr(env, typed, &iter, findings)
+    for s in body do oracle_walk_typed_stmt(env, typed, s, findings) end
+  when TypedStmtKind::Loop(body) then
+    for s in body do oracle_walk_typed_stmt(env, typed, s, findings) end
+  when TypedStmtKind::Return(ret_opt) then
+    match ret_opt
+    when Option::Some(r) then oracle_walk_typed_expr(env, typed, &r, findings)
+    when Option::None then ()
+    end
+  when TypedStmtKind::Break(br_opt) then
+    match br_opt
+    when Option::Some(b) then oracle_walk_typed_expr(env, typed, &b, findings)
+    when Option::None then ()
+    end
+  when TypedStmtKind::Continue then ()
+  when TypedStmtKind::Expr(e) then oracle_walk_typed_expr(env, typed, &e, findings)
+  when TypedStmtKind::Unsafe(_, body) then
+    for s in body do oracle_walk_typed_stmt(env, typed, s, findings) end
+  when TypedStmtKind::Defer(body) then
+    for s in body do oracle_walk_typed_stmt(env, typed, s, findings) end
+  when TypedStmtKind::Guard(cond, else_action) then
+    oracle_walk_typed_expr(env, typed, &cond, findings)
+    match else_action
+    when TypedGuardElse::Return(ret_opt) then
+      match ret_opt
+      when Option::Some(r) then oracle_walk_typed_expr(env, typed, &r, findings)
+      when Option::None then ()
+      end
+    when TypedGuardElse::Panic(_) then ()
+    when TypedGuardElse::Break(br_opt) then
+      match br_opt
+      when Option::Some(b) then oracle_walk_typed_expr(env, typed, &b, findings)
+      when Option::None then ()
+      end
+    when TypedGuardElse::Continue then ()
+    end
+  when TypedStmtKind::Try(body, catches, finally_opt) then
+    for s in body do oracle_walk_typed_stmt(env, typed, s, findings) end
+    for c in catches do
+      oracle_walk_typed_pattern(typed, c.pattern, findings)
+      for s in c.body do oracle_walk_typed_stmt(env, typed, s, findings) end
+    end
+    match finally_opt
+    when Option::Some(fb) then
+      for s in fb do oracle_walk_typed_stmt(env, typed, s, findings) end
+    when Option::None then ()
+    end
+  when TypedStmtKind::With(expr, pat, body) then
+    oracle_walk_typed_expr(env, typed, &expr, findings)
+    oracle_walk_typed_pattern(typed, pat, findings)
+    for s in body do oracle_walk_typed_stmt(env, typed, s, findings) end
+  when TypedStmtKind::HandleWith(expr, handlers) then
+    oracle_walk_typed_expr(env, typed, &expr, findings)
+    for h in handlers do
+      for ha in h.arms do
+        for p in ha.params do oracle_walk_typed_pattern(typed, p, findings) end
+        for s in ha.body do oracle_walk_typed_stmt(env, typed, s, findings) end
+      end
+    end
+  end
+end
+
+def oracle_walk_typed_pattern(typed: TypedProgram, tp: TypedPattern, inout findings: Vec[String]) -> Unit
+  match tp.kind
+  when TypedPatternKind::Wildcard then ()
+  when TypedPatternKind::Ident(_, _, _) then ()
+  when TypedPatternKind::Literal(_) then ()
+  when TypedPatternKind::Tuple(pats) then
+    for p in pats do oracle_walk_typed_pattern(typed, p, findings) end
+  when TypedPatternKind::Array(pats) then
+    for p in pats do oracle_walk_typed_pattern(typed, p, findings) end
+  when TypedPatternKind::Struct(_, fields) then
+    for (_, fp) in fields do oracle_walk_typed_pattern(typed, fp, findings) end
+  when TypedPatternKind::Variant(vid, args) then
+    oracle_check_variant_id(typed, &vid, "variant pattern of node " + tp.id.to_string(), findings)
+    for p in args do oracle_walk_typed_pattern(typed, p, findings) end
+  when TypedPatternKind::Or(pats) then
+    for p in pats do oracle_walk_typed_pattern(typed, p, findings) end
+  when TypedPatternKind::Range(_, _, _) then ()
+  end
+end
+
+def oracle_check_field_id(typed: TypedProgram, fid: FieldId, what: String, inout findings: Vec[String]) -> Unit
+  match typed.type_fields.get(fid.owner.id)
+  when Option::Some(fshape) then
+    if fid.index < 0 || fid.index >= fshape.len() then
+      findings.push("internal error: " + what + " records field index " + fid.index.to_string() + " of type#" + fid.owner.id.to_string() + " which has " + fshape.len().to_string() + " fields (unknown FieldId would reach MIR/codegen)")
+    end
+  when Option::None then
+    findings.push("internal error: " + what + " records a field of unknown owner type#" + fid.owner.id.to_string() + " (unknown FieldId would reach MIR/codegen)")
+  end
+end
+
+def oracle_check_variant_id(typed: TypedProgram, vid: VariantId, what: String, inout findings: Vec[String]) -> Unit
+  match typed.type_variants.get(vid.owner.id)
+  when Option::Some(vshape) then
+    if (vid.index as Int) < 0 || (vid.index as Int) >= vshape.len() then
+      findings.push("internal error: " + what + " records variant index " + vid.index.to_string() + " of type#" + vid.owner.id.to_string() + " which has " + vshape.len().to_string() + " variants (unknown VariantId would reach MIR/codegen)")
+    end
+  when Option::None then
+    findings.push("internal error: " + what + " records a variant of unknown owner type#" + vid.owner.id.to_string() + " (unknown VariantId would reach MIR/codegen)")
+  end
+end
+
+def oracle_scan_deinit_plan(typed: TypedProgram, plan: DeinitPlan, inout findings: Vec[String]) -> Unit
+  match plan
+  when DeinitPlan::Trivial then ()
+  when DeinitPlan::Call(_) then ()
+  when DeinitPlan::UserFinalizer(_, inner) then oracle_scan_deinit_plan(typed, inner, findings)
+  when DeinitPlan::Aggregate(plans) then
+    for p in plans do oracle_scan_deinit_plan(typed, p, findings) end
+  when DeinitPlan::Enum(entries_map) then
+    for (_, payload) in entries_map do
+      let vid = payload.0
+      oracle_check_variant_id(typed, &vid, "deinit-plan variant identity", findings)
+      let inner_plans = payload.1
+      for p in inner_plans do oracle_scan_deinit_plan(typed, p, findings) end
+    end
+  when DeinitPlan::Array(inner) then oracle_scan_deinit_plan(typed, inner, findings)
+  when DeinitPlan::Set(inner) then oracle_scan_deinit_plan(typed, inner, findings)
+  when DeinitPlan::Box(inner) then oracle_scan_deinit_plan(typed, inner, findings)
   end
 end
 
@@ -16754,7 +17802,8 @@ def resolve_pending_call_instances(inout env: TypeEnv) -> Unit
         let chased = resolve_type_var(env, entry_ty.clone())
         var chased_has_error = false
         var chased_has_var = false
-        scan_codegen_type(env, &chased, &mut chased_has_error, &mut chased_has_var)
+        var chased_has_param = false
+        scan_codegen_type(env, &chased, &mut chased_has_error, &mut chased_has_var, &mut chased_has_param, true)
         if !chased_has_error && !chased_has_var then
           unify(env, entry_ty.clone(), chased, rec_span)
           all_solved = true
@@ -17146,6 +18195,15 @@ def type_check_typed(inout env: TypeEnv, program: Program, resolutions: Resolved
     generic_param_ids: env.generic_param_ids.clone(),
     generic_param_names: env.generic_param_table.names.clone()
   }
+  # (item-8 oracle): after the TypedProgram is assembled, the semantic
+  # completeness oracle audits the ACCEPTED program's recorded channels —
+  # any residual placeholder (an unknown DefId/FieldId/VariantId, a missing
+  # access effect, a missing obligation solution, an unknown TypeId) is an
+  # ICE-class error recorded here so compilation aborts before MIR
+  # lowering. User mistakes were already recorded by the checker with the
+  # stable diagnostics; reaching this point with a placeholder is an
+  # internal invariant failure by construction.
+  run_semantic_completeness_oracle(&mut env, typed)
   env.resolutions = Option::None
  # the checker's result carries the EMPTY-ANALYSIS artifact (the
   # placeholder) — the TypedProgram plus a fresh AnalysisContext, an empty

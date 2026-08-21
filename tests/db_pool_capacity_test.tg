@@ -1,0 +1,175 @@
+# tests/db_pool_capacity_test.tg — the Pool[C] ownership and capacity
+# contract (reviewer item 17).
+#
+# THE ARC-OWNED POOL: Pool[C] { inner: Arc[PoolInner[C]] } and
+# PooledConnection[C] { conn: Option[C], inner: Arc[PoolInner[C]] } —
+# the pooled handle keeps the pool alive (pooled = pool.get();
+# drop(pool); use pooled is SAFE — the handle's Arc clone survives the
+# pool value and the returned connection lands in the still-alive
+# inner). current_size lives UNDER the state lock and increments ONLY
+# when a connection is created, so max_size is enforced under any
+# concurrency: GATE X — max_size=4, 64 threads × 8 acquire/release
+# (512 operations), the created count never exceeds 4.
+#
+# THE FACTORY-FAILURE CONSISTENCY: a failed create returns the error
+# WITHOUT incrementing the count, and the pool stays fully usable.
+# max_size == 0 is rejected at construction.
+
+use std::core::{Vec, String, Unit, Result, Option, Int, UInt}
+use std::test::*
+use std::db::{Pool, Sqlite, DbError, Connection}
+use std::sync::{Arc}
+use std::thread::{spawn, JoinHandle}
+
+mut factory_calls: Int = 0
+mut factory_fail: Bool = false
+
+def pool_factory() -> Result[Sqlite, DbError]
+  factory_calls = factory_calls + 1
+  if factory_fail then
+    return Result::Err(DbError::Internal("injected factory failure".to_string()))
+  end
+  Sqlite::open_memory()
+end
+
+# A worker: acquire a pooled connection (parking on the pool's condvar
+# while the pool is exhausted), then release it on drop.
+def pool_worker(shared: Arc[Pool[Sqlite]], iterations: Int) -> Int
+  var i = 0
+  while i < iterations do
+    let pc = shared.get()
+    match pc
+    when Result::Ok(pc) then
+      drop(pc)
+    when Result::Err(_) then
+      return 1
+    end
+    i = i + 1
+  end
+  0
+end
+
+# THE REVIEWER'S LIFETIME SCENARIO (item 17): pooled = pool.get();
+# drop(pool); use pooled — SAFE. The pooled handle holds its own Arc
+# clone of the pool inner, the checked-out connection stays usable after
+# the pool value is dropped, and the handle's drop returns the
+# connection into the still-alive inner (released when the LAST Arc
+# clone goes away).
+@test
+def test_pool_handle_keeps_pool_alive_after_pool_drop() -> Unit
+  factory_calls = 0
+  factory_fail = false
+  let pool = assert_ok(Pool::new(2, pool_factory))
+  let pooled = assert_ok(pool.get())
+  drop(pool)
+
+  # The pooled handle works after the pool is dropped.
+  let rc = pooled.execute("CREATE TABLE kv (id INTEGER PRIMARY KEY, value TEXT)", &[])
+  assert_ok(rc)
+  let qi = pooled.query("SELECT COUNT(*) AS n FROM kv", &[])
+  let rows = assert_ok(qi)
+  assert_eq(rows.row_count(), 1)
+
+  drop(pooled)
+end
+
+# The factory-failure consistency at CONSTRUCTION: a failed initial
+# create fails Pool::new with the Result (never a partial pool), and a
+# subsequent Pool::new with the working factory creates exactly one
+# connection.
+@test
+def test_pool_new_factory_failure_leaves_no_state() -> Unit
+  factory_calls = 0
+  factory_fail = true
+  match Pool::new(4, pool_factory)
+  when Result::Err(_) then ()
+  when Result::Ok(_) then assert_false(true)
+  end
+  factory_fail = false
+  let pool = assert_ok(Pool::new(4, pool_factory))
+  drop(pool)
+  assert_eq(factory_calls, 1)
+end
+
+# The factory-failure consistency at ACQUIRE time: a failed create
+# returns the error WITHOUT incrementing current_size (the pool is not
+# one connection smaller than the bound says), and the pool remains
+# fully usable.
+@test
+def test_pool_get_factory_failure_consistent() -> Unit
+  factory_calls = 0
+  factory_fail = false
+  let pool = assert_ok(Pool::new(4, pool_factory))
+  let a = assert_ok(pool.get())
+
+  factory_fail = true
+  match pool.get()
+  when Result::Err(_) then ()
+  when Result::Ok(_) then assert_false(true)
+  end
+  assert_eq(factory_calls, 2)
+
+  factory_fail = false
+  let b = assert_ok(pool.get())
+  let c = assert_ok(pool.get())
+  let d = assert_ok(pool.get())
+  # 4 successful creates (1 eager + 3 lazy) + 1 failed attempt — the
+  # failed attempt never counted.
+  assert_eq(factory_calls, 5)
+
+  drop(a)
+  drop(b)
+  drop(c)
+  drop(d)
+
+  # The pool still hands out connections after the failed factory call.
+  let e = assert_ok(pool.get())
+  drop(e)
+end
+
+# GATE X (item 17): max_size=4, 64 threads × 8 acquire/release = 512
+# operations through the shared pool — the created count never exceeds
+# the bound (the count is decided under the state lock, waiters park on
+# the condvar, and every release returns the connection to the idle
+# list).
+@test
+def test_pool_max_size_bounds_simultaneous_connections() -> Unit
+  factory_calls = 0
+  factory_fail = false
+  let pool = assert_ok(Pool::new(4, pool_factory))
+  let shared = Arc::new(pool)
+
+  var handles: Vec[JoinHandle[Int]] = Vec::new()
+  var t = 0
+  while t < 64 do
+    let s = shared.clone()
+    handles.push(spawn(move || pool_worker(s, 8)))
+    t = t + 1
+  end
+
+  var j = 0
+  while j < handles.len() do
+    let h = handles.remove(j)
+    let rc = h.join()
+    assert_ok(rc)
+    j = j + 1
+  end
+
+  # 512 acquire/release operations through a 4-capacity pool: exactly 4
+  # connections were ever created.
+  assert_true(factory_calls <= 4)
+  assert_eq(factory_calls, 4)
+end
+
+# max_size == 0 is rejected at construction (a zero-capacity pool could
+# never hand out a connection and would park every getter forever).
+@test
+def test_pool_max_size_zero_rejected() -> Unit
+  factory_calls = 0
+  factory_fail = false
+  match Pool::new(0, pool_factory)
+  when Result::Err(_) then ()
+  when Result::Ok(_) then assert_false(true)
+  end
+  assert_eq(factory_calls, 0)
+end
