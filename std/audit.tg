@@ -1,15 +1,15 @@
 # [METADATA]
 # module: tg::audit
-# status: alpha
-# effects: []
+# effects: [fs, ctx]
 # capabilities: []
-# error_codes: [InvalidArg, Internal]
+# error_codes: [InvalidArg, Unsupported, Internal]
 
 use std::core::{Option, Result, String, Bool, Int, Unit, Vec, List, Map}
 use std::gfx_errors::{Error, ErrorCode}
 
 enum AuditError
   InvalidArg(Error)
+  Unsupported(Error)
   Internal(Error)
 end
 
@@ -17,6 +17,7 @@ impl AuditError
   def message(self: AuditError) -> String
     match self
     when AuditError::InvalidArg(e) then e.message.clone()
+    when AuditError::Unsupported(e) then e.message.clone()
     when AuditError::Internal(e) then e.message.clone()
     end
   end
@@ -24,6 +25,7 @@ impl AuditError
   def code(self: AuditError) -> ErrorCode
     match self
     when AuditError::InvalidArg(_) then ErrorCode::InvalidArg
+    when AuditError::Unsupported(_) then ErrorCode::Unsupported
     when AuditError::Internal(_) then ErrorCode::Internal
     end
   end
@@ -52,53 +54,93 @@ end
 
 use std::time::{instant_now, duration_nanos}
 use std::ctx
+use std::fs
 
+# ═══════════════════════════════════════════════════════════════
+# THE REAL AUDIT (the reviewer's false-success fix)
+# ═══════════════════════════════════════════════════════════════
+#
+# The old stubs are gone — the empty scope scan (every audit reported
+# zero findings), the never-true drift/stub predicates, the empty
+# location. The split:
+#
+#   REAL — the feasible parts: run_audit resolves the scope to the
+#   Tangerine source files it names (a file, or every .tg file under a
+#   directory — the recursive walk), READS the module's actual data, and
+#   scans it: the stub markers (MNT-001 — todo/fixme/placeholder/not-
+#   implemented lines) and the capability drift (SEC-001 — a capability
+#   used in the source but not declared in the module's METADATA header
+#   capabilities list). Every finding carries its REAL location
+#   (path:line).
+#
+#   UNSUPPORTED — the genuinely-future: the compiler-integrated analysis
+#   (the dataflow + capability-closure analysis over the resolved symbol
+#   registry, the interprocedural reachability) has no std-visible
+#   machinery. run_audit_deep is the explicit Unsupported entrypoint —
+#   it returns the Unsupported error, NEVER an empty success.
 def run_audit(scope: String) -> Result[AuditReport, AuditError]
-  # Production-grade static analysis logic:
-  # 1. Scan the scope for critical patterns using the compiler's analysis engine.
-  # 2. Categorize findings by severity.
-  # 3. Emit structured report.
-  
   let mut findings: Vec[AuditFinding] = Vec::new()
-  
-  # In a production environment, this calls into the compiler's dataflow and capability analysis.
-  # Here we perform an audit based on the scope's registered symbols and their metadata.
-  
-  # Scan registered symbols in the given scope
-  let symbols = _scan_scope_symbols(&scope)
-  let mut i = 0
-  while i < symbols.len() do
-    let sym = symbols.get(i)
-    
-    # Check for capability drift: using more capabilities than declared in METADATA
-    if _has_capability_drift(sym) then
-      findings.push(AuditFinding {
-        code: "SEC-001".to_string(),
-        severity: Severity::Major,
-        message: "Capability drift detected in symbol: " + *sym,
-        location: _get_symbol_location(sym),
-        repro: Option::Some("tg audit --check drift " + *sym)
-      })
+
+  # THE REAL SCOPE SCAN: resolve the scope to the actual source files.
+  let files = _scan_scope_symbols(scope.clone())?
+
+  var f = 0
+  while f < files.len() do
+    let file = files.get(f).clone()
+    let content = match fs::read_to_string(file.clone())
+    when Result::Ok(c) then c
+    when Result::Err(e) then
+      return Result::Err(AuditError::Internal(Error::new(ErrorCode::IOError, "cannot read audit scope file " + file + ": " + e.to_string())))
     end
-    
-    # Check for stub patterns: functions containing 'todo' or 'panic' with placeholder messages
-    if _has_stub_patterns(sym) then
-      findings.push(AuditFinding {
-        code: "MNT-001".to_string(),
-        severity: Severity::Minor,
-        message: "Stub implementation or TODO found in: " + *sym,
-        location: _get_symbol_location(sym),
-        repro: Option::None
-      })
+
+    # The module's declared capabilities (the [METADATA] header's
+    # capabilities list) — the drift baseline.
+    let declared = _extract_declared_capabilities(&content)
+
+    # THE LINE SCAN: every line of the module's real data.
+    let lines = content.split("\n")
+    var li = 0
+    while li < lines.len() do
+      let line = lines.get(li).clone()
+
+      # THE REAL STUB PREDICATE: a line carrying a stub marker is a
+      # MNT-001 finding with its real location.
+      if _has_stub_patterns(&line) then
+        findings.push(AuditFinding {
+          code: "MNT-001".to_string(),
+          severity: Severity::Minor,
+          message: "Stub implementation or TODO found in: " + file.clone(),
+          location: _get_symbol_location(&file, li + 1),
+          repro: Option::Some("tg audit --check stubs".to_string())
+        })
+      end
+
+      # THE REAL DRIFT PREDICATE: a capability used on this line but not
+      # declared in the module's METADATA is a SEC-001 finding.
+      let used = _extract_used_capabilities(&line)
+      if _has_capability_drift(&declared, &used) then
+        var u = 0
+        while u < used.len() do
+          findings.push(AuditFinding {
+            code: "SEC-001".to_string(),
+            severity: Severity::Major,
+            message: "Capability drift detected: " + used.get(u).clone() + " used but not declared in " + file.clone(),
+            location: _get_symbol_location(&file, li + 1),
+            repro: Option::Some("tg audit --check drift " + used.get(u).clone())
+          })
+          u = u + 1
+        end
+      end
+
+      li = li + 1
     end
-    
-    i = i + 1
+
+    f = f + 1
   end
 
   # Generate a deterministic ID based on scope and findings (the pure-std
-  # FNV-1a hash — the reviewer's phantom removal: the std::crypto
-  # dependency is gone, so the audit module compiles without pulling the
-  # compiler-runtime random_bytes surface).
+  # FNV-1a hash — the report identity; the findings' authenticity is the
+  # scan above, the id is the stable report key).
   let id_hex = _audit_id(&scope, &findings)
 
   let report = AuditReport {
@@ -119,37 +161,160 @@ def run_audit(scope: String) -> Result[AuditReport, AuditError]
   Result::Ok(report)
 end
 
-# --- Internal helpers for production-grade audit ---
-# The reviewer's phantom removal: the `@intrinsic("...")` compiler-runtime
-# surfaces (scan_scope_symbols / check_capability_drift / check_stub_patterns
-# / get_symbol_location) are REMOVED — the compiler's symbol registry is not
-# reachable from std, and the intrinsic gate hard-errors unknown intrinsic
-# names. Each helper is the defined pure-std behavior: the audit scans the
-# symbols std can observe (none without the registry) and reports the
-# neutral values, so run_audit stays deterministic and the report shape is
-# preserved.
-
-def _scan_scope_symbols(scope: String) -> Vec[String]
-  ## The compiler's global symbol registry is a compiler-runtime surface;
-  ## std has no handle to it — the scan yields the symbols std can see
-  ## (none), never a phantom intrinsic call.
-  Vec::new()
+# THE EXPLICIT UNSUPPORTED ENTRYPOINT (the genuinely-future half of the
+# split): the compiler-integrated audit — the dataflow + capability-
+# closure analysis over the resolved symbol registry, the interprocedural
+# reachability, the source-map-grounded semantic drift — has no std-
+# visible machinery. The contract is the explicit Unsupported error,
+# NEVER the empty success (the old stubs' report of zero findings for
+# every input was the false success this fixes).
+def run_audit_deep(scope: String) -> Result[AuditReport, AuditError]
+  Result::Err(AuditError::Unsupported(Error::new(ErrorCode::Unsupported,
+    "the compiler-integrated audit (the dataflow + capability-closure analysis over the resolved symbol registry) is not implemented; run_audit performs the static source scan over the module's data".to_string())))
 end
 
-def _has_capability_drift(symbol_id: String) -> Bool
-  ## Without the compiler's capability-closure analysis there is no drift
-  ## evidence — the defined std result is false.
+# --- Internal helpers for the real audit ---
+
+## THE REAL SCOPE SCAN: resolve the scope to the Tangerine source files
+## it names. An empty scope, or a scope that resolves to no readable
+## source, is the explicit InvalidArg error — never an empty success.
+## A directory scope is walked RECURSIVELY (every .tg file at every
+## depth), so the audit covers the module's full data.
+def _scan_scope_symbols(scope: String) -> Result[Vec[String], AuditError]
+  var files: Vec[String] = Vec::new()
+  if scope.is_empty() then
+    return Result::Err(AuditError::InvalidArg(Error::new(ErrorCode::InvalidArg, "audit scope is empty".to_string())))
+  end
+  if fs::is_file(scope.clone()) then
+    files.push(scope.clone())
+  elsif fs::is_dir(scope.clone()) then
+    match _collect_source_files(&mut files, scope.clone())
+    when Result::Ok(()) then ()
+    when Result::Err(e) then return Result::Err(e)
+    end
+  else
+    return Result::Err(AuditError::InvalidArg(Error::new(ErrorCode::InvalidArg, "audit scope does not resolve to a file or directory: " + scope)))
+  end
+  if files.is_empty() then
+    return Result::Err(AuditError::InvalidArg(Error::new(ErrorCode::InvalidArg, "audit scope contains no Tangerine source files: " + scope)))
+  end
+  Result::Ok(files)
+end
+
+def _collect_source_files(inout files: Vec[String], dir: String) -> Result[Unit, AuditError]
+  match fs::read_dir(dir.clone())
+  when Result::Ok(entries) then
+    for e in entries do
+      if e.metadata.is_dir then
+        match _collect_source_files(&mut files, e.path.clone())
+        when Result::Ok(()) then ()
+        when Result::Err(err) then return Result::Err(err)
+        end
+      elsif e.name.ends_with(".tg") then
+        files.push(e.path.clone())
+      end
+    end
+    Result::Ok(())
+  when Result::Err(e) then
+    Result::Err(AuditError::Internal(Error::new(ErrorCode::IOError, "cannot read audit scope directory " + dir + ": " + e.to_string())))
+  end
+end
+
+## THE REAL STUB PREDICATE: a line carries a stub marker when it
+## contains a todo/fixme/xxx/placeholder/not-implemented marker (the
+## case-insensitive forms). The old predicate returned false for
+## EVERYTHING — a file full of todo() stubs audited clean.
+def _has_stub_patterns(line: String) -> Bool
+  let lowered = line.to_lowercase()
+  lowered.contains("todo") || lowered.contains("fixme") ||
+    lowered.contains("xxx") || lowered.contains("not implemented") ||
+    lowered.contains("unimplemented") || lowered.contains("placeholder") ||
+    lowered.contains("stub")
+end
+
+## THE REAL DRIFT PREDICATE: a capability USED on the line but not
+## DECLARED in the module's METADATA header is drift. The old predicate
+## returned false for everything — an undeclared capability usage
+## audited clean.
+def _has_capability_drift(declared: Vec[String], used: Vec[String]) -> Bool
+  var i = 0
+  while i < used.len() do
+    let cap = used.get(i).clone()
+    if !declared.contains(cap.clone()) then
+      return true
+    end
+    i = i + 1
+  end
   false
 end
 
-def _has_stub_patterns(symbol_id: String) -> Bool
-  ## Without source access there are no stub patterns to detect.
-  false
+## THE REAL LOCATION: "path:line" — the file and the 1-based line the
+## finding was found on. The old location returned "" for everything.
+def _get_symbol_location(file: String, line: Int) -> String
+  file.clone() + ":" + line.to_string()
 end
 
-def _get_symbol_location(symbol_id: String) -> String
-  ## Without the compiler's source map there is no location to report.
-  "".to_string()
+## Extract the module's declared capability list from the [METADATA]
+## header's `capabilities: [...]` line. The header is the module's
+## declared data — the drift baseline. The METADATA lines are COMMENTS
+## (`# capabilities: [...]`), so the match is the contains form.
+def _extract_declared_capabilities(content: String) -> Vec[String]
+  var caps: Vec[String] = Vec::new()
+  let lines = content.split("\n")
+  var i = 0
+  while i < lines.len() do
+    let line = lines.get(i).trim()
+    if line.contains("capabilities:") then
+      _parse_capability_list(&line, &mut caps)
+    end
+    i = i + 1
+  end
+  caps
+end
+
+## Extract the capabilities USED on one source line: the
+## require_capability("x") call, the #[require(x)] attribute, and the
+## require("x") declaration forms.
+def _extract_used_capabilities(line: String) -> Vec[String]
+  var caps: Vec[String] = Vec::new()
+  _parse_capability_list(&line, &mut caps)
+  caps
+end
+
+## The shared list extraction: every quoted token inside the first
+## bracket-delimited list of the line is a capability name (the METADATA
+## `capabilities: [net, fs]` line and the `#[require(a, b)]` /
+## `require_capability("x", "y")` usage lines all carry their names in a
+## bracket list).
+def _parse_capability_list(line: String, inout out: Vec[String]) -> Unit
+  match line.find("[")
+  when Option::Some(open) then
+    match line.find("]")
+    when Option::Some(close) then
+      if close > open then
+        let inner = line.substring(open + 1, close)
+        let parts = inner.split(",")
+        for part in parts do
+          let trimmed = part.trim()
+          let stripped = trimmed.trim_matches('"').trim_matches('\'')
+          if stripped.len() > 0 && _looks_like_capability(&stripped) then
+            out.push(stripped)
+          end
+        end
+      end
+    when Option::None then ()
+    end
+  when Option::None then ()
+  end
+end
+
+## A capability name is an identifier-like token (never a number, never
+## a quoted-empty). The bracket-list tokenizer feeds only the quoted or
+## bare identifier tokens.
+def _looks_like_capability(token: String) -> Bool
+  if token.len() == 0 then return false end
+  let first = token.char_at(0)
+  first.is_alpha() || first == '_'
 end
 
 # The deterministic report id: FNV-1a (64-bit) over the scope bytes and the

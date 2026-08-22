@@ -8,13 +8,13 @@
 
 use std::core::{Option, Result, panic}
 use std::collections::{Vec}
-use tg_compiler::token::{Span, Token, TokenKind, span_new, span_merge, is_expr_start, is_stmt_start, is_item_start, is_doc_comment, parsed_int_to_host}
+use tg_compiler::token::{Span, Token, TokenKind, span_new, span_merge, span_dummy, is_expr_start, is_stmt_start, is_item_start, is_doc_comment, parsed_int_to_host}
 use tg_compiler::lexer::LexResult
 use tg_compiler::ids::{is_intrinsic_extern_name}
 use tg_compiler::ast::{
-  Program, Item, ItemKind, Visibility,
+  Program, Item, ItemKind, Visibility, Attribute,
   FunctionDecl, GenericParam, Param, AccessConvention, NominalKind, FnBody, FunctionSig,
-  StructDecl, FieldDecl, EnumDecl, VariantDecl,
+  StructDecl, FieldDecl, EnumDecl, VariantDecl, LayoutAttrs, layout_attrs_plain,
   TraitDecl, TraitMethod, AssocType, ImplDecl, WherePredicate, AssocTypeImpl,
   ModuleDecl, UseDecl, AstPath, TypeAliasDecl, ConstDecl, StaticDecl,
   MacroDecl, ExternBlock, ExternItem, ExternFn, ExternStatic,
@@ -41,6 +41,7 @@ enum ErrorCode
   E106SafeRefNotFirstClass
   E107MacroAmbiguity
   E108InvalidCfgPredicate
+  E109InvalidLayoutAttribute
 end
 
 enum DiagLevel
@@ -97,6 +98,7 @@ def error_code_to_string(code: ErrorCode) -> String
   when ErrorCode::E106SafeRefNotFirstClass then "E106"
   when ErrorCode::E107MacroAmbiguity then "E107"
   when ErrorCode::E108InvalidCfgPredicate then "E108"
+  when ErrorCode::E109InvalidLayoutAttribute then "E109"
   end
 end
 
@@ -573,6 +575,95 @@ def parse_attributes(inout p: TgcParser) -> Vec[Attribute]
 end
 
 # ———————————————————————————————————————————————————————————————
+# Layout attribute extraction — @repr(C) / @align(N) / @packed
+# ———————————————————————————————————————————————————————————————
+# The layout-relevant subset of the collected item attributes, extracted
+# into the LayoutAttrs record every struct/enum declaration carries. The
+# SYNTAX-LEVEL validation lives here (fail closed at parse time):
+#   - @repr takes exactly the form @repr(C) — any other repr spelling is
+#     an E109 error (only the C representation is supported);
+#   - @packed takes no arguments;
+#   - @align(N) requires exactly one argument that parses as a positive
+#     POWER OF TWO (the dialect's alignment rule);
+#   - the EXCLUSIVITY rules: @repr(C) with @packed, and @packed with
+#     @align(N), are invalid combinations (E109) — a declaration may carry
+#     at most one layout strategy.
+# The semantic validation (the alignment-overflow bound, the typed
+# re-check) happens in the checker; the parser guarantees the shape.
+
+def is_power_of_two(n: Int) -> Bool
+  n > 0 && (n & (n - 1)) == 0
+end
+
+def extract_layout_attrs(inout p: TgcParser, attrs: Vec[Attribute]) -> LayoutAttrs
+  var is_repr_c = false
+  var is_packed = false
+  var align = Option::None
+  var layout_span = Option::None
+  for attr in attrs do
+    match layout_span
+    when Option::Some(_) then ()
+    when Option::None then layout_span = Option::Some(attr.span)
+    end
+    if attr.name == "repr" then
+      # @repr(C) — the ONLY supported representation. A bare @repr, an
+      # empty @repr() or any spelling other than C is rejected — an
+      # unsupported representation must never silently degrade to the
+      # natural layout (fail closed).
+      let ok_c = attr.args.len() == 1 && attr.args[0] == "C"
+      if !ok_c then
+        diag_error(&mut p.diag, ErrorCode::E109InvalidLayoutAttribute, "@repr expects the form @repr(C) — only the C representation is supported", attr.span)
+      end
+      is_repr_c = true
+    elsif attr.name == "packed" then
+      if attr.args.len() > 0 then
+        diag_error(&mut p.diag, ErrorCode::E109InvalidLayoutAttribute, "@packed takes no arguments", attr.span)
+      end
+      is_packed = true
+    elsif attr.name == "align" then
+      if attr.args.len() == 1 then
+        match attr.args[0].parse_int()
+        when Result::Ok(n) then
+          if n <= 0 || !is_power_of_two(n) then
+            diag_error(&mut p.diag, ErrorCode::E109InvalidLayoutAttribute, "@align(N) requires N to be a power of two (got " + attr.args[0].clone() + ")", attr.span)
+          else
+            align = Option::Some(n)
+          end
+        when Result::Err(_) then
+          diag_error(&mut p.diag, ErrorCode::E109InvalidLayoutAttribute, "@align(N) requires an integer alignment (got '" + attr.args[0].clone() + "')", attr.span)
+        end
+      else
+        diag_error(&mut p.diag, ErrorCode::E109InvalidLayoutAttribute, "@align(N) requires exactly one argument — the power-of-two alignment N", attr.span)
+      end
+    end
+  end
+  # The exclusivity rules — the invalid combinations are errors.
+  if is_repr_c && is_packed then
+    match layout_span
+    when Option::Some(sp) then
+      diag_error(&mut p.diag, ErrorCode::E109InvalidLayoutAttribute, "@repr(C) and @packed are mutually exclusive (a declaration may carry at most one layout strategy)", sp)
+    when Option::None then ()
+    end
+  end
+  if is_packed then
+    match align
+    when Option::Some(_) then
+      match layout_span
+      when Option::Some(sp) then
+        diag_error(&mut p.diag, ErrorCode::E109InvalidLayoutAttribute, "@packed and @align(N) are mutually exclusive (@packed fixes the alignment to 1)", sp)
+      when Option::None then ()
+      end
+    when Option::None then ()
+    end
+  end
+  let merged_span = match layout_span
+  when Option::Some(sp) then sp
+  when Option::None then span_dummy()
+  end
+  LayoutAttrs { is_repr_c: is_repr_c, is_packed: is_packed, align: align, span: merged_span }
+end
+
+# ———————————————————————————————————————————————————————————————
 # Item Parsing
 # ———————————————————————————————————————————————————————————————
 
@@ -699,6 +790,11 @@ def parse_item(inout p: TgcParser) -> Option[Item]
       end
     end
   end
+
+  # Extract the layout attributes — @repr(C) / @align(N) / @packed — into
+  # the declaration record (validated: N a power of two, the C/packed and
+  # packed/align exclusivity — see extract_layout_attrs).
+  let layout_attrs = extract_layout_attrs(p, &attrs)
   
   let start = peek_span(p)
   let vis = parse_visibility(p)
@@ -733,21 +829,21 @@ def parse_item(inout p: TgcParser) -> Option[Item]
     end
   elsif pk2 == TokenKind::Struct then
     advance(p)
-    match parse_struct_decl(p, vis, start, derives)
+    match parse_struct_decl(p, vis, start, derives, &layout_attrs)
     when Option::Some(s) then
       result = Option::Some(make_item(ItemKind::ItemStruct(s), span_merge(start, peek_span(p))))
     when Option::None then ()
     end
   elsif pk2 == TokenKind::Resource then
     advance(p)
-    match parse_resource_decl(p, vis, start, derives)
+    match parse_resource_decl(p, vis, start, derives, &layout_attrs)
     when Option::Some(s) then
       result = Option::Some(make_item(ItemKind::ItemStruct(s), span_merge(start, peek_span(p))))
     when Option::None then ()
     end
   elsif pk2 == TokenKind::Enum then
     advance(p)
-    match parse_enum_decl(p, vis, start, derives)
+    match parse_enum_decl(p, vis, start, derives, &layout_attrs)
     when Option::Some(e) then
       result = Option::Some(make_item(ItemKind::ItemEnum(e), span_merge(start, peek_span(p))))
     when Option::None then ()
@@ -1781,15 +1877,15 @@ end
 # Struct
 # ———————————————————————————————————————————————————————————————
 
-def parse_struct_decl(inout p: TgcParser, vis: Visibility, start: Span, derives: Vec[String]) -> Option[StructDecl]
-  parse_struct_decl_kind(p, vis, start, derives, NominalKind::Value, false)
+def parse_struct_decl(inout p: TgcParser, vis: Visibility, start: Span, derives: Vec[String], layout_attrs: LayoutAttrs) -> Option[StructDecl]
+  parse_struct_decl_kind(p, vis, start, derives, layout_attrs, NominalKind::Value, false)
 end
 
-def parse_resource_decl(inout p: TgcParser, vis: Visibility, start: Span, derives: Vec[String]) -> Option[StructDecl]
-  parse_struct_decl_kind(p, vis, start, derives, NominalKind::Resource, true)
+def parse_resource_decl(inout p: TgcParser, vis: Visibility, start: Span, derives: Vec[String], layout_attrs: LayoutAttrs) -> Option[StructDecl]
+  parse_struct_decl_kind(p, vis, start, derives, layout_attrs, NominalKind::Resource, true)
 end
 
-def parse_struct_decl_kind(inout p: TgcParser, vis: Visibility, start: Span, derives: Vec[String], kind: NominalKind, skip_methods: Bool) -> Option[StructDecl]
+def parse_struct_decl_kind(inout p: TgcParser, vis: Visibility, start: Span, derives: Vec[String], layout_attrs: LayoutAttrs, kind: NominalKind, skip_methods: Bool) -> Option[StructDecl]
   match expect_ident(p)
   when Option::Some(name) then
     let generic_params = parse_generic_params(p)
@@ -1848,6 +1944,7 @@ def parse_struct_decl_kind(inout p: TgcParser, vis: Visibility, start: Span, der
       methods: methods,
       derives: derives,
       kind: kind,
+      layout_attrs: layout_attrs,
       span: span_merge(start, peek_span(p))
     })
   when Option::None then
@@ -1888,7 +1985,7 @@ end
 # Enum
 # ———————————————————————————————————————————————————————————————
 
-def parse_enum_decl(inout p: TgcParser, vis: Visibility, start: Span, derives: Vec[String]) -> Option[EnumDecl]
+def parse_enum_decl(inout p: TgcParser, vis: Visibility, start: Span, derives: Vec[String], layout_attrs: LayoutAttrs) -> Option[EnumDecl]
   match expect_ident(p)
   when Option::Some(name) then
     let generic_params = parse_generic_params(p)
@@ -1918,6 +2015,7 @@ def parse_enum_decl(inout p: TgcParser, vis: Visibility, start: Span, derives: V
       generic_params: generic_params,
       variants: variants,
       derives: derives,
+      layout_attrs: layout_attrs,
       span: span_merge(start, peek_span(p))
     })
   when Option::None then return Option::None
@@ -2451,37 +2549,49 @@ def parse_effect_decl(inout p: TgcParser, vis: Visibility, start: Span) -> Optio
       parent = expect_ident(p)
     end
     # Grammar: effect NAME [type_params] { effect_op_sig } end
-    # The AST EffectDecl carries no op-signature storage, so op signatures are
-    # parsed (and validated structurally) then consumed.
+    # The op signatures (name(param: T, ...) -> R) are parsed AND stored on
+    # the EffectDecl — the typed checker resolves them into the semantic
+    # EffectId-keyed op table the perform surface and the handler arms are
+    # checked against (the algebraic-effects row).
     let _type_params = parse_generic_params(p)
     skip_newlines(p)
+    mut ops = Vec::new()
     while !at(p, TokenKind::End) && !at(p, TokenKind::Eof) do
       skip_newlines(p)
       if at(p, TokenKind::End) || at(p, TokenKind::Eof) then break end
       let before_pos = p.pos
+      let op_start = peek_span(p)
       match expect_ident(p)
-      when Option::Some(_op_name) then
+      when Option::Some(op_name) then
         expect(p, TokenKind::LParen)
         skip_newlines(p)
+        mut op_params = Vec::new()
         if !at(p, TokenKind::RParen) then
-          match expect_ident(p)
-          when Option::Some(_) then
-            while at(p, TokenKind::Comma) do
-              advance(p)
-              skip_newlines(p)
-              match expect_ident(p)
-              when Option::Some(_) then ()
-              when Option::None then break
-              end
-            end
+          match parse_effect_op_param(p)
+          when Option::Some(pp) then op_params.push(pp)
           when Option::None then ()
+          end
+          while at(p, TokenKind::Comma) do
+            advance(p)
+            skip_newlines(p)
+            match parse_effect_op_param(p)
+            when Option::Some(pp) then op_params.push(pp)
+            when Option::None then break
+            end
           end
         end
         expect(p, TokenKind::RParen)
+        mut op_ret = Option::None
         if at(p, TokenKind::Arrow) then
           advance(p)
-          let _ret = parse_type(p)
+          op_ret = parse_type(p)
         end
+        ops.push(EffectOpSig {
+          name: op_name,
+          params: op_params,
+          ret: op_ret,
+          span: span_merge(op_start, peek_span(p))
+        })
         eat_optional_semi(p)
       when Option::None then
         synchronize(p)
@@ -2496,9 +2606,31 @@ def parse_effect_decl(inout p: TgcParser, vis: Visibility, start: Span) -> Optio
       vis: vis,
       name: name,
       parent: parent,
+      ops: ops,
       span: span_merge(start, peek_span(p))
     })
   when Option::None then return Option::None
+  end
+end
+
+# One operation parameter: `name: Type` (the bounded effect-op surface; a
+# parameter without a type annotation is parsed for recovery and reported by
+# the checker — the typed signature is the authority).
+def parse_effect_op_param(inout p: TgcParser) -> Option[EffectOpParamSig]
+  let param_start = peek_span(p)
+  match expect_ident(p)
+  when Option::Some(param_name) then
+    if at(p, TokenKind::Colon) then
+      advance(p)
+      match parse_type(p)
+      when Option::Some(pt) then
+        Option::Some(EffectOpParamSig { name: param_name, ty: pt })
+      when Option::None then Option::None
+      end
+    else
+      Option::None
+    end
+  when Option::None then Option::None
   end
 end
 
@@ -3634,7 +3766,7 @@ def parse_stmt(inout p: TgcParser) -> Option[Stmt]
     end
   elsif at(p, TokenKind::Struct) then
     advance(p)
-    match parse_struct_decl(p, Visibility::Private, start, Vec::new())
+    match parse_struct_decl(p, Visibility::Private, start, Vec::new(), &layout_attrs_plain(start))
     when Option::Some(_) then
       let noop = make_expr(ExprKind::ExprNilLit, span_merge(start, peek_span(p)))
       return Option::Some(make_stmt(StmtKind::StmtExpr(noop), span_merge(start, peek_span(p))))
@@ -3642,7 +3774,7 @@ def parse_stmt(inout p: TgcParser) -> Option[Stmt]
     end
   elsif at(p, TokenKind::Resource) then
     advance(p)
-    match parse_resource_decl(p, Visibility::Private, start, Vec::new())
+    match parse_resource_decl(p, Visibility::Private, start, Vec::new(), &layout_attrs_plain(start))
     when Option::Some(_) then
       let noop = make_expr(ExprKind::ExprNilLit, span_merge(start, peek_span(p)))
       return Option::Some(make_stmt(StmtKind::StmtExpr(noop), span_merge(start, peek_span(p))))
@@ -3650,7 +3782,7 @@ def parse_stmt(inout p: TgcParser) -> Option[Stmt]
     end
   elsif at(p, TokenKind::Enum) then
     advance(p)
-    match parse_enum_decl(p, Visibility::Private, start, Vec::new())
+    match parse_enum_decl(p, Visibility::Private, start, Vec::new(), &layout_attrs_plain(start))
     when Option::Some(_) then
       let noop = make_expr(ExprKind::ExprNilLit, span_merge(start, peek_span(p)))
       return Option::Some(make_stmt(StmtKind::StmtExpr(noop), span_merge(start, peek_span(p))))

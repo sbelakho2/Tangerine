@@ -1,0 +1,154 @@
+# tests/executor_drop_control_token_test.tg — the Executor::drop
+# control-token lifecycle (the reviewer's leak fix).
+#
+# The old drop initiated the shutdown only when self.inner.strong_count()
+# == 1 — a RUNNING executor's inner is also referenced by the worker
+# threads' clones, so the count was >= 2 while they lived: the gate never
+# fired, the shutdown never initiated, the workers blocked forever, and
+# the inner leaked. The control token is the separate public-owner
+# authority: the wrappers hold it, the workers do NOT. The last wrapper's
+# drop SETS the token (the shutdown initiation, independent of the inner
+# strong count); the workers read the token through the inner's
+# reference, transition the lifecycle (Running -> Draining under the
+# admission lock), drain to the quiescent point, and exit; their Arc
+# clones are released, and the final Arc release completes the teardown —
+# no leak.
+#
+# The two observables: (a) the token is SET after the wrapper drops (read
+# through the observer's inner reference), and (b) the workers EXIT and
+# release their clones — the inner's strong count falls to the observer's
+# single reference (the teardown completed; nothing leaked).
+#
+# Run with: tg run tests/executor_drop_control_token_test.tg
+
+use std::core::{Vec, String, Unit, Result, Option, Int}
+use std::test::*
+use std::exec::{Executor}
+use std::sync::{Arc}
+
+@test
+def test_drop_sets_token_and_workers_exit_no_leak() -> Unit
+  let exec = assert_ok(Executor::new(2))
+  # The observer's own Arc clone — the probe that outlives the wrapper
+  # (the workers' clones are released when they exit).
+  let probe = exec.inner.clone()
+
+  # THE WRAPPER DROPS: the last public owner leaves — the control token
+  # is set (the shutdown initiation) and the workers are woken.
+  drop(exec)
+
+  # (a) THE SHUTDOWN INITIATED: the token is observable through the
+  # inner's control reference (the workers hold no separate token clone).
+  unsafe "executor inner access — the observer's Arc keeps the inner alive" do
+    let inner = probe.ptr.as_ref()
+    assert_true(inner.control.shutdown_token.load())
+  end
+
+  # (b) THE WORKERS EXIT + NO LEAK: bounded spin on the inner's strong
+  # count — the workers observe the token, transition to Draining, exit
+  # at the quiescent point, and drop their clones; the count falls to the
+  # probe's single reference (the final Arc release — the teardown
+  # completed).
+  var spins = 0
+  while spins < 5000000 && probe.strong_count() > 1 do
+    spins = spins + 1
+    std::thread::yield_now()
+  end
+  assert_eq(probe.strong_count(), 1)
+end
+
+@test
+def test_drop_drains_submitted_work_before_workers_exit() -> Unit
+  let exec = assert_ok(Executor::new(2))
+  let probe = exec.inner.clone()
+  let counter = Arc::new(std::sync::Mutex::new(0))
+  var submitted = 0
+  while submitted < 64 do
+    let c = counter.clone()
+    exec.submit(Box::new(move || {
+      let mut g = c.lock()
+      *g = *g + 1
+      drop(g)
+    }), std::exec::TaskPriority::Normal)
+    submitted = submitted + 1
+  end
+
+  drop(exec)
+
+  # The drain semantics: the drop-initiated shutdown is the GRACEFUL
+  # drain (Running -> Draining), so the queued work still runs — the
+  # worker-side transition preserves the admission protocol. The
+  # completion counter reaches the full 64 after the wrapper dropped.
+  var spins = 0
+  while spins < 5000000 do
+    let g = counter.lock()
+    let done = *g
+    drop(g)
+    if done == 64 then
+      break
+    end
+    spins = spins + 1
+    std::thread::yield_now()
+  end
+  let g = counter.lock()
+  assert_eq(*g, 64)
+  drop(g)
+
+  # The workers exited and released their clones — no leak.
+  spins = 0
+  while spins < 5000000 && probe.strong_count() > 1 do
+    spins = spins + 1
+    std::thread::yield_now()
+  end
+  assert_eq(probe.strong_count(), 1)
+end
+
+@test
+def test_transient_wrapper_drop_never_initiates_shutdown() -> Unit
+  # A transient wrapper (Executor::wrap — the convenience-function shape)
+  # around a live executor must NOT fire the drop: the owner wrapper's
+  # control reference keeps the token count above the fire threshold, so
+  # the executor keeps running after the transient leaves.
+  let exec = assert_ok(Executor::new(1))
+  let probe = exec.inner.clone()
+  let counter = Arc::new(std::sync::Mutex::new(0))
+
+  # The transient wrapper submits through the owner's inner; the helper
+  # returns and ITS transient drops (the fire threshold is not reached —
+  # the owner's reference persists).
+  _submit_via_transient(exec.inner.clone(), counter.clone())
+
+  # The executor is still Running — the transient's drop did NOT set the
+  # token and did NOT transition the lifecycle (a bounded quiescence
+  # wait for the submitted task first, then the state probe).
+  var spins = 0
+  while spins < 500000 && exec.debug_completed_count() < 1 do
+    spins = spins + 1
+    std::thread::yield_now()
+  end
+  assert_true(exec.debug_completed_count() >= 1)
+  unsafe "executor inner access — the probe's Arc keeps the inner alive" do
+    let inner = probe.ptr.as_ref()
+    assert_false(inner.control.shutdown_token.load())
+    assert_eq(inner.state.load(), 0)  # still Running
+  end
+
+  # The explicit shutdown still works after the transient's drop.
+  exec.shutdown()
+  unsafe "executor inner access — the probe's Arc keeps the inner alive" do
+    let inner = probe.ptr.as_ref()
+    assert_eq(inner.state.load(), 3)  # Stopped
+  end
+end
+
+# The transient-wrapper submit helper: builds the wrapper, submits, and
+# lets the wrapper drop at the return.
+def _submit_via_transient(inner: Arc[std::exec::ExecutorInner], counter: Arc[std::sync::Mutex[Int]]) -> Unit
+  let transient = Executor::wrap(inner)
+  let c = counter.clone()
+  let _ = transient.submit(Box::new(move || {
+    let mut g = c.lock()
+    *g = *g + 1
+    drop(g)
+  }), std::exec::TaskPriority::Normal)
+end

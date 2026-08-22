@@ -778,6 +778,18 @@ std::async::block_on(async {
 })
 ```
 
+The Linux epoll reactor crosses the C boundary through the native shim
+(`native/epoll_shims.c` — it holds the REAL libc `struct epoll_event`,
+the PACKED 12-byte `{ u32 events @ 0, u64 data @ 4 }` kernel shape, and
+converts to/from the Tangerine-native `EpollEvent` representation). The
+`@packed` layout attribute (implemented — see interop.md §Data Layout)
+now lets the Tangerine side spell the kernel's packed offsets directly
+(`@packed struct { events: u32, data: UInt }` — size 12, data at byte
+4, never the padded offset 8); the shim stays the C-boundary
+conversion authority, and the differential suite's attributed section
+probes that the Tangerine `@packed` layout equals the C compiler's
+packed layout of the kernel shape byte-for-byte.
+
 The reactor's readiness tokens have the pinned semantics: the
 second-poll-stays-pending / ready-consume / EAGAIN-re-register behavior
 on the kqueue-backed reactor (`reactor_readiness_test.tg`).

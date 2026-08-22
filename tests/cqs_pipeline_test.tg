@@ -1,0 +1,240 @@
+# tests/cqs_pipeline_test.tg — the CQS query server invoked by the
+# canonical pipeline, with the query results asserted.
+#
+# The compiler-query-server contract:
+#   (a) the PIPELINE INVOCATION — analyze_source_cqs (the library
+#       pipeline's boundary in tg_compiler/lib.tg) runs the canonical
+#       semantic path (parse -> analyze_parsed -> lower_to_mir) and
+#       returns the three query results: the typed info, the symbols,
+#       the diagnostics;
+#   (b) the QUERY RESULTS' EFFECT — the diagnostics query converts the
+#       detected signals into the pipeline's STRUCTURED diagnostics at
+#       the enforcement levels the mode matrix assigns: the gated
+#       failures (Hardened) are Error-level — the driver's check path
+#       reports them and fails the check; the Dev matrix enforces
+#       nothing, so the Dev run carries no Error-level diagnostic;
+#   (c) the FULL DETECTOR WIRING — run_cqs_analysis runs the complete
+#       detector set over the lowered MIR (the reachability-based CF
+#       family, the def-use DF family, the switch-based DF-4, the
+#       unwind-based EH-3) — the signal-level results are asserted
+#       here (DF-3 dead assignment, DF-4 identical branches, CF-4
+#       constant-return dominance on the fixture).
+#
+# Run with: tg run tests/cqs_pipeline_test.tg
+
+use std::test::*
+use std::core::{Option, Result, String, Unit, Bool, Int, UInt}
+
+use tg_compiler::lib::analyze_source_cqs
+use tg_compiler::compiler_core::{default_options, parse_source_program, analyze_parsed, CompilerOptions}
+use tg_compiler::types::{type_env_new}
+use tg_compiler::mir::{lower_to_mir}
+use tg_compiler::mode::{Mode}
+use tg_compiler::parser::{DiagLevel}
+use tg_compiler::cqs::{run_cqs_analysis, SymbolKind, SignalKind}
+
+# The fixture: one PUBLIC function with the deliberate signals —
+#   - a DEAD ASSIGNMENT (`let dead = 1` is never read — the def-use
+#     DF-3 detector fires);
+#   - the IF-ELSE whose branches return the SAME literal (the
+#     switch-based DF-4 detector fires);
+# and a SECOND public function whose every return site is the constant
+# 42 (the CF-4 constant-return dominance — the Hardened gate blocks
+# both symbols: the penalties push the scores below the 92 threshold).
+# `main` stays clean: the InternalGlue surface never gates.
+const FIXTURE: str = "pub def broken(given: Int) -> Int\n" +
+  "  let dead = 1\n" +
+  "  if given > 0 then\n" +
+  "    42\n" +
+  "  else\n" +
+  "    42\n" +
+  "  end\n" +
+  "end\n" +
+  "\n" +
+  "pub def get_answer() -> Int\n" +
+  "  42\n" +
+  "end\n" +
+  "\n" +
+  "def main() -> Int\n" +
+  "  0\n" +
+  "end\n"
+
+def _hardened_opts() -> CompilerOptions
+  var opts = default_options()
+  opts.strict_resolution = true
+  opts.mode = Mode::Hardened
+  opts
+end
+
+def _dev_opts() -> CompilerOptions
+  var opts = default_options()
+  opts.strict_resolution = true
+  opts.mode = Mode::Dev
+  opts
+end
+
+# ─── (a) the pipeline invocation + the query results ─────────────────
+
+@test
+def test_pipeline_invokes_cqs_and_returns_symbols() -> Unit
+  let results = assert_ok(analyze_source_cqs(FIXTURE.to_string(), "cqs_fixture.tg", _hardened_opts()))
+  # The symbols query: every top-level function, with the stable
+  # sha256 symbol id and the surface class.
+  assert_true(results.symbols.len() >= 2)
+  var has_broken = false
+  var has_main = false
+  for sym in results.symbols do
+    if sym.name == "broken" then
+      has_broken = true
+      match sym.kind
+      when SymbolKind::Function then ()
+      when _ then assert_false(true)
+      end
+      assert_true(sym.symbol_id.len() == 64)
+    end
+    if sym.name == "main" then
+      has_main = true
+    end
+  end
+  assert_true(has_broken)
+  assert_true(has_main)
+end
+
+@test
+def test_typed_info_query_reports_signatures_and_typed_coverage() -> Unit
+  let results = assert_ok(analyze_source_cqs(FIXTURE.to_string(), "cqs_fixture.tg", _hardened_opts()))
+  var has_broken = false
+  for info in results.typed_info do
+    if info.name == "broken" then
+      has_broken = true
+      assert_eq(info.type_str, "fn broken(given: Int) -> Int")
+      assert_true(info.param_count == 1)
+      assert_true(info.generic_count == 0)
+      # the typed HIR's expr_types covered the function's expressions
+      assert_true(info.typed_expr_count >= 1)
+    end
+  end
+  assert_true(has_broken)
+end
+
+@test
+def test_queries_are_deterministic_across_invocations() -> Unit
+  let r1 = assert_ok(analyze_source_cqs(FIXTURE.to_string(), "cqs_fixture.tg", _hardened_opts()))
+  let r2 = assert_ok(analyze_source_cqs(FIXTURE.to_string(), "cqs_fixture.tg", _hardened_opts()))
+  assert_true(r1.symbols.len() == r2.symbols.len())
+  var i = 0
+  while i < r1.symbols.len() do
+    assert_eq(r1.symbols[i].symbol_id, r2.symbols[i].symbol_id)
+    assert_eq(r1.symbols[i].name, r2.symbols[i].name)
+    i = i + 1
+  end
+  assert_true(r1.diagnostics.len() == r2.diagnostics.len())
+  i = 0
+  while i < r1.diagnostics.len() do
+    assert_eq(r1.diagnostics[i].message, r2.diagnostics[i].message)
+    i = i + 1
+  end
+end
+
+# ─── (c) the FULL detector wiring — the signal-level results ─────────
+
+@test
+def test_run_cqs_analysis_detects_df3_df4_and_cf4_on_the_fixture() -> Unit
+  var ast = assert_ok(parse_source_program(FIXTURE.to_string(), "cqs_fixture.tg"))
+  var env = type_env_new()
+  let analyzed = assert_ok(analyze_parsed(&mut env, &mut ast, _hardened_opts()))
+  let mir = assert_ok(lower_to_mir(&ast, &analyzed))
+  let queried = assert_ok(analyze_source_cqs(FIXTURE.to_string(), "cqs_fixture.tg", _hardened_opts()))
+  let report = run_cqs_analysis(&queried.symbols, &mir.functions, Mode::Hardened, "test")
+
+  # the broken symbol's signal set: DF-3 (the dead assignment), DF-4
+  # (the identical branches); the get_answer symbol's signal set: CF-4
+  # (the constant-return dominance). The scores gate under Hardened.
+  var broken_report = Option::None
+  var answer_report = Option::None
+  for module in report.modules do
+    for sr in module.symbols do
+      if sr.name == "broken" then
+        broken_report = Option::Some(sr)
+      end
+      if sr.name == "get_answer" then
+        answer_report = Option::Some(sr)
+      end
+    end
+  end
+  match broken_report
+  when Option::Some(sr) then
+    var has_df3 = false
+    var has_df4 = false
+    for signal in sr.signals do
+      match signal.kind
+      when SignalKind::DF3_DeadAssignment then has_df3 = true
+      when SignalKind::DF4_AllBranchesReturnSameLiteral then has_df4 = true
+      when _ then ()
+      end
+    end
+    assert(has_df3, "the dead assignment must be detected (DF-3)")
+    assert(has_df4, "the identical branches must be detected (DF-4)")
+    assert(sr.score.clamped < 92, "the fixture must gate under Hardened")
+  when Option::None then
+    assert_false(true)
+  end
+  match answer_report
+  when Option::Some(sr) then
+    var has_cf4 = false
+    for signal in sr.signals do
+      match signal.kind
+      when SignalKind::CF4_ConstantReturnDominance then has_cf4 = true
+      when _ then ()
+      end
+    end
+    assert(has_cf4, "the constant-return dominance must be detected (CF-4)")
+    assert(sr.score.clamped < 92, "the constant-returning symbol must gate under Hardened")
+  when Option::None then
+    assert_false(true)
+  end
+end
+
+# ─── (b) the query results' effect — the enforcement levels ──────────
+
+@test
+def test_hardened_diagnostics_are_error_level_and_carry_cqs_codes() -> Unit
+  let results = assert_ok(analyze_source_cqs(FIXTURE.to_string(), "cqs_fixture.tg", _hardened_opts()))
+  assert_true(results.diagnostics.len() >= 2)
+  var has_cf4 = false
+  var has_df3 = false
+  var all_error = true
+  for d in results.diagnostics do
+    match d.level
+    when DiagLevel::Error then ()
+    when _ then all_error = false
+    end
+    match d.code
+    when Option::Some(code) then
+      if code == "CQS-CF4" then has_cf4 = true end
+      if code == "CQS-DF3" then has_df3 = true end
+    when Option::None then ()
+    end
+  end
+  assert(all_error, "the Hardened gate's diagnostics must be Error-level")
+  assert_true(has_cf4)
+  assert_true(has_df3)
+end
+
+@test
+def test_dev_mode_enforces_nothing() -> Unit
+  let results = assert_ok(analyze_source_cqs(FIXTURE.to_string(), "cqs_fixture.tg", _dev_opts()))
+  for d in results.diagnostics do
+    match d.level
+    when DiagLevel::Error then assert_false(true)
+    when _ then ()
+    end
+  end
+end
+
+@test
+def test_clean_source_produces_no_diagnostics_in_any_mode() -> Unit
+  let clean = "def main() -> Int\n  0\nend\n".to_string()
+  let results = assert_ok(analyze_source_cqs(clean, "clean.tg", _hardened_opts()))
+  assert_true(results.diagnostics.len() == 0)
+end

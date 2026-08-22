@@ -269,6 +269,73 @@ end
 
 The compiler can auto-generate these via `@ffi_union`.
 
+### `@align(N)` Struct Layout (implemented)
+
+`@align(N)` raises a declaration's alignment to N (N a power of two,
+validated at parse time — E109 for a non-power-of-two; the checker
+rejects N above the supported maximum with the alignment-overflow
+error). Per the dialect's documented C-alignment rule:
+
+1. The type's alignment becomes N.
+2. Each field's offset aligns to the MAX of the field's own alignment
+   and the declared N (a field never sits at an offset its declared
+   alignment would not honor).
+3. The total size is tail-aligned to N.
+
+```tangerine
+@align(16)
+struct Aligned
+  a: u8   # offset 0
+  b: u32  # offset 16 — max(field align 4, declared 16)
+end
+# Align: 16, Size: 32
+```
+
+(Note: this differs deliberately from GCC's `__attribute__((aligned))`,
+which keeps the natural field offsets and only raises the struct's
+size/alignment — the dialect's max-rule is the documented field
+placement; see the differential suite's attributed section.)
+
+### `@packed` Struct Layout (implemented)
+
+`@packed` places the fields at the PACKED offsets — no padding between
+fields, per-field alignment 1, the type's alignment 1 and the size the
+exact byte span. `@packed` is mutually exclusive with `@repr(C)` and
+with `@align(N)` (E109 — a declaration carries at most one layout
+strategy). Field accesses at the packed (misaligned) offsets lower
+through the byte-wise unaligned load/store machinery — never a direct
+misaligned mov.
+
+```tangerine
+@packed
+struct EpollEventKernel
+  events: u32  # offset 0
+  data: UInt   # offset 4 — the kernel's packed offset, never 8
+end
+# Size: 12, Align: 1 — exactly the Linux x86-64 `struct epoll_event`
+```
+
+### The epoll adoption
+
+The Linux x86-64 `struct epoll_event` is a PACKED 12-byte struct
+(`{ u32 events @ 0, u64 data @ 4 }` — size 12, alignment 4). The
+`std::async` epoll calls route through the native shim
+(`native/epoll_shims.c` — the shim holds the REAL libc struct and
+converts between it and the Tangerine-native 16-byte `EpollEvent`
+representation at the C boundary; the shim stays the C boundary
+authority). With the `@packed` attribute now implemented, the
+Tangerine side CAN spell the kernel's packed representation directly —
+`@packed struct EpollEventKernel { events: u32, data: UInt }` is the
+12-byte kernel shape (data at byte 4, never the padded offset 8), and
+the differential suite's attributed section probes that the Tangerine
+`@packed` layout equals the C compiler's packed layout of the kernel
+shape byte-for-byte (the `PackedEv` probe: size 12, `data` at offset 4).
+The shim's conversion comment (the "a Tangerine struct would pad to 16
+bytes" rationale) is superseded for the packed spelling: the shim
+remains for the runtime C-boundary conversions, but the layout
+mismatch it papers over no longer requires the explicit `_pad` field —
+a `@packed` declaration reproduces the kernel offsets directly.
+
 ---
 
 ## Ownership and Memory

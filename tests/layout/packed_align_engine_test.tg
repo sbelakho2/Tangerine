@@ -1,0 +1,422 @@
+# tests/layout/packed_align_engine_test.tg — The attributed-layout engine
+# suite (@repr(C) / @align(N) / @packed).
+#
+# The layout engine's attributed computations, exercised directly: every
+# struct/enum below is registered as a MirTypeDef carrying the declaration's
+# layout-attribute record, and the engine's size/align/field-offset answers
+# are asserted against the attributed rules:
+#   @repr(C) — the C struct rules (declaration order, natural alignment,
+#              standard offsets; the ABI classification follows the C
+#              aggregate rules);
+#   @align(N) — the type's alignment = N; the fields' offsets align to the
+#              max of the field's own alignment and the declared N; the
+#              total size tail-aligns to N;
+#   @packed  — the fields sit at the packed offsets (no padding, per-field
+#              alignment 1); the type's alignment is 1 and the size is the
+#              exact byte span — the kernel epoll_event shape
+#              ({ u32 events @ 0, u64 data @ 4 } — size 12) is the
+#              canonical user;
+#   nested   — a @packed aggregate inside an aligned (natural) aggregate:
+#              the inner record's alignment (1) drives the outer placement,
+#              the inner's fields stay at their packed offsets;
+#   unaligned access — a packed u32 field at an odd offset (the codegen
+#              decision input: the offset is not a multiple of the access
+#              width — the byte-wise lowering must fire).
+#
+# Run with: tg run tests/layout/packed_align_engine_test.tg
+
+use std::core::{Option, Result, Int, String, Unit, Bool, panic}
+use std::collections::{Vec}
+use tg_compiler::layout_engine::{
+  LayoutEngine, TargetDescriptor, aarch64_target,
+  layout_engine_new, layout_engine_register_types, compute_all_layouts,
+  size_of, align_of, stride_of, field_offset, field_size,
+  discriminant_offset, payload_offset,
+  classify_value_category, ValueCategory, layout_error_to_string
+}
+use tg_compiler::ast::{LayoutAttrs, layout_attrs_plain}
+use tg_compiler::token::{span_dummy}
+use tg_compiler::lexer::{tokenize}
+use tg_compiler::parser::{parse, diag_has_errors}
+use tg_compiler::types::{Type, TypeId, type_env_new, validate_layout_attrs}
+use tg_compiler::mir::{MirTypeDef, MirTypeDefKind, MirFieldDef, MirVariantDef}
+
+mut tests_passed = 0
+mut tests_failed = 0
+
+def check(cond: Bool, name: String) -> Unit
+  if cond then
+    tests_passed = tests_passed + 1
+    println("[PASS] " + name)
+  else
+    tests_failed = tests_failed + 1
+    println("[FAIL] " + name)
+  end
+end
+
+def check_eq(expected: Int, actual: Int, name: String) -> Unit
+  if expected == actual then
+    tests_passed = tests_passed + 1
+    println("[PASS] " + name + " (expected=" + expected.to_string() + ", actual=" + actual.to_string() + ")")
+  else
+    tests_failed = tests_failed + 1
+    println("[FAIL] " + name + " (expected=" + expected.to_string() + ", actual=" + actual.to_string() + ")")
+  end
+end
+
+def make_struct(tid: Int, name: String, fields: Vec[MirFieldDef], attrs: LayoutAttrs) -> MirTypeDef
+  MirTypeDef {
+    id: TypeId { id: tid },
+    name: name,
+    kind: MirTypeDefKind::Struct(fields),
+    generic_params: Vec::new(),
+    layout: attrs
+  }
+end
+
+# ———————————————————————————————————————————————————————————————
+# 1. @packed — the packed offsets, align 1, exact byte span
+# ———————————————————————————————————————————————————————————————
+# The kernel epoll_event shape: { u32 events @ 0, u64 data @ 4 } — the
+# natural layout would pad data to offset 8 (size 16); the packed layout
+# is size 12 with data at 4.
+def test_packed_struct() -> Unit
+  let target = aarch64_target()
+  mut engine = layout_engine_new(target)
+  var fields = Vec::new()
+  fields.push(MirFieldDef { name: "events".to_string(), ty: Type::U32 })
+  fields.push(MirFieldDef { name: "data".to_string(), ty: Type::UInt })
+  var defs = Vec::new()
+  defs.push(make_struct(1, "PackedEv", fields, LayoutAttrs { is_repr_c: false, is_packed: true, align: Option::None, span: span_dummy() }))
+  layout_engine_register_types(&mut engine, &defs)
+  compute_all_layouts(&mut engine)
+  let ty = Type::Adt(TypeId { id: 1 }, Vec::new())
+  check_eq(12, size_of(&mut engine, &ty), "P1: packed {u32,u64} size = 12 (the exact byte span)")
+  check_eq(1, align_of(&mut engine, &ty), "P2: packed alignment = 1")
+  check_eq(0, field_offset(&mut engine, &ty, 0), "P3: packed events @ 0")
+  check_eq(4, field_offset(&mut engine, &ty, 1), "P4: packed data @ 4 (NO padding — the epoll_event offset)")
+  check_eq(4, field_size(&mut engine, &ty, 0), "P5: packed events width = 4")
+  check_eq(8, field_size(&mut engine, &ty, 1), "P6: packed data width = 8")
+  check_eq(12, stride_of(&mut engine, &ty), "P7: packed stride = 12 (align 1 -> no stride padding)")
+end
+
+# A packed struct with a small leading field: { u8 @ 0, u32 @ 1 } — the
+# u32 sits at an ODD offset: a misaligned access by construction (the
+# codegen's byte-wise lowering decision input).
+def test_packed_odd_offset_unaligned() -> Unit
+  let target = aarch64_target()
+  mut engine = layout_engine_new(target)
+  var fields = Vec::new()
+  fields.push(MirFieldDef { name: "tag".to_string(), ty: Type::U8 })
+  fields.push(MirFieldDef { name: "word".to_string(), ty: Type::U32 })
+  fields.push(MirFieldDef { name: "big".to_string(), ty: Type::U64 })
+  var defs = Vec::new()
+  defs.push(make_struct(2, "PackedOdd", fields, LayoutAttrs { is_repr_c: false, is_packed: true, align: Option::None, span: span_dummy() }))
+  layout_engine_register_types(&mut engine, &defs)
+  compute_all_layouts(&mut engine)
+  let ty = Type::Adt(TypeId { id: 2 }, Vec::new())
+  check_eq(13, size_of(&mut engine, &ty), "P8: packed {u8,u32,u64} size = 13 (1 + 4 + 8)")
+  check_eq(1, align_of(&mut engine, &ty), "P9: packed alignment = 1")
+  check_eq(1, field_offset(&mut engine, &ty, 1), "P10: packed u32 @ 1 (odd — UNALIGNED by construction)")
+  check_eq(5, field_offset(&mut engine, &ty, 2), "P11: packed u64 @ 5 (4 % 8 != 0 — UNALIGNED by construction)")
+  # The codegen decision inputs: 1 % 4 != 0 and 5 % 8 != 0 — the byte-wise
+  # unaligned lowering must fire for both.
+  check((field_offset(&mut engine, &ty, 1) % 4) != 0, "P12: u32 at odd offset -> the unaligned load/store path")
+  check((field_offset(&mut engine, &ty, 2) % 8) != 0, "P13: u64 at offset 5 -> the unaligned load/store path")
+  # The aligned-placement sanity: a 4-aligned field stays aligned.
+  check((field_offset(&mut engine, &ty, 0) % 1) == 0, "P14: u8 offset 0 aligned (trivially)")
+end
+
+# ———————————————————————————————————————————————————————————————
+# 2. @align(N) — the declared alignment, the max-rule field offsets,
+#    the tail padding
+# ———————————————————————————————————————————————————————————————
+# @align(16) { u8 @ 0, u32 @ 16 } — the fields' offsets align to the max
+# of the field's own alignment and the declared 16 (per the C alignment
+# rules), and the total size tail-aligns to 16.
+def test_align_n_struct() -> Unit
+  let target = aarch64_target()
+  mut engine = layout_engine_new(target)
+  var fields = Vec::new()
+  fields.push(MirFieldDef { name: "a".to_string(), ty: Type::U8 })
+  fields.push(MirFieldDef { name: "b".to_string(), ty: Type::U32 })
+  var defs = Vec::new()
+  defs.push(make_struct(3, "Aligned16", fields, LayoutAttrs { is_repr_c: false, is_packed: false, align: Option::Some(16), span: span_dummy() }))
+  layout_engine_register_types(&mut engine, &defs)
+  compute_all_layouts(&mut engine)
+  let ty = Type::Adt(TypeId { id: 3 }, Vec::new())
+  check_eq(16, align_of(&mut engine, &ty), "A1: @align(16) alignment = 16")
+  check_eq(0, field_offset(&mut engine, &ty, 0), "A2: a @ 0")
+  check_eq(16, field_offset(&mut engine, &ty, 1), "A3: b @ 16 (max(field align 4, declared 16))")
+  check_eq(32, size_of(&mut engine, &ty), "A4: total size 32 (tail-aligned to 16)")
+  # @align(8) on a {u8, u32} struct: b @ 8 (max(4,8)), size 16.
+  var fields2 = Vec::new()
+  fields2.push(MirFieldDef { name: "a".to_string(), ty: Type::U8 })
+  fields2.push(MirFieldDef { name: "b".to_string(), ty: Type::U32 })
+  var defs2 = Vec::new()
+  defs2.push(make_struct(4, "Aligned8", fields2, LayoutAttrs { is_repr_c: false, is_packed: false, align: Option::Some(8), span: span_dummy() }))
+  layout_engine_register_types(&mut engine, &defs2)
+  compute_all_layouts(&mut engine)
+  let ty2 = Type::Adt(TypeId { id: 4 }, Vec::new())
+  check_eq(8, align_of(&mut engine, &ty2), "A5: @align(8) alignment = 8")
+  check_eq(8, field_offset(&mut engine, &ty2, 1), "A6: b @ 8 (max(4, 8))")
+  check_eq(16, size_of(&mut engine, &ty2), "A7: total size 16")
+  # @align(4) on the same shape: the natural layout (b @ 4, size 8).
+  var fields3 = Vec::new()
+  fields3.push(MirFieldDef { name: "a".to_string(), ty: Type::U8 })
+  fields3.push(MirFieldDef { name: "b".to_string(), ty: Type::U32 })
+  var defs3 = Vec::new()
+  defs3.push(make_struct(5, "Aligned4", fields3, LayoutAttrs { is_repr_c: false, is_packed: false, align: Option::Some(4), span: span_dummy() }))
+  layout_engine_register_types(&mut engine, &defs3)
+  compute_all_layouts(&mut engine)
+  let ty3 = Type::Adt(TypeId { id: 5 }, Vec::new())
+  check_eq(4, align_of(&mut engine, &ty3), "A8: @align(4) alignment = 4")
+  check_eq(4, field_offset(&mut engine, &ty3, 1), "A9: b @ 4 (max(4, 4) = the natural offset)")
+  check_eq(8, size_of(&mut engine, &ty3), "A10: total size 8")
+end
+
+# ———————————————————————————————————————————————————————————————
+# 3. @repr(C) — the C struct rules: natural offsets; the C-ABI
+#    classification (the 8-byte integer-class splitting)
+# ———————————————————————————————————————————————————————————————
+# { u8 @ 0, u32 @ 4, u64 @ 8 } — size 16, align 8 — identical to the
+# natural layout (the supported field types lay out the same under both
+# rules); the classification is the C aggregate rule.
+def test_repr_c_struct() -> Unit
+  let target = aarch64_target()
+  mut engine = layout_engine_new(target)
+  var fields = Vec::new()
+  fields.push(MirFieldDef { name: "a".to_string(), ty: Type::U8 })
+  fields.push(MirFieldDef { name: "b".to_string(), ty: Type::U32 })
+  fields.push(MirFieldDef { name: "c".to_string(), ty: Type::U64 })
+  var defs = Vec::new()
+  defs.push(make_struct(6, "CRepr", fields, LayoutAttrs { is_repr_c: true, is_packed: false, align: Option::None, span: span_dummy() }))
+  layout_engine_register_types(&mut engine, &defs)
+  compute_all_layouts(&mut engine)
+  let ty = Type::Adt(TypeId { id: 6 }, Vec::new())
+  check_eq(0, field_offset(&mut engine, &ty, 0), "C1: a @ 0")
+  check_eq(4, field_offset(&mut engine, &ty, 1), "C2: b @ 4 (natural alignment)")
+  check_eq(8, field_offset(&mut engine, &ty, 2), "C3: c @ 8 (natural alignment)")
+  check_eq(16, size_of(&mut engine, &ty), "C4: total size 16")
+  check_eq(8, align_of(&mut engine, &ty), "C5: alignment 8")
+  # The C-ABI classification: 16 bytes -> two INTEGER eightbytes.
+  match classify_value_category(&mut engine, &ty)
+  when Result::Ok(cat) then
+    match cat
+    when ValueCategory::ScalarPair(a, b) then
+      check_eq(8, a, "C6: C-repr 16-byte struct -> ScalarPair(8, 8) [0]")
+      check_eq(8, b, "C7: C-repr 16-byte struct -> ScalarPair(8, 8) [1]")
+    when _ then check(false, "C6/C7: C-repr 16-byte struct must classify ScalarPair(8, 8)")
+    end
+  when Result::Err(e) then check(false, "C6: classification failed: " + layout_error_to_string(&e))
+  end
+end
+
+# The C-ABI 12-byte rule: a C-repr (or packed) 12-byte aggregate spans two
+# INTEGER eightbytes -> ScalarPair(8, 8), while the NATIVE rule sends
+# 12-byte aggregates ByAddress — the exact divergence the C-ABI rules
+# define (the epoll_event shape).
+def test_c_abi_12_byte_classification() -> Unit
+  let target = aarch64_target()
+  mut engine = layout_engine_new(target)
+  # The packed 12-byte kernel epoll_event shape (packed IS the C layout).
+  var p_fields = Vec::new()
+  p_fields.push(MirFieldDef { name: "events".to_string(), ty: Type::U32 })
+  p_fields.push(MirFieldDef { name: "data".to_string(), ty: Type::UInt })
+  # The same shape un-attributed (the natural 16-byte padded layout).
+  var n_fields = Vec::new()
+  n_fields.push(MirFieldDef { name: "events".to_string(), ty: Type::U32 })
+  n_fields.push(MirFieldDef { name: "data".to_string(), ty: Type::UInt })
+  var defs = Vec::new()
+  defs.push(make_struct(7, "Packed12", p_fields, LayoutAttrs { is_repr_c: false, is_packed: true, align: Option::None, span: span_dummy() }))
+  defs.push(make_struct(8, "Natural12", n_fields, LayoutAttrs { is_repr_c: false, is_packed: false, align: Option::None, span: span_dummy() }))
+  layout_engine_register_types(&mut engine, &defs)
+  compute_all_layouts(&mut engine)
+  let pty = Type::Adt(TypeId { id: 7 }, Vec::new())
+  let nty = Type::Adt(TypeId { id: 8 }, Vec::new())
+  check_eq(12, size_of(&mut engine, &pty), "C8: packed shape size = 12")
+  check_eq(16, size_of(&mut engine, &nty), "C9: natural shape size = 16 (padded)")
+  match classify_value_category(&mut engine, &pty)
+  when Result::Ok(cat) then
+    match cat
+    when ValueCategory::ScalarPair(_, _) then check(true, "C10: packed 12-byte -> ScalarPair (the C two-eightbyte rule)")
+    when _ then check(false, "C10: packed 12-byte must classify ScalarPair(8, 8)")
+    end
+  when Result::Err(e) then check(false, "C10: classification failed: " + layout_error_to_string(&e))
+  end
+  match classify_value_category(&mut engine, &nty)
+  when Result::Ok(cat) then
+    match cat
+    when ValueCategory::ByAddress(_) then check(true, "C11: natural 12-byte -> ByAddress (the native rule)")
+    when _ then check(false, "C11: natural 12-byte must classify ByAddress")
+    end
+  when Result::Err(e) then check(false, "C11: classification failed: " + layout_error_to_string(&e))
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# 4. Nested packed aggregates — a @packed struct inside a natural
+#    (aligned) struct
+# ———————————————————————————————————————————————————————————————
+# Outer { a: u32 @ 0, inner: PackedOdd @ 4, b: u64 @ 17 } — the inner
+# record's alignment is 1 (packed), so the inner sits right after a (at
+# 4); the outer's own fields keep the natural alignment; the inner's
+# fields stay at their packed offsets (1 and 5 relative to the inner
+# base).
+def test_nested_packed() -> Unit
+  let target = aarch64_target()
+  mut engine = layout_engine_new(target)
+  var inner_fields = Vec::new()
+  inner_fields.push(MirFieldDef { name: "tag".to_string(), ty: Type::U8 })
+  inner_fields.push(MirFieldDef { name: "word".to_string(), ty: Type::U32 })
+  var outer_fields = Vec::new()
+  outer_fields.push(MirFieldDef { name: "a".to_string(), ty: Type::U32 })
+  outer_fields.push(MirFieldDef { name: "inner".to_string(), ty: Type::Adt(TypeId { id: 9 }, Vec::new()) })
+  outer_fields.push(MirFieldDef { name: "b".to_string(), ty: Type::U64 })
+  var defs = Vec::new()
+  defs.push(make_struct(9, "InnerPacked", inner_fields, LayoutAttrs { is_repr_c: false, is_packed: true, align: Option::None, span: span_dummy() }))
+  defs.push(make_struct(10, "OuterAligned", outer_fields, LayoutAttrs { is_repr_c: false, is_packed: false, align: Option::None, span: span_dummy() }))
+  layout_engine_register_types(&mut engine, &defs)
+  compute_all_layouts(&mut engine)
+  let ity = Type::Adt(TypeId { id: 9 }, Vec::new())
+  let oty = Type::Adt(TypeId { id: 10 }, Vec::new())
+  check_eq(5, size_of(&mut engine, &ity), "N1: inner packed size = 5 (1 + 4)")
+  check_eq(1, align_of(&mut engine, &ity), "N2: inner packed align = 1")
+  check_eq(1, field_offset(&mut engine, &ity, 1), "N3: inner packed u32 @ 1")
+  check_eq(0, field_offset(&mut engine, &oty, 0), "N4: outer a @ 0")
+  check_eq(4, field_offset(&mut engine, &oty, 1), "N5: outer inner @ 4 (the packed align 1 -> no padding)")
+  check_eq(9, field_offset(&mut engine, &oty, 2), "N6: outer b @ 9 (4 + 5, then aligned to 8)")
+  check_eq(16, size_of(&mut engine, &oty), "N7: outer size 16 (tail-aligned to 8)")
+  # The inner's unaligned word (absolute offset 5 = 4 + 1) — 5 % 4 != 0.
+  check(((4 + field_offset(&mut engine, &ity, 1)) % 4) != 0, "N8: inner packed u32 at an odd ABSOLUTE offset -> unaligned access")
+end
+
+# ———————————————————————————————————————————————————————————————
+# 5. @align(N) on an enum — the image alignment + tail padding
+# ———————————————————————————————————————————————————————————————
+def test_align_n_enum() -> Unit
+  let target = aarch64_target()
+  mut engine = layout_engine_new(target)
+  var variants = Vec::new()
+  var some_fields = Vec::new()
+  some_fields.push(Type::Int)
+  variants.push(MirVariantDef { name: "None".to_string(), discriminant: 0, fields: Vec::new() })
+  variants.push(MirVariantDef { name: "Some".to_string(), discriminant: 1, fields: some_fields })
+  var defs = Vec::new()
+  defs.push(MirTypeDef {
+    id: TypeId { id: 11 },
+    name: "AlignedOpt".to_string(),
+    kind: MirTypeDefKind::Enum(variants),
+    generic_params: Vec::new(),
+    layout: LayoutAttrs { is_repr_c: false, is_packed: false, align: Option::Some(16), span: span_dummy() }
+  })
+  layout_engine_register_types(&mut engine, &defs)
+  compute_all_layouts(&mut engine)
+  let ty = Type::Adt(TypeId { id: 11 }, Vec::new())
+  check_eq(16, align_of(&mut engine, &ty), "E1: @align(16) enum alignment = 16")
+  check_eq(32, size_of(&mut engine, &ty), "E2: enum image size 32 (16-byte image tail-aligned to 16)")
+  check_eq(0, discriminant_offset(&mut engine, &ty), "E3: tag stays @ 0 (the frozen F3 image)")
+  check_eq(8, payload_offset(&mut engine, &ty), "E4: payload stays @ 8 (the frozen F3 image)")
+end
+
+# ———————————————————————————————————————————————————————————————
+# 6. The plain record — no attribute changes the natural layout
+# ———————————————————————————————————————————————————————————————
+def test_plain_record_is_natural() -> Unit
+  let target = aarch64_target()
+  mut engine = layout_engine_new(target)
+  var fields = Vec::new()
+  fields.push(MirFieldDef { name: "a".to_string(), ty: Type::U8 })
+  fields.push(MirFieldDef { name: "b".to_string(), ty: Type::U32 })
+  var defs = Vec::new()
+  defs.push(make_struct(12, "Plain", fields, layout_attrs_plain(span_dummy())))
+  layout_engine_register_types(&mut engine, &defs)
+  compute_all_layouts(&mut engine)
+  let ty = Type::Adt(TypeId { id: 12 }, Vec::new())
+  check_eq(0, field_offset(&mut engine, &ty, 0), "Z1: plain a @ 0")
+  check_eq(4, field_offset(&mut engine, &ty, 1), "Z2: plain b @ 4 (natural)")
+  check_eq(8, size_of(&mut engine, &ty), "Z3: plain size 8")
+  check_eq(4, align_of(&mut engine, &ty), "Z4: plain align 4")
+end
+
+# ———————————————————————————————————————————————————————————————
+# 7. The attribute validation — the E109 shape/exclusivity errors and
+#    the checker's alignment-overflow bound
+# ———————————————————————————————————————————————————————————————
+# The parser rejects the invalid shapes/combos (fail closed at parse
+# time); the checker re-validates the recorded attributes and adds the
+# alignment-overflow bound. Every rejection below must produce an
+# error-level diagnostic.
+
+# Parse a source snippet and assert it produced an error-level diagnostic
+# containing `substr`.
+def parse_rejects(source: String, substr: String, name: String) -> Unit
+  let lexed = tokenize(source, "packed_align_engine_test.tg".to_string())
+  let out = parse(lexed)
+  var found = false
+  for d in out.diagnostics do
+    if d.message.contains(substr) then
+      found = true
+    end
+  end
+  check(found, name + " (diagnostic containing '" + substr + "')")
+  check(diag_has_errors(out.diagnostics), name + " (error-level diagnostic present)")
+end
+
+def test_attribute_validation() -> Unit
+  # @packed with @align(N) — the exclusivity rule.
+  parse_rejects("@packed\n@align(4)\nstruct Bad\n  a: u32\nend\n", "@packed and @align(N) are mutually exclusive", "V1: @packed + @align rejected")
+  # @repr(C) with @packed — the exclusivity rule.
+  parse_rejects("@repr(C)\n@packed\nstruct Bad2\n  a: u32\nend\n", "@repr(C) and @packed are mutually exclusive", "V2: @repr(C) + @packed rejected")
+  # @align with a non-power-of-two N.
+  parse_rejects("@align(3)\nstruct Bad3\n  a: u32\nend\n", "power of two", "V3: @align(3) rejected (not a power of two)")
+  # @align with a non-integer argument.
+  parse_rejects("@align(x)\nstruct Bad4\n  a: u32\nend\n", "integer alignment", "V4: @align(x) rejected (non-integer)")
+  # @repr with a non-C spelling.
+  parse_rejects("@repr(Rust)\nstruct Bad5\n  a: u32\nend\n", "@repr(C)", "V5: @repr(Rust) rejected (only @repr(C))")
+  # The checker's alignment-overflow bound: @align above the supported
+  # maximum is a semantic error (never a silent degrade).
+  let target = aarch64_target()
+  mut env = type_env_new()
+  validate_layout_attrs(&mut env, LayoutAttrs { is_repr_c: false, is_packed: false, align: Option::Some(1 << 20), span: span_dummy() })
+  check(env.errors.len() > 0, "V6: the checker rejects @align(2^20) — the alignment-overflow bound")
+  # The plain record and the legal combos pass the validation silently.
+  validate_layout_attrs(&mut env, LayoutAttrs { is_repr_c: true, is_packed: false, align: Option::None, span: span_dummy() })
+  validate_layout_attrs(&mut env, LayoutAttrs { is_repr_c: false, is_packed: false, align: Option::Some(16), span: span_dummy() })
+  validate_layout_attrs(&mut env, LayoutAttrs { is_repr_c: false, is_packed: true, align: Option::None, span: span_dummy() })
+  validate_layout_attrs(&mut env, layout_attrs_plain(span_dummy()))
+  check(env.errors.len() == 1, "V7: the legal records pass the semantic validation (only the overflow error remains)")
+end
+
+# ———————————————————————————————————————————————————————————————
+# Main
+# ———————————————————————————————————————————————————————————————
+
+def main() -> Int
+  println("========================================")
+  println("Attributed-Layout Engine Suite (@repr(C)/@align(N)/@packed)")
+  println("========================================")
+  println("\n--- 1. @packed ---")
+  test_packed_struct()
+  test_packed_odd_offset_unaligned()
+  println("\n--- 2. @align(N) ---")
+  test_align_n_struct()
+  println("\n--- 3. @repr(C) + the C-ABI classification ---")
+  test_repr_c_struct()
+  test_c_abi_12_byte_classification()
+  println("\n--- 4. Nested packed aggregates ---")
+  test_nested_packed()
+  println("\n--- 5. @align(N) enums ---")
+  test_align_n_enum()
+  println("\n--- 6. The plain record ---")
+  test_plain_record_is_natural()
+  println("\n--- 7. The attribute validation (E109 + the overflow bound) ---")
+  test_attribute_validation()
+  println("\n========================================")
+  println("Results: " + tests_passed.to_string() + " passed, " + tests_failed.to_string() + " failed")
+  println("========================================")
+  if tests_failed > 0 then
+    panic("PACKED/ALIGN ENGINE TESTS FAILED")
+  end
+  0
+end

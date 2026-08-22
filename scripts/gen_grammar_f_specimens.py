@@ -9,26 +9,40 @@
 #                                  construct alone, compiles cleanly)
 #   pos/<prod>_nested.tg           the positive program with the construct
 #                                  NESTED inside another construct
-#   neg/<prod>_before.tg           the minimal positive with a parse error
-#                                  inserted BEFORE the construct (the
-#                                  parser must still reject the program —
-#                                  the construct cannot swallow the error)
-#   neg/<prod>_after.tg            the minimal positive with a parse error
-#                                  inserted AFTER the construct (the parser
-#                                  must still reject the program — the
-#                                  construct cannot swallow what follows)
+#   neg/<prod>_before.tg           the PRODUCTION-SPECIFIC malformation of
+#                                  the production placed BEFORE the
+#                                  construct (the parser must still reject
+#                                  the program — the construct cannot
+#                                  swallow the error)
+#   neg/<prod>_after.tg            the PRODUCTION-SPECIFIC malformation of
+#                                  the production placed AFTER the
+#                                  construct (the parser must still reject
+#                                  the program — the construct cannot
+#                                  swallow what follows)
+#
+# The negative specimens are NOT the generic stray-paren mutation: the
+# reviewer (item 10) rejected the weak generic `)` negatives. Every
+# production's negatives are the production's OWN grammar violations from
+# the per-production MALFORMATIONS catalog below (the wrong arity / the
+# wrong keyword / the missing clause / the malformed internal structure —
+# the production's own rule text is the catalog's ground). The gate
+# (scripts/check_grammar_f_gate.sh) mechanically backstops the catalog: a
+# negative file containing a bare `)` line FAILS (the generic stray paren
+# is forbidden), and the malformation block's position relative to the
+# construct marker is verified (BEFORE in the before file, AFTER in the
+# after file).
 #
 # The positive templates live HERE (the generator is the single source of
-# truth); the negative specimens are deterministic mutations of the
-# minimal positives (a stray `)` line, the always-rejected token). The
-# gate (scripts/check_grammar_f_gate.sh) regenerates the whole corpus into
-# a temp dir and diffs it against tests/grammar_f (the generate-then-diff
-# discipline), then compiles the positives and rejects the negatives.
+# truth); the gate regenerates the whole corpus into a temp dir and diffs
+# it against tests/grammar_f (the generate-then-diff discipline), then
+# compiles the positives and rejects the negatives.
 #
 # Every template carries the marker line the gate scans for:
 #   # gate-f: <prod> minimal-positive / nested-positive
 # The neg files carry:
 #   # gate-f: <prod> invalid-before / invalid-after
+# and the malformation block carries:
+#   # gate-f: <prod> malformed
 #
 # The `verify` mode per production (from grammar_facts.toml): "check" — the
 # positive specimens must pass `tg check`; "parse" — the production is
@@ -39,8 +53,8 @@
 #
 # Usage: scripts/gen_grammar_f_specimens.py [--out DIR]
 #   DIR defaults to <repo>/tests/grammar_f. Fails (exit 1) when a
-#   production in the facts has no template — an uncovered production can
-#   never be shipped silently.
+#   production in the facts has no template OR no malformation catalog
+#   entry — an uncovered production can never be shipped silently.
 
 import os
 import re
@@ -50,7 +64,15 @@ import tomllib
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FACTS = os.path.join(ROOT, "docs", "current", "grammar_facts.toml")
 
-INVALID_LINE = ")"
+# The per-production malformation catalog — the reviewer's item 10
+# strengthening. For every production: (before_snippet, after_snippet),
+# the production's OWN grammar violations (the wrong arity / the wrong
+# keyword / the missing clause / the malformed internal structure —
+# grounded in the production's rule text in grammar_facts.toml). The
+# generic stray-paren negative is GONE: a production without a catalog
+# entry fails the generation, and the gate backstops a bare `)` line.
+# Each snippet is a standalone construct (top-level or a full wrapper
+# containing the violation) that the compiler MUST reject.
 
 # ———————————————————————————————————————————————————————————————
 # The positive templates. For each production: (minimal, nested).
@@ -1679,19 +1701,575 @@ end
 }
 
 
-def mutate_before(minimal: str, prod: str) -> str:
+MALFORMATIONS = {
+    # access_marker — the marker requires an operand; a dangling marker is
+    # the production's own violation.
+    "access_marker": (
+        "gate_f_access_helper(&)",
+        "gate_f_access_helper(&mut)",
+    ),
+    # arg_list — wrong arity / unterminated list.
+    "arg_list": (
+        "gate_f_arg_list_helper(1, 2, 3)",
+        "gate_f_arg_list_helper(1, 2,",
+    ),
+    # assignment — missing operator / doubled operator.
+    "assignment": (
+        "x 5",
+        "x = = 5",
+    ),
+    # async_block — wrong keyword / missing clause (end).
+    "async_block": (
+        "sync do 1 end",
+        "async do 1",
+    ),
+    # attribute — dangling marker / doubled marker.
+    "attribute": (
+        "@",
+        "@@inline",
+    ),
+    # attribute_args — unterminated parens / attribute with no name.
+    "attribute_args": (
+        "@derive(Clone",
+        "@(Clone)",
+    ),
+    # bitwise_and — missing operator / missing operand.
+    "bitwise_and": (
+        "a b",
+        "a &",
+    ),
+    # bitwise_or — missing operator / missing operand.
+    "bitwise_or": (
+        "a b",
+        "a |",
+    ),
+    # bitwise_xor — missing operator / missing operand.
+    "bitwise_xor": (
+        "a b",
+        "a ^",
+    ),
+    # block_expr — an extra closing end / a missing closing end.
+    "block_expr": (
+        "do 3 end end",
+        "do 3",
+    ),
+    # break_expr — trailing junk after the optional operand / an
+    # incomplete operand expression.
+    "break_expr": (
+        "break 1 2",
+        "break 1 +",
+    ),
+    # budget_amount — the amount must be a STRING_LITERAL.
+    "budget_amount": (
+        '@budget cpu: "10',
+        "@budget cpu: 10",
+    ),
+    # capability_decl — missing name / dangling implies.
+    "capability_decl": (
+        "cap",
+        "cap GateFBad implies",
+    ),
+    # closure_expr — missing closing pipe / a nameless parameter.
+    "closure_expr": (
+        "|x: Int x * 2",
+        "|: Int| x",
+    ),
+    # closure_param — colon without a type / missing colon.
+    "closure_param": (
+        "|x: | x",
+        "|x Int| x",
+    ),
+    # closure_params — doubled comma / a trailing comma (not allowed in
+    # closure_params, unlike arg_list).
+    "closure_params": (
+        "|x: Int,, y: Int| 1",
+        "|x: Int, | 1",
+    ),
+    # comparison — missing operator / missing operand.
+    "comparison": (
+        "a b",
+        "a <",
+    ),
+    # comptime_block — missing do / missing end.
+    "comptime_block": (
+        "comptime 1 end",
+        "comptime do 1",
+    ),
+    # const_decl — missing colon / missing the = expr clause.
+    "const_decl": (
+        "const GATE_F_BAD Int = 5",
+        "const GATE_F_BAD: Int",
+    ),
+    # convention — the legacy mut prefix (E100) / a wrong keyword.
+    "convention": (
+        "def gate_f_convention_bad(g: fn(mut Int) -> Int) -> Int\n  g(1)\nend",
+        "def gate_f_convention_bad(g: fn(inoutt Int) -> Int) -> Int\n  g(1)\nend",
+    ),
+    # defer_block — missing do / an empty deferred block.
+    "defer_block": (
+        "defer x = x + 1 end",
+        "defer do",
+    ),
+    # deinit_def — the receiver loses the sink convention / the body's
+    # closing end is missing.
+    "deinit_def": (
+        "resource GateFBadDeinit\n  v: Int\n\n  def deinit(self: Self) -> Unit\n    ()\n  end\nend",
+        "resource GateFBadDeinit\n  v: Int\n\n  def deinit(sink self: Self) -> Unit\n    ()",
+    ),
+    # edition_decl — missing the string / an unquoted edition.
+    "edition_decl": (
+        "edition",
+        "edition 2026",
+    ),
+    # effect_decl — missing name / an unterminated op signature.
+    "effect_decl": (
+        "effect",
+        "effect GateFBad\n  op( -> Int\nend",
+    ),
+    # effect_op_sig — the arrow with no type / a trailing token.
+    "effect_op_sig": (
+        "effect GateFBad\n  op1(path: String) ->\nend",
+        "effect GateFBad\n  op1() -> Int Int\nend",
+    ),
+    # enum_def — wrong keyword / an unterminated variant payload.
+    "enum_def": (
+        "enumt gate_f_enum_bad",
+        "enum gate_f_enum_bad\n  A\n  B(Int,",
+    ),
+    # equality — missing operator / missing operand.
+    "equality": (
+        "a b",
+        "a ==",
+    ),
+    # expr — an incomplete expression / a doubled operator.
+    "expr": (
+        "let v = 1 +",
+        "let v = = 2",
+    ),
+    # expr_statement — unterminated call / a call without parens.
+    "expr_statement": (
+        "gate_f_expr_stmt_helper(1",
+        "gate_f_expr_stmt_helper 1",
+    ),
+    # extern_item — the arrow with no type / a static without its type.
+    "extern_item": (
+        "extern def gate_f_extern_bad(x: Int) ->",
+        "extern static GATE_F_EXTERN_BAD",
+    ),
+    # factor — missing operator / missing operand.
+    "factor": (
+        "a b",
+        "a *",
+    ),
+    # field_def — missing colon / missing type.
+    "field_def": (
+        "struct GateFBad\n  x Int\nend",
+        "struct GateFBad\n  x: \nend",
+    ),
+    # field_init — the colon with no expr / a missing colon.
+    "field_init": (
+        "gate_f_field_init { x: }",
+        "gate_f_field_init { x 1 }",
+    ),
+    # field_init_list — missing comma / a field with no value.
+    "field_init_list": (
+        "gate_f_field_init_list_bad { x: 1 y: 2 }",
+        "gate_f_field_init_list_bad { x: 1, y: 2, z: }",
+    ),
+    # field_pattern — the colon with no pattern / a missing comma.
+    "field_pattern": (
+        "gate_f_field_pattern_bad { x: }",
+        "gate_f_field_pattern_bad { x y }",
+    ),
+    # field_pattern_list — missing comma / a trailing comma (not allowed).
+    "field_pattern_list": (
+        "gate_f_field_pattern_list_bad { x, y x }",
+        "gate_f_field_pattern_list_bad { x, y, }",
+    ),
+    # fn_clause — an incomplete pre expr / a missing clause expr.
+    "fn_clause": (
+        "def gate_f_fn_clause_bad(x: Int) -> Int pre x >\n  x\nend",
+        "def gate_f_fn_clause_bad(x: Int) -> Int pre\n  x\nend",
+    ),
+    # fn_modifier — a wrong keyword in the modifier position.
+    "fn_modifier": (
+        "unsafely def gate_f_fn_modifier_bad() -> Int\n  0\nend",
+        "safe def gate_f_fn_modifier_bad() -> Int\n  0\nend",
+    ),
+    # fn_type — missing comma / the arrow with no return type.
+    "fn_type": (
+        "def gate_f_fn_type_bad(g: fn(Int Int) -> Int) -> Int\n  g(1)\nend",
+        "def gate_f_fn_type_bad(g: fn(Int) ->) -> Int\n  g(1)\nend",
+    ),
+    # fn_type_param — a wrong convention keyword / a missing comma.
+    "fn_type_param": (
+        "def gate_f_fn_type_param_bad(g: fn(inoutt Int) -> Int) -> Int\n  g(1)\nend",
+        "def gate_f_fn_type_param_bad(g: fn(Int Int) -> Int) -> Int\n  g(1)\nend",
+    ),
+    # for_expr — missing pattern / missing in.
+    "for_expr": (
+        "for in 0..3 do 1 end",
+        "for i 0..3 do 1 end",
+    ),
+    # function_def — missing arrow / missing the body's closing end.
+    "function_def": (
+        "def gate_f_function_def_bad(x: Int) Int\n  x\nend",
+        "def gate_f_function_def_bad(x: Int) -> Int\n  x",
+    ),
+    # function_sig — missing arrow / the arrow with no type.
+    "function_sig": (
+        "trait GateFBad\n  def f(self: GateFBad) Int\nend",
+        "trait GateFBad\n  def f(self: GateFBad) ->\nend",
+    ),
+    # guard_stmt — missing else / a dangling else.
+    "guard_stmt": (
+        "guard x > 0 return 0",
+        "guard x > 0 else",
+    ),
+    # handle_with_expr (parse-mode) — with without an op name / with
+    # without its do block.
+    "handle_with_expr": (
+        "def gate_f_handle_bad() -> Int\n  handle 1 with do\n    x\n  end\n  0\nend",
+        "def gate_f_handle_bad() -> Int\n  handle 1 with op x\n  0\nend",
+    ),
+    # if_expr — missing condition / an extra closing end (the short form
+    # makes a missing end legal, so the violation is the doubled end).
+    "if_expr": (
+        "if then 1 else 2 end",
+        "if c then 1 else 2 end end",
+    ),
+    # if_let — missing the = / a missing end (no short form for if_let).
+    "if_let": (
+        "if let Option::Some(v) o then 1 else 0 end",
+        "if let Option::Some(v) = o then 1 else 0",
+    ),
+    # impl_block — missing type / a dangling for.
+    "impl_block": (
+        "impl",
+        "impl gate_f_impl_bad for",
+    ),
+    # impl_item — missing arrow / a nameless type item.
+    "impl_item": (
+        "impl GateFBad\n  def get(self: GateFBad) Int\n    self.v\n  end\nend",
+        "impl GateFBad\n  type = Int\nend",
+    ),
+    # item — malformed params / a malformed field.
+    "item": (
+        "def gate_f_item_bad( -> Int\n  0\nend",
+        "struct gate_f_item_bad\n  v Int\nend",
+    ),
+    # literal_pattern — an unterminated string literal / two literals.
+    "literal_pattern": (
+        'when "unterminated then 0',
+        "when 1 1 then 0",
+    ),
+    # local_decl — missing = / a dangling =.
+    "local_decl": (
+        "let x 1",
+        "var y =",
+    ),
+    # logical_and — missing operator / missing operand.
+    "logical_and": (
+        "a b",
+        "a &&",
+    ),
+    # logical_or — missing operator / missing operand.
+    "logical_or": (
+        "a b",
+        "a ||",
+    ),
+    # loop_expr — missing do / a missing closing end.
+    "loop_expr": (
+        "loop i = i + 1 end",
+        "def gate_f_loop_bad() -> Int\n  var i = 0\n  loop do\n    i = i + 1\n    if i >= 3 then break end\n  end",
+    ),
+    # macro_decl — missing colon / a missing closing end.
+    "macro_decl": (
+        "macro gate_f_bad(x Expr)\n  (x)\nend",
+        "macro gate_f_bad(x: Expr)\n  (x)",
+    ),
+    # macro_param — a non-vocabulary macro type / a missing macro type.
+    "macro_param": (
+        "macro gate_f_bad(x: Exprt)\n  (x)\nend",
+        "macro gate_f_bad(x:)\n  (x)\nend",
+    ),
+    # macro_type — outside the vocabulary / wrong case.
+    "macro_type": (
+        "macro gate_f_bad(x: Stmt)\n  (x)\nend",
+        "macro gate_f_bad(x: expr)\n  (x)\nend",
+    ),
+    # match_arm — missing pattern / a dangling =>.
+    "match_arm": (
+        "when then 1",
+        "0 =>",
+    ),
+    # match_expr — missing scrutinee / a missing closing end.
+    "match_expr": (
+        "match",
+        "match n\n  when 0 then 1",
+    ),
+    # name_list — missing comma / a trailing comma (not allowed).
+    "name_list": (
+        "use std::collections::{Vec Map}",
+        "use std::collections::{Vec,}",
+    ),
+    # named_arg — missing colon / a missing label.
+    "named_arg": (
+        "gate_f_named_arg_helper(x: 1, y 2)",
+        "gate_f_named_arg_helper(x: 1, : 2)",
+    ),
+    # param — missing colon / a convention with no name.
+    "param": (
+        "def gate_f_param_bad(inout x Int) -> Int\n  x\nend",
+        "def gate_f_param_bad(inout) -> Int\n  x\nend",
+    ),
+    # param_list — missing comma / a doubled comma.
+    "param_list": (
+        "def gate_f_param_list_bad(a: Int b: Int) -> Int\n  a + b\nend",
+        "def gate_f_param_list_bad(a: Int, , b: Int) -> Int\n  a + b\nend",
+    ),
+    # path — a dangling ::.
+    "path": (
+        "use std::core::Option::",
+        "use std::core::",
+    ),
+    # path_segment — a numeric segment / a keyword segment.
+    "path_segment": (
+        "use std::core::123",
+        "use std::core::Option::mut",
+    ),
+    # pattern — a dangling or-pipe / an or-pipe with no operands.
+    "pattern": (
+        "let x | = 1",
+        "let | = 1",
+    ),
+    # postfix — an unterminated call / a dangling dot.
+    "postfix": (
+        "s.len(",
+        "s.",
+    ),
+    # postfix_op — a leading comma in the call / a doubled dot.
+    "postfix_op": (
+        "s.len(,)",
+        "s..len()",
+    ),
+    # primary — two adjacent primaries / an incomplete expression.
+    "primary": (
+        "let v = 42 43",
+        "let v = 42 +",
+    ),
+    # program — malformed params / an extra closing end.
+    "program": (
+        "def gate_f_program_bad( -> Int\n  0\nend",
+        "def gate_f_program_bad() -> Int\n  0\nend end",
+    ),
+    # range — missing the .. / a dangling ...
+    "range": (
+        "for i in 0 3 do 1 end",
+        "for i in 0.. do 1 end",
+    ),
+    # range_pattern — a dangling .. / a trailing literal.
+    "range_pattern": (
+        "when 1.. then 10",
+        "when 1..5 6 then 10",
+    ),
+    # rationale_block — a missing closing end / a value-less field.
+    "rationale_block": (
+        "rationale\n  why: \"gate f\"",
+        "rationale\n  why:",
+    ),
+    # rationale_field — a nameless field / a missing colon.
+    "rationale_field": (
+        'rationale\n  "gate f"\nend',
+        'rationale\n  why "gate f"\nend',
+    ),
+    # raw_deref — a dangling star / trailing junk after the deref.
+    "raw_deref": (
+        "let v = *",
+        "let v = *p p",
+    ),
+    # resource_def — missing colon / a missing closing end.
+    "resource_def": (
+        "resource gate_f_bad\n  v Int\nend",
+        "resource gate_f_bad\n  v: Int",
+    ),
+    # return_expr — trailing junk / a dangling =.
+    "return_expr": (
+        "def gate_f_return_bad() -> Int\n  return x y\nend",
+        "def gate_f_return_bad() -> Int\n  return = x\nend",
+    ),
+    # shift — missing operator / missing operand.
+    "shift": (
+        "a b",
+        "a <<",
+    ),
+    # single_pattern — two adjacent patterns / an empty tuple pattern.
+    "single_pattern": (
+        "when _ _ then 0",
+        "when (,) then 0",
+    ),
+    # statement — a missing pattern / a missing =.
+    "statement": (
+        "def gate_f_statement_bad() -> Int\n  let = 1\n  1\nend",
+        "def gate_f_statement_bad() -> Int\n  let x 1\n  1\nend",
+    ),
+    # static_decl — missing colon / missing the = expr clause.
+    "static_decl": (
+        "static GATE_F_BAD Int = 5",
+        "static GATE_F_BAD: Int",
+    ),
+    # struct_def — a missing closing end / a body-less struct.
+    "struct_def": (
+        "struct gate_f_bad\n  v: Int",
+        "struct gate_f_bad",
+    ),
+    # struct_literal — an unterminated list / a missing comma.
+    "struct_literal": (
+        "gate_f_struct_literal { x: 1, y: 2",
+        "gate_f_struct_literal { x: 1 y: 2 }",
+    ),
+    # supertrait_list — a dangling + / a leading +.
+    "supertrait_list": (
+        "trait GateFBad: gate_f_supertrait_base +",
+        "trait GateFBad: + gate_f_supertrait_base",
+    ),
+    # term — missing operator / missing operand.
+    "term": (
+        "a b",
+        "a +",
+    ),
+    # trailing_block — an unterminated block / an empty closure body.
+    "trailing_block": (
+        "items.map { |x| x * 2",
+        "items.map { |x| }",
+    ),
+    # trait_def — missing arrow / a missing closing end.
+    "trait_def": (
+        "trait GateFBad\n  def f(self: GateFBad) Int\nend",
+        "trait GateFBad\n  def f(self: GateFBad) -> Int",
+    ),
+    # trait_item — missing arrow / a nameless type item.
+    "trait_item": (
+        "trait GateFBad\n  def f(self: GateFBad) Int\nend",
+        "trait GateFBad\n  type : Copy\nend",
+    ),
+    # try_expr (parse-mode) — a catch without a pattern / a missing
+    # closing end.
+    "try_expr": (
+        "def gate_f_try_bad() -> Int\n  try do\n    1\n  catch do\n    2\n  end\nend",
+        "def gate_f_try_bad() -> Int\n  try do\n    1\n  catch _ do\n    2\n  end",
+    ),
+    # type_alias — missing = / a dangling =.
+    "type_alias": (
+        "type GateFBad Int",
+        "type GateFBad =",
+    ),
+    # type_args — an unterminated list / an empty list.
+    "type_args": (
+        "def gate_f_type_args_bad(x: Vec[Int) -> Int\n  x.len()\nend",
+        "def gate_f_type_args_bad(x: Vec[]) -> Int\n  x.len()\nend",
+    ),
+    # type_bound — a dangling + / a leading +.
+    "type_bound": (
+        "def gate_f_type_bound_bad[T: Copy +](x: T) -> T\n  x\nend",
+        "def gate_f_type_bound_bad[T: + Eq](x: T) -> T\n  x\nend",
+    ),
+    # type_expr — the arrow with no type / a typeless parameter.
+    "type_expr": (
+        "def gate_f_type_bad(x: Int) ->\n  x\nend",
+        "def gate_f_type_bad(x:) -> Int\n  x\nend",
+    ),
+    # type_param — a missing bound / a missing colon.
+    "type_param": (
+        "def gate_f_type_param_bad[T: ](x: T) -> T\n  x\nend",
+        "def gate_f_type_param_bad[T Copy](x: T) -> T\n  x\nend",
+    ),
+    # type_params — a doubled comma / a missing comma.
+    "type_params": (
+        "def gate_f_type_params_bad[T,, U](x: T, y: U) -> T\n  x\nend",
+        "def gate_f_type_params_bad[U: Copy T](x: U) -> U\n  x\nend",
+    ),
+    # type_primary — a numeric type / an empty type-args list.
+    "type_primary": (
+        "def gate_f_type_primary_bad(x: 123) -> Int\n  0\nend",
+        "def gate_f_type_primary_bad(x: Vec[]) -> Int\n  0\nend",
+    ),
+    # unary — a dangling operator / two adjacent operands.
+    "unary": (
+        "-",
+        "- a b",
+    ),
+    # unless_expr — missing condition / an extra closing end.
+    "unless_expr": (
+        "unless then 1 else 2 end",
+        "unless c then 1 else 2 end end",
+    ),
+    # unsafe_block — missing do / a missing closing end.
+    "unsafe_block": (
+        "unsafe 1 end",
+        "unsafe do 1",
+    ),
+    # until_expr — missing condition / a missing closing end.
+    "until_expr": (
+        "until do i = i + 1 end",
+        "until i >= 3 do i = i + 1",
+    ),
+    # use_decl — a dangling as / an invalid alias.
+    "use_decl": (
+        "use std::core::Option as",
+        "use std::core::Option as 123",
+    ),
+    # variant_def — a nameless variant / a missing comma in the payload.
+    "variant_def": (
+        "enum GateFBad\n  (Int)\nend",
+        "enum GateFBad\n  A(Int)\n  B(Int Int)\nend",
+    ),
+    # variant_field — two types / a missing type.
+    "variant_field": (
+        "enum GateFBad\n  C(v: Int Int)\nend",
+        "enum GateFBad\n  C(v: )\nend",
+    ),
+    # vis — the wrong keyword / a doubled visibility.
+    "vis": (
+        "public def gate_f_vis_bad() -> Int\n  0\nend",
+        "pubpub def gate_f_vis_bad() -> Int\n  0\nend",
+    ),
+    # where_clause — missing colon / a missing type.
+    "where_clause": (
+        "def gate_f_where_clause_bad[T](x: T) -> T where T Copy\n  x\nend",
+        "def gate_f_where_clause_bad[T](x: T) -> T where : Copy\n  x\nend",
+    ),
+    # where_pred — missing comma / a missing type.
+    "where_pred": (
+        "def gate_f_where_pred_bad[T, U](a: T, b: U) -> T where T: Copy U: Copy\n  a\nend",
+        "def gate_f_where_pred_bad[T](x: T) -> T where T: Copy, : Eq\n  x\nend",
+    ),
+    # while_expr — missing condition / a missing closing end.
+    "while_expr": (
+        "while do i = i + 1 end",
+        "while i < 3 do i = i + 1",
+    ),
+}
+
+
+def malformed_block(prod: str, minimal: str, kind: str) -> str:
+    """The production-specific malformation block: the marker line plus
+    the catalog snippet, then the embedded minimal positive."""
+    if prod not in MALFORMATIONS:
+        raise SystemExit(
+            "gen_grammar_f: production %r has no malformation catalog entry — "
+            "the generic stray-paren negative is forbidden (the reviewer's "
+            "item 10); every production needs its own grammar violation" % prod)
+    before_snippet, after_snippet = MALFORMATIONS[prod]
+    snippet = before_snippet if kind == "before" else after_snippet
     marker = "# gate-f: %s minimal-positive" % prod
     lines = minimal.split("\n")
     idx = next((i for i, l in enumerate(lines) if l.lstrip().startswith(marker)), None)
     if idx is None:
         raise SystemExit("gen_grammar_f: minimal template for %r has no marker line" % prod)
-    out = lines[:idx] + [INVALID_LINE] + lines[idx:]
-    return "\n".join(out)
-
-
-def mutate_after(minimal: str, prod: str) -> str:
-    out = minimal.rstrip("\n").split("\n") + [INVALID_LINE]
-    return "\n".join(out)
+    if kind == "before":
+        return "# gate-f: %s malformed\n%s\n\n%s" % (prod, snippet, minimal)
+    return "%s\n\n# gate-f: %s malformed\n%s" % (minimal, prod, snippet)
 
 
 def gen(out_dir: str) -> None:
@@ -1737,20 +2315,24 @@ def gen(out_dir: str) -> None:
             "# (generated by scripts/gen_grammar_f_specimens.py — do not edit)\n"
             "# production: %(prod)s  verify: %(verify)s\n"
             "# gate-f: %(prod)s invalid-before\n"
-            "# The parse error line is inserted BEFORE the construct; the\n"
-            "# parser must still reject the program.\n" % {
+            "# The PRODUCTION-SPECIFIC malformation (the production's own grammar\n"
+            "# violation from the per-production catalog — the wrong arity / the\n"
+            "# wrong keyword / the missing clause) is placed BEFORE the construct;\n"
+            "# the parser must still reject the program.\n" % {
                 "prod": prod, "verify": verify})
-        write(os.path.join(neg_dir, prod + "_before.tg"), before + mutate_before(minimal, prod))
+        write(os.path.join(neg_dir, prod + "_before.tg"), before + malformed_block(prod, minimal, "before"))
 
         after = (
             "# tests/grammar_f/neg/%(prod)s_after.tg — Gate F invalid-after specimen\n"
             "# (generated by scripts/gen_grammar_f_specimens.py — do not edit)\n"
             "# production: %(prod)s  verify: %(verify)s\n"
             "# gate-f: %(prod)s invalid-after\n"
-            "# The parse error line is inserted AFTER the construct; the\n"
-            "# parser must still reject the program.\n" % {
+            "# The PRODUCTION-SPECIFIC malformation (the production's own grammar\n"
+            "# violation from the per-production catalog — the wrong arity / the\n"
+            "# wrong keyword / the missing clause) is placed AFTER the construct;\n"
+            "# the parser must still reject the program.\n" % {
                 "prod": prod, "verify": verify})
-        write(os.path.join(neg_dir, prod + "_after.tg"), after + mutate_after(minimal, prod))
+        write(os.path.join(neg_dir, prod + "_after.tg"), after + malformed_block(prod, minimal, "after"))
 
     print("gen_grammar_f: %d production(s) x 4 specimens -> %s" % (len(productions), out_dir))
 

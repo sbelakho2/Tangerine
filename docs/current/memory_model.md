@@ -364,9 +364,10 @@ move/sink (transfer).
   duplicate the owned buffer without the required clone), the builtin
   containers (Vec/Array/Map/Set — including Vec's registered shape
   `{ ptr: Ptr[T], len, cap }`, whose Ptr field must not be walked),
-  the RAW Slice view (UnsafeSlice — the builtin Slice's `{ptr,len}` words
+  the RAW view (UnsafeSlice — the builtin's `{ptr,len}` words
   are structurally copyable but the view borrows; the raw view is
-  unsafe/FFI-only), the SAFE shared/pinned views (SharedSlice/StrView —
+  unsafe/FFI-only), the SAFE shared/pinned views (the source-spelled
+  Slice / StrView —
   the ArcStrong field makes them owning, never bit-copyable),
   the owning smart pointers (Box/Rc by LangItems id; UniquePtr/WeakRc/
   ArcStrong/WeakArc by name), resources and capabilities
@@ -610,22 +611,13 @@ are **gone**. The shape is:
 - **`Dyn(TypeId)`** — trait objects; **`Effect(Vec[String], Type)`**;
   **`Tuple(Vec[Type])`**; **`Var(TypeVarId)`**; **`Param(String)`**;
   **`Error`**.
-- **`Slice`** is a registered builtin Opaque generic Adt (the LangItems
-  `slice` id is the special-behavior selector) — the **RAW view**: the
-  16-byte borrowed `{ ptr: Ptr[T], len: UInt }` fat value
-  (`slice_view_layout` in layout_engine.tg), source-spelled
-  **`UnsafeSlice[T]`** (the registered name stays `Slice` for the
-  name-based layout/MIR matching). The raw view is the **unsafe/FFI-only
-  form**: safe code cannot produce it, and its escapes are the P0-SL-
-  rejected cases (the escape channels in types.tg + the live-view
-  registry in resource_check.tg). The only raw views safe code ever sees
-  are the compiler-scoped loop-consumed iterable forms (chars/bytes/
-  split/iter/keys/values — consumed by the enclosing for-loop) and the
-  compiler-manufactured literal coercion behind `vec!`.
-  **The SAFE Slice is the shared/pinned form** — the std-declared
-  `SharedSlice[T] { inner: ArcStrong[SliceBacking[T]] }` (std/collections.tg;
-  the reviewer's shared/pinned backing — no lifetime inference). The
-  backing record = the pinned buffer + the window's offset/len:
+- **`Slice`** — THE ONE-REPRESENTATION AUTHORITY (the P0 safe-view
+  closure): the SOURCE-spelled `Slice[T]` (and the `[T]` sugar) IS the
+  SAFE **shared/pinned form** — the std-declared struct
+  `Slice[T] { inner: ArcStrong[SliceBacking[T]] }`
+  (std/collections.tg; the reviewer's shared/pinned backing — no
+  lifetime inference). The backing record = the pinned buffer + the
+  window's offset/len:
   `SliceBacking[T] = { ptr: Ptr[T] @ 0, len: UInt @ 8, offset: UInt @ 16 }`
   (24 bytes). The Arc keeps the pinned backing alive: the view **survives
   the original owner's drop**, and the owner's capacity-changing
@@ -633,11 +625,21 @@ are **gone**. The shape is:
   — the mutation allocates a fresh pinned backing for the new buffer, the
   views keep the old one alive). **Actual layout: the safe Slice value is
   8 bytes — one pointer-sized Arc handle `{ inner @ 0 }` (the Arc-class
-  `{ptr,len}`: the handle to the 16-byte-shaped pinned record); the raw
-  view is 16 bytes `{ ptr @ 0, len @ 8 }`.** The pin operations
-  (`slice_pin` / `str_view_pin`) copy the window into the pinned
-  allocation; the backing's deinit releases it when the last Arc dies.
-  The shared forms are ordinary owning values (no escape tracking). `str`
+  `{ptr,len}`); the pinned backing is the 24-byte record above.** The pin
+  operations (`slice_pin` / `str_view_pin`) copy the window into the
+  pinned allocation; the backing's deinit releases it when the last Arc
+  dies. The shared forms are ordinary owning values — NO escape tracking,
+  NO access-scoping, NO "eventual mechanism" (the backing owns).
+  **The RAW view is the registered `UnsafeSlice` builtin** (the LangItems
+  `slice` id) — the 16-byte borrowed `{ ptr: Ptr[T], len: UInt }` fat
+  value (`slice_view_layout` in layout_engine.tg), the explicit
+  **unsafe/FFI-only spelling**. Safe code cannot produce it, and its
+  escapes are the P0-SL-rejected cases (the escape channels in types.tg +
+  the live-view registry in resource_check.tg). The only raw views safe
+  code ever sees are the compiler-scoped loop-consumed iterable forms
+  (chars/bytes/split/iter/keys/values — consumed by the enclosing
+  for-loop) and the compiler-manufactured literal coercion behind `vec!`.
+  `str`
   is the registered string escape spelling (`__intrinsic_string_as_str`),
   mapping to the `String` primitive. **The String/StrView distinction is
   implemented**: `StrView` (std/core.tg) is the SAFE shared/pinned
@@ -951,7 +953,7 @@ compiler-owned structural field cleanup — exactly once.
 | Zero-inference fail-closed: unsolved generic parameters are hard errors; the monomorphizer performs no inference | types.tg / mono.tg §13 |
 | LangItems built once, structurally unique; semantic identity by DefId/TypeId/TraitId — never strings | types.tg / ids.tg §8 |
 | String is the OWNED String object: one pointer to the 32-byte {data,len,cap,stride} header; the string_* intrinsics dispatch to the String ABI (`_tg_string_*`), never the Array ABI; literals are the static StrView and convert to owned Strings via `string_from_static` at every owned-String demand site (by-value String params, String destinations, Vec[String] literals, concat, to_string, clone); the destructor `_tg_string_drop` frees object + buffer through `_tg_mem_free` (per-class free-list reclaim) | runtime.tg "String Object Runtime"; codegen.tg `resolve_intrinsic_id` / `string_abi_intrinsic_name`; mir.tg `mir_call_arg_needs_owned_string` / `lower_string_literal_to_owned`; std/core.tg String contract + `impl Clone/Eq/Hash for String` |
-| THE SAFE VIEW MODEL: the safe Slice/StrView are the SHARED/PINNED forms — `SharedSlice[T] { inner: ArcStrong[SliceBacking[T]] }` / `StrView { inner: ArcStrong[StrViewBacking] }` — the Arc-class `{ptr,len}`: 8-byte Arc handle to the 24-byte pinned backing `{ ptr @ 0, len @ 8, offset @ 16 }` (the pinned buffer + the window's offset/len). The backing keeps the storage alive (the view survives the owner's drop and its capacity-changing mutations — the backing is the separate pinned allocation); the backing's deinit releases the pinned allocation at the last Arc's drop. The shared forms need NO escape tracking (ordinary owning values). The RAW view — the builtin Slice (16-byte `{ ptr @ 0, len @ 8 }`), source-spelled UnsafeSlice — is unsafe/FFI-only: safe code cannot produce it; its escapes are the P0-SL-rejected cases (return/store/capture channels in types.tg; the live-view registry + IterationPlan mutation scan in resource_check.tg). Safe APIs return the shared form (Vec::as_slice / String::as_str_view — pin-copies); FFI surfaces use the raw form (FfiSlice); the for-loop iterable forms stay compiler-scoped and loop-consumed | std/collections.tg "THE SAFE VIEW MODEL"; std/core.tg StrView contract; types.tg `is_slice_view_type_of` / `is_shared_view_type_of` / `check_no_escaping_slice`; resource_check.tg `slice_views` registry / `check_slice_view_backing_mutation` |
+| THE SAFE VIEW MODEL — ONE REPRESENTATION, ONE SEMANTIC AUTHORITY: the SOURCE-spelled `Slice[T]`/`StrView` ARE the SHARED/PINNED forms — `Slice[T] { inner: ArcStrong[SliceBacking[T]] }` / `StrView { inner: ArcStrong[StrViewBacking] }` — the Arc-class `{ptr,len}`: 8-byte Arc handle to the 24-byte pinned backing `{ ptr @ 0, len @ 8, offset @ 16 }` (the pinned buffer + the window's offset/len). The backing keeps the storage alive (the view survives the owner's drop and its capacity-changing mutations — the backing is the separate pinned allocation); the backing's deinit releases the pinned allocation at the last Arc's drop. The shared forms need NO escape tracking (ordinary owning values — the backing owns; there is no "eventual mechanism"). The RAW view — the registered `UnsafeSlice` builtin (the LangItems slice id; 16-byte `{ ptr @ 0, len @ 8 }`) — is the explicit unsafe/FFI-only spelling: safe code cannot produce it; its escapes are the P0-SL-rejected cases (return/store/capture channels in types.tg; the live-view registry + IterationPlan mutation scan in resource_check.tg). Safe APIs return the shared form (Vec::as_slice / String::as_str_view — pin-copies); FFI surfaces use the raw form (FfiSlice); the for-loop iterable forms stay compiler-scoped and loop-consumed | std/collections.tg "THE SAFE VIEW MODEL"; std/core.tg StrView contract; types.tg `is_slice_view_type_of` / `is_shared_view_type_of` / `check_no_escaping_slice`; resource_check.tg `slice_views` registry / `check_slice_view_backing_mutation` |
 | Type-property graph algorithm with inline-recursion diagnostics; memoized per concrete args | types.tg §7 |
 | Monomorphization: seen-set, MAX_MONO_INSTANCES, residual-param aborts | mono.tg §13 |
 | Map/set ownership ops: every key-operating map/set intrinsic site injects the CONCRETE `Hash::hash` / `Eq::eq` dispatch calls (core-ABI gates by declared param count; kernel key types dispatch to the runtime helpers) — the impls are reached and specialized with zero inference | mono.tg `inject_map_dispatch_calls` / `apply_dispatch_injection`; codegen.tg `map_hash_dispatch_label` / `map_eq_dispatch_label` |
@@ -962,6 +964,8 @@ compiler-owned structural field cleanup — exactly once.
 | Generated drop glue: every concrete non-trivial plan owns a memoized drop-glue function; recursive owning types are broken by symbol (the glue calls itself); PlanLimit remains only for missing registered deinit targets | mir.tg `mir_glue_instance_for_type` / `mir_build_all_drop_glues` / `DeinitPlan::Call` §14.3 |
 | Fixed-array const sizes: literal / const-reference / constant-arithmetic sizes evaluate before the FixedArray identity forms | types.tg `eval_const_size_expr` / `const_values` §9; `tests/canary/canary_pos_fixed_array_const_size.tg` |
 | LangItems built once, structurally unique; the bundle covers option/result/vec/map/set/box/rc/array/slice + string/str_view/unique_ptr/arc_strong/weak_rc/weak_arc/ptr/ptr_mut + the trait ids; semantic identity by DefId/TypeId/TraitId — never strings | types.tg / ids.tg §8 |
+| THE SIMD VECTOR ROW: the std Vec2/Vec4/Vec8/Vec16 instantiations with a 16/32/64-byte width lay out as N lanes of the lane type with ALIGNMENT = the vector WIDTH (never the lane alignment), and the ABI classifier's vector cases cross the 16-byte vector THROUGH the registers (`Vector(16)` — never sret) while the 32/64-byte forms cross by address; a non-vector width (Vec2[f32] — 8 bytes) and an ordinary `[T; N]` fixed array keep the element-aligned inline layout | layout_engine.tg `compute_vector_layout` / `is_simd_vector_type` / `classify_value_category`; codegen.tg `AbiArg::Vector` / `category_uses_sret`; tests/simd/simd_layout_test.tg / simd_abi_probe.tg |
+| THE WASM32 LINEAR-MEMORY MODEL: the wasm32-unknown-unknown / wasm32-wasi target's address space is the wasm linear memory — pointers and handles are 32-bit linear addresses (i32), aggregates live in linear-memory images addressed by i32 handles, and the wasm stack holds the i32/i64/f32/f64 values; the type mapping (Bool/Char/I8/I16/I32/U8/U16/U32 → i32; Int/I64/U64/ISize/USize → i64; F32 → f32; Float/F64 → f64; Ptr/PtrMut/RefInternal/String/Adt/FnPtr/Dyn/Effect/Closure → i32 handles; Unit/Never → no value; I128/U128 fail closed; the SIMD vectors cross by address) is the single authority in wasm_target.tg, and the category-level classification maps the layout engine's value categories to the wasm32 slots | wasm_target.tg "THE WASM TYPE MAPPING TABLE" / `map_primitive_to_wasm` / `mir_type_to_wasm` / `classify_wasm_value_category`; tests/wasm/wasm_conformance_test.tg (the mapping-table case) |
 
 ### 15.2 Pending (documented targets, not assumptions)
 

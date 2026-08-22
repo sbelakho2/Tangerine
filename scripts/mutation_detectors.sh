@@ -1,27 +1,40 @@
 #!/usr/bin/env bash
 # ———————————————————————————————————————————————————————————————
-# scripts/mutation_detectors.sh — the per-mutation DETECTOR library
-# for the bounded mutation harness (scripts/run_mutation_tests.sh).
+# scripts/mutation_detectors.sh — the per-mutation SOURCE-INTEGRITY
+# detector library for the bounded mutation harness
+# (scripts/run_mutation_tests.sh).
 #
-# The reviewer's rule: a mutation is KILLED iff its DETECTOR fails — a
-# structural test whose outcome depends on the mutated site's CORRECTNESS,
-# not on the mutation text itself. Every detector below asserts the
-# CANONICAL SEMANTIC FORM of one mutation target site: the form the
-# checker/verifier/layout/async code MUST state for the compiler's
-# accepted/rejected sets, layouts, emitted code, or wake/ordering arms to
-# be correct. A mutation destroys its own site's canonical form, so the
-# detector fails on the mutated copy and PASSES on the pristine tree.
+# THE RE-ROLE (the reviewer's mandate): the structural detectors are the
+# SOURCE-INTEGRITY CHECKS — they verify the mutation was applied at the
+# INTENDED SITE (the canonical semantic form of the site is destroyed on
+# the mutated copy, confirming the transformation landed where the
+# catalog says). They NEVER classify a kill. THE KILL CLASSIFICATION IS
+# BEHAVIORAL ONLY (the semantic mutation protocol):
+#   mutate -> BUILD the mutated kernel with a usable current-grammar
+#   compiler binary -> RUN the per-mutation behavioral suite under the
+#   mutated compiler -> the mutation is KILLED iff the behavioral suite
+#   FAILS.
+#
+# Every detector below asserts the CANONICAL SEMANTIC FORM of one
+# mutation target site: the form the checker/verifier/layout/async code
+# MUST state for the compiler's accepted/rejected sets, layouts, emitted
+# code, or wake/ordering arms to be correct. A mutation destroys its own
+# site's canonical form, so the detector fires on the mutated copy and
+# holds on the pristine tree.
 #
 # The G13 group of scripts/verify_invariants.sh encodes the same
-# assertions as permanent tree-wide invariants; this library is the
-# per-mutation entry point the harness calls for the direct attribution.
+# assertions as permanent tree-wide source-integrity invariants; this
+# library is the per-mutation entry point the harness calls for the
+# direct application confirmation.
 #
 # Usage: detect_mutation <mutation-id> <tree-root>
-#   exit 0 = the site is intact (the mutation is NOT observable at the
-#            site — the detector did NOT fire);
-#   exit 1 = the site is broken (the detector fired — the mutation is
-#            observable as a semantic break at its target site);
-#   the reason is echoed on stdout.
+#   on the PRISTINE tree: exit 0 = the site is intact (the canonical
+#            form holds);
+#   on a MUTATED copy:    exit 1 = the site is broken (the detector
+#            FIRED — the mutation IS present at its intended site).
+#   The harness REQUIRES the detector to FIRE on the mutated copy: a
+#   detector that does NOT fire means the mutation is not observable at
+#   its target site — an application/drift error, NEVER a kill signal.
 # ———————————————————————————————————————————————————————————————
 
 detect_mutation() {

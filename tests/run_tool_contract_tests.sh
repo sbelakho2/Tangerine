@@ -169,6 +169,43 @@ grep -q "=> 3" "$TMP/repl.out" && pass "repl evaluated 1 + 2 => 3" || fail "repl
 grep -q "Goodbye!" "$TMP/repl.out" && pass "repl :quit exits cleanly" || fail "repl :quit exits cleanly"
 
 echo ""
+echo "--- the bounded REPL: the error-then-continue piped session ---"
+# A FAILING entry (a parse error) is reported; the session CONTINUES and
+# the next expression evaluates — the failed entry's state never leaks
+# into the next (the buffer clears after every completed entry).
+printf 'let =\n1 + 2\n:quit\n' | "$COMPILER" repl > "$TMP/repl_err.out" 2>&1
+check "tg repl piped session (error then continue) exits 0" 0 $?
+grep -q "=> 3" "$TMP/repl_err.out" && pass "repl continues after the failed entry (1 + 2 => 3)" || fail "repl continues after the failed entry (1 + 2 => 3): $(cat "$TMP/repl_err.out")"
+grep -q "Goodbye!" "$TMP/repl_err.out" && pass "repl error-then-continue session quits cleanly" || fail "repl error-then-continue session quits cleanly"
+
+echo ""
+echo "--- the CQS query server: the diagnostics affect the check where required ---"
+CQS_FIXTURE="$TMP/cqs_gate.tg"
+cat > "$CQS_FIXTURE" <<'EOF'
+pub def broken(given: Int) -> Int
+  let dead = 1
+  if given > 0 then
+    42
+  else
+    42
+  end
+end
+
+def main() -> Int
+  broken(1)
+end
+EOF
+# The Dev-mode check (the sweep contract): zero CQS diagnostics, exit 0.
+"$COMPILER" check "$CQS_FIXTURE" > "$TMP/cqs_dev.out" 2>&1
+check "tg check (Dev) with the CQS invocation exits 0" 0 $?
+grep -q "CQS-" "$TMP/cqs_dev.out" && fail "Dev check must not emit CQS diagnostics" || pass "Dev check emits no CQS diagnostics"
+# The Hardened-mode check: the mode matrix's gated failures are
+# reported and FAIL the check.
+"$COMPILER" check --mode hardened "$CQS_FIXTURE" > "$TMP/cqs_hard.out" 2>&1
+check "tg check --mode hardened gates the fixture (exit 1)" 1 $?
+grep -q "CQS-" "$TMP/cqs_hard.out" && pass "the CQS gate diagnostics are reported" || fail "the CQS gate diagnostics are reported: $(cat "$TMP/cqs_hard.out")"
+
+echo ""
 echo "--- read-only inputs are never written, never partially modified ---"
 READONLY="$TMP/readonly.tg"
 cp "$HELLO_FILE" "$READONLY"

@@ -7,7 +7,7 @@ coverage, last verified SHA). This document is rendered by
 `scripts/gen_invariants.sh`; the CI evidence-gate job regenerates it
 and runs `git diff --exit-code`.
 
-Last verified SHA: `e1eb946`  ·  Registry version: `3`
+Last verified SHA: `9ae5778e8e3dd4d53d44b36a122e4e565be299b7`  ·  Registry version: `3`
 
 ## Status policy
 
@@ -29,8 +29,8 @@ gap is classified as **implemented-with-assertions** or
 | INV-ABI-003 | partial | explicitly-scoped | scoped | the 'Type is not FFI-safe' rejection claim is removed from the verified set: no pass rejects non-FFI-safe types at extern boundaries; the enforceable core (ABI classification) remains asserted at mir.tg verify_function_v2 (INV-ABI-004) |
 | INV-ABI-006 | design | explicitly-scoped | scoped | the claim's surface does not exist in the callable: variadic functions are not part of the dialect (no va_list protocol, no variadic parse); the invariant is removed from the verified set with this justification |
 | INV-ABI-007 | design | explicitly-scoped | scoped | the surface is removed from the callable on both fronts: the vtable machinery is deleted in tg_compiler (no emission exists), and the stage0 subset rejects type-position dyn/impl (E9032) so no bootstrap program can construct a trait object |
-| INV-ABI-008 | partial | explicitly-scoped | scoped | the completeness claim is narrowed: the registry asserts the implemented lanes (x64 SysV/Win64, aarch64 Windows via target-lane canaries) and scopes 'complete specs for every advertised target' — wasm32 is not wired into the driver/codegen |
-| INV-CODEGEN-005 | design | explicitly-scoped | scoped | the surface is already removed from the callable: generate_dwarf_debug_info has no caller and opts.debug_info is inert — no compile path can emit debug info; the claim is removed from the verified set |
+| INV-ABI-008 | partial | explicitly-scoped | scoped | the completeness claim is narrowed: the registry asserts the implemented lanes (x64 SysV/Win64, aarch64 Windows via target-lane canaries) and scopes 'complete specs for every advertised target' — wasm32 is wired into the driver (compile_to_wasm_route) and the codegen (wasm_target.tg emission); the conformance lane is the structural wasm parser + the optional wasmtime execution |
+| INV-CODEGEN-005 | design | explicitly-scoped | scoped | the surface is removed from the callable: generate_dwarf_debug_info has no caller, and the -g flag is rejected with the explicit 'debug info is not supported' error (the inert debug_info option is gone — no compile path can emit debug info, so the claim is removed from the verified set) |
 | INV-MIR-001 | partial | explicitly-scoped | scoped | the claim is re-scoped to the DCE removal rule: dead blocks cannot survive in optimized MIR (the removal is asserted), and the verifier's warning-only stance for pre-opt MIR is the documented contract (canonical_ir_spec.md); the reachability-as-error claim is removed from the verified set |
 | INV-MIR-005 | partial | explicitly-scoped | scoped | the verifier-side switch-coverage claim is removed: exhaustiveness is already asserted at the type checker (INV-TYPE-004), and MIR lowering only produces switch terms for checker-validated matches — the duplicate claim is scoped out |
 | INV-MIR-009 | design | explicitly-scoped | scoped | the serialization claim is removed from the verified set: no serializer exists in the callable; the former claim is re-assigned to the deterministic pretty-printer (INV-MIR-008) |
@@ -48,104 +48,104 @@ gap is classified as **implemented-with-assertions** or
 
 | ID | Stage | Description | Severity | Status | Assertion / scoping | Verified SHA |
 |----|-------|-------------|----------|--------|---------------------|--------------|
-| INV-ABI-001 | ABI | Function signatures match platform calling convention | error | implemented | tg_compiler/codegen.tg:classify_value_category | e1eb946 |
-| INV-ABI-002 | ABI | Struct layout follows platform struct alignment rules | error | implemented | tg_compiler/layout_engine.tg:compute_type_layout | e1eb946 |
-| INV-ABI-003 | ABI | FFI bridge validates type compatibility | error | scoped | tg_compiler/mir.tg:verify_function_v2 | e1eb946 |
-| INV-ABI-004 | ABI | Extern blocks declare valid ABI strings | error | implemented | tg_compiler/mir.tg:verify_function_v2 | e1eb946 |
-| INV-ABI-005 | ABI | Pointer types carry correct mutability annotations | error | implemented | tg_compiler/types.tg:type_check_typed | e1eb946 |
-| INV-ABI-006 | ABI | Variadic functions use correct va_list protocol | warning | scoped | the claim's surface does not exist in the callable: variadic functions are not part of the dialect (no va_list protocol, no variadic parse); the invariant is removed from the verified set with this justification | e1eb946 |
-| INV-ABI-007 | ABI | Trait objects use consistent vtable layout | error | scoped | stage0_swift/Sources/TangerineCompiler/SubsetChecker.swift:checkTypeExpr | e1eb946 |
-| INV-ABI-008 | ABI | Cross-compilation targets have complete ABI specs | error | scoped | tests/run_target_lane_canaries.sh:run_target_lane_canaries | e1eb946 |
-| INV-CODEGEN-001 | Code Generation | Output assembly is syntactically valid | error | implemented | tg_compiler/asm.tg:emit | e1eb946 |
-| INV-CODEGEN-002 | Code Generation | All MIR instructions have codegen mappings | error | implemented | tg_compiler/codegen.tg:codegen_statement | e1eb946 |
-| INV-CODEGEN-003 | Code Generation | Calling convention matches target ABI | error | implemented | tg_compiler/codegen.tg:classify_value_category | e1eb946 |
-| INV-CODEGEN-004 | Code Generation | Stack frame layout is consistent | error | implemented | tg_compiler/codegen.tg:codegen_prologue | e1eb946 |
-| INV-CODEGEN-005 | Code Generation | Debug information maps back to source spans | error | scoped | the surface is already removed from the callable: generate_dwarf_debug_info has no caller and opts.debug_info is inert — no compile path can emit debug info; the claim is removed from the verified set | e1eb946 |
-| INV-CODEGEN-006 | Code Generation | Global constants are emitted in data sections | error | implemented | tg_compiler/codegen.tg:codegen_static | e1eb946 |
-| INV-CODEGEN-007 | Code Generation | Type layouts match target pointer size | error | implemented | tg_compiler/layout_engine.tg:compute_type_layout | e1eb946 |
-| INV-CODEGEN-008 | Code Generation | Variant tag size matches enum variant count | error | implemented | tg_compiler/layout_engine.tg:compute_enum_layout | e1eb946 |
-| INV-FIREWALL-001 | MIR | Post-monomorphization verification is UNCONDITIONAL (the generic substitution is a transformative boundary every build re-proves) | error | implemented | tg_compiler/compiler_core.tg:compile_file_core | e1eb946 |
-| INV-FIREWALL-002 | MIR | The final firewall: verify_mir + the completeness oracle immediately before codegen | error | implemented | tg_compiler/compiler_core.tg:compile_file_core | e1eb946 |
-| INV-FIREWALL-003 | MIR | A MirSwitchInt discriminant is an integer-like scalar and its target values are pairwise distinct | error | implemented | tg_compiler/mir.tg:verifier_switch_checks | e1eb946 |
-| INV-FIREWALL-004 | MIR | Switch target values over an enum must be DECLARED variant discriminants (impossible enum discriminants rejected) | error | implemented | tg_compiler/mir.tg:verifier_switch_checks | e1eb946 |
-| INV-FIREWALL-005 | MIR | The block-id universe of one function is disjoint (the exactly-one-terminator rule) | error | implemented | tg_compiler/mir.tg:verify_function_v2 | e1eb946 |
-| INV-LAYOUT-003 | Code generation | Layout size/offset arithmetic is overflow-fail-closed (checked add/mul, ICE on overflow or negative operands) | error | implemented | tg_compiler/layout_engine.tg:layout_checked_add | e1eb946 |
-| INV-LAYOUT-004 | Type checking | The fixed-array element count is bounded at the [T; N] annotation (the user-input path into layout arithmetic) | error | implemented | tg_compiler/types.tg:MAX_FIXED_ARRAY_ELEMS | e1eb946 |
-| INV-LOWER-001 | MIR Lowering | Every AST function produces at least one MIR basic block | error | implemented | tg_compiler/mir.tg:verify_function_v2 | e1eb946 |
-| INV-LOWER-002 | MIR Lowering | All local variables are allocated in scope | error | implemented | tg_compiler/mir.tg:verify_function_v2 | e1eb946 |
-| INV-LOWER-003 | MIR Lowering | Terminators are only at block ends | error | implemented | tg_compiler/mir.tg:verify_function_v2 | e1eb946 |
-| INV-LOWER-004 | MIR Lowering | Phi nodes reference valid predecessor blocks | error | implemented | tg_compiler/mir.tg:verifier_dataflow_init | e1eb946 |
-| INV-LOWER-005 | MIR Lowering | Struct field accesses lower to typed offsets | error | implemented | tg_compiler/mir.tg:lower_place | e1eb946 |
-| INV-LOWER-006 | MIR Lowering | Enum variant construction lowers to tagged unions | error | implemented | tg_compiler/mir.tg:enum_variant_name_matches | e1eb946 |
-| INV-LOWER-007 | MIR Lowering | Closures capture environment via capture list | error | implemented | tg_compiler/mir.tg:lower_pending_closures | e1eb946 |
-| INV-LOWER-008 | MIR Lowering | Control flow (if/match/loop) lowers to branch instructions | error | implemented | tg_compiler/mir.tg:lower_if | e1eb946 |
-| INV-MIR-001 | MIR Validation | All basic blocks are reachable from entry | error | scoped | tg_compiler/mir.tg:eliminate_dead_code | e1eb946 |
-| INV-MIR-002 | MIR Validation | SSA values are defined before use | error | implemented | tg_compiler/mir.tg:verifier_dataflow_init | e1eb946 |
-| INV-MIR-003 | MIR Validation | Types in MIR instructions are well-formed | error | implemented | tg_compiler/mir.tg:verify_function_v2 | e1eb946 |
-| INV-MIR-004 | MIR Validation | No orphan local variables without definition | error | implemented | tg_compiler/mir.tg:verify_function_v2 | e1eb946 |
-| INV-MIR-005 | MIR Validation | Switch targets cover all enum variants | error | scoped | tg_compiler/types.tg:check_match | e1eb946 |
-| INV-MIR-006 | MIR Validation | Function calls match callee signature arity | error | implemented | tg_compiler/mir.tg:verifier_check_callees | e1eb946 |
-| INV-MIR-007 | MIR Validation | Return instruction type matches function return type | error | implemented | tg_compiler/mir.tg:verify_function_v2 | e1eb946 |
-| INV-MIR-008 | MIR Validation | Pretty-print output is deterministic and diffable | error | implemented | tg_compiler/mir.tg:pretty_print_mir | e1eb946 |
-| INV-MIR-009 | MIR Validation | MIR serialization round-trips without loss | error | scoped | the serialization claim is removed from the verified set: no serializer exists in the callable; the former claim is re-assigned to the deterministic pretty-printer (INV-MIR-008) | e1eb946 |
-| INV-MIR-010 | MIR Validation | Entry block is always bb0 | error | implemented | tg_compiler/mir.tg:verify_function_v2 | e1eb946 |
-| INV-OPT-001 | Optimization | Inlining preserves observable behavior | error | implemented | tg_compiler/mir.tg:inline_functions | e1eb946 |
-| INV-OPT-002 | Optimization | Dead code elimination does not remove side effects | error | implemented | tg_compiler/mir.tg:eliminate_dead_code | e1eb946 |
-| INV-OPT-003 | Optimization | Constant folding preserves value precision | error | implemented | tg_compiler/mir.tg:fold_constants | e1eb946 |
-| INV-OPT-004 | Optimization | Loop transformations preserve termination | warning | scoped | the claim's surface does not exist in the callable: there is no loop-transformation pass to violate termination; the invariant is removed from the verified set with this justification | e1eb946 |
-| INV-OPT-005 | Optimization | Common subexpression elimination is correct | error | implemented | tg_compiler/mir.tg:global_value_numbering | e1eb946 |
-| INV-OPT-006 | Optimization | Register allocation spills are correctly inserted | error | scoped | the claim's surface does not exist in the callable: there is no register allocator (codegen.tg direct emission); the invariant is removed from the verified set with this justification | e1eb946 |
-| INV-OPT-007 | Optimization | Optimized MIR passes all MIR validation invariants | error | implemented | tg_compiler/compiler_core.tg:compile_file_core | e1eb946 |
-| INV-OPT-008 | Optimization | No new undefined values introduced by optimization | error | implemented | tg_compiler/mir.tg:verifier_dataflow_init | e1eb946 |
-| INV-ORACLE-001 | Type checking | The semantic completeness oracle audits every typed channel at the typecheck tail; any residual Type::Error / Type::Var / Param-in-concrete-position is an ICE-class error | error | implemented | tg_compiler/types.tg:run_semantic_completeness_oracle | e1eb946 |
-| INV-ORACLE-002 | Type checking | Every recorded call-target and finalizer DefId is a resolver-registered symbol | error | implemented | tg_compiler/types.tg:run_semantic_completeness_oracle | e1eb946 |
-| INV-ORACLE-003 | Type checking | Every typed FieldId / VariantId names an existing field/variant of its owner type | error | implemented | tg_compiler/types.tg:oracle_check_field_id | e1eb946 |
-| INV-ORACLE-004 | Type checking | Every typed call's receiver and arguments carry the recorded per-node access effect | error | implemented | tg_compiler/types.tg:oracle_walk_typed_expr | e1eb946 |
-| INV-ORACLE-005 | Type checking | Every registered trait impl is backed by its trait's declared contract (the obligation-solution backstop) | error | implemented | tg_compiler/types.tg:run_semantic_completeness_oracle | e1eb946 |
-| INV-ORACLE-006 | MIR | The MIR completeness oracle proves every post-mono type has a computable layout (fail-closed) | error | implemented | tg_compiler/compiler_core.tg:run_mir_completeness_oracle | e1eb946 |
-| INV-ORACLE-007 | Type checking | Every named TypeId the typed channels reference is a registered nominal (the unknown-layout precursor) | error | implemented | tg_compiler/types.tg:run_semantic_completeness_oracle | e1eb946 |
-| INV-OWN-001 | Access Checking | Per-call access overlap is exclusive for Modify/Consume/Initialize | error | implemented | tg_compiler/access_check.tg:check_overlaps | e1eb946 |
-| INV-OWN-002 | Access Checking | At most one mutable access is active per call | error | implemented | tg_compiler/access_check.tg:check_overlaps | e1eb946 |
-| INV-OWN-003 | Access Checking | Access duration is the containing call | error | implemented | tg_compiler/types.tg:record_arg_effect | e1eb946 |
-| INV-OWN-004 | Access Checking | Fixed struct fields are statically disjoint under access checks | error | implemented | tg_compiler/access_check.tg:check_overlaps | e1eb946 |
-| INV-OWN-005 | Resource Checking | Resource locals are consumed at most once per CFG path | error | implemented | tg_compiler/resource_check.tg:resource_check | e1eb946 |
-| INV-OWN-006 | Resource Checking | Capabilities are transferred exactly once | error | implemented | tg_compiler/resource_check.tg:validate_capability_exit | e1eb946 |
-| INV-OWN-007 | Resource Checking | Resources created in a loop are consumed per iteration | error | implemented | tg_compiler/resource_check.tg:resource_check | e1eb946 |
-| INV-OWN-008 | Resource Checking | Resources are auto-deinitialized at scope exit in declaration reverse order | error | implemented | tg_compiler/mir.tg:emit_cleanup_chain | e1eb946 |
-| INV-PANIC-001 | Runtime | panic=abort is the ONLY stable panic strategy; the compiler rejects any stable panic=unwind request | error | implemented | std/core.tg:panic | e1eb946 |
-| INV-PARSE-001 | Lexing | All tokens carry source location spans | error | implemented | tg_compiler/token.tg:struct Token | e1eb946 |
-| INV-PARSE-002 | Lexing | String literals are UTF-8 validated | error | implemented | stage0_swift/Sources/TangerineCompiler/SemanticGates.swift:SourceLoader | e1eb946 |
-| INV-PARSE-003 | Lexing | Numeric literals fit in host integer range | warning | implemented | stage0_swift/Sources/TangerineCompiler/SemanticGates.swift:NumericLiteralGuard | e1eb946 |
-| INV-PARSE-004 | Parsing | Every parsed item has a non-empty span | error | implemented | tg_compiler/parser.tg:parse_item | e1eb946 |
-| INV-PARSE-005 | Parsing | Block bodies terminate with `end` keyword | error | implemented | tg_compiler/parser.tg:parse_block_body | e1eb946 |
-| INV-PARSE-006 | Parsing | Function declarations have at least a name | error | implemented | tg_compiler/parser.tg:parse_function_decl | e1eb946 |
-| INV-PARSE-007 | Parsing | Spans are well-ordered (start ≤ end) for non-synthetic nodes | error | implemented | stage0_swift/Sources/TangerineCompiler/ASTVerifier.swift:verifySpan | e1eb946 |
-| INV-PARSE-008 | Parsing | Inverted spans are detected and reported by the verifier | error | implemented | stage0_swift/Sources/TangerineCompiler/ASTVerifier.swift:verifySpan | e1eb946 |
-| INV-PARSE-009 | Parsing | Duplicate top-level names produce a diagnostic | warning | implemented | tg_compiler/resolver.tg:record_item_def | e1eb946 |
-| INV-PARSE-010 | Parsing | Macro declarations are preserved in AST | error | implemented | tg_compiler/parser.tg:parse_macro_decl | e1eb946 |
-| INV-PARSE-011 | Parsing | Attributes attach to exactly one item | error | implemented | tg_compiler/parser.tg:parse_attributes | e1eb946 |
-| INV-PARSE-012 | Parsing | Use declarations form valid module paths | error | implemented | tg_compiler/compiler_core.tg:merge_imported_deps | e1eb946 |
-| INV-RELOC-001 | Link | Relocation offsets are WIDTH-AWARE section-bounded (offset + patch width <= len, overflow-safe) | error | implemented | tg_compiler/object.tg:validate_object_file | e1eb946 |
-| INV-RELOC-002 | Link | Every relocation names a symbol the object carries | error | implemented | tg_compiler/object.tg:validate_object_file | e1eb946 |
-| INV-RELOC-003 | Link | The AArch64 ADRP/ADD pair invariants: page relocation at O must pair with its lo12 at O+4 for the SAME symbol (and vice versa) | error | implemented | tg_compiler/object.tg:validate_aarch64_adrp_add_pairs | e1eb946 |
-| INV-RESOLVE-001 | Name Resolution | All references resolve to a declaration | error | implemented | tg_compiler/resolver.tg:resolve_names | e1eb946 |
-| INV-RESOLVE-002 | Name Resolution | No ambiguous name references remain | error | implemented | tg_compiler/resolver.tg:bare_name_resolve | e1eb946 |
-| INV-RESOLVE-003 | Name Resolution | Use imports are validated against module graph | error | implemented | tg_compiler/compiler_core.tg:merge_imported_deps | e1eb946 |
-| INV-RESOLVE-004 | Name Resolution | Visibility rules are enforced for cross-module refs | error | implemented | tg_compiler/resolver.tg:resolve_names | e1eb946 |
-| INV-RESOLVE-005 | Name Resolution | Extern declarations resolve to ABI symbols | warning | scoped | tg_compiler/mir.tg:verify_function_v2 | e1eb946 |
-| INV-RESOLVE-006 | Name Resolution | Type aliases expand without cycles | error | implemented | tg_compiler/types.tg:is_trivially_copyable_walk | e1eb946 |
-| INV-RESOLVE-007 | Name Resolution | Trait implementations match trait signatures | error | implemented | tg_compiler/types.tg:solve_obligation | e1eb946 |
-| INV-RESOLVE-008 | Name Resolution | Const expressions evaluate at compile time | error | implemented | tg_compiler/types.tg:eval_const_size_expr | e1eb946 |
-| INV-TYPE-001 | Type Checking | All expressions have an inferred or annotated type | error | implemented | tg_compiler/types.tg:type_check_typed | e1eb946 |
-| INV-TYPE-002 | Type Checking | Function return types match body type | error | implemented | tg_compiler/types.tg:type_check_typed | e1eb946 |
-| INV-TYPE-003 | Type Checking | Binary operators have compatible operand types | error | implemented | tg_compiler/types.tg:type_check_typed | e1eb946 |
-| INV-TYPE-004 | Type Checking | Match arms have consistent return types | error | implemented | tg_compiler/types.tg:check_match | e1eb946 |
-| INV-TYPE-005 | Type Checking | Struct field access uses declared field names | error | implemented | tg_compiler/types.tg:type_check_typed | e1eb946 |
-| INV-TYPE-006 | Type Checking | Generic type parameters satisfy trait bounds | error | implemented | tg_compiler/types.tg:solve_obligation | e1eb946 |
-| INV-TYPE-007 | Type Checking | Closures capture variables with correct ownership | error | implemented | tg_compiler/types.tg:scan_closure_captures | e1eb946 |
-| INV-TYPE-008 | Type Checking | Integer literals fit declared type width | warning | implemented | tg_compiler/types.tg:check_integer_literal_range | e1eb946 |
-| INV-TYPE-009 | Type Checking | Enum variant construction matches variant signature | error | implemented | tg_compiler/types.tg:type_check_typed | e1eb946 |
-| INV-TYPE-010 | Type Checking | Trait objects use dyn keyword | error | scoped | stage0_swift/Sources/TangerineCompiler/SubsetChecker.swift:checkTypeExpr | e1eb946 |
+| INV-ABI-001 | ABI | Function signatures match platform calling convention | error | implemented | tg_compiler/codegen.tg:classify_value_category | 9ae5778e8e |
+| INV-ABI-002 | ABI | Struct layout follows platform struct alignment rules | error | implemented | tg_compiler/layout_engine.tg:compute_type_layout | 9ae5778e8e |
+| INV-ABI-003 | ABI | FFI bridge validates type compatibility | error | scoped | tg_compiler/mir.tg:verify_function_v2 | 9ae5778e8e |
+| INV-ABI-004 | ABI | Extern blocks declare valid ABI strings | error | implemented | tg_compiler/mir.tg:verify_function_v2 | 9ae5778e8e |
+| INV-ABI-005 | ABI | Pointer types carry correct mutability annotations | error | implemented | tg_compiler/types.tg:type_check_typed | 9ae5778e8e |
+| INV-ABI-006 | ABI | Variadic functions use correct va_list protocol | warning | scoped | the claim's surface does not exist in the callable: variadic functions are not part of the dialect (no va_list protocol, no variadic parse); the invariant is removed from the verified set with this justification | 9ae5778e8e |
+| INV-ABI-007 | ABI | Trait objects use consistent vtable layout | error | scoped | stage0_swift/Sources/TangerineCompiler/SubsetChecker.swift:checkTypeExpr | 9ae5778e8e |
+| INV-ABI-008 | ABI | Cross-compilation targets have complete ABI specs | error | scoped | tests/run_target_lane_canaries.sh:run_target_lane_canaries | 9ae5778e8e |
+| INV-CODEGEN-001 | Code Generation | Output assembly is syntactically valid | error | implemented | tg_compiler/asm.tg:emit | 9ae5778e8e |
+| INV-CODEGEN-002 | Code Generation | All MIR instructions have codegen mappings | error | implemented | tg_compiler/codegen.tg:codegen_statement | 9ae5778e8e |
+| INV-CODEGEN-003 | Code Generation | Calling convention matches target ABI | error | implemented | tg_compiler/codegen.tg:classify_value_category | 9ae5778e8e |
+| INV-CODEGEN-004 | Code Generation | Stack frame layout is consistent | error | implemented | tg_compiler/codegen.tg:codegen_prologue | 9ae5778e8e |
+| INV-CODEGEN-005 | Code Generation | Debug information maps back to source spans | error | scoped | the surface is removed from the callable: generate_dwarf_debug_info has no caller, and the -g flag is rejected with the explicit 'debug info is not supported' error (the inert debug_info option is gone — no compile path can emit debug info, so the claim is removed from the verified set) | 9ae5778e8e |
+| INV-CODEGEN-006 | Code Generation | Global constants are emitted in data sections | error | implemented | tg_compiler/codegen.tg:codegen_static | 9ae5778e8e |
+| INV-CODEGEN-007 | Code Generation | Type layouts match target pointer size | error | implemented | tg_compiler/layout_engine.tg:compute_type_layout | 9ae5778e8e |
+| INV-CODEGEN-008 | Code Generation | Variant tag size matches enum variant count | error | implemented | tg_compiler/layout_engine.tg:compute_enum_layout | 9ae5778e8e |
+| INV-FIREWALL-001 | MIR | Post-monomorphization verification is UNCONDITIONAL (the generic substitution is a transformative boundary every build re-proves) | error | implemented | tg_compiler/compiler_core.tg:compile_file_core | 9ae5778e8e |
+| INV-FIREWALL-002 | MIR | The final firewall: verify_mir + the completeness oracle immediately before codegen | error | implemented | tg_compiler/compiler_core.tg:compile_file_core | 9ae5778e8e |
+| INV-FIREWALL-003 | MIR | A MirSwitchInt discriminant is an integer-like scalar and its target values are pairwise distinct | error | implemented | tg_compiler/mir.tg:verifier_switch_checks | 9ae5778e8e |
+| INV-FIREWALL-004 | MIR | Switch target values over an enum must be DECLARED variant discriminants (impossible enum discriminants rejected) | error | implemented | tg_compiler/mir.tg:verifier_switch_checks | 9ae5778e8e |
+| INV-FIREWALL-005 | MIR | The block-id universe of one function is disjoint (the exactly-one-terminator rule) | error | implemented | tg_compiler/mir.tg:verify_function_v2 | 9ae5778e8e |
+| INV-LAYOUT-003 | Code generation | Layout size/offset arithmetic is overflow-fail-closed (checked add/mul, ICE on overflow or negative operands) | error | implemented | tg_compiler/layout_engine.tg:layout_checked_add | 9ae5778e8e |
+| INV-LAYOUT-004 | Type checking | The fixed-array element count is bounded at the [T; N] annotation (the user-input path into layout arithmetic) | error | implemented | tg_compiler/types.tg:MAX_FIXED_ARRAY_ELEMS | 9ae5778e8e |
+| INV-LOWER-001 | MIR Lowering | Every AST function produces at least one MIR basic block | error | implemented | tg_compiler/mir.tg:verify_function_v2 | 9ae5778e8e |
+| INV-LOWER-002 | MIR Lowering | All local variables are allocated in scope | error | implemented | tg_compiler/mir.tg:verify_function_v2 | 9ae5778e8e |
+| INV-LOWER-003 | MIR Lowering | Terminators are only at block ends | error | implemented | tg_compiler/mir.tg:verify_function_v2 | 9ae5778e8e |
+| INV-LOWER-004 | MIR Lowering | Phi nodes reference valid predecessor blocks | error | implemented | tg_compiler/mir.tg:verifier_dataflow_init | 9ae5778e8e |
+| INV-LOWER-005 | MIR Lowering | Struct field accesses lower to typed offsets | error | implemented | tg_compiler/mir.tg:lower_place | 9ae5778e8e |
+| INV-LOWER-006 | MIR Lowering | Enum variant construction lowers to tagged unions | error | implemented | tg_compiler/mir.tg:enum_variant_name_matches | 9ae5778e8e |
+| INV-LOWER-007 | MIR Lowering | Closures capture environment via capture list | error | implemented | tg_compiler/mir.tg:lower_pending_closures | 9ae5778e8e |
+| INV-LOWER-008 | MIR Lowering | Control flow (if/match/loop) lowers to branch instructions | error | implemented | tg_compiler/mir.tg:lower_if | 9ae5778e8e |
+| INV-MIR-001 | MIR Validation | All basic blocks are reachable from entry | error | scoped | tg_compiler/mir.tg:eliminate_dead_code | 9ae5778e8e |
+| INV-MIR-002 | MIR Validation | SSA values are defined before use | error | implemented | tg_compiler/mir.tg:verifier_dataflow_init | 9ae5778e8e |
+| INV-MIR-003 | MIR Validation | Types in MIR instructions are well-formed | error | implemented | tg_compiler/mir.tg:verify_function_v2 | 9ae5778e8e |
+| INV-MIR-004 | MIR Validation | No orphan local variables without definition | error | implemented | tg_compiler/mir.tg:verify_function_v2 | 9ae5778e8e |
+| INV-MIR-005 | MIR Validation | Switch targets cover all enum variants | error | scoped | tg_compiler/types.tg:check_match | 9ae5778e8e |
+| INV-MIR-006 | MIR Validation | Function calls match callee signature arity | error | implemented | tg_compiler/mir.tg:verifier_check_callees | 9ae5778e8e |
+| INV-MIR-007 | MIR Validation | Return instruction type matches function return type | error | implemented | tg_compiler/mir.tg:verify_function_v2 | 9ae5778e8e |
+| INV-MIR-008 | MIR Validation | Pretty-print output is deterministic and diffable | error | implemented | tg_compiler/mir.tg:pretty_print_mir | 9ae5778e8e |
+| INV-MIR-009 | MIR Validation | MIR serialization round-trips without loss | error | scoped | the serialization claim is removed from the verified set: no serializer exists in the callable; the former claim is re-assigned to the deterministic pretty-printer (INV-MIR-008) | 9ae5778e8e |
+| INV-MIR-010 | MIR Validation | Entry block is always bb0 | error | implemented | tg_compiler/mir.tg:verify_function_v2 | 9ae5778e8e |
+| INV-OPT-001 | Optimization | Inlining preserves observable behavior | error | implemented | tg_compiler/mir.tg:inline_functions | 9ae5778e8e |
+| INV-OPT-002 | Optimization | Dead code elimination does not remove side effects | error | implemented | tg_compiler/mir.tg:eliminate_dead_code | 9ae5778e8e |
+| INV-OPT-003 | Optimization | Constant folding preserves value precision | error | implemented | tg_compiler/mir.tg:fold_constants | 9ae5778e8e |
+| INV-OPT-004 | Optimization | Loop transformations preserve termination | warning | scoped | the claim's surface does not exist in the callable: there is no loop-transformation pass to violate termination; the invariant is removed from the verified set with this justification | 9ae5778e8e |
+| INV-OPT-005 | Optimization | Common subexpression elimination is correct | error | implemented | tg_compiler/mir.tg:global_value_numbering | 9ae5778e8e |
+| INV-OPT-006 | Optimization | Register allocation spills are correctly inserted | error | scoped | the claim's surface does not exist in the callable: there is no register allocator (codegen.tg direct emission); the invariant is removed from the verified set with this justification | 9ae5778e8e |
+| INV-OPT-007 | Optimization | Optimized MIR passes all MIR validation invariants | error | implemented | tg_compiler/compiler_core.tg:compile_file_core | 9ae5778e8e |
+| INV-OPT-008 | Optimization | No new undefined values introduced by optimization | error | implemented | tg_compiler/mir.tg:verifier_dataflow_init | 9ae5778e8e |
+| INV-ORACLE-001 | Type checking | The semantic completeness oracle audits every typed channel at the typecheck tail; any residual Type::Error / Type::Var / Param-in-concrete-position is an ICE-class error | error | implemented | tg_compiler/types.tg:run_semantic_completeness_oracle | 9ae5778e8e |
+| INV-ORACLE-002 | Type checking | Every recorded call-target and finalizer DefId is a resolver-registered symbol | error | implemented | tg_compiler/types.tg:run_semantic_completeness_oracle | 9ae5778e8e |
+| INV-ORACLE-003 | Type checking | Every typed FieldId / VariantId names an existing field/variant of its owner type | error | implemented | tg_compiler/types.tg:oracle_check_field_id | 9ae5778e8e |
+| INV-ORACLE-004 | Type checking | Every typed call's receiver and arguments carry the recorded per-node access effect | error | implemented | tg_compiler/types.tg:oracle_walk_typed_expr | 9ae5778e8e |
+| INV-ORACLE-005 | Type checking | Every registered trait impl is backed by its trait's declared contract (the obligation-solution backstop) | error | implemented | tg_compiler/types.tg:run_semantic_completeness_oracle | 9ae5778e8e |
+| INV-ORACLE-006 | MIR | The MIR completeness oracle proves every post-mono type has a computable layout (fail-closed) | error | implemented | tg_compiler/compiler_core.tg:run_mir_completeness_oracle | 9ae5778e8e |
+| INV-ORACLE-007 | Type checking | Every named TypeId the typed channels reference is a registered nominal (the unknown-layout precursor) | error | implemented | tg_compiler/types.tg:run_semantic_completeness_oracle | 9ae5778e8e |
+| INV-OWN-001 | Access Checking | Per-call access overlap is exclusive for Modify/Consume/Initialize | error | implemented | tg_compiler/access_check.tg:check_overlaps | 9ae5778e8e |
+| INV-OWN-002 | Access Checking | At most one mutable access is active per call | error | implemented | tg_compiler/access_check.tg:check_overlaps | 9ae5778e8e |
+| INV-OWN-003 | Access Checking | Access duration is the containing call | error | implemented | tg_compiler/types.tg:record_arg_effect | 9ae5778e8e |
+| INV-OWN-004 | Access Checking | Fixed struct fields are statically disjoint under access checks | error | implemented | tg_compiler/access_check.tg:check_overlaps | 9ae5778e8e |
+| INV-OWN-005 | Resource Checking | Resource locals are consumed at most once per CFG path | error | implemented | tg_compiler/resource_check.tg:resource_check | 9ae5778e8e |
+| INV-OWN-006 | Resource Checking | Capabilities are transferred exactly once | error | implemented | tg_compiler/resource_check.tg:validate_capability_exit | 9ae5778e8e |
+| INV-OWN-007 | Resource Checking | Resources created in a loop are consumed per iteration | error | implemented | tg_compiler/resource_check.tg:resource_check | 9ae5778e8e |
+| INV-OWN-008 | Resource Checking | Resources are auto-deinitialized at scope exit in declaration reverse order | error | implemented | tg_compiler/mir.tg:emit_cleanup_chain | 9ae5778e8e |
+| INV-PANIC-001 | Runtime | panic=abort is the ONLY stable panic strategy; the compiler rejects any stable panic=unwind request | error | implemented | std/core.tg:panic | 9ae5778e8e |
+| INV-PARSE-001 | Lexing | All tokens carry source location spans | error | implemented | tg_compiler/token.tg:struct Token | 9ae5778e8e |
+| INV-PARSE-002 | Lexing | String literals are UTF-8 validated | error | implemented | stage0_swift/Sources/TangerineCompiler/SemanticGates.swift:SourceLoader | 9ae5778e8e |
+| INV-PARSE-003 | Lexing | Numeric literals fit in host integer range | warning | implemented | stage0_swift/Sources/TangerineCompiler/SemanticGates.swift:NumericLiteralGuard | 9ae5778e8e |
+| INV-PARSE-004 | Parsing | Every parsed item has a non-empty span | error | implemented | tg_compiler/parser.tg:parse_item | 9ae5778e8e |
+| INV-PARSE-005 | Parsing | Block bodies terminate with `end` keyword | error | implemented | tg_compiler/parser.tg:parse_block_body | 9ae5778e8e |
+| INV-PARSE-006 | Parsing | Function declarations have at least a name | error | implemented | tg_compiler/parser.tg:parse_function_decl | 9ae5778e8e |
+| INV-PARSE-007 | Parsing | Spans are well-ordered (start ≤ end) for non-synthetic nodes | error | implemented | stage0_swift/Sources/TangerineCompiler/ASTVerifier.swift:verifySpan | 9ae5778e8e |
+| INV-PARSE-008 | Parsing | Inverted spans are detected and reported by the verifier | error | implemented | stage0_swift/Sources/TangerineCompiler/ASTVerifier.swift:verifySpan | 9ae5778e8e |
+| INV-PARSE-009 | Parsing | Duplicate top-level names produce a diagnostic | warning | implemented | tg_compiler/resolver.tg:record_item_def | 9ae5778e8e |
+| INV-PARSE-010 | Parsing | Macro declarations are preserved in AST | error | implemented | tg_compiler/parser.tg:parse_macro_decl | 9ae5778e8e |
+| INV-PARSE-011 | Parsing | Attributes attach to exactly one item | error | implemented | tg_compiler/parser.tg:parse_attributes | 9ae5778e8e |
+| INV-PARSE-012 | Parsing | Use declarations form valid module paths | error | implemented | tg_compiler/compiler_core.tg:merge_imported_deps | 9ae5778e8e |
+| INV-RELOC-001 | Link | Relocation offsets are WIDTH-AWARE section-bounded (offset + patch width <= len, overflow-safe) | error | implemented | tg_compiler/object.tg:validate_object_file | 9ae5778e8e |
+| INV-RELOC-002 | Link | Every relocation names a symbol the object carries | error | implemented | tg_compiler/object.tg:validate_object_file | 9ae5778e8e |
+| INV-RELOC-003 | Link | The AArch64 ADRP/ADD pair invariants: page relocation at O must pair with its lo12 at O+4 for the SAME symbol (and vice versa) | error | implemented | tg_compiler/object.tg:validate_aarch64_adrp_add_pairs | 9ae5778e8e |
+| INV-RESOLVE-001 | Name Resolution | All references resolve to a declaration | error | implemented | tg_compiler/resolver.tg:resolve_names | 9ae5778e8e |
+| INV-RESOLVE-002 | Name Resolution | No ambiguous name references remain | error | implemented | tg_compiler/resolver.tg:bare_name_resolve | 9ae5778e8e |
+| INV-RESOLVE-003 | Name Resolution | Use imports are validated against module graph | error | implemented | tg_compiler/compiler_core.tg:merge_imported_deps | 9ae5778e8e |
+| INV-RESOLVE-004 | Name Resolution | Visibility rules are enforced for cross-module refs | error | implemented | tg_compiler/resolver.tg:resolve_names | 9ae5778e8e |
+| INV-RESOLVE-005 | Name Resolution | Extern declarations resolve to ABI symbols | warning | scoped | tg_compiler/mir.tg:verify_function_v2 | 9ae5778e8e |
+| INV-RESOLVE-006 | Name Resolution | Type aliases expand without cycles | error | implemented | tg_compiler/types.tg:is_trivially_copyable_walk | 9ae5778e8e |
+| INV-RESOLVE-007 | Name Resolution | Trait implementations match trait signatures | error | implemented | tg_compiler/types.tg:solve_obligation | 9ae5778e8e |
+| INV-RESOLVE-008 | Name Resolution | Const expressions evaluate at compile time | error | implemented | tg_compiler/types.tg:eval_const_size_expr | 9ae5778e8e |
+| INV-TYPE-001 | Type Checking | All expressions have an inferred or annotated type | error | implemented | tg_compiler/types.tg:type_check_typed | 9ae5778e8e |
+| INV-TYPE-002 | Type Checking | Function return types match body type | error | implemented | tg_compiler/types.tg:type_check_typed | 9ae5778e8e |
+| INV-TYPE-003 | Type Checking | Binary operators have compatible operand types | error | implemented | tg_compiler/types.tg:type_check_typed | 9ae5778e8e |
+| INV-TYPE-004 | Type Checking | Match arms have consistent return types | error | implemented | tg_compiler/types.tg:check_match | 9ae5778e8e |
+| INV-TYPE-005 | Type Checking | Struct field access uses declared field names | error | implemented | tg_compiler/types.tg:type_check_typed | 9ae5778e8e |
+| INV-TYPE-006 | Type Checking | Generic type parameters satisfy trait bounds | error | implemented | tg_compiler/types.tg:solve_obligation | 9ae5778e8e |
+| INV-TYPE-007 | Type Checking | Closures capture variables with correct ownership | error | implemented | tg_compiler/types.tg:scan_closure_captures | 9ae5778e8e |
+| INV-TYPE-008 | Type Checking | Integer literals fit declared type width | warning | implemented | tg_compiler/types.tg:check_integer_literal_range | 9ae5778e8e |
+| INV-TYPE-009 | Type Checking | Enum variant construction matches variant signature | error | implemented | tg_compiler/types.tg:type_check_typed | 9ae5778e8e |
+| INV-TYPE-010 | Type Checking | Trait objects use dyn keyword | error | scoped | stage0_swift/Sources/TangerineCompiler/SubsetChecker.swift:checkTypeExpr | 9ae5778e8e |
 
 ## Test matrix
 
@@ -266,7 +266,7 @@ gap is classified as **implemented-with-assertions** or
 | INV-CODEGEN-002 | exhaustive dispatch over MirStatementKind/MirRvalueKind/MirTerminatorKind with fail-closed panic arms — an unmapped instruction is an ICE, never silent |
 | INV-CODEGEN-003 | value-category classification on both arches |
 | INV-CODEGEN-004 | FP/LR + callee-saved survival |
-| INV-CODEGEN-005 | generate_dwarf_debug_info exists (object.tg) but has NO caller in any compile path; opts.debug_info is inert |
+| INV-CODEGEN-005 | the -g flag is REJECTED at the argument parse ("debug info is not supported") — generate_dwarf_debug_info (object.tg) has no caller in any compile path, and opts.debug_info can never be set by a CLI invocation |
 | INV-CODEGEN-006 | data emission for statics/constants |
 | INV-CODEGEN-007 | pointer_size-driven sizes |
 | INV-CODEGEN-008 | discriminant sizing |
@@ -356,4 +356,4 @@ gap is classified as **implemented-with-assertions** or
 ---
 
 Generated by `scripts/gen_invariants.sh` from `invariants.toml`.
-Registry version 3; last verified SHA e1eb946.
+Registry version 3; last verified SHA 9ae5778e8e3dd4d53d44b36a122e4e565be299b7.

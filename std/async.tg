@@ -1087,12 +1087,37 @@ end
 # child was cancelled. Awaiting the handle from the scoped join_all is the
 # cooperative wait — the executor advances the children between the
 # join_all task's polls.
+#
+# THE REGISTER-ONCE WAITER MACHINERY (the reviewer's scoped closure — the
+# same register-once/Drop-unregister machinery the JoinHandle has): the
+# handle's OWN join waiter registration — set at the FIRST Pending poll (a
+# re-poll while the child is still running never appends a duplicate
+# waiter — the old scoped poll appended a waiter on EVERY Pending poll),
+# cleared never (the registration lives until the child's completion
+# detaches the waiter vector, or the handle's Drop unregisters the exact
+# entry). The id comes from the executor's next_waiter_id allocator.
 struct ScopedTaskHandle
   task_id: UInt
   executor: Arc[ExecutorInner]
+  waiter_id: Option[UInt]
 end
 
 impl ScopedTaskHandle
+  # THE OBSERVER CLONE: a clone is a NEW observer of the same child — it
+  # shares the task id and the executor Arc clone, but it starts with NO
+  # registered waiter (waiter_id: None — its first Pending poll registers
+  # its OWN join waiter exactly once, and its own Drop unregisters it).
+  # The explicit form is REQUIRED: the bare intrinsic clone would copy a
+  # registered waiter_id, and the two handles would share one registration
+  # (the first Drop would unregister the other's waiter).
+  def clone(self: ScopedTaskHandle) -> ScopedTaskHandle
+    ScopedTaskHandle {
+      task_id: self.task_id,
+      executor: self.executor.clone(),
+      waiter_id: Option::None
+    }
+  end
+
   # Cancel the child task: the task reaches the terminal state Cancelled,
   # its registrations are removed, and its join waiters (a join_all
   # awaiting it) are woken — the handle then resolves Err on the next
@@ -1100,6 +1125,24 @@ impl ScopedTaskHandle
   def cancel(self: ScopedTaskHandle) -> Bool
     let mut exec = Executor { inner: self.executor.clone() }
     exec.cancel_task(self.task_id)
+  end
+end
+
+impl Drop for ScopedTaskHandle
+  def drop(inout self: ScopedTaskHandle) -> Unit
+    # THE DROP UNREGISTER (the scoped closure): an observer that leaves
+    # before the child's completion removes its OWN waiter entry by the
+    # waiter id — the child's completion never wakes a dropped observer's
+    # stale waker, and the waiter map holds no dead registration (after
+    # every handle to a finished child drops, the map is empty).
+    match self.waiter_id
+    when Option::Some(id) then
+      unsafe "executor inner access — the handle's Arc clone keeps the executor alive" do
+        let exec = self.executor.ptr.as_mut()
+        exec.unregister_join_waiter(self.task_id, id)
+      end
+    when Option::None then ()
+    end
   end
 end
 
@@ -1111,8 +1154,10 @@ impl Future for ScopedTaskHandle
       let exec = self.executor.ptr.as_mut()
       # The terminal states: Completed (a result is stored) or Cancelled.
       # Everything else — the child is still running — registers the
-      # waiter and stays Pending (the child's completion or cancellation
-      # wakes this handle).
+      # waiter ONCE (the waiter_id guard — a re-poll while the child is
+      # still running never appends a duplicate; the old scoped poll
+      # appended a waiter on EVERY Pending poll) and stays Pending (the
+      # child's completion or cancellation wakes this handle).
       if exec.task_results.contains_key(&self.task_id) then
         let ok_result: Result[Unit, String] = Result::Ok(())
         return Poll::Ready(ok_result)
@@ -1125,7 +1170,11 @@ impl Future for ScopedTaskHandle
         let fail_result: Result[Unit, String] = Result::Err("task failed".to_string())
         Poll::Ready(fail_result)
       when _ then
-        exec.register_join_waiter(self.task_id, cx.waker.clone())
+        if self.waiter_id.is_none() then
+          let id = exec.alloc_waiter_id()
+          exec.register_join_waiter_with_id(self.task_id, id, cx.waker.clone())
+          self.waiter_id = Option::Some(id)
+        end
         Poll::Pending
       end
     end
@@ -3229,7 +3278,8 @@ impl TaskScope
     let handle = spawn(future)
     let scoped_handle = ScopedTaskHandle {
       task_id: handle.task_id,
-      executor: handle.executor.clone()
+      executor: handle.executor.clone(),
+      waiter_id: Option::None
     }
     # The intentional clone — the deliberate ownership split: the scope
     # tracks ITS copy (the join_all drains the scope's vector), the

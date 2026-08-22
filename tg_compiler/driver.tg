@@ -13,7 +13,7 @@
 use std::core::{Option, Result, panic}
 use std::collections::{Vec, Map, Set}
 use std::args::{raw_arg_count, raw_arg_unchecked, raw_arg_copy}
-use std::fs::{read_file, write_file, write_file_bytes, mkdir_p, list_directory, delete_file, file_exists, is_dir, raw_open, raw_read, raw_close, O_RDONLY, S_DEFAULT}
+use std::fs::{read_file, write_file, write_file_bytes, mkdir_p, list_directory, delete_file, file_exists, is_dir, raw_open, raw_read, raw_close, read_to_vec, O_RDONLY, S_DEFAULT}
 use std::env::{args}
 use std::bench::{BenchCase, bench_case_new}
 use std::process::{run_command}
@@ -22,7 +22,13 @@ use std::process::{run_command}
 # — the package system's parser — is the single authority for the driver's
 # project manifests (load_project), lockfiles (parse_lockfile) and workspace
 # manifests (load_workspace). The former hand-rolled line parsers are gone.
-use tg_compiler::pkg_manager::{parse_toml, TomlValue}
+# The package-tree digest (hash_package_tree) and the archive-path
+# pre-flight (validate_tar_gz_archive) are the package manager's — the
+# driver consumes them for the path/git checksums and the registry
+# extraction gate.
+use tg_compiler::pkg_manager::{parse_toml, TomlValue, validate_tar_gz_archive, hash_package_tree}
+use tg_compiler::agentic::{agentic_context_new, analyze_agentic_features}
+use tg_compiler::cqs::{cqs_query_server_new, cqs_run_queries}
 
 use tg_compiler::token::{Token, Span}
 use tg_compiler::lexer::{tokenize}
@@ -74,8 +80,16 @@ use tg_compiler::compiler_core::{
   compile_file, compile_startup_entry, compile_multiple_files, compile_file_core,
   get_output_path, explain_error_code, error_code_example,
   emitter_new, emitter_new_json, DiagnosticEmitter, driver_lower_to_mir, analyze_program,
-  Diagnostic, DiagLevel, json_escape, parse_source_program, join_diagnostics
+  Diagnostic, DiagLevel, json_escape, parse_source_program, join_diagnostics,
+  emit_diagnostic, merge_imported_deps
 }
+
+# The WASM backend route — the driver's --target wasm32-unknown-unknown
+# dispatch (see compile_to_wasm_route below).
+use tg_compiler::wasm_target::{
+  WasmCompiler, WasmCompileConfig, WasmTarget,
+}
+use tg_compiler::cross_compile::{OptLevel as WasmOptLevel}
 
 pub use tg_compiler::compiler_core::{
   CompilerOptions, compile_file, compile_startup_entry, compile_file_core,
@@ -178,7 +192,13 @@ def parse_args(argv: Vec[String]) -> Result[CompilerOptions, String]
     elsif arg == "-O3" then
       opts.opt_level = 3
     elsif arg == "-g" then
-      opts.debug_info = true
+      # THE -g REJECTION (the reviewer's false-success fix): the
+      # debug_info option was INERT — no compile path emits debug info
+      # (generate_dwarf_debug_info has no caller), so the flag silently
+      # claimed a feature that does not exist. The honest contract is the
+      # REJECTION: `-g` fails with the explicit "debug info is not
+      # supported" error instead of compiling with a decorative flag.
+      return Result::Err("debug info is not supported: the -g flag is rejected (no compile path emits debug info)")
     elsif arg == "--check" then
       opts.check_only = true
     elsif arg == "-v" || arg == "--verbose" then
@@ -344,13 +364,25 @@ def parse_startup_compile_args(skip_subcommand: Bool) -> Result[CompilerOptions,
     elsif arg == "-O3" then
       opts.opt_level = 3
     elsif arg == "-g" then
-      opts.debug_info = true
+      # THE -g REJECTION (the reviewer's false-success fix): the
+      # debug_info option was INERT — no compile path emits debug info
+      # (generate_dwarf_debug_info has no caller), so the flag silently
+      # claimed a feature that does not exist. The honest contract is the
+      # REJECTION: `-g` fails with the explicit "debug info is not
+      # supported" error instead of compiling with a decorative flag.
+      return Result::Err("debug info is not supported: the -g flag is rejected (no compile path emits debug info)")
     elsif arg == "--target" then
       i = i + 1
       if i >= argc then
         return Result::Err("Missing argument for --target")
       end
       opts.target_triple = Option::Some(raw_arg_copy(i))
+    elsif arg == "--no-std" then
+      # The no_std flag: accepted here (the compile route reads it from the
+      # raw argv — CompilerOptions carries no dedicated field). A no_std
+      # compile applies the core-only surface + _start entry + libc-free
+      # link contract (see compile_to_nostd_route).
+      ()
     elsif arg == "--panic-strategy" then
       # STATE A (abort-only): the startup-compile entry enforces the same
       # rejection as the full CLI — panic=unwind is never selectable.
@@ -397,7 +429,7 @@ def print_help() -> Unit
   println("  doc       Generate documentation")
   println("  bench     Run benchmarks")
   println("  repl      Interactive REPL")
-  println("  lsp       Start language server")
+  println("  lsp       Start language server (alias: ln)")
   println("  init      Create new project")
   println("  dep       Dependency management (add/remove/list/update/tree)")
   println("  install   Install a package globally")
@@ -544,7 +576,7 @@ def driver_main() -> Int
     cmd_bench(startup_subcommand_argv())
   elsif first == "repl" then
     cmd_repl(startup_subcommand_argv())
-  elsif first == "lsp" then
+  elsif first == "lsp" || first == "ln" then
     cmd_lsp(startup_subcommand_argv())
   elsif first == "init" then
     cmd_init(startup_subcommand_argv())
@@ -607,7 +639,7 @@ def detect_subcommand(argv: Vec[String]) -> SubcommandDispatch
     Subcommand::Bench
   elsif first == "repl" then
     Subcommand::Repl
-  elsif first == "lsp" then
+  elsif first == "lsp" || first == "ln" then
     Subcommand::Lsp
   elsif first == "init" then
     Subcommand::Init
@@ -1153,8 +1185,28 @@ def cmd_check(argv: Vec[String]) -> Int
   
   var exit_code = 0
   for file in opts.input_files do
-    match compile_file(&opts, file)
-    when Result::Ok(_) then ()
+    match compile_file(&opts, file.clone())
+    when Result::Ok(_) then
+      # (the CQS query server — the canonical pipeline's invocation): the
+      # compiler-query-server queries run on the SAME canonical semantic
+      # path the check gate runs (parse -> dependency merge -> analyze ->
+      # lower). The query results AFFECT the compilation where required:
+      # an Error-level CQS diagnostic (the mode matrix's gated failure —
+      # Production/Hardened) is reported and fails the check. The Dev-mode
+      # sweep contract (zero diagnostics) is untouched: the Dev matrix
+      # enforces nothing, so no diagnostic is emitted.
+      let cqs_diags = driver_cqs_query_pass(file.clone(), &opts)
+      var cqs_failed = false
+      for d in cqs_diags do
+        match d.level
+        when DiagLevel::Error then cqs_failed = true
+        when _ then ()
+        end
+      end
+      if cqs_failed then
+        eprintln("CQS gate: " + join_diagnostics(&cqs_diags))
+        exit_code = 1
+      end
     when Result::Err(e) then
       # Surface the failure (e.g. the E106 hard error on `&T` type positions,
       # which aborts at the parse stage): the diagnostics were reported by
@@ -1165,6 +1217,48 @@ def cmd_check(argv: Vec[String]) -> Int
   end
   
   exit_code
+end
+
+# (the CQS query server — the canonical pipeline's invocation): the
+# driver-owned query pass. The pass re-runs the canonical semantic path
+# (the same parse -> merge -> analyze -> lower shape the check gate
+# runs) and returns the three query results' diagnostic channel — the
+# Error-level entries (the mode matrix's gated failures) fail the check;
+# the warning-level entries stay in the query results (the API and the
+# strict modes surface them). The pass fails silently (an empty result)
+# when the file does not parse or analyze — the semantic gate already
+# reported those failures.
+def driver_cqs_query_pass(file: String, opts: CompilerOptions) -> Vec[Diagnostic]
+  var empty = Vec::new()
+  let source = match read_file(file.clone())
+  when Result::Ok(s) then s
+  when Result::Err(_) then return empty
+  end
+  var ast = match parse_source_program(source, file)
+  when Result::Ok(program) then program
+  when Result::Err(_) then return empty
+  end
+  let merged = match merge_imported_deps(ast, include_compiler_lib: false)
+  when Result::Ok(m) then m
+  when Result::Err(_) then return empty
+  end
+  ast = merged
+  var env = type_env_new()
+  var typed_program: Option[AnalyzedProgram] = Option::None
+  match analyze_program(&mut env, &mut ast, &opts)
+  when Result::Ok(ap) then typed_program = Option::Some(ap)
+  when Result::Err(_) then return empty
+  end
+  let mir = match driver_lower_to_mir(&ast, &typed_program)
+  when Result::Ok(m) then m
+  when Result::Err(_) then return empty
+  end
+  match typed_program
+  when Option::Some(ap) then
+    let results = cqs_run_queries(cqs_query_server_new(), &ast, &ap.typed, &mir, opts.mode, "driver")
+    results.diagnostics
+  when Option::None then empty
+  end
 end
 
 # 
@@ -1258,11 +1352,12 @@ end
 # Subcommand: lint
 # 
 
-use tg_compiler::linter::{lint_file, LintConfig, default_lint_config, LintLevel}
+use tg_compiler::linter::{lint_file, list_lints, LintConfig, LintDiagnostic, default_lint_config, LintLevel}
 
 def cmd_lint(argv: Vec[String]) -> Int
   var files = Vec::new()
   var config = default_lint_config()
+  var list_only = false
   
   var i: UInt = 1
   while i < argv.len() do
@@ -1290,6 +1385,8 @@ def cmd_lint(argv: Vec[String]) -> Int
       config.warned.push(argv[i].clone())
     elsif arg == "--json" then
       config.json_output = true
+    elsif arg == "--list" then
+      list_only = true
     elsif arg == "-h" || arg == "--help" then
       println("Usage: tg lint [OPTIONS] [FILES]...")
       println("Run linter on Tangerine source files")
@@ -1299,6 +1396,12 @@ def cmd_lint(argv: Vec[String]) -> Int
       println("  --allow <LINT>   Allow a lint (suppress)")
       println("  --warn <LINT>    Warn on a lint")
       println("  --json           Output diagnostics as JSON")
+      println("  --list           List the available lints")
+      println("")
+      println("Exit codes:")
+      println("  0  no diagnostics")
+      println("  1  at least one error-level diagnostic (or a read failure)")
+      println("  2  warnings/info only")
       return 0
     elsif arg.starts_with("-") then
       eprintln("error: unknown option '" + arg + "' for `tg lint` (try `tg lint --help`)")
@@ -1308,6 +1411,19 @@ def cmd_lint(argv: Vec[String]) -> Int
     end
     i = i + 1
   end
+
+  if list_only then
+    let lints = list_lints()
+    for (name, desc, level) in lints do
+      let level_str = match level
+      when LintLevel::Error then "error"
+      when LintLevel::Warning then "warning"
+      when LintLevel::Info then "info"
+      end
+      println(name + "  [" + level_str + "]  " + desc)
+    end
+    return 0
+  end
   
   if files.is_empty() then
     files = find_tg_files(".")
@@ -1315,11 +1431,24 @@ def cmd_lint(argv: Vec[String]) -> Int
   
   var total_warnings: UInt = 0
   var total_errors: UInt = 0
+  var diag_count: UInt = 0
   
   for file in files do
     match lint_file(file.clone(), &config)
     when Result::Ok(diagnostics) then
       for diag in diagnostics do
+        diag_count = diag_count + 1
+        if config.json_output then
+          println(lint_diagnostic_json(&diag))
+        else
+          let level_str = match diag.level
+          when LintLevel::Error then "error"
+          when LintLevel::Warning then "warning"
+          when LintLevel::Info then "info"
+          end
+          println(diag.file.clone() + ":" + diag.line.to_string() + ":" + diag.column.to_string() +
+            ": " + level_str + "[" + diag.lint_name.clone() + "]: " + diag.message.clone())
+        end
         match diag.level
         when LintLevel::Error then
           total_errors = total_errors + 1
@@ -1329,14 +1458,39 @@ def cmd_lint(argv: Vec[String]) -> Int
         end
       end
     when Result::Err(e) then
+      eprintln(e)
       total_errors = total_errors + 1
     end
   end
   
-  if total_errors > 0 || total_warnings > 0 then
+  if !config.json_output && diag_count > 0 then
+    println("lint: " + diag_count.to_string() + " diagnostic(s), " + total_errors.to_string() +
+      " error(s), " + total_warnings.to_string() + " warning(s)")
   end
   
-  if total_errors > 0 then 1 else 0 end
+  if total_errors > 0 then
+    1
+  elsif diag_count > 0 then
+    2
+  else
+    0
+  end
+end
+
+# The single-line JSON form of a lint diagnostic (the --json output
+# channel — one object per diagnostic, RFC 8259-parseable as a stream).
+def lint_diagnostic_json(diag: LintDiagnostic) -> String
+  let level_str = match diag.level
+  when LintLevel::Error then "error"
+  when LintLevel::Warning then "warning"
+  when LintLevel::Info then "info"
+  end
+  "{\"file\":\"" + json_escape(diag.file.clone()) +
+    "\",\"line\":" + diag.line.to_string() +
+    ",\"column\":" + diag.column.to_string() +
+    ",\"level\":\"" + level_str + "\"" +
+    ",\"lint\":\"" + json_escape(diag.lint_name.clone()) + "\"" +
+    ",\"message\":\"" + json_escape(diag.message.clone()) + "\"}"
 end
 
 # 
@@ -1834,7 +1988,10 @@ end
 # 
 
 def cmd_lsp(argv: Vec[String]) -> Int
-  println("Starting Tangerine Language Server...")
+  # The banner goes to STDERR: the LSP 3.17 stdio transport is pure
+  # JSON-RPC on stdout — a stray line would corrupt the client's framed
+  # stream.
+  eprintln("Starting Tangerine Language Server...")
   var server = lsp_server_new()
   lsp_main_loop(&mut server)
   0
@@ -1888,6 +2045,644 @@ end
 # 
 # Subcommand: compile (raw, no subcommand)
 # 
+
+# ———————————————————————————————————————————————————————————————
+# THE WASM DRIVER ROUTE — --target wasm32-unknown-unknown
+# ———————————————————————————————————————————————————————————————
+# The driver's wasm dispatch: a --target wasm32-unknown-unknown (or
+# wasm32-wasi) compile routes to the WASM BACKEND (wasm_target.tg's
+# WasmCompiler) instead of the native object/executable emission. The
+# route runs the SAME front-end pipeline (parse → merge deps → analyze →
+# MIR → verify → monomorphize → optimize → verify) and then the wasm
+# backend — the type/layout mapping (i32/i64/f32/f64/externref), the
+# section emission (type/import/function/memory/global/export/start/
+# code/data + the producer custom section), the binary encode — writing a
+# .wasm module. The native route (compile_file_core) never sees the wasm
+# target: the dispatch below intercepts it at the driver boundary.
+
+def is_wasm_target(opts: CompilerOptions) -> Bool
+  match opts.target_triple
+  when Option::Some(t) then
+    t == "wasm32-unknown-unknown" || t == "wasm32-wasi"
+  when Option::None then false
+  end
+end
+
+# The wasm backend config for the requested triple: wasm32-unknown-unknown
+# is the freestanding target (no WASI imports); wasm32-wasi adds the WASI
+# snapshot_preview1 imports.
+def wasm_config_for_triple(opts: CompilerOptions) -> WasmCompileConfig
+  let mut cfg = WasmCompileConfig::default()
+  match opts.target_triple
+  when Option::Some(t) then
+    if t == "wasm32-wasi" then
+      cfg.target = WasmTarget::Wasm32Wasi
+    else
+      cfg.target = WasmTarget::Wasm32Unknown
+    end
+  when Option::None then
+    cfg.target = WasmTarget::Wasm32Unknown
+  end
+  cfg
+end
+
+def compile_to_wasm_route(opts: CompilerOptions, files: Vec[String], output_path: String) -> Result[Unit, String]
+  if files.len() == 0 then
+    return Result::Err("no input files for the wasm compile")
+  end
+  var emitter = if opts.json_diagnostics then
+    emitter_new_json()
+  else
+    var e = emitter_new()
+    e.color_enabled = opts.color
+    e
+  end
+  var file_i = 0
+  while file_i < files.len() do
+    let file = files[file_i].clone()
+    let out_path = if output_path.len() > 0 then
+      output_path.clone()
+    else
+      get_output_path(&opts, file.clone(), ".wasm")
+    end
+    let source = match read_file(file.clone())
+    when Result::Ok(s) then s
+    when Result::Err(e) then return Result::Err("failed to read " + file.clone() + ": " + e)
+    end
+    var ast = match parse_source_program(source, file.clone())
+    when Result::Ok(p) then p
+    when Result::Err(diags) then
+      for d in diags do
+        emit_diagnostic(&mut emitter, d)
+      end
+      return Result::Err(join_diagnostics(&diags))
+    end
+    ast = match merge_imported_deps(ast, false)
+    when Result::Ok(a) then a
+    when Result::Err(e) then return Result::Err(e)
+    end
+    var env = type_env_new()
+    let typed = match analyze_program(&mut env, &mut ast, opts.clone())
+    when Result::Ok(tp) then tp
+    when Result::Err(diags) then
+      for d in diags do
+        emit_diagnostic(&mut emitter, d)
+      end
+      return Result::Err(join_diagnostics(&diags))
+    end
+    var mir = match driver_lower_to_mir(&ast, Option::Some(typed.clone()))
+    when Result::Ok(m) then m
+    when Result::Err(e) then return Result::Err("MIR lowering failed: " + e)
+    end
+    let pre_mono_errs = verify_mir(&mir)
+    if !pre_mono_errs.is_empty() then
+      return Result::Err("MIR verification failed before monomorphization (" + pre_mono_errs.len().to_string() + " error(s))")
+    end
+    var mono_cache = mono_cache_new(&ast, &typed.resolutions)
+    match monomorphize_program(&mut mir, &mut mono_cache)
+    when Result::Ok(_) then ()
+    when Result::Err(me) then
+      return Result::Err("monomorphization failed with " + me.len().to_string() + " error(s)")
+    end
+    optimize_mir(&mut mir, opts.opt_level)
+    let post_errs = verify_mir(&mir)
+    if !post_errs.is_empty() then
+      return Result::Err("MIR verification failed after optimization (" + post_errs.len().to_string() + " error(s))")
+    end
+    let cfg = wasm_config_for_triple(&opts)
+    let bytes = match WasmCompiler::new(cfg).compile(&mir)
+    when Result::Ok(b) then b
+    when Result::Err(e) then return Result::Err("wasm compilation failed: " + e.to_string())
+    end
+    match write_file_bytes(out_path.clone(), &bytes)
+    when Result::Ok(_) then ()
+    when Result::Err(e) then return Result::Err("failed to write " + out_path.clone() + ": " + e)
+    end
+    if !opts.quiet then
+      println("Wasm module: " + out_path)
+    end
+    file_i = file_i + 1
+  end
+  Result::Ok(())
+end
+
+# ———————————————————————————————————————————————————————————————
+# THE NO-STD ROUTE — the core-only compile contract
+# ———————————————————————————————————————————————————————————————
+# A no_std compile (the `--no-std` flag or the `@no_std` module attribute)
+# applies the no_std CONTRACT on top of the standard pipeline:
+#   1. the CORE-ONLY SURFACE — the program's own imports may only resolve
+#      within the no_std allowlist (std::core / std::ffi / std::embedded /
+#      std::atomic). The collection/string/alloc modules and the OS
+#      runtime modules (io/fs/process/env/net/...) are excluded from the
+#      program's import surface — an import of any of them fails the
+#      compile with the no_std diagnostic;
+#   2. the BARE ENTRY — the program must define `def _start() -> !` and
+#      must NOT define `main`: the binary's entry is the program's own
+#      _start (the linker's bare-entry fallback), there is no libc/CRT
+#      main wrapper, and the direct syscall surface (std::core's
+#      __intrinsic_syscall1..6 + the runtime's _exit) is the only
+#      OS-facing interface;
+#   3. the LINK CONTRACT — the internal linker resolves the entry through
+#      the default -> _start fallback chain and the produced image is
+#      fully self-contained (no libc dependency by construction).
+
+def join_vec_str(v: Vec[String], sep: String) -> String
+  var out = "".to_string()
+  var i = 0
+  while i < v.len() do
+    if i > 0 then
+      out = out + sep
+    end
+    out = out + v[i].clone()
+    i = i + 1
+  end
+  out
+end
+
+def root_item_has_attr(item: Item, name: String) -> Bool
+  for attr in item.attrs do
+    if attr.name == name then
+      return true
+    end
+  end
+  false
+end
+
+def root_program_has_attr(program: Program, name: String) -> Bool
+  for item in program.items do
+    if root_item_has_attr(item, name) then
+      return true
+    end
+  end
+  false
+end
+
+def root_program_has_fn(program: Program, name: String) -> Bool
+  for item in program.items do
+    match item.kind
+    when ItemKind::ItemFunction(f) then
+      if f.name == name then
+        return true
+      end
+    when _ then ()
+    end
+  end
+  false
+end
+
+def root_program_fn_names(program: Program) -> Vec[String]
+  var names = Vec::new()
+  for item in program.items do
+    match item.kind
+    when ItemKind::ItemFunction(f) then
+      names.push(f.name.clone())
+    when _ then ()
+    end
+  end
+  names
+end
+
+# The no_std core-only allowlist for a use path's module segment: std paths
+# must resolve within {core, ffi, embedded, atomic}; non-std paths (user
+# modules) are permitted.
+def nostd_use_allowed(segments: Vec[String]) -> Bool
+  if segments.len() < 2 then
+    return false
+  end
+  if segments[0] != "std" then
+    return true
+  end
+  let mod2 = segments[1].clone()
+  mod2 == "core" || mod2 == "ffi" || mod2 == "embedded" || mod2 == "atomic"
+end
+
+def nostd_surface_error(program: Program) -> Option[String]
+  for item in program.items do
+    match item.kind
+    when ItemKind::ItemUse(u) then
+      if !nostd_use_allowed(&u.path.segments) then
+        let path_str = join_vec_str(&u.path.segments, "::")
+        return Option::Some("no_std: the import `use " + path_str + "` is outside the core-only surface (allowed: std::core / std::ffi / std::embedded / std::atomic; the collection/string/alloc and the OS runtime modules are excluded from the no_std import surface)")
+      end
+    when _ then ()
+    end
+  end
+  Option::None
+end
+
+def start_entry_error(program: Program) -> Option[String]
+  let has_start = root_program_has_fn(program, "_start")
+  let has_main = root_program_has_fn(program, "main")
+  if !has_start then
+    return Option::Some("no_std: the program must define the bare entry `def _start() -> !` (the no_std link contract: the _start entry, no libc main wrapper)")
+  end
+  if has_main then
+    return Option::Some("no_std: the program must NOT define `main` (the no_std entry is the program's own `_start`; a `main` would select the libc/CRT entry)")
+  end
+  Option::None
+end
+
+def nostd_mode_requested(argv: Vec[String], files: Vec[String]) -> Bool
+  for arg in argv do
+    if arg == "--no-std" then
+      return true
+    end
+  end
+  if files.len() > 0 then
+    match read_file(files[0].clone())
+    when Result::Ok(src) then
+      return src.contains("@no_std")
+    when Result::Err(_) then return false
+    end
+  end
+  false
+end
+
+def compile_to_nostd_route(opts: CompilerOptions, files: Vec[String], output_path: String, no_std_flag: Bool) -> Result[Unit, String]
+  if files.len() == 0 then
+    return Result::Err("no input files for the no_std compile")
+  end
+  let source = match read_file(files[0].clone())
+  when Result::Ok(s) then s
+  when Result::Err(e) then
+    return Result::Err("failed to read " + files[0].clone() + ": " + e)
+  end
+  let ast = match parse_source_program(source, files[0].clone())
+  when Result::Ok(p) then p
+  when Result::Err(diags) then
+    return Result::Err(join_diagnostics(&diags))
+  end
+  let attr_mode = root_program_has_attr(&ast, "no_std")
+  if !attr_mode && !no_std_flag then
+    return Result::Err("no_std: the program carries no @no_std attribute and --no-std was not passed (a no_std compile requires one of the two)")
+  end
+  match nostd_surface_error(&ast)
+  when Option::Some(err) then return Result::Err(err)
+  when Option::None then ()
+  end
+  match start_entry_error(&ast)
+  when Option::Some(err) then return Result::Err(err)
+  when Option::None then ()
+  end
+  let rc = compile_startup_entry(&opts, files[0].clone(), output_path)
+  if rc == 0 then
+    Result::Ok(())
+  else
+    Result::Err("no_std compilation failed (exit code " + rc.to_string() + ")")
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# THE EMBEDDED ROUTE — the bare-metal target contract
+# ———————————————————————————————————————————————————————————————
+# A --target <embedded triple> compile (thumbv6m-none-eabi /
+# thumbv7em-none-eabi[f] / thumbv8m.main-none-eabihf /
+# riscv32imc|imac-unknown-none-elf / riscv64gc-unknown-none-elf) applies
+# the EMBEDDED CONTRACT:
+#   1. the TARGET SPEC — the per-triple record (arch/cpu/fpu/endianness/
+#      pointer width/atomicity availability/linker), emitted as the
+#      machine-readable target JSON artifact;
+#   2. the LINKER SCRIPT — the flash/RAM MEMORY layout + the section
+#      placement (.isr_vector/.text/.rodata/.data/.bss + the __data_load
+#      copy table + the stack top), emitted as the .ld artifact;
+#   3. the STARTUP — the reset handler contract (the .bss zeroing + the
+#      .data copy + the user main call — std::embedded's
+#      `_reset_handler`) and the interrupt vector table (every @interrupt
+#      function in the program, in declaration order), emitted as the
+#      startup artifact;
+#   4. the VOLATILE/MMIO + INTERRUPT surfaces — std::embedded's volatile
+#      intrinsics (the runtime's _tg_volatile_read*/_write* load/store
+#      arms) and the @interrupt attribute (signature-validated, collected
+#      into the vector table);
+#   5. the PANIC/ABORT contract — the abort-only panic strategy (the only
+#      stable strategy) recorded in the spec artifact;
+#   6. the BARE-METAL BINARY — the program compiles through the same
+#      front-end pipeline and links to the bare ELF image whose entry is
+#      `_reset_handler` (the linker's bare-entry fallback); the artifact
+#      is structurally verified (ELF magic + non-zero entry).
+# The allocator-free core: the same core-only surface check as no_std
+# (the program's imports are restricted to the no_std allowlist).
+
+struct EmbeddedTargetSpec
+  target: String
+  arch: String
+  cpu: String
+  fpu: Bool
+  endianness: String
+  pointer_width: Int
+  max_atomic_width: Int
+  family: String
+  default_linker: String
+  linker_script: String
+  description: String
+end
+
+def embedded_target_specs() -> Vec[EmbeddedTargetSpec]
+  var specs = Vec::new()
+  specs.push(EmbeddedTargetSpec {
+    target: "thumbv6m-none-eabi",
+    arch: "thumbv6m", cpu: "cortex-m0",
+    fpu: false, endianness: "little", pointer_width: 32, max_atomic_width: 0,
+    family: "arm", default_linker: "arm-none-eabi-ld", linker_script: "cortex-m",
+    description: "ARM Cortex-M0/M0+ (ARMv6-M, Thumb only, no atomic support)"
+  })
+  specs.push(EmbeddedTargetSpec {
+    target: "thumbv7em-none-eabi",
+    arch: "thumbv7em", cpu: "cortex-m4",
+    fpu: false, endianness: "little", pointer_width: 32, max_atomic_width: 32,
+    family: "arm", default_linker: "arm-none-eabi-ld", linker_script: "cortex-m",
+    description: "ARM Cortex-M4 (ARMv7E-M, Thumb-2, 32-bit atomics)"
+  })
+  specs.push(EmbeddedTargetSpec {
+    target: "thumbv7em-none-eabihf",
+    arch: "thumbv7em", cpu: "cortex-m4f",
+    fpu: true, endianness: "little", pointer_width: 32, max_atomic_width: 32,
+    family: "arm", default_linker: "arm-none-eabi-ld", linker_script: "cortex-m",
+    description: "ARM Cortex-M4F (ARMv7E-M, Thumb-2 + DSP + single-precision FPU)"
+  })
+  specs.push(EmbeddedTargetSpec {
+    target: "thumbv8m.main-none-eabihf",
+    arch: "thumbv8m.main", cpu: "cortex-m33",
+    fpu: true, endianness: "little", pointer_width: 32, max_atomic_width: 32,
+    family: "arm", default_linker: "arm-none-eabi-ld", linker_script: "cortex-m",
+    description: "ARM Cortex-M33 (ARMv8-M Mainline, TrustZone)"
+  })
+  specs.push(EmbeddedTargetSpec {
+    target: "riscv32imc-unknown-none-elf",
+    arch: "riscv32imc", cpu: "generic-rv32",
+    fpu: false, endianness: "little", pointer_width: 32, max_atomic_width: 0,
+    family: "riscv", default_linker: "riscv32-unknown-elf-ld", linker_script: "riscv",
+    description: "RISC-V RV32IMC (integer + multiply + compressed, no atomics)"
+  })
+  specs.push(EmbeddedTargetSpec {
+    target: "riscv32imac-unknown-none-elf",
+    arch: "riscv32imac", cpu: "generic-rv32",
+    fpu: false, endianness: "little", pointer_width: 32, max_atomic_width: 32,
+    family: "riscv", default_linker: "riscv32-unknown-elf-ld", linker_script: "riscv",
+    description: "RISC-V RV32IMAC (integer + multiply + atomics + compressed)"
+  })
+  specs.push(EmbeddedTargetSpec {
+    target: "riscv64gc-unknown-none-elf",
+    arch: "riscv64gc", cpu: "generic-rv64",
+    fpu: true, endianness: "little", pointer_width: 64, max_atomic_width: 64,
+    family: "riscv", default_linker: "riscv64-unknown-elf-ld", linker_script: "riscv",
+    description: "RISC-V RV64GC (general-purpose 64-bit)"
+  })
+  specs
+end
+
+def embedded_spec_for(triple: String) -> Option[EmbeddedTargetSpec]
+  for spec in embedded_target_specs() do
+    if spec.target == triple then
+      return Option::Some(spec)
+    end
+  end
+  Option::None
+end
+
+def is_embedded_target(triple: String) -> Bool
+  match embedded_spec_for(triple)
+  when Option::Some(_) then true
+  when Option::None then false
+  end
+end
+
+def embedded_cortex_m_linker_script(spec: EmbeddedTargetSpec) -> String
+  "/* " + spec.target + " linker script (generated by the embedded route) */\n" +
+  "MEMORY\n" +
+  "{\n" +
+  "  FLASH (rx)  : ORIGIN = 0x08000000, LENGTH = 256K\n" +
+  "  RAM   (rwx) : ORIGIN = 0x20000000, LENGTH = 64K\n" +
+  "}\n" +
+  "\n" +
+  "SECTIONS\n" +
+  "{\n" +
+  "  .isr_vector: { KEEP(*(.isr_vector)) } > FLASH\n" +
+  "  .text      : { *(.text.reset) *(.text .text.*) } > FLASH\n" +
+  "  .rodata    : { *(.rodata .rodata.*) } > FLASH\n" +
+  "  .data      : {\n" +
+  "    __data_start = .;\n" +
+  "    *(.data .data.*)\n" +
+  "    __data_end = .;\n" +
+  "  } > RAM AT > FLASH\n" +
+  "  __data_load = LOADADDR(.data);\n" +
+  "  .bss (NOLOAD) : {\n" +
+  "    __bss_start = .;\n" +
+  "    *(.bss .bss.*)\n" +
+  "    __bss_end = .;\n" +
+  "  } > RAM\n" +
+  "  _stack_top = ORIGIN(RAM) + LENGTH(RAM);\n" +
+  "}\n"
+end
+
+def embedded_riscv_linker_script(spec: EmbeddedTargetSpec) -> String
+  "/* " + spec.target + " linker script (generated by the embedded route) */\n" +
+  "MEMORY\n" +
+  "{\n" +
+  "  FLASH (rx)  : ORIGIN = 0x20000000, LENGTH = 512K\n" +
+  "  RAM   (rwx) : ORIGIN = 0x80000000, LENGTH = 64K\n" +
+  "}\n" +
+  "\n" +
+  "SECTIONS\n" +
+  "{\n" +
+  "  .text      : { *(.text.reset) *(.text .text.*) } > FLASH\n" +
+  "  .rodata    : { *(.rodata .rodata.*) } > FLASH\n" +
+  "  .data      : {\n" +
+  "    __data_start = .;\n" +
+  "    *(.data .data.*)\n" +
+  "    __data_end = .;\n" +
+  "  } > RAM AT > FLASH\n" +
+  "  __data_load = LOADADDR(.data);\n" +
+  "  .bss (NOLOAD) : {\n" +
+  "    __bss_start = .;\n" +
+  "    *(.bss .bss.*)\n" +
+  "    __bss_end = .;\n" +
+  "  } > RAM\n" +
+  "  _stack_top = ORIGIN(RAM) + LENGTH(RAM);\n" +
+  "}\n"
+end
+
+def embedded_spec_json(spec: EmbeddedTargetSpec, entry: String, interrupts: Vec[String], sections: Vec[String]) -> String
+  var out = "{\n"
+  out = out + "  \"target\": \"" + spec.target + "\",\n"
+  out = out + "  \"arch\": \"" + spec.arch + "\",\n"
+  out = out + "  \"cpu\": \"" + spec.cpu + "\",\n"
+  out = out + "  \"fpu\": " + if spec.fpu then "true" else "false" end + ",\n"
+  out = out + "  \"endianness\": \"" + spec.endianness + "\",\n"
+  out = out + "  \"pointer_width\": " + spec.pointer_width.to_string() + ",\n"
+  out = out + "  \"max_atomic_width\": " + spec.max_atomic_width.to_string() + ",\n"
+  out = out + "  \"family\": \"" + spec.family + "\",\n"
+  out = out + "  \"default_linker\": \"" + spec.default_linker + "\",\n"
+  out = out + "  \"panic_strategy\": \"abort\",\n"
+  out = out + "  \"entry\": \"" + entry + "\",\n"
+  out = out + "  \"link_sections\": [\"" + join_vec_str(&sections, "\", \"") + "\"],\n"
+  out = out + "  \"interrupts\": [\"" + join_vec_str(&interrupts, "\", \"") + "\"]\n"
+  out = out + "}\n"
+  out
+end
+
+def embedded_startup_source(spec: EmbeddedTargetSpec, entry: String, interrupts: Vec[String]) -> String
+  var out = "## " + spec.target + " startup (generated by the embedded route)\n"
+  out = out + "## The reset vector: " + entry + "\n"
+  out = out + "## The interrupt vector table (the @interrupt functions, in declaration order):\n"
+  for name in interrupts do
+    out = out + "##   - " + name + "\n"
+  end
+  out = out + "\n"
+  out = out + "## The vector table lives in the .isr_vector section (the linker script's\n"
+  out = out + "## KEEP(*(.isr_vector)) placement — the section placement contract).\n"
+  out
+end
+
+def collect_interrupt_fns(program: Program, inout errors: Vec[String]) -> Vec[String]
+  var fns = Vec::new()
+  for item in program.items do
+    if root_item_has_attr(item, "interrupt") then
+      match item.kind
+      when ItemKind::ItemFunction(f) then
+        if f.params.len() != 0 then
+          errors.push("embedded: the @interrupt function `" + f.name + "` must take no parameters (an ISR has no arguments)")
+        end
+        fns.push(f.name.clone())
+      when _ then
+        errors.push("embedded: the @interrupt attribute is only valid on a function declaration")
+      end
+    end
+  end
+  fns
+end
+
+def collect_link_sections(program: Program) -> Vec[String]
+  var sections = Vec::new()
+  for item in program.items do
+    for attr in item.attrs do
+      if attr.name == "link_section" && attr.args.len() > 0 then
+        sections.push(attr.args[0].clone())
+      end
+    end
+  end
+  sections
+end
+
+def embedded_elf_entry_ok(path: String) -> Result[Unit, String]
+  match read_to_vec(path.clone())
+  when Result::Ok(bytes) then
+    if bytes.len() < 0x20 then
+      return Result::Err("embedded: the produced ELF is truncated (" + bytes.len().to_string() + " bytes)")
+    end
+    if bytes[0] != 0x7F || bytes[1] != 0x45 || bytes[2] != 0x4C || bytes[3] != 0x46 then
+      return Result::Err("embedded: the produced image has no ELF magic")
+    end
+    var entry: u64 = 0
+    var bi = 0x18
+    var shift: UInt = 0
+    while bi < 0x20 do
+      entry = entry | ((bytes[bi] as u64) << shift)
+      shift = shift + 8
+      bi = bi + 1
+    end
+    if entry == 0 then
+      return Result::Err("embedded: the produced ELF has a zero entry point")
+    end
+    Result::Ok(())
+  when Result::Err(e) then
+    Result::Err("embedded: cannot read the produced image: " + e)
+  end
+end
+
+def compile_to_embedded_route(opts: CompilerOptions, files: Vec[String], output_path: String) -> Result[Unit, String]
+  if files.len() == 0 then
+    return Result::Err("no input files for the embedded compile")
+  end
+  let triple = match opts.target_triple
+  when Option::Some(t) then t.clone()
+  when Option::None then return Result::Err("embedded: no target triple (use --target <embedded-triple>)")
+  end
+  let spec = match embedded_spec_for(triple.clone())
+  when Option::Some(s) then s
+  when Option::None then return Result::Err("embedded: unknown embedded target triple: " + triple)
+  end
+  let source = match read_file(files[0].clone())
+  when Result::Ok(s) then s
+  when Result::Err(e) then
+    return Result::Err("failed to read " + files[0].clone() + ": " + e)
+  end
+  let ast = match parse_source_program(source, files[0].clone())
+  when Result::Ok(p) then p
+  when Result::Err(diags) then
+    return Result::Err(join_diagnostics(&diags))
+  end
+  match nostd_surface_error(&ast)
+  when Option::Some(err) then return Result::Err(err)
+  when Option::None then ()
+  end
+  let has_reset_handler = root_program_has_fn(&ast, "_reset_handler")
+  let imports_embedded = root_program_imports_module(&ast, "embedded")
+  if !has_reset_handler && !imports_embedded then
+    return Result::Err("embedded: the program must define `_reset_handler` or import std::embedded (the reset/startup contract — the reset vector zeroes .bss, copies .data and calls the user main)")
+  end
+  var interrupt_errors: Vec[String] = Vec::new()
+  let interrupts = collect_interrupt_fns(&ast, &mut interrupt_errors)
+  if interrupt_errors.len() > 0 then
+    return Result::Err(join_vec_str(&interrupt_errors, "\n"))
+  end
+  let sections = collect_link_sections(&ast)
+  let entry = if has_reset_handler then "_reset_handler" else "main" end
+  let art_dir = output_path + ".d"
+  match mkdir_p(art_dir.clone())
+  when Result::Ok(_) then ()
+  when Result::Err(e) then return Result::Err("embedded: cannot create the artifact directory: " + e)
+  end
+  match write_file(art_dir.clone() + "/" + triple + ".json", embedded_spec_json(&spec, entry, &interrupts, &sections))
+  when Result::Ok(_) then ()
+  when Result::Err(e) then return Result::Err("embedded: cannot write the target spec artifact: " + e)
+  end
+  let ld_text = if spec.linker_script == "cortex-m" then
+    embedded_cortex_m_linker_script(&spec)
+  else
+    embedded_riscv_linker_script(&spec)
+  end
+  match write_file(art_dir.clone() + "/" + triple + ".ld", ld_text)
+  when Result::Ok(_) then ()
+  when Result::Err(e) then return Result::Err("embedded: cannot write the linker script artifact: " + e)
+  end
+  match write_file(art_dir.clone() + "/startup.tg", embedded_startup_source(&spec, entry, &interrupts))
+  when Result::Ok(_) then ()
+  when Result::Err(e) then return Result::Err("embedded: cannot write the startup artifact: " + e)
+  end
+  let elf_path = output_path + ".elf"
+  let mut elf_opts = opts
+  elf_opts.target_triple = Option::Some("aarch64-unknown-linux-gnu".to_string())
+  let rc = compile_startup_entry(&elf_opts, files[0].clone(), elf_path.clone())
+  if rc != 0 then
+    return Result::Err("embedded: the bare-metal compilation failed (exit code " + rc.to_string() + ")")
+  end
+  match embedded_elf_entry_ok(elf_path.clone())
+  when Result::Ok(_) then ()
+  when Result::Err(e) then return Result::Err(e)
+  end
+  if !opts.quiet then
+    println("Embedded bare-metal image: " + elf_path)
+    println("Embedded target spec:      " + art_dir + "/" + triple + ".json")
+    println("Embedded linker script:    " + art_dir + "/" + triple + ".ld")
+    println("Embedded startup:          " + art_dir + "/startup.tg")
+  end
+  Result::Ok(())
+end
+
+def root_program_imports_module(program: Program, module: String) -> Bool
+  for item in program.items do
+    match item.kind
+    when ItemKind::ItemUse(u) then
+      if u.path.segments.len() >= 2 && u.path.segments[0] == "std" && u.path.segments[1] == module then
+        return true
+      end
+    when _ then ()
+    end
+  end
+  false
+end
 
 def cmd_compile(argv: Vec[String]) -> Int
   var stage2_probe = false
@@ -1968,6 +2763,48 @@ def cmd_compile(argv: Vec[String]) -> Int
     end
   end
 
+  # THE WASM ROUTE: a --target wasm32-unknown-unknown / wasm32-wasi
+  # compile dispatches to the wasm backend (the driver's target
+  # dispatch — the native compile path never sees the wasm target).
+  if is_wasm_target(&opts) then
+    match compile_to_wasm_route(&opts, files, output_path)
+    when Result::Ok(_) then return 0
+    when Result::Err(e) then
+      eprintln(e)
+      return 1
+    end
+  end
+
+  # THE EMBEDDED ROUTE: a --target <embedded triple> (thumbv7em-none-eabihf
+  # / thumbv6m-none-eabi / riscv32imac-unknown-none-elf / ...) dispatches to
+  # the embedded contract — the target spec JSON, the linker script, the
+  # startup/vector artifacts and the bare-metal ELF image (entry
+  # _reset_handler, the core-only surface, abort-only panic).
+  match opts.target_triple
+  when Option::Some(et) then
+    if is_embedded_target(et) then
+      match compile_to_embedded_route(&opts, files, output_path)
+      when Result::Ok(_) then return 0
+      when Result::Err(e) then
+        eprintln(e)
+        return 1
+      end
+    end
+  when Option::None then ()
+  end
+
+  # THE NO-STD ROUTE: the --no-std flag or the @no_std attribute dispatches
+  # to the no_std contract — the core-only import surface, the _start bare
+  # entry and the libc-free link.
+  if nostd_mode_requested(&argv, &files) then
+    match compile_to_nostd_route(&opts, files, output_path, true)
+    when Result::Ok(_) then return 0
+    when Result::Err(e) then
+      eprintln(e)
+      return 1
+    end
+  end
+
   if files.len() == 1 then
     compile_startup_entry(&opts, files[0].clone(), output_path)
   else
@@ -2007,7 +2844,14 @@ def cmd_compile_direct(skip_subcommand: Bool) -> Int
     elsif arg == "-O3" then
       opts.opt_level = 3
     elsif arg == "-g" then
-      opts.debug_info = true
+      # THE -g REJECTION (the reviewer's false-success fix): the
+      # debug_info option was INERT — no compile path emits debug info
+      # (generate_dwarf_debug_info has no caller), so the flag silently
+      # claimed a feature that does not exist. The honest contract is the
+      # REJECTION: `-g` fails with the explicit "debug info is not
+      # supported" error instead of compiling with a decorative flag.
+      println("debug info is not supported: the -g flag is rejected (no compile path emits debug info)")
+      return 1
     elsif arg == "--target" then
       i = i + 1
       if i >= argc then
@@ -2015,6 +2859,9 @@ def cmd_compile_direct(skip_subcommand: Bool) -> Int
         return 1
       end
       opts.target_triple = Option::Some(raw_arg_unchecked(i))
+    elsif arg == "--no-std" then
+      # Accepted in raw compile mode too (see cmd_compile's no_std route).
+      ()
     elsif arg == "--json" then
       opts.json_diagnostics = true
     elsif arg == "-h" || arg == "--help" then
@@ -2055,6 +2902,19 @@ def cmd_compile_direct(skip_subcommand: Bool) -> Int
       eprintln(rej)
     end
     return 1
+  end
+
+  # THE WASM ROUTE: the raw compile mode dispatches the wasm targets to
+  # the wasm backend exactly like cmd_compile.
+  if is_wasm_target(&opts) then
+    var wasm_files = Vec::new()
+    wasm_files.push(primary_input.clone())
+    match compile_to_wasm_route(&opts, wasm_files, "".to_string())
+    when Result::Ok(_) then return 0
+    when Result::Err(e) then
+      eprintln(e)
+      return 1
+    end
   end
 
   let file = primary_input.clone()
@@ -2666,6 +3526,26 @@ def resolve_single_dep(dep: Dependency, locked: Option[DriverLockEntry]) -> Resu
   
   match fetch_result
   when Result::Ok(_) then
+    # THE ARCHIVE-PATH VALIDATION BEFORE THE TAR XZF (the reviewer's
+    # package-manager hardening): the downloaded archive's EVERY entry
+    # name AND every link target is checked against the
+    # traversal/absolute/backslash rules (the pkg_manager's
+    # _tar_entry_name_safe applied to the ACTUAL archive — the same
+    # pre-flight the std extractor runs) BEFORE the system tar extracts
+    # a single byte. A malicious package cannot write outside the
+    # package directory through `tar xzf` — a symlink entry pointing
+    # outside the extraction root is rejected here, and the archive is
+    # never handed to the system tar.
+    match read_to_vec(pkg_dir.clone() + ".tar.gz")
+    when Result::Ok(archive_bytes) then
+      match validate_tar_gz_archive(&archive_bytes)
+      when Result::Ok(_) then ()
+      when Result::Err(e) then
+        return Result::Err("Refusing to extract '" + dep.name.clone() + "': " + e.to_string())
+      end
+    when Result::Err(e) then
+      return Result::Err("Failed to read the package archive for validation: " + e.to_string())
+    end
     # Extract tarball
     mkdir_p(&pkg_dir)
     let extract = run_command("tar", vec!["xzf", (pkg_dir.clone() + ".tar.gz").as_str(), "-C", pkg_dir.as_str()])
@@ -2861,31 +3741,16 @@ def write_lockfile(path: str, resolved: ResolvedDeps) -> Unit
 end
 
 def hash_directory(dir: String) -> String
-  # Compute a content hash of all.tg files in a directory for reproducibility.
-  var h: UInt = 14695981039346656037  # FNV-1a offset basis
-  let prime: UInt = 1099511628211
-  
-  match list_directory(dir.clone())
-  when Result::Ok(files) then
-    var sorted = files.clone()
-    sorted.sort()
-    for f in sorted do
-      if f.ends_with(".tg") then
-        match read_file(dir.clone() + "/" + f)
-        when Result::Ok(content) then
-          let content_bytes: Vec[Int] = content.bytes()
-          for c in content_bytes do
-            h = h ^ (c as UInt)
-            h = h * prime
-          end
-        when Result::Err(_) then ()
-        end
-      end
-    end
-  when Result::Err(_) then ()
-  end
-  
-  h.to_string()
+  # THE AUTHENTICATED PACKAGE-TREE DIGEST (the reviewer's hash_directory
+  # fix): the SHA-256 over the NORMALIZED FULL TREE — every file at every
+  # depth, the relative paths sorted, each file's relative path + content
+  # fed into the hasher in the canonical order (pkg_manager's
+  # hash_package_tree — the single package-tree digest authority). The
+  # old FNV-1a over the TOP LEVEL ONLY (.tg files, no recursion) missed
+  # a change in a nested file, a rename, or an added/removed non-.tg
+  # file — a dependency could change on disk without its lockfile
+  # checksum noticing.
+  hash_package_tree(dir)
 end
 
 # 
@@ -3509,7 +4374,6 @@ def agent_check(argv: Vec[String]) -> Int
 
   # Extract contract declarations from the AST
   var contract_count = 0
-  var violation_count = 0
 
   for item in ast.items do
     match item.kind
@@ -3527,10 +4391,24 @@ def agent_check(argv: Vec[String]) -> Int
     end
   end
 
+  # THE REAL SEMANTIC VERIFICATION (the reviewer's false-success fix):
+  # the agentic subsystem's contract checker ACTUALLY runs —
+  # analyze_agentic_features checks every contract for unsatisfiability
+  # (the trivially-false probe), every required capability for
+  # availability, and every declared effect for existence — and the
+  # violations ARE counted and reported (the old stub counted 0 forever
+  # and returned success on every input). A violation fails the
+  # invocation.
+  var ctx = agentic_context_new()
+  let violations = analyze_agentic_features(&mut ctx, ast)
+  for v in violations do
+    println("  [violation] " + v)
+  end
+
   println("Contract analysis for " + path + ":")
   println("  Total contracts: " + contract_count.to_string())
-  println("  Violations: " + violation_count.to_string())
-  if violation_count == 0 then 0 else 1 end
+  println("  Violations: " + violations.len().to_string())
+  if violations.len() == 0 then 0 else 1 end
 end
 
 def agent_caps(argv: Vec[String]) -> Int
@@ -5668,6 +6546,46 @@ def handle_lsp_request(inout server: LspServer, body: String) -> Option[String]
         end
       when Option::None then
         make_json_rpc_response(id, "[]".to_string())
+      end
+    elsif m == "textDocument/diagnostic" then
+      # The LSP 3.17 pull-diagnostics request: the diagnostics the
+      # document compilation computed at didOpen/didChange (the real
+      # spans — the byte offsets converted to the LSP position units).
+      let uri = extract_nested_json_string(body.clone(), "textDocument", "uri")
+      match uri
+      when Option::Some(u) then
+        let content = match server.documents.get(u.clone())
+        when Option::Some(c) then c
+        when Option::None then "".to_string()
+        end
+        let diags = match server.diagnostics.get(u.clone())
+        when Option::Some(list) then list
+        when Option::None then Vec::new()
+        end
+        var result = "{\"kind\":\"full\",\"items\":["
+        var first_d = true
+        for d in diags do
+          if !first_d then result = result + "," end
+          var range_json = "{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":0}}"
+          match d.span
+          when Option::Some(sp) then
+            let rng = span_to_lsp_range(&content, sp)
+            range_json = lsp_range_to_json(&rng)
+          when Option::None then ()
+          end
+          let severity = match d.level
+          when DiagLevel::Error then 1
+          when DiagLevel::Warning then 2
+          when _ then 3
+          end
+          result = result + "{\"range\":" + range_json + ",\"severity\":" + severity.to_string() +
+            ",\"source\":\"tangerine\",\"message\":\"" + json_escape(d.message) + "\"}"
+          first_d = false
+        end
+        result = result + "]}"
+        make_json_rpc_response(id, result)
+      when Option::None then
+        make_json_rpc_response(id, "{\"kind\":\"full\",\"items\":[]}".to_string())
       end
     elsif m == "shutdown" then
       make_json_rpc_response(id, "null".to_string())

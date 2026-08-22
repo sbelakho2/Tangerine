@@ -60,6 +60,9 @@ pub enum WasmValType
   I64
   F32
   F64
+  ## the host-reference type (0x6F) — the wasm-side bridge for the
+  ## std::wasm ExternRef handle (see the type mapping table below)
+  ExternRef
 end
 
 pub struct ImportSection
@@ -182,6 +185,9 @@ pub struct WasmCompileConfig
   pub stack_size: UInt
   pub strip_debug: Bool
   pub producer_section: Bool
+  ## the START section: the name of the function the binary starts at
+  ## (Option::None = no start section — the default)
+  pub start_function: Option[String]
 end
 
 pub enum WasmTarget
@@ -208,6 +214,7 @@ impl WasmCompileConfig
       stack_size: 65536,
       strip_debug: true,
       producer_section: true,
+      start_function: Option::None,
     }
   end
 end
@@ -224,6 +231,11 @@ pub struct WasmCompiler
   memory_section: MemorySection
   data_section: DataSection
   global_section: GlobalSection
+  ## the funcref table and element sections (absent by design in the
+  ## current subset — no call_indirect; the fields complete the section
+  ## universe so the binary struct mirrors the wasm spec)
+  table_section: TableSection
+  element_section: ElementSection
   ## func signature -> type index
   type_cache: Map[String, UInt]
   func_index: UInt
@@ -232,6 +244,8 @@ pub struct WasmCompiler
   data_offset: UInt
   ## global index of __stack_pointer
   stack_ptr_global: UInt
+  ## the START section's function index (Option::None = no start section)
+  start_fn: Option[UInt]
 end
 
 impl WasmCompiler
@@ -246,11 +260,14 @@ impl WasmCompiler
       memory_section: MemorySection { memories: Array::new() },
       data_section: DataSection { segments: Array::new() },
       global_section: GlobalSection { globals: Array::new() },
+      table_section: TableSection { tables: Array::new() },
+      element_section: ElementSection { elements: Array::new() },
       type_cache: Map::new(),
       func_index: 0,
       string_pool: Map::new(),
       data_offset: 0,
       stack_ptr_global: 0,
+      start_fn: Option::None,
     }
   end
 
@@ -261,6 +278,12 @@ impl WasmCompiler
 
     ## Setup stack pointer global for aggregate allocation
     self.setup_stack_pointer()
+
+    ## Intern every string constant into the data segment BEFORE any
+    ## function body is emitted (the emit_operand string arm reads the
+    ## string pool for the constant's linear-memory offset — the pool is
+    ## the single authority, never an ad-hoc 0).
+    self.intern_program_strings(&mir)
 
     ## Add WASI imports if targeting WASI
     match self.config.target
@@ -273,6 +296,18 @@ impl WasmCompiler
     for func in mir.functions do
       func_map.insert(func.name.clone(), self.func_index)
       self.func_index = self.func_index + 1
+    end
+    ## The START section's function index (the config's named start
+    ## function; a name with no compiled function is an internal error —
+    ## never a silently absent start section).
+    match self.config.start_function
+    when Option::Some(sf) then
+      match func_map.get(&sf)
+      when Option::Some(idx) then self.start_fn = Option::Some(*idx)
+      when Option::None then
+        panic("wasm: start function `" + sf + "` is not a compiled function (the start section must name a real function)")
+      end
+    when Option::None then ()
     end
     ## Reset index for actual compilation
     self.func_index = self.func_index - mir.functions.len() as UInt
@@ -337,12 +372,108 @@ impl WasmCompiler
     ))
   end
 
+  # Intern ONE string constant: append a data segment at the current
+  # data offset (the pool is the single authority — the same string is
+  # interned once and every reference reads the recorded offset).
+  def intern_string_data(inout self, s: String) -> UInt
+    match self.string_pool.get(&s)
+    when Option::Some(off) then
+      *off
+    when Option::None then
+      let off = self.data_offset
+      var offset_expr: Array[u8] = Array::new()
+      emit_i32_const(&mut offset_expr, off as i32)
+      self.data_section.segments.push(DataSegment {
+        memory_index: 0,
+        offset: offset_expr,
+        data: s.as_bytes(),
+      })
+      self.data_offset = self.data_offset + s.as_bytes().len() as UInt
+      self.string_pool.insert(s.clone(), off)
+      off
+    end
+  end
+
+  # THE DATA-SECTION CLOSURE: every string constant in the program is
+  # interned before any body is emitted, so no MirString reference can
+  # ever read a missing pool entry.
+  def intern_program_strings(inout self, mir: MirProgram) -> Unit
+    for func in mir.functions do
+      for local in func.locals do
+        match local.ty
+        when Type::String then ()
+        when _ then ()
+        end
+      end
+      for block in func.blocks do
+        for stmt in block.statements do
+          match stmt.kind
+          when MirStatementKind::MirAssign(_, rvalue) then
+            self.intern_rvalue_strings(rvalue)
+          when _ then ()
+          end
+        end
+        self.intern_terminator_strings(&block.terminator)
+      end
+    end
+    for st in mir.statics do
+      match st.init
+      when Option::Some(op) then self.intern_operand_strings(op)
+      when Option::None then ()
+      end
+    end
+  end
+
+  def intern_rvalue_strings(inout self, rvalue: MirRvalue) -> Unit
+    match rvalue.kind
+    when MirRvalueKind::MirMove(operand) | MirRvalueKind::MirUnOp(_, operand) |
+         MirRvalueKind::MirCast(_, operand, _) then
+      self.intern_operand_strings(&operand)
+    when MirRvalueKind::MirBinOp(_, lhs, rhs) then
+      self.intern_operand_strings(&lhs)
+      self.intern_operand_strings(&rhs)
+    when MirRvalueKind::MirAggregate(_, operands) then
+      for op in operands do
+        self.intern_operand_strings(op)
+      end
+    when _ then ()
+    end
+  end
+
+  def intern_terminator_strings(inout self, term: MirTerminator) -> Unit
+    match term.kind
+    when MirTerminatorKind::MirSwitchInt { op, targets, default_target } then
+      self.intern_operand_strings(op)
+    when MirTerminatorKind::MirCall { dest, func, args, success, unwind, intrinsic } then
+      for arg in args do
+        let arg_op = mir_call_arg_operand(arg)
+        self.intern_operand_strings(&arg_op)
+      end
+    when MirTerminatorKind::MirAssert { cond, expected, msg, target, unwind } then
+      self.intern_operand_strings(cond)
+    when _ then ()
+    end
+  end
+
+  def intern_operand_strings(inout self, op: MirOperand) -> Unit
+    match op.kind
+    when MirOperandKind::MirConstant(c) then
+      match c.kind
+      when MirConstantKind::MirString(s) then
+        let _ = self.intern_string_data(s)
+      when _ then ()
+      end
+    when _ then ()
+    end
+  end
+
   def add_wasi_imports(inout self) -> Unit
     ## WASI snapshot_preview1 imports
     let wasi_funcs = vec![
       ("fd_write", vec![WasmValType::I32, WasmValType::I32, WasmValType::I32, WasmValType::I32], vec![WasmValType::I32]),
       ("fd_read", vec![WasmValType::I32, WasmValType::I32, WasmValType::I32, WasmValType::I32], vec![WasmValType::I32]),
       ("fd_close", vec![WasmValType::I32], vec![WasmValType::I32]),
+      ("clock_time_get", vec![WasmValType::I32, WasmValType::I64, WasmValType::I32], vec![WasmValType::I32]),
       ("proc_exit", vec![WasmValType::I32], vec![]),
       ("args_get", vec![WasmValType::I32, WasmValType::I32], vec![WasmValType::I32]),
       ("args_sizes_get", vec![WasmValType::I32, WasmValType::I32], vec![WasmValType::I32]),
@@ -625,9 +756,15 @@ impl WasmCompiler
       when MirConstantKind::MirBool(b) then emit_i32_const(code, if *b then 1 else 0 end)
       when MirConstantKind::MirChar(cv) then emit_i32_const(code, *cv as i32)
       when MirConstantKind::MirUnit then ()  ## produces no value
-      when MirConstantKind::MirString(_) then
-        ## String literals: push data offset (would be interned in data segment)
-        emit_i32_const(code, 0)
+      when MirConstantKind::MirString(s) then
+        ## String literals: the data segment offset, interned by the
+        ## pre-emission pass (intern_program_strings — the pool is the
+        ## single authority; a missing entry is an internal error).
+        match self.string_pool.get(s)
+        when Option::Some(off) then emit_i32_const(code, *off as i32)
+        when Option::None then
+          panic("wasm: string constant `" + s + "` was not interned before emission (the data-section closure is broken)")
+        end
       when _ then emit_i64_const(code, 0)
       end
     end
@@ -819,6 +956,12 @@ impl WasmCompiler
       _encode_section(&mut binary, 0x03, &_encode_function_section(&self.function_section))
     end
 
+    ## Section 4: Table (absent by design in the current subset — no
+    ## call_indirect; emitted whenever a table exists)
+    if !self.table_section.tables.is_empty() then
+      _encode_section(&mut binary, 0x04, &_encode_table_section(&self.table_section))
+    end
+
     ## Section 5: Memory
     if !self.memory_section.memories.is_empty() then
       _encode_section(&mut binary, 0x05, &_encode_memory_section(&self.memory_section))
@@ -834,6 +977,21 @@ impl WasmCompiler
       _encode_section(&mut binary, 0x07, &_encode_export_section(&self.export_section))
     end
 
+    ## Section 8: Start
+    match self.start_fn
+    when Option::Some(idx) then
+      var start_payload: Array[u8] = Array::new()
+      _encode_leb128_u32(&mut start_payload, idx)
+      _encode_section(&mut binary, 0x08, &start_payload)
+    when Option::None then ()
+    end
+
+    ## Section 9: Element (absent by design in the current subset — no
+    ## table initializers; emitted whenever an element list exists)
+    if !self.element_section.elements.is_empty() then
+      _encode_section(&mut binary, 0x09, &_encode_element_section(&self.element_section))
+    end
+
     ## Section 10: Code
     if !self.code_section.bodies.is_empty() then
       _encode_section(&mut binary, 0x0A, &_encode_code_section(&self.code_section))
@@ -842,6 +1000,12 @@ impl WasmCompiler
     ## Section 11: Data
     if !self.data_section.segments.is_empty() then
       _encode_section(&mut binary, 0x0B, &_encode_data_section(&self.data_section))
+    end
+
+    ## The producer custom section (section 0) — the toolchain provenance
+    ## record, emitted last per the custom-section convention.
+    if self.config.producer_section then
+      _encode_section(&mut binary, 0x00, &_encode_producer_section())
     end
 
     Ok(binary)
@@ -940,6 +1104,13 @@ def classify_wasm_value_category(inout engine: LayoutEngine, ty: Type) -> Result
         })
       end
     end
+  when Result::Ok(ValueCategory::Vector(_)) then
+    # THE VECTOR CASE: a SIMD vector crosses by its linear-memory ADDRESS
+    # (the wasm SIMD v128 proposal is not in this backend's subset; the
+    # 16-byte vector's register classification is a native-ABI notion —
+    # wasm32 has no vector registers, so every vector crosses as its
+    # image handle).
+    Result::Ok(WasmValueCategory::WasmByAddress)
   when Result::Ok(ValueCategory::ScalarPair(_, _)) then
     # A 16-byte aggregate (the Slice view { ptr, len } and other 16-byte
     # values) crosses the wasm32 ABI as its LINEAR-MEMORY ADDRESS: every
@@ -951,6 +1122,55 @@ def classify_wasm_value_category(inout engine: LayoutEngine, ty: Type) -> Result
   when Result::Ok(ValueCategory::ByAddress(_)) then
     # >16-byte aggregates cross by their linear-memory address.
     Result::Ok(WasmValueCategory::WasmByAddress)
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# THE WASM TYPE MAPPING TABLE (wasm32-unknown-unknown)
+# ———————————————————————————————————————————————————————————————
+# THE Tangerine → wasm32 value-type mapping (the single authority; the
+# ABI classification above is the category-level authority and this table
+# is the value-type level). The memory model: the wasm32 linear memory is
+# the program's address space — pointers and handles are 32-bit linear
+# addresses (i32), aggregates live in linear-memory images addressed by
+# i32 handles, and the wasm stack holds the i32/i64/f32/f64 values.
+#
+#   Tangerine primitive              | wasm value type
+#   ————————————————————————————————+——————————————————
+#   Bool, Char, I8, I16, I32,        | i32
+#   U8, U16, U32                     |
+#   Int, I64, U64, ISize, USize      | i64
+#   F32                              | f32
+#   Float, F64                       | f64
+#   Ptr[T], PtrMut[T], RefInternal,  | i32 (the 32-bit linear address)
+#   StaticStrPtr, String (the        |
+#   handle), Adt (the image handle), |
+#   FnPtr, Dyn, Effect, Closure      |
+#   Unit, Never                      | NO value (zero-sized)
+#   I128, U128                       | FAIL CLOSED (no wasm value type)
+#   ExternRef (the std::wasm host-   | externref — the host-reference
+#   reference bridge)                | bridge; in the CURRENT subset the
+#                                    | handle word crosses as the i32
+#                                    | address form (see below)
+#   SIMD vectors (Vec2/4/8/16)       | by ADDRESS (i32 image handle; the
+#                                    | wasm SIMD v128 proposal is NOT in
+#                                    | the subset)
+#
+# The externref row: externref is a first-class wasm value type in this
+# backend's type universe (the encoder emits 0x6F), reserved for the
+# std::wasm ExternRef host-reference bridge. No Tangerine PRIMITIVE maps
+# to it in the current subset (the std::wasm ExternRef struct value is
+# its 4-byte _handle word — an i32 linear address); the mapping function
+# refuses a primitive for which no wasm value type exists (fail closed).
+def map_primitive_to_wasm(ty: Type) -> Option[WasmValType]
+  match ty
+  when Type::Bool | Type::Char | Type::I8 | Type::I16 | Type::I32 |
+       Type::U8 | Type::U16 | Type::U32 then Option::Some(WasmValType::I32)
+  when Type::Int | Type::I64 | Type::U64 | Type::ISize | Type::USize then Option::Some(WasmValType::I64)
+  when Type::F32 then Option::Some(WasmValType::F32)
+  when Type::Float | Type::F64 then Option::Some(WasmValType::F64)
+  when Type::I128 | Type::U128 then Option::None
+  when _ then Option::None
   end
 end
 
@@ -1113,15 +1333,23 @@ def mir_type_to_wasm(ty: Type) -> WasmValType
     panic("wasm: mir_type_to_wasm on an unresolved type (Var/Param/Error) — layout queries fail closed, never a guessed word")
   when _ then ()
   end
-  match ty
-  when Type::Bool | Type::Char then WasmValType::I32
-  when Type::Int then WasmValType::I64
-  when Type::Float then WasmValType::F64
-  when Type::RefInternal(_, _) then WasmValType::I32  ## wasm32 pointers
-  when Type::String then WasmValType::I32  ## pointer to struct
-  when Type::Adt(_, _) then WasmValType::I32  ## pointer to heap allocation
-  when Type::FnPtr(_, _, _) then WasmValType::I32  ## table index
-  when _ then WasmValType::I32  ## fallback
+  match map_primitive_to_wasm(ty)
+  when Option::Some(vt) then
+    vt
+  when Option::None then
+    # The primitive table's fail-closed rows (I128/U128) and the
+    # non-primitive forms: pointers/handles are 32-bit linear addresses
+    # in the wasm32 memory model; an I128/U128 has no wasm value type.
+    match ty
+    when Type::I128 | Type::U128 then
+      panic("wasm: I128/U128 has no wasm32 value type (the i64 form is the widest integer)")
+    when Type::RefInternal(_, _) | Type::Ptr(_) | Type::PtrMut(_) | Type::StaticStrPtr then WasmValType::I32
+    when Type::String then WasmValType::I32
+    when Type::Adt(_, _) then WasmValType::I32
+    when Type::FnPtr(_, _, _) then WasmValType::I32
+    when Type::Dyn(_) | Type::Effect(_, _) | Type::Closure(_, _, _, _, _) then WasmValType::I32
+    when _ then WasmValType::I32
+    end
   end
 end
 
@@ -1193,6 +1421,7 @@ def _valtype_str(vt: WasmValType) -> String
   when I64 then "i64"
   when F32 then "f32"
   when F64 then "f64"
+  when ExternRef then "externref"
   end
 end
 
@@ -1224,6 +1453,7 @@ def _encode_valtype(inout buf: Array[u8], vt: WasmValType) -> Unit
   when I64 then buf.push(0x7E)
   when F32 then buf.push(0x7D)
   when F64 then buf.push(0x7C)
+  when ExternRef then buf.push(0x6F)
   end
 end
 
@@ -1303,6 +1533,51 @@ def _encode_memory_section(ms: MemorySection) -> Array[u8]
   for mem in ms.memories do
     _encode_limits(&mut buf, mem)
   end
+  buf
+end
+
+def _encode_table_section(ts: TableSection) -> Array[u8]
+  var buf = Array::new()
+  _encode_leb128_u32(&mut buf, ts.tables.len() as UInt)
+  for tt in ts.tables do
+    _encode_valtype(&mut buf, &tt.element)
+    _encode_limits(&mut buf, &tt.limits)
+  end
+  buf
+end
+
+def _encode_element_section(es: ElementSection) -> Array[u8]
+  var buf = Array::new()
+  _encode_leb128_u32(&mut buf, es.elements.len() as UInt)
+  for elem in es.elements do
+    ## The active segment form: table index, offset init expr, funcs.
+    _encode_leb128_u32(&mut buf, elem.table_index)
+    buf.extend_from_slice(&elem.offset)
+    buf.push(0x0B)  ## end opcode for the offset init expr
+    _encode_leb128_u32(&mut buf, elem.func_indices.len() as UInt)
+    for fi in elem.func_indices do
+      _encode_leb128_u32(&mut buf, fi)
+    end
+  end
+  buf
+end
+
+## The producer custom section payload: the toolchain provenance record
+## ({"language": [Tangerine], "processed-by": [tg]}).
+def _encode_producer_section() -> Array[u8]
+  var buf = Array::new()
+  _encode_name(&mut buf, "producer")
+  _encode_leb128_u32(&mut buf, 2)  ## two fields
+  ## field 1: language
+  _encode_name(&mut buf, "language")
+  _encode_leb128_u32(&mut buf, 1)
+  _encode_name(&mut buf, "Tangerine")
+  _encode_leb128_u32(&mut buf, 0)  ## no version
+  ## field 2: processed-by
+  _encode_name(&mut buf, "processed-by")
+  _encode_leb128_u32(&mut buf, 1)
+  _encode_name(&mut buf, "tg")
+  _encode_leb128_u32(&mut buf, 0)  ## no version
   buf
 end
 

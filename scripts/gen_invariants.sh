@@ -18,7 +18,13 @@
 #         is present in it (Swift / .tg / .sh sources);
 #       * every positive/negative/mutation test entry is a glob that
 #         matches at least one real file;
-#       * verified_sha is a 7..40 hex-char commit id;
+#       * verified_sha is a 7..40 hex-char commit id that RESOLVES to a
+#         real commit in this repository (git rev-parse --verify — the
+#         format-only check cannot catch a stale or invented sha), and the
+#         GLOBAL last_verified_sha is the current HEAD at generation time
+#         (a stale global sha — the registry verified against an older
+#         commit — FAILS the generation; the sha is bumped when the tree
+#         moves, never silently carried over);
 #       * coverage is non-empty.
 #     Any drift FAILS the generation (exit non-zero), so the catalog can
 #     never claim an artifact that does not exist.
@@ -47,6 +53,7 @@ python3 - "$TOML" "$OUT" "$ROOT" <<'PY'
 import json
 import os
 import re
+import subprocess
 import sys
 
 toml_path, out_path, root = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -167,7 +174,35 @@ def check_assertion(eid, assertion):
 SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
 IDS = set()
 
+# ── the SHA verification (the reviewer's item 10 stale-sha discipline) ──
+# The format-only check cannot catch a stale or invented commit id: every
+# verified_sha must RESOLVE to a real commit in this repository, and the
+# GLOBAL last_verified_sha must be the current HEAD at generation time
+# (the registry claims verification against the tree being generated).
+# When git is unavailable (an exported tree), the format check remains
+# the fallback; when git IS available, a non-resolving sha is a FAIL.
+def git_resolve(sha):
+    """Resolve a sha/prefix to its full commit id via git; None when git
+    is unavailable (format-only fallback), '' when git could not resolve."""
+    try:
+        r = subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", sha + "^{commit}"],
+            cwd=root, capture_output=True, text=True, timeout=20)
+    except Exception:
+        return None
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+head_sha = git_resolve("HEAD")
+
 global_sha = doc.get("last_verified_sha", "unknown")
+if not SHA_RE.match(global_sha):
+    fail(f"last_verified_sha '{global_sha}' is not a 7..40 hex commit id")
+if head_sha is not None:
+    resolved = git_resolve(global_sha)
+    if not resolved:
+        fail(f"last_verified_sha '{global_sha}' does not resolve to a commit in this repository (git rev-parse --verify failed)")
+    elif resolved != head_sha:
+        fail(f"last_verified_sha '{global_sha}' is STALE — the registry must be re-verified at the current HEAD {head_sha}; the sha is bumped when the tree moves, never carried over silently")
 
 for entry in invariants:
     eid = entry.get("id", "")
@@ -206,6 +241,8 @@ for entry in invariants:
     sha = entry.get("verified_sha", global_sha)
     if not SHA_RE.match(sha):
         fail(f"{eid}: verified_sha '{sha}' is not a 7..40 hex commit id")
+    elif head_sha is not None and not git_resolve(sha):
+        fail(f"{eid}: verified_sha '{sha}' does not resolve to a commit in this repository (git rev-parse --verify failed)")
 
     if not entry.get("summary", "").strip():
         fail(f"{eid}: empty summary")

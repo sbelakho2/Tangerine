@@ -40,10 +40,12 @@ use tg_compiler::layout_engine::{
   size_of, align_of, stride_of, field_offset, tuple_layout,
   discriminant_offset, closure_object_record, enum_variant_field_offsets,
   container_header_size, container_field_offset,
-  map_header_field_offset, map_header_total_size, slice_view_layout
+  map_header_field_offset, map_header_total_size, slice_view_layout,
+  slice_shared_handle_layout, slice_shared_backing_layout
 }
 use tg_compiler::types::{Type, TypeId, ParamType}
-use tg_compiler::ast::{AccessConvention}
+use tg_compiler::ast::{AccessConvention, LayoutAttrs, layout_attrs_plain}
+use tg_compiler::token::{span_dummy}
 use tg_compiler::ids::{ClosureId}
 use tg_compiler::mir::{MirTypeDef, MirTypeDefKind, MirFieldDef, MirVariantDef}
 
@@ -347,7 +349,8 @@ def make_typedef(tid: Int, name: String, fields: Vec[MirFieldDef]) -> MirTypeDef
     id: TypeId { id: tid },
     name: name,
     kind: MirTypeDefKind::Struct(fields),
-    generics: Vec::new()
+    generic_params: Vec::new(),
+    layout: layout_attrs_plain(span_dummy())
   }
 end
 
@@ -356,7 +359,8 @@ def make_enumdef(tid: Int, name: String, variants: Vec[MirVariantDef]) -> MirTyp
     id: TypeId { id: tid },
     name: name,
     kind: MirTypeDefKind::Enum(variants),
-    generics: Vec::new()
+    generic_params: Vec::new(),
+    layout: layout_attrs_plain(span_dummy())
   }
 end
 
@@ -594,15 +598,28 @@ def test_headers() -> Unit
   check_eq(72, map_header_field_offset(&"next_off".to_string()), "engine: Map.next_off @ 72")
   check_eq(80, map_header_field_offset(&"bucket_stride".to_string()), "engine: Map.bucket_stride @ 80")
   check_eq(88, map_header_field_offset(&"free_list".to_string()), "engine: Map.free_list @ 88")
-  # Slice[T] — the 16-byte {ptr @ 0, len @ 8} inline view (StrView is the
-  # std spelling of the same two-field shape). Slice is the registered
-  # Opaque view builtin (no MirTypeDef): the view layout is the engine's
+  # The RAW UnsafeSlice[T] — the 16-byte {ptr @ 0, len @ 8} inline view
+  # (the explicit unsafe/FFI form). The view layout is the engine's
   # canonical answer (slice_view_layout).
   let target = aarch64_target()
   mut engine = layout_engine_new(target)
   let sv = slice_view_layout(&engine)
-  check_eq(16, sv.size, "engine: Slice[u8] view size = 16")
-  check_eq(8, sv.align, "engine: Slice[u8] view align = 8")
+  check_eq(16, sv.size, "engine: UnsafeSlice[u8] view size = 16")
+  check_eq(8, sv.align, "engine: UnsafeSlice[u8] view align = 8")
+  # The SAFE SOURCE-spelled Slice — the SHARED/PINNED form: the value is
+  # the 8-byte Arc-class handle { inner: Arc @ 0 } to the 24-byte pinned
+  # backing { ptr @ 0, len @ 8, offset @ 16 } (the ONE safe-view
+  # authority — slice_shared_handle_layout / slice_shared_backing_layout).
+  let sh = slice_shared_handle_layout(&engine)
+  check_eq(8, sh.size, "engine: Slice[T] shared handle size = 8")
+  check_eq(8, sh.align, "engine: Slice[T] shared handle align = 8")
+  check_eq(0, sh.fields[0].offset, "engine: Slice[T] handle inner @ 0")
+  let sb = slice_shared_backing_layout(&engine)
+  check_eq(24, sb.size, "engine: SliceBacking[T] size = 24")
+  check_eq(8, sb.align, "engine: SliceBacking[T] align = 8")
+  check_eq(0, sb.fields[0].offset, "engine: SliceBacking.ptr @ 0")
+  check_eq(8, sb.fields[1].offset, "engine: SliceBacking.len @ 8")
+  check_eq(16, sb.fields[2].offset, "engine: SliceBacking.offset @ 16")
   var c_src = "#include <stddef.h>\n#include <stdio.h>\n#include <stdint.h>\n"
   c_src = c_src + "typedef struct { void* data; size_t len; size_t cap; size_t stride; } StrObj;\n"
   c_src = c_src + "typedef struct { void* data; size_t len; size_t cap; size_t stride; } VecHdr;\n"
@@ -881,6 +898,164 @@ def test_randomized_structs() -> Unit
 end
 
 # ———————————————————————————————————————————————————————————————
+# 9. The attributed shapes — @repr(C) / @align(N) / @packed vs the C
+#    compiler (the reviewer's packed/alignment attributes)
+# ———————————————————————————————————————————————————————————————
+#   @repr(C) — the C struct rules: exact-match probes against the natural
+#              C layout (offsets, size, align).
+#   @packed  — GCC's __attribute__((packed)): exact-match probes — the
+#              kernel epoll_event shape ({ u32 events @ 0, u64 data @ 4 }
+#              — size 12) is the canonical case (a natural {u32,u64}
+#              struct would pad data to 8 and span 16 bytes).
+#   @align(N) — single-field shapes probe exactly (size + align agree
+#              with GCC's __attribute__((aligned(N)))). The dialect's
+#              MULTI-field rule — the fields' offsets align to the MAX of
+#              the field's own alignment and the declared N (the
+#              dialect's documented C-alignment rule) — is asserted
+#              engine-side (packed_align_engine_test.tg), NOT probed
+#              against GCC (GCC keeps the natural field offsets and only
+#              raises the struct's size/alignment; the divergence is
+#              deliberate and documented).
+def test_attributed_layouts() -> Unit
+  let target = aarch64_target()
+  mut engine = layout_engine_new(target)
+  # @repr(C) { u8 @ 0, u32 @ 4, u64 @ 8 } — size 16 align 8.
+  var c_fields = Vec::new()
+  c_fields.push(MirFieldDef { name: "a".to_string(), ty: Type::U8 })
+  c_fields.push(MirFieldDef { name: "b".to_string(), ty: Type::U32 })
+  c_fields.push(MirFieldDef { name: "c".to_string(), ty: Type::U64 })
+  var c_attrs = LayoutAttrs { is_repr_c: true, is_packed: false, align: Option::None, span: span_dummy() }
+  # @packed { u32 @ 0, u64 @ 4 } — the kernel epoll_event: size 12 align 1.
+  var p_fields = Vec::new()
+  p_fields.push(MirFieldDef { name: "events".to_string(), ty: Type::U32 })
+  p_fields.push(MirFieldDef { name: "data".to_string(), ty: Type::UInt })
+  var p_attrs = LayoutAttrs { is_repr_c: false, is_packed: true, align: Option::None, span: span_dummy() }
+  # @packed { u8 @ 0, u32 @ 1, u64 @ 5 } — size 13 align 1.
+  var p2_fields = Vec::new()
+  p2_fields.push(MirFieldDef { name: "tag".to_string(), ty: Type::U8 })
+  p2_fields.push(MirFieldDef { name: "word".to_string(), ty: Type::U32 })
+  p2_fields.push(MirFieldDef { name: "big".to_string(), ty: Type::U64 })
+  var p2_attrs = LayoutAttrs { is_repr_c: false, is_packed: true, align: Option::None, span: span_dummy() }
+  # @align(16) { u8 } — size 16 align 16 (single-field: exact-matchable).
+  var a_fields = Vec::new()
+  a_fields.push(MirFieldDef { name: "a".to_string(), ty: Type::U8 })
+  var a_attrs = LayoutAttrs { is_repr_c: false, is_packed: false, align: Option::Some(16), span: span_dummy() }
+  # @align(8) { u64 } — size 16 align 8 (single-field).
+  var a2_fields = Vec::new()
+  a2_fields.push(MirFieldDef { name: "x".to_string(), ty: Type::U64 })
+  var a2_attrs = LayoutAttrs { is_repr_c: false, is_packed: false, align: Option::Some(8), span: span_dummy() }
+  var defs = Vec::new()
+  defs.push(MirTypeDef {
+    id: TypeId { id: 31 },
+    name: "CRepr".to_string(),
+    kind: MirTypeDefKind::Struct(c_fields),
+    generic_params: Vec::new(),
+    layout: c_attrs
+  })
+  defs.push(MirTypeDef {
+    id: TypeId { id: 32 },
+    name: "PackedEv".to_string(),
+    kind: MirTypeDefKind::Struct(p_fields),
+    generic_params: Vec::new(),
+    layout: p_attrs
+  })
+  defs.push(MirTypeDef {
+    id: TypeId { id: 33 },
+    name: "PackedOdd".to_string(),
+    kind: MirTypeDefKind::Struct(p2_fields),
+    generic_params: Vec::new(),
+    layout: p2_attrs
+  })
+  defs.push(MirTypeDef {
+    id: TypeId { id: 34 },
+    name: "Aligned16".to_string(),
+    kind: MirTypeDefKind::Struct(a_fields),
+    generic_params: Vec::new(),
+    layout: a_attrs
+  })
+  defs.push(MirTypeDef {
+    id: TypeId { id: 35 },
+    name: "Aligned8".to_string(),
+    kind: MirTypeDefKind::Struct(a2_fields),
+    generic_params: Vec::new(),
+    layout: a2_attrs
+  })
+  layout_engine_register_types(&mut engine, &defs)
+  compute_all_layouts(&mut engine)
+  var c_src = "#include <stddef.h>\n#include <stdio.h>\n#include <stdint.h>\n"
+  c_src = c_src + "typedef struct { unsigned char a; unsigned int b; unsigned long long c; } CRepr;\n"
+  c_src = c_src + "typedef struct __attribute__((packed)) { uint32_t events; uint64_t data; } PackedEv;\n"
+  c_src = c_src + "typedef struct __attribute__((packed)) { unsigned char tag; unsigned int word; unsigned long long big; } PackedOdd;\n"
+  c_src = c_src + "typedef struct __attribute__((aligned(16))) { unsigned char a; } Aligned16;\n"
+  c_src = c_src + "typedef struct __attribute__((aligned(8))) { unsigned long long x; } Aligned8;\n"
+  c_src = c_src + "int main(void) {\n"
+  c_src = c_src + "  printf(\"CRepr:%zu:%zu:%zu:%zu:%zu\\n\", sizeof(CRepr), _Alignof(CRepr), offsetof(CRepr, a), offsetof(CRepr, b), offsetof(CRepr, c));\n"
+  c_src = c_src + "  printf(\"PackedEv:%zu:%zu:%zu:%zu\\n\", sizeof(PackedEv), _Alignof(PackedEv), offsetof(PackedEv, events), offsetof(PackedEv, data));\n"
+  c_src = c_src + "  printf(\"PackedOdd:%zu:%zu:%zu:%zu:%zu\\n\", sizeof(PackedOdd), _Alignof(PackedOdd), offsetof(PackedOdd, tag), offsetof(PackedOdd, word), offsetof(PackedOdd, big));\n"
+  c_src = c_src + "  printf(\"Aligned16:%zu:%zu:%zu\\n\", sizeof(Aligned16), _Alignof(Aligned16), offsetof(Aligned16, a));\n"
+  c_src = c_src + "  printf(\"Aligned8:%zu:%zu:%zu\\n\", sizeof(Aligned8), _Alignof(Aligned8), offsetof(Aligned8, x));\n"
+  c_src = c_src + "  return 0;\n}\n"
+  var c_ty = Type::Adt(TypeId { id: 31 }, Vec::new())
+  var p_ty = Type::Adt(TypeId { id: 32 }, Vec::new())
+  var p2_ty = Type::Adt(TypeId { id: 33 }, Vec::new())
+  var a_ty = Type::Adt(TypeId { id: 34 }, Vec::new())
+  var a2_ty = Type::Adt(TypeId { id: 35 }, Vec::new())
+  # The engine-side expectations.
+  var co: Vec[Int] = Vec::new()
+  co.push(0)
+  co.push(4)
+  co.push(8)
+  var po: Vec[Int] = Vec::new()
+  po.push(0)
+  po.push(4)
+  var p2o: Vec[Int] = Vec::new()
+  p2o.push(0)
+  p2o.push(1)
+  p2o.push(5)
+  var a_o: Vec[Int] = Vec::new()
+  a_o.push(0)
+  var a2_o: Vec[Int] = Vec::new()
+  a2_o.push(0)
+  var expects: Vec[(String, Int, Int, Vec[Int])] = Vec::new()
+  expects.push(("CRepr".to_string(), size_of(&mut engine, &c_ty), align_of(&mut engine, &c_ty), co))
+  expects.push(("PackedEv".to_string(), size_of(&mut engine, &p_ty), align_of(&mut engine, &p_ty), po))
+  expects.push(("PackedOdd".to_string(), size_of(&mut engine, &p2_ty), align_of(&mut engine, &p2_ty), p2o))
+  expects.push(("Aligned16".to_string(), size_of(&mut engine, &a_ty), align_of(&mut engine, &a_ty), a_o))
+  expects.push(("Aligned8".to_string(), size_of(&mut engine, &a2_ty), align_of(&mut engine, &a2_ty), a2_o))
+  # The packed/C-repr rules the engine must produce.
+  check_eq(16, size_of(&mut engine, &c_ty), "engine: CRepr size = 16 (the natural C layout)")
+  check_eq(12, size_of(&mut engine, &p_ty), "engine: PackedEv size = 12 (the kernel epoll_event size)")
+  check_eq(4, field_offset(&mut engine, &p_ty, 1), "engine: PackedEv.data @ 4 (the kernel offset — never 8)")
+  check_eq(13, size_of(&mut engine, &p2_ty), "engine: PackedOdd size = 13")
+  check_eq(1, field_offset(&mut engine, &p2_ty, 1), "engine: PackedOdd.word @ 1 (odd — unaligned by construction)")
+  check_eq(16, align_of(&mut engine, &a_ty), "engine: Aligned16 align = 16")
+  check_eq(16, size_of(&mut engine, &a_ty), "engine: Aligned16 size = 16")
+  check_eq(8, align_of(&mut engine, &a2_ty), "engine: Aligned8 align = 8")
+  check_eq(16, size_of(&mut engine, &a2_ty), "engine: Aligned8 size = 16")
+  match run_c_probe(c_src)
+  when Option::Some(out) then
+    let lines = probe_lines(out)
+    for (name, esize, ealign, eoffs) in expects do
+      match lines.get(&name)
+      when Option::Some(pl) then
+        check_eq(esize, pl.size, "differential attributed size " + name.clone())
+        check_eq(ealign, pl.align, "differential attributed align " + name.clone())
+        check_eq(eoffs.len(), pl.offsets.len(), "differential attributed offset count " + name.clone())
+        var oi = 0
+        while oi < eoffs.len() && oi < pl.offsets.len() do
+          check_eq(eoffs[oi], pl.offsets[oi], "differential attributed offset " + name.clone() + "[" + oi.to_string() + "]")
+          oi = oi + 1
+        end
+      when Option::None then
+        check(false, "differential attributed " + name.clone() + " missing from probe output")
+      end
+    end
+  when Option::None then
+    check(false, "differential attributed: probe failed to run")
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
 # Main
 # ———————————————————————————————————————————————————————————————
 
@@ -906,6 +1081,8 @@ def main() -> Int
   test_ffi_opaque_aligns()
   println("\n--- 8. Randomized shapes (fixed seed) ---")
   test_randomized_structs()
+  println("\n--- 9. Attributed shapes (@repr(C)/@align(N)/@packed) ---")
+  test_attributed_layouts()
   println("\n========================================")
   println("Results: " + tests_passed.to_string() + " passed, " + tests_failed.to_string() + " failed")
   println("========================================")

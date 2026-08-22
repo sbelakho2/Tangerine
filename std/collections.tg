@@ -6,16 +6,19 @@ use std::alloc::{ArcStrong, ArcInnerWeak, alloc, alloc_array, dealloc_array, ptr
 
 # ———————————————————————————————————————————————————————————————
 # THE SAFE VIEW MODEL (DECIDED — the reviewer's shared/pinned backing;
-# the raw {ptr,len} views become unsafe/FFI-only)
+# ONE representation, ONE semantic authority: the SOURCE-spelled Slice[T]
+# IS the shared/pinned form; the raw {ptr,len} view is ONLY the explicit
+# UnsafeSlice — unsafe/FFI-only)
 # ———————————————————————————————————————————————————————————————
-# THE SAFE SLICE = THE SHARED/PINNED FORM:
+# THE SAFE SLICE = THE SOURCE-SPELLED SLICE (declared below as the
+# SHARED/PINNED form):
 #     SliceBacking[T] = { ptr: Ptr[T], len: UInt, offset: UInt }
 #                       — the PINNED BACKING: the pinned buffer (ptr) plus
 #                         the view window's offset/len. The backing owns a
 #                         pinned allocation that holds the window's
 #                         elements, so the backing ITSELF keeps the
 #                         underlying storage alive.
-#     Slice[T] (the safe form, declared as SharedSlice below) =
+#     Slice[T] (declared below) =
 #         { inner: Arc[SliceBacking[T]] }  — the Arc-CLASS {ptr,len}:
 #         one pointer-sized Arc handle to the pinned backing record.
 #
@@ -30,16 +33,17 @@ use std::alloc::{ArcStrong, ArcInnerWeak, alloc, alloc_array, dealloc_array, ptr
 #   drop    = the Arc's drop — the backing's deinit releases the pinned
 #             allocation when the last Arc dies. The view is an ordinary
 #             OWNING value in the resource checker: no escape tracking,
-#             no access-scoping — it can be returned, stored in fields/
-#             containers, captured, and outlive its source.
+#             no access-scoping, no "eventual mechanism" — it can be
+#             returned, stored in fields/containers, captured, and outlive
+#             its source.
 #   bit copy= no      — the Arc handle is NOT bit-copyable; the shared
 #                       view is moved/cloned (Arc::clone).
 #   layout  = the safe Slice is 8 bytes: { inner: Arc @ 0 } — the
 #             Arc-class handle. The backing record is 24 bytes:
 #             { ptr @ 0, len @ 8, offset @ 16 }.
 #
-# THE RAW VIEW = UnsafeSlice[T] (the compiler's Slice builtin, exposed
-# under its explicit unsafe/FFI spelling):
+# THE RAW VIEW = UnsafeSlice[T] (the compiler's builtin — the registered
+# Opaque generic, the LangItems slice id):
 #     UnsafeSlice[T] = { ptr: Ptr[T], len: UInt } — the 16-byte borrowed
 #     {ptr,len} fat value. owns=false, drop=none, bit-copyable. It is the
 #     FFI/unsafe-only form: SAFE CODE CANNOT PRODUCE IT (no safe API
@@ -136,8 +140,8 @@ impl[T] SliceMut[T]
   end
 end
 # ———————————————————————————————————————————————————————————————
-# The SHARED/PINNED slice — SliceBacking[T] + SharedSlice[T]
-# (the safe Slice; the contract header above)
+# The SHARED/PINNED slice — SliceBacking[T] + Slice[T]
+# (the SAFE SOURCE-SPELLED Slice; the contract header above)
 # ———————————————————————————————————————————————————————————————
 
 # The PINNED BACKING — the pinned buffer plus the window's offset/len.
@@ -153,17 +157,21 @@ struct SliceBacking[T]
 end
 
 # The SHARED/PINNED VIEW — the Arc-class {ptr,len}: one Arc handle to the
-# pinned backing record (the 8-byte layout: { inner: Arc @ 0 }).
-struct SharedSlice[T]
+# pinned backing record (the 8-byte layout: { inner: Arc @ 0 }). This IS
+# the SOURCE-spelled Slice[T] — the one safe Slice representation.
+struct Slice[T]
   inner: ArcStrong[SliceBacking[T]]
 end
 
 # Pin the window [offset, offset + count) of the buffer at `ptr` into a
 # FRESH pinned allocation. The pin copies the window — the pinned record
 # is self-contained, so the view can never dangle (no lifetime inference:
-# the Arc is the backing's keep-alive, nothing else). The offset records
-# the window's start within the pinned buffer at pin time.
-def slice_pin[T](ptr: Ptr[T], count: UInt, offset: UInt) -> SharedSlice[T]
+# the Arc is the backing's keep-alive, nothing else). The backing's ptr
+# IS the window's start (the pin copies exactly the window; element i of
+# the view lives at backing.ptr + i * stride). The offset records the
+# window's start within the SOURCE buffer at pin time — metadata for the
+# sub-view chaining (the backing's deinit releases the pinned window).
+def slice_pin[T](ptr: Ptr[T], count: UInt, offset: UInt) -> Slice[T]
   var buf: Ptr[T] = Ptr::null()
   if count > 0 then
     let bytes = (count as Int * size_of[T]() as Int) as UInt
@@ -179,7 +187,7 @@ def slice_pin[T](ptr: Ptr[T], count: UInt, offset: UInt) -> SharedSlice[T]
     weak_count: 0,
     data: SliceBacking { ptr: buf, len: count, offset: offset }
   })
-  SharedSlice { inner: ArcStrong { ptr: inner } }
+  Slice { inner: ArcStrong { ptr: inner } }
 end
 
 impl[T] SliceBacking[T]
@@ -194,7 +202,7 @@ impl[T] SliceBacking[T]
   end
 end
 
-impl[T] SharedSlice[T]
+impl[T] Slice[T]
   def len(self: Self) -> UInt
     self.inner.ptr.as_mut().data.len
   end
@@ -204,26 +212,50 @@ impl[T] SharedSlice[T]
   end
 
   # The sub-view [start, start + len): a fresh pinned backing holds the
-  # sub-window (the pin copies; the sub-view is self-contained and shares
-  # nothing with the parent except the element values).
-  def sub(self: Self, start: Int, len: UInt) -> SharedSlice[T]
+  # sub-window (the pin copies from the parent's pinned window at `start`;
+  # the sub-view is self-contained and shares nothing with the parent
+  # except the element values). The recorded offset is the sub-window's
+  # start within the ORIGINAL source buffer (the metadata chaining rule).
+  def sub(self: Self, start: Int, len: UInt) -> Slice[T]
     let b = self.inner.ptr.as_mut().data
     let elem = size_of[T]() as Int
-    slice_pin((b.ptr as Int + (b.offset as Int + start) * elem) as Ptr[T], len, start as UInt)
+    slice_pin((b.ptr as Int + start * elem) as Ptr[T], len, (b.offset as Int + start) as UInt)
   end
 end
 
-impl[T: Copy] SharedSlice[T]
+impl[T: Copy] Slice[T]
   # The pinned element read — safe: the backing owns the pinned buffer,
   # so the view can never dangle. Out-of-range reads TRAP (the std OOB
-  # policy, like Array::get).
+  # policy, like Array::get). Element i of the view lives at
+  # backing.ptr + i * stride — the backing.ptr IS the pinned window's
+  # start (the offset is source metadata, never an element address).
   def get(self: Self, index: Int) -> T
     let b = self.inner.ptr.as_mut().data
     let elem = size_of[T]() as Int
     if index < 0 || index >= b.len as Int then
-      panic("SharedSlice::get: index out of bounds")
+      panic("Slice::get: index out of bounds")
     end
-    *((b.ptr as Int + (b.offset as Int + index) * elem) as Ptr[T])
+    *((b.ptr as Int + index * elem) as Ptr[T])
+  end
+
+  # The first element (None when empty) — the shared form's safe first:
+  # reads through the Arc deref into the pinned backing.
+  def first(self: Self) -> Option[T]
+    if self.len() == 0 then
+      Option::None
+    else
+      Option::Some(self.get(0))
+    end
+  end
+
+  # The last element (None when empty) — the shared form's safe last:
+  # reads through the Arc deref into the pinned backing.
+  def last(self: Self) -> Option[T]
+    if self.len() == 0 then
+      Option::None
+    else
+      Option::Some(self.get(self.len() as Int - 1))
+    end
   end
 end
 # ———————————————————————————————————————————————————————————————
@@ -752,11 +784,12 @@ impl[T: Copy] Array[T]
   end
 
   # The SAFE VIEW: pins the window [0, len) into a fresh pinned backing and
-  # returns the SHARED/PINNED Slice (the Arc-class view). The view survives
+  # returns the SHARED/PINNED Slice — the SOURCE-spelled Slice[T] (the
+  # Arc-class view). The view survives
   # this array's drop and its capacity-changing mutations — the backing is
   # the separate pinned allocation. The pin copies the window; the view is
   # immutable and never dangles (no lifetime inference).
-  def as_slice(self: Self) -> SharedSlice[T]
+  def as_slice(self: Self) -> Slice[T]
     slice_pin(self.as_ptr(), self.len() as UInt, 0)
   end
 

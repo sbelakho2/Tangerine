@@ -39,7 +39,7 @@
 | Parse | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Type | ✓ | ✓ | ✓ | ✓ | ✓ |
 | MIR | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Object | ✓ | ✓ | ✓ | ✗ | ✗ |
+| Object | ✓ | ✓ | ✓ | ✗ | ✓ |
 | Static-link | ✓ | ✓ | ✗ | ✗ | ✗ |
 | Dynamic-extern | ✓ | ✓ | ✗ | ✗ | ✗ |
 | Native-run | ✓ | ✗ | ✗ | ✗ | ✗ |
@@ -62,15 +62,15 @@ None of the targets' front-end marks depend on a native run.
 
 **aarch64-apple-darwin: Parse, Type, MIR, Object, Static-link, Dynamic-extern, Native-run, TLS, Threads, DB ✓; Debug ✗.**
 
-Evidence: `tests/canary`; `tests/canary_neg`; `tests/resource_cfg`; `tests/differential`; `tests/run_target_lane_canaries.sh`; `tests/thread_local_drop_test.tg`; `tests/pthread_abi_test.tg`; `tests/db_mysql_integration_test.tg`; `tests/db_postgres_integration_test.tg`; `tests/db_async_pool_test.tg`.
+Evidence: `tests/canary`; `tests/canary_neg`; `tests/resource_cfg`; `tests/differential`; `tests/run_target_lane_canaries.sh`; `tests/thread_local_drop_test.tg`; `tests/pthread_abi_test.tg`; `tests/db_mysql_integration_test.tg`; `tests/db_postgres_integration_test.tg`; `tests/db_async_pool_test.tg`; `tests/run_nostd_bare_lane.sh`; `tests/nostd/nostd_bare_start.tg`.
 
-the bootstrap host: the ARM64 backend (asm.tg AArch64 encoder), the Mach-O object writer and the in-tree Mach-O linker (linker.tg — dyld import stubs, bind opcodes, LC_LOAD_DYLIB libSystem.B.dylib) are the committed artifacts. TLS: @thread_local statics + thread_local_drop_test.tg. Threads: std/thread.tg pthread opaques + the FFI-opaque alignment override (ffi_opaque_native_align) + pthread_abi_test.tg. DB: std/db.tg mysql/postgres dispatch + the integration suites. The ✓ row is artifact-backed — NO ladder/CI run has occurred on THIS tree (the host IS the target of the tree's bootstrap ladder, but no run-observed mark is claimed).
+the bootstrap host: the ARM64 backend (asm.tg AArch64 encoder), the Mach-O object writer and the in-tree Mach-O linker (linker.tg — dyld import stubs, bind opcodes, LC_LOAD_DYLIB libSystem.B.dylib) are the committed artifacts. TLS: @thread_local statics + thread_local_drop_test.tg. Threads: std/thread.tg pthread opaques + the FFI-opaque alignment override (ffi_opaque_native_align) + pthread_abi_test.tg. DB: std/db.tg mysql/postgres dispatch + the integration suites. no_std: the @no_std/--no-std route compiles the core-only surface + the _start bare entry into the libc-free self-contained binary (tests/run_nostd_bare_lane.sh + tests/nostd/nostd_bare_start.tg); the embedded route emits the bare-metal ELF image per embedded triple with the spec/linker/startup artifacts (tests/run_embedded_lane.sh). The ✓ row is artifact-backed — NO ladder/CI run has occurred on THIS tree (the host IS the target of the tree's bootstrap ladder, but no run-observed mark is claimed).
 
 **x86_64-unknown-linux-gnu: Parse, Type, MIR, Object, Static-link, Dynamic-extern ✓; Native-run, TLS, Threads, DB, Debug ✗.**
 
-Evidence: `tests/canary`; `tests/canary_neg`; `tests/resource_cfg`; `tests/differential`; `tests/run_target_lane_canaries.sh`.
+Evidence: `tests/canary`; `tests/canary_neg`; `tests/resource_cfg`; `tests/differential`; `tests/run_target_lane_canaries.sh`; `tests/run_nostd_bare_lane.sh`; `tests/nostd/nostd_bare_start.tg`.
 
-the x86-64 ELF backend (asm.tg x64 encoder + ELF64 object writer + ELF linker: EM_X86_64, the PLT/GOT stub machinery, R_X86_64_* relocations) is committed; parse_target_triple resolves the triple. Dynamic-extern: the ELF extern-stub surface (the linker's extern_stub_map/PLT path). Native-run/TLS/Threads/DB are ✗: no executed evidence on this tree — the x86_64 host lane is the committed artifact, not an observed run.
+the x86-64 ELF backend (asm.tg x64 encoder + ELF64 object writer + ELF linker: EM_X86_64, the PLT/GOT stub machinery, R_X86_64_* relocations) is committed; parse_target_triple resolves the triple. Dynamic-extern: the ELF extern-stub surface (the linker's extern_stub_map/PLT path). no_std: the @no_std/--no-std route (the core-only surface + the _start bare entry + the direct syscall surface — tests/run_nostd_bare_lane.sh). Native-run/TLS/Threads/DB are ✗: no executed evidence on this tree — the x86_64 host lane is the committed artifact, not an observed run.
 
 **x86_64-apple-darwin: Parse, Type, MIR, Object ✓; Static-link, Dynamic-extern, Native-run, TLS, Threads, DB, Debug ✗.**
 
@@ -84,11 +84,11 @@ Evidence: `tests/canary`; `tests/canary_neg`; `tests/resource_cfg`; `tests/diffe
 
 no PE/COFF object writer, no Windows linker, no Windows ABI table. The triple parses, so Parse/Type/MIR ✓ — and nothing after that.
 
-**wasm32: Parse, Type, MIR ✓; Object, Static-link, Dynamic-extern, Native-run, TLS, Threads, DB, Debug ✗.**
+**wasm32: Parse, Type, MIR, Object ✓; Static-link, Dynamic-extern, Native-run, TLS, Threads, DB, Debug ✗.**
 
-Evidence: `tests/canary`; `tests/canary_neg`; `tests/resource_cfg`; `tests/differential`.
+Evidence: `tests/canary`; `tests/canary_neg`; `tests/resource_cfg`; `tests/differential`; `tests/run_wasm_conformance.sh`; `tests/wasm/wasm_conformance_test.tg`; `tests/run_wasi_conformance.sh`; `tests/wasi/wasi_guest_canary.tg`.
 
-wasm_target.tg builds WASM sections but nothing calls it: no `--target wasm32*` route in driver.tg/codegen.tg (feature_matrix.md §III.4 agrees). Parse/Type/MIR ✓ (the front end is target-independent), Object ✗ (the WASM builder is not wired into the object pipeline), everything below ✗.
+the driver's wasm dispatch routes `--target wasm32-unknown-unknown` (freestanding) and `wasm32-wasi` (WASI imports) to the wasm backend (driver.tg compile_to_wasm_route), and the emission is the wasm OBJECT form: the .wasm binary (the type/import/function/memory/global/export/start/code/data sections + the producer custom record). The WASI surface is the implemented row: the wasm32-wasi target adds the wasi_snapshot_preview1 import section (wasm_target.tg add_wasi_imports — fd_write/fd_read/fd_close/proc_exit/args/environ), the host-side ABI lives in the compiler runtime (runtime.tg emit_wasi_host_runtime — the _tg_wasi_fd_write/_tg_wasi_fd_read/_tg_wasi_fd_close/_tg_wasi_clock_time_get/_tg_wasi_proc_exit bodies), and the guest surface is std/wasi.tg; the wasmtime --dir conformance lane runs when the runtime is installed (tests/run_wasi_conformance.sh), and the pure guest-surface suite is tests/wasi/wasi_guest_surface_test.tg. Static-link/dynamic-extern/native-run remain ✗: there is no in-tree wasm linker or runtime — the conformance is structural (the independent wasm parser validates the emitted binary) plus the wasmtime execution lane when the runtime is installed.
 
 Debug — every target ✗. `-g` sets `debug_info` but no committed artifact executes a debugger surface (`tg debug`/debugger.tg is not wired); the honest mark is ✗ everywhere.
 

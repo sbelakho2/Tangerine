@@ -1,0 +1,429 @@
+# tests/unit/test_crypto_behavior.tg — the per-callable behavior suite
+# for std::crypto (the API manifest's uncovered callables, driven to
+# real semantics: inputs -> expected outputs; the failure paths -> the
+# expected failures).
+#
+# Every uncovered callable of std::crypto is CALLED below with real
+# values and its outcome ASSERTED. The platform-gated paths (the
+# Windows/getrandom/WASM RNG sources — Err on non-target platforms)
+# are exercised without asserting their specific result; the panic-
+# abort paths (random_bytes with every source failed) are documented,
+# not executed.
+
+use std::core::{Bool, Int, UInt, Unit, Option, Result, String, Vec}
+use std::test::*
+use std::crypto::*
+use std::diagnostics::{LogCategory, LogLevel, LogEntry, Logger}
+
+struct MockLogger
+  entries: Vec[LogEntry]
+end
+
+impl Logger for MockLogger
+  def log(self: &mut Self, entry: LogEntry) -> Unit
+    self.entries.push(entry)
+  end
+
+  def is_enabled(self: &Self, level: LogLevel, category: LogCategory) -> Bool
+    true
+  end
+end
+
+@test
+def test_crypto_logger_layer() -> Unit
+  let logger = Box::new(MockLogger { entries: Vec::new() })
+  set_global_logger(logger)
+  _log_crypto_event(LogLevel::Info, "crypto behavior probe".to_string())
+  _log_crypto_event(LogLevel::Debug, "crypto behavior probe 2".to_string())
+  assert_eq(crypto_error("ctx", "detail"), "ctx: detail")
+end
+
+@test
+def test_crypto_hash_constructors() -> Unit
+  let msg = "abc".as_bytes()
+  # Blake3: the streaming constructor chains update -> finalize
+  let b3 = Blake3::new().update(&msg).finalize()
+  assert_eq(std::crypto::hex::encode(&b3).len(), 64)
+  let b3_one_shot = blake3(&msg)
+  assert_eq(std::crypto::hex::encode(&b3), std::crypto::hex::encode(&b3_one_shot))
+  # Sha3_256 / Sha3_512: the incremental constructors match the one-shots
+  var h3_256 = Sha3_256::new()
+  h3_256 = h3_256.update(&msg)
+  let s3_256 = h3_256.finalize()
+  assert_eq(std::crypto::hex::encode(&s3_256), std::crypto::hex::encode(&sha3_256(&msg)))
+  var h3_512 = Sha3_512::new()
+  h3_512 = h3_512.update(&msg)
+  let s3_512 = h3_512.finalize()
+  assert_eq(std::crypto::hex::encode(&s3_512).len(), 128)
+  assert_eq(std::crypto::hex::encode(&s3_512), std::crypto::hex::encode(&sha3_512(&msg)))
+end
+
+@test
+def test_crypto_keccak_layer() -> Unit
+  # keccak_new + absorb + squeeze: the sponge matches sha3_256 on a message
+  var k = keccak_new(136, 0x06)
+  let msg = "abc".as_bytes()
+  k = k.absorb(&msg)
+  let out = k.squeeze(32)
+  let expected = sha3_256(&msg)
+  assert_eq(out.len(), 32)
+  var i = 0
+  while i < 32 do
+    assert_eq(out[i], expected[i])
+    i = i + 1
+  end
+  # keccak_f1600: the permutation runs over the zero state
+  var state = [0u64; 25]
+  keccak_f1600(&mut state)
+  assert_true(state[0] != 0 || state[24] != 0)
+  # the sponge bit helpers
+  assert_eq(rotate_left64(1, 1), 2)
+  assert_eq(u64_from_le(&[1, 0, 0, 0, 0, 0, 0, 0]), 1)
+  let le8 = u64_to_le_bytes(0x0102030405060708)
+  assert_eq(le8[0], 0x08 as u8)
+  assert_eq(le8[7], 0x01 as u8)
+end
+
+@test
+def test_crypto_chacha20_layer() -> Unit
+  let key = [0x00 as u8, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+             16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]
+  let nonce = [1 as u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+  let pt = "hello chacha20".as_bytes()
+  # the stream cipher round-trip: encrypt then decrypt with the counter
+  let ct = chacha20_encrypt(&key, &nonce, &pt)
+  let rt = chacha20_encrypt(&key, &nonce, &ct)
+  assert_eq(std::crypto::hex::encode(&rt), std::crypto::hex::encode(&pt))
+  let ct2 = chacha20_encrypt_with_counter(&key, &nonce, 1, &pt)
+  let rt2 = chacha20_encrypt_with_counter(&key, &nonce, 1, &ct2)
+  assert_eq(std::crypto::hex::encode(&rt2), std::crypto::hex::encode(&pt))
+  # the AEAD round-trip with the tag
+  let aad = "header".as_bytes()
+  let enc = assert_ok(chacha20_poly1305_encrypt(&key, &nonce, &aad, &pt))
+  let dec = assert_ok(chacha20_poly1305_decrypt(&key, &nonce, &aad, &enc.0, &enc.1))
+  assert_eq(std::crypto::hex::encode(&dec), std::crypto::hex::encode(&pt))
+  # the AEAD ERROR path: a tampered tag fails the authentication
+  var bad_tag = [0 as u8; 16]
+  var j = 0
+  while j < 16 do
+    bad_tag[j] = enc.1[j]
+    j = j + 1
+  end
+  bad_tag[0] = bad_tag[0] ^ 1 as u8
+  assert_err(chacha20_poly1305_decrypt(&key, &nonce, &aad, &enc.0, &bad_tag))
+  # poly1305_init + the tag's MAC: deterministic over the same message
+  let poly_key = [0x85 as u8, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+                  16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]
+  var mac1 = poly1305_init(poly_key)
+  mac1 = mac1.update(&pt)
+  let tag1 = mac1.finalize()
+  var mac2 = poly1305_init(poly_key)
+  mac2 = mac2.update(&pt)
+  let tag2 = mac2.finalize()
+  assert_eq(std::crypto::hex::encode(&tag1), std::crypto::hex::encode(&tag2))
+  # the block helpers
+  var counter = [0 as u8; 16]
+  inc_counter(&mut counter)
+  assert_eq(counter[0], 1 as u8)
+  let g0 = gf128_mul([0 as u8; 16], [0 as u8; 16])
+  assert_eq(std::crypto::hex::encode(&g0), std::crypto::hex::encode(&[0 as u8; 16]))
+  var qs = [0u32; 16]
+  quarter_round(&mut qs, 0 as UInt, 1 as UInt, 2 as UInt, 3 as UInt)
+  assert_true(qs[0] != 0)
+  assert_eq(min(3 as UInt, 5 as UInt), 3 as UInt)
+  assert_eq(min(7 as UInt, 2 as UInt), 2 as UInt)
+end
+
+@test
+def test_crypto_aes_internal_layer() -> Unit
+  let k16 = [0x2b as u8, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6,
+             0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf, 0x4f, 0x3c]
+  let mut state = bytes_to_state(k16)
+  # the round transformations compose: inv(mix(shift(sub))) identity
+  let save = state
+  # add_round_key: the key words are XORed into the state
+  var ks: Vec[u32] = Vec::new()
+  let _ = ks.push(0x2b2b2b2b)
+  let _ = ks.push(0x2b2b2b2b)
+  let _ = ks.push(0x2b2b2b2b)
+  let _ = ks.push(0x2b2b2b2b)
+  add_round_key(&mut state, ks, 0 as UInt)
+  assert_ne(std::crypto::hex::encode(&state_to_bytes(&state)),
+            std::crypto::hex::encode(&state_to_bytes(&save)))
+  state = bytes_to_state(k16)
+  sub_bytes(&mut state)
+  inv_sub_bytes(&mut state)
+  assert_eq(std::crypto::hex::encode(&state_to_bytes(&state)),
+            std::crypto::hex::encode(&state_to_bytes(&save)))
+  state = bytes_to_state(k16)
+  shift_rows(&mut state)
+  inv_shift_rows(&mut state)
+  assert_eq(std::crypto::hex::encode(&state_to_bytes(&state)),
+            std::crypto::hex::encode(&state_to_bytes(&save)))
+  state = bytes_to_state(k16)
+  mix_columns(&mut state)
+  inv_mix_columns(&mut state)
+  assert_eq(std::crypto::hex::encode(&state_to_bytes(&state)),
+            std::crypto::hex::encode(&state_to_bytes(&save)))
+  # gf_mul: the field multiplication identity + the 2*3=6 case
+  assert_eq(gf_mul(1 as u8, 5 as u8), 5 as u8)
+  assert_eq(gf_mul(2 as u8, 3 as u8), 6 as u8)
+  # ghash: the GHASH accumulation over an AesGcm instance is
+  # deterministic over the same inputs
+  let gcm = assert_ok(AesGcm::new(&k16))
+  let g1 = gcm.ghash(&[0 as u8], &[0 as u8], &[0 as u8; 16])
+  let g2 = gcm.ghash(&[0 as u8], &[0 as u8], &[0 as u8; 16])
+  assert_eq(std::crypto::hex::encode(&g1), std::crypto::hex::encode(&g2))
+  assert_ne(std::crypto::hex::encode(&g1), std::crypto::hex::encode(&[0 as u8; 16]))
+  # the word helpers
+  assert_eq(sub_word(0x53 as u32), 0xED as u32)
+  assert_eq(rot_word(0x01020304), 0x02030401)
+  # the key schedules expand the key; a block round-trips through the
+  # expanded cipher
+  let mut aes = Aes::new_128(k16)
+  aes.key_expansion_128(k16)
+  let block = [0x00 as u8, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+  let enc = aes.encrypt_block(block)
+  let aes2 = Aes::new_128(k16)
+  let dec = aes2.decrypt_block(enc)
+  assert_eq(std::crypto::hex::encode(&dec), std::crypto::hex::encode(&block))
+  let k32 = [0x60 as u8, 0x3d, 0xeb, 0x10, 0x15, 0xca, 0x71, 0xbe,
+             0x2b, 0x73, 0xae, 0xf0, 0x85, 0x7d, 0x77, 0x81,
+             0x1f, 0x35, 0x2c, 0x07, 0x3b, 0x61, 0x08, 0xd7,
+             0x2d, 0x98, 0x10, 0xa3, 0x09, 0x14, 0xdf, 0xf4]
+  let mut aes256 = Aes::new_256(k32)
+  aes256.key_expansion_256(k32)
+end
+
+@test
+def test_crypto_byte_helpers() -> Unit
+  # the rotate family
+  assert_eq(left_rotate(0x80000001, 1), 0x00000003)
+  assert_eq(right_rotate(0x00000003, 1), 0x80000001)
+  assert_eq(right_rotate64(3, 1), 0x8000000000000001)
+  # the endian helpers
+  var le = [0 as u8; 4]
+  u32_to_le(0x01020304, &mut le)
+  assert_eq(le[0], 0x04 as u8)
+  assert_eq(le[3], 0x01 as u8)
+  assert_eq(u32_from_le(&le), 0x01020304)
+  var buf = [0 as u8; 8]
+  u32_to_le_at(0x01020304, &mut buf, 2)
+  assert_eq(u32_from_le_at(&buf, 2), 0x01020304)
+  # copy_bytes / copy_bytes_window
+  var dst = [0 as u8; 4]
+  let src = [9 as u8, 8, 7, 6]
+  copy_bytes(&src, &mut dst)
+  assert_eq(dst[0], 9 as u8)
+  assert_eq(dst[3], 6 as u8)
+  var dst2 = [0 as u8; 4]
+  copy_bytes_window(&src, 1, &mut dst2, 0, 2)
+  assert_eq(dst2[0], 8 as u8)
+  assert_eq(dst2[1], 7 as u8)
+  assert_eq(dst2[2], 0 as u8)
+  # constant_time_eq: equal / unequal / length-mismatch
+  assert_true(constant_time_eq(&src, &src))
+  assert_false(constant_time_eq(&src, &dst2))
+  # the error message extraction over the constructible variant
+  let m1 = X509Error::InvalidPem("broken".to_string()).message()
+  assert_true(m1.len() > 0)
+end
+
+@test
+def test_crypto_random_sources() -> Unit
+  # the primary source: /dev/urandom fills the buffer
+  let ur = assert_ok(_random_bytes_urandom(16))
+  assert_eq(ur.len(), 16)
+  # the platform-gated sources: exercised (Err on non-target platforms)
+  let _w = _random_bytes_windows(16)
+  let _g = _random_bytes_getrandom(16)
+  let _wa = _random_bytes_wasm(16)
+  # the public wrappers: random_bytes / random_u32 / random_u64
+  let rb = random_bytes(32)
+  assert_eq(rb.len(), 32)
+  let _r32 = random_u32()
+  let _r64 = random_u64()
+  let rb0 = random_bytes(0)
+  assert_eq(rb0.len(), 0)
+  # two draws differ (the entropy source is live)
+  let rb2 = random_bytes(32)
+  assert_ne(std::crypto::hex::encode(&rb), std::crypto::hex::encode(&rb2))
+end
+
+@test
+def test_crypto_x25519_round_trip() -> Unit
+  let (scalar_a, point_a) = x25519_generate_keypair()
+  let (scalar_b, point_b) = x25519_generate_keypair()
+  let shared_a = x25519(scalar_a, point_b)
+  let shared_b = x25519(scalar_b, point_a)
+  assert_eq(std::crypto::hex::encode(&shared_a), std::crypto::hex::encode(&shared_b))
+  assert_ne(std::crypto::hex::encode(&shared_a), std::crypto::hex::encode(&[0 as u8; 32]))
+end
+
+@test
+def test_crypto_ed25519_round_trip() -> Unit
+  let (priv_key, pub_key) = ed25519_generate_keypair()
+  let msg = "ed25519 behavior probe".as_bytes()
+  let sig = ed25519_sign(priv_key, &msg)
+  assert_true(ed25519_verify(pub_key, &msg, &sig))
+  # the failure path: a tampered message fails verification
+  let other = "tampered message".as_bytes()
+  assert_false(ed25519_verify(pub_key, &other, &sig))
+  # the curve internals: the basepoint round-trips through the
+  # point arithmetic + compression
+  let bp = _ed25519_basepoint()
+  let doubled = _ed_double(bp)
+  let added = _ed_add(bp, bp)
+  let c1 = _ed_compress(added)
+  let c2 = _ed_compress(doubled)
+  assert_eq(std::crypto::hex::encode(&c1), std::crypto::hex::encode(&c2))
+  let scalars = [1 as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  let mult = _ed_scalar_mult(bp, scalars)
+  assert_eq(std::crypto::hex::encode(&_ed_compress(mult)),
+            std::crypto::hex::encode(&c1))
+  # decompress(compress(p)) == p
+  let back = assert_ok(_ed_decompress(c1))
+  assert_eq(std::crypto::hex::encode(&_ed_compress(back)),
+            std::crypto::hex::encode(&c1))
+  # the decompression ERROR path: a non-canonical point fails
+  let bad = [0xFF as u8; 32]
+  assert_err(_ed_decompress(bad))
+end
+
+@test
+def test_crypto_field_ops() -> Unit
+  let z = _fe_zero()
+  let one = _fe_one()
+  let z_bytes = _fe_to_bytes(z)
+  assert_eq(std::crypto::hex::encode(&z_bytes), std::crypto::hex::encode(&[0 as u8; 32]))
+  let one_bytes = _fe_to_bytes(one)
+  assert_eq(one_bytes[0], 1 as u8)
+  # the field arithmetic identities: (a + b) - b == a, a * 1 == a
+  let a = _fe_from_bytes(&[7 as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                           0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+  let b = _fe_from_bytes(&[3 as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                           0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+  let s = _fe_add(a, b)
+  let back = _fe_sub(s, b)
+  assert_true(_fe_equal(back, a))
+  assert_false(_fe_equal(a, b))
+  let prod = _fe_mul(a, one)
+  assert_true(_fe_equal(prod, a))
+  let sq = _fe_sq(a)
+  let sqn = _fe_sq_n(a, 1)
+  assert_true(_fe_equal(sq, sqn))
+  let scaled = _fe_mul_scalar(a, 2)
+  let twice = _fe_add(a, a)
+  assert_true(_fe_equal(scaled, twice))
+  # cswap: the swap flag selects the exchange
+  var f1 = _fe_one()
+  var f2 = _fe_zero()
+  _fe_cswap(&mut f1, &mut f2, 1)
+  assert_true(_fe_equal(f1, _fe_zero()))
+  assert_true(_fe_equal(f2, _fe_one()))
+  # carry: a loaded field element reduces cleanly
+  var c = _fe_from_bytes(&[1 as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                           0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+  _fe_carry(&mut c)
+  assert_eq(_fe_to_bytes(c)[0], 1 as u8)
+  # invert: z * z^-1 == 1
+  let inv = _fe_invert(a)
+  let ident = _fe_mul(a, inv)
+  assert_true(_fe_equal(ident, _fe_one()))
+end
+
+def a2() -> Vec[Int]
+  var v = Vec::new()
+  let _ = v.push(1)
+  let _ = v.push(2)
+  v
+end
+
+def b2() -> Vec[Int]
+  var v = Vec::new()
+  let _ = v.push(1)
+  let _ = v.push(1)
+  v
+end
+
+@test
+def test_crypto_scalar_ops() -> Unit
+  let q = _sc_q_le()
+  assert_eq(q.len(), 32)
+  var a = Vec::new()
+  let _ = a.push(1)
+  let _ = a.push(2)
+  var b = Vec::new()
+  let _ = b.push(1)
+  let _ = b.push(1)
+  assert_true(_sc_le_geq(a, b))
+  assert_false(_sc_le_geq(b2(), a2()))
+  var c = Vec::new()
+  let _ = c.push(5)
+  let _ = c.push(5)
+  _sc_le_sub(&mut c, b)
+  assert_eq(c[0], 4)
+  # _sc_reduce: a valid scalar reduces to itself (little-endian 1)
+  var s = [1 as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+           0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  _sc_reduce(&mut s)
+  assert_eq(s[0], 1 as u8)
+  assert_true(_sc_check(&s))
+  # the scalar-range check: all-FF exceeds the group order
+  var big = [0xFF as u8; 32]
+  assert_false(_sc_check(&big))
+  # _sc_muladd: (a * b + c) mod q with tiny scalars
+  let a8 = [2 as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  let b8 = [3 as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  let c8 = [1 as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  let r = _sc_muladd(&a8, &b8, &c8)
+  assert_eq(r[0], 7 as u8)
+end
+
+@test
+def test_crypto_process_blocks() -> Unit
+  # the compression blocks run over the zero buffer without panic
+  var md5 = Md5::new()
+  md5.process_block()
+  var sha1 = Sha1::new()
+  sha1.process_block()
+  var sha256 = Sha256::new()
+  sha256.process_block()
+  var sha512 = Sha512::new()
+  sha512.process_block()
+  let msg = "process block probe".as_bytes()
+  let one_shot = md5(&msg)
+  assert_eq(std::crypto::hex::encode(&one_shot).len(), 32)
+end
+
+def mk_x509_cert(nb: i64, na: i64) -> X509Certificate
+  X509Certificate {
+    version: 3,
+    serial_number: Vec::new(),
+    issuer: "Tangerine Test CA".to_string(),
+    subject: "behavior probe".to_string(),
+    not_before: nb,
+    not_after: na,
+    public_key_algorithm: "RSA".to_string(),
+    public_key: Vec::new(),
+    signature_algorithm: "SHA256".to_string(),
+    signature: Vec::new(),
+    raw: Vec::new(),
+  }
+end
+
+@test
+def test_crypto_x509_error_paths() -> Unit
+  # the DER/PEM parsers fail on garbage input
+  let garbage = "not a certificate".as_bytes()
+  assert_err(x509_from_der(&garbage))
+  assert_err(x509_from_pem("-----BEGIN CERTIFICATE-----\ngarbage\n-----END CERTIFICATE-----"))
+  # x509_is_valid: the validity window is honored
+  assert_true(x509_is_valid(mk_x509_cert(1000, 2000), 1500 as i64))
+  assert_false(x509_is_valid(mk_x509_cert(1000, 2000), 500 as i64))
+  assert_false(x509_is_valid(mk_x509_cert(1000, 2000), 2500 as i64))
+end

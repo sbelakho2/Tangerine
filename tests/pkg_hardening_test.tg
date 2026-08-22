@@ -1,0 +1,300 @@
+# tests/pkg_hardening_test.tg — the package-management hardening (the
+# reviewer's items):
+#
+#   (a) the ARCHIVE-PATH VALIDATION BEFORE the tar xzf: every entry name
+#       and every link target of the ACTUAL archive is checked against
+#       the traversal/absolute/backslash rules — a `../` entry, an
+#       absolute entry, and a symlink entry pointing outside the
+#       extraction root are REJECTED before a single byte is written
+#       (validate_tar_gz_archive — the pre-flight the driver's system
+#       `tar xzf` runs too — and _extract_tar_gz);
+#   (b) the CACHED LOCKED PACKAGES' REVALIDATION: the cache-hit
+#       re-hashes the CURRENT contents against the lockfile's checksum
+#       before the reuse — a tampered cached tree is detected and
+#       REJECTED (the old hit returned Ok(()) with no verification);
+#   (c) hash_package_tree — the cryptographic authenticated
+#       package-tree digest (the SHA-256 over the normalized FULL tree,
+#       not the FNV top-level-only): a change in a NESTED file, a rename,
+#       an added or removed file all change the digest.
+#
+# Run with: tg run tests/pkg_hardening_test.tg
+
+use std::core::{Option, Result, String, Unit, Bool, Int, UInt}
+use std::test::*
+use std::fs
+use std::collections::{Array}
+use std::compress::tar_gz
+use std::compress::{TarEntry, TarEntryType}
+use std::semver::{Version}
+use tg_compiler::pkg_manager::{
+  PkgManager, LockedPackage, PackageSource, PkgError, PackageId, Registry, Package,
+  hash_package_tree, validate_tar_gz_archive, _extract_tar_gz
+}
+
+# ─── helpers ──────────────────────────────────────────────────────────
+
+def _root() -> String
+  "/tmp/tg_pkg_hardening".to_string()
+end
+
+def _cleanup(path: String) -> Unit
+  let _ = fs::remove_dir_all(path)
+end
+
+def _write(path: String, content: String) -> Unit
+  match fs::write_file_bytes(path.clone(), content.as_bytes().to_vec())
+  when Result::Ok(_) then ()
+  when Result::Err(_) then assert_false(true)
+  end
+end
+
+def _assert_escape_rejected(data: [u8]) -> Unit
+  match validate_tar_gz_archive(data)
+  when Result::Ok(_) then assert_false(true)
+  when Result::Err(e) then
+    let msg = e.to_string()
+    assert_true(msg.contains("escapes") || msg.contains("link target"))
+  end
+end
+
+# ─── (a) the archive-path validation BEFORE the tar xzf ──────────────
+
+@test
+def test_traversal_entry_rejected_before_extraction() -> Unit
+  # A tar.gz whose SECOND entry escapes the destination ("../evil.txt")
+  # — the pre-flight must reject the WHOLE archive (nothing written).
+  let mut good = TarEntry::new("good.txt")
+  good.entry_type = TarEntryType::Regular
+  let mut evil = TarEntry::new("../evil.txt")
+  evil.entry_type = TarEntryType::Regular
+  let data = assert_ok(tar_gz::compress([good, evil]))
+  _assert_escape_rejected(&data)
+end
+
+@test
+def test_absolute_entry_rejected_before_extraction() -> Unit
+  # An absolute entry name ("/etc/passwd") is rejected by the pre-flight.
+  let mut e = TarEntry::new("/etc/passwd")
+  e.entry_type = TarEntryType::Regular
+  let data = assert_ok(tar_gz::compress([e]))
+  _assert_escape_rejected(&data)
+end
+
+@test
+def test_backslash_entry_rejected_before_extraction() -> Unit
+  # A backslash entry name ("..\\evil") — the Windows escape — is
+  # rejected by the pre-flight.
+  let mut e = TarEntry::new("..\\evil")
+  e.entry_type = TarEntryType::Regular
+  let data = assert_ok(tar_gz::compress([e]))
+  _assert_escape_rejected(&data)
+end
+
+@test
+def test_symlink_entry_outside_root_rejected() -> Unit
+  # A symlink entry whose TARGET leaves the extraction root ("../../etc/
+  # passwd") is rejected — the link-target validation.
+  let mut e = TarEntry::new("link")
+  e.entry_type = TarEntryType::SymLink
+  e.linkname = "../../etc/passwd".to_string()
+  let data = assert_ok(tar_gz::compress([e]))
+  _assert_escape_rejected(&data)
+end
+
+@test
+def test_safe_archive_extracts_and_unsafe_rejects_without_writes() -> Unit
+  let root = _root() + "/extract_ok"
+  _cleanup(root.clone())
+  let _ = fs::create_dir_all(root.clone())
+
+  # A SAFE archive (one regular file + one directory) extracts fine.
+  let mut f = TarEntry::new("src/main.tg")
+  f.entry_type = TarEntryType::Regular
+  f.data = "let x = 1\n".to_string().as_bytes().to_vec()
+  let mut d = TarEntry::new("src")
+  d.entry_type = TarEntryType::Directory
+  let safe = assert_ok(tar_gz::compress([f, d]))
+  match validate_tar_gz_archive(&safe)
+  when Result::Ok(()) then ()
+  when Result::Err(_) then assert_false(true)
+  end
+  match _extract_tar_gz(&safe, &root)
+  when Result::Ok(()) then ()
+  when Result::Err(_) then assert_false(true)
+  end
+  assert_true(fs::path_exists(root.clone() + "/src/main.tg"))
+  _cleanup(root.clone())
+
+  # The extraction REJECTS an archive whose validation failed: the
+  # traversal archive never reaches _extract_tar_gz's write path (the
+  # pre-flight inside it rejects first) — and the pre-flight itself
+  # writes nothing.
+  let root2 = _root() + "/extract_reject"
+  _cleanup(root2.clone())
+  let _ = fs::create_dir_all(root2.clone())
+  let mut evil = TarEntry::new("../evil.txt")
+  evil.entry_type = TarEntryType::Regular
+  let bad = assert_ok(tar_gz::compress([evil]))
+  match validate_tar_gz_archive(&bad)
+  when Result::Ok(_) then assert_false(true)
+  when Result::Err(_) then ()
+  end
+  # The std extractor's OWN pre-flight rejects the same archive before
+  # any write (fail-closed).
+  match _extract_tar_gz(&bad, &root2)
+  when Result::Ok(_) then assert_false(true)
+  when Result::Err(e) then
+    assert_true(e.to_string().contains("escapes"))
+  end
+  # NOTHING was written outside the extraction root.
+  assert_false(fs::path_exists("/tmp/evil.txt"))
+  _cleanup(root2.clone())
+end
+
+# ─── (c) hash_package_tree — the authenticated full-tree digest ───────
+
+@test
+def test_tree_digest_covers_nested_files_and_renames() -> Unit
+  let root = _root() + "/tree"
+  _cleanup(root.clone())
+  let _ = fs::create_dir_all(root.clone() + "/nested")
+
+  _write(root.clone() + "/main.tg", "let a = 1\n".to_string())
+  _write(root.clone() + "/nested/lib.tg", "let b = 2\n".to_string())
+  _write(root.clone() + "/data.txt", "payload\n".to_string())
+
+  let d0 = hash_package_tree(root.clone())
+  assert_true(d0.len() > 0)
+
+  # A byte change in a NESTED file changes the digest.
+  _write(root.clone() + "/nested/lib.tg", "let b = 3\n".to_string())
+  let d1 = hash_package_tree(root.clone())
+  assert_true(d1 != d0)
+
+  # A rename changes the digest.
+  _write(root.clone() + "/nested/lib2.tg", "let b = 3\n".to_string())
+  let _ = fs::remove_file(root.clone() + "/nested/lib.tg")
+  let d2 = hash_package_tree(root.clone())
+  assert_true(d2 != d1)
+
+  # An ADDED file changes the digest.
+  _write(root.clone() + "/added.tg", "let c = 4\n".to_string())
+  let d3 = hash_package_tree(root.clone())
+  assert_true(d3 != d2)
+
+  # The digest is DETERMINISTIC (same tree, same digest).
+  let d4 = hash_package_tree(root.clone())
+  assert_eq(d4, d3)
+
+  _cleanup(root.clone())
+end
+
+# ─── (b) the cached locked packages' revalidation ─────────────────────
+
+struct TestRegistry
+  archive: Array[u8]
+end
+
+impl Registry for TestRegistry
+  def fetch_versions(self: Self, name: str) -> Result[Array[Version], PkgError]
+    Result::Err(PkgError::RegistryError("not used".to_string()))
+  end
+
+  def fetch_package(self: Self, name: str, version: Version) -> Result[Package, PkgError]
+    Result::Err(PkgError::RegistryError("not used".to_string()))
+  end
+
+  def download_archive(self: Self, id: PackageId) -> Result[Array[u8], PkgError]
+    Result::Ok(self.archive.clone())
+  end
+end
+
+@test
+def test_cache_hit_revalidates_current_contents() -> Unit
+  let root = _root() + "/cache"
+  let cache = root.clone() + "/.cache"
+  let src = root.clone() + "/src"
+  _cleanup(root.clone())
+  let _ = fs::create_dir_all(src.clone() + "/nested")
+  _write(src.clone() + "/main.tg", "let a = 1\n".to_string())
+  _write(src.clone() + "/nested/lib.tg", "let b = 2\n".to_string())
+
+  # The lockfile checksum IS the authenticated package-tree digest.
+  let checksum = hash_package_tree(src.clone())
+
+  # The archive contains the same tree (one file + one nested file).
+  let mut f1 = TarEntry::new("main.tg")
+  f1.entry_type = TarEntryType::Regular
+  f1.data = "let a = 1\n".to_string().as_bytes().to_vec()
+  let mut f2 = TarEntry::new("nested/lib.tg")
+  f2.entry_type = TarEntryType::Regular
+  f2.data = "let b = 2\n".to_string().as_bytes().to_vec()
+  let archive = assert_ok(tar_gz::compress([f1, f2]))
+
+  let manager = PkgManager::with_cache(root.clone(), cache.clone())
+  let pkg = LockedPackage {
+    name: "demo".to_string(),
+    version: Version::parse("1.0.0").unwrap_or(Version::new(1, 0, 0)),
+    source: PackageSource::Registry("https://registry.tangerine-lang.org".to_string()),
+    checksum: checksum.clone(),
+    dependencies: Array::new(),
+  }
+  let registry: Box[dyn Registry] = Box::new(TestRegistry { archive: archive })
+
+  # THE MISS: download + extract + verify the extracted tree against the
+  # locked digest — all three happen before the Ok.
+  match manager.ensure_cached(pkg.clone(), &*registry)
+  when Result::Ok(()) then ()
+  when Result::Err(e) then
+    assert_false(true)
+  end
+  assert_true(fs::path_exists(cache.clone() + "/demo-1.0.0/main.tg"))
+
+  # THE HIT REVALIDATION (1): the untouched cache re-hashes to the same
+  # digest and is reused.
+  match manager.ensure_cached(pkg.clone(), &*registry)
+  when Result::Ok(()) then ()
+  when Result::Err(_) then assert_false(true)
+  end
+
+  # THE HIT REVALIDATION (2): a TAMPERED cache — one byte changed in the
+  # cached tree — is detected by the re-hash and REJECTED (the old hit
+  # returned Ok(()) with no verification at all).
+  _write(cache.clone() + "/demo-1.0.0/main.tg", "let a = 999\n".to_string())
+  match manager.ensure_cached(pkg.clone(), &*registry)
+  when Result::Ok(_) then assert_false(true)
+  when Result::Err(e) then
+    match e
+    when PkgError::ChecksumMismatch { package, expected, actual } then
+      assert_eq(package, "demo")
+      assert_eq(expected, checksum)
+      assert_true(actual != checksum)
+    when _ then assert_false(true)
+    end
+  end
+
+  # THE MISS VERIFICATION: a lockfile checksum that does not match the
+  # EXTRACTED tree is rejected (the registry's bytes are never trusted
+  # past their authenticated form).
+  let wrong = LockedPackage {
+    name: "demo".to_string(),
+    version: Version::parse("1.0.0").unwrap_or(Version::new(1, 0, 0)),
+    source: PackageSource::Registry("https://registry.tangerine-lang.org".to_string()),
+    checksum: "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+    dependencies: Array::new(),
+  }
+  let cache2 = root.clone() + "/.cache2"
+  let manager2 = PkgManager::with_cache(root.clone(), cache2.clone())
+  match manager2.ensure_cached(wrong, &*registry)
+  when Result::Ok(_) then assert_false(true)
+  when Result::Err(e) then
+    match e
+    when PkgError::ChecksumMismatch { package, expected, actual } then
+      assert_eq(package, "demo")
+      assert_eq(actual, checksum)
+    when _ then assert_false(true)
+    end
+  end
+
+  _cleanup(root.clone())
+end

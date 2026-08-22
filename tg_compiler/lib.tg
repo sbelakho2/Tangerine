@@ -69,7 +69,55 @@ pub use mir::{lower_to_mir, MirProgram, optimize_mir, pretty_print_mir, verify_m
 pub use codegen::{generate_native, generate_executable, generate_object_file, detect_host_target}
 pub use agentic::{AgenticContext, ContractChecker, CapabilityContext, EffectContext, BudgetContext}
 pub use trait_resolve::{monomorphize_program, mono_cache_new, mono_specialize_function}
-pub use compiler_core::{compile_file, analyze_source, analyze_parsed, default_options, CompilerOptions, join_diagnostics}
+pub use compiler_core::{compile_file, analyze_source, analyze_parsed, parse_source_program, default_options, CompilerOptions, join_diagnostics}
+use tg_compiler::parser::{Diagnostic, DiagLevel}
+use tg_compiler::cqs::{cqs_query_server_new, cqs_run_queries, CqsQueryServer, CqsQueryResults}
+
+# ———————————————————————————————————————————————————————————————
+# The CQS query server — the canonical pipeline's invocation point
+# ———————————————————————————————————————————————————————————————
+# The library pipeline INVOKES the compiler-query-server queries on the
+# analyzed program + the lowered MIR. analyze_source_cqs is the query
+# server's library boundary: it runs the canonical semantic path
+# (parse -> analyze_parsed -> lower) and returns the three query results
+# (the typed info, the symbols, the diagnostics). The library compile/
+# check entries surface the Error-level CQS diagnostics on their Result
+# channel — the query results AFFECT the compilation where required (the
+# mode matrix's gated failures).
+
+pub def analyze_source_cqs(source: String, file: String, opts: CompilerOptions) -> Result[CqsQueryResults, Vec[Diagnostic]]
+  var ast = match parse_source_program(source, file)
+  when Result::Ok(program) then program
+  when Result::Err(diags) then
+    return Result::Err(diags)
+  end
+  var env = type_env_new()
+  let analyzed = match analyze_parsed(&mut env, &mut ast, &opts)
+  when Result::Ok(ap) then ap
+  when Result::Err(diags) then
+    return Result::Err(diags)
+  end
+  let mir = match lower_to_mir(&ast, &analyzed)
+  when Result::Ok(m) then m
+  when Result::Err(e) then
+    return Result::Err(Vec::from([Diagnostic {
+      level: DiagLevel::Error,
+      message: "CQS query pipeline: MIR lowering failed: " + e,
+      span: Option::None,
+      notes: Vec::new(),
+      suggestions: Vec::new(),
+      code: Option::None
+    }]))
+  end
+  Result::Ok(cqs_run_queries(
+    cqs_query_server_new(),
+    &ast,
+    &analyzed.typed,
+    &mir,
+    opts.mode,
+    "lib"
+  ))
+end
 
 # Convenience function for quick compilation
 pub def compile(source: String) -> Result[String, String]
@@ -79,6 +127,23 @@ pub def compile(source: String) -> Result[String, String]
   when Result::Ok(t) then t
   when Result::Err(diags) then
     return Result::Err(join_diagnostics(&diags))
+  end
+
+  # (the CQS query server — the library pipeline's invocation): the query
+  # diagnostics AFFECT the compilation where required — an Error-level CQS
+  # diagnostic (the mode matrix's gated failure) fails the compile with
+  # the query results reported.
+  let query = match analyze_source_cqs(source.clone(), "", &opts)
+  when Result::Ok(q) then q
+  when Result::Err(diags) then
+    return Result::Err(join_diagnostics(&diags))
+  end
+  for d in query.diagnostics do
+    match d.level
+    when DiagLevel::Error then
+      return Result::Err("CQS gate: " + join_diagnostics(&query.diagnostics))
+    when _ then ()
+    end
   end
 
   let ast = typed.ast.clone()
@@ -115,6 +180,22 @@ pub def check(source: String) -> Vec[String]
   opts.strict_resolution = true
   match analyze_source(source, "", &opts)
   when Result::Ok(_) then ()
+  when Result::Err(diags) then
+    errors.push(join_diagnostics(&diags))
+  end
+  # (the CQS query server — the library pipeline's invocation): the
+  # query diagnostics AFFECT the check where required — an Error-level
+  # CQS diagnostic is surfaced on the result channel.
+  match analyze_source_cqs(source.clone(), "", &opts)
+  when Result::Ok(query) then
+    for d in query.diagnostics do
+      match d.level
+      when DiagLevel::Error then
+        errors.push("CQS gate: " + join_diagnostics(&query.diagnostics))
+        break
+      when _ then ()
+      end
+    end
   when Result::Err(diags) then
     errors.push(join_diagnostics(&diags))
   end

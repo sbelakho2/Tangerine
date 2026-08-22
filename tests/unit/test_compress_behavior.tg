@@ -1,0 +1,191 @@
+# tests/unit/test_compress_behavior.tg — the per-callable behavior
+# suite for std::compress (the API manifest's uncovered callables,
+# driven to real semantics: inputs -> expected outputs; the failure
+# paths -> the expected failures). The tar/zip/deflate layers run over
+# real buffers and a temp file — the full container round trips.
+
+use std::core::{Bool, Int, UInt, Unit, Option, Result, String, Vec}
+use std::test::*
+use std::compress::*
+use std::fs
+
+const CBEHAVIOR_TAR_PATH: str = "/tmp/tg_compress_behavior_38820.tar"
+const CBEHAVIOR_ZIP_PATH: str = "/tmp/tg_compress_behavior_38821.bin"
+const CBEHAVIOR_DEFLATE_PATH: str = "/tmp/tg_compress_behavior_38822.z"
+
+@test
+def test_compress_error_surface() -> Unit
+  assert_eq(z_errno(), -1)
+  assert_eq(z_stream_error(), -2)
+  assert_eq(z_data_error(), -3)
+  assert_eq(z_mem_error(), -4)
+  assert_eq(z_buf_error(), -5)
+  assert_true(compression_error_message(CompressionError::InvalidData("x".to_string())).len() > 0)
+  assert_true(CompressionError::InvalidData("y".to_string()).message().len() > 0)
+  let mapped = zlib_error_from_code(z_data_error(), "probe")
+  assert_true(compression_error_message(mapped).len() > 0)
+end
+
+@test
+def test_compress_tar_header_round_trip() -> Unit
+  var h = TarHeader::new()
+  h.set_name("file.txt")
+  h.set_mode(0o644)
+  h.set_uid(501)
+  h.set_gid(20)
+  h.set_size(1234)
+  h.set_mtime(1700000000)
+  h.set_type(TarEntryType::Regular)
+  h.set_linkname("link-target")
+  h.set_uname("alice")
+  h.set_gname("staff")
+  h.set_ustar()
+  h.set_checksum(h.compute_checksum())
+  assert_eq(h.get_name(), "file.txt")
+  assert_eq(h.get_mode(), 0o644)
+  assert_eq(h.get_uid(), 501)
+  assert_eq(h.get_gid(), 20)
+  assert_eq(h.get_size(), 1234)
+  assert_eq(h.get_mtime(), 1700000000)
+  assert_true(h.get_checksum() != 0)
+  assert_eq(h.get_type().to_byte(), 48)
+  assert_eq(h.get_linkname(), "link-target")
+  assert_eq(h.get_uname(), "alice")
+  assert_eq(h.get_gname(), "staff")
+  assert_true(h.is_ustar())
+  assert_false(h.is_null())
+  assert_true(h.get_magic().len() > 0)
+  assert_eq(h.get_prefix(), "")
+  # the null header
+  let null_h = TarHeader::new()
+  assert_true(null_h.is_null())
+  # TarEntryType::from_byte
+  assert_eq(TarEntryType::from_byte(48).to_byte(), 48)
+  assert_eq(TarEntryType::from_byte(50).to_byte(), 50)
+  assert_eq(TarEntryType::from_byte(53).to_byte(), 53)
+  # the tar entry classification
+  let f = TarEntry::new("a.txt")
+  assert_true(f.is_file())
+  assert_false(f.is_dir())
+  assert_false(f.is_symlink())
+  # the octal helpers
+  assert_eq(parse_octal("000755".as_bytes()), 493)
+  assert_eq(read_null_terminated("hi\0junk".as_bytes()), "hi")
+  var oct_buf = [0 as u8; 12]
+  write_octal(&mut oct_buf, 493, 8)
+  assert_eq(parse_octal(&oct_buf), 493)
+  var str_buf = [0 as u8; 16]
+  write_string(&mut str_buf, "abc")
+  assert_eq(str_buf[0], 'a' as u8)
+  assert_eq(str_buf[3], 0 as u8)
+  # the long-name splitter
+  let (p, s) = split_tar_name("short.txt")
+  assert_eq(p, "")
+  assert_eq(s, "short.txt")
+  let (p2, s2) = split_tar_name("dir/sub/long-name-here.txt")
+  assert_eq(s2, "long-name-here.txt")
+  assert_eq(p2, "dir/sub")
+end
+
+@test
+def test_compress_u16_u32_helpers() -> Unit
+  let le16 = [0x34 as u8, 0x12]
+  assert_eq(read_u16_le(&le16, 0), 0x1234)
+  var w16: Vec[u8] = Vec::new()
+  write_u16_le(&mut w16, 0x5678)
+  assert_eq(w16[0], 0x78 as u8)
+  assert_eq(w16[1], 0x56 as u8)
+  let le32 = [0x78 as u8, 0x56, 0x34, 0x12]
+  assert_eq(read_u32_le(&le32, 0), 0x12345678)
+  var w32: Vec[u8] = Vec::new()
+  write_u32_le(&mut w32, 0x9ABCDEF0)
+  assert_eq(w32[0], 0xF0 as u8)
+  assert_eq(w32[3], 0x9A as u8)
+end
+
+@test
+def test_compress_zip_round_trip() -> Unit
+  var zw = ZipWriter::new()
+  let content: Vec[u8] = Vec::from([104u8, 105u8, 33u8])
+  assert_ok(zw.add_file("hello.txt", &content))
+  let bin: Vec[u8] = Vec::from([0u8, 1, 2, 3, 4])
+  assert_ok(zw.add_file_compressed("raw.bin", &bin, false))
+  assert_ok(zw.add_directory("dir"))
+  let bytes = zw.finish()
+  assert_true(bytes.len() > 0)
+  # the reader round trip
+  let reader = assert_ok(ZipReader::open(bytes))
+  let entries = reader.entries()
+  assert_eq(entries.len(), 3)
+  let extracted = assert_ok(reader.extract_all())
+  assert_eq(extracted.len(), 3)
+  # the per-entry read back: the extracted entry round-trips through
+  # read_entry against the central directory
+  let reader2 = assert_ok(ZipReader::open(reader_zip_bytes()))
+  let central = reader2.entries()
+  let data = assert_ok(reader2.read_entry(&central[0]))
+  assert_eq(data.len(), 3)
+  # the open ERROR path: garbage is not a zip
+  let garbage: Vec[u8] = Vec::from([1u8, 2, 3, 4])
+  assert_err(ZipReader::open(garbage))
+end
+
+def reader_zip_bytes() -> Vec[u8]
+  var zw = ZipWriter::new()
+  let content: Vec[u8] = Vec::from([104u8, 105u8, 33u8])
+  let _ = zw.add_file("hello.txt", &content)
+  zw.finish()
+end
+
+@test
+def test_compress_tar_round_trip() -> Unit
+  # build a tar into a temp file, then read it back
+  let w = assert_ok(fs::File::create(CBEHAVIOR_TAR_PATH))
+  var tb = assert_ok(TarBuilder::new(w))
+  let data: Vec[u8] = Vec::from([1u8, 2, 3])
+  assert_ok(tb.add_file("one.txt", &data))
+  assert_ok(tb.add_dir("adir"))
+  assert_ok(tb.add_entry(TarEntry::new("three.txt")))
+  assert_ok(tb.add_file("two.txt", &data))
+  assert_ok(tb.finish())
+  let r = assert_ok(fs::File::open(CBEHAVIOR_TAR_PATH))
+  var tr = TarReader::new(r)
+  let entries = assert_ok(tr.entries())
+  assert_eq(entries.len(), 4)
+  var tr2 = TarReader::new(assert_ok(fs::File::open(CBEHAVIOR_TAR_PATH)))
+  let e1 = assert_ok(tr2.next_entry())
+  match e1
+  when Option::Some(entry) then
+    assert_true(entry.is_file())
+  when Option::None then
+    assert_false(true)
+  end
+  let _ = fs::remove_file(CBEHAVIOR_TAR_PATH)
+end
+
+@test
+def test_compress_levels() -> Unit
+  assert_eq(CompressionLevel::None.to_zlib_level(), 0)
+  assert_eq(CompressionLevel::Fast.to_zlib_level(), 1)
+  assert_eq(CompressionLevel::Default.to_zlib_level(), 6)
+  assert_eq(CompressionLevel::Best.to_zlib_level(), 9)
+  assert_eq(CompressionLevel::Custom(4).to_zlib_level(), 4)
+end
+
+@test
+def test_compress_deflate_encoder_with_level() -> Unit
+  let w = assert_ok(fs::File::create(CBEHAVIOR_DEFLATE_PATH))
+  var enc = assert_ok(DeflateEncoder::with_level(w, CompressionLevel::Best))
+  let payload: Vec[u8] = Vec::from([104u8, 105u8, 33u8])
+  assert_ok(enc.write(&payload))
+  assert_ok(enc.finish())
+  # the written file decompresses back to the payload
+  let f = assert_ok(fs::File::open(CBEHAVIOR_DEFLATE_PATH))
+  let raw = assert_ok(f.read_all())
+  let round = assert_ok(std::compress::deflate::decompress(&raw))
+  assert_eq(round.len(), 3)
+  assert_eq(round[0], 104u8)
+  assert_eq(round[1], 105u8)
+  assert_eq(round[2], 33u8)
+  let _ = fs::remove_file(CBEHAVIOR_DEFLATE_PATH)
+end

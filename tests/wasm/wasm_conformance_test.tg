@@ -1,0 +1,469 @@
+# tests/wasm/wasm_conformance_test.tg — the wasm structural conformance
+# (the mandate's wasm (d): the binary's sections validated by the wasm
+# parser — the CHOSEN conformance; wasmtime execution is additionally
+# attempted by the runner script when the runtime is installed).
+#
+# The test builds a small MIR program (an `add(a, b)` function + a string
+# static), compiles it with the wasm backend (wasm_target.tg's
+# WasmCompiler — the same emission the driver's --target
+# wasm32-unknown-unknown route uses), and VALIDATES the resulting binary
+# with an independent STRUCTURAL wasm parser implemented in this test:
+#   - the magic header and version;
+#   - the section walk: every section's id and length, the spec order
+#     (type, import, function, table, memory, global, export, start,
+#     element, code, data), the custom producer section;
+#   - the type section: the functype encodings (params/results);
+#   - the function section: one type index per function;
+#   - the memory section: the limits (initial <= max);
+#   - the global section: the stack-pointer global (mutable i32);
+#   - the export section: "add" -> func 0, "memory" -> memory 0;
+#   - the start section: the configured start function;
+#   - the code section: one body per function, each ending with `end`;
+#   - the data section: the interned string static's bytes.
+#
+# Run with: tg run tests/wasm/wasm_conformance_test.tg
+
+use std::core::{Option, Result, Unit, Bool, panic}
+use std::collections::{Vec, Map}
+use std::test::*
+use tg_compiler::mir::{
+  MirProgram, MirFunction, MirLocal, MirLocalId, MirBlock, MirBlockId,
+  MirStatement, MirStatementKind, MirTerminator, MirTerminatorKind,
+  MirRvalue, MirRvalueKind, MirBinOp, MirOperand, MirOperandKind,
+  MirConstant, MirConstantKind, MirStatic, MirTypeDef, MirFieldDef,
+  MirTypeDefKind, MirVariantDef, MirCallArg, MirCallValue,
+  operand_copy_local, place_local, Span,
+}
+use tg_compiler::types::{Type, TypeId}
+use tg_compiler::token::{span_dummy}
+use tg_compiler::wasm_target::{
+  WasmCompiler, WasmCompileConfig, WasmTarget,
+  WasmBinary, WasmSection, WasmValType,
+}
+use tg_compiler::cross_compile::{OptLevel}
+
+# ———————————————————————————————————————————————————————————————
+# the structural wasm parser (the independent validator)
+# ———————————————————————————————————————————————————————————————
+
+struct WasmCursor
+  bytes: Vec[u8]
+  pos: Int
+end
+
+def cursor_new(bytes: Vec[u8]) -> WasmCursor
+  WasmCursor { bytes: bytes, pos: 0 }
+end
+
+def cur_read_u8(inout c: WasmCursor) -> Int
+  if c.pos >= c.bytes.len() then
+    panic("wasm parser: unexpected end of binary at " + c.pos.to_string())
+  end
+  let b = c.bytes[c.pos]
+  c.pos = c.pos + 1
+  b as Int
+end
+
+def cur_read_leb_u32(inout c: WasmCursor) -> Int
+  var result = 0
+  var shift = 0
+  var done = false
+  while !done do
+    let b = cur_read_u8(c)
+    result = result | ((b & 0x7F) << shift)
+    if (b & 0x80) == 0 then
+      done = true
+    else
+      shift = shift + 7
+      if shift > 35 then
+        panic("wasm parser: malformed LEB128")
+      end
+    end
+  end
+  result
+end
+
+def cur_read_bytes(inout c: WasmCursor, n: Int) -> Vec[u8]
+  var out = Vec::new()
+  var i = 0
+  while i < n do
+    out.push(cur_read_u8(c) as u8)
+    i = i + 1
+  end
+  out
+end
+
+def cur_read_name(inout c: WasmCursor) -> String
+  let len = cur_read_leb_u32(c)
+  let bytes = cur_read_bytes(c, len)
+  var s = "".to_string()
+  for b in bytes do
+    s = s + (b as Int as Char).to_string()
+  end
+  s
+end
+
+# The section record the walk produces.
+struct WasmSectionRecord
+  id: Int
+  start: Int
+  end: Int
+  payload: Vec[u8]
+end
+
+# The structural section walk: reads the header, then every section in
+# order (the wasm spec order — a section with a smaller id than the
+# previous is a malformed binary), returning the records.
+def parse_sections(binary: Vec[u8]) -> Vec[WasmSectionRecord]
+  if binary.len() < 8 then
+    panic("wasm parser: binary shorter than the 8-byte header")
+  end
+  if binary[0] != 0x00 || binary[1] != 0x61 || binary[2] != 0x73 || binary[3] != 0x6D then
+    panic("wasm parser: missing \\0asm magic")
+  end
+  if binary[4] != 0x01 || binary[5] != 0x00 || binary[6] != 0x00 || binary[7] != 0x00 then
+    panic("wasm parser: unsupported version")
+  end
+  mut c = cursor_new(binary)
+  c.pos = 8
+  var records = Vec::new()
+  var last_id = -1
+  while c.pos < c.bytes.len() do
+    let id = cur_read_u8(&mut c)
+    let len = cur_read_leb_u32(&mut c)
+    let payload = cur_read_bytes(&mut c, len)
+    if id != 0 && id <= last_id then
+      panic("wasm parser: section id " + id.to_string() + " out of order (after " + last_id.to_string() + ")")
+    end
+    if id != 0 then
+      last_id = id
+    end
+    records.push(WasmSectionRecord { id: id, start: 0, end: 0, payload: payload })
+  end
+  records
+end
+
+def section_ids(records: Vec[WasmSectionRecord]) -> Vec[Int]
+  var out = Vec::new()
+  for r in records do
+    out.push(r.id)
+  end
+  out
+end
+
+def find_section(records: Vec[WasmSectionRecord], id: Int) -> Option[WasmSectionRecord]
+  for r in records do
+    if r.id == id then
+      return Option::Some(r)
+    end
+  end
+  Option::None
+end
+
+# The type-section payload check: the vector of functypes.
+def check_type_section(payload: Vec[u8], expected_params: Int, expected_results: Int) -> Unit
+  mut c = cursor_new(payload)
+  let count = cur_read_leb_u32(&mut c)
+  check_eq(count, 1, "the type section has one functype")
+  let marker = cur_read_u8(&mut c)
+  check_eq(marker, 0x60, "the functype marker (0x60)")
+  let nparams = cur_read_leb_u32(&mut c)
+  check_eq(nparams, expected_params, "the functype parameter count")
+  var i = 0
+  while i < nparams do
+    let vt = cur_read_u8(&mut c)
+    check_eq(vt, 0x7E, "the parameter value type (i64 = 0x7E)")
+    i = i + 1
+  end
+  let nresults = cur_read_leb_u32(&mut c)
+  check_eq(nresults, expected_results, "the functype result count")
+  if nresults > 0 then
+    let vt = cur_read_u8(&mut c)
+    check_eq(vt, 0x7E, "the result value type (i64 = 0x7E)")
+  end
+end
+
+def check_function_section(payload: Vec[u8], expected_count: Int) -> Unit
+  mut c = cursor_new(payload)
+  let count = cur_read_leb_u32(&mut c)
+  check_eq(count, expected_count, "the function section count")
+  while c.pos < c.bytes.len() do
+    let _ = cur_read_leb_u32(&mut c)
+  end
+end
+
+def check_memory_section(payload: Vec[u8]) -> Unit
+  mut c = cursor_new(payload)
+  let count = cur_read_leb_u32(&mut c)
+  check_eq(count, 1, "the memory section has one memory")
+  let flags = cur_read_u8(&mut c)
+  check_eq(flags, 0x01, "the memory limits carry the max flag")
+  let min = cur_read_leb_u32(&mut c)
+  let max = cur_read_leb_u32(&mut c)
+  check(min <= max, "the memory limits satisfy min <= max")
+end
+
+def check_global_section(payload: Vec[u8]) -> Unit
+  mut c = cursor_new(payload)
+  let count = cur_read_leb_u32(&mut c)
+  check_eq(count, 1, "the global section has the stack pointer")
+  let vt = cur_read_u8(&mut c)
+  check_eq(vt, 0x7F, "the stack pointer is an i32 (0x7F)")
+  let mutable = cur_read_u8(&mut c)
+  check_eq(mutable, 0x01, "the stack pointer is mutable")
+  # the init expr: i32.const + end
+  let opcode = cur_read_u8(&mut c)
+  check_eq(opcode, 0x41, "the stack pointer init is i32.const")
+  let _ = cur_read_leb_u32(&mut c)
+  let end_op = cur_read_u8(&mut c)
+  check_eq(end_op, 0x0B, "the init expr ends with `end`")
+end
+
+def check_export_section(payload: Vec[u8]) -> Unit
+  mut c = cursor_new(payload)
+  let count = cur_read_leb_u32(&mut c)
+  check_eq(count, 2, "the export section has the function and the memory")
+  let name1 = cur_read_name(&mut c)
+  let kind1 = cur_read_u8(&mut c)
+  let idx1 = cur_read_leb_u32(&mut c)
+  check_eq(name1, "add", "the first export is the `add` function")
+  check_eq(kind1, 0x00, "the function export kind (0x00)")
+  check_eq(idx1, 0, "the function export index")
+  let name2 = cur_read_name(&mut c)
+  let kind2 = cur_read_u8(&mut c)
+  let idx2 = cur_read_leb_u32(&mut c)
+  check_eq(name2, "memory", "the second export is the `memory`")
+  check_eq(kind2, 0x02, "the memory export kind (0x02)")
+  check_eq(idx2, 0, "the memory export index")
+end
+
+def check_start_section(payload: Vec[u8]) -> Unit
+  mut c = cursor_new(payload)
+  let idx = cur_read_leb_u32(&mut c)
+  check_eq(idx, 0, "the start section names the add function")
+end
+
+def check_code_section(payload: Vec[u8], expected_count: Int) -> Unit
+  mut c = cursor_new(payload)
+  let count = cur_read_leb_u32(&mut c)
+  check_eq(count, expected_count, "the code section count matches the function section")
+  var body_i = 0
+  while body_i < expected_count do
+    let body_len = cur_read_leb_u32(&mut c)
+    let body_end = c.pos + body_len
+    # the locals declaration vector
+    let nlocals_groups = cur_read_leb_u32(&mut c)
+    var g = 0
+    while g < nlocals_groups do
+      let _ = cur_read_leb_u32(&mut c)
+      let _ = cur_read_u8(&mut c)
+      g = g + 1
+    end
+    check(c.pos < body_end, "the function body has instruction bytes")
+    # the body must end with the `end` opcode (0x0B) at its final byte
+    let final_byte = c.bytes[body_end - 1]
+    check_eq(final_byte, 0x0B, "the function body ends with `end` (0x0B)")
+    c.pos = body_end
+    body_i = body_i + 1
+  end
+end
+
+def check_data_section(payload: Vec[u8], expected: String) -> Unit
+  mut c = cursor_new(payload)
+  let count = cur_read_leb_u32(&mut c)
+  check_eq(count, 1, "the data section has the interned string segment")
+  let mem_idx = cur_read_leb_u32(&mut c)
+  check_eq(mem_idx, 0, "the data segment targets memory 0")
+  let opcode = cur_read_u8(&mut c)
+  check_eq(opcode, 0x41, "the data offset is i32.const")
+  let _ = cur_read_leb_u32(&mut c)
+  let end_op = cur_read_u8(&mut c)
+  check_eq(end_op, 0x0B, "the data offset expr ends with `end`")
+  let data_len = cur_read_leb_u32(&mut c)
+  check_eq(data_len, expected.as_bytes().len(), "the data segment byte length")
+  var s = "".to_string()
+  var i = 0
+  while i < data_len do
+    s = s + (cur_read_u8(&mut c) as Char).to_string()
+    i = i + 1
+  end
+  check_eq(s, expected, "the data segment carries the interned string bytes")
+end
+
+def check_producer_section(payload: Vec[u8]) -> Unit
+  mut c = cursor_new(payload)
+  let name = cur_read_name(&mut c)
+  check_eq(name, "producer", "the custom section is the producer record")
+  let fields = cur_read_leb_u32(&mut c)
+  check_eq(fields, 2, "the producer record has two fields")
+  let fname1 = cur_read_name(&mut c)
+  check_eq(fname1, "language", "the first producer field is language")
+  let n1 = cur_read_leb_u32(&mut c)
+  check_eq(n1, 1, "one language entry")
+  let lang = cur_read_name(&mut c)
+  check_eq(lang, "Tangerine", "the language is Tangerine")
+  let v1 = cur_read_leb_u32(&mut c)
+  check_eq(v1, 0, "the language version is empty")
+  let fname2 = cur_read_name(&mut c)
+  check_eq(fname2, "processed-by", "the second producer field is processed-by")
+  let n2 = cur_read_leb_u32(&mut c)
+  check_eq(n2, 1, "one processed-by entry")
+  let tool = cur_read_name(&mut c)
+  check_eq(tool, "tg", "the processing tool is tg")
+  let v2 = cur_read_leb_u32(&mut c)
+  check_eq(v2, 0, "the tool version is empty")
+end
+
+# ———————————————————————————————————————————————————————————————
+# the hand-built MIR program
+# ———————————————————————————————————————————————————————————————
+
+def make_add_program() -> MirProgram
+  # add(a: Int, b: Int) -> Int: local 0 is the return place.
+  var locals = Vec::new()
+  locals.push(MirLocal { id: MirLocalId { id: 0 }, name: "_0".to_string(), ty: Type::Int, is_mut: true, span: span_dummy() })
+  locals.push(MirLocal { id: MirLocalId { id: 1 }, name: "a".to_string(), ty: Type::Int, is_mut: false, span: span_dummy() })
+  locals.push(MirLocal { id: MirLocalId { id: 2 }, name: "b".to_string(), ty: Type::Int, is_mut: false, span: span_dummy() })
+  var stmts = Vec::new()
+  stmts.push(MirStatement {
+    kind: MirStatementKind::MirAssign(
+      place_local(MirLocalId { id: 0 }),
+      MirRvalue { kind: MirRvalueKind::MirBinOp(MirBinOp::Add, operand_copy_local(MirLocalId { id: 1 }), operand_copy_local(MirLocalId { id: 2 })) }
+    ),
+    span: span_dummy()
+  })
+  var blocks = Vec::new()
+  blocks.push(MirBlock {
+    id: MirBlockId { id: 0 },
+    statements: stmts,
+    terminator: MirTerminator { kind: MirTerminatorKind::MirReturn, span: span_dummy() }
+  })
+  var functions = Vec::new()
+  functions.push(MirFunction {
+    name: "add".to_string(),
+    params: vec![locals[1].clone(), locals[2].clone()],
+    ret_type: Type::Int,
+    locals: locals,
+    blocks: blocks,
+    entry_block: MirBlockId { id: 0 },
+    is_async: false,
+    is_unsafe: false,
+    is_extern: false,
+    extern_abi: "".to_string(),
+    contracts: Vec::new(),
+    span: span_dummy()
+  })
+  # the string static: the data-section closure must intern the bytes
+  var statics = Vec::new()
+  statics.push(MirStatic {
+    name: "HELLO".to_string(),
+    ty: Type::String,
+    init: Option::Some(MirOperand {
+      kind: MirOperandKind::MirConstant(MirConstant {
+        kind: MirConstantKind::MirString("hi".to_string()),
+        ty: Type::String,
+        instance: Option::None
+      })
+    }),
+    is_mut: false
+  })
+  MirProgram {
+    functions: functions,
+    statics: statics,
+    types: Vec::new()
+  }
+end
+
+def test_emission_and_sections() -> Unit
+  let mut cfg = WasmCompileConfig::default()
+  cfg.target = WasmTarget::Wasm32Unknown
+  cfg.start_function = Option::Some("add".to_string())
+  let program = make_add_program()
+  let bytes = match WasmCompiler::new(cfg).compile(&program)
+  when Result::Ok(b) then b
+  when Result::Err(e) then
+    panic("wasm compile failed: " + e.to_string())
+  end
+  check(bytes.len() > 8, "the emitted binary is longer than the header")
+
+  let records = parse_sections(bytes)
+  # the spec section order for this program:
+  # 1 type, 3 function, 5 memory, 6 global, 7 export, 8 start, 10 code,
+  # 11 data, 0 custom (producer)
+  let ids = section_ids(records)
+  check_eq(ids.len(), 9, "the emitted binary has nine sections")
+  check_eq(ids[0], 1, "section 1: type")
+  check_eq(ids[1], 3, "section 3: function")
+  check_eq(ids[2], 5, "section 5: memory")
+  check_eq(ids[3], 6, "section 6: global")
+  check_eq(ids[4], 7, "section 7: export")
+  check_eq(ids[5], 8, "section 8: start")
+  check_eq(ids[6], 10, "section 10: code")
+  check_eq(ids[7], 11, "section 11: data")
+  check_eq(ids[8], 0, "section 0: the producer custom section")
+
+  match find_section(&records, 1)
+  when Option::Some(ts) then check_type_section(&ts.payload, 2, 1)
+  when Option::None then check(false, "missing type section")
+  end
+  match find_section(&records, 3)
+  when Option::Some(fs) then check_function_section(&fs.payload, 1)
+  when Option::None then check(false, "missing function section")
+  end
+  match find_section(&records, 5)
+  when Option::Some(ms) then check_memory_section(&ms.payload)
+  when Option::None then check(false, "missing memory section")
+  end
+  match find_section(&records, 6)
+  when Option::Some(gs) then check_global_section(&gs.payload)
+  when Option::None then check(false, "missing global section")
+  end
+  match find_section(&records, 7)
+  when Option::Some(es) then check_export_section(&es.payload)
+  when Option::None then check(false, "missing export section")
+  end
+  match find_section(&records, 8)
+  when Option::Some(ss) then check_start_section(&ss.payload)
+  when Option::None then check(false, "missing start section")
+  end
+  match find_section(&records, 10)
+  when Option::Some(cs) then check_code_section(&cs.payload, 1)
+  when Option::None then check(false, "missing code section")
+  end
+  match find_section(&records, 11)
+  when Option::Some(ds) then check_data_section(&ds.payload, "hi")
+  when Option::None then check(false, "missing data section")
+  end
+  match find_section(&records, 0)
+  when Option::Some(ps) then check_producer_section(&ps.payload)
+  when Option::None then check(false, "missing producer custom section")
+  end
+end
+
+def test_mapping_table() -> Unit
+  # THE WASM TYPE MAPPING: i32/i64/f32/f64 per the Tangerine primitives
+  # (the mapping table in wasm_target.tg; the externref row is the
+  # std::wasm host-reference bridge — no primitive maps to it in the
+  # current subset).
+  check(tg_compiler::wasm_target::_valtype_str(&tg_compiler::wasm_target::mir_type_to_wasm(&Type::Bool)) == "i32", "Bool -> i32")
+  check(tg_compiler::wasm_target::_valtype_str(&tg_compiler::wasm_target::mir_type_to_wasm(&Type::I32)) == "i32", "I32 -> i32")
+  check(tg_compiler::wasm_target::_valtype_str(&tg_compiler::wasm_target::mir_type_to_wasm(&Type::Int)) == "i64", "Int -> i64")
+  check(tg_compiler::wasm_target::_valtype_str(&tg_compiler::wasm_target::mir_type_to_wasm(&Type::I64)) == "i64", "I64 -> i64")
+  check(tg_compiler::wasm_target::_valtype_str(&tg_compiler::wasm_target::mir_type_to_wasm(&Type::F32)) == "f32", "F32 -> f32")
+  check(tg_compiler::wasm_target::_valtype_str(&tg_compiler::wasm_target::mir_type_to_wasm(&Type::Float)) == "f64", "Float -> f64")
+  check(tg_compiler::wasm_target::_valtype_str(&tg_compiler::wasm_target::mir_type_to_wasm(&Type::Ptr(Type::U8))) == "i32", "Ptr -> i32 (the 32-bit linear address)")
+  check(tg_compiler::wasm_target::_valtype_str(&tg_compiler::wasm_target::mir_type_to_wasm(&Type::String)) == "i32", "String handle -> i32")
+  check(tg_compiler::wasm_target::_valtype_str(&WasmValType::ExternRef) == "externref", "the externref row renders")
+  match tg_compiler::wasm_target::map_primitive_to_wasm(&Type::I128)
+  when Option::None then ()
+  when Option::Some(_) then check(false, "I128 has no wasm value type (fail closed)")
+  end
+end
+
+def main() -> Int
+  var suite = test_suite_new()
+  suite.add(test_case_new("emission_sections", "wasm_conformance", || -> Unit { test_emission_and_sections() }))
+  suite.add(test_case_new("mapping_table", "wasm_conformance", || -> Unit { test_mapping_table() }))
+  let ok = run_tests(suite, test_runner_config_new())
+  if ok then 0 else 1 end
+end

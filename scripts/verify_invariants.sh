@@ -25,6 +25,29 @@ set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT" || { echo "cannot cd to repo root"; exit 2; }
 
+# The SOURCE-INTEGRITY mode for the bounded mutation harness:
+# --mutation-source-integrity <mutation-id> — run against a MUTATED copy:
+# the mutation's own G13 assertion MUST FIRE (the canonical form at the
+# site is destroyed = the mutation is really applied at the intended
+# site), the documented site-mirror assertions (non-G13 assertions
+# encoding the SAME canonical form) may fire too, and every other
+# assertion must PASS. Exit 0 = source integrity holds; 1 = the mutation
+# is not observable at its site or collateral invariant disturbance.
+# This mode NEVER classifies a kill (the kill classification is the
+# behavioral tier of scripts/run_mutation_tests.sh). Without the flag the
+# script runs the plain invariant gate (G13 holds on the pristine tree).
+MUTATION_SOURCE_CHECK=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --mutation-source-integrity)
+      shift
+      MUTATION_SOURCE_CHECK="${1:-}"
+      shift
+      ;;
+    *) break ;;
+  esac
+done
+
 PASSED=0
 FAILURES=0
 FAILED_LABELS=""
@@ -424,14 +447,21 @@ t G11.2b "the only crate.modules.entries() in the compiler are the macro-filter 
   'test "$(grep -c "crate.modules.entries()" tg_compiler/compiler_core.tg)" -eq 3'
 
 # ———————————————————————————————————————————————————————————————
-# G13 Mutation-site invariants (the per-mutation detectors)
+# G13 Mutation-site SOURCE-INTEGRITY checks (the G13 structural
+# detectors — KEPT as the source-integrity checks, REMOVED from the kill
+# classification)
 # ———————————————————————————————————————————————————————————————
 # The bounded mutation harness (scripts/run_mutation_tests.sh) applies one
-# mutation at a time to a COPY of the tree and runs the structural suite.
-# Each assertion below pins the CANONICAL SEMANTIC FORM of one mutation
-# target site: the mutation destroys its own site's canonical form, so the
-# mutated copy fails exactly the G13 assertion that guards its category
-# (the kill instrument; on the pristine tree every assertion holds). The
+# mutation at a time to a COPY of the tree and runs the behavioral tier
+# (mutate -> build the mutated kernel -> run the per-mutation behavioral
+# suite -> KILLED iff the suite FAILS). THE G13 GROUP NEVER CLASSIFIES A
+# KILL: each assertion below pins the CANONICAL SEMANTIC FORM of one
+# mutation target site — the mutation destroys its own site's canonical
+# form, so on the mutated copy the site's own G13 assertion FIRES and the
+# other G13 assertions still HOLD. The harness uses the group as the
+# SOURCE-INTEGRITY CONFIRMATION (via --mutation-source-integrity <id>):
+# the mutation's own G13 must fire — the mutation is really applied at
+# the intended site; on the pristine tree every assertion holds. The
 # mapping is the harness's mutation catalog:
 #   G13.1  <- mut-invert-comparison        G13.8  <- mut-field-offset
 #   G13.2  <- mut-delete-diagnostic        G13.9  <- mut-enum-tag
@@ -441,7 +471,41 @@ t G11.2b "the only crate.modules.entries() in the compiler are the macro-filter 
 #   G13.6  <- mut-duplicate-drop           G13.13 <- mut-remove-atomic-ordering
 #   G13.7  <- mut-skip-verifier            G13.14 <- mut-equality-to-permissive
 # ———————————————————————————————————————————————————————————————
-group G13 "Mutation-site invariants (the per-mutation detectors)"
+group G13 "Mutation-site source-integrity checks (the canonical-form assertions; never a kill classification)"
+
+# mutation_g13_label <mutation-id> — the G13 assertion that guards the
+# mutation's own site (the assertion that MUST FIRE on the mutated copy).
+mutation_g13_label() {
+  case "$1" in
+    mut-invert-comparison)      echo "G13.1" ;;
+    mut-delete-diagnostic)      echo "G13.2" ;;
+    mut-consume-to-read)        echo "G13.3" ;;
+    mut-modify-to-read)         echo "G13.4" ;;
+    mut-remove-drop-mark)       echo "G13.5" ;;
+    mut-duplicate-drop)         echo "G13.6" ;;
+    mut-skip-verifier)          echo "G13.7" ;;
+    mut-field-offset)           echo "G13.8" ;;
+    mut-enum-tag)               echo "G13.9" ;;
+    mut-remove-overflow-check)  echo "G13.10" ;;
+    mut-branch-target)          echo "G13.11" ;;
+    mut-remove-wake)            echo "G13.12" ;;
+    mut-remove-atomic-ordering) echo "G13.13" ;;
+    mut-equality-to-permissive) echo "G13.14" ;;
+    *)                          echo "" ;;
+  esac
+}
+
+# mutation_site_mirrors <mutation-id> — the NON-G13 assertions that encode
+# the SAME canonical form as the mutation's own G13 (they legitimately
+# fire on the mutated copy — e.g. G1.2.key_stride IS the MAP_HEADER_FIELDS
+# key_stride offset the field-offset mutation rewrites, so it fires
+# alongside G13.8).
+mutation_site_mirrors() {
+  case "$1" in
+    mut-field-offset) echo "G1.2.key_stride" ;;
+    *) echo "" ;;
+  esac
+}
 
 t G13.1 'invert-comparison detector: the field-index bounds check is the canonical `>= 0 && < len()` form (a valid index is never rejected)' \
   'grep -qF "if fid.index >= 0 && fid.index < fields.len() then" tg_compiler/types.tg'
@@ -490,6 +554,47 @@ t G13.14 'permissive-equality detector: the EXACT-equality invariants (the E0225
 # ———————————————————————————————————————————————————————————————
 printf '\n== %s: Summary ==\n' "G12"
 printf '  assertions: %d total, %d passed, %d failed\n' "$((PASSED + FAILURES))" "$PASSED" "$FAILURES"
+
+# — the SOURCE-INTEGRITY verdict (--mutation-source-integrity <id>) —
+# The bounded mutation harness runs this mode on a MUTATED copy: the
+# mutation's own G13 assertion MUST FIRE (the canonical form at the site
+# is destroyed = the mutation is really applied at the intended site —
+# its FAIL above is the FIRED signal); the documented site-mirror
+# assertions may fire too; every other assertion must PASS. This is a
+# SOURCE-INTEGRITY check only — it NEVER classifies a kill (the kill
+# classification is the behavioral tier of scripts/run_mutation_tests.sh:
+# mutate -> build the mutated kernel -> run the per-mutation behavioral
+# suite -> KILLED iff the suite FAILS).
+if [ -n "$MUTATION_SOURCE_CHECK" ]; then
+  OWN_LABEL="$(mutation_g13_label "$MUTATION_SOURCE_CHECK")"
+  if [ -z "$OWN_LABEL" ]; then
+    printf '  RESULT: FAIL — unknown mutation id for the source-integrity mode: %s\n' "$MUTATION_SOURCE_CHECK"
+    exit 2
+  fi
+  MIRRORS=" $(mutation_site_mirrors "$MUTATION_SOURCE_CHECK") "
+  FIRED=0
+  COLLATERAL=""
+  for label in $FAILED_LABELS; do
+    if [ "$label" = "$OWN_LABEL" ]; then
+      FIRED=1
+    elif [[ "$MIRRORS" == *" $label "* ]]; then
+      :
+    else
+      COLLATERAL="$COLLATERAL $label"
+    fi
+  done
+  if [ "$FIRED" -eq 0 ]; then
+    printf '  RESULT: FAIL — source integrity: the mutation %s is NOT observable at its target site (the %s canonical form still holds — the transformation was a no-op or the catalog drifted from the sources)\n' "$MUTATION_SOURCE_CHECK" "$OWN_LABEL"
+    exit 1
+  fi
+  if [ -n "$COLLATERAL" ]; then
+    printf '  RESULT: FAIL — source integrity: the mutation %s fired its own %s assertion but ALSO disturbed invariant(s) beyond the site:%s\n' "$MUTATION_SOURCE_CHECK" "$OWN_LABEL" "$COLLATERAL"
+    exit 1
+  fi
+  printf '  RESULT: PASS — source integrity: the mutation %s is applied at the intended site (%s FIRED on the mutated copy); every other invariant holds (this is the application confirmation, never a kill classification)\n' "$MUTATION_SOURCE_CHECK" "$OWN_LABEL"
+  exit 0
+fi
+
 if [ "$FAILURES" -eq 0 ]; then
   printf '  RESULT: PASS — every encoded invariant holds on this tree\n'
   exit 0

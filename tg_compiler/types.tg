@@ -31,7 +31,7 @@ use tg_compiler::ast::{
   UseDecl, AstPath, ExternItem, NominalKind, AccessConvention,
   TypeExpr, TypeExprKind, Param, GenericParam,
   Block, Stmt, StmtKind, Expr, ExprKind, Pattern, PatternKind,
-  BudgetAnnotation, BudgetConstraint
+  BudgetAnnotation, BudgetConstraint, LayoutAttrs, layout_attrs_plain
 }
 # (ONE AnalyzedProgram): the ONE TypedCFG the pipeline builds
 # (compiler_core's analyze_parsed — build_typed_cfg ONCE) is passed through
@@ -73,8 +73,9 @@ enum Type
   # internal: the checker never produces it and it never appears in a
   # public ABI signature. (RENAMED from the former internal StrView
   # variant — the new name states the 8-byte raw-pointer representation and
-  # cannot be confused with the PUBLIC std StrView, the 16-byte
-  # {ptr,len} view struct: one name, one layout.)
+  # cannot be confused with the PUBLIC std StrView, the SAFE shared/pinned
+  # view: the 8-byte Arc-class handle { inner: ArcStrong[StrViewBacking] } —
+  # one name, one layout.)
   StaticStrPtr
   Never
   
@@ -605,6 +606,320 @@ def effect_display_name(env: TypeEnv, e: EffectId) -> String
   end
 end
 
+# The typed effect declaration of a source effect NAME — the resolution the
+# perform surface and the handle/with blocks use: the name resolves through
+# the current module first ("path::name"), then the bare/root key ("name"),
+# then the fully-qualified key (the key domain the EffectRegistry interns).
+# Option::None for a name never declared (the caller reports the unknown
+# effect). The declared effect's typed op table is the authority the
+# operation-call surface is checked against.
+def typed_effect_of_name(env: TypeEnv, name: String) -> Option[TypedEffectDecl]
+  var candidates = Vec::new()
+  if !env.current_module_path.is_empty() then
+    candidates.push(env.current_module_path.join("::") + "::" + name.clone())
+  end
+  candidates.push(name.clone())
+  var ci = 0
+  while ci < candidates.len() do
+    match env.effect_name_index.get(candidates[ci].clone())
+    when Option::Some(eid) then
+      match env.typed_effects.get(eid)
+      when Option::Some(decl) then return Option::Some(decl.clone())
+      when Option::None then ()
+      end
+    when Option::None then ()
+    end
+    ci = ci + 1
+  end
+  Option::None
+end
+
+# ———————————————————————————————————————————————————————————————
+# The operation-call surface — std::effects::perform(EFFECT.op, ...)
+# ———————————————————————————————————————————————————————————————
+# The perform function is the checker-recognized operation-call surface:
+# the callee path "std::effects::perform" (the std/effects.tg declaration
+# is the resolution seed; its declared generic signature is never used for
+# call typing). The FIRST argument is the operation REFERENCE — a
+# `EFFECT.op` path whose effect resolves to the declared effect's semantic
+# EffectId and whose op name resolves into the typed op table (the
+# declaration-order index — the dispatch identity the MIR statement and
+# the runtime handler-frame bitmap carry). The remaining arguments are the
+# operation's payload, checked against the op signature's parameter types;
+# the call's type is the op's return type. The performed effect accumulates
+# into the enclosing function's COMPUTED effect set (the transitive
+# discipline: a function that performs an effect it does not declare is a
+# violation, exactly like an effectful call).
+#
+# The bounded row's Copy gate: an effect operation's parameters and return
+# type must be Copy (is_trivially_copyable) — resource ownership never
+# crosses the perform boundary (the payload is a plain value tuple moved
+# through the runtime's untyped frame).
+
+def effect_perform_callee_path(func: Expr) -> Bool
+  match func.kind
+  when ExprKind::ExprPath(p) then
+    p.segments.len() == 3 && p.segments[0] == "std" && p.segments[1] == "effects" && p.segments[2] == "perform"
+  when ExprKind::ExprEnumVariant(p, _) then
+    # The 3-segment module-qualified call path parses as ExprEnumVariant
+    # ("std::effects::perform(...)") — the checker recognizes the SAME
+    # surface shape in both the ExprCall and ExprEnumVariant arms.
+    p.segments.len() == 3 && p.segments[0] == "std" && p.segments[1] == "effects" && p.segments[2] == "perform"
+  when _ then false
+  end
+end
+
+# The operation reference of an expression: the (effect name, op name) of
+# the `EFFECT.op` path form (also the `EFFECT.op` field-access spelling).
+def effect_op_reference_of(expr: Expr) -> Option[(String, String)]
+  match expr.kind
+  when ExprKind::ExprPath(p) then
+    if p.segments.len() >= 2 then
+      Option::Some((p.segments[p.segments.len() - 2].clone(), p.segments[p.segments.len() - 1].clone()))
+    else
+      Option::None
+    end
+  when ExprKind::ExprFieldAccess(base, field) then
+    match base.kind
+    when ExprKind::ExprIdent(eff_name) then Option::Some((eff_name.clone(), field.clone()))
+    when _ then Option::None
+    end
+  when _ then Option::None
+  end
+end
+
+# The typed effect declaration of an operation-reference path — the
+# qualified prefix (a path `mod::EFFECT.op` resolves the effect under its
+# module-qualified key first), then the current-module/bare resolution.
+def typed_effect_of_op_reference(env: TypeEnv, expr: Expr, eff_name: String) -> Option[TypedEffectDecl]
+  match expr.kind
+  when ExprKind::ExprPath(p) then
+    if p.segments.len() > 2 then
+      var prefix = Vec::new()
+      var si = 0
+      while si < p.segments.len() - 2 do
+        prefix.push(p.segments[si].clone())
+        si = si + 1
+      end
+      let qkey = prefix.join("::") + "::" + eff_name.clone()
+      match env.effect_name_index.get(qkey.clone())
+      when Option::Some(eid) then
+        match env.typed_effects.get(eid)
+        when Option::Some(decl) then return Option::Some(decl.clone())
+        when Option::None then ()
+        end
+      when Option::None then ()
+      end
+    end
+  when _ then ()
+  end
+  typed_effect_of_name(env, eff_name)
+end
+
+# The performed effect accumulates into the enclosing function's computed
+# effect set (the transitive discipline's call-site channel). A perform
+# lexically inside a handle/with block for the SAME effect is neutralized
+# (the enclosing handler catches it — the enclosing function need not
+# declare an effect it handles).
+def record_perform_effect(inout env: TypeEnv, eid: EffectId) -> Unit
+  if env.current_fn_key == "" then return end
+  var hi = 0
+  while hi < env.handler_stack.len() do
+    if env.handler_stack[hi] == eid.id then return end
+    hi = hi + 1
+  end
+  var effs = Vec::new()
+  effs.push(eid.clone())
+  match env.fn_computed_effects.get(env.current_fn_key.clone())
+  when Option::Some(comp) then
+    var new_comp = comp.clone()
+    let _ = effect_set_append(&mut new_comp, effs)
+    env.fn_computed_effects.insert(env.current_fn_key.clone(), new_comp)
+  when Option::None then
+    env.fn_computed_effects.insert(env.current_fn_key.clone(), effs)
+  end
+end
+
+# The perform-call typing. Option::None when the call is NOT the perform
+# surface (the caller falls through to the normal call checking); a
+# resolved perform call returns the op's return type.
+def check_effect_perform_call(inout env: TypeEnv, expr: Expr, func: Expr, args: Vec[Expr]) -> Option[Type]
+  if !effect_perform_callee_path(&func) then return Option::None end
+  if args.len() < 1 then
+    type_add_error(env, "std::effects::perform requires an operation reference as its first argument: perform(EFFECT.op, ...)", expr.span)
+    return Option::Some(Type::Error)
+  end
+  match effect_op_reference_of(&args[0])
+  when Option::Some((eff_name, op_name)) then
+    var decl: Option[TypedEffectDecl] = Option::None
+    match typed_effect_of_op_reference(env, &args[0], &eff_name)
+    when Option::Some(td) then decl = Option::Some(td)
+    when Option::None then ()
+    end
+    match decl
+    when Option::Some(td) then
+      let op_index = typed_effect_op_index(&td, &op_name)
+      if op_index < 0 then
+        type_add_error(env, "effect `" + eff_name + "` has no operation `" + op_name + "`", args[0].span)
+        return Option::Some(Type::Error)
+      end
+      let op_sig = td.ops[op_index]
+      if args.len() - 1 != op_sig.params.len() then
+        type_add_error(env, "wrong number of arguments for effect operation `" + eff_name + "::" + op_name + "`: expected " + op_sig.params.len().to_string() + ", found " + (args.len() - 1).to_string(), expr.span)
+      end
+      env.access_marker_depth = env.access_marker_depth + 1
+      var pi = 0
+      while pi < args.len() - 1 && pi < op_sig.params.len() do
+        let arg_ty = check_expr(env, &args[pi + 1])
+        unify(env, arg_ty, op_sig.params[pi].clone(), args[pi + 1].span)
+        record_arg_effect(env, &args[pi + 1], AccessConvention::Let)
+        pi = pi + 1
+      end
+      while pi < args.len() - 1 do
+        check_expr(env, &args[pi + 1])
+        record_arg_effect(env, &args[pi + 1], AccessConvention::Let)
+        pi = pi + 1
+      end
+      env.access_marker_depth = env.access_marker_depth - 1
+      record_perform_effect(env, &td.id)
+      Option::Some(op_sig.ret.clone())
+    when Option::None then
+      type_add_error(env, "unknown effect `" + eff_name + "` in the operation reference (no `effect " + eff_name + "` declaration is in scope)", args[0].span)
+      Option::Some(Type::Error)
+    end
+  when Option::None then
+    type_add_error(env, "std::effects::perform requires an operation reference as its first argument: perform(EFFECT.op, ...)", args[0].span)
+    Option::Some(Type::Error)
+  end
+end
+
+# The typed-tree assembly of a resolved perform call (the mirror of
+# typed_call_for): the EffectPerform callee identity carries the semantic
+# EffectId + the op's declaration index + name; the args are the OPERATION
+# PAYLOAD (the op-reference argument is never a typed child — the MIR's
+# perform lowering reads the identity from the callee record).
+def typed_effect_perform_call_for(env: TypeEnv, expr: Expr, args: Vec[Expr]) -> Option[TypedCall]
+  var eff_id = EffectId { id: -1 }
+  var op_idx = -1
+  var op_name = ""
+  match effect_op_reference_of(&args[0])
+  when Option::Some((eff_name, op_name2)) then
+    op_name = op_name2.clone()
+    match typed_effect_of_op_reference(env, &args[0], &eff_name)
+    when Option::Some(td) then
+      eff_id = td.id.clone()
+      op_idx = typed_effect_op_index(&td, &op_name2)
+    when Option::None then ()
+    end
+  when Option::None then ()
+  end
+  if eff_id.id < 0 || op_idx < 0 then return Option::None end
+  var typed_args = Vec::new()
+  var i = 1
+  while i < args.len() do
+    match env.typed_access_effects.get(args[i].node_id)
+    when Option::Some(eff) then
+      match typed_child_of(env, &args[i])
+      when Option::Some(at) then
+        typed_args.push(TypedCallArg { effect: eff, value: at })
+      when Option::None then return Option::None
+      end
+    when Option::None then return Option::None
+    end
+    i = i + 1
+  end
+  Option::Some(TypedCall { callee: TypedCallee::EffectPerform(eff_id, op_idx, op_name), receiver_effect: Option::None, receiver: Option::None, args: typed_args })
+end
+
+# The bounded arm-body control-flow gate: return/break/continue/defer are
+# rejected inside effect-handler arms (the arm runs in the handler's
+# dispatcher function — the enclosing frame's CFG edges and teardown plans
+# do not exist there). Walks nested blocks/expressions recursively.
+def effect_arm_body_has_control_flow(block: Block) -> Bool
+  var i = 0
+  while i < block.stmts.len() do
+    if effect_stmt_has_control_flow(&block.stmts[i]) then return true end
+    i = i + 1
+  end
+  false
+end
+
+def effect_stmt_has_control_flow(stmt: Stmt) -> Bool
+  match stmt.kind
+  when StmtKind::StmtReturn(_) | StmtKind::StmtBreak(_) | StmtKind::StmtContinue then true
+  when StmtKind::StmtDefer(body) then true
+  when StmtKind::StmtIf(if_stmt) then
+    if effect_expr_has_control_flow(&if_stmt.cond) then return true end
+    if effect_arm_body_has_control_flow(&if_stmt.then_block) then return true end
+    var ei = 0
+    while ei < if_stmt.elsif_branches.len() do
+      if effect_expr_has_control_flow(&if_stmt.elsif_branches[ei].0) then return true end
+      if effect_arm_body_has_control_flow(&if_stmt.elsif_branches[ei].1) then return true end
+      ei = ei + 1
+    end
+    match if_stmt.else_block
+    when Option::Some(eb) then effect_arm_body_has_control_flow(&eb)
+    when Option::None then false
+    end
+  when StmtKind::StmtWhile(cond, body) then
+    effect_expr_has_control_flow(&cond) || effect_arm_body_has_control_flow(&body)
+  when StmtKind::StmtFor(for_stmt) then
+    effect_expr_has_control_flow(&for_stmt.iter) || effect_arm_body_has_control_flow(&for_stmt.body)
+  when StmtKind::StmtLoop(body) then effect_arm_body_has_control_flow(&body)
+  when StmtKind::StmtMatch(m) then
+    if effect_expr_has_control_flow(&m.scrutinee) then return true end
+    var ai = 0
+    while ai < m.arms.len() do
+      match m.arms[ai].guard_expr
+      when Option::Some(g) then if effect_expr_has_control_flow(&g) then return true end
+      when Option::None then ()
+      end
+      if effect_arm_body_has_control_flow(&m.arms[ai].body) then return true end
+      ai = ai + 1
+    end
+    false
+  when StmtKind::StmtExpr(e) then effect_expr_has_control_flow(&e)
+  when StmtKind::StmtUnsafe(_, body) then effect_arm_body_has_control_flow(&body)
+  when _ then false
+  end
+end
+
+def effect_expr_has_control_flow(expr: Expr) -> Bool
+  match expr.kind
+  when ExprKind::ExprBlock(block) then effect_arm_body_has_control_flow(&block)
+  when ExprKind::ExprIf(if_stmt) then
+    if effect_expr_has_control_flow(&if_stmt.cond) then return true end
+    if effect_arm_body_has_control_flow(&if_stmt.then_block) then return true end
+    var ei = 0
+    while ei < if_stmt.elsif_branches.len() do
+      if effect_expr_has_control_flow(&if_stmt.elsif_branches[ei].0) then return true end
+      if effect_arm_body_has_control_flow(&if_stmt.elsif_branches[ei].1) then return true end
+      ei = ei + 1
+    end
+    match if_stmt.else_block
+    when Option::Some(eb) then effect_arm_body_has_control_flow(&eb)
+    when Option::None then false
+    end
+  when ExprKind::ExprMatch(m) then
+    if effect_expr_has_control_flow(&m.scrutinee) then return true end
+    var ai = 0
+    while ai < m.arms.len() do
+      match m.arms[ai].guard_expr
+      when Option::Some(g) then if effect_expr_has_control_flow(&g) then return true end
+      when Option::None then ()
+      end
+      if effect_arm_body_has_control_flow(&m.arms[ai].body) then return true end
+      ai = ai + 1
+    end
+    false
+  when ExprKind::ExprUnsafe(_, block) then effect_arm_body_has_control_flow(&block)
+  when ExprKind::ExprClosure(_, _, body) then effect_expr_has_control_flow(&body)
+  when ExprKind::ExprAsync(block) then effect_arm_body_has_control_flow(&block)
+  when ExprKind::ExprTry(inner) then effect_expr_has_control_flow(&inner)
+  when _ then false
+  end
+end
+
 # Whether the function under a def-key is a std module function — the
 # trusted implementation base exempt from the compare diagnostics (its
 # declared effects are the API contract for USER callers; its internal
@@ -828,10 +1143,11 @@ end
 # Map/Set), keyed by the LangItems TypeId (the typed program's canonical
 # snapshot — never the registered name; a snapshot missing an id fails
 # CLOSED to Trivial/structural, matching the pre-existing name fallback
-# behavior for an unregistered name). The RAW Slice (UnsafeSlice) is
+# behavior for an unregistered name). The RAW view (UnsafeSlice) is
 # deliberately NOT here as an owning container: the raw view is the
 # {ptr,len} view (owns=false, drop=none) and its plan is Trivial. The
-# SAFE shared/pinned forms (SharedSlice/StrView — the Arc-class views) are
+# SAFE shared/pinned forms (the source-spelled Slice / StrView — the
+# Arc-class views) are
 # std-declared structs and flow through the structural walk: the Arc
 # field's registered Drop owns the destruction (the backing's deinit
 # releases the pinned allocation). Returns Trivial for anything else; the
@@ -850,7 +1166,8 @@ def nominal_container_plan(typed: TypedProgram, tid: TypeId, type_name: String, 
     # backing — the escape constraint is enforced by the P0-SL rules
     # (the raw view's escape channels in the type checker + the resource
     # checker's live-view registry / IterationPlan mutation scan). The
-    # SAFE shared/pinned form (SharedSlice — the Arc-class view) is NOT
+    # SAFE shared/pinned form (the source-spelled Slice — the Arc-class
+    # view) is NOT
     # this arm: its Arc field's Drop owns the destruction.
     DeinitPlan::Trivial
   elsif ((li.array != -1 && tid.id == li.array) || (li.vec != -1 && tid.id == li.vec)) && args.len() >= 1 then
@@ -1379,6 +1696,14 @@ struct TypeEnv
   callable_first_wins: Map[String, Type]
   type_id_index: Map[Int, Int]         # TypeId.id -> index into type_list
   type_id_counter: Int
+  # TypeId.id -> the declaration's LAYOUT attributes (@repr(C) / @align(N)
+  # / @packed — the layout-relevant subset of the item attributes),
+  # validated and recorded at collect_type_def / collect_enum_type_def.
+  # The TypedProgram serializes this table (type_layout_attrs) and the MIR
+  # carries it into the MirTypeDefs the layout engine reads — the typed
+  # records are the attribute authority end-to-end.
+  layout_attrs: Map[Int, LayoutAttrs]
+  wcet_bounds: Map[String, Int]
   
   # Type variable substitution
   subst: Map[TypeVarId, Type]
@@ -1651,6 +1976,41 @@ struct TypeEnv
   # internal calls are the implementation of those declared effects,
   # never checked against its own declarations.
   fn_effect_modules: Map[String, Vec[String]] = Map::new()
+  # ———————————————————————————————————————————————
+  # the algebraic-effects typed records
+  # ———————————————————————————————————————————————
+  # EffectId.id -> the typed effect declaration (the resolved op-signature
+  # table the perform surface and the handler arms are checked against).
+  # Registered at the ItemEffectDecl site: the declared effect interns its
+  # module-qualified EffectId and its ops resolve through resolve_type_expr
+  # (TypeExpr is never interpreted after checking).
+  typed_effects: Map[Int, TypedEffectDecl] = Map::new()
+  # The qualified effect-name index: module-qualified key ("path::name" —
+  # the root module's effects under the bare name, the SAME key domain the
+  # EffectRegistry interns) -> EffectId.id. The perform surface's op
+  # reference (EFFECT.op) resolves through this index.
+  effect_name_index: Map[String, Int] = Map::new()
+  # handle-with statement node id -> the typed handler records (per handler
+  # in source order: the resolved EffectId, the op index per arm and the
+  # arm's resolved body type). Assembled at the StmtHandleWith check arm;
+  # consumed by the typed-tree assembly (typed_stmt_for) and serialized for
+  # the MIR's handler lowering.
+  typed_effect_handlers: Map[Int, Vec[TypedHandler]] = Map::new()
+  # handle-with statement node id -> per-handler capture records (handler
+  # index -> captured local id -> effect): the union of the handler's arm
+  # bodies' free-variable scans — the semantic capture record the MIR's
+  # handler-env construction reads (the SAME capture discipline as
+  # closure_captures).
+  handler_captures: Map[Int, Vec[Map[Int, AccessEffect]]] = Map::new()
+  # The lexically-enclosing effect-handler stack (EffectId ids, outermost
+  # first) — the bounded neutralization rule: a perform lexically inside a
+  # handle/with block for the same effect is HANDLED, so the performed
+  # effect does not accumulate into the ENCLOSING function's computed set
+  # (the handler neutralizes it; a perform in a CALLED function still
+  # accumulates into the callee's own computed set — each function declares
+  # its own discipline).
+  handler_stack: Vec[Int] = Vec::new()
+  # ———————————————————————————————————————————————
  # the def-key of the function/method whose body is being checked —
   # the call-recording sites accumulate into its computed set. "" outside
   # any function body (const/static initializers record no edges).
@@ -2393,10 +2753,15 @@ end
 # A call's callee identity: the resolved CallableId (ids.tg — the
 # callable's DefId) or the closure-call marker — a closure VALUE invoked (a
 # local or a parenthesized closure whose type is Type::Closure) with no
-# DefId target.
+# DefId target. EffectPerform is the OPERATION-CALL surface identity — a
+# std::effects::perform(EFFECT.op, ...) call the checker resolved against
+# the declared effect's op table: the semantic EffectId, the op's index in
+# the declaration (declaration order — the MIR/runtime dispatch identity)
+# and the op's name (diagnostics).
 enum TypedCallee
   Def(CallableId)
   Closure
+  EffectPerform(EffectId, Int, String)
 end
 
 # The typed call node: the callee identity, the receiver's recorded access
@@ -2508,12 +2873,55 @@ enum TypedGuardElse
 end
 
 struct TypedHandler
+  effect: EffectId
+  name: String
   arms: Vec[TypedHandlerArm]
 end
 
 struct TypedHandlerArm
+  op_index: Int
+  ret_type: Type
   params: Vec[TypedPattern]
   body: Vec[TypedStmt]
+end
+
+# ———————————————————————————————————————————————————————————————
+# The typed effect representation (the algebraic-effects row)
+# ———————————————————————————————————————————————————————————————
+# The typed records of the `effect` declarations: the semantic EffectId
+# (interned module-qualified by the declaration) keying the declaration's
+# OPERATION SIGNATURES — the resolved op table the perform surface and the
+# handler arms are typed against. The op index is the arm/dispatch identity
+# (the position in the declaration's op list, declaration order) — the same
+# index the MIR's perform statement and the runtime's handler-frame bitmap
+# carry.
+struct TypedEffectOp
+  name: String
+  params: Vec[Type]
+  ret: Type
+end
+
+struct TypedEffectDecl
+  id: EffectId
+  name: String
+  ops: Vec[TypedEffectOp]
+end
+
+def typed_effect_op_index(decl: TypedEffectDecl, op_name: String) -> Int
+  var i = 0
+  while i < decl.ops.len() do
+    if decl.ops[i].name == op_name then return i end
+    i = i + 1
+  end
+  -1
+end
+
+# The synthetic (negative) NodeId key of a handler arm's resource-check
+# cleanup record — the checker's resource pass and the MIR's dispatcher
+# lowering derive the SAME key (negative: node ids are positive, so the
+# key can never collide with a real closure/expression node).
+pub def effect_handler_synth_key(stmt_node_id: Int, handler_idx: Int, arm_idx: Int) -> Int
+  -(1000 + stmt_node_id * 8 + handler_idx * 4 + arm_idx)
 end
 
 # The typed place record — a place path (the semantic AccessRoot (ids.tg:
@@ -3091,45 +3499,14 @@ def typed_stmt_for(env: TypeEnv, stmt: Stmt) -> Option[TypedStmt]
   when StmtKind::StmtHandleWith(expr, handlers) then
     match typed_child_of(env, &expr)
     when Option::Some(et) then
-      var handlers_typed = Vec::new()
-      var hi = 0
-      var handlers_ok = true
-      while hi < handlers.len() do
-        var arms_typed = Vec::new()
-        var hj = 0
-        var arms_ok = true
-        while hj < handlers[hi].arms.len() do
-          var params_typed = Vec::new()
-          var pk = 0
-          var params_ok = true
-          while pk < handlers[hi].arms[hj].params.len() do
-            match typed_pattern_of(env, &handlers[hi].arms[hj].params[pk])
-            when Option::Some(hp) then
-              params_typed.push(hp)
-              pk = pk + 1
-            when Option::None then
-              params_ok = false
-              pk = pk + 1
-            end
-          end
-          if params_ok then
-            arms_typed.push(TypedHandlerArm { params: params_typed, body: typed_stmts_of(env, &handlers[hi].arms[hj].body) })
-            hj = hj + 1
-          else
-            arms_ok = false
-            hj = hj + 1
-          end
-        end
-        if arms_ok then
-          handlers_typed.push(TypedHandler { arms: arms_typed })
-          hi = hi + 1
-        else
-          handlers_ok = false
-          hi = hi + 1
-        end
-      end
-      if handlers_ok then
-        kind = Option::Some(TypedStmtKind::HandleWith { expr: et, handlers: handlers_typed })
+      # The typed handler records were assembled at the StmtHandleWith
+      # check arm (the semantic EffectId, the arm op indices and the arm
+      # result types); the tree carries the checker's record — the MIR's
+      # handler lowering reads the same table.
+      match env.typed_effect_handlers.get(stmt.node_id)
+      when Option::Some(typed_handlers) then
+        kind = Option::Some(TypedStmtKind::HandleWith { expr: et, handlers: typed_handlers })
+      when Option::None then ()
       end
     when Option::None then ()
     end
@@ -3363,6 +3740,19 @@ def typed_kind_for(inout env: TypeEnv, expr: Expr) -> Option[TypedExprKind]
     end
     Option::Some(TypedExprKind::MapLit(entries_typed))
   when ExprKind::ExprCall(func, args) then
+    # The operation-call surface: a resolved std::effects::perform call
+    # assembles the EffectPerform callee (the semantic EffectId + the op's
+    # declaration index + name) — never the DefId form (the callee's
+    # declared generic signature is a resolution seed, not the call's
+    # typing).
+    if effect_perform_callee_path(&func) then
+      match typed_effect_perform_call_for(env, expr, &args)
+      when Option::Some(tc_perform) then Option::Some(TypedExprKind::Call(tc_perform))
+      when Option::None then
+        add_error_with_code(env, "internal error: cannot assemble the typed effect-perform call node (node " + expr.node_id.to_string() + "): missing effect identity or argument access effect", expr.span, "ICE")
+        Option::None
+      end
+    else
     match typed_call_for(env, expr, &args, Option::None)
     when Option::Some(tc) then Option::Some(TypedExprKind::Call(tc))
     when Option::None then
@@ -3378,6 +3768,7 @@ def typed_kind_for(inout env: TypeEnv, expr: Expr) -> Option[TypedExprKind]
         add_error_with_code(env, "internal error: cannot assemble the typed HIR call node (node " + expr.node_id.to_string() + "): missing typed call target or argument access effect", expr.span, "ICE")
         Option::None
       end
+    end
     end
   when ExprKind::ExprMethodCall(recv, _, _, args) then
     match typed_call_for(env, expr, &args, Option::Some(recv))
@@ -3413,6 +3804,22 @@ def typed_kind_for(inout env: TypeEnv, expr: Expr) -> Option[TypedExprKind]
     when Option::None then missing_typed_hir_child(env, expr)
     end
   when ExprKind::ExprEnumVariant(path, args) then
+    # The operation-call surface: a std::effects::perform(EFFECT.op, ...)
+    # call parses as an ExprEnumVariant (the 3-segment module-qualified
+    # call path — the same shape the check arm routes through
+    # check_effect_perform_call). The typed assembly mirrors the ExprCall
+    # arm: the resolved perform call carries the EffectPerform callee
+    # identity (the semantic EffectId + the op's declaration index + name)
+    # — never a variant construction or a StaticPathCall (the MIR's
+    # perform lowering reads the identity from the callee record).
+    if effect_perform_callee_path(&expr) then
+      match typed_effect_perform_call_for(env, expr, &args)
+      when Option::Some(tc_perform) then Option::Some(TypedExprKind::Call(tc_perform))
+      when Option::None then
+        add_error_with_code(env, "internal error: cannot assemble the typed effect-perform call node (node " + expr.node_id.to_string() + "): missing effect identity or argument access effect", expr.span, "ICE")
+        Option::None
+      end
+    else
     match typed_children_of(env, &args)
     when Option::Some(args_typed) then
       # The resolved variant identity: find_enum_variant_indexed is the
@@ -3428,6 +3835,7 @@ def typed_kind_for(inout env: TypeEnv, expr: Expr) -> Option[TypedExprKind]
         Option::Some(TypedExprKind::StaticPathCall { path: if path.segments.len() > 0 then path.segments.join("::") else "" end, args: args_typed })
       end
     when Option::None then missing_typed_hir_child(env, expr)
+    end
     end
   when ExprKind::ExprMacroCall(name, args) then
     match typed_children_of(env, &args)
@@ -3633,6 +4041,14 @@ struct TypedProgram
   # Typed HIR section note.
   typed_exprs: Map[Int, TypedExpr]
   closure_captures: Map[Int, Map[Int, AccessEffect]]
+  # The algebraic-effects typed records (the semantic EffectId-keyed op
+  # tables, the typed handle-with handlers per statement node and the
+  # per-handler capture records) — the checker's typed effect channel into
+  # the MIR's perform/handler lowering.
+  typed_effects: Map[Int, TypedEffectDecl] = Map::new()
+  effect_name_index: Map[String, Int] = Map::new()
+  typed_effect_handlers: Map[Int, Vec[TypedHandler]] = Map::new()
+  handler_captures: Map[Int, Vec[Map[Int, AccessEffect]]] = Map::new()
   local_bindings: Map[Int, LocalBinding]
   ident_resolutions: Map[Int, Int]
   # Parameter bindings are keyed by owner (function/method DefId via
@@ -3690,9 +4106,14 @@ struct TypedProgram
   type_fields: Map[Int, Vec[(String, Type)]]
   type_variants: Map[Int, Vec[(String, Vec[Type], Int)]]
   # Type id -> generic parameter ids (for substituting concrete args into
- # field/variant types when building containment plans). the ids in
+  # field/variant types when building containment plans). the ids in
   # declaration order; the param-name table below holds the display names.
   type_params: Map[Int, Vec[GenericParamId]]
+  # Type id -> the declaration's LAYOUT attributes (@repr(C) / @align(N) /
+  # @packed) — the checker's validated record (env.layout_attrs), carried
+  # into the MirTypeDefs the layout engine reads; the typed records are the
+  # attribute authority end-to-end.
+  type_layout_attrs: Map[Int, LayoutAttrs]
   type_kinds: Map[Int, TypeKind]
  # (engine snapshot completeness): type id -> the RESOLVED inner type of
   # a type alias (TypeDefKind::Alias — the checker's registered alias
@@ -3754,6 +4175,8 @@ def type_env_new() -> TypeEnv
     callable_first_wins: Map::new(),
     type_id_index: Map::new(),
     type_id_counter: 100,
+    layout_attrs: Map::new(),
+    wcet_bounds: Map::new(),
     subst: Map::new(),
     var_counter: 0,
     scopes: Vec::new(),
@@ -3906,32 +4329,33 @@ def type_env_new() -> TypeEnv
       FieldInfo { name: "len", ty: Type::Int, is_public: true },
       FieldInfo { name: "cap", ty: Type::Int, is_public: false }
     ]))
- # Type representation collapse: Map/Set/Array/Slice ARE registered
-  # as builtin Opaque generic types — the Adt form needs their TypeIds.
+ # Type representation collapse: Map/Set/Array ARE registered
+  # as builtin Opaque generic types — the Adt form needs their TypeIds
+  # (the RAW view is the "UnsafeSlice" builtin — the `slice` LangItems id).
   # Their LangItems ids (map/set/array/slice) are the special-behavior
   # selector of the Adt form (Type::Adt(tid, args)); the canonical variants
   # (Type::Map/Type::Set/Type::Array/Type::Slice) no longer exist. The std's
   # empty `struct Map[K: Hash + Eq, V]` / `struct Set[T: Hash + Eq]` stubs
   # are no-op re-registrations of these builtins (store_type_def's
   # empty-stub / builtin-Opaque paths keep the intrinsic TypeId), and the
-  # Array/Slice names are special-cased before any name lookup.
+  # Array name is special-cased before any name lookup. The SOURCE-spelled
+  # "Slice" is NOT a builtin: it resolves to the std-declared SHARED struct
+  # (the safe-view authority — see the UnsafeSlice registration below).
   let array_ids = begin_builtin_generic(&mut env, Vec::from(["T".to_string()]))
   register_builtin_generic_named(&mut env, "Array", array_ids, TypeDefKind::Opaque)
-  let slice_ids = begin_builtin_generic(&mut env, Vec::from(["T".to_string()]))
-  register_builtin_generic_named(&mut env, "Slice", slice_ids, TypeDefKind::Opaque)
-  # The RAW {ptr,len} view's EXPLICIT UNSAFE/FFI spelling: "UnsafeSlice[T]"
-  # in source resolves to the SAME builtin TypeId as the registered
-  # "Slice" (the registered name must stay "Slice" — the layout engine's
-  # is_slice_view_tid and the MIR's "Slice" arms match the TypeDef name
-  # by id, and they are not editable here). The safe Slice is the
-  # std-declared SHARED/PINNED form (SharedSlice — the Arc-class
-  # { inner: Arc[SliceBacking[T]] } in std/collections.tg): the raw view
-  # is unsafe/FFI-only and safe code cannot produce it (the P0-SL escape
-  # machinery below polices the raw view's escapes).
-  match env.type_name_index.get("Slice")
-  when Option::Some(slice_idx) then env.type_name_index.insert("UnsafeSlice".to_string(), slice_idx)
-  when Option::None then ()
-  end
+  # THE ONE-REPRESENTATION AUTHORITY (P0 — the safe-view closure): the
+  # SOURCE-spelled "Slice" name is NOT registered here — it resolves to
+  # the std-declared SHARED/PINNED form (the `struct Slice[T] { inner:
+  # ArcStrong[SliceBacking[T]] }` in std/collections.tg — the Arc-class
+  # {ptr,len} handle). "UnsafeSlice" is the RAW view's builtin
+  # registration — the 16-byte { ptr: Ptr[T], len: UInt } borrowed form,
+  # the EXPLICIT unsafe/FFI-only spelling. The raw view is the `slice`
+  # LangItems id (the escape checks / deinit plans / layout rows select
+  # the raw form by that id); the shared form is an ordinary std struct
+  # (its Arc field's Drop owns the destruction, its layout is computed
+  # from its MirTypeDef — no name-based special case anywhere).
+  let unsafe_slice_ids = begin_builtin_generic(&mut env, Vec::from(["T".to_string()]))
+  register_builtin_generic_named(&mut env, "UnsafeSlice", unsafe_slice_ids, TypeDefKind::Opaque)
   let map_ids = begin_builtin_generic(&mut env, Vec::from(["K".to_string(), "V".to_string()]))
   register_builtin_generic_named(&mut env, "Map", map_ids, TypeDefKind::Opaque)
   let set_ids = begin_builtin_generic(&mut env, Vec::from(["T".to_string()]))
@@ -4286,7 +4710,11 @@ def build_lang_items(env: TypeEnv) -> LangItems
     box_: lang_item_type_id(env, "Box"),
     rc: lang_item_type_id(env, "Rc"),
     array: lang_item_type_id(env, "Array"),
-    slice: lang_item_type_id(env, "Slice"),
+    # The `slice` LangItems id IS the RAW view — the registered builtin
+    # "UnsafeSlice" (the 16-byte {ptr,len} borrowed form). The SAFE
+    # source-spelled Slice is the std-declared shared struct (a distinct
+    # TypeId, never a LangItems entry — it needs no special-case behavior).
+    slice: lang_item_type_id(env, "UnsafeSlice"),
     string: lang_item_type_id(env, "String"),
     str_view: lang_item_type_id(env, "StrView"),
     unique_ptr: lang_item_type_id(env, "UniquePtr"),
@@ -5161,10 +5589,14 @@ def type_def_to_canonical(inout env: TypeEnv, td: TypeDef) -> Type
     if args.len() >= 2 then builtin_adt(env, "Result".to_string(), args)
     else builtin_adt(env, "Result".to_string(), [fresh_type_var(env), fresh_type_var(env)])
     end
-  elsif name == "Slice" then
+  elsif name == "UnsafeSlice" then
+    # The RAW {ptr,len} view builtin (LangItems slice id): the explicit
+    # unsafe/FFI spelling. The SOURCE-spelled "Slice" is NOT this arm —
+    # it resolves to the std-declared shared struct (the fallthrough
+    # below, which builds the Adt form of the std Slice).
     let args = fresh_type_args_for(env, td)
-    if args.len() >= 1 then builtin_adt(env, "Slice".to_string(), args)
-    else builtin_adt(env, "Slice".to_string(), [fresh_type_var(env)])
+    if args.len() >= 1 then builtin_adt(env, "UnsafeSlice".to_string(), args)
+    else builtin_adt(env, "UnsafeSlice".to_string(), [fresh_type_var(env)])
     end
   elsif name == "Array" then
     let args = fresh_type_args_for(env, td)
@@ -5530,7 +5962,7 @@ def type_tag(env: TypeEnv, t: Type) -> String
     elsif id.id == env.lang_items.result && args.len() >= 2 then "Result"
     elsif id.id == env.lang_items.map && args.len() >= 2 then "Map"
     elsif id.id == env.lang_items.set && args.len() >= 1 then "Set"
-    elsif id.id == env.lang_items.slice && args.len() >= 1 then "Slice"
+    elsif id.id == env.lang_items.slice && args.len() >= 1 then "UnsafeSlice"
     elsif id.id == env.lang_items.array && args.len() >= 1 then "Array"
     elsif id.id == env.lang_items.box_ && args.len() >= 1 then "Box"
     elsif id.id == env.lang_items.rc && args.len() >= 1 then "Rc"
@@ -5642,8 +6074,12 @@ def is_unit_type(ty: Type) -> Bool
 end
 
 # True for Slice/Vec/Array (element containers interchangeable in the checker).
-# The Adt forms of the slice-like builtins (LangItems slice/array/vec ids)
-# are slice-like; Vec is a registered Adt type matched by LangItems id.
+# The RAW view (the UnsafeSlice builtin — LangItems slice id), the heap
+# vector (Array/Vec ids) are the slice-like Adt forms. The SAFE
+# source-spelled Slice (the std-declared shared struct) is NOT this class:
+# it is an ordinary struct whose element access is its compiled methods
+# (len/get/sub — the Arc-backed std impl), never a checker-managed
+# container.
 def is_slice_like(env: TypeEnv, ty: Type) -> Bool
   match ty
   when Type::Adt(tid, _) then
@@ -5655,7 +6091,8 @@ end
 def slice_inner(env: TypeEnv, ty: Type) -> Type
   match ty
   when Type::Adt(tid, args) then
-    # Only the slice-like builtin ids (and Vec) yield their element; the
+    # Only the slice-like builtin ids (the raw view UnsafeSlice, the heap
+    # vector Array/Vec — and Vec) yield their element; the
     # Option/Result/Map/Set/Box/Rc Adt forms keep their identity. Other Adt
     # types keep the pre-existing arg-based fallback.
     if tid.id == env.lang_items.slice || tid.id == env.lang_items.array || tid.id == env.lang_items.vec then
@@ -6783,21 +7220,65 @@ def pre_register_type_name(inout env: TypeEnv, item: Item, module_path: Vec[Stri
       env.type_list.push(td)
     end
   when ItemKind::ItemEffectDecl(e) then
- # (EffectId domain): an `effect Name` DECLARATION interns the
+    # (EffectId domain): an `effect Name` DECLARATION interns the
     # declared effect under the current module's qualified key ("path::name"
     # — the root module's effects under the bare name), so the effect has
     # a semantic EffectId (module-qualified user effects never collide
     # across modules) and the canonical type identity renders the
     # canonical ordered effect-ID set. A builtin name resolves to its
-    # fixed id.
+    # fixed id. The typed op-signature registration lives in check_item
+    # (pass 4) where every referenced type resolves.
     let _ = intern_module_effect(&mut env.effects, &env.current_module_path, &e.name)
   when _ then ()
   end
 end
 
+# The supported-maximum alignment bound for @align(N) — the semantic
+# alignment-overflow check. N is already a power of two when it reaches the
+# checker (the parser validates the shape); this bound rejects an alignment
+# whose size arithmetic or runtime placement the platform discipline cannot
+# honor (the allocator contract tops out at 16, the stack slots at 16; a
+# larger N would silently degrade every placement). Fail closed: an
+# over-aligned declaration is an error, never a silent 1.
+def layout_align_max() -> Int = 65536
+
+# The semantic layout-attribute validation (the typed re-check): the
+# parser guarantees the SHAPE (power-of-two N, the exclusivity rules); the
+# checker re-validates the recorded attributes fail-closed (a program the
+# parser never saw cannot bypass the rules) and adds the semantic bound —
+# the ALIGNMENT-OVERFLOW check: N above layout_align_max is rejected (an
+# alignment the layout arithmetic / runtime placement cannot honor would
+# silently mis-place every field). Every violation records a TypeError at
+# the attribute's span.
+def validate_layout_attrs(inout env: TypeEnv, attrs: LayoutAttrs) -> Unit
+  if attrs.is_repr_c && attrs.is_packed then
+    type_add_error(env, "@repr(C) and @packed are mutually exclusive (a declaration may carry at most one layout strategy)", attrs.span)
+  end
+  if attrs.is_packed then
+    match attrs.align
+    when Option::Some(_) then
+      type_add_error(env, "@packed and @align(N) are mutually exclusive (@packed fixes the alignment to 1)", attrs.span)
+    when Option::None then ()
+    end
+  end
+  match attrs.align
+  when Option::Some(n) then
+    if n <= 0 || !is_power_of_two_int(n) then
+      type_add_error(env, "@align(N) requires N to be a power of two", attrs.span)
+    elsif n > layout_align_max() then
+      type_add_error(env, "@align(" + n.to_string() + ") exceeds the supported maximum alignment " + layout_align_max().to_string() + " — alignment overflow (fail closed, never a silent degrade)", attrs.span)
+    end
+  when Option::None then ()
+  end
+end
+
+def is_power_of_two_int(n: Int) -> Bool
+  n > 0 && (n & (n - 1)) == 0
+end
+
 def collect_enum_type_def(inout env: TypeEnv, e: EnumDecl, module_path: Vec[String]) -> Unit
   push_scope(env)
- # the enum interns its generic parameters in declaration order
+  # the enum interns its generic parameters in declaration order
   # under its DefKind::TypeName DefId (type_decl_owner_def); the variant
   # payload types reference the interned ids.
   let owner = type_decl_owner_def(env, &e.name, module_path)
@@ -6847,6 +7328,11 @@ def collect_enum_type_def(inout env: TypeEnv, e: EnumDecl, module_path: Vec[Stri
   # field/variant-derived mutation here (concrete ownership is computed by
   # the TypeProperties engine keyed by (TypeId, substitutions) — see
   # type_properties_of / type_named_props).
+
+  # The layout attributes: semantically validated and recorded under the
+  # semantic TypeId (the typed table — type_layout_attrs — the MIR reads).
+  validate_layout_attrs(&mut env, &e.layout_attrs)
+  env.layout_attrs.insert(id.id, e.layout_attrs.clone())
 
   let td = TypeDef {
     id: id,
@@ -6918,6 +7404,12 @@ def collect_type_def(inout env: TypeEnv, item: Item, module_path: Vec[String]) -
     # INLINE pop_scope
     env.scopes.pop()
     env.local_ids.pop()
+
+    # The layout attributes: semantically validated and recorded under the
+    # semantic TypeId (the typed table — type_layout_attrs — the MIR
+    # reads; the record is the attribute authority end-to-end).
+    validate_layout_attrs(&mut env, &s.layout_attrs)
+    env.layout_attrs.insert(id.id, s.layout_attrs.clone())
 
     let td = TypeDef {
       id: id,
@@ -7177,6 +7669,25 @@ def check_item(inout env: TypeEnv, program: Program, item: Item, item_idx: Int) 
     # pass 3 (item_owner_def) — check_function reconstructs the same ids
     # from (owner, declaration index).
     let f_owner = item_owner_def(env, item_idx)
+    # The WCET validity (the hard rules): the @[wcet_us(N)] bound vs the
+    # body's static worst-case cost — an over-bound body is rejected.
+    match parse_real_time_bound(item.attrs)
+    when Option::Some(bound) then
+      env.wcet_bounds.insert(f.name.clone(), bound)
+      match f.body
+      when FnBody::FnBlock(b) then
+        let estimated = wcet_cost_stmts(&env, &b.stmts)
+        if estimated > bound then
+          env.errors.push(TypeError {
+            code: Option::Some("E0215".to_string()),
+            message: "wcet bound exceeded: estimated worst-case cost " + estimated.to_string() + " exceeds the declared bound " + bound.to_string(),
+            span: f.span,
+          })
+        end
+      when _ then ()
+      end
+    when Option::None then ()
+    end
     check_function(env, f, owner_key, &f_owner)
   when ItemKind::ItemImpl(i) then
     if fn_keys.len() == i.methods.len() then
@@ -7247,6 +7758,53 @@ def check_item(inout env: TypeEnv, program: Program, item: Item, item_idx: Int) 
     let value_ty = check_expr(env, &s.value)
     unify(env, value_ty, static_ty, s.span)
     pop_scope(env)
+  when ItemKind::ItemEffectDecl(e) then
+    # The algebraic-effects typed registration (pass 4 — every referenced
+    # type resolves here): intern the semantic EffectId (idempotent — the
+    # pre-registration pass already interned it), resolve each op's
+    # parameter/return types into the typed op table, and index the
+    # qualified name so the perform surface's EFFECT.op references resolve.
+    # The op index is the declaration-order identity the perform/handler
+    # lowering and the runtime dispatch share.
+    let eid = intern_module_effect(&mut env.effects, &env.current_module_path, &e.name)
+    var typed_ops = Vec::new()
+    var op_i = 0
+    while op_i < e.ops.len() do
+      var op_params = Vec::new()
+      var par_i = 0
+      while par_i < e.ops[op_i].params.len() do
+        let p_ty = resolve_type_expr(env, &e.ops[op_i].params[par_i].ty)
+        # The bounded row's Copy gate: an operation's payload crosses the
+        # perform boundary as a plain value tuple through the runtime's
+        # untyped frame — resource ownership never crosses it.
+        if !is_trivially_copyable(env, &p_ty) then
+          type_add_error(env, "effect operation parameter `" + e.ops[op_i].params[par_i].name + "` of `" + e.name + "::" + e.ops[op_i].name + "` must be a Copy type (the bounded algebraic-effects row moves the op payload as a plain value tuple; resource ownership does not cross the perform boundary)", e.ops[op_i].span)
+        end
+        op_params.push(p_ty)
+        par_i = par_i + 1
+      end
+      var op_ret = Type::Unit
+      match e.ops[op_i].ret
+      when Option::Some(ret_te) then op_ret = resolve_type_expr(env, &ret_te)
+      when Option::None then ()
+      end
+      if !is_trivially_copyable(env, &op_ret) then
+        type_add_error(env, "effect operation `" + e.name + "::" + e.ops[op_i].name + "` must return a Copy type (the bounded algebraic-effects row returns the op result through the runtime's untyped result slot)", e.ops[op_i].span)
+      end
+      typed_ops.push(TypedEffectOp {
+        name: e.ops[op_i].name.clone(),
+        params: op_params,
+        ret: op_ret
+      })
+      op_i = op_i + 1
+    end
+    env.typed_effects.insert(eid.id, TypedEffectDecl {
+      id: eid.clone(),
+      name: e.name.clone(),
+      ops: typed_ops
+    })
+    let qkey = if env.current_module_path.is_empty() then e.name.clone() else env.current_module_path.join("::") + "::" + e.name.clone() end
+    env.effect_name_index.insert(qkey, eid.id)
   when _ then ()
   end
 end
@@ -7652,14 +8210,16 @@ def record_where_predicate_bounds(inout env: TypeEnv, where_clause: Vec[WherePre
 end
 
 # ———————————————————————————————————————————————————————————————
-# SLICE SAFETY — the shared/pinned safe views + the RAW view's
-# unsafe/FFI-only escape enforcement (the P0-SL rules)
+# SLICE SAFETY — ONE REPRESENTATION, ONE SEMANTIC AUTHORITY (P0 — the
+# safe-view closure): the SOURCE-spelled Slice/StrView ARE the shared/
+# pinned forms; the raw {ptr,len} view is ONLY the explicit UnsafeSlice
+# (unsafe/FFI-only).
 # ———————————————————————————————————————————————————————————————
-# THE SAFE VIEW MODEL (reviewer's shared/pinned backing — the safe-view
+# THE ONE AUTHORITY (the reviewer's shared/pinned backing — the safe-view
 # model; std contract in std/collections.tg / std/core.tg):
-#   - The SAFE Slice is the SHARED/PINNED form — the std-declared
-#     SharedSlice[T] { inner: Arc[SliceBacking[T]] } (the Arc-class
-#     {ptr,len}: the backing = the pinned buffer + the window's
+#   - The SOURCE-spelled Slice[T] IS the SHARED/PINNED form — the
+#     std-declared `Slice[T] { inner: Arc[SliceBacking[T]] }` (the
+#     Arc-class {ptr,len}: the backing = the pinned buffer + the window's
 #     offset/len). The Arc keeps the pinned backing alive — the view
 #     SURVIVES the original owner's drop and the owner's capacity-changing
 #     mutations (the backing is the separate pinned allocation). The safe
@@ -7667,19 +8227,18 @@ end
 #     The shared forms are ordinary OWNING values: the resource checker
 #     tracks them like any Arc-backed value (owns_state=true,
 #     requires_drop_glue via the Arc's Drop) — NO escape tracking, no
-#     access-scoping, no lifetime inference. They can be returned, stored
-#     in fields/containers/statics, and captured.
-#   - The RAW view is the compiler's Slice BUILTIN — the 16-byte borrowed
-#     { ptr: Ptr[T], len: UInt } fat value, source-spelled UnsafeSlice[T]
-#     (the registered name stays "Slice" for the name-based layout/MIR
-#     matching). It is the UNSAFE/FFI-ONLY form: safe code cannot produce
-#     it (the opaque builtin has no constructor; no safe API returns it in
-#     an escaping position). The ONLY raw views safe code ever sees are
-#     the compiler-scoped LOOP-CONSUMED iterable forms (chars/bytes/split/
-#     iter/keys/values — builtin method results consumed by the enclosing
-#     for-loop) and the compiler-manufactured literal coercion behind
-#     vec!, and the checker keeps them access-scoped / non-escapable at
-#     the four escape channels:
+#     access-scoping, no lifetime inference, NO "eventual mechanism". They
+#     can be returned, stored in fields/containers/statics, and captured.
+#   - The RAW view is the "UnsafeSlice" BUILTIN (the LangItems slice id) —
+#     the 16-byte borrowed { ptr: Ptr[T], len: UInt } fat value
+#     (slice_view_layout). It is the UNSAFE/FFI-ONLY form: safe code cannot
+#     produce it (the opaque builtin has no constructor; no safe API
+#     returns it in an escaping position). The ONLY raw views safe code
+#     ever sees are the compiler-scoped LOOP-CONSUMED iterable forms
+#     (chars/bytes/split/iter/keys/values — builtin method results consumed
+#     by the enclosing for-loop) and the compiler-manufactured literal
+#     coercion behind vec!, and the checker keeps them access-scoped /
+#     non-escapable at the four escape channels:
 #   (a) RETURN   — a raw-view-typed value must not be returned from a
 #                  function: the declared return type is checked at every
 #                  callable declaration (free functions, impl/struct
@@ -7702,7 +8261,7 @@ end
 # Vec results; Vec::as_slice / String::as_str_view return the SHARED
 # (pinned-backing) forms; for-loop iterables are consumed by the loop.
 # The containment walk is the single type_contains_slice_view predicate —
-# the raw Slice BUILTIN (LangItems id) in any stored position (Adt
+# the raw UnsafeSlice BUILTIN (LangItems id) in any stored position (Adt
 # arguments, tuples, fixed arrays, references, effects). Type::Param /
 # Type::Var fail OPEN (false): a generic instantiation is checked at the
 # concrete use sites.
@@ -7716,12 +8275,13 @@ end
 # The SAFE SHARED/PINNED view forms (the std-declared Arc-class views) —
 # the resource checker's live-view registry must NEVER treat them as raw
 # views: the backing owns, so they need no escape tracking. Selected by
-# the std type names (SharedSlice / StrView — the std-declared Adt names).
+# the std type names (Slice / StrView — the std-declared Adt names; the
+# source-spelled "Slice" IS the shared form).
 pub def is_shared_view_type_of(env: TypeEnv, ty: Type) -> Bool
   match ty
   when Type::Adt(tid, _) then
     match get_type_by_id_ref(env, tid)
-    when Option::Some(td) then td.name == "SharedSlice" || td.name == "StrView"
+    when Option::Some(td) then td.name == "Slice" || td.name == "StrView"
     when Option::None then false
     end
   when _ then false
@@ -7760,11 +8320,125 @@ end
 # reject a type that holds the RAW Slice view in stored / longer-lived
 # state at the channel's declaration site. `what` renders the channel in
 # the diagnostic ("returned from a function", "stored in a struct field",
-#...). The SAFE shared/pinned forms (SharedSlice/StrView — the Arc-backed
+#...). The SAFE shared/pinned forms (Slice/StrView — the Arc-backed
 # views) are ordinary owning values and never reach this rejection.
 def check_no_escaping_slice(inout env: TypeEnv, ty: Type, span: Span, what: String) -> Unit
   if type_contains_slice_view(env, ty) then
     type_add_error(env, "the raw Slice view (UnsafeSlice[T]) cannot be " + what + ": the raw {ptr,len} view is unsafe/FFI-only and must not outlive its backing buffer (use the shared/pinned form: Vec::as_slice / String::as_str_view — the Arc-backed Slice/StrView)", span)
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# The WCET analyzer: the @[wcet_us(N)] annotation's bound is parsed and
+# validated (a positive integer), the function body's static worst-case
+# cost is estimated with the operation cost model (the simple ops 1, the
+# calls the callee's declared bound or the default 20, the blocks the
+# sum, the ifs the max arm, the loops the body * the loop factor), and
+# an over-bound body is REJECTED with the hard validity error — "actual
+# analyzer and hard validity rules", never a silent pass.
+# ———————————————————————————————————————————————————————————————
+
+# The wcet_us attribute's bound, or None (no annotation).
+def parse_real_time_bound(attrs: Vec[Attribute]) -> Option[Int]
+  match attribute_named(attrs, "wcet_us")
+  when Option::Some(attr) then
+    if attr.args.len() >= 1 then
+      let bound = wcet_arg_int(&attr.args[0])
+      if bound > 0 then
+        Option::Some(bound)
+      else
+        Option::None
+      end
+    else
+      Option::None
+    end
+  when Option::None then Option::None
+  end
+end
+
+def wcet_arg_int(s: &String) -> Int
+  var acc = 0
+  for ch in s.chars() do
+    if ch >= '0' && ch <= '9' then
+      acc = acc * 10 + (ch as Int - '0' as Int)
+    end
+  end
+  acc
+end
+
+# The static worst-case cost of a statement list (the bounded model).
+def wcet_cost_stmts(env: &TypeEnv, stmts: Vec<Stmt>) -> Int
+  var total = 0
+  for st in stmts do
+    total = total + wcet_cost_stmt(env, &st)
+  end
+  total
+end
+
+def wcet_cost_stmt(env: &TypeEnv, st: &Stmt) -> Int
+  match st.kind
+  when StmtKind::StmtLet(ls) then
+    match ls.value
+    when Option::Some(v) then wcet_cost_expr(env, &v) + 1
+    when Option::None then 1
+    end
+  when StmtKind::StmtAssign(_, e) then wcet_cost_expr(env, &e) + 1
+  when StmtKind::StmtExpr(e) then wcet_cost_expr(env, &e)
+  when StmtKind::StmtIf(if_stmt) then
+    let cond_cost = wcet_cost_expr(env, &if_stmt.cond)
+    let then_cost = wcet_cost_stmts(env, &if_stmt.then_branch.stmts)
+    let else_cost = match if_stmt.else_branch
+    when Option::Some(b) then wcet_cost_stmts(env, &b.stmts)
+    when Option::None then 0
+    end
+    cond_cost + (if then_cost > else_cost then then_cost else else_cost end) + 1
+  when StmtKind::StmtMatch(m) then wcet_cost_expr(env, &m.scrutinee) + 1
+  when StmtKind::StmtWhile(cond, body) then (wcet_cost_expr(env, &cond) + wcet_cost_stmts(env, &body.stmts)) * 10
+  when StmtKind::StmtFor(fs) then wcet_cost_stmts(env, &fs.body.stmts) * 10 + 2
+  when StmtKind::StmtLoop(b) then wcet_cost_stmts(env, &b.stmts) * 10
+  when StmtKind::StmtReturn(e) then
+    match e
+    when Option::Some(v) then wcet_cost_expr(env, &v)
+    when Option::None then 1
+    end
+  when StmtKind::StmtDefer(_) then 1
+  when _ then 1
+  end
+end
+
+def wcet_cost_expr(env: &TypeEnv, e: &Expr) -> Int
+  match e.kind
+  when ExprKind::ExprIntLit(_) | ExprKind::ExprFloatLit(_) | ExprKind::ExprCharLit(_) then 1
+  when ExprKind::ExprStringLit(_) then 1
+  when ExprKind::ExprBoolLit(_) then 1
+  when ExprKind::ExprIdent(_) | ExprKind::ExprPath(_) then 1
+  when ExprKind::ExprUnary(_, inner) then wcet_cost_expr(env, &inner) + 1
+  when ExprKind::ExprBinary(_, a, b) then wcet_cost_expr(env, &a) + wcet_cost_expr(env, &b) + 1
+  when ExprKind::ExprIndex(base, idx) then wcet_cost_expr(env, &base) + wcet_cost_expr(env, &idx) + 1
+  when ExprKind::ExprField(base, _) then wcet_cost_expr(env, &base) + 1
+  when ExprKind::ExprCall(callee, args) then
+    var total = wcet_cost_expr(env, &callee)
+    for a in args do
+      total = total + wcet_cost_expr(env, &a)
+    end
+    # the callee's declared bound when available (the transitive cost),
+    # else the default 20.
+    match callee.kind
+    when ExprKind::ExprPath(p) then
+      if p.len() > 0 then
+        let callee_name = p[p.len() - 1].clone()
+        match env.wcet_bounds.get(&callee_name)
+        when Option::Some(b) then total + b
+        when Option::None then total + 20
+        end
+      else
+        total + 20
+      end
+    when _ then total + 20
+    end
+  when ExprKind::ExprBlock(b) then wcet_cost_stmts(env, &b.stmts)
+  when ExprKind::ExprIf(if_e) then wcet_cost_expr(env, &if_e.cond) + 1
+  when _ then 2
   end
 end
 
@@ -7828,7 +8502,8 @@ def check_function(inout env: TypeEnv, f: FunctionDecl, owner_key: String, f_own
   end
  # (channel a): a RAW Slice view (UnsafeSlice) must not be RETURNED from
   # a function — the declared return type is rejected when it is (or
-  # contains) the raw view (the shared/pinned Slice — SharedSlice — is an
+  # contains) the raw view (the shared/pinned source-spelled Slice — the
+  # std-declared shared struct — is an
   # ordinary owning value and passes freely).
   check_no_escaping_slice(env, &ret_type, f.span, "returned from a function")
  # record the function's typed signature under the SAME owner key (the
@@ -8686,7 +9361,8 @@ def check_impl(inout env: TypeEnv, i: ImplDecl, method_keys: Vec[String]) -> Uni
     end
  # (channel a): a RAW Slice view (UnsafeSlice) must not be RETURNED from
     # a method — the declared return type is rejected when it is (or
-    # contains) the raw view (the shared/pinned Slice — SharedSlice — is
+    # contains) the raw view (the shared/pinned source-spelled Slice — the
+    # std-declared shared struct — is
     # an ordinary owning value and passes freely).
     check_no_escaping_slice(env, &ret_type, m.span, "returned from a function")
 
@@ -8866,7 +9542,7 @@ def check_stmt(inout env: TypeEnv, stmt: Stmt) -> FlowResult
         else
           match get_type_by_id_ref(env, tid)
           when Option::Some(td) then
-            type_add_error(env, "cannot iterate `" + td.name + "`: for loops require Slice, Array, String, Vec or Map", for_stmt.span)
+            type_add_error(env, "cannot iterate `" + td.name + "`: for loops require Array, Vec, String, Map, Set or the raw-view iterable forms (UnsafeSlice)", for_stmt.span)
           when Option::None then
             type_add_error(env, "cannot iterate unresolved container type", for_stmt.span)
           end
@@ -9007,14 +9683,169 @@ def check_stmt(inout env: TypeEnv, stmt: Stmt) -> FlowResult
       may_continue: g_may_continue,
       may_throw: false
     }
-  when StmtKind::StmtHandleWith(_, _) then
- # effect-handler blocks (`handle... with...`) are an
-    # exceptional control-flow form — a handler edge with cleanup. No
-    # exception runtime exists in the backend and the resource CFG has no
-    # Handler edges, so the form is REJECTED here, at the type checker,
-    # before the resource checker or MIR ever see it.
-    type_add_error(env, "exceptions are not supported — no throwing path may bypass teardown: handle/with is rejected", stmt.span)
-    flow_normal(Type::Error)
+  when StmtKind::StmtHandleWith(expr, handlers) then
+    # The effect-handler block (the algebraic-effects row): `handle EXPR
+    # with EFF { op(params) => body ... }` — the handler's effect resolves
+    # to its semantic EffectId and the arms are typed against the declared
+    # op signatures (an unknown effect or op is an error; the arm's params
+    # bind the op's parameter types and the arm body's value unifies with
+    # the op's return type). The handled expression is checked normally.
+    # The bounded row's control-flow rule: return/break/continue/defer are
+    # rejected inside arm bodies — the arms run in the handler's dispatcher
+    # function, not the enclosing frame (a return/break/continue would
+    # need the enclosing CFG edges; a defer would register against the
+    # enclosing scope's teardown plan that never runs on the dispatcher
+    # path).
+    var typed_handlers = Vec::new()
+    var handler_cap_records = Vec::new()
+    var h_idx = 0
+    var handlers_ok = true
+    while h_idx < handlers.len() do
+      let handler = handlers[h_idx]
+      match typed_effect_of_name(env, &handler.effect_name)
+      when Option::Some(td) then
+        var typed_arms = Vec::new()
+        var arm_caps: Vec[Map[Int, AccessEffect]] = Vec::new()
+        var a_idx = 0
+        var arms_ok = true
+        while a_idx < handler.arms.len() do
+          let arm = handler.arms[a_idx]
+          let op_index = typed_effect_op_index(&td, &arm.operation)
+          if op_index < 0 then
+            type_add_error(env, "effect `" + handler.effect_name + "` has no operation `" + arm.operation + "`", arm.span)
+            arms_ok = false
+          else
+            let op_sig = td.ops[op_index]
+            push_scope(env)
+            # The arm's parameter patterns bind the op's parameter types
+            # (the binding source is the op's payload — unknown at the
+            # handler definition, RawUnknown, exactly like a closure
+            # parameter).
+            var pi = 0
+            while pi < arm.params.len() && pi < op_sig.params.len() do
+              let p_ty = op_sig.params[pi].clone()
+              resolve_pattern_variants(env, &arm.params[pi], p_ty.clone())
+              check_pattern(env, &arm.params[pi], p_ty, TypedPlace { root: AccessRoot::RawUnknown, root_name: "effect operation parameter", projections: Vec::new() })
+              pi = pi + 1
+            end
+            while pi < arm.params.len() do
+              let p_ty = fresh_type_var(env)
+              resolve_pattern_variants(env, &arm.params[pi], p_ty.clone())
+              check_pattern(env, &arm.params[pi], p_ty, TypedPlace { root: AccessRoot::RawUnknown, root_name: "effect operation parameter", projections: Vec::new() })
+              pi = pi + 1
+            end
+            # The arm body: a value block unifying with the op's return
+            # type.
+            if effect_arm_body_has_control_flow(&arm.body) then
+              type_add_error(env, "return/break/continue/defer are not supported inside an effect-handler arm (the arm runs in the handler's dispatcher frame, not the enclosing function)", arm.span)
+            end
+            let arm_flow = check_block(env, &arm.body, true)
+            unify(env, arm_flow.normal.clone(), op_sig.ret.clone(), arm.span)
+            pop_scope(env)
+            # The arm's capture scan (the semantic record the MIR's
+            # handler-env construction reads): the arm's params are bound;
+            # every other local the body references is a capture.
+            var scan = CaptureScan { bound: Vec::new(), uses: Map::new(), nodes: Map::new() }
+            var sp = 0
+            while sp < arm.params.len() do
+              scan_pattern_bind(env, &mut scan, &arm.params[sp])
+              sp = sp + 1
+            end
+            scan_block(env, &mut scan, &arm.body)
+            arm_caps.push(scan.uses)
+            typed_arms.push(TypedHandlerArm {
+              op_index: op_index,
+              ret_type: op_sig.ret.clone(),
+              params: typed_patterns_of(env, &arm.params).unwrap_or(Vec::new()),
+              body: typed_stmts_of(env, &arm.body)
+            })
+          end
+          a_idx = a_idx + 1
+        end
+        # The handler's capture record: the union of its arms' capture
+        # sets (the handler env is one tuple over the union). The bounded
+        # row's capture gate: owning (resource) values never cross into
+        # the handler env — only non-owning captures are supported (the
+        # env is a plain value tuple with no per-env finalization).
+        var handler_caps: Map[Int, AccessEffect] = Map::new()
+        var ci = 0
+        while ci < arm_caps.len() do
+          let cap_entries = arm_caps[ci].entries()
+          var cei = 0
+          while cei < cap_entries.len() do
+            match handler_caps.get(cap_entries[cei].0)
+            when Option::Some(cur) then
+              if capture_effect_strength(cap_entries[cei].1) > capture_effect_strength(cur) then
+                handler_caps.insert(cap_entries[cei].0, cap_entries[cei].1)
+              end
+            when Option::None then
+              handler_caps.insert(cap_entries[cei].0, cap_entries[cei].1)
+            end
+            cei = cei + 1
+          end
+          ci = ci + 1
+        end
+        let cap_entries2 = handler_caps.entries()
+        var cei2 = 0
+        while cei2 < cap_entries2.len() do
+          match env.typed_local_bindings.get(cap_entries2[cei2].0)
+          when Option::Some(lb) then
+            match type_properties_of(env, &lb.ty)
+            when TypeProperties { owns_state: true, .. } then
+              type_add_error(env, "cannot capture `" + lb.name + "` into an effect handler: the bounded handler env is a plain value tuple and resource ownership never crosses the perform boundary (capture a Copy value instead)", handler.span)
+            when _ then ()
+            end
+          when Option::None then ()
+          end
+          cei2 = cei2 + 1
+        end
+        if arms_ok then
+          typed_handlers.push(TypedHandler {
+            effect: td.id.clone(),
+            name: handler.effect_name.clone(),
+            arms: typed_arms
+          })
+          handler_cap_records.push(handler_caps)
+        else
+          handlers_ok = false
+        end
+      when Option::None then
+        type_add_error(env, "unknown effect `" + handler.effect_name + "` in the handle/with block (no `effect " + handler.effect_name + "` declaration is in scope)", handler.span)
+        handlers_ok = false
+        handler_cap_records.push(Map::new())
+      end
+      h_idx = h_idx + 1
+    end
+    # The neutralization scope: every handler's effect is neutralized for
+    # the handled expression (a perform inside the block is caught by the
+    # innermost matching handler — the enclosing function declares only the
+    # effects it does NOT handle).
+    var hsi = 0
+    if handlers_ok then
+      while hsi < typed_handlers.len() do
+        env.handler_stack.push(typed_handlers[hsi].effect.id)
+        hsi = hsi + 1
+      end
+    end
+    let body_flow2 = check_expr(env, &expr)
+    hsi = 0
+    if handlers_ok then
+      while hsi < typed_handlers.len() do
+        env.handler_stack.pop()
+        hsi = hsi + 1
+      end
+    end
+    if handlers_ok then
+      env.typed_effect_handlers.insert(stmt.node_id, typed_handlers)
+      env.handler_captures.insert(stmt.node_id, handler_cap_records)
+    end
+    FlowResult {
+      normal: body_flow2.clone(),
+      may_return: false,
+      may_break: false,
+      may_continue: false,
+      may_throw: false
+    }
   when StmtKind::StmtWith(_, _, _) then
  # (g): unsupported feature — an explicit diagnostic, never a silent
     # Unit fallback (MIR has no with lowering).
@@ -10339,7 +11170,175 @@ def method_def_for(env: TypeEnv, recv_type: Type, method: String) -> Option[DefI
 end
 
 # ———————————————————————————————————————————————————————————————
-# the SEMANTIC INTRINSIC ROUTER (IntrinsicId at check time)
+# The SIMD INTRINSIC SUB-DOMAIN — the vector operations of the
+# IntrinsicId domain
+# ———————————————————————————————————————————————————————————————
+# The SIMD intrinsics (the `__intrinsic_simd_<op>_<lane>` family —
+# std/simd.tg's vector surface) are a NAME-ROUTED sub-domain of the
+# semantic IntrinsicId classification: the KIND enum below names the
+# machine operation the name denotes (the same role IntrinsicId plays for
+# the scalar intrinsics), and the router (simd_intrinsic_kind_of) is the
+# ONE name -> kind classification. The checker's call-recording and
+# codegen's dispatch both read this sub-domain; the IntrinsicId carried in
+# typed_intrinsics for a SIMD name is the FormatterNoOp marker (a
+# classified-but-inlined-elsewhere id — the SIMD arms inline their own
+# machine emission and never reach the IntrinsicId dispatch).
+#
+# The supported operation subset (the codegen arms — NEON + SSE/AVX):
+#   add / sub / mul / and / or / xor / load / store / shuffle
+# per lane width (the lane spelling in the name: f32x4, f64x2, i8x16,
+# i16x8, i32x4, i64x2, f32x8, i32x8, f64x4, i64x4, i16x16, i8x32 and the
+# 512-bit Vec16 forms f32x16/i32x16/f64x8/i64x8/i16x32/i8x64). An
+# operation the current arms do not lower (per the documented supported
+# subset — e.g. the 512-bit arithmetic, the i64 lane multiply) fails
+# closed at codegen, never a silent scalar fallback.
+
+enum SimdIntrinsicKind
+  SimdAdd
+  SimdSub
+  SimdMul
+  SimdAnd
+  SimdOr
+  SimdXor
+  SimdLoad
+  SimdStore
+  SimdShuffle
+end
+
+# The SIMD lane shapes — the lane spelling parsed from the intrinsic
+# name's trailing `_<lane>` segment.
+enum SimdLane
+  F32x4
+  F64x2
+  I8x16
+  I16x8
+  I32x4
+  I64x2
+  F32x8
+  I32x8
+  F64x4
+  I64x4
+  I16x16
+  I8x32
+  F32x16
+  I32x16
+  F64x8
+  I64x8
+  I16x32
+  I8x64
+end
+
+# The vector width of a lane shape (128/256/512 bits).
+def simd_lane_width(lane: SimdLane) -> Int
+  match lane
+  when F32x4 | F64x2 | I8x16 | I16x8 | I32x4 | I64x2 then 128
+  when F32x8 | I32x8 | F64x4 | I64x4 | I16x16 | I8x32 then 256
+  when F32x16 | I32x16 | F64x8 | I64x8 | I16x32 | I8x64 then 512
+  end
+end
+
+# The lane element width in bytes (1/2/4/8).
+def simd_lane_elem_size(lane: SimdLane) -> Int
+  match lane
+  when I8x16 | I8x32 | I8x64 then 1
+  when I16x8 | I16x16 | I16x32 then 2
+  when F32x4 | I32x4 | F32x8 | I32x8 | F32x16 | I32x16 then 4
+  when F64x2 | I64x2 | F64x4 | I64x4 | F64x8 | I64x8 then 8
+  end
+end
+
+# The lane count of a lane shape.
+def simd_lane_count(lane: SimdLane) -> Int
+  simd_lane_width(lane) / (simd_lane_elem_size(lane) * 8)
+end
+
+# Whether the lane shape is a floating-point lane.
+def simd_lane_is_float(lane: SimdLane) -> Bool
+  match lane
+  when F32x4 | F64x2 | F32x8 | F64x4 | F32x16 | F64x8 then true
+  when _ then false
+  end
+end
+
+# Parse the `_<lane>` spelling ("f32x4", "i64x2", ...) into the lane
+# shape; Option::None for an unknown spelling.
+def parse_simd_lane(s: String) -> Option[SimdLane]
+  if s == "f32x4" then Option::Some(SimdLane::F32x4)
+  elsif s == "f64x2" then Option::Some(SimdLane::F64x2)
+  elsif s == "i8x16" then Option::Some(SimdLane::I8x16)
+  elsif s == "i16x8" then Option::Some(SimdLane::I16x8)
+  elsif s == "i32x4" then Option::Some(SimdLane::I32x4)
+  elsif s == "i64x2" then Option::Some(SimdLane::I64x2)
+  elsif s == "f32x8" then Option::Some(SimdLane::F32x8)
+  elsif s == "i32x8" then Option::Some(SimdLane::I32x8)
+  elsif s == "f64x4" then Option::Some(SimdLane::F64x4)
+  elsif s == "i64x4" then Option::Some(SimdLane::I64x4)
+  elsif s == "i16x16" then Option::Some(SimdLane::I16x16)
+  elsif s == "i8x32" then Option::Some(SimdLane::I8x32)
+  elsif s == "f32x16" then Option::Some(SimdLane::F32x16)
+  elsif s == "i32x16" then Option::Some(SimdLane::I32x16)
+  elsif s == "f64x8" then Option::Some(SimdLane::F64x8)
+  elsif s == "i64x8" then Option::Some(SimdLane::I64x8)
+  elsif s == "i16x32" then Option::Some(SimdLane::I16x32)
+  elsif s == "i8x64" then Option::Some(SimdLane::I8x64)
+  else Option::None
+  end
+end
+
+# The SIMD intrinsic name test: a name is a SIMD intrinsic exactly when
+# its `simd_<op>_<lane>` shape classifies. The __intrinsic_ prefix is
+# stripped first (the checker routes the full prefixed spelling; codegen
+# routes the bare spelling).
+def simd_intrinsic_kind_of(name: String) -> Option[SimdIntrinsicKind]
+  var bare = name.clone()
+  if bare.len() >= 12 && bare.slice(0, 12) == "__intrinsic_" then
+    bare = bare.slice(12, bare.len())
+  end
+  if !bare.starts_with("simd_") then return Option::None end
+  let rest = bare.slice(5, bare.len())
+  # <op>_<lane>: split at the LAST underscore (the lane spelling has no
+  # underscores).
+  match rest.rfind("_")
+  when Option::Some(pos) then
+    let op = rest.slice(0, pos)
+    let lane_s = rest.slice(pos + 1, rest.len())
+    match parse_simd_lane(lane_s)
+    when Option::Some(_) then ()
+    when Option::None then return Option::None
+    end
+    match op
+    when "add" then Option::Some(SimdIntrinsicKind::SimdAdd)
+    when "sub" then Option::Some(SimdIntrinsicKind::SimdSub)
+    when "mul" then Option::Some(SimdIntrinsicKind::SimdMul)
+    when "and" then Option::Some(SimdIntrinsicKind::SimdAnd)
+    when "or" then Option::Some(SimdIntrinsicKind::SimdOr)
+    when "xor" then Option::Some(SimdIntrinsicKind::SimdXor)
+    when "load" then Option::Some(SimdIntrinsicKind::SimdLoad)
+    when "store" then Option::Some(SimdIntrinsicKind::SimdStore)
+    when "shuffle" then Option::Some(SimdIntrinsicKind::SimdShuffle)
+    when _ then Option::None
+    end
+  when Option::None then Option::None
+  end
+end
+
+# The lane shape of a classified SIMD intrinsic name (None for a
+# non-SIMD name — the caller must have classified it first).
+def simd_intrinsic_lane_of(name: String) -> Option[SimdLane]
+  var bare = name.clone()
+  if bare.len() >= 12 && bare.slice(0, 12) == "__intrinsic_" then
+    bare = bare.slice(12, bare.len())
+  end
+  if !bare.starts_with("simd_") then return Option::None end
+  let rest = bare.slice(5, bare.len())
+  match rest.rfind("_")
+  when Option::Some(pos) then parse_simd_lane(rest.slice(pos + 1, rest.len()))
+  when Option::None then Option::None
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# The SEMANTIC INTRINSIC ROUTER (IntrinsicId at check time)
 # ———————————————————————————————————————————————————————————————
 # The ONE name -> IntrinsicId classification (moved out of codegen.tg —
 # the frontend attaches the semantic IntrinsicId at call-recording time;
@@ -10372,9 +11371,9 @@ end
 
 # The receiver-side collection test for the collection-method
 # classification: the heap-vector Adt (the registered name "Array"), the
-# std Vec struct, and the raw Slice view (UnsafeSlice — the builtin).
+# std Vec struct, and the RAW view (UnsafeSlice — the builtin).
 def router_receiver_is_collection(receiver_named: String) -> Bool
-  receiver_named == "Array" || receiver_named == "Vec" || receiver_named == "Slice"
+  receiver_named == "Array" || receiver_named == "Vec" || receiver_named == "UnsafeSlice"
 end
 
 pub def intrinsic_id_of_call(
@@ -10392,6 +11391,19 @@ pub def intrinsic_id_of_call(
     orig_fn_name == "string_contains" ||
     orig_fn_name == "__intrinsic_string_contains" ||
     orig_fn_name == "str_contains"
+
+  # THE SIMD SUB-DOMAIN: a SIMD intrinsic name (__intrinsic_simd_<op>_<lane>
+  # or its bare simd_<op>_<lane> spelling) classifies through the SIMD
+  # router — the vector operations of the IntrinsicId domain. The
+  # classification is recorded so the call is NOT a phantom intrinsic; the
+  # codegen inlines the machine emission from the SIMD kind (the
+  # FormatterNoOp marker id is never dispatched to: the SIMD gate in
+  # codegen_intrinsic routes the name before the IntrinsicId match).
+  match simd_intrinsic_kind_of(&name)
+  when Option::Some(_) then
+    return Option::Some(IntrinsicId::FormatterNoOp)
+  when Option::None then ()
+  end
 
   # Type-directed aliases
   if name == "entries" then
@@ -11032,15 +12044,17 @@ def is_named_trivially_copyable(env: TypeEnv, tid: TypeId, args: Vec[Type], inou
     end
     # Heap-backed containers (including the registered Vec shape { ptr, len,
     # cap } — the Ptr field must NOT be walked): never bit-copyable. The
-    # LangItems TypeIds select the builtin containers. Slice is NOT in this
-    # class: Slice[T] is the two-field VIEW { ptr: Ptr[T], len: UInt } with
-    # owns=false (no drop, no allocation) — bit-copyable regardless of T.
+    # LangItems TypeIds select the builtin containers. The SAFE
+    # source-spelled Slice is NOT in this class: it is the std-declared
+    # shared struct (the Arc handle is never bit-copyable — the structural
+    # walk below decides through its ArcStrong field).
     if tid.id == env.lang_items.vec || tid.id == env.lang_items.array || tid.id == env.lang_items.map ||
        tid.id == env.lang_items.set then
       return false
     end
     # UnsafeSlice[T] — the RAW view (the reviewer's no-general-borrow model;
-    # safe Slice = the shared/pinned SharedSlice — the Arc-class form):
+    # the SAFE Slice = the shared/pinned std-declared Slice struct — the
+    # Arc-class form):
     # { ptr: Ptr[T], len: UInt }, owns=false, drop=none. Bit-copy is
     # structurally possible: the view holds a raw pointer (bit-copyable) and
     # a length; the element type's ownership lives in the owning container
@@ -11498,7 +12512,11 @@ pub def type_canon_render(ctx: TypeCanonCtx, ty: Type) -> Result[String, String]
       elsif tid.id == ctx.lang_set && args.len() >= 1 then
         Result::Ok("Set[" + canon_render_unwrap(ctx, &args[0]) + "]")
       elsif tid.id == ctx.lang_slice && args.len() >= 1 then
-        Result::Ok("Slice[" + canon_render_unwrap(ctx, &args[0]) + "]")
+        # The `slice` LangItems id IS the RAW view (UnsafeSlice) — the
+        # canonical semantic key renders its spelling. The SAFE
+        # source-spelled Slice (the std-declared shared struct) keys by
+        # its own TypeId ("Named#...").
+        Result::Ok("UnsafeSlice[" + canon_render_unwrap(ctx, &args[0]) + "]")
       elsif tid.id == ctx.lang_array && args.len() >= 1 then
         Result::Ok("Array[" + canon_render_unwrap(ctx, &args[0]) + "]")
       elsif tid.id == ctx.lang_box && args.len() >= 1 then
@@ -12495,7 +13513,8 @@ def type_named_props(inout env: TypeEnv, tid: TypeId, args: Vec[Type], inout vis
       # buffer). The element type's ownership lives in the backing buffer,
       # never in the view; nothing here walks the args (mirror of the
       # Ptr/StaticStrPtr classification). The SAFE shared/pinned form
-      # (SharedSlice/StrView — the Arc-class views) is NOT this arm: the
+      # (the source-spelled Slice / StrView — the Arc-class views) is NOT
+      # this arm: the
       # std-declared struct's Arc field owns, and the structural walk
       # applies.
       ()
@@ -12625,7 +13644,10 @@ def container_element_type(env: TypeEnv, ty: Type) -> Option[Type]
   match ty
   when Type::Adt(tid, args) then
     # The Adt form of the element-bearing builtin containers (LangItems
-    # ids): Map yields its value, Array/Vec/Slice their element.
+    # ids): Map yields its value, Array/Vec and the RAW view (UnsafeSlice)
+    # yield their element. (The SAFE source-spelled Slice is the
+    # std-declared shared struct — its element access is the compiled std
+    # get method, never this rule.)
     if tid.id == env.lang_items.map && args.len() >= 2 then Option::Some(args[1].clone())
     elsif (tid.id == env.lang_items.array || tid.id == env.lang_items.vec || tid.id == env.lang_items.slice) && args.len() >= 1 then Option::Some(args[0].clone())
     else Option::None
@@ -13825,6 +14847,13 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
   when ExprKind::ExprUnaryOp(op, inner) then
     check_unary_op(env, op, &inner, expr.span)
   when ExprKind::ExprCall(func, args) then
+    # The operation-call surface: a std::effects::perform(EFFECT.op, ...)
+    # call is typed against the declared effect's op table (the semantic
+    # EffectId-keyed records) — the payload args unify with the op's
+    # parameter types and the call's type is the op's return type.
+    match check_effect_perform_call(env, expr, &func, &args)
+    when Option::Some(perform_ty) then perform_ty
+    when Option::None then
     var func_type = check_expr(env, &func)
  # (FnPtr/Closure split): the call-shape analysis below keys on the
     # FnPtr signature form; a Closure callee NORMALIZES to it (the
@@ -14123,6 +15152,7 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
     else
       ret_type
     end
+    end
   when ExprKind::ExprMethodCall(recv, method, type_args, args) then
     env.access_marker_depth = env.access_marker_depth + 1
     let recv_type = check_expr(env, &recv)
@@ -14260,9 +15290,12 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
       unify(env, index_type, Type::Int, index.span)
       elem.clone()
     when Type::Adt(tid, args) then
-      # Map[K, V] indexing: key type K, result V. Array/Slice index like
-      # their element containers (element result, Int index); Set membership
-      # returns Bool. The LangItems TypeIds select the builtins.
+      # Map[K, V] indexing: key type K, result V. Array and the raw view
+      # (UnsafeSlice) index like their element containers (element result,
+      # Int index); Set membership
+      # returns Bool. The LangItems TypeIds select the builtins. The SAFE
+      # source-spelled Slice — the std-declared shared struct — indexes
+      # through the Arc deref into the pinned backing (the arm below).
       if tid.id == env.lang_items.map && args.len() >= 2 then
         if type_has_resource_kind(env, &args[1]) then
           type_add_error(env, "cannot extract resource element from shared container; use an inout/consuming access", expr.span)
@@ -14270,6 +15303,16 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
         unify(env, index_type, args[0].clone(), index.span)
         args[1].clone()
       elsif (tid.id == env.lang_items.array || tid.id == env.lang_items.slice) && args.len() >= 1 then
+        if type_has_resource_kind(env, &args[0]) then
+          type_add_error(env, "cannot extract resource element from shared container; use an inout/consuming access", expr.span)
+        end
+        unify(env, index_type, Type::Int, index.span)
+        args[0].clone()
+      elsif type_bare_name_of(env, &Type::Adt(tid, args)) == "Slice" && args.len() >= 1 then
+        # The SAFE source-spelled Slice — the std-declared SHARED struct:
+        # indexing reads through the Arc deref into the pinned backing
+        # (the element is the struct's type argument; the MIR/codegen
+        # lower the index as the backing-window read).
         if type_has_resource_kind(env, &args[0]) then
           type_add_error(env, "cannot extract resource element from shared container; use an inout/consuming access", expr.span)
         end
@@ -14846,12 +15889,52 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
       end
     end
   when ExprKind::ExprEnumVariant(path, args) then
-    # ID-based variant typing: find_enum_variant locates the OWNER enum by
-    # variant name (the only join key between the source text and the
-    # checker's type tables), and the semantic result type is built from the
-    # owner's TypeId — Type::Adt(td.id,...) for user enums; the builtin
-    # Option/Result enums resolve their LangItems ids via builtin_adt. The
-    # variant name never decides the result type.
+    # The operation-call surface: a std::effects::perform(EFFECT.op, ...)
+    # call parses as an ExprEnumVariant (the 3-segment module-qualified
+    # call path) — typed against the declared effect's op table BEFORE the
+    # variant/static-path fallback (an op reference is not a variant
+    # payload).
+    if effect_perform_callee_path(&expr) then
+      var perform_callee = Expr { kind: ExprKind::ExprPath(path.clone()), span: expr.span, node_id: 0 }
+      match check_effect_perform_call(env, expr, &perform_callee, &args)
+      when Option::Some(perform_ty) then perform_ty
+      when Option::None then check_enum_variant_construct(env, expr, &path, &args)
+      end
+    else
+      check_enum_variant_construct(env, expr, &path, &args)
+    end
+  when ExprKind::ExprComptime(block) then
+    # Rejected at check time with an explicit diagnostic: the MIR has no
+    # comptime lowering, so an accepted block would fail only at lowering.
+    # The block is still visited for error recovery, then the construct is
+    # rejected before MIR (never an Unsupported node).
+    check_block(env, &block, true)
+    type_add_error(env, "comptime blocks are not supported", expr.span)
+    Type::Error
+  when _ then Type::Error
+  end
+  if expr.node_id != 0 then
+    env.typed_expr_types.insert(expr.node_id, result.clone())
+    record_typed_hir(env, expr, &result)
+  end
+  result
+end
+
+# The enum-variant construction / static-path call check — the
+# ExprEnumVariant arm's body, extracted into a helper so the operation-
+# call surface (std::effects::perform(EFFECT.op, ...) — which parses as
+# an ExprEnumVariant) routes AROUND it: the perform arm short-circuits
+# through check_effect_perform_call and this helper handles every other
+# ExprEnumVariant form (enum variant construction, Vec::new() / Map::new()
+# static-path calls).
+# The enum-variant construction / static-path call check — the
+# ExprEnumVariant arm's body, extracted into a helper so the operation-
+# call surface (std::effects::perform(EFFECT.op, ...) — which parses as
+# an ExprEnumVariant) routes AROUND it: the perform arm short-circuits
+# through check_effect_perform_call and this helper handles every other
+# ExprEnumVariant form (enum variant construction, Vec::new() / Map::new()
+# static-path calls).
+def check_enum_variant_construct(inout env: TypeEnv, expr: Expr, path: AstPath, args: Vec[Expr]) -> Type
     let variant_name = if path.segments.len() > 0 then path.segments[path.segments.len() - 1] else "" end
     let enum_name = if path.segments.len() >= 2 then path.segments[path.segments.len() - 2] else "" end
     match find_enum_variant(env, variant_name.clone())
@@ -15101,22 +16184,7 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
           fresh_type_var(env)
         end
       end
-    end
-  when ExprKind::ExprComptime(block) then
-    # Rejected at check time with an explicit diagnostic: the MIR has no
-    # comptime lowering, so an accepted block would fail only at lowering.
-    # The block is still visited for error recovery, then the construct is
-    # rejected before MIR (never an Unsupported node).
-    check_block(env, &block, true)
-    type_add_error(env, "comptime blocks are not supported", expr.span)
-    Type::Error
-  when _ then Type::Error
-  end
-  if expr.node_id != 0 then
-    env.typed_expr_types.insert(expr.node_id, result.clone())
-    record_typed_hir(env, expr, &result)
-  end
-  result
+end
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -15151,10 +16219,11 @@ def resolve_field_type(inout env: TypeEnv, recv_type: Type, field: String, span:
     when Option::Some(td) then
       # The Slice/Array Adt field surface mirrors the dropped canonical
       # Type::Slice/Type::Array arms, selected by LangItems TypeId. The raw
-      # Slice (UnsafeSlice) is the two-field VIEW { ptr: Ptr[T], len: UInt }
+      # view (UnsafeSlice) is the two-field VIEW { ptr: Ptr[T], len: UInt }
       # — len is its only accessor field (there is NO capacity on a view).
-      # (The SAFE shared/pinned Slice — SharedSlice — is a std-declared
-      # struct and takes the structural field path below.)
+      # (The SAFE shared/pinned source-spelled Slice — the std-declared
+      # shared struct — is an ordinary struct and takes the structural
+      # field path below.)
       if tid.id == env.lang_items.slice then
         if field == "len" then Type::Int
         else fresh_type_var(env)
@@ -16023,11 +17092,12 @@ def resolve_method_type(inout env: TypeEnv, recv_type: Type, method: String, arg
     if method == "ends_with" then return Type::Bool end
     if method == "slice" then return Type::String end
     if method == "trim" then return Type::String end
-    # The split/chars/bytes results are the Adt form of the registered
-    # Slice builtin (LangItems id).
-    if method == "split" then return builtin_adt(env, "Slice".to_string(), [Type::String]) end
-    if method == "chars" then return builtin_adt(env, "Slice".to_string(), [Type::Char]) end
-    if method == "bytes" then return builtin_adt(env, "Slice".to_string(), [Type::Int]) end
+    # The split/chars/bytes results are the Adt form of the registered RAW
+    # view builtin (UnsafeSlice — the compiler-scoped loop-consumed
+    # iterable forms; the SAFE source-spelled Slice is the shared struct).
+    if method == "split" then return builtin_adt(env, "UnsafeSlice".to_string(), [Type::String]) end
+    if method == "chars" then return builtin_adt(env, "UnsafeSlice".to_string(), [Type::Char]) end
+    if method == "bytes" then return builtin_adt(env, "UnsafeSlice".to_string(), [Type::Int]) end
     if method == "push" then return Type::Unit end
     if method == "clone" then return Type::String end
   when Type::Int then
@@ -16079,8 +17149,13 @@ def resolve_method_type(inout env: TypeEnv, recv_type: Type, method: String, arg
       if method == "pop" then return builtin_adt(env, "Option".to_string(), [inner]) end
       if method == "get" then return builtin_adt(env, "Option".to_string(), [inner]) end
       if method == "clone" then return Type::Adt(tid.clone(), args.clone()) end
-      if method == "iter" then return builtin_adt(env, "Slice".to_string(), [inner]) end
-    elsif _nn == "Slice" then
+      if method == "iter" then return builtin_adt(env, "UnsafeSlice".to_string(), [inner]) end
+    elsif _nn == "UnsafeSlice" then
+      # The RAW view's method table — the compiler-scoped loop-consumed
+      # iterable forms (iter/map/filter/clone/keys/values) produce raw
+      # {ptr,len} views, consumed by the enclosing for-loop (never
+      # storable). The SAFE source-spelled Slice is NOT this arm: it is the
+      # std-declared shared struct with its compiled methods.
       let inner = if args.len() >= 1 then args[0].clone() else fresh_type_var(env) end
       if method == "get" || method == "iter" || method == "clone" || method == "slice" || method == "extend" then
         if type_has_resource_kind(env, &inner) then
@@ -16094,20 +17169,20 @@ def resolve_method_type(inout env: TypeEnv, recv_type: Type, method: String, arg
       if method == "pop" then return builtin_adt(env, "Option".to_string(), [inner]) end
       if method == "get" then return builtin_adt(env, "Option".to_string(), [inner]) end
       if method == "contains" then return Type::Bool end
-      if method == "iter" then return builtin_adt(env, "Slice".to_string(), [inner]) end
+      if method == "iter" then return builtin_adt(env, "UnsafeSlice".to_string(), [inner]) end
  # (residual): Slice map/fold — U solved from the fn
       # argument's return and recorded (the iterator-adapter map); filter
-      # returns Slice(inner) with no method-level generic.
+      # returns the raw view with no method-level generic.
       if method == "map" then
         let u = solve_builtin_method_u(env, &args, arg_types, 0, "ret", method_type_args, call_node_id, span)
-        return builtin_adt(env, "Slice".to_string(), [u])
+        return builtin_adt(env, "UnsafeSlice".to_string(), [u])
       end
-      if method == "filter" then return builtin_adt(env, "Slice".to_string(), [inner]) end
+      if method == "filter" then return builtin_adt(env, "UnsafeSlice".to_string(), [inner]) end
       if method == "fold" then
         let u = solve_builtin_method_u(env, &args, arg_types, 1, "ret", method_type_args, call_node_id, span)
         return u
       end
-      if method == "clone" then return builtin_adt(env, "Slice".to_string(), [inner]) end
+      if method == "clone" then return builtin_adt(env, "UnsafeSlice".to_string(), [inner]) end
       if method == "sort" then return Type::Unit end
       if method == "reverse" then return Type::Unit end
       if method == "first" then return builtin_adt(env, "Option".to_string(), [inner]) end
@@ -16189,8 +17264,8 @@ def resolve_method_type(inout env: TypeEnv, recv_type: Type, method: String, arg
       if method == "remove" then return builtin_adt(env, "Option".to_string(), [v]) end
       if method == "len" then return Type::Int end
       if method == "is_empty" then return Type::Bool end
-      if method == "keys" then return builtin_adt(env, "Slice".to_string(), [k]) end
-      if method == "values" then return builtin_adt(env, "Slice".to_string(), [v]) end
+      if method == "keys" then return builtin_adt(env, "UnsafeSlice".to_string(), [k]) end
+      if method == "values" then return builtin_adt(env, "UnsafeSlice".to_string(), [v]) end
       if method == "clone" then return builtin_adt(env, "Map".to_string(), [k, v]) end
     elsif _nn == "Set" then
       let elem = if args.len() >= 1 then args[0].clone() else fresh_type_var(env) end
@@ -16631,12 +17706,23 @@ def resolve_type_expr(inout env: TypeEnv, te: TypeExpr) -> Type
         builtin_adt(env, "Array".to_string(), [fresh_type_var(env)])
       end
     elsif name == "Slice" then
-      # Handle Slice[T] named syntax — the Adt form of the registered
-      # Slice builtin (LangItems id).
+      # The SOURCE-spelled Slice[T] — the SAFE SHARED/PINNED form: the
+      # name resolves to the std-declared shared struct (Slice[T] { inner:
+      # Arc[SliceBacking[T]] }) through builtin_adt. The RAW 16-byte
+      # {ptr,len} view is the separate explicit UnsafeSlice builtin — this
+      # named form never produces it.
       if args.len() >= 1 then
         builtin_adt(env, "Slice".to_string(), [resolve_type_expr(env, &args[0])])
       else
         builtin_adt(env, "Slice".to_string(), [fresh_type_var(env)])
+      end
+    elsif name == "UnsafeSlice" then
+      # The RAW {ptr,len} view — the explicit unsafe/FFI spelling (the
+      # builtin Opaque; LangItems slice id).
+      if args.len() >= 1 then
+        builtin_adt(env, "UnsafeSlice".to_string(), [resolve_type_expr(env, &args[0])])
+      else
+        builtin_adt(env, "UnsafeSlice".to_string(), [fresh_type_var(env)])
       end
     elsif name == "Any" then
       # Any is a top type — use a fresh type variable that unifies with everything
@@ -16785,6 +17871,11 @@ def resolve_type_expr(inout env: TypeEnv, te: TypeExpr) -> Type
     end
     Type::FixedArray(elem_type, size_n)
   when TypeExprKind::Slice(elem) then
+    # The [T] type spelling IS the source-spelled Slice — the SAFE
+    # SHARED/PINNED form: the name "Slice" resolves to the std-declared
+    # shared struct (Slice[T] { inner: Arc[SliceBacking[T]] }). The RAW
+    # 16-byte {ptr,len} view is the separate explicit UnsafeSlice builtin —
+    # the [T] sugar never produces it.
     let elem_type = resolve_type_expr(env, &elem)
     builtin_adt(env, "Slice".to_string(), [elem_type])
   when TypeExprKind::Fn(params, ret) then
@@ -17506,6 +18597,18 @@ def oracle_walk_typed_expr(inout env: TypeEnv, typed: TypedProgram, te: TypedExp
         findings.push("internal error: call node " + te.id.to_string() + " carries a typed Def callee but no call_targets entry (missing callee identity would reach MIR/codegen)")
       end
     when TypedCallee::Closure then ()
+    when TypedCallee::EffectPerform(eid, op_idx, op_name) then
+      # The effect-perform identity: the semantic EffectId must be a
+      # registered typed effect and the op index must resolve in its op
+      # table (a stale identity would reach MIR/codegen).
+      match typed.typed_effects.get(eid.id)
+      when Option::Some(decl) then
+        if op_idx < 0 || op_idx >= decl.ops.len() then
+          findings.push("internal error: call node " + te.id.to_string() + " performs op index " + op_idx.to_string() + " of effect " + eid.id.to_string() + " which has " + decl.ops.len().to_string() + " operations (stale EffectPerform identity would reach MIR/codegen)")
+        end
+      when Option::None then
+        findings.push("internal error: call node " + te.id.to_string() + " performs unregistered effect id " + eid.id.to_string() + " (unknown effect would reach MIR/codegen)")
+      end
     end
     match tc.receiver_effect
     when Option::Some(_) then ()
@@ -17894,6 +18997,7 @@ def type_check_typed(inout env: TypeEnv, program: Program, resolutions: Resolved
   var type_fields = Map::new()
   var type_variants = Map::new()
   var type_params = Map::new()
+  var type_layout_attrs = Map::new()
   var type_aliases = Map::new()
   var ki = 0
   while ki < env.type_list.len() do
@@ -17901,6 +19005,11 @@ def type_check_typed(inout env: TypeEnv, program: Program, resolutions: Resolved
     kinds.insert(td.id.id, td.kind)
     type_names.insert(td.id.id, td.name.clone())
     type_params.insert(td.id.id, td.generic_params.clone())
+    # The layout attributes (the checker's validated declaration record).
+    match env.layout_attrs.get(td.id.id)
+    when Option::Some(la) then type_layout_attrs.insert(td.id.id, la.clone())
+    when Option::None then ()
+    end
     # Record the nominal shapes (struct fields / enum variants) so the
     # deinit-plan builder can walk them for viral containment.
     match td.def_kind
@@ -18134,6 +19243,10 @@ def type_check_typed(inout env: TypeEnv, program: Program, resolutions: Resolved
     access_effects: env.typed_access_effects.clone(),
     typed_exprs: env.typed_exprs.clone(),
     closure_captures: env.closure_captures.clone(),
+    typed_effects: env.typed_effects.clone(),
+    effect_name_index: env.effect_name_index.clone(),
+    typed_effect_handlers: env.typed_effect_handlers.clone(),
+    handler_captures: env.handler_captures.clone(),
     local_bindings: env.typed_local_bindings.clone(),
     ident_resolutions: env.typed_ident_resolutions.clone(),
     param_binding_resolutions: env.param_binding_resolutions.clone(),
@@ -18147,6 +19260,7 @@ def type_check_typed(inout env: TypeEnv, program: Program, resolutions: Resolved
     type_fields: type_fields.clone(),
     type_variants: type_variants.clone(),
     type_params: type_params.clone(),
+    type_layout_attrs: type_layout_attrs.clone(),
     type_kinds: kinds.clone(),
     type_aliases: type_aliases.clone(),
     typed_fn_signatures: typed_fn_sigs.clone(),
@@ -18174,6 +19288,10 @@ def type_check_typed(inout env: TypeEnv, program: Program, resolutions: Resolved
     access_effects: env.typed_access_effects.clone(),
     typed_exprs: env.typed_exprs.clone(),
     closure_captures: env.closure_captures.clone(),
+    typed_effects: env.typed_effects.clone(),
+    effect_name_index: env.effect_name_index.clone(),
+    typed_effect_handlers: env.typed_effect_handlers.clone(),
+    handler_captures: env.handler_captures.clone(),
     local_bindings: env.typed_local_bindings.clone(),
     ident_resolutions: env.typed_ident_resolutions.clone(),
     param_binding_resolutions: env.param_binding_resolutions.clone(),
@@ -18187,6 +19305,7 @@ def type_check_typed(inout env: TypeEnv, program: Program, resolutions: Resolved
     type_fields: type_fields,
     type_variants: type_variants,
     type_params: type_params,
+    type_layout_attrs: type_layout_attrs,
     type_kinds: kinds,
     type_aliases: type_aliases,
     typed_fn_signatures: typed_fn_sigs,
@@ -18716,7 +19835,7 @@ def type_display(env: TypeEnv, ty: Type) -> String
     elsif tid.id == env.lang_items.result && args.len() >= 2 then "Result[" + type_display(env, &args[0]) + ", " + type_display(env, &args[1]) + "]"
     elsif tid.id == env.lang_items.map && args.len() >= 2 then "Map[" + type_display(env, &args[0]) + ", " + type_display(env, &args[1]) + "]"
     elsif tid.id == env.lang_items.set && args.len() >= 1 then "Set[" + type_display(env, &args[0]) + "]"
-    elsif tid.id == env.lang_items.slice && args.len() >= 1 then "[" + type_display(env, &args[0]) + "]"
+    elsif tid.id == env.lang_items.slice && args.len() >= 1 then "UnsafeSlice[" + type_display(env, &args[0]) + "]"
     elsif tid.id == env.lang_items.array && args.len() >= 1 then
       # The heap-vector Adt form carries no count (the size lives in the
       # distinct FixedArray variant); display as the element container.

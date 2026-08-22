@@ -42,6 +42,57 @@ def Position::from_json(v: json::Value) -> Result[Position, Unit]
   Result::Ok(Position{line: line, character: ch})
 end
 
+# ═══════════════════════════════════════════════════════════════
+# Position Encoding (the LSP 3.17 negotiated character units)
+# ═══════════════════════════════════════════════════════════════
+# LSP 3.17: a Position's `character` is expressed in the NEGOTIATED
+# position encoding — UTF-16 code units by default, or UTF-8 / UTF-32
+# when the client's initialize `positionEncodings` list is honored. The
+# server picks the FIRST encoding of the client's offered list that it
+# supports; an empty or all-unsupported list falls back to UTF-16 (the
+# protocol default). The document model must convert the character unit
+# to the BYTE offset the underlying String uses — the old
+# position_to_offset added `pos.character` DIRECTLY to the byte offset,
+# which is only correct for pure-ASCII UTF-8 documents and silently
+# mis-maps every astral character under the UTF-16 default.
+
+enum PositionEncoding
+  Utf16
+  Utf8
+  Utf32
+end
+
+def PositionEncoding::kind_string(self: PositionEncoding) -> String
+  match self
+  when PositionEncoding::Utf16 then "utf-16".to_string()
+  when PositionEncoding::Utf8 then "utf-8".to_string()
+  when PositionEncoding::Utf32 then "utf-32".to_string()
+  end
+end
+
+def PositionEncoding::from_kind_string(kind: String) -> Option[PositionEncoding]
+  if kind == "utf-8" then Option::Some(PositionEncoding::Utf8)
+  elsif kind == "utf-16" then Option::Some(PositionEncoding::Utf16)
+  elsif kind == "utf-32" then Option::Some(PositionEncoding::Utf32)
+  else Option::None
+  end
+end
+
+## THE NEGOTIATION: the server's chosen encoding is the FIRST entry of
+## the client's offered `positionEncodings` list that the server
+## supports (this client library supports all three kinds); an empty
+## list — or a list with no supported entry — falls back to UTF-16, the
+## LSP 3.17 default.
+def negotiate_position_encoding(client_supported: Vec[String]) -> PositionEncoding
+  for enc in client_supported do
+    match PositionEncoding::from_kind_string(enc.clone())
+    when Option::Some(e) then return e
+    when Option::None then ()
+    end
+  end
+  PositionEncoding::Utf16
+end
+
 struct Range
   start: Position
   end_pos: Position
@@ -158,19 +209,129 @@ struct TextDocument
   version: Int
   text: String
   lines: Vec[String]
+  position_encoding: PositionEncoding
 end
 
 def TextDocument::new(uri: String, version: Int, text: String) -> TextDocument
-  TextDocument{uri: uri, version: version, text: text.clone(), lines: text.split("\n")}
+  # THE DEFAULT ENCODING: UTF-16 — the LSP 3.17 protocol default (the
+  # client that did not negotiate an explicit positionEncoding gets
+  # UTF-16 code units in every Position).
+  TextDocument{uri: uri, version: version, text: text.clone(), lines: text.split("\n"), position_encoding: PositionEncoding::Utf16}
 end
 
+## Set the negotiated position encoding — the initialize handshake's
+## result (the server's chosen entry from the client's positionEncodings
+## list; see negotiate_position_encoding). Every subsequent
+## position_to_offset conversion uses the chosen unit.
+def TextDocument::set_position_encoding(inout self, enc: PositionEncoding) -> Unit
+  self.position_encoding = enc
+end
+
+## THE CHARACTER-UNIT → BYTE-OFFSET CONVERSION (the reviewer's LSP-unit
+## fix): the `character` is a count of the NEGOTIATED encoding's units
+## (UTF-16 code units by default — an astral scalar is TWO units there —
+## or UTF-8 bytes / UTF-32 scalars when negotiated), and the String
+## offsets are BYTES. The conversion walks the line's UTF-8 code points,
+## accumulating the chosen units per code point (1 for BMP/1-byte, 2 for
+## an astral scalar under UTF-16), and returns the byte offset of the
+## code-point boundary that reaches the target — a target inside a
+## multi-unit code point CLAMPS to the code point's start (a position
+## never splits a scalar), and a target beyond the line's end clamps to
+## the line end (the LSP 3.17 line-length clamp). The CRLF case: the
+## model splits on "\n" only, so the "\r" is line content and counts as
+## one unit — exactly the LSP line semantics.
 def TextDocument::position_to_offset(self: TextDocument, pos: Position) -> UInt
   if pos.line >= self.lines.len() then return self.text.len() end
   let mut offset = 0
   for i in 0..pos.line do
     offset += self.lines[i].len() + 1
   end
-  offset + pos.character
+  offset + _line_character_to_byte(self.lines[pos.line as Int], pos.character, self.position_encoding)
+end
+
+## The UTF-8 byte length of the code point starting at the lead byte.
+def _utf8_code_point_len(lead: u8) -> Int
+  if lead < 0x80 then
+    1
+  elsif lead >= 0xC2 && lead <= 0xDF then
+    2
+  elsif lead >= 0xE0 && lead <= 0xEF then
+    3
+  elsif lead >= 0xF0 && lead <= 0xF4 then
+    4
+  else
+    1
+  end
+end
+
+## The per-line unit conversion: returns the byte offset within the line
+## for the character count in the given encoding.
+def _line_character_to_byte(line: String, character: UInt, enc: PositionEncoding) -> UInt
+  let target = character as Int
+  if target <= 0 then return 0 end
+  let bytes = line.as_bytes()
+  match enc
+  when PositionEncoding::Utf8 then
+    # A UTF-8 unit IS a byte: the character count is the byte offset
+    # directly (clamped to the line length — the LSP 3.17 line-length
+    # clamp).
+    if target >= bytes.len() then
+      bytes.len() as UInt
+    else
+      target as UInt
+    end
+  when PositionEncoding::Utf16 then
+    _utf16_units_to_byte(&bytes, target)
+  when PositionEncoding::Utf32 then
+    _utf32_scalars_to_byte(&bytes, target)
+  end
+end
+
+## The UTF-16 → byte conversion: walks the line's UTF-8 code points,
+## accumulating the UTF-16 code units per code point (1 for every BMP
+## scalar, 2 for an astral scalar — the surrogate pair), and returns the
+## byte offset of the code-point boundary that reaches the target — a
+## target inside a surrogate pair CLAMPS to the code point's start (a
+## position never splits a scalar), and a target beyond the line's end
+## clamps to the line end. The CRLF case: the model splits on "\n" only,
+## so the "\r" is line content and counts as one unit — exactly the LSP
+## line semantics.
+def _utf16_units_to_byte(bytes: Vec[u8], target: Int) -> UInt
+  var byte_pos = 0
+  var units = 0
+  while byte_pos < bytes.len() do
+    let cp_len = _utf8_code_point_len(bytes[byte_pos])
+    let width = if cp_len == 4 then 2 else 1 end
+    if units + width > target then
+      return byte_pos as UInt
+    end
+    units = units + width
+    byte_pos = byte_pos + cp_len
+    if units == target then
+      return byte_pos as UInt
+    end
+  end
+  bytes.len() as UInt
+end
+
+## The UTF-32 → byte conversion: one scalar = one unit; the walk returns
+## the byte offset of the scalar boundary that reaches the target
+## (clamped to the line end).
+def _utf32_scalars_to_byte(bytes: Vec[u8], target: Int) -> UInt
+  var byte_pos = 0
+  var scalars = 0
+  while byte_pos < bytes.len() do
+    let cp_len = _utf8_code_point_len(bytes[byte_pos])
+    if scalars + 1 > target then
+      return byte_pos as UInt
+    end
+    scalars = scalars + 1
+    byte_pos = byte_pos + cp_len
+    if scalars == target then
+      return byte_pos as UInt
+    end
+  end
+  bytes.len() as UInt
 end
 
 def TextDocument::apply_full_change(inout self, text: String, version: Int)

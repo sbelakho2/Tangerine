@@ -57,6 +57,7 @@ use tg_compiler::asm::{
   Arch, OsAbi, AsmTarget, Section, SymBinding, SymKind, AsmSymbol,
   FixupKind, RelocKind, CC,
   X64, x64_code, x64_arg_reg, x64_callee_saved,
+  A64, a64_code,
   x64_mov_ri, x64_mov_rr, x64_mov_rm, x64_mov_mr,
   x64_add_rr, x64_add_ri, x64_sub_rr, x64_sub_ri,
   x64_imul_rr, x64_cqo, x64_idiv_r,
@@ -78,6 +79,11 @@ use tg_compiler::mono::{type_to_mangled}
 use tg_compiler::asm::{merge_code_buffer}
 use tg_compiler::ids::{IntrinsicId}
 use tg_compiler::types::{intrinsic_id_of_call, classify_intrinsic_call}
+use tg_compiler::types::{
+  SimdIntrinsicKind, SimdLane,
+  simd_intrinsic_kind_of, simd_intrinsic_lane_of,
+  simd_lane_width, simd_lane_elem_size, simd_lane_is_float
+}
 
 # ———————————————————————————————————————————————————————————————
 # Code Generation Context
@@ -125,6 +131,24 @@ struct FrameInfo
   # range for every function.
   budget_alloc_offset: i32 = 0
   budget_time_offset: i32 = 0
+  # The per-invocation EFFECT-HANDLER frame slots (FP-relative offsets;
+  # empty = the function installs no handler frames). EVERY
+  # MirEffectFrameEnter in the function gets its OWN 48-byte slot (the
+  # runtime writes the handler frame — effect id, op count, handled
+  # bitmap, dispatcher, env ptr, next — into the CALLER's frame slot at
+  # that address), so NESTED/SEQUENTIAL handle-with blocks in one
+  # function each link an independent frame onto the task's handler
+  # stack. The slots are reserved in emission order (the same block/
+  # statement walk allocate_locals uses to build this vector and
+  # codegen_function uses to emit — the j-th MirEffectFrameEnter reads
+  # effect_frame_offsets[j]); each slot is 48 bytes and is placed BELOW
+  # the budget slots so its upward 48-byte write region stays entirely
+  # inside the spill area and never reaches the saved frame pointer /
+  # return address at [fp .. fp+16). The slots live in the generated
+  # function's STACK FRAME (the direct-style handler frames —
+  # per-invocation, nesting-safe, race-free, exactly like the budget
+  # counters): the runtime never allocates.
+  effect_frame_offsets: Vec[i32] = Vec::new()
 end
 
 struct FnCodegenCtx
@@ -133,6 +157,11 @@ struct FnCodegenCtx
   var_locs: Map[Int, VarLoc]     # MirLocalId.id -> VarLoc
   block_labels: Map[Int, String] # MirBlockId.id -> label name
   string_locals: Set[Int]        # MirLocalId.id values known to be string type
+  # The per-function effect-handler-frame occurrence counter: codegen
+  # consumes frame.effect_frame_offsets[0..] in EMISSION order (the same
+  # order allocate_locals scanned), so the j-th MirEffectFrameEnter
+  # emitted installs into the j-th reserved 48-byte slot.
+  next_effect_frame: Int = 0
 end
 
 struct CodegenCtx
@@ -354,9 +383,12 @@ def build_all_layouts(inout engine: LayoutEngine, types: Vec[MirTypeDef], concre
     match inst
     when Type::Adt(tid, args) then
       if lookup_type_name(engine, tid.id) == "Array" || is_slice_view_tid(engine, tid.id) then
-        # Heap-vector handle / slice view: pointer-sized handles — no field
+        # Heap-vector handle / RAW UnsafeSlice view: pointer-sized or
+        # 16-byte inline handles — no field
         # table (their shapes come from container_field_offset /
-        # slice_view_layout, not the def).
+        # slice_view_layout, not the def). The SAFE source-spelled Slice
+        # is the std-declared shared struct and gets its field table below
+        # (the 8-byte Arc handle).
         ()
       else
         let cty = Type::Adt(tid.clone(), args.clone())
@@ -773,6 +805,33 @@ def func_budget_slot_usage(func: MirFunction) -> (Bool, Bool)
   (needs_alloc, needs_time)
 end
 
+# Whether a function installs effect-handler frames: any
+# MirEffectFrameEnter in the body reserves the frame slots (the
+# slot-reservation authority mirror of func_budget_slot_usage — the
+# __tg_effect_frame_push arm always finds its slot reserved).
+def func_has_effect_frame(func: MirFunction) -> Bool
+  func_effect_frame_count(func) > 0
+end
+
+# The number of MirEffectFrameEnter occurrences in a function, in
+# block/statement order (the SAME order codegen_function emits). Every
+# occurrence — one per `handle ... with ...` clause and one per nested
+# handle-with statement — reserves its OWN 48-byte frame slot, so nested
+# and sequential handlers within one function each install an independent
+# frame onto the task's handler stack.
+def func_effect_frame_count(func: MirFunction) -> Int
+  var count = 0
+  for block in func.blocks do
+    for stmt in block.statements do
+      match stmt.kind
+      when MirStatementKind::MirEffectFrameEnter(_, _, _, _, _) then count = count + 1
+      when _ then ()
+      end
+    end
+  end
+  count
+end
+
 def allocate_locals(func: MirFunction, arch: Arch, inout engine: LayoutEngine) -> (Map[Int, VarLoc], FrameInfo)
   var ra = reg_alloc_new(arch)
   var local_offsets: Map[Int, Int] = Map::new()
@@ -795,6 +854,24 @@ def allocate_locals(func: MirFunction, arch: Arch, inout engine: LayoutEngine) -
   if fn_needs_time then
     spill_off = spill_off - 8
     budget_time_offset = spill_off
+  end
+  # The effect-handler frame slots: reserved with the budget slots — one
+  # 48-byte slot per MirEffectFrameEnter occurrence, placed BELOW the
+  # budget slots. Each slot's upward 48-byte write region
+  # ([slot .. slot+48)) stays entirely inside the spill area, so it never
+  # reaches the budget counters or the saved FP/LR at [fp .. fp+16).
+  # Nested/sequential handle-with blocks in one function each get their
+  # own slot (frame.effect_frame_offsets[j] is the j-th occurrence's
+  # slot, in emission order).
+  var effect_frame_offsets: Vec[i32] = Vec::new()
+  let fn_effect_frames = func_effect_frame_count(func)
+  if fn_effect_frames > 0 then
+    spill_off = spill_off - (48 * fn_effect_frames) as i32
+    var efi = 0
+    while efi < fn_effect_frames do
+      effect_frame_offsets.push(spill_off + (48 * efi) as i32)
+      efi = efi + 1
+    end
   end
 
   # sret ABI: if the return type (local 0) has a sret-eligible value
@@ -954,7 +1031,8 @@ def allocate_locals(func: MirFunction, arch: Arch, inout engine: LayoutEngine) -
     saved_regs: saved,
     sret_offset: sret_offset,
     budget_alloc_offset: budget_alloc_offset,
-    budget_time_offset: budget_time_offset
+    budget_time_offset: budget_time_offset,
+    effect_frame_offsets: effect_frame_offsets
   }
 
   (var_locs, frame)
@@ -1320,6 +1398,249 @@ def emit_store_mem_sized(inout ctx: CodegenCtx, addr: PhysReg, offset: i32, src:
       when MemWidth::W64 then a64_str(&mut ctx.text, s, ab, off as u32)
       end
     when _ then panic("emit_store_mem_sized: mixed architectures")
+    end
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# UNALIGNED load/store lowering (the @packed attribute's memory accesses)
+# ———————————————————————————————————————————————————————————————
+# A @packed aggregate's fields sit at the PACKED offsets (no padding), so
+# a wider-than-1 field (a u32 at offset 1, a u64 at offset 4 — the
+# kernel epoll_event shape { u32 events @ 0, u64 data @ 4 }) is accessed
+# at a misaligned address. A direct `mov` of that width at a misaligned
+# address is undefined on the target (and faults on strict-alignment
+# AArch64), so the codegen's load/store width paths route the MISALIGNED
+# accesses through the BYTE-WISE lowering:
+#   load  = assemble the little-endian value byte by byte
+#           (b0 | b1<<8 | ... — zero-extended into the register, then
+#           sign-extended per the storage signedness);
+#   store = store each byte of the value ((src >> 8*i) & 0xFF) into
+#           [addr + i].
+# The CHOICE is made statically: a projected place whose final offset is
+# KNOWN at compile time and not a multiple of the access width lowers
+# unaligned (the aligned path is used everywhere else — the unaligned
+# path only where the attributed layout demands it).
+#
+# The width in bytes of a MemWidth — the unaligned check's modulus.
+def mem_width_bytes(width: MemWidth) -> Int
+  match width
+  when MemWidth::W8 then 1
+  when MemWidth::W16 then 2
+  when MemWidth::W32 then 4
+  when MemWidth::W64 then 8
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# The place's FINAL STATIC byte offset — the unaligned-access decision
+# ———————————————————————————————————————————————————————————————
+# The byte offset the LAST projection contributes to the place address
+# (Field/TupleIndex/ConstantIndex offsets are compile-time constants; a
+# dynamic final projection — ProjIndex — cannot be decided statically).
+# The unaligned load/store lowering (emit_load_mem_sized_unaligned /
+# emit_store_mem_sized_unaligned — the @packed attribute's misaligned
+# field accesses) consults this: when the final static offset is not a
+# multiple of the access width, the place address base (stack slots are
+# 8-aligned, heap payloads 16-aligned) makes the access misaligned and
+# the byte-wise lowering is chosen. Returns -1 when the offset is not
+# statically decidable (the aligned path is used).
+def place_final_static_offset(inout ctx: CodegenCtx, fctx: FnCodegenCtx, place: Place) -> Int
+  if place.projections.len() == 0 then
+    return -1
+  end
+  var current_ty = local_type(fctx, place.local.id)
+  var downcast_variant: Option[VariantId] = Option::None
+  var last_static = 0
+  var has_static_last = true
+  for proj in place.projections do
+    match proj
+    when Projection::ProjDeref then
+      current_ty = project_deref_type(ctx, &current_ty)
+    when Projection::Variant(vid) then
+      downcast_variant = Option::Some(vid)
+    when Projection::Field(fid) then
+      last_static = projected_field_offset(ctx, &fid, &downcast_variant, &current_ty)
+      current_ty = projected_field_type(ctx, &fid, &downcast_variant, &current_ty)
+    when Projection::TupleIndex(idx) then
+      last_static = projected_tuple_offset(ctx, &current_ty, idx)
+      current_ty = projected_tuple_type(ctx, &current_ty, idx)
+    when Projection::ProjConstantIndex(_) then
+      current_ty = project_index_type(ctx, &current_ty)
+    when Projection::ProjIndex(_) then
+      # A dynamic final index: the element offset is runtime — the
+      # alignment cannot be decided statically.
+      has_static_last = false
+      current_ty = project_index_type(ctx, &current_ty)
+    end
+  end
+  if has_static_last then last_static else -1 end
+end
+
+# The place-address base alignment check: a projected place whose FINAL
+# static offset is known and not a multiple of `width_bytes` bytes is a
+# MISALIGNED access (the @packed attribute's packed field offsets) — the
+# byte-wise unaligned lowering must be used. All runtime bases (the
+# 8-aligned stack slots, the 16-aligned heap payloads) are multiples of
+# every supported access width (1/2/4/8), so the static offset alone
+# decides the alignment.
+def place_access_is_unaligned(inout ctx: CodegenCtx, fctx: FnCodegenCtx, place: Place, width: MemWidth) -> Bool
+  let wb = mem_width_bytes(width)
+  if wb <= 1 then
+    false
+  else
+    let off = place_final_static_offset(ctx, fctx, place)
+    off >= 0 && (off % wb) != 0
+  end
+end
+
+# The byte-wise UNALIGNED load: assembles the little-endian value of
+# `width` bytes from [addr + 0 .. addr + width) into `dst`, then applies
+# the storage extension. `dst` may alias `addr` (the canonical
+# emit_load_place pattern computes the address INTO the destination
+# register): the address is copied to the scratch register first.
+def emit_load_mem_sized_unaligned(inout ctx: CodegenCtx, dst: PhysReg, addr: PhysReg, width: MemWidth, extension: Extension) -> Unit
+  let scratch = scratch_reg(ctx.target.arch)
+  var a = addr
+  # Preserve the address when the destination aliases it.
+  if phys_reg_id(dst) == phys_reg_id(a) then
+    emit_mov_rr(ctx, scratch, a)
+    a = scratch
+  end
+  let bytes = mem_width_bytes(width)
+  match dst
+  when PhysReg::X64Reg(d) then
+    match a
+    when PhysReg::X64Reg(base) then
+      match scratch2_reg(ctx.target.arch)
+      when PhysReg::X64Reg(t) then
+        var bi = 0
+        while bi < bytes do
+          x64_movzx_r64_m8(&mut ctx.text, t, base, bi as i32)
+          if bi > 0 then
+            x64_shl_ri(&mut ctx.text, t, (bi * 8) as u8)
+            x64_or_rr(&mut ctx.text, d, t)
+          else
+            x64_mov_rr(&mut ctx.text, d, t)
+          end
+          bi = bi + 1
+        end
+        # The storage extension on the assembled narrow value.
+        match extension
+        when Extension::Sign then
+          # Sign-extend the register-held narrow value through the stack
+          # (the movsx memory forms are the x86 sign-extension authority).
+          emit_push(ctx, dst)
+          match sp_reg(ctx.target.arch)
+          when PhysReg::X64Reg(spx) then
+            match width
+            when MemWidth::W8 then x64_movsx_r64_m8(&mut ctx.text, d, spx, 0)
+            when MemWidth::W16 then x64_movsx_r64_m16(&mut ctx.text, d, spx, 0)
+            when MemWidth::W32 then x64_movsx_r64_m32(&mut ctx.text, d, spx, 0)
+            when MemWidth::W64 then ()
+            end
+          when _ then panic("emit_load_mem_sized_unaligned: mixed architectures")
+          end
+          emit_pop(ctx, scratch)
+        when _ then ()
+        end
+      when _ then panic("emit_load_mem_sized_unaligned: mixed architectures")
+      end
+    when _ then panic("emit_load_mem_sized_unaligned: mixed architectures")
+    end
+  when PhysReg::A64Reg(d) then
+    match a
+    when PhysReg::A64Reg(base) then
+      match scratch2_reg(ctx.target.arch)
+      when PhysReg::A64Reg(t) then
+        var bi = 0
+        while bi < bytes do
+          a64_ldrb(&mut ctx.text, t, base, bi as u32)
+          if bi > 0 then
+            a64_lsl(&mut ctx.text, t, t, (bi * 8) as u32)
+            a64_orr_rrr(&mut ctx.text, d, d, t)
+          else
+            a64_mov_rr(&mut ctx.text, d, t)
+          end
+          bi = bi + 1
+        end
+        match extension
+        when Extension::Sign then
+          # Sign-extend the assembled narrow value (the aligned path's
+          # lsl/asr sequence).
+          match width
+          when MemWidth::W8 then
+            a64_lsl(&mut ctx.text, d, d, 56)
+            a64_mov_ri(&mut ctx.text, A64::X15, 56)
+            a64_asr_rrr(&mut ctx.text, d, d, A64::X15)
+          when MemWidth::W16 then
+            a64_lsl(&mut ctx.text, d, d, 48)
+            a64_mov_ri(&mut ctx.text, A64::X15, 48)
+            a64_asr_rrr(&mut ctx.text, d, d, A64::X15)
+          when MemWidth::W32 then
+            a64_sxtw(&mut ctx.text, d, d)
+          when MemWidth::W64 then ()
+          end
+        when _ then ()
+        end
+      when _ then panic("emit_load_mem_sized_unaligned: mixed architectures")
+      end
+    when _ then panic("emit_load_mem_sized_unaligned: mixed architectures")
+    end
+  end
+end
+
+# The byte-wise UNALIGNED store: stores each byte of `src`'s low `width`
+# bytes into [addr + i] (the little-endian byte order).
+def emit_store_mem_sized_unaligned(inout ctx: CodegenCtx, addr: PhysReg, src: PhysReg, width: MemWidth) -> Unit
+  let bytes = mem_width_bytes(width)
+  # The byte temp must be distinct from BOTH addr and src: the callers
+  # may pass a scratch2-register address (store_place's base is
+  # scratch2_reg) or a scratch-register source — clobbering either would
+  # corrupt the store.
+  let s2 = scratch2_reg(ctx.target.arch)
+  let tmp_reg = if phys_reg_id(s2) == phys_reg_id(addr) || phys_reg_id(s2) == phys_reg_id(src) then
+    scratch_reg(ctx.target.arch)
+  else
+    s2
+  end
+  match addr
+  when PhysReg::X64Reg(b) then
+    match src
+    when PhysReg::X64Reg(s) then
+      match tmp_reg
+      when PhysReg::X64Reg(t) then
+        var bi = 0
+        while bi < bytes do
+          x64_mov_rr(&mut ctx.text, t, s)
+          if bi > 0 then
+            x64_shr_ri(&mut ctx.text, t, (bi * 8) as u8)
+          end
+          x64_mov_m8_r8(&mut ctx.text, b, bi as i32, t)
+          bi = bi + 1
+        end
+      when _ then panic("emit_store_mem_sized_unaligned: mixed architectures")
+      end
+    when _ then panic("emit_store_mem_sized_unaligned: mixed architectures")
+    end
+  when PhysReg::A64Reg(b) then
+    match src
+    when PhysReg::A64Reg(s) then
+      match tmp_reg
+      when PhysReg::A64Reg(t) then
+        var bi = 0
+        while bi < bytes do
+          if bi > 0 then
+            a64_lsr(&mut ctx.text, t, s, (bi * 8) as u32)
+          else
+            a64_mov_rr(&mut ctx.text, t, s)
+          end
+          a64_strb(&mut ctx.text, t, b, bi as u32)
+          bi = bi + 1
+        end
+      when _ then panic("emit_store_mem_sized_unaligned: mixed architectures")
+      end
+    when _ then panic("emit_store_mem_sized_unaligned: mixed architectures")
     end
   end
 end
@@ -3079,7 +3400,12 @@ def project_index_type(ctx: CodegenCtx, ty: Type) -> Type
     # chain keeps covering Vec/Array/Map/Set in their Adt storage forms.
     let qualified = type_name_by_id(ctx, tid.id)
     let type_name = bare_name_from_qualified(qualified)
-    if (type_name == "Slice") && !args.is_empty() then
+    if (type_name == "UnsafeSlice") && !args.is_empty() then
+      args[0].clone()
+    else if (type_name == "Slice") && !args.is_empty() then
+      # The SAFE source-spelled Slice (the std-declared shared struct):
+      # the element is its type argument (the index reads through the Arc
+      # deref — see the ProjIndex arm).
       args[0].clone()
     else if (type_name == "Box" || type_name == "Rc") && !args.is_empty() then
       project_index_type(ctx, &args[0])
@@ -3304,7 +3630,7 @@ def is_string_like_type(ctx: CodegenCtx, ty: Type) -> Bool
  # Adt form of Slice mirrors the canonical Slice arm
     # (char/i8/u8 element via the Adt args).
     let slt_named = bare_name_from_qualified(type_name_by_id(ctx, tid.id))
-    if slt_named == "Slice" && !args.is_empty() then
+    if slt_named == "UnsafeSlice" && !args.is_empty() then
       match strip_ref_like_type(&args[0])
       when Type::Char then true
       when Type::I8 then true
@@ -3376,17 +3702,20 @@ end
 # semantics (ProjIndex derefs the handle, MirLen reads the header) apply to
 # the heap collections; a FixedArray is indexed/measured in place (ProjIndex
 # keeps the inline base, MirLen emits the constant count).
-# Slice is NOT a heap collection: a Slice[T] value is the 16-byte inline
-# VIEW { ptr: Ptr[T], len: UInt } (Repr::Inline — see slice_view_layout).
+# UnsafeSlice is NOT a heap collection: an UnsafeSlice[T] value is the
+# 16-byte inline RAW VIEW { ptr: Ptr[T], len: UInt } (Repr::Inline — see
+# slice_view_layout). The SAFE source-spelled Slice is the std-declared
+# shared struct — its 8-byte Arc-class handle (slice_shared_handle_layout).
 # For a view, the projection chain's reg holds the DATA pointer after the
 # ProjDeref of the receiver, so ProjIndex must NOT deref again; len comes
 # from the view's second word, never from a heap header.
 # this is a REPRESENTATION question — the layout engine's type_repr
 # (via codegen_type_repr) is the single authority. The former name-list
-# special cases (Adt "Array" -> HeapVecHeader, "Slice" -> Inline) duplicated
-# type_repr's own Adt arms (layout_engine type_repr: named Array ->
-# HeapVecHeader, named Slice -> Inline, FixedArray -> Inline) and are
-# are not part of the model: the engine answers the same, table-for-table.
+# special cases (Adt "Array" -> HeapVecHeader, "UnsafeSlice" -> Inline)
+# duplicated type_repr's own Adt arms (layout_engine type_repr: named
+# Array -> HeapVecHeader, named UnsafeSlice -> Inline, FixedArray ->
+# Inline) and are not part of the model: the engine answers the same,
+# table-for-table.
 def is_heap_collection_type(inout ctx: CodegenCtx, ty: Type) -> Bool
   match codegen_type_repr(ctx, &strip_ref_like_type(ty))
   when Repr::HeapVecHeader then true
@@ -3396,9 +3725,27 @@ def is_heap_collection_type(inout ctx: CodegenCtx, ty: Type) -> Bool
   end
 end
 
-# True when the value type is the Slice view (after stripping references and
-# pointer layers). Mirrors the layout engine's is_slice_view_tid.
+# True when the value type is the RAW UnsafeSlice view (after stripping
+# references and pointer layers). Mirrors the layout engine's
+# is_slice_view_tid. The SAFE source-spelled Slice is the std-declared
+# shared struct — its operations compile as its std methods (the Arc
+# deref through the backing), never through these raw-view emitters.
 def is_slice_view_type(ctx: CodegenCtx, ty: Type) -> Bool
+  match strip_ref_like_type(ty)
+  when Type::Adt(tid, _) then
+    bare_name_from_qualified(type_name_by_id(ctx, tid.id)) == "UnsafeSlice"
+  when _ then false
+  end
+end
+
+# True when the value type is the SAFE SOURCE-spelled Slice — the
+# std-declared SHARED struct (Slice[T] { inner: ArcStrong[SliceBacking[T]] }).
+# Its VALUE is the 8-byte Arc-class handle; its element reads go through
+# the Arc deref chain into the 24-byte pinned backing (slice_shared_handle
+# _layout / slice_shared_backing_layout): handle word @ 0, ArcInnerWeak
+# { refcount @ 0, weak_count @ 8, data @ 16 }, SliceBacking
+# { ptr @ 0, len @ 8, offset @ 16 }.
+def is_shared_slice_type(ctx: CodegenCtx, ty: Type) -> Bool
   match strip_ref_like_type(ty)
   when Type::Adt(tid, _) then
     bare_name_from_qualified(type_name_by_id(ctx, tid.id)) == "Slice"
@@ -4057,6 +4404,7 @@ def element_stride_bytes(inout ctx: CodegenCtx, elem_ty: Type) -> Int
     when ValueCategory::ZeroSized then 0
     when ValueCategory::Scalar(w) then w
     when ValueCategory::ScalarPair(_, _) then 16
+    when ValueCategory::Vector(w) then w
     when ValueCategory::ByAddress(sz) then sz
     end
   end
@@ -4072,7 +4420,7 @@ def vec_elem_type_of(inout ctx: CodegenCtx, ty: Type) -> Type
   when Type::FixedArray(elem, _) then elem.clone()
   when Type::Adt(tid, args) then
     let ven = bare_name_from_qualified(type_name_by_id(ctx, tid.id))
-    if ven == "Array" || ven == "Vec" || ven == "Slice" then
+    if ven == "Array" || ven == "Vec" || ven == "UnsafeSlice" || ven == "Slice" then
       if args.is_empty() then
         panic("internal error: Vec/Array receiver type carries no element type argument at a codegen operation site")
       end
@@ -4167,7 +4515,16 @@ def apply_projections(inout ctx: CodegenCtx, fctx: FnCodegenCtx, place: Place, p
       let field_ty = projected_field_type(ctx, &fid, &downcast_variant, &current_ty)
       let fwidth = storage_width_of(ctx, &field_ty)
       let fext = storage_signedness_of(&field_ty)
-      emit_load_mem_sized(ctx, reg, reg, offset as i32, fwidth, fext)
+      if (offset % mem_width_bytes(fwidth)) != 0 then
+        # A @packed-aggregate field at a MISALIGNED static offset: the
+        # byte-wise unaligned load.
+        emit_push(ctx, reg)
+        emit_add_ri(ctx, reg, offset as i32)
+        emit_load_mem_sized_unaligned(ctx, reg, reg, fwidth, fext)
+        emit_pop(ctx, scratch)
+      else
+        emit_load_mem_sized(ctx, reg, reg, offset as i32, fwidth, fext)
+      end
       current_ty = field_ty
       last_deref_unwrapped_ref = false
     when Projection::TupleIndex(idx) then
@@ -4177,27 +4534,59 @@ def apply_projections(inout ctx: CodegenCtx, fctx: FnCodegenCtx, place: Place, p
       let field_ty = projected_tuple_type(ctx, &current_ty, idx)
       let fwidth = storage_width_of(ctx, &field_ty)
       let fext = storage_signedness_of(&field_ty)
-      emit_load_mem_sized(ctx, reg, reg, offset as i32, fwidth, fext)
+      if (offset % mem_width_bytes(fwidth)) != 0 then
+        # A @packed-aggregate tuple field at a MISALIGNED static offset:
+        # the byte-wise unaligned load.
+        emit_push(ctx, reg)
+        emit_add_ri(ctx, reg, offset as i32)
+        emit_load_mem_sized_unaligned(ctx, reg, reg, fwidth, fext)
+        emit_pop(ctx, scratch)
+      else
+        emit_load_mem_sized(ctx, reg, reg, offset as i32, fwidth, fext)
+      end
       current_ty = field_ty
       last_deref_unwrapped_ref = false
     when Projection::ProjIndex(local_id) then
-      if is_heap_collection_type(ctx, &current_ty) then
-        emit_load_mem(ctx, reg, reg, 0)
-      end
       let idx_reg = scratch2_reg(ctx.target.arch)
       load_place(ctx, fctx, &Place { local: local_id, projections: Vec::new() }, idx_reg)
       # Determine element size from the collection type.
       let elem_ty = project_index_type(ctx, &current_ty)
       let elem_size = element_stride_bytes(ctx, &elem_ty)
       let is_byte_indexed = is_string_like_type(ctx, &current_ty)
-      if !is_byte_indexed then
-        # Scale index by the element's storage stride (1/2/4/8 shifts,
-        # multiply for any other stride — the SAME authority the runtime
-        # reads from the Vec header).
-        emit_scale_index(ctx, idx_reg, elem_size)
+      if is_heap_collection_type(ctx, &current_ty) then
+        emit_load_mem(ctx, reg, reg, 0)
+        if !is_byte_indexed then
+          # Scale index by the element's storage stride (1/2/4/8 shifts,
+          # multiply for any other stride — the SAME authority the runtime
+          # reads from the Vec header).
+          emit_scale_index(ctx, idx_reg, elem_size)
+        end
+        # Add scaled offset to base address
+        emit_add_rrr(ctx, reg, reg, idx_reg)
+      elsif is_shared_slice_type(ctx, &current_ty) then
+        # The SAFE source-spelled Slice — the SHARED form's element read:
+        # element i lives at backing.ptr + i * stride (the backing.ptr IS
+        # the pinned window's start; the backing's offset is source
+        # metadata, never an element address — the std get/sub contract).
+        # The Arc deref chain: [value+0] = ArcInnerWeak*, [inner+16] =
+        # SliceBacking { ptr@0, len@8, offset@16 }. The scratch register
+        # is consumed BEFORE emit_scale_index (which may itself use the
+        # scratch on x86-64 for a non-power-of-2 stride).
+        emit_load_mem(ctx, scratch_reg(ctx.target.arch), reg, 0)  # scratch = ArcInnerWeak*
+        emit_load_mem(ctx, scratch_reg(ctx.target.arch), scratch_reg(ctx.target.arch), 16) # scratch = SliceBacking*
+        emit_load_mem(ctx, reg, scratch_reg(ctx.target.arch), 0)  # reg = backing.ptr
+        emit_add_rrr(ctx, reg, reg, idx_reg)                      # reg = ptr + i
+        emit_scale_index(ctx, reg, elem_size)
+      else
+        if !is_byte_indexed then
+          # Scale index by the element's storage stride (1/2/4/8 shifts,
+          # multiply for any other stride — the SAME authority the runtime
+          # reads from the Vec header).
+          emit_scale_index(ctx, idx_reg, elem_size)
+        end
+        # Add scaled offset to base address
+        emit_add_rrr(ctx, reg, reg, idx_reg)
       end
-      # Add scaled offset to base address
-      emit_add_rrr(ctx, reg, reg, idx_reg)
       if is_byte_indexed then
         match reg
         when PhysReg::A64Reg(a) then a64_ldrb(&mut ctx.text, a, a, 0)
@@ -4211,23 +4600,49 @@ def apply_projections(inout ctx: CodegenCtx, fctx: FnCodegenCtx, place: Place, p
       current_ty = elem_ty
       last_deref_unwrapped_ref = false
     when Projection::ProjConstantIndex(ci) then
-      if is_heap_collection_type(ctx, &current_ty) then
-        emit_load_mem(ctx, reg, reg, 0)
-      end
       let is_byte_indexed = is_string_like_type(ctx, &current_ty)
       let elem_ty2 = project_index_type(ctx, &current_ty)
       let elem_size2 = element_stride_bytes(ctx, &elem_ty2)
-      if is_byte_indexed then
-        emit_add_ri(ctx, reg, ci as i32)
-        match reg
-        when PhysReg::A64Reg(a) then a64_ldrb(&mut ctx.text, a, a, 0)
-        when PhysReg::X64Reg(x) then x64_movzx_r64_m8(&mut ctx.text, x, x, 0)
+      if is_heap_collection_type(ctx, &current_ty) then
+        emit_load_mem(ctx, reg, reg, 0)
+        if is_byte_indexed then
+          emit_add_ri(ctx, reg, ci as i32)
+          match reg
+          when PhysReg::A64Reg(a) then a64_ldrb(&mut ctx.text, a, a, 0)
+          when PhysReg::X64Reg(x) then x64_movzx_r64_m8(&mut ctx.text, x, x, 0)
+          end
+        else
+          let offset = ci * elem_size2
+          let ewidth2 = storage_width_of(ctx, &elem_ty2)
+          let eext2 = storage_signedness_of(&elem_ty2)
+          emit_load_mem_sized(ctx, reg, reg, offset as i32, ewidth2, eext2)
         end
-      else
-        let offset = ci * elem_size2
+      elsif is_shared_slice_type(ctx, &current_ty) then
+        # The SAFE source-spelled Slice — the SHARED form's constant-index
+        # read: element ci at backing.ptr + ci * stride (the Arc deref
+        # chain; see the ProjIndex arm — the scratch is consumed before
+        # emit_scale_index).
+        emit_load_mem(ctx, scratch_reg(ctx.target.arch), reg, 0)  # scratch = ArcInnerWeak*
+        emit_load_mem(ctx, scratch_reg(ctx.target.arch), scratch_reg(ctx.target.arch), 16) # scratch = SliceBacking*
+        emit_load_mem(ctx, reg, scratch_reg(ctx.target.arch), 0)  # reg = backing.ptr
+        emit_add_ri(ctx, reg, ci as i32)                          # reg = ptr + ci
+        emit_scale_index(ctx, reg, elem_size2)
         let ewidth2 = storage_width_of(ctx, &elem_ty2)
         let eext2 = storage_signedness_of(&elem_ty2)
-        emit_load_mem_sized(ctx, reg, reg, offset as i32, ewidth2, eext2)
+        emit_load_mem_sized(ctx, reg, reg, 0, ewidth2, eext2)
+      else
+        if is_byte_indexed then
+          emit_add_ri(ctx, reg, ci as i32)
+          match reg
+          when PhysReg::A64Reg(a) then a64_ldrb(&mut ctx.text, a, a, 0)
+          when PhysReg::X64Reg(x) then x64_movzx_r64_m8(&mut ctx.text, x, x, 0)
+          end
+        else
+          let offset = ci * elem_size2
+          let ewidth2 = storage_width_of(ctx, &elem_ty2)
+          let eext2 = storage_signedness_of(&elem_ty2)
+          emit_load_mem_sized(ctx, reg, reg, offset as i32, ewidth2, eext2)
+        end
       end
       current_ty = elem_ty2
       last_deref_unwrapped_ref = false
@@ -4517,9 +4932,19 @@ def store_place(inout ctx: CodegenCtx, fctx: FnCodegenCtx, place: Place, src: Ph
 
       emit_pop(ctx, src)  # restore value
       # Store exactly the final projected value's storage width so a narrow
-      # field/element is never overwritten by an 8-byte write.
+      # field/element is never overwritten by an 8-byte write. A
+      # @packed-aggregate field at a MISALIGNED static offset (the
+      # attributed layout's packed offsets) lowers through the byte-wise
+      # UNALIGNED path — never a direct misaligned mov.
       let final_store_width = storage_width_of(ctx, &current_ty)
-      emit_store_mem_sized(ctx, base, store_off, src, final_store_width)
+      if (store_off as Int) % mem_width_bytes(final_store_width) != 0 then
+        emit_push(ctx, base)
+        emit_add_ri(ctx, base, store_off)
+        emit_store_mem_sized_unaligned(ctx, base, src, final_store_width)
+        emit_pop(ctx, scratch)
+      else
+        emit_store_mem_sized(ctx, base, store_off, src, final_store_width)
+      end
     end
   when Option::None then
     panic("store_place: unknown local " + place.local.id.to_string())
@@ -4668,9 +5093,10 @@ def codegen_rvalue(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, stmt: MirSta
         emit_mov_ri(ctx, dst, n as i64)
       when _ then
       if is_slice_view_type(ctx, &len_ty2) then
-        # Slice[T] view len: the len lives in the VIEW's second word, not in
-        # a heap header. dst = the view base address (a plain slice place is
-        # addressed directly; a &Slice place derefs its ref slot once).
+        # UnsafeSlice[T] raw-view len: the len lives in the VIEW's second
+        # word, not in a heap header. dst = the view base address (a plain
+        # raw-view place is addressed directly; a &UnsafeSlice place derefs
+        # its ref slot once).
         emit_place_address(ctx, fctx, place, dst)
         if is_ref_like_type(&len_ty2) then
           emit_load_mem(ctx, dst, dst, 0)
@@ -5569,11 +5995,18 @@ def emit_load_place(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, place: Plac
     end
   else
     emit_place_address(ctx, fctx, place, dst)
-    # Load exactly the final projected value's storage width.
+    # Load exactly the final projected value's storage width. A
+    # @packed-aggregate field at a MISALIGNED static offset (the
+    # attributed layout's packed offsets) lowers through the byte-wise
+    # UNALIGNED path — never a direct misaligned mov.
     let pty = place_type(ctx, fctx, place)
     let pwidth = storage_width_of(ctx, &pty)
     let pext = storage_signedness_of(&pty)
-    emit_load_mem_sized(ctx, dst, dst, 0, pwidth, pext)
+    if place_access_is_unaligned(ctx, fctx, place, pwidth) then
+      emit_load_mem_sized_unaligned(ctx, dst, dst, pwidth, pext)
+    else
+      emit_load_mem_sized(ctx, dst, dst, 0, pwidth, pext)
+    end
   end
 end
 
@@ -5604,10 +6037,17 @@ def emit_store_place(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, place: Pla
     emit_push(ctx, src)
     emit_place_address(ctx, fctx, place, base)
     emit_pop(ctx, src)
-    # Store exactly the place's final storage width.
+    # Store exactly the place's final storage width. A @packed-aggregate
+    # field at a MISALIGNED static offset (the attributed layout's packed
+    # offsets) lowers through the byte-wise UNALIGNED path — never a
+    # direct misaligned mov.
     let pty = place_type(ctx, fctx, place)
     let pwidth = storage_width_of(ctx, &pty)
-    emit_store_mem_sized(ctx, base, 0, src, pwidth)
+    if place_access_is_unaligned(ctx, fctx, place, pwidth) then
+      emit_store_mem_sized_unaligned(ctx, base, src, pwidth)
+    else
+      emit_store_mem_sized(ctx, base, 0, src, pwidth)
+    end
   end
 end
 
@@ -5803,10 +6243,22 @@ def codegen_aggregate(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, kind: Agg
       panic("codegen_aggregate: no layout for concrete aggregate of type " + ckey)
     end
     # Store exactly the field's storage width so adjacent narrow fields are not
-    # corrupted by an 8-byte write.
+    # corrupted by an 8-byte write. A @packed-aggregate field at a
+    # MISALIGNED offset (the attributed layout's packed offsets) lowers
+    # through the byte-wise UNALIGNED path — never a direct misaligned mov.
     let field_ty = operand_type(ctx, fctx, &operands[i])
     let field_width = storage_width_of(ctx, &field_ty)
-    emit_store_mem_sized(ctx, dst, field_off as i32, scratch, field_width)
+    if (field_off % mem_width_bytes(field_width)) != 0 then
+      # The aggregate base is 8/16-aligned; the field's own static offset
+      # decides the alignment (the aggregate-literal store path carries no
+      # runtime base, so the field offset alone is the check).
+      emit_push(ctx, dst)
+      emit_add_ri(ctx, dst, field_off as i32)
+      emit_store_mem_sized_unaligned(ctx, dst, scratch, field_width)
+      emit_pop(ctx, scratch)
+    else
+      emit_store_mem_sized(ctx, dst, field_off as i32, scratch, field_width)
+    end
     i = i + 1
   end
   emit_load_mem(ctx, dst, sp, 0)
@@ -5833,11 +6285,12 @@ def codegen_statement(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, block: Mi
       # register/8-byte-word guess:
       #   ZeroSized          -> no payload: nothing to copy
       #   Scalar(width)      -> one register word (the pre-existing path)
-      #   ScalarPair(w1, w2) -> TWO words: the 16-byte Slice view { ptr, len }
-      #                         and other 16-byte aggregates (the Slice view
-      #                         keeps emitting exactly the two-word copy it
-      #                         always has; the single-register path would
-      #                         copy only the ptr word and leave len stale)
+      #   ScalarPair(w1, w2) -> TWO words: the 16-byte raw UnsafeSlice view
+      #                         { ptr, len } and other 16-byte aggregates
+      #                         (the raw view keeps emitting exactly the
+      #                         two-word copy it always has; the
+      #                         single-register path would copy only the ptr
+      #                         word and leave len stale)
       #   ByAddress(size)    -> a >16-byte inline aggregate (fixed arrays,
       #                         large structs): the full layout byte size is
       #                         copied — a 40-byte value is NOT an
@@ -5864,6 +6317,26 @@ def codegen_statement(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, block: Mi
           should_store = false
         when MirOperandKind::MirConsume(p) then
           emit_aggregate_value_copy(ctx, fctx, p, place, 16)
+          should_store = false
+        when _ then
+          load_operand_rvalue_item(ctx, fctx, op, rr)
+        end
+      when Result::Ok(ValueCategory::Vector(w)) then
+        # A SIMD vector value (the 16/32/64-byte vector row): the FULL
+        # image is byte-copied — the vector never travels through the
+        # scalar value register.
+        match op.kind
+        when MirOperandKind::MirCopy(p) then
+          emit_aggregate_value_copy(ctx, fctx, p, place, w)
+          should_store = false
+        when MirOperandKind::MirMovePlace(p) then
+          emit_aggregate_value_copy(ctx, fctx, p, place, w)
+          should_store = false
+        when MirOperandKind::MirRead(p) then
+          emit_aggregate_value_copy(ctx, fctx, p, place, w)
+          should_store = false
+        when MirOperandKind::MirConsume(p) then
+          emit_aggregate_value_copy(ctx, fctx, p, place, w)
           should_store = false
         when _ then
           load_operand_rvalue_item(ctx, fctx, op, rr)
@@ -5943,10 +6416,10 @@ def codegen_statement(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, block: Mi
         emit_mov_ri(ctx, rr, n as i64)
       when _ then
       if is_slice_view_type(ctx, &len_ty) then
-        # Slice[T] view len: the len lives in the VIEW's second word, not in
-        # a heap header. rr = the view base address (a plain slice place is
-        # addressed directly; a &Slice place derefs its ref slot once), then
-        # read [base + len_off].
+        # UnsafeSlice[T] raw-view len: the len lives in the VIEW's second
+        # word, not in a heap header. rr = the view base address (a plain
+        # raw-view place is addressed directly; a &UnsafeSlice place derefs
+        # its ref slot once), then read [base + len_off].
         emit_place_address(ctx, fctx, len_place, rr)
         if is_ref_like_type(&len_ty) then
           emit_load_mem(ctx, rr, rr, 0)
@@ -6158,6 +6631,92 @@ def codegen_statement(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, block: Mi
       # Call the runtime function
       emit_call_direct(ctx, "__tg_effect_record".to_string())
     end
+
+  when MirStatementKind::MirEffectPerform(eid, op_index, op_name, payload_ptr, result_ptr) then
+    # The algebraic-effects perform dispatch: call
+    # __tg_effect_perform(effect_id, op_index, payload_ptr, result_ptr) —
+    # the runtime walks the task's handler frames, invokes the innermost
+    # matching handler's dispatcher (which writes the op's result into
+    # *result_ptr) and returns; an unhandled operation aborts with the
+    # defined error. The payload/result slots live in THIS frame (the
+    # MirRef'd locals) — the synchronous dispatch reads/writes them.
+    # Arguments are loaded into the ABI registers in reverse order so the
+    # const loads never clobber an already-loaded operand.
+    match arg_reg(ctx.target.arch, 3)
+    when Option::Some(arg3) then
+      load_operand_control_input(ctx, fctx, result_ptr, arg3)
+    when Option::None then ()
+    end
+    match arg_reg(ctx.target.arch, 2)
+    when Option::Some(arg2) then
+      load_operand_control_input(ctx, fctx, payload_ptr, arg2)
+    when Option::None then ()
+    end
+    match arg_reg(ctx.target.arch, 1)
+    when Option::Some(arg1) then
+      emit_mov_ri(ctx, arg1, op_index as i64)
+    when Option::None then ()
+    end
+    match arg_reg(ctx.target.arch, 0)
+    when Option::Some(arg0) then
+      emit_mov_ri(ctx, arg0, eid.id as i64)
+    when Option::None then ()
+    end
+    emit_call_direct(ctx, "__tg_effect_perform".to_string())
+
+  when MirStatementKind::MirEffectFrameEnter(eid, op_count, bitmap, disp_name, env_ptr) then
+    # Install a handler frame: call __tg_effect_frame_push(slot_ptr,
+    # effect_id, op_count, handled_bitmap, dispatcher, env_ptr) — the
+    # runtime writes the frame into THIS function's per-occurrence frame
+    # slot (fctx.frame.effect_frame_offsets[this occurrence], consumed in
+    # emission order — nested/sequential handle-with blocks each get their
+    # own 48-byte slot) and links it onto the task's handler stack. The
+    # dispatcher address is the MIR-synthesized handler function's label.
+    if fctx.next_effect_frame >= fctx.frame.effect_frame_offsets.len() then
+      emit_trap(ctx)
+    else
+      let slot_off = fctx.frame.effect_frame_offsets[fctx.next_effect_frame]
+      fctx.next_effect_frame = fctx.next_effect_frame + 1
+      let fp = fp_reg(ctx.target.arch)
+      match arg_reg(ctx.target.arch, 5)
+      when Option::Some(arg5) then
+        load_operand_control_input(ctx, fctx, env_ptr, arg5)
+      when Option::None then ()
+      end
+      match arg_reg(ctx.target.arch, 4)
+      when Option::Some(arg4) then
+        emit_lea_label(ctx, arg4, disp_name.clone())
+      when Option::None then ()
+      end
+      match arg_reg(ctx.target.arch, 3)
+      when Option::Some(arg3) then
+        emit_mov_ri(ctx, arg3, bitmap as i64)
+      when Option::None then ()
+      end
+      match arg_reg(ctx.target.arch, 2)
+      when Option::Some(arg2) then
+        emit_mov_ri(ctx, arg2, op_count as i64)
+      when Option::None then ()
+      end
+      match arg_reg(ctx.target.arch, 1)
+      when Option::Some(arg1) then
+        emit_mov_ri(ctx, arg1, eid.id as i64)
+      when Option::None then ()
+      end
+      match arg_reg(ctx.target.arch, 0)
+      when Option::Some(arg0) then
+        emit_add_ri(ctx, fp, slot_off)
+        emit_mov_rr(ctx, arg0, fp)
+        emit_add_ri(ctx, fp, -slot_off)
+      when Option::None then ()
+      end
+      emit_call_direct(ctx, "__tg_effect_frame_push".to_string())
+    end
+
+  when MirStatementKind::MirEffectFrameExit then
+    # Pop the innermost handler frame (the frame slot is reclaimed by the
+    # epilogue).
+    emit_call_direct(ctx, "__tg_effect_frame_pop".to_string())
   end
 end
 
@@ -6232,7 +6791,7 @@ end
 #                         their ONE pointer-width TaggedPtr word crosses
 #                         regardless of the image size)
 #   ScalarPair(w1, w2)  — a 16-byte value: two ABI slots (16-byte tuples/
-#                         structs, the Slice view, I128)
+#                         structs, the raw UnsafeSlice view, I128)
 #   ByAddress(size)     — a >16-byte value: crosses BY ADDRESS (the slot
 #                         carries the address; returns use sret)
 # The SLOT rule stays mechanical (arg_reg(arch, index) Some/None picks the
@@ -6265,6 +6824,11 @@ def category_uses_sret(cat: ValueCategory) -> Bool
   when ValueCategory::ZeroSized then false
   when ValueCategory::Scalar(_) then false
   when ValueCategory::ScalarPair(_, _) then true
+  # THE VECTOR CASE: the 16-byte vector crosses THROUGH THE REGISTERS
+  # (never sret); the 32/64-byte vectors cross BY ADDRESS (memory/sret) —
+  # the classifier emits ByAddress for them, so the only Vector category
+  # that reaches here is the register-classified 16-byte form.
+  when ValueCategory::Vector(_) then false
   when ValueCategory::ByAddress(_) then true
   end
 end
@@ -6315,6 +6879,13 @@ end
 enum AbiArg
   Scalar(Int, Int)     # one <width>-byte value in ABI slot <index>
   ScalarPair(Int, Int) # a 16-byte value: ABI slots <index> and <index + 1>
+  # A SIMD VECTOR (the 16-byte vector row): the value crosses THROUGH THE
+  # REGISTER SLOTS — the address travels in slot <index> (the by-reference
+  # convention; the 128-bit payload lives in the memory image and the
+  # intrinsic bodies work in the architectural vector registers q0-q7 /
+  # xmm0-xmm7). <width> = the vector width (16). The 32/64-byte vectors
+  # classify ByAddress (memory) at the classifier.
+  Vector(Int, Int)     # SIMD vector in ABI slot <index>; <width> bytes
   ByAddress(Int, Int)  # a >16-byte value crossed BY ADDRESS: slot <index>
                        # carries the address; <size> = payload byte size
 end
@@ -6359,6 +6930,9 @@ def classify_argument(inout ctx: CodegenCtx, ty: Type, index: Int) -> AbiArg
     when ValueCategory::ZeroSized then AbiArg::Scalar(index, 0)
     when ValueCategory::Scalar(w) then AbiArg::Scalar(index, w)
     when ValueCategory::ScalarPair(_, _) then AbiArg::ScalarPair(index, index + 1)
+    # THE VECTOR CASE: the 16-byte SIMD vector crosses through the
+    # register slots (the vector class — never sret, never memory).
+    when ValueCategory::Vector(w) then AbiArg::Vector(index, w)
     when ValueCategory::ByAddress(sz) then AbiArg::ByAddress(index, sz)
     end
   end
@@ -6623,6 +7197,17 @@ def codegen_call(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, dest: Place, c
     when AbiArg::ScalarPair(_, _) then
       # A 16-byte aggregate (a two-slot value) — crossed by reference: the
       # ADDRESS travels in the single slot.
+      match arg_reg(arch, slot_idx)
+      when Option::Some(abi_r) then
+        load_call_arg_value(ctx, fctx, arg, abi_r)
+      when Option::None then
+        load_call_arg_value(ctx, fctx, arg, scratch)
+        emit_push(ctx, scratch)
+      end
+    when AbiArg::Vector(_, _) then
+      # THE VECTOR CASE: a 16-byte SIMD vector — crossed by reference
+      # through the register slots (the address travels in the slot; the
+      # 128-bit payload stays in the memory image).
       match arg_reg(arch, slot_idx)
       when Option::Some(abi_r) then
         load_call_arg_value(ctx, fctx, arg, abi_r)
@@ -7277,7 +7862,12 @@ def project_index_type(ctx: CodegenCtx, ty: Type) -> Type
     # chain keeps covering Vec/Array/Map/Set in their Adt storage forms.
     let qualified = type_name_by_id(ctx, tid.id)
     let type_name = bare_name_from_qualified(qualified)
-    if (type_name == "Slice") && !args.is_empty() then
+    if (type_name == "UnsafeSlice") && !args.is_empty() then
+      args[0].clone()
+    else if (type_name == "Slice") && !args.is_empty() then
+      # The SAFE source-spelled Slice (the std-declared shared struct):
+      # the element is its type argument (the index reads through the Arc
+      # deref — see the ProjIndex arm).
       args[0].clone()
     else if (type_name == "Box" || type_name == "Rc") && !args.is_empty() then
       project_index_type(ctx, &args[0])
@@ -7502,7 +8092,7 @@ def is_string_like_type(ctx: CodegenCtx, ty: Type) -> Bool
  # Adt form of Slice mirrors the canonical Slice arm
     # (char/i8/u8 element via the Adt args).
     let slt_named = bare_name_from_qualified(type_name_by_id(ctx, tid.id))
-    if slt_named == "Slice" && !args.is_empty() then
+    if slt_named == "UnsafeSlice" && !args.is_empty() then
       match strip_ref_like_type(&args[0])
       when Type::Char then true
       when Type::I8 then true
@@ -7574,17 +8164,20 @@ end
 # semantics (ProjIndex derefs the handle, MirLen reads the header) apply to
 # the heap collections; a FixedArray is indexed/measured in place (ProjIndex
 # keeps the inline base, MirLen emits the constant count).
-# Slice is NOT a heap collection: a Slice[T] value is the 16-byte inline
-# VIEW { ptr: Ptr[T], len: UInt } (Repr::Inline — see slice_view_layout).
+# UnsafeSlice is NOT a heap collection: an UnsafeSlice[T] value is the
+# 16-byte inline RAW VIEW { ptr: Ptr[T], len: UInt } (Repr::Inline — see
+# slice_view_layout). The SAFE source-spelled Slice is the std-declared
+# shared struct — its 8-byte Arc-class handle (slice_shared_handle_layout).
 # For a view, the projection chain's reg holds the DATA pointer after the
 # ProjDeref of the receiver, so ProjIndex must NOT deref again; len comes
 # from the view's second word, never from a heap header.
 # this is a REPRESENTATION question — the layout engine's type_repr
 # (via codegen_type_repr) is the single authority. The former name-list
-# special cases (Adt "Array" -> HeapVecHeader, "Slice" -> Inline) duplicated
-# type_repr's own Adt arms (layout_engine type_repr: named Array ->
-# HeapVecHeader, named Slice -> Inline, FixedArray -> Inline) and are
-# are not part of the model: the engine answers the same, table-for-table.
+# special cases (Adt "Array" -> HeapVecHeader, "UnsafeSlice" -> Inline)
+# duplicated type_repr's own Adt arms (layout_engine type_repr: named
+# Array -> HeapVecHeader, named UnsafeSlice -> Inline, FixedArray ->
+# Inline) and are not part of the model: the engine answers the same,
+# table-for-table.
 def is_heap_collection_type(inout ctx: CodegenCtx, ty: Type) -> Bool
   match codegen_type_repr(ctx, &strip_ref_like_type(ty))
   when Repr::HeapVecHeader then true
@@ -7594,9 +8187,27 @@ def is_heap_collection_type(inout ctx: CodegenCtx, ty: Type) -> Bool
   end
 end
 
-# True when the value type is the Slice view (after stripping references and
-# pointer layers). Mirrors the layout engine's is_slice_view_tid.
+# True when the value type is the RAW UnsafeSlice view (after stripping
+# references and pointer layers). Mirrors the layout engine's
+# is_slice_view_tid. The SAFE source-spelled Slice is the std-declared
+# shared struct — its operations compile as its std methods (the Arc
+# deref through the backing), never through these raw-view emitters.
 def is_slice_view_type(ctx: CodegenCtx, ty: Type) -> Bool
+  match strip_ref_like_type(ty)
+  when Type::Adt(tid, _) then
+    bare_name_from_qualified(type_name_by_id(ctx, tid.id)) == "UnsafeSlice"
+  when _ then false
+  end
+end
+
+# True when the value type is the SAFE SOURCE-spelled Slice — the
+# std-declared SHARED struct (Slice[T] { inner: ArcStrong[SliceBacking[T]] }).
+# Its VALUE is the 8-byte Arc-class handle; its element reads go through
+# the Arc deref chain into the 24-byte pinned backing (slice_shared_handle
+# _layout / slice_shared_backing_layout): handle word @ 0, ArcInnerWeak
+# { refcount @ 0, weak_count @ 8, data @ 16 }, SliceBacking
+# { ptr @ 0, len @ 8, offset @ 16 }.
+def is_shared_slice_type(ctx: CodegenCtx, ty: Type) -> Bool
   match strip_ref_like_type(ty)
   when Type::Adt(tid, _) then
     bare_name_from_qualified(type_name_by_id(ctx, tid.id)) == "Slice"
@@ -8255,6 +8866,7 @@ def element_stride_bytes(inout ctx: CodegenCtx, elem_ty: Type) -> Int
     when ValueCategory::ZeroSized then 0
     when ValueCategory::Scalar(w) then w
     when ValueCategory::ScalarPair(_, _) then 16
+    when ValueCategory::Vector(w) then w
     when ValueCategory::ByAddress(sz) then sz
     end
   end
@@ -8270,7 +8882,7 @@ def vec_elem_type_of(inout ctx: CodegenCtx, ty: Type) -> Type
   when Type::FixedArray(elem, _) then elem.clone()
   when Type::Adt(tid, args) then
     let ven = bare_name_from_qualified(type_name_by_id(ctx, tid.id))
-    if ven == "Array" || ven == "Vec" || ven == "Slice" then
+    if ven == "Array" || ven == "Vec" || ven == "UnsafeSlice" || ven == "Slice" then
       if args.is_empty() then
         panic("internal error: Vec/Array receiver type carries no element type argument at a codegen operation site")
       end
@@ -8365,7 +8977,16 @@ def apply_projections(inout ctx: CodegenCtx, fctx: FnCodegenCtx, place: Place, p
       let field_ty = projected_field_type(ctx, &fid, &downcast_variant, &current_ty)
       let fwidth = storage_width_of(ctx, &field_ty)
       let fext = storage_signedness_of(&field_ty)
-      emit_load_mem_sized(ctx, reg, reg, offset as i32, fwidth, fext)
+      if (offset % mem_width_bytes(fwidth)) != 0 then
+        # A @packed-aggregate field at a MISALIGNED static offset: the
+        # byte-wise unaligned load.
+        emit_push(ctx, reg)
+        emit_add_ri(ctx, reg, offset as i32)
+        emit_load_mem_sized_unaligned(ctx, reg, reg, fwidth, fext)
+        emit_pop(ctx, scratch)
+      else
+        emit_load_mem_sized(ctx, reg, reg, offset as i32, fwidth, fext)
+      end
       current_ty = field_ty
       last_deref_unwrapped_ref = false
     when Projection::TupleIndex(idx) then
@@ -8375,27 +8996,59 @@ def apply_projections(inout ctx: CodegenCtx, fctx: FnCodegenCtx, place: Place, p
       let field_ty = projected_tuple_type(ctx, &current_ty, idx)
       let fwidth = storage_width_of(ctx, &field_ty)
       let fext = storage_signedness_of(&field_ty)
-      emit_load_mem_sized(ctx, reg, reg, offset as i32, fwidth, fext)
+      if (offset % mem_width_bytes(fwidth)) != 0 then
+        # A @packed-aggregate tuple field at a MISALIGNED static offset:
+        # the byte-wise unaligned load.
+        emit_push(ctx, reg)
+        emit_add_ri(ctx, reg, offset as i32)
+        emit_load_mem_sized_unaligned(ctx, reg, reg, fwidth, fext)
+        emit_pop(ctx, scratch)
+      else
+        emit_load_mem_sized(ctx, reg, reg, offset as i32, fwidth, fext)
+      end
       current_ty = field_ty
       last_deref_unwrapped_ref = false
     when Projection::ProjIndex(local_id) then
-      if is_heap_collection_type(ctx, &current_ty) then
-        emit_load_mem(ctx, reg, reg, 0)
-      end
       let idx_reg = scratch2_reg(ctx.target.arch)
       load_place(ctx, fctx, &Place { local: local_id, projections: Vec::new() }, idx_reg)
       # Determine element size from the collection type.
       let elem_ty = project_index_type(ctx, &current_ty)
       let elem_size = element_stride_bytes(ctx, &elem_ty)
       let is_byte_indexed = is_string_like_type(ctx, &current_ty)
-      if !is_byte_indexed then
-        # Scale index by the element's storage stride (1/2/4/8 shifts,
-        # multiply for any other stride — the SAME authority the runtime
-        # reads from the Vec header).
-        emit_scale_index(ctx, idx_reg, elem_size)
+      if is_heap_collection_type(ctx, &current_ty) then
+        emit_load_mem(ctx, reg, reg, 0)
+        if !is_byte_indexed then
+          # Scale index by the element's storage stride (1/2/4/8 shifts,
+          # multiply for any other stride — the SAME authority the runtime
+          # reads from the Vec header).
+          emit_scale_index(ctx, idx_reg, elem_size)
+        end
+        # Add scaled offset to base address
+        emit_add_rrr(ctx, reg, reg, idx_reg)
+      elsif is_shared_slice_type(ctx, &current_ty) then
+        # The SAFE source-spelled Slice — the SHARED form's element read:
+        # element i lives at backing.ptr + i * stride (the backing.ptr IS
+        # the pinned window's start; the backing's offset is source
+        # metadata, never an element address — the std get/sub contract).
+        # The Arc deref chain: [value+0] = ArcInnerWeak*, [inner+16] =
+        # SliceBacking { ptr@0, len@8, offset@16 }. The scratch register
+        # is consumed BEFORE emit_scale_index (which may itself use the
+        # scratch on x86-64 for a non-power-of-2 stride).
+        emit_load_mem(ctx, scratch_reg(ctx.target.arch), reg, 0)  # scratch = ArcInnerWeak*
+        emit_load_mem(ctx, scratch_reg(ctx.target.arch), scratch_reg(ctx.target.arch), 16) # scratch = SliceBacking*
+        emit_load_mem(ctx, reg, scratch_reg(ctx.target.arch), 0)  # reg = backing.ptr
+        emit_add_rrr(ctx, reg, reg, idx_reg)                      # reg = ptr + i
+        emit_scale_index(ctx, reg, elem_size)
+      else
+        if !is_byte_indexed then
+          # Scale index by the element's storage stride (1/2/4/8 shifts,
+          # multiply for any other stride — the SAME authority the runtime
+          # reads from the Vec header).
+          emit_scale_index(ctx, idx_reg, elem_size)
+        end
+        # Add scaled offset to base address
+        emit_add_rrr(ctx, reg, reg, idx_reg)
       end
-      # Add scaled offset to base address
-      emit_add_rrr(ctx, reg, reg, idx_reg)
       if is_byte_indexed then
         match reg
         when PhysReg::A64Reg(a) then a64_ldrb(&mut ctx.text, a, a, 0)
@@ -8409,23 +9062,49 @@ def apply_projections(inout ctx: CodegenCtx, fctx: FnCodegenCtx, place: Place, p
       current_ty = elem_ty
       last_deref_unwrapped_ref = false
     when Projection::ProjConstantIndex(ci) then
-      if is_heap_collection_type(ctx, &current_ty) then
-        emit_load_mem(ctx, reg, reg, 0)
-      end
       let is_byte_indexed = is_string_like_type(ctx, &current_ty)
       let elem_ty2 = project_index_type(ctx, &current_ty)
       let elem_size2 = element_stride_bytes(ctx, &elem_ty2)
-      if is_byte_indexed then
-        emit_add_ri(ctx, reg, ci as i32)
-        match reg
-        when PhysReg::A64Reg(a) then a64_ldrb(&mut ctx.text, a, a, 0)
-        when PhysReg::X64Reg(x) then x64_movzx_r64_m8(&mut ctx.text, x, x, 0)
+      if is_heap_collection_type(ctx, &current_ty) then
+        emit_load_mem(ctx, reg, reg, 0)
+        if is_byte_indexed then
+          emit_add_ri(ctx, reg, ci as i32)
+          match reg
+          when PhysReg::A64Reg(a) then a64_ldrb(&mut ctx.text, a, a, 0)
+          when PhysReg::X64Reg(x) then x64_movzx_r64_m8(&mut ctx.text, x, x, 0)
+          end
+        else
+          let offset = ci * elem_size2
+          let ewidth2 = storage_width_of(ctx, &elem_ty2)
+          let eext2 = storage_signedness_of(&elem_ty2)
+          emit_load_mem_sized(ctx, reg, reg, offset as i32, ewidth2, eext2)
         end
-      else
-        let offset = ci * elem_size2
+      elsif is_shared_slice_type(ctx, &current_ty) then
+        # The SAFE source-spelled Slice — the SHARED form's constant-index
+        # read: element ci at backing.ptr + ci * stride (the Arc deref
+        # chain; see the ProjIndex arm — the scratch is consumed before
+        # emit_scale_index).
+        emit_load_mem(ctx, scratch_reg(ctx.target.arch), reg, 0)  # scratch = ArcInnerWeak*
+        emit_load_mem(ctx, scratch_reg(ctx.target.arch), scratch_reg(ctx.target.arch), 16) # scratch = SliceBacking*
+        emit_load_mem(ctx, reg, scratch_reg(ctx.target.arch), 0)  # reg = backing.ptr
+        emit_add_ri(ctx, reg, ci as i32)                          # reg = ptr + ci
+        emit_scale_index(ctx, reg, elem_size2)
         let ewidth2 = storage_width_of(ctx, &elem_ty2)
         let eext2 = storage_signedness_of(&elem_ty2)
-        emit_load_mem_sized(ctx, reg, reg, offset as i32, ewidth2, eext2)
+        emit_load_mem_sized(ctx, reg, reg, 0, ewidth2, eext2)
+      else
+        if is_byte_indexed then
+          emit_add_ri(ctx, reg, ci as i32)
+          match reg
+          when PhysReg::A64Reg(a) then a64_ldrb(&mut ctx.text, a, a, 0)
+          when PhysReg::X64Reg(x) then x64_movzx_r64_m8(&mut ctx.text, x, x, 0)
+          end
+        else
+          let offset = ci * elem_size2
+          let ewidth2 = storage_width_of(ctx, &elem_ty2)
+          let eext2 = storage_signedness_of(&elem_ty2)
+          emit_load_mem_sized(ctx, reg, reg, offset as i32, ewidth2, eext2)
+        end
       end
       current_ty = elem_ty2
       last_deref_unwrapped_ref = false
@@ -8715,9 +9394,19 @@ def store_place(inout ctx: CodegenCtx, fctx: FnCodegenCtx, place: Place, src: Ph
 
       emit_pop(ctx, src)  # restore value
       # Store exactly the final projected value's storage width so a narrow
-      # field/element is never overwritten by an 8-byte write.
+      # field/element is never overwritten by an 8-byte write. A
+      # @packed-aggregate field at a MISALIGNED static offset (the
+      # attributed layout's packed offsets) lowers through the byte-wise
+      # UNALIGNED path — never a direct misaligned mov.
       let final_store_width = storage_width_of(ctx, &current_ty)
-      emit_store_mem_sized(ctx, base, store_off, src, final_store_width)
+      if (store_off as Int) % mem_width_bytes(final_store_width) != 0 then
+        emit_push(ctx, base)
+        emit_add_ri(ctx, base, store_off)
+        emit_store_mem_sized_unaligned(ctx, base, src, final_store_width)
+        emit_pop(ctx, scratch)
+      else
+        emit_store_mem_sized(ctx, base, store_off, src, final_store_width)
+      end
     end
   when Option::None then
     panic("store_place: unknown local " + place.local.id.to_string())
@@ -8866,9 +9555,10 @@ def codegen_rvalue(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, stmt: MirSta
         emit_mov_ri(ctx, dst, n as i64)
       when _ then
       if is_slice_view_type(ctx, &len_ty2) then
-        # Slice[T] view len: the len lives in the VIEW's second word, not in
-        # a heap header. dst = the view base address (a plain slice place is
-        # addressed directly; a &Slice place derefs its ref slot once).
+        # UnsafeSlice[T] raw-view len: the len lives in the VIEW's second
+        # word, not in a heap header. dst = the view base address (a plain
+        # raw-view place is addressed directly; a &UnsafeSlice place derefs
+        # its ref slot once).
         emit_place_address(ctx, fctx, place, dst)
         if is_ref_like_type(&len_ty2) then
           emit_load_mem(ctx, dst, dst, 0)
@@ -9767,11 +10457,18 @@ def emit_load_place(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, place: Plac
     end
   else
     emit_place_address(ctx, fctx, place, dst)
-    # Load exactly the final projected value's storage width.
+    # Load exactly the final projected value's storage width. A
+    # @packed-aggregate field at a MISALIGNED static offset (the
+    # attributed layout's packed offsets) lowers through the byte-wise
+    # UNALIGNED path — never a direct misaligned mov.
     let pty = place_type(ctx, fctx, place)
     let pwidth = storage_width_of(ctx, &pty)
     let pext = storage_signedness_of(&pty)
-    emit_load_mem_sized(ctx, dst, dst, 0, pwidth, pext)
+    if place_access_is_unaligned(ctx, fctx, place, pwidth) then
+      emit_load_mem_sized_unaligned(ctx, dst, dst, pwidth, pext)
+    else
+      emit_load_mem_sized(ctx, dst, dst, 0, pwidth, pext)
+    end
   end
 end
 
@@ -9802,10 +10499,17 @@ def emit_store_place(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, place: Pla
     emit_push(ctx, src)
     emit_place_address(ctx, fctx, place, base)
     emit_pop(ctx, src)
-    # Store exactly the place's final storage width.
+    # Store exactly the place's final storage width. A @packed-aggregate
+    # field at a MISALIGNED static offset (the attributed layout's packed
+    # offsets) lowers through the byte-wise UNALIGNED path — never a
+    # direct misaligned mov.
     let pty = place_type(ctx, fctx, place)
     let pwidth = storage_width_of(ctx, &pty)
-    emit_store_mem_sized(ctx, base, 0, src, pwidth)
+    if place_access_is_unaligned(ctx, fctx, place, pwidth) then
+      emit_store_mem_sized_unaligned(ctx, base, src, pwidth)
+    else
+      emit_store_mem_sized(ctx, base, 0, src, pwidth)
+    end
   end
 end
 
@@ -10001,10 +10705,22 @@ def codegen_aggregate(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, kind: Agg
       panic("codegen_aggregate: no layout for concrete aggregate of type " + ckey)
     end
     # Store exactly the field's storage width so adjacent narrow fields are not
-    # corrupted by an 8-byte write.
+    # corrupted by an 8-byte write. A @packed-aggregate field at a
+    # MISALIGNED offset (the attributed layout's packed offsets) lowers
+    # through the byte-wise UNALIGNED path — never a direct misaligned mov.
     let field_ty = operand_type(ctx, fctx, &operands[i])
     let field_width = storage_width_of(ctx, &field_ty)
-    emit_store_mem_sized(ctx, dst, field_off as i32, scratch, field_width)
+    if (field_off % mem_width_bytes(field_width)) != 0 then
+      # The aggregate base is 8/16-aligned; the field's own static offset
+      # decides the alignment (the aggregate-literal store path carries no
+      # runtime base, so the field offset alone is the check).
+      emit_push(ctx, dst)
+      emit_add_ri(ctx, dst, field_off as i32)
+      emit_store_mem_sized_unaligned(ctx, dst, scratch, field_width)
+      emit_pop(ctx, scratch)
+    else
+      emit_store_mem_sized(ctx, dst, field_off as i32, scratch, field_width)
+    end
     i = i + 1
   end
   emit_load_mem(ctx, dst, sp, 0)
@@ -10031,11 +10747,12 @@ def codegen_statement(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, block: Mi
       # register/8-byte-word guess:
       #   ZeroSized          -> no payload: nothing to copy
       #   Scalar(width)      -> one register word (the pre-existing path)
-      #   ScalarPair(w1, w2) -> TWO words: the 16-byte Slice view { ptr, len }
-      #                         and other 16-byte aggregates (the Slice view
-      #                         keeps emitting exactly the two-word copy it
-      #                         always has; the single-register path would
-      #                         copy only the ptr word and leave len stale)
+      #   ScalarPair(w1, w2) -> TWO words: the 16-byte raw UnsafeSlice view
+      #                         { ptr, len } and other 16-byte aggregates
+      #                         (the raw view keeps emitting exactly the
+      #                         two-word copy it always has; the
+      #                         single-register path would copy only the ptr
+      #                         word and leave len stale)
       #   ByAddress(size)    -> a >16-byte inline aggregate (fixed arrays,
       #                         large structs): the full layout byte size is
       #                         copied — a 40-byte value is NOT an
@@ -10062,6 +10779,26 @@ def codegen_statement(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, block: Mi
           should_store = false
         when MirOperandKind::MirConsume(p) then
           emit_aggregate_value_copy(ctx, fctx, p, place, 16)
+          should_store = false
+        when _ then
+          load_operand_rvalue_item(ctx, fctx, op, rr)
+        end
+      when Result::Ok(ValueCategory::Vector(w)) then
+        # A SIMD vector value (the 16/32/64-byte vector row): the FULL
+        # image is byte-copied — the vector never travels through the
+        # scalar value register.
+        match op.kind
+        when MirOperandKind::MirCopy(p) then
+          emit_aggregate_value_copy(ctx, fctx, p, place, w)
+          should_store = false
+        when MirOperandKind::MirMovePlace(p) then
+          emit_aggregate_value_copy(ctx, fctx, p, place, w)
+          should_store = false
+        when MirOperandKind::MirRead(p) then
+          emit_aggregate_value_copy(ctx, fctx, p, place, w)
+          should_store = false
+        when MirOperandKind::MirConsume(p) then
+          emit_aggregate_value_copy(ctx, fctx, p, place, w)
           should_store = false
         when _ then
           load_operand_rvalue_item(ctx, fctx, op, rr)
@@ -10141,10 +10878,10 @@ def codegen_statement(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, block: Mi
         emit_mov_ri(ctx, rr, n as i64)
       when _ then
       if is_slice_view_type(ctx, &len_ty) then
-        # Slice[T] view len: the len lives in the VIEW's second word, not in
-        # a heap header. rr = the view base address (a plain slice place is
-        # addressed directly; a &Slice place derefs its ref slot once), then
-        # read [base + len_off].
+        # UnsafeSlice[T] raw-view len: the len lives in the VIEW's second
+        # word, not in a heap header. rr = the view base address (a plain
+        # raw-view place is addressed directly; a &UnsafeSlice place derefs
+        # its ref slot once), then read [base + len_off].
         emit_place_address(ctx, fctx, len_place, rr)
         if is_ref_like_type(&len_ty) then
           emit_load_mem(ctx, rr, rr, 0)
@@ -10356,6 +11093,92 @@ def codegen_statement(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, block: Mi
       # Call the runtime function
       emit_call_direct(ctx, "__tg_effect_record".to_string())
     end
+
+  when MirStatementKind::MirEffectPerform(eid, op_index, op_name, payload_ptr, result_ptr) then
+    # The algebraic-effects perform dispatch: call
+    # __tg_effect_perform(effect_id, op_index, payload_ptr, result_ptr) —
+    # the runtime walks the task's handler frames, invokes the innermost
+    # matching handler's dispatcher (which writes the op's result into
+    # *result_ptr) and returns; an unhandled operation aborts with the
+    # defined error. The payload/result slots live in THIS frame (the
+    # MirRef'd locals) — the synchronous dispatch reads/writes them.
+    # Arguments are loaded into the ABI registers in reverse order so the
+    # const loads never clobber an already-loaded operand.
+    match arg_reg(ctx.target.arch, 3)
+    when Option::Some(arg3) then
+      load_operand_control_input(ctx, fctx, result_ptr, arg3)
+    when Option::None then ()
+    end
+    match arg_reg(ctx.target.arch, 2)
+    when Option::Some(arg2) then
+      load_operand_control_input(ctx, fctx, payload_ptr, arg2)
+    when Option::None then ()
+    end
+    match arg_reg(ctx.target.arch, 1)
+    when Option::Some(arg1) then
+      emit_mov_ri(ctx, arg1, op_index as i64)
+    when Option::None then ()
+    end
+    match arg_reg(ctx.target.arch, 0)
+    when Option::Some(arg0) then
+      emit_mov_ri(ctx, arg0, eid.id as i64)
+    when Option::None then ()
+    end
+    emit_call_direct(ctx, "__tg_effect_perform".to_string())
+
+  when MirStatementKind::MirEffectFrameEnter(eid, op_count, bitmap, disp_name, env_ptr) then
+    # Install a handler frame: call __tg_effect_frame_push(slot_ptr,
+    # effect_id, op_count, handled_bitmap, dispatcher, env_ptr) — the
+    # runtime writes the frame into THIS function's per-occurrence frame
+    # slot (fctx.frame.effect_frame_offsets[this occurrence], consumed in
+    # emission order — nested/sequential handle-with blocks each get their
+    # own 48-byte slot) and links it onto the task's handler stack. The
+    # dispatcher address is the MIR-synthesized handler function's label.
+    if fctx.next_effect_frame >= fctx.frame.effect_frame_offsets.len() then
+      emit_trap(ctx)
+    else
+      let slot_off = fctx.frame.effect_frame_offsets[fctx.next_effect_frame]
+      fctx.next_effect_frame = fctx.next_effect_frame + 1
+      let fp = fp_reg(ctx.target.arch)
+      match arg_reg(ctx.target.arch, 5)
+      when Option::Some(arg5) then
+        load_operand_control_input(ctx, fctx, env_ptr, arg5)
+      when Option::None then ()
+      end
+      match arg_reg(ctx.target.arch, 4)
+      when Option::Some(arg4) then
+        emit_lea_label(ctx, arg4, disp_name.clone())
+      when Option::None then ()
+      end
+      match arg_reg(ctx.target.arch, 3)
+      when Option::Some(arg3) then
+        emit_mov_ri(ctx, arg3, bitmap as i64)
+      when Option::None then ()
+      end
+      match arg_reg(ctx.target.arch, 2)
+      when Option::Some(arg2) then
+        emit_mov_ri(ctx, arg2, op_count as i64)
+      when Option::None then ()
+      end
+      match arg_reg(ctx.target.arch, 1)
+      when Option::Some(arg1) then
+        emit_mov_ri(ctx, arg1, eid.id as i64)
+      when Option::None then ()
+      end
+      match arg_reg(ctx.target.arch, 0)
+      when Option::Some(arg0) then
+        emit_add_ri(ctx, fp, slot_off)
+        emit_mov_rr(ctx, arg0, fp)
+        emit_add_ri(ctx, fp, -slot_off)
+      when Option::None then ()
+      end
+      emit_call_direct(ctx, "__tg_effect_frame_push".to_string())
+    end
+
+  when MirStatementKind::MirEffectFrameExit then
+    # Pop the innermost handler frame (the frame slot is reclaimed by the
+    # epilogue).
+    emit_call_direct(ctx, "__tg_effect_frame_pop".to_string())
   end
 end
 
@@ -10430,7 +11253,7 @@ end
 #                         their ONE pointer-width TaggedPtr word crosses
 #                         regardless of the image size)
 #   ScalarPair(w1, w2)  — a 16-byte value: two ABI slots (16-byte tuples/
-#                         structs, the Slice view, I128)
+#                         structs, the raw UnsafeSlice view, I128)
 #   ByAddress(size)     — a >16-byte value: crosses BY ADDRESS (the slot
 #                         carries the address; returns use sret)
 # The SLOT rule stays mechanical (arg_reg(arch, index) Some/None picks the
@@ -10463,6 +11286,11 @@ def category_uses_sret(cat: ValueCategory) -> Bool
   when ValueCategory::ZeroSized then false
   when ValueCategory::Scalar(_) then false
   when ValueCategory::ScalarPair(_, _) then true
+  # THE VECTOR CASE: the 16-byte vector crosses THROUGH THE REGISTERS
+  # (never sret); the 32/64-byte vectors cross BY ADDRESS (memory/sret) —
+  # the classifier emits ByAddress for them, so the only Vector category
+  # that reaches here is the register-classified 16-byte form.
+  when ValueCategory::Vector(_) then false
   when ValueCategory::ByAddress(_) then true
   end
 end
@@ -10513,6 +11341,13 @@ end
 enum AbiArg
   Scalar(Int, Int)     # one <width>-byte value in ABI slot <index>
   ScalarPair(Int, Int) # a 16-byte value: ABI slots <index> and <index + 1>
+  # A SIMD VECTOR (the 16-byte vector row): the value crosses THROUGH THE
+  # REGISTER SLOTS — the address travels in slot <index> (the by-reference
+  # convention; the 128-bit payload lives in the memory image and the
+  # intrinsic bodies work in the architectural vector registers q0-q7 /
+  # xmm0-xmm7). <width> = the vector width (16). The 32/64-byte vectors
+  # classify ByAddress (memory) at the classifier.
+  Vector(Int, Int)     # SIMD vector in ABI slot <index>; <width> bytes
   ByAddress(Int, Int)  # a >16-byte value crossed BY ADDRESS: slot <index>
                        # carries the address; <size> = payload byte size
 end
@@ -10557,6 +11392,9 @@ def classify_argument(inout ctx: CodegenCtx, ty: Type, index: Int) -> AbiArg
     when ValueCategory::ZeroSized then AbiArg::Scalar(index, 0)
     when ValueCategory::Scalar(w) then AbiArg::Scalar(index, w)
     when ValueCategory::ScalarPair(_, _) then AbiArg::ScalarPair(index, index + 1)
+    # THE VECTOR CASE: the 16-byte SIMD vector crosses through the
+    # register slots (the vector class — never sret, never memory).
+    when ValueCategory::Vector(w) then AbiArg::Vector(index, w)
     when ValueCategory::ByAddress(sz) then AbiArg::ByAddress(index, sz)
     end
   end
@@ -10821,6 +11659,17 @@ def codegen_call(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, dest: Place, c
     when AbiArg::ScalarPair(_, _) then
       # A 16-byte aggregate (a two-slot value) — crossed by reference: the
       # ADDRESS travels in the single slot.
+      match arg_reg(arch, slot_idx)
+      when Option::Some(abi_r) then
+        load_call_arg_value(ctx, fctx, arg, abi_r)
+      when Option::None then
+        load_call_arg_value(ctx, fctx, arg, scratch)
+        emit_push(ctx, scratch)
+      end
+    when AbiArg::Vector(_, _) then
+      # THE VECTOR CASE: a 16-byte SIMD vector — crossed by reference
+      # through the register slots (the address travels in the slot; the
+      # 128-bit payload stays in the memory image).
       match arg_reg(arch, slot_idx)
       when Option::Some(abi_r) then
         load_call_arg_value(ctx, fctx, arg, abi_r)
@@ -11291,6 +12140,25 @@ end
 def codegen_intrinsic(inout ctx: CodegenCtx, fctx: FnCodegenCtx, name: String, args: Vec[MirOperand], call_args: Vec[MirCallArg], orig_fn_name: String, dest_ty: Type, dest: Place) -> Bool
   let arch = ctx.target.arch
   let rr = ret_reg(arch)
+ # (THE SIMD GATE): a SIMD intrinsic name (the __intrinsic_simd_<op>_<lane>
+  # family — the vector operations of the IntrinsicId domain, classified
+  # by types.tg's SIMD router) routes to the SIMD emission BEFORE the
+  # IntrinsicId dispatch: the SIMD arms inline the machine instructions
+  # (aarch64 NEON + x86 SSE/AVX) and materialize the full vector image
+  # into the destination place (returning true — the post-call register
+  # store is suppressed). An unknown SIMD spelling fails closed (the
+  # router's Option::None means the name is not a SIMD intrinsic and the
+  # IntrinsicId dispatch below owns it).
+  match simd_intrinsic_kind_of(&name)
+  when Option::Some(kind) then
+    match simd_intrinsic_lane_of(&name)
+    when Option::Some(lane) then
+      return codegen_simd_intrinsic(ctx, fctx, name, kind, lane, args, dest, dest_ty)
+    when Option::None then
+      panic("internal error: SIMD intrinsic `" + name + "` classified but its lane shape is unknown")
+    end
+  when Option::None then ()
+  end
  # (IntrinsicId at check time): the classification comes from the ONE
   # semantic router (types.tg's classify_intrinsic_call — the same
   # classification the type checker attaches at call-recording time) over
@@ -11339,7 +12207,7 @@ def codegen_intrinsic(inout ctx: CodegenCtx, fctx: FnCodegenCtx, name: String, a
     let recv_ty = if args.len() > 0 then operand_type(ctx, fctx, &args[0]) else Type::Unit end
     let recv_value_ty = strip_receiver_ptr_like_type(&recv_ty)
     if is_slice_view_type(ctx, &recv_value_ty) then
-      # Slice[T] view is_empty: [view + len_off] == 0.
+      # UnsafeSlice[T] raw-view is_empty: [view + len_off] == 0.
       codegen_slice_is_empty(ctx)
     else
       emit_load_mem(ctx, rr, rr, 0)
@@ -11428,9 +12296,9 @@ def codegen_intrinsic(inout ctx: CodegenCtx, fctx: FnCodegenCtx, name: String, a
     let recv_ty = if args.len() > 0 then operand_type(ctx, fctx, &args[0]) else Type::Unit end
     let recv_value_ty = strip_receiver_ptr_like_type(&recv_ty)
     if is_slice_view_type(ctx, &recv_value_ty) then
-      # Slice[T] view len: the receiver is the &Slice borrow — arg0 holds
-      # the ADDRESS of the view; len is the view's second word, never a
-      # heap-header read.
+      # UnsafeSlice[T] raw-view len: the receiver is the &UnsafeSlice
+      # borrow — arg0 holds the ADDRESS of the view; len is the view's
+      # second word, never a heap-header read.
       codegen_slice_len(ctx)
     else
       emit_load_mem(ctx, rr, rr, 0)
@@ -11440,8 +12308,8 @@ def codegen_intrinsic(inout ctx: CodegenCtx, fctx: FnCodegenCtx, name: String, a
     let recv_ty = if args.len() > 0 then operand_type(ctx, fctx, &args[0]) else Type::Unit end
     let recv_value_ty = strip_receiver_ptr_like_type(&recv_ty)
     if is_slice_view_type(ctx, &recv_value_ty) then
-      # Slice[T] view get: element at ptr + index * size_of(T) — the
-      # element stride/width come from the layout engine (no fixed 8).
+      # UnsafeSlice[T] raw-view get: element at ptr + index * size_of(T) —
+      # the element stride/width come from the layout engine (no fixed 8).
       let slice_elem_ty = project_index_type(ctx, &recv_value_ty)
       codegen_slice_get(ctx, &slice_elem_ty)
     else
@@ -11473,6 +12341,12 @@ def codegen_intrinsic(inout ctx: CodegenCtx, fctx: FnCodegenCtx, name: String, a
           emit_load_mem_sized(ctx, rr, rr, 0, gw, ge)
         when ValueCategory::ScalarPair(_, _) then
           codegen_array_image_to_dest(ctx, fctx, dest, 16)
+          return true
+        when ValueCategory::Vector(w) then
+          # THE VECTOR CASE: a SIMD vector element — the FULL image is
+          # materialized into the destination place (the post-call
+          # register store is suppressed).
+          codegen_array_image_to_dest(ctx, fctx, dest, w)
           return true
         when ValueCategory::ByAddress(sz) then
           codegen_array_image_to_dest(ctx, fctx, dest, sz)
@@ -11627,9 +12501,10 @@ def codegen_intrinsic(inout ctx: CodegenCtx, fctx: FnCodegenCtx, name: String, a
       orig_fn_name == "__intrinsic_array_len" ||
       orig_fn_name == "array_len"
     if is_slice_view_type(ctx, &value_ty) then
-      # Slice[T] view len: arg0 is the &Slice borrow — the ADDRESS of the
-      # view value. The len is the view's second word (slice_view_field_offset),
-      # NEVER a heap-header read. No deref: the view base stays in arg0.
+      # UnsafeSlice[T] raw-view len: arg0 is the &UnsafeSlice borrow — the
+      # ADDRESS of the view value. The len is the view's second word
+      # (slice_view_field_offset), NEVER a heap-header read. No deref: the
+      # view base stays in arg0.
       codegen_slice_len(ctx)
     # Fixed arrays (collapsed): the canonical Array count is are not part of the model —
     # the Adt Array form is the heap-vector identity, so every array is a
@@ -11794,7 +12669,7 @@ def codegen_intrinsic(inout ctx: CodegenCtx, fctx: FnCodegenCtx, name: String, a
     let recv_ty = if args.len() > 0 then operand_type(ctx, fctx, &args[0]) else Type::Unit end
     let recv_value_ty = strip_receiver_ptr_like_type(&recv_ty)
     if is_slice_view_type(ctx, &recv_value_ty) then
-      # Slice[T] view last: element at ptr + (len-1) * size_of(T).
+      # UnsafeSlice[T] raw-view last: element at ptr + (len-1) * size_of(T).
       let slice_elem_ty = project_index_type(ctx, &recv_value_ty)
       codegen_slice_last(ctx, &slice_elem_ty)
     else
@@ -11805,7 +12680,7 @@ def codegen_intrinsic(inout ctx: CodegenCtx, fctx: FnCodegenCtx, name: String, a
     let recv_ty = if args.len() > 0 then operand_type(ctx, fctx, &args[0]) else Type::Unit end
     let recv_value_ty = strip_receiver_ptr_like_type(&recv_ty)
     if is_slice_view_type(ctx, &recv_value_ty) then
-      # Slice[T] view first: element at ptr.
+      # UnsafeSlice[T] raw-view first: element at ptr.
       let slice_elem_ty = project_index_type(ctx, &recv_value_ty)
       codegen_slice_first(ctx, &slice_elem_ty)
     else
@@ -11816,7 +12691,7 @@ def codegen_intrinsic(inout ctx: CodegenCtx, fctx: FnCodegenCtx, name: String, a
     let recv_ty = if args.len() > 0 then operand_type(ctx, fctx, &args[0]) else Type::Unit end
     let recv_value_ty = strip_receiver_ptr_like_type(&recv_ty)
     if is_slice_view_type(ctx, &recv_value_ty) then
-      # Slice[T] view is_empty: [view + len_off] == 0.
+      # UnsafeSlice[T] raw-view is_empty: [view + len_off] == 0.
       codegen_slice_is_empty(ctx)
     else
       emit_load_mem(ctx, rr, rr, 0)
@@ -12351,10 +13226,11 @@ def codegen_intrinsic(inout ctx: CodegenCtx, fctx: FnCodegenCtx, name: String, a
     emit_call_label(ctx, "_tg_array_slice")
   when IntrinsicId::ArrayFromList then
     # (items: &[T]) -> _tg_array_from_list: the arg is the &[T] borrow —
-    # the ADDRESS of the Slice view {ptr@0, len@8} (the array-literal
-    # argument is the heap-vector form whose header {data@0, len@8} is
-    # the same leading layout). The element stride comes from the CONCRETE
-    # destination element type at this operation site.
+    # the ADDRESS of the raw UnsafeSlice view {ptr@0, len@8} (the
+    # array-literal argument is the heap-vector form whose header
+    # {data@0, len@8} is the same leading layout). The element stride
+    # comes from the CONCRETE destination element type at this operation
+    # site.
     let fl_elem_ty = vec_elem_type_of(ctx, dest_ty)
     let fl_stride = element_stride_bytes(ctx, &fl_elem_ty)
     match ctx.target.arch
@@ -12399,13 +13275,603 @@ def codegen_intrinsic(inout ctx: CodegenCtx, fctx: FnCodegenCtx, name: String, a
     # never a silent zero (a fake value would corrupt semantics).
     panic("internal error: unknown or unsupported intrinsic `" + name + "`")
   end
-  # The default result: the intrinsic arm materialized its result in the
+    # The default result: the intrinsic arm materialized its result in the
   # return register — the general call machinery stores it into dest. Arms
   # that wrote the FULL result image into the destination place themselves
   # (the ArrayGet/ArrayRemove ScalarPair/ByAddress materializations) return
   # true so that store is suppressed.
   false
 end
+
+# ———————————————————————————————————————————————————————————————
+# THE SIMD EMISSION — aarch64 NEON + x86 SSE/AVX arms
+# ———————————————————————————————————————————————————————————————
+# The vector operations of the IntrinsicId domain (the __intrinsic_simd_*
+# family — the SIMD sub-domain classified in types.tg). The vectors are
+# the std Vec2/Vec4/Vec8/Vec16 values (the VECTOR ROW: 16/32/64-byte
+# images, alignment = the vector width); the emission works on the memory
+# images through the ARCHITECTURAL vector registers — v0/v1 (q0/q1) on
+# aarch64, xmm0/xmm1 (ymm0/ymm1 for the 256-bit AVX forms) on x86-64 —
+# which the intrinsic bodies use TRANSIENTLY (load → op → store; no
+# register allocation — the vector values themselves live in the memory
+# image, so the ABI crossing stays the by-reference convention).
+#
+# THE SUPPORTED SUBSET per arm (FAIL-CLOSED: an op/lane combo an arm does
+# not lower panics with the explicit gap — never a silent scalar fallback):
+#   AArch64 NEON (128-bit vregs):
+#     f32x4/f64x2/i32x4/i16x8/i8x16  add/sub/mul, and/or/xor, load/store,
+#                                     shuffle (TBL with a runtime byte mask)
+#     i64x2                          add/sub only (NEON has no 64-bit lane
+#                                     multiply), and/or/xor, load/store,
+#                                     shuffle
+#     256-bit (f32x8/i32x8/f64x4/i64x4/i16x16/i8x32): two 128-bit halves
+#     512-bit (f32x16/i32x16/f64x8/i64x8/i16x32/i8x64): four 128-bit
+#       halves (add/sub/mul/and/or/xor/load/store/shuffle)
+#   x86-64 SSE (128-bit):
+#     f32x4 add/sub/mul/and/or/xor (addps/subps/mulps/andps/orps/xorps),
+#     i32x4 add/sub (paddd/psubd) + mul (pmulld — SSE4.1),
+#     i64x2 add/sub (paddq/psubq), i16x8 add/sub/mul (paddw/psubw/pmullw),
+#     i8x16 add/sub (paddb/psubb), load/store (movdqu), shuffle (pshufb —
+#       SSSE3); the i8x16 mul and the i64x2 mul have NO SSE instruction —
+#       NOT in the subset (fail closed)
+#   x86-64 AVX (256-bit):
+#     f32x8/f64x4 add/sub/mul/and/or/xor (vaddps/vsubps/vmulps/vandps/
+#       vorps/vxorps), i32x8 add/sub (vpaddd/vpsubd) + mul (vpmulld —
+#       AVX2), i16x16/i8x32 add/sub (vpaddw/vpsubb — AVX2), i64x4 add/sub
+#       (vpaddq/vpsubq — AVX2), load/store (vmovdqu), shuffle (vpshufb —
+#       AVX2); the i8x32 mul has no AVX2 instruction — NOT in the subset
+#   512-bit on x86-64: NOT in the subset (no EVEX emission)
+
+# The vector register index gate: the transient registers are v0/v1 on
+# aarch64, xmm0/xmm1 (ymm0/ymm1) on x86-64 — fixed, never allocated.
+def codegen_simd_intrinsic(inout ctx: CodegenCtx, fctx: FnCodegenCtx, name: String, kind: SimdIntrinsicKind, lane: SimdLane, args: Vec[MirOperand], dest: Place, dest_ty: Type) -> Bool
+  match kind
+  when SimdIntrinsicKind::SimdAdd | SimdIntrinsicKind::SimdSub |
+       SimdIntrinsicKind::SimdMul | SimdIntrinsicKind::SimdAnd |
+       SimdIntrinsicKind::SimdOr | SimdIntrinsicKind::SimdXor then
+    codegen_simd_binop(ctx, fctx, kind, lane, args, dest)
+    true
+  when SimdIntrinsicKind::SimdLoad then
+    codegen_simd_load(ctx, fctx, lane, args, dest)
+    true
+  when SimdIntrinsicKind::SimdStore then
+    codegen_simd_store(ctx, fctx, lane, args, dest)
+    false
+  when SimdIntrinsicKind::SimdShuffle then
+    codegen_simd_shuffle(ctx, fctx, lane, args, dest)
+    true
+  end
+end
+
+# The address of a vector operand's memory image (the MIR materializes
+# vector values as stack temps — place operands only; a constant operand
+# is a lowering bug and fails closed).
+def simd_operand_address(inout ctx: CodegenCtx, fctx: FnCodegenCtx, op: MirOperand, reg: PhysReg) -> Unit
+  match op.kind
+  when MirOperandKind::MirCopy(p) | MirOperandKind::MirMovePlace(p) |
+       MirOperandKind::MirRead(p) | MirOperandKind::MirConsume(p) then
+    emit_place_address(ctx, fctx, p, reg)
+  when MirConstant(_) then
+    panic("internal error: SIMD operand is a constant — the MIR must materialize vector operands as stack temps")
+  end
+end
+
+# The aarch64 NEON three-register-same emitter (Q=1 — the 128-bit form).
+# The register fields (EMPIRICAL — verified byte-for-byte against the
+# assembler for every op below): the SECOND source operand at bits 20:16,
+# the FIRST source operand at bits 9:5, the destination at bits 4:0.
+# `vn` is the first source, `vm` the second source, `vd` the destination
+# (the instruction computes vd = vn op vm).
+def emit_neon_3same(inout ctx: CodegenCtx, base: UInt, vn: Int, vd: Int, vm: Int) -> Unit
+  var word = base
+  word = word | ((vm as UInt) << 16)
+  word = word | (((vn as UInt) & 0x1F) << 5)
+  word = word | ((vd as UInt) & 0x1F)
+  emit32_le(&mut ctx.text, word)
+end
+
+# ldr q{vreg}, [addr] — the 128-bit vector load.
+def emit_neon_ldr_q(inout ctx: CodegenCtx, vreg: Int, addr: PhysReg) -> Unit
+  match addr
+  when PhysReg::A64Reg(r) then
+    emit32_le(&mut ctx.text, 0x3DC00000 | ((vreg as UInt) & 0x1F) | (a64_code(r) << 5))
+  when _ then panic("emit_neon_ldr_q: aarch64 register required")
+  end
+end
+
+# str q{vreg}, [addr] — the 128-bit vector store.
+def emit_neon_str_q(inout ctx: CodegenCtx, vreg: Int, addr: PhysReg) -> Unit
+  match addr
+  when PhysReg::A64Reg(r) then
+    emit32_le(&mut ctx.text, 0x3D800000 | ((vreg as UInt) & 0x1F) | (a64_code(r) << 5))
+  when _ then panic("emit_neon_str_q: aarch64 register required")
+  end
+end
+
+# tbl v{vd}.16b, {v{vn}.16b}, v{vm}.16b — the byte-lane shuffle (the
+# table vector vn at bits 9:5, the index vector vm at bits 20:16).
+def emit_neon_tbl(inout ctx: CodegenCtx, vd: Int, vn: Int, vm: Int) -> Unit
+  emit32_le(&mut ctx.text, 0x4E000000 | (((vm as UInt) & 0x1F) << 16) | (((vn as UInt) & 0x1F) << 5) | ((vd as UInt) & 0x1F))
+end
+
+# The NEON 3-same base word for an op/lane pair (all register fields
+# ZERO — the emitter adds vn/vd/vm). The size field (bits 23:22) is
+# added by the caller via simd_neon_size_field (integer ops: log2(lane
+# size); FP ops: 0 for 4s, 1 for 2d).
+def simd_neon_base(kind: SimdIntrinsicKind, lane: SimdLane) -> UInt
+  let is_int = !simd_lane_is_float(lane)
+  match kind
+  when SimdIntrinsicKind::SimdAdd then if is_int then 0x4E208400 else 0x4E20D400 end
+  when SimdIntrinsicKind::SimdSub then if is_int then 0x6E208400 else 0x4EA0D400 end
+  when SimdIntrinsicKind::SimdMul then if is_int then 0x4E209C00 else 0x6E20DC00 end
+  when SimdIntrinsicKind::SimdAnd then 0x4E201C00
+  when SimdIntrinsicKind::SimdOr then 0x4EA01C00
+  when SimdIntrinsicKind::SimdXor then 0x6E201C00
+  end
+end
+
+# The NEON size field for the op/lane pair: the integer ops encode
+# log2(lane size) at bits 23:22 (8-bit → 00, 16-bit → 01, 32-bit → 10,
+# 64-bit → 11); the FP ops encode the FP size (0 for 4s, 1 for 2d) at bit
+# 22; the logical ops (and/or/xor) always use 00 (the full 128-bit form).
+def simd_neon_size_field(kind: SimdIntrinsicKind, lane: SimdLane) -> UInt
+  match kind
+  when SimdIntrinsicKind::SimdAnd | SimdIntrinsicKind::SimdOr | SimdIntrinsicKind::SimdXor then
+    0
+  when _ then
+    if simd_lane_is_float(lane) then
+      if simd_lane_elem_size(lane) == 8 then 1 else 0 end
+    else
+      let sz = simd_lane_elem_size(lane)
+      if sz == 1 then 0
+      elsif sz == 2 then 1
+      elsif sz == 4 then 2
+      else 3
+      end
+    end
+  end
+end
+
+# The NEON op for one 128-bit half: load [a + off] -> v0, load [b + off]
+# -> v1, op v0,v1 -> v0, store [dest + off] <- v0.
+def codegen_neon_128_binop(inout ctx: CodegenCtx, kind: SimdIntrinsicKind, lane: SimdLane, a_addr: PhysReg, b_addr: PhysReg, d_addr: PhysReg, offset: Int) -> Unit
+  if offset != 0 then
+    emit_add_ri(ctx, a_addr, offset)
+    emit_add_ri(ctx, b_addr, offset)
+    emit_add_ri(ctx, d_addr, offset)
+  end
+  emit_neon_ldr_q(ctx, 0, a_addr)
+  emit_neon_ldr_q(ctx, 1, b_addr)
+  let base = simd_neon_base(kind, lane)
+  let size = simd_neon_size_field(kind, lane)
+  let word = base | (size << 22)
+  emit_neon_3same(ctx, word, 1, 0, 0)
+  emit_neon_str_q(ctx, 0, d_addr)
+  if offset != 0 then
+    emit_add_ri(ctx, a_addr, -offset)
+    emit_add_ri(ctx, b_addr, -offset)
+    emit_add_ri(ctx, d_addr, -offset)
+  end
+end
+
+# The x86-64 SIMD op bytes (opcode stream; the modrm byte follows).
+def simd_x64_op_bytes(kind: SimdIntrinsicKind, lane: SimdLane, is_256: Bool) -> Vec[u8]
+  var out = Vec::new()
+  match kind
+  when SimdIntrinsicKind::SimdAdd then
+    if simd_lane_is_float(lane) then
+      if is_256 then
+        out.push(0xC5); out.push(0xFC)
+      else
+        out.push(0x0F)
+      end
+      out.push(0x58)
+    else
+      if is_256 then out.push(0xC5); out.push(0xFD) else out.push(0x66) end
+      match simd_lane_elem_size(lane)
+      when 1 then out.push(0x0F); out.push(0xFC)
+      when 2 then out.push(0x0F); out.push(0xFD)
+      when 4 then out.push(0x0F); out.push(0xFE)
+      when 8 then out.push(0x0F); out.push(0xD4)
+      end
+    end
+  when SimdIntrinsicKind::SimdSub then
+    if simd_lane_is_float(lane) then
+      if is_256 then
+        out.push(0xC5); out.push(0xFC)
+      else
+        out.push(0x0F)
+      end
+      out.push(0x5C)
+    else
+      if is_256 then out.push(0xC5); out.push(0xFD) else out.push(0x66) end
+      match simd_lane_elem_size(lane)
+      when 1 then out.push(0x0F); out.push(0xF8)
+      when 2 then out.push(0x0F); out.push(0xF9)
+      when 4 then out.push(0x0F); out.push(0xFA)
+      when 8 then out.push(0x0F); out.push(0xFB)
+      end
+    end
+  when SimdIntrinsicKind::SimdMul then
+    if simd_lane_is_float(lane) then
+      if is_256 then
+        out.push(0xC5); out.push(0xFC)
+      else
+        out.push(0x0F)
+      end
+      out.push(0x59)
+    else
+      match simd_lane_elem_size(lane)
+      when 2 then
+        if is_256 then out.push(0xC5); out.push(0xFD) else out.push(0x66) end
+        out.push(0x0F); out.push(0xD5)
+      when 4 then
+        if is_256 then out.push(0xC4); out.push(0xE2); out.push(0x7D) else out.push(0x66); out.push(0x0F); out.push(0x38) end
+        out.push(0x40)
+      when _ then
+        panic("internal error: SIMD i" + (simd_lane_elem_size(lane) * 8).to_string() + " lane multiply has no x86-64 instruction (not in the supported subset)")
+      end
+    end
+  when SimdIntrinsicKind::SimdAnd then
+    if is_256 then
+      out.push(0xC5); out.push(0xFC)
+    else
+      out.push(0x0F)
+    end
+    out.push(0x54)
+  when SimdIntrinsicKind::SimdOr then
+    if is_256 then
+      out.push(0xC5); out.push(0xFC)
+    else
+      out.push(0x0F)
+    end
+    out.push(0x56)
+  when SimdIntrinsicKind::SimdXor then
+    if is_256 then
+      out.push(0xC5); out.push(0xFC)
+    else
+      out.push(0x0F)
+    end
+    out.push(0x57)
+  end
+  out
+end
+
+# The x86-64 modrm for [rbp + disp32] with the given reg field (the SIMD
+# ops use the RBP-relative frame addressing; mod=10, rm=101).
+def simd_x64_modrm_mem(reg: u8) -> u8
+  (0x02 << 6) | ((reg & 0x07) << 3) | 0x05
+end
+
+# The x86-64 register-register modrm (mod=11).
+def simd_x64_modrm_reg(dst_reg: u8, src_reg: u8) -> u8
+  (0x03 << 6) | ((src_reg & 0x07) << 3) | (dst_reg & 0x07)
+end
+
+# movdqu/vmovdqu xmm/ymm {0,1} <-> [rbp + disp32].
+def emit_x64_simd_load(inout ctx: CodegenCtx, vreg: Int, disp: i32, is_256: Bool) -> Unit
+  if is_256 then
+    emit8(&mut ctx.text, 0xC5)
+    emit8(&mut ctx.text, 0xFE)
+    emit8(&mut ctx.text, 0x6F)
+  else
+    emit8(&mut ctx.text, 0xF3)
+    emit8(&mut ctx.text, 0x0F)
+    emit8(&mut ctx.text, 0x6F)
+  end
+  emit8(&mut ctx.text, simd_x64_modrm_mem(vreg as u8))
+  emit32_le(&mut ctx.text, disp as u32)
+end
+
+def emit_x64_simd_store(inout ctx: CodegenCtx, vreg: Int, disp: i32, is_256: Bool) -> Unit
+  if is_256 then
+    emit8(&mut ctx.text, 0xC5)
+    emit8(&mut ctx.text, 0xFE)
+    emit8(&mut ctx.text, 0x7F)
+  else
+    emit8(&mut ctx.text, 0xF3)
+    emit8(&mut ctx.text, 0x0F)
+    emit8(&mut ctx.text, 0x7F)
+  end
+  emit8(&mut ctx.text, simd_x64_modrm_mem(vreg as u8))
+  emit32_le(&mut ctx.text, disp as u32)
+end
+
+# movdqu xmm{vreg}, [base] / movdqu [base], xmm{vreg} — the register-
+# indirect unaligned 128-bit move (REX.B for the high registers).
+def emit_x64_movdqu_reg_indirect(inout ctx: CodegenCtx, vreg: Int, base: X64, is_load: Bool) -> Unit
+  if x64_code(base) >= 8 then
+    emit8(&mut ctx.text, 0x41)  ## REX.B
+  end
+  emit8(&mut ctx.text, 0xF3)
+  emit8(&mut ctx.text, 0x0F)
+  emit8(&mut ctx.text, if is_load then 0x6F else 0x7F end)
+  emit8(&mut ctx.text, (0x00 << 6) | ((vreg & 0x07) << 3) | (x64_code(base) & 0x07))
+end
+
+# vmovdqu ymm{vreg}, [base] / vmovdqu [base], ymm{vreg} — the AVX
+# register-indirect 256-bit move (3-byte VEX with B=0 for the high
+# registers, 2-byte VEX otherwise).
+def emit_x64_vmovdqu_reg_indirect(inout ctx: CodegenCtx, vreg: Int, base: X64, is_load: Bool) -> Unit
+  if x64_code(base) >= 8 then
+    emit8(&mut ctx.text, 0xC4)
+    emit8(&mut ctx.text, 0xC1)
+    emit8(&mut ctx.text, 0x7E)
+  else
+    emit8(&mut ctx.text, 0xC5)
+    emit8(&mut ctx.text, 0xFE)
+  end
+  emit8(&mut ctx.text, if is_load then 0x6F else 0x7F end)
+  emit8(&mut ctx.text, (0x00 << 6) | ((vreg & 0x07) << 3) | (x64_code(base) & 0x07))
+end
+
+# The x86-64 128-bit op: load [a_disp] -> xmm0, op xmm0, [b_disp] (the
+# memory-operand form), store [d_disp] <- xmm0.
+def codegen_x64_128_binop(inout ctx: CodegenCtx, kind: SimdIntrinsicKind, lane: SimdLane, a_disp: i32, b_disp: i32, d_disp: i32) -> Unit
+  emit_x64_simd_load(ctx, 0, a_disp, false)
+  let bytes = simd_x64_op_bytes(kind, lane, false)
+  var bi = 0
+  while bi < bytes.len() do
+    emit8(&mut ctx.text, bytes[bi])
+    bi = bi + 1
+  end
+  emit8(&mut ctx.text, simd_x64_modrm_mem(0))
+  emit32_le(&mut ctx.text, b_disp as u32)
+  emit_x64_simd_store(ctx, 0, d_disp, false)
+end
+
+# The x86-64 256-bit (AVX) op: vmovdqu [a_disp] -> ymm0, op ymm0, [b_disp],
+# vmovdqu [d_disp] <- ymm0.
+def codegen_x64_256_binop(inout ctx: CodegenCtx, kind: SimdIntrinsicKind, lane: SimdLane, a_disp: i32, b_disp: i32, d_disp: i32) -> Unit
+  emit_x64_simd_load(ctx, 0, a_disp, true)
+  let bytes = simd_x64_op_bytes(kind, lane, true)
+  var bi = 0
+  while bi < bytes.len() do
+    emit8(&mut ctx.text, bytes[bi])
+    bi = bi + 1
+  end
+  emit8(&mut ctx.text, simd_x64_modrm_mem(0))
+  emit32_le(&mut ctx.text, b_disp as u32)
+  emit_x64_simd_store(ctx, 0, d_disp, true)
+end
+
+# The stack displacement of a local's slot (the frame's FP-relative
+# offset; Option::None when the local has no stack home — a SIMD vector
+# must be memory-resident for the by-reference emission).
+def simd_local_disp(fctx: FnCodegenCtx, local_id: Int) -> i32
+  match fctx.var_locs.get(local_id)
+  when Option::Some(loc) then
+    match loc
+    when VarLoc::Stack(off) then off
+    when VarLoc::Spilled(off) then off
+    when _ then panic("internal error: SIMD operand local has no stack home (the vector emission is memory-based)")
+    end
+  when Option::None then panic("internal error: SIMD operand local " + local_id.to_string() + " has no location")
+  end
+end
+
+# The binary-op arm: a = args[0], b = args[1], result into dest. The
+# emission is memory-based on both arms: the vector images live in the
+# stack slots; the op runs in the transient architectural vector
+# registers. The 256/512-bit forms run the 128-bit op per half (NEON) or
+# the AVX 256-bit instruction (x86).
+def codegen_simd_binop(inout ctx: CodegenCtx, fctx: FnCodegenCtx, kind: SimdIntrinsicKind, lane: SimdLane, args: Vec[MirOperand], dest: Place) -> Unit
+  if args.len() < 2 then
+    panic("internal error: SIMD binary intrinsic requires two operands")
+  end
+  let width = simd_lane_width(lane)
+  let width_b = width / 8
+  if width_b > 64 then
+    panic("internal error: SIMD vector width " + width_b.to_string() + " bytes is not in the supported subset")
+  end
+  match ctx.target.arch
+  when Arch::AArch64 then
+    let scratch = scratch_reg(ctx.target.arch)
+    let scratch2 = scratch2_reg(ctx.target.arch)
+    let d_scratch = ret_reg(ctx.target.arch)
+    simd_operand_address(ctx, fctx, &args[0], scratch)
+    simd_operand_address(ctx, fctx, &args[1], scratch2)
+    emit_place_address(ctx, fctx, dest, d_scratch)
+    let halves = width_b / 16
+    var h = 0
+    while h < halves do
+      codegen_neon_128_binop(ctx, kind, lane, scratch, scratch2, d_scratch, h * 16)
+      h = h + 1
+    end
+  when Arch::X86_64 then
+    let a_disp = simd_local_disp(fctx, _simd_operand_local_id(&args[0]))
+    let b_disp = simd_local_disp(fctx, _simd_operand_local_id(&args[1]))
+    let d_disp = simd_local_disp(fctx, dest.local.id)
+    if width_b == 16 then
+      codegen_x64_128_binop(ctx, kind, lane, a_disp, b_disp, d_disp)
+    elsif width_b == 32 then
+      codegen_x64_256_binop(ctx, kind, lane, a_disp, b_disp, d_disp)
+    else
+      panic("internal error: SIMD " + width_b.to_string() + "-byte arithmetic has no x86-64 lowering (not in the supported subset)")
+    end
+  end
+end
+
+# The local id of a place-carrying operand (the x86 arm's frame-displacement
+# addressing requires the local directly).
+def _simd_operand_local_id(op: MirOperand) -> Int
+  match op.kind
+  when MirOperandKind::MirCopy(p) | MirOperandKind::MirMovePlace(p) |
+       MirOperandKind::MirRead(p) | MirOperandKind::MirConsume(p) then
+    p.local.id
+  when MirConstant(_) then
+    panic("internal error: SIMD operand is a constant — the MIR must materialize vector operands as stack temps")
+  end
+end
+
+# The load arm: __intrinsic_simd_load_<lane>(ptr) — the pointer operand's
+# VALUE is the address of the 16/32/64-byte image; the image is copied
+# into the destination vector. The aarch64 arm loads each 128-bit half
+# through the scratch register; the x86 arm uses the memory-operand form
+# of the unaligned load.
+def codegen_simd_load(inout ctx: CodegenCtx, fctx: FnCodegenCtx, lane: SimdLane, args: Vec[MirOperand], dest: Place) -> Unit
+  if args.len() < 1 then
+    panic("internal error: SIMD load intrinsic requires a pointer operand")
+  end
+  let width_b = simd_lane_width(lane) / 8
+  match ctx.target.arch
+  when Arch::AArch64 then
+    let ptr_reg = scratch_reg(ctx.target.arch)
+    let scratch2 = scratch2_reg(ctx.target.arch)
+    load_operand_rvalue_item(ctx, fctx, &args[0], ptr_reg)
+    emit_place_address(ctx, fctx, dest, scratch2)
+    let halves = width_b / 16
+    var h = 0
+    while h < halves do
+      if h != 0 then
+        emit_add_ri(ctx, ptr_reg, h * 16)
+        emit_add_ri(ctx, scratch2, h * 16)
+      end
+      emit_neon_ldr_q(ctx, 0, ptr_reg)
+      emit_neon_str_q(ctx, 0, scratch2)
+      if h != 0 then
+        emit_add_ri(ctx, ptr_reg, -(h * 16))
+        emit_add_ri(ctx, scratch2, -(h * 16))
+      end
+      h = h + 1
+    end
+  when Arch::X86_64 then
+    let ptr_reg = scratch_reg(ctx.target.arch)
+    load_operand_rvalue_item(ctx, fctx, &args[0], ptr_reg)
+    let d_disp = simd_local_disp(fctx, dest.local.id)
+    match ptr_reg
+    when PhysReg::X64Reg(pr) then
+      if width_b == 16 then
+        emit_x64_movdqu_reg_indirect(ctx, 0, pr, true)
+        emit_x64_simd_store(ctx, 0, d_disp, false)
+      elsif width_b == 32 then
+        emit_x64_vmovdqu_reg_indirect(ctx, 0, pr, true)
+        emit_x64_simd_store(ctx, 0, d_disp, true)
+      else
+        panic("internal error: SIMD " + width_b.to_string() + "-byte load/store has no x86-64 lowering (not in the supported subset)")
+      end
+    when _ then panic("emit_x64_simd: x86-64 register required")
+    end
+  end
+end
+
+# The store arm: __intrinsic_simd_store_<lane>(v, ptr) — the vector
+# image is copied to the pointer's address. Returns no value (Unit).
+def codegen_simd_store(inout ctx: CodegenCtx, fctx: FnCodegenCtx, lane: SimdLane, args: Vec[MirOperand], dest: Place) -> Unit
+  if args.len() < 2 then
+    panic("internal error: SIMD store intrinsic requires (vector, pointer) operands")
+  end
+  let width_b = simd_lane_width(lane) / 8
+  match ctx.target.arch
+  when Arch::AArch64 then
+    let v_addr = scratch_reg(ctx.target.arch)
+    let ptr_reg = scratch2_reg(ctx.target.arch)
+    simd_operand_address(ctx, fctx, &args[0], v_addr)
+    load_operand_rvalue_item(ctx, fctx, &args[1], ptr_reg)
+    let halves = width_b / 16
+    var h = 0
+    while h < halves do
+      if h != 0 then
+        emit_add_ri(ctx, v_addr, h * 16)
+        emit_add_ri(ctx, ptr_reg, h * 16)
+      end
+      emit_neon_ldr_q(ctx, 0, v_addr)
+      emit_neon_str_q(ctx, 0, ptr_reg)
+      if h != 0 then
+        emit_add_ri(ctx, v_addr, -(h * 16))
+        emit_add_ri(ctx, ptr_reg, -(h * 16))
+      end
+      h = h + 1
+    end
+  when Arch::X86_64 then
+    let v_disp = simd_local_disp(fctx, _simd_operand_local_id(&args[0]))
+    let ptr_reg = scratch_reg(ctx.target.arch)
+    load_operand_rvalue_item(ctx, fctx, &args[1], ptr_reg)
+    match ptr_reg
+    when PhysReg::X64Reg(pr) then
+      if width_b == 16 then
+        emit_x64_simd_load(ctx, 0, v_disp, false)
+        emit_x64_movdqu_reg_indirect(ctx, 0, pr, false)
+      elsif width_b == 32 then
+        emit_x64_simd_load(ctx, 0, v_disp, true)
+        emit_x64_vmovdqu_reg_indirect(ctx, 0, pr, false)
+      else
+        panic("internal error: SIMD " + width_b.to_string() + "-byte load/store has no x86-64 lowering (not in the supported subset)")
+      end
+    when _ then panic("emit_x64_simd: x86-64 register required")
+    end
+  end
+end
+
+# The shuffle arm: __intrinsic_simd_shuffle_<lane>(a, mask) — the mask is
+# the 16/32/64-byte BYTE mask image (mask byte j selects the source byte
+# j — the std helpers build the byte mask from the lane indexes); the
+# result is a lane rearrangement of a's bytes. NEON: TBL per 128-bit half
+# (the mask half selects within the half); x86-64: pshufb per 128-bit
+# half (SSE) / vpshufb (AVX2, 256-bit).
+def codegen_simd_shuffle(inout ctx: CodegenCtx, fctx: FnCodegenCtx, lane: SimdLane, args: Vec[MirOperand], dest: Place) -> Unit
+  if args.len() < 2 then
+    panic("internal error: SIMD shuffle intrinsic requires (vector, mask) operands")
+  end
+  let width_b = simd_lane_width(lane) / 8
+  match ctx.target.arch
+  when Arch::AArch64 then
+    let a_addr = scratch_reg(ctx.target.arch)
+    let m_addr = scratch2_reg(ctx.target.arch)
+    let d_addr = ret_reg(ctx.target.arch)
+    simd_operand_address(ctx, fctx, &args[0], a_addr)
+    simd_operand_address(ctx, fctx, &args[1], m_addr)
+    emit_place_address(ctx, fctx, dest, d_addr)
+    let halves = width_b / 16
+    var h = 0
+    while h < halves do
+      if h != 0 then
+        emit_add_ri(ctx, a_addr, h * 16)
+        emit_add_ri(ctx, m_addr, h * 16)
+        emit_add_ri(ctx, d_addr, h * 16)
+      end
+      emit_neon_ldr_q(ctx, 0, a_addr)
+      emit_neon_ldr_q(ctx, 1, m_addr)
+      emit_neon_tbl(ctx, 0, 0, 1)
+      emit_neon_str_q(ctx, 0, d_addr)
+      if h != 0 then
+        emit_add_ri(ctx, a_addr, -(h * 16))
+        emit_add_ri(ctx, m_addr, -(h * 16))
+        emit_add_ri(ctx, d_addr, -(h * 16))
+      end
+      h = h + 1
+    end
+  when Arch::X86_64 then
+    let a_disp = simd_local_disp(fctx, _simd_operand_local_id(&args[0]))
+    let m_disp = simd_local_disp(fctx, _simd_operand_local_id(&args[1]))
+    let d_disp = simd_local_disp(fctx, dest.local.id)
+    if width_b == 16 then
+      # pshufb xmm0, xmm1: load a -> xmm0, mask -> xmm1, pshufb, store.
+      emit_x64_simd_load(ctx, 0, a_disp, false)
+      emit_x64_simd_load(ctx, 1, m_disp, false)
+      emit8(&mut ctx.text, 0x66)
+      emit8(&mut ctx.text, 0x0F)
+      emit8(&mut ctx.text, 0x38)
+      emit8(&mut ctx.text, 0x00)
+      emit8(&mut ctx.text, simd_x64_modrm_reg(0, 1))
+      emit_x64_simd_store(ctx, 0, d_disp, false)
+    elsif width_b == 32 then
+      # vpshufb ymm0, ymm0, ymm1 (AVX2).
+      emit_x64_simd_load(ctx, 0, a_disp, true)
+      emit_x64_simd_load(ctx, 1, m_disp, true)
+      emit8(&mut ctx.text, 0xC4)
+      emit8(&mut ctx.text, 0xE2)
+      emit8(&mut ctx.text, 0x7D)
+      emit8(&mut ctx.text, 0x00)
+      emit8(&mut ctx.text, simd_x64_modrm_reg(0, 1))
+      emit_x64_simd_store(ctx, 0, d_disp, true)
+    else
+      panic("internal error: SIMD " + width_b.to_string() + "-byte shuffle has no x86-64 lowering (not in the supported subset)")
+    end
+  end
+end
+
+
 # ———————————————————————————————————————————————————————————————
 # The per-target syscall identity table (the ONE translation authority)
 # ———————————————————————————————————————————————————————————————
@@ -12962,6 +14428,17 @@ def codegen_prologue(inout ctx: CodegenCtx, fctx: FnCodegenCtx) -> Unit
         # Aggregate address pushed on the caller's stack (idx >= max_ra).
         prologue_bind_param_from_stack(ctx, fctx, fp, param, idx)
       end
+    when AbiArg::Vector(_, _) then
+      # THE VECTOR CASE: a 16-byte SIMD vector passed BY REFERENCE through
+      # the register slots (see classify_argument) — the address arrives in
+      # the same ABI slot a scalar of this index would use.
+      match arg_reg(arch, idx)
+      when Option::Some(abi_r) then
+        prologue_bind_param_from_abi_reg(ctx, fctx, fp, param, abi_r)
+      when Option::None then
+        # Vector address pushed on the caller's stack (idx >= max_ra).
+        prologue_bind_param_from_stack(ctx, fctx, fp, param, idx)
+      end
     when AbiArg::ByAddress(_, _) then
       # A >16-byte aggregate passed BY REFERENCE: the address arrives in the
       # same ABI slot a scalar of this index would use (see classify_argument).
@@ -13226,7 +14703,8 @@ def codegen_function(inout ctx: CodegenCtx, func: MirFunction) -> Unit
     frame: frame,
     var_locs: var_locs,
     block_labels: block_labels,
-    string_locals: str_locals
+    string_locals: str_locals,
+    next_effect_frame: 0
   }
 
   # Align function start to 4 bytes (required for ARM64 instruction alignment)
@@ -13368,6 +14846,11 @@ def collect_static_refs(func: MirFunction) -> Vec[(DefId, Type)]
         collect_static_refs_from_operand(cond, &mut refs)
       when MirStatementKind::MirEffectRecord(_, op) then
         collect_static_refs_from_operand(op, &mut refs)
+      when MirStatementKind::MirEffectPerform(_, _, _, payload_ptr, result_ptr) then
+        collect_static_refs_from_operand(payload_ptr, &mut refs)
+        collect_static_refs_from_operand(result_ptr, &mut refs)
+      when MirStatementKind::MirEffectFrameEnter(_, _, _, _, env_ptr) then
+        collect_static_refs_from_operand(env_ptr, &mut refs)
       when _ then ()
       end
     end
@@ -13559,9 +15042,13 @@ def codegen_static(inout ctx: CodegenCtx, st: MirStatic) -> Unit
     if cst_named == "Array" then true else false end
   when _ then false
   end
+  # The RAW UnsafeSlice view static (the checker rejects raw-view statics,
+  # so this empty-view emission is the defensive/FFI path). The SAFE
+  # source-spelled Slice is the std-declared shared struct — its static is
+  # the Arc handle, emitted through the general initializer path below.
   let is_slice_static = match st.ty
   when Type::Adt(tid, _) then
-    bare_name_from_qualified(type_name_by_id(ctx, tid.id)) == "Slice"
+    bare_name_from_qualified(type_name_by_id(ctx, tid.id)) == "UnsafeSlice"
   when _ then false
   end
   
@@ -13610,9 +15097,10 @@ def codegen_static(inout ctx: CodegenCtx, st: MirStatic) -> Unit
       return
     end
 
-    # Slice statics are the 16-byte VIEW { ptr: Ptr[T], len: UInt }: the
-    # value IS the view (slice_view_layout), emitted inline as an empty view
-    # { ptr = 0, len = 0 } — never a pointer to a heap header.
+    # UnsafeSlice statics are the 16-byte RAW VIEW { ptr: Ptr[T], len:
+    # UInt }: the value IS the view (slice_view_layout), emitted inline as
+    # an empty view { ptr = 0, len = 0 } — never a pointer to a heap
+    # header.
     if is_slice_static then
       add_symbol(&mut ctx.data, AsmSymbol {
         name: st.name.clone(),
@@ -13752,6 +15240,11 @@ def collect_fn_refs(func: MirFunction) -> Vec[String]
         collect_fn_refs_from_operand(cond, &mut refs)
       when MirStatementKind::MirEffectRecord(_, op) then
         collect_fn_refs_from_operand(op, &mut refs)
+      when MirStatementKind::MirEffectPerform(_, _, _, payload_ptr, result_ptr) then
+        collect_fn_refs_from_operand(payload_ptr, &mut refs)
+        collect_fn_refs_from_operand(result_ptr, &mut refs)
+      when MirStatementKind::MirEffectFrameEnter(_, _, _, _, env_ptr) then
+        collect_fn_refs_from_operand(env_ptr, &mut refs)
       when _ then ()
       end
     end
@@ -14079,7 +15572,7 @@ def resolve_dot_method(ctx: CodegenCtx, fctx: FnCodegenCtx, fn_name: String, arg
     let bare_type_name = bare_name_from_qualified(type_name)
     if bare_type_name == "Map" then "Map__" + method
     elsif bare_type_name == "Set" then "Set__" + method
-    elsif bare_type_name == "Array" || bare_type_name == "Slice" then "Vec__" + method
+    elsif bare_type_name == "Array" || bare_type_name == "UnsafeSlice" then "Vec__" + method
     elsif bare_type_name == "Option" then "Option__" + method
     elsif bare_type_name == "Result" then "Result__" + method
     else
@@ -15564,6 +17057,10 @@ def codegen_collection_elem_transfer_arg(inout ctx: CodegenCtx, inout fctx: FnCo
       end
     when ValueCategory::ScalarPair(_, _) then
       codegen_collection_elem_image_addr(ctx, fctx, args, arg_idx, slot)
+    when ValueCategory::Vector(_) then
+      # THE VECTOR CASE: a SIMD vector element — the image ADDRESS
+      # convention, exactly like the other aggregate forms.
+      codegen_collection_elem_image_addr(ctx, fctx, args, arg_idx, slot)
     when ValueCategory::ByAddress(_) then
       codegen_collection_elem_image_addr(ctx, fctx, args, arg_idx, slot)
     end
@@ -15605,6 +17102,17 @@ def codegen_collection_elem_transfer_operand(inout ctx: CodegenCtx, inout fctx: 
     when ValueCategory::Scalar(_) then
       load_operand_aggregate_item(ctx, fctx, op, slot)
     when ValueCategory::ScalarPair(_, _) then
+      match op.kind
+      when MirOperandKind::MirCopy(p) then emit_place_address(ctx, fctx, p, slot)
+      when MirOperandKind::MirMovePlace(p) then emit_place_address(ctx, fctx, p, slot)
+      when MirOperandKind::MirRead(p) then emit_place_address(ctx, fctx, p, slot)
+      when MirOperandKind::MirConsume(p) then emit_place_address(ctx, fctx, p, slot)
+      when MirConstant(_) then
+        panic("internal error: aggregate collection element is a constant operand — the MIR must materialize aggregates as stack temps")
+      end
+    when ValueCategory::Vector(_) then
+      # THE VECTOR CASE: a SIMD vector element — the image ADDRESS
+      # convention, exactly like the other aggregate forms.
       match op.kind
       when MirOperandKind::MirCopy(p) then emit_place_address(ctx, fctx, p, slot)
       when MirOperandKind::MirMovePlace(p) then emit_place_address(ctx, fctx, p, slot)
@@ -15755,17 +17263,23 @@ def codegen_array_set(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, args: Vec
 end
 
 # ———————————————————————————————————————————————————————————————
-# Slice view ops (the reviewer's two-field view model)
+# RAW UnsafeSlice view ops (the explicit unsafe/FFI two-field view model)
 # ———————————————————————————————————————————————————————————————
-# Slice[T] = { ptr: Ptr[T] @ 0, len: UInt @ 8 } — a 16-byte inline VIEW
-# (layout_engine's slice_view_layout; field offsets from
-# slice_view_field_offset). Every Slice operation is a VIEW operation:
-#   - the receiver arrives in arg0 (x0/rdi) as the &Slice borrow — the
-#     ADDRESS of the view value, never a heap-header handle;
+# UnsafeSlice[T] = { ptr: Ptr[T] @ 0, len: UInt @ 8 } — the RAW 16-byte
+# inline VIEW (layout_engine's slice_view_layout; field offsets from
+# slice_view_field_offset) — the explicit unsafe/FFI form. Every raw-view
+# operation is a VIEW operation:
+#   - the receiver arrives in arg0 (x0/rdi) as the &UnsafeSlice borrow —
+#     the ADDRESS of the view value, never a heap-header handle;
 #   - len reads [base + 8];
 #   - element i lives at ptr + i * size_of(T) — the element stride and
 #     width come from the layout engine (no fixed 8);
-#   - a Slice value is NEVER read through HeapVecHeader offsets.
+#   - an UnsafeSlice value is NEVER read through HeapVecHeader offsets.
+# The SAFE source-spelled Slice is the std-declared shared struct — its
+# operations (len/get/sub/first/last) compile as its std methods, which
+# deref the Arc handle to the 24-byte pinned backing {ptr@0, len@8,
+# offset@16} (slice_shared_backing_layout). These raw-view emitters never
+# see it.
 
 # view len: arg0 = view base address; return [base + len_off].
 def codegen_slice_len(inout ctx: CodegenCtx) -> Unit
@@ -15886,16 +17400,18 @@ def codegen_slice_last(inout ctx: CodegenCtx, elem_ty: Type) -> Unit
   end
 end
 
-# Copy a whole Slice view value (16 bytes: {ptr, len}) from one plain slice
-# place to another. The single-register machinery only moves 8 bytes, which
-# would copy the ptr word and leave the len word stale — the view needs both
-# words. Both places must be plain slice locals/params (no projections).
+# Copy a whole RAW UnsafeSlice view value (16 bytes: {ptr, len}) from one
+# plain raw-view place to another. The single-register machinery only moves
+# 8 bytes, which would copy the ptr word and leave the len word stale — the
+# view needs both words. Both places must be plain raw-view locals/params
+# (no projections).
 # Whole-value aggregate copy — the move/copy emitter for non-scalar value
 # categories (asked of classify_value_category by the MirMove lowering):
-#   - ScalarPair (16 bytes — the Slice view { ptr @ 0, len @ 8 } and other
-#     16-byte aggregates): both words are copied. For the Slice view this is
-#     byte-identical to the former name-based emit_slice_value_copy; the
-#     single-register path would copy only the ptr word and leave len stale.
+#   - ScalarPair (16 bytes — the raw UnsafeSlice view { ptr @ 0, len @ 8 }
+#     and other 16-byte aggregates): both words are copied. For the raw
+#     view this is byte-identical to the former name-based
+#     emit_slice_value_copy; the single-register path would copy only the
+#     ptr word and leave len stale.
 #   - ByAddress (>16-byte inline aggregates — fixed arrays, large structs):
 #     the full layout byte size is copied in 8-byte chunks plus 4/2/1-byte
 #     tails (the same shape the sret epilogue uses) — a 40-byte value is
@@ -17606,6 +19122,48 @@ def emit_argc_argv_data(inout ctx: CodegenCtx) -> Unit
   })
   def_label(&mut ctx.data, "_tg_bump_end".to_string())
   emit64_le(&mut ctx.data, 0)
+
+  # __tg_effect_stack_top (8 bytes, initialized to 0) — the task's
+  # effect-handler stack top (the direct-style handler frames: each
+  # installed handler's frame is written by __tg_effect_frame_push into
+  # the INSTALLING function's frame slot and linked here; perform walks
+  # the linked frames to the innermost matching handler).
+  let effect_top_off = buf_pos(&ctx.data)
+  add_symbol(&mut ctx.data, AsmSymbol {
+    name: "__tg_effect_stack_top".to_string(),
+    section: Section::Data,
+    offset: effect_top_off,
+    size: 8,
+    binding: SymBinding::Global,
+    kind: SymKind::Data
+  })
+  def_label(&mut ctx.data, "__tg_effect_stack_top".to_string())
+  emit64_le(&mut ctx.data, 0)
+
+  # __tg_effect_unhandled_msg — the DEFINED ERROR message of an unhandled
+  # effect operation (78 bytes incl. the newline): __tg_effect_perform
+  # writes it to stderr and aborts when no handler frame matches the
+  # performed op.
+  let effect_msg_off = buf_pos(&ctx.data)
+  add_symbol(&mut ctx.data, AsmSymbol {
+    name: "__tg_effect_unhandled_msg".to_string(),
+    section: Section::Data,
+    offset: effect_msg_off,
+    size: 80,
+    binding: SymBinding::Global,
+    kind: SymKind::Data
+  })
+  def_label(&mut ctx.data, "__tg_effect_unhandled_msg".to_string())
+  let effect_msg = "Tangerine runtime: unhandled effect operation (no matching handler frame)\n"
+  var emi = 0
+  while emi < 80 do
+    if emi < effect_msg.len() then
+      emit8(&mut ctx.data, effect_msg.char_at(emi) as u8)
+    else
+      emit8(&mut ctx.data, 0)
+    end
+    emi = emi + 1
+  end
 end
 
 # ———————————————————————————————————————————————————————————————

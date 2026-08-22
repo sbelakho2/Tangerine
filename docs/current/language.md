@@ -562,15 +562,17 @@ The two enforced bits are unconditional: they do not consult their
 flag, so `--no-contracts` / `--no-capabilities` (see the option table
 below) do not disable them today.
 
-Behaviors formerly claimed by deleted `ModeConfig` bits — each is pending,
-no config bit claims it:
+Behaviors formerly claimed by deleted `ModeConfig` bits — each is pending
+except `gate_on_score` (the CQS gate row below is implemented — the
+deleted bit's behavior now lives in the pipeline, not in a config bit);
+no config bit claims any of them:
 
 | Former bit (deleted) | Pending behavior |
 |----------------------|------------------|
 | `enforce_effects` | effect lowering + effect-log runtime — `MirEffectRecord` is never constructed from source; the `__tg_effect_record` runtime body is a trap stub (runtime.tg) |
 | `enforce_budgets` | budget lowering + budget-table runtime — `MirBudgetConsume` is never constructed from source; the `__tg_budget_*` data symbols have no definitions (runtime.tg) and fail closed at link if emitted |
 | `enforce_coverage` | a coverage gate in the pipeline — `coverage.tg` exists but is not invoked by any compile/check path |
-| `gate_on_score` | a CQS gate in the pipeline — `run_cqs_analysis` (cqs.tg) has no caller in the driver or pipeline |
+| `gate_on_score` | a CQS gate in the pipeline — the compiler-query-server IS invoked by the canonical pipeline: the driver's check path (driver_cqs_query_pass) and the library API (analyze_source_cqs) run the typed-info / symbols / diagnostics queries over the analyzed program + the lowered MIR, and the mode matrix's gated failures are reported as Error-level diagnostics and FAIL the check (Production/Hardened); the Dev matrix enforces nothing |
 | `require_docs_for_pub` / `require_tests_for_pub` | pub-API doc/test checks — no checker rejects |
 | `forbid_unsafe_no_reason` / `forbid_all_unsafe` | compile-path unsafe-reason / unsafe ban — the `unsafe_usage` lint (linter.tg) warns only under `tg lint` |
 | `enforce_memory_safety` | per-mode bounds-check instrumentation — no pass adds extra checks per mode |
@@ -733,8 +735,11 @@ The compiler does **not** yet run `validate_against_profile()`: the
 function is declared in `std/capabilities.tg` (API-only, outside the
 bootstrap closure) and no compile/CQS path calls it. The `SecurityProfile`
 enum and `profile_check()` are declared surfaces, not enforced behavior
-(the CQS gate itself has no pipeline caller — see the ModeConfig table in
-§"Progressive Strictness").
+(the CQS's own query server IS invoked by the canonical pipeline — the
+driver's check path and the library API run the typed-info / symbols /
+diagnostics queries and report the mode matrix's gated failures — but
+the capability-profile validation is a separate, still-declared surface;
+see the ModeConfig table in §"Progressive Strictness").
 
 ### Effects
 
@@ -1250,6 +1255,47 @@ end
 For complete FFI documentation, see:
 - [Interoperability Guide](interop.md) - Full reference
 - [FFI Cheat Sheet](ffi_cheatsheet.md) - Quick reference
+
+## Layout Attributes
+
+Struct and enum declarations may carry the layout attributes
+`@repr(C)`, `@align(N)` and `@packed` (parsed and validated — E109 for
+an invalid shape or an invalid combination; the checker adds the
+semantic alignment-overflow bound):
+
+```tangerine
+# The C struct rules: declaration order, natural alignment, standard
+# offsets; the ABI classification follows the C aggregate rules.
+@repr(C)
+struct Point
+  x: f64
+  y: f64
+end
+
+# The declared alignment N (a power of two): the type's alignment = N;
+# the fields' offsets align to the max of the field's own alignment and
+# the declared N; the total size tail-aligns to N.
+@align(16)
+struct Aligned
+  a: u8   # @ 0
+  b: u32  # @ 16 (max(4, 16))
+end
+
+# The packed offsets: no padding, per-field alignment 1, the size the
+# exact byte span — the kernel epoll_event shape
+# ({ u32 events @ 0, UInt data @ 4 } — size 12). The misaligned field
+# accesses lower through the byte-wise unaligned load/store machinery.
+@packed
+struct EpollEventKernel
+  events: u32
+  data: UInt
+end
+```
+
+The exclusivity rules: `@repr(C)` with `@packed`, and `@packed` with
+`@align(N)`, are invalid combinations (E109). See
+[interop.md](interop.md) §Data Layout for the full rule reference and
+the epoll adoption note.
 
 ## Compile-time Evaluation
 
@@ -1993,6 +2039,76 @@ tg abi dump src/lib.tg
 # Check ABI compatibility between versions
 tg abi check v1/lib.tg v2/lib.tg
 ```
+
+## No-std, Embedded and WASI Surfaces
+
+### `@no_std` — the core/std separation
+
+A program may opt out of the std runtime modules with the `@no_std`
+module attribute (or the `--no-std` driver flag). The compile route
+(`compile_to_nostd_route`) applies the no_std contract:
+
+- **The core-only surface** — the program's own imports may resolve only
+  within `std::core` / `std::ffi` / `std::embedded` / `std::atomic`; an
+  import of the collection/string/alloc modules or the OS runtime
+  modules (io/fs/process/env/net/...) fails the compile with the no_std
+  diagnostic.
+- **The bare entry** — the program must define `def _start() -> !` and
+  must NOT define `main` (a `main` would select the libc/CRT entry).
+- **The direct syscall surface** — the only OS-facing interface is
+  `std::core`'s `__intrinsic_syscall1..6` + the runtime's `_exit`.
+- **The link contract** — the internal linker resolves the entry through
+  the default → `_start` → `_reset_handler` bare-entry fallback chain and
+  the produced image is fully self-contained (no libc dependency by
+  construction).
+
+```tangerine
+@no_std
+use std::core::{Unit, Bool, Int, UInt, __intrinsic_syscall3}
+extern def _exit(code: Int) -> Never
+
+def write_stdout(s: str) -> Unit
+  let bytes = s.as_bytes()
+  let _ = __intrinsic_syscall3(1, 1, bytes.as_ptr() as Int, bytes.len())
+  ()
+end
+
+def _start() -> !
+  write_stdout("hello from the bare binary\n")
+  _exit(0)
+end
+```
+
+### The embedded route (`--target <embedded-triple>`)
+
+The bare-metal targets (Cortex-M thumbv6m/thumbv7em/thumbv8m.main and
+RISC-V riscv32imc/riscv32imac/riscv64gc) route to the embedded contract
+(`compile_to_embedded_route`): the per-triple **target spec** (arch / cpu /
+fpu / endianness / pointer width / max atomic width / linker / abort-only
+panic) emitted as the JSON artifact, the **linker script** (the flash/RAM
+`MEMORY` layout + the `.isr_vector`/`.text`/`.rodata`/`.data`/`.bss`
+placement + the `__data_load` copy table + the stack top), the **startup**
+(the `_reset_handler` contract — the `.bss` zeroing + the `.data` copy +
+the user `main` call), the **interrupt vector table** (every `@interrupt`
+function, in declaration order; an ISR takes no parameters — the
+signature gate), the **volatile/MMIO** load/store intrinsics (the
+runtime's `_tg_volatile_read*` / `_tg_volatile_write*` arms), the
+**atomicity availability** per target (0/32/64), the allocator-free
+core-only surface, and the **bare-metal binary** (the reset-vector entry,
+structurally verified). `std::embedded` provides the `Register` /
+`ReadOnly` / `WriteOnly` MMIO abstraction, the `@interrupt` /
+`@link_section` / `@panic_handler` markers, the `interrupt_vector_table`
+and the allocator-free `ArrayVec` / `RingBuffer` collections.
+
+### WASI (preview1)
+
+A `--target wasm32-wasi` compile adds the `wasi_snapshot_preview1` import
+section to the wasm module (`add_wasi_imports` — fd_read / fd_write /
+fd_close / clock_time_get / proc_exit / args / environ), and the compiler
+runtime hosts the same ABI natively (`_tg_wasi_*` — the iovec walk, the
+errno normalization, the clock_gettime-backed clock). `std::wasi`
+declares the guest externs plus the ABI wrappers; the wasmtime `--dir`
+conformance lane runs when the runtime is installed.
 
 ## See Also
 

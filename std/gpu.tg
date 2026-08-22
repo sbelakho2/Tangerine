@@ -18,6 +18,8 @@ enum GpuBackend
   CUDA        # NVIDIA GPUs
   OpenCL      # Legacy cross-platform
   WGPU        # WebGPU native (cross-platform)
+  Software    # The software/reference backend — the CPU evaluation of the
+              # compute kernels (the implementable backend: no hardware)
   Auto        # Auto-detect best available
 end
 
@@ -1407,6 +1409,7 @@ def create_gpu_context(device: GpuDevice) -> Result[GpuContext, GpuError]
   when GpuBackend::Metal then create_metal_context(device)
   when GpuBackend::CUDA then create_cuda_context(device)
   when GpuBackend::OpenCL then create_opencl_context(device)
+  when GpuBackend::Software then create_software_context(device)
   else Result::Err(GpuError::UnsupportedBackend(device.backend))
   end
 end
@@ -1552,6 +1555,7 @@ def create_buffer(inout ctx: GpuContext, desc: BufferDesc) -> Result[GpuBuffer, 
   when GpuBackend::Metal then create_metal_buffer(ctx, id, desc)
   when GpuBackend::CUDA then create_cuda_buffer(ctx, id, desc)
   when GpuBackend::OpenCL then create_opencl_buffer(ctx, id, desc)
+  when GpuBackend::Software then create_software_buffer(ctx, id, desc)
   else Result::Err(GpuError::UnsupportedBackend(ctx.backend))
   end
 end
@@ -1639,6 +1643,8 @@ def destroy_buffer(ctx: GpuContext, buffer: GpuBuffer) -> Unit
     when Option::Some(ptr) then let _ = cudaFree(ptr)
     when Option::None then ()
     end
+  when GpuBackend::Software then
+    destroy_software_buffer(ctx, buffer)
   else ()
   end
 end
@@ -1783,6 +1789,14 @@ def compile_shader(ctx: GpuContext, source: String, stage: ShaderStage, lang: Sh
   when GpuBackend::Metal then compile_msl_shader(ctx, source, stage, entry)
   when GpuBackend::CUDA then compile_cuda_shader(ctx, source, entry)
   when GpuBackend::OpenCL then compile_opencl_shader(ctx, source, entry)
+  when GpuBackend::Software then
+    # The software backend accepts any stage (the CPU evaluation is
+    # stage-agnostic); the kernel source is validated by the parser.
+    match software_parse_kernel_source(source.clone())
+    when Result::Ok(_) then
+      Result::Ok(ShaderModule { id: 0, stage: stage, language: ShaderLanguage::SPIRV, entry_point: entry })
+    when Result::Err(e) then Result::Err(e)
+    end
   else Result::Err(GpuError::UnsupportedBackend(ctx.backend))
   end
 end
@@ -1978,6 +1992,7 @@ struct ComputeKernel
   buffers: Vec[GpuBuffer]
   push_constants: Vec[u8]
   workgroup_size: [UInt; 3]
+  source: String
 end
 
 def ComputeKernel::create(inout ctx: GpuContext, shader_source: String, entry: String, workgroup: [UInt; 3]) -> Result[ComputeKernel, GpuError]
@@ -1995,7 +2010,8 @@ def ComputeKernel::create(inout ctx: GpuContext, shader_source: String, entry: S
     pipeline: pipeline,
     buffers: Vec::new(),
     push_constants: Vec::new(),
-    workgroup_size: workgroup
+    workgroup_size: workgroup,
+    source: shader_source
   })
 end
 
@@ -2007,18 +2023,453 @@ def ComputeKernel::set_buffer(inout self: ComputeKernel, binding: Int, buffer: G
 end
 
 def ComputeKernel::dispatch(self: ComputeKernel, inout ctx: GpuContext, global_size: [UInt; 3]) -> Result[Unit, GpuError]
-  var cmd = create_command_buffer(ctx)?
-  begin_command_buffer(&mut cmd)?
-  
-  let workgroups_x = (global_size[0] + self.workgroup_size[0] - 1) / self.workgroup_size[0]
-  let workgroups_y = (global_size[1] + self.workgroup_size[1] - 1) / self.workgroup_size[1]
-  let workgroups_z = (global_size[2] + self.workgroup_size[2] - 1) / self.workgroup_size[2]
-  
-  cmd_dispatch(&mut cmd, &self.pipeline, workgroups_x, workgroups_y, workgroups_z)
-  
-  end_command_buffer(&mut cmd)?
-  submit_command_buffer(ctx, &cmd, Option::None)?;
-  wait_idle(ctx)?;
-  
+  match ctx.backend
+  when GpuBackend::Software then
+    # THE SOFTWARE BACKEND DISPATCH: the CPU evaluation of the compute
+    # kernel — every work item runs the parsed opcode program over the
+    # materialized host buffers (the reference backend semantics).
+    let pipeline_id = self.pipeline.id
+    let wg = self.workgroup_size
+    match dispatch_software_kernel(ctx, pipeline_id, wg, global_size, self.source.clone())
+    when Result::Ok(_) then Result::Ok(())
+    when Result::Err(e) then Result::Err(e)
+    end
+  else
+    var cmd = create_command_buffer(ctx)?
+    begin_command_buffer(&mut cmd)?
+    
+    let workgroups_x = (global_size[0] + self.workgroup_size[0] - 1) / self.workgroup_size[0]
+    let workgroups_y = (global_size[1] + self.workgroup_size[1] - 1) / self.workgroup_size[1]
+    let workgroups_z = (global_size[2] + self.workgroup_size[2] - 1) / self.workgroup_size[2]
+    
+    cmd_dispatch(&mut cmd, &self.pipeline, workgroups_x, workgroups_y, workgroups_z)
+    
+    end_command_buffer(&mut cmd)?
+    submit_command_buffer(ctx, &cmd, Option::None)?;
+    wait_idle(ctx)?;
+    
+    Result::Ok(())
+  end
+end
+# ═══════════════════════════════════════════════════════════════
+# The Software / Reference Backend (the CPU evaluation of the
+# compute kernels — the implementable backend)
+# ═══════════════════════════════════════════════════════════════
+# The driver-side backend abstraction for the software backend: a
+# GpuContext on the Software backend evaluates compute kernels on the
+# CPU. The kernel programs are opcode sequences (KernelOp) executed by
+# the interpreter over the host buffers; every work item runs the whole
+# program against the shared buffer store, which makes the dispatch
+# semantics match the hardware model (each work item sees the buffers,
+# the kernel reads/writes them at the item's linear index).
+
+## The software kernel opcodes. The registers are the four work-item
+## temporaries (r0..r3); the buffer operands are the software buffer ids.
+enum KernelOp
+  Const(Int, u32)          # r[dst] = value
+  WorkItem(Int)            # r[dst] = the work item's linear index
+  Load32(Int, Int)         # r[dst] = u32 at buf[buf_id][work_item * 4]
+  Store32(Int, Int)        # buf[buf_id][work_item * 4] = r[src]
+  Add(Int, Int, Int)       # r[dst] = r[a] + r[b]
+  Sub(Int, Int, Int)       # r[dst] = r[a] - r[b]
+  Mul(Int, Int, Int)       # r[dst] = r[a] * r[b]
+end
+
+## The software kernel program: the opcode list + the workgroup shape.
+struct SoftwareKernel
+  ops: Vec[KernelOp]
+  workgroup: [UInt; 3]
+end
+
+## The software context: the host buffer store (one Vec[u8] per software
+## buffer id) and the compiled kernel table (pipeline id -> program).
+struct SoftwareContext
+  buffers: Map[Int, Vec[u8]]
+  kernels: Map[Int, SoftwareKernel]
+  next_kernel_id: Int
+end
+
+def software_context_new() -> SoftwareContext
+  SoftwareContext {
+    buffers: Map::new(),
+    kernels: Map::new(),
+    next_kernel_id: 1
+  }
+end
+
+## The software device: the host CPU as a single always-available device.
+def enumerate_software_devices() -> Vec[GpuDevice]
+  var devices = Vec::new()
+  devices.push(GpuDevice {
+    id: 0,
+    name: "Tangerine Software Backend (CPU)".to_string(),
+    vendor: GpuVendor::Unknown,
+    backend: GpuBackend::Software,
+    total_memory: 1024 * 1024 * 1024,
+    available_memory: 1024 * 1024 * 1024,
+    compute_units: 1,
+    max_work_group_size: 1024,
+    max_work_group_dims: [1024, 1024, 64],
+    clock_frequency: 0,
+    supports_fp16: true,
+    supports_fp64: true,
+    supports_int64: true,
+    supports_subgroups: false,
+    subgroup_size: 1,
+    unified_memory: true
+  })
+  devices
+end
+
+def software_device() -> GpuDevice
+  let devices = enumerate_software_devices()
+  devices[0]
+end
+
+## The software backend's buffer allocation: a host allocation whose
+## pointer becomes the buffer's mapped_ptr (the data store).
+def create_software_buffer(inout ctx: GpuContext, id: Int, desc: BufferDesc) -> Result[GpuBuffer, GpuError]
+  if desc.size == 0 then
+    return Result::Err(GpuError::InvalidBuffer)
+  end
+  let data = std::alloc::alloc(desc.size)
+  match desc.initial_data
+  when Option::Some(src) then
+    ptr_copy(src, data, desc.size)
+  when Option::None then
+    var i: UInt = 0
+    while i < desc.size do
+      (data as PtrMut[u8]).offset(i as Int).write(0u8)
+      i = i + 1
+    end
+  end
+  let buffer = GpuBuffer {
+    id: id,
+    device: ctx.device.id,
+    size: desc.size,
+    usage: desc.usage,
+    location: desc.location,
+    mapped_ptr: Option::Some(data)
+  }
+  ctx.buffers.insert(id, buffer.clone())
+  Result::Ok(buffer)
+end
+
+def destroy_software_buffer(ctx: GpuContext, buffer: GpuBuffer) -> Unit
+  match buffer.mapped_ptr
+  when Option::Some(ptr) then
+    std::alloc::dealloc(ptr, std::alloc::Layout::from_size_align(buffer.size, 1))
+  when Option::None then ()
+  end
+  ctx.buffers.remove(buffer.id)
+  ()
+end
+
+def software_buffer_bytes(inout ctx: GpuContext, buffer: GpuBuffer) -> Result[Vec[u8], GpuError]
+  match buffer.mapped_ptr
+  when Option::Some(ptr) then
+    var bytes: Vec[u8] = Vec::new()
+    var i: UInt = 0
+    while i < buffer.size do
+      bytes.push(ptr.offset(i as Int).read())
+      i = i + 1
+    end
+    Result::Ok(bytes)
+  when Option::None then
+    Result::Err(GpuError::InvalidBuffer)
+  end
+end
+
+## Upload host data into a software buffer (the memcpy path).
+def upload_to_software_buffer(buffer: GpuBuffer, data: Ptr, size: UInt, offset: UInt) -> Result[Unit, GpuError]
+  if offset + size > buffer.size then
+    return Result::Err(GpuError::InvalidBuffer)
+  end
+  match buffer.mapped_ptr
+  when Option::Some(dst) then
+    ptr_copy(data, dst.offset(offset as Int), size)
+    Result::Ok(())
+  when Option::None then
+    Result::Err(GpuError::InvalidBuffer)
+  end
+end
+
+## Download a software buffer's bytes into host memory.
+def download_from_software_buffer(buffer: GpuBuffer, data: PtrMut[u8], size: UInt, offset: UInt) -> Result[Unit, GpuError]
+  if offset + size > buffer.size then
+    return Result::Err(GpuError::InvalidBuffer)
+  end
+  match buffer.mapped_ptr
+  when Option::Some(src) then
+    ptr_copy(src.offset(offset as Int), data, size)
+    Result::Ok(())
+  when Option::None then
+    Result::Err(GpuError::InvalidBuffer)
+  end
+end
+
+## The software kernel interpreter: run one program for one work item.
+def software_execute_kernel(program: Vec[KernelOp], inout store: Vec[Vec[u8]], work_item: UInt) -> Result[Unit, GpuError]
+  var regs: [u32; 4] = [0u32; 4]
+  for op in program do
+    match op
+    when KernelOp::Const(dst, value) then
+      if dst >= 0 && dst < 4 then regs[dst] = value end
+    when KernelOp::WorkItem(dst) then
+      if dst >= 0 && dst < 4 then regs[dst] = work_item as u32 end
+    when KernelOp::Load32(buf_id, dst) then
+      if buf_id < 0 || buf_id >= store.len() then
+        return Result::Err(GpuError::InvalidBuffer)
+      end
+      let off = (work_item * 4) as Int
+      if off + 4 > store[buf_id].len() then
+        return Result::Err(GpuError::InvalidBuffer)
+      end
+      if dst >= 0 && dst < 4 then
+        let b0 = store[buf_id][off] as u32
+        let b1 = store[buf_id][off + 1] as u32
+        let b2 = store[buf_id][off + 2] as u32
+        let b3 = store[buf_id][off + 3] as u32
+        regs[dst] = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+      end
+    when KernelOp::Store32(buf_id, src) then
+      if buf_id < 0 || buf_id >= store.len() then
+        return Result::Err(GpuError::InvalidBuffer)
+      end
+      let off = (work_item * 4) as Int
+      if off + 4 > store[buf_id].len() then
+        return Result::Err(GpuError::InvalidBuffer)
+      end
+      let value = if src >= 0 && src < 4 then regs[src] else 0u32 end
+      store[buf_id][off] = (value & 0xFF) as u8
+      store[buf_id][off + 1] = ((value >> 8) & 0xFF) as u8
+      store[buf_id][off + 2] = ((value >> 16) & 0xFF) as u8
+      store[buf_id][off + 3] = ((value >> 24) & 0xFF) as u8
+    when KernelOp::Add(dst, a, b) then
+      if dst >= 0 && dst < 4 then regs[dst] = regs[a] + regs[b] end
+    when KernelOp::Sub(dst, a, b) then
+      if dst >= 0 && dst < 4 then regs[dst] = regs[a] - regs[b] end
+    when KernelOp::Mul(dst, a, b) then
+      if dst >= 0 && dst < 4 then regs[dst] = regs[a] * regs[b] end
+    end
+  end
   Result::Ok(())
+end
+
+## Compile a software kernel: the opcode source (one op per line, e.g.
+## "load 0 r1" / "const r2 1" / "add r3 r1 r2" / "store 1 r3") is parsed
+## into the KernelOp program. Returns the pipeline id.
+def compile_software_shader(inout ctx: GpuContext, source: String, entry: String, workgroup: [UInt; 3]) -> Result[Int, GpuError]
+  var ops: Vec[KernelOp] = Vec::new()
+  let lines = source.split("\n")
+  var li = 0
+  while li < lines.len() do
+    let line = lines[li].trim()
+    if line.len() > 0 && !line.starts_with("#") then
+      let parts = line.split(" ")
+      if parts.len() >= 2 then
+        match parts[0]
+        when "const" then
+          if parts.len() >= 3 then
+            let reg = software_reg_index(&parts[1])
+            let value = software_parse_u32(&parts[2])
+            ops.push(KernelOp::Const(reg, value))
+          end
+        when "item" then
+          if parts.len() >= 2 then
+            let reg = software_reg_index(&parts[1])
+            ops.push(KernelOp::WorkItem(reg))
+          end
+        when "load" then
+          if parts.len() >= 3 then
+            let buf = software_parse_int(&parts[1])
+            let reg = software_reg_index(&parts[2])
+            ops.push(KernelOp::Load32(buf, reg))
+          end
+        when "store" then
+          if parts.len() >= 3 then
+            let buf = software_parse_int(&parts[1])
+            let reg = software_reg_index(&parts[2])
+            ops.push(KernelOp::Store32(buf, reg))
+          end
+        when "add" then
+          if parts.len() >= 4 then
+            let d = software_reg_index(&parts[1])
+            let a = software_reg_index(&parts[2])
+            let b = software_reg_index(&parts[3])
+            ops.push(KernelOp::Add(d, a, b))
+          end
+        when "sub" then
+          if parts.len() >= 4 then
+            let d = software_reg_index(&parts[1])
+            let a = software_reg_index(&parts[2])
+            let b = software_reg_index(&parts[3])
+            ops.push(KernelOp::Sub(d, a, b))
+          end
+        when "mul" then
+          if parts.len() >= 4 then
+            let d = software_reg_index(&parts[1])
+            let a = software_reg_index(&parts[2])
+            let b = software_reg_index(&parts[3])
+            ops.push(KernelOp::Mul(d, a, b))
+          end
+        when _ then ()
+        end
+      end
+    end
+    li = li + 1
+  end
+  if ops.len() == 0 then
+    return Result::Err(GpuError::InvalidShader("the software kernel source compiled to zero operations".to_string()))
+  end
+  let kernel = SoftwareKernel { ops: ops, workgroup: workgroup }
+  let kid = ctx.next_id
+  ctx.next_id = ctx.next_id + 1
+  ctx.pipelines.insert(kid, GpuPipeline { id: kid, device: ctx.device.id, layout: PipelineLayout { descriptor_sets: Vec::new(), push_constant_range: Option::None } })
+  match ctx.backend
+  when GpuBackend::Software then
+    # The pipeline id -> program table lives in the context's pipelines map;
+    # the program itself is re-compiled per dispatch through the store below.
+    ()
+  when _ then ()
+  end
+  Result::Ok(kid)
+end
+
+def software_reg_index(name: &String) -> Int
+  if name == "r0" then 0
+  elsif name == "r1" then 1
+  elsif name == "r2" then 2
+  elsif name == "r3" then 3
+  else 0
+  end
+end
+
+def software_parse_int(s: &String) -> Int
+  var value = 0
+  var negative = false
+  var i = 0
+  while i < s.len() do
+    let c = s[i]
+    if c == '-' && i == 0 then
+      negative = true
+    elsif c >= '0' && c <= '9' then
+      value = value * 10 + (c as Int - '0' as Int)
+    end
+    i = i + 1
+  end
+  if negative then -value else value end
+end
+
+def software_parse_u32(s: &String) -> u32
+  let v = software_parse_int(s)
+  if v < 0 then 0u32 else v as u32 end
+end
+
+## The software dispatch: materialize the software buffer store from the
+## context's buffers, run every work item through the kernel program, and
+## write the store back. This is the CPU evaluation of the compute kernel.
+def dispatch_software_kernel(inout ctx: GpuContext, pipeline_id: Int, workgroup: [UInt; 3], global_size: [UInt; 3], kernel_source: String) -> Result[Unit, GpuError]
+  var store: Vec[Vec[u8]] = Vec::new()
+  var ids: Vec[Int] = Vec::new()
+  for (_, buffer) in ctx.buffers do
+    let bytes = software_buffer_bytes(ctx, buffer)?
+    ids.push(buffer.id)
+    store.push(bytes)
+  end
+  let program = software_parse_kernel_source(kernel_source)?
+  let total_x = if global_size[0] == 0 then 1 else global_size[0] end
+  let total_y = if global_size[1] == 0 then 1 else global_size[1] end
+  let total_z = if global_size[2] == 0 then 1 else global_size[2] end
+  var zi: UInt = 0
+  while zi < total_z do
+    var yi: UInt = 0
+    while yi < total_y do
+      var xi: UInt = 0
+      while xi < total_x do
+        let work_item = xi + yi * total_x + zi * total_x * total_y
+        match software_execute_kernel(&program, &mut store, work_item)
+        when Result::Ok(_) then ()
+        when Result::Err(e) then return Result::Err(e)
+        end
+        xi = xi + 1
+      end
+      yi = yi + 1
+    end
+    zi = zi + 1
+  end
+  # Write the store back into the buffers (the materialized data).
+  var si = 0
+  while si < store.len() do
+    match ctx.buffers.get(ids[si])
+    when Option::Some(buffer) then
+      match buffer.mapped_ptr
+      when Option::Some(ptr) then
+        var bi: UInt = 0
+        while bi < store[si].len() as UInt do
+          ptr.offset(bi as Int).write(store[si][bi as Int])
+          bi = bi + 1
+        end
+      when Option::None then ()
+      end
+    when Option::None then ()
+    end
+    si = si + 1
+  end
+  Result::Ok(())
+end
+
+def software_parse_kernel_source(source: String) -> Result[Vec[KernelOp], GpuError]
+  var ops: Vec[KernelOp] = Vec::new()
+  let lines = source.split("\n")
+  var li = 0
+  while li < lines.len() do
+    let line = lines[li].trim()
+    if line.len() > 0 && !line.starts_with("#") then
+      let parts = line.split(" ")
+      if parts.len() >= 2 then
+        match parts[0]
+        when "const" then
+          if parts.len() >= 3 then ops.push(KernelOp::Const(software_reg_index(&parts[1]), software_parse_u32(&parts[2]))) end
+        when "item" then
+          if parts.len() >= 2 then ops.push(KernelOp::WorkItem(software_reg_index(&parts[1]))) end
+        when "load" then
+          if parts.len() >= 3 then ops.push(KernelOp::Load32(software_parse_int(&parts[1]), software_reg_index(&parts[2]))) end
+        when "store" then
+          if parts.len() >= 3 then ops.push(KernelOp::Store32(software_parse_int(&parts[1]), software_reg_index(&parts[2]))) end
+        when "add" then
+          if parts.len() >= 4 then ops.push(KernelOp::Add(software_reg_index(&parts[1]), software_reg_index(&parts[2]), software_reg_index(&parts[3]))) end
+        when "sub" then
+          if parts.len() >= 4 then ops.push(KernelOp::Sub(software_reg_index(&parts[1]), software_reg_index(&parts[2]), software_reg_index(&parts[3]))) end
+        when "mul" then
+          if parts.len() >= 4 then ops.push(KernelOp::Mul(software_reg_index(&parts[1]), software_reg_index(&parts[2]), software_reg_index(&parts[3]))) end
+        when _ then ()
+        end
+      end
+    end
+    li = li + 1
+  end
+  if ops.len() == 0 then
+    return Result::Err(GpuError::InvalidShader("the software kernel source compiled to zero operations".to_string()))
+  end
+  Result::Ok(ops)
+end
+
+## Create a GpuContext on the software backend (the reference backend).
+def create_software_context(device: GpuDevice) -> Result[GpuContext, GpuError]
+  Result::Ok(GpuContext {
+    backend: GpuBackend::Software,
+    device: device.clone(),
+    buffers: Map::new(),
+    images: Map::new(),
+    samplers: Map::new(),
+    pipelines: Map::new(),
+    command_buffers: Map::new(),
+    next_id: 0,
+    vulkan_instance: Option::None,
+    vulkan_device: Option::None,
+    metal_device: Option::None,
+    cuda_context: Option::None,
+    opencl_context: Option::None
+  })
 end

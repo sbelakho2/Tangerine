@@ -9,6 +9,8 @@ use std::collections::{Vec, Map, Set}
 # Layout.enum_layout field is a flat projection that no consumer reads; the
 # rich EnumLayout lives here.
 use std::alloc::{Layout, FieldLayout, VariantLayout}
+use tg_compiler::token::{span_dummy}
+use tg_compiler::ast::{LayoutAttrs, layout_attrs_plain}
 use tg_compiler::types::{Type, TypeId, subst_type_args}
 use tg_compiler::mir::{MirTypeDef, MirTypeDefKind, MirFieldDef, MirVariantDef, mir_type_identity_key}
 
@@ -87,6 +89,9 @@ enum LayoutCategory
   ZeroSized
   # Function types (raw function pointers)
   FunctionType
+  # SIMD vectors — the VECTOR ROW: the std Vec2/Vec4/Vec8/Vec16 family (N
+  # lanes of the lane type) with alignment = the vector width (16/32/64).
+  Vector
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -109,8 +114,15 @@ end
 #     32-byte OwnedStringObjectLayout { data, len, cap, stride })
 #   Vec[T], Array[T]                      | HeapVecHeader   | Yes         | move + clone
 #   FixedArray[T, N] (any N >= 0)         | Inline          | N elements  | structural
-#   Slice[T]                              | Inline view     | No          | bit
-#     ({ptr: Ptr[T] @0, len: UInt @8})
+#   Slice[T] (the SOURCE-spelled SAFE form — the std-declared shared
+#     struct)                             | Inline (8)      | Yes (Arc)   | move + clone
+#     (the value is the 8-byte Arc-class handle { inner: Arc @ 0 } to the
+#      24-byte pinned backing {ptr: Ptr[T] @0, len: UInt @8, offset: UInt
+#      @16} — slice_shared_handle_layout / slice_shared_backing_layout;
+#      the layout is computed from the std struct's MirTypeDef)
+#   UnsafeSlice[T] (the RAW view — the explicit unsafe/FFI form)
+#                                         | Inline view     | No          | bit
+#     ({ptr: Ptr[T] @0, len: UInt @8} — the 16-byte borrowed fat value)
 #   Map[K,V]                              | HeapMapHeader   | Yes         | move + clone
 #   Set[T]                                | HeapSetHeader   | Yes         | move + clone
 #   struct                                | Inline          | fields      | structural
@@ -138,9 +150,14 @@ end
 #                                   {data:0, len:8, cap:16, stride:24} —
 #                                   owned_string_object_size; the drop frees
 #                                   the object AND its data buffer)
-#   StrView                 -> 16  (the non-owning view {ptr: Ptr[u8] @0,
-#                                   len: UInt @8} — the static literal form
-#                                   and the borrowed form; no object)
+#   StrView                 -> 8   (the SAFE SHARED/PINNED view: the
+#                                   Arc-class handle { inner: Arc @ 0 } to
+#                                   the 24-byte pinned byte backing
+#                                   {ptr: Ptr[u8] @0, len: UInt @8,
+#                                   offset: UInt @16} — the std-declared
+#                                   struct; the raw 16-byte {ptr,len} byte
+#                                   view survives only as UnsafeSlice[u8] /
+#                                   the FFI FfiSlice form)
 #   CStringPtr              -> 8   (the RAW pointer to NUL-terminated bytes
 #                                   — the borrowed c-string form, no object)
 # HeapVecHeader -> 32  ({data:0, len:8, cap:16, stride:24} — the heap
@@ -151,9 +168,11 @@ end
 #                         aligned fixed-array size for [T; N] elements) is
 #                         the runtime's element-addressing authority — every
 #                         _tg_array_* helper computes data + i*stride and
-#                         releases cap*stride bytes. Slice is NOT in this
-#                         class: a Slice value is a 16-byte inline {ptr,len}
-#                         VIEW)
+#                         releases cap*stride bytes. The RAW UnsafeSlice is
+#                         NOT in this class: an UnsafeSlice value is a
+#                         16-byte inline {ptr,len} VIEW; the SAFE
+#                         source-spelled Slice is the 8-byte Arc-class
+#                         handle to the 24-byte pinned backing (both below)
 #   HeapMapHeader -> 96  (the runtime's actual Map header — a 96-byte raw
 #                         byte arena plus the CONCRETE layout parameters.
 #                         The canonical machine-readable authority is the
@@ -190,17 +209,36 @@ end
 # the LangItems array id and stays HeapVecHeader — a pointer-sized handle,
 # never inline.
 #
-# SLICE (the reviewer's no-general-borrow view model — adopted): Slice[T] is
-# a COMPILER-SCOPED VIEW, the plain two-field aggregate
-#     Slice[T] = { ptr: Ptr[T] @ 0, len: UInt @ 8 }
-# (a 16-byte inline value, Repr::Inline — the same shape as the std's
-# StrView / FfiSlice). It owns NO memory (owns=false), needs NO drop, and
-# is bit-copyable. It is NOT a pointer to a heap {ptr,len,cap} Vec header:
-# Slice values carry no capacity, and no consumer may read a Slice through a
-# HeapVecHeader offset. Escape (storing a view beyond the lifetime of its
-# backing buffer) is constrained by the safe access model — the
-# projected-access enforcement of the resource checker's IterationPlan is
-# the eventual mechanism (see the Slice contract in std/collections.tg).
+# SLICE — THE ONE-REPRESENTATION AUTHORITY (the reviewer's safe-view
+# closure; the P0 safe-view model — ONE representation, ONE semantic
+# authority, end-to-end):
+#   - The SOURCE-spelled Slice[T] IS the SAFE SHARED/PINNED form — the
+#     std-declared struct `Slice[T] { inner: ArcStrong[SliceBacking[T]] }`
+#     (std/collections.tg). Its layout is computed structurally from its
+#     MirTypeDef: the VALUE is the 8-byte Arc-class handle
+#     { inner: Arc @ 0 } to the 24-byte PINNED BACKING record
+#     SliceBacking[T] = { ptr: Ptr[T] @ 0, len: UInt @ 8,
+#     offset: UInt @ 16 } (slice_shared_handle_layout /
+#     slice_shared_backing_layout). The backing owns the pinned buffer —
+#     the view SURVIVES the original owner's drop and the owner's
+#     capacity-changing mutations (the backing is the separate pinned
+#     allocation). The shared form is an ordinary OWNING value: the Arc's
+#     Drop owns the destruction, and NO escape tracking exists or is
+#     needed — the backing owns (there is no "eventual mechanism"; the
+#     shared form's safety is the Arc's keep-alive, nothing else).
+#   - The RAW 16-byte { ptr: Ptr[T] @ 0, len: UInt @ 8 } view exists ONLY
+#     as the explicit UnsafeSlice[T] builtin (the LangItems slice id — the
+#     unsafe/FFI-only form) and the compiler-scoped loop-iterable forms
+#     (chars/bytes/split/iter/keys/values — consumed by the enclosing
+#     for-loop, never storable) plus the io SliceMut. It owns NO memory
+#     (owns=false), needs NO drop, and is bit-copyable. It is NOT a
+#     pointer to a heap {ptr,len,cap} Vec header: UnsafeSlice values carry
+#     no capacity, and no consumer may read an UnsafeSlice through a
+#     HeapVecHeader offset. Its escapes are rejected by the P0-SL escape
+#     channels in the type checker (the return/store/capture gates over
+#     the raw LangItems id) and the resource checker's live-view registry
+#     / IterationPlan mutation scan — the raw view NEVER escapes to
+#     longer-lived state.
 #
 # (TaggedPtr is the enum VALUE encoding — one pointer-width word holding a
 # raw discriminant below the inline-tag threshold or a heap pointer (at/above
@@ -216,8 +254,10 @@ enum Repr
                  # String OBJECT (OwnedStringObjectLayout — {data,len,cap,
                  # stride}); the object and its buffer are heap-allocated
                  # and freed by the String drop — never a raw C-string
-                 # pointer (the raw borrowed forms are StrView / CStringPtr)
-  HeapVecHeader  # pointer to a heap {ptr,len,cap} header (Vec/Array — NOT Slice)
+                 # pointer (the raw borrowed forms are UnsafeSlice /
+                 # CStringPtr)
+  HeapVecHeader  # pointer to a heap {ptr,len,cap} header (Vec/Array — NOT
+                 # the raw UnsafeSlice view, NOT the safe Slice handle)
   HeapMapHeader  # pointer to a heap Map header
   HeapSetHeader  # pointer to a heap Set header
   Inline         # stored field-by-field inline (structs, tagged enums, tuples)
@@ -284,9 +324,12 @@ def type_repr(engine: LayoutEngine, ty: Type) -> Repr
     let named_repr_name = lookup_type_name(engine, tid.id)
     if named_repr_name == "Box" then Repr::RawPtr
     elsif named_repr_name == "Rc" then Repr::RawPtr
-    # Slice[T] is the two-field {ptr: Ptr[T], len: UInt} VIEW (16-byte inline
-    # aggregate — see the SLICE note above); it is NOT a HeapVecHeader handle.
-    elsif named_repr_name == "Slice" then Repr::Inline
+    # UnsafeSlice[T] is the RAW {ptr: Ptr[T], len: UInt} VIEW (16-byte
+    # inline aggregate — see the SLICE note above); it is NOT a
+    # HeapVecHeader handle. The SAFE source-spelled Slice is the
+    # std-declared shared struct — it falls through to named_type_repr
+    # (Inline, computed from its MirTypeDef: the 8-byte Arc handle).
+    elsif named_repr_name == "UnsafeSlice" then Repr::Inline
     elsif named_repr_name == "Array" then Repr::HeapVecHeader
     elsif named_repr_name == "Map" then Repr::HeapMapHeader
     elsif named_repr_name == "Set" then Repr::HeapSetHeader
@@ -530,8 +573,10 @@ def repr_storage_align(inout engine: LayoutEngine, ty: Type) -> Int
       # never reaches the Inline case — the fixed arrays are the distinct
       # Type::FixedArray variant below.
       if is_slice_view_tid(engine, tid.id) then
-        # Slice[T] is the two-field {ptr,len} view: alignment is the pointer
-        # alignment (both fields are pointer-width).
+        # UnsafeSlice[T] is the two-field {ptr,len} view: alignment is the pointer
+        # alignment (both fields are pointer-width). The SAFE source-spelled
+        # Slice is the std-declared shared struct — the Arc handle's
+        # alignment (computed from its MirTypeDef).
         engine.target.pointer_align
       elsif lookup_type_name(engine, tid.id) == "Array" && !args.is_empty() then
         repr_storage_align(engine, &args[0])
@@ -576,7 +621,7 @@ def inline_storage_size(inout engine: LayoutEngine, ty: Type) -> Int
     # case (type_repr maps it to HeapVecHeader) — the fixed arrays are the
     # distinct Type::FixedArray variant below.
     if is_slice_view_tid(engine, tid.id) then
-      # Slice[T] view: 2 pointer-width fields {ptr @ 0, len @ 8}.
+      # UnsafeSlice[T] view: 2 pointer-width fields {ptr @ 0, len @ 8}.
       slice_view_layout(engine).size
     elsif lookup_type_name(engine, tid.id) == "Array" && !args.is_empty() then
       inline_array_storage_size(engine, &args[0], 0)
@@ -634,8 +679,26 @@ struct LayoutRecord
   header_size: Int       # 0 for non-heap types
   payload_offset: Int    # Offset of payload from heap object base
   
+  # The declaration's layout attributes (@repr(C) / @align(N) / @packed) —
+  # the attributed rules that produced this record (the engine's single
+  # layout authority; the ABI classifier consults it for the C-aggregate
+  # classification of attributed types).
+  layout_attrs: LayoutAttrs
+  
   # Hash for caching
   hash: Int
+end
+
+# The layout attributes of a registered type def (the engine's single
+# authority: the MirTypeDef.layout record the MIR carried from the typed
+# table); the un-attributed default for unregistered/builtin ids.
+def type_layout_attrs_of(engine: LayoutEngine, type_id: Int) -> LayoutAttrs
+  for td in engine.type_defs do
+    if td.id.id == type_id then
+      return td.layout.clone()
+    end
+  end
+  layout_attrs_plain(span_dummy())
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -834,7 +897,8 @@ def substituted_type_def(engine: LayoutEngine, ty: Type) -> Option[MirTypeDef]
             id: td.id.clone(),
             name: td.name.clone(),
             kind: MirTypeDefKind::Struct(new_fields),
-            generic_params: td.generic_params.clone()
+            generic_params: td.generic_params.clone(),
+            layout: td.layout.clone()
           })
         when MirTypeDefKind::Enum(variants) then
           var new_variants = Vec::new()
@@ -853,7 +917,8 @@ def substituted_type_def(engine: LayoutEngine, ty: Type) -> Option[MirTypeDef]
             id: td.id.clone(),
             name: td.name.clone(),
             kind: MirTypeDefKind::Enum(new_variants),
-            generic_params: td.generic_params.clone()
+            generic_params: td.generic_params.clone(),
+            layout: td.layout.clone()
           })
         end
       end
@@ -1030,7 +1095,7 @@ def size_of(inout engine: LayoutEngine, ty: Type) -> Int
       # the named Array[T] heap-vector identity only (fixed arrays are the
       # distinct Type::FixedArray variant).
       if is_slice_view_tid(engine, tid.id) then
-        # Slice[T] view: the 16-byte {ptr, len} aggregate.
+        # UnsafeSlice[T] view: the 16-byte {ptr, len} aggregate.
         slice_view_layout(engine).size
       elsif lookup_type_name(engine, tid.id) == "Array" && !args.is_empty() then
         inline_array_storage_size(engine, &args[0], 0)
@@ -1094,7 +1159,7 @@ def align_of(inout engine: LayoutEngine, ty: Type) -> Int
       # (element alignment); the fixed arrays are the distinct Type::FixedArray
       # variant below.
       if is_slice_view_tid(engine, tid.id) then
-        # Slice[T] view: pointer alignment (both fields are pointer-width).
+        # UnsafeSlice[T] view: pointer alignment (both fields are pointer-width).
         engine.target.pointer_align
       elsif lookup_type_name(engine, tid.id) == "Array" && !args.is_empty() then
         repr_storage_align(engine, &args[0])
@@ -1160,7 +1225,7 @@ def layout_of(inout engine: LayoutEngine, ty: Type) -> Layout
       # the named Array[T] heap-vector identity only (fixed arrays are the
       # distinct Type::FixedArray variant below).
       if is_slice_view_tid(engine, tid.id) then
-        # Slice[T] is the two-field {ptr,len} view — the 16-byte aggregate.
+        # UnsafeSlice[T] is the two-field {ptr,len} view — the 16-byte aggregate.
         slice_view_layout(engine)
       elsif lookup_type_name(engine, tid.id) == "Array" && !args.is_empty() then
         let sz = inline_array_storage_size(engine, &args[0], 0)
@@ -1260,9 +1325,12 @@ def check_concrete_layout(inout engine: LayoutEngine, ty: Type) -> Result[Unit, 
  # Adt form of Array is the heap-vector identity (the named
     # Array[T]) — an opaque pointer-sized handle, concrete without
     # inspecting the pointee (fixed inline arrays are the distinct
-    # Type::FixedArray variant). Slice[T] is the two-field view builtin —
-    # also concrete without inspecting the element (the view holds a raw
-    # pointer; the element's own layout lives behind the indirection).
+    # Type::FixedArray variant). The RAW UnsafeSlice[T] is the two-field
+    # view builtin — also concrete without inspecting the element (the view
+    # holds a raw pointer; the element's own layout lives behind the
+    # indirection). The SAFE source-spelled Slice is the std-declared shared
+    # struct: its inner field is the Arc handle — an indirection — so it is
+    # concrete without inspecting the element too.
     if lookup_type_name(engine, tid.id) == "Array" || is_slice_view_tid(engine, tid.id) then
       Result::Ok(())
     else
@@ -1409,9 +1477,11 @@ def layout_of_concrete(inout engine: LayoutEngine, ty: Type) -> Result[Layout, L
     })
   when Type::Adt(tid, _) then
     if is_slice_view_tid(engine, tid.id) then
-      # Slice[T] is the registered-but-Opaque view builtin: it has NO
-      # MirTypeDef, but its layout is fully concrete — the 16-byte {ptr,len}
-      # aggregate (the view never depends on the element type).
+      # UnsafeSlice[T] is the registered-but-Opaque RAW-view builtin: it
+      # has NO MirTypeDef, but its layout is fully concrete — the 16-byte
+      # {ptr,len} aggregate (the view never depends on the element type).
+      # The SAFE source-spelled Slice is the std-declared shared struct and
+      # takes the engine_has_type_def path below (the 8-byte Arc handle).
       Result::Ok(slice_view_layout(engine))
     elsif engine_has_type_def(engine, tid.id) then
       # Recursively strict: an unresolved inline child (Var/Error/Param) or an
@@ -1467,15 +1537,19 @@ def fn_ptr_layout(engine: LayoutEngine) -> Layout
   Layout { size: s, align: engine.target.pointer_align, stride: s, fields: Vec::new(), enum_layout: Option::None }
 end
 
-# True when a TypeId is the registered Slice builtin (LangItems id). The
-# Slice is a compiler-scoped VIEW — a 16-byte two-field aggregate, never a
-# heap container.
+# True when a TypeId is the registered RAW-view builtin (the LangItems
+# slice id, source-spelled "UnsafeSlice"). The UnsafeSlice is a
+# compiler-scoped VIEW — a 16-byte two-field aggregate, never a
+# heap container. The SAFE source-spelled Slice (the std-declared shared
+# struct) is NOT matched here: its layout is computed structurally from
+# its MirTypeDef (slice_shared_handle_layout below).
 def is_slice_view_tid(engine: LayoutEngine, type_id: Int) -> Bool
-  lookup_type_name(engine, type_id) == "Slice"
+  lookup_type_name(engine, type_id) == "UnsafeSlice"
 end
 
-# The Slice[T] view layout: { ptr: Ptr[T] @ 0, len: UInt @ 8 } — a 16-byte
-# inline value (size 2 * pointer_size, align pointer_align). Slice is a
+# The RAW UnsafeSlice[T] view layout: { ptr: Ptr[T] @ 0, len: UInt @ 8 } —
+# a 16-byte inline value (size 2 * pointer_size, align pointer_align).
+# UnsafeSlice is a
 # registered Opaque builtin with NO MirTypeDef, so every inline layout path
 # special-cases it here instead of falling into compute_type_layout (which
 # would report the unknown-type pointer-sized record).
@@ -1501,6 +1575,83 @@ def slice_view_layout(engine: LayoutEngine) -> Layout
     size: 2 * ptr_size,
     align: palign,
     stride: 2 * ptr_size,
+    fields: field_layouts,
+    enum_layout: Option::None
+  }
+end
+
+# ———————————————————————————————————————————————————————————————
+# THE SAFE SLICE LAYOUT AUTHORITY — the SHARED/PINNED form (the
+# SOURCE-spelled Slice[T], the std-declared struct in std/collections.tg):
+# the exact layout is REPORTED here, once, and the stabilized tables + the
+# ABI schema are generated from it. The layout itself is computed
+# structurally from the std struct's MirTypeDef (Slice[T] { inner:
+# ArcStrong[SliceBacking[T]] }), so these functions are the engine's
+# declared facts:
+#   - the VALUE is the 8-byte Arc-class handle { inner: Arc @ 0 }
+#     (slice_shared_handle_layout);
+#   - the backing record the handle points at is the 24-byte
+#     SliceBacking[T] = { ptr: Ptr[T] @ 0, len: UInt @ 8,
+#     offset: UInt @ 16 } (slice_shared_backing_layout) — the pinned
+#     buffer plus the view window's offset/len. The backing's ptr IS the
+#     pinned window's start (element i of the view lives at
+#     backing.ptr + i * stride); the offset records the window's start
+#     within the SOURCE buffer at pin time (metadata for the sub-view
+#     chaining — never an element address; see std/collections.tg
+#     slice_pin / Slice::get).
+# The shared form owns (the Arc keeps the pinned backing alive), drops via
+# the Arc's Drop, and needs NO escape tracking. The RAW 16-byte {ptr,len}
+# view is the separate UnsafeSlice layout (slice_view_layout) — the
+# explicit unsafe/FFI form.
+def slice_shared_handle_layout(engine: LayoutEngine) -> Layout
+  let ptr_size = engine.target.pointer_size
+  let palign = engine.target.pointer_align
+  var field_layouts = Vec::new()
+  field_layouts.push(FieldLayout {
+    name: "inner",
+    offset: 0,
+    size: ptr_size,
+    align: palign,
+    type_id: -1
+  })
+  Layout {
+    size: ptr_size,
+    align: palign,
+    stride: ptr_size,
+    fields: field_layouts,
+    enum_layout: Option::None
+  }
+end
+
+def slice_shared_backing_layout(engine: LayoutEngine) -> Layout
+  let ptr_size = engine.target.pointer_size
+  let palign = engine.target.pointer_align
+  var field_layouts = Vec::new()
+  field_layouts.push(FieldLayout {
+    name: "ptr",
+    offset: 0,
+    size: ptr_size,
+    align: palign,
+    type_id: -1
+  })
+  field_layouts.push(FieldLayout {
+    name: "len",
+    offset: ptr_size,
+    size: ptr_size,
+    align: palign,
+    type_id: -1
+  })
+  field_layouts.push(FieldLayout {
+    name: "offset",
+    offset: 2 * ptr_size,
+    size: ptr_size,
+    align: palign,
+    type_id: -1
+  })
+  Layout {
+    size: 3 * ptr_size,
+    align: palign,
+    stride: 3 * ptr_size,
     fields: field_layouts,
     enum_layout: Option::None
   }
@@ -1757,7 +1908,33 @@ end
 # distinguishable in dumps). `fields` arrive ALREADY SUBSTITUTED (see
 # compute_type_layout / substituted_type_def) — no Param can reach a
 # placement here.
-def compute_struct_layout(inout engine: LayoutEngine, ty: Type, fields: Vec[MirFieldDef]) -> LayoutRecord
+#
+# THE ATTRIBUTED RULES (the layout attributes — @repr(C) / @align(N) /
+# @packed — validated by the parser + checker, carried by the
+# MirTypeDef.layout record):
+#   @repr(C) — the C struct rules: declaration order, natural field
+#              alignment, standard offsets, tail padding to the max
+#              natural alignment. For every supported field type the
+#              natural layout IS the C layout, so the C-repr computation
+#              is the natural computation; the attribute's real effect is
+#              the ABI classification (classify_value_category routes
+#              C-repr aggregates through the C aggregate rules).
+#   @align(N) — the type's alignment becomes N. Per the C alignment
+#              rules, each field's offset aligns to the MAX of the
+#              field's own alignment and the declared N (a field never
+#              sits at an offset its declared alignment would not
+#              honor), and the total size is tail-aligned to N. The
+#              enclosing aggregates read the record's align (N) when
+#              placing the struct itself.
+#   @packed   — the fields sit at the PACKED offsets: per-field
+#              alignment 1 (no padding between fields), the type's
+#              alignment 1, and the size is the exact byte span of the
+#              fields (no tail padding) — the kernel epoll_event shape
+#              ({ u32 events @ 0, u64 data @ 4 } — size 12, align 1) is
+#              the canonical user. A nested aggregate field keeps its own
+#              internal layout (its own record); only its PLACEMENT is
+#              packed (align 1).
+def compute_struct_layout(inout engine: LayoutEngine, ty: Type, fields: Vec[MirFieldDef], attrs: LayoutAttrs) -> LayoutRecord
   var type_id = -1
   match ty
   when Type::Adt(tid, _) then type_id = tid.id
@@ -1766,12 +1943,37 @@ def compute_struct_layout(inout engine: LayoutEngine, ty: Type, fields: Vec[MirF
   var field_layouts = Vec::new()
   var current_offset = 0
   var max_align = 1
+  let is_packed = attrs.is_packed
+  let declared_align = match attrs.align
+  when Option::Some(n) then n
+  when Option::None then 1
+  end
+  # The declared @align(N) participates from the start — an EMPTY
+  # @align(16) struct is still 16-aligned (tail-padded to 16).
+  if declared_align > max_align then
+    max_align = declared_align
+  end
 
   var field_idx = 0
   while field_idx < fields.len() do
     let f = fields[field_idx]
     let f_size = struct_field_storage_size(engine, &f.ty)
-    let f_align = struct_field_storage_align(engine, &f.ty)
+    var f_align = struct_field_storage_align(engine, &f.ty)
+    
+    if is_packed then
+      # @packed: the fields sit at the packed offsets — per-field
+      # placement alignment 1 (no padding between fields). The field's
+      # PLACEMENT align is reported as 1; the field's own type keeps its
+      # natural alignment in its own record (the unaligned-access
+      # lowering detects the misalignment from the offset).
+      f_align = 1
+    elsif declared_align > 1 then
+      # @align(N): per the C alignment rules the field offsets align to
+      # the max of the field's own alignment and the declared N.
+      if declared_align > f_align then
+        f_align = declared_align
+      end
+    end
     
     if f_align > max_align then
       max_align = f_align
@@ -1821,6 +2023,7 @@ def compute_struct_layout(inout engine: LayoutEngine, ty: Type, fields: Vec[MirF
     tag_size: 0,
     header_size: 0,
     payload_offset: 0,
+    layout_attrs: attrs,
     hash: hash
   }
 end
@@ -1907,6 +2110,7 @@ def closure_object_record(inout engine: LayoutEngine, ty: Type) -> LayoutRecord
         tag_size: 0,
         header_size: 0,
         payload_offset: 0,
+        layout_attrs: layout_attrs_plain(span_dummy()),
         hash: rec_hash
       }
       engine.records.insert(ckey, rec.clone())
@@ -1926,7 +2130,15 @@ end
 # compute_type_layout / substituted_type_def) — Option[u8]'s Some carries
 # the u8 payload, Option[(Int, Int)]'s the 16-byte tuple, never a
 # pointer-width slot.
-def compute_enum_layout(inout engine: LayoutEngine, ty: Type, variants: Vec[MirVariantDef]) -> LayoutRecord
+#
+# THE ATTRIBUTED RULES for enums: @align(N) raises the image's alignment
+# and tail-pads the total size to N; @packed places the variant payload
+# fields at the packed offsets (per-field alignment 1 inside the payload
+# image — the tag stays the frozen 8-byte word at 0); @repr(C) is
+# recorded (the frozen {tag @ 0, payload @ 8} image stays the enum
+# representation — the C-repr classification routes through the C
+# aggregate rules at the ABI boundary).
+def compute_enum_layout(inout engine: LayoutEngine, ty: Type, variants: Vec[MirVariantDef], attrs: LayoutAttrs) -> LayoutRecord
   var type_id = -1
   match ty
   when Type::Adt(tid, _) then type_id = tid.id
@@ -1935,6 +2147,14 @@ def compute_enum_layout(inout engine: LayoutEngine, ty: Type, variants: Vec[MirV
   var variant_layouts = Vec::new()
   var max_payload_size = 0
   var max_align = 8  # Tag alignment
+  let is_packed = attrs.is_packed
+  let declared_align = match attrs.align
+  when Option::Some(n) then n
+  when Option::None then 1
+  end
+  if declared_align > max_align then
+    max_align = declared_align
+  end
 
   var variant_idx = 0
   while variant_idx < variants.len() do
@@ -1954,7 +2174,17 @@ def compute_enum_layout(inout engine: LayoutEngine, ty: Type, variants: Vec[MirV
       # dependency-order bug of the old uniform-8-byte-slot rule cannot
       # recur: a later type's layout is computed on the spot.
       let f_size = repr_storage_size(engine, fty)
-      let f_align = repr_storage_align(engine, fty)
+      var f_align = repr_storage_align(engine, fty)
+
+      if is_packed then
+        # @packed enum: the payload fields sit at the packed offsets
+        # (per-field placement alignment 1 inside the payload image).
+        f_align = 1
+      elsif declared_align > f_align then
+        # @align(N): the payload offsets align to the max of the field's
+        # own alignment and the declared N (per the C alignment rules).
+        f_align = declared_align
+      end
 
       if f_align > max_align then
         max_align = f_align
@@ -2034,6 +2264,7 @@ def compute_enum_layout(inout engine: LayoutEngine, ty: Type, variants: Vec[MirV
     tag_size: 8,        # F3: tag is 8 bytes
     header_size: 0,
     payload_offset: 8,  # F3: payload at offset 8
+    layout_attrs: attrs,
     hash: hash
   }
 end
@@ -2049,6 +2280,118 @@ end
 # per concrete key. A generic definition has NO nominal layout: computing
 # the def with empty args leaves the Param fields in place, which fail
 # closed (Repr::Invalid) at placement — never a pointer-width slot.
+# ———————————————————————————————————————————————————————————————
+# SIMD VECTOR ROWS — the real vector type's layout
+# ———————————————————————————————————————————————————————————————
+# The compiler's vector type is the std::simd VECTOR FAMILY — the
+# Vec2[T] / Vec4[T] / Vec8[T] / Vec16[T] structs (the N-lane SIMD
+# registers; Vec4[Float] is the f32x4 register, Vec8[Float] the 256-bit
+# AVX form, Vec16 the 512-bit form). These are the REAL vector types:
+# their layout is the VECTOR ROW —
+#   size     = N lanes × lane size   (16 / 32 / 64 bytes)
+#   align    = the vector WIDTH      (the vector width, NOT the lane size)
+#   stride   = the vector width
+#   category = LayoutCategory::Vector
+# The lane COUNT comes from the def's fields (Vec4 declares x/y/z/w), the
+# lane SIZE from the concrete substituted lane type (Vec4[Float]'s lanes
+# are the 4-byte Float — f32x4, 16 bytes; Vec2[Float]'s lanes are the
+# 8-byte Float — f64x2, 16 bytes).
+# The gate is the registered def name + a concrete SIMD lane type: ONLY
+# the std vector family gets the row — an ordinary [T; N] fixed array or
+# a user struct named differently keeps the element-aligned inline layout
+# (the differential layout suite's [f64; 2] must stay 16/8 — C's double
+# array convention — never the 16-byte-vector alignment).
+# Widths outside 16/32/64 (e.g. Vec2[f32] — 8 bytes) are NOT vector rows:
+# they fall back to the ordinary struct layout.
+
+# The SIMD lane size of a type: the element width of the supported SIMD
+# lane types (1/2/4/8 bytes); 0 for anything else.
+def simd_lane_size_of_type(ty: Type) -> Int
+  match ty
+  when Type::I8 | Type::U8 then 1
+  when Type::I16 | Type::U16 then 2
+  when Type::I32 | Type::U32 | Type::F32 then 4
+  when Type::I64 | Type::U64 | Type::F64 then 8
+  when _ then 0
+  end
+end
+
+# The std SIMD vector family names — the ONLY names the vector row
+# recognizes (the real vector type).
+def is_simd_vector_type_name(name: String) -> Bool
+  name == "Vec2" || name == "Vec4" || name == "Vec8" || name == "Vec16"
+end
+
+# THE vector-type gate: a CONCRETE Adt of the std vector family whose
+# substituted fields are all SIMD lanes of ONE width and whose total
+# width is a vector width (16/32/64). Everything else — the nominal
+# generic form, a non-lane instantiation, a non-vector width — is NOT a
+# vector type (the ordinary struct row applies).
+def is_simd_vector_type(inout engine: LayoutEngine, ty: Type) -> Bool
+  match ty
+  when Type::Adt(tid, args) then
+    let name = lookup_type_name(engine, tid.id)
+    if !is_simd_vector_type_name(&name) then return false end
+    if args.is_empty() then return false end
+    match substituted_type_def(engine, ty)
+    when Option::Some(std) then
+      match std.kind
+      when MirTypeDefKind::Struct(fields) then
+        if fields.is_empty() then return false end
+        let lane = simd_lane_size_of_type(&fields[0].ty)
+        if lane <= 0 then return false end
+        var fi = 0
+        while fi < fields.len() do
+          if simd_lane_size_of_type(&fields[fi].ty) != lane then return false end
+          fi = fi + 1
+        end
+        let width = lane * fields.len()
+        width == 16 || width == 32 || width == 64
+      when _ then false
+      end
+    when Option::None then false
+    end
+  when _ then false
+  end
+end
+
+# THE VECTOR ROW: the vector type's layout record. The fields keep the
+# element-aligned placement (lane j at j × lane size — the lane offsets
+# the aggregate emission and the lane projections use), but the RECORD's
+# alignment and stride are the VECTOR WIDTH (the row's defining rule).
+def compute_vector_layout(inout engine: LayoutEngine, ty: Type, fields: Vec[MirFieldDef], attrs: LayoutAttrs) -> LayoutRecord
+  let rec = compute_struct_layout(engine, ty, fields, attrs)
+  if rec.fields.is_empty() then
+    panic("layout: the SIMD vector row requires at least one lane field (a vector type is N lanes of a SIMD lane type)")
+  end
+  let lane = rec.fields[0].size
+  if lane <= 0 then
+    panic("layout: the SIMD vector row requires a concrete SIMD lane type (the lane size is 0)")
+  end
+  let width = lane * rec.fields.len()
+  if width != 16 && width != 32 && width != 64 then
+    panic("layout: the SIMD vector row requires a 16/32/64-byte vector width (got " + width.to_string() + " bytes)")
+  end
+  LayoutRecord {
+    type_id: rec.type_id,
+    name: rec.name,
+    category: LayoutCategory::Vector,
+    repr: rec.repr,
+    size: width,
+    align: width,
+    stride: width,
+    field_count: rec.field_count,
+    fields: rec.fields,
+    variants: rec.variants,
+    tag_offset: 0,
+    tag_size: 0,
+    header_size: 0,
+    payload_offset: 0,
+    layout_attrs: attrs,
+    hash: rec.hash
+  }
+end
+
 def compute_type_layout(inout engine: LayoutEngine, ty: Type) -> LayoutRecord
   match ty
   when Type::Adt(tid, args) then
@@ -2082,10 +2425,19 @@ def compute_type_layout(inout engine: LayoutEngine, ty: Type) -> LayoutRecord
       let rec = match td.kind
       when MirTypeDefKind::Struct(fields) then
         # The substituted-field computation: the def's fields under THIS
-        # concrete key (generic_params <- args).
-        compute_struct_layout(engine, ty, &substitute_mir_fields(engine, ty, &fields))
+        # concrete key (generic_params <- args). The attributed layout
+        # rules come from the def's layout-attribute record (the typed
+        # authority the MIR carried). A std SIMD vector family
+        # instantiation takes the VECTOR ROW (alignment = the vector
+        # width); every other struct keeps the field-by-field layout.
+        let sub_fields = substitute_mir_fields(engine, ty, &fields)
+        if is_simd_vector_type(engine, ty) then
+          compute_vector_layout(engine, ty, &sub_fields, &td.layout)
+        else
+          compute_struct_layout(engine, ty, &sub_fields, &td.layout)
+        end
       when MirTypeDefKind::Enum(variants) then
-        compute_enum_layout(engine, ty, &substitute_mir_variants(engine, ty, &variants))
+        compute_enum_layout(engine, ty, &substitute_mir_variants(engine, ty, &variants), &td.layout)
       end
 
       # Cache the result under the CONCRETE key
@@ -2309,13 +2661,17 @@ end
 # (OwnedStringObjectLayout — the 32-byte {data:0, len:8, cap:16, stride:24}
 # object the StringHandleLayout value points at; the object and its buffer
 # are heap-allocated and freed by the String drop). It does NOT describe
-# the raw borrowed forms (the 16-byte StrView view and the CStringPtr raw
-# pointer — neither has these fields).
+# the raw borrowed forms (the 16-byte UnsafeSlice view and the CStringPtr
+# raw pointer — neither has these fields).
 #
-# Slice is deliberately NOT in container_repr_for_name: a Slice value is the
+# The RAW UnsafeSlice is deliberately NOT in container_repr_for_name: an
+# UnsafeSlice value is the
 # inline two-field view { ptr: Ptr[T] @ 0, len: UInt @ pointer_size }
-# (slice_view_layout) — never a heap header. Consumers of Slice values use
-# slice_view_field_offset, never container_field_offset / HeapVecHeader.
+# (slice_view_layout) — never a heap header. Consumers of the RAW view
+# use slice_view_field_offset, never container_field_offset /
+# HeapVecHeader. The SAFE source-spelled Slice is the std-declared shared
+# struct (the 8-byte Arc handle — slice_shared_handle_layout), whose
+# fields are read through the ordinary struct field path.
 def slice_view_field_offset(engine: LayoutEngine, field_name: String) -> Int
   let ptr_size = engine.target.pointer_size
   if field_name == "ptr" || field_name == "data" then 0
@@ -2497,6 +2853,7 @@ def category_to_string(cat: LayoutCategory) -> String
   when LayoutCategory::DynContainer then "DynContainer"
   when LayoutCategory::ZeroSized then "ZeroSized"
   when LayoutCategory::FunctionType then "FunctionType"
+  when LayoutCategory::Vector then "Vector"
   end
 end
 
@@ -2552,8 +2909,16 @@ end
 #   Scalar(width)       — ONE ABI slot of `width` bytes (1/2/4/8): the value
 #                         itself travels in the slot
 #   ScalarPair(w1, w2)  — exactly TWO words (16-byte aggregates: pairs,
-#                         16-byte tuples/structs, the Slice view, I128):
+#                         16-byte tuples/structs, the UnsafeSlice view,
+#                         I128):
 #                         a two-slot value
+#   Vector(width)       — a SIMD VECTOR (the std Vec2/Vec4/Vec8/Vec16
+#                         family — the VECTOR ROW): the 16-byte vector
+#                         crosses THROUGH THE REGISTERS (the vector
+#                         register class — q0-q7 / xmm0-xmm7 at the ISA
+#                         level); the 32/64-byte vectors classify
+#                         ByAddress (memory) — see the vector cases in
+#                         classify_value_category
 #   ByAddress(size)     — more than 16 bytes: the value crosses BY ADDRESS
 #                         (the slot carries the address; returns use sret)
 #
@@ -2568,7 +2933,12 @@ end
 #   tuples/structs/fixed arrays (Inline) -> by layout size: 0 -> ZeroSized,
 #                      1/2/4/8 -> Scalar(size), 16 -> ScalarPair(8, 8),
 #                      >16 -> ByAddress(size)
-#   Slice (the 16-byte view) -> ScalarPair(8, 8) via the size rule
+#   SIMD vectors     -> the VECTOR CASES: the 16-byte vector ->
+#                      Vector(16) (registers); the 32/64-byte vectors ->
+#                      ByAddress(width) (memory) — the size rule for
+#                      >16-byte inline aggregates
+#   UnsafeSlice (the 16-byte raw view) -> ScalarPair(8, 8) via the size
+#   rule (the SAFE Slice crosses as its 8-byte Arc-class handle)
 # FAIL-CLOSED: Var/Param/Error/unknown -> Result::Err(LayoutError) — the
 # caller (codegen's classify pair, sret decisions) must ICE, never assume a
 # word.
@@ -2576,11 +2946,13 @@ enum ValueCategory
   ZeroSized
   Scalar(Int)          # one ABI slot; slot width in bytes (1/2/4/8)
   ScalarPair(Int, Int) # two ABI slots (16-byte aggregate: two words)
+  Vector(Int)          # a SIMD vector; the vector width in bytes (16/32/64)
   ByAddress(Int)       # by reference (address in the slot); payload byte size
 end
 
 # Size-based category for INLINE aggregates (tuples, structs, fixed arrays,
-# the Slice view, InlineTagged-represented enums): the layout size decides.
+# the UnsafeSlice view, InlineTagged-represented enums): the layout size
+# decides.
 def inline_aggregate_category(inout engine: LayoutEngine, ty: Type) -> Result[ValueCategory, LayoutError]
   match layout_of_concrete(engine, ty)
   when Result::Ok(l) then
@@ -2589,6 +2961,36 @@ def inline_aggregate_category(inout engine: LayoutEngine, ty: Type) -> Result[Va
     elsif l.size <= 8 then
       Result::Ok(ValueCategory::Scalar(l.size))
     elsif l.size == 16 then
+      Result::Ok(ValueCategory::ScalarPair(8, 8))
+    else
+      Result::Ok(ValueCategory::ByAddress(l.size))
+    end
+  when Result::Err(e) then Result::Err(e)
+  end
+end
+
+# Size-based category for C-REPR / PACKED aggregates — the C ABI rules
+# (the System V AMD64 aggregate classification: the aggregate is split
+# into eightbytes; each is classified INTEGER for the all-integral
+# shapes the supported types produce, so the aggregate crosses in as many
+# integer registers as its size spans):
+#   size 0        -> ZeroSized
+#   size <= 8     -> ONE integer slot of `size` bytes  (Scalar(size))
+#   8 < size <= 16 -> TWO integer slots               (ScalarPair(8, 8))
+#   size > 16     -> BY ADDRESS (memory class)        (ByAddress(size))
+# This differs from the NATIVE rule (inline_aggregate_category — which
+# sends 9..16-byte aggregates ByAddress, keeping only the exactly-16-byte
+# pair in registers) exactly where the C ABI matters: a C-repr struct of
+# 12 bytes (the packed epoll_event { u32 @ 0, u64 @ 4 } shape) crosses in
+# two integer registers per the C rules, never by address.
+def c_aggregate_category(inout engine: LayoutEngine, ty: Type) -> Result[ValueCategory, LayoutError]
+  match layout_of_concrete(engine, ty)
+  when Result::Ok(l) then
+    if l.size == 0 then
+      Result::Ok(ValueCategory::ZeroSized)
+    elsif l.size <= 8 then
+      Result::Ok(ValueCategory::Scalar(l.size))
+    elsif l.size <= 16 then
       Result::Ok(ValueCategory::ScalarPair(8, 8))
     else
       Result::Ok(ValueCategory::ByAddress(l.size))
@@ -2630,6 +3032,26 @@ def classify_value_category(inout engine: LayoutEngine, ty: Type) -> Result[Valu
       context: "classify_value_category"
     })
   when _ then ()
+  end
+
+  # THE VECTOR CASES: a SIMD vector type (the std Vec2/Vec4/Vec8/Vec16
+  # family — the VECTOR ROW, N lanes of the lane type) classifies by its
+  # vector width:
+  #   - the 16-byte vector crosses THROUGH THE REGISTERS
+  #     (ValueCategory::Vector(16) — the vector-register class, never sret);
+  #   - the 32/64-byte vectors cross BY ADDRESS
+  #     (ValueCategory::ByAddress(width) — memory), the size rule for
+  #     >16-byte inline aggregates.
+  # The 16-byte vector is therefore NOT a ScalarPair: the register
+  # classification is first-class (the ABI probe distinguishes the vector
+  # case from the two-GP-word aggregate crossing).
+  if is_simd_vector_type(engine, ty) then
+    let vwidth = simd_vector_width_of(engine, ty)
+    if vwidth == 16 then
+      return Result::Ok(ValueCategory::Vector(16))
+    else
+      return Result::Ok(ValueCategory::ByAddress(vwidth))
+    end
   end
 
   match type_repr(engine, ty)
@@ -2712,7 +3134,16 @@ def classify_value_category(inout engine: LayoutEngine, ty: Type) -> Result[Valu
           })
         end
       else
-        inline_aggregate_category(engine, ty)
+        # Structs: the ATTRIBUTED types (a @repr(C) or @packed
+        # declaration) are classified through the C-ABI aggregate rules
+        # (c_aggregate_category) — the C-repr contract is the ABI
+        # contract; the native rule serves the un-attributed aggregates.
+        let def_attrs = type_layout_attrs_of(engine, tid.id)
+        if def_attrs.is_repr_c || def_attrs.is_packed then
+          c_aggregate_category(engine, ty)
+        else
+          inline_aggregate_category(engine, ty)
+        end
       end
     when _ then
       inline_aggregate_category(engine, ty)
@@ -2777,16 +3208,19 @@ end
 # Collect TypeIds of named types reached through INLINE storage only: direct
 # Adt fields, tuple elements, and fixed-array elements. The named Array[T]
 # Adt form is the heap-vector handle — an indirection never followed. Other
-# indirections (Ptr/PtrMut/Ref, Box/Rc, Slice — the {ptr,len} view holds a
-# raw pointer, Option/Result/Map/Set, Function, String) are never followed;
+# indirections (Ptr/PtrMut/Ref, Box/Rc, UnsafeSlice — the raw {ptr,len}
+# view holds a raw pointer, the SAFE Slice/StrView — the Arc handle,
+# Option/Result/Map/Set, Function, String) are never followed;
 # unregistered named types have no definition to recurse into.
 def collect_inline_named_children(engine: LayoutEngine, ty: Type, inout out: Vec[Int]) -> Unit
   match ty
   when Type::Adt(tid, args) then
  # Adt form of Array is the heap-vector identity (the named
     # Array[T]) — an indirection, never followed into inline children. The
-    # Slice view is likewise an indirection (its only field is a raw Ptr),
-    # so it is never an inline child. The fixed arrays are the distinct
+    # RAW UnsafeSlice view is likewise an indirection (its only field is a
+    # raw Ptr), and the SAFE Slice/StrView are Arc handles (their only
+    # field is the Arc indirection), so they are never inline children.
+    # The fixed arrays are the distinct
     # Type::FixedArray variant below.
     if lookup_type_name(engine, tid.id) == "Array" || is_slice_view_tid(engine, tid.id) then
       ()
@@ -2890,6 +3324,7 @@ def compute_all_layouts(inout engine: LayoutEngine) -> Unit
         tag_size: 0,
         header_size: 0,
         payload_offset: 0,
+        layout_attrs: layout_attrs_plain(span_dummy()),
         hash: 0
       })
     end

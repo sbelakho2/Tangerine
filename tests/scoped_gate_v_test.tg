@@ -1,0 +1,224 @@
+# tests/scoped_gate_v_test.tg — the ScopedTaskHandle multi-observer
+# (the reviewer's scoped waiter closure, Gate V): SIXTEEN scoped handles/
+# observers of the SAME child, each polled multiple times before the
+# completion. The register-once: the registered join waiters per observer
+# stay <= 1 (the total is 16, never 16 x polls — the old scoped poll
+# appended a waiter on EVERY Pending poll). The non-consumptive
+# completion: the terminal TaskState is the authoritative completion —
+# every observer becomes Ready. Afterward the waiter map is empty, and no
+# Executor Arc is retained once all the handles drop. The Drop-unregister
+# lane: a dropped observer removes its own exact registration.
+
+use std::core::{Vec, String, Unit, Result, Option, UInt}
+use std::test::*
+use std::time::Duration
+use std::async::{Future, Waker, Context, Poll, TaskState, ScopedTaskHandle}
+
+@test
+def test_scoped_gate_v_multi_observer_join() -> Unit
+  let mut exec = std::async::executor_new()
+  exec.set_deterministic(1u64)
+
+  # The child: a long deterministic sleep — it stays Waiting while the
+  # observers poll their handles, and it completes only when the virtual
+  # clock advances past the deadline.
+  let base = exec.spawn(async {
+    std::async::sleep_millis(10000).await
+  })
+  let task_id = base.task_id
+  # The seed the 16 observers are cloned from (the seed itself is dropped
+  # after — the seed counts as a retained Arc).
+  let seed = ScopedTaskHandle {
+    task_id: base.task_id,
+    executor: base.executor.clone(),
+    waiter_id: Option::None
+  }
+  drop(base)
+
+  # The observer pool: 16 scoped handles to the SAME child — every clone
+  # is a NEW observer with its own register-once waiter slot (the
+  # explicit clone resets the waiter_id).
+  var observers: Vec[ScopedTaskHandle] = Vec::new()
+  var n = 0
+  while n < 16 do
+    observers.push(seed.clone())
+    n = n + 1
+  end
+
+  # Poll the child once: the sleep registers its timer, the task waits.
+  exec.poll_task(task_id)
+  match exec.inner.ptr.as_ref().task_states.get(&task_id)
+  when Option::Some(TaskState::Waiting) then ()
+  when _ then assert_false(true)
+  end
+
+  # Each observer polls its handle THREE times before the completion —
+  # every poll returns Pending (the child is still running).
+  let waker = Waker { task_id: 999, executor: exec.inner.clone() }
+  mut cx = Context { waker: waker }
+  n = 0
+  while n < 16 do
+    let mut obs = observers.remove(0)
+    var poll_count = 0
+    while poll_count < 3 do
+      match obs.poll(&mut cx)
+      when Poll::Pending then ()
+      when Poll::Ready(_) then assert_false(true)
+      end
+      poll_count = poll_count + 1
+    end
+    observers.push(obs)
+    n = n + 1
+  end
+
+  # THE REGISTER-ONCE ASSERTION: 16 observers x 3 polls, but exactly 16
+  # registered waiters — a re-poll never appends a duplicate.
+  unsafe "the waiter map is executor-thread state" do
+    let exec_inner = exec.inner.ptr.as_mut()
+    match exec_inner.join_waiters.remove(&task_id)
+    when Option::Some(waiters) then
+      assert_eq(waiters.len(), 16)
+      let _ = exec_inner.join_waiters.insert(task_id, waiters)
+    when Option::None then assert_false(true)
+    end
+  end
+
+  # THE COMPLETION: advance the virtual clock past the deadline — the
+  # sleep's timer fires, the child completes (the terminal path records
+  # the Completed state AND the ()-result marker, and detaches the whole
+  # waiter vector — every observer's waker is woken).
+  unsafe "advance the executor's virtual clock" do
+    let exec_inner = exec.inner.ptr.as_mut()
+    exec_inner.virtual_time = exec_inner.virtual_time.add(Duration::from_millis(20000))
+    exec_inner.check_timers_deterministic()
+  end
+  exec.poll_task(task_id)
+
+  # THE NON-CONSUMPTIVE COMPLETION: every observer's re-poll observes
+  # the terminal Completed state — ALL 16 become Ready(Ok).
+  n = 0
+  while n < 16 do
+    let mut obs = observers.remove(0)
+    match obs.poll(&mut cx)
+    when Poll::Ready(res) then
+      match res
+      when Result::Ok(_) then ()
+      when Result::Err(_) then assert_false(true)
+      end
+    when Poll::Pending then assert_false(true)
+    end
+    observers.push(obs)
+    n = n + 1
+  end
+
+  # THE WAITER MAP IS EMPTY AFTERWARD: the completion's detach removed
+  # the child's waiter vector, and the observers' Drop-unregister found
+  # nothing to remove.
+  assert_false(exec.inner.ptr.as_ref().join_waiters.contains_key(&task_id))
+
+  # The test's poll waker held an executor Arc clone — released now, so
+  # the remaining references are exactly the handles + the seed + the
+  # stack-local Executor.
+  drop(cx)
+
+  # NO RETAINED EXECUTOR ARC: at this point the executor's inner is
+  # referenced by the 16 handles + the seed + the stack-local Executor
+  # (the child's future and the waiters' wakers were released at the
+  # completion).
+  assert_eq(exec.inner.strong_count(), 18)
+
+  # Dropping every handle releases its Arc clones — only the seed and
+  # the stack-local Executor's own reference remain.
+  while observers.len() > 0 do
+    let _ = observers.remove(0)
+  end
+  assert_eq(exec.inner.strong_count(), 2)
+  drop(seed)
+  assert_eq(exec.inner.strong_count(), 1)
+end
+
+# THE DROP UNREGISTER: a scoped handle dropped WHILE the child is still
+# running removes its own waiter registration — the completion's detach
+# never wakes the dropped observer's stale waker, and the waiter vector
+# holds exactly the remaining live observers.
+@test
+def test_scoped_gate_v_dropped_observer_unregisters() -> Unit
+  let mut exec = std::async::executor_new()
+  exec.set_deterministic(1u64)
+
+  let base = exec.spawn(async {
+    std::async::sleep_millis(10000).await
+  })
+  let task_id = base.task_id
+
+  var observers: Vec[ScopedTaskHandle] = Vec::new()
+  observers.push(ScopedTaskHandle { task_id: base.task_id, executor: base.executor.clone(), waiter_id: Option::None })
+  observers.push(ScopedTaskHandle { task_id: base.task_id, executor: base.executor.clone(), waiter_id: Option::None })
+  observers.push(ScopedTaskHandle { task_id: base.task_id, executor: base.executor.clone(), waiter_id: Option::None })
+  drop(base)
+
+  exec.poll_task(task_id)
+
+  let waker = Waker { task_id: 998, executor: exec.inner.clone() }
+  mut cx = Context { waker: waker }
+
+  # All three observers register their waiter (two polls each — the
+  # register-once keeps one registration per observer).
+  var n = 0
+  while n < 3 do
+    let mut obs = observers.remove(0)
+    let _ = obs.poll(&mut cx)
+    let _ = obs.poll(&mut cx)
+    observers.push(obs)
+    n = n + 1
+  end
+  unsafe "the waiter map is executor-thread state" do
+    let exec_inner = exec.inner.ptr.as_mut()
+    match exec_inner.join_waiters.remove(&task_id)
+    when Option::Some(waiters) then
+      assert_eq(waiters.len(), 3)
+      let _ = exec_inner.join_waiters.insert(task_id, waiters)
+    when Option::None then assert_false(true)
+    end
+  end
+
+  # THE OBSERVER LEAVES: the dropped handle unregisters its exact entry.
+  let _ = observers.remove(1)
+  unsafe "the waiter map is executor-thread state" do
+    let exec_inner = exec.inner.ptr.as_mut()
+    match exec_inner.join_waiters.remove(&task_id)
+    when Option::Some(waiters) then
+      assert_eq(waiters.len(), 2)
+      let _ = exec_inner.join_waiters.insert(task_id, waiters)
+    when Option::None then assert_false(true)
+    end
+  end
+
+  # The remaining observers still complete: the completion detaches the
+  # live vector (2 entries) and every one of them becomes Ready.
+  unsafe "advance the executor's virtual clock" do
+    let exec_inner = exec.inner.ptr.as_mut()
+    exec_inner.virtual_time = exec_inner.virtual_time.add(Duration::from_millis(20000))
+    exec_inner.check_timers_deterministic()
+  end
+  exec.poll_task(task_id)
+
+  n = 0
+  while n < 2 do
+    let mut obs = observers.remove(0)
+    match obs.poll(&mut cx)
+    when Poll::Ready(res) then
+      match res
+      when Result::Ok(_) then ()
+      when Result::Err(_) then assert_false(true)
+      end
+    when Poll::Pending then assert_false(true)
+    end
+    observers.push(obs)
+    n = n + 1
+  end
+
+  if exec.inner.ptr.as_ref().join_waiters.contains_key(&task_id) then
+    assert_false(true)
+  end
+end

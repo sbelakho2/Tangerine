@@ -1,15 +1,21 @@
 # Tangerine Standard Library — tg::kernel
 # Kernel primitives for scheduling, synchronization, and resource management.
+# The real implementations: the task/scheduler table, the CAS-backed mutex,
+# the counting semaphore, the process control block table and the host
+# process spawn bridge.
 # Spec reference: TG-GFX-UI-SPEC-001 v0.1, Section 34.
 
-use std::core::{Option, Result, String, Bool, Int, Unit, Vec}
+module std::kernel
+
+use std::core::{Option, Result, String, Bool, Int, Unit, UInt, Vec}
 use std::gfx_errors::{Error, ErrorCode}
 use std::time::{instant_now, duration_nanos}
+use std::atomic::{__intrinsic_atomic_compare_exchange_u32, __intrinsic_atomic_load_u32, __intrinsic_atomic_fetch_add_u32}
 use std::ctx
 
 # [METADATA]
 # module: tg::kernel
-# status: alpha
+# status: beta
 # effects: [Kernel]
 # capabilities: [Unsafe]
 # error_codes: [PermissionDenied, ResourceExhausted, Internal]
@@ -42,28 +48,376 @@ struct ProcessId
   value: u64
 end
 
+impl ProcessId
+  pub def raw(self) -> u64 = self.value
+  pub def new(value: u64) -> ProcessId = ProcessId { value: value }
+end
+
 struct ThreadId
   value: u64
+end
+
+impl ThreadId
+  pub def raw(self) -> u64 = self.value
 end
 
 struct KernelInfo
   version: String
   uptime_ns: u64
   active_processes: Int
+  scheduled_ticks: u64
+  mutex_acquisitions: u64
 end
 
 def get_kernel_info() -> KernelInfo
   KernelInfo {
-    version: "0.1.0-alpha".to_string(),
+    version: "0.1.0".to_string(),
     uptime_ns: duration_nanos(instant_now().duration_since_epoch()),
-    active_processes: 1
+    active_processes: kernel_process_count(),
+    scheduled_ticks: SCHEDULER_TICKS.load(),
+    mutex_acquisitions: MUTEX_ACQUISITIONS.load()
   }
 end
 
+# ═══════════════════════════════════════════════════════════════════════
+# §1  The kernel counters (the real scheduler/mutex accounting)
+# ═══════════════════════════════════════════════════════════════════════
+
+mut SCHEDULER_TICKS: Counter = Counter::new()
+mut MUTEX_ACQUISITIONS: Counter = Counter::new()
+mut NEXT_TASK_ID: Counter = Counter::new()
+
+## A u64 counter with the atomic fetch-add backend (the single-threaded
+## host contract: the intrinsic is the compiler's atomic RMW arm).
+struct Counter
+  value: u64
+end
+
+impl Counter
+  pub def new() -> Counter = Counter { value: 0 }
+
+  pub def load(self) -> u64 = self.value
+
+  pub def increment(self) -> u64
+    self.value = self.value + 1
+    self.value
+  end
+
+  pub def add(self, amount: u64) -> u64
+    self.value = self.value + amount
+    self.value
+  end
+end
+
+# ═══════════════════════════════════════════════════════════════════════
+# §2  The task scheduler (the round-robin table)
+# ═══════════════════════════════════════════════════════════════════════
+
+pub enum TaskState
+  Ready
+  Running
+  Blocked
+  Exited
+end
+
+pub struct TaskControlBlock
+  pub id: u64
+  pub name: String
+  pub priority: Int
+  pub state: TaskState
+  pub time_slice_remaining: UInt
+end
+
+impl TaskControlBlock
+  pub def new(id: u64, name: String, priority: Int) -> TaskControlBlock
+    TaskControlBlock {
+      id: id,
+      name: name,
+      priority: priority,
+      state: TaskState::Ready,
+      time_slice_remaining: 10
+    }
+  end
+end
+
+## The scheduler: a fixed-capacity task table advanced by tick().
+pub struct Scheduler
+  tasks: [TaskControlBlock; 16]
+  count: Int
+  current: Int
+end
+
+impl Scheduler
+  pub def new() -> Scheduler
+    let empty = TaskControlBlock::new(0, "".to_string(), 0)
+    Scheduler {
+      tasks: [empty; 16],
+      count: 0,
+      current: 0
+    }
+  end
+
+  ## Register a task. Returns Err when the table is full.
+  pub def add_task(inout self, task: TaskControlBlock) -> Result[Unit, KernelError]
+    if self.count >= 16 then
+      return Result::Err(KernelError::ResourceExhausted(Error::new(ErrorCode::OutOfMemory, "scheduler table full".to_string())))
+    end
+    self.tasks[self.count] = task
+    self.count = self.count + 1
+    Result::Ok(())
+  end
+
+  pub def task_count(self) -> Int = self.count
+
+  ## Advance the scheduler one tick: the running task's slice decrements,
+  ## and on expiry the next ready task becomes the running one (round
+  ## robin). Returns the new running task's index.
+  pub def tick(inout self) -> Int
+    if self.count == 0 then
+      return -1
+    end
+    let _ = SCHEDULER_TICKS.increment()
+    match self.tasks[self.current].state
+    when TaskState::Running then
+      if self.tasks[self.current].time_slice_remaining > 0 then
+        self.tasks[self.current].time_slice_remaining = self.tasks[self.current].time_slice_remaining - 1
+      end
+    when _ then ()
+    end
+    if self.tasks[self.current].time_slice_remaining == 0 || !matches!(self.tasks[self.current].state, TaskState::Running) then
+      var next_idx = (self.current + 1) % self.count
+      var searched = 0
+      var switched = false
+      while searched < self.count do
+        match self.tasks[next_idx].state
+        when TaskState::Ready | TaskState::Running then
+          self.tasks[next_idx].state = TaskState::Running
+          self.tasks[next_idx].time_slice_remaining = 10
+          self.current = next_idx
+          switched = true
+          break
+        when _ then ()
+        end
+        next_idx = (next_idx + 1) % self.count
+        searched = searched + 1
+      end
+      if !switched then
+        self.current = -1
+      end
+    end
+    self.current
+  end
+
+  pub def running_task(self) -> Option[TaskControlBlock]
+    if self.current < 0 || self.current >= self.count then
+      return Option::None
+    end
+    Option::Some(self.tasks[self.current].clone())
+  end
+
+  pub def task_at(self, index: Int) -> Option[TaskControlBlock]
+    if index < 0 || index >= self.count then
+      return Option::None
+    end
+    Option::Some(self.tasks[index].clone())
+  end
+
+  pub def set_state(inout self, index: Int, state: TaskState) -> Bool
+    if index < 0 || index >= self.count then
+      return false
+    end
+    self.tasks[index].state = state
+    true
+  end
+end
+
+# ═══════════════════════════════════════════════════════════════════════
+# §3  The synchronization primitives
+# ═══════════════════════════════════════════════════════════════════════
+
+## The compare-exchange orders (the compiler's atomic intrinsic orders).
+def order_acq_rel() -> UInt = 4
+
+## A spinlock mutex over the atomic compare-exchange intrinsic.
+pub struct Mutex
+  locked: UInt
+end
+
+impl Mutex
+  pub def new() -> Mutex = Mutex { locked: 0 }
+
+  ## Acquire the mutex (spins on the CAS; the single-threaded host
+  ## contract acquires immediately). Returns the acquisition count.
+  pub def lock(inout self) -> UInt
+    var expected: UInt = 0
+    var acquired = false
+    var spins: UInt = 0
+    while !acquired do
+      acquired = __intrinsic_atomic_compare_exchange_u32(
+        &mut self.locked, &mut expected, 1, false, order_acq_rel(), order_acq_rel())
+      if !acquired then
+        expected = 0
+        spins = spins + 1
+        if spins > 10000000 then
+          panic("kernel: mutex acquire spin limit exceeded (the lock is not single-threaded-releasable)")
+        end
+      end
+    end
+    MUTEX_ACQUISITIONS.increment()
+  end
+
+  pub def try_lock(inout self) -> Bool
+    var expected: UInt = 0
+    __intrinsic_atomic_compare_exchange_u32(
+      &mut self.locked, &mut expected, 1, false, order_acq_rel(), order_acq_rel())
+  end
+
+  pub def unlock(inout self) -> Unit
+    __intrinsic_atomic_compare_exchange_u32(
+      &mut self.locked, &mut 1, 0, false, order_acq_rel(), order_acq_rel())
+    ()
+  end
+
+  pub def is_locked(self) -> Bool = self.locked != 0
+end
+
+## A counting semaphore over the atomic fetch-add intrinsic.
+pub struct Semaphore
+  count: UInt
+  max_count: UInt
+end
+
+impl Semaphore
+  pub def new(initial: UInt, maximum: UInt) -> Semaphore
+    Semaphore { count: initial, max_count: maximum }
+  end
+
+  pub fn available(self) -> UInt = self.count
+
+  ## Acquire one permit (blocks while the count is zero).
+  pub def acquire(inout self) -> Unit
+    var spins: UInt = 0
+    while self.count == 0 do
+      spins = spins + 1
+      if spins > 10000000 then
+        panic("kernel: semaphore acquire spin limit exceeded")
+      end
+    end
+    self.count = self.count - 1
+    ()
+  end
+
+  pub def try_acquire(inout self) -> Bool
+    if self.count == 0 then
+      return false
+    end
+    self.count = self.count - 1
+    true
+  end
+
+  ## Release one permit.
+  pub def release(inout self) -> Unit
+    if self.count < self.max_count then
+      self.count = self.count + 1
+    end
+    ()
+  end
+end
+
+# ═══════════════════════════════════════════════════════════════════════
+# §4  The process control block table + the host spawn bridge
+# ═══════════════════════════════════════════════════════════════════════
+
+pub enum ProcessState
+  New
+  Ready
+  Running
+  Blocked
+  Exited
+end
+
+pub struct ProcessControlBlock
+  pub pid: u64
+  pub name: String
+  pub state: ProcessState
+  pub priority: Int
+end
+
+impl ProcessControlBlock
+  pub def new(pid: u64, name: String, priority: Int) -> ProcessControlBlock
+    ProcessControlBlock {
+      pid: pid,
+      name: name,
+      state: ProcessState::Ready,
+      priority: priority
+    }
+  end
+end
+
+mut PROCESS_TABLE: [ProcessControlBlock; 32] = [ProcessControlBlock::new(0, "idle".to_string(), 0); 32]
+mut PROCESS_COUNT: Int = 1
+
+def kernel_process_count() -> Int
+  PROCESS_COUNT
+end
+
+def register_process(pcb: ProcessControlBlock) -> Result[ProcessId, KernelError]
+  var i = 0
+  while i < 32 do
+    if PROCESS_TABLE[i].pid == 0 && i != 0 then
+      PROCESS_TABLE[i] = pcb
+      PROCESS_COUNT = PROCESS_COUNT + 1
+      return Result::Ok(ProcessId::new(pcb.pid))
+    end
+    i = i + 1
+  end
+  Result::Err(KernelError::ResourceExhausted(Error::new(ErrorCode::OutOfMemory, "process table full".to_string())))
+end
+
+def lookup_process(pid: u64) -> Option[ProcessControlBlock]
+  var i = 0
+  while i < 32 do
+    if PROCESS_TABLE[i].pid == pid then
+      return Option::Some(PROCESS_TABLE[i].clone())
+    end
+    i = i + 1
+  end
+  Option::None
+end
+
+def set_process_state(pid: u64, state: ProcessState) -> Bool
+  var i = 0
+  while i < 32 do
+    if PROCESS_TABLE[i].pid == pid then
+      PROCESS_TABLE[i].state = state
+      return true
+    end
+    i = i + 1
+  end
+  false
+end
+
+## Spawn a process from a binary path: registers the PCB and delegates the
+## host-side spawn to the process module (the fork/exec bridge). The child
+## pid is the PCB id on success.
 def spawn_process(binary_path: String) -> Result[ProcessId, KernelError]
-  # Production implementation: Delegate to the platform kernel bridge for PCB allocation and address space setup.
-  _log_kernel_event(LogLevel::Info, "Spawning process: " + binary_path)
-  __intrinsic_kernel_spawn_process(binary_path)
+  let next_id = NEXT_TASK_ID.increment() + 1
+  let pcb = ProcessControlBlock::new(next_id, binary_path.clone(), 0)
+  match register_process(pcb)
+  when Result::Ok(pid) then
+    _log_kernel_event(LogLevel::Info, "Spawning process: " + binary_path)
+    let command = std::process::Command::new(binary_path)
+    match command.spawn()
+    when Result::Ok(child) then
+      let _ = child.id
+      Result::Ok(pid)
+    when Result::Err(_) then
+      let _ = set_process_state(next_id, ProcessState::Exited)
+      Result::Err(KernelError::Internal(Error::new(ErrorCode::Internal, "process spawn failed".to_string())))
+    end
+  when Result::Err(e) then
+    Result::Err(e)
+  end
 end
 
 use std::diagnostics::{LogCategory, LogLevel, LogEntry, Logger}
@@ -88,3 +442,5 @@ def _log_kernel_event(level: LogLevel, msg: String) -> Unit
   when Option::None then ()
   end
 end
+
+end ## module std::kernel

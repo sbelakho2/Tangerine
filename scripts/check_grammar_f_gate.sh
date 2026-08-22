@@ -11,14 +11,22 @@
 #   pos/<prod>_minimal.tg     minimal positive (the construct alone)
 #   pos/<prod>_nested.tg      positive with the construct NESTED inside
 #                             another construct
-#   neg/<prod>_before.tg      the minimal positive with a parse error
-#                             inserted BEFORE the construct — the parser
-#                             must still reject the program (the construct
-#                             cannot swallow the error)
-#   neg/<prod>_after.tg       the minimal positive with a parse error
-#                             inserted AFTER the construct — the parser
-#                             must still reject the program (the construct
+#   neg/<prod>_before.tg      the minimal positive with the production's
+#                             OWN grammar violation (the per-production
+#                             malformation catalog — the wrong arity / the
+#                             wrong keyword / the missing clause — NOT the
+#                             generic stray paren) placed BEFORE the
+#                             construct — the parser must still reject the
+#                             program (the construct cannot swallow the
+#                             error)
+#   neg/<prod>_after.tg       the same production-specific malformation
+#                             placed AFTER the construct — the parser must
+#                             still reject the program (the construct
 #                             cannot swallow what follows)
+#
+# The reviewer's item 10 strengthening: the generic stray-paren negative
+# is FORBIDDEN — a bare `)` line in any negative specimen fails the gate
+# (the malformations must be the production's own grammar violations).
 #
 # WHAT THE GATE CHECKS
 #   1. FACTS ↔ FILES parity — every production in the facts has its four
@@ -28,8 +36,10 @@
 #   2. SPECIMEN STRUCTURE — the positive files carry the declared marker
 #      (`# gate-f: <prod> minimal-positive` / `nested-positive`) and the
 #      negative files carry the invalid-before/invalid-after markers with
-#      the injected error line positioned BEFORE/AFTER the construct
-#      marker (a mechanical, position-verified property).
+#      the malformation block (`# gate-f: <prod> malformed`) positioned
+#      BEFORE/AFTER the construct marker (a mechanical, position-verified
+#      property), plus the generic-stray-paren backstop (a bare `)` line
+#      is a failure).
 #   3. COMPILER VERDICTS (when a USABLE compiler binary exists — the same
 #      probe discipline as run_selfhost_grammar_gate.sh: the binary must
 #      accept a valid probe and REJECT a broken probe):
@@ -40,13 +50,22 @@
 #        all negatives:             `check` must fail (a diagnostic must
 #                                   appear — the bootstrap ladder rule)
 #      Without a usable binary the structural checks (1 + 2) remain the
-#      authoritative rejection (the compiler checks are documented as
-#      "skipped" in the table).
+#      authoritative rejection OUTSIDE the release context.
 #
-# Usage: scripts/check_grammar_f_gate.sh [--report-only]
+# THE RELEASE CONTEXT (--release): the reviewer's item 10 release-path
+# requirement — the compiler-verdict layer is REQUIRED. In the release
+# context a missing usable binary FAILS the gate with the
+# PENDING-UNTIL-BINARY verdict (the release proof's Gate-F row reads
+# PENDING-UNTIL-BINARY until the ladder produces a current-grammar stage
+# binary); the structural-only pass is never a release pass. --report-only
+# can never mask a failure in the release context.
+#
+# Usage: scripts/check_grammar_f_gate.sh [--report-only] [--release]
 # Exit status: 0 when every production's four specimens exist, regenerate
 # identically, carry the right structure, and (with a usable compiler)
-# receive the right verdicts; 1 otherwise.
+# receive the right verdicts; 1 otherwise. In the release context the
+# compiler-verdict layer is required (a missing binary is a FAIL with the
+# PENDING-UNTIL-BINARY verdict).
 
 set -uo pipefail
 
@@ -56,11 +75,15 @@ GEN="$ROOT/scripts/gen_grammar_f_specimens.py"
 SUITE="$ROOT/tests/grammar_f"
 BUILD_DIR="$ROOT/build"
 REPORT_ONLY=0
-case "${1:-}" in
-  --report-only) REPORT_ONLY=1 ;;
-  "") ;;
-  *) echo "check_grammar_f_gate: unknown argument: $1" >&2; exit 2 ;;
-esac
+RELEASE=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --report-only) REPORT_ONLY=1 ;;
+    --release) RELEASE=1 ;;
+    *) echo "check_grammar_f_gate: unknown argument: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
 
 fail() { echo "[grammar-f:error] $*" >&2; exit 1; }
 
@@ -117,33 +140,52 @@ while IFS= read -r prod; do
   # positive markers
   grep -q "# gate-f: $prod minimal-positive" "$pos_min" || { echo "[grammar-f:error] $prod: minimal-positive marker missing"; structure_bad=1; }
   grep -q "# gate-f: $prod nested-positive" "$pos_nest" || { echo "[grammar-f:error] $prod: nested-positive marker missing"; structure_bad=1; }
-  # negative markers + the positional property: the injected error line
-  # (a lone `)`) sits BEFORE the construct marker in the before file and
-  # AFTER it (at EOF) in the after file.
+  # negative markers + the positional property: the production-specific
+  # malformation block (the production's OWN grammar violation — the
+  # wrong arity / the wrong keyword / the missing clause) sits BEFORE
+  # the construct marker in the before file and AFTER it in the after
+  # file. The generic stray-paren negative is FORBIDDEN (the reviewer's
+  # item 10): a bare `)` line in any negative specimen is a failure.
   grep -q "# gate-f: $prod invalid-before" "$neg_before" || { echo "[grammar-f:error] $prod: invalid-before marker missing"; structure_bad=1; }
   grep -q "# gate-f: $prod invalid-after" "$neg_after" || { echo "[grammar-f:error] $prod: invalid-after marker missing"; structure_bad=1; }
-  before_line="$(grep -n '^)' "$neg_before" | head -1 | cut -d: -f1)"
-  marker_line="$(grep -n "# gate-f: $prod minimal-positive" "$neg_before" | head -1 | cut -d: -f1)"
-  [ -n "$before_line" ] && [ -n "$marker_line" ] && [ "$before_line" -lt "$marker_line" ] || {
-    echo "[grammar-f:error] $prod: invalid-before specimen must place the error BEFORE the construct (line $before_line vs marker line $marker_line)"
+  grep -q '^)$' "$neg_before" && {
+    echo "[grammar-f:error] $prod: invalid-before specimen uses the generic stray-paren negative — the negatives must be the production-specific malformations (wrong arity / wrong keyword / missing clause), never a bare ')'"
     structure_bad=1
   }
-  after_line="$(grep -n '^)' "$neg_after" | head -1 | cut -d: -f1)"
-  total_lines="$(wc -l < "$neg_after" | tr -d ' ')"
-  [ -n "$after_line" ] && [ "$after_line" -eq "$total_lines" ] || {
-    echo "[grammar-f:error] $prod: invalid-after specimen must place the error AFTER the construct (error line $after_line, file lines $total_lines)"
+  grep -q '^)$' "$neg_after" && {
+    echo "[grammar-f:error] $prod: invalid-after specimen uses the generic stray-paren negative — the negatives must be the production-specific malformations (wrong arity / wrong keyword / missing clause), never a bare ')'"
+    structure_bad=1
+  }
+  before_mal="$(grep -n "# gate-f: $prod malformed" "$neg_before" | head -1 | cut -d: -f1)"
+  before_marker="$(grep -n "# gate-f: $prod minimal-positive" "$neg_before" | head -1 | cut -d: -f1)"
+  [ -n "$before_mal" ] && [ -n "$before_marker" ] && [ "$before_mal" -lt "$before_marker" ] || {
+    echo "[grammar-f:error] $prod: invalid-before specimen must place the malformation BEFORE the construct (malformed marker line $before_mal vs construct marker line $before_marker)"
+    structure_bad=1
+  }
+  after_mal="$(grep -n "# gate-f: $prod malformed" "$neg_after" | head -1 | cut -d: -f1)"
+  after_marker="$(grep -n "# gate-f: $prod minimal-positive" "$neg_after" | head -1 | cut -d: -f1)"
+  [ -n "$after_mal" ] && [ -n "$after_marker" ] && [ "$after_mal" -gt "$after_marker" ] || {
+    echo "[grammar-f:error] $prod: invalid-after specimen must place the malformation AFTER the construct (malformed marker line $after_mal vs construct marker line $after_marker)"
     structure_bad=1
   }
 done <<< "$productions"
 
 if [ "$structure_bad" -ne 0 ]; then
+  if [ "$RELEASE" -eq 1 ]; then
+    echo "[grammar-f] GATE-F|FAIL|structural failures above — the release context REQUIRES the full gate (report-only can never mask a release failure)"
+    exit 1
+  fi
   [ "$REPORT_ONLY" -eq 1 ] || exit 1
 fi
 
 # ———————————————————————————————————————————————————————————————
-# 3. Compiler verdicts — only with a USABLE binary (accepts a valid
-#    probe, rejects a broken probe). Without one the structural checks
-#    remain the authority and the verdicts are reported as skipped.
+# 3. Compiler verdicts — with a USABLE binary (accepts a valid probe,
+#    rejects a broken probe). WITHOUT one the structural checks remain
+#    the authority OUTSIDE the release context; the RELEASE context
+#    (--release) REQUIRES the compiler-verdict layer — a missing usable
+#    binary is the PENDING-UNTIL-BINARY verdict (a FAIL: the release
+#    proof's Gate-F row stays PENDING-UNTIL-BINARY until the ladder
+#    produces a current-grammar stage binary).
 # ———————————————————————————————————————————————————————————————
 
 GOOD_PROBE="$TMP/gate_f_good.tg"
@@ -219,11 +261,15 @@ echo "[grammar-f] productions: $count"
 printf '%-26s %-8s %-9s %-8s %-8s %-7s %s\n' "PRODUCTION" "VERIFY" "MINIMAL" "NESTED" "BEFORE" "AFTER" "NOTES"
 bad=0
 if [ -z "$BIN" ]; then
+  if [ "$RELEASE" -eq 1 ]; then
+    echo "[grammar-f] GATE-F|PENDING-UNTIL-BINARY|the release context REQUIRES the compiler-verdict layer — no usable stage binary in $BUILD_DIR (the ladder must produce a current-grammar binary; the structural pass is never a release pass)"
+    exit 1
+  fi
   while IFS= read -r prod; do
     [ -n "$prod" ] || continue
     printf '%-26s %-8s %-9s %-8s %-8s %-7s %s\n' "$prod" "$(verify_of "$prod")" "OK" "OK" "OK" "OK" "compiler skipped (no usable binary)"
   done <<< "$productions"
-  echo "[grammar-f] NO usable compiler binary — structural gate only (bootstrap will produce one)"
+  echo "[grammar-f] NO usable compiler binary — structural gate only (bootstrap will produce one; the release context requires the verdicts)"
   exit 0
 fi
 
@@ -258,9 +304,16 @@ while IFS= read -r prod; do
 done <<< "$productions"
 
 if [ "$bad" -ne 0 ]; then
+  if [ "$RELEASE" -eq 1 ]; then
+    echo "[grammar-f] GATE-F|FAIL|compiler-verdict failures above — the release context REQUIRES the verdicts from the actual compiler execution (report-only can never mask a release failure)"
+    exit 1
+  fi
   [ "$REPORT_ONLY" -eq 1 ] || exit 1
   echo "[grammar-f] FAILURES above (report-only)"
   exit 0
+fi
+if [ "$RELEASE" -eq 1 ]; then
+  echo "[grammar-f] GATE-F|PASS|all $count productions: the four specimens exist, regenerate identically, and the ACTUAL compiler execution returned the required verdicts"
 fi
 echo "[grammar-f] GATE F PASSED: every production's four specimens exist, regenerate identically, and receive the right compiler verdicts"
 exit 0

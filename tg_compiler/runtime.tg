@@ -98,8 +98,394 @@ def emit_all_runtime(inout ctx: RuntimeEmitCtx) -> Unit
   emit_intrinsic_runtime(ctx)
   emit_arg_runtime(ctx)
   emit_posix_runtime(ctx)
+  emit_volatile_runtime(ctx)
+  emit_wasi_host_runtime(ctx)
   emit_bump_alloc_runtime(ctx)
   emit_tg_clock_ns(ctx)
+end
+
+# ———————————————————————————————————————————————————————————————
+# The volatile load/store intrinsics (the volatile/MMIO contract)
+# ———————————————————————————————————————————————————————————————
+# The embedded volatile surface (std::embedded's volatile_read /
+# volatile_write) lowers to these dedicated runtime functions: an explicit
+# load/store that the MIR optimizer cannot elide or reorder (the call
+# boundary is opaque), with the width-exact byte/16/32/64 accessors. This
+# is the compiler's volatile/MMIO lowering arm: a volatile access is a
+# CALL to the width-specific intrinsic, never an inlined plain load/store
+# (which the optimizer may sink/hoist). The aarch64/x86-64 arms are
+# emitted here; an unsupported arch traps (fail closed).
+
+def emit_volatile_runtime(inout ctx: RuntimeEmitCtx) -> Unit
+  emit_volatile_read(ctx, 8)
+  emit_volatile_read(ctx, 16)
+  emit_volatile_read(ctx, 32)
+  emit_volatile_read(ctx, 64)
+  emit_volatile_write(ctx, 8)
+  emit_volatile_write(ctx, 16)
+  emit_volatile_write(ctx, 32)
+  emit_volatile_write(ctx, 64)
+end
+
+def emit_volatile_read(inout ctx: RuntimeEmitCtx, width: Int) -> Unit
+  def_runtime_fn(ctx, "_tg_volatile_read" + width.to_string())
+  match ctx.target.arch
+  when Arch::AArch64 then
+    if width == 8 then
+      a64_ldrb(&mut ctx.text, A64::X0, A64::X0, 0)
+    elsif width == 16 then
+      a64_ldrh(&mut ctx.text, A64::X0, A64::X0, 0)
+    elsif width == 32 then
+      a64_ldr_w(&mut ctx.text, A64::X0, A64::X0, 0)
+    else
+      a64_ldr(&mut ctx.text, A64::X0, A64::X0, 0)
+    end
+    a64_ret(&mut ctx.text)
+  when Arch::X86_64 then
+    if width == 8 then
+      x64_movzx_r64_m8(&mut ctx.text, X64::RAX, X64::RDI, 0)
+    elsif width == 16 then
+      x64_movzx_r64_m16(&mut ctx.text, X64::RAX, X64::RDI, 0)
+    elsif width == 32 then
+      x64_mov_r32_m32(&mut ctx.text, X64::RAX, X64::RDI, 0)
+    else
+      x64_mov_rm(&mut ctx.text, X64::RAX, X64::RDI, 0)
+    end
+    x64_ret(&mut ctx.text)
+  end
+end
+
+def emit_volatile_write(inout ctx: RuntimeEmitCtx, width: Int) -> Unit
+  def_runtime_fn(ctx, "_tg_volatile_write" + width.to_string())
+  match ctx.target.arch
+  when Arch::AArch64 then
+    if width == 8 then
+      a64_strb(&mut ctx.text, A64::X1, A64::X0, 0)
+    elsif width == 16 then
+      a64_strh(&mut ctx.text, A64::X1, A64::X0, 0)
+    elsif width == 32 then
+      a64_str_w(&mut ctx.text, A64::X1, A64::X0, 0)
+    else
+      a64_str(&mut ctx.text, A64::X1, A64::X0, 0)
+    end
+    a64_ret(&mut ctx.text)
+  when Arch::X86_64 then
+    if width == 8 then
+      x64_mov_m8_r8(&mut ctx.text, X64::RDI, 0, X64::RSI)
+    elsif width == 16 then
+      x64_mov_m16_r16(&mut ctx.text, X64::RDI, 0, X64::RSI)
+    elsif width == 32 then
+      x64_mov_m32_r32(&mut ctx.text, X64::RDI, 0, X64::RSI)
+    else
+      x64_mov_mr(&mut ctx.text, X64::RDI, 0, X64::RSI)
+    end
+    x64_ret(&mut ctx.text)
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# The host-side WASI ABI (the runtime's wasi_snapshot_preview1 surface)
+# ———————————————————————————————————————————————————————————————
+# The native implementations behind the wasi imports a wasm32-wasi guest
+# module declares (std::wasi's externs): when a Tangerine HOST embeds the
+# wasm target (or the wasmtime --dir conformance lane provides them), the
+# ABI functions below are the real implementations —
+#   _tg_wasi_fd_write(fd, iovs, iovs_len, nwritten) -> errno
+#   _tg_wasi_fd_read(fd, iovs, iovs_len, nread) -> errno
+#   _tg_wasi_fd_close(fd) -> errno
+#   _tg_wasi_clock_time_get(clock_id, precision, out) -> errno
+#   _tg_wasi_proc_exit(code) -> !
+# The iovec layout is the wasi preview1 wire format: {base: u64, len: u64}
+# (16 bytes per entry). errno is the wasi convention (0 = success; a
+# negative posix result is negated to the positive errno value).
+
+def emit_wasi_host_runtime(inout ctx: RuntimeEmitCtx) -> Unit
+  emit_tg_wasi_fd_write(ctx)
+  emit_tg_wasi_fd_read(ctx)
+  emit_tg_wasi_fd_close(ctx)
+  emit_tg_wasi_clock_time_get(ctx)
+  emit_tg_wasi_proc_exit(ctx)
+end
+
+def emit_tg_wasi_fd_write(inout ctx: RuntimeEmitCtx) -> Unit
+  def_runtime_fn(ctx, "_tg_wasi_fd_write")
+  let loop_label = fresh_label(ctx, ".Lwasi_write_loop")
+  let done_label = fresh_label(ctx, ".Lwasi_write_done")
+  let err_label = fresh_label(ctx, ".Lwasi_write_err")
+  let exit_label = fresh_label(ctx, ".Lwasi_write_exit")
+  match ctx.target.arch
+  when Arch::AArch64 then
+    # x0=fd, x1=iovs, x2=iovs_len, x3=nwritten
+    a64_stp_pre(&mut ctx.text, A64::FP, A64::LR, A64::SP, -16)
+    a64_mov_rr(&mut ctx.text, A64::FP, A64::SP)
+    a64_stp_pre(&mut ctx.text, A64::X19, A64::X20, A64::SP, -16)
+    a64_stp_pre(&mut ctx.text, A64::X21, A64::X22, A64::SP, -16)
+    a64_stp_pre(&mut ctx.text, A64::X23, A64::XZR, A64::SP, -16)
+    # x19=fd, x20=iovs, x21=iovs_len, x22=total, x23=nwritten
+    a64_mov_rr(&mut ctx.text, A64::X19, A64::X0)
+    a64_mov_rr(&mut ctx.text, A64::X20, A64::X1)
+    a64_mov_rr(&mut ctx.text, A64::X21, A64::X2)
+    a64_mov_ri(&mut ctx.text, A64::X22, 0)
+    a64_mov_rr(&mut ctx.text, A64::X23, A64::X3)
+    a64_cmp_ri(&mut ctx.text, A64::X21, 0)
+    a64_bcond(&mut ctx.text, a64_cc_eq(), done_label.clone())
+    def_label(&mut ctx.text, loop_label.clone())
+    a64_ldr(&mut ctx.text, A64::X1, A64::X20, 0)
+    a64_ldr(&mut ctx.text, A64::X2, A64::X20, 8)
+    a64_mov_rr(&mut ctx.text, A64::X0, A64::X19)
+    a64_bl(&mut ctx.text, "_tg_posix_write")
+    a64_cmp_ri(&mut ctx.text, A64::X0, 0)
+    a64_bcond(&mut ctx.text, a64_cc_lt(), err_label.clone())
+    a64_add_rrr(&mut ctx.text, A64::X22, A64::X22, A64::X0)
+    a64_add_rri(&mut ctx.text, A64::X20, A64::X20, 16)
+    a64_sub_rri(&mut ctx.text, A64::X21, A64::X21, 1)
+    a64_cmp_ri(&mut ctx.text, A64::X21, 0)
+    a64_bcond(&mut ctx.text, a64_cc_ne(), loop_label.clone())
+    a64_b(&mut ctx.text, done_label.clone())
+    def_label(&mut ctx.text, err_label.clone())
+    a64_neg(&mut ctx.text, A64::X0, A64::X0)
+    a64_b(&mut ctx.text, exit_label.clone())
+    def_label(&mut ctx.text, done_label.clone())
+    a64_mov_ri(&mut ctx.text, A64::X0, 0)
+    def_label(&mut ctx.text, exit_label.clone())
+    a64_str_w(&mut ctx.text, A64::X22, A64::X23, 0)
+    a64_ldp_post(&mut ctx.text, A64::X23, A64::XZR, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::X21, A64::X22, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::X19, A64::X20, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::FP, A64::LR, A64::SP, 16)
+    a64_ret(&mut ctx.text)
+  when Arch::X86_64 then
+    # rdi=fd, rsi=iovs, rdx=iovs_len, rcx=nwritten
+    x64_push(&mut ctx.text, X64::RBP)
+    x64_mov_rr(&mut ctx.text, X64::RBP, X64::RSP)
+    x64_push(&mut ctx.text, X64::RBX)
+    x64_push(&mut ctx.text, X64::R12)
+    x64_push(&mut ctx.text, X64::R13)
+    x64_push(&mut ctx.text, X64::R14)
+    x64_push(&mut ctx.text, X64::R15)
+    x64_mov_rr(&mut ctx.text, X64::R12, X64::RDI)
+    x64_mov_rr(&mut ctx.text, X64::R13, X64::RSI)
+    x64_mov_rr(&mut ctx.text, X64::R14, X64::RDX)
+    x64_mov_rr(&mut ctx.text, X64::R15, X64::RCX)
+    x64_xor_rr(&mut ctx.text, X64::RBX, X64::RBX)
+    x64_test_rr(&mut ctx.text, X64::R14, X64::R14)
+    x64_jcc(&mut ctx.text, CC::Z, done_label.clone())
+    def_label(&mut ctx.text, loop_label.clone())
+    x64_mov_rr(&mut ctx.text, X64::RDI, X64::R12)
+    x64_mov_rm(&mut ctx.text, X64::RSI, X64::R13, 0)
+    x64_mov_rm(&mut ctx.text, X64::RDX, X64::R13, 8)
+    x64_call_label(&mut ctx.text, "_tg_posix_write".to_string())
+    x64_cmp_ri(&mut ctx.text, X64::RAX, 0)
+    x64_jcc(&mut ctx.text, CC::L, err_label.clone())
+    x64_add_rr(&mut ctx.text, X64::RBX, X64::RAX)
+    x64_add_ri(&mut ctx.text, X64::R13, 16)
+    x64_sub_ri(&mut ctx.text, X64::R14, 1)
+    x64_test_rr(&mut ctx.text, X64::R14, X64::R14)
+    x64_jcc(&mut ctx.text, CC::NZ, loop_label.clone())
+    x64_jmp(&mut ctx.text, done_label.clone())
+    def_label(&mut ctx.text, err_label.clone())
+    x64_neg_r(&mut ctx.text, X64::RAX)
+    x64_jmp(&mut ctx.text, exit_label.clone())
+    def_label(&mut ctx.text, done_label.clone())
+    x64_mov_ri(&mut ctx.text, X64::RAX, 0)
+    def_label(&mut ctx.text, exit_label.clone())
+    x64_mov_rr(&mut ctx.text, X64::RCX, X64::R15)
+    x64_mov_m32_r32(&mut ctx.text, X64::RCX, 0, X64::RBX)
+    x64_pop(&mut ctx.text, X64::R15)
+    x64_pop(&mut ctx.text, X64::R14)
+    x64_pop(&mut ctx.text, X64::R13)
+    x64_pop(&mut ctx.text, X64::R12)
+    x64_pop(&mut ctx.text, X64::RBX)
+    x64_pop(&mut ctx.text, X64::RBP)
+    x64_ret(&mut ctx.text)
+  end
+end
+
+def emit_tg_wasi_fd_read(inout ctx: RuntimeEmitCtx) -> Unit
+  def_runtime_fn(ctx, "_tg_wasi_fd_read")
+  let loop_label = fresh_label(ctx, ".Lwasi_read_loop")
+  let done_label = fresh_label(ctx, ".Lwasi_read_done")
+  let err_label = fresh_label(ctx, ".Lwasi_read_err")
+  let exit_label = fresh_label(ctx, ".Lwasi_read_exit")
+  match ctx.target.arch
+  when Arch::AArch64 then
+    a64_stp_pre(&mut ctx.text, A64::FP, A64::LR, A64::SP, -16)
+    a64_mov_rr(&mut ctx.text, A64::FP, A64::SP)
+    a64_stp_pre(&mut ctx.text, A64::X19, A64::X20, A64::SP, -16)
+    a64_stp_pre(&mut ctx.text, A64::X21, A64::X22, A64::SP, -16)
+    a64_stp_pre(&mut ctx.text, A64::X23, A64::XZR, A64::SP, -16)
+    a64_mov_rr(&mut ctx.text, A64::X19, A64::X0)
+    a64_mov_rr(&mut ctx.text, A64::X20, A64::X1)
+    a64_mov_rr(&mut ctx.text, A64::X21, A64::X2)
+    a64_mov_ri(&mut ctx.text, A64::X22, 0)
+    a64_mov_rr(&mut ctx.text, A64::X23, A64::X3)
+    a64_cmp_ri(&mut ctx.text, A64::X21, 0)
+    a64_bcond(&mut ctx.text, a64_cc_eq(), done_label.clone())
+    def_label(&mut ctx.text, loop_label.clone())
+    a64_ldr(&mut ctx.text, A64::X1, A64::X20, 0)
+    a64_ldr(&mut ctx.text, A64::X2, A64::X20, 8)
+    a64_mov_rr(&mut ctx.text, A64::X0, A64::X19)
+    a64_bl(&mut ctx.text, "_tg_posix_read")
+    a64_cmp_ri(&mut ctx.text, A64::X0, 0)
+    a64_bcond(&mut ctx.text, a64_cc_lt(), err_label.clone())
+    a64_add_rrr(&mut ctx.text, A64::X22, A64::X22, A64::X0)
+    a64_add_rri(&mut ctx.text, A64::X20, A64::X20, 16)
+    a64_sub_rri(&mut ctx.text, A64::X21, A64::X21, 1)
+    a64_cmp_ri(&mut ctx.text, A64::X21, 0)
+    a64_bcond(&mut ctx.text, a64_cc_ne(), loop_label.clone())
+    a64_b(&mut ctx.text, done_label.clone())
+    def_label(&mut ctx.text, err_label.clone())
+    a64_neg(&mut ctx.text, A64::X0, A64::X0)
+    a64_b(&mut ctx.text, exit_label.clone())
+    def_label(&mut ctx.text, done_label.clone())
+    a64_mov_ri(&mut ctx.text, A64::X0, 0)
+    def_label(&mut ctx.text, exit_label.clone())
+    a64_str_w(&mut ctx.text, A64::X22, A64::X23, 0)
+    a64_ldp_post(&mut ctx.text, A64::X23, A64::XZR, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::X21, A64::X22, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::X19, A64::X20, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::FP, A64::LR, A64::SP, 16)
+    a64_ret(&mut ctx.text)
+  when Arch::X86_64 then
+    x64_push(&mut ctx.text, X64::RBP)
+    x64_mov_rr(&mut ctx.text, X64::RBP, X64::RSP)
+    x64_push(&mut ctx.text, X64::RBX)
+    x64_push(&mut ctx.text, X64::R12)
+    x64_push(&mut ctx.text, X64::R13)
+    x64_push(&mut ctx.text, X64::R14)
+    x64_push(&mut ctx.text, X64::R15)
+    x64_mov_rr(&mut ctx.text, X64::R12, X64::RDI)
+    x64_mov_rr(&mut ctx.text, X64::R13, X64::RSI)
+    x64_mov_rr(&mut ctx.text, X64::R14, X64::RDX)
+    x64_mov_rr(&mut ctx.text, X64::R15, X64::RCX)
+    x64_xor_rr(&mut ctx.text, X64::RBX, X64::RBX)
+    x64_test_rr(&mut ctx.text, X64::R14, X64::R14)
+    x64_jcc(&mut ctx.text, CC::Z, done_label.clone())
+    def_label(&mut ctx.text, loop_label.clone())
+    x64_mov_rr(&mut ctx.text, X64::RDI, X64::R12)
+    x64_mov_rm(&mut ctx.text, X64::RSI, X64::R13, 0)
+    x64_mov_rm(&mut ctx.text, X64::RDX, X64::R13, 8)
+    x64_call_label(&mut ctx.text, "_tg_posix_read".to_string())
+    x64_cmp_ri(&mut ctx.text, X64::RAX, 0)
+    x64_jcc(&mut ctx.text, CC::L, err_label.clone())
+    x64_add_rr(&mut ctx.text, X64::RBX, X64::RAX)
+    x64_add_ri(&mut ctx.text, X64::R13, 16)
+    x64_sub_ri(&mut ctx.text, X64::R14, 1)
+    x64_test_rr(&mut ctx.text, X64::R14, X64::R14)
+    x64_jcc(&mut ctx.text, CC::NZ, loop_label.clone())
+    x64_jmp(&mut ctx.text, done_label.clone())
+    def_label(&mut ctx.text, err_label.clone())
+    x64_neg_r(&mut ctx.text, X64::RAX)
+    x64_jmp(&mut ctx.text, exit_label.clone())
+    def_label(&mut ctx.text, done_label.clone())
+    x64_mov_ri(&mut ctx.text, X64::RAX, 0)
+    def_label(&mut ctx.text, exit_label.clone())
+    x64_mov_rr(&mut ctx.text, X64::RCX, X64::R15)
+    x64_mov_m32_r32(&mut ctx.text, X64::RCX, 0, X64::RBX)
+    x64_pop(&mut ctx.text, X64::R15)
+    x64_pop(&mut ctx.text, X64::R14)
+    x64_pop(&mut ctx.text, X64::R13)
+    x64_pop(&mut ctx.text, X64::R12)
+    x64_pop(&mut ctx.text, X64::RBX)
+    x64_pop(&mut ctx.text, X64::RBP)
+    x64_ret(&mut ctx.text)
+  end
+end
+
+def emit_tg_wasi_fd_close(inout ctx: RuntimeEmitCtx) -> Unit
+  def_runtime_fn(ctx, "_tg_wasi_fd_close")
+  let ok_label = fresh_label(ctx, ".Lwasi_close_ok")
+  match ctx.target.arch
+  when Arch::AArch64 then
+    a64_stp_pre(&mut ctx.text, A64::FP, A64::LR, A64::SP, -16)
+    a64_mov_rr(&mut ctx.text, A64::FP, A64::SP)
+    a64_bl(&mut ctx.text, "_tg_posix_close")
+    a64_cmp_ri(&mut ctx.text, A64::X0, 0)
+    a64_bcond(&mut ctx.text, a64_cc_ge(), ok_label.clone())
+    a64_neg(&mut ctx.text, A64::X0, A64::X0)
+    a64_ldp_post(&mut ctx.text, A64::FP, A64::LR, A64::SP, 16)
+    a64_ret(&mut ctx.text)
+    def_label(&mut ctx.text, ok_label.clone())
+    a64_mov_ri(&mut ctx.text, A64::X0, 0)
+    a64_ldp_post(&mut ctx.text, A64::FP, A64::LR, A64::SP, 16)
+    a64_ret(&mut ctx.text)
+  when Arch::X86_64 then
+    x64_push(&mut ctx.text, X64::RBP)
+    x64_mov_rr(&mut ctx.text, X64::RBP, X64::RSP)
+    x64_call_label(&mut ctx.text, "_tg_posix_close".to_string())
+    x64_cmp_ri(&mut ctx.text, X64::RAX, 0)
+    x64_jcc(&mut ctx.text, CC::GE, ok_label.clone())
+    x64_neg_r(&mut ctx.text, X64::RAX)
+    x64_pop(&mut ctx.text, X64::RBP)
+    x64_ret(&mut ctx.text)
+    def_label(&mut ctx.text, ok_label.clone())
+    x64_mov_ri(&mut ctx.text, X64::RAX, 0)
+    x64_pop(&mut ctx.text, X64::RBP)
+    x64_ret(&mut ctx.text)
+  end
+end
+
+def emit_tg_wasi_clock_time_get(inout ctx: RuntimeEmitCtx) -> Unit
+  def_runtime_fn(ctx, "_tg_wasi_clock_time_get")
+  let done_label = fresh_label(ctx, ".Lwasi_clock_done")
+  match ctx.target.arch
+  when Arch::AArch64 then
+    # x0=clock_id, x1=precision(i64), x2=out
+    a64_stp_pre(&mut ctx.text, A64::FP, A64::LR, A64::SP, -16)
+    a64_mov_rr(&mut ctx.text, A64::FP, A64::SP)
+    a64_stp_pre(&mut ctx.text, A64::X19, A64::XZR, A64::SP, -16)
+    a64_mov_rr(&mut ctx.text, A64::X19, A64::X2)
+    a64_sub_rri(&mut ctx.text, A64::SP, A64::SP, 16)
+    a64_add_rri(&mut ctx.text, A64::X1, A64::SP, 0)
+    a64_bl(&mut ctx.text, "clock_gettime")
+    a64_cmp_ri(&mut ctx.text, A64::X0, 0)
+    a64_bcond(&mut ctx.text, a64_cc_ne(), done_label.clone())
+    a64_ldur(&mut ctx.text, A64::X9, A64::SP, 0)
+    a64_mov_ri(&mut ctx.text, A64::X10, 1000000000)
+    a64_mul_rrr(&mut ctx.text, A64::X9, A64::X9, A64::X10)
+    a64_ldur(&mut ctx.text, A64::X10, A64::SP, 8)
+    a64_add_rrr(&mut ctx.text, A64::X9, A64::X9, A64::X10)
+    a64_str(&mut ctx.text, A64::X9, A64::X19, 0)
+    a64_mov_ri(&mut ctx.text, A64::X0, 0)
+    def_label(&mut ctx.text, done_label.clone())
+    a64_add_rri(&mut ctx.text, A64::SP, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::X19, A64::XZR, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::FP, A64::LR, A64::SP, 16)
+    a64_ret(&mut ctx.text)
+  when Arch::X86_64 then
+    # rdi=clock_id, rsi:rdx=precision, rcx=out
+    x64_push(&mut ctx.text, X64::RBP)
+    x64_mov_rr(&mut ctx.text, X64::RBP, X64::RSP)
+    x64_push(&mut ctx.text, X64::RBX)
+    x64_sub_ri(&mut ctx.text, X64::RSP, 32)
+    x64_mov_rr(&mut ctx.text, X64::RBX, X64::RCX)
+    x64_mov_rr(&mut ctx.text, X64::RSI, X64::RSP)
+    x64_call_label(&mut ctx.text, "clock_gettime".to_string())
+    x64_cmp_ri(&mut ctx.text, X64::RAX, 0)
+    x64_jcc(&mut ctx.text, CC::NE, done_label.clone())
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RSP, 0)
+    x64_mov_ri(&mut ctx.text, X64::RCX, 1000000000)
+    x64_imul_rr(&mut ctx.text, X64::RAX, X64::RCX)
+    x64_mov_rm(&mut ctx.text, X64::RDX, X64::RSP, 8)
+    x64_add_rr(&mut ctx.text, X64::RAX, X64::RDX)
+    x64_mov_mr(&mut ctx.text, X64::RBX, 0, X64::RAX)
+    x64_mov_ri(&mut ctx.text, X64::RAX, 0)
+    def_label(&mut ctx.text, done_label.clone())
+    x64_add_ri(&mut ctx.text, X64::RSP, 32)
+    x64_pop(&mut ctx.text, X64::RBX)
+    x64_pop(&mut ctx.text, X64::RBP)
+    x64_ret(&mut ctx.text)
+  end
+end
+
+def emit_tg_wasi_proc_exit(inout ctx: RuntimeEmitCtx) -> Unit
+  def_runtime_fn(ctx, "_tg_wasi_proc_exit")
+  match ctx.target.arch
+  when Arch::AArch64 then
+    a64_b(&mut ctx.text, "_exit")
+  when Arch::X86_64 then
+    x64_jmp(&mut ctx.text, "_exit")
+  end
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -446,6 +832,7 @@ def emit_arg_runtime(inout ctx: RuntimeEmitCtx) -> Unit
   emit_tg_env_entry(ctx)
   emit_tg_args_vec(ctx)
   emit_tg_effect_record(ctx)
+  emit_effect_runtime(ctx)
   emit_tg_status(ctx)
   emit_tg_output(ctx)
   emit_tg_stdout_string(ctx)
@@ -472,6 +859,248 @@ def emit_tg_effect_record(inout ctx: RuntimeEmitCtx) -> Unit
     a64_brk(&mut ctx.text, 1)
   when Arch::X86_64 then
     x64_ud2(&mut ctx.text)
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# The algebraic-effects handler runtime — the DIRECT-STYLE handler frames
+# ———————————————————————————————————————————————————————————————
+# The bounded handler runtime: the task's handler stack is a linked list of
+# FRAMES, each written by __tg_effect_frame_push into the INSTALLING
+# function's own stack-frame slot (FrameInfo.effect_frame_offset — the
+# same per-invocation, nesting-safe, race-free discipline as the budget
+# counters; the runtime never allocates). A frame is 48 bytes:
+#   [0]  effect_id        the semantic EffectId of the handled effect
+#   [8]  op_count         the effect's handled operation count
+#   [16] handled_bitmap   bit i set when the handler has an arm for op i
+#   [24] dispatcher       the MIR-synthesized handler function
+#                         (env_ptr, op_index, payload_ptr, result_ptr)
+#   [32] env_ptr          the handler env (the arms' captured locals tuple)
+#   [40] next             the enclosing frame (or 0)
+# __tg_effect_perform walks the stack from the TOP: the FIRST frame whose
+# effect matches AND whose bitmap covers the op index is the innermost
+# matching handler — the dispatcher runs synchronously with the payload and
+# writes the op's result into the caller's result slot. A frame that does
+# NOT handle the op is SKIPPED (the perform re-performs to the outer
+# handler). A perform with no matching frame anywhere is the DEFINED ERROR:
+# a stderr message + abort.
+#
+# The design choice (the reviewer's bounded row): DIRECT STYLE with the
+# explicit handler frames — never CPS. The perform suspends nothing: the
+# handler runs synchronously on the caller's stack and its result returns
+# in place, so the payload/result slots live in the PERFORMING function's
+# own frame and no continuation allocation exists. The bounded cost: a
+# handler cannot outlive the function that installs it (the frame lives in
+# that function's stack frame) — a handler cannot span an async task
+# boundary (the boundary report: the effect stack is per-task-global and
+# the executor interleaves tasks cooperatively, so a perform never crosses
+# a task switch; installing a handler in one task and performing from
+# another is out of the bounded row — the stack is not per-task).
+
+def emit_effect_runtime(inout ctx: RuntimeEmitCtx) -> Unit
+  emit_tg_effect_frame_push(ctx)
+  emit_tg_effect_frame_pop(ctx)
+  emit_tg_effect_perform(ctx)
+end
+
+# __tg_effect_frame_push(slot_ptr, effect_id, op_count, handled_bitmap,
+# dispatcher, env_ptr): write the frame into the caller's slot and link it
+# onto the task's handler stack. No callee-saved register is touched (the
+# frame words move straight from the ABI argument registers).
+def emit_tg_effect_frame_push(inout ctx: RuntimeEmitCtx) -> Unit
+  def_runtime_fn(ctx, "__tg_effect_frame_push")
+  match ctx.target.arch
+  when Arch::AArch64 then
+    # X0 = slot_ptr, X1 = effect_id, X2 = op_count, X3 = bitmap,
+    # X4 = dispatcher, X5 = env_ptr
+    a64_str(&mut ctx.text, A64::X1, A64::X0, 0)
+    a64_str(&mut ctx.text, A64::X2, A64::X0, 8)
+    a64_str(&mut ctx.text, A64::X3, A64::X0, 16)
+    a64_str(&mut ctx.text, A64::X4, A64::X0, 24)
+    a64_str(&mut ctx.text, A64::X5, A64::X0, 32)
+    # link: [slot + 40] = top; top = slot
+    add_reloc(&mut ctx.text, RelocKind::R_AARCH64_ADR_PREL_PG_HI21, "__tg_effect_stack_top".to_string(), 0)
+    emit32_le(&mut ctx.text, 0x90000000 | a64_code(A64::X9))
+    add_reloc(&mut ctx.text, RelocKind::R_AARCH64_ADD_ABS_LO12_NC, "__tg_effect_stack_top".to_string(), 0)
+    a64_add_rri(&mut ctx.text, A64::X9, A64::X9, 0)
+    a64_ldr(&mut ctx.text, A64::X10, A64::X9, 0)
+    a64_str(&mut ctx.text, A64::X10, A64::X0, 40)
+    a64_str(&mut ctx.text, A64::X0, A64::X9, 0)
+    a64_ret(&mut ctx.text)
+  when Arch::X86_64 then
+    # RDI = slot_ptr, RSI = effect_id, RDX = op_count, RCX = bitmap,
+    # R8 = dispatcher, R9 = env_ptr
+    x64_mov_mr(&mut ctx.text, X64::RDI, 0, X64::RSI)
+    x64_mov_mr(&mut ctx.text, X64::RDI, 8, X64::RDX)
+    x64_mov_mr(&mut ctx.text, X64::RDI, 16, X64::RCX)
+    x64_mov_mr(&mut ctx.text, X64::RDI, 24, X64::R8)
+    x64_mov_mr(&mut ctx.text, X64::RDI, 32, X64::R9)
+    # link: [slot + 40] = top; top = slot
+    x64_lea_rip(&mut ctx.text, X64::RAX, "__tg_effect_stack_top".to_string())
+    x64_mov_rm(&mut ctx.text, X64::R10, X64::RAX, 0)
+    x64_mov_mr(&mut ctx.text, X64::RDI, 40, X64::R10)
+    x64_mov_mr(&mut ctx.text, X64::RAX, 0, X64::RDI)
+    x64_ret(&mut ctx.text)
+  end
+end
+
+# __tg_effect_frame_pop(): pop the innermost handler frame (the frame
+# slot memory is reclaimed by the installing function's epilogue). The
+# enter/exit statements are balanced by construction; pop never verifies
+# the slot identity (the bounded row: a mismatch is a compiler defect, and
+# the fail-closed rule is the perform's frame walk, not pop's).
+def emit_tg_effect_frame_pop(inout ctx: RuntimeEmitCtx) -> Unit
+  def_runtime_fn(ctx, "__tg_effect_frame_pop")
+  match ctx.target.arch
+  when Arch::AArch64 then
+    add_reloc(&mut ctx.text, RelocKind::R_AARCH64_ADR_PREL_PG_HI21, "__tg_effect_stack_top".to_string(), 0)
+    emit32_le(&mut ctx.text, 0x90000000 | a64_code(A64::X9))
+    add_reloc(&mut ctx.text, RelocKind::R_AARCH64_ADD_ABS_LO12_NC, "__tg_effect_stack_top".to_string(), 0)
+    a64_add_rri(&mut ctx.text, A64::X9, A64::X9, 0)
+    a64_ldr(&mut ctx.text, A64::X10, A64::X9, 0)
+    a64_ldr(&mut ctx.text, A64::X11, A64::X10, 40)
+    a64_str(&mut ctx.text, A64::X11, A64::X9, 0)
+    a64_ret(&mut ctx.text)
+  when Arch::X86_64 then
+    x64_lea_rip(&mut ctx.text, X64::RAX, "__tg_effect_stack_top".to_string())
+    x64_mov_rm(&mut ctx.text, X64::RCX, X64::RAX, 0)
+    x64_mov_rm(&mut ctx.text, X64::RDX, X64::RCX, 40)
+    x64_mov_mr(&mut ctx.text, X64::RAX, 0, X64::RDX)
+    x64_ret(&mut ctx.text)
+  end
+end
+
+# __tg_effect_perform(effect_id, op_index, payload_ptr, result_ptr): walk
+# the task's handler stack from the top; the first frame matching the
+# effect whose bitmap covers the op index is the innermost matching
+# handler — its dispatcher(env, op_index, payload, result) runs
+# synchronously. No matching frame: the DEFINED ERROR (a stderr message +
+# abort). Callee-saved registers are preserved across the dispatcher call.
+def emit_tg_effect_perform(inout ctx: RuntimeEmitCtx) -> Unit
+  def_runtime_fn(ctx, "__tg_effect_perform")
+  let lblLoop = fresh_label(ctx, ".Lperform_loop")
+  let lblNext = fresh_label(ctx, ".Lperform_next")
+  let lblDispatch = fresh_label(ctx, ".Lperform_dispatch")
+  let lblUnhandled = fresh_label(ctx, ".Lperform_unhandled")
+  let lblDone = fresh_label(ctx, ".Lperform_done")
+  match ctx.target.arch
+  when Arch::AArch64 then
+    # X0 = effect_id, X1 = op_index, X2 = payload_ptr, X3 = result_ptr
+    a64_stp_pre(&mut ctx.text, A64::FP, A64::LR, A64::SP, -16)
+    a64_mov_rr(&mut ctx.text, A64::FP, A64::SP)
+    a64_stp_pre(&mut ctx.text, A64::X19, A64::X20, A64::SP, -16)
+    a64_stp_pre(&mut ctx.text, A64::X21, A64::X22, A64::SP, -16)
+    a64_stp_pre(&mut ctx.text, A64::X23, A64::X24, A64::SP, -16)
+    a64_stp_pre(&mut ctx.text, A64::X25, A64::X26, A64::SP, -16)
+    a64_stp_pre(&mut ctx.text, A64::X27, A64::X28, A64::SP, -16)
+    # X19 = effect_id, X20 = op_index, X21 = payload_ptr, X22 = result_ptr
+    a64_mov_rr(&mut ctx.text, A64::X19, A64::X0)
+    a64_mov_rr(&mut ctx.text, A64::X20, A64::X1)
+    a64_mov_rr(&mut ctx.text, A64::X21, A64::X2)
+    a64_mov_rr(&mut ctx.text, A64::X22, A64::X3)
+    # X23 = top
+    add_reloc(&mut ctx.text, RelocKind::R_AARCH64_ADR_PREL_PG_HI21, "__tg_effect_stack_top".to_string(), 0)
+    emit32_le(&mut ctx.text, 0x90000000 | a64_code(A64::X23))
+    add_reloc(&mut ctx.text, RelocKind::R_AARCH64_ADD_ABS_LO12_NC, "__tg_effect_stack_top".to_string(), 0)
+    a64_add_rri(&mut ctx.text, A64::X23, A64::X23, 0)
+    a64_ldr(&mut ctx.text, A64::X23, A64::X23, 0)
+    def_label(&mut ctx.text, lblLoop.clone())
+    a64_cmp_ri(&mut ctx.text, A64::X23, 0)
+    a64_bcond(&mut ctx.text, a64_cc_eq(), lblUnhandled.clone())
+    # effect match: [frame + 0] == X19 ?
+    a64_ldr(&mut ctx.text, A64::X24, A64::X23, 0)
+    a64_cmp_rr(&mut ctx.text, A64::X24, A64::X19)
+    a64_bcond(&mut ctx.text, a64_cc_ne(), lblNext.clone())
+    # bitmap test: ([frame + 16] >> op_index) & 1 != 0 ?
+    a64_ldr(&mut ctx.text, A64::X24, A64::X23, 16)
+    a64_lsr_rrr(&mut ctx.text, A64::X24, A64::X24, A64::X20)
+    a64_and_ri(&mut ctx.text, A64::X24, 1)
+    a64_cmp_ri(&mut ctx.text, A64::X24, 0)
+    a64_bcond(&mut ctx.text, a64_cc_eq(), lblNext.clone())
+    # dispatch: dispatcher(env=[frame+32], op_index, payload, result)
+    a64_ldr(&mut ctx.text, A64::X24, A64::X23, 24)
+    a64_ldr(&mut ctx.text, A64::X0, A64::X23, 32)
+    a64_mov_rr(&mut ctx.text, A64::X1, A64::X20)
+    a64_mov_rr(&mut ctx.text, A64::X2, A64::X21)
+    a64_mov_rr(&mut ctx.text, A64::X3, A64::X22)
+    a64_blr(&mut ctx.text, A64::X24)
+    a64_b(&mut ctx.text, lblDone.clone())
+    def_label(&mut ctx.text, lblNext.clone())
+    a64_ldr(&mut ctx.text, A64::X23, A64::X23, 40)
+    a64_b(&mut ctx.text, lblLoop.clone())
+    def_label(&mut ctx.text, lblUnhandled.clone())
+    a64_mov_ri(&mut ctx.text, A64::X0, 2)
+    add_reloc(&mut ctx.text, RelocKind::R_AARCH64_ADR_PREL_PG_HI21, "__tg_effect_unhandled_msg".to_string(), 0)
+    emit32_le(&mut ctx.text, 0x90000000 | a64_code(A64::X1))
+    add_reloc(&mut ctx.text, RelocKind::R_AARCH64_ADD_ABS_LO12_NC, "__tg_effect_unhandled_msg".to_string(), 0)
+    a64_add_rri(&mut ctx.text, A64::X1, A64::X1, 0)
+    a64_mov_ri(&mut ctx.text, A64::X2, 78)
+    a64_bl(&mut ctx.text, "_tg_posix_write")
+    a64_bl(&mut ctx.text, "__intrinsic_abort")
+    def_label(&mut ctx.text, lblDone.clone())
+    a64_ldp_post(&mut ctx.text, A64::X27, A64::X28, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::X25, A64::X26, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::X23, A64::X24, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::X21, A64::X22, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::X19, A64::X20, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::FP, A64::LR, A64::SP, 16)
+    a64_ret(&mut ctx.text)
+  when Arch::X86_64 then
+    # RDI = effect_id, RSI = op_index, RDX = payload_ptr, RCX = result_ptr
+    x64_push(&mut ctx.text, X64::RBP)
+    x64_mov_rr(&mut ctx.text, X64::RBP, X64::RSP)
+    x64_push(&mut ctx.text, X64::RBX)
+    x64_push(&mut ctx.text, X64::R12)
+    x64_push(&mut ctx.text, X64::R13)
+    x64_push(&mut ctx.text, X64::R14)
+    x64_push(&mut ctx.text, X64::R15)
+    # R12 = effect_id, R13 = op_index, R14 = payload_ptr, R15 = result_ptr
+    x64_mov_rr(&mut ctx.text, X64::R12, X64::RDI)
+    x64_mov_rr(&mut ctx.text, X64::R13, X64::RSI)
+    x64_mov_rr(&mut ctx.text, X64::R14, X64::RDX)
+    x64_mov_rr(&mut ctx.text, X64::R15, X64::RCX)
+    # RBX = top
+    x64_lea_rip(&mut ctx.text, X64::RAX, "__tg_effect_stack_top".to_string())
+    x64_mov_rm(&mut ctx.text, X64::RBX, X64::RAX, 0)
+    def_label(&mut ctx.text, lblLoop.clone())
+    x64_test_rr(&mut ctx.text, X64::RBX, X64::RBX)
+    x64_jcc(&mut ctx.text, CC::E, lblUnhandled.clone())
+    # effect match: [frame + 0] == R12 ?
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBX, 0)
+    x64_cmp_rr(&mut ctx.text, X64::RAX, X64::R12)
+    x64_jcc(&mut ctx.text, CC::NE, lblNext.clone())
+    # bitmap test: ([frame + 16] >> op_index) & 1 != 0 ?
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBX, 16)
+    x64_mov_rr(&mut ctx.text, X64::RCX, X64::R13)
+    x64_shr_rcl(&mut ctx.text, X64::RAX)
+    x64_and_ri(&mut ctx.text, X64::RAX, 1)
+    x64_test_rr(&mut ctx.text, X64::RAX, X64::RAX)
+    x64_jcc(&mut ctx.text, CC::E, lblNext.clone())
+    # dispatch: dispatcher(env=[frame+32], op_index, payload, result)
+    x64_mov_rm(&mut ctx.text, X64::RDI, X64::RBX, 32)
+    x64_mov_rr(&mut ctx.text, X64::RSI, X64::R13)
+    x64_mov_rr(&mut ctx.text, X64::RDX, X64::R14)
+    x64_mov_rr(&mut ctx.text, X64::RCX, X64::R15)
+    x64_mov_rm(&mut ctx.text, X64::RAX, X64::RBX, 24)
+    x64_call_r(&mut ctx.text, X64::RAX)
+    x64_jmp(&mut ctx.text, lblDone.clone())
+    def_label(&mut ctx.text, lblNext.clone())
+    x64_mov_rm(&mut ctx.text, X64::RBX, X64::RBX, 40)
+    x64_jmp(&mut ctx.text, lblLoop.clone())
+    def_label(&mut ctx.text, lblUnhandled.clone())
+    x64_mov_ri(&mut ctx.text, X64::RDI, 2)
+    x64_lea_rip(&mut ctx.text, X64::RSI, "__tg_effect_unhandled_msg".to_string())
+    x64_mov_ri(&mut ctx.text, X64::RDX, 78)
+    x64_call_label(&mut ctx.text, "_tg_posix_write")
+    x64_call_label(&mut ctx.text, "__intrinsic_abort")
+    def_label(&mut ctx.text, lblDone.clone())
+    x64_pop(&mut ctx.text, X64::R15)
+    x64_pop(&mut ctx.text, X64::R14)
+    x64_pop(&mut ctx.text, X64::R13)
+    x64_pop(&mut ctx.text, X64::R12)
+    x64_pop(&mut ctx.text, X64::RBX)
+    x64_pop(&mut ctx.text, X64::RBP)
+    x64_ret(&mut ctx.text)
   end
 end
 

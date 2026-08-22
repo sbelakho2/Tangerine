@@ -1,0 +1,379 @@
+# tests/unit/test_db_behavior.tg — the per-callable behavior suite
+# for std::db (the API manifest's uncovered callables, driven to real
+# semantics: inputs -> expected outputs; the failure paths -> the
+# expected failures).
+#
+# Every uncovered callable of std::db is CALLED below with real values
+# and its outcome ASSERTED. The SQLite path runs against a live
+# in-memory database; the driver-handle paths that require a live
+# MySQL/Postgres server are documented as the honest remaining gap
+# (they need the external daemons the integration suites use), and the
+# worker-loop entry is exercised through the pool's own spawn (a
+# direct call would block forever on the job queue).
+
+use std::core::{Bool, Int, UInt, Unit, Option, Result, String, Vec}
+use std::test::*
+use std::db::*
+use std::sync::{Arc}
+use std::alloc::{alloc, dealloc}
+use std::ffi::{cstring_new, Ptr, PtrMut}
+
+@test
+def test_db_query_builder_surface() -> Unit
+  # the SQLite-style builder: the full chain composes the SQL
+  var qb = QueryBuilder::new()
+  qb = qb.select("a, b")
+  qb = qb.from("t")
+  qb = qb.where_clause("x = ?")
+  qb = qb.and_where("y = ?")
+  qb = qb.or_where("z = ?")
+  qb = qb.order_by("a DESC")
+  qb = qb.limit(10 as UInt)
+  qb = qb.offset(5 as UInt)
+  qb = qb.group_by("a")
+  qb = qb.having("count(*) > 1")
+  let (sql, params) = qb.build()
+  assert_true(sql.contains("SELECT a, b"))
+  assert_true(sql.contains("FROM t"))
+  assert_true(sql.contains("WHERE x = ?"))
+  assert_true(sql.contains("AND y = ?"))
+  assert_true(sql.contains("OR z = ?"))
+  assert_true(sql.contains("ORDER BY a DESC"))
+  assert_true(sql.contains("LIMIT 10"))
+  assert_true(sql.contains("OFFSET 5"))
+  assert_true(sql.contains("GROUP BY a"))
+  assert_true(sql.contains("HAVING count(*) > 1"))
+  assert_eq(params.len(), 0)
+  # the DML forms
+  var ins = QueryBuilder::new()
+  ins = ins.insert_into("kv", "id, value")
+  ins = ins.values(2)
+  let (ins_sql, _) = ins.build()
+  assert_true(ins_sql.contains("INSERT INTO kv"))
+  assert_true(ins_sql.contains("id, value"))
+  var upd = QueryBuilder::new()
+  upd = upd.update("kv")
+  upd = upd.where_clause("id = 1")
+  let (upd_sql, _) = upd.build()
+  assert_true(upd_sql.contains("UPDATE kv"))
+  assert_true(upd_sql.contains("WHERE id = 1"))
+  var del = QueryBuilder::new()
+  del = del.delete_from("kv")
+  let (del_sql, _) = del.build()
+  assert_eq(del_sql, "DELETE FROM kv")
+  # the join forms
+  var jb = QueryBuilder::new()
+  jb = jb.select("a.*")
+  jb = jb.from("a")
+  jb = jb.join("b", "a.id = b.a_id")
+  let (j_sql, _) = jb.build()
+  assert_true(j_sql.contains("JOIN b ON a.id = b.a_id"))
+  var lb = QueryBuilder::new()
+  lb = lb.select("a.*")
+  lb = lb.from("a")
+  lb = lb.left_join("b", "a.id = b.a_id")
+  let (l_sql, _) = lb.build()
+  assert_true(l_sql.contains("LEFT JOIN b ON a.id = b.a_id"))
+  # raw SQL parts
+  var rb = QueryBuilder::new()
+  rb = rb.raw("SELECT 1")
+  let (r_sql, _) = rb.build()
+  assert_eq(r_sql, "SELECT 1")
+  # the PostgreSQL-style placeholder: $N
+  var pg = QueryBuilder::new_postgres()
+  pg = pg.select("a")
+  pg = pg.from("t")
+  let ph1 = pg.param(SqlValue::Integer(7))
+  assert_eq(ph1, "$1")
+  let ph2 = pg.param(SqlValue::Text("x".to_string()))
+  assert_eq(ph2, "$2")
+  let (pg_sql, pg_params) = pg.build()
+  assert_eq(pg_sql, "SELECT a FROM t")
+  assert_eq(pg_params.len(), 2)
+  # the SQLite-style placeholder on the default builder
+  var sq = QueryBuilder::new()
+  sq = sq.select("a")
+  let ph = sq.param(SqlValue::Null)
+  assert_eq(ph, "?")
+end
+
+def make_rows() -> Rows
+  var columns: Vec[String] = Vec::new()
+  let _ = columns.push("id".to_string())
+  let _ = columns.push("name".to_string())
+  var data: Vec[Vec[SqlValue]] = Vec::new()
+  var row0: Vec[SqlValue] = Vec::new()
+  let _ = row0.push(SqlValue::Integer(1))
+  let _ = row0.push(SqlValue::Text("alice".to_string()))
+  let _ = data.push(row0)
+  Rows::new(columns, data)
+end
+
+@test
+def test_db_rows_and_row_surface() -> Unit
+  # Rows::new + the metadata accessors
+  let rows = make_rows()
+  assert_eq(rows.column_count(), 2 as UInt)
+  assert_false(rows.is_empty())
+  let names = rows.column_names()
+  assert_eq(names[0], "id")
+  assert_eq(names[1], "name")
+  # the row surface through the iterator: get_by_name + get_value
+  let rows2 = make_rows()
+  var iter = rows2
+  match iter.next()
+  when Option::Some(row) then
+    let by_name: i64 = assert_ok(row.get_by_name("id"))
+    assert_eq(by_name, 1)
+  when Option::None then
+    assert_false(true)
+  end
+  let rows3 = make_rows()
+  var iter2 = rows3
+  match iter2.next()
+  when Option::Some(row) then
+    let v0 = row.get_value(0)
+    match v0
+    when Option::Some(SqlValue::Integer(i)) then assert_eq(i, 1)
+    when _ then assert_false(true)
+    end
+  when Option::None then
+    assert_false(true)
+  end
+  let rows4 = make_rows()
+  var iter3 = rows4
+  match iter3.next()
+  when Option::Some(row) then
+    let v1 = row.get_value(9)
+    assert_none(v1)
+  when Option::None then
+    assert_false(true)
+  end
+  let rows5 = make_rows()
+  var iter4 = rows5
+  match iter4.next()
+  when Option::Some(row) then
+    let missing: i64 = assert_err(row.get_by_name("nope"))
+    let _ = missing
+  when Option::None then
+    assert_false(true)
+  end
+  # the empty-rows path
+  let empty_cols: Vec[String] = Vec::new()
+  let empty_data: Vec[Vec[SqlValue]] = Vec::new()
+  let empty = Rows::new(empty_cols, empty_data)
+  assert_true(empty.is_empty())
+  assert_eq(empty.column_count(), 0 as UInt)
+end
+
+@test
+def test_db_sql_value_conversions() -> Unit
+  # to_sql_param over the impl'd types
+  let sv_int = (7).to_sql_param()
+  match sv_int
+  when SqlValue::Integer(i) then assert_eq(i, 7)
+  when _ then assert_false(true)
+  end
+  let sv_i64 = (8 as i64).to_sql_param()
+  match sv_i64
+  when SqlValue::Integer(i) then assert_eq(i, 8)
+  when _ then assert_false(true)
+  end
+  let sv_f64 = (1.5).to_sql_param()
+  match sv_f64
+  when SqlValue::Float(f) then assert_eq(f, 1.5)
+  when _ then assert_false(true)
+  end
+  let sv_str = "hi".to_string().to_sql_param()
+  match sv_str
+  when SqlValue::Text(t) then assert_eq(t, "hi")
+  when _ then assert_false(true)
+  end
+  let sv_bool = true.to_sql_param()
+  match sv_bool
+  when SqlValue::Bool(b) then assert_true(b)
+  when _ then assert_false(true)
+  end
+  var bytes: Vec[u8] = Vec::new()
+  let _ = bytes.push(1 as u8)
+  let sv_blob = bytes.clone().to_sql_param()
+  match sv_blob
+  when SqlValue::Blob(b) then assert_eq(b.len(), 1)
+  when _ then assert_false(true)
+  end
+  let none: Option[Int] = Option::None
+  let sv_none = none.to_sql_param()
+  match sv_none
+  when SqlValue::Null then ()
+  when _ then assert_false(true)
+  end
+  # from_sql_value over the impl'd types
+  let from_i: i64 = assert_ok(Int::from_sql_value(SqlValue::Integer(5)))
+  assert_eq(from_i, 5)
+  let from_s: String = assert_ok(String::from_sql_value(SqlValue::Text("x".to_string())))
+  assert_eq(from_s, "x")
+  let from_b: Bool = assert_ok(Bool::from_sql_value(SqlValue::Bool(true)))
+  assert_true(from_b)
+  let from_blob: Vec[u8] = assert_ok(Vec::from_sql_value(SqlValue::Blob(bytes)))
+  assert_eq(from_blob.len(), 1)
+  # the conversion ERROR path: a type mismatch
+  let bad: i64 = assert_err(Int::from_sql_value(SqlValue::Text("nope".to_string())))
+  let _ = bad
+end
+
+@test
+def test_db_errors_and_state() -> Unit
+  let e = DbError::QueryFailed("boom".to_string())
+  assert_true(db_error_message(e).len() > 0)
+  assert_true(DbError::QueryFailed("boom".to_string()).message().len() > 0)
+  assert_eq(db_error_message(DbError::NotFound), "not found")
+  assert_eq(conn_state_to_int(ConnState::Open), 0)
+  assert_eq(conn_state_to_int(ConnState::Closing), 1)
+  assert_eq(conn_state_to_int(ConnState::Closed), 2)
+end
+
+@test
+def test_db_conn_lifetime() -> Unit
+  let life = conn_lifetime_new()
+  assert_true(conn_lifetime_open(life.clone()))
+  assert_ok(conn_lifetime_check(life.clone()))
+  conn_lifetime_register_child(life.clone())
+  conn_lifetime_register_child(life.clone())
+  assert_true(conn_lifetime_open(life.clone()))
+end
+
+@test
+def test_db_sqlite_in_memory() -> Unit
+  let db = Sqlite::open_memory()
+  let mut c = assert_ok(db)
+  assert_ok(c.execute("CREATE TABLE kv (id INTEGER PRIMARY KEY, value TEXT)", &[]))
+  # a prepared statement over the module-level sqlite layer
+  var stmt = assert_ok(c.prepare("INSERT INTO kv (value) VALUES (?)"))
+  assert_ok(sqlite_stmt_execute(&mut stmt, &[Box::new("hello".to_string()) as Box[dyn ToSqlParam]]))
+  assert_ok(sqlite_stmt_finalize(&mut stmt))
+  var stmt2 = assert_ok(c.prepare("SELECT value FROM kv"))
+  let q_rows = assert_ok(sqlite_stmt_query(stmt2, &[]))
+  assert_eq(q_rows.row_count(), 1 as UInt)
+  let qr = c.query("SELECT value FROM kv", &[])
+  let rows = assert_ok(qr)
+  assert_eq(rows.row_count(), 1 as UInt)
+  # the module-level error helpers
+  let errmsg = sqlite_errmsg(null_ptr() as Ptr[Unit])
+  assert_true(errmsg.len() > 0)
+  let code = sqlite_error_from_code(1, "syntax error".to_string())
+  assert_true(db_error_message(code).len() > 0)
+  let _destructor = sqlite_transient_destructor()
+  # the raw-execute ERROR path: a null handle is rejected by sqlite
+  assert_err(sqlite_execute_raw(null_ptr() as Ptr[Unit], "SELECT 1", &[]))
+  assert_err(sqlite_query_raw(null_ptr() as Ptr[Unit], "SELECT 1", &[]))
+  # the migrator over the in-memory database
+  var mig = Migrator::new()
+  mig = mig.add(1 as UInt, "first".to_string(), "CREATE TABLE t1 (id INTEGER)".to_string(), "DROP TABLE t1".to_string())
+  mig = mig.add(2 as UInt, "second".to_string(), "CREATE TABLE t2 (id INTEGER)".to_string(), "DROP TABLE t2".to_string())
+  let applied = assert_ok(mig.migrate(&mut c))
+  assert_eq(applied, 2 as UInt)
+  let again = assert_ok(mig.migrate(&mut c))
+  assert_eq(again, 0 as UInt)
+  # rollback: the newest migration is rolled back through the down SQL
+  let rolled = assert_ok(mig.rollback(&mut c, 1 as UInt))
+  assert_eq(rolled, 1 as UInt)
+  # status consumes the connection (the last use)
+  let st = assert_ok(mig.status(c))
+  assert_eq(st.len(), 1)
+  # the Sqlite::open entry (the file-backed path shares the driver)
+  let db2 = Sqlite::open(":memory:")
+  let _c2 = assert_ok(db2)
+end
+
+@test
+def test_db_bytea_and_lexers() -> Unit
+  # decode_bytea: the \x hex form
+  let hex = decode_bytea("\\xDEAD")
+  assert_eq(hex.len(), 2)
+  assert_eq(hex[0], 0xDE as u8)
+  assert_eq(hex[1], 0xAD as u8)
+  # decode_bytea: the escape form
+  let esc = decode_bytea("a\\141b")
+  assert_eq(esc.len(), 3)
+  assert_eq(hex_char_to_byte('a'), 10 as u8)
+  assert_eq(hex_char_to_byte('F'), 15 as u8)
+  assert_eq(hex_char_to_byte('0'), 0 as u8)
+  assert_eq(hex_char_to_byte('z'), 0 as u8)
+  # parse_pg_timestamp: the epoch instant
+  assert_eq(parse_pg_timestamp("1970-01-01 00:00:01"), 1)
+  assert_eq(parse_pg_timestamp("1970-01-01 00:00:00"), 0)
+  assert_eq(parse_pg_timestamp("garbage"), 0)
+  # the lexer classification
+  assert_true(pg_lex_ident_start('a' as u8))
+  assert_true(pg_lex_ident_start('_' as u8))
+  assert_false(pg_lex_ident_start('1' as u8))
+  assert_true(pg_lex_ident_char('9' as u8))
+  assert_false(pg_lex_ident_char('-' as u8))
+  # postgres_scan_sql: the pass-through + the native count
+  let (s0, c0) = postgres_scan_sql("SELECT $1 + $2", false)
+  assert_eq(s0, "SELECT $1 + $2")
+  assert_eq(c0, 0)
+  let (s1, c1) = postgres_scan_sql("SELECT $1 + $2", true)
+  assert_eq(c1, 2)
+  assert_eq(s1, "SELECT $1 + $2")
+end
+
+@test
+def test_db_param_backings() -> Unit
+  # the postgres backing: build + the i32 views + the direct pushes
+  let params: [Box[dyn ToSqlParam]] = [
+    Box::new(5) as Box[dyn ToSqlParam],
+    Box::new("s".to_string()) as Box[dyn ToSqlParam],
+  ]
+  let backing = postgres_build_backing(params)
+  let lengths = postgres_i32_lengths(backing.clone())
+  assert_eq(lengths.len(), 2)
+  let formats = postgres_i32_formats(backing)
+  assert_eq(formats.len(), 2)
+  var pb = PgParamBacking::new()
+  pb.push_null()
+  var pbytes: Vec[u8] = Vec::new()
+  let _ = pbytes.push(0x41 as u8)
+  pb.push_text_bytes(pbytes)
+  var pblob: Vec[u8] = Vec::new()
+  let _ = pblob.push(0x01 as u8)
+  pb.push_blob(pblob)
+  let pb_lengths = postgres_i32_lengths(pb.clone())
+  assert_eq(pb_lengths.len(), 3)
+  # the mysql backing builders + the blob classification
+  var mb = mysql_build_binds([Box::new(1) as Box[dyn ToSqlParam], Box::new("x".to_string()) as Box[dyn ToSqlParam]])
+  mb.push_text_param("t".to_string())
+  var blob: Vec[u8] = Vec::new()
+  let _ = blob.push(0 as u8)
+  mb.push_blob_param(blob)
+  mb.push_null_param()
+  assert_true(mysql_type_is_blob(249))
+  assert_false(mysql_type_is_blob(3))
+  let _cfg = mysql_config_new("localhost", "u", "p", "d")
+  # the postgres config builders
+  var pgc = PostgresConfig::new()
+  pgc = pgc.user("behavior_user")
+  pgc = pgc.ssl_mode("disable")
+  let conn_str = pgc.to_connection_string()
+  assert_true(conn_str.contains("user=behavior_user"))
+  assert_true(conn_str.contains("sslmode=disable"))
+end
+
+@test
+def test_db_blocking_pool() -> Unit
+  assert_ok(blocking_pool_init())
+  let inner = assert_ok(blocking_pool_get())
+  let _ = inner
+end
+
+@test
+def test_db_ffi_string_helpers() -> Unit
+  let buf = alloc[u8]()
+  buf.write(0x41)
+  let s = string_from_ptr(buf, 1)
+  assert_eq(s, "A")
+  dealloc[u8](buf)
+  let cs = cstring_new("ffi probe".to_string())
+  let s2 = cstring_to_string(cs.as_ptr())
+  assert_eq(s2, "ffi probe")
+end

@@ -26,7 +26,8 @@
 #      instead of pretending to be current.
 #
 # Usage: ./scripts/gen_status.sh [--refresh-manifests] [--artifacts <dir>]
-#                                 [--release-evidence <dir>] [outfile]
+#                                 [--release-evidence <dir>]
+#                                 [--job-results <json>] [outfile]
 #   --refresh-manifests  regenerate the canary MANIFEST self-description
 #                        (the `# count:`, `# manifest sha256:` and
 #                        `# test list sha256:` lines of tests/canary,
@@ -39,22 +40,41 @@
 #                       file under <dir> (repeatable; also read from
 #                       $TG_STATUS_ARTIFACTS, a colon-separated list).
 #   --release-evidence  THE RELEASE-RUN EVIDENCE path (the reviewer's
-#                       items 32/36/API-manifest): requires --artifacts
-#                       dirs with run artifacts, then verifies the
-#                       release gates — the API-manifest release check
-#                       (a public callable with zero behavior tests, an
-#                       error variant never exercised, or a cfg target
-#                       without execution FAILS the release), the
-#                       completeness enumeration (every std module
-#                       contracted), and the completeness model — and
-#                       writes build/release_evidence.json
-#                       (tested_sha + artifact hashes +
-#                       release_gated_features). This file is the ONLY
-#                       source of the registry's EXACT_SHA_VERIFIED /
+#                       items 32/36/API-manifest): the directory holding
+#                       ONE SUBDIRECTORY PER RUN ARTIFACT (the artifact
+#                       names — tg-stages-macos-arm64, bootstrap-
+#                       fingerprints, bootstrap-native-tests, cross-lane-
+#                       binaries, linux-fingerprints, linux-native-tests;
+#                       the CI status job downloads each artifact into its
+#                       own subdirectory). Verifies the release gates —
+#                       the API-manifest release check (a public callable
+#                       with zero behavior tests, an error variant never
+#                       exercised, or a cfg target without execution
+#                       FAILS the release), the completeness enumeration
+#                       (every std module contracted), the completeness
+#                       model, and the run-artifact presence — then
+#                       writes build/release_evidence.json through the
+#                       RELEASE EVIDENCE SCHEMA (scripts/
+#                       release_evidence_schema.sh): the workflow run
+#                       identity, the per-job conclusions (--job-results),
+#                       the required artifacts with the PER-ARTIFACT
+#                       sha-256 read from the ACTUAL FILES, the stage
+#                       binaries' hashes, the stage2 == stage3 and the
+#                       semantic-fingerprint equality VERDICTS (the
+#                       equality checks' actual results), and the
+#                       native-lane outputs. This file is the ONLY source
+#                       of the registry's EXACT_SHA_VERIFIED /
 #                       RELEASE_GATED ladder positions: the registry
 #                       generator reads it and never derives those
 #                       positions from source. A failing gate writes NO
-#                       evidence file (the release cannot be gated).
+#                       evidence file (the release cannot be gated); the
+#                       proof generator VALIDATES the evidence against
+#                       the schema — a matching SHA alone is never a
+#                       proof.
+#   --job-results <f>   the CI job-results JSON (toJSON(needs) of the
+#                       status job — the ACTUAL observed per-job
+#                       conclusions), recorded in the evidence file.
+#                       (Also read from $TG_STATUS_JOB_RESULTS.)
 #   outfile             defaults to STATUS.txt at the repo root.
 # Exit status: 0 when every structural fact greps as expected; non-zero
 # (with the file still written) when a fact drifted, so CI can gate on it.
@@ -65,6 +85,7 @@ OUT="${1:-$ROOT/STATUS.txt}"
 ARTIFACT_DIRS=""
 REFRESH_MANIFESTS=0
 RELEASE_EVIDENCE=""
+JOB_RESULTS=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -82,11 +103,21 @@ while [ $# -gt 0 ]; do
       RELEASE_EVIDENCE="${1:-}"
       shift
       ;;
+    --job-results)
+      shift
+      JOB_RESULTS="${1:-}"
+      shift
+      ;;
     *) break ;;
   esac
 done
 [ $# -eq 0 ] || OUT="$1"
 ARTIFACT_DIRS="${ARTIFACT_DIRS}${TG_STATUS_ARTIFACTS:-}"
+[ -n "$JOB_RESULTS" ] || JOB_RESULTS="${TG_STATUS_JOB_RESULTS:-}"
+
+# The release-evidence schema (the writer + the fail-closed validator).
+# shellcheck source=scripts/release_evidence_schema.sh
+. "$ROOT/scripts/release_evidence_schema.sh"
 
 SHA="$(git -C "$ROOT" rev-parse HEAD)"
 DATE="$(date +%Y-%m-%d)"
@@ -729,7 +760,7 @@ if [ -n "$RELEASE_EVIDENCE" ]; then
     printf '  [RELEASE GATE FAILED] the stdlib completeness model failed (enumeration / contracts / experimental gating); NO release evidence written\n' >&2
     RELEASE_EVIDENCE_FAIL=1
   fi
-  if [ "${RELEASE_EVIDENCE_FAIL:-0}" = "1" ] || [ ! -d "$RELEASE_EVIDENCE" ] || [ -z "$(find "$RELEASE_EVIDENCE" -type f 2>/dev/null | head -1)" ]; then
+  if [ ! -d "$RELEASE_EVIDENCE" ] || [ -z "$(find "$RELEASE_EVIDENCE" -type f 2>/dev/null | head -1)" ]; then
     printf '  [RELEASE GATE FAILED] the run artifacts are missing or empty (%s); a release requires executed artifacts\n' "$RELEASE_EVIDENCE" >&2
     RELEASE_EVIDENCE_FAIL=1
   fi
@@ -754,37 +785,47 @@ PY
     rm -f "$LADDER_TMP"
   fi
   if [ "${RELEASE_EVIDENCE_FAIL:-0}" = "0" ]; then
-    RELEASE_HASHES="$(IFS=':' ; for d in $ARTIFACT_DIRS; do
-      [ -n "$d" ] || continue
-      if [ -d "$d" ]; then
-        find "$d" -type f -print0 2>/dev/null | sort -z | while IFS= read -r -d '' f; do
-          shasum -a 256 "$f" 2>/dev/null | sed "s#  $d/#  #"
-        done
-      fi
-    done)"
-    [ -n "$RELEASE_HASHES" ] || RELEASE_HASHES="  (no artifact hashes — the release evidence requires run artifacts)"
+    # The evidence WRITER (scripts/release_evidence_schema.sh): records the
+    # workflow run identity, the per-job conclusions (--job-results / the
+    # ACTUAL observed CI results), the required artifacts with the
+    # per-artifact sha-256 READ FROM THE ACTUAL FILES, the stage binaries'
+    # hashes, the stage2 == stage3 / semantic-fingerprint / linux-fixed-point
+    # equality VERDICTS (the equality checks' actual results), and the
+    # native-lane outputs. There is no "present" shorthand: every hash is
+    # read from the actual files, and the proof generator validates the
+    # evidence against the schema (a matching SHA alone is never a proof).
     mkdir -p "$ROOT/build"
-    python3 - "$ROOT/build/release_evidence.json" "$SHA" "$RELEASE_GATED_LIST" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" <<'PY'
+    EVIDENCE_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    if build_release_evidence "$RELEASE_EVIDENCE" "$ROOT/build/release_evidence.json" \
+       "$SHA" "$JOB_RESULTS" "$RELEASE_GATED_LIST" "$EVIDENCE_TIMESTAMP"; then
+      EVIDENCE_ARTIFACT_COUNT="$(ls -d "$RELEASE_EVIDENCE"/*/ 2>/dev/null | wc -l | tr -d ' ')"
+      EVIDENCE_HASH_LINE_COUNT="$(python3 - "$ROOT/build/release_evidence.json" <<'PY'
 import json, sys
-path, sha, gated, stamp = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
-gated = gated.split()
-with open(path, "w", encoding="utf-8") as fh:
-    json.dump({
-        "tested_sha": sha,
-        "artifact_hashes": "present" if True else [],
-        "release_gated_features": gated,
-        "generated_by": "scripts/gen_status.sh --release-evidence",
-        "timestamp_utc": stamp,
-    }, fh, indent=2, sort_keys=True)
-    fh.write("\n")
+d = json.load(open(sys.argv[1], encoding="utf-8"))
+print(len(d.get("artifact_hashes", [])))
 PY
-    RELEASE_EVIDENCE_TEXT="  release evidence WRITTEN: build/release_evidence.json
+)"
+      RELEASE_EVIDENCE_TEXT="  release evidence WRITTEN: build/release_evidence.json
     tested_sha:      $SHA
     release-gated:   $(printf '%s' "$RELEASE_GATED_LIST" | wc -w | tr -d ' ') feature(s)
-    artifact hashes: present ($(printf '%s\n' "$RELEASE_HASHES" | grep -c . || true) file hash line(s))
+    artifact set:    $EVIDENCE_ARTIFACT_COUNT artifact(s) recorded with
+                     $EVIDENCE_HASH_LINE_COUNT per-file sha-256 line(s) read
+                     from the ACTUAL files (the \"present\" shorthand is gone)
+    job conclusions: $(if [ -n "$JOB_RESULTS" ] && [ -f "$JOB_RESULTS" ]; then echo "recorded from $JOB_RESULTS (the ACTUAL observed results)"; else echo "NOT RECORDED (no --job-results file — the fail-closed validation will fail the categories)"; fi)
+    verdicts:        stage2 == stage3, the semantic-fingerprint equality
+                     (tokens/ast/hir/mir/mir-mono), and the linux fixed
+                     point recorded with the equality checks' actual
+                     results; the release-proof generator VALIDATES this
+                     file against scripts/release_evidence_schema.sh —
+                     a matching SHA alone is never a proof
     the registry generator reads this file for the EXACT_SHA_VERIFIED /
     RELEASE_GATED ladder positions; a run that fails any gate writes nothing."
-  else
+    else
+      RELEASE_EVIDENCE_FAIL=1
+      printf '  [RELEASE GATE FAILED] the release-evidence writer failed; NO release evidence written\n' >&2
+    fi
+  fi
+  if [ "${RELEASE_EVIDENCE_FAIL:-0}" = "1" ]; then
     RELEASE_EVIDENCE_TEXT="  release evidence NOT WRITTEN — a release gate failed (see the errors above)."
   fi
 fi

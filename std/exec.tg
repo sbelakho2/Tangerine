@@ -192,6 +192,18 @@ end
 # Executor Core
 # ═══════════════════════════════════════════════════════════════
 
+## THE CONTROL TOKEN (the public-owner/control-token lifecycle — the
+## reviewer's drop-leak fix): a dedicated flag the WORKERS do NOT hold —
+## the wrapper-visible owners hold it (the inner's own reference plus one
+## per Executor wrapper), so its reference count tracks exactly the
+## public owners and is independent of the worker clones. The last
+## wrapper's Drop SETS the token — the shutdown initiation — and the
+## worker threads read the token (through the inner's reference) and
+## transition the lifecycle themselves.
+struct ExecutorControl
+  shutdown_token: AtomicBool
+end
+
 ## The executor's shared state (the worker slots, the queues, the
 ## counters, the shutdown coordination) lives in a heap allocation owned
 ## by an Arc — std::sync's Arc, the same heap-stable shape the sync
@@ -209,6 +221,11 @@ struct ExecutorInner
   
   # Global queue for tasks without affinity
   global_queue: Arc[Mutex[Queue[Task]]]
+  
+  # THE CONTROL TOKEN REFERENCE (the workers read the drop-initiated
+  # shutdown signal through THIS — the workers hold no separate control
+  # clone, so the token's count stays the wrapper-visible owner count).
+  control: Arc[ExecutorControl]
   
   # THE LIFECYCLE STATE MACHINE (the single shutdown authority — the old
   # stop-flag-then-join abandoned queued work): Running -> Draining ->
@@ -273,13 +290,29 @@ end
 
 ## The Executor is a thin Arc wrapper over the inner — the same
 ## { inner: Arc[ExecutorInner] } shape std::async's cooperative Executor
-## uses. The wrapper can be copied/moved freely; the state never moves.
+## uses — PLUS the wrapper's OWN handle to the executor's control token
+## (the same Arc the inner references; the wrappers are the token's
+## public owners). The wrapper can be copied/moved freely; the state
+## never moves. The transient wrappers built around an existing inner
+## (Executor::wrap — the convenience functions, the test harnesses)
+## share the token, so their drops never initiate the shutdown (a
+## longer-lived owner — or the global keeper — holds a reference); the
+## LAST wrapper of an executor's public owners initiates it.
 struct Executor
   inner: Arc[ExecutorInner]
+  control: Arc[ExecutorControl]
 end
 
 ## Global executor instance
 var GLOBAL_EXECUTOR: Option[Arc[ExecutorInner]] = Option::None
+
+## The global executor's PERMANENT control-token keeper: the convenience
+## wrappers (spawn/par_*/spawn_with_result) share the global's token, and
+## the keeper holds one reference for as long as the global lives — the
+## transient wrappers' drops see the token count above the fire threshold
+## and never tear the global executor down (the same protection the old
+## strong_count gate gave the global's inner Arc).
+var GLOBAL_EXECUTOR_CONTROL: Option[Arc[ExecutorControl]] = Option::None
 
 def Executor::new(thread_count: Int) -> Result[Executor, String]
   if thread_count < 1 then
@@ -289,6 +322,10 @@ def Executor::new(thread_count: Int) -> Result[Executor, String]
   let state = Arc::new(AtomicU32::new(_exec_state_running()))
   let task_available = Arc::new(Condvar::new())
   let global_queue = Arc::new(Mutex::new(Queue::new()))
+  # THE CONTROL TOKEN: the wrapper's Drop sets the shutdown_token when
+  # the last public owner drops; the workers read it through the inner's
+  # reference below.
+  let control = Arc::new(ExecutorControl { shutdown_token: AtomicBool::new(false) })
   var workers: Vec[WorkerState] = Vec::with_capacity(thread_count)
   var i = 0
   while i < thread_count do
@@ -301,6 +338,7 @@ def Executor::new(thread_count: Int) -> Result[Executor, String]
       workers: workers,
       threads: Vec::new(),
       global_queue: global_queue,
+      control: control.clone(),
       state: state,
       active_tasks: AtomicU32::new(0),
       task_available: task_available,
@@ -312,7 +350,8 @@ def Executor::new(thread_count: Int) -> Result[Executor, String]
       total_tasks_completed: AtomicU32::new(0),
       next_task_id: AtomicU32::new(1),
       debug_task_states: Arc::new(Mutex::new(Map::new()))
-    })
+    }),
+    control: control
   }
   
   # Start worker threads — each thread receives its own Arc clone of the
@@ -320,6 +359,22 @@ def Executor::new(thread_count: Int) -> Result[Executor, String]
   executor.start_workers()
   
   Result::Ok(executor)
+end
+
+## The TRANSIENT WRAPPER constructor: a wrapper around an EXISTING inner
+## (the convenience functions' wrappers around global_executor(), the
+## test harnesses' wrappers around a live executor). The wrapper shares
+## the inner's control token, so it counts as a public owner — but the
+## drop fires only when the LAST public owner drops (the token count is
+## the inner's reference + this one), so a transient wrapper whose
+## executor has a longer-lived owner never initiates the shutdown.
+def Executor::wrap(inner: Arc[ExecutorInner]) -> Executor
+  unsafe "executor inner access — the Arc clone keeps the inner alive" do
+    Executor {
+      inner: inner.clone(),
+      control: inner.ptr.as_ref().control.clone()
+    }
+  end
 end
 
 ## The validated default thread count: the CPU count when positive, the
@@ -398,6 +453,26 @@ def worker_loop(executor: Arc[ExecutorInner], worker_id: Int) -> Unit
         end
       when Option::None then
         consecutive_empty = consecutive_empty + 1
+        
+        # THE CONTROL-TOKEN REACTION (the drop-initiated shutdown — the
+        # reviewer's lifecycle fix): the wrapper's Drop SET the control
+        # token (the shutdown initiation, independent of the inner's
+        # strong count — the workers hold NO token clone, they read it
+        # through the inner's reference). A worker that observes the
+        # token performs the Running -> Draining transition under the
+        # ADMISSION MUTEX (the same protocol as the explicit shutdown —
+        # the first observer wins, the rest skip) and wakes the pool;
+        # the queued work then DRAINS exactly like the explicit graceful
+        # shutdown (the exit condition below still requires the
+        # empty-scan + zero-active quiescence).
+        if inner.control.shutdown_token.load() then
+          let guard = inner.admission.lock()
+          let old = inner.state.compare_and_swap(_exec_state_running(), _exec_state_draining())
+          drop(guard)
+          if old == _exec_state_running() then
+            inner.task_available.notify_all()
+          end
+        end
         
         # THE DRAIN EXIT: the find_task scan found no task anywhere.
         # The worker exits only when the lifecycle left Running AND no
@@ -1279,6 +1354,14 @@ def init_global_executor(thread_count: Int) -> Result[Unit, String]
   match Executor::new(thread_count)
   when Result::Ok(exec) then
     GLOBAL_EXECUTOR = Option::Some(exec.inner.clone())
+    # THE GLOBAL KEEPER: the permanent control-token reference — the
+    # transient wrappers around global_executor() (spawn/par_*/...)
+    # share the token, and the keeper keeps the token count above the
+    # drop's fire threshold for as long as the global lives, so no
+    # transient wrapper's drop ever initiates the global shutdown (the
+    # same protection the old strong_count gate provided through the
+    # global's inner Arc).
+    GLOBAL_EXECUTOR_CONTROL = Option::Some(exec.control.clone())
     Result::Ok(())
   when Result::Err(e) then
     Result::Err(e)
@@ -1311,25 +1394,25 @@ end
 
 ## Spawn a closure on the global executor
 def spawn(func: fn() -> Unit) -> u64
-  let executor = Executor { inner: global_executor() }
+  let executor = Executor::wrap(global_executor())
   executor.submit(Box::new(func), TaskPriority::Normal)
 end
 
 ## Spawn with priority
 def spawn_with_priority(func: fn() -> Unit, priority: TaskPriority) -> u64
-  let executor = Executor { inner: global_executor() }
+  let executor = Executor::wrap(global_executor())
   executor.submit(Box::new(func), priority)
 end
 
 ## Spawn a closure that returns a value
 def spawn_with_result[T: Transferable](func: fn() -> T) -> JoinHandle[T]
-  let executor = Executor { inner: global_executor() }
+  let executor = Executor::wrap(global_executor())
   executor.submit_with_result(func, TaskPriority::Normal)
 end
 
 ## Parallel for-each
 def par_for_each[T](items: [T], func: fn(T) -> Unit) -> Unit
-  let executor = Executor { inner: global_executor() }
+  let executor = Executor::wrap(global_executor())
   let count = items.len()
   
   if count == 0 then return end
@@ -1373,7 +1456,7 @@ end
 
 ## Parallel map
 def par_map[T: Transferable, U: Transferable](items: [T], func: fn(T) -> U) -> Vec[U]
-  let executor = Executor { inner: global_executor() }
+  let executor = Executor::wrap(global_executor())
   let count = items.len()
   
   if count == 0 then
@@ -1446,7 +1529,7 @@ def par_fold[T: Transferable, U: Transferable + Clone](
   merge: fn(U, U) -> U
 ) -> U
   let exec = global_executor()
-  let executor = Executor { inner: exec.clone() }
+  let executor = Executor::wrap(exec.clone())
   let count = items.len()
   
   if count == 0 then
@@ -1535,7 +1618,7 @@ end
 
 ## Schedule a CPU-intensive task with proper CPU affinity
 def spawn_cpu_intensive[T: Transferable](func: fn() -> T) -> JoinHandle[T]
-  let executor = Executor { inner: global_executor() }
+  let executor = Executor::wrap(global_executor())
   executor.submit_with_result(func, TaskPriority::High)
 end
 
@@ -1566,17 +1649,32 @@ end
 
 impl Drop for Executor
   def drop(inout self: Executor) -> Unit
-    # The wrapper's Drop shuts the executor down ONLY when this is the
-    # LAST wrapper-visible owner (strong_count == 1): the worker threads
-    # hold their own Arc clones (count >= 2 while they run), and the
-    # convenience functions build transient wrappers around
-    # global_executor() — neither may tear the shared executor down. The
-    # worker threads exit when the lifecycle leaves the Running state;
-    # the inner allocation releases when the last Arc clone drops.
-    if self.inner.strong_count() == 1 then
-      let inner = self.inner.ptr.as_ref()
-      if inner.state.load() == _exec_state_running() then
-        self.shutdown()
+    # THE CONTROL-TOKEN LIFECYCLE (the reviewer's drop-leak fix): the old
+    # gate (self.inner.strong_count() == 1) could never fire for a RUNNING
+    # executor — the worker threads hold their own inner Arc clones, so
+    # the inner's count was >= 2 while they lived: the shutdown never
+    # initiated, the workers blocked forever on the queues, and the inner
+    # leaked. The CONTROL TOKEN is the separate public-owner authority:
+    # the wrappers hold it, the workers do NOT — its count tracks exactly
+    # the wrapper-visible owners (the inner's own reference + one per
+    # wrapper), independent of the workers' clones. When the LAST wrapper
+    # drops (the count is the inner's reference + this one), the token is
+    # SET — the shutdown initiation — and the worker threads read the
+    # token (through the inner's reference), transition the lifecycle
+    # (Running -> Draining under the admission lock — the worker-side
+    # reaction in worker_loop), drain to the quiescent point, and exit;
+    # their Arc clones are released, and the FINAL Arc release completes
+    # the teardown (the inner allocation is freed — no leak). A transient
+    # wrapper around a longer-lived executor (a cloned owner, the global
+    # keeper) never fires: its drop leaves the token count above 2.
+    if self.control.strong_count() == 2 then
+      self.control.shutdown_token.store(true)
+      unsafe "executor inner access — the wrapper's Arc clone keeps the inner alive" do
+        let inner = self.inner.ptr.as_mut()
+        # Wake the workers so they observe the token promptly (the
+        # transition itself is theirs — the admission-lock CAS in
+        # worker_loop).
+        inner.task_available.notify_all()
       end
     end
   end

@@ -22,11 +22,11 @@
 
 ## The per-target capability evidence (the ✓ marks' artifacts)
 
-- **aarch64-apple-darwin** (10 ✓): `tests/canary` ✓ `tests/canary_neg` ✓ `tests/resource_cfg` ✓ `tests/differential` ✓ `tests/run_target_lane_canaries.sh` ✓ `tests/thread_local_drop_test.tg` ✓ `tests/pthread_abi_test.tg` ✓ `tests/db_mysql_integration_test.tg` ✓ `tests/db_postgres_integration_test.tg` ✓ `tests/db_async_pool_test.tg` ✓
-- **x86_64-unknown-linux-gnu** (6 ✓): `tests/canary` ✓ `tests/canary_neg` ✓ `tests/resource_cfg` ✓ `tests/differential` ✓ `tests/run_target_lane_canaries.sh` ✓
+- **aarch64-apple-darwin** (10 ✓): `tests/canary` ✓ `tests/canary_neg` ✓ `tests/resource_cfg` ✓ `tests/differential` ✓ `tests/run_target_lane_canaries.sh` ✓ `tests/thread_local_drop_test.tg` ✓ `tests/pthread_abi_test.tg` ✓ `tests/db_mysql_integration_test.tg` ✓ `tests/db_postgres_integration_test.tg` ✓ `tests/db_async_pool_test.tg` ✓ `tests/run_nostd_bare_lane.sh` ✓ `tests/nostd/nostd_bare_start.tg` ✓
+- **x86_64-unknown-linux-gnu** (6 ✓): `tests/canary` ✓ `tests/canary_neg` ✓ `tests/resource_cfg` ✓ `tests/differential` ✓ `tests/run_target_lane_canaries.sh` ✓ `tests/run_nostd_bare_lane.sh` ✓ `tests/nostd/nostd_bare_start.tg` ✓
 - **x86_64-apple-darwin** (4 ✓): `tests/canary` ✓ `tests/canary_neg` ✓ `tests/resource_cfg` ✓ `tests/differential` ✓ `tests/run_target_lane_canaries.sh` ✓
 - **x86_64-windows** (3 ✓): `tests/canary` ✓ `tests/canary_neg` ✓ `tests/resource_cfg` ✓ `tests/differential` ✓
-- **wasm32** (3 ✓): `tests/canary` ✓ `tests/canary_neg` ✓ `tests/resource_cfg` ✓ `tests/differential` ✓
+- **wasm32** (4 ✓): `tests/canary` ✓ `tests/canary_neg` ✓ `tests/resource_cfg` ✓ `tests/differential` ✓ `tests/run_wasm_conformance.sh` ✓ `tests/wasm/wasm_conformance_test.tg` ✓ `tests/run_wasi_conformance.sh` ✓ `tests/wasi/wasi_guest_canary.tg` ✓
 
 ## The mechanical gates the generator enforces
 

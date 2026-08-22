@@ -118,6 +118,7 @@ EXCLUDED_DOCS=(
   "ffi_cheatsheet.md	API-only declared surface (examples document the removed reference-era FFI spellings)"
   "stdlib_reference.md	API-only declared surface (module surfaces outside the kernel closure — registry status API-only)"
   "stdlib_completeness.md	generated evidence document (machine-generated from stdlib_contracts.toml — no hand-written grammar examples)"
+  "coverage_oracles.md	generated evidence document (the coverage-oracle tables — no hand-written grammar examples)"
   "target_capabilities.md	generated evidence document (the target capability matrix — no hand-written grammar examples)"
   "language_spec.md	generated evidence document (machine-generated from language_spec.toml — no hand-written grammar examples)"
   "pipeline_stages.md	generated evidence document (machine-generated from compiler_pipeline.toml — no hand-written grammar examples)"

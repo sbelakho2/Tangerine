@@ -1,135 +1,86 @@
 #!/usr/bin/env bash
 # ———————————————————————————————————————————————————————————————
 # scripts/run_mutation_tests.sh — the bounded mutation harness
-# (the reviewer's mutation categories; per-mutation DETECTORS).
+# (the reviewer's mutation categories; the SEMANTIC mutation protocol).
 #
-# The mutations are applied to COPIES of the KEY SEMANTIC files (the
-# checker, the verifier, the layout engine — plus the two contracts
-# whose semantic homes are std/async.tg and tg_compiler/codegen.tg) by
-# SCRIPTED transformations (exact-string edits with an anchor-count
-# assertion — an unapplied transformation is a drift error). The
-# ORIGINALS ARE NEVER MODIFIED: the harness builds a fresh source copy
-# of the tree, applies ONE mutation to the copy, runs the bounded suite
-# against the mutated tree, and discards it.
+# THE SEMANTIC MUTATION PROTOCOL (the reviewer's mandate):
+#   mutate -> BUILD the mutated compiler/runtime -> RUN the behavioral
+#   suite -> the mutation is KILLED iff the behavioral suite FAILS.
+# Per mutation:
+#   (1) MUTATE — apply ONE scripted transformation to a COPY of the tree
+#       (the ORIGINALS ARE NEVER MODIFIED; exact-string edits with an
+#       anchor-count assertion — an unapplied transformation is a drift
+#       error; the mutated file must differ from the pristine original).
+#   (2) SOURCE-INTEGRITY CONFIRMATION (never a kill classification) — the
+#       per-mutation detector (scripts/mutation_detectors.sh) MUST FIRE
+#       (the canonical semantic form at the intended site is destroyed)
+#       and scripts/verify_invariants.sh --mutation-source-integrity <id>
+#       must pass (the mutation's own G13 assertion fired; every other
+#       invariant holds). The G13 structural detectors are KEPT ONLY as
+#       these source-integrity checks — they verify the mutation was
+#       applied at the intended site and NEVER classify a kill.
+#   (3) BUILD — when a usable current-grammar compiler binary exists (the
+#       ladder produces one: build/tg_stage3 -> tg_stage2 -> tg_stage1,
+#       or the --binary argument), the MUTATED kernel is compiled with it
+#       (tg_compiler/bootstrap_main.tg -> the mutated compiler binary).
+#       A mutated kernel that does not compile is caught at the BUILD
+#       step — KILLED-BEHAVIORALLY (the build is part of the protocol).
+#   (4) RUN — the PER-MUTATION BEHAVIORAL SUITE (the mapping table below)
+#       runs under the mutated compiler. The mutation is KILLED iff the
+#       mapped behavioral suite FAILS. A suite that PASSES under the
+#       mutated compiler = SURVIVED (a finding — every catalog entry is
+#       non-equivalent, so a survivor means the suite needs a detector).
 #
-# THE KILL RULE (the reviewer's mandate): each mutation is KILLED iff its
-# DETECTOR fails — a structural test whose outcome depends on the mutated
-# site's CORRECTNESS. The detectors are the canonical-semantic-form
-# assertions of scripts/mutation_detectors.sh (mirrored tree-wide as the
-# G13 group of scripts/verify_invariants.sh): a mutation destroys its own
-# target site's canonical form, so the detector fails exactly on its own
-# mutation and holds on the pristine tree. The BOUNDED SUITE (structural
-# tier — runs everywhere, no compiler binary, no ladder):
-#     scripts/mutation_detectors.sh   — the per-mutation detector
-#     scripts/verify_invariants.sh    — the invariant script (incl. the
-#                                       G13 per-mutation detector group)
-#     scripts/run_selfhost_grammar_gate.sh — the structural semantic
-#                                       scans over the closure + the
-#                                       full tool tree
-#     scripts/check_struct_balance.py — the balance/end-token gate over
-#                                       the kernel closure + the
-#                                       mutation target files
-#     the manifest-parity check       — canary / canary_neg / arm64
-#                                       three-way manifest parity PLUS the
-#                                       canary_neg expected-diagnostic
-#                                       parity (every expected diagnostic
-#                                       substring in the MANIFEST is
-#                                       present in the checker/verifier
-#                                       sources — a deleted diagnostic
-#                                       site breaks the parity)
-#   binary tier (--binary <tg> — runs only when every structural piece
-#   PASSED, i.e. a mutation escaped the structural detectors; the mutated
-#   kernel is COMPILED with the given binary and the executed suites run
-#   against the mutated compiler):
-#     the canaries (tests/canary/MANIFEST)  — compile + execute every
-#     tests/verifier_projection_tests.tg    — the verifier tests
+# THE HONEST CURRENT STATE: without a usable compiler binary the
+# behavioral tier cannot run — every mutation's kill classification is
+# PENDING-UNTIL-BINARY (NOT killed). PENDING-UNTIL-BINARY and SURVIVED
+# make the release gate fail: with --gate the harness exits nonzero while
+# any non-equivalent mutation is not KILLED-BEHAVIORALLY (a survivor or a
+# pending kill in the release context fails CI).
 #
-# THE MUTATION CATALOG (one entry per reviewer category; every entry is
-# classified NON-EQUIVALENT — each changes an observable semantic: the
-# accepted/rejected sets, the emitted layout/code, or a wake/ordering
-# arm — so a survivor is a finding, and the target is a 100% kill-rate):
-#   mut-invert-comparison        NE  checker       types.tg — the field-
-#                                                index bounds check is
-#                                                inverted (`<` -> `>`)
-#                                                detector G13.1
-#   mut-delete-diagnostic        NE  verifier      mir.tg — the extern-ABI
-#                                                classification diagnostic
-#                                                is deleted
-#                                                detector G13.2
-#   mut-consume-to-read          NE  checker       types.tg — AccessEffect::
-#                                                Consume classified as
-#                                                Read (a moving binding
-#                                                is treated as read-only)
-#                                                detector G13.3
-#   mut-modify-to-read           NE  checker       mir.tg — the inout
-#                                                access convention maps to
-#                                                Read (an inout parameter
-#                                                is treated as read-only)
-#                                                detector G13.4
-#   mut-remove-drop-mark         NE  checker       types.tg — the partial-
-#                                                move registry record the
-#                                                MIR's partial-drop chain
-#                                                consumes is never marked
-#                                                detector G13.5
-#   mut-duplicate-drop           NE  verifier      mir.tg — the MirDeinit
-#                                                identity guard is deleted
-#                                                (a duplicate/unregistered
-#                                                deinit instance passes)
-#                                                detector G13.6
-#   mut-skip-verifier            NE  verifier      mir.tg — verify_mir
-#                                                returns an empty error
-#                                                list immediately
-#                                                detector G13.7
-#   mut-field-offset             NE  layout engine layout_engine.tg — the
-#                                                Map header key_stride
-#                                                offset 24 -> 32
-#                                                detector G13.8
-#   mut-enum-tag                 NE  layout engine layout_engine.tg — the
-#                                                TaggedUnion tag_size
-#                                                8 -> 4 (F3: tag at 0)
-#                                                detector G13.9
-#   mut-remove-overflow-check    NE  layout engine layout_engine.tg — the
-#                                                layout_checked_add
-#                                                overflow guard is
-#                                                deleted (fail-closed
-#                                                becomes wrap)
-#                                                detector G13.10
-#   mut-branch-target            NE  verifier      mir.tg — the verify_
-#                                                function_v2 extern
-#                                                early-return condition
-#                                                is flipped (non-extern
-#                                                functions return
-#                                                unverified)
-#                                                detector G13.11
-#   mut-remove-wake              NE  async contract std/async.tg — the
-#                                                waker's wake_task
-#                                                dispatch is removed
-#                                                detector G13.12
-#   mut-remove-atomic-ordering   NE  atomics       codegen.tg — the x86
-#                                                SeqCst store branch is
-#                                                made unreachable (the
-#                                                ordering is removed;
-#                                                SeqCst stores become
-#                                                weak MOVs)
-#                                                detector G13.13
-#   mut-equality-to-permissive   NE  checker       types.tg — the exact
-#                                                depth-1 projection
-#                                                check `== 1` becomes
-#                                                the permissive `>= 1`
-#                                                detector G13.14
+# THE PER-MUTATION BEHAVIORAL SUITE MAPPING (the kill instruments — the
+# suites whose PASS/FAIL depends on the mutated semantics):
+#   mut-invert-comparison        canary-pos + canary-neg  (the canaries'
+#                               accepted/rejected sets)
+#   mut-delete-diagnostic        canary-neg  (the negative canaries'
+#                               expected-diagnostic suite)
+#   mut-consume-to-read          resource-neg  (the resource negatives)
+#   mut-modify-to-read           resource-neg  (the resource negatives)
+#   mut-remove-drop-mark         resource-neg  (the resource negatives)
+#   mut-duplicate-drop           verifier  (the verifier tests)
+#   mut-skip-verifier            verifier  (the verifier tests)
+#   mut-field-offset             layout  (the layout tests)
+#   mut-enum-tag                 enum + layout  (the enum tests + the
+#                               layout engine's enum-offset assertions)
+#   mut-remove-overflow-check    numeric-gate  (the numeric gate)
+#   mut-branch-target            cfg-oracle  (the CFG oracle)
+#   mut-remove-wake              async-waiter  (the async waiter tests)
+#   mut-remove-atomic-ordering   litmus  (the atomic litmus suites)
+#   mut-equality-to-permissive   conv-neg  (the trait-conformance
+#                               negatives)
 #
 # Usage: scripts/run_mutation_tests.sh [--binary <tg>] [--only <id,...>]
-#                                      [--out <file>]
-#   --binary  a working tg compiler; the mutated kernel is compiled
-#             with it and the binary tier runs (canaries + verifier
-#             tests) — ONLY for mutations that escape every structural
-#             detector.
+#                                      [--out <file>] [--gate]
+#   --binary  a usable CURRENT-GRAMMAR compiler binary (the ladder's
+#             stage3/stage2/stage1, or any binary that passes the
+#             usability probe: it must `check` a trivial valid program
+#             AND reject a legacy-spelling probe). The mutated kernel is
+#             compiled with it and the behavioral tier runs for EVERY
+#             mutation. When omitted, the harness auto-detects
+#             build/tg_stage3 -> tg_stage2 -> tg_stage1 -> build/tg.
 #   --only    run a subset of the catalog (comma-separated ids).
 #   --out     write the report to a file (also printed on stdout).
-# Exit status: 0 when every mutation ran and the report was produced
-# (SURVIVORS are a finding inside the report, not a harness failure);
-# 1 when a mutation could not be applied (the catalog drifted from the
-# sources — a real failure to fix).
+#   --gate    the release-context gate: exit nonzero when any
+#             non-equivalent mutation is not KILLED-BEHAVIORALLY
+#             (SURVIVED or PENDING-UNTIL-BINARY) or when any mutation
+#             errored. WITHOUT a usable compiler binary every kill is
+#             PENDING-UNTIL-BINARY and the gate fails — the honest state.
+# Exit status: 0 when every mutation ran, the report was produced, and
+# (with --gate) every non-equivalent mutation is KILLED-BEHAVIORALLY;
+# 1 when a mutation could not be applied / failed the source-integrity
+# confirmation (the catalog drifted from the sources — a real failure to
+# fix), or with --gate when a mutation SURVIVED or is PENDING-UNTIL-
+# BINARY; 2 on a harness configuration error (an unusable --binary).
 # ———————————————————————————————————————————————————————————————
 set -u
 
@@ -142,6 +93,7 @@ cd "$ROOT" || { echo "run_mutation_tests: cannot cd to repo root" >&2; exit 2; }
 BINARY=""
 ONLY=""
 OUT=""
+GATE=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --binary)
@@ -159,18 +111,62 @@ while [ $# -gt 0 ]; do
       OUT="${1:-}"
       shift
       ;;
+    --gate)
+      GATE=1
+      shift
+      ;;
     *) break ;;
   esac
 done
 
-if [ -n "$BINARY" ] && [ ! -x "$BINARY" ]; then
-  echo "run_mutation_tests: the --binary compiler is not executable: $BINARY" >&2
-  exit 2
+# probe_usable_compiler <binary> — 0 iff the binary is a USABLE
+# CURRENT-GRAMMAR compiler: it must `check` a trivial valid program
+# (a crashed/broken leftover artifact never qualifies) AND reject a
+# legacy-spelling probe (a stale binary built before the E100 removal
+# silently accepts the probe and is NOT usable for the build tier — the
+# same probe discipline as scripts/run_selfhost_grammar_gate.sh).
+probe_usable_compiler() {
+  local bin="$1" d rc
+  d="$(mktemp -d "${TMPDIR:-/tmp}/tg_mut_probe.XXXXXX")" || return 1
+  cat > "$d/good.tg" <<'PROBEGOOD'
+def mutation_good_probe() -> Int
+  0
+end
+PROBEGOOD
+  cat > "$d/legacy.tg" <<'PROBELEGACY'
+def mutation_legacy_probe(x: &Int) -> Int
+  x
+end
+PROBELEGACY
+  ( "$bin" check "$d/good.tg" >/dev/null 2>&1 ) && ! ( "$bin" check "$d/legacy.tg" >/dev/null 2>&1 )
+  rc=$?
+  rm -rf "$d"
+  return $rc
+}
+
+if [ -n "$BINARY" ]; then
+  if [ ! -x "$BINARY" ]; then
+    echo "run_mutation_tests: the --binary compiler is not executable: $BINARY" >&2
+    exit 2
+  fi
+  if ! probe_usable_compiler "$BINARY"; then
+    echo "run_mutation_tests: the --binary compiler is NOT a usable current-grammar compiler (it must check a trivial valid program AND reject a legacy-spelling probe): $BINARY — a stale or broken artifact cannot drive the behavioral tier" >&2
+    exit 2
+  fi
+else
+  for cand in build/tg_stage3 build/tg_stage2 build/tg_stage1 build/tg; do
+    if [ -x "$cand" ] && probe_usable_compiler "$cand"; then
+      BINARY="$cand"
+      break
+    fi
+  done
 fi
 
 WORK_BASE="$(mktemp -d "${TMPDIR:-/tmp}/tg_mutation.XXXXXX")"
 PRISTINE="$WORK_BASE/pristine"
 WORK="$WORK_BASE/work"
+LOGS="$WORK_BASE/logs"
+mkdir -p "$LOGS"
 trap 'rm -rf "$WORK_BASE"' EXIT
 
 # ———————————————————————————————————————————————————————————————
@@ -209,6 +205,29 @@ CATALOG=(
   "mut-remove-atomic-ordering|tg_compiler/codegen.tg|NE|atomics: the x86 SeqCst store branch made unreachable (weak MOV always)"
   "mut-equality-to-permissive|tg_compiler/types.tg|NE|checker: the exact depth-1 projection check == 1 becomes >= 1"
 )
+
+# behavioral_suites_for <mutation-id> — the PER-MUTATION BEHAVIORAL SUITE
+# MAPPING (the kill instruments: the mutation is KILLED iff any mapped
+# suite FAILS under the mutated compiler).
+behavioral_suites_for() {
+  case "$1" in
+    mut-invert-comparison)      echo "canary-pos canary-neg" ;;
+    mut-delete-diagnostic)      echo "canary-neg" ;;
+    mut-consume-to-read)        echo "resource-neg" ;;
+    mut-modify-to-read)         echo "resource-neg" ;;
+    mut-remove-drop-mark)       echo "resource-neg" ;;
+    mut-duplicate-drop)         echo "verifier" ;;
+    mut-skip-verifier)          echo "verifier" ;;
+    mut-field-offset)           echo "layout" ;;
+    mut-enum-tag)               echo "enum layout" ;;
+    mut-remove-overflow-check)  echo "numeric-gate" ;;
+    mut-branch-target)          echo "cfg-oracle" ;;
+    mut-remove-wake)            echo "async-waiter" ;;
+    mut-remove-atomic-ordering) echo "litmus" ;;
+    mut-equality-to-permissive) echo "conv-neg" ;;
+    *)                          echo "" ;;
+  esac
+}
 
 apply_mutation() { # apply_mutation <id> <root> ; prints "applied" | "ERROR: ..."
   python3 - "$1" "$2" <<'PY'
@@ -326,14 +345,17 @@ PY
 }
 
 # ———————————————————————————————————————————————————————————————
-# Step 2 — the bounded suite pieces
+# Step 2 — the source-integrity suite pieces
 # ———————————————————————————————————————————————————————————————
 # manifest_parity <dir> <manifest>: listed == discovered == declared,
 # every listed file exists, every discovered file is listed (the
-# G10.1-family check the harness runs as an explicit suite piece).
+# G10.1-family check the harness runs as an explicit source-integrity
+# piece — the mutated copy must keep the suite sets intact).
 # diagnostic_parity <manifest> <src-dir>...: every expected diagnostic
 # substring in the canary_neg MANIFEST is present in the compiler
-# sources (the G10.6 check — the mandate's expected-diagnostic parity).
+# sources (the G10.6 check — the expected-diagnostic parity; a mutation
+# that deletes a diagnostic site the negative canaries pin breaks the
+# parity — recorded as a source-integrity observation, NEVER a kill).
 manifest_parity() {
   local dir="$1" manifest="$2"
   [ -d "$dir" ] || return 1
@@ -358,13 +380,6 @@ manifest_parity() {
   [ "$listed" -eq "$discovered" ] && [ "$declared" -eq "$listed" ] || return 1
 }
 
-# the canary_neg expected-diagnostic parity: every expected diagnostic
-# substring in the MANIFEST must be present in the compiler sources —
-# verbatim, or with the backtick-quoted spans normalized (a template
-# diagnostic still pins the canary's expected text). A mutation that
-# deletes or renames a diagnostic site the negative canaries pin breaks
-# the parity (the mandate's "a deleted diagnostic → the expected
-# substring missing → the parity gate fails").
 diagnostic_parity() {
   python3 - "$1" "$2" "$3" <<'PY'
 import os, re, sys
@@ -413,17 +428,110 @@ balance_gate() {
 }
 
 # ———————————————————————————————————————————————————————————————
-# Step 3 — one mutation at a time, against a fresh copy
+# Step 3 — the per-mutation BEHAVIORAL SUITE runners
+# (each runs with cwd = the MUTATED COPY; 0 = suite passed, 1 = the
+# suite FAILED under the mutated compiler — the kill instrument)
+# ———————————————————————————————————————————————————————————————
+# run_pos_canaries <compiler> — the positive canaries' accepted set:
+# every tests/canary/MANIFEST entry must compile AND execute cleanly.
+run_pos_canaries() {
+  local compiler="$1" failures=0 total=0 line name
+  mkdir -p build/.mut_canaries
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in ''|\#*) continue ;; esac
+    name="${line%.tg}"
+    total=$((total + 1))
+    if ! "$compiler" compile --mode dev -O2 -o "build/.mut_canaries/$name" "tests/canary/$line" >/dev/null 2>&1 \
+       || ! "build/.mut_canaries/$name" >/dev/null 2>&1; then
+      echo "FAIL: positive canary $name failed to compile or execute under the mutated compiler"
+      failures=$((failures + 1))
+    else
+      echo "OK: positive canary $name compiled and executed"
+    fi
+  done < tests/canary/MANIFEST
+  [ "$total" -eq 0 ] && { echo "FAIL: zero positive canaries discovered (a zero suite is fatal)"; return 1; }
+  [ "$failures" -eq 0 ]
+}
+
+# run_neg_canaries <compiler> <name-regex> — the negative canaries'
+# accepted/rejected sets: every matching tests/canary_neg/MANIFEST entry
+# must be REJECTED by `check` and carry the manifest's expected
+# diagnostic substring (an entry without one needs rejection only).
+run_neg_canaries() {
+  local compiler="$1" regex="$2" failures=0 total=0 line file expected name out rc
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in ''|\#*) continue ;; esac
+    file="${line%%$'\t'*}"
+    expected="${line#*$'\t'}"
+    [ "$expected" = "$line" ] && expected=""
+    name="${file%.tg}"
+    [[ "$name" =~ $regex ]] || continue
+    total=$((total + 1))
+    out="$( "$compiler" check "tests/canary_neg/$file" 2>&1 )"
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+      echo "FAIL: negative $name was ACCEPTED by the mutated compiler (the accepted set widened)"
+      failures=$((failures + 1))
+    elif [ -n "$expected" ] && ! printf '%s' "$out" | grep -qF "$expected"; then
+      echo "FAIL: negative $name rejected but WITHOUT the expected diagnostic '$expected'"
+      failures=$((failures + 1))
+    else
+      echo "OK: negative $name rejected with the expected diagnostic"
+    fi
+  done < tests/canary_neg/MANIFEST
+  [ "$total" -eq 0 ] && { echo "FAIL: zero negatives matched the family (a zero suite is fatal)"; return 1; }
+  [ "$failures" -eq 0 ]
+}
+
+# run_behavioral_suite <suite-id> <compiler> — dispatch the per-mutation
+# behavioral suite mapping. 0 = suite passed; 1 = suite FAILED.
+run_behavioral_suite() {
+  case "$1" in
+    canary-pos)     run_pos_canaries "$2" ;;
+    canary-neg)     run_neg_canaries "$2" '.*' ;;
+    resource-neg)   run_neg_canaries "$2" '^(canary_neg_access_|canary_neg_resource_|resource_|canary_neg_option_resource)' ;;
+    conv-neg)       run_neg_canaries "$2" '^canary_neg_conv_' ;;
+    verifier)       "$2" test tests/verifier_projection_tests.tg golden/compiler_module_tests.tg ;;
+    layout)         "$2" test tests/layout_tests.tg tests/layout/differential_layout_test.tg ;;
+    enum)           "$2" test tests/struct_enum_test.tg ;;
+    numeric-gate)   "$2" test tests/numeric_literal_gate_e_test.tg ;;
+    cfg-oracle)     bash tests/resource_cfg/run_cfg_oracle.sh "$2" ;;
+    async-waiter)   "$2" test tests/async_mutex_waiter_test.tg tests/async_channel_waiter_test.tg \
+                          tests/async_semaphore_waiter_test.tg tests/task_scope_test.tg \
+                          tests/cancellation_token_test.tg tests/reactor_readiness_test.tg \
+                          tests/channel_stream_wake_test.tg tests/join_cancel_test.tg ;;
+    litmus)         "$2" test tests/atomic_litmus_sb_test.tg tests/atomic_litmus_mp_test.tg \
+                          tests/atomic_litmus_wrc_test.tg tests/atomic_litmus_acqrel_test.tg \
+                          tests/atomic_litmus_cas_pub_test.tg tests/atomic_litmus_cas_fail_test.tg \
+                          tests/atomic_litmus_ring4_test.tg tests/atomic_litmus_seqcst_chain4_test.tg ;;
+    *) echo "run_behavioral_suite: unknown suite: $1" >&2; return 2 ;;
+  esac
+}
+
+# ———————————————————————————————————————————————————————————————
+# Step 4 — one mutation at a time, against a fresh copy
+# (mutate -> source-integrity confirmation -> build -> behavioral suite)
 # ———————————————————————————————————————————————————————————————
 declare -a KILLED_IDS=()
-declare -a SURVIVED_IDS=()
-declare -a ERROR_IDS=()
 declare -a KILLED_BY=()
-declare -a SURVIVED_CLASS=()
+declare -a SURVIVED_IDS=()
+declare -a SURVIVED_REASON=()
+declare -a PENDING_IDS=()
+declare -a PENDING_REASON=()
+declare -a ERROR_IDS=()
+declare -a ERROR_REASON=()
 TOTAL=0
 KILLED=0
 SURVIVED=0
+PENDING=0
 ERRORS=0
+SOURCE_INTEGRITY_OK=0
+
+if [ -n "$BINARY" ]; then
+  echo "binary tier: $BINARY (usable current-grammar compiler — the mutated kernel is built with it and the behavioral tier runs for every mutation)"
+else
+  echo "binary tier: NONE — no usable current-grammar compiler binary in build/ and no --binary given; every kill classification is PENDING-UNTIL-BINARY (the behavioral tier cannot run)"
+fi
 
 for entry in "${CATALOG[@]}"; do
   id="${entry%%|*}"
@@ -443,9 +551,11 @@ for entry in "${CATALOG[@]}"; do
   rm -rf "$WORK"
   rsync -a "$PRISTINE/" "$WORK/"
 
+  # ————— (1) MUTATE —————
   APPLY_OUT="$(apply_mutation "$id" "$WORK" 2>&1)" || {
     echo "== $id — MUTATION APPLICATION ERROR: $APPLY_OUT (the catalog drifted from the sources)"
     ERROR_IDS+=("$id")
+    ERROR_REASON+=("mutation application error: $APPLY_OUT")
     ERRORS=$((ERRORS + 1))
     continue
   }
@@ -457,136 +567,177 @@ for entry in "${CATALOG[@]}"; do
   if diff -q "$PRISTINE/$file" "$WORK/$file" >/dev/null 2>&1; then
     echo "== $id — MUTATION APPLICATION ERROR: the mutated file does not differ from the pristine original (the transformation was a no-op)"
     ERROR_IDS+=("$id")
+    ERROR_REASON+=("the mutated file does not differ from the pristine original")
     ERRORS=$((ERRORS + 1))
     continue
   fi
 
-  # (1) the per-mutation DETECTOR — the primary kill instrument. It must
-  # fail iff the mutation is observable at its target site.
+  # ————— (2) THE SOURCE-INTEGRITY CONFIRMATION (never a kill) —————
+  # The per-mutation detector (scripts/mutation_detectors.sh) MUST FIRE:
+  # the canonical semantic form at the intended site is destroyed — the
+  # mutation is really applied where the catalog says. A detector that
+  # does NOT fire means the mutation is not observable at its site — an
+  # application/drift error, NEVER a kill.
   DETECTOR_NAME="$(detector_name "$id")"
-  DETECTOR_REASON=""
-  if ! DETECTOR_REASON="$(detect_mutation "$id" "$WORK" 2>&1)"; then
-    :
+  if detect_mutation "$id" "$WORK" >/dev/null 2>&1; then
+    echo "== $id — SOURCE-INTEGRITY ERROR: the mutation is NOT observable at its target site ($DETECTOR_NAME did not fire — the transformation was a no-op or the site drifted)"
+    ERROR_IDS+=("$id")
+    ERROR_REASON+=("the per-mutation detector did not fire: $DETECTOR_NAME")
+    ERRORS=$((ERRORS + 1))
+    continue
   fi
+  DETECTOR_REASON="$(detect_mutation "$id" "$WORK" 2>&1)"
 
-  # (2) the shared structural suite — invariant script (incl. the G13
-  # detector group), grammar gate, balance gate, manifest parity.
-  INV_LOG="$(mktemp "${TMPDIR:-/tmp}/tg_mut_inv.XXXXXX")"
-  GATE_LOG="$(mktemp "${TMPDIR:-/tmp}/tg_mut_gate.XXXXXX")"
-  BAL_LOG="$(mktemp "${TMPDIR:-/tmp}/tg_mut_bal.XXXXXX")"
-  SUITE_FAILED_PIECES=""
-  if ! (cd "$WORK" && bash scripts/verify_invariants.sh >"$INV_LOG" 2>&1); then
-    SUITE_FAILED_PIECES="verify_invariants.sh"
+  # the tree-wide source-integrity mode of verify_invariants.sh: the
+  # mutation's own G13 assertion must FIRE and every other invariant
+  # (incl. the remaining G13s, the grammar gate, the balance gate, the
+  # manifest/diagnostic parity) must hold.
+  INV_LOG="$LOGS/$id.invariants"
+  GATE_LOG="$LOGS/$id.grammar"
+  BAL_LOG="$LOGS/$id.balance"
+  if ! (cd "$WORK" && bash scripts/verify_invariants.sh --mutation-source-integrity "$id" >"$INV_LOG" 2>&1); then
+    echo "== $id — SOURCE-INTEGRITY ERROR: verify_invariants.sh --mutation-source-integrity $id FAILED (see the log: $(tail -n 1 "$INV_LOG"))"
+    ERROR_IDS+=("$id")
+    ERROR_REASON+=("verify_invariants.sh --mutation-source-integrity $id failed: $(tail -n 1 "$INV_LOG")")
+    ERRORS=$((ERRORS + 1))
+    continue
   fi
   if ! (cd "$WORK" && bash scripts/run_selfhost_grammar_gate.sh >"$GATE_LOG" 2>&1); then
-    SUITE_FAILED_PIECES="${SUITE_FAILED_PIECES:+$SUITE_FAILED_PIECES, }run_selfhost_grammar_gate.sh"
+    echo "== $id — SOURCE-INTEGRITY ERROR: the self-host grammar gate FAILED on the mutated copy"
+    ERROR_IDS+=("$id")
+    ERROR_REASON+=("the self-host grammar gate failed on the mutated copy")
+    ERRORS=$((ERRORS + 1))
+    continue
   fi
-  if ! (cd "$WORK" && balance_gate >"$BAL_LOG" 2>&1); then
-    SUITE_FAILED_PIECES="${SUITE_FAILED_PIECES:+$SUITE_FAILED_PIECES, }check_struct_balance.py"
+  if ! (cd "$WORK" && balance_gate >"$BAL_LOG" 2>&1) \
+     || ! (cd "$WORK" && manifest_parity tests/canary tests/canary/MANIFEST \
+            && manifest_parity tests/canary_neg tests/canary_neg/MANIFEST \
+            && manifest_parity tests/arm64 tests/arm64/MANIFEST \
+            && diagnostic_parity tests/canary_neg/MANIFEST tg_compiler std) >"$BAL_LOG" 2>&1; then
+    echo "== $id — SOURCE-INTEGRITY ERROR: the balance gate or the manifest/diagnostic parity FAILED on the mutated copy"
+    ERROR_IDS+=("$id")
+    ERROR_REASON+=("the balance gate or the manifest/diagnostic parity failed on the mutated copy")
+    ERRORS=$((ERRORS + 1))
+    continue
   fi
-  if ! (cd "$WORK" && manifest_parity tests/canary tests/canary/MANIFEST \
-       && manifest_parity tests/canary_neg tests/canary_neg/MANIFEST \
-       && manifest_parity tests/arm64 tests/arm64/MANIFEST \
-       && diagnostic_parity tests/canary_neg/MANIFEST tg_compiler std) >"$BAL_LOG" 2>&1; then
-    SUITE_FAILED_PIECES="${SUITE_FAILED_PIECES:+$SUITE_FAILED_PIECES, }manifest parity + the canary_neg expected-diagnostic parity"
+  SOURCE_INTEGRITY_OK=$((SOURCE_INTEGRITY_OK + 1))
+  echo "== $id — source-integrity OK: $DETECTOR_NAME fired (the mutation is applied at the intended site); the tree-wide invariants hold"
+
+  # ————— (3)+(4) BUILD + the per-mutation BEHAVIORAL SUITE —————
+  # Without a usable compiler binary the behavioral tier cannot run: the
+  # kill classification is PENDING-UNTIL-BINARY (NOT killed).
+  if [ -z "$BINARY" ]; then
+    PENDING=$((PENDING + 1))
+    PENDING_IDS+=("$id")
+    PENDING_REASON+=("no usable current-grammar compiler binary — the behavioral tier cannot run (PENDING-UNTIL-BINARY, not killed)")
+    echo "== $id — PENDING-UNTIL-BINARY (no usable compiler binary; the behavioral tier cannot run — not killed, not survived)"
+    echo "   $file — $desc"
+    continue
   fi
 
-  SUITE_OK=1
-  if [ -n "$DETECTOR_REASON" ] || [ -n "$SUITE_FAILED_PIECES" ]; then
-    SUITE_OK=0
-  fi
-
-  # (3) the bounded suite — binary tier (only when every structural
-  # piece passed: a mutation that escaped the structural detectors).
-  if [ "$SUITE_OK" -eq 1 ] && [ -n "$BINARY" ]; then
-    TARGET="${TARGET_TRIPLE:-${TG_BOOTSTRAP_TARGET:-aarch64-apple-darwin}}"
-    MUT_BIN="$WORK/build/.mut_stage1"
-    CANARY_LOG="$(mktemp "${TMPDIR:-/tmp}/tg_mut_canary.XXXXXX")"
-    VTEST_LOG="$(mktemp "${TMPDIR:-/tmp}/tg_mut_vtest.XXXXXX")"
-    mkdir -p "$WORK/build/.mut_canaries"
-    if ! (cd "$WORK" && ./build/tg_stage1 compile --strict-resolution tg_compiler/bootstrap_main.tg \
-             -o "$MUT_BIN" --target "$TARGET" >"$CANARY_LOG" 2>&1); then
-      # the kernel could not be compiled from the mutated sources — the
-      # mutation is caught at the compiler's own gate: KILLED.
-      SUITE_OK=0
-      SUITE_FAILED_PIECES="the mutated kernel compile (tg_stage1 compile of tg_compiler/bootstrap_main.tg)"
-    fi
-    if [ "$SUITE_OK" -eq 1 ]; then
-      CANARY_FAILURES=0
-      while IFS= read -r line || [ -n "$line" ]; do
-        case "$line" in
-          \#*|"") continue ;;
-        esac
-        name="${line%.tg}"
-        if ! "$MUT_BIN" compile --mode dev -O2 -o "$WORK/build/.mut_canaries/$name" "$WORK/tests/canary/$line" >>"$CANARY_LOG" 2>&1 \
-           || ! "$WORK/build/.mut_canaries/$name" >>"$CANARY_LOG" 2>&1; then
-          CANARY_FAILURES=$((CANARY_FAILURES + 1))
-        fi
-      done < "$WORK/tests/canary/MANIFEST"
-      if [ "$CANARY_FAILURES" -ne 0 ]; then
-        SUITE_OK=0
-        SUITE_FAILED_PIECES="the canary suite ($CANARY_FAILURES canary failure(s))"
-      fi
-    fi
-    if [ "$SUITE_OK" -eq 1 ]; then
-      if ! "$MUT_BIN" test "$WORK/tests/verifier_projection_tests.tg" >"$VTEST_LOG" 2>&1; then
-        SUITE_OK=0
-        SUITE_FAILED_PIECES="${SUITE_FAILED_PIECES:+$SUITE_FAILED_PIECES, }tests/verifier_projection_tests.tg"
-      fi
-    fi
-    rm -f "$CANARY_LOG" "$VTEST_LOG"
-  fi
-
-  if [ "$SUITE_OK" -eq 0 ]; then
+  # BUILD the mutated kernel with the current-grammar binary: a kernel
+  # that does not compile is caught at the compiler's own build gate —
+  # KILLED-BEHAVIORALLY (the build is part of the protocol).
+  TARGET="${TARGET_TRIPLE:-${TG_BOOTSTRAP_TARGET:-aarch64-apple-darwin}}"
+  MUT_BIN="$WORK/build/.mut_stage1"
+  BUILD_LOG="$LOGS/$id.build"
+  if ! (cd "$WORK" && ./build/tg_stage1 compile --strict-resolution tg_compiler/bootstrap_main.tg \
+           -o "$MUT_BIN" --target "$TARGET" >"$BUILD_LOG" 2>&1); then
     KILLED=$((KILLED + 1))
     KILLED_IDS+=("$id")
-    if [ -n "$DETECTOR_REASON" ]; then
-      KILLED_BY+=("the dedicated detector ($DETECTOR_NAME): $DETECTOR_REASON")
-      echo "== $id — KILLED (the dedicated detector fired)"
-      echo "   detector: $DETECTOR_NAME — $DETECTOR_REASON"
-      if [ -n "$SUITE_FAILED_PIECES" ]; then
-        echo "   also caught by: $SUITE_FAILED_PIECES"
-      fi
-    else
-      KILLED_BY+=("the shared suite: $SUITE_FAILED_PIECES")
-      echo "== $id — KILLED (the shared suite caught it: ${SUITE_FAILED_PIECES})"
-    fi
+    KILLED_BY+=("the BUILD step: the mutated kernel does not compile under the current-grammar binary (the mutation is caught at the compiler's own gate)")
+    echo "== $id — KILLED-BEHAVIORALLY (the BUILD step: the mutated kernel failed to compile under the current-grammar binary)"
     echo "   $file — $desc"
+    continue
+  fi
+
+  # RUN the per-mutation behavioral suite (the mapping table above) under
+  # the mutated compiler. The mutation is KILLED iff a mapped suite FAILS.
+  SUITES="$(behavioral_suites_for "$id")"
+  if [ -z "$SUITES" ]; then
+    echo "== $id — HARNESS ERROR: no behavioral suite mapped for $id"
+    ERROR_IDS+=("$id")
+    ERROR_REASON+=("no behavioral suite mapped for $id")
+    ERRORS=$((ERRORS + 1))
+    continue
+  fi
+  SUITE_LOG="$LOGS/$id.suite"
+  FAILED_SUITES=""
+  for suite in $SUITES; do
+    if ! (cd "$WORK" && run_behavioral_suite "$suite" "$MUT_BIN" >>"$SUITE_LOG" 2>&1); then
+      FAILED_SUITES="${FAILED_SUITES:+$FAILED_SUITES, }$suite"
+    fi
+  done
+
+  if [ -n "$FAILED_SUITES" ]; then
+    KILLED=$((KILLED + 1))
+    KILLED_IDS+=("$id")
+    KILLED_BY+=("the behavioral suite failed under the mutated compiler: $FAILED_SUITES")
+    echo "== $id — KILLED-BEHAVIORALLY (the behavioral suite failed under the mutated compiler: $FAILED_SUITES)"
+    echo "   $file — $desc"
+    if [ -s "$SUITE_LOG" ]; then
+      echo "   behavioral suite log (tail):"
+      tail -n 25 "$SUITE_LOG" | sed 's/^/     /'
+    fi
   else
     SURVIVED=$((SURVIVED + 1))
     SURVIVED_IDS+=("$id")
-    SURVIVED_CLASS+=("$klass")
-    if [ -n "$BINARY" ]; then
-      echo "== $id — SURVIVED (no structural detector fired; the binary tier passed too)"
-    else
-      echo "== $id — SURVIVED (no structural detector fired; no --binary given, so the binary tier did not run)"
-    fi
+    SURVIVED_REASON+=("the mapped behavioral suite(s) passed under the mutated compiler: $SUITES")
+    echo "== $id — SURVIVED (the mapped behavioral suite passed under the mutated compiler: $SUITES) — a non-equivalent survivor is a FINDING"
     echo "   $file — $desc"
+    if [ -s "$SUITE_LOG" ]; then
+      echo "   behavioral suite log (tail):"
+      tail -n 6 "$SUITE_LOG" | sed 's/^/     /'
+    fi
   fi
-  rm -f "$INV_LOG" "$GATE_LOG" "$BAL_LOG"
 done
 
 # ———————————————————————————————————————————————————————————————
-# Step 4 — the report (the honest per-mutation kill-rate table)
+# Step 5 — the report (the honest per-mutation kill table)
 # ———————————————————————————————————————————————————————————————
 {
   echo ""
   echo "======================================================"
-  echo "MUTATION TEST REPORT (bounded harness, per-mutation detectors)"
+  echo "MUTATION TEST REPORT (the semantic protocol: mutate -> build -> behavioral suite)"
   echo "======================================================"
-  echo "tier:            structural (per-mutation detectors + invariant script + grammar gate + balance gate + manifest parity; no ladder run)"
-  echo "mutations run:   $TOTAL"
-  echo "killed:          $KILLED"
-  echo "survived:        $SURVIVED"
-  echo "apply errors:    $ERRORS"
+  if [ -n "$BINARY" ]; then
+    echo "binary tier:      $BINARY (a usable current-grammar compiler — the mutated kernel is built with it)"
+  else
+    echo "binary tier:      NONE — no usable current-grammar compiler binary; every kill is PENDING-UNTIL-BINARY"
+  fi
+  echo "tier:             behavioral — the per-mutation mapped suite runs under the MUTATED compiler;"
+  echo "                  the structural detectors (mutation_detectors.sh + the G13 group of"
+  echo "                  verify_invariants.sh) are SOURCE-INTEGRITY checks only and never"
+  echo "                  classify a kill"
+  echo "mutations run:    $TOTAL"
+  echo "killed behaviorally: $KILLED"
+  echo "survived:         $SURVIVED"
+  echo "pending:          $PENDING"
+  echo "apply errors:     $ERRORS"
   if [ "$TOTAL" -gt 0 ]; then
     KILL_RATE="$(python3 -c "print('%.1f%%' % (100.0 * $KILLED / $TOTAL))")"
-    echo "kill-rate:       $KILL_RATE  ($KILLED/$TOTAL)"
+    echo "kill-rate:        $KILL_RATE  ($KILLED/$TOTAL) — KILLED iff the behavioral suite FAILED under the mutated compiler"
   else
-    echo "kill-rate:       n/a"
+    echo "kill-rate:        n/a"
   fi
   echo ""
-  echo "the per-mutation result table (id | class | detector | result):"
+  echo "the per-mutation behavioral suite mapping (the kill instruments):"
+  echo "  mut-invert-comparison        canary-pos + canary-neg (the canaries' accepted/rejected sets)"
+  echo "  mut-delete-diagnostic        canary-neg (the negative canaries' expected-diagnostic suite)"
+  echo "  mut-consume-to-read          resource-neg (the resource negatives)"
+  echo "  mut-modify-to-read           resource-neg (the resource negatives)"
+  echo "  mut-remove-drop-mark         resource-neg (the resource negatives)"
+  echo "  mut-duplicate-drop           verifier (the verifier tests)"
+  echo "  mut-skip-verifier            verifier (the verifier tests)"
+  echo "  mut-field-offset             layout (the layout tests)"
+  echo "  mut-enum-tag                 enum + layout (the enum tests + the layout engine's enum-offset assertions)"
+  echo "  mut-remove-overflow-check    numeric-gate (the numeric gate)"
+  echo "  mut-branch-target            cfg-oracle (the CFG oracle)"
+  echo "  mut-remove-wake              async-waiter (the async waiter tests)"
+  echo "  mut-remove-atomic-ordering   litmus (the atomic litmus suites)"
+  echo "  mut-equality-to-permissive   conv-neg (the trait-conformance negatives)"
+  echo ""
+  echo "the per-mutation result table (id | class | behavioral suite(s) | result):"
   for entry in "${CATALOG[@]}"; do
     id="${entry%%|*}"
     rest="${entry#*|}"
@@ -602,7 +753,7 @@ done
     result="not-run"
     for i in "${!KILLED_IDS[@]}"; do
       if [ "${KILLED_IDS[$i]}" = "$id" ]; then
-        result="KILLED"
+        result="KILLED-BEHAVIORALLY"
         break
       fi
     done
@@ -614,21 +765,50 @@ done
         fi
       done
     fi
-    printf '  %-28s %-3s %-52s %s\n' "$id" "$klass" "$(detector_name "$id")" "$result"
+    if [ "$result" = "not-run" ]; then
+      for i in "${!PENDING_IDS[@]}"; do
+        if [ "${PENDING_IDS[$i]}" = "$id" ]; then
+          result="PENDING-UNTIL-BINARY"
+          break
+        fi
+      done
+    fi
+    if [ "$result" = "not-run" ]; then
+      for i in "${!ERROR_IDS[@]}"; do
+        if [ "${ERROR_IDS[$i]}" = "$id" ]; then
+          result="ERROR"
+          break
+        fi
+      done
+    fi
+    printf '  %-28s %-3s %-46s %s\n' "$id" "$klass" "$(behavioral_suites_for "$id")" "$result"
   done
   echo ""
   echo "non-equivalent classification: every catalog entry is NE (it"
   echo "changes an observable semantic — accepted/rejected sets, emitted"
-  echo "layout/code, or a wake/ordering arm). An NE survivor is a finding."
+  echo "layout/code, or a wake/ordering arm). An NE survivor is a finding;"
+  echo "an unproven kill (PENDING-UNTIL-BINARY) is not a kill."
   echo "  NE mutations:    $TOTAL"
+  echo "  NE killed:       $KILLED (behaviorally)"
   echo "  NE survivors:    $SURVIVED"
-  if [ "$SURVIVED" -eq 0 ]; then
-    echo "  NE kill-rate:    100.0% ($KILLED/$TOTAL) — every non-equivalent mutation is killed by its detector"
+  echo "  NE pending:      $PENDING"
+  if [ "$SURVIVED" -eq 0 ] && [ "$PENDING" -eq 0 ]; then
+    echo "  NE kill-rate:    100.0% ($KILLED/$TOTAL) — every non-equivalent mutation is KILLED-BEHAVIORALLY (the behavioral suite failed under the mutated compiler)"
   else
-    echo "  NE kill-rate:    $([ "$TOTAL" -gt 0 ] && python3 -c "print('%.1f%%' % (100.0 * ($TOTAL - $SURVIVED) / $TOTAL))") — FINDING: the surviving mutations must gain detectors"
+    echo "  NE kill-rate:    $([ "$TOTAL" -gt 0 ] && python3 -c "print('%.1f%%' % (100.0 * $KILLED / $TOTAL))") — FINDING:"
+    if [ "$SURVIVED" -gt 0 ]; then
+      echo "    the surviving non-equivalent mutation(s) must gain a behavioral detector (the mapped suite passed under the mutated compiler)"
+    fi
+    if [ "$PENDING" -gt 0 ]; then
+      echo "    the pending kills are UNPROVEN: without a usable current-grammar compiler binary the behavioral tier cannot run (PENDING-UNTIL-BINARY is not a kill)"
+    fi
   fi
   echo ""
-  echo "killed (with the killing detector):"
+  echo "source-integrity tier: $SOURCE_INTEGRITY_OK mutation(s) confirmed applied at the intended site"
+  echo "  (the per-mutation detector FIRED and verify_invariants.sh --mutation-source-integrity"
+  echo "  passed — the structural detectors NEVER classify a kill)"
+  echo ""
+  echo "killed behaviorally (with the killing instrument):"
   if [ "$KILLED" -gt 0 ]; then
     idx=0
     for id in "${KILLED_IDS[@]}"; do
@@ -636,17 +816,57 @@ done
       idx=$((idx + 1))
     done
   fi
-  echo "survived (the mutations the suite does NOT catch):"
+  echo "survived (the mutations the behavioral suite does NOT catch — findings):"
   if [ "$SURVIVED" -gt 0 ]; then
     idx=0
     for id in "${SURVIVED_IDS[@]}"; do
-      echo "  $id (class ${SURVIVED_CLASS[$idx]})"
+      echo "  $id — ${SURVIVED_REASON[$idx]}"
       idx=$((idx + 1))
     done
   fi
-  echo "apply errors (the catalog drifted — a real failure):"
+  echo "pending-until-binary (the kills the behavioral tier could not prove):"
+  if [ "$PENDING" -gt 0 ]; then
+    idx=0
+    for id in "${PENDING_IDS[@]}"; do
+      echo "  $id — ${PENDING_REASON[$idx]}"
+      idx=$((idx + 1))
+    done
+  fi
+  echo "apply/source-integrity errors (the catalog drifted — a real failure):"
   if [ "$ERRORS" -gt 0 ]; then
-    for id in "${ERROR_IDS[@]}"; do echo "  $id"; done
+    idx=0
+    for id in "${ERROR_IDS[@]}"; do
+      echo "  $id — ${ERROR_REASON[$idx]}"
+      idx=$((idx + 1))
+    done
+  fi
+  if [ "$GATE" -eq 1 ]; then
+    if [ "$SURVIVED" -eq 0 ] && [ "$PENDING" -eq 0 ] && [ "$ERRORS" -eq 0 ]; then
+      echo ""
+      echo "GATE (--gate): PASS — every non-equivalent mutation is KILLED-BEHAVIORALLY"
+    else
+      echo ""
+      echo "GATE (--gate): FAIL — every non-equivalent mutation must be killed behaviorally;"
+      echo "  a SURVIVED ($SURVIVED) or PENDING-UNTIL-BINARY ($PENDING) non-equivalent mutation"
+      echo "  (or an apply error: $ERRORS) fails the release gate"
+    fi
   fi
   echo "======================================================"
 } > "${OUT:-/dev/stdout}"
+
+# ———————————————————————————————————————————————————————————————
+# Step 6 — the exit status
+# ———————————————————————————————————————————————————————————————
+if [ "$ERRORS" -gt 0 ]; then
+  echo "run_mutation_tests: $ERRORS mutation(s) could not be applied or failed the source-integrity confirmation (the catalog drifted from the sources — a real failure to fix)" >&2
+  exit 1
+fi
+if [ "$GATE" -eq 1 ] && { [ "$SURVIVED" -gt 0 ] || [ "$PENDING" -gt 0 ]; }; then
+  if [ "$PENDING" -gt 0 ] && [ "$SURVIVED" -eq 0 ]; then
+    echo "run_mutation_tests: GATE FAILED — every kill is PENDING-UNTIL-BINARY (no usable current-grammar compiler binary; the behavioral tier cannot run — an unproven non-equivalent kill fails the release gate)" >&2
+  else
+    echo "run_mutation_tests: GATE FAILED — $SURVIVED non-equivalent mutation(s) survived the behavioral suite and/or $PENDING kill(s) are pending-until-binary; every non-equivalent mutation must be killed behaviorally (a surviving non-equivalent mutation fails CI)" >&2
+  fi
+  exit 1
+fi
+exit 0

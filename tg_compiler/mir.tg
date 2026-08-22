@@ -14,7 +14,8 @@ use tg_compiler::token::{Span, span_dummy, parsed_int_to_host, parsed_float_to_h
 use tg_compiler::ast::{
   Program, Crate, Item, ItemKind, FunctionDecl, FnBody, ConstDecl,
   Block, Stmt, StmtKind, Expr, ExprKind, BinOp, UnOp, Pattern, PatternKind, AstPath,
-  Param, AccessConvention, expr_is_place_like, TypeExpr, TypeExprKind
+  Param, AccessConvention, expr_is_place_like, TypeExpr, TypeExprKind,
+  LayoutAttrs, layout_attrs_plain
 }
 use tg_compiler::types::{
   Type, TypeId, AccessEffect, ParamType, FnSignature, LangItems, TypedProgram, LocalBinding,
@@ -156,6 +157,11 @@ struct MirTypeDef
   # deinit plans (the cached per-TypeId plan cannot represent Wrapper[Int]
   # vs Wrapper[File]). The param-name table holds the display names.
   generic_params: Vec[GenericParamId]
+ # the declaration's LAYOUT attributes (@repr(C) / @align(N) / @packed) —
+  # the checker's validated record, copied from the typed table at lowering
+  # (typed_type_layout_attrs); the layout engine reads the attributed
+  # layout rules from this field (the single authority end-to-end).
+  layout: LayoutAttrs
 end
 
 enum MirTypeDefKind
@@ -319,6 +325,23 @@ enum MirStatementKind
   # never in global .data — per-invocation, nesting-safe, race-free.
   MirBudgetConsume(String, Int)              # Consume budget resources
   MirEffectRecord(String, MirOperand)        # Record an effect
+  # The algebraic-effects perform: perform the operation identified by the
+  # SEMANTIC EffectId + the op's declaration index (with the name for
+  # diagnostics) with the payload — a pointer to the caller-frame payload
+  # tuple (the op's parameter types, built by the lowering) — and a pointer
+  # to the caller-frame RESULT slot (the op's return type, zeroed at
+  # allocation). Codegen lowers the statement to the runtime dispatch
+  # __tg_effect_perform(effect_id, op_index, payload_ptr, result_ptr).
+  MirEffectPerform(EffectId, Int, String, MirOperand, MirOperand)
+  # Install/remove a handler frame on the runtime handler stack: the frame
+  # (effect id, op count, the handled-op bitmap, the dispatcher function,
+  # the handler-env pointer) is written into the CALLER's frame slot by
+  # __tg_effect_frame_push / __tg_effect_frame_pop — the direct-style
+  # handler frames (never CPS). The dispatcher name is the MIR-synthesized
+  # handler function the runtime invokes with
+  # (env_ptr, op_index, payload_ptr, result_ptr).
+  MirEffectFrameEnter(EffectId, Int, Int, String, MirOperand)
+  MirEffectFrameExit
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -940,6 +963,21 @@ def duplicate_statement(stmt: MirStatement) -> MirStatement
       kind: MirStatementKind::MirEffectRecord(name.clone(), duplicate_operand(operand)),
       span: duplicate_span(&stmt.span)
     }
+  when MirStatementKind::MirEffectPerform(eid, op_index, op_name, payload_ptr, result_ptr) then
+    MirStatement {
+      kind: MirStatementKind::MirEffectPerform(eid, op_index, op_name.clone(), duplicate_operand(payload_ptr), duplicate_operand(result_ptr)),
+      span: duplicate_span(&stmt.span)
+    }
+  when MirStatementKind::MirEffectFrameEnter(eid, op_count, bitmap, disp_name, env_ptr) then
+    MirStatement {
+      kind: MirStatementKind::MirEffectFrameEnter(eid, op_count, bitmap, disp_name.clone(), duplicate_operand(env_ptr)),
+      span: duplicate_span(&stmt.span)
+    }
+  when MirStatementKind::MirEffectFrameExit then
+    MirStatement {
+      kind: MirStatementKind::MirEffectFrameExit,
+      span: duplicate_span(&stmt.span)
+    }
   end
 end
 
@@ -1308,6 +1346,20 @@ struct MirBuilder
   # Typed closure captures (closure expr node id -> captured local id ->
   # effect): the SEMANTIC capture record — the ONLY capture source.
   closure_captures: Map[Int, Map[Int, AccessEffect]]
+  # The algebraic-effects typed records (the semantic EffectId-keyed op
+  # tables, the typed handle-with handlers per statement node and the
+  # per-handler capture records) — the checker's typed effect channel the
+  # perform/handler lowering reads (the op signature types, the arm op
+  # indices and result types, and the handler env's capture set).
+  typed_effects: Map[Int, TypedEffectDecl]
+  effect_name_index: Map[String, Int]
+  typed_effect_handlers: Map[Int, Vec[TypedHandler]]
+  handler_captures: Map[Int, Vec[Map[Int, AccessEffect]]]
+  # The effect-handler dispatcher functions queued during lowering
+  # (mirroring pending_closures): each handler's arm bodies lower as a
+  # synthesized function (env_ptr, op_index, payload_ptr, result_ptr) that
+  # the runtime invokes from the handler frame.
+  pending_dispatchers: Vec[PendingEffectDispatcher]
   # Semantic local id (type-checker global counter) -> MIR local id. Semantic
   # locals are allocated globally during type checking; MIR locals are
   # per-function (0 = return place). Finalize-plan ids are SEMANTIC ids and
@@ -1414,6 +1466,13 @@ struct MirBuilder
   # record; the field types' Type::Param forms reference exactly these ids).
   typed_type_fields: Map[Int, Vec[(String, Type)]]
   typed_type_params: Map[Int, Vec[GenericParamId]]
+ # the typed program's LAYOUT-ATTRIBUTE table — semantic TypeId -> the
+  # checker's validated declaration attributes (@repr(C) / @align(N) /
+  # @packed). lower_struct_def / lower_enum_def read the declaration's
+  # attributes from HERE (the typed records are the authority — TypeExpr
+  # and the raw item attributes are never interpreted after checking); the
+  # MirTypeDef.layout field the layout engine reads is filled from it.
+  typed_type_layout_attrs: Map[Int, LayoutAttrs]
  # (partial moves — place-level state): the SEMANTIC per-place move
   # registry copied from TypedProgram.place_move_states at lower_program —
   # root semantic local id -> joined field path ("a" / "a.b" — struct and
@@ -1449,6 +1508,33 @@ struct PendingClosure
   # The closure expression's node id — the key of its typed capture record
   # AND its authoritative finalize plan entry ("closure::<node_id>").
   node_id: Int
+end
+
+# A queued effect-handler dispatcher (mirroring PendingClosure): one
+# synthesized function per `handle ... with EFF` handler — the runtime
+# invokes it with (env_ptr, op_index, payload_ptr, result_ptr) from the
+# handler frame. The captures (the union of the arms' free-variable sets,
+# sorted by semantic local id) are read from the env tuple; the arms switch
+# on the op index, unpack the payload, run the arm body and store its value
+# into the result slot.
+struct PendingEffectDispatcher
+  name: String
+  captures: Vec[String]
+  capture_types: Vec[Type]
+  capture_ids: Vec[Int]
+  arms: Vec[PendingEffectDispatcherArm]
+  span: Span
+end
+
+struct PendingEffectDispatcherArm
+  op_index: Int
+  params: Vec[Pattern]
+  param_types: Vec[Type]
+  body: Block
+  ret_type: Type
+  # The synthetic (negative) NodeId key of the arm's resource-check
+  # closure_cleanup record — the per-arm deinit chain's lookup key.
+  cleanup_key: Int
 end
 
 def builder_new() -> MirBuilder
@@ -1503,6 +1589,11 @@ def builder_new() -> MirBuilder
     typed_intrinsics: Map::new(),
     ident_resolutions: Map::new(),
     closure_captures: Map::new(),
+    typed_effects: Map::new(),
+    effect_name_index: Map::new(),
+    typed_effect_handlers: Map::new(),
+    handler_captures: Map::new(),
+    pending_dispatchers: Vec::new(),
     return_edge_blocks: Set::new(),
     semantic_to_mir: Map::new(),
     pattern_binding_resolutions: Map::new(),
@@ -1547,6 +1638,7 @@ def builder_new() -> MirBuilder
     typed_static_types: Map::new(),
     typed_type_fields: Map::new(),
     typed_type_params: Map::new(),
+    typed_type_layout_attrs: Map::new(),
     place_move_states: Map::new(),
     access_effects: Map::new(),
     typed_local_bindings: Map::new(),
@@ -2260,6 +2352,12 @@ def mir_collect_statement_plan_types(inout b: MirBuilder, stmt: MirStatement) ->
     mir_collect_operand_plan_types(b, &contract.condition)
   when MirStatementKind::MirEffectRecord(_, operand) then
     mir_collect_operand_plan_types(b, &operand)
+  when MirStatementKind::MirEffectPerform(_, _, _, payload_ptr, result_ptr) then
+    mir_collect_operand_plan_types(b, &payload_ptr)
+    mir_collect_operand_plan_types(b, &result_ptr)
+  when MirStatementKind::MirEffectFrameEnter(_, _, _, _, env_ptr) then
+    mir_collect_operand_plan_types(b, &env_ptr)
+  when MirStatementKind::MirEffectFrameExit then ()
   when MirStatementKind::MirStorageLive(_) then ()
   when MirStatementKind::MirStorageDead(_) then ()
   when MirStatementKind::MirNop then ()
@@ -2430,13 +2528,16 @@ def deinit_plan_for_type_uncached(inout b: MirBuilder, ty: Type, inout visited: 
     elsif li.result != -1 && tid.id == li.result && args.len() >= 2 then
       DeinitPlan::Result(deinit_plan_for_type(b, &args[0], visited), deinit_plan_for_type(b, &args[1], visited))
     elsif li.slice != -1 && tid.id == li.slice then
-      # Slice[T] — the compiler-scoped VIEW { ptr: Ptr[T], len: UInt }:
-      # owns=false, drop=none. A Slice local needs NO destruction regardless
-      # of the element type (the element's ownership lives in the backing
-      # container the view borrows). The view must not outlive its backing
-      # buffer — the escape constraint is enforced by the safe access model
-      # (the resource checker's IterationPlan projected-access enforcement is
-      # the eventual mechanism).
+      # UnsafeSlice[T] — the RAW view { ptr: Ptr[T], len: UInt } (the
+      # LangItems slice id): owns=false, drop=none. A raw-view local needs
+      # NO destruction regardless of the element type (the element's
+      # ownership lives in the backing container the view borrows). The
+      # raw view must not outlive its backing — its escapes are REJECTED
+      # by the P0-SL channels (the type checker's return/store/capture
+      # gates + the resource checker's live-view registry / IterationPlan
+      # mutation scan — existing machinery, no deferred mechanism). The
+      # SAFE source-spelled Slice (the std-declared shared struct) is NOT
+      # this arm: its Arc field's Drop owns the destruction.
       DeinitPlan::Trivial
     elsif li.array != -1 && tid.id == li.array && args.len() >= 1 then
       DeinitPlan::Array(deinit_plan_for_type(b, &args[0], visited))
@@ -2470,10 +2571,13 @@ def deinit_plan_for_type_uncached(inout b: MirBuilder, ty: Type, inout visited: 
       DeinitPlan::Option(deinit_plan_for_type(b, &args[0], visited))
     elsif plan_named == "Result" && args.len() >= 2 then
       DeinitPlan::Result(deinit_plan_for_type(b, &args[0], visited), deinit_plan_for_type(b, &args[1], visited))
-    elsif plan_named == "Slice" then
-      # Slice[T] — the compiler-scoped VIEW { ptr: Ptr[T], len: UInt }:
+    elsif plan_named == "UnsafeSlice" then
+      # UnsafeSlice[T] — the RAW view { ptr: Ptr[T], len: UInt }:
       # owns=false, drop=none (the id-selected arm above is the primary
-      # path; this is the snapshot-fallback twin).
+      # path; this is the snapshot-fallback twin). The SAFE source-spelled
+      # Slice (the std-declared shared struct) is NOT this arm — its name
+      # falls through to the structural def walk below, whose Arc field
+      # owns the destruction.
       DeinitPlan::Trivial
     elsif plan_named == "Array" && args.len() >= 1 then
       DeinitPlan::Array(deinit_plan_for_type(b, &args[0], visited))
@@ -3963,7 +4067,7 @@ def refine_collection_local_type_from_push(inout b: MirBuilder, recv_place: Plac
     when Option::Some(n) then mir_bare_type_name(&n)
     when Option::None then ""
     end
-    if push_named == "Slice" then
+    if push_named == "UnsafeSlice" then
       Option::Some(Type::Adt(TypeId { id: b.lang_items.slice }, Vec::from([elem_ty.clone()])))
     elsif push_named == "Array" then
       Option::Some(Type::Adt(TypeId { id: b.lang_items.array }, Vec::from([elem_ty.clone()])))
@@ -3979,7 +4083,7 @@ def refine_collection_local_type_from_push(inout b: MirBuilder, recv_place: Plac
       when Option::Some(n) then mir_bare_type_name(&n)
       when Option::None then ""
       end
-      if push_inner_named == "Slice" then
+      if push_inner_named == "UnsafeSlice" then
         Option::Some(Type::RefInternal(Type::Adt(TypeId { id: b.lang_items.slice }, Vec::from([elem_ty.clone()])), mutable))
       elsif push_inner_named == "Array" then
         Option::Some(Type::RefInternal(Type::Adt(TypeId { id: b.lang_items.array }, Vec::from([elem_ty.clone()])), mutable))
@@ -4335,6 +4439,10 @@ def lower_program(program: Program, analyzed: AnalyzedProgram) -> Result[MirProg
   b.ident_resolutions = analyzed.typed.ident_resolutions.clone()
   b.item_defs = analyzed.typed.resolutions.item_defs.clone()
   b.closure_captures = analyzed.typed.closure_captures.clone()
+  b.typed_effects = analyzed.typed.typed_effects.clone()
+  b.effect_name_index = analyzed.typed.effect_name_index.clone()
+  b.typed_effect_handlers = analyzed.typed.typed_effect_handlers.clone()
+  b.handler_captures = analyzed.typed.handler_captures.clone()
   b.pattern_binding_resolutions = analyzed.typed.pattern_binding_resolutions.clone()
   b.param_binding_resolutions = analyzed.typed.param_binding_resolutions.clone()
  # the typed program's Program and resolver
@@ -4359,6 +4467,7 @@ def lower_program(program: Program, analyzed: AnalyzedProgram) -> Result[MirProg
   b.typed_static_types = analyzed.typed.typed_static_types.clone()
   b.typed_type_fields = analyzed.typed.type_fields.clone()
   b.typed_type_params = analyzed.typed.type_params.clone()
+  b.typed_type_layout_attrs = analyzed.typed.type_layout_attrs.clone()
  # (partial moves): the semantic per-place move registry — the frame's
   # per-field states serialized by the checker's pattern-binding sites
   # (types.tg's record_place_moves). The drop sites consult it for the
@@ -5127,7 +5236,7 @@ def lower_program(program: Program, analyzed: AnalyzedProgram) -> Result[MirProg
   end
   var result = MirProgram { functions: functions, statics: statics, types: types, deinit_plans: b.deinit_plans.clone(), dispatch_methods: dispatch_methods, generic_param_names: b.generic_param_names.clone(), drop_glue_instances: b.drop_glue_instances.clone(), drop_glue_fns: b.drop_glue_fns.clone(), method_names_by_def: b.method_names_by_def.clone(), engine_env: b.engine_env.clone() }
   lower_pending_closures(&mut b, &mut result)
-
+  lower_pending_dispatchers(&mut b, &mut result)
  # (plan-key fix): pre-populate the CONCRETE (TypeId, substs)-keyed
   # deinit-plan cache (b.concrete_deinit_plans) from the lowered MIR, then
   # carry it on MirProgram as the authoritative plan table (codegen's drop
@@ -5150,14 +5259,17 @@ def lower_program(program: Program, analyzed: AnalyzedProgram) -> Result[MirProg
   result.drop_glue_fns = b.drop_glue_fns.clone()
   result.drop_glue_instances = b.drop_glue_instances.clone()
 
-  # Slice[T] has NO std stub declaration (it is a registered Opaque builtin),
-  # so no MirTypeDef for its id reaches the MIR type table — the layout
-  # engine and codegen classify the Slice id BY NAME (type_repr's "Slice" arm
-  # → the 16-byte two-field view). Synthesize the MirTypeDef so the name
-  # tables resolve it; the declared fields mirror the view shape
-  # { ptr: Ptr[T] @ 0, len: Int @ 8 } (slice_view_layout). The synthesized
-  # def is never walked for ownership (deinit_plan_for_type's "Slice" arm
-  # returns Trivial before any def lookup).
+  # The RAW view (UnsafeSlice[T]) has NO std stub declaration (it is a
+  # registered Opaque builtin), so no MirTypeDef for its id reaches the MIR
+  # type table — the layout engine and codegen classify the raw id BY NAME
+  # (type_repr's "UnsafeSlice" arm → the 16-byte two-field view).
+  # Synthesize the MirTypeDef so the name tables resolve it; the declared
+  # fields mirror the raw view shape { ptr: Ptr[T] @ 0, len: Int @ 8 }
+  # (slice_view_layout). The synthesized def is never walked for ownership
+  # (deinit_plan_for_type's "UnsafeSlice" arm returns Trivial before any
+  # def lookup). The SAFE source-spelled Slice is the std-declared shared
+  # struct — its real MirTypeDef (the Arc-backed inner field) arrives from
+  # the std and needs no synthesis.
   var slice_def_present = false
   var sd_idx = 0
   while sd_idx < result.types.len() do
@@ -5186,9 +5298,10 @@ def lower_program(program: Program, analyzed: AnalyzedProgram) -> Result[MirProg
       slice_generics.push(slice_t_id)
       result.types.push(MirTypeDef {
         id: TypeId { id: slice_tid },
-        name: "Slice".to_string(),
+        name: "UnsafeSlice".to_string(),
         kind: MirTypeDefKind::Struct(slice_fields),
-        generic_params: slice_generics
+        generic_params: slice_generics,
+        layout: layout_attrs_plain(span_dummy())
       })
     end
   end
@@ -5803,6 +5916,17 @@ def lower_struct_def(inout b: MirBuilder, s: StructDecl) -> MirTypeDef
   when Option::None then b.errors.push("internal error: no typed generic parameters for struct '" + s.name + "' during MIR lowering")
   end
 
+ # the declaration's layout attributes come from the typed table
+  # (typed_type_layout_attrs — the checker's validated @repr(C) /
+  # @align(N) / @packed record; the typed records are the authority —
+  # the AST's item attributes are never interpreted after checking). A
+  # missing entry is an internal error (fail-closed).
+  var s_layout = layout_attrs_plain(s.span)
+  match b.typed_type_layout_attrs.get(tid)
+  when Option::Some(la) then s_layout = la.clone()
+  when Option::None then b.errors.push("internal error: no typed layout-attribute record for struct '" + s.name + "' during MIR lowering")
+  end
+
  # the field types come from the typed table (typed_type_fields — the
   # checker's resolved declaration record; TypeExpr is never interpreted
   # after checking). A missing entry is an internal error (fail-closed).
@@ -5821,7 +5945,8 @@ def lower_struct_def(inout b: MirBuilder, s: StructDecl) -> MirTypeDef
     id: TypeId { id: tid },
     name: s.name,
     kind: MirTypeDefKind::Struct(fields),
-    generic_params: s_generics
+    generic_params: s_generics,
+    layout: s_layout
   }
   b.type_defs.push(td.clone())
   td
@@ -5869,7 +5994,7 @@ def lower_enum_def(inout b: MirBuilder, e: EnumDecl) -> MirTypeDef
       end
     when Option::None then ()
     end
- # the variant payload types come from the typed table
+  # the variant payload types come from the typed table
     # (typed_type_variants — the checker's resolved declaration record;
     # TypeExpr is never interpreted after checking). A missing entry is an
     # internal error (fail-closed).
@@ -5892,11 +6017,22 @@ def lower_enum_def(inout b: MirBuilder, e: EnumDecl) -> MirTypeDef
     disc = disc + 1
     v_index = v_index + 1
   end
+
+ # the declaration's layout attributes come from the typed table
+  # (typed_type_layout_attrs — the checker's validated record). A missing
+  # entry is an internal error (fail-closed).
+  var e_layout = layout_attrs_plain(e.span)
+  match b.typed_type_layout_attrs.get(tid)
+  when Option::Some(la) then e_layout = la.clone()
+  when Option::None then b.errors.push("internal error: no typed layout-attribute record for enum '" + e.name + "' during MIR lowering")
+  end
+
   let td = MirTypeDef {
     id: TypeId { id: tid },
     name: e.name,
     kind: MirTypeDefKind::Enum(variants),
-    generic_params: e_generics
+    generic_params: e_generics,
+    layout: e_layout
   }
   b.type_defs.push(td.clone())
   td
@@ -7992,14 +8128,268 @@ def lower_stmt(inout b: MirBuilder, stmt: Stmt) -> Unit
       return
     when _ then ()
     end
-  elsif kind_name == "StmtTry" || kind_name == "StmtWith" || kind_name == "StmtHandleWith" then
- # REJECTED at the type checker — exceptions are not supported
+  elsif kind_name == "StmtTry" || kind_name == "StmtWith" then
+    # REJECTED at the type checker — exceptions are not supported
     # (no exception runtime in the backend, no Throw/Unwind/Handler edges
     # in the resource CFG). MIR must fail CLOSED here, never silently skip
- # the statement: the pre-lower_stmt fell through this dispatch
-    # and silently ERASED try/with/handle blocks — exactly the class of
+    # the statement: the pre-lower_stmt fell through this dispatch
+    # and silently ERASED try/with blocks — exactly the class of
     # bypass that could skip Drop/defer teardown on an exceptional path.
     b.errors.push("exceptions are not supported — no throwing path may bypass teardown: " + kind_name + " reached MIR lowering")
+  elsif kind_name == "StmtHandleWith" then
+    match stmt.kind
+    when StmtKind::StmtHandleWith(expr, handlers) then
+      lower_effect_handler(b, stmt, &expr, &handlers)
+      return
+    when _ then ()
+    end
+  end
+end
+
+# The frame-slot key of a handler dispatcher's frame in the CALLER's stack
+# frame — the codegen-side FrameInfo offset is reserved by the
+# MirEffectFrameEnter lowering (the runtime writes the frame into the
+# caller's slot; the slot is reclaimed by the caller's epilogue).
+# (effect_handler_synth_key lives in types.tg — the resource checker and
+# the MIR derive the SAME per-arm cleanup key.)
+
+def mir_effect_const(eid: EffectId) -> MirOperand
+  MirOperand {
+    kind: MirOperandKind::MirConstant(MirConstant {
+      kind: MirConstantKind::MirInt(eid.id),
+      ty: Type::Int,
+      instance: Option::None
+    })
+  }
+end
+
+def mir_int_operand(v: Int) -> MirOperand
+  MirOperand {
+    kind: MirOperandKind::MirConstant(MirConstant {
+      kind: MirConstantKind::MirInt(v),
+      ty: Type::Int,
+      instance: Option::None
+    })
+  }
+end
+
+def mir_ptr_operand_of_local(id: MirLocalId) -> MirOperand
+  MirOperand { kind: MirOperandKind::MirCopy(place_local(id)) }
+end
+
+# The perform-call lowering: std::effects::perform(EFFECT.op, args...) —
+# the typed tree's EffectPerform callee (the semantic EffectId + op index
+# + name) is the authority; the op's parameter tuple becomes the payload
+# aggregate, the op's return type becomes the result slot, and the runtime
+# dispatch statement (MirEffectPerform) carries the two frame pointers.
+def lower_effect_perform_call(inout b: MirBuilder, callee_expr: Expr, arg_exprs: Vec[Expr], span: Span, call_node_id: Int) -> MirRvalue
+  var eff_id = EffectId { id: -1 }
+  var op_idx = -1
+  var op_name = ""
+  match typed_call_of(b, call_node_id)
+  when Option::Some(tc) then
+    match tc.callee
+    when TypedCallee::EffectPerform(eid, oi, on) then
+      eff_id = eid
+      op_idx = oi
+      op_name = on
+    when _ then ()
+    end
+  when Option::None then ()
+  end
+  if eff_id.id < 0 || op_idx < 0 then
+    b.errors.push("internal error: effect-perform call without a typed EffectPerform callee identity (node " + call_node_id.to_string() + ")")
+    return MirRvalue { kind: MirRvalueKind::MirMove(operand_unit()) }
+  end
+  var op_sig: Option[TypedEffectOp] = Option::None
+  match b.typed_effects.get(eff_id.id)
+  when Option::Some(decl) then
+    if op_idx < decl.ops.len() then op_sig = Option::Some(decl.ops[op_idx].clone()) end
+  when Option::None then ()
+  end
+  match op_sig
+  when Option::Some(sig) then
+    # The payload tuple: the op's arguments in source order (arg_exprs[1..]
+    # — the op reference is never lowered).
+    var payload_ops = Vec::new()
+    var ai = 1
+    while ai < arg_exprs.len() do
+      payload_ops.push(lower_expr(b, &arg_exprs[ai], span))
+      ai = ai + 1
+    end
+    let payload_tmp = add_temp(b, Type::Tuple(sig.params.clone()), span)
+    push_assign(b, place_local(payload_tmp), MirRvalue {
+      kind: MirRvalueKind::MirAggregate(AggregateKind::Tuple, payload_ops)
+    }, span)
+    let payload_ptr = add_temp(b, Type::Ptr(Type::Unit), span)
+    push_assign(b, place_local(payload_ptr), MirRvalue { kind: MirRvalueKind::MirRef(place_local(payload_tmp)) }, span)
+    # The result slot: the op's return type (the call's typed record is the
+    # fallback authority — they agree by construction).
+    let ret_type = sig.ret.clone()
+    let result_tmp = add_temp(b, ret_type.clone(), span)
+    let result_ptr = add_temp(b, Type::Ptr(Type::Unit), span)
+    push_assign(b, place_local(result_ptr), MirRvalue { kind: MirRvalueKind::MirRef(place_local(result_tmp)) }, span)
+    push_stmt(b, MirStatementKind::MirEffectPerform(eff_id.clone(), op_idx, op_name.clone(), mir_ptr_operand_of_local(payload_ptr), mir_ptr_operand_of_local(result_ptr)), span)
+    MirRvalue { kind: MirRvalueKind::MirMove(MirOperand { kind: MirOperandKind::MirCopy(place_local(result_tmp)) }) }
+  when Option::None then
+    b.errors.push("internal error: effect-perform call for effect id " + eff_id.id.to_string() + " has no typed op signature record (node " + call_node_id.to_string() + ")")
+    MirRvalue { kind: MirRvalueKind::MirMove(operand_unit()) }
+  end
+end
+
+def effect_perform_callee_path_mir(callee_expr: Expr) -> Bool
+  match callee_expr.kind
+  when ExprKind::ExprPath(p) then
+    p.segments.len() == 3 && p.segments[0] == "std" && p.segments[1] == "effects" && p.segments[2] == "perform"
+  when ExprKind::ExprEnumVariant(p, _) then
+    # The operation-call surface's parse shape: the 3-segment module-
+    # qualified path `std::effects::perform(...)` parses as an
+    # ExprEnumVariant (the primary parser consumes the call parens itself)
+    # — the SAME surface the checker recognizes in its ExprEnumVariant
+    # arm. The MIR's ExprEnumVariant lowering (lr_enum_variant) routes it
+    # through this test.
+    p.segments.len() == 3 && p.segments[0] == "std" && p.segments[1] == "effects" && p.segments[2] == "perform"
+  when _ then false
+  end
+end
+
+# The handler lowering of `handle EXPR with EFF { arms } end` — the
+# direct-style handler frames:
+#   1. for each handler (source order — the LAST with is the innermost):
+#      build the handler env (the union of the arms' captured locals, one
+#      tuple), queue the dispatcher function, and emit
+#      MirEffectFrameEnter(effect, op_count, handled_bitmap, dispatcher,
+#      env_ptr) — codegen calls __tg_effect_frame_push with the caller's
+#      frame slot;
+#   2. lower the handled expression;
+#   3. emit MirEffectFrameExit per handler in REVERSE order.
+def lower_effect_handler(inout b: MirBuilder, stmt: Stmt, expr: Expr, handlers: Vec[EffectHandler]) -> Unit
+  let stmt_node_id = stmt.node_id
+  var typed_handlers = Vec::new()
+  match b.typed_effect_handlers.get(stmt_node_id)
+  when Option::Some(th) then typed_handlers = th.clone()
+  when Option::None then
+    b.errors.push("internal error: handle/with statement (node " + stmt_node_id.to_string() + ") has no typed handler record during MIR lowering")
+    return
+  end
+  var cap_records = Vec::new()
+  match b.handler_captures.get(stmt_node_id)
+  when Option::Some(hc) then cap_records = hc.clone()
+  when Option::None then ()
+  end
+  var hi = 0
+  while hi < typed_handlers.len() do
+    let th = typed_handlers[hi]
+    # The handler env: the union of the arms' captures, sorted by semantic
+    # local id (the SAME order discipline as the closure capture tuple).
+    var cap_pairs: Vec[(Int, AccessEffect)] = Vec::new()
+    if hi < cap_records.len() then
+      let caps = cap_records[hi]
+      for (cap_id, cap_effect) in caps do
+        cap_pairs.push((cap_id, cap_effect))
+      end
+    end
+    var csi = 1
+    while csi < cap_pairs.len() do
+      var csj = csi
+      while csj > 0 && cap_pairs[csj].0 < cap_pairs[csj - 1].0 do
+        let tmp = cap_pairs[csj]
+        cap_pairs[csj] = cap_pairs[csj - 1]
+        cap_pairs[csj - 1] = tmp
+        csj = csj - 1
+      end
+      csi = csi + 1
+    end
+    var captures = Vec::new()
+    var capture_types = Vec::new()
+    var capture_ids = Vec::new()
+    var capture_ops = Vec::new()
+    for (cap_id, cap_effect) in cap_pairs do
+      match b.semantic_to_mir.get(cap_id)
+      when Option::Some(mid) then
+        match lookup_local_id(b, MirLocalId { id: mid })
+        when Option::Some(ml) then
+          captures.push(ml.name.clone())
+          capture_types.push(ml.ty.clone())
+          capture_ids.push(cap_id)
+          match cap_effect
+          when AccessEffect::Consume then
+            capture_ops.push(MirOperand { kind: MirOperandKind::MirConsume(place_local(MirLocalId { id: mid })) })
+          when _ then
+            capture_ops.push(MirOperand { kind: MirOperandKind::MirCopy(place_local(MirLocalId { id: mid })) })
+          end
+        when Option::None then
+          b.errors.push("internal error: handler capture MIR local _" + mid.to_string() + " missing")
+        end
+      when Option::None then
+        b.errors.push("internal error: handler capture semantic local _" + cap_id.to_string() + " has no MIR local")
+      end
+    end
+    let env_tmp = add_temp(b, Type::Tuple(capture_types.clone()), span_dummy())
+    push_assign(b, place_local(env_tmp), MirRvalue { kind: MirRvalueKind::MirAggregate(AggregateKind::Tuple, capture_ops) }, stmt.span)
+    let env_ptr = add_temp(b, Type::Ptr(Type::Unit), span_dummy())
+    push_assign(b, place_local(env_ptr), MirRvalue { kind: MirRvalueKind::MirRef(place_local(env_tmp)) }, stmt.span)
+    # The handled-op bitmap and the dispatcher's arm records.
+    var bitmap = 0
+    var arms = Vec::new()
+    var aj = 0
+    while aj < th.arms.len() do
+      let arm = th.arms[aj]
+      if arm.op_index >= 0 && arm.op_index < 64 then
+        bitmap = bitmap | (1 << arm.op_index)
+      end
+      var param_types = Vec::new()
+      match b.typed_effects.get(th.effect.id)
+      when Option::Some(decl) then
+        if arm.op_index >= 0 && arm.op_index < decl.ops.len() then
+          param_types = decl.ops[arm.op_index].params.clone()
+        end
+      when Option::None then ()
+      end
+      arms.push(PendingEffectDispatcherArm {
+        op_index: arm.op_index,
+        params: Vec::new(),
+        param_types: param_types,
+        body: Block { stmts: Vec::new(), span: stmt.span },
+        ret_type: arm.ret_type.clone(),
+        cleanup_key: effect_handler_synth_key(stmt_node_id, hi, aj)
+      })
+      aj = aj + 1
+    end
+    # The dispatcher's arm source bodies and parameter patterns come from
+    # the SOURCE handlers (the typed record carries the op indices and
+    # result types; the source arms carry the bodies and patterns).
+    if hi < handlers.len() then
+      var saj = 0
+      while saj < arms.len() && saj < handlers[hi].arms.len() do
+        arms[saj].body = handlers[hi].arms[saj].body.clone()
+        arms[saj].params = handlers[hi].arms[saj].params.clone()
+        saj = saj + 1
+      end
+    end
+    let dispatcher_name = "_effect_dispatcher" + b.temp_counter.to_string()
+    b.temp_counter = b.temp_counter + 1
+    b.pending_dispatchers.push(PendingEffectDispatcher {
+      name: dispatcher_name.clone(),
+      captures: captures,
+      capture_types: capture_types,
+      capture_ids: capture_ids,
+      arms: arms,
+      span: stmt.span
+    })
+    push_stmt(b, MirStatementKind::MirEffectFrameEnter(th.effect.clone(), th.arms.len(), bitmap, dispatcher_name.clone(), mir_ptr_operand_of_local(env_ptr)), stmt.span)
+    hi = hi + 1
+  end
+  # The handled expression runs with every handler frame installed.
+  match lower_expr_to_rvalue(b, &expr, stmt.span)
+  when Result::Ok(_) then ()
+  when Result::Err(e) then b.errors.push(e)
+  end
+  # The frames pop in REVERSE order (the LAST with is the innermost).
+  var pi = typed_handlers.len()
+  while pi > 0 do
+    pi = pi - 1
+    push_stmt(b, MirStatementKind::MirEffectFrameExit, stmt.span)
   end
 end
 
@@ -8489,6 +8879,7 @@ def mir_call_instance(b: MirBuilder, call_node_id: Int) -> Option[InstanceId]
     match tc.callee
     when TypedCallee::Def(cid) then did = Option::Some(cid.def)
     when TypedCallee::Closure then ()
+    when TypedCallee::EffectPerform(_, _, _) then ()
     end
   when Option::None then
     match b.call_def_ids.get(call_node_id)
@@ -8559,6 +8950,14 @@ end
 
 def lr_call(inout b: MirBuilder, callee_expr: Expr, arg_exprs: Vec[Expr], span: Span, call_node_id: Int) -> MirRvalue
   let callee_kind = expr_kind_name(&callee_expr.kind)
+  # The operation-call surface: a std::effects::perform(EFFECT.op, ...)
+  # call lowers to the MirEffectPerform runtime dispatch (the typed
+  # EffectPerform callee identity carries the semantic EffectId + the op's
+  # declaration index + name; the payload args pack into the op's parameter
+  # tuple and the result flows back through the result slot).
+  if effect_perform_callee_path_mir(&callee_expr) then
+    return lower_effect_perform_call(b, &callee_expr, &arg_exprs, span, call_node_id)
+  end
   if callee_kind == "ExprPath" then
     let callee_path = path_in_expr(callee_expr)
     if is_vec_like_from_path(&callee_path) && arg_exprs.len() == 1 then
@@ -8888,6 +9287,17 @@ def lr_enum_record_construct(inout b: MirBuilder, path: AstPath, fields: Vec[(St
 end
 
 def lr_enum_variant(inout b: MirBuilder, path: AstPath, args: Vec[Expr], span: Span, node_id: Int) -> Result[MirRvalue, String]
+  # The operation-call surface: `std::effects::perform(EFFECT.op, ...)`
+  # parses as an ExprEnumVariant (the 3-segment module-qualified call
+  # path) — route it through the MirEffectPerform runtime dispatch (the
+  # typed EffectPerform callee identity carries the semantic EffectId +
+  # the op's declaration index + name; the payload args pack into the op's
+  # parameter tuple), NEVER a static-path call to the resolution-seed
+  # function in std/effects.tg.
+  let perform_callee_synth = Expr { kind: ExprKind::ExprEnumVariant(path.clone(), args.clone()), span: span, node_id: 0 }
+  if effect_perform_callee_path_mir(&perform_callee_synth) then
+    return Result::Ok(lower_effect_perform_call(b, &perform_callee_synth, &args, span, node_id))
+  end
   if is_registered_enum_path(b, path) then
     return lr_enum_construct(b, path, args, span, node_id)
   end
@@ -9889,7 +10299,11 @@ def lower_expr_to_rvalue(inout b: MirBuilder, expr: Expr, span: Span) -> Result[
         when Option::Some(n) then mir_bare_type_name(&n)
         when Option::None then ""
         end
-        if method_named == "Slice" || method_named == "Array" then
+        # The RAW view (UnsafeSlice) mangles its methods to the Vec__ runtime
+        # surface like the heap vector; the SAFE source-spelled Slice is the
+        # std-declared shared struct and falls to the name-based resolution
+        # below (its compiled std methods: Slice__len, Slice__get, ...).
+        if method_named == "UnsafeSlice" || method_named == "Array" then
           resolved_method = "Vec__" + normalized_method_name.clone()
         elsif method_named == "Option" then
           resolved_method = "Option__" + normalized_method_name.clone()
@@ -11092,7 +11506,17 @@ def mir_project_index_type(b: MirBuilder, ty: Type) -> Type
     # chain is gone; HashMap/HashSet are not registered types — a user
     # type with those names must NOT project as the builtin hash map).
     let li = b.lang_items
+    # The RAW view (UnsafeSlice — the LangItems slice id) projects its
+    # element via the Adt args; the SAFE source-spelled Slice (the
+    # std-declared shared struct) does the same — its index lowers to
+    # ProjIndex, and codegen reads through the Arc deref into the pinned
+    # backing.
     if (li.slice != -1 && tid.id == li.slice) && !args.is_empty() then
+      args[0].clone()
+    elsif (match b.typed_type_names.get(tid.id)
+           when Option::Some(n) then mir_bare_type_name(&n) == "Slice"
+           when Option::None then false
+           end) && !args.is_empty() then
       args[0].clone()
     elsif (li.box_ != -1 && tid.id == li.box_) && !args.is_empty() then
       mir_project_index_type(b, &args[0])
@@ -11517,6 +11941,255 @@ def lower_pending_closures(inout b: MirBuilder, inout program: MirProgram) -> Un
     b.blocks = saved_block_map
   end
   end  # while pending_closures
+end
+
+# The effect-handler dispatcher lowering (the mirror of
+# lower_pending_closures): each queued handler becomes a synthesized
+# function
+#   dispatcher(env_ptr, op_index, payload_ptr, result_ptr) -> Unit
+# that the runtime invokes from the handler frame:
+#   1. the capture locals load from the env tuple (deref + tuple index);
+#   2. a switch on op_index branches to the matching arm block (the
+#      frame's handled-bitmap guarantees only handled ops reach the
+#      dispatcher — the default is a defensive abort);
+#   3. each arm block casts the payload/result pointers to the op's typed
+#      forms, unpacks the payload into the arm's parameter locals, lowers
+#      the arm body, stores the arm's value into the result slot, runs the
+#      arm's per-arm deinit chain (its resource-check cleanup record keyed
+#      by the synthetic negative NodeId) and joins the done block.
+def lower_pending_dispatchers(inout b: MirBuilder, inout program: MirProgram) -> Unit
+  while b.pending_dispatchers.len() > 0 do
+  let dispatchers = b.pending_dispatchers.clone()
+  b.pending_dispatchers = Vec::new()
+
+  for disp in dispatchers do
+    let saved_fn = b.current_fn.clone()
+    let saved_block = b.current_block.clone()
+    let saved_locals = b.local_counter
+    let saved_blocks = b.block_counter
+    let saved_vars = b.var_map.clone()
+    let saved_block_map = duplicate_blocks(&b.blocks)
+
+    start_function(b, disp.name.clone(), Type::Unit, disp.span)
+    b.current_fn_key = "effect_dispatcher::" + disp.name.clone()
+    b.current_callable = Option::None
+    b.current_closure_node = Option::None
+
+    # The dispatcher ABI: (env_ptr, op_index, payload_ptr, result_ptr) —
+    # the runtime passes the four words from the handler frame.
+    let env_ptr_p = add_param(b, "_env_ptr", Type::Ptr(Type::Unit), disp.span)
+    let op_index_p = add_param(b, "_op_index", Type::Int, disp.span)
+    let payload_ptr_p = add_param(b, "_payload_ptr", Type::Ptr(Type::Unit), disp.span)
+    let result_ptr_p = add_param(b, "_result_ptr", Type::Ptr(Type::Unit), disp.span)
+
+    # 1. The capture locals: the env tuple's elements (the checker's
+    #    capture record is the only capture source; the ORDER is the
+    #    sorted semantic-local-id order the env construction used). The
+    #    created locals are collected (cap_local_ids) so the done block
+    #    can WRITE THEM BACK into the frame's env tuple — the bounded
+    #    row's state-like persistence: an arm's mutations of a captured
+    #    value survive the return, and the NEXT perform dispatched to the
+    #    same handler frame reads the updated value (the env tuple lives
+    #    in the installing function's frame slot for the whole handled
+    #    block). The write-back is sound for every reachable capture:
+    #    the checker's handler-capture gate rejects owning captures, so
+    #    every capture is Copy and no arm can move it.
+    var cap_local_ids: Vec[MirLocalId] = Vec::new()
+    if disp.captures.len() > 0 then
+      let env_ty = Type::Ptr(Type::Tuple(disp.capture_types.clone()))
+      let env_typed = add_temp(b, env_ty.clone(), disp.span)
+      push_assign(b, place_local(env_typed), MirRvalue {
+        kind: MirRvalueKind::MirCast(CastKind::Pointer, MirOperand { kind: MirOperandKind::MirCopy(place_local(env_ptr_p)) }, env_ty)
+      }, disp.span)
+      var ci = 0
+      while ci < disp.captures.len() do
+        let cap_local = add_temp(b, disp.capture_types[ci].clone(), disp.span)
+        cap_local_ids.push(cap_local)
+        var projs = Vec::new()
+        projs.push(Projection::ProjDeref)
+        projs.push(Projection::TupleIndex(ci))
+        let cap_place = Place { local: env_typed, projections: projs }
+        push_assign(b, place_local(cap_local), MirRvalue {
+          kind: MirRvalueKind::MirMove(MirOperand { kind: MirOperandKind::MirCopy(cap_place) })
+        }, disp.span)
+        if ci < disp.capture_ids.len() then
+          b.semantic_to_mir.insert(disp.capture_ids[ci], cap_local.id)
+        end
+        ci = ci + 1
+      end
+    end
+
+    # 2. The op-index switch: each arm block + the defensive abort default.
+    var arm_blocks = Vec::new()
+    var ai = 0
+    while ai < disp.arms.len() do
+      arm_blocks.push(create_block(b))
+      ai = ai + 1
+    end
+    let trap_blk = create_block(b)
+    let done_blk = create_block(b)
+    var targets = Vec::new()
+    ai = 0
+    while ai < disp.arms.len() do
+      targets.push(SwitchTarget { value: disp.arms[ai].op_index, target: arm_blocks[ai] })
+      ai = ai + 1
+    end
+    set_terminator(b, MirTerminatorKind::MirSwitchInt {
+      op: MirOperand { kind: MirOperandKind::MirCopy(place_local(op_index_p)) },
+      targets: targets,
+      default_target: trap_blk
+    }, disp.span)
+    switch_to_block(b, trap_blk)
+    set_terminator(b, MirTerminatorKind::MirAbort, disp.span)
+
+    # 3. The arm blocks.
+    ai = 0
+    while ai < disp.arms.len() do
+      let arm = disp.arms[ai]
+      switch_to_block(b, arm_blocks[ai])
+      # The typed payload/result pointer forms for this arm's op.
+      let payload_ty = Type::Ptr(Type::Tuple(arm.param_types.clone()))
+      let payload_typed = add_temp(b, payload_ty.clone(), disp.span)
+      push_assign(b, place_local(payload_typed), MirRvalue {
+        kind: MirRvalueKind::MirCast(CastKind::Pointer, MirOperand { kind: MirOperandKind::MirCopy(place_local(payload_ptr_p)) }, payload_ty)
+      }, disp.span)
+      let result_ty = Type::Ptr(arm.ret_type.clone())
+      let result_typed = add_temp(b, result_ty.clone(), disp.span)
+      push_assign(b, place_local(result_typed), MirRvalue {
+        kind: MirRvalueKind::MirCast(CastKind::Pointer, MirOperand { kind: MirOperandKind::MirCopy(place_local(result_ptr_p)) }, result_ty)
+      }, disp.span)
+      # The payload unpack: each parameter pattern binds a deref'd tuple
+      # element (the pattern binding resolves through the checker's
+      # pattern_binding_resolutions — the semantic ids map to these
+      # locals, so the arm body's references resolve).
+      var pj = 0
+      while pj < arm.params.len() && pj < arm.param_types.len() do
+        var projs = Vec::new()
+        projs.push(Projection::ProjDeref)
+        projs.push(Projection::TupleIndex(pj))
+        let field_place = Place { local: payload_typed, projections: projs }
+        let field_rvalue = MirRvalue { kind: MirRvalueKind::MirMove(MirOperand { kind: MirOperandKind::MirCopy(field_place) }) }
+        lower_pattern_assignment(b, &arm.params[pj], &field_rvalue, &arm.param_types[pj], disp.span)
+        pj = pj + 1
+      end
+      # The arm body: the source block lowered as a value; the value
+      # stores into the typed result slot.
+      let synth = Expr { kind: ExprKind::ExprBlock(arm.body.clone()), span: disp.span, node_id: 0 }
+      b.current_closure_node = Option::Some(NodeId { id: arm.cleanup_key })
+      var arm_val: Option[MirRvalue] = Option::None
+      match lower_expr_to_rvalue(b, &synth, disp.span)
+      when Result::Ok(rv) then arm_val = Option::Some(rv)
+      when Result::Err(e) then b.errors.push(e)
+      end
+      match arm_val
+      when Option::Some(rv) then
+        var result_projs = Vec::new()
+        result_projs.push(Projection::ProjDeref)
+        let result_place = Place { local: result_typed, projections: result_projs }
+        push_assign(b, result_place, rv, disp.span)
+      when Option::None then ()
+      end
+      # The arm's per-arm deinit chain (the resource-check cleanup record
+      # under the synthetic key — the arm's own locals' drops run exactly
+      # here, at the arm's exit).
+      let arm_tail = mir_current_block_id(b)
+      let arm_consumed_map = compute_definitely_consumed(b, b.blocks.len())
+      let arm_consumed = match arm_consumed_map.get(arm_tail.id)
+      when Option::Some(s) then s.clone()
+      when Option::None then Set::new()
+      end
+      let arm_cands = deinit_candidates(b, arm_consumed)
+      if arm_cands.len() > 0 then
+        emit_effect_arm_deinit_chain(b, arm_tail, arm_cands, done_blk, disp.span)
+      else
+        set_terminator(b, MirTerminatorKind::MirGoto(done_blk), disp.span)
+      end
+      ai = ai + 1
+    end
+
+    switch_to_block(b, done_blk)
+    b.current_closure_node = Option::None
+    # The env write-back: when the handler carries captures, reassemble
+    # the env tuple from the (possibly arm-mutated) capture locals and
+    # store it back through the frame's env pointer — the state-like
+    # persistence across performs within the handled block (the frame's
+    # env tuple is the handler's state cell; every dispatch re-reads it
+    # and every exit re-writes it). No captures: nothing to persist.
+    if cap_local_ids.len() > 0 then
+      var back_ops = Vec::new()
+      var bci = 0
+      while bci < cap_local_ids.len() do
+        back_ops.push(MirOperand { kind: MirOperandKind::MirCopy(place_local(cap_local_ids[bci])) })
+        bci = bci + 1
+      end
+      let env_back = add_temp(b, Type::Tuple(disp.capture_types.clone()), disp.span)
+      push_assign(b, place_local(env_back), MirRvalue {
+        kind: MirRvalueKind::MirAggregate(AggregateKind::Tuple, back_ops)
+      }, disp.span)
+      let env_back_ty = Type::Ptr(Type::Tuple(disp.capture_types.clone()))
+      let env_back_ptr = add_temp(b, env_back_ty.clone(), disp.span)
+      push_assign(b, place_local(env_back_ptr), MirRvalue {
+        kind: MirRvalueKind::MirCast(CastKind::Pointer, MirOperand { kind: MirOperandKind::MirCopy(place_local(env_ptr_p)) }, env_back_ty)
+      }, disp.span)
+      var env_back_projs = Vec::new()
+      env_back_projs.push(Projection::ProjDeref)
+      let env_back_place = Place { local: env_back_ptr, projections: env_back_projs }
+      push_assign(b, env_back_place, MirRvalue {
+        kind: MirRvalueKind::MirMove(MirOperand { kind: MirOperandKind::MirCopy(place_local(env_back)) })
+      }, disp.span)
+    end
+    set_terminator(b, MirTerminatorKind::MirReturn, disp.span)
+
+    # Finish and add to program
+    let disp_fn = finish_function(b)
+    match disp_fn
+    when Option::Some(f) then program.functions.push(f)
+    when Option::None then ()
+    end
+
+    b.current_fn = saved_fn
+    b.current_block = saved_block
+    b.local_counter = saved_locals
+    b.block_counter = saved_blocks
+    b.var_map = saved_vars
+    b.blocks = saved_block_map
+  end
+  end  # while pending_dispatchers
+end
+
+# The per-arm deinit chain (the mirror of emit_deinit_chain_at's glue loop,
+# branching to the arm's join block instead of a fresh return): every
+# candidate place's whole-value destruction is ONE MirDeinit carrying the
+# concrete type's drop-GLUE instance; the chain ends at the arm's done
+# block, and the arm's tail block is routed to the chain head (the arm
+# body's value store already happened in the tail).
+def emit_effect_arm_deinit_chain(inout b: MirBuilder, block_id: MirBlockId, places: Vec[Place], join: MirBlockId, span: Span) -> Unit
+  var succ = join
+  var i = places.len()
+  while i > 0 do
+    i = i - 1
+    let ty = builder_local_typed_ty(b, &places[i].local)
+    let glue_inst = match ty
+    when Option::Some(t) then mir_try_glue_instance(b, &t)
+    when Option::None then Option::None
+    end
+    match glue_inst
+    when Option::Some(inst) then
+      let bk = create_block(b)
+      switch_to_block(b, bk)
+      set_terminator(b, MirTerminatorKind::MirDeinit {
+        place: places[i].clone(),
+        deinit_fn: inst,
+        target: succ,
+        unwind: Option::None
+      }, span)
+      succ = bk
+    when Option::None then ()
+    end
+  end
+  switch_to_block(b, block_id)
+  set_terminator(b, MirTerminatorKind::MirGoto(succ), span)
+  switch_to_block(b, join)
 end
 
 # Helper: lower if expression as rvalue (returns its value). the
@@ -12746,7 +13419,7 @@ def mir_iter_elem_type(b: MirBuilder, ty: Type) -> Type
     when Option::Some(n) then mir_bare_type_name(&n)
     when Option::None then ""
     end
-    if (iet_named == "Slice" || iet_named == "Vec" || iet_named == "Array") && !args.is_empty() then
+    if (iet_named == "UnsafeSlice" || iet_named == "Vec" || iet_named == "Array") && !args.is_empty() then
       args[0].clone()
     else
       Type::Unit
@@ -14168,6 +14841,12 @@ def format_mir_statement(names: Map[Int, String], param_names: Map[Int, String],
     "budget_consume(\"" + resource.clone() + "\", " + amount.to_string() + ")"
   when MirStatementKind::MirEffectRecord(name, op) then
     "effect_record(\"" + name.clone() + "\", " + format_operand(names, param_names, &op) + ")"
+  when MirStatementKind::MirEffectPerform(eid, op_index, op_name, payload_ptr, result_ptr) then
+    "effect_perform(" + eid.id.to_string() + ", " + op_index.to_string() + ", \"" + op_name.clone() + "\", " + format_operand(names, param_names, &payload_ptr) + ", " + format_operand(names, param_names, &result_ptr) + ")"
+  when MirStatementKind::MirEffectFrameEnter(eid, op_count, bitmap, disp_name, env_ptr) then
+    "effect_frame_enter(" + eid.id.to_string() + ", " + op_count.to_string() + ", " + bitmap.to_string() + ", \"" + disp_name.clone() + "\", " + format_operand(names, param_names, &env_ptr) + ")"
+  when MirStatementKind::MirEffectFrameExit then
+    "effect_frame_exit"
   end
 end
 
@@ -14379,7 +15058,7 @@ def format_cast_kind(kind: CastKind) -> String
 end
 
 # the registered builtin compounds (Option/Result/Box/Rc/Map/Set/
-# Slice/Array/Vec) display like their canonical variants — the Adt form
+# UnsafeSlice/Array/Vec) display like their canonical variants — the Adt form
 # renders the builtin syntax via the registered name. The name comes from
 # the program's type table (type id -> name, built from MirProgram.types /
 # the builder's typed_type_names); unknown ids keep the id-based rendering.
@@ -14456,7 +15135,11 @@ def format_mir_type(names: Map[Int, String], param_names: Map[Int, String], ty: 
     elsif nname == "Set" && args.len() >= 1 then
       "Set[" + format_mir_type(names, param_names, &args[0]) + "]"
     elsif nname == "Slice" && args.len() >= 1 then
-      "[" + format_mir_type(names, param_names, &args[0]) + "]"
+      # The SAFE source-spelled Slice (the std-declared shared struct).
+      "Slice[" + format_mir_type(names, param_names, &args[0]) + "]"
+    elsif nname == "UnsafeSlice" && args.len() >= 1 then
+      # The RAW {ptr,len} view — the explicit unsafe/FFI form.
+      "UnsafeSlice[" + format_mir_type(names, param_names, &args[0]) + "]"
     elsif (nname == "Array" || nname == "Vec") && args.len() >= 1 then
       # The heap-vector Adt form carries no count (the fixed-array size
       # lives in the distinct Type::FixedArray variant); render as the
@@ -14988,6 +15671,21 @@ def remap_statement(stmt: MirStatement, local_map: Map[Int, Int]) -> MirStatemen
       kind: MirStatementKind::MirEffectRecord(name.clone(), remap_operand(&operand, local_map)),
       span: stmt.span.clone()
     }
+  when MirStatementKind::MirEffectPerform(eid, op_index, op_name, payload_ptr, result_ptr) then
+    MirStatement {
+      kind: MirStatementKind::MirEffectPerform(eid, op_index, op_name.clone(), remap_operand(&payload_ptr, local_map), remap_operand(&result_ptr, local_map)),
+      span: stmt.span.clone()
+    }
+  when MirStatementKind::MirEffectFrameEnter(eid, op_count, bitmap, disp_name, env_ptr) then
+    MirStatement {
+      kind: MirStatementKind::MirEffectFrameEnter(eid, op_count, bitmap, disp_name.clone(), remap_operand(&env_ptr, local_map)),
+      span: stmt.span.clone()
+    }
+  when MirStatementKind::MirEffectFrameExit then
+    MirStatement {
+      kind: MirStatementKind::MirEffectFrameExit,
+      span: stmt.span.clone()
+    }
   end
 end
 
@@ -15367,6 +16065,11 @@ def propagate_copies(inout f: MirFunction) -> Unit
         substitute_operand_copies(&mut operand, &copy_map)
       when MirStatementKind::MirEffectRecord(_, operand) then
         substitute_operand_copies(&mut operand, &copy_map)
+      when MirStatementKind::MirEffectPerform(_, _, _, payload_ptr, result_ptr) then
+        substitute_operand_copies(&mut payload_ptr, &copy_map)
+        substitute_operand_copies(&mut result_ptr, &copy_map)
+      when MirStatementKind::MirEffectFrameEnter(_, _, _, _, env_ptr) then
+        substitute_operand_copies(&mut env_ptr, &copy_map)
       when _ then ()
       end
     end
@@ -16559,6 +17262,11 @@ def count_operand_uses(stmt: MirStatement, inout counts: Map[Int, Int]) -> Unit
     count_op_uses(&op, counts)
   when MirStatementKind::MirEffectRecord(_, op) then
     count_op_uses(&op, counts)
+  when MirStatementKind::MirEffectPerform(_, _, _, payload_ptr, result_ptr) then
+    count_op_uses(&payload_ptr, counts)
+    count_op_uses(&result_ptr, counts)
+  when MirStatementKind::MirEffectFrameEnter(_, _, _, _, env_ptr) then
+    count_op_uses(&env_ptr, counts)
   when _ then ()
   end
 end
@@ -18255,6 +18963,11 @@ def verify_statement(stmt: MirStatement, valid_locals: Set[Int], types: Vec[MirT
     if !valid_locals.contains(&local_id) then
       errors.push(ctx.clone() + ": StorageDead for undefined local _" + local_id.to_string())
     end
+  when MirStatementKind::MirEffectPerform(_, _, _, payload_ptr, result_ptr) then
+    verify_operand(payload_ptr, valid_locals, ctx, errors)
+    verify_operand(result_ptr, valid_locals, ctx, errors)
+  when MirStatementKind::MirEffectFrameEnter(_, _, _, _, env_ptr) then
+    verify_operand(env_ptr, valid_locals, ctx, errors)
   when _ then ()
   end
 end
@@ -18510,7 +19223,11 @@ def verifier_type_key(type_index: Map[Int, MirTypeDef], ty: Type) -> String
     elsif nname == "Set" && args.len() >= 1 then
       "set:" + verifier_type_key(type_index, &args[0])
     elsif nname == "Slice" && args.len() >= 1 then
+      # The SAFE source-spelled Slice (the std-declared shared struct) keys
+      # as the shared slice; the RAW view keys under its own name.
       "slice:" + verifier_type_key(type_index, &args[0])
+    elsif nname == "UnsafeSlice" && args.len() >= 1 then
+      "unsafe_slice:" + verifier_type_key(type_index, &args[0])
     elsif (nname == "Array" || nname == "Vec") && args.len() >= 1 then
       # The heap-vector Adt form carries no count (the size lives in the
       # distinct FixedArray variant); key by the element alone.
@@ -18700,7 +19417,7 @@ def verifier_elem_type(type_index: Map[Int, MirTypeDef], ty: Type) -> Option[Typ
     when Option::Some(td) then mir_bare_type_name(&td.name)
     when Option::None then ""
     end
-    if (nname == "Array" || nname == "Slice" || nname == "Vec") && !args.is_empty() then
+    if (nname == "Array" || nname == "UnsafeSlice" || nname == "Slice" || nname == "Vec") && !args.is_empty() then
       Option::Some(args[0].clone())
     else
       Option::None

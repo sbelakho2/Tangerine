@@ -1,0 +1,453 @@
+# tests/pkg_resolver_test.tg — the dependency-graph tests: the
+# deterministic SemVer solving, the lockfile integrity, the yanked /
+# pre-release policies, the cycle guard, and the offline reproducibility.
+#
+# The scenarios:
+#   compatible        — the highest version satisfying the requirement is
+#                       selected;
+#   unsatisfiable     — a requirement no offered version satisfies fails
+#                       with NoMatchingVersion;
+#   cycles            — a cyclic graph terminates (the resolver's visited
+#                       guard) and resolves to the full SET with the
+#                       graph EDGES recorded in the lockfile;
+#   pre-releases      — the SemVer §10 policy: a pre-release version is
+#                       NEVER selected unless the requirement itself
+#                       carries a pre-release component;
+#   yanked            — a yanked version is not offered by the registry
+#                       (the HttpRegistry contract: fetch_versions
+#                       filters yanked entries) and is never selected;
+#   checksum          — the lockfile integrity: a registry package
+#                       without a checksum, a duplicate entry, and an
+#                       unsupported schema version are rejected by
+#                       Lockfile.verify;
+#   tampered/traversal— the authenticated tree digest + the archive
+#                       pre-flight are pinned by tests/pkg_hardening_test.tg;
+#   offline           — a lockfile + a fully verified cache install with
+#                       ZERO registry contact (a registry that fails
+#                       every call).
+#
+# Run with: tg run tests/pkg_resolver_test.tg
+
+use std::test::*
+use std::core::{Option, Result, String, Unit, Bool, Int, UInt}
+use std::collections::{Map, Array}
+use std::fs
+use std::semver::{Version, Requirement, Comparator}
+use std::core::List
+use std::compress::tar_gz
+use std::compress::{TarEntry, TarEntryType}
+
+use tg_compiler::pkg_manager::{
+  PkgManager, Resolver, Registry, Package, PackageId, Dependency, LockedPackage,
+  Lockfile, PackageSource, PkgError, hash_package_tree
+}
+
+# ─── the in-memory registry ──────────────────────────────────────────
+
+struct FakeRegistry
+  versions: Map[String, Array[Version]]
+  packages: Map[String, Package]
+  archive: Array[u8]
+end
+
+impl Registry for FakeRegistry
+  def fetch_versions(self: Self, name: str) -> Result[Array[Version], PkgError]
+    match self.versions.get(name)
+    when Option::Some(vs) then Result::Ok(vs.clone())
+    when Option::None then Result::Err(PkgError::RegistryError("unknown package".to_string()))
+    end
+  end
+
+  def fetch_package(self: Self, name: str, version: Version) -> Result[Package, PkgError]
+    let key = name.to_string() + "@" + version.to_string()
+    match self.packages.get(&key)
+    when Option::Some(p) then Result::Ok(p.clone())
+    when Option::None then
+      Result::Err(PkgError::NoMatchingVersion { name: name.to_string(), requirement: version.to_string() })
+    end
+  end
+
+  def download_archive(self: Self, id: PackageId) -> Result[Array[u8], PkgError]
+    Result::Ok(self.archive.clone())
+  end
+end
+
+struct FailingRegistry end
+
+impl Registry for FailingRegistry
+  def fetch_versions(self: Self, name: str) -> Result[Array[Version], PkgError]
+    Result::Err(PkgError::RegistryError("offline: no registry contact".to_string()))
+  end
+
+  def fetch_package(self: Self, name: str, version: Version) -> Result[Package, PkgError]
+    Result::Err(PkgError::RegistryError("offline: no registry contact".to_string()))
+  end
+
+  def download_archive(self: Self, id: PackageId) -> Result[Array[u8], PkgError]
+    Result::Err(PkgError::RegistryError("offline: no registry contact".to_string()))
+  end
+end
+
+# ─── helpers ──────────────────────────────────────────────────────────
+
+def _v(s: str) -> Version
+  Version::parse(s).unwrap_or(Version::new(0, 0, 0))
+end
+
+def _dep(name: String, req: String) -> Dependency
+  Dependency {
+    name: name,
+    version: req.clone(),
+    requirement: Requirement::parse(&req).unwrap_or(Requirement::parse("*").unwrap_or(_any_req())),
+    path: Option::None,
+    git: Option::None
+  }
+end
+
+def _any_req() -> Requirement
+  var groups: List[List[Comparator]] = List.new()
+  groups.push(List.new())
+  Requirement { comparators: groups }
+end
+
+def _pkg(name: String, version: Version, deps: Array[Dependency]) -> Package
+  Package {
+    id: PackageId { name: name, version: version },
+    dependencies: deps,
+    dev_dependencies: Array::new(),
+    features: Map::new(),
+    authors: Array::new(),
+    license: Option::None,
+    repository: Option::None,
+    description: Option::None,
+    keywords: Array::new(),
+    edition: "2024".to_string(),
+    source_dir: "src".to_string(),
+    checksum: Option::Some("checksum".to_string())
+  }
+end
+
+def _demo_versions() -> Array[(String, Array[Version])]
+  var versions = Array::new()
+  versions.push(( "demo".to_string(), Array::from([_v("1.5.0"), _v("1.0.0")]) ))
+  versions
+end
+
+def _demo_packages() -> Array[Package]
+  var pkgs = Array::new()
+  pkgs.push(_pkg("demo".to_string(), _v("1.5.0"), Array::new()))
+  pkgs.push(_pkg("demo".to_string(), _v("1.0.0"), Array::new()))
+  pkgs
+end
+
+def _registry(versions: Array[(String, Array[Version])], packages: Array[Package]) -> FakeRegistry
+  var vmap = Map::new()
+  var pmap = Map::new()
+  for (name, vs) in versions do
+    vmap.insert(name, vs)
+  end
+  for p in packages do
+    let key = p.id.name.clone() + "@" + p.id.version.to_string()
+    pmap.insert(key, p)
+  end
+  FakeRegistry { versions: vmap, packages: pmap, archive: Array::new() }
+end
+
+def _locked_names(entries: Array[LockedPackage]) -> Array[String]
+  var names = Array::new()
+  for e in entries do
+    names.push(e.name.clone() + "@" + e.version.to_string())
+  end
+  names
+end
+
+def _has_entry(entries: Array[LockedPackage], name: String, version: String) -> Bool
+  for e in entries do
+    if e.name == name && e.version.to_string() == version then
+      return true
+    end
+  end
+  false
+end
+
+# ─── compatible: the highest satisfying version wins ─────────────────
+
+@test
+def test_resolver_selects_the_highest_compatible_version() -> Unit
+  var versions = Array::new()
+  versions.push(( "demo".to_string(), Array::from([_v("1.0.0"), _v("1.2.0"), _v("1.5.0")]) ))
+  var pkgs = Array::new()
+  pkgs.push(_pkg("demo".to_string(), _v("1.5.0"), Array::new()))
+  pkgs.push(_pkg("demo".to_string(), _v("1.2.0"), Array::new()))
+  pkgs.push(_pkg("demo".to_string(), _v("1.0.0"), Array::new()))
+  let registry = _registry(versions, pkgs)
+  let mut resolver = Resolver::new(Box::new(registry))
+  var deps = Array::new()
+  deps.push(_dep("demo".to_string(), "^1.0.0".to_string()))
+  let locked = assert_ok(resolver.resolve(&deps))
+  assert_true(_has_entry(&locked, "demo".to_string(), "1.5.0"), "the highest compatible version must win")
+end
+
+# ─── unsatisfiable: no offered version satisfies the requirement ─────
+
+@test
+def test_resolver_fails_unsatisfiable_requirement() -> Unit
+  var versions = Array::new()
+  versions.push(( "demo".to_string(), Array::from([_v("1.0.0")]) ))
+  var pkgs = Array::new()
+  pkgs.push(_pkg("demo".to_string(), _v("1.0.0"), Array::new()))
+  let registry = _registry(versions, pkgs)
+  let mut resolver = Resolver::new(Box::new(registry))
+  var deps = Array::new()
+  deps.push(_dep("demo".to_string(), "^2.0.0".to_string()))
+  match resolver.resolve(&deps)
+  when Result::Err(PkgError::NoMatchingVersion { name, requirement }) then
+    assert_eq(name, "demo")
+    assert_true(requirement.len() > 0)
+  when Result::Err(_) then assert_false(true)
+  when Result::Ok(_) then assert_false(true)
+  end
+end
+
+# ─── cycles: the graph terminates and resolves with edges ────────────
+
+@test
+def test_resolver_terminates_on_cyclic_graph() -> Unit
+  var versions = Array::new()
+  versions.push(( "alpha".to_string(), Array::from([_v("1.0.0")]) ))
+  versions.push(( "beta".to_string(), Array::from([_v("1.0.0")]) ))
+  var pkgs = Array::new()
+  var beta_deps = Array::new()
+  beta_deps.push(_dep("alpha".to_string(), "^1.0.0".to_string()))
+  var alpha_deps = Array::new()
+  alpha_deps.push(_dep("beta".to_string(), "^1.0.0".to_string()))
+  pkgs.push(_pkg("alpha".to_string(), _v("1.0.0"), alpha_deps))
+  pkgs.push(_pkg("beta".to_string(), _v("1.0.0"), beta_deps))
+  let registry = _registry(versions, pkgs)
+  let mut resolver = Resolver::new(Box::new(registry))
+  var deps = Array::new()
+  deps.push(_dep("alpha".to_string(), "^1.0.0".to_string()))
+  let locked = assert_ok(resolver.resolve(&deps))
+  # the full SET resolves (the visited guard cuts the cycle)
+  assert_true(_has_entry(&locked, "alpha".to_string(), "1.0.0"))
+  assert_true(_has_entry(&locked, "beta".to_string(), "1.0.0"))
+end
+
+@test
+def test_resolver_records_the_dependency_graph_edges() -> Unit
+  var versions = Array::new()
+  versions.push(( "alpha".to_string(), Array::from([_v("1.0.0")]) ))
+  versions.push(( "beta".to_string(), Array::from([_v("1.0.0")]) ))
+  var pkgs = Array::new()
+  var alpha_deps = Array::new()
+  alpha_deps.push(_dep("beta".to_string(), "^1.0.0".to_string()))
+  pkgs.push(_pkg("alpha".to_string(), _v("1.0.0"), alpha_deps))
+  pkgs.push(_pkg("beta".to_string(), _v("1.0.0"), Array::new()))
+  let registry = _registry(versions, pkgs)
+  let mut resolver = Resolver::new(Box::new(registry))
+  var deps = Array::new()
+  deps.push(_dep("alpha".to_string(), "^1.0.0".to_string()))
+  let locked = assert_ok(resolver.resolve(&deps))
+  # the alpha lockfile entry carries the beta edge (name@version)
+  var alpha_has_beta_edge = false
+  for e in locked do
+    if e.name == "alpha" then
+      for d in e.dependencies do
+        if d == "beta@1.0.0" then
+          alpha_has_beta_edge = true
+        end
+      end
+    end
+  end
+  assert_true(alpha_has_beta_edge, "the alpha entry must record the beta edge")
+end
+
+# ─── pre-releases: the SemVer §10 selection policy ───────────────────
+
+@test
+def test_pre_release_version_never_selected_without_explicit_opt_in() -> Unit
+  var versions = Array::new()
+  versions.push(( "demo".to_string(), Array::from([_v("2.0.0-beta.1"), _v("1.9.0")]) ))
+  var pkgs = Array::new()
+  pkgs.push(_pkg("demo".to_string(), _v("2.0.0-beta.1"), Array::new()))
+  pkgs.push(_pkg("demo".to_string(), _v("1.9.0"), Array::new()))
+  let registry = _registry(versions, pkgs)
+  let mut resolver = Resolver::new(Box::new(registry))
+  var deps = Array::new()
+  # "^2.0.0" does NOT opt into pre-releases: the beta is skipped and
+  # 1.9.0 does not satisfy the caret — the resolution must FAIL (the
+  # pre-release exclusion is observable, never silently bypassed).
+  deps.push(_dep("demo".to_string(), "^2.0.0".to_string()))
+  match resolver.resolve(&deps)
+  when Result::Err(PkgError::NoMatchingVersion { name, requirement }) then
+    assert_eq(name, "demo")
+  when Result::Err(_) then assert_false(true)
+  when Result::Ok(_) then assert_false(true)
+  end
+end
+
+@test
+def test_pre_release_selected_when_requirement_opts_in() -> Unit
+  var versions = Array::new()
+  versions.push(( "demo".to_string(), Array::from([_v("2.0.0-beta.1"), _v("1.9.0")]) ))
+  var pkgs = Array::new()
+  pkgs.push(_pkg("demo".to_string(), _v("2.0.0-beta.1"), Array::new()))
+  pkgs.push(_pkg("demo".to_string(), _v("1.9.0"), Array::new()))
+  let registry = _registry(versions, pkgs)
+  let mut resolver = Resolver::new(Box::new(registry))
+  var deps = Array::new()
+  # ">=2.0.0-beta.1" carries the explicit pre-release component — the
+  # beta is eligible and is the highest match.
+  deps.push(_dep("demo".to_string(), ">=2.0.0-beta.1".to_string()))
+  let locked = assert_ok(resolver.resolve(&deps))
+  assert_true(_has_entry(&locked, "demo".to_string(), "2.0.0-beta.1"))
+end
+
+# ─── yanked: the registry never offers the yanked version ────────────
+
+@test
+def test_yanked_version_is_never_selected() -> Unit
+  var versions = Array::new()
+  # The registry-side yank contract (HttpRegistry::fetch_versions
+  # filters the yanked entries): 2.0.0 was yanked and is NOT offered.
+  versions.push(( "demo".to_string(), Array::from([_v("1.0.0")]) ))
+  var pkgs = Array::new()
+  pkgs.push(_pkg("demo".to_string(), _v("1.0.0"), Array::new()))
+  let registry = _registry(versions, pkgs)
+  let mut resolver = Resolver::new(Box::new(registry))
+  var deps = Array::new()
+  deps.push(_dep("demo".to_string(), "^2.0.0".to_string()))
+  # the yanked 2.0.0 is not offered — the resolution must fail rather
+  # than resurrect the yanked version.
+  match resolver.resolve(&deps)
+  when Result::Err(PkgError::NoMatchingVersion { name, requirement }) then
+    assert_eq(name, "demo")
+  when Result::Err(_) then assert_false(true)
+  when Result::Ok(_) then assert_false(true)
+  end
+end
+
+# ─── checksum: the lockfile integrity verification ──────────────────
+
+@test
+def test_lockfile_verify_rejects_missing_checksum_duplicates_and_bad_version() -> Unit
+  let checksum = "a".to_string().repeat(64)
+  # a registry package WITHOUT a checksum is rejected.
+  var lf = Lockfile::new()
+  lf.packages.push(LockedPackage {
+    name: "demo".to_string(),
+    version: _v("1.0.0"),
+    source: PackageSource::Registry("https://registry.tangerine-lang.org".to_string()),
+    checksum: "".to_string(),
+    dependencies: Array::new(),
+  })
+  match lf.verify()
+  when Result::Ok(_) then assert_false(true)
+  when Result::Err(_) then ()
+  end
+  # with the checksum the same lockfile verifies.
+  lf.packages[0].checksum = checksum.clone()
+  match lf.verify()
+  when Result::Ok(_) then ()
+  when Result::Err(_) then assert_false(true)
+  end
+  # a duplicate (name, version) entry is rejected.
+  lf.packages.push(LockedPackage {
+    name: "demo".to_string(),
+    version: _v("1.0.0"),
+    source: PackageSource::Registry("https://registry.tangerine-lang.org".to_string()),
+    checksum: checksum.clone(),
+    dependencies: Array::new(),
+  })
+  match lf.verify()
+  when Result::Ok(_) then assert_false(true)
+  when Result::Err(_) then ()
+  end
+  # an unsupported schema version is rejected.
+  lf.version = 99
+  match lf.verify()
+  when Result::Ok(_) then assert_false(true)
+  when Result::Err(_) then ()
+  end
+end
+
+# ─── the deterministic lockfile (offline reproducibility) ────────────
+
+@test
+def test_resolution_is_deterministic_and_round_trips() -> Unit
+  var versions = Array::new()
+  versions.push(( "demo".to_string(), Array::from([_v("1.5.0"), _v("1.0.0")]) ))
+  var pkgs = Array::new()
+  pkgs.push(_pkg("demo".to_string(), _v("1.5.0"), Array::new()))
+  pkgs.push(_pkg("demo".to_string(), _v("1.0.0"), Array::new()))
+  let mut resolver1 = Resolver::new(Box::new(_registry(_demo_versions(), _demo_packages())))
+  var deps = Array::new()
+  deps.push(_dep("demo".to_string(), "^1.0.0".to_string()))
+  let locked1 = assert_ok(resolver1.resolve(&deps))
+  let mut resolver2 = Resolver::new(Box::new(_registry(_demo_versions(), _demo_packages())))
+  let locked2 = assert_ok(resolver2.resolve(&deps))
+  let lf1 = Lockfile { packages: locked1, metadata: Map::new(), version: 1 }
+  let lf2 = Lockfile { packages: locked2, metadata: Map::new(), version: 1 }
+  assert_eq(lf1.serialize(), lf2.serialize())
+  # the serialized lockfile parses back and verifies.
+  let back = assert_ok(Lockfile::parse(lf1.serialize()))
+  match back.verify()
+  when Result::Ok(_) then ()
+  when Result::Err(_) then assert_false(true)
+  end
+end
+
+# ─── offline: a lockfile + a verified cache install with zero contact ─
+
+@test
+def test_offline_install_reuses_the_verified_cache_without_registry() -> Unit
+  let root = "/tmp/tg_pkg_resolver".to_string()
+  let cache = root.clone() + "/.cache"
+  let _ = fs::remove_dir_all(root.clone())
+  let _ = fs::create_dir_all(root.clone() + "/src")
+
+  # the authenticated tree + its archive
+  let content = "let a = 1\n".to_string()
+  let _ = fs::write_file_bytes(root.clone() + "/src/main.tg", content.as_bytes().to_vec())
+  let checksum = hash_package_tree(root.clone() + "/src")
+  var entry = TarEntry::new("main.tg")
+  entry.entry_type = TarEntryType::Regular
+  entry.data = content.as_bytes().to_vec()
+  let archive = assert_ok(tar_gz::compress([entry]))
+
+  let pkg = LockedPackage {
+    name: "demo".to_string(),
+    version: _v("1.0.0"),
+    source: PackageSource::Registry("https://registry.tangerine-lang.org".to_string()),
+    checksum: checksum,
+    dependencies: Array::new(),
+  }
+
+  # the ONLINE phase: the download + extraction + tree verification
+  let online = FakeRegistry { versions: Map::new(), packages: Map::new(), archive: archive }
+  let manager = PkgManager::with_cache(root.clone(), cache.clone())
+  match manager.ensure_cached(pkg.clone(), &*Box::new(online))
+  when Result::Ok(_) then ()
+  when Result::Err(_) then assert_false(true)
+  end
+
+  # the lockfile with the verified checksum
+  var lf = Lockfile::new()
+  lf.packages.push(pkg)
+  match lf.write_to_file(root.clone() + "/Tangerine.lock")
+  when Result::Ok(_) then ()
+  when Result::Err(_) then assert_false(true)
+  end
+
+  # the OFFLINE phase: the same lockfile + cache install through a
+  # registry that FAILS every call — the verified cache must suffice.
+  let failing: Box[dyn Registry] = Box::new(FailingRegistry {})
+  let manager2 = PkgManager::with_cache(root.clone(), cache.clone())
+  match manager2.install(failing)
+  when Result::Ok(_) then ()
+  when Result::Err(e) then
+    assert_false(true)
+  end
+
+  let _ = fs::remove_dir_all(root.clone())
+end

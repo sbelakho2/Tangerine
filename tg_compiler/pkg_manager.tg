@@ -905,10 +905,20 @@ impl Resolver
     when Result::Ok(versions) then versions
     when Result::Err(e) then return Result::Err(e)
     end
-    
+
+    ## THE PRE-RELEASE POLICY (SemVer §10): a pre-release version is only
+    ## eligible when the requirement itself carries a pre-release component
+    ## (an explicit `>=1.0.0-beta.1` opts IN; a bare `^1.0.0` never selects
+    ## a pre-release). The resolver applies the policy at selection time —
+    ## the highest ELIGIBLE version wins.
+    let allow_pre = _requirement_allows_pre_release(&dep.requirement)
+
     ## Find best matching version (highest that satisfies requirement)
     var best: Option[Version] = None
     for v in versions do
+      if !allow_pre && !v.pre.is_empty() then
+        next
+      end
       if dep.requirement.matches(&v) then
         match best
         when Some(b) then
@@ -951,6 +961,30 @@ impl Resolver
       end
     end
 
+    ## THE LOCKFILE GRAPH EDGES: the resolved node's dependency edges —
+    ## the transitive PackageIds in declaration order. The node is
+    ## re-inserted with its edges AFTER the recursion (the cycle guard
+    ## above keeps this terminating — a visited dependency returns
+    ## immediately, so the graph is acyclic by construction here). The
+    ## lockfile the resolver generates therefore carries the FULL
+    ## dependency graph, not a flat name set.
+    match self.resolved.get(&dep.name)
+    when Option::Some(node) then
+      var dep_ids = Array::new()
+      for td in transitive_deps.clone() do
+        match self.resolved.get(&td.name)
+        when Option::Some(child) then
+          dep_ids.push(child.package.id.clone())
+        when Option::None then ()
+        end
+      end
+      self.resolved.insert(dep.name.clone(), ResolvedNode {
+        package: node.package.clone(),
+        deps: dep_ids
+      })
+    when Option::None then ()
+    end
+
     Ok(())
   end
 
@@ -984,6 +1018,36 @@ def _locked_pkg_lt(a: LockedPackage, b: LockedPackage) -> Bool
   else
     a.version < b.version
   end
+end
+
+# THE PRE-RELEASE POLICY (SemVer §10): whether the requirement explicitly
+# carries a pre-release component in ANY of its comparator versions (an
+# `=1.0.0-beta.1`, a `>=1.0.0-rc.2`, a `^1.1.0-alpha` — the explicit
+# opt-in). A requirement without one NEVER selects a pre-release version,
+# no matter how high it sorts.
+def _requirement_allows_pre_release(req: Requirement) -> Bool
+  for group in req.comparators do
+    for comp in group do
+      match comp
+      when Comparator::Exact(v) then
+        if !v.pre.is_empty() then return true end
+      when Comparator::Greater(v) then
+        if !v.pre.is_empty() then return true end
+      when Comparator::GreaterEq(v) then
+        if !v.pre.is_empty() then return true end
+      when Comparator::Less(v) then
+        if !v.pre.is_empty() then return true end
+      when Comparator::LessEq(v) then
+        if !v.pre.is_empty() then return true end
+      when Comparator::Tilde(v) then
+        if !v.pre.is_empty() then return true end
+      when Comparator::Caret(v) then
+        if !v.pre.is_empty() then return true end
+      when _ then ()
+      end
+    end
+  end
+  false
 end
 
 # ─── Build plan ──────────────────────────────────────────────────────
@@ -1049,6 +1113,17 @@ impl PkgManager
       project_root: project_root.to_string(),
       lockfile_path: project_root.to_string() + "/Tangerine.lock",
       cache_dir: std::env::home_dir().unwrap_or("/tmp".to_string()) + "/.tangerine/cache",
+    }
+  end
+
+  ## The explicit-cache constructor (the test hook): a manager whose
+  ## cache lives at the given directory — the cache-hit revalidation
+  ## contract is exercised without touching the real user cache.
+  pub def with_cache(project_root: str, cache_dir: str) -> PkgManager
+    PkgManager {
+      project_root: project_root.to_string(),
+      lockfile_path: project_root.to_string() + "/Tangerine.lock",
+      cache_dir: cache_dir.to_string(),
     }
   end
 
@@ -1184,9 +1259,32 @@ impl PkgManager
     })
   end
 
-  def ensure_cached(self, pkg: LockedPackage, registry: dyn Registry) -> Result[Unit, PkgError]
+  # THE CACHE VERIFICATION CONTRACT (pub — the reviewer's revalidation
+  # fix is a first-class surface): a locked package is cached ONLY when
+  # its authenticated tree digest matches the lockfile checksum — on the
+  # MISS path (after the extraction) AND on the HIT path (the current
+  # contents re-hashed before the reuse).
+  pub def ensure_cached(self, pkg: LockedPackage, registry: dyn Registry) -> Result[Unit, PkgError]
     let cache_path = self.cache_dir.clone() + "/" + pkg.name.clone() + "-" + pkg.version.to_string()
     if fs::path_exists(cache_path.clone()) then
+      # THE CACHE-HIT REVALIDATION (the reviewer's cache-reuse fix): the
+      # old hit returned Ok(()) with NO verification — a tampered or
+      # corrupted cache tree was silently reused. The hit re-hashes the
+      # cache's CURRENT contents (the SHA-256 package-tree digest over
+      # the normalized full tree) and compares it against the lockfile's
+      # checksum BEFORE the reuse: a replaced file, an added file, a
+      # deleted file, a modified byte — any drift is detected and
+      # REJECTED (fail-closed — the package is never reused unverified).
+      if !pkg.checksum.is_empty() then
+        let current = hash_package_tree(cache_path.clone())
+        if current != pkg.checksum then
+          return Err(PkgError::ChecksumMismatch {
+            package: pkg.name.clone(),
+            expected: pkg.checksum.clone(),
+            actual: current,
+          })
+        end
+      end
       return Ok(())
     end
 
@@ -1194,28 +1292,78 @@ impl PkgManager
     let pkg_id = PackageId { name: pkg.name.clone(), version: pkg.version.clone() }
     let archive_bytes = registry.download_archive(&pkg_id)?
 
-    ## Verify SHA-256 checksum if expected checksum is present
-    if !pkg.checksum.is_empty() then
-      mut hasher = Sha256::new()
-      hasher.update(&archive_bytes)
-      let actual_hash = hasher.finalize_hex()
-      if actual_hash != pkg.checksum then
-        return Err(PkgError::ChecksumMismatch {
-          package: pkg.name.clone(),
-          expected: pkg.checksum.clone(),
-          actual: actual_hash,
-        })
-      end
-    end
-
-    ## Create cache directory and extract archive
+    ## Create cache directory and extract archive — the extraction's
+    ## archive-path validation (every entry name + link target) runs
+    ## BEFORE any byte is written.
     fs::create_dir_all(cache_path.clone())
       .map_err(|e| PkgError::IoError(e.to_string()))?
 
     ## Extract tar.gz archive contents into cache_path
     _extract_tar_gz(&archive_bytes, &cache_path)?
 
+    ## THE EXTRACTED-TREE VERIFICATION (the authenticated package-tree
+    ## digest — the lockfile's checksum is the SHA-256 over the
+    ## normalized FULL extracted tree, so the reuse verification (the
+    ## cache-hit revalidation above) and this initial verification use
+    ## the SAME digest function): a package whose extracted tree does not
+    ## match the locked digest is rejected — the registry's bytes are
+    ## never trusted past their authenticated form.
+    if !pkg.checksum.is_empty() then
+      let tree_digest = hash_package_tree(cache_path.clone())
+      if tree_digest != pkg.checksum then
+        return Err(PkgError::ChecksumMismatch {
+          package: pkg.name.clone(),
+          expected: pkg.checksum.clone(),
+          actual: tree_digest,
+        })
+      end
+    end
+
     Ok(())
+  end
+end
+
+# ─── Package tree digest ─────────────────────────────────────────────
+
+# THE AUTHENTICATED PACKAGE-TREE DIGEST (the reviewer's hash_directory
+# fix): the SHA-256 over the NORMALIZED FULL TREE — every file at every
+# depth under the root, walked recursively; each file's RELATIVE path
+# (the normalized forward-slash form, NUL-terminated) and its CONTENT
+# feed the same hasher, the files processed in the canonical sorted
+# order of the relative paths (the git-tree-style path+content
+# chaining). A change ANYWHERE — a byte in a nested file, a rename, an
+# added or removed file — changes the digest. The old hash_directory was
+# an FNV-1a over the TOP LEVEL ONLY (the .tg files, no recursion):
+# nested files and non-.tg files were invisible to it.
+pub def hash_package_tree(root: String) -> String
+  mut hasher = Sha256::new()
+  var rels: Vec[String] = Vec::new()
+  _collect_tree_files(&mut rels, root.clone(), "".to_string())
+  rels.sort()
+  for rel in rels do
+    let path_bytes = (rel.clone() + "\x00").as_bytes()
+    hasher.update(&path_bytes)
+    let abs = root.clone() + "/" + rel.clone()
+    match fs::read_to_vec(abs)
+    when Result::Ok(content) then hasher.update(&content)
+    when Result::Err(_) then ()
+    end
+  end
+  hasher.finalize_hex()
+end
+
+def _collect_tree_files(inout rels: Vec[String], root: String, prefix: String) -> Unit
+  match fs::read_dir(root.clone())
+  when Result::Ok(entries) then
+    for e in entries do
+      let rel = if prefix.is_empty() then e.name.clone() else prefix.clone() + "/" + e.name.clone() end
+      if e.metadata.is_dir then
+        _collect_tree_files(&mut rels, root.clone() + "/" + e.name.clone(), rel)
+      elsif e.metadata.is_file then
+        rels.push(rel)
+      end
+    end
+  when Result::Err(_) then ()
   end
 end
 
@@ -1447,6 +1595,59 @@ def _tar_entry_name_safe(name: String) -> Bool
   true
 end
 
+## THE ARCHIVE PRE-FLIGHT (the archive-path validation BEFORE the tar
+## xzf): walks EVERY tar entry of the DECOMPRESSED archive and checks
+## every entry NAME and every LINK TARGET (the symlink/hardlink entries'
+## linkname field) against the traversal rules — an absolute path, a `..`
+## segment, a backslash escape, or an empty name REJECTS the WHOLE
+## archive before a single byte is written. A symlink entry pointing
+## outside the extraction root is rejected HERE (its target must also
+## satisfy _tar_entry_name_safe — a target of `../x`, `/etc/passwd` or
+## `..\win` escapes the root).
+def _validate_tar_archive(tar_bytes: [u8]) -> Result[Unit, PkgError]
+  var offset = 0
+  while offset + 512 <= tar_bytes.len() do
+    let header = tar_bytes[offset..offset + 512]
+    if _is_zero_block(header) then
+      break
+    end
+    let name = _tar_string(header, 0, 100)
+    if !_tar_entry_name_safe(&name) then
+      return Err(PkgError::ParseError("archive entry escapes the destination: " + name))
+    end
+    let type_flag = header[156]
+    # THE LINK-TARGET VALIDATION: a symlink (type '2') or hardlink
+    # (type '1') whose target leaves the extraction root is rejected —
+    # the extraction would otherwise create a link pointing outside the
+    # destination.
+    if type_flag == '1' as u8 || type_flag == '2' as u8 then
+      let link_name = _tar_string(header, 157, 100)
+      if !_tar_entry_name_safe(&link_name) then
+        return Err(PkgError::ParseError("archive link target escapes the destination: " + name + " -> " + link_name))
+      end
+    end
+    let size = _tar_octal(header, 124, 12)
+    let blocks = (size + 511) / 512
+    offset = offset + 512 + blocks * 512
+  end
+  Ok(())
+end
+
+## The PUBLIC pre-flight entrypoint: decompresses the gzip wrapper and
+## validates EVERY entry name and link target of the ACTUAL archive
+## (the `_tar_entry_name_safe` rules applied to the archive's real
+## contents) WITHOUT extracting anything. The driver's registry download
+## path calls this BEFORE the system `tar xzf` — a malicious package
+## cannot write outside the package directory through the extraction.
+pub def validate_tar_gz_archive(data: [u8]) -> Result[Unit, PkgError]
+  if data.len() < 10 || data[0] != 0x1F || data[1] != 0x8B then
+    return Err(PkgError::ParseError("not a gzip archive".to_string()))
+  end
+  let deflate_data = _skip_gzip_header(data)?
+  let tar_bytes = _inflate(&deflate_data)?
+  _validate_tar_archive(&tar_bytes)
+end
+
 ## Extract a tar.gz archive into the given directory.
 ## Implements minimal tar header parsing (POSIX ustar) and DEFLATE/gzip decompression.
 def _extract_tar_gz(data: Array[u8], dest: str) -> Result[Unit, PkgError]
@@ -1457,6 +1658,11 @@ def _extract_tar_gz(data: Array[u8], dest: str) -> Result[Unit, PkgError]
   end
   let deflate_data = _skip_gzip_header(data)?
   let tar_bytes = _inflate(&deflate_data)?
+
+  ## Step 1.5: THE ARCHIVE PRE-FLIGHT — every entry name AND every link
+  ## target is validated BEFORE any extraction (fail-closed: a single
+  ## unsafe entry rejects the whole archive with nothing written).
+  _validate_tar_archive(&tar_bytes)?
 
   ## Step 2: Parse tar archive
   mut offset = 0
@@ -1471,9 +1677,11 @@ def _extract_tar_gz(data: Array[u8], dest: str) -> Result[Unit, PkgError]
 
     ## Extract file name (offset 0, 100 bytes)
     let name = _tar_string(header, 0, 100)
-    ## PATH/ARCHIVE TRAVERSAL PROTECTION: every entry name must stay
-    ## inside the destination — an absolute path, a `..` segment or a
-    ## backslash escape is rejected before any write (fail-closed).
+    ## PATH/ARCHIVE TRAVERSAL PROTECTION (the extraction's own
+    ## validation — the second line of defense after the pre-flight):
+    ## every entry name must stay inside the destination — an absolute
+    ## path, a `..` segment or a backslash escape is rejected before any
+    ## write (fail-closed).
     if !_tar_entry_name_safe(&name) then
       return Err(PkgError::ParseError("archive entry escapes the destination: " + name))
     end
@@ -1502,6 +1710,14 @@ def _extract_tar_gz(data: Array[u8], dest: str) -> Result[Unit, PkgError]
       let file_data = tar_bytes[offset..offset + size].to_vec()
       fs::write_file_bytes(&file_path, &file_data)
         .map_err(|e| PkgError::IoError(e.to_string()))?
+    elsif type_flag == '1' as u8 || type_flag == '2' as u8 then
+      ## Symlink/hardlink entry: the pre-flight validated the target
+      ## stays inside the root, but the extractor has no link-creation
+      ## primitive — silently skipping would change the package, so the
+      ## entry is REJECTED explicitly (the driver's system-tar path
+      ## extracts safe links; the std extractor never fabricates one).
+      let link_name = _tar_string(header, 157, 100)
+      return Err(PkgError::ParseError("archive link entry cannot be extracted safely: " + name + " -> " + link_name))
     end
 
     ## Advance past file data (rounded up to 512-byte boundary)

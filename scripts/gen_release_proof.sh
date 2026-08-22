@@ -30,14 +30,25 @@
 #     R7  the native runs          — the executed canary/litmus/native
 #                                   suites at the tested SHA
 #
-#   THE HONEST STATE: R5-R7 REQUIRE THE LADDER. They are marked
-#   PENDING-UNTIL-LADDER in the current snapshot and turn PASS only
-#   when the ladder evidence exists — build/release_evidence.json
-#   (written ONLY by scripts/gen_status.sh --release-evidence from the
-#   tested SHA + the run artifacts; a failing release gate writes no
-#   evidence file — that file's role in this proof is exactly the
-#   ladder-evidence check). The artifact is generated from the tested
-#   SHA by the CI `release-proof` job.
+#   THE STRICT EVIDENCE CONTRACT (the P0 fail-closed discipline): R5-R7
+#   REQUIRE THE LADDER. They are marked PENDING-UNTIL-LADDER without the
+#   ladder evidence — build/release_evidence.json (written ONLY by
+#   scripts/gen_status.sh --release-evidence from the tested SHA + the run
+#   artifacts through scripts/release_evidence_schema.sh; a failing
+#   release gate writes no evidence file). The evidence file records the
+#   per-artifact hash + the per-job conclusion + the per-verdict proof
+#   (the equality checks' actual results). This generator VALIDATES the
+#   evidence against the schema — a missing required artifact, an extra
+#   unlisted artifact, a failed/skipped job, a mismatched hash, a missing
+#   fingerprint, an absent equality proof — and a category is PASS only
+#   when its OWN artifacts and conclusions are recorded and proven. The
+#   matching-SHA test alone can NEVER promote a category to PASS:
+#     ABSENT evidence  -> R5/R6/R7 = PENDING-UNTIL-LADDER
+#     STALE evidence   -> R5/R6/R7 = PENDING-UNTIL-LADDER
+#     INVALID evidence -> R5/R6/R7 = FAIL (the evidence exists but fails
+#                          the fail-closed schema validation)
+#     VALID evidence   -> R5/R6/R7 = PASS (each category rests on its own
+#                          recorded artifacts + conclusions)
 #
 #   THE COUNTS (the reviewer's table):
 #     UNTESTED PUBLIC SYMBOLS      — the API manifest's
@@ -63,11 +74,17 @@
 # Exit status: 0 when the proof document was WRITTEN (the verdicts are
 # data inside the document — a RELEASE_100 = FALSE proof is still
 # generated and reported, never suppressed); non-zero when the document
-# could not be produced.
+# could not be produced. With --gate, the exit status is additionally
+# the RELEASE GATE: a written proof with RELEASE_100 = FALSE (any FAIL
+# or PENDING category or nonzero count) exits non-zero — the mere report
+# generation is never the gate.
 #
-# Usage: scripts/gen_release_proof.sh [--sha <sha>] [--evidence <path>] [outfile]
+# Usage: scripts/gen_release_proof.sh [--sha <sha>] [--evidence <path>]
+#                                     [--gate] [outfile]
 #   --sha       the tested SHA (default: `git rev-parse HEAD`)
 #   --evidence  the ladder-evidence path (default: build/release_evidence.json)
+#   --gate      fail (exit nonzero) when the written proof is not
+#               RELEASE_100 = TRUE
 #   outfile     default: build/release_proof.md
 # ———————————————————————————————————————————————————————————————
 set -u
@@ -75,9 +92,15 @@ set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT" || { echo "gen_release_proof: cannot cd to repo root" >&2; exit 2; }
 
+# The release-evidence schema (the fail-closed validator + the per-category
+# verdicts).
+# shellcheck source=scripts/release_evidence_schema.sh
+. "$ROOT/scripts/release_evidence_schema.sh"
+
 SHA="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
 EVIDENCE="$ROOT/build/release_evidence.json"
 OUT="$ROOT/build/release_proof.md"
+GATE=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -89,6 +112,10 @@ while [ $# -gt 0 ]; do
     --evidence)
       shift
       EVIDENCE="${1:-$EVIDENCE}"
+      shift
+      ;;
+    --gate)
+      GATE=1
       shift
       ;;
     *) break ;;
@@ -176,38 +203,37 @@ else
 fi
 
 # ———————————————————————————————————————————————————————————————
-# The ladder evidence (the release_evidence.json's role)
+# The ladder evidence (the release_evidence.json's role) — the STRICT
+# fail-closed evaluation: the proof generator VALIDATES the evidence
+# against the schema (scripts/release_evidence_schema.sh). ABSENT or
+# STALE evidence -> R5/R6/R7 = PENDING-UNTIL-LADDER; INVALID evidence
+# (a missing required artifact, an extra unlisted artifact, a failed/
+# skipped job, a mismatched hash, a missing fingerprint, an absent
+# equality proof) -> R5/R6/R7 = FAIL; VALID evidence -> R5/R6/R7 = PASS
+# (each category rests on its OWN recorded artifacts + conclusions).
+# The matching-SHA test alone can never promote a category to PASS.
 # ———————————————————————————————————————————————————————————————
-EVIDENCE_STATE="ABSENT"
-EVIDENCE_SHA=""
+EVIDENCE_STATE="ABSENT (no ladder evidence: build/release_evidence.json was not found — the ladder has not produced evidence at this SHA)"
+R5_STATE="PENDING-UNTIL-LADDER"
+R6_STATE="PENDING-UNTIL-LADDER"
+R7_STATE="PENDING-UNTIL-LADDER"
+R5_DETAIL="stage2 == stage3 byte-identical at the tested SHA — requires the validated ladder evidence (build/release_evidence.json written by scripts/gen_status.sh --release-evidence from the tested SHA + the run artifacts; the proof generator validates it against the release-evidence schema)"
+R6_DETAIL="stage0 -> stage1 -> stage2 -> stage3 at the tested SHA — requires the validated ladder evidence"
+R7_DETAIL="the executed canary/litmus/native suites at the tested SHA — requires the validated ladder evidence"
 if [ -f "$EVIDENCE" ]; then
-  EVIDENCE_SHA="$(python3 - "$EVIDENCE" <<'PY'
-import json, sys
-try:
-    print(json.load(open(sys.argv[1])).get("tested_sha", ""))
-except Exception:
-    print("")
-PY
-)"
-  if [ "$EVIDENCE_SHA" = "$SHA" ]; then
-    EVIDENCE_STATE="PRESENT (tested_sha = $SHA)"
-    R5_STATE="PASS"
-    R6_STATE="PASS"
-    R7_STATE="PASS"
-  else
-    EVIDENCE_STATE="PRESENT but tested_sha ($EVIDENCE_SHA) != the proof SHA — STALE for this snapshot"
-    R5_STATE="PENDING-UNTIL-LADDER"
-    R6_STATE="PENDING-UNTIL-LADDER"
-    R7_STATE="PENDING-UNTIL-LADDER"
-  fi
-else
-  R5_STATE="PENDING-UNTIL-LADDER"
-  R6_STATE="PENDING-UNTIL-LADDER"
-  R7_STATE="PENDING-UNTIL-LADDER"
+  while IFS= read -r line || [ -n "$line" ]; do
+    name="${line%%|*}"
+    rest="${line#*|}"
+    state="${rest%%|*}"
+    detail="${rest#*|}"
+    case "$name" in
+      EVIDENCE) EVIDENCE_STATE="$detail" ;;
+      R5) R5_STATE="$state"; R5_DETAIL="$detail" ;;
+      R6) R6_STATE="$state"; R6_DETAIL="$detail" ;;
+      R7) R7_STATE="$state"; R7_DETAIL="$detail" ;;
+    esac
+  done < <(release_evidence_rows "$EVIDENCE" "$SHA")
 fi
-R5_DETAIL="stage2 == stage3 byte-identical at the tested SHA — requires the ladder evidence (build/release_evidence.json written by scripts/gen_status.sh --release-evidence from the tested SHA + the run artifacts)"
-R6_DETAIL="stage0 -> stage1 -> stage2 -> stage3 at the tested SHA — requires the ladder evidence"
-R7_DETAIL="the executed canary/litmus/native suites at the tested SHA — requires the ladder evidence"
 
 # ———————————————————————————————————————————————————————————————
 # THE COUNTS (the reviewer's table)
@@ -288,7 +314,8 @@ mkdir -p "$(dirname "$OUT")"
   echo "tested SHA:  $SHA"
   echo "generated:   $(date -u +%Y-%m-%dT%H:%M:%SZ) (UTC)"
   echo "by:          scripts/gen_release_proof.sh"
-  echo "ladder evidence (release_evidence.json): $EVIDENCE_STATE"
+  echo "ladder evidence (release_evidence.json), validated against the"
+  echo "release-evidence schema (scripts/release_evidence_schema.sh): $EVIDENCE_STATE"
   echo ""
   echo "## The release checks (the reviewer's table)"
   echo ""
@@ -314,4 +341,12 @@ mkdir -p "$(dirname "$OUT")"
 } > "$OUT"
 
 echo "wrote $OUT (tested SHA $SHA, RELEASE_100 = $RELEASE_100)"
+
+# The RELEASE GATE (--gate): a written proof that is not RELEASE_100 =
+# TRUE — a FAIL or a PENDING-UNTIL-LADDER category or a nonzero count —
+# FAILS the invocation. The mere report generation is never the gate.
+if [ "$GATE" -eq 1 ] && [ "$RELEASE_100" != "TRUE" ]; then
+  echo "gen_release_proof: GATE FAILED — RELEASE_100 = $RELEASE_100 (any FAIL or PENDING-UNTIL-LADDER category or nonzero count fails the release gate; the report generation alone is never the gate)" >&2
+  exit 1
+fi
 exit 0

@@ -146,6 +146,84 @@ experimental.
 
 ---
 
+## 4.2 The Gate-F release row (the reviewer's item 10)
+
+The release proof's Gate-F row carries the verdicts from the **actual
+compiler execution** over the grammar-production corpus
+(`scripts/check_grammar_f_gate.sh --release` — the release context of
+the grammar-production coverage oracle; the oracle itself is documented
+in [coverage_oracles.md](coverage_oracles.md) §2). The compiler-verdict
+layer is REQUIRED in the release context:
+
+- **The verdicts must come from a USABLE current-grammar stage binary**
+  (the probe discipline: the binary accepts a valid probe, rejects a
+  broken probe, and accepts the current-grammar probe — a STALE binary
+  is never usable). The positives must pass (`check`, or `parse` for the
+  two pipeline-rejected-after-parse productions) and every negative — a
+  production-specific malformation (the wrong arity / the wrong keyword
+  / the missing clause; the generic stray-paren negative is forbidden) —
+  must be rejected with a diagnostic.
+- **Without a usable binary the row reads PENDING-UNTIL-BINARY and the
+  gate FAILS** — the structural pass is never a release pass. The row
+  stays PENDING-UNTIL-BINARY until the ladder produces the binary; the
+  release gate (`gen_release_proof.sh --gate`) treats a PENDING row as
+  not-100. `--report-only` can never mask a failure in the release
+  context.
+
+The release row verdict format emitted by the gate:
+`GATE-F|PASS|...` (every production's four specimens exist, regenerate
+identically, and the actual compiler execution returned the required
+verdicts), `GATE-F|PENDING-UNTIL-BINARY|...` (no usable binary — the
+ladder must produce a current-grammar stage binary), or
+`GATE-F|FAIL|...` (structural or verdict failures).
+
+---
+
+## 4.3 The release-surface drive table (the reviewer's item 5)
+
+The reviewer's item 5: every shipped-surface row that was
+`partial` / `api-only` / `design` / `unsupported` must be **fully
+implemented or explicitly removed from the release surface**. The drive
+closes it with exactly two registry statuses — `implemented` and
+`excluded-from-release` (the registry's stable/experimental split gates
+the platform-only surfaces; the compiler's E100/E106 rejection
+surfaces enforce the excluded rows' absence). Per-row outcome:
+
+| Row | Former status | Drive outcome | What the drive completes / the removal |
+|-----|---------------|---------------|----------------------------------------|
+| `async-await` | partial | **implemented** | the surface IS implemented (executor, wakers, timers, the I/O reactor, deterministic scheduler mode) with the module's `alpha` maturity label; the drive completes the status against the native proof suite (`stdlib-integration` lane) |
+| `progressive-strictness` | partial | **implemented** | the reduced surface IS the completed design — `ModeConfig` carries only mode + the two unconditional enforcements (contracts/capabilities), the former config bits were deleted, not pending; `tests/run_mode_behavior_tests.sh` |
+| `linting` (`tg lint`) | partial | **implemented** | the full linter: nine built-in passes over the parsed AST with the typed semantic data (the LintContext's DefId reachability), the `#[allow]` + `--allow/--deny/--warn` suppression, the human/`--json` output, the `--list` catalog, and the exit codes (0 clean / 1 errors / 2 warnings-only); `tests/lint_suite_test.tg` + `tests/run_lint_tests.sh` |
+| `lsp` (`tg lsp`) | partial | **implemented** | the JSON-RPC 3.17 server over stdio (initialize/didOpen/didChange diagnostics/completion/hover/definition/references/rename/signatureHelp/formatting/shutdown/exit; the negotiated UTF-16/UTF-8/UTF-32 position units); the JSON-RPC client gate `tests/run_lsp_tests.sh` + the position-unit/delegation contract `tests/lsp_delegation_test.tg` |
+| `pkg-manager` (`tg dep` / `tg install`) | partial | **implemented** | the deterministic SemVer solver (pre-release policy + the cycle guard), the lockfile integrity verification, the SHA-256 package-tree verification (miss + cache-hit revalidation), the tar traversal protection, and the offline reproducibility; `tests/pkg_resolver_test.tg` + `tests/pkg_hardening_test.tg` |
+| `algebraic-effects` | api-only | excluded-from-release | declared surface never lowered (trap-stub runtime); the `effects` surface is gated experimental |
+| `cqs` | api-only | **implemented** | the compiler-query-server: the typed-info / symbols / diagnostics queries INVOKED by the canonical pipeline (the driver's check path + the library API), the FULL detector wiring in `run_cqs_analysis`, and the diagnostics' compilation effect where required (the mode matrix's gated failures); `tests/cqs_pipeline_test.tg` |
+| `simd` | api-only | **implemented** | the real vector type (the std Vec2/Vec4/Vec8/Vec16 family — the VECTOR ROW: alignment = the vector width) + the compiler-inline `__intrinsic_simd_<op>_<lane>` family (add/sub/mul/and/or/xor/load/store/shuffle per the lane widths) with the aarch64 NEON + x86 SSE/AVX codegen arms, the ABI's vector cases, and the runtime feature detection (`detect_simd`); `tests/simd/` (behavior vs the scalar reference, layout, ABI probe); the std/simd module's wider surface stays gated experimental |
+| `wasm-target` | api-only | **implemented** | the driver route (`--target wasm32-unknown-unknown` / `wasm32-wasi` → the wasm backend), the type/layout mapping (i32/i64/f32/f64/externref, the linear-memory model), the section emission, and the structural conformance (the emitted binary validated by the independent wasm parser; the wasmtime execution lane when the runtime is installed); `tests/wasm/` + `tests/run_wasm_conformance.sh`; `wasm`/`wasm_js` stay gated experimental |
+| `gpu-platform` | api-only | excluded-from-release | declared gpu*/gfx_gpu/hal surfaces, no backend; gated experimental |
+| `platform-only-surfaces` | api-only | excluded-from-release | android/ios/cocoa/windows/gui surfaces for unserved targets; gated experimental |
+| `kernel-primitives` | api-only | excluded-from-release | declared alpha surface (`std/kernel.tg`); gated experimental |
+| `non-kernel-stdlib-behavior` | api-only | excluded-from-release | the sweep verifies parse-clean only — never a release behavior claim |
+| `packed-align-attributes` | design | excluded-from-release | documented only, no implementation |
+| `real-time-wcet` | design | excluded-from-release | documented only, no implementation |
+| `repl` (`tg repl`) | design | **implemented** | the bounded REPL: every entry compiles AND runs through the driver's real machinery as its own process, with the multi-line buffering, the stateful sessions, the runtime-error state preservation and the `=> <code>` expression results; `tests/repl_contract_test.tg` + the piped-session lane in `tests/run_tool_contract_tests.sh` |
+| `first-class-references` | unsupported | excluded-from-release | the E106 rejection surface IS the exclusion |
+| `legacy-parameter-spellings` | unsupported | excluded-from-release | the E100 rejection surface IS the exclusion |
+| `lifetimes` | unsupported | excluded-from-release | no lifetime tokens exist in the dialect |
+| `ref-patterns` | unsupported | excluded-from-release | the E106 rejection surface IS the exclusion |
+| `inline-assembly` | unsupported | excluded-from-release | no asm directive in token/ast/parser |
+| `no-std` | unsupported | excluded-from-release | no such attribute |
+| `wasi` | unsupported | excluded-from-release | no WASI runtime; platform-only surface gated experimental |
+| `embedded-targets` | unsupported | excluded-from-release | no such targets; `embedded` gated experimental |
+
+The registry's status vocabulary is now exactly
+`implemented | excluded-from-release` (+ the `experimental` marker for
+the gated platform-only surfaces); the feature matrix and the generated
+registry derive from it, and the generator's mechanical checks verify
+every row's evidence before rendering.
+
+---
+
 ## 5. Manifest and Compatibility Matrix Publication
 
 Each release includes a published compatibility matrix:
