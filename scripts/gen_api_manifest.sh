@@ -13,6 +13,18 @@
 # compiler binary) can regenerate the manifest; extraction HEALTH is part
 # of the gate (an unterminated block or an unparsable item header fails).
 #
+# THE PER-SYMBOL LAYER (the coverage oracle #5): scripts/
+# api_manifest_associator.py attributes every public callable to the
+# tests that reference it (tests/**/*.tg, excluding the generated sweep
+# suite) and computes the honest per-symbol uncovered enumeration — the
+# public callables of the behavior-family modules (native/lane,
+# non-experimental) referenced by no test. The associations are embedded
+# per callable (`tests` list) and the uncovered callables are listed
+# per module in gates.uncovered_callables. The tests-added layer for the
+# uncovered callables is the generated sweep suite (tests/api_manifest/,
+# scripts/gen_api_manifest_sweep.py), closed by scripts/
+# check_api_manifest_extractor.sh.
+#
 # The manifest is DETERMINISTIC (no timestamps, no SHA): the CI
 # enumeration gate (tests/run_stdlib_completeness_gate.sh, run first by
 # tests/run_stdlib_e106_sweep.sh) regenerates it and the completeness
@@ -58,11 +70,16 @@ case "${1:-}" in
 esac
 
 EXTRACTOR="$ROOT/scripts/api_manifest_extractor.py"
+ASSOCIATOR="$ROOT/scripts/api_manifest_associator.py"
 CONTRACTS="$ROOT/docs/current/stdlib_contracts.toml"
 STDDIR="$ROOT/std"
 
 if [ ! -f "$EXTRACTOR" ]; then
   echo "gen_api_manifest: missing extractor: $EXTRACTOR" >&2
+  exit 1
+fi
+if [ ! -f "$ASSOCIATOR" ]; then
+  echo "gen_api_manifest: missing associator: $ASSOCIATOR" >&2
   exit 1
 fi
 if [ ! -f "$CONTRACTS" ]; then
@@ -73,7 +90,7 @@ fi
 mkdir -p "$(dirname "$OUT")"
 
 RELEASE_CHECK="$RELEASE_CHECK" ROOT="$ROOT" STDDIR="$STDDIR" \
-  EXTRACTOR="$EXTRACTOR" CONTRACTS="$CONTRACTS" OUT="$OUT" \
+  EXTRACTOR="$EXTRACTOR" ASSOCIATOR="$ASSOCIATOR" CONTRACTS="$CONTRACTS" OUT="$OUT" \
   python3 - <<'PY'
 import json
 import os
@@ -85,6 +102,7 @@ release_check = os.environ.get("RELEASE_CHECK") == "1"
 root = os.environ["ROOT"]
 stddir = os.environ["STDDIR"]
 extractor = os.environ["EXTRACTOR"]
+associator = os.environ["ASSOCIATOR"]
 contracts_path = os.environ["CONTRACTS"]
 out_path = os.environ["OUT"]
 
@@ -136,7 +154,55 @@ for fname in sorted(os.listdir(stddir)):
         continue
     records.append(json.loads(proc.stdout))
 
+# ———————————————————————————————————————————————————————————————
+# The PER-SYMBOL test associations (the NEW coverage oracle): every public
+# callable is attributed to the tests that reference it, and the honest
+# per-symbol uncovered enumeration is computed for the modules with real
+# behavior suites (the native/lane families, non-experimental).
+# ———————————————————————————————————————————————————————————————
+assoc = {}
+assoc_failures = []
+if records:
+    probe = {"modules": records}
+    probe_path = out_path + ".assoc-probe.json"
+    with open(probe_path, "w", encoding="utf-8") as fh:
+        json.dump(probe, fh)
+    proc = subprocess.run(
+        [sys.executable, associator, probe_path, os.path.join(root, "tests")],
+        capture_output=True, text=True)
+    try:
+        os.remove(probe_path)
+    except OSError:
+        pass
+    if proc.returncode != 0:
+        assoc_failures.append(proc.stderr.strip() or "associator failed")
+    else:
+        assoc = json.loads(proc.stdout)
+        # attach the per-callable test lists into the manifest records
+        syms = assoc.get("symbols", {})
+        for rec in records:
+            mod = rec.get("module", "?")
+            mod_syms = syms.get(mod, {})
+            api = rec.get("public_api", {})
+            for key in ("functions", "methods", "constructors"):
+                for item in api.get(key, []):
+                    name = item.get("name", "")
+                    if name in mod_syms:
+                        item["tests"] = mod_syms[name]
+                    else:
+                        item["tests"] = []
+
 findings = {"uncovered_callables": [], "unexercised_error_variants": [], "unexecuted_cfg_targets": []}
+
+# The per-symbol uncovered enumeration (bounded to the behavior families,
+# non-experimental): every public callable of a module with a real suite
+# must be referenced by at least one test.
+for mod, callables in assoc.get("uncovered", {}).items():
+    findings["uncovered_callables"].append({
+        "module": mod,
+        "callables": callables,
+        "rule": "per-symbol: the module's family claims behavior suites, but these public callables are referenced by no test (tests/**/*.tg)",
+    })
 
 for rec in records:
     # the contract association: the module's contract id (its completeness
@@ -188,10 +254,14 @@ manifest = {
     "schema_version": 1,
     "generator": "scripts/gen_api_manifest.sh",
     "extractor": "scripts/api_manifest_extractor.py",
+    "associator": "scripts/api_manifest_associator.py",
     "source": "docs/current/stdlib_contracts.toml + std/*.tg (deterministic — no run identity embedded)",
     "modules": records,
+    "symbol_test_associations": {
+        "stats": assoc.get("stats", {}),
+    },
     "gates": findings,
-    "release_check": "PASS" if release_check and not any(findings.values()) else
+    "release_check": "PASS" if release_check and not any(findings.values()) and not assoc_failures else
                      "FAIL" if release_check else "not-run",
 }
 
@@ -205,6 +275,13 @@ if extraction_failures:
     for f in extraction_failures:
         print("  - " + f, file=sys.stderr)
     sys.exit(1)
+if assoc_failures:
+    print("gen_api_manifest: ASSOCIATOR FAILURES:", file=sys.stderr)
+    for f in assoc_failures:
+        print("  - " + f, file=sys.stderr)
+    sys.exit(1)
+stats = assoc.get("stats", {})
+print("  symbol associations: %(callables)d callables, %(referenced)d referenced, %(uncovered_bounded)d uncovered (bounded)" % stats)
 for kind, items in findings.items():
     print("  findings[%s] = %d" % (kind, len(items)))
 if release_check:

@@ -169,8 +169,81 @@ grep -q "=> 3" "$TMP/repl.out" && pass "repl evaluated 1 + 2 => 3" || fail "repl
 grep -q "Goodbye!" "$TMP/repl.out" && pass "repl :quit exits cleanly" || fail "repl :quit exits cleanly"
 
 echo ""
+echo "--- read-only inputs are never written, never partially modified ---"
+READONLY="$TMP/readonly.tg"
+cp "$HELLO_FILE" "$READONLY"
+chmod 444 "$READONLY"
+"$COMPILER" check "$READONLY" >/dev/null 2>&1; check "tg check read-only input" 0 $?
+"$COMPILER" lint "$READONLY" >/dev/null 2>&1; check "tg lint read-only input" 0 $?
+"$COMPILER" fmt --check "$READONLY" >/dev/null 2>&1; check "tg fmt --check read-only input" 0 $?
+"$COMPILER" doc -o "$TMP/docs_ro" "$READONLY" >/dev/null 2>&1; check "tg doc read-only input" 0 $?
+cmp -s "$HELLO_FILE" "$READONLY" && pass "read-only input byte-identical after check/lint/fmt --check/doc" || fail "read-only input byte-identical after check/lint/fmt --check/doc"
+# The in-place fmt path on a WRITABLE copy leaves the read-only original
+# untouched (a tool that opened the input for writing would have failed
+# on the 444 file or clobbered it).
+WRITABLE="$TMP/writable.tg"
+cp "$HELLO_FILE" "$WRITABLE"
+"$COMPILER" fmt "$WRITABLE" >/dev/null 2>&1; check "tg fmt in-place on writable copy" 0 $?
+cmp -s "$HELLO_FILE" "$READONLY" && pass "read-only original untouched by the in-place fmt of a copy" || fail "read-only original untouched by the in-place fmt of a copy"
+
+echo ""
+echo "--- stdout/stderr separation (diagnostics never leak to stdout) ---"
+BAD_FILE="$TMP/bad_syntax.tg"
+cat > "$BAD_FILE" <<'EOF'
+def main() -> Int
+  let =
+end
+EOF
+"$COMPILER" check "$BAD_FILE" > "$TMP/bad.out" 2> "$TMP/bad.err"
+check "tg check bad file exits nonzero" 1 $?
+if [ -s "$TMP/bad.err" ]; then
+  pass "diagnostics on stderr"
+else
+  fail "diagnostics on stderr (empty stderr)"
+fi
+if [ -s "$TMP/bad.out" ]; then
+  fail "stdout must be empty on the error path (got: $(cat "$TMP/bad.out"))"
+else
+  pass "stdout empty on the error path"
+fi
+"$COMPILER" fmt --check "$BAD_FILE" > "$TMP/badfmt.out" 2> "$TMP/badfmt.err"
+check "tg fmt --check bad file exits nonzero" 1 $?
+[ -s "$TMP/badfmt.err" ] && pass "fmt diagnostics on stderr" || fail "fmt diagnostics on stderr"
+[ -s "$TMP/badfmt.out" ] && fail "fmt stdout must be empty on the error path" || pass "fmt stdout empty on the error path"
+# The success path: --help writes stdout with empty stderr.
+"$COMPILER" --help > "$TMP/help.out" 2> "$TMP/help.err"
+check "tg --help exits 0" 0 $?
+[ -s "$TMP/help.out" ] && pass "--help writes stdout" || fail "--help writes stdout"
+[ -s "$TMP/help.err" ] && fail "--help stderr must be empty" || pass "--help stderr empty"
+
+echo ""
+echo "--- exit-status forwarding: the signal termination (128+sig) ---"
+PANIC_FILE="$TMP/panic_signal.tg"
+cat > "$PANIC_FILE" <<'EOF'
+def main() -> Int
+  panic("the abort-only panic state")
+  0
+end
+EOF
+"$COMPILER" run "$PANIC_FILE" >/dev/null 2>&1
+check "tg run panicking program exits 134 (SIGABRT, the abort-only panic state)" 134 $?
+"$COMPILER" run "$PANIC_FILE" >/dev/null 2>&1
+check "tg run panicking program 134 (again — the signal status is stable)" 134 $?
+
+echo ""
+echo "--- the deterministic repeat extends to doc generation ---"
+"$COMPILER" doc -o "$TMP/doc1.md" "$HELLO_FILE" >/dev/null 2>&1; DOC1=$?
+"$COMPILER" doc -o "$TMP/doc2.md" "$HELLO_FILE" >/dev/null 2>&1; DOC2=$?
+check "tg doc deterministic exit" $DOC1 $DOC2
+if [ -f "$TMP/doc1.md" ] && [ -f "$TMP/doc2.md" ]; then
+  cmp -s "$TMP/doc1.md" "$TMP/doc2.md" && pass "tg doc output byte-identical across runs" || fail "tg doc output byte-identical across runs"
+else
+  fail "tg doc wrote no output file"
+fi
+
+echo ""
 if [ "$FAILURES" -ne 0 ]; then
   echo "tool contracts FAILED with $FAILURES failure(s)" >&2
   exit 1
 fi
-echo "tool contracts OK: existence/help/version/unknown-option/missing-file/spaces/determinism/exit-forwarding/JSON/REPL all green"
+echo "tool contracts OK: existence/help/version/unknown-option/missing-file/spaces/determinism/exit-forwarding/signals/read-only/stdout-stderr/JSON/REPL all green"

@@ -44,6 +44,19 @@
 #   ProjDeref                                      ACCEPTED/REJECTED (tests
 #                                                    12, 13)
 #
+# The STRENGTHENED classes (the adversarial audit):
+#   nested projections (field-of-field, enum-at-depth,
+#     Vec-element-then-field, the double-substitution generic
+#     Wrapper[Wrapper[T]])                     ACCEPTED/REJECTED (tests
+#                                                14-20 — the walk must end
+#                                                on the LEAF's type)
+#   cross-block moved states (a field moved in block 0, the copy in a
+#     later block: the sibling copy, the moved-field copy, the
+#     whole-root copy after a partial move, the reinitialized slot) —
+#     the projection-aware moved lattice across MirGoto edges
+#                                                ACCEPTED/REJECTED (tests
+#                                                21-24)
+#
 # Choice: a DEDICATED verifier test file (the @test shape, run via
 # `tg test tests/verifier_projection_tests.tg`, the same shape as
 # golden/compiler_module_tests.tg), not canary_neg: the projected-place
@@ -63,7 +76,7 @@ use tg_compiler::mir::{
   MirStatement, MirStatementKind, MirRvalue, MirRvalueKind, MirBinOp, MirOperand,
   MirConstant, MirConstantKind, MirTypeDef, MirTypeDefKind, MirFieldDef,
   MirVariantDef, MirTerminator, MirTerminatorKind, place_local, operand_copy,
-  operand_constant
+  operand_constant, operand_move_place, operand_read
 }
 use tg_compiler::ids::{FieldId, VariantId, TypeId}
 use tg_compiler::types::Type
@@ -332,4 +345,417 @@ def test_neg_deref_ptr_string() -> Unit
   let errors = verifier_verify(f, Vec::new())
   assert(errors.len() == 1, "test_neg_deref_ptr_string: expected exactly one error, got " + errors.len().to_string())
   assert(errors[0].contains("MirCopy of non-trivially-copyable type string"), "test_neg_deref_ptr_string: expected the MirCopy error, got: " + errors[0])
+end
+
+# ———————————————————————————————————————————————————————————————
+# The STRENGTHENED cases (the adversarial audit): nested projections,
+# post-substitution generics at depth, cross-block moved states.
+# ———————————————————————————————————————————————————————————————
+
+# Test 14 — NESTED struct-field projection, Copy leaf: MirCopy(_0.inner.x)
+# where Outer { inner: Inner } and Inner { x: Int, y: String }. The
+# projection walk passes through the non-Copy root AND the non-Copy outer
+# field onto the Copy Int leaf — the leaf's copyability decides — ACCEPTED.
+@test
+def test_pos_nested_field_of_field_int() -> Unit
+  let defs = Vec::from([
+    MirTypeDef {
+      id: TypeId { id: 140 },
+      name: "Inner".to_string(),
+      kind: MirTypeDefKind::Struct(Vec::from([
+        MirFieldDef { name: "x".to_string(), ty: Type::Int },
+        MirFieldDef { name: "y".to_string(), ty: Type::String }
+      ])),
+      generic_params: Vec::new()
+    },
+    MirTypeDef {
+      id: TypeId { id: 141 },
+      name: "Outer".to_string(),
+      kind: MirTypeDefKind::Struct(Vec::from([
+        MirFieldDef { name: "inner".to_string(), ty: Type::Adt(TypeId { id: 140 }, Vec::new()) }
+      ])),
+      generic_params: Vec::new()
+    }
+  ])
+  let proj = Vec::from([
+    Projection::Field(FieldId { owner: TypeId { id: 141 }, index: 0 }),
+    Projection::Field(FieldId { owner: TypeId { id: 140 }, index: 0 })
+  ])
+  let f = verifier_copy_fn("pos_nested_field_of_field_int".to_string(), Type::Adt(TypeId { id: 141 }, Vec::new()), proj, Type::Int, int_const())
+  let errors = verifier_verify(f, defs)
+  assert(errors.len() == 0, "test_pos_nested_field_of_field_int: expected no errors, got " + errors.len().to_string() + (if errors.len() > 0 then ": " + errors[0] else "" end))
+end
+
+# Test 15 — NESTED struct-field projection, owning leaf: MirCopy(_0.inner.y)
+# — the String at depth 2 — REJECTED. The root-only typing would have
+# rejected this for the wrong reason (the root is non-Copy) but the
+# boundary is the LEAF: the walk must end on the String.
+@test
+def test_neg_nested_field_of_field_string() -> Unit
+  let defs = Vec::from([
+    MirTypeDef {
+      id: TypeId { id: 140 },
+      name: "Inner".to_string(),
+      kind: MirTypeDefKind::Struct(Vec::from([
+        MirFieldDef { name: "x".to_string(), ty: Type::Int },
+        MirFieldDef { name: "y".to_string(), ty: Type::String }
+      ])),
+      generic_params: Vec::new()
+    },
+    MirTypeDef {
+      id: TypeId { id: 141 },
+      name: "Outer".to_string(),
+      kind: MirTypeDefKind::Struct(Vec::from([
+        MirFieldDef { name: "inner".to_string(), ty: Type::Adt(TypeId { id: 140 }, Vec::new()) }
+      ])),
+      generic_params: Vec::new()
+    }
+  ])
+  let proj = Vec::from([
+    Projection::Field(FieldId { owner: TypeId { id: 141 }, index: 0 }),
+    Projection::Field(FieldId { owner: TypeId { id: 140 }, index: 1 })
+  ])
+  let f = verifier_copy_fn("neg_nested_field_of_field_string".to_string(), Type::Adt(TypeId { id: 141 }, Vec::new()), proj, Type::String, string_const())
+  let errors = verifier_verify(f, defs)
+  assert(errors.len() == 1, "test_neg_nested_field_of_field_string: expected exactly one error, got " + errors.len().to_string())
+  assert(errors[0].contains("MirCopy of non-trivially-copyable type string"), "test_neg_nested_field_of_field_string: expected the MirCopy error, got: " + errors[0])
+end
+
+# Test 16 — NESTED enum payload at depth: MirCopy(_0.e.V.0) where
+# Outer { e: E } and E::V0(String) — the Field -> Variant -> Field chain
+# ends on the owning String — REJECTED.
+@test
+def test_neg_nested_enum_payload_string() -> Unit
+  let defs = Vec::from([
+    MirTypeDef {
+      id: TypeId { id: 142 },
+      name: "E".to_string(),
+      kind: MirTypeDefKind::Enum(Vec::from([
+        MirVariantDef { name: "V0".to_string(), discriminant: 0, fields: Vec::from([Type::String]) }
+      ])),
+      generic_params: Vec::new()
+    },
+    MirTypeDef {
+      id: TypeId { id: 143 },
+      name: "Outer".to_string(),
+      kind: MirTypeDefKind::Struct(Vec::from([
+        MirFieldDef { name: "e".to_string(), ty: Type::Adt(TypeId { id: 142 }, Vec::new()) }
+      ])),
+      generic_params: Vec::new()
+    }
+  ])
+  let proj = Vec::from([
+    Projection::Field(FieldId { owner: TypeId { id: 143 }, index: 0 }),
+    Projection::Variant(VariantId { owner: TypeId { id: 142 }, index: 0 }),
+    Projection::Field(FieldId { owner: TypeId { id: 142 }, index: 0 })
+  ])
+  let f = verifier_copy_fn("neg_nested_enum_payload_string".to_string(), Type::Adt(TypeId { id: 143 }, Vec::new()), proj, Type::String, string_const())
+  let errors = verifier_verify(f, defs)
+  assert(errors.len() == 1, "test_neg_nested_enum_payload_string: expected exactly one error, got " + errors.len().to_string())
+  assert(errors[0].contains("MirCopy of non-trivially-copyable type string"), "test_neg_nested_enum_payload_string: expected the MirCopy error, got: " + errors[0])
+end
+
+# Test 17 — Vec ELEMENT then field, Copy leaf: MirCopy(_0[i].x) where
+# _0: Vec[Inner] and Inner { x: Int, y: String } — the ProjIndex advances
+# to the concrete element type, the Field to the Int — ACCEPTED.
+@test
+def test_pos_vec_element_field_int() -> Unit
+  let defs = Vec::from([
+    MirTypeDef {
+      id: TypeId { id: 140 },
+      name: "Inner".to_string(),
+      kind: MirTypeDefKind::Struct(Vec::from([
+        MirFieldDef { name: "x".to_string(), ty: Type::Int },
+        MirFieldDef { name: "y".to_string(), ty: Type::String }
+      ])),
+      generic_params: Vec::new()
+    },
+    MirTypeDef {
+      id: TypeId { id: 120 },
+      name: "Vec".to_string(),
+      kind: MirTypeDefKind::Struct(Vec::new()),
+      generic_params: Vec::new()
+    }
+  ])
+  let proj = Vec::from([
+    Projection::ProjIndex(MirLocalId { id: 9 }),
+    Projection::Field(FieldId { owner: TypeId { id: 140 }, index: 0 })
+  ])
+  let f = verifier_copy_fn("pos_vec_element_field_int".to_string(), Type::Adt(TypeId { id: 120 }, Vec::from([Type::Adt(TypeId { id: 140 }, Vec::new())])), proj, Type::Int, int_const())
+  let errors = verifier_verify(f, defs)
+  assert(errors.len() == 0, "test_pos_vec_element_field_int: expected no errors, got " + errors.len().to_string() + (if errors.len() > 0 then ": " + errors[0] else "" end))
+end
+
+# Test 18 — Vec ELEMENT then field, owning leaf: MirCopy(_0[i].y) where
+# _0: Vec[Inner] — the chain ends on the String — REJECTED.
+@test
+def test_neg_vec_element_field_string() -> Unit
+  let defs = Vec::from([
+    MirTypeDef {
+      id: TypeId { id: 140 },
+      name: "Inner".to_string(),
+      kind: MirTypeDefKind::Struct(Vec::from([
+        MirFieldDef { name: "x".to_string(), ty: Type::Int },
+        MirFieldDef { name: "y".to_string(), ty: Type::String }
+      ])),
+      generic_params: Vec::new()
+    },
+    MirTypeDef {
+      id: TypeId { id: 120 },
+      name: "Vec".to_string(),
+      kind: MirTypeDefKind::Struct(Vec::new()),
+      generic_params: Vec::new()
+    }
+  ])
+  let proj = Vec::from([
+    Projection::ProjIndex(MirLocalId { id: 9 }),
+    Projection::Field(FieldId { owner: TypeId { id: 140 }, index: 1 })
+  ])
+  let f = verifier_copy_fn("neg_vec_element_field_string".to_string(), Type::Adt(TypeId { id: 120 }, Vec::from([Type::Adt(TypeId { id: 140 }, Vec::new())])), proj, Type::String, string_const())
+  let errors = verifier_verify(f, defs)
+  assert(errors.len() == 1, "test_neg_vec_element_field_string: expected exactly one error, got " + errors.len().to_string())
+  assert(errors[0].contains("MirCopy of non-trivially-copyable type string"), "test_neg_vec_element_field_string: expected the MirCopy error, got: " + errors[0])
+end
+
+# Test 19 — NESTED post-substitution generic, owning leaf: the wrapper's
+# field is ITSELF a wrapper holding the concrete String (the post-mono
+# view of Wrapper[Wrapper[String]] — both field defs already carry the
+# concrete types). MirCopy(_0.inner.item) — the double substitution — the
+# walk must end on the String — REJECTED.
+@test
+def test_neg_nested_generic_post_substitution_string() -> Unit
+  let defs = Vec::from([
+    MirTypeDef {
+      id: TypeId { id: 144 },
+      name: "Inner".to_string(),
+      kind: MirTypeDefKind::Struct(Vec::from([
+        MirFieldDef { name: "item".to_string(), ty: Type::String }
+      ])),
+      generic_params: Vec::new()
+    },
+    MirTypeDef {
+      id: TypeId { id: 145 },
+      name: "Wrapper".to_string(),
+      kind: MirTypeDefKind::Struct(Vec::from([
+        MirFieldDef { name: "inner".to_string(), ty: Type::Adt(TypeId { id: 144 }, Vec::new()) }
+      ])),
+      generic_params: Vec::new()
+    }
+  ])
+  let proj = Vec::from([
+    Projection::Field(FieldId { owner: TypeId { id: 145 }, index: 0 }),
+    Projection::Field(FieldId { owner: TypeId { id: 144 }, index: 0 })
+  ])
+  let f = verifier_copy_fn("neg_nested_generic_post_substitution_string".to_string(), Type::Adt(TypeId { id: 145 }, Vec::from([Type::String])), proj, Type::String, string_const())
+  let errors = verifier_verify(f, defs)
+  assert(errors.len() == 1, "test_neg_nested_generic_post_substitution_string: expected exactly one error, got " + errors.len().to_string())
+  assert(errors[0].contains("MirCopy of non-trivially-copyable type string"), "test_neg_nested_generic_post_substitution_string: expected the MirCopy error, got: " + errors[0])
+end
+
+# Test 20 — NESTED post-substitution generic, Copy leaf: the same double
+# substitution with the concrete Int at the leaf — MirCopy(_0.inner.item)
+# where item: Int — ACCEPTED (the substitution carries Copy at depth too).
+@test
+def test_pos_nested_generic_post_substitution_int() -> Unit
+  let defs = Vec::from([
+    MirTypeDef {
+      id: TypeId { id: 144 },
+      name: "Inner".to_string(),
+      kind: MirTypeDefKind::Struct(Vec::from([
+        MirFieldDef { name: "item".to_string(), ty: Type::Int }
+      ])),
+      generic_params: Vec::new()
+    },
+    MirTypeDef {
+      id: TypeId { id: 145 },
+      name: "Wrapper".to_string(),
+      kind: MirTypeDefKind::Struct(Vec::from([
+        MirFieldDef { name: "inner".to_string(), ty: Type::Adt(TypeId { id: 144 }, Vec::new()) }
+      ])),
+      generic_params: Vec::new()
+    }
+  ])
+  let proj = Vec::from([
+    Projection::Field(FieldId { owner: TypeId { id: 145 }, index: 0 }),
+    Projection::Field(FieldId { owner: TypeId { id: 144 }, index: 0 })
+  ])
+  let f = verifier_copy_fn("pos_nested_generic_post_substitution_int".to_string(), Type::Adt(TypeId { id: 145 }, Vec::from([Type::Int])), proj, Type::Int, int_const())
+  let errors = verifier_verify(f, defs)
+  assert(errors.len() == 0, "test_pos_nested_generic_post_substitution_int: expected no errors, got " + errors.len().to_string() + (if errors.len() > 0 then ": " + errors[0] else "" end))
+end
+
+# ———————————————————————————————————————————————————————————————
+# The CROSS-BLOCK MOVED STATES (the projection-aware moved lattice across
+# blocks): block0 moves a field out via MirMovePlace(_0.<move>), a later
+# block copies a place — the copy's legality is decided by the moved state
+# that flowed through the MirGoto edge.
+# ———————————————————————————————————————————————————————————————
+
+# Build a multi-block function: block0 assigns the moved field value into
+# the _2 temp (MirMovePlace — legal for ANY type, and it marks the chain
+# moved), then (optionally reinit) re-initializes the copy projection with
+# a constant store in its own block, then the final block runs the
+# MirCopy binop exactly like verifier_copy_fn.
+def verifier_cross_block_fn(name: String, root_ty: Type, move_proj: Vec[Projection], copy_proj: Vec[Projection], dest_ty: Type, rhs: MirOperand, reinit: Bool) -> MirFunction
+  let param0 = MirLocal { id: MirLocalId { id: 0 }, name: "_0".to_string(), ty: root_ty, is_mut: false, span: span_dummy() }
+  let param1 = MirLocal { id: MirLocalId { id: 1 }, name: "_1".to_string(), ty: dest_ty, is_mut: false, span: span_dummy() }
+  let temp2 = MirLocal { id: MirLocalId { id: 2 }, name: "_2".to_string(), ty: Type::Int, is_mut: true, span: span_dummy() }
+
+  var move_place = place_local(MirLocalId { id: 0 })
+  for p in move_proj do
+    move_place.projections.push(p)
+  end
+  let move_stmt = MirStatement {
+    kind: MirStatementKind::MirAssign(place_local(MirLocalId { id: 2 }),
+      MirRvalue { kind: MirRvalueKind::MirMove(operand_move_place(move_place)), span: span_dummy() }),
+    span: span_dummy()
+  }
+  var blocks = Vec::new()
+  blocks.push(MirBlock {
+    id: MirBlockId { id: 0 },
+    statements: Vec::from([move_stmt]),
+    terminator: MirTerminator { kind: MirTerminatorKind::MirGoto(MirBlockId { id: 1 }), span: span_dummy() }
+  })
+
+  var copy_place = place_local(MirLocalId { id: 0 })
+  for p in copy_proj do
+    copy_place.projections.push(p)
+  end
+  let copy_rvalue = MirRvalue { kind: MirRvalueKind::MirBinOp(MirBinOp::Eq, operand_copy(copy_place), rhs), span: span_dummy() }
+  let copy_stmt = MirStatement {
+    kind: MirStatementKind::MirAssign(place_local(MirLocalId { id: 1 }), copy_rvalue),
+    span: span_dummy()
+  }
+
+  if reinit then
+    var re_place = place_local(MirLocalId { id: 0 })
+    for p in copy_proj do
+      re_place.projections.push(p)
+    end
+    let re_stmt = MirStatement {
+      kind: MirStatementKind::MirAssign(re_place,
+        MirRvalue { kind: MirRvalueKind::MirMove(operand_constant(MirConstant { kind: MirConstantKind::MirInt(0), ty: Type::Int, instance: Option::None })), span: span_dummy() }),
+      span: span_dummy()
+    }
+    blocks.push(MirBlock {
+      id: MirBlockId { id: 1 },
+      statements: Vec::from([re_stmt]),
+      terminator: MirTerminator { kind: MirTerminatorKind::MirGoto(MirBlockId { id: 2 }), span: span_dummy() }
+    })
+    blocks.push(MirBlock {
+      id: MirBlockId { id: 2 },
+      statements: Vec::from([copy_stmt]),
+      terminator: MirTerminator { kind: MirTerminatorKind::MirReturn, span: span_dummy() }
+    })
+  else
+    blocks.push(MirBlock {
+      id: MirBlockId { id: 1 },
+      statements: Vec::from([copy_stmt]),
+      terminator: MirTerminator { kind: MirTerminatorKind::MirReturn, span: span_dummy() }
+    })
+  end
+
+  MirFunction {
+    name: name,
+    params: Vec::from([param0, param1]),
+    ret_type: Type::Unit,
+    locals: Vec::from([temp2]),
+    blocks: blocks,
+    entry_block: MirBlockId { id: 0 },
+    is_async: false,
+    is_unsafe: false,
+    is_extern: false,
+    extern_abi: "",
+    contracts: Vec::new(),
+    span: span_dummy()
+  }
+end
+
+# Test 21 — cross-block SIBLING copy: block0 moves _0.a (Int) out, the
+# final block copies _0.b (Int) — the sibling chain is NOT moved — the
+# copy is legal — ACCEPTED.
+@test
+def test_pos_cross_block_move_sibling_copy() -> Unit
+  let defs = Vec::from([MirTypeDef {
+    id: TypeId { id: 150 },
+    name: "S".to_string(),
+    kind: MirTypeDefKind::Struct(Vec::from([
+      MirFieldDef { name: "a".to_string(), ty: Type::Int },
+      MirFieldDef { name: "b".to_string(), ty: Type::Int }
+    ])),
+    generic_params: Vec::new()
+  }])
+  let move_proj = Vec::from([Projection::Field(FieldId { owner: TypeId { id: 150 }, index: 0 })])
+  let copy_proj = Vec::from([Projection::Field(FieldId { owner: TypeId { id: 150 }, index: 1 })])
+  let f = verifier_cross_block_fn("pos_cross_block_move_sibling_copy".to_string(), Type::Adt(TypeId { id: 150 }, Vec::new()), move_proj, copy_proj, Type::Int, operand_read(place_local(MirLocalId { id: 2 })), false)
+  let errors = verifier_verify(f, defs)
+  assert(errors.len() == 0, "test_pos_cross_block_move_sibling_copy: expected no errors, got " + errors.len().to_string() + (if errors.len() > 0 then ": " + errors[0] else "" end))
+end
+
+# Test 22 — cross-block copy of the MOVED field: block0 moves _0.a out,
+# the final block copies _0.a — the moved chain flowed through the
+# MirGoto edge — "copy of previously moved place" — REJECTED (exactly one
+# error: the moved-state check fires, and the Int leaf keeps the
+# ownership check quiet — the boundary is the moved state, not the type).
+@test
+def test_neg_cross_block_copy_moved_field() -> Unit
+  let defs = Vec::from([MirTypeDef {
+    id: TypeId { id: 150 },
+    name: "S".to_string(),
+    kind: MirTypeDefKind::Struct(Vec::from([
+      MirFieldDef { name: "a".to_string(), ty: Type::Int },
+      MirFieldDef { name: "b".to_string(), ty: Type::Int }
+    ])),
+    generic_params: Vec::new()
+  }])
+  let move_proj = Vec::from([Projection::Field(FieldId { owner: TypeId { id: 150 }, index: 0 })])
+  let copy_proj = Vec::from([Projection::Field(FieldId { owner: TypeId { id: 150 }, index: 0 })])
+  let f = verifier_cross_block_fn("neg_cross_block_copy_moved_field".to_string(), Type::Adt(TypeId { id: 150 }, Vec::new()), move_proj, copy_proj, Type::Int, operand_read(place_local(MirLocalId { id: 2 })), false)
+  let errors = verifier_verify(f, defs)
+  assert(errors.len() == 1, "test_neg_cross_block_copy_moved_field: expected exactly one error, got " + errors.len().to_string())
+  assert(errors[0].contains("copy of previously moved place"), "test_neg_cross_block_copy_moved_field: expected the moved-place error, got: " + errors[0])
+end
+
+# Test 23 — cross-block WHOLE-ROOT copy after a partial move: block0
+# moves _0.a out, the final block copies the WHOLE root _0 — the root's
+# "" key is moved by the partial move (the partial root is not fully
+# live) — REJECTED.
+@test
+def test_neg_cross_block_whole_root_copy_after_partial_move() -> Unit
+  let defs = Vec::from([MirTypeDef {
+    id: TypeId { id: 150 },
+    name: "S".to_string(),
+    kind: MirTypeDefKind::Struct(Vec::from([
+      MirFieldDef { name: "a".to_string(), ty: Type::Int },
+      MirFieldDef { name: "b".to_string(), ty: Type::Int }
+    ])),
+    generic_params: Vec::new()
+  }])
+  let move_proj = Vec::from([Projection::Field(FieldId { owner: TypeId { id: 150 }, index: 0 })])
+  let f = verifier_cross_block_fn("neg_cross_block_whole_root_copy_after_partial_move".to_string(), Type::Adt(TypeId { id: 150 }, Vec::new()), move_proj, Vec::new(), Type::Adt(TypeId { id: 150 }, Vec::new()), operand_read(place_local(MirLocalId { id: 2 })), false)
+  let errors = verifier_verify(f, defs)
+  assert(errors.len() == 1, "test_neg_cross_block_whole_root_copy_after_partial_move: expected exactly one error, got " + errors.len().to_string())
+  assert(errors[0].contains("copy of previously moved place"), "test_neg_cross_block_whole_root_copy_after_partial_move: expected the moved-place error, got: " + errors[0])
+end
+
+# Test 24 — cross-block REINITIALIZE then copy: block0 moves _0.a out,
+# block1 STORES a constant back into _0.a (the store re-lives the chain —
+# the checker's reinitialization of a moved-out slot), the final block
+# copies _0.a — the re-lived chain makes the copy legal — ACCEPTED.
+@test
+def test_pos_cross_block_reinit_then_copy() -> Unit
+  let defs = Vec::from([MirTypeDef {
+    id: TypeId { id: 150 },
+    name: "S".to_string(),
+    kind: MirTypeDefKind::Struct(Vec::from([
+      MirFieldDef { name: "a".to_string(), ty: Type::Int },
+      MirFieldDef { name: "b".to_string(), ty: Type::Int }
+    ])),
+    generic_params: Vec::new()
+  }])
+  let move_proj = Vec::from([Projection::Field(FieldId { owner: TypeId { id: 150 }, index: 0 })])
+  let copy_proj = Vec::from([Projection::Field(FieldId { owner: TypeId { id: 150 }, index: 0 })])
+  let f = verifier_cross_block_fn("pos_cross_block_reinit_then_copy".to_string(), Type::Adt(TypeId { id: 150 }, Vec::new()), move_proj, copy_proj, Type::Int, operand_read(place_local(MirLocalId { id: 2 })), true)
+  let errors = verifier_verify(f, defs)
+  assert(errors.len() == 0, "test_pos_cross_block_reinit_then_copy: expected no errors, got " + errors.len().to_string() + (if errors.len() > 0 then ": " + errors[0] else "" end))
 end

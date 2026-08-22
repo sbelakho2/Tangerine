@@ -18,6 +18,13 @@
 # FAILURE (the sweep gate fails), so a module whose structure the tool
 # cannot read cannot be shipped silently.
 #
+# Frame discipline: the declaration-structure walk tracks each block
+# opener's INDENT and pops a frame only on an `end` at the frame's own
+# indent (or shallower). A method body's `end` (deeper indent) never pops
+# the enclosing impl frame — without this rule the first method body of a
+# multi-method impl silently drops every later method (the manifest's
+# per-symbol association layer depends on the full method surface).
+#
 # Usage: scripts/api_manifest_extractor.py <module.tg> [<contracts.toml>]
 #   Prints one JSON object per module (the manifest record) to stdout.
 #   <contracts.toml> defaults to docs/current/stdlib_contracts.toml; the
@@ -204,9 +211,15 @@ def extract(path, contracts):
         indent = len(clean) - len(clean.lstrip())
 
         if END_LINE.match(clean):
-            if frames:
+            # Indent-aware frame pop: an `end` at a DEEPER indent closes an
+            # inner block (a method body inside an impl frame) and must NOT
+            # pop the enclosing frame — only an `end` at the frame's own
+            # indent (or shallower) closes it. Without this rule the first
+            # method body's `end` pops the impl frame and every later method
+            # of that impl is silently lost.
+            while frames and indent <= frames[-1].get("indent", 0):
                 f = frames.pop()
-                if f["kind"] == "enum":
+                if f.get("kind") == "enum":
                     enum = None
                     enum_indent = None
             i += 1
@@ -235,7 +248,7 @@ def extract(path, contracts):
             continue
 
         if indent == 0 and BLOCK_OPENERS.match(clean):
-            f = {"kind": None, "name": None, "pub": True}
+            f = {"kind": None, "name": None, "pub": True, "indent": indent}
             m = DEF_HEADER.match(clean)
             if m:
                 f["kind"] = "def"

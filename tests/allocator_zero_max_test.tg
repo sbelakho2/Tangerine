@@ -1,0 +1,151 @@
+# tests/allocator_zero_max_test.tg — the allocator's adversarial boundary
+# classes: the zero-size request, the size-1 request, the small/large
+# boundary pair (65536 the last small class / 65537 the first large
+# mapping), the wrong-size free (the header-driven free path must ignore
+# the size argument), and the guard-page OOB probe (the large-path header
+# {marker, total} must live INSIDE the mapping at base = payload - 16 —
+# reading it back proves the allocator wrote it within the mapped region,
+# and the payload's last byte is the last mapped byte before the
+# unmapped tail).
+#
+# Accounting contract under test: small requests charge the CLASS size
+# (0 and 1 both clamp to class 16), large requests charge
+# align8(size + 23); the outstanding counter must return EXACTLY to the
+# baseline after every free.
+
+use std::core
+
+extern def _tg_mem_alloc(size: UInt) -> Ptr[u8]
+extern def _tg_mem_free(ptr: Ptr[u8], size: UInt) -> Unit
+extern def tg_allocator_outstanding_bytes() -> Int
+
+def is_16_aligned(p: Ptr[u8]) -> Bool
+  (p as Int) & 15 == 0
+end
+
+# The @test attribute registers this executable under the strict `tg test`
+# runner (canary convention: the file is compiled as-is and run once; the
+# process exit code is the test outcome — see tg_compiler/driver.tg
+# compile_and_run_file_main).
+@test
+def main() -> Int
+  let before = tg_allocator_outstanding_bytes()
+
+  # 1) ZERO-SIZE and SIZE-1: the request clamps to the 16-byte class —
+  #    non-null, 16-aligned, charged exactly class 16, released exactly.
+  let z = _tg_mem_alloc(0 as UInt)
+  if z.is_null() then
+    println("allocator_zero_max: zero-size alloc returned null")
+    return 1
+  end
+  if !is_16_aligned(z) then
+    println("allocator_zero_max: zero-size block not 16-aligned")
+    return 2
+  end
+  let after_z = tg_allocator_outstanding_bytes()
+  if after_z != before + 16 then
+    println("allocator_zero_max: outstanding after zero-size = " + after_z.to_string() + " expected " + (before + 16).to_string())
+    return 3
+  end
+  _tg_mem_free(z, 0 as UInt)
+  let after_zf = tg_allocator_outstanding_bytes()
+  if after_zf != before then
+    println("allocator_zero_max: outstanding after zero-size free = " + after_zf.to_string() + " expected " + before.to_string())
+    return 4
+  end
+
+  let o = _tg_mem_alloc(1 as UInt)
+  if o.is_null() || !is_16_aligned(o) then
+    println("allocator_zero_max: size-1 alloc failed or misaligned")
+    return 5
+  end
+  let after_o = tg_allocator_outstanding_bytes()
+  if after_o != before + 16 then
+    println("allocator_zero_max: outstanding after size-1 = " + after_o.to_string() + " expected " + (before + 16).to_string())
+    return 6
+  end
+  _tg_mem_free(o, 1 as UInt)
+  if tg_allocator_outstanding_bytes() != before then
+    println("allocator_zero_max: outstanding after size-1 free = " + tg_allocator_outstanding_bytes().to_string() + " expected " + before.to_string())
+    return 7
+  end
+
+  # 2) The SMALL/LARGE boundary pair: 65536 is the LAST small class
+  #    (charged 65536), 65537 is the FIRST large mapping (charged
+  #    align8(65537 + 23) = 65560).
+  let s = _tg_mem_alloc(65536 as UInt)
+  if s.is_null() || !is_16_aligned(s) then
+    println("allocator_zero_max: 65536 alloc failed or misaligned")
+    return 8
+  end
+  if tg_allocator_outstanding_bytes() != before + 65536 then
+    println("allocator_zero_max: outstanding after 65536 = " + tg_allocator_outstanding_bytes().to_string() + " expected " + (before + 65536).to_string())
+    return 9
+  end
+  _tg_mem_free(s, 65536 as UInt)
+  if tg_allocator_outstanding_bytes() != before then
+    println("allocator_zero_max: outstanding after 65536 free = " + tg_allocator_outstanding_bytes().to_string() + " expected " + before.to_string())
+    return 10
+  end
+
+  let l = _tg_mem_alloc(65537 as UInt)
+  if l.is_null() || !is_16_aligned(l) then
+    println("allocator_zero_max: 65537 alloc failed or misaligned")
+    return 11
+  end
+  if tg_allocator_outstanding_bytes() != before + 65560 then
+    println("allocator_zero_max: outstanding after 65537 = " + tg_allocator_outstanding_bytes().to_string() + " expected " + (before + 65560).to_string())
+    return 12
+  end
+
+  # 3) THE GUARD-PAGE OOB PROBE: the large block's {marker = 1, total}
+  #    header lives at base = payload - 16, INSIDE the mapping. Reading
+  #    the header back (marker byte 1, total byte 0 = 65560 & 0xff = 24
+  #    on the little-endian runtime) proves the allocator wrote the
+  #    header within the mapped region — a header written before the
+  #    mapping would fault or read garbage. The payload's LAST byte
+  #    (offset 65536) must also be writable — the mapping covers the
+  #    whole request.
+  let base = l.offset(-16)
+  let marker_byte = base.read()
+  if marker_byte != (1 as u8) then
+    println("allocator_zero_max: large header marker = " + marker_byte.to_string() + " expected 1")
+    return 13
+  end
+  let total_byte0 = base.offset(8).read()
+  if total_byte0 != (24 as u8) then
+    println("allocator_zero_max: large header total byte0 = " + total_byte0.to_string() + " expected 24")
+    return 14
+  end
+  l.offset(65536).write(0x5a as u8)
+  if l.offset(65536).read() != (0x5a as u8) then
+    println("allocator_zero_max: last payload byte not writable")
+    return 15
+  end
+  l.offset(65536).write(0)
+
+  # 4) THE WRONG-SIZE FREE: the free path is HEADER-DRIVEN (the total
+  #    comes from the header, never from the size argument). Freeing the
+  #    large block with a bogus size must still release exactly the
+  #    mapped bytes and return the counter to the baseline.
+  _tg_mem_free(l, 1 as UInt)
+  if tg_allocator_outstanding_bytes() != before then
+    println("allocator_zero_max: outstanding after wrong-size large free = " + tg_allocator_outstanding_bytes().to_string() + " expected " + before.to_string())
+    return 16
+  end
+
+  # The small path is header-driven too: free the 16-byte block with a
+  # wrong size — the class comes from the header, the counter returns
+  # exactly.
+  let w = _tg_mem_alloc(16 as UInt)
+  if w.is_null() then
+    return 17
+  end
+  _tg_mem_free(w, 999999 as UInt)
+  if tg_allocator_outstanding_bytes() != before then
+    println("allocator_zero_max: outstanding after wrong-size small free = " + tg_allocator_outstanding_bytes().to_string() + " expected " + before.to_string())
+    return 18
+  end
+
+  0
+end

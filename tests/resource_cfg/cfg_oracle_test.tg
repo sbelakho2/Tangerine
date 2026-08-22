@@ -190,13 +190,25 @@ def oracle_run(node: RNode, inout state: OracleState, path: String, inout violat
   when RNode::RIf(then_node, else_node) then
     var then_state = oracle_state_clone(state)
     let then_fell = oracle_run(then_node, &mut then_state, path.clone() + "/then", violations, iterations)
-    if !then_fell then
-      violations.push(path.clone() + ": break out of an if is not modeled (the shape is invalid)")
-    end
     var else_state = oracle_state_clone(state)
     let else_fell = oracle_run(else_node, &mut else_state, path.clone() + "/else", violations, iterations)
+    # A break inside an arm exits the ENCLOSING loop: the arm that broke
+    # already ran its break-edge cleanup, so the loop-exit path propagates
+    # the fall-through flag (the RLoop's !fell branch consumes it) and the
+    # post-loop state is the broke arm's post-cleanup state. The other
+    # arm's symbolic effects are discarded (that path was not taken).
+    # Previously this shape pushed a "break out of an if is not modeled"
+    # violation — the strengthened oracle models it: the break-in-else
+    # shape is a valid loop exit.
+    if !then_fell then
+      state.syms = then_state.syms
+      state.defers = then_state.defers
+      return false
+    end
     if !else_fell then
-      violations.push(path.clone() + ": break out of an if is not modeled (the shape is invalid)")
+      state.syms = else_state.syms
+      state.defers = else_state.defers
+      return false
     end
     # The join: a local Live on one arm and not-live on another is the
     # maybe-live-unresolved class (the checker rejects it).
@@ -412,7 +424,12 @@ def oracle_accepts(model: RNode) -> Bool
   var state = oracle_state_new()
   var violations = Vec::new()
   var iterations = 0
-  let _ = oracle_run(model, &mut state, "shape", &mut violations, &mut iterations)
+  let fell = oracle_run(model, &mut state, "shape", &mut violations, &mut iterations)
+  # A break that reaches the shape ROOT has no enclosing loop to exit —
+  # the shape is invalid (the compiler rejects a top-level break).
+  if !fell then
+    violations.push("shape: a break exited the shape root (break outside any loop is invalid)")
+  end
   violations.is_empty()
 end
 
@@ -667,6 +684,140 @@ def model_shape_neg_loop_carried_consume() -> RNode
   node_seq(ns)
 end
 
+# ———————————————————————————————————————————————————————————————
+# The STRENGTHENED shapes (the adversarial audit): the nested
+# combinations (loop-in-match-in-loop, break-in-else, defer-in-both-arms,
+# sink-in-loop, set-in-branch), the 0/1/N iteration coverage, the
+# nested-defers scope chain, the partial-move-then-reassign, and the
+# nested loop-carried-consume rejection.
+# ———————————————————————————————————————————————————————————————
+
+def model_shape_loop_in_match_in_loop() -> RNode
+  var inner_arm = Vec::new()
+  inner_arm.push(RNode::RLoop(node_seq(Vec::from([op_make("r"), op_drop("r")]))))
+  var outer_arm = Vec::new()
+  outer_arm.push(RNode::RMatch(Vec::from([node_seq(inner_arm), node_seq(Vec::new())])))
+  var outer = Vec::new()
+  outer.push(RNode::RLoop(node_seq(outer_arm)))
+  outer.push(RNode::RExit)
+  node_seq(outer)
+end
+
+def model_shape_break_in_else() -> RNode
+  var body = Vec::new()
+  body.push(RNode::RIf(node_seq(Vec::new()), node_seq(Vec::from([op_make("r"), op_break()]))))
+  var outer = Vec::new()
+  outer.push(RNode::RLoop(node_seq(body)))
+  outer.push(RNode::RExit)
+  node_seq(outer)
+end
+
+def model_shape_defer_in_both_arms() -> RNode
+  var ns = Vec::new()
+  ns.push(op_make("r"))
+  ns.push(RNode::RIf(node_seq(Vec::from([op_defer("r")])), node_seq(Vec::from([op_defer("r")]))))
+  ns.push(RNode::RExit)
+  node_seq(ns)
+end
+
+# The 0/1/N iteration coverage: the oracle's RLoop runs the body once and
+# checks the back-edge invariant, so the classes are distinguished by the
+# body's shape —
+#   ZERO: the per-iteration make/drop invariant class (the body leaves no
+#         live state at the back-edge; the loop may run 0 or more times).
+#   ONE:  the break-on-first-iteration class (the loop exits on its first
+#         pass through the body — the single-iteration boundary).
+#   N:    the multiple-constructions-per-iteration class (TWO make/drop
+#         pairs per pass — the loop must re-establish the invariant for
+#         every local it creates, iteration after iteration).
+# The iteration COUNT itself is asserted at the runtime level (the
+# Gate-L counters: the zero-iteration while runs 0 constructions, the
+# one-iteration loop runs 1, the N-iteration while runs 5).
+def model_shape_loop_zero_iter() -> RNode
+  var body = Vec::new()
+  body.push(op_make("r"))
+  body.push(op_drop("r"))
+  var outer = Vec::new()
+  outer.push(RNode::RLoop(node_seq(body)))
+  outer.push(RNode::RExit)
+  node_seq(outer)
+end
+
+def model_shape_loop_one_iter() -> RNode
+  var body = Vec::new()
+  body.push(op_make("r"))
+  body.push(op_drop("r"))
+  body.push(op_break())
+  var outer = Vec::new()
+  outer.push(RNode::RLoop(node_seq(body)))
+  outer.push(RNode::RExit)
+  node_seq(outer)
+end
+
+def model_shape_loop_n_iter() -> RNode
+  var body = Vec::new()
+  body.push(op_make("r"))
+  body.push(op_drop("r"))
+  body.push(op_make("r2"))
+  body.push(op_drop("r2"))
+  var outer = Vec::new()
+  outer.push(RNode::RLoop(node_seq(body)))
+  outer.push(RNode::RExit)
+  node_seq(outer)
+end
+
+def model_shape_sink_in_loop() -> RNode
+  var body = Vec::new()
+  body.push(op_make("r"))
+  body.push(op_sink("r"))
+  var outer = Vec::new()
+  outer.push(RNode::RLoop(node_seq(body)))
+  outer.push(RNode::RExit)
+  node_seq(outer)
+end
+
+def model_shape_set_in_both_branches() -> RNode
+  var ns = Vec::new()
+  ns.push(RNode::RIf(op_set("r"), op_set("r")))
+  ns.push(op_drop("r"))
+  ns.push(RNode::RExit)
+  node_seq(ns)
+end
+
+def model_shape_nested_defers() -> RNode
+  var ns = Vec::new()
+  ns.push(op_make("a"))
+  ns.push(op_make("b"))
+  ns.push(op_defer("b"))
+  ns.push(op_defer("a"))
+  ns.push(RNode::RExit)
+  node_seq(ns)
+end
+
+def model_shape_partial_reassign_pair() -> RNode
+  var ns = Vec::new()
+  ns.push(op_make("p"))
+  ns.push(op_partial("p", 0))
+  ns.push(op_set("p"))
+  ns.push(RNode::RExit)
+  node_seq(ns)
+end
+
+def model_shape_neg_loop_in_match_carried_consume() -> RNode
+  var inner_arm = Vec::new()
+  inner_arm.push(op_sink("r"))
+  var arms = Vec::new()
+  arms.push(node_seq(inner_arm))
+  arms.push(node_seq(Vec::new()))
+  var body = Vec::new()
+  body.push(RNode::RMatch(arms))
+  var outer = Vec::new()
+  outer.push(op_make("r"))
+  outer.push(RNode::RLoop(node_seq(body)))
+  outer.push(RNode::RExit)
+  node_seq(outer)
+end
+
 # The verdict table: (name, model, expected-verdict, source-fn, kind).
 struct ShapeEntry
   name: String
@@ -711,6 +862,21 @@ def build_shape_table() -> Vec[ShapeEntry]
   table.push(shape_entry("cfg_neg_partial_then_whole", model_shape_neg_partial_then_whole(), false, "neg_partial_then_whole", false))
   table.push(shape_entry("cfg_neg_defer_after_consume", model_shape_neg_defer_after_consume(), false, "neg_defer_after_consume", false))
   table.push(shape_entry("cfg_neg_loop_carried_consume", model_shape_neg_loop_carried_consume(), false, "neg_loop_carried_consume", false))
+  # The STRENGTHENED shapes (the adversarial audit): the nested
+  # combinations, the 0/1/N iteration classes, the defer chain, the
+  # sink-in-loop, the set-in-branch, the partial-move-then-reassign, and
+  # the loop-in-match carried-consume rejection.
+  table.push(shape_entry("loop_in_match_in_loop", model_shape_loop_in_match_in_loop(), true, "shape_loop_in_match_in_loop", true))
+  table.push(shape_entry("break_in_else", model_shape_break_in_else(), true, "shape_break_in_else", true))
+  table.push(shape_entry("defer_in_both_arms", model_shape_defer_in_both_arms(), true, "shape_defer_in_both_arms", true))
+  table.push(shape_entry("loop_zero_iter", model_shape_loop_zero_iter(), true, "shape_loop_zero_iter", true))
+  table.push(shape_entry("loop_one_iter", model_shape_loop_one_iter(), true, "shape_loop_one_iter", true))
+  table.push(shape_entry("loop_n_iter", model_shape_loop_n_iter(), true, "shape_while_n_iter", true))
+  table.push(shape_entry("sink_in_loop", model_shape_sink_in_loop(), true, "shape_sink_in_loop", true))
+  table.push(shape_entry("set_in_both_branches", model_shape_set_in_both_branches(), true, "shape_set_in_both_branches", true))
+  table.push(shape_entry("nested_defers", model_shape_nested_defers(), true, "shape_nested_defers", true))
+  table.push(shape_entry("partial_reassign_pair", model_shape_partial_reassign_pair(), true, "shape_partial_reassign_pair", true))
+  table.push(shape_entry("cfg_neg_loop_in_match_carried_consume", model_shape_neg_loop_in_match_carried_consume(), false, "neg_loop_in_match_carried_consume", false))
   table
 end
 
@@ -839,6 +1005,114 @@ def shape_move_transfer() -> Unit
 end
 
 # ———————————————————————————————————————————————————————————————
+# The STRENGTHENED source shapes (the adversarial audit): each function
+# compiles into this file (the compiler accepts it) and the runtime
+# counters in main() pin the exactly-once destruction counts.
+# ———————————————————————————————————————————————————————————————
+
+def shape_loop_in_match_in_loop() -> Unit
+  loop
+    let b = 1
+    match b
+    when 1 then
+      loop
+        let r = Canary { id: 20 }
+        drop(r)
+        break
+      end
+    when _ then
+      ()
+    end
+    break
+  end
+end
+
+def shape_break_in_else() -> Unit
+  loop
+    if false then
+      ()
+    else
+      let r = Canary { id: 30 }
+      break
+    end
+  end
+end
+
+def shape_defer_in_both_arms(flag: Bool) -> Unit
+  let r = Canary { id: 31 }
+  if flag then
+    defer
+      drop(r)
+    end
+  else
+    defer
+      drop(r)
+    end
+  end
+end
+
+def shape_loop_zero_iter() -> Unit
+  var i = 0
+  while i < 0 do
+    let r = Canary { id: 40 }
+    drop(r)
+    i = i + 1
+  end
+end
+
+def shape_loop_one_iter() -> Unit
+  loop
+    let r = Canary { id: 41 }
+    drop(r)
+    break
+  end
+end
+
+def shape_while_n_iter() -> Unit
+  var i = 0
+  while i < 5 do
+    let r = Canary { id: 42 + i }
+    drop(r)
+    i = i + 1
+  end
+end
+
+def shape_sink_in_loop() -> Unit
+  var i = 0
+  while i < 3 do
+    let r = Canary { id: 50 + i }
+    sink_canary(r)
+    i = i + 1
+  end
+end
+
+def shape_set_in_both_branches(set r: Canary, flag: Bool) -> Unit
+  if flag then
+    r = Canary { id: 60 }
+  else
+    r = Canary { id: 61 }
+  end
+  drop(r)
+end
+
+def shape_nested_defers() -> Unit
+  let a = Canary { id: 70 }
+  let b = Canary { id: 71 }
+  defer
+    drop(a)
+  end
+  defer
+    drop(b)
+  end
+end
+
+def shape_partial_reassign_pair() -> Unit
+  let p = Pair { a: Canary { id: 80 }, b: Canary { id: 81 } }
+  sink_canary(p.a)
+  p = Pair { a: Canary { id: 82 }, b: Canary { id: 83 } }
+end
+
+# ———————————————————————————————————————————————————————————————
 # Main: run the oracle over the whole shape table and the instrumented
 # shapes at runtime.
 # ———————————————————————————————————————————————————————————————
@@ -907,6 +1181,41 @@ def main() -> Int
   base = CANARY_DROPS
   shape_move_transfer()
   check_eq(drops_since(base), 1, "move_transfer: the moved-to local's scope exit destroys exactly once")
+
+  # The STRENGTHENED runtime counters (Gate-L): the 0/1/N iteration
+  # classes, the nested combos, and the partial-move-then-reassign.
+  base = CANARY_DROPS
+  shape_loop_in_match_in_loop()
+  check_eq(drops_since(base), 1, "loop_in_match_in_loop: the inner loop's break edge finalized its construction exactly once (1 iteration, 1 destructor)")
+  base = CANARY_DROPS
+  shape_break_in_else()
+  check_eq(drops_since(base), 1, "break_in_else: the break edge in the else arm finalized the arm's construction exactly once")
+  base = CANARY_DROPS
+  shape_defer_in_both_arms(true)
+  shape_defer_in_both_arms(false)
+  check_eq(drops_since(base), 2, "defer_in_both_arms: each call's taken-arm defer finalized the construction exactly once (2 calls, 2 destructors — never double-registered)")
+  base = CANARY_DROPS
+  shape_loop_zero_iter()
+  check_eq(drops_since(base), 0, "loop_zero_iter: the zero-iteration while constructed nothing and destroyed nothing")
+  base = CANARY_DROPS
+  shape_loop_one_iter()
+  check_eq(drops_since(base), 1, "loop_one_iter: the break-on-first-iteration loop finalized its construction exactly once")
+  base = CANARY_DROPS
+  shape_while_n_iter()
+  check_eq(drops_since(base), 5, "while_n_iter: 5 iterations, exactly 5 destructor calls (the N-iteration class)")
+  base = CANARY_DROPS
+  shape_sink_in_loop()
+  check_eq(drops_since(base), 3, "sink_in_loop: 3 per-iteration transfers, exactly 3 destructor calls (all in the callee)")
+  base = CANARY_DROPS
+  shape_set_in_both_branches(true)
+  shape_set_in_both_branches(false)
+  check_eq(drops_since(base), 2, "set_in_both_branches: each call's branch-set construction is dropped exactly once (2 calls, 2 destructors)")
+  base = CANARY_DROPS
+  shape_nested_defers()
+  check_eq(drops_since(base), 2, "nested_defers: the LIFO defer chain finalized each construction exactly once (2 constructions, 2 destructors)")
+  base = CANARY_DROPS
+  shape_partial_reassign_pair()
+  check_eq(drops_since(base), 4, "partial_reassign_pair: the sunk field (1) + the assign-drop of the remaining field (1) + the scope-exit drop of the re-stored pair (2) = 4 constructions, 4 destructors")
 
   println("\n========================================")
   println("Results: " + tests_passed.to_string() + " passed, " + tests_failed.to_string() + " failed")

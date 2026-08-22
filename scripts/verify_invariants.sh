@@ -358,6 +358,46 @@ t G10.4 "trap-gate whitelist: check_target_capabilities rejects instead of emitt
 t G10.5 "self-host manifest gate: merge_imported_deps fails without compiler_kernel.manifest" \
   'grep -qE "^pub def merge_imported_deps" tg_compiler/compiler_core.tg && grep -q "requires bootstrap/compiler_kernel.manifest" tg_compiler/compiler_core.tg && grep -q "prelude fallback is disabled in self-host mode" tg_compiler/compiler_core.tg'
 
+# diagnostic_parity: every expected diagnostic substring in the canary_neg
+# MANIFEST must be present in the compiler sources — verbatim, or with the
+# backtick-quoted spans normalized (a template diagnostic such as
+# "no method `{}` on receiver type" still pins the canary's expected
+# "no method `iter` on receiver type"). A mutation that deletes or renames
+# a diagnostic site the negative canaries pin breaks the parity — the
+# mandate's "a deleted diagnostic → the expected substring missing → the
+# parity gate fails".
+diagnostic_parity() {
+  python3 - tests/canary_neg/MANIFEST tg_compiler std <<'PY'
+import os, re, sys
+manifest, src_dir_a, src_dir_b = sys.argv[1], sys.argv[2], sys.argv[3]
+text = ""
+for d in (src_dir_a, src_dir_b):
+    for f in sorted(os.listdir(d)):
+        if f.endswith(".tg"):
+            with open(os.path.join(d, f), encoding="utf-8") as fh:
+                text += fh.read()
+def norm(s):
+    return re.sub(r"`[^`]*`", "`X`", s)
+for line in open(manifest, encoding="utf-8"):
+    line = line.rstrip("\n")
+    if not line or line.startswith("#"):
+        continue
+    parts = line.split("\t")
+    if len(parts) < 2:
+        continue
+    expected = parts[1]
+    if expected in text:
+        continue
+    if norm(expected) != expected and norm(expected) in norm(text):
+        continue
+    print("expected diagnostic not found in the sources: " + parts[0] + " -> '" + expected + "'", file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
+t G10.6 "canary_neg expected-diagnostic parity: every expected diagnostic substring in the MANIFEST is present in the compiler sources (verbatim or backtick-normalized)" \
+  'diagnostic_parity'
+
 # ———————————————————————————————————————————————————————————————
 # G11 Module identity
 # ———————————————————————————————————————————————————————————————
@@ -382,6 +422,68 @@ fi
 
 t G11.2b "the only crate.modules.entries() in the compiler are the macro-filter rebuild, the module-graph dump, and the @cfg module remap (compiler_core.tg)" \
   'test "$(grep -c "crate.modules.entries()" tg_compiler/compiler_core.tg)" -eq 3'
+
+# ———————————————————————————————————————————————————————————————
+# G13 Mutation-site invariants (the per-mutation detectors)
+# ———————————————————————————————————————————————————————————————
+# The bounded mutation harness (scripts/run_mutation_tests.sh) applies one
+# mutation at a time to a COPY of the tree and runs the structural suite.
+# Each assertion below pins the CANONICAL SEMANTIC FORM of one mutation
+# target site: the mutation destroys its own site's canonical form, so the
+# mutated copy fails exactly the G13 assertion that guards its category
+# (the kill instrument; on the pristine tree every assertion holds). The
+# mapping is the harness's mutation catalog:
+#   G13.1  <- mut-invert-comparison        G13.8  <- mut-field-offset
+#   G13.2  <- mut-delete-diagnostic        G13.9  <- mut-enum-tag
+#   G13.3  <- mut-consume-to-read          G13.10 <- mut-remove-overflow-check
+#   G13.4  <- mut-modify-to-read           G13.11 <- mut-branch-target
+#   G13.5  <- mut-remove-drop-mark         G13.12 <- mut-remove-wake
+#   G13.6  <- mut-duplicate-drop           G13.13 <- mut-remove-atomic-ordering
+#   G13.7  <- mut-skip-verifier            G13.14 <- mut-equality-to-permissive
+# ———————————————————————————————————————————————————————————————
+group G13 "Mutation-site invariants (the per-mutation detectors)"
+
+t G13.1 'invert-comparison detector: the field-index bounds check is the canonical `>= 0 && < len()` form (a valid index is never rejected)' \
+  'grep -qF "if fid.index >= 0 && fid.index < fields.len() then" tg_compiler/types.tg'
+
+t G13.2 "delete-diagnostic detector: the ABI-classification block's two diagnostic arms are both present (the extern-unknown arm's deletion breaks the two-site count and the expected substring goes missing)" \
+  'test "$(grep -c "extern function carries unknown ABI classification" tg_compiler/mir.tg)" -eq 1 && test "$(grep -c "non-extern function carries ABI classification" tg_compiler/mir.tg)" -eq 1'
+
+t G13.3 "consume-to-read detector: the partial-move binder still classifies AccessEffect::Consume (a moving binding is never read-only)" \
+  'grep -qF "if bp.action == AccessEffect::Consume then" tg_compiler/types.tg && grep -q "canary_neg_access_sink_twice.tg.*consumed twice" tests/canary_neg/MANIFEST && grep -q "canary_neg_access_sink_use_after.tg.*use of consumed" tests/canary_neg/MANIFEST && grep -qF "consumed twice" tg_compiler/resource_check.tg'
+
+t G13.4 "modify-to-read detector: the inout access convention still maps to AccessEffect::Modify (an inout parameter is never read-only)" \
+  'grep -qF "when AccessConvention::Inout then AccessEffect::Modify" tg_compiler/mir.tg && grep -q "canary_neg_access_inout_dup.tg.*conflicting accesses" tests/canary_neg/MANIFEST && grep -qF "conflicting accesses" tg_compiler/access_check.tg'
+
+t G13.5 "remove-drop-mark detector: the partial-move registry still marks the consumed place (the MIR partial-drop chain sees the Consumed state)" \
+  'grep -qF "ext.insert(path.clone(), PlaceMoveState::Consumed)" tg_compiler/types.tg && grep -q "canary_neg_resource_use_after_consume.tg.*consumed" tests/canary_neg/MANIFEST && grep -qF "use of consumed" tg_compiler/resource_check.tg'
+
+t G13.6 "duplicate-drop detector: the deinit-count invariants — the MirDeinit identity guard and the deinit-instance registration site both present, each exactly once (a duplicate/unregistered deinit is a verifier error; the collection site count is pinned)" \
+  'grep -qF "if !deinit_instances.contains(&inst_key) && !drop_glue_fns.contains_key(&inst_key) then" tg_compiler/mir.tg && test "$(grep -c "collect_deinit_plan_instances(&dp, &mut deinit_instances)" tg_compiler/mir.tg)" -eq 1'
+
+t G13.7 "skip-verifier detector: the MIR firewall calls verify_function_v2 from verify_mir and never early-returns an empty error list" \
+  'test "$(grep -c "verify_function_v2(&type_index" tg_compiler/mir.tg)" -eq 1 && test "$(awk "/^def verify_mir\(/{f=1; next} f && /^def /{f=0} f && /return Vec::new\(\)/{n++} END{print n+0}" tg_compiler/mir.tg)" -eq 0'
+
+t G13.8 "field-offset detector: the Map header key_stride offset is the canonical 24 (the MAP_HEADER_FIELDS table)" \
+  'grep -qE "field_name == \"key_stride\".*then Option::Some\(24\)" tg_compiler/layout_engine.tg'
+
+t G13.9 "enum-tag detector: the TaggedUnion layout record pins tag_size 8 / payload_offset 8 (F3 — tag at 0, payload at 8)" \
+  'grep -qF "tag_size: 8" tg_compiler/layout_engine.tg && grep -qF "payload_offset: 8" tg_compiler/layout_engine.tg && grep -qF "\"B7: Enum tag at offset 0\"" tests/layout_tests.tg'
+
+t G13.10 "remove-overflow-check detector: layout_checked_add keeps the fail-closed overflow guard (a wrapped size/offset never reaches the emitter)" \
+  'grep -qF "if b > 9223372036854775807 - a then" tg_compiler/layout_engine.tg && grep -qF "if a != 0 && b > 9223372036854775807 / a then" tg_compiler/layout_engine.tg'
+
+t G13.11 "branch-target detector: verify_function_v2 early-returns ONLY for extern functions (the non-extern edge stays verified)" \
+  'test "$(awk "/^def verify_function_v2\(/{f=1} f && /if func.is_extern then return end/{n++} f && /^def / && !/^def verify_function_v2/{f=0} END{print n+0}" tg_compiler/mir.tg)" -eq 1 && ! grep -qF "if !func.is_extern then return end" tg_compiler/mir.tg'
+
+t G13.12 "remove-wake detector: the task waker's wake_task dispatch site is present (the ready-queue wake path exists)" \
+  'grep -qF "      exec.wake_task(self.task_id)" std/async.tg && test "$(grep -c "wake_task" std/async.tg)" -eq 10'
+
+t G13.13 "remove-atomic-ordering detector: the x86 SeqCst store branch and the a64 ordering arms (ldaddal/casal/xchg) are present" \
+  'grep -qF "emit8(&mut ctx.text, 0x05)   # cmp edx, 5 (SeqCst)" tg_compiler/codegen.tg && grep -q "a64_ldaddal" tg_compiler/codegen.tg && grep -q "a64_casal" tg_compiler/codegen.tg && grep -q "xchg" tg_compiler/codegen.tg'
+
+t G13.14 'permissive-equality detector: the EXACT-equality invariants (the E0225-class) — the depth-1 projection check is the exact `== 1`, the convention-equality site is the exact `!(cpt.convention == ipt.convention)` form with the E0225 code, and the convention-mismatch negative canaries pin the expected text; the permissive `>= 1` never appears at the projection site' \
+  'grep -qF "if keys.len() == 1 then" tg_compiler/types.tg && ! grep -qF "if keys.len() >= 1 then" tg_compiler/types.tg && grep -qF "if !(cpt.convention == ipt.convention) then" tg_compiler/types.tg && grep -q "\"E0225\"" tg_compiler/types.tg && grep -q "canary_neg_conv_convention_inout_let.tg.*access convention mismatch" tests/canary_neg/MANIFEST && grep -q "canary_neg_conv_convention_let_inout.tg.*access convention mismatch" tests/canary_neg/MANIFEST'
 
 # ———————————————————————————————————————————————————————————————
 # G12 Summary report

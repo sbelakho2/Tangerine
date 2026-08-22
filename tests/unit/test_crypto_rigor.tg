@@ -637,3 +637,193 @@ def test_base64_rfc4648_vectors() -> Unit
   let bad = std::crypto::base64::decode("Zm9$")
   assert_true(_is_err(bad))
 end
+
+# ———————————————————————————————————————————————————————————————
+# The STRENGTHENED lane (the adversarial audit): the padding edges, the
+# tampered-padding rejection, the dkLen boundary prefix property, the
+# block-boundary HMAC classes, the SHAKE output-prefix stream property,
+# and the base64 padding-class boundary (the lenient accepts vs the hard
+# rejects).
+# ———————————————————————————————————————————————————————————————
+
+@test
+def test_aes_cbc_padding_boundary_round_trips() -> Unit
+  let key = _fixed16("2b7e151628aed2a6abf7158809cf4f3c")
+  let iv = _fixed16("000102030405060708090a0b0c0d0e0f")
+  # The PKCS7 padding edges: 0 -> one full 0x10 pad block; 1..15 -> the
+  # remainder; 16 -> the MANDATORY full pad block (16 + 16 ciphertext
+  # bytes); 17 -> two blocks with 15 pad bytes; 31 -> 1 pad byte; 32 ->
+  # the full pad block again; 33 -> three blocks with 15 pad bytes.
+  for len in [0, 1, 15, 16, 17, 31, 32, 33] do
+    let msg = _pattern_bytes(len as UInt)
+    let ct = assert_ok(std::crypto::aes_cbc_encrypt(&key, &iv, &msg))
+    let recovered = assert_ok(std::crypto::aes_cbc_decrypt(&key, &iv, &ct))
+    assert_eq(std::crypto::hex::encode(recovered.as_slice()), std::crypto::hex::encode(msg.as_slice()))
+    # The ciphertext length pins the padding edge: always one full block
+    # MORE than the data blocks (the padding is never elided).
+    assert_eq(ct.len(), (16 * (len / 16 + 1)) as UInt)
+  end
+end
+
+@test
+def test_aes_cbc_tampered_last_padding_block_rejected() -> Unit
+  let key = _fixed16("2b7e151628aed2a6abf7158809cf4f3c")
+  let iv = _fixed16("000102030405060708090a0b0c0d0e0f")
+  # A 16-byte plaintext yields a 32-byte ciphertext: the data block plus
+  # the FULL 0x10-padding block. ANY flip inside the padding block must
+  # break the PKCS7 validation deterministically.
+  let plaintext = _pattern_bytes(16)
+  let ct = assert_ok(std::crypto::aes_cbc_encrypt(&key, &iv, &plaintext))
+  # Flip the FIRST byte of the padding block: the padding length stays
+  # 16 but the byte 0x10 ^ 0xff != 0x10 — the padding-bytes check fails.
+  var t1 = ct
+  t1[16] = t1[16] ^ 0xff
+  assert_true(_is_err(std::crypto::aes_cbc_decrypt(&key, &iv, &t1)))
+  # Flip the LAST byte (the padding length itself): 16 ^ 0xff = 239 > 16
+  # — the padding-length check fails.
+  var t2 = ct
+  t2[31] = t2[31] ^ 0xff
+  assert_true(_is_err(std::crypto::aes_cbc_decrypt(&key, &iv, &t2)))
+  # The untampered control still decrypts.
+  let ok = assert_ok(std::crypto::aes_cbc_decrypt(&key, &iv, &ct))
+  assert_eq(std::crypto::hex::encode(ok.as_slice()), std::crypto::hex::encode(plaintext.as_slice()))
+end
+
+@test
+def test_aes_cbc_empty_and_nonblock_ciphertexts_rejected() -> Unit
+  let key = _fixed16("2b7e151628aed2a6abf7158809cf4f3c")
+  let iv = _fixed16("000102030405060708090a0b0c0d0e0f")
+  # The empty ciphertext passes the 16-multiple gate and must hit the
+  # empty-plaintext guard; 17 bytes fails the 16-multiple gate; 0 is a
+  # legal PLAINTEXT (encrypts to the full padding block — the edge of
+  # the edge).
+  let empty: Vec[u8] = Vec::new()
+  assert_true(_is_err(std::crypto::aes_cbc_decrypt(&key, &iv, &empty)))
+  let seventeen = _pattern_bytes(17)
+  assert_true(_is_err(std::crypto::aes_cbc_decrypt(&key, &iv, &seventeen)))
+  let ct = assert_ok(std::crypto::aes_cbc_encrypt(&key, &iv, &empty))
+  assert_eq(ct.len(), 16)
+end
+
+@test
+def test_pbkdf2_dklen_boundary_prefix_property() -> Unit
+  # PBKDF2 derives its blocks INDEPENDENTLY: the first dk_len bytes of a
+  # longer derivation must equal the shorter derivation exactly — the
+  # block-boundary truncation property at 33/64/65/96 (32 is the hash
+  # block size; 33 and 65 are the one-past-the-block edges).
+  let pw = "passwd".to_string().as_bytes()
+  let salt = "salt".to_string().as_bytes()
+  let d33 = std::crypto::pbkdf2_sha256_core(pw, salt, 2, 33)
+  let d64 = std::crypto::pbkdf2_sha256_core(pw, salt, 2, 64)
+  let d65 = std::crypto::pbkdf2_sha256_core(pw, salt, 2, 65)
+  let d96 = std::crypto::pbkdf2_sha256_core(pw, salt, 2, 96)
+  assert_eq(d33.len(), 33)
+  assert_eq(d64.len(), 64)
+  assert_eq(d65.len(), 65)
+  assert_eq(d96.len(), 96)
+  var i: UInt = 0
+  while i < 33 do
+    assert_eq(d33[i], d64[i])
+    assert_eq(d33[i], d96[i])
+    i = i + 1
+  end
+  var j: UInt = 0
+  while j < 65 do
+    assert_eq(d65[j], d96[j])
+    j = j + 1
+  end
+  var k: UInt = 0
+  while k < 64 do
+    assert_eq(d64[k], d96[k])
+    k = k + 1
+  end
+end
+
+@test
+def test_hmac_block_boundary_incremental_vs_one_shot() -> Unit
+  # The HMAC key-block boundary: keys of 63/64/65 and 127/128/129 bytes
+  # (below/at/above the 64-byte inner block — the 65+ class pre-hashes
+  # the key) crossed with messages at the SHA-256 padding edges
+  # 55/56/64/65. The byte-by-byte incremental path must agree with the
+  # one-shot path at every combination.
+  let key_edges = [63, 64, 65, 127, 128, 129]
+  let msg_edges = [55, 56, 64, 65]
+  for kl in key_edges do
+    for ml in msg_edges do
+      let key = _pattern_bytes(kl as UInt)
+      let msg = _pattern_bytes(ml as UInt)
+      let one_shot = std::crypto::hmac_sha256(&key, &msg)
+      let mut hmac = std::crypto::HmacSha256::new(&key)
+      let s = msg.as_slice()
+      var i = 0
+      while i < s.len() do
+        hmac.update(s.slice(i, i + 1))
+        i = i + 1
+      end
+      let incremental = hmac.finalize()
+      assert_eq(std::crypto::hex::encode(&one_shot), std::crypto::hex::encode(&incremental))
+    end
+  end
+end
+
+@test
+def test_sha3_shake_output_prefix_consistency() -> Unit
+  # SHAKE is the variable-length output primitive: the first n bytes of
+  # the (n+1)-byte output MUST equal the n-byte output — the stream
+  # property across the 0/1/15/16/17/31/32/33/63/64/65 output lengths
+  # (the 16/32/64 classes are the sponge-rate multiples).
+  let msg = _pattern_bytes(17)
+  let out_lens = [0, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65]
+  for n in out_lens do
+    let short = std::crypto::shake128(&msg, n as UInt)
+    assert_eq(short.len(), n as UInt)
+    if n > 0 then
+      let long = std::crypto::shake128(&msg, (n + 1) as UInt)
+      var i: UInt = 0
+      while i < n as UInt do
+        assert_eq(short[i], long[i])
+        i = i + 1
+      end
+    end
+  end
+  for n in out_lens do
+    let short = std::crypto::shake256(&msg, n as UInt)
+    assert_eq(short.len(), n as UInt)
+    if n > 0 then
+      let long = std::crypto::shake256(&msg, (n + 1) as UInt)
+      var i: UInt = 0
+      while i < n as UInt do
+        assert_eq(short[i], long[i])
+        i = i + 1
+      end
+    end
+  end
+end
+
+@test
+def test_base64_padding_class_boundaries() -> Unit
+  # The canonical RFC 4648 encodings are pinned above; this pins the
+  # padding-CLASS boundary: the LENIENT accepts (missing/excess trailing
+  # padding are the decoder's defined behaviors — `= is trimmed from the
+  # end`) and the HARD rejects (padding mid-stream is not a base64 digit;
+  # invalid characters).
+  # Missing padding: "Zg" decodes to the same byte as the padded form.
+  let no_pad = assert_ok(std::crypto::base64::decode("Zg"))
+  assert_eq(std::crypto::hex::encode(no_pad.as_slice()), "66")
+  let with_pad = assert_ok(std::crypto::base64::decode("Zg=="))
+  assert_eq(std::crypto::hex::encode(with_pad.as_slice()), "66")
+  # Excess padding: "Zm9vYg===" is accepted (the trailing = is trimmed).
+  let excess = assert_ok(std::crypto::base64::decode("Zm9vYg==="))
+  assert_eq(std::crypto::hex::encode(excess.as_slice()), "666f6f62")
+  # The degenerate padding-only input decodes to the empty byte string.
+  let pads = assert_ok(std::crypto::base64::decode("===="))
+  assert_eq(pads.len(), 0)
+  # Padding in the MIDDLE is rejected (the = is not a base64 digit).
+  assert_true(_is_err(std::crypto::base64::decode("AA=A")))
+  assert_true(_is_err(std::crypto::base64::decode("Zg=Z")))
+  # The URL-safe variant re-pads by the length class and decodes.
+  let url1 = assert_ok(std::crypto::base64::decode_url("Zg"))
+  assert_eq(std::crypto::hex::encode(url1.as_slice()), "66")
+  let url2 = assert_ok(std::crypto::base64::decode_url("Zm9vYmFy"))
+  assert_eq(std::crypto::hex::encode(url2.as_slice()), "666f6f626172")
+end
