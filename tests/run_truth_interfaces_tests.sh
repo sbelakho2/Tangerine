@@ -12,6 +12,12 @@
 #       violation is counted and the invocation fails — and a clean file
 #       passes with zero violations (the never-incremented
 #       violation_count stub is gone).
+#   (3) std::gpu_vulkan's device properties are the UNSUPPORTED contract
+#       (P1.11): the enumeration returns the Unsupported error and never
+#       FABRICATES device values (the undefined `from_native` path is
+#       gone); the software/reference backend stays the supported path.
+#       The check is structural (the module's FFI surface is unbound, so
+#       it cannot be executed on this host).
 #
 # Usage: tests/run_truth_interfaces_tests.sh [compiler]
 #   compiler defaults to ./build/tg_stage1
@@ -115,6 +121,33 @@ if echo "$OUT" | grep -q "Violations: 0"; then
   pass "the clean file counts zero violations"
 else
   fail "clean file violation count: $OUT"
+fi
+
+echo ""
+echo "--- (3) std::gpu_vulkan: the UNSUPPORTED device properties (no fabricated values) ---"
+
+if grep -q "physical-device enumeration is UNSUPPORTED" std/gpu_vulkan.tg; then
+  pass "the enumeration returns the UNSUPPORTED error"
+else
+  fail "std/gpu_vulkan.tg has no UNSUPPORTED device-properties diagnostic"
+fi
+
+if grep -q "never fabricates device values" std/gpu_vulkan.tg; then
+  pass "the module states the never-fabricate contract"
+else
+  fail "std/gpu_vulkan.tg does not state the never-fabricate contract"
+fi
+
+if grep -q "from_native" std/gpu_vulkan.tg; then
+  fail "std/gpu_vulkan.tg still references the undefined PhysicalDevice::from_native fabrication path"
+else
+  pass "the undefined from_native fabrication path is gone"
+fi
+
+if grep -q "use the software/reference backend (std::gpu) or bind the real loader FFI" std/gpu_vulkan.tg; then
+  pass "the supported path (the software/reference backend) is stated"
+else
+  fail "std/gpu_vulkan.tg does not point to the software/reference backend"
 fi
 
 echo ""

@@ -65,9 +65,10 @@ public enum SourceLoader {
 ///   binary            0b1010 / 0B1010
 ///   octal             0o17 / 0O17
 ///   digit separators  1_000_000 and 8_u (separator before the suffix)
-///   integer suffixes  u i u8 u16 u32 u64 i8 i16 i32 i64 (stripped before
-///                     range evaluation — the suffix selects a narrower
-///                     target width; the magnitude gate is the host range)
+///   integer suffixes  u i u8 u16 u32 u64 u128 i8 i16 i32 i64 i128
+///                     usize isize (stripped before range evaluation —
+///                     the suffix selects a narrower target width; the
+///                     magnitude gate is the host range)
 ///
 /// The gate is conservative on the signed edge: a literal is a MAGNITUDE
 /// (a leading '-' is the unary-negation expression, not part of the
@@ -76,7 +77,8 @@ public enum SourceLoader {
 /// 0xcbf29ce484222325) are unsigned 64-bit values. Values above
 /// UInt64.max are rejected with E9030 at parse time, and
 /// MIRLowering.parseInt preserves the bit pattern for the unsigned domain
-/// (no silent `?? 0` truncation).
+/// (a literal that still cannot be parsed is reported at its span — never
+/// a silent `?? 0`).
 public enum NumericLiteralGuard {
 
     /// True when `literal` fits the host UInt64 magnitude range.
@@ -97,9 +99,11 @@ public enum NumericLiteralGuard {
     private static func magnitudeDigits(_ literal: String) -> (String, Int)? {
         var clean = literal
         // Suffix grammar: optional separator underscore, then u|i with an
-        // optional width (u, i, u8..u64, i8..i64). The separator-before-
-        // suffix spelling (8_u) is language-grade.
-        if let r = clean.range(of: #"(?:_)?[ui](?:8|16|32|64)?$"#, options: .regularExpression) {
+        // optional width (u, i, u8..u128, i8..i128, usize, isize). The
+        // separator-before-suffix spelling (8_u) is language-grade. The
+        // set mirrors the kernel's `integer_suffix_valid` (plus the
+        // stage0's documented `_` separator).
+        if let r = clean.range(of: #"(?:_)?(?:[ui](?:8|16|32|64|128)?|usize|isize)$"#, options: .regularExpression) {
             clean = String(clean[clean.startIndex..<r.lowerBound])
         }
         clean = clean.replacingOccurrences(of: "_", with: "")

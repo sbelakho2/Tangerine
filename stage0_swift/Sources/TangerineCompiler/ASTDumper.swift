@@ -303,8 +303,17 @@ public final class ASTDumper {
             push()
             emit("Cond:"); push(); dumpExpr(e.condition); pop()
             emit("Then:"); push(); dumpBlock(e.thenBlock); pop()
-            for clause in e.elsifClauses {
-                emit("ElsIf:"); push(); dumpExpr(clause.condition); dumpBlock(clause.body); pop()
+            for (clauseIndex, clause) in e.elsifClauses.enumerated() {
+                emit("ElsIf:"); push()
+                if clauseIndex < e.elsifLet.count {
+                    let (pat, value) = e.elsifLet[clauseIndex]
+                    emit("LetPattern:"); push(); dumpPattern(pat); pop()
+                    emit("LetValue:"); push(); dumpExpr(value); pop()
+                } else {
+                    dumpExpr(clause.condition)
+                }
+                dumpBlock(clause.body)
+                pop()
             }
             if let el = e.elseBlock {
                 emit("Else:"); push(); dumpBlock(el); pop()

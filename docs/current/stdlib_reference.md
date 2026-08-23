@@ -134,10 +134,10 @@ forbidden-syntax grep backstop; the gate is a **required CI job**
 4. [Memory Allocation](#memory-allocation) - `std/alloc`
 5. [Environment](#environment) - `std/env`
 6. [Backtrace](#backtrace) - `std/backtrace`
-7. [Serialization](#serialization) - `std/serde`, `std/json`, `std/toml`
+7. [Serialization](#serialization) - `std/serde`, `std/json`, `std/toml`, `std/cbor`
 8. [HTTP & Networking](#http--networking) - `std/http`, `std/url`, `std/net`
 9. [Web Framework](#web-framework) - `std/web`
-10. [Database](#database) - `std/db`
+10. [Database](#database) - `std/db`, `std/sql`
 11. [Cryptography](#cryptography) - `std/crypto`
 12. [CLI & Terminal](#cli--terminal) - `std/cli`
 13. [Logging & Tracing](#logging--tracing) - `std/log`
@@ -159,7 +159,7 @@ forbidden-syntax grep backstop; the gate is a **required CI job**
 29. [Semantic Diff](#semantic-diff) - `std/semantic_diff`
 30. [Supply Chain Security](#supply-chain-security) - `std/supply_chain`
 31. [Mathematics](#mathematics) - `std/math`
-32. [Random Numbers](#random-numbers) - `std/random`
+32. [Random Numbers](#random-numbers) - `std/random`, `std/rand`
 33. [Path Manipulation](#path-manipulation) - `std/path`
 34. [CSV](#csv) - `std/csv`
 35. [YAML](#yaml) - `std/yaml`
@@ -411,9 +411,34 @@ let s = stringify(&obj);
 - **`MaxDepthExceeded`**: The nesting depth of the JSON exceeded the safe limit (`MAX_JSON_DEPTH`).
 - **`TrailingComma`**: A trailing comma was found in an object or array (forbidden by spec).
 
+#### The document policy (RFC 8259 §8.1)
+- `parse` is the DOCUMENT parser: `parse_document = value + optional whitespace + REQUIRED end of input`. Any unconsumed input after the value is `UnexpectedChar` ("trailing data after JSON document") — never a silent success.
+- The policy rejects the JSONTestSuite `n_*` class: trailing garbage (`"{} junk"`), a second value (`"1 2"`), and the leading-zero number prefix (`"01"` parses the `0` and must fail on the `1` residue; `"-01"` likewise).
+- The behavior is pinned by `tests/unit/test_json_rigor.tg`.
+
 #### Security & Capabilities
 - Implements strict RFC 8259 compliance.
 - Depth limiting (default 128) prevents recursion-based DoS.
+
+---
+
+### `std/cbor` - CBOR
+
+Concise Binary Object Representation (RFC 8949) binary serialization.
+
+```tangerine
+use std::cbor::{cbor_encode, cbor_decode_strict, Value}
+
+let v = Value::Array(Vec::from([Value::UnsignedInt(1), Value::UnsignedInt(2)]));
+let bytes = cbor_encode(v);
+let back = cbor_decode_strict(bytes)?;
+```
+
+#### Coverage (RFC 8949)
+- The full major-type matrix: unsigned/negative integers, byte/text strings, arrays, maps, tags, simple values, and the float16/float32/float64 forms.
+- **The indefinite-length forms (additional info 31):** the indefinite byte-string (`0x5F`) and text-string (`0x7F`) chunking (definite-length chunks of the same major type, terminated by the `0xFF` break), the indefinite array (`0x9F`) and the indefinite map (`0xBF`). The decode side is fully implemented; the encode side emits the definite forms by default (RFC 8949 §3.2 permits either) with the explicit `Encoder::encode_indefinite_*` forms for chunked bytes/text/arrays/maps.
+- A break byte (`0xFF`) outside an indefinite-length context is `UnexpectedBreak`; an invalid chunk inside a chunked string is `InvalidIndefiniteChunk`; `cbor_decode_strict` rejects trailing data (`TrailingData`).
+- The RFC 8949 Appendix A vectors (definite and indefinite) are pinned by `tests/unit/test_cbor_rigor.tg`, including the round-trips and the definite/indefinite value equivalence (`cbor_value_eq`).
 
 ---
 
@@ -480,6 +505,12 @@ let bytes = secure_rng.fill_bytes(&mut buf);
 #### Compatibility
 - Floating point generation uses a standard 53-bit shift for consistency.
 - Distributions (Uniform, Normal, Bernoulli, Exponential) are implemented using deterministic algorithms.
+
+#### `std::rand` — the deterministic PRNGs and the published reference vectors
+- `std::rand::Xoshiro256PlusPlus::next_u64` is the reference xoshiro256++ output formula `rotl(s0 + s3, 23) + s0` with the reference state transition (`t = s1 << 17`; `s2 ^= s0`; `s3 ^= s1`; `s1 ^= s2`; `s0 ^= s3`; `s2 ^= t`; `s3 = rotl(s3, 45)`). The published vectors are pinned by `XOSHIRO256PP_REF_VECTORS` (the reference implementation's first ten values from the state `{1, 2, 3, 4}`).
+- `std::rand::ChaCha20Rng::new([0u8; 32])` reproduces the RFC 8439 zero block (the all-zero key/nonce, counter 0), pinned by `CHACHA20_ZERO_BLOCK`.
+- `std::rand::Pcg32::new(seed)` is the pcg-basic reference seeding shape (`pcg32_srandom_r(state = seed, seq = seed)`) with the XSH-RR output, pinned by `PCG32_REF_VECTORS`.
+- The seeded-state → exact-sequence mapping is asserted by `tests/unit/test_rand_behavior.tg`.
 
 ---
 
@@ -901,9 +932,14 @@ let graph = load_graph("project.tg")?;
 let deps = graph.query_dependencies("my_module::my_function");
 ```
 
+#### The versioned serialization and the strict parser
+- The on-disk format is versioned: the first non-empty line is the REQUIRED `GRAPH 1` header, followed by one declaration per line — `NODE <id> <kind>` and `EDGE <source> <target> <kind>`. Blank lines are skipped.
+- The parser is STRICT: an unknown non-empty line is `InvalidGraph` (never silently ignored); a missing version header and an unsupported version are `InvalidGraph` too.
+- `serialize_graph` produces the canonical text; `save_graph` writes it (both round-trip: `save_graph` → `load_graph` reproduces the identical serialization, pinned with the hash proofs in `tests/unit/test_graph_rigor.tg`).
+
 #### How it fails
 - **`NotFound`**: A requested symbol or edge does not exist in the graph.
-- **`InvalidGraph`**: The persisted graph file is malformed or uses an incompatible version.
+- **`InvalidGraph`**: The persisted graph file is malformed, carries an unknown line, or uses an incompatible version.
 - **`Internal`**: Unexpected error in the graph indexing or query engine.
 
 #### Security & Capabilities
@@ -1415,6 +1451,33 @@ migrator.run_migration("001_create_users", r#"
   )
 "#)?
 ```
+
+---
+
+### `std/sql` - SQL Facade
+
+The SQL abstraction layer: typed parameters, prepared statements, and the connection facade.
+
+```tangerine
+use std::sql::{Connection, PreparedStatement}
+
+let conn = SqliteConnection::open("app.db", fs)?;
+let mut stmt = conn.prepare("SELECT * FROM users WHERE id = ?")?;
+stmt.bind(1, SqlParam::Int(7))?;
+# The execution surface is the concrete driver's Connection::execute —
+# the facade's prepared statement itself carries no driver path.
+```
+
+#### The execute contract (P0.3/P1.6)
+- `PreparedStatement::bind` is 1-based and records the binding on the statement.
+- `PreparedStatement::execute` is the explicit **`Err(SqlError::QueryFailed(ErrorCode::Unsupported))`** — the silent `Ok(ResultSet { rows: [] })` is gone. A facade statement can never fabricate rows: the sqlite-backed statement created by the concrete driver's `Connection::prepare` executes through the driver's `Connection::execute` on the connection that prepared it.
+- The contract is pinned by `tests/unit/test_sql_rigor.tg`.
+
+#### How it fails
+- **`ConnectionFailed`**: The connection could not be established.
+- **`QueryFailed`**: The query or prepared-statement execution failed (including the facade's explicit unsupported error).
+- **`InvalidParam`**: A parameter index outside the 1-based range or an invalid parameter value.
+- **`Internal`**: An unexpected error in the SQL provider.
 
 ---
 

@@ -2946,6 +2946,14 @@ public final class Parser {
     private func parseMultiplication() -> Expr {
         var expr = parseUnary()
         while at(.star) || at(.slash) || at(.percent) {
+            // The kernel authority (parser.tg:5216-5223): a `*` at the start
+            // of a NEW line is a dereference expression starting a new
+            // statement, NOT a multiplication continuation — only treat `*`
+            // as a binary multiply when it appears on the same line as the
+            // left operand.
+            if peekKind() == .star && sourceRangeContainsNewline(from: previousTokenEnd, to: currentSpan.start) {
+                break
+            }
             let op: BinaryOp
             switch peekKind() {
             case .star:    op = .mul
@@ -3202,10 +3210,6 @@ public final class Parser {
                 if at(.lBrace) && isStructLiteralContext(fullName) {
                     return parseStructLiteral(name: fullName, typeArgs: typeArgs, start: start)
                 }
-                // Check for end-block struct literal: Name::Path\n  field: value\nend
-                if looksLikeEndStructLiteral(fullName) {
-                    return parseEndStructLiteral(name: fullName, typeArgs: typeArgs, start: start)
-                }
                 // Check for call: Path(args)
                 if at(.lParen) {
                     advance()
@@ -3231,9 +3235,6 @@ public final class Parser {
                 }
                 if at(.lBrace) && isStructLiteralContext(fullName) {
                     return parseStructLiteral(name: fullName, typeArgs: typeArgs, start: start)
-                }
-                if looksLikeEndStructLiteral(fullName) {
-                    return parseEndStructLiteral(name: fullName, typeArgs: typeArgs, start: start)
                 }
                 if at(.lParen) {
                     advance()
@@ -3305,9 +3306,21 @@ public final class Parser {
                 return .arrayRepeat(value: first, count: count, start.merged(with: currentSpan))
             }
             var elements = [first]
-            while eat(.comma) {
+            while true {
                 if at(.rBracket) { break }
-                elements.append(parseExpr())
+                if eat(.comma) {
+                    if at(.rBracket) { break }
+                    elements.append(parseExpr())
+                    continue
+                }
+                // Lenient element separation: a newline acts as an element
+                // separator when the comma is absent (the kernel's
+                // resolver.tg string-array lines are newline-separated).
+                if atExprStart() && sourceRangeContainsNewline(from: previousTokenEnd, to: currentSpan.start) {
+                    elements.append(parseExpr())
+                    continue
+                }
+                break
             }
             expect(.rBracket)
             return .array(elements, start.merged(with: currentSpan))
@@ -3367,13 +3380,27 @@ public final class Parser {
             return .breakExpr(nil, start)
 
         case .kwNext:
-            // Only treat as control flow if not followed by ., ::, or (
-            if peekAhead(1) == .dot || peekAhead(1) == .colonColon || peekAhead(1) == .lParen {
+            // `next` is the continue statement only when it stands alone at
+            // a statement boundary. In every VALUE position — `next = ...`,
+            // `next - 1`, `foo(next)`, `next.field` — it is the contextual
+            // identifier "next" (the kernel's parse_expr maps TokenKind::Next
+            // to ExprIdent("next"); expect_ident accepts it as a param/field
+            // name; parse_pattern accepts it as a binding).
+            switch peekAhead(1) {
+            case .dot, .colonColon, .lParen,
+                 .eq, .plusEq, .minusEq, .starEq, .slashEq, .percentEq,
+                 .caretEq, .ampEq, .pipeEq, .shlEq, .shrEq,
+                 .minus, .plus, .star, .slash, .percent, .tilde,
+                 .lt, .ltEq, .gt, .gtEq, .eqEq, .bangEq,
+                 .ampAmp, .pipePipe, .amp, .pipe, .caret, .shl, .shr,
+                 .rParen, .rBracket, .comma, .colon, .question, .arrow,
+                 .dotDot, .dotDotEq, .kwAs:
                 advance()
                 return .name("next", start)
+            default:
+                advance()
+                return .nextExpr(start)
             }
-            advance()
-            return .nextExpr(start)
 
         case .kwUnsafe:
             return parseUnsafeBlock()
@@ -3495,10 +3522,21 @@ public final class Parser {
                 var elseStmts: [Stmt] = []
                 if let stmt = parseStatement() {
                     elseStmts.append(stmt)
-                    let elseCol = columnOf(offset: elseSpan.start)
+                    // The else branch is a single-expression branch only
+                    // when every following statement sits at a SHALLOWER
+                    // column than the branch's own first statement — a
+                    // following statement at the same (or deeper) column
+                    // belongs to the else block (the kernel's block-else
+                    // form: `let v = if c then a else` + a multi-statement
+                    // body + `end`, as in tg_compiler/mir.tg's
+                    // mir_signature_param_types). The std/fft.tg window
+                    // construction keeps the single-expression reading: its
+                    // next statement is at the enclosing block's column,
+                    // shallower than the branch body.
+                    let elseBodyCol = columnOf(offset: elseBodyStart.start)
                     while (at(.kwLet) || at(.kwMut) || atVarBinding() || at(.at) || atExprStart())
                             && !atBlockBodyTerminator()
-                            && columnOf(offset: currentSpan.start) > elseCol {
+                            && columnOf(offset: currentSpan.start) >= elseBodyCol {
                         if let nextStmt = parseStatement() {
                             elseStmts.append(nextStmt)
                         } else {
@@ -3553,6 +3591,10 @@ public final class Parser {
                               elsifClauses: elsifClauses.map { ($0.condition, $0.body) },
                               elseBlock: elseBlock,
                               ifLetPattern: branch.pattern, ifLetValue: branch.value,
+                              elsifLet: elsifClauses.compactMap { b in
+                                  if let p = b.pattern, let v = b.value { return (p, v) }
+                                  return nil
+                              },
                               span: start.merged(with: currentSpan)))
     }
 
@@ -4599,6 +4641,11 @@ public final class Parser {
                     advance()
                     var sFields: [(String, Pattern?)] = []
                     while !at(.rBrace) && !atEof() {
+                        // Struct rest pattern: `..` — ignore the remaining fields.
+                        if eat(.dotDot) {
+                            _ = eat(.comma)
+                            break
+                        }
                         let fName = expectIdent()
                         var fPat: Pattern? = nil
                         if eat(.colon) {
@@ -4620,6 +4667,11 @@ public final class Parser {
                 advance()
                 var fields: [(String, Pattern?)] = []
                 while !at(.rBrace) && !atEof() {
+                    // Struct rest pattern: `..` — ignore the remaining fields.
+                    if eat(.dotDot) {
+                        _ = eat(.comma)
+                        break
+                    }
                     let fName = expectIdent()
                     var fPat: Pattern? = nil
                     if eat(.colon) {
@@ -4811,8 +4863,10 @@ public final class Parser {
 
     /// Rejects integer literals whose magnitude does not fit the host Int
     /// range. The literal is carried as a string through the AST; without
-    /// this gate an overflowing literal would silently truncate to 0 at MIR
-    /// lowering (MIRLowering.parseInt `?? 0`).
+    /// this gate an overflowing literal would silently truncate at MIR
+    /// lowering. The lexer's numeric validation (E1010/E1014) already
+    /// rejects malformed spellings, and MIRLowering.parseInt reports any
+    /// literal that still cannot be parsed at its span — never a silent 0.
     private func checkIntegerLiteralRange(_ literal: String, span: Span) {
         if !NumericLiteralGuard.fitsHostRange(literal) {
             diagnostics.error(

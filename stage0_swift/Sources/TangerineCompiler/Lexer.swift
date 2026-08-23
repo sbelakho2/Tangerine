@@ -9,6 +9,9 @@ public final class Lexer {
     private var pos: Int = 0
     private let fileID: Int
     private let diagnostics: DiagnosticBag
+    /// Tokens produced by a keyword-boundary split (e.g. `enddef` → `end` + `def`)
+    /// that are waiting to be emitted after the token that triggered the split.
+    private var pending: [Token] = []
 
     public init(source: String, fileID: Int = 0, diagnostics: DiagnosticBag) {
         self.source = source
@@ -41,7 +44,11 @@ public final class Lexer {
 
     private func lexAll() -> [Token] {
         var tokens: [Token] = []
-        while pos < utf8.count {
+        while pos < utf8.count || !pending.isEmpty {
+            if !pending.isEmpty {
+                tokens.append(pending.removeFirst())
+                continue
+            }
             let tok = lexToken()
             tokens.append(tok)
         }
@@ -226,6 +233,18 @@ public final class Lexer {
         if let kw = TokenKind.keyword(for: text) {
             return Token(kind: kw, span: makeSpan(start, pos))
         }
+        // Keyword-boundary rule: the keywords are the longest-match
+        // identifiers, and a keyword token terminates at the whitespace /
+        // newline. A block-terminator keyword glued to a following keyword
+        // (e.g. `enddef` — `end` + `def`) is a boundary that the identifier
+        // scanning must not merge into a single token: split it back into
+        // the two keyword tokens (the kernel source contains such a glued
+        // boundary at std/env.tg:369).
+        if text.hasPrefix("end"), text.count > 3,
+           let kw = TokenKind.keyword(for: String(text.dropFirst(3))) {
+            pending.append(Token(kind: kw, span: makeSpan(start + 3, pos)))
+            return Token(kind: .kwEnd, span: makeSpan(start, start + 3))
+        }
         return Token(kind: .ident(text), span: makeSpan(start, pos))
     }
 
@@ -255,40 +274,53 @@ public final class Lexer {
         if pos < utf8.count && utf8[pos] == ascii(".") {
             // Look ahead to distinguish float from range (..)
             if pos + 1 < utf8.count && utf8[pos + 1] == ascii(".") {
-                // This is a range operator, not a float
-                consumeNumericSuffix()
-                let text = extractString(start, pos)
-                return Token(kind: .integer(text), span: makeSpan(start, pos))
+                // This is a range operator, not a float (the kernel's
+                // lex_number: a '.' must be followed by a digit to open a
+                // fractional part — `1.` is never a float).
+                return lexNumberTail(start: start, isFloat: false)
             }
             if pos + 1 < utf8.count && isDigit(utf8[pos + 1]) {
                 pos += 1 // consume .
                 consumeDigits()
-                // Optional exponent
+                // Optional exponent (the kernel's fail-closed rule: an e/E
+                // must be followed by an optional sign and at least one
+                // digit — the malformed `1.5e` forms are REJECTED with
+                // E1010, never a silent fallback).
                 if pos < utf8.count && (utf8[pos] == ascii("e") || utf8[pos] == ascii("E")) {
-                    pos += 1
-                    if pos < utf8.count && (utf8[pos] == ascii("+") || utf8[pos] == ascii("-")) {
-                        pos += 1
-                    }
-                    if pos >= utf8.count || !isDigit(utf8[pos]) {
-                        diagnostics.error(
-                            code: "E1010",
-                            message: "float exponent must contain digits",
-                            span: makeSpan(start, pos),
-                            stage: .lexer
-                        )
-                    } else {
-                        consumeDigits()
-                    }
+                    consumeExponent(start: start)
                 }
-                consumeNumericSuffix()
-                let text = extractString(start, pos)
-                return Token(kind: .float(text), span: makeSpan(start, pos))
+                return lexNumberTail(start: start, isFloat: true)
             }
         }
 
-        consumeNumericSuffix()
-        let text = extractString(start, pos)
-        return Token(kind: .integer(text), span: makeSpan(start, pos))
+        // Optional exponent on the integer spelling too (the kernel lexes
+        // `1e5` as a float literal — the exponent needs no fraction).
+        if pos < utf8.count && (utf8[pos] == ascii("e") || utf8[pos] == ascii("E")) {
+            consumeExponent(start: start)
+            return lexNumberTail(start: start, isFloat: true)
+        }
+
+        return lexNumberTail(start: start, isFloat: false)
+    }
+
+    /// The exponent scan: e/E, an optional sign, then at least one digit
+    /// (the kernel's fail-closed rule — the malformed `1e` / `1e+` forms
+    /// are REJECTED here, never a silent value).
+    private func consumeExponent(start: Int) {
+        pos += 1
+        if pos < utf8.count && (utf8[pos] == ascii("+") || utf8[pos] == ascii("-")) {
+            pos += 1
+        }
+        if pos >= utf8.count || !isDigit(utf8[pos]) {
+            diagnostics.error(
+                code: "E1010",
+                message: "float exponent must contain digits",
+                span: makeSpan(start, pos),
+                stage: .lexer
+            )
+        } else {
+            consumeDigits()
+        }
     }
 
     private func lexHexNumber(start: Int) -> Token {
@@ -305,9 +337,51 @@ public final class Lexer {
                 stage: .lexer
             )
         }
-        consumeNumericSuffix()
-        let text = extractString(start, pos)
-        return Token(kind: .integer(text), span: makeSpan(start, pos))
+        // Swift-compatible hex float extension (the audit's float grammar):
+        // `0x1.8p3` / `0x1p3` / `0x1.8` — a '.' followed by a hex digit
+        // opens the fraction, and an optional p/P binary exponent must
+        // carry at least one digit (the malformed exponent is the E1010
+        // lexer error, never a silent value). The p/P exponent is also
+        // accepted on the dot-less spelling (`0x1p3` — Swift's hex float
+        // grammar). The kernel's decimal float validation rules
+        // (fraction/exponent digit requirements, suffix class check)
+        // apply to the hex float shape identically.
+        if pos < utf8.count && utf8[pos] == ascii("."),
+           pos + 1 < utf8.count && isHexDigit(utf8[pos + 1]) {
+            pos += 1 // consume .
+            while pos < utf8.count && (isHexDigit(utf8[pos]) || utf8[pos] == ascii("_")) {
+                pos += 1
+            }
+            if pos < utf8.count && (utf8[pos] == ascii("p") || utf8[pos] == ascii("P")) {
+                consumeBinaryExponent(start: start)
+            }
+            return lexNumberTail(start: start, isFloat: true)
+        }
+        if pos < utf8.count && (utf8[pos] == ascii("p") || utf8[pos] == ascii("P")) {
+            consumeBinaryExponent(start: start)
+            return lexNumberTail(start: start, isFloat: true)
+        }
+        return lexNumberTail(start: start, isFloat: false)
+    }
+
+    /// The hex-float binary exponent scan: p/P, an optional sign, then at
+    /// least one digit (fail-closed — the malformed `0x1p` is the E1010
+    /// lexer error, never a silent value).
+    private func consumeBinaryExponent(start: Int) {
+        pos += 1
+        if pos < utf8.count && (utf8[pos] == ascii("+") || utf8[pos] == ascii("-")) {
+            pos += 1
+        }
+        if pos >= utf8.count || !isDigit(utf8[pos]) {
+            diagnostics.error(
+                code: "E1010",
+                message: "float exponent must contain digits",
+                span: makeSpan(start, pos),
+                stage: .lexer
+            )
+        } else {
+            consumeDigits()
+        }
     }
 
     private func lexBinaryNumber(start: Int) -> Token {
@@ -324,9 +398,7 @@ public final class Lexer {
                 stage: .lexer
             )
         }
-        consumeNumericSuffix()
-        let text = extractString(start, pos)
-        return Token(kind: .integer(text), span: makeSpan(start, pos))
+        return lexNumberTail(start: start, isFloat: false)
     }
 
     private func lexOctalNumber(start: Int) -> Token {
@@ -343,9 +415,50 @@ public final class Lexer {
                 stage: .lexer
             )
         }
-        consumeNumericSuffix()
-        let text = extractString(start, pos)
-        return Token(kind: .integer(text), span: makeSpan(start, pos))
+        return lexNumberTail(start: start, isFloat: false)
+    }
+
+    /// The shared numeric tail: the suffix scan, the literal-class suffix
+    /// validation, and the token emission. Mirrors the kernel's
+    /// lex_number/lex_radix_number suffix handling (fail-closed):
+    ///
+    ///   - an integer spelling with a float suffix (`1f32`) IS a float
+    ///     literal (the kernel's `float_suffix_on_int` rule);
+    ///   - a float spelling (fraction/exponent/float suffix) must carry an
+    ///     f32/f64 suffix or none — anything else is the E1014 lexer error;
+    ///   - an integer spelling must carry an integer suffix (the kernel's
+    ///     `integer_suffix_valid` set, plus the stage0's documented
+    ///     separator-before-suffix spelling `8_u`) or none — anything else
+    ///     is the E1014 lexer error ("invalid numeric suffix", the kernel's
+    ///     fail-closed numeric handling — never a silent value).
+    ///
+    /// The float token text EXCLUDES the suffix (the kernel's
+    /// parsed_float_spelling form), so the host conversion never sees a
+    /// suffix it cannot parse.
+    private func lexNumberTail(start: Int, isFloat: Bool) -> Token {
+        let suffixStart = pos
+        let suffix = scanNumericSuffix()
+        var isFloat = isFloat
+        if !suffix.isEmpty {
+            if floatSuffixValid(suffix) {
+                // `1f32` / `1.5f32` / `1e3f64` — the float suffix on any
+                // spelling makes it a float literal (kernel parity).
+                isFloat = true
+            } else if !isFloat && integerSuffixValid(suffix) {
+                // Integer spelling with an integer suffix: carried in the
+                // token text, stripped by the host parse (kernel parity:
+                // the suffix is the literal's explicit_suffix field).
+            } else {
+                diagnostics.error(
+                    code: "E1014",
+                    message: "invalid numeric suffix '\(suffix)'",
+                    span: makeSpan(start, pos),
+                    stage: .lexer
+                )
+            }
+        }
+        let text = extractString(start, isFloat ? suffixStart : pos)
+        return Token(kind: isFloat ? .float(text) : .integer(text), span: makeSpan(start, pos))
     }
 
     private func consumeDigits() {
@@ -354,10 +467,33 @@ public final class Lexer {
         }
     }
 
-    private func consumeNumericSuffix() {
+    /// The numeric suffix scan: an alpha-start, alphanumeric-continue run
+    /// (the kernel's lex_scan_suffix, with the underscore start admitted
+    /// for the stage0's documented separator-before-suffix spelling
+    /// `8_u`). The caller validates the text against the literal's class.
+    private func scanNumericSuffix() -> String {
+        guard pos < utf8.count,
+              isIdentStart(utf8[pos]) || utf8[pos] == ascii("_") else {
+            return ""
+        }
+        let start = pos
         while pos < utf8.count && isIdentContinue(utf8[pos]) {
             pos += 1
         }
+        return extractString(start, pos)
+    }
+
+    /// The integer suffix set (the kernel's `integer_suffix_valid`), plus
+    /// the stage0's documented optional separator before the suffix
+    /// (`8_u` — the E9030 gate's suffix grammar).
+    private func integerSuffixValid(_ s: String) -> Bool {
+        s.range(of: #"^(?:_)?(?:[ui](?:8|16|32|64|128)?|usize|isize)$"#,
+                options: .regularExpression) != nil
+    }
+
+    /// The float suffix set (the kernel's `float_suffix_valid`).
+    private func floatSuffixValid(_ s: String) -> Bool {
+        s == "f32" || s == "f64"
     }
 
     // MARK: - Strings

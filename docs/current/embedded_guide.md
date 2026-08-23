@@ -4,16 +4,33 @@
 
 ## Overview
 
-Tangerine provides first-class support for bare-metal and embedded development through the `std::embedded` module. Combined with the ownership system and zero-cost abstractions, Tangerine delivers Rust-level safety guarantees in embedded contexts with a cleaner syntax.
+Tangerine provides bare-metal development support through the `std::embedded`
+module (the volatile/MMIO Register abstraction, the `@interrupt` /
+`@link_section` / `@panic_handler` markers, the interrupt vector table and
+the allocator-free `ArrayVec` / `RingBuffer` collections) and the driver's
+embedded route (`compile_to_embedded_route`).
+
+> **THE ISA CODE-GEN TRUTH (P0.2).** The ONLY embedded target with real
+> code generation is **`aarch64-unknown-none`** (ARM64 bare-metal — the
+> aarch64 backend). The Thumb triples (`thumbv6m-none-eabi`,
+> `thumbv7em-none-eabi[f]`, `thumbv8m.main-none-eabihf`) and the RISC-V
+> triples (`riscv32imc|imac-unknown-none-elf`, `riscv64gc-unknown-none-elf`)
+> are **HARD-REJECTED** by the route: the compiler has no Thumb/RISC-V code
+> generator, so the route emits the stable rejection diagnostic and NO
+> artifact (it never fabricates an aarch64 image under a foreign triple).
+> There is **no QEMU execution lane** — hardware execution is not claimed.
 
 ## Target Platforms
 
-| Target Triple             | Architecture | Tier | Status   |
-|---------------------------|-------------|------|----------|
-| `thumbv7em-none-eabihf`  | ARM Cortex-M4/M7 | 2 | Supported |
-| `thumbv6m-none-eabi`     | ARM Cortex-M0/M0+ | 2 | Supported |
-| `riscv32imac-unknown-none-elf` | RISC-V RV32 | 3 | Experimental |
-| `aarch64-unknown-none`   | ARM Cortex-A (bare) | 3 | Experimental |
+| Target Triple             | Architecture | Status   |
+|---------------------------|-------------|----------|
+| `aarch64-unknown-none`   | ARM64 (bare) | Supported — the real codegen (the aarch64 backend): the spec JSON + the linker script + the startup/vector artifacts + the bare-metal ELF image |
+| `thumbv7em-none-eabihf`  | ARM Cortex-M4/M7 | REJECTED — no Thumb code generator (the stable diagnostic; no artifact) |
+| `thumbv6m-none-eabi`     | ARM Cortex-M0/M0+ | REJECTED — no Thumb code generator |
+| `thumbv8m.main-none-eabihf` | ARM Cortex-M33 | REJECTED — no Thumb code generator |
+| `riscv32imac-unknown-none-elf` | RISC-V RV32 | REJECTED — no RISC-V code generator |
+| `riscv32imc-unknown-none-elf` | RISC-V RV32IMC | REJECTED — no RISC-V code generator |
+| `riscv64gc-unknown-none-elf` | RISC-V RV64 | REJECTED — no RISC-V code generator |
 
 ## Getting Started
 
@@ -27,7 +44,7 @@ version = "0.1.0"
 edition = "2026"
 
 [target]
-triple = "thumbv7em-none-eabihf"
+triple = "aarch64-unknown-none"
 features = ["no_std"]
 
 [dependencies]
@@ -354,14 +371,13 @@ end
 ## Cross-Compilation
 
 ```bash
-# Build for Cortex-M4
-tg build --target thumbv7em-none-eabihf --release
+# Build for the REAL bare-metal target (aarch64 — the aarch64 backend)
+tg build --target aarch64-unknown-none --release
 
-# Flash via OpenOCD
-tg flash --probe openocd --chip stm32f407
-
-# Debug with GDB
-tg debug --probe openocd --chip stm32f407
+# The Thumb (thumbv6m/thumbv7em/thumbv8m.main) and RISC-V
+# (riscv32imc/riscv32imac/riscv64gc) embedded triples are HARD-REJECTED:
+# the route emits the stable diagnostic and NO artifact (no code
+# generator exists for those ISAs — no fabricated image).
 ```
 
 ## Best Practices

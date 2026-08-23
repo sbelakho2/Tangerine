@@ -427,7 +427,7 @@ impl WasmCompiler
   def intern_rvalue_strings(inout self, rvalue: MirRvalue) -> Unit
     match rvalue.kind
     when MirRvalueKind::MirMove(operand) | MirRvalueKind::MirUnOp(_, operand) |
-         MirRvalueKind::MirCast(_, operand, _) then
+         MirRvalueKind::MirCast(_, operand, _) | MirRvalueKind::MirRepeat(operand, _) then
       self.intern_operand_strings(&operand)
     when MirRvalueKind::MirBinOp(_, lhs, rhs) then
       self.intern_operand_strings(&lhs)
@@ -436,6 +436,8 @@ impl WasmCompiler
       for op in operands do
         self.intern_operand_strings(op)
       end
+    ## MirRef/MirDiscriminant/MirLen carry places only and MirPhi carries
+    ## (block, local) pairs — no constant operands to intern.
     when _ then ()
     end
   end
@@ -623,6 +625,11 @@ impl WasmCompiler
     Ok(FunctionBody { locals: locals, code: code })
   end
 
+  # THE STATEMENT TABLE: every MirStatementKind is enumerated here —
+  # SUPPORTED arms emit the REAL machine semantics, UNSUPPORTED arms fail
+  # the compilation with the stable "unsupported MIR statement <name> for
+  # the wasm target" diagnostic. There is NO fallthrough and no silent
+  # no-op for an unhandled statement.
   def emit_statement(self, inout code: Array[u8], stmt: MirStatement, func: MirFunction) -> Result[Unit, WasmCompileError]
     match stmt.kind
     when MirStatementKind::MirAssign(place, rvalue) then
@@ -641,55 +648,101 @@ impl WasmCompiler
         code.push(0x02)  ## align=4
         _encode_leb128_u32(code, 0)  ## offset=0
       end
-    when MirStatementKind::MirStorageLive(_) then ()  ## no-op in WASM
-    when MirStatementKind::MirStorageDead(_) then ()  ## no-op in WASM
-    when MirStatementKind::MirNop then ()
-    ## Agentic statements have no WASM lowering — no-op.
-    when _ then ()
+    when MirStatementKind::MirStorageLive(_) then
+      ## SUPPORTED — the real semantics of the liveness marker: the wasm
+      ## backend statically allocates every local (no stack slot is ever
+      ## reused), so the marker's contract — the slot's storage is live
+      ## from this point — is fully realized by the static allocation and
+      ## requires no machine emission. (An explicit arm, never a
+      ## fallthrough.)
+      ()
+    when MirStatementKind::MirStorageDead(_) then
+      ## SUPPORTED — the symmetric liveness marker (see MirStorageLive):
+      ## the statically allocated slot outlives the marker, so no machine
+      ## emission is required.
+      ()
+    when MirStatementKind::MirNop then
+      ## SUPPORTED — the MIR-level no-op statement: its real semantics IS
+      ## "emit nothing".
+      ()
+    when MirStatementKind::MirContractCheck(_, cond) then
+      ## SUPPORTED — the real contract check: evaluate the condition and
+      ## TRAP when it fails (the native backend's contract arm tests the
+      ## condition and traps on false; the wasm arm emits the identical
+      ## check — the eqz/if/unreachable shape of MirAssert).
+      self.emit_operand(code, cond)?
+      match _operand_wasm_type(cond, func)
+      when WasmValType::I64 then code.push(0x50)  ## i64.eqz
+      when WasmValType::I32 then code.push(0x45)  ## i32.eqz
+      when WasmValType::F32 | WasmValType::F64 | WasmValType::ExternRef then
+        return Result::Err(WasmCompileError::UnsupportedMir(
+          "unsupported MIR statement MirContractCheck on a non-integer condition for the wasm target"))
+      end
+      code.push(0x04)  ## if
+      code.push(0x40)  ## void
+      code.push(0x00)  ## unreachable
+      code.push(0x0B)  ## end if
+    when MirStatementKind::MirBudgetConsume(_, _) then
+      ## UNSUPPORTED — the wasm backend has no budget frame-slot
+      ## machinery (the native backend's per-frame counters); the emission
+      ## FAILS the compilation with the stable diagnostic.
+      return Result::Err(WasmCompileError::UnsupportedMir(
+        "unsupported MIR statement MirBudgetConsume for the wasm target"))
+    when MirStatementKind::MirEffectRecord(_, _) then
+      ## UNSUPPORTED — the wasm backend has no __tg_effect_record import
+      ## (the native runtime's effect log); fail the compilation, never a
+      ## silent no-op.
+      return Result::Err(WasmCompileError::UnsupportedMir(
+        "unsupported MIR statement MirEffectRecord for the wasm target"))
+    when MirStatementKind::MirEffectPerform(_, _, _, _, _) then
+      ## UNSUPPORTED — the wasm backend has no __tg_effect_perform import
+      ## (the native runtime's handler-stack dispatch); fail the
+      ## compilation, never a silent no-op.
+      return Result::Err(WasmCompileError::UnsupportedMir(
+        "unsupported MIR statement MirEffectPerform for the wasm target"))
+    when MirStatementKind::MirEffectFrameEnter(_, _, _, _, _) then
+      ## UNSUPPORTED — the wasm backend has no __tg_effect_frame_push
+      ## import; fail the compilation.
+      return Result::Err(WasmCompileError::UnsupportedMir(
+        "unsupported MIR statement MirEffectFrameEnter for the wasm target"))
+    when MirStatementKind::MirEffectFrameExit then
+      ## UNSUPPORTED — the wasm backend has no __tg_effect_frame_pop
+      ## import; fail the compilation.
+      return Result::Err(WasmCompileError::UnsupportedMir(
+        "unsupported MIR statement MirEffectFrameExit for the wasm target"))
     end
     Ok(())
   end
 
+  # THE RVALUE TABLE: every MirRvalueKind is enumerated here — SUPPORTED
+  # arms emit the REAL wasm semantics, UNSUPPORTED arms fail the
+  # compilation with the stable "unsupported MIR rvalue <name> for the
+  # wasm target" diagnostic. There is NO fallback: an unhandled rvalue
+  # NEVER pushes a zero.
   def emit_rvalue(self, inout code: Array[u8], rvalue: MirRvalue, func: MirFunction) -> Result[Unit, WasmCompileError]
     match rvalue.kind
     when MirRvalueKind::MirMove(operand) then
-      self.emit_operand(code, operand)?
-    when MirRvalueKind::MirBinOp(op, lhs, rhs) then
-      self.emit_operand(code, lhs)?
-      self.emit_operand(code, rhs)?
-      self.emit_binop(code, op)?
-    when MirRvalueKind::MirUnOp(op, operand) then
-      self.emit_operand(code, operand)?
-      self.emit_unaryop(code, op)?
-    when MirRvalueKind::MirCast(_, operand, _) then
+      ## SUPPORTED — MirMove: the operand's value IS the moved value (a
+      ## move is a value copy in the wasm linear-memory model).
       self.emit_operand(code, operand)?
     when MirRvalueKind::MirRef(place) then
-      ## Take address — in wasm32 the aggregate's handle is its local value;
-      ## a projected place walks the canonical address chain.
+      ## SUPPORTED — MirRef: the address of the place (in wasm32 the
+      ## aggregate's handle is its local value; a projected place walks
+      ## the canonical address chain).
       if place.projections.is_empty() then
         code.push(0x20)  ## local.get
         _encode_leb128_u32(code, place.local.id as UInt)
       else
         _emit_place_address_wasm(code, place)
       end
-    when MirRvalueKind::MirDiscriminant(place) then
-      ## Read the enum VALUE word (the image handle), then the tag at the
-      ## image base ([word + 0] — the wasm image stores the discriminant as
-      ## slot 0, exactly like the native image's tag at offset 0).
-      if place.projections.is_empty() then
-        code.push(0x20)  ## local.get
-        _encode_leb128_u32(code, place.local.id as UInt)
-      else
-        _emit_place_address_wasm(code, place)
-        code.push(0x28)  ## i32.load — the enum value word
-        code.push(0x02)
-        code.push(0x00)
-      end
-      code.push(0x28)  ## i32.load — the tag word at the image base
-      code.push(0x02)
-      code.push(0x00)
     when MirRvalueKind::MirAggregate(_, operands) then
-      ## Allocate memory on the stack for the aggregate.
+      ## SUPPORTED — MirAggregate: the slot-image construction. Allocate
+      ## n 4-byte slots below the stack pointer, store every operand at
+      ## base + i*4, leave the base handle. The SAME uniform image model
+      ## covers every AggregateKind (array/tuple/struct/closure/generator
+      ## fields are all 4-byte slots; an enum aggregate stores the
+      ## discriminant as operand 0 — the tag at slot 0, exactly what the
+      ## Variant projection's payload shift expects).
       let num_fields = operands.len()
       let alloc_size = (num_fields * 4) as i32
       if num_fields == 0 then
@@ -728,8 +781,111 @@ impl WasmCompiler
         code.push(0x23)  ## global.get
         _encode_leb128_u32(code, self.stack_ptr_global)
       end
-    when _ then
-      emit_i64_const(code, 0)  ## fallback: push zero
+    when MirRvalueKind::MirBinOp(op, lhs, rhs) then
+      ## SUPPORTED — MirBinOp: the per-family real wasm opcode (the
+      ## i32/i64/f32/f64 tables in emit_binop); an op without a wasm
+      ## opcode in the operand family is the explicit Unsupported
+      ## diagnostic.
+      self.emit_operand(code, lhs)?
+      self.emit_operand(code, rhs)?
+      let lhs_vt = _operand_wasm_type(lhs, func)
+      let rhs_vt = _operand_wasm_type(rhs, func)
+      self.emit_binop(code, op, lhs_vt, rhs_vt)?
+    when MirRvalueKind::MirUnOp(op, operand) then
+      ## SUPPORTED — MirUnOp: the per-family real opcodes (Neg/Not/BitNot
+      ## are exhaustive; the family gaps are the explicit Unsupported
+      ## diagnostic).
+      self.emit_operand(code, operand)?
+      let operand_vt = _operand_wasm_type(operand, func)
+      self.emit_unaryop(code, op, operand_vt)?
+    when MirRvalueKind::MirDiscriminant(place) then
+      ## SUPPORTED — MirDiscriminant: read the enum VALUE word (the image
+      ## handle), then the tag at the image base ([word + 0] — the wasm
+      ## image stores the discriminant as slot 0, exactly like the native
+      ## image's tag at offset 0).
+      if place.projections.is_empty() then
+        code.push(0x20)  ## local.get
+        _encode_leb128_u32(code, place.local.id as UInt)
+      else
+        _emit_place_address_wasm(code, place)
+        code.push(0x28)  ## i32.load — the enum value word
+        code.push(0x02)
+        code.push(0x00)
+      end
+      code.push(0x28)  ## i32.load — the tag word at the image base
+      code.push(0x02)
+      code.push(0x00)
+    when MirRvalueKind::MirLen(place) then
+      ## SUPPORTED for the fixed-array form only: the length is the
+      ## compile-time count carried in the TYPE (Type::FixedArray(elem,
+      ## n)) — emitted as the i64 constant, exactly the native backend's
+      ## fixed-array arm. Every other MirLen source (heap collections,
+      ## slice views) has no wasm metadata — the explicit Unsupported
+      ## diagnostic, never a pushed zero.
+      match _place_local_type(func, place)
+      when Option::Some(Type::FixedArray(_, n)) then emit_i64_const(code, n)
+      when Option::None then
+        return Result::Err(WasmCompileError::UnsupportedMir(
+          "unsupported MIR rvalue MirLen for the wasm target"))
+      when Option::Some(_) then
+        return Result::Err(WasmCompileError::UnsupportedMir(
+          "unsupported MIR rvalue MirLen for the wasm target"))
+      end
+    when MirRvalueKind::MirCast(cast_kind, operand, target_ty) then
+      ## SUPPORTED for the cast pairs with real wasm conversion opcodes
+      ## (the per-pair table in emit_cast_wasm — identity when the source
+      ## and destination share a representation); every other pair is the
+      ## explicit Unsupported diagnostic, never a silently dropped
+      ## conversion.
+      self.emit_operand(code, operand)?
+      let src_vt = _operand_wasm_type(operand, func)
+      let dst_vt = mir_type_to_wasm(target_ty)
+      emit_cast_wasm(code, cast_kind, src_vt, dst_vt)?
+    when MirRvalueKind::MirRepeat(operand, count) then
+      ## SUPPORTED — MirRepeat: the [value; n] array initializer under
+      ## the slot-image model: allocate n 4-byte slots, store the element
+      ## into each slot (wrapping the i64/f64/f32 operand words exactly
+      ## like the MirAggregate field stores), leave the base handle.
+      if count <= 0 then
+        emit_i32_const(code, 0)
+      else
+        code.push(0x23)  ## global.get
+        _encode_leb128_u32(code, self.stack_ptr_global)
+        emit_i32_const(code, (count * 4) as i32)
+        code.push(0x6B)  ## i32.sub
+        code.push(0x24)  ## global.set
+        _encode_leb128_u32(code, self.stack_ptr_global)
+
+        var rep_i = 0
+        while rep_i < count do
+          code.push(0x23)  ## global.get (base address)
+          _encode_leb128_u32(code, self.stack_ptr_global)
+          self.emit_operand(code, operand)?
+          let wtype = _operand_wasm_type(operand, func)
+          match wtype
+          when WasmValType::I64 then code.push(0xA7)  ## i32.wrap_i64
+          when WasmValType::F64 then code.push(0xAA)  ## i32.trunc_f64_s
+          when WasmValType::F32 then code.push(0xA8)  ## i32.trunc_f32_s
+          when _ then ()  ## already i32
+          end
+          code.push(0x36)  ## i32.store
+          code.push(0x02)  ## align=4
+          _encode_leb128_u32(code, (rep_i * 4) as UInt)  ## offset
+          rep_i = rep_i + 1
+        end
+
+        ## Leave the base handle on the stack
+        code.push(0x23)  ## global.get
+        _encode_leb128_u32(code, self.stack_ptr_global)
+      end
+    when MirRvalueKind::MirPhi(_) then
+      ## UNSUPPORTED — MirPhi: the wasm dispatch-loop model has no phi
+      ## placement pass (the native backend's "values already placed by
+      ## predecessors" skip cannot be reproduced — the runtime
+      ## predecessor is not statically known); fail the compilation,
+      ## never a pushed zero.
+      return Result::Err(WasmCompileError::UnsupportedMir(
+        "unsupported MIR rvalue MirPhi for the wasm target"))
     end
     Ok(())
   end
@@ -750,12 +906,16 @@ impl WasmCompiler
         code.push(0x00)
       end
     when MirOperandKind::MirConstant(c) then
+      ## THE CONSTANT TABLE: every MirConstantKind is enumerated here —
+      ## the SUPPORTED kinds emit their real value, the UNSUPPORTED kinds
+      ## fail the compilation with the stable diagnostic. There is NO
+      ## push-zero fallback for an unhandled constant.
       match c.kind
+      when MirConstantKind::MirUnit then ()  ## zero-sized: no machine value
+      when MirConstantKind::MirBool(b) then emit_i32_const(code, if *b then 1 else 0 end)
       when MirConstantKind::MirInt(n) then emit_i64_const(code, *n)
       when MirConstantKind::MirFloat(f) then emit_f64_const(code, *f)
-      when MirConstantKind::MirBool(b) then emit_i32_const(code, if *b then 1 else 0 end)
       when MirConstantKind::MirChar(cv) then emit_i32_const(code, *cv as i32)
-      when MirConstantKind::MirUnit then ()  ## produces no value
       when MirConstantKind::MirString(s) then
         ## String literals: the data segment offset, interned by the
         ## pre-emission pass (intern_program_strings — the pool is the
@@ -765,49 +925,88 @@ impl WasmCompiler
         when Option::None then
           panic("wasm: string constant `" + s + "` was not interned before emission (the data-section closure is broken)")
         end
-      when _ then emit_i64_const(code, 0)
+      when MirConstantKind::MirZeroSized then ()  ## zero-sized: no machine value
+      when MirConstantKind::MirFnItem(_) then
+        ## UNSUPPORTED — a function item as a VALUE (a function pointer):
+        ## the wasm subset has no call_indirect/table to materialize the
+        ## address; fail the compilation, never a pushed zero.
+        return Result::Err(WasmCompileError::UnsupportedMir(
+          "unsupported MIR constant MirFnItem for the wasm target"))
+      when MirConstantKind::MirStaticRef(_) then
+        ## UNSUPPORTED — the wasm backend interns STRING constants only;
+        ## no static-image labels exist for general statics; fail the
+        ## compilation, never a pushed zero.
+        return Result::Err(WasmCompileError::UnsupportedMir(
+          "unsupported MIR constant MirStaticRef for the wasm target"))
+      when MirConstantKind::MirStaticAddr(_) then
+        ## UNSUPPORTED — see MirStaticRef.
+        return Result::Err(WasmCompileError::UnsupportedMir(
+          "unsupported MIR constant MirStaticAddr for the wasm target"))
       end
     end
     Ok(())
   end
 
-  def emit_binop(self, inout code: Array[u8], op: MirBinOp) -> Result[Unit, WasmCompileError]
-    match op
-    when MirBinOp::Add then code.push(0x7C)   ## i64.add
-    when MirBinOp::Sub then code.push(0x7D)   ## i64.sub
-    when MirBinOp::Mul then code.push(0x7E)   ## i64.mul
-    when MirBinOp::Div then code.push(0x7F)   ## i64.div_s
-    when MirBinOp::Mod then code.push(0x81)   ## i64.rem_s
-    when MirBinOp::BitAnd then code.push(0x83) ## i64.and
-    when MirBinOp::BitOr then code.push(0x84)  ## i64.or
-    when MirBinOp::BitXor then code.push(0x85) ## i64.xor
-    when MirBinOp::Shl then code.push(0x86)   ## i64.shl
-    when MirBinOp::Shr then code.push(0x87)   ## i64.shr_s
-    when MirBinOp::Eq then code.push(0x51)     ## i64.eq
-    when MirBinOp::Ne then code.push(0x52)     ## i64.ne
-    when MirBinOp::Lt then code.push(0x53)     ## i64.lt_s
-    when MirBinOp::Le then code.push(0x57)     ## i64.le_s
-    when MirBinOp::Gt then code.push(0x55)     ## i64.gt_s
-    when MirBinOp::Ge then code.push(0x59)     ## i64.ge_s
-    when _ then code.push(0x7C)  ## fallback: i64.add
+  # THE BINOP TABLE: every MirBinOpKind is dispatched to the REAL wasm
+  # opcode of the operands' value family (the i32/i64/f32/f64 families
+  # per the type mapping table — see _binop_opcode). An op with no wasm
+  # opcode in the operand family (the float bitwise/shift/rem gaps) and a
+  # mixed-family operand pair are the explicit Unsupported diagnostics.
+  # There is NO fallback opcode.
+  def emit_binop(self, inout code: Array[u8], op: MirBinOp, lhs_vt: WasmValType, rhs_vt: WasmValType) -> Result[Unit, WasmCompileError]
+    if lhs_vt != rhs_vt then
+      return Result::Err(WasmCompileError::UnsupportedMir(
+        "unsupported MIR binop " + _binop_name(op) + " on mixed wasm operand types (" + _valtype_str(lhs_vt) + ", " + _valtype_str(rhs_vt) + ") for the wasm target"))
+    end
+    match _binop_opcode(op, lhs_vt)
+    when Option::Some(opcode) then code.push(*opcode)
+    when Option::None then
+      return Result::Err(WasmCompileError::UnsupportedMir(
+        "unsupported MIR binop " + _binop_name(op) + " for the wasm " + _valtype_str(lhs_vt) + " operand family"))
     end
     Ok(())
   end
 
-  def emit_unaryop(self, inout code: Array[u8], op: MirUnOp) -> Result[Unit, WasmCompileError]
+  # THE UNARY TABLE: every MirUnOpKind is enumerated with the REAL wasm
+  # opcode for the operand's value family (Neg exists for all four
+  # families; Not/BitNot are integer-family only — the float/externref
+  # forms are the explicit Unsupported diagnostic). No fallback.
+  def emit_unaryop(self, inout code: Array[u8], op: MirUnOp, operand_vt: WasmValType) -> Result[Unit, WasmCompileError]
     match op
     when MirUnOp::Neg then
-      ## Negate: operand is on stack, multiply by -1
-      emit_i64_const(code, -1)
-      code.push(0x7E)  ## i64.mul
+      match operand_vt
+      when WasmValType::I64 then
+        emit_i64_const(code, -1)
+        code.push(0x7E)  ## i64.mul
+      when WasmValType::I32 then
+        emit_i32_const(code, -1)
+        code.push(0x6C)  ## i32.mul
+      when WasmValType::F64 then code.push(0x9A)  ## f64.neg
+      when WasmValType::F32 then code.push(0x8C)  ## f32.neg
+      when WasmValType::ExternRef then
+        return Result::Err(WasmCompileError::UnsupportedMir(
+          "unsupported MIR unop Neg for the wasm target"))
+      end
     when MirUnOp::Not then
-      ## Logical not: i64.eqz
-      code.push(0x50)  ## i64.eqz
+      match operand_vt
+      when WasmValType::I64 then code.push(0x50)  ## i64.eqz
+      when WasmValType::I32 then code.push(0x45)  ## i32.eqz
+      when WasmValType::F32 | WasmValType::F64 | WasmValType::ExternRef then
+        return Result::Err(WasmCompileError::UnsupportedMir(
+          "unsupported MIR unop Not for the wasm target"))
+      end
     when MirUnOp::BitNot then
-      ## Bitwise not: xor with -1
-      emit_i64_const(code, -1)
-      code.push(0x85)  ## i64.xor
-    when _ then ()
+      match operand_vt
+      when WasmValType::I64 then
+        emit_i64_const(code, -1)
+        code.push(0x85)  ## i64.xor
+      when WasmValType::I32 then
+        emit_i32_const(code, -1)
+        code.push(0x73)  ## i32.xor
+      when WasmValType::F32 | WasmValType::F64 | WasmValType::ExternRef then
+        return Result::Err(WasmCompileError::UnsupportedMir(
+          "unsupported MIR unop BitNot for the wasm target"))
+      end
     end
     Ok(())
   end
@@ -1017,6 +1216,13 @@ end
 pub enum WasmCompileError
   UnsupportedType(String)
   UnsupportedInstruction(String)
+  ## The stable compile-time diagnostic for an MIR variant the wasm
+  ## backend cannot implement faithfully: "unsupported MIR <kind> <name>
+  ## for the wasm target". The Display renders the message VERBATIM (the
+  ## string IS the diagnostic — no prefix), so the conformance tests can
+  ## assert the exact text. Emission FAILS the compilation; nothing is
+  ## ever silently emitted for an unhandled variant.
+  UnsupportedMir(String)
   TooManyLocals
   FunctionTooLarge
   MemoryOverflow
@@ -1027,6 +1233,7 @@ impl Display for WasmCompileError
     match self
     when UnsupportedType(t) then "unsupported WASM type: " + t
     when UnsupportedInstruction(i) then "unsupported WASM instruction: " + i
+    when UnsupportedMir(m) then m
     when TooManyLocals then "too many locals in function"
     when FunctionTooLarge then "function body too large"
     when MemoryOverflow then "data segment exceeds memory"
@@ -1234,6 +1441,244 @@ def _call_callee_name(op: MirOperand) -> String
     end
   when _ then "".to_string()
   end
+end
+
+# The declared type of a place's LOCAL (params and locals are
+# function-scoped — the same id discipline _operand_wasm_type and
+# _place_wasm_type use; an id outside both ranges is an internal defect
+# and Option::None fails the caller closed).
+def _place_local_type(func: MirFunction, place: Place) -> Option[Type]
+  let id = place.local.id
+  if id < func.params.len() then
+    let t = &func.params[id].ty
+    Option::Some(t.clone())
+  else
+    let local_idx = id - func.params.len()
+    if local_idx < func.locals.len() then
+      let t = &func.locals[local_idx].ty
+      Option::Some(t.clone())
+    else
+      Option::None
+    end
+  end
+end
+
+# The stable diagnostic name of a MirBinOpKind.
+def _binop_name(op: MirBinOp) -> String
+  match op
+  when MirBinOp::Add then "Add"
+  when MirBinOp::Sub then "Sub"
+  when MirBinOp::Mul then "Mul"
+  when MirBinOp::Div then "Div"
+  when MirBinOp::Mod then "Mod"
+  when MirBinOp::BitAnd then "BitAnd"
+  when MirBinOp::BitOr then "BitOr"
+  when MirBinOp::BitXor then "BitXor"
+  when MirBinOp::Shl then "Shl"
+  when MirBinOp::Shr then "Shr"
+  when MirBinOp::Eq then "Eq"
+  when MirBinOp::Ne then "Ne"
+  when MirBinOp::Lt then "Lt"
+  when MirBinOp::Le then "Le"
+  when MirBinOp::Gt then "Gt"
+  when MirBinOp::Ge then "Ge"
+  end
+end
+
+# THE BINOP OPCODE TABLE: every MirBinOpKind x value-family pair with a
+# REAL wasm opcode. Option::None = no wasm opcode exists for the op in
+# that family (the float bitwise/shift/rem gaps — wasm has no such
+# opcodes; the externref family has no arithmetic at all) — the caller
+# turns None into the explicit Unsupported diagnostic.
+def _binop_opcode(op: MirBinOp, vt: WasmValType) -> Option[u8]
+  match vt
+  when WasmValType::I64 then
+    match op
+    when MirBinOp::Add then Option::Some(0x7C)  ## i64.add
+    when MirBinOp::Sub then Option::Some(0x7D)  ## i64.sub
+    when MirBinOp::Mul then Option::Some(0x7E)  ## i64.mul
+    when MirBinOp::Div then Option::Some(0x7F)  ## i64.div_s
+    when MirBinOp::Mod then Option::Some(0x81)  ## i64.rem_s
+    when MirBinOp::BitAnd then Option::Some(0x83)  ## i64.and
+    when MirBinOp::BitOr then Option::Some(0x84)  ## i64.or
+    when MirBinOp::BitXor then Option::Some(0x85)  ## i64.xor
+    when MirBinOp::Shl then Option::Some(0x86)  ## i64.shl
+    when MirBinOp::Shr then Option::Some(0x87)  ## i64.shr_s
+    when MirBinOp::Eq then Option::Some(0x51)  ## i64.eq
+    when MirBinOp::Ne then Option::Some(0x52)  ## i64.ne
+    when MirBinOp::Lt then Option::Some(0x53)  ## i64.lt_s
+    when MirBinOp::Le then Option::Some(0x57)  ## i64.le_s
+    when MirBinOp::Gt then Option::Some(0x55)  ## i64.gt_s
+    when MirBinOp::Ge then Option::Some(0x59)  ## i64.ge_s
+    end
+  when WasmValType::I32 then
+    match op
+    when MirBinOp::Add then Option::Some(0x6A)  ## i32.add
+    when MirBinOp::Sub then Option::Some(0x6B)  ## i32.sub
+    when MirBinOp::Mul then Option::Some(0x6C)  ## i32.mul
+    when MirBinOp::Div then Option::Some(0x6D)  ## i32.div_s
+    when MirBinOp::Mod then Option::Some(0x6F)  ## i32.rem_s
+    when MirBinOp::BitAnd then Option::Some(0x71)  ## i32.and
+    when MirBinOp::BitOr then Option::Some(0x72)  ## i32.or
+    when MirBinOp::BitXor then Option::Some(0x73)  ## i32.xor
+    when MirBinOp::Shl then Option::Some(0x74)  ## i32.shl
+    when MirBinOp::Shr then Option::Some(0x75)  ## i32.shr_s
+    when MirBinOp::Eq then Option::Some(0x46)  ## i32.eq
+    when MirBinOp::Ne then Option::Some(0x47)  ## i32.ne
+    when MirBinOp::Lt then Option::Some(0x48)  ## i32.lt_s
+    when MirBinOp::Le then Option::Some(0x4C)  ## i32.le_s
+    when MirBinOp::Gt then Option::Some(0x4A)  ## i32.gt_s
+    when MirBinOp::Ge then Option::Some(0x4E)  ## i32.ge_s
+    end
+  when WasmValType::F64 then
+    match op
+    when MirBinOp::Add then Option::Some(0xA0)  ## f64.add
+    when MirBinOp::Sub then Option::Some(0xA1)  ## f64.sub
+    when MirBinOp::Mul then Option::Some(0xA2)  ## f64.mul
+    when MirBinOp::Div then Option::Some(0xA3)  ## f64.div
+    when MirBinOp::Eq then Option::Some(0x61)  ## f64.eq
+    when MirBinOp::Ne then Option::Some(0x62)  ## f64.ne
+    when MirBinOp::Lt then Option::Some(0x63)  ## f64.lt
+    when MirBinOp::Le then Option::Some(0x65)  ## f64.le
+    when MirBinOp::Gt then Option::Some(0x64)  ## f64.gt
+    when MirBinOp::Ge then Option::Some(0x66)  ## f64.ge
+    ## the float-family gaps: wasm has NO bitwise/shift/rem float opcodes
+    when MirBinOp::Mod | MirBinOp::BitAnd | MirBinOp::BitOr | MirBinOp::BitXor |
+         MirBinOp::Shl | MirBinOp::Shr then Option::None
+    end
+  when WasmValType::F32 then
+    match op
+    when MirBinOp::Add then Option::Some(0x92)  ## f32.add
+    when MirBinOp::Sub then Option::Some(0x93)  ## f32.sub
+    when MirBinOp::Mul then Option::Some(0x94)  ## f32.mul
+    when MirBinOp::Div then Option::Some(0x95)  ## f32.div
+    when MirBinOp::Eq then Option::Some(0x5B)  ## f32.eq
+    when MirBinOp::Ne then Option::Some(0x5C)  ## f32.ne
+    when MirBinOp::Lt then Option::Some(0x5D)  ## f32.lt
+    when MirBinOp::Le then Option::Some(0x5F)  ## f32.le
+    when MirBinOp::Gt then Option::Some(0x5E)  ## f32.gt
+    when MirBinOp::Ge then Option::Some(0x60)  ## f32.ge
+    ## the float-family gaps (see the F64 arm)
+    when MirBinOp::Mod | MirBinOp::BitAnd | MirBinOp::BitOr | MirBinOp::BitXor |
+         MirBinOp::Shl | MirBinOp::Shr then Option::None
+    end
+  when WasmValType::ExternRef then
+    ## the externref family has NO binops at all — every op is the
+    ## explicit Unsupported classification
+    Option::None
+  end
+end
+
+# The stable Unsupported diagnostic for a MirCast pair without a wasm
+# conversion.
+def _cast_unsupported_error(cast_name: String, src_vt: WasmValType, dst_vt: WasmValType) -> WasmCompileError
+  WasmCompileError::UnsupportedMir(
+    "unsupported MIR rvalue MirCast (" + cast_name + " " + _valtype_str(src_vt) + " -> " + _valtype_str(dst_vt) + ") for the wasm target")
+end
+
+# THE CAST TABLE: every CastKind is dispatched to the REAL wasm
+# conversion opcode(s) for the (source, destination) value-family pair —
+# identity (no conversion) when both families already share the
+# representation; the specific convert opcode otherwise. A pair with no
+# wasm conversion (Transmute always; a family pair without a convert
+# instruction) is the explicit Unsupported diagnostic — the conversion is
+# NEVER silently dropped.
+def emit_cast_wasm(inout code: Array[u8], kind: CastKind, src_vt: WasmValType, dst_vt: WasmValType) -> Result[Unit, WasmCompileError]
+  match kind
+  when CastKind::IntToInt then
+    match src_vt
+    when WasmValType::I32 then
+      match dst_vt
+      when WasmValType::I32 then ()  ## identity (same family)
+      when WasmValType::I64 then code.push(0xAC)  ## i64.extend_i32_s
+      when WasmValType::F32 | WasmValType::F64 | WasmValType::ExternRef then
+        return Result::Err(_cast_unsupported_error("IntToInt", src_vt, dst_vt))
+      end
+    when WasmValType::I64 then
+      match dst_vt
+      when WasmValType::I64 then ()  ## identity (same family)
+      when WasmValType::I32 then code.push(0xA7)  ## i32.wrap_i64
+      when WasmValType::F32 | WasmValType::F64 | WasmValType::ExternRef then
+        return Result::Err(_cast_unsupported_error("IntToInt", src_vt, dst_vt))
+      end
+    when WasmValType::F32 | WasmValType::F64 | WasmValType::ExternRef then
+      return Result::Err(_cast_unsupported_error("IntToInt", src_vt, dst_vt))
+    end
+  when CastKind::IntToFloat then
+    match src_vt
+    when WasmValType::I32 then
+      match dst_vt
+      when WasmValType::F32 then code.push(0xB2)  ## f32.convert_i32_s
+      when WasmValType::F64 then code.push(0xB7)  ## f64.convert_i32_s
+      when WasmValType::I32 | WasmValType::I64 | WasmValType::ExternRef then
+        return Result::Err(_cast_unsupported_error("IntToFloat", src_vt, dst_vt))
+      end
+    when WasmValType::I64 then
+      match dst_vt
+      when WasmValType::F32 then code.push(0xB4)  ## f32.convert_i64_s
+      when WasmValType::F64 then code.push(0xB9)  ## f64.convert_i64_s
+      when WasmValType::I32 | WasmValType::I64 | WasmValType::ExternRef then
+        return Result::Err(_cast_unsupported_error("IntToFloat", src_vt, dst_vt))
+      end
+    when WasmValType::F32 | WasmValType::F64 | WasmValType::ExternRef then
+      return Result::Err(_cast_unsupported_error("IntToFloat", src_vt, dst_vt))
+    end
+  when CastKind::FloatToInt then
+    match src_vt
+    when WasmValType::F32 then
+      match dst_vt
+      when WasmValType::I32 then code.push(0xA8)  ## i32.trunc_f32_s
+      when WasmValType::I64 then code.push(0xAE)  ## i64.trunc_f32_s
+      when WasmValType::F32 | WasmValType::F64 | WasmValType::ExternRef then
+        return Result::Err(_cast_unsupported_error("FloatToInt", src_vt, dst_vt))
+      end
+    when WasmValType::F64 then
+      match dst_vt
+      when WasmValType::I32 then code.push(0xAA)  ## i32.trunc_f64_s
+      when WasmValType::I64 then code.push(0xB0)  ## i64.trunc_f64_s
+      when WasmValType::F32 | WasmValType::F64 | WasmValType::ExternRef then
+        return Result::Err(_cast_unsupported_error("FloatToInt", src_vt, dst_vt))
+      end
+    when WasmValType::I32 | WasmValType::I64 | WasmValType::ExternRef then
+      return Result::Err(_cast_unsupported_error("FloatToInt", src_vt, dst_vt))
+    end
+  when CastKind::FloatToFloat then
+    match src_vt
+    when WasmValType::F32 then
+      match dst_vt
+      when WasmValType::F32 then ()  ## identity (same family)
+      when WasmValType::F64 then code.push(0xBB)  ## f64.promote_f32
+      when WasmValType::I32 | WasmValType::I64 | WasmValType::ExternRef then
+        return Result::Err(_cast_unsupported_error("FloatToFloat", src_vt, dst_vt))
+      end
+    when WasmValType::F64 then
+      match dst_vt
+      when WasmValType::F64 then ()  ## identity (same family)
+      when WasmValType::F32 then code.push(0xB6)  ## f32.demote_f64
+      when WasmValType::I32 | WasmValType::I64 | WasmValType::ExternRef then
+        return Result::Err(_cast_unsupported_error("FloatToFloat", src_vt, dst_vt))
+      end
+    when WasmValType::I32 | WasmValType::I64 | WasmValType::ExternRef then
+      return Result::Err(_cast_unsupported_error("FloatToFloat", src_vt, dst_vt))
+    end
+  when CastKind::Pointer then
+    match src_vt
+    when WasmValType::I32 then
+      match dst_vt
+      when WasmValType::I32 then ()  ## identity — every pointer is an i32 linear address
+      when WasmValType::I64 | WasmValType::F32 | WasmValType::F64 | WasmValType::ExternRef then
+        return Result::Err(_cast_unsupported_error("Pointer", src_vt, dst_vt))
+      end
+    when WasmValType::I64 | WasmValType::F32 | WasmValType::F64 | WasmValType::ExternRef then
+      return Result::Err(_cast_unsupported_error("Pointer", src_vt, dst_vt))
+    end
+  when CastKind::Transmute then
+    ## UNSUPPORTED — Transmute is a bit reinterpretation between ARBITRARY
+    ## types; the wasm backend has no type-safe transmute — fail the
+    ## compilation, never a silently dropped conversion.
+    return Result::Err(_cast_unsupported_error("Transmute", src_vt, dst_vt))
+  end
+  Ok(())
 end
 
 # Push the BYTE ADDRESS of `place` onto the wasm stack: the base is the
@@ -1650,3 +2095,599 @@ def _encode_data_section(ds: DataSection) -> Array[u8]
 end
 
 end ## module tg_compiler::wasm_target
+# ———————————————————————————————————————————————————————————————
+# THE WASM CONFORMANCE SUITE — the P0.1 negative/positive additions
+# (the TOP-LEVEL test section: the driver's @test discovery scans the
+# file's TOP-LEVEL items — the module-scoped tests would never run).
+# ———————————————————————————————————————————————————————————————
+# Every MirRvalueKind / MirStatementKind / MirBinOpKind / MirUnOpKind /
+# CastKind / MirConstantKind the wasm emitter handles is exercised here:
+#
+#   SUPPORTED variants  -> the program COMPILES and the emitted function
+#                         body carries the asserted REAL wasm opcodes;
+#   UNSUPPORTED variants -> the compilation FAILS with the stable
+#                         "unsupported MIR <kind> <name> for the wasm
+#                         target" diagnostic — never a silently emitted
+#                         zero, fallback opcode, or no-op statement.
+#
+# THE INVENTORY (variant -> classification):
+#   MirRvalueKind:
+#     MirMove        SUPPORTED (value copy)          MirRef        SUPPORTED (address handle)
+#     MirAggregate   SUPPORTED (slot-image build)    MirBinOp      SUPPORTED (per-family opcode table)
+#     MirUnOp        SUPPORTED (per-family opcodes)  MirDiscriminant SUPPORTED (tag load)
+#     MirLen         SUPPORTED (FixedArray count) | UNSUPPORTED (other sources)
+#     MirCast        SUPPORTED (per-pair convert) | UNSUPPORTED (Transmute / gap pairs)
+#     MirRepeat      SUPPORTED (slot-fill init)      MirPhi        UNSUPPORTED (no wasm phi placement)
+#   MirBinOp:        Add/Sub/Mul/Div/Mod/BitAnd/BitOr/BitXor/Shl/Shr/Eq/Ne/Lt/Le/Gt/Ge
+#                    SUPPORTED in the i32/i64 families; the arith+compare ops also in the
+#                    f32/f64 families; the float bitwise/shift/rem gaps and mixed families
+#                    UNSUPPORTED (diagnostic)
+#   MirUnOp:         Neg SUPPORTED (all families); Not/BitNot SUPPORTED (int families),
+#                    UNSUPPORTED (float/externref)
+#   CastKind:        IntToInt/IntToFloat/FloatToInt/FloatToFloat/Pointer SUPPORTED for the
+#                    convertible pairs; Transmute UNSUPPORTED
+#   MirConstantKind: MirUnit/MirBool/MirInt/MirFloat/MirChar/MirString/MirZeroSized
+#                    SUPPORTED; MirFnItem/MirStaticRef/MirStaticAddr UNSUPPORTED
+#   MirStatementKind: MirAssign/MirStorageLive/MirStorageDead/MirNop/MirContractCheck
+#                    SUPPORTED; MirBudgetConsume/MirEffectRecord/MirEffectPerform/
+#                    MirEffectFrameEnter/MirEffectFrameExit UNSUPPORTED
+#
+# Run with: tg test tg_compiler/wasm_target.tg
+
+use std::core::{Option, Result, Unit, Bool, panic}
+use std::collections::{Vec}
+use tg_compiler::types::{Type}
+use tg_compiler::mir::{
+  MirProgram, MirFunction, MirBlock, MirLocal,
+  MirStatement, MirStatementKind,
+  MirTerminator, MirTerminatorKind,
+  MirRvalue, MirRvalueKind,
+  MirOperand, MirOperandKind,
+  MirConstant, MirConstantKind,
+  MirBinOp, MirUnOp, CastKind,
+  AggregateKind, MirLocalId, MirBlockId,
+  MirContract, MirContractKind, operand_copy_local, place_local
+}
+use tg_compiler::ids::{DefId, ModuleId, EffectId}
+use tg_compiler::token::{span_dummy}
+
+def wasm_test_check(cond: Bool, msg: String) -> Unit
+  if !cond then
+    panic("wasm conformance: " + msg)
+  end
+end
+
+def wasm_test_check_eq(expected: Int, actual: Int, msg: String) -> Unit
+  if expected != actual then
+    panic("wasm conformance: " + msg + " (expected " + expected.to_string() + ", got " + actual.to_string() + ")")
+  end
+end
+
+def _wasm_test_local(id: Int, name: String, ty: Type) -> MirLocal
+  MirLocal { id: MirLocalId { id: id }, name: name, ty: ty, is_mut: false, span: span_dummy() }
+end
+
+# A single-block program `fn_name(p0, p1, ...)`: `_0 = rvalue; return`.
+# The conformance convention (the committed make_add_program shape): the
+# params are ALSO listed in `locals` (locals[0] is the return place).
+def _wasm_test_rvalue_program(fn_name: String, ret_ty: Type, param_types: Vec[Type], rvalue: MirRvalue) -> MirProgram
+  var locals = Vec::new()
+  locals.push(_wasm_test_local(0, "_0", ret_ty))
+  var params = Vec::new()
+  var pi = 0
+  while pi < param_types.len() do
+    locals.push(_wasm_test_local(pi + 1, "p" + pi.to_string(), param_types[pi]))
+    params.push(locals[locals.len() - 1].clone())
+    pi = pi + 1
+  end
+  var stmts = Vec::new()
+  stmts.push(MirStatement {
+    kind: MirStatementKind::MirAssign(place_local(MirLocalId { id: 0 }), rvalue),
+    span: span_dummy()
+  })
+  var blocks = Vec::new()
+  blocks.push(MirBlock {
+    id: MirBlockId { id: 0 },
+    statements: stmts,
+    terminator: MirTerminator { kind: MirTerminatorKind::MirReturn, span: span_dummy() }
+  })
+  var functions = Vec::new()
+  functions.push(MirFunction {
+    name: fn_name,
+    params: params,
+    ret_type: ret_ty,
+    locals: locals,
+    blocks: blocks,
+    entry_block: MirBlockId { id: 0 },
+    is_async: false,
+    is_unsafe: false,
+    is_extern: false,
+    extern_abi: "".to_string(),
+    contracts: Vec::new(),
+    span: span_dummy()
+  })
+  MirProgram { functions: functions, statics: Vec::new(), types: Vec::new() }
+end
+
+# A single-block program whose body is the given statement list.
+def _wasm_test_stmt_program(fn_name: String, ret_ty: Type, locals: Vec[MirLocal], stmts: Vec[MirStatement]) -> MirProgram
+  var blocks = Vec::new()
+  blocks.push(MirBlock {
+    id: MirBlockId { id: 0 },
+    statements: stmts,
+    terminator: MirTerminator { kind: MirTerminatorKind::MirReturn, span: span_dummy() }
+  })
+  var functions = Vec::new()
+  functions.push(MirFunction {
+    name: fn_name,
+    params: Vec::new(),
+    ret_type: ret_ty,
+    locals: locals,
+    blocks: blocks,
+    entry_block: MirBlockId { id: 0 },
+    is_async: false,
+    is_unsafe: false,
+    is_extern: false,
+    extern_abi: "".to_string(),
+    contracts: Vec::new(),
+    span: span_dummy()
+  })
+  MirProgram { functions: functions, statics: Vec::new(), types: Vec::new() }
+end
+
+def _wasm_test_compile(program: MirProgram) -> Vec[u8]
+  let mut cfg = tg_compiler::wasm_target::WasmCompileConfig::default()
+  cfg.target = tg_compiler::wasm_target::WasmTarget::Wasm32Unknown
+  match tg_compiler::wasm_target::WasmCompiler::new(cfg).compile(&program)
+  when Result::Ok(bytes) then bytes
+  when Result::Err(e) then
+    panic("wasm conformance: unexpected compile failure: " + e.to_string())
+  end
+end
+
+# Compile and return the ERROR message; a successful compile is a test
+# failure (the Unsupported variants must FAIL the compilation).
+def _wasm_test_compile_error(program: MirProgram) -> String
+  let mut cfg = tg_compiler::wasm_target::WasmCompileConfig::default()
+  cfg.target = tg_compiler::wasm_target::WasmTarget::Wasm32Unknown
+  match tg_compiler::wasm_target::WasmCompiler::new(cfg).compile(&program)
+  when Result::Ok(_) then
+    panic("wasm conformance: expected the compile to FAIL with the Unsupported diagnostic, but it succeeded")
+  when Result::Err(e) then e.to_string()
+  end
+end
+
+# The minimal independent wasm section walk: header, then each section's
+# (id, len, payload); the CODE section's first body is decoded (the locals
+# declaration groups are skipped) and its instruction bytes returned.
+struct WasmTestCursor
+  bytes: Vec[u8]
+  pos: Int
+end
+
+def _wasm_test_u8(inout c: WasmTestCursor) -> Int
+  let b = c.bytes[c.pos] as Int
+  c.pos = c.pos + 1
+  b
+end
+
+def _wasm_test_leb(inout c: WasmTestCursor) -> Int
+  var result = 0
+  var shift = 0
+  var done = false
+  while !done do
+    let b = _wasm_test_u8(c)
+    result = result | ((b & 0x7F) << shift)
+    if (b & 0x80) == 0 then done = true else shift = shift + 7 end
+  end
+  result
+end
+
+def _wasm_test_body_bytes(bytes: Vec[u8]) -> Vec[u8]
+  mut c = WasmTestCursor { bytes: bytes, pos: 8 }
+  while c.pos < c.bytes.len() do
+    let id = _wasm_test_u8(&mut c)
+    let len = _wasm_test_leb(&mut c)
+    let payload_start = c.pos
+    if id == 10 then
+      let _ = _wasm_test_leb(&mut c)  ## the code-section body count
+      let body_len = _wasm_test_leb(&mut c)
+      let body_end = c.pos + body_len
+      let ngroups = _wasm_test_leb(&mut c)
+      var g = 0
+      while g < ngroups do
+        let _ = _wasm_test_leb(&mut c)  ## the group count
+        let _ = _wasm_test_u8(&mut c)   ## the group valtype
+        g = g + 1
+      end
+      var out = Vec::new()
+      while c.pos < body_end do
+        out.push(_wasm_test_u8(&mut c) as u8)
+      end
+      return out
+    end
+    c.pos = payload_start + len
+  end
+  panic("wasm conformance: the binary carries no code section")
+end
+
+def _wasm_test_contains(bytes: Vec[u8], needle: Vec[u8]) -> Bool
+  if needle.len() == 0 then return true end
+  var i = 0
+  while i <= bytes.len() - needle.len() do
+    var j = 0
+    var matches = true
+    while j < needle.len() do
+      if bytes[i + j] != needle[j] then
+        matches = false
+        break
+      end
+      j = j + 1
+    end
+    if matches then return true end
+    i = i + 1
+  end
+  false
+end
+
+def _wasm_test_count_byte(bytes: Vec[u8], b: u8) -> Int
+  var count = 0
+  var i = 0
+  while i < bytes.len() do
+    if bytes[i] == b then count = count + 1 end
+    i = i + 1
+  end
+  count
+end
+
+def _wasm_test_binop_program(op: MirBinOp, ty: Type) -> MirProgram
+  _wasm_test_rvalue_program("f_binop", ty, vec![ty, ty],
+    MirRvalue { kind: MirRvalueKind::MirBinOp(op, operand_copy_local(MirLocalId { id: 1 }), operand_copy_local(MirLocalId { id: 2 })) })
+end
+
+def _wasm_test_unop_program(op: MirUnOp, ty: Type) -> MirProgram
+  _wasm_test_rvalue_program("f_unop", ty, vec![ty, ty],
+    MirRvalue { kind: MirRvalueKind::MirUnOp(op, operand_copy_local(MirLocalId { id: 1 })) })
+end
+
+def _wasm_test_cast_program(kind: CastKind, p_ty: Type, target_ty: Type) -> MirProgram
+  _wasm_test_rvalue_program("f_cast", target_ty, vec![p_ty, p_ty],
+    MirRvalue { kind: MirRvalueKind::MirCast(kind, operand_copy_local(MirLocalId { id: 1 }), target_ty) })
+end
+
+def _wasm_test_int_constant(value: Int) -> MirConstant
+  MirConstant { kind: MirConstantKind::MirInt(value), ty: Type::Int, instance: Option::None }
+end
+
+def _wasm_test_bool_constant(value: Bool) -> MirConstant
+  MirConstant { kind: MirConstantKind::MirBool(value), ty: Type::Bool, instance: Option::None }
+end
+
+@test
+def test_wasm_rvalues_supported() -> Unit
+  ## MirMove: SUPPORTED — the operand's value.
+  let body_move = _wasm_test_body_bytes(_wasm_test_compile(
+    _wasm_test_rvalue_program("f_move", Type::Int, vec![Type::Int],
+      MirRvalue { kind: MirRvalueKind::MirMove(operand_copy_local(MirLocalId { id: 1 })) })))
+  wasm_test_check(_wasm_test_contains(body_move, vec![0x20, 0x01]), "MirMove emits the operand's local.get")
+
+  ## MirRef: SUPPORTED — the address handle.
+  let body_ref = _wasm_test_body_bytes(_wasm_test_compile(
+    _wasm_test_rvalue_program("f_ref", Type::Int, vec![Type::Int],
+      MirRvalue { kind: MirRvalueKind::MirRef(place_local(MirLocalId { id: 1 })) })))
+  wasm_test_check(_wasm_test_contains(body_ref, vec![0x20, 0x01]), "MirRef emits the place's local.get")
+
+  ## MirAggregate: SUPPORTED — the slot-image build (i32.sub, one
+  ## i32.store per field, the base handle).
+  let body_agg = _wasm_test_body_bytes(_wasm_test_compile(
+    _wasm_test_rvalue_program("f_agg", Type::Int, vec![Type::Int, Type::Int],
+      MirRvalue { kind: MirRvalueKind::MirAggregate(AggregateKind::Tuple,
+        vec![operand_copy_local(MirLocalId { id: 1 }), operand_copy_local(MirLocalId { id: 2 })]) })))
+  wasm_test_check(_wasm_test_contains(body_agg, vec![0x6B]), "MirAggregate decrements the stack pointer (i32.sub)")
+  wasm_test_check_eq(2, _wasm_test_count_byte(body_agg, 0x36), "MirAggregate stores one slot per field (i32.store)")
+
+  ## MirBinOp: SUPPORTED — the i64 family opcode.
+  let body_binop = _wasm_test_body_bytes(_wasm_test_compile(_wasm_test_binop_program(MirBinOp::Add, Type::Int)))
+  wasm_test_check(_wasm_test_contains(body_binop, vec![0x7C]), "MirBinOp(Add) on Int operands emits i64.add (0x7C)")
+
+  ## MirUnOp: SUPPORTED — the i64 family opcode.
+  let body_unop = _wasm_test_body_bytes(_wasm_test_compile(_wasm_test_unop_program(MirUnOp::Neg, Type::Int)))
+  wasm_test_check(_wasm_test_contains(body_unop, vec![0x7E]), "MirUnOp(Neg) on an Int operand emits i64.mul -1 (0x7E)")
+
+  ## MirDiscriminant: SUPPORTED — the tag word loads.
+  let body_disc = _wasm_test_body_bytes(_wasm_test_compile(
+    _wasm_test_rvalue_program("f_disc", Type::Int, vec![Type::Int],
+      MirRvalue { kind: MirRvalueKind::MirDiscriminant(place_local(MirLocalId { id: 1 })) })))
+  wasm_test_check(_wasm_test_contains(body_disc, vec![0x28, 0x02, 0x00, 0x28, 0x02, 0x00]), "MirDiscriminant emits the two i32.load tag reads")
+
+  ## MirLen: SUPPORTED for the fixed-array form — the compile-time count.
+  let body_len = _wasm_test_body_bytes(_wasm_test_compile(
+    _wasm_test_rvalue_program("f_len", Type::Int, vec![Type::Int, Type::FixedArray(Type::Int, 5)],
+      MirRvalue { kind: MirRvalueKind::MirLen(place_local(MirLocalId { id: 1 })) })))
+  wasm_test_check(_wasm_test_contains(body_len, vec![0x42, 0x05]), "MirLen of a FixedArray emits the i64.const count (5)")
+
+  ## MirCast: SUPPORTED for the convertible pairs — the real convert opcode.
+  let body_cast = _wasm_test_body_bytes(_wasm_test_compile(
+    _wasm_test_cast_program(CastKind::IntToFloat, Type::Int, Type::Float)))
+  wasm_test_check(_wasm_test_contains(body_cast, vec![0xB9]), "MirCast(IntToFloat i64 -> f64) emits f64.convert_i64_s (0xB9)")
+
+  ## MirRepeat: SUPPORTED — the slot-fill initializer (alloc + one store
+  ## per repetition).
+  let body_rep = _wasm_test_body_bytes(_wasm_test_compile(
+    _wasm_test_rvalue_program("f_rep", Type::Int, vec![Type::Int, Type::Int],
+      MirRvalue { kind: MirRvalueKind::MirRepeat(operand_copy_local(MirLocalId { id: 1 }), 3) })))
+  wasm_test_check(_wasm_test_contains(body_rep, vec![0x6B]), "MirRepeat allocates the slots (i32.sub)")
+  wasm_test_check_eq(3, _wasm_test_count_byte(body_rep, 0x36), "MirRepeat stores the element once per repetition (3 x i32.store)")
+end
+
+@test
+def test_wasm_binop_i64_family_opcodes() -> Unit
+  var cases = vec![
+    (MirBinOp::Add, 0x7C), (MirBinOp::Sub, 0x7D), (MirBinOp::Mul, 0x7E),
+    (MirBinOp::Div, 0x7F), (MirBinOp::Mod, 0x81), (MirBinOp::BitAnd, 0x83),
+    (MirBinOp::BitOr, 0x84), (MirBinOp::BitXor, 0x85), (MirBinOp::Shl, 0x86),
+    (MirBinOp::Shr, 0x87), (MirBinOp::Eq, 0x51), (MirBinOp::Ne, 0x52),
+    (MirBinOp::Lt, 0x53), (MirBinOp::Le, 0x57), (MirBinOp::Gt, 0x55),
+    (MirBinOp::Ge, 0x59)
+  ]
+  for (op, opcode) in cases do
+    let body = _wasm_test_body_bytes(_wasm_test_compile(_wasm_test_binop_program(op, Type::Int)))
+    wasm_test_check(_wasm_test_contains(body, vec![opcode as u8]), "the i64 binop family emitted opcode 0x" + (opcode as Int).to_string())
+  end
+end
+
+@test
+def test_wasm_binop_i32_family_opcodes() -> Unit
+  var cases = vec![
+    (MirBinOp::Add, 0x6A), (MirBinOp::Sub, 0x6B), (MirBinOp::Mul, 0x6C),
+    (MirBinOp::Div, 0x6D), (MirBinOp::Mod, 0x6F), (MirBinOp::BitAnd, 0x71),
+    (MirBinOp::BitOr, 0x72), (MirBinOp::BitXor, 0x73), (MirBinOp::Shl, 0x74),
+    (MirBinOp::Shr, 0x75), (MirBinOp::Eq, 0x46), (MirBinOp::Ne, 0x47),
+    (MirBinOp::Lt, 0x48), (MirBinOp::Le, 0x4C), (MirBinOp::Gt, 0x4A),
+    (MirBinOp::Ge, 0x4E)
+  ]
+  for (op, opcode) in cases do
+    let body = _wasm_test_body_bytes(_wasm_test_compile(_wasm_test_binop_program(op, Type::I32)))
+    wasm_test_check(_wasm_test_contains(body, vec![opcode as u8]), "the i32 binop family emitted opcode 0x" + (opcode as Int).to_string())
+  end
+end
+
+@test
+def test_wasm_binop_f64_family_opcodes() -> Unit
+  var cases = vec![
+    (MirBinOp::Add, 0xA0), (MirBinOp::Sub, 0xA1), (MirBinOp::Mul, 0xA2),
+    (MirBinOp::Div, 0xA3), (MirBinOp::Eq, 0x61), (MirBinOp::Ne, 0x62),
+    (MirBinOp::Lt, 0x63), (MirBinOp::Le, 0x65), (MirBinOp::Gt, 0x64),
+    (MirBinOp::Ge, 0x66)
+  ]
+  for (op, opcode) in cases do
+    let body = _wasm_test_body_bytes(_wasm_test_compile(_wasm_test_binop_program(op, Type::Float)))
+    wasm_test_check(_wasm_test_contains(body, vec![opcode as u8]), "the f64 binop family emitted opcode 0x" + (opcode as Int).to_string())
+  end
+end
+
+@test
+def test_wasm_binop_f32_family_opcodes() -> Unit
+  var cases = vec![
+    (MirBinOp::Add, 0x92), (MirBinOp::Sub, 0x93), (MirBinOp::Mul, 0x94),
+    (MirBinOp::Div, 0x95), (MirBinOp::Eq, 0x5B), (MirBinOp::Ne, 0x5C),
+    (MirBinOp::Lt, 0x5D), (MirBinOp::Le, 0x5F), (MirBinOp::Gt, 0x5E),
+    (MirBinOp::Ge, 0x60)
+  ]
+  for (op, opcode) in cases do
+    let body = _wasm_test_body_bytes(_wasm_test_compile(_wasm_test_binop_program(op, Type::F32)))
+    wasm_test_check(_wasm_test_contains(body, vec![opcode as u8]), "the f32 binop family emitted opcode 0x" + (opcode as Int).to_string())
+  end
+end
+
+@test
+def test_wasm_binop_unsupported_diagnostics() -> Unit
+  ## the float-family gaps: wasm has no bitwise float opcodes.
+  wasm_test_check(_wasm_test_compile_error(_wasm_test_binop_program(MirBinOp::BitAnd, Type::Float)) ==
+    "unsupported MIR binop BitAnd for the wasm f64 operand family", "f64 BitAnd fails with the stable diagnostic")
+  wasm_test_check(_wasm_test_compile_error(_wasm_test_binop_program(MirBinOp::Mod, Type::F32)) ==
+    "unsupported MIR binop Mod for the wasm f32 operand family", "f32 Mod fails with the stable diagnostic")
+  wasm_test_check(_wasm_test_compile_error(_wasm_test_binop_program(MirBinOp::Shl, Type::Float)) ==
+    "unsupported MIR binop Shl for the wasm f64 operand family", "f64 Shl fails with the stable diagnostic")
+  ## mixed operand families: no promotion exists — fail closed.
+  let mixed = _wasm_test_rvalue_program("f_mixed", Type::Int, vec![Type::Int, Type::I32],
+    MirRvalue { kind: MirRvalueKind::MirBinOp(MirBinOp::Add, operand_copy_local(MirLocalId { id: 1 }), operand_copy_local(MirLocalId { id: 2 })) })
+  wasm_test_check(_wasm_test_compile_error(mixed) ==
+    "unsupported MIR binop Add on mixed wasm operand types (i32, i64) for the wasm target", "mixed-family binop fails with the stable diagnostic")
+end
+
+@test
+def test_wasm_unop_table() -> Unit
+  ## the integer families: Neg/Not/BitNot are real.
+  let body_neg_i64 = _wasm_test_body_bytes(_wasm_test_compile(_wasm_test_unop_program(MirUnOp::Neg, Type::Int)))
+  wasm_test_check(_wasm_test_contains(body_neg_i64, vec![0x7E]), "Neg on i64 emits i64.mul (0x7E)")
+  let body_not_i64 = _wasm_test_body_bytes(_wasm_test_compile(_wasm_test_unop_program(MirUnOp::Not, Type::Int)))
+  wasm_test_check(_wasm_test_contains(body_not_i64, vec![0x50]), "Not on i64 emits i64.eqz (0x50)")
+  let body_bn_i64 = _wasm_test_body_bytes(_wasm_test_compile(_wasm_test_unop_program(MirUnOp::BitNot, Type::Int)))
+  wasm_test_check(_wasm_test_contains(body_bn_i64, vec![0x85]), "BitNot on i64 emits i64.xor (0x85)")
+  let body_neg_i32 = _wasm_test_body_bytes(_wasm_test_compile(_wasm_test_unop_program(MirUnOp::Neg, Type::I32)))
+  wasm_test_check(_wasm_test_contains(body_neg_i32, vec![0x6C]), "Neg on i32 emits i32.mul (0x6C)")
+  let body_not_i32 = _wasm_test_body_bytes(_wasm_test_compile(_wasm_test_unop_program(MirUnOp::Not, Type::I32)))
+  wasm_test_check(_wasm_test_contains(body_not_i32, vec![0x45]), "Not on i32 emits i32.eqz (0x45)")
+  let body_bn_i32 = _wasm_test_body_bytes(_wasm_test_compile(_wasm_test_unop_program(MirUnOp::BitNot, Type::I32)))
+  wasm_test_check(_wasm_test_contains(body_bn_i32, vec![0x73]), "BitNot on i32 emits i32.xor (0x73)")
+  ## the float families: Neg is real, Not/BitNot are the explicit
+  ## Unsupported diagnostics.
+  let body_neg_f64 = _wasm_test_body_bytes(_wasm_test_compile(_wasm_test_unop_program(MirUnOp::Neg, Type::Float)))
+  wasm_test_check(_wasm_test_contains(body_neg_f64, vec![0x9A]), "Neg on f64 emits f64.neg (0x9A)")
+  wasm_test_check(_wasm_test_compile_error(_wasm_test_unop_program(MirUnOp::Not, Type::Float)) ==
+    "unsupported MIR unop Not for the wasm target", "Not on f64 fails with the stable diagnostic")
+  wasm_test_check(_wasm_test_compile_error(_wasm_test_unop_program(MirUnOp::BitNot, Type::F32)) ==
+    "unsupported MIR unop BitNot for the wasm target", "BitNot on f32 fails with the stable diagnostic")
+end
+
+@test
+def test_wasm_cast_table() -> Unit
+  ## the convertible pairs emit the real conversion opcodes.
+  wasm_test_check(_wasm_test_contains(_wasm_test_body_bytes(_wasm_test_compile(
+    _wasm_test_cast_program(CastKind::IntToInt, Type::I32, Type::Int))), vec![0xAC]),
+    "IntToInt i32 -> i64 emits i64.extend_i32_s (0xAC)")
+  wasm_test_check(_wasm_test_contains(_wasm_test_body_bytes(_wasm_test_compile(
+    _wasm_test_cast_program(CastKind::IntToInt, Type::Int, Type::I32))), vec![0xA7]),
+    "IntToInt i64 -> i32 emits i32.wrap_i64 (0xA7)")
+  wasm_test_check(_wasm_test_contains(_wasm_test_body_bytes(_wasm_test_compile(
+    _wasm_test_cast_program(CastKind::IntToFloat, Type::I32, Type::F32))), vec![0xB2]),
+    "IntToFloat i32 -> f32 emits f32.convert_i32_s (0xB2)")
+  wasm_test_check(_wasm_test_contains(_wasm_test_body_bytes(_wasm_test_compile(
+    _wasm_test_cast_program(CastKind::IntToFloat, Type::Int, Type::Float))), vec![0xB9]),
+    "IntToFloat i64 -> f64 emits f64.convert_i64_s (0xB9)")
+  wasm_test_check(_wasm_test_contains(_wasm_test_body_bytes(_wasm_test_compile(
+    _wasm_test_cast_program(CastKind::FloatToInt, Type::Float, Type::Int))), vec![0xB0]),
+    "FloatToInt f64 -> i64 emits i64.trunc_f64_s (0xB0)")
+  wasm_test_check(_wasm_test_contains(_wasm_test_body_bytes(_wasm_test_compile(
+    _wasm_test_cast_program(CastKind::FloatToInt, Type::F32, Type::I32))), vec![0xA8]),
+    "FloatToInt f32 -> i32 emits i32.trunc_f32_s (0xA8)")
+  wasm_test_check(_wasm_test_contains(_wasm_test_body_bytes(_wasm_test_compile(
+    _wasm_test_cast_program(CastKind::FloatToFloat, Type::Float, Type::F32))), vec![0xB6]),
+    "FloatToFloat f64 -> f32 emits f32.demote_f64 (0xB6)")
+  wasm_test_check(_wasm_test_contains(_wasm_test_body_bytes(_wasm_test_compile(
+    _wasm_test_cast_program(CastKind::FloatToFloat, Type::F32, Type::Float))), vec![0xBB]),
+    "FloatToFloat f32 -> f64 emits f64.promote_f32 (0xBB)")
+  ## the same-family casts are identity — NO conversion opcode is emitted.
+  let body_id = _wasm_test_body_bytes(_wasm_test_compile(_wasm_test_cast_program(CastKind::IntToInt, Type::Int, Type::Int)))
+  wasm_test_check(!_wasm_test_contains(body_id, vec![0xAC]) && !_wasm_test_contains(body_id, vec![0xA7]),
+    "IntToInt within the i64 family is the identity (no conversion opcode)")
+  ## Pointer casts: every pointer is an i32 linear address — identity.
+  let _ = _wasm_test_compile(_wasm_test_cast_program(CastKind::Pointer, Type::Ptr(Type::U8), Type::Ptr(Type::U8)))
+  ## the gap pairs and Transmute are the explicit Unsupported diagnostics.
+  wasm_test_check(_wasm_test_compile_error(_wasm_test_cast_program(CastKind::Transmute, Type::Int, Type::Int)) ==
+    "unsupported MIR rvalue MirCast (Transmute i64 -> i64) for the wasm target", "Transmute fails with the stable diagnostic")
+  wasm_test_check(_wasm_test_compile_error(_wasm_test_cast_program(CastKind::IntToFloat, Type::Int, Type::I32)) ==
+    "unsupported MIR rvalue MirCast (IntToFloat i64 -> i32) for the wasm target", "the IntToFloat i64 -> i32 gap fails with the stable diagnostic")
+end
+
+@test
+def test_wasm_rvalues_unsupported_diagnostics() -> Unit
+  ## MirLen on a non-fixed-array source: no wasm length metadata — fail
+  ## closed, never a pushed zero.
+  let prog_len = _wasm_test_rvalue_program("f_len_bad", Type::Int, vec![Type::Int, Type::String],
+    MirRvalue { kind: MirRvalueKind::MirLen(place_local(MirLocalId { id: 1 })) })
+  wasm_test_check(_wasm_test_compile_error(prog_len) ==
+    "unsupported MIR rvalue MirLen for the wasm target", "MirLen on a non-fixed-array source fails with the stable diagnostic")
+  ## MirPhi: the wasm dispatch model has no phi placement — fail closed.
+  let prog_phi = _wasm_test_rvalue_program("f_phi", Type::Int, vec![Type::Int],
+    MirRvalue { kind: MirRvalueKind::MirPhi(vec![]) })
+  wasm_test_check(_wasm_test_compile_error(prog_phi) ==
+    "unsupported MIR rvalue MirPhi for the wasm target", "MirPhi fails with the stable diagnostic")
+end
+
+@test
+def test_wasm_constants_table() -> Unit
+  ## the SUPPORTED constants emit their real values.
+  let body_int = _wasm_test_body_bytes(_wasm_test_compile(
+    _wasm_test_rvalue_program("f_cint", Type::Int, vec![],
+      MirRvalue { kind: MirRvalueKind::MirMove(MirOperand { kind: MirOperandKind::MirConstant(_wasm_test_int_constant(7)) }) })))
+  wasm_test_check(_wasm_test_contains(body_int, vec![0x42, 0x07]), "MirInt(7) emits i64.const 7 (0x42 0x07)")
+  let body_bool = _wasm_test_body_bytes(_wasm_test_compile(
+    _wasm_test_rvalue_program("f_cbool", Type::Bool, vec![],
+      MirRvalue { kind: MirRvalueKind::MirMove(MirOperand { kind: MirOperandKind::MirConstant(_wasm_test_bool_constant(true)) }) })))
+  wasm_test_check(_wasm_test_contains(body_bool, vec![0x41, 0x01]), "MirBool(true) emits i32.const 1 (0x41 0x01)")
+  ## MirUnit / MirZeroSized are zero-sized: no machine value — the compile
+  ## succeeds without any push.
+  let _ = _wasm_test_compile(
+    _wasm_test_rvalue_program("f_cunit", Type::Int, vec![],
+      MirRvalue { kind: MirRvalueKind::MirMove(MirOperand { kind: MirOperandKind::MirConstant(
+        MirConstant { kind: MirConstantKind::MirUnit, ty: Type::Unit, instance: Option::None }) }) }))
+  let _ = _wasm_test_compile(
+    _wasm_test_rvalue_program("f_czs", Type::Int, vec![],
+      MirRvalue { kind: MirRvalueKind::MirMove(MirOperand { kind: MirOperandKind::MirConstant(
+        MirConstant { kind: MirConstantKind::MirZeroSized, ty: Type::Unit, instance: Option::None }) }) }))
+  ## the UNSUPPORTED constants fail the compilation with the stable
+  ## diagnostics — never a pushed zero.
+  wasm_test_check(_wasm_test_compile_error(
+    _wasm_test_rvalue_program("f_cfn", Type::Int, vec![],
+      MirRvalue { kind: MirRvalueKind::MirMove(MirOperand { kind: MirOperandKind::MirConstant(
+        MirConstant { kind: MirConstantKind::MirFnItem("f".to_string()), ty: Type::Int, instance: Option::None }) }) })) ==
+    "unsupported MIR constant MirFnItem for the wasm target", "MirFnItem fails with the stable diagnostic")
+  wasm_test_check(_wasm_test_compile_error(
+    _wasm_test_rvalue_program("f_csr", Type::Int, vec![],
+      MirRvalue { kind: MirRvalueKind::MirMove(MirOperand { kind: MirOperandKind::MirConstant(
+        MirConstant { kind: MirConstantKind::MirStaticRef(DefId { module: ModuleId { id: 0 }, index: 0 }), ty: Type::Int, instance: Option::None }) }) })) ==
+    "unsupported MIR constant MirStaticRef for the wasm target", "MirStaticRef fails with the stable diagnostic")
+  wasm_test_check(_wasm_test_compile_error(
+    _wasm_test_rvalue_program("f_csa", Type::Int, vec![],
+      MirRvalue { kind: MirRvalueKind::MirMove(MirOperand { kind: MirOperandKind::MirConstant(
+        MirConstant { kind: MirConstantKind::MirStaticAddr(DefId { module: ModuleId { id: 0 }, index: 0 }), ty: Type::Int, instance: Option::None }) }) })) ==
+    "unsupported MIR constant MirStaticAddr for the wasm target", "MirStaticAddr fails with the stable diagnostic")
+end
+
+@test
+def test_wasm_statements_supported() -> Unit
+  ## MirAssign: the real store.
+  let body_assign = _wasm_test_body_bytes(_wasm_test_compile(_wasm_test_binop_program(MirBinOp::Add, Type::Int)))
+  wasm_test_check(_wasm_test_contains(body_assign, vec![0x7C]), "MirAssign emits the rvalue's real opcode")
+
+  ## MirContractCheck: SUPPORTED — the condition is tested and a failure
+  ## TRAPS (i32.eqz / if / unreachable / end — the MirAssert shape).
+  var contract_locals = Vec::new()
+  contract_locals.push(_wasm_test_local(0, "_0", Type::Unit))
+  contract_locals.push(_wasm_test_local(1, "c", Type::Bool))
+  var contract_stmts = Vec::new()
+  contract_stmts.push(MirStatement {
+    kind: MirStatementKind::MirContractCheck(
+      MirContract { kind: MirContractKind::Pre, condition: operand_copy_local(MirLocalId { id: 1 }), message: "".to_string(), span: span_dummy() },
+      operand_copy_local(MirLocalId { id: 1 })),
+    span: span_dummy()
+  })
+  let body_contract = _wasm_test_body_bytes(_wasm_test_compile(
+    _wasm_test_stmt_program("f_contract", Type::Unit, contract_locals, contract_stmts)))
+  wasm_test_check(_wasm_test_contains(body_contract, vec![0x45, 0x04, 0x40, 0x00, 0x0B]),
+    "MirContractCheck emits the i32.eqz / if / unreachable / end trap check")
+
+  ## MirStorageLive / MirStorageDead / MirNop: SUPPORTED with their real
+  ## semantics (the statically allocated slots need no machine emission) —
+  ## the compile succeeds and no no-op fallthrough exists.
+  var stmt_locals = Vec::new()
+  stmt_locals.push(_wasm_test_local(0, "_0", Type::Unit))
+  stmt_locals.push(_wasm_test_local(1, "t", Type::Int))
+  var stmt_list = Vec::new()
+  stmt_list.push(MirStatement { kind: MirStatementKind::MirStorageLive(MirLocalId { id: 1 }), span: span_dummy() })
+  stmt_list.push(MirStatement { kind: MirStatementKind::MirNop, span: span_dummy() })
+  stmt_list.push(MirStatement { kind: MirStatementKind::MirStorageDead(MirLocalId { id: 1 }), span: span_dummy() })
+  let _ = _wasm_test_compile(_wasm_test_stmt_program("f_storage", Type::Unit, stmt_locals, stmt_list))
+end
+
+@test
+def test_wasm_statements_unsupported_diagnostics() -> Unit
+  var base_locals = Vec::new()
+  base_locals.push(_wasm_test_local(0, "_0", Type::Unit))
+  var base_stmts = Vec::new()
+
+  base_stmts = Vec::new()
+  base_stmts.push(MirStatement { kind: MirStatementKind::MirBudgetConsume("alloc".to_string(), 10), span: span_dummy() })
+  wasm_test_check(_wasm_test_compile_error(_wasm_test_stmt_program("f_budget", Type::Unit, base_locals.clone(), base_stmts)) ==
+    "unsupported MIR statement MirBudgetConsume for the wasm target", "MirBudgetConsume fails with the stable diagnostic")
+
+  base_stmts = Vec::new()
+  base_stmts.push(MirStatement { kind: MirStatementKind::MirEffectRecord("evt".to_string(), operand_copy_local(MirLocalId { id: 0 })), span: span_dummy() })
+  wasm_test_check(_wasm_test_compile_error(_wasm_test_stmt_program("f_erec", Type::Unit, base_locals.clone(), base_stmts)) ==
+    "unsupported MIR statement MirEffectRecord for the wasm target", "MirEffectRecord fails with the stable diagnostic")
+
+  base_stmts = Vec::new()
+  base_stmts.push(MirStatement {
+    kind: MirStatementKind::MirEffectPerform(EffectId { id: 1 }, 0, "op".to_string(),
+      operand_copy_local(MirLocalId { id: 0 }), operand_copy_local(MirLocalId { id: 0 })),
+    span: span_dummy()
+  })
+  wasm_test_check(_wasm_test_compile_error(_wasm_test_stmt_program("f_eperf", Type::Unit, base_locals.clone(), base_stmts)) ==
+    "unsupported MIR statement MirEffectPerform for the wasm target", "MirEffectPerform fails with the stable diagnostic")
+
+  base_stmts = Vec::new()
+  base_stmts.push(MirStatement {
+    kind: MirStatementKind::MirEffectFrameEnter(EffectId { id: 1 }, 1, 1, "disp".to_string(),
+      operand_copy_local(MirLocalId { id: 0 })),
+    span: span_dummy()
+  })
+  wasm_test_check(_wasm_test_compile_error(_wasm_test_stmt_program("f_fenter", Type::Unit, base_locals.clone(), base_stmts)) ==
+    "unsupported MIR statement MirEffectFrameEnter for the wasm target", "MirEffectFrameEnter fails with the stable diagnostic")
+
+  base_stmts = Vec::new()
+  base_stmts.push(MirStatement { kind: MirStatementKind::MirEffectFrameExit, span: span_dummy() })
+  wasm_test_check(_wasm_test_compile_error(_wasm_test_stmt_program("f_fexit", Type::Unit, base_locals.clone(), base_stmts)) ==
+    "unsupported MIR statement MirEffectFrameExit for the wasm target", "MirEffectFrameExit fails with the stable diagnostic")
+end

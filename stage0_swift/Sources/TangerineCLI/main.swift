@@ -967,6 +967,8 @@ struct TangerineCLI {
             return .unaryOp(op, rewrite(operand, moduleKey: moduleKey, catalog: catalog))
         case .cast(let operand, let type):
             return .cast(rewrite(operand, moduleKey: moduleKey, catalog: catalog), type)
+        case .repeat(let operand, let count):
+            return .repeat(rewrite(operand, moduleKey: moduleKey, catalog: catalog), count)
         }
     }
 

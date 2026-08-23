@@ -2081,24 +2081,34 @@ end
 
 ### The embedded route (`--target <embedded-triple>`)
 
-The bare-metal targets (Cortex-M thumbv6m/thumbv7em/thumbv8m.main and
-RISC-V riscv32imc/riscv32imac/riscv64gc) route to the embedded contract
-(`compile_to_embedded_route`): the per-triple **target spec** (arch / cpu /
-fpu / endianness / pointer width / max atomic width / linker / abort-only
-panic) emitted as the JSON artifact, the **linker script** (the flash/RAM
-`MEMORY` layout + the `.isr_vector`/`.text`/`.rodata`/`.data`/`.bss`
-placement + the `__data_load` copy table + the stack top), the **startup**
-(the `_reset_handler` contract — the `.bss` zeroing + the `.data` copy +
-the user `main` call), the **interrupt vector table** (every `@interrupt`
-function, in declaration order; an ISR takes no parameters — the
-signature gate), the **volatile/MMIO** load/store intrinsics (the
-runtime's `_tg_volatile_read*` / `_tg_volatile_write*` arms), the
-**atomicity availability** per target (0/32/64), the allocator-free
-core-only surface, and the **bare-metal binary** (the reset-vector entry,
-structurally verified). `std::embedded` provides the `Register` /
-`ReadOnly` / `WriteOnly` MMIO abstraction, the `@interrupt` /
-`@link_section` / `@panic_handler` markers, the `interrupt_vector_table`
-and the allocator-free `ArrayVec` / `RingBuffer` collections.
+The embedded route (`compile_to_embedded_route`) serves the bare-metal
+target **`aarch64-unknown-none`** — the ONLY embedded triple with real
+code generation (the aarch64 backend): the per-triple **target spec**
+(arch / cpu / fpu / endianness / pointer width / max atomic width /
+linker / abort-only panic) emitted as the JSON artifact, the **linker
+script** (the flash/RAM `MEMORY` layout + the `.isr_vector`/`.text`/
+`.rodata`/`.data`/`.bss` placement + the `__data_load` copy table + the
+stack top), the **startup** (the `_reset_handler` contract — the `.bss`
+zeroing + the `.data` copy + the user `main` call), the **interrupt
+vector table** (every `@interrupt` function, in declaration order; an ISR
+takes no parameters — the signature gate), the **volatile/MMIO**
+load/store intrinsics (the runtime's `_tg_volatile_read*` /
+`_tg_volatile_write*` arms), the **atomicity availability** (64), the
+allocator-free core-only surface, and the **bare-metal binary** (the
+reset-vector entry, structurally verified). `std::embedded` provides the
+`Register` / `ReadOnly` / `WriteOnly` MMIO abstraction, the `@interrupt`
+/ `@link_section` / `@panic_handler` markers, the
+`interrupt_vector_table` and the allocator-free `ArrayVec` / `RingBuffer`
+collections.
+
+**The ISA code-gen truth (P0.2):** the Thumb triples (`thumbv6m-none-eabi`
+/ `thumbv7em-none-eabi[f]` / `thumbv8m.main-none-eabihf`) and the RISC-V
+triples (`riscv32imc|imac-unknown-none-elf` / `riscv64gc-unknown-none-elf`)
+are **HARD-REJECTED** — the compiler has no Thumb/RISC-V code generator,
+so the route emits the stable rejection diagnostic and NO artifact (the
+old behavior forced the aarch64 backend under the foreign triple and
+fabricated the image). There is no QEMU execution lane; hardware
+execution is not claimed.
 
 ### WASI (preview1)
 

@@ -186,10 +186,10 @@ let normalized = a.normalize()   ## unit vector
 let length = a.length()          ## 3.741...
 let lerped = a.lerp(b, 0.5)     ## midpoint
 
-## SIMD-accelerated Vec4
+## SIMD-shaped Vec4 (the scalar lane ops; the intrinsic SIMD arms are the separate std::simd surface)
 let v4 = Vec4.new(1.0, 2.0, 3.0, 4.0)
 let w4 = Vec4.new(5.0, 6.0, 7.0, 8.0)
-let dot4 = v4.dot(w4)  ## Uses f32x4 SIMD internally
+let dot4 = v4.dot(w4)  ## the portable lane-wise ops (NOT the __intrinsic_simd_* arms)
 ```
 
 ### Matrices
@@ -416,7 +416,7 @@ let discrete = adapters.iter()
 4. **Use memory-mapped I/O** for large asset files
 5. **Enable deterministic float only where needed** — it can inhibit optimizations
 6. **Profile with GPU timestamps** — measure actual GPU time, not CPU time
-7. **Use `Vec4`/`Mat4`** — SIMD-accelerated on x86_64 and AArch64
+7. **Use `Vec4`/`Mat4`** — the portable lane-wise ops; the compiler-inline `__intrinsic_simd_*` arms (aarch64 NEON + x86 SSE/AVX, experimental) are the separate std::simd surface
 
 ## See Also
 

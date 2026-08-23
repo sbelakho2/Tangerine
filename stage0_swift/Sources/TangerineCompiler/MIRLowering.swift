@@ -33,6 +33,11 @@ public final class MIRLowering {
     private var loopBreakTargets: [BlockId] = []
     private var loopContinueTargets: [BlockId] = []
 
+    // Registered defer bodies (as pre-lowered exit blocks), in registration
+    // order; executed at the function's exit cleanup, LIFO (the kernel's
+    // defer model, bounded to the function end).
+    private var pendingDeferBlocks: [BlockId] = []
+
     // Function resolution cache: name → resolved name
     private var fnCache: [String: String] = [:]
     private var functionReturnTypes: [String: MirType] = [:]
@@ -62,27 +67,43 @@ public final class MIRLowering {
         typeDefByName.removeAll(keepingCapacity: true)
         variantCache.removeAll(keepingCapacity: true)
         for td in typeDefs {
-            // Index by exact name
-            typeDefByName[td.name] = td
-            // Also index by bare name (last segment) if unambiguous
-            let bareName = typeNameParts(td.name).last ?? td.name
-            if typeDefByName[bareName] == nil {
-                typeDefByName[bareName] = td
-            }
-            // Build variant cache for enums
-            if case .enumDef(let variants) = td.kind {
-                for (idx, variant) in variants.enumerated() {
-                    let key = "\(td.name)::\(variant.0)"
-                    variantCache[key] = (td, idx)
-                    // Also cache by bare type name
-                    let bareKey = "\(bareName)::\(variant.0)"
-                    if variantCache[bareKey] == nil {
-                        variantCache[bareKey] = (td, idx)
+            registerTypeDefInCaches(td)
+        }
+    }
+
+    /// Register one type def in the lookup caches (the audit item 13 —
+    /// decided deliberately):
+    ///   - the QUALIFIED key (td.name / "Type::Variant") is the
+    ///     registration authority — always exact, always the last
+    ///     registration (the kernel's per-module tables +
+    ///     module_qualified_key);
+    ///   - the bare-name type slot and the "bareType::Variant" slot are
+    ///     LAST-DEF-WINS mirrors (the later registration shadows the
+    ///     earlier one, consistent with the flat per-module registration
+    ///     order); they never shadow the qualified keys, which every
+    ///     qualified lookup consults first;
+    ///   - the variant-NAME-ALONE slot is QUALIFIED-ONLY where the hazard
+    ///     matters: the slot exists only while the variant name is
+    ///     globally unambiguous (the first registration); a same-named
+    ///     variant in a second enum REMOVES the bare slot, so an
+    ///     unqualified variant reference ("Some") never depends on the
+    ///     registration order — it falls back to the exact-name scan with
+    ///     the uniqueness requirement (the kernel's per-module tables
+    ///     decide the bare reference).
+    private func registerTypeDefInCaches(_ td: MirTypeDef) {
+        typeDefByName[td.name] = td
+        let bareName = typeNameParts(td.name).last ?? td.name
+        typeDefByName[bareName] = td
+        if case .enumDef(let variants) = td.kind {
+            for (idx, variant) in variants.enumerated() {
+                variantCache["\(td.name)::\(variant.0)"] = (td, idx)
+                variantCache["\(bareName)::\(variant.0)"] = (td, idx)
+                if let existing = variantCache[variant.0] {
+                    if existing.0.name != td.name {
+                        variantCache.removeValue(forKey: variant.0)
                     }
-                    // Cache variant name alone (for unqualified resolution)
-                    if variantCache[variant.0] == nil {
-                        variantCache[variant.0] = (td, idx)
-                    }
+                } else {
+                    variantCache[variant.0] = (td, idx)
                 }
             }
         }
@@ -208,14 +229,18 @@ public final class MIRLowering {
         for item in items {
             switch item.kind {
             case .function(let fn):
-                functionReturnTypes[fn.sig.name] = fn.sig.returnType.map(lowerTypeExpr) ?? .unit
-                functionParamConventions[fn.sig.name] = fn.sig.params.map { $0.convention }
+                // The MIR function identity is the module-qualified key
+                // (the audit item 12): two `def foo()` in different
+                // modules must NOT collide — the Item.modulePath is the
+                // registration authority (the kernel's
+                // module_qualified_key).
+                let qualifiedName = Program.moduleQualifiedKey(path: item.modulePath, name: fn.sig.name)
+                functionReturnTypes[qualifiedName] = fn.sig.returnType.map(lowerTypeExpr) ?? .unit
+                functionParamConventions[qualifiedName] = fn.sig.params.map { $0.convention }
             case .moduleDef(let d):
-                pushModule(d.name)
                 if let children = d.items {
                     collectFunctionReturnTypes(children)
                 }
-                popModule()
             case .implBlock(let d):
                 let previousSelfType = currentSelfType
                 currentSelfType = d.targetType
@@ -396,7 +421,15 @@ public final class MIRLowering {
     private func lowerItem(_ item: Item) {
         switch item.kind {
         case .function(let fn):
-            lowerFunction(fn)
+            // The MIR function name carries the module qualification (the
+            // audit item 12): the Item.modulePath stamp is the identity
+            // authority, so two `def foo()` in different modules register
+            // distinct "path::foo" names and never collide. The bare
+            // spelling stays reachable through resolveFunctionName's
+            // "::foo" suffix pass and the interpreter's candidate search.
+            var qualifiedFn = fn
+            qualifiedFn.sig.name = Program.moduleQualifiedKey(path: item.modulePath, name: fn.sig.name)
+            lowerFunction(qualifiedFn)
         case .testDecl:
             break
         case .constDecl(let d):
@@ -422,17 +455,7 @@ public final class MIRLowering {
             // Rebuild cache for new enum types (including variants)
             if typeDefs.count > beforeCount {
                 for i in beforeCount..<typeDefs.count {
-                    let td = typeDefs[i]
-                    typeDefByName[td.name] = td
-                    if case .enumDef(let variants) = td.kind {
-                        let bareName = typeNameParts(td.name).last ?? td.name
-                        for (idx, variant) in variants.enumerated() {
-                            variantCache["\(td.name)::\(variant.0)"] = (td, idx)
-                            if variantCache[variant.0] == nil { variantCache[variant.0] = (td, idx) }
-                            let bareKey = "\(bareName)::\(variant.0)"
-                            if variantCache[bareKey] == nil { variantCache[bareKey] = (td, idx) }
-                        }
-                    }
+                    registerTypeDefInCaches(typeDefs[i])
                 }
             }
         case .moduleDef(let d):
@@ -448,6 +471,16 @@ public final class MIRLowering {
                                           type: lowerTypeExpr(c.type),
                                           initializer: evalConstant(c.value),
                                           isMutable: false))
+            }
+        case .externBlock(let d):
+            // Extern declarations become EMPTY MIR functions with the
+            // isExtern flag set (the kernel's ItemExternBlock lowering —
+            // codegen emits relocations instead of bodies). The decl's
+            // FunctionSig carries isExtern = true, so lowerFunction marks
+            // the MirFunction; an extern function is never silently
+            // dropped from the program.
+            for fn in d.functions {
+                lowerFunction(fn)
             }
         default:
             break // traits, impls, use, type alias, extern, etc. — skipped in MIR lowering
@@ -484,6 +517,23 @@ public final class MIRLowering {
     // MARK: - Function lowering
 
     private func lowerFunction(_ fn: FunctionDecl) {
+        // A nested function declaration (a `def` statement inside a function
+        // body) lowers THROUGH this path while the enclosing function's
+        // lowering is in progress. resetFunctionState() would otherwise wipe
+        // the enclosing function's scopes/blocks/locals — the same
+        // save/restore discipline lowerClosure applies to nested closures —
+        // so the enclosing lowering state is preserved across the nested
+        // function's lowering (the nested MirFunction still accumulates
+        // into the shared program-level `functions` list).
+        let savedBlocks = blocks
+        let savedLocals = locals
+        let savedCurrentBlock = currentBlock
+        let savedNextLocal = nextLocal
+        let savedNextBlock = nextBlock
+        let savedReturnLocal = returnLocal
+        let savedScopes = scopes
+        let savedDeferBlocks = pendingDeferBlocks
+
         resetFunctionState()
         pushScope()
 
@@ -500,6 +550,12 @@ public final class MIRLowering {
                 ty = .refInternal(base, true)
             } else if p.modifier == .ref {
                 ty = .refInternal(base, false)
+            } else if p.modifier == .refMut {
+                // A .refMut-modifier param is a mutable internal reference —
+                // the same refInternal form as .ref (the mutability flag
+                // carried; the old asymmetry that dropped .refMut to the
+                // by-value type is fixed).
+                ty = .refInternal(base, true)
             } else {
                 ty = base
             }
@@ -515,22 +571,36 @@ public final class MIRLowering {
         switch fn.body {
         case .block(let body):
             lowerBlock(body, resultInto: returnLocal)
-            terminateIfNeeded(.ret)
+            terminateIfNeeded(exitTerminator())
         case .expr(let expr):
             let val = lowerExpr(expr)
             emit(.assign(.local(returnLocal), .use(val)))
-            terminateIfNeeded(.ret)
+            terminateIfNeeded(exitTerminator())
         case .signatureOnly:
-            terminateIfNeeded(.ret)
+            terminateIfNeeded(exitTerminator())
         }
 
         popScope()
 
+        // Wire the function's exit cleanup (the registered defers, LIFO)
+        // and build the MirFunction with the declaration's flags.
+        buildDeferExitChain()
+
         let mirFn = MirFunction(name: fn.sig.name, params: paramLocals, returnType: retType,
                                  locals: locals, blocks: blocks, entryBlock: entry,
-                                 isAsync: fn.sig.isAsync)
+                                 isAsync: fn.sig.isAsync,
+                                 isUnsafe: fn.sig.isUnsafe,
+                                 isExtern: fn.sig.isExtern)
         functions.append(mirFn)
         fnCache.removeAll()  // Invalidate cache when functions are added
+
+        // Restore the enclosing function's lowering state (the nested
+        // function's MIR is complete and registered).
+        blocks = savedBlocks; locals = savedLocals
+        currentBlock = savedCurrentBlock; nextLocal = savedNextLocal
+        nextBlock = savedNextBlock; returnLocal = savedReturnLocal
+        scopes = savedScopes
+        pendingDeferBlocks = savedDeferBlocks
     }
 
     // MARK: - Block lowering
@@ -562,12 +632,25 @@ public final class MIRLowering {
         case .item(let item):
             lowerItem(item)
         case .deferStmt(let body, _):
+            // `defer { ... }` REGISTERS a deferred action — the body does
+            // NOT execute at registration. The body's statements are
+            // lowered into a dedicated exit block, wired into the
+            // function's exit cleanup at function end and executed there
+            // LIFO (the last registered defer runs first) — the kernel's
+            // defer model, bounded to the function-level exit.
+            let deferBlock = freshBlock()
+            let savedBlock = currentBlock
+            currentBlock = deferBlock
+            pushScope()
             for s in body.stmts {
                 lowerStmt(s)
             }
             if let tail = body.tailExpr {
                 _ = lowerExpr(tail)
             }
+            popScope()
+            currentBlock = savedBlock
+            pendingDeferBlocks.append(deferBlock)
         }
     }
 
@@ -600,10 +683,18 @@ public final class MIRLowering {
 
     private func lowerExpr(_ expr: Expr) -> MirOperand {
         switch expr {
-        case .intLit(let s, _):
-            return .mirConstant(.int(MIRLowering.parseInt(s)))
-        case .floatLit(let s, _):
-            return .mirConstant(.float(Double(s) ?? 0.0))
+        case .intLit(let s, let span):
+            guard let v = MIRLowering.parseInt(s) else {
+                recordLoweringError("MIRLowering: unparseable integer literal '\(s)' at span \(span.start)..<\(span.end) — the parse failure is reported at the literal's span (INV-PARSE-003 fail-closed), never a silent 0")
+                return .mirConstant(.int(0))
+            }
+            return .mirConstant(.int(v))
+        case .floatLit(let s, let span):
+            guard let v = MIRLowering.parseFloatLiteral(s) else {
+                recordLoweringError("MIRLowering: unparseable float literal '\(s)' at span \(span.start)..<\(span.end) — the parse failure is reported at the literal's span (INV-PARSE-003 fail-closed), never a silent 0.0")
+                return .mirConstant(.float(0.0))
+            }
+            return .mirConstant(.float(v))
         case .stringLit(let s, _):
             return .mirConstant(.str(s))
         case .charLit(let c, _):
@@ -614,6 +705,13 @@ public final class MIRLowering {
             if let id = lookupScope(n) {
                 return .mirCopy(.local(id))
             }
+            // A registered static (mut static / const / impl const) reads
+            // as the MirStaticRef constant — the kernel's MirStaticRef(DefId)
+            // form, name-keyed (the seed's MirStaticId is the MirStatic
+            // name). Never the fnItem mis-lowering.
+            if statics.contains(where: { $0.name == n }) {
+                return .mirConstant(.staticRef(n))
+            }
             // Check for A::B style enum variants encoded as name
             if n.contains("::") {
                 let parts = typeNameParts(n)
@@ -622,8 +720,10 @@ public final class MIRLowering {
                     let variantName = parts.last!
                     if let (td, idx) = resolveNamedVariant(enumName, variantName: variantName, expectedFieldCount: 0) {
                         if case .enumDef(let variants) = td.kind, variants[idx].1.isEmpty {
-                            let tmp = freshTemp(type: .named(td.name))
-                            emit(.assign(.local(tmp), .aggregate(.enumCtor(td.name, idx), [.mirConstant(.unit)])))
+                            let tmp = freshTemp(type: .named(td.name, []))
+                            // Zero-field variant: the enumCtor carries an
+                            // EMPTY payload (no unit stub).
+                            emit(.assign(.local(tmp), .aggregate(.enumCtor(td.name, idx), [])))
                             return .mirCopy(.local(tmp))
                         }
                         return .mirConstant(.fnItem(n))
@@ -634,12 +734,19 @@ public final class MIRLowering {
             let resolvedName = resolveFunctionName(n)
             return .mirConstant(.fnItem(resolvedName))
         case .path(let a, let b, _):
+            // A qualified static (impl const "Type::NAME", module statics)
+            // reads as the MirStaticRef constant before the fnItem fallback.
+            let qualifiedStatic = "\(a)::\(b)"
+            if statics.contains(where: { $0.name == qualifiedStatic }) {
+                return .mirConstant(.staticRef(qualifiedStatic))
+            }
             // Check if this is an enum variant (e.g., Option::None, Subcommand::Build)
             if let (td, idx) = resolveNamedVariant(a, variantName: b, expectedFieldCount: 0) {
                 if case .enumDef(let variants) = td.kind, variants[idx].1.isEmpty {
-                    // Unit-like variant: produce enum value directly
-                    let tmp = freshTemp(type: .named(td.name))
-                    emit(.assign(.local(tmp), .aggregate(.enumCtor(td.name, idx), [.mirConstant(.unit)])))
+                    // Unit-like variant: produce enum value directly with an
+                    // EMPTY payload (no unit stub).
+                    let tmp = freshTemp(type: .named(td.name, []))
+                    emit(.assign(.local(tmp), .aggregate(.enumCtor(td.name, idx), [])))
                     return .mirCopy(.local(tmp))
                 }
                 // Variant with fields: return as a constructor function
@@ -649,7 +756,11 @@ public final class MIRLowering {
         case .binary(let left, let op, let right, _):
             let l = lowerExpr(left)
             let r = lowerExpr(right)
-            let tmp = freshTemp()
+            // Comparison/logical operators produce Bool-typed values;
+            // arithmetic/bitwise produce Int-typed values — the static
+            // type rides on the temp so condition normalization
+            // (normalizeCondition) can see bool-typed conditions.
+            let tmp = freshTemp(type: binOpResultType(op))
             emit(.assign(.local(tmp), .binaryOp(lowerBinOp(op), l, r)))
             return .mirCopy(.local(tmp))
 
@@ -662,8 +773,39 @@ public final class MIRLowering {
                 return .mirCopy(.local(tmp))
             case .not:
                 let val = lowerExpr(inner)
-                let tmp = freshTemp(type: operandType(val) ?? .unknown)
+                let tmp = freshTemp(type: .bool)
                 emit(.assign(.local(tmp), .unaryOp(.not, val)))
+                return .mirCopy(.local(tmp))
+            case .bitNot:
+                // `~x` — the bitwise-not rvalue (kernel MirUnOp::BitNot),
+                // never a plain copy.
+                let val = lowerExpr(inner)
+                let tmp = freshTemp(type: operandType(val) ?? .unknown)
+                emit(.assign(.local(tmp), .unaryOp(.bitNot, val)))
+                return .mirCopy(.local(tmp))
+            case .deref:
+                // `*x` — the deref READ of the place: the place extended
+                // with the ProjDeref projection (the kernel's
+                // place_deref — ExprRawDeref is place-like), never the
+                // plain copy of the operand.
+                if let place = exprToPlace(inner) {
+                    let derefPlace = MirPlace(local: place.local,
+                                              projections: place.projections + [.projDeref])
+                    let derefType = projectedType(operandType(.mirCopy(place)) ?? .unknown,
+                                                  by: .projDeref) ?? .unknown
+                    let tmp = freshTemp(type: derefType)
+                    emit(.assign(.local(tmp), .use(.mirCopy(derefPlace))))
+                    return .mirCopy(.local(tmp))
+                }
+                // Non-place inner: spill the operand, then deref through
+                // the spilled local.
+                let val = lowerExpr(inner)
+                let valLocal = placeOf(val)
+                let derefType = projectedType(operandType(val) ?? .unknown,
+                                              by: .projDeref) ?? .unknown
+                let tmp = freshTemp(type: derefType)
+                emit(.assign(.local(tmp), .use(.mirCopy(MirPlace(local: valLocal,
+                                                                 projections: [.projDeref])))))
                 return .mirCopy(.local(tmp))
             case .borrowMut:
                 if let place = exprToPlace(inner) {
@@ -689,17 +831,20 @@ public final class MIRLowering {
                     emit(.assign(.local(tmp), .use(val)))
                     return .mirCopy(.local(tmp))
                 }
-            default:
-                let val = lowerExpr(inner)
-                let tmp = freshTemp(type: operandType(val) ?? .unknown)
-                emit(.assign(.local(tmp), .use(val)))
-                return .mirCopy(.local(tmp))
             }
+            // The switch is exhaustive over UnaryOp (neg/not/bitNot/deref/
+            // borrow/borrowMut) — a new operator becomes a compile error,
+            // never a silent copy.
 
-        case .assign(let target, let value, _):
+        case .assign(let target, let value, let span):
             let val = lowerExpr(value)
             if case .name(let n, _) = target, let id = lookupScope(n) {
                 emit(.assign(.local(id), .use(val)))
+            } else if case .name(let n, _) = target, statics.contains(where: { $0.name == n }) {
+                // A write to a registered static: the static store — the
+                // projStatic place (the kernel's MirStaticAddr-deref place),
+                // never the non-scope rejection.
+                emit(.assign(MirPlace(local: 0, projections: [.projStatic(n)]), .use(val)))
             } else {
                 // Handle field/indexed/nested assignment: base.field = val,
                 // base[idx] = val. lowerPlaceExpr inserts the ProjDeref when
@@ -707,16 +852,47 @@ public final class MIRLowering {
                 let (local, projs) = lowerPlaceExpr(target)
                 if !projs.isEmpty {
                     emit(.assign(MirPlace(local: local, projections: projs), .use(val)))
+                } else {
+                    // A bare-name target that is NOT a scope local (or a
+                    // place that failed to decompose) is an undeclared
+                    // assign — the lowering error, never a silent drop
+                    // (the audit item 8; the kernel's resolver rejects the
+                    // undeclared assign target).
+                    let rendered = renderExprBrief(target)
+                    recordLoweringError("MIRLowering: assignment to non-scope bare name '\(rendered)' at span \(span.start)..<\(span.end) — the target does not resolve to a local or a field/index place (never silently dropped)")
                 }
             }
             return .mirConstant(.unit)
 
-        case .compoundAssign(let target, let op, let value, _):
+        case .compoundAssign(let target, let op, let value, let span):
             let val = lowerExpr(value)
+            let binOp = lowerBinOp(op)
             if case .name(let n, _) = target, let id = lookupScope(n) {
                 let tmp = freshTemp()
-                emit(.assign(.local(tmp), .binaryOp(lowerBinOp(op), .mirCopy(.local(id)), val)))
+                emit(.assign(.local(tmp), .binaryOp(binOp, .mirCopy(.local(id)), val)))
                 emit(.assign(.local(id), .use(.mirCopy(.local(tmp)))))
+            } else if case .name(let n, _) = target, statics.contains(where: { $0.name == n }) {
+                // Compound-assign to a static: read the slot through the
+                // projStatic place, apply the op, write the slot back.
+                let place = MirPlace(local: 0, projections: [.projStatic(n)])
+                let tmp = freshTemp()
+                emit(.assign(.local(tmp), .binaryOp(binOp, .mirCopy(place), val)))
+                emit(.assign(place, .use(.mirCopy(.local(tmp)))))
+            } else {
+                // The field/index place read-modify-write: base.field += v
+                // and base[idx] += v lower to a place read, the binary op,
+                // and the place write-back — NEVER silently dropped (the
+                // audit item 8).
+                let (local, projs) = lowerPlaceExpr(target)
+                if !projs.isEmpty {
+                    let place = MirPlace(local: local, projections: projs)
+                    let tmp = freshTemp()
+                    emit(.assign(.local(tmp), .binaryOp(binOp, .mirCopy(place), val)))
+                    emit(.assign(place, .use(.mirCopy(.local(tmp)))))
+                } else {
+                    let rendered = renderExprBrief(target)
+                    recordLoweringError("MIRLowering: compound-assign to non-scope bare name '\(rendered)' at span \(span.start)..<\(span.end) — the target does not resolve to a local or a field/index place (never silently dropped)")
+                }
             }
             return .mirConstant(.unit)
 
@@ -769,7 +945,7 @@ public final class MIRLowering {
             }
             if let ctor = resolveVariantConstructor(callee, argCount: args.count) {
                 let argOps = args.map { lowerExpr($0.value) }
-                let result = freshTemp(type: .named(ctor.typeName))
+                let result = freshTemp(type: .named(ctor.typeName, []))
                 // Check if this variant has a named payload struct (synthetic struct type).
                 // Positional call syntax on a named-field variant (e.g. MirCall(a,b,c,d,e))
                 // must be lowered by creating the struct payload first, then wrapping in the enum.
@@ -790,7 +966,7 @@ public final class MIRLowering {
                        case .structDef(let fields) = payloadTD.kind {
                         // Named-field variant: create struct payload, then wrap in enum ctor
                         let fieldNames = fields.map { $0.0 }
-                        let payloadTmp = freshTemp(type: .named(payloadTD.name))
+                        let payloadTmp = freshTemp(type: .named(payloadTD.name, []))
                         emit(.assign(.local(payloadTmp), .aggregate(.structCtor(payloadTD.name, fieldNames), argOps)))
                         emit(.assign(.local(result), .aggregate(.enumCtor(ctor.typeName, ctor.variantIdx), [.mirCopy(.local(payloadTmp))])))
                     } else {
@@ -881,12 +1057,24 @@ public final class MIRLowering {
                 let op = lowerExpr(v)
                 emit(.assign(.local(returnLocal), .use(op)))
             }
-            terminateWith(.ret)
+            // Route through the function's defer exit cleanup when defers
+            // are registered (the chain entry is the last defer registered
+            // BEFORE this return — later, unreachable registrations never
+            // run on this path).
+            terminateWith(exitTerminator())
             // Dead code after return — start a new unreachable block
             currentBlock = freshBlock()
             return .mirConstant(.unit)
 
-        case .breakExpr:
+        case .breakExpr(let val, _):
+            // The break's VALUE expression is lowered (evaluated — its
+            // side effects emitted) before the jump; it is never dropped
+            // at the AST level. The kernel's MIR has no break-value
+            // channel (StmtBreak lowers to the loop-exit goto), so the
+            // value's evaluation is the faithful seed boundary.
+            if let v = val {
+                _ = lowerExpr(v)
+            }
             if let target = loopBreakTargets.last {
                 terminateWith(.goto(target))
                 currentBlock = freshBlock() // unreachable after break
@@ -945,16 +1133,16 @@ public final class MIRLowering {
                     let variantName = parts.last!
                     if let (td, idx) = resolveNamedVariant(enumName, variantName: variantName, expectedFieldCount: fieldNames.count) {
                         // Enum variant with named fields: create struct payload + enum ctor
-                        let tmp = freshTemp(type: .named(td.name))
+                        let tmp = freshTemp(type: .named(td.name, []))
                         let payloadName = resolveTypeDef("\(td.name)::\(variantName)")?.name ?? name
-                        let payloadTmp = freshTemp(type: .named(payloadName))
+                        let payloadTmp = freshTemp(type: .named(payloadName, []))
                         emit(.assign(.local(payloadTmp), .aggregate(.structCtor(payloadName, fieldNames), ops)))
                         emit(.assign(.local(tmp), .aggregate(.enumCtor(td.name, idx), [.mirCopy(.local(payloadTmp))])))
                         return .mirCopy(.local(tmp))
                     }
                 }
             }
-            let tmp = freshTemp(type: .named(name))
+            let tmp = freshTemp(type: .named(name, []))
             emit(.assign(.local(tmp), .aggregate(.structCtor(name, fieldNames), ops)))
             return .mirCopy(.local(tmp))
 
@@ -962,7 +1150,7 @@ public final class MIRLowering {
             let s = lowerExpr(start)
             let e = lowerExpr(end)
             let kindName = inclusive ? "RangeInclusive" : "Range"
-            let tmp = freshTemp(type: .named(kindName))
+            let tmp = freshTemp(type: .named(kindName, []))
             emit(.assign(.local(tmp), .aggregate(.structCtor(kindName, ["start", "end"]), [s, e])))
             return .mirCopy(.local(tmp))
 
@@ -977,42 +1165,169 @@ public final class MIRLowering {
             return .mirCopy(.local(tmp))
 
         case .tryOp(let inner, _):
+            // `expr?` — ERASURE (the kernel's ExprTry semantics: the
+            // operand's value; never an exceptional construct — the
+            // kernel's own compiler uses it).
             return lowerExpr(inner)
 
-        default:
+        case .unlessExpr(let unlessE):
+            // `unless cond { body } else { other }` — the negated
+            // condition branches (real semantics: unless == if !cond).
+            return lowerUnless(unlessE)
+
+        case .untilExpr(let untilE):
+            // `until cond { body }` — the negated-condition loop
+            // (real semantics: until == while !cond).
+            return lowerUntil(untilE)
+
+        case .tryBlock(let tryB):
+            // The kernel REJECTS try/catch/finally blocks at the checker
+            // (exceptions are not supported — no throwing path may bypass
+            // teardown); the seed's lowering must fail CLOSED with the
+            // explicit unsupported error, never silently produce unit.
+            recordLoweringError("MIRLowering: exceptions are not supported — try/catch/finally block reached MIR lowering (span \(tryB.span))")
+            return .mirConstant(.unit)
+
+        case .handleExpr(let handleE):
+            // Effect-handler blocks are outside the seed dialect; the
+            // explicit unsupported error, never silent unit.
+            recordLoweringError("MIRLowering: effect handlers are not supported — handle/with expression reached MIR lowering (span \(handleE.span))")
+            return .mirConstant(.unit)
+
+        case .awaitExpr(let inner, _):
+            // The seed dialect has no async runtime; the explicit
+            // unsupported error, never silent unit.
+            recordLoweringError("MIRLowering: async/await is not supported — await expression reached MIR lowering (span \(inner.span))")
+            return .mirConstant(.unit)
+
+        case .comptimeBlock(let body, _):
+            // The seed's REAL subset of comptime: the block's statements
+            // and value are lowered in program order (the seed has no
+            // compile-time evaluator; the kernel rejects comptime blocks
+            // at the checker). Never the silent unit for the whole block.
+            let tmp = freshTemp()
+            pushScope()
+            lowerBlock(body, resultInto: tmp)
+            popScope()
+            return .mirCopy(.local(tmp))
+
+        case .arrayRepeat(let value, let count, _):
+            // `[v; N]` — the MirRepeat rvalue (the kernel's
+            // MirRepeat(MirOperand, Int): the element is repeated N
+            // times), the real repetition — never the unit. The count
+            // must be a compile-time constant (fail-closed: an explicit
+            // error, never a silently guessed repetition).
+            if let n = evalConstSize(count) {
+                let valOp = lowerExpr(value)
+                let elemType = operandType(valOp) ?? .unknown
+                let tmp = freshTemp(type: .array(elemType, n))
+                emit(.assign(.local(tmp), .repeat(valOp, n)))
+                return .mirCopy(.local(tmp))
+            }
+            recordLoweringError("MIRLowering: arrayRepeat count is not a compile-time constant (span \(count.span))")
             return .mirConstant(.unit)
         }
+        // The switch above is exhaustive over Expr — an unhandled Expr
+        // kind becomes a compile error here, never a silent unit.
     }
 
     // MARK: - Control flow lowering
 
+    /// Normalize a condition operand for switchInt.
+    ///
+    /// The seed's switchInt condition form is the EXPLICIT compare-to-1:
+    /// the terminator jumps to the then-target exactly when the operand
+    /// equals the int target 1 and to `otherwise` on every other value
+    /// (mirroring the kernel's codegen, which emits `cmp operand, <target>`
+    /// per target). Bool-typed operands (bool locals, bool constants and
+    /// comparison results) feed the switchInt directly — the interpreter's
+    /// int view maps true→1 / false→0. A condition whose lowered operand is
+    /// NOT bool/int-shaped (a Unit from a void-valued expression, a string,
+    /// etc. — the silent-loss class) is normalized to the explicit
+    /// `(cond == 1)` comparison so the branch semantics are never implicit.
+    ///
+    /// PRINTING NOTE (item 20): a switchInt operand that is a bool
+    /// CONSTANT prints as `true`/`false` (printConstant's bool form),
+    /// while a comparison-result operand prints as its Int-valued temp
+    /// (the interpreter's compare result view: 0/1). Both are valid
+    /// switchInt operands in this dialect; the targets are always Int.
+    private func normalizeCondition(_ operand: MirOperand) -> MirOperand {
+        if let ty = operandType(operand) {
+            switch ty {
+            case .bool, .int:
+                return operand
+            default:
+                break
+            }
+        }
+        let tmp = freshTemp(type: .bool)
+        emit(.assign(.local(tmp), .binaryOp(.eq, operand, .mirConstant(.int(1)))))
+        return .mirCopy(.local(tmp))
+    }
+
     private func lowerIfExpr(_ ifE: IfExpr) -> MirOperand {
         let result = freshTemp()
-        let condOp = lowerExpr(ifE.condition)
         let thenBB = freshBlock()
         let elseBB = freshBlock()
         let mergeBB = freshBlock()
 
+        // if-let: `if let PATTERN = VALUE` — the pattern TEST is the
+        // condition (the parser synthesizes condition = true); the VALUE
+        // is evaluated ONCE (spilled to a temp) and the pattern is bound
+        // from that same operand inside the then branch (single binding).
+        let ifLetBinding: (pattern: Pattern, value: MirOperand, hint: String?)?
+        if let pattern = ifE.ifLetPattern, let value = ifE.ifLetValue {
+            let valOp = lowerExpr(value)
+            let enumHint = inferEnumHint(from: valOp)
+            ifLetBinding = (pattern, valOp, enumHint)
+        } else {
+            ifLetBinding = nil
+        }
+        let condOp: MirOperand
+        if let binding = ifLetBinding {
+            condOp = normalizeCondition(lowerPatternTest(binding.pattern, value: binding.value, enumHint: binding.hint))
+        } else {
+            condOp = normalizeCondition(lowerExpr(ifE.condition))
+        }
+
         terminateWith(.switchInt(condOp, targets: [(1, thenBB)], otherwise: elseBB))
 
-        // Then
+        // Then — the if-let pattern binding lives in this scope (single
+        // binding; the pattern names resolve in the branch body).
         currentBlock = thenBB
         pushScope()
+        if let binding = ifLetBinding {
+            lowerPatternBind(binding.pattern, value: binding.value, enumHint: binding.hint)
+        }
         lowerBlock(ifE.thenBlock, resultInto: result)
         popScope()
         terminateIfNeeded(.goto(mergeBB))
 
-        // Elsif chain
+        // Elsif chain (each clause may carry its own if-let pattern/value)
         var currentElseBB = elseBB
-        for clause in ifE.elsifClauses {
+        for (clauseIndex, clause) in ifE.elsifClauses.enumerated() {
             currentBlock = currentElseBB
-            let clauseCondOp = lowerExpr(clause.condition)
+            let clauseCondOp: MirOperand
+            let clauseBinding: (pattern: Pattern, value: MirOperand, hint: String?)?
+            if clauseIndex < ifE.elsifLet.count {
+                let (pat, val) = ifE.elsifLet[clauseIndex]
+                let valOp = lowerExpr(val)
+                let enumHint = inferEnumHint(from: valOp)
+                clauseBinding = (pat, valOp, enumHint)
+                clauseCondOp = normalizeCondition(lowerPatternTest(pat, value: valOp, enumHint: enumHint))
+            } else {
+                clauseBinding = nil
+                clauseCondOp = normalizeCondition(lowerExpr(clause.condition))
+            }
             let clauseThenBB = freshBlock()
             let nextElseBB = freshBlock()
             terminateWith(.switchInt(clauseCondOp, targets: [(1, clauseThenBB)], otherwise: nextElseBB))
 
             currentBlock = clauseThenBB
             pushScope()
+            if let binding = clauseBinding {
+                lowerPatternBind(binding.pattern, value: binding.value, enumHint: binding.hint)
+            }
             lowerBlock(clause.body, resultInto: result)
             popScope()
             terminateIfNeeded(.goto(mergeBB))
@@ -1033,6 +1348,70 @@ public final class MIRLowering {
         return .mirCopy(.local(result))
     }
 
+    /// `unless cond { body } else { other }` — the negated-condition
+    /// branches (unless == if !cond; the condition is negated once and the
+    /// switchInt keeps the explicit compare-to-1 form).
+    private func lowerUnless(_ unlessE: UnlessExpr) -> MirOperand {
+        let result = freshTemp()
+        let condOp = lowerExpr(unlessE.condition)
+        let negTmp = freshTemp(type: .bool)
+        emit(.assign(.local(negTmp), .unaryOp(.not, condOp)))
+        let negCond = normalizeCondition(.mirCopy(.local(negTmp)))
+
+        let thenBB = freshBlock()
+        let elseBB = freshBlock()
+        let mergeBB = freshBlock()
+        terminateWith(.switchInt(negCond, targets: [(1, thenBB)], otherwise: elseBB))
+
+        currentBlock = thenBB
+        pushScope()
+        lowerBlock(unlessE.body, resultInto: result)
+        popScope()
+        terminateIfNeeded(.goto(mergeBB))
+
+        currentBlock = elseBB
+        if let elseBlock = unlessE.elseBlock {
+            pushScope()
+            lowerBlock(elseBlock, resultInto: result)
+            popScope()
+        }
+        terminateIfNeeded(.goto(mergeBB))
+
+        currentBlock = mergeBB
+        return .mirCopy(.local(result))
+    }
+
+    /// `until cond { body }` — the negated-condition loop
+    /// (until == while !cond; the body runs while the condition is false).
+    private func lowerUntil(_ untilE: UntilExpr) -> MirOperand {
+        let condBB = freshBlock()
+        let bodyBB = freshBlock()
+        let exitBB = freshBlock()
+
+        terminateWith(.goto(condBB))
+
+        currentBlock = condBB
+        let condOp = lowerExpr(untilE.condition)
+        let negTmp = freshTemp(type: .bool)
+        emit(.assign(.local(negTmp), .unaryOp(.not, condOp)))
+        let negCond = normalizeCondition(.mirCopy(.local(negTmp)))
+        terminateWith(.switchInt(negCond, targets: [(1, bodyBB)], otherwise: exitBB))
+
+        currentBlock = bodyBB
+        loopBreakTargets.append(exitBB)
+        loopContinueTargets.append(condBB)
+        pushScope()
+        let tmp = freshTemp()
+        lowerBlock(untilE.body, resultInto: tmp)
+        popScope()
+        loopBreakTargets.removeLast()
+        loopContinueTargets.removeLast()
+        terminateIfNeeded(.goto(condBB))
+
+        currentBlock = exitBB
+        return .mirConstant(.unit)
+    }
+
     private func lowerMatch(_ matchE: MatchExpr) -> MirOperand {
         let result = freshTemp()
         let subject = lowerExpr(matchE.subject)
@@ -1050,25 +1429,33 @@ public final class MIRLowering {
             let nextArmBB = freshBlock()
 
             // Test pattern (with enum type hint for disambiguation)
-            let matches = lowerPatternTest(arm.pattern, value: subject, enumHint: enumHint)
+            let matches = normalizeCondition(lowerPatternTest(arm.pattern, value: subject, enumHint: enumHint))
 
-            // If match succeeded and there's a guard, also test the guard
+            // If match succeeded and there's a guard, also test the guard.
+            // The pattern is bound ONCE: the guard scope and the arm scope
+            // are MERGED — the bindings made for the guard stay visible to
+            // the arm body (no second binding, no double-defined names).
             if let guardExpr = arm.guardExpr {
                 let guardBB = freshBlock()
                 terminateWith(.switchInt(matches, targets: [(1, guardBB)], otherwise: nextArmBB))
                 currentBlock = guardBB
                 pushScope()
                 lowerPatternBind(arm.pattern, value: subject, enumHint: enumHint)
-                let guardVal = lowerExpr(guardExpr)
-                popScope()
+                let guardVal = normalizeCondition(lowerExpr(guardExpr))
+                // NOTE: the scope stays open through the arm (the guard
+                // scope + the arm scope are one); it is popped after the
+                // arm body, before the next arm's candidate block is
+                // lowered, so no binding leaks across arms.
                 terminateWith(.switchInt(guardVal, targets: [(1, armBB)], otherwise: nextArmBB))
             } else {
                 terminateWith(.switchInt(matches, targets: [(1, armBB)], otherwise: nextArmBB))
             }
 
             currentBlock = armBB
-            pushScope()
-            lowerPatternBind(arm.pattern, value: subject, enumHint: enumHint)
+            if arm.guardExpr == nil {
+                pushScope()
+                lowerPatternBind(arm.pattern, value: subject, enumHint: enumHint)
+            }
             let bodyVal = lowerExpr(arm.body)
             emit(.assign(.local(result), .use(bodyVal)))
             popScope()
@@ -1094,22 +1481,50 @@ public final class MIRLowering {
         }
     }
 
-    /// Resolve a variant name in an enum definition, supporting prefix conventions.
-    /// e.g. "Function" matches variant "ItemFunction" in enum "ItemKind".
+    // MARK: - Variant name canonicalization
+    //
+    // The kernel's ast.tg is the authority for variant names: ExprKind's
+    // operator/member-access variants are spelled ExprUnaryOp / ExprBinaryOp
+    // / ExprFieldAccess. Kernel sources that still spell the legacy names
+    // (types.tg's wcet_cost_expr) resolve through this table — the payload
+    // shapes are identical, so a legacy spelling lowers to the same variant
+    // index as its current name. The canonicalized name is what every
+    // variant resolution path (cache lookup + linear scan) sees, so the
+    // seed's MIR lowering of the kernel closure aligns exactly with the
+    // kernel's current AST names.
+    private static let renamedVariantAliases: [String: String] = [
+        "ExprUnary": "ExprUnaryOp",
+        "ExprBinary": "ExprBinaryOp",
+        "ExprField": "ExprFieldAccess",
+    ]
+
+    private func canonicalVariantName(_ name: String) -> String {
+        Self.renamedVariantAliases[name] ?? name
+    }
+
+    /// Resolve a variant name in an enum definition. The matching is the
+    /// EXACT-NAME matching (the audit item 16): the kernel's variant
+    /// identity is the exact per-module name (resolver.tg's
+    /// `variant_indices.get(name)`), so `Function` must NOT match
+    /// `ItemFunction` — the field-count filter alone is unsafe (a suffix
+    /// match filtered by arity still resolves the wrong variant). The only
+    /// fallback is the curated renamed-variant alias table
+    /// (canonicalVariantName — exact after canonicalization), which covers
+    /// the kernel's renamed AST spellings without a raw suffix scan.
     private func resolveVariantIndex(_ shortName: String, in variants: [(String, [MirType])]) -> Int? {
-        // Try exact match first
-        if let idx = variants.firstIndex(where: { $0.0 == shortName }) {
-            return idx
-        }
-        // Try suffix match: variant name ends with shortName (e.g. "ItemFunction" ends with "Function")
-        if let idx = variants.firstIndex(where: { $0.0.hasSuffix(shortName) && $0.0 != shortName }) {
-            return idx
-        }
-        return nil
+        let shortName = canonicalVariantName(shortName)
+        // Exact match only: "Function" resolves "Function" — never
+        // "ItemFunction", "ExprFunction", or any other prefix-variant.
+        return variants.firstIndex(where: { $0.0 == shortName })
     }
 
     /// Resolve a possibly module-qualified type name (e.g. "app::Event") against typeDefs.
     private func resolveTypeDef(_ typeName: String) -> MirTypeDef? {
+        // Generic-instantiation-carrying names (any pre-rendered
+        // "Name<Args>" form) resolve by their BASE Adt name: the
+        // instantiation rides in MirType.named's args, never in the
+        // registered-def identity.
+        let typeName = bareTypeName(typeName)
         // Fast path: cache lookup (O(1))
         if let td = typeDefByName[typeName] { return td }
 
@@ -1155,7 +1570,7 @@ public final class MIRLowering {
 
     private func enumHint(from type: MirType) -> String? {
         switch type {
-        case .named(let name):
+        case .named(let name, _):
             guard let td = resolveTypeDef(name), case .enumDef = td.kind else {
                 return nil
             }
@@ -1173,8 +1588,10 @@ public final class MIRLowering {
     private func extractTypeName(_ type: MirType?) -> String? {
         guard let ty = type else { return nil }
         switch ty {
-        case .named(let name):
-            // Strip generic parameters if present (e.g. "Map<String,String>" → "Map")
+        case .named(let name, _):
+            // The generic instantiation args are carried separately
+            // (MirType.named's args — the kernel's Type::Adt(TypeId, args)
+            // shape); a defensive "<" strip handles any pre-rendered name.
             if let idx = name.firstIndex(of: "<") {
                 return String(name[name.startIndex..<idx])
             }
@@ -1197,6 +1614,11 @@ public final class MIRLowering {
     private func operandType(_ operand: MirOperand) -> MirType? {
         switch operand {
         case .mirCopy(let place), .mirMovePlace(let place), .mirRead(let place), .mirConsume(let place):
+            // A projStatic-rooted place types as its static's declared
+            // type (the root local is unused).
+            if case .projStatic(let staticName) = place.projections.first {
+                return statics.first(where: { $0.name == staticName })?.type
+            }
             guard place.local < locals.count else {
                 return nil
             }
@@ -1224,6 +1646,8 @@ public final class MIRLowering {
                 return .string
             case .fnItem:
                 return nil
+            case .staticRef(let staticName):
+                return statics.first(where: { $0.name == staticName })?.type
             }
         }
     }
@@ -1245,7 +1669,7 @@ public final class MIRLowering {
                 return index < elems.count ? elems[index] : nil
             case .array(let inner, _), .slice(let inner):
                 return inner
-            case .named(let name):
+            case .named(let name, _):
                 guard let td = resolveTypeDef(name) else {
                     return nil
                 }
@@ -1265,7 +1689,7 @@ public final class MIRLowering {
                     return nil
                 }
                 return elems[index]
-            case .named(let name):
+            case .named(let name, _):
                 guard let td = resolveTypeDef(name), case .structDef(let fields) = td.kind else {
                     return nil
                 }
@@ -1283,7 +1707,7 @@ public final class MIRLowering {
                 return nil
             }
         case .downcast(let variantIndex):
-            guard case .named(let name) = unwrapReferenceTypes(baseType),
+            guard case .named(let name, _) = unwrapReferenceTypes(baseType),
                   let td = resolveTypeDef(name),
                   case .enumDef(let variants) = td.kind,
                   variantIndex < variants.count else {
@@ -1291,10 +1715,13 @@ public final class MIRLowering {
             }
             let payloadTypeName = "\(td.name)::\(variants[variantIndex].0)"
             if let payloadTd = resolveTypeDef(payloadTypeName), case .structDef = payloadTd.kind {
-                return .named(payloadTd.name)
+                return .named(payloadTd.name, [])
             }
             let fields = variants[variantIndex].1
             return .tuple(fields)
+        case .projStatic(let staticName):
+            // The static-address place types as the static's declared type.
+            return statics.first(where: { $0.name == staticName })?.type
         }
     }
 
@@ -1314,6 +1741,7 @@ public final class MIRLowering {
     private func resolveVariantAcrossAllEnums(_ variantName: String, hintEnumType: String? = nil,
                                               expectedFieldCount: Int? = nil,
                                               allowExtraFields: Bool = false) -> (MirTypeDef, Int)? {
+        let variantName = canonicalVariantName(variantName)
         // If we have a hint (from a qualified arm in the same match), prefer that enum
         if let hint = hintEnumType, !hint.isEmpty {
             if let match = resolveNamedVariant(hint, variantName: variantName,
@@ -1401,6 +1829,7 @@ public final class MIRLowering {
     private func resolveNamedVariant(_ typeName: String, variantName: String,
                                      expectedFieldCount: Int? = nil,
                                      allowExtraFields: Bool = false) -> (MirTypeDef, Int)? {
+        let variantName = canonicalVariantName(variantName)
         // Fast path: cache lookup (O(1))
         let cacheKey = "\(typeName)::\(variantName)"
         if let cached = variantCache[cacheKey] {
@@ -1493,6 +1922,23 @@ public final class MIRLowering {
         }
     }
 
+    /// A brief single-line rendering of an expression for error messages
+    /// (the assign/compound-assign target diagnostics).
+    private func renderExprBrief(_ expr: Expr) -> String {
+        switch expr {
+        case .name(let n, _):
+            return n
+        case .path(let a, let b, _):
+            return "\(a)::\(b)"
+        case .field(let base, let f, _):
+            return "\(renderExprBrief(base)).\(f)"
+        case .index(let base, _, _):
+            return "\(renderExprBrief(base))[...]"
+        default:
+            return "<expr>"
+        }
+    }
+
     private func unresolvedVariantFailure(typeName: String, variantName: String, enumHint: String?, context: String) -> String {
         let renderedType = typeName.isEmpty ? "<unqualified>" : typeName
         let hintText = enumHint.map { " (hint: \($0))" } ?? ""
@@ -1536,7 +1982,7 @@ public final class MIRLowering {
         case .wildcard, .ident, .refPattern, .refMutPattern:
             return .mirConstant(.bool(true))
         case .literal(let expr, _):
-            let tmp = freshTemp()
+            let tmp = freshTemp(type: .bool)
             let litVal = lowerExpr(expr)
             emit(.assign(.local(tmp), .binaryOp(.eq, value, litVal)))
             return .mirCopy(.local(tmp))
@@ -1545,7 +1991,7 @@ public final class MIRLowering {
                subPats.isEmpty,
                looksLikeConstFunctionPattern(variantName),
                resolveVariantAcrossAllEnums(variantName, hintEnumType: enumHint, expectedFieldCount: 0) == nil {
-                let tmp = freshTemp()
+                let tmp = freshTemp(type: .bool)
                 let constValue = lowerExpr(.call(callee: .name(variantName, span), typeArgs: [], args: [], span))
                 emit(.assign(.local(tmp), .binaryOp(.eq, value, constValue)))
                 return .mirCopy(.local(tmp))
@@ -1558,13 +2004,13 @@ public final class MIRLowering {
             let idx = variantMatch.1
             let discTmp = freshTemp()
             emit(.assign(.local(discTmp), .discriminant(MirPlace(local: placeOf(value), projections: []))))
-            let cmpTmp = freshTemp()
+            let cmpTmp = freshTemp(type: .bool)
             emit(.assign(.local(cmpTmp), .binaryOp(.eq, .mirCopy(.local(discTmp)), .mirConstant(.int(idx)))))
             // Also check sub-patterns (e.g. literal payloads like Some('#'))
             if subPats.isEmpty {
                 return .mirCopy(.local(cmpTmp))
             }
-            let resultTmp = freshTemp()
+            let resultTmp = freshTemp(type: .bool)
             emit(.assign(.local(resultTmp), .use(.mirConstant(.bool(false)))))
 
             let payloadBB = freshBlock()
@@ -1582,7 +2028,7 @@ public final class MIRLowering {
                     let elem = freshTemp()
                     emit(.assign(.local(elem), .use(.mirCopy(MirPlace(local: inner, projections: [.field(i)])))))
                     let subTest = lowerPatternTest(pat, value: .mirCopy(.local(elem)))
-                    let andTmp = freshTemp()
+                    let andTmp = freshTemp(type: .bool)
                     emit(.assign(.local(andTmp), .binaryOp(.and, subResult, subTest)))
                     subResult = .mirCopy(.local(andTmp))
                 }
@@ -1607,7 +2053,7 @@ public final class MIRLowering {
                     }
                     let discTmp = freshTemp()
                     emit(.assign(.local(discTmp), .discriminant(MirPlace(local: placeOf(value), projections: []))))
-                    let cmpTmp = freshTemp()
+                    let cmpTmp = freshTemp(type: .bool)
                     emit(.assign(.local(cmpTmp), .binaryOp(.eq, .mirCopy(.local(discTmp)), .mirConstant(.int(idx)))))
                     return .mirCopy(.local(cmpTmp))
                 }
@@ -1620,7 +2066,7 @@ public final class MIRLowering {
                 let elem = freshTemp()
                 emit(.assign(.local(elem), .use(.mirCopy(MirPlace(local: placeOf(value), projections: [.field(i)])))))
                 let sub = lowerPatternTest(pat, value: .mirCopy(.local(elem)))
-                let andTmp = freshTemp()
+                let andTmp = freshTemp(type: .bool)
                 emit(.assign(.local(andTmp), .binaryOp(.and, allMatch, sub)))
                 allMatch = .mirCopy(.local(andTmp))
             }
@@ -1628,18 +2074,18 @@ public final class MIRLowering {
         case .orPattern(let lhs, let rhs, _):
             let l = lowerPatternTest(lhs, value: value)
             let r = lowerPatternTest(rhs, value: value)
-            let tmp = freshTemp()
+            let tmp = freshTemp(type: .bool)
             emit(.assign(.local(tmp), .binaryOp(.or, l, r)))
             return .mirCopy(.local(tmp))
         case .rangePattern(let lo, let hi, _):
             // Compute: value >= lo_lit && value <= hi_lit
             let loLit = lowerExpr(patternToExpr(lo))
             let hiLit = lowerExpr(patternToExpr(hi))
-            let geTmp = freshTemp()
+            let geTmp = freshTemp(type: .bool)
             emit(.assign(.local(geTmp), .binaryOp(.ge, value, loLit)))
-            let leTmp = freshTemp()
+            let leTmp = freshTemp(type: .bool)
             emit(.assign(.local(leTmp), .binaryOp(.le, value, hiLit)))
-            let andTmp = freshTemp()
+            let andTmp = freshTemp(type: .bool)
             emit(.assign(.local(andTmp), .binaryOp(.and, .mirCopy(.local(geTmp)), .mirCopy(.local(leTmp)))))
             return .mirCopy(.local(andTmp))
         }
@@ -1768,7 +2214,7 @@ public final class MIRLowering {
             return inner
         case .refInternal(let inner, _), .rawPtr(let inner):
             return projectedCollectionElementType(inner)
-        case .named(let name):
+        case .named(let name, _):
             let bare = bareTypeName(name)
             if bare == "Vec" || bare == "Array" {
                 return .unknown
@@ -1880,6 +2326,9 @@ public final class MIRLowering {
             for clause in ifE.elsifClauses {
                 if !exprIsReadOnly(varName: varName, expr: clause.condition) { return false }
                 if !blockIsReadOnly(varName: varName, body: clause.body) { return false }
+            }
+            for (_, value) in ifE.elsifLet {
+                if !exprIsReadOnly(varName: varName, expr: value) { return false }
             }
             if let elseBlock = ifE.elseBlock, !blockIsReadOnly(varName: varName, body: elseBlock) {
                 return false
@@ -2057,6 +2506,9 @@ public final class MIRLowering {
                 if closureMentions(varName, expr: clause.condition) { return true }
                 if closureBlockMentions(varName, body: clause.body) { return true }
             }
+            for (_, value) in ifE.elsifLet {
+                if closureMentions(varName, expr: value) { return true }
+            }
             if let elseBlock = ifE.elseBlock, closureBlockMentions(varName, body: elseBlock) { return true }
             if let ifLetValue = ifE.ifLetValue, closureMentions(varName, expr: ifLetValue) { return true }
             return false
@@ -2173,7 +2625,7 @@ public final class MIRLowering {
 
         // Condition: idx < len
         currentBlock = condBB
-        let cmpTmp = freshTemp()
+        let cmpTmp = freshTemp(type: .bool)
         emit(.assign(.local(cmpTmp), .binaryOp(.lt, .mirCopy(.local(idxLocal)), .mirCopy(.local(lenLocal)))))
         terminateWith(.switchInt(.mirCopy(.local(cmpTmp)), targets: [(1, bodyBB)], otherwise: exitBB))
 
@@ -2234,7 +2686,7 @@ public final class MIRLowering {
 
         // Condition: idx < len
         currentBlock = condBB
-        let cmpTmp = freshTemp()
+        let cmpTmp = freshTemp(type: .bool)
         emit(.assign(.local(cmpTmp), .binaryOp(.lt, .mirCopy(.local(idxLocal)), .mirCopy(.local(lenLocal)))))
         terminateWith(.switchInt(.mirCopy(.local(cmpTmp)), targets: [(1, bodyBB)], otherwise: exitBB))
 
@@ -2272,7 +2724,7 @@ public final class MIRLowering {
         terminateWith(.goto(condBB))
 
         currentBlock = condBB
-        let condOp = lowerExpr(whileE.condition)
+        let condOp = normalizeCondition(lowerExpr(whileE.condition))
         terminateWith(.switchInt(condOp, targets: [(1, bodyBB)], otherwise: exitBB))
 
         currentBlock = bodyBB
@@ -2316,10 +2768,18 @@ public final class MIRLowering {
         let closureName = "__closure_\(functions.count)"
 
         // ── 1. Collect outer scope bindings for capture ──
+        // Shadowing-aware: iterate the scopes INNERMOST-FIRST and keep only
+        // the NEAREST binding per name — an inner binding shadows the outer
+        // one, so the outermost must never win (and duplicates would
+        // otherwise create duplicate capture params).
         var outerBindings: [(String, LocalId)] = []
-        for scope in scopes {
+        var seenOuterNames = Set<String>()
+        for scope in scopes.reversed() {
             for (name, id) in scope {
-                outerBindings.append((name, id))
+                if !seenOuterNames.contains(name) {
+                    seenOuterNames.insert(name)
+                    outerBindings.append((name, id))
+                }
             }
         }
         let savedBlocks = blocks
@@ -2329,6 +2789,7 @@ public final class MIRLowering {
         let savedNextBlock = nextBlock
         let savedReturnLocal = returnLocal
         let savedScopes = scopes
+        let savedDeferBlocks = pendingDeferBlocks
 
         resetFunctionState()
         pushScope()
@@ -2367,8 +2828,12 @@ public final class MIRLowering {
         currentBlock = entry
         let bodyVal = lowerExpr(closureE.body)
         emit(.assign(.local(returnLocal), .use(bodyVal)))
-        terminateIfNeeded(.ret)
+        terminateIfNeeded(exitTerminator())
         popScope()
+
+        // Wire the closure's own exit cleanup (defers registered inside
+        // the closure body, LIFO).
+        buildDeferExitChain()
 
         // ── 5. Create MIR function with all params (declared + captures) ──
         let allParams = paramLocals + captureParamLocals
@@ -2382,6 +2847,7 @@ public final class MIRLowering {
         currentBlock = savedCurrentBlock; nextLocal = savedNextLocal
         nextBlock = savedNextBlock; returnLocal = savedReturnLocal
         scopes = savedScopes
+        pendingDeferBlocks = savedDeferBlocks
 
         // ── 6. Emit closure value in parent function ──
         if captureOuterIds.isEmpty {
@@ -2398,10 +2864,22 @@ public final class MIRLowering {
     }
 
     // MARK: - Type lowering
+    //
+    // lowerTypeExpr carries EVERYTHING the source type annotation carries
+    // (the kernel's resolve_type_expr parity — TypeExpr → Type is
+    // lossless):
+    //   - [T; N]       → .array(inner, N)  — the FIXED length carried (the
+    //                     kernel's Type::FixedArray(elem, count); a
+    //                     non-constant size is an explicit lowering error,
+    //                     never a silently dropped length);
+    //   - T<A1, ...>   → .named(name, args) — the generic instantiation
+    //                     carried (the kernel's Type::Adt(TypeId, args));
+    //   - T?           → .named("Option", [T]) — the arg carried;
+    //   - Self         → the current impl target (deliberately kept).
 
     private func lowerTypeExpr(_ typeExpr: TypeExpr) -> MirType {
         switch typeExpr {
-        case .named(let name, _, _):
+        case .named(let name, let typeArgs, _):
             switch name {
             case "Int": return .int
             case "Float", "f64": return .float
@@ -2409,7 +2887,7 @@ public final class MIRLowering {
             case "String": return .string
             case "Char": return .char
             case "Unit", "()": return .unit
-            default: return .named(name)
+            default: return .named(name, typeArgs.map(lowerTypeExpr))
             }
         case .assocBinding:
             return .unknown
@@ -2423,12 +2901,27 @@ public final class MIRLowering {
             return .refInternal(lowerTypeExpr(inner), mutable)
         case .rawPtr(let inner, _, _):
             return .rawPtr(lowerTypeExpr(inner))
-        case .array(let inner, _, _):
-            return .array(lowerTypeExpr(inner), nil)
+        case .array(let inner, let lenExpr, _):
+            // The [T; N] length is carried in the type (the kernel's
+            // FixedArray count); a length that is not a compile-time
+            // constant is an explicit error — the length is never
+            // silently dropped.
+            let len: Int?
+            if let lenExpr {
+                len = evalConstSize(lenExpr)
+                if len == nil {
+                    recordLoweringError("MIRLowering lowerTypeExpr: array type [T; N] length is not a compile-time constant (span \(lenExpr.span))")
+                }
+            } else {
+                len = nil
+            }
+            return .array(lowerTypeExpr(inner), len)
         case .slice(let inner, _):
             return .slice(lowerTypeExpr(inner))
-        case .option(_, _):
-            return .named("Option")
+        case .option(let inner, _):
+            // `T?` — the Option Adt WITH its type argument (never the
+            // bare "Option" name with the instantiation dropped).
+            return .named("Option", [lowerTypeExpr(inner)])
         case .fnPtr(let params, let ret, _):
             return .fn(params.map(lowerTypeExpr), lowerTypeExpr(ret))
         case .unit(_):
@@ -2437,7 +2930,7 @@ public final class MIRLowering {
             return .unknown
         case .selfType(_):
             if let currentSelfType {
-                return .named(currentSelfType)
+                return .named(currentSelfType, [])
             }
             return .unknown
         case .inferred(_):
@@ -2445,12 +2938,66 @@ public final class MIRLowering {
         }
     }
 
+    /// The bounded const-size evaluator for `[T; N]` lengths and repeat
+    /// counts — the kernel's eval_const_size_expr subset (int literals,
+    /// const-ident/path references, + - * / % arithmetic, unary neg),
+    /// fail-closed: any other form returns nil (the caller reports the
+    /// explicit error — never a silently guessed size).
+    private func evalConstSize(_ expr: Expr) -> Int? {
+        switch expr {
+        case .intLit(let s, _):
+            return MIRLowering.parseInt(s)
+        case .name(let n, _):
+            return statics.first(where: { $0.name == n })?.initializer.flatMap { c in
+                if case .int(let i) = c { return i } else { return nil }
+            }
+        case .path(let a, let b, _):
+            let qualified = "\(a)::\(b)"
+            return statics.first(where: { $0.name == qualified })?.initializer.flatMap { c in
+                if case .int(let i) = c { return i } else { return nil }
+            }
+        case .binary(let l, let op, let r, _):
+            guard let a = evalConstSize(l), let b = evalConstSize(r) else { return nil }
+            switch op {
+            case .add:
+                if a >= 0 && b >= 0 && a <= Int.max - b { return a + b } else { return nil }
+            case .sub:
+                return a >= b ? a - b : nil
+            case .mul:
+                if a >= 0 && b >= 0 && (a == 0 || b <= Int.max / a) { return a * b } else { return nil }
+            case .div:
+                return b != 0 ? a / b : nil
+            case .mod:
+                return b != 0 ? a % b : nil
+            default:
+                return nil
+            }
+        case .unary(let op, let inner, _):
+            if case .neg = op {
+                if let n = evalConstSize(inner) { return -n }
+            }
+            return nil
+        default:
+            return nil
+        }
+    }
+
     // MARK: - Constant evaluation (for const/static initializers)
 
     private func evalConstant(_ expr: Expr) -> MirConstant? {
         switch expr {
-        case .intLit(let s, _): return .int(MIRLowering.parseInt(s))
-        case .floatLit(let s, _): return .float(Double(s) ?? 0)
+        case .intLit(let s, let span):
+            guard let v = MIRLowering.parseInt(s) else {
+                recordLoweringError("MIRLowering: unparseable integer literal '\(s)' at span \(span.start)..<\(span.end) — the parse failure is reported at the literal's span (INV-PARSE-003 fail-closed), never a silent 0")
+                return nil
+            }
+            return .int(v)
+        case .floatLit(let s, let span):
+            guard let v = MIRLowering.parseFloatLiteral(s) else {
+                recordLoweringError("MIRLowering: unparseable float literal '\(s)' at span \(span.start)..<\(span.end) — the parse failure is reported at the literal's span (INV-PARSE-003 fail-closed), never a silent 0.0")
+                return nil
+            }
+            return .float(v)
         case .stringLit(let s, _): return .str(s)
         case .charLit(let c, _): return .char(c)
         case .boolLit(let b, _): return .bool(b)
@@ -2483,6 +3030,17 @@ public final class MIRLowering {
         }
     }
 
+    /// The static result type of a binary operator: comparisons and the
+    /// logical and/or produce Bool; arithmetic and bitwise produce Int.
+    private func binOpResultType(_ op: BinaryOp) -> MirType {
+        switch op {
+        case .eq, .notEq, .lt, .ltEq, .gt, .gtEq, .and, .or:
+            return .bool
+        case .add, .sub, .mul, .div, .mod, .bitAnd, .bitOr, .bitXor, .shl, .shr:
+            return .int
+        }
+    }
+
     // MARK: - Builder helpers
 
     private func resetFunctionState() {
@@ -2493,6 +3051,38 @@ public final class MIRLowering {
         nextBlock = 0
         returnLocal = 0
         scopes = []
+        pendingDeferBlocks = []
+    }
+
+    /// The function-exit terminator: with registered defers, every exit
+    /// (fallthrough and explicit return) routes through the LIFO defer
+    /// chain (the last registered defer block); without defers the exit
+    /// is the direct .ret.
+    private func exitTerminator() -> MirTerminator {
+        guard let lastDefer = pendingDeferBlocks.last else {
+            return .ret
+        }
+        return .goto(lastDefer)
+    }
+
+    /// Wire the registered defer blocks into the function's exit cleanup:
+    /// execution enters the LAST registered defer's block first (LIFO),
+    /// each block chains to the previously registered one, and the first
+    /// registered block chains to a fresh block terminated with .ret.
+    /// Called once at function end, after every exit site has been
+    /// lowered (its terminator already captured the chain entry).
+    private func buildDeferExitChain() {
+        guard !pendingDeferBlocks.isEmpty else { return }
+        let retBlock = freshBlock()
+        let savedBlock = currentBlock
+        for (i, deferBlock) in pendingDeferBlocks.enumerated().reversed() {
+            let next = i == 0 ? retBlock : pendingDeferBlocks[i - 1]
+            currentBlock = deferBlock
+            terminateIfNeeded(.goto(next))
+        }
+        currentBlock = retBlock
+        terminateWith(.ret)
+        currentBlock = savedBlock
     }
 
     @discardableResult
@@ -2559,6 +3149,11 @@ public final class MIRLowering {
         }
     }
 
+    // DEAD CODE — do not port (the audit item 6): the hash-based field
+    // index (abs(name.hashValue) % 256) is never called — field access is
+    // resolved by NAME through MirPlace namedField projections, and the
+    // kernel's layout resolves fields structurally. Kept only as the
+    // audit marker; no caller exists.
     private func fieldIndex(_ name: String) -> Int {
         // Without type info, use name hash for deterministic field index
         // In a real compiler this would resolve via type definitions
@@ -2567,11 +3162,19 @@ public final class MIRLowering {
 
     /// Convert an expression directly to a MirPlace (for &/&mut lowering).
     /// Returns nil if the expression can't be represented as a place.
+    /// `*x` (ExprRawDeref) is place-like (ast.tg expr_is_place_like): the
+    /// deref is the ProjDeref projection on the inner place.
     private func exprToPlace(_ expr: Expr) -> MirPlace? {
         switch expr {
         case .name(let n, _):
             if let id = lookupScope(n) {
                 return MirPlace(local: id)
+            }
+            // &static: the static-address place — the projStatic form
+            // (the kernel's MirStaticAddr + place_deref). The root local
+            // is unused; the projection carries the MirStatic name.
+            if statics.contains(where: { $0.name == n }) {
+                return MirPlace(local: 0, projections: [.projStatic(n)])
             }
             return nil
         case .field(let base, let field, _):
@@ -2586,6 +3189,14 @@ public final class MIRLowering {
                 let idxLocal = placeOf(idxOp)
                 return MirPlace(local: basePlace.local,
                                 projections: basePlace.projections + [.index(idxLocal)])
+            }
+            return nil
+        case .unary(let op, let inner, _):
+            if case .deref = op {
+                if let basePlace = exprToPlace(inner) {
+                    return MirPlace(local: basePlace.local,
+                                    projections: basePlace.projections + [.projDeref])
+                }
             }
             return nil
         default:
@@ -2621,6 +3232,12 @@ public final class MIRLowering {
             let idxOp = lowerExpr(idx)
             let idxLocal = placeOf(idxOp)
             return (local, idxProjs + [.index(idxLocal)])
+        case .unary(.deref, let inner, _):
+            // `*p = v` — the LHS is the deref place (the ProjDeref
+            // projection on the inner place; the kernel's place_deref),
+            // never an assignment into a spill temp.
+            let (local, projs) = lowerPlaceExpr(inner)
+            return (local, projs + [.projDeref])
         default:
             let op = lowerExpr(expr)
             return (placeOf(op), [])
@@ -2686,9 +3303,21 @@ public final class MIRLowering {
                 result = qualifiedAliases(for: name).first { hasFunction(named: $0) } ?? name
             }
         } else {
-            // Search existing functions for a matching bare name.
-            // Two-pass: prefer exact match over qualified/mangled suffix match.
-            if let exactMatch = functions.first(where: { $0.name == name }) {
+            // Search existing functions for a matching bare name. The
+            // current module's qualified registration is preferred FIRST
+            // (the kernel's per-module tables decide the bare reference —
+            // the audit item 12): "m::foo" for the current module path,
+            // then the module-qualified ancestors, before the bare
+            // exact/suffix scan. This keeps two same-named `def foo()` in
+            // different modules resolved to the CALLER's module, not the
+            // first registration.
+            var resolved: String? = nil
+            if !modulePath.isEmpty {
+                resolved = moduleQualifiedTypeNames(for: name).first { hasFunction(named: $0) }
+            }
+            if let resolved {
+                result = resolved
+            } else if let exactMatch = functions.first(where: { $0.name == name }) {
                 result = exactMatch.name
             } else {
                 // Second pass: try qualified suffix matches
@@ -2711,14 +3340,18 @@ public final class MIRLowering {
     }
 
     /// Parse an integer literal string, supporting hex (0x), binary (0b), octal (0o),
-    /// decimal, and underscore separators.
-    static func parseInt(_ s: String) -> Int {
+    /// decimal, and underscore separators. Returns nil when the literal cannot be
+    /// parsed — the parse FAILURE is the caller's to report at the literal's span
+    /// (the kernel's fail-closed numeric handling: never the silent 0).
+    static func parseInt(_ s: String) -> Int? {
         let clean = s.replacingOccurrences(of: "_", with: "")
             .trimmingCharacters(in: .whitespaces)
-        // Strip type suffixes like u8, u16, u32, u64, i32, i64, and the
-        // bare u/i spellings (u, i, 8_u).
+        // Strip type suffixes like u8, u16, u32, u64, i32, i64, u128, i128,
+        // usize, isize, and the bare u/i spellings (u, i, 8_u). The set is
+        // the kernel's `integer_suffix_valid` plus the stage0's documented
+        // separator-before-suffix spelling.
         let stripped: String
-        if let r = clean.range(of: #"(?:_)?[ui](?:8|16|32|64)?$"#, options: .regularExpression) {
+        if let r = clean.range(of: #"(?:_)?(?:[ui](?:8|16|32|64|128)?|usize|isize)$"#, options: .regularExpression) {
             stripped = String(clean[clean.startIndex..<r.lowerBound])
         } else {
             stripped = clean
@@ -2744,7 +3377,10 @@ public final class MIRLowering {
         // The unsigned domain (the kernel's u64 hash constants exceed
         // Int64.max): preserve the bit pattern instead of silently
         // truncating to 0 (INV-PARSE-003 — the E9030 gate admits exactly
-        // the magnitudes that fit UInt64).
+        // the magnitudes that fit UInt64). The wrap is DELIBERATE and
+        // documented; only a literal the lexer/E9030 could not validate
+        // reaches the nil below, which the caller reports as the parse
+        // failure (never a silent 0).
         let digits = stripped.hasPrefix("0x") || stripped.hasPrefix("0X")
             ? String(stripped.dropFirst(2))
             : (stripped.hasPrefix("0b") || stripped.hasPrefix("0B")
@@ -2755,6 +3391,19 @@ public final class MIRLowering {
         if let unsigned = UInt64(digits, radix: radix) {
             return Int(bitPattern: UInt(truncatingIfNeeded: unsigned))
         }
-        return 0
+        return nil
+    }
+
+    /// Parse a float literal spelling to a Double. The grammar is the
+    /// Swift-compatible float grammar (the audit item 3): Swift's Double()
+    /// accepts the hex floats (`0x1.8p3`), inf/infinity/nan, and the
+    /// decimal significand/exponent forms; the kernel's fail-closed
+    /// validations — the malformed `1e`/`1.` shapes and the invalid
+    /// suffixes — are rejected at the LEXER (E1010/E1014), so an
+    /// unparseable float reaching the lowering is a parse failure the
+    /// caller reports at the literal's span (never a fabricated 0.0).
+    static func parseFloatLiteral(_ s: String) -> Double? {
+        let clean = s.replacingOccurrences(of: "_", with: "")
+        return Double(clean)
     }
 }

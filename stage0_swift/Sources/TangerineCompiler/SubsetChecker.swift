@@ -101,7 +101,7 @@ public final class SubsetChecker {
             reject("E9014", "inline function modifier is not available in the bootstrap subset", sig.span)
         }
         for param in sig.params {
-            checkTypeExpr(param.type)
+            checkTypeExpr(param.type, allowsImplTrait: true)
             if let dv = param.defaultValue {
                 checkExpr(dv)
             }
@@ -190,33 +190,38 @@ public final class SubsetChecker {
 
     // MARK: - Type Expressions
 
-    private func checkTypeExpr(_ ty: TypeExpr) {
+    /// `allowsImplTrait` marks PARAMETER-position type checks: the kernel's
+    /// own API surface uses `impl Trait` parameters (std/taint.tg
+    /// `validator: impl Validator[T, Clean]`), so the subset extension
+    /// accepts the impl-trait parameter form while trait objects stay
+    /// rejected in every other type position.
+    private func checkTypeExpr(_ ty: TypeExpr, allowsImplTrait: Bool = false) {
         switch ty {
         case .constExpr(let expr, _):
             checkExpr(expr)
         case .ref(let inner, _, _):
-            checkTypeExpr(inner)
+            checkTypeExpr(inner, allowsImplTrait: allowsImplTrait)
         case .rawPtr(let inner, _, _):
-            checkTypeExpr(inner)
+            checkTypeExpr(inner, allowsImplTrait: allowsImplTrait)
         case .fnPtr(let params, let ret, _):
-            for p in params { checkTypeExpr(p) }
-            checkTypeExpr(ret)
+            for p in params { checkTypeExpr(p, allowsImplTrait: allowsImplTrait) }
+            checkTypeExpr(ret, allowsImplTrait: allowsImplTrait)
         case .array(let elem, let len, _):
-            checkTypeExpr(elem)
+            checkTypeExpr(elem, allowsImplTrait: allowsImplTrait)
             if let l = len { checkExpr(l) }
         case .slice(let elem, _):
-            checkTypeExpr(elem)
+            checkTypeExpr(elem, allowsImplTrait: allowsImplTrait)
         case .option(let inner, _):
-            checkTypeExpr(inner)
+            checkTypeExpr(inner, allowsImplTrait: allowsImplTrait)
         case .never:
             break
         case .tuple(let elems, _):
-            for e in elems { checkTypeExpr(e) }
+            for e in elems { checkTypeExpr(e, allowsImplTrait: allowsImplTrait) }
         case .named(_, let typeArgs, _):
-            for ta in typeArgs { checkTypeExpr(ta) }
+            for ta in typeArgs { checkTypeExpr(ta, allowsImplTrait: allowsImplTrait) }
         case .assocBinding(_, let value, _):
-            checkTypeExpr(value)
-        case .dynTrait(let inner, _), .implTrait(let inner, _):
+            checkTypeExpr(value, allowsImplTrait: allowsImplTrait)
+        case .dynTrait(let inner, _):
             // INV-TYPE-010 / INV-ABI-007 scoping action: trait objects are
             // NOT in the bootstrap subset. The kernel compiles without any
             // type-position dyn/impl (the stage3 parser desugars both to the
@@ -224,10 +229,17 @@ public final class SubsetChecker {
             // dialect), so rejecting the surface here removes it from the
             // bootstrap callable entirely.
             reject("E9032", "trait-object types (dyn Trait / impl Trait in type position) are not available in the bootstrap subset", inner.span)
-            checkTypeExpr(inner)
+            checkTypeExpr(inner, allowsImplTrait: allowsImplTrait)
+        case .implTrait(let inner, _):
+            if allowsImplTrait {
+                checkTypeExpr(inner, allowsImplTrait: allowsImplTrait)
+            } else {
+                reject("E9032", "trait-object types (dyn Trait / impl Trait in type position) are not available in the bootstrap subset", inner.span)
+                checkTypeExpr(inner, allowsImplTrait: allowsImplTrait)
+            }
         case .bounded(let base, let bounds, _):
-            checkTypeExpr(base)
-            for bound in bounds { checkTypeExpr(bound) }
+            checkTypeExpr(base, allowsImplTrait: allowsImplTrait)
+            for bound in bounds { checkTypeExpr(bound, allowsImplTrait: allowsImplTrait) }
         case .unit, .selfType, .inferred:
             break
         }
@@ -274,6 +286,9 @@ public final class SubsetChecker {
             for clause in e.elsifClauses {
                 checkExpr(clause.condition)
                 checkBlock(clause.body)
+            }
+            for (_, value) in e.elsifLet {
+                checkExpr(value)
             }
             if let el = e.elseBlock { checkBlock(el) }
             if let v = e.ifLetValue { checkExpr(v) }

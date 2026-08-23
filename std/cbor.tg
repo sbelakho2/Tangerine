@@ -1,5 +1,13 @@
 # std::cbor — CBOR (RFC 8949) binary serialization
 # Concise Binary Object Representation for compact, efficient data interchange.
+#
+# RFC 8949 coverage: the full major-type matrix (unsigned/negative ints,
+# byte/text strings, arrays, maps, tags, simple values, the float16/32/64
+# forms) AND the indefinite-length forms (additional info 31: the
+# indefinite byte/text string chunking, the indefinite array/map, the
+# 0xFF break terminator) — decode-side fully implemented, encode-side
+# via the explicit encode_indefinite_* forms (the definite forms remain
+# the default, as RFC 8949 §3.2 permits either).
 
 use std::core::{Option, Result, String, Bool, Int, Unit, Vec}
 use std::collections::{Map}
@@ -103,6 +111,8 @@ enum CborError
   UnexpectedEof
   InvalidMajorType(u8)
   InvalidAdditionalInfo(u8)
+  UnexpectedBreak
+  InvalidIndefiniteChunk
   InvalidUtf8
   NestedTooDeep
   TrailingData
@@ -115,6 +125,8 @@ def cbor_error_message(e: CborError) -> String
   when CborError::UnexpectedEof then "CBOR: unexpected end of input".to_string()
   when CborError::InvalidMajorType(t) then "CBOR: invalid major type " + (t as Int).to_string()
   when CborError::InvalidAdditionalInfo(i) then "CBOR: invalid additional info " + (i as Int).to_string()
+  when CborError::UnexpectedBreak then "CBOR: break byte outside an indefinite-length context".to_string()
+  when CborError::InvalidIndefiniteChunk then "CBOR: invalid chunk in an indefinite-length byte/text string".to_string()
   when CborError::InvalidUtf8 then "CBOR: invalid UTF-8 in text string".to_string()
   when CborError::NestedTooDeep then "CBOR: nesting too deep".to_string()
   when CborError::TrailingData then "CBOR: trailing data after value".to_string()
@@ -194,6 +206,52 @@ impl Encoder
 
   def into_bytes(self: Encoder) -> Vec[u8]
     self.output
+  end
+
+  # The indefinite-length ENCODING forms (RFC 8949 §3.2): the definite
+  # forms above remain the default (RFC 8949 permits either), and these
+  # four emit the additional-info-31 headers with the 0xFF break
+  # terminator explicitly — round-trippable through the decoder.
+
+  def encode_indefinite_bytes(inout self: Encoder, chunks: Vec[Vec[u8]]) -> Unit
+    self.output.push((2 << 5) | 31)
+    for chunk in chunks do
+      self._write_type_value(2, chunk.len() as UInt)
+      for b in chunk do
+        self.output.push(b)
+      end
+    end
+    self.output.push(0xFF)
+  end
+
+  def encode_indefinite_text(inout self: Encoder, chunks: Vec[String]) -> Unit
+    self.output.push((3 << 5) | 31)
+    for chunk in chunks do
+      let bytes = chunk.as_bytes()
+      self._write_type_value(3, bytes.len() as UInt)
+      for b in bytes do
+        self.output.push(b)
+      end
+    end
+    self.output.push(0xFF)
+  end
+
+  def encode_indefinite_array(inout self: Encoder, items: Vec[Value]) -> Unit
+    self.output.push((4 << 5) | 31)
+    for item in items do
+      self.encode(&item)
+    end
+    self.output.push(0xFF)
+  end
+
+  def encode_indefinite_map(inout self: Encoder, entries: Vec[(Value, Value)]) -> Unit
+    self.output.push((5 << 5) | 31)
+    for entry in entries do
+      let (key, val) = entry
+      self.encode(&key)
+      self.encode(&val)
+    end
+    self.output.push(0xFF)
   end
 
   def _write_type_value(inout self: Encoder, major: u8, value: UInt) -> Unit
@@ -298,39 +356,55 @@ impl Decoder
       let val = self._read_uint(additional)?
       Result::Ok(Value::NegativeInt(-1 - (val as Int)))
     when 2 then
-      let len = self._read_uint(additional)? as Int
-      let bytes = self._read_bytes(len)?
-      Result::Ok(Value::ByteString(bytes))
+      if additional == 31 then
+        self._decode_indefinite_bytes(depth)
+      else
+        let len = self._read_uint(additional)? as Int
+        let bytes = self._read_bytes(len)?
+        Result::Ok(Value::ByteString(bytes))
+      end
     when 3 then
-      let len = self._read_uint(additional)? as Int
-      let bytes = self._read_bytes(len)?
-      match String::from_utf8(bytes)
-      when Result::Ok(s) then Result::Ok(Value::TextString(s))
-      when Result::Err(_) then Result::Err(CborError::InvalidUtf8)
+      if additional == 31 then
+        self._decode_indefinite_text(depth)
+      else
+        let len = self._read_uint(additional)? as Int
+        let bytes = self._read_bytes(len)?
+        match String::from_utf8(bytes)
+        when Result::Ok(s) then Result::Ok(Value::TextString(s))
+        when Result::Err(_) then Result::Err(CborError::InvalidUtf8)
+        end
       end
     when 4 then
-      let count = self._read_uint(additional)? as Int
-      let mut items = Vec::with_capacity(count as UInt)
-      let mut i = 0
-      while i < count do
-        match self._decode_value(depth + 1)
-        when Result::Ok(v) then items.push(v)
-        when Result::Err(e) then return Result::Err(e)
+      if additional == 31 then
+        self._decode_indefinite_array(depth)
+      else
+        let count = self._read_uint(additional)? as Int
+        let mut items = Vec::with_capacity(count as UInt)
+        let mut i = 0
+        while i < count do
+          match self._decode_value(depth + 1)
+          when Result::Ok(v) then items.push(v)
+          when Result::Err(e) then return Result::Err(e)
+          end
+          i = i + 1
         end
-        i = i + 1
+        Result::Ok(Value::Array(items))
       end
-      Result::Ok(Value::Array(items))
     when 5 then
-      let count = self._read_uint(additional)? as Int
-      let mut entries = Vec::with_capacity(count as UInt)
-      let mut i = 0
-      while i < count do
-        let key = self._decode_value(depth + 1)?
-        let val = self._decode_value(depth + 1)?
-        entries.push((key, val))
-        i = i + 1
+      if additional == 31 then
+        self._decode_indefinite_map(depth)
+      else
+        let count = self._read_uint(additional)? as Int
+        let mut entries = Vec::with_capacity(count as UInt)
+        let mut i = 0
+        while i < count do
+          let key = self._decode_value(depth + 1)?
+          let val = self._decode_value(depth + 1)?
+          entries.push((key, val))
+          i = i + 1
+        end
+        Result::Ok(Value::Map(entries))
       end
-      Result::Ok(Value::Map(entries))
     when 6 then
       let tag = self._read_uint(additional)?
       let inner = self._decode_value(depth + 1)?
@@ -365,6 +439,11 @@ impl Decoder
           i = i + 1
         end
         Result::Ok(Value::Float64(_f64_bits_to_float(bits)))
+      when 31 then
+        # The break byte (0xFF) is legal ONLY inside an indefinite-length
+        # context; the indefinite decoders consume it themselves, so a
+        # break that reaches _decode_value is an error.
+        Result::Err(CborError::UnexpectedBreak)
       else
         if additional < 20 then
           Result::Ok(Value::SimpleValue(additional))
@@ -382,6 +461,100 @@ impl Decoder
     let b = self.input.get(self.pos as UInt)
     self.pos = self.pos + 1
     Result::Ok(b)
+  end
+
+  # The indefinite-length forms (RFC 8949 §3.2): additional info 31 with
+  # the break byte (0xFF) terminator. The byte/text forms consist of
+  # definite-length chunks of the SAME major type (an indefinite chunk or
+  # a foreign major type inside is invalid); the array/map forms are
+  # ordinary items terminated by the break.
+
+  def _decode_indefinite_bytes(inout self: Decoder, depth: Int) -> Result[Value, CborError]
+    # 0x5F ... 0xFF: the chunks are definite-length byte strings.
+    let mut chunks = Vec::new()
+    loop
+      if self.pos >= self.input.len() as Int then return Result::Err(CborError::UnexpectedEof) end
+      let initial = self.input.get(self.pos as UInt)
+      if initial == 0xFF then
+        self.pos = self.pos + 1
+        break
+      end
+      match self._decode_value(depth + 1)
+      when Result::Ok(Value::ByteString(b)) then chunks.push(b)
+      when Result::Ok(_) then return Result::Err(CborError::InvalidIndefiniteChunk)
+      when Result::Err(e) then return Result::Err(e)
+      end
+    end
+    let mut result = Vec::new()
+    for chunk in chunks do
+      for b in chunk do
+        result.push(b)
+      end
+    end
+    Result::Ok(Value::ByteString(result))
+  end
+
+  def _decode_indefinite_text(inout self: Decoder, depth: Int) -> Result[Value, CborError]
+    # 0x7F ... 0xFF: the chunks are definite-length text strings; the
+    # concatenated bytes are validated as UTF-8 once, after the chunks.
+    let mut chunks = Vec::new()
+    loop
+      if self.pos >= self.input.len() as Int then return Result::Err(CborError::UnexpectedEof) end
+      let initial = self.input.get(self.pos as UInt)
+      if initial == 0xFF then
+        self.pos = self.pos + 1
+        break
+      end
+      match self._decode_value(depth + 1)
+      when Result::Ok(Value::TextString(s)) then chunks.push(s)
+      when Result::Ok(_) then return Result::Err(CborError::InvalidIndefiniteChunk)
+      when Result::Err(e) then return Result::Err(e)
+      end
+    end
+    let mut bytes = Vec::new()
+    for chunk in chunks do
+      let chunk_bytes = chunk.as_bytes()
+      for b in chunk_bytes do
+        bytes.push(b)
+      end
+    end
+    match String::from_utf8(bytes)
+    when Result::Ok(s) then Result::Ok(Value::TextString(s))
+    when Result::Err(_) then Result::Err(CborError::InvalidUtf8)
+    end
+  end
+
+  def _decode_indefinite_array(inout self: Decoder, depth: Int) -> Result[Value, CborError]
+    # 0x9F ... 0xFF: the items until the break.
+    let mut items = Vec::new()
+    loop
+      if self.pos >= self.input.len() as Int then return Result::Err(CborError::UnexpectedEof) end
+      let initial = self.input.get(self.pos as UInt)
+      if initial == 0xFF then
+        self.pos = self.pos + 1
+        break
+      end
+      let item = self._decode_value(depth + 1)?
+      items.push(item)
+    end
+    Result::Ok(Value::Array(items))
+  end
+
+  def _decode_indefinite_map(inout self: Decoder, depth: Int) -> Result[Value, CborError]
+    # 0xBF ... 0xFF: the alternating key/value pairs until the break.
+    let mut entries = Vec::new()
+    loop
+      if self.pos >= self.input.len() as Int then return Result::Err(CborError::UnexpectedEof) end
+      let initial = self.input.get(self.pos as UInt)
+      if initial == 0xFF then
+        self.pos = self.pos + 1
+        break
+      end
+      let key = self._decode_value(depth + 1)?
+      let val = self._decode_value(depth + 1)?
+      entries.push((key, val))
+    end
+    Result::Ok(Value::Map(entries))
   end
 
   def _read_bytes(inout self: Decoder, n: Int) -> Result[Vec[u8], CborError]
@@ -504,4 +677,112 @@ end
 def cbor_decode_strict(bytes: Vec[u8]) -> Result[Value, CborError]
   let mut dec = decoder_new(bytes.clone())
   dec.decode_strict()
+end
+
+# Structural equality over the CBOR Value tree (used by the RFC 8949
+# vector tests; the definite vs indefinite distinction is NOT part of the
+# value — an indefinite array decoded equals its definite encoding).
+def cbor_value_eq(a: Value, b: Value) -> Bool
+  match a
+  when Value::UnsignedInt(x) then
+    match b
+    when Value::UnsignedInt(y) then x == y
+    else false
+    end
+  when Value::NegativeInt(x) then
+    match b
+    when Value::NegativeInt(y) then x == y
+    else false
+    end
+  when Value::ByteString(x) then
+    match b
+    when Value::ByteString(y) then _bytes_eq(x, y)
+    else false
+    end
+  when Value::TextString(x) then
+    match b
+    when Value::TextString(y) then x == y
+    else false
+    end
+  when Value::Array(x) then
+    match b
+    when Value::Array(y) then _value_vec_eq(x, y)
+    else false
+    end
+  when Value::Map(x) then
+    match b
+    when Value::Map(y) then _map_eq(x, y)
+    else false
+    end
+  when Value::Tag(t1, inner1) then
+    match b
+    when Value::Tag(t2, inner2) then
+      t1 == t2 && cbor_value_eq(*inner1.get(), *inner2.get())
+    else false
+    end
+  when Value::SimpleValue(x) then
+    match b
+    when Value::SimpleValue(y) then x == y
+    else false
+    end
+  when Value::Float16(x) then
+    match b
+    when Value::Float16(y) then x == y
+    else false
+    end
+  when Value::Float32(x) then
+    match b
+    when Value::Float32(y) then x == y
+    else false
+    end
+  when Value::Float64(x) then
+    match b
+    when Value::Float64(y) then x == y
+    else false
+    end
+  end
+end
+
+def _bytes_eq(x: Vec[u8], y: Vec[u8]) -> Bool
+  if x.len() != y.len() then
+    return false
+  end
+  var i = 0
+  while i < x.len() do
+    if x[i] != y[i] then
+      return false
+    end
+    i = i + 1
+  end
+  true
+end
+
+def _value_vec_eq(x: Vec[Value], y: Vec[Value]) -> Bool
+  if x.len() != y.len() then
+    return false
+  end
+  var i = 0
+  while i < x.len() do
+    if !cbor_value_eq(x[i], y[i]) then
+      return false
+    end
+    i = i + 1
+  end
+  true
+end
+
+def _map_eq(x: Vec[(Value, Value)], y: Vec[(Value, Value)]) -> Bool
+  if x.len() != y.len() then
+    return false
+  end
+  var i = 0
+  while i < x.len() do
+    let (xk, xv) = x[i]
+    let (yk, yv) = y[i]
+    if !cbor_value_eq(xk, yk) || !cbor_value_eq(xv, yv) then
+      return false
+    end
+    i = i + 1
+  end
+  true
 end

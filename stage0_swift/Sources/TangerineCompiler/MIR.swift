@@ -134,6 +134,14 @@ public enum MirProjection {
     case index(LocalId)
     case constantIndex(Int)
     case downcast(Int)
+    // projStatic(name) — the STATIC-ADDRESS place (the kernel's
+    // MirStaticAddr-temp + place_deref pairing, fused): a place rooted at
+    // a registered static instead of a local. The root local of the
+    // MirPlace is unused; the projection carries the static's name (the
+    // MirStaticId). Used for &static borrows (call-arg places, ref
+    // rvalues) and static store sites. The kernel's authority:
+    // MirConstantKind::MirStaticAddr + place_deref(place_local(addr_tmp)).
+    case projStatic(String)
 }
 
 // MARK: - Operand
@@ -172,6 +180,12 @@ public enum MirConstant {
     case char(Character)
     case str(String)
     case fnItem(String)
+    // MirStaticRef(MirStaticId) — a READ of a registered static. The
+    // MirStaticId-class identity is the MirStatic's NAME (the seed's
+    // static registry is name-keyed; the kernel's DefId side is its
+    // DefId machinery). The value resolves through the interpreter's
+    // static store at runtime.
+    case staticRef(String)
     case zeroSized
 }
 
@@ -187,6 +201,7 @@ public enum MirRvalue {
     case discriminant(MirPlace)
     case len(MirPlace)
     case cast(MirOperand, MirType)
+    case `repeat`(MirOperand, Int)  // array repeat — MirRepeat(MirOperand, Int)
 }
 
 public enum AggregateKind {
@@ -205,7 +220,7 @@ public enum MirBinOp {
 }
 
 public enum MirUnOp {
-    case neg, not
+    case neg, not, bitNot
 }
 
 // MARK: - Type
@@ -217,7 +232,12 @@ public indirect enum MirType: Equatable {
     case float
     case char
     case string
-    case named(String)
+    /// A named Adt type. `args` carries the generic instantiation
+    /// (e.g. `Map<String, Int>` → name "Map", args [.string, .int]) — the
+    /// kernel's Type::Adt(TypeId, Vec[Type]) shape; the args are never
+    /// folded into the name string. The registered type-def identity is
+    /// the bare name; resolution strips the args (bareTypeName).
+    case named(String, [MirType])
     case refInternal(MirType, Bool)
     case rawPtr(MirType)
     case array(MirType, Int?)

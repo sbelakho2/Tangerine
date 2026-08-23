@@ -24,18 +24,19 @@ Tangerine supports cross-compilation to multiple platforms and architectures fro
 | `aarch64-unknown-linux-gnu` | Linux | ARM64 | Servers, Raspberry Pi 4+ |
 | `wasm32-unknown-unknown` | WebAssembly | WASM32 | Browser targets |
 | `wasm32-wasi` | WASI | WASM32 | Server-side WASM |
-| `thumbv7em-none-eabihf` | Bare metal | ARM Cortex-M4/M7 | Hard-float embedded |
-| `thumbv6m-none-eabi` | Bare metal | ARM Cortex-M0/M0+ | Minimal embedded |
+| `thumbv7em-none-eabihf` | Bare metal | ARM Cortex-M4/M7 | REJECTED by the embedded route — no Thumb code generator (the stable diagnostic, no artifact) |
+| `thumbv6m-none-eabi` | Bare metal | ARM Cortex-M0/M0+ | REJECTED by the embedded route — no Thumb code generator |
 
 ### Tier 3 — Community-Supported
 
 | Target Triple | OS | Architecture | Notes |
 |---|---|---|---|
 | `riscv64gc-unknown-linux-gnu` | Linux | RISC-V 64 | Emerging architecture |
-| `riscv32imac-unknown-none-elf` | Bare metal | RISC-V 32 | Embedded RISC-V |
+| `riscv32imac-unknown-none-elf` | Bare metal | RISC-V 32 | REJECTED by the embedded route — no RISC-V code generator (no artifact) |
+| `riscv32imc-unknown-none-elf` | Bare metal | RISC-V 32 | REJECTED by the embedded route — no RISC-V code generator |
 | `aarch64-linux-android` | Android | ARM64 | Android NDK required |
 | `x86_64-unknown-freebsd` | FreeBSD | x86-64 | Server deployments |
-| `aarch64-unknown-none` | Bare metal | ARM64 | AArch64 baremetal |
+| `aarch64-unknown-none` | Bare metal | ARM64 | AArch64 baremetal — the embedded route's REAL target (the aarch64 backend) |
 
 ## Basic Cross-Compilation
 
@@ -51,8 +52,8 @@ tg build --target wasm32-unknown-unknown --release
 # List all available targets
 tg target list
 
-# Add a target toolchain
-tg target add thumbv7em-none-eabihf
+# Add the real bare-metal toolchain
+tg target add aarch64-unknown-none
 ```
 
 ### Tangerine.toml Configuration
@@ -75,9 +76,9 @@ features = ["windows_service"]
 features = ["web_ui"]
 opt_level = "s"
 
-[target.thumbv7em-none-eabihf]
+[target.aarch64-unknown-none]
 features = ["no_std", "embedded"]
-linker = "arm-none-eabi-ld"
+linker = "aarch64-none-elf-ld"
 linker_script = "memory.ld"
 ```
 
@@ -122,22 +123,29 @@ tg wasm-opt target/wasm32-unknown-unknown/release/myapp.wasm \
   -Os -o myapp_optimized.wasm
 ```
 
-### Any Host → Embedded ARM
+### Any Host → Embedded AArch64
 
 ```bash
-# Install ARM toolchain
-tg target add thumbv7em-none-eabihf
+# Install the bare-metal ARM64 toolchain
+tg target add aarch64-unknown-none
 
-# Build firmware
-tg build --target thumbv7em-none-eabihf --release
+# Build firmware (the REAL embedded target — the aarch64 backend)
+tg build --target aarch64-unknown-none --release
 
-# Output: target/thumbv7em-none-eabihf/release/firmware.elf
+# Output: target/aarch64-unknown-none/release/firmware.elf
 
 # Convert to binary for flashing
 tg objcopy -O binary \
-  target/thumbv7em-none-eabihf/release/firmware.elf \
+  target/aarch64-unknown-none/release/firmware.elf \
   firmware.bin
 ```
+
+The Thumb (`thumbv6m-none-eabi` / `thumbv7em-none-eabi[f]` /
+`thumbv8m.main-none-eabihf`) and RISC-V (`riscv32imc|imac-unknown-none-elf`
+/ `riscv64gc-unknown-none-elf`) embedded triples are HARD-REJECTED by the
+embedded route: the compiler has no Thumb/RISC-V code generator, so the
+route emits the stable rejection diagnostic and NO artifact — it never
+fabricates an aarch64 image under a foreign triple.
 
 ## Conditional Compilation
 
@@ -252,15 +260,15 @@ end
 
 ```toml
 # Tangerine.toml
-[target.thumbv7em-none-eabihf]
+[target.aarch64-unknown-none]
 linker_script = "memory.ld"
 panic = "abort"
 
-[target.thumbv7em-none-eabihf.memory]
-flash_origin = "0x08000000"
+[target.aarch64-unknown-none.memory]
+flash_origin = "0x00000000"
 flash_size = "512K"
-ram_origin = "0x20000000"
-ram_size = "128K"
+ram_origin = "0x40000000"
+ram_size = "64K"
 stack_size = "8K"
 ```
 
@@ -331,7 +339,7 @@ jobs:
 
 ```bash
 # Show target details
-tg target info thumbv7em-none-eabihf
+tg target info aarch64-unknown-none
 
 # Check what features are available
 tg target features x86_64-unknown-linux-gnu

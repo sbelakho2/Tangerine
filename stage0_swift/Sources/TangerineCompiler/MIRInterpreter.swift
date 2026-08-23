@@ -90,6 +90,13 @@ public final class MIRInterpreter {
     private var deferredFnIdx: Int = -1
     private var deferredArgs: [MirValue] = []
 
+    // The static storage — every MirStatic's runtime slot, keyed by the
+    // MirStatic NAME (the seed's MirStaticId-class identity; the kernel's
+    // static storage is keyed by the static's emission label — the
+    // name-side symbol-table registration). Mutable statics' writes land
+    // here; MirStaticRef reads and projStatic places resolve through it.
+    private var staticStore: [String: MirValue] = [:]
+
     public init(program: MirProgram, enableTrace: Bool = false) {
         self.program = program
         self.enableTrace = enableTrace
@@ -181,6 +188,16 @@ public final class MIRInterpreter {
         self.nativeFastPathSiteCache.reserveCapacity(program.functions.count * 2)
         self.directCallSiteCache.reserveCapacity(program.functions.count * 4)
         self.methodCallSiteCache.reserveCapacity(program.functions.count)
+        // Static storage: every MirStatic (mut/const) gets a runtime slot
+        // keyed by its name, seeded from its initializer constant (or Unit).
+        self.staticStore.reserveCapacity(program.statics.count)
+        for st in program.statics {
+            if let initConst = st.initializer {
+                self.staticStore[st.name] = evalConstant(initConst)
+            } else {
+                self.staticStore[st.name] = .unit
+            }
+        }
     }
     private let functionIndex: [String: Int]
     private let blockIndices: [[BlockId: MirBlock]]
@@ -368,6 +385,21 @@ public final class MIRInterpreter {
         }
     }
 
+    /// Resolve the static slot a __sync pointer argument targets. The
+    /// pointer arrives as the MirCallArg place — the projStatic
+    /// static-address place; the slot is keyed by the MirStatic name. A
+    /// pointer with no modeled slot (heap memory) returns nil — the
+    /// interpreter's transparent memory model has no such storage.
+    @inline(__always)
+    private func staticSlotForPointer(_ rawArgs: [MirCallArg]?, index: Int) -> String? {
+        guard let rawArgs, index < rawArgs.count else { return nil }
+        guard let place = callArgPlace(rawArgs[index]) else { return nil }
+        if case .projStatic(let staticName) = place.projections.first {
+            return staticName
+        }
+        return nil
+    }
+
     /// Write-back eligibility: Modify and Consume behave like Modify for now.
     @inline(__always)
     private func callArgNeedsWriteBack(_ arg: MirCallArg) -> Bool {
@@ -469,7 +501,7 @@ public final class MIRInterpreter {
         startTime = Date()
         nextProgressReportStep = progressReportInterval > 0 ? progressReportInterval : .max
 
-        guard let fn = findFunction(entryFunction) else {
+        guard let fn = findFunction(entryFunction) ?? findEntryFallback(entryFunction) else {
             return InterpreterResult(exitCode: 1, output: ["Error: function '\(entryFunction)' not found"],
                                      trace: trace)
         }
@@ -707,6 +739,12 @@ public final class MIRInterpreter {
             let calleeFnName = program.functions[callStack[callStack.count - 1].functionIdx].name
             popCallFrame()
             if enableTrace { addTrace(calleeFnName, -1, .exitFunction, "result=\(lastResult.description)") }
+            if calleeFnName == "read_source_file" || calleeFnName.hasSuffix("::read_source_file") {
+                fputs("INTERP-DEBUG: read_source_file -> \(lastResult.description.prefix(120))\n", stderr)
+            }
+            if calleeFnName == "collect_dep_file" || calleeFnName.hasSuffix("::collect_dep_file") {
+                fputs("INTERP-DEBUG: collect_dep_file -> \(lastResult.description.prefix(160))\n", stderr)
+            }
 
             if callStack.isEmpty {
                 return lastResult
@@ -806,6 +844,11 @@ public final class MIRInterpreter {
 
                 let result: MirValue
                 if case .fn(let name) = calleeVal {
+                    let debugCurFn = callStack.isEmpty ? "" : program.functions[callStack[callStack.count - 1].functionIdx].name
+                    let debugLexer = name == "lex_peek" || name == "lex_advance" || name == "ident_start_at" || name == "decode_scalar" || name == "is_xid_start_scalar" || name == "lexer_char_at" || name == "char_at" || name == "skip_whitespace" || debugCurFn.contains("lexer::") || debugCurFn == "lex_ident" || debugCurFn == "tokenize_impl"
+                    if debugLexer {
+                        fputs("INTERP-DBGLEX fn=\(debugCurFn) call=\(name) args=[\(argVals.map { $0.description.prefix(40) }.joined(separator: " | "))]\n", stderr)
+                    }
                     let staticSiteKey: CallSiteKey?
                     if case .mirConstant(.fnItem(let staticName)) = callee, staticName == name {
                         staticSiteKey = currentCallSiteKey()
@@ -814,7 +857,7 @@ public final class MIRInterpreter {
                     }
                     lastCallFinalParams = []
                     lastCallMutRefMask = []
-                    result = dispatchCall(name, args: argVals, staticSite: staticSiteKey)
+                    result = dispatchCall(name, args: argVals, staticSite: staticSiteKey, rawArgs: callArgs)
                     // Check if dispatchCall deferred a user-function call
                     if hasDeferredCall {
                         // Save continuation on current frame and return to trampoline
@@ -961,6 +1004,15 @@ public final class MIRInterpreter {
         switch stmt {
         case .assign(let place, let rvalue):
             let val = evalRvalue(rvalue)
+            // A static store: the assign target is the projStatic place
+            // (the static-address place) — write the runtime slot keyed by
+            // the MirStatic name, never a local.
+            if case .projStatic(let staticName) = place.projections.first {
+                staticStore[staticName] = val
+                if enableTrace { addTrace(fn.name, callStack.last!.currentBlock, .statement,
+                         "static \(staticName) = \(val.description)") }
+                break
+            }
             if place.projections.isEmpty {
                 setLocal(place.local, val)
                 if case .mirRefMut(let borrowedPlace) = rvalue {
@@ -1195,6 +1247,13 @@ public final class MIRInterpreter {
             }
             return .int(0)
 
+        case .repeat(let operand, let count):
+            // MirRepeat(MirOperand, Int) — the fixed-array initializer:
+            // the operand's value repeated `count` times.
+            let v = evalOperand(operand)
+            let elements = count > 0 ? Array(repeating: v, count: count) : []
+            return .array(MirArrayBuffer(elements))
+
         case .cast(let op, let targetType):
             let val = evalOperand(op)
             // Integer-like types (Int, I8-U128, ISize, U8-U128, USize)
@@ -1205,7 +1264,7 @@ public final class MIRInterpreter {
             switch targetType {
             case .int:
                 return convertToInt(val)
-            case .named(let n) where intLikeNames.contains(n):
+            case .named(let n, _) where intLikeNames.contains(n):
                 return convertToInt(val)
             case .float:
                 if let f = val.asFloat { return .float(f) }
@@ -1263,6 +1322,12 @@ public final class MIRInterpreter {
 
     @inline(__always)
     private func loadPlaceValue(_ place: MirPlace) -> MirValue {
+        // The static-address place (projStatic): the static's slot value —
+        // the address and the slot coincide in the interpreter's
+        // transparent pointer model (deref of a static address = the slot).
+        if case .projStatic(let staticName) = place.projections.first {
+            return staticStore[staticName] ?? .unit
+        }
         var val = getLocal(place.local)
         let projections = place.projections
         let count = projections.count
@@ -1285,6 +1350,9 @@ public final class MIRInterpreter {
         case .char(let c): return .char(c)
         case .str(let s): return .string(s)
         case .fnItem(let name): return .fn(name)
+        case .staticRef(let staticName):
+            // MirStaticRef(MirStaticId): the static's current slot value.
+            return staticStore[staticName] ?? .unit
         case .zeroSized: return .unit
         }
     }
@@ -1404,6 +1472,9 @@ public final class MIRInterpreter {
             return v
         case .not:
             if let b = v.asBool { return .bool(!b) }
+            if let i = v.asInt { return .int(~i) }
+            return v
+        case .bitNot:
             if let i = v.asInt { return .int(~i) }
             return v
         }
@@ -1700,6 +1771,9 @@ public final class MIRInterpreter {
             }
             // Non-enum value: likely already unwrapped — return as-is instead of losing data
             return val
+        case .projStatic(let staticName):
+            // The static-address place reads the static's slot value.
+            return staticStore[staticName] ?? .unit
         case .projDeref:
             // Dereference through single-ptr-field wrappers (Box, Owned, Rc, etc.)
             // and Ptr values to get the inner value.
@@ -1722,6 +1796,13 @@ public final class MIRInterpreter {
     private func setProjected(_ base: MirValue, projections: [MirProjection], value: MirValue) -> MirValue {
         if halted { return base }
         guard let first = projections.first else { return value }
+        // The static-address place (projStatic): the write is a static
+        // store — the runtime slot keyed by the MirStatic name. The base
+        // (the unused root local) is returned unchanged.
+        if case .projStatic(let staticName) = first {
+            staticStore[staticName] = value
+            return base
+        }
         if projections.count == 1 {
             switch first {
             case .field(let idx):
@@ -2224,38 +2305,100 @@ public final class MIRInterpreter {
         }
     }
 
+    // The kernel's String ABI is a UTF-8 BYTE buffer (_tg_string_len is
+    // "the byte length of an owned String object"): len() = byte count,
+    // char_at(idx) = the BYTE at idx (the kernel's byte-wise char_at "can
+    // only see its first byte"), slice(start, end) = a BYTE range, find =
+    // byte offset. These helpers therefore index the UTF-8 bytes directly
+    // (never NSString/UTF-16 code units — a multi-byte scalar shifts every
+    // byte-vs-code-unit position, which corrupts the lexer's positions).
     @inline(__always)
     private func stringLength(_ string: String) -> Int {
-        (string as NSString).length
+        if let b = string.utf8.withContiguousStorageIfAvailable({ $0 }) {
+            return b.count
+        }
+        return string.utf8.count
     }
 
     @inline(__always)
     private func stringCharacter(_ string: String, at index: Int) -> Character? {
-        let nsString = string as NSString
-        guard index >= 0 && index < nsString.length else { return nil }
-        let codeUnit = nsString.character(at: index)
-        if codeUnit < 0xD800 || codeUnit > 0xDFFF,
-           let scalar = UnicodeScalar(Int(codeUnit)) {
-            return Character(scalar)
+        guard index >= 0 else { return nil }
+        if let b = string.utf8.withContiguousStorageIfAvailable({ $0 }) {
+            guard index < b.count else { return nil }
+            return Character(UnicodeScalar(b[index]))
         }
-        return nsString.substring(with: NSRange(location: index, length: 1)).first
+        let bytes = Array(string.utf8)
+        guard index < bytes.count else { return nil }
+        return Character(UnicodeScalar(bytes[index]))
     }
 
     @inline(__always)
     private func stringSlice(_ string: String, start: Int, end: Int) -> String {
-        let nsString = string as NSString
-        let lowerBound = max(0, min(start, nsString.length))
-        let upperBound = max(lowerBound, min(end, nsString.length))
-        return nsString.substring(with: NSRange(location: lowerBound, length: upperBound - lowerBound))
+        if let b = string.utf8.withContiguousStorageIfAvailable({ $0 }) {
+            let lowerBound = max(0, min(start, b.count))
+            let upperBound = max(lowerBound, min(end, b.count))
+            if upperBound <= lowerBound { return "" }
+            return String(decoding: b[lowerBound..<upperBound], as: UTF8.self)
+        }
+        let bytes = Array(string.utf8)
+        let lowerBound = max(0, min(start, bytes.count))
+        let upperBound = max(lowerBound, min(end, bytes.count))
+        if upperBound <= lowerBound { return "" }
+        return String(decoding: bytes[lowerBound..<upperBound], as: UTF8.self)
+    }
+
+    /// Byte-wise substring search: returns the BYTE offset of the needle's
+    /// first occurrence (the native codegen_str_find is a byte scan — the
+    /// empty needle matches at position 0; the empty-needle backwards case
+    /// mirrors the kernel's std rfind contract: the byte length).
+    @inline(__always)
+    private func stringFind(_ string: String, needle: String, backwards: Bool = false) -> Int? {
+        if needle.isEmpty {
+            return backwards ? stringLength(string) : 0
+        }
+        let needleBytes = Array(needle.utf8)
+        if let b = string.utf8.withContiguousStorageIfAvailable({ $0 }) {
+            return byteFind(haystack: Array(b), needle: needleBytes, backwards: backwards)
+        }
+        return byteFind(haystack: Array(string.utf8), needle: needleBytes, backwards: backwards)
     }
 
     @inline(__always)
-    private func stringFind(_ string: String, needle: String, backwards: Bool = false) -> Int? {
-        let nsString = string as NSString
-        let options: NSString.CompareOptions = backwards ? .backwards : []
-        let range = nsString.range(of: needle, options: options)
-        guard range.location != NSNotFound else { return nil }
-        return range.location
+    private func byteFind(haystack: [UInt8], needle: [UInt8], backwards: Bool) -> Int? {
+        if needle.isEmpty {
+            return backwards ? haystack.count : 0
+        }
+        if needle.count > haystack.count {
+            return nil
+        }
+        if backwards {
+            var pos = haystack.count - needle.count
+            while pos >= 0 {
+                var matched = true
+                for (k, n) in needle.enumerated() {
+                    if haystack[pos + k] != n {
+                        matched = false
+                        break
+                    }
+                }
+                if matched { return pos }
+                pos -= 1
+            }
+            return nil
+        }
+        var pos = 0
+        while pos <= haystack.count - needle.count {
+            var matched = true
+            for (k, n) in needle.enumerated() {
+                if haystack[pos + k] != n {
+                    matched = false
+                    break
+                }
+            }
+            if matched { return pos }
+            pos += 1
+        }
+        return nil
     }
 
     @inline(__always)
@@ -2266,7 +2409,8 @@ public final class MIRInterpreter {
         return .enumVal("Option", 1, .unit)
     }
 
-    private func dispatchCall(_ name: String, args: [MirValue], staticSite: CallSiteKey? = nil) -> MirValue {
+    private func dispatchCall(_ name: String, args: [MirValue], staticSite: CallSiteKey? = nil,
+                              rawArgs: [MirCallArg]? = nil) -> MirValue {
         // If name has a native fast-path, skip the dispatch cache and go straight to the switch.
         // Cache alias resolution because interpreted compilation revisits the same call names
         // millions of times and repeated prefix/set lookups become dominant.
@@ -3991,6 +4135,31 @@ public final class MIRInterpreter {
                 return .string(String(decoding: rawBytes, as: UTF8.self))
             }
             return .string("")
+        case "String::from_chars", "String__from_chars", "string_from_chars",
+             "__intrinsic_string_from_chars":
+            // String::from_chars(chars: Vec[Char]) -> String — build an owned
+            // String by appending each Char in order (the kernel's charset
+            // constructors: from_cstr/from_str_view push `byte as Char` into
+            // an owned String; this is the Vec[Char] equivalent).
+            if case .array(let chars) = args.first {
+                var result = ""
+                for ch in chars {
+                    switch ch {
+                    case .char(let c):
+                        result.append(c)
+                    case .int(let cp):
+                        if let u = UnicodeScalar(cp) {
+                            result.append(Character(u))
+                        }
+                    case .string(let s):
+                        result.append(s)
+                    default:
+                        break
+                    }
+                }
+                return .string(result)
+            }
+            return .string("")
         case "Box::new":
             // Box::new(val): wrap the value in a Box struct so projections work.
             // Box[T] = struct { ptr: Ptr[T] }
@@ -4314,8 +4483,24 @@ public final class MIRInterpreter {
             }
             return .bool(false)
         case ".trim":
+            // The kernel's _tg_string_trim trims ONLY the ASCII whitespace
+            // bytes (space/tab/CR/LF) — non-ASCII whitespace passes through.
             if case .string(let s) = args.first {
-                return .string(s.trimmingCharacters(in: .whitespacesAndNewlines))
+                let bytes = Array(s.utf8)
+                var lo = 0
+                var hi = bytes.count
+                while lo < hi {
+                    let b = bytes[lo]
+                    if b == 32 || b == 9 || b == 13 || b == 10 { lo += 1 } else { break }
+                }
+                while hi > lo {
+                    let b = bytes[hi - 1]
+                    if b == 32 || b == 9 || b == 13 || b == 10 { hi -= 1 } else { break }
+                }
+                if lo == 0 && hi == bytes.count {
+                    return .string(s)
+                }
+                return .string(String(decoding: bytes[lo..<hi], as: UTF8.self))
             }
             return args.first ?? .string("")
         case ".split":
@@ -4336,8 +4521,10 @@ public final class MIRInterpreter {
             }
             return args.first ?? .string("")
         case ".chars":
+            // The kernel's str.chars() is the SCALAR view (the char-Vec
+            // convention, _tg_str_chars) — never grapheme clusters.
             if !args.isEmpty, case .string(let s) = args[0] {
-                return makeArray(s.map { .char($0) })
+                return makeArray(s.unicodeScalars.map { .char(Character($0)) })
             }
             return .array([])
         case ".char_at":
@@ -4371,10 +4558,25 @@ public final class MIRInterpreter {
             }
             return .enumVal("Option", 1, .unit)
         case ".to_lowercase":
-            if case .string(let s) = args.first { return .string(s.lowercased()) }
+            // The kernel's _tg_string_tolower maps ONLY the ASCII uppercase
+            // bytes; non-ASCII bytes pass through unchanged (never the
+            // Unicode-wide case mapping).
+            if case .string(let s) = args.first {
+                let bytes = Array(s.utf8).map { b -> UInt8 in
+                    b >= 65 && b <= 90 ? b + 32 : b
+                }
+                return .string(String(decoding: bytes, as: UTF8.self))
+            }
             return args.first ?? .string("")
         case ".to_uppercase":
-            if case .string(let s) = args.first { return .string(s.uppercased()) }
+            // The kernel's _tg_string_toupper maps ONLY the ASCII lowercase
+            // bytes; non-ASCII bytes pass through unchanged.
+            if case .string(let s) = args.first {
+                let bytes = Array(s.utf8).map { b -> UInt8 in
+                    b >= 97 && b <= 122 ? b - 32 : b
+                }
+                return .string(String(decoding: bytes, as: UTF8.self))
+            }
             return args.first ?? .string("")
         case ".capitalize":
             if case .string(let s) = args.first { return .string(s.prefix(1).uppercased() + s.dropFirst()) }
@@ -4682,6 +4884,7 @@ public final class MIRInterpreter {
             return .string("")
         case "read_file", "fs::read_to_string", "fs::read_file", "std::fs::read_file", "std::fs::read_to_string":
             if let path = args.first?.displayString {
+                fputs("INTERP-DEBUG: read_file('\(path)')\n", stderr)
                 do {
                     let contents = try String(contentsOfFile: path, encoding: .utf8)
                     return .enumVal("Result", 0, .string(contents))
@@ -4757,7 +4960,9 @@ public final class MIRInterpreter {
         case "file_exists", "path_exists", "fs::file_exists", "fs::path_exists",
              "std::fs::file_exists", "std::fs::path_exists":
             if let path = args.first?.displayString {
-                return .bool(FileManager.default.fileExists(atPath: path))
+                let ok = FileManager.default.fileExists(atPath: path)
+                fputs("INTERP-DEBUG: file_exists('\(path)') = \(ok)\n", stderr)
+                return .bool(ok)
             }
             return .bool(false)
         case "mkdir_p", "create_dir_all", "fs::create_dir_all", "fs::mkdir_p",
@@ -4931,6 +5136,56 @@ public final class MIRInterpreter {
         // ── FFI stubs (no-ops in interpreter) ──────────────────
         case "sched_yield":
             return .int(0)
+
+        // ── __sync builtins (the kernel's codegen atomic arms, mirrored
+        //    in the interpreter's single-threaded model: the fence is a
+        //    no-op, the CAS family is the plain compare+swap with the
+        //    old-value return, fetch_and_add/sub are the plain slot
+        //    read-modify-write). The pointer argument is the projStatic
+        //    static-address place; the slot is keyed by the MirStatic
+        //    name — the same static store the writes use. ────────────
+        case "__sync_synchronize":
+            // A memory barrier — a no-op fence under the single-threaded
+            // interpreter model (the kernel's DMB ISH / MFENCE arms).
+            return .unit
+        case "__sync_bool_compare_and_swap_1":
+            // CAS on the byte: ptr, expected: u8, desired: u8 → Bool —
+            // true when the exchange succeeded (old value == expected).
+            guard let slotName = staticSlotForPointer(rawArgs, index: 0) else { return .bool(false) }
+            let old = staticStore[slotName] ?? .int(0)
+            let expected = args.count > 1 ? args[1] : .int(0)
+            let desired = args.count > 2 ? args[2] : .int(0)
+            if old.asInt == expected.asInt {
+                staticStore[slotName] = desired
+                return .bool(true)
+            }
+            return .bool(false)
+        case "__sync_val_compare_and_swap_uint", "__sync_val_compare_and_swap_4", "__sync_val_compare_and_swap_8":
+            // 32/64-bit CAS returning the ORIGINAL value (the kernel's
+            // __sync_val_compare_and_swap_uint / _4 / _8 arms).
+            guard let slotName = staticSlotForPointer(rawArgs, index: 0) else { return .int(0) }
+            let old = staticStore[slotName] ?? .int(0)
+            let expected = args.count > 1 ? args[1] : .int(0)
+            let desired = args.count > 2 ? args[2] : .int(0)
+            if old.asInt == expected.asInt {
+                staticStore[slotName] = desired
+            }
+            return old
+        case "__sync_fetch_and_add", "__sync_fetch_and_add_4", "__sync_fetch_and_add_8":
+            // Atomic add: returns the old value (the kernel's LDADDAL /
+            // LOCK xadd arms).
+            guard let slotName = staticSlotForPointer(rawArgs, index: 0) else { return .int(0) }
+            let old = staticStore[slotName] ?? .int(0)
+            let delta = args.count > 1 ? (args[1].asInt ?? 0) : 0
+            staticStore[slotName] = .int((old.asInt ?? 0) &+ delta)
+            return old
+        case "__sync_fetch_and_sub", "__sync_fetch_and_sub_4", "__sync_fetch_and_sub_8":
+            // Atomic subtract: returns the old value.
+            guard let slotName = staticSlotForPointer(rawArgs, index: 0) else { return .int(0) }
+            let old = staticStore[slotName] ?? .int(0)
+            let delta = args.count > 1 ? (args[1].asInt ?? 0) : 0
+            staticStore[slotName] = .int((old.asInt ?? 0) &- delta)
+            return old
         case "usleep":
             return .int(0)
         case "nanosleep":
@@ -5128,6 +5383,17 @@ public final class MIRInterpreter {
                     return deferResolvedUserCall(idx, args: args)
                 }
             }
+            // Kernel-classified always-intrinsic methods (types.tg's intrinsic
+            // table: `clone` -> IntrinsicId::Clone, `to_string` ->
+            // IntrinsicId::ToString for ANY receiver — the non-native-receiver
+            // redirect above kept these out of the fast-path switch, so mirror
+            // the kernel's classification here when no user method resolved).
+            if name == ".clone" {
+                return cloneValue(args.first ?? .unit)
+            }
+            if name == ".to_string" {
+                return .string(args.first?.displayString ?? "")
+            }
             // Try enum variant construction: TypeName::VariantName(args)
             if name.contains("::") {
                 let parts = name.split(separator: ":").map(String.init).filter { !$0.isEmpty }
@@ -5193,6 +5459,9 @@ public final class MIRInterpreter {
                 msg = "INTERPRETER: unknown function '\(name)' with \(args.count) args"
             } else {
                 msg = "INTERPRETER: unknown function '\(name)' with \(args.count) args [stack: \(stack)]"
+            }
+            if name.hasPrefix("__intrinsic_syscall") || name == "open" || name == "raw_open" || name == "read" || name == "raw_read" || name == "close" || name == "raw_stat" || name == "syscall" {
+                fputs("INTERP-DEBUG: unknown fn '\(name)' stack=\(stack)\n", stderr)
             }
             output.append(msg)
             runtimeError = msg
@@ -5539,6 +5808,23 @@ public final class MIRInterpreter {
         return program.functions[idx]
     }
 
+    /// The module-qualified entry fallback (the audit item 12): the MIR
+    /// function names carry the module qualification ("hello::main"), while
+    /// callers commonly spell the bare "main". The exact match is tried
+    /// first (findFunction); this fallback resolves the unique "::name"
+    /// suffix, and an ambiguous suffix set resolves deterministically (the
+    /// lexicographic first) instead of failing. A qualified spelling is
+    /// never suffix-rematched.
+    private func findEntryFallback(_ name: String) -> MirFunction? {
+        guard !name.contains("::") else { return nil }
+        let suffix = "::" + name
+        let matches = program.functions.filter { $0.name.hasSuffix(suffix) }
+        if matches.count == 1 {
+            return matches.first
+        }
+        return matches.sorted(by: { $0.name < $1.name }).first
+    }
+
     private func resolveFunctionCandidates(name: String, args: [MirValue]) -> [String] {
         // Fast path for simple names (no . prefix, no ::) — try exact match first,
         // then search for qualified variants (module::name) in the function index.
@@ -5660,6 +5946,11 @@ public final class MIRInterpreter {
 
     /// Run the Swift Lexer at native speed and convert the result to TG MirValues
     /// matching tg_compiler's LexResult { tokens: Vec[Token], errors: Vec[(String,Span)] }.
+    /// The lexer diagnostics are forwarded into the errors array (the audit
+    /// items 2/3 — the kernel's fail-closed numeric handling): a malformed
+    /// numeric literal (E1010/E1011/E1014 ...) is a LEXER error at the
+    /// literal's span that the interpreted tg compiler reports, never a
+    /// silently accepted token.
     private func nativeTokenize(source: String, path: String = "") -> MirValue {
         let diags = DiagnosticBag()
         let lexer = Lexer(source: source, fileID: 0, diagnostics: diags)
@@ -5685,9 +5976,15 @@ public final class MIRInterpreter {
             ]))
             i += consumed
         }
+
+        var errorValues: [MirValue] = []
+        for diag in diags.diagnostics where diag.severity == .error {
+            let spanVal = Self.spanValue(file: path, start: diag.span.start, end: diag.span.end)
+            errorValues.append(.tuple([.string("[\(diag.code)] \(diag.message)"), spanVal]))
+        }
         return .structVal("LexResult", [
             "tokens": makeArray(mirTokens),
-            "errors": .array([])
+            "errors": makeArray(errorValues)
         ])
     }
 
@@ -5718,8 +6015,28 @@ public final class MIRInterpreter {
 
         switch tok.kind {
         // ── Literals ──
-        case .integer(let s):    return (tkEnum(0, .int(MIRLowering.parseInt(s))), 1)
-        case .float(let s):      return (tkEnum(1, .float(Double(s.replacingOccurrences(of: "_", with: "")) ?? 0)), 1)
+        case .integer(let s):
+            // Fail-closed (the audit items 2/3): an unparseable literal is
+            // a reported failure, never the silent 0. The lexer validates
+            // numeric spellings, so nil here is an internal inconsistency
+            // that must surface.
+            guard let v = MIRLowering.parseInt(s) else {
+                let msg = "INTERPRETER: unparseable integer literal '\(s)' in the token interop — the parse failure is reported, never a silent 0"
+                output.append(msg)
+                runtimeError = msg
+                halted = true
+                return (tkEnum(0, .int(0)), 1)
+            }
+            return (tkEnum(0, .int(v)), 1)
+        case .float(let s):
+            guard let v = MIRLowering.parseFloatLiteral(s) else {
+                let msg = "INTERPRETER: unparseable float literal '\(s)' in the token interop — the parse failure is reported, never a silent 0.0"
+                output.append(msg)
+                runtimeError = msg
+                halted = true
+                return (tkEnum(1, .float(0.0)), 1)
+            }
+            return (tkEnum(1, .float(v)), 1)
         case .string(let s):     return (tkEnum(2, .string(s)), 1)
         case .char(let c):       return (tkEnum(3, .char(c)), 1)
         // ── Identifier (with TG-extra-keyword post-processing) ──
@@ -6550,6 +6867,8 @@ public struct MIRPrettyPrinter {
             return "Len(\(printPlace(place)))"
         case .cast(let op, let ty):
             return "\(printOperand(op)) as \(printType(ty))"
+        case .repeat(let op, let count):
+            return "[\(printOperand(op)); \(count)]"
         }
     }
 
@@ -6573,6 +6892,7 @@ public struct MIRPrettyPrinter {
             case .index(let id): s += "[_\(id)]"
             case .constantIndex(let i): s += "[\(i)]"
             case .downcast(let v): s += " as variant#\(v)"
+            case .projStatic(let staticName): s = "*\(staticName)"
             }
         }
         return s
@@ -6587,6 +6907,7 @@ public struct MIRPrettyPrinter {
         case .char(let c): return "'\(c)'"
         case .str(let s): return "\"\(s)\""
         case .fnItem(let n): return n
+        case .staticRef(let staticName): return "static \(staticName)"
         case .zeroSized: return "zst"
         }
     }
@@ -6599,7 +6920,11 @@ public struct MIRPrettyPrinter {
         case .float: return "Float"
         case .char: return "Char"
         case .string: return "String"
-        case .named(let n): return n
+        case .named(let n, let args):
+            // The generic instantiation rides in the args (the kernel's
+            // Type::Adt(TypeId, args) shape); printType renders it so the
+            // info survives into dumps.
+            return args.isEmpty ? n : "\(n)<\(args.map(printType).joined(separator: ", "))>"
         case .refInternal(let inner, let mutable): return "&\(mutable ? "mut " : "")\(printType(inner))"
         case .rawPtr(let inner): return "*\(printType(inner))"
         case .array(let inner, let size): return size.map { "[\(printType(inner)); \($0)]" } ?? "[\(printType(inner))]"
@@ -6621,6 +6946,6 @@ public struct MIRPrettyPrinter {
     }
 
     private func unOpStr(_ op: MirUnOp) -> String {
-        switch op { case .neg: return "Neg"; case .not: return "Not" }
+        switch op { case .neg: return "Neg"; case .not: return "Not"; case .bitNot: return "BitNot" }
     }
 }

@@ -172,6 +172,10 @@ public final class ASTVerifier {
                 verifyExpr(clause.condition)
                 verifyBlock(clause.body)
             }
+            for (pat, value) in e.elsifLet {
+                verifyPattern(pat)
+                verifyExpr(value)
+            }
             if let el = e.elseBlock { verifyBlock(el) }
             if let pat = e.ifLetPattern { verifyPattern(pat) }
             if let v = e.ifLetValue { verifyExpr(v) }

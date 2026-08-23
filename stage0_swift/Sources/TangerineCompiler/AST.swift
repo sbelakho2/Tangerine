@@ -914,12 +914,18 @@ public struct IfExpr {
     public var elseBlock: BlockBody?
     public var ifLetPattern: Pattern?
     public var ifLetValue: Expr?
+    /// if-let bindings carried by the elsif clauses (parallel to
+    /// elsifClauses; a clause with an entry here is `elsif let P = V` —
+    /// its synthesized condition is `true` and the pattern test IS the
+    /// branch condition). Never dropped at the AST level.
+    public var elsifLet: [(pattern: Pattern, value: Expr)]
     public var span: Span
 
     public init(condition: Expr, thenBlock: BlockBody,
                 elsifClauses: [(condition: Expr, body: BlockBody)] = [],
                 elseBlock: BlockBody? = nil,
                 ifLetPattern: Pattern? = nil, ifLetValue: Expr? = nil,
+                elsifLet: [(pattern: Pattern, value: Expr)] = [],
                 span: Span) {
         self.condition = condition
         self.thenBlock = thenBlock
@@ -927,6 +933,7 @@ public struct IfExpr {
         self.elseBlock = elseBlock
         self.ifLetPattern = ifLetPattern
         self.ifLetValue = ifLetValue
+        self.elsifLet = elsifLet
         self.span = span
     }
 }

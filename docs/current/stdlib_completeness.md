@@ -30,9 +30,9 @@ impossible by construction.
 | Family | Minimum proof (the contract) | Modules |
 |--------|-------------------------------|---------|
 | `kernel` | the bootstrap ladder compiles the module at every stage (bootstrap/compiler_kernel.manifest + run_bootstrap.sh); the E106 sweep keeps it parse-clean | 14 |
-| `native` | a committed native behavior suite (tests/unit/*_rigor.tg, tests/*_test.tg) exercises the module's public API via `tg test` | 45 |
+| `native` | a committed native behavior suite (tests/unit/*_rigor.tg, tests/*_test.tg) exercises the module's public API via `tg test` | 48 |
 | `lane` | a committed CI lane verifies check + object + link/import smoke and the module's own @test suites where declared | 7 |
-| `parse-clean` | the E106 sweep only: `tg check` zero-diagnostics + the forbidden-syntax backstop (tests/run_stdlib_e106_sweep.sh) | 48 |
+| `parse-clean` | the E106 sweep only: `tg check` zero-diagnostics + the forbidden-syntax backstop (tests/run_stdlib_e106_sweep.sh) | 45 |
 | `experimental` | parse-clean only; the module is flagged experimental (item 33 stable-subset policy) and is EXPLICITLY EXCLUDED from the shipped-std behavior claims | 18 |
 
 - **kernel** — the 14-module bootstrap closure (`bootstrap/compiler_kernel.manifest`)
@@ -72,7 +72,7 @@ impossible by construction.
 | `blas` | parse-clean | `tests/run_stdlib_e106_sweep.sh` |
 | `budget` | parse-clean | `tests/run_stdlib_e106_sweep.sh` |
 | `capabilities` | native | `tests/unit/test_capability.tg` |
-| `cbor` | parse-clean | `tests/run_stdlib_e106_sweep.sh` |
+| `cbor` | native | `tests/unit/test_cbor_rigor.tg` — the RFC 8949 vector suite: the Appendix A definite + indefinite-length forms (additional info 31, the 0xFF break), the strict decode, and the encode round-trips |
 | `cli` | native | `tests/unit/test_cli_rigor.tg` |
 | `cocoa` | experimental | `tests/run_stdlib_e106_sweep.sh`; `tests/platform/cocoa_ffi_smoke_test.tg` — the ObjC FFI round trip (get_nsstring / nsstring_to_string through objc_getClass / sel_registerName / objc_msgSend) is the macOS-host smoke |
 | `collections` | kernel | `bootstrap/compiler_kernel.manifest`; `tests/run_stdlib_e106_sweep.sh` |
@@ -92,7 +92,7 @@ impossible by construction.
 | `dynload` | parse-clean | `tests/run_stdlib_e106_sweep.sh` |
 | `effects` | experimental | `tests/run_stdlib_e106_sweep.sh` |
 | `embed_trace` | native | `tests/unit/test_embed_trace_rigor.tg` |
-| `embedded` | experimental | `tests/run_stdlib_e106_sweep.sh`; `tests/embedded/embedded_mmio_behavior_test.tg` — the volatile/MMIO Register abstraction, the bitfield helpers, the allocator-free ArrayVec/RingBuffer and the atomicity availability are host-tested; the bare-metal target row is the embedded-targets feature |
+| `embedded` | experimental | `tests/run_stdlib_e106_sweep.sh`; `tests/embedded/embedded_mmio_behavior_test.tg` — the volatile/MMIO Register abstraction, the bitfield helpers, the allocator-free ArrayVec/RingBuffer and the atomicity availability are host-tested; the bare-metal route (P0.2): aarch64-unknown-none is the REAL target (the aarch64 backend); the Thumb (thumbv6m/thumbv7em/thumbv8m.main) and RISC-V (riscv32imc/riscv32imac/riscv64gc) triples are HARD-REJECTED — no code generator, the stable diagnostic, no artifact |
 | `encoding` | native | `tests/unit/test_encoding_rigor.tg` |
 | `env` | kernel | `bootstrap/compiler_kernel.manifest`; `tests/run_stdlib_e106_sweep.sh` |
 | `exec` | native | `tests/exec_conservation_test.tg`; `tests/exec_admission_freeze_test.tg`; `tests/exec_global_executor_test.tg`; `tests/exec_par_family_test.tg`; `tests/exec_victim_range_test.tg` |
@@ -108,7 +108,7 @@ impossible by construction.
 | `gfx_gpu` | experimental | `tests/run_stdlib_e106_sweep.sh` — committed host-side rigor artifact(s) exist but are non-claiming for the unserved platform target |
 | `gpu` | experimental | `tests/run_stdlib_e106_sweep.sh`; `tests/gpu/gpu_software_backend_test.tg` — the software/reference backend (the device enumeration, the mapped-host-pointer buffers, the opcode-parse kernel compile + the elementwise CPU dispatch) is host-tested; the hardware backends probe-and-fail-closed |
 | `gpu_metal` | experimental | `tests/run_stdlib_e106_sweep.sh` |
-| `gpu_vulkan` | experimental | `tests/run_stdlib_e106_sweep.sh` |
+| `gpu_vulkan` | experimental | `tests/run_stdlib_e106_sweep.sh` — the physical-device properties are UNSUPPORTED (P1.11) — the vkGetPhysicalDeviceProperties FFI is not bound to a Vulkan loader, so the enumeration returns the Unsupported error and never fabricates device values; the software/reference backend (std::gpu) is the supported path |
 | `gpu_webgpu` | experimental | `tests/run_stdlib_e106_sweep.sh` |
 | `graph` | native | `tests/unit/test_graph_rigor.tg` |
 | `gui` | experimental | `tests/run_stdlib_e106_sweep.sh`; `tests/gui/gui_software_canvas_test.tg` — the software CanvasBuffer rasterizer (clear/put_pixel/fill_rect/frame_rect/blit) is host-tested — the always-available rendering path |
@@ -121,7 +121,7 @@ impossible by construction.
 | `input` | parse-clean | `tests/run_stdlib_e106_sweep.sh` |
 | `io` | kernel | `bootstrap/compiler_kernel.manifest`; `tests/run_stdlib_e106_sweep.sh` |
 | `ios` | experimental | `tests/run_stdlib_e106_sweep.sh`; `tests/platform/platform_surface_smoke_test.tg` — the pure platform helpers (the device-name/version no-ops off-iOS) are host-tested |
-| `json` | parse-clean | `tests/run_stdlib_e106_sweep.sh` |
+| `json` | native | `tests/unit/test_json_rigor.tg` — the RFC 8259 document policy: parse_document = value + whitespace + required EOF — the JSONTestSuite n_* class (trailing data, the second value, the leading-zero prefix) is rejected |
 | `kernel` | experimental | `tests/run_stdlib_e106_sweep.sh`; `tests/kernel/kernel_primitives_test.tg` — the real implementations (the alpha stubs completed) — the round-robin scheduler, the CAS-backed mutex, the counting semaphore, the PCB table — are host-tested |
 | `linalg` | lane | `tests/run_stdlib_e106_sweep.sh`; `std/linalg.tg` |
 | `lint` | parse-clean | `tests/run_stdlib_e106_sweep.sh` |
@@ -143,7 +143,7 @@ impossible by construction.
 | `platform` | parse-clean | `tests/run_stdlib_e106_sweep.sh` |
 | `process` | kernel | `bootstrap/compiler_kernel.manifest`; `tests/run_stdlib_e106_sweep.sh` |
 | `profile` | parse-clean | `tests/run_stdlib_e106_sweep.sh` |
-| `rand` | native | `tests/rand_entropy_test.tg` |
+| `rand` | native | `tests/rand_entropy_test.tg`; `tests/unit/test_rand_behavior.tg` — the published reference vectors for every exported PRNG (xoshiro256++ rotl(s0 + s3, 23) + s0 formula; the ChaCha20 zero block; the PCG32 XSH-RR outputs) plus the entropy contract |
 | `random` | native | `tests/unit/test_random_rigor.tg` |
 | `regex` | parse-clean | `tests/run_stdlib_e106_sweep.sh` |
 | `replay` | parse-clean | `tests/run_stdlib_e106_sweep.sh` |
@@ -152,9 +152,9 @@ impossible by construction.
 | `semver` | parse-clean | `tests/run_stdlib_e106_sweep.sh` |
 | `serde` | native | `tests/unit/test_serde_rigor.tg` |
 | `signal` | parse-clean | `tests/run_stdlib_e106_sweep.sh` |
-| `simd` | experimental | `tests/run_stdlib_e106_sweep.sh` |
+| `simd` | experimental | `tests/run_stdlib_e106_sweep.sh` — the honest proof state (P1.12): the __intrinsic_simd_* externs, the aarch64 NEON + x86 SSE/AVX codegen arms and the vector-row layout ARE implemented; the NATIVE EXACT-VECTOR execution tests are NOT yet run (the tests/simd/ suite executes on the host; the machine-vector equality is unobserved at this SHA) |
 | `snapshot` | parse-clean | `tests/run_stdlib_e106_sweep.sh` |
-| `sql` | parse-clean | `tests/run_stdlib_e106_sweep.sh` |
+| `sql` | native | `tests/unit/test_sql_rigor.tg` — the facade SQL contract: PreparedStatement::execute is the explicit Err(Unsupported) — never the silent Ok(empty) result set — the concrete driver's Connection::execute is the execution surface |
 | `sqlite` | parse-clean | `tests/run_stdlib_e106_sweep.sh` |
 | `stats` | parse-clean | `tests/run_stdlib_e106_sweep.sh` |
 | `supply_chain` | native | `tests/unit/test_supply_chain_rigor.tg` |
