@@ -2262,9 +2262,15 @@ and check_name (env : env) (scope : scope) (expected : Type_repr.t option) (n : 
                                     (Printf.sprintf
                                        "`%s` is a function; call it with arguments (or pass it where a function type is expected)"
                                        n)))
-                    | None ->
-                        env.state.oracle.o_unresolved_calls <- env.state.oracle.o_unresolved_calls + 1;
-                        Error (err span (Printf.sprintf "unknown name `%s`" n))))
+                    | None -> (
+                        (* a type name used as a value: the static method
+                           dispatch's synthetic receiver (`Type::method`) *)
+                        match List.assoc_opt n env.types with
+                        | Some ty ->
+                            Ok { te_type = ty; te_effects = [| Access_effect.Read |]; te_span = span }
+                        | None ->
+                            env.state.oracle.o_unresolved_calls <- env.state.oracle.o_unresolved_calls + 1;
+                            Error (err span (Printf.sprintf "unknown name `%s`" n)))))
 
 and return_unify_err (span : Span.span) (a : Type_repr.t) (b : Type_repr.t) (m : string) :
     (typed_expr, string) result =
@@ -2334,9 +2340,18 @@ and check_call (env : env) (scope : scope) (expected : Type_repr.t option)
                         let mname = String.sub n (i + 2) (String.length n - i - 2) in
                         match List.assoc_opt (owner, mname) env.methods with
                         | Some sig_ ->
-                            if Array.length sig_.ts_params = 0 then
+                            (* prepend the synthetic receiver only when the
+                               method actually declares one (`self` as its
+                               first parameter) *)
+                            let has_self =
+                              Array.length sig_.ts_params > 0
+                              && Array.length sig_.ts_param_names > 0
+                              && sig_.ts_param_names.(0) = "self"
+                            in
+                            if not has_self then
                               (* a static/associated method without a receiver
-                                 (e.g. `Vec::new`): check the args as-is *)
+                                 (e.g. `Vec::new`, `Vec::with_capacity`):
+                                 check the args as-is *)
                               check_call_sig env scope expected sig_ targs args span
                             else
                               check_call_sig env scope expected sig_ targs
@@ -2373,7 +2388,12 @@ and check_call (env : env) (scope : scope) (expected : Type_repr.t option)
                               | alias_owner :: rest -> (
                                   match List.assoc_opt (alias_owner, mname) env.methods with
                                   | Some sig_ ->
-                                      if Array.length sig_.ts_params = 0 then
+                                      let has_self2 =
+                                        Array.length sig_.ts_params > 0
+                                        && Array.length sig_.ts_param_names > 0
+                                        && sig_.ts_param_names.(0) = "self"
+                                      in
+                                      if not has_self2 then
                                         check_call_sig env scope expected sig_ targs args span
                                       else
                                         check_call_sig env scope expected sig_ targs
@@ -2758,7 +2778,22 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
   in
   (* the nominal owner name (used by receiver unification below) *)
   let oname = match owner_name with Some n -> n | None -> "" in
-  match try_owners candidate_owners with
+  (* derived Clone: the kernel relies on Clone for its core types
+     (Type, Expr, Span, Option, ...) without declaring the impls; every
+     seed value is Clone-able, so synthesize the signature *)
+  let derived_clone () =
+    if mname <> "clone" then None
+    else
+      match owner_ty with
+      | Type_repr.Named _ | Type_repr.Fixed_array _ | Type_repr.Tuple _
+      | Type_repr.String | Type_repr.Int _ | Type_repr.Bool | Type_repr.Char
+      | Type_repr.Float _ | Type_repr.Type_param _ ->
+          Some
+            (mk_sig env.state ~name:("derived::" ^ oname ^ "::clone") ~params_decl:[]
+               ~params:[ ("self", Access_effect.Let, owner_ty) ] ~ret:owner_ty ~where:[])
+      | _ -> None
+  in
+  match (match try_owners candidate_owners with Some s -> Some s | None -> derived_clone ()) with
   | None ->
       env.state.oracle.o_unresolved_calls <- env.state.oracle.o_unresolved_calls + 1;
       Error
@@ -2930,6 +2965,7 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
                   (fun (k, v) -> if not (List.mem_assoc k !subst) then subst := (k, v) :: !subst)
                   !s3;
                 let ret = substitute_fixpoint !subst sig_.ts_return in
+
                 let sig_ids = List.map snd sig_.ts_params_decl in
                 let* () =
                   match List.filter (fun p -> List.mem p sig_ids) (params_in ret) with
@@ -3642,7 +3678,13 @@ let item_param_ids (env : env) (item : Ast.item) : Ids.Generic_param_id.t list =
       List.concat_map
         (fun (m : Ast.function_decl) ->
           match List.assoc_opt (d.i_target_type, m.fn_sig.sig_name) env.methods with
-          | Some s -> List.map snd s.ts_params_decl
+          | Some s ->
+              (* the impl's own type parameters appear in the method
+                 signature (self type, params, return): they are bound by
+                 the impl, so the oracle must not flag them *)
+              List.map snd s.ts_params_decl
+              @ List.concat_map (fun p -> params_in p.Type_repr.pt_type) (Array.to_list s.ts_params)
+              @ params_in s.ts_return
           | None -> [])
         d.i_methods
   | Ast.ConstDecl d -> (
