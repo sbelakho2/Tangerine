@@ -1378,7 +1378,15 @@ and parse_extern_function (p : parser) : Ast.item option =
     let params = parse_param_list p in
     let ret = parse_optional_return_type p in
     p.extern_abi_context <- was_intrinsic;
-    ignore (eat p Token.KwEnd);
+    (* An extern def's trailing `end` is only its own when it sits on the
+       SAME line (single-line form); inside an extern `do ... end` block
+       the block's closing `end` must not be consumed here. *)
+    if at p Token.KwEnd
+       && not
+            (source_has_newline p
+               (Span.make p.prev_end p.prev_end p.file_id)
+               (cur_span p))
+    then ignore (advance p);
     let sig_rec =
       {
         Ast.sig_name = name;

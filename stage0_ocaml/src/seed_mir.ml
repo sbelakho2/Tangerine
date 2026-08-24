@@ -38,12 +38,8 @@
    callee payloads are registry indices owned by the Seed VM layer; they
    are opaque to this module. *)
 
-type int_value = {
-  width : int;             (* 8 | 16 | 32 | 64 | 128 *)
-  signed : bool;
-  bits_lo : int64;         (* low 64 bits *)
-  bits_hi : int64;         (* high 64 bits; must be 0 for width <= 64 *)
-}
+(* The typed-bitvector integer authority (audit §38). *)
+type int_value = Int_value.t
 
 type constant =
   | Unit

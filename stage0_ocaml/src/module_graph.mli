@@ -19,6 +19,7 @@ type t = {
 and state
 
 val create : Bootstrap_manifest.t -> Diagnostic.bag -> t
+val create_with_root : string -> Bootstrap_manifest.t -> Diagnostic.bag -> t
 val source_map : t -> Span.source_map
 val find_module_by_path : t -> string list -> module_node option
 val find_module_by_id : t -> Ids.Module_id.t -> module_node option

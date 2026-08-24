@@ -38,9 +38,10 @@ type t = {
 
 let join_path (p : string list) : string = String.concat "::" p
 
-let parse_one (sm : Span.source_map) (entry : Bootstrap_manifest.module_entry)
+let parse_one (sm : Span.source_map) (repo_root : string) (entry : Bootstrap_manifest.module_entry)
     (diags : Diagnostic.bag) : Ast.program option =
-  match Source_loader.load entry.Bootstrap_manifest.file with
+  let full = Filename.concat repo_root entry.Bootstrap_manifest.file in
+  match Source_loader.load full with
   | Error _ ->
       Diagnostic.error diags "E1000"
         (Printf.sprintf "cannot read source file '%s' for module '%s'"
@@ -60,7 +61,11 @@ let parse_one (sm : Span.source_map) (entry : Bootstrap_manifest.module_entry)
 let module_name_segments (name : string) : string list =
   String.split_on_char ':' name |> List.filter (fun s -> s <> "")
 
-let create (manifest : Bootstrap_manifest.t) (diags : Diagnostic.bag) : t =
+let rec create (manifest : Bootstrap_manifest.t) (diags : Diagnostic.bag) : t =
+  create_with_root "." manifest diags
+
+and create_with_root (repo_root : string) (manifest : Bootstrap_manifest.t)
+    (diags : Diagnostic.bag) : t =
   let sm = Span.create () in
   let next_id = ref 0 in
   let nodes = ref [] in
@@ -117,7 +122,7 @@ let create (manifest : Bootstrap_manifest.t) (diags : Diagnostic.bag) : t =
   in
   List.iter
     (fun entry ->
-      match parse_one sm entry diags with
+      match parse_one sm repo_root entry diags with
       | None -> ()
       | Some program ->
           let fid = assign_id () in

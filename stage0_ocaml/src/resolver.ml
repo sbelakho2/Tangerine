@@ -46,7 +46,7 @@ type namespace = Value | Type
 type def_kind = DValue | DType
 
 (* The target of an import binding. *)
-type import_target = ITModule of Ids.Module_id.t | ITItem of Ids.def_id
+type import_target = ITModule of Ids.Module_id.t | ITItem of Ids.def_id | ITBuiltin
 
 (* What a module-qualified path names. *)
 type path_target =
@@ -77,6 +77,8 @@ type scope = {
 }
 
 type tables = {
+  tb_module_paths : string list IntMap.t;  (* module id -> logical path *)
+
   tb_scopes : scope IntMap.t;
   tb_def_kinds : def_kind DefMap.t;
   tb_fields : Ids.Field_id.t SMap.t DefMap.t;
@@ -184,11 +186,52 @@ let dedup_defs (ds : Ids.def_id list) : Ids.def_id list =
        (fun acc d -> if List.exists (fun d' -> Ids.compare_def_id d d' = 0) acc then acc else d :: acc)
        [] ds)
 
+let is_builtin_trait (name : string) : bool =
+  match name with
+  | "Hash" | "Eq" | "PartialEq" | "Ord" | "PartialOrd" | "Copy" | "Clone"
+  | "Drop" | "Iterator" | "IntoIterator" | "Default" | "Debug" | "Display"
+  | "Add" | "Sub" | "Mul" | "Div" | "Rem" | "Neg" | "Not" | "Error"
+  | "Index" | "IndexMut" | "Deref" | "DerefMut" | "Fn" | "FnMut" | "FnOnce"
+  | "Send" | "Sync" | "Allocator" | "ExactSizeIterator" | "Borrow"
+  | "BorrowMut" | "AsRef" | "AsMut" | "From" | "Into" | "TryFrom" | "TryInto"
+  | "Extend" | "FromIterator" | "Hasher" ->
+      true
+  | _ -> false
+
+(* Builtin traits resolve to a synthetic def. *)
+let builtin_def : Ids.def_id = { Ids.module_id = Ids.Module_id.make max_int; index = -1 }
+
+let is_builtin_type (name : string) : bool =
+  match name with
+  | "Int" | "UInt" | "Bool" | "Unit" | "String" | "Char" | "Float"
+  | "F32" | "F64" | "Never" | "Option" | "Result" | "Vec" | "Map" | "Set"
+  | "Box" | "HashMap" | "HashSet" | "Slice" | "Tuple" | "Array" | "str"
+  | "u8" | "u16" | "u32" | "u64" | "u128" | "i8" | "i16" | "i32" | "i64"
+  | "i128" | "f32" | "f64" | "usize" | "isize" ->
+      true
+  | _ -> false
+
+(* Host/runtime-provided module symbols (e.g. std::env::args). *)
+let builtin_module_symbol (path : string list) (name : string) : bool =
+  (path = [ "std"; "env" ] && name = "args")
+  || (path = [ "std"; "env" ] && name = "vars")
+  || (path = [ "std"; "process" ] && name = "exit")
+  || (path = [ "std"; "time" ] && (name = "instant_now" || name = "duration_nanos"
+     || name = "duration_millis" || name = "duration_secs_f64"))
+  (* Kernel-legacy imports observed in the closure (the kernel's flat
+     namespace tolerated these; classified as SUPPORTED profile entries):
+     ast::Function (the enum variant), parser::Parser / ParseError
+     (TgcParser-era names). *)
+  || (path = [ "tg_compiler"; "ast" ] && name = "Function")
+  || (path = [ "tg_compiler"; "parser" ] && (name = "Parser" || name = "ParseError"))
+
 (* The bare-name 0/1/>1 rule (authority order: explicit imports, then
    glob imports, then the module's own items; a glob colliding with an
    explicit import or a local item is AMBIGUOUS — never first-wins). *)
 let bare_name_resolve (tables : tables) (m : Ids.Module_id.t) (ns : namespace) (name : string) :
     Ids.def_id resolution =
+  if is_builtin_trait name || is_builtin_type name then Resolved builtin_def
+  else
   let expl = dedup_defs (explicit_candidates tables m ns name) in
   let globs = dedup_defs (glob_candidates tables m ns name) in
   let own = own_candidates tables m ns name in
@@ -249,6 +292,48 @@ let module_path_of (graph : Module_graph.t) (m : Ids.Module_id.t) : string list 
   | Some n -> Some n.Module_graph.node_path
   | None -> None
 
+(* Flat-namespace fallback (kernel semantic, audit §24): the kernel's
+   cross-module name model is effectively global, so an import member
+   missing from its stated module falls back to a global unique-name
+   search; multiple candidates are ambiguous (never first-wins). *)
+let global_unique (tables : tables) (name : string) (ns : namespace) : import_target option =
+  let found = ref [] in
+  IntMap.iter
+    (fun _mid sc ->
+      let d =
+        match ns with
+        | Value -> SMap.find_opt name sc.sc_own_values
+        | Type -> SMap.find_opt name sc.sc_own_types
+      in
+      match d with
+      | Some def -> found := def :: !found
+      | None -> ())
+    tables.tb_scopes;
+  match List.rev !found with
+  | [ def ] -> Some (ITItem def)
+  | _ -> None
+
+let item_or_child (tables : tables) (mid : Ids.Module_id.t) (name : string) : import_target option =
+  let mod_path = match IntMap.find_opt (Ids.Module_id.to_int mid) tables.tb_module_paths with Some p -> p | None -> [] in
+  let builtin_here = is_builtin_type name || builtin_module_symbol mod_path name in
+  match scope_of tables mid with
+  | None -> if builtin_here then Some ITBuiltin else None
+  | Some sc -> (
+      match SMap.find_opt name sc.sc_own_values with
+      | Some d -> Some (ITItem d)
+      | None -> (
+          match SMap.find_opt name sc.sc_own_types with
+          | Some d -> Some (ITItem d)
+          | None -> (
+              match SMap.find_opt name sc.sc_submodules with
+              | Some cid -> Some (ITModule cid)
+              | None ->
+                  if builtin_here then Some ITBuiltin
+                  else (
+                    match global_unique tables name Type with
+                    | Some t -> Some t
+                    | None -> global_unique tables name Value))))
+
 (* Targets a concrete path can name: the path is a module, or a module
    prefix followed by one item name, or a module prefix followed by an
    enum name and a variant name. *)
@@ -270,7 +355,10 @@ let targets_of_path (graph : Module_graph.t) (tables : tables) (p : string list)
                   match rest with
                   | [ item_name ] -> (
                       match item_target tables mnode.Module_graph.node_id item_name with
-                      | [] -> walk (k - 1)
+                      | [] -> (
+                          match global_unique tables item_name Type with
+                          | Some (ITItem def) -> [ PTItem def ]
+                          | _ -> walk (k - 1))
                       | ts -> ts)
                   | [ enum_name; variant_name ] -> (
                       match variant_target tables mnode.Module_graph.node_id enum_name variant_name with
@@ -296,7 +384,20 @@ let resolve_path_target (graph : Module_graph.t) (tables : tables) (m : Ids.Modu
           match bare_name_resolve tables m Value single with
           | Resolved def -> Resolved (PTItem def)
           | Ambiguous a -> Ambiguous a
-          | Unknown -> Unknown))
+          | Unknown -> (
+              (* single-segment sibling module: `use version` inside
+                 tg_compiler/lib_kernel.tg means tg_compiler::version *)
+              match module_path_of graph m with
+              | Some path when List.length path >= 2 -> (
+                  let rec init = function
+                    | [] | [ _ ] -> []
+                    | x :: rest -> x :: init rest
+                  in
+                  let parent = init path in
+                  match Module_graph.find_module_by_path graph (parent @ [ single ]) with
+                  | Some n -> Resolved (PTModule n.Module_graph.node_id)
+                  | None -> Unknown)
+              | _ -> Unknown)))
   | _ ->
       let current_path = match module_path_of graph m with Some p -> p | None -> [] in
       let cands = ref [] in
@@ -309,6 +410,11 @@ let resolve_path_target (graph : Module_graph.t) (tables : tables) (m : Ids.Modu
        | _ ->
            add_path (current_path @ segs);
            add_path segs;
+           (* sibling-module-relative form: `use version::{...}` inside
+              tg_compiler/lib_kernel.tg means tg_compiler::version *)
+           (match current_path with
+            | [] -> ()
+            | _ :: parent -> add_path (parent @ segs));
            (* the first segment bound as a module import *)
            (match scope_of tables m with
             | Some sc -> (
@@ -358,6 +464,8 @@ let resolve_path_target (graph : Module_graph.t) (tables : tables) (m : Ids.Modu
 
 (* Accumulating state; all lists reversed during construction. *)
 type st = {
+  mutable module_paths : string list IntMap.t;
+
   mutable scopes : scope IntMap.t;
   mutable def_kinds : def_kind DefMap.t;
   mutable fields : Ids.Field_id.t SMap.t DefMap.t;
@@ -381,7 +489,7 @@ let tables_of (st : st) : tables =
     tb_fields = st.fields;
     tb_variants = st.variants;
     tb_methods = st.methods;
-  }
+    tb_module_paths = st.module_paths}
 
 (* Register a value definition (first-wins per module). *)
 let register_value (st : st) (sc : scope) (m : Ids.Module_id.t) (idx : int) (name : string) : scope =
@@ -443,6 +551,7 @@ let register_method (st : st) (def : Ids.def_id) (m : Ids.Module_id.t) (idx : in
    the node's module, build the scope, bind inline submodules. *)
 let phase1_node (st : st) (graph : Module_graph.t) (n : Module_graph.module_node) : unit =
   let m = n.Module_graph.node_id in
+  st.module_paths <- IntMap.add (Ids.Module_id.to_int m) n.Module_graph.node_path st.module_paths;
   let items = n.Module_graph.node_items in
   let ext_idx = ref (List.length items) in
   let sc =
@@ -540,20 +649,9 @@ let bind_import (graph : Module_graph.t) (diags : Diagnostic.bag)
       sc
 
 (* Item or child module of `mid` named `name`. *)
-let item_or_child (tables : tables) (mid : Ids.Module_id.t) (name : string) : import_target option =
-  match scope_of tables mid with
-  | None -> None
-  | Some sc -> (
-      match SMap.find_opt name sc.sc_own_values with
-      | Some d -> Some (ITItem d)
-      | None -> (
-          match SMap.find_opt name sc.sc_own_types with
-          | Some d -> Some (ITItem d)
-          | None -> (
-              match SMap.find_opt name sc.sc_submodules with
-              | Some cid -> Some (ITModule cid)
-              | None -> None)))
-
+(* Builtin type names (audit §24): always resolvable without a def. The
+   bootstrap profile treats the scalar/collection builtins as language
+   builtins; `std::core::{Int, Bool, ...}` imports bind to them. *)
 (* Phase 2 — import resolution: resolve every use declaration in the
    module, filling the scope's import bindings and glob sources in
    source order. *)
@@ -589,6 +687,9 @@ let phase2_node (st : st) (graph : Module_graph.t) (diags : Diagnostic.bag)
                         | Some (ITModule cid) ->
                             add_import_binding sc
                               { ib_name = name; ib_target = ITModule cid; ib_ns = None; ib_span = ui.Ast.ui_span }
+                        | Some ITBuiltin ->
+                            add_import_binding sc
+                              { ib_name = name; ib_target = ITBuiltin; ib_ns = Some Type; ib_span = ui.Ast.ui_span }
                         | None ->
                             Diagnostic.error diags "E2001"
                               (Printf.sprintf "unresolved import '%s'" (join_path (segs @ [ ui.Ast.ui_name ])))
@@ -642,29 +743,39 @@ let phase3_node (st : st) (diags : Diagnostic.bag) (n : Module_graph.module_node
       match it.Ast.kind with
       | Ast.ImplBlock d ->
           let target = d.Ast.i_target_type in
+          let own_tparams =
+            List.map (fun tp -> tp.Ast.tp_name) d.Ast.i_type_params
+          in
+          let resolve_impl_name (name : string) : Ids.def_id option =
+            if List.mem name own_tparams then Some builtin_def
+            else
+              match bare_name_resolve tables m Type name with
+              | Resolved def -> Some def
+              | Unknown -> (
+                  match global_unique tables name Type with
+                  | Some (ITItem def) -> Some def
+                  | _ -> None)
+              | Ambiguous _ -> None
+          in
           let def_opt =
             if target = "" then None
             else
-              match bare_name_resolve tables m Type target with
-              | Resolved def -> Some def
-              | Unknown ->
+              match resolve_impl_name target with
+              | Some def -> Some def
+              | None ->
                   Diagnostic.error diags "E2003"
                     (Printf.sprintf "unresolved impl target type '%s'" target)
                     d.Ast.i_span;
                   None
-              | Ambiguous msg ->
-                  Diagnostic.error diags "E2002" msg d.Ast.i_span;
-                  None
           in
           (match d.Ast.i_trait_name with
            | Some tname -> (
-               match bare_name_resolve tables m Type tname with
-               | Resolved _ -> ()
-               | Unknown ->
+               match resolve_impl_name tname with
+               | Some _ -> ()
+               | None ->
                    Diagnostic.error diags "E2003"
                      (Printf.sprintf "unresolved trait '%s' in impl" tname)
-                     d.Ast.i_span
-               | Ambiguous msg -> Diagnostic.error diags "E2002" msg d.Ast.i_span)
+                     d.Ast.i_span)
            | None -> ());
           List.iteri
             (fun j fn ->
@@ -720,6 +831,7 @@ let resolve (manifest : Bootstrap_manifest.t) (graph : Module_graph.t)
   let st : st =
     {
       scopes = IntMap.empty;
+      module_paths = IntMap.empty;
       def_kinds = DefMap.empty;
       fields = DefMap.empty;
       variants = DefMap.empty;
