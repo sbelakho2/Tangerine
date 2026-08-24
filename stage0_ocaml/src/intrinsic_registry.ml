@@ -153,8 +153,15 @@ let signature_to_string (s : signature) : string =
 (* ———————————————————————————————————————————————————————————————
    The manifest closure's intrinsic surface: std/collections.tg's extern
    declarations for the map/set record-visit traversal and the set
-   algebra. Signatures transcribed exactly (inout/sink access qualifiers
-   are source-level only and have no place in the signature type). *)
+   algebra, plus the I/O and scalar-conversion surface that the host
+   binding table implements (std/io.tg print/println conventions,
+   std/core.tg's __intrinsic_* string conversions and abort).
+   Signatures transcribed exactly (inout/sink access qualifiers are
+   source-level only and have no place in the signature type).
+
+   Ids are stable 0-based manifest-order indices. Existing ids are
+   appended to, never renumbered: a host program's intrinsic callee
+   indices remain valid across registry edits. *)
 
 let manifest : t =
   let entries =
@@ -193,6 +200,17 @@ let manifest : t =
         sig_ ~params:[| set_of (param Type_param.t) |] ~ret:ty_unit );
       ( "__intrinsic_set_entries",
         sig_ ~params:[| set_of (param Type_param.t) |] ~ret:(vec_of (param Type_param.t)) );
+      (* I/O and conversion surface with real host semantics; the host
+         binding table (Host.binding_manifest) implements every one of
+         these. panic/abort raise a deterministic host error. *)
+      ("print", sig_ ~params:[| ty_string |] ~ret:ty_unit);
+      ("println", sig_ ~params:[| ty_string |] ~ret:ty_unit);
+      ("panic", sig_ ~params:[| ty_string |] ~ret:Type_repr.Never);
+      ("__intrinsic_abort", sig_ ~params:[||] ~ret:ty_unit);
+      ("__intrinsic_int_to_string", sig_ ~params:[| ty_int |] ~ret:ty_string);
+      ("__intrinsic_bool_to_string", sig_ ~params:[| ty_bool |] ~ret:ty_string);
+      ("__intrinsic_char_to_string", sig_ ~params:[| Type_repr.Char |] ~ret:ty_string);
+      ("__intrinsic_string_len", sig_ ~params:[| ty_string |] ~ret:ty_int);
     ]
   in
   let tbl = ref empty in

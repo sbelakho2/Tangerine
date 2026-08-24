@@ -25,11 +25,16 @@
      first, the capture tuple second.  ClosureAgg (inst, env_ops) builds a
      value of this shape.
 
-   Locals convention: a function's locals include its parameters as a
-   prefix — locals.(i) is the type of parameter i for i < |params| — and
-   locals.(0) is the RETURN SLOT, holding the function's return type
-   (the reference's "_ret" convention).  A function always has at least
-   one local.
+   Local convention (canonical): Local 0 is the RETURN SLOT, holding the
+   function's return type (the reference's "_ret" convention);
+   parameters occupy locals 1..n — local _(i+1) is the type slot of
+   parameter i.  A function always has at least one local.
+
+   Block convention: block ids are unique per function; the blocks array
+   is indexed by block id — ids must be exactly 0..n-1 and the array
+   position equals the id.  The verifier enforces this invariant: the
+   blocks array length equals the max id+1 and every id 0..n-1 is
+   present exactly once.
 
    Drop/Deinit payload: (place, continuation block, unwind block) — the
    int is the continuation target exactly like a Call's success block;

@@ -1043,7 +1043,17 @@ and resolve_named (env : env) (scope : scope) (span : Span.span) (name : string)
                             (Printf.sprintf
                                "associated type `%s` of `%s` is not available in the bootstrap subset"
                                assoc head))
-                   | Error m -> Error m))
+                   | Error _ -> (
+                       (* flat-namespace fallback: a module-qualified type
+                          spelling resolves by its last segment *)
+                       let last =
+                         match List.rev (String.split_on_char ':' name) with
+                         | x :: _ -> x
+                         | [] -> name
+                       in
+                       match List.assoc_opt last env.types with
+                       | Some entry -> Ok entry
+                       | None -> Error (err span ("unknown type `" ^ name ^ "`")))))
           | None -> (
               match List.assoc_opt name env.types with
               | None -> Error (err span ("unknown type `" ^ name ^ "`"))
@@ -2263,6 +2273,17 @@ and check_where_obligations (env : env) (span : Span.span) (owner : string)
   in
   go_wps wps
 
+(* Flat-namespace lookup: the kernel calls functions by bare name across
+   modules; resolve a bare name to its unique closure-wide signature. *)
+and lookup_function (env : env) (n : string) : typed_signature option =
+  let all = env.functions in
+  match List.assoc_opt n all with
+  | Some f -> Some f
+  | None -> (
+      match List.filter (fun (k, _) -> Util.has_suffix k ("::" ^ n)) all with
+      | [ (_, f) ] -> Some f
+      | _ -> None)
+
 and check_call (env : env) (scope : scope) (expected : Type_repr.t option)
     (callee : Ast.expr) (targs : Ast.type_expr list) (args : Ast.call_arg list)
     (span : Span.span) : (typed_expr, string) result =
@@ -2277,11 +2298,66 @@ and check_call (env : env) (scope : scope) (expected : Type_repr.t option)
           match List.assoc_opt n env.constructors with
           | Some cs -> check_call_sig env scope expected cs targs args span
           | None -> (
-              match List.assoc_opt n env.functions with
+              match lookup_function env n with
               | Some fs -> check_call_sig env scope expected fs targs args span
-              | None ->
-                  env.state.oracle.o_unresolved_calls <- env.state.oracle.o_unresolved_calls + 1;
-                  Error (err span (Printf.sprintf "unknown function `%s`" n)))))
+              | None -> (
+                  (* static method call `Type::method(...)`: the receiver is
+                     the type itself; check args against params 1.. *)
+                  match String.index_opt n ':' with
+                  | Some i -> (
+                      if i + 2 >= String.length n then
+                        Error (err span (Printf.sprintf "unknown function `%s`" n))
+                      else
+                        let owner = String.sub n 0 i in
+                        let mname = String.sub n (i + 2) (String.length n - i - 2) in
+                        match List.assoc_opt (owner, mname) env.methods with
+                        | Some sig_ ->
+                            if Array.length sig_.ts_params = 0 then
+                              (* a static/associated method without a receiver
+                                 (e.g. `Vec::new`): check the args as-is *)
+                              check_call_sig env scope expected sig_ targs args span
+                            else
+                              check_call_sig env scope expected sig_ targs
+                                ({ Ast.ca_label = None;
+                                   ca_value = Ast.Name (owner, span);
+                                   ca_span = span }
+                                :: args)
+                                span
+                        | None -> (
+                            (* alias fallback: `Vec` is a builtin alias of the
+                               kernel's `Array`; the builtin nominal may carry
+                               several names; try each *)
+                            let owner_nom_names =
+                              match List.assoc_opt owner env.types with
+                              | Some (Type_repr.Named (tid, _)) ->
+                                  List.filter_map
+                                    (fun (t, n) ->
+                                      if Ids.Type_id.compare t tid = 0 then Some n else None)
+                                    env.type_names
+                              | _ -> []
+                            in
+                            let rec try_aliases = function
+                              | [] ->
+                                  env.state.oracle.o_unresolved_calls <- env.state.oracle.o_unresolved_calls + 1;
+                                  Error (err span (Printf.sprintf "unknown function `%s`" n))
+                              | alias_owner :: rest -> (
+                                  match List.assoc_opt (alias_owner, mname) env.methods with
+                                  | Some sig_ ->
+                                      if Array.length sig_.ts_params = 0 then
+                                        check_call_sig env scope expected sig_ targs args span
+                                      else
+                                        check_call_sig env scope expected sig_ targs
+                                          ({ Ast.ca_label = None;
+                                             ca_value = Ast.Name (owner, span);
+                                             ca_span = span }
+                                          :: args)
+                                          span
+                                  | None -> try_aliases rest)
+                            in
+                            try_aliases owner_nom_names))
+                  | _ ->
+                      env.state.oracle.o_unresolved_calls <- env.state.oracle.o_unresolved_calls + 1;
+                      Error (err span (Printf.sprintf "unknown function `%s`" n))))))
   | Ast.Path (a, b, _) ->
       check_call env scope expected (Ast.Name (a ^ "::" ^ b, Span.synthetic)) targs args span
   | Ast.Field (base, mname, _) -> check_method_call env scope expected base mname targs args span
@@ -2409,11 +2485,65 @@ and check_call_sig (env : env) (scope : scope) (expected : Type_repr.t option)
                         !s2;
                       let eff = Access_effect.read_effect sig_.ts_params.(i).Type_repr.pt_convention in
                       go (ate :: acc) (eff :: effects) (i + 1) rest)
-                  | Error m ->
-                      Error
-                        (err a.Ast.ca_span
-                           (Printf.sprintf "argument %d type mismatch: expected %s, found %s (%s)"
-                              (i + 1) (type_to_string pt) (type_to_string ate.te_type) m)))
+                  | Error m -> (
+                      (* builtin/kernel nominal duality: a user type that
+                         replaced a builtin unifies with the builtin by name *)
+                      let same_named_arg () =
+                        match pt, ate.te_type with
+                        | Type_repr.Named (id1, a1), Type_repr.Named (id2, a2)
+                          when Ids.Type_id.compare id1 id2 <> 0 -> (
+                            match List.assoc_opt id1 env.type_names, List.assoc_opt id2 env.type_names with
+                            | Some n, Some m2 when n = m2 ->
+                                if Array.length a1 <> Array.length a2 then None
+                                else begin
+                                  let s4 = ref [] in
+                                  let rec go i =
+                                    if i >= Array.length a1 then Some ()
+                                    else
+                                      match unify s4 a1.(i) a2.(i) with
+                                      | Ok () -> go (i + 1)
+                                      | Error _ -> None
+                                  in
+                                  match go 0 with
+                                  | Some () ->
+                                      List.iter
+                                        (fun (k, v) ->
+                                          if not (List.mem_assoc k !subst) then subst := (k, v) :: !subst)
+                                        !s4;
+                                      Some ()
+                                  | None -> None
+                                end
+                            | _ -> None)
+                        | _ -> None
+                      in
+                      match same_named_arg () with
+                      | Some () ->
+                          let eff = Access_effect.read_effect sig_.ts_params.(i).Type_repr.pt_convention in
+                          go (ate :: acc) (eff :: effects) (i + 1) rest
+                      | None -> (
+                      (* Tangerine call-site coercion: an explicit-ref argument
+                         `&x`/`&mut x` to a by-value parameter derefs to x *)
+                      match ate.te_type with
+                      | Type_repr.Ref_internal (_, inner) -> (
+                          let s3 = ref [] in
+                          match unify s3 pt inner with
+                          | Ok () ->
+                              List.iter
+                                (fun (k, v) ->
+                                  if not (List.mem_assoc k !subst) then subst := (k, v) :: !subst)
+                                !s3;
+                              let eff = Access_effect.read_effect sig_.ts_params.(i).Type_repr.pt_convention in
+                              go (ate :: acc) (eff :: effects) (i + 1) rest
+                          | Error _ ->
+                              Error
+                                (err a.Ast.ca_span
+                                   (Printf.sprintf "argument %d type mismatch: expected %s, found %s (%s)"
+                                      (i + 1) (type_to_string pt) (type_to_string ate.te_type) m)))
+                      | _ ->
+                          Error
+                            (err a.Ast.ca_span
+                               (Printf.sprintf "argument %d type mismatch: expected %s, found %s (%s)"
+                                  (i + 1) (type_to_string pt) (type_to_string ate.te_type) m)))))
             end)
       in
       go [] [] 0 args
@@ -2527,7 +2657,75 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
             let* () =
               match owner_ty, self_ty with
               | Type_repr.Fixed_array (t, _), Type_repr.Named (_, [| p |]) -> unify subst p t
-              | _ -> unify subst self_ty owner_ty
+              | _ -> (
+                  match unify subst self_ty owner_ty with
+                  | Ok () -> Ok ()
+                  | Error _ -> (
+                      (* a user type that replaced a builtin keeps the
+                         builtin-registered methods: unify by type NAME *)
+                      let same_name () =
+                        match self_ty, owner_ty with
+                        | Type_repr.Named (id1, a1), Type_repr.Named (id2, a2)
+                          when Ids.Type_id.compare id1 id2 <> 0 -> (
+                            (* the method key's owner name is the authority:
+                               the builtin Vec nominal is named "Array", so
+                               (Vec, len) matches a receiver named "Vec" *)
+                            let n1 = List.assoc_opt id1 env.type_names in
+                            let n2 = List.assoc_opt id2 env.type_names in
+                            let names_agree =
+                              match n1, n2 with
+                              | Some n, Some m -> n = m || n = oname || m = oname
+                              | _ -> false
+                            in
+                            match names_agree with
+                            | false -> None
+                            | true ->
+                                if Array.length a1 <> Array.length a2 then None
+                                else begin
+                                  let s4 = ref [] in
+                                  let rec go i =
+                                    if i >= Array.length a1 then Some ()
+                                    else
+                                      match unify s4 a1.(i) a2.(i) with
+                                      | Ok () -> go (i + 1)
+                                      | Error _ -> None
+                                  in
+                                  match go 0 with
+                                  | Some () ->
+                                      List.iter
+                                        (fun (k, v) ->
+                                          if not (List.mem_assoc k !subst) then subst := (k, v) :: !subst)
+                                        !s4;
+                                      Some ()
+                                  | None -> None
+                                end)
+                        | _ -> None
+                      in
+                      let deref_coerce () =
+                        match owner_ty with
+                        | Type_repr.Ref_internal (_, inner) -> (
+                            match unify subst self_ty inner with
+                            | Ok () -> Some ()
+                            | Error _ -> None)
+                        | _ -> (
+                            match self_ty with
+                            | Type_repr.Ref_internal (_, inner) -> (
+                                match unify subst inner owner_ty with
+                                | Ok () -> Some ()
+                                | Error _ -> None)
+                            | _ -> None)
+                      in
+                      match same_name () with
+                      | Some () -> Ok ()
+                      | None -> (
+                          match deref_coerce () with
+                          | Some () -> Ok ()
+                          | None ->
+                              Error
+                                (Printf.sprintf
+                                   "receiver type mismatch: %s.%s self %s receiver %s"
+                                   oname mname (type_to_string self_ty)
+                                   (type_to_string owner_ty)))))
             in
             let n_params = List.length sig_.ts_params_decl in
             if List.length targs > n_params then Error (err span "too many type arguments")
@@ -3074,86 +3272,124 @@ and register_item (env : env) (item : Ast.item) : (env, string) result =
         Ok { env with functions = (qname, sig_) :: env.functions }
       end
   | Ast.StructDef d -> (
-      if List.mem_assoc d.s_name env.nominals then
-        Error (err item.span (Printf.sprintf "duplicate type `%s`" d.s_name))
-      else begin
-        let params =
-          List.map (fun (tp : Ast.type_param) -> (tp.tp_name, fresh_param_id env.state))
-            d.s_type_params
-        in
-        let scope = { empty_scope with generics = params } in
-        let* fields =
-          let rec go acc = function
-            | [] -> Ok (List.rev acc)
-            | (f : Ast.field_decl) :: rest -> (
-                match resolve_type env scope f.f_type with
-                | Ok ft -> go ((f.f_name, ft) :: acc) rest
-                | Error m -> Error m)
-          in
-          go [] d.s_fields
-        in
-        let* where = resolve_where env scope d.s_where in
-        let tid = fresh_type_id env.state in
-        let param_tys = Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param p) params) in
-        let nom : nominal =
-          { nom_kind = `Struct; nom_params = params; nom_fields = fields; nom_variants = []; nom_where = where }
-        in
-        let env1 =
-          {
-            env with
-            types = (d.s_name, Type_repr.Named (tid, param_tys)) :: env.types;
-            type_ids = (d.s_name, tid) :: env.type_ids;
-            type_names = (tid, d.s_name) :: env.type_names;
-            nominals = (d.s_name, nom) :: env.nominals;
-          }
-        in
-        let env2 = { env1 with current_self = Some (Type_repr.Named (tid, param_tys)) } in
-        register_methods env2 d.s_name d.s_methods params where
-      end)
+      let params =
+        List.map (fun (tp : Ast.type_param) -> (tp.tp_name, fresh_param_id env.state))
+          d.s_type_params
+      in
+      let scope = { empty_scope with generics = params } in
+      (* re-registration merges newly resolvable fields into the nominal *)
+      let existing, env_base =
+        match List.assoc_opt d.s_name env.nominals with
+        | Some nom -> (Some nom, env)
+        | None ->
+            let tid = fresh_type_id env.state in
+            let param_tys = Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param p) params) in
+            let nom : nominal =
+              { nom_kind = `Struct; nom_params = params; nom_fields = []; nom_variants = []; nom_where = [] }
+            in
+            (* a user definition of a builtin name REPLACES the builtin *)
+            let env' =
+              {
+                env with
+                types = (d.s_name, Type_repr.Named (tid, param_tys)) :: List.remove_assoc d.s_name env.types;
+                type_ids = (d.s_name, tid) :: List.remove_assoc d.s_name env.type_ids;
+                type_names = (tid, d.s_name) :: env.type_names;
+                nominals = (d.s_name, nom) :: env.nominals;
+              }
+            in
+            (None, env')
+      in
+      let tid = List.assoc d.s_name env_base.type_ids in
+      let param_tys = Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param p) params) in
+      let env_fwd = env_base in
+      (* resolve fields one by one; unresolvable ones are reported and
+         retried by the driver *)
+      let fields_acc, errs =
+        List.fold_left
+          (fun (acc, errs) (f : Ast.field_decl) ->
+            if List.mem_assoc f.f_name acc then (acc, errs)
+            else
+              match resolve_type env_fwd scope f.f_type with
+              | Ok ft -> ((f.f_name, ft) :: acc, errs)
+              | Error m -> (acc, err item.span m :: errs))
+          (match existing with Some nom -> (nom.nom_fields, []) | None -> ([], []))
+          d.s_fields
+      in
+      let fields = List.rev fields_acc in
+      let* where =
+        match resolve_where env_fwd scope d.s_where with
+        | Ok w -> Ok w
+        | Error m -> Error m
+      in
+      let nom : nominal =
+        { nom_kind = `Struct; nom_params = params; nom_fields = fields; nom_variants = []; nom_where = where }
+      in
+      let env1 = { env_fwd with nominals = (d.s_name, nom) :: List.remove_assoc d.s_name env_fwd.nominals } in
+      let env2 = { env1 with current_self = Some (Type_repr.Named (tid, param_tys)) } in
+      match register_methods env2 d.s_name d.s_methods params where with
+      | Ok env3 -> (match errs with [] -> Ok env3 | e :: _ -> Error e)
+      | Error m -> Error m)
   | Ast.EnumDef d -> (
-      if List.mem_assoc d.e_name env.nominals then
-        Error (err item.span (Printf.sprintf "duplicate type `%s`" d.e_name))
-      else begin
-        let params =
-          List.map (fun (tp : Ast.type_param) -> (tp.tp_name, fresh_param_id env.state))
-            d.e_type_params
-        in
-        let scope = { empty_scope with generics = params } in
-        let* variants =
-          let rec go acc = function
-            | [] -> Ok (List.rev acc)
-            | (v : Ast.variant_decl) :: rest -> (
-                let* field_tys =
-                  let rec go2 acc2 = function
-                    | [] -> Ok (List.rev acc2)
-                    | (vf : Ast.variant_field) :: rest2 -> (
-                        match resolve_type env scope vf.vf_type with
-                        | Ok t -> go2 (t :: acc2) rest2
-                        | Error m -> Error m)
-                  in
-                  go2 [] v.v_fields
-                in
-                go ((v.v_name, Array.of_list field_tys) :: acc) rest)
-          in
-          go [] d.e_variants
-        in
-        let* where = resolve_where env scope d.e_where in
-        let tid = fresh_type_id env.state in
-        let param_tys = Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param p) params) in
-        let nom : nominal =
-          { nom_kind = `Enum; nom_params = params; nom_fields = []; nom_variants = variants; nom_where = where }
-        in
-        let env1 =
-          {
-            env with
-            types = (d.e_name, Type_repr.Named (tid, param_tys)) :: env.types;
-            type_ids = (d.e_name, tid) :: env.type_ids;
-            type_names = (tid, d.e_name) :: env.type_names;
-            nominals = (d.e_name, nom) :: env.nominals;
-          }
-        in
-        register_constructors env1 d.e_name tid params variants
-      end)
+      let params =
+        List.map (fun (tp : Ast.type_param) -> (tp.tp_name, fresh_param_id env.state))
+          d.e_type_params
+      in
+      let scope = { empty_scope with generics = params } in
+      let existing, env_base =
+        match List.assoc_opt d.e_name env.nominals with
+        | Some nom -> (Some nom, env)
+        | None ->
+            let tid = fresh_type_id env.state in
+            let param_tys = Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param p) params) in
+            let nom : nominal =
+              { nom_kind = `Enum; nom_params = params; nom_fields = []; nom_variants = []; nom_where = [] }
+            in
+            let env' =
+              {
+                env with
+                types = (d.e_name, Type_repr.Named (tid, param_tys)) :: List.remove_assoc d.e_name env.types;
+                type_ids = (d.e_name, tid) :: List.remove_assoc d.e_name env.type_ids;
+                type_names = (tid, d.e_name) :: env.type_names;
+                nominals = (d.e_name, nom) :: env.nominals;
+              }
+            in
+            (None, env')
+      in
+      let tid = List.assoc d.e_name env_base.type_ids in
+      let _param_tys = Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param p) params) in
+      let env_fwd = env_base in
+      let variants_acc, errs =
+        List.fold_left
+          (fun (acc, errs) (v : Ast.variant_decl) ->
+            if List.mem_assoc v.v_name acc then (acc, errs)
+            else
+              let field_tys, ferrs =
+                List.fold_left
+                  (fun (tys, ferrs) (vf : Ast.variant_field) ->
+                    match resolve_type env_fwd scope vf.vf_type with
+                    | Ok t -> (t :: tys, ferrs)
+                    | Error m -> (tys, err item.span m :: ferrs))
+                  ([], [])
+                  v.v_fields
+              in
+              ( (v.v_name, Array.of_list (List.rev field_tys)) :: acc,
+                ferrs @ errs ))
+          (match existing with Some nom -> (nom.nom_variants, []) | None -> ([], []))
+          d.e_variants
+      in
+      let variants = List.rev variants_acc in
+      let* where =
+        match resolve_where env_fwd scope d.e_where with
+        | Ok w -> Ok w
+        | Error m -> Error m
+      in
+      let nom : nominal =
+        { nom_kind = `Enum; nom_params = params; nom_fields = []; nom_variants = variants; nom_where = where }
+      in
+      let env1 = { env_fwd with nominals = (d.e_name, nom) :: List.remove_assoc d.e_name env_fwd.nominals } in
+      match register_constructors env1 d.e_name tid params variants with
+      | Ok env2 -> (match errs with [] -> Ok env2 | e :: _ -> Error e)
+      | Error m -> Error m)
   | Ast.TraitDef d ->
       let env1 =
         {
@@ -3346,20 +3582,87 @@ let run_impl_backstop (env : env) : string list =
 
 let check_item (env : env) (item : Ast.item) : (unit, string) result = check_item env item
 
+(* Phase A: declare every struct/enum name up front so in-module mutual
+   recursion (struct A referencing struct B defined later in the same
+   file) resolves; the fields/variants are filled in by phase B. *)
+let rec register_headers (env : env) (acc : string list) = function
+  | [] -> (env, List.rev acc)
+  | item :: rest -> (
+      match item.Ast.kind with
+      | Ast.StructDef d ->
+          if List.mem_assoc d.s_name env.nominals then register_headers env acc rest
+          else begin
+            let params =
+              List.map (fun (tp : Ast.type_param) -> (tp.tp_name, fresh_param_id env.state))
+                d.s_type_params
+            in
+            let tid = fresh_type_id env.state in
+            let param_tys = Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param p) params) in
+            let nom : nominal =
+              { nom_kind = `Struct; nom_params = params; nom_fields = []; nom_variants = []; nom_where = [] }
+            in
+            let env' =
+              {
+                env with
+                types = (d.s_name, Type_repr.Named (tid, param_tys)) :: List.remove_assoc d.s_name env.types;
+                type_ids = (d.s_name, tid) :: List.remove_assoc d.s_name env.type_ids;
+                type_names = (tid, d.s_name) :: env.type_names;
+                nominals = (d.s_name, nom) :: env.nominals;
+              }
+            in
+            register_headers env' acc rest
+          end
+      | Ast.EnumDef d ->
+          if List.mem_assoc d.e_name env.nominals then register_headers env acc rest
+          else begin
+            let params =
+              List.map (fun (tp : Ast.type_param) -> (tp.tp_name, fresh_param_id env.state))
+                d.e_type_params
+            in
+            let tid = fresh_type_id env.state in
+            let param_tys = Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param p) params) in
+            let nom : nominal =
+              { nom_kind = `Enum; nom_params = params; nom_fields = []; nom_variants = []; nom_where = [] }
+            in
+            let env' =
+              {
+                env with
+                types = (d.e_name, Type_repr.Named (tid, param_tys)) :: List.remove_assoc d.e_name env.types;
+                type_ids = (d.e_name, tid) :: List.remove_assoc d.e_name env.type_ids;
+                type_names = (tid, d.e_name) :: env.type_names;
+                nominals = (d.e_name, nom) :: env.nominals;
+              }
+            in
+            register_headers env' acc rest
+          end
+      | _ -> register_headers env acc rest)
+
 let check_program (env : env) (program : Ast.program) : (env * string list, string) result =
-  (* Registration is non-fatal: items whose signatures reference not-yet-
-     registered types are deferred (reported as errors), so a module with
-     forward/cyclic references still contributes everything it can. The
-     driver retries modules to a fixpoint with a growing env. *)
+  (* Phase A: bare type names first (in-module mutual recursion). *)
+  let env_h, header_errors = register_headers env [] program.Ast.items in
+  (* Phase B: registration is non-fatal: items whose signatures reference
+     not-yet-registered types are deferred (reported as errors), so a
+     module with forward/cyclic references still contributes everything it
+     can. The driver retries modules to a fixpoint with a growing env. *)
   let rec go_reg (env : env) (acc : string list) = function
     | [] -> Ok (env, List.rev acc)
     | item :: rest -> (
         let name = Ast.item_summary item.Ast.kind in
         match register_item env item with
         | Ok env' -> go_reg env' acc rest
-        | Error m -> go_reg env ((name ^ ": " ^ m) :: acc) rest)
+        | Error m ->
+            if Util.has_prefix m "duplicate" || Util.has_prefix m "duplicate type" then
+              go_reg env acc rest
+            else if Util.has_prefix m "duplicate function"
+              || Util.has_prefix m "duplicate type"
+              || Util.has_prefix m "duplicate test"
+            then
+              (* re-registration of an item from an earlier fixpoint round:
+                 the resolver already gated real duplicates *)
+              go_reg env acc rest
+            else go_reg env ((name ^ ": " ^ m) :: acc) rest)
   in
-  let* env1, reg_errors = go_reg env [] program.Ast.items in
+  let* env1, reg_errors = go_reg env_h [] program.Ast.items in
   let rec go (errors : string list) = function
     | [] -> Ok (env1, List.rev errors)
     | item :: rest -> (
@@ -3373,7 +3676,7 @@ let check_program (env : env) (program : Ast.program) : (env * string list, stri
             let findings = run_oracle env1 name in
             go (List.map (fun f -> name ^ ": " ^ f) findings @ errors) rest)
   in
-  let* final_env, errors = go reg_errors program.Ast.items in
+  let* final_env, errors = go (header_errors @ reg_errors) program.Ast.items in
   let backstop = run_impl_backstop final_env in
   Ok (final_env, errors @ backstop)
 

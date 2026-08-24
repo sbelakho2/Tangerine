@@ -126,3 +126,20 @@ let to_ocaml_int (a : t) : int =
     v := (!v lsl 32) lor a.(i)
   done;
   !v
+
+(* Exact conversion to an unsigned 128-bit word pair (low 64 bits,
+   high 64 bits), with no decimal-to-OCaml-int intermediate.
+   Raises Invalid_argument if the value needs more than 128 bits. *)
+let to_words_128 (a : t) : int64 * int64 =
+  if bit_length a > 128 then invalid_arg "Big_nat.to_words_128: more than 128 bits"
+  else begin
+    let lo = ref 0L and hi = ref 0L in
+    let n = Array.length a in
+    for i = 0 to n - 1 do
+      let limb = Int64.of_int a.(i) in
+      let word = if i < 2 then lo else hi in
+      let sh = (i mod 2) * 32 in
+      word := Int64.logor !word (Int64.shift_left limb sh)
+    done;
+    (!lo, !hi)
+  end

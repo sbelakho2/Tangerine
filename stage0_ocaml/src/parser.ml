@@ -242,7 +242,9 @@ let is_uppercase_initial (s : string) =
 (* ────────────────────────────────────────────────────────────────
    Mutual recursion spine. *)
 let rec parse_program (p : parser) (program_module_path : string list) : Ast.program =
-  p.inline_module_path <- [];
+  (* top-level items belong to the program's module; nested `module`
+     blocks extend this path *)
+  p.inline_module_path <- program_module_path;
   let items = ref [] in
   let start = cur_span p in
   while not (at_eof p) do
@@ -1127,12 +1129,31 @@ and parse_impl_decl (p : parser) : Ast.item_kind =
   let trait_name = ref None in
   let for_type = ref None in
   let target = ref first_name in
-  if eat p Token.KwFor then begin
+  let has_for = eat p Token.KwFor in
+  if has_for then begin
     trait_name := Some first_name;
     for_type := Some first;
     let target_ty = parse_type p in
     target := type_base_name target_ty
   end;
+  (* `impl NonNull[T]` (args on the target, no impl-level params) is the
+     Tangerine inherent-impl form: promote the target's type-arg names to
+     the impl's own type parameters. The trait form `impl Validator[A, B]
+     for X` keeps the trait's args as trait arguments, not impl params. *)
+  let tps =
+    if tps <> [] then tps
+    else if has_for then []
+    else
+      match first with
+      | Ast.Named (_, args, _) ->
+          List.filter_map
+            (fun a ->
+              match a with
+              | Ast.Named (n, [], sp) -> Some { Ast.tp_name = n; tp_bounds = []; tp_span = sp }
+              | _ -> None)
+            args
+      | _ -> []
+  in
   let where_clause = parse_optional_where_clause p in
   let methods = ref [] in
   let assoc = ref [] in

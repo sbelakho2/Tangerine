@@ -79,13 +79,19 @@ let check_drop (env : env) (local : int) (ctx : string) =
         env.actions <- { local; action = Drop } :: env.actions
   end
 
-(* Branch merge: join two states. *)
+(* Branch merge: join two states.
+
+   The lattice row Consumed + Consumed -> Consumed is deliberate: a value
+   consumed on EVERY predecessor is still consumed at the join.  Merging
+   it to Maybe_live would make finalize (below) believe a drop is still
+   due and schedule one, producing a double-drop plan. *)
 let join (a : resource_state) (b : resource_state) : resource_state =
   match a, b with
   | Uninitialized, x | x, Uninitialized -> (
       match x with Uninitialized -> Uninitialized | _ -> Maybe_live)
   | Live, Live -> Live
-  | Live, Consumed | Consumed, Live | Consumed, Consumed -> Maybe_live
+  | Consumed, Consumed -> Consumed
+  | Live, Consumed | Consumed, Live -> Maybe_live
   | Maybe_live, _ | _, Maybe_live -> Maybe_live
 
 (* Merge the state of `from` into the state snapshot taken at a join point. *)
@@ -98,16 +104,29 @@ let merge_state (env : env) (snapshot : (int * resource_state) list) =
         | None -> (l, s))
       env.states
 
-(* Finalize a function: drop every still-Live owned local; report leaks. *)
+(* Finalize a function: drop every still-Live owned local; report leaks.
+
+   DEFENSIVE INVARIANT: finalize must NEVER schedule a Drop for a
+   Consumed local — a consumed value must not be dropped again.  This is
+   exactly why the merge row is Consumed + Consumed -> Consumed: after
+   the join, a value consumed on both branches stays Consumed, so the
+   fixed row cannot produce a double-drop plan (finalize sees Consumed
+   and schedules nothing).
+
+   Maybe_live is likewise NOT treated as Live here: planning an
+   unconditional final drop for a maybe-live value would double-drop it
+   on the branch where it was already consumed.  A Maybe_live local is
+   left in final_states as a conditional-cleanup signal for the caller;
+   no silent drop is planned. *)
 let finalize (env : env) (ctx : string) : plan =
   List.iter
     (fun l ->
       match state_of env l with
-      | Live | Maybe_live ->
+      | Live ->
           env.actions <- { local = l; action = Drop } :: env.actions;
           set_state env l Consumed
       | Uninitialized ->
           env.errors <- Printf.sprintf "%s: owned local _%d never initialized" ctx l :: env.errors
-      | Consumed -> ())
+      | Consumed | Maybe_live -> ())
     env.owned;
   { actions = List.rev env.actions; final_states = env.states }

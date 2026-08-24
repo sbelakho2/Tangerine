@@ -1,0 +1,256 @@
+(* tg_host.ml — host binding-closure self-check (audit §70).
+
+   Proves three properties of the executable host closure:
+     (a) closure_check FAILS (non-zero) when a declared symbol has no
+         binding, and names the symbol;
+     (b) closure_check PASSES when every declared symbol carries a
+         binding with an executable invoke;
+     (c) the VM's host dispatch invokes the real binding table entry:
+         hand-built Seed MIR with Intrinsic/Extern call terminators run
+         through Vm.run, asserting results, plus fail-closed traps for
+         declared-but-unbound symbols. *)
+
+let fail fmt = Printf.ksprintf (fun s -> Printf.printf "FAIL: %s\n" s; exit 1) fmt
+let pass fmt = Printf.ksprintf (fun s -> Printf.printf "PASS: %s\n" s) fmt
+
+(* Substring test on VM error messages (err_trap prefixes them). *)
+let contains (haystack : string) (needle : string) : bool =
+  let h = String.length haystack and n = String.length needle in
+  if n = 0 then true
+  else if n > h then false
+  else begin
+    let rec go i =
+      i + n <= h && (String.sub haystack i n = needle || go (i + 1))
+    in
+    go 0
+  end
+
+let sig_string_unit : Intrinsic_registry.signature =
+  Intrinsic_registry.sig_ ~params:[| Intrinsic_registry.ty_string |]
+    ~ret:Intrinsic_registry.ty_unit
+
+let manifest_binding (name : string) : Host.binding =
+  match Host.binding_of_manifest name with
+  | Some b -> b
+  | None -> fail "manifest binding for '%s' not found" name
+
+let mk_host ~intrinsics ~bindings : Host.t =
+  Host.create_with ~repo_root:"." ~argv:[||] ~intrinsics
+    ~externs:Extern_registry.empty ~bindings
+
+let register (name : string) (id : int) (sig_ : Intrinsic_registry.signature)
+    (reg : Intrinsic_registry.t) : Intrinsic_registry.t =
+  Intrinsic_registry.register reg ~name ~id sig_
+
+(* (a) a declared symbol without a binding must FAIL the closure check. *)
+let check_declared_unbound () =
+  let reg =
+    Intrinsic_registry.empty
+    |> register "print" 0 sig_string_unit
+    |> register "println" 1 sig_string_unit
+  in
+  let host = mk_host ~intrinsics:reg ~bindings:[ manifest_binding "print" ] in
+  match Host.closure_check host with
+  | Ok _ -> fail "closure_check passed although 'println' is declared but unbound"
+  | Error problems -> (
+      match List.find_opt (fun p -> Util.has_prefix p "declared but not bound") problems with
+      | None ->
+          fail "closure_check failed for the wrong reason: %s"
+            (String.concat "; " problems)
+      | Some p ->
+          if not (Util.has_suffix p "println") then
+            fail "declared-but-unbound symbol not named in the report: %s" p;
+          Printf.printf "  %s\n" p;
+          pass "closure_check FAILS (non-zero) when a declared symbol has no binding")
+
+(* (b) every declared symbol bound -> closure_check PASSES. *)
+let check_declared_implemented () =
+  let sig_panic : Intrinsic_registry.signature =
+    Intrinsic_registry.sig_ ~params:[| Intrinsic_registry.ty_string |]
+      ~ret:Type_repr.Never
+  in
+  let sig_int_string : Intrinsic_registry.signature =
+    Intrinsic_registry.sig_ ~params:[| Intrinsic_registry.ty_int |]
+      ~ret:Intrinsic_registry.ty_string
+  in
+  let reg =
+    Intrinsic_registry.empty
+    |> register "print" 0 sig_string_unit
+    |> register "println" 1 sig_string_unit
+    |> register "panic" 2 sig_panic
+    |> register "__intrinsic_int_to_string" 3 sig_int_string
+  in
+  let bindings =
+    [
+      manifest_binding "print";
+      manifest_binding "println";
+      manifest_binding "panic";
+      manifest_binding "__intrinsic_int_to_string";
+    ]
+  in
+  let host = mk_host ~intrinsics:reg ~bindings in
+  match Host.closure_check host with
+  | Error problems ->
+      List.iter (fun p -> Printf.printf "    %s\n" p) problems;
+      fail "closure_check failed on a host where every declared symbol is bound"
+  | Ok report ->
+      if
+        report.declared <> 4 || report.implemented <> 4
+        || List.length report.bound <> 4
+      then
+        fail "unexpected closure report: declared=%d implemented=%d bound=[%s]"
+          report.declared report.implemented (String.concat ", " report.bound);
+      Printf.printf "  closure report: declared=%d implemented=%d bound=[%s]\n"
+        report.declared report.implemented (String.concat ", " report.bound);
+      pass "closure_check PASSES when every declared symbol carries an executable binding"
+
+(* (c) VM dispatch through the binding table. *)
+
+let intrinsic_id (name : string) : int =
+  match Intrinsic_registry.lookup Intrinsic_registry.manifest ~name with
+  | Some (id, _) -> id
+  | None -> fail "intrinsic '%s' not declared" name
+
+let extern_id (name : string) : int =
+  match Extern_registry.lookup Extern_registry.manifest ~name with
+  | Some (id, _) -> id
+  | None -> fail "extern '%s' not declared" name
+
+let int_constant (n : int64) : Seed_mir.constant =
+  Seed_mir.Integer (Int_value.of_int64 ~width:64 ~signed:true n)
+
+(* Hand-built Seed MIR: one function whose only block calls the host
+   symbol with the given constant argument (or none) and stores the
+   result in the return slot _0, then returns. *)
+let call_program (callee : Seed_mir.callee) (arg : (Type_repr.t * Seed_mir.constant) option)
+    (ret_ty : Type_repr.t) : Seed_mir.program =
+  let statements, args, locals =
+    match arg with
+    | None -> ([], [||], [| ret_ty |])
+    | Some (arg_ty, c) ->
+        ( [ Seed_mir.Assign
+              ({ local = 1; projections = [] }, Seed_mir.Use (Seed_mir.Constant c)) ],
+          [| { Seed_mir.effect_ = Access_effect.Read; value = Seed_mir.Copy { local = 1; projections = [] } } |],
+          [| ret_ty; arg_ty |] )
+  in
+  let instance = Ids.Instance_id.make ~callable:(Ids.Callable_id.make 0) ~type_args:[||] in
+  let fn =
+    {
+      Seed_mir.name = "main";
+      instance;
+      params = [||];
+      locals;
+      blocks =
+        [|
+          { id = 0;
+            statements;
+            terminator = Seed_mir.Call ({ local = 0; projections = [] }, callee, args, 1, None) };
+          { id = 1; statements = []; terminator = Seed_mir.Ret };
+        |];
+      entry = 0;
+    }
+  in
+  { Seed_mir.functions = [| fn |]; statics = [||]; types = [||] }
+
+let check_vm_dispatch () =
+  (* __intrinsic_int_to_string(42) -> "42" through the real binding *)
+  let p1 =
+    call_program (Seed_mir.Intrinsic (intrinsic_id "__intrinsic_int_to_string"))
+      (Some (Type_repr.Int Type_repr.Int, int_constant 42L)) Type_repr.String
+  in
+  let entry = p1.Seed_mir.functions.(0).Seed_mir.instance in
+  let host1 = Host.create ~repo_root:"." ~argv:[||] in
+  (match Vm.run ~program:p1 ~entry ~argv:[||] ~host:host1 with
+   | Error e -> fail "int-to-string host call failed: %s" e.Vm.message
+   | Ok 0 -> (
+       match Vm.entry_frame_of ~program:p1 ~entry ~argv:[||] with
+       | Error m -> fail "entry frame inspection failed: %s" m
+       | Ok (vm2, frame) -> (
+           match Vm.run_inspect vm2 frame with
+           | Ok "42" ->
+               pass "VM host dispatch invokes the real __intrinsic_int_to_string binding (42 -> \"42\")"
+           | Ok other -> fail "__intrinsic_int_to_string returned %S (expected \"42\")" other
+           | Error m -> fail "int-to-string inspect failed: %s" m))
+   | Ok _ -> fail "int-to-string program returned a non-zero exit code");
+  (* println("...") writes the Host stdout buffer through the binding *)
+  let p2 =
+    call_program (Seed_mir.Intrinsic (intrinsic_id "println"))
+      (Some (Type_repr.String, Seed_mir.String "hello from host self-check"))
+      Type_repr.Unit
+  in
+  let e2 = p2.Seed_mir.functions.(0).Seed_mir.instance in
+  let host2 = Host.create ~repo_root:"." ~argv:[||] in
+  (match Vm.run ~program:p2 ~entry:e2 ~argv:[||] ~host:host2 with
+   | Error e -> fail "println host call failed: %s" e.Vm.message
+   | Ok 0 ->
+       if Host.stdout_contents host2 = "hello from host self-check\n" then
+         pass "VM host dispatch invokes the real println binding (writes the Host stdout buffer)"
+       else
+         fail "println wrote %S to the stdout buffer" (Host.stdout_contents host2)
+   | Ok _ -> fail "println program returned a non-zero exit code");
+  (* panic("boom") -> deterministic host error *)
+  let p3 =
+    call_program (Seed_mir.Intrinsic (intrinsic_id "panic"))
+      (Some (Type_repr.String, Seed_mir.String "boom")) Type_repr.Never
+  in
+  let e3 = p3.Seed_mir.functions.(0).Seed_mir.instance in
+  let host3 = Host.create ~repo_root:"." ~argv:[||] in
+  (match Vm.run ~program:p3 ~entry:e3 ~argv:[||] ~host:host3 with
+   | Error e when contains e.Vm.message "panic: boom" ->
+       pass "VM host dispatch invokes the real panic binding (deterministic host error)"
+   | Error e -> fail "panic produced the wrong error: %s" e.Vm.message
+   | Ok _ -> fail "panic program returned instead of raising a host error");
+  (* __intrinsic_abort() -> deterministic host error (zero-arity binding) *)
+  let p4 = call_program (Seed_mir.Intrinsic (intrinsic_id "__intrinsic_abort")) None Type_repr.Unit in
+  let e4 = p4.Seed_mir.functions.(0).Seed_mir.instance in
+  let host4 = Host.create ~repo_root:"." ~argv:[||] in
+  (match Vm.run ~program:p4 ~entry:e4 ~argv:[||] ~host:host4 with
+   | Error e when contains e.Vm.message "abort: __intrinsic_abort" ->
+       pass "VM host dispatch invokes the real __intrinsic_abort binding (zero-arity)"
+   | Error e -> fail "__intrinsic_abort produced the wrong error: %s" e.Vm.message
+   | Ok _ -> fail "__intrinsic_abort program returned instead of raising a host error");
+  (* __sync_synchronize() -> Unit through the Extern dispatch path *)
+  let p5 =
+    call_program (Seed_mir.Extern (extern_id "__sync_synchronize")) None Type_repr.Unit
+  in
+  let e5 = p5.Seed_mir.functions.(0).Seed_mir.instance in
+  let host5 = Host.create ~repo_root:"." ~argv:[||] in
+  (match Vm.run ~program:p5 ~entry:e5 ~argv:[||] ~host:host5 with
+   | Ok 0 -> pass "VM host dispatch invokes the real __sync_synchronize binding (Extern path)"
+   | Error e -> fail "__sync_synchronize host call failed: %s" e.Vm.message
+   | Ok _ -> fail "__sync_synchronize program returned a non-zero exit code");
+  (* declared-but-unbound symbol traps fail-closed *)
+  let p6 =
+    call_program (Seed_mir.Intrinsic (intrinsic_id "__intrinsic_set_len"))
+      (Some (Type_repr.Unit, Seed_mir.Unit)) Type_repr.Unit
+  in
+  let e6 = p6.Seed_mir.functions.(0).Seed_mir.instance in
+  let host6 = Host.create ~repo_root:"." ~argv:[||] in
+  (match Vm.run ~program:p6 ~entry:e6 ~argv:[||] ~host:host6 with
+   | Error e when contains e.Vm.message "has no binding (fail-closed)" ->
+       pass "VM traps fail-closed for a declared-but-unbound host symbol"
+   | Error e -> fail "unbound host call produced the wrong error: %s" e.Vm.message
+   | Ok _ -> fail "unbound host call did not trap")
+
+let () =
+  Printf.printf "host closure self-check\n";
+  check_declared_unbound ();
+  check_declared_implemented ();
+  check_vm_dispatch ();
+  (* Informational: the default manifest host is fail-closed (the Ruby C
+     API / map-set / dl* symbols are declared without bindings). *)
+  let host = Host.create ~repo_root:"." ~argv:[||] in
+  (match Host.closure_check host with
+   | Ok report ->
+       Printf.printf
+         "INFO: default manifest host closure_check passed (declared=%d implemented=%d)\n"
+         report.declared report.implemented
+   | Error problems ->
+       Printf.printf
+         "INFO: default manifest host closure_check: %d problem(s), declared=%d bound=%d (fail-closed)\n"
+         (List.length problems)
+         (List.length (Intrinsic_registry.names host.Host.intrinsics)
+         + List.length (Extern_registry.names host.Host.externs))
+         (List.length host.Host.bindings));
+  Printf.printf "OK: host closure self-check passed\n";
+  exit 0

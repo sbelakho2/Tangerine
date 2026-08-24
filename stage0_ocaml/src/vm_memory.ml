@@ -29,6 +29,9 @@ type mem_error =
   | Misaligned of pointer * int
   | BadRegion of int
   | Overflow of string
+  | NegativeSize of int
+  | BadAlignment of int
+  | InvalidFree of pointer
 
 let mem_error_string = function
   | DeadRegion p -> Printf.sprintf "access to freed region %d at offset %d" p.region p.offset
@@ -36,19 +39,39 @@ let mem_error_string = function
   | Misaligned (p, al) -> Printf.sprintf "misaligned access region %d offset %d (alignment %d)" p.region p.offset al
   | BadRegion r -> Printf.sprintf "invalid region id %d" r
   | Overflow m -> Printf.sprintf "pointer arithmetic overflow: %s" m
+  | NegativeSize n -> Printf.sprintf "negative allocation size %d" n
+  | BadAlignment al -> Printf.sprintf "invalid alignment %d (must be a positive power of two)" al
+  | InvalidFree p -> Printf.sprintf "free of non-base pointer (region %d offset %d)" p.region p.offset
+
+let is_power_of_two (n : int) : bool = n > 0 && n land (n - 1) = 0
 
 let alloc (m : t) (size : int) (alignment : int) : (pointer, mem_error) result =
-  let region_id = m.next_region in
-  m.next_region <- m.next_region + 1;
-  let region = { live = true; bytes = Bytes.make (max 0 size) '\000'; alignment = max 1 alignment } in
-  m.regions <- Array.append m.regions [| region |];
-  Ok { region = region_id; offset = 0 }
+  if size < 0 then Error (NegativeSize size)
+  else if not (is_power_of_two alignment) then Error (BadAlignment alignment)
+  else begin
+    let region_id = m.next_region in
+    m.next_region <- m.next_region + 1;
+    let region = { live = true; bytes = Bytes.make size '\000'; alignment } in
+    m.regions <- Array.append m.regions [| region |];
+    Ok { region = region_id; offset = 0 }
+  end
 
 let alloc_bytes (m : t) (size : int) : (pointer, mem_error) result = alloc m size 1
 
-let free (m : t) (p : pointer) : unit =
-  if p.region >= 0 && p.region < Array.length m.regions then
-    m.regions.(p.region).live <- false
+(* Strict free: the pointer must name a live region at its base (offset 0).
+   The region's live flag transitions exactly once (live -> freed); a
+   second free, a free of a dead region, a free of a non-base pointer and
+   a free of an unknown region are all deterministic errors. *)
+let free (m : t) (p : pointer) : (unit, mem_error) result =
+  if p.region < 0 || p.region >= Array.length m.regions then Error (BadRegion p.region)
+  else
+    let r = m.regions.(p.region) in
+    if not r.live then Error (DeadRegion p)
+    else if p.offset <> 0 then Error (InvalidFree p)
+    else begin
+      r.live <- false;
+      Ok ()
+    end
 
 let region_of (m : t) (p : pointer) : (region, mem_error) result =
   if p.region < 0 || p.region >= Array.length m.regions then Error (BadRegion p.region)

@@ -3,13 +3,21 @@
    The manifest is the SOLE authority for the bootstrap closure: no
    directory-scan fallback. Validation: unknown record types rejected,
    duplicate paths rejected, absolute paths rejected, `..` rejected,
-   symlink escape rejected, every file must exist, no duplicate canonical
-   file. A deterministic fingerprint (SHA-256 over manifest content +
-   logical paths + source bytes + version) is computed at load. *)
+   symlink escape rejected, every file must exist and be readable, no
+   duplicate canonical file. A deterministic fingerprint (SHA-256 over
+   manifest content + version + per-entry canonical sequence of logical
+   module path, relative source path, source byte length and SHA-256 of
+   the source bytes) is computed at load.
+
+   Each entry retains its validated source snapshot (bytes + SHA-256),
+   so nothing re-reads the source files after load (TOCTOU closure). *)
 
 type module_entry = {
   path : string list;   (* logical module path, e.g. ["std"; "core"] *)
   file : string;        (* repository-relative source file *)
+  real : string;        (* canonical resolved absolute path *)
+  source : string;      (* validated source bytes (UTF-8, security-scanned) *)
+  source_hash : string; (* SHA-256 (hex) of source bytes *)
 }
 
 type t = {
@@ -42,7 +50,10 @@ let reject_path (rel : string) : (string, string) result =
     else Ok rel
   end
 
-(* Resolve a repo-relative path beneath root, rejecting symlink escape. *)
+(* Resolve a repo-relative path beneath root, rejecting symlink escape.
+   Containment is checked at a path-segment boundary: the resolved path
+   must equal the root itself or start with root ^ "/", so a root
+   `/repo` can never prefix-match a sibling `/repo_evil/...`. *)
 let resolve_under_root (repo_root : string) (rel : string) : (string, string) result =
   match reject_path rel with
   | Error m -> Error m
@@ -51,93 +62,42 @@ let resolve_under_root (repo_root : string) (rel : string) : (string, string) re
       (try
          let real = Unix.realpath full in
          let root_real = Unix.realpath repo_root in
-         if Util.has_prefix real root_real then Ok real
+         if real = root_real || Util.has_prefix real (root_real ^ "/") then Ok real
          else Error (Printf.sprintf "path escapes repository root via symlink: '%s'" rel)
        with Unix.Unix_error _ -> Error (Printf.sprintf "cannot resolve path '%s'" rel))
 
-(* ── SHA-256 fingerprint (FIPS 180-4, pure OCaml) ───────────────── *)
+(* ── Fingerprint ────────────────────────────────────────────────── *)
 
-module Sha256 = struct
-  let k =
-    [| 0x428a2f98l; 0x71374491l; 0xb5c0fbcfl; 0xe9b5dba5l; 0x3956c25bl; 0x59f111f1l;
-       0x923f82a4l; 0xab1c5ed5l; 0xd807aa98l; 0x12835b01l; 0x243185bel; 0x550c7dc3l;
-       0x72be5d74l; 0x80deb1fel; 0x9bdc06a7l; 0xc19bf174l; 0xe49b69c1l; 0xefbe4786l;
-       0x0fc19dc6l; 0x240ca1ccl; 0x2de92c6fl; 0x4a7484aal; 0x5cb0a9dcl; 0x76f988dal;
-       0x983e5152l; 0xa831c66dl; 0xb00327c8l; 0xbf597fc7l; 0xc6e00bf3l; 0xd5a79147l;
-       0x06ca6351l; 0x14292967l; 0x27b70a85l; 0x2e1b2138l; 0x4d2c6dfcl; 0x53380d13l;
-       0x650a7354l; 0x766a0abbl; 0x81c2c92el; 0x92722c85l; 0xa2bfe8a1l; 0xa81a664bl;
-       0xc24b8b70l; 0xc76c51a3l; 0xd192e819l; 0xd6990624l; 0xf40e3585l; 0x106aa070l;
-       0x19a4c116l; 0x1e376c08l; 0x2748774cl; 0x34b0bcb5l; 0x391c0cb3l; 0x4ed8aa4al;
-       0x5b9cca4fl; 0x682e6ff3l; 0x748f82eel; 0x78a5636fl; 0x84c87814l; 0x8cc70208l;
-       0x90befffal; 0xa4506cebl; 0xbef9a3f7l; 0xc67178f2l |]
+(* Fingerprint input (deterministic, no absolute paths or timestamps):
 
-  let rotr x n = Int32.logor (Int32.shift_right_logical x n) (Int32.shift_left x (32 - n))
+   content ^ "\n\000" ^ version ^ "\n\000"
+   ^ for each entry in manifest order, separated by "\000":
+       String.concat "::" path ^ "\001" ^ file ^ "\001"
+       ^ string_of_int (String.length source) ^ "\001" ^ source_hash
 
-  let digest (data : Bytes.t) : string =
-    let n = Bytes.length data in
-    let padded = Bytes.make ((n + 8 + 63) / 64 * 64) '\000' in
-    Bytes.blit data 0 padded 0 n;
-    Bytes.set padded n (Char.chr 0x80);
-    let bitlen = Int64.mul (Int64.of_int n) 8L in
-    for i = 0 to 7 do
-      Bytes.set padded (Bytes.length padded - 8 + i)
-        (Char.chr (Int64.to_int (Int64.shift_right_logical bitlen (8 * i)) land 0xFF))
-    done;
-    let h = ref [| 0x6a09e667l; 0xbb67ae85l; 0x3c6ef372l; 0xa54ff53al; 0x510e527fl; 0x9b05688cl; 0x1f83d9abl; 0x5be0cd19l |] in
-    let w = Array.make 64 0l in
-    let blocks = Bytes.length padded / 64 in
-    for bi = 0 to blocks - 1 do
-      for i = 0 to 15 do
-        let b0 = Char.code (Bytes.get padded (bi * 64 + i * 4)) in
-        let b1 = Char.code (Bytes.get padded (bi * 64 + i * 4 + 1)) in
-        let b2 = Char.code (Bytes.get padded (bi * 64 + i * 4 + 2)) in
-        let b3 = Char.code (Bytes.get padded (bi * 64 + i * 4 + 3)) in
-        w.(i) <-
-          Int32.logor
-            (Int32.logor (Int32.shift_left (Int32.of_int b0) 24) (Int32.shift_left (Int32.of_int b1) 16))
-            (Int32.logor (Int32.shift_left (Int32.of_int b2) 8) (Int32.of_int b3))
-      done;
-      for i = 16 to 63 do
-        let s0 = Int32.logxor (rotr w.(i - 15) 7) (Int32.logxor (rotr w.(i - 15) 18) (Int32.shift_right_logical w.(i - 15) 3)) in
-        let s1 = Int32.logxor (rotr w.(i - 2) 17) (Int32.logxor (rotr w.(i - 2) 19) (Int32.shift_right_logical w.(i - 2) 10)) in
-        w.(i) <- Int32.add (Int32.add w.(i - 16) s0) (Int32.add w.(i - 7) s1)
-      done;
-      let a = ref !h.(0) and b = ref !h.(1) and c = ref !h.(2) and d = ref !h.(3)
-      and e = ref !h.(4) and f = ref !h.(5) and g = ref !h.(6) and hh = ref !h.(7) in
-      for i = 0 to 63 do
-        let s1 = Int32.logxor (rotr !e 6) (Int32.logxor (rotr !e 11) (rotr !e 25)) in
-        let ch = Int32.logxor (Int32.logand !e !f) (Int32.logand (Int32.lognot !e) !g) in
-        let t1 = Int32.add (Int32.add !hh s1) (Int32.add ch (Int32.add k.(i) w.(i))) in
-        let s0 = Int32.logxor (rotr !a 2) (Int32.logxor (rotr !a 13) (rotr !a 22)) in
-        let maj = Int32.logxor (Int32.logand !a !b) (Int32.logxor (Int32.logand !a !c) (Int32.logand !b !c)) in
-        let t2 = Int32.add s0 maj in
-        hh := !g;
-        g := !f;
-        f := !e;
-        e := Int32.add !d t1;
-        d := !c;
-        c := !b;
-        b := !a;
-        a := Int32.add t1 t2
-      done;
-      h := [| Int32.add !h.(0) !a; Int32.add !h.(1) !b; Int32.add !h.(2) !c; Int32.add !h.(3) !d;
-              Int32.add !h.(4) !e; Int32.add !h.(5) !f; Int32.add !h.(6) !g; Int32.add !h.(7) !hh |]
-    done;
-    let buf = Buffer.create 64 in
-    Array.iter
-      (fun x ->
-        for i = 3 downto 0 do
-          Buffer.add_char buf (Char.chr (Int32.to_int (Int32.shift_right_logical x (8 * i)) land 0xFF))
-        done)
-      !h;
-    Buffer.contents buf
-
-  let hex (s : string) : string =
-    let hexd = "0123456789abcdef" in
-    String.init (String.length s * 2) (fun i ->
-        let c = Char.code s.[i / 2] in
-        if i mod 2 = 0 then hexd.[c lsr 4] else hexd.[c land 0xF])
-end
+   The per-entry canonical sequence — logical module path, relative
+   source path, source byte length, SHA-256(source bytes) — means the
+   fingerprint changes whenever any source file's bytes change, even
+   when the manifest itself is untouched. *)
+let fingerprint_of (content : string) (version : string option)
+    (entries : module_entry list) : string =
+  let buf = Buffer.create (String.length content + 64) in
+  Buffer.add_string buf content;
+  Buffer.add_string buf "\n\000";
+  Buffer.add_string buf (match version with Some v -> v | None -> "");
+  Buffer.add_string buf "\n\000";
+  List.iteri
+    (fun i e ->
+      if i > 0 then Buffer.add_char buf '\000';
+      Buffer.add_string buf (String.concat "::" e.path);
+      Buffer.add_char buf '\001';
+      Buffer.add_string buf e.file;
+      Buffer.add_char buf '\001';
+      Buffer.add_string buf (string_of_int (String.length e.source));
+      Buffer.add_char buf '\001';
+      Buffer.add_string buf e.source_hash)
+    entries;
+  Sha256.digest (Buffer.contents buf)
 
 (* ── Loader ────────────────────────────────────────────────────── *)
 
@@ -188,7 +148,8 @@ let load ~(repo_root : string) ~(manifest_path : string) : (t, string) result =
                          else value
                        in
                        entries :=
-                         { path = String.split_on_char '/' (dir ^ "/" ^ name) |> List.filter (fun x -> x <> ""); file = rel }
+                         { path = String.split_on_char '/' (dir ^ "/" ^ name) |> List.filter (fun x -> x <> ""); file = rel;
+                           real = ""; source = ""; source_hash = "" }
                          :: !entries
                      end
                  | other ->
@@ -200,35 +161,59 @@ let load ~(repo_root : string) ~(manifest_path : string) : (t, string) result =
         let entries = List.rev !entries in
         let canonical_seen = ref Util.StringSet.empty in
         let path_errors = ref [] in
+        (* Each entry is resolved, read exactly once, hashed, and the
+           validated snapshot (bytes + hash) is retained in the entry. *)
+        let loaded : (module_entry * string * string * string) list ref = ref [] in
         List.iter
           (fun e ->
             match resolve_under_root repo_root e.file with
             | Error m -> path_errors := m :: !path_errors
             | Ok real ->
                 if Util.StringSet.mem real !canonical_seen then
-                  path_errors := Printf.sprintf "duplicate canonical file: '%s'" e.file :: !path_errors;
-                canonical_seen := Util.StringSet.add real !canonical_seen)
+                  path_errors := Printf.sprintf "duplicate canonical file: '%s'" e.file :: !path_errors
+                else begin
+                  canonical_seen := Util.StringSet.add real !canonical_seen;
+                  match Source_loader.load real with
+                  | Error _ ->
+                      path_errors := Printf.sprintf "cannot read source file '%s'" e.file :: !path_errors
+                  | Ok src ->
+                      let bytes = src.Source.bytes in
+                      loaded := (e, real, bytes, Sha256.digest bytes) :: !loaded
+                end)
           entries;
         if !path_errors <> [] then Error (String.concat "; " (List.rev !path_errors))
         else begin
-          let fp =
-            Sha256.hex
-              (Sha256.digest
-                 (Bytes.of_string
-                    (content
-                    ^ "\n\000"
-                    ^ (match !version with Some v -> v | None -> "")
-                    ^ "\n\000"
-                    ^ String.concat "\000"
-                        (List.map (fun e -> String.concat "::" e.path ^ "\001" ^ e.file) entries))))
+          let loaded = List.rev !loaded in
+          let entries =
+            List.map
+              (fun (e, real, bytes, hash) ->
+                { e with real; source = bytes; source_hash = hash })
+              loaded
           in
+          let fp = fingerprint_of content !version entries in
           Ok { entries; version = !version; fingerprint = fp; manifest_content = content }
         end
       end
 
+(* Return a copy of the manifest in which the entry with the given logical
+   path has its source bytes replaced; the source hash and fingerprint are
+   recomputed over the new bytes. Used by the fingerprint self-check. *)
+let with_entry_source (m : t) (path : string list) (bytes : string) : t =
+  let entries =
+    List.map
+      (fun e -> if e.path = path then { e with source = bytes; source_hash = Sha256.digest bytes } else e)
+      m.entries
+  in
+  { m with entries; fingerprint = fingerprint_of m.manifest_content m.version entries }
+
 let single ~(file : string) ~(path : string list) : t =
+  let source, source_hash =
+    match Source_loader.load file with
+    | Ok s -> (s.Source.bytes, Sha256.digest s.Source.bytes)
+    | Error _ -> ("", "")
+  in
   {
-    entries = [ { path; file } ];
+    entries = [ { path; file; real = file; source; source_hash } ];
     version = None;
     fingerprint = "adhoc";
     manifest_content = "";

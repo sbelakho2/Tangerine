@@ -38,6 +38,15 @@ type t = {
 
 let join_path (p : string list) : string = String.concat "::" p
 
+let parse_program (sm : Span.source_map) (src : Source.source)
+    (entry : Bootstrap_manifest.module_entry) (diags : Diagnostic.bag) : Ast.program option =
+  let file_id = Span.add_file sm src.Source.name src in
+  let lx = Lexer.create src.Source.bytes file_id diags in
+  let tokens = Lexer.lex lx in
+  let program = Parser.parse tokens src.Source.bytes file_id diags entry.Bootstrap_manifest.path in
+  if not (Diagnostic.has_errors diags) then Verify.verify diags program;
+  Some program
+
 let parse_one (sm : Span.source_map) (repo_root : string) (entry : Bootstrap_manifest.module_entry)
     (diags : Diagnostic.bag) : Ast.program option =
   let full = Filename.concat repo_root entry.Bootstrap_manifest.file in
@@ -48,13 +57,18 @@ let parse_one (sm : Span.source_map) (repo_root : string) (entry : Bootstrap_man
            entry.Bootstrap_manifest.file (join_path entry.Bootstrap_manifest.path))
         Span.synthetic;
       None
-  | Ok src ->
-      let file_id = Span.add_file sm src.Source.name src in
-      let lx = Lexer.create src.Source.bytes file_id diags in
-      let tokens = Lexer.lex lx in
-      let program = Parser.parse tokens src.Source.bytes file_id diags entry.Bootstrap_manifest.path in
-      if not (Diagnostic.has_errors diags) then Verify.verify diags program;
-      Some program
+  | Ok src -> parse_program sm src entry diags
+
+(* Parse from the manifest's retained source snapshot (bytes + hash),
+   which the manifest load validated and read exactly once: no re-read
+   of the file, so the graph cannot observe a different file than the
+   one that was fingerprinted. *)
+let parse_snapshot (sm : Span.source_map) (entry : Bootstrap_manifest.module_entry)
+    (diags : Diagnostic.bag) : Ast.program option =
+  let src =
+    Source.of_bytes ~name:entry.Bootstrap_manifest.real ~bytes:entry.Bootstrap_manifest.source
+  in
+  parse_program sm src entry diags
 
 (* Split a `module a::b` declaration name into segments (mirrors the
    parser's inline-module path handling). *)
@@ -66,6 +80,16 @@ let rec create (manifest : Bootstrap_manifest.t) (diags : Diagnostic.bag) : t =
 
 and create_with_root (repo_root : string) (manifest : Bootstrap_manifest.t)
     (diags : Diagnostic.bag) : t =
+  create_with_parser (fun sm entry diags -> parse_one sm repo_root entry diags) manifest diags
+
+(* Consume the manifest's retained source snapshots instead of re-reading
+   the files from disk (the driver's bootstrap-check entry point). *)
+and create_with_sources (manifest : Bootstrap_manifest.t) (diags : Diagnostic.bag) : t =
+  create_with_parser parse_snapshot manifest diags
+
+and create_with_parser
+    (parse : Span.source_map -> Bootstrap_manifest.module_entry -> Diagnostic.bag -> Ast.program option)
+    (manifest : Bootstrap_manifest.t) (diags : Diagnostic.bag) : t =
   let sm = Span.create () in
   let next_id = ref 0 in
   let nodes = ref [] in
@@ -122,7 +146,7 @@ and create_with_root (repo_root : string) (manifest : Bootstrap_manifest.t)
   in
   List.iter
     (fun entry ->
-      match parse_one sm repo_root entry diags with
+      match parse sm entry diags with
       | None -> ()
       | Some program ->
           let fid = assign_id () in

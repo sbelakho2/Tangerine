@@ -1317,18 +1317,24 @@ let verify_function (ctx : ctx) (fn : function_) : unit =
               "%s: function returns a ref value (refs are internal ABI and must not escape)"
               fn_ctx)
      | _ -> ());
-  if Array.length fn.params > Array.length fn.locals then
+  (* Local convention (seed_mir.ml): local _0 is the return slot;
+     parameter i occupies local _(i+1), so the locals array must be at
+     least 1 + |params| long. *)
+  if Array.length fn.locals < 1 + Array.length fn.params then
     add_err ctx
       (Printf.sprintf
-         "%s: %d parameters but only %d locals (params must be a prefix of locals)" fn_ctx
-         (Array.length fn.params) (Array.length fn.locals))
+         "%s: %d parameters require %d locals (return slot _0 plus one slot per parameter), but the function has %d locals"
+         fn_ctx (Array.length fn.params) (1 + Array.length fn.params)
+         (Array.length fn.locals))
   else
     Array.iteri
       (fun i (_, pty) ->
-        if not (types_compatible ctx fn.locals.(i) pty) then
+        if not (types_compatible ctx fn.locals.(i + 1) pty) then
           add_err ctx
-            (Printf.sprintf "%s: param _%d type %s does not match its local slot type %s" fn_ctx i
-               (Seed_mir.print_type pty) (Seed_mir.print_type fn.locals.(i))))
+            (Printf.sprintf
+               "%s: param _%d type %s does not match its local slot _%d type %s" fn_ctx i
+               (Seed_mir.print_type pty) (i + 1)
+               (Seed_mir.print_type fn.locals.(i + 1))))
       fn.params;
   check_embedded_concreteness ctx fn;
   if Array.length fn.blocks = 0 then
@@ -1346,6 +1352,26 @@ let verify_function (ctx : ctx) (fn : function_) : unit =
                b.id)
         else Hashtbl.add seen_ids b.id ())
       fn.blocks;
+    (* Block convention (seed_mir.ml): the blocks array is indexed by
+       block id — ids must be exactly 0..n-1 and the array position
+       equals the id.  Enforce it: the array length equals the max id+1
+       and every id 0..n-1 is present exactly once. *)
+    let nblocks = Array.length fn.blocks in
+    Array.iter
+      (fun b ->
+        if b.id < 0 || b.id >= nblocks then
+          add_err ctx
+            (Printf.sprintf
+               "%s: block id bb%d out of range: the blocks array is indexed by block id, so ids must be exactly 0..%d (array position == id)"
+               fn_ctx b.id (nblocks - 1)))
+      fn.blocks;
+    for i = 0 to nblocks - 1 do
+      if not (Hashtbl.mem seen_ids i) then
+        add_err ctx
+          (Printf.sprintf
+             "%s: missing block id bb%d: every id 0..%d must be present exactly once (the blocks array is indexed by block id)"
+             fn_ctx i (nblocks - 1))
+    done;
     let reachable = reachable_blocks fn tbl in
     let in_sets = init_in_sets fn tbl in
     let moved_sets = moved_in_sets fn tbl in

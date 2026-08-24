@@ -225,16 +225,67 @@ let do_drop (vm : t) (frame : frame) (local : int) : unit =
   | Ok s -> frame.locals.(local) <- s
   | Error e -> err_trap vm (Vm_value.slot_error_string e)
 
-let binop_int (op : Seed_mir.bin_op) (a : Int_value.t) (b : Int_value.t) : Vm_value.t =
+(* Frame-shape invariant, enforced at frame creation (the VM boundary):
+   the block array must be indexed by block id — blocks.(i).id = i for
+   every i — and the function must declare at least one local (local _0
+   is the return slot).  Mis-shaped MIR traps deterministically instead
+   of indexing out of bounds. *)
+let check_fn_shape (vm : t) (fn_idx : int) : unit =
+  let fn = vm.program.Seed_mir.functions.(fn_idx) in
+  let nblocks = Array.length fn.Seed_mir.blocks in
+  if nblocks > 0 then begin
+    Array.iteri
+      (fun i b ->
+        if b.Seed_mir.id <> i then
+          err_trap vm
+            (Printf.sprintf
+               "function %s: block array must be indexed by block id: blocks.(%d).id = %d (expected %d)"
+               fn.Seed_mir.name i b.Seed_mir.id i))
+      fn.Seed_mir.blocks;
+    if fn.Seed_mir.entry < 0 || fn.Seed_mir.entry >= nblocks then
+      err_trap vm
+        (Printf.sprintf "function %s: entry block %d out of range 0..%d"
+           fn.Seed_mir.name fn.Seed_mir.entry (nblocks - 1))
+  end;
+  if Array.length fn.Seed_mir.locals < 1 then
+    err_trap vm
+      (Printf.sprintf "function %s: must declare at least one local (local _0 is the return slot)"
+         fn.Seed_mir.name)
+
+(* True when v is the signed minimum of its width: the unique non-zero
+   value whose two's-complement negation wraps to itself (the 128-bit
+   pattern is explicit: hi = min_int, lo = 0).  Representation-robust:
+   it does not depend on how Int_value stores sign-extended low words. *)
+let is_signed_min (v : Int_value.t) : bool =
+  let open Int_value in
+  v.signed
+  && if v.width = 128 then v.bits_hi = Int64.min_int && v.bits_lo = 0L
+     else not (is_zero v) && compare_vals v (neg v) = 0
+
+(* The signed value -1 of the value's width. *)
+let is_neg_one (v : Int_value.t) : bool =
+  let open Int_value in
+  v.signed
+  && if v.width = 128 then v.bits_lo = -1L && v.bits_hi = -1L else v.bits_lo = -1L
+
+(* Signed division overflows exactly when min / -1 is evaluated: the true
+   quotient 2^(w-1) does not fit the width, so no deterministic exact
+   value exists. Trap instead of inventing one. *)
+let int_div_overflow (a : Int_value.t) (b : Int_value.t) : bool =
+  is_signed_min a && is_neg_one b
+
+let binop_int (vm : t) (op : Seed_mir.bin_op) (a : Int_value.t) (b : Int_value.t) : Vm_value.t =
   let open Int_value in
   match op with
   | Seed_mir.Add -> Vm_value.Int (add a b)
   | Seed_mir.Sub -> Vm_value.Int (sub a b)
   | Seed_mir.Mul -> Vm_value.Int (mul a b)
-  | Seed_mir.Div -> (
-      try Vm_value.Int (div a b) with Division_by_zero -> Vm_value.Int (zero a.width a.signed))
-  | Seed_mir.Rem -> (
-      try Vm_value.Int (rem a b) with Division_by_zero -> Vm_value.Int (zero a.width a.signed))
+  | Seed_mir.Div | Seed_mir.Rem ->
+      if int_div_overflow a b then err_trap vm "signed division overflow"
+      else
+        (try
+           Vm_value.Int (if op = Seed_mir.Div then div a b else rem a b)
+         with Division_by_zero -> err_trap vm "division by zero")
   | Seed_mir.Eq -> Vm_value.Bool (compare_vals a b = 0)
   | Seed_mir.Ne -> Vm_value.Bool (compare_vals a b <> 0)
   | Seed_mir.Lt -> Vm_value.Bool (compare_vals a b < 0)
@@ -257,12 +308,7 @@ let rec eval_rvalue (vm : t) (frame : frame) (rv : Seed_mir.rvalue) : Vm_value.t
       (* allocate a fresh region holding the current value bytes; the seed
          subset materializes scalars and small aggregates *)
       (match Vm_value.read_slot frame.locals.(p.Seed_mir.local) with
-       | Ok v ->
-           let ptr = ref None in
-           (match vm_alloc_scalar vm v with
-            | Some ptr' -> ptr := Some ptr'
-            | None -> err_trap vm "ref of unsupported value shape");
-           (match !ptr with Some pp -> Vm_value.Ref pp | None -> Vm_value.Null)
+       | Ok v -> Vm_value.Ref (vm_alloc_scalar vm v)
        | Error e -> err_trap vm (Vm_value.slot_error_string e))
   | Seed_mir.Aggregate (kind, ops) ->
       let vals = Array.of_list (List.map (eval_operand vm frame) ops) in
@@ -276,7 +322,7 @@ let rec eval_rvalue (vm : t) (frame : frame) (rv : Seed_mir.rvalue) : Vm_value.t
       let lv = eval_operand vm frame l in
       let rv = eval_operand vm frame r in
       (match lv, rv with
-       | Vm_value.Int a, Vm_value.Int b -> binop_int op a b
+       | Vm_value.Int a, Vm_value.Int b -> binop_int vm op a b
        | Vm_value.Bool a, Vm_value.Bool b -> (
            match op with
            | Seed_mir.And -> Vm_value.Bool (a && b)
@@ -380,8 +426,9 @@ and int_cast (i : Int_value.t) (kind : Type_repr.int_kind) : Int_value.t =
   Int_value.of_int64 ~width:(int_width kind) ~signed:(int_signed kind) (Int_value.to_int64 i)
 
 (* Allocate a scalar/aggregate region for a Ref (the seed subset
-   materializes a copy; the pointer is a fresh region). *)
-and vm_alloc_scalar (vm : t) (v : Vm_value.t) : Vm_memory.pointer option =
+   materializes a copy; the pointer is a fresh region).  An allocation
+   failure is a deterministic trap, never a silent fallback. *)
+and vm_alloc_scalar (vm : t) (v : Vm_value.t) : Vm_memory.pointer =
   let size =
     match v with
     | Vm_value.Int i -> if i.Int_value.width = 128 then 16 else 8
@@ -393,8 +440,8 @@ and vm_alloc_scalar (vm : t) (v : Vm_value.t) : Vm_memory.pointer option =
   vm.alloc_bytes <- vm.alloc_bytes + size;
   if vm.alloc_bytes > vm.limits.max_alloc_bytes then err_trap vm "allocation limit exceeded";
   match Vm_memory.alloc vm.memory size 8 with
-  | Ok ptr -> Some ptr
-  | Error _ -> None
+  | Ok ptr -> ptr
+  | Error e -> err_trap vm ("allocation failed: " ^ Vm_memory.mem_error_string e)
 
 let rec exec_terminator (vm : t) (frame : frame) (term : Seed_mir.terminator) : unit =
   step_limit vm;
@@ -431,6 +478,7 @@ let rec exec_terminator (vm : t) (frame : frame) (term : Seed_mir.terminator) : 
            if List.length vm.frames > vm.limits.max_depth then
              err_trap vm "call depth exceeded";
            let fn = vm.program.Seed_mir.functions.(fn_idx) in
+           check_fn_shape vm fn_idx;
            let callee_frame =
              { fn = fn_idx;
                locals = Array.make (Array.length fn.Seed_mir.locals) Vm_value.Uninitialized;
@@ -444,23 +492,38 @@ let rec exec_terminator (vm : t) (frame : frame) (term : Seed_mir.terminator) : 
                 (Array.sub arg_vals 0 (Array.length fn.Seed_mir.params));
               run_frame vm callee_frame
             with Exit -> ());
+           (* The return slot is the callee's declared return value.  For a
+              Unit-typed return it may legitimately be left Uninitialized
+              (return Unit then); for any other declared return type an
+              uninitialized or moved/dropped slot at return is an invariant
+              failure and traps — the VM never fabricates a value. *)
            let ret =
              match callee_frame.locals.(0) with
              | Vm_value.Live v -> v
-             | _ -> Vm_value.Unit
+             | Vm_value.Uninitialized ->
+                 if fn.Seed_mir.locals.(0) = Type_repr.Unit then Vm_value.Unit
+                 else
+                   err_trap vm
+                     (Printf.sprintf
+                        "callee %s returned with an uninitialized return slot (declared return type %s is not unit)"
+                        fn.Seed_mir.name (Seed_mir.print_type fn.Seed_mir.locals.(0)))
+             | Vm_value.Moved | Vm_value.Dropped ->
+                 err_trap vm
+                   (Printf.sprintf "callee %s returned with a non-live return slot"
+                      fn.Seed_mir.name)
            in
            vm.frames <- List.tl vm.frames;
            write_place vm frame dest ret;
            frame.block <- next;
            frame.stmt <- 0
-       | Seed_mir.Intrinsic id | Seed_mir.Extern id ->
-           vm.host_calls <- vm.host_calls + 1;
-           if vm.host_calls > vm.limits.max_host_calls then
-             err_trap vm "host call limit exceeded";
-           let ret = call_host vm id arg_vals in
-           write_place vm frame dest ret;
-           frame.block <- next;
-           frame.stmt <- 0)
+        | Seed_mir.Intrinsic _ | Seed_mir.Extern _ as host_callee ->
+            vm.host_calls <- vm.host_calls + 1;
+            if vm.host_calls > vm.limits.max_host_calls then
+              err_trap vm "host call limit exceeded";
+            let ret = call_host vm host_callee arg_vals in
+            write_place vm frame dest ret;
+            frame.block <- next;
+            frame.stmt <- 0)
   | Seed_mir.Drop (p, next, _) ->
       do_drop vm frame p.Seed_mir.local;
       frame.block <- next;
@@ -485,11 +548,37 @@ let rec exec_terminator (vm : t) (frame : frame) (term : Seed_mir.terminator) : 
   | Seed_mir.Unreachable -> raise (Failure "vm: reached Unreachable")
   | Seed_mir.Abort -> raise (Failure "vm: abort")
 
-(* Host boundary: the seed subset provides a small registry-driven
-   surface. Calls not implemented fail closed. *)
-and call_host (vm : t) (id : int) (args : Vm_value.t array) : Vm_value.t =
-  ignore args;
-  err_trap vm (Printf.sprintf "host call #%d not implemented (fail-closed)" id)
+(* Host boundary: the executable closure is the Host binding table
+   (audit §70). Dispatch resolves the registry index to a binding id and
+   invokes the binding's `invoke`; a declared symbol without a binding
+   fails closed, and an invoke error becomes a deterministic trap. *)
+and call_host (vm : t) (callee : Seed_mir.callee) (args : Vm_value.t array) : Vm_value.t =
+  let id =
+    match callee with
+    | Seed_mir.Intrinsic i -> Host.Intrinsic i
+    | Seed_mir.Extern i -> Host.Extern i
+    | Seed_mir.User _ -> err_trap vm "internal: user call routed to host dispatch"
+  in
+  match Host.lookup_binding vm.host id with
+  | None ->
+      let label =
+        match Host.name_of_host_id vm.host id with
+        | Some name -> name
+        | None -> (
+            match callee with
+            | Seed_mir.Intrinsic i -> Printf.sprintf "intrinsic#%d" i
+            | Seed_mir.Extern i -> Printf.sprintf "extern#%d" i
+            | Seed_mir.User _ -> "?")
+      in
+      err_trap vm (Printf.sprintf "host call %s has no binding (fail-closed)" label)
+  | Some b ->
+      if Array.length args <> b.Host.arity then
+        err_trap vm
+          (Printf.sprintf "host call %s: arity mismatch (binding arity %d, got %d)"
+             b.Host.name b.Host.arity (Array.length args));
+      (match b.Host.invoke vm.host args with
+       | Ok v -> v
+       | Error msg -> err_trap vm (Printf.sprintf "host call %s: %s" b.Host.name msg))
 
 and run_frame (vm : t) (frame : frame) : unit =
   let fn = vm.program.Seed_mir.functions.(frame.fn) in
@@ -583,28 +672,32 @@ let entry_frame_of ~(program : Seed_mir.program) ~(entry : Ids.Instance_id.t) ~(
   match Hashtbl.find_opt fn_index entry with
   | None -> Error "entry instance not found"
   | Some fn_idx ->
-      let vm =
-        {
-          program;
-          fn_index;
-          memory = Vm_memory.create ();
-          host = Host.create ~repo_root:"." ~argv:[||];
-          limits = default_limits;
-          steps = 0;
-          host_calls = 0;
-          alloc_bytes = 0;
-          stdout = Buffer.create 256;
-          stderr = Buffer.create 256;
-          frames = [];
-          trace = [];
-        }
-      in
-      let fn = program.Seed_mir.functions.(fn_idx) in
-      let entry_frame =
-        { fn = fn_idx; locals = Array.make (Array.length fn.Seed_mir.locals) Vm_value.Uninitialized; block = fn.Seed_mir.entry; stmt = 0 }
-      in
-      Array.iteri (fun i s -> entry_frame.locals.(i) <- Vm_value.Live (Vm_value.String s)) argv;
-      Ok (vm, entry_frame)
+      (try
+         let vm =
+           {
+             program;
+             fn_index;
+             memory = Vm_memory.create ();
+             host = Host.create ~repo_root:"." ~argv:[||];
+             limits = default_limits;
+             steps = 0;
+             host_calls = 0;
+             alloc_bytes = 0;
+             stdout = Buffer.create 256;
+             stderr = Buffer.create 256;
+             frames = [];
+             trace = [];
+           }
+         in
+         check_fn_shape vm fn_idx;
+         let fn = program.Seed_mir.functions.(fn_idx) in
+         let entry_frame =
+           { fn = fn_idx; locals = Array.make (Array.length fn.Seed_mir.locals) Vm_value.Uninitialized; block = fn.Seed_mir.entry; stmt = 0 }
+         in
+         Array.iteri (fun i s -> entry_frame.locals.(i) <- Vm_value.Live (Vm_value.String s)) argv;
+         Ok (vm, entry_frame)
+       with
+      | Failure msg -> Error msg)
 
 let run ~(program : Seed_mir.program) ~(entry : Ids.Instance_id.t) ~(argv : string array)
     ~(host : Host.t) : (int, vm_error) result =

@@ -109,6 +109,102 @@ let report_errors (diags : Diagnostic.bag) (sm : Span.source_map) : unit =
     if Diagnostic.has_errors diags then exit 1
   end
 
+(* Flat-namespace signature lookup (kernel code uses bare names). *)
+let lookup_typed_fn (env : Typecheck.env) (name : string) : Typecheck.typed_signature option =
+  match List.assoc_opt name env.Typecheck.functions with
+  | Some ts -> Some ts
+  | None -> (
+      match List.filter (fun (k, _) -> Util.has_suffix k ("::" ^ name)) env.Typecheck.functions with
+      | [ (_, ts) ] -> Some ts
+      | _ -> None)
+
+let lowering_env_of (env : Typecheck.env) : Mir_lower.func_env =
+  (* both the qualified key and the bare name resolve (flat namespace) *)
+  let values =
+    List.concat_map
+      (fun (n, ts : string * Typecheck.typed_signature) ->
+        let bare =
+          match String.rindex_opt n ':' with
+          | Some i -> [ (String.sub n (i + 1) (String.length n - i - 1), ts.Typecheck.ts_return) ]
+          | None -> []
+        in
+        (n, ts.Typecheck.ts_return) :: bare)
+      env.Typecheck.functions
+  in
+  let callables =
+    List.concat_map
+      (fun (n, ts : string * Typecheck.typed_signature) ->
+        let cid = Ids.Callable_id.to_int ts.Typecheck.ts_callable in
+        let bare =
+          match String.rindex_opt n ':' with
+          | Some i -> [ (String.sub n (i + 1) (String.length n - i - 1), cid) ]
+          | None -> []
+        in
+        (n, cid) :: bare)
+      env.Typecheck.functions
+  in
+  let methods =
+    List.map
+      (fun ((t, m), ts : (string * string) * Typecheck.typed_signature) ->
+        ((t, m), Ids.Instance_id.make ~callable:ts.Typecheck.ts_callable ~type_args:[||]))
+      env.Typecheck.methods
+  in
+  {
+    Mir_lower.types = env.Typecheck.types;
+    values;
+    callables;
+    methods;
+    fn_ret = Type_repr.Unit;
+  }
+
+let lower_and_report (path : string) (env : Typecheck.env) (program : Ast.program) : int =
+  let module_path = Parser.module_path_of_file path in
+  let funcs =
+    List.filter_map
+      (fun i -> match i.Ast.kind with Ast.Function d -> Some d | _ -> None)
+      program.Ast.items
+  in
+  Printf.printf "// lower %s (module %s): %d items, %d functions\n" path
+    (String.concat "::" module_path)
+    (List.length program.Ast.items)
+    (List.length funcs);
+  let base = lowering_env_of env in
+  let mir_funcs =
+    List.mapi
+      (fun i d ->
+        let fn_ret, callable =
+          match lookup_typed_fn env d.Ast.fn_sig.Ast.sig_name with
+          | Some ts -> (ts.Typecheck.ts_return, Ids.Callable_id.to_int ts.Typecheck.ts_callable)
+          | None -> (Type_repr.Unit, i)
+        in
+        Mir_lower.lower_function { base with Mir_lower.fn_ret } d.Ast.fn_sig.Ast.sig_name
+          callable d)
+      funcs
+  in
+  let prog =
+    { Seed_mir.functions = Array.of_list mir_funcs; statics = [||]; types = [||] }
+  in
+  match Mir_verify.require_valid prog with
+  | Error errs ->
+      Printf.printf "// MIR verify FAILED:\n";
+      List.iter (fun e -> Printf.printf "//   %s\n" e) errs;
+      1
+  | Ok () ->
+      Printf.printf "// MIR verify PASS (%d functions)\n" (Array.length prog.Seed_mir.functions);
+      print_string (Seed_mir.print_program prog);
+      (match
+         Array.to_list prog.Seed_mir.functions
+         |> List.find_opt (fun f -> f.Seed_mir.name = "main")
+       with
+      | None -> 0
+      | Some main ->
+          let host = Host.create ~repo_root:"." ~argv:[||] in
+          (match Vm.run ~program:prog ~entry:main.Seed_mir.instance ~argv:[||] ~host with
+           | Ok _ -> Printf.printf "// VM: exit 0\n"; 0
+           | Error e -> Printf.printf "// VM: %s\n" e.Vm.message; 1))
+
+
+
 let cmd_lex (args : string list) : int =
   match args with
   | path :: _ ->
@@ -146,11 +242,93 @@ let cmd_check (args : string list) : int =
       report_errors diags sm;
       if not (Diagnostic.has_errors diags) then Subset.check diags program;
       report_errors diags sm;
-      Printf.printf "Checked %d top-level items: 0 errors, %d warnings\n"
-        (List.length program.Ast.items)
-        (Diagnostic.warning_count diags);
-      0
+      if Diagnostic.has_errors diags then 1
+      else begin
+        (* the advertised semantics: parse + profile + resolution + typing *)
+        let env = Typecheck.initial_env () in
+        match Typecheck.check_program env program with
+        | Error m -> die "typecheck failed: %s" m
+        | Ok (_, errors) ->
+            if errors <> [] then begin
+              List.iter (fun e -> Printf.printf "  %s\n" e) (List.rev errors);
+              Printf.printf "Checked %d top-level items: %d errors, %d warnings\n"
+                (List.length program.Ast.items) (List.length errors)
+                (Diagnostic.warning_count diags);
+              1
+            end
+            else begin
+              Printf.printf "Checked %d top-level items: 0 errors, %d warnings\n"
+                (List.length program.Ast.items)
+                (Diagnostic.warning_count diags);
+              0
+            end
+      end
   | [] -> die "'check' requires a file path"
+
+(* interpret: lower a file and run its main through the seed VM, printing
+   the return value (audit: the dispatcher advertised interpret but had no
+   branch). *)
+let cmd_interpret (args : string list) : int =
+  match args with
+  | path :: _ ->
+      let diags, sm, program = front_end path in
+      report_errors diags sm;
+      if Diagnostic.has_errors diags then 1
+      else begin
+        let env = Typecheck.initial_env () in
+        match Typecheck.check_program env program with
+        | Error m -> die "typecheck failed: %s" m
+        | Ok (env, errors) ->
+            if errors <> [] then begin
+              List.iter (fun e -> Printf.printf "  %s\n" e) (List.rev errors);
+              1
+            end
+            else begin
+              let funcs =
+                List.filter_map
+                  (fun i -> match i.Ast.kind with Ast.Function d -> Some d | _ -> None)
+                  program.Ast.items
+              in
+              let base = lowering_env_of env in
+              let mir_funcs =
+                List.mapi
+                  (fun i d ->
+                    let fn_ret, callable =
+                      match lookup_typed_fn env d.Ast.fn_sig.Ast.sig_name with
+                      | Some ts -> (ts.Typecheck.ts_return, Ids.Callable_id.to_int ts.Typecheck.ts_callable)
+                      | None -> (Type_repr.Unit, i)
+                    in
+                    Mir_lower.lower_function { base with Mir_lower.fn_ret }
+                      d.Ast.fn_sig.Ast.sig_name callable d)
+                  funcs
+              in
+              let prog =
+                { Seed_mir.functions = Array.of_list mir_funcs; statics = [||]; types = [||] }
+              in
+              (match Mir_verify.require_valid prog with
+               | Error errs ->
+                   List.iter (fun e -> Printf.printf "  %s\n" e) errs;
+                   1
+               | Ok () -> (
+                   match
+                     Array.to_list prog.Seed_mir.functions
+                     |> List.find_opt (fun f -> f.Seed_mir.name = "main")
+                   with
+                   | None -> die "no `main` function to interpret"
+                   | Some main -> (
+                       match Vm.entry_frame_of ~program:prog ~entry:main.Seed_mir.instance ~argv:[||] with
+                       | Error m -> die "interpret: %s" m
+                       | Ok (vm, entry_frame) -> (
+                           match Vm.run_inspect vm entry_frame with
+                           | Ok ret ->
+                               Printf.printf "%s\n" ret;
+                               0
+                           | Error m ->
+                               Printf.printf "interpret failed: %s\n" m;
+                               1))))
+            end
+      end
+  | [] -> die "'interpret' requires a file path"
 
 let cmd_dump_ast (args : string list) : int =
   match args with
@@ -246,78 +424,6 @@ let topological_nodes (graph : Module_graph.t) : Module_graph.module_node list =
   else List.map (Array.get nodes) order
 
 (* Build the Mir_lower func_env from the typed environment. *)
-let lowering_env_of (env : Typecheck.env) : Mir_lower.func_env =
-  let values =
-    List.map
-      (fun (n, ts : string * Typecheck.typed_signature) -> (n, ts.Typecheck.ts_return))
-      env.Typecheck.functions
-  in
-  let callables =
-    List.map
-      (fun (n, ts : string * Typecheck.typed_signature) -> (n, Ids.Callable_id.to_int ts.Typecheck.ts_callable))
-      env.Typecheck.functions
-  in
-  let methods =
-    List.map
-      (fun ((t, m), ts : (string * string) * Typecheck.typed_signature) ->
-        ((t, m), Ids.Instance_id.make ~callable:ts.Typecheck.ts_callable ~type_args:[||]))
-      env.Typecheck.methods
-  in
-  {
-    Mir_lower.types = env.Typecheck.types;
-    values;
-    callables;
-    methods;
-    fn_ret = Type_repr.Unit;
-  }
-
-let lower_and_report (path : string) (env : Typecheck.env) (program : Ast.program) : int =
-  let module_path = Parser.module_path_of_file path in
-  let funcs =
-    List.filter_map
-      (fun i -> match i.Ast.kind with Ast.Function d -> Some d | _ -> None)
-      program.Ast.items
-  in
-  Printf.printf "// lower %s (module %s): %d items, %d functions\n" path
-    (String.concat "::" module_path)
-    (List.length program.Ast.items)
-    (List.length funcs);
-  let base = lowering_env_of env in
-  let mir_funcs =
-    List.mapi
-      (fun i d ->
-        let fn_ret, callable =
-          match List.assoc_opt d.Ast.fn_sig.Ast.sig_name env.Typecheck.functions with
-          | Some ts -> (ts.Typecheck.ts_return, Ids.Callable_id.to_int ts.Typecheck.ts_callable)
-          | None -> (Type_repr.Unit, i)
-        in
-        Mir_lower.lower_function { base with Mir_lower.fn_ret } d.Ast.fn_sig.Ast.sig_name
-          callable d)
-      funcs
-  in
-  let prog =
-    { Seed_mir.functions = Array.of_list mir_funcs; statics = [||]; types = [||] }
-  in
-  match Mir_verify.require_valid prog with
-  | Error errs ->
-      Printf.printf "// MIR verify FAILED:\n";
-      List.iter (fun e -> Printf.printf "//   %s\n" e) errs;
-      1
-  | Ok () ->
-      Printf.printf "// MIR verify PASS (%d functions)\n" (Array.length prog.Seed_mir.functions);
-      print_string (Seed_mir.print_program prog);
-      (match
-         Array.to_list prog.Seed_mir.functions
-         |> List.find_opt (fun f -> f.Seed_mir.name = "main")
-       with
-      | None -> 0
-      | Some main ->
-          let host = Host.create ~repo_root:"." ~argv:[||] in
-          (match Vm.run ~program:prog ~entry:main.Seed_mir.instance ~argv:[||] ~host with
-           | Ok _ -> Printf.printf "// VM: exit 0\n"; 0
-           | Error e -> Printf.printf "// VM: %s\n" e.Vm.message; 1))
-
-
 let cmd_lower (args : string list) : int =
   match args with
   | path :: _ ->
@@ -370,7 +476,7 @@ let cmd_bootstrap_check (args : string list) : int =
          (match Bootstrap_manifest.version_of manifest with Some v -> v | None -> "(none)");
        Printf.printf "  fingerprint: %s\n" (Bootstrap_manifest.fingerprint manifest);
        let diags = Diagnostic.create_bag () in
-       let graph = Module_graph.create_with_root opts.repo_root manifest diags in
+       let graph = Module_graph.create_with_sources manifest diags in
        Printf.printf "  module graph: %d modules, %d items\n" graph.Module_graph.node_count
          graph.Module_graph.item_count;
        let resolved = Resolver.resolve manifest graph diags in
@@ -392,7 +498,7 @@ let cmd_bootstrap_check (args : string list) : int =
             modules with forward/cyclic references retry with the growing
             env until no module makes progress *)
          let env = ref (Typecheck.initial_env ()) in
-         let type_errors = ref [] in
+         let errs_by_mod : (string, string list) Hashtbl.t = Hashtbl.create 64 in
          let items = ref 0 in
          let functions = ref 0 in
          let pending = ref (topological_nodes graph) in
@@ -403,33 +509,28 @@ let cmd_bootstrap_check (args : string list) : int =
            pending := [];
            List.iter
              (fun node ->
+               let key = String.concat "::" node.Module_graph.node_path in
                match Typecheck.check_program !env node.Module_graph.node_program with
-               | Error m ->
-                   type_errors :=
-                     (String.concat "::" node.Module_graph.node_path ^ ": " ^ m)
-                     :: !type_errors
+               | Error m -> Hashtbl.replace errs_by_mod key [ m ]
                | Ok (env', errors) ->
                    env := env';
-                   if errors <> [] then begin
-                     pending := node :: !pending;
-                     type_errors :=
-                       List.rev_append
-                         (List.map
-                            (fun e ->
-                              String.concat "::" node.Module_graph.node_path ^ ": " ^ e)
-                            errors)
-                         !type_errors
-                   end)
+                   Hashtbl.replace errs_by_mod key errors;
+                   if errors <> [] then pending := node :: !pending)
              this_round
          done;
          List.iter
            (fun node ->
              items := !items + List.length node.Module_graph.node_items)
            (topological_nodes graph);
+         let type_errors =
+           Hashtbl.fold
+             (fun key errs acc -> List.map (fun e -> key ^ ": " ^ e) errs @ acc)
+             errs_by_mod []
+         in
          Printf.printf "  typecheck: %d modules, %d items, %d errors (%d rounds)\n"
-           graph.Module_graph.node_count !items (List.length !type_errors) !rounds;
-         List.iter (fun e -> Printf.printf "    %s\n" e) (List.rev !type_errors);
-         if !type_errors <> [] then begin
+           graph.Module_graph.node_count !items (List.length type_errors) !rounds;
+         List.iter (fun e -> Printf.printf "    %s\n" e) (List.sort compare type_errors);
+         if type_errors <> [] then begin
            Printf.printf "  RESULT: FAIL\n";
            1
          end
@@ -464,16 +565,71 @@ let cmd_bootstrap_check (args : string list) : int =
            in
            (match Mir_verify.require_valid prog with
             | Error errs ->
-                Printf.printf "  MIR verify: FAIL (%d functions)\n"
-                  (Array.length prog.Seed_mir.functions);
+                Printf.printf "  SEED_MIR_STRUCTURAL_GATE = FAIL\n";
                 List.iter (fun e -> Printf.printf "    %s\n" e) errs;
-                Printf.printf "  RESULT: FAIL\n";
+                Printf.printf "  RESULT = WIP\n";
                 1
             | Ok () ->
-                Printf.printf "  MIR verify: PASS (%d functions)\n"
+                Printf.printf "  SEED_MIR_STRUCTURAL_GATE = PASS (%d functions)\n"
                   (Array.length prog.Seed_mir.functions);
-                Printf.printf "  RESULT: PASS\n";
-                0)
+                (* Lowering completeness oracle (audit): every left/right
+                   difference must be zero before the gate may claim a
+                   bootstrap-level pass. *)
+                let typed_functions = List.length env.contents.Typecheck.functions in
+                let typed_methods = List.length env.contents.Typecheck.methods in
+                let typed_consts = List.length env.contents.Typecheck.consts in
+                let typed_nominals = List.length env.contents.Typecheck.nominals in
+                let mir_functions = Array.length prog.Seed_mir.functions in
+                let mir_statics = Array.length prog.Seed_mir.statics in
+                let mir_types = Array.length prog.Seed_mir.types in
+                let mir_calls, callable_zero =
+                  let calls = ref 0 and zeros = ref 0 in
+                  Array.iter
+                    (fun fn ->
+                      Array.iter
+                        (fun blk ->
+                          match blk.Seed_mir.terminator with
+                          | Seed_mir.Call (_, Seed_mir.User inst, _, _, _) ->
+                              incr calls;
+                              let cid = inst.callable in
+                              if Ids.Callable_id.to_int cid = 0 then
+                                incr zeros
+                          | _ -> ())
+                        fn.Seed_mir.blocks)
+                    prog.Seed_mir.functions;
+                  (!calls, !zeros)
+                in
+                let diffs =
+                  [
+                    ("typed reachable functions", typed_functions, mir_functions);
+                    ("typed methods", typed_methods, 0);
+                    ("required static definitions", typed_consts, mir_statics);
+                    ("required concrete nominal type defs", typed_nominals, mir_types);
+                  ]
+                in
+                List.iter
+                  (fun (label, expected, emitted) ->
+                    Printf.printf "  oracle %-40s expected %6d  emitted %6d  %s\n"
+                      label expected emitted
+                      (if expected = emitted then "OK" else "DIFF"))
+                  diffs;
+                Printf.printf "  oracle calls with concrete callee InstanceId  emitted %6d  callable#0 uses %d\n"
+                  mir_calls callable_zero;
+                let incomplete =
+                  List.exists (fun (_, e, m) -> e <> m) diffs || callable_zero > 0
+                in
+                Printf.printf "  FRONTEND_SEMANTIC_GATE = %s\n"
+                  (if type_errors = [] then "PASS" else "FAIL");
+                if incomplete then begin
+                  Printf.printf "  BOOTSTRAP_EXECUTABLE_CLOSURE = INCOMPLETE\n";
+                  Printf.printf "  RESULT = WIP\n";
+                  1
+                end
+                else begin
+                  Printf.printf "  BOOTSTRAP_EXECUTABLE_CLOSURE = PASS\n";
+                  Printf.printf "  RESULT = PASS\n";
+                  0
+                end)
          end
        end)
 
@@ -494,6 +650,7 @@ let main () : int =
       | "check" -> cmd_check rest
       | "dump-ast" -> cmd_dump_ast rest
       | "lower" -> cmd_lower rest
+      | "interpret" -> cmd_interpret rest
       | "bootstrap-check" -> cmd_bootstrap_check rest
       | "compile" -> cmd_compile rest
       | "version" -> cmd_version ()

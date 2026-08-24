@@ -2,13 +2,17 @@
 
    A place is (root local, projection chain). Conflicts are determined by
    the effect pair and the place relationship; distinct fixed fields are
-   disjoint, dynamic indexes stay conservative (overlap). *)
+   disjoint, dynamic indexes stay conservative (overlap).
+
+   The post-resolution access representation is FieldId-based ONLY: the
+   kernel resolver assigns FieldIds (Ids.Field_id.make; see ids.ml) and
+   Seed MIR projects with `Field of Ids.Field_id.t` (mir_verify.ml), so
+   there is no name-keyed projection. *)
 
 type projection =
   | Field of Ids.Field_id.t
   | Index
   | Deref
-  | NamedField of string
 
 type access_path = {
   root : int;
@@ -53,10 +57,7 @@ let rec disjoint_projs (pa : projection list) (pb : projection list) : bool opti
   | Field fa :: ra, Field fb :: rb ->
       if Ids.Field_id.compare fa fb = 0 then disjoint_projs ra rb
       else Some true
-  | NamedField na :: ra, NamedField nb :: rb ->
-      if na = nb then disjoint_projs ra rb else Some true
   | (Index | Deref) :: _, _ | _, (Index | Deref) :: _ -> None (* conservative *)
-  | Field _ :: _, NamedField _ :: _ | NamedField _ :: _, Field _ :: _ -> Some true
 
 let places_conflict (a : access_path) (b : access_path) : bool =
   if not (same_root a b) then false
@@ -66,12 +67,12 @@ let places_conflict (a : access_path) (b : access_path) : bool =
     | _ -> true
   end
 
-(* A single access is self-conflicting when it is Consume (a consume
-   cannot target a borrowed chain etc.) — kept for completeness. *)
-let self_conflict (a : Access_effect.read_effect) : bool =
-  match a with Access_effect.Consume -> true | _ -> false
+(* Check a set of argument accesses; returns the first conflict.
 
-(* Check a set of argument accesses; returns the first conflict. *)
+   Pairwise conflict checking applies ONLY to DISTINCT argument accesses
+   (i <> j): a single access never conflicts with itself, so a lone
+   Consume (Sink) argument `f(sink x)` is accepted — there is no second
+   overlapping access to conflict with. *)
 let check_call_args (accesses : (access_path * Access_effect.read_effect) array) :
     (unit, conflict) result =
   let n = Array.length accesses in
@@ -84,8 +85,6 @@ let check_call_args (accesses : (access_path * Access_effect.read_effect) array)
         else begin
           let (pb, eb) = accesses.(j) in
           if i <> j && places_conflict pa pb && effects_conflict ea eb then
-            Error { path_a = pa; effect_a = ea; path_b = pb; effect_b = eb }
-          else if i = j && self_conflict ea then
             Error { path_a = pa; effect_a = ea; path_b = pb; effect_b = eb }
           else inner (j + 1)
         end

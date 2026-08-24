@@ -178,8 +178,11 @@ let int_signed_of (k : Type_repr.int_kind) : bool =
   | _ -> false
 
 let int_constant_of (k : Type_repr.int_kind) (i : int64) : Seed_mir.constant =
+  Seed_mir.Integer (Int_value.of_int64 ~width:(int_width_of k) ~signed:(int_signed_of k) i)
+
+let int_constant_of_words (k : Type_repr.int_kind) (lo : int64) (hi : int64) : Seed_mir.constant =
   Seed_mir.Integer
-    { Int_value.width = int_width_of k; signed = int_signed_of k; bits_lo = i; bits_hi = 0L }
+    (Int_value.of_words ~width:(int_width_of k) ~signed:(int_signed_of k) ~bits_lo:lo ~bits_hi:hi)
 
 (* ── Expression lowering ──────────────────────────────────────── *)
 
@@ -205,9 +208,10 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
           if Big_nat.fits_ocaml_int magnitude then
             (Seed_mir.Constant (int_constant_of kind (Int64.of_int (Big_nat.to_ocaml_int magnitude))),
              Type_repr.Int kind)
-          else if Big_nat.fits_unsigned magnitude 64 then
-            (Seed_mir.Constant (int_constant_of kind (Big_nat.to_bits magnitude |> fun _ -> Int64.of_string "0")), Type_repr.Int kind)
-          else seed_bug "integer literal out of host range in lowering")
+          else if Big_nat.fits_unsigned magnitude 128 then
+            let lo, hi = Big_nat.to_words_128 magnitude in
+            (Seed_mir.Constant (int_constant_of_words kind lo hi), Type_repr.Int kind)
+          else seed_bug "integer literal exceeds 128 bits in lowering")
       | None -> seed_bug "unparseable integer literal '%s'" lit)
   | Ast.FloatLit (lit, _) -> (
       match float_of_string_opt lit with
@@ -228,15 +232,12 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
           | None -> seed_bug "local _%d has no type in lowering" id)
       | None -> (
           match List.assoc_opt n env.values with
-          | Some ty ->
-              (Seed_mir.Constant (Seed_mir.Function (Ids.Instance_id.make ~callable:(Ids.Callable_id.make 0) ~type_args:[||])), ty)
+          | Some _ ->
+              seed_bug "function value `%s` reached lowering without a resolved callable identity" n
           | None -> seed_bug "unknown value '%s' in lowering" n))
-  | Ast.Path (a, b, _) -> (
-      let n = a ^ "::" ^ b in
-      match List.assoc_opt n env.values with
-      | Some ty ->
-          (Seed_mir.Constant (Seed_mir.Function (Ids.Instance_id.make ~callable:(Ids.Callable_id.make 0) ~type_args:[||])), ty)
-      | None -> seed_bug "unknown path value '%s' in lowering" n)
+  | Ast.Path (a, b, span) -> (
+      ignore span;
+      seed_bug "path value `%s::%s` reached lowering without a resolved callable identity" a b)
   | Ast.Binary (l, op, r, _) ->
       let lo, lt = lower_expr env st l in
       let ro, _rt = lower_expr env st r in
@@ -280,29 +281,33 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
       emit st (Seed_mir.Assign (cur_place st id, Seed_mir.Cast (io, rt)));
       (copy_place st (cur_place st id), rt)
   | Ast.Tuple (elems, _) ->
-      let ops = List.map (fun e -> fst (lower_expr env st e)) elems in
-      let tys = List.map (fun e -> snd (lower_expr env st e)) elems in
+      (* each element is lowered exactly once *)
+      let lowered = List.map (fun e -> lower_expr env st e) elems in
+      let ops = List.map fst lowered in
+      let tys = List.map snd lowered in
       let rt = Type_repr.Tuple (Array.of_list tys) in
       let id = fresh_local st rt in
       emit st (Seed_mir.Assign (cur_place st id, Seed_mir.Aggregate (Seed_mir.TupleAgg, ops)));
       (copy_place st (cur_place st id), rt)
   | Ast.Array (elems, _) ->
-      let ops = List.map (fun e -> fst (lower_expr env st e)) elems in
-      let tys = List.map (fun e -> snd (lower_expr env st e)) elems in
-      let rt = Type_repr.Tuple (Array.of_list tys) in
+      let lowered = List.map (fun e -> lower_expr env st e) elems in
+      let ops = List.map fst lowered in
+      let tys = List.map snd lowered in
+      let elem_ty =
+        match tys with
+        | t :: _ -> t
+        | [] -> Type_repr.Unit
+      in
+      let rt = Type_repr.Fixed_array (elem_ty, List.length elems) in
       let id = fresh_local st rt in
       emit st (Seed_mir.Assign (cur_place st id, Seed_mir.Aggregate (Seed_mir.ArrayAgg, ops)));
       (copy_place st (cur_place st id), rt)
-  | Ast.Index (base, idx, _) ->
-      let _bo, _ = lower_expr env st base in
-      let _io, _ = lower_expr env st idx in
-      let _bid = fresh_local st Type_repr.Unit in
-      (Seed_mir.Constant Seed_mir.Unit, Type_repr.Unit)
-  | Ast.Field (base, fname, _) ->
-      let _bo, bt = lower_expr env st base in
-      let rt = field_type_of bt fname in
-      let id = fresh_local st rt in
-      (copy_place st (cur_place st id), rt)
+  | Ast.Index (_, _, span) ->
+      ignore span;
+      seed_bug "Index reached MIR lowering without a supported typed lowering rule"
+  | Ast.Field (_, _, span) ->
+      ignore span;
+      seed_bug "Field access reached MIR lowering without a typed place (FieldId) rule"
   | Ast.IfExpr i -> lower_if env st i
   | Ast.MatchExpr m -> lower_match env st m
   | Ast.WhileExpr w -> lower_while env st w
@@ -348,15 +353,13 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
                    (copy_place st (cur_place st id), ty)
                | None -> seed_bug "assignment to unknown value '%s'" n))
        | _ -> (vo, vt))
-  | Ast.CompoundAssign (target, _op, value, _) ->
-      let _vo, _vt = lower_expr env st value in
-      let target_ty = target_type env target in
-      let id = fresh_local st target_ty in
-      (copy_place st (cur_place st id), target_ty)
+  | Ast.CompoundAssign (_, _, _, span) ->
+      ignore span;
+      seed_bug "CompoundAssign reached MIR lowering without a typed-place writeback rule"
   | Ast.Call (callee, _, args, _) -> lower_call env st callee args
-  | Ast.TryOp (e, _) ->
-      (* Option/Result unwrap: the seed subset lowers `e?` to e *)
-      lower_expr env st e
+  | Ast.TryOp (_, span) ->
+      ignore span;
+      seed_bug "`?` reached MIR lowering without enum branch + early-return lowering"
   | other -> seed_bug "unhandled supported expression form: %s" (expr_form_name other)
 
 and int_kind_of (t : Type_repr.t) : Type_repr.int_kind =
@@ -447,9 +450,9 @@ and lower_stmt (env : func_env) (st : lower_state) (s : Ast.stmt) : unit =
            st.local_names <- (id, n) :: st.local_names;
            st.scope <- (n, id) :: st.scope
        | None -> ())
-  | Ast.DeferStmt (b, _) ->
-      (* audit §30/§34: defer inlined at its statement position in the seed *)
-      ignore (lower_block env st b)
+  | Ast.DeferStmt (_, span) ->
+      ignore span;
+      seed_bug "defer reached MIR lowering without scope-exit cleanup planning"
   | Ast.Item _ -> ()
   | Ast.AttributeStmt _ | Ast.Attributed _ -> ()
 
@@ -607,23 +610,9 @@ and lower_call (env : func_env) (st : lower_state) (callee : Ast.expr)
             next_b;
           (copy_place st rp, ty)
       | None -> seed_bug "unknown callee '%s' in lowering" n)
-  | Ast.Field (recv, mname, _) -> (
-      let _rv, _rt = lower_expr env st recv in
-      match List.find_opt (fun ((_t, m), _) -> m = mname) env.methods with
-      | Some ((_t, _), inst) ->
-          let arg_ops =
-            List.map (fun a -> fst (lower_expr env st a.Ast.ca_value)) args
-          in
-          let id = fresh_local st Type_repr.Unit in
-          let rp = cur_place st id in
-          let arg_vals =
-            Array.of_list
-              (List.map (fun op -> { Seed_mir.effect_ = Access_effect.Read; value = op }) arg_ops)
-          in
-          let next_b = new_block st in
-          set_terminator_to st (Seed_mir.Call (rp, Seed_mir.User inst, arg_vals, next_b, None)) next_b;
-          (copy_place st rp, Type_repr.Unit)
-      | None -> seed_bug "unknown method '%s' in lowering" mname)
+  | Ast.Field (_, mname, span) -> (
+      ignore span;
+      seed_bug "method call `%s` reached lowering without a resolved receiver-typed instance" mname)
   | _ -> seed_bug "unsupported callee form in lowering"
 
 (* ── Function lowering ────────────────────────────────────────── *)
