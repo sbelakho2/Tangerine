@@ -1,8 +1,13 @@
-(* span.ml — Source spans and source maps.
+(* span.ml — Source spans with stable source-map identity.
 
-   A span is a half-open byte range [start, end) into the UTF-8 source of a
-   file, plus the file id. file_id = -1 marks synthetic spans (never
-   verified, never resolved). *)
+   A span is a half-open byte range [start, end) into the UTF-8 bytes of a
+   source. file_id = -1 marks synthetic spans (never verified, never
+   resolved).
+
+   The source map assigns each file a STABLE, monotonically increasing id
+   (never derived from list position after insertion — the previous
+   reversed-list implementation made every multi-file span resolve to the
+   wrong file). *)
 
 type span = {
   start : int;
@@ -16,67 +21,56 @@ let make start end_ file_id = { start; end_; file_id }
 
 let is_synthetic (s : span) = s.file_id = -1
 
+(* Structural bounds: a real span must satisfy 0 <= start <= end. *)
 let is_well_ordered (s : span) =
   if is_synthetic s then true
   else s.start >= 0 && s.end_ >= s.start
 
-let merged (a : span) (b : span) =
-  { start = min a.start b.start; end_ = max a.end_ b.end_; file_id = a.file_id }
+(* Merge two spans of the same file. A cross-file merge is an internal
+   invariant violation and must not be silently accepted. *)
+let merged (a : span) (b : span) : (span, string) result =
+  if is_synthetic a then Ok b
+  else if is_synthetic b then Ok a
+  else if a.file_id <> b.file_id then
+    Error
+      (Printf.sprintf "cross-file span merge: file %d [%d,%d) with file %d [%d,%d)"
+         a.file_id a.start a.end_ b.file_id b.start b.end_)
+  else
+    Ok { start = min a.start b.start; end_ = max a.end_ b.end_; file_id = a.file_id }
 
-type file_entry = {
-  name : string;
-  source : string;
-  line_starts : int array;
-}
+let merge_exn (m : (span, string) result) : span =
+  match m with
+  | Ok s -> s
+  | Error msg -> failwith ("internal: " ^ msg)
+
+(* Bounds against a concrete source length. *)
+let within_source (s : span) (source_len : int) =
+  if is_synthetic s then true
+  else s.start <= s.end_ && s.end_ <= source_len
 
 type source_map = {
-  mutable files : file_entry list;  (* reversed *)
+  files : (int, Source.source) Hashtbl.t;
+  mutable next_id : int;
 }
 
-let create () = { files = [] }
+let create () = { files = Hashtbl.create 16; next_id = 0 }
 
-let add_file sm name source =
-  let len = String.length source in
-  let starts = ref [ 0 ] in
-  for i = 0 to len - 1 do
-    if source.[i] = '\n' then starts := (i + 1) :: !starts
-  done;
-  let arr = Array.of_list (List.rev !starts) in
-  sm.files <- { name; source; line_starts = arr } :: sm.files;
-  List.length sm.files - 1
+let add_file sm (_name : string) (source : Source.source) : int =
+  let id = sm.next_id in
+  sm.next_id <- id + 1;
+  Hashtbl.add sm.files id source;
+  id
 
-(* Find the 1-based line whose start is the greatest line start <= offset.
-   Mirrors the Swift binary search (upper bound); an offset past the last
-   line start resolves to a phantom line. *)
-let find_line (starts : int array) (offset : int) : int =
-  let n = Array.length starts in
-  if n = 0 then 1
-  else if offset < starts.(0) then 1
-  else if offset >= starts.(n - 1) then n
-  else begin
-    let lo = ref 0 and hi = ref (n - 1) in
-    while !hi - !lo > 1 do
-      let mid = (!lo + !hi) / 2 in
-      if starts.(mid) <= offset then lo := mid else hi := mid
-    done;
-    !lo + 1
-  end
+let file_of_id sm file_id =
+  if file_id < 0 then None else Hashtbl.find_opt sm.files file_id
 
+(* Resolve a span to (file name, line, column) — 1-based, via the single
+   position authority in Source. *)
 let resolve sm (s : span) : (string * int * int) option =
   if s.file_id < 0 then None
-  else begin
-    let files = sm.files in
-    let n = List.length files in
-    if s.file_id >= n then None
-    else begin
-      let rec pick k = function
-        | f :: _ when k = 0 -> f
-        | _ :: rest -> pick (k - 1) rest
-        | [] -> assert false
-      in
-      let entry = pick s.file_id files in
-      let line = find_line entry.line_starts s.start in
-      let col = s.start - entry.line_starts.(line - 1) + 1 in
-      Some (entry.name, line, col)
-    end
-  end
+  else
+    match Hashtbl.find_opt sm.files s.file_id with
+    | None -> None
+    | Some src ->
+        let line, col = Source.position src s.start in
+        Some (src.Source.name, line, col)

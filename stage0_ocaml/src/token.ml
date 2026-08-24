@@ -1,12 +1,17 @@
 (* token.ml — Token kinds for the Tangerine lexer.
 
-   The kind set mirrors the stage0 Swift front end exactly (the
-   `lex` output contract and the differential token vocabulary depend on
-   it), extended where the Edition-2026 grammar requires it. *)
+   The kind set is derived from the Edition-2026 grammar. Identifiers carry
+   both the exact source spelling and the normalized (NFC) identity used
+   for name resolution — normalization never destroys the spelling. *)
+
+type identifier = {
+  spelling : string;
+  normalized : string;
+}
 
 type kind =
   (* Literals *)
-  | Ident of string
+  | Ident of identifier
   | Integer of string
   | Float of string
   | String of string
@@ -129,7 +134,7 @@ let keyword_of_string (text : string) : kind option =
 (* Human-readable name for diagnostics and the `lex` output. *)
 let display_name (k : kind) : string =
   match k with
-  | Ident s -> "identifier '" ^ s ^ "'"
+  | Ident i -> "identifier '" ^ i.spelling ^ "'"
   | Integer s -> "integer '" ^ s ^ "'"
   | Float s -> "float '" ^ s ^ "'"
   | String _ -> "string literal"
@@ -262,6 +267,9 @@ let display_name (k : kind) : string =
   | Eq -> "'='"
   | Question -> "'?'"
   | Eof -> "end of file"
+
+let ident_spelling (i : identifier) = i.spelling
+let ident_normalized (i : identifier) = i.normalized
 
 let is_trivia (k : kind) : bool =
   match k with

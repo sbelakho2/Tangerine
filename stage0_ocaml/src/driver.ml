@@ -27,30 +27,41 @@ Commands:
   help             Print this help message
 |}
 
-let load_source_or_report (path : string) : string option =
+let load_source_or_report (path : string) : Source.source option =
   match Source_loader.load path with
   | Ok s -> Some s
   | Error e ->
       (match e with
        | Source_loader.Unreadable p ->
            prerr_endline ("error: cannot read file '" ^ p ^ "'")
-       | Source_loader.NotUTF8 p ->
-           prerr_endline ("error: E9029: source file is not valid UTF-8: '" ^ p ^ "'"));
+       | Source_loader.NotUTF8 (p, uerr) ->
+           prerr_endline
+             (Printf.sprintf "error: E9029: source file is not valid UTF-8: '%s' (%s at byte %d)"
+                p (Utf8.error_string uerr.Utf8.kind) uerr.Utf8.offset)
+       | Source_loader.Security (p, msg) ->
+           prerr_endline (Printf.sprintf "error: source security scan failed: '%s' (%s)" p msg));
       None
 
-let front_end (path : string) : (Diagnostic.bag * Span.source_map * Ast.program) option =
+(* Pipeline phases (audit §48):
+   parse = UTF8 -> lex -> parse -> structural verification.
+   check = parse + bootstrap profile + cfg + resolution + typing +
+           access/resource + completeness oracle.
+   The front-end below implements parse and check. *)
+let front_end (path : string) (check : bool) :
+    (Diagnostic.bag * Span.source_map * Ast.program) option =
   match load_source_or_report path with
   | None -> None
-  | Some source ->
+  | Some src ->
       let sm = Span.create () in
-      let file_id = Span.add_file sm path source in
+      let file_id = Span.add_file sm src.Source.name src in
       let diags = Diagnostic.create_bag () in
-      let lx = Lexer.create source file_id diags in
+      let source_str = src.Source.bytes in
+      let lx = Lexer.create source_str file_id diags in
       let tokens = Lexer.lex lx in
       let module_path = Parser.module_path_of_file path in
-      let program = Parser.parse tokens source file_id diags module_path in
+      let program = Parser.parse tokens source_str file_id diags module_path in
       if not (Diagnostic.has_errors diags) then Verify.verify diags program;
-      if not (Diagnostic.has_errors diags) then Subset.check diags program;
+      if check && not (Diagnostic.has_errors diags) then Subset.check diags program;
       Some (diags, sm, program)
 
 let render_errors diags sm =
@@ -59,11 +70,11 @@ let render_errors diags sm =
 let cmd_lex (path : string) : int =
   match load_source_or_report path with
   | None -> 1
-  | Some source ->
+  | Some src ->
       let sm = Span.create () in
-      let file_id = Span.add_file sm path source in
+      let file_id = Span.add_file sm src.Source.name src in
       let diags = Diagnostic.create_bag () in
-      let lx = Lexer.create source file_id diags in
+      let lx = Lexer.create src.Source.bytes file_id diags in
       let tokens = Lexer.lex lx in
       List.iter
         (fun t ->
@@ -81,7 +92,7 @@ let cmd_lex (path : string) : int =
       end
 
 let cmd_parse_or_check (path : string) (check : bool) : int =
-  match front_end path with
+  match front_end path check with
   | None -> 1
   | Some (diags, sm, program) ->
       Printf.printf "Parsed %d top-level items\n" (List.length program.Ast.items);
@@ -110,7 +121,7 @@ let cmd_scan (dir : string) : int =
   List.iter
     (fun file ->
       incr total_files;
-      match front_end file with
+      match front_end file true with
       | None -> incr total_errors
       | Some (diags, sm, _) ->
           if Diagnostic.has_errors diags then begin
@@ -126,7 +137,7 @@ let cmd_scan (dir : string) : int =
   if !total_errors > 0 then 1 else 0
 
 let cmd_dump (path : string) : int =
-  match front_end path with
+  match front_end path true with
   | None -> 1
   | Some (diags, sm, program) ->
       if Diagnostic.has_errors diags then begin
@@ -140,7 +151,7 @@ let cmd_dump (path : string) : int =
       end
 
 let cmd_hash (path : string) : int =
-  match front_end path with
+  match front_end path true with
   | None -> 1
   | Some (diags, sm, program) ->
       if Diagnostic.has_errors diags then begin

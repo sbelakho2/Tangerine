@@ -62,15 +62,11 @@ and function_sig = {
 
 and param = {
   p_name : string;
-  p_mutable : bool;
   p_convention : access_convention;
-  p_modifier : param_modifier option;
   p_type : type_expr;
   p_default : expr option;
   p_span : Span.span;
 }
-
-and param_modifier = ModMut | ModRef | ModRefMut | ModMove | ModOwn
 
 and access_convention = LetAccess | InoutAccess | Sink | Set
 

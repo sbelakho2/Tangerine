@@ -5,13 +5,12 @@
    - E100/E106: legacy parameter spellings / safe-reference type positions
      (hard errors per grammar.md §2.3/§3 — the Swift stage0 treated E106 as
      a warning; the grammar is the spec here).
-   - E1100: expected-token parse errors.
-   - E9030: integer literal range gate (expression literals, literal
-     patterns, and const generic type args — the reference call sites). *)
+   - E1100: expected-token parse errors. *)
 
 type parser = {
   tokens : Token.t array;
   source : string;
+  source_obj : Source.source;
   file_id : int;
   diags : Diagnostic.bag;
   mutable pos : int;
@@ -19,12 +18,14 @@ type parser = {
   mutable inline_module_path : string list;
   mutable extern_abi_context : bool;
   mutable match_arm_cols : int list;
+  mutable type_arg_depth : int;
 }
 
 let make tokens source file_id diags =
   {
     tokens;
     source;
+    source_obj = Source.of_bytes ~name:"<parser>" ~bytes:source;
     file_id;
     diags;
     pos = 0;
@@ -32,8 +33,13 @@ let make tokens source file_id diags =
     inline_module_path = [];
     extern_abi_context = false;
     match_arm_cols = [];
+    type_arg_depth = 0;
   }
 
+(* Module identity is provided by the manifest loader, never derived from
+   OS paths (audit §11). This helper remains only for standalone/adhoc
+   parsing of a single file with a logical path derived from the argument;
+   the bootstrap pipeline passes explicit logical paths. *)
 let module_path_of_file (path : string) : string list =
   String.split_on_char '/' path
   |> List.map (fun seg ->
@@ -83,11 +89,13 @@ let expected p what =
   let got = Token.display_name (kind p) in
   err p "E1100" (Printf.sprintf "expected %s, found %s" what got) (cur_span p)
 
-let span_merged (p : parser) a b = Span.merged a b
-
 (* Span from a start span to the last consumed token's end. *)
 let span_end (p : parser) (start : Span.span) : Span.span =
   Span.make start.Span.start p.prev_end p.file_id
+
+(* The parser is single-file: every span shares one file id, so merges
+   cannot cross files and the total merge is safe. *)
+let span_merged (p : parser) a b = ignore p; Span.merge_exn (Span.merged a b)
 
 let src_text (p : parser) (s : Span.span) =
   if s.Span.file_id <> p.file_id || s.Span.start < 0 || s.Span.end_ > String.length p.source
@@ -106,59 +114,9 @@ let source_has_newline (p : parser) (a : Span.span) (b : Span.span) : bool =
   end
 
 (* ────────────────────────────────────────────────────────────────
-   Integer literal range gate (E9030) — INV-PARSE-003. *)
-
-let strip_suffix (text : string) : string =
-  let n = String.length text in
-  let rec find_ui i =
-    if i < 0 then None
-    else
-      match text.[i] with
-      | 'u' | 'i' -> Some i
-      | _ -> find_ui (i - 1)
-  in
-  match find_ui (n - 1) with
-  | None -> text
-  | Some ui ->
-      let body = String.sub text 0 ui in
-      let tail =
-        let t = String.sub text ui (n - ui) in
-        if String.length t > 1 && t.[0] = '_' then String.sub t 1 (String.length t - 1)
-        else t
-      in
-      let width = String.sub tail 1 (String.length tail - 1) in
-      if ui > 0 && (width = "" || width = "8" || width = "16" || width = "32" || width = "64")
-      then body
-      else text
-
-let fits_host_range (literal : string) : bool =
-  let body = strip_suffix literal in
-  let body = String.concat "" (String.split_on_char '_' body) in
-  let radix, digits =
-    if String.length body >= 2 then
-      match String.sub body 0 2 with
-      | "0x" | "0X" -> (16, String.sub body 2 (String.length body - 2))
-      | "0b" | "0B" -> (2, String.sub body 2 (String.length body - 2))
-      | "0o" | "0O" -> (8, String.sub body 2 (String.length body - 2))
-      | _ -> (10, body)
-    else (10, body)
-  in
-  match Util.parse_uint64_digits radix digits with
-  | Some _ -> true
-  | None -> false
-
-let check_integer_literal_range (p : parser) (literal : string) (span : Span.span) =
-  if not (fits_host_range literal) then
-    err p "E9030"
-      (Printf.sprintf
-         "integer literal '%s' does not fit the host integer range (UInt64 domain) (INV-PARSE-003)"
-         literal)
-      span
-
-(* ────────────────────────────────────────────────────────────────
    Soft keywords usable as identifiers. *)
 let soft_ident_kind = function
-  | Token.Ident s -> Some s
+  | Token.Ident i -> Some i.Token.spelling
   | Token.KwBudget -> Some "budget"
   | Token.KwDef -> Some "def"
   | Token.KwExtern -> Some "extern"
@@ -252,59 +210,13 @@ let eat_optional_semi (p : parser) = eat p Token.Semi
 
 let at_eof p = at p Token.Eof
 
-(* 1-based line of a byte offset. *)
+(* Single position authority: line/column via Source.position
+   (LF/CR/CRLF semantics, precomputed line starts). *)
 let line_of (p : parser) (offset : int) : int =
-  let i = ref (max 0 (min offset (String.length p.source))) in
-  let n = ref 1 in
-  for k = 0 to !i - 1 do
-    if p.source.[k] = '\n' then incr n
-  done;
-  !n
+  fst (Source.position p.source_obj offset)
 
-(* 1-based column of a byte offset (line starts after '\n'). *)
 let column_of (p : parser) (offset : int) : int =
-  let i = ref (max 0 (min offset (String.length p.source))) in
-  while !i > 0 && p.source.[!i - 1] <> '\n' do
-    decr i
-  done;
-  offset - !i + 1
-
-(* `end` as a block terminator vs an identifier use: when followed (on the
-   SAME line) by identifier-continuation tokens (=, +=, (, ., ::, :, [, ?),
-   `end` is a field/name; otherwise it terminates the enclosing block. *)
-let at_kw_end_as_terminator (p : parser) : bool =
-  if not (at p Token.KwEnd) then false
-  else begin
-    let nk = kind_at p 1 in
-    let is_continuation =
-      nk = Token.Eq || nk = Token.PlusEq || nk = Token.MinusEq
-      || nk = Token.StarEq || nk = Token.SlashEq || nk = Token.PercentEq
-      || nk = Token.CaretEq || nk = Token.AmpEq || nk = Token.PipeEq
-      || nk = Token.ShlEq || nk = Token.ShrEq
-      || nk = Token.LParen || nk = Token.Dot || nk = Token.ColonColon
-      || nk = Token.Colon || nk = Token.LBracket || nk = Token.Question
-    in
-    if is_continuation then
-      source_has_newline p (cur_span p) (peek_at p 1).Token.span
-    else true
-  end
-
-(* 1-based line of a byte offset. *)
-let line_of (p : parser) (offset : int) : int =
-  let i = ref (max 0 (min offset (String.length p.source))) in
-  let n = ref 1 in
-  for k = 0 to !i - 1 do
-    if p.source.[k] = '\n' then incr n
-  done;
-  !n
-
-(* 1-based column of a byte offset (line starts after '\n'). *)
-let column_of (p : parser) (offset : int) : int =
-  let i = ref (max 0 (min offset (String.length p.source))) in
-  while !i > 0 && p.source.[!i - 1] <> '\n' do
-    decr i
-  done;
-  offset - !i + 1
+  snd (Source.position p.source_obj offset)
 
 (* `end` as a block terminator vs an identifier use: when followed (on the
    SAME line) by identifier-continuation tokens (=, +=, (, ., ::, :, [, ?),
@@ -370,13 +282,14 @@ and parse_attributes (p : parser) : Ast.attribute list =
     if eat p Token.LParen then begin
       while not (at p Token.RParen) && not (at_eof p) do
         (match kind p with
-         | Token.Ident s ->
+         | Token.Ident i ->
              ignore (advance p);
+             let s = i.Token.spelling in
              if at p Token.Eq then begin
                ignore (advance p);
                let v =
                  match kind p with
-                 | Token.Ident s2 -> ignore (advance p); s2
+                 | Token.Ident i2 -> ignore (advance p); i2.Token.spelling
                  | Token.String s2 -> ignore (advance p); s2
                  | Token.Integer s2 -> ignore (advance p); s2
                  | _ -> ""
@@ -388,7 +301,7 @@ and parse_attributes (p : parser) : Ast.attribute list =
                let inner = ref [] in
                while not (at p Token.RParen) && not (at_eof p) do
                  (match kind p with
-                  | Token.Ident si -> ignore (advance p); inner := Ast.AttrIdent si :: !inner
+                  | Token.Ident si -> ignore (advance p); inner := Ast.AttrIdent si.Token.spelling :: !inner
                   | Token.String si -> ignore (advance p); inner := Ast.AttrString si :: !inner
                   | Token.Integer si -> ignore (advance p); inner := Ast.AttrInt si :: !inner
                   | _ -> ignore (advance p));
@@ -415,7 +328,7 @@ and parse_attributes (p : parser) : Ast.attribute list =
   done;
   List.rev !attrs
 
-and parse_function (p : parser) (attrs : Ast.attribute list) (vis : unit * bool) (is_pub : bool) :
+and parse_function (p : parser) (_attrs : Ast.attribute list) (_vis : unit * bool) (is_pub : bool) :
     Ast.item_kind option =
   let is_async = eat p Token.KwAsync in
   let is_unsafe = eat p Token.KwUnsafe in
@@ -540,7 +453,6 @@ and parse_param_list (p : parser) : Ast.param list =
 and parse_param (p : parser) : Ast.param =
   let start = cur_span p in
   let convention = ref Ast.LetAccess in
-  let modifier = ref None in
   let prefix () =
     match kind p with
     | Token.KwInout ->
@@ -557,8 +469,7 @@ and parse_param (p : parser) : Ast.param =
           "legacy parameter spelling 'mut' is removed; use the explicit access convention 'inout'"
           (cur_span p);
         ignore (advance p);
-        convention := Ast.InoutAccess;
-        modifier := Some Ast.ModMut
+        convention := Ast.InoutAccess
     | Token.Amp ->
         let amp_span = cur_span p in
         ignore (advance p);
@@ -567,21 +478,18 @@ and parse_param (p : parser) : Ast.param =
           err p "E100"
             "legacy parameter spelling '&mut' is removed; use the explicit access convention 'inout'"
             amp_span;
-          convention := Ast.InoutAccess;
-          modifier := Some Ast.ModRefMut
+          convention := Ast.InoutAccess
         end
         else begin
           err p "E100"
-            "legacy parameter spelling '&' is removed; use the default 'let' convention" amp_span;
-          modifier := Some Ast.ModRef
+            "legacy parameter spelling '&' is removed; use the default 'let' convention" amp_span
         end
-    | Token.Ident s when s = "move" || s = "own" ->
+    | Token.Ident i when i.Token.spelling = "move" || i.Token.spelling = "own" ->
         err p "E100"
           "legacy parameter spelling 'move'/'own' is removed; use the explicit access convention 'sink'"
           (cur_span p);
         ignore (advance p);
-        convention := Ast.Sink;
-        modifier := Some Ast.ModMove
+        convention := Ast.Sink
     | _ -> ()
   in
   prefix ();
@@ -611,9 +519,7 @@ and parse_param (p : parser) : Ast.param =
   let default = if eat p Token.Eq then Some (parse_expr p) else None in
   {
     Ast.p_name = name;
-    p_mutable = false;
     p_convention = !convention;
-    p_modifier = !modifier;
     p_type = ty;
     p_default = default;
     p_span = span_end p start;
@@ -767,9 +673,8 @@ and parse_block_body (p : parser) (terminators : Token.kind list) : Ast.block_bo
   done;
   { Ast.b_stmts = List.rev !stmts; b_tail = !tail; b_span = span_merged p start (cur_span p) }
 
-and parse_stmt (p : parser) (terminators : Token.kind list) : Ast.stmt =
+and parse_stmt (p : parser) (_terminators : Token.kind list) : Ast.stmt =
   let start = cur_span p in
-  prerr_endline (Printf.sprintf "STMT at %d kind=%s txt=%S" start.Span.start (Token.display_name (kind p)) (if start.Span.start < String.length p.source && start.Span.file_id = p.file_id then String.sub p.source start.Span.start (min 12 (String.length p.source - start.Span.start)) else "?"));
   match kind p with
   | Token.KwLet ->
       ignore (advance p);
@@ -844,10 +749,10 @@ and parse_type_primary (p : parser) : Ast.type_expr =
   | Token.KwFn | Token.KwDef ->
       ignore (advance p);
       parse_fn_type p start
-  | Token.Ident s when s = "Fn" || s = "FnOnce" || s = "FnMut" ->
+  | Token.Ident i when i.Token.spelling = "Fn" || i.Token.spelling = "FnOnce" || i.Token.spelling = "FnMut" ->
       ignore (advance p);
       parse_fn_type p start
-  | Token.Ident s when s = "_" ->
+  | Token.Ident i when i.Token.spelling = "_" ->
       ignore (advance p);
       Ast.Inferred (span_end p start)
   | Token.Ident _ | Token.KwSuper | Token.KwCrate ->
@@ -919,10 +824,16 @@ and parse_type_primary (p : parser) : Ast.type_expr =
       let amp_span = cur_span p in
       ignore (advance p);
       let mutable_ = eat p Token.KwMut in
-      if not p.extern_abi_context then
-        (* E106: the kernel's own var annotations still use &T (e.g.
-           `Map[String, &MirFunction]`); recover with the inner type. *)
-        Diagnostic.warning p.diags "E106"
+      (* E106 is a hard error in ordinary type position. The manifest
+         closure (bootstrap profile) contains exactly two exceptions:
+         (a) __intrinsic_* extern signatures — the internal ABI;
+         (b) `&T` nested inside type arguments (e.g.
+             `Map[String, &MirFunction]` in tg_compiler/mir.tg) — the
+             internal reference type in annotation position.
+         Both are recorded as SUPPORTED profile constructs; everything
+         else stops before semantics. *)
+      if not p.extern_abi_context && p.type_arg_depth = 0 then
+        err p "E106"
           "safe reference types are not first-class; use a parameter access convention / access operation"
           amp_span;
       let inner = parse_type_primary p in
@@ -958,6 +869,7 @@ and parse_type_name (p : parser) : string =
 and parse_optional_type_args (p : parser) : Ast.type_expr list =
   if not (at p Token.LBracket) then []
   else begin
+    p.type_arg_depth <- p.type_arg_depth + 1;
     ignore (advance p);
     let args = ref [] in
     while not (at p Token.RBracket) && not (at_eof p) do
@@ -971,7 +883,6 @@ and parse_optional_type_args (p : parser) : Ast.type_expr list =
       else
         match kind p with
         | Token.Integer lit ->
-            check_integer_literal_range p lit (cur_span p);
             ignore (advance p);
             args :=
               Ast.ConstExpr (Ast.IntLit (lit, span_merged p start (cur_span p)), span_merged p start (cur_span p))
@@ -981,6 +892,7 @@ and parse_optional_type_args (p : parser) : Ast.type_expr list =
     done;
     if at p Token.RBracket then ignore (advance p)
     else expected p "']' in type arguments";
+    p.type_arg_depth <- p.type_arg_depth - 1;
     List.rev !args
   end
 
@@ -1017,7 +929,7 @@ and parse_fn_type_param (p : parser) : Ast.type_expr =
         "legacy parameter spelling '&' is removed; use the explicit access convention"
         amp_span;
       parse_type p
-  | Token.Ident s when s = "move" || s = "own" ->
+  | Token.Ident i when i.Token.spelling = "move" || i.Token.spelling = "own" ->
       err p "E100"
         "legacy parameter spelling 'move'/'own' is removed; use the explicit access convention 'sink'"
         (cur_span p);
@@ -1607,7 +1519,7 @@ and parse_effect_decl (p : parser) : Ast.item_kind =
           sig_inline = false;
           sig_extern = false;
           sig_type_params = [];
-          sig_params = List.map (fun n -> { Ast.p_name = n; p_mutable = false; p_convention = Ast.LetAccess; p_modifier = None; p_type = Ast.Named ("", [], Span.synthetic); p_default = None; p_span = Span.synthetic }) (List.rev !op_params);
+          sig_params = List.map (fun n -> { Ast.p_name = n; p_convention = Ast.LetAccess; p_type = Ast.Named ("", [], Span.synthetic); p_default = None; p_span = Span.synthetic }) (List.rev !op_params);
           sig_return = ret;
           sig_where = [];
           sig_span = span_end p start;
@@ -1959,7 +1871,7 @@ and parse_postfix (p : parser) : Ast.expr =
         let ty = parse_type p in
         e := Ast.Cast (!e, ty, span_end p start);
         loop ()
-    | Token.Ident s when s = "is" ->
+    | Token.Ident i when i.Token.spelling = "is" ->
         let start = cur_span p in
         ignore (advance p);
         let ty = parse_type p in
@@ -2059,7 +1971,6 @@ and parse_primary (p : parser) : Ast.expr =
   let start = cur_span p in
   match kind p with
   | Token.Integer lit ->
-      check_integer_literal_range p lit (cur_span p);
       ignore (advance p);
       Ast.IntLit (lit, start)
   | Token.Float lit ->
@@ -2382,17 +2293,25 @@ and parse_macro_args (p : parser) (close : Token.kind) : Ast.macro_arg list =
   if top_level_opaque_macro_syntax p close then begin
     let start = cur_span p in
     let depth_paren = ref 0 and depth_bracket = ref 0 and depth_brace = ref 0 in
-    while not (at_eof p) do
-      (match kind p with
-       | Token.LParen -> incr depth_paren
-       | Token.RParen -> decr depth_paren
-       | Token.LBracket -> incr depth_bracket
-       | Token.RBracket -> decr depth_bracket
-       | Token.LBrace -> incr depth_brace
-       | Token.RBrace -> decr depth_brace
-       | _ -> ());
-      if !depth_paren = 0 && !depth_bracket = 0 && !depth_brace = 0 && at p close then ()
-      else ignore (advance p)
+    (* Collect raw tokens up to (not including) the depth-0 closer. *)
+    let continue_ = ref true in
+    while !continue_ && not (at_eof p) do
+      let k = kind p in
+      let at_close =
+        !depth_paren = 0 && !depth_bracket = 0 && !depth_brace = 0 && k = close
+      in
+      if at_close then continue_ := false
+      else begin
+        (match k with
+         | Token.LParen -> incr depth_paren
+         | Token.RParen -> if !depth_paren > 0 then decr depth_paren
+         | Token.LBracket -> incr depth_bracket
+         | Token.RBracket -> if !depth_bracket > 0 then decr depth_bracket
+         | Token.LBrace -> incr depth_brace
+         | Token.RBrace -> if !depth_brace > 0 then decr depth_brace
+         | _ -> ());
+        ignore (advance p)
+      end
     done;
     let text = src_text p (span_end p start) in
     [ Ast.MacroTokens (text, span_end p start) ]
@@ -2694,10 +2613,13 @@ and parse_if_expr (p : parser) (start : Span.span) : Ast.expr =
     else if is_expr_start p then begin
       let first_col = column_of p (cur_span p).Span.start in
       let s = parse_stmt p [ Token.KwEnd ] in
+      (* `;` after the first else expression means the branch continues on
+         the same line (else expr; expr) — the if's `end` closes the whole
+         construct, so the single-branch determination excludes `;`. *)
       let single =
         at_eof p || at_kw_end_as_terminator p
         || at p Token.RParen || at p Token.RBracket || at p Token.Comma
-        || at p Token.Semi || at p Token.RBrace
+        || at p Token.RBrace
         || ((is_expr_start p || at p Token.KwMut || at p Token.KwLet)
            && column_of p (cur_span p).Span.start < first_col)
       in
@@ -3099,17 +3021,17 @@ and parse_pattern (p : parser) : Ast.pattern =
 and parse_single_pattern (p : parser) : Ast.pattern =
   let start = cur_span p in
   match kind p with
-  | Token.Ident s when s = "_" ->
+  | Token.Ident i0 when i0.Token.spelling = "_" ->
       ignore (advance p);
       Ast.Wildcard (span_end p start)
-  | Token.Ident s when s = "ref" ->
+  | Token.Ident i when i.Token.spelling = "ref" ->
       err p "E106" "ref patterns are not supported; bind by value" (cur_span p);
       ignore (advance p);
       let name = expect_ident p in
       Ast.RefPattern (name, span_end p start)
-  | Token.Ident s when s = "mut" -> (
+  | Token.Ident i when i.Token.spelling = "mut" -> (
       (* handled below as KwMut; unreachable *)
-      ignore s;
+      ignore i;
       ignore (advance p);
       let name = expect_ident p in
       Ast.PatIdent (name, true, span_end p start))
@@ -3195,13 +3117,11 @@ and parse_single_pattern (p : parser) : Ast.pattern =
         else Ast.PatIdent (name, false, span_end p start)
       end)
   | Token.Integer lit ->
-      check_integer_literal_range p lit (cur_span p);
       ignore (advance p);
       if at p Token.DotDot || at p Token.DotDotEq then begin
         ignore (advance p);
         (match kind p with
          | Token.Integer hi ->
-             check_integer_literal_range p hi (cur_span p);
              ignore (advance p);
              Ast.RangePattern
                (Ast.PatLiteral (Ast.IntLit (lit, start), start),

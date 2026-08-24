@@ -236,13 +236,13 @@ let rec print_type (t : mir_type) : string =
         (print_type ret)
   | Unknown -> "?"
 
-let print_effect = function
+and print_effect = function
   | Read -> "read"
   | Modify -> "modify"
   | Consume -> "consume"
   | Initialize -> "init"
 
-let rec print_place (p : mir_place) : string =
+and print_place (p : mir_place) : string =
   let s = ref (Printf.sprintf "_%d" p.p_local) in
   List.iter
     (function
@@ -255,7 +255,7 @@ let rec print_place (p : mir_place) : string =
     p.p_projections;
   !s
 
-let print_constant (c : mir_constant) : string =
+and print_constant (c : mir_constant) : string =
   match c with
   | Unit -> "()"
   | Bool b -> if b then "true" else "false"
@@ -266,7 +266,7 @@ let print_constant (c : mir_constant) : string =
   | FnItem n -> n
   | ZeroSized -> "zst"
 
-let rec print_operand (op : mir_operand) : string =
+and print_operand (op : mir_operand) : string =
   match op with
   | MirCopy p -> print_place p
   | MirMovePlace p -> "move " ^ print_place p
@@ -274,20 +274,20 @@ let rec print_operand (op : mir_operand) : string =
   | MirConsume p -> "consume " ^ print_place p
   | MirConstant c -> print_constant c
 
-let print_bin_op = function
+and print_bin_op = function
   | Add -> "+" | Sub -> "-" | Mul -> "*" | Div -> "/" | Rem -> "%"
   | Eq -> "==" | Ne -> "!=" | Lt -> "<" | Le -> "<=" | Gt -> ">" | Ge -> ">="
   | And -> "&&" | Or -> "||"
   | BitAnd -> "&" | BitOr -> "|" | BitXor -> "^" | Shl -> "<<" | Shr -> ">>"
 
-let print_un_op = function Neg -> "Neg" | Not -> "Not"
+and print_un_op = function Neg -> "Neg" | Not -> "Not"
 
-let print_call_value (v : mir_call_value) : string =
+and print_call_value (v : mir_call_value) : string =
   match v with
   | CallValue op -> print_operand op
   | CallPlace p -> print_place p
 
-let print_rvalue (rv : mir_rvalue) : string =
+and print_rvalue (rv : mir_rvalue) : string =
   match rv with
   | Use op -> print_operand op
   | MirRef p -> "&" ^ print_place p
@@ -314,7 +314,7 @@ let print_rvalue (rv : mir_rvalue) : string =
   | Len p -> "Len(" ^ print_place p ^ ")"
   | Cast (op, t) -> print_operand op ^ " as " ^ print_type t
 
-let print_statement (st : mir_statement) : string =
+and print_statement (st : mir_statement) : string =
   match st with
   | Assign (p, rv) -> print_place p ^ " = " ^ print_rvalue rv ^ ";"
   | StorageLive id -> Printf.sprintf "StorageLive(_%d);" id
@@ -322,7 +322,7 @@ let print_statement (st : mir_statement) : string =
   | SetDiscriminant (p, d) -> Printf.sprintf "SetDiscriminant(%s, %d);" (print_place p) d
   | Nop -> "nop;"
 
-let print_terminator (t : mir_terminator) : string =
+and print_terminator (t : mir_terminator) : string =
   match t with
   | Goto b -> Printf.sprintf "goto -> bb%d;" b
   | Ret -> "return;"
@@ -358,7 +358,7 @@ let print_terminator (t : mir_terminator) : string =
   | Unreachable -> "unreachable;"
   | Abort -> "abort;"
 
-let print_function (fn : mir_function) : string =
+and print_function (fn : mir_function) : string =
   let buf = Buffer.create 256 in
   let params =
     String.concat ", "
@@ -396,5 +396,5 @@ let print_function (fn : mir_function) : string =
   Buffer.add_string buf "}\n";
   Buffer.contents buf
 
-let print_program (prog : mir_program) : string =
+and print_program (prog : mir_program) : string =
   String.concat "\n" (List.map print_function prog.prog_functions)

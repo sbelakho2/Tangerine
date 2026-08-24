@@ -27,14 +27,6 @@ let convention_tag = function
   | Ast.Sink -> " [sink]"
   | Ast.Set -> " [set]"
 
-let modifier_tag = function
-  | None -> ""
-  | Some Ast.ModMut -> " [mod:mut]"
-  | Some Ast.ModRef -> " [mod:ref]"
-  | Some Ast.ModRefMut -> " [mod:refmut]"
-  | Some Ast.ModMove -> " [mod:move]"
-  | Some Ast.ModOwn -> " [mod:own]"
-
 let binary_op_str = function
   | Ast.BOr -> "||"
   | Ast.BAnd -> "&&"
@@ -575,8 +567,7 @@ and dump_function_decl d (fn : Ast.function_decl) =
     List.iter
       (fun p ->
         emit d
-          (p.Ast.p_name ^ (if p.Ast.p_mutable then " [mut]" else "")
-         ^ convention_tag p.Ast.p_convention ^ modifier_tag p.Ast.p_modifier);
+          (p.Ast.p_name ^ convention_tag p.Ast.p_convention);
         push d;
         dump_type d p.Ast.p_type;
         pop d)
