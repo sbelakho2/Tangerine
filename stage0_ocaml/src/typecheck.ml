@@ -257,6 +257,9 @@ let builtin_types (st : state) : (string * Type_repr.t) list =
       ("f64", Type_repr.Float Type_repr.F64);
       ("Float", Type_repr.Float Type_repr.F64);
       ("Bool", Type_repr.Bool);
+      (* the kernel's string-slice type: `str` behaves as a String in the
+         bootstrap subset (std/core.tg impl String methods return str) *)
+      ("str", Type_repr.String);
       ("Char", Type_repr.Char);
       ("String", Type_repr.String);
       ("str", Type_repr.String);
@@ -1539,6 +1542,15 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
                   Ok { te_type = t; te_effects = Array.append te.te_effects [| Access_effect.Read |]; te_span = span }
               | Type_repr.Named (id, [| t |]) when Ids.Type_id.compare id b_array = 0 ->
                   Ok { te_type = t; te_effects = Array.append te.te_effects [| Access_effect.Read |]; te_span = span }
+              | Type_repr.Named (id, [| t |]) -> (
+                  (* the kernel's Array/Vec containers are indexable *)
+                  match List.assoc_opt id env.type_names with
+                  | Some ("Array" | "Vec") ->
+                      Ok { te_type = t; te_effects = Array.append te.te_effects [| Access_effect.Read |]; te_span = span }
+                  | _ ->
+                      Error
+                        (err span
+                           (Printf.sprintf "cannot index a value of type %s" (type_to_string te.te_type))))
               | _ ->
                   Error
                     (err span
@@ -2116,6 +2128,15 @@ and check_place (env : env) (scope : scope) (e : Ast.expr) : (Type_repr.t * bool
           match bt with
           | Type_repr.Fixed_array (t, _) -> Ok (t, bmut)
           | Type_repr.Named (id, [| t |]) when Ids.Type_id.compare id b_array = 0 -> Ok (t, bmut)
+          | Type_repr.Named (id, [| t |]) -> (
+              (* the kernel's Array/Vec containers are indexable *)
+              match List.assoc_opt id env.type_names with
+              | Some ("Array" | "Vec") -> Ok (t, bmut)
+              | _ -> (
+                  match check_expr env scope None idx with
+                  | Ok _ ->
+                      Error (err span (Printf.sprintf "cannot index a value of type %s" (type_to_string bt)))
+                  | Error m -> Error m))
           | _ -> (
               match check_expr env scope None idx with
               | Ok _ ->
@@ -2328,13 +2349,21 @@ and check_call (env : env) (scope : scope) (expected : Type_repr.t option)
                                kernel's `Array`; the builtin nominal may carry
                                several names; try each *)
                             let owner_nom_names =
-                              match List.assoc_opt owner env.types with
-                              | Some (Type_repr.Named (tid, _)) ->
-                                  List.filter_map
-                                    (fun (t, n) ->
-                                      if Ids.Type_id.compare t tid = 0 then Some n else None)
-                                    env.type_names
-                              | _ -> []
+                              let base =
+                                match List.assoc_opt owner env.types with
+                                | Some (Type_repr.Named (tid, _)) ->
+                                    List.filter_map
+                                      (fun (t, n) ->
+                                        if Ids.Type_id.compare t tid = 0 then Some n else None)
+                                      env.type_names
+                                | _ -> []
+                              in
+                              (* kernel convention (std/collections.tg):
+                                 `Vec[T] is an alias for Array[T]` — static
+                                 constructors dispatch to the Array impl *)
+                              if owner = "Vec" then "Array" :: base
+                              else if owner = "Array" then "Vec" :: base
+                              else base
                             in
                             let rec try_aliases = function
                               | [] ->
@@ -2516,7 +2545,20 @@ and check_call_sig (env : env) (scope : scope) (expected : Type_repr.t option)
                             | _ -> None)
                         | _ -> None
                       in
+                      let int_kind_adopt () =
+                        (* the kernel passes Int values where a typed-width
+                           integer (u32/i32/...) is expected; the value is
+                           truncated by the callee's width semantics *)
+                        match pt, ate.te_type with
+                        | Type_repr.Int pk, Type_repr.Int ak when pk <> ak -> Some ()
+                        | _ -> None
+                      in
                       match same_named_arg () with
+                      | Some () ->
+                          let eff = Access_effect.read_effect sig_.ts_params.(i).Type_repr.pt_convention in
+                          go (ate :: acc) (eff :: effects) (i + 1) rest
+                      | None -> (
+                      match int_kind_adopt () with
                       | Some () ->
                           let eff = Access_effect.read_effect sig_.ts_params.(i).Type_repr.pt_convention in
                           go (ate :: acc) (eff :: effects) (i + 1) rest
@@ -2543,7 +2585,7 @@ and check_call_sig (env : env) (scope : scope) (expected : Type_repr.t option)
                           Error
                             (err a.Ast.ca_span
                                (Printf.sprintf "argument %d type mismatch: expected %s, found %s (%s)"
-                                  (i + 1) (type_to_string pt) (type_to_string ate.te_type) m)))))
+                                  (i + 1) (type_to_string pt) (type_to_string ate.te_type) m))))))
             end)
       in
       go [] [] 0 args
@@ -2560,7 +2602,53 @@ and check_call_sig (env : env) (scope : scope) (expected : Type_repr.t option)
        | Some exp -> (
            match unify s3 (substitute_fixpoint !subst sig_.ts_return) exp with
            | Ok () -> ()
-           | Error _ -> ())
+           | Error _ -> (
+               (* nominal/alias fallback: `Vec` and the kernel's `Array` are
+                  the same container; unify the type arguments by name *)
+               let ret = substitute_fixpoint !subst sig_.ts_return in
+               let rec same_named_ret a b =
+                 match a, b with
+                 | Type_repr.Named (id1, a1), Type_repr.Named (id2, a2)
+                   when Ids.Type_id.compare id1 id2 <> 0 -> (
+                     let n1 = List.assoc_opt id1 env.type_names in
+                     let n2 = List.assoc_opt id2 env.type_names in
+                     let alias_pair =
+                       match n1, n2 with
+                       | Some n, Some m ->
+                           (n = "Vec" && m = "Array") || (n = "Array" && m = "Vec")
+                           || n = m
+                       | _ -> false
+                     in
+                     if not alias_pair || Array.length a1 <> Array.length a2 then None
+                     else begin
+                       let s4 = ref [] in
+                       let rec go i =
+                         if i >= Array.length a1 then Some ()
+                         else
+                           match same_named_ret a1.(i) a2.(i) with
+                           | Some () -> go (i + 1)
+                           | None -> None
+                       in
+                       match go 0 with
+                       | Some () ->
+                           List.iter
+                             (fun (k, v) ->
+                               if not (List.mem_assoc k !s3) then s3 := (k, v) :: !s3)
+                             !s4;
+                           Some ()
+                       | None -> None
+                     end)
+                 | _ -> (
+                     let s5 = ref [] in
+                     match unify s5 a b with
+                     | Ok () ->
+                         List.iter
+                           (fun (k, v) -> if not (List.mem_assoc k !s3) then s3 := (k, v) :: !s3)
+                           !s5;
+                         Some ()
+                     | Error _ -> None)
+               in
+               ignore (same_named_ret ret exp)))
        | None -> ());
       List.iter
         (fun (k, v) -> if not (List.mem_assoc k !subst) then subst := (k, v) :: !subst)
@@ -2641,13 +2729,40 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
     | Type_repr.Fixed_array _ -> Some "Array"
     | _ -> primitive_name owner_ty
   in
-  match owner_name with
-  | None -> Error (err span (Printf.sprintf "type %s has no methods" (type_to_string owner_ty)))
-  | Some oname -> (
-      match List.assoc_opt (oname, mname) env.methods with
-      | None ->
-          env.state.oracle.o_unresolved_calls <- env.state.oracle.o_unresolved_calls + 1;
-          Error (err span (Printf.sprintf "type `%s` has no method `%s`" oname mname))
+  (* candidate owners: the nominal name (with kernel aliases), or — for a
+     generic receiver — the trait bounds on its type parameter *)
+  let candidate_owners =
+    match owner_name with
+    | None -> (
+        match owner_ty with
+        | Type_repr.Type_param pid -> (
+            match List.assoc_opt pid env.impls.Trait_solver.param_bounds with
+            | Some bounds -> List.map fst bounds
+            | None -> [])
+        | _ -> [])
+    | Some oname -> (
+        match oname with
+        | "Vec" -> [ oname; "Array" ]
+        | "Array" -> [ oname; "Vec" ]
+        | "String" -> [ oname; "str" ]
+        | "str" -> [ oname; "String" ]
+        | _ -> [ oname ])
+  in
+  let rec try_owners = function
+    | [] -> None
+    | o :: rest -> (
+        match List.assoc_opt (o, mname) env.methods with
+        | Some sig_ -> Some sig_
+        | None -> try_owners rest)
+  in
+  (* the nominal owner name (used by receiver unification below) *)
+  let oname = match owner_name with Some n -> n | None -> "" in
+  match try_owners candidate_owners with
+  | None ->
+      env.state.oracle.o_unresolved_calls <- env.state.oracle.o_unresolved_calls + 1;
+      Error
+        (err span
+           (Printf.sprintf "type %s has no method `%s`" (type_to_string owner_ty) mname))
       | Some sig_ -> (
           if Array.length sig_.ts_params = 0 then
             Error (err span "internal: method signature without a receiver")
@@ -2766,11 +2881,32 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
                                   !s2;
                                 let eff = Access_effect.read_effect sig_.ts_params.(ai).Type_repr.pt_convention in
                                 go (ate :: acc) (eff :: effects) (i + 1) rest)
-                            | Error m ->
-                                Error
-                                  (err a.Ast.ca_span
-                                     (Printf.sprintf "argument %d type mismatch: expected %s, found %s (%s)"
-                                        (i + 1) (type_to_string pt) (type_to_string ate.te_type) m)))
+                            | Error m -> (
+                                (* call-site coercion: an explicit-ref argument
+                                   derefs to its pointee for a by-value param *)
+                                let deref_ok () =
+                                  match ate.te_type with
+                                  | Type_repr.Ref_internal (_, inner) -> (
+                                      let s3 = ref [] in
+                                      match unify s3 pt inner with
+                                      | Ok () ->
+                                          List.iter
+                                            (fun (k, v) ->
+                                              if not (List.mem_assoc k !subst) then subst := (k, v) :: !subst)
+                                            !s3;
+                                          Some ()
+                                      | Error _ -> None)
+                                  | _ -> None
+                                in
+                                match deref_ok () with
+                                | Some () ->
+                                    let eff = Access_effect.read_effect sig_.ts_params.(ai).Type_repr.pt_convention in
+                                    go (ate :: acc) (eff :: effects) (i + 1) rest
+                                | None ->
+                                    Error
+                                      (err a.Ast.ca_span
+                                         (Printf.sprintf "argument %d type mismatch: expected %s, found %s (%s)"
+                                            (i + 1) (type_to_string pt) (type_to_string ate.te_type) m))))
                       end)
                 in
                 go [] [] 0 args
@@ -2828,7 +2964,9 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
                   {
                     target = Some sig_.ts_callable;
                     substitution;
-                    args = Array.of_list tes;
+                    (* the receiver is an argument: effects include its
+                       convention, so the args array must too *)
+                    args = Array.of_list (receiver :: tes);
                     effects = all_effects;
                     return_type = ret;
                   }
@@ -2837,7 +2975,7 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
                 Ok { te_type = ret; te_effects = all_effects; te_span = span }
               end
             end
-          end))
+          end)
 
 (* ────────────────────────────────────────────────────────────────
    Items: checking *)
