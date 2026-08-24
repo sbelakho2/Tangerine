@@ -72,6 +72,12 @@ let init_slot (s : slot) (v : t) : (slot, slot_error) result =
   | Dropped -> Error InitializeDropped
   | Uninitialized | Moved -> Ok (Live v)
 
+(* Assign semantics: overwrite a live slot, initialize an empty one. *)
+let write_slot (s : slot) (v : t) : (slot, slot_error) result =
+  match s with
+  | Live _ | Uninitialized | Moved -> Ok (Live v)
+  | Dropped -> Error InitializeDropped
+
 (* ── Structural helpers ─────────────────────────────────────────── *)
 
 let rec equal (a : t) (b : t) : bool =

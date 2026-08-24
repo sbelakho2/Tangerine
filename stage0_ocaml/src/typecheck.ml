@@ -2652,6 +2652,12 @@ let qualified_name (mp : string list) (n : string) : string =
 let rec check_function_body (env : env) (extra_tp_bounds : (string * string list) list)
     (sig_ : typed_signature) (d : Ast.function_decl) : (unit, string) result =
   let scope =
+    let n_ast = List.length d.fn_sig.sig_params in
+    let n_sig = Array.length sig_.ts_params in
+    if n_ast > n_sig then
+      failwith
+        (Printf.sprintf "ts_params mismatch in %s: ast=%d sig=%d"
+           sig_.ts_name n_ast n_sig);
     {
       locals =
         List.mapi
@@ -3341,16 +3347,19 @@ let run_impl_backstop (env : env) : string list =
 let check_item (env : env) (item : Ast.item) : (unit, string) result = check_item env item
 
 let check_program (env : env) (program : Ast.program) : (env * string list, string) result =
-  let* env1 =
-    let rec go env = function
-      | [] -> Ok env
-      | item :: rest -> (
-          match register_item env item with
-          | Ok env' -> go env' rest
-          | Error m -> Error m)
-    in
-    go env program.Ast.items
+  (* Registration is non-fatal: items whose signatures reference not-yet-
+     registered types are deferred (reported as errors), so a module with
+     forward/cyclic references still contributes everything it can. The
+     driver retries modules to a fixpoint with a growing env. *)
+  let rec go_reg (env : env) (acc : string list) = function
+    | [] -> Ok (env, List.rev acc)
+    | item :: rest -> (
+        let name = Ast.item_summary item.Ast.kind in
+        match register_item env item with
+        | Ok env' -> go_reg env' acc rest
+        | Error m -> go_reg env ((name ^ ": " ^ m) :: acc) rest)
   in
+  let* env1, reg_errors = go_reg env [] program.Ast.items in
   let rec go (errors : string list) = function
     | [] -> Ok (env1, List.rev errors)
     | item :: rest -> (
@@ -3364,7 +3373,7 @@ let check_program (env : env) (program : Ast.program) : (env * string list, stri
             let findings = run_oracle env1 name in
             go (List.map (fun f -> name ^ ": " ^ f) findings @ errors) rest)
   in
-  let* final_env, errors = go [] program.Ast.items in
+  let* final_env, errors = go reg_errors program.Ast.items in
   let backstop = run_impl_backstop final_env in
   Ok (final_env, errors @ backstop)
 

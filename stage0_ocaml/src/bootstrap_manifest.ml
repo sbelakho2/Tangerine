@@ -143,6 +143,10 @@ end
 
 let load ~(repo_root : string) ~(manifest_path : string) : (t, string) result =
   let open Result in
+  let manifest_path =
+    if Filename.is_relative manifest_path then Filename.concat repo_root manifest_path
+    else manifest_path
+  in
   match Source_loader.load manifest_path with
   | Error _ -> Error (Printf.sprintf "cannot read manifest '%s'" manifest_path)
   | Ok manifest_src ->

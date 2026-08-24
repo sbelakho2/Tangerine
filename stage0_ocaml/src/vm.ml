@@ -34,7 +34,7 @@ type t = {
   program : Seed_mir.program;
   fn_index : (Ids.Instance_id.t, int) Hashtbl.t;  (* lookup only; iteration is never semantic *)
   memory : Vm_memory.t;
-  host : Host.t;
+  mutable host : Host.t;
   limits : limits;
   mutable steps : int;
   mutable host_calls : int;
@@ -56,7 +56,13 @@ let step_limit (vm : t) : unit =
   if vm.steps > vm.limits.max_steps then
     raise (Failure "vm: step limit exceeded")
 
-let err_trap _vm msg = raise (Failure ("vm trap: " ^ msg))
+let err_trap vm msg =
+  let where =
+    match vm.frames with
+    | f :: _ -> Printf.sprintf " (fn %d bb%d stmt %d)" f.fn f.block f.stmt
+    | [] -> " (entry frame)"
+  in
+  raise (Failure ("vm trap: " ^ msg ^ where))
 
 (* Evaluate an operand to a value (with slot-state checks). *)
 let rec eval_operand (vm : t) (frame : frame) (op : Seed_mir.operand) : Vm_value.t =
@@ -162,7 +168,7 @@ let rec write_place (vm : t) (frame : frame) (p : Seed_mir.place) (v : Vm_value.
   step_limit vm;
   match p.Seed_mir.projections with
   | [] -> (
-      match Vm_value.init_slot frame.locals.(p.Seed_mir.local) v with
+      match Vm_value.write_slot frame.locals.(p.Seed_mir.local) v with
       | Ok s -> frame.locals.(p.Seed_mir.local) <- s
       | Error e -> err_trap vm (Vm_value.slot_error_string e))
   | projs -> (
@@ -172,7 +178,7 @@ let rec write_place (vm : t) (frame : frame) (p : Seed_mir.place) (v : Vm_value.
         | Error e -> err_trap vm (Vm_value.slot_error_string e)
       in
       let updated = update_place vm base projs v in
-      match Vm_value.init_slot frame.locals.(p.Seed_mir.local) updated with
+      match Vm_value.write_slot frame.locals.(p.Seed_mir.local) updated with
       | Ok s -> frame.locals.(p.Seed_mir.local) <- s
       | Error e -> err_trap vm (Vm_value.slot_error_string e))
 
@@ -432,12 +438,19 @@ let rec exec_terminator (vm : t) (frame : frame) (term : Seed_mir.terminator) : 
                stmt = 0 }
            in
            (try
+              (* params occupy locals _1 .. _n (local _0 is the return slot) *)
               Array.iteri
-                (fun i _slot -> callee_frame.locals.(i) <- Vm_value.Live arg_vals.(i))
+                (fun i _slot -> callee_frame.locals.(i + 1) <- Vm_value.Live arg_vals.(i))
                 (Array.sub arg_vals 0 (Array.length fn.Seed_mir.params));
               run_frame vm callee_frame
             with Exit -> ());
+           let ret =
+             match callee_frame.locals.(0) with
+             | Vm_value.Live v -> v
+             | _ -> Vm_value.Unit
+           in
            vm.frames <- List.tl vm.frames;
+           write_place vm frame dest ret;
            frame.block <- next;
            frame.stmt <- 0
        | Seed_mir.Intrinsic id | Seed_mir.Extern id ->
@@ -484,11 +497,24 @@ and run_frame (vm : t) (frame : frame) : unit =
     let block = fn.Seed_mir.blocks.(frame.block) in
     if frame.stmt < List.length block.Seed_mir.statements then begin
       let st = List.nth block.Seed_mir.statements frame.stmt in
-      exec_statement vm frame st;
-      frame.stmt <- frame.stmt + 1;
-      go ()
+      (try
+         exec_statement vm frame st;
+         frame.stmt <- frame.stmt + 1;
+         go ()
+       with Failure msg ->
+         raise
+           (Failure
+              (Printf.sprintf "%s [fn %d bb%d id=%d stmts=%d]"
+                 msg frame.fn frame.block
+                 (if frame.block < Array.length fn.Seed_mir.blocks then fn.Seed_mir.blocks.(frame.block).Seed_mir.id else -1)
+                 (if frame.block < Array.length fn.Seed_mir.blocks then List.length fn.Seed_mir.blocks.(frame.block).Seed_mir.statements else -1))))
     end
-    else exec_terminator vm frame block.Seed_mir.terminator
+    else
+      (try
+         exec_terminator vm frame block.Seed_mir.terminator;
+         go ()
+       with Failure msg ->
+         raise (Failure (Printf.sprintf "%s [fn %d bb%d term]" msg frame.fn frame.block)))
   in
   go ()
 
@@ -509,19 +535,60 @@ and exec_statement (vm : t) (frame : frame) (st : Seed_mir.statement) : unit =
       | _ -> err_trap vm "SetDiscriminant on non-enum")
   | Seed_mir.Nop -> ()
 
-let run ~(program : Seed_mir.program) ~(entry : Ids.Instance_id.t) ~(argv : string array)
-    ~(host : Host.t) : (int, vm_error) result =
+(* Re-run the entry frame and return the entry return slot as text
+   (self-check/inspection helper). *)
+let rec run_inspect (vm : t) (entry_frame : frame) : (string, string) result =
+  (try
+     run_frame vm entry_frame;
+     Ok "unit"
+   with
+  | Failure msg -> Error msg
+  | Exit -> (
+      match entry_frame.locals.(0) with
+      | Vm_value.Live v -> (
+          match v with
+          | Vm_value.Int i -> Ok (Int_value.to_string i)
+          | Vm_value.Bool b -> Ok (if b then "true" else "false")
+          | Vm_value.String s -> Ok s
+          | Vm_value.Unit -> Ok "()"
+          | other -> Ok (Printf.sprintf "<%s>" (value_kind other)))
+      | Vm_value.Uninitialized -> Ok "<uninitialized>"
+      | Vm_value.Moved -> Ok "<moved>"
+      | Vm_value.Dropped -> Ok "<dropped>"))
+
+and value_kind (v : Vm_value.t) : string =
+  match v with
+  | Vm_value.Unit -> "unit"
+  | Vm_value.Bool _ -> "bool"
+  | Vm_value.Int _ -> "int"
+  | Vm_value.Float32 _ -> "f32"
+  | Vm_value.Float64 _ -> "f64"
+  | Vm_value.Char _ -> "char"
+  | Vm_value.String _ -> "string"
+  | Vm_value.Tuple _ -> "tuple"
+  | Vm_value.Struct _ -> "struct"
+  | Vm_value.Enum _ -> "enum"
+  | Vm_value.Array _ -> "array"
+  | Vm_value.Function _ -> "fn"
+  | Vm_value.Closure _ -> "closure"
+  | Vm_value.RawPtr _ -> "ptr"
+  | Vm_value.Ref _ -> "ref"
+  | Vm_value.Null -> "null"
+
+(* Build an entry frame without running (inspection). *)
+let entry_frame_of ~(program : Seed_mir.program) ~(entry : Ids.Instance_id.t) ~(argv : string array) :
+    (t * frame, string) result =
   let fn_index = Hashtbl.create 64 in
   Array.iteri (fun i fn -> Hashtbl.replace fn_index fn.Seed_mir.instance i) program.Seed_mir.functions;
   match Hashtbl.find_opt fn_index entry with
-  | None -> Error { kind = Trap "entry instance not found"; message = "entry missing"; trace = [] }
+  | None -> Error "entry instance not found"
   | Some fn_idx ->
       let vm =
         {
           program;
           fn_index;
           memory = Vm_memory.create ();
-          host;
+          host = Host.create ~repo_root:"." ~argv:[||];
           limits = default_limits;
           steps = 0;
           host_calls = 0;
@@ -533,10 +600,19 @@ let run ~(program : Seed_mir.program) ~(entry : Ids.Instance_id.t) ~(argv : stri
         }
       in
       let fn = program.Seed_mir.functions.(fn_idx) in
-      let entry_frame = { fn = fn_idx; locals = Array.make (Array.length fn.Seed_mir.locals) Vm_value.Uninitialized; block = fn.Seed_mir.entry; stmt = 0 } in
+      let entry_frame =
+        { fn = fn_idx; locals = Array.make (Array.length fn.Seed_mir.locals) Vm_value.Uninitialized; block = fn.Seed_mir.entry; stmt = 0 }
+      in
+      Array.iteri (fun i s -> entry_frame.locals.(i) <- Vm_value.Live (Vm_value.String s)) argv;
+      Ok (vm, entry_frame)
+
+let run ~(program : Seed_mir.program) ~(entry : Ids.Instance_id.t) ~(argv : string array)
+    ~(host : Host.t) : (int, vm_error) result =
+  match entry_frame_of ~program ~entry ~argv with
+  | Error m -> Error { kind = Trap "entry instance not found"; message = m; trace = [] }
+  | Ok (vm, entry_frame) ->
+      vm.host <- host;
       (try
-         (* argv is passed as a host value for the bootstrap entry *)
-         Array.iteri (fun i s -> entry_frame.locals.(i) <- Vm_value.Live (Vm_value.String s)) argv;
          run_frame vm entry_frame;
          Ok 0
        with

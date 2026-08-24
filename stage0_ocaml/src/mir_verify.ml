@@ -375,7 +375,8 @@ let init_in_sets (fn : function_) (tbl : (int, block) Hashtbl.t) : (int, IntSet.
     !out
   in
   let in_set = Hashtbl.create 16 and out_set = Hashtbl.create 16 in
-  let entry_init = IntSet.of_list (List.init (Array.length fn.params) (fun i -> i)) in
+  (* locals: _0 is the return slot; params occupy _1 .. _n *)
+  let entry_init = IntSet.of_list (List.init (Array.length fn.params) (fun i -> i + 1)) in
   Hashtbl.add in_set fn.entry entry_init;
   let work = Queue.create () in
   let in_work = Hashtbl.create 16 in
