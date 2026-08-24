@@ -3,7 +3,53 @@
    Lowering operates on the syntax AST plus a name→type environment
    produced by the type checker; every lowered construct is typed. If a
    construct is reached with an unknown type, lowering raises Seed_bug
-   (never produces Nop). *)
+   (never produces Nop).
+
+   Seed-surface constructs implemented here:
+
+   - Variant match arms (Ast.PatVariant): the subject is an enum value.
+     The Seed VM represents an enum as `Vm_value.Enum (tag, payload)` —
+     tag = variant index in declaration order, payload = the variant's
+     field array (see vm_value.ml).  Lowering emits the subject into a
+     local, computes the discriminant with the `Discriminant` rvalue
+     (the VM returns the tag as an Int), dispatches with one SwitchInt
+     whose targets are the per-variant tags (0-based declaration order,
+     matching EnumCtor's tags), and binds each arm's payload fields by
+     projecting the subject with [Downcast vid; Field i] (the VM's
+     Downcast turns the payload into a Struct, Field picks field i).
+     Payload binding locals are Copy-read when the payload type is
+     copyable (non-copy payload binding fails closed: the seed VM's Move
+     operand ignores projections, so a projected move would be wrong).
+
+   - `?` (Ast.TryOp): the subject is an Option/Result.  The success
+     variant (tag 0) supplies the expression value (the payload read
+     via the Downcast/Field projection above); the failure variant
+     early-returns from the enclosing function: the subject is copied
+     into the return slot (enum values are copyable under the verifier
+     since their def is Function (_, Never)) and `Ret` is emitted, with
+     the function-level defer bodies running first.  The subject's type
+     must equal the enclosing function's return type (fail-closed
+     otherwise).
+
+   - `for x in [..] do` (Ast.ForExpr): the seed VM cannot execute
+     dynamic index projections (vm.ml traps on Seed_mir.Index), so a
+     for-loop over a compile-time Array literal is UNROLLED into
+     per-element body copies with ConstantIndex element reads; a
+     non-literal iterable fails closed (the kernel's runtime Vec
+     iteration needs a dynamic-index VM that this seed does not have).
+
+   - defer (Ast.DeferStmt): each function accumulates a defer stack
+     (function level; nested scopes are flattened to function level for
+     the seed).  Every return terminator — explicit `return`, the `?`
+     failure path, and the function's final implicit return — first
+     lowers the collected defer bodies inline in reverse declaration
+     order (LIFO), then assigns the return slot, then emits Ret.
+
+   - Statics/consts: there is AST plumbing (Ast.ConstDecl/Ast.StaticDecl
+     and a Typecheck `consts` registry), but the Mir_lower API carries
+     no const/static table and the driver passes `statics = [||]`, so
+     names that resolve only to consts/statics fail closed at lowering
+     with Seed_bug.  See the statics TODO at the bottom of the file. *)
 
 exception Seed_bug of string
 
@@ -19,6 +65,99 @@ type func_env = {
   fn_ret : Type_repr.t;
 }
 
+(* ── Variant tables ──────────────────────────────────────────────
+
+   The seed representation of an enum value is
+   `Vm_value.Enum (variant_index_in_declaration_order, payload)`
+   (vm_value.ml), constructed by EnumCtor and read by Discriminant /
+   Downcast / Field projections.  Variant indices must therefore be
+   consistent across construction sites and match arms within one
+   program.  The builtin enums Option (Some=0, None=1) and Result
+   (Ok=0, Err=1) are hardcoded (their payloads come from the enum's
+   type arguments); user enums are declared by the caller through a
+   variant_table (see lower_function_with_variants).  The plain
+   lower_function API (used by the driver) lowers with the builtin
+   table only, so user-defined enum constructs fail closed there with a
+   Seed_bug pointing at lower_function_with_variants. *)
+
+type variant_spec = {
+  vs_index : int;                   (* tag = declaration-order variant index *)
+  vs_fields : Type_repr.t list;     (* payload field types (concrete) *)
+}
+
+type variant_table = {
+  vt_enums : (string * (string * variant_spec) list) list;  (* enum name -> variant name -> spec *)
+  vt_ctors : (string * (string * string)) list;  (* ctor name -> (enum name, variant name) *)
+}
+
+let builtin_variant_spec (enum_name : string) (vname : string) (repr : Type_repr.t) :
+    variant_spec option =
+  let index_of =
+    match enum_name, vname with
+    | "Option", "Some" -> Some 0
+    | "Option", "None" -> Some 1
+    | "Result", "Ok" -> Some 0
+    | "Result", "Err" -> Some 1
+    | _ -> None
+  in
+  match index_of with
+  | None -> None
+  | Some idx ->
+      let args = match repr with Type_repr.Named (_, args) -> args | _ -> [||] in
+      let fields =
+        match vname with
+        | "Some" | "Ok" -> if Array.length args > 0 then [ args.(0) ] else []
+        | "Err" -> if Array.length args > 1 then [ args.(1) ] else []
+        | _ -> []
+      in
+      Some { vs_index = idx; vs_fields = fields }
+
+let variant_spec_of (_env : func_env) (tbl : variant_table) ~(enum_name : string)
+    ~(vname : string) ~(repr : Type_repr.t) : variant_spec =
+  match List.assoc_opt enum_name tbl.vt_enums with
+  | Some varmap -> (
+      match List.assoc_opt vname varmap with
+      | Some spec -> spec
+      | None ->
+          seed_bug "unknown variant `%s` of enum `%s` (no variant table entry)" vname enum_name)
+  | None -> (
+      match builtin_variant_spec enum_name vname repr with
+      | Some spec -> spec
+      | None ->
+          seed_bug
+            "unknown variant `%s` of enum `%s` in lowering (user enums require lower_function_with_variants)"
+            vname enum_name)
+
+let ctor_of (tbl : variant_table) (n : string) : (string * string) option =
+  match List.assoc_opt n tbl.vt_ctors with
+  | Some pair -> Some pair
+  | None -> (
+      match n with
+      | "Some" | "Option::Some" -> Some ("Option", "Some")
+      | "None" | "Option::None" -> Some ("Option", "None")
+      | "Ok" | "Result::Ok" -> Some ("Result", "Ok")
+      | "Err" | "Result::Err" -> Some ("Result", "Err")
+      | _ -> None)
+
+let enum_tid_of (env : func_env) (enum_name : string) : Ids.Type_id.t =
+  match List.assoc_opt enum_name env.types with
+  | Some (Type_repr.Named (tid, _)) -> tid
+  | _ -> seed_bug "enum `%s` has no type identity in the lowering env" enum_name
+
+let enum_name_of_ty (env : func_env) (t : Type_repr.t) : string =
+  match t with
+  | Type_repr.Named (tid, _) -> (
+      match
+        List.find_opt
+          (fun (_, r) -> match r with Type_repr.Named (tid2, _) -> Ids.Type_id.compare tid tid2 = 0 | _ -> false)
+          env.types
+      with
+      | Some (n, _) -> n
+      | None -> seed_bug "the match subject's enum type has no name in the lowering env")
+  | _ -> seed_bug "variant match subject is not an enum value"
+
+let default_variant_table : variant_table = { vt_enums = []; vt_ctors = [] }
+
 type lower_state = {
   mutable next_local : int;
   mutable next_block : int;
@@ -30,6 +169,8 @@ type lower_state = {
   mutable cur_stmts : Seed_mir.statement list;  (* reversed *)
   mutable break_target : int option;
   mutable continue_target : int option;
+  variants : variant_table;              (* enum variant/constructor identity *)
+  mutable defer_stack : Ast.block_body list;  (* function-level defer bodies; head = most recent *)
 }
 
 let new_block (st : lower_state) : int =
@@ -71,6 +212,184 @@ let set_terminator_to (st : lower_state) (t : Seed_mir.terminator) (cont : int) 
   st.blocks <- { Seed_mir.id = st.cur_block; statements = List.rev st.cur_stmts; terminator = t } :: st.blocks;
   st.cur_stmts <- [];
   st.cur_block <- cont
+
+(* ── Small operand/place helpers ──────────────────────────────── *)
+
+let constant_type_of (c : Seed_mir.constant) : Type_repr.t =
+  match c with
+  | Seed_mir.Unit -> Type_repr.Unit
+  | Seed_mir.Bool _ -> Type_repr.Bool
+  | Seed_mir.Integer v ->
+      let width = v.Int_value.width and signed = v.Int_value.signed in
+      let kind =
+        match width, signed with
+        | 8, true -> Type_repr.I8 | 16, true -> Type_repr.I16 | 32, true -> Type_repr.I32
+        | 64, true -> Type_repr.Int | 128, true -> Type_repr.I128
+        | 8, false -> Type_repr.U8 | 16, false -> Type_repr.U16 | 32, false -> Type_repr.U32
+        | 64, false -> Type_repr.UInt | 128, false -> Type_repr.U128
+        | _ -> Type_repr.Int
+      in
+      Type_repr.Int kind
+  | Seed_mir.Float32 _ -> Type_repr.Float Type_repr.F32
+  | Seed_mir.Float64 _ -> Type_repr.Float Type_repr.F64
+  | Seed_mir.Char _ -> Type_repr.Char
+  | Seed_mir.String _ -> Type_repr.String
+  | Seed_mir.Function _ -> Type_repr.Function ([||], Type_repr.Unit)
+
+(* Turn an operand into a place (materializing constants into a local). *)
+let materialize_place (st : lower_state) (op : Seed_mir.operand) : Seed_mir.place =
+  match op with
+  | Seed_mir.Copy p | Seed_mir.Read p | Seed_mir.Move p | Seed_mir.Consume p -> p
+  | Seed_mir.Constant c ->
+      let id = fresh_local st (constant_type_of c) in
+      emit st (Seed_mir.Assign (cur_place st id, Seed_mir.Use (Seed_mir.Constant c)));
+      cur_place st id
+
+(* The element type of an iterable/indexable type.  Named array types
+   (Vec/Array nominals) fail closed: their element reads would need a
+   dynamic-index projection the seed VM cannot execute. *)
+let element_type_of (t : Type_repr.t) : Type_repr.t =
+  match t with
+  | Type_repr.Fixed_array (e, _) -> e
+  | Type_repr.String -> Type_repr.Char
+  | Type_repr.Tuple _ -> Type_repr.Int Type_repr.Int
+  | _ -> seed_bug "element access on a non-iterable type %s (named Vec/Array element access is not executable in the seed VM)"
+           (Seed_mir.print_type t)
+
+(* Conservative copyability for payload binding: enums resolve to
+   Function (_, Never) defs which the verifier treats as Copy, but the
+   lowering has no def table, so Named values are conservatively
+   non-copy (a projected Move is wrong: the seed VM's Move ignores
+   projections, so non-copy payload binding fails closed). *)
+let rec copyable_ty (t : Type_repr.t) : bool =
+  match t with
+  | Type_repr.Unit | Type_repr.Bool | Type_repr.Char | Type_repr.Int _
+  | Type_repr.Float _ | Type_repr.Raw_ptr _ | Type_repr.Ref_internal _
+  | Type_repr.Function _ | Type_repr.Never ->
+      true
+  | Type_repr.String -> false
+  | Type_repr.Tuple elems -> Array.for_all copyable_ty elems
+  | Type_repr.Fixed_array (e, _) -> copyable_ty e
+  | Type_repr.Named _ | Type_repr.Type_param _ -> false
+
+(* ── Defer machinery ─────────────────────────────────────────────
+
+   Function-level defer stack: every DeferStmt pushes its body; every
+   exit edge (explicit return, `?` failure early-return, final implicit
+   return) re-lowers the collected bodies inline in reverse declaration
+   order (LIFO) BEFORE the return slot is assigned, so mutations made by
+   the defers are observable in the returned value.  Nested scopes are
+   flattened to function level (the seed's lowering never pops scope),
+   so a defer declared inside a conditional still runs on every exit —
+   documented seed approximation of per-scope cleanup.  emit_defers is
+   part of the mutually recursive expression-lowering group because it
+   re-lowers defer bodies through lower_block. *)
+
+(* Structural scanners used to fail closed on constructs that would be
+   unsound when re-lowered inline (a return inside a defer body would
+   recurse at lowering time; break/next inside an unrolled loop would
+   target the wrong loop). *)
+
+let rec expr_has_return (e : Ast.expr) : bool =
+  match e with
+  | Ast.ReturnExpr _ -> true
+  | Ast.Block (b, _) -> block_has_return b
+  | Ast.IfExpr i ->
+      expr_has_return i.Ast.if_condition
+      || block_has_return i.Ast.if_then
+      || List.exists (fun (_, b) -> block_has_return b) i.Ast.if_elsif
+      || (match i.Ast.if_else with Some b -> block_has_return b | None -> false)
+      || (match i.Ast.if_let_value with Some v -> expr_has_return v | None -> false)
+  | Ast.MatchExpr m ->
+      expr_has_return m.Ast.m_subject
+      || List.exists
+           (fun arm ->
+             expr_has_return arm.Ast.ma_body
+             || (match arm.Ast.ma_guard with Some g -> expr_has_return g | None -> false))
+           m.Ast.m_arms
+  | Ast.WhileExpr w -> expr_has_return w.Ast.wh_condition || block_has_return w.Ast.wh_body
+  | Ast.LoopExpr (b, _) -> block_has_return b
+  | Ast.ForExpr f -> expr_has_return f.Ast.for_iterable || block_has_return f.Ast.for_body
+  | Ast.UntilExpr u -> expr_has_return u.Ast.ut_condition || block_has_return u.Ast.ut_body
+  | Ast.UnlessExpr u ->
+      expr_has_return u.Ast.un_condition
+      || block_has_return u.Ast.un_body
+      || (match u.Ast.un_else with Some b -> block_has_return b | None -> false)
+  | Ast.Call (c, _, args, _) ->
+      expr_has_return c || List.exists (fun a -> expr_has_return a.Ast.ca_value) args
+  | Ast.Index (b, i, _) | Ast.Binary (b, _, i, _) | Ast.CompoundAssign (b, _, i, _) ->
+      expr_has_return b || expr_has_return i
+  | Ast.Unary (_, e, _) | Ast.TryOp (e, _) | Ast.Cast (e, _, _) | Ast.AwaitExpr (e, _) ->
+      expr_has_return e
+  | Ast.Field (b, _, _) | Ast.Assign (b, _, _) ->
+      expr_has_return b
+  | Ast.BreakExpr (Some e, _) -> expr_has_return e
+  | Ast.BreakExpr (None, _) -> false
+  | Ast.Tuple (es, _) | Ast.Array (es, _) -> List.exists expr_has_return es
+  | Ast.ArrayRepeat (e1, e2, _) -> expr_has_return e1 || expr_has_return e2
+  | Ast.Range (e1, e2, _, _) -> expr_has_return e1 || expr_has_return e2
+  | _ -> false
+
+and block_has_return (b : Ast.block_body) : bool =
+  List.exists stmt_has_return b.Ast.b_stmts
+  || (match b.Ast.b_tail with Some t -> expr_has_return t | None -> false)
+
+and stmt_has_return (s : Ast.stmt) : bool =
+  match s with
+  | Ast.ExprStmt (e, _) -> expr_has_return e
+  | Ast.LetBinding (_, _, _, v, _) -> expr_has_return v
+  | Ast.DeferStmt (b, _) -> block_has_return b
+  | Ast.Attributed (_, inner, _) -> stmt_has_return inner
+  | Ast.Item _ | Ast.AttributeStmt _ -> false
+
+let rec expr_has_loop_exit (e : Ast.expr) : bool =
+  match e with
+  | Ast.BreakExpr _ | Ast.NextExpr _ -> true
+  | Ast.Block (b, _) -> block_has_loop_exit b
+  | Ast.IfExpr i ->
+      expr_has_loop_exit i.Ast.if_condition
+      || block_has_loop_exit i.Ast.if_then
+      || List.exists (fun (_, b) -> block_has_loop_exit b) i.Ast.if_elsif
+      || (match i.Ast.if_else with Some b -> block_has_loop_exit b | None -> false)
+  | Ast.MatchExpr m ->
+      expr_has_loop_exit m.Ast.m_subject
+      || List.exists
+           (fun arm ->
+             expr_has_loop_exit arm.Ast.ma_body
+             || (match arm.Ast.ma_guard with Some g -> expr_has_loop_exit g | None -> false))
+           m.Ast.m_arms
+  | Ast.WhileExpr w -> expr_has_loop_exit w.Ast.wh_condition || block_has_loop_exit w.Ast.wh_body
+  | Ast.LoopExpr (b, _) -> block_has_loop_exit b
+  | Ast.ForExpr f -> expr_has_loop_exit f.Ast.for_iterable || block_has_loop_exit f.Ast.for_body
+  | Ast.UntilExpr u -> expr_has_loop_exit u.Ast.ut_condition || block_has_loop_exit u.Ast.ut_body
+  | Ast.UnlessExpr u ->
+      expr_has_loop_exit u.Ast.un_condition
+      || block_has_loop_exit u.Ast.un_body
+      || (match u.Ast.un_else with Some b -> block_has_loop_exit b | None -> false)
+  | Ast.Call (c, _, args, _) ->
+      expr_has_loop_exit c || List.exists (fun a -> expr_has_loop_exit a.Ast.ca_value) args
+  | Ast.Index (b, i, _) | Ast.Binary (b, _, i, _) | Ast.CompoundAssign (b, _, i, _) ->
+      expr_has_loop_exit b || expr_has_loop_exit i
+  | Ast.Unary (_, e, _) | Ast.TryOp (e, _) | Ast.Cast (e, _, _) | Ast.AwaitExpr (e, _) ->
+      expr_has_loop_exit e
+  | Ast.Field (b, _, _) | Ast.Assign (b, _, _) ->
+      expr_has_loop_exit b
+  | Ast.Tuple (es, _) | Ast.Array (es, _) -> List.exists expr_has_loop_exit es
+  | Ast.ArrayRepeat (e1, e2, _) -> expr_has_loop_exit e1 || expr_has_loop_exit e2
+  | Ast.Range (e1, e2, _, _) -> expr_has_loop_exit e1 || expr_has_loop_exit e2
+  | _ -> false
+
+and block_has_loop_exit (b : Ast.block_body) : bool =
+  List.exists stmt_has_loop_exit b.Ast.b_stmts
+  || (match b.Ast.b_tail with Some t -> expr_has_loop_exit t | None -> false)
+
+and stmt_has_loop_exit (s : Ast.stmt) : bool =
+  match s with
+  | Ast.ExprStmt (e, _) -> expr_has_loop_exit e
+  | Ast.LetBinding (_, _, _, v, _) -> expr_has_loop_exit v
+  | Ast.DeferStmt (b, _) -> block_has_loop_exit b
+  | Ast.Attributed (_, inner, _) -> stmt_has_loop_exit inner
+  | Ast.Item _ | Ast.AttributeStmt _ -> false
 
 (* ── Type mapping (syntax type → repr) ────────────────────────── *)
 
@@ -231,10 +550,29 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
           | Some ty -> (copy_place st (cur_place st id), ty)
           | None -> seed_bug "local _%d has no type in lowering" id)
       | None -> (
-          match List.assoc_opt n env.values with
-          | Some _ ->
-              seed_bug "function value `%s` reached lowering without a resolved callable identity" n
-          | None -> seed_bug "unknown value '%s' in lowering" n))
+          match ctor_of st.variants n with
+          | Some (enum_name, vname) ->
+              (* a nullary enum constructor in value position, e.g. `None` *)
+              let ty =
+                match List.assoc_opt n env.values with
+                | Some t -> t
+                | None ->
+                    seed_bug "enum constructor `%s` has no registered result type in the lowering env" n
+              in
+              let spec = variant_spec_of env st.variants ~enum_name ~vname ~repr:ty in
+              let id = fresh_local st ty in
+              emit st
+                (Seed_mir.Assign
+                   ( cur_place st id,
+                     Seed_mir.Aggregate
+                       ( Seed_mir.EnumCtor (enum_tid_of env enum_name, Ids.Variant_id.make spec.vs_index),
+                         [] ) ));
+              (copy_place st (cur_place st id), ty)
+          | None -> (
+              match List.assoc_opt n env.values with
+              | Some _ ->
+                  seed_bug "function value `%s` reached lowering without a resolved callable identity" n
+              | None -> seed_bug "unknown value '%s' in lowering" n)))
   | Ast.Path (a, b, span) -> (
       ignore span;
       seed_bug "path value `%s::%s` reached lowering without a resolved callable identity" a b)
@@ -302,9 +640,25 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
       let id = fresh_local st rt in
       emit st (Seed_mir.Assign (cur_place st id, Seed_mir.Aggregate (Seed_mir.ArrayAgg, ops)));
       (copy_place st (cur_place st id), rt)
-  | Ast.Index (_, _, span) ->
-      ignore span;
-      seed_bug "Index reached MIR lowering without a supported typed lowering rule"
+  | Ast.Index (base, idx, _) -> (
+      (* The seed VM executes only static ConstantIndex projections (a
+         dynamic Seed_mir.Index traps in vm.ml), so an index expression
+         lowers only when the index is a compile-time integer literal. *)
+      match idx with
+      | Ast.IntLit (s, _) -> (
+          match Literal.parse_integer ~span:Span.synthetic s with
+          | Some p when Big_nat.fits_ocaml_int p.Literal.magnitude ->
+              let k = Big_nat.to_ocaml_int p.Literal.magnitude in
+              if k < 0 then seed_bug "negative constant index in lowering";
+              let base_op, base_ty = lower_expr env st base in
+              let bp = materialize_place st base_op in
+              let elem_ty = element_type_of base_ty in
+              let p =
+                { bp with Seed_mir.projections = bp.Seed_mir.projections @ [ Seed_mir.ConstantIndex k ] }
+              in
+              (Seed_mir.Copy p, elem_ty)
+          | _ -> seed_bug "index expression is not a constant integer")
+      | _ -> seed_bug "dynamic index expressions are not executable in the seed VM (only constant indices lower to ConstantIndex)")
   | Ast.Field (_, _, span) ->
       ignore span;
       seed_bug "Field access reached MIR lowering without a typed place (FieldId) rule"
@@ -315,11 +669,12 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
   | Ast.Block (b, _) -> lower_block env st b
   | Ast.ReturnExpr (Some e, _) ->
       let vo, _ = lower_expr env st e in
-      let rp = cur_place st 0 in
-      emit st (Seed_mir.Assign (rp, Seed_mir.Use vo));
+      emit_defers env st;
+      emit st (Seed_mir.Assign (cur_place st 0, Seed_mir.Use vo));
       set_terminator st Seed_mir.Ret;
       (Seed_mir.Constant Seed_mir.Unit, Type_repr.Unit)
   | Ast.ReturnExpr (None, _) ->
+      emit_defers env st;
       set_terminator st Seed_mir.Ret;
       (Seed_mir.Constant Seed_mir.Unit, Type_repr.Unit)
   | Ast.BreakExpr (v, _) -> (
@@ -357,9 +712,83 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
       ignore span;
       seed_bug "CompoundAssign reached MIR lowering without a typed-place writeback rule"
   | Ast.Call (callee, _, args, _) -> lower_call env st callee args
-  | Ast.TryOp (_, span) ->
-      ignore span;
-      seed_bug "`?` reached MIR lowering without enum branch + early-return lowering"
+  | Ast.TryOp (inner, _) -> (
+      (* `?`: match the Option/Result subject; the success variant (tag
+         0) supplies the payload as the expression value; the failure
+         variant early-returns from the enclosing function with the
+         subject itself (the failure enum value) in the return slot,
+         after running the function-level defers (LIFO).  The seed
+         representation is Vm_value.Enum (tag, payload); the payload is
+         read via [Downcast 0; Field 0]. *)
+      let subj_op, subj_ty = lower_expr env st inner in
+      let sid = fresh_local st subj_ty in
+      emit st (Seed_mir.Assign (cur_place st sid, Seed_mir.Use subj_op));
+      if Type_repr.compare env.fn_ret subj_ty <> 0 then
+        seed_bug
+          "`?` subject type %s does not match the enclosing function's return type %s (the failure early-return needs the subject to fit the return slot)"
+          (Seed_mir.print_type subj_ty) (Seed_mir.print_type env.fn_ret);
+      let payload_ty =
+        match subj_ty with
+        | Type_repr.Named (_, args) when Array.length args > 0 -> args.(0)
+        | _ -> seed_bug "`?` subject has no payload type"
+      in
+      let did = fresh_local st (Type_repr.Int Type_repr.UInt) in
+      emit st (Seed_mir.Assign (cur_place st did, Seed_mir.Discriminant (cur_place st sid)));
+      let fail = new_block st in
+      let success = new_block st in
+      let join = new_block st in
+      set_terminator_to st
+        (Seed_mir.SwitchInt (copy_place st (cur_place st did), [ (0L, success) ], fail))
+        fail;
+      (* failure path: defers, then the failure value into the return slot, then Ret *)
+      emit_defers env st;
+      emit st (Seed_mir.Assign (cur_place st 0, Seed_mir.Use (Seed_mir.Copy (cur_place st sid))));
+      set_terminator st Seed_mir.Ret;
+      push_block st success;
+      set_terminator_to st (Seed_mir.Goto join) join;
+      ( Seed_mir.Copy
+          { Seed_mir.local = sid; projections = [ Seed_mir.Downcast (Ids.Variant_id.make 0); Seed_mir.Field (Ids.Field_id.make 0) ] },
+        payload_ty ))
+  | Ast.ForExpr f -> (
+      (* The seed VM cannot execute dynamic index projections (vm.ml
+         traps on Seed_mir.Index), so a for-loop over a compile-time
+         Array literal is unrolled: each element is read with a
+         ConstantIndex projection and the body is lowered once per
+         element.  Loops over runtime Vec/Array values fail closed
+         (they need a dynamic-index VM the seed does not have). *)
+      match f.Ast.for_iterable with
+      | Ast.Array (elems, _) ->
+          if block_has_loop_exit f.Ast.for_body then
+            seed_bug
+              "break/next inside a literal-unrolled for loop (the unrolled seed form has no loop structure to target)";
+          let arr_op, arr_ty = lower_expr env st f.Ast.for_iterable in
+          let arr_id = materialize_place st arr_op in
+          let elem_ty = element_type_of arr_ty in
+          let bindings =
+            match f.Ast.for_pattern with
+            | Ast.PatIdent (n, _, _) -> [ (n, fresh_local st elem_ty) ]
+            | Ast.Wildcard _ -> []
+            | _ -> seed_bug "unsupported for-loop pattern in lowering (bind by name or _)"
+          in
+          List.iter (fun (n, id) -> st.scope <- (n, id) :: st.scope) bindings;
+          List.iteri
+            (fun i _ ->
+              List.iter
+                (fun (_, id) ->
+                  emit st
+                    (Seed_mir.Assign
+                       ( cur_place st id,
+                         Seed_mir.Use
+                           (Seed_mir.Copy
+                              { Seed_mir.local = arr_id.Seed_mir.local;
+                                projections = [ Seed_mir.ConstantIndex i ] }) )))
+                bindings;
+              ignore (lower_block env st f.Ast.for_body))
+            elems;
+          (Seed_mir.Constant Seed_mir.Unit, Type_repr.Unit)
+      | _ ->
+          seed_bug
+            "for over a non-array-literal iterable requires dynamic indexing, which the seed VM does not execute")
   | other -> seed_bug "unhandled supported expression form: %s" (expr_form_name other)
 
 and int_kind_of (t : Type_repr.t) : Type_repr.int_kind =
@@ -450,9 +879,13 @@ and lower_stmt (env : func_env) (st : lower_state) (s : Ast.stmt) : unit =
            st.local_names <- (id, n) :: st.local_names;
            st.scope <- (n, id) :: st.scope
        | None -> ())
-  | Ast.DeferStmt (_, span) ->
-      ignore span;
-      seed_bug "defer reached MIR lowering without scope-exit cleanup planning"
+  | Ast.DeferStmt (b, _) ->
+      (* function-level defer stack (LIFO): pushed here, lowered inline
+         at every return/scope-exit edge (see emit_defers).  A defer
+         body containing `return` would recurse at lowering time, so it
+         fails closed. *)
+      if block_has_return b then seed_bug "defer bodies may not contain `return`";
+      st.defer_stack <- b :: st.defer_stack
   | Ast.Item _ -> ()
   | Ast.AttributeStmt _ | Ast.Attributed _ -> ()
 
@@ -507,44 +940,164 @@ and lower_if (env : func_env) (st : lower_state) (i : Ast.if_expr) : Seed_mir.op
 
 and lower_match (env : func_env) (st : lower_state) (m : Ast.match_expr) :
     Seed_mir.operand * Type_repr.t =
-  let subj, _ = lower_expr env st m.Ast.m_subject in
-  let sid = fresh_local st (Type_repr.Int Type_repr.Int) in
-  emit st (Seed_mir.Assign (cur_place st sid, Seed_mir.Use subj));
+  let subj_op, subj_ty = lower_expr env st m.Ast.m_subject in
+  let sid = fresh_local st subj_ty in
+  emit st (Seed_mir.Assign (cur_place st sid, Seed_mir.Use subj_op));
   let join_b = new_block st in
-  List.iter
-    (fun arm ->
-      match arm.Ast.ma_pattern with
-      | Ast.PatLiteral (lit, _) -> (
-          match lit with
-          | Ast.IntLit (s, _) -> (
-              match int_of_string_opt s with
-              | Some v ->
-                  let ab = new_block st in
-                  emit st
-                    (Seed_mir.Assign
-                       (cur_place st (fresh_local st Type_repr.Bool),
-                        Seed_mir.BinaryOp
-                          (Seed_mir.Eq, copy_place st (cur_place st sid),
-                           Seed_mir.Constant (int_constant_of Type_repr.Int (Int64.of_int v)))));
-                  let bid = st.next_local - 1 in
-                  set_terminator st
-                    (Seed_mir.SwitchInt (copy_place st (cur_place st bid), [ (1L, ab) ], join_b));
-                  push_block st ab;
-                  ignore (lower_expr env st arm.Ast.ma_body);
-                  set_terminator st (Seed_mir.Goto join_b)
-              | None -> seed_bug "non-integer literal match arm in lowering")
-          | _ -> seed_bug "unsupported literal match arm in lowering")
-      | Ast.Wildcard _ ->
-          let ab = new_block st in
-          set_terminator st (Seed_mir.Goto ab);
-          push_block st ab;
-          ignore (lower_expr env st arm.Ast.ma_body);
-          set_terminator st (Seed_mir.Goto join_b)
-      | Ast.PatVariant _ -> seed_bug "variant match arms require enum lowering (not yet in seed subset)"
+  (* one result local shared by every arm (the typechecker unifies arm
+     bodies, so the first body's type is the match's type) *)
+  let result_id = ref 0 in
+  let result_ty : Type_repr.t option ref = ref None in
+  let ensure_result ty =
+    match !result_ty with
+    | None ->
+        result_id := fresh_local st ty;
+        result_ty := Some ty
+    | Some _ -> ()
+  in
+  if
+    List.length
+      (List.filter (fun (a : Ast.match_arm) -> match a.Ast.ma_pattern with Ast.Wildcard _ -> true | _ -> false) m.Ast.m_arms)
+    > 1
+  then seed_bug "multiple wildcard arms in match lowering";
+  if List.exists (fun (a : Ast.match_arm) -> a.Ast.ma_guard <> None) m.Ast.m_arms then
+    seed_bug "match arm guards are not supported in seed lowering";
+  let arm_blocks = Array.of_list (List.map (fun _ -> new_block st) m.Ast.m_arms) in
+  let wildcard_idx =
+    let rec go i = function
+      | [] -> None
+      | (a : Ast.match_arm) :: rest -> (
+          match a.Ast.ma_pattern with
+          | Ast.Wildcard _ -> Some i
+          | _ -> go (i + 1) rest)
+    in
+    go 0 m.Ast.m_arms
+  in
+  (* The switch's otherwise: the wildcard arm's block when one exists,
+     else a dedicated Abort block.  The Abort form is important for the
+     verifier's definite-initialization dataflow: the switch's otherwise
+     target is a JOIN predecessor, so routing the fallthrough to the
+     join block itself would make the match result look
+     possibly-uninitialized there.  An Abort block has no successors, so
+     the join's only predecessors are the arms (each of which assigns
+     the result).  Reaching the Abort at runtime means the match was
+     non-exhaustive — a deterministic trap, never silent. *)
+  let abort_block = ref None in
+  let otherwise =
+    match wildcard_idx with
+    | Some i -> arm_blocks.(i)
+    | None ->
+        let b = new_block st in
+        abort_block := Some b;
+        b
+  in
+  let has_variant =
+    List.exists (fun (a : Ast.match_arm) -> match a.Ast.ma_pattern with Ast.PatVariant _ -> true | _ -> false) m.Ast.m_arms
+  in
+  let switch_op =
+    if has_variant then begin
+      (* enum subject: the discriminant test over the variant tags *)
+      let did = fresh_local st (Type_repr.Int Type_repr.UInt) in
+      emit st (Seed_mir.Assign (cur_place st did, Seed_mir.Discriminant (cur_place st sid)));
+      cur_place st did
+    end
+    else cur_place st sid
+  in
+  let targets = ref [] in
+  List.iteri
+    (fun i (a : Ast.match_arm) ->
+      match a.Ast.ma_pattern with
+      | Ast.PatVariant (seg1, seg2, _, _) -> (
+          let enum_name =
+            if seg1 = "" then enum_name_of_ty env subj_ty
+            else begin
+              (* qualified `Enum::Variant`: trust the qualifier *)
+              if List.assoc_opt seg1 env.types = None then
+                seed_bug "variant qualifier `%s` is not a known type in lowering" seg1;
+              seg1
+            end
+          in
+          let spec = variant_spec_of env st.variants ~enum_name ~vname:seg2 ~repr:subj_ty in
+          targets := (Int64.of_int spec.vs_index, arm_blocks.(i)) :: !targets)
+      | Ast.PatLiteral (Ast.IntLit (s, _), _) -> (
+          match int_of_string_opt s with
+          | Some v -> targets := (Int64.of_int v, arm_blocks.(i)) :: !targets
+          | None -> seed_bug "non-integer literal match arm in lowering")
+      | Ast.Wildcard _ -> ()
       | _ -> seed_bug "unsupported match pattern in lowering")
     m.Ast.m_arms;
-  push_block st join_b;
-  (Seed_mir.Constant Seed_mir.Unit, Type_repr.Unit)
+  set_terminator_to st
+    (Seed_mir.SwitchInt (copy_place st switch_op, List.rev !targets, otherwise))
+    arm_blocks.(0);
+  (* lower each arm body into its block *)
+  List.iteri
+    (fun i (a : Ast.match_arm) ->
+      if i > 0 then push_block st arm_blocks.(i);
+      (match a.Ast.ma_pattern with
+       | Ast.PatVariant (seg1, seg2, pats, _) -> (
+           let enum_name =
+             if seg1 = "" then enum_name_of_ty env subj_ty
+             else begin
+               if List.assoc_opt seg1 env.types = None then
+                 seed_bug "variant qualifier `%s` is not a known type in lowering" seg1;
+               seg1
+             end
+           in
+           let spec = variant_spec_of env st.variants ~enum_name ~vname:seg2 ~repr:subj_ty in
+           (* bind the payload fields by projecting the subject; the
+              seed VM's Downcast turns the payload into a Struct and
+              Field picks field i *)
+           List.iteri
+             (fun j pat ->
+               match pat with
+               | Ast.PatIdent (name, _, _) -> (
+                   let fty =
+                     match List.nth_opt spec.vs_fields j with
+                     | Some t -> t
+                     | None -> seed_bug "variant `%s` payload pattern has more fields than the variant" seg2
+                   in
+                   if not (copyable_ty fty) then
+                     seed_bug
+                       "non-Copy payload binding in a variant match arm is not supported by the seed VM (a projected Move is not executable; payload type %s)"
+                       (Seed_mir.print_type fty);
+                   let id = fresh_local st fty in
+                   emit st
+                     (Seed_mir.Assign
+                        ( cur_place st id,
+                          Seed_mir.Use
+                            (Seed_mir.Copy
+                               { Seed_mir.local = sid;
+                                 projections =
+                                   [
+                                     Seed_mir.Downcast (Ids.Variant_id.make spec.vs_index);
+                                     Seed_mir.Field (Ids.Field_id.make j);
+                                   ] }) ));
+                   st.scope <- (name, id) :: st.scope)
+               | Ast.Wildcard _ -> ()
+               | _ -> seed_bug "unsupported variant payload pattern in lowering")
+             pats)
+       | Ast.Wildcard _ | Ast.PatLiteral _ -> ()
+       | _ -> seed_bug "unsupported match arm pattern in lowering");
+      let bval, bty = lower_expr env st a.Ast.ma_body in
+      ensure_result bty;
+      emit st (Seed_mir.Assign (cur_place st !result_id, Seed_mir.Use bval));
+      if i = Array.length arm_blocks - 1 then begin
+        match !abort_block with
+        | Some abort_b ->
+            (* close the arm block; fill the Abort fallthrough through
+               the dead-block pattern; leave the join open *)
+            set_terminator st (Seed_mir.Goto join_b);
+            push_block st abort_b;
+            set_terminator st Seed_mir.Abort;
+            push_block st join_b
+        | None -> set_terminator_to st (Seed_mir.Goto join_b) join_b
+      end
+      else set_terminator st (Seed_mir.Goto join_b))
+    m.Ast.m_arms;
+  (* join block stays open for the continuation *)
+  match !result_ty with
+  | Some ty -> (copy_place st (cur_place st !result_id), ty)
+  | None -> (Seed_mir.Constant Seed_mir.Unit, Type_repr.Unit)
 
 and lower_while (env : func_env) (st : lower_state) (w : Ast.while_expr) :
     Seed_mir.operand * Type_repr.t =
@@ -590,35 +1143,60 @@ and lower_call (env : func_env) (st : lower_state) (callee : Ast.expr)
     (args : Ast.call_arg list) : Seed_mir.operand * Type_repr.t =
   match callee with
   | Ast.Name (n, _) -> (
-      match List.assoc_opt n env.callables with
-      | Some cid ->
+      match ctor_of st.variants n with
+      | Some (enum_name, vname) ->
+          (* an enum variant constructor call: `Some(x)`, `Green(7)`,
+             `Err("...")` — built as an EnumCtor aggregate with the
+             declaration-order variant index as the tag *)
           let ty =
-            match List.assoc_opt n env.values with Some t -> t | None -> Type_repr.Unit
+            match List.assoc_opt n env.values with
+            | Some t -> t
+            | None ->
+                seed_bug "enum constructor `%s` has no registered result type in the lowering env" n
           in
+          let spec = variant_spec_of env st.variants ~enum_name ~vname ~repr:ty in
           let arg_ops = List.map (fun a -> fst (lower_expr env st a.Ast.ca_value)) args in
           let id = fresh_local st ty in
-          let rp = cur_place st id in
-          let arg_vals =
-            Array.of_list
-              (List.map
-                 (fun op -> { Seed_mir.effect_ = Access_effect.Read; value = op })
-                 arg_ops)
-          in
-          let next_b = new_block st in
-          set_terminator_to st
-            (Seed_mir.Call (rp, Seed_mir.User (Ids.Instance_id.make ~callable:(Ids.Callable_id.make cid) ~type_args:[||]), arg_vals, next_b, None))
-            next_b;
-          (copy_place st rp, ty)
-      | None -> seed_bug "unknown callee '%s' in lowering" n)
+          emit st
+            (Seed_mir.Assign
+               ( cur_place st id,
+                 Seed_mir.Aggregate
+                   ( Seed_mir.EnumCtor (enum_tid_of env enum_name, Ids.Variant_id.make spec.vs_index),
+                     arg_ops ) ));
+          (copy_place st (cur_place st id), ty)
+      | None -> (
+          match List.assoc_opt n env.callables with
+          | Some cid ->
+              let ty =
+                match List.assoc_opt n env.values with Some t -> t | None -> Type_repr.Unit
+              in
+              let arg_ops = List.map (fun a -> fst (lower_expr env st a.Ast.ca_value)) args in
+              let id = fresh_local st ty in
+              let rp = cur_place st id in
+              let arg_vals =
+                Array.of_list
+                  (List.map
+                     (fun op -> { Seed_mir.effect_ = Access_effect.Read; value = op })
+                     arg_ops)
+              in
+              let next_b = new_block st in
+              set_terminator_to st
+                (Seed_mir.Call (rp, Seed_mir.User (Ids.Instance_id.make ~callable:(Ids.Callable_id.make cid) ~type_args:[||]), arg_vals, next_b, None))
+                next_b;
+              (copy_place st rp, ty)
+          | None -> seed_bug "unknown callee '%s' in lowering" n))
   | Ast.Field (_, mname, span) -> (
       ignore span;
       seed_bug "method call `%s` reached lowering without a resolved receiver-typed instance" mname)
   | _ -> seed_bug "unsupported callee form in lowering"
 
+and emit_defers (env : func_env) (st : lower_state) : unit =
+  List.iter (fun b -> ignore (lower_block env st b)) st.defer_stack
+
 (* ── Function lowering ────────────────────────────────────────── *)
 
-let lower_function (env : func_env) (name : string) (callable : int)
-    (fn : Ast.function_decl) : Seed_mir.function_ =
+let lower_function_with_variants (variants : variant_table) (env : func_env) (name : string)
+    (callable : int) (fn : Ast.function_decl) : Seed_mir.function_ =
   let st =
     {
       next_local = 0;
@@ -631,6 +1209,8 @@ let lower_function (env : func_env) (name : string) (callable : int)
       cur_stmts = [];
       break_target = None;
       continue_target = None;
+      variants;
+      defer_stack = [];
     }
   in
   (* local 0 = return slot *)
@@ -660,6 +1240,11 @@ let lower_function (env : func_env) (name : string) (callable : int)
     | Ast.FnExpr e -> Some (lower_expr env st e)
     | Ast.FnSignatureOnly -> None
   in
+  (* the function's final implicit return runs the defers (LIFO) BEFORE
+     the return slot is assigned, so mutations made by the defers are
+     observable in the returned value (explicit returns lower the same
+     order) *)
+  emit_defers env st;
   (match result with
    | Some (vo, _) -> emit st (Seed_mir.Assign (cur_place st 0, Seed_mir.Use vo))
    | None -> ());
@@ -675,3 +1260,24 @@ let lower_function (env : func_env) (name : string) (callable : int)
         (List.sort (fun a b -> compare a.Seed_mir.id b.Seed_mir.id) (List.rev st.blocks));
     entry;
   }
+
+(* The public entry point used by the driver: lowers with the builtin
+   variant table (Option/Result) only.  User-defined enums need
+   lower_function_with_variants. *)
+let lower_function (env : func_env) (name : string) (callable : int)
+    (fn : Ast.function_decl) : Seed_mir.function_ =
+  lower_function_with_variants default_variant_table env name callable fn
+
+(* ── Statics/consts (audit §35) ─────────────────────────────────
+   TODO: Ast.ConstDecl/Ast.StaticDecl exist and the typechecker keeps a
+   `consts` registry, but the Mir_lower API carries no const/static
+   value table and every caller (driver.ml) passes `statics = [||]`.
+   A const/static reference in lowering position therefore reaches
+   lower_expr's Name case without a scope/callable/constructor entry and
+   fails closed with `unknown value` — the seed does not invent a
+   representation for typechecker-registered consts it cannot lower
+   soundly (a const is a value, not an addressable global, and the
+   seed's operands have no init/load form).  Wiring real consts into
+   func_env (name -> (repr, constant)) and lowering Name references to
+   Constant operands is the follow-up; it requires extending the
+   Mir_lower API and the driver's lowering_env_of together. *)

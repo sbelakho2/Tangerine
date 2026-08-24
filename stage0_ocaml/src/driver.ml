@@ -30,7 +30,14 @@ Commands:
     --repo-root ROOT
     --manifest FILE
     --target TRIPLE
+    --entry NAME
   compile ...               Bootstrap compile (interprets the compiler)
+    --repo-root ROOT
+    --manifest FILE
+    --target TRIPLE
+    --entry NAME
+    -- <kernel args...>     Passed verbatim to the kernel's bootstrap_main
+                            (e.g. -- compile hello.tg -o /tmp/out)
   version                   Print version info
   help                      Print this help message
 |}
@@ -49,6 +56,7 @@ let parse_options (specs : 'a opt_spec list) (default : 'a) (args : string list)
     'a * string list =
   let rec go acc = function
     | [] -> (acc, [])
+    | "--" :: rest -> (acc, rest)   (* everything after -- is positional *)
     | arg :: rest ->
         if String.length arg >= 2 && arg.[0] = '-' && arg <> "-" then begin
           let eq = String.index_opt arg '=' in
@@ -443,23 +451,444 @@ let cmd_lower (args : string list) : int =
            else lower_and_report path env program)
   | [] -> die "'lower' requires a file path"
 
-(* ── bootstrap-check (audit §51) ───────────────────────────────── *)
+(* ── bootstrap-check / compile shared machinery ─────────────────── *)
 
 type boot_opts = {
   repo_root : string;
   manifest : string;
   target : string;
+  entry : string option;
 }
 
-let cmd_bootstrap_check (args : string list) : int =
-  let specs =
-    [
-      { name = "--repo-root"; takes_value = true; apply = (fun v o -> match v with Some v -> { o with repo_root = v } | None -> o) };
-      { name = "--manifest"; takes_value = true; apply = (fun v o -> match v with Some v -> { o with manifest = v } | None -> o) };
-      { name = "--target"; takes_value = true; apply = (fun v o -> match v with Some v -> { o with target = v } | None -> o) };
-    ]
+let default_boot_opts =
+  {
+    repo_root = ".";
+    manifest = "bootstrap/compiler_kernel.manifest";
+    target = "aarch64-apple-darwin";
+    entry = None;
+  }
+
+let boot_specs =
+  [
+    { name = "--repo-root"; takes_value = true; apply = (fun v o -> match v with Some v -> { o with repo_root = v } | None -> o) };
+    { name = "--manifest"; takes_value = true; apply = (fun v o -> match v with Some v -> { o with manifest = v } | None -> o) };
+    { name = "--target"; takes_value = true; apply = (fun v o -> match v with Some v -> { o with target = v } | None -> o) };
+    { name = "--entry"; takes_value = true; apply = (fun v o -> match v with Some v -> { o with entry = Some v } | None -> o) };
+  ]
+
+(* Everything bootstrap-check and compile share: manifest load, module
+   graph, resolver, and the typecheck fixpoint (registration is
+   non-fatal, so modules with forward/cyclic references retry with the
+   growing env until no module makes progress).  The o_calls channel is
+   reset per item inside check_program, so the driver's observable typed
+   call count is sampled after every module check (a lower bound). *)
+type closure_ctx = {
+  ctx_repo_root : string;
+  ctx_manifest_path : string;
+  ctx_target : Target.t;
+  ctx_graph : Module_graph.t;
+  ctx_resolved : Resolver.resolved_program;
+  ctx_env : Typecheck.env;
+  ctx_type_errors : string list;
+  ctx_items : int;
+  ctx_typed_calls_sample : int;
+  ctx_rounds : int;
+}
+
+let run_closure_pipeline ~(repo_root : string) ~(manifest_path : string) ~(target : Target.t) :
+    (closure_ctx, string) result =
+  match Bootstrap_manifest.load ~repo_root ~manifest_path with
+  | Error m -> Error m
+  | Ok manifest ->
+      let n = List.length (Bootstrap_manifest.entries manifest) in
+      Printf.printf "  manifest: %d entries, version %s\n" n
+        (match Bootstrap_manifest.version_of manifest with Some v -> v | None -> "(none)");
+      Printf.printf "  fingerprint: %s\n" (Bootstrap_manifest.fingerprint manifest);
+      let diags = Diagnostic.create_bag () in
+      let graph = Module_graph.create_with_sources manifest diags in
+      Printf.printf "  module graph: %d modules, %d items\n" graph.Module_graph.node_count
+        graph.Module_graph.item_count;
+      let resolved = Resolver.resolve manifest graph diags in
+      Printf.printf "  resolver: %d expr defs, %d type defs, %d field defs, %d variant defs, %d call candidates\n"
+        (List.length resolved.Resolver.expr_defs)
+        (List.length resolved.Resolver.type_defs)
+        (List.length resolved.Resolver.field_defs)
+        (List.length resolved.Resolver.variant_defs)
+        (List.length resolved.Resolver.call_candidates);
+      if Diagnostic.has_errors diags then begin
+        prerr_string (Diagnostic.render (Module_graph.source_map graph) diags);
+        prerr_newline ();
+        Error "resolver diagnostics"
+      end
+      else begin
+        Printf.printf "  diagnostics: 0\n";
+        let env = ref (Typecheck.initial_env ()) in
+        let errs_by_mod : (string, string list) Hashtbl.t = Hashtbl.create 64 in
+        let items = ref 0 in
+        let typed_calls = ref 0 in
+        let pending = ref (topological_nodes graph) in
+        let rounds = ref 0 in
+        while !pending <> [] && !rounds < 8 do
+          incr rounds;
+          let this_round = !pending in
+          pending := [];
+          List.iter
+            (fun node ->
+              let key = String.concat "::" node.Module_graph.node_path in
+              match Typecheck.check_program !env node.Module_graph.node_program with
+              | Error m -> Hashtbl.replace errs_by_mod key [ m ]
+              | Ok (env', errors) ->
+                  env := env';
+                  typed_calls := !typed_calls + List.length (!env).state.oracle.o_calls;
+                  Hashtbl.replace errs_by_mod key errors;
+                  if errors <> [] then pending := node :: !pending)
+            this_round
+        done;
+        List.iter
+          (fun node ->
+            items := !items + List.length node.Module_graph.node_items)
+          (topological_nodes graph);
+        let type_errors =
+          Hashtbl.fold
+            (fun key errs acc -> List.map (fun e -> key ^ ": " ^ e) errs @ acc)
+            errs_by_mod []
+        in
+        Ok
+          { ctx_repo_root = repo_root;
+            ctx_manifest_path = manifest_path;
+            ctx_target = target;
+            ctx_graph = graph;
+            ctx_resolved = resolved;
+            ctx_env = !env;
+            ctx_type_errors = type_errors;
+            ctx_items = !items;
+            ctx_typed_calls_sample = !typed_calls;
+            ctx_rounds = !rounds }
+      end
+
+(* Lower every top-level free function of the closure into one Seed MIR
+   program (flat namespace; shared by bootstrap-check and compile). *)
+let lower_closure (ctx : closure_ctx) : Seed_mir.program =
+  let base = lowering_env_of ctx.ctx_env in
+  let mir_funcs = ref [] in
+  List.iter
+    (fun node ->
+      let funcs =
+        List.filter_map
+          (fun i -> match i.Ast.kind with Ast.Function fd -> Some fd | _ -> None)
+          node.Module_graph.node_items
+      in
+      List.iter
+        (fun fd ->
+          let fn_ret, callable =
+            match lookup_typed_fn ctx.ctx_env fd.Ast.fn_sig.Ast.sig_name with
+            | Some ts -> (ts.Typecheck.ts_return, Ids.Callable_id.to_int ts.Typecheck.ts_callable)
+            | None -> (Type_repr.Unit, 0)
+          in
+          let f =
+            Mir_lower.lower_function { base with Mir_lower.fn_ret }
+              fd.Ast.fn_sig.Ast.sig_name callable fd
+          in
+          mir_funcs := f :: !mir_funcs)
+        funcs)
+    ctx.ctx_graph.Module_graph.nodes;
+  { Seed_mir.functions = Array.of_list (List.rev !mir_funcs); statics = [||]; types = [||] }
+
+(* MIR-side counts for the completeness oracle: calls, callable#0 uses,
+   enum variant operations (EnumCtor aggregates, SetDiscriminant,
+   Discriminant rvalues, Downcast projections) and closure objects
+   (ClosureAgg aggregates and function-pointer constants). *)
+type mir_stats = {
+  ms_functions : int;
+  ms_statics : int;
+  ms_types : int;
+  ms_calls : int;
+  ms_callable_zero : int;
+  ms_enum_ops : int;
+  ms_closures : int;
+}
+
+let count_mir_stats (prog : Seed_mir.program) : mir_stats =
+  let calls = ref 0 and zeros = ref 0 and enums = ref 0 and closures = ref 0 in
+  let scan_place (p : Seed_mir.place) =
+    List.iter
+      (function
+        | Seed_mir.Downcast _ -> incr enums
+        | _ -> ())
+      p.Seed_mir.projections
   in
-  let opts, positional = parse_options specs { repo_root = "."; manifest = "bootstrap/compiler_kernel.manifest"; target = "aarch64-apple-darwin" } args in
+  let scan_operand (op : Seed_mir.operand) =
+    match op with
+    | Seed_mir.Copy p | Seed_mir.Move p | Seed_mir.Read p | Seed_mir.Consume p -> scan_place p
+    | Seed_mir.Constant (Seed_mir.Function _) -> incr closures
+    | Seed_mir.Constant _ -> ()
+  in
+  let scan_rvalue (rv : Seed_mir.rvalue) =
+    match rv with
+    | Seed_mir.Discriminant p ->
+        scan_place p;
+        incr enums
+    | Seed_mir.Aggregate (kind, ops) ->
+        (match kind with
+         | Seed_mir.EnumCtor _ -> incr enums
+         | Seed_mir.ClosureAgg _ -> incr closures
+         | _ -> ());
+        List.iter scan_operand ops
+    | Seed_mir.Use op | Seed_mir.Cast (op, _) | Seed_mir.UnaryOp (_, op) -> scan_operand op
+    | Seed_mir.BinaryOp (_, l, r) ->
+        scan_operand l;
+        scan_operand r
+    | Seed_mir.Ref p | Seed_mir.RefMut p | Seed_mir.Len p -> scan_place p
+  in
+  Array.iter
+    (fun (f : Seed_mir.function_) ->
+      Array.iter
+        (fun (b : Seed_mir.block) ->
+          List.iter
+            (fun st ->
+              match st with
+              | Seed_mir.Assign (p, rv) ->
+                  scan_place p;
+                  scan_rvalue rv
+              | Seed_mir.SetDiscriminant (p, _) ->
+                  scan_place p;
+                  incr enums
+              | _ -> ())
+            b.Seed_mir.statements;
+          (match b.Seed_mir.terminator with
+           | Seed_mir.Call (dest, callee, args, _, _) ->
+               scan_place dest;
+               (match callee with
+                | Seed_mir.User inst ->
+                    incr calls;
+                    if Ids.Callable_id.to_int inst.callable = 0 then incr zeros
+                | _ -> ());
+               Array.iter (fun a -> scan_operand a.Seed_mir.value) args
+           | Seed_mir.SwitchInt (op, _, _) | Seed_mir.Assert (op, _, _, _) -> scan_operand op
+           | Seed_mir.Drop (p, _, _) | Seed_mir.Deinit (p, _, _) -> scan_place p
+           | _ -> ()))
+        f.Seed_mir.blocks)
+    prog.Seed_mir.functions;
+  { ms_functions = Array.length prog.Seed_mir.functions;
+    ms_statics = Array.length prog.Seed_mir.statics;
+    ms_types = Array.length prog.Seed_mir.types;
+    ms_calls = !calls;
+    ms_callable_zero = !zeros;
+    ms_enum_ops = !enums;
+    ms_closures = !closures }
+
+(* The completeness-oracle rows.  Returns true when the closure is
+   INCOMPLETE (any DIFF or any callable#0 use). *)
+type oracle_counts = {
+  oc_typed_functions : int;
+  oc_typed_methods : int;
+  oc_typed_consts : int;
+  oc_typed_nominals : int;
+  oc_typed_calls : int;
+  oc_mir_functions : int;
+  oc_mir_statics : int;
+  oc_mir_types : int;
+  oc_mir_calls : int;
+  oc_mir_callable_zero : int;
+  oc_mir_enum_ops : int;
+  oc_mir_closures : int;
+  oc_skipped : bool;
+}
+
+let print_oracle_rows (o : oracle_counts) : bool =
+  let diff_count = ref 0 in
+  let skipped_note = if o.oc_skipped then " (skipped: typecheck gate failed)" else "" in
+  let row (label : string) (expected : int) (emitted : int) =
+    let ok = expected = emitted in
+    if not ok then incr diff_count;
+    Printf.printf "  oracle %-40s expected %6d  emitted %6d  %s%s\n" label expected emitted
+      (if ok then "OK" else "DIFF")
+      (if ok then "" else skipped_note)
+  in
+  row "typed reachable functions" o.oc_typed_functions o.oc_mir_functions;
+  row "typed methods" o.oc_typed_methods 0;
+  row "required static definitions" o.oc_typed_consts o.oc_mir_statics;
+  row "required concrete nominal type defs" o.oc_typed_nominals o.oc_mir_types;
+  row "typed calls" o.oc_typed_calls o.oc_mir_calls;
+  row "enum variant ops (ctor/setdisc/discr/downcast)" o.oc_mir_enum_ops o.oc_mir_enum_ops;
+  row "closure objects (ClosureAgg + fn-ptr consts)" o.oc_mir_closures o.oc_mir_closures;
+  Printf.printf "  oracle calls with concrete callee InstanceId  emitted %6d  callable#0 uses %d\n"
+    o.oc_mir_calls o.oc_mir_callable_zero;
+  if o.oc_skipped then
+    Printf.printf "  oracle note: MIR side emitted as zeros — lowering skipped (typecheck gate failed)\n"
+  else
+    Printf.printf
+      "  oracle note: typed-call row's expected side is the recorded o_calls sample (per-item channel; a lower bound); enum/closure rows have no exposed typed channel — both sides are MIR counts\n";
+  !diff_count > 0 || o.oc_mir_callable_zero > 0
+
+(* The bootstrap entry: --entry overrides; default is the kernel's
+   bootstrap_main (the closure's single `main`), else the first
+   function.  Suffix matching allows qualified names. *)
+let resolve_bootstrap_entry (prog : Seed_mir.program) (entry_opt : string option) :
+    (string * Ids.Instance_id.t) option =
+  let fns = Array.to_list prog.Seed_mir.functions in
+  let find (name : string) =
+    List.find_opt
+      (fun (f : Seed_mir.function_) ->
+        f.Seed_mir.name = name || Util.has_suffix f.Seed_mir.name ("::" ^ name))
+      fns
+  in
+  match entry_opt with
+  | Some name -> (
+      match find name with
+      | Some f -> Some (f.Seed_mir.name, f.Seed_mir.instance)
+      | None -> None)
+  | None -> (
+      match find "bootstrap_main" with
+      | Some f -> Some (f.Seed_mir.name, f.Seed_mir.instance)
+      | None -> (
+          match find "main" with
+          | Some f -> Some (f.Seed_mir.name, f.Seed_mir.instance)
+          | None -> (
+              match fns with
+              | f :: _ -> Some (f.Seed_mir.name, f.Seed_mir.instance)
+              | [] -> None)))
+
+(* Residual Type_param walk over every rvalue/operand/type position of a
+   program: params, locals, instance type args, cast targets, function
+   constants, closure aggregates, call callees, static types, type
+   defs. *)
+let count_residual_type_params (prog : Seed_mir.program) : int =
+  let n = ref 0 in
+  let tp (ty : Type_repr.t) = if Type_repr.has_type_param ty then incr n in
+  let tp_inst (i : Ids.Instance_id.t) = Array.iter tp i.Ids.Instance_id.type_args in
+  let scan_operand (op : Seed_mir.operand) =
+    match op with
+    | Seed_mir.Constant (Seed_mir.Function i) -> tp_inst i
+    | _ -> ()
+  in
+  let scan_rvalue (rv : Seed_mir.rvalue) =
+    match rv with
+    | Seed_mir.Cast (op, ty) ->
+        tp ty;
+        scan_operand op
+    | Seed_mir.Aggregate (kind, ops) ->
+        (match kind with
+         | Seed_mir.ClosureAgg i -> tp_inst i
+         | _ -> ());
+        List.iter scan_operand ops
+    | Seed_mir.Use op | Seed_mir.UnaryOp (_, op) -> scan_operand op
+    | Seed_mir.BinaryOp (_, l, r) ->
+        scan_operand l;
+        scan_operand r
+    | _ -> ()
+  in
+  Array.iter
+    (fun (f : Seed_mir.function_) ->
+      Array.iter tp f.Seed_mir.instance.type_args;
+      Array.iter (fun (_, ty) -> tp ty) f.Seed_mir.params;
+      Array.iter tp f.Seed_mir.locals;
+      Array.iter
+        (fun (b : Seed_mir.block) ->
+          List.iter
+            (fun st ->
+              match st with
+              | Seed_mir.Assign (_, rv) -> scan_rvalue rv
+              | _ -> ())
+            b.Seed_mir.statements;
+          (match b.Seed_mir.terminator with
+           | Seed_mir.Call (_, callee, args, _, _) ->
+               (match callee with
+                | Seed_mir.User i -> tp_inst i
+                | _ -> ());
+               Array.iter (fun a -> scan_operand a.Seed_mir.value) args
+           | _ -> ()))
+        f.Seed_mir.blocks)
+    prog.Seed_mir.functions;
+  Array.iter
+    (fun (_, ty, init) ->
+      tp ty;
+      match init with
+      | Some (Seed_mir.Function i) -> tp_inst i
+      | _ -> ())
+    prog.Seed_mir.statics;
+  Array.iter (fun (_, ty) -> tp ty) prog.Seed_mir.types;
+  !n
+
+type mono_outcome = {
+  mo_program : Seed_mir.program;
+  mo_entry : Ids.Instance_id.t;
+  mo_entry_name : string;
+  mo_pre_functions : int;
+  mo_post_functions : int;
+  mo_post_instances : int;
+  mo_residual_type_params : int;
+}
+
+(* Mono the lowered closure from the bootstrap entry; report pre/post
+   function and instance counts; require zero residual Type_param and a
+   clean Mir_verify of the mono'd program. *)
+let run_mono_phase ~(entry_name : string) ~(entry : Ids.Instance_id.t)
+    (prog : Seed_mir.program) : (mono_outcome, string list) result =
+  Printf.printf "  mono: entry '%s' (%s)\n" entry_name (Seed_mir.print_instance entry);
+  match Mono.build ~entry prog with
+  | Error errs ->
+      Printf.printf "  mono: BUILD FAILED\n";
+      List.iter (fun e -> Printf.printf "    %s\n" e) errs;
+      Error errs
+  | Ok fns ->
+      let mono_prog = { prog with Seed_mir.functions = fns } in
+      let pre = Array.length prog.Seed_mir.functions in
+      let post = Array.length fns in
+      let residual = count_residual_type_params mono_prog in
+      Printf.printf "  mono: build OK — pre %d template function(s) -> post %d specialized instance(s)\n" pre post;
+      Printf.printf "  mono: post-instance count %d; residual Type_param positions %d (walked params/locals/instance args/operands/callees/statics/type defs)\n" post residual;
+      (match Mir_verify.require_valid mono_prog with
+       | Error errs ->
+           Printf.printf "  MONO_MIR_STRUCTURAL_GATE = FAIL\n";
+           List.iter (fun e -> Printf.printf "    %s\n" e) errs;
+           Error errs
+       | Ok () ->
+           Printf.printf "  MONO_MIR_STRUCTURAL_GATE = PASS (%d functions)\n" post;
+           Ok
+             { mo_program = mono_prog;
+               mo_entry = entry;
+               mo_entry_name = entry_name;
+               mo_pre_functions = pre;
+               mo_post_functions = post;
+               mo_post_instances = post;
+               mo_residual_type_params = residual })
+
+let oracle_of_ctx (ctx : closure_ctx) (stats : mir_stats option) : oracle_counts =
+  let s =
+    match stats with
+    | Some s -> s
+    | None ->
+        {
+          ms_functions = 0;
+          ms_statics = 0;
+          ms_types = 0;
+          ms_calls = 0;
+          ms_callable_zero = 0;
+          ms_enum_ops = 0;
+          ms_closures = 0;
+        }
+  in
+  {
+    oc_typed_functions = List.length ctx.ctx_env.Typecheck.functions;
+    oc_typed_methods = List.length ctx.ctx_env.Typecheck.methods;
+    oc_typed_consts = List.length ctx.ctx_env.Typecheck.consts;
+    oc_typed_nominals = List.length ctx.ctx_env.Typecheck.nominals;
+    oc_typed_calls = ctx.ctx_typed_calls_sample;
+    oc_mir_functions = s.ms_functions;
+    oc_mir_statics = s.ms_statics;
+    oc_mir_types = s.ms_types;
+    oc_mir_calls = s.ms_calls;
+    oc_mir_callable_zero = s.ms_callable_zero;
+    oc_mir_enum_ops = s.ms_enum_ops;
+    oc_mir_closures = s.ms_closures;
+    oc_skipped = stats = None;
+  }
+
+(* ── bootstrap-check (audit §51) ───────────────────────────────── *)
+
+let cmd_bootstrap_check (args : string list) : int =
+  let opts, positional = parse_options boot_specs default_boot_opts args in
   if positional <> [] then die "unexpected positional arguments to bootstrap-check";
   let target =
     match Target.unsupported_triple opts.target with
@@ -468,173 +897,196 @@ let cmd_bootstrap_check (args : string list) : int =
   in
   Printf.printf "TANGERINE OCAML SEED — bootstrap-check\n";
   Printf.printf "  target: %s\n" (Target.to_string target);
-  (match Bootstrap_manifest.load ~repo_root:opts.repo_root ~manifest_path:opts.manifest with
-   | Error m -> die "manifest: %s" m
-   | Ok manifest ->
-       let n = List.length (Bootstrap_manifest.entries manifest) in
-       Printf.printf "  manifest: %d entries, version %s\n" n
-         (match Bootstrap_manifest.version_of manifest with Some v -> v | None -> "(none)");
-       Printf.printf "  fingerprint: %s\n" (Bootstrap_manifest.fingerprint manifest);
-       let diags = Diagnostic.create_bag () in
-       let graph = Module_graph.create_with_sources manifest diags in
-       Printf.printf "  module graph: %d modules, %d items\n" graph.Module_graph.node_count
-         graph.Module_graph.item_count;
-       let resolved = Resolver.resolve manifest graph diags in
-       Printf.printf "  resolver: %d expr defs, %d type defs, %d field defs, %d variant defs, %d call candidates\n"
-         (List.length resolved.Resolver.expr_defs)
-         (List.length resolved.Resolver.type_defs)
-         (List.length resolved.Resolver.field_defs)
-         (List.length resolved.Resolver.variant_defs)
-         (List.length resolved.Resolver.call_candidates);
-       if Diagnostic.has_errors diags then begin
-         prerr_string (Diagnostic.render (Module_graph.source_map graph) diags);
-         prerr_newline ();
+  (match run_closure_pipeline ~repo_root:opts.repo_root ~manifest_path:opts.manifest ~target with
+   | Error m ->
+       prerr_endline ("error: " ^ m);
+       Printf.printf "  RESULT: FAIL\n";
+       1
+   | Ok ctx ->
+       Printf.printf "  typecheck: %d modules, %d items, %d errors (%d rounds)\n"
+         ctx.ctx_graph.Module_graph.node_count ctx.ctx_items (List.length ctx.ctx_type_errors)
+         ctx.ctx_rounds;
+       List.iter (fun e -> Printf.printf "    %s\n" e) (List.sort compare ctx.ctx_type_errors);
+       if ctx.ctx_type_errors <> [] then begin
+         (* honest: lowering/mono are unreachable — print the oracle rows
+            with zeros and the skipped note, then fail the gate *)
+         ignore (print_oracle_rows (oracle_of_ctx ctx None));
+         Printf.printf "  mono: skipped (typecheck gate failed)\n";
+         Printf.printf "  FRONTEND_SEMANTIC_GATE = FAIL\n";
+         Printf.printf "  BOOTSTRAP_EXECUTABLE_CLOSURE = INCOMPLETE\n";
          Printf.printf "  RESULT: FAIL\n";
          1
        end
        else begin
-         Printf.printf "  diagnostics: 0\n";
-         (* typecheck modules to a fixpoint: registration is non-fatal, so
-            modules with forward/cyclic references retry with the growing
-            env until no module makes progress *)
-         let env = ref (Typecheck.initial_env ()) in
-         let errs_by_mod : (string, string list) Hashtbl.t = Hashtbl.create 64 in
-         let items = ref 0 in
-         let functions = ref 0 in
-         let pending = ref (topological_nodes graph) in
-         let rounds = ref 0 in
-         while !pending <> [] && !rounds < 8 do
-           incr rounds;
-           let this_round = !pending in
-           pending := [];
-           List.iter
-             (fun node ->
-               let key = String.concat "::" node.Module_graph.node_path in
-               match Typecheck.check_program !env node.Module_graph.node_program with
-               | Error m -> Hashtbl.replace errs_by_mod key [ m ]
-               | Ok (env', errors) ->
-                   env := env';
-                   Hashtbl.replace errs_by_mod key errors;
-                   if errors <> [] then pending := node :: !pending)
-             this_round
-         done;
-         List.iter
-           (fun node ->
-             items := !items + List.length node.Module_graph.node_items)
-           (topological_nodes graph);
-         let type_errors =
-           Hashtbl.fold
-             (fun key errs acc -> List.map (fun e -> key ^ ": " ^ e) errs @ acc)
-             errs_by_mod []
-         in
-         Printf.printf "  typecheck: %d modules, %d items, %d errors (%d rounds)\n"
-           graph.Module_graph.node_count !items (List.length type_errors) !rounds;
-         List.iter (fun e -> Printf.printf "    %s\n" e) (List.sort compare type_errors);
-         if type_errors <> [] then begin
-           Printf.printf "  RESULT: FAIL\n";
-           1
-         end
-         else begin
-           (* lower the whole closure into one Seed MIR program and verify *)
-           let base = lowering_env_of !env in
-           let mir_funcs = ref [] in
-           List.iter
-             (fun node ->
-               let funcs =
-                 List.filter_map
-                   (fun i -> match i.Ast.kind with Ast.Function fd -> Some fd | _ -> None)
-                   node.Module_graph.node_items
-               in
-               List.iter
-                 (fun fd ->
-                   let fn_ret, callable =
-                     match List.assoc_opt fd.Ast.fn_sig.Ast.sig_name env.contents.Typecheck.functions with
-                     | Some ts -> (ts.Typecheck.ts_return, Ids.Callable_id.to_int ts.Typecheck.ts_callable)
-                     | None -> (Type_repr.Unit, 0)
-                   in
-                   let f =
-                     Mir_lower.lower_function { base with Mir_lower.fn_ret }
-                       fd.Ast.fn_sig.Ast.sig_name callable fd
-                   in
-                   mir_funcs := f :: !mir_funcs)
-                 funcs;
-               functions := !functions + List.length funcs)
-             graph.Module_graph.nodes;
-           let prog =
-             { Seed_mir.functions = Array.of_list (List.rev !mir_funcs); statics = [||]; types = [||] }
-           in
-           (match Mir_verify.require_valid prog with
-            | Error errs ->
-                Printf.printf "  SEED_MIR_STRUCTURAL_GATE = FAIL\n";
-                List.iter (fun e -> Printf.printf "    %s\n" e) errs;
-                Printf.printf "  RESULT = WIP\n";
-                1
-            | Ok () ->
-                Printf.printf "  SEED_MIR_STRUCTURAL_GATE = PASS (%d functions)\n"
-                  (Array.length prog.Seed_mir.functions);
-                (* Lowering completeness oracle (audit): every left/right
-                   difference must be zero before the gate may claim a
-                   bootstrap-level pass. *)
-                let typed_functions = List.length env.contents.Typecheck.functions in
-                let typed_methods = List.length env.contents.Typecheck.methods in
-                let typed_consts = List.length env.contents.Typecheck.consts in
-                let typed_nominals = List.length env.contents.Typecheck.nominals in
-                let mir_functions = Array.length prog.Seed_mir.functions in
-                let mir_statics = Array.length prog.Seed_mir.statics in
-                let mir_types = Array.length prog.Seed_mir.types in
-                let mir_calls, callable_zero =
-                  let calls = ref 0 and zeros = ref 0 in
-                  Array.iter
-                    (fun fn ->
-                      Array.iter
-                        (fun blk ->
-                          match blk.Seed_mir.terminator with
-                          | Seed_mir.Call (_, Seed_mir.User inst, _, _, _) ->
-                              incr calls;
-                              let cid = inst.callable in
-                              if Ids.Callable_id.to_int cid = 0 then
-                                incr zeros
-                          | _ -> ())
-                        fn.Seed_mir.blocks)
-                    prog.Seed_mir.functions;
-                  (!calls, !zeros)
-                in
-                let diffs =
-                  [
-                    ("typed reachable functions", typed_functions, mir_functions);
-                    ("typed methods", typed_methods, 0);
-                    ("required static definitions", typed_consts, mir_statics);
-                    ("required concrete nominal type defs", typed_nominals, mir_types);
-                  ]
-                in
-                List.iter
-                  (fun (label, expected, emitted) ->
-                    Printf.printf "  oracle %-40s expected %6d  emitted %6d  %s\n"
-                      label expected emitted
-                      (if expected = emitted then "OK" else "DIFF"))
-                  diffs;
-                Printf.printf "  oracle calls with concrete callee InstanceId  emitted %6d  callable#0 uses %d\n"
-                  mir_calls callable_zero;
-                let incomplete =
-                  List.exists (fun (_, e, m) -> e <> m) diffs || callable_zero > 0
-                in
-                Printf.printf "  FRONTEND_SEMANTIC_GATE = %s\n"
-                  (if type_errors = [] then "PASS" else "FAIL");
-                if incomplete then begin
-                  Printf.printf "  BOOTSTRAP_EXECUTABLE_CLOSURE = INCOMPLETE\n";
-                  Printf.printf "  RESULT = WIP\n";
-                  1
-                end
-                else begin
-                  Printf.printf "  BOOTSTRAP_EXECUTABLE_CLOSURE = PASS\n";
-                  Printf.printf "  RESULT = PASS\n";
-                  0
-                end)
-         end
-       end)
+         let prog = lower_closure ctx in
+         (match Mir_verify.require_valid prog with
+          | Error errs ->
+              Printf.printf "  SEED_MIR_STRUCTURAL_GATE = FAIL\n";
+              List.iter (fun e -> Printf.printf "    %s\n" e) errs;
+              Printf.printf "  RESULT = WIP\n";
+              1
+          | Ok () ->
+              Printf.printf "  SEED_MIR_STRUCTURAL_GATE = PASS (%d functions)\n"
+                (Array.length prog.Seed_mir.functions);
+              let stats = count_mir_stats prog in
+              let incomplete = print_oracle_rows (oracle_of_ctx ctx (Some stats)) in
+              Printf.printf "  FRONTEND_SEMANTIC_GATE = PASS\n";
+              (match resolve_bootstrap_entry prog opts.entry with
+               | None ->
+                   Printf.printf "  mono: skipped (no entry function in the closure)\n";
+                   Printf.printf "  BOOTSTRAP_EXECUTABLE_CLOSURE = INCOMPLETE\n";
+                   Printf.printf "  RESULT = WIP\n";
+                   1
+               | Some (entry_name, entry) -> (
+                   match run_mono_phase ~entry_name ~entry prog with
+                   | Error _ ->
+                       Printf.printf "  BOOTSTRAP_EXECUTABLE_CLOSURE = INCOMPLETE\n";
+                       Printf.printf "  RESULT = WIP\n";
+                       1
+                   | Ok mo ->
+                       if mo.mo_residual_type_params > 0 || incomplete then begin
+                         Printf.printf "  BOOTSTRAP_EXECUTABLE_CLOSURE = INCOMPLETE\n";
+                         Printf.printf "  RESULT = WIP\n";
+                         1
+                       end
+                       else begin
+                         Printf.printf "  BOOTSTRAP_EXECUTABLE_CLOSURE = PASS\n";
+                         Printf.printf "  RESULT = PASS\n";
+                         0
+                       end)))
+      end)
 
-let cmd_compile (_args : string list) : int =
-  die "compile is not yet available: the seed VM must first interpret the bootstrap closure (audit §49)"
+(* ── compile (audit §49) ───────────────────────────────────────── *)
+
+let take_first (n : int) (l : 'a list) : 'a list =
+  List.rev (snd (List.fold_left (fun (i, acc) x -> if i < n then (i + 1, x :: acc) else (i, acc)) (0, []) l))
+
+(* The artifact path the kernel derives from its own argv: the -o/
+   --output value, else the input file minus .tg. *)
+let kernel_output_path (kernel_args : string list) : string option =
+  let rec go = function
+    | "-o" :: v :: _ | "--output" :: v :: _ -> Some v
+    | _ :: rest -> go rest
+    | [] -> None
+  in
+  match go kernel_args with
+  | Some p -> Some p
+  | None -> (
+      match kernel_args with
+      | file :: _ when not (String.length file >= 1 && file.[0] = '-') ->
+          if Filename.check_suffix file ".tg" then Some (Filename.chop_suffix file ".tg")
+          else Some file
+      | _ -> None)
+
+let artifact_exists ~(repo_root : string) (path : string) : bool =
+  if Filename.is_relative path then Sys.file_exists (Filename.concat repo_root path)
+  else Sys.file_exists path
+
+let cmd_compile (args : string list) : int =
+  let opts, positional = parse_options boot_specs default_boot_opts args in
+  let target =
+    match Target.unsupported_triple opts.target with
+    | Ok t -> t
+    | Error m -> die "%s" m
+  in
+  Printf.printf "TANGERINE OCAML SEED — compile\n";
+  Printf.printf "  target: %s\n" (Target.to_string target);
+  (match run_closure_pipeline ~repo_root:opts.repo_root ~manifest_path:opts.manifest ~target with
+   | Error m ->
+       prerr_endline ("error: " ^ m);
+       Printf.printf "  RESULT: FAIL\n";
+       1
+   | Ok ctx ->
+       Printf.printf "  typecheck: %d modules, %d items, %d errors (%d rounds)\n"
+         ctx.ctx_graph.Module_graph.node_count ctx.ctx_items (List.length ctx.ctx_type_errors)
+         ctx.ctx_rounds;
+       if ctx.ctx_type_errors <> [] then begin
+         Printf.printf "compile: FAILED — closure typecheck gate: %d errors; the VM bootstrap run is NOT attempted\n"
+           (List.length ctx.ctx_type_errors);
+         List.iter (fun e -> Printf.printf "    %s\n" e)
+           (List.sort compare (take_first 20 ctx.ctx_type_errors));
+         Printf.printf "  RESULT: FAIL\n";
+         1
+       end
+       else begin
+         let prog = lower_closure ctx in
+         (match Mir_verify.require_valid prog with
+          | Error errs ->
+              Printf.printf "compile: FAILED — SEED_MIR_STRUCTURAL_GATE: %s\n" (String.concat "; " errs);
+              Printf.printf "  RESULT: FAIL\n";
+              1
+          | Ok () -> (
+              match resolve_bootstrap_entry prog opts.entry with
+              | None ->
+                  Printf.printf "compile: FAILED — no entry function in the closure\n";
+                  Printf.printf "  RESULT: FAIL\n";
+                  1
+              | Some (entry_name, entry) -> (
+                  match run_mono_phase ~entry_name ~entry prog with
+                  | Error _ ->
+                      Printf.printf "compile: FAILED — mono phase\n";
+                      Printf.printf "  RESULT: FAIL\n";
+                      1
+                  | Ok mo ->
+                      if mo.mo_residual_type_params > 0 then begin
+                        Printf.printf "compile: FAILED — %d residual Type_param after mono\n"
+                          mo.mo_residual_type_params;
+                        Printf.printf "  RESULT: FAIL\n";
+                        1
+                      end
+                      else begin
+                        (* Real tg compiler argv for the kernel's
+                           bootstrap_main: argv[0] is the program name,
+                           argv[1] the command.  Positional args past the
+                           driver options are passed through verbatim. *)
+                        let kernel_args =
+                          match positional with
+                          | [] -> [ "compile"; "--help" ]
+                          | first :: _
+                            when List.mem first [ "compile"; "check"; "-h"; "--help"; "-V"; "--version" ] ->
+                              positional
+                          | _ -> "compile" :: positional
+                        in
+                        let argv = Array.of_list ("tg-bootstrap" :: kernel_args) in
+                        Printf.printf "  compile: kernel argv: %s\n" (String.concat " " (Array.to_list argv));
+                        let host = Host.create ~repo_root:opts.repo_root ~argv in
+                        (match Vm.run ~program:mo.mo_program ~entry:mo.mo_entry ~argv ~host with
+                         | Error e ->
+                             Printf.printf "compile: VM bootstrap run TRAPPED: %s\n" e.Vm.message;
+                             let out = Host.stdout_contents host in
+                             if out <> "" then Printf.printf "compile: kernel stdout:\n%s\n" out;
+                             let err = Host.stderr_contents host in
+                             if err <> "" then Printf.printf "compile: kernel stderr:\n%s\n" err;
+                             Printf.printf "  RESULT: FAIL\n";
+                             1
+                         | Ok code ->
+                             let out = Host.stdout_contents host in
+                             if out <> "" then Printf.printf "compile: kernel stdout:\n%s\n" out;
+                             Printf.printf "compile: VM bootstrap run exit %d\n" code;
+                             (match kernel_output_path kernel_args with
+                              | None ->
+                                  Printf.printf "compile: FAILED — no output path derivable from the kernel argv\n";
+                                  Printf.printf "  RESULT: FAIL\n";
+                                  1
+                              | Some out_path ->
+                                  if code <> 0 then begin
+                                    Printf.printf "compile: FAILED — nonzero exit from the kernel\n";
+                                    Printf.printf "  RESULT: FAIL\n";
+                                    1
+                                  end
+                                  else if artifact_exists ~repo_root:opts.repo_root out_path then begin
+                                    Printf.printf "compile: artifact produced: %s\n" out_path;
+                                    Printf.printf "  RESULT: PASS\n";
+                                    0
+                                  end
+                                  else begin
+                                    Printf.printf "compile: FAILED — VM exited 0 but produced no artifact at %s\n"
+                                      out_path;
+                                     Printf.printf "  RESULT: FAIL\n";
+                                     1
+                                   end))
+                       end)))
+      end)
 
 let cmd_version () : int =
   print_string (version_string ^ "\n");
