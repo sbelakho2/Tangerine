@@ -2438,10 +2438,30 @@ and check_call_sig (env : env) (scope : scope) (expected : Type_repr.t option)
       let ret = substitute_fixpoint !subst sig_.ts_return in
       (* any of the signature's own params still unbound in the result? *)
       let sig_ids = List.map snd sig_.ts_params_decl in
+      (* Residual signature type params: when an expected type drove the
+         call they must be bound; without one, they are deferred as fresh
+         inference variables and resolved by the enclosing unification
+         (e.g. `if b == 0 then None else Some(x)` unifies the branches). *)
+      let residual = List.filter (fun p -> List.mem p sig_ids) (params_in ret) in
+      (* Deferral: without an expected type, bind residual params to fresh
+         inference variables resolved by the enclosing unification. *)
+      (match residual, expected with
+       | [], _ -> ()
+       | _ :: _, None ->
+           List.iter
+             (fun p ->
+               if not (List.mem_assoc p !subst) then begin
+                 let fresh = Ids.Generic_param_id.make env.state.next_param_id in
+                 env.state.next_param_id <- env.state.next_param_id + 1;
+                 subst := (p, Type_repr.Type_param fresh) :: !subst
+               end)
+             residual
+       | _ :: _, Some _ -> ());
       let* () =
-        match List.filter (fun p -> List.mem p sig_ids) (params_in ret) with
-        | [] -> Ok ()
-        | p :: _ ->
+        match residual, expected with
+        | [], _ -> Ok ()
+        | _ :: _, None -> Ok ()
+        | p :: _, Some _ ->
             let pname =
               match
                 List.find_opt (fun (_, i) -> Ids.Generic_param_id.compare i p = 0) sig_.ts_params_decl
@@ -2452,6 +2472,7 @@ and check_call_sig (env : env) (scope : scope) (expected : Type_repr.t option)
             Error (err span (Printf.sprintf "cannot infer type parameter `%s` of `%s`" pname sig_.ts_name))
       in
       let wps = List.map (fun (wt, bs) -> (substitute_fixpoint !subst wt, bs)) sig_.ts_where in
+      let* () = check_where_obligations env span sig_.ts_name wps in
       let* () = check_where_obligations env span sig_.ts_name wps in
       let substitution =
         Array.of_list
