@@ -59,7 +59,8 @@ type constant =
 type projection =
   | Deref
   | Field of Ids.Field_id.t
-  | Index of int            (* dynamic-index form; constant payload *)
+  | Index of int            (* dynamic-index form: the payload is the LOCAL
+                               whose value is the runtime index *)
   | ConstantIndex of int
   | Downcast of Ids.Variant_id.t
 
@@ -227,7 +228,7 @@ let print_place (p : place) : string =
     (function
       | Deref -> s := "(*" ^ !s ^ ")"
       | Field f -> s := !s ^ "." ^ string_of_int (Ids.Field_id.to_int f)
-      | Index i -> s := !s ^ Printf.sprintf "[%d]" i
+      | Index li -> s := !s ^ Printf.sprintf "[_%d]" li
       | ConstantIndex i -> s := !s ^ Printf.sprintf "[%d]" i
       | Downcast v -> s := !s ^ Printf.sprintf " as variant#%d" (Ids.Variant_id.to_int v))
     p.projections;

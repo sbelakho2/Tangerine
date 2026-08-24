@@ -3,9 +3,62 @@
    Executes pre-indexed, monomorphized Seed MIR: functions/block ids/
    locals are arrays; calls go through callee = User InstanceId |
    Intrinsic id | Extern id — never name dispatch. Slot-state ownership
-   is enforced on every local access. *)
+   is enforced on every local access.
 
-type frame = {
+   ── Kernel-closure primitives (the audit's remaining items) ─────────
+
+   1. DYNAMIC INDEX PROJECTIONS.  The Seed MIR dynamic-index projection
+      is `Seed_mir.Index local` (seed_mir.ml): the payload is a LOCAL
+      whose value is the runtime index — the seed's dynamic-index
+      convention (the "index operand" is read from the current frame's
+      locals through the slot machine).  The index is bounds-checked
+      deterministically (traps: "index out of bounds" for arrays,
+      "tuple index out of bounds", "string index out of bounds"; a
+      non-integer or 128-bit index traps).  Reads project the element
+      and continue the remaining projections; writes update the element
+      in place — the updated aggregate is written back to the slot
+      (Array/Tuple elements; a String write replaces the byte at the
+      index with the char's UTF-8 bytes — String indices are BYTE
+      indices, consistent with Len's String.length and the
+      ConstantIndex projection).
+      NOTE: mir_lower.ml today emits ConstantIndex for literal `arr[i]`
+      (already executed here) and unrolls for-loops with ConstantIndex
+      reads; it never emits the dynamic Index form — the VM executes it
+      for hand-written/kernel MIR.
+
+   2. POINTER DEREFERENCE (`Seed_mir.Deref`).  A RawPtr (or a
+      region-backed Ref) dereferences through the simulated memory: the
+      region at (region, offset) holds a self-describing byte
+      serialization (Vm_value.serialize/deserialize — see vm_value.ml
+      for the exact format; integers little-endian by width, Bool 1
+      byte, Char 4-byte utf-32, String 8-byte length prefix + utf-8,
+      aggregates recursively; it round-trips).  Null pointers, dead
+      regions, out-of-bounds offsets and invalid payloads are
+      deterministic traps.  A deref WRITE serializes the value into the
+      region (in place, never a copy).
+
+   3. REF / REFMUT WRITEBACK.  `Ref p`/`RefMut p` with a place source
+      (no Deref in p's projections) produces a REAL reference:
+      `Vm_value.Ref (Place (frame, local, projections))` — the target
+      frame RECORD is captured, so reads resolve to the target place
+      and writes through the ref update the target IN PLACE, even when
+      the ref crosses a call boundary.  `Ref p` whose source has a Deref
+      projection (a computed value, e.g. `&*ptr`) keeps a serialized
+      copy in a fresh region (`Ref (Region ptr)`): reads load the copy
+      back, and WRITES THROUGH IT ARE A DETERMINISTIC TRAP (no silent
+      divergence).
+
+   4. RECURSIVE DROP.  `Drop`/`Deinit` run the recursive drop glue
+      (Vm_value.drop_glue) over the place's value first: aggregates are
+      visited depth-first and every region-backed ref inside is
+      deterministically freed, then the outer slot transitions per the
+      slot machine (Live -> Dropped; Moved/Uninitialized are no-ops; a
+      second drop of a Dropped slot traps). *)
+
+(* Frame identity — the type lives in vm_value.ml so that reference
+   targets can record a frame; the equation re-declares it here so the
+   record fields are in scope in this module. *)
+type frame = Vm_value.frame = {
   fn : int;
   locals : Vm_value.slot array;
   mutable block : int;
@@ -95,10 +148,8 @@ let rec eval_operand (vm : t) (frame : frame) (op : Seed_mir.operand) : Vm_value
           v
       | Error e -> err_trap vm (Vm_value.slot_error_string e))
 
-(* Read a place: project through the value; allocations for deref targets
-   are materialized on write (see write_place); reads of deref places are
-   not supported at the scalar level in this seed subset — the memory
-   layer is the authority for pointers. *)
+(* Read a place: project through the value.  A Deref projection resolves
+   through memory (RawPtr) or through the reference target (Ref). *)
 and read_place (vm : t) (frame : frame) (p : Seed_mir.place) :
     (Vm_value.t, Vm_value.slot_error) result =
   step_limit vm;
@@ -108,14 +159,15 @@ and read_place (vm : t) (frame : frame) (p : Seed_mir.place) :
     | Error e -> Error e
   in
   match base with
-  | Ok b -> Ok (project_read vm b p.Seed_mir.projections)
+  | Ok b -> Ok (project_read vm frame b p.Seed_mir.projections)
   | Error e -> Error e
 
-and project_read (vm : t) (base : Vm_value.t) (projs : Seed_mir.projection list) : Vm_value.t =
+and project_read (vm : t) (frame : frame) (base : Vm_value.t)
+    (projs : Seed_mir.projection list) : Vm_value.t =
   match projs with
   | [] -> base
   | proj :: rest ->
-      let recurse v = project_read vm v rest in
+      let recurse v = project_read vm frame v rest in
       (match proj with
        | Seed_mir.Field fid -> (
            match base with
@@ -140,28 +192,82 @@ and project_read (vm : t) (base : Vm_value.t) (projs : Seed_mir.projection list)
                if i < 0 || i >= String.length str then err_trap vm "string index out of bounds"
                else recurse (Vm_value.Char (Uchar.of_char str.[i]))
            | _ -> err_trap vm "index projection on non-array")
-       | Seed_mir.Index _ -> err_trap vm "dynamic index projection on read (unsupported shape)"
+       | Seed_mir.Index li -> (
+           let i = index_of_local vm frame li in
+           match base with
+           | Vm_value.Array elems ->
+               if i < 0 || i >= Array.length elems then err_trap vm "index out of bounds"
+               else recurse elems.(i)
+           | Vm_value.Tuple elems ->
+               if i < 0 || i >= Array.length elems then err_trap vm "tuple index out of bounds"
+               else recurse elems.(i)
+           | Vm_value.String str ->
+               if i < 0 || i >= String.length str then err_trap vm "string index out of bounds"
+               else recurse (Vm_value.Char (Uchar.of_char str.[i]))
+           | _ -> err_trap vm "index projection on non-array")
        | Seed_mir.Downcast _ -> (
            match base with
            | Vm_value.Enum (_, fields) -> recurse (Vm_value.Struct fields)
            | _ -> err_trap vm "downcast on non-enum")
        | Seed_mir.Deref -> (
            match base with
-           | Vm_value.RawPtr ptr | Vm_value.Ref ptr ->
-               if ptr.Vm_memory.region < 0 then err_trap vm "deref of null pointer"
-               else err_trap vm "deref read requires the memory layer (unsupported in this subset)"
+           | Vm_value.Ref (Vm_value.Place (tf, l, projs)) ->
+               (* a real reference: resolve the target place, then
+                  continue the remaining projections on the target value *)
+               let tv =
+                 match read_place vm tf { Seed_mir.local = l; projections = projs } with
+                 | Ok v -> v
+                 | Error e -> err_trap vm (Vm_value.slot_error_string e)
+               in
+               recurse tv
+           | Vm_value.Ref (Vm_value.Region ptr) -> recurse (memory_load vm ptr)
+           | Vm_value.RawPtr ptr -> recurse (memory_load vm ptr)
            | _ -> err_trap vm "deref on non-pointer"))
 
-(* Deref chains end at a scalar read from memory: load per the trailing
-   type. The seed subset reads u8/u16/u32/u64/f32/f64. *)
-and read_pointer (_vm : t) (ptr : Vm_memory.pointer) (rest : Seed_mir.projection list) :
-    Vm_value.t option =
-  if ptr.Vm_memory.region < 0 then None
-  else begin
-    match rest with
-    | [] -> None
-    | _ -> None
-  end
+(* The dynamic-index form: the payload is a LOCAL whose value is the
+   runtime index (the seed's dynamic-index convention).  The local is
+   read through the slot machine; a non-integer or 128-bit index is a
+   deterministic trap. *)
+and index_of_local (vm : t) (frame : frame) (li : int) : int =
+  if li < 0 || li >= Array.length frame.locals then
+    err_trap vm "dynamic index local out of range";
+  match Vm_value.read_slot frame.locals.(li) with
+  | Error e -> err_trap vm (Vm_value.slot_error_string e)
+  | Ok (Vm_value.Int i) ->
+      if i.Int_value.width > 64 then err_trap vm "dynamic index is a 128-bit value";
+      let n = Int_value.to_int64 i in
+      if n < 0L then err_trap vm "index out of bounds (negative)";
+      if Int64.compare n (Int64.of_int max_int) > 0 then err_trap vm "index out of bounds";
+      Int64.to_int n
+  | Ok _ -> err_trap vm "dynamic index is not an integer"
+
+(* Deref read: the region at the pointer holds a self-describing
+   serialized value (Vm_value.serialize).  Null pointers, dead regions,
+   out-of-bounds offsets and invalid payloads are deterministic traps. *)
+and memory_load (vm : t) (ptr : Vm_memory.pointer) : Vm_value.t =
+  if ptr.Vm_memory.region < 0 then err_trap vm "deref of null pointer";
+  match Vm_memory.region_of vm.memory ptr with
+  | Error e -> err_trap vm ("deref read: " ^ Vm_memory.mem_error_string e)
+  | Ok r ->
+      let len = Bytes.length r.Vm_memory.bytes in
+      if ptr.Vm_memory.offset < 0 || ptr.Vm_memory.offset > len then
+        err_trap vm "deref read: out-of-bounds";
+      let sub = Bytes.sub r.Vm_memory.bytes ptr.Vm_memory.offset (len - ptr.Vm_memory.offset) in
+      Vm_value.deserialize sub
+
+(* Deref write: serialize the value into the region (in place, never a
+   copy). *)
+and memory_store (vm : t) (ptr : Vm_memory.pointer) (v : Vm_value.t) : unit =
+  if ptr.Vm_memory.region < 0 then err_trap vm "deref of null pointer";
+  let bytes = Vm_value.serialize v in
+  match Vm_memory.region_of vm.memory ptr with
+  | Error e -> err_trap vm ("deref write: " ^ Vm_memory.mem_error_string e)
+  | Ok r ->
+      let blen = Bytes.length bytes in
+      let rlen = Bytes.length r.Vm_memory.bytes in
+      if ptr.Vm_memory.offset < 0 || ptr.Vm_memory.offset > rlen - blen then
+        err_trap vm "deref write: out-of-bounds";
+      Bytes.blit bytes 0 r.Vm_memory.bytes ptr.Vm_memory.offset blen
 
 (* Write a value into a place (assign). *)
 let rec write_place (vm : t) (frame : frame) (p : Seed_mir.place) (v : Vm_value.t) : unit =
@@ -177,13 +283,13 @@ let rec write_place (vm : t) (frame : frame) (p : Seed_mir.place) (v : Vm_value.
         | Ok b -> b
         | Error e -> err_trap vm (Vm_value.slot_error_string e)
       in
-      let updated = update_place vm base projs v in
+      let updated = update_place vm frame base projs v in
       match Vm_value.write_slot frame.locals.(p.Seed_mir.local) updated with
       | Ok s -> frame.locals.(p.Seed_mir.local) <- s
       | Error e -> err_trap vm (Vm_value.slot_error_string e))
 
-and update_place (vm : t) (base : Vm_value.t) (projs : Seed_mir.projection list)
-    (v : Vm_value.t) : Vm_value.t =
+and update_place (vm : t) (frame : frame) (base : Vm_value.t)
+    (projs : Seed_mir.projection list) (v : Vm_value.t) : Vm_value.t =
   match projs with
   | [] -> v
   | proj :: rest -> (
@@ -192,25 +298,114 @@ and update_place (vm : t) (base : Vm_value.t) (projs : Seed_mir.projection list)
           match base with
           | Vm_value.Struct fields ->
               let i = Ids.Field_id.to_int fid in
+              if i < 0 || i >= Array.length fields then err_trap vm "field index out of bounds";
               let copy = Array.copy fields in
-              copy.(i) <- update_place vm fields.(i) rest v;
+              copy.(i) <- update_place vm frame fields.(i) rest v;
               Vm_value.Struct copy
           | Vm_value.Tuple fields ->
               let i = Ids.Field_id.to_int fid in
+              if i < 0 || i >= Array.length fields then err_trap vm "field index out of bounds";
               let copy = Array.copy fields in
-              copy.(i) <- update_place vm fields.(i) rest v;
+              copy.(i) <- update_place vm frame fields.(i) rest v;
               Vm_value.Tuple copy
           | _ -> err_trap vm "field write on non-aggregate")
       | Seed_mir.ConstantIndex i -> (
           match base with
           | Vm_value.Array elems ->
+              if i < 0 || i >= Array.length elems then err_trap vm "index out of bounds";
               let copy = Array.copy elems in
-              copy.(i) <- update_place vm elems.(i) rest v;
+              copy.(i) <- update_place vm frame elems.(i) rest v;
               Vm_value.Array copy
+          | Vm_value.Tuple elems ->
+              if i < 0 || i >= Array.length elems then err_trap vm "tuple index out of bounds";
+              let copy = Array.copy elems in
+              copy.(i) <- update_place vm frame elems.(i) rest v;
+              Vm_value.Tuple copy
+          | Vm_value.String str ->
+              if i < 0 || i >= String.length str then err_trap vm "string index out of bounds";
+              let c =
+                match update_place vm frame (Vm_value.Char (Uchar.of_char str.[i])) rest v with
+                | Vm_value.Char c -> c
+                | _ -> err_trap vm "string index write with non-char value"
+              in
+              Vm_value.String (string_with_char_at str i c)
           | _ -> err_trap vm "index write on non-array")
-      | Seed_mir.Index _ -> err_trap vm "dynamic index write (unsupported shape)"
+      | Seed_mir.Index li -> (
+          let i = index_of_local vm frame li in
+          match base with
+          | Vm_value.Array elems ->
+              if i < 0 || i >= Array.length elems then err_trap vm "index out of bounds";
+              let copy = Array.copy elems in
+              copy.(i) <- update_place vm frame elems.(i) rest v;
+              Vm_value.Array copy
+          | Vm_value.Tuple elems ->
+              if i < 0 || i >= Array.length elems then err_trap vm "tuple index out of bounds";
+              let copy = Array.copy elems in
+              copy.(i) <- update_place vm frame elems.(i) rest v;
+              Vm_value.Tuple copy
+          | Vm_value.String str ->
+              if i < 0 || i >= String.length str then err_trap vm "string index out of bounds";
+              let c =
+                match update_place vm frame (Vm_value.Char (Uchar.of_char str.[i])) rest v with
+                | Vm_value.Char c -> c
+                | _ -> err_trap vm "string index write with non-char value"
+              in
+              Vm_value.String (string_with_char_at str i c)
+          | _ -> err_trap vm "index write on non-array")
       | Seed_mir.Downcast _ -> base
-      | Seed_mir.Deref -> err_trap vm "deref write (use memory layer)")
+      | Seed_mir.Deref -> (
+          match base with
+          | Vm_value.Ref (Vm_value.Place (tf, l, projs)) ->
+              (* a real reference: write through to the target place; the
+                 remaining projections extend the target path; the ref
+                 value itself is unchanged *)
+              write_place vm tf
+                { Seed_mir.local = l; projections = projs @ rest }
+                v;
+              base
+          | Vm_value.Ref (Vm_value.Region _) ->
+              err_trap vm "write through a region-backed ref (computed-value ref) is a deterministic trap"
+          | Vm_value.RawPtr ptr -> (
+              match rest with
+              | [] -> memory_store vm ptr v
+              | _ ->
+                  (* projected write through the pointee: load, update, store *)
+                  let cur = memory_load vm ptr in
+                  memory_store vm ptr (update_place vm frame cur rest v));
+              base
+          | _ -> err_trap vm "deref write on non-pointer"))
+
+(* Replace the byte at index i with the char's UTF-8 encoding (the byte
+   index is the seed String convention — see the header).  The char's
+   encoding may be multi-byte, so the result string's length changes. *)
+and string_with_char_at (str : string) (i : int) (c : Uchar.t) : string =
+  let encoded = uchar_utf8_encode c in
+  let prefix = String.sub str 0 i in
+  let suffix = String.sub str (i + 1) (String.length str - i - 1) in
+  prefix ^ encoded ^ suffix
+
+(* UTF-8 encode a code point (deterministic; the input Uchar is always
+   valid). *)
+and uchar_utf8_encode (c : Uchar.t) : string =
+  let cp = Uchar.to_int c in
+  if cp <= 0x7F then String.make 1 (Char.chr cp)
+  else if cp <= 0x7FF then
+    String.init 2 (fun j ->
+        if j = 0 then Char.chr (0xC0 lor (cp lsr 6))
+        else Char.chr (0x80 lor (cp land 0x3F)))
+  else if cp <= 0xFFFF then
+    String.init 3 (fun j ->
+        match j with
+        | 0 -> Char.chr (0xE0 lor (cp lsr 12))
+        | 1 -> Char.chr (0x80 lor ((cp lsr 6) land 0x3F))
+        | _ -> Char.chr (0x80 lor (cp land 0x3F)))
+  else
+    String.init 4 (fun j ->
+        match j with
+        | 0 -> Char.chr (0xF0 lor (cp lsr 18))
+        | 1 -> Char.chr (0x80 lor ((cp lsr 12) land 0x3F))
+        | 2 -> Char.chr (0x80 lor ((cp lsr 6) land 0x3F))
+        | _ -> Char.chr (0x80 lor (cp land 0x3F)))
 
 let type_of_local (vm : t) (fn_idx : int) (local : int) : Type_repr.t =
   let fn = vm.program.Seed_mir.functions.(fn_idx) in
@@ -219,11 +414,18 @@ let type_of_local (vm : t) (fn_idx : int) (local : int) : Type_repr.t =
   else fn.Seed_mir.locals.(local)
 
 (* A needs_drop value requires a Drop terminator; the verifier has already
-   checked the plan; here we just execute the slot transition. *)
+   checked the plan.  The drop is RECURSIVE: the value's contained
+   components run their drop glue first (aggregates depth-first; every
+   region-backed ref inside is freed), then the outer slot transitions.
+   Moved/Uninitialized slots are no-ops and a second drop of a Dropped
+   slot traps — exactly the slot machine in vm_value.ml. *)
 let do_drop (vm : t) (frame : frame) (local : int) : unit =
-  match Vm_value.drop_slot frame.locals.(local) with
-  | Ok s -> frame.locals.(local) <- s
-  | Error e -> err_trap vm (Vm_value.slot_error_string e)
+  match frame.locals.(local) with
+  | Vm_value.Live v ->
+      Vm_value.drop_glue vm.memory v;
+      frame.locals.(local) <- Vm_value.Dropped
+  | Vm_value.Moved | Vm_value.Uninitialized -> ()
+  | Vm_value.Dropped -> err_trap vm (Vm_value.slot_error_string Vm_value.DropDropped)
 
 (* Frame-shape invariant, enforced at frame creation (the VM boundary):
    the block array must be indexed by block id — blocks.(i).id = i for
@@ -305,11 +507,18 @@ let rec eval_rvalue (vm : t) (frame : frame) (rv : Seed_mir.rvalue) : Vm_value.t
   match rv with
   | Seed_mir.Use op -> eval_operand vm frame op
   | Seed_mir.Ref p | Seed_mir.RefMut p ->
-      (* allocate a fresh region holding the current value bytes; the seed
-         subset materializes scalars and small aggregates *)
-      (match Vm_value.read_slot frame.locals.(p.Seed_mir.local) with
-       | Ok v -> Vm_value.Ref (vm_alloc_scalar vm v)
-       | Error e -> err_trap vm (Vm_value.slot_error_string e))
+      if p.Seed_mir.local < 0 || p.Seed_mir.local >= Array.length frame.locals then
+        err_trap vm "ref of out-of-range local";
+      if List.exists (function Seed_mir.Deref -> true | _ -> false) p.Seed_mir.projections then
+        (* computed-value source (e.g. `&*ptr`): the target is not a
+           local subplace; keep a serialized copy in a fresh region;
+           writes through this ref are a deterministic trap *)
+        (match read_place vm frame p with
+         | Ok v -> Vm_value.Ref (Vm_value.Region (vm_alloc_scalar vm v))
+         | Error e -> err_trap vm (Vm_value.slot_error_string e))
+      else
+        (* real reference: record the target (frame, local, projections) *)
+        Vm_value.Ref (Vm_value.Place (frame, p.Seed_mir.local, p.Seed_mir.projections))
   | Seed_mir.Aggregate (kind, ops) ->
       let vals = Array.of_list (List.map (eval_operand vm frame) ops) in
       (match kind with
@@ -425,23 +634,21 @@ and int_signed = function
 and int_cast (i : Int_value.t) (kind : Type_repr.int_kind) : Int_value.t =
   Int_value.of_int64 ~width:(int_width kind) ~signed:(int_signed kind) (Int_value.to_int64 i)
 
-(* Allocate a scalar/aggregate region for a Ref (the seed subset
-   materializes a copy; the pointer is a fresh region).  An allocation
-   failure is a deterministic trap, never a silent fallback. *)
+(* Allocate a region holding the serialized bytes of a value (the
+   computed-value refs).  An allocation failure is a deterministic trap,
+   never a silent fallback. *)
 and vm_alloc_scalar (vm : t) (v : Vm_value.t) : Vm_memory.pointer =
-  let size =
-    match v with
-    | Vm_value.Int i -> if i.Int_value.width = 128 then 16 else 8
-    | Vm_value.Float64 _ -> 8
-    | Vm_value.Float32 _ -> 4
-    | Vm_value.Bool _ | Vm_value.Char _ -> 1
-    | _ -> 8
-  in
+  let bytes = Vm_value.serialize v in
+  let size = Bytes.length bytes in
   vm.alloc_bytes <- vm.alloc_bytes + size;
   if vm.alloc_bytes > vm.limits.max_alloc_bytes then err_trap vm "allocation limit exceeded";
   match Vm_memory.alloc vm.memory size 8 with
-  | Ok ptr -> ptr
   | Error e -> err_trap vm ("allocation failed: " ^ Vm_memory.mem_error_string e)
+  | Ok ptr -> (
+      match Vm_memory.region_of vm.memory ptr with
+      | Error e -> err_trap vm ("allocation failed: " ^ Vm_memory.mem_error_string e)
+      | Ok r -> Bytes.blit bytes 0 r.Vm_memory.bytes 0 size);
+      ptr
 
 let rec exec_terminator (vm : t) (frame : frame) (term : Seed_mir.terminator) : unit =
   step_limit vm;
@@ -516,14 +723,14 @@ let rec exec_terminator (vm : t) (frame : frame) (term : Seed_mir.terminator) : 
            write_place vm frame dest ret;
            frame.block <- next;
            frame.stmt <- 0
-        | Seed_mir.Intrinsic _ | Seed_mir.Extern _ as host_callee ->
-            vm.host_calls <- vm.host_calls + 1;
-            if vm.host_calls > vm.limits.max_host_calls then
-              err_trap vm "host call limit exceeded";
-            let ret = call_host vm host_callee arg_vals in
-            write_place vm frame dest ret;
-            frame.block <- next;
-            frame.stmt <- 0)
+       | Seed_mir.Intrinsic _ | Seed_mir.Extern _ as host_callee ->
+           vm.host_calls <- vm.host_calls + 1;
+           if vm.host_calls > vm.limits.max_host_calls then
+             err_trap vm "host call limit exceeded";
+           let ret = call_host vm host_callee arg_vals in
+           write_place vm frame dest ret;
+           frame.block <- next;
+           frame.stmt <- 0)
   | Seed_mir.Drop (p, next, _) ->
       do_drop vm frame p.Seed_mir.local;
       frame.block <- next;
