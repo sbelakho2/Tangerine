@@ -1066,14 +1066,17 @@ and parse_trait_decl (p : parser) : Ast.item_kind =
   let where_clause = parse_optional_where_clause p in
   let methods = ref [] in
   let assoc = ref [] in
-  if eat p Token.KwDo || at p Token.LBrace then begin
-    let brace =
-      if at p Token.LBrace then begin
-        ignore (advance p);
-        true
-      end
-      else false
-    in
+  (* trait bodies may open with `do`, `{`, or bare newline-separated
+     methods terminated by `end` *)
+  let brace =
+    if at p Token.LBrace then begin
+      ignore (advance p);
+      true
+    end
+    else false
+  in
+  ignore (eat p Token.KwDo);
+  if brace || true then begin
     let rec loop () =
       if at_eof p then ()
       else if (not brace && at_kw_end_as_terminator p) || (brace && at p Token.RBrace) then ()

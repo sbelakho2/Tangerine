@@ -461,6 +461,7 @@ let builtin_methods (st : state) : ((string * string) * typed_signature) list =
       ("to_uppercase", [], s_ty, [], let_);
       ("split", [ par "sep" let_ s_ty ], vec s_ty, [], let_);
       ("lines", [], vec s_ty, [], let_);
+      ("char_at", [ par "index" let_ i_ty ], c_ty, [], let_);
       ("as_bytes", [], vec (Type_repr.Int Type_repr.U8), [], let_);
       ("parse_int", [], res i_ty s_ty, [], let_);
       ("parse_float", [], opt f_ty, [], let_);
@@ -3528,8 +3529,7 @@ and register_item (env : env) (item : Ast.item) : (env, string) result =
       match register_constructors env1 d.e_name tid params variants with
       | Ok env2 -> (match errs with [] -> Ok env2 | e :: _ -> Error e)
       | Error m -> Error m)
-  | Ast.TraitDef d ->
-      let env1 =
+  | Ast.TraitDef d ->      let env1 =
         {
           env with
           impls =
