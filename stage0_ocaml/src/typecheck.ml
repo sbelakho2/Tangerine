@@ -81,6 +81,7 @@ type oracle = {
   mutable o_unresolved_calls : int;
   mutable o_unsolved_obligations : int;
   mutable o_missing_effects : int;
+  mutable o_derived_callables : Ids.Callable_id.t list;
 }
 
 (* Mutable check state (per check_program run). *)
@@ -718,6 +719,7 @@ let initial_env () : env =
           o_unresolved_calls = 0;
           o_unsolved_obligations = 0;
           o_missing_effects = 0;
+          o_derived_callables = [];
         };
     }
   in
@@ -1461,8 +1463,23 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
           let* lit_args =
             match targs with
             | [] -> (
+                (* the stored nominal params may be stale (frozen at the
+                   first registration round); instantiate against the
+                   scope's live generics by name, falling back to a fresh
+                   param when the name is not in scope *)
                 match List.assoc_opt name env.types with
-                | Some (Type_repr.Named (_, a)) -> Ok a
+                | Some (Type_repr.Named (_, a)) ->
+                    Ok
+                      (Array.of_list
+                         (List.map2
+                            (fun (pname, _) stored ->
+                              match List.assoc_opt pname scope.generics with
+                              | Some pid -> Type_repr.Type_param pid
+                              | None -> (
+                                  match stored with
+                                  | Type_repr.Type_param _ -> Type_repr.Type_param (fresh_param_id env.state)
+                                  | other -> other))
+                            nom.nom_params (Array.to_list a)))
                 | _ -> Ok [||])
             | ts ->
                 let rec go acc = function
@@ -1765,6 +1782,11 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
             match te.te_type with
             | Type_repr.Fixed_array (t, _) -> Some t
             | Type_repr.Named (id, [| t |]) when Ids.Type_id.compare id b_array = 0 -> Some t
+            | Type_repr.Named (id, [| t |]) -> (
+                (* the kernel's Array/Vec containers are iterable *)
+                match List.assoc_opt id env.type_names with
+                | Some ("Array" | "Vec") -> Some t
+                | _ -> None)
             | Type_repr.String -> Some Type_repr.Char
             | Type_repr.Tuple _ -> Some (Type_repr.Int Type_repr.Int)
             | _ -> None
@@ -2199,7 +2221,9 @@ and check_name (env : env) (scope : scope) (expected : Type_repr.t option) (n : 
       let subst = ref [] in
       (match expected with
        | Some exp -> (
-           match unify subst t exp with
+           (* the expected's params bind to the local's type: a stale
+              signature param must not rewrite the local's own bound param *)
+           match unify subst exp t with
            | Ok () -> ()
            | Error m -> ignore (return_unify_err span t exp m))
        | None -> ());
@@ -2788,9 +2812,12 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
       | Type_repr.Named _ | Type_repr.Fixed_array _ | Type_repr.Tuple _
       | Type_repr.String | Type_repr.Int _ | Type_repr.Bool | Type_repr.Char
       | Type_repr.Float _ | Type_repr.Type_param _ ->
-          Some
-            (mk_sig env.state ~name:("derived::" ^ oname ^ "::clone") ~params_decl:[]
-               ~params:[ ("self", Access_effect.Let, owner_ty) ] ~ret:owner_ty ~where:[])
+          let sig_ =
+            mk_sig env.state ~name:("derived::" ^ oname ^ "::clone") ~params_decl:[]
+              ~params:[ ("self", Access_effect.Let, owner_ty) ] ~ret:owner_ty ~where:[]
+          in
+          env.state.oracle.o_derived_callables <- sig_.ts_callable :: env.state.oracle.o_derived_callables;
+          Some sig_
       | _ -> None
   in
   match (match try_owners candidate_owners with Some s -> Some s | None -> derived_clone ()) with
@@ -3644,7 +3671,8 @@ let reset_oracle (env : env) : unit =
   o.o_unknown_variants <- 0;
   o.o_unresolved_calls <- 0;
   o.o_unsolved_obligations <- 0;
-  o.o_missing_effects <- 0
+  o.o_missing_effects <- 0;
+  o.o_derived_callables <- []
 
 let item_param_ids (env : env) (item : Ast.item) : Ids.Generic_param_id.t list =
   match item.Ast.kind with
@@ -3708,7 +3736,10 @@ let run_oracle (env : env) (_item_name : string) : string list =
     @ List.map (fun (_, s) -> s.ts_callable) env.methods
     @ List.map (fun (_, s) -> s.ts_callable) env.constructors
   in
-  let is_known c = List.exists (fun k -> Ids.Callable_id.compare k c = 0) known_callables in
+  let is_known c =
+    List.exists (fun k -> Ids.Callable_id.compare k c = 0) known_callables
+    || List.exists (fun k -> Ids.Callable_id.compare k c = 0) o.o_derived_callables
+  in
   (* 1+2. Type_param in concrete execution position / unsolved vars *)
   List.iter
     (fun (te : typed_expr) ->
