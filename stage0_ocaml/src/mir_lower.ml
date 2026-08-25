@@ -569,7 +569,7 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
                 (Seed_mir.Assign
                    ( cur_place st id,
                      Seed_mir.Aggregate
-                       ( Seed_mir.EnumCtor (enum_tid_of env enum_name, Ids.Variant_id.make spec.vs_index),
+                       ( Seed_mir.EnumCtor (enum_tid_of env enum_name, Ids.Variant_index.make spec.vs_index),
                          [] ) ));
               (copy_place st (cur_place st id), ty)
           | None -> (
@@ -711,7 +711,9 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
                    emit st (Seed_mir.Assign (cur_place st id, Seed_mir.Use vo));
                    (copy_place st (cur_place st id), ty)
                | None -> seed_bug "assignment to unknown value '%s'" n))
-       | _ -> (vo, vt))
+       | _ ->
+           ignore (vo, vt);
+           seed_bug "projected assignment reached MIR lowering without a typed-place writeback rule")
   | Ast.CompoundAssign (_, _, _, span) ->
       ignore span;
       seed_bug "CompoundAssign reached MIR lowering without a typed-place writeback rule"
@@ -727,10 +729,32 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
       let subj_op, subj_ty = lower_expr env st inner in
       let sid = fresh_local st subj_ty in
       emit st (Seed_mir.Assign (cur_place st sid, Seed_mir.Use subj_op));
-      if Type_repr.compare env.fn_ret subj_ty <> 0 then
-        seed_bug
-          "`?` subject type %s does not match the enclosing function's return type %s (the failure early-return needs the subject to fit the return slot)"
-          (Seed_mir.print_type subj_ty) (Seed_mir.print_type env.fn_ret);
+      (* the error channel is the identity: for Result[T, E] the
+         enclosing function's return must be Result[_, E] (the success
+         types may differ); for Option[T] the return must be Option[_] *)
+      let is_result, err_payload_ty =
+        match subj_ty with
+        | Type_repr.Named (_, [| _; e |]) -> (true, Some e)
+        | Type_repr.Named (_, [| _ |]) -> (false, None)
+        | _ -> seed_bug "`?` subject is not an Option/Result (found %s)" (Seed_mir.print_type subj_ty)
+      in
+      (match env.fn_ret, is_result with
+       | Type_repr.Named (_, [| _; e2 |]), true ->
+           if
+             (match err_payload_ty with
+              | Some e1 -> Type_repr.compare e1 e2 <> 0
+              | None -> true)
+           then
+             seed_bug
+               "`?` error channel mismatch: subject error %s vs enclosing return error %s"
+               (Seed_mir.print_type (Option.get err_payload_ty)) (Seed_mir.print_type e2)
+       | Type_repr.Named (_, [| _ |]), false -> ()
+       | Type_repr.Named (_, [| _; _ |]), false ->
+           seed_bug "`?` Option subject inside a Result-returning function"
+       | Type_repr.Named (_, [| _ |]), true ->
+           seed_bug "`?` Result subject inside an Option-returning function"
+       | _, _ -> seed_bug "`?` enclosing function does not return an Option/Result (found %s)"
+                    (Seed_mir.print_type env.fn_ret));
       let payload_ty =
         match subj_ty with
         | Type_repr.Named (_, args) when Array.length args > 0 -> args.(0)
@@ -744,14 +768,41 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
       set_terminator_to st
         (Seed_mir.SwitchInt (copy_place st (cur_place st did), [ (0L, success) ], fail))
         fail;
-      (* failure path: defers, then the failure value into the return slot, then Ret *)
+      (* failure path: defers, then the failure value into the return
+         slot, then Ret.  For Option the None is the subject itself; for
+         Result the Err(error) is reconstructed from the subject's error
+         payload so the enclosing function's (possibly different)
+         success type does not matter. *)
       emit_defers env st;
-      emit st (Seed_mir.Assign (cur_place st 0, Seed_mir.Use (Seed_mir.Copy (cur_place st sid))));
+      (match is_result, err_payload_ty with
+       | false, _ ->
+           emit st (Seed_mir.Assign (cur_place st 0, Seed_mir.Use (Seed_mir.Copy (cur_place st sid))))
+       | true, Some e ->
+           let eid = fresh_local st e in
+           emit st
+             (Seed_mir.Assign
+                ( cur_place st eid,
+                  Seed_mir.Use
+                    (Seed_mir.Copy
+                       { Seed_mir.local = sid;
+                         projections =
+                           [ Seed_mir.Downcast (Ids.Variant_index.make 1);
+                             Seed_mir.Field (Ids.Field_index.make 0) ] }) ));
+           (match env.fn_ret with
+            | Type_repr.Named (ret_tid, _) ->
+                emit st
+                  (Seed_mir.Assign
+                     ( cur_place st 0,
+                       Seed_mir.Aggregate
+                         ( Seed_mir.EnumCtor (Ids.Type_id.make ret_tid, Ids.Variant_index.make 1),
+                           [ Seed_mir.Copy (cur_place st eid) ] ) ))
+            | _ -> seed_bug "`?` Result failure reconstruction: enclosing return is not a nominal")
+       | true, None -> seed_bug "`?` Result subject without an error payload");
       set_terminator st Seed_mir.Ret;
       push_block st success;
       set_terminator_to st (Seed_mir.Goto join) join;
       ( Seed_mir.Copy
-          { Seed_mir.local = sid; projections = [ Seed_mir.Downcast (Ids.Variant_id.make 0); Seed_mir.Field (Ids.Field_id.make 0) ] },
+          { Seed_mir.local = sid; projections = [ Seed_mir.Downcast (Ids.Variant_index.make 0); Seed_mir.Field (Ids.Field_index.make 0) ] },
         payload_ty ))
   | Ast.ForExpr f -> (
       (* The seed VM cannot execute dynamic index projections (vm.ml
@@ -884,10 +935,13 @@ and lower_stmt (env : func_env) (st : lower_state) (s : Ast.stmt) : unit =
            st.scope <- (n, id) :: st.scope
        | None -> ())
   | Ast.DeferStmt (b, _) ->
-      (* function-level defer stack (LIFO): pushed here, lowered inline
-         at every return/scope-exit edge (see emit_defers).  A defer
-         body containing `return` would recurse at lowering time, so it
-         fails closed. *)
+      (* FRONTEND-SUPPORTED (not yet executable-seed-supported per the
+         audit): the function-level LIFO stack is an approximation —
+         conditional/loop scopes flatten to function level, so a defer
+         inside an untaken branch would still run. The audit's exact
+         scope-tree + CFG-exit-edge cleanup model is the required
+         redesign; until then this construct is documented as
+         frontend-supported and its lowering is approximate. *)
       if block_has_return b then seed_bug "defer bodies may not contain `return`";
       st.defer_stack <- b :: st.defer_stack
   | Ast.Item _ -> ()
@@ -1073,8 +1127,8 @@ and lower_match (env : func_env) (st : lower_state) (m : Ast.match_expr) :
                                { Seed_mir.local = sid;
                                  projections =
                                    [
-                                     Seed_mir.Downcast (Ids.Variant_id.make spec.vs_index);
-                                     Seed_mir.Field (Ids.Field_id.make j);
+                                     Seed_mir.Downcast (Ids.Variant_index.make spec.vs_index);
+                                     Seed_mir.Field (Ids.Field_index.make j);
                                    ] }) ));
                    st.scope <- (name, id) :: st.scope)
                | Ast.Wildcard _ -> ()
@@ -1165,7 +1219,7 @@ and lower_call (env : func_env) (st : lower_state) (callee : Ast.expr)
             (Seed_mir.Assign
                ( cur_place st id,
                  Seed_mir.Aggregate
-                   ( Seed_mir.EnumCtor (enum_tid_of env enum_name, Ids.Variant_id.make spec.vs_index),
+                   ( Seed_mir.EnumCtor (enum_tid_of env enum_name, Ids.Variant_index.make spec.vs_index),
                      arg_ops ) ));
           (copy_place st (cur_place st id), ty)
       | None -> (

@@ -172,11 +172,11 @@ and project_read (vm : t) (frame : frame) (base : Vm_value.t)
        | Seed_mir.Field fid -> (
            match base with
            | Vm_value.Struct fields | Vm_value.Tuple fields ->
-               let i = Ids.Field_id.to_int fid in
+               let i = Ids.Field_index.to_int fid in
                if i < 0 || i >= Array.length fields then err_trap vm "field index out of bounds"
                else recurse fields.(i)
            | Vm_value.Enum (_, fields) ->
-               let i = Ids.Field_id.to_int fid in
+               let i = Ids.Field_index.to_int fid in
                if i < 0 || i >= Array.length fields then err_trap vm "enum field index out of bounds"
                else recurse fields.(i)
            | _ -> err_trap vm "field projection on non-aggregate")
@@ -297,13 +297,13 @@ and update_place (vm : t) (frame : frame) (base : Vm_value.t)
       | Seed_mir.Field fid -> (
           match base with
           | Vm_value.Struct fields ->
-              let i = Ids.Field_id.to_int fid in
+              let i = Ids.Field_index.to_int fid in
               if i < 0 || i >= Array.length fields then err_trap vm "field index out of bounds";
               let copy = Array.copy fields in
               copy.(i) <- update_place vm frame fields.(i) rest v;
               Vm_value.Struct copy
           | Vm_value.Tuple fields ->
-              let i = Ids.Field_id.to_int fid in
+              let i = Ids.Field_index.to_int fid in
               if i < 0 || i >= Array.length fields then err_trap vm "field index out of bounds";
               let copy = Array.copy fields in
               copy.(i) <- update_place vm frame fields.(i) rest v;
@@ -525,7 +525,7 @@ let rec eval_rvalue (vm : t) (frame : frame) (rv : Seed_mir.rvalue) : Vm_value.t
        | Seed_mir.TupleAgg -> Vm_value.Tuple vals
        | Seed_mir.ArrayAgg -> Vm_value.Array vals
        | Seed_mir.StructCtor _ -> Vm_value.Struct vals
-       | Seed_mir.EnumCtor (_, vid) -> Vm_value.Enum (Ids.Variant_id.to_int vid, vals)
+       | Seed_mir.EnumCtor (_, vid) -> Vm_value.Enum (Ids.Variant_index.to_int vid, vals)
        | Seed_mir.ClosureAgg inst -> Vm_value.Closure (inst, vals))
   | Seed_mir.BinaryOp (op, l, r) ->
       let lv = eval_operand vm frame l in
@@ -827,7 +827,7 @@ and exec_statement (vm : t) (frame : frame) (st : Seed_mir.statement) : unit =
   | Seed_mir.SetDiscriminant (p, vid) -> (
       match read_place vm frame p with
       | Ok (Vm_value.Enum (_, payload)) ->
-          write_place vm frame p (Vm_value.Enum (Ids.Variant_id.to_int vid, payload))
+          write_place vm frame p (Vm_value.Enum (Ids.Variant_index.to_int vid, payload))
       | _ -> err_trap vm "SetDiscriminant on non-enum")
   | Seed_mir.Nop -> ()
 

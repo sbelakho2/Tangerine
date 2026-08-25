@@ -58,11 +58,11 @@ type constant =
 
 type projection =
   | Deref
-  | Field of Ids.Field_id.t
+  | Field of Ids.Field_index.t
   | Index of int            (* dynamic-index form: the payload is the LOCAL
                                whose value is the runtime index *)
   | ConstantIndex of int
-  | Downcast of Ids.Variant_id.t
+  | Downcast of Ids.Variant_index.t
 
 type place = { local : int; projections : projection list }
 
@@ -94,8 +94,8 @@ type un_op = Neg | Not
 type aggregate_kind =
   | TupleAgg
   | ArrayAgg
-  | StructCtor of Ids.Type_id.t * Ids.Field_id.t array
-  | EnumCtor of Ids.Type_id.t * Ids.Variant_id.t
+  | StructCtor of Ids.Type_id.t * Ids.Field_index.t array
+  | EnumCtor of Ids.Type_id.t * Ids.Variant_index.t
   | ClosureAgg of Ids.Instance_id.t
 
 type rvalue =
@@ -113,7 +113,7 @@ type statement =
   | Assign of place * rvalue
   | StorageLive of int
   | StorageDead of int
-  | SetDiscriminant of place * Ids.Variant_id.t
+  | SetDiscriminant of place * Ids.Variant_index.t
   | Nop
 
 type terminator =
@@ -227,10 +227,10 @@ let print_place (p : place) : string =
   List.iter
     (function
       | Deref -> s := "(*" ^ !s ^ ")"
-      | Field f -> s := !s ^ "." ^ string_of_int (Ids.Field_id.to_int f)
+      | Field f -> s := !s ^ "." ^ string_of_int (Ids.Field_index.to_int f)
       | Index li -> s := !s ^ Printf.sprintf "[_%d]" li
       | ConstantIndex i -> s := !s ^ Printf.sprintf "[%d]" i
-      | Downcast v -> s := !s ^ Printf.sprintf " as variant#%d" (Ids.Variant_id.to_int v))
+      | Downcast v -> s := !s ^ Printf.sprintf " as variant#%d" (Ids.Variant_index.to_int v))
     p.projections;
   !s
 
@@ -269,7 +269,7 @@ let print_rvalue (rv : rvalue) : string =
           Printf.sprintf "type#%d { %s }" (Ids.Type_id.to_int tid) ops_s
       | EnumCtor (tid, vid) ->
           Printf.sprintf "type#%d::variant#%d(%s)" (Ids.Type_id.to_int tid)
-            (Ids.Variant_id.to_int vid) ops_s
+            (Ids.Variant_index.to_int vid) ops_s
       | ClosureAgg inst -> Printf.sprintf "closure(%s, [%s])" (print_instance inst) ops_s)
   | BinaryOp (op, l, r) ->
       print_operand l ^ " " ^ print_bin_op op ^ " " ^ print_operand r
@@ -285,7 +285,7 @@ let print_statement (st : statement) : string =
   | StorageDead id -> Printf.sprintf "StorageDead(_%d);" id
   | SetDiscriminant (p, d) ->
       Printf.sprintf "SetDiscriminant(%s, variant#%d);" (print_place p)
-        (Ids.Variant_id.to_int d)
+        (Ids.Variant_index.to_int d)
   | Nop -> "nop;"
 
 let print_terminator (t : terminator) : string =

@@ -155,11 +155,11 @@ let rec types_compatible (ctx : ctx) (a : Type_repr.t) (b : Type_repr.t) : bool 
 
 (* Whether the resolved type is an ENUM def (Function with Never ret),
    and the payload type of one of its variants. *)
-let enum_variant_payload (ctx : ctx) (ty : Type_repr.t) (vid : Ids.Variant_id.t) :
+let enum_variant_payload (ctx : ctx) (ty : Type_repr.t) (vid : Ids.Variant_index.t) :
     Type_repr.t option =
   match resolve_or_self ctx ty with
   | Type_repr.Function (variants, Type_repr.Never) ->
-      let i = Ids.Variant_id.to_int vid in
+      let i = Ids.Variant_index.to_int vid in
       if i >= 0 && i < Array.length variants then
         Some variants.(i).Type_repr.pt_type
       else None
@@ -178,7 +178,7 @@ let project_type (ctx : ctx) (ty : Type_repr.t) (proj : projection) : Type_repr.
       | Type_repr.Ref_internal (_, t) | Type_repr.Raw_ptr (_, t) -> Some t
       | _ -> None)
   | Field fid -> (
-      let i = Ids.Field_id.to_int fid in
+      let i = Ids.Field_index.to_int fid in
       match resolve_or_self ctx ty with
       | Type_repr.Tuple elems when i >= 0 && i < Array.length elems -> Some elems.(i)
       | _ -> None)
@@ -214,7 +214,7 @@ let place_key (p : place) : string =
       (function
         | Deref | Index _ -> boundary := true
         | Downcast _ -> ()
-        | Field fid -> segs := string_of_int (Ids.Field_id.to_int fid) :: !segs
+        | Field fid -> segs := string_of_int (Ids.Field_index.to_int fid) :: !segs
         | ConstantIndex i -> segs := string_of_int i :: !segs)
       p.projections;
     if !boundary then "*"
@@ -615,7 +615,7 @@ let check_projection_owners (ctx : ctx) (fn : function_) (bb_ctx : string) (p : 
         | Field fid -> (
             match resolve_or_self ctx ty with
             | Type_repr.Tuple elems ->
-                let i = Ids.Field_id.to_int fid in
+                let i = Ids.Field_index.to_int fid in
                 if i < 0 || i >= Array.length elems then
                   add_err ctx
                     (Printf.sprintf
@@ -646,7 +646,7 @@ let check_projection_owners (ctx : ctx) (fn : function_) (bb_ctx : string) (p : 
                 add_err ctx
                   (Printf.sprintf
                      "%s: variant projection variant#%d does not match the projected type's enum def"
-                     bb_ctx (Ids.Variant_id.to_int vid))))
+                     bb_ctx (Ids.Variant_index.to_int vid))))
   in
   if p.local >= 0 && p.local < Array.length fn.locals then
     go fn.locals.(p.local) p.projections
@@ -706,6 +706,18 @@ let check_ref_operand (ctx : ctx) (fn : function_) (bb_ctx : string) (op : opera
                  (Printf.sprintf "%s: ref-typed local _%d moved (refs are internal ABI temporaries)"
                     bb_ctx p.local)
            | _ -> ())
+       | _ :: _, _ ->
+           (* the seed VM has no partial-move representation: a projected
+              move/consume would lose the distinction between moving a
+              subvalue and moving the whole aggregate, so it is rejected
+              (verifier semantics must never be stronger than the
+              executor's) *)
+           add_err ctx
+             (Printf.sprintf
+                "%s: projected %s of local _%d is not supported (the seed VM has no partial-move representation)"
+                bb_ctx
+                (match op with Move _ -> "move" | Consume _ -> "consume" | _ -> "transfer")
+                p.local)
        | _ -> ())
   | Constant _ -> ()
 
@@ -891,7 +903,7 @@ let check_aggregate (ctx : ctx) (fn : function_) (bb_ctx : string) (kind : aggre
               add_err ctx
                 (Printf.sprintf
                    "%s: enum aggregate references invalid variant variant#%d of type#%d" bb_ctx
-                   (Ids.Variant_id.to_int vid) (Ids.Type_id.to_int tid))
+                   (Ids.Variant_index.to_int vid) (Ids.Type_id.to_int tid))
           | Some payload -> (
               match resolve_or_self ctx payload with
               | Type_repr.Unit -> check_count 0
@@ -1456,7 +1468,7 @@ let verify_function (ctx : ctx) (fn : function_) : unit =
                          add_err ctx
                            (Printf.sprintf
                               "%s: SetDiscriminant references invalid variant variant#%d (not a variant of the place's enum type)"
-                              bb_ctx (Ids.Variant_id.to_int vid)))
+                              bb_ctx (Ids.Variant_index.to_int vid)))
                  | None -> ())
             | Nop -> ())
           b.statements;
