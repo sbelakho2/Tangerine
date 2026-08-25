@@ -3643,7 +3643,11 @@ and register_methods (env : env) (owner : string) (methods : Ast.function_decl l
             in
             let sig_ = { sig_ with ts_where = where_extra @ sig_.ts_where } in
             let key = (owner, sig_.ts_name) in
-            let env' = { env with methods = (key, sig_) :: env.methods } in
+            (* idempotent registration (audit Fix 3): re-registration
+               replaces, never appends a duplicate declaration *)
+            let env' =
+              { env with methods = (key, sig_) :: List.remove_assoc key env.methods }
+            in
             go env' rest)
   in
   go env methods
@@ -3667,7 +3671,13 @@ and register_constructors (env : env) (ename : string) (tid : Ids.Type_id.t)
             ~ret:ret_ty ~where:[]
         in
         let env' =
-          { env with constructors = (ename ^ "::" ^ vname, sig_) :: (vname, sig_) :: env.constructors }
+          {
+            env with
+            constructors =
+              (ename ^ "::" ^ vname, sig_)
+              :: List.remove_assoc (ename ^ "::" ^ vname) env.constructors
+              |> fun l -> (vname, sig_) :: List.remove_assoc vname l;
+          }
         in
         go env' rest)
   in
@@ -3756,7 +3766,16 @@ and register_impl (env : env) (d : Ast.impl_decl) : (env, string) result =
     }
   in
   env.state.next_impl_index <- env.state.next_impl_index + 1;
-  let env2 = { env' with impls = { env'.impls with impls = entry :: env'.impls.impls } } in
+  let env2 =
+    {
+      env' with
+      impls =
+        {
+          env'.impls with
+          impls = entry :: List.filter (fun e -> e.Trait_solver.ie_id <> entry.Trait_solver.ie_id) env'.impls.impls;
+        };
+    }
+  in
   let* () =
     match d.i_trait_name with
     | None -> Ok ()
@@ -3989,11 +4008,11 @@ and register_item (env : env) (item : Ast.item) : (env, string) result =
   | Ast.ConstDecl d ->
       let qname = qualified_name item.module_path d.c_name in
       let* ty = resolve_type env empty_scope d.c_type in
-      Ok { env with consts = (qname, ty) :: env.consts }
+      Ok { env with consts = (qname, ty) :: List.remove_assoc qname env.consts }
   | Ast.StaticDecl d ->
       let qname = qualified_name item.module_path d.st_name in
       let* ty = resolve_type env empty_scope d.st_type in
-      Ok { env with consts = (qname, ty) :: env.consts }
+      Ok { env with consts = (qname, ty) :: List.remove_assoc qname env.consts }
   | Ast.TypeAlias d ->
       let params =
         List.map (fun (tp : Ast.type_param) -> (tp.tp_name, fresh_param_id env.state))
@@ -4265,9 +4284,41 @@ let record_module_debt (env : env) (program : Ast.program) (errors : string list
     st.debt_last_printed <- printed
   end
 
-let check_program (env : env) (program : Ast.program) : (env * string list, string) result =
+(* ────────────────────────────────────────────────────────────────
+   Deterministic phase split (audit Fix 3): check_declarations registers
+   every identity once (headers + signatures, non-fatal), then
+   check_bodies checks the items' bodies against the frozen environment.
+   The driver runs the declaration pass over the whole closure first,
+   then the body pass — no mutating retry rounds re-register
+   declarations. *)
+
+let rec check_declarations (env : env) (program : Ast.program) :
+    (env * string list, string) result =
   (* Phase A: bare type names first (in-module mutual recursion). *)
   let env_h, header_errors = register_headers env [] program.Ast.items in
+  (* Phase C: resolve the nominal SHAPES (fields, variants, where
+     predicates) and register methods/impls — idempotently, so the
+     driver's declaration fixpoint can re-run a module as the env grows
+     without appending duplicate declarations *)
+  let is_shape item =
+    match item.Ast.kind with
+    | Ast.StructDef _ | Ast.EnumDef _ | Ast.TraitDef _ | Ast.ImplBlock _
+    | Ast.ExternBlock _ | Ast.ModuleDef _ ->
+        true
+    | _ -> false
+  in
+  let shape_items = List.filter is_shape program.Ast.items in
+  let shape_errors = ref [] in
+  let env_s =
+    List.fold_left
+      (fun e item ->
+        match check_item e item with
+        | Ok () -> e
+        | Error m ->
+            shape_errors := (Ast.item_summary item.Ast.kind ^ ": " ^ m) :: !shape_errors;
+            e)
+      env_h shape_items
+  in
   (* Phase B: registration is non-fatal: items whose signatures reference
      not-yet-registered types are deferred (reported as errors), so a
      module with forward/cyclic references still contributes everything it
@@ -4293,27 +4344,49 @@ let check_program (env : env) (program : Ast.program) : (env * string list, stri
               go_reg env ((name ^ ": " ^ m) :: acc) rest
             end)
   in
-  let* env1, reg_errors = go_reg env_h [] program.Ast.items in
+  let* env1, reg_errors = go_reg env_s [] program.Ast.items in
+  Ok (env1, header_errors @ reg_errors @ List.rev !shape_errors)
+
+and check_bodies (env : env) (program : Ast.program) : (env * string list, string) result =
+  (* shape items (structs/enums/traits/impls/externs) fill the nominal
+     shapes and register methods/impls; body items (functions/tests/
+     consts/statics) are checked against the complete shapes — within a
+     module the shapes always precede the bodies, so a declaration's
+     fields are visible to every function in the module *)
+  let is_shape item =
+    match item.Ast.kind with
+    | Ast.StructDef _ | Ast.EnumDef _ | Ast.TraitDef _ | Ast.ImplBlock _
+    | Ast.ExternBlock _ | Ast.ModuleDef _ ->
+        true
+    | _ -> false
+  in
+  let shape_items = List.filter is_shape program.Ast.items in
+  let body_items = List.filter (fun i -> not (is_shape i)) program.Ast.items in
   let rec go (errors : string list) = function
-    | [] -> Ok (env1, List.rev errors)
+    | [] -> Ok (env, List.rev errors)
     | item :: rest -> (
         let name = Ast.item_summary item.Ast.kind in
-        env1.state.current_item <- name;
-        env1.state.current_item_params <- item_param_ids env1 item;
-        reset_oracle env1;
-        let secondary = List.mem name env1.state.failed_items in
+        env.state.current_item <- name;
+        env.state.current_item_params <- item_param_ids env item;
+        reset_oracle env;
+        let secondary = List.mem name env.state.failed_items in
         let tag m = if secondary then "[secondary] " ^ m else m in
-        match check_item env1 item with
+        match check_item env item with
         | Error m -> go (tag (name ^ ": " ^ m) :: errors) rest
         | Ok () ->
-            let findings = run_oracle env1 name in
+            let findings = run_oracle env name in
             go (List.map (fun f -> tag (name ^ ": " ^ f)) findings @ errors) rest)
   in
-  let* final_env, errors = go (header_errors @ reg_errors) program.Ast.items in
+  let* final_env, errors = go [] (shape_items @ body_items) in
   let backstop = run_impl_backstop final_env in
   let all_errors = errors @ backstop in
   record_module_debt final_env program all_errors;
   Ok (final_env, all_errors)
+
+and check_program (env : env) (program : Ast.program) : (env * string list, string) result =
+  let* env_d, decl_errors = check_declarations env program in
+  let* env_b, body_errors = check_bodies env_d program in
+  Ok (env_b, decl_errors @ body_errors)
 
 (* Public classification entry over the checker's error strings. *)
 let debt_report (errors : string list) : Debt_report.t = Debt_report.of_errors errors

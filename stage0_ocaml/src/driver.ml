@@ -669,26 +669,62 @@ let run_closure_pipeline ~(repo_root : string) ~(manifest_path : string) ~(targe
         let errs_by_mod : (string, string list) Hashtbl.t = Hashtbl.create 64 in
         let items = ref 0 in
         let typed_calls = ref 0 in
-        let pending = ref (topological_nodes graph) in
-        let rounds = ref 0 in
-        while !pending <> [] && !rounds < 8 do
-          incr rounds;
-          let this_round = !pending in
-          pending := [];
-          List.iter
-            (fun node ->
-              let key = String.concat "::" node.Module_graph.node_path in
-              (* the resolver's per-module scoping needs the module id *)
-              let env_m = { !env with Typecheck.module_id = node.Module_graph.node_id } in
-              match Typecheck.check_program env_m node.Module_graph.node_program with
-              | Error m -> Hashtbl.replace errs_by_mod key [ m ]
+        (* deterministic phase split (audit Fix 3): declare every identity
+           over the closure to a fixpoint (registration is idempotent —
+           re-runs replace, never append duplicates; the fixpoint only
+           resolves what became resolvable as the env grew), then check
+           bodies exactly once against the frozen environment *)
+        let nodes = topological_nodes graph in
+        let with_module env node = { env with Typecheck.module_id = node.Module_graph.node_id } in
+        let decl_rounds = ref 0 in
+        let rec decl_pass env = function
+          | [] -> env
+          | node :: rest -> (
+              match Typecheck.check_declarations (with_module env node) node.Module_graph.node_program with
+              | Error m ->
+                  let key = String.concat "::" node.Module_graph.node_path in
+                  Hashtbl.replace errs_by_mod key [ m ];
+                  decl_pass env rest
               | Ok (env', errors) ->
-                  env := { env' with Typecheck.module_id = (!env).Typecheck.module_id };
-                  typed_calls := !typed_calls + List.length (!env).state.oracle.o_calls;
+                  let key = String.concat "::" node.Module_graph.node_path in
                   Hashtbl.replace errs_by_mod key errors;
-                  if errors <> [] then pending := node :: !pending)
-            this_round
-        done;
+                  decl_pass env' rest)
+        in
+        let env_after_decls =
+          let rec fixpoint env =
+            incr decl_rounds;
+            let before = Hashtbl.copy errs_by_mod in
+            let env' = decl_pass env nodes in
+            (* keep re-declaring while the declaration error surface
+               shrinks (new resolutions appear), capped like the old
+               retry loop but with idempotent registration *)
+            let improved =
+              Hashtbl.fold
+                (fun k errs acc ->
+                  match Hashtbl.find_opt before k with
+                  | Some old -> acc || List.length errs < List.length old
+                  | None -> acc || errs <> [])
+                errs_by_mod false
+            in
+            if improved && !decl_rounds < 8 then fixpoint env' else env'
+          in
+          fixpoint !env
+        in
+        let rec body_pass env = function
+          | [] -> env
+          | node :: rest -> (
+              match Typecheck.check_bodies (with_module env node) node.Module_graph.node_program with
+              | Error m ->
+                  let key = String.concat "::" node.Module_graph.node_path in
+                  Hashtbl.replace errs_by_mod key [ m ];
+                  body_pass env rest
+              | Ok (env', errors) ->
+                  let key = String.concat "::" node.Module_graph.node_path in
+                  typed_calls := !typed_calls + List.length env.state.oracle.o_calls;
+                  Hashtbl.replace errs_by_mod key errors;
+                  body_pass env' rest)
+        in
+        env := body_pass env_after_decls nodes;
         (* identity-handoff invariant: every method the resolver can
            resolve must carry the resolver's CallableId, not a fresh mint *)
         Printf.printf
@@ -713,7 +749,7 @@ let run_closure_pipeline ~(repo_root : string) ~(manifest_path : string) ~(targe
             ctx_type_errors = type_errors;
             ctx_items = !items;
             ctx_typed_calls_sample = !typed_calls;
-            ctx_rounds = !rounds }
+            ctx_rounds = 2 }
       end)
 
 (* Lower every top-level free function of the closure into one Seed MIR
