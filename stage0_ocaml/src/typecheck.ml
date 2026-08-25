@@ -91,6 +91,8 @@ type state = {
   mutable next_param_id : int;
   mutable next_var_id : int;
   mutable failed_items : string list;
+  mutable o_handoff_resolved : int;
+  mutable o_handoff_fallback : int;
   (* once-only declaration identities: the first allocation of an item's
      generic-parameter ids is recorded and reused by every later
      registration attempt, so retry rounds never create stale ids *)
@@ -122,6 +124,7 @@ type env = {
   consts : (string * Type_repr.t) list;
   state : state;
   module_id : Ids.Module_id.t;
+  resolved : Resolver.resolved_program option;
 }
 
 type scope = {
@@ -730,13 +733,15 @@ let builtin_constructors (st : state) : (string * typed_signature) list =
   ]
 
 (* The initial env: the compiler-registered prelude. *)
-let initial_env () : env =
+let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
   let st =
     {
       next_type_id = 100;
       next_param_id = 1000;
       next_var_id = 0;
       failed_items = [];
+      o_handoff_resolved = 0;
+      o_handoff_fallback = 0;
       sig_param_ids = Hashtbl.create 256;
       next_callable_id = 0;
       next_impl_index = 0;
@@ -809,6 +814,7 @@ let initial_env () : env =
     consts = [];
     state = st;
     module_id = Ids.Module_id.make 0;
+    resolved;
   }
 
 (* ────────────────────────────────────────────────────────────────
@@ -3553,6 +3559,23 @@ and register_methods (env : env) (owner : string) (methods : Ast.function_decl l
         with
         | Error e -> Error e
         | Ok sig_ ->
+            (* identity handoff (audit Fix 2): the resolver owns method
+               callable identity — use its CallableId when it resolves;
+               fall back to the fresh mint only when it cannot *)
+            let sig_ =
+              match env.resolved with
+              | Some rp -> (
+                  match
+                    Resolver.resolve_method rp env.module_id owner m.Ast.fn_sig.Ast.sig_name
+                  with
+                  | Resolver.Resolved cid ->
+                      env.state.o_handoff_resolved <- env.state.o_handoff_resolved + 1;
+                      { sig_ with ts_callable = cid }
+                  | _ ->
+                      env.state.o_handoff_fallback <- env.state.o_handoff_fallback + 1;
+                      sig_)
+              | None -> sig_
+            in
             let sig_ = { sig_ with ts_where = where_extra @ sig_.ts_where } in
             let key = (owner, sig_.ts_name) in
             let env' = { env with methods = (key, sig_) :: env.methods } in

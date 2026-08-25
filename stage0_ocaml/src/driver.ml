@@ -663,7 +663,9 @@ let run_closure_pipeline ~(repo_root : string) ~(manifest_path : string) ~(targe
       end
       else begin
         Printf.printf "  diagnostics: 0\n";
-        let env = ref (Typecheck.initial_env ()) in
+        (* identity handoff (audit Fix 2): the typechecker consumes the
+           resolver's semantic identities instead of rediscovering them *)
+        let env = ref (Typecheck.initial_env ~resolved:(Some resolved) ()) in
         let errs_by_mod : (string, string list) Hashtbl.t = Hashtbl.create 64 in
         let items = ref 0 in
         let typed_calls = ref 0 in
@@ -676,15 +678,22 @@ let run_closure_pipeline ~(repo_root : string) ~(manifest_path : string) ~(targe
           List.iter
             (fun node ->
               let key = String.concat "::" node.Module_graph.node_path in
-              match Typecheck.check_program !env node.Module_graph.node_program with
+              (* the resolver's per-module scoping needs the module id *)
+              let env_m = { !env with Typecheck.module_id = node.Module_graph.node_id } in
+              match Typecheck.check_program env_m node.Module_graph.node_program with
               | Error m -> Hashtbl.replace errs_by_mod key [ m ]
               | Ok (env', errors) ->
-                  env := env';
+                  env := { env' with Typecheck.module_id = (!env).Typecheck.module_id };
                   typed_calls := !typed_calls + List.length (!env).state.oracle.o_calls;
                   Hashtbl.replace errs_by_mod key errors;
                   if errors <> [] then pending := node :: !pending)
             this_round
         done;
+        (* identity-handoff invariant: every method the resolver can
+           resolve must carry the resolver's CallableId, not a fresh mint *)
+        Printf.printf
+          "  identity handoff: methods via resolver %d, fallback %d\n"
+          (!env).Typecheck.state.o_handoff_resolved (!env).Typecheck.state.o_handoff_fallback;
         List.iter
           (fun node ->
             items := !items + List.length node.Module_graph.node_items)
