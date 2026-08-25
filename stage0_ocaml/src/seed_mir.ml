@@ -324,20 +324,25 @@ let print_terminator (t : terminator) : string =
 
 let print_function (fn : function_) : string =
   let buf = Buffer.create 256 in
+  (* local convention: _0 is the return slot, parameter i lives at
+     local _i+1 (seed_mir.ml's documented contract) *)
   let params =
     String.concat ", "
       (Array.to_list
          (Array.mapi
             (fun i (_, ty) ->
-              Printf.sprintf "_%d: %s" i (print_type ty))
+              Printf.sprintf "_%d: %s" (i + 1) (print_type ty))
             fn.params))
   in
   Buffer.add_string buf
-    (Printf.sprintf "fn %s(%s) { instance = %s;\n" fn.name params
-       (print_instance fn.instance));
+    (Printf.sprintf "fn %s(_0: %s, %s) { instance = %s;\n" fn.name
+       (match Array.length fn.locals with
+        | 0 -> "_"
+        | _ -> print_type fn.locals.(0))
+       params (print_instance fn.instance));
   Array.iteri
     (fun i ty ->
-      if i >= Array.length fn.params then
+      if i > Array.length fn.params then
         Buffer.add_string buf (Printf.sprintf "    let _%d: %s;\n" i (print_type ty)))
     fn.locals;
   if Array.length fn.locals > Array.length fn.params then Buffer.add_char buf '\n';

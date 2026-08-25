@@ -268,7 +268,6 @@ let builtin_types (st : state) : (string * Type_repr.t) list =
       ("str", Type_repr.String);
       ("Char", Type_repr.Char);
       ("String", Type_repr.String);
-      ("str", Type_repr.String);
       ("Never", Type_repr.Never);
       ("Unit", Type_repr.Unit);
       ("()", Type_repr.Unit);
@@ -475,14 +474,11 @@ let builtin_methods (st : state) : ((string * string) * typed_signature) list =
     ]
     |> List.map (fun (n, p, r, w, rc) -> simple ~owner:"String" ~owner_ty:s_ty ~name:n ~params:p ~ret:r ~decl:[] ~where:w ~recv_conv:rc)
   in
+  (* the str owner's surface is the String builtin minus what the
+     kernel's own impl str provides; the String<->str owner alias in
+     check_method_call covers the shared methods *)
   let m_str =
-    [
-      ("len", [], i_ty, [], let_);
-      ("to_string", [], s_ty, [], let_);
-      ("find", [ par "sub" let_ s_ty ], opt i_ty, [], let_);
-      ("slice", [ par "start" let_ i_ty; par "end_idx" let_ i_ty ], s_ty, [], let_);
-      ("parse_int", [], res i_ty s_ty, [], let_);
-    ]
+    [ ("to_string", [], s_ty, [], let_) ]
     |> List.map (fun (n, p, r, w, rc) -> simple ~owner:"str" ~owner_ty:s_ty ~name:n ~params:p ~ret:r ~decl:[] ~where:w ~recv_conv:rc)
   in
   let m_int =
@@ -2766,7 +2762,6 @@ and check_call_sig (env : env) (scope : scope) (expected : Type_repr.t option)
       in
       let wps = List.map (fun (wt, bs) -> (substitute_fixpoint !subst wt, bs)) sig_.ts_where in
       let* () = check_where_obligations env span sig_.ts_name wps in
-      let* () = check_where_obligations env span sig_.ts_name wps in
       let substitution =
         Array.of_list
           (List.map
@@ -3557,8 +3552,16 @@ and register_item (env : env) (item : Ast.item) : (env, string) result =
       end
   | Ast.StructDef d -> (
       let params =
-        List.map (fun (tp : Ast.type_param) -> (tp.tp_name, fresh_param_id env.state))
-          d.s_type_params
+        let key = "nominal::" ^ d.s_name in
+        match Hashtbl.find_opt env.state.sig_param_ids key with
+        | Some ids -> ids
+        | None ->
+            let ids =
+              List.map (fun (tp : Ast.type_param) -> (tp.tp_name, fresh_param_id env.state))
+                d.s_type_params
+            in
+            Hashtbl.add env.state.sig_param_ids key ids;
+            ids
       in
       let scope = { empty_scope with generics = params } in
       (* re-registration merges newly resolvable fields into the nominal *)
@@ -3615,8 +3618,16 @@ and register_item (env : env) (item : Ast.item) : (env, string) result =
       | Error m -> Error m)
   | Ast.EnumDef d -> (
       let params =
-        List.map (fun (tp : Ast.type_param) -> (tp.tp_name, fresh_param_id env.state))
-          d.e_type_params
+        let key = "nominal::" ^ d.e_name in
+        match Hashtbl.find_opt env.state.sig_param_ids key with
+        | Some ids -> ids
+        | None ->
+            let ids =
+              List.map (fun (tp : Ast.type_param) -> (tp.tp_name, fresh_param_id env.state))
+                d.e_type_params
+            in
+            Hashtbl.add env.state.sig_param_ids key ids;
+            ids
       in
       let scope = { empty_scope with generics = params } in
       let existing, env_base =
@@ -3887,8 +3898,16 @@ let rec register_headers (env : env) (acc : string list) = function
           if List.mem_assoc d.s_name env.nominals then register_headers env acc rest
           else begin
             let params =
-              List.map (fun (tp : Ast.type_param) -> (tp.tp_name, fresh_param_id env.state))
-                d.s_type_params
+              let key = "nominal::" ^ d.s_name in
+              match Hashtbl.find_opt env.state.sig_param_ids key with
+              | Some ids -> ids
+              | None ->
+                  let ids =
+                    List.map (fun (tp : Ast.type_param) -> (tp.tp_name, fresh_param_id env.state))
+                      d.s_type_params
+                  in
+                  Hashtbl.add env.state.sig_param_ids key ids;
+                  ids
             in
             let tid = fresh_type_id env.state in
             let param_tys = Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param (Ids.Generic_param_id.to_int p)) params) in
@@ -3910,8 +3929,16 @@ let rec register_headers (env : env) (acc : string list) = function
           if List.mem_assoc d.e_name env.nominals then register_headers env acc rest
           else begin
             let params =
-              List.map (fun (tp : Ast.type_param) -> (tp.tp_name, fresh_param_id env.state))
-                d.e_type_params
+              let key = "nominal::" ^ d.e_name in
+              match Hashtbl.find_opt env.state.sig_param_ids key with
+              | Some ids -> ids
+              | None ->
+                  let ids =
+                    List.map (fun (tp : Ast.type_param) -> (tp.tp_name, fresh_param_id env.state))
+                      d.e_type_params
+                  in
+                  Hashtbl.add env.state.sig_param_ids key ids;
+                  ids
             in
             let tid = fresh_type_id env.state in
             let param_tys = Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param (Ids.Generic_param_id.to_int p)) params) in

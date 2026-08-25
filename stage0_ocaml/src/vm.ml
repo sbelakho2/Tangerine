@@ -235,7 +235,11 @@ and index_of_local (vm : t) (frame : frame) (li : int) : int =
   | Error e -> err_trap vm (Vm_value.slot_error_string e)
   | Ok (Vm_value.Int i) ->
       if i.Int_value.width > 64 then err_trap vm "dynamic index is a 128-bit value";
-      let n = Int_value.to_int64 i in
+      let n =
+        if i.Int_value.width > 64 then
+          err_trap vm "128-bit value used as an index (not representable in the seed)"
+        else Int_value.to_int64 i
+      in
       if n < 0L then err_trap vm "index out of bounds (negative)";
       if Int64.compare n (Int64.of_int max_int) > 0 then err_trap vm "index out of bounds";
       Int64.to_int n
@@ -593,18 +597,27 @@ let rec eval_rvalue (vm : t) (frame : frame) (rv : Seed_mir.rvalue) : Vm_value.t
           | _ -> err_trap vm "invalid cast to int")
       | Type_repr.Float Type_repr.F64 -> (
           match vv with
-          | Vm_value.Int i -> Vm_value.Float64 (Int64.bits_of_float (Int64.to_float (Int_value.to_int64 i)))
+          | Vm_value.Int i ->
+              if i.Int_value.width > 64 then
+                err_trap vm "128-bit value cast to f64 (not representable in the seed)"
+              else Vm_value.Float64 (Int64.bits_of_float (Int64.to_float (Int_value.to_int64 i)))
           | Vm_value.Float32 f -> Vm_value.Float64 (Int64.bits_of_float (Int32.float_of_bits f))
           | Vm_value.Float64 f -> Vm_value.Float64 f
           | _ -> err_trap vm "invalid cast to f64")
       | Type_repr.Float Type_repr.F32 -> (
           match vv with
-          | Vm_value.Int i -> Vm_value.Float32 (Int32.bits_of_float (Int64.to_float (Int_value.to_int64 i)))
+          | Vm_value.Int i ->
+              if i.Int_value.width > 64 then
+                err_trap vm "128-bit value cast to f32 (not representable in the seed)"
+              else Vm_value.Float32 (Int32.bits_of_float (Int64.to_float (Int_value.to_int64 i)))
           | Vm_value.Float64 f -> Vm_value.Float32 (Int32.bits_of_float (Int64.float_of_bits f))
           | _ -> err_trap vm "invalid cast to f32")
       | Type_repr.Raw_ptr _ | Type_repr.Ref_internal _ -> (
           match vv with
-          | Vm_value.Int i -> Vm_value.RawPtr { Vm_memory.region = Int64.to_int (Int_value.to_int64 i); offset = 0 }
+          | Vm_value.Int i ->
+              if i.Int_value.width > 64 then
+                err_trap vm "128-bit value cast to a pointer (not representable in the seed)"
+              else Vm_value.RawPtr { Vm_memory.region = Int64.to_int (Int_value.to_int64 i); offset = 0 }
           | Vm_value.RawPtr _ -> vv
           | _ -> err_trap vm "invalid cast to pointer")
       | Type_repr.Unit -> Vm_value.Unit
@@ -615,7 +628,10 @@ let rec eval_rvalue (vm : t) (frame : frame) (rv : Seed_mir.rvalue) : Vm_value.t
           | _ -> err_trap vm "invalid cast to bool")
       | Type_repr.Char -> (
           match vv with
-          | Vm_value.Int i -> Vm_value.Char (Uchar.of_int (Int64.to_int (Int_value.to_int64 i)))
+          | Vm_value.Int i ->
+              if i.Int_value.width > 64 then
+                err_trap vm "128-bit value cast to char (not representable in the seed)"
+              else Vm_value.Char (Uchar.of_int (Int64.to_int (Int_value.to_int64 i)))
           | Vm_value.Char _ -> vv
           | _ -> err_trap vm "invalid cast to char")
       | _ -> err_trap vm "cast to unsupported type")
@@ -661,7 +677,10 @@ let rec exec_terminator (vm : t) (frame : frame) (term : Seed_mir.terminator) : 
       let v = eval_operand vm frame op in
       let tag =
         match v with
-        | Vm_value.Int i -> Int_value.to_int64 i
+        | Vm_value.Int i ->
+            if i.Int_value.width > 64 then
+              err_trap vm "128-bit switch value (not representable in the seed)"
+            else Int_value.to_int64 i
         | Vm_value.Bool b -> if b then 1L else 0L
         | Vm_value.Char c -> Int64.of_int (Uchar.to_int c)
         | _ -> err_trap vm "switchInt on non-tag value"
