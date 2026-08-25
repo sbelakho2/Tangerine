@@ -50,6 +50,8 @@ type nominal = {
   nom_fields : (string * Type_repr.t) list;          (* struct, in param scope *)
   nom_variants : (string * Type_repr.t array) list;  (* enum, in param scope *)
   nom_where : (Type_repr.t * string list) list;      (* resolved where predicates *)
+  nom_field_ids : Ids.Field_id.t list;               (* resolver identities, parallel to nom_fields *)
+  nom_variant_ids : Ids.Variant_id.t list;           (* resolver identities, parallel to nom_variants *)
 }
 
 type typed_expr = {
@@ -785,6 +787,8 @@ let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
       nom_variants =
         [ ("Some", [| Type_repr.Type_param opt_p |]); ("None", [||]) ];
       nom_where = [];
+      nom_field_ids = [];
+      nom_variant_ids = [];
     }
   in
   let res_nominal : nominal =
@@ -798,6 +802,8 @@ let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
           ("Err", [| Type_repr.Type_param res_e |]);
         ];
       nom_where = [];
+      nom_field_ids = [];
+      nom_variant_ids = [];
     }
   in
   {
@@ -3749,7 +3755,7 @@ and register_item (env : env) (item : Ast.item) : (env, string) result =
             let tid = fresh_type_id env.state in
             let param_tys = Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param (p)) params) in
             let nom : nominal =
-              { nom_kind = `Struct; nom_params = params; nom_fields = []; nom_variants = []; nom_where = [] }
+              { nom_kind = `Struct; nom_params = params; nom_fields = []; nom_variants = []; nom_where = []; nom_field_ids = []; nom_variant_ids = [] }
             in
             (* a user definition of a builtin name REPLACES the builtin *)
             let env' =
@@ -3785,8 +3791,27 @@ and register_item (env : env) (item : Ast.item) : (env, string) result =
         | Ok w -> Ok w
         | Error m -> Error m
       in
+      let field_ids =
+        List.mapi
+          (fun i (fname, _) ->
+            match env_fwd.resolved with
+            | Some rp -> (
+                match Resolver.resolve_field rp env_fwd.module_id d.s_name fname with
+                | Resolver.Resolved fid -> fid
+                | _ -> Ids.Field_id.make (i + 1))
+            | None -> Ids.Field_id.make (i + 1))
+          fields
+      in
       let nom : nominal =
-        { nom_kind = `Struct; nom_params = params; nom_fields = fields; nom_variants = []; nom_where = where }
+        {
+          nom_kind = `Struct;
+          nom_params = params;
+          nom_fields = fields;
+          nom_variants = [];
+          nom_where = where;
+          nom_field_ids = field_ids;
+          nom_variant_ids = [];
+        }
       in
       let env1 = { env_fwd with nominals = (d.s_name, nom) :: List.remove_assoc d.s_name env_fwd.nominals } in
       let env2 = { env1 with current_self = Some (Type_repr.Named (tid, param_tys)) } in
@@ -3814,7 +3839,7 @@ and register_item (env : env) (item : Ast.item) : (env, string) result =
             let tid = fresh_type_id env.state in
             let param_tys = Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param (p)) params) in
             let nom : nominal =
-              { nom_kind = `Enum; nom_params = params; nom_fields = []; nom_variants = []; nom_where = [] }
+              { nom_kind = `Enum; nom_params = params; nom_fields = []; nom_variants = []; nom_where = []; nom_field_ids = []; nom_variant_ids = [] }
             in
             let env' =
               {
@@ -3855,8 +3880,27 @@ and register_item (env : env) (item : Ast.item) : (env, string) result =
         | Ok w -> Ok w
         | Error m -> Error m
       in
+      let variant_ids =
+        List.mapi
+          (fun i (vname, _) ->
+            match env_fwd.resolved with
+            | Some rp -> (
+                match Resolver.resolve_variant rp env_fwd.module_id d.e_name vname with
+                | Resolver.Resolved vid -> vid
+                | _ -> Ids.Variant_id.make (i + 1))
+            | None -> Ids.Variant_id.make (i + 1))
+          variants
+      in
       let nom : nominal =
-        { nom_kind = `Enum; nom_params = params; nom_fields = []; nom_variants = variants; nom_where = where }
+        {
+          nom_kind = `Enum;
+          nom_params = params;
+          nom_fields = [];
+          nom_variants = variants;
+          nom_where = where;
+          nom_field_ids = [];
+          nom_variant_ids = variant_ids;
+        }
       in
       let env1 = { env_fwd with nominals = (d.e_name, nom) :: List.remove_assoc d.e_name env_fwd.nominals } in
       match register_constructors env1 d.e_name tid params variants with
@@ -4089,7 +4133,7 @@ let rec register_headers (env : env) (acc : string list) = function
             let tid = fresh_type_id env.state in
             let param_tys = Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param (p)) params) in
             let nom : nominal =
-              { nom_kind = `Struct; nom_params = params; nom_fields = []; nom_variants = []; nom_where = [] }
+              { nom_kind = `Struct; nom_params = params; nom_fields = []; nom_variants = []; nom_where = []; nom_field_ids = []; nom_variant_ids = [] }
             in
             let env' =
               {
@@ -4120,7 +4164,7 @@ let rec register_headers (env : env) (acc : string list) = function
             let tid = fresh_type_id env.state in
             let param_tys = Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param (p)) params) in
             let nom : nominal =
-              { nom_kind = `Enum; nom_params = params; nom_fields = []; nom_variants = []; nom_where = [] }
+              { nom_kind = `Enum; nom_params = params; nom_fields = []; nom_variants = []; nom_where = []; nom_field_ids = []; nom_variant_ids = [] }
             in
             let env' =
               {

@@ -734,6 +734,13 @@ let closure_types (env : Typecheck.env) : Seed_mir.type_def array =
              else
                (match nom.Typecheck.nom_kind with
                 | `Struct ->
+                    let fids =
+                      if List.length nom.Typecheck.nom_field_ids
+                         = List.length nom.Typecheck.nom_fields
+                      then nom.Typecheck.nom_field_ids
+                      else
+                        List.mapi (fun i _ -> Ids.Field_id.make (i + 1)) nom.Typecheck.nom_fields
+                    in
                     Some
                       (Seed_mir.StructDef
                          {
@@ -742,13 +749,20 @@ let closure_types (env : Typecheck.env) : Seed_mir.type_def array =
                              List.mapi
                                (fun i (_, fty) ->
                                  {
-                                   Seed_mir.fd_id = Ids.Field_id.make (i + 1);
+                                   Seed_mir.fd_id = List.nth fids i;
                                    fd_index = Ids.Field_index.make i;
                                    fd_ty = fty;
                                  })
                                nom.Typecheck.nom_fields;
                          })
                 | `Enum ->
+                    let vids =
+                      if List.length nom.Typecheck.nom_variant_ids
+                         = List.length nom.Typecheck.nom_variants
+                      then nom.Typecheck.nom_variant_ids
+                      else
+                        List.mapi (fun i _ -> Ids.Variant_id.make (i + 1)) nom.Typecheck.nom_variants
+                    in
                     Some
                       (Seed_mir.EnumDef
                          {
@@ -757,7 +771,7 @@ let closure_types (env : Typecheck.env) : Seed_mir.type_def array =
                              List.mapi
                                (fun i (_, pty) ->
                                  {
-                                   Seed_mir.vd_id = Ids.Variant_id.make (i + 1);
+                                   Seed_mir.vd_id = List.nth vids i;
                                    vd_index = Ids.Variant_index.make i;
                                    vd_payload =
                                      (if Array.length pty = 0 then Type_repr.Unit
