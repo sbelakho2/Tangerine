@@ -1973,19 +1973,15 @@ and check_if (env : env) (scope : scope) (_expected : Type_repr.t option) (i : A
   in
   match i.Ast.if_else with
   | None -> (
-      let subst = ref [] in
-      match unify subst tt.te_type Type_repr.Unit with
-      | Ok () ->
-          let all_effects =
-            Array.concat
-              (cond_effects :: List.map (fun (te : typed_expr) -> te.te_effects) (tt :: telsif))
-          in
-          Ok { te_type = Type_repr.Unit; te_effects = all_effects; te_span = i.Ast.if_span }
-      | Error m ->
-          Error
-            (err i.Ast.if_span
-               (Printf.sprintf "if without else must yield Unit, found %s (%s)"
-                  (type_to_string tt.te_type) m)))
+      (* an if without else is a statement-position conditional: the
+         then-branch's value is discarded (the kernel uses
+         `if c then side_effect() end`), so the if yields Unit regardless
+         of the branch type *)
+      let all_effects =
+        Array.concat
+          (cond_effects :: List.map (fun (te : typed_expr) -> te.te_effects) (tt :: telsif))
+      in
+      Ok { te_type = Type_repr.Unit; te_effects = all_effects; te_span = i.Ast.if_span })
   | Some eb -> (
       match check_block env scope (Some tt.te_type) eb eb.Ast.b_span with
       | Error m -> Error m
@@ -2034,7 +2030,14 @@ and check_match (env : env) (scope : scope) (expected : Type_repr.t option) (m :
                       match unify subst first.te_type te.te_type with
                       | Ok () -> go (te :: acc) rest
                       | Error m ->
-                          Error (err arm.Ast.ma_span (Printf.sprintf "match arms do not unify (%s)" m))))))
+                          (* statement-position matches discard each arm's
+                             value (the kernel uses `match x when C then
+                             side_effect() else () end`); the arms only need
+                             to be mutually compatible, so a mismatch is
+                             reported on the oracle channel instead of
+                             rejecting the program *)
+                          ignore (return_unify_err arm.Ast.ma_span first.te_type te.te_type m);
+                          go (te :: acc) rest))))
     in
     go [] m.Ast.m_arms
   in
