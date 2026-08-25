@@ -43,8 +43,8 @@ let i64 = Type_repr.Int Type_repr.Int
 let int_const (n : int64) : Seed_mir.constant =
   Seed_mir.Integer (Int_value.of_int64 ~width:64 ~signed:true n)
 
-let inst (n : int) : Ids.Instance_id.t =
-  Ids.Instance_id.make ~callable:(Ids.Callable_id.make n) ~type_args:[||]
+let inst (n : int) : Instance_id.t =
+  Instance_id.make ~callable:(Ids.Callable_id.make n) ~type_args:[||]
 
 let place (l : int) : Seed_mir.place = { Seed_mir.local = l; projections = [] }
 
@@ -485,6 +485,147 @@ let mut_h3 () : Seed_mir.program =
   in
   prog_of [| fn |]
 
+(* ── (i) dynamic Index projection mutations ───────────────────────────
+
+   The dynamic-index form is `Seed_mir.Index li`: the payload is the
+   LOCAL whose runtime integer value is the index.  The verifier must
+   check that li names an existing local, that the local is definitely
+   initialized at the program point, and that its type is an allowed
+   integer index type — but must NEVER compare li against the container
+   length (the runtime value is bounds-checked by the VM at execution). *)
+
+(* valid base: a 3-element array aggregate into _1, the index local _2
+   initialized to the runtime value Int 1, an element read through
+   `Index 2` into _3, returned via _0. *)
+let base_runtime_index () : Seed_mir.program =
+  let arr_ty = Type_repr.Fixed_array (i64, 3) in
+  let fn =
+    {
+      Seed_mir.name = "dynidx";
+      instance = inst 15;
+      params = [||];
+      locals = [| i64; arr_ty; i64; i64 |];
+      blocks =
+        [|
+          {
+            Seed_mir.id = 0;
+            statements =
+              [
+                assign 1
+                  (Seed_mir.Aggregate
+                     (Seed_mir.ArrayAgg,
+                       [ const_op (int_const 10L); const_op (int_const 20L); const_op (int_const 30L) ]));
+                assign 2 (use_op (const_op (int_const 1L)));
+                assign 3
+                  (use_op (Seed_mir.Copy { Seed_mir.local = 1; projections = [ Seed_mir.Index 2 ] }));
+                assign 0 (use_op (copy 3));
+              ];
+            terminator = Seed_mir.Ret;
+          };
+        |];
+      entry = 0;
+    }
+  in
+  prog_of [| fn |]
+
+(* i1: the Index payload names a local that does not exist — li = 9 is
+   >= |locals| = 4. *)
+let mut_i1 () : Seed_mir.program =
+  let prog = base_runtime_index () in
+  let fn = prog.Seed_mir.functions.(0) in
+  let bb0 = fn.Seed_mir.blocks.(0) in
+  fn.Seed_mir.blocks.(0) <-
+    { bb0 with
+      Seed_mir.statements =
+        [
+          assign 1
+            (Seed_mir.Aggregate
+               (Seed_mir.ArrayAgg,
+                 [ const_op (int_const 10L); const_op (int_const 20L); const_op (int_const 30L) ]));
+          assign 2 (use_op (const_op (int_const 1L)));
+          assign 3
+            (use_op (Seed_mir.Copy { Seed_mir.local = 1; projections = [ Seed_mir.Index 9 ] }));
+          assign 0 (use_op (copy 3));
+        ] };
+  prog
+
+(* i2: the Index payload local is never initialized on the entry path —
+   the `assign 2` statement is deleted, so _2 is not in the
+   definite-initialization running set at the read. *)
+let mut_i2 () : Seed_mir.program =
+  let prog = base_runtime_index () in
+  let fn = prog.Seed_mir.functions.(0) in
+  let bb0 = fn.Seed_mir.blocks.(0) in
+  fn.Seed_mir.blocks.(0) <-
+    { bb0 with
+      Seed_mir.statements =
+        [
+          assign 1
+            (Seed_mir.Aggregate
+               (Seed_mir.ArrayAgg,
+                 [ const_op (int_const 10L); const_op (int_const 20L); const_op (int_const 30L) ]));
+          assign 3
+            (use_op (Seed_mir.Copy { Seed_mir.local = 1; projections = [ Seed_mir.Index 2 ] }));
+          assign 0 (use_op (copy 3));
+        ] };
+  prog
+
+(* i3: the Index payload local's type is a String — _2 is initialized
+   (with a String value) but its type is not an allowed integer index
+   type. *)
+let mut_i3 () : Seed_mir.program =
+  let prog = base_runtime_index () in
+  let fn = prog.Seed_mir.functions.(0) in
+  let bb0 = fn.Seed_mir.blocks.(0) in
+  fn.Seed_mir.locals.(2) <- Type_repr.String;
+  fn.Seed_mir.blocks.(0) <-
+    { bb0 with
+      Seed_mir.statements =
+        [
+          assign 1
+            (Seed_mir.Aggregate
+               (Seed_mir.ArrayAgg,
+                 [ const_op (int_const 10L); const_op (int_const 20L); const_op (int_const 30L) ]));
+          assign 2 (use_op (const_op (Seed_mir.String "x")));
+          assign 3
+            (use_op (Seed_mir.Copy { Seed_mir.local = 1; projections = [ Seed_mir.Index 2 ] }));
+          assign 0 (use_op (copy 3));
+        ] };
+  prog
+
+(* i5: the runtime out-of-bounds case — the same valid runtime-index
+   shape with a 1-element base and the index local's runtime value 2.
+   The verifier ACCEPTS it (Index is never compared against the
+   container length at compile time) and Vm.run traps on the runtime
+   out-of-bounds read. *)
+let runtime_oob_prog () : Seed_mir.program =
+  let arr_ty = Type_repr.Fixed_array (i64, 1) in
+  let fn =
+    {
+      Seed_mir.name = "dynidx_oob";
+      instance = inst 16;
+      params = [||];
+      locals = [| i64; arr_ty; i64; i64 |];
+      blocks =
+        [|
+          {
+            Seed_mir.id = 0;
+            statements =
+              [
+                assign 1 (Seed_mir.Aggregate (Seed_mir.ArrayAgg, [ const_op (int_const 10L) ]));
+                assign 2 (use_op (const_op (int_const 2L)));
+                assign 3
+                  (use_op (Seed_mir.Copy { Seed_mir.local = 1; projections = [ Seed_mir.Index 2 ] }));
+                assign 0 (use_op (copy 3));
+              ];
+            terminator = Seed_mir.Ret;
+          };
+        |];
+      entry = 0;
+    }
+  in
+  prog_of [| fn |]
+
 let () =
   Printf.printf "Seed MIR verifier mutation self-check\n";
   expect_valid "base1: params + arithmetic + call + switch + return accepted"
@@ -537,6 +678,51 @@ let () =
   expect_error "h3: Ret from a non-final block with the return slot uninitialized rejected"
     "return with the return slot _0 not definitely initialized" (mut_h3 ());
 
+  expect_valid
+    "i4: runtime dynamic-index program accepted (index local _2 initialized to Int 1)"
+    (base_runtime_index ());
+  expect_error "i1: Index payload names a nonexistent local (li >= |locals|) rejected"
+    "dynamic index local _9 does not exist" (mut_i1 ());
+  expect_error
+    "i2: Index payload local never initialized on the entry path rejected"
+    "dynamic index local _2 is not definitely initialized" (mut_i2 ());
+  expect_error
+    "i3: Index payload local typed String (non-integer index type) rejected"
+    "dynamic index local _2 has non-integer index type String" (mut_i3 ());
+  (* i5: the runtime out-of-bounds case through the VM — the verifier
+     must accept the program (Index li is never compared against the
+     container length; the value 2 is only known at runtime) and
+     Vm.run must trap with a message mentioning the index/bounds. *)
+  (match Mir_verify.require_valid (runtime_oob_prog ()) with
+   | Ok () ->
+       check
+         "i5a: runtime-OOB program passes the verifier (Index li is never compile-time bounds-checked)"
+         true
+   | Error errs ->
+       Printf.printf "    unexpected verifier errors:\n%s\n" (String.concat "\n    " errs);
+       check
+         "i5a: runtime-OOB program passes the verifier (Index li is never compile-time bounds-checked)"
+         false);
+  (let prog = runtime_oob_prog () in
+   let host = Host.create ~repo_root:"." ~argv:[||] in
+   match
+     Vm.run ~program:prog ~entry:prog.Seed_mir.functions.(0).Seed_mir.instance ~argv:[||] ~host
+   with
+   | Error e when contains_sub e.Vm.message "index" || contains_sub e.Vm.message "bounds" ->
+       check
+         (Printf.sprintf
+            "i5b: runtime out-of-bounds dynamic index (base length 1, index value 2) traps in the VM (%s)"
+            e.Vm.message)
+         true
+   | Error e ->
+       check
+         (Printf.sprintf "i5b: runtime OOB trapped with a message lacking index/bounds: %s"
+            e.Vm.message)
+         false
+   | Ok _ ->
+       check "i5b: runtime out-of-bounds dynamic index (base length 1, index value 2) did not trap"
+         false);
+
   if !failures = 0 then begin
     Printf.printf "ALL MUTATION TESTS PASS (%d)\n" !total_mutations;
     exit 0
@@ -545,3 +731,4 @@ let () =
     Printf.printf "%d MUTATION TEST FAILURE(S)\n" !failures;
     exit 1
   end
+

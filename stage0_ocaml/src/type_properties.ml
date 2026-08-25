@@ -51,7 +51,7 @@ and of_type (ty : Type_repr.t) : t =
 let of_named_type (name_of : Ids.Type_id.t -> string) (ty : Type_repr.t) : t =
   match ty with
   | Type_repr.Named (id, _args) ->
-      let name = name_of (Ids.Type_id.make id) in
+      let name = name_of id in
       let base = if is_owned_named name then owned else scalar in
       if base.is_copy then base
       else { base with needs_drop = true; is_copy = false }

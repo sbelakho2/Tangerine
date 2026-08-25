@@ -31,12 +31,14 @@
      must equal the enclosing function's return type (fail-closed
      otherwise).
 
-   - `for x in [..] do` (Ast.ForExpr): the seed VM cannot execute
-     dynamic index projections (vm.ml traps on Seed_mir.Index), so a
-     for-loop over a compile-time Array literal is UNROLLED into
-     per-element body copies with ConstantIndex element reads; a
-     non-literal iterable fails closed (the kernel's runtime Vec
-     iteration needs a dynamic-index VM that this seed does not have).
+   - `for x in [..] do` (Ast.ForExpr): a for-loop over a compile-time
+     Array literal is UNROLLED into per-element body copies with
+     ConstantIndex element reads; any other iterable lowers to a runtime
+     counter loop — the container is evaluated once into a local, a
+     counter local counts from 0 to Len(container), and each iteration
+     reads the element through the dynamic `Seed_mir.Index <counter>`
+     projection (the VM executes it and bounds-checks the runtime index
+     at execution).
 
    - defer (Ast.DeferStmt): each function accumulates a defer stack
      (function level; nested scopes are flattened to function level for
@@ -61,7 +63,7 @@ type func_env = {
   types : (string * Type_repr.t) list;               (* type name -> repr *)
   values : (string * Type_repr.t) list;              (* global value name -> type *)
   callables : (string * int) list;                   (* function name -> callable id *)
-  methods : ((string * string) * Ids.Instance_id.t) list;  (* (receiver type name, method) -> instance *)
+  methods : ((string * string) * Instance_id.t) list;  (* (receiver type name, method) -> instance *)
   fn_ret : Type_repr.t;
 }
 
@@ -141,7 +143,7 @@ let ctor_of (tbl : variant_table) (n : string) : (string * string) option =
 
 let enum_tid_of (env : func_env) (enum_name : string) : Ids.Type_id.t =
   match List.assoc_opt enum_name env.types with
-  | Some (Type_repr.Named (tid, _)) -> Ids.Type_id.make tid
+  | Some (Type_repr.Named (tid, _)) -> tid
   | _ -> seed_bug "enum `%s` has no type identity in the lowering env" enum_name
 
 let enum_name_of_ty (env : func_env) (t : Type_repr.t) : string =
@@ -152,7 +154,7 @@ let enum_name_of_ty (env : func_env) (t : Type_repr.t) : string =
           (fun (_, r) ->
             match r with
             | Type_repr.Named (tid2, _) ->
-                Ids.Type_id.compare (Ids.Type_id.make tid) (Ids.Type_id.make tid2) = 0
+                Ids.Type_id.compare tid tid2 = 0
             | _ -> false)
           env.types
       with
@@ -250,14 +252,16 @@ let materialize_place (st : lower_state) (op : Seed_mir.operand) : Seed_mir.plac
       cur_place st id
 
 (* The element type of an iterable/indexable type.  Named array types
-   (Vec/Array nominals) fail closed: their element reads would need a
-   dynamic-index projection the seed VM cannot execute. *)
+   (Vec/Array nominals) fail closed: the lowering env carries no
+   type-substituted element lookup for them (their element reads lower
+   to a dynamic Seed_mir.Index projection, which the verifier only
+   admits on Fixed_array bases). *)
 let element_type_of (t : Type_repr.t) : Type_repr.t =
   match t with
   | Type_repr.Fixed_array (e, _) -> e
   | Type_repr.String -> Type_repr.Char
   | Type_repr.Tuple _ -> Type_repr.Int Type_repr.Int
-  | _ -> seed_bug "element access on a non-iterable type %s (named Vec/Array element access is not executable in the seed VM)"
+  | _ -> seed_bug "element access on a non-iterable type %s (the lowering env carries no type-substituted element lookup for named Vec/Array types; the dynamic Seed_mir.Index projection itself is executable — the verifier only admits it on Fixed_array bases)"
            (Seed_mir.print_type t)
 
 (* Conservative copyability for payload binding: enums resolve to
@@ -404,7 +408,7 @@ let rec type_of_syntax (env : func_env) (t : Ast.type_expr) : Type_repr.t =
       | Some r ->
           let subst =
             List.mapi
-              (fun i _ -> (i, type_of_syntax env (List.nth args i)))
+              (fun i _ -> (Ids.Generic_param_id.make i, type_of_syntax env (List.nth args i)))
               args
           in
           Type_repr.substitute subst r
@@ -428,7 +432,7 @@ let rec type_of_syntax (env : func_env) (t : Ast.type_expr) : Type_repr.t =
   | Ast.Slice (inner, _) -> Type_repr.Fixed_array (type_of_syntax env inner, 0)
   | Ast.Option (inner, _) -> (
       match List.assoc_opt "Option" env.types with
-      | Some r -> Type_repr.substitute [ (0, type_of_syntax env inner) ] r
+      | Some r -> Type_repr.substitute [ (Ids.Generic_param_id.make 0, type_of_syntax env inner) ] r
       | None -> seed_bug "Option type not in env")
   | Ast.Ref (inner, m, _) -> Type_repr.Ref_internal ((if m then Type_repr.Mutable else Type_repr.Immutable), type_of_syntax env inner)
   | Ast.RawPtr (inner, m, _) -> Type_repr.Raw_ptr ((if m then Type_repr.Mutable else Type_repr.Immutable), type_of_syntax env inner)
@@ -645,24 +649,35 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
       emit st (Seed_mir.Assign (cur_place st id, Seed_mir.Aggregate (Seed_mir.ArrayAgg, ops)));
       (copy_place st (cur_place st id), rt)
   | Ast.Index (base, idx, _) -> (
-      (* The seed VM executes only static ConstantIndex projections (a
-         dynamic Seed_mir.Index traps in vm.ml), so an index expression
-         lowers only when the index is a compile-time integer literal. *)
+      let base_op, base_ty = lower_expr env st base in
+      let bp = materialize_place st base_op in
+      let elem_ty = element_type_of base_ty in
       match idx with
       | Ast.IntLit (s, _) -> (
           match Literal.parse_integer ~span:Span.synthetic s with
           | Some p when Big_nat.fits_ocaml_int p.Literal.magnitude ->
               let k = Big_nat.to_ocaml_int p.Literal.magnitude in
               if k < 0 then seed_bug "negative constant index in lowering";
-              let base_op, base_ty = lower_expr env st base in
-              let bp = materialize_place st base_op in
-              let elem_ty = element_type_of base_ty in
               let p =
                 { bp with Seed_mir.projections = bp.Seed_mir.projections @ [ Seed_mir.ConstantIndex k ] }
               in
               (Seed_mir.Copy p, elem_ty)
           | _ -> seed_bug "index expression is not a constant integer")
-      | _ -> seed_bug "dynamic index expressions are not executable in the seed VM (only constant indices lower to ConstantIndex)")
+      | _ ->
+          (* nonconstant index: evaluate the index expression exactly
+             once into a fresh local and emit the dynamic
+             `Seed_mir.Index <index_local>` projection — the payload is
+             the LOCAL whose runtime integer value is the index.  The VM
+             executes this form and bounds-checks the runtime index
+             value at execution; the verifier checks the index local's
+             existence/initialization/type. *)
+          let idx_op, idx_ty = lower_expr env st idx in
+          let iid = fresh_local st idx_ty in
+          emit st (Seed_mir.Assign (cur_place st iid, Seed_mir.Use idx_op));
+          let p =
+            { bp with Seed_mir.projections = bp.Seed_mir.projections @ [ Seed_mir.Index iid ] }
+          in
+          (Seed_mir.Copy p, elem_ty))
   | Ast.Field (_, _, span) ->
       ignore span;
       seed_bug "Field access reached MIR lowering without a typed place (FieldId) rule"
@@ -794,7 +809,7 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
                   (Seed_mir.Assign
                      ( cur_place st 0,
                        Seed_mir.Aggregate
-                         ( Seed_mir.EnumCtor (Ids.Type_id.make ret_tid, Ids.Variant_index.make 1),
+                         ( Seed_mir.EnumCtor (ret_tid, Ids.Variant_index.make 1),
                            [ Seed_mir.Copy (cur_place st eid) ] ) ))
             | _ -> seed_bug "`?` Result failure reconstruction: enclosing return is not a nominal")
        | true, None -> seed_bug "`?` Result subject without an error payload");
@@ -805,12 +820,14 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
           { Seed_mir.local = sid; projections = [ Seed_mir.Downcast (Ids.Variant_index.make 0); Seed_mir.Field (Ids.Field_index.make 0) ] },
         payload_ty ))
   | Ast.ForExpr f -> (
-      (* The seed VM cannot execute dynamic index projections (vm.ml
-         traps on Seed_mir.Index), so a for-loop over a compile-time
-         Array literal is unrolled: each element is read with a
-         ConstantIndex projection and the body is lowered once per
-         element.  Loops over runtime Vec/Array values fail closed
-         (they need a dynamic-index VM the seed does not have). *)
+      (* A for-loop over a compile-time Array literal is UNROLLED into
+         per-element body copies with ConstantIndex element reads.
+         Any other iterable lowers to a runtime counter loop: the
+         container is evaluated once into a local, a counter local
+         counts from 0 to Len(container), and each iteration reads the
+         element through the dynamic `Seed_mir.Index <counter>`
+         projection — the VM executes the dynamic Index form and
+         bounds-checks the runtime index value at execution. *)
       match f.Ast.for_iterable with
       | Ast.Array (elems, _) ->
           if block_has_loop_exit f.Ast.for_body then
@@ -841,9 +858,80 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
               ignore (lower_block env st f.Ast.for_body))
             elems;
           (Seed_mir.Constant Seed_mir.Unit, Type_repr.Unit)
-      | _ ->
-          seed_bug
-            "for over a non-array-literal iterable requires dynamic indexing, which the seed VM does not execute")
+      | _ -> (
+          let arr_op, arr_ty = lower_expr env st f.Ast.for_iterable in
+          match arr_ty with
+          | Type_repr.Fixed_array (elem_ty, _) ->
+              let arr_id = materialize_place st arr_op in
+              (* counter local: UInt so the Len comparison is well-typed
+                 (the verifier types Len as UInt) and UInt is an allowed
+                 dynamic-index type *)
+              let cid = fresh_local st (Type_repr.Int Type_repr.UInt) in
+              emit st
+                (Seed_mir.Assign
+                   ( cur_place st cid,
+                     Seed_mir.Use
+                       (Seed_mir.Constant (int_constant_of Type_repr.UInt 0L)) ));
+              let len_id = fresh_local st (Type_repr.Int Type_repr.UInt) in
+              emit st (Seed_mir.Assign (cur_place st len_id, Seed_mir.Len arr_id));
+              let head_b = new_block st in
+              let body_b = new_block st in
+              let incr_b = new_block st in
+              let join_b = new_block st in
+              set_terminator st (Seed_mir.Goto head_b);
+              push_block st head_b;
+              let cnd_id = fresh_local st Type_repr.Bool in
+              emit st
+                (Seed_mir.Assign
+                   ( cur_place st cnd_id,
+                     Seed_mir.BinaryOp
+                       ( Seed_mir.Lt,
+                         copy_place st (cur_place st cid),
+                         copy_place st (cur_place st len_id) ) ));
+              set_terminator st
+                (Seed_mir.SwitchInt
+                   (copy_place st (cur_place st cnd_id), [ (1L, body_b) ], join_b));
+              push_block st body_b;
+              let bindings =
+                match f.Ast.for_pattern with
+                | Ast.PatIdent (n, _, _) -> [ (n, fresh_local st elem_ty) ]
+                | Ast.Wildcard _ -> []
+                | _ -> seed_bug "unsupported for-loop pattern in lowering (bind by name or _)"
+              in
+              List.iter (fun (n, id) -> st.scope <- (n, id) :: st.scope) bindings;
+              List.iter
+                (fun (_, id) ->
+                  emit st
+                    (Seed_mir.Assign
+                       ( cur_place st id,
+                         Seed_mir.Use
+                           (Seed_mir.Copy
+                              { Seed_mir.local = arr_id.Seed_mir.local;
+                                projections = [ Seed_mir.Index cid ] }) )))
+                bindings;
+              let saved_break = st.break_target in
+              let saved_continue = st.continue_target in
+              st.break_target <- Some join_b;
+              st.continue_target <- Some incr_b;
+              ignore (lower_block env st f.Ast.for_body);
+              st.break_target <- saved_break;
+              st.continue_target <- saved_continue;
+              set_terminator st (Seed_mir.Goto incr_b);
+              push_block st incr_b;
+              emit st
+                (Seed_mir.Assign
+                   ( cur_place st cid,
+                     Seed_mir.BinaryOp
+                       ( Seed_mir.Add,
+                         copy_place st (cur_place st cid),
+                         Seed_mir.Constant (int_constant_of Type_repr.UInt 1L) ) ));
+              set_terminator st (Seed_mir.Goto head_b);
+              push_block st join_b;
+              (Seed_mir.Constant Seed_mir.Unit, Type_repr.Unit)
+          | _ ->
+              seed_bug
+                "runtime for-loop over a non-array iterable of type %s is not lowered (the seed verifier admits dynamic Index/Len only on Fixed_array bases; lower it to an Array literal for the unrolled path)"
+                (Seed_mir.print_type arr_ty)))
   | other -> seed_bug "unhandled supported expression form: %s" (expr_form_name other)
 
 and int_kind_of (t : Type_repr.t) : Type_repr.int_kind =
@@ -1239,7 +1327,7 @@ and lower_call (env : func_env) (st : lower_state) (callee : Ast.expr)
               in
               let next_b = new_block st in
               set_terminator_to st
-                (Seed_mir.Call (rp, Seed_mir.User (Ids.Instance_id.make ~callable:(Ids.Callable_id.make cid) ~type_args:[||]), arg_vals, next_b, None))
+                (Seed_mir.Call (rp, Seed_mir.User (Instance_id.make ~callable:(Ids.Callable_id.make cid) ~type_args:[||]), arg_vals, next_b, None))
                 next_b;
               (copy_place st rp, ty)
           | None -> seed_bug "unknown callee '%s' in lowering" n))
@@ -1310,7 +1398,7 @@ let lower_function_with_variants (variants : variant_table) (env : func_env) (na
   let params = Array.of_list (List.map (fun ty -> (None, ty)) param_tys) in
   {
     Seed_mir.name;
-    instance = Ids.Instance_id.make ~callable:(Ids.Callable_id.make callable) ~type_args:[||];
+    instance = Instance_id.make ~callable:(Ids.Callable_id.make callable) ~type_args:[||];
     params;
     locals = st.locals;
     blocks =

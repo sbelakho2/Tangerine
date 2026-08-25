@@ -18,9 +18,14 @@
        StorageDead, SetDiscriminant, call destinations);
    6.  every projection is legal for its base type: Deref on a
        ref/pointer, Field on the declared owner def (struct/tuple) with
-       an in-bounds index, Index/ConstantIndex on a fixed array with an
-       in-bounds index, Downcast on the declared owner enum with an
-       in-bounds variant index;
+       an in-bounds index, ConstantIndex on a fixed array with an
+       in-bounds index, Index on a fixed array whose index local exists,
+       is definitely initialized/readable at that program point and is
+       typed as an allowed integer index type (Int/I32/I64/UInt/U32/
+       U64/U8 — the runtime index value is bounds-checked by the VM at
+       execution, never compared against the container length here),
+       Downcast on the declared owner enum with an in-bounds variant
+       index;
    7.  operand type matches its operation (binop/unop arities and
        scalar classes, aggregate element types, cast matrix);
    8.  destination type matches the rvalue (assign and call dest);
@@ -85,11 +90,11 @@ let rec resolve_ty (ctx : ctx) (seen : Ids.Type_id.t list) (ty : Type_repr.t) :
     Type_repr.t option =
   match ty with
   | Type_repr.Named (tid, _) ->
-      if List.mem (Ids.Type_id.make tid) seen then None
+      if List.mem tid seen then None
       else (
-        match find_type ctx (Ids.Type_id.make tid) with
+        match find_type ctx tid with
         | None -> None
-        | Some def -> resolve_ty ctx (Ids.Type_id.make tid :: seen) def)
+        | Some def -> resolve_ty ctx (tid :: seen) def)
   | _ -> Some ty
 
 let resolve_or_self (ctx : ctx) (ty : Type_repr.t) : Type_repr.t =
@@ -107,11 +112,11 @@ let rec is_copy (ctx : ctx) (seen : Ids.Type_id.t list) (ty : Type_repr.t) : boo
   | Type_repr.Tuple elems -> Array.for_all (is_copy ctx seen) elems
   | Type_repr.Fixed_array (elem, _) -> is_copy ctx seen elem
   | Type_repr.Named (tid, _) ->
-      if List.mem (Ids.Type_id.make tid) seen then false
+      if List.mem tid seen then false
       else (
-        match find_type ctx (Ids.Type_id.make tid) with
+        match find_type ctx tid with
         | None -> false
-        | Some def -> is_copy ctx (Ids.Type_id.make tid :: seen) def)
+        | Some def -> is_copy ctx (tid :: seen) def)
   | Type_repr.Type_param _ -> false
 
 (* Type compatibility after Named resolution.  Function param
@@ -182,9 +187,20 @@ let project_type (ctx : ctx) (ty : Type_repr.t) (proj : projection) : Type_repr.
       match resolve_or_self ctx ty with
       | Type_repr.Tuple elems when i >= 0 && i < Array.length elems -> Some elems.(i)
       | _ -> None)
-  | Index i | ConstantIndex i -> (
+  | ConstantIndex i -> (
       match resolve_or_self ctx ty with
       | Type_repr.Fixed_array (elem, n) when i >= 0 && i < n -> Some elem
+      | _ -> None)
+  | Index li -> (
+      (* dynamic-index form: the payload is the LOCAL whose runtime
+         integer value is the index.  The runtime value is unknown at
+         compile time, so only the base shape constrains the projected
+         type; the index local's existence/initialization/type are
+         checked in check_projection_owners and the runtime bounds are
+         checked by the VM at execution. *)
+      ignore li;
+      match resolve_or_self ctx ty with
+      | Type_repr.Fixed_array (elem, _) -> Some elem
       | _ -> None)
   | Downcast vid -> enum_variant_payload ctx ty vid
 
@@ -599,7 +615,23 @@ let destroyed_in_sets (fn : function_) (tbl : (int, block) Hashtbl.t) :
    ownership transfer (rvalue_moved_targets / terminator_moved_targets)
    after the check. *)
 
-let check_projection_owners (ctx : ctx) (fn : function_) (bb_ctx : string) (p : place) : unit =
+(* Allowed integer types for a dynamic Index projection's index local
+   (Seed_mir.Index of local) — matching the widths the VM's
+   index_of_local accepts (64-bit-or-narrower integers). *)
+let is_index_local_type (ctx : ctx) (ty : Type_repr.t) : bool =
+  match resolve_or_self ctx ty with
+  | Type_repr.Int Type_repr.Int
+  | Type_repr.Int Type_repr.I32
+  | Type_repr.Int Type_repr.I64
+  | Type_repr.Int Type_repr.UInt
+  | Type_repr.Int Type_repr.U32
+  | Type_repr.Int Type_repr.U64
+  | Type_repr.Int Type_repr.U8 ->
+      true
+  | _ -> false
+
+let check_projection_owners (ctx : ctx) (fn : function_) (bb_ctx : string)
+    (running : IntSet.t) (p : place) : unit =
   let rec go ty projs =
     match projs with
     | [] -> ()
@@ -628,7 +660,7 @@ let check_projection_owners (ctx : ctx) (fn : function_) (bb_ctx : string) (p : 
                 add_err ctx
                   (Printf.sprintf "%s: field projection on non-struct type %s" bb_ctx
                      (Seed_mir.print_type ty)))
-        | Index i | ConstantIndex i -> (
+        | ConstantIndex i -> (
             match resolve_or_self ctx ty with
             | Type_repr.Fixed_array (elem, n) ->
                 if i < 0 || i >= n then
@@ -639,6 +671,36 @@ let check_projection_owners (ctx : ctx) (fn : function_) (bb_ctx : string) (p : 
                 add_err ctx
                   (Printf.sprintf "%s: index projection on non-array type %s" bb_ctx
                      (Seed_mir.print_type ty)))
+        | Index li ->
+            (* dynamic-index form: the payload is the LOCAL whose runtime
+               integer value is the index.  The index local must exist,
+               be definitely initialized/readable at this program point
+               and be typed as an allowed integer index type; the runtime
+               value is bounds-checked by the VM at execution, never
+               compared against the container length here. *)
+            (if li < 0 || li >= Array.length fn.locals then
+               add_err ctx
+                 (Printf.sprintf
+                    "%s: dynamic index local _%d does not exist (the function has %d locals)"
+                    bb_ctx li (Array.length fn.locals))
+             else begin
+               if not (IntSet.mem li running) then
+                 add_err ctx
+                   (Printf.sprintf
+                      "%s: dynamic index local _%d is not definitely initialized at this program point"
+                      bb_ctx li);
+               if not (is_index_local_type ctx fn.locals.(li)) then
+                 add_err ctx
+                   (Printf.sprintf
+                      "%s: dynamic index local _%d has non-integer index type %s" bb_ctx li
+                      (Seed_mir.print_type fn.locals.(li)))
+             end);
+            (match resolve_or_self ctx ty with
+             | Type_repr.Fixed_array (elem, _) -> go elem rest
+             | _ ->
+                 add_err ctx
+                   (Printf.sprintf "%s: index projection on non-array type %s" bb_ctx
+                      (Seed_mir.print_type ty)))
         | Downcast vid -> (
             match enum_variant_payload ctx ty vid with
             | Some payload -> go payload rest
@@ -658,7 +720,7 @@ let check_place_readable (ctx : ctx) (fn : function_) (bb_ctx : string)
   else begin
     if not (IntSet.mem p.local running) then
       add_err ctx (Printf.sprintf "%s: use of possibly-uninitialized local _%d" bb_ctx p.local);
-    check_projection_owners ctx fn bb_ctx p;
+    check_projection_owners ctx fn bb_ctx running p;
     if p.projections <> [] && place_type ctx fn p = None then
       add_err ctx (Printf.sprintf "%s: invalid projection chain on local _%d" bb_ctx p.local)
   end
@@ -668,7 +730,7 @@ let check_dest_place (ctx : ctx) (fn : function_) (bb_ctx : string) (p : place)
   if p.local < 0 || p.local >= Array.length fn.locals then
     add_err ctx (Printf.sprintf "%s: assignment to undefined local _%d" bb_ctx p.local)
   else begin
-    check_projection_owners ctx fn bb_ctx p;
+    check_projection_owners ctx fn bb_ctx running p;
     if p.projections <> [] then begin
       if not (IntSet.mem p.local running) then
         add_err ctx
@@ -779,7 +841,7 @@ and constant_type (ctx : ctx) (c : constant) : Type_repr.t =
   | String _ -> Type_repr.String
   | Function inst -> function_constant_type ctx inst
 
-and function_constant_type (ctx : ctx) (inst : Ids.Instance_id.t) : Type_repr.t =
+and function_constant_type (ctx : ctx) (inst : Instance_id.t) : Type_repr.t =
   match find_function_by_instance ctx inst with
   | Some f ->
       let ret = if Array.length f.locals > 0 then f.locals.(0) else Type_repr.Unit in
@@ -790,7 +852,7 @@ and function_constant_type (ctx : ctx) (inst : Ids.Instance_id.t) : Type_repr.t 
           ret )
   | None -> Type_repr.Unit
 
-and find_function_by_instance (ctx : ctx) (inst : Ids.Instance_id.t) : function_ option =
+and find_function_by_instance (ctx : ctx) (inst : Instance_id.t) : function_ option =
   let found = ref None in
   Array.iter (fun f -> if f.instance = inst then found := Some f) ctx.prog.functions;
   !found
@@ -877,7 +939,7 @@ let check_aggregate (ctx : ctx) (fn : function_) (bb_ctx : string) (kind : aggre
                (Seed_mir.print_type dest_ty)))
   | StructCtor (tid, fields) -> (
       match dest_ty with
-      | Type_repr.Named (dtid, _) when dtid = Ids.Type_id.to_int tid -> (
+      | Type_repr.Named (dtid, _) when dtid = tid -> (
           match rty with
           | Type_repr.Tuple elems ->
               check_count (Array.length elems);
@@ -897,7 +959,7 @@ let check_aggregate (ctx : ctx) (fn : function_) (bb_ctx : string) (kind : aggre
                (Ids.Type_id.to_int tid) (Seed_mir.print_type dest_ty)))
   | EnumCtor (tid, vid) -> (
       match dest_ty with
-      | Type_repr.Named (dtid, _) when dtid = Ids.Type_id.to_int tid -> (
+      | Type_repr.Named (dtid, _) when dtid = tid -> (
           match enum_variant_payload ctx dest_ty vid with
           | None ->
               add_err ctx
@@ -1275,7 +1337,7 @@ let check_embedded_concreteness (ctx : ctx) (fn : function_) : unit =
   let check_operand op =
     match op with
     | Constant (Function inst) ->
-        Array.iter (check_what "function-constant instance") (Ids.Instance_id.type_args inst)
+        Array.iter (check_what "function-constant instance") (Instance_id.type_args inst)
     | _ -> ()
   in
   let check_rvalue_instances rv =
@@ -1284,7 +1346,7 @@ let check_embedded_concreteness (ctx : ctx) (fn : function_) : unit =
     | Aggregate (kind, ops) ->
         List.iter check_operand ops;
         (match kind with
-         | ClosureAgg inst -> Array.iter (check_what "closure instance") (Ids.Instance_id.type_args inst)
+         | ClosureAgg inst -> Array.iter (check_what "closure instance") (Instance_id.type_args inst)
          | _ -> ())
     | BinaryOp (_, l, r) ->
         check_operand l;
@@ -1302,7 +1364,7 @@ let check_embedded_concreteness (ctx : ctx) (fn : function_) : unit =
       (match b.terminator with
        | Call (_, callee, args, _, _) -> (
            (match callee with
-            | User inst -> Array.iter (check_what "call instance") (Ids.Instance_id.type_args inst)
+            | User inst -> Array.iter (check_what "call instance") (Instance_id.type_args inst)
             | Intrinsic _ | Extern _ -> ());
            Array.iter (fun arg -> check_operand arg.value) args)
        | SwitchInt (op, _, _) | Assert (op, _, _, _) -> check_operand op
@@ -1317,7 +1379,7 @@ let verify_function (ctx : ctx) (fn : function_) : unit =
         add_err ctx
           (Printf.sprintf "%s: instance type argument %s carries an unresolved type parameter"
              fn_ctx (Seed_mir.print_type ty)))
-    (Ids.Instance_id.type_args fn.instance);
+    (Instance_id.type_args fn.instance);
   if Array.length fn.locals = 0 then
     add_err ctx
       (Printf.sprintf "%s: function has no locals (missing the return slot _0)" fn_ctx)

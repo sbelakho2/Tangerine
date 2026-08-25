@@ -13,13 +13,15 @@
    it, and the VM's host dispatch traps — fail-closed. There is no
    metadata-only "implementation". *)
 
-(* Host symbol ids: the VM dispatches registry indices
-   (Seed_mir.Intrinsic n / Seed_mir.Extern n); the binding table is keyed
-   by the same ids, namespaced by kind so the two registries cannot
-   collide. *)
+(* Host symbol ids: the VM dispatches registry ids (Seed_mir.Intrinsic n
+   / Seed_mir.Extern n, converted at the dispatch boundary); the binding
+   table is keyed by the same ids, namespaced by kind so the two
+   registries cannot collide. The ids are the registries' ABSTRACT id
+   types — not raw ints — so an intrinsic id can never be used where an
+   extern id belongs, and vice versa. *)
 type host_id =
-  | Intrinsic of int
-  | Extern of int
+  | Intrinsic of Intrinsic_registry.Id.t
+  | Extern of Extern_registry.Id.t
 
 (* One binding table for the whole host surface. A symbol WITHOUT an
    `invoke` is not implemented — the record type requires the function, so
@@ -41,13 +43,13 @@ let rec type_key (ty : Type_repr.t) : string =
   | Type_repr.String -> "String"
   | Type_repr.Tuple elems -> "(" ^ String.concat "," (Array.to_list (Array.map type_key elems)) ^ ")"
   | Type_repr.Named (id, args) ->
-      "T#" ^ string_of_int id
+      "T#" ^ string_of_int (Ids.Type_id.to_int id)
       ^ (if Array.length args = 0 then ""
          else "[" ^ String.concat "," (Array.to_list (Array.map type_key args)) ^ "]")
   | Type_repr.Fixed_array (t, _) -> "[" ^ type_key t ^ "]"
   | Type_repr.Raw_ptr (_, t) -> "ptr<" ^ type_key t ^ ">"
   | Type_repr.Ref_internal (_, t) -> "ref<" ^ type_key t ^ ">"
-  | Type_repr.Type_param id -> "P#" ^ string_of_int id
+  | Type_repr.Type_param id -> "P#" ^ string_of_int (Ids.Generic_param_id.to_int id)
   | Type_repr.Function (ps, r) ->
       "fn(" ^ String.concat "," (Array.to_list (Array.map (fun p -> type_key p.Type_repr.pt_type) ps)) ^ ")->" ^ type_key r
   | Type_repr.Never -> "!"
@@ -64,12 +66,25 @@ type binding = {
   invoke : t -> Vm_value.t array -> (Vm_value.t, string) result;
 }
 
+(* The process surface (audit §44): real spawning through
+   Host_process, wired into the host aggregate so source-derived process
+   symbols have a single place to call. A cwd supplied by Tangerine is a
+   VIRTUAL path: it goes through the Host_fs resolver first, and only a
+   path that resolves inside the canonical root is handed to the child. *)
+and process_api = {
+  spawn :
+    executable:string -> argv:string array -> env:string array -> cwd:string option
+    -> (Host_process.status, string) result;
+  spawn_nocapture :
+    executable:string -> argv:string array -> env:string array -> (int, string) result;
+}
+
 and t = {
   intrinsics : Intrinsic_registry.t;
   externs : Extern_registry.t;
   bindings : binding list;
   fs : Host_fs.t;
-  process : unit;
+  process : process_api;
   argv : string array;
   mutable env : (string * string) list;
   mutable stdout : Buffer.t;
@@ -91,109 +106,169 @@ let stderr_contents (t : t) : string = Buffer.contents t.stderr
    semantics are not implementable on this seed host, so no stub is
    shipped. closure_check fails on them and the VM traps. *)
 
-let expect_one_arg (name : string) (args : Vm_value.t array) : (Vm_value.t, string) result =
-  match args with
-  | [| v |] -> Ok v
-  | _ ->
-      Error
-        (Printf.sprintf "%s: expected exactly 1 argument, got %d" name
-           (Array.length args))
+(* ── Independent typed binding adapters (host P1) ───────────────────
 
-let invoke_print (t : t) (args : Vm_value.t array) : (Vm_value.t, string) result =
-  match expect_one_arg "print" args with
-  | Error e -> Error e
-  | Ok (Vm_value.String s) ->
-      emit_stdout t s;
-      Ok Vm_value.Unit
-  | Ok _ -> Error "print: expected a String argument"
+   Each executable binding is declared through a typed ADAPTER that
+   independently encodes the symbol's signature. The OCaml function type
+   the adapter accepts fixes the argument/result conversion, and the
+   signature strings are written ONCE at the adapter — never copied from
+   the registry declaration. `intrinsic_binding`/`extern_binding` then
+   pair the adapter with the registry-declared id, and closure_check
+   compares the ADAPTER's signature against the registry's
+   source-derived declaration: a drift between the two is a real,
+   caught error, not a self-comparison. *)
 
-let invoke_println (t : t) (args : Vm_value.t array) : (Vm_value.t, string) result =
-  match expect_one_arg "println" args with
-  | Error e -> Error e
-  | Ok (Vm_value.String s) ->
-      emit_stdout t s;
-      emit_stdout t "\n";
-      Ok Vm_value.Unit
-  | Ok _ -> Error "println: expected a String argument"
+type adapter = {
+  signature : signature;
+  invoke : t -> Vm_value.t array -> (Vm_value.t, string) result;
+}
 
-(* Deterministic host error: the VM turns the Error into a trap. *)
-let invoke_panic (_t : t) (args : Vm_value.t array) : (Vm_value.t, string) result =
-  match expect_one_arg "panic" args with
-  | Error e -> Error e
-  | Ok (Vm_value.String s) -> Error (Printf.sprintf "panic: %s" s)
-  | Ok _ -> Error "panic: expected a String argument"
+let arg_mismatch expected : (Vm_value.t, string) result =
+  Error ("argument mismatch: expected " ^ expected)
 
-let invoke_abort (_t : t) (args : Vm_value.t array) : (Vm_value.t, string) result =
-  match args with
-  | [||] -> Error "__intrinsic_abort: process aborted"
-  | _ -> Error "__intrinsic_abort: expected no arguments"
-
-let invoke_int_to_string (_t : t) (args : Vm_value.t array) : (Vm_value.t, string) result =
-  match expect_one_arg "__intrinsic_int_to_string" args with
-  | Error e -> Error e
-  | Ok (Vm_value.Int i) -> Ok (Vm_value.String (Int_value.to_string i))
-  | Ok _ -> Error "__intrinsic_int_to_string: expected an Int argument"
-
-let invoke_bool_to_string (_t : t) (args : Vm_value.t array) : (Vm_value.t, string) result =
-  match expect_one_arg "__intrinsic_bool_to_string" args with
-  | Error e -> Error e
-  | Ok (Vm_value.Bool b) -> Ok (Vm_value.String (if b then "true" else "false"))
-  | Ok _ -> Error "__intrinsic_bool_to_string: expected a Bool argument"
-
-let invoke_char_to_string (_t : t) (args : Vm_value.t array) : (Vm_value.t, string) result =
-  match expect_one_arg "__intrinsic_char_to_string" args with
-  | Error e -> Error e
-  | Ok (Vm_value.Char c) -> Ok (Vm_value.String (String.make 1 (Uchar.to_char c)))
-  | Ok _ -> Error "__intrinsic_char_to_string: expected a Char argument"
-
-let invoke_string_len (_t : t) (args : Vm_value.t array) : (Vm_value.t, string) result =
-  match expect_one_arg "__intrinsic_string_len" args with
-  | Error e -> Error e
-  | Ok (Vm_value.String s) ->
-      Ok
-        (Vm_value.Int
-           (Int_value.of_int64 ~width:64 ~signed:true (Int64.of_int (String.length s))))
-  | Ok _ -> Error "__intrinsic_string_len: expected a String argument"
-
-(* __sync_synchronize is a full memory barrier; on the single-threaded
-   seed host there is nothing to order, so the correct implementation is
-   a no-op. This is the real semantic, not a fabricated value. *)
-let invoke_sync_synchronize (_t : t) (args : Vm_value.t array) : (Vm_value.t, string) result =
-  match args with
-  | [||] -> Ok Vm_value.Unit
-  | _ -> Error "__sync_synchronize: expected no arguments"
-
-(* Binding ids are derived from the declared registries by name, so the
-   executable closure and the declarations can never drift apart. *)
-let sig_of_decl (decl : Intrinsic_registry.signature) : signature =
+(* () -> Unit *)
+let adapter_ret_unit (f : t -> unit) : adapter =
   {
-    param_types = Array.to_list (Array.map type_key decl.Intrinsic_registry.params);
-    return_type = type_key decl.Intrinsic_registry.ret;
+    signature = { param_types = []; return_type = type_key Type_repr.Unit };
+    invoke =
+      (fun t args ->
+        match args with
+        | [||] ->
+            f t;
+            Ok Vm_value.Unit
+        | _ -> arg_mismatch "no arguments");
   }
 
-let intrinsic_binding (name : string)
-    (invoke : t -> Vm_value.t array -> (Vm_value.t, string) result) : binding =
+(* () -> Never: f produces the deterministic host error message. *)
+let adapter_ret_never (f : t -> string) : adapter =
+  {
+    signature = { param_types = []; return_type = type_key Type_repr.Never };
+    invoke =
+      (fun t args ->
+        match args with
+        | [||] -> Error (f t)
+        | _ -> arg_mismatch "no arguments");
+  }
+
+(* String -> Unit *)
+let adapter_string_ret_unit (f : t -> string -> unit) : adapter =
+  {
+    signature =
+      { param_types = [ type_key Type_repr.String ];
+        return_type = type_key Type_repr.Unit };
+    invoke =
+      (fun t args ->
+        match args with
+        | [| Vm_value.String s |] ->
+            f t s;
+            Ok Vm_value.Unit
+        | _ -> arg_mismatch "String");
+  }
+
+(* String -> Never: f produces the deterministic host error message. *)
+let adapter_string_ret_never (f : t -> string -> string) : adapter =
+  {
+    signature =
+      { param_types = [ type_key Type_repr.String ];
+        return_type = type_key Type_repr.Never };
+    invoke =
+      (fun t args ->
+        match args with
+        | [| Vm_value.String s |] -> Error (f t s)
+        | _ -> arg_mismatch "String");
+  }
+
+(* Int -> String *)
+let adapter_int_ret_string (f : t -> Int_value.t -> string) : adapter =
+  {
+    signature =
+      { param_types = [ type_key (Type_repr.Int Type_repr.Int) ];
+        return_type = type_key Type_repr.String };
+    invoke =
+      (fun t args ->
+        match args with
+        | [| Vm_value.Int i |] -> Ok (Vm_value.String (f t i))
+        | _ -> arg_mismatch "Int");
+  }
+
+(* Bool -> String *)
+let adapter_bool_ret_string (f : t -> bool -> string) : adapter =
+  {
+    signature =
+      { param_types = [ type_key Type_repr.Bool ];
+        return_type = type_key Type_repr.String };
+    invoke =
+      (fun t args ->
+        match args with
+        | [| Vm_value.Bool b |] -> Ok (Vm_value.String (f t b))
+        | _ -> arg_mismatch "Bool");
+  }
+
+(* Char -> String *)
+let adapter_char_ret_string (f : t -> Uchar.t -> string) : adapter =
+  {
+    signature =
+      { param_types = [ type_key Type_repr.Char ];
+        return_type = type_key Type_repr.String };
+    invoke =
+      (fun t args ->
+        match args with
+        | [| Vm_value.Char c |] -> Ok (Vm_value.String (f t c))
+        | _ -> arg_mismatch "Char");
+  }
+
+(* String -> Int *)
+let adapter_string_ret_int (f : t -> string -> Int_value.t) : adapter =
+  {
+    signature =
+      { param_types = [ type_key Type_repr.String ];
+        return_type = type_key (Type_repr.Int Type_repr.Int) };
+    invoke =
+      (fun t args ->
+        match args with
+        | [| Vm_value.String s |] -> Ok (Vm_value.Int (f t s))
+        | _ -> arg_mismatch "String");
+  }
+
+(* Binding ids are resolved from the declared registries by name, so the
+   executable closure and the declarations can never drift apart in
+   identity; the SIGNATURE is the adapter's independent declaration. *)
+let intrinsic_binding (name : string) (a : adapter) : binding =
   match Intrinsic_registry.lookup Intrinsic_registry.manifest ~name with
-  | Some (id, decl) -> { id = Intrinsic id; name; signature = sig_of_decl decl; invoke }
+  | Some (id, _) -> { id = Intrinsic id; name; signature = a.signature; invoke = a.invoke }
   | None -> failwith (Printf.sprintf "host binding '%s': not a declared intrinsic" name)
 
-let extern_binding (name : string)
-    (invoke : t -> Vm_value.t array -> (Vm_value.t, string) result) : binding =
+let extern_binding (name : string) (a : adapter) : binding =
   match Extern_registry.lookup Extern_registry.manifest ~name with
-  | Some (id, decl) -> { id = Extern id; name; signature = sig_of_decl decl; invoke }
+  | Some (id, _) -> { id = Extern id; name; signature = a.signature; invoke = a.invoke }
   | None -> failwith (Printf.sprintf "host binding '%s': not a declared extern" name)
 
 let binding_manifest : binding list =
   [
-    intrinsic_binding "print" invoke_print;
-    intrinsic_binding "println" invoke_println;
-    intrinsic_binding "panic" invoke_panic;
-    intrinsic_binding "__intrinsic_abort" invoke_abort;
-    intrinsic_binding "__intrinsic_int_to_string" invoke_int_to_string;
-    intrinsic_binding "__intrinsic_bool_to_string" invoke_bool_to_string;
-    intrinsic_binding "__intrinsic_char_to_string" invoke_char_to_string;
-    intrinsic_binding "__intrinsic_string_len" invoke_string_len;
-    extern_binding "__sync_synchronize" invoke_sync_synchronize;
+    intrinsic_binding "print"
+      (adapter_string_ret_unit (fun t s -> emit_stdout t s));
+    intrinsic_binding "println"
+      (adapter_string_ret_unit (fun t s ->
+           emit_stdout t s;
+           emit_stdout t "\n"));
+    intrinsic_binding "panic"
+      (adapter_string_ret_never (fun _ s -> Printf.sprintf "panic: %s" s));
+    intrinsic_binding "__intrinsic_abort"
+      (adapter_ret_never (fun _ -> "__intrinsic_abort: process aborted"));
+    intrinsic_binding "__intrinsic_int_to_string"
+      (adapter_int_ret_string (fun _ i -> Int_value.to_string i));
+    intrinsic_binding "__intrinsic_bool_to_string"
+      (adapter_bool_ret_string (fun _ b -> if b then "true" else "false"));
+    intrinsic_binding "__intrinsic_char_to_string"
+      (adapter_char_ret_string (fun _ c -> Bytes.to_string (Utf8.encode_scalar c)));
+    intrinsic_binding "__intrinsic_string_len"
+      (adapter_string_ret_int (fun _ s ->
+           Int_value.of_int64 ~width:64 ~signed:true (Int64.of_int (String.length s))));
+    (* __sync_synchronize is a full memory barrier; on the single-threaded
+       seed host there is nothing to order, so the correct implementation
+       is a no-op. This is the real semantic, not a fabricated value. *)
+    extern_binding "__sync_synchronize"
+      (adapter_ret_unit (fun _ -> ()));
   ]
 
 let binding_of_manifest (name : string) : binding option =
@@ -201,16 +276,42 @@ let binding_of_manifest (name : string) : binding option =
 
 (* ── Construction ─────────────────────────────────────────────────── *)
 
+(* The process capability is built ONCE per host from Host_process,
+   bound to the host's virtual filesystem: a Tangerine-supplied cwd is a
+   virtual path, resolved through Host_fs (canonicalized + containment)
+   before a child is chdir'd onto it. *)
+let default_process_api (fs : Host_fs.t) : process_api =
+  let resolve_virtual_cwd (cwd : string option) : (string option, string) result =
+    match cwd with
+    | None -> Ok None
+    | Some dir ->
+        let segs =
+          String.split_on_char '/' dir |> List.filter (fun s -> s <> "")
+        in
+        (match Host_fs.resolve fs segs with
+        | Ok real -> Ok (Some real)
+        | Error e -> Error e)
+  in
+  {
+    spawn =
+      (fun ~executable ~argv ~env ~cwd ->
+        match resolve_virtual_cwd cwd with
+        | Error e -> Error e
+        | Ok cwd' -> Host_process.spawn ~executable ~argv ~env ~cwd:cwd');
+    spawn_nocapture = Host_process.spawn_nocapture;
+  }
+
 (* Build a host from explicit registries (declared surface) and an
    explicit binding table (executable closure). *)
 let create_with ~repo_root ~(argv : string array) ~(intrinsics : Intrinsic_registry.t)
     ~(externs : Extern_registry.t) ~(bindings : binding list) : t =
+  let fs = Host_fs.create ~repo_root in
   {
     intrinsics;
     externs;
     bindings;
-    fs = Host_fs.create ~repo_root;
-    process = ();
+    fs;
+    process = default_process_api fs;
     argv;
     env = [];
     stdout = Buffer.create 4096;
@@ -267,9 +368,10 @@ let name_of_host_id (t : t) (id : host_id) : string option =
    compared against the EXACT SAME binding table the VM dispatches
    through (t.bindings). PASS requires every declared symbol to carry a
    binding — an executable invoke. Any declared-but-unbound symbol FAILS
-   the check and is named; an arity disagreement with the declared
-   signature also fails; bound-but-undeclared extras fail. The report
-   carries the implemented-vs-declared counts. *)
+   the check and is named; a signature disagreement between the
+   binding's INDEPENDENT adapter declaration and the registry's
+   source-derived declaration also fails; bound-but-undeclared extras
+   fail. The report carries the implemented-vs-declared counts. *)
 
 type closure_report = {
   declared : int;

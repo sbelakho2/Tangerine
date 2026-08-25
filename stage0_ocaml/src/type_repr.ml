@@ -28,9 +28,9 @@ and t =
   | Ref_internal of mutability * t
   | Tuple of t array
   | Fixed_array of t * int
-  | Named of int * t array
+  | Named of Ids.Type_id.t * t array
   | Function of param_type array * t
-  | Type_param of int
+  | Type_param of Ids.Generic_param_id.t
   | Never
 
 (* Lexicographic array comparison over an element comparator (standalone
@@ -63,11 +63,11 @@ let rec compare (a : t) (b : t) : int =
   | Fixed_array (t1, n1), Fixed_array (t2, n2) ->
       let c = Stdlib.compare n1 n2 in if c <> 0 then c else compare t1 t2
   | Named (i1, a1), Named (i2, a2) ->
-      let c = Stdlib.compare i1 i2 in if c <> 0 then c else compare_arrays compare a1 a2
+      let c = Ids.Type_id.compare i1 i2 in if c <> 0 then c else compare_arrays compare a1 a2
   | Function (p1, r1), Function (p2, r2) ->
       let c = compare_arrays compare_param p1 p2 in
       if c <> 0 then c else compare r1 r2
-  | Type_param i1, Type_param i2 -> Stdlib.compare i1 i2
+  | Type_param i1, Type_param i2 -> Ids.Generic_param_id.compare i1 i2
   | Never, Never -> 0
   | Unit, _ -> -1 | _, Unit -> 1
   | Bool, _ -> -1 | _, Bool -> 1
@@ -87,8 +87,9 @@ and compare_param (a : param_type) (b : param_type) =
   let c = Access_effect.compare a.pt_convention b.pt_convention in
   if c <> 0 then c else compare a.pt_type b.pt_type
 
-(* Substitute type parameters (used by monomorphization). *)
-let rec substitute (subst : (int * t) list) (ty : t) : t =
+(* Substitute type parameters (used by monomorphization). The table is
+   keyed by Generic_param_id, never by a naked int. *)
+let rec substitute (subst : (Ids.Generic_param_id.t * t) list) (ty : t) : t =
   match ty with
   | Type_param id -> (
       match List.assoc_opt id subst with

@@ -54,7 +54,7 @@ type constant =
   | Float64 of int64
   | Char of Uchar.t
   | String of string
-  | Function of Ids.Instance_id.t
+  | Function of Instance_id.t
 
 type projection =
   | Deref
@@ -74,7 +74,7 @@ type operand =
   | Constant of constant
 
 type callee =
-  | User of Ids.Instance_id.t
+  | User of Instance_id.t
   | Intrinsic of int
   | Extern of int
 
@@ -96,7 +96,7 @@ type aggregate_kind =
   | ArrayAgg
   | StructCtor of Ids.Type_id.t * Ids.Field_index.t array
   | EnumCtor of Ids.Type_id.t * Ids.Variant_index.t
-  | ClosureAgg of Ids.Instance_id.t
+  | ClosureAgg of Instance_id.t
 
 type rvalue =
   | Use of operand
@@ -135,7 +135,7 @@ type block = {
 
 type function_ = {
   name : string;
-  instance : Ids.Instance_id.t;
+  instance : Instance_id.t;
   params : (Ids.Callable_id.t option * Type_repr.t) array;
   locals : Type_repr.t array;
   blocks : block array;
@@ -169,7 +169,7 @@ let rec print_type (t : Type_repr.t) : string =
       Printf.sprintf "[%s; %d]" (print_type inner) n
   | Type_repr.Named (id, args) ->
       Printf.sprintf "type#%d%s"
-        id
+        (Ids.Type_id.to_int id)
         (if Array.length args = 0 then ""
          else
            "[" ^ String.concat ", " (Array.to_list (Array.map print_type args)) ^ "]")
@@ -179,7 +179,7 @@ let rec print_type (t : Type_repr.t) : string =
            (Array.to_list
               (Array.map (fun p -> print_type p.Type_repr.pt_type) params)))
         (print_type ret)
-  | Type_repr.Type_param id -> Printf.sprintf "T%d" id
+  | Type_repr.Type_param id -> Printf.sprintf "T%d" (Ids.Generic_param_id.to_int id)
   | Type_repr.Never -> "!"
 
 and print_int_kind = function
@@ -217,10 +217,10 @@ let rec print_constant (c : constant) : string =
   | String s -> Printf.sprintf "\"%s\"" s
   | Function inst -> "fn " ^ print_instance inst
 
-and print_instance (inst : Ids.Instance_id.t) : string =
+and print_instance (inst : Instance_id.t) : string =
   Printf.sprintf "inst{callable#%d; [%s]}"
-    (Ids.Callable_id.to_int (Ids.Instance_id.callable inst))
-    (String.concat ", " (Array.to_list (Array.map print_type (Ids.Instance_id.type_args inst))))
+    (Ids.Callable_id.to_int (Instance_id.callable inst))
+    (String.concat ", " (Array.to_list (Array.map print_type (Instance_id.type_args inst))))
 
 let print_place (p : place) : string =
   let s = ref (Printf.sprintf "_%d" p.local) in

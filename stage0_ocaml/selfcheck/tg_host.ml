@@ -40,7 +40,7 @@ let mk_host ~intrinsics ~bindings : Host.t =
 
 let register (name : string) (id : int) (sig_ : Intrinsic_registry.signature)
     (reg : Intrinsic_registry.t) : Intrinsic_registry.t =
-  Intrinsic_registry.register reg ~name ~id sig_
+  Intrinsic_registry.register reg ~name ~id:(Intrinsic_registry.Id.make id) sig_
 
 (* (a) a declared symbol without a binding must FAIL the closure check. *)
 let check_declared_unbound () =
@@ -104,16 +104,40 @@ let check_declared_implemented () =
         report.declared report.implemented (String.concat ", " report.bound);
       pass "closure_check PASSES when every declared symbol carries an executable binding"
 
+(* (b') a REAL signature drift between the binding's independent adapter
+   declaration and the registry's source-derived declaration must FAIL
+   the closure check (the adapter signature is no longer derived from
+   the declaration it is compared against). *)
+let check_independent_signature_mismatch () =
+  let sig_string_never : Intrinsic_registry.signature =
+    Intrinsic_registry.sig_ ~params:[| Intrinsic_registry.ty_string |]
+      ~ret:Type_repr.Never
+  in
+  let reg = Intrinsic_registry.empty |> register "print" 0 sig_string_never in
+  let host = mk_host ~intrinsics:reg ~bindings:[ manifest_binding "print" ] in
+  match Host.closure_check host with
+  | Ok _ -> fail "closure_check passed although the binding's adapter signature (String -> Unit) disagrees with the declaration (String -> Never)"
+  | Error problems -> (
+      match
+        List.find_opt (fun p -> Util.has_prefix p "return mismatch for print") problems
+      with
+      | None ->
+          fail "closure_check failed for the wrong reason: %s"
+            (String.concat "; " problems)
+      | Some p ->
+          Printf.printf "  %s\n" p;
+          pass "a real adapter-vs-declaration signature mismatch FAILS the closure check")
+
 (* (c) VM dispatch through the binding table. *)
 
 let intrinsic_id (name : string) : int =
   match Intrinsic_registry.lookup Intrinsic_registry.manifest ~name with
-  | Some (id, _) -> id
+  | Some (id, _) -> Intrinsic_registry.Id.to_int id
   | None -> fail "intrinsic '%s' not declared" name
 
 let extern_id (name : string) : int =
   match Extern_registry.lookup Extern_registry.manifest ~name with
-  | Some (id, _) -> id
+  | Some (id, _) -> Extern_registry.Id.to_int id
   | None -> fail "extern '%s' not declared" name
 
 let int_constant (n : int64) : Seed_mir.constant =
@@ -133,7 +157,7 @@ let call_program (callee : Seed_mir.callee) (arg : (Type_repr.t * Seed_mir.const
           [| { Seed_mir.effect_ = Access_effect.Read; value = Seed_mir.Copy { local = 1; projections = [] } } |],
           [| ret_ty; arg_ty |] )
   in
-  let instance = Ids.Instance_id.make ~callable:(Ids.Callable_id.make 0) ~type_args:[||] in
+  let instance = Instance_id.make ~callable:(Ids.Callable_id.make 0) ~type_args:[||] in
   let fn =
     {
       Seed_mir.name = "main";
@@ -219,6 +243,30 @@ let check_vm_dispatch () =
    | Ok 0 -> pass "VM host dispatch invokes the real __sync_synchronize binding (Extern path)"
    | Error e -> fail "__sync_synchronize host call failed: %s" e.Vm.message
    | Ok _ -> fail "__sync_synchronize program returned a non-zero exit code");
+  (* __intrinsic_char_to_string(U+00E9) -> the two-byte UTF-8 sequence
+     C3 A9: the host must use the Stage0 UTF-8 scalar encoder, not
+     String.make 1 (Uchar.to_char c) (which truncates non-ASCII). *)
+  let p7 =
+    call_program (Seed_mir.Intrinsic (intrinsic_id "__intrinsic_char_to_string"))
+      (Some (Type_repr.Char, Seed_mir.Char (Uchar.of_int 0xE9))) Type_repr.String
+  in
+  let e7 = p7.Seed_mir.functions.(0).Seed_mir.instance in
+  let host7 = Host.create ~repo_root:"." ~argv:[||] in
+  (match Vm.run ~program:p7 ~entry:e7 ~argv:[||] ~host:host7 with
+   | Error e -> fail "char-to-string host call failed: %s" e.Vm.message
+   | Ok 0 -> (
+       match Vm.entry_frame_of ~program:p7 ~entry:e7 ~argv:[||] with
+       | Error m -> fail "entry frame inspection failed: %s" m
+       | Ok (vm2, frame) -> (
+           match Vm.run_inspect vm2 frame with
+           | Ok s when s = "\xC3\xA9" ->
+               pass
+                 "__intrinsic_char_to_string encodes U+00E9 as the two-byte UTF-8 sequence C3 A9"
+           | Ok other ->
+               fail "__intrinsic_char_to_string returned %S (expected the two-byte UTF-8 sequence)"
+                 other
+           | Error m -> fail "char-to-string inspect failed: %s" m))
+   | Ok _ -> fail "char-to-string program returned a non-zero exit code");
   (* declared-but-unbound symbol traps fail-closed *)
   let p6 =
     call_program (Seed_mir.Intrinsic (intrinsic_id "__intrinsic_set_len"))
@@ -236,6 +284,7 @@ let () =
   Printf.printf "host closure self-check\n";
   check_declared_unbound ();
   check_declared_implemented ();
+  check_independent_signature_mismatch ();
   check_vm_dispatch ();
   (* Informational: the default manifest host is fail-closed (the Ruby C
      API / map-set / dl* symbols are declared without bindings). *)

@@ -60,10 +60,10 @@ let int_value (n : int64) : Seed_mir.constant =
 let int_op (n : int) : Seed_mir.operand = Seed_mir.Constant (int_value (Int64.of_int n))
 let str_op (s : string) : Seed_mir.operand = Seed_mir.Constant (Seed_mir.String s)
 
-let instance (callable : int) : Ids.Instance_id.t =
-  Ids.Instance_id.make ~callable:(Ids.Callable_id.make callable) ~type_args:[||]
+let instance (callable : int) : Instance_id.t =
+  Instance_id.make ~callable:(Ids.Callable_id.make callable) ~type_args:[||]
 
-let entry_of (prog : Seed_mir.program) : Ids.Instance_id.t =
+let entry_of (prog : Seed_mir.program) : Instance_id.t =
   prog.Seed_mir.functions.(0).Seed_mir.instance
 
 let run_program (prog : Seed_mir.program) : (int, Vm.vm_error) result =

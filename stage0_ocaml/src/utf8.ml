@@ -163,3 +163,33 @@ let validate_string (s : string) : (unit, error) result =
 
 let is_valid_utf8 (s : string) : bool =
   match validate_string s with Ok () -> true | Error _ -> false
+
+(* Encode one Unicode scalar as strict UTF-8 (the inverse of decode_at).
+   Uchar.t is by construction a scalar (0..U+10FFFF, no surrogates), so
+   the emitted sequence always passes `validate`. Used by the host's
+   __intrinsic_char_to_string so non-ASCII Chars produce valid UTF-8
+   instead of the truncated String.make 1 (Uchar.to_char c). *)
+let encode_scalar (u : Uchar.t) : Bytes.t =
+  let cp = Uchar.to_int u in
+  let n =
+    if cp < 0x80 then 1
+    else if cp < 0x800 then 2
+    else if cp < 0x10000 then 3
+    else 4
+  in
+  let b = Bytes.create n in
+  (match n with
+  | 1 -> Bytes.set b 0 (Char.chr cp)
+  | 2 ->
+      Bytes.set b 0 (Char.chr (0xC0 lor (cp lsr 6)));
+      Bytes.set b 1 (Char.chr (0x80 lor (cp land 0x3F)))
+  | 3 ->
+      Bytes.set b 0 (Char.chr (0xE0 lor (cp lsr 12)));
+      Bytes.set b 1 (Char.chr (0x80 lor ((cp lsr 6) land 0x3F)));
+      Bytes.set b 2 (Char.chr (0x80 lor (cp land 0x3F)))
+  | _ ->
+      Bytes.set b 0 (Char.chr (0xF0 lor (cp lsr 18)));
+      Bytes.set b 1 (Char.chr (0x80 lor ((cp lsr 12) land 0x3F)));
+      Bytes.set b 2 (Char.chr (0x80 lor ((cp lsr 6) land 0x3F)));
+      Bytes.set b 3 (Char.chr (0x80 lor (cp land 0x3F))));
+  b

@@ -85,7 +85,7 @@ let default_limits =
 
 type t = {
   program : Seed_mir.program;
-  fn_index : (Ids.Instance_id.t, int) Hashtbl.t;  (* lookup only; iteration is never semantic *)
+  fn_index : (Instance_id.t, int) Hashtbl.t;  (* lookup only; iteration is never semantic *)
   memory : Vm_memory.t;
   mutable host : Host.t;
   limits : limits;
@@ -98,7 +98,7 @@ type t = {
   mutable trace : string list;
 }
 
-let find_fn (vm : t) (inst : Ids.Instance_id.t) : int option =
+let find_fn (vm : t) (inst : Instance_id.t) : int option =
   Hashtbl.find_opt vm.fn_index inst
 
 let mk_error vm kind message =
@@ -781,8 +781,8 @@ let rec exec_terminator (vm : t) (frame : frame) (term : Seed_mir.terminator) : 
 and call_host (vm : t) (callee : Seed_mir.callee) (args : Vm_value.t array) : Vm_value.t =
   let id =
     match callee with
-    | Seed_mir.Intrinsic i -> Host.Intrinsic i
-    | Seed_mir.Extern i -> Host.Extern i
+    | Seed_mir.Intrinsic i -> Host.Intrinsic (Intrinsic_registry.Id.make i)
+    | Seed_mir.Extern i -> Host.Extern (Extern_registry.Id.make i)
     | Seed_mir.User _ -> err_trap vm "internal: user call routed to host dispatch"
   in
   match Host.lookup_binding vm.host id with
@@ -792,8 +792,9 @@ and call_host (vm : t) (callee : Seed_mir.callee) (args : Vm_value.t array) : Vm
         | Some name -> name
         | None -> (
             match callee with
-            | Seed_mir.Intrinsic i -> Printf.sprintf "intrinsic#%d" i
-            | Seed_mir.Extern i -> Printf.sprintf "extern#%d" i
+            | Seed_mir.Intrinsic i ->
+                Printf.sprintf "intrinsic#%d" (Intrinsic_registry.Id.to_int i)
+            | Seed_mir.Extern i -> Printf.sprintf "extern#%d" (Extern_registry.Id.to_int i)
             | Seed_mir.User _ -> "?")
       in
       err_trap vm (Printf.sprintf "host call %s has no binding (fail-closed)" label)
@@ -891,7 +892,7 @@ and value_kind (v : Vm_value.t) : string =
   | Vm_value.Null -> "null"
 
 (* Build an entry frame without running (inspection). *)
-let entry_frame_of ~(program : Seed_mir.program) ~(entry : Ids.Instance_id.t) ~(argv : string array) :
+let entry_frame_of ~(program : Seed_mir.program) ~(entry : Instance_id.t) ~(argv : string array) :
     (t * frame, string) result =
   let fn_index = Hashtbl.create 64 in
   Array.iteri (fun i fn -> Hashtbl.replace fn_index fn.Seed_mir.instance i) program.Seed_mir.functions;
@@ -925,7 +926,7 @@ let entry_frame_of ~(program : Seed_mir.program) ~(entry : Ids.Instance_id.t) ~(
        with
       | Failure msg -> Error msg)
 
-let run ~(program : Seed_mir.program) ~(entry : Ids.Instance_id.t) ~(argv : string array)
+let run ~(program : Seed_mir.program) ~(entry : Instance_id.t) ~(argv : string array)
     ~(host : Host.t) : (int, vm_error) result =
   match entry_frame_of ~program ~entry ~argv with
   | Error m -> Error { kind = Trap "entry instance not found"; message = m; trace = [] }

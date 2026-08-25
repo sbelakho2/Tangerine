@@ -154,7 +154,7 @@ let lowering_env_of (env : Typecheck.env) : Mir_lower.func_env =
   let methods =
     List.map
       (fun ((t, m), ts : (string * string) * Typecheck.typed_signature) ->
-        ((t, m), Ids.Instance_id.make ~callable:ts.Typecheck.ts_callable ~type_args:[||]))
+        ((t, m), Instance_id.make ~callable:ts.Typecheck.ts_callable ~type_args:[||]))
       env.Typecheck.methods
   in
   {
@@ -476,6 +476,110 @@ let boot_specs =
     { name = "--entry"; takes_value = true; apply = (fun v o -> match v with Some v -> { o with entry = Some v } | None -> o) };
   ]
 
+(* ── @cfg elimination (audit @cfg P0) ──────────────────────────── *)
+
+(* Cut the eliminated items' byte spans out of a module's source text.
+   The spans are the MAXIMAL removed spans returned by the pass (an
+   eliminated inline module covers its children), disjoint and sorted by
+   start, so the re-parse of the cut text is exactly the kept program. *)
+let cut_spans (text : string) (spans : Span.span list) : string =
+  let sorted = List.sort (fun a b -> compare a.Span.start b.Span.start) spans in
+  let buf = Buffer.create (String.length text) in
+  let rec go pos = function
+    | [] -> Buffer.add_substring buf text pos (String.length text - pos)
+    | (s : Span.span) :: rest ->
+        Buffer.add_substring buf text pos (s.Span.start - pos);
+        go s.Span.end_ rest
+  in
+  go 0 sorted;
+  Buffer.contents buf
+
+(* Apply @cfg elimination over every module program: AFTER the
+   parse/merge (the module graph), BEFORE the resolver's duplicate/name
+   registration and the type checker. Each module's target-contradicting
+   declarations are physically removed from the source snapshot (the
+   eliminated spans are cut out and the graph is re-parsed), so the
+   resolver, the typechecker and everything downstream only ever see the
+   target's semantic program — an eliminated declaration does not exist
+   for this target and cannot be resurrected by any reference. Fail
+   closed: an empty @cfg() (E108), a malformed predicate or an unknown
+   target key renders its diagnostics and aborts the pipeline BEFORE the
+   resolver runs — a bad gate never silently stays active. *)
+let apply_cfg_elimination ~(manifest : Bootstrap_manifest.t) ~(graph : Module_graph.t)
+    (target : Target.t) : (Module_graph.t * int, string) result =
+  let ctx = Target.Cfg_context.of_target target in
+  let manifest_ref = ref manifest in
+  let total = ref 0 in
+  let cfg_errors = ref [] in
+  let file_nodes =
+    List.filter (fun n -> n.Module_graph.node_parent = None) graph.Module_graph.nodes
+  in
+  List.iter
+    (fun node ->
+      let key = String.concat "::" node.Module_graph.node_path in
+      match Target.eliminate_program ctx node.Module_graph.node_program with
+      | Error ds -> cfg_errors := !cfg_errors @ ds
+      | Ok r ->
+          if r.Target.elim_removed > 0 then begin
+            total := !total + r.Target.elim_removed;
+            Printf.printf "  cfg: module %s eliminated %d items\n" key r.Target.elim_removed;
+            (match Bootstrap_manifest.find manifest node.Module_graph.node_path with
+             | None -> ()
+             | Some entry ->
+                 let text = cut_spans entry.Bootstrap_manifest.source r.Target.elim_spans in
+                 manifest_ref :=
+                   Bootstrap_manifest.with_entry_source !manifest_ref node.Module_graph.node_path
+                     text)
+          end)
+    file_nodes;
+  if !cfg_errors <> [] then begin
+    prerr_string
+      (Diagnostic.render (Module_graph.source_map graph)
+         { Diagnostic.diagnostics = List.rev !cfg_errors });
+    prerr_newline ();
+    Error "cfg elimination diagnostics"
+  end
+  else begin
+    let reparse_diags = Diagnostic.create_bag () in
+    let graph' = Module_graph.create_with_sources !manifest_ref reparse_diags in
+    if Diagnostic.has_errors reparse_diags then begin
+      prerr_string (Diagnostic.render (Module_graph.source_map graph') reparse_diags);
+      prerr_newline ();
+      Error "cfg elimination re-parse diagnostics"
+    end
+    else begin
+      (* Sanity: the re-parse of the cut sources must reproduce exactly the
+         filtered programs (an off-by-one span cut is an internal error,
+         not a silent semantic change). *)
+      List.iter
+        (fun node ->
+          match Target.eliminate_program ctx node.Module_graph.node_program with
+          | Error _ -> ()
+          | Ok r ->
+              if r.Target.elim_removed > 0 then begin
+                match Module_graph.find_module_by_path graph' node.Module_graph.node_path with
+                | Some n ->
+                    if List.length n.Module_graph.node_items
+                       <> List.length r.Target.elim_program.Ast.items
+                    then
+                      failwith
+                        (Printf.sprintf
+                           "cfg elimination internal error: module %s re-parse diverged (%d items, expected %d)"
+                           (String.concat "::" node.Module_graph.node_path)
+                           (List.length n.Module_graph.node_items)
+                           (List.length r.Target.elim_program.Ast.items))
+                | None ->
+                    failwith
+                      (Printf.sprintf
+                         "cfg elimination internal error: module %s missing from the re-parsed graph"
+                         (String.concat "::" node.Module_graph.node_path))
+              end)
+        file_nodes;
+      Printf.printf "  cfg: total eliminated across closure: %d items\n" !total;
+      Ok (graph', !total)
+    end
+  end
+
 (* Everything bootstrap-check and compile share: manifest load, module
    graph, resolver, and the typecheck fixpoint (registration is
    non-fatal, so modules with forward/cyclic references retry with the
@@ -508,6 +612,14 @@ let run_closure_pipeline ~(repo_root : string) ~(manifest_path : string) ~(targe
       let graph = Module_graph.create_with_sources manifest diags in
       Printf.printf "  module graph: %d modules, %d items\n" graph.Module_graph.node_count
         graph.Module_graph.item_count;
+      (* ── @cfg elimination (audit @cfg P0) ─────────────────────────
+         The production compiler applies apply_cfg_elimination after
+         parse/dependency merge and BEFORE the resolver/typechecker
+         registration. Identical position here: every module program is
+         target-filtered before anything registers or typechecks it. *)
+      (match apply_cfg_elimination ~manifest ~graph target with
+       | Error m -> Error m
+       | Ok (graph, _cfg_eliminated) ->
       let resolved = Resolver.resolve manifest graph diags in
       Printf.printf "  resolver: %d expr defs, %d type defs, %d field defs, %d variant defs, %d call candidates\n"
         (List.length resolved.Resolver.expr_defs)
@@ -564,7 +676,7 @@ let run_closure_pipeline ~(repo_root : string) ~(manifest_path : string) ~(targe
             ctx_items = !items;
             ctx_typed_calls_sample = !typed_calls;
             ctx_rounds = !rounds }
-      end
+      end)
 
 (* Lower every top-level free function of the closure into one Seed MIR
    program (flat namespace; shared by bootstrap-check and compile). *)
@@ -661,7 +773,7 @@ let count_mir_stats (prog : Seed_mir.program) : mir_stats =
                (match callee with
                 | Seed_mir.User inst ->
                     incr calls;
-                    if Ids.Callable_id.to_int (Ids.Instance_id.callable inst) = 0 then incr zeros
+                    if Ids.Callable_id.to_int (Instance_id.callable inst) = 0 then incr zeros
                 | _ -> ());
                Array.iter (fun a -> scan_operand a.Seed_mir.value) args
            | Seed_mir.SwitchInt (op, _, _) | Seed_mir.Assert (op, _, _, _) -> scan_operand op
@@ -725,7 +837,7 @@ let print_oracle_rows (o : oracle_counts) : bool =
    bootstrap_main (the closure's single `main`), else the first
    function.  Suffix matching allows qualified names. *)
 let resolve_bootstrap_entry (prog : Seed_mir.program) (entry_opt : string option) :
-    (string * Ids.Instance_id.t) option =
+    (string * Instance_id.t) option =
   let fns = Array.to_list prog.Seed_mir.functions in
   let find (name : string) =
     List.find_opt
@@ -756,7 +868,7 @@ let resolve_bootstrap_entry (prog : Seed_mir.program) (entry_opt : string option
 let count_residual_type_params (prog : Seed_mir.program) : int =
   let n = ref 0 in
   let tp (ty : Type_repr.t) = if Type_repr.has_type_param ty then incr n in
-  let tp_inst (i : Ids.Instance_id.t) = Array.iter tp (Ids.Instance_id.type_args i) in
+  let tp_inst (i : Instance_id.t) = Array.iter tp (Instance_id.type_args i) in
   let scan_operand (op : Seed_mir.operand) =
     match op with
     | Seed_mir.Constant (Seed_mir.Function i) -> tp_inst i
@@ -780,7 +892,7 @@ let count_residual_type_params (prog : Seed_mir.program) : int =
   in
   Array.iter
     (fun (f : Seed_mir.function_) ->
-      Array.iter tp (Ids.Instance_id.type_args f.Seed_mir.instance);
+      Array.iter tp (Instance_id.type_args f.Seed_mir.instance);
       Array.iter (fun (_, ty) -> tp ty) f.Seed_mir.params;
       Array.iter tp f.Seed_mir.locals;
       Array.iter
@@ -812,7 +924,7 @@ let count_residual_type_params (prog : Seed_mir.program) : int =
 
 type mono_outcome = {
   mo_program : Seed_mir.program;
-  mo_entry : Ids.Instance_id.t;
+  mo_entry : Instance_id.t;
   mo_entry_name : string;
   mo_pre_functions : int;
   mo_post_functions : int;
@@ -823,7 +935,7 @@ type mono_outcome = {
 (* Mono the lowered closure from the bootstrap entry; report pre/post
    function and instance counts; require zero residual Type_param and a
    clean Mir_verify of the mono'd program. *)
-let run_mono_phase ~(entry_name : string) ~(entry : Ids.Instance_id.t)
+let run_mono_phase ~(entry_name : string) ~(entry : Instance_id.t)
     (prog : Seed_mir.program) : (mono_outcome, string list) result =
   Printf.printf "  mono: entry '%s' (%s)\n" entry_name (Seed_mir.print_instance entry);
   match Mono.build ~entry prog with

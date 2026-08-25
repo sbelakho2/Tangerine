@@ -1,112 +1,24 @@
 (* ids.ml — Strong semantic IDs (audit §12).
 
-   Distinct abstract ID domains so that ModuleId, TypeId, FieldId,
-   VariantId and CallableId can never be mixed accidentally. *)
+   Thin re-export of the primitive ID domains from Ids_core (which has
+   no dependency on Type_repr), plus the def_id pair.  Instance_id moved
+   to its own module (instance_id.ml): it is the only ID domain that
+   carries Type_repr values, so it must live ABOVE Type_repr, not
+   underneath it. *)
 
-module Module_id = struct
-  type t = int
-  let make (i : int) : t = i
-  let compare (a : t) (b : t) = compare a b
-  let to_int (t : t) = t
-  let of_int (i : int) : t = i
-  let to_string (t : t) = Printf.sprintf "module#%d" t
-end
+module Module_id = Ids_core.Module_id
+module Item_id = Ids_core.Item_id
+module Type_id = Ids_core.Type_id
+module Trait_id = Ids_core.Trait_id
+module Field_id = Ids_core.Field_id
+module Variant_id = Ids_core.Variant_id
+module Callable_id = Ids_core.Callable_id
+module Generic_param_id = Ids_core.Generic_param_id
 
-module Item_id = struct
-  type t = int
-  let make (i : int) : t = i
-  let compare (a : t) (b : t) = compare a b
-  let to_int (t : t) = t
-  let of_int (i : int) : t = i
-end
-
-module Type_id = struct
-  type t = int
-  let make (i : int) : t = i
-  let compare (a : t) (b : t) = compare a b
-  let to_int (t : t) = t
-  let of_int (i : int) : t = i
-end
-
-module Trait_id = struct
-  type t = int
-  let make (i : int) : t = i
-  let compare (a : t) (b : t) = compare a b
-  let to_int (t : t) = t
-  let of_int (i : int) : t = i
-end
-
-module Field_id = struct
-  type t = int
-  let make (i : int) : t = i
-  let compare (a : t) (b : t) = compare a b
-  let to_int (t : t) = t
-  let of_int (i : int) : t = i
-end
-
-module Variant_id = struct
-  type t = int
-  let make (i : int) : t = i
-  let compare (a : t) (b : t) = compare a b
-  let to_int (t : t) = t
-  let of_int (i : int) : t = i
-end
-
-module Callable_id = struct
-  type t = int
-  let make (i : int) : t = i
-  let compare (a : t) (b : t) = compare a b
-  let to_int (t : t) = t
-  let of_int (i : int) : t = i
-end
-
-module Generic_param_id = struct
-  type t = int
-  let make (i : int) : t = i
-  let compare (a : t) (b : t) = compare a b
-  let to_int (t : t) = t
-  let of_int (i : int) : t = i
-end
-
-(* Per-struct / per-enum declaration-order positions (Seed MIR
-   projections and discriminant tags): 0..n-1 within the owner. *)
-module Field_index = struct
-  type t = int
-  let make (i : int) : t = i
-  let compare (a : t) (b : t) = compare a b
-  let to_int (t : t) = t
-  let of_int (i : int) : t = i
-end
-
-module Variant_index = struct
-  type t = int
-  let make (i : int) : t = i
-  let compare (a : t) (b : t) = compare a b
-  let to_int (t : t) = t
-  let of_int (i : int) : t = i
-end
-
-module Instance_id = struct
-  type t = { callable : Callable_id.t; type_args : Type_repr.t array }
-  let make ~callable ~type_args = { callable; type_args }
-  let callable (t : t) = t.callable
-  let type_args (t : t) = t.type_args
-  let compare (a : t) (b : t) =
-    let c = Callable_id.compare a.callable b.callable in
-    if c <> 0 then c
-    else
-      let n = Array.length a.type_args in
-      let m = Array.length b.type_args in
-      let rec cmp i =
-        if i >= n && i >= m then 0
-        else if i >= n then -1
-        else if i >= m then 1
-        else
-          let c = Type_repr.compare a.type_args.(i) b.type_args.(i) in
-          if c <> 0 then c else cmp (i + 1)
-      in
-      cmp 0
-end
+(* Per-struct / per-enum declaration-order positions used by Seed MIR
+   projections and discriminant tags (0..n-1). *)
+module Field_index = Ids_core.Field_index
+module Variant_index = Ids_core.Variant_index
 
 type def_id = {
   module_id : Module_id.t;

@@ -34,8 +34,8 @@ let i64 = Type_repr.Int Type_repr.Int
 let int_constant (n : int64) : Seed_mir.constant =
   Seed_mir.Integer (Int_value.of_int64 ~width:64 ~signed:true n)
 
-let instance (callable : int) : Ids.Instance_id.t =
-  Ids.Instance_id.make ~callable:(Ids.Callable_id.make callable) ~type_args:[||]
+let instance (callable : int) : Instance_id.t =
+  Instance_id.make ~callable:(Ids.Callable_id.make callable) ~type_args:[||]
 
 let run_program (prog : Seed_mir.program) : (int, Vm.vm_error) result =
   let entry = prog.Seed_mir.functions.(0).Seed_mir.instance in

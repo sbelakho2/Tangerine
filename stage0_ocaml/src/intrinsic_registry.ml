@@ -7,7 +7,17 @@
    (Host.closure_check). Ids are stable 0-based manifest-order indices;
    the name is the sole identity. *)
 
-type intrinsic_id = int
+(* Abstract id type: the host ids are distinct from bare ints, so a host
+   binding keyed on Intrinsic_registry.Id.t can never be confused with an
+   Extern_registry id or with Seed_mir's raw index ints. The .ml keeps
+   `type t = int` (structural equality works); only this module can
+   construct ids (make), and the VM dispatch converts back with to_int. *)
+module Id = struct
+  type t = int
+
+  let make (i : int) : t = i
+  let to_int (id : t) : int = id
+end
 
 type signature = {
   params : Type_repr.t array;
@@ -15,15 +25,15 @@ type signature = {
 }
 
 type t = {
-  by_name : (string * (intrinsic_id * signature)) list;
+  by_name : (string * (Id.t * signature)) list;
 }
 
 let empty : t = { by_name = [] }
 
-let register (t : t) ~name ~(id : intrinsic_id) (sig_ : signature) : t =
+let register (t : t) ~name ~(id : Id.t) (sig_ : signature) : t =
   { by_name = (name, (id, sig_)) :: t.by_name }
 
-let lookup (t : t) ~name : (intrinsic_id * signature) option =
+let lookup (t : t) ~name : (Id.t * signature) option =
   List.assoc_opt name t.by_name
 
 let names (t : t) : string list =
@@ -66,14 +76,14 @@ let ptr (t : Type_repr.t) : Type_repr.t = Type_repr.Raw_ptr (Type_repr.Immutable
 let ptr_u8 : Type_repr.t = ptr ty_u8
 let ref_ (t : Type_repr.t) : Type_repr.t = Type_repr.Ref_internal (Type_repr.Immutable, t)
 let named (id : Ids.Type_id.t) (args : Type_repr.t array) : Type_repr.t =
-  Type_repr.Named (Ids.Type_id.to_int id, args)
+  Type_repr.Named (id, args)
 let option_of (t : Type_repr.t) : Type_repr.t = named Type_id.option_ [| t |]
 let vec_of (t : Type_repr.t) : Type_repr.t = named Type_id.vec [| t |]
 let map_of (k : Type_repr.t) (v : Type_repr.t) : Type_repr.t = named Type_id.map [| k; v |]
 let set_of (t : Type_repr.t) : Type_repr.t = named Type_id.set [| t |]
 let ruby_value : Type_repr.t = named Type_id.ruby_value [||]
 let ruby_id : Type_repr.t = named Type_id.ruby_id [||]
-let param (id : Ids.Generic_param_id.t) : Type_repr.t = Type_repr.Type_param (Ids.Generic_param_id.to_int id)
+let param (id : Ids.Generic_param_id.t) : Type_repr.t = Type_repr.Type_param id
 
 let sig_ ~(params : Type_repr.t array) ~(ret : Type_repr.t) : signature =
   { params; ret }
@@ -131,7 +141,7 @@ let rec ty_to_string (ty : Type_repr.t) : string =
   | Type_repr.Fixed_array (inner, n) ->
       Printf.sprintf "[%s; %d]" (ty_to_string inner) n
   | Type_repr.Named (id, args) ->
-      named_name (Ids.Type_id.make id)
+      named_name id
       ^ (if Array.length args > 0 then
            "[" ^ String.concat ", " (Array.to_list (Array.map ty_to_string args)) ^ "]"
          else "")
@@ -143,7 +153,7 @@ let rec ty_to_string (ty : Type_repr.t) : string =
       Printf.sprintf "fn(%s) -> %s"
         (String.concat ", " (Array.to_list (Array.map render params)))
         (ty_to_string ret)
-  | Type_repr.Type_param id -> Printf.sprintf "T%d" id
+  | Type_repr.Type_param id -> Printf.sprintf "T%d" (Ids.Generic_param_id.to_int id)
   | Type_repr.Never -> "!"
 
 let signature_to_string (s : signature) : string =
@@ -214,5 +224,5 @@ let manifest : t =
     ]
   in
   let tbl = ref empty in
-  List.iteri (fun i (name, s) -> tbl := register !tbl ~name ~id:i s) entries;
+  List.iteri (fun i (name, s) -> tbl := register !tbl ~name ~id:(Id.make i) s) entries;
   !tbl

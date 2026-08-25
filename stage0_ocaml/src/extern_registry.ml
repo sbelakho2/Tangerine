@@ -7,20 +7,28 @@
    exactly from the extern declarations; the table is the
    declared-host-symbol side of the closure check (Host.closure_check). *)
 
-type extern_id = int
+(* Abstract id type: see Intrinsic_registry.Id — an extern id is its own
+   type, constructed only here, so it can never be confused with an
+   intrinsic id or a raw index. *)
+module Id = struct
+  type t = int
+
+  let make (i : int) : t = i
+  let to_int (id : t) : int = id
+end
 
 type signature = Intrinsic_registry.signature
 
 type t = {
-  by_name : (string * (extern_id * signature)) list;
+  by_name : (string * (Id.t * signature)) list;
 }
 
 let empty : t = { by_name = [] }
 
-let register (t : t) ~name ~(id : extern_id) (sig_ : signature) : t =
+let register (t : t) ~name ~(id : Id.t) (sig_ : signature) : t =
   { by_name = (name, (id, sig_)) :: t.by_name }
 
-let lookup (t : t) ~name : (extern_id * signature) option =
+let lookup (t : t) ~name : (Id.t * signature) option =
   List.assoc_opt name t.by_name
 
 let names (t : t) : string list =
@@ -120,5 +128,5 @@ let manifest : t =
     ]
   in
   let tbl = ref empty in
-  List.iteri (fun i (name, s) -> tbl := register !tbl ~name ~id:i s) entries;
+  List.iteri (fun i (name, s) -> tbl := register !tbl ~name ~id:(Id.make i) s) entries;
   !tbl

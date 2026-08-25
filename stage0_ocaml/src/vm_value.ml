@@ -17,8 +17,8 @@ type t =
   | Struct of t array
   | Enum of int * t array          (* variant index, payload *)
   | Array of t array
-  | Function of Ids.Instance_id.t
-  | Closure of Ids.Instance_id.t * t array
+  | Function of Instance_id.t
+  | Closure of Instance_id.t * t array
   | RawPtr of Vm_memory.pointer
   | Ref of ref_target
   | Null
@@ -127,9 +127,9 @@ let rec equal (a : t) (b : t) : bool =
   | Tuple x, Tuple y | Struct x, Struct y | Array x, Array y ->
       Array.length x = Array.length y && Array.for_all2 equal x y
   | Enum (i, x), Enum (j, y) -> i = j && Array.length x = Array.length y && Array.for_all2 equal x y
-  | Function a, Function b -> Ids.Instance_id.compare a b = 0
+  | Function a, Function b -> Instance_id.compare a b = 0
   | Closure (a, ca), Closure (b, cb) ->
-      Ids.Instance_id.compare a b = 0 && Array.length ca = Array.length cb && Array.for_all2 equal ca cb
+      Instance_id.compare a b = 0 && Array.length ca = Array.length cb && Array.for_all2 equal ca cb
   | RawPtr a, RawPtr b ->
       a.Vm_memory.region = b.Vm_memory.region && a.Vm_memory.offset = b.Vm_memory.offset
   | Ref a, Ref b -> (
