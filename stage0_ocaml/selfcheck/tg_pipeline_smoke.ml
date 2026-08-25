@@ -1,12 +1,14 @@
-(* tg_gates.ml — pipeline-gates self-check (driver-path parity).
+(* tg_pipeline_smoke.ml — pipeline SMOKE self-check (driver-path parity).
 
-   Runs the same pipeline functions the driver uses for bootstrap-check /
-   compile: Bootstrap_manifest.load -> Module_graph -> Resolver ->
-   single-module typecheck (the differential corpus when it checks
-   cleanly, else a small inline program) -> lower -> MIR verify -> mono
-   -> residual Type_param walk -> MIR verify again -> VM run of the
-   mono'd entry.  The oracle rows print; expected-zero rows must print
-   zero.  Prints PASS/FAIL and exits accordingly. *)
+   SMOKE TEST — NOT the bootstrap-completeness gate.  This executable
+   runs the driver's pipeline on a SINGLE module (the differential
+   corpus when it checks cleanly, else a small inline program): parse ->
+   manifest/module graph -> resolver -> single-module typecheck -> lower
+   -> MIR verify -> mono -> residual Type_param walk -> MIR verify again
+   -> VM run of the mono'd entry.  The inline fallback means a PASS here
+   can never be read as a compiler-closure PASS; the aggregate closure
+   gate is tg_bootstrap_gate, which runs the real manifest closure with
+   no fallback.  Prints SMOKE PASS/FAIL and exits accordingly. *)
 
 let inline_src = {|
 def main() -> Int
@@ -39,7 +41,7 @@ def sum_to(n: Int) -> Int
 end
 |}
 
-let fail fmt = Printf.ksprintf (fun s -> Printf.printf "tg_gates: FAIL: %s\n" s; exit 1) fmt
+let fail fmt = Printf.ksprintf (fun s -> Printf.printf "tg_pipeline_smoke: FAIL: %s\n" s; exit 1) fmt
 
 let program_of_src (src : Source.source) (module_path : string list) : Ast.program =
   let sm = Span.create () in
@@ -61,7 +63,8 @@ let () =
         ("..", f)
     | _ -> ("..", "../tests/differential/corpus/12_options_results.tg")
   in
-  Printf.printf "tg_gates: repo-root %s\n" repo_root;
+  Printf.printf "tg_pipeline_smoke: repo-root %s\n" repo_root;
+  Printf.printf "SMOKE: pipeline sanity on a single module (corpus or inline fallback) — this is NOT the bootstrap-completeness closure gate; the aggregate gate is tg_bootstrap_gate\n";
   (* 1. manifest -> module graph -> resolver (driver parity) *)
   (match Bootstrap_manifest.load ~repo_root ~manifest_path:"bootstrap/compiler_kernel.manifest" with
    | Error m -> fail "manifest load: %s" m
@@ -164,9 +167,9 @@ let () =
          }
        in
        let incomplete = Driver.print_oracle_rows o in
-       if incomplete then
-         Printf.printf
-           "  oracle note: DIFF rows present — expected for the seed subset (typed methods/nominals are not yet lowered); gate semantics are informational here\n";
+        if incomplete then
+          Printf.printf
+            "  oracle note: DIFF rows present — expected for the seed subset (typed methods/nominals are not yet lowered); SMOKE informational only, the closure gate is tg_bootstrap_gate\n";
        (* 5. mono: build, verify, residual walk, verify again *)
        let entry_name, entry =
          match Driver.resolve_bootstrap_entry prog None with
@@ -193,5 +196,5 @@ let () =
                      match Vm.run_inspect vm2 ef with
                      | Ok ret -> Printf.printf "  main returned: %s\n" ret
                      | Error m -> fail "VM inspect run: %s" m));
-                 Printf.printf "tg_gates: PASS\n";
+                 Printf.printf "SMOKE: PASS\n";
                  exit 0)))

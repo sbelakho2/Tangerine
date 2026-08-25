@@ -10,7 +10,22 @@
    the source bytes) is computed at load.
 
    Each entry retains its validated source snapshot (bytes + SHA-256),
-   so nothing re-reads the source files after load (TOCTOU closure). *)
+   so nothing re-reads the source files after load (TOCTOU closure).
+
+   Version policy: the bootstrap closure manifests declare `version: 1`
+   (bootstrap/compiler_kernel.manifest). A manifest that omits the
+   version field or declares a version outside `supported_versions` is
+   rejected outright: nothing that seeds a compilation trust root
+   silently accepts an arbitrary or missing schema version. *)
+
+(* The manifest schema versions the loader accepts. Derived from the
+   declared `version:` fields of the repository's bootstrap manifests
+   (bootstrap/compiler_kernel.manifest declares 1; no manifest declares
+   a dev revision beyond it yet). *)
+let supported_versions : int list = [ 1 ]
+
+let version_policy_message () : string =
+  String.concat ", " (List.map string_of_int supported_versions)
 
 type module_entry = {
   path : string list;   (* logical module path, e.g. ["std"; "core"] *)
@@ -115,6 +130,7 @@ let load ~(repo_root : string) ~(manifest_path : string) : (t, string) result =
       let entries = ref [] in
       let version = ref None in
       let seen = ref Util.StringSet.empty in
+      let seen_path = ref Util.StringSet.empty in
       let errors = ref [] in
       List.iteri
         (fun lineno line ->
@@ -147,8 +163,19 @@ let load ~(repo_root : string) ~(manifest_path : string) : (t, string) result =
                            String.sub value 0 (String.length value - 3)
                          else value
                        in
+                       let path =
+                         String.split_on_char '/' (dir ^ "/" ^ name)
+                         |> List.filter (fun x -> x <> "")
+                       in
+                       let pkey = String.concat "::" path in
+                       if Util.StringSet.mem pkey !seen_path then
+                         errors :=
+                           Printf.sprintf "line %d: duplicate logical module path '%s'"
+                             (lineno + 1) pkey
+                           :: !errors;
+                       seen_path := Util.StringSet.add pkey !seen_path;
                        entries :=
-                         { path = String.split_on_char '/' (dir ^ "/" ^ name) |> List.filter (fun x -> x <> ""); file = rel;
+                         { path; file = rel;
                            real = ""; source = ""; source_hash = "" }
                          :: !entries
                      end
@@ -156,7 +183,29 @@ let load ~(repo_root : string) ~(manifest_path : string) : (t, string) result =
                      errors := Printf.sprintf "line %d: unknown record type '%s'" (lineno + 1) other :: !errors)
           end)
         lines;
-      if !errors <> [] then Error (String.concat "; " (List.rev !errors))
+      (* Version validation: a missing, non-integer, or unsupported
+         version is a hard failure — never a silent accept. *)
+      let version_errors =
+        match !version with
+        | None ->
+            [ Printf.sprintf "no version field (supported versions: %s)" (version_policy_message ()) ]
+        | Some v -> (
+            match int_of_string_opt v with
+            | None ->
+                [
+                  Printf.sprintf "malformed version '%s' (expected an integer; supported versions: %s)"
+                    v (version_policy_message ());
+                ]
+            | Some n ->
+                if List.mem n supported_versions then []
+                else
+                  [
+                    Printf.sprintf "unsupported version %d (supported versions: %s)" n
+                      (version_policy_message ());
+                  ])
+      in
+      if version_errors <> [] || !errors <> [] then
+        Error (String.concat "; " (version_errors @ List.rev !errors))
       else begin
         let entries = List.rev !entries in
         let canonical_seen = ref Util.StringSet.empty in
@@ -206,15 +255,26 @@ let with_entry_source (m : t) (path : string list) (bytes : string) : t =
   in
   { m with entries; fingerprint = fingerprint_of m.manifest_content m.version entries }
 
-let single ~(file : string) ~(path : string list) : t =
-  let source, source_hash =
+(* Adhoc single-module manifest (standalone corpus parsing). A source
+   that cannot be loaded is an Error: nothing falls back to a fabricated
+   empty source/hash snapshot (a trust root must not silently degrade
+   into empty input). The adhoc manifest carries an explicit supported
+   version (the current one by default), never a missing/arbitrary one. *)
+let single ?(version = List.hd supported_versions) ~(file : string) ~(path : string list) () :
+    (t, string) result =
+  if not (List.mem version supported_versions) then
+    Error
+      (Printf.sprintf "unsupported manifest version %d (supported versions: %s)" version
+         (version_policy_message ()))
+  else
     match Source_loader.load file with
-    | Ok s -> (s.Source.bytes, Sha256.digest s.Source.bytes)
-    | Error _ -> ("", "")
-  in
-  {
-    entries = [ { path; file; real = file; source; source_hash } ];
-    version = None;
-    fingerprint = "adhoc";
-    manifest_content = "";
-  }
+    | Error _ -> Error (Printf.sprintf "cannot read source file '%s'" file)
+    | Ok s ->
+        let source = s.Source.bytes in
+        Ok
+          {
+            entries = [ { path; file; real = file; source; source_hash = Sha256.digest source } ];
+            version = Some (string_of_int version);
+            fingerprint = "adhoc";
+            manifest_content = "";
+          }

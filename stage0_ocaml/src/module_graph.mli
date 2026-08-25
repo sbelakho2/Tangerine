@@ -1,4 +1,11 @@
-(* module_graph.mli — public surface. *)
+(* module_graph.mli — public surface.
+
+   Uniqueness contract: registering the same logical module path twice
+   (two manifest entries or two inline declarations resolving to one
+   path) hard-fails with Invalid_argument — a map entry is never
+   silently replaced. If two logical routes reach the same physical
+   source (same canonical `real`), the source module is modeled once and
+   the additional route is an alias pointing at the same node id. *)
 
 type module_node = {
   node_id : Ids.Module_id.t;

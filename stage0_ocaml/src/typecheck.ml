@@ -98,6 +98,11 @@ type state = {
   mutable current_item : string;
   mutable current_item_params : Ids.Generic_param_id.t list;
   oracle : oracle;
+  (* diagnostic-debt accounting (audit P1-1): per-module-path debt
+     reports, last round wins (mirrors the driver's errs_by_mod), and
+     the last emitted block so the printer only fires on change *)
+  mutable debt_by_module : (string * Debt_report.t) list;
+  mutable debt_last_printed : string;
 }
 
 type env = {
@@ -744,6 +749,9 @@ let initial_env () : env =
           o_derived_callables = [];
           o_deferred_params = [];
         };
+      debt_by_module = [];
+      debt_last_printed =
+        Debt_report.empty |> Debt_report.to_lines |> String.concat "\n";
     }
   in
   let types = builtin_types st in
@@ -3978,6 +3986,33 @@ let rec register_headers (env : env) (acc : string list) = function
           end
       | _ -> register_headers env acc rest)
 
+(* ────────────────────────────────────────────────────────────────
+   Diagnostic-debt accounting (audit P1-1).
+
+   The module's error list is classified into the fixed stable
+   categories and accumulated per module path (last round wins), so the
+   accumulated report always equals the driver's closure-wide error
+   total.  The machine-readable block is printed only when the
+   accumulated report changes; the LAST printed block is therefore the
+   closure's final debt report.  This is purely additive: no existing
+   error message or count is modified. *)
+
+let record_module_debt (env : env) (program : Ast.program) (errors : string list) : unit =
+  let st = env.state in
+  let key = String.concat "::" program.Ast.prog_module_path in
+  let rep = Debt_report.of_errors errors in
+  let by_mod =
+    if rep.Debt_report.total = 0 then List.remove_assoc key st.debt_by_module
+    else (key, rep) :: List.remove_assoc key st.debt_by_module
+  in
+  st.debt_by_module <- by_mod;
+  let block = Debt_report.to_lines (Debt_report.sum_reports (List.map snd by_mod)) in
+  let printed = String.concat "\n" block in
+  if printed <> st.debt_last_printed then begin
+    List.iter print_endline block;
+    st.debt_last_printed <- printed
+  end
+
 let check_program (env : env) (program : Ast.program) : (env * string list, string) result =
   (* Phase A: bare type names first (in-module mutual recursion). *)
   let env_h, header_errors = register_headers env [] program.Ast.items in
@@ -4019,7 +4054,12 @@ let check_program (env : env) (program : Ast.program) : (env * string list, stri
   in
   let* final_env, errors = go (header_errors @ reg_errors) program.Ast.items in
   let backstop = run_impl_backstop final_env in
-  Ok (final_env, errors @ backstop)
+  let all_errors = errors @ backstop in
+  record_module_debt final_env program all_errors;
+  Ok (final_env, all_errors)
+
+(* Public classification entry over the checker's error strings. *)
+let debt_report (errors : string list) : Debt_report.t = Debt_report.of_errors errors
 
 (* One-line oracle summary for reports. *)
 let oracle_report (env : env) : string =

@@ -18,7 +18,17 @@ let corpus_args () =
 let () =
   let file, module_path = corpus_args () in
   let diags = Diagnostic.create_bag () in
-  let manifest = Bootstrap_manifest.single ~file ~path:module_path in
+  let manifest =
+    match
+      Bootstrap_manifest.single
+        ~version:(List.hd Bootstrap_manifest.supported_versions)
+        ~file ~path:module_path ()
+    with
+    | Ok m -> m
+    | Error e ->
+        Printf.eprintf "self-check: cannot load single-module manifest for %s: %s\n" file e;
+        exit 1
+  in
   let graph = Module_graph.create manifest diags in
   let resolved = Resolver.resolve manifest graph diags in
   Printf.printf "self-check: %s\n" file;

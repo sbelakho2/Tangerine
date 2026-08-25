@@ -11,6 +11,13 @@
    FIFO queue.
 
    Rules enforced:
+   - substitution arity is EXACT: the template's own instance declares
+     its generic parameters in declaration order ([Type_param T;
+     Type_param U] for f[T,U]); the requested instance must carry
+     exactly that many type arguments, paired positionally — extra
+     arguments, missing arguments and declaration-order disagreement are
+     internal errors (the lowerer must preserve generic substitutions
+     through lowering);
    - every instance is specialized AT MOST once (a seen-set by instance);
    - duplicate instances must be identical: re-discovering an instance
      re-specializes it and compares structurally with the cached body —
@@ -44,22 +51,35 @@ let find_template (prog : program) (inst : Instance_id.t) : function_ option =
 
 (* The substitution map: the template's own instance type arguments
    declare its parameter ids positionally (Type_param 0, 1, ...); the
-   requested instance's type arguments are the concrete substitutes. *)
+   requested instance's type arguments are the concrete substitutes.
+   Substitution arity is EXACT: template and instance must carry the
+   same number of type arguments, else the input program is internally
+   inconsistent (the audit's arity contract: extra arguments, missing
+   arguments and declaration-order disagreement are internal errors).
+   Entries are paired positionally — template arg i substitutes
+   instance arg i, so declaration order is authoritative.  The error is
+   reported through build's errors list (this file's convention); the
+   result type also lets specialize raise a Seed_bug backstop for
+   direct (non-build) callers. *)
 let substitution (tmpl : function_) (inst : Instance_id.t) :
-    (Ids.Generic_param_id.t * Type_repr.t) list =
-  let n =
-    min
-      (Array.length (Instance_id.type_args tmpl.instance))
-      (Array.length (Instance_id.type_args inst))
-  in
-  let rec go i acc =
-    if i >= n then List.rev acc
-    else
-      match (Instance_id.type_args tmpl.instance).(i) with
-      | Type_repr.Type_param pid -> go (i + 1) ((pid, (Instance_id.type_args inst).(i)) :: acc)
-      | _ -> go (i + 1) acc
-  in
-  go 0 []
+    ((Ids.Generic_param_id.t * Type_repr.t) list, string) result =
+  let nt = Array.length (Instance_id.type_args tmpl.instance) in
+  let ni = Array.length (Instance_id.type_args inst) in
+  if nt <> ni then
+    Error
+      (Printf.sprintf
+         "monomorphization internal error: template arity %d != instance arity %d for callable %d"
+         nt ni (Ids.Callable_id.to_int (Instance_id.callable tmpl.instance)))
+  else
+    let rec go i acc =
+      if i >= ni then Ok (List.rev acc)
+      else
+        match (Instance_id.type_args tmpl.instance).(i) with
+        | Type_repr.Type_param pid ->
+            go (i + 1) ((pid, (Instance_id.type_args inst).(i)) :: acc)
+        | _ -> go (i + 1) acc
+    in
+    go 0 []
 
 let subst_instance (subst : (Ids.Generic_param_id.t * Type_repr.t) list)
     (inst : Instance_id.t) : Instance_id.t =
@@ -73,9 +93,10 @@ let subst_instance (subst : (Ids.Generic_param_id.t * Type_repr.t) list)
 (* Specialize a template under an instance: every embedded type is
    substituted (params, locals, cast targets, callee instances, function
    constants, closure aggregates).  The result carries the requested
-   instance as its identity. *)
-let specialize (tmpl : function_) (inst : Instance_id.t) : function_ =
-  let subst = substitution tmpl inst in
+   instance as its identity.  The substitution is applied positionally
+   from the template's declaration order. *)
+let specialize_under (subst : (Ids.Generic_param_id.t * Type_repr.t) list)
+    (tmpl : function_) (inst : Instance_id.t) : function_ =
   let subst_ty =
     Type_repr.substitute subst
   in
@@ -135,12 +156,22 @@ let specialize (tmpl : function_) (inst : Instance_id.t) : function_ =
     entry = tmpl.entry;
   }
 
+(* specialize: compute the exact-arity substitution and specialize.
+   An arity disagreement is an internal error; build() reports it
+   through the errors list before reaching this, so the raise here is a
+   backstop for direct callers (instantiate) only. *)
+let specialize (tmpl : function_) (inst : Instance_id.t) : function_ =
+  match substitution tmpl inst with
+  | Ok subst -> specialize_under subst tmpl inst
+  | Error m -> raise (Mir_lower.Seed_bug m)
+
 (* instantiate: substitute the Type_params of the template registered
    under inst's callable.  None when the program has no template for the
-   instance (callable not found).  The returned body may still carry
-   Type_params when the instance's type arguments do not cover the
-   template's declared parameters — build rejects that case
-   fail-closed. *)
+   instance (callable not found).  An exact-arity disagreement raises
+   (internal error; build reports it through the errors list instead).
+   The returned body may still carry Type_params when the instance's
+   type arguments do not cover the template's declared parameters —
+   build rejects that case fail-closed. *)
 let instantiate (prog : program) (inst : Instance_id.t) : function_ option =
   match find_template prog inst with
   | None -> None
@@ -240,13 +271,24 @@ let build ~(entry : Instance_id.t) (prog : program) : (function_ array, string l
       | Some (Function inst) -> enqueue_instance inst
       | _ -> ())
     prog.statics;
-  (* drain: specialize each work item, then re-walk its calls *)
+  (* drain: specialize each work item, then re-walk its calls.
+     Nested-substitution chaining: the caller's substitution is applied
+     to every instance embedded in its body — callee instances,
+     function constants, closure aggregates — BEFORE the callee is
+     enqueued, so a generic caller calling a generic callee (the callee
+     instance carries the caller's Type_params) specializes the callee
+     against the SUBSTITUTED arguments and memoizes by them (the
+     seen-set and cache hold post-substitution instances).  An arity
+     disagreement is an internal error reported through the errors list;
+     the mismatched work item is skipped (it cannot produce a body). *)
   while not (Queue.is_empty queue) do
     let wi = Queue.pop queue in
-    let body = specialize wi.fn wi.instance in
-    cache := (wi.instance, body) :: !cache;
-    let subst = substitution wi.fn wi.instance in
-    walk_instances body (fun inst -> enqueue_instance (subst_instance subst inst))
+    match substitution wi.fn wi.instance with
+    | Error m -> err m
+    | Ok subst ->
+        let body = specialize_under subst wi.fn wi.instance in
+        cache := (wi.instance, body) :: !cache;
+        walk_instances body (fun inst -> enqueue_instance (subst_instance subst inst))
   done;
   (* final validation: every embedded instance is concrete and
      specialized; every body is concrete; the output is self-contained *)

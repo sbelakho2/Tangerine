@@ -7,6 +7,16 @@
    order (0, 1, 2, ...), inline modules immediately after their enclosing
    file module in pre-order DFS.
 
+   Uniqueness and alias semantics:
+   - Registering the same logical module path twice — two manifest
+     entries, or two inline declarations resolving to one path — is a
+     hard failure (raised), never a silent map replacement.
+   - If two logical routes reach the same physical source (same
+     canonical `real` path), the source module is modeled exactly once:
+     the additional route is an alias edge pointing at the same node id.
+     No node is dropped and no second copy is parsed, so identity is
+     semantic and deterministic under both routes.
+
    All iteration over the graph is deterministic (lists in construction
    order, Maps keyed by path/id). There is no Hashtbl iteration anywhere. *)
 
@@ -97,14 +107,19 @@ and create_with_parser
   let by_path = ref SMap.empty in
   let by_id = ref IntMap.empty in
   let children = ref IntMap.empty in
+  let by_real = ref SMap.empty in  (* canonical real path -> file module id *)
   let assign_id () =
     let i = !next_id in
     incr next_id;
     Ids.Module_id.make i
   in
   let add_node (node : module_node) =
+    let key = join_path node.node_path in
+    if SMap.mem key !by_path then
+      invalid_arg
+        (Printf.sprintf "module_graph: logical module path '%s' registered twice" key);
     nodes := node :: !nodes;
-    by_path := SMap.add (join_path node.node_path) (Ids.Module_id.to_int node.node_id) !by_path;
+    by_path := SMap.add key (Ids.Module_id.to_int node.node_id) !by_path;
     by_id := IntMap.add (Ids.Module_id.to_int node.node_id) node !by_id;
     children := IntMap.add (Ids.Module_id.to_int node.node_id) [] !children;
     item_count := !item_count + List.length node.node_items
@@ -146,22 +161,37 @@ and create_with_parser
   in
   List.iter
     (fun entry ->
-      match parse sm entry diags with
-      | None -> ()
-      | Some program ->
-          let fid = assign_id () in
-          let fnode =
-            {
-              node_id = fid;
-              node_path = entry.Bootstrap_manifest.path;
-              node_file = entry.Bootstrap_manifest.file;
-              node_parent = None;
-              node_items = program.Ast.items;
-              node_program = program;
-            }
-          in
-          add_node fnode;
-          collect_inline fnode program.Ast.items)
+      let key = join_path entry.Bootstrap_manifest.path in
+      match SMap.find_opt entry.Bootstrap_manifest.real !by_real with
+      | Some existing ->
+          (* A second logical route to the same physical source: model
+             the source module once; the additional route is an alias
+             edge pointing at the same node id. No node is dropped and
+             the file is not re-parsed, so the graph is deterministic
+             under both routes. *)
+          if SMap.mem key !by_path then
+            invalid_arg
+              (Printf.sprintf "module_graph: logical module path '%s' registered twice" key);
+          by_path := SMap.add key existing !by_path
+      | None ->
+          (match parse sm entry diags with
+           | None -> ()
+           | Some program ->
+               let fid = assign_id () in
+               by_real :=
+                 SMap.add entry.Bootstrap_manifest.real (Ids.Module_id.to_int fid) !by_real;
+               let fnode =
+                 {
+                   node_id = fid;
+                   node_path = entry.Bootstrap_manifest.path;
+                   node_file = entry.Bootstrap_manifest.file;
+                   node_parent = None;
+                   node_items = program.Ast.items;
+                   node_program = program;
+                 }
+               in
+               add_node fnode;
+               collect_inline fnode program.Ast.items))
     (Bootstrap_manifest.entries manifest);
   let nodes = List.rev !nodes in
   {
