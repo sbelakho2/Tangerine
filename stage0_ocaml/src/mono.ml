@@ -62,7 +62,7 @@ let find_template (prog : program) (inst : Instance_id.t) : function_ option =
    result type also lets specialize raise a Seed_bug backstop for
    direct (non-build) callers. *)
 let substitution (tmpl : function_) (inst : Instance_id.t) :
-    ((Ids.Generic_param_id.t * Type_repr.t) list, string) result =
+    ((Type_repr.generic_key * Type_repr.t) list, string) result =
   let nt = Array.length (Instance_id.type_args tmpl.instance) in
   let ni = Array.length (Instance_id.type_args inst) in
   if nt <> ni then
@@ -76,12 +76,12 @@ let substitution (tmpl : function_) (inst : Instance_id.t) :
       else
         match (Instance_id.type_args tmpl.instance).(i) with
         | Type_repr.Type_param pid ->
-            go (i + 1) ((pid, (Instance_id.type_args inst).(i)) :: acc)
+            go (i + 1) ((Type_repr.KParam pid, (Instance_id.type_args inst).(i)) :: acc)
         | _ -> go (i + 1) acc
     in
     go 0 []
 
-let subst_instance (subst : (Ids.Generic_param_id.t * Type_repr.t) list)
+let subst_instance (subst : (Type_repr.generic_key * Type_repr.t) list)
     (inst : Instance_id.t) : Instance_id.t =
   Instance_id.make
     ~callable:(Instance_id.callable inst)
@@ -95,7 +95,7 @@ let subst_instance (subst : (Ids.Generic_param_id.t * Type_repr.t) list)
    constants, closure aggregates).  The result carries the requested
    instance as its identity.  The substitution is applied positionally
    from the template's declaration order. *)
-let specialize_under (subst : (Ids.Generic_param_id.t * Type_repr.t) list)
+let specialize_under (subst : (Type_repr.generic_key * Type_repr.t) list)
     (tmpl : function_) (inst : Instance_id.t) : function_ =
   let subst_ty =
     Type_repr.substitute subst

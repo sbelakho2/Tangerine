@@ -231,6 +231,9 @@ let rec print_type (t : Type_repr.t) : string =
               (Array.map (fun p -> print_type p.Type_repr.pt_type) params)))
         (print_type ret)
   | Type_repr.Type_param id -> Printf.sprintf "T%d" (Ids.Generic_param_id.to_int id)
+  | Type_repr.Infer_var v -> Printf.sprintf "?#%d" v
+  | Type_repr.Int_literal _ -> "int-literal"
+  | Type_repr.Error -> "error"
   | Type_repr.Never -> "!"
 
 and print_int_kind = function

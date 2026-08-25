@@ -811,6 +811,7 @@ let initial_env () : env =
 let rec occurs (needle : Ids.Generic_param_id.t) (ty : Type_repr.t) : bool =
   match ty with
   | Type_repr.Type_param id -> Ids.Generic_param_id.compare id needle = 0
+  | Type_repr.Infer_var _ | Type_repr.Int_literal _ | Type_repr.Error -> false
   | Type_repr.Raw_ptr (_, t) | Type_repr.Ref_internal (_, t) | Type_repr.Fixed_array (t, _) ->
       occurs needle t
   | Type_repr.Tuple elems | Type_repr.Named (_, elems) -> Array.exists (occurs needle) elems
@@ -820,16 +821,16 @@ let rec occurs (needle : Ids.Generic_param_id.t) (ty : Type_repr.t) : bool =
   | Type_repr.String | Type_repr.Never ->
       false
 
-let rec resolve_param (subst : (Ids.Generic_param_id.t * Type_repr.t) list)
+let rec resolve_param (subst : (Type_repr.generic_key * Type_repr.t) list)
     (id : Ids.Generic_param_id.t) : Type_repr.t option =
-  match List.assoc_opt id subst with
+  match List.assoc_opt (Type_repr.KParam id) subst with
   | Some (Type_repr.Type_param id2) -> (
       if Ids.Generic_param_id.compare id2 id = 0 then Some (Type_repr.Type_param id)
       else match resolve_param subst id2 with Some t -> Some t | None -> Some (Type_repr.Type_param id))
   | Some t -> Some t
   | None -> None
 
-let rec unify (subst : (Ids.Generic_param_id.t * Type_repr.t) list ref) (a : Type_repr.t)
+let rec unify (subst : (Type_repr.generic_key * Type_repr.t) list ref) (a : Type_repr.t)
     (b : Type_repr.t) : (unit, string) result =
   let a' =
     match a with
@@ -853,13 +854,13 @@ let rec unify (subst : (Ids.Generic_param_id.t * Type_repr.t) list ref) (a : Typ
   | Type_repr.Type_param pa, _ ->
       if occurs pa b' then Error "recursive type"
       else begin
-        subst := (pa, b') :: !subst;
+        subst := (Type_repr.KParam pa, b') :: !subst;
         Ok ()
       end
   | _, Type_repr.Type_param pb ->
       if occurs pb a' then Error "recursive type"
       else begin
-        subst := (pb, a') :: !subst;
+        subst := (Type_repr.KParam pb, a') :: !subst;
         Ok ()
       end
   | Type_repr.Named (id1, a1), Type_repr.Named (id2, a2) ->
@@ -906,7 +907,7 @@ let rec unify (subst : (Ids.Generic_param_id.t * Type_repr.t) list ref) (a : Typ
   | _ -> Error "type mismatch"
 
 (* Substitute through the bindings until fixpoint. *)
-let substitute_fixpoint (subst : (Ids.Generic_param_id.t * Type_repr.t) list) (ty : Type_repr.t) :
+let substitute_fixpoint (subst : (Type_repr.generic_key * Type_repr.t) list) (ty : Type_repr.t) :
     Type_repr.t =
   let rec go n ty =
     let ty' =
@@ -922,6 +923,7 @@ let params_in (ty : Type_repr.t) : Ids.Generic_param_id.t list =
   let rec walk ty =
     match ty with
     | Type_repr.Type_param id -> if not (List.mem id !acc) then acc := id :: !acc
+    | Type_repr.Infer_var _ | Type_repr.Int_literal _ | Type_repr.Error -> ()
     | Type_repr.Raw_ptr (_, t) | Type_repr.Ref_internal (_, t) | Type_repr.Fixed_array (t, _) ->
         walk t
     | Type_repr.Tuple elems | Type_repr.Named (_, elems) -> Array.iter walk elems
@@ -964,6 +966,9 @@ let rec type_to_string (ty : Type_repr.t) : string =
                 ps))
       ^ ") -> " ^ type_to_string r
   | Type_repr.Type_param id -> "P#" ^ string_of_int (Ids.Generic_param_id.to_int id)
+  | Type_repr.Infer_var v -> "?#" ^ string_of_int v
+  | Type_repr.Int_literal _ -> "int-literal"
+  | Type_repr.Error -> "error"
 
 (* ────────────────────────────────────────────────────────────────
    Constant evaluation (bootstrap: integer literal constants) *)
@@ -1123,7 +1128,7 @@ and resolve_named (env : env) (scope : scope) (span : Span.span) (name : string)
                              (Printf.sprintf "type `%s` expects %d type argument(s), got %d" name
                                 (List.length params) (List.length rargs)))
                       else begin
-                        let subst = List.map2 (fun p a -> (p, a)) params rargs in
+                        let subst = List.map2 (fun p a -> (Type_repr.KParam p, a)) params rargs in
                         Ok (substitute_fixpoint subst entry)
                       end)))))
 
@@ -1262,7 +1267,7 @@ let rec check_pattern (env : env) (scope : scope) (ty : Type_repr.t) (p : Ast.pa
       match resolve_nominal env span name with
       | Error m -> Error m
       | Ok (nom, _, args) when nom.nom_kind = `Struct -> (
-          let subst = List.map2 (fun (_, p) a -> (p, a)) nom.nom_params (Array.to_list args) in
+          let subst = List.map2 (fun (_, p) a -> (Type_repr.KParam p, a)) nom.nom_params (Array.to_list args) in
           let field_ty (fname : string) : (Type_repr.t, string) result =
             match List.assoc_opt fname nom.nom_fields with
             | Some ft -> Ok (substitute_fixpoint subst ft)
@@ -1336,7 +1341,7 @@ and resolve_variant (env : env) (_scope : scope) (span : Span.span) (seg1 : stri
             | Some nom when nom.nom_kind = `Enum -> (
                 match List.assoc_opt seg2 nom.nom_variants with
                 | Some field_tys ->
-                    let subst = List.map2 (fun (_, p) a -> (p, a)) nom.nom_params (Array.to_list args) in
+                    let subst = List.map2 (fun (_, p) a -> (Type_repr.KParam p, a)) nom.nom_params (Array.to_list args) in
                     Ok (Array.map (substitute_fixpoint subst) field_tys, name)
                 | None ->
                     env.state.oracle.o_unknown_variants <- env.state.oracle.o_unknown_variants + 1;
@@ -1357,7 +1362,7 @@ and resolve_variant (env : env) (_scope : scope) (span : Span.span) (seg1 : stri
               | Type_repr.Named (sid, sargs) when Ids.Type_id.compare sid tid = 0 -> sargs
               | _ -> args
             in
-            let subst = List.map2 (fun (_, p) a -> (p, a)) nom.nom_params (Array.to_list sargs) in
+            let subst = List.map2 (fun (_, p) a -> (Type_repr.KParam p, a)) nom.nom_params (Array.to_list sargs) in
             Ok (Array.map (substitute_fixpoint subst) field_tys, seg1)
         | None ->
             env.state.oracle.o_unknown_variants <- env.state.oracle.o_unknown_variants + 1;
@@ -1547,7 +1552,7 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
                  (Printf.sprintf "struct `%s` expects %d type argument(s), got %d" name
                     (List.length nom.nom_params) (Array.length lit_args)))
           else begin
-            let subst = List.map2 (fun (_, p) a -> (p, a)) nom.nom_params (Array.to_list lit_args) in
+            let subst = List.map2 (fun (_, p) a -> (Type_repr.KParam p, a)) nom.nom_params (Array.to_list lit_args) in
             let rec go acc = function
               | [] -> Ok (List.rev acc)
               | (fname, fe) :: fs -> (
@@ -2150,7 +2155,7 @@ and check_closure (env : env) (scope : scope) (expected : Type_repr.t option)
 
 and return_ret_err m = Error m
 
-and check_binary (subst : (Ids.Generic_param_id.t * Type_repr.t) list ref) (op : Ast.binary_op)
+and check_binary (subst : (Type_repr.generic_key * Type_repr.t) list ref) (op : Ast.binary_op)
     (lt : Type_repr.t) (rt : Type_repr.t) : (Type_repr.t, string) result =
   match op with
   | Ast.BAnd | Ast.BOr -> (
@@ -2247,7 +2252,7 @@ and check_field (env : env) (_scope : scope) (span : Span.span) (base : typed_ex
               | Some nom when nom.nom_kind = `Struct -> (
                   match List.assoc_opt fname nom.nom_fields with
                   | Some ft ->
-          let subst = List.map2 (fun (_, p) a -> (p, a)) nom.nom_params (Array.to_list args) in
+          let subst = List.map2 (fun (_, p) a -> (Type_repr.KParam p, a)) nom.nom_params (Array.to_list args) in
                       Ok
                         {
                           te_type = substitute_fixpoint subst ft;
@@ -2589,9 +2594,9 @@ and check_call_sig (env : env) (scope : scope) (expected : Type_repr.t option)
       in
       go [] targs
     in
-    let subst : (Ids.Generic_param_id.t * Type_repr.t) list ref = ref [] in
+    let subst : (Type_repr.generic_key * Type_repr.t) list ref = ref [] in
     List.iter2
-      (fun (_, pid) t -> subst := (pid, t) :: !subst)
+      (fun (_, pid) t -> subst := (Type_repr.KParam pid, t) :: !subst)
       (List.filteri (fun i _ -> i < List.length expl) sig_.ts_params_decl)
       expl;
     let* tes, effects =
@@ -2609,7 +2614,8 @@ and check_call_sig (env : env) (scope : scope) (expected : Type_repr.t option)
                   match unify s2 pt ate.te_type with
                   | Ok () -> (
                       List.iter
-                        (fun (k, v) -> if not (List.mem_assoc k !subst) then subst := (k, v) :: !subst)
+                        (fun (k, v) ->
+                          if not (List.mem_assoc k !subst) then subst := (k, v) :: !subst)
                         !s2;
                       let eff = Access_effect.read_effect sig_.ts_params.(i).Type_repr.pt_convention in
                       go (ate :: acc) (eff :: effects) (i + 1) rest)
@@ -2767,10 +2773,10 @@ and check_call_sig (env : env) (scope : scope) (expected : Type_repr.t option)
        | _ :: _, None ->
            List.iter
              (fun p ->
-               if not (List.mem_assoc p !subst) then begin
+               if not (List.mem_assoc (Type_repr.KParam p) !subst) then begin
                  let fresh = Ids.Generic_param_id.make env.state.next_param_id in
                  env.state.next_param_id <- env.state.next_param_id + 1;
-                 subst := (p, Type_repr.Type_param fresh) :: !subst
+                 subst := (Type_repr.KParam p, Type_repr.Type_param fresh) :: !subst
                end)
              residual
        | _ :: _, Some _ -> ());
@@ -2794,7 +2800,7 @@ and check_call_sig (env : env) (scope : scope) (expected : Type_repr.t option)
         Array.of_list
           (List.map
              (fun (_, pid) ->
-               match List.assoc_opt pid !subst with
+               match List.assoc_opt (Type_repr.KParam pid) !subst with
                | Some t -> substitute_fixpoint !subst t
                | None -> Type_repr.Type_param pid)
              sig_.ts_params_decl)
@@ -2883,7 +2889,7 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
           if Array.length sig_.ts_params = 0 then
             Error (err span "internal: method signature without a receiver")
           else begin
-            let subst : (Ids.Generic_param_id.t * Type_repr.t) list ref = ref [] in
+            let subst : (Type_repr.generic_key * Type_repr.t) list ref = ref [] in
             let self_ty = sig_.ts_params.(0).Type_repr.pt_type in
             let* () =
               match owner_ty, self_ty with
@@ -2972,7 +2978,7 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
                 go [] targs
               in
               List.iter2
-                (fun (_, pid) t -> subst := (pid, t) :: !subst)
+                (fun (_, pid) t -> subst := (Type_repr.KParam pid, t) :: !subst)
                 (List.filteri (fun i _ -> i < List.length expl) sig_.ts_params_decl)
                 expl;
               let* tes, arg_effects =
@@ -3072,7 +3078,7 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
                   Array.of_list
                     (List.map
                        (fun (_, pid) ->
-                         match List.assoc_opt pid !subst with
+                         match List.assoc_opt (Type_repr.KParam pid) !subst with
                          | Some t -> substitute_fixpoint !subst t
                          | None -> Type_repr.Type_param pid)
                        sig_.ts_params_decl)

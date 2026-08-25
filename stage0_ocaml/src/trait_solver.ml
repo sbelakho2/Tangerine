@@ -104,7 +104,7 @@ let rec is_copy (ty : Type_repr.t) : bool =
   | Type_repr.Raw_ptr _ | Type_repr.Ref_internal _ -> true
   | Type_repr.Tuple elems -> Array.for_all is_copy elems
   | Type_repr.Fixed_array (inner, _) -> is_copy inner
-  | Type_repr.Named _ | Type_repr.Function _ | Type_repr.Type_param _ -> false
+  | Type_repr.Named _ | Type_repr.Function _ | Type_repr.Type_param _ | Type_repr.Infer_var _ | Type_repr.Int_literal _ | Type_repr.Error -> false
 
 (* Canonical identity key of a type for the recursion guard. *)
 let rec type_key (ty : Type_repr.t) : string =
@@ -131,6 +131,9 @@ let rec type_key (ty : Type_repr.t) : string =
       ^ String.concat "," (Array.to_list (Array.map (fun p -> type_key p.Type_repr.pt_type) params))
       ^ ")->" ^ type_key ret
   | Type_repr.Type_param id -> "P#" ^ string_of_int (Ids.Generic_param_id.to_int id)
+  | Type_repr.Infer_var v -> "V#" ^ string_of_int v
+  | Type_repr.Int_literal _ -> "INTLIT"
+  | Type_repr.Error -> "ERR"
 
 let obligation_key (ob : obligation) : string =
   ob.trait_name ^ "<" ^ String.concat "," (Array.to_list (Array.map type_key ob.type_args))
@@ -147,13 +150,13 @@ let structurally_equal (a : Type_repr.t) (b : Type_repr.t) : bool =
 
 (* Unify the impl's target type with the obligation's self type, binding
    the impl's generic parameters (the substitution is returned). *)
-let rec unify_target (subst : (Ids.Generic_param_id.t * Type_repr.t) list)
-    (a : Type_repr.t) (b : Type_repr.t) : (Ids.Generic_param_id.t * Type_repr.t) list option =
+let rec unify_target (subst : (Type_repr.generic_key * Type_repr.t) list)
+    (a : Type_repr.t) (b : Type_repr.t) : (Type_repr.generic_key * Type_repr.t) list option =
   match a with
   | Type_repr.Type_param id ->
-      (match List.assoc_opt id subst with
+      (match List.assoc_opt (Type_repr.KParam id) subst with
        | Some s -> if structurally_equal s b then Some subst else None
-       | None -> Some ((id, b) :: subst))
+       | None -> Some ((Type_repr.KParam id, b) :: subst))
   | _ -> (
       match b with
       | Type_repr.Type_param _ -> None

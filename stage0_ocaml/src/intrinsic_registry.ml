@@ -154,6 +154,9 @@ let rec ty_to_string (ty : Type_repr.t) : string =
         (String.concat ", " (Array.to_list (Array.map render params)))
         (ty_to_string ret)
   | Type_repr.Type_param id -> Printf.sprintf "T%d" (Ids.Generic_param_id.to_int id)
+  | Type_repr.Infer_var v -> Printf.sprintf "?#%d" v
+  | Type_repr.Int_literal _ -> "int-literal"
+  | Type_repr.Error -> "error"
   | Type_repr.Never -> "!"
 
 let signature_to_string (s : signature) : string =

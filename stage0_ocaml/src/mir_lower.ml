@@ -279,12 +279,12 @@ let rec copyable_ty (t : Type_repr.t) : bool =
   match t with
   | Type_repr.Unit | Type_repr.Bool | Type_repr.Char | Type_repr.Int _
   | Type_repr.Float _ | Type_repr.Raw_ptr _ | Type_repr.Ref_internal _
-  | Type_repr.Function _ | Type_repr.Never ->
+  | Type_repr.Function _ | Type_repr.Never | Type_repr.Error ->
       true
   | Type_repr.String -> false
   | Type_repr.Tuple elems -> Array.for_all copyable_ty elems
   | Type_repr.Fixed_array (e, _) -> copyable_ty e
-  | Type_repr.Named _ | Type_repr.Type_param _ -> false
+  | Type_repr.Named _ | Type_repr.Type_param _ | Type_repr.Infer_var _ | Type_repr.Int_literal _ -> false
 
 (* ── Defer machinery ─────────────────────────────────────────────
 
@@ -414,7 +414,7 @@ let rec type_of_syntax (env : func_env) (t : Ast.type_expr) : Type_repr.t =
       | Some r ->
           let subst =
             List.mapi
-              (fun i _ -> (Ids.Generic_param_id.make i, type_of_syntax env (List.nth args i)))
+              (fun i _ -> (Type_repr.KParam (Ids.Generic_param_id.make i), type_of_syntax env (List.nth args i)))
               args
           in
           Type_repr.substitute subst r
@@ -438,7 +438,7 @@ let rec type_of_syntax (env : func_env) (t : Ast.type_expr) : Type_repr.t =
   | Ast.Slice (inner, _) -> Type_repr.Fixed_array (type_of_syntax env inner, 0)
   | Ast.Option (inner, _) -> (
       match List.assoc_opt "Option" env.types with
-      | Some r -> Type_repr.substitute [ (Ids.Generic_param_id.make 0, type_of_syntax env inner) ] r
+      | Some r -> Type_repr.substitute [ (Type_repr.KParam (Ids.Generic_param_id.make 0), type_of_syntax env inner) ] r
       | None -> seed_bug "Option type not in env")
   | Ast.Ref (inner, m, _) -> Type_repr.Ref_internal ((if m then Type_repr.Mutable else Type_repr.Immutable), type_of_syntax env inner)
   | Ast.RawPtr (inner, m, _) -> Type_repr.Raw_ptr ((if m then Type_repr.Mutable else Type_repr.Immutable), type_of_syntax env inner)

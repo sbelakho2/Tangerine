@@ -49,6 +49,12 @@ let rec type_key (ty : Type_repr.t) : string =
   | Type_repr.Fixed_array (t, _) -> "[" ^ type_key t ^ "]"
   | Type_repr.Raw_ptr (_, t) -> "ptr<" ^ type_key t ^ ">"
   | Type_repr.Ref_internal (_, t) -> "ref<" ^ type_key t ^ ">"
+  | Type_repr.Infer_var v -> Printf.sprintf "?#%d" v
+
+  | Type_repr.Int_literal _ -> "int-literal"
+
+  | Type_repr.Error -> "error"
+
   | Type_repr.Type_param id -> "P#" ^ string_of_int (Ids.Generic_param_id.to_int id)
   | Type_repr.Function (ps, r) ->
       "fn(" ^ String.concat "," (Array.to_list (Array.map (fun p -> type_key p.Type_repr.pt_type) ps)) ^ ")->" ^ type_key r

@@ -122,7 +122,7 @@ let rec is_copy (ctx : ctx) (seen : Ids.Type_id.t list) (ty : Type_repr.t) : boo
         match find_type ctx tid with
         | None -> false
         | Some def -> is_copy ctx (tid :: seen) def)
-  | Type_repr.Type_param _ -> false
+  | Type_repr.Type_param _ | Type_repr.Infer_var _ | Type_repr.Int_literal _ | Type_repr.Error -> false
 
 (* Type compatibility after Named resolution.  Function param
    CONVENTIONS are deliberately ignored: they are a call-site concern

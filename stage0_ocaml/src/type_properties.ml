@@ -44,7 +44,8 @@ and of_type (ty : Type_repr.t) : t =
       ignore id;
       owned
   | Type_repr.Function _ -> scalar
-  | Type_repr.Type_param _ -> owned (* conservative *)
+  | Type_repr.Type_param _ | Type_repr.Infer_var _ | Type_repr.Int_literal _ | Type_repr.Error ->
+      owned (* conservative *)
   | Type_repr.Never -> scalar
 
 (* Named-type property with the resolver's def table (binds the name). *)
