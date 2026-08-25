@@ -147,6 +147,52 @@ let () =
       Printf.printf "lowersurface: %s\n" file;
       Printf.printf "  parse: %d items\n" (List.length program.Ast.items);
       let env = Typecheck.initial_env () in
+      (* closure materialization proof (audit P0-8): concrete nominals
+         and consts from the typed registry cross into Seed MIR *)
+      let mat_src = {|
+struct Point
+  x: Int
+  y: Int
+end
+const MAX_POINTS: Int = 10
+def main() -> Int
+  0
+end
+|} in
+      (match Source_loader.load_string "<mat>" mat_src with
+       | Error _ -> failwith "mat source load"
+       | Ok src2 ->
+           let sm2 = Span.create () in
+           let fid2 = Span.add_file sm2 src2.Source.name src2 in
+           let diags2 = Diagnostic.create_bag () in
+           let lx2 = Lexer.create src2.Source.bytes fid2 diags2 in
+           let toks2 = Lexer.lex lx2 in
+           let mat_prog = Parser.parse toks2 src2.Source.bytes fid2 diags2 [ "mat" ] in
+           (match Typecheck.check_program (Typecheck.initial_env ()) mat_prog with
+            | Error m -> failwith ("mat typecheck: " ^ m)
+            | Ok (env_m, errs) ->
+                if errs <> [] then failwith ("mat typecheck errors: " ^ String.concat "; " errs)
+                else begin
+                  let tys = Driver.closure_types env_m in
+                  let sts = Driver.closure_statics env_m in
+                  let struct_ok =
+                    Array.exists
+                      (fun d ->
+                        match d with
+                        | Seed_mir.StructDef { sd_fields; _ } -> List.length sd_fields = 2
+                        | _ -> false)
+                      tys
+                  in
+                  let static_ok = Array.exists (fun (n, _, _) -> n = "mat::MAX_POINTS") sts in
+                  if struct_ok && static_ok then
+                    Printf.printf
+                      "  closure materialization: PASS (Point struct def + MAX_POINTS static from the typed registry)\n"
+                  else begin
+                    Printf.printf "  closure materialization: FAIL (struct_ok=%b static_ok=%b)\n"
+                      struct_ok static_ok;
+                    exit 1
+                  end
+                end));
       let tcheck_env =
         match Typecheck.check_program env program with
         | Error m -> Printf.printf "  typecheck: FAIL %s\n" m; exit 1

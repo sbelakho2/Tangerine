@@ -709,6 +709,65 @@ let run_closure_pipeline ~(repo_root : string) ~(manifest_path : string) ~(targe
 
 (* Lower every top-level free function of the closure into one Seed MIR
    program (flat namespace; shared by bootstrap-check and compile). *)
+(* Materialize program.types from the typed nominal registry (audit P0-8):
+   concrete (non-generic) structs/enums become StructDef/EnumDef entries
+   with deterministic field/variant identities; generic nominals are
+   deferred to post-mono (the seed types table is concrete-only by
+   contract). *)
+let closure_types (env : Typecheck.env) : Seed_mir.type_def array =
+  Array.of_list
+    (List.filter_map
+       (fun (name, nom : string * Typecheck.nominal) ->
+         match List.assoc_opt name env.Typecheck.type_ids with
+         | None -> None
+         | Some tid ->
+             if nom.Typecheck.nom_params <> [] then None
+             else
+               (match nom.Typecheck.nom_kind with
+                | `Struct ->
+                    Some
+                      (Seed_mir.StructDef
+                         {
+                           sd_id = tid;
+                           sd_fields =
+                             List.mapi
+                               (fun i (_, fty) ->
+                                 {
+                                   Seed_mir.fd_id = Ids.Field_id.make (i + 1);
+                                   fd_index = Ids.Field_index.make i;
+                                   fd_ty = fty;
+                                 })
+                               nom.Typecheck.nom_fields;
+                         })
+                | `Enum ->
+                    Some
+                      (Seed_mir.EnumDef
+                         {
+                           ed_id = tid;
+                           ed_variants =
+                             List.mapi
+                               (fun i (_, pty) ->
+                                 {
+                                   Seed_mir.vd_id = Ids.Variant_id.make (i + 1);
+                                   vd_index = Ids.Variant_index.make i;
+                                   vd_payload =
+                                     (if Array.length pty = 0 then Type_repr.Unit
+                                      else Type_repr.Tuple pty);
+                                 })
+                               nom.Typecheck.nom_variants;
+                         })))
+       env.Typecheck.nominals)
+
+(* Materialize program.statics from the typed const registry: declared
+   with their types; initializers arrive with the typed-expression
+   channel (the subset firewall rejects const uses until then). *)
+let closure_statics (env : Typecheck.env) : (string * Type_repr.t * Seed_mir.constant option) array =
+  Array.of_list
+    (List.filter_map
+       (fun (n, ty : string * Type_repr.t) ->
+         if Type_repr.has_type_param ty then None else Some (n, ty, None))
+       env.Typecheck.consts)
+
 let lower_closure (ctx : closure_ctx) : Seed_mir.program =
   let base = lowering_env_of ctx.ctx_env in
   let mir_funcs = ref [] in
@@ -733,7 +792,11 @@ let lower_closure (ctx : closure_ctx) : Seed_mir.program =
           mir_funcs := f :: !mir_funcs)
         funcs)
     ctx.ctx_graph.Module_graph.nodes;
-  { Seed_mir.functions = Array.of_list (List.rev !mir_funcs); statics = [||]; types = [||] }
+  {
+    Seed_mir.functions = Array.of_list (List.rev !mir_funcs);
+    statics = closure_statics ctx.ctx_env;
+    types = closure_types ctx.ctx_env;
+  }
 
 (* MIR-side counts for the completeness oracle: calls, callable#0 uses,
    enum variant operations (EnumCtor aggregates, SetDiscriminant,
