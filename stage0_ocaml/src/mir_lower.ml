@@ -59,10 +59,15 @@ let seed_bug fmt = Printf.ksprintf (fun m -> raise (Seed_bug m)) fmt
 
 (* ── Environment ──────────────────────────────────────────────── *)
 
+type callable_entry = {
+  ce_callable : int;                    (* resolved callable id *)
+  ce_template_args : Type_repr.t array; (* declaration-order template params for generic defs *)
+}
+
 type func_env = {
   types : (string * Type_repr.t) list;               (* type name -> repr *)
   values : (string * Type_repr.t) list;              (* global value name -> type *)
-  callables : (string * int) list;                   (* function name -> callable id *)
+  callables : (string * callable_entry) list;        (* function name -> resolved entry *)
   methods : ((string * string) * Instance_id.t) list;  (* (receiver type name, method) -> instance *)
   fn_ret : Type_repr.t;
 }
@@ -1312,7 +1317,8 @@ and lower_call (env : func_env) (st : lower_state) (callee : Ast.expr)
           (copy_place st (cur_place st id), ty)
       | None -> (
           match List.assoc_opt n env.callables with
-          | Some cid ->
+          | Some entry ->
+              let cid = entry.ce_callable in
               let ty =
                 match List.assoc_opt n env.values with Some t -> t | None -> Type_repr.Unit
               in
@@ -1326,6 +1332,10 @@ and lower_call (env : func_env) (st : lower_state) (callee : Ast.expr)
                      arg_ops)
               in
               let next_b = new_block st in
+              (* the concrete call-substitution arrives with the typed
+                 lowering channel; until then, non-generic calls (the
+                 kernel closure has zero generic defs) carry [||] and the
+                 mono arity pairing stays exact. *)
               set_terminator_to st
                 (Seed_mir.Call (rp, Seed_mir.User (Instance_id.make ~callable:(Ids.Callable_id.make cid) ~type_args:[||]), arg_vals, next_b, None))
                 next_b;
@@ -1342,7 +1352,8 @@ and emit_defers (env : func_env) (st : lower_state) : unit =
 (* ── Function lowering ────────────────────────────────────────── *)
 
 let lower_function_with_variants (variants : variant_table) (env : func_env) (name : string)
-    (callable : int) (fn : Ast.function_decl) : Seed_mir.function_ =
+    (callable : int) (template_args : Type_repr.t array) (fn : Ast.function_decl) :
+    Seed_mir.function_ =
   let st =
     {
       next_local = 0;
@@ -1398,7 +1409,10 @@ let lower_function_with_variants (variants : variant_table) (env : func_env) (na
   let params = Array.of_list (List.map (fun ty -> (None, ty)) param_tys) in
   {
     Seed_mir.name;
-    instance = Instance_id.make ~callable:(Ids.Callable_id.make callable) ~type_args:[||];
+    (* the template instance carries the declaration-order generic params,
+       so monomorphization can build exact substitutions *)
+    instance =
+      Instance_id.make ~callable:(Ids.Callable_id.make callable) ~type_args:template_args;
     params;
     locals = st.locals;
     blocks =
@@ -1410,9 +1424,9 @@ let lower_function_with_variants (variants : variant_table) (env : func_env) (na
 (* The public entry point used by the driver: lowers with the builtin
    variant table (Option/Result) only.  User-defined enums need
    lower_function_with_variants. *)
-let lower_function (env : func_env) (name : string) (callable : int)
-    (fn : Ast.function_decl) : Seed_mir.function_ =
-  lower_function_with_variants default_variant_table env name callable fn
+let lower_function (env : func_env) (name : string) (callable : int) (fn : Ast.function_decl) :
+    Seed_mir.function_ =
+  lower_function_with_variants default_variant_table env name callable [||] fn
 
 (* ── Statics/consts (audit §35) ─────────────────────────────────
    TODO: Ast.ConstDecl/Ast.StaticDecl exist and the typechecker keeps a

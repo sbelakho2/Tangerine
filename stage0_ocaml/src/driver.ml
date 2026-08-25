@@ -142,13 +142,25 @@ let lowering_env_of (env : Typecheck.env) : Mir_lower.func_env =
   let callables =
     List.concat_map
       (fun (n, ts : string * Typecheck.typed_signature) ->
-        let cid = Ids.Callable_id.to_int ts.Typecheck.ts_callable in
+        let entry : Mir_lower.callable_entry =
+          {
+            ce_callable = Ids.Callable_id.to_int ts.Typecheck.ts_callable;
+            (* the template instance declares the generic params in
+               declaration order, so the monomorphizer can construct
+               exact substitutions *)
+            ce_template_args =
+              Array.of_list
+                (List.map
+                   (fun (_, pid) -> Type_repr.Type_param pid)
+                   ts.Typecheck.ts_params_decl);
+          }
+        in
         let bare =
           match String.rindex_opt n ':' with
-          | Some i -> [ (String.sub n (i + 1) (String.length n - i - 1), cid) ]
+          | Some i -> [ (String.sub n (i + 1) (String.length n - i - 1), entry) ]
           | None -> []
         in
-        (n, cid) :: bare)
+        (n, entry) :: bare)
       env.Typecheck.functions
   in
   let methods =
@@ -180,13 +192,20 @@ let lower_and_report (path : string) (env : Typecheck.env) (program : Ast.progra
   let mir_funcs =
     List.mapi
       (fun i d ->
-        let fn_ret, callable =
+        let fn_ret, callable, template_args =
           match lookup_typed_fn env d.Ast.fn_sig.Ast.sig_name with
-          | Some ts -> (ts.Typecheck.ts_return, Ids.Callable_id.to_int ts.Typecheck.ts_callable)
-          | None -> (Type_repr.Unit, i)
+          | Some ts ->
+              ( ts.Typecheck.ts_return,
+                Ids.Callable_id.to_int ts.Typecheck.ts_callable,
+                Array.of_list
+                  (List.map
+                     (fun (_, pid) -> Type_repr.Type_param pid)
+                     ts.Typecheck.ts_params_decl) )
+          | None -> (Type_repr.Unit, i, [||])
         in
-        Mir_lower.lower_function { base with Mir_lower.fn_ret } d.Ast.fn_sig.Ast.sig_name
-          callable d)
+        Mir_lower.lower_function_with_variants Mir_lower.default_variant_table
+          { base with Mir_lower.fn_ret }
+          d.Ast.fn_sig.Ast.sig_name callable template_args d)
       funcs
   in
   let prog =

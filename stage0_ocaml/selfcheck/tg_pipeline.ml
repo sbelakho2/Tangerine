@@ -93,10 +93,13 @@ let () =
             List.filter_map
               (fun i ->
                 match i.Ast.kind with
-                | Ast.Function d -> Some (d.Ast.fn_sig.Ast.sig_name, 0)
+                | Ast.Function d ->
+                    Some
+                      ( d.Ast.fn_sig.Ast.sig_name,
+                        { Mir_lower.ce_callable = 0; ce_template_args = [||] } )
                 | _ -> None)
               program.Ast.items
-            |> List.mapi (fun i (n, _) -> (n, i));
+            |> List.mapi (fun i (n, e) -> (n, { e with Mir_lower.ce_callable = i }));
           methods = [];
           fn_ret = Type_repr.Int Type_repr.Int;
         }

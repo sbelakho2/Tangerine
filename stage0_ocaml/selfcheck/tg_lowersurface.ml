@@ -209,7 +209,11 @@ let () =
             List.map
               (fun d ->
                 let n = d.Ast.fn_sig.Ast.sig_name in
-                (n, Ids.Callable_id.to_int (ts_of n).Typecheck.ts_callable))
+                ( n,
+                  {
+                    Mir_lower.ce_callable = Ids.Callable_id.to_int (ts_of n).Typecheck.ts_callable;
+                    ce_template_args = [||];
+                  } ))
               funcs;
           methods = [];
           fn_ret = int_ty;
@@ -222,7 +226,7 @@ let () =
             let ts = ts_of n in
             Mir_lower.lower_function_with_variants variant_table
               { env2 with Mir_lower.fn_ret = ts.Typecheck.ts_return }
-              n (Ids.Callable_id.to_int ts.Typecheck.ts_callable) d)
+              n (Ids.Callable_id.to_int ts.Typecheck.ts_callable) [||] d)
           funcs
       in
       (* concrete enum defs (post-mono): a variant's payload is recorded
@@ -258,6 +262,56 @@ let () =
            Printf.printf "  MIR verify: FAIL\n";
            List.iter (fun e -> Printf.printf "    %s\n" e) errs;
            Printf.printf "%s\n" (Seed_mir.print_program prog);
+           exit 1);
+      (* template-instance proof: a generic def f[T,U] must get a
+         template Instance_id carrying [Type_param T; Type_param U] in
+         declaration order, so mono can build exact substitutions *)
+      let pid_t = Ids_core.Generic_param_id.make 7 in
+      let pid_u = Ids_core.Generic_param_id.make 11 in
+      let gen_env =
+        {
+          env2 with
+          Mir_lower.callables =
+            [
+              ( "f",
+                {
+                  Mir_lower.ce_callable = 42;
+                  ce_template_args = [| Type_repr.Type_param pid_t; Type_repr.Type_param pid_u |];
+                } );
+            ];
+        }
+      in
+      let gen_fn : Ast.function_decl =
+        {
+          Ast.fn_sig =
+            {
+              Ast.sig_name = "f";
+              sig_public = false;
+              sig_async = false;
+              sig_unsafe = false;
+              sig_const = false;
+              sig_pure = false;
+              sig_inline = false;
+              sig_extern = false;
+              sig_type_params = [];
+              sig_params = [];
+              sig_return = None;
+              sig_where = [];
+              sig_span = Span.synthetic;
+            };
+          fn_clauses = [];
+          fn_body = Ast.FnExpr (Ast.IntLit ("0", Span.synthetic));
+          fn_span = Span.synthetic;
+        }
+      in
+      let lowered = Mir_lower.lower_function_with_variants variant_table gen_env "f" 42 [| Type_repr.Type_param pid_t; Type_repr.Type_param pid_u |] gen_fn in
+      (match lowered.Seed_mir.instance with
+       | { Instance_id.callable = _; type_args = [| Type_repr.Type_param a; Type_repr.Type_param b |] } when
+           Ids_core.Generic_param_id.compare a pid_t = 0
+           && Ids_core.Generic_param_id.compare b pid_u = 0 ->
+           Printf.printf "  template instance: PASS (f[T,U] -> [T;U] in declaration order)\n"
+       | _ ->
+           Printf.printf "  template instance: FAIL\n";
            exit 1);
       if dump then Printf.printf "%s\n" (Seed_mir.print_program prog);
       let entry =
