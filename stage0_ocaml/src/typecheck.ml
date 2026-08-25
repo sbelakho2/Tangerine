@@ -1135,7 +1135,10 @@ let resolve_signature (env : env) (scope : scope) (sig_ : Ast.function_sig)
   in
   let* ret =
     match sig_.Ast.sig_return with
-    | Some r -> resolve_type env scope r
+    | Some r ->
+        let r2 = resolve_type env scope r in
+
+        r2
     | None -> Ok Type_repr.Unit
   in
   let* where =
@@ -2778,6 +2781,7 @@ and check_call_sig (env : env) (scope : scope) (expected : Type_repr.t option)
         }
       in
       env.state.oracle.o_calls <- call :: env.state.oracle.o_calls;
+
       Ok { te_type = ret; te_effects = Array.of_list effects; te_span = span }
     end
   end
