@@ -90,6 +90,7 @@ type state = {
   mutable next_type_id : int;
   mutable next_param_id : int;
   mutable next_var_id : int;
+  mutable failed_items : string list;
   (* once-only declaration identities: the first allocation of an item's
      generic-parameter ids is recorded and reused by every later
      registration attempt, so retry rounds never create stale ids *)
@@ -735,6 +736,7 @@ let initial_env () : env =
       next_type_id = 100;
       next_param_id = 1000;
       next_var_id = 0;
+      failed_items = [];
       sig_param_ids = Hashtbl.create 256;
       next_callable_id = 0;
       next_impl_index = 0;
@@ -4160,7 +4162,10 @@ let check_program (env : env) (program : Ast.program) : (env * string list, stri
               (* re-registration of an item from an earlier fixpoint round:
                  the resolver already gated real duplicates *)
               go_reg env acc rest
-            else go_reg env ((name ^ ": " ^ m) :: acc) rest)
+            else begin
+              env.state.failed_items <- name :: env.state.failed_items;
+              go_reg env ((name ^ ": " ^ m) :: acc) rest
+            end)
   in
   let* env1, reg_errors = go_reg env_h [] program.Ast.items in
   let rec go (errors : string list) = function
@@ -4170,11 +4175,13 @@ let check_program (env : env) (program : Ast.program) : (env * string list, stri
         env1.state.current_item <- name;
         env1.state.current_item_params <- item_param_ids env1 item;
         reset_oracle env1;
+        let secondary = List.mem name env1.state.failed_items in
+        let tag m = if secondary then "[secondary] " ^ m else m in
         match check_item env1 item with
-        | Error m -> go ((name ^ ": " ^ m) :: errors) rest
+        | Error m -> go (tag (name ^ ": " ^ m) :: errors) rest
         | Ok () ->
             let findings = run_oracle env1 name in
-            go (List.map (fun f -> name ^ ": " ^ f) findings @ errors) rest)
+            go (List.map (fun f -> tag (name ^ ": " ^ f)) findings @ errors) rest)
   in
   let* final_env, errors = go (header_errors @ reg_errors) program.Ast.items in
   let backstop = run_impl_backstop final_env in

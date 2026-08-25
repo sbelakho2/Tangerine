@@ -29,9 +29,12 @@ let categories : string list =
 type t = {
   buckets : (string * int) list;  (* one entry per category, categories order *)
   total : int;
+  primaries : int;   (* root-failure diagnostics (first symptom per item) *)
+  secondaries : int; (* cascade diagnostics (item whose registration failed) *)
 }
 
-let empty : t = { buckets = List.map (fun c -> (c, 0)) categories; total = 0 }
+let empty : t =
+  { buckets = List.map (fun c -> (c, 0)) categories; total = 0; primaries = 0; secondaries = 0 }
 
 (* Substring test (stdlib < 5.3 portable). *)
 let contains_sub (s : string) (sub : string) : bool =
@@ -128,15 +131,22 @@ let classify (msg : string) : string =
 (* Classify the typechecker's raw error strings.  Every string is
    classified exactly once; the bucket counts therefore always sum to
    the total. *)
+let secondary_prefix = "[secondary] "
+
 let of_errors (errors : string list) : t =
   let tbl = Hashtbl.create (List.length categories) in
+  let primaries = ref 0 and secondaries = ref 0 in
   List.iter
     (fun e ->
+      if String.length e >= String.length secondary_prefix
+      && String.sub e 0 (String.length secondary_prefix) = secondary_prefix
+      then incr secondaries
+      else incr primaries;
       let c = classify e in
       Hashtbl.replace tbl c (1 + Option.value ~default:0 (Hashtbl.find_opt tbl c)))
     errors;
   let buckets = List.map (fun c -> (c, Option.value ~default:0 (Hashtbl.find_opt tbl c))) categories in
-  { buckets; total = List.length errors }
+  { buckets; total = List.length errors; primaries = !primaries; secondaries = !secondaries }
 
 (* The requested public entry: classify a Diagnostic bag's messages. *)
 let debt_report (ds : Diagnostic.diagnostic list) : t =
@@ -151,6 +161,8 @@ let sum_reports (reps : t list) : t =
             (fun (c, n1) (_, n2) -> (c, n1 + n2))
             acc.buckets r.buckets;
         total = acc.total + r.total;
+        primaries = acc.primaries + r.primaries;
+        secondaries = acc.secondaries + r.secondaries;
       })
     empty reps
 
@@ -158,7 +170,11 @@ let sum_reports (reps : t list) : t =
    per category (fixed order, zeros included) plus `debt_total: <K>`. *)
 let to_lines (r : t) : string list =
   List.map (fun (c, n) -> Printf.sprintf "debt: %s %d" c n) r.buckets
-  @ [ Printf.sprintf "debt_total: %d" r.total ]
+  @ [
+      Printf.sprintf "debt_total: %d" r.total;
+      Printf.sprintf "debt_primary: %d" r.primaries;
+      Printf.sprintf "debt_secondary: %d" r.secondaries;
+    ]
 
 let emit (errors : string list) : unit =
   List.iter print_endline (to_lines (of_errors errors))
