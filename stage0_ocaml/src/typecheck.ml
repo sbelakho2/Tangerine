@@ -2786,7 +2786,6 @@ and check_call_sig (env : env) (scope : scope) (expected : Type_repr.t option)
         }
       in
       env.state.oracle.o_calls <- call :: env.state.oracle.o_calls;
-
       Ok { te_type = ret; te_effects = Array.of_list effects; te_span = span }
     end
   end
