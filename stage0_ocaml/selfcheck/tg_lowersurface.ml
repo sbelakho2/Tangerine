@@ -159,9 +159,9 @@ let () =
       let option_tid = List.assoc "Option" tcheck_env.Typecheck.type_ids in
       let result_tid = List.assoc "Result" tcheck_env.Typecheck.type_ids in
       let color_tid = List.assoc "Color" tcheck_env.Typecheck.type_ids in
-      let option_int = Type_repr.Named (option_tid, [| int_ty |]) in
-      let result_int_str = Type_repr.Named (result_tid, [| int_ty; string_ty |]) in
-      let color_ty = Type_repr.Named (color_tid, [||]) in
+      let option_int = Type_repr.Named (Ids.Type_id.to_int option_tid, [| int_ty |]) in
+      let result_int_str = Type_repr.Named (Ids.Type_id.to_int result_tid, [| int_ty; string_ty |]) in
+      let color_ty = Type_repr.Named (Ids.Type_id.to_int color_tid, [||]) in
       (* typed signatures per function (flat names) *)
       let ts_of name =
         match List.assoc_opt name tcheck_env.Typecheck.functions with
@@ -183,8 +183,8 @@ let () =
           Mir_lower.types =
             [
               ("Color", color_ty);
-              ("Option", Type_repr.Named (option_tid, [| Type_repr.Type_param (Ids.Generic_param_id.make 0) |]));
-              ("Result", Type_repr.Named (result_tid, [| Type_repr.Type_param (Ids.Generic_param_id.make 0); Type_repr.Type_param (Ids.Generic_param_id.make 1) |]));
+              ("Option", Type_repr.Named (Ids.Type_id.to_int option_tid, [| Type_repr.Type_param (Ids.Generic_param_id.to_int (Ids.Generic_param_id.make 0)) |]));
+              ("Result", Type_repr.Named (Ids.Type_id.to_int result_tid, [| Type_repr.Type_param (Ids.Generic_param_id.to_int (Ids.Generic_param_id.make 0)); Type_repr.Type_param (Ids.Generic_param_id.to_int (Ids.Generic_param_id.make 1)) |]));
               ("Int", int_ty);
               ("Unit", Type_repr.Unit);
               ("Bool", Type_repr.Bool);

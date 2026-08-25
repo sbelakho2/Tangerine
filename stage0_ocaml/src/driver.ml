@@ -661,7 +661,7 @@ let count_mir_stats (prog : Seed_mir.program) : mir_stats =
                (match callee with
                 | Seed_mir.User inst ->
                     incr calls;
-                    if Ids.Callable_id.to_int inst.callable = 0 then incr zeros
+                    if Ids.Callable_id.to_int (Ids.Instance_id.callable inst) = 0 then incr zeros
                 | _ -> ());
                Array.iter (fun a -> scan_operand a.Seed_mir.value) args
            | Seed_mir.SwitchInt (op, _, _) | Seed_mir.Assert (op, _, _, _) -> scan_operand op
@@ -756,7 +756,7 @@ let resolve_bootstrap_entry (prog : Seed_mir.program) (entry_opt : string option
 let count_residual_type_params (prog : Seed_mir.program) : int =
   let n = ref 0 in
   let tp (ty : Type_repr.t) = if Type_repr.has_type_param ty then incr n in
-  let tp_inst (i : Ids.Instance_id.t) = Array.iter tp i.Ids.Instance_id.type_args in
+  let tp_inst (i : Ids.Instance_id.t) = Array.iter tp (Ids.Instance_id.type_args i) in
   let scan_operand (op : Seed_mir.operand) =
     match op with
     | Seed_mir.Constant (Seed_mir.Function i) -> tp_inst i
@@ -780,7 +780,7 @@ let count_residual_type_params (prog : Seed_mir.program) : int =
   in
   Array.iter
     (fun (f : Seed_mir.function_) ->
-      Array.iter tp f.Seed_mir.instance.type_args;
+      Array.iter tp (Ids.Instance_id.type_args f.Seed_mir.instance);
       Array.iter (fun (_, ty) -> tp ty) f.Seed_mir.params;
       Array.iter tp f.Seed_mir.locals;
       Array.iter

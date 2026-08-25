@@ -66,14 +66,14 @@ let ptr (t : Type_repr.t) : Type_repr.t = Type_repr.Raw_ptr (Type_repr.Immutable
 let ptr_u8 : Type_repr.t = ptr ty_u8
 let ref_ (t : Type_repr.t) : Type_repr.t = Type_repr.Ref_internal (Type_repr.Immutable, t)
 let named (id : Ids.Type_id.t) (args : Type_repr.t array) : Type_repr.t =
-  Type_repr.Named (id, args)
+  Type_repr.Named (Ids.Type_id.to_int id, args)
 let option_of (t : Type_repr.t) : Type_repr.t = named Type_id.option_ [| t |]
 let vec_of (t : Type_repr.t) : Type_repr.t = named Type_id.vec [| t |]
 let map_of (k : Type_repr.t) (v : Type_repr.t) : Type_repr.t = named Type_id.map [| k; v |]
 let set_of (t : Type_repr.t) : Type_repr.t = named Type_id.set [| t |]
 let ruby_value : Type_repr.t = named Type_id.ruby_value [||]
 let ruby_id : Type_repr.t = named Type_id.ruby_id [||]
-let param (id : Ids.Generic_param_id.t) : Type_repr.t = Type_repr.Type_param id
+let param (id : Ids.Generic_param_id.t) : Type_repr.t = Type_repr.Type_param (Ids.Generic_param_id.to_int id)
 
 let sig_ ~(params : Type_repr.t array) ~(ret : Type_repr.t) : signature =
   { params; ret }
@@ -131,7 +131,7 @@ let rec ty_to_string (ty : Type_repr.t) : string =
   | Type_repr.Fixed_array (inner, n) ->
       Printf.sprintf "[%s; %d]" (ty_to_string inner) n
   | Type_repr.Named (id, args) ->
-      named_name id
+      named_name (Ids.Type_id.make id)
       ^ (if Array.length args > 0 then
            "[" ^ String.concat ", " (Array.to_list (Array.map ty_to_string args)) ^ "]"
          else "")
@@ -143,7 +143,7 @@ let rec ty_to_string (ty : Type_repr.t) : string =
       Printf.sprintf "fn(%s) -> %s"
         (String.concat ", " (Array.to_list (Array.map render params)))
         (ty_to_string ret)
-  | Type_repr.Type_param id -> Printf.sprintf "T%d" (Ids.Generic_param_id.to_int id)
+  | Type_repr.Type_param id -> Printf.sprintf "T%d" id
   | Type_repr.Never -> "!"
 
 let signature_to_string (s : signature) : string =

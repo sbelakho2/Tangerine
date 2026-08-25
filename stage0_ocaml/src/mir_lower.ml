@@ -141,7 +141,7 @@ let ctor_of (tbl : variant_table) (n : string) : (string * string) option =
 
 let enum_tid_of (env : func_env) (enum_name : string) : Ids.Type_id.t =
   match List.assoc_opt enum_name env.types with
-  | Some (Type_repr.Named (tid, _)) -> tid
+  | Some (Type_repr.Named (tid, _)) -> Ids.Type_id.make tid
   | _ -> seed_bug "enum `%s` has no type identity in the lowering env" enum_name
 
 let enum_name_of_ty (env : func_env) (t : Type_repr.t) : string =
@@ -149,7 +149,11 @@ let enum_name_of_ty (env : func_env) (t : Type_repr.t) : string =
   | Type_repr.Named (tid, _) -> (
       match
         List.find_opt
-          (fun (_, r) -> match r with Type_repr.Named (tid2, _) -> Ids.Type_id.compare tid tid2 = 0 | _ -> false)
+          (fun (_, r) ->
+            match r with
+            | Type_repr.Named (tid2, _) ->
+                Ids.Type_id.compare (Ids.Type_id.make tid) (Ids.Type_id.make tid2) = 0
+            | _ -> false)
           env.types
       with
       | Some (n, _) -> n
@@ -400,7 +404,7 @@ let rec type_of_syntax (env : func_env) (t : Ast.type_expr) : Type_repr.t =
       | Some r ->
           let subst =
             List.mapi
-              (fun i _ -> (Ids.Generic_param_id.make i, type_of_syntax env (List.nth args i)))
+              (fun i _ -> (i, type_of_syntax env (List.nth args i)))
               args
           in
           Type_repr.substitute subst r
@@ -424,7 +428,7 @@ let rec type_of_syntax (env : func_env) (t : Ast.type_expr) : Type_repr.t =
   | Ast.Slice (inner, _) -> Type_repr.Fixed_array (type_of_syntax env inner, 0)
   | Ast.Option (inner, _) -> (
       match List.assoc_opt "Option" env.types with
-      | Some r -> Type_repr.substitute [ (Ids.Generic_param_id.make 0, type_of_syntax env inner) ] r
+      | Some r -> Type_repr.substitute [ (0, type_of_syntax env inner) ] r
       | None -> seed_bug "Option type not in env")
   | Ast.Ref (inner, m, _) -> Type_repr.Ref_internal ((if m then Type_repr.Mutable else Type_repr.Immutable), type_of_syntax env inner)
   | Ast.RawPtr (inner, m, _) -> Type_repr.Raw_ptr ((if m then Type_repr.Mutable else Type_repr.Immutable), type_of_syntax env inner)

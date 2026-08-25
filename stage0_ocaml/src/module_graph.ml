@@ -104,18 +104,18 @@ and create_with_parser
   in
   let add_node (node : module_node) =
     nodes := node :: !nodes;
-    by_path := SMap.add (join_path node.node_path) node.node_id !by_path;
-    by_id := IntMap.add node.node_id node !by_id;
-    children := IntMap.add node.node_id [] !children;
+    by_path := SMap.add (join_path node.node_path) (Ids.Module_id.to_int node.node_id) !by_path;
+    by_id := IntMap.add (Ids.Module_id.to_int node.node_id) node !by_id;
+    children := IntMap.add (Ids.Module_id.to_int node.node_id) [] !children;
     item_count := !item_count + List.length node.node_items
   in
   let add_child (parent : Ids.Module_id.t) (child : Ids.Module_id.t) =
     let cur =
-      match IntMap.find_opt parent !children with
+      match IntMap.find_opt (Ids.Module_id.to_int parent) !children with
       | Some l -> l
       | None -> []
     in
-    children := IntMap.add parent (child :: cur) !children
+    children := IntMap.add (Ids.Module_id.to_int parent) (child :: cur) !children
   in
   let rec collect_inline (parent : module_node) (items : Ast.item list) : unit =
     List.iter
@@ -169,7 +169,12 @@ and create_with_parser
     node_count = List.length nodes;
     item_count = !item_count;
     state =
-      { by_path = !by_path; by_id = !by_id; children = IntMap.map List.rev !children; sm };
+      {
+        by_path = !by_path;
+        by_id = !by_id;
+        children = IntMap.map (List.map Ids.Module_id.to_int) !children;
+        sm;
+      };
   }
 
 let source_map (g : t) : Span.source_map = g.state.sm

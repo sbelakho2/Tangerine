@@ -37,7 +37,7 @@ let find_template (prog : program) (inst : Ids.Instance_id.t) : function_ option
   let found = ref None in
   Array.iter
     (fun (f : function_) ->
-      if Ids.Callable_id.compare f.instance.callable inst.callable = 0 && !found = None
+      if Ids.Callable_id.compare (Ids.Instance_id.callable f.instance) (Ids.Instance_id.callable inst) = 0 && !found = None
       then found := Some f)
     prog.functions;
   !found
@@ -47,22 +47,28 @@ let find_template (prog : program) (inst : Ids.Instance_id.t) : function_ option
    requested instance's type arguments are the concrete substitutes. *)
 let substitution (tmpl : function_) (inst : Ids.Instance_id.t) :
     (Ids.Generic_param_id.t * Type_repr.t) list =
-  let n = min (Array.length tmpl.instance.type_args) (Array.length inst.type_args) in
+  let n =
+    min
+      (Array.length (Ids.Instance_id.type_args tmpl.instance))
+      (Array.length (Ids.Instance_id.type_args inst))
+  in
   let rec go i acc =
     if i >= n then List.rev acc
     else
-      match tmpl.instance.type_args.(i) with
-      | Type_repr.Type_param pid -> go (i + 1) ((pid, inst.type_args.(i)) :: acc)
+      match (Ids.Instance_id.type_args tmpl.instance).(i) with
+      | Type_repr.Type_param pid -> go (i + 1) ((Ids.Generic_param_id.make pid, (Ids.Instance_id.type_args inst).(i)) :: acc)
       | _ -> go (i + 1) acc
   in
   go 0 []
 
 let subst_instance (subst : (Ids.Generic_param_id.t * Type_repr.t) list)
     (inst : Ids.Instance_id.t) : Ids.Instance_id.t =
-  {
-    callable = inst.callable;
-    type_args = Array.map (Type_repr.substitute subst) inst.type_args;
-  }
+  Ids.Instance_id.make
+    ~callable:(Ids.Instance_id.callable inst)
+    ~type_args:
+      (Array.map
+         (Type_repr.substitute (List.map (fun (k, v) -> (Ids.Generic_param_id.to_int k, v)) subst))
+         (Ids.Instance_id.type_args inst))
 
 (* Specialize a template under an instance: every embedded type is
    substituted (params, locals, cast targets, callee instances, function
@@ -70,7 +76,9 @@ let subst_instance (subst : (Ids.Generic_param_id.t * Type_repr.t) list)
    instance as its identity. *)
 let specialize (tmpl : function_) (inst : Ids.Instance_id.t) : function_ =
   let subst = substitution tmpl inst in
-  let subst_ty = Type_repr.substitute subst in
+  let subst_ty =
+    Type_repr.substitute (List.map (fun (k, v) -> (Ids.Generic_param_id.to_int k, v)) subst)
+  in
   let subst_operand op =
     match op with
     | Constant (Function i) -> Constant (Function (subst_instance subst i))
@@ -184,12 +192,12 @@ let build ~(entry : Ids.Instance_id.t) (prog : program) : (function_ array, stri
   let seen_callables = Hashtbl.create 16 in
   Array.iter
     (fun (f : function_) ->
-      if Hashtbl.mem seen_callables f.instance.callable then
+      if Hashtbl.mem seen_callables (Ids.Instance_id.callable f.instance) then
         err
           (Printf.sprintf
              "mono: duplicate callable %s in the input program (two functions share one callable identity)"
              (Seed_mir.print_instance f.instance))
-      else Hashtbl.add seen_callables f.instance.callable ())
+      else Hashtbl.add seen_callables (Ids.Instance_id.callable f.instance) ())
     prog.functions;
   let queue : work_item Queue.t = Queue.create () in
   let seen : Ids.Instance_id.t list ref = ref [] in
@@ -242,7 +250,9 @@ let build ~(entry : Ids.Instance_id.t) (prog : program) : (function_ array, stri
   done;
   (* final validation: every embedded instance is concrete and
      specialized; every body is concrete; the output is self-contained *)
-  let concrete (inst : Ids.Instance_id.t) = not (Array.exists Type_repr.has_type_param inst.type_args) in
+  let concrete (inst : Ids.Instance_id.t) =
+    not (Array.exists Type_repr.has_type_param (Ids.Instance_id.type_args inst))
+  in
   let in_output (inst : Ids.Instance_id.t) = List.mem_assoc inst !cache in
   List.iter
     (fun (inst, body) ->

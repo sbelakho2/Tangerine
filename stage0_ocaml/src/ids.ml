@@ -68,9 +68,29 @@ module Generic_param_id = struct
   let of_int (i : int) : t = i
 end
 
+(* Per-struct / per-enum declaration-order positions (Seed MIR
+   projections and discriminant tags): 0..n-1 within the owner. *)
+module Field_index = struct
+  type t = int
+  let make (i : int) : t = i
+  let compare (a : t) (b : t) = compare a b
+  let to_int (t : t) = t
+  let of_int (i : int) : t = i
+end
+
+module Variant_index = struct
+  type t = int
+  let make (i : int) : t = i
+  let compare (a : t) (b : t) = compare a b
+  let to_int (t : t) = t
+  let of_int (i : int) : t = i
+end
+
 module Instance_id = struct
   type t = { callable : Callable_id.t; type_args : Type_repr.t array }
   let make ~callable ~type_args = { callable; type_args }
+  let callable (t : t) = t.callable
+  let type_args (t : t) = t.type_args
   let compare (a : t) (b : t) =
     let c = Callable_id.compare a.callable b.callable in
     if c <> 0 then c

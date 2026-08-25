@@ -124,13 +124,13 @@ let rec type_key (ty : Type_repr.t) : string =
       "(" ^ String.concat "," (Array.to_list (Array.map type_key elems)) ^ ")"
   | Type_repr.Fixed_array (t, n) -> Printf.sprintf "[%s;%d]" (type_key t) n
   | Type_repr.Named (id, args) ->
-      Printf.sprintf "N#%d[%s]" (Ids.Type_id.to_int id)
+      Printf.sprintf "N#%d[%s]" id
         (String.concat "," (Array.to_list (Array.map type_key args)))
   | Type_repr.Function (params, ret) ->
       "fn("
       ^ String.concat "," (Array.to_list (Array.map (fun p -> type_key p.Type_repr.pt_type) params))
       ^ ")->" ^ type_key ret
-  | Type_repr.Type_param id -> "P#" ^ string_of_int (Ids.Generic_param_id.to_int id)
+  | Type_repr.Type_param id -> "P#" ^ string_of_int id
 
 let obligation_key (ob : obligation) : string =
   ob.trait_name ^ "<" ^ String.concat "," (Array.to_list (Array.map type_key ob.type_args))
@@ -139,7 +139,7 @@ let obligation_key (ob : obligation) : string =
 (* The impl's target head Type_id. *)
 let impl_head (ie : impl_entry) : Ids.Type_id.t option =
   match ie.ie_target with
-  | Type_repr.Named (id, _) -> Some id
+  | Type_repr.Named (id, _) -> Some (Ids.Type_id.make id)
   | _ -> None
 
 let structurally_equal (a : Type_repr.t) (b : Type_repr.t) : bool =
@@ -151,9 +151,9 @@ let rec unify_target (subst : (Ids.Generic_param_id.t * Type_repr.t) list)
     (a : Type_repr.t) (b : Type_repr.t) : (Ids.Generic_param_id.t * Type_repr.t) list option =
   match a with
   | Type_repr.Type_param id ->
-      (match List.assoc_opt id subst with
+      (match List.assoc_opt (Ids.Generic_param_id.make id) subst with
        | Some s -> if structurally_equal s b then Some subst else None
-       | None -> Some ((id, b) :: subst))
+       | None -> Some ((Ids.Generic_param_id.make id, b) :: subst))
   | _ -> (
       match b with
       | Type_repr.Type_param _ -> None
@@ -162,7 +162,9 @@ let rec unify_target (subst : (Ids.Generic_param_id.t * Type_repr.t) list)
           else
             match a, b with
             | Type_repr.Named (id1, args1), Type_repr.Named (id2, args2) ->
-                if Ids.Type_id.compare id1 id2 <> 0 || Array.length args1 <> Array.length args2
+                if
+                  Ids.Type_id.compare (Ids.Type_id.make id1) (Ids.Type_id.make id2) <> 0
+                  || Array.length args1 <> Array.length args2
                 then None
                 else begin
                   let rec go subst i =
@@ -210,7 +212,7 @@ let solve (env : env) (ob : obligation) : (solution, solve_error) result =
         | Type_repr.Type_param pid ->
             (* A generic parameter is an opaque instance of its DECLARED
                bounds: the param-bound registry is the only proof source. *)
-            (match List.assoc_opt pid env.param_bounds with
+            (match List.assoc_opt (Ids.Generic_param_id.make pid) env.param_bounds with
              | Some bounds -> (
                  let args = ob.type_args in
                  let rec find = function
@@ -249,7 +251,7 @@ let solve (env : env) (ob : obligation) : (solution, solve_error) result =
           match impl_head ie with
           | Some hid -> (
               match ob.self_ty with
-              | Type_repr.Named (sid, sargs) when Ids.Type_id.compare sid hid = 0 ->
+              | Type_repr.Named (sid, sargs) when Ids.Type_id.compare (Ids.Type_id.make sid) hid = 0 ->
                   let impl_args =
                     match ie.ie_target with
                     | Type_repr.Named (_, a) -> a
@@ -274,13 +276,20 @@ let solve (env : env) (ob : obligation) : (solution, solve_error) result =
               let b' =
                 {
                   trait_name = b.trait_name;
-                  self_ty = Type_repr.substitute subst b.self_ty;
-                  type_args = Array.map (Type_repr.substitute subst) b.type_args;
+                  self_ty =
+                    Type_repr.substitute
+                      (List.map (fun (k, v) -> (Ids.Generic_param_id.to_int k, v)) subst)
+                      b.self_ty;
+                  type_args =
+                    Array.map
+                      (Type_repr.substitute
+                         (List.map (fun (k, v) -> (Ids.Generic_param_id.to_int k, v)) subst))
+                      b.type_args;
                 }
               in
               match go (depth + 1) b' with Ok _ -> discharge rest | Error _ -> false)
         in
-        if discharge ie.ie_bounds then survivors := (ie, subst) :: !survivors)
+        (if discharge ie.ie_bounds then survivors := (ie, subst) :: !survivors))
       !candidates;
     (match !survivors with
      | [] -> Error NoImpl
@@ -288,7 +297,14 @@ let solve (env : env) (ob : obligation) : (solution, solve_error) result =
          Ok
            {
              impl_id = ie.ie_id;
-             assoc_subst = List.map (fun (n, t) -> (n, Type_repr.substitute subst t)) ie.ie_assoc;
+             assoc_subst =
+               List.map
+                 (fun (n, t) ->
+                   ( n,
+                     Type_repr.substitute
+                       (List.map (fun (k, v) -> (Ids.Generic_param_id.to_int k, v)) subst)
+                       t ))
+                 ie.ie_assoc;
            }
      | _ -> Error Ambiguous)
   in

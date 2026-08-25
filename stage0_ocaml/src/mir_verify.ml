@@ -85,11 +85,11 @@ let rec resolve_ty (ctx : ctx) (seen : Ids.Type_id.t list) (ty : Type_repr.t) :
     Type_repr.t option =
   match ty with
   | Type_repr.Named (tid, _) ->
-      if List.mem tid seen then None
+      if List.mem (Ids.Type_id.make tid) seen then None
       else (
-        match find_type ctx tid with
+        match find_type ctx (Ids.Type_id.make tid) with
         | None -> None
-        | Some def -> resolve_ty ctx (tid :: seen) def)
+        | Some def -> resolve_ty ctx (Ids.Type_id.make tid :: seen) def)
   | _ -> Some ty
 
 let resolve_or_self (ctx : ctx) (ty : Type_repr.t) : Type_repr.t =
@@ -107,11 +107,11 @@ let rec is_copy (ctx : ctx) (seen : Ids.Type_id.t list) (ty : Type_repr.t) : boo
   | Type_repr.Tuple elems -> Array.for_all (is_copy ctx seen) elems
   | Type_repr.Fixed_array (elem, _) -> is_copy ctx seen elem
   | Type_repr.Named (tid, _) ->
-      if List.mem tid seen then false
+      if List.mem (Ids.Type_id.make tid) seen then false
       else (
-        match find_type ctx tid with
+        match find_type ctx (Ids.Type_id.make tid) with
         | None -> false
-        | Some def -> is_copy ctx (tid :: seen) def)
+        | Some def -> is_copy ctx (Ids.Type_id.make tid :: seen) def)
   | Type_repr.Type_param _ -> false
 
 (* Type compatibility after Named resolution.  Function param
@@ -865,7 +865,7 @@ let check_aggregate (ctx : ctx) (fn : function_) (bb_ctx : string) (kind : aggre
                (Seed_mir.print_type dest_ty)))
   | StructCtor (tid, fields) -> (
       match dest_ty with
-      | Type_repr.Named (dtid, _) when dtid = tid -> (
+      | Type_repr.Named (dtid, _) when dtid = Ids.Type_id.to_int tid -> (
           match rty with
           | Type_repr.Tuple elems ->
               check_count (Array.length elems);
@@ -885,7 +885,7 @@ let check_aggregate (ctx : ctx) (fn : function_) (bb_ctx : string) (kind : aggre
                (Ids.Type_id.to_int tid) (Seed_mir.print_type dest_ty)))
   | EnumCtor (tid, vid) -> (
       match dest_ty with
-      | Type_repr.Named (dtid, _) when dtid = tid -> (
+      | Type_repr.Named (dtid, _) when dtid = Ids.Type_id.to_int tid -> (
           match enum_variant_payload ctx dest_ty vid with
           | None ->
               add_err ctx
@@ -1263,7 +1263,7 @@ let check_embedded_concreteness (ctx : ctx) (fn : function_) : unit =
   let check_operand op =
     match op with
     | Constant (Function inst) ->
-        Array.iter (check_what "function-constant instance") inst.type_args
+        Array.iter (check_what "function-constant instance") (Ids.Instance_id.type_args inst)
     | _ -> ()
   in
   let check_rvalue_instances rv =
@@ -1272,7 +1272,7 @@ let check_embedded_concreteness (ctx : ctx) (fn : function_) : unit =
     | Aggregate (kind, ops) ->
         List.iter check_operand ops;
         (match kind with
-         | ClosureAgg inst -> Array.iter (check_what "closure instance") inst.type_args
+         | ClosureAgg inst -> Array.iter (check_what "closure instance") (Ids.Instance_id.type_args inst)
          | _ -> ())
     | BinaryOp (_, l, r) ->
         check_operand l;
@@ -1290,7 +1290,7 @@ let check_embedded_concreteness (ctx : ctx) (fn : function_) : unit =
       (match b.terminator with
        | Call (_, callee, args, _, _) -> (
            (match callee with
-            | User inst -> Array.iter (check_what "call instance") inst.type_args
+            | User inst -> Array.iter (check_what "call instance") (Ids.Instance_id.type_args inst)
             | Intrinsic _ | Extern _ -> ());
            Array.iter (fun arg -> check_operand arg.value) args)
        | SwitchInt (op, _, _) | Assert (op, _, _, _) -> check_operand op
@@ -1305,7 +1305,7 @@ let verify_function (ctx : ctx) (fn : function_) : unit =
         add_err ctx
           (Printf.sprintf "%s: instance type argument %s carries an unresolved type parameter"
              fn_ctx (Seed_mir.print_type ty)))
-    fn.instance.type_args;
+    (Ids.Instance_id.type_args fn.instance);
   if Array.length fn.locals = 0 then
     add_err ctx
       (Printf.sprintf "%s: function has no locals (missing the return slot _0)" fn_ctx)

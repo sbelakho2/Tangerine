@@ -243,15 +243,15 @@ let builtin_types (st : state) : (string * Type_repr.t) list =
       (fun n -> (n, Type_repr.Int (Option.get (int_kind_of_name n))))
       [ "Int"; "UInt"; "i8"; "i16"; "i32"; "i64"; "i128"; "u8"; "u16"; "u32"; "u64"; "u128" ]
   in
-  let arr_p = Type_repr.Type_param (fresh_param_id st) in
-  let map_k = Type_repr.Type_param (fresh_param_id st) in
-  let map_v = Type_repr.Type_param (fresh_param_id st) in
-  let set_t = Type_repr.Type_param (fresh_param_id st) in
-  let opt_t = Type_repr.Type_param (fresh_param_id st) in
-  let res_t = Type_repr.Type_param (fresh_param_id st) in
-  let res_e = Type_repr.Type_param (fresh_param_id st) in
-  let ptr_t = Type_repr.Type_param (fresh_param_id st) in
-  let ptrm_t = Type_repr.Type_param (fresh_param_id st) in
+  let arr_p = Type_repr.Type_param (Ids.Generic_param_id.to_int (fresh_param_id st)) in
+  let map_k = Type_repr.Type_param (Ids.Generic_param_id.to_int (fresh_param_id st)) in
+  let map_v = Type_repr.Type_param (Ids.Generic_param_id.to_int (fresh_param_id st)) in
+  let set_t = Type_repr.Type_param (Ids.Generic_param_id.to_int (fresh_param_id st)) in
+  let opt_t = Type_repr.Type_param (Ids.Generic_param_id.to_int (fresh_param_id st)) in
+  let res_t = Type_repr.Type_param (Ids.Generic_param_id.to_int (fresh_param_id st)) in
+  let res_e = Type_repr.Type_param (Ids.Generic_param_id.to_int (fresh_param_id st)) in
+  let ptr_t = Type_repr.Type_param (Ids.Generic_param_id.to_int (fresh_param_id st)) in
+  let ptrm_t = Type_repr.Type_param (Ids.Generic_param_id.to_int (fresh_param_id st)) in
   ints
   @ [
       ("f32", Type_repr.Float Type_repr.F32);
@@ -267,17 +267,17 @@ let builtin_types (st : state) : (string * Type_repr.t) list =
       ("Never", Type_repr.Never);
       ("Unit", Type_repr.Unit);
       ("()", Type_repr.Unit);
-      ("Vec", Type_repr.Named (b_array, [| arr_p |]));
-      ("Array", Type_repr.Named (b_array, [| arr_p |]));
-      ("List", Type_repr.Named (b_array, [| arr_p |]));
-      ("Map", Type_repr.Named (b_map, [| map_k; map_v |]));
-      ("HashMap", Type_repr.Named (b_map, [| map_k; map_v |]));
-      ("Set", Type_repr.Named (b_set, [| set_t |]));
-      ("HashSet", Type_repr.Named (b_set, [| set_t |]));
-      ("Option", Type_repr.Named (b_option, [| opt_t |]));
-      ("Result", Type_repr.Named (b_result, [| res_t; res_e |]));
-      ("Ptr", Type_repr.Named (b_ptr, [| ptr_t |]));
-      ("PtrMut", Type_repr.Named (b_ptrmut, [| ptrm_t |]));
+      ("Vec", Type_repr.Named (Ids.Type_id.to_int b_array, [| arr_p |]));
+      ("Array", Type_repr.Named (Ids.Type_id.to_int b_array, [| arr_p |]));
+      ("List", Type_repr.Named (Ids.Type_id.to_int b_array, [| arr_p |]));
+      ("Map", Type_repr.Named (Ids.Type_id.to_int b_map, [| map_k; map_v |]));
+      ("HashMap", Type_repr.Named (Ids.Type_id.to_int b_map, [| map_k; map_v |]));
+      ("Set", Type_repr.Named (Ids.Type_id.to_int b_set, [| set_t |]));
+      ("HashSet", Type_repr.Named (Ids.Type_id.to_int b_set, [| set_t |]));
+      ("Option", Type_repr.Named (Ids.Type_id.to_int b_option, [| opt_t |]));
+      ("Result", Type_repr.Named (Ids.Type_id.to_int b_result, [| res_t; res_e |]));
+      ("Ptr", Type_repr.Named (Ids.Type_id.to_int b_ptr, [| ptr_t |]));
+      ("PtrMut", Type_repr.Named (Ids.Type_id.to_int b_ptrmut, [| ptrm_t |]));
     ]
 
 let type_ids_of_builtins : (string * Ids.Type_id.t) list =
@@ -365,31 +365,31 @@ let builtin_impls (st : state) : Trait_solver.impl_entry list =
   (* generic impls with where-bounds: Hash for Vec[T] where T: Hash, ... *)
   let t_vec = fresh_param_id st in
   let hash_vec =
-    ent ~trait:"Hash" ~target:(Type_repr.Named (b_array, [| Type_repr.Type_param t_vec |]))
+    ent ~trait:"Hash" ~target:(Type_repr.Named (Ids.Type_id.to_int b_array, [| Type_repr.Type_param (Ids.Generic_param_id.to_int t_vec) |]))
       ~name:"Vec" ~params:[ "T" ]
-      ~bounds:[ ob ~trait:"Hash" ~self:(Type_repr.Type_param t_vec) ] ~assoc:[]
+      ~bounds:[ ob ~trait:"Hash" ~self:(Type_repr.Type_param (Ids.Generic_param_id.to_int t_vec)) ] ~assoc:[]
   in
   let eq_vec =
-    ent ~trait:"Eq" ~target:(Type_repr.Named (b_array, [| Type_repr.Type_param t_vec |]))
+    ent ~trait:"Eq" ~target:(Type_repr.Named (Ids.Type_id.to_int b_array, [| Type_repr.Type_param (Ids.Generic_param_id.to_int t_vec) |]))
       ~name:"Vec" ~params:[ "T" ]
-      ~bounds:[ ob ~trait:"Eq" ~self:(Type_repr.Type_param t_vec) ] ~assoc:[]
+      ~bounds:[ ob ~trait:"Eq" ~self:(Type_repr.Type_param (Ids.Generic_param_id.to_int t_vec)) ] ~assoc:[]
   in
   let t_opt = fresh_param_id st in
   let hash_opt =
-    ent ~trait:"Hash" ~target:(Type_repr.Named (b_option, [| Type_repr.Type_param t_opt |]))
+    ent ~trait:"Hash" ~target:(Type_repr.Named (Ids.Type_id.to_int b_option, [| Type_repr.Type_param (Ids.Generic_param_id.to_int t_opt) |]))
       ~name:"Option" ~params:[ "T" ]
-      ~bounds:[ ob ~trait:"Hash" ~self:(Type_repr.Type_param t_opt) ] ~assoc:[]
+      ~bounds:[ ob ~trait:"Hash" ~self:(Type_repr.Type_param (Ids.Generic_param_id.to_int t_opt)) ] ~assoc:[]
   in
   let k_map = fresh_param_id st in
   let v_map = fresh_param_id st in
   let hash_map =
     ent ~trait:"Hash"
-      ~target:(Type_repr.Named (b_map, [| Type_repr.Type_param k_map; Type_repr.Type_param v_map |]))
+      ~target:(Type_repr.Named (Ids.Type_id.to_int b_map, [| Type_repr.Type_param (Ids.Generic_param_id.to_int k_map); Type_repr.Type_param (Ids.Generic_param_id.to_int v_map) |]))
       ~name:"Map" ~params:[ "K"; "V" ]
       ~bounds:
         [
-          ob ~trait:"Hash" ~self:(Type_repr.Type_param k_map);
-          ob ~trait:"Hash" ~self:(Type_repr.Type_param v_map);
+          ob ~trait:"Hash" ~self:(Type_repr.Type_param (Ids.Generic_param_id.to_int k_map));
+          ob ~trait:"Hash" ~self:(Type_repr.Type_param (Ids.Generic_param_id.to_int v_map));
         ]
       ~assoc:[]
   in
@@ -427,11 +427,11 @@ let builtin_methods (st : state) : ((string * string) * typed_signature) list =
   let c_ty = Type_repr.Char in
   let f_ty = Type_repr.Float Type_repr.F64 in
   let unit = Type_repr.Unit in
-  let opt t = Type_repr.Named (b_option, [| t |]) in
-  let res t e = Type_repr.Named (b_result, [| t; e |]) in
-  let vec t = Type_repr.Named (b_array, [| t |]) in
-  let ptr t = Type_repr.Named (b_ptr, [| t |]) in
-  let ptrm t = Type_repr.Named (b_ptrmut, [| t |]) in
+  let opt t = Type_repr.Named (Ids.Type_id.to_int b_option, [| t |]) in
+  let res t e = Type_repr.Named (Ids.Type_id.to_int b_result, [| t; e |]) in
+  let vec t = Type_repr.Named (Ids.Type_id.to_int b_array, [| t |]) in
+  let ptr t = Type_repr.Named (Ids.Type_id.to_int b_ptr, [| t |]) in
+  let ptrm t = Type_repr.Named (Ids.Type_id.to_int b_ptrmut, [| t |]) in
   let simple ~(owner : string) ~(owner_ty : Type_repr.t) ~(name : string)
       ~(params : (string * Access_effect.t * Type_repr.t) list) ~(ret : Type_repr.t)
       ~(decl : (string * Ids.Generic_param_id.t) list)
@@ -528,8 +528,8 @@ let builtin_methods (st : state) : ((string * string) * typed_signature) list =
   in
   (* Vec / Array (the same builtin heap type) *)
   let vec_p = fresh_param_id st in
-  let vec_t = Type_repr.Type_param vec_p in
-  let vec_self = Type_repr.Named (b_array, [| vec_t |]) in
+  let vec_t = Type_repr.Type_param (Ids.Generic_param_id.to_int vec_p) in
+  let vec_self = Type_repr.Named (Ids.Type_id.to_int b_array, [| vec_t |]) in
   let vec_methods =
     [
       ("len", [], i_ty, [], let_);
@@ -559,8 +559,8 @@ let builtin_methods (st : state) : ((string * string) * typed_signature) list =
   in
   (* Option *)
   let opt_p = fresh_param_id st in
-  let opt_t = Type_repr.Type_param opt_p in
-  let opt_self = Type_repr.Named (b_option, [| opt_t |]) in
+  let opt_t = Type_repr.Type_param (Ids.Generic_param_id.to_int opt_p) in
+  let opt_self = Type_repr.Named (Ids.Type_id.to_int b_option, [| opt_t |]) in
   let m_opt =
     [
       ("is_some", [], b_ty, [], let_);
@@ -574,9 +574,9 @@ let builtin_methods (st : state) : ((string * string) * typed_signature) list =
   (* Result *)
   let res_p = fresh_param_id st in
   let res_e_p = fresh_param_id st in
-  let res_t = Type_repr.Type_param res_p in
-  let res_e = Type_repr.Type_param res_e_p in
-  let res_self = Type_repr.Named (b_result, [| res_t; res_e |]) in
+  let res_t = Type_repr.Type_param (Ids.Generic_param_id.to_int res_p) in
+  let res_e = Type_repr.Type_param (Ids.Generic_param_id.to_int res_e_p) in
+  let res_self = Type_repr.Named (Ids.Type_id.to_int b_result, [| res_t; res_e |]) in
   let m_res =
     [
       ("is_ok", [], b_ty, [], let_);
@@ -591,9 +591,9 @@ let builtin_methods (st : state) : ((string * string) * typed_signature) list =
   (* Map *)
   let map_k_p = fresh_param_id st in
   let map_v_p = fresh_param_id st in
-  let map_k = Type_repr.Type_param map_k_p in
-  let map_v = Type_repr.Type_param map_v_p in
-  let map_self = Type_repr.Named (b_map, [| map_k; map_v |]) in
+  let map_k = Type_repr.Type_param (Ids.Generic_param_id.to_int map_k_p) in
+  let map_v = Type_repr.Type_param (Ids.Generic_param_id.to_int map_v_p) in
+  let map_self = Type_repr.Named (Ids.Type_id.to_int b_map, [| map_k; map_v |]) in
   let hash_eq = [ (map_k, [ "Hash"; "Eq" ]) ] in
   let m_map =
     [
@@ -611,8 +611,8 @@ let builtin_methods (st : state) : ((string * string) * typed_signature) list =
   in
   (* Set *)
   let set_p = fresh_param_id st in
-  let set_t = Type_repr.Type_param set_p in
-  let set_self = Type_repr.Named (b_set, [| set_t |]) in
+  let set_t = Type_repr.Type_param (Ids.Generic_param_id.to_int set_p) in
+  let set_self = Type_repr.Named (Ids.Type_id.to_int b_set, [| set_t |]) in
   let m_set =
     [
       ("len", [], i_ty, [], let_);
@@ -666,28 +666,28 @@ let builtin_constructors (st : state) : (string * typed_signature) list =
   let some_t = fresh_param_id st in
   let some =
     mk_sig st ~name:"Option::Some" ~params_decl:[ ("T", some_t) ]
-      ~params:[ ("value", Access_effect.Let, Type_repr.Type_param some_t) ]
-      ~ret:(Type_repr.Named (b_option, [| Type_repr.Type_param some_t |])) ~where:[]
+      ~params:[ ("value", Access_effect.Let, Type_repr.Type_param (Ids.Generic_param_id.to_int some_t)) ]
+      ~ret:(Type_repr.Named (Ids.Type_id.to_int b_option, [| Type_repr.Type_param (Ids.Generic_param_id.to_int some_t) |])) ~where:[]
   in
   let none_t = fresh_param_id st in
   let none =
     mk_sig st ~name:"Option::None" ~params_decl:[ ("T", none_t) ]
-      ~params:[] ~ret:(Type_repr.Named (b_option, [| Type_repr.Type_param none_t |])) ~where:[]
+      ~params:[] ~ret:(Type_repr.Named (Ids.Type_id.to_int b_option, [| Type_repr.Type_param (Ids.Generic_param_id.to_int none_t) |])) ~where:[]
   in
   let ok_t = fresh_param_id st in
   let ok_e = fresh_param_id st in
   let ok =
     mk_sig st ~name:"Result::Ok" ~params_decl:[ ("T", ok_t); ("E", ok_e) ]
-      ~params:[ ("value", Access_effect.Let, Type_repr.Type_param ok_t) ]
-      ~ret:(Type_repr.Named (b_result, [| Type_repr.Type_param ok_t; Type_repr.Type_param ok_e |]))
+      ~params:[ ("value", Access_effect.Let, Type_repr.Type_param (Ids.Generic_param_id.to_int ok_t)) ]
+      ~ret:(Type_repr.Named (Ids.Type_id.to_int b_result, [| Type_repr.Type_param (Ids.Generic_param_id.to_int ok_t); Type_repr.Type_param (Ids.Generic_param_id.to_int ok_e) |]))
       ~where:[]
   in
   let err_t = fresh_param_id st in
   let err_e = fresh_param_id st in
   let err =
     mk_sig st ~name:"Result::Err" ~params_decl:[ ("T", err_t); ("E", err_e) ]
-      ~params:[ ("value", Access_effect.Let, Type_repr.Type_param err_e) ]
-      ~ret:(Type_repr.Named (b_result, [| Type_repr.Type_param err_t; Type_repr.Type_param err_e |]))
+      ~params:[ ("value", Access_effect.Let, Type_repr.Type_param (Ids.Generic_param_id.to_int err_e)) ]
+      ~ret:(Type_repr.Named (Ids.Type_id.to_int b_result, [| Type_repr.Type_param (Ids.Generic_param_id.to_int err_t); Type_repr.Type_param (Ids.Generic_param_id.to_int err_e) |]))
       ~where:[]
   in
   [
@@ -737,7 +737,7 @@ let initial_env () : env =
       nom_params = [ ("T", opt_p) ];
       nom_fields = [];
       nom_variants =
-        [ ("Some", [| Type_repr.Type_param opt_p |]); ("None", [||]) ];
+        [ ("Some", [| Type_repr.Type_param (Ids.Generic_param_id.to_int opt_p) |]); ("None", [||]) ];
       nom_where = [];
     }
   in
@@ -748,8 +748,8 @@ let initial_env () : env =
       nom_fields = [];
       nom_variants =
         [
-          ("Ok", [| Type_repr.Type_param res_t |]);
-          ("Err", [| Type_repr.Type_param res_e |]);
+          ("Ok", [| Type_repr.Type_param (Ids.Generic_param_id.to_int res_t) |]);
+          ("Err", [| Type_repr.Type_param (Ids.Generic_param_id.to_int res_e) |]);
         ];
       nom_where = [];
     }
@@ -779,7 +779,7 @@ let initial_env () : env =
 
 let rec occurs (needle : Ids.Generic_param_id.t) (ty : Type_repr.t) : bool =
   match ty with
-  | Type_repr.Type_param id -> Ids.Generic_param_id.compare id needle = 0
+  | Type_repr.Type_param id -> Ids.Generic_param_id.compare (Ids.Generic_param_id.make id) needle = 0
   | Type_repr.Raw_ptr (_, t) | Type_repr.Ref_internal (_, t) | Type_repr.Fixed_array (t, _) ->
       occurs needle t
   | Type_repr.Tuple elems | Type_repr.Named (_, elems) -> Array.exists (occurs needle) elems
@@ -793,8 +793,8 @@ let rec resolve_param (subst : (Ids.Generic_param_id.t * Type_repr.t) list)
     (id : Ids.Generic_param_id.t) : Type_repr.t option =
   match List.assoc_opt id subst with
   | Some (Type_repr.Type_param id2) -> (
-      if Ids.Generic_param_id.compare id2 id = 0 then Some (Type_repr.Type_param id)
-      else match resolve_param subst id2 with Some t -> Some t | None -> Some (Type_repr.Type_param id2))
+      if Ids.Generic_param_id.compare (Ids.Generic_param_id.make id2) id = 0 then Some (Type_repr.Type_param (Ids.Generic_param_id.to_int id))
+      else match resolve_param subst (Ids.Generic_param_id.make id2) with Some t -> Some t | None -> Some (Type_repr.Type_param (Ids.Generic_param_id.to_int id)))
   | Some t -> Some t
   | None -> None
 
@@ -803,33 +803,39 @@ let rec unify (subst : (Ids.Generic_param_id.t * Type_repr.t) list ref) (a : Typ
   let a' =
     match a with
     | Type_repr.Type_param id -> (
-        match resolve_param !subst id with Some t -> t | None -> a)
+        match resolve_param !subst (Ids.Generic_param_id.make id) with
+        | Some t -> t
+        | None -> a)
     | _ -> a
   in
   let b' =
     match b with
     | Type_repr.Type_param id -> (
-        match resolve_param !subst id with Some t -> t | None -> b)
+        match resolve_param !subst (Ids.Generic_param_id.make id) with
+        | Some t -> t
+        | None -> b)
     | _ -> b
   in
   match a', b' with
   | x, y when Type_repr.compare x y = 0 -> Ok ()
   | Type_repr.Never, _ | _, Type_repr.Never -> Ok ()
   | Type_repr.Type_param pa, _ ->
-      if occurs pa b' then Error "recursive type"
+      if occurs (Ids.Generic_param_id.make pa) b' then Error "recursive type"
       else begin
-        subst := (pa, b') :: !subst;
+        subst := (Ids.Generic_param_id.make pa, b') :: !subst;
         Ok ()
       end
   | _, Type_repr.Type_param pb ->
-      if occurs pb a' then Error "recursive type"
+      if occurs (Ids.Generic_param_id.make pb) a' then Error "recursive type"
       else begin
-        subst := (pb, a') :: !subst;
+        subst := (Ids.Generic_param_id.make pb, a') :: !subst;
         Ok ()
       end
   | Type_repr.Named (id1, a1), Type_repr.Named (id2, a2) ->
-      if Ids.Type_id.compare id1 id2 <> 0 || Array.length a1 <> Array.length a2 then
-        Error "type mismatch"
+      if
+        Ids.Type_id.compare (Ids.Type_id.make id1) (Ids.Type_id.make id2) <> 0
+        || Array.length a1 <> Array.length a2
+      then Error "type mismatch"
       else begin
         let rec go i =
           if i >= Array.length a1 then Ok ()
@@ -872,7 +878,9 @@ let rec unify (subst : (Ids.Generic_param_id.t * Type_repr.t) list ref) (a : Typ
 let substitute_fixpoint (subst : (Ids.Generic_param_id.t * Type_repr.t) list) (ty : Type_repr.t) :
     Type_repr.t =
   let rec go n ty =
-    let ty' = Type_repr.substitute subst ty in
+    let ty' =
+      Type_repr.substitute (List.map (fun (k, v) -> (Ids.Generic_param_id.to_int k, v)) subst) ty
+    in
     if Type_repr.compare ty ty' = 0 || n > List.length subst + 1 then ty'
     else go (n + 1) ty'
   in
@@ -882,7 +890,7 @@ let params_in (ty : Type_repr.t) : Ids.Generic_param_id.t list =
   let acc = ref [] in
   let rec walk ty =
     match ty with
-    | Type_repr.Type_param id -> if not (List.mem id !acc) then acc := id :: !acc
+    | Type_repr.Type_param id -> if not (List.mem (Ids.Generic_param_id.make id) !acc) then acc := Ids.Generic_param_id.make id :: !acc
     | Type_repr.Raw_ptr (_, t) | Type_repr.Ref_internal (_, t) | Type_repr.Fixed_array (t, _) ->
         walk t
     | Type_repr.Tuple elems | Type_repr.Named (_, elems) -> Array.iter walk elems
@@ -913,7 +921,7 @@ let rec type_to_string (ty : Type_repr.t) : string =
       "(" ^ String.concat ", " (Array.to_list (Array.map type_to_string elems)) ^ ")"
   | Type_repr.Fixed_array (t, n) -> Printf.sprintf "[%s; %d]" (type_to_string t) n
   | Type_repr.Named (id, args) ->
-      let n = string_of_int (Ids.Type_id.to_int id) in
+      let n = string_of_int id in
       if Array.length args = 0 then "T#" ^ n
       else "T#" ^ n ^ "[" ^ String.concat ", " (Array.to_list (Array.map type_to_string args)) ^ "]"
   | Type_repr.Function (ps, r) ->
@@ -924,7 +932,7 @@ let rec type_to_string (ty : Type_repr.t) : string =
                 (fun p -> Access_effect.to_string p.Type_repr.pt_convention ^ " " ^ type_to_string p.Type_repr.pt_type)
                 ps))
       ^ ") -> " ^ type_to_string r
-  | Type_repr.Type_param id -> "P#" ^ string_of_int (Ids.Generic_param_id.to_int id)
+  | Type_repr.Type_param id -> "P#" ^ string_of_int id
 
 (* ────────────────────────────────────────────────────────────────
    Constant evaluation (bootstrap: integer literal constants) *)
@@ -991,7 +999,7 @@ let rec resolve_type (env : env) (scope : scope) (t : Ast.type_expr) : (Type_rep
       | Error m -> Error m
       | Ok et -> (
           match len with
-          | None -> Ok (Type_repr.Named (b_array, [| et |]))
+          | None -> Ok (Type_repr.Named (Ids.Type_id.to_int b_array, [| et |]))
           | Some le -> (
               match resolve_constant_int le with
               | Ok n when n >= 0 -> Ok (Type_repr.Fixed_array (et, n))
@@ -999,7 +1007,7 @@ let rec resolve_type (env : env) (scope : scope) (t : Ast.type_expr) : (Type_rep
               | Error m -> Error (err span m))))
   | Ast.Slice (inner, _) -> (
       match resolve_type env scope inner with
-      | Ok t -> Ok (Type_repr.Named (b_array, [| t |]))
+      | Ok t -> Ok (Type_repr.Named (Ids.Type_id.to_int b_array, [| t |]))
       | Error m -> Error m)
   | Ast.SelfType span -> (
       match env.current_self with
@@ -1010,7 +1018,7 @@ let rec resolve_type (env : env) (scope : scope) (t : Ast.type_expr) : (Type_rep
   | Ast.Bounded (base, _, _) -> resolve_type env scope base
   | Ast.Option (inner, _) -> (
       match resolve_type env scope inner with
-      | Ok t -> Ok (Type_repr.Named (b_option, [| t |]))
+      | Ok t -> Ok (Type_repr.Named (Ids.Type_id.to_int b_option, [| t |]))
       | Error m -> Error m)
   | Ast.Inferred span -> Error (err span "cannot infer this type; an explicit annotation is required")
 
@@ -1019,7 +1027,7 @@ and resolve_named (env : env) (scope : scope) (span : Span.span) (name : string)
   match List.assoc_opt name scope.generics with
   | Some id ->
       if args <> [] then Error (err span "type parameters do not take arguments")
-      else Ok (Type_repr.Type_param id)
+      else Ok (Type_repr.Type_param (Ids.Generic_param_id.to_int id))
   | None -> (
       match name with
       | "Self" ->
@@ -1158,7 +1166,7 @@ let solver_param_bounds (decl : (string * Ids.Generic_param_id.t) list)
         List.filter_map
           (fun (wt, bs) ->
             match wt with
-            | Type_repr.Type_param wid when Ids.Generic_param_id.compare wid id = 0 ->
+            | Type_repr.Type_param wid when Ids.Generic_param_id.compare (Ids.Generic_param_id.make wid) id = 0 ->
                 Some (List.map (fun b -> (b, [||])) bs)
             | _ -> None)
           where
@@ -1280,7 +1288,7 @@ and resolve_variant (env : env) (_scope : scope) (span : Span.span) (seg1 : stri
   if seg1 = "" then begin
     match subject with
     | Type_repr.Named (tid, args) -> (
-        match List.assoc_opt tid env.type_names with
+        match List.assoc_opt (Ids.Type_id.make tid) env.type_names with
         | Some name -> (
             match List.assoc_opt name env.nominals with
             | Some nom when nom.nom_kind = `Enum -> (
@@ -1304,7 +1312,7 @@ and resolve_variant (env : env) (_scope : scope) (span : Span.span) (seg1 : stri
             (* prefer the subject's arguments when the subject IS this enum *)
             let sargs =
               match subject with
-              | Type_repr.Named (sid, sargs) when Ids.Type_id.compare sid tid = 0 -> sargs
+              | Type_repr.Named (sid, sargs) when Ids.Type_id.compare (Ids.Type_id.make sid) tid = 0 -> sargs
               | _ -> args
             in
             let subst = List.map2 (fun (_, p) a -> (p, a)) nom.nom_params (Array.to_list sargs) in
@@ -1321,7 +1329,7 @@ and resolve_nominal (env : env) (span : Span.span) (name : string) :
   | None -> Error (err span (Printf.sprintf "unknown nominal type `%s`" name))
   | Some nom -> (
       match List.assoc_opt name env.types with
-      | Some (Type_repr.Named (tid, args)) -> Ok (nom, tid, args)
+      | Some (Type_repr.Named (tid, args)) -> Ok (nom, Ids.Type_id.make tid, args)
       | _ -> Error (err span (Printf.sprintf "`%s` is not a nominal type" name)))
 
 (* ────────────────────────────────────────────────────────────────
@@ -1414,8 +1422,8 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
           match expected with
           | Some (Type_repr.Fixed_array (t, n)) ->
               Ok { te_type = Type_repr.Fixed_array (t, n); te_effects = [||]; te_span = span }
-          | Some (Type_repr.Named (id, [| t |])) when Ids.Type_id.compare id b_array = 0 ->
-              Ok { te_type = Type_repr.Named (b_array, [| t |]); te_effects = [||]; te_span = span }
+          | Some (Type_repr.Named (id, [| t |])) when Ids.Type_id.compare (Ids.Type_id.make id) b_array = 0 ->
+              Ok { te_type = Type_repr.Named (Ids.Type_id.to_int b_array, [| t |]); te_effects = [||]; te_span = span }
           | _ -> Error (err span "cannot infer the element type of an empty array"))
       | first :: rest -> (
           match check_expr env scope None first with
@@ -1474,10 +1482,10 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
                          (List.map2
                             (fun (pname, _) stored ->
                               match List.assoc_opt pname scope.generics with
-                              | Some pid -> Type_repr.Type_param pid
+                              | Some pid -> Type_repr.Type_param (Ids.Generic_param_id.to_int pid)
                               | None -> (
                                   match stored with
-                                  | Type_repr.Type_param _ -> Type_repr.Type_param (fresh_param_id env.state)
+                                  | Type_repr.Type_param _ -> Type_repr.Type_param (Ids.Generic_param_id.to_int (fresh_param_id env.state))
                                   | other -> other))
                             nom.nom_params (Array.to_list a)))
                 | _ -> Ok [||])
@@ -1522,7 +1530,7 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
             match go [] fields with
             | Error m -> Error m
             | Ok fes -> (
-                let lit_ty = Type_repr.Named (tid, lit_args) in
+                let lit_ty = Type_repr.Named (Ids.Type_id.to_int tid, lit_args) in
                 let rest_ok =
                   match rest with
                   | None -> Ok [||]
@@ -1558,11 +1566,11 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
               match te.te_type with
               | Type_repr.Fixed_array (t, _) ->
                   Ok { te_type = t; te_effects = Array.append te.te_effects [| Access_effect.Read |]; te_span = span }
-              | Type_repr.Named (id, [| t |]) when Ids.Type_id.compare id b_array = 0 ->
+              | Type_repr.Named (id, [| t |]) when Ids.Type_id.compare (Ids.Type_id.make id) b_array = 0 ->
                   Ok { te_type = t; te_effects = Array.append te.te_effects [| Access_effect.Read |]; te_span = span }
               | Type_repr.Named (id, [| t |]) -> (
                   (* the kernel's Array/Vec containers are indexable *)
-                  match List.assoc_opt id env.type_names with
+                  match List.assoc_opt (Ids.Type_id.make id) env.type_names with
                   | Some ("Array" | "Vec") ->
                       Ok { te_type = t; te_effects = Array.append te.te_effects [| Access_effect.Read |]; te_span = span }
                   | _ ->
@@ -1618,7 +1626,8 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
       | Ok te -> (
           match te.te_type with
           | Type_repr.Named (id, [| t |])
-            when Ids.Type_id.compare id b_option = 0 || Ids.Type_id.compare id b_result = 0 ->
+            when Ids.Type_id.compare (Ids.Type_id.make id) b_option = 0
+                 || Ids.Type_id.compare (Ids.Type_id.make id) b_result = 0 ->
               Ok { te_type = t; te_effects = te.te_effects; te_span = span }
           | _ ->
               Error
@@ -1781,10 +1790,10 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
           let elem_ty =
             match te.te_type with
             | Type_repr.Fixed_array (t, _) -> Some t
-            | Type_repr.Named (id, [| t |]) when Ids.Type_id.compare id b_array = 0 -> Some t
+            | Type_repr.Named (id, [| t |]) when Ids.Type_id.compare (Ids.Type_id.make id) b_array = 0 -> Some t
             | Type_repr.Named (id, [| t |]) -> (
                 (* the kernel's Array/Vec containers are iterable *)
-                match List.assoc_opt id env.type_names with
+                match List.assoc_opt (Ids.Type_id.make id) env.type_names with
                 | Some ("Array" | "Vec") -> Some t
                 | _ -> None)
             | Type_repr.String -> Some Type_repr.Char
@@ -2150,10 +2159,10 @@ and check_place (env : env) (scope : scope) (e : Ast.expr) : (Type_repr.t * bool
       | Ok (bt, bmut) -> (
           match bt with
           | Type_repr.Fixed_array (t, _) -> Ok (t, bmut)
-          | Type_repr.Named (id, [| t |]) when Ids.Type_id.compare id b_array = 0 -> Ok (t, bmut)
+          | Type_repr.Named (id, [| t |]) when Ids.Type_id.compare (Ids.Type_id.make id) b_array = 0 -> Ok (t, bmut)
           | Type_repr.Named (id, [| t |]) -> (
               (* the kernel's Array/Vec containers are indexable *)
-              match List.assoc_opt id env.type_names with
+              match List.assoc_opt (Ids.Type_id.make id) env.type_names with
               | Some ("Array" | "Vec") -> Ok (t, bmut)
               | _ -> (
                   match check_expr env scope None idx with
@@ -2187,7 +2196,7 @@ and check_field (env : env) (_scope : scope) (span : Span.span) (base : typed_ex
   | _ -> (
       match base.te_type with
       | Type_repr.Named (tid, args) -> (
-          match List.assoc_opt tid env.type_names with
+          match List.assoc_opt (Ids.Type_id.make tid) env.type_names with
           | Some owner -> (
               match List.assoc_opt owner env.nominals with
               | Some nom when nom.nom_kind = `Struct -> (
@@ -2394,7 +2403,7 @@ and check_call (env : env) (scope : scope) (expected : Type_repr.t option)
                                 | Some (Type_repr.Named (tid, _)) ->
                                     List.filter_map
                                       (fun (t, n) ->
-                                        if Ids.Type_id.compare t tid = 0 then Some n else None)
+                                        if Ids.Type_id.compare t (Ids.Type_id.make tid) = 0 then Some n else None)
                                       env.type_names
                                 | _ -> []
                               in
@@ -2565,8 +2574,8 @@ and check_call_sig (env : env) (scope : scope) (expected : Type_repr.t option)
                       let same_named_arg () =
                         match pt, ate.te_type with
                         | Type_repr.Named (id1, a1), Type_repr.Named (id2, a2)
-                          when Ids.Type_id.compare id1 id2 <> 0 -> (
-                            match List.assoc_opt id1 env.type_names, List.assoc_opt id2 env.type_names with
+                          when Ids.Type_id.compare (Ids.Type_id.make id1) (Ids.Type_id.make id2) <> 0 -> (
+                            match List.assoc_opt (Ids.Type_id.make id1) env.type_names, List.assoc_opt (Ids.Type_id.make id2) env.type_names with
                             | Some n, Some m2 when n = m2 ->
                                 if Array.length a1 <> Array.length a2 then None
                                 else begin
@@ -2654,9 +2663,9 @@ and check_call_sig (env : env) (scope : scope) (expected : Type_repr.t option)
                let rec same_named_ret a b =
                  match a, b with
                  | Type_repr.Named (id1, a1), Type_repr.Named (id2, a2)
-                   when Ids.Type_id.compare id1 id2 <> 0 -> (
-                     let n1 = List.assoc_opt id1 env.type_names in
-                     let n2 = List.assoc_opt id2 env.type_names in
+                   when Ids.Type_id.compare (Ids.Type_id.make id1) (Ids.Type_id.make id2) <> 0 -> (
+                     let n1 = List.assoc_opt (Ids.Type_id.make id1) env.type_names in
+                     let n2 = List.assoc_opt (Ids.Type_id.make id2) env.type_names in
                      let alias_pair =
                        match n1, n2 with
                        | Some n, Some m ->
@@ -2716,7 +2725,7 @@ and check_call_sig (env : env) (scope : scope) (expected : Type_repr.t option)
                if not (List.mem_assoc p !subst) then begin
                  let fresh = Ids.Generic_param_id.make env.state.next_param_id in
                  env.state.next_param_id <- env.state.next_param_id + 1;
-                 subst := (p, Type_repr.Type_param fresh) :: !subst
+                 subst := (p, Type_repr.Type_param (Ids.Generic_param_id.to_int fresh)) :: !subst
                end)
              residual
        | _ :: _, Some _ -> ());
@@ -2743,7 +2752,7 @@ and check_call_sig (env : env) (scope : scope) (expected : Type_repr.t option)
              (fun (_, pid) ->
                match List.assoc_opt pid !subst with
                | Some t -> substitute_fixpoint !subst t
-               | None -> Type_repr.Type_param pid)
+               | None -> Type_repr.Type_param (Ids.Generic_param_id.to_int pid))
              sig_.ts_params_decl)
       in
       let call : typed_call =
@@ -2768,7 +2777,7 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
   let owner_name =
     match owner_ty with
     | Type_repr.Named (tid, _) -> (
-        match List.assoc_opt tid env.type_names with
+        match List.assoc_opt (Ids.Type_id.make tid) env.type_names with
         | Some n -> Some n
         | None -> primitive_name owner_ty)
     | Type_repr.Fixed_array _ -> Some "Array"
@@ -2781,7 +2790,7 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
     | None -> (
         match owner_ty with
         | Type_repr.Type_param pid -> (
-            match List.assoc_opt pid env.impls.Trait_solver.param_bounds with
+            match List.assoc_opt (Ids.Generic_param_id.make pid) env.impls.Trait_solver.param_bounds with
             | Some bounds -> List.map fst bounds
             | None -> [])
         | _ -> [])
@@ -2844,12 +2853,12 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
                       let same_name () =
                         match self_ty, owner_ty with
                         | Type_repr.Named (id1, a1), Type_repr.Named (id2, a2)
-                          when Ids.Type_id.compare id1 id2 <> 0 -> (
+                          when Ids.Type_id.compare (Ids.Type_id.make id1) (Ids.Type_id.make id2) <> 0 -> (
                             (* the method key's owner name is the authority:
                                the builtin Vec nominal is named "Array", so
                                (Vec, len) matches a receiver named "Vec" *)
-                            let n1 = List.assoc_opt id1 env.type_names in
-                            let n2 = List.assoc_opt id2 env.type_names in
+                            let n1 = List.assoc_opt (Ids.Type_id.make id1) env.type_names in
+                            let n2 = List.assoc_opt (Ids.Type_id.make id2) env.type_names in
                             let names_agree =
                               match n1, n2 with
                               | Some n, Some m -> n = m || n = oname || m = oname
@@ -3021,7 +3030,7 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
                        (fun (_, pid) ->
                          match List.assoc_opt pid !subst with
                          | Some t -> substitute_fixpoint !subst t
-                         | None -> Type_repr.Type_param pid)
+                         | None -> Type_repr.Type_param (Ids.Generic_param_id.to_int pid))
                        sig_.ts_params_decl)
                 in
                 let call : typed_call =
@@ -3180,7 +3189,7 @@ and check_trait (env : env) (d : Ast.trait_decl) : (unit, string) result =
   in
   let scope = { empty_scope with generics = params } in
   let* where = resolve_where env scope d.t_where in
-  let env' = { env with current_self = Some (Type_repr.Type_param (fresh_param_id env.state)) } in
+  let env' = { env with current_self = Some (Type_repr.Type_param (Ids.Generic_param_id.to_int (fresh_param_id env.state))) } in
   let tp_bounds =
     List.map (fun (tp : Ast.type_param) -> (tp.tp_name, tp.tp_bounds)) d.t_type_params
   in
@@ -3358,7 +3367,10 @@ and register_methods (env : env) (owner : string) (methods : Ast.function_decl l
 and register_constructors (env : env) (ename : string) (tid : Ids.Type_id.t)
     (params : (string * Ids.Generic_param_id.t) list)
     (variants : (string * Type_repr.t array) list) : (env, string) result =
-  let ret_ty = Type_repr.Named (tid, Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param p) params)) in
+  let ret_ty =
+    Type_repr.Named
+      (Ids.Type_id.to_int tid, Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param (Ids.Generic_param_id.to_int p)) params))
+  in
   let rec go env = function
     | [] -> Ok env
     | (vname, field_tys) :: rest -> (
@@ -3413,7 +3425,7 @@ and register_impl (env : env) (d : Ast.impl_decl) : (env, string) result =
           (fun b ->
             {
               Trait_solver.trait_name = b;
-              self_ty = Type_repr.Type_param (List.assoc tp.tp_name impl_params);
+              self_ty = Type_repr.Type_param (Ids.Generic_param_id.to_int (List.assoc tp.tp_name impl_params));
               type_args = [||];
             })
           tp.tp_bounds)
@@ -3485,7 +3497,7 @@ and register_item (env : env) (item : Ast.item) : (env, string) result =
         | Some nom -> (Some nom, env)
         | None ->
             let tid = fresh_type_id env.state in
-            let param_tys = Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param p) params) in
+            let param_tys = Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param (Ids.Generic_param_id.to_int p)) params) in
             let nom : nominal =
               { nom_kind = `Struct; nom_params = params; nom_fields = []; nom_variants = []; nom_where = [] }
             in
@@ -3493,7 +3505,7 @@ and register_item (env : env) (item : Ast.item) : (env, string) result =
             let env' =
               {
                 env with
-                types = (d.s_name, Type_repr.Named (tid, param_tys)) :: List.remove_assoc d.s_name env.types;
+                types = (d.s_name, Type_repr.Named (Ids.Type_id.to_int tid, param_tys)) :: List.remove_assoc d.s_name env.types;
                 type_ids = (d.s_name, tid) :: List.remove_assoc d.s_name env.type_ids;
                 type_names = (tid, d.s_name) :: env.type_names;
                 nominals = (d.s_name, nom) :: env.nominals;
@@ -3502,7 +3514,7 @@ and register_item (env : env) (item : Ast.item) : (env, string) result =
             (None, env')
       in
       let tid = List.assoc d.s_name env_base.type_ids in
-      let param_tys = Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param p) params) in
+      let param_tys = Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param (Ids.Generic_param_id.to_int p)) params) in
       let env_fwd = env_base in
       (* resolve fields one by one; unresolvable ones are reported and
          retried by the driver *)
@@ -3527,7 +3539,7 @@ and register_item (env : env) (item : Ast.item) : (env, string) result =
         { nom_kind = `Struct; nom_params = params; nom_fields = fields; nom_variants = []; nom_where = where }
       in
       let env1 = { env_fwd with nominals = (d.s_name, nom) :: List.remove_assoc d.s_name env_fwd.nominals } in
-      let env2 = { env1 with current_self = Some (Type_repr.Named (tid, param_tys)) } in
+      let env2 = { env1 with current_self = Some (Type_repr.Named (Ids.Type_id.to_int tid, param_tys)) } in
       match register_methods env2 d.s_name d.s_methods params where with
       | Ok env3 -> (match errs with [] -> Ok env3 | e :: _ -> Error e)
       | Error m -> Error m)
@@ -3542,14 +3554,14 @@ and register_item (env : env) (item : Ast.item) : (env, string) result =
         | Some nom -> (Some nom, env)
         | None ->
             let tid = fresh_type_id env.state in
-            let param_tys = Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param p) params) in
+            let param_tys = Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param (Ids.Generic_param_id.to_int p)) params) in
             let nom : nominal =
               { nom_kind = `Enum; nom_params = params; nom_fields = []; nom_variants = []; nom_where = [] }
             in
             let env' =
               {
                 env with
-                types = (d.e_name, Type_repr.Named (tid, param_tys)) :: List.remove_assoc d.e_name env.types;
+                types = (d.e_name, Type_repr.Named (Ids.Type_id.to_int tid, param_tys)) :: List.remove_assoc d.e_name env.types;
                 type_ids = (d.e_name, tid) :: List.remove_assoc d.e_name env.type_ids;
                 type_names = (tid, d.e_name) :: env.type_names;
                 nominals = (d.e_name, nom) :: env.nominals;
@@ -3558,7 +3570,7 @@ and register_item (env : env) (item : Ast.item) : (env, string) result =
             (None, env')
       in
       let tid = List.assoc d.e_name env_base.type_ids in
-      let _param_tys = Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param p) params) in
+      let _param_tys = Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param (Ids.Generic_param_id.to_int p)) params) in
       let env_fwd = env_base in
       let variants_acc, errs =
         List.fold_left
@@ -3610,7 +3622,7 @@ and register_item (env : env) (item : Ast.item) : (env, string) result =
       in
       let scope = { empty_scope with generics = params } in
       let* where = resolve_where env1 scope d.t_where in
-      let env2 = { env1 with current_self = Some (Type_repr.Type_param (fresh_param_id env1.state)) } in
+      let env2 = { env1 with current_self = Some (Type_repr.Type_param (Ids.Generic_param_id.to_int (fresh_param_id env1.state))) } in
       register_methods env2 d.t_name d.t_methods params where
   | Ast.ImplBlock d -> register_impl env d
   | Ast.ConstDecl d ->
@@ -3808,14 +3820,14 @@ let rec register_headers (env : env) (acc : string list) = function
                 d.s_type_params
             in
             let tid = fresh_type_id env.state in
-            let param_tys = Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param p) params) in
+            let param_tys = Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param (Ids.Generic_param_id.to_int p)) params) in
             let nom : nominal =
               { nom_kind = `Struct; nom_params = params; nom_fields = []; nom_variants = []; nom_where = [] }
             in
             let env' =
               {
                 env with
-                types = (d.s_name, Type_repr.Named (tid, param_tys)) :: List.remove_assoc d.s_name env.types;
+                types = (d.s_name, Type_repr.Named (Ids.Type_id.to_int tid, param_tys)) :: List.remove_assoc d.s_name env.types;
                 type_ids = (d.s_name, tid) :: List.remove_assoc d.s_name env.type_ids;
                 type_names = (tid, d.s_name) :: env.type_names;
                 nominals = (d.s_name, nom) :: env.nominals;
@@ -3831,14 +3843,14 @@ let rec register_headers (env : env) (acc : string list) = function
                 d.e_type_params
             in
             let tid = fresh_type_id env.state in
-            let param_tys = Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param p) params) in
+            let param_tys = Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param (Ids.Generic_param_id.to_int p)) params) in
             let nom : nominal =
               { nom_kind = `Enum; nom_params = params; nom_fields = []; nom_variants = []; nom_where = [] }
             in
             let env' =
               {
                 env with
-                types = (d.e_name, Type_repr.Named (tid, param_tys)) :: List.remove_assoc d.e_name env.types;
+                types = (d.e_name, Type_repr.Named (Ids.Type_id.to_int tid, param_tys)) :: List.remove_assoc d.e_name env.types;
                 type_ids = (d.e_name, tid) :: List.remove_assoc d.e_name env.type_ids;
                 type_names = (tid, d.e_name) :: env.type_names;
                 nominals = (d.e_name, nom) :: env.nominals;
