@@ -34,9 +34,19 @@ fi
 TESTS="$(grep -oE '[0-9]+ passed, 0 failed' <<<"$TEST_OUT" | head -1)"
 
 # Enumerate the required self-checks from the dune file so new ones are
-# automatically required.
-NAMES_LINE="$(grep -E '^\s*\(names' selfcheck/dune | head -1)"
-NAMES="$(echo "$NAMES_LINE" | sed -E 's/.*\(names[[:space:]]*//; s/[[:space:]]*\).*//')"
+# automatically required. The (names ...) block may span several lines.
+NAMES="$(
+  awk '/\(names/ {
+         line=$0
+         sub(/.*\(names[[:space:]]*/, "", line)
+         if (line ~ /\)/) { sub(/[[:space:]]*\).*/, "", line); print line; exit }
+         print line
+         in_names=1
+         next
+       }
+       in_names && /\)/ { sub(/[[:space:]]*\).*/, ""); print; exit }
+       in_names { print }' selfcheck/dune
+)"
 SELFCHECK_COUNT=0
 SELFCHECK_FAIL=0
 for name in $NAMES; do
