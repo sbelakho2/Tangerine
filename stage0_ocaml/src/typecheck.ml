@@ -659,8 +659,28 @@ let builtin_methods (st : state) : ((string * string) * typed_signature) list =
         simple ~owner:"String" ~owner_ty:s_ty ~name:"eq" ~params:[ par "other" let_ s_ty ] ~ret:b_ty ~decl:[] ~where:[] ~recv_conv:let_;
       ]
   in
+  (* trait-name-keyed entries: a generic receiver with a trait bound
+     (`fn f[T: Hash](x: T)`) dispatches through candidate_owners = the
+     bound trait names; the methods table must carry (Hash, hash),
+     (Eq, eq), (Display, fmt), (Clone, clone) keys whose self is the
+     trait's generic parameter, so the bound's methods resolve *)
+  let generic_self = Type_repr.Type_param (Ids.Generic_param_id.to_int (fresh_param_id st)) in
+  let m_traits =
+    [
+      ("Hash", "hash", [ ("self", let_, generic_self) ], i_ty);
+      ("Eq", "eq", [ ("self", let_, generic_self); ("other", let_, generic_self) ], b_ty);
+      ("Eq", "ne", [ ("self", let_, generic_self); ("other", let_, generic_self) ], b_ty);
+      ("Display", "fmt", [ ("self", let_, generic_self) ], s_ty);
+      ("Clone", "clone", [ ("self", let_, generic_self) ], generic_self);
+    ]
+    |> List.map (fun (owner, name, params, ret) ->
+           ((owner, name),
+            mk_sig st ~name:("builtin::" ^ owner ^ "::" ^ name) ~params_decl:[]
+              ~params ~ret ~where:[]))
+  in
   m_string @ m_str @ m_int @ m_uint @ m_small_int @ m_float @ m_bool @ m_char
   @ m_vec @ m_array @ m_opt @ m_res @ m_map @ m_set @ m_display @ m_hash @ m_eq
+  @ m_traits
 
 (* ─── builtin variant constructors ─── *)
 let builtin_constructors (st : state) : (string * typed_signature) list =
