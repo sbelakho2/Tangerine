@@ -2240,8 +2240,6 @@ and check_name (env : env) (scope : scope) (expected : Type_repr.t option) (n : 
     (span : Span.span) : (typed_expr, string) result =
   match assoc_local n scope.locals with
       | Some (t, _) ->
-      (if span.Span.start >= 74430 && span.Span.start <= 74450 then
-         Printf.eprintf "DBG name %s local=%s span=%d\n" n (type_to_string t) span.Span.start);
       let subst = ref [] in
       (match expected with
        | Some exp -> (
@@ -3820,10 +3818,6 @@ let run_oracle (env : env) (_item_name : string) : string list =
   List.iter
     (fun (te : typed_expr) ->
       let illegal = List.filter (fun p -> not (List.mem p st.current_item_params)) (params_in te.te_type) in
-      (if illegal <> [] && (st.current_item = "def windows" || st.current_item = "def catch_panic") then
-         Printf.eprintf "DBG oracle %s ty=%s span=%d..%d params=%s\n" st.current_item
-           (type_to_string te.te_type) te.te_span.Span.start te.te_span.Span.end_
-           (String.concat "," (List.map (fun p -> string_of_int (Ids.Generic_param_id.to_int p)) st.current_item_params)));
       if illegal <> [] then begin
         o.o_type_params <- o.o_type_params + List.length illegal;
         o.o_unsolved_vars <- o.o_unsolved_vars + 1
