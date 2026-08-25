@@ -845,11 +845,7 @@ and function_constant_type (ctx : ctx) (inst : Instance_id.t) : Type_repr.t =
   match find_function_by_instance ctx inst with
   | Some f ->
       let ret = if Array.length f.locals > 0 then f.locals.(0) else Type_repr.Unit in
-      Type_repr.Function
-        ( Array.map
-            (fun (_, ty) -> { Type_repr.pt_convention = Access_effect.Let; pt_type = ty })
-            f.params,
-          ret )
+      Type_repr.Function (f.params, ret)
   | None -> Type_repr.Unit
 
 and find_function_by_instance (ctx : ctx) (inst : Instance_id.t) : function_ option =
@@ -1030,8 +1026,9 @@ let check_aggregate (ctx : ctx) (fn : function_) (bb_ctx : string) (kind : aggre
                      bb_ctx (Array.length f.params) (Array.length sig_params))
               else
                 Array.iteri
-                  (fun i (_, pt) ->
-                    if not (types_compatible ctx pt sig_params.(i).Type_repr.pt_type) then
+                  (fun i p ->
+                    if not (types_compatible ctx p.Type_repr.pt_type sig_params.(i).Type_repr.pt_type)
+                    then
                       add_err ctx
                         (Printf.sprintf
                            "%s: closure aggregate instance parameter %d type mismatch" bb_ctx i))
@@ -1200,15 +1197,28 @@ let check_call (ctx : ctx) (fn : function_) (bb_ctx : string) (dest : place)
                             bb_ctx i (Seed_mir.print_effect arg.effect_))
                    | _ -> ()));
               match (if i < Array.length cf.params then Some cf.params.(i) else None) with
-               | Some (_, pty) -> (
+               | Some p -> (
+                   (* the documented exactness rule: a call argument's
+                      access effect must be the read-side of the callee's
+                      parameter convention (Let->Read, Inout->Modify,
+                      Sink->Consume, Set->Initialize) *)
+                   let expected = Access_effect.read_effect p.Type_repr.pt_convention in
+                   if arg.effect_ <> expected then
+                     add_err ctx
+                       (Printf.sprintf
+                          "%s: call arg %d effect %s does not match the callee's %s convention (expected %s)"
+                          bb_ctx i (Seed_mir.print_effect arg.effect_)
+                          (Access_effect.to_string p.Type_repr.pt_convention)
+                          (Seed_mir.print_effect expected));
                    match
                      check_operand ctx fn bb_ctx arg.value running moved ~as_call_arg:true
                    with
                    | Some aty ->
-                       if not (types_compatible ctx pty aty) then
+                       if not (types_compatible ctx p.Type_repr.pt_type aty) then
                          add_err ctx
                            (Printf.sprintf "%s: call arg %d type mismatch: expected %s got %s"
-                              bb_ctx i (Seed_mir.print_type pty) (Seed_mir.print_type aty))
+                              bb_ctx i (Seed_mir.print_type p.Type_repr.pt_type)
+                              (Seed_mir.print_type aty))
                    | None -> ())
                | None -> ())
             args;
@@ -1332,7 +1342,7 @@ let check_embedded_concreteness (ctx : ctx) (fn : function_) : unit =
         (Printf.sprintf "fn %s: %s carries an unresolved type parameter (%s)" fn.name what
            (Seed_mir.print_type ty))
   in
-  Array.iter (fun (_, ty) -> check_what "param" ty) fn.params;
+  Array.iter (fun p -> check_what "param" p.Type_repr.pt_type) fn.params;
   Array.iter (fun ty -> check_what "local" ty) fn.locals;
   let check_operand op =
     match op with
@@ -1402,7 +1412,8 @@ let verify_function (ctx : ctx) (fn : function_) : unit =
          (Array.length fn.locals))
   else
     Array.iteri
-      (fun i (_, pty) ->
+      (fun i p ->
+        let pty = p.Type_repr.pt_type in
         if not (types_compatible ctx fn.locals.(i + 1) pty) then
           add_err ctx
             (Printf.sprintf

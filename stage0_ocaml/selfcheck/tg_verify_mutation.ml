@@ -1,3 +1,4 @@
+let let_param (ty : Type_repr.t) : Type_repr.param_type = { Type_repr.pt_convention = Access_effect.Let; pt_type = ty }
 (* tg_verify_mutation.ml — mutation tests for the Seed MIR verifier
    (Mir_verify.require_valid, audit §36).
 
@@ -93,7 +94,7 @@ let base_arith () : Seed_mir.program =
     {
       Seed_mir.name = "entry";
       instance = inst 0;
-      params = [| (None, i64); (None, i64) |];
+      params = [| let_param(i64); let_param(i64) |];
       locals = [| i64; i64; i64; i64 |];
       blocks =
         [|
@@ -119,7 +120,7 @@ let base_arith () : Seed_mir.program =
     {
       Seed_mir.name = "add1";
       instance = inst 1;
-      params = [| (None, i64) |];
+      params = [| let_param(i64) |];
       locals = [| i64; i64 |];
       blocks =
         [|
@@ -143,7 +144,7 @@ let base_if_else () : Seed_mir.program =
     {
       Seed_mir.name = "branch";
       instance = inst 2;
-      params = [| (None, Type_repr.Bool) |];
+      params = [| let_param(Type_repr.Bool) |];
       locals = [| i64; Type_repr.Bool; i64 |];
       blocks =
         [|
@@ -168,7 +169,7 @@ let base_tuple () : Seed_mir.program =
     {
       Seed_mir.name = "mk_pair";
       instance = inst 3;
-      params = [| (None, i64); (None, i64) |];
+      params = [| let_param(i64); let_param(i64) |];
       locals = [| pair_ty; i64; i64 |];
       blocks =
         [|
@@ -191,7 +192,7 @@ let base_string () : Seed_mir.program =
     {
       Seed_mir.name = "echo";
       instance = inst 4;
-      params = [| (None, Type_repr.String) |];
+      params = [| let_param(Type_repr.String) |];
       locals = [| Type_repr.String; Type_repr.String |];
       blocks =
         [|
@@ -220,7 +221,7 @@ let mut_a2 () : Seed_mir.program =
     {
       Seed_mir.name = "f";
       instance = inst 5;
-      params = [| (None, Type_repr.String) |];
+      params = [| let_param(Type_repr.String) |];
       locals = [| i64; i64 |];
       blocks =
         [|
@@ -370,6 +371,107 @@ let mut_e2 () : Seed_mir.program =
     { bb0 with
       Seed_mir.terminator =
         Seed_mir.Call (place 0, Seed_mir.User (inst 99), [| call_arg 3 |], 1, None) };
+  prog
+
+(* ── (e2) access-effect exactness mutations (audit) ─────────────────── *)
+(* callee `con` declares Sink/Inout/Set params; the call's Read args
+   must not match those conventions (Read is the read-side of Let only). *)
+let base_conventions () : Seed_mir.program =
+  let entry =
+    {
+      Seed_mir.name = "entry";
+      instance = inst 0;
+      params = [||];
+      locals = [| i64; i64 |];
+      blocks =
+        [|
+          {
+            Seed_mir.id = 0;
+            statements = [ assign 1 (Seed_mir.Use (const_op (int_const 5L))) ];
+            terminator =
+              Seed_mir.Call (place 0, Seed_mir.User (inst 7), [| call_arg 1; call_arg 1; call_arg 1 |], 1, None);
+          };
+          { Seed_mir.id = 1; statements = []; terminator = Seed_mir.Ret };
+        |];
+      entry = 0;
+    }
+  in
+  let con =
+    {
+      Seed_mir.name = "con";
+      instance = inst 7;
+      params =
+        [|
+          { Type_repr.pt_convention = Access_effect.Sink; pt_type = i64 };
+          { Type_repr.pt_convention = Access_effect.Inout; pt_type = i64 };
+          { Type_repr.pt_convention = Access_effect.Set; pt_type = i64 };
+        |];
+      locals = [| i64; i64; i64; i64 |];
+      blocks =
+        [|
+          {
+            Seed_mir.id = 0;
+            statements = [];
+            terminator = Seed_mir.Ret;
+          };
+        |];
+      entry = 0;
+    }
+  in
+  prog_of [| entry; con |]
+
+(* e3: Read arg against the callee's Sink (Consume) convention. *)
+let mut_e3 () : Seed_mir.program = base_conventions ()
+(* e4: Read arg against the callee's Inout (Modify) convention. *)
+let mut_e4 () : Seed_mir.program = base_conventions ()
+(* e5: Read arg against the callee's Set (Initialize) convention. *)
+let mut_e5 () : Seed_mir.program = base_conventions ()
+(* e6: Consume arg against a Let callee param (Read convention). *)
+let mut_e6 () : Seed_mir.program =
+  let prog = base_arith () in
+  let entry = prog.Seed_mir.functions.(0) in
+  let bb0 = entry.Seed_mir.blocks.(0) in
+  entry.Seed_mir.blocks.(0) <-
+    { bb0 with
+      Seed_mir.terminator =
+        Seed_mir.Call
+          ( place 0,
+            Seed_mir.User (inst 1),
+            [| { Seed_mir.effect_ = Access_effect.Consume; value = copy 3 } |],
+            1,
+            None ) };
+  prog
+(* e7: Modify on a constant operand (that effect requires a place). *)
+let mut_e7 () : Seed_mir.program =
+  let prog = base_arith () in
+  let entry = prog.Seed_mir.functions.(0) in
+  let bb0 = entry.Seed_mir.blocks.(0) in
+  entry.Seed_mir.blocks.(0) <-
+    { bb0 with
+      Seed_mir.terminator =
+        Seed_mir.Call
+          ( place 0,
+            Seed_mir.User (inst 1),
+            [| { Seed_mir.effect_ = Access_effect.Modify; value = const_op (int_const 1L) } |],
+            1,
+            None ) };
+  prog
+(* e8: Consume of a place already consumed (double-use of local _3). *)
+let mut_e8 () : Seed_mir.program =
+  let prog = base_arith () in
+  let entry = prog.Seed_mir.functions.(0) in
+  let bb0 = entry.Seed_mir.blocks.(0) in
+  entry.Seed_mir.blocks.(0) <-
+    { bb0 with
+      Seed_mir.statements =
+        [ assign 2 (Seed_mir.Use (move 3)) ];
+      terminator =
+        Seed_mir.Call
+          ( place 0,
+            Seed_mir.User (inst 1),
+            [| { Seed_mir.effect_ = Access_effect.Consume; value = move 3 } |],
+            1,
+            None ) };
   prog
 
 (* ── (f) switch / target mutations ──────────────────────────────────── *)
@@ -658,6 +760,19 @@ let () =
     "call argument count mismatch" (mut_e1 ());
   expect_error "e2: call to an unknown callee instance rejected"
     "call to unknown function instance" (mut_e2 ());
+
+  expect_error "e3: Read arg against the callee's Sink (Consume) convention rejected"
+    "does not match the callee's sink convention" (mut_e3 ());
+  expect_error "e4: Read arg against the callee's Inout (Modify) convention rejected"
+    "does not match the callee's inout convention" (mut_e4 ());
+  expect_error "e5: Read arg against the callee's Set (Initialize) convention rejected"
+    "does not match the callee's set convention" (mut_e5 ());
+  expect_error "e6: Consume arg against a Let callee param rejected"
+    "does not match the callee's let convention" (mut_e6 ());
+  expect_error "e7: Modify on a constant operand rejected"
+    "requires a place operand" (mut_e7 ());
+  expect_error "e8: Consume of an already-consumed place rejected"
+    "use-after-move" (mut_e8 ());
 
   expect_error "f1: SwitchInt default target does not exist rejected"
     "references invalid block bb3" (mut_f1 ());

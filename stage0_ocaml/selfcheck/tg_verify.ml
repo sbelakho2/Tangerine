@@ -1,3 +1,4 @@
+let let_param (ty : Type_repr.t) : Type_repr.param_type = { Type_repr.pt_convention = Access_effect.Let; pt_type = ty }
 (* tg_verify.ml — mir_verify param-offset mutation self-check (audit §36).
 
    The local convention (seed_mir.ml): local _0 is the return slot;
@@ -39,7 +40,7 @@ let mk_fn (param_ty : Type_repr.t) (slot1_ty : Type_repr.t) : Seed_mir.function_
   {
     Seed_mir.name = "f";
     instance = Instance_id.make ~callable:(Ids.Callable_id.make 0) ~type_args:[||];
-    params = [| (None, param_ty) |];
+    params = [| let_param(param_ty) |];
     locals = [| i64_int; slot1_ty |];
     blocks =
       [|

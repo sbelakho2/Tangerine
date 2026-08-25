@@ -136,7 +136,7 @@ type block = {
 type function_ = {
   name : string;
   instance : Instance_id.t;
-  params : (Ids.Callable_id.t option * Type_repr.t) array;
+  params : Type_repr.param_type array;
   locals : Type_repr.t array;
   blocks : block array;
   entry : int;
@@ -330,8 +330,8 @@ let print_function (fn : function_) : string =
     String.concat ", "
       (Array.to_list
          (Array.mapi
-            (fun i (_, ty) ->
-              Printf.sprintf "_%d: %s" (i + 1) (print_type ty))
+            (fun i p ->
+              Printf.sprintf "_%d: %s" (i + 1) (print_type p.Type_repr.pt_type))
             fn.params))
   in
   Buffer.add_string buf

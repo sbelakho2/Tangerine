@@ -213,6 +213,7 @@ let () =
                   {
                     Mir_lower.ce_callable = Ids.Callable_id.to_int (ts_of n).Typecheck.ts_callable;
                     ce_template_args = [||];
+                    ce_params = [||];
                   } ))
               funcs;
           methods = [];
@@ -226,7 +227,7 @@ let () =
             let ts = ts_of n in
             Mir_lower.lower_function_with_variants variant_table
               { env2 with Mir_lower.fn_ret = ts.Typecheck.ts_return }
-              n (Ids.Callable_id.to_int ts.Typecheck.ts_callable) [||] d)
+              n (Ids.Callable_id.to_int ts.Typecheck.ts_callable) [||] [||] d)
           funcs
       in
       (* concrete enum defs (post-mono): a variant's payload is recorded
@@ -277,6 +278,7 @@ let () =
                 {
                   Mir_lower.ce_callable = 42;
                   ce_template_args = [| Type_repr.Type_param pid_t; Type_repr.Type_param pid_u |];
+                  ce_params = [||];
                 } );
             ];
         }
@@ -304,7 +306,7 @@ let () =
           fn_span = Span.synthetic;
         }
       in
-      let lowered = Mir_lower.lower_function_with_variants variant_table gen_env "f" 42 [| Type_repr.Type_param pid_t; Type_repr.Type_param pid_u |] gen_fn in
+      let lowered = Mir_lower.lower_function_with_variants variant_table gen_env "f" 42 [| Type_repr.Type_param pid_t; Type_repr.Type_param pid_u |] [||] gen_fn in
       (match lowered.Seed_mir.instance with
        | { Instance_id.callable = _; type_args = [| Type_repr.Type_param a; Type_repr.Type_param b |] } when
            Ids_core.Generic_param_id.compare a pid_t = 0

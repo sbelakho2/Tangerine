@@ -142,7 +142,7 @@ let specialize_under (subst : (Ids.Generic_param_id.t * Type_repr.t) list)
   {
     name = tmpl.name;
     instance = inst;
-    params = Array.map (fun (c, ty) -> (c, subst_ty ty)) tmpl.params;
+    params = Array.map (fun p -> { p with Type_repr.pt_type = subst_ty p.Type_repr.pt_type }) tmpl.params;
     locals = Array.map subst_ty tmpl.locals;
     blocks =
       Array.map
@@ -302,11 +302,11 @@ let build ~(entry : Instance_id.t) (prog : program) : (function_ array, string l
         err
           (Printf.sprintf "mono: instance %s has unresolved type arguments" (Seed_mir.print_instance inst));
       Array.iter
-        (fun (_, ty) ->
-          if Type_repr.has_type_param ty then
+        (fun p ->
+          if Type_repr.has_type_param p.Type_repr.pt_type then
             err
               (Printf.sprintf "mono: instantiated body of %s still carries a type parameter in a param type (%s)"
-                 body.name (Seed_mir.print_type ty)))
+                 body.name (Seed_mir.print_type p.Type_repr.pt_type)))
         body.params;
       Array.iter
         (fun ty ->

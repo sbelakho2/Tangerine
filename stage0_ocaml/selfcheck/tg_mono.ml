@@ -1,3 +1,4 @@
+let let_param (ty : Type_repr.t) : Type_repr.param_type = { Type_repr.pt_convention = Access_effect.Let; pt_type = ty }
 (* tg_mono.ml — Monomorphizer exact-arity and specialization self-check
    (audit P0: "Preserve generic substitutions through lowering").
 
@@ -92,7 +93,7 @@ let mk_fn (name : string) (instance : Instance_id.t) (params : Type_repr.t array
     Seed_mir.function_ =
   { Seed_mir.name;
     instance;
-    params = Array.map (fun ty -> (None, ty)) params;
+    params = Array.map (fun ty -> let_param(ty)) params;
     locals;
     blocks;
     entry }
@@ -127,7 +128,7 @@ let find_by_callable (prog : Seed_mir.program) (c : int) : Seed_mir.function_ li
 
 let fn_is_concrete (f : Seed_mir.function_) : bool =
   not (Array.exists Type_repr.has_type_param (Instance_id.type_args f.Seed_mir.instance))
-  && Array.for_all (fun (_, ty) -> not (Type_repr.has_type_param ty)) f.Seed_mir.params
+  && Array.for_all (fun p -> not (Type_repr.has_type_param p.Type_repr.pt_type)) f.Seed_mir.params
   && not (Array.exists Type_repr.has_type_param f.Seed_mir.locals)
 
 (* ── (a) two concrete instantiations of one template ──────────────── *)
@@ -173,13 +174,13 @@ let check_two_instantiations () =
          let has_int =
            List.exists (fun f ->
                Instance_id.type_args f.Seed_mir.instance = [| i64 |]
-               && (snd f.Seed_mir.params.(0)) = i64)
+               && f.Seed_mir.params.(0).Type_repr.pt_type = i64)
              f_ints
          in
          let has_str =
            List.exists (fun f ->
                Instance_id.type_args f.Seed_mir.instance = [| string_ty |]
-               && (snd f.Seed_mir.params.(0)) = string_ty)
+               && f.Seed_mir.params.(0).Type_repr.pt_type = string_ty)
              f_ints
          in
          if not (has_int && has_str) then
@@ -389,13 +390,13 @@ let check_generic_callers () =
          let has_int =
            List.exists (fun f ->
                Instance_id.type_args f.Seed_mir.instance = [| i64 |]
-               && (snd f.Seed_mir.params.(0)) = i64)
+               && f.Seed_mir.params.(0).Type_repr.pt_type = i64)
              inner_ints
          in
          let has_str =
            List.exists (fun f ->
                Instance_id.type_args f.Seed_mir.instance = [| string_ty |]
-               && (snd f.Seed_mir.params.(0)) = string_ty)
+               && f.Seed_mir.params.(0).Type_repr.pt_type = string_ty)
              inner_ints
          in
          (match Mir_verify.require_valid mono_prog with
@@ -448,13 +449,13 @@ let check_nested_generics () =
        let outer_ok =
          List.exists (fun f ->
              Instance_id.type_args f.Seed_mir.instance = [| i64 |]
-             && (snd f.Seed_mir.params.(0)) = vec_ty i64)
+             && f.Seed_mir.params.(0).Type_repr.pt_type = vec_ty i64)
            outer_fns
        in
        let inner_ok =
          List.exists (fun f ->
              Instance_id.type_args f.Seed_mir.instance = [| vec_ty i64 |]
-             && (snd f.Seed_mir.params.(0)) = vec_ty i64)
+             && f.Seed_mir.params.(0).Type_repr.pt_type = vec_ty i64)
            inner_fns
        in
        let all_concrete = List.for_all fn_is_concrete (Array.to_list mono_prog.Seed_mir.functions) in

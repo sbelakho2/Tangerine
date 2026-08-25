@@ -96,7 +96,7 @@ let () =
                 | Ast.Function d ->
                     Some
                       ( d.Ast.fn_sig.Ast.sig_name,
-                        { Mir_lower.ce_callable = 0; ce_template_args = [||] } )
+                        { Mir_lower.ce_callable = 0; ce_template_args = [||]; ce_params = [||] } )
                 | _ -> None)
               program.Ast.items
             |> List.mapi (fun i (n, e) -> (n, { e with Mir_lower.ce_callable = i }));

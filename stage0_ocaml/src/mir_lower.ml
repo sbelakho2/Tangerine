@@ -62,6 +62,7 @@ let seed_bug fmt = Printf.ksprintf (fun m -> raise (Seed_bug m)) fmt
 type callable_entry = {
   ce_callable : int;                    (* resolved callable id *)
   ce_template_args : Type_repr.t array; (* declaration-order template params for generic defs *)
+  ce_params : Type_repr.param_type array; (* callee parameter contracts (conventions in order) *)
 }
 
 type func_env = {
@@ -1325,10 +1326,22 @@ and lower_call (env : func_env) (st : lower_state) (callee : Ast.expr)
               let arg_ops = List.map (fun a -> fst (lower_expr env st a.Ast.ca_value)) args in
               let id = fresh_local st ty in
               let rp = cur_place st id in
+              (* the typed parameter contracts are authoritative for the
+                 argument access effects (Let->Read, Inout->Modify,
+                 Sink->Consume, Set->Initialize), so ownership semantics
+                 survive into MIR and the verifier can enforce exactness *)
+              let ce_params = entry.ce_params in
               let arg_vals =
                 Array.of_list
-                  (List.map
-                     (fun op -> { Seed_mir.effect_ = Access_effect.Read; value = op })
+                  (List.mapi
+                     (fun i op ->
+                       {
+                         Seed_mir.effect_ =
+                           (if i < Array.length ce_params then
+                             Access_effect.read_effect ce_params.(i).Type_repr.pt_convention
+                            else Access_effect.Read);
+                         value = op;
+                       })
                      arg_ops)
               in
               let next_b = new_block st in
@@ -1352,8 +1365,8 @@ and emit_defers (env : func_env) (st : lower_state) : unit =
 (* ── Function lowering ────────────────────────────────────────── *)
 
 let lower_function_with_variants (variants : variant_table) (env : func_env) (name : string)
-    (callable : int) (template_args : Type_repr.t array) (fn : Ast.function_decl) :
-    Seed_mir.function_ =
+    (callable : int) (template_args : Type_repr.t array)
+    (param_conventions : Access_effect.t array) (fn : Ast.function_decl) : Seed_mir.function_ =
   let st =
     {
       next_local = 0;
@@ -1406,7 +1419,17 @@ let lower_function_with_variants (variants : variant_table) (env : func_env) (na
    | Some (vo, _) -> emit st (Seed_mir.Assign (cur_place st 0, Seed_mir.Use vo))
    | None -> ());
   set_terminator st Seed_mir.Ret;
-  let params = Array.of_list (List.map (fun ty -> (None, ty)) param_tys) in
+  let params =
+    Array.of_list
+      (List.mapi
+         (fun i ty ->
+           let convention =
+             if i < Array.length param_conventions then param_conventions.(i)
+             else Access_effect.Let
+           in
+           { Type_repr.pt_convention = convention; pt_type = ty })
+         param_tys)
+  in
   {
     Seed_mir.name;
     (* the template instance carries the declaration-order generic params,
@@ -1426,7 +1449,7 @@ let lower_function_with_variants (variants : variant_table) (env : func_env) (na
    lower_function_with_variants. *)
 let lower_function (env : func_env) (name : string) (callable : int) (fn : Ast.function_decl) :
     Seed_mir.function_ =
-  lower_function_with_variants default_variant_table env name callable [||] fn
+  lower_function_with_variants default_variant_table env name callable [||] [||] fn
 
 (* ── Statics/consts (audit §35) ─────────────────────────────────
    TODO: Ast.ConstDecl/Ast.StaticDecl exist and the typechecker keeps a

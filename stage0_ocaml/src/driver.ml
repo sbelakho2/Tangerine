@@ -153,6 +153,7 @@ let lowering_env_of (env : Typecheck.env) : Mir_lower.func_env =
                 (List.map
                    (fun (_, pid) -> Type_repr.Type_param pid)
                    ts.Typecheck.ts_params_decl);
+            ce_params = ts.Typecheck.ts_params;
           }
         in
         let bare =
@@ -203,9 +204,15 @@ let lower_and_report (path : string) (env : Typecheck.env) (program : Ast.progra
                      ts.Typecheck.ts_params_decl) )
           | None -> (Type_repr.Unit, i, [||])
         in
+        let conventions =
+          match lookup_typed_fn env d.Ast.fn_sig.Ast.sig_name with
+          | Some ts ->
+              Array.map (fun p -> p.Type_repr.pt_convention) ts.Typecheck.ts_params
+          | None -> [||]
+        in
         Mir_lower.lower_function_with_variants Mir_lower.default_variant_table
           { base with Mir_lower.fn_ret }
-          d.Ast.fn_sig.Ast.sig_name callable template_args d)
+          d.Ast.fn_sig.Ast.sig_name callable template_args conventions d)
       funcs
   in
   let prog =
@@ -912,7 +919,7 @@ let count_residual_type_params (prog : Seed_mir.program) : int =
   Array.iter
     (fun (f : Seed_mir.function_) ->
       Array.iter tp (Instance_id.type_args f.Seed_mir.instance);
-      Array.iter (fun (_, ty) -> tp ty) f.Seed_mir.params;
+      Array.iter (fun p -> tp p.Type_repr.pt_type) f.Seed_mir.params;
       Array.iter tp f.Seed_mir.locals;
       Array.iter
         (fun (b : Seed_mir.block) ->
