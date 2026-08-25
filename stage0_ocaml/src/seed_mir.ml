@@ -142,10 +142,61 @@ type function_ = {
   entry : int;
 }
 
+(* ── Type definitions ────────────────────────────────────────────────
+   program.types holds explicit definitions (audit): a struct is a
+   StructDef whose fields carry the semantic Field_id, the local
+   Field_index and the field type; an enum is an EnumDef whose variants
+   carry the semantic Variant_id, the declaration-order Variant_index
+   and the payload type (Tuple for multi-field payloads, Unit for none).
+   def_repr reconstructs the historical Type_repr encoding (Tuple for
+   structs, Function(payloads, Never) for enums) so type-shape checks
+   that consumed the old encoding keep their semantics. *)
+
+type field_def = {
+  fd_id : Ids.Field_id.t;        (* semantic field identity *)
+  fd_index : Ids.Field_index.t;  (* declaration-order position within the owner def *)
+  fd_ty : Type_repr.t;
+}
+
+type variant_def = {
+  vd_id : Ids.Variant_id.t;      (* semantic variant identity *)
+  vd_index : Ids.Variant_index.t; (* declaration-order tag = discriminant *)
+  vd_payload : Type_repr.t;      (* Tuple of payload types; Unit when none *)
+}
+
+type type_def =
+  | StructDef of { sd_id : Ids.Type_id.t; sd_fields : field_def list }
+  | EnumDef of { ed_id : Ids.Type_id.t; ed_variants : variant_def list }
+
+let def_id = function
+  | StructDef { sd_id; _ } -> sd_id
+  | EnumDef { ed_id; _ } -> ed_id
+
+let def_repr (d : type_def) : Type_repr.t =
+  match d with
+  | StructDef { sd_fields; _ } ->
+      Type_repr.Tuple
+        (Array.of_list
+           (List.map
+              (fun f -> f.fd_ty)
+              (List.sort
+                 (fun a b -> Ids.Field_index.compare a.fd_index b.fd_index)
+                 sd_fields)))
+  | EnumDef { ed_variants; _ } ->
+      Type_repr.Function
+        ( Array.of_list
+            (List.map
+               (fun v ->
+                 { Type_repr.pt_convention = Access_effect.Let; pt_type = v.vd_payload })
+               (List.sort
+                  (fun a b -> Ids.Variant_index.compare a.vd_index b.vd_index)
+                  ed_variants)),
+          Type_repr.Never )
+
 type program = {
   functions : function_ array;
   statics : (string * Type_repr.t * constant option) array;
-  types : (Ids.Type_id.t * Type_repr.t) array;
+  types : type_def array;
 }
 
 (* ────────────────────────────────────────────────────────────────────
@@ -367,9 +418,26 @@ let print_static (name : string) (ty : Type_repr.t) (init : constant option) : s
 let print_program (prog : program) : string =
   let buf = Buffer.create 512 in
   Array.iter
-    (fun (tid, ty) ->
-      Buffer.add_string buf
-        (Printf.sprintf "type type#%d = %s\n" (Ids.Type_id.to_int tid) (print_type ty)))
+    (fun d ->
+      match d with
+      | StructDef { sd_id; sd_fields } ->
+          Buffer.add_string buf
+            (Printf.sprintf "struct type#%d { %s }\n" (Ids.Type_id.to_int sd_id)
+               (String.concat "; "
+                  (List.map
+                     (fun f ->
+                       Printf.sprintf "%s: %s" (string_of_int (Ids.Field_id.to_int f.fd_id))
+                         (print_type f.fd_ty))
+                     sd_fields)))
+      | EnumDef { ed_id; ed_variants } ->
+          Buffer.add_string buf
+            (Printf.sprintf "enum type#%d { %s }\n" (Ids.Type_id.to_int ed_id)
+               (String.concat "; "
+                  (List.map
+                     (fun v ->
+                       Printf.sprintf "%s: %s" (string_of_int (Ids.Variant_id.to_int v.vd_id))
+                         (print_type v.vd_payload))
+                     ed_variants))))
     prog.types;
   if Array.length prog.types > 0 then Buffer.add_char buf '\n';
   Array.iter

@@ -111,7 +111,7 @@ let identity_template (name : string) (callable : int) : Seed_mir.function_ =
     |]
     0
 
-let mk_prog (fns : Seed_mir.function_ array) (types : (Ids.Type_id.t * Type_repr.t) array) :
+let mk_prog (fns : Seed_mir.function_ array) (types : Seed_mir.type_def array) :
     Seed_mir.program =
   { Seed_mir.functions = fns; statics = [||]; types }
 
@@ -440,7 +440,14 @@ let check_nested_generics () =
       |]
       0
   in
-  (match mono_of (mk_prog [| main; outer; inner |] [| (Ids.Type_id.make 7, Type_repr.Tuple [| i64 |]) |]) with
+  (match mono_of (mk_prog [| main; outer; inner |] [|
+    Seed_mir.StructDef
+      {
+        sd_id = Ids.Type_id.make 7;
+        sd_fields =
+          [ { Seed_mir.fd_id = Ids.Field_id.make 0; fd_index = Ids.Field_index.make 0; fd_ty = i64 } ];
+      }
+  |]) with
    | Error errs ->
        fail "nested generics: mono build failed: %s" (String.concat "; " errs)
    | Ok mono_prog ->

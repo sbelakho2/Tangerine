@@ -945,7 +945,7 @@ let count_residual_type_params (prog : Seed_mir.program) : int =
       | Some (Seed_mir.Function i) -> tp_inst i
       | _ -> ())
     prog.Seed_mir.statics;
-  Array.iter (fun (_, ty) -> tp ty) prog.Seed_mir.types;
+  Array.iter (fun d -> tp (Seed_mir.def_repr d)) prog.Seed_mir.types;
   !n
 
 type mono_outcome = {

@@ -84,7 +84,12 @@ let add_err (ctx : ctx) (msg : string) =
    Type-definition lookup and resolution *)
 
 let find_type (ctx : ctx) (tid : Ids.Type_id.t) : Type_repr.t option =
-  List.assoc_opt tid (Array.to_list ctx.prog.types)
+  match
+    Array.to_list ctx.prog.types
+    |> List.find_opt (fun d -> Seed_mir.def_id d = tid)
+  with
+  | Some d -> Some (Seed_mir.def_repr d)
+  | None -> None
 
 let rec resolve_ty (ctx : ctx) (seen : Ids.Type_id.t list) (ty : Type_repr.t) :
     Type_repr.t option =
@@ -1572,11 +1577,13 @@ let verify_function (ctx : ctx) (fn : function_) : unit =
 let verify_types_table (ctx : ctx) : unit =
   let seen = Hashtbl.create 16 in
   Array.iter
-    (fun (tid, ty) ->
+    (fun d ->
+      let tid = Seed_mir.def_id d in
       if Hashtbl.mem seen tid then
         add_err ctx
           (Printf.sprintf "types table: duplicate TypeId type#%d" (Ids.Type_id.to_int tid))
       else Hashtbl.add seen tid ();
+      let ty = Seed_mir.def_repr d in
       if Type_repr.has_type_param ty then
         add_err ctx
           (Printf.sprintf "types table: def of type#%d carries an unresolved type parameter (%s)"

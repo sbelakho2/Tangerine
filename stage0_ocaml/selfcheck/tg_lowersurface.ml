@@ -239,11 +239,20 @@ let () =
         | [] -> Type_repr.Unit
         | fs -> Type_repr.Tuple (Array.of_list fs)
       in
-      let enum_def payloads =
-        Type_repr.Function
-          (Array.of_list
-             (List.map (fun fs -> { Type_repr.pt_convention = Access_effect.Let; pt_type = payload_def fs }) payloads),
-           Type_repr.Never)
+      let enum_def tid payloads =
+        Seed_mir.EnumDef
+          {
+            ed_id = tid;
+            ed_variants =
+              List.mapi
+                (fun i fs ->
+                  {
+                    Seed_mir.vd_id = Ids.Variant_id.make i;
+                    vd_index = Ids.Variant_index.make i;
+                    vd_payload = payload_def fs;
+                  })
+                payloads;
+          }
       in
       let prog =
         {
@@ -251,9 +260,9 @@ let () =
           statics = [||];
           types =
             [|
-              (option_tid, enum_def [ [ int_ty ]; [] ]);
-              (result_tid, enum_def [ [ int_ty ]; [ string_ty ] ]);
-              (color_tid, enum_def [ []; [ int_ty ]; [ int_ty; int_ty ] ]);
+              enum_def option_tid [ [ int_ty ]; [] ];
+              enum_def result_tid [ [ int_ty ]; [ string_ty ] ];
+              enum_def color_tid [ []; [ int_ty ]; [ int_ty; int_ty ] ];
             |];
         }
       in
@@ -307,6 +316,42 @@ let () =
         }
       in
       let lowered = Mir_lower.lower_function_with_variants variant_table gen_env "f" 42 [| Type_repr.Type_param pid_t; Type_repr.Type_param pid_u |] [||] gen_fn in
+      (* type-definition proof: def_repr reconstructs the historical
+         encodings exactly (struct -> Tuple of fields in index order;
+         enum -> Function(payloads, Never) with declaration-order tags),
+         and the defs carry semantic ids distinct from positions *)
+      let struct_def =
+        Seed_mir.StructDef
+          {
+            sd_id = Ids.Type_id.make 3;
+            sd_fields =
+              [
+                { Seed_mir.fd_id = Ids.Field_id.make 40; fd_index = Ids.Field_index.make 0; fd_ty = int_ty };
+                { Seed_mir.fd_id = Ids.Field_id.make 41; fd_index = Ids.Field_index.make 1; fd_ty = string_ty };
+              ];
+          }
+      in
+      let enum_def2 =
+        Seed_mir.EnumDef
+          {
+            ed_id = Ids.Type_id.make 4;
+            ed_variants =
+              [
+                { Seed_mir.vd_id = Ids.Variant_id.make 60; vd_index = Ids.Variant_index.make 0; vd_payload = Type_repr.Tuple [| int_ty |] };
+                { Seed_mir.vd_id = Ids.Variant_id.make 61; vd_index = Ids.Variant_index.make 1; vd_payload = Type_repr.Unit };
+              ];
+          }
+      in
+      (match Seed_mir.def_repr struct_def, Seed_mir.def_repr enum_def2 with
+       | Type_repr.Tuple [| a; b |], Type_repr.Function (ps, Type_repr.Never)
+         when a = int_ty && b = string_ty && Array.length ps = 2
+              && ps.(0).Type_repr.pt_type = Type_repr.Tuple [| int_ty |]
+              && ps.(1).Type_repr.pt_type = Type_repr.Unit ->
+           Printf.printf
+             "  type defs: PASS (struct -> Tuple fields in index order; enum -> Function(payloads, Never); field/variant ids distinct from positions)\n"
+       | _ ->
+           Printf.printf "  type defs: FAIL\n";
+           exit 1);
       (match lowered.Seed_mir.instance with
        | { Instance_id.callable = _; type_args = [| Type_repr.Type_param a; Type_repr.Type_param b |] } when
            Ids_core.Generic_param_id.compare a pid_t = 0
