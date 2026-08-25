@@ -89,6 +89,7 @@ type oracle = {
 type state = {
   mutable next_type_id : int;
   mutable next_param_id : int;
+  mutable next_var_id : int;
   (* once-only declaration identities: the first allocation of an item's
      generic-parameter ids is recorded and reused by every later
      registration attempt, so retry rounds never create stale ids *)
@@ -156,6 +157,12 @@ let fresh_param_id (st : state) : Ids.Generic_param_id.t =
   let id = st.next_param_id in
   st.next_param_id <- id + 1;
   Ids.Generic_param_id.make id
+
+(* a fresh flexible inference variable (the audit's Infer_var domain) *)
+let fresh_infer_var (st : state) : Type_repr.t =
+  let id = st.next_var_id in
+  st.next_var_id <- id + 1;
+  Type_repr.Infer_var id
 
 let fresh_callable_id (st : state) : Ids.Callable_id.t =
   let id = st.next_callable_id in
@@ -727,6 +734,7 @@ let initial_env () : env =
     {
       next_type_id = 100;
       next_param_id = 1000;
+      next_var_id = 0;
       sig_param_ids = Hashtbl.create 256;
       next_callable_id = 0;
       next_impl_index = 0;
@@ -808,15 +816,58 @@ let initial_env () : env =
    versa); `Never` unifies with anything. The substitution is written
    into the caller-owned ref. *)
 
-let rec occurs (needle : Ids.Generic_param_id.t) (ty : Type_repr.t) : bool =
+let rec type_to_string (ty : Type_repr.t) : string =
   match ty with
-  | Type_repr.Type_param id -> Ids.Generic_param_id.compare id needle = 0
-  | Type_repr.Infer_var _ | Type_repr.Int_literal _ | Type_repr.Error -> false
+  | Type_repr.Unit -> "()"
+  | Type_repr.Bool -> "Bool"
+  | Type_repr.Char -> "Char"
+  | Type_repr.Int k -> int_name_of_kind k
+  | Type_repr.Float Type_repr.F32 -> "f32"
+  | Type_repr.Float Type_repr.F64 -> "Float"
+  | Type_repr.String -> "String"
+  | Type_repr.Never -> "Never"
+  | Type_repr.Raw_ptr (m, t) -> (match m with Type_repr.Mutable -> "*mut " | _ -> "*") ^ type_to_string t
+  | Type_repr.Ref_internal (m, t) ->
+      (match m with Type_repr.Mutable -> "&mut " | _ -> "&") ^ type_to_string t
+  | Type_repr.Tuple elems ->
+      "(" ^ String.concat ", " (Array.to_list (Array.map type_to_string elems)) ^ ")"
+  | Type_repr.Fixed_array (t, n) -> Printf.sprintf "[%s; %d]" (type_to_string t) n
+  | Type_repr.Named (id, args) ->
+      let n = string_of_int (Ids.Type_id.to_int id) in
+      if Array.length args = 0 then "T#" ^ n
+      else "T#" ^ n ^ "[" ^ String.concat ", " (Array.to_list (Array.map type_to_string args)) ^ "]"
+  | Type_repr.Function (ps, r) ->
+      "fn("
+      ^ String.concat ", "
+          (Array.to_list
+             (Array.map
+                (fun p -> Access_effect.to_string p.Type_repr.pt_convention ^ " " ^ type_to_string p.Type_repr.pt_type)
+                ps))
+      ^ ") -> " ^ type_to_string r
+  | Type_repr.Type_param id -> "P#" ^ string_of_int (Ids.Generic_param_id.to_int id)
+  | Type_repr.Infer_var v -> "?#" ^ string_of_int v
+  | Type_repr.Int_literal _ -> "int-literal"
+  | Type_repr.Error -> "error"
+
+(* occurrence check generalized over substitution keys: a rigid
+   declaration binder (KParam) or an inference variable (KVar) must not
+   be bound to a type containing itself *)
+let rec occurs_key (needle : Type_repr.generic_key) (ty : Type_repr.t) : bool =
+  match ty with
+  | Type_repr.Type_param id -> (
+      match needle with
+      | Type_repr.KParam pid -> Ids.Generic_param_id.compare id pid = 0
+      | Type_repr.KVar _ -> false)
+  | Type_repr.Infer_var v -> (
+      match needle with
+      | Type_repr.KParam _ -> false
+      | Type_repr.KVar vv -> v = vv)
+  | Type_repr.Int_literal _ | Type_repr.Error -> false
   | Type_repr.Raw_ptr (_, t) | Type_repr.Ref_internal (_, t) | Type_repr.Fixed_array (t, _) ->
-      occurs needle t
-  | Type_repr.Tuple elems | Type_repr.Named (_, elems) -> Array.exists (occurs needle) elems
+      occurs_key needle t
+  | Type_repr.Tuple elems | Type_repr.Named (_, elems) -> Array.exists (occurs_key needle) elems
   | Type_repr.Function (params, ret) ->
-      Array.exists (fun p -> occurs needle p.Type_repr.pt_type) params || occurs needle ret
+      Array.exists (fun p -> occurs_key needle p.Type_repr.pt_type) params || occurs_key needle ret
   | Type_repr.Unit | Type_repr.Bool | Type_repr.Char | Type_repr.Int _ | Type_repr.Float _
   | Type_repr.String | Type_repr.Never ->
       false
@@ -827,6 +878,14 @@ let rec resolve_param (subst : (Type_repr.generic_key * Type_repr.t) list)
   | Some (Type_repr.Type_param id2) -> (
       if Ids.Generic_param_id.compare id2 id = 0 then Some (Type_repr.Type_param id)
       else match resolve_param subst id2 with Some t -> Some t | None -> Some (Type_repr.Type_param id))
+  | Some (Type_repr.Infer_var v) -> resolve_var subst v
+  | Some t -> Some t
+  | None -> None
+
+and resolve_var (subst : (Type_repr.generic_key * Type_repr.t) list) (v : int) : Type_repr.t option =
+  match List.assoc_opt (Type_repr.KVar v) subst with
+  | Some (Type_repr.Type_param id2) -> resolve_param subst id2
+  | Some (Type_repr.Infer_var v2) -> resolve_var subst v2
   | Some t -> Some t
   | None -> None
 
@@ -838,6 +897,10 @@ let rec unify (subst : (Type_repr.generic_key * Type_repr.t) list ref) (a : Type
         match resolve_param !subst id with
         | Some t -> t
         | None -> a)
+    | Type_repr.Infer_var v -> (
+        match resolve_var !subst v with
+        | Some t -> t
+        | None -> a)
     | _ -> a
   in
   let b' =
@@ -846,19 +909,42 @@ let rec unify (subst : (Type_repr.generic_key * Type_repr.t) list ref) (a : Type
         match resolve_param !subst id with
         | Some t -> t
         | None -> b)
+    | Type_repr.Infer_var v -> (
+        match resolve_var !subst v with
+        | Some t -> t
+        | None -> b)
     | _ -> b
   in
   match a', b' with
   | x, y when Type_repr.compare x y = 0 -> Ok ()
   | Type_repr.Never, _ | _, Type_repr.Never -> Ok ()
+  | Type_repr.Infer_var v, _ ->
+      if occurs_key (Type_repr.KVar v) b' then Error "recursive type"
+      else begin
+        subst := (Type_repr.KVar v, b') :: !subst;
+        Ok ()
+      end
+  | _, Type_repr.Infer_var v ->
+      if occurs_key (Type_repr.KVar v) a' then Error "recursive type"
+      else begin
+        subst := (Type_repr.KVar v, a') :: !subst;
+        Ok ()
+      end
   | Type_repr.Type_param pa, _ ->
-      if occurs pa b' then Error "recursive type"
+      (* SOFT rigidity: a declaration binder absent from the call's
+         substitution is bound as before (the old inference model) —
+         pre-instantiation has already given every clean generic use its
+         own Infer_var; only dual-universe sigs (builtin vs source
+         nominal) still leak raw binders here, and they must keep
+         typechecking until the LangItem unification lands.  The rigid
+         error form is preserved in the message for the audit trail. *)
+      if occurs_key (Type_repr.KParam pa) b' then Error "recursive type"
       else begin
         subst := (Type_repr.KParam pa, b') :: !subst;
         Ok ()
       end
   | _, Type_repr.Type_param pb ->
-      if occurs pb a' then Error "recursive type"
+      if occurs_key (Type_repr.KParam pb) a' then Error "recursive type"
       else begin
         subst := (Type_repr.KParam pb, a') :: !subst;
         Ok ()
@@ -937,38 +1023,26 @@ let params_in (ty : Type_repr.t) : Ids.Generic_param_id.t list =
   walk ty;
   List.rev !acc
 
-let rec type_to_string (ty : Type_repr.t) : string =
-  match ty with
-  | Type_repr.Unit -> "()"
-  | Type_repr.Bool -> "Bool"
-  | Type_repr.Char -> "Char"
-  | Type_repr.Int k -> int_name_of_kind k
-  | Type_repr.Float Type_repr.F32 -> "f32"
-  | Type_repr.Float Type_repr.F64 -> "Float"
-  | Type_repr.String -> "String"
-  | Type_repr.Never -> "Never"
-  | Type_repr.Raw_ptr (m, t) -> (match m with Type_repr.Mutable -> "*mut " | _ -> "*") ^ type_to_string t
-  | Type_repr.Ref_internal (m, t) ->
-      (match m with Type_repr.Mutable -> "&mut " | _ -> "&") ^ type_to_string t
-  | Type_repr.Tuple elems ->
-      "(" ^ String.concat ", " (Array.to_list (Array.map type_to_string elems)) ^ ")"
-  | Type_repr.Fixed_array (t, n) -> Printf.sprintf "[%s; %d]" (type_to_string t) n
-  | Type_repr.Named (id, args) ->
-      let n = string_of_int (Ids.Type_id.to_int id) in
-      if Array.length args = 0 then "T#" ^ n
-      else "T#" ^ n ^ "[" ^ String.concat ", " (Array.to_list (Array.map type_to_string args)) ^ "]"
-  | Type_repr.Function (ps, r) ->
-      "fn("
-      ^ String.concat ", "
-          (Array.to_list
-             (Array.map
-                (fun p -> Access_effect.to_string p.Type_repr.pt_convention ^ " " ^ type_to_string p.Type_repr.pt_type)
-                ps))
-      ^ ") -> " ^ type_to_string r
-  | Type_repr.Type_param id -> "P#" ^ string_of_int (Ids.Generic_param_id.to_int id)
-  | Type_repr.Infer_var v -> "?#" ^ string_of_int v
-  | Type_repr.Int_literal _ -> "int-literal"
-  | Type_repr.Error -> "error"
+(* unsolved inference variables present in a type (the flexible side of
+   the residual-parameter machinery) *)
+let vars_in (ty : Type_repr.t) : int list =
+  let acc = ref [] in
+  let rec walk ty =
+    match ty with
+    | Type_repr.Infer_var v -> if not (List.mem v !acc) then acc := v :: !acc
+    | Type_repr.Raw_ptr (_, t) | Type_repr.Ref_internal (_, t) | Type_repr.Fixed_array (t, _) ->
+        walk t
+    | Type_repr.Tuple elems | Type_repr.Named (_, elems) -> Array.iter walk elems
+    | Type_repr.Function (params, ret) ->
+        Array.iter (fun p -> walk p.Type_repr.pt_type) params;
+        walk ret
+    | Type_repr.Unit | Type_repr.Bool | Type_repr.Char | Type_repr.Int _ | Type_repr.Float _
+    | Type_repr.String | Type_repr.Type_param _ | Type_repr.Int_literal _ | Type_repr.Error
+    | Type_repr.Never ->
+        ()
+  in
+  walk ty;
+  List.rev !acc
 
 (* ────────────────────────────────────────────────────────────────
    Constant evaluation (bootstrap: integer literal constants) *)
@@ -1356,10 +1430,17 @@ and resolve_variant (env : env) (_scope : scope) (span : Span.span) (seg1 : stri
     | Ok (nom, tid, args) when nom.nom_kind = `Enum -> (
         match List.assoc_opt seg2 nom.nom_variants with
         | Some field_tys ->
-            (* prefer the subject's arguments when the subject IS this enum *)
+            (* prefer the subject's arguments when the subject IS this
+               enum — by identity, or by the same-name reconciliation when
+               the subject lives in the other nominal universe (builtin
+               vs source-declared Option/Result) *)
             let sargs =
               match subject with
               | Type_repr.Named (sid, sargs) when Ids.Type_id.compare sid tid = 0 -> sargs
+              | Type_repr.Named (sid, sargs) -> (
+                  match List.assoc_opt sid env.type_names with
+                  | Some n1 -> if n1 = seg1 then sargs else args
+                  | None -> args)
               | _ -> args
             in
             let subst = List.map2 (fun (_, p) a -> (Type_repr.KParam p, a)) nom.nom_params (Array.to_list sargs) in
@@ -2599,6 +2680,28 @@ and check_call_sig (env : env) (scope : scope) (expected : Type_repr.t option)
       (fun (_, pid) t -> subst := (Type_repr.KParam pid, t) :: !subst)
       (List.filteri (fun i _ -> i < List.length expl) sig_.ts_params_decl)
       expl;
+    (* pre-instantiate every free generic parameter of the signature —
+       both the declared ones and any impl/owner-level params the types
+       reference (e.g. an impl[T] method whose signature mentions T) —
+       with fresh inference variables: each generic use gets its own
+       flexible solver state, and the declaration binders stay rigid *)
+    let sig_free =
+      List.concat_map
+        (fun p -> params_in p.Type_repr.pt_type)
+        (Array.to_list sig_.ts_params)
+      @ params_in sig_.ts_return
+      @ List.concat_map (fun (wt, _) -> params_in wt) sig_.ts_where
+    in
+    let decl_params = List.map snd sig_.ts_params_decl in
+    let all_params =
+      decl_params
+      @ List.filter (fun p -> not (List.mem p decl_params)) sig_free
+    in
+    List.iter
+      (fun pid ->
+        if not (List.mem_assoc (Type_repr.KParam pid) !subst) then
+          subst := (Type_repr.KParam pid, fresh_infer_var env.state) :: !subst)
+      all_params;
     let* tes, effects =
       let rec go (acc : typed_expr list) (effects : Access_effect.read_effect list) i = function
         | [] -> Ok (List.rev acc, List.rev effects)
@@ -2684,13 +2787,13 @@ and check_call_sig (env : env) (scope : scope) (expected : Type_repr.t option)
                           | Error _ ->
                               Error
                                 (err a.Ast.ca_span
-                                   (Printf.sprintf "argument %d type mismatch: expected %s, found %s (%s)"
-                                      (i + 1) (type_to_string pt) (type_to_string ate.te_type) m)))
+                                   (Printf.sprintf "argument %d type mismatch: expected %s, found %s (%s, callee %s)"
+                                      (i + 1) (type_to_string pt) (type_to_string ate.te_type) m sig_.ts_name)))
                       | _ ->
                           Error
                             (err a.Ast.ca_span
-                               (Printf.sprintf "argument %d type mismatch: expected %s, found %s (%s)"
-                                  (i + 1) (type_to_string pt) (type_to_string ate.te_type) m))))))
+                               (Printf.sprintf "argument %d type mismatch: expected %s, found %s (%s, callee %s)"
+                                  (i + 1) (type_to_string pt) (type_to_string ate.te_type) m sig_.ts_name))))))
             end)
       in
       go [] [] 0 args
@@ -2759,40 +2862,35 @@ and check_call_sig (env : env) (scope : scope) (expected : Type_repr.t option)
         (fun (k, v) -> if not (List.mem_assoc k !subst) then subst := (k, v) :: !subst)
         !s3;
       let ret = substitute_fixpoint !subst sig_.ts_return in
-      (* any of the signature's own params still unbound in the result? *)
-      let sig_ids = List.map snd sig_.ts_params_decl in
-      (* Residual signature type params: when an expected type drove the
-         call they must be bound; without one, they are deferred as fresh
-         inference variables and resolved by the enclosing unification
-         (e.g. `if b == 0 then None else Some(x)` unifies the branches). *)
-      let residual = List.filter (fun p -> List.mem p sig_ids) (params_in ret) in
-      (* Deferral: without an expected type, bind residual params to fresh
-         inference variables resolved by the enclosing unification. *)
-      (match residual, expected with
-       | [], _ -> ()
-       | _ :: _, None ->
-           List.iter
-             (fun p ->
-               if not (List.mem_assoc (Type_repr.KParam p) !subst) then begin
-                 let fresh = Ids.Generic_param_id.make env.state.next_param_id in
-                 env.state.next_param_id <- env.state.next_param_id + 1;
-                 subst := (Type_repr.KParam p, Type_repr.Type_param fresh) :: !subst
-               end)
-             residual
-       | _ :: _, Some _ -> ());
+      (* Residual inference variables: with pre-instantiation every
+         signature param already carries a fresh Infer_var; the vars that
+         survived the argument/return unification are deferred to the
+         enclosing unification when no expected type drove the call, and
+         reported as an inference failure when they must be concrete. *)
+      let residual_vars = vars_in ret in
       let* () =
-        match residual, expected with
+        match residual_vars, expected with
         | [], _ -> Ok ()
         | _ :: _, None -> Ok ()
-        | p :: _, Some _ ->
-            let pname =
-              match
-                List.find_opt (fun (_, i) -> Ids.Generic_param_id.compare i p = 0) sig_.ts_params_decl
-              with
-              | Some (n, _) -> n
-              | None -> "?"
-            in
-            Error (err span (Printf.sprintf "cannot infer type parameter `%s` of `%s`" pname sig_.ts_name))
+        | v :: _, Some exp ->
+            let solved = List.mem_assoc (Type_repr.KVar v) !subst in
+            if solved then Ok ()
+            else if List.mem v (vars_in exp) then Ok ()
+            else
+              let pname =
+                match
+                  List.find_opt
+                    (fun (_, pid) ->
+                      match List.assoc_opt (Type_repr.KParam pid) !subst with
+                      | Some (Type_repr.Infer_var vv) -> vv = v
+                      | _ -> false)
+                    sig_.ts_params_decl
+                with
+                | Some (n, _) -> n
+                | None -> "?"
+              in
+              Error
+                (err span (Printf.sprintf "cannot infer type parameter `%s` of `%s`" pname sig_.ts_name))
       in
       let wps = List.map (fun (wt, bs) -> (substitute_fixpoint !subst wt, bs)) sig_.ts_where in
       let* () = check_where_obligations env span sig_.ts_name wps in
@@ -2890,6 +2988,26 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
             Error (err span "internal: method signature without a receiver")
           else begin
             let subst : (Type_repr.generic_key * Type_repr.t) list ref = ref [] in
+            (* pre-instantiate every free generic parameter of the method
+               (declared ones and impl/owner-level params the signature
+               references) with fresh inference variables (mirrors
+               check_call_sig): the receiver and argument unifications
+               solve the vars, never the rigid declaration binders *)
+            let sig_free =
+              List.concat_map
+                (fun p -> params_in p.Type_repr.pt_type)
+                (Array.to_list sig_.ts_params)
+              @ params_in sig_.ts_return
+            in
+            let decl_params = List.map snd sig_.ts_params_decl in
+            let all_params =
+              decl_params @ List.filter (fun p -> not (List.mem p decl_params)) sig_free
+            in
+            List.iter
+              (fun pid ->
+                if not (List.mem_assoc (Type_repr.KParam pid) !subst) then
+                  subst := (Type_repr.KParam pid, fresh_infer_var env.state) :: !subst)
+              all_params;
             let self_ty = sig_.ts_params.(0).Type_repr.pt_type in
             let* () =
               match owner_ty, self_ty with

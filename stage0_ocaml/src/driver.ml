@@ -138,6 +138,9 @@ let lowering_env_of (env : Typecheck.env) : Mir_lower.func_env =
         in
         (n, ts.Typecheck.ts_return) :: bare)
       env.Typecheck.functions
+    (* enum variant constructors are callable values: their registered
+       result type lets lowering build the EnumCtor aggregate *)
+    @ List.map (fun (n, ts) -> (n, ts.Typecheck.ts_return)) env.Typecheck.constructors
   in
   let callables =
     List.concat_map

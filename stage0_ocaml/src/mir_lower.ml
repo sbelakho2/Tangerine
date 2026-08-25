@@ -1175,8 +1175,21 @@ and lower_match (env : func_env) (st : lower_state) (m : Ast.match_expr) :
           match int_of_string_opt s with
           | Some v -> targets := (Int64.of_int v, arm_blocks.(i)) :: !targets
           | None -> seed_bug "non-integer literal match arm in lowering")
-      | Ast.Wildcard _ -> ()
-      | _ -> seed_bug "unsupported match pattern in lowering")
+      | Ast.Wildcard _ | Ast.PatIdent _ -> ()
+      | p ->
+      let pname =
+        match p with
+        | Ast.PatVariant _ -> "PatVariant"
+        | Ast.PatIdent _ -> "PatIdent"
+        | Ast.PatTuple _ -> "PatTuple"
+        | Ast.PatLiteral _ -> "PatLiteral"
+        | Ast.Wildcard _ -> "Wildcard"
+        | Ast.StructPattern _ -> "StructPattern"
+        | Ast.OrPattern _ -> "OrPattern"
+        | Ast.RangePattern _ -> "RangePattern"
+        | _ -> "other"
+      in
+      seed_bug "unsupported match pattern %s in lowering" pname)
     m.Ast.m_arms;
   set_terminator_to st
     (Seed_mir.SwitchInt (copy_place st switch_op, List.rev !targets, otherwise))
