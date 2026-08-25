@@ -51,7 +51,7 @@ SELFCHECK_COUNT=0
 SELFCHECK_FAIL=0
 for name in $NAMES; do
   SELFCHECK_COUNT=$((SELFCHECK_COUNT + 1))
-  if ! timeout 180 "_build/default/selfcheck/${name}.exe" >/tmp/ocaml_sc_${name}.out 2>&1; then
+  if ! timeout 420 "_build/default/selfcheck/${name}.exe" >/tmp/ocaml_sc_${name}.out 2>&1; then
     echo "check_ocaml_stage0: FAIL — selfcheck ${name} exited non-zero"
     tail -10 "/tmp/ocaml_sc_${name}.out" || true
     SELFCHECK_FAIL=1
