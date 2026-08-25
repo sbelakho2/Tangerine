@@ -88,6 +88,10 @@ type oracle = {
 type state = {
   mutable next_type_id : int;
   mutable next_param_id : int;
+  (* once-only declaration identities: the first allocation of an item's
+     generic-parameter ids is recorded and reused by every later
+     registration attempt, so retry rounds never create stale ids *)
+  mutable sig_param_ids : (string, (string * Ids.Generic_param_id.t) list) Hashtbl.t;
   mutable next_callable_id : int;
   mutable next_impl_index : int;
   mutable current_item : string;
@@ -701,6 +705,7 @@ let initial_env () : env =
     {
       next_type_id = 100;
       next_param_id = 1000;
+      sig_param_ids = Hashtbl.create 256;
       next_callable_id = 0;
       next_impl_index = 0;
       current_item = "<none>";
@@ -1100,11 +1105,19 @@ and resolve_named (env : env) (scope : scope) (span : Span.span) (name : string)
    Signature resolution *)
 
 let resolve_signature (env : env) (scope : scope) (sig_ : Ast.function_sig)
-    (extra_params : (string * Ids.Generic_param_id.t) list) : (typed_signature, string) result =
+    (extra_params : (string * Ids.Generic_param_id.t) list) ~(key : string) :
+    (typed_signature, string) result =
   let params_decl =
-    List.map (fun (tp : Ast.type_param) -> (tp.Ast.tp_name, fresh_param_id env.state))
-      sig_.Ast.sig_type_params
-    @ extra_params
+    let own =
+      List.map (fun (tp : Ast.type_param) -> (tp.Ast.tp_name, fresh_param_id env.state))
+        sig_.Ast.sig_type_params
+    in
+    match Hashtbl.find_opt env.state.sig_param_ids key with
+    | Some ids -> ids
+    | None ->
+        let ids = own @ extra_params in
+        Hashtbl.add env.state.sig_param_ids key ids;
+        ids
   in
   let scope =
     { scope with generics = List.map (fun (n, i) -> (n, i)) params_decl @ scope.generics }
@@ -3217,7 +3230,30 @@ and check_trait (env : env) (d : Ast.trait_decl) : (unit, string) result =
 
 and check_impl (env : env) (d : Ast.impl_decl) : (unit, string) result =
   let impl_params =
-    List.map (fun (tp : Ast.type_param) -> (tp.tp_name, fresh_param_id env.state)) d.i_type_params
+    let key = "impl::" ^ d.i_target_type in
+    match Hashtbl.find_opt env.state.sig_param_ids key with
+    | Some ids -> ids
+    | None ->
+        (* the impl's type parameters ARE the target nominal's type
+           parameters: reuse the nominal's identities so the impl's `T`
+           and the struct's `T` are the same semantic id *)
+        let nominal_ids =
+          match List.assoc_opt d.i_target_type env.nominals with
+          | Some nom ->
+              List.map
+                (fun (tp : Ast.type_param) ->
+                  match List.assoc_opt tp.tp_name nom.nom_params with
+                  | Some pid -> (tp.tp_name, pid)
+                  | None -> (tp.tp_name, fresh_param_id env.state))
+                d.i_type_params
+          | None -> []
+        in
+        let ids =
+          if List.length nominal_ids = List.length d.i_type_params then nominal_ids
+          else List.map (fun (tp : Ast.type_param) -> (tp.tp_name, fresh_param_id env.state)) d.i_type_params
+        in
+        Hashtbl.add env.state.sig_param_ids key ids;
+        ids
   in
   let scope = { empty_scope with generics = impl_params } in
   let* target =
@@ -3354,7 +3390,10 @@ and register_methods (env : env) (owner : string) (methods : Ast.function_decl l
   let rec go env = function
     | [] -> Ok env
     | (m : Ast.function_decl) :: rest -> (
-        match resolve_signature env empty_scope m.fn_sig extra_params with
+        match
+          resolve_signature env empty_scope m.fn_sig extra_params
+            ~key:(owner ^ "::" ^ m.fn_sig.sig_name)
+        with
         | Error e -> Error e
         | Ok sig_ ->
             let sig_ = { sig_ with ts_where = where_extra @ sig_.ts_where } in
@@ -3391,7 +3430,30 @@ and register_constructors (env : env) (ename : string) (tid : Ids.Type_id.t)
 
 and register_impl (env : env) (d : Ast.impl_decl) : (env, string) result =
   let impl_params =
-    List.map (fun (tp : Ast.type_param) -> (tp.tp_name, fresh_param_id env.state)) d.i_type_params
+    let key = "impl::" ^ d.i_target_type in
+    match Hashtbl.find_opt env.state.sig_param_ids key with
+    | Some ids -> ids
+    | None ->
+        (* the impl's type parameters ARE the target nominal's type
+           parameters: reuse the nominal's identities so the impl's `T`
+           and the struct's `T` are the same semantic id *)
+        let nominal_ids =
+          match List.assoc_opt d.i_target_type env.nominals with
+          | Some nom ->
+              List.map
+                (fun (tp : Ast.type_param) ->
+                  match List.assoc_opt tp.tp_name nom.nom_params with
+                  | Some pid -> (tp.tp_name, pid)
+                  | None -> (tp.tp_name, fresh_param_id env.state))
+                d.i_type_params
+          | None -> []
+        in
+        let ids =
+          if List.length nominal_ids = List.length d.i_type_params then nominal_ids
+          else List.map (fun (tp : Ast.type_param) -> (tp.tp_name, fresh_param_id env.state)) d.i_type_params
+        in
+        Hashtbl.add env.state.sig_param_ids key ids;
+        ids
   in
   let scope = { empty_scope with generics = impl_params } in
   let* target =
@@ -3473,7 +3535,7 @@ and register_item (env : env) (item : Ast.item) : (env, string) result =
       if List.mem_assoc qname env.functions then
         Error (err item.span (Printf.sprintf "duplicate function `%s`" qname))
       else
-        let* sig_ = resolve_signature env empty_scope d.fn_sig [] in
+        let* sig_ = resolve_signature env empty_scope d.fn_sig [] ~key:qname in
         Ok { env with functions = (qname, sig_) :: env.functions }
   | Ast.TestDecl d ->
       let qname = qualified_name item.module_path d.test_name in
