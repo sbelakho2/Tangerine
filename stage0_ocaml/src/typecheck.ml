@@ -82,6 +82,7 @@ type oracle = {
   mutable o_unsolved_obligations : int;
   mutable o_missing_effects : int;
   mutable o_derived_callables : Ids.Callable_id.t list;
+  mutable o_deferred_params : Ids.Generic_param_id.t list;
 }
 
 (* Mutable check state (per check_program run). *)
@@ -725,6 +726,7 @@ let initial_env () : env =
           o_unsolved_obligations = 0;
           o_missing_effects = 0;
           o_derived_callables = [];
+          o_deferred_params = [];
         };
     }
   in
@@ -3750,7 +3752,8 @@ let reset_oracle (env : env) : unit =
   o.o_unresolved_calls <- 0;
   o.o_unsolved_obligations <- 0;
   o.o_missing_effects <- 0;
-  o.o_derived_callables <- []
+  o.o_derived_callables <- [];
+  o.o_deferred_params <- []
 
 let item_param_ids (env : env) (item : Ast.item) : Ids.Generic_param_id.t list =
   match item.Ast.kind with
