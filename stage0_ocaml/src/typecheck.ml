@@ -932,6 +932,32 @@ let rec unify (subst : (Type_repr.generic_key * Type_repr.t) list ref) (a : Type
   match a', b' with
   | x, y when Type_repr.compare x y = 0 -> Ok ()
   | Type_repr.Never, _ | _, Type_repr.Never -> Ok ()
+  | Type_repr.Int_literal m, Type_repr.Int k ->
+      (* an unsuffixed literal adopts the concrete integer kind only when
+         its magnitude is representable in that kind (the native
+         IntLiteral rule) *)
+      let p : Literal.parsed_integer =
+        { original = ""; radix = 10; magnitude = m; suffix = Literal.No_int_suffix;
+          span = Span.synthetic }
+      in
+      let fits = if int_signed k then Literal.fits_signed p (int_width k) else Literal.fits_unsigned p (int_width k) in
+      if fits then Ok ()
+      else
+        Error
+          (Printf.sprintf "integer literal does not fit its adopted type %s"
+             (int_name_of_kind k))
+  | Type_repr.Int k, Type_repr.Int_literal m ->
+      let p : Literal.parsed_integer =
+        { original = ""; radix = 10; magnitude = m; suffix = Literal.No_int_suffix;
+          span = Span.synthetic }
+      in
+      let fits = if int_signed k then Literal.fits_signed p (int_width k) else Literal.fits_unsigned p (int_width k) in
+      if fits then Ok ()
+      else
+        Error
+          (Printf.sprintf "integer literal does not fit its adopted type %s"
+             (int_name_of_kind k))
+  | Type_repr.Int_literal _, Type_repr.Int_literal _ -> Ok ()
   | Type_repr.Infer_var v, _ ->
       if occurs_key (Type_repr.KVar v) b' then Error "recursive type"
       else begin
@@ -1314,6 +1340,13 @@ let solver_param_bounds (decl : (string * Ids.Generic_param_id.t) list)
    Patterns, variant/field resolution, expressions.
    The whole group is mutually recursive. *)
 
+(* Default an unsuffixed literal's inference type to Int when it crosses
+   a concrete boundary (binding, arithmetic, cast). *)
+let default_literal (ty : Type_repr.t) : Type_repr.t =
+  match ty with
+  | Type_repr.Int_literal _ -> Type_repr.Int Type_repr.Int
+  | t -> t
+
 let rec check_pattern (env : env) (scope : scope) (ty : Type_repr.t) (p : Ast.pattern) :
     ((string * Type_repr.t * bool) list, string) result =
   match p with
@@ -1474,6 +1507,7 @@ and resolve_nominal (env : env) (span : Span.span) (name : string) :
       | Some (Type_repr.Named (tid, args)) -> Ok (nom, tid, args)
       | _ -> Error (err span (Printf.sprintf "`%s` is not a nominal type" name)))
 
+
 (* ────────────────────────────────────────────────────────────────
    The expression checker. `check_expr` records every accepted node on
    the oracle channel; `check_expr_inner` is the rule engine. *)
@@ -1495,28 +1529,41 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
       | Some p -> (
           let kind =
             match p.Literal.suffix with
-            | Literal.I8 -> Type_repr.I8 | Literal.I16 -> Type_repr.I16
-            | Literal.I32 -> Type_repr.I32 | Literal.I64 -> Type_repr.I64
-            | Literal.I128 -> Type_repr.I128
-            | Literal.U8 -> Type_repr.U8 | Literal.U16 -> Type_repr.U16
-            | Literal.U32 -> Type_repr.U32 | Literal.U64 -> Type_repr.U64
-            | Literal.U128 -> Type_repr.U128
-            | Literal.Int -> Type_repr.Int | Literal.UInt -> Type_repr.UInt
-            | Literal.No_int_suffix -> (
-                match expected with
-                | Some (Type_repr.Int k) -> k
-                | _ -> Type_repr.Int)
+            | Literal.I8 -> Some Type_repr.I8 | Literal.I16 -> Some Type_repr.I16
+            | Literal.I32 -> Some Type_repr.I32 | Literal.I64 -> Some Type_repr.I64
+            | Literal.I128 -> Some Type_repr.I128
+            | Literal.U8 -> Some Type_repr.U8 | Literal.U16 -> Some Type_repr.U16
+            | Literal.U32 -> Some Type_repr.U32 | Literal.U64 -> Some Type_repr.U64
+            | Literal.U128 -> Some Type_repr.U128
+            | Literal.Int -> Some Type_repr.Int | Literal.UInt -> Some Type_repr.UInt
+            | Literal.No_int_suffix -> None
           in
-          let fits =
-            if int_signed kind then Literal.fits_signed p (int_width kind)
-            else Literal.fits_unsigned p (int_width kind)
-          in
-          if not fits then
-            Error
-              (err span
-                 (Literal.range_error p
-                  ^ " (a literal that does not fit its type is a TYPE error, never zeroed)"))
-          else Ok { te_type = Type_repr.Int kind; te_effects = [||]; te_span = span }))
+          match kind with
+          | Some k -> (
+              let fits =
+                if int_signed k then Literal.fits_signed p (int_width k)
+                else Literal.fits_unsigned p (int_width k)
+              in
+              if not fits then
+                Error
+                  (err span
+                     (Literal.range_error p
+                      ^ " (a literal that does not fit its type is a TYPE error, never zeroed)"))
+              else Ok { te_type = Type_repr.Int k; te_effects = [||]; te_span = span })
+          | None ->
+              (* unsuffixed literal: the Int_literal inference type is
+                 adopted by the enclosing constraints (the native model);
+                 only the 128-bit-wide sanity bound is checked here *)
+              if
+                not
+                  (Literal.fits_unsigned
+                     p (int_width Type_repr.U128))
+              then
+                Error
+                  (err span
+                     (Literal.range_error p
+                      ^ " (a literal that does not fit its type is a TYPE error, never zeroed)"))
+              else Ok { te_type = Type_repr.Int_literal p.Literal.magnitude; te_effects = [||]; te_span = span }))
   | Ast.FloatLit (_, span) -> (
       match expected with
       | Some (Type_repr.Float Type_repr.F32) ->
@@ -1753,6 +1800,7 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
                 | Type_repr.Int _, Type_repr.Char -> true
                 | Type_repr.Char, Type_repr.Int _ -> true
                 | Type_repr.Float _, Type_repr.Float _ -> true
+                | Type_repr.Int_literal _, (Type_repr.Int _ | Type_repr.Float _ | Type_repr.Char) -> true
                 | Type_repr.Never, _ -> true
                 | _ -> false
               in
@@ -1807,6 +1855,13 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
               match te.te_type with
               | Type_repr.Int _ | Type_repr.Float _ ->
                   Ok { te_type = te.te_type; te_effects = te.te_effects; te_span = span }
+              | Type_repr.Int_literal _ ->
+                  Ok
+                    {
+                      te_type = Type_repr.Int Type_repr.Int;
+                      te_effects = te.te_effects;
+                      te_span = span;
+                    }
               | _ ->
                   Error
                     (err span
@@ -2006,7 +2061,7 @@ and check_stmt (env : env) (scope : scope) (s : Ast.stmt) : (scope, string) resu
           match check_expr env scope None value with
           | Error m -> Error m
           | Ok te -> (
-              match check_pattern env scope te.te_type pat with
+              match check_pattern env scope (default_literal te.te_type) pat with
               | Error m -> Error m
               | Ok binds ->
                   Ok (add_binds scope (List.map (fun (n, t, _) -> (n, t, mut_)) binds))))
@@ -2268,6 +2323,8 @@ and check_binary (subst : (Type_repr.generic_key * Type_repr.t) list ref) (op : 
       match lt, rt with
       | Type_repr.Int _, Type_repr.Int _ -> Ok lt
       | Type_repr.Float _, Type_repr.Float _ -> Ok lt
+      | (Type_repr.Int_literal _ | Type_repr.Int _), (Type_repr.Int_literal _ | Type_repr.Int _) ->
+          Ok (Type_repr.Int Type_repr.Int)
       | Type_repr.String, Type_repr.String when op = Ast.Add -> Ok Type_repr.String
       | _ ->
           Error
@@ -2276,6 +2333,8 @@ and check_binary (subst : (Type_repr.generic_key * Type_repr.t) list ref) (op : 
   | Ast.BitOr | Ast.BitXor | Ast.BitAnd | Ast.Shl | Ast.Shr -> (
       match lt, rt with
       | Type_repr.Int _, Type_repr.Int _ -> Ok lt
+      | (Type_repr.Int_literal _ | Type_repr.Int _), (Type_repr.Int_literal _ | Type_repr.Int _) ->
+          Ok (Type_repr.Int Type_repr.Int)
       | _ ->
           Error
             (Printf.sprintf "bitwise operator requires integer operands, found %s and %s"

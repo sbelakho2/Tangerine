@@ -45,7 +45,7 @@ and t =
   | Function of param_type array * t
   | Type_param of Ids.Generic_param_id.t
   | Infer_var of int
-  | Int_literal of Int_value.t
+  | Int_literal of Big_nat.t
   | Error
   | Never
 
@@ -85,7 +85,7 @@ let rec compare (a : t) (b : t) : int =
       if c <> 0 then c else compare r1 r2
   | Type_param i1, Type_param i2 -> Ids.Generic_param_id.compare i1 i2
   | Infer_var i1, Infer_var i2 -> Stdlib.compare i1 i2
-  | Int_literal v1, Int_literal v2 -> Int_value.compare_vals v1 v2
+  | Int_literal v1, Int_literal v2 -> Big_nat.compare v1 v2
   | Error, Error -> 0
   | Never, Never -> 0
   | Unit, _ -> -1 | _, Unit -> 1
