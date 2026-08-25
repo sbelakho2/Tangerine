@@ -779,10 +779,10 @@ and call_host (vm : t) (callee : Seed_mir.callee) (args : Vm_value.t array) : Vm
       in
       err_trap vm (Printf.sprintf "host call %s has no binding (fail-closed)" label)
   | Some b ->
-      if Array.length args <> b.Host.arity then
+      if Array.length args <> List.length b.Host.signature.Host.param_types then
         err_trap vm
           (Printf.sprintf "host call %s: arity mismatch (binding arity %d, got %d)"
-             b.Host.name b.Host.arity (Array.length args));
+             b.Host.name (List.length b.Host.signature.Host.param_types) (Array.length args));
       (match b.Host.invoke vm.host args with
        | Ok v -> v
        | Error msg -> err_trap vm (Printf.sprintf "host call %s: %s" b.Host.name msg))

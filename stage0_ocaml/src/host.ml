@@ -24,10 +24,43 @@ type host_id =
 (* One binding table for the whole host surface. A symbol WITHOUT an
    `invoke` is not implemented — the record type requires the function, so
    "bound" and "has an executable invoke" are the same predicate. *)
+(* Canonical type key for signature comparison. *)
+let rec type_key (ty : Type_repr.t) : string =
+  match ty with
+  | Type_repr.Unit -> "Unit"
+  | Type_repr.Bool -> "Bool"
+  | Type_repr.Int k -> (
+      match k with
+      | Type_repr.I8 -> "i8" | Type_repr.I16 -> "i16" | Type_repr.I32 -> "i32"
+      | Type_repr.I64 -> "i64" | Type_repr.I128 -> "i128"
+      | Type_repr.U8 -> "u8" | Type_repr.U16 -> "u16" | Type_repr.U32 -> "u32"
+      | Type_repr.U64 -> "u64" | Type_repr.U128 -> "u128"
+      | Type_repr.Int -> "Int" | Type_repr.UInt -> "UInt")
+  | Type_repr.Float k -> (match k with Type_repr.F32 -> "f32" | Type_repr.F64 -> "f64")
+  | Type_repr.Char -> "Char"
+  | Type_repr.String -> "String"
+  | Type_repr.Tuple elems -> "(" ^ String.concat "," (Array.to_list (Array.map type_key elems)) ^ ")"
+  | Type_repr.Named (id, args) ->
+      "T#" ^ string_of_int id
+      ^ (if Array.length args = 0 then ""
+         else "[" ^ String.concat "," (Array.to_list (Array.map type_key args)) ^ "]")
+  | Type_repr.Fixed_array (t, _) -> "[" ^ type_key t ^ "]"
+  | Type_repr.Raw_ptr (_, t) -> "ptr<" ^ type_key t ^ ">"
+  | Type_repr.Ref_internal (_, t) -> "ref<" ^ type_key t ^ ">"
+  | Type_repr.Type_param id -> "P#" ^ string_of_int id
+  | Type_repr.Function (ps, r) ->
+      "fn(" ^ String.concat "," (Array.to_list (Array.map (fun p -> type_key p.Type_repr.pt_type) ps)) ^ ")->" ^ type_key r
+  | Type_repr.Never -> "!"
+
+type signature = {
+  param_types : string list;
+  return_type : string;
+}
+
 type binding = {
   id : host_id;
   name : string;
-  arity : int;
+  signature : signature;
   invoke : t -> Vm_value.t array -> (Vm_value.t, string) result;
 }
 
@@ -132,29 +165,35 @@ let invoke_sync_synchronize (_t : t) (args : Vm_value.t array) : (Vm_value.t, st
 
 (* Binding ids are derived from the declared registries by name, so the
    executable closure and the declarations can never drift apart. *)
-let intrinsic_binding (name : string) (arity : int)
+let sig_of_decl (decl : Intrinsic_registry.signature) : signature =
+  {
+    param_types = Array.to_list (Array.map type_key decl.Intrinsic_registry.params);
+    return_type = type_key decl.Intrinsic_registry.ret;
+  }
+
+let intrinsic_binding (name : string)
     (invoke : t -> Vm_value.t array -> (Vm_value.t, string) result) : binding =
   match Intrinsic_registry.lookup Intrinsic_registry.manifest ~name with
-  | Some (id, _) -> { id = Intrinsic id; name; arity; invoke }
+  | Some (id, decl) -> { id = Intrinsic id; name; signature = sig_of_decl decl; invoke }
   | None -> failwith (Printf.sprintf "host binding '%s': not a declared intrinsic" name)
 
-let extern_binding (name : string) (arity : int)
+let extern_binding (name : string)
     (invoke : t -> Vm_value.t array -> (Vm_value.t, string) result) : binding =
   match Extern_registry.lookup Extern_registry.manifest ~name with
-  | Some (id, _) -> { id = Extern id; name; arity; invoke }
+  | Some (id, decl) -> { id = Extern id; name; signature = sig_of_decl decl; invoke }
   | None -> failwith (Printf.sprintf "host binding '%s': not a declared extern" name)
 
 let binding_manifest : binding list =
   [
-    intrinsic_binding "print" 1 invoke_print;
-    intrinsic_binding "println" 1 invoke_println;
-    intrinsic_binding "panic" 1 invoke_panic;
-    intrinsic_binding "__intrinsic_abort" 0 invoke_abort;
-    intrinsic_binding "__intrinsic_int_to_string" 1 invoke_int_to_string;
-    intrinsic_binding "__intrinsic_bool_to_string" 1 invoke_bool_to_string;
-    intrinsic_binding "__intrinsic_char_to_string" 1 invoke_char_to_string;
-    intrinsic_binding "__intrinsic_string_len" 1 invoke_string_len;
-    extern_binding "__sync_synchronize" 0 invoke_sync_synchronize;
+    intrinsic_binding "print" invoke_print;
+    intrinsic_binding "println" invoke_println;
+    intrinsic_binding "panic" invoke_panic;
+    intrinsic_binding "__intrinsic_abort" invoke_abort;
+    intrinsic_binding "__intrinsic_int_to_string" invoke_int_to_string;
+    intrinsic_binding "__intrinsic_bool_to_string" invoke_bool_to_string;
+    intrinsic_binding "__intrinsic_char_to_string" invoke_char_to_string;
+    intrinsic_binding "__intrinsic_string_len" invoke_string_len;
+    extern_binding "__sync_synchronize" invoke_sync_synchronize;
   ]
 
 let binding_of_manifest (name : string) : binding option =
@@ -261,9 +300,13 @@ let closure_check (t : t) : (closure_report, string list) result =
       match List.find_opt (fun b -> b.name = name) t.bindings with
       | None -> ()
       | Some b ->
-          if Array.length dsig.Intrinsic_registry.params <> b.arity then
-            problem "arity mismatch for %s: declared %d params, binding arity %d"
-              name (Array.length dsig.Intrinsic_registry.params) b.arity)
+          let decl_params = Array.to_list (Array.map type_key dsig.Intrinsic_registry.params) in
+          let decl_ret = type_key dsig.Intrinsic_registry.ret in
+          if decl_params <> b.signature.param_types then
+            problem "signature mismatch for %s: declared params [%s], binding params [%s]"
+              name (String.concat ", " decl_params) (String.concat ", " b.signature.param_types);
+          if decl_ret <> b.signature.return_type then
+            problem "return mismatch for %s: declared %s, binding %s" name decl_ret b.signature.return_type)
     declared;
   let extras = SS.diff impl_names decl_names in
   if not (SS.is_empty extras) then
