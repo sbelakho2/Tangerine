@@ -249,7 +249,12 @@ let rec parse_program (p : parser) (program_module_path : string list) : Ast.pro
   let start = cur_span p in
   while not (at_eof p) do
     (match parse_item p with
-     | Some item -> items := item :: !items
+     | Some item ->
+         (match item.Ast.kind with
+          | Ast.Function fd when String.equal fd.Ast.fn_sig.Ast.sig_name "linker_resolve_entry_name" ->
+              Printf.eprintf "DBG parse-item-FOUND\n"
+          | _ -> ());
+         items := item :: !items
      | None -> ignore (advance p));
     ignore (eat_optional_semi p)
   done;
@@ -362,7 +367,7 @@ and parse_function (p : parser) (_attrs : Ast.attribute list) (_vis : unit * boo
         sig_span = sig_start;
       }
     in
-    if signature_only_next p then
+    if signature_only_next p then begin
       Some
         (Ast.Function
            {
@@ -371,6 +376,7 @@ and parse_function (p : parser) (_attrs : Ast.attribute list) (_vis : unit * boo
              fn_body = Ast.FnSignatureOnly;
              fn_span = span_merged p sig_start (cur_span p);
            })
+    end
     else begin
       let clauses = parse_fn_clauses p in
       let body = parse_function_body p in
@@ -3312,7 +3318,8 @@ and parse_item_with_attrs (p : parser) (attrs : Ast.attribute list) : Ast.item o
   | Token.KwDef | Token.KwFn | Token.KwAsync | Token.KwUnsafe | Token.KwPure
   | Token.KwInline -> (
       match parse_function p attrs ((), is_pub) is_pub with
-      | Some kind -> Some (item_of p attrs ((), is_pub) kind start)
+      | Some kind -> (
+          Some (item_of p attrs ((), is_pub) kind start))
       | None -> None)
   | Token.KwTest -> Some (item_of p attrs ((), is_pub) (parse_test_decl p) start)
   | Token.KwStruct | Token.KwResource ->

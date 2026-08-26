@@ -4324,7 +4324,7 @@ and register_item (env : env) (item : Ast.item) : (env, string) result =
       let qname = qualified_name item.module_path d.fn_sig.sig_name in
       if List.mem_assoc qname env.functions then
         Error (err item.span (Printf.sprintf "duplicate function `%s`" qname))
-      else
+      else begin
         let* sig_ = resolve_signature env empty_scope d.fn_sig [] ~key:qname in
         (* the qualified-def form `def Type::method(...)` is a method
            declaration: it also enters the method table under
@@ -4339,6 +4339,7 @@ and register_item (env : env) (item : Ast.item) : (env, string) result =
           | _ -> env
         in
         Ok { env_m with functions = (qname, sig_) :: env.functions }
+      end
   | Ast.TestDecl d ->
       let qname = qualified_name item.module_path d.test_name in
       if List.mem_assoc qname env.functions then
