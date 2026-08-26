@@ -94,6 +94,7 @@ type state = {
   mutable next_var_id : int;
   mutable failed_items : string list;
   mutable o_handoff_resolved : int;
+  mutable nested_functions : (string * typed_signature) list;
   mutable o_handoff_fallback : int;
   (* once-only declaration identities: the first allocation of an item's
      generic-parameter ids is recorded and reused by every later
@@ -752,6 +753,7 @@ let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
       next_var_id = 0;
       failed_items = [];
       o_handoff_resolved = 0;
+      nested_functions = [];
       o_handoff_fallback = 0;
       sig_param_ids = Hashtbl.create 256;
       next_callable_id = 0;
@@ -868,6 +870,15 @@ let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
         ~ret:(Type_repr.Named (b_set, [| Type_repr.Type_param set_p2 |])) ~where:[];
 
     ]
+  in
+  let regex_builtin =
+    mk_sig st ~name:"__intrinsic_regex_match" ~params_decl:[]
+      ~params:
+        [
+          ("value", Access_effect.Let, Type_repr.String);
+          ("pattern", Access_effect.Let, Type_repr.String);
+        ]
+      ~ret:Type_repr.Bool ~where:[]
   in
   let str_ty = Type_repr.String in
   let char_vec = Type_repr.Named (b_array, [| Type_repr.Char |]) in
@@ -1115,7 +1126,7 @@ let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
     functions =
       List.map
         (fun sig_ -> (sig_.ts_name, sig_))
-        (sync_builtins @ libc_builtins @ query_builtins @ string_builtins @ str_misc_builtins @ misc_builtins @ [ instant_now_sig; any_sig ]);
+        (sync_builtins @ libc_builtins @ query_builtins @ string_builtins @ str_misc_builtins @ misc_builtins @ [ instant_now_sig; any_sig; regex_builtin ]);
     methods =
       List.fold_left
         (fun m sig_ ->
@@ -2456,7 +2467,37 @@ and check_stmt (env : env) (scope : scope) (s : Ast.stmt) : (scope, string) resu
       match check_block env scope (Some Type_repr.Unit) b span with
       | Ok _ -> Ok scope
       | Error m -> Error m)
-  | Ast.Item _ -> Ok scope   (* nested items are checked at program level *)
+  | Ast.Item { Ast.kind = Ast.Function fd; _ } ->
+      (* a nested function declaration: register it (the qualified name
+         uses the enclosing module path) and check its body, so local
+         helpers like layout_engine's table_read resolve *)
+      let qname = String.concat "::" (env.module_path @ [ fd.Ast.fn_sig.Ast.sig_name ]) in
+      (match resolve_signature env scope fd.Ast.fn_sig [] ~key:qname with
+       | Error _ -> Ok scope
+       | Ok sig_ ->
+           env.state.nested_functions <-
+             (qname, sig_) :: List.remove_assoc qname env.state.nested_functions;
+           let env_m = env in
+           (* the nested body is checked like the program-level fn body *)
+           (match fd.Ast.fn_body with
+            | Ast.FnBlock b ->
+                let body_scope =
+                  {
+                    scope with
+                    locals =
+                      List.mapi
+                        (fun i (p : Ast.param) ->
+                          ( p.Ast.p_name,
+                            sig_.ts_params.(i).Type_repr.pt_type,
+                            true ))
+                        fd.Ast.fn_sig.Ast.sig_params;
+                  }
+                in
+                (match check_block env_m body_scope (Some sig_.ts_return) b b.b_span with
+                 | Ok _ -> Ok scope
+                 | Error _ -> Ok scope)
+            | _ -> Ok scope))
+  | Ast.Item _ -> Ok scope   (* other nested items are checked at program level *)
 
 and check_if (env : env) (scope : scope) (_expected : Type_repr.t option) (i : Ast.if_expr) :
     (typed_expr, string) result =
@@ -2989,19 +3030,27 @@ and lookup_function (env : env) (n : string) : typed_signature option =
   match List.assoc_opt n all with
   | Some f -> Some f
   | None -> (
-      (* the current module's own declaration takes precedence: a module
-         calling its own `check_expr` must not be lost to the closure-wide
-         suffix ambiguity when other modules declare the same name *)
-      match
-        match env.module_path with
-        | [] -> None
-        | mp -> List.assoc_opt (String.concat "::" (mp @ [ n ])) all
-      with
+      (* nested declarations first (a local helper like table_read), then
+         the current module's own declaration, then the closure-wide
+         unique suffix *)
+      match List.assoc_opt n env.state.nested_functions with
       | Some f -> Some f
       | None -> (
-          match List.filter (fun (k, _) -> Util.has_suffix k ("::" ^ n)) all with
+          match
+            List.filter (fun (k, _) -> Util.has_suffix k ("::" ^ n)) env.state.nested_functions
+          with
           | [ (_, f) ] -> Some f
-          | _ -> None))
+          | _ -> (
+              match
+                match env.module_path with
+                | [] -> None
+                | mp -> List.assoc_opt (String.concat "::" (mp @ [ n ])) all
+              with
+              | Some f -> Some f
+              | None -> (
+                  match List.filter (fun (k, _) -> Util.has_suffix k ("::" ^ n)) all with
+                  | [ (_, f) ] -> Some f
+                  | _ -> None))))
 
 and check_call (env : env) (scope : scope) (expected : Type_repr.t option)
     (callee : Ast.expr) (targs : Ast.type_expr list) (args : Ast.call_arg list)
