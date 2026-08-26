@@ -48,16 +48,16 @@ let baseline_typecheck_debt : Debt_report.t =
     Debt_report.buckets =
       [
         ("unresolved_type", 15);
-        ("unresolved_callable", 34);
+        ("unresolved_callable", 33);
         ("unresolved_module", 0);
         ("cannot_infer_generic", 9);
-        ("type_mismatch", 189);
+        ("type_mismatch", 183);
         ("obligation", 4);
         ("duplicate_decl", 0);
-        ("other", 20);
+        ("other", 21);
       ];
-    total = 271;
-    primaries = 195;
+    total = 265;
+    primaries = 189;
     secondaries = 76;
   }
 

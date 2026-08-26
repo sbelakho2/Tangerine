@@ -1934,7 +1934,7 @@ and parse_postfix (p : parser) : Ast.expr =
           | Ast.WhileExpr _ | Ast.ForExpr _ | Ast.LoopExpr _ | Ast.MatchExpr _
           | Ast.IfExpr _ | Ast.Block _ | Ast.UnsafeBlock _ | Ast.NextExpr _
           | Ast.BreakExpr _ | Ast.ReturnExpr _ | Ast.Assign _
-          | Ast.CompoundAssign _ ->
+          | Ast.CompoundAssign _ | Ast.Cast _ | Ast.Binary _ ->
               true
           | _ -> false
         in

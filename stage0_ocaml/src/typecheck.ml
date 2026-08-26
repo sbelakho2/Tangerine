@@ -917,7 +917,7 @@ let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
         ~ret:str_ty ~where:[];
       mk_sig st ~name:"string_hash" ~params_decl:[]
         ~params:[ ("s", Access_effect.Let, str_ty) ]
-        ~ret:(Type_repr.Int Type_repr.UInt) ~where:[];
+        ~ret:(Type_repr.Int Type_repr.Int) ~where:[];
       mk_sig st ~name:"string_from_chars" ~params_decl:[]
         ~params:[ ("chars", Access_effect.Let, char_vec) ]
         ~ret:str_ty ~where:[];
@@ -3150,10 +3150,17 @@ and check_field (env : env) (_scope : scope) (span : Span.span) (base : typed_ex
               | None -> check_field env _scope span { base with te_type = inner } fname)
           | _ -> check_field env _scope span { base with te_type = inner } fname)
       | Type_repr.Named (id, [| inner |])
-        when Ids.Type_id.compare id b_ptr = 0 || Ids.Type_id.compare id b_ptrmut = 0 ->
-          (* a field through the builtin Ptr/PtrMut nominal derefs the
-             pointee (`self.ptr.as_mut().refcount`) *)
-          check_field env _scope span { base with te_type = inner } fname
+        when Ids.Type_id.compare id b_ptr = 0 || Ids.Type_id.compare id b_ptrmut = 0 -> (
+          (* the source Ptr struct's own fields first (`self.address`
+             inside impl Ptr), then the pointee deref (`self.ptr.as_mut()
+             .refcount`) *)
+          match List.assoc_opt "Ptr" env.nominals with
+          | Some nom when List.mem_assoc fname nom.nom_fields -> (
+              match List.assoc_opt fname nom.nom_fields with
+              | Some ft ->
+                  Ok { te_type = substitute_fixpoint [ (Type_repr.KParam (snd (List.hd nom.nom_params)), inner) ] ft; te_effects = [||]; te_span = span }
+              | None -> check_field env _scope span { base with te_type = inner } fname)
+          | _ -> check_field env _scope span { base with te_type = inner } fname)
       | Type_repr.Named (tid, args) -> (
           match List.assoc_opt tid env.type_names with
           | Some owner -> (
