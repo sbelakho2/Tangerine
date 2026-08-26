@@ -836,6 +836,7 @@ let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
         ~ret:str_ty ~where:[];
     ]
   in
+  let opt_p2 = fresh_param_id st in
   let vec_p2 = fresh_param_id st in
   let ptr_p2 = fresh_param_id st in
   let ptr_p = fresh_param_id st in
@@ -876,6 +877,28 @@ let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
       mk_sig st ~name:"Vec::as_ptr_address" ~params_decl:[ ("T", vec_p2) ]
         ~params:[ ("self", Access_effect.Let, Type_repr.Named (b_array, [| Type_repr.Type_param vec_p2 |])) ]
         ~ret:(Type_repr.Named (b_ptr, [| Type_repr.Type_param vec_p2 |])) ~where:[];
+      (* Option::to_string (the impl Result/Array bodies) *)
+      mk_sig st ~name:"Option::to_string" ~params_decl:[ ("T", opt_p2) ]
+        ~params:
+          [
+            ("self", Access_effect.Let, Type_repr.Named (b_option, [| Type_repr.Type_param opt_p2 |]));
+          ]
+        ~ret:Type_repr.String ~where:[];
+      (* Ptr::as_ref (WeakRc/ContextError bodies) *)
+      mk_sig st ~name:"Ptr::as_ref" ~params_decl:[ ("T", ptr_p2) ]
+        ~params:[ ("self", Access_effect.Let, Type_repr.Named (b_ptr, [| Type_repr.Type_param ptr_p2 |])) ]
+        ~ret:(Type_repr.Ref_internal (Type_repr.Immutable, Type_repr.Type_param ptr_p2)) ~where:[];
+      (* Char::to_uppercase / String::rfind *)
+      mk_sig st ~name:"Char::to_uppercase" ~params_decl:[]
+        ~params:[ ("self", Access_effect.Let, Type_repr.Char) ]
+        ~ret:Type_repr.Char ~where:[];
+      mk_sig st ~name:"String::rfind" ~params_decl:[]
+        ~params:
+          [
+            ("self", Access_effect.Let, Type_repr.String);
+            ("sub", Access_effect.Let, Type_repr.String);
+          ]
+        ~ret:(Type_repr.Named (b_option, [| Type_repr.Int Type_repr.Int |])) ~where:[];
       (* String::chars (the bench's s.chars() iteration) *)
       mk_sig st ~name:"String::chars" ~params_decl:[]
         ~params:[ ("self", Access_effect.Let, Type_repr.String) ]
@@ -3294,7 +3317,8 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
       match owner_ty with
       | Type_repr.Named _ | Type_repr.Fixed_array _ | Type_repr.Tuple _
       | Type_repr.String | Type_repr.Int _ | Type_repr.Bool | Type_repr.Char
-      | Type_repr.Float _ | Type_repr.Type_param _ | Type_repr.Infer_var _ ->
+      | Type_repr.Float _ | Type_repr.Type_param _ | Type_repr.Infer_var _
+      | Type_repr.Ref_internal _ ->
           let sig_ =
             mk_sig env.state ~name:("derived::" ^ oname ^ "::clone") ~params_decl:[]
               ~params:[ ("self", Access_effect.Let, owner_ty) ] ~ret:owner_ty ~where:[]
@@ -3304,11 +3328,58 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
       | _ -> None
   in
   match (match try_owners candidate_owners with Some s -> Some s | None -> derived_clone ()) with
-  | None ->
-      env.state.oracle.o_unresolved_calls <- env.state.oracle.o_unresolved_calls + 1;
-      Error
-        (err span
-           (Printf.sprintf "type %s has no method `%s`" (type_to_string owner_ty) mname))
+  | None -> (
+      (* a field of function type called on the receiver: `self.func(x)`
+         where the struct's field `func` is itself a function value *)
+      match check_field env scope span receiver mname with
+      | Ok fte -> (
+          match fte.te_type with
+          | Type_repr.Function (ps, r) -> (
+              let rec check_args acc i = function
+                | [] -> Ok (List.rev acc)
+                | (a : Ast.call_arg) :: rest -> (
+                    if i >= Array.length ps then
+                      Error (err a.Ast.ca_span "too many arguments")
+                    else
+                      match check_expr env scope (Some ps.(i).Type_repr.pt_type) a.Ast.ca_value with
+                      | Error m -> Error m
+                      | Ok ate -> (
+                          let subst = ref [] in
+                          match unify subst ps.(i).Type_repr.pt_type ate.te_type with
+                          | Ok () -> check_args (ate :: acc) (i + 1) rest
+                          | Error m ->
+                              Error
+                                (err a.Ast.ca_span
+                                   (Printf.sprintf "argument %d type mismatch: expected %s (%s)"
+                                      (i + 1) (type_to_string ps.(i).Type_repr.pt_type) m))))
+              in
+              match check_args [] 0 args with
+              | Error m -> Error m
+              | Ok tes ->
+                  if List.length tes < Array.length ps then
+                    Error (err span "too few arguments")
+                  else
+                    Ok
+                      {
+                        te_type = r;
+                        te_effects =
+                          Array.of_list
+                            (List.map2
+                               (fun (_te : typed_expr) (p : Type_repr.param_type) ->
+                                 Access_effect.read_effect p.Type_repr.pt_convention)
+                               tes (Array.to_list ps));
+                        te_span = span;
+                      })
+          | _ ->
+              env.state.oracle.o_unresolved_calls <- env.state.oracle.o_unresolved_calls + 1;
+              Error
+                (err span
+                   (Printf.sprintf "type %s has no method `%s`" (type_to_string owner_ty) mname)))
+      | Error _ ->
+          env.state.oracle.o_unresolved_calls <- env.state.oracle.o_unresolved_calls + 1;
+          Error
+            (err span
+               (Printf.sprintf "type %s has no method `%s`" (type_to_string owner_ty) mname)))
       | Some sig_ -> (
           if Array.length sig_.ts_params = 0 then
             Error (err span "internal: method signature without a receiver")
