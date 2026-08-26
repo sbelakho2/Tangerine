@@ -951,6 +951,25 @@ let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
         ~params:[] ~ret:uint_ty ~where:[];
     ]
   in
+  (* the kernel's `Instant` (bench's instant_now): the source std/time
+     declares the struct; the builtin nominal adopts the canonical id *)
+  let instant_tid = fresh_type_id st in
+  let instant_nominal : nominal =
+    {
+      nom_kind = `Struct;
+      nom_params = [];
+      nom_fields = [];
+      nom_variants = [];
+      nom_where = [];
+      nom_field_ids = [];
+      nom_variant_ids = [];
+    }
+  in
+  let instant_types = ("Instant", Type_repr.Named (instant_tid, [||])) in
+  let instant_now_sig =
+    mk_sig st ~name:"instant_now" ~params_decl:[]
+      ~params:[] ~ret:(Type_repr.Named (instant_tid, [||])) ~where:[]
+  in
   (* the kernel's `Any` (Box[Any], Arc[Box[Any]]): declared nowhere in
      the source, a compiler builtin — one concrete nominal *)
   let any_tid = fresh_type_id st in
@@ -965,9 +984,19 @@ let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
       nom_variant_ids = [];
     }
   in
-  let types = ("Any", Type_repr.Named (any_tid, [||])) :: types in
-  let type_ids = ("Any", any_tid) :: type_ids_of_builtins in
-  let type_names = (any_tid, "Any") :: type_names_of_builtins in
+  let types =
+    ("Any", Type_repr.Named (any_tid, [||])) :: instant_types :: types
+  in
+  let type_ids =
+    ("Any", any_tid) :: ("Instant", instant_tid) :: type_ids_of_builtins
+  in
+  let type_names =
+    (any_tid, "Any") :: (instant_tid, "Instant") :: type_names_of_builtins
+  in
+  let any_sig =
+    mk_sig st ~name:"Any" ~params_decl:[]
+      ~params:[] ~ret:(Type_repr.Named (any_tid, [||])) ~where:[]
+  in
   (* LangItem generic parameters minted once, in declaration order *)
   let vec_p = fresh_param_id st in
   let opt_p = fresh_param_id st in
@@ -1029,7 +1058,7 @@ let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
     functions =
       List.map
         (fun sig_ -> (sig_.ts_name, sig_))
-        (sync_builtins @ libc_builtins @ query_builtins @ string_builtins);
+        (sync_builtins @ libc_builtins @ query_builtins @ string_builtins @ [ instant_now_sig; any_sig ]);
     methods =
       List.fold_left
         (fun m sig_ ->
@@ -1047,7 +1076,7 @@ let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
     impls;
     current_self = None;
     current_return = None;
-    nominals = [ ("Any", any_nominal); ("Option", opt_nominal); ("Result", res_nominal) ];
+    nominals = [ ("Instant", instant_nominal); ("Any", any_nominal); ("Option", opt_nominal); ("Result", res_nominal) ];
     constructors = builtin_constructors st opt_p res_p res_e_p;
     consts = [];
     state = st;
@@ -2056,6 +2085,7 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
                 | Type_repr.Float _, Type_repr.Float _ -> true
                 | Type_repr.Int_literal _, (Type_repr.Int _ | Type_repr.Float _ | Type_repr.Char) -> true
                 | a, Type_repr.Int _ when is_ptr a -> true
+                | Type_repr.Int _, b when is_ptr b -> true
                 | a, b when is_ptr a && is_ptr b -> true
                 | Type_repr.Never, _ -> true
                 | _ -> false
@@ -2103,6 +2133,9 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
           | Ast.Deref -> (
               match te.te_type with
               | Type_repr.Ref_internal (_, t) | Type_repr.Raw_ptr (_, t) ->
+                  Ok { te_type = t; te_effects = Array.append te.te_effects [| Access_effect.Read |]; te_span = span }
+              | Type_repr.Named (id, [| t |])
+                when Ids.Type_id.compare id b_ptr = 0 || Ids.Type_id.compare id b_ptrmut = 0 ->
                   Ok { te_type = t; te_effects = Array.append te.te_effects [| Access_effect.Read |]; te_span = span }
               | _ ->
                   Error
