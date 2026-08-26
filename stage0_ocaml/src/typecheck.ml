@@ -576,6 +576,7 @@ let builtin_methods (st : state) (vec_p : Ids.Generic_param_id.t) (opt_p : Ids.G
       ("is_digit", [], b_ty, [], let_);
       ("is_alpha", [], b_ty, [], let_);
       ("is_alphanumeric", [], b_ty, [], let_);
+      ("to_int", [], i_ty, [], let_);
     ]
     |> List.map (fun (n, p, r, w, rc) -> simple ~owner:"Char" ~owner_ty:c_ty ~name:n ~params:p ~ret:r ~decl:[] ~where:w ~recv_conv:rc)
   in
@@ -811,6 +812,7 @@ let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
     }
   in
   let types = builtin_types st in
+  let types = ("isize", Type_repr.Int Type_repr.Int) :: types in
   (* the canonical sync intrinsics and type-query builtins: ONE
      registration, so the bare names resolve exactly (the source
      duplicates them across std/alloc and std/ffi, which would make the
@@ -2419,6 +2421,8 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
                 | a, Type_repr.Int _ when is_ptr a -> true
                 | Type_repr.Int _, b when is_ptr b -> true
                 | a, b when is_ptr a && is_ptr b -> true
+                | Type_repr.Type_param _, b when is_ptr b -> true
+                | a, Type_repr.Type_param _ when is_ptr a -> true
                 | Type_repr.Never, _ -> true
                 | _ -> false
               in
@@ -2532,8 +2536,19 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
                       te_span = span;
                     })))
   | Ast.AwaitExpr (_, span) -> Error (err span "await is not available in the bootstrap subset")
-  | Ast.MacroCall (name, _, span) ->
-      Error (err span (Printf.sprintf "macro call `%s!` is not available in the bootstrap subset" name))
+  | Ast.MacroCall (name, args, span) ->
+      (* debug_assert!(cond[, msg]): the kernel's 3 uses (ffi) are a
+         check on a boolean condition — check the condition, drop the
+         optional message, yield Unit *)
+      if name = "debug_assert" then
+        match args with
+        | Ast.MacroExpr cond :: _ ->
+            (match check_expr env scope None cond with
+             | Error m -> Error m
+             | Ok _ -> Ok { te_type = Type_repr.Unit; te_effects = [||]; te_span = span })
+        | _ -> Ok { te_type = Type_repr.Unit; te_effects = [||]; te_span = span }
+      else
+        Error (err span (Printf.sprintf "macro call `%s!` is not available in the bootstrap subset" name))
   | Ast.Assign (target, value, span) -> (
       match check_place env scope target with
       | Error m -> Error m

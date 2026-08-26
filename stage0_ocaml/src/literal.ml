@@ -18,6 +18,7 @@ let suffix_of_string (s : string) : int_suffix option =
   | "u8" -> Some U8 | "u16" -> Some U16 | "u32" -> Some U32
   | "u64" -> Some U64 | "u128" -> Some U128
   | "int" -> Some Int | "uint" -> Some UInt
+  | "u" -> Some UInt | "i" -> Some Int
   | _ -> None
 
 let suffix_string = function
