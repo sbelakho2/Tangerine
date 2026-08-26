@@ -1003,15 +1003,11 @@ let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
         ~ret:Type_repr.Unit ~where:[];
     ]
   in
-  let size_p = fresh_param_id st in
-  let query_builtins =
-    [
-      mk_sig st ~name:"size_of" ~params_decl:[ ("T", size_p) ]
-        ~params:[] ~ret:uint_ty ~where:[];
-      mk_sig st ~name:"align_of" ~params_decl:[ ("T", size_p) ]
-        ~params:[] ~ret:uint_ty ~where:[];
-    ]
-  in
+  (* the type queries size_of[T]()/align_of[T]() are a SPECIAL FORM at
+     call sites (they carry type arguments); they must NOT sit in the
+     functions table, or the exact-name lookup would shadow a module's
+     own size_of(engine, ty) *)
+  let query_builtins = [] in
   (* the kernel's `Instant` (bench's instant_now): the source std/time
      declares the struct; the builtin nominal adopts the canonical id *)
   let instant_tid = fresh_type_id st in
@@ -2770,6 +2766,21 @@ and check_place (env : env) (scope : scope) (e : Ast.expr) : (Type_repr.t * bool
               | Ok _ ->
                   Error (err span (Printf.sprintf "cannot index a value of type %s" (type_to_string bt)))
               | Error m -> Error m)))
+  | Ast.Unary (Ast.Deref, e, _) -> (
+      (* the pointer-write place: *(ptr) = value *)
+      match check_expr env scope None e with
+      | Error m -> Error m
+      | Ok te -> (
+          match te.te_type with
+          | Type_repr.Ref_internal (_, t) | Type_repr.Raw_ptr (_, t) -> Ok (t, true)
+          | Type_repr.Named (id, [| t |])
+            when Ids.Type_id.compare id b_ptr = 0 || Ids.Type_id.compare id b_ptrmut = 0 ->
+              Ok (t, true)
+          | Type_repr.Type_param _ -> Ok (te.te_type, true)
+          | _ ->
+              Error
+                (err (Ast.expr_span e)
+                   (Printf.sprintf "cannot dereference %s" (type_to_string te.te_type)))))
   | _ -> Error (err (Ast.expr_span e) "assignment target must be a variable, field or index")
 
 and check_field (env : env) (_scope : scope) (span : Span.span) (base : typed_expr)
@@ -2981,6 +2992,14 @@ and check_call (env : env) (scope : scope) (expected : Type_repr.t option)
     (callee : Ast.expr) (targs : Ast.type_expr list) (args : Ast.call_arg list)
     (span : Span.span) : (typed_expr, string) result =
   match callee with
+  | Ast.Name (n, _) when (n = "size_of" || n = "align_of") && targs <> [] -> (
+      (* the type-query special form: size_of[T]() / align_of[T]() *)
+      let size_p = fresh_param_id env.state in
+      let query_sig =
+        mk_sig env.state ~name:n ~params_decl:[ ("T", size_p) ]
+          ~params:[] ~ret:(Type_repr.Int Type_repr.UInt) ~where:[]
+      in
+      check_call_sig env scope expected query_sig targs args span)
   | Ast.Name (n, _) -> (
       match assoc_local n scope.locals with
       | Some (Type_repr.Function (ps, _), _) ->
@@ -3237,6 +3256,9 @@ and check_call_sig (env : env) (scope : scope) (expected : Type_repr.t option)
       let rec go (acc : typed_expr list) (effects : Access_effect.read_effect list) i = function
         | [] -> Ok (List.rev acc, List.rev effects)
         | (a : Ast.call_arg) :: rest -> (
+            (* the kernel's exact-arity rule (types.tg): every declared
+               parameter must have a supplied argument and every argument
+               must map to a declared parameter *)
             if i >= Array.length sig_.ts_params then
               Error (err a.Ast.ca_span "too many arguments")
             else begin
