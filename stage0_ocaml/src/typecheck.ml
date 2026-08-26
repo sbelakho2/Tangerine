@@ -854,6 +854,7 @@ let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
     ]
   in
   let u32_ty = Type_repr.Int Type_repr.U32 in
+  let ts_p2 = fresh_param_id st in
   let set_p2 = fresh_param_id st in
   let misc_builtins =
     [
@@ -865,13 +866,46 @@ let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
       mk_sig st ~name:"set_of" ~params_decl:[ ("T", set_p2) ]
         ~params:[ ("value", Access_effect.Let, Type_repr.Type_param set_p2) ]
         ~ret:(Type_repr.Named (b_set, [| Type_repr.Type_param set_p2 |])) ~where:[];
-      mk_sig st ~name:"duration_nanos" ~params_decl:[]
-        ~params:[] ~ret:(Type_repr.Int Type_repr.UInt) ~where:[];
-      mk_sig st ~name:"duration_millis" ~params_decl:[]
-        ~params:[] ~ret:(Type_repr.Int Type_repr.UInt) ~where:[];
+
     ]
   in
   let str_ty = Type_repr.String in
+  let char_vec = Type_repr.Named (b_array, [| Type_repr.Char |]) in
+  let str_misc_builtins =
+    [
+      mk_sig st ~name:"string_clone" ~params_decl:[]
+        ~params:[ ("s", Access_effect.Let, str_ty) ]
+        ~ret:str_ty ~where:[];
+      mk_sig st ~name:"string_hash" ~params_decl:[]
+        ~params:[ ("s", Access_effect.Let, str_ty) ]
+        ~ret:(Type_repr.Int Type_repr.UInt) ~where:[];
+      mk_sig st ~name:"string_from_chars" ~params_decl:[]
+        ~params:[ ("chars", Access_effect.Let, char_vec) ]
+        ~ret:str_ty ~where:[];
+      mk_sig st ~name:"duration_nanos" ~params_decl:[ ("T", ts_p2) ]
+        ~params:[ ("ts", Access_effect.Let, Type_repr.Type_param ts_p2) ]
+        ~ret:(Type_repr.Int Type_repr.UInt) ~where:[];
+      mk_sig st ~name:"duration_millis" ~params_decl:[ ("T", ts_p2) ]
+        ~params:[ ("ts", Access_effect.Let, Type_repr.Type_param ts_p2) ]
+        ~ret:(Type_repr.Int Type_repr.UInt) ~where:[];
+      mk_sig st ~name:"vec_filled" ~params_decl:[ ("T", ts_p2) ]
+        ~params:
+          [
+            ("n", Access_effect.Let, Type_repr.Int Type_repr.Int);
+            ("value", Access_effect.Let, Type_repr.Type_param ts_p2);
+          ]
+        ~ret:(Type_repr.Named (b_array, [| Type_repr.Type_param ts_p2 |])) ~where:[];
+      mk_sig st ~name:"a64_ldurb" ~params_decl:[ ("T", ts_p2) ]
+        ~params:
+          [
+            ("b", Access_effect.Inout, Type_repr.Type_param ts_p2);
+            ("rd", Access_effect.Let, Type_repr.Type_param ts_p2);
+            ("rn", Access_effect.Let, Type_repr.Type_param ts_p2);
+            ("imm", Access_effect.Let, Type_repr.Int Type_repr.Int);
+          ]
+        ~ret:Type_repr.Unit ~where:[];
+    ]
+  in
   let vec_u8 = Type_repr.Named (b_array, [| u8_ty |]) in
   let string_builtins =
     [
@@ -1085,7 +1119,7 @@ let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
     functions =
       List.map
         (fun sig_ -> (sig_.ts_name, sig_))
-        (sync_builtins @ libc_builtins @ query_builtins @ string_builtins @ misc_builtins @ [ instant_now_sig; any_sig ]);
+        (sync_builtins @ libc_builtins @ query_builtins @ string_builtins @ str_misc_builtins @ misc_builtins @ [ instant_now_sig; any_sig ]);
     methods =
       List.fold_left
         (fun m sig_ ->
