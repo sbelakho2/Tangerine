@@ -836,6 +836,61 @@ let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
         ~ret:str_ty ~where:[];
     ]
   in
+  let vec_p2 = fresh_param_id st in
+  let ptr_p2 = fresh_param_id st in
+  let ptr_p = fresh_param_id st in
+  let ptr_t = Type_repr.Named (b_ptr, [| Type_repr.Type_param ptr_p |]) in
+  let ptr_builtins =
+    [
+      (* the raw-pointer surface the kernel relies on (box_new's
+         ptr.write, rc_new's ptr.read): compiler builtins *)
+      mk_sig st ~name:"Ptr::write" ~params_decl:[ ("T", ptr_p) ]
+        ~params:
+          [
+            ("self", Access_effect.Let, ptr_t);
+            ("value", Access_effect.Sink, Type_repr.Type_param ptr_p);
+          ]
+        ~ret:Type_repr.Unit ~where:[];
+      mk_sig st ~name:"Ptr::read" ~params_decl:[ ("T", ptr_p) ]
+        ~params:[ ("self", Access_effect.Let, ptr_t) ]
+        ~ret:(Type_repr.Type_param ptr_p) ~where:[];
+      (* Ptr::as_mut (ArcStrong/Drop bodies), Ptr::drop_in_place *)
+      mk_sig st ~name:"Ptr::as_mut" ~params_decl:[ ("T", ptr_p2) ]
+        ~params:[ ("self", Access_effect.Let, Type_repr.Named (b_ptr, [| Type_repr.Type_param ptr_p2 |])) ]
+        ~ret:(Type_repr.Named (b_ptrmut, [| Type_repr.Type_param ptr_p2 |])) ~where:[];
+      mk_sig st ~name:"Ptr::drop_in_place" ~params_decl:[ ("T", ptr_p2) ]
+        ~params:[ ("self", Access_effect.Inout, Type_repr.Named (b_ptr, [| Type_repr.Type_param ptr_p2 |])) ]
+        ~ret:Type_repr.Unit ~where:[];
+      (* Vec::sort (the bench's sorted.sort()), Vec::truncate,
+         Vec::as_ptr_address (the ffi's args.as_ptr_address()) *)
+      mk_sig st ~name:"Vec::sort" ~params_decl:[ ("T", vec_p2) ]
+        ~params:[ ("self", Access_effect.Inout, Type_repr.Named (b_array, [| Type_repr.Type_param vec_p2 |])) ]
+        ~ret:Type_repr.Unit ~where:[];
+      mk_sig st ~name:"Vec::truncate" ~params_decl:[ ("T", vec_p2) ]
+        ~params:
+          [
+            ("self", Access_effect.Inout, Type_repr.Named (b_array, [| Type_repr.Type_param vec_p2 |]));
+            ("new_len", Access_effect.Let, Type_repr.Int Type_repr.Int);
+          ]
+        ~ret:Type_repr.Unit ~where:[];
+      mk_sig st ~name:"Vec::as_ptr_address" ~params_decl:[ ("T", vec_p2) ]
+        ~params:[ ("self", Access_effect.Let, Type_repr.Named (b_array, [| Type_repr.Type_param vec_p2 |])) ]
+        ~ret:(Type_repr.Named (b_ptr, [| Type_repr.Type_param vec_p2 |])) ~where:[];
+      (* String::chars (the bench's s.chars() iteration) *)
+      mk_sig st ~name:"String::chars" ~params_decl:[]
+        ~params:[ ("self", Access_effect.Let, Type_repr.String) ]
+        ~ret:(Type_repr.Named (b_array, [| Type_repr.Char |])) ~where:[];
+      (* Vec::resize (the kernel's buffer growth) *)
+      mk_sig st ~name:"Vec::resize" ~params_decl:[ ("T", vec_p2) ]
+        ~params:
+          [
+            ("self", Access_effect.Inout, Type_repr.Named (b_array, [| Type_repr.Type_param vec_p2 |]));
+            ("new_len", Access_effect.Let, Type_repr.Int Type_repr.Int);
+            ("value", Access_effect.Sink, Type_repr.Type_param vec_p2);
+          ]
+        ~ret:Type_repr.Unit ~where:[];
+    ]
+  in
   let size_p = fresh_param_id st in
   let query_builtins =
     [
@@ -924,7 +979,20 @@ let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
       List.map
         (fun sig_ -> (sig_.ts_name, sig_))
         (sync_builtins @ query_builtins @ string_builtins);
-    methods = builtin_methods st vec_p opt_p res_p res_e_p map_k_p map_v_p set_p;
+    methods =
+      List.fold_left
+        (fun m sig_ ->
+          match String.index_opt sig_.ts_name ':' with
+          | Some i when i + 2 < String.length sig_.ts_name ->
+              let owner = String.sub sig_.ts_name 0 i in
+              let mname =
+                String.sub sig_.ts_name (i + 2) (String.length sig_.ts_name - i - 2)
+              in
+              let key = (owner, mname) in
+              (key, sig_) :: List.remove_assoc key m
+          | _ -> m)
+        (builtin_methods st vec_p opt_p res_p res_e_p map_k_p map_v_p set_p)
+        ptr_builtins;
     impls;
     current_self = None;
     current_return = None;
@@ -3226,7 +3294,7 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
       match owner_ty with
       | Type_repr.Named _ | Type_repr.Fixed_array _ | Type_repr.Tuple _
       | Type_repr.String | Type_repr.Int _ | Type_repr.Bool | Type_repr.Char
-      | Type_repr.Float _ | Type_repr.Type_param _ ->
+      | Type_repr.Float _ | Type_repr.Type_param _ | Type_repr.Infer_var _ ->
           let sig_ =
             mk_sig env.state ~name:("derived::" ^ oname ^ "::clone") ~params_decl:[]
               ~params:[ ("self", Access_effect.Let, owner_ty) ] ~ret:owner_ty ~where:[]
@@ -3988,7 +4056,19 @@ and register_item (env : env) (item : Ast.item) : (env, string) result =
         Error (err item.span (Printf.sprintf "duplicate function `%s`" qname))
       else
         let* sig_ = resolve_signature env empty_scope d.fn_sig [] ~key:qname in
-        Ok { env with functions = (qname, sig_) :: env.functions }
+        (* the qualified-def form `def Type::method(...)` is a method
+           declaration: it also enters the method table under
+           (Type, method) so `x.method()` dispatches to it *)
+        let env_m =
+          match String.index_opt d.fn_sig.sig_name ':' with
+          | Some i when i + 2 < String.length d.fn_sig.sig_name ->
+              let owner = String.sub d.fn_sig.sig_name 0 i in
+              let mname = String.sub d.fn_sig.sig_name (i + 2) (String.length d.fn_sig.sig_name - i - 2) in
+              let key = (owner, mname) in
+              { env with methods = (key, sig_) :: List.remove_assoc key env.methods }
+          | _ -> env
+        in
+        Ok { env_m with functions = (qname, sig_) :: env.functions }
   | Ast.TestDecl d ->
       let qname = qualified_name item.module_path d.test_name in
       if List.mem_assoc qname env.functions then
