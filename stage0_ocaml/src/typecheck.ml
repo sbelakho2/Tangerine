@@ -95,6 +95,7 @@ type state = {
   mutable failed_items : string list;
   mutable o_handoff_resolved : int;
   mutable nested_functions : (string * typed_signature) list;
+  mutable query_sigs : (string * typed_signature) list;
   mutable o_handoff_fallback : int;
   (* once-only declaration identities: the first allocation of an item's
      generic-parameter ids is recorded and reused by every later
@@ -754,6 +755,7 @@ let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
       failed_items = [];
       o_handoff_resolved = 0;
       nested_functions = [];
+      query_sigs = [];
       o_handoff_fallback = 0;
       sig_param_ids = Hashtbl.create 256;
       next_callable_id = 0;
@@ -1014,11 +1016,6 @@ let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
         ~ret:Type_repr.Unit ~where:[];
     ]
   in
-  (* the type queries size_of[T]()/align_of[T]() are a SPECIAL FORM at
-     call sites (they carry type arguments); they must NOT sit in the
-     functions table, or the exact-name lookup would shadow a module's
-     own size_of(engine, ty) *)
-  let query_builtins = [] in
   (* the kernel's `Instant` (bench's instant_now): the source std/time
      declares the struct; the builtin nominal adopts the canonical id *)
   let instant_tid = fresh_type_id st in
@@ -1065,6 +1062,22 @@ let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
     mk_sig st ~name:"Any" ~params_decl:[]
       ~params:[] ~ret:(Type_repr.Named (any_tid, [||])) ~where:[]
   in
+  (* the type queries size_of[T]()/align_of[T]() are a SPECIAL FORM at
+     call sites (they carry type arguments); they must NOT sit in the
+     functions table, or the exact-name lookup would shadow a module's
+     own size_of(engine, ty). They are minted ONCE here so the oracle
+     sees known DefIds. *)
+  let size_p = fresh_param_id st in
+  let align_p = fresh_param_id st in
+  st.query_sigs <-
+    [
+      ( "size_of",
+        mk_sig st ~name:"size_of" ~params_decl:[ ("T", size_p) ]
+          ~params:[] ~ret:(Type_repr.Int Type_repr.UInt) ~where:[] );
+      ( "align_of",
+        mk_sig st ~name:"align_of" ~params_decl:[ ("T", align_p) ]
+          ~params:[] ~ret:(Type_repr.Int Type_repr.UInt) ~where:[] );
+    ];
   (* LangItem generic parameters minted once, in declaration order *)
   let vec_p = fresh_param_id st in
   let opt_p = fresh_param_id st in
@@ -1126,7 +1139,7 @@ let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
     functions =
       List.map
         (fun sig_ -> (sig_.ts_name, sig_))
-        (sync_builtins @ libc_builtins @ query_builtins @ string_builtins @ str_misc_builtins @ misc_builtins @ [ instant_now_sig; any_sig; regex_builtin ]);
+        (sync_builtins @ libc_builtins @ string_builtins @ str_misc_builtins @ misc_builtins @ [ instant_now_sig; any_sig; regex_builtin ]);
     methods =
       List.fold_left
         (fun m sig_ ->
@@ -3057,13 +3070,13 @@ and check_call (env : env) (scope : scope) (expected : Type_repr.t option)
     (span : Span.span) : (typed_expr, string) result =
   match callee with
   | Ast.Name (n, _) when (n = "size_of" || n = "align_of") && targs <> [] -> (
-      (* the type-query special form: size_of[T]() / align_of[T]() *)
-      let size_p = fresh_param_id env.state in
-      let query_sig =
-        mk_sig env.state ~name:n ~params_decl:[ ("T", size_p) ]
-          ~params:[] ~ret:(Type_repr.Int Type_repr.UInt) ~where:[]
-      in
-      check_call_sig env scope expected query_sig targs args span)
+      (* the type-query special form: size_of[T]() / align_of[T]() — the
+         stable, once-minted signature so the oracle sees a known DefId *)
+      match List.assoc_opt n env.state.query_sigs with
+      | Some query_sig -> check_call_sig env scope expected query_sig targs args span
+      | None ->
+          env.state.oracle.o_unresolved_calls <- env.state.oracle.o_unresolved_calls + 1;
+          Error (err span (Printf.sprintf "unknown function `%s`" n)))
   | Ast.Name (n, _) -> (
       match assoc_local n scope.locals with
       | Some (Type_repr.Function (ps, _), _) ->
@@ -4767,6 +4780,7 @@ let run_oracle (env : env) (_item_name : string) : string list =
     List.map (fun (_, s) -> s.ts_callable) env.functions
     @ List.map (fun (_, s) -> s.ts_callable) env.methods
     @ List.map (fun (_, s) -> s.ts_callable) env.constructors
+    @ List.map (fun (_, s) -> s.ts_callable) st.query_sigs
   in
   let is_known c =
     List.exists (fun k -> Ids.Callable_id.compare k c = 0) known_callables
