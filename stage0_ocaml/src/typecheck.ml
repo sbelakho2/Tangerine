@@ -2005,6 +2005,13 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
           match resolve_type env scope ty with
           | Error m -> Error m
           | Ok tgt -> (
+              let is_ptr t =
+                match t with
+                | Type_repr.Raw_ptr _ | Type_repr.Ref_internal _ -> true
+                | Type_repr.Named (id, _) ->
+                    Ids.Type_id.compare id b_ptr = 0 || Ids.Type_id.compare id b_ptrmut = 0
+                | _ -> false
+              in
               let ok =
                 match te.te_type, tgt with
                 | Type_repr.Int _, Type_repr.Int _ -> true
@@ -2014,6 +2021,8 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
                 | Type_repr.Char, Type_repr.Int _ -> true
                 | Type_repr.Float _, Type_repr.Float _ -> true
                 | Type_repr.Int_literal _, (Type_repr.Int _ | Type_repr.Float _ | Type_repr.Char) -> true
+                | a, Type_repr.Int _ when is_ptr a -> true
+                | a, b when is_ptr a && is_ptr b -> true
                 | Type_repr.Never, _ -> true
                 | _ -> false
               in
@@ -2567,7 +2576,19 @@ and check_place (env : env) (scope : scope) (e : Ast.expr) : (Type_repr.t * bool
   | Ast.Name (n, span) -> (
       match assoc_local n scope.locals with
       | Some (t, mutable_) -> Ok (t, mutable_)
-      | None -> Error (err span (Printf.sprintf "unknown variable `%s`" n)))
+      | None -> (
+          (* a static is an assignable global: resolve it through the
+             module-qualified consts, then the bare name *)
+          match
+            match env.module_path with
+            | [] -> None
+            | mp -> List.assoc_opt (String.concat "::" (mp @ [ n ])) env.consts
+          with
+          | Some t -> Ok (t, true)
+          | None -> (
+              match List.assoc_opt n env.consts with
+              | Some t -> Ok (t, true)
+              | None -> Error (err span (Printf.sprintf "unknown variable `%s`" n)))))
   | Ast.Field (base, fname, span) -> (
       match check_place env scope base with
       | Error m -> Error m
@@ -2621,6 +2642,11 @@ and check_field (env : env) (_scope : scope) (span : Span.span) (base : typed_ex
                (Printf.sprintf "cannot project `.%s` from %s" fname (type_to_string base.te_type))))
   | _ -> (
       match base.te_type with
+      | Type_repr.Named (id, [| inner |])
+        when Ids.Type_id.compare id b_ptr = 0 || Ids.Type_id.compare id b_ptrmut = 0 ->
+          (* a field through the builtin Ptr/PtrMut nominal derefs the
+             pointee (`self.ptr.as_mut().refcount`) *)
+          check_field env _scope span { base with te_type = inner } fname
       | Type_repr.Named (tid, args) -> (
           match List.assoc_opt tid env.type_names with
           | Some owner -> (
@@ -2644,6 +2670,13 @@ and check_field (env : env) (_scope : scope) (span : Span.span) (base : typed_ex
                        (Printf.sprintf "cannot project `.%s` from non-struct type %s" fname
                           (type_to_string base.te_type))))
           | None -> Error (err span "field projection on a type with unknown identity"))
+      | Type_repr.Ref_internal (_, inner) ->
+          (* a field through a reference derefs the pointee
+             (`self.ptr.as_ref().strong_count`) *)
+          check_field env _scope span { base with te_type = inner } fname
+      | Type_repr.Raw_ptr (_, inner) ->
+          (* a field through a raw pointer: the pointer's pointee *)
+          check_field env _scope span { base with te_type = inner } fname
       | _ ->
           Error
             (err span
