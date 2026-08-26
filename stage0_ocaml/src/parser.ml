@@ -1937,7 +1937,11 @@ and parse_postfix (p : parser) : Ast.expr =
               true
           | _ -> false
         in
-        if statement_form !e && source_has_newline p (Ast.expr_span !e) (cur_span p)
+        (* the statement-form's span can extend into the following
+           token (the if-expr span merges the next token); the
+           statement boundary is the last CONSUMED token's end *)
+        let boundary = Span.make p.prev_end p.prev_end p.file_id in
+        if statement_form !e && source_has_newline p boundary (cur_span p)
         then ()
         else begin
           let start = cur_span p in

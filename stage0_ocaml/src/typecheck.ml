@@ -824,6 +824,34 @@ let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
         ~ret:uint_ty ~where:[];
     ]
   in
+  let libc_builtins =
+    [
+      mk_sig st ~name:"memcpy" ~params_decl:[]
+        ~params:
+          [
+            ("dest", Access_effect.Let, ptr_u8);
+            ("src", Access_effect.Let, ptr_u8);
+            ("n", Access_effect.Let, uint_ty);
+          ]
+        ~ret:ptr_u8 ~where:[];
+      mk_sig st ~name:"memset" ~params_decl:[]
+        ~params:
+          [
+            ("dest", Access_effect.Let, ptr_u8);
+            ("c", Access_effect.Let, Type_repr.Int Type_repr.Int);
+            ("n", Access_effect.Let, uint_ty);
+          ]
+        ~ret:ptr_u8 ~where:[];
+      mk_sig st ~name:"memmove" ~params_decl:[]
+        ~params:
+          [
+            ("dest", Access_effect.Let, ptr_u8);
+            ("src", Access_effect.Let, ptr_u8);
+            ("n", Access_effect.Let, uint_ty);
+          ]
+        ~ret:ptr_u8 ~where:[];
+    ]
+  in
   let str_ty = Type_repr.String in
   let vec_u8 = Type_repr.Named (b_array, [| u8_ty |]) in
   let string_builtins =
@@ -1001,7 +1029,7 @@ let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
     functions =
       List.map
         (fun sig_ -> (sig_.ts_name, sig_))
-        (sync_builtins @ query_builtins @ string_builtins);
+        (sync_builtins @ libc_builtins @ query_builtins @ string_builtins);
     methods =
       List.fold_left
         (fun m sig_ ->
