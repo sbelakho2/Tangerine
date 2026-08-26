@@ -249,11 +249,7 @@ let rec parse_program (p : parser) (program_module_path : string list) : Ast.pro
   let start = cur_span p in
   while not (at_eof p) do
     (match parse_item p with
-     | Some item ->
-         (match item.Ast.kind with
-          | Ast.Function fd when String.equal fd.Ast.fn_sig.Ast.sig_name "linker_resolve_entry_name" ->
-          | _ -> ());
-         items := item :: !items
+     | Some item -> items := item :: !items
      | None -> ignore (advance p));
     ignore (eat_optional_semi p)
   done;
