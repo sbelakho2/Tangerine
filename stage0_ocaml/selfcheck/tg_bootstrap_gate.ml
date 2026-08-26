@@ -47,18 +47,18 @@ let baseline_typecheck_debt : Debt_report.t =
   {
     Debt_report.buckets =
       [
-        ("unresolved_type", 84);
-        ("unresolved_callable", 33);
+        ("unresolved_type", 15);
+        ("unresolved_callable", 34);
         ("unresolved_module", 0);
         ("cannot_infer_generic", 9);
-        ("type_mismatch", 222);
-        ("obligation", 3);
+        ("type_mismatch", 193);
+        ("obligation", 4);
         ("duplicate_decl", 0);
-        ("other", 18);
+        ("other", 20);
       ];
-    total = 369;
-    primaries = 258;
-    secondaries = 111;
+    total = 275;
+    primaries = 197;
+    secondaries = 78;
   }
 
 let fail fmt = Printf.ksprintf (fun s -> Printf.printf "BOOTSTRAP GATE: FAIL: %s\n" s; exit 1) fmt
@@ -193,12 +193,36 @@ let artifact_exists ~(repo_root : string) (path : string) : bool =
   if Filename.is_relative path then Sys.file_exists (Filename.concat repo_root path)
   else Sys.file_exists path
 
-(* Whether the access/resource closure walkers are integrated into the
-   seed closure pipeline.  The library modules exist (access_check.ml,
-   resource_check.ml, exercised by tg_ownship) but the driver pipeline
-   does not run them on the closure yet — the completeness gate cannot
-   claim closure PASS until it does. *)
-let access_resource_integrated = false
+(* The first integrated access/resource semantic pass (re-audit P0-11):
+   the driver runs Access_check.run_closure over the closure env's
+   RECORDED typed channels (one access record per checked call argument
+   — place path + callee-side read effect — accumulated across the
+   closure by the typechecker).  The pass checks the access-effect
+   conflict matrix per statement group and replays the operations on
+   Resource_check's ownership state lattice per item; findings are
+   reported, nothing is rewritten.
+
+   HONEST NOTE: the pass walks the recorded typed channels — the full
+   CFG-based stage (finalize_plan + edge_cleanup consumed by MIR)
+   remains future work.  The sentinel (access_resource_integrated =
+   false) is GONE: the gate now RUNS the pass and reports findings;
+   the debt gate's exit behavior is unchanged (additive reporting). *)
+
+let run_and_report_access_resource (ctx : Driver.closure_ctx) : int =
+  let findings = Driver.run_access_resource_pass ctx in
+  let status = if findings = [] then "PASS" else "FAIL" in
+  Printf.printf "  ACCESS_RESOURCE_PASS = %s (%d finding(s))\n" status (List.length findings);
+  let printed = ref 0 in
+  List.iter
+    (fun (f : Access_check.finding) ->
+      if !printed < 10 then begin
+        Printf.printf "    %s: %s\n" f.Access_check.f_kind f.Access_check.f_message;
+        incr printed
+      end)
+    findings;
+  if List.length findings > 10 then
+    Printf.printf "    ... (%d more findings suppressed)\n" (List.length findings - 10);
+  List.length findings
 
 (* The no-regression policy: total <= baseline total, primary <=
    baseline primary, and NO category above its baseline bucket.  The
@@ -298,6 +322,11 @@ let () =
          measured_debt.Debt_report.total measured_debt.Debt_report.primaries
          measured_debt.Debt_report.secondaries;
        check_no_regression measured_debt baseline_typecheck_debt;
+       (* [6/10] the integrated access/resource pass: RUNS over the
+          closure env's recorded typed channels (additive reporting —
+          it cannot change the debt numbers above) *)
+       Printf.printf "  [6/10] access/resource: integrated pass over recorded typed channels\n";
+       let n_access_findings = run_and_report_access_resource ctx in
        if n_errs > 0 then begin
          (* At the checked baseline: report the deferred semantic stages
             explicitly; exit 0 ONLY because the debt is unchanged and at
@@ -314,10 +343,11 @@ let () =
        end;
        (* Zero typecheck debt: the full semantic closure must succeed. *)
        Printf.printf "  [6/10] access/resource checks\n";
-       if not access_resource_integrated then
+       if n_access_findings > 0 then
          fail
-           "access/resource closure walkers are not integrated into the seed closure pipeline yet \
-            (library-only, exercised by tg_ownship) — the completeness gate requires them before closure PASS";
+           "access/resource findings on the closure (%d) — the integrated pass must be clean \
+            before closure PASS (the recorded-typed-channels walk is the integrated semantic \
+            pass; the CFG-based cleanup-plan stage remains future work)" n_access_findings;
        let prog = Driver.lower_closure ctx in
        Printf.printf "  [7/10] lowering: PASS (%d functions lowered)\n"
          (Array.length prog.Seed_mir.functions);

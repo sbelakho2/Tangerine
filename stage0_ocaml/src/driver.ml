@@ -1193,6 +1193,46 @@ let oracle_of_ctx (ctx : closure_ctx) (stats : mir_stats option) : oracle_counts
     oc_skipped = stats = None;
   }
 
+(* ── The first integrated semantic pass (re-audit P0-11) ─────────────
+   After the typecheck phase, walk the closure env's RECORDED typed
+   channels: the typechecker accumulates one Access_check.access per
+   checked call argument (place path + callee-side read effect) across
+   the whole closure (the channel is not reset per item).  The pass
+   (a) feeds the access-effect conflict matrix per statement group (one
+   call's argument list) and (b) replays the recorded operations on
+   Resource_check's ownership state lattice per item; findings are
+   returned, nothing in the typechecker is rewritten.
+
+   HONEST NOTE: this is a real pass over the recorded typed channels —
+   the full CFG-based stage (finalize_plan + edge_cleanup consumed by
+   MIR) remains future work.  Additive by construction: it reports
+   findings and cannot change the typecheck debt. *)
+
+let run_access_resource_pass (ctx : closure_ctx) : Access_check.finding list =
+  Access_check.run_closure ctx.ctx_env.Typecheck.state.oracle.o_accesses
+
+let report_access_resource_pass (ctx : closure_ctx) : unit =
+  let findings = run_access_resource_pass ctx in
+  let recorded = List.rev ctx.ctx_env.Typecheck.state.oracle.o_accesses in
+  let n_places =
+    List.length (List.filter (fun (a : Access_check.access) -> a.a_path <> None) recorded)
+  in
+  Printf.printf
+    "  access/resource: integrated pass over recorded typed channels: %d call-argument accesses (%d place paths), %d findings\n"
+    (List.length recorded) n_places (List.length findings);
+  let status = if findings = [] then "PASS" else "FAIL" in
+  Printf.printf "  ACCESS_RESOURCE_PASS = %s (%d finding(s))\n" status (List.length findings);
+  let printed = ref 0 in
+  List.iter
+    (fun (f : Access_check.finding) ->
+      if !printed < 20 then begin
+        Printf.printf "    %s: %s\n" f.Access_check.f_kind f.Access_check.f_message;
+        incr printed
+      end)
+    findings;
+  if List.length findings > 20 then
+    Printf.printf "    ... (%d more findings suppressed)\n" (List.length findings - 20)
+
 (* ── bootstrap-check (audit §51) ───────────────────────────────── *)
 
 let cmd_bootstrap_check (args : string list) : int =
@@ -1214,6 +1254,7 @@ let cmd_bootstrap_check (args : string list) : int =
        Printf.printf "  typecheck: %d modules, %d items, %d errors (%d rounds)\n"
          ctx.ctx_graph.Module_graph.node_count ctx.ctx_items (List.length ctx.ctx_type_errors)
          ctx.ctx_rounds;
+       report_access_resource_pass ctx;
        List.iter (fun e -> Printf.printf "    %s\n" e) (List.sort compare ctx.ctx_type_errors);
        if ctx.ctx_type_errors <> [] then begin
          (* honest: lowering/mono are unreachable — print the oracle rows

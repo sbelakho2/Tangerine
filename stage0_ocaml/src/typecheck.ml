@@ -85,6 +85,20 @@ type oracle = {
   mutable o_missing_effects : int;
   mutable o_derived_callables : Ids.Callable_id.t list;
   mutable o_deferred_params : Ids.Generic_param_id.t list;
+  (* the integrated access/resource channel (re-audit P0-11): one
+     Access_check.access per checked call argument, accumulated ACROSS
+     items (reset_oracle deliberately leaves it alone) so the driver's
+     integrated pass walks the whole closure's recorded accesses;
+     o_access_seq numbers each recorded call so the pass can delimit
+     statement groups *)
+  mutable o_accesses : Access_check.access list;
+  mutable o_access_seq : int;
+  (* local-name -> stable root id for the integrated pass: scope-local
+     LIST positions shift as bindings accumulate (add_binds prepends), so
+     the channel roots are name-keyed ids assigned on first sight (the
+     pass groups per item, so cross-item aliasing of ids is harmless;
+     shadowed locals of the same name are conservatively conflated) *)
+  mutable o_access_root_ids : (string, int) Hashtbl.t;
 }
 
 (* Mutable check state (per check_program run). *)
@@ -172,6 +186,15 @@ let fresh_infer_var (st : state) : Type_repr.t =
   let id = st.next_var_id in
   st.next_var_id <- id + 1;
   Type_repr.Infer_var id
+
+(* the kernel's strict Box[T] wrapper is transparent: Box[T] unifies
+   with T in both directions and derefs on field/method access (the
+   full compiler's Box coercions). The Box nominal's tid is registered
+   when the source declaration processes. *)
+let box_tid : Ids.Type_id.t option ref = ref None
+
+let is_box (id : Ids.Type_id.t) : bool =
+  match !box_tid with Some b -> Ids.Type_id.compare b id = 0 | None -> false
 
 let fresh_callable_id (st : state) : Ids.Callable_id.t =
   let id = st.next_callable_id in
@@ -778,6 +801,9 @@ let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
           o_missing_effects = 0;
           o_derived_callables = [];
           o_deferred_params = [];
+          o_accesses = [];
+          o_access_seq = 0;
+          o_access_root_ids = Hashtbl.create 256;
         };
       debt_by_module = [];
       debt_last_printed =
@@ -1301,6 +1327,8 @@ let rec unify (subst : (Type_repr.generic_key * Type_repr.t) list ref) (a : Type
           (Printf.sprintf "integer literal does not fit its adopted type %s"
              (int_name_of_kind k))
   | Type_repr.Int_literal _, Type_repr.Int_literal _ -> Ok ()
+  | Type_repr.Named (id, [| t |]), u when is_box id -> unify subst t u
+  | u, Type_repr.Named (id, [| t |]) when is_box id -> unify subst u t
   | Type_repr.Infer_var v, _ ->
       if occurs_key (Type_repr.KVar v) b' then Error "recursive type"
       else begin
@@ -1689,12 +1717,169 @@ let solver_param_bounds (decl : (string * Ids.Generic_param_id.t) list)
    Patterns, variant/field resolution, expressions.
    The whole group is mutually recursive. *)
 
+(* ── Place-path derivation for the integrated access channel ─────────
+   (re-audit P0-11).  Pure syntactic/scope walk — NO oracle writes, no
+   unification, no re-checking: it only derives the Access_check place
+   path (root local + projection chain) of a call argument so the
+   driver's integrated pass can feed access_check's conflict matrix and
+   resource_check's state lattice.  Anything not resolvable is
+   conservatively None. *)
+
+(* The access record key: the enclosing item, disambiguated by module
+   path (two modules can both define `def f`). *)
+let access_item_key (env : env) : string =
+  String.concat "::" env.module_path ^ " " ^ env.state.current_item
+
+(* Resolve the FieldId of a named field of the nominal owned by the
+   given Type_id (nom_field_ids is the resolver's identity list,
+   parallel to nom_fields). *)
+let field_id_of (env : env) (owner_name : string) (fname : string) : Ids.Field_id.t option =
+  match List.assoc_opt owner_name env.nominals with
+  | None -> None
+  | Some nom -> (
+      let rec index_of i = function
+        | [] -> None
+        | (n, _) :: rest -> if n = fname then Some i else index_of (i + 1) rest
+      in
+      match index_of 0 nom.nom_fields with
+      | None -> None
+      | Some i ->
+          if i < List.length nom.nom_field_ids then Some (List.nth nom.nom_field_ids i)
+          else None)
+
+(* The static type of a place-shaped expression, used only to resolve
+   the FIELD OWNER for field projections (the checked expression's type
+   would be the projection RESULT type, which cannot name the owner).
+   Deref is conservative None (the pointee type is not statically
+   recoverable here without the full checker). *)
+let rec static_type_of (env : env) (scope : scope) (e : Ast.expr) : Type_repr.t option =
+  match e with
+  | Ast.Name (n, _) -> (
+      match assoc_local n scope.locals with Some (t, _) -> Some t | None -> None)
+  | Ast.Path _ -> None
+  | Ast.Field (base, fname, _span) -> (
+      match static_type_of env scope base with
+      | None -> None
+      | Some bt -> (
+          (* a field through a reference/pointer derefs the pointee *)
+          let bt =
+            match bt with
+            | Type_repr.Ref_internal (_, t) | Type_repr.Raw_ptr (_, t) -> t
+            | Type_repr.Named (id, [| t |])
+              when Ids.Type_id.compare id b_ptr = 0 || Ids.Type_id.compare id b_ptrmut = 0 ->
+                t
+            | _ -> bt
+          in
+          match bt with
+          | Type_repr.Named (tid, _args) -> (
+              match List.assoc_opt tid env.type_names with
+              | Some owner -> (
+                  match List.assoc_opt owner env.nominals with
+                  | Some nom when nom.nom_kind = `Struct -> (
+                      match List.assoc_opt fname nom.nom_fields with
+                      | Some ft -> Some ft
+                      | None -> None)
+                  | _ -> None)
+              | None -> None)
+          | _ -> None))
+  | Ast.Index (base, _, _) -> (
+      match static_type_of env scope base with
+      | Some (Type_repr.Fixed_array (t, _)) -> Some t
+      | Some (Type_repr.Named (_, [| t |])) -> Some t
+      | _ -> None)
+  | Ast.Unary (Ast.Borrow, inner, _) | Ast.Unary (Ast.BorrowMut, inner, _) ->
+      static_type_of env scope inner
+  | _ -> None
+
+(* The place path of a call argument: root = the local's index in the
+   scope (stable within the item), projections = the syntactic chain.
+   `&x` / `&mut x` arguments are the place of x (the borrow's effect is
+   the callee-side convention, recorded separately). *)
+let rec place_of_expr (env : env) (scope : scope) (e : Ast.expr) : Access_check.access_path option
+    =
+  match e with
+  | Ast.Name (n, _) -> (
+      (* root ids are NAME-keyed (see o_access_root_ids): stable across
+         the item even as bindings accumulate *)
+      match Hashtbl.find_opt env.state.oracle.o_access_root_ids n with
+      | Some i -> Some { Access_check.root = i; Access_check.projections = [] }
+      | None ->
+          let i = Hashtbl.length env.state.oracle.o_access_root_ids in
+          Hashtbl.add env.state.oracle.o_access_root_ids n i;
+          Some { Access_check.root = i; Access_check.projections = [] })
+  | Ast.Path _ -> None
+  | Ast.Field (base, fname, _) -> (
+      match place_of_expr env scope base with
+      | None -> None
+      | Some p -> (
+          let fid =
+            match static_type_of env scope base with
+            | Some (Type_repr.Named (tid, _)) -> (
+                match List.assoc_opt tid env.type_names with
+                | Some oname -> field_id_of env oname fname
+                | None -> None)
+            | _ -> None
+          in
+          match fid with
+          | Some fid ->
+              Some
+                {
+                  p with
+                  Access_check.projections = p.Access_check.projections @ [ Access_check.Field fid ];
+                }
+          | None -> None))
+  | Ast.Index (base, _, _) -> (
+      match place_of_expr env scope base with
+      | None -> None
+      | Some p ->
+          Some
+            {
+              p with
+              Access_check.projections = p.Access_check.projections @ [ Access_check.Index ];
+            })
+  | Ast.Unary (Ast.Borrow, inner, _) | Ast.Unary (Ast.BorrowMut, inner, _) ->
+      place_of_expr env scope inner
+  | Ast.Unary (Ast.Deref, inner, _) -> (
+      match place_of_expr env scope inner with
+      | None -> None
+      | Some p ->
+          Some
+            {
+              p with
+              Access_check.projections = p.Access_check.projections @ [ Access_check.Deref ];
+            })
+  | _ -> None
+
+(* Record one call's argument accesses on the integrated channel (in
+   program order; the channel is prepended, so callers prepend the
+   reversed list). *)
+let record_call_accesses (env : env) (scope : scope) (accs : (Ast.expr * Access_effect.read_effect * Span.span) list) : unit =
+  let call_seq = env.state.oracle.o_access_seq in
+  env.state.oracle.o_access_seq <- call_seq + 1;
+  let item = access_item_key env in
+  let records =
+    List.map
+      (fun (arg_expr, eff, span) ->
+        {
+          Access_check.a_item = item;
+          a_call = call_seq;
+          a_path = place_of_expr env scope arg_expr;
+          a_effect = eff;
+          a_span = span;
+        })
+      accs
+  in
+  env.state.oracle.o_accesses <-
+    List.rev_append records env.state.oracle.o_accesses
+
 (* Default an unsuffixed literal's inference type to Int when it crosses
    a concrete boundary (binding, arithmetic, cast). *)
 let default_literal (ty : Type_repr.t) : Type_repr.t =
   match ty with
   | Type_repr.Int_literal _ -> Type_repr.Int Type_repr.Int
   | t -> t
+
+
 
 let rec check_pattern (env : env) (scope : scope) (ty : Type_repr.t) (p : Ast.pattern) :
     ((string * Type_repr.t * bool) list, string) result =
@@ -1756,6 +1941,40 @@ let rec check_pattern (env : env) (scope : scope) (ty : Type_repr.t) (p : Ast.pa
                     | Error m -> Error m))
           in
           go [] fields)
+      | Ok (nom, _, args) when nom.nom_kind = `Enum -> (
+          (* the braced-variant pattern: `Enum::Variant { f1, .. }` —
+             the split's member is the variant; the pattern's fields bind
+             the variant's payload types positionally *)
+          let len = String.length name in
+          let rec last_pair i =
+            if i <= 0 then None
+            else if name.[i] = ':' && name.[i - 1] = ':' then Some i
+            else last_pair (i - 1)
+          in
+          let member =
+            match last_pair (len - 1) with
+            | Some i when i + 1 < len -> String.sub name (i + 1) (len - i - 1)
+            | _ -> name
+          in
+          let subst = List.map2 (fun (_, p) a -> (Type_repr.KParam p, a)) nom.nom_params (Array.to_list args) in
+          match List.assoc_opt member nom.nom_variants with
+          | None -> Error (err span (Printf.sprintf "unknown variant `%s` of enum `%s`" member name))
+          | Some pty -> (
+              let payload = Array.map (substitute_fixpoint subst) pty in
+              if Array.length payload <> List.length fields then
+                Error (err span (Printf.sprintf "variant `%s` expects %d field(s), pattern has %d" member
+                          (Array.length payload) (List.length fields)))
+              else begin
+                let rec go acc i = function
+                  | [] -> Ok (List.rev acc)
+                  | (fname, sub) :: rest -> (
+                      let sub = match sub with Some s -> s | None -> Ast.PatIdent (fname, false, span) in
+                      match check_pattern env scope payload.(i) sub with
+                      | Ok binds -> go (binds @ acc) (i + 1) rest
+                      | Error m -> Error m)
+                in
+                go [] 0 fields
+              end))
       | Ok _ -> Error (err span (Printf.sprintf "`%s` is not a struct" name)))
   | Ast.PatTuple (pats, span) -> (
       match ty with
@@ -1850,11 +2069,42 @@ and resolve_variant (env : env) (_scope : scope) (span : Span.span) (seg1 : stri
 and resolve_nominal (env : env) (span : Span.span) (name : string) :
     (nominal * Ids.Type_id.t * Type_repr.t array, string) result =
   match List.assoc_opt name env.nominals with
-  | None -> Error (err span (Printf.sprintf "unknown nominal type `%s`" name))
   | Some nom -> (
       match List.assoc_opt name env.types with
       | Some (Type_repr.Named (tid, args)) -> Ok (nom, tid, args)
       | _ -> Error (err span (Printf.sprintf "`%s` is not a nominal type" name)))
+  | None -> (
+      (* the qualified braces-form: `Enum::Variant { .. }` patterns and
+         `mod::path::Struct { .. }` literals join the full name; split
+         the LAST `::` pair and resolve the qualifier as a nominal (the
+         variant/field is resolved by the caller) or the last segment
+         flat (module-qualified structs) *)
+      let len = String.length name in
+      let rec last_pair i =
+        if i <= 0 then None
+        else if name.[i] = ':' && name.[i - 1] = ':' then Some i
+        else last_pair (i - 1)
+      in
+      match last_pair (len - 1) with
+      | Some i when i + 1 < len -> (
+          let qualifier = String.sub name 0 (i - 1) in
+          let member = String.sub name (i + 1) (len - i - 1) in
+          match List.assoc_opt qualifier env.nominals with
+          | Some nom -> (
+              match List.assoc_opt qualifier env.types with
+              | Some (Type_repr.Named (tid, args)) -> Ok (nom, tid, args)
+              | _ -> Error (err span (Printf.sprintf "`%s` is not a nominal type" qualifier)))
+          | None -> (
+              (* the qualifier is a module path: resolve the last segment
+                 flat (the module-qualified struct form) *)
+              match List.assoc_opt member env.nominals with
+              | Some nom -> (
+                  match List.assoc_opt member env.types with
+                  | Some (Type_repr.Named (tid, args)) -> Ok (nom, tid, args)
+                  | _ -> Error (err span (Printf.sprintf "`%s` is not a nominal type" member)))
+              | None ->
+                  Error (err span (Printf.sprintf "unknown nominal type `%s`" name))))
+      | _ -> Error (err span (Printf.sprintf "unknown nominal type `%s`" name)))
 
 
 (* ────────────────────────────────────────────────────────────────
@@ -2807,6 +3057,11 @@ and check_place (env : env) (scope : scope) (e : Ast.expr) : (Type_repr.t * bool
             | Type_repr.Named (id, _) when Ids.Type_id.compare id b_ptrmut = 0 -> true
             | _ -> bmut
           in
+          let bt =
+            match bt with
+            | Type_repr.Named (id, [| inner |]) when is_box id -> inner
+            | _ -> bt
+          in
           match
             check_field env scope span
               { te_type = bt; te_effects = [||]; te_span = span }
@@ -2871,6 +3126,10 @@ and check_field (env : env) (_scope : scope) (span : Span.span) (base : typed_ex
                (Printf.sprintf "cannot project `.%s` from %s" fname (type_to_string base.te_type))))
   | _ -> (
       match base.te_type with
+      | Type_repr.Named (id, [| inner |]) when is_box id ->
+          (* a field on a Box derefs the boxed value (`expr.kind` on a
+             Box[Expr]) *)
+          check_field env _scope span { base with te_type = inner } fname
       | Type_repr.Named (id, [| inner |])
         when Ids.Type_id.compare id b_ptr = 0 || Ids.Type_id.compare id b_ptrmut = 0 ->
           (* a field through the builtin Ptr/PtrMut nominal derefs the
@@ -3543,6 +3802,14 @@ and check_call_sig (env : env) (scope : scope) (expected : Type_repr.t option)
         }
       in
       env.state.oracle.o_calls <- call :: env.state.oracle.o_calls;
+      (* the integrated access channel (re-audit P0-11): one record per
+         argument, in program order, aligned with the recorded effects *)
+      let rec zip (a : Ast.call_arg list) (e : Access_effect.read_effect list) =
+        match a, e with
+        | x :: ra, eff :: re -> (x.Ast.ca_value, eff, x.Ast.ca_span) :: zip ra re
+        | _ -> []
+      in
+      record_call_accesses env scope (zip args effects);
       Ok { te_type = ret; te_effects = Array.of_list effects; te_span = span }
     end
   end
@@ -3894,6 +4161,16 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
                   }
                 in
                 env.state.oracle.o_calls <- call :: env.state.oracle.o_calls;
+                (* the integrated access channel (re-audit P0-11): the
+                   receiver first, then the arguments, aligned with
+                   all_effects *)
+                let rec zip (a : Ast.call_arg list) (e : Access_effect.read_effect list) =
+                  match a, e with
+                  | x :: ra, eff :: re -> (x.Ast.ca_value, eff, x.Ast.ca_span) :: zip ra re
+                  | _ -> []
+                in
+                record_call_accesses env scope
+                  ((base, recv_effect, Ast.expr_span base) :: zip args arg_effects);
                 Ok { te_type = ret; te_effects = all_effects; te_span = span }
               end
             end
@@ -4514,6 +4791,7 @@ and register_item (env : env) (item : Ast.item) : (env, string) result =
               | Some t -> t
               | None -> fresh_type_id env.state
             in
+            (if d.s_name = "Box" then box_tid := Some tid);
             let param_tys = Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param (p)) params) in
             let nom : nominal =
               { nom_kind = `Struct; nom_params = params; nom_fields = []; nom_variants = []; nom_where = []; nom_field_ids = []; nom_variant_ids = [] }
@@ -4916,6 +5194,7 @@ let rec register_headers (env : env) (acc : string list) = function
               | Some t -> t
               | None -> fresh_type_id env.state
             in
+            (if d.s_name = "Box" then box_tid := Some tid);
             let param_tys = Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param (p)) params) in
             let nom : nominal =
               { nom_kind = `Struct; nom_params = params; nom_fields = []; nom_variants = []; nom_where = []; nom_field_ids = []; nom_variant_ids = [] }
