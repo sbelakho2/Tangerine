@@ -1953,10 +1953,34 @@ and parse_postfix (p : parser) : Ast.expr =
     | Token.LBracket ->
         let start = cur_span p in
         ignore (advance p);
-        let idx = parse_expr p in
-        expect p Token.RBracket "']' in index";
-        e := Ast.Index (!e, idx, span_end p start);
-        loop ()
+        (* the type-query application form: `size_of[T]()` / `align_of[T]()`
+           — a known query name followed by a bracketed type and a call *)
+        let query_name =
+          match !e with
+          | Ast.Name (n, _) when n = "size_of" || n = "align_of" -> Some n
+          | _ -> None
+        in
+        (if query_name <> None then Printf.eprintf "DBG query-parse: name=%s\n" (Option.get query_name));
+        if query_name <> None then begin
+          let ty = parse_type p in
+          expect p Token.RBracket "']' in type application";
+          if at p Token.LParen then begin
+            let args = parse_call_args p in
+            e := Ast.Call (Ast.Name (Option.get query_name, start), [ ty ], args, span_end p start);
+            loop ()
+          end
+          else begin
+            (* not a call: fall back to the index interpretation *)
+            e := Ast.Index (Ast.Name (Option.get query_name, start), Ast.Name ("", start), span_end p start);
+            loop ()
+          end
+        end
+        else begin
+          let idx = parse_expr p in
+          expect p Token.RBracket "']' in index";
+          e := Ast.Index (!e, idx, span_end p start);
+          loop ()
+        end
     | Token.KwAs ->
         let start = cur_span p in
         ignore (advance p);
@@ -2358,6 +2382,12 @@ and parse_ident_expr (p : parser) (start : Span.span) : Ast.expr =
       let args = parse_macro_args p close in
       expect p close (if close = Token.RParen then "')' in macro call" else "']' in macro call");
       Ast.MacroCall (first, args, span_end p start)
+    end
+    else if at p Token.LParen then begin
+      (* a type-application call: `size_of[T]()` — the bracketed type
+         arguments belong to the call, not to the postfix index *)
+      let args = parse_call_args p in
+      Ast.Call (Ast.Name (first, span_end p start), type_args, args, span_end p start)
     end
     else Ast.Name (first, span_end p start)
   end
