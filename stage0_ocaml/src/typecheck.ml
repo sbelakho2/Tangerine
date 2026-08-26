@@ -2019,10 +2019,14 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
             match te.te_type with
             | Type_repr.Fixed_array (t, _) -> Some t
             | Type_repr.Named (id, [| t |]) when Ids.Type_id.compare id b_array = 0 -> Some t
-            | Type_repr.Named (id, [| t |]) -> (
-                (* the kernel's Array/Vec containers are iterable *)
+            | Type_repr.Named (id, args) -> (
+                (* the kernel's Array/Vec/Set containers are iterable;
+                   Map iteration binds the (K, V) tuple *)
                 match List.assoc_opt id env.type_names with
-                | Some ("Array" | "Vec") -> Some t
+                | Some ("Array" | "Vec" | "Set") when Array.length args = 1 ->
+                    Some args.(0)
+                | Some "Map" when Array.length args = 2 ->
+                    Some (Type_repr.Tuple [| args.(0); args.(1) |])
                 | _ -> None)
             | Type_repr.String -> Some Type_repr.Char
             | Type_repr.Tuple _ -> Some (Type_repr.Int Type_repr.Int)
