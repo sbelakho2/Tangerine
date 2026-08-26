@@ -1960,7 +1960,6 @@ and parse_postfix (p : parser) : Ast.expr =
           | Ast.Name (n, _) when n = "size_of" || n = "align_of" -> Some n
           | _ -> None
         in
-        (if query_name <> None then Printf.eprintf "DBG query-parse: name=%s\n" (Option.get query_name));
         if query_name <> None then begin
           let ty = parse_type p in
           expect p Token.RBracket "']' in type application";
