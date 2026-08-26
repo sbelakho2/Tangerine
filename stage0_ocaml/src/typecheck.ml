@@ -2317,9 +2317,6 @@ and check_stmt (env : env) (scope : scope) (s : Ast.stmt) : (scope, string) resu
           match check_expr env scope None value with
           | Error m -> Error m
           | Ok te -> (
-              (if te.te_type = Type_repr.Unit then
-                 Printf.eprintf "DBG let-unit: value ty=()
-");
               match check_pattern env scope (default_literal te.te_type) pat with
               | Error m -> Error m
               | Ok binds ->
