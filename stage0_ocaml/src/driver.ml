@@ -675,7 +675,13 @@ let run_closure_pipeline ~(repo_root : string) ~(manifest_path : string) ~(targe
            resolves what became resolvable as the env grew), then check
            bodies exactly once against the frozen environment *)
         let nodes = topological_nodes graph in
-        let with_module env node = { env with Typecheck.module_id = node.Module_graph.node_id } in
+        let with_module env node =
+          {
+            env with
+            Typecheck.module_id = node.Module_graph.node_id;
+            module_path = node.Module_graph.node_path;
+          }
+        in
         let decl_rounds = ref 0 in
         let rec decl_pass env = function
           | [] -> env

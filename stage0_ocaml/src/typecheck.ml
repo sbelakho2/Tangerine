@@ -127,6 +127,7 @@ type env = {
   state : state;
   module_id : Ids.Module_id.t;
   resolved : Resolver.resolved_program option;
+  module_path : string list;
 }
 
 type scope = {
@@ -779,6 +780,88 @@ let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
     }
   in
   let types = builtin_types st in
+  (* the canonical sync intrinsics and type-query builtins: ONE
+     registration, so the bare names resolve exactly (the source
+     duplicates them across std/alloc and std/ffi, which would make the
+     suffix lookup ambiguous) *)
+  let u8_ty = Type_repr.Int Type_repr.U8 in
+  let uint_ty = Type_repr.Int Type_repr.UInt in
+  let ptr_u8 = Type_repr.Named (b_ptr, [| u8_ty |]) in
+  let ptr_uint = Type_repr.Named (b_ptr, [| uint_ty |]) in
+  let sync_builtins =
+    [
+      mk_sig st ~name:"__sync_synchronize" ~params_decl:[]
+        ~params:[] ~ret:Type_repr.Unit ~where:[];
+      mk_sig st ~name:"__sync_fetch_and_add" ~params_decl:[]
+        ~params:
+          [
+            ("ptr", Access_effect.Let, ptr_uint);
+            ("val", Access_effect.Let, uint_ty);
+          ]
+        ~ret:uint_ty ~where:[];
+      mk_sig st ~name:"__sync_fetch_and_sub" ~params_decl:[]
+        ~params:
+          [
+            ("ptr", Access_effect.Let, ptr_uint);
+            ("val", Access_effect.Let, uint_ty);
+          ]
+        ~ret:uint_ty ~where:[];
+      mk_sig st ~name:"__sync_bool_compare_and_swap_1" ~params_decl:[]
+        ~params:
+          [
+            ("ptr", Access_effect.Let, ptr_u8);
+            ("expected", Access_effect.Let, u8_ty);
+            ("desired", Access_effect.Let, u8_ty);
+          ]
+        ~ret:Type_repr.Bool ~where:[];
+      mk_sig st ~name:"__sync_val_compare_and_swap_uint" ~params_decl:[]
+        ~params:
+          [
+            ("ptr", Access_effect.Let, ptr_uint);
+            ("expected", Access_effect.Let, uint_ty);
+            ("desired", Access_effect.Let, uint_ty);
+          ]
+        ~ret:uint_ty ~where:[];
+    ]
+  in
+  let str_ty = Type_repr.String in
+  let vec_u8 = Type_repr.Named (b_array, [| u8_ty |]) in
+  let string_builtins =
+    [
+      (* the compiler constructors (docs: no extern spelling needed) *)
+      mk_sig st ~name:"string_new" ~params_decl:[]
+        ~params:[] ~ret:str_ty ~where:[];
+      mk_sig st ~name:"string_from_bytes" ~params_decl:[]
+        ~params:[ ("data", Access_effect.Let, vec_u8) ]
+        ~ret:str_ty ~where:[];
+    ]
+  in
+  let size_p = fresh_param_id st in
+  let query_builtins =
+    [
+      mk_sig st ~name:"size_of" ~params_decl:[ ("T", size_p) ]
+        ~params:[] ~ret:uint_ty ~where:[];
+      mk_sig st ~name:"align_of" ~params_decl:[ ("T", size_p) ]
+        ~params:[] ~ret:uint_ty ~where:[];
+    ]
+  in
+  (* the kernel's `Any` (Box[Any], Arc[Box[Any]]): declared nowhere in
+     the source, a compiler builtin — one concrete nominal *)
+  let any_tid = fresh_type_id st in
+  let any_nominal : nominal =
+    {
+      nom_kind = `Struct;
+      nom_params = [];
+      nom_fields = [];
+      nom_variants = [];
+      nom_where = [];
+      nom_field_ids = [];
+      nom_variant_ids = [];
+    }
+  in
+  let types = ("Any", Type_repr.Named (any_tid, [||])) :: types in
+  let type_ids = ("Any", any_tid) :: type_ids_of_builtins in
+  let type_names = (any_tid, "Any") :: type_names_of_builtins in
   (* LangItem generic parameters minted once, in declaration order *)
   let vec_p = fresh_param_id st in
   let opt_p = fresh_param_id st in
@@ -835,19 +918,23 @@ let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
   Hashtbl.replace st.sig_param_ids "nominal::Set" [ ("T", set_p) ];
   {
     types;
-    functions = [];
+    type_ids;
+    type_names;
+    functions =
+      List.map
+        (fun sig_ -> (sig_.ts_name, sig_))
+        (sync_builtins @ query_builtins @ string_builtins);
     methods = builtin_methods st vec_p opt_p res_p res_e_p map_k_p map_v_p set_p;
     impls;
     current_self = None;
     current_return = None;
-    type_ids = type_ids_of_builtins;
-    type_names = type_names_of_builtins;
-    nominals = [ ("Option", opt_nominal); ("Result", res_nominal) ];
+    nominals = [ ("Any", any_nominal); ("Option", opt_nominal); ("Result", res_nominal) ];
     constructors = builtin_constructors st opt_p res_p res_e_p;
     consts = [];
     state = st;
     module_id = Ids.Module_id.make 0;
     resolved;
+    module_path = [];
   }
 
 (* ────────────────────────────────────────────────────────────────
@@ -1037,6 +1124,12 @@ let rec unify (subst : (Type_repr.generic_key * Type_repr.t) list ref) (a : Type
       if m1 <> m2 then Error "reference mutability mismatch" else unify subst t1 t2
   | Type_repr.Raw_ptr (m1, t1), Type_repr.Raw_ptr (m2, t2) ->
       if m1 <> m2 then Error "pointer mutability mismatch" else unify subst t1 t2
+  (* the address-of coercion: an explicit reference unifies with a raw
+     pointer over the same pointee (the sync intrinsics take &x) *)
+  | Type_repr.Raw_ptr (m1, t1), Type_repr.Ref_internal (_, t2)
+  | Type_repr.Ref_internal (_, t1), Type_repr.Raw_ptr (m1, t2) ->
+      if m1 = Type_repr.Mutable then unify subst t1 t2
+      else Error "pointer mutability mismatch"
   | Type_repr.Function (p1, r1), Type_repr.Function (p2, r2) ->
       if Array.length p1 <> Array.length p2 then Error "function arity mismatch"
       else begin
@@ -2484,12 +2577,26 @@ and check_name (env : env) (scope : scope) (expected : Type_repr.t option) (n : 
           te_effects = [| Access_effect.Read |];
           te_span = span;
         }
-  | None ->
-      (match List.assoc_opt n scope.generics with
+  | None -> (
+      match n with
+      | "self" -> (
+          (* the implicit receiver: impl methods may reference `self`
+             without declaring it — the impl target is the type *)
+          match env.current_self with
+          | Some t ->
+              Ok { te_type = t; te_effects = [| Access_effect.Read |]; te_span = span }
+          | None ->
+              Error (err span "unknown name `self` (not inside an impl)"))
+      | _ -> (
+      match List.assoc_opt n scope.generics with
        | Some _ ->
            Error (err span (Printf.sprintf "type parameter `%s` cannot be used as a value" n))
        | None ->
-           match List.assoc_opt n env.consts with
+           match
+             match env.module_path with
+             | [] -> None
+             | mp -> List.assoc_opt (String.concat "::" (mp @ [ n ])) env.consts
+           with
            | Some t ->
                let subst = ref [] in
                (match expected with
@@ -2545,7 +2652,7 @@ and check_name (env : env) (scope : scope) (expected : Type_repr.t option) (n : 
                             Ok { te_type = ty; te_effects = [| Access_effect.Read |]; te_span = span }
                         | None ->
                             env.state.oracle.o_unresolved_calls <- env.state.oracle.o_unresolved_calls + 1;
-                            Error (err span (Printf.sprintf "unknown name `%s`" n)))))
+                            Error (err span (Printf.sprintf "unknown name `%s`" n))))))
 
 and return_unify_err (span : Span.span) (a : Type_repr.t) (b : Type_repr.t) (m : string) :
     (typed_expr, string) result =
@@ -2583,9 +2690,19 @@ and lookup_function (env : env) (n : string) : typed_signature option =
   match List.assoc_opt n all with
   | Some f -> Some f
   | None -> (
-      match List.filter (fun (k, _) -> Util.has_suffix k ("::" ^ n)) all with
-      | [ (_, f) ] -> Some f
-      | _ -> None)
+      (* the current module's own declaration takes precedence: a module
+         calling its own `check_expr` must not be lost to the closure-wide
+         suffix ambiguity when other modules declare the same name *)
+      match
+        match env.module_path with
+        | [] -> None
+        | mp -> List.assoc_opt (String.concat "::" (mp @ [ n ])) all
+      with
+      | Some f -> Some f
+      | None -> (
+          match List.filter (fun (k, _) -> Util.has_suffix k ("::" ^ n)) all with
+          | [ (_, f) ] -> Some f
+          | _ -> None))
 
 and check_call (env : env) (scope : scope) (expected : Type_repr.t option)
     (callee : Ast.expr) (targs : Ast.type_expr list) (args : Ast.call_arg list)
@@ -2656,10 +2773,27 @@ and check_call (env : env) (scope : scope) (expected : Type_repr.t option)
                               else if owner = "Array" then "Vec" :: base
                               else base
                             in
+                            (* kernel convention: `Type::method` dispatches
+                               to the mangled free function `type_method`
+                               (`Box::new` -> box_new, `String::new` ->
+                               string_new — the compiler constructor) *)
+                            let mangled =
+                              let lower =
+                                String.lowercase_ascii owner
+                                |> String.map (fun c -> if c = ':' then '_' else c)
+                              in
+                              lookup_function env (lower ^ "_" ^ mname)
+                            in
                             let rec try_aliases = function
-                              | [] ->
-                                  env.state.oracle.o_unresolved_calls <- env.state.oracle.o_unresolved_calls + 1;
-                                  Error (err span (Printf.sprintf "unknown function `%s`" n))
+                              | [] -> (
+                                  match mangled with
+                                  | Some sig_ ->
+                                      check_call_sig env scope expected sig_ targs args span
+                                  | None ->
+                                      env.state.oracle.o_unresolved_calls <-
+                                        env.state.oracle.o_unresolved_calls + 1;
+                                      Error
+                                        (err span (Printf.sprintf "unknown function `%s`" n)))
                               | alias_owner :: rest -> (
                                   match List.assoc_opt (alias_owner, mname) env.methods with
                                   | Some sig_ ->
