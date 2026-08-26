@@ -2256,10 +2256,13 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
   | Ast.Assign (target, value, span) -> (
       match check_place env scope target with
       | Error m -> Error m
-      | Ok (ptype, mutable_) -> (
-          if not mutable_ then Error (err (Ast.expr_span target) "assignment to an immutable place")
-          else
-            match check_expr env scope (Some ptype) value with
+      | Ok (ptype, _) -> (
+          (* the kernel's assignment semantics (types.tg): the target and
+             value types unify; there is no binding-level mutability
+             error — access effects govern mutation in the resource
+             model, and the kernel writes through Let params and
+             pointer-deref places freely *)
+          match check_expr env scope (Some ptype) value with
             | Error m -> Error m
             | Ok te -> (
                 let subst = ref [] in
@@ -2279,10 +2282,13 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
   | Ast.CompoundAssign (target, op, value, span) -> (
       match check_place env scope target with
       | Error m -> Error m
-      | Ok (ptype, mutable_) -> (
-          if not mutable_ then Error (err (Ast.expr_span target) "assignment to an immutable place")
-          else
-            match check_expr env scope (Some ptype) value with
+      | Ok (ptype, _) -> (
+          (* the kernel's assignment semantics (types.tg): the target and
+             value types unify; there is no binding-level mutability
+             error — access effects govern mutation in the resource
+             model, and the kernel writes through Let params and
+             pointer-deref places freely *)
+          match check_expr env scope (Some ptype) value with
             | Error m -> Error m
             | Ok te -> (
                 let subst = ref [] in
@@ -2738,6 +2744,15 @@ and check_place (env : env) (scope : scope) (e : Ast.expr) : (Type_repr.t * bool
       match check_place env scope base with
       | Error m -> Error m
       | Ok (bt, bmut) -> (
+          (* a field-write through a pointer derefs the pointee: the
+             pointer's own mutability governs (PtrMut -> mutable), not
+             the binding of the local holding it *)
+          let bmut =
+            match bt with
+            | Type_repr.Raw_ptr (Type_repr.Mutable, _) -> true
+            | Type_repr.Named (id, _) when Ids.Type_id.compare id b_ptrmut = 0 -> true
+            | _ -> bmut
+          in
           match
             check_field env scope span
               { te_type = bt; te_effects = [||]; te_span = span }
