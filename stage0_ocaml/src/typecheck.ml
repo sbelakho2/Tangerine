@@ -624,6 +624,7 @@ let builtin_methods (st : state) (vec_p : Ids.Generic_param_id.t) (opt_p : Ids.G
       ("get", [ par "key" let_ map_k ], opt map_v, hash_eq, let_);
       ("contains_key", [ par "key" let_ map_k ], b_ty, hash_eq, let_);
       ("set", [ par "key" let_ map_k; par "value" sink map_v ], unit, hash_eq, inout);
+      ("insert", [ par "key" let_ map_k; par "value" sink map_v ], unit, hash_eq, inout);
       ("remove", [ par "key" let_ map_k ], opt map_v, hash_eq, let_);
       ("keys", [], vec map_k, [], let_);
       ("values", [], vec map_v, [], let_);
@@ -852,6 +853,24 @@ let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
         ~ret:ptr_u8 ~where:[];
     ]
   in
+  let u32_ty = Type_repr.Int Type_repr.U32 in
+  let set_p2 = fresh_param_id st in
+  let misc_builtins =
+    [
+      (* the kernel's compiler helpers: the a64 condition code constant
+         (runtime's emit_tg_mem_alloc), Set::of (taint's singleton
+         sets), and the duration queries (bench) *)
+      mk_sig st ~name:"a64_cc_hi" ~params_decl:[]
+        ~params:[] ~ret:u32_ty ~where:[];
+      mk_sig st ~name:"set_of" ~params_decl:[ ("T", set_p2) ]
+        ~params:[ ("value", Access_effect.Let, Type_repr.Type_param set_p2) ]
+        ~ret:(Type_repr.Named (b_set, [| Type_repr.Type_param set_p2 |])) ~where:[];
+      mk_sig st ~name:"duration_nanos" ~params_decl:[]
+        ~params:[] ~ret:(Type_repr.Int Type_repr.UInt) ~where:[];
+      mk_sig st ~name:"duration_millis" ~params_decl:[]
+        ~params:[] ~ret:(Type_repr.Int Type_repr.UInt) ~where:[];
+    ]
+  in
   let str_ty = Type_repr.String in
   let vec_u8 = Type_repr.Named (b_array, [| u8_ty |]) in
   let string_builtins =
@@ -1066,7 +1085,7 @@ let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
     functions =
       List.map
         (fun sig_ -> (sig_.ts_name, sig_))
-        (sync_builtins @ libc_builtins @ query_builtins @ string_builtins @ [ instant_now_sig; any_sig ]);
+        (sync_builtins @ libc_builtins @ query_builtins @ string_builtins @ misc_builtins @ [ instant_now_sig; any_sig ]);
     methods =
       List.fold_left
         (fun m sig_ ->
@@ -2651,7 +2670,17 @@ and check_binary (subst : (Type_repr.generic_key * Type_repr.t) list ref) (op : 
       match lt, rt with
       | Type_repr.Int _, Type_repr.Int _ -> Ok lt
       | (Type_repr.Int_literal _ | Type_repr.Int _), (Type_repr.Int_literal _ | Type_repr.Int _) ->
-          Ok (Type_repr.Int Type_repr.Int)
+          (* the bitwise result carries the concrete operand's kind
+             (v | 0x08 on u8 is u8) *)
+          let k =
+            match lt with
+            | Type_repr.Int k -> k
+            | _ -> (
+                match rt with
+                | Type_repr.Int k -> k
+                | _ -> Type_repr.Int)
+          in
+          Ok (Type_repr.Int k)
       | _ ->
           Error
             (Printf.sprintf "bitwise operator requires integer operands, found %s and %s"
@@ -3786,13 +3815,30 @@ let rec check_function_body (env : env) (extra_tp_bounds : (string * string list
           Ok { te_type = sig_.ts_return; te_effects = [||]; te_span = sig_.ts_span }
     in
     let subst = ref [] in
-    match unify subst sig_.ts_return body.te_type with
-    | Ok () -> Ok ()
-    | Error m ->
-        Error
-          (err d.fn_span
-             (Printf.sprintf "function body type mismatch: expected %s, found %s (%s)"
-                (type_to_string sig_.ts_return) (type_to_string body.te_type) m))
+    (* the production rule (types.tg): a Unit-returning function
+       DISCARDS its trailing statement's value (`if c then advance(p)
+       end` where advance returns a Token) — only the FnExpr form
+       unifies its value *)
+    match sig_.ts_return with
+    | Type_repr.Unit -> (
+        match d.fn_body with
+        | Ast.FnBlock _ -> Ok ()
+        | _ -> (
+            match unify subst Type_repr.Unit body.te_type with
+            | Ok () -> Ok ()
+            | Error m ->
+                Error
+                  (err d.fn_span
+                     (Printf.sprintf "function body type mismatch: expected %s, found %s (%s)"
+                        (type_to_string sig_.ts_return) (type_to_string body.te_type) m))))
+    | _ -> (
+        match unify subst sig_.ts_return body.te_type with
+        | Ok () -> Ok ()
+        | Error m ->
+            Error
+              (err d.fn_span
+                 (Printf.sprintf "function body type mismatch: expected %s, found %s (%s)"
+                    (type_to_string sig_.ts_return) (type_to_string body.te_type) m)))
   in
   env.impls.param_bounds <- saved;
   result
