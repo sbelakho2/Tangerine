@@ -241,6 +241,12 @@ let solve (env : env) (ob : obligation) : (solution, solve_error) result =
                 if is_copy ob.self_ty then
                   Ok { impl_id = synthetic_impl_id; assoc_subst = [] }
                 else impl_round depth ()
+            | ("Eq" | "PartialEq") -> (
+                (* an internal reference compares by its pointee *)
+                match ob.self_ty with
+                | Type_repr.Ref_internal _ ->
+                    Ok { impl_id = synthetic_impl_id; assoc_subst = [] }
+                | _ -> impl_round depth ())
             | _ -> impl_round depth ())
       in
       visited := List.filter (fun k -> k <> key) !visited;
@@ -298,9 +304,18 @@ let solve (env : env) (ob : obligation) : (solution, solve_error) result =
         in
         (if discharge ie.ie_bounds then survivors := (ie, subst) :: !survivors))
       !candidates;
-    (match !survivors with
-     | [] -> Error NoImpl
-     | [ (ie, subst) ] ->
+    (* when several impls discharge (e.g. the builtin String: Eq plus the
+       source std/core declaration), prefer the one with no where-bounds —
+       the builtin/synthetic registration is the canonical one *)
+    let preferred =
+      match !survivors with
+      | [] -> None
+      | [ x ] -> Some x
+      | xs -> List.find_opt (fun (ie, _) -> ie.ie_bounds = []) xs
+    in
+    (match preferred with
+     | None -> Error NoImpl
+     | Some (ie, subst) ->
          Ok
            {
              impl_id = ie.ie_id;
@@ -308,7 +323,6 @@ let solve (env : env) (ob : obligation) : (solution, solve_error) result =
                List.map
                  (fun (n, t) -> (n, Type_repr.substitute subst t))
                  ie.ie_assoc;
-           }
-     | _ -> Error Ambiguous)
+           })
   in
   go 0 ob
