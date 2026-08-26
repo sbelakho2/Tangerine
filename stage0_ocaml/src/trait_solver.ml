@@ -265,8 +265,18 @@ let solve (env : env) (ob : obligation) : (solution, solve_error) result =
                     | Some subst -> candidates := (ie, subst) :: !candidates
                     | None -> ()
                   else ()
-              | _ -> ())
-          | None -> ())
+              | _ -> (
+                  (* a primitive/other self type (String, Int, Bool, ...):
+                     the impl's target unifies directly with the self *)
+                  match unify_target [] ie.ie_target ob.self_ty with
+                  | Some subst -> candidates := (ie, subst) :: !candidates
+                  | None -> ()))
+          | None -> (
+              (* the impl's target is itself non-nominal (a primitive
+                 impl like Eq for String/Int): unify it with the self *)
+              match unify_target [] ie.ie_target ob.self_ty with
+              | Some subst -> candidates := (ie, subst) :: !candidates
+              | None -> ()))
       env.impls;
     (* Discharge each candidate's own where-bounds under the target
        substitution; drop candidates with an unsatisfied bound. *)

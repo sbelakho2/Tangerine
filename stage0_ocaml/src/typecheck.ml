@@ -1249,6 +1249,12 @@ let rec unify (subst : (Type_repr.generic_key * Type_repr.t) list ref) (a : Type
   | Type_repr.Ref_internal (_, t1), Type_repr.Raw_ptr (m1, t2) ->
       if m1 = Type_repr.Mutable then unify subst t1 t2
       else Error "pointer mutability mismatch"
+  | Type_repr.Named (id1, [| t1 |]), Type_repr.Ref_internal (_, t2)
+    when Ids.Type_id.compare id1 b_ptr = 0 || Ids.Type_id.compare id1 b_ptrmut = 0 ->
+      unify subst t1 t2
+  | Type_repr.Ref_internal (_, t1), Type_repr.Named (id2, [| t2 |])
+    when Ids.Type_id.compare id2 b_ptr = 0 || Ids.Type_id.compare id2 b_ptrmut = 0 ->
+      unify subst t1 t2
   | Type_repr.Function (p1, r1), Type_repr.Function (p2, r2) ->
       if Array.length p1 <> Array.length p2 then Error "function arity mismatch"
       else begin
