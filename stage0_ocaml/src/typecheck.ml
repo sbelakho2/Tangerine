@@ -1084,6 +1084,7 @@ let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
   let type_names =
     (any_tid, "Any") :: (instant_tid, "Instant") :: type_names_of_builtins
   in
+
   let any_sig =
     mk_sig st ~name:"Any" ~params_decl:[]
       ~params:[] ~ret:(Type_repr.Named (any_tid, [||])) ~where:[]
@@ -2432,10 +2433,16 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
       | Error m -> Error m
       | Ok te -> (
           match te.te_type with
-          | Type_repr.Named (id, [| t |])
-            when Ids.Type_id.compare id b_option = 0
-                 || Ids.Type_id.compare id b_result = 0 ->
-              Ok { te_type = t; te_effects = te.te_effects; te_span = span }
+          | Type_repr.Named (id, args)
+            when Array.length args > 0
+                 && (Ids.Type_id.compare id b_option = 0
+                    || Ids.Type_id.compare id b_result = 0
+                    || (match List.assoc_opt id env.type_names with
+                        | Some ("Option" | "Result") -> true
+                        | _ -> false)) ->
+              (* `?` unwraps the Ok/Some payload: the first type argument
+                 (the Result[T,E] carries both) *)
+              Ok { te_type = args.(0); te_effects = te.te_effects; te_span = span }
           | _ ->
               Error
                 (err span
