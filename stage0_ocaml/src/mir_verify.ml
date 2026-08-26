@@ -17,15 +17,21 @@
    5.  every local reference exists (assigns, operands, StorageLive/
        StorageDead, SetDiscriminant, call destinations);
    6.  every projection is legal for its base type: Deref on a
-       ref/pointer, Field on the declared owner def (struct/tuple) with
-       an in-bounds index, ConstantIndex on a fixed array with an
-       in-bounds index, Index on a fixed array whose index local exists,
-       is definitely initialized/readable at that program point and is
-       typed as an allowed integer index type (Int/I32/I64/UInt/U32/
-       U64/U8 — the runtime index value is bounds-checked by the VM at
-       execution, never compared against the container length here),
-       Downcast on the declared owner enum with an in-bounds variant
-       index;
+       ref/pointer, Field on the OWNER struct def of the projected base
+       (the native identity rule: the projected FieldId must belong to
+       the base type's def; the positional fd_index is derived from the
+       def's metadata, never trusted from the projection), ConstantIndex
+       on a fixed array (or a tuple — the variant-payload form: tuples
+       have no FieldId, so payload positions are indexed positionally,
+       like the reference's TupleIndex) with an in-bounds index, Index
+       on a fixed array whose index local exists, is definitely
+       initialized/readable at that program point and is typed as an
+       allowed integer index type (Int/I32/I64/UInt/U32/U64/U8 — the
+       runtime index value is bounds-checked by the VM at execution,
+       never compared against the container length here), Downcast on
+       the OWNER enum def of the projected base (the projected VariantId
+       must belong to the base type's def; the runtime tag vd_index is
+       derived from the def's metadata);
    7.  operand type matches its operation (binop/unop arities and
        scalar classes, aggregate element types, cast matrix);
    8.  destination type matches the rvalue (assign and call dest);
@@ -90,6 +96,33 @@ let find_type (ctx : ctx) (tid : Ids.Type_id.t) : Type_repr.t option =
   with
   | Some d -> Some (Seed_mir.def_repr d)
   | None -> None
+
+(* The raw def of a TypeId (the semantic registry). *)
+let find_def (ctx : ctx) (tid : Ids.Type_id.t) : Seed_mir.type_def option =
+  Array.to_list ctx.prog.types
+  |> List.find_opt (fun d -> Seed_mir.def_id d = tid)
+
+(* ── Semantic projection resolution (re-audit) ────────────────────
+   A Field projection carries the semantic FieldId; its owner must be
+   the projected base's struct def, and the positional fd_index is
+   derived from the def's metadata.  A Downcast projection carries the
+   semantic VariantId; its owner must be the projected base's enum def,
+   and the declaration-order tag (vd_index) is derived from the def's
+   metadata.  These lookups fail closed (None) on any identity/owner
+   mismatch. *)
+let struct_field_of (ctx : ctx) (tid : Ids.Type_id.t) (fid : Ids.Field_id.t) :
+    Seed_mir.field_def option =
+  match find_def ctx tid with
+  | Some (Seed_mir.StructDef { sd_fields; _ }) ->
+      List.find_opt (fun f -> Ids.Field_id.compare f.Seed_mir.fd_id fid = 0) sd_fields
+  | _ -> None
+
+let enum_variant_of (ctx : ctx) (tid : Ids.Type_id.t) (vid : Ids.Variant_id.t) :
+    Seed_mir.variant_def option =
+  match find_def ctx tid with
+  | Some (Seed_mir.EnumDef { ed_variants; _ }) ->
+      List.find_opt (fun v -> Ids.Variant_id.compare v.Seed_mir.vd_id vid = 0) ed_variants
+  | _ -> None
 
 let rec resolve_ty (ctx : ctx) (seen : Ids.Type_id.t list) (ty : Type_repr.t) :
     Type_repr.t option =
@@ -187,7 +220,11 @@ let rec types_compatible (ctx : ctx) (a : Type_repr.t) (b : Type_repr.t) : bool 
   | _ -> false
 
 (* Whether the resolved type is an ENUM def (Function with Never ret),
-   and the payload type of one of its variants. *)
+   and the payload type of one of its variants.  The enum's runtime
+   tag is the declaration-order vd_index: EnumCtor tags, SetDiscriminant
+   and SwitchInt values are the positional indices (the seed model
+   collapses the reference's discriminant table), so these positional
+   helpers stay in-bounds checks over the def_repr. *)
 let enum_variant_payload (ctx : ctx) (ty : Type_repr.t) (vid : Ids.Variant_index.t) :
     Type_repr.t option =
   match resolve_or_self ctx ty with
@@ -203,7 +240,11 @@ let enum_def_arity (ctx : ctx) (ty : Type_repr.t) : int option =
   | Type_repr.Function (variants, Type_repr.Never) -> Some (Array.length variants)
   | _ -> None
 
-(* The type produced by applying one projection; None = illegal. *)
+(* The type produced by applying one projection; None = illegal.
+   Field/Downcast resolve the SEMANTIC id in the projected base's own
+   def (the owner-identity rule); ConstantIndex also admits Tuple bases
+   — the variant-payload positions are tuples (like the reference's
+   TupleIndex, tuples have no FieldId), so payload access is positional. *)
 let project_type (ctx : ctx) (ty : Type_repr.t) (proj : projection) : Type_repr.t option =
   match proj with
   | Deref -> (
@@ -211,13 +252,16 @@ let project_type (ctx : ctx) (ty : Type_repr.t) (proj : projection) : Type_repr.
       | Type_repr.Ref_internal (_, t) | Type_repr.Raw_ptr (_, t) -> Some t
       | _ -> None)
   | Field fid -> (
-      let i = Ids.Field_index.to_int fid in
-      match resolve_or_self ctx ty with
-      | Type_repr.Tuple elems when i >= 0 && i < Array.length elems -> Some elems.(i)
+      match ty with
+      | Type_repr.Named (tid, _) -> (
+          match struct_field_of ctx tid fid with
+          | Some f -> Some f.Seed_mir.fd_ty
+          | None -> None)
       | _ -> None)
   | ConstantIndex i -> (
       match resolve_or_self ctx ty with
       | Type_repr.Fixed_array (elem, n) when i >= 0 && i < n -> Some elem
+      | Type_repr.Tuple elems when i >= 0 && i < Array.length elems -> Some elems.(i)
       | _ -> None)
   | Index li -> (
       (* dynamic-index form: the payload is the LOCAL whose runtime
@@ -230,7 +274,13 @@ let project_type (ctx : ctx) (ty : Type_repr.t) (proj : projection) : Type_repr.
       match resolve_or_self ctx ty with
       | Type_repr.Fixed_array (elem, _) -> Some elem
       | _ -> None)
-  | Downcast vid -> enum_variant_payload ctx ty vid
+  | Downcast vid -> (
+      match ty with
+      | Type_repr.Named (tid, _) -> (
+          match enum_variant_of ctx tid vid with
+          | Some v -> Some v.Seed_mir.vd_payload
+          | None -> None)
+      | _ -> None)
 
 let place_type (ctx : ctx) (fn : function_) (p : place) : Type_repr.t option =
   if p.local < 0 || p.local >= Array.length fn.locals then None
@@ -247,7 +297,7 @@ let place_type (ctx : ctx) (fn : function_) (p : place) : Type_repr.t option =
 
    "" = the whole root; "*" = a whole-value boundary (a chain containing
    a deref or a dynamic-index projection); Field contributes its
-   declaration-order index, ConstantIndex contributes "<i>", Downcast
+   semantic FieldId, ConstantIndex contributes "<i>", Downcast
    contributes nothing. *)
 
 let place_key (p : place) : string =
@@ -258,7 +308,7 @@ let place_key (p : place) : string =
       (function
         | Deref | Index _ -> boundary := true
         | Downcast _ -> ()
-        | Field fid -> segs := string_of_int (Ids.Field_index.to_int fid) :: !segs
+        | Field fid -> segs := Printf.sprintf "field#%d" (Ids.Field_id.to_int fid) :: !segs
         | ConstantIndex i -> segs := string_of_int i :: !segs)
       p.projections;
     if !boundary then "*"
@@ -673,17 +723,37 @@ let check_projection_owners (ctx : ctx) (fn : function_) (bb_ctx : string)
                   (Printf.sprintf "%s: deref projection on non-pointer type %s" bb_ctx
                      (Seed_mir.print_type ty)))
         | Field fid -> (
-            match resolve_or_self ctx ty with
-            | Type_repr.Tuple elems ->
-                let i = Ids.Field_index.to_int fid in
-                if i < 0 || i >= Array.length elems then
-                  add_err ctx
-                    (Printf.sprintf
-                       "%s: field #%d does not exist in the projected def (arity %d)" bb_ctx i
-                       (Array.length elems))
-                else go elems.(i) rest
-            | Type_repr.Function (_, Type_repr.Never) ->
-                add_err ctx (Printf.sprintf "%s: field projection on an enum value" bb_ctx)
+            (* the native owner-identity invariant: the projected
+               FieldId must belong to the projected base's OWN struct
+               def.  The positional fd_index is derived from the def's
+               metadata (never trusted from the projection itself). *)
+            match ty with
+            | Type_repr.Named (tid, _) -> (
+                match find_def ctx tid with
+                | Some (Seed_mir.StructDef { sd_fields; _ }) -> (
+                    match
+                      List.find_opt
+                        (fun f -> Ids.Field_id.compare f.Seed_mir.fd_id fid = 0)
+                        sd_fields
+                    with
+                    | Some f -> go f.Seed_mir.fd_ty rest
+                    | None ->
+                        add_err ctx
+                          (Printf.sprintf
+                             "%s: field identity owner mismatch: FieldId %d does not belong to the projected base type#%d's struct def"
+                             bb_ctx (Ids.Field_id.to_int fid) (Ids.Type_id.to_int tid)))
+                | Some (Seed_mir.EnumDef _) ->
+                    add_err ctx
+                      (Printf.sprintf "%s: field projection on an enum value" bb_ctx)
+                | None ->
+                    add_err ctx
+                      (Printf.sprintf
+                         "%s: field projection on a type with no def in the types table" bb_ctx))
+            | Type_repr.Tuple _ ->
+                add_err ctx
+                  (Printf.sprintf
+                     "%s: field projection on a tuple (tuples have no FieldId — the seed uses ConstantIndex for tuple/payload positions)"
+                     bb_ctx)
             | _ ->
                 add_err ctx
                   (Printf.sprintf "%s: field projection on non-struct type %s" bb_ctx
@@ -695,6 +765,15 @@ let check_projection_owners (ctx : ctx) (fn : function_) (bb_ctx : string)
                   add_err ctx
                     (Printf.sprintf "%s: index %d out of bounds for array of length %d" bb_ctx i n)
                 else go elem rest
+            | Type_repr.Tuple elems ->
+                (* the tuple form (native TupleIndex): variant payloads
+                   are tuples with no FieldId, so payload positions are
+                   indexed positionally *)
+                if i < 0 || i >= Array.length elems then
+                  add_err ctx
+                    (Printf.sprintf "%s: tuple index %d out of bounds (arity %d)" bb_ctx i
+                       (Array.length elems))
+                else go elems.(i) rest
             | _ ->
                 add_err ctx
                   (Printf.sprintf "%s: index projection on non-array type %s" bb_ctx
@@ -730,13 +809,36 @@ let check_projection_owners (ctx : ctx) (fn : function_) (bb_ctx : string)
                    (Printf.sprintf "%s: index projection on non-array type %s" bb_ctx
                       (Seed_mir.print_type ty)))
         | Downcast vid -> (
-            match enum_variant_payload ctx ty vid with
-            | Some payload -> go payload rest
-            | None ->
+            (* the native owner-identity invariant for variants: the
+               projected VariantId must belong to the projected base's
+               OWN enum def; the runtime tag (vd_index) is derived from
+               the def's metadata. *)
+            match ty with
+            | Type_repr.Named (tid, _) -> (
+                match find_def ctx tid with
+                | Some (Seed_mir.EnumDef { ed_variants; _ }) -> (
+                    match
+                      List.find_opt
+                        (fun v -> Ids.Variant_id.compare v.Seed_mir.vd_id vid = 0)
+                        ed_variants
+                    with
+                    | Some v -> go v.Seed_mir.vd_payload rest
+                    | None ->
+                        add_err ctx
+                          (Printf.sprintf
+                             "%s: variant identity owner mismatch: VariantId %d does not belong to the projected base type#%d's enum def"
+                             bb_ctx (Ids.Variant_id.to_int vid) (Ids.Type_id.to_int tid)))
+                | Some (Seed_mir.StructDef _) ->
+                    add_err ctx
+                      (Printf.sprintf "%s: variant projection on a struct value" bb_ctx)
+                | None ->
+                    add_err ctx
+                      (Printf.sprintf
+                         "%s: variant projection on a type with no def in the types table" bb_ctx))
+            | _ ->
                 add_err ctx
-                  (Printf.sprintf
-                     "%s: variant projection variant#%d does not match the projected type's enum def"
-                     bb_ctx (Ids.Variant_index.to_int vid))))
+                  (Printf.sprintf "%s: variant projection on non-enum type %s" bb_ctx
+                     (Seed_mir.print_type ty))))
   in
   if p.local >= 0 && p.local < Array.length fn.locals then
     go fn.locals.(p.local) p.projections

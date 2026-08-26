@@ -15,11 +15,15 @@
      (the VM returns the tag as an Int), dispatches with one SwitchInt
      whose targets are the per-variant tags (0-based declaration order,
      matching EnumCtor's tags), and binds each arm's payload fields by
-     projecting the subject with [Downcast vid; Field i] (the VM's
-     Downcast turns the payload into a Struct, Field picks field i).
-     Payload binding locals are Copy-read when the payload type is
-     copyable (non-copy payload binding fails closed: the seed VM's Move
-     operand ignores projections, so a projected move would be wrong).
+     projecting the subject with [Downcast vid; ConstantIndex i] — the
+     Downcast carries the SEMANTIC VariantId (the declaration-order tag
+     is metadata in the owner EnumDef; the VM derives it through the
+     type table), and the payload is a TUPLE (tuples have no FieldId,
+     so payload positions are indexed positionally — the reference's
+     TupleIndex form).  Payload binding locals are Copy-read when the
+     payload type is copyable (non-copy payload binding fails closed:
+     the seed VM's Move operand ignores projections, so a projected move
+     would be wrong).
 
    - `?` (Ast.TryOp): the subject is an Option/Result.  The success
      variant (tag 0) supplies the expression value (the payload read
@@ -80,20 +84,38 @@ type func_env = {
    The seed representation of an enum value is
    `Vm_value.Enum (variant_index_in_declaration_order, payload)`
    (vm_value.ml), constructed by EnumCtor and read by Discriminant /
-   Downcast / Field projections.  Variant indices must therefore be
-   consistent across construction sites and match arms within one
+   Downcast / ConstantIndex projections.  Variant indices must therefore
+   be consistent across construction sites and match arms within one
    program.  The builtin enums Option (Some=0, None=1) and Result
    (Ok=0, Err=1) are hardcoded (their payloads come from the enum's
    type arguments); user enums are declared by the caller through a
    variant_table (see lower_function_with_variants).  The plain
    lower_function API (used by the driver) lowers with the builtin
    table only, so user-defined enum constructs fail closed there with a
-   Seed_bug pointing at lower_function_with_variants. *)
+   Seed_bug pointing at lower_function_with_variants.  Every emitted
+   Downcast projection carries the SEMANTIC VariantId derived from the
+   spec's declaration-order index (semantic_variant_id below) — the
+   compile-time identity; the runtime tag stays the declaration-order
+   index, and the verifier/VM reconcile the two through the enum def. *)
 
 type variant_spec = {
   vs_index : int;                   (* tag = declaration-order variant index *)
   vs_fields : Type_repr.t list;     (* payload field types (concrete) *)
 }
+
+(* Semantic variant identity of a table spec: 1-based declaration order
+   (`Variant_id.make (vs_index + 1)`) — the same deterministic minting
+   the typechecker's fallback registration uses (typecheck.ml: "None ->
+   Ids.Variant_id.make (i + 1)") when no resolver handoff exists, and
+   the scheme the seed's EnumDefs carry.  The semantic id is the
+   compile-time identity; the runtime tag is the declaration-order
+   vd_index (== vs_index), which the VM derives through the enum def
+   when executing a Downcast.  NOTE: a RESOLVER-driven registry mints
+   closure-wide dense ids (non-positional); the driver must then carry
+   the ids in the variant table — the fallback scheme here is the
+   deterministic position-based minting. *)
+let semantic_variant_id (spec : variant_spec) : Ids.Variant_id.t =
+  Ids.Variant_id.make (spec.vs_index + 1)
 
 type variant_table = {
   vt_enums : (string * (string * variant_spec) list) list;  (* enum name -> variant name -> spec *)
@@ -748,7 +770,9 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
          subject itself (the failure enum value) in the return slot,
          after running the function-level defers (LIFO).  The seed
          representation is Vm_value.Enum (tag, payload); the payload is
-         read via [Downcast 0; Field 0]. *)
+         read via [Downcast <success VariantId>; ConstantIndex 0] (the
+         payload is a tuple — tuples have no FieldId, so the payload
+         position is indexed positionally). *)
       let subj_op, subj_ty = lower_expr env st inner in
       let sid = fresh_local st subj_ty in
       emit st (Seed_mir.Assign (cur_place st sid, Seed_mir.Use subj_op));
@@ -783,6 +807,17 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
         | Type_repr.Named (_, args) when Array.length args > 0 -> args.(0)
         | _ -> seed_bug "`?` subject has no payload type"
       in
+      (* the semantic identities of the success/failure variants, from
+         the same variant universe the EnumCtor tags come from: the
+         builtin table for Option/Result, the caller's table otherwise *)
+      let variant_vid (vname : string) : Ids.Variant_id.t =
+        semantic_variant_id
+          (variant_spec_of env st.variants
+             ~enum_name:(if is_result then "Result" else "Option")
+             ~vname ~repr:subj_ty)
+      in
+      let ok_vid = variant_vid (if is_result then "Ok" else "Some") in
+      let err_vid = variant_vid (if is_result then "Err" else "None") in
       let did = fresh_local st (Type_repr.Int Type_repr.UInt) in
       emit st (Seed_mir.Assign (cur_place st did, Seed_mir.Discriminant (cur_place st sid)));
       let fail = new_block st in
@@ -819,18 +854,17 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
              seed_bug
                "`?` Result failure reconstruction is not lowerable for a non-Copy error payload %s (the seed VM's Move ignores projections, so extracting Err's payload from the subject and rebuilding it cannot move the value; pass the value by place or make the payload Copy)"
                (Seed_mir.print_type e)
-           else begin
-             let eid = fresh_local st e in
-             emit st
-               (Seed_mir.Assign
-                  ( cur_place st eid,
-                    Seed_mir.Use
-                      (Seed_mir.Copy
-                         { Seed_mir.local = sid;
-                           projections =
-                             [ Seed_mir.Downcast (Ids.Variant_index.make 1);
-                               Seed_mir.Field (Ids.Field_index.make 0) ] }) ));
-             (match env.fn_ret with
+            else begin
+              let eid = fresh_local st e in
+              emit st
+                (Seed_mir.Assign
+                   ( cur_place st eid,
+                     Seed_mir.Use
+                       (Seed_mir.Copy
+                          { Seed_mir.local = sid;
+                            projections =
+                              [ Seed_mir.Downcast err_vid; Seed_mir.ConstantIndex 0 ] }) ));
+              (match env.fn_ret with
               | Type_repr.Named (ret_tid, _) ->
                   emit st
                     (Seed_mir.Assign
@@ -845,7 +879,7 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
       push_block st success;
       set_terminator_to st (Seed_mir.Goto join) join;
       ( Seed_mir.Copy
-          { Seed_mir.local = sid; projections = [ Seed_mir.Downcast (Ids.Variant_index.make 0); Seed_mir.Field (Ids.Field_index.make 0) ] },
+          { Seed_mir.local = sid; projections = [ Seed_mir.Downcast ok_vid; Seed_mir.ConstantIndex 0 ] },
         payload_ty ))
   | Ast.ForExpr f -> (
       (* A for-loop over a compile-time Array literal is UNROLLED into
@@ -1232,8 +1266,11 @@ and lower_match (env : func_env) (st : lower_state) (m : Ast.match_expr) :
            in
            let spec = variant_spec_of env st.variants ~enum_name ~vname:seg2 ~repr:subj_ty in
            (* bind the payload fields by projecting the subject; the
-              seed VM's Downcast turns the payload into a Struct and
-              Field picks field i *)
+              Downcast carries the semantic VariantId (the VM derives
+              the runtime tag through the enum def) and the payload is a
+              TUPLE — tuples have no FieldId, so the payload positions
+              are indexed positionally with ConstantIndex (the
+              reference's TupleIndex form) *)
            List.iteri
              (fun j pat ->
                match pat with
@@ -1247,19 +1284,19 @@ and lower_match (env : func_env) (st : lower_state) (m : Ast.match_expr) :
                      seed_bug
                        "non-Copy payload binding in a variant match arm is not supported by the seed VM (a projected Move is not executable; payload type %s)"
                        (Seed_mir.print_type fty);
-                   let id = fresh_local st fty in
-                   emit st
-                     (Seed_mir.Assign
-                        ( cur_place st id,
-                          Seed_mir.Use
-                            (Seed_mir.Copy
-                               { Seed_mir.local = sid;
-                                 projections =
-                                   [
-                                     Seed_mir.Downcast (Ids.Variant_index.make spec.vs_index);
-                                     Seed_mir.Field (Ids.Field_index.make j);
-                                   ] }) ));
-                   st.scope <- (name, id) :: st.scope)
+                    let id = fresh_local st fty in
+                    emit st
+                      (Seed_mir.Assign
+                         ( cur_place st id,
+                           Seed_mir.Use
+                             (Seed_mir.Copy
+                                { Seed_mir.local = sid;
+                                  projections =
+                                    [
+                                      Seed_mir.Downcast (semantic_variant_id spec);
+                                      Seed_mir.ConstantIndex j;
+                                    ] }) ));
+                    st.scope <- (name, id) :: st.scope)
                | Ast.Wildcard _ -> ()
                | _ -> seed_bug "unsupported variant payload pattern in lowering")
              pats)

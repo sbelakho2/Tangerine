@@ -221,6 +221,162 @@ end
             if errors <> [] then exit 1;
             env'
       in
+      (* ── user-enum variant-table proof (re-audit finding: the closure
+         driver must feed lowering the typechecker's enum universe — the
+         DRIVER's table-builder runs on the TYPED nominal registry and
+         must reproduce the manual Color table above exactly, with the
+         declaration-order indices aligned to the semantic VariantIds
+         that closure_types materializes into the EnumDefs) *)
+      let color_nom = List.assoc "Color" tcheck_env.Typecheck.nominals in
+      let color_tid = List.assoc "Color" tcheck_env.Typecheck.type_ids in
+      let driver_table = Driver.user_variant_table tcheck_env in
+      if driver_table <> variant_table then begin
+        Printf.printf "  user-enum table: FAIL (driver table differs from the manual Color table)\n";
+        exit 1
+      end;
+      (match
+         Array.to_list (Driver.closure_types tcheck_env)
+         |> List.find_map (fun d ->
+                match d with
+                | Seed_mir.EnumDef { ed_id; ed_variants }
+                  when Ids.Type_id.compare ed_id color_tid = 0 ->
+                    Some ed_variants
+                | _ -> None)
+       with
+       | None ->
+           Printf.printf "  user-enum table: FAIL (no Color EnumDef in the driver's closure types)\n";
+           exit 1
+       | Some ed_variants ->
+           let ok =
+             List.for_all
+               (fun (vname, spec : string * Mir_lower.variant_spec) ->
+                 List.assoc_opt vname color_nom.Typecheck.nom_variants <> None
+                 && (let vd : Seed_mir.variant_def =
+                       List.nth ed_variants spec.Mir_lower.vs_index
+                     in
+                     Ids.Variant_id.compare vd.Seed_mir.vd_id
+                       (List.nth color_nom.Typecheck.nom_variant_ids spec.Mir_lower.vs_index)
+                     = 0))
+               (List.assoc "Color" driver_table.Mir_lower.vt_enums)
+           in
+           if ok then
+             Printf.printf
+               "  user-enum table: PASS (driver table == manual Color table; vs_index aligns with the semantic VariantIds in the EnumDefs)\n"
+           else begin
+             Printf.printf "  user-enum table: FAIL (semantic VariantId alignment)\n";
+             exit 1
+           end);
+      (* a resolver-driven env: the semantic VariantIds are the
+         resolver's dense closure-wide enumeration, so the second enum's
+         ids are NOT its declaration positions — the driver's
+         table-builder must still reproduce the manual construction
+         shape (name -> index -> payloads; ctor -> (enum, variant)) from
+         the typed nominals alone *)
+      let proof_src = {|
+enum A
+  A0,
+  A1(Int)
+end
+
+enum B
+  B0,
+  B1(Int),
+  B2(Int, Int)
+end
+
+def main() -> Int
+  0
+end
+|} in
+      let proof_file = Filename.temp_file "tg_lowersurface_user_enum" ".tg" in
+      (let oc = open_out_bin proof_file in
+       output_string oc proof_src;
+       close_out oc);
+      let proof_manifest =
+        match Bootstrap_manifest.single ~file:proof_file ~path:[ "proof" ] () with
+        | Ok m -> m
+        | Error e -> failwith ("user-enum proof manifest: " ^ e)
+      in
+      let pdiags = Diagnostic.create_bag () in
+      let pgraph = Module_graph.create_with_sources proof_manifest pdiags in
+      let presolved = Resolver.resolve proof_manifest pgraph pdiags in
+      let pprog = (List.hd pgraph.Module_graph.nodes).Module_graph.node_program in
+      let penv =
+        match Typecheck.check_program (Typecheck.initial_env ~resolved:(Some presolved) ()) pprog with
+        | Error m -> failwith ("user-enum proof typecheck: " ^ m)
+        | Ok (env', errors) ->
+            if errors <> [] then
+              failwith ("user-enum proof typecheck errors: " ^ String.concat "; " errors);
+            env'
+      in
+      Sys.remove proof_file;
+      let a_nom = List.assoc "A" penv.Typecheck.nominals in
+      let b_nom = List.assoc "B" penv.Typecheck.nominals in
+      let b_ids = b_nom.Typecheck.nom_variant_ids in
+      let a_specs =
+        [
+          ("A0", { Mir_lower.vs_index = 0; vs_fields = [] });
+          ("A1", { Mir_lower.vs_index = 1; vs_fields = [ int_ty ] });
+        ]
+      in
+      let b_specs =
+        [
+          ("B0", { Mir_lower.vs_index = 0; vs_fields = [] });
+          ("B1", { Mir_lower.vs_index = 1; vs_fields = [ int_ty ] });
+          ("B2", { Mir_lower.vs_index = 2; vs_fields = [ int_ty; int_ty ] });
+        ]
+      in
+      let p_table = Driver.user_variant_table penv in
+      let enums_ok =
+        List.assoc "A" p_table.Mir_lower.vt_enums = a_specs
+        && List.assoc "B" p_table.Mir_lower.vt_enums = b_specs
+      in
+      let ctors_ok =
+        List.sort compare p_table.Mir_lower.vt_ctors
+        = List.sort compare
+            [
+              ("A0", ("A", "A0"));
+              ("A1", ("A", "A1"));
+              ("B0", ("B", "B0"));
+              ("B1", ("B", "B1"));
+              ("B2", ("B", "B2"));
+            ]
+      in
+      let b_tid = List.assoc "B" penv.Typecheck.type_ids in
+      let b_ed =
+        Array.to_list (Driver.closure_types penv)
+        |> List.find_map (fun d ->
+               match d with
+               | Seed_mir.EnumDef { ed_id; ed_variants }
+                 when Ids.Type_id.compare ed_id b_tid = 0 ->
+                   Some ed_variants
+               | _ -> None)
+      in
+      let ids_ok =
+        b_ids = [ Ids.Variant_id.make 2; Ids.Variant_id.make 3; Ids.Variant_id.make 4 ]
+        && List.for_all
+             (fun (vname, spec : string * Mir_lower.variant_spec) ->
+               List.assoc_opt vname b_nom.Typecheck.nom_variants <> None
+               && (match b_ed with
+                   | None -> false
+                   | Some ed_variants ->
+                       let vd : Seed_mir.variant_def =
+                         List.nth ed_variants spec.Mir_lower.vs_index
+                       in
+                       Ids.Variant_id.compare vd.Seed_mir.vd_id
+                         (List.nth b_ids spec.Mir_lower.vs_index)
+                       = 0))
+             b_specs
+      in
+      if enums_ok && ctors_ok && ids_ok then
+        Printf.printf
+          "  user-enum table (resolver env): PASS (A/B entries in the manual shape; B's semantic VariantIds [2;3;4] are non-positional and aligned with the table indices via the EnumDefs)\n"
+      else begin
+        Printf.printf "  user-enum table (resolver env): FAIL (enums_ok=%b ctors_ok=%b ids_ok=%b)\n"
+          enums_ok ctors_ok ids_ok;
+        exit 1
+      end;
+      ignore a_nom;
       let option_tid = List.assoc "Option" tcheck_env.Typecheck.type_ids in
       let result_tid = List.assoc "Result" tcheck_env.Typecheck.type_ids in
       let color_tid = List.assoc "Color" tcheck_env.Typecheck.type_ids in
@@ -312,7 +468,12 @@ end
               List.mapi
                 (fun i fs ->
                   {
-                    Seed_mir.vd_id = Ids.Variant_id.make i;
+                    (* semantic VariantIds are minted 1-based in
+                       declaration order — the same deterministic scheme
+                       the typechecker's fallback registration and
+                       mir_lower's semantic_variant_id use (the lowered
+                       Downcast projections carry these ids) *)
+                    Seed_mir.vd_id = Ids.Variant_id.make (i + 1);
                     vd_index = Ids.Variant_index.make i;
                     vd_payload = payload_def fs;
                   })

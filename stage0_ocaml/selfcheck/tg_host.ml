@@ -1,6 +1,6 @@
 (* tg_host.ml — host binding-closure self-check (audit §70).
 
-   Proves three properties of the executable host closure:
+   Proves four properties of the executable host closure:
      (a) closure_check FAILS (non-zero) when a declared symbol has no
          binding, and names the symbol;
      (b) closure_check PASSES when every declared symbol carries a
@@ -8,7 +8,13 @@
      (c) the VM's host dispatch invokes the real binding table entry:
          hand-built Seed MIR with Intrinsic/Extern call terminators run
          through Vm.run, asserting results, plus fail-closed traps for
-         declared-but-unbound symbols. *)
+         declared-but-unbound symbols;
+     (d) the REACHABLE-host closure boundary (re-audit: stage 10): the
+         static scan collects exactly the host ids a post-mono program
+         can dispatch to, and the reachable-set check fails when a
+         declared-but-unbound symbol is reachable but passes when it is
+         not called (declared-but-unreachable needs no binding), with
+         User-form host calls resolved to their host ids. *)
 
 let fail fmt = Printf.ksprintf (fun s -> Printf.printf "FAIL: %s\n" s; exit 1) fmt
 let pass fmt = Printf.ksprintf (fun s -> Printf.printf "PASS: %s\n" s) fmt
@@ -143,11 +149,12 @@ let extern_id (name : string) : int =
 let int_constant (n : int64) : Seed_mir.constant =
   Seed_mir.Integer (Int_value.of_int64 ~width:64 ~signed:true n)
 
-(* Hand-built Seed MIR: one function whose only block calls the host
-   symbol with the given constant argument (or none) and stores the
-   result in the return slot _0, then returns. *)
-let call_program (callee : Seed_mir.callee) (arg : (Type_repr.t * Seed_mir.constant) option)
-    (ret_ty : Type_repr.t) : Seed_mir.program =
+(* A single-function program fragment: name + callee + optional constant
+   argument + return type; the reachable-host closure proof builds
+   programs whose reachable calls are exactly the given callees. *)
+let call_fn (name : string) (cid : int) (callee : Seed_mir.callee)
+    (arg : (Type_repr.t * Seed_mir.constant) option) (ret_ty : Type_repr.t) :
+    Seed_mir.function_ =
   let statements, args, locals =
     match arg with
     | None -> ([], [||], [| ret_ty |])
@@ -157,24 +164,29 @@ let call_program (callee : Seed_mir.callee) (arg : (Type_repr.t * Seed_mir.const
           [| { Seed_mir.effect_ = Access_effect.Read; value = Seed_mir.Copy { local = 1; projections = [] } } |],
           [| ret_ty; arg_ty |] )
   in
-  let instance = Instance_id.make ~callable:(Ids.Callable_id.make 0) ~type_args:[||] in
-  let fn =
-    {
-      Seed_mir.name = "main";
-      instance;
-      params = [||];
-      locals;
-      blocks =
-        [|
-          { id = 0;
-            statements;
-            terminator = Seed_mir.Call ({ local = 0; projections = [] }, callee, args, 1, None) };
-          { id = 1; statements = []; terminator = Seed_mir.Ret };
-        |];
-      entry = 0;
-    }
-  in
-  { Seed_mir.functions = [| fn |]; statics = [||]; types = [||] }
+  {
+    Seed_mir.name;
+    instance = Instance_id.make ~callable:(Ids.Callable_id.make cid) ~type_args:[||];
+    params = [||];
+    locals;
+    blocks =
+      [|
+        { id = 0;
+          statements;
+          terminator = Seed_mir.Call ({ local = 0; projections = [] }, callee, args, 1, None) };
+        { id = 1; statements = []; terminator = Seed_mir.Ret };
+      |];
+    entry = 0;
+  }
+
+(* Hand-built Seed MIR: one function whose only block calls the host
+   symbol with the given constant argument (or none) and stores the
+   result in the return slot _0, then returns. *)
+let call_program (callee : Seed_mir.callee) (arg : (Type_repr.t * Seed_mir.constant) option)
+    (ret_ty : Type_repr.t) : Seed_mir.program =
+  { Seed_mir.functions = [| call_fn "main" 0 callee arg ret_ty |];
+    statics = [||];
+    types = [||] }
 
 let check_vm_dispatch () =
   (* __intrinsic_int_to_string(42) -> "42" through the real binding *)
@@ -280,12 +292,117 @@ let check_vm_dispatch () =
    | Error e -> fail "unbound host call produced the wrong error: %s" e.Vm.message
    | Ok _ -> fail "unbound host call did not trap")
 
+(* ── Reachable-host closure proof (re-audit: stage 10) ────────────
+   The REACHABLE set is the right closure boundary: a declared-but-
+   unreachable host symbol needs no binding, but a REACHABLE
+   declared-but-unbound symbol fails the reachable-host closure check.
+   The scan (Driver.collect_reachable_host_ids) collects exactly the
+   host ids the program can dispatch to — Intrinsic/Extern call IDs
+   directly (the VM's call_host conversion: registry index ->
+   Host.Intrinsic/Extern id) plus User-form host calls resolved by
+   name.  The check (Host.closure_check_reachable) then requires every
+   reachable id to carry an executable binding with the exact typed
+   signature. *)
+
+let reachable_names (host : Host.t) (ids : Host.host_id list) : string =
+  String.concat ", "
+    (List.map
+       (fun id -> match Host.name_of_host_id host id with Some n -> n | None -> "?")
+       ids)
+
+let check_reachable_closure_boundary () =
+  let host = Host.create ~repo_root:"." ~argv:[||] in
+  (* (a) reachable calls: one bound intrinsic (__intrinsic_int_to_string)
+     and one declared-but-unbound extern (rb_funcall) — the reachable
+     closure check must FAIL and name the unbound extern *)
+  let prog_a =
+    { Seed_mir.functions =
+        [| call_fn "use_bound_intrinsic" 1
+             (Seed_mir.Intrinsic (intrinsic_id "__intrinsic_int_to_string"))
+             (Some (Type_repr.Int Type_repr.Int, int_constant 42L)) Type_repr.String;
+           call_fn "use_unbound_extern" 2 (Seed_mir.Extern (extern_id "rb_funcall")) None
+             Type_repr.Unit |];
+      statics = [||];
+      types = [||] }
+  in
+  let reachable_a = Driver.collect_reachable_host_ids prog_a in
+  Printf.printf "  reachable host ids: %s\n" (reachable_names host reachable_a);
+  (match Host.closure_check_reachable host reachable_a with
+   | Ok _ ->
+       fail
+         "reachable closure check passed although the reachable set contains the \
+          declared-but-unbound extern 'rb_funcall'"
+   | Error problems -> (
+       match
+         List.find_opt (fun p -> Util.has_prefix p "reachable but not bound") problems
+       with
+       | None ->
+           fail "reachable closure check failed for the wrong reason: %s"
+             (String.concat "; " problems)
+       | Some p ->
+           if not (Util.has_suffix p "rb_funcall") then
+             fail "reachable-but-unbound symbol not named in the report: %s" p;
+           Printf.printf "  %s\n" p;
+           pass
+             "reachable-host closure FAILS when a declared-but-unbound extern is reachable"));
+  (* (b) the same program with the unbound extern NOT called — every
+     reachable id is bound, the check must PASS *)
+  let prog_b =
+    { Seed_mir.functions =
+        [| call_fn "use_bound_intrinsic" 1
+             (Seed_mir.Intrinsic (intrinsic_id "__intrinsic_int_to_string"))
+             (Some (Type_repr.Int Type_repr.Int, int_constant 42L)) Type_repr.String |];
+      statics = [||];
+      types = [||] }
+  in
+  let reachable_b = Driver.collect_reachable_host_ids prog_b in
+  (match Host.closure_check_reachable host reachable_b with
+   | Error problems ->
+       List.iter (fun p -> Printf.printf "    %s\n" p) problems;
+       fail
+         "reachable closure check failed although every reachable host id is bound"
+   | Ok report ->
+       if report.Host.declared <> 1 || report.Host.implemented <> 1 then
+         fail "unexpected reachable closure report: declared=%d implemented=%d"
+           report.Host.declared report.Host.implemented;
+       pass
+         "reachable-host closure PASSES when the unbound extern is not called \
+          (declared-but-unreachable needs no binding)");
+  (* (c) User-form host calls: a User callee whose specialized function
+     name is a declared host symbol maps to that host id (the scan's
+     name resolution — the same boundary the binding table uses), and
+     the reachable set passes the closure check *)
+  let println_inst = Instance_id.make ~callable:(Ids.Callable_id.make 7) ~type_args:[||] in
+  let prog_c =
+    { Seed_mir.functions =
+        [| call_fn "println" 7 (Seed_mir.User println_inst) None Type_repr.Unit;
+           call_fn "use_bound_intrinsic" 1
+             (Seed_mir.Intrinsic (intrinsic_id "__intrinsic_int_to_string"))
+             (Some (Type_repr.Int Type_repr.Int, int_constant 42L)) Type_repr.String |];
+      statics = [||];
+      types = [||] }
+  in
+  let reachable_c = Driver.collect_reachable_host_ids prog_c in
+  let println_id = Host.Intrinsic (Intrinsic_registry.Id.make (intrinsic_id "println")) in
+  if not (List.mem println_id reachable_c) then
+    fail "User-form host call to 'println' was not resolved to its intrinsic host id (reachable = [%s])"
+      (reachable_names host reachable_c);
+  (match Host.closure_check_reachable host reachable_c with
+   | Error problems ->
+       List.iter (fun p -> Printf.printf "    %s\n" p) problems;
+       fail
+         "reachable closure check failed on the User-form program (println is bound; the \
+          reachable set must pass)"
+   | Ok _ ->
+       pass "User-form host calls resolve to their host ids (callee instance -> declared host symbol name)")
+
 let () =
   Printf.printf "host closure self-check\n";
   check_declared_unbound ();
   check_declared_implemented ();
   check_independent_signature_mismatch ();
   check_vm_dispatch ();
+  check_reachable_closure_boundary ();
   (* Informational: the default manifest host is fail-closed (the Ruby C
      API / map-set / dl* symbols are declared without bindings). *)
   let host = Host.create ~repo_root:"." ~argv:[||] in

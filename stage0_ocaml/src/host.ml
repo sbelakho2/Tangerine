@@ -426,3 +426,73 @@ let closure_check (t : t) : (closure_report, string list) result =
           implemented = SS.cardinal impl_names;
           bound = List.sort compare (List.map (fun b -> b.name) t.bindings) }
   | ps -> Error ps
+
+(* ────────────────────────────────────────────────────────────────────
+   Reachable-host closure check (re-audit: stage 10).  closure_check
+   compares the WHOLE declared surface against the binding table; the
+   reachable-host proof needs the narrower boundary: only the host ids
+   a post-mono program's calls actually REACH must carry an executable
+   binding with the exact typed signature.  A declared-but-unreachable
+   symbol needs no binding — that is the documented distinction (the
+   host is a declared surface; the executable closure is the bound
+   subset the VM may dispatch).  PASS requires every reachable id to be
+   declared AND bound with matching signatures; any problem names the
+   symbol, mirroring closure_check's failure report. *)
+
+let closure_check_reachable (t : t) (reachable : host_id list) :
+    (closure_report, string list) result =
+  let problems = ref [] in
+  let problem fmt = Printf.ksprintf (fun s -> problems := s :: !problems) fmt in
+  let seen = Hashtbl.create 16 in
+  let declared = ref 0 in
+  let implemented = ref 0 in
+  let bound_names = ref [] in
+  List.iter
+    (fun id ->
+      if not (Hashtbl.mem seen id) then begin
+        Hashtbl.add seen id ();
+        incr declared;
+        let decl =
+          match id with
+          | Intrinsic i ->
+              List.find_map
+                (fun (name, (iid, sig_)) -> if iid = i then Some (name, sig_) else None)
+                t.intrinsics.Intrinsic_registry.by_name
+          | Extern i ->
+              List.find_map
+                (fun (name, (eid, sig_)) -> if eid = i then Some (name, sig_) else None)
+                t.externs.Extern_registry.by_name
+        in
+        match decl with
+        | None ->
+            problem "reachable host id #%d is not declared in the host registries"
+              (match id with
+              | Intrinsic i -> Intrinsic_registry.Id.to_int i
+              | Extern i -> Extern_registry.Id.to_int i)
+        | Some (name, dsig) -> (
+            match List.find_opt (fun b -> b.id = id) t.bindings with
+            | None -> problem "reachable but not bound (no invoke): %s" name
+            | Some b ->
+                incr implemented;
+                bound_names := name :: !bound_names;
+                let decl_params =
+                  Array.to_list (Array.map type_key dsig.Intrinsic_registry.params)
+                in
+                let decl_ret = type_key dsig.Intrinsic_registry.ret in
+                if decl_params <> b.signature.param_types then
+                  problem
+                    "signature mismatch for reachable %s: declared params [%s], binding params [%s]"
+                    name (String.concat ", " decl_params)
+                    (String.concat ", " b.signature.param_types);
+                if decl_ret <> b.signature.return_type then
+                  problem "return mismatch for reachable %s: declared %s, binding %s" name
+                    decl_ret b.signature.return_type)
+      end)
+    reachable;
+  match List.rev !problems with
+  | [] ->
+      Ok
+        { declared = !declared;
+          implemented = !implemented;
+          bound = List.sort compare (List.rev !bound_names) }
+  | ps -> Error ps

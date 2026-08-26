@@ -12,14 +12,18 @@
    concrete (post-mono): they never contain Type_param.
 
    - a struct is recorded as `Tuple` of its field types (declaration
-     order); a Field projection's Field_id is the declaration-order index
-     of the field in the owner def — the "field owner matches the def"
-     rule is index-in-bounds over the projected base's def;
+     order); a Field projection carries the SEMANTIC FieldId — the
+     declaration-order fd_index is metadata in the owner def, resolved
+     through the type table by the verifier and the VM ("the projected
+     FieldId's owner def must equal the projected base's def" is the
+     native identity rule);
    - an enum is recorded as `Function` whose return type is `Never` and
      whose parameter list is the variant payloads (declaration order; a
      payload is `Tuple` for multi-field variants and `Unit` for none).
-     Discriminants ARE the variant indices (0-based declaration order) —
-     the seed model collapses the reference's explicit discriminant table;
+     A Downcast projection carries the SEMANTIC VariantId — the
+     declaration-order vd_index is the runtime tag/discriminant
+     (metadata in the owner EnumDef); the seed model collapses the
+     reference's explicit discriminant table;
    - a closure object is recorded as
      `Tuple [Function (ptys, ret); Tuple (env types)]` — the code pointer
      first, the capture tuple second.  ClosureAgg (inst, env_ops) builds a
@@ -56,13 +60,23 @@ type constant =
   | String of string
   | Function of Instance_id.t
 
+(* Projections are SEMANTIC (re-audit finding: the seed's projections
+   must carry the field/variant identity, not the declaration-order
+   position).  Field carries the semantic FieldId — the positional
+   fd_index is metadata in the owner StructDef, resolved through the
+   type-definition table by the verifier and the VM.  Downcast carries
+   the semantic VariantId — the declaration-order tag (vd_index) is
+   metadata in the owner EnumDef.  The positional Index/ConstantIndex
+   forms are retained as-is: they index arrays positionally, and
+   ConstantIndex also serves the variant PAYLOAD positions (a payload is
+   a Tuple — like the reference's TupleIndex, tuples have no FieldId). *)
 type projection =
   | Deref
-  | Field of Ids.Field_index.t
+  | Field of Ids.Field_id.t
   | Index of int            (* dynamic-index form: the payload is the LOCAL
                                whose value is the runtime index *)
   | ConstantIndex of int
-  | Downcast of Ids.Variant_index.t
+  | Downcast of Ids.Variant_id.t
 
 type place = { local : int; projections : projection list }
 
@@ -281,10 +295,10 @@ let print_place (p : place) : string =
   List.iter
     (function
       | Deref -> s := "(*" ^ !s ^ ")"
-      | Field f -> s := !s ^ "." ^ string_of_int (Ids.Field_index.to_int f)
+      | Field f -> s := !s ^ Printf.sprintf ".field#%d" (Ids.Field_id.to_int f)
       | Index li -> s := !s ^ Printf.sprintf "[_%d]" li
       | ConstantIndex i -> s := !s ^ Printf.sprintf "[%d]" i
-      | Downcast v -> s := !s ^ Printf.sprintf " as variant#%d" (Ids.Variant_index.to_int v))
+      | Downcast v -> s := !s ^ Printf.sprintf " as variant#%d" (Ids.Variant_id.to_int v))
     p.projections;
   !s
 

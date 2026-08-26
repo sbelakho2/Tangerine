@@ -859,6 +859,122 @@ let valid_j4_copyable_enum_copy () : Seed_mir.program =
   in
   prog_with_types fn
 
+(* ── (k) semantic projection owner-identity proofs (re-audit) ────────
+
+   The Field and Downcast projections carry the SEMANTIC FieldId /
+   VariantId (not the declaration-order position).  The verifier must
+   enforce the native invariant: the projected FieldId must belong to
+   the projected base's OWN struct def ("field identity owner
+   mismatch"), and the projected VariantId must belong to the projected
+   base's OWN enum def — the positional index/tag is metadata derived
+   from the defs (fd_index/vd_index), never trusted from the
+   projection.  The shape_defs above give UserId/SocketFd distinct
+   FieldIds (0 and 1) and Result-like/Option-like distinct VariantIds
+   (0,1 and 2,3), so a cross-type id is expressible as a single-defect
+   mutation. *)
+
+(* k1 (positive control): a UserId field read through its OWN FieldId
+   (fd_id 0 of the UserId def). *)
+let valid_k1_field_owner_same () : Seed_mir.program =
+  let fn =
+    {
+      Seed_mir.name = "field_owner_same";
+      instance = inst 24;
+      params = [| let_param(user_id_ty) |];
+      locals = [| i64; user_id_ty |];
+      blocks =
+        [|
+          { Seed_mir.id = 0;
+            statements =
+              [ assign 0
+                  (use_op
+                     (Seed_mir.Copy
+                        { Seed_mir.local = 1;
+                          projections = [ Seed_mir.Field (Ids.Field_id.make 0) ] })) ];
+            terminator = Seed_mir.Ret };
+        |];
+      entry = 0;
+    }
+  in
+  prog_with_types fn
+
+(* k2: the SAME shape with the FieldId of the OTHER struct (fd_id 1
+   belongs to SocketFd, not UserId) — the owner-identity check must
+   reject it. *)
+let mut_k2_field_owner_mismatch () : Seed_mir.program =
+  let fn =
+    {
+      Seed_mir.name = "field_owner_mismatch";
+      instance = inst 25;
+      params = [| let_param(user_id_ty) |];
+      locals = [| i64; user_id_ty |];
+      blocks =
+        [|
+          { Seed_mir.id = 0;
+            statements =
+              [ assign 0
+                  (use_op
+                     (Seed_mir.Copy
+                        { Seed_mir.local = 1;
+                          projections = [ Seed_mir.Field (Ids.Field_id.make 1) ] })) ];
+            terminator = Seed_mir.Ret };
+        |];
+      entry = 0;
+    }
+  in
+  prog_with_types fn
+
+(* k3 (positive control): a Result-like value downcast through its OWN
+   VariantId (vd_id 0 of the Result-like def) — the payload tuple. *)
+let valid_k3_variant_owner_same () : Seed_mir.program =
+  let fn =
+    {
+      Seed_mir.name = "variant_owner_same";
+      instance = inst 26;
+      params = [| let_param(result_like_ty) |];
+      locals = [| Type_repr.Tuple [| i64 |]; result_like_ty |];
+      blocks =
+        [|
+          { Seed_mir.id = 0;
+            statements =
+              [ assign 0
+                  (use_op
+                     (Seed_mir.Copy
+                        { Seed_mir.local = 1;
+                          projections = [ Seed_mir.Downcast (Ids.Variant_id.make 0) ] })) ];
+            terminator = Seed_mir.Ret };
+        |];
+      entry = 0;
+    }
+  in
+  prog_with_types fn
+
+(* k4: the VariantId of the OTHER enum (vd_id 2 belongs to the
+   Option-like def, not the Result-like base) — the owner-identity
+   check must reject it. *)
+let mut_k4_variant_owner_mismatch () : Seed_mir.program =
+  let fn =
+    {
+      Seed_mir.name = "variant_owner_mismatch";
+      instance = inst 27;
+      params = [| let_param(result_like_ty) |];
+      locals = [| Type_repr.Tuple [| i64 |]; result_like_ty |];
+      blocks =
+        [|
+          { Seed_mir.id = 0;
+            statements =
+              [ assign 0
+                  (use_op
+                     (Seed_mir.Copy
+                        { Seed_mir.local = 1;
+                          projections = [ Seed_mir.Downcast (Ids.Variant_id.make 2) ] })) ];
+            terminator = Seed_mir.Ret };
+        |];
+      entry = 0;
+    }
+  in
+  prog_with_types fn
+
 let () =
   Printf.printf "Seed MIR verifier mutation self-check\n";
   expect_valid "base1: params + arithmetic + call + switch + return accepted"
@@ -949,6 +1065,20 @@ let () =
   expect_valid
     "j4: copy of an Option[Int]-shaped enum (all-Copy payloads) accepted by the recursive enum Copy rule"
     (valid_j4_copyable_enum_copy ());
+
+  (* (k) semantic projection owner identity *)
+  expect_valid
+    "k1: a Field projection whose FieldId belongs to the projected base's OWN def passes"
+    (valid_k1_field_owner_same ());
+  expect_error
+    "k2: a Field projection whose FieldId belongs to a DIFFERENT type than the projected base fails (field identity owner mismatch)"
+    "field identity owner mismatch" (mut_k2_field_owner_mismatch ());
+  expect_valid
+    "k3: a Downcast projection whose VariantId belongs to the projected base's OWN enum def passes"
+    (valid_k3_variant_owner_same ());
+  expect_error
+    "k4: a Downcast projection whose VariantId belongs to a DIFFERENT enum than the projected base fails (variant identity owner mismatch)"
+    "variant identity owner mismatch" (mut_k4_variant_owner_mismatch ());
   (* i5: the runtime out-of-bounds case through the VM — the verifier
      must accept the program (Index li is never compared against the
      container length; the value 2 is only known at runtime) and

@@ -5,6 +5,19 @@
    Intrinsic id | Extern id — never name dispatch. Slot-state ownership
    is enforced on every local access.
 
+   ── Semantic projection execution (re-audit) ────────────────────────
+
+   The Field and Downcast projections carry SEMANTIC ids (FieldId /
+   VariantId); the positional index/tag is NOT in the projection.  At
+   execution the VM derives the position from the program's
+   type-definition table: the static type of the base value (from the
+   frame's locals, threaded through the projection walk) names the
+   owner def, and the def's fd_index/vd_index metadata gives the
+   position.  The aggregate value itself is positional (Struct fields
+   arrays, Enum (tag, payload)); the id is the compile-time identity
+   that the verifier ties to the owner.  A Downcast additionally
+   checks the runtime tag equals the VariantId's declaration-order tag.
+
    ── Kernel-closure primitives (the audit's remaining items) ─────────
 
    1. DYNAMIC INDEX PROJECTIONS.  The Seed MIR dynamic-index projection
@@ -117,6 +130,125 @@ let err_trap vm msg =
   in
   raise (Failure ("vm trap: " ^ msg ^ where))
 
+(* The static type of a local in a frame's function (the locals array
+   carries the concrete types). *)
+let type_of_local (vm : t) (fn_idx : int) (local : int) : Type_repr.t =
+  let fn = vm.program.Seed_mir.functions.(fn_idx) in
+  if local < 0 || local >= Array.length fn.Seed_mir.locals then
+    err_trap vm (Printf.sprintf "local _%d out of range" local)
+  else fn.Seed_mir.locals.(local)
+
+(* ── Semantic projection resolution (re-audit) ────────────────────
+   The Field/Downcast projections carry SEMANTIC ids; the positional
+   index/tag is metadata in the program's type-definition table
+   (fd_index/vd_index) and is derived HERE at execution.  The verifier
+   has already established the owner identity, so a miss at runtime is
+   an invariant failure (deterministic trap). *)
+
+let find_def (vm : t) (tid : Ids.Type_id.t) : Seed_mir.type_def option =
+  let found = ref None in
+  Array.iter
+    (fun d -> if Seed_mir.def_id d = tid && !found = None then found := Some d)
+    vm.program.Seed_mir.types;
+  !found
+
+(* FieldId -> positional index within the owner StructDef. *)
+let field_index_of (vm : t) (ty : Type_repr.t) (fid : Ids.Field_id.t) : int =
+  match ty with
+  | Type_repr.Named (tid, _) -> (
+      match find_def vm tid with
+      | Some (Seed_mir.StructDef { sd_fields; _ }) -> (
+          match
+            List.find_opt
+              (fun f -> Ids.Field_id.compare f.Seed_mir.fd_id fid = 0)
+              sd_fields
+          with
+          | Some f -> Ids.Field_index.to_int f.Seed_mir.fd_index
+          | None -> err_trap vm "field identity not found in the owner struct def")
+      | _ -> err_trap vm "field projection on a non-struct value")
+  | _ -> err_trap vm "field projection on a non-struct value"
+
+(* VariantId -> declaration-order tag (vd_index) within the owner
+   EnumDef. *)
+let variant_index_of (vm : t) (ty : Type_repr.t) (vid : Ids.Variant_id.t) : int =
+  match ty with
+  | Type_repr.Named (tid, _) -> (
+      match find_def vm tid with
+      | Some (Seed_mir.EnumDef { ed_variants; _ }) -> (
+          match
+            List.find_opt
+              (fun v -> Ids.Variant_id.compare v.Seed_mir.vd_id vid = 0)
+              ed_variants
+          with
+          | Some v -> Ids.Variant_index.to_int v.Seed_mir.vd_index
+          | None -> err_trap vm "variant identity not found in the owner enum def")
+      | _ -> err_trap vm "variant projection on a non-enum value")
+  | _ -> err_trap vm "variant projection on a non-enum value"
+
+(* The static type produced by one projection: the VM mirrors the
+   verifier's project_type with the program's def table, so the static
+   type stays in sync with the value walk (a FieldId resolves its owner
+   def's fd_ty, a VariantId its owner def's vd_payload, a tuple
+   ConstantIndex its element).  Field/Downcast are SEMANTIC and need
+   the static type to resolve their ids — a mismatch traps.  The
+   positional forms (Deref/Index/ConstantIndex) are value-driven: when
+   the static type does not match their expected shape (hand-written
+   MIR with imprecise locals — the verifier rejects such chains, so no
+   verified program reaches the fallback), the static type is carried
+   through unchanged and the value-side case still bounds-checks. *)
+let proj_type_of (vm : t) (ty : Type_repr.t) (proj : Seed_mir.projection) : Type_repr.t =
+  match proj with
+  | Seed_mir.Deref -> (
+      match ty with
+      | Type_repr.Ref_internal (_, t) | Type_repr.Raw_ptr (_, t) -> t
+      | _ -> ty)
+  | Seed_mir.Field fid -> (
+      match ty with
+      | Type_repr.Named (tid, _) -> (
+          match find_def vm tid with
+          | Some (Seed_mir.StructDef { sd_fields; _ }) -> (
+              match
+                List.find_opt
+                  (fun f -> Ids.Field_id.compare f.Seed_mir.fd_id fid = 0)
+                  sd_fields
+              with
+              | Some f -> f.Seed_mir.fd_ty
+              | None -> err_trap vm "field identity not found in the owner struct def")
+          | _ -> err_trap vm "field projection on a non-struct static type")
+      | _ -> err_trap vm "field projection on a non-struct static type")
+  | Seed_mir.ConstantIndex i -> (
+      match ty with
+      | Type_repr.Fixed_array (elem, n) ->
+          if i < 0 || i >= n then err_trap vm "constant index out of bounds (static)"
+          else elem
+      | Type_repr.Tuple elems ->
+          if i < 0 || i >= Array.length elems then
+            err_trap vm "tuple index out of bounds (static)"
+          else elems.(i)
+      | Type_repr.String -> Type_repr.Char
+      | _ -> ty)
+  | Seed_mir.Index _ -> (
+      match ty with
+      | Type_repr.Fixed_array (elem, _) -> elem
+      | Type_repr.Tuple elems when Array.length elems > 0 -> elems.(0)
+      | Type_repr.Tuple _ -> err_trap vm "dynamic index on an empty tuple (static)"
+      | Type_repr.String -> Type_repr.Char
+      | _ -> ty)
+  | Seed_mir.Downcast vid -> (
+      match ty with
+      | Type_repr.Named (tid, _) -> (
+          match find_def vm tid with
+          | Some (Seed_mir.EnumDef { ed_variants; _ }) -> (
+              match
+                List.find_opt
+                  (fun v -> Ids.Variant_id.compare v.Seed_mir.vd_id vid = 0)
+                  ed_variants
+              with
+              | Some v -> v.Seed_mir.vd_payload
+              | None -> err_trap vm "variant identity not found in the owner enum def")
+          | _ -> err_trap vm "variant projection on a non-enum static type")
+      | _ -> err_trap vm "variant projection on a non-enum static type")
+
 (* Evaluate an operand to a value (with slot-state checks). *)
 let rec eval_operand (vm : t) (frame : frame) (op : Seed_mir.operand) : Vm_value.t =
   step_limit vm;
@@ -149,7 +281,10 @@ let rec eval_operand (vm : t) (frame : frame) (op : Seed_mir.operand) : Vm_value
       | Error e -> err_trap vm (Vm_value.slot_error_string e))
 
 (* Read a place: project through the value.  A Deref projection resolves
-   through memory (RawPtr) or through the reference target (Ref). *)
+   through memory (RawPtr) or through the reference target (Ref).  The
+   static type of the base (from the frame's locals) is threaded through
+   the walk so Field/Downcast can resolve their semantic ids against the
+   program's type-definition table (fd_index/vd_index metadata). *)
 and read_place (vm : t) (frame : frame) (p : Seed_mir.place) :
     (Vm_value.t, Vm_value.slot_error) result =
   step_limit vm;
@@ -159,24 +294,29 @@ and read_place (vm : t) (frame : frame) (p : Seed_mir.place) :
     | Error e -> Error e
   in
   match base with
-  | Ok b -> Ok (project_read vm frame b p.Seed_mir.projections)
+  | Ok b ->
+      let base_ty = type_of_local vm frame.fn p.Seed_mir.local in
+      Ok (project_read vm frame b base_ty p.Seed_mir.projections)
   | Error e -> Error e
 
-and project_read (vm : t) (frame : frame) (base : Vm_value.t)
+and project_read (vm : t) (frame : frame) (base : Vm_value.t) (base_ty : Type_repr.t)
     (projs : Seed_mir.projection list) : Vm_value.t =
   match projs with
   | [] -> base
   | proj :: rest ->
-      let recurse v = project_read vm frame v rest in
+      let next_ty = proj_type_of vm base_ty proj in
+      let recurse v = project_read vm frame v next_ty rest in
       (match proj with
        | Seed_mir.Field fid -> (
+           (* the semantic id resolves to the positional index through
+              the owner def (the verifier has checked the owner
+              identity) *)
+           let i = field_index_of vm base_ty fid in
            match base with
            | Vm_value.Struct fields | Vm_value.Tuple fields ->
-               let i = Ids.Field_index.to_int fid in
                if i < 0 || i >= Array.length fields then err_trap vm "field index out of bounds"
                else recurse fields.(i)
            | Vm_value.Enum (_, fields) ->
-               let i = Ids.Field_index.to_int fid in
                if i < 0 || i >= Array.length fields then err_trap vm "enum field index out of bounds"
                else recurse fields.(i)
            | _ -> err_trap vm "field projection on non-aggregate")
@@ -187,6 +327,9 @@ and project_read (vm : t) (frame : frame) (base : Vm_value.t)
                else recurse elems.(i)
            | Vm_value.Tuple elems ->
                if i < 0 || i >= Array.length elems then err_trap vm "tuple index out of bounds"
+               else recurse elems.(i)
+           | Vm_value.Struct elems ->
+               if i < 0 || i >= Array.length elems then err_trap vm "struct index out of bounds"
                else recurse elems.(i)
            | Vm_value.String str ->
                if i < 0 || i >= String.length str then err_trap vm "string index out of bounds"
@@ -205,9 +348,19 @@ and project_read (vm : t) (frame : frame) (base : Vm_value.t)
                if i < 0 || i >= String.length str then err_trap vm "string index out of bounds"
                else recurse (Vm_value.Char (Uchar.of_char str.[i]))
            | _ -> err_trap vm "index projection on non-array")
-       | Seed_mir.Downcast _ -> (
+       | Seed_mir.Downcast vid -> (
+           (* the semantic id resolves to the declaration-order tag
+              through the owner enum def; the runtime tag must equal it
+              (a wrong-tag downcast is an invariant failure) *)
+           let expect = variant_index_of vm base_ty vid in
            match base with
-           | Vm_value.Enum (_, fields) -> recurse (Vm_value.Struct fields)
+           | Vm_value.Enum (tag, fields) ->
+               if tag <> expect then
+                 err_trap vm
+                   (Printf.sprintf
+                      "variant downcast: runtime tag %d does not match VariantId %d's declaration-order tag %d"
+                      tag (Ids.Variant_id.to_int vid) expect)
+               else recurse (Vm_value.Struct fields)
            | _ -> err_trap vm "downcast on non-enum")
        | Seed_mir.Deref -> (
            match base with
@@ -287,30 +440,31 @@ let rec write_place (vm : t) (frame : frame) (p : Seed_mir.place) (v : Vm_value.
         | Ok b -> b
         | Error e -> err_trap vm (Vm_value.slot_error_string e)
       in
-      let updated = update_place vm frame base projs v in
+      let base_ty = type_of_local vm frame.fn p.Seed_mir.local in
+      let updated = update_place vm frame base base_ty projs v in
       match Vm_value.write_slot frame.locals.(p.Seed_mir.local) updated with
       | Ok s -> frame.locals.(p.Seed_mir.local) <- s
       | Error e -> err_trap vm (Vm_value.slot_error_string e))
 
-and update_place (vm : t) (frame : frame) (base : Vm_value.t)
+and update_place (vm : t) (frame : frame) (base : Vm_value.t) (base_ty : Type_repr.t)
     (projs : Seed_mir.projection list) (v : Vm_value.t) : Vm_value.t =
   match projs with
   | [] -> v
   | proj :: rest -> (
+      let next_ty = proj_type_of vm base_ty proj in
       match proj with
       | Seed_mir.Field fid -> (
+          let i = field_index_of vm base_ty fid in
           match base with
           | Vm_value.Struct fields ->
-              let i = Ids.Field_index.to_int fid in
               if i < 0 || i >= Array.length fields then err_trap vm "field index out of bounds";
               let copy = Array.copy fields in
-              copy.(i) <- update_place vm frame fields.(i) rest v;
+              copy.(i) <- update_place vm frame fields.(i) next_ty rest v;
               Vm_value.Struct copy
           | Vm_value.Tuple fields ->
-              let i = Ids.Field_index.to_int fid in
               if i < 0 || i >= Array.length fields then err_trap vm "field index out of bounds";
               let copy = Array.copy fields in
-              copy.(i) <- update_place vm frame fields.(i) rest v;
+              copy.(i) <- update_place vm frame fields.(i) next_ty rest v;
               Vm_value.Tuple copy
           | _ -> err_trap vm "field write on non-aggregate")
       | Seed_mir.ConstantIndex i -> (
@@ -318,17 +472,22 @@ and update_place (vm : t) (frame : frame) (base : Vm_value.t)
           | Vm_value.Array elems ->
               if i < 0 || i >= Array.length elems then err_trap vm "index out of bounds";
               let copy = Array.copy elems in
-              copy.(i) <- update_place vm frame elems.(i) rest v;
+              copy.(i) <- update_place vm frame elems.(i) next_ty rest v;
               Vm_value.Array copy
           | Vm_value.Tuple elems ->
               if i < 0 || i >= Array.length elems then err_trap vm "tuple index out of bounds";
               let copy = Array.copy elems in
-              copy.(i) <- update_place vm frame elems.(i) rest v;
+              copy.(i) <- update_place vm frame elems.(i) next_ty rest v;
               Vm_value.Tuple copy
+          | Vm_value.Struct elems ->
+              if i < 0 || i >= Array.length elems then err_trap vm "struct index out of bounds";
+              let copy = Array.copy elems in
+              copy.(i) <- update_place vm frame elems.(i) next_ty rest v;
+              Vm_value.Struct copy
           | Vm_value.String str ->
               if i < 0 || i >= String.length str then err_trap vm "string index out of bounds";
               let c =
-                match update_place vm frame (Vm_value.Char (Uchar.of_char str.[i])) rest v with
+                match update_place vm frame (Vm_value.Char (Uchar.of_char str.[i])) next_ty rest v with
                 | Vm_value.Char c -> c
                 | _ -> err_trap vm "string index write with non-char value"
               in
@@ -340,17 +499,17 @@ and update_place (vm : t) (frame : frame) (base : Vm_value.t)
           | Vm_value.Array elems ->
               if i < 0 || i >= Array.length elems then err_trap vm "index out of bounds";
               let copy = Array.copy elems in
-              copy.(i) <- update_place vm frame elems.(i) rest v;
+              copy.(i) <- update_place vm frame elems.(i) next_ty rest v;
               Vm_value.Array copy
           | Vm_value.Tuple elems ->
               if i < 0 || i >= Array.length elems then err_trap vm "tuple index out of bounds";
               let copy = Array.copy elems in
-              copy.(i) <- update_place vm frame elems.(i) rest v;
+              copy.(i) <- update_place vm frame elems.(i) next_ty rest v;
               Vm_value.Tuple copy
           | Vm_value.String str ->
               if i < 0 || i >= String.length str then err_trap vm "string index out of bounds";
               let c =
-                match update_place vm frame (Vm_value.Char (Uchar.of_char str.[i])) rest v with
+                match update_place vm frame (Vm_value.Char (Uchar.of_char str.[i])) next_ty rest v with
                 | Vm_value.Char c -> c
                 | _ -> err_trap vm "string index write with non-char value"
               in
@@ -375,7 +534,7 @@ and update_place (vm : t) (frame : frame) (base : Vm_value.t)
               | _ ->
                   (* projected write through the pointee: load, update, store *)
                   let cur = memory_load vm ptr in
-                  memory_store vm ptr (update_place vm frame cur rest v));
+                  memory_store vm ptr (update_place vm frame cur next_ty rest v));
               base
           | _ -> err_trap vm "deref write on non-pointer"))
 
@@ -410,12 +569,6 @@ and uchar_utf8_encode (c : Uchar.t) : string =
         | 1 -> Char.chr (0x80 lor ((cp lsr 12) land 0x3F))
         | 2 -> Char.chr (0x80 lor ((cp lsr 6) land 0x3F))
         | _ -> Char.chr (0x80 lor (cp land 0x3F)))
-
-let type_of_local (vm : t) (fn_idx : int) (local : int) : Type_repr.t =
-  let fn = vm.program.Seed_mir.functions.(fn_idx) in
-  if local < 0 || local >= Array.length fn.Seed_mir.locals then
-    err_trap vm (Printf.sprintf "local _%d out of range" local)
-  else fn.Seed_mir.locals.(local)
 
 (* A needs_drop value requires a Drop terminator; the verifier has already
    checked the plan.  The drop is RECURSIVE: the value's contained

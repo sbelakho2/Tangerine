@@ -181,6 +181,52 @@ let lowering_env_of (env : Typecheck.env) : Mir_lower.func_env =
     fn_ret = Type_repr.Unit;
   }
 
+(* ── User-enum variant table (re-audit finding: the closure driver never
+      fed lowering the typechecker's enum/VariantId universe) ─────────
+
+   mir_lower's variant_table (vt_enums: enum name -> variant name ->
+   {vs_index; vs_fields}; vt_ctors: bare ctor name -> (enum name,
+   variant name)) is built HERE from the TYPED nominal registry — the
+   same semantic registry closure_types reads for the EnumDefs — never
+   from re-parsing the AST.  Only concrete (non-generic) enums are
+   tabled: generic payloads are deferred to post-mono, and the builtin
+   Option/Result stay on mir_lower's hardcoded fallback (their fields
+   derive from the enum's type arguments at each use site).  The
+   declaration-order vs_index is exactly the EnumDef variant position,
+   so construction sites (EnumCtor tags), match arms (SwitchInt
+   targets) and the typed EnumDefs (semantic VariantIds from
+   nom_variant_ids) agree.  The nominal is validated against its
+   semantic variant-id registry (fail closed on a length mismatch). *)
+let user_variant_table (env : Typecheck.env) : Mir_lower.variant_table =
+  let enums =
+    List.filter_map
+      (fun (name, nom : string * Typecheck.nominal) ->
+        match nom.Typecheck.nom_kind with
+        | `Struct -> None
+        | `Enum ->
+            if nom.Typecheck.nom_params <> [] then None
+            else begin
+              let nvar = List.length nom.Typecheck.nom_variants in
+              if List.length nom.Typecheck.nom_variant_ids <> nvar then
+                die "enum `%s`: %d variants but %d semantic VariantIds" name nvar
+                  (List.length nom.Typecheck.nom_variant_ids);
+              Some
+                ( name,
+                  List.mapi
+                    (fun i (vname, pty) ->
+                      (vname, { Mir_lower.vs_index = i; vs_fields = Array.to_list pty }))
+                    nom.Typecheck.nom_variants )
+            end)
+      env.Typecheck.nominals
+  in
+  let ctors =
+    List.concat_map
+      (fun (ename, specs) ->
+        List.map (fun (vname, _) -> (vname, (ename, vname))) specs)
+      enums
+  in
+  { Mir_lower.vt_enums = enums; vt_ctors = ctors }
+
 let lower_and_report (path : string) (env : Typecheck.env) (program : Ast.program) : int =
   let module_path = Parser.module_path_of_file path in
   let funcs =
@@ -213,7 +259,7 @@ let lower_and_report (path : string) (env : Typecheck.env) (program : Ast.progra
               Array.map (fun p -> p.Type_repr.pt_convention) ts.Typecheck.ts_params
           | None -> [||]
         in
-        Mir_lower.lower_function_with_variants Mir_lower.default_variant_table
+        Mir_lower.lower_function_with_variants (user_variant_table env)
           { base with Mir_lower.fn_ret }
           d.Ast.fn_sig.Ast.sig_name callable template_args conventions d)
       funcs
@@ -335,8 +381,9 @@ let cmd_interpret (args : string list) : int =
                       | Some ts -> (ts.Typecheck.ts_return, Ids.Callable_id.to_int ts.Typecheck.ts_callable)
                       | None -> (Type_repr.Unit, i)
                     in
-                    Mir_lower.lower_function { base with Mir_lower.fn_ret }
-                      d.Ast.fn_sig.Ast.sig_name callable d)
+                    Mir_lower.lower_function_with_variants (user_variant_table env)
+                      { base with Mir_lower.fn_ret }
+                      d.Ast.fn_sig.Ast.sig_name callable [||] [||] d)
                   funcs
               in
               let prog =
@@ -941,6 +988,7 @@ let closure_statics (env : Typecheck.env) : (string * Type_repr.t * Seed_mir.con
 
 let lower_closure (ctx : closure_ctx) : Seed_mir.program =
   let base = lowering_env_of ctx.ctx_env in
+  let variants = user_variant_table ctx.ctx_env in
   let mir_funcs = ref [] in
   let lowered_methods = ref 0 in
   List.iter
@@ -958,8 +1006,9 @@ let lower_closure (ctx : closure_ctx) : Seed_mir.program =
             | None -> (Type_repr.Unit, 0)
           in
           let f =
-            Mir_lower.lower_function { base with Mir_lower.fn_ret }
-              fd.Ast.fn_sig.Ast.sig_name callable fd
+            Mir_lower.lower_function_with_variants variants
+              { base with Mir_lower.fn_ret }
+              fd.Ast.fn_sig.Ast.sig_name callable [||] [||] fd
           in
           mir_funcs := f :: !mir_funcs)
         funcs;
@@ -979,7 +1028,7 @@ let lower_closure (ctx : closure_ctx) : Seed_mir.program =
                   | Some ts ->
                       let f =
                         Mir_lower.lower_function_with_variants
-                          Mir_lower.default_variant_table
+                          variants
                           { base with Mir_lower.fn_ret = ts.Typecheck.ts_return }
                           m.Ast.fn_sig.Ast.sig_name
                           (Ids.Callable_id.to_int ts.Typecheck.ts_callable)
@@ -1221,6 +1270,62 @@ let count_residual_type_params (prog : Seed_mir.program) : int =
   Array.iter (fun d -> tp (Seed_mir.def_repr d)) prog.Seed_mir.types;
   !n
 
+(* ── Static reachable-host closure scan (re-audit: stage 10) ────────
+
+   The post-mono program's calls carry their callees as Seed_mir callee
+   forms.  The VM's host dispatch (Vm.call_host) converts
+   Seed_mir.Intrinsic i / Seed_mir.Extern i into
+   Host.Intrinsic (Intrinsic_registry.Id.make i) / Host.Extern
+   (Extern_registry.Id.make i) — the registry-index -> abstract-id
+   boundary.  A call in User form maps to a host symbol when the
+   callee's instance names one of the program's specialized functions
+   and that function's source name is a declared host symbol (extern-
+   declared functions reach Seed MIR as User callees; the host
+   registries are keyed by those same names, and the binding table
+   resolves ids from them).  This scan collects exactly the host ids
+   the program can dispatch to — the REACHABLE set. *)
+let collect_reachable_host_ids (prog : Seed_mir.program) : Host.host_id list =
+  let module IdSet = Set.Make (struct type t = Host.host_id let compare = compare end) in
+  let acc = ref IdSet.empty in
+  let add (id : Host.host_id) = acc := IdSet.add id !acc in
+  (* User callee -> host symbol: the callee instance's callable names
+     one of the specialized functions; a function whose name is a
+     declared host symbol is a host call in User form. *)
+  let fn_by_callable = Hashtbl.create 64 in
+  Array.iter
+    (fun (f : Seed_mir.function_) ->
+      Hashtbl.replace fn_by_callable
+        (Ids.Callable_id.to_int (Instance_id.callable f.Seed_mir.instance))
+        f.Seed_mir.name)
+    prog.Seed_mir.functions;
+  let resolve_user (inst : Instance_id.t) =
+    match
+      Hashtbl.find_opt fn_by_callable (Ids.Callable_id.to_int (Instance_id.callable inst))
+    with
+    | None -> ()
+    | Some name -> (
+        match Intrinsic_registry.lookup Intrinsic_registry.manifest ~name with
+        | Some (iid, _) -> add (Host.Intrinsic iid)
+        | None -> (
+            match Extern_registry.lookup Extern_registry.manifest ~name with
+            | Some (eid, _) -> add (Host.Extern eid)
+            | None -> ()))
+  in
+  Array.iter
+    (fun (f : Seed_mir.function_) ->
+      Array.iter
+        (fun (b : Seed_mir.block) ->
+          match b.Seed_mir.terminator with
+          | Seed_mir.Call (_, callee, _, _, _) -> (
+              match callee with
+              | Seed_mir.Intrinsic i -> add (Host.Intrinsic (Intrinsic_registry.Id.make i))
+              | Seed_mir.Extern i -> add (Host.Extern (Extern_registry.Id.make i))
+              | Seed_mir.User inst -> resolve_user inst)
+          | _ -> ())
+        f.Seed_mir.blocks)
+    prog.Seed_mir.functions;
+  IdSet.elements !acc
+
 type mono_outcome = {
   mo_program : Seed_mir.program;
   mo_entry : Instance_id.t;
@@ -1370,6 +1475,27 @@ let report_access_resource_pass (ctx : closure_ctx) : unit =
 
 (* ── bootstrap-check (audit §51) ───────────────────────────────── *)
 
+(* The artifact path the kernel derives from its own argv: the -o/
+   --output value, else the input file minus .tg. *)
+let kernel_output_path (kernel_args : string list) : string option =
+  let rec go = function
+    | "-o" :: v :: _ | "--output" :: v :: _ -> Some v
+    | _ :: rest -> go rest
+    | [] -> None
+  in
+  match go kernel_args with
+  | Some p -> Some p
+  | None -> (
+      match kernel_args with
+      | file :: _ when not (String.length file >= 1 && file.[0] = '-') ->
+          if Filename.check_suffix file ".tg" then Some (Filename.chop_suffix file ".tg")
+          else Some file
+      | _ -> None)
+
+let artifact_exists ~(repo_root : string) (path : string) : bool =
+  if Filename.is_relative path then Sys.file_exists (Filename.concat repo_root path)
+  else Sys.file_exists path
+
 let cmd_bootstrap_check (args : string list) : int =
   let opts, positional = parse_options boot_specs default_boot_opts args in
   if positional <> [] then die "unexpected positional arguments to bootstrap-check";
@@ -1434,9 +1560,94 @@ let cmd_bootstrap_check (args : string list) : int =
                          1
                        end
                        else begin
-                         Printf.printf "  BOOTSTRAP_EXECUTABLE_CLOSURE = PASS\n";
-                         Printf.printf "  RESULT = PASS\n";
-                         0
+                         (* ── post-mono host section (stage 10) ─────────
+                            The STATIC reachable-host closure proof FIRST,
+                            then the dynamic VM evidence: every host id the
+                            mono'd program can dispatch to must carry an
+                            executable binding with the exact typed
+                            signature before any host call executes (the
+                            re-audit's strongest-solution order).  The VM
+                            compiler invocation is dynamic evidence ON TOP
+                            of the static proof. *)
+                         let kernel_args =
+                           [ "compile"; "tests/differential/corpus/01_defs_arith.tg"; "-o";
+                             "bootstrap_check.out" ]
+                         in
+                         let argv = Array.of_list ("tg-bootstrap" :: kernel_args) in
+                         let host = Host.create ~repo_root:opts.repo_root ~argv in
+                         let reachable = collect_reachable_host_ids mo.mo_program in
+                         let reachable_names =
+                           List.map
+                             (fun id ->
+                               match Host.name_of_host_id host id with
+                               | Some n -> n
+                               | None -> "?")
+                             reachable
+                         in
+                         (match Host.closure_check_reachable host reachable with
+                          | Error problems ->
+                              Printf.printf
+                                "  REACHABLE_HOST_CLOSURE = FAIL (%d reachable host id(s): %s)\n"
+                                (List.length reachable) (String.concat ", " reachable_names);
+                              List.iter (fun p -> Printf.printf "    %s\n" p) problems;
+                              Printf.printf "  BOOTSTRAP_EXECUTABLE_CLOSURE = INCOMPLETE\n";
+                              Printf.printf "  RESULT: FAIL\n";
+                              1
+                          | Ok report ->
+                              Printf.printf
+                                "  REACHABLE_HOST_CLOSURE = PASS (%d reachable host id(s) [%s], %d with executable bindings, all exact typed signatures)\n"
+                                report.Host.declared (String.concat ", " reachable_names)
+                                report.Host.implemented;
+                              Printf.printf "  BOOTSTRAP_EXECUTABLE_CLOSURE = PASS\n";
+                              (match
+                                 Vm.run ~program:mo.mo_program ~entry:mo.mo_entry ~argv ~host
+                               with
+                               | Error e ->
+                                   let out = Host.stdout_contents host in
+                                   if out <> "" then
+                                     Printf.printf "  kernel stdout:\n%s\n" out;
+                                   let err = Host.stderr_contents host in
+                                   if err <> "" then
+                                     Printf.printf "  kernel stderr:\n%s\n" err;
+                                   Printf.printf "  VM bootstrap run TRAPPED: %s\n"
+                                     e.Vm.message;
+                                   Printf.printf "  RESULT: FAIL\n";
+                                   1
+                               | Ok code ->
+                                   let out = Host.stdout_contents host in
+                                   if out <> "" then
+                                     Printf.printf "  kernel stdout:\n%s\n" out;
+                                   Printf.printf "  VM bootstrap run: exit %d\n" code;
+                                   if code <> 0 then begin
+                                     Printf.printf
+                                       "  VM bootstrap run: FAILED (nonzero exit from the kernel)\n";
+                                     Printf.printf "  RESULT: FAIL\n";
+                                     1
+                                   end
+                                   else
+                                     (match kernel_output_path kernel_args with
+                                     | None ->
+                                         Printf.printf
+                                           "  artifact: FAILED (no output path derivable from the kernel argv)\n";
+                                         Printf.printf "  RESULT: FAIL\n";
+                                         1
+                                     | Some out_path ->
+                                         if
+                                           not
+                                             (artifact_exists ~repo_root:opts.repo_root
+                                                out_path)
+                                         then begin
+                                           Printf.printf
+                                             "  artifact: FAILED (VM exited 0 but produced no artifact at %s)\n"
+                                             out_path;
+                                           Printf.printf "  RESULT: FAIL\n";
+                                           1
+                                         end
+                                         else begin
+                                           Printf.printf "  artifact produced: %s\n" out_path;
+                                           Printf.printf "  RESULT = PASS\n";
+                                           0
+                                         end)))
                        end)))
       end)
 
@@ -1444,27 +1655,6 @@ let cmd_bootstrap_check (args : string list) : int =
 
 let take_first (n : int) (l : 'a list) : 'a list =
   List.rev (snd (List.fold_left (fun (i, acc) x -> if i < n then (i + 1, x :: acc) else (i, acc)) (0, []) l))
-
-(* The artifact path the kernel derives from its own argv: the -o/
-   --output value, else the input file minus .tg. *)
-let kernel_output_path (kernel_args : string list) : string option =
-  let rec go = function
-    | "-o" :: v :: _ | "--output" :: v :: _ -> Some v
-    | _ :: rest -> go rest
-    | [] -> None
-  in
-  match go kernel_args with
-  | Some p -> Some p
-  | None -> (
-      match kernel_args with
-      | file :: _ when not (String.length file >= 1 && file.[0] = '-') ->
-          if Filename.check_suffix file ".tg" then Some (Filename.chop_suffix file ".tg")
-          else Some file
-      | _ -> None)
-
-let artifact_exists ~(repo_root : string) (path : string) : bool =
-  if Filename.is_relative path then Sys.file_exists (Filename.concat repo_root path)
-  else Sys.file_exists path
 
 let cmd_compile (args : string list) : int =
   let opts, positional = parse_options boot_specs default_boot_opts args in
