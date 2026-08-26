@@ -1924,10 +1924,27 @@ and parse_postfix (p : parser) : Ast.expr =
                  expected p "field name after '.'";
                  loop ()))
     | Token.LParen ->
-        let start = cur_span p in
-        let args = parse_call_args p in
-        e := Ast.Call (!e, [], args, span_end p start);
-        loop ()
+        (* a `(` at the start of a new line after a statement-form
+           expression begins a NEW statement (a parenthesized value), not
+           a call application: `if ... end` followed by `()` parses as
+           two statements (the statement-boundary semantics) *)
+        let statement_form e =
+          match e with
+          | Ast.WhileExpr _ | Ast.ForExpr _ | Ast.LoopExpr _ | Ast.MatchExpr _
+          | Ast.IfExpr _ | Ast.Block _ | Ast.UnsafeBlock _ | Ast.NextExpr _
+          | Ast.BreakExpr _ | Ast.ReturnExpr _ | Ast.Assign _
+          | Ast.CompoundAssign _ ->
+              true
+          | _ -> false
+        in
+        if statement_form !e && source_has_newline p (Ast.expr_span !e) (cur_span p)
+        then ()
+        else begin
+          let start = cur_span p in
+          let args = parse_call_args p in
+          e := Ast.Call (!e, [], args, span_end p start);
+          loop ()
+        end
     | Token.LBracket ->
         let start = cur_span p in
         ignore (advance p);
