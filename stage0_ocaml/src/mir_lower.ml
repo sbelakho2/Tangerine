@@ -1377,7 +1377,8 @@ and emit_defers (env : func_env) (st : lower_state) : unit =
 
 (* ── Function lowering ────────────────────────────────────────── *)
 
-let lower_function_with_variants (variants : variant_table) (env : func_env) (name : string)
+let lower_function_with_variants ?(param_tys_opt : Type_repr.t array option) (variants : variant_table)
+    (env : func_env) (name : string)
     (callable : int) (template_args : Type_repr.t array)
     (param_conventions : Access_effect.t array) (fn : Ast.function_decl) : Seed_mir.function_ =
   let st =
@@ -1401,9 +1402,12 @@ let lower_function_with_variants (variants : variant_table) (env : func_env) (na
   ignore (fresh_local st ret_ty);
   (* params *)
   let param_tys =
-    List.map
-      (fun (p : Ast.param) -> type_of_syntax env p.Ast.p_type)
-      fn.Ast.fn_sig.Ast.sig_params
+    match param_tys_opt with
+    | Some tys -> Array.to_list tys
+    | None ->
+        List.map
+          (fun (p : Ast.param) -> type_of_syntax env p.Ast.p_type)
+          fn.Ast.fn_sig.Ast.sig_params
   in
   let param_ids =
     List.map

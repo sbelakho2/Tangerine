@@ -626,6 +626,7 @@ type closure_ctx = {
   ctx_items : int;
   ctx_typed_calls_sample : int;
   ctx_rounds : int;
+  mutable lowered_methods : int;
 }
 
 let run_closure_pipeline ~(repo_root : string) ~(manifest_path : string) ~(target : Target.t) :
@@ -755,7 +756,8 @@ let run_closure_pipeline ~(repo_root : string) ~(manifest_path : string) ~(targe
             ctx_type_errors = type_errors;
             ctx_items = !items;
             ctx_typed_calls_sample = !typed_calls;
-            ctx_rounds = 2 }
+            ctx_rounds = 2;
+            lowered_methods = 0 }
       end)
 
 (* Lower every top-level free function of the closure into one Seed MIR
@@ -836,6 +838,7 @@ let closure_statics (env : Typecheck.env) : (string * Type_repr.t * Seed_mir.con
 let lower_closure (ctx : closure_ctx) : Seed_mir.program =
   let base = lowering_env_of ctx.ctx_env in
   let mir_funcs = ref [] in
+  let lowered_methods = ref 0 in
   List.iter
     (fun node ->
       let funcs =
@@ -855,8 +858,42 @@ let lower_closure (ctx : closure_ctx) : Seed_mir.program =
               fd.Ast.fn_sig.Ast.sig_name callable fd
           in
           mir_funcs := f :: !mir_funcs)
-        funcs)
+        funcs;
+      (* methods: every callable in the typed universe reaches Seed MIR —
+         the impl methods lower with their typed signatures (the audit's
+         no-second-AST-scan invariant) *)
+      List.iter
+        (fun i ->
+          match i.Ast.kind with
+          | Ast.ImplBlock d -> (
+              List.iter
+                (fun (m : Ast.function_decl) ->
+                  match
+                    List.assoc_opt (d.Ast.i_target_type, m.Ast.fn_sig.Ast.sig_name)
+                      ctx.ctx_env.Typecheck.methods
+                  with
+                  | Some ts ->
+                      let f =
+                        Mir_lower.lower_function_with_variants
+                          Mir_lower.default_variant_table
+                          { base with Mir_lower.fn_ret = ts.Typecheck.ts_return }
+                          m.Ast.fn_sig.Ast.sig_name
+                          (Ids.Callable_id.to_int ts.Typecheck.ts_callable)
+                          (Array.of_list
+                             (List.map (fun (_, pid) -> Type_repr.Type_param pid)
+                                ts.Typecheck.ts_params_decl))
+                          (Array.map (fun p -> p.Type_repr.pt_convention) ts.Typecheck.ts_params)
+                          ~param_tys_opt:(Array.map (fun p -> p.Type_repr.pt_type) ts.Typecheck.ts_params)
+                          m
+                      in
+                      mir_funcs := f :: !mir_funcs;
+                      incr lowered_methods
+                  | None -> ())
+                d.Ast.i_methods)
+          | _ -> ())
+        node.Module_graph.node_items)
     ctx.ctx_graph.Module_graph.nodes;
+  ctx.lowered_methods <- !lowered_methods;
   {
     Seed_mir.functions = Array.of_list (List.rev !mir_funcs);
     statics = closure_statics ctx.ctx_env;
@@ -955,6 +992,7 @@ type oracle_counts = {
   oc_typed_nominals : int;
   oc_typed_calls : int;
   oc_mir_functions : int;
+  oc_mir_methods : int;
   oc_mir_statics : int;
   oc_mir_types : int;
   oc_mir_calls : int;
@@ -975,7 +1013,7 @@ let print_oracle_rows (o : oracle_counts) : bool =
       (if ok then "" else skipped_note)
   in
   row "typed reachable functions" o.oc_typed_functions o.oc_mir_functions;
-  row "typed methods" o.oc_typed_methods 0;
+  row "typed methods" o.oc_typed_methods o.oc_mir_methods;
   row "required static definitions" o.oc_typed_consts o.oc_mir_statics;
   row "required concrete nominal type defs" o.oc_typed_nominals o.oc_mir_types;
   row "typed calls" o.oc_typed_calls o.oc_mir_calls;
@@ -1145,6 +1183,7 @@ let oracle_of_ctx (ctx : closure_ctx) (stats : mir_stats option) : oracle_counts
     oc_typed_nominals = List.length ctx.ctx_env.Typecheck.nominals;
     oc_typed_calls = ctx.ctx_typed_calls_sample;
     oc_mir_functions = s.ms_functions;
+    oc_mir_methods = ctx.lowered_methods;
     oc_mir_statics = s.ms_statics;
     oc_mir_types = s.ms_types;
     oc_mir_calls = s.ms_calls;
