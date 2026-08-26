@@ -912,6 +912,14 @@ let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
             ("self", Access_effect.Let, Type_repr.Named (b_option, [| Type_repr.Type_param opt_p2 |]));
           ]
         ~ret:Type_repr.String ~where:[];
+      (* Ptr::offset (std::env's get_env pointer walking) *)
+      mk_sig st ~name:"Ptr::offset" ~params_decl:[ ("T", ptr_p2) ]
+        ~params:
+          [
+            ("self", Access_effect.Let, Type_repr.Named (b_ptr, [| Type_repr.Type_param ptr_p2 |]));
+            ("count", Access_effect.Let, Type_repr.Int Type_repr.Int);
+          ]
+        ~ret:(Type_repr.Named (b_ptr, [| Type_repr.Type_param ptr_p2 |])) ~where:[];
       (* Ptr::as_ref (WeakRc/ContextError bodies) *)
       mk_sig st ~name:"Ptr::as_ref" ~params_decl:[ ("T", ptr_p2) ]
         ~params:[ ("self", Access_effect.Let, Type_repr.Named (b_ptr, [| Type_repr.Type_param ptr_p2 |])) ]
@@ -2137,6 +2145,10 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
               | Type_repr.Named (id, [| t |])
                 when Ids.Type_id.compare id b_ptr = 0 || Ids.Type_id.compare id b_ptrmut = 0 ->
                   Ok { te_type = t; te_effects = Array.append te.te_effects [| Access_effect.Read |]; te_span = span }
+              | Type_repr.Type_param _ ->
+                  (* a generic pointer: the pointee is the parameter
+                     itself until the instantiation resolves *)
+                  Ok { te_type = te.te_type; te_effects = Array.append te.te_effects [| Access_effect.Read |]; te_span = span }
               | _ ->
                   Error
                     (err span (Printf.sprintf "cannot dereference %s" (type_to_string te.te_type))))
@@ -2619,7 +2631,17 @@ and check_binary (subst : (Type_repr.generic_key * Type_repr.t) list ref) (op : 
       | Type_repr.Int _, Type_repr.Int _ -> Ok lt
       | Type_repr.Float _, Type_repr.Float _ -> Ok lt
       | (Type_repr.Int_literal _ | Type_repr.Int _), (Type_repr.Int_literal _ | Type_repr.Int _) ->
-          Ok (Type_repr.Int Type_repr.Int)
+          (* the arithmetic result carries the concrete operand's kind
+             (UInt + 1 is UInt); the literal adopts the other side *)
+          let k =
+            match lt with
+            | Type_repr.Int k -> k
+            | _ -> (
+                match rt with
+                | Type_repr.Int k -> k
+                | _ -> Type_repr.Int)
+          in
+          Ok (Type_repr.Int k)
       | Type_repr.String, Type_repr.String when op = Ast.Add -> Ok Type_repr.String
       | _ ->
           Error
