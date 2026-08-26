@@ -56,9 +56,9 @@ let baseline_typecheck_debt : Debt_report.t =
         ("duplicate_decl", 0);
         ("other", 20);
       ];
-    total = 6;
-    primaries = 5;
-    secondaries = 1;
+    total = 271;
+    primaries = 195;
+    secondaries = 76;
   }
 
 let fail fmt = Printf.ksprintf (fun s -> Printf.printf "BOOTSTRAP GATE: FAIL: %s\n" s; exit 1) fmt
