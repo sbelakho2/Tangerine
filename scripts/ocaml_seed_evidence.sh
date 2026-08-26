@@ -10,9 +10,12 @@
 #     bootstrap/evidence/ocaml/<short-sha>_<unix-time>.json
 #
 #   containing:
-#     git_commit            exact `git rev-parse HEAD`
-#     git_dirty             false on a clean tree; true otherwise
-#     git_dirty_stat        `git diff --stat` summary when dirty
+#     git_commit            exact `git rev-parse HEAD` of the CLEAN tree
+#     git_dirty             ALWAYS false — the generator FAILS on a dirty
+#                           tree (re-audit finding 1: an exact-SHA record
+#                           is only produced from a clean checkout; a
+#                           dirty tree aborts before anything is recorded)
+#     git_dirty_stat        always empty (no dirty-tree record exists)
 #     manifest_file_sha256  SHA-256 of bootstrap/compiler_kernel.manifest
 #     manifest_fingerprint  the pipeline's canonical manifest fingerprint
 #                           (the same value the driver prints)
@@ -35,11 +38,26 @@
 #     evidence              the deterministic tg_evidence phase lines
 #                           (incl. declaration_fixpoint_iterations /
 #                           body_passes, parsed into bootstrap_check)
+#     diagnostics           ocaml-diagnostics.jsonl next to the record
+#                           (re-audit finding 6): one JSON line per
+#                           bootstrap-check diagnostic — module, item,
+#                           category, message, span-file, span-start/end,
+#                           secondary flag — lines sorted
+#                           lexicographically; diagnostics.sha256 is the
+#                           sha256 over the sorted lines (deterministic),
+#                           diagnostics.count the number of lines
 #     recorded_at_unix/iso  when the record was captured
 #
 #   The record IS the CI artifact for the exact tested SHA: publish
 #   bootstrap/evidence/ocaml/<short-sha>_<unix-time>.json from the CI
-#   job that tested that SHA.
+#   job that tested that SHA.  Do not commit the record afterward (the
+#   audit's evidence model — the record names the SHA it tested).
+#
+# CLEAN-TREE POLICY (re-audit finding 1)
+#   Exact-SHA evidence requires a clean checkout of the tested commit:
+#   `git status --porcelain` must be empty or the script FAILS before
+#   building or recording anything.  A record with git_dirty=true can
+#   never be produced.
 #
 # STALE-FILE POLICY
 #   bootstrap/evidence/ocaml/ holds ONLY exact-HEAD records of the
@@ -52,13 +70,15 @@
 #   scripts/ocaml_seed_evidence.sh
 #
 # Behavior: (a) verifies the locked OCaml/Dune toolchain via
-# scripts/check_ocaml_toolchain.sh; (b) builds the seed with `dune build`
-# (a failing build aborts before any record is written — no record for a
-# tree that does not compile); (c) captures git identity, all hashes,
-# the test suite result, every selfcheck verdict, the bootstrap-check
-# gate output and the tg_evidence phase lines; (d) writes the JSON
-# record; (e) moves stale non-schema files to history/; (f) prints the
-# record to stdout.
+# scripts/check_ocaml_toolchain.sh and FAILS if the working tree is
+# dirty (exact-SHA evidence requires a clean checkout of the tested
+# commit); (b) builds the seed with `dune build` (a failing build aborts
+# before any record is written — no record for a tree that does not
+# compile); (c) captures git identity, all hashes, the test suite
+# result, every selfcheck verdict, the bootstrap-check gate output and
+# the tg_evidence phase lines; (d) writes the JSON record and the
+# ocaml-diagnostics.jsonl artifact; (e) moves stale non-schema files to
+# history/; (f) prints the record to stdout.
 
 set -euo pipefail
 
@@ -77,20 +97,24 @@ sha256_of() { shasum -a 256 "$1" | awk '{print $1}'; }
 # (bootstrap/ocaml-toolchain.lock) are not installed.
 "$ROOT_DIR/scripts/check_ocaml_toolchain.sh"
 
+# (a') Exact-SHA evidence model (re-audit finding 1): the tree MUST be
+# clean.  A dirty tree cannot produce an exact-HEAD record — fail before
+# building or recording anything instead of emitting git_dirty=true.
+if [ -n "$(git -C "$ROOT_DIR" status --porcelain)" ]; then
+  echo "ocaml_seed_evidence: FAIL — the working tree is NOT clean; exact-SHA evidence requires a clean checkout of the tested commit" >&2
+  git -C "$ROOT_DIR" status --porcelain >&2
+  exit 1
+fi
+
 # (b) Build the seed. The tree treats warnings as errors, so a clean
 # build is also the compile gate; a broken tree never records evidence.
 (cd "$STAGE_DIR" && dune build)
 
-# (c) Gather the exact-HEAD identity.
+# (c) Gather the exact-HEAD identity of the clean tree.
 GIT_COMMIT="$(git -C "$ROOT_DIR" rev-parse HEAD)"
 GIT_SHORT="$(git -C "$ROOT_DIR" rev-parse --short HEAD)"
-if git -C "$ROOT_DIR" status --porcelain | grep -q .; then
-  GIT_DIRTY=true
-  GIT_DIRTY_STAT="$(git -C "$ROOT_DIR" diff --stat)"
-else
-  GIT_DIRTY=false
-  GIT_DIRTY_STAT=""
-fi
+GIT_DIRTY=false
+GIT_DIRTY_STAT=""
 
 # Manifest and toolchain-lock hashes.
 MANIFEST_SHA="$(sha256_of "$MANIFEST")"
@@ -161,6 +185,7 @@ printf '%s' "$TESTS_FAILED" > "$WORK_DIR/tests_failed"
 printf '%s' "$BC_RC" > "$WORK_DIR/bc_rc"
 printf '%s' "$RECORD_TIME" > "$WORK_DIR/record_time"
 python3 - "$WORK_DIR" "$RECORD_FILE" <<'PYEOF'
+import hashlib
 import json
 import os
 import re
@@ -232,6 +257,113 @@ typecheck_m = list(re.finditer(
     r"typecheck: (\d+) modules, (\d+) items, (\d+) errors \((\d+) rounds\)", bc_out))
 typecheck_groups = typecheck_m[-1].groups() if typecheck_m else ("", "", "", "")
 
+# ocaml-diagnostics.jsonl (re-audit finding 6): every per-item
+# bootstrap-check line — "<module>: [secondary] <item>: <message> at
+# file#<id>[<start>..<end>)" (the driver emits the "[secondary] "
+# prefix before the item name) — becomes one JSON line with module,
+# item, category (Debt_report.classify ported 1:1 from
+# src/debt_report.ml, in pattern order), the full message, the span
+# file id and byte offsets, and the secondary flag.  Lines are written
+# lexicographically sorted so the content is canonical; the hash is
+# sha256 over exactly those sorted lines (deterministic).
+DEBT_PATTERNS = [
+    ("cannot infer", "cannot_infer_generic"),
+    ("Type_param(s) in concrete execution position", "cannot_infer_generic"),
+    ("unsolved type variable", "cannot_infer_generic"),
+    ("type parameters do not take arguments", "cannot_infer_generic"),
+    ("too many type arguments", "cannot_infer_generic"),
+    ("type parameter `", "cannot_infer_generic"),
+    ("unknown type `", "unresolved_type"),
+    ("unknown nominal type `", "unresolved_type"),
+    ("unknown trait `", "unresolved_type"),
+    ("unknown field `", "unresolved_type"),
+    ("unknown variant `", "unresolved_type"),
+    ("unknown identity", "unresolved_type"),
+    ("Self is only available", "unresolved_type"),
+    ("does not take arguments", "unresolved_type"),
+    ("associated type `", "unresolved_type"),
+    ("trait-object types", "unresolved_type"),
+    ("FieldId", "unresolved_type"),
+    ("VariantId", "unresolved_type"),
+    ("unknown function `", "unresolved_callable"),
+    ("unknown name `", "unresolved_callable"),
+    ("unknown variable `", "unresolved_callable"),
+    ("has no method `", "unresolved_callable"),
+    ("cannot call a value of type ", "unresolved_callable"),
+    ("too many arguments", "unresolved_callable"),
+    ("too few arguments", "unresolved_callable"),
+    ("is a function; call it with arguments", "unresolved_callable"),
+    ("DefId", "unresolved_callable"),
+    ("unresolved call", "unresolved_callable"),
+    ("missing argument access effects", "unresolved_callable"),
+    ("not a module", "unresolved_module"),
+    ("type mismatch", "type_mismatch"),
+    ("cannot cast ", "type_mismatch"),
+    ("cannot index ", "type_mismatch"),
+    ("cannot iterate ", "type_mismatch"),
+    ("cannot dereference ", "type_mismatch"),
+    ("cannot project ", "type_mismatch"),
+    ("operator requires matching numeric operands", "type_mismatch"),
+    ("bitwise operator requires integer operands", "type_mismatch"),
+    ("unary minus requires a number", "type_mismatch"),
+    ("requires Bool", "type_mismatch"),
+    ("requires an integer", "type_mismatch"),
+    ("requires an Option or Result", "type_mismatch"),
+    ("tuple pattern requires a tuple type", "type_mismatch"),
+    ("tuple pattern arity mismatch", "type_mismatch"),
+    ("tuple index ", "type_mismatch"),
+    ("or-pattern alternatives bind different types", "type_mismatch"),
+    ("range pattern ", "type_mismatch"),
+    ("is not a struct", "type_mismatch"),
+    ("is not an enum", "type_mismatch"),
+    ("is not a nominal type", "type_mismatch"),
+    ("type argument(s)", "type_mismatch"),
+    (" field(s)", "type_mismatch"),
+    ("incompatible with the expected function type", "type_mismatch"),
+    ("recursive type", "type_mismatch"),
+    ("unsatisfied", "obligation"),
+    ("obligation", "obligation"),
+    ("trait contract", "obligation"),
+    ("duplicate ", "duplicate_decl"),
+]
+
+
+def classify(message):
+    for sub, cat in DEBT_PATTERNS:
+        if sub in message:
+            return cat
+    return "other"
+
+
+DIAG_RE = re.compile(
+    r"^(.+?): (\[secondary\] )?(.+?): (.+) at file#(\d+)\[(\d+)\.\.(\d+)\)$")
+diagnostics = []
+for raw in bc_out.splitlines():
+    m = DIAG_RE.match(raw.strip())
+    if not m:
+        continue
+    module, sec, item, message, fid, start, end = m.groups()
+    diagnostics.append({
+        "module": module,
+        "item": item,
+        "category": classify(message),
+        "message": message,
+        "span_file": int(fid),
+        "span_start": int(start),
+        "span_end": int(end),
+        "secondary": sec is not None,
+    })
+diagnostics.sort(
+    key=lambda d: json.dumps(d, sort_keys=True, separators=(",", ":")))
+diag_content = "\n".join(
+    json.dumps(d, sort_keys=True, separators=(",", ":")) for d in diagnostics)
+if diag_content:
+    diag_content += "\n"
+diag_sha = hashlib.sha256(diag_content.encode()).hexdigest()
+diag_path = record_file[:-5] + ".diagnostics.jsonl"
+with open(diag_path, "w") as f:
+    f.write(diag_content)
+
 record = {
     "schema_version": 3,
     "git_commit": rd("git_commit"),
@@ -274,6 +406,11 @@ record = {
     "evidence": [
         l for l in rd("evidence_lines").splitlines() if l.startswith("evidence ")
     ],
+    "diagnostics": {
+        "artifact": os.path.basename(diag_path),
+        "count": len(diagnostics),
+        "sha256": diag_sha,
+    },
     "recorded_at_unix": rd_int("record_time"),
     "record_file": os.path.basename(record_file),
 }
@@ -289,14 +426,17 @@ with open(record_file, "w") as f:
 PYEOF
 
 # (e) Stale-file policy: only exact-HEAD records of the current schema
-# stay in place; anything else moves to history/.
-python3 - "$EVIDENCE_DIR" "$HISTORY_DIR" "$GIT_COMMIT" "$RECORD_FILE" <<'PYEOF'
+# stay in place; anything else (including stale diagnostics artifacts)
+# moves to history/.
+DIAG_FILE="${RECORD_FILE%.json}.diagnostics.jsonl"
+python3 - "$EVIDENCE_DIR" "$HISTORY_DIR" "$GIT_COMMIT" "$RECORD_FILE" "$DIAG_FILE" <<'PYEOF'
 import json
 import os
 import shutil
 import sys
 
-evidence_dir, history_dir, head, fresh_record = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+evidence_dir, history_dir, head, fresh_record, fresh_diag = (
+    sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5])
 
 required_fields = [
     "git_commit",
@@ -328,7 +468,7 @@ for name in sorted(os.listdir(evidence_dir)):
     path = os.path.join(evidence_dir, name)
     if not os.path.isfile(path):
         continue
-    if os.path.abspath(path) == os.path.abspath(fresh_record):
+    if os.path.abspath(path) in (os.path.abspath(fresh_record), os.path.abspath(fresh_diag)):
         continue
     if is_current_record(path):
         continue
@@ -338,3 +478,5 @@ PYEOF
 # (f) Print the record.
 python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1])), indent=2))' "$RECORD_FILE"
 printf '\nrecord: %s\n' "$RECORD_FILE"
+printf 'diagnostics artifact: %s (sha256 %s)\n' "$DIAG_FILE" \
+  "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["diagnostics"]["sha256"])' "$RECORD_FILE")"

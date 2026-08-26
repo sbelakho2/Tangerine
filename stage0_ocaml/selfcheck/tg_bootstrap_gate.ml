@@ -19,30 +19,39 @@
          second MIR verify
     [10] reachable-host closure, VM run, artifact production
 
-   Typecheck-debt policy (audit P1 + re-audit no-regression finding):
-   NO-REGRESSION against a CHECKED baseline captured from a real
-   `tg_stage0.exe bootstrap-check` run on the checked tree (2026-08-26):
+   Typecheck-debt policy (audit P1 + re-audit findings 3/5): the debt
+   policy has ONE authority — this gate — running NO-REGRESSION against
+   a CHECKED baseline captured from a real `tg_stage0.exe
+   bootstrap-check` run on the checked tree (2026-08-26):
 
-     debt_total:    369
-     debt_primary:  258   (debt_secondary: 111)
-     per-category:  unresolved_type 84, unresolved_callable 33,
+     debt_total:    257
+     debt_primary:  181   (debt_secondary: 76)
+     per-category:  unresolved_type 14, unresolved_callable 32,
                     unresolved_module 0, cannot_infer_generic 9,
-                    type_mismatch 222, obligation 3, duplicate_decl 0,
+                    type_mismatch 180, obligation 4, duplicate_decl 0,
                     other 18
-     modules/items: 56 modules, 4496 items (2 rounds)
+     modules/items: 56 modules, 4496 items (4 measured declaration
+                    fixpoint passes — re-audit finding 2: closure_ctx
+                    carries !decl_rounds, not a hard-coded 2)
 
-   The gate fails (exit 1) when the total, the primary count, or ANY
-   category count is above its baseline — a scalar ceiling cannot mask a
-   redistribution (369 -> 800 -> 1500 would still be "below the pin" for
-   a 1,690 ceiling).  At or below the baseline, the semantic stages are
-   reported as deferred and the gate exits 0 ONLY because the debt is at
-   its checked baseline.  The day the count is 0, stages 6-10 run and
-   every one of them must succeed for the gate to print PASS. *)
+   The MONOTONIC gate fails (exit 1) exactly when a scalar rises:
+   total > baseline total, primary > baseline primary, or secondary >
+   baseline secondary — a scalar ceiling cannot mask a redistribution.
+   Per-category comparisons are a DIAGNOSTIC REPORT, not a hard fail: a
+   category may rise while the total falls (the audit's obligation 3 -> 4
+   inside a falling total), so an individual category increase is
+   printed as a redistribution note and never fails the gate by itself.
+   At or below the baseline, the semantic stages are reported as
+   deferred and the gate exits 0 ONLY because the debt is at its checked
+   baseline.  The day the count is 0, stages 6-10 run and every one of
+   them must succeed for the gate to print PASS. *)
 
 (* The checked baseline: Debt_report.t with the per-category buckets in
    Debt_report.categories order (the order of_errors emits), the total,
-   the primary count and the secondary count.  Any of these numbers
-   moving UP fails the gate; moving down is progress, not a regression. *)
+   the primary count and the secondary count.  The MONOTONIC scalars
+   moving UP fails the gate; moving down is progress, not a regression.
+   The per-category buckets are diagnostic context only (a category may
+   rise while the total falls — re-audit finding 5). *)
 let baseline_typecheck_debt : Debt_report.t =
   {
     Debt_report.buckets =
@@ -224,8 +233,13 @@ let run_and_report_access_resource (ctx : Driver.closure_ctx) : int =
     Printf.printf "    ... (%d more findings suppressed)\n" (List.length findings - 10);
   List.length findings
 
-(* The no-regression policy: total <= baseline total, primary <=
-   baseline primary, and NO category above its baseline bucket.  The
+(* The no-regression policy (re-audit finding 5): the MONOTONIC gate is
+   total <= baseline total, primary <= baseline primary, secondary <=
+   baseline secondary.  The per-category buckets are compared only for a
+   DIAGNOSTIC report — every category's baseline vs current is printed,
+   and a category that rose while the total fell is noted — because a
+   category may rise while the total falls (the audit's obligation 3 -> 4
+   example); no individual category increase is a gate failure.  The
    buckets are compared positionally (both sides are emitted in
    Debt_report.categories order); a bucket-length mismatch is an
    internal error. *)
@@ -247,21 +261,39 @@ let check_no_regression (measured : Debt_report.t) (baseline : Debt_report.t) : 
       :: !violations;
   (try
      List.iter2
-       (fun (c, n) (_, b) ->
-         if n > b then
-           violations := Printf.sprintf "%s %d > baseline %d" c n b :: !violations)
+       (fun _ _ -> ())
        measured.Debt_report.buckets baseline.Debt_report.buckets
    with Invalid_argument _ ->
      fail "debt bucket alignment: measured %d buckets, baseline %d"
        (List.length measured.Debt_report.buckets)
        (List.length baseline.Debt_report.buckets));
+  (* DIAGNOSTIC report: baseline vs current per category.  A category
+     that rose while the scalars held (or fell) is a redistribution
+     note, never a failure. *)
+  let rose =
+    List.filter_map
+      (fun ((c, n), (_, b)) -> if n > b then Some (c, n, b) else None)
+      (List.combine measured.Debt_report.buckets baseline.Debt_report.buckets)
+  in
+  Printf.printf "  debt categories (current vs checked baseline):\n";
+  List.iter2
+    (fun (c, n) (_, b) ->
+      let mark = if n > b then "  (above baseline — diagnostic note)" else "" in
+      Printf.printf "    %s: %d vs %d%s\n" c n b mark)
+    measured.Debt_report.buckets baseline.Debt_report.buckets;
+  if rose <> [] then
+    Printf.printf
+      "  NOTE: category redistribution (a category may rise while the total falls; \
+       the monotonic gate is total/primary/secondary only): %s\n"
+      (String.concat "; "
+         (List.map (fun (c, n, b) -> Printf.sprintf "%s %d -> %d" c b n) rose));
   match List.rev !violations with
   | [] -> ()
   | vs ->
       List.iter (fun v -> Printf.printf "  BOOTSTRAP GATE: debt regression: %s\n" v) vs;
       fail
-        "typecheck debt REGRESSED against the checked baseline — no category may increase, \
-         primary may not increase, total may not increase"
+        "typecheck debt REGRESSED against the checked baseline — total, primary or \
+         secondary increased"
 
 (* ── The gate ───────────────────────────────────────────────────── *)
 
@@ -307,7 +339,7 @@ let () =
    | Ok ctx ->
        let n_errs = List.length ctx.ctx_type_errors in
        Printf.printf "  typecheck: %d errors across %d modules / %d items (%d rounds)\n" n_errs
-         ctx.ctx_graph.Module_graph.node_count ctx.ctx_items ctx.ctx_rounds;
+         ctx.ctx_graph.Module_graph.node_count ctx.ctx_items ctx.ctx_decl_rounds;
        (* The measured debt is the pipeline's OWN accumulated accounting
           (Typecheck.state.debt_by_module — what record_module_debt
           prints block by block), not a re-classification of the driver's

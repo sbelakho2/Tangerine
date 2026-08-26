@@ -1,13 +1,21 @@
-(* subset.ml — Bootstrap-subset checker (E9001–E9036).
+(* subset.ml — Bootstrap-subset checker (E9001–E9049).
 
    Rejects constructs outside the stage0 bootstrap subset with the exact
    reference codes and messages.  The checker is the executable-subset
-   firewall (audit P1): constructs whose later semantics remain
-   approximate or absent are rejected up front with a clean diagnostic
-   instead of a deep Seed_bug at lowering.  Each rejection carries the
-   AST form it fires on; each one must be DELETED (with an executable
-   positive test added) once the corresponding semantic implementation
-   lands. *)
+   firewall (audit P1 + re-audit): constructs whose later semantics
+   remain approximate or absent are rejected up front with a clean
+   diagnostic instead of a deep Seed_bug at lowering.  Each rejection
+   carries the AST form it fires on; each one must be DELETED (with an
+   executable positive test added) once the corresponding semantic
+   implementation lands.
+
+   The firewall's contract: every AST form the checker ACCEPTS must be
+   lowerable by mir_lower (accepted ⊆ lowerable — the machine check in
+   selfcheck/tg_subset.ml asserts it from Subset.expr_form_status vs
+   Mir_lower.expr_lower_status).  E9037–E9049 close the re-audit's
+   accepted-but-unlowerable gaps (the lowerer's expression-name
+   diagnostic table has no branch for several forms the checker used to
+   traverse). *)
 
 let rejected_attributes =
   [
@@ -28,32 +36,48 @@ let reject (diags : Diagnostic.bag) code msg span =
 (* ── Firewall context ──────────────────────────────────────────────
 
    Carries the user-defined enum surface of the program (bare variant
-   names plus qualified `enum::variant` names).  The driver lowers with
-   the default variant table — the builtin Option/Result table only
+   names plus qualified `enum::variant` names), the declared nominal
+   (struct/enum) names and the declared top-level function names
+   (qualified names included, e.g. `Command::new`).  The driver lowers
+   with the default variant table — the builtin Option/Result table only
    (mir_lower.default_variant_table + the builtin ctor_of fallback), so
    any user-enum construct or match arm fails closed at lowering with
-   Seed_bug.  The firewall rejects that usage up front (E9035). *)
+   Seed_bug.  The firewall rejects that usage up front (E9035), and
+   rejects nominal-qualified references that are neither declared
+   top-level functions nor builtin variant constructors (E9048): the
+   lowering env's callables carry top-level functions only, so a
+   `Type::method` reference fails closed at lowering with "unknown
+   callee". *)
 
-type ctx = { user_variants : string list }
+type ctx = {
+  user_variants : string list;
+  nominals : string list;
+  functions : string list;
+}
 
-(* Collect user-enum ctor names from the program items (recursing into
+(* Collect the firewall context from the program items (recursing into
    module and extern blocks, the realistic nesting for seed enums). *)
-let collect_user_variants (program : Ast.program) : string list =
-  let acc = ref [] in
+let collect_ctx (program : Ast.program) : ctx =
+  let variants = ref [] in
+  let nominals = ref [] in
+  let functions = ref [] in
   let rec item i =
     match i.Ast.kind with
     | Ast.EnumDef d ->
+        nominals := d.Ast.e_name :: !nominals;
         List.iter
           (fun v ->
-            acc := v.Ast.v_name :: !acc;
-            acc := (d.Ast.e_name ^ "::" ^ v.Ast.v_name) :: !acc)
+            variants := v.Ast.v_name :: !variants;
+            variants := (d.Ast.e_name ^ "::" ^ v.Ast.v_name) :: !variants)
           d.Ast.e_variants
+    | Ast.StructDef d -> nominals := d.Ast.s_name :: !nominals
+    | Ast.Function d -> functions := d.Ast.fn_sig.Ast.sig_name :: !functions
     | Ast.ModuleDef d -> Option.iter (List.iter item) d.Ast.m_items
     | Ast.ExternBlock d -> List.iter item d.Ast.ex_items
     | _ -> ()
   in
   List.iter item program.Ast.items;
-  !acc
+  { user_variants = !variants; nominals = !nominals; functions = !functions }
 
 (* A variant pattern the default variant table can serve: the builtin
    enums Option (Some=0, None=1) and Result (Ok=0, Err=1), in bare or
@@ -196,6 +220,18 @@ and check_block ctx diags (b : Ast.block_body) =
 and check_stmt ctx diags (s : Ast.stmt) =
   match s with
   | Ast.LetBinding (p, _, ty, v, _) ->
+      (* AST form: Ast.LetBinding (pattern, ...).  Seed lowering binds
+         let patterns by NAME only (lower_stmt: a non-PatIdent let
+         pattern gets an anonymous local and NO scope bindings), so a
+         destructuring let's names would be unbound at lowering and any
+         later use fails closed with "unknown value"; reject the
+         destructuring form until typed-pattern lowering lands. *)
+      (match p with
+       | Ast.PatIdent _ -> ()
+       | _ ->
+           reject diags "E9045"
+             "destructuring let-binding patterns are not available in the bootstrap subset (seed lowering binds let patterns by name only — the destructured names would be unbound at lowering)"
+             (Ast.pattern_span p));
       check_pattern ctx diags p;
       Option.iter (check_type ctx diags false) ty;
       check_expr ctx diags v
@@ -210,7 +246,18 @@ and check_stmt ctx diags (s : Ast.stmt) =
         "defer statements are not available in the bootstrap subset (function-scoped deferral semantics are not yet precise)"
         span;
       check_block ctx diags b
-  | Ast.Item i -> check_item ctx diags i
+  | Ast.Item i ->
+      (* AST form: Ast.Item item — a nested definition inside a
+         function body (parser `def`/`struct`/... in statement
+         position).  Seed lowering DROPS nested items silently
+         (lower_stmt: `Ast.Item _ -> ()`): the nested def is never
+         registered as a callable, so any call to it fails closed at
+         lowering with "unknown callee".  Reject until nested items
+         reach the MIR program. *)
+      reject diags "E9047"
+        "nested item definitions are not available in the bootstrap subset (seed lowering drops nested items — a nested def is never registered as a callable)"
+        i.Ast.span;
+      check_item ctx diags i
 
 and check_type ctx diags allows_impl (t : Ast.type_expr) =
   match t with
@@ -268,6 +315,65 @@ and check_pattern ctx diags (p : Ast.pattern) =
       check_pattern ctx diags a;
       check_pattern ctx diags b
 
+(* ── Match-arm patterns (E9043/E9044) ─────────────────────────────
+   Seed lowering serves exactly three arm forms: variant arms against
+   the builtin variant table (Option/Result) with name/underscore
+   payload bindings, integer-literal arms, and wildcard arms
+   (lower_match: arm guards fail closed; PatIdent/PatTuple/Struct/
+   Or/Range and non-integer literal arms fail closed with "unsupported
+   match arm pattern"; a variant payload pattern that is not a name or
+   `_` fails closed with "unsupported variant payload pattern").  The
+   arm-position check below rejects every other form (E9044) and every
+   guard (E9043) so an accepted match can never reach lowering's
+   fail-closed branches. *)
+
+and check_arm_pattern ctx diags (p : Ast.pattern) =
+  match p with
+  | Ast.PatVariant (seg1, seg2, fields, span) ->
+      if not (builtin_variant_of seg1 seg2) then
+        reject diags "E9035"
+          (Printf.sprintf
+             "user-defined enum match arm `%s` is not available in the bootstrap subset (the default variant table serves only Option/Result)"
+             (if seg1 = "" then seg2 else seg1 ^ "::" ^ seg2))
+          span;
+      List.iter
+        (fun f ->
+          match f with
+          | Ast.PatIdent _ | Ast.Wildcard _ -> ()
+          | _ ->
+              reject diags "E9044"
+                "variant payload patterns are not available in the bootstrap subset (seed lowering binds payload fields by name or `_` only)"
+                (Ast.pattern_span f))
+        fields
+  | Ast.PatLiteral (e, span) -> (
+      match e with
+      | Ast.IntLit _ -> ()
+      | _ ->
+          reject diags "E9044"
+            "non-integer literal match arms are not available in the bootstrap subset (seed lowering builds switch targets for integer literal arms only)"
+            span);
+      check_expr ctx diags e
+  | Ast.Wildcard _ -> ()
+  | p ->
+      reject diags "E9044"
+        (Printf.sprintf
+           "match arm pattern `%s` is not available in the bootstrap subset (seed lowering supports variant arms, integer literal arms and wildcard arms only)"
+           (arm_pattern_name p))
+        (Ast.pattern_span p)
+
+and arm_pattern_name (p : Ast.pattern) : string =
+  match p with
+  | Ast.Wildcard _ -> "_"
+  | Ast.PatIdent _ -> "binding"
+  | Ast.RefPattern _ -> "ref"
+  | Ast.RefMutPattern _ -> "ref-mut"
+  | Ast.PatLiteral _ -> "literal"
+  | Ast.PatVariant _ -> "variant"
+  | Ast.StructPattern _ -> "struct"
+  | Ast.PatTuple _ -> "tuple"
+  | Ast.OrPattern _ -> "or-pattern"
+  | Ast.RangePattern _ -> "range"
+
 and check_expr ctx diags (e : Ast.expr) =
   match e with
   | Ast.AwaitExpr (_, s) ->
@@ -301,17 +407,75 @@ and check_expr ctx diags (e : Ast.expr) =
              "user-defined enum constructor `%s` is not available in the bootstrap subset (the default variant table serves only Option/Result)"
              n)
           span
+      else
+        (* AST form: Ast.Name "Type::method" — a nominal-qualified
+           reference that is neither a declared top-level function nor a
+           builtin variant constructor.  The lowering env's callables
+           carry top-level functions only (methods are never consulted
+           by lower_call), so `Vec::new()` fails closed at lowering with
+           "unknown callee"; reject until receiver-typed method lowering
+           lands. *)
+        (match String.index_opt n ':' with
+         | Some i when i + 1 < String.length n && n.[i + 1] = ':' ->
+             let qual = String.sub n 0 i in
+             let rest = String.sub n (i + 2) (String.length n - i - 2) in
+             if
+               (not (List.mem n ctx.functions))
+               && List.mem qual ctx.nominals
+               && not (builtin_variant_of qual rest)
+             then
+               reject diags "E9048"
+                 (Printf.sprintf
+                    "qualified method reference `%s` is not available in the bootstrap subset (seed lowering resolves top-level callables only — receiver-typed method calls have no lowering)"
+                    n)
+                 span
+         | _ -> ())
   | Ast.Array (elems, _) -> List.iter (check_expr ctx diags) elems
-  | Ast.ArrayRepeat (v, c, _) ->
+  | Ast.ArrayRepeat (v, c, span) ->
+      (* AST form: Ast.ArrayRepeat (value, count, span) (parser `[v; n]`).
+         The lowerer's expression-name diagnostic table has no
+         ArrayRepeat branch — it falls to "unhandled supported
+         expression form: ArrayRepeat"; reject until array-repeat
+         lowering lands. *)
+      reject diags "E9038"
+        "array-repeat expressions are not available in the bootstrap subset (seed lowering has no ArrayRepeat branch — write the elements out as an Array literal)"
+        span;
       check_expr ctx diags v;
       check_expr ctx diags c
   | Ast.Tuple (elems, _) -> List.iter (check_expr ctx diags) elems
-  | Ast.StructLit (_, targs, fields, rest, _) ->
+  | Ast.StructLit (_, targs, fields, rest, span) ->
+      (* AST form: Ast.StructLit (name, targs, fields, rest, span)
+         (parser `Name { f: v, ..rest }`).  The lowerer has no StructLit
+         branch — it falls to "unhandled supported expression form:
+         StructLit"; reject until struct-literal lowering lands. *)
+      reject diags "E9037"
+        "struct literal expressions are not available in the bootstrap subset (seed lowering has no StructLit branch — struct construction is unlowered)"
+        span;
       List.iter (check_type ctx diags false) targs;
       List.iter (fun (_, v) -> check_expr ctx diags v) fields;
       Option.iter (check_expr ctx diags) rest
-  | Ast.Block (b, _) | Ast.UnsafeBlock (_, b, _) -> check_block ctx diags b
+  | Ast.Block (b, _) -> check_block ctx diags b
+  | Ast.UnsafeBlock (_, b, span) ->
+      (* AST form: Ast.UnsafeBlock (reason, body, span) (parser
+         `unsafe "reason" do ... end`).  The lowerer has no UnsafeBlock
+         branch — it falls to "unhandled supported expression form:
+         UnsafeBlock"; reject until an unsafe model lands in the seed. *)
+      reject diags "E9041"
+        "unsafe blocks are not available in the bootstrap subset (seed lowering has no UnsafeBlock branch — the seed VM has no unsafe model)"
+        span;
+      check_block ctx diags b
   | Ast.IfExpr i ->
+      (* AST form: Ast.IfExpr with if_let_pattern/if_let_value (parser
+         `if let <pat> = <expr> then`).  Seed lowering ignores the
+         if-let pattern entirely (lower_if has no if-let arm), so the
+         branch would lower unconditionally; reject the if-let form
+         until typed-pattern conditionals land. *)
+      (match i.Ast.if_let_pattern with
+       | None -> ()
+       | Some _ ->
+           reject diags "E9046"
+             "if-let expressions are not available in the bootstrap subset (seed lowering ignores the if-let pattern — the branch would lower unconditionally)"
+             (Ast.expr_span i.Ast.if_condition));
       check_expr ctx diags i.Ast.if_condition;
       check_block ctx diags i.Ast.if_then;
       List.iter
@@ -344,15 +508,27 @@ and check_expr ctx diags (e : Ast.expr) =
          verifies. *)
       check_expr ctx diags b;
       check_expr ctx diags i
-  | Ast.Range (s, e, _, _) ->
-      check_expr ctx diags s;
-      check_expr ctx diags e
+  | Ast.Range (_, _, _, span) ->
+      (* AST form: Ast.Range (start, end, inclusive, span) (parser
+         `a..b` / `a..=b`).  The lowerer has no Range branch — it falls
+         to "unhandled supported expression form: Range" (a `for x in
+         0..n` iterable reaches the same fail-closed path); reject until
+         range lowering lands. *)
+      reject diags "E9039"
+        "range expressions are not available in the bootstrap subset (seed lowering has no Range branch — iterate an Array literal instead)"
+        span
   | Ast.MatchExpr m ->
       check_expr ctx diags m.Ast.m_subject;
       List.iter
         (fun arm ->
-          check_pattern ctx diags arm.Ast.ma_pattern;
-          Option.iter (check_expr ctx diags) arm.Ast.ma_guard;
+          (match arm.Ast.ma_guard with
+           | Some g ->
+               reject diags "E9043"
+                 "match arm guards are not available in the bootstrap subset (seed lowering rejects arm guards)"
+                 (Ast.expr_span g);
+               check_expr ctx diags g
+           | None -> ());
+          check_arm_pattern ctx diags arm.Ast.ma_pattern;
           check_expr ctx diags arm.Ast.ma_body)
         m.Ast.m_arms
   | Ast.Cast (e, t, _) ->
@@ -360,6 +536,14 @@ and check_expr ctx diags (e : Ast.expr) =
       check_type ctx diags false t
   | Ast.TryOp (e, _) -> check_expr ctx diags e
   | Ast.Closure c ->
+      (* AST form: Ast.Closure (params, body) (parser pipe closure
+         `|x| e` or do-block closure `fn |x| ... end`).  The lowerer has
+         no Closure branch — it falls to "unhandled supported
+         expression form: Closure"; reject until closure lowering lands
+         (lift the closure to a named function). *)
+      reject diags "E9040"
+        "closure expressions are not available in the bootstrap subset (seed lowering has no Closure branch — lift the closure to a named function)"
+        c.Ast.cl_span;
       List.iter (fun p -> Option.iter (check_type ctx diags true) p.Ast.cp_type) c.Ast.cl_params;
       Option.iter (check_type ctx diags false) c.Ast.cl_return;
       check_expr ctx diags c.Ast.cl_body
@@ -378,7 +562,19 @@ and check_expr ctx diags (e : Ast.expr) =
   | Ast.Binary (l, _, r, _) ->
       check_expr ctx diags l;
       check_expr ctx diags r
-  | Ast.MacroCall (_, args, _) ->
+  | Ast.MacroCall (n, args, span) ->
+      (* AST form: Ast.MacroCall (name, args, span) — `name!(...)`.  The
+         lowerer has no MacroCall branch — it falls to "unhandled
+         supported expression form: MacroCall"; reject until macro
+         lowering lands (the typechecker's debug_assert special case
+         keeps `debug_assert!` out of the typecheck debt, so without
+         this rejection it would sail through to the fail-closed
+         lowering branch). *)
+      reject diags "E9049"
+        (Printf.sprintf
+           "macro invocations (`%s!`) are not available in the bootstrap subset (seed lowering has no MacroCall branch)"
+           n)
+        span;
       List.iter
         (function Ast.MacroExpr e -> check_expr ctx diags e | Ast.MacroTokens _ -> ())
         args
@@ -395,19 +591,28 @@ and check_expr ctx diags (e : Ast.expr) =
       check_expr ctx diags target;
       check_expr ctx diags v
   | Ast.CompoundAssign (target, _, v, span) ->
-      (* AST form: Ast.CompoundAssign (target, op, value, span) — the
-         projected forms fail closed at lowering like Assign; plain Name
-         targets are left to the existing lowering surface. *)
-      (match target with
-       | Ast.Name _ -> ()
-       | _ ->
-           reject diags "E9036"
-             "projected compound assignment is not available in the bootstrap subset (writeback through a projection is resource-sensitive and has no typed-place rule in seed lowering)"
-             span);
+      (* AST form: Ast.CompoundAssign (target, op, value, span).  The
+         lowerer has NO CompoundAssign branch at all — even a plain Name
+         target (`x += 1`) fails closed with "CompoundAssign reached MIR
+         lowering without a typed-place writeback rule"; reject the
+         whole form until writeback lowering lands. *)
+      reject diags "E9042"
+        "compound assignment is not available in the bootstrap subset (seed lowering has no CompoundAssign branch — even plain name targets fail closed at lowering)"
+        span;
       check_expr ctx diags target;
       check_expr ctx diags v
   | Ast.ReturnExpr (e, _) | Ast.BreakExpr (e, _) -> Option.iter (check_expr ctx diags) e
   | Ast.ForExpr f ->
+      (* AST form: Ast.ForExpr with a destructuring loop pattern
+         (`for (k, v) in m do`).  Seed lowering binds the loop variable
+         by name or `_` only (lower ForExpr: "unsupported for-loop
+         pattern"); reject the destructuring form (E9045). *)
+      (match f.Ast.for_pattern with
+       | Ast.PatIdent _ | Ast.Wildcard _ -> ()
+       | p ->
+           reject diags "E9045"
+             "destructuring for-loop patterns are not available in the bootstrap subset (seed lowering binds the loop variable by name or `_` only)"
+             (Ast.pattern_span p));
       check_pattern ctx diags f.Ast.for_pattern;
       check_expr ctx diags f.Ast.for_iterable;
       check_block ctx diags f.Ast.for_body
@@ -417,5 +622,66 @@ and check_expr ctx diags (e : Ast.expr) =
   | Ast.LoopExpr (b, _) -> check_block ctx diags b
 
 let check (diags : Diagnostic.bag) (program : Ast.program) =
-  let ctx = { user_variants = collect_user_variants program } in
+  let ctx = collect_ctx program in
   List.iter (check_item ctx diags) program.Ast.items
+
+(* ── Machine-check surface (selfcheck/tg_subset.ml) ───────────────
+   The firewall's form-level rules as DATA, keyed by the SAME form names
+   as Mir_lower.expr_form_name.  The selfcheck asserts the re-audit's
+   invariant — `Subset-accepted AST variants ⊆ Mir_lower-lowerable AST
+   variants` — for every form (an Accepted/Conditional form must never
+   be Unlowerable), and verifies this table against the checker itself
+   by running Subset.check on one specimen per form.  Keep this table in
+   lockstep with the checker: a rule change here without the
+   corresponding check_expr change fails the selfcheck. *)
+
+type form_status =
+  | Accepted
+  | Rejected of string          (* the E-code that always fires on the form *)
+  | Conditional of string list  (* E-codes that fire on specific sub-forms *)
+  | Unreachable                 (* no parser production reaches the checker *)
+
+let expr_form_status : (string * form_status) list =
+  [
+    ("IntLit", Accepted);
+    ("FloatLit", Accepted);
+    ("StringLit", Accepted);
+    ("CharLit", Accepted);
+    ("BoolLit", Accepted);
+    ("Name", Conditional [ "E9035"; "E9048" ]);
+    (* the parser folds qualified names into Name; a Path value never
+       exists in a parsed program (Path would fail closed at lowering) *)
+    ("Path", Unreachable);
+    ("Array", Accepted);
+    ("ArrayRepeat", Rejected "E9038");
+    ("Tuple", Accepted);
+    ("StructLit", Rejected "E9037");
+    ("Block", Accepted);
+    ("UnsafeBlock", Rejected "E9041");
+    ("If", Conditional [ "E9046" ]);
+    ("Call", Conditional [ "E9035"; "E9036"; "E9048" ]);
+    ("Index", Accepted);
+    ("Range", Rejected "E9039");
+    ("Match", Conditional [ "E9035"; "E9043"; "E9044" ]);
+    ("Cast", Accepted);
+    ("TryOp", Accepted);
+    ("Closure", Rejected "E9040");
+    ("Unary", Accepted);
+    ("Field", Rejected "E9036");
+    ("Binary", Accepted);
+    ("Await", Rejected "E9015");
+    ("MacroCall", Rejected "E9049");
+    ("Assign", Conditional [ "E9036" ]);
+    ("CompoundAssign", Rejected "E9042");
+    ("Return", Accepted);
+    ("Break", Accepted);
+    ("Next", Accepted);
+    ("For", Conditional [ "E9045" ]);
+    ("While", Accepted);
+    ("Loop", Accepted);
+    ("Handle", Rejected "E9016");
+    ("Unless", Rejected "E9017");
+    ("Until", Rejected "E9018");
+    ("Try", Rejected "E9019");
+    ("Comptime", Rejected "E9006");
+  ]

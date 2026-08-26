@@ -107,30 +107,53 @@ let resolve_or_self (ctx : ctx) (ty : Type_repr.t) : Type_repr.t =
   | Some t -> t
   | None -> ty
 
-let rec is_copy (ctx : ctx) (seen : Ids.Type_id.t list) (ty : Type_repr.t) : bool =
-  match ty with
-  | Type_repr.Unit | Type_repr.Bool | Type_repr.Char
-  | Type_repr.Int _ | Type_repr.Float _ | Type_repr.Raw_ptr _
-  | Type_repr.Ref_internal _ | Type_repr.Function _ | Type_repr.Never ->
-      true
-  | Type_repr.String -> false
-  | Type_repr.Tuple elems -> Array.for_all (is_copy ctx seen) elems
-  | Type_repr.Fixed_array (elem, _) -> is_copy ctx seen elem
-  | Type_repr.Named (tid, _) ->
-      if List.mem tid seen then false
-      else (
-        match find_type ctx tid with
-        | None -> false
-        | Some def -> is_copy ctx (tid :: seen) def)
-  | Type_repr.Type_param _ | Type_repr.Infer_var _ | Type_repr.Int_literal _ | Type_repr.Error -> false
+(* Copy property authority (re-audit §36): the seed's property engine
+   (Type_properties.of_type) with the program's def table as the Named
+   resolver.  The engine's rules: scalars/String-owned/immutable refs
+   and genuine function pointers behave as before; a def_repr'd enum
+   (Function(payloads, Never)) is Copy iff EVERY variant payload is Copy
+   — an enum with an owning payload (Result[Int, String]) must be moved,
+   consumed or passed by place, never bitwise-copied; a Named type's
+   copyability resolves its def and applies the same recursive rule
+   (struct Copy iff all fields Copy). *)
+let is_copy (ctx : ctx) (ty : Type_repr.t) : bool =
+  (Type_properties.of_type ~resolve_def:(fun tid -> find_type ctx tid) ty).is_copy
 
-(* Type compatibility after Named resolution.  Function param
-   CONVENTIONS are deliberately ignored: they are a call-site concern
-   (checked as access effects), not a value-shape concern. *)
+(* Type compatibility.  NOMINAL-vs-NOMINAL comparisons are identity
+   comparisons: Named (TypeId, args) is compatible with Named
+   (TypeId', args') iff the TypeIds are equal and the concrete arguments
+   are pairwise compatible — BEFORE any structural resolution.  Two
+   different TypeIds are NEVER compatible merely because their
+   definitions happen to share a shape (a UserId and a SocketFd both
+   degrade to Tuple[Int] only if the verifier replaces nominal identity
+   with physical structure, which it must not).  The definition table is
+   consulted only for structural-by-nature comparisons (one side
+   nominal, the other already structural — a tuple literal against a
+   struct, an enum value against its reconstructed def) and for
+   inspecting fields, variants, copy properties and layout; it is never
+   used to substitute a nominal value's identity for ordinary equality.
+   Function param CONVENTIONS are deliberately ignored: they are a
+   call-site concern (checked as access effects), not a value-shape
+   concern. *)
 let rec types_compatible (ctx : ctx) (a : Type_repr.t) (b : Type_repr.t) : bool =
-  match resolve_or_self ctx a, resolve_or_self ctx b with
-  | Type_repr.Named (ta, _), Type_repr.Named (tb, _) -> ta = tb
-  | Type_repr.Named _, _ | _, Type_repr.Named _ -> false
+  match a, b with
+  | Type_repr.Named (ta, aargs), Type_repr.Named (tb, bargs) ->
+      ta = tb
+      && Array.length aargs = Array.length bargs
+      && (let ok = ref true in
+          Array.iteri
+            (fun i t -> if not (types_compatible ctx aargs.(i) t) then ok := false)
+            bargs;
+          !ok)
+  | Type_repr.Named _, _ | _, Type_repr.Named _ ->
+      (* one side nominal, the other structural: the comparison is
+         structural-by-nature, so the nominal side is resolved — but
+         never both-nominal (handled above); an unresolvable nominal
+         (no def-table entry) fails closed *)
+      let ra = resolve_or_self ctx a and rb = resolve_or_self ctx b in
+      (match ra, rb with
+       | Type_repr.Named _, _ | _, Type_repr.Named _ -> false
+       | _ -> types_compatible ctx ra rb)
   | Type_repr.Unit, Type_repr.Unit -> true
   | Type_repr.Bool, Type_repr.Bool -> true
   | Type_repr.Char, Type_repr.Char -> true
@@ -800,7 +823,7 @@ let rec check_operand (ctx : ctx) (fn : function_) (bb_ctx : string) (op : opera
           (Printf.sprintf "%s: copy of previously moved place _%d (key %S)" bb_ctx p.local k);
       (match place_type ctx fn p with
        | Some ty ->
-           if not (is_copy ctx [] ty) then
+           if not (is_copy ctx ty) then
              add_err ctx
                (Printf.sprintf
                   "%s: copy of non-Copy value of type %s (a bitwise copy of an owning type must be moved, consumed or passed by place)"

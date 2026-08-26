@@ -21,9 +21,11 @@
        resolver/typechecker measure)
      resolver counts (ctx_resolved)
      typecheck errors / items (ctx_type_errors, ctx_items)
-     declaration fixpoint iterations + body passes (ctx_rounds: the
-       driver sets 2 = declaration fixpoint rounds; the body pass runs
-       exactly once — audit Fix 3 deterministic phase split)
+     declaration fixpoint iterations + body passes (ctx_decl_rounds:
+       the driver's MEASURED declaration-fixpoint iteration counter from
+       run_closure_pipeline's fixpoint loop — re-audit finding 2, no
+       hard-coded 2; the body pass runs exactly once — audit Fix 3
+       deterministic phase split)
      the real debt report: per-category buckets, total, primaries,
        secondaries (the pipeline's accumulated debt_by_module)
      the lowering/mono gates the driver itself would run (lower_closure,
@@ -132,15 +134,16 @@ let () =
          measure (the driver's raw "module graph:" line prints the
          pre-@cfg count including eliminated items). *)
       Printf.printf "evidence typecheck errors=%d items=%d\n" n_errors ctx.Driver.ctx_items;
-      (* Phase counts (re-audit rounds=2 finding): the closure_ctx
-         carries the driver's round count (ctx_rounds = 2 — the
-         declaration fixpoint's iteration count; audit Fix 3 split the
+      (* Phase counts (re-audit finding 2): the closure_ctx carries the
+         driver's MEASURED declaration-fixpoint iteration count
+         (ctx_decl_rounds = !decl_rounds from run_closure_pipeline's
+         fixpoint loop — the hard-coded 2 is gone; audit Fix 3 split the
          old retry loop into declare-to-fixpoint then check bodies
          exactly once against the frozen env).  Reported as
-         declaration_fixpoint_iterations = ctx_rounds and body_passes =
-         1, the audit's semantic. *)
+         declaration_fixpoint_iterations = ctx_decl_rounds and
+         body_passes = 1, the audit's semantic. *)
       Printf.printf "evidence declaration_fixpoint_iterations=%d body_passes=1\n"
-        ctx.Driver.ctx_rounds;
+        ctx.Driver.ctx_decl_rounds;
 
       (* ── the real debt report (per-category, total, primaries,
             secondaries): the pipeline's OWN accumulated accounting

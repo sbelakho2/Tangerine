@@ -609,6 +609,96 @@ let apply_cfg_elimination ~(manifest : Bootstrap_manifest.t) ~(graph : Module_gr
     end
   end
 
+(* ── Executable-subset firewall over the manifest closure ─────────
+   (re-audit P1 finding 1): the aggregate bootstrap path previously
+   never called Subset.check over the actual manifest programs — only
+   the standalone check/lower commands and the gate's synthetic
+   specimens did.  run_closure_pipeline now runs Subset.check over EVERY
+   module program of the cfg-filtered closure, AFTER the module graph +
+   @cfg elimination and BEFORE the resolver/typechecker, with a FRESH
+   diagnostic bag per module: the findings are a SEPARATE channel and
+   can never inflate the resolver diagnostics or the typecheck debt
+   (debt_total is a typecheck-only count). *)
+
+type subset_module = {
+  ssm_key : string;                   (* module path key *)
+  ssm_findings : (string * int) list; (* E-code -> count, sorted by code *)
+  ssm_total : int;
+}
+
+type subset_result = {
+  sr_modules : subset_module list;  (* dedup by source file *)
+  sr_accepted : int;
+  sr_rejected : int;
+  sr_total : int;
+}
+
+let subset_firewall_of_graph (graph : Module_graph.t) : subset_result =
+  (* Deduplicate by source file: lib_kernel.tg creates re-export subtree
+     nodes whose node_file aliases the same file (same rule as
+     topological_nodes). *)
+  let seen = Hashtbl.create 64 in
+  let nodes =
+    List.filter
+      (fun node ->
+        if Hashtbl.mem seen node.Module_graph.node_file then false
+        else begin
+          Hashtbl.add seen node.Module_graph.node_file ();
+          true
+        end)
+      graph.Module_graph.nodes
+  in
+  let modules =
+    List.map
+      (fun node ->
+        let diags = Diagnostic.create_bag () in
+        Subset.check diags node.Module_graph.node_program;
+        let total = Diagnostic.error_count diags in
+        let counts =
+          List.map
+            (fun code ->
+              ( code,
+                List.length
+                  (List.filter
+                     (fun d ->
+                       d.Diagnostic.severity = Diagnostic.Error && d.Diagnostic.code = code)
+                     diags.Diagnostic.diagnostics) ))
+            (Diagnostic.codes diags)
+        in
+        {
+          ssm_key = String.concat "::" node.Module_graph.node_path;
+          ssm_findings = counts;
+          ssm_total = total;
+        })
+      nodes
+  in
+  let accepted = List.length (List.filter (fun m -> m.ssm_total = 0) modules) in
+  {
+    sr_modules = modules;
+    sr_accepted = accepted;
+    sr_rejected = List.length modules - accepted;
+    sr_total = List.fold_left (fun acc m -> acc + m.ssm_total) 0 modules;
+  }
+
+let subset_firewall_status (r : subset_result) : string =
+  if r.sr_total = 0 then "PASS" else "FAIL"
+
+let print_subset_firewall (r : subset_result) : unit =
+  Printf.printf
+    "  subset firewall: %d module programs (dedup by source file) — %d accepted, %d rejected, %d findings\n"
+    (List.length r.sr_modules) r.sr_accepted r.sr_rejected r.sr_total;
+  List.iter
+    (fun m ->
+      if m.ssm_total > 0 then begin
+        Printf.printf "    module %s: REJECTED (%d findings:" m.ssm_key m.ssm_total;
+        List.iter (fun (c, n) -> Printf.printf " %s x%d" c n) m.ssm_findings;
+        Printf.printf ")\n"
+      end
+      else Printf.printf "    module %s: ACCEPTED\n" m.ssm_key)
+    r.sr_modules;
+  Printf.printf "  SUBSET_FIREWALL = %s (%d findings across %d module(s))\n"
+    (subset_firewall_status r) r.sr_total r.sr_rejected
+
 (* Everything bootstrap-check and compile share: manifest load, module
    graph, resolver, and the typecheck fixpoint (registration is
    non-fatal, so modules with forward/cyclic references retry with the
@@ -625,7 +715,12 @@ type closure_ctx = {
   ctx_type_errors : string list;
   ctx_items : int;
   ctx_typed_calls_sample : int;
-  ctx_rounds : int;
+  (* The MEASURED declaration-fixpoint iteration count (re-audit finding
+     2): !decl_rounds from the fixpoint loop below — never a hard-coded
+     2.  The body pass runs exactly once against the frozen env (audit
+     Fix 3 deterministic phase split). *)
+  ctx_decl_rounds : int;
+  ctx_subset : subset_result;
   mutable lowered_methods : int;
 }
 
@@ -650,6 +745,14 @@ let run_closure_pipeline ~(repo_root : string) ~(manifest_path : string) ~(targe
       (match apply_cfg_elimination ~manifest ~graph target with
        | Error m -> Error m
        | Ok (graph, _cfg_eliminated) ->
+      (* ── executable-subset firewall (re-audit P1 finding 1): run
+         Subset.check over EVERY module program of the cfg-filtered
+         closure, BEFORE the resolver/typechecker.  Each module gets a
+         FRESH diagnostic bag, so the findings are a separate gate line
+         and cannot touch the resolver diagnostics or the typecheck
+         debt. *)
+      let subset_result = subset_firewall_of_graph graph in
+      print_subset_firewall subset_result;
       let resolved = Resolver.resolve manifest graph diags in
       Printf.printf "  resolver: %d expr defs, %d type defs, %d field defs, %d variant defs, %d call candidates\n"
         (List.length resolved.Resolver.expr_defs)
@@ -756,7 +859,8 @@ let run_closure_pipeline ~(repo_root : string) ~(manifest_path : string) ~(targe
             ctx_type_errors = type_errors;
             ctx_items = !items;
             ctx_typed_calls_sample = !typed_calls;
-            ctx_rounds = 2;
+            ctx_decl_rounds = !decl_rounds;
+            ctx_subset = subset_result;
             lowered_methods = 0 }
       end)
 
@@ -1208,8 +1312,39 @@ let oracle_of_ctx (ctx : closure_ctx) (stats : mir_stats option) : oracle_counts
    MIR) remains future work.  Additive by construction: it reports
    findings and cannot change the typecheck debt. *)
 
+(* Nominal-definition lookup for the pass's copy query (mirror of
+   seed_mir.def_repr / mir_verify.find_type, read-only): a struct
+   resolves to its field tuple, an enum to its payload function, so
+   Resource_check.is_copy recurses over every field / payload.  A name
+   with no nominal (alias/builtin) falls back to the type registry. *)
+let nominal_def_of_tid (env : Typecheck.env) (tid : Ids.Type_id.t) : Type_repr.t option =
+  match List.assoc_opt tid env.Typecheck.type_names with
+  | None -> None
+  | Some name -> (
+      match List.assoc_opt name env.Typecheck.nominals with
+      | Some nom ->
+          Some
+            (match nom.Typecheck.nom_kind with
+             | `Struct ->
+                 Type_repr.Tuple (Array.of_list (List.map snd nom.Typecheck.nom_fields))
+             | `Enum ->
+                 Type_repr.Function
+                   ( Array.of_list
+                       (List.map
+                          (fun (_, pty) ->
+                            {
+                              Type_repr.pt_convention = Access_effect.Let;
+                              pt_type =
+                                (if Array.length pty = 0 then Type_repr.Unit
+                                 else Type_repr.Tuple pty);
+                            })
+                          nom.Typecheck.nom_variants),
+                     Type_repr.Never ))
+      | None -> List.assoc_opt name env.Typecheck.types)
+
 let run_access_resource_pass (ctx : closure_ctx) : Access_check.finding list =
-  Access_check.run_closure ctx.ctx_env.Typecheck.state.oracle.o_accesses
+  Access_check.run_closure (nominal_def_of_tid ctx.ctx_env)
+    ctx.ctx_env.Typecheck.state.oracle.o_accesses
 
 let report_access_resource_pass (ctx : closure_ctx) : unit =
   let findings = run_access_resource_pass ctx in
@@ -1253,7 +1388,7 @@ let cmd_bootstrap_check (args : string list) : int =
    | Ok ctx ->
        Printf.printf "  typecheck: %d modules, %d items, %d errors (%d rounds)\n"
          ctx.ctx_graph.Module_graph.node_count ctx.ctx_items (List.length ctx.ctx_type_errors)
-         ctx.ctx_rounds;
+         ctx.ctx_decl_rounds;
        report_access_resource_pass ctx;
        List.iter (fun e -> Printf.printf "    %s\n" e) (List.sort compare ctx.ctx_type_errors);
        if ctx.ctx_type_errors <> [] then begin
@@ -1348,7 +1483,7 @@ let cmd_compile (args : string list) : int =
    | Ok ctx ->
        Printf.printf "  typecheck: %d modules, %d items, %d errors (%d rounds)\n"
          ctx.ctx_graph.Module_graph.node_count ctx.ctx_items (List.length ctx.ctx_type_errors)
-         ctx.ctx_rounds;
+         ctx.ctx_decl_rounds;
        if ctx.ctx_type_errors <> [] then begin
          Printf.printf "compile: FAILED — closure typecheck gate: %d errors; the VM bootstrap run is NOT attempted\n"
            (List.length ctx.ctx_type_errors);

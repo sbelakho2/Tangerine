@@ -24,10 +24,12 @@
    - `?` (Ast.TryOp): the subject is an Option/Result.  The success
      variant (tag 0) supplies the expression value (the payload read
      via the Downcast/Field projection above); the failure variant
-     early-returns from the enclosing function: the subject is copied
-     into the return slot (enum values are copyable under the verifier
-     since their def is Function (_, Never)) and `Ret` is emitted, with
-     the function-level defer bodies running first.  The subject's type
+     early-returns from the enclosing function: the subject TRANSFERS
+     (moves) into the return slot — never a copy, because the verifier's
+     enum Copy rule is recursive (an enum is Copy iff every variant
+     payload is Copy) and an owning-payload enum must be moved, not
+     bitwise-copied — and `Ret` is emitted, with the function-level
+     defer bodies running first.  The subject's type
      must equal the enclosing function's return type (fail-closed
      otherwise).
 
@@ -270,9 +272,9 @@ let element_type_of (t : Type_repr.t) : Type_repr.t =
   | _ -> seed_bug "element access on a non-iterable type %s (the lowering env carries no type-substituted element lookup for named Vec/Array types; the dynamic Seed_mir.Index projection itself is executable — the verifier only admits it on Fixed_array bases)"
            (Seed_mir.print_type t)
 
-(* Conservative copyability for payload binding: enums resolve to
-   Function (_, Never) defs which the verifier treats as Copy, but the
-   lowering has no def table, so Named values are conservatively
+(* Conservative copyability for payload binding: the verifier's enum
+   rule is recursive (an enum is Copy iff every variant payload is Copy)
+   but the lowering has no def table, so Named values are conservatively
    non-copy (a projected Move is wrong: the seed VM's Move ignores
    projections, so non-copy payload binding fails closed). *)
 let rec copyable_ty (t : Type_repr.t) : bool =
@@ -790,34 +792,54 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
         (Seed_mir.SwitchInt (copy_place st (cur_place st did), [ (0L, success) ], fail))
         fail;
       (* failure path: defers, then the failure value into the return
-         slot, then Ret.  For Option the None is the subject itself; for
-         Result the Err(error) is reconstructed from the subject's error
-         payload so the enclosing function's (possibly different)
-         success type does not matter. *)
+         slot, then Ret.  The subject TRANSFERS (moves) into the return
+         slot — a copy is only legal for a trivially Copy enum, and the
+         verifier's enum rule is recursive (Copy iff every variant
+         payload is Copy), so an enum with an owning payload
+         (Result[Int, String]-shaped) must be MOVED.  For Option the
+         subject IS the return value; for Result whose instantiation
+         equals the enclosing return type the subject IS the Err value
+         (its runtime tag is 1 on this path).  Only when the success
+         types differ must Err(e) be reconstructed from the subject's
+         error payload — a projected move is NOT expressible in the seed
+         operand set (the VM's Move ignores projections and moves the
+         whole slot, and the verifier rejects projected moves), so the
+         reconstruction reads the payload by Copy and fails closed at
+         lowering when the error payload is not Copy. *)
       emit_defers env st;
       (match is_result, err_payload_ty with
        | false, _ ->
-           emit st (Seed_mir.Assign (cur_place st 0, Seed_mir.Use (Seed_mir.Copy (cur_place st sid))))
-       | true, Some e ->
-           let eid = fresh_local st e in
            emit st
-             (Seed_mir.Assign
-                ( cur_place st eid,
-                  Seed_mir.Use
-                    (Seed_mir.Copy
-                       { Seed_mir.local = sid;
-                         projections =
-                           [ Seed_mir.Downcast (Ids.Variant_index.make 1);
-                             Seed_mir.Field (Ids.Field_index.make 0) ] }) ));
-           (match env.fn_ret with
-            | Type_repr.Named (ret_tid, _) ->
-                emit st
-                  (Seed_mir.Assign
-                     ( cur_place st 0,
-                       Seed_mir.Aggregate
-                         ( Seed_mir.EnumCtor (ret_tid, Ids.Variant_index.make 1),
-                           [ Seed_mir.Copy (cur_place st eid) ] ) ))
-            | _ -> seed_bug "`?` Result failure reconstruction: enclosing return is not a nominal")
+             (Seed_mir.Assign (cur_place st 0, Seed_mir.Use (Seed_mir.Move (cur_place st sid))))
+       | true, Some e ->
+           if Type_repr.compare subj_ty env.fn_ret = 0 then
+             emit st
+               (Seed_mir.Assign (cur_place st 0, Seed_mir.Use (Seed_mir.Move (cur_place st sid))))
+           else if not (copyable_ty e) then
+             seed_bug
+               "`?` Result failure reconstruction is not lowerable for a non-Copy error payload %s (the seed VM's Move ignores projections, so extracting Err's payload from the subject and rebuilding it cannot move the value; pass the value by place or make the payload Copy)"
+               (Seed_mir.print_type e)
+           else begin
+             let eid = fresh_local st e in
+             emit st
+               (Seed_mir.Assign
+                  ( cur_place st eid,
+                    Seed_mir.Use
+                      (Seed_mir.Copy
+                         { Seed_mir.local = sid;
+                           projections =
+                             [ Seed_mir.Downcast (Ids.Variant_index.make 1);
+                               Seed_mir.Field (Ids.Field_index.make 0) ] }) ));
+             (match env.fn_ret with
+              | Type_repr.Named (ret_tid, _) ->
+                  emit st
+                    (Seed_mir.Assign
+                       ( cur_place st 0,
+                         Seed_mir.Aggregate
+                           ( Seed_mir.EnumCtor (ret_tid, Ids.Variant_index.make 1),
+                             [ Seed_mir.Copy (cur_place st eid) ] ) ))
+              | _ -> seed_bug "`?` Result failure reconstruction: enclosing return is not a nominal")
+           end
        | true, None -> seed_bug "`?` Result subject without an error payload");
       set_terminator st Seed_mir.Ret;
       push_block st success;

@@ -7,8 +7,16 @@
      (a) an enum with three variants (zero, one and two payload fields)
          plus a match over it binding payloads in every arm;
      (b) Option/Result plumbing: `?` on an Option (success payload
-         propagation AND failure early-return), Result construction and
-         a Result match;
+         propagation AND failure early-return) and on a Result (the
+         failure path MOVES the subject into the return slot — a copy
+         is only legal for trivially Copy enums), Result construction
+         and Result matches — the Result carries an ALL-COPY payload
+         (Result[Int, Int]): an enum with an owning payload
+         (Result[Int, String]-shaped) is not Copy under the verifier's
+         recursive enum rule (Copy iff every variant payload is Copy),
+         and the seed surface passes values by bitwise copy, so an
+         owning-payload enum cannot flow by value through the
+         lowered program;
      (c) a for-loop over an Array literal (unrolled with ConstantIndex
          element reads);
      (d) two function-level defers that must run in reverse declaration
@@ -56,18 +64,27 @@ def unwrap_or_zero(o: Option[Int]) -> Int
   }
 end
 
-def checked_div2(a: Int, b: Int) -> Result[Int, String]
+def checked_div2(a: Int, b: Int) -> Result[Int, Int]
   match safe_div(a, b) {
     Some(v) => Ok(v * 3),
-    None() => Err("div by zero")
+    None() => Err(-1)
   }
 end
 
-def unwrap_res_or_zero(r: Result[Int, String]) -> Int
+def unwrap_res_or_zero(r: Result[Int, Int]) -> Int
   match r {
     Ok(v) => v,
     Err(_) => 0
   }
+end
+
+def res_chain(a: Int, b: Int) -> Result[Int, Int]
+  let q = checked_div2(a, b)?
+  if q > 0 then
+    Ok(q + 1)
+  else
+    Err(-1)
+  end
 end
 
 def for_sum() -> Int
@@ -97,9 +114,11 @@ def main() -> Int
   let e = unwrap_or_zero(checked_div(1, 0))
   let f = unwrap_res_or_zero(checked_div2(4, 2))
   let g = unwrap_res_or_zero(checked_div2(1, 0))
+  let j = unwrap_res_or_zero(res_chain(4, 2)) - 7
+  let k = unwrap_res_or_zero(res_chain(1, 0))
   let h = for_sum()
   let i = defer_order()
-  a + b + c + d + e + f + g + h + i
+  a + b + c + d + e + f + g + h + i + j + k
 end
 |}
 
@@ -206,7 +225,7 @@ end
       let result_tid = List.assoc "Result" tcheck_env.Typecheck.type_ids in
       let color_tid = List.assoc "Color" tcheck_env.Typecheck.type_ids in
       let option_int = Type_repr.Named (option_tid, [| int_ty |]) in
-      let result_int_str = Type_repr.Named (result_tid, [| int_ty; string_ty |]) in
+      let result_int_int = Type_repr.Named (result_tid, [| int_ty; int_ty |]) in
       let color_ty = Type_repr.Named (color_tid, [||]) in
       (* typed signatures per function (flat names) *)
       let ts_of name =
@@ -240,8 +259,8 @@ end
             [
               ("Some", option_int);
               ("None", option_int);
-              ("Ok", result_int_str);
-              ("Err", result_int_str);
+              ("Ok", result_int_int);
+              ("Err", result_int_int);
               ("Red", color_ty);
               ("Green", color_ty);
               ("Blue", color_ty);
@@ -307,7 +326,7 @@ end
           types =
             [|
               enum_def option_tid [ [ int_ty ]; [] ];
-              enum_def result_tid [ [ int_ty ]; [ string_ty ] ];
+              enum_def result_tid [ [ int_ty ]; [ int_ty ] ];
               enum_def color_tid [ []; [ int_ty ]; [ int_ty; int_ty ] ];
             |];
         }

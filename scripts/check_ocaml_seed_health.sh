@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # check_ocaml_seed_health.sh — OCaml-seed DEVELOPMENT-HEALTH gate.
 #
-# Pinned-debt gate (audit P1 item 3). Permits ONLY explicitly pinned
-# debt, everything else is exact:
+# Debt policy (re-audit finding 3): ONE authority — tg_bootstrap_gate
+# (stage0_ocaml/selfcheck), the aggregate bootstrap gate whose monotonic
+# no-regression check runs against its checked baseline (total / primary
+# / secondary must not rise; category redistribution is reported as a
+# diagnostic). This script pins NO debt scalar of its own.
 #   1. the pinned OCaml/Dune toolchain
 #   2. dune build (warnings are errors)
 #   3. the EXACT unit-test inventory: 226 passed, 0 failed
@@ -12,10 +15,9 @@
 #   4. EVERY self-check executable enumerated in selfcheck/dune (a new
 #      self-check is automatically required; each must exit 0 and print
 #      its PASS marker)
-#   5. bootstrap-check: must not crash; its typecheck error count must
-#      be AT OR BELOW the pinned semantic debt (1690) — a count above
-#      the pin fails; the count at or below the pin is reported as the
-#      pinned debt, NOT as closure PASS.
+#   5. bootstrap-check: must not crash; the measured typecheck count is
+#      reported, and the debt policy is delegated to tg_bootstrap_gate
+#      (the single debt authority), which must pass.
 #
 # This script is NOT a compiler-closure gate: the closure gate is
 # check_ocaml_bootstrap_complete.sh (zero semantic debt, full closure).
@@ -27,7 +29,6 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 PINNED_TEST_INVENTORY=226
-PINNED_TYPECHECK_DEBT=1690
 
 if [ -f scripts/check_ocaml_toolchain.sh ]; then
   scripts/check_ocaml_toolchain.sh
@@ -69,8 +70,9 @@ for name in $NAMES; do
   fi
 done
 
-# bootstrap-check: pinned semantic debt — must not crash; the typecheck
-# error count must be <= the pin. A count above the pin is a hard fail.
+# bootstrap-check: must not crash. The debt policy is NOT a scalar pin
+# here — it is delegated to tg_bootstrap_gate, the single debt authority
+# (monotonic no-regression vs its checked baseline).
 set +e
 timeout 300 _build/default/bin/tg_stage0.exe bootstrap-check --repo-root .. >/tmp/ocaml_bootstrap_check.out 2>&1
 BC_STATUS=$?
@@ -91,8 +93,12 @@ if [ -z "$TC_COUNT" ]; then
   tail -20 /tmp/ocaml_bootstrap_check.out
   exit 1
 fi
-if [ "$TC_COUNT" -gt "$PINNED_TYPECHECK_DEBT" ]; then
-  echo "check_ocaml_seed_health: FAIL — typecheck debt $TC_COUNT EXCEEDS the pinned $PINNED_TYPECHECK_DEBT"
+
+# The single debt-policy authority: tg_bootstrap_gate must pass its
+# monotonic no-regression gate against the checked baseline.
+if ! timeout 420 _build/default/selfcheck/tg_bootstrap_gate.exe --repo-root .. >/tmp/ocaml_bootstrap_gate.out 2>&1; then
+  echo "check_ocaml_seed_health: FAIL — tg_bootstrap_gate (the debt-policy authority) rejected the measured debt"
+  tail -20 /tmp/ocaml_bootstrap_gate.out
   exit 1
 fi
 
@@ -101,5 +107,5 @@ if [ "$SELFCHECK_FAIL" -ne 0 ]; then
   exit 1
 fi
 
-echo "check_ocaml_seed_health: tests=${TESTS} (pinned exact inventory) selfchecks=${SELFCHECK_COUNT} selfcheck_fail=0 typecheck_debt=${TC_COUNT} (pinned max ${PINNED_TYPECHECK_DEBT})"
+echo "check_ocaml_seed_health: tests=${TESTS} (pinned exact inventory) selfchecks=${SELFCHECK_COUNT} selfcheck_fail=0 typecheck_debt=${TC_COUNT} (debt policy: tg_bootstrap_gate monotonic vs checked baseline)"
 echo "check_ocaml_seed_health: seed health ALL REQUIRED CHECKS PASSED (this is NOT a compiler-closure PASS — run check_ocaml_bootstrap_complete.sh for the closure gate)"

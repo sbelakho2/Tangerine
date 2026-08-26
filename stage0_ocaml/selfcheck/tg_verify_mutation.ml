@@ -5,10 +5,10 @@ let let_param (ty : Type_repr.t) : Type_repr.param_type = { Type_repr.pt_convent
    For every verifier class — local convention, block ids,
    definite-initialization dataflow, assign typing, call argument counts
    and callee resolution, switch and terminator targets, aggregate and
-   rvalue typing, terminator constraints — a VALID hand-built base
-   program is mutated by a SINGLE defect and must be rejected with a
-   message from the expected class.  The four base programs are also
-   asserted valid (Ok) unchanged.
+   rvalue typing, terminator constraints, nominal identity, recursive
+   enum copyability — a VALID hand-built base program is mutated by a
+   SINGLE defect and must be rejected with a message from the expected
+   class.  The base programs are also asserted valid (Ok) unchanged.
 
    Two audit-listed mutations are not literally expressible in the
    record MIR (a Goto or a Ret is only ever the block's `terminator`,
@@ -728,6 +728,137 @@ let runtime_oob_prog () : Seed_mir.program =
   in
   prog_of [| fn |]
 
+(* ── (j) nominal identity + recursive enum copy proofs (re-audit) ────
+
+   Two distinct structs with the same physical shape must NOT be
+   interchangeable (types_compatible compares Named types by TypeId +
+   concrete args BEFORE any structural resolution — the verifier must
+   never replace a nominal value's identity with its reconstructed
+   shape for ordinary type equality), and enum copyability is recursive
+   over the variant payloads (an enum with an owning payload — a
+   Result[Int, String]-shaped def — is NOT Copy; an enum with all-Copy
+   payloads — Option[Int]-shaped — is). *)
+
+let shape_tid_user = Ids.Type_id.make 200
+let shape_tid_socket = Ids.Type_id.make 201
+let shape_tid_result = Ids.Type_id.make 202
+let shape_tid_option = Ids.Type_id.make 203
+
+let user_id_ty = Type_repr.Named (shape_tid_user, [||])
+let socket_fd_ty = Type_repr.Named (shape_tid_socket, [||])
+let result_like_ty = Type_repr.Named (shape_tid_result, [||])
+let option_like_ty = Type_repr.Named (shape_tid_option, [||])
+
+(* UserId { value: Int } and SocketFd { value: Int } share the EXACT
+   shape (Tuple [Int]); Result-like has an owning (String) payload,
+   Option-like is all-Copy. *)
+let shape_defs : Seed_mir.type_def array =
+  [|
+    Seed_mir.StructDef
+      { sd_id = shape_tid_user;
+        sd_fields =
+          [ { Seed_mir.fd_id = Ids.Field_id.make 0; fd_index = Ids.Field_index.make 0; fd_ty = i64 } ] };
+    Seed_mir.StructDef
+      { sd_id = shape_tid_socket;
+        sd_fields =
+          [ { Seed_mir.fd_id = Ids.Field_id.make 1; fd_index = Ids.Field_index.make 0; fd_ty = i64 } ] };
+    Seed_mir.EnumDef
+      { ed_id = shape_tid_result;
+        ed_variants =
+          [ { Seed_mir.vd_id = Ids.Variant_id.make 0; vd_index = Ids.Variant_index.make 0;
+              vd_payload = Type_repr.Tuple [| i64 |] };
+            { Seed_mir.vd_id = Ids.Variant_id.make 1; vd_index = Ids.Variant_index.make 1;
+              vd_payload = Type_repr.Tuple [| Type_repr.String |] } ] };
+    Seed_mir.EnumDef
+      { ed_id = shape_tid_option;
+        ed_variants =
+          [ { Seed_mir.vd_id = Ids.Variant_id.make 2; vd_index = Ids.Variant_index.make 0;
+              vd_payload = Type_repr.Tuple [| i64 |] };
+            { Seed_mir.vd_id = Ids.Variant_id.make 3; vd_index = Ids.Variant_index.make 1;
+              vd_payload = Type_repr.Unit } ] };
+  |]
+
+let prog_with_types (fn : Seed_mir.function_) : Seed_mir.program =
+  { Seed_mir.functions = [| fn |]; statics = [||]; types = shape_defs }
+
+(* j1: a UserId-typed param slot is moved into a SocketFd-typed return
+   slot — both defs are Tuple [Int] (the SAME shape), so a structural
+   comparison would accept it; the nominal rule must reject it. *)
+let mut_j1_nominal_shape () : Seed_mir.program =
+  let fn =
+    {
+      Seed_mir.name = "nominal_shape";
+      instance = inst 20;
+      params = [| let_param(user_id_ty) |];
+      locals = [| socket_fd_ty; user_id_ty |];
+      blocks =
+        [|
+          { Seed_mir.id = 0; statements = [ assign 0 (use_op (move 1)) ];
+            terminator = Seed_mir.Ret };
+        |];
+      entry = 0;
+    }
+  in
+  prog_with_types fn
+
+(* j2 (positive control): UserId into a UserId return slot is accepted
+   (the identity rule also admits the SAME nominal). *)
+let valid_j2_nominal_same () : Seed_mir.program =
+  let fn =
+    {
+      Seed_mir.name = "nominal_same";
+      instance = inst 21;
+      params = [| let_param(user_id_ty) |];
+      locals = [| user_id_ty; user_id_ty |];
+      blocks =
+        [|
+          { Seed_mir.id = 0; statements = [ assign 0 (use_op (move 1)) ];
+            terminator = Seed_mir.Ret };
+        |];
+      entry = 0;
+    }
+  in
+  prog_with_types fn
+
+(* j3: a bitwise copy of a Result[Int, String]-shaped enum (a variant
+   payload is String — an owning payload) must fail the verifier's
+   recursive Copy check. *)
+let mut_j3_owning_enum_copy () : Seed_mir.program =
+  let fn =
+    {
+      Seed_mir.name = "owning_enum_copy";
+      instance = inst 22;
+      params = [| let_param(result_like_ty) |];
+      locals = [| result_like_ty; result_like_ty |];
+      blocks =
+        [|
+          { Seed_mir.id = 0; statements = [ assign 0 (use_op (copy 1)) ];
+            terminator = Seed_mir.Ret };
+        |];
+      entry = 0;
+    }
+  in
+  prog_with_types fn
+
+(* j4 (positive control): a bitwise copy of an Option[Int]-shaped enum
+   (all-Copy payloads) is accepted. *)
+let valid_j4_copyable_enum_copy () : Seed_mir.program =
+  let fn =
+    {
+      Seed_mir.name = "copyable_enum_copy";
+      instance = inst 23;
+      params = [| let_param(option_like_ty) |];
+      locals = [| option_like_ty; option_like_ty |];
+      blocks =
+        [|
+          { Seed_mir.id = 0; statements = [ assign 0 (use_op (copy 1)) ];
+            terminator = Seed_mir.Ret };
+        |];
+      entry = 0;
+    }
+  in
+  prog_with_types fn
+
 let () =
   Printf.printf "Seed MIR verifier mutation self-check\n";
   expect_valid "base1: params + arithmetic + call + switch + return accepted"
@@ -804,6 +935,20 @@ let () =
   expect_error
     "i3: Index payload local typed String (non-integer index type) rejected"
     "dynamic index local _2 has non-integer index type String" (mut_i3 ());
+
+  (* (j) nominal identity + recursive enum copy proofs *)
+  expect_error
+    "j1: UserId value moved into a SocketFd slot rejected (same {value: Int} shape, distinct TypeIds — nominal identity is enforced, never degraded to Tuple[Int] == Tuple[Int])"
+    "assign type mismatch" (mut_j1_nominal_shape ());
+  expect_valid
+    "j2: UserId value moved into a UserId slot accepted (the SAME nominal is admitted)"
+    (valid_j2_nominal_same ());
+  expect_error
+    "j3: copy of a Result[Int, String]-shaped enum (String payload is owning) rejected by the recursive enum Copy rule"
+    "copy of non-Copy value" (mut_j3_owning_enum_copy ());
+  expect_valid
+    "j4: copy of an Option[Int]-shaped enum (all-Copy payloads) accepted by the recursive enum Copy rule"
+    (valid_j4_copyable_enum_copy ());
   (* i5: the runtime out-of-bounds case through the VM — the verifier
      must accept the program (Index li is never compared against the
      container length; the value 2 is only known at runtime) and

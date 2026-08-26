@@ -107,9 +107,10 @@ let effects_of_convention (c : Access_effect.t) : Access_effect.read_effect =
    The typechecker appends one `access` record per checked call
    argument: the place path when one is derivable (root local +
    projection chain; None otherwise), the callee-side read effect, the
-   enclosing item key and the call sequence number.  The channel
-   ACCUMULATES across the closure (it is not reset per item), so the
-   integrated pass can walk the whole recorded closure in one shot.
+   argument's type, the enclosing item key and the call sequence number.
+   The channel ACCUMULATES across the closure (it is not reset per
+   item), so the integrated pass can walk the whole recorded closure in
+   one shot.
 
    run_closure consumes that channel and returns a finding list:
      (a) ACCESS: per statement group — one call's argument list — the
@@ -119,12 +120,24 @@ let effects_of_convention (c : Access_effect.t) : Access_effect.read_effect =
      (b) OWNERSHIP: per item, the recorded operations are replayed on
          Resource_check's per-local state lattice in program order and
          state conflicts (double-move, use-after-consume,
-         re-initialization of a live value) are findings.
+         re-initialization of a live value) are findings.  The lattice
+         tracks ONLY genuinely owned (non-Copy) roots — the root's
+         copyability comes from its recorded type via
+         Resource_check.is_copy (the verifier's rule: scalars and
+         references Copy, String owning, a nominal Copy iff every field
+         / payload Copy); Copy-typed roots are routed read-only (moving
+         them is a copy).  A first Initialize transitions
+         Uninitialized -> Live without the re-initialization error (the
+         first sight of a `set`-convention write is the initialization
+         itself, so the pass cannot manufacture its own conflict).
 
    HONEST BOUNDARY: the pass walks the RECORDED typed channels — the
    full CFG-based stage (finalize_plan + edge_cleanup consumed by MIR)
-   remains future work.  The pass is additive: it reports findings and
-   changes nothing in the typechecker's counts. *)
+   remains future work.  A clean result from this recorded-channel
+   replay is NOT Stage 8/9 ownership completeness: the real
+   implementation must operate on the same typed CFG/native ownership
+   model.  The pass is additive: it reports findings and changes
+   nothing in the typechecker's counts. *)
 
 type access = {
   a_item : string;                 (* module::item key of the enclosing function *)
@@ -132,6 +145,7 @@ type access = {
   a_path : access_path option;     (* None when the argument is not a derivable place *)
   a_effect : Access_effect.read_effect;
   a_span : Span.span;
+  a_type : Type_repr.t;            (* the argument's type at the call site *)
 }
 
 type finding = {
@@ -161,8 +175,12 @@ let path_to_string (p : access_path) : string =
 
 (* The first integrated semantic pass (re-audit P0-11).  Consumes the
    closure's recorded typed access channel (accumulated per call
-   argument by the typechecker) and returns the finding list. *)
-let run_closure (accesses : access list) : finding list =
+   argument by the typechecker; each record carries the argument's type)
+   and returns the finding list.  `resolve` maps a nominal type id to
+   its definition shape so Resource_check.is_copy can decide which
+   tracked roots are genuinely owned (see resource_check.ml). *)
+let run_closure (resolve : Ids.Type_id.t -> Type_repr.t option) (accesses : access list) :
+    finding list =
   (* the channel is recorded by prepending: restore program order *)
   let accesses = List.rev accesses in
   (* one pass: group by statement group (item, call) and by item,
@@ -220,15 +238,27 @@ let run_closure (accesses : access list) : finding list =
     List.concat_map
       (fun item ->
         let accs = List.rev (Hashtbl.find item_buckets item) in
-        (* roots in first-seen order; every tracked root is owned *)
+        (* roots in first-seen order, carrying the first-seen type.  The
+           owned-local lattice tracks ONLY genuinely owned (non-Copy)
+           roots: a Copy-typed root (Int/Bool scalar, reference, ...) is
+           routed read-only — moving it is a copy, there is no resource
+           state to track.  The first-seen type is the root local's own
+           type (the local's type is stable across its accesses). *)
         let roots = ref [] in
         List.iter
           (fun (a : access) ->
             match a.a_path with
-            | Some p -> if not (List.mem p.root !roots) then roots := p.root :: !roots
+            | Some p ->
+                if not (List.exists (fun (r, _) -> r = p.root) !roots) then
+                  roots := (p.root, a.a_type) :: !roots
             | None -> ())
           accs;
-        let env = Resource_check.create_env (List.rev !roots) in
+        let owned_roots =
+          List.filter
+            (fun (_, ty) -> not (Resource_check.is_copy resolve [] ty))
+            (List.rev !roots)
+        in
+        let env = Resource_check.create_env (List.map fst owned_roots) in
         List.iter
           (fun (a : access) ->
             match a.a_path with
@@ -237,12 +267,29 @@ let run_closure (accesses : access list) : finding list =
                 (* a recorded access implies the local's binding was
                    accepted by the typechecker: materialize the binding
                    as Live at first sight (the lattice starts
-                   Uninitialized for locals created in the body) *)
-                if Resource_check.state_of env p.root = Resource_check.Uninitialized then
+                   Uninitialized for locals created in the body).  A
+                   FIRST Initialize is the initialization itself, so it
+                   transitions Uninitialized -> Live WITHOUT the
+                   re-initialization error — the re-initialization
+                   error applies only to subsequent Initialize accesses
+                   on a root that is already Live (otherwise the pass
+                   manufactures its own conflict). *)
+                let was_uninitialized =
+                  Resource_check.state_of env p.root = Resource_check.Uninitialized
+                in
+                if was_uninitialized then
                   Resource_check.set_state env p.root Resource_check.Live;
                 (match a.a_effect with
-                 | Access_effect.Consume -> Resource_check.check_move env p.root false a.a_item
-                 | Access_effect.Initialize -> Resource_check.check_initialize env p.root a.a_item
+                 | Access_effect.Consume ->
+                     (* the move's copyability comes from the argument's
+                        recorded type (scalars/immutables copy; owning
+                        types move) — not a hard-coded move *)
+                     Resource_check.check_move env p.root
+                       (Resource_check.is_copy resolve [] a.a_type)
+                       a.a_item
+                 | Access_effect.Initialize ->
+                     if was_uninitialized then ()
+                     else Resource_check.check_initialize env p.root a.a_item
                  | Access_effect.Read | Access_effect.Modify ->
                      Resource_check.check_read env p.root a.a_item))
           accs;

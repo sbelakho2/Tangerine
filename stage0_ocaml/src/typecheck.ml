@@ -1855,20 +1855,24 @@ let rec place_of_expr (env : env) (scope : scope) (e : Ast.expr) : Access_check.
 
 (* Record one call's argument accesses on the integrated channel (in
    program order; the channel is prepended, so callers prepend the
-   reversed list). *)
-let record_call_accesses (env : env) (scope : scope) (accs : (Ast.expr * Access_effect.read_effect * Span.span) list) : unit =
+   reversed list).  Each record carries the argument's typed expression
+   type so the pass can compute the root's copyability/owned-ness (the
+   verifier's copy rule) instead of hard-coding moves. *)
+let record_call_accesses (env : env) (scope : scope)
+    (accs : (Ast.expr * Access_effect.read_effect * Span.span * Type_repr.t) list) : unit =
   let call_seq = env.state.oracle.o_access_seq in
   env.state.oracle.o_access_seq <- call_seq + 1;
   let item = access_item_key env in
   let records =
     List.map
-      (fun (arg_expr, eff, span) ->
+      (fun (arg_expr, eff, span, ty) ->
         {
           Access_check.a_item = item;
           a_call = call_seq;
           a_path = place_of_expr env scope arg_expr;
           a_effect = eff;
           a_span = span;
+          a_type = ty;
         })
       accs
   in
@@ -3844,13 +3848,16 @@ and check_call_sig (env : env) (scope : scope) (expected : Type_repr.t option)
       in
       env.state.oracle.o_calls <- call :: env.state.oracle.o_calls;
       (* the integrated access channel (re-audit P0-11): one record per
-         argument, in program order, aligned with the recorded effects *)
-      let rec zip (a : Ast.call_arg list) (e : Access_effect.read_effect list) =
-        match a, e with
-        | x :: ra, eff :: re -> (x.Ast.ca_value, eff, x.Ast.ca_span) :: zip ra re
+         argument, in program order, aligned with the recorded effects;
+         each record carries the argument's typed type *)
+      let rec zip (a : Ast.call_arg list) (e : Access_effect.read_effect list)
+          (t : typed_expr list) =
+        match a, e, t with
+        | x :: ra, eff :: re, te :: rt ->
+            (x.Ast.ca_value, eff, x.Ast.ca_span, te.te_type) :: zip ra re rt
         | _ -> []
       in
-      record_call_accesses env scope (zip args effects);
+      record_call_accesses env scope (zip args effects tes);
       Ok { te_type = ret; te_effects = Array.of_list effects; te_span = span }
     end
   end
@@ -4204,14 +4211,17 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
                 env.state.oracle.o_calls <- call :: env.state.oracle.o_calls;
                 (* the integrated access channel (re-audit P0-11): the
                    receiver first, then the arguments, aligned with
-                   all_effects *)
-                let rec zip (a : Ast.call_arg list) (e : Access_effect.read_effect list) =
-                  match a, e with
-                  | x :: ra, eff :: re -> (x.Ast.ca_value, eff, x.Ast.ca_span) :: zip ra re
+                   all_effects; each record carries the typed type *)
+                let rec zip (a : Ast.call_arg list) (e : Access_effect.read_effect list)
+                    (t : typed_expr list) =
+                  match a, e, t with
+                  | x :: ra, eff :: re, te :: rt ->
+                      (x.Ast.ca_value, eff, x.Ast.ca_span, te.te_type) :: zip ra re rt
                   | _ -> []
                 in
                 record_call_accesses env scope
-                  ((base, recv_effect, Ast.expr_span base) :: zip args arg_effects);
+                  ((base, recv_effect, Ast.expr_span base, receiver.te_type)
+                  :: zip args arg_effects tes);
                 Ok { te_type = ret; te_effects = all_effects; te_span = span }
               end
             end

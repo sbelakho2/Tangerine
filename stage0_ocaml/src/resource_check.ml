@@ -24,6 +24,32 @@ type plan = {
   final_states : (int * resource_state) list;
 }
 
+(* The Copy property (mirror of mir_verify.is_copy, read-only reference):
+   scalars, references and function values are Copy; String is owning; a
+   tuple/fixed-array is Copy iff every element is; a nominal is Copy iff
+   every field (struct) or every payload (enum) is.  `resolve` maps a
+   nominal type id to its definition shape (the caller supplies the
+   typecheck env's nominal registry); anything unknown or unresolvable is
+   CONSERVATIVELY non-Copy (an owned lattice root, moved not copied). *)
+let rec is_copy (resolve : Ids.Type_id.t -> Type_repr.t option) (seen : Ids.Type_id.t list)
+    (ty : Type_repr.t) : bool =
+  match ty with
+  | Type_repr.Unit | Type_repr.Bool | Type_repr.Char | Type_repr.Int _
+  | Type_repr.Float _ | Type_repr.Raw_ptr _ | Type_repr.Ref_internal _
+  | Type_repr.Function _ | Type_repr.Never ->
+      true
+  | Type_repr.String -> false
+  | Type_repr.Tuple elems -> Array.for_all (is_copy resolve seen) elems
+  | Type_repr.Fixed_array (elem, _) -> is_copy resolve seen elem
+  | Type_repr.Named (tid, _) ->
+      if List.mem tid seen then false
+      else (
+        match resolve tid with
+        | None -> false
+        | Some def -> is_copy resolve (tid :: seen) def)
+  | Type_repr.Type_param _ | Type_repr.Infer_var _ | Type_repr.Int_literal _ | Type_repr.Error ->
+      false
+
 type env = {
   owned : int list;             (* locals that own a needs_drop value *)
   mutable states : (int * resource_state) list;
