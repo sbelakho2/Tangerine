@@ -3126,10 +3126,22 @@ and check_field (env : env) (_scope : scope) (span : Span.span) (base : typed_ex
                (Printf.sprintf "cannot project `.%s` from %s" fname (type_to_string base.te_type))))
   | _ -> (
       match base.te_type with
-      | Type_repr.Named (id, [| inner |]) when is_box id ->
+      | Type_repr.Named (id, [| inner |]) when is_box id -> (
           (* a field on a Box derefs the boxed value (`expr.kind` on a
-             Box[Expr]) *)
-          check_field env _scope span { base with te_type = inner } fname
+             Box[Expr]) UNLESS the Box declares the field itself
+             (`self.ptr` inside impl Box) *)
+          match List.assoc_opt "Box" env.nominals with
+          | Some nom when List.mem_assoc fname nom.nom_fields -> (
+              match List.assoc_opt fname nom.nom_fields with
+              | Some ft ->
+                  Ok
+                    {
+                      te_type = substitute_fixpoint [ (Type_repr.KParam (snd (List.hd nom.nom_params)), inner) ] ft;
+                      te_effects = [||];
+                      te_span = span;
+                    }
+              | None -> check_field env _scope span { base with te_type = inner } fname)
+          | _ -> check_field env _scope span { base with te_type = inner } fname)
       | Type_repr.Named (id, [| inner |])
         when Ids.Type_id.compare id b_ptr = 0 || Ids.Type_id.compare id b_ptrmut = 0 ->
           (* a field through the builtin Ptr/PtrMut nominal derefs the

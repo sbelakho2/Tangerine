@@ -51,13 +51,13 @@ let baseline_typecheck_debt : Debt_report.t =
         ("unresolved_callable", 34);
         ("unresolved_module", 0);
         ("cannot_infer_generic", 9);
-        ("type_mismatch", 193);
+        ("type_mismatch", 192);
         ("obligation", 4);
         ("duplicate_decl", 0);
         ("other", 20);
       ];
-    total = 275;
-    primaries = 197;
+    total = 274;
+    primaries = 196;
     secondaries = 78;
   }
 
