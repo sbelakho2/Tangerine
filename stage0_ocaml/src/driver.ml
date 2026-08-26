@@ -158,6 +158,25 @@ let struct_fields_of (env : Typecheck.env) :
                 nom.Typecheck.nom_fields ))
     env.Typecheck.nominals
 
+(* ── The persistent typed-node bridge (re-audit: TypedProgram/TypedHIR) ──
+   The typechecker's node-keyed map (span identity (file_id, start) ->
+   resolved node) crosses into lowering as Mir_lower's typed_nodes
+   channel, threaded alongside lowering_env_of into every
+   lower_function_with_variants call.  The typed channel is authoritative
+   in lowering when a span-keyed entry is present; the cast rule consumes
+   the checker-RESOLVED target (declaration-owned GenericParamIds) and
+   never re-derives it from syntax positionally. *)
+let typed_nodes_of (env : Typecheck.env) : ((int * int) * Mir_lower.typed_node) list =
+  Hashtbl.fold
+    (fun key (node : Typecheck.typed_node) acc ->
+      ( key,
+        {
+          Mir_lower.tn_type = node.Typecheck.tn_type;
+          tn_cast_target = node.Typecheck.tn_cast_target;
+        } )
+      :: acc)
+    env.Typecheck.typed_nodes []
+
 let lowering_env_of (env : Typecheck.env) : Mir_lower.func_env =
   (* both the qualified key and the bare name resolve (flat namespace) *)
   let values =
@@ -292,7 +311,8 @@ let lower_and_report (path : string) (env : Typecheck.env) (program : Ast.progra
               Array.map (fun p -> p.Type_repr.pt_convention) ts.Typecheck.ts_params
           | None -> [||]
         in
-        Mir_lower.lower_function_with_variants (user_variant_table env)
+        Mir_lower.lower_function_with_variants ~typed_nodes:(typed_nodes_of env)
+          (user_variant_table env)
           { base with Mir_lower.fn_ret }
           d.Ast.fn_sig.Ast.sig_name callable template_args conventions d)
       funcs
@@ -414,7 +434,8 @@ let cmd_interpret (args : string list) : int =
                       | Some ts -> (ts.Typecheck.ts_return, Ids.Callable_id.to_int ts.Typecheck.ts_callable)
                       | None -> (Type_repr.Unit, i)
                     in
-                    Mir_lower.lower_function_with_variants (user_variant_table env)
+                    Mir_lower.lower_function_with_variants ~typed_nodes:(typed_nodes_of env)
+                      (user_variant_table env)
                       { base with Mir_lower.fn_ret }
                       d.Ast.fn_sig.Ast.sig_name callable [||] [||] d)
                   funcs
@@ -1118,7 +1139,8 @@ let lower_closure (ctx : closure_ctx) : Seed_mir.program =
             | None -> (Type_repr.Unit, 0)
           in
           let f =
-            Mir_lower.lower_function_with_variants variants
+            Mir_lower.lower_function_with_variants ~typed_nodes:(typed_nodes_of ctx.ctx_env)
+              variants
               { base with Mir_lower.fn_ret }
               fd.Ast.fn_sig.Ast.sig_name callable [||] [||] fd
           in
@@ -1140,6 +1162,7 @@ let lower_closure (ctx : closure_ctx) : Seed_mir.program =
                   | Some ts ->
                       let f =
                         Mir_lower.lower_function_with_variants
+                          ~typed_nodes:(typed_nodes_of ctx.ctx_env)
                           variants
                           { base with Mir_lower.fn_ret = ts.Typecheck.ts_return }
                           m.Ast.fn_sig.Ast.sig_name

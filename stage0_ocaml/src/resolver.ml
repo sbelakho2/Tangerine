@@ -84,6 +84,14 @@ type tables = {
   tb_fields : Ids.Field_id.t SMap.t DefMap.t;
   tb_variants : Ids.Variant_id.t SMap.t DefMap.t;
   tb_methods : Ids.Callable_id.t SMap.t DefMap.t;
+  (* flat-namespace fallback accounting (re-audit frontend identity):
+     tb_strict disables the scan-all-scopes fallback entirely (the
+     future compiler mode: wrong module -> unresolved import);
+     tb_flat_fallback counts the fallback activations in the current
+     (recovery-capable) path, so the closure can trend the count to
+     zero as the kernel's imports move to per-module authority *)
+  tb_strict : bool;
+  tb_flat_fallback : int ref;
 }
 
 type callable = CFree of Ids.Module_id.t * int | CMethod of Ids.Module_id.t * int * int
@@ -91,6 +99,8 @@ type callable = CFree of Ids.Module_id.t * int | CMethod of Ids.Module_id.t * in
 type state = {
   st_tables : tables;
   st_callables : callable list;   (* dense CallableId enumeration order *)
+  st_strict : bool;
+  st_flat_fallback : int;
 }
 
 type resolved_program = {
@@ -295,23 +305,32 @@ let module_path_of (graph : Module_graph.t) (m : Ids.Module_id.t) : string list 
 (* Flat-namespace fallback (kernel semantic, audit §24): the kernel's
    cross-module name model is effectively global, so an import member
    missing from its stated module falls back to a global unique-name
-   search; multiple candidates are ambiguous (never first-wins). *)
+   search; multiple candidates are ambiguous (never first-wins).  The
+   re-audit's frontend-identity finding: this recovery belongs ONLY to
+   the current (flat/global) seed path — in strict mode (the future
+   compiler mode's per-module ModuleId/DefId authority) it is disabled:
+   wrong module -> unresolved import.  Every activation is counted so
+   the closure can trend the count to zero. *)
 let global_unique (tables : tables) (name : string) (ns : namespace) : import_target option =
-  let found = ref [] in
-  IntMap.iter
-    (fun _mid sc ->
-      let d =
-        match ns with
-        | Value -> SMap.find_opt name sc.sc_own_values
-        | Type -> SMap.find_opt name sc.sc_own_types
-      in
-      match d with
-      | Some def -> found := def :: !found
-      | None -> ())
-    tables.tb_scopes;
-  match List.rev !found with
-  | [ def ] -> Some (ITItem def)
-  | _ -> None
+  if tables.tb_strict then None
+  else
+    let found = ref [] in
+    IntMap.iter
+      (fun _mid sc ->
+        let d =
+          match ns with
+          | Value -> SMap.find_opt name sc.sc_own_values
+          | Type -> SMap.find_opt name sc.sc_own_types
+        in
+        match d with
+        | Some def -> found := def :: !found
+        | None -> ())
+      tables.tb_scopes;
+    match List.rev !found with
+    | [ def ] ->
+        incr tables.tb_flat_fallback;
+        Some (ITItem def)
+    | _ -> None
 
 let item_or_child (tables : tables) (mid : Ids.Module_id.t) (name : string) : import_target option =
   let mod_path = match IntMap.find_opt (Ids.Module_id.to_int mid) tables.tb_module_paths with Some p -> p | None -> [] in
@@ -480,6 +499,8 @@ type st = {
   mutable next_field : int;
   mutable next_variant : int;
   mutable next_callable : int;
+  mutable strict_mode : bool;
+  flat_fallback : int ref;
 }
 
 let tables_of (st : st) : tables =
@@ -489,7 +510,10 @@ let tables_of (st : st) : tables =
     tb_fields = st.fields;
     tb_variants = st.variants;
     tb_methods = st.methods;
-    tb_module_paths = st.module_paths}
+    tb_module_paths = st.module_paths;
+    tb_strict = st.strict_mode;
+    tb_flat_fallback = st.flat_fallback;
+  }
 
 (* Register a value definition (first-wins per module). *)
 let register_value (st : st) (sc : scope) (m : Ids.Module_id.t) (idx : int) (name : string) : scope =
@@ -826,7 +850,13 @@ let iter_nodes (manifest : Bootstrap_manifest.t) (graph : Module_graph.t)
           visit file_node)
     (Bootstrap_manifest.entries manifest)
 
-let resolve (manifest : Bootstrap_manifest.t) (graph : Module_graph.t)
+(* Resolve the closure.  strict: the future compiler mode's per-module
+   authority — the flat/global unique-name recovery is disabled and
+   every wrong-module import stays unresolved.  Off (recovery on) for
+   the current bootstrap path; the fallback activation count is
+   reported here so the closure's dependency on the flat model can be
+   measured and trended toward zero. *)
+let resolve ?(strict = false) (manifest : Bootstrap_manifest.t) (graph : Module_graph.t)
     (diags : Diagnostic.bag) : resolved_program =
   let st : st =
     {
@@ -845,12 +875,17 @@ let resolve (manifest : Bootstrap_manifest.t) (graph : Module_graph.t)
       next_field = 0;
       next_variant = 0;
       next_callable = 0;
+      strict_mode = strict;
+      flat_fallback = ref 0;
     }
   in
   iter_nodes manifest graph (phase1_node st graph);
   iter_nodes manifest graph (phase2_node st graph diags);
   iter_nodes manifest graph (phase3_node st diags);
   let tables = tables_of st in
+  let fallback = !(st.flat_fallback) in
+  Printf.printf "  resolver flat-name fallback activations: %d (strict mode: %s)\n" fallback
+    (if strict then "ON" else "off");
   {
     graph;
     expr_defs = List.rev st.expr_defs;
@@ -858,7 +893,7 @@ let resolve (manifest : Bootstrap_manifest.t) (graph : Module_graph.t)
     field_defs = List.rev st.field_defs;
     variant_defs = List.rev st.variant_defs;
     call_candidates = List.rev st.call_candidates;
-    state = { st_tables = tables; st_callables = List.rev st.callables };
+    state = { st_tables = tables; st_callables = List.rev st.callables; st_strict = strict; st_flat_fallback = fallback };
   }
 
 (* ── Public lookups ─────────────────────────────────────────── *)

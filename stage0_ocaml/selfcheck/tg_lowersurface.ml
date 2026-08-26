@@ -931,4 +931,194 @@ end
                       Printf.printf "  struct-field RESULT: FAIL (expected 63)\n";
                       exit 1
                     end
-                | Error m -> Printf.printf "  struct-field main returned: <inspect failed: %s>\n" m)))
+                 | Error m -> Printf.printf "  struct-field main returned: <inspect failed: %s>\n" m)));
+      (* ── typed-cast proof (re-audit: the persistent
+         TypedProgram/TypedHIR bridge — the node-keyed typed-expr map and
+         its cast-target channel) ─────────────────────────────────────
+         A generic cast `p as Ptr[U]` inside def cast_proof[T, U]: the
+         CHECKER resolves the target to Named(Ptr, [Type_param pid_u])
+         with pid_u the function's DECLARATION-OWNED GenericParamId.
+         The map the typechecker persists (span identity (file_id, start)
+         -> node) must carry exactly that target, and lowering through
+         the DRIVER-built env (the typed_nodes channel present) must emit
+         the Cast rvalue with the SAME pid — never the syntax-driven
+         reconstruction, which cannot even resolve the generic name and
+         whose positional KParam(make i) keys miss the declaration-owned
+         ids. *)
+      let cast_src = {|
+def cast_proof[T, U](p: Ptr[T]) -> Ptr[U]
+  p as Ptr[U]
+end
+|} in
+      let cast_file = "<typed-cast-proof>" in
+      (match Source_loader.load_string cast_file cast_src with
+       | Error _ -> failwith "typed-cast proof source load"
+       | Ok csrc ->
+           let csm = Span.create () in
+           let cfid = Span.add_file csm csrc.Source.name csrc in
+           let cdiags = Diagnostic.create_bag () in
+           let clx = Lexer.create csrc.Source.bytes cfid cdiags in
+           let ctoks = Lexer.lex clx in
+           let cprog = Parser.parse ctoks csrc.Source.bytes cfid cdiags [ "castproof" ] in
+           if Diagnostic.has_errors cdiags then begin
+             Printf.printf "  typed-cast proof: FAIL (parse errors)\n%s\n"
+               (Diagnostic.render csm cdiags);
+             exit 1
+           end;
+           let cenv =
+             match Typecheck.check_program (Typecheck.initial_env ()) cprog with
+             | Error m -> failwith ("typed-cast proof typecheck: " ^ m)
+             | Ok (env', errors) ->
+                 if errors <> [] then
+                   failwith
+                     ("typed-cast proof typecheck errors: " ^ String.concat "; " errors);
+                 env'
+           in
+           let cast_fn_decl =
+             match
+               List.find_map
+                 (fun i ->
+                   match i.Ast.kind with
+                   | Ast.Function d when d.Ast.fn_sig.Ast.sig_name = "cast_proof" -> Some d
+                   | _ -> None)
+                 cprog.Ast.items
+             with
+             | Some d -> d
+             | None -> failwith "typed-cast proof: no cast_proof function"
+           in
+           let ty_ast, cast_span, inner_span =
+             match cast_fn_decl.Ast.fn_body with
+             | Ast.FnExpr (Ast.Cast (Ast.Name (_, ispan), ty, span)) -> (ty, span, ispan)
+             | Ast.FnBlock { Ast.b_tail = Some (Ast.Cast (Ast.Name (_, ispan), ty, span)); _ } ->
+                 (ty, span, ispan)
+             | _ -> failwith "typed-cast proof: cast_proof body is not `p as Ptr[U]`"
+           in
+           let cast_ts =
+             match List.assoc_opt "cast_proof" cenv.Typecheck.functions with
+             | Some ts -> ts
+             | None -> (
+                 match
+                   List.filter
+                     (fun (k, _) -> Util.has_suffix k "::cast_proof")
+                     cenv.Typecheck.functions
+                 with
+                 | [ (_, ts) ] -> ts
+                 | _ -> failwith "typed-cast proof: no typed signature for cast_proof")
+           in
+           let pid_t, pid_u =
+             match cast_ts.Typecheck.ts_params_decl with
+             | [ (_, t); (_, u) ] -> (t, u)
+             | _ -> failwith "typed-cast proof: cast_proof[T,U] params not declaration-owned"
+           in
+           let ptr_tid = List.assoc "Ptr" cenv.Typecheck.type_ids in
+           let resolved_target =
+             Type_repr.Named (ptr_tid, [| Type_repr.Type_param pid_u |])
+           in
+           let map = Driver.typed_nodes_of cenv in
+           let cast_node =
+             match List.assoc_opt (cfid, cast_span.Span.start) map with
+             | Some n -> n
+             | None ->
+                 Printf.printf
+                   "  typed-cast map: FAIL (no typed node for the cast's span file#%d[%d..%d))\n"
+                   cfid cast_span.Span.start cast_span.Span.end_;
+                 exit 1
+           in
+           (* the cast's node carries the resolved target, and the target
+              is the declaration-owned U — distinct from the builtin
+              Ptr's own param and from the positional synthetic id *)
+           let ptr_builtin_param =
+             match List.assoc "Ptr" (Driver.lowering_env_of cenv).Mir_lower.types with
+             | Type_repr.Named (_, [| Type_repr.Type_param p |]) -> p
+             | _ -> failwith "typed-cast proof: no Ptr builtin type entry"
+           in
+           if
+             cast_node.Mir_lower.tn_cast_target <> Some resolved_target
+             || Type_repr.compare cast_node.Mir_lower.tn_type resolved_target <> 0
+             || Ids_core.Generic_param_id.compare pid_u ptr_builtin_param = 0
+             || Ids_core.Generic_param_id.compare pid_u (Ids_core.Generic_param_id.make 0) = 0
+           then begin
+             Printf.printf
+               "  typed-cast map: FAIL (expected the checker-resolved Named(Ptr, [Type_param %d]) at file#%d[%d..%d)); got tn_type=%s tn_cast_target=%s; builtin Ptr param=%d; U=%d)\n"
+               (Ids_core.Generic_param_id.to_int pid_u)
+               cfid cast_span.Span.start cast_span.Span.end_
+               (match cast_node.Mir_lower.tn_type with
+                | Type_repr.Named (_, args) -> "Named(Ptr, [" ^ String.concat "; " (Array.to_list (Array.map (fun a -> match a with Type_repr.Type_param p -> "Type_param " ^ string_of_int (Ids_core.Generic_param_id.to_int p) | _ -> "?") args)) ^ "])"
+                | _ -> "?")
+               (match cast_node.Mir_lower.tn_cast_target with
+                | Some _ -> "Some(Named(Ptr, [...]))"
+                | None -> "None")
+               (Ids_core.Generic_param_id.to_int ptr_builtin_param)
+               (Ids_core.Generic_param_id.to_int pid_u);
+             exit 1
+           end;
+           (* the inner `p` node is NOT a cast: the channel distinguishes
+              the cast-target field from the plain expr type *)
+           (match List.assoc_opt (cfid, inner_span.Span.start) map with
+            | Some inner_node when inner_node.Mir_lower.tn_cast_target = None -> ()
+            | Some _ ->
+                Printf.printf "  typed-cast map: FAIL (the inner `p` node carries a cast target)\n";
+                exit 1
+            | None -> ());
+           Printf.printf
+             "  typed-cast map: PASS (cast span file#%d[%d..%d) -> Named(Ptr, [Type_param %d]) with the declaration-owned U; builtin Ptr param %d differs)\n"
+             cfid cast_span.Span.start cast_span.Span.end_
+             (Ids_core.Generic_param_id.to_int pid_u)
+             (Ids_core.Generic_param_id.to_int ptr_builtin_param);
+           (* the lowering leg: lower cast_proof through the DRIVER-built
+              env with the typed_nodes channel present; the Cast rvalue
+              must carry the SAME declaration-owned pid_u *)
+           let lowered_cast =
+             Mir_lower.lower_function_with_variants Mir_lower.default_variant_table
+               ~typed_nodes:(Driver.typed_nodes_of cenv)
+               ~param_tys_opt:
+                 (Array.map (fun p -> p.Type_repr.pt_type) cast_ts.Typecheck.ts_params)
+               { (Driver.lowering_env_of cenv) with Mir_lower.fn_ret = cast_ts.Typecheck.ts_return }
+               "cast_proof" (Ids.Callable_id.to_int cast_ts.Typecheck.ts_callable)
+               (Array.of_list
+                  (List.map (fun (_, pid) -> Type_repr.Type_param pid)
+                     cast_ts.Typecheck.ts_params_decl))
+               (Array.map (fun p -> p.Type_repr.pt_convention) cast_ts.Typecheck.ts_params)
+               cast_fn_decl
+           in
+           let cast_rv_ty =
+             Array.to_list lowered_cast.Seed_mir.blocks
+             |> List.find_map (fun (b : Seed_mir.block) ->
+                    List.find_map
+                      (fun (s : Seed_mir.statement) ->
+                        match s with
+                        | Seed_mir.Assign (_, Seed_mir.Cast (_, ty)) -> Some ty
+                        | _ -> None)
+                      b.Seed_mir.statements)
+           in
+           (match cast_rv_ty with
+            | Some ty when Type_repr.compare ty resolved_target = 0 ->
+                Printf.printf
+                  "  typed-cast lowering: PASS (lowered Cast rvalue carries Named(Ptr, [Type_param %d]) — the declaration-owned U, not a synthetic positional id)\n"
+                  (Ids_core.Generic_param_id.to_int pid_u)
+            | Some ty ->
+                Printf.printf
+                  "  typed-cast lowering: FAIL (Cast rvalue differs from the resolved target)\n";
+                ignore ty;
+                exit 1
+            | None ->
+                Printf.printf "  typed-cast lowering: FAIL (no Cast statement in lowered cast_proof)\n";
+                exit 1);
+           (* the contrast: the syntax-driven reconstruction cannot
+              resolve the generic name at all (and its positional keys
+              could never hit the declaration-owned ids) *)
+           (match
+              (try Ok (Mir_lower.type_of_syntax (Driver.lowering_env_of cenv) ty_ast)
+               with Mir_lower.Seed_bug _ -> Error ())
+            with
+            | Error () ->
+                Printf.printf
+                  "  typed-cast contrast: PASS (the syntax-driven reconstruction cannot even resolve `Ptr[U]` — the typed channel is required)\n"
+            | Ok t when Type_repr.compare t resolved_target <> 0 ->
+                Printf.printf
+                  "  typed-cast contrast: PASS (syntax reconstruction differs from the checker-resolved target)\n"
+            | Ok _ ->
+                Printf.printf
+                  "  typed-cast contrast: FAIL (syntax reconstruction reproduced the resolved target)\n";
+                exit 1);
+           ignore pid_t)

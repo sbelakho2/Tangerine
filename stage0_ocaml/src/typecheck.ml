@@ -60,6 +60,20 @@ type typed_expr = {
   te_span : Span.span;
 }
 
+(* The persistent typed-node bridge (re-audit: TypedProgram/TypedHIR).
+   Node identity = the expr's span (file_id, start) — the same identity
+   the parser stamps on the AST node.  Every accepted node persists its
+   resolved type; casts additionally persist the checker-RESOLVED target
+   type (a Named(GenericParamId, ...) carrying the declaration-owned
+   ids — never a positional reconstruction).  The map is populated
+   during check_expr (additive) and exposed to lowering through the
+   driver's typed_nodes_of, where the typed channel is authoritative
+   when a span-keyed entry is present. *)
+type typed_node = {
+  tn_type : Type_repr.t;               (* the expr's resolved type *)
+  tn_cast_target : Type_repr.t option; (* Ast.Cast: checker-resolved target *)
+}
+
 type typed_call = {
   target : Ids.Callable_id.t option;
   substitution : Type_repr.t array;
@@ -144,6 +158,12 @@ type env = {
   module_id : Ids.Module_id.t;
   resolved : Resolver.resolved_program option;
   module_path : string list;
+  (* the persistent typed-node map (re-audit bridge): span identity
+     (file_id, start) -> resolved node.  Populated during check_expr;
+     the mutable table is shared across the `{ env with ... }` record
+     updates, so the final env the driver receives holds every accepted
+     node's channel entry. *)
+  typed_nodes : (int * int, typed_node) Hashtbl.t;
 }
 
 type scope = {
@@ -771,6 +791,10 @@ let builtin_constructors (st : state) (opt_p : Ids.Generic_param_id.t)
 
 (* The initial env: the compiler-registered prelude. *)
 let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
+  (* the Box wrapper identity is per-environment: the global only ever
+     tracks the CURRENT env's Box registration, never one leaked from an
+     earlier independent compilation environment in the same process *)
+  box_tid := None;
   let st =
     {
       next_type_id = 100;
@@ -1193,6 +1217,7 @@ let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
     module_id = Ids.Module_id.make 0;
     resolved;
     module_path = [];
+    typed_nodes = Hashtbl.create 256;
   }
 
 (* ────────────────────────────────────────────────────────────────
@@ -1632,17 +1657,26 @@ and resolve_named (env : env) (scope : scope) (span : Span.span) (name : string)
 let resolve_signature (env : env) (scope : scope) (sig_ : Ast.function_sig)
     (extra_params : (string * Ids.Generic_param_id.t) list) ~(key : string) :
     (typed_signature, string) result =
+  (* the memo covers ONLY the method's OWN type parameters (per-method
+     deterministic minting across the fixpoint re-registrations).  The
+     impl/owner-level params (extra_params) are always the current
+     caller's binders: a stale memo hit must never mix ANOTHER impl's
+     params into this signature (the owner-separated model — each impl's
+     U_impl is its own binder; reusing the first impl's ids here would
+     make `self: Array[T_a]` and `-> Array[T_b]` disagree). *)
   let params_decl =
     let own =
-      List.map (fun (tp : Ast.type_param) -> (tp.Ast.tp_name, fresh_param_id env.state))
-        sig_.Ast.sig_type_params
+      match Hashtbl.find_opt env.state.sig_param_ids key with
+      | Some ids -> ids
+      | None ->
+          let ids =
+            List.map (fun (tp : Ast.type_param) -> (tp.Ast.tp_name, fresh_param_id env.state))
+              sig_.Ast.sig_type_params
+          in
+          Hashtbl.add env.state.sig_param_ids key ids;
+          ids
     in
-    match Hashtbl.find_opt env.state.sig_param_ids key with
-    | Some ids -> ids
-    | None ->
-        let ids = own @ extra_params in
-        Hashtbl.add env.state.sig_param_ids key ids;
-        ids
+    own @ extra_params
   in
   let scope =
     { scope with generics = List.map (fun (n, i) -> (n, i)) params_decl @ scope.generics }
@@ -1928,7 +1962,18 @@ let rec check_pattern (env : env) (scope : scope) (ty : Type_repr.t) (p : Ast.pa
   | Ast.StructPattern (name, fields, span) -> (
       match resolve_nominal env span name with
       | Error m -> Error m
-      | Ok (nom, _, args) when nom.nom_kind = `Struct -> (
+      | Ok (nom, tid, args) when nom.nom_kind = `Struct -> (
+          (* the pattern's field types instantiate the nominal's params
+             with the SCRUTINEE's concrete arguments when the scrutinee
+             is the same nominal (the owner-separated model: a pattern
+             `Box { ptr }` against `Box[U_impl]` binds Ptr[U_impl], never
+             the nominal's own T_struct); otherwise the nominal's stored
+             args are the fallback *)
+          let args =
+            match ty with
+            | Type_repr.Named (tyid, tyargs) when Ids.Type_id.compare tyid tid = 0 -> tyargs
+            | _ -> args
+          in
           let subst = List.map2 (fun (_, p) a -> (Type_repr.KParam p, a)) nom.nom_params (Array.to_list args) in
           let field_ty (fname : string) : (Type_repr.t, string) result =
             match List.assoc_opt fname nom.nom_fields with
@@ -2123,6 +2168,15 @@ and check_expr (env : env) (scope : scope) (expected : Type_repr.t option) (e : 
   match check_expr_inner env scope expected e with
   | Ok te ->
       env.state.oracle.o_exprs <- te :: env.state.oracle.o_exprs;
+      (* the persistent typed-node bridge: record the accepted node by
+         span identity (file_id, start).  A cast node's te_type IS the
+         checker-resolved target type; the dedicated tn_cast_target
+         field keeps the channel self-describing for the lowering Cast
+         rule (the target carries the declaration-owned GenericParamIds
+         the syntax-driven reconstruction cannot recover). *)
+      let cast_target = match e with Ast.Cast _ -> Some te.te_type | _ -> None in
+      Hashtbl.replace env.typed_nodes (te.te_span.Span.file_id, te.te_span.Span.start)
+        { tn_type = te.te_type; tn_cast_target = cast_target };
       Ok te
   | Error m -> Error m
 
@@ -2276,7 +2330,13 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
                     (* the stored nominal params may be stale (frozen at
                        the first registration round); instantiate against
                        the scope's live generics by name, falling back to
-                       a fresh param when the name is not in scope *)
+                       a fresh param when the name is not in scope.
+                       NOTE (re-audit): the name-based reconstruction is
+                       genuinely reachable in the kernel closure — the
+                       ID-based path (the nominal's own memoized params)
+                       raises the closure debt to 259; kept with its
+                       reachability reported until the kernel's literals
+                       pass explicit type arguments *)
                     match List.assoc_opt name env.types with
                     | Some (Type_repr.Named (_, a)) ->
                         Ok
@@ -3082,11 +3142,6 @@ and check_place (env : env) (scope : scope) (e : Ast.expr) : (Type_repr.t * bool
             | Type_repr.Raw_ptr (Type_repr.Mutable, _) -> true
             | Type_repr.Named (id, _) when Ids.Type_id.compare id b_ptrmut = 0 -> true
             | _ -> bmut
-          in
-          let bt =
-            match bt with
-            | Type_repr.Named (id, [| inner |]) when is_box id -> inner
-            | _ -> bt
           in
           match
             check_field env scope span
@@ -4165,7 +4220,6 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
                   (fun (k, v) -> if not (List.mem_assoc k !subst) then subst := (k, v) :: !subst)
                   !s3;
                 let ret = substitute_fixpoint !subst sig_.ts_return in
-
                 let sig_ids = List.map snd sig_.ts_params_decl in
                 let* () =
                   match List.filter (fun p -> List.mem p sig_ids) (params_in ret) with
@@ -4419,40 +4473,15 @@ and check_impl (env : env) (d : Ast.impl_decl) : (unit, string) result =
     match Hashtbl.find_opt env.state.sig_param_ids key with
     | Some ids -> ids
     | None ->
-        (* the impl's type parameters ARE the target nominal's type
-           parameters: reuse the nominal's identities so the impl's `T`
-           and the struct's `T` are the same semantic id *)
-        let nominal_ids =
-          match List.assoc_opt d.i_target_type env.nominals with
-          | Some nom ->
-              List.map
-                (fun (tp : Ast.type_param) ->
-                  match List.assoc_opt tp.tp_name nom.nom_params with
-                  | Some pid -> (tp.tp_name, pid)
-                  | None -> (tp.tp_name, fresh_param_id env.state))
-                d.i_type_params
-          | None ->
-              (* no nominal record (builtin-only targets like `Array`):
-                 the nominal binder memo still holds the canonical param
-                 ids (seeded for LangItems, or minted by a source
-                 declaration) — reuse them so every impl of the target
-                 converges on ONE parameter identity *)
-              List.map
-                (fun (tp : Ast.type_param) ->
-                  match
-                    (match
-                       Hashtbl.find_opt env.state.sig_param_ids ("nominal::" ^ d.i_target_type)
-                     with
-                     | Some ids -> List.assoc_opt tp.tp_name ids
-                     | None -> None)
-                  with
-                  | Some pid -> (tp.tp_name, pid)
-                  | None -> (tp.tp_name, fresh_param_id env.state))
-                d.i_type_params
-        in
+        (* owner separation: the impl's type parameters are the impl's OWN
+           binders, never the target nominal's — T_struct and U_impl are
+           different declarations with different owners; their relationship
+           is the target substitution Box[T_struct] <- Box[U_impl], applied
+           when field/method resolution reaches into the nominal's shapes *)
         let ids =
-          if List.length nominal_ids = List.length d.i_type_params then nominal_ids
-          else List.map (fun (tp : Ast.type_param) -> (tp.tp_name, fresh_param_id env.state)) d.i_type_params
+          List.map
+            (fun (tp : Ast.type_param) -> (tp.tp_name, fresh_param_id env.state))
+            d.i_type_params
         in
         Hashtbl.add env.state.sig_param_ids key ids;
         ids
@@ -4663,40 +4692,15 @@ and register_impl (env : env) (d : Ast.impl_decl) : (env, string) result =
     match Hashtbl.find_opt env.state.sig_param_ids key with
     | Some ids -> ids
     | None ->
-        (* the impl's type parameters ARE the target nominal's type
-           parameters: reuse the nominal's identities so the impl's `T`
-           and the struct's `T` are the same semantic id *)
-        let nominal_ids =
-          match List.assoc_opt d.i_target_type env.nominals with
-          | Some nom ->
-              List.map
-                (fun (tp : Ast.type_param) ->
-                  match List.assoc_opt tp.tp_name nom.nom_params with
-                  | Some pid -> (tp.tp_name, pid)
-                  | None -> (tp.tp_name, fresh_param_id env.state))
-                d.i_type_params
-          | None ->
-              (* no nominal record (builtin-only targets like `Array`):
-                 the nominal binder memo still holds the canonical param
-                 ids (seeded for LangItems, or minted by a source
-                 declaration) — reuse them so every impl of the target
-                 converges on ONE parameter identity *)
-              List.map
-                (fun (tp : Ast.type_param) ->
-                  match
-                    (match
-                       Hashtbl.find_opt env.state.sig_param_ids ("nominal::" ^ d.i_target_type)
-                     with
-                     | Some ids -> List.assoc_opt tp.tp_name ids
-                     | None -> None)
-                  with
-                  | Some pid -> (tp.tp_name, pid)
-                  | None -> (tp.tp_name, fresh_param_id env.state))
-                d.i_type_params
-        in
+        (* owner separation: the impl's type parameters are the impl's OWN
+           binders, never the target nominal's — T_struct and U_impl are
+           different declarations with different owners; their relationship
+           is the target substitution Box[T_struct] <- Box[U_impl], applied
+           when field/method resolution reaches into the nominal's shapes *)
         let ids =
-          if List.length nominal_ids = List.length d.i_type_params then nominal_ids
-          else List.map (fun (tp : Ast.type_param) -> (tp.tp_name, fresh_param_id env.state)) d.i_type_params
+          List.map
+            (fun (tp : Ast.type_param) -> (tp.tp_name, fresh_param_id env.state))
+            d.i_type_params
         in
         Hashtbl.add env.state.sig_param_ids key ids;
         ids

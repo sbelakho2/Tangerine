@@ -33,8 +33,11 @@ and state
 (* Resolve a compilation: iterate modules in manifest order, items in
    source order; build per-module symbol tables, resolve imports
    (E2001), report ambiguous names (E2002) and unresolved mandatory
-   names (E2003, impl targets/traits and trait supertraits). *)
-val resolve : Bootstrap_manifest.t -> Module_graph.t -> Diagnostic.bag -> resolved_program
+   names (E2003, impl targets/traits and trait supertraits).  strict
+   disables the flat/global unique-name recovery (the future compiler
+   mode's per-module ModuleId/DefId authority): wrong module ->
+   unresolved import. *)
+val resolve : ?strict:bool -> Bootstrap_manifest.t -> Module_graph.t -> Diagnostic.bag -> resolved_program
 
 (* Bare-name lookups.  Authority order: explicit/aliased/group imports,
    then glob imports, then the module's own items; a glob colliding with

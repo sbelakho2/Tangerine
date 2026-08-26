@@ -92,6 +92,22 @@ type func_env = {
   struct_fields : (Ids.Type_id.t * (string * Ids.Field_id.t * Type_repr.t) list) list;
 }
 
+(* ── The persistent typed-node channel (re-audit: TypedProgram/TypedHIR
+      bridge) ─────────────────────────────────────────────────────
+   Span identity (file_id, start) -> the typechecker's resolved node.
+   The typed channel is AUTHORITATIVE when present: a cast's resolved
+   target comes from the checker's Named(GenericParamId, ...) with the
+   declaration-owned ids, never from type_of_syntax's positional
+   KParam(make i) reconstruction.  The channel is threaded into lowering
+   through the ~typed_nodes parameter of lower_function_with_variants
+   (the driver's typed_nodes_of builds it from the typechecker's env);
+   hand-built selfcheck envs omit it ([]) and lowering falls back to the
+   syntax-driven channels. *)
+type typed_node = {
+  tn_type : Type_repr.t;               (* the expr's resolved type *)
+  tn_cast_target : Type_repr.t option; (* Ast.Cast: checker-resolved target *)
+}
+
 (* ── Variant tables ──────────────────────────────────────────────
 
    The seed representation of an enum value is
@@ -220,7 +236,15 @@ type lower_state = {
   mutable continue_target : int option;
   variants : variant_table;              (* enum variant/constructor identity *)
   mutable defer_stack : Ast.block_body list;  (* function-level defer bodies; head = most recent *)
+  (* the persistent typed-node channel: span identity (file_id, start)
+     -> the typechecker's resolved node ([] = channel absent) *)
+  typed_nodes : ((int * int) * typed_node) list;
 }
+
+(* The typed-node channel lookup: the typechecker's resolved node for an
+   expr's span identity, when the channel is present. *)
+let typed_node_of (st : lower_state) (span : Span.span) : typed_node option =
+  List.assoc_opt (span.Span.file_id, span.Span.start) st.typed_nodes
 
 let new_block (st : lower_state) : int =
   let id = st.next_block in
@@ -806,9 +830,21 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
           (copy_place st (cur_place st id), it)
       | Ast.Deref | Ast.Borrow | Ast.BorrowMut ->
           lower_expr env st inner)
-  | Ast.Cast (inner, ty, _) ->
+  | Ast.Cast (inner, ty, span) ->
       let io, _ = lower_expr env st inner in
-      let rt = type_of_syntax env ty in
+      (* the typed channel is authoritative when present: the target is
+         the checker's resolved type (declaration-owned GenericParamIds),
+         not type_of_syntax's positional KParam(make i) reconstruction
+         (re-audit: `x as Ptr[U]` must lower Ptr[U]'s U, not the
+         builtin's own param or a synthetic positional id) *)
+      let rt =
+        match typed_node_of st span with
+        | Some node -> (
+            match node.tn_cast_target with
+            | Some tgt -> tgt
+            | None -> node.tn_type)
+        | None -> type_of_syntax env ty
+      in
       let id = fresh_local st rt in
       emit st (Seed_mir.Assign (cur_place st id, Seed_mir.Cast (io, rt)));
       (copy_place st (cur_place st id), rt)
@@ -1591,7 +1627,9 @@ and emit_defers (env : func_env) (st : lower_state) : unit =
 
 (* ── Function lowering ────────────────────────────────────────── *)
 
-let lower_function_with_variants ?(param_tys_opt : Type_repr.t array option) (variants : variant_table)
+let lower_function_with_variants
+    ?(typed_nodes : ((int * int) * typed_node) list = [])
+    ?(param_tys_opt : Type_repr.t array option) (variants : variant_table)
     (env : func_env) (name : string)
     (callable : int) (template_args : Type_repr.t array)
     (param_conventions : Access_effect.t array) (fn : Ast.function_decl) : Seed_mir.function_ =
@@ -1609,6 +1647,7 @@ let lower_function_with_variants ?(param_tys_opt : Type_repr.t array option) (va
       continue_target = None;
       variants;
       defer_stack = [];
+      typed_nodes;
     }
   in
   (* local 0 = return slot *)
