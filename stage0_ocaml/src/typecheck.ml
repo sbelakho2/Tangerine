@@ -4781,6 +4781,7 @@ let run_oracle (env : env) (_item_name : string) : string list =
     @ List.map (fun (_, s) -> s.ts_callable) env.methods
     @ List.map (fun (_, s) -> s.ts_callable) env.constructors
     @ List.map (fun (_, s) -> s.ts_callable) st.query_sigs
+    @ List.map (fun (_, s) -> s.ts_callable) st.nested_functions
   in
   let is_known c =
     List.exists (fun k -> Ids.Callable_id.compare k c = 0) known_callables
