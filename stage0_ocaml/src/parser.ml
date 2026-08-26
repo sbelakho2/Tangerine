@@ -252,7 +252,6 @@ let rec parse_program (p : parser) (program_module_path : string list) : Ast.pro
      | Some item ->
          (match item.Ast.kind with
           | Ast.Function fd when String.equal fd.Ast.fn_sig.Ast.sig_name "linker_resolve_entry_name" ->
-              Printf.eprintf "DBG parse-item-FOUND\n"
           | _ -> ());
          items := item :: !items
      | None -> ignore (advance p));
