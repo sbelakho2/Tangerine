@@ -28,9 +28,22 @@ let let_param (ty : Type_repr.t) : Type_repr.param_type = { Type_repr.pt_convent
          before matching/specializing, and the specialization cache is
          memoized by the SUBSTITUTED args (outer[Int] -> mid[Int] ->
          inner[Int], outer[String] -> mid[String] -> inner[String]);
-     (e) NESTED GENERIC TYPE ARGUMENTS: inner is instantiated with
-         Named(type#7,[T]) where T is the caller's parameter — the
-         substitution recurses through the generic type's arguments.
+   (e) NESTED GENERIC TYPE ARGUMENTS: inner is instantiated with
+       Named(type#7,[T]) where T is the caller's parameter — the
+       substitution recurses through the generic type's arguments;
+   (f) POST-MONO CONCRETE TYPE-INSTANCE MATERIALIZATION (the re-audit
+       finding: "generic nominal type definitions disappear before
+       MIR"): a generic struct Pair[T] { first: T; second: T } (the
+       template def whose fields carry Type_param) instantiated at
+       Pair[Int] and Pair[String] through the CALL instances — the
+       monomorphizer queues (pair_tid, [Int]) and (pair_tid, [String])
+       as required concrete type definitions, and the driver's post-mono
+       materialization produces BOTH concrete StructDefs (fields
+       substituted Int,Int / String,String) with the semantic FieldIds
+       preserved from the original def, mints a distinct fresh TypeId
+       per instance, rewrites every Named mention (bodies, call
+       instances, aggregate kinds) to the fresh identities, and the
+       final program verifies and executes.
 
    Generic method calls are NOT representable in Seed MIR: the MIR has
    no method-call form (lowering of a method call is a seed_bug in
@@ -473,6 +486,322 @@ let check_nested_generics () =
        else
          fail "nested generics: expected outer[Int] with param Vec[Int] and inner[Vec[Int]] with param Vec[Int]")
 
+(* ── (f) post-mono concrete type-instance materialization ───────────
+   The re-audit finding: the mono phase specializes functions only —
+   a generic struct Pair[T] { first: T; second: T } instantiated at
+   Pair[Int] and Pair[String] has no real post-mono StructDef
+   specialization mechanism.  This check runs the FULL post-mono
+   assembly: Mono.build with the generic registry (the monomorphizer
+   queues the concrete instances alongside the function instances),
+   then Driver.materialize_type_instances (the driver's post-mono type
+   materialization).  It asserts:
+     - the queue carries (pair_tid, [Int]) and (pair_tid, [String])
+       exactly once each, in discovery order;
+     - the final types table carries BOTH concrete StructDefs — fields
+       substituted Int,Int and String,String — with the semantic
+       FieldIds (and declaration-order indices) preserved from the
+       original def, under DISTINCT fresh TypeIds (never the generic
+       tid);
+     - every Named mention is rewritten to the fresh identity (the
+       specialized f's signature/body and main's call instances);
+     - the final program passes Mir_verify and executes under the Seed
+       VM. *)
+
+let type_eq (a : Type_repr.t) (b : Type_repr.t) : bool = Type_repr.compare a b = 0
+
+(* Mono + the driver's post-mono type materialization, mirroring
+   run_mono_phase: returns the final program and the queued instances. *)
+let mono_with_types ~(generic_types : Mono.generic_def array)
+    (prog : Seed_mir.program) : (Seed_mir.program * Mono.type_instance list, string list) result =
+  let entry = prog.Seed_mir.functions.(0).Seed_mir.instance in
+  let collected = ref [] in
+  match
+    Mono.build ~entry ~generic_types
+      ~on_type_instance:(fun ti -> collected := ti :: !collected)
+      prog
+  with
+  | Error errs -> Error errs
+  | Ok fns ->
+      let mono_prog = { prog with Seed_mir.functions = fns } in
+      let queued = List.rev !collected in
+      (match
+         Driver.materialize_type_instances ~generic_types ~type_instances:queued mono_prog
+       with
+       | Error errs -> Error errs
+       | Ok final_prog -> Ok (final_prog, queued))
+
+let check_type_instances () =
+  let pair_tid = Ids.Type_id.make 8 in
+  let fid_first = Ids.Field_id.make 21 and fid_second = Ids.Field_id.make 22 in
+  let pair_ty (t : Type_repr.t) : Type_repr.t = Type_repr.Named (pair_tid, [| t |]) in
+  (* the generic template def: fields carry the declared Type_param; the
+     semantic FieldIds belong to the ORIGINAL def and must survive the
+     materialization *)
+  let pair_def =
+    Seed_mir.StructDef
+      {
+        sd_id = pair_tid;
+        sd_fields =
+          [ { Seed_mir.fd_id = fid_first; fd_index = Ids.Field_index.make 0; fd_ty = tparam 0 };
+            { Seed_mir.fd_id = fid_second; fd_index = Ids.Field_index.make 1; fd_ty = tparam 0 } ];
+      }
+  in
+  let generic_types =
+    [|
+      { Mono.gd_tid = pair_tid;
+        gd_params = [| Ids.Generic_param_id.make 0 |];
+        gd_def = pair_def };
+    |]
+  in
+  (* f[T] -> T: identity over a Pair[T].  main CALLS f with the concrete
+     instances — the callee instances are f[Pair[Int]] and
+     f[Pair[String]] ("the calls with the concrete instances"), so the
+     specialized signatures AND bodies mention Pair[Int]/Pair[String]. *)
+  let f = identity_template "f" 1 in
+  let main =
+    mk_fn "main" (inst 0 [||]) [||]
+      [| Type_repr.Unit;
+         pair_ty i64;
+         pair_ty i64;
+         pair_ty string_ty;
+         pair_ty string_ty;
+         bool_ty |]
+      [|
+        { Seed_mir.id = 0;
+          statements =
+            [ assign 1
+                (Seed_mir.Aggregate
+                   ( Seed_mir.StructCtor (pair_tid, [| Ids.Field_index.make 0; Ids.Field_index.make 1 |]),
+                     [ int_op 1; int_op 2 ] )) ];
+          terminator =
+            call 2 (Seed_mir.User (inst 1 [| pair_ty i64 |])) [| call_arg (move_ 1) |] 1 };
+        { Seed_mir.id = 1;
+          statements =
+            [ assign 3
+                (Seed_mir.Aggregate
+                   ( Seed_mir.StructCtor (pair_tid, [| Ids.Field_index.make 0; Ids.Field_index.make 1 |]),
+                     [ str_op "a"; str_op "b" ] )) ];
+          terminator =
+            call 4 (Seed_mir.User (inst 1 [| pair_ty string_ty |])) [| call_arg (move_ 3) |] 2 };
+        { Seed_mir.id = 2;
+          statements =
+            [ assign 5
+                (Seed_mir.BinaryOp
+                   ( Seed_mir.Eq,
+                     Seed_mir.Copy { local = 2; projections = [ Seed_mir.Field fid_first ] },
+                     int_op 1 )) ];
+          terminator = Seed_mir.Assert (copy 5, true, "Pair[Int].first != 1", 3) };
+        { Seed_mir.id = 3;
+          statements = [ assign 0 (Seed_mir.Use (Seed_mir.Constant Seed_mir.Unit)) ];
+          terminator = Seed_mir.Ret };
+      |]
+      0
+  in
+  (match mono_with_types ~generic_types (mk_prog [| main; f |] [||]) with
+   | Error errs ->
+       fail "type instances: mono/materialize failed: %s" (String.concat "; " errs)
+   | Ok (final_prog, queued) ->
+       (* ── 1. the queue: (pair_tid, [Int]) then (pair_tid, [String]),
+             exactly once each *)
+       let queued_tids =
+         List.map (fun (ti : Mono.type_instance) -> Ids.Type_id.to_int ti.Mono.ti_tid) queued
+       in
+       let queued_args =
+         List.map
+           (fun (ti : Mono.type_instance) ->
+             if Array.length ti.Mono.ti_args = 1 then ti.Mono.ti_args.(0) else Type_repr.Unit)
+           queued
+       in
+       let has_int = List.exists (fun t -> type_eq t i64) queued_args in
+       let has_str = List.exists (fun t -> type_eq t string_ty) queued_args in
+       if queued_tids <> [ 8; 8 ] || not (has_int && has_str) || List.length queued <> 2 then
+         fail "type instances: queue = [%s] (expected type#8[Int], type#8[String] exactly once)"
+           (String.concat ", "
+              (List.map
+                 (fun (ti : Mono.type_instance) ->
+                   Seed_mir.print_type
+                     (if Array.length ti.Mono.ti_args = 1 then ti.Mono.ti_args.(0)
+                      else Type_repr.Unit))
+                 queued))
+       else
+         (* ── 2. the materialized defs *)
+         let field_tys (d : Seed_mir.type_def) : Type_repr.t list option =
+           match d with
+           | Seed_mir.StructDef { sd_fields; _ } -> Some (List.map (fun f -> f.Seed_mir.fd_ty) sd_fields)
+           | _ -> None
+         in
+         let field_ids (d : Seed_mir.type_def) : Ids.Field_id.t list option =
+           match d with
+           | Seed_mir.StructDef { sd_fields; _ } -> Some (List.map (fun f -> f.Seed_mir.fd_id) sd_fields)
+           | _ -> None
+         in
+         let field_indices (d : Seed_mir.type_def) : int list option =
+           match d with
+           | Seed_mir.StructDef { sd_fields; _ } ->
+               Some (List.map (fun f -> Ids.Field_index.to_int f.Seed_mir.fd_index) sd_fields)
+           | _ -> None
+         in
+         let defs = Array.to_list final_prog.Seed_mir.types in
+         let def_int =
+           List.find_opt
+             (fun d ->
+               match field_tys d with
+               | Some [ a; b ] -> type_eq a i64 && type_eq b i64
+               | _ -> false)
+             defs
+         in
+         let def_str =
+           List.find_opt
+             (fun d ->
+               match field_tys d with
+               | Some [ a; b ] -> type_eq a string_ty && type_eq b string_ty
+               | _ -> false)
+             defs
+         in
+         let n_defs = List.length defs in
+         let generic_gone =
+           not
+             (List.exists
+                (fun d ->
+                  match d with
+                  | Seed_mir.StructDef { sd_id; _ } -> Ids.Type_id.compare sd_id pair_tid = 0
+                  | _ -> false)
+                defs)
+         in
+         let def_int_id, def_str_id =
+           match def_int, def_str with
+           | Some (Seed_mir.StructDef { sd_id = a; _ }), Some (Seed_mir.StructDef { sd_id = b; _ })
+             ->
+               (a, b)
+           | _ -> (Ids.Type_id.make 0, Ids.Type_id.make 0)
+         in
+         let ids_ok =
+           match def_int, def_str with
+           | Some di, Some ds ->
+               List.length defs = 2
+               && field_ids di = Some [ fid_first; fid_second ]
+               && field_ids ds = Some [ fid_first; fid_second ]
+               && field_indices di = Some [ 0; 1 ]
+               && field_indices ds = Some [ 0; 1 ]
+               && Ids.Type_id.compare def_int_id def_str_id <> 0
+               && generic_gone
+           | _ -> false
+         in
+         if n_defs <> 2 || not ids_ok then begin
+           fail "type instances: expected 2 concrete StructDefs (Pair[Int]: Int,Int / Pair[String]: String,String with FieldIds %d,%d indices 0,1 under distinct fresh TypeIds, generic type#%d absent); got %d def(s): %s"
+             (Ids.Field_id.to_int fid_first) (Ids.Field_id.to_int fid_second)
+             (Ids.Type_id.to_int pair_tid) n_defs
+             (String.concat " | "
+                (List.map
+                   (fun d ->
+                     match d with
+                   | Seed_mir.StructDef { sd_id; sd_fields } ->
+                       Printf.sprintf "struct type#%d { %s }" (Ids.Type_id.to_int sd_id)
+                         (String.concat "; "
+                            (List.map
+                               (fun f ->
+                                 Printf.sprintf "%d: %s" (Ids.Field_id.to_int f.Seed_mir.fd_id)
+                                   (Seed_mir.print_type f.Seed_mir.fd_ty))
+                               sd_fields))
+                   | Seed_mir.EnumDef { ed_id; _ } ->
+                       Printf.sprintf "enum type#%d" (Ids.Type_id.to_int ed_id))
+                   defs))
+         end
+         else
+           (* ── 3. the rewrite: the specialized f's signature/body and
+                 main's call instances reference the fresh TypeIds *)
+           let f_instances =
+             Array.to_list final_prog.Seed_mir.functions
+             |> List.filter (fun fn ->
+                    Ids.Callable_id.to_int (Instance_id.callable fn.Seed_mir.instance) = 1)
+           in
+           let f_ok =
+             List.length f_instances = 2
+             && List.exists
+                  (fun fn ->
+                    let args = Instance_id.type_args fn.Seed_mir.instance in
+                    Array.length args = 1
+                    && (match args.(0) with
+                       | Type_repr.Named (tid, a) ->
+                           Ids.Type_id.compare tid def_int_id = 0
+                           && Array.length a = 1 && type_eq a.(0) i64
+                       | _ -> false)
+                    && (match fn.Seed_mir.params.(0).Type_repr.pt_type with
+                       | Type_repr.Named (tid, a) ->
+                           Ids.Type_id.compare tid def_int_id = 0
+                           && Array.length a = 1 && type_eq a.(0) i64
+                       | _ -> false))
+                  f_instances
+             && List.exists
+                  (fun fn ->
+                    let args = Instance_id.type_args fn.Seed_mir.instance in
+                    Array.length args = 1
+                    && (match args.(0) with
+                       | Type_repr.Named (tid, a) ->
+                           Ids.Type_id.compare tid def_str_id = 0
+                           && Array.length a = 1 && type_eq a.(0) string_ty
+                       | _ -> false)
+                    && (match fn.Seed_mir.params.(0).Type_repr.pt_type with
+                       | Type_repr.Named (tid, a) ->
+                           Ids.Type_id.compare tid def_str_id = 0
+                           && Array.length a = 1 && type_eq a.(0) string_ty
+                       | _ -> false))
+                  f_instances
+           in
+           let call_instances =
+             Array.to_list final_prog.Seed_mir.functions.(0).Seed_mir.blocks
+             |> List.concat_map (fun b ->
+                    match b.Seed_mir.terminator with
+                    | Seed_mir.Call (_, Seed_mir.User i, _, _, _) -> [ i ]
+                    | _ -> [])
+           in
+           let calls_ok =
+             List.length call_instances = 2
+             && List.exists
+                  (fun inst ->
+                    let args = Instance_id.type_args inst in
+                    Array.length args = 1
+                    && (match args.(0) with
+                       | Type_repr.Named (tid, a) ->
+                           Ids.Type_id.compare tid def_int_id = 0
+                           && Array.length a = 1 && type_eq a.(0) i64
+                       | _ -> false))
+                  call_instances
+             && List.exists
+                  (fun inst ->
+                    let args = Instance_id.type_args inst in
+                    Array.length args = 1
+                    && (match args.(0) with
+                       | Type_repr.Named (tid, a) ->
+                           Ids.Type_id.compare tid def_str_id = 0
+                           && Array.length a = 1 && type_eq a.(0) string_ty
+                       | _ -> false))
+                  call_instances
+           in
+           if not (f_ok && calls_ok) then
+             fail "type instances: the fresh TypeId rewrite missed a mention (specialized signatures/bodies or main's call instances)"
+           else
+             (* ── 4/5. the final program verifies and executes *)
+             (match Mir_verify.require_valid final_prog with
+              | Error errs ->
+                  fail "type instances: final program fails Mir_verify: %s"
+                    (String.concat "; " errs)
+              | Ok () -> (
+                  match
+                    Vm.entry_frame_of ~program:final_prog
+                      ~entry:(final_prog.Seed_mir.functions.(0).Seed_mir.instance)
+                      ~argv:[||]
+                  with
+                  | Error m -> fail "type instances: entry_frame_of: %s" m
+                  | Ok (vm, frame) -> (
+                      match Vm.run_inspect vm frame with
+                      | Ok "()" ->
+                          pass
+                            "type instances: Pair[Int] and Pair[String] queued, materialized as concrete StructDefs (Int,Int / String,String) with the semantic FieldIds preserved, fresh TypeIds per instance, all Named mentions rewritten; verifies and executes"
+                      | Ok other ->
+                          fail "type instances: unexpected VM return %s" other
+                      | Error m -> fail "type instances: vm: %s" m))))
+
 let () =
   Printf.printf "Monomorphizer exact-arity and specialization self-check\n";
   check_two_instantiations ();
@@ -480,6 +809,7 @@ let () =
   check_arity_mismatch ();
   check_generic_callers ();
   check_nested_generics ();
+  check_type_instances ();
   if !failures = 0 then begin
     Printf.printf "ALL MONO PASS\n";
     exit 0

@@ -77,6 +77,19 @@ type func_env = {
   callables : (string * callable_entry) list;        (* function name -> resolved entry *)
   methods : ((string * string) * Instance_id.t) list;  (* (receiver type name, method) -> instance *)
   fn_ret : Type_repr.t;
+  (* The typed nominal registry (re-audit finding: Field access reached
+     MIR lowering without a typed place (FieldId) rule — the lowerer's
+     only struct-field emission channel was the out-of-scope typed
+     registry).  Type_id -> (field name, SEMANTIC FieldId, field type)
+     triples for every Struct/Enum nominal of the typed registry (enums
+     carry no fields — their entries are empty, so a field on an enum
+     fails closed instead of mis-projecting).  Field types are recorded
+     in the nominal's own parameter scope; the lowering substitutes the
+     nominal's generic params with the base type's arguments at each use
+     (the substitution's param list is derived from env.types' Named
+     (tid, params) entries, which the driver keeps aligned with the
+     nominals — the same scheme type_of_syntax uses). *)
+  struct_fields : (Ids.Type_id.t * (string * Ids.Field_id.t * Type_repr.t) list) list;
 }
 
 (* ── Variant tables ──────────────────────────────────────────────
@@ -541,6 +554,149 @@ let int_constant_of_words (k : Type_repr.int_kind) (lo : int64) (hi : int64) : S
   Seed_mir.Integer
     (Int_value.of_words ~width:(int_width_of k) ~signed:(int_signed_of k) ~bits_lo:lo ~bits_hi:hi)
 
+(* ── Field resolution (re-audit: the typed-place (FieldId) rule) ──
+
+   The lowerer's struct-field emission channel is the typed nominal
+   registry carried in func_env.struct_fields: a field access resolves
+   the base's type against the registry, finds the field's SEMANTIC
+   FieldId (the identity the verifier's owner rule and the VM's
+   field_index_of resolve through the owner StructDef), and derives the
+   field's type by substituting the nominal's generic params with the
+   base type's arguments.  Every unresolvable field fails closed with a
+   Seed_bug — never a silent Unit.
+
+   The projection chain mirrors the typechecker's check_field exactly:
+   - Named struct (non-transparent): `Field <FieldId>` on the base.
+   - Box/Ptr/PtrMut: the nominal's OWN declared fields first (e.g.
+     `self.ptr` inside impl Box), then the deref-on-field transparency —
+     `Deref; Field <FieldId>` projected through the pointee (the type
+     of the chain is the inner field's type).
+   - Ref_internal/Raw_ptr: `Deref; Field <FieldId>` through the pointee
+     (the verifier admits Deref on ref/raw-pointer bases).
+   - A NUMERIC name is the tuple-index form: tuples have no FieldId, so
+     the position is a ConstantIndex (the seed's TupleIndex form — the
+     same scheme the variant payloads use). *)
+
+(* The generic-param pattern of a nominal, from env.types' Named
+   (tid, params) entry (the driver keeps these aligned with the
+   nominals): the substitution keys at a use site. *)
+let nominal_params_of (env : func_env) (tid : Ids.Type_id.t) : Type_repr.t array =
+  match
+    List.find_map
+      (fun (_, r) ->
+        match r with
+        | Type_repr.Named (t, params) when Ids.Type_id.compare t tid = 0 -> Some params
+        | _ -> None)
+      env.types
+  with
+  | Some params -> params
+  | None -> [||]
+
+(* The Box/Ptr/PtrMut transparency (the typechecker's check_field derefs
+   these nominals on field access): identified by NAME through env.types
+   — the same name-anchored scheme the typechecker uses (b_ptr/b_ptrmut
+   and the Box declaration's canonical tid). *)
+let transparent_nominal_name_of (env : func_env) (tid : Ids.Type_id.t) : string option =
+  List.find_map
+    (fun (name, r) ->
+      match r with
+      | Type_repr.Named (t, _)
+        when Ids.Type_id.compare t tid = 0
+             && (name = "Box" || name = "Ptr" || name = "PtrMut") ->
+          Some name
+      | _ -> None)
+    env.types
+
+(* The own-field lookup: the registry entry of `tid` (present for every
+   Struct/Enum nominal; enums' entries are empty).  The registry's
+   entries are (name, FieldId, type) triples. *)
+let registry_field_of (env : func_env) (tid : Ids.Type_id.t) (fname : string) :
+    (Ids.Field_id.t * Type_repr.t) option =
+  let rec go = function
+    | [] -> None
+    | (n, fid, fty) :: rest ->
+        if n = fname then Some (fid, fty) else go rest
+  in
+  match List.assoc_opt tid env.struct_fields with
+  | None -> None
+  | Some fields -> go fields
+
+(* Resolve `fname` on `bty`: the projection chain to APPEND to the base
+   place and the field's type (the nominal's params substituted with the
+   base type's arguments).  Fails closed on every unresolvable case. *)
+let rec field_projection_of (env : func_env) (bty : Type_repr.t) (fname : string) :
+    Seed_mir.projection list * Type_repr.t =
+  match int_of_string_opt fname with
+  | Some i when i >= 0 -> (
+      (* the tuple-index form: tuples have no FieldId, so the position is
+         a ConstantIndex *)
+      match bty with
+      | Type_repr.Tuple elems when i < Array.length elems -> ([ Seed_mir.ConstantIndex i ], elems.(i))
+      | Type_repr.Tuple elems ->
+          seed_bug "tuple index %d out of bounds (arity %d) in field lowering" i
+            (Array.length elems)
+      | _ ->
+          seed_bug "tuple-index field `.%s` on a non-tuple base of type %s in lowering" fname
+            (Seed_mir.print_type bty))
+  | _ -> (
+      match bty with
+      | Type_repr.Named (tid, args) -> (
+          let own = registry_field_of env tid fname in
+          match transparent_nominal_name_of env tid with
+          | Some name when own = None -> (
+              (* the Box/Ptr/PtrMut deref-on-field transparency: the
+                 nominal declares no such field, so the field is the
+                 POINTEE's — `Deref; Field <FieldId>` *)
+              match args with
+              | [| inner |] ->
+                  let projs, fty = field_projection_of env inner fname in
+                  (Seed_mir.Deref :: projs, fty)
+              | _ ->
+                  seed_bug
+                    "transparent nominal `%s` (type#%d) instantiated with %d arguments in lowering — the deref-on-field transparency needs exactly one"
+                    name (Ids.Type_id.to_int tid) (Array.length args))
+          | _ -> (
+              match own with
+              | Some (fid, fty) ->
+                  (* the nominal's own field: substitute its generic
+                     params with the base type's arguments (the fields
+                     are recorded in the nominal's own parameter scope) *)
+                  let params = nominal_params_of env tid in
+                  if Array.length params <> Array.length args then
+                    seed_bug
+                      "nominal type#%d has %d generic params but the base type carries %d arguments in lowering"
+                      (Ids.Type_id.to_int tid) (Array.length params) (Array.length args);
+                  let subst =
+                    List.mapi
+                      (fun i p ->
+                        match p with
+                        | Type_repr.Type_param pid -> (Type_repr.KParam pid, args.(i))
+                        | _ ->
+                            seed_bug
+                              "nominal type#%d's registered repr entry is not parameter-shaped at position %d in lowering"
+                              (Ids.Type_id.to_int tid) i)
+                      (Array.to_list params)
+                  in
+                  ([ Seed_mir.Field fid ], Type_repr.substitute subst fty)
+              | None ->
+                  seed_bug
+                    "unknown field `%s` of type#%d in lowering (the typed nominal registry has no such field%s)"
+                    fname (Ids.Type_id.to_int tid)
+                    (match transparent_nominal_name_of env tid with
+                     | Some name ->
+                         Printf.sprintf " — `%s` is transparent and declares no such field" name
+                     | None -> "")))
+      | Type_repr.Ref_internal (_, inner) | Type_repr.Raw_ptr (_, inner) ->
+          (* a field through a reference/raw pointer derefs the pointee *)
+          let projs, fty = field_projection_of env inner fname in
+          (Seed_mir.Deref :: projs, fty)
+      | Type_repr.Tuple _ ->
+          seed_bug
+            "named field `.%s` on a tuple base in lowering (tuples have no FieldId — use the numeric ConstantIndex form)"
+            fname
+      | _ ->
+          seed_bug "field access on non-struct type %s in lowering" (Seed_mir.print_type bty))
+
 (* ── Expression lowering ──────────────────────────────────────── *)
 
 (* Returns (place-or-constant operand, type). *)
@@ -708,9 +864,17 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
             { bp with Seed_mir.projections = bp.Seed_mir.projections @ [ Seed_mir.Index iid ] }
           in
           (Seed_mir.Copy p, elem_ty))
-  | Ast.Field (_, _, span) ->
-      ignore span;
-      seed_bug "Field access reached MIR lowering without a typed place (FieldId) rule"
+  | Ast.Field (base, fname, _span) ->
+      (* re-audit: the typed-place (FieldId) rule — lower the base to a
+         place, resolve the base's type against the typed nominal
+         registry (func_env.struct_fields) and emit the semantic FieldId
+         projection with the derived type (tuples project positionally
+         with ConstantIndex).  Every unresolvable field fails closed. *)
+      let bop, bty = lower_expr env st base in
+      let bp = materialize_place st bop in
+      let projs, fty = field_projection_of env bty fname in
+      ( Seed_mir.Copy { bp with Seed_mir.projections = bp.Seed_mir.projections @ projs },
+        fty )
   | Ast.IfExpr i -> lower_if env st i
   | Ast.MatchExpr m -> lower_match env st m
   | Ast.WhileExpr w -> lower_while env st w
@@ -1042,15 +1206,6 @@ and expr_form_name (e : Ast.expr) : string =
   | Ast.UntilExpr _ -> "Until"
   | Ast.TryBlock _ -> "Try"
   | Ast.ComptimeBlock _ -> "Comptime"
-
-and field_type_of (base : Type_repr.t) (fname : string) : Type_repr.t =
-  match base with
-  | Type_repr.Named _ -> (
-      match int_of_string_opt fname with
-      | Some _ -> Type_repr.Int Type_repr.Int
-      | None -> Type_repr.Unit)
-  | Type_repr.Tuple _ -> Type_repr.Unit
-  | _ -> Type_repr.Unit
 
 and target_type (env : func_env) (target : Ast.expr) : Type_repr.t =
   match target with

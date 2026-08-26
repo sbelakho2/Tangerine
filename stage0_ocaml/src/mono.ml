@@ -40,6 +40,105 @@ type work_item = {
   fn : function_;
 }
 
+(* ── The concrete type-instance queue (re-audit finding: "generic
+      nominal type definitions disappear before MIR") ──────────────
+   The monomorphizer specializes FUNCTIONS; it never constructed
+   concrete type-definition instances.  A specialized body or signature
+   mentioning Named (TypeId, args) where args carry no Type_params is a
+   CONCRETE instance of a generic nominal (Pair[Int] where Pair[T]'s
+   template def has Type_param fields) — a required concrete type
+   definition.  The identity of such an instance is exactly (TypeId,
+   [concrete substitutions]), and the instances are queued ALONGSIDE
+   the function instances during the drain: every specialized body is
+   walked for Named mentions, each (tid, args) whose tid names a
+   generic template is queued at most once (dedup by (tid, args)), and
+   the queue is exposed in first-discovery order through build's
+   on_type_instance hook.  The materialization itself (substituting the
+   template's field/variant types under the KParam-keyed table and
+   minting fresh TypeIds) is the driver's post-mono assembly
+   (Driver.materialize_type_instances). *)
+
+type type_instance = {
+  ti_tid : Ids.Type_id.t;      (* the generic nominal's TypeId *)
+  ti_args : Type_repr.t array; (* the concrete substitution *)
+}
+
+(* The generic nominal registry handed to build: the template def (whose
+   field/variant types reference the generic params as Type_params) plus
+   the declared parameter ids in DECLARATION order — the positional
+   KParam substitution maps param i to instance arg i, the same
+   declaration-order contract as the function templates.  The seed
+   types table is concrete-only by contract, so the templates live in
+   this registry, never in program.types. *)
+type generic_def = {
+  gd_tid : Ids.Type_id.t;
+  gd_params : Ids.Generic_param_id.t array; (* declaration order *)
+  gd_def : type_def;                        (* template with Type_param field types *)
+}
+
+let type_instance_equal (a : type_instance) (b : type_instance) : bool =
+  Ids.Type_id.compare a.ti_tid b.ti_tid = 0
+  && Array.length a.ti_args = Array.length b.ti_args
+  && Array.for_all2
+       (fun x y -> Type_repr.compare x y = 0)
+       a.ti_args b.ti_args
+
+let find_generic (generic_types : generic_def array) (tid : Ids.Type_id.t) :
+    generic_def option =
+  Array.to_list generic_types
+  |> List.find_opt (fun gd -> Ids.Type_id.compare gd.gd_tid tid = 0)
+
+(* The positional KParam substitution for a generic def's declared
+   parameters — the same exact-arity machinery as substitution: the
+   instance's type arguments substitute the template's parameter ids in
+   declaration order (param i substitutes arg i).  An arity
+   disagreement is an internal error (the caller reports it through
+   build's errors list; the result type also lets the driver's
+   materializer fail closed). *)
+let type_substitution (gd : generic_def) (args : Type_repr.t array) :
+    ((Type_repr.generic_key * Type_repr.t) list, string) result =
+  let n = Array.length gd.gd_params in
+  let ni = Array.length args in
+  if n <> ni then
+    Error
+      (Printf.sprintf
+         "monomorphization internal error: generic type#%d declares %d parameter(s) but the instance carries %d type argument(s)"
+         (Ids.Type_id.to_int gd.gd_tid) n ni)
+  else
+    Ok
+      (List.map2
+         (fun p a -> (Type_repr.KParam p, a))
+         (Array.to_list gd.gd_params)
+         (Array.to_list args))
+
+(* Walk a type and fire queue for every CONCRETE instance of a generic
+   nominal: Named (tid, args) with no Type_params anywhere in args,
+   where tid is a generic template in the registry.  Recurses through
+   the args, so nested instances are discovered too (Pair[Vec[Int]]
+   queues both Pair[Vec[Int]] and Vec[Int]).  Dedup is the caller's —
+   the queue is a set by (tid, args). *)
+let rec scan_type (generic_types : generic_def array)
+    (queue : type_instance -> unit) (ty : Type_repr.t) : unit =
+  match ty with
+  | Type_repr.Named (tid, args) ->
+      if
+        Array.length generic_types > 0
+        && find_generic generic_types tid <> None
+        && not (Array.exists Type_repr.has_type_param args)
+      then queue { ti_tid = tid; ti_args = args };
+      Array.iter (scan_type generic_types queue) args
+  | Type_repr.Raw_ptr (_, t) | Type_repr.Ref_internal (_, t) | Type_repr.Fixed_array (t, _) ->
+      scan_type generic_types queue t
+  | Type_repr.Tuple elems -> Array.iter (scan_type generic_types queue) elems
+  | Type_repr.Function (params, ret) ->
+      Array.iter
+        (fun p -> scan_type generic_types queue p.Type_repr.pt_type)
+        params;
+      scan_type generic_types queue ret
+  | Unit | Bool | Char | Int _ | Float _ | String | Type_param _ | Infer_var _
+  | Int_literal _ | Error | Never ->
+      ()
+
 let find_template (prog : program) (inst : Instance_id.t) : function_ option =
   let found = ref None in
   Array.iter
@@ -216,7 +315,16 @@ let walk_instances (body : function_) (f : Instance_id.t -> unit) : unit =
       | _ -> ())
     body.blocks
 
-let build ~(entry : Instance_id.t) (prog : program) : (function_ array, string list) result =
+(* build — the work-queue monomorphizer.  The optional generic_types
+   registry and on_type_instance hook implement the concrete
+   type-instance queue: when a registry is supplied, every specialized
+   body/signature is walked for concrete Named mentions of generic
+   nominals and each first-discovered (tid, args) fires the hook (in
+   discovery order).  With the defaults (empty registry, no-op hook)
+   the behavior is exactly the function-only monomorphizer. *)
+let build ~(entry : Instance_id.t) ?(generic_types : generic_def array = [||])
+    ?(on_type_instance : type_instance -> unit = fun _ -> ())
+    (prog : program) : (function_ array, string list) result =
   let errors = ref [] in
   let err msg = errors := msg :: !errors in
   (* input sanity: one function per callable identity *)
@@ -258,6 +366,69 @@ let build ~(entry : Instance_id.t) (prog : program) : (function_ array, string l
           (Printf.sprintf "mono: no template function for instance %s"
              (Seed_mir.print_instance inst))
   in
+  (* the concrete type-instance queue: dedup by (tid, args); the hook
+     fires at FIRST discovery, so the driver's materialization sees each
+     required instance exactly once, in deterministic order *)
+  let type_seen : type_instance list ref = ref [] in
+  let queue_type_instance (ti : type_instance) =
+    if not (List.exists (type_instance_equal ti) !type_seen) then begin
+      type_seen := ti :: !type_seen;
+      on_type_instance ti
+    end
+  in
+  let scan_ty (ty : Type_repr.t) = scan_type generic_types queue_type_instance ty in
+  let scan_inst (inst : Instance_id.t) =
+    Array.iter scan_ty (Instance_id.type_args inst)
+  in
+  let scan_operand (op : operand) =
+    match op with
+    | Constant (Function i) -> scan_inst i
+    | _ -> ()
+  in
+  let scan_rvalue (rv : rvalue) =
+    match rv with
+    | Use op -> scan_operand op
+    | Ref _ | RefMut _ | Discriminant _ | Len _ -> ()
+    | Aggregate (kind, ops) ->
+        List.iter scan_operand ops;
+        (match kind with
+         | ClosureAgg i -> scan_inst i
+         | _ -> ())
+    | BinaryOp (_, l, r) ->
+        scan_operand l;
+        scan_operand r
+    | UnaryOp (_, op) -> scan_operand op
+    | Cast (op, ty) ->
+        scan_operand op;
+        scan_ty ty
+  in
+  (* walk every type position of a specialized body/signature: its own
+     instance args, params, locals, then every rvalue type (cast
+     targets, function constants, closure aggregates, callee instances,
+     call argument operands) *)
+  let scan_body_types (body : function_) =
+    if Array.length generic_types > 0 then begin
+      scan_inst body.instance;
+      Array.iter (fun p -> scan_ty p.Type_repr.pt_type) body.params;
+      Array.iter scan_ty body.locals;
+      Array.iter
+        (fun b ->
+          List.iter
+            (function
+              | Assign (_, rv) -> scan_rvalue rv
+              | _ -> ())
+            b.statements;
+          match b.terminator with
+          | Call (_, callee, args, _, _) ->
+              (match callee with
+               | User i -> scan_inst i
+               | Intrinsic _ | Extern _ -> ());
+              Array.iter (fun a -> scan_operand a.value) args
+          | SwitchInt (op, _, _) | Assert (op, _, _, _) -> scan_operand op
+          | _ -> ())
+        body.blocks
+    end
+  in
   (* seed: entry + static initializers *)
   (match find_template prog entry with
    | Some tmpl -> enqueue ~template:tmpl entry
@@ -288,7 +459,8 @@ let build ~(entry : Instance_id.t) (prog : program) : (function_ array, string l
     | Ok subst ->
         let body = specialize_under subst wi.fn wi.instance in
         cache := (wi.instance, body) :: !cache;
-        walk_instances body (fun inst -> enqueue_instance (subst_instance subst inst))
+        walk_instances body (fun inst -> enqueue_instance (subst_instance subst inst));
+        scan_body_types body
   done;
   (* final validation: every embedded instance is concrete and
      specialized; every body is concrete; the output is self-contained *)

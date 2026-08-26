@@ -439,6 +439,7 @@ end
               funcs;
           methods = [];
           fn_ret = int_ty;
+          struct_fields = Driver.struct_fields_of tcheck_env;
         }
       in
       let mir_funcs =
@@ -613,4 +614,321 @@ end
                       Printf.printf "  RESULT: FAIL (expected 113)\n";
                       exit 1
                     end
-                | Error m -> Printf.printf "  main returned: <inspect failed: %s>\n" m)))
+                | Error m -> Printf.printf "  main returned: <inspect failed: %s>\n" m)));
+      (* ── struct-field lowering proof (re-audit's first priority: Field
+         access must reach MIR lowering through a typed place (FieldId)
+         rule — the ordinary lowering surface's first item) ─────────
+         A two-field struct Pair: make_pair CONSTRUCTS a Pair value as a
+         StructCtor aggregate with the typed field indices (the seed's
+         aggregate construction form — source-level struct literals are
+         still gated at the frontend), and read_a/read_b read `.a`/`.b`
+         through the LOWERED Field projection.  The proof shows:
+         (1) the driver's registry builder (struct_fields_of on the
+         TYPED registry — the same source closure_types materializes
+         the StructDefs from) reproduces the manual Pair table exactly,
+         with the semantic FieldIds;
+         (2) the lowered read functions carry the Field projection with
+         the semantic FieldId MATCHING the StructDef installed into
+         program.types (the verifier's owner-identity rule);
+         (3) the whole program passes Mir_verify.require_valid and the
+         VM round-trips the field values (main = 21 + 42 = 63). *)
+      let field_src = {|
+struct Pair
+  a: Int
+  b: Int
+end
+
+def make_pair(a: Int, b: Int) -> Pair
+end
+
+def read_a(p: Pair) -> Int
+  p.a
+end
+
+def read_b(p: Pair) -> Int
+  p.b
+end
+
+def main() -> Int
+  read_a(make_pair(21, 42)) + read_b(make_pair(21, 42))
+end
+|} in
+      let field_file = Filename.temp_file "tg_lowersurface_struct" ".tg" in
+      (let oc = open_out_bin field_file in
+       output_string oc field_src;
+       close_out oc);
+      let field_manifest =
+        match Bootstrap_manifest.single ~file:field_file ~path:[ "fieldproof" ] () with
+        | Ok m -> m
+        | Error e -> failwith ("struct-field proof manifest: " ^ e)
+      in
+      let fdiags = Diagnostic.create_bag () in
+      let fgraph = Module_graph.create_with_sources field_manifest fdiags in
+      let fresolved = Resolver.resolve field_manifest fgraph fdiags in
+      let fprog_ast = (List.hd fgraph.Module_graph.nodes).Module_graph.node_program in
+      let fenv =
+        match Typecheck.check_program (Typecheck.initial_env ~resolved:(Some fresolved) ()) fprog_ast with
+        | Error m -> failwith ("struct-field proof typecheck: " ^ m)
+        | Ok (env', errors) ->
+            if errors <> [] then
+              failwith ("struct-field proof typecheck errors: " ^ String.concat "; " errors);
+            env'
+      in
+      Sys.remove field_file;
+      let pair_nom = List.assoc "Pair" fenv.Typecheck.nominals in
+      let pair_tid = List.assoc "Pair" fenv.Typecheck.type_ids in
+      let pair_fids = pair_nom.Typecheck.nom_field_ids in
+      if List.length pair_fids <> 2 then
+        failwith ("struct-field proof: Pair has " ^ string_of_int (List.length pair_fids) ^ " FieldIds");
+      let fid_a = List.nth pair_fids 0 and fid_b = List.nth pair_fids 1 in
+      let pair_fields = [ ("a", fid_a, int_ty); ("b", fid_b, int_ty) ] in
+      let driver_pair_fields = List.assoc pair_tid (Driver.struct_fields_of fenv) in
+      if driver_pair_fields <> pair_fields then begin
+        Printf.printf
+          "  struct-field registry: FAIL (driver struct_fields_of differs from the manual Pair table)\n";
+        exit 1
+      end;
+      Printf.printf
+        "  struct-field registry: PASS (driver struct_fields_of == manual Pair table with the semantic FieldIds %d and %d)\n"
+        (Ids.Field_id.to_int fid_a) (Ids.Field_id.to_int fid_b);
+      let ffuncs =
+        List.filter_map
+          (fun i -> match i.Ast.kind with Ast.Function d -> Some d | _ -> None)
+          fprog_ast.Ast.items
+      in
+      let fts_of name =
+        match List.assoc_opt name fenv.Typecheck.functions with
+        | Some ts -> ts
+        | None -> (
+            match
+              List.filter (fun (k, _) -> Util.has_suffix k ("::" ^ name)) fenv.Typecheck.functions
+            with
+            | [ (_, ts) ] -> ts
+            | _ -> failwith ("struct-field proof: no typed signature for " ^ name))
+      in
+      let fenv2 : Mir_lower.func_env =
+        {
+          Mir_lower.types =
+            [
+              ("Pair", Type_repr.Named (pair_tid, [||]));
+              ("Int", int_ty);
+              ("Unit", Type_repr.Unit);
+              ("Bool", Type_repr.Bool);
+              ("String", string_ty);
+            ];
+          values =
+            List.map
+              (fun d ->
+                let n = d.Ast.fn_sig.Ast.sig_name in
+                (n, (fts_of n).Typecheck.ts_return))
+              ffuncs;
+          callables =
+            List.map
+              (fun d ->
+                let n = d.Ast.fn_sig.Ast.sig_name in
+                ( n,
+                  {
+                    Mir_lower.ce_callable = Ids.Callable_id.to_int (fts_of n).Typecheck.ts_callable;
+                    ce_template_args = [||];
+                    ce_params = [||];
+                  } ))
+              ffuncs;
+          methods = [];
+          fn_ret = int_ty;
+          struct_fields = Driver.struct_fields_of fenv;
+        }
+      in
+      let fmir_funcs =
+        List.map
+          (fun d ->
+            let n = d.Ast.fn_sig.Ast.sig_name in
+            let ts = fts_of n in
+            Mir_lower.lower_function_with_variants Mir_lower.default_variant_table
+              { fenv2 with Mir_lower.fn_ret = ts.Typecheck.ts_return }
+              n (Ids.Callable_id.to_int ts.Typecheck.ts_callable) [||] [||] d)
+          ffuncs
+      in
+      (* the StructCtor aggregate that CONSTRUCTS the Pair value (the
+         seed's post-mono aggregate form: the typed field indices in
+         declaration order; the lowered Field projections resolve
+         through the semantic FieldIds of the def — the declaration
+         position is def metadata, never in the projection) *)
+      let make_pair_fn : Seed_mir.function_ =
+        {
+          Seed_mir.name = "make_pair";
+          instance =
+            Instance_id.make ~callable:(fts_of "make_pair").Typecheck.ts_callable ~type_args:[||];
+          params =
+            [|
+              { Type_repr.pt_convention = Access_effect.Let; pt_type = int_ty };
+              { Type_repr.pt_convention = Access_effect.Let; pt_type = int_ty };
+            |];
+          locals = [| Type_repr.Named (pair_tid, [||]); int_ty; int_ty |];
+          blocks =
+            [|
+              {
+                Seed_mir.id = 0;
+                statements =
+                  [
+                    Seed_mir.Assign
+                      ( { Seed_mir.local = 0; projections = [] },
+                        Seed_mir.Aggregate
+                          ( Seed_mir.StructCtor
+                              ( pair_tid,
+                                [| Ids.Field_index.make 0; Ids.Field_index.make 1 |] ),
+                            [
+                              Seed_mir.Copy { Seed_mir.local = 1; projections = [] };
+                              Seed_mir.Copy { Seed_mir.local = 2; projections = [] };
+                            ] ) );
+                  ];
+                terminator = Seed_mir.Ret;
+              };
+            |];
+          entry = 0;
+        }
+      in
+      let fprog : Seed_mir.program =
+        {
+          Seed_mir.functions =
+            Array.of_list
+              (make_pair_fn
+               :: List.filter (fun f -> f.Seed_mir.name <> "make_pair") fmir_funcs);
+          statics = [||];
+          (* the StructDef with the SEMANTIC FieldIds — built manually
+             (the harness's style), and cross-checked against the typed
+             registry below *)
+          types =
+            [|
+              Seed_mir.StructDef
+                {
+                  sd_id = pair_tid;
+                  sd_fields =
+                    [
+                      { Seed_mir.fd_id = fid_a; fd_index = Ids.Field_index.make 0; fd_ty = int_ty };
+                      { Seed_mir.fd_id = fid_b; fd_index = Ids.Field_index.make 1; fd_ty = int_ty };
+                    ];
+                };
+            |];
+        }
+      in
+      (* the def-alignment proof: closure_types materializes the SAME
+         StructDef from the typed registry (same FieldIds) *)
+      let pair_def_ok =
+        match
+          Array.to_list (Driver.closure_types fenv)
+          |> List.find_map (fun d ->
+                 match d with
+                 | Seed_mir.StructDef { sd_id; sd_fields }
+                   when Ids.Type_id.compare sd_id pair_tid = 0 ->
+                     Some sd_fields
+                 | _ -> None)
+        with
+        | Some sd_fields ->
+            List.length sd_fields = 2
+            && List.for_all
+                 (fun (fname, fid, _ : string * Ids.Field_id.t * Type_repr.t) ->
+                   List.exists
+                     (fun (fd : Seed_mir.field_def) ->
+                       Ids.Field_id.compare fd.Seed_mir.fd_id fid = 0
+                       && Type_repr.compare fd.Seed_mir.fd_ty int_ty = 0
+                       && (match fname with
+                           | "a" -> Ids.Field_index.compare fd.Seed_mir.fd_index (Ids.Field_index.make 0) = 0
+                           | _ -> Ids.Field_index.compare fd.Seed_mir.fd_index (Ids.Field_index.make 1) = 0))
+                     sd_fields)
+                 pair_fields
+        | None -> false
+      in
+      if not pair_def_ok then begin
+        Printf.printf "  struct-field defs: FAIL (closure_types does not materialize the Pair StructDef with the semantic FieldIds)\n";
+        exit 1
+      end;
+      Printf.printf "  struct-field defs: PASS (Pair StructDef FieldIds match the typed registry's nom_field_ids)\n";
+      (* the projection proof: the LOWERED read functions must carry the
+         Field projection with the semantic FieldId of the field they
+         read (matching the def — the verifier's owner-identity rule) *)
+      let place_has_field (fid : Ids.Field_id.t) (p : Seed_mir.place) : bool =
+        List.exists
+          (fun proj ->
+            match proj with
+            | Seed_mir.Field f -> Ids.Field_id.compare f fid = 0
+            | _ -> false)
+          p.Seed_mir.projections
+      in
+      let operand_has_field (fid : Ids.Field_id.t) (op : Seed_mir.operand) : bool =
+        match op with
+        | Seed_mir.Copy p | Seed_mir.Read p | Seed_mir.Move p | Seed_mir.Consume p ->
+            place_has_field fid p
+        | Seed_mir.Constant _ -> false
+      in
+      let fn_has_field (fid : Ids.Field_id.t) (f : Seed_mir.function_) : bool =
+        Array.exists
+          (fun (b : Seed_mir.block) ->
+            List.exists
+              (fun (st : Seed_mir.statement) ->
+                match st with
+                | Seed_mir.Assign (p, rv) ->
+                    place_has_field fid p
+                    || (match rv with
+                       | Seed_mir.Use op -> operand_has_field fid op
+                       | Seed_mir.Aggregate (_, ops) -> List.exists (operand_has_field fid) ops
+                       | _ -> false)
+                | _ -> false)
+              b.Seed_mir.statements)
+          f.Seed_mir.blocks
+      in
+      let read_a_fn =
+        List.find
+          (fun f -> f.Seed_mir.name = "read_a")
+          (Array.to_list fprog.Seed_mir.functions)
+      in
+      let read_b_fn =
+        List.find
+          (fun f -> f.Seed_mir.name = "read_b")
+          (Array.to_list fprog.Seed_mir.functions)
+      in
+      if not (fn_has_field fid_a read_a_fn && fn_has_field fid_b read_b_fn) then begin
+        Printf.printf
+          "  struct-field lowering: FAIL (read_a/read_b carry no Field projection with the semantic FieldIds)\n";
+        exit 1
+      end;
+      Printf.printf
+        "  struct-field lowering: PASS (read_a/read_b carry Field projections with FieldId#%d / FieldId#%d, matching the def)\n"
+        (Ids.Field_id.to_int fid_a) (Ids.Field_id.to_int fid_b);
+      (match Mir_verify.require_valid fprog with
+       | Ok () ->
+           Printf.printf "  struct-field MIR verify: PASS (%d functions)\n"
+             (Array.length fprog.Seed_mir.functions)
+       | Error errs ->
+           Printf.printf "  struct-field MIR verify: FAIL\n";
+           List.iter (fun e -> Printf.printf "    %s\n" e) errs;
+           Printf.printf "%s\n" (Seed_mir.print_program fprog);
+           exit 1);
+      let fentry =
+        match
+          Array.to_list fprog.Seed_mir.functions
+          |> List.find_opt (fun f -> f.Seed_mir.name = "main")
+        with
+        | Some f -> f.Seed_mir.instance
+        | None -> failwith "struct-field proof: no main function"
+      in
+      let fhost = Host.create ~repo_root:"." ~argv:[||] in
+      (match Vm.run ~program:fprog ~entry:fentry ~argv:[||] ~host:fhost with
+       | Error e ->
+           Printf.printf "  struct-field VM: FAIL %s\n" e.Vm.message;
+           exit 1
+       | Ok code ->
+           Printf.printf "  struct-field VM: exit %d\n" code;
+           (match Vm.entry_frame_of ~program:fprog ~entry:fentry ~argv:[||] with
+            | Error m -> Printf.printf "  struct-field main returned: <inspect failed: %s>\n" m
+            | Ok (fvm, fentry_frame) -> (
+                match Vm.run_inspect fvm fentry_frame with
+                | Ok ret_val ->
+                    Printf.printf "  struct-field main returned: %s\n" ret_val;
+                    if ret_val = "63" then
+                      Printf.printf
+                        "  struct-field RESULT: PASS (21 and 42 round-tripped through the Field projections)\n"
+                    else begin
+                      Printf.printf "  struct-field RESULT: FAIL (expected 63)\n";
+                      exit 1
+                    end
+                | Error m -> Printf.printf "  struct-field main returned: <inspect failed: %s>\n" m)))

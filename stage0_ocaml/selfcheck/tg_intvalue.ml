@@ -197,6 +197,7 @@ let lower_env () : Mir_lower.func_env =
     callables = [];
     methods = [];
     fn_ret = Type_repr.Unit;
+    struct_fields = [];
   }
 
 let collect_int_constants (fn : Seed_mir.function_) : Int_value.t list =

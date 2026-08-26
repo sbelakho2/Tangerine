@@ -102,6 +102,7 @@ let () =
             |> List.mapi (fun i (n, e) -> (n, { e with Mir_lower.ce_callable = i }));
           methods = [];
           fn_ret = Type_repr.Int Type_repr.Int;
+          struct_fields = [];
         }
       in
       let mir_funcs =

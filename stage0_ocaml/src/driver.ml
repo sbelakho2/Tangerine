@@ -126,6 +126,38 @@ let lookup_typed_fn (env : Typecheck.env) (name : string) : Typecheck.typed_sign
       | [ (_, ts) ] -> Some ts
       | _ -> None)
 
+(* ── Struct-field registry (re-audit finding: Field access reached MIR
+      lowering without a typed place (FieldId) rule — the lowerer's only
+      struct-field emission channel was the out-of-scope typed registry) ──
+   Every Struct/Enum nominal of the typed registry crosses into the
+   lowering env: Type_id -> (field name, semantic FieldId, field type)
+   triples (enums carry no fields — their entries are empty, so a field
+   on an enum fails closed at lowering instead of mis-projecting).
+   Field types are recorded in the nominal's OWN parameter scope and the
+   lowering substitutes the nominal's generic params at each use.  The
+   semantic FieldIds are the typed registry's nom_field_ids — the SAME
+   identities closure_types materializes into the StructDefs — with the
+   same deterministic fallback (1-based declaration order) when the
+   identity lists are not parallel to the field lists. *)
+let struct_fields_of (env : Typecheck.env) :
+    (Ids.Type_id.t * (string * Ids.Field_id.t * Type_repr.t) list) list =
+  List.filter_map
+    (fun (name, nom : string * Typecheck.nominal) ->
+      match List.assoc_opt name env.Typecheck.type_ids with
+      | None -> None
+      | Some tid ->
+          let nf = List.length nom.Typecheck.nom_fields in
+          let fids =
+            if List.length nom.Typecheck.nom_field_ids = nf then nom.Typecheck.nom_field_ids
+            else List.mapi (fun i _ -> Ids.Field_id.make (i + 1)) nom.Typecheck.nom_fields
+          in
+          Some
+            ( tid,
+              List.mapi
+                (fun i (fname, fty) -> (fname, List.nth fids i, fty))
+                nom.Typecheck.nom_fields ))
+    env.Typecheck.nominals
+
 let lowering_env_of (env : Typecheck.env) : Mir_lower.func_env =
   (* both the qualified key and the bare name resolve (flat namespace) *)
   let values =
@@ -179,6 +211,7 @@ let lowering_env_of (env : Typecheck.env) : Mir_lower.func_env =
     callables;
     methods;
     fn_ret = Type_repr.Unit;
+    struct_fields = struct_fields_of env;
   }
 
 (* ── User-enum variant table (re-audit finding: the closure driver never
@@ -976,6 +1009,85 @@ let closure_types (env : Typecheck.env) : Seed_mir.type_def array =
                          })))
        env.Typecheck.nominals)
 
+(* The generic nominal registry for the monomorphizer (re-audit finding:
+   "generic nominal type definitions disappear before MIR").  closure_types
+   above DROPS nom_params <> [] nominals from the seed types table — but
+   the generic TEMPLATES do not disappear: they are handed to Mono.build
+   as its generic_types registry, and the post-mono assembly
+   (materialize_type_instances) materializes the CONCRETE instances the
+   mono queue reaches (Mono.build's on_type_instance channel) as
+   concrete StructDef/EnumDef entries carrying the SAME semantic
+   FieldIds/VariantIds as the original def.  The builtin Option/Result
+   nominals are included: mir_lower's hardcoded fallback mints the same
+   1-based semantic VariantIds (vs_index + 1), so the materialized defs
+   agree with the lowered projections. *)
+let closure_generic_types (env : Typecheck.env) : Mono.generic_def array =
+  Array.of_list
+    (List.filter_map
+       (fun (name, nom : string * Typecheck.nominal) ->
+         match List.assoc_opt name env.Typecheck.type_ids with
+         | None -> None
+         | Some tid ->
+             if nom.Typecheck.nom_params = [] then None
+             else
+               let params =
+                 Array.of_list (List.map snd nom.Typecheck.nom_params)
+               in
+               (match nom.Typecheck.nom_kind with
+                | `Struct ->
+                    let fids =
+                      if List.length nom.Typecheck.nom_field_ids
+                         = List.length nom.Typecheck.nom_fields
+                      then nom.Typecheck.nom_field_ids
+                      else
+                        List.mapi (fun i _ -> Ids.Field_id.make (i + 1)) nom.Typecheck.nom_fields
+                    in
+                    Some
+                      { Mono.gd_tid = tid;
+                        gd_params = params;
+                        gd_def =
+                          Seed_mir.StructDef
+                            {
+                              sd_id = tid;
+                              sd_fields =
+                                List.mapi
+                                  (fun i (_, fty) ->
+                                    {
+                                      Seed_mir.fd_id = List.nth fids i;
+                                      fd_index = Ids.Field_index.make i;
+                                      fd_ty = fty;
+                                    })
+                                  nom.Typecheck.nom_fields;
+                            } }
+                | `Enum ->
+                    let vids =
+                      if List.length nom.Typecheck.nom_variant_ids
+                         = List.length nom.Typecheck.nom_variants
+                      then nom.Typecheck.nom_variant_ids
+                      else
+                        List.mapi (fun i _ -> Ids.Variant_id.make (i + 1)) nom.Typecheck.nom_variants
+                    in
+                    Some
+                      { Mono.gd_tid = tid;
+                        gd_params = params;
+                        gd_def =
+                          Seed_mir.EnumDef
+                            {
+                              ed_id = tid;
+                              ed_variants =
+                                List.mapi
+                                  (fun i (_, pty) ->
+                                    {
+                                      Seed_mir.vd_id = List.nth vids i;
+                                      vd_index = Ids.Variant_index.make i;
+                                      vd_payload =
+                                        (if Array.length pty = 0 then Type_repr.Unit
+                                         else Type_repr.Tuple pty);
+                                    })
+                                  nom.Typecheck.nom_variants;
+                            } }))
+       env.Typecheck.nominals)
+
 (* Materialize program.statics from the typed const registry: declared
    with their types; initializers arrive with the typed-expression
    channel (the subset firewall rejects const uses until then). *)
@@ -1333,16 +1445,405 @@ type mono_outcome = {
   mo_pre_functions : int;
   mo_post_functions : int;
   mo_post_instances : int;
+  mo_type_instances : int;
   mo_residual_type_params : int;
 }
+
+(* ── Post-mono type materialization (re-audit finding: "generic nominal
+      type definitions disappear before MIR") ───────────────────────
+   Mono.build's queue (the on_type_instance channel) lists every
+   CONCRETE instance of a generic nominal the specialized bodies and
+   signatures mention, in first-discovery order.  This assembles the
+   final types table: for each queued (tid, args) the generic
+   template's fields/variants are substituted under the KParam-keyed
+   table (Mono.type_substitution — the same positional machinery as the
+   function templates), and the result carries a FRESH TypeId — the
+   semantic identity of a concrete instance is (tid, args), so two
+   instances (Pair[Int], Pair[String]) must never share one def.  Every
+   Named (tid, args) in the program (bodies, statics, defs) is then
+   rewritten to the fresh TypeId; StructCtor/EnumCtor aggregate kinds
+   are rewritten through their destination's rewritten type.  The
+   materialization is a FIXPOINT: the substituted field types can
+   reveal further instances (Pair[Vec[Int]], Pair[Pair[Int]], ...),
+   queued in materialization order; instances embedded in the pre-mono
+   defs/statics (invisible to the body walk) are queued here too.  Fail
+   closed: an instance whose tid has no generic template, or an arity
+   disagreement, is an internal error.  The materialized defs carry the
+   SEMANTIC FieldId/VariantId of the original def (fd_id/vd_id are
+   copied, never re-minted); fd_index/vd_index stay the declaration
+   order. *)
+
+let array_eq (cmp : 'a -> 'a -> int) (a : 'a array) (b : 'a array) : bool =
+  Array.length a = Array.length b
+  && Array.for_all2 (fun x y -> cmp x y = 0) a b
+
+let rec rewrite_ty (map : (Ids.Type_id.t * Type_repr.t array * Ids.Type_id.t) list)
+    (ty : Type_repr.t) : Type_repr.t =
+  match ty with
+  | Type_repr.Named (tid, args) ->
+      let args' = Array.map (rewrite_ty map) args in
+      (match
+         List.find_opt
+           (fun (t, a, _) -> Ids.Type_id.compare t tid = 0 && array_eq Type_repr.compare a args)
+           map
+       with
+       | Some (_, _, ntid) -> Type_repr.Named (ntid, args')
+       | None -> Type_repr.Named (tid, args'))
+  | Type_repr.Raw_ptr (m, t) -> Type_repr.Raw_ptr (m, rewrite_ty map t)
+  | Type_repr.Ref_internal (m, t) -> Type_repr.Ref_internal (m, rewrite_ty map t)
+  | Type_repr.Tuple elems -> Type_repr.Tuple (Array.map (rewrite_ty map) elems)
+  | Type_repr.Fixed_array (t, n) -> Type_repr.Fixed_array (rewrite_ty map t, n)
+  | Type_repr.Function (params, ret) ->
+      Type_repr.Function
+        ( Array.map
+            (fun p -> { p with Type_repr.pt_type = rewrite_ty map p.Type_repr.pt_type })
+            params,
+          rewrite_ty map ret )
+  | ty -> ty
+
+let rewrite_instance (map) (inst : Instance_id.t) : Instance_id.t =
+  Instance_id.make ~callable:(Instance_id.callable inst)
+    ~type_args:(Array.map (rewrite_ty map) (Instance_id.type_args inst))
+
+let rewrite_operand map (op : Seed_mir.operand) : Seed_mir.operand =
+  match op with
+  | Seed_mir.Constant (Seed_mir.Function inst) ->
+      Seed_mir.Constant (Seed_mir.Function (rewrite_instance map inst))
+  | op -> op
+
+(* Aggregate kinds carry the owner TypeId but not the instance args; the
+   instance is the DESTINATION's type.  The verifier requires the kind
+   tid to equal the dest's Named tid, so after the dest's type was
+   rewritten to its fresh instance tid, the kind follows.  (Aggregates
+   target plain locals in valid programs; the root local type is the
+   dest type.) *)
+let rewrite_rvalue map (dest_ty : Type_repr.t option) (rv : Seed_mir.rvalue) :
+    Seed_mir.rvalue =
+  match rv with
+  | Seed_mir.Use op -> Seed_mir.Use (rewrite_operand map op)
+  | Seed_mir.Ref p -> Seed_mir.Ref p
+  | Seed_mir.RefMut p -> Seed_mir.RefMut p
+  | Seed_mir.Aggregate (kind, ops) ->
+      let kind' =
+        match kind with
+        | Seed_mir.StructCtor (tid, fields) -> (
+            match dest_ty with
+            | Some (Type_repr.Named (ntid, _)) -> Seed_mir.StructCtor (ntid, fields)
+            | _ -> Seed_mir.StructCtor (tid, fields))
+        | Seed_mir.EnumCtor (tid, vid) -> (
+            match dest_ty with
+            | Some (Type_repr.Named (ntid, _)) -> Seed_mir.EnumCtor (ntid, vid)
+            | _ -> Seed_mir.EnumCtor (tid, vid))
+        | Seed_mir.ClosureAgg inst -> Seed_mir.ClosureAgg (rewrite_instance map inst)
+        | k -> k
+      in
+      Seed_mir.Aggregate (kind', List.map (rewrite_operand map) ops)
+  | Seed_mir.BinaryOp (o, l, r) ->
+      Seed_mir.BinaryOp (o, rewrite_operand map l, rewrite_operand map r)
+  | Seed_mir.UnaryOp (o, op) -> Seed_mir.UnaryOp (o, rewrite_operand map op)
+  | Seed_mir.Discriminant p -> Seed_mir.Discriminant p
+  | Seed_mir.Len p -> Seed_mir.Len p
+  | Seed_mir.Cast (op, ty) -> Seed_mir.Cast (rewrite_operand map op, rewrite_ty map ty)
+
+let rewrite_block map (locals : Type_repr.t array) (b : Seed_mir.block) : Seed_mir.block =
+  let dest_ty (p : Seed_mir.place) : Type_repr.t option =
+    if p.Seed_mir.local >= 0 && p.Seed_mir.local < Array.length locals then
+      Some locals.(p.Seed_mir.local)
+    else None
+  in
+  {
+    id = b.id;
+    statements =
+      List.map
+        (function
+          | Seed_mir.Assign (p, rv) -> Seed_mir.Assign (p, rewrite_rvalue map (dest_ty p) rv)
+          | st -> st)
+        b.statements;
+    terminator =
+      (match b.terminator with
+       | Seed_mir.Call (dest, callee, args, next, unwind) ->
+           let callee' =
+             match callee with
+             | Seed_mir.User inst -> Seed_mir.User (rewrite_instance map inst)
+             | c -> c
+           in
+           Seed_mir.Call
+             ( dest,
+               callee',
+               Array.map
+                 (fun a -> { a with Seed_mir.value = rewrite_operand map a.Seed_mir.value })
+                 args,
+               next,
+               unwind )
+       | Seed_mir.SwitchInt (op, targets, default) ->
+           Seed_mir.SwitchInt (rewrite_operand map op, targets, default)
+       | Seed_mir.Assert (op, expected, msg, target) ->
+           Seed_mir.Assert (rewrite_operand map op, expected, msg, target)
+       | t -> t);
+  }
+
+let rewrite_function map (fn : Seed_mir.function_) : Seed_mir.function_ =
+  let locals' = Array.map (rewrite_ty map) fn.Seed_mir.locals in
+  {
+    fn with
+    instance = rewrite_instance map fn.Seed_mir.instance;
+    params =
+      Array.map
+        (fun p -> { p with Type_repr.pt_type = rewrite_ty map p.Type_repr.pt_type })
+        fn.Seed_mir.params;
+    locals = locals';
+    blocks = Array.map (rewrite_block map locals') fn.Seed_mir.blocks;
+  }
+
+let rewrite_static map ((name, ty, init) : string * Type_repr.t * Seed_mir.constant option) :
+    string * Type_repr.t * Seed_mir.constant option =
+  ( name,
+    rewrite_ty map ty,
+    match init with
+    | Some (Seed_mir.Function inst) ->
+        Some (Seed_mir.Function (rewrite_instance map inst))
+    | init -> init )
+
+let rewrite_def map (d : Seed_mir.type_def) : Seed_mir.type_def =
+  match d with
+  | Seed_mir.StructDef { sd_id; sd_fields } ->
+      Seed_mir.StructDef
+        {
+          sd_id;
+          sd_fields =
+            List.map
+              (fun f -> { f with Seed_mir.fd_ty = rewrite_ty map f.Seed_mir.fd_ty })
+              sd_fields;
+        }
+  | Seed_mir.EnumDef { ed_id; ed_variants } ->
+      Seed_mir.EnumDef
+        {
+          ed_id;
+          ed_variants =
+            List.map
+              (fun v -> { v with Seed_mir.vd_payload = rewrite_ty map v.Seed_mir.vd_payload })
+              ed_variants;
+        }
+
+(* The largest TypeId the program can see: every def id, every generic
+   registry tid and every Named mention in bodies/statics/defs.  The
+   fresh instance TypeIds are minted above it, so a fresh id can never
+   alias an existing identity (a body's unrewritten Named tid must not
+   start resolving to a materialized def). *)
+let program_max_type_id ~(generic_types : Mono.generic_def array)
+    (prog : Seed_mir.program) : int =
+  let acc = ref 0 in
+  let bump i = if i > !acc then acc := i in
+  let rec walk_ty (ty : Type_repr.t) : unit =
+    match ty with
+    | Type_repr.Named (tid, args) ->
+        bump (Ids.Type_id.to_int tid);
+        Array.iter walk_ty args
+    | Type_repr.Raw_ptr (_, t) | Type_repr.Ref_internal (_, t) | Type_repr.Fixed_array (t, _) ->
+        walk_ty t
+    | Type_repr.Tuple elems -> Array.iter walk_ty elems
+    | Type_repr.Function (params, ret) ->
+        Array.iter (fun p -> walk_ty p.Type_repr.pt_type) params;
+        walk_ty ret
+    | _ -> ()
+  in
+  let walk_operand (op : Seed_mir.operand) : unit =
+    match op with
+    | Seed_mir.Constant (Seed_mir.Function inst) ->
+        Array.iter walk_ty (Instance_id.type_args inst)
+    | _ -> ()
+  in
+  let walk_rvalue (rv : Seed_mir.rvalue) : unit =
+    match rv with
+    | Seed_mir.Use op -> walk_operand op
+    | Seed_mir.Ref _ | Seed_mir.RefMut _ | Seed_mir.Discriminant _ | Seed_mir.Len _ -> ()
+    | Seed_mir.Aggregate (kind, ops) ->
+        List.iter walk_operand ops;
+        (match kind with
+         | Seed_mir.ClosureAgg inst -> Array.iter walk_ty (Instance_id.type_args inst)
+         | _ -> ())
+    | Seed_mir.BinaryOp (_, l, r) ->
+        walk_operand l;
+        walk_operand r
+    | Seed_mir.UnaryOp (_, op) -> walk_operand op
+    | Seed_mir.Cast (op, ty) ->
+        walk_operand op;
+        walk_ty ty
+  in
+  Array.iter
+    (fun (d : Seed_mir.type_def) -> bump (Ids.Type_id.to_int (Seed_mir.def_id d)))
+    prog.Seed_mir.types;
+  Array.iter
+    (fun (gd : Mono.generic_def) -> bump (Ids.Type_id.to_int gd.Mono.gd_tid))
+    generic_types;
+  Array.iter
+    (fun (f : Seed_mir.function_) ->
+      Array.iter walk_ty (Instance_id.type_args f.Seed_mir.instance);
+      Array.iter (fun p -> walk_ty p.Type_repr.pt_type) f.Seed_mir.params;
+      Array.iter walk_ty f.Seed_mir.locals;
+      Array.iter
+        (fun (b : Seed_mir.block) ->
+          List.iter
+            (function
+              | Seed_mir.Assign (_, rv) -> walk_rvalue rv
+              | _ -> ())
+            b.Seed_mir.statements;
+          match b.Seed_mir.terminator with
+          | Seed_mir.Call (_, callee, args, _, _) ->
+              (match callee with
+               | Seed_mir.User inst -> Array.iter walk_ty (Instance_id.type_args inst)
+               | _ -> ());
+              Array.iter (fun a -> walk_operand a.Seed_mir.value) args
+          | Seed_mir.SwitchInt (op, _, _) | Seed_mir.Assert (op, _, _, _) -> walk_operand op
+          | _ -> ())
+        f.Seed_mir.blocks)
+    prog.Seed_mir.functions;
+  Array.iter
+    (fun (_, ty, init) ->
+      walk_ty ty;
+      match init with
+      | Some (Seed_mir.Function inst) -> Array.iter walk_ty (Instance_id.type_args inst)
+      | _ -> ())
+    prog.Seed_mir.statics;
+  Array.iter
+    (fun (d : Seed_mir.type_def) ->
+      match d with
+      | Seed_mir.StructDef { sd_fields; _ } -> List.iter (fun f -> walk_ty f.Seed_mir.fd_ty) sd_fields
+      | Seed_mir.EnumDef { ed_variants; _ } ->
+          List.iter (fun v -> walk_ty v.Seed_mir.vd_payload) ed_variants)
+    prog.Seed_mir.types;
+  !acc
+
+let materialize_type_instances ~(generic_types : Mono.generic_def array)
+    ~(type_instances : Mono.type_instance list) (prog : Seed_mir.program) :
+    (Seed_mir.program, string list) result =
+  if Array.length generic_types = 0 then Ok prog
+  else begin
+    let errors = ref [] in
+    let err msg = errors := msg :: !errors in
+    let seen : Mono.type_instance list ref = ref [] in
+    let queue : Mono.type_instance Queue.t = Queue.create () in
+    let enqueue (ti : Mono.type_instance) =
+      if not (List.exists (Mono.type_instance_equal ti) !seen) then begin
+        seen := ti :: !seen;
+        Queue.add ti queue
+      end
+    in
+    (* seed: the mono queue (first-discovery order), then instances
+       embedded in the pre-mono defs and statics — those are invisible
+       to the body walk (a struct Foo { p: Pair[Int] } field type is
+       only reached through Foo's def) *)
+    List.iter enqueue type_instances;
+    Array.iter
+      (fun (d : Seed_mir.type_def) ->
+        match d with
+        | Seed_mir.StructDef { sd_fields; _ } ->
+            List.iter (fun f -> Mono.scan_type generic_types enqueue f.Seed_mir.fd_ty) sd_fields
+        | Seed_mir.EnumDef { ed_variants; _ } ->
+            List.iter
+              (fun v -> Mono.scan_type generic_types enqueue v.Seed_mir.vd_payload)
+              ed_variants)
+      prog.Seed_mir.types;
+    Array.iter
+      (fun (_, ty, init) ->
+        Mono.scan_type generic_types enqueue ty;
+        match init with
+        | Some (Seed_mir.Function inst) ->
+            Array.iter (Mono.scan_type generic_types enqueue) (Instance_id.type_args inst)
+        | _ -> ())
+      prog.Seed_mir.statics;
+    let next_tid = ref (program_max_type_id ~generic_types prog + 1) in
+    let map : (Ids.Type_id.t * Type_repr.t array * Ids.Type_id.t) list ref = ref [] in
+    let materialized : Seed_mir.type_def list ref = ref [] in
+    (* drain: materialize each queued instance; the substituted field
+       types can reveal further instances (the fixpoint), queued in
+       materialization order *)
+    while not (Queue.is_empty queue) do
+      let ti = Queue.pop queue in
+      match Mono.find_generic generic_types ti.Mono.ti_tid with
+      | None ->
+          err
+            (Printf.sprintf
+               "mono: no generic template def for the required concrete type instance type#%d[%s]"
+               (Ids.Type_id.to_int ti.Mono.ti_tid)
+               (String.concat ", "
+                  (Array.to_list (Array.map Seed_mir.print_type ti.Mono.ti_args))))
+      | Some gd -> (
+          match Mono.type_substitution gd ti.Mono.ti_args with
+          | Error m -> err m
+          | Ok subst ->
+              let ntid = Ids.Type_id.make !next_tid in
+              incr next_tid;
+              let def =
+                match gd.Mono.gd_def with
+                | Seed_mir.StructDef { sd_fields; _ } ->
+                    Seed_mir.StructDef
+                      {
+                        sd_id = ntid;
+                        sd_fields =
+                          List.map
+                            (fun f ->
+                              {
+                                f with
+                                Seed_mir.fd_ty = Type_repr.substitute subst f.Seed_mir.fd_ty;
+                              })
+                            sd_fields;
+                      }
+                | Seed_mir.EnumDef { ed_variants; _ } ->
+                    Seed_mir.EnumDef
+                      {
+                        ed_id = ntid;
+                        ed_variants =
+                          List.map
+                            (fun v ->
+                              {
+                                v with
+                                Seed_mir.vd_payload =
+                                  Type_repr.substitute subst v.Seed_mir.vd_payload;
+                              })
+                            ed_variants;
+                      }
+              in
+              map := (ti.Mono.ti_tid, ti.Mono.ti_args, ntid) :: !map;
+              materialized := def :: !materialized;
+              (match def with
+               | Seed_mir.StructDef { sd_fields; _ } ->
+                   List.iter (fun f -> Mono.scan_type generic_types enqueue f.Seed_mir.fd_ty)
+                     sd_fields
+               | Seed_mir.EnumDef { ed_variants; _ } ->
+                   List.iter
+                     (fun v -> Mono.scan_type generic_types enqueue v.Seed_mir.vd_payload)
+                     ed_variants))
+    done;
+    match !errors with
+    | [] ->
+        let map = List.rev !map in
+        let materialized = List.rev !materialized in
+        Ok
+          {
+            Seed_mir.functions = Array.map (rewrite_function map) prog.Seed_mir.functions;
+            statics = Array.map (rewrite_static map) prog.Seed_mir.statics;
+            types =
+              Array.append
+                (Array.map (rewrite_def map) prog.Seed_mir.types)
+                (Array.of_list (List.map (rewrite_def map) materialized));
+          }
+    | errs -> Error (List.rev errs)
+  end
 
 (* Mono the lowered closure from the bootstrap entry; report pre/post
    function and instance counts; require zero residual Type_param and a
    clean Mir_verify of the mono'd program. *)
 let run_mono_phase ~(entry_name : string) ~(entry : Instance_id.t)
+    ?(generic_types : Mono.generic_def array = [||])
     (prog : Seed_mir.program) : (mono_outcome, string list) result =
   Printf.printf "  mono: entry '%s' (%s)\n" entry_name (Seed_mir.print_instance entry);
-  match Mono.build ~entry prog with
+  let type_instances = ref [] in
+  match
+    Mono.build ~entry ~generic_types
+      ~on_type_instance:(fun ti -> type_instances := ti :: !type_instances)
+      prog
+  with
   | Error errs ->
       Printf.printf "  mono: BUILD FAILED\n";
       List.iter (fun e -> Printf.printf "    %s\n" e) errs;
@@ -1351,24 +1852,52 @@ let run_mono_phase ~(entry_name : string) ~(entry : Instance_id.t)
       let mono_prog = { prog with Seed_mir.functions = fns } in
       let pre = Array.length prog.Seed_mir.functions in
       let post = Array.length fns in
-      let residual = count_residual_type_params mono_prog in
-      Printf.printf "  mono: build OK — pre %d template function(s) -> post %d specialized instance(s)\n" pre post;
-      Printf.printf "  mono: post-instance count %d; residual Type_param positions %d (walked params/locals/instance args/operands/callees/statics/type defs)\n" post residual;
-      (match Mir_verify.require_valid mono_prog with
+      let queued = List.rev !type_instances in
+      (match materialize_type_instances ~generic_types ~type_instances:queued mono_prog with
        | Error errs ->
-           Printf.printf "  MONO_MIR_STRUCTURAL_GATE = FAIL\n";
+           Printf.printf "  mono: TYPE MATERIALIZATION FAILED\n";
            List.iter (fun e -> Printf.printf "    %s\n" e) errs;
            Error errs
-       | Ok () ->
-           Printf.printf "  MONO_MIR_STRUCTURAL_GATE = PASS (%d functions)\n" post;
-           Ok
-             { mo_program = mono_prog;
-               mo_entry = entry;
-               mo_entry_name = entry_name;
-               mo_pre_functions = pre;
-               mo_post_functions = post;
-               mo_post_instances = post;
-               mo_residual_type_params = residual })
+       | Ok final_prog ->
+           let n_type_instances =
+             Array.length final_prog.Seed_mir.types - Array.length prog.Seed_mir.types
+           in
+           let residual = count_residual_type_params final_prog in
+           Printf.printf
+             "  mono: build OK — pre %d template function(s) -> post %d specialized instance(s)\n"
+             pre post;
+           Printf.printf "  mono: queued concrete type instances: %d (%s)\n"
+             (List.length queued)
+             (String.concat ", "
+                (List.map
+                   (fun (ti : Mono.type_instance) ->
+                     Printf.sprintf "type#%d[%s]"
+                       (Ids.Type_id.to_int ti.Mono.ti_tid)
+                       (String.concat ", "
+                          (Array.to_list (Array.map Seed_mir.print_type ti.Mono.ti_args))))
+                   queued));
+           Printf.printf
+             "  mono: materialized %d concrete type instance def(s); final types table %d entries\n"
+             n_type_instances (Array.length final_prog.Seed_mir.types);
+           Printf.printf
+             "  mono: post-instance count %d; residual Type_param positions %d (walked params/locals/instance args/operands/callees/statics/type defs)\n"
+             post residual;
+           (match Mir_verify.require_valid final_prog with
+            | Error errs ->
+                Printf.printf "  MONO_MIR_STRUCTURAL_GATE = FAIL\n";
+                List.iter (fun e -> Printf.printf "    %s\n" e) errs;
+                Error errs
+            | Ok () ->
+                Printf.printf "  MONO_MIR_STRUCTURAL_GATE = PASS (%d functions)\n" post;
+                Ok
+                  { mo_program = final_prog;
+                    mo_entry = entry;
+                    mo_entry_name = entry_name;
+                    mo_pre_functions = pre;
+                    mo_post_functions = post;
+                    mo_post_instances = post;
+                    mo_type_instances = n_type_instances;
+                    mo_residual_type_params = residual }))
 
 let oracle_of_ctx (ctx : closure_ctx) (stats : mir_stats option) : oracle_counts =
   let s =
@@ -1548,7 +2077,11 @@ let cmd_bootstrap_check (args : string list) : int =
                    Printf.printf "  RESULT = WIP\n";
                    1
                | Some (entry_name, entry) -> (
-                   match run_mono_phase ~entry_name ~entry prog with
+                   match
+                     run_mono_phase ~entry_name ~entry
+                       ~generic_types:(closure_generic_types ctx.ctx_env)
+                       prog
+                   with
                    | Error _ ->
                        Printf.printf "  BOOTSTRAP_EXECUTABLE_CLOSURE = INCOMPLETE\n";
                        Printf.printf "  RESULT = WIP\n";
@@ -1696,7 +2229,11 @@ let cmd_compile (args : string list) : int =
                   Printf.printf "  RESULT: FAIL\n";
                   1
               | Some (entry_name, entry) -> (
-                  match run_mono_phase ~entry_name ~entry prog with
+                  match
+                    run_mono_phase ~entry_name ~entry
+                      ~generic_types:(closure_generic_types ctx.ctx_env)
+                      prog
+                  with
                   | Error _ ->
                       Printf.printf "compile: FAILED — mono phase\n";
                       Printf.printf "  RESULT: FAIL\n";
