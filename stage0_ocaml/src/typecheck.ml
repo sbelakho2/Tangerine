@@ -440,7 +440,15 @@ let builtin_trait_contracts : (string * string list) list =
   ]
 
 (* ─── builtin methods ─── *)
-let builtin_methods (st : state) : ((string * string) * typed_signature) list =
+(* the canonical LangItem generic parameters (audit Fix 4): minted once
+   in initial_env, shared by the builtin method tables, the builtin
+   nominals and — through the seeded sig_param_ids memo — the source
+   std declarations *)
+let builtin_methods (st : state) (vec_p : Ids.Generic_param_id.t) (opt_p : Ids.Generic_param_id.t)
+    (res_p : Ids.Generic_param_id.t) (res_e_p : Ids.Generic_param_id.t)
+    (map_k_p : Ids.Generic_param_id.t) (map_v_p : Ids.Generic_param_id.t)
+    (set_p : Ids.Generic_param_id.t) :
+    ((string * string) * typed_signature) list =
   let par (n : string) (c : Access_effect.t) (t : Type_repr.t) = (n, c, t) in
   let i_ty = Type_repr.Int Type_repr.Int in
   let u_ty = Type_repr.Int Type_repr.UInt in
@@ -546,7 +554,6 @@ let builtin_methods (st : state) : ((string * string) * typed_signature) list =
     |> List.map (fun (n, p, r, w, rc) -> simple ~owner:"Char" ~owner_ty:c_ty ~name:n ~params:p ~ret:r ~decl:[] ~where:w ~recv_conv:rc)
   in
   (* Vec / Array (the same builtin heap type) *)
-  let vec_p = fresh_param_id st in
   let vec_t = Type_repr.Type_param vec_p in
   let vec_self = Type_repr.Named (b_array, [| vec_t |]) in
   let vec_methods =
@@ -577,7 +584,6 @@ let builtin_methods (st : state) : ((string * string) * typed_signature) list =
       vec_methods
   in
   (* Option *)
-  let opt_p = fresh_param_id st in
   let opt_t = Type_repr.Type_param opt_p in
   let opt_self = Type_repr.Named (b_option, [| opt_t |]) in
   let m_opt =
@@ -591,8 +597,6 @@ let builtin_methods (st : state) : ((string * string) * typed_signature) list =
     |> List.map (fun (n, p, r, w, rc) -> simple ~owner:"Option" ~owner_ty:opt_self ~name:n ~params:p ~ret:r ~decl:[ ("T", opt_p) ] ~where:w ~recv_conv:rc)
   in
   (* Result *)
-  let res_p = fresh_param_id st in
-  let res_e_p = fresh_param_id st in
   let res_t = Type_repr.Type_param res_p in
   let res_e = Type_repr.Type_param res_e_p in
   let res_self = Type_repr.Named (b_result, [| res_t; res_e |]) in
@@ -608,8 +612,6 @@ let builtin_methods (st : state) : ((string * string) * typed_signature) list =
     |> List.map (fun (n, p, r, w, rc) -> simple ~owner:"Result" ~owner_ty:res_self ~name:n ~params:p ~ret:r ~decl:[ ("T", res_p); ("E", res_e_p) ] ~where:w ~recv_conv:rc)
   in
   (* Map *)
-  let map_k_p = fresh_param_id st in
-  let map_v_p = fresh_param_id st in
   let map_k = Type_repr.Type_param map_k_p in
   let map_v = Type_repr.Type_param map_v_p in
   let map_self = Type_repr.Named (b_map, [| map_k; map_v |]) in
@@ -629,7 +631,6 @@ let builtin_methods (st : state) : ((string * string) * typed_signature) list =
     |> List.map (fun (n, p, r, w, rc) -> simple ~owner:"Map" ~owner_ty:map_self ~name:n ~params:p ~ret:r ~decl:[ ("K", map_k_p); ("V", map_v_p) ] ~where:w ~recv_conv:rc)
   in
   (* Set *)
-  let set_p = fresh_param_id st in
   let set_t = Type_repr.Type_param set_p in
   let set_self = Type_repr.Named (b_set, [| set_t |]) in
   let m_set =
@@ -700,29 +701,35 @@ let builtin_methods (st : state) : ((string * string) * typed_signature) list =
   @ m_vec @ m_array @ m_opt @ m_res @ m_map @ m_set @ m_display @ m_hash @ m_eq
   @ m_traits
 
-(* ─── builtin variant constructors ─── *)
-let builtin_constructors (st : state) : (string * typed_signature) list =
-  let some_t = fresh_param_id st in
+(* ─── builtin variant constructors ───
+   LangItem unification (audit Fix 4): the constructors share the
+   canonical Option/Result parameter ids with the method tables and the
+   nominals, so every builtin and source-declared use of Option/Result
+   has ONE parameter identity. *)
+let builtin_constructors (st : state) (opt_p : Ids.Generic_param_id.t)
+    (res_p : Ids.Generic_param_id.t) (res_e_p : Ids.Generic_param_id.t) :
+    (string * typed_signature) list =
+  let some_t = opt_p in
   let some =
     mk_sig st ~name:"Option::Some" ~params_decl:[ ("T", some_t) ]
       ~params:[ ("value", Access_effect.Let, Type_repr.Type_param some_t) ]
       ~ret:(Type_repr.Named (b_option, [| Type_repr.Type_param some_t |])) ~where:[]
   in
-  let none_t = fresh_param_id st in
+  let none_t = opt_p in
   let none =
     mk_sig st ~name:"Option::None" ~params_decl:[ ("T", none_t) ]
       ~params:[] ~ret:(Type_repr.Named (b_option, [| Type_repr.Type_param none_t |])) ~where:[]
   in
-  let ok_t = fresh_param_id st in
-  let ok_e = fresh_param_id st in
+  let ok_t = res_p in
+  let ok_e = res_e_p in
   let ok =
     mk_sig st ~name:"Result::Ok" ~params_decl:[ ("T", ok_t); ("E", ok_e) ]
       ~params:[ ("value", Access_effect.Let, Type_repr.Type_param ok_t) ]
       ~ret:(Type_repr.Named (b_result, [| Type_repr.Type_param ok_t; Type_repr.Type_param ok_e |]))
       ~where:[]
   in
-  let err_t = fresh_param_id st in
-  let err_e = fresh_param_id st in
+  let err_t = res_p in
+  let err_e = res_e_p in
   let err =
     mk_sig st ~name:"Result::Err" ~params_decl:[ ("T", err_t); ("E", err_e) ]
       ~params:[ ("value", Access_effect.Let, Type_repr.Type_param err_e) ]
@@ -772,13 +779,22 @@ let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
     }
   in
   let types = builtin_types st in
+  (* LangItem generic parameters minted once, in declaration order *)
+  let vec_p = fresh_param_id st in
+  let opt_p = fresh_param_id st in
+  let res_p = fresh_param_id st in
+  let res_e_p = fresh_param_id st in
+  let map_k_p = fresh_param_id st in
+  let map_v_p = fresh_param_id st in
+  let set_p = fresh_param_id st in
   let impls =
     { Trait_solver.impls = builtin_impls st; param_bounds = []; trait_contracts = builtin_trait_contracts }
   in
-  (* builtin nominals so patterns can resolve Option::Some / Result::Ok *)
-  let opt_p = fresh_param_id st in
-  let res_t = fresh_param_id st in
-  let res_e = fresh_param_id st in
+  (* builtin nominals so patterns can resolve Option::Some / Result::Ok.
+     LangItem unification (audit Fix 4): the nominal's parameter ids must
+     BE the method tables' parameter ids — the source std declaration
+     (via the seeded sig_param_ids memo below) then reuses the SAME ids,
+     so there is exactly one Option-T identity, one Result-T/E identity. *)
   let opt_nominal : nominal =
     {
       nom_kind = `Enum;
@@ -794,29 +810,35 @@ let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
   let res_nominal : nominal =
     {
       nom_kind = `Enum;
-      nom_params = [ ("T", res_t); ("E", res_e) ];
+      nom_params = [ ("T", res_p); ("E", res_e_p) ];
       nom_fields = [];
       nom_variants =
         [
-          ("Ok", [| Type_repr.Type_param res_t |]);
-          ("Err", [| Type_repr.Type_param res_e |]);
+          ("Ok", [| Type_repr.Type_param res_p |]);
+          ("Err", [| Type_repr.Type_param res_e_p |]);
         ];
       nom_where = [];
       nom_field_ids = [];
       nom_variant_ids = [];
     }
   in
+  (* the source declarations of Option/Result adopt the builtin LangItem
+     parameter identities through the memo, collapsing the dual nominal
+     universes (audit Fix 4) *)
+  Hashtbl.replace st.sig_param_ids "nominal::Option" [ ("T", opt_p) ];
+  Hashtbl.replace st.sig_param_ids "nominal::Result"
+    [ ("T", res_p); ("E", res_e_p) ];
   {
     types;
     functions = [];
-    methods = builtin_methods st;
+    methods = builtin_methods st vec_p opt_p res_p res_e_p map_k_p map_v_p set_p;
     impls;
     current_self = None;
     current_return = None;
     type_ids = type_ids_of_builtins;
     type_names = type_names_of_builtins;
     nominals = [ ("Option", opt_nominal); ("Result", res_nominal) ];
-    constructors = builtin_constructors st;
+    constructors = builtin_constructors st opt_p res_p res_e_p;
     consts = [];
     state = st;
     module_id = Ids.Module_id.make 0;
@@ -901,7 +923,7 @@ and resolve_var (subst : (Type_repr.generic_key * Type_repr.t) list) (v : int) :
   | Some (Type_repr.Type_param id2) -> resolve_param subst id2
   | Some (Type_repr.Infer_var v2) -> resolve_var subst v2
   | Some t -> Some t
-  | None -> None
+  | None -> Some (Type_repr.Infer_var v)
 
 let rec unify (subst : (Type_repr.generic_key * Type_repr.t) list ref) (a : Type_repr.t)
     (b : Type_repr.t) : (unit, string) result =
@@ -971,24 +993,18 @@ let rec unify (subst : (Type_repr.generic_key * Type_repr.t) list ref) (a : Type
         Ok ()
       end
   | Type_repr.Type_param pa, _ ->
-      (* SOFT rigidity: a declaration binder absent from the call's
-         substitution is bound as before (the old inference model) —
-         pre-instantiation has already given every clean generic use its
-         own Infer_var; only dual-universe sigs (builtin vs source
-         nominal) still leak raw binders here, and they must keep
-         typechecking until the LangItem unification lands.  The rigid
-         error form is preserved in the message for the audit trail. *)
-      if occurs_key (Type_repr.KParam pa) b' then Error "recursive type"
-      else begin
-        subst := (Type_repr.KParam pa, b') :: !subst;
-        Ok ()
-      end
+      (* RIGID: a declaration binder absent from the substitution has
+         not been instantiated — it is rigid within its own declaration
+         and must never be bound by unification (the native model).
+         Pre-instantiation covers every generic use; anything reaching
+         this arm is an uninstantiated leak and must be reported. *)
+      Error
+        (Printf.sprintf "cannot unify rigid generic parameter P#%d with %s"
+           (Ids.Generic_param_id.to_int pa) (type_to_string b'))
   | _, Type_repr.Type_param pb ->
-      if occurs_key (Type_repr.KParam pb) a' then Error "recursive type"
-      else begin
-        subst := (Type_repr.KParam pb, a') :: !subst;
-        Ok ()
-      end
+      Error
+        (Printf.sprintf "cannot unify rigid generic parameter P#%d with %s"
+           (Ids.Generic_param_id.to_int pb) (type_to_string a'))
   | Type_repr.Named (id1, a1), Type_repr.Named (id2, a2) ->
       if
         Ids.Type_id.compare id1 id2 <> 0
@@ -1660,24 +1676,32 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
           let* lit_args =
             match targs with
             | [] -> (
-                (* the stored nominal params may be stale (frozen at the
-                   first registration round); instantiate against the
-                   scope's live generics by name, falling back to a fresh
-                   param when the name is not in scope *)
-                match List.assoc_opt name env.types with
-                | Some (Type_repr.Named (_, a)) ->
-                    Ok
-                      (Array.of_list
-                         (List.map2
-                            (fun (pname, _) stored ->
-                              match List.assoc_opt pname scope.generics with
-                              | Some pid -> Type_repr.Type_param pid
-                              | None -> (
-                                  match stored with
-                                  | Type_repr.Type_param _ -> Type_repr.Type_param (fresh_param_id env.state)
-                                  | other -> other))
-                            nom.nom_params (Array.to_list a)))
-                | _ -> Ok [||])
+                (* the expected type is authoritative when it is the same
+                   nominal: its arguments ARE the literal's arguments (the
+                   native model — no re-derivation from scope names) *)
+                match expected with
+                | Some (Type_repr.Named (eid, eargs)) when Ids.Type_id.compare eid tid = 0 ->
+                    Ok eargs
+                | _ -> (
+                    (* the stored nominal params may be stale (frozen at
+                       the first registration round); instantiate against
+                       the scope's live generics by name, falling back to
+                       a fresh param when the name is not in scope *)
+                    match List.assoc_opt name env.types with
+                    | Some (Type_repr.Named (_, a)) ->
+                        Ok
+                          (Array.of_list
+                             (List.map2
+                                (fun (pname, _) stored ->
+                                  match List.assoc_opt pname scope.generics with
+                                  | Some pid -> Type_repr.Type_param pid
+                                  | None -> (
+                                      match stored with
+                                      | Type_repr.Type_param _ ->
+                                          Type_repr.Type_param (fresh_param_id env.state)
+                                      | other -> other))
+                                nom.nom_params (Array.to_list a)))
+                    | _ -> Ok [||]))
             | ts ->
                 let rec go acc = function
                   | [] -> Ok (Array.of_list (List.rev acc))
@@ -2703,13 +2727,26 @@ and check_closure_call (env : env) (scope : scope) (expected : Type_repr.t optio
           | Error m -> Error m
           | Ok ate -> (
               let subst = ref [] in
-              match unify subst ps.(i).Type_repr.pt_type ate.te_type with
-              | Ok () -> check_args (ate :: acc) (i + 1) rest
-              | Error m ->
-                  Error
-                    (err a.Ast.ca_span
-                       (Printf.sprintf "argument %d type mismatch: expected %s (%s)" (i + 1)
-                          (type_to_string ps.(i).Type_repr.pt_type) m))))
+              (* Tangerine call-site coercion for closure calls too: an
+                 explicit-ref argument `&x` to a by-value parameter derefs
+                 to x (parity with check_call_sig) *)
+              match ate.te_type with
+              | Type_repr.Ref_internal (_, inner) -> (
+                  match unify subst ps.(i).Type_repr.pt_type inner with
+                  | Ok () -> check_args (ate :: acc) (i + 1) rest
+                  | Error m ->
+                      Error
+                        (err a.Ast.ca_span
+                           (Printf.sprintf "argument %d type mismatch: expected %s (%s)"
+                              (i + 1) (type_to_string ps.(i).Type_repr.pt_type) m)))
+              | _ -> (
+                  match unify subst ps.(i).Type_repr.pt_type ate.te_type with
+                  | Ok () -> check_args (ate :: acc) (i + 1) rest
+                  | Error m ->
+                      Error
+                        (err a.Ast.ca_span
+                           (Printf.sprintf "argument %d type mismatch: expected %s (%s)"
+                              (i + 1) (type_to_string ps.(i).Type_repr.pt_type) m)))))
   in
   match check_args [] 0 args with
   | Error m -> Error m
@@ -3110,7 +3147,10 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
                             | true ->
                                 if Array.length a1 <> Array.length a2 then None
                                 else begin
-                                  let s4 = ref [] in
+                                  (* the same-name unification must see the
+                                     call's pre-instantiation, so it starts
+                                     from the main substitution *)
+                                  let s4 = ref !subst in
                                   let rec go i =
                                     if i >= Array.length a1 then Some ()
                                     else
