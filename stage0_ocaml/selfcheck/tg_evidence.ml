@@ -1,18 +1,35 @@
 (* tg_evidence.ml — deterministic per-phase pipeline evidence record.
 
-   Runs the SAME pipeline functions the driver's bootstrap-check / compile
-   use (src/driver.ml cmd_bootstrap_check): Bootstrap_manifest.load ->
-   fingerprint -> Module_graph.create_with_sources -> Resolver.resolve ->
-   the typecheck fixpoint (registration is non-fatal; modules with errors
-   retry with the growing env until no module makes progress or the
-   8-round cap) -> lowering (Driver.lower_closure) -> mono (Mono.build +
-   residual Type_param walk + Mir_verify).  The driver's pipeline helpers
-   print diagnostics to stdout, so this tool replicates the minimal call
-   sequence with the same underlying functions and reuses the driver's
-   non-printing helpers (Driver.lower_closure, Driver.resolve_bootstrap_entry,
-   Driver.count_residual_type_params); module order is the driver's
-   topological order (topological_nodes in src/driver.ml) minus its debug
-   prints.
+   Calls the SAME canonical closure entry the driver's bootstrap-check /
+   compile use — Driver.run_closure_pipeline (src/driver.ml) — and
+   serializes the resulting closure_ctx.  ONE implementation, ONE
+   measurement: the evidence typecheck count, the debt report and the
+   phase counts come from the driver's own closure pipeline (manifest ->
+   fingerprint -> module graph -> @cfg elimination -> resolver -> the
+   declaration fixpoint + one body pass), NOT from a locally replicated
+   pipeline.  The driver's helpers print their detail lines to stdout
+   (manifest, module graph, @cfg, resolver, identity handoff, the
+   accumulated debt blocks); the last debt block printed by
+   Typecheck.record_module_debt is the closure's final debt report and is
+   serialized here from the ctx's own accumulated accounting
+   (ctx_env.state.debt_by_module), so the evidence lines are exactly the
+   pipeline's numbers.
+
+   Serialized from the closure_ctx:
+     manifest fingerprint (re-verified from the canonical sequence)
+     graph modules / item count (ctx_graph — the post-@cfg graph the
+       resolver/typechecker measure)
+     resolver counts (ctx_resolved)
+     typecheck errors / items (ctx_type_errors, ctx_items)
+     declaration fixpoint iterations + body passes (ctx_rounds: the
+       driver sets 2 = declaration fixpoint rounds; the body pass runs
+       exactly once — audit Fix 3 deterministic phase split)
+     the real debt report: per-category buckets, total, primaries,
+       secondaries (the pipeline's accumulated debt_by_module)
+     the lowering/mono gates the driver itself would run (lower_closure,
+       Mono.build, residual Type_param walk, Mir_verify — the same
+       helpers bootstrap-check uses; skipped when the typecheck gate
+       failed, exactly as the driver skips them)
 
    Emits one `evidence <phase> ...` line per phase on stdout, in a fixed
    order, byte-identical across runs EXCEPT the run= line (unix epoch
@@ -83,172 +100,96 @@ let () =
     die "fingerprint mismatch: canonical-sequence SHA-256 differs from the loaded record";
   Printf.printf "evidence manifest=%s\n" fp;
 
-  (* ── module graph ──────────────────────────────────────────────── *)
-  let diags = Diagnostic.create_bag () in
-  let graph = Module_graph.create_with_sources manifest diags in
-  Printf.printf "evidence graph modules=%d items=%d\n" graph.Module_graph.node_count
-    graph.Module_graph.item_count;
-
-  (* ── resolver ──────────────────────────────────────────────────── *)
-  let resolved = Resolver.resolve manifest graph diags in
-  if Diagnostic.has_errors diags then
-    die "resolver diagnostics: %s" (Diagnostic.render (Module_graph.source_map graph) diags);
-  let n_entries = List.length (Bootstrap_manifest.entries manifest) in
-  let expr = List.length resolved.Resolver.expr_defs in
-  let type_ = List.length resolved.Resolver.type_defs in
-  let field = List.length resolved.Resolver.field_defs in
-  let variant = List.length resolved.Resolver.variant_defs in
-  let calls = List.length resolved.Resolver.call_candidates in
-  Printf.printf "evidence resolver entries=%d defs=%d expr=%d type=%d field=%d variant=%d calls=%d\n"
-    n_entries (expr + type_ + field + variant) expr type_ field variant calls;
-
-  (* ── typecheck fixpoint (driver parity) ────────────────────────── *)
-
-  (* Driver-parity module order (driver.ml topological_nodes): dedupe
-     nodes by source file (lib_kernel re-export subtrees alias files),
-     Kahn topological order over import edges, manifest-order fallback for
-     the cyclic remainder. *)
-  let topological_nodes (graph : Module_graph.t) : Module_graph.module_node list =
-    let seen_files = Hashtbl.create 64 in
-    let canonical =
-      List.filter
-        (fun node ->
-          if Hashtbl.mem seen_files node.Module_graph.node_file then false
-          else begin
-            Hashtbl.add seen_files node.Module_graph.node_file ();
-            true
-          end)
-        graph.Module_graph.nodes
-    in
-    let nodes = Array.of_list canonical in
-    let n = Array.length nodes in
-    let by_path = Hashtbl.create 64 in
-    Array.iteri
-      (fun i node -> Hashtbl.replace by_path (String.concat "::" node.Module_graph.node_path) i)
-      nodes;
-    let deps = Array.make n [] in
-    let rdeps = Array.make n [] in
-    Array.iteri
-      (fun i node ->
-        let imports =
-          List.filter_map
-            (fun it -> match it.Ast.kind with Ast.UseDecl u -> Some u | _ -> None)
-            node.Module_graph.node_program.Ast.items
-        in
-        let add (path : string list) =
-          match Hashtbl.find_opt by_path (String.concat "::" path) with
-          | Some j when j <> i ->
-              deps.(i) <- j :: deps.(i);
-              rdeps.(j) <- i :: rdeps.(j)
-          | _ -> ()
-        in
-        List.iter
-          (fun (u : Ast.use_decl) ->
-            match u.Ast.u_path with
-            | Ast.UseSimple p | Ast.UseAliased (p, _) | Ast.UseGlob p -> add p
-            | Ast.UseGroup (p, items) ->
-                add p;
-                List.iter
-                  (fun (it : Ast.use_item) -> add (p @ [ it.Ast.ui_name ]))
-                  items)
-          imports)
-      nodes;
-    let indeg = Array.map List.length deps in
-    let queue = Queue.create () in
-    Array.iteri (fun i d -> if d = 0 then Queue.push i queue) indeg;
-    let order = ref [] in
-    while not (Queue.is_empty queue) do
-      let i = Queue.pop queue in
-      order := i :: !order;
-      List.iter
-        (fun j ->
-          indeg.(j) <- indeg.(j) - 1;
-          if indeg.(j) = 0 then Queue.push j queue)
-        rdeps.(i)
-    done;
-    let order = List.rev !order in
-    if List.length order <> n then begin
-      let in_order = Hashtbl.create 16 in
-      List.iter (fun i -> Hashtbl.add in_order i ()) order;
-      let rest =
-        List.filter (fun i -> not (Hashtbl.mem in_order i)) (List.init n Fun.id)
-      in
-      List.map (Array.get nodes) (order @ rest)
-    end
-    else List.map (Array.get nodes) order
-  in
-  let env = ref (Typecheck.initial_env ()) in
-  let errs_by_mod : (string, string list) Hashtbl.t = Hashtbl.create 64 in
-  let pending = ref (topological_nodes graph) in
-  let rounds = ref 0 in
-  while !pending <> [] && !rounds < 8 do
-    incr rounds;
-    let this_round = !pending in
-    pending := [];
-    List.iter
-      (fun node ->
-        let key = String.concat "::" node.Module_graph.node_path in
-        match Typecheck.check_program !env node.Module_graph.node_program with
-        | Error m -> Hashtbl.replace errs_by_mod key [ m ]
-        | Ok (env', errors) ->
-            env := env';
-            Hashtbl.replace errs_by_mod key errors;
-            if errors <> [] then pending := node :: !pending)
-      this_round
-  done;
-  let type_errors =
-    Hashtbl.fold
-      (fun key errs acc -> List.map (fun e -> key ^ ": " ^ e) errs @ acc)
-      errs_by_mod []
-  in
-  let n_errors = List.length type_errors in
-  Printf.printf "evidence typecheck errors=%d rounds=%d\n" n_errors !rounds;
-
-  (* ── lowering + mono counts ────────────────────────────────────── *)
-  let ctx : Driver.closure_ctx =
+  (* ── the driver's canonical closure pipeline (bootstrap-check parity) *)
+  let target =
     match Target.unsupported_triple "aarch64-apple-darwin" with
     | Error m -> die "target: %s" m
-    | Ok target ->
-        {
-          Driver.ctx_repo_root = repo_root;
-          ctx_manifest_path = manifest_path;
-          ctx_target = target;
-          ctx_graph = graph;
-          ctx_resolved = resolved;
-          ctx_env = !env;
-          ctx_type_errors = type_errors;
-          ctx_items = graph.Module_graph.item_count;
-          ctx_typed_calls_sample = 0;
-          ctx_rounds = !rounds;
-        }
+    | Ok t -> t
   in
-  let frontend = if n_errors = 0 then "PASS" else "FAIL" in
-  let structural, mono_gate, pre, post, residual =
-    if n_errors = 0 then begin
-      let prog = Driver.lower_closure ctx in
-      match Mir_verify.require_valid prog with
-      | Error _ -> ("FAIL", "SKIPPED", 0, 0, 0)
-      | Ok () -> (
-          match Driver.resolve_bootstrap_entry prog None with
-          | None -> ("PASS", "SKIPPED", 0, 0, 0)
-          | Some (_, entry) -> (
-              match Mono.build ~entry prog with
-              | Error _ -> ("PASS", "FAIL", Array.length prog.Seed_mir.functions, 0, 0)
-              | Ok fns ->
-                  let mono_prog = { prog with Seed_mir.functions = fns } in
-                  let pre = Array.length prog.Seed_mir.functions in
-                  let post = Array.length fns in
-                  let residual = Driver.count_residual_type_params mono_prog in
-                  (match Mir_verify.require_valid mono_prog with
-                   | Error _ -> ("PASS", "FAIL", pre, post, residual)
-                   | Ok () -> ("PASS", "PASS", pre, post, residual))))
-    end
-    else ("SKIPPED", "SKIPPED", 0, 0, 0)
-  in
-  Printf.printf "evidence mono pre=%d post=%d residual=%d skipped=%d\n" pre post residual
-    (if n_errors = 0 then 0 else 1);
-  Printf.printf "evidence gates frontend=%s structural=%s mono=%s\n" frontend structural mono_gate;
+  match
+    Driver.run_closure_pipeline ~repo_root ~manifest_path ~target
+  with
+  | Error m -> die "closure pipeline: %s" m
+  | Ok ctx ->
+      let graph = ctx.Driver.ctx_graph in
+      Printf.printf "evidence graph modules=%d items=%d\n" graph.Module_graph.node_count
+        graph.Module_graph.item_count;
+      let n_entries = List.length (Bootstrap_manifest.entries manifest) in
+      let expr = List.length ctx.Driver.ctx_resolved.Resolver.expr_defs in
+      let type_ = List.length ctx.Driver.ctx_resolved.Resolver.type_defs in
+      let field = List.length ctx.Driver.ctx_resolved.Resolver.field_defs in
+      let variant = List.length ctx.Driver.ctx_resolved.Resolver.variant_defs in
+      let calls = List.length ctx.Driver.ctx_resolved.Resolver.call_candidates in
+      Printf.printf "evidence resolver entries=%d defs=%d expr=%d type=%d field=%d variant=%d calls=%d\n"
+        n_entries (expr + type_ + field + variant) expr type_ field variant calls;
 
-  (* ── run stamp (the only non-deterministic line) ───────────────── *)
-  Printf.printf "evidence run=%d\n" (int_of_float (Unix.time ()));
-  exit 0
+      (* ── the ctx's own typecheck measurement ───────────────────── *)
+      let n_errors = List.length ctx.Driver.ctx_type_errors in
+      (* ctx_items is the driver's file-deduped item count (what
+         bootstrap-check prints: "typecheck: 56 modules, 4496 items,
+         N errors (2 rounds)").  The graph line above is the closure_ctx
+         graph — the POST-@cfg graph the resolver and typechecker
+         measure (the driver's raw "module graph:" line prints the
+         pre-@cfg count including eliminated items). *)
+      Printf.printf "evidence typecheck errors=%d items=%d\n" n_errors ctx.Driver.ctx_items;
+      (* Phase counts (re-audit rounds=2 finding): the closure_ctx
+         carries the driver's round count (ctx_rounds = 2 — the
+         declaration fixpoint's iteration count; audit Fix 3 split the
+         old retry loop into declare-to-fixpoint then check bodies
+         exactly once against the frozen env).  Reported as
+         declaration_fixpoint_iterations = ctx_rounds and body_passes =
+         1, the audit's semantic. *)
+      Printf.printf "evidence declaration_fixpoint_iterations=%d body_passes=1\n"
+        ctx.Driver.ctx_rounds;
+
+      (* ── the real debt report (per-category, total, primaries,
+            secondaries): the pipeline's OWN accumulated accounting
+            (Typecheck.state.debt_by_module — what
+            Typecheck.record_module_debt prints block by block; the last
+            printed block is the closure's final debt report).  NOT a
+            re-classification of the driver's flattened error list: the
+            driver prepends "<module>: " to every error, which would
+            hide the "[secondary] " prefix and misreport the
+            primary/secondary split. *)
+      let debt =
+        Debt_report.sum_reports
+          (List.map snd ctx.Driver.ctx_env.Typecheck.state.debt_by_module)
+      in
+      List.iter
+        (fun (c, n) -> Printf.printf "evidence debt_%s=%d\n" c n)
+        debt.Debt_report.buckets;
+      Printf.printf "evidence debt_total=%d debt_primary=%d debt_secondary=%d\n"
+        debt.Debt_report.total debt.Debt_report.primaries debt.Debt_report.secondaries;
+
+      (* ── lowering + mono counts (the driver's own helpers; skipped
+            when the typecheck gate failed, as the driver skips them) *)
+      let frontend = if n_errors = 0 then "PASS" else "FAIL" in
+      let structural, mono_gate, pre, post, residual =
+        if n_errors = 0 then begin
+          let prog = Driver.lower_closure ctx in
+          match Mir_verify.require_valid prog with
+          | Error _ -> ("FAIL", "SKIPPED", 0, 0, 0)
+          | Ok () -> (
+              match Driver.resolve_bootstrap_entry prog None with
+              | None -> ("PASS", "SKIPPED", 0, 0, 0)
+              | Some (_, entry) -> (
+                  match Mono.build ~entry prog with
+                  | Error _ -> ("PASS", "FAIL", Array.length prog.Seed_mir.functions, 0, 0)
+                  | Ok fns ->
+                      let mono_prog = { prog with Seed_mir.functions = fns } in
+                      let pre = Array.length prog.Seed_mir.functions in
+                      let post = Array.length fns in
+                      let residual = Driver.count_residual_type_params mono_prog in
+                      (match Mir_verify.require_valid mono_prog with
+                       | Error _ -> ("PASS", "FAIL", pre, post, residual)
+                       | Ok () -> ("PASS", "PASS", pre, post, residual))))
+        end
+        else ("SKIPPED", "SKIPPED", 0, 0, 0)
+      in
+      Printf.printf "evidence mono pre=%d post=%d residual=%d skipped=%d\n" pre post residual
+        (if n_errors = 0 then 0 else 1);
+      Printf.printf "evidence gates frontend=%s structural=%s mono=%s\n" frontend structural mono_gate;
+
+      (* ── run stamp (the only non-deterministic line) ───────────── *)
+      Printf.printf "evidence run=%d\n" (int_of_float (Unix.time ()));
+      exit 0

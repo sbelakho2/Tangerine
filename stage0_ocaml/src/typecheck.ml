@@ -3907,6 +3907,10 @@ let empty_scope : scope = { locals = []; generics = []; loop_depth = 0; capture 
 let qualified_name (mp : string list) (n : string) : string =
   match mp with [] -> n | segs -> String.concat "::" (segs @ [ n ])
 
+let impl_param_key (env : env) (d : Ast.impl_decl) : string =
+  Printf.sprintf "impl::%s::%d:%d-%d" (qualified_name env.module_path d.i_target_type)
+    d.i_span.Span.file_id d.i_span.Span.start d.i_span.Span.end_
+
 let rec check_function_body (env : env) (extra_tp_bounds : (string * string list) list)
     (sig_ : typed_signature) (d : Ast.function_decl) : (unit, string) result =
   let scope =
@@ -4083,7 +4087,7 @@ and check_trait (env : env) (d : Ast.trait_decl) : (unit, string) result =
 
 and check_impl (env : env) (d : Ast.impl_decl) : (unit, string) result =
   let impl_params =
-    let key = "impl::" ^ d.i_target_type in
+    let key = impl_param_key env d in
     match Hashtbl.find_opt env.state.sig_param_ids key with
     | Some ids -> ids
     | None ->
@@ -4099,7 +4103,24 @@ and check_impl (env : env) (d : Ast.impl_decl) : (unit, string) result =
                   | Some pid -> (tp.tp_name, pid)
                   | None -> (tp.tp_name, fresh_param_id env.state))
                 d.i_type_params
-          | None -> []
+          | None ->
+              (* no nominal record (builtin-only targets like `Array`):
+                 the nominal binder memo still holds the canonical param
+                 ids (seeded for LangItems, or minted by a source
+                 declaration) — reuse them so every impl of the target
+                 converges on ONE parameter identity *)
+              List.map
+                (fun (tp : Ast.type_param) ->
+                  match
+                    (match
+                       Hashtbl.find_opt env.state.sig_param_ids ("nominal::" ^ d.i_target_type)
+                     with
+                     | Some ids -> List.assoc_opt tp.tp_name ids
+                     | None -> None)
+                  with
+                  | Some pid -> (tp.tp_name, pid)
+                  | None -> (tp.tp_name, fresh_param_id env.state))
+                d.i_type_params
         in
         let ids =
           if List.length nominal_ids = List.length d.i_type_params then nominal_ids
@@ -4310,7 +4331,7 @@ and register_constructors (env : env) (ename : string) (tid : Ids.Type_id.t)
 
 and register_impl (env : env) (d : Ast.impl_decl) : (env, string) result =
   let impl_params =
-    let key = "impl::" ^ d.i_target_type in
+    let key = impl_param_key env d in
     match Hashtbl.find_opt env.state.sig_param_ids key with
     | Some ids -> ids
     | None ->
@@ -4326,7 +4347,24 @@ and register_impl (env : env) (d : Ast.impl_decl) : (env, string) result =
                   | Some pid -> (tp.tp_name, pid)
                   | None -> (tp.tp_name, fresh_param_id env.state))
                 d.i_type_params
-          | None -> []
+          | None ->
+              (* no nominal record (builtin-only targets like `Array`):
+                 the nominal binder memo still holds the canonical param
+                 ids (seeded for LangItems, or minted by a source
+                 declaration) — reuse them so every impl of the target
+                 converges on ONE parameter identity *)
+              List.map
+                (fun (tp : Ast.type_param) ->
+                  match
+                    (match
+                       Hashtbl.find_opt env.state.sig_param_ids ("nominal::" ^ d.i_target_type)
+                     with
+                     | Some ids -> List.assoc_opt tp.tp_name ids
+                     | None -> None)
+                  with
+                  | Some pid -> (tp.tp_name, pid)
+                  | None -> (tp.tp_name, fresh_param_id env.state))
+                d.i_type_params
         in
         let ids =
           if List.length nominal_ids = List.length d.i_type_params then nominal_ids
@@ -4667,8 +4705,16 @@ and register_item (env : env) (item : Ast.item) : (env, string) result =
       Ok { env with consts = (qname, ty) :: List.remove_assoc qname env.consts }
   | Ast.TypeAlias d ->
       let params =
-        List.map (fun (tp : Ast.type_param) -> (tp.tp_name, fresh_param_id env.state))
-          d.ta_type_params
+        let key = "alias::" ^ qualified_name item.module_path d.ta_name in
+        match Hashtbl.find_opt env.state.sig_param_ids key with
+        | Some ids -> ids
+        | None ->
+            let ids =
+              List.map (fun (tp : Ast.type_param) -> (tp.tp_name, fresh_param_id env.state))
+                d.ta_type_params
+            in
+            Hashtbl.add env.state.sig_param_ids key ids;
+            ids
       in
       let scope = { empty_scope with generics = params } in
       let* value = resolve_type env scope d.ta_value in

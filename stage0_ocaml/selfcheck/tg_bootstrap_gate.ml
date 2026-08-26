@@ -11,7 +11,7 @@
      [2] module graph
      [3] @cfg elimination
      [4] resolver
-     [5] typechecker (fixpoint) — pinned-debt policy
+     [5] typechecker (fixpoint) — no-regression debt gate
      [6] access/resource checks
      [7] lowering
      [8] MIR verify (structural gate)
@@ -19,14 +19,47 @@
          second MIR verify
     [10] reachable-host closure, VM run, artifact production
 
-   Typecheck-debt policy (audit P1): the CURRENT known typecheck error
-   count (1690) is pinned here.  Any count ABOVE the pin fails the gate
-   (exit 1).  At or below the pin, the semantic stages are reported as
-   deferred and the gate exits 0 ONLY because the debt is pinned and
-   unchanged.  The day the count is 0, stages 6-10 run and every one of
-   them must succeed for the gate to print PASS. *)
+   Typecheck-debt policy (audit P1 + re-audit no-regression finding):
+   NO-REGRESSION against a CHECKED baseline captured from a real
+   `tg_stage0.exe bootstrap-check` run on the checked tree (2026-08-26):
 
-let pinned_typecheck_debt = 1690
+     debt_total:    369
+     debt_primary:  258   (debt_secondary: 111)
+     per-category:  unresolved_type 84, unresolved_callable 33,
+                    unresolved_module 0, cannot_infer_generic 9,
+                    type_mismatch 222, obligation 3, duplicate_decl 0,
+                    other 18
+     modules/items: 56 modules, 4496 items (2 rounds)
+
+   The gate fails (exit 1) when the total, the primary count, or ANY
+   category count is above its baseline — a scalar ceiling cannot mask a
+   redistribution (369 -> 800 -> 1500 would still be "below the pin" for
+   a 1,690 ceiling).  At or below the baseline, the semantic stages are
+   reported as deferred and the gate exits 0 ONLY because the debt is at
+   its checked baseline.  The day the count is 0, stages 6-10 run and
+   every one of them must succeed for the gate to print PASS. *)
+
+(* The checked baseline: Debt_report.t with the per-category buckets in
+   Debt_report.categories order (the order of_errors emits), the total,
+   the primary count and the secondary count.  Any of these numbers
+   moving UP fails the gate; moving down is progress, not a regression. *)
+let baseline_typecheck_debt : Debt_report.t =
+  {
+    Debt_report.buckets =
+      [
+        ("unresolved_type", 84);
+        ("unresolved_callable", 33);
+        ("unresolved_module", 0);
+        ("cannot_infer_generic", 9);
+        ("type_mismatch", 222);
+        ("obligation", 3);
+        ("duplicate_decl", 0);
+        ("other", 18);
+      ];
+    total = 369;
+    primaries = 258;
+    secondaries = 111;
+  }
 
 let fail fmt = Printf.ksprintf (fun s -> Printf.printf "BOOTSTRAP GATE: FAIL: %s\n" s; exit 1) fmt
 
@@ -167,6 +200,45 @@ let artifact_exists ~(repo_root : string) (path : string) : bool =
    claim closure PASS until it does. *)
 let access_resource_integrated = false
 
+(* The no-regression policy: total <= baseline total, primary <=
+   baseline primary, and NO category above its baseline bucket.  The
+   buckets are compared positionally (both sides are emitted in
+   Debt_report.categories order); a bucket-length mismatch is an
+   internal error. *)
+let check_no_regression (measured : Debt_report.t) (baseline : Debt_report.t) : unit =
+  let violations = ref [] in
+  if measured.Debt_report.total > baseline.Debt_report.total then
+    violations :=
+      Printf.sprintf "total %d > baseline %d" measured.Debt_report.total baseline.Debt_report.total
+      :: !violations;
+  if measured.Debt_report.primaries > baseline.Debt_report.primaries then
+    violations :=
+      Printf.sprintf "primary %d > baseline %d" measured.Debt_report.primaries
+        baseline.Debt_report.primaries
+      :: !violations;
+  if measured.Debt_report.secondaries > baseline.Debt_report.secondaries then
+    violations :=
+      Printf.sprintf "secondary %d > baseline %d" measured.Debt_report.secondaries
+        baseline.Debt_report.secondaries
+      :: !violations;
+  (try
+     List.iter2
+       (fun (c, n) (_, b) ->
+         if n > b then
+           violations := Printf.sprintf "%s %d > baseline %d" c n b :: !violations)
+       measured.Debt_report.buckets baseline.Debt_report.buckets
+   with Invalid_argument _ ->
+     fail "debt bucket alignment: measured %d buckets, baseline %d"
+       (List.length measured.Debt_report.buckets)
+       (List.length baseline.Debt_report.buckets));
+  match List.rev !violations with
+  | [] -> ()
+  | vs ->
+      List.iter (fun v -> Printf.printf "  BOOTSTRAP GATE: debt regression: %s\n" v) vs;
+      fail
+        "typecheck debt REGRESSED against the checked baseline — no category may increase, \
+         primary may not increase, total may not increase"
+
 (* ── The gate ───────────────────────────────────────────────────── *)
 
 let () =
@@ -179,7 +251,12 @@ let () =
   in
   Printf.printf "TANGERINE OCAML SEED — BOOTSTRAP COMPLETENESS GATE (tg_bootstrap_gate)\n";
   Printf.printf "  repo-root: %s; target: %s\n" repo_root target_str;
-  Printf.printf "  pinned typecheck debt: %d (any count above the pin fails)\n" pinned_typecheck_debt;
+  Printf.printf "  checked typecheck-debt baseline: total %d, primary %d, secondary %d\n"
+    baseline_typecheck_debt.Debt_report.total baseline_typecheck_debt.Debt_report.primaries
+    baseline_typecheck_debt.Debt_report.secondaries;
+  List.iter
+    (fun (c, n) -> Printf.printf "    baseline %s: %d\n" c n)
+    baseline_typecheck_debt.Debt_report.buckets;
   let target =
     match Target.unsupported_triple target_str with
     | Ok t -> t
@@ -207,22 +284,32 @@ let () =
        let n_errs = List.length ctx.ctx_type_errors in
        Printf.printf "  typecheck: %d errors across %d modules / %d items (%d rounds)\n" n_errs
          ctx.ctx_graph.Module_graph.node_count ctx.ctx_items ctx.ctx_rounds;
-       if n_errs > pinned_typecheck_debt then begin
-         Printf.printf "  BOOTSTRAP GATE: typecheck debt %d EXCEEDS the pinned %d — FAIL\n" n_errs
-           pinned_typecheck_debt;
-         exit 1
-       end;
+       (* The measured debt is the pipeline's OWN accumulated accounting
+          (Typecheck.state.debt_by_module — what record_module_debt
+          prints block by block), not a re-classification of the driver's
+          flattened error list: the driver prepends "<module>: " to every
+          error, which would hide the "[secondary] " prefix and misreport
+          the primary/secondary split. *)
+       let measured_debt =
+         Debt_report.sum_reports
+           (List.map snd ctx.ctx_env.Typecheck.state.debt_by_module)
+       in
+       Printf.printf "  measured debt: total %d, primary %d, secondary %d\n"
+         measured_debt.Debt_report.total measured_debt.Debt_report.primaries
+         measured_debt.Debt_report.secondaries;
+       check_no_regression measured_debt baseline_typecheck_debt;
        if n_errs > 0 then begin
-         (* Pinned debt: report the deferred semantic stages explicitly;
-            exit 0 ONLY because the debt is unchanged and pinned. *)
+         (* At the checked baseline: report the deferred semantic stages
+            explicitly; exit 0 ONLY because the debt is unchanged and at
+            (or below) the baseline. *)
          Printf.printf "  [6/10] access/resource checks: deferred (typecheck debt)\n";
          Printf.printf "  [7/10] lowering: deferred (typecheck debt)\n";
          Printf.printf "  [8/10] MIR verify: deferred (typecheck debt)\n";
          Printf.printf "  [9/10] mono + second MIR verify: deferred (typecheck debt)\n";
          Printf.printf "  [10/10] host closure + VM + artifacts: deferred (typecheck debt)\n";
-         Printf.printf "BOOTSTRAP GATE: typecheck debt %d (pinned) — semantic stages deferred\n"
+         Printf.printf "BOOTSTRAP GATE: typecheck debt %d (at/below the checked baseline) — semantic stages deferred\n"
            n_errs;
-         Printf.printf "BOOTSTRAP GATE: RESULT: PASS (debt pinned and unchanged)\n";
+         Printf.printf "BOOTSTRAP GATE: RESULT: PASS (no regression vs the checked baseline)\n";
          exit 0
        end;
        (* Zero typecheck debt: the full semantic closure must succeed. *)

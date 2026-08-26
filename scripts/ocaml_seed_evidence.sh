@@ -26,12 +26,15 @@
 #                           stage0_ocaml/selfcheck/*.exe
 #     bootstrap_check       the driver gate output: typecheck counts,
 #                           the machine-readable diagnostic-debt block
-#                           (debt: <category> <count> per category and
-#                           debt_total), and every gate verdict
+#                           (debt: <category> <count> per category,
+#                           debt_total, debt_primary, debt_secondary)
+#                           and every gate verdict
 #                           (FRONTEND_SEMANTIC_GATE,
 #                           SEED_MIR_STRUCTURAL_GATE,
 #                           BOOTSTRAP_EXECUTABLE_CLOSURE, RESULT)
 #     evidence              the deterministic tg_evidence phase lines
+#                           (incl. declaration_fixpoint_iterations /
+#                           body_passes, parsed into bootstrap_check)
 #     recorded_at_unix/iso  when the record was captured
 #
 #   The record IS the CI artifact for the exact tested SHA: publish
@@ -182,15 +185,27 @@ def rd_int(name, default=0):
 lock_ocaml, lock_dune, lock_arch = rd("lock_versions", "||").split("|", 2)
 
 # Parse the bootstrap-check output: the last debt block (8 category
-# lines + debt_total) is the closure's final debt report; the gate
-# verdicts and typecheck counters come from the same output.
+# lines + debt_total + debt_primary + debt_secondary) is the closure's
+# final debt report; the gate verdicts and typecheck counters come from
+# the same output.  The declaration/body phase counts come from the
+# tg_evidence lines (declaration_fixpoint_iterations / body_passes —
+# the re-audit's replacement for the misleading "(N rounds)" driver
+# line).
 bc_out = rd("bc_out")
 debt_lines = [l for l in bc_out.splitlines() if l.startswith("debt: ")]
 debt_total_lines = [l for l in bc_out.splitlines() if l.startswith("debt_total: ")]
+debt_primary_lines = [l for l in bc_out.splitlines() if l.startswith("debt_primary: ")]
+debt_secondary_lines = [l for l in bc_out.splitlines() if l.startswith("debt_secondary: ")]
 debt = {}
 last_total = 0
+last_primary = 0
+last_secondary = 0
 if debt_total_lines:
     last_total = int(debt_total_lines[-1].split()[1])
+    if debt_primary_lines:
+        last_primary = int(debt_primary_lines[-1].split()[1])
+    if debt_secondary_lines:
+        last_secondary = int(debt_secondary_lines[-1].split()[1])
     n = len(debt_lines)
     if n >= 8:
         block = debt_lines[-8:]
@@ -201,6 +216,14 @@ if debt_total_lines:
         if sum(debt.values()) != last_total:
             sys.stderr.write("warning: last debt block sum != debt_total\n")
 
+# The declaration/body phase counts from the tg_evidence lines (the
+# canonical measurement; the driver's "(N rounds)" line is not used for
+# these because rounds=2 was found semantically misleading).
+phase_m = list(re.finditer(
+    r"evidence declaration_fixpoint_iterations=(\d+) body_passes=(\d+)",
+    rd("evidence_lines")))
+phase_groups = phase_m[-1].groups() if phase_m else ("", "")
+
 def last_match(pattern):
     m = list(re.finditer(pattern, bc_out))
     return m[-1].group(1) if m else ""
@@ -210,7 +233,7 @@ typecheck_m = list(re.finditer(
 typecheck_groups = typecheck_m[-1].groups() if typecheck_m else ("", "", "", "")
 
 record = {
-    "schema_version": 2,
+    "schema_version": 3,
     "git_commit": rd("git_commit"),
     "git_short_sha": rd("git_short"),
     "git_dirty": rd("git_dirty") == "true",
@@ -235,8 +258,12 @@ record = {
         "items": int(typecheck_groups[1]) if typecheck_groups[1] else None,
         "errors": int(typecheck_groups[2]) if typecheck_groups[2] else None,
         "rounds": int(typecheck_groups[3]) if typecheck_groups[3] else None,
+        "declaration_fixpoint_iterations": int(phase_groups[0]) if phase_groups[0] else None,
+        "body_passes": int(phase_groups[1]) if phase_groups[1] else None,
         "debt": debt,
         "debt_total": last_total,
+        "debt_primary": last_primary,
+        "debt_secondary": last_secondary,
         "gates": {
             "FRONTEND_SEMANTIC_GATE": last_match(r"FRONTEND_SEMANTIC_GATE = (\S+)"),
             "SEED_MIR_STRUCTURAL_GATE": last_match(r"SEED_MIR_STRUCTURAL_GATE = (\S+)"),
