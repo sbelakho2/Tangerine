@@ -828,6 +828,11 @@ let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
   Hashtbl.replace st.sig_param_ids "nominal::Option" [ ("T", opt_p) ];
   Hashtbl.replace st.sig_param_ids "nominal::Result"
     [ ("T", res_p); ("E", res_e_p) ];
+  Hashtbl.replace st.sig_param_ids "nominal::Vec" [ ("T", vec_p) ];
+  Hashtbl.replace st.sig_param_ids "nominal::Array" [ ("T", vec_p) ];
+  Hashtbl.replace st.sig_param_ids "nominal::Map"
+    [ ("K", map_k_p); ("V", map_v_p) ];
+  Hashtbl.replace st.sig_param_ids "nominal::Set" [ ("T", set_p) ];
   {
     types;
     functions = [];
@@ -2002,8 +2007,10 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
             | Ok te -> Ok { te_type = Type_repr.Unit; te_effects = te.te_effects; te_span = span }
             | Error m -> Error m))
   | Ast.NextExpr span -> (
-      if scope.loop_depth = 0 then Error (err span "next outside a loop")
-      else Ok { te_type = Type_repr.Unit; te_effects = [||]; te_span = span })
+      (* the Swift seed's semantics: a bare `next` without a loop target
+         is a Unit statement, not an error (the kernel relies on the
+         tail-`next` identifier form in cfg_synthetic_alloc) *)
+      Ok { te_type = Type_repr.Unit; te_effects = [||]; te_span = span })
   | Ast.ForExpr f -> (
       match check_expr env scope None f.Ast.for_iterable with
       | Error m -> Error m
@@ -3873,7 +3880,14 @@ and register_item (env : env) (item : Ast.item) : (env, string) result =
         match List.assoc_opt d.s_name env.nominals with
         | Some nom -> (Some nom, env)
         | None ->
-            let tid = fresh_type_id env.state in
+            (* LangItem tid adoption (audit Fix 4): a source declaration of
+               a builtin standard type reuses the builtin's TypeId, so
+               Vec/Map/Set/Option/Result/Ptr have ONE identity *)
+            let tid =
+              match List.assoc_opt d.s_name env.type_ids with
+              | Some t -> t
+              | None -> fresh_type_id env.state
+            in
             let param_tys = Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param (p)) params) in
             let nom : nominal =
               { nom_kind = `Struct; nom_params = params; nom_fields = []; nom_variants = []; nom_where = []; nom_field_ids = []; nom_variant_ids = [] }
@@ -3957,7 +3971,14 @@ and register_item (env : env) (item : Ast.item) : (env, string) result =
         match List.assoc_opt d.e_name env.nominals with
         | Some nom -> (Some nom, env)
         | None ->
-            let tid = fresh_type_id env.state in
+            (* LangItem tid adoption (audit Fix 4): a source declaration of
+               a builtin standard type reuses the builtin's TypeId, so
+               Vec/Map/Set/Option/Result/Ptr have ONE identity *)
+            let tid =
+              match List.assoc_opt d.e_name env.type_ids with
+              | Some t -> t
+              | None -> fresh_type_id env.state
+            in
             let param_tys = Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param (p)) params) in
             let nom : nominal =
               { nom_kind = `Enum; nom_params = params; nom_fields = []; nom_variants = []; nom_where = []; nom_field_ids = []; nom_variant_ids = [] }
@@ -4251,7 +4272,14 @@ let rec register_headers (env : env) (acc : string list) = function
                   Hashtbl.add env.state.sig_param_ids key ids;
                   ids
             in
-            let tid = fresh_type_id env.state in
+            (* LangItem tid adoption (audit Fix 4): a source declaration of
+               a builtin standard type reuses the builtin's TypeId, so
+               Vec/Map/Set/Option/Result/Ptr have ONE identity *)
+            let tid =
+              match List.assoc_opt d.s_name env.type_ids with
+              | Some t -> t
+              | None -> fresh_type_id env.state
+            in
             let param_tys = Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param (p)) params) in
             let nom : nominal =
               { nom_kind = `Struct; nom_params = params; nom_fields = []; nom_variants = []; nom_where = []; nom_field_ids = []; nom_variant_ids = [] }
@@ -4282,7 +4310,14 @@ let rec register_headers (env : env) (acc : string list) = function
                   Hashtbl.add env.state.sig_param_ids key ids;
                   ids
             in
-            let tid = fresh_type_id env.state in
+            (* LangItem tid adoption (audit Fix 4): a source declaration of
+               a builtin standard type reuses the builtin's TypeId, so
+               Vec/Map/Set/Option/Result/Ptr have ONE identity *)
+            let tid =
+              match List.assoc_opt d.e_name env.type_ids with
+              | Some t -> t
+              | None -> fresh_type_id env.state
+            in
             let param_tys = Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param (p)) params) in
             let nom : nominal =
               { nom_kind = `Enum; nom_params = params; nom_fields = []; nom_variants = []; nom_where = []; nom_field_ids = []; nom_variant_ids = [] }

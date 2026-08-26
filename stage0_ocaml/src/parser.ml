@@ -712,15 +712,25 @@ and parse_stmt (p : parser) (_terminators : Token.kind list) : Ast.stmt =
       expect p Token.KwEnd "'end' in defer statement";
       Ast.DeferStmt (body, span_end p start)
   | Token.KwNext ->
-      (* `next` is contextually a name (the production parser's
-         TokenKind::Next -> ExprIdent("next") rule): `next = ...` assigns
-         a local named next, `abs_f(next - guess)` reads it.  A bare
-         `next` statement is the loop continue. *)
-      if kind_at p 1 = Token.Eq then parse_expr_stmt p start
-      else begin
-        ignore (advance p);
-        Ast.ExprStmt (Ast.NextExpr (span_end p start), span_end p start)
-      end
+      (* the Swift seed's statement-boundary rule: `next` followed by a
+         value-position token is the contextual identifier "next"
+         (`next = ...`, `next - 1`, `foo(next)`, `next.field`); a bare
+         `next` at a statement boundary is the loop continue *)
+      (match kind_at p 1 with
+       | Token.Dot | Token.ColonColon | Token.LParen | Token.Eq
+       | Token.PlusEq | Token.MinusEq | Token.StarEq | Token.SlashEq
+       | Token.PercentEq | Token.CaretEq | Token.AmpEq | Token.PipeEq
+       | Token.ShlEq | Token.ShrEq | Token.Minus | Token.Plus | Token.Star
+       | Token.Slash | Token.Percent | Token.Tilde | Token.Lt | Token.LtEq
+       | Token.Gt | Token.GtEq | Token.EqEq | Token.BangEq | Token.AmpAmp
+       | Token.PipePipe | Token.Amp | Token.Pipe | Token.Caret | Token.Shl
+       | Token.Shr | Token.RParen | Token.RBracket | Token.Comma
+       | Token.Colon | Token.Question | Token.Arrow | Token.DotDot
+       | Token.DotDotEq | Token.KwAs ->
+           parse_expr_stmt p start
+       | _ ->
+           ignore (advance p);
+           Ast.ExprStmt (Ast.NextExpr (span_end p start), span_end p start))
   | _ -> parse_expr_stmt p start
 
 and parse_expr_stmt (p : parser) (start : Span.span) : Ast.stmt =
