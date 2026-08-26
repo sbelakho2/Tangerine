@@ -711,6 +711,16 @@ and parse_stmt (p : parser) (_terminators : Token.kind list) : Ast.stmt =
       let body = parse_block_body p [ Token.KwEnd ] in
       expect p Token.KwEnd "'end' in defer statement";
       Ast.DeferStmt (body, span_end p start)
+  | Token.KwNext ->
+      (* `next` is contextually a name (the production parser's
+         TokenKind::Next -> ExprIdent("next") rule): `next = ...` assigns
+         a local named next, `abs_f(next - guess)` reads it.  A bare
+         `next` statement is the loop continue. *)
+      if kind_at p 1 = Token.Eq then parse_expr_stmt p start
+      else begin
+        ignore (advance p);
+        Ast.ExprStmt (Ast.NextExpr (span_end p start), span_end p start)
+      end
   | _ -> parse_expr_stmt p start
 
 and parse_expr_stmt (p : parser) (start : Span.span) : Ast.stmt =
@@ -1751,7 +1761,25 @@ and parse_shift (p : parser) : Ast.expr =
 
 and parse_term (p : parser) : Ast.expr =
   let left = ref (parse_factor p) in
-  while at p Token.Plus || at p Token.Minus do
+  (* a statement-form expression (`while ... end`, `match ... end`,
+     `if ... end`, a block) yields no value; a `+`/`-` at the start of a
+     new line after one begins a NEW statement (a negative literal or a
+     fresh term), NOT an additive continuation — mirrors the production
+     parser's documented statement-boundary semantics, so `while ... end`
+     followed by `-1` parses as two statements. After a value expression
+     (call/name/index) the leading-operator style still continues. *)
+  let statement_form e =
+    match e with
+    | Ast.WhileExpr _ | Ast.ForExpr _ | Ast.MatchExpr _ | Ast.IfExpr _
+    | Ast.Block _ | Ast.UnsafeBlock _ | Ast.NextExpr _ | Ast.BreakExpr _
+    | Ast.ReturnExpr _ | Ast.Assign _ | Ast.CompoundAssign _ ->
+        true
+    | _ -> false
+  in
+  let newline_before = source_has_newline p (Ast.expr_span !left) (cur_span p) in
+  while (at p Token.Plus && not (statement_form !left && newline_before))
+        || (at p Token.Minus && not newline_before)
+  do
     let start = cur_span p in
     let op = if at p Token.Plus then Ast.Add else Ast.Sub in
     ignore (advance p);
@@ -2213,11 +2241,10 @@ and parse_primary (p : parser) : Ast.expr =
       if is_expr_start p then
         Ast.BreakExpr (Some (parse_expr p), span_end p start)
       else Ast.BreakExpr (None, span_end p start)
-  | Token.KwNext ->
-      ignore (advance p);
-      Ast.NextExpr (span_end p start)
   | _ -> (
-      (* Soft keywords usable as expressions (e.g. `mod(17, 5)`) *)
+      (* Soft keywords usable as expressions (e.g. `mod(17, 5)`, and
+         `next` as an identifier — the production parser's
+         TokenKind::Next -> ExprIdent("next") rule) *)
       match soft_ident_kind (kind p) with
       | Some _ -> parse_ident_expr p start
       | None ->
