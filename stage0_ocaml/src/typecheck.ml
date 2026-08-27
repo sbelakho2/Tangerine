@@ -2719,9 +2719,13 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
               | Type_repr.Int _ | Type_repr.Float _ ->
                   Ok { te_type = te.te_type; te_effects = te.te_effects; te_span = span }
               | Type_repr.Int_literal _ ->
+                  (* a negated unsuffixed literal stays a literal: it must
+                     adopt the concrete integer kind of its comparison/
+                     arithmetic partner (i64 > -4096), never collapse to
+                     the default Int kind *)
                   Ok
                     {
-                      te_type = Type_repr.Int Type_repr.Int;
+                      te_type = te.te_type;
                       te_effects = te.te_effects;
                       te_span = span;
                     }
