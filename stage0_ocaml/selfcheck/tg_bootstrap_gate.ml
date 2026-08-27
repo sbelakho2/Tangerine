@@ -22,17 +22,20 @@
    Typecheck-debt policy (audit P1 + re-audit findings 3/5): the debt
    policy has ONE authority — this gate — running NO-REGRESSION against
    a CHECKED baseline captured from a real `tg_stage0.exe
-   bootstrap-check` run on the checked tree (2026-08-26):
+   bootstrap-check` run on the checked tree and pinned in
+   baseline_typecheck_debt below (last re-pinned on the 2026-08-27
+   tree):
 
-     debt_total:    257
-     debt_primary:  181   (debt_secondary: 76)
-     per-category:  unresolved_type 14, unresolved_callable 32,
-                    unresolved_module 0, cannot_infer_generic 9,
-                    type_mismatch 180, obligation 4, duplicate_decl 0,
-                    other 18
-     modules/items: 56 modules, 4496 items (4 measured declaration
-                    fixpoint passes — re-audit finding 2: closure_ctx
-                    carries !decl_rounds, not a hard-coded 2)
+     checked baseline: debt_total 84, debt_primary 28, debt_secondary
+     56 (the per-category buckets are diagnostic context only — the
+     gate enforces the three monotonic scalars, never the buckets)
+     current measured state (2026-08-27): 80 errors across 56 modules /
+     4499 items (4 measured declaration-fixpoint passes — re-audit
+     finding 2: closure_ctx carries !decl_rounds, not a hard-coded 2);
+     debt_total 80, debt_primary 24, debt_secondary 56 — at/below the
+     checked baseline; per-category: unresolved_type 3,
+     unresolved_callable 8, unresolved_module 0, cannot_infer_generic
+     5, type_mismatch 53, obligation 3, duplicate_decl 0, other 8
 
    The MONOTONIC gate fails (exit 1) exactly when a scalar rises:
    total > baseline total, primary > baseline primary, or secondary >
@@ -141,17 +144,10 @@ def make() -> Color
   Color::Green(7)
 end
 |} );
-    ( "field projection (no typed-place Field rule)",
-      "E9036",
-      {|struct Point
-  x: Int
-  y: Int
-end
-
-def f(p: Point) -> Int
-  p.x
-end
-|} );
+    (* field-projection E9036 was DELETED 2026-08-27: the typed-place
+       (FieldId) rule landed in mir_lower — p.x now lowers and is VM
+       proven in tg_lowersurface's struct-field proof (the positive
+       parse -> typecheck -> lower -> verify -> execute replacement) *)
     ( "projected assignment writeback (no typed-place writeback rule)",
       "E9036",
       {|def f() -> Int

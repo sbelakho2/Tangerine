@@ -1,20 +1,25 @@
 #!/usr/bin/env bash
 #
-# scripts/ocaml_seed_evidence.sh — exact-HEAD CI evidence for the OCaml
+# scripts/ocaml_seed_evidence.sh — tested-parent CI evidence for the OCaml
 # bootstrap seed (stage0_ocaml), audit P1-2.
 #
 # WHAT THIS RECORDS
-#   Every record is bound to the EXACT tested revision.  Each run writes
+#   Every record is evidence FOR THE TESTED PARENT: the commit whose
+#   clean tree was built and tested (the SHA the record names).  The
+#   commit that later CONTAINS the record has a NEW SHA — a record can
+#   be exact for its tested parent, never for itself.  Each run writes
 #   one machine-readable JSON record to
 #
 #     bootstrap/evidence/ocaml/<short-sha>_<unix-time>.json
 #
 #   containing:
-#     git_commit            exact `git rev-parse HEAD` of the CLEAN tree
+#     git_commit            the TESTED commit (`git rev-parse HEAD` of
+#                           the CLEAN tree the build/tests ran on)
 #     git_dirty             ALWAYS false — the generator FAILS on a dirty
-#                           tree (re-audit finding 1: an exact-SHA record
-#                           is only produced from a clean checkout; a
-#                           dirty tree aborts before anything is recorded)
+#                           tree (re-audit finding 1: a tested-parent
+#                           record is only produced from a clean checkout;
+#                           a dirty tree aborts before anything is
+#                           recorded)
 #     git_dirty_stat        always empty (no dirty-tree record exists)
 #     manifest_file_sha256  SHA-256 of bootstrap/compiler_kernel.manifest
 #     manifest_fingerprint  the pipeline's canonical manifest fingerprint
@@ -48,21 +53,23 @@
 #                           diagnostics.count the number of lines
 #     recorded_at_unix/iso  when the record was captured
 #
-#   The record IS the CI artifact for the exact tested SHA: publish
-#   bootstrap/evidence/ocaml/<short-sha>_<unix-time>.json from the CI
-#   job that tested that SHA.  Do not commit the record afterward (the
-#   audit's evidence model — the record names the SHA it tested).
+#   The record IS the CI artifact for the TESTED PARENT — the SHA it
+#   names: publish bootstrap/evidence/ocaml/<short-sha>_<unix-time>.json
+#   from the CI job that tested that SHA.  If the record is committed,
+#   it is evidence for the COMMIT'S PARENT (the tested tree), not for
+#   the commit containing it (that commit has a new SHA).
 #
 # CLEAN-TREE POLICY (re-audit finding 1)
-#   Exact-SHA evidence requires a clean checkout of the tested commit:
-#   `git status --porcelain` must be empty or the script FAILS before
-#   building or recording anything.  A record with git_dirty=true can
-#   never be produced.
+#   Tested-parent evidence requires a clean checkout of the tested
+#   commit: `git status --porcelain` must be empty or the script FAILS
+#   before building or recording anything.  A record with
+#   git_dirty=true can never be produced.
 #
 # STALE-FILE POLICY
-#   bootstrap/evidence/ocaml/ holds ONLY exact-HEAD records of the
-#   current schema.  Files that are not JSON records with the required
-#   fields (e.g. the legacy *.evidence files) are MOVED to
+#   bootstrap/evidence/ocaml/ holds ONLY tested-parent records of the
+#   current schema — a file that is not a JSON record with the required
+#   fields (e.g. the legacy *.evidence files), or a record that names a
+#   commit other than the current tested commit, is MOVED to
 #   bootstrap/evidence/ocaml/history/ — never deleted, never left in
 #   place as "current state".
 #
@@ -71,7 +78,7 @@
 #
 # Behavior: (a) verifies the locked OCaml/Dune toolchain via
 # scripts/check_ocaml_toolchain.sh and FAILS if the working tree is
-# dirty (exact-SHA evidence requires a clean checkout of the tested
+# dirty (tested-parent evidence requires a clean checkout of the tested
 # commit); (b) builds the seed with `dune build` (a failing build aborts
 # before any record is written — no record for a tree that does not
 # compile); (c) captures git identity, all hashes, the test suite
@@ -97,11 +104,12 @@ sha256_of() { shasum -a 256 "$1" | awk '{print $1}'; }
 # (bootstrap/ocaml-toolchain.lock) are not installed.
 "$ROOT_DIR/scripts/check_ocaml_toolchain.sh"
 
-# (a') Exact-SHA evidence model (re-audit finding 1): the tree MUST be
-# clean.  A dirty tree cannot produce an exact-HEAD record — fail before
-# building or recording anything instead of emitting git_dirty=true.
+# (a') Tested-parent evidence model (re-audit finding 1): the tree MUST
+# be clean.  A dirty tree cannot produce a tested-parent record — fail
+# before building or recording anything instead of emitting
+# git_dirty=true.
 if [ -n "$(git -C "$ROOT_DIR" status --porcelain)" ]; then
-  echo "ocaml_seed_evidence: FAIL — the working tree is NOT clean; exact-SHA evidence requires a clean checkout of the tested commit" >&2
+  echo "ocaml_seed_evidence: FAIL — the working tree is NOT clean; tested-parent evidence requires a clean checkout of the tested commit" >&2
   git -C "$ROOT_DIR" status --porcelain >&2
   exit 1
 fi
@@ -110,7 +118,7 @@ fi
 # build is also the compile gate; a broken tree never records evidence.
 (cd "$STAGE_DIR" && dune build)
 
-# (c) Gather the exact-HEAD identity of the clean tree.
+# (c) Gather the tested-commit identity of the clean tree.
 GIT_COMMIT="$(git -C "$ROOT_DIR" rev-parse HEAD)"
 GIT_SHORT="$(git -C "$ROOT_DIR" rev-parse --short HEAD)"
 GIT_DIRTY=false
@@ -425,9 +433,10 @@ with open(record_file, "w") as f:
     f.write("\n")
 PYEOF
 
-# (e) Stale-file policy: only exact-HEAD records of the current schema
-# stay in place; anything else (including stale diagnostics artifacts)
-# moves to history/.
+# (e) Stale-file policy: only tested-parent records of the current
+# schema (records naming the CURRENT tested commit) stay in place;
+# anything else (including stale diagnostics artifacts) moves to
+# history/.
 DIAG_FILE="${RECORD_FILE%.json}.diagnostics.jsonl"
 python3 - "$EVIDENCE_DIR" "$HISTORY_DIR" "$GIT_COMMIT" "$RECORD_FILE" "$DIAG_FILE" <<'PYEOF'
 import json
@@ -477,6 +486,6 @@ PYEOF
 
 # (f) Print the record.
 python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1])), indent=2))' "$RECORD_FILE"
-printf '\nrecord: %s\n' "$RECORD_FILE"
+printf '\nrecord: %s — evidence for TESTED PARENT %s (the clean tree that was built and tested); the commit containing this record is a NEW SHA and was NOT what was tested\n' "$RECORD_FILE" "$GIT_COMMIT"
 printf 'diagnostics artifact: %s (sha256 %s)\n' "$DIAG_FILE" \
   "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["diagnostics"]["sha256"])' "$RECORD_FILE")"

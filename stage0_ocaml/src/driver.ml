@@ -296,17 +296,22 @@ let lowering_env_of (env : Typecheck.env) : Mir_lower.func_env =
       fed lowering the typechecker's enum/VariantId universe) ─────────
 
    mir_lower's variant_table (vt_enums: enum name -> variant name ->
-   {vs_index; vs_fields}; vt_ctors: bare ctor name -> (enum name,
+   {vs_id; vs_index; vs_fields}; vt_ctors: bare ctor name -> (enum name,
    variant name)) is built HERE from the TYPED nominal registry — the
    same semantic registry closure_types reads for the EnumDefs — never
    from re-parsing the AST.  Only concrete (non-generic) enums are
    tabled: generic payloads are deferred to post-mono, and the builtin
-   Option/Result stay on mir_lower's hardcoded fallback (their fields
-   derive from the enum's type arguments at each use site).  The
-   declaration-order vs_index is exactly the EnumDef variant position,
-   so construction sites (EnumCtor tags), match arms (SwitchInt
-   targets) and the typed EnumDefs (semantic VariantIds from
-   nom_variant_ids) agree.  The nominal is validated against its
+   Option/Result go through the SAME registry (the table's vt_builtin
+   channel, fed from the nominals' nom_variant_ids — the LangItem
+   declarations in the kernel source carry resolver ids), NOT a
+   hardcoded position formula (audit P0: the semantic VariantId must
+   never be reconstructed from the declaration-order index).  Each
+   spec's vs_id is the typed nominal's nom_variant_ids entry at the
+   variant's position; vs_index is the declaration-order position (the
+   EnumDef variant position — construction sites (EnumCtor tags), match
+   arms (SwitchInt targets) and the typed EnumDefs (semantic VariantIds
+   from nom_variant_ids) agree; the semantic id and the runtime tag are
+   independent coordinates).  The nominal is validated against its
    semantic variant-id registry (fail closed on a length mismatch). *)
 let user_variant_table (env : Typecheck.env) : Mir_lower.variant_table =
   let enums =
@@ -325,9 +330,38 @@ let user_variant_table (env : Typecheck.env) : Mir_lower.variant_table =
                 ( name,
                   List.mapi
                     (fun i (vname, pty) ->
-                      (vname, { Mir_lower.vs_index = i; vs_fields = Array.to_list pty }))
+                      ( vname,
+                        {
+                          Mir_lower.vs_id = List.nth nom.Typecheck.nom_variant_ids i;
+                          vs_index = i;
+                          vs_fields = Array.to_list pty;
+                        } ))
                     nom.Typecheck.nom_variants )
             end)
+      env.Typecheck.nominals
+  in
+  (* the builtin Option/Result semantic identities: the SAME typed
+     registry channel.  A bare compiler-seeded nominal (no source
+     declaration, no resolver handoff) carries no nom_variant_ids — the
+     deterministic 1-based minting the typechecker's own fallback
+     registration and closure_types' EnumDef materialization use is the
+     no-resolver world's canonical identity, so the fallback below is
+     the registry's identity, never a lowering-side derivation. *)
+  let builtin_ids =
+    List.filter_map
+      (fun (name, nom : string * Typecheck.nominal) ->
+        match (name, nom.Typecheck.nom_kind) with
+        | ("Option" | "Result"), `Enum ->
+            let ids =
+              if List.length nom.Typecheck.nom_variant_ids
+                 = List.length nom.Typecheck.nom_variants
+              then nom.Typecheck.nom_variant_ids
+              else
+                List.mapi (fun i _ -> Ids.Variant_id.make (i + 1)) nom.Typecheck.nom_variants
+            in
+            Some
+              (name, List.mapi (fun i (vname, _) -> (vname, List.nth ids i)) nom.Typecheck.nom_variants)
+        | _ -> None)
       env.Typecheck.nominals
   in
   let ctors =
@@ -336,7 +370,89 @@ let user_variant_table (env : Typecheck.env) : Mir_lower.variant_table =
         List.map (fun (vname, _) -> (vname, (ename, vname))) specs)
       enums
   in
-  { Mir_lower.vt_enums = enums; vt_ctors = ctors }
+  { Mir_lower.vt_enums = enums; vt_ctors = ctors; vt_builtin = builtin_ids }
+
+(* The generic nominal registry for the monomorphizer (re-audit finding:
+   "generic nominal type definitions disappear before MIR").  closure_types
+   below DROPS nom_params <> [] nominals from the seed types table — but
+   the generic TEMPLATES do not disappear: they are handed to Mono.build
+   as its generic_types registry, and the post-mono assembly
+   (materialize_type_instances) materializes the CONCRETE instances the
+   mono queue reaches (Mono.build's on_type_instance channel) as
+   concrete StructDef/EnumDef entries carrying the SAME semantic
+   FieldIds/VariantIds as the original def.  The builtin Option/Result
+   nominals are included: mir_lower's hardcoded fallback mints the same
+   1-based semantic VariantIds (vs_index + 1), so the materialized defs
+   agree with the lowered projections.  The SAME registry is handed to
+   Mir_verify.require_valid_template: program.types is concrete-only
+   pre-mono, so the template verifier resolves generic nominal
+   identities against this registry. *)
+let closure_generic_types (env : Typecheck.env) : Mono.generic_def array =
+  Array.of_list
+    (List.filter_map
+       (fun (name, nom : string * Typecheck.nominal) ->
+         match List.assoc_opt name env.Typecheck.type_ids with
+         | None -> None
+         | Some tid ->
+             if nom.Typecheck.nom_params = [] then None
+             else
+               let params =
+                 Array.of_list (List.map snd nom.Typecheck.nom_params)
+               in
+               (match nom.Typecheck.nom_kind with
+                | `Struct ->
+                    let fids =
+                      if List.length nom.Typecheck.nom_field_ids
+                         = List.length nom.Typecheck.nom_fields
+                      then nom.Typecheck.nom_field_ids
+                      else
+                        List.mapi (fun i _ -> Ids.Field_id.make (i + 1)) nom.Typecheck.nom_fields
+                    in
+                    Some
+                      { Mono.gd_tid = tid;
+                        gd_params = params;
+                        gd_def =
+                          Seed_mir.StructDef
+                            {
+                              sd_id = tid;
+                              sd_fields =
+                                List.mapi
+                                  (fun i (_, fty) ->
+                                    {
+                                      Seed_mir.fd_id = List.nth fids i;
+                                      fd_index = Ids.Field_index.make i;
+                                      fd_ty = fty;
+                                    })
+                                  nom.Typecheck.nom_fields;
+                            } }
+                | `Enum ->
+                    let vids =
+                      if List.length nom.Typecheck.nom_variant_ids
+                         = List.length nom.Typecheck.nom_variants
+                      then nom.Typecheck.nom_variant_ids
+                      else
+                        List.mapi (fun i _ -> Ids.Variant_id.make (i + 1)) nom.Typecheck.nom_variants
+                    in
+                    Some
+                      { Mono.gd_tid = tid;
+                        gd_params = params;
+                        gd_def =
+                          Seed_mir.EnumDef
+                            {
+                              ed_id = tid;
+                              ed_variants =
+                                List.mapi
+                                  (fun i (_, pty) ->
+                                    {
+                                      Seed_mir.vd_id = List.nth vids i;
+                                      vd_index = Ids.Variant_index.make i;
+                                      vd_payload =
+                                        (if Array.length pty = 0 then Type_repr.Unit
+                                         else Type_repr.Tuple pty);
+                                    })
+                                  nom.Typecheck.nom_variants;
+                            } }))
+       env.Typecheck.nominals)
 
 let lower_and_report (path : string) (env : Typecheck.env) (program : Ast.program) : int =
   let module_path = Parser.module_path_of_file path in
@@ -379,7 +495,7 @@ let lower_and_report (path : string) (env : Typecheck.env) (program : Ast.progra
   let prog =
     { Seed_mir.functions = Array.of_list mir_funcs; statics = [||]; types = [||] }
   in
-  match Mir_verify.require_valid prog with
+  match Mir_verify.require_valid_template ~generic_types:(closure_generic_types env) prog with
   | Error errs ->
       Printf.printf "// MIR verify FAILED:\n";
       List.iter (fun e -> Printf.printf "//   %s\n" e) errs;
@@ -502,7 +618,11 @@ let cmd_interpret (args : string list) : int =
               let prog =
                 { Seed_mir.functions = Array.of_list mir_funcs; statics = [||]; types = [||] }
               in
-              (match Mir_verify.require_valid prog with
+              (match
+                 Mir_verify.require_valid_template
+                   ~generic_types:(closure_generic_types env)
+                   prog
+               with
                | Error errs ->
                    List.iter (fun e -> Printf.printf "  %s\n" e) errs;
                    1
@@ -1087,85 +1207,6 @@ let closure_types (env : Typecheck.env) : Seed_mir.type_def array =
                                  })
                                nom.Typecheck.nom_variants;
                          })))
-       env.Typecheck.nominals)
-
-(* The generic nominal registry for the monomorphizer (re-audit finding:
-   "generic nominal type definitions disappear before MIR").  closure_types
-   above DROPS nom_params <> [] nominals from the seed types table — but
-   the generic TEMPLATES do not disappear: they are handed to Mono.build
-   as its generic_types registry, and the post-mono assembly
-   (materialize_type_instances) materializes the CONCRETE instances the
-   mono queue reaches (Mono.build's on_type_instance channel) as
-   concrete StructDef/EnumDef entries carrying the SAME semantic
-   FieldIds/VariantIds as the original def.  The builtin Option/Result
-   nominals are included: mir_lower's hardcoded fallback mints the same
-   1-based semantic VariantIds (vs_index + 1), so the materialized defs
-   agree with the lowered projections. *)
-let closure_generic_types (env : Typecheck.env) : Mono.generic_def array =
-  Array.of_list
-    (List.filter_map
-       (fun (name, nom : string * Typecheck.nominal) ->
-         match List.assoc_opt name env.Typecheck.type_ids with
-         | None -> None
-         | Some tid ->
-             if nom.Typecheck.nom_params = [] then None
-             else
-               let params =
-                 Array.of_list (List.map snd nom.Typecheck.nom_params)
-               in
-               (match nom.Typecheck.nom_kind with
-                | `Struct ->
-                    let fids =
-                      if List.length nom.Typecheck.nom_field_ids
-                         = List.length nom.Typecheck.nom_fields
-                      then nom.Typecheck.nom_field_ids
-                      else
-                        List.mapi (fun i _ -> Ids.Field_id.make (i + 1)) nom.Typecheck.nom_fields
-                    in
-                    Some
-                      { Mono.gd_tid = tid;
-                        gd_params = params;
-                        gd_def =
-                          Seed_mir.StructDef
-                            {
-                              sd_id = tid;
-                              sd_fields =
-                                List.mapi
-                                  (fun i (_, fty) ->
-                                    {
-                                      Seed_mir.fd_id = List.nth fids i;
-                                      fd_index = Ids.Field_index.make i;
-                                      fd_ty = fty;
-                                    })
-                                  nom.Typecheck.nom_fields;
-                            } }
-                | `Enum ->
-                    let vids =
-                      if List.length nom.Typecheck.nom_variant_ids
-                         = List.length nom.Typecheck.nom_variants
-                      then nom.Typecheck.nom_variant_ids
-                      else
-                        List.mapi (fun i _ -> Ids.Variant_id.make (i + 1)) nom.Typecheck.nom_variants
-                    in
-                    Some
-                      { Mono.gd_tid = tid;
-                        gd_params = params;
-                        gd_def =
-                          Seed_mir.EnumDef
-                            {
-                              ed_id = tid;
-                              ed_variants =
-                                List.mapi
-                                  (fun i (_, pty) ->
-                                    {
-                                      Seed_mir.vd_id = List.nth vids i;
-                                      vd_index = Ids.Variant_index.make i;
-                                      vd_payload =
-                                        (if Array.length pty = 0 then Type_repr.Unit
-                                         else Type_repr.Tuple pty);
-                                    })
-                                  nom.Typecheck.nom_variants;
-                            } }))
        env.Typecheck.nominals)
 
 (* Materialize program.statics from the typed const registry: declared
@@ -1941,7 +1982,8 @@ let materialize_type_instances ~(generic_types : Mono.generic_def array)
 
 (* Mono the lowered closure from the bootstrap entry; report pre/post
    function and instance counts; require zero residual Type_param and a
-   clean Mir_verify of the mono'd program. *)
+   clean Mir_verify.require_valid_concrete (post-mono = concrete mode)
+   of the mono'd program. *)
 let run_mono_phase ~(entry_name : string) ~(entry : Instance_id.t)
     ?(generic_types : Mono.generic_def array = [||])
     (prog : Seed_mir.program) : (mono_outcome, string list) result =
@@ -1990,7 +2032,7 @@ let run_mono_phase ~(entry_name : string) ~(entry : Instance_id.t)
            Printf.printf
              "  mono: post-instance count %d; residual Type_param positions %d (walked params/locals/instance args/operands/callees/statics/type defs)\n"
              post residual;
-           (match Mir_verify.require_valid final_prog with
+           (match Mir_verify.require_valid_concrete final_prog with
             | Error errs ->
                 Printf.printf "  MONO_MIR_STRUCTURAL_GATE = FAIL\n";
                 List.iter (fun e -> Printf.printf "    %s\n" e) errs;
@@ -2166,7 +2208,11 @@ let cmd_bootstrap_check (args : string list) : int =
        end
        else begin
          let prog = lower_closure ctx in
-         (match Mir_verify.require_valid prog with
+         (match
+            Mir_verify.require_valid_template
+              ~generic_types:(closure_generic_types ctx.ctx_env)
+              prog
+          with
           | Error errs ->
               Printf.printf "  SEED_MIR_STRUCTURAL_GATE = FAIL\n";
               List.iter (fun e -> Printf.printf "    %s\n" e) errs;
@@ -2325,7 +2371,11 @@ let cmd_compile (args : string list) : int =
        end
        else begin
          let prog = lower_closure ctx in
-         (match Mir_verify.require_valid prog with
+         (match
+            Mir_verify.require_valid_template
+              ~generic_types:(closure_generic_types ctx.ctx_env)
+              prog
+          with
           | Error errs ->
               Printf.printf "compile: FAILED — SEED_MIR_STRUCTURAL_GATE: %s\n" (String.concat "; " errs);
               Printf.printf "  RESULT: FAIL\n";

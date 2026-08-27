@@ -1,10 +1,24 @@
 (* mir_verify.ml — Seed MIR verifier (audit §36).
 
-   Run post-lowering, post-monomorphization, after every Seed MIR
-   transformation and immediately before VM execution.  The verifier is
-   total over the CONCRETE (post-mono) representation: any program that
-   violates a rule is rejected with the full deterministic list of
-   violations; nothing reaches execution on a rejected program.
+   Two explicit verification modes (audit P0: template vs concrete):
+   - require_valid_template runs pre-monomorphization, right after
+     lowering: the program is the GENERIC TEMPLATE universe (a function's
+     instance carries its declaration rigid GenericParamIds, and params/
+     locals/cast targets/constants/embedded instances may reference
+     them).  Template mode PERMITS a function's own declared rigid
+     params everywhere a template legitimately carries them, and still
+     REJECTS Infer_var, Error, unknown TypeId, unknown FieldId/VariantId,
+     wrong owner identity, malformed CFG, bad projection, bad call
+     arity, and any generic parameter the function's own signature does
+     NOT declare.  Generic nominal type templates resolve through the
+     registry (the same Mono.generic_def array the driver hands to
+     Mono.build) because program.types is concrete-only at this point.
+   - require_valid_concrete runs post-monomorphization and before VM
+     execution: the verifier is total over the CONCRETE (post-mono)
+     representation — zero Type_param/Infer_var/Error anywhere — and any
+     program that violates a rule is rejected with the full
+     deterministic list of violations; nothing reaches execution on a
+     rejected program.
 
    Checklist implemented (audit §36, §66):
    1.  every function has an entry block;
@@ -78,9 +92,15 @@ module IntSet = Set.Make (Int)
 module StrSet = Set.Make (String)
 module IntMap = Map.Make (Int)
 
+type mode =
+  | Template_mode (* pre-mono: declared rigid Type_params permitted *)
+  | Concrete_mode (* post-mono: zero Type_param/Infer_var/Error anywhere *)
+
 type ctx = {
   prog : program;
   errors : string list ref;
+  mode : mode;
+  generic_types : Mono.generic_def array; (* generic nominal templates; used in Template_mode *)
 }
 
 let add_err (ctx : ctx) (msg : string) =
@@ -89,18 +109,47 @@ let add_err (ctx : ctx) (msg : string) =
 (* ──────────────────────────────────────────────────────────────────
    Type-definition lookup and resolution *)
 
-let find_type (ctx : ctx) (tid : Ids.Type_id.t) : Type_repr.t option =
+(* Registry fallback (Template_mode): program.types is concrete-only by
+   contract, so a tid missing from the types table is a generic nominal
+   template in the registry.  The registry is ignored in Concrete_mode
+   (post-mono programs carry every def they reference). *)
+let find_def (ctx : ctx) (tid : Ids.Type_id.t) : Seed_mir.type_def option =
   match
     Array.to_list ctx.prog.types
     |> List.find_opt (fun d -> Seed_mir.def_id d = tid)
   with
+  | Some d -> Some d
+  | None -> (
+      match ctx.mode with
+      | Template_mode -> (
+          match Mono.find_generic ctx.generic_types tid with
+          | Some gd -> Some gd.Mono.gd_def
+          | None -> None)
+      | Concrete_mode -> None)
+
+let find_type (ctx : ctx) (tid : Ids.Type_id.t) : Type_repr.t option =
+  match find_def ctx tid with
   | Some d -> Some (Seed_mir.def_repr d)
   | None -> None
 
-(* The raw def of a TypeId (the semantic registry). *)
-let find_def (ctx : ctx) (tid : Ids.Type_id.t) : Seed_mir.type_def option =
-  Array.to_list ctx.prog.types
-  |> List.find_opt (fun d -> Seed_mir.def_id d = tid)
+(* Substitute a registry template def's declared params with a base's
+   instance args (declaration order — the same positional KParam
+   contract as mono's specialization).  Non-template defs pass through
+   unchanged; an arity disagreement is a malformed template and fails
+   closed. *)
+let subst_registry_type (ctx : ctx) (tid : Ids.Type_id.t) (args : Type_repr.t array)
+    (ty : Type_repr.t) : Type_repr.t =
+  match ctx.mode with
+  | Concrete_mode -> ty
+  | Template_mode -> (
+      match Mono.find_generic ctx.generic_types tid with
+      | None -> ty
+      | Some gd -> (
+          match Mono.type_substitution gd args with
+          | Ok subst -> Type_repr.substitute subst ty
+          | Error m ->
+              add_err ctx (Printf.sprintf "registry: %s" m);
+              ty))
 
 (* ── Semantic projection resolution (re-audit) ────────────────────
    A Field projection carries the semantic FieldId; its owner must be
@@ -109,7 +158,11 @@ let find_def (ctx : ctx) (tid : Ids.Type_id.t) : Seed_mir.type_def option =
    semantic VariantId; its owner must be the projected base's enum def,
    and the declaration-order tag (vd_index) is derived from the def's
    metadata.  These lookups fail closed (None) on any identity/owner
-   mismatch. *)
+   mismatch.  In Template_mode the def may be a registry template, so
+   the FIELD/VARIANT TYPE is substituted by the base's instance args —
+   the projected type of Named (tid, args) is the def's field type with
+   the template's declared params replaced by args (the same positional
+   KParam contract as mono). *)
 let struct_field_of (ctx : ctx) (tid : Ids.Type_id.t) (fid : Ids.Field_id.t) :
     Seed_mir.field_def option =
   match find_def ctx tid with
@@ -124,15 +177,30 @@ let enum_variant_of (ctx : ctx) (tid : Ids.Type_id.t) (vid : Ids.Variant_id.t) :
       List.find_opt (fun v -> Ids.Variant_id.compare v.Seed_mir.vd_id vid = 0) ed_variants
   | _ -> None
 
+let struct_field_ty (ctx : ctx) (tid : Ids.Type_id.t) (args : Type_repr.t array)
+    (fid : Ids.Field_id.t) : Type_repr.t option =
+  match struct_field_of ctx tid fid with
+  | Some f -> Some (subst_registry_type ctx tid args f.Seed_mir.fd_ty)
+  | None -> None
+
+let enum_variant_ty (ctx : ctx) (tid : Ids.Type_id.t) (args : Type_repr.t array)
+    (vid : Ids.Variant_id.t) : Type_repr.t option =
+  match enum_variant_of ctx tid vid with
+  | Some v -> Some (subst_registry_type ctx tid args v.Seed_mir.vd_payload)
+  | None -> None
+
 let rec resolve_ty (ctx : ctx) (seen : Ids.Type_id.t list) (ty : Type_repr.t) :
     Type_repr.t option =
   match ty with
-  | Type_repr.Named (tid, _) ->
+  | Type_repr.Named (tid, args) ->
       if List.mem tid seen then None
       else (
         match find_type ctx tid with
         | None -> None
-        | Some def -> resolve_ty ctx (tid :: seen) def)
+        | Some def ->
+            (* registry templates substitute their declared params with
+               the base's instance args; concrete defs pass through *)
+            resolve_ty ctx (tid :: seen) (subst_registry_type ctx tid args def))
   | _ -> Some ty
 
 let resolve_or_self (ctx : ctx) (ty : Type_repr.t) : Type_repr.t =
@@ -170,6 +238,11 @@ let is_copy (ctx : ctx) (ty : Type_repr.t) : bool =
    concern. *)
 let rec types_compatible (ctx : ctx) (a : Type_repr.t) (b : Type_repr.t) : bool =
   match a, b with
+  | Type_repr.Type_param pa, Type_repr.Type_param pb ->
+      (* rigid params are compatible exactly when they are the SAME
+         declaration binder (template bodies legitimately compare their
+         own params against themselves — locals, aggregates, casts) *)
+      Ids.Generic_param_id.compare pa pb = 0
   | Type_repr.Named (ta, aargs), Type_repr.Named (tb, bargs) ->
       ta = tb
       && Array.length aargs = Array.length bargs
@@ -253,10 +326,7 @@ let project_type (ctx : ctx) (ty : Type_repr.t) (proj : projection) : Type_repr.
       | _ -> None)
   | Field fid -> (
       match ty with
-      | Type_repr.Named (tid, _) -> (
-          match struct_field_of ctx tid fid with
-          | Some f -> Some f.Seed_mir.fd_ty
-          | None -> None)
+      | Type_repr.Named (tid, args) -> struct_field_ty ctx tid args fid
       | _ -> None)
   | ConstantIndex i -> (
       match resolve_or_self ctx ty with
@@ -276,10 +346,7 @@ let project_type (ctx : ctx) (ty : Type_repr.t) (proj : projection) : Type_repr.
       | _ -> None)
   | Downcast vid -> (
       match ty with
-      | Type_repr.Named (tid, _) -> (
-          match enum_variant_of ctx tid vid with
-          | Some v -> Some v.Seed_mir.vd_payload
-          | None -> None)
+      | Type_repr.Named (tid, args) -> enum_variant_ty ctx tid args vid
       | _ -> None)
 
 let place_type (ctx : ctx) (fn : function_) (p : place) : Type_repr.t option =
@@ -728,7 +795,7 @@ let check_projection_owners (ctx : ctx) (fn : function_) (bb_ctx : string)
                def.  The positional fd_index is derived from the def's
                metadata (never trusted from the projection itself). *)
             match ty with
-            | Type_repr.Named (tid, _) -> (
+            | Type_repr.Named (tid, args) -> (
                 match find_def ctx tid with
                 | Some (Seed_mir.StructDef { sd_fields; _ }) -> (
                     match
@@ -736,7 +803,7 @@ let check_projection_owners (ctx : ctx) (fn : function_) (bb_ctx : string)
                         (fun f -> Ids.Field_id.compare f.Seed_mir.fd_id fid = 0)
                         sd_fields
                     with
-                    | Some f -> go f.Seed_mir.fd_ty rest
+                    | Some f -> go (subst_registry_type ctx tid args f.Seed_mir.fd_ty) rest
                     | None ->
                         add_err ctx
                           (Printf.sprintf
@@ -812,9 +879,9 @@ let check_projection_owners (ctx : ctx) (fn : function_) (bb_ctx : string)
             (* the native owner-identity invariant for variants: the
                projected VariantId must belong to the projected base's
                OWN enum def; the runtime tag (vd_index) is derived from
-               the def's metadata. *)
+               the                 def's metadata. *)
             match ty with
-            | Type_repr.Named (tid, _) -> (
+            | Type_repr.Named (tid, args) -> (
                 match find_def ctx tid with
                 | Some (Seed_mir.EnumDef { ed_variants; _ }) -> (
                     match
@@ -822,7 +889,7 @@ let check_projection_owners (ctx : ctx) (fn : function_) (bb_ctx : string)
                         (fun v -> Ids.Variant_id.compare v.Seed_mir.vd_id vid = 0)
                         ed_variants
                     with
-                    | Some v -> go v.Seed_mir.vd_payload rest
+                    | Some v -> go (subst_registry_type ctx tid args v.Seed_mir.vd_payload) rest
                     | None ->
                         add_err ctx
                           (Printf.sprintf
@@ -913,6 +980,12 @@ let check_ref_operand (ctx : ctx) (fn : function_) (bb_ctx : string) (op : opera
        | _ -> ())
   | Constant _ -> ()
 
+(* Callee-resolution result (see resolve_callee below). *)
+type callee_resolution =
+  | Callee_ok of function_ * (Type_repr.t -> Type_repr.t)
+  | Callee_unknown
+  | Callee_arity_mismatch of string
+
 let rec check_operand (ctx : ctx) (fn : function_) (bb_ctx : string) (op : operand)
     (running : IntSet.t) (moved : StrSet.t IntMap.t) ~(as_call_arg : bool) : Type_repr.t option =
   match op with
@@ -972,16 +1045,78 @@ and constant_type (ctx : ctx) (c : constant) : Type_repr.t =
   | Function inst -> function_constant_type ctx inst
 
 and function_constant_type (ctx : ctx) (inst : Instance_id.t) : Type_repr.t =
-  match find_function_by_instance ctx inst with
-  | Some f ->
+  match resolve_callee ctx inst with
+  | Callee_ok (f, subst) ->
+      (* template mode: the constant's instance carries the EMBEDDING
+         function's params, so the callee's signature is read under the
+         substitution (its own declaration binders -> the constant's
+         type args) — the same contract mono applies *)
       let ret = if Array.length f.locals > 0 then f.locals.(0) else Type_repr.Unit in
-      Type_repr.Function (f.params, ret)
-  | None -> Type_repr.Unit
+      Type_repr.Function
+        ( Array.map
+            (fun (p : Type_repr.param_type) -> { p with pt_type = subst p.pt_type })
+            f.params,
+          subst ret )
+  | Callee_unknown | Callee_arity_mismatch _ -> Type_repr.Unit
 
 and find_function_by_instance (ctx : ctx) (inst : Instance_id.t) : function_ option =
   let found = ref None in
   Array.iter (fun f -> if f.instance = inst then found := Some f) ctx.prog.functions;
   !found
+
+(* ── Callee resolution by mode ─────────────────────────────────────
+   Concrete mode resolves a User callee by EXACT instance identity (the
+   program holds the specialized functions).  Template mode cannot: a
+   call's instance carries the CALLER's rigid params (the checker
+   instantiates the callee's declaration in the caller's context), never
+   the callee template's own declaration binders, so the call instance
+   can never equal the template's instance.  The callee is resolved by
+   CALLABLE identity and the call's type args are substituted into the
+   callee's declaration binders — the exact specialization contract mono
+   applies (declaration-order positional KParam substitution).  A
+   type-argument arity disagreement fails closed. *)
+
+and resolve_callee (ctx : ctx) (inst : Instance_id.t) : callee_resolution =
+  match ctx.mode with
+  | Concrete_mode -> (
+      match find_function_by_instance ctx inst with
+      | Some f -> Callee_ok (f, fun ty -> ty)
+      | None -> Callee_unknown)
+  | Template_mode -> (
+      match
+        Array.to_list ctx.prog.functions
+        |> List.find_opt (fun f ->
+               Ids.Callable_id.compare (Instance_id.callable f.instance)
+                 (Instance_id.callable inst)
+               = 0)
+      with
+      | None -> Callee_unknown
+      | Some cf ->
+          let decl = Instance_id.type_args cf.instance in
+          let args = Instance_id.type_args inst in
+          let decl_params =
+            Array.to_list decl
+            |> List.map (function
+                 | Type_repr.Type_param p -> Some p
+                 | _ -> None)
+          in
+          if
+            List.exists Option.is_none decl_params
+            || List.length decl_params <> Array.length args
+          then
+            Callee_arity_mismatch
+              (Printf.sprintf
+                 "callee %s declares %d generic parameter(s) but the call carries %d type argument(s)"
+                 cf.name (Array.length decl) (Array.length args))
+          else
+            let subst =
+              List.combine
+                (List.map
+                   (fun p -> Type_repr.KParam (Option.get p))
+                   decl_params)
+                (Array.to_list args)
+            in
+            Callee_ok (cf, fun ty -> Type_repr.substitute subst ty))
 
 (* ──────────────────────────────────────────────────────────────────
    Rvalue checking — returns the rvalue's type (None when already
@@ -1019,6 +1154,82 @@ let check_int64_in_int_kind (k : Type_repr.int_kind) (v : int64) : bool =
   | Type_repr.U16 -> v >= 0L && v <= 65535L
   | Type_repr.U32 -> v >= 0L && v <= Int64.of_string "4294967295"
   | Type_repr.U64 | Type_repr.UInt | Type_repr.U128 -> v >= 0L
+
+(* ──────────────────────────────────────────────────────────────────
+   Type-parameter discipline by mode.
+
+   Concrete mode: zero Type_param/Infer_var/Error at every walked type
+   position.  Template mode: a function's DECLARED rigid params (the
+   Type_params of its own instance — the declaration binders) are
+   permitted anywhere a template legitimately carries them; every OTHER
+   Type_param — a binder the function never declared — is an error ("the
+   template must not reference undeclared params"), and Infer_var/Error
+   are rejected exactly like concrete mode.  In template mode every
+   Named mention must resolve to a def (the types table or the generic
+   nominal registry) — unknown TypeIds fail closed — and a registry
+   template mention must carry exactly its declared arity. *)
+
+(* The declared rigid params of a template function: the Type_params of
+   its own instance (mir_lower mints template instances from the
+   signature's declaration binders). *)
+let declared_params (fn : function_) : IntSet.t =
+  Array.fold_left
+    (fun acc ty ->
+      match ty with
+      | Type_repr.Type_param pid -> IntSet.add (Ids.Generic_param_id.to_int pid) acc
+      | _ -> acc)
+    IntSet.empty (Instance_id.type_args fn.instance)
+
+let check_type_walk (ctx : ctx) (where : string) (what : string) (declared : IntSet.t)
+    (ty : Type_repr.t) : unit =
+  let rec go ty =
+    match ty with
+    | Type_repr.Type_param pid -> (
+        match ctx.mode with
+        | Concrete_mode ->
+            add_err ctx
+              (Printf.sprintf "%s: %s carries an unresolved type parameter (T%d)" where what
+                 (Ids.Generic_param_id.to_int pid))
+        | Template_mode ->
+            if not (IntSet.mem (Ids.Generic_param_id.to_int pid) declared) then
+              add_err ctx
+                (Printf.sprintf "%s: %s references generic parameter T%d that is not declared in this scope"
+                   where what (Ids.Generic_param_id.to_int pid)))
+    | Type_repr.Infer_var v ->
+        add_err ctx
+          (Printf.sprintf "%s: %s carries an unresolved inference variable #%d" where what v)
+    | Type_repr.Error ->
+        add_err ctx (Printf.sprintf "%s: %s carries the Error recovery type" where what)
+    | Type_repr.Named (tid, elems) -> (
+        match ctx.mode with
+        | Template_mode ->
+            if not (Option.is_some (find_def ctx tid)) then
+              add_err ctx
+                (Printf.sprintf
+                   "%s: %s references unknown TypeId type#%d (no def in the types table or the generic nominal registry)"
+                   where what (Ids.Type_id.to_int tid));
+            (match Mono.find_generic ctx.generic_types tid with
+             | Some gd ->
+                 if Array.length elems <> Array.length gd.Mono.gd_params then
+                   add_err ctx
+                     (Printf.sprintf
+                        "%s: %s instantiates generic template type#%d with %d argument(s) but it declares %d"
+                        where what (Ids.Type_id.to_int tid) (Array.length elems)
+                        (Array.length gd.Mono.gd_params))
+             | None -> ())
+        | Concrete_mode -> ());
+        Array.iter go elems
+    | Type_repr.Raw_ptr (_, t) | Type_repr.Ref_internal (_, t) | Type_repr.Fixed_array (t, _) ->
+        go t
+    | Type_repr.Tuple elems -> Array.iter go elems
+    | Type_repr.Function (params, ret) ->
+        Array.iter (fun p -> go p.Type_repr.pt_type) params;
+        go ret
+    | Type_repr.Unit | Type_repr.Bool | Type_repr.Char | Type_repr.Int _ | Type_repr.Float _
+    | Type_repr.String | Type_repr.Int_literal _ | Type_repr.Never ->
+        ()
+  in
+  go ty
 
 let check_aggregate (ctx : ctx) (fn : function_) (bb_ctx : string) (kind : aggregate_kind)
     (ops : operand list) (running : IntSet.t) (moved : StrSet.t IntMap.t) (dest_ty : Type_repr.t) :
@@ -1142,13 +1353,15 @@ let check_aggregate (ctx : ctx) (fn : function_) (bb_ctx : string) (kind : aggre
           in
           check_count (Array.length env_tys);
           Array.iteri (fun i t -> check_elem i t) env_tys;
-          match find_function_by_instance ctx inst with
-          | None ->
+          match resolve_callee ctx inst with
+          | Callee_unknown | Callee_arity_mismatch _ ->
               add_err ctx
                 (Printf.sprintf "%s: closure aggregate references unknown function instance"
                    bb_ctx)
-          | Some f ->
-              let ret = if Array.length f.locals > 0 then f.locals.(0) else Type_repr.Unit in
+          | Callee_ok (f, subst) ->
+              let ret =
+                subst (if Array.length f.locals > 0 then f.locals.(0) else Type_repr.Unit)
+              in
               if Array.length f.params <> Array.length sig_params then
                 add_err ctx
                   (Printf.sprintf
@@ -1157,7 +1370,10 @@ let check_aggregate (ctx : ctx) (fn : function_) (bb_ctx : string) (kind : aggre
               else
                 Array.iteri
                   (fun i p ->
-                    if not (types_compatible ctx p.Type_repr.pt_type sig_params.(i).Type_repr.pt_type)
+                    if
+                      not
+                        (types_compatible ctx (subst p.Type_repr.pt_type)
+                           sig_params.(i).Type_repr.pt_type)
                     then
                       add_err ctx
                         (Printf.sprintf
@@ -1166,8 +1382,9 @@ let check_aggregate (ctx : ctx) (fn : function_) (bb_ctx : string) (kind : aggre
               if not (types_compatible ctx ret sig_ret) then
                 add_err ctx
                   (Printf.sprintf "%s: closure aggregate instance return type mismatch" bb_ctx)))
-let check_rvalue (ctx : ctx) (fn : function_) (bb_ctx : string) (rv : rvalue)
-    (running : IntSet.t) (moved : StrSet.t IntMap.t) (dest_ty : Type_repr.t) : Type_repr.t option =
+let check_rvalue (ctx : ctx) (fn : function_) (bb_ctx : string) (declared : IntSet.t)
+    (rv : rvalue) (running : IntSet.t) (moved : StrSet.t IntMap.t) (dest_ty : Type_repr.t) :
+    Type_repr.t option =
   match rv with
   | Use op -> check_operand ctx fn bb_ctx op running moved ~as_call_arg:false
   | Ref p | RefMut p -> (
@@ -1278,19 +1495,44 @@ let check_rvalue (ctx : ctx) (fn : function_) (bb_ctx : string) (rv : rvalue)
                    (Seed_mir.print_type ty));
               None)
       | None -> None)
-  | Cast (op, ty) ->
+  | Cast (op, ty) -> (
       ignore (check_operand ctx fn bb_ctx op running moved ~as_call_arg:false);
-      if Type_repr.has_type_param ty then
-        add_err ctx
-          (Printf.sprintf "%s: cast target %s carries an unresolved type parameter" bb_ctx
-             (Seed_mir.print_type ty));
-      if is_scalar ctx ty then Some ty
-      else begin
-        add_err ctx
-          (Printf.sprintf "%s: cast target %s is not a scalar/pointer type" bb_ctx
-             (Seed_mir.print_type ty));
-        None
-      end
+      match ctx.mode with
+      | Concrete_mode ->
+          if Type_repr.has_type_param ty then
+            add_err ctx
+              (Printf.sprintf "%s: cast target %s carries an unresolved type parameter" bb_ctx
+                 (Seed_mir.print_type ty));
+          if is_scalar ctx ty then Some ty
+          else begin
+            add_err ctx
+              (Printf.sprintf "%s: cast target %s is not a scalar/pointer type" bb_ctx
+                 (Seed_mir.print_type ty));
+            None
+          end
+      | Template_mode ->
+          (* template mode: a cast to a DECLARED rigid param is a
+             template-legitimate position (its scalar class is an
+             instantiation-time fact); every other target must pass the
+             scalar/pointer matrix, and the target may only reference
+             the function's own declared params *)
+          (match ty with
+           | Type_repr.Type_param pid ->
+               if not (IntSet.mem (Ids.Generic_param_id.to_int pid) declared) then
+                 add_err ctx
+                   (Printf.sprintf
+                      "%s: cast target references generic parameter T%d that is not declared by this function's signature"
+                      bb_ctx (Ids.Generic_param_id.to_int pid));
+               Some ty
+           | _ ->
+               check_type_walk ctx bb_ctx "cast target" declared ty;
+               if is_scalar ctx ty then Some ty
+               else begin
+                 add_err ctx
+                   (Printf.sprintf "%s: cast target %s is not a scalar/pointer type" bb_ctx
+                      (Seed_mir.print_type ty));
+                 None
+               end))
 
 (* ──────────────────────────────────────────────────────────────────
    Terminator checking *)
@@ -1304,12 +1546,15 @@ let check_call (ctx : ctx) (fn : function_) (bb_ctx : string) (dest : place)
         add_err ctx
           (Printf.sprintf "%s: negative intrinsic/extern callee index %d" bb_ctx i)
   | User inst -> (
-      match find_function_by_instance ctx inst with
-      | None ->
+      match resolve_callee ctx inst with
+      | Callee_unknown ->
           add_err ctx
             (Printf.sprintf "%s: call to unknown function instance %s" bb_ctx
                (Seed_mir.print_instance inst))
-      | Some cf -> (
+      | Callee_arity_mismatch m ->
+          add_err ctx (Printf.sprintf "%s: call to instance %s: %s" bb_ctx
+                          (Seed_mir.print_instance inst) m)
+      | Callee_ok (cf, subst) -> (
           if Array.length args <> Array.length cf.params then
             add_err ctx
               (Printf.sprintf "%s: call argument count mismatch: expected %d got %d" bb_ctx
@@ -1340,20 +1585,25 @@ let check_call (ctx : ctx) (fn : function_) (bb_ctx : string) (dest : place)
                           bb_ctx i (Seed_mir.print_effect arg.effect_)
                           (Access_effect.to_string p.Type_repr.pt_convention)
                           (Seed_mir.print_effect expected));
+                   (* template mode: the callee's param type is read under
+                      the substitution (its declaration binders <- this
+                      call's type args), the same specialization contract
+                      mono applies *)
+                   let pty = subst p.Type_repr.pt_type in
                    match
                      check_operand ctx fn bb_ctx arg.value running moved ~as_call_arg:true
                    with
                    | Some aty ->
-                       if not (types_compatible ctx p.Type_repr.pt_type aty) then
+                       if not (types_compatible ctx pty aty) then
                          add_err ctx
                            (Printf.sprintf "%s: call arg %d type mismatch: expected %s got %s"
-                              bb_ctx i (Seed_mir.print_type p.Type_repr.pt_type)
+                              bb_ctx i (Seed_mir.print_type pty)
                               (Seed_mir.print_type aty))
                    | None -> ())
                | None -> ())
             args;
           let ret_ty =
-            if Array.length cf.locals > 0 then cf.locals.(0) else Type_repr.Unit
+            subst (if Array.length cf.locals > 0 then cf.locals.(0) else Type_repr.Unit)
           in
           match place_type ctx fn dest with
           | Some dty ->
@@ -1465,13 +1715,17 @@ let check_terminator (ctx : ctx) (fn : function_) (bb_ctx : string) (t : termina
 (* ──────────────────────────────────────────────────────────────────
    Per-function verification *)
 
-let check_embedded_concreteness (ctx : ctx) (fn : function_) : unit =
-  let check_what what ty =
-    if Type_repr.has_type_param ty then
-      add_err ctx
-        (Printf.sprintf "fn %s: %s carries an unresolved type parameter (%s)" fn.name what
-           (Seed_mir.print_type ty))
-  in
+(* Embedded type-position audit: params, locals and every instance
+   embedded in the body (function constants, closure aggregates, call
+   callees and call-argument constants) are walked under the function's
+   declared-param discipline.  Concrete mode: zero Type_param/Infer_var/
+   Error.  Template mode: the function's own declared rigid params are
+   permitted, undeclared params / Infer_var / Error / unknown TypeIds
+   are rejected. *)
+let check_embedded_types (ctx : ctx) (fn : function_) : unit =
+  let where = Printf.sprintf "fn %s" fn.name in
+  let declared = declared_params fn in
+  let check_what what ty = check_type_walk ctx where what declared ty in
   Array.iter (fun p -> check_what "param" p.Type_repr.pt_type) fn.params;
   Array.iter (fun ty -> check_what "local" ty) fn.locals;
   let check_operand op =
@@ -1486,7 +1740,8 @@ let check_embedded_concreteness (ctx : ctx) (fn : function_) : unit =
     | Aggregate (kind, ops) ->
         List.iter check_operand ops;
         (match kind with
-         | ClosureAgg inst -> Array.iter (check_what "closure instance") (Instance_id.type_args inst)
+         | ClosureAgg inst ->
+             Array.iter (check_what "closure instance") (Instance_id.type_args inst)
          | _ -> ())
     | BinaryOp (_, l, r) ->
         check_operand l;
@@ -1513,12 +1768,13 @@ let check_embedded_concreteness (ctx : ctx) (fn : function_) : unit =
 
 let verify_function (ctx : ctx) (fn : function_) : unit =
   let fn_ctx = Printf.sprintf "fn %s" fn.name in
+  (* the function's own instance is its declaration: in template mode
+     every Type_param it carries IS declared (the declared set is
+     exactly these binders); concrete mode rejects any residual
+     Type_param/Infer_var/Error here like everywhere else *)
+  let declared = declared_params fn in
   Array.iter
-    (fun ty ->
-      if Type_repr.has_type_param ty then
-        add_err ctx
-          (Printf.sprintf "%s: instance type argument %s carries an unresolved type parameter"
-             fn_ctx (Seed_mir.print_type ty)))
+    (fun ty -> check_type_walk ctx fn_ctx "instance type argument" declared ty)
     (Instance_id.type_args fn.instance);
   if Array.length fn.locals = 0 then
     add_err ctx
@@ -1551,7 +1807,7 @@ let verify_function (ctx : ctx) (fn : function_) : unit =
                (Seed_mir.print_type pty) (i + 1)
                (Seed_mir.print_type fn.locals.(i + 1))))
       fn.params;
-  check_embedded_concreteness ctx fn;
+  check_embedded_types ctx fn;
   if Array.length fn.blocks = 0 then
     add_err ctx (Printf.sprintf "%s: function has no blocks" fn_ctx)
   else begin
@@ -1619,10 +1875,12 @@ let verify_function (ctx : ctx) (fn : function_) : unit =
                             bb_ctx)
                  | _ -> ());
                 check_dest_place ctx fn bb_ctx p !running;
-                (match place_type ctx fn p with
-                 | Some dst_ty -> (
-                     let rv_ty = check_rvalue ctx fn bb_ctx rv !running !moved dst_ty in
-                     match rv_ty with
+                 (match place_type ctx fn p with
+                  | Some dst_ty -> (
+                      let rv_ty =
+                        check_rvalue ctx fn bb_ctx declared rv !running !moved dst_ty
+                      in
+                      match rv_ty with
                      | Some t ->
                          if not (types_compatible ctx dst_ty t) then
                            add_err ctx
@@ -1708,19 +1966,38 @@ let verify_types_table (ctx : ctx) : unit =
         add_err ctx
           (Printf.sprintf "types table: duplicate TypeId type#%d" (Ids.Type_id.to_int tid))
       else Hashtbl.add seen tid ();
-      let ty = Seed_mir.def_repr d in
-      if Type_repr.has_type_param ty then
-        add_err ctx
-          (Printf.sprintf "types table: def of type#%d carries an unresolved type parameter (%s)"
-             (Ids.Type_id.to_int tid) (Seed_mir.print_type ty)))
+      (* program.types is CONCRETE-only by contract in both modes: the
+         generic templates live in the registry (verify_registry) *)
+      check_type_walk ctx "types table" (Printf.sprintf "def of type#%d"
+                                            (Ids.Type_id.to_int tid))
+        IntSet.empty (Seed_mir.def_repr d))
     ctx.prog.types
+
+(* Template-mode audit of the generic nominal-template registry: a
+   template def may reference ONLY its own declared binders (gd_params)
+   and never Infer_var/Error — the registry is the pre-mono source of
+   generic def identities, so a malformed template is a closed gate. *)
+let verify_registry (ctx : ctx) : unit =
+  Array.iter
+    (fun (gd : Mono.generic_def) ->
+      let declared =
+        Array.fold_left
+          (fun acc p -> IntSet.add (Ids.Generic_param_id.to_int p) acc)
+          IntSet.empty gd.Mono.gd_params
+      in
+      let where =
+        Printf.sprintf "registry template type#%d" (Ids.Type_id.to_int gd.Mono.gd_tid)
+      in
+      check_type_walk ctx where "def" declared (Seed_mir.def_repr gd.Mono.gd_def))
+    ctx.generic_types
 
 let verify_statics (ctx : ctx) : unit =
   Array.iter
     (fun (name, ty, init) ->
       let what = Printf.sprintf "static %s" name in
-      if Type_repr.has_type_param ty then
-        add_err ctx (Printf.sprintf "%s: type carries an unresolved type parameter" what);
+      (* statics are module-level: nothing is declared, so template mode
+         rejects Type_params here exactly like concrete mode *)
+      check_type_walk ctx what "type" IntSet.empty ty;
       match init with
       | None -> ()
       | Some c -> (
@@ -1758,14 +2035,42 @@ let verify_function_uniqueness (ctx : ctx) : unit =
     ctx.prog.functions
 
 (* ──────────────────────────────────────────────────────────────────
-   Entry point *)
+   Entry points: the template/concrete split (audit P0).
 
-let require_valid (prog : program) : (unit, string list) result =
-  let ctx = { prog; errors = ref [] } in
+   require_valid_template  — pre-monomorphization: permits each
+       function's own declared rigid GenericParamIds wherever a template
+       legitimately carries them (instance args, params, locals, cast
+       targets, constants, embedded instances) and resolves generic
+       nominal identities through the optional registry (the same
+       Mono.generic_def array the driver hands to Mono.build; program.types
+       is concrete-only at this point).  Still rejects Infer_var, Error,
+       unknown TypeId, unknown FieldId/VariantId, wrong owner identity,
+       malformed CFG, bad projection, bad call arity and undeclared
+       generic parameters.
+   require_valid_concrete — post-monomorphization / immediately before
+       VM execution: zero Type_param/Infer_var/Error anywhere. *)
+
+let verify_all (ctx : ctx) (prog : program) : (unit, string list) result =
   verify_types_table ctx;
+  (match ctx.mode with
+   | Template_mode -> verify_registry ctx
+   | Concrete_mode -> ());
   verify_statics ctx;
   verify_function_uniqueness ctx;
   Array.iter (verify_function ctx) prog.functions;
   match !(ctx.errors) with
   | [] -> Ok ()
   | errs -> Error (List.rev errs)
+
+let require_valid_template ?(generic_types : Mono.generic_def array = [||])
+    (prog : program) : (unit, string list) result =
+  verify_all { prog; errors = ref []; mode = Template_mode; generic_types } prog
+
+let require_valid_concrete (prog : program) : (unit, string list) result =
+  verify_all { prog; errors = ref []; mode = Concrete_mode; generic_types = [||] } prog
+
+(* Deprecated strict alias: the pre-existing entry point is the CONCRETE
+   (post-mono) verifier — never the template mode.  Callers that want
+   pre-mono verification must name require_valid_template explicitly. *)
+let require_valid (prog : program) : (unit, string list) result =
+  require_valid_concrete prog

@@ -171,6 +171,20 @@ end
   end
 end
 |});
+    ("StructLit", {|struct P
+  x: Int
+end
+def f() -> Int
+  P { x: 1 }
+end
+|});
+    ("Field", {|struct P
+  x: Int
+end
+def f(p: P) -> Int
+  p.x
+end
+|});
   ]
 
 (* Rejected forms: the listed E-code must fire. *)
@@ -180,14 +194,6 @@ let rejected_specimens : (string * string * string) list =
      {|def f() -> Int
   let a = [0; 3]
   a[0]
-end
-|});
-    ("StructLit", "E9037",
-     {|struct P
-  x: Int
-end
-def f() -> Int
-  P { x: 1 }
 end
 |});
     ("UnsafeBlock", "E9041",
@@ -205,14 +211,6 @@ end
     ("Closure", "E9040",
      {|def f() -> Int
   |x| x + 1
-end
-|});
-    ("Field", "E9036",
-     {|struct P
-  x: Int
-end
-def f(p: P) -> Int
-  p.x
 end
 |});
     ("Await", "E9015",
@@ -492,12 +490,14 @@ end
   ]
 
 (* ── (b) the actually-lowerable table, curated from mir_lower ─────
-   Read from mir_lower.lower_expr (2026-08-26).  `Lowerable` = a
-   working branch emits Seed MIR for the form; `Partial` = the branch
-   lowers but specific sub-forms fail closed (called out in the
-   comment); `Unlowerable` = the form falls to the expression-name
-   diagnostic table ("unhandled supported expression form") or a
-   dedicated always-failing branch. *)
+   Read from mir_lower.lower_expr (2026-08-27 — the StructCtor
+   aggregate rule and the typed-place FieldId projection rule landed;
+   both are VM-proven in tg_lowersurface).  `Lowerable` = a working
+   branch emits Seed MIR for the form; `Partial` = the branch lowers
+   but specific sub-forms fail closed (called out in the comment);
+   `Unlowerable` = the form falls to the expression-name diagnostic
+   table ("unhandled supported expression form") or a dedicated
+   always-failing branch. *)
 
 type lower_status = Lowerable | Partial | Unlowerable
 
@@ -524,16 +524,21 @@ let expr_lower_status : (string * lower_status) list =
     (* no ArrayRepeat branch — the expression-name diagnostic table *)
     ("ArrayRepeat", Unlowerable);
     ("Tuple", Lowerable);
-    (* no StructLit branch — the expression-name diagnostic table *)
-    ("StructLit", Unlowerable);
+    (* the StructCtor aggregate rule: the literal lowers with the typed
+       registry's declaration-order positions (the same order
+       closure_types materializes into the StructDefs); the `..` spread
+       sub-form fails closed ("no spread channel") *)
+    ("StructLit", Partial);
     ("Block", Lowerable);
     (* no UnsafeBlock branch — the expression-name diagnostic table *)
     ("UnsafeBlock", Unlowerable);
     (* lower_if ignores the if-let pattern entirely *)
     ("If", Partial);
-    (* Name callees lower; Field callees ("method call ... without a
-       resolved receiver-typed instance") and nominal-qualified
-       "Type::method" names fail closed *)
+    (* Name callees lower (functions + builtin/user-enum ctors through
+       the variant table); Field callees (method calls) lower through
+       the receiver-typed method rule when the methods table carries
+       the instance; nominal-qualified "Type::method" names and
+       unresolved receivers fail closed *)
     ("Call", Partial);
     ("Index", Lowerable);
     (* no Range branch — the expression-name diagnostic table *)
@@ -553,9 +558,12 @@ let expr_lower_status : (string * lower_status) list =
     ("Closure", Unlowerable);
     (* Neg/Not/BitNot lower; Deref/Borrow/BorrowMut pass through *)
     ("Unary", Partial);
-    (* dedicated always-failing branch ("Field access reached MIR
-       lowering without a typed place (FieldId) rule") *)
-    ("Field", Unlowerable);
+    (* the typed-place (FieldId) rule: a projected read resolves the
+       base's type against the typed nominal registry and emits the
+       semantic FieldId projection (tuples project positionally with
+       ConstantIndex); every unresolvable field fails closed — never a
+       silent Unit *)
+    ("Field", Lowerable);
     ("Binary", Lowerable);
     ("Await", Unlowerable);
     (* no MacroCall branch — the expression-name diagnostic table *)

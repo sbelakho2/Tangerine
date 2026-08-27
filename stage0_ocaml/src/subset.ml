@@ -15,7 +15,12 @@
    Mir_lower.expr_lower_status).  E9037–E9049 close the re-audit's
    accepted-but-unlowerable gaps (the lowerer's expression-name
    diagnostic table has no branch for several forms the checker used to
-   traverse). *)
+   traverse).  The E9037 (StructLit) and Field-side E9036 rejections were
+   DELETED 2026-08-27 when the StructCtor aggregate rule and the
+   typed-place (FieldId) projection rule landed in mir_lower — their
+   positive parse → typecheck → lower → verify → execute proofs live in
+   selfcheck/tg_lowersurface.ml (E9036 remains for projected
+   ASSIGNMENT writebacks, which still have no typed-place rule). *)
 
 let rejected_attributes =
   [
@@ -39,11 +44,16 @@ let reject (diags : Diagnostic.bag) code msg span =
    names plus qualified `enum::variant` names), the declared nominal
    (struct/enum) names and the declared top-level function names
    (qualified names included, e.g. `Command::new`).  The driver lowers
-   with the default variant table — the builtin Option/Result table only
-   (mir_lower.default_variant_table + the builtin ctor_of fallback), so
-   any user-enum construct or match arm fails closed at lowering with
-   Seed_bug.  The firewall rejects that usage up front (E9035), and
-   rejects nominal-qualified references that are neither declared
+   with user_variant_table (built from the TYPED nominal registry —
+   driver.ml), and the VariantId fix landed 2026-08-27 (each variant
+   spec carries its registry-minted SEMANTIC vs_id — never a
+   position-derived id — for user enums AND the builtin Option/Result
+   via the table's vt_builtin channel).  User-enum support STAYS behind
+   the firewall (E9035) until the positive driver-path end-to-end proof
+   lands (parse → typecheck with resolver → driver lower → verify → VM
+   on a user-enum program — the tg_lowersurface user-enum proofs still
+   use hand-built tables; flipping is a separate wave).  The firewall
+   also rejects nominal-qualified references that are neither declared
    top-level functions nor builtin variant constructors (E9048): the
    lowering env's callables carry top-level functions only, so a
    `Type::method` reference fails closed at lowering with "unknown
@@ -296,12 +306,14 @@ and check_pattern ctx diags (p : Ast.pattern) =
   | Ast.PatVariant (seg1, seg2, fields, span) ->
       (* AST form: Ast.PatVariant (enum_seg, variant_name, pats, span)
          (parser: `Enum::Variant(...)` qualified, `Variant(...)` bare).
-         The driver's default variant table serves only Option/Result —
-         a user-enum match arm fails closed at lowering with Seed_bug. *)
+         User-enum match arms are held behind the firewall (E9035): the
+         VariantId fix landed 2026-08-27 (specs carry the registry-
+         minted vs_id), but the positive driver-path end-to-end proof
+         is absent — support stays gated until it lands. *)
       if not (builtin_variant_of seg1 seg2) then
         reject diags "E9035"
           (Printf.sprintf
-             "user-defined enum match arm `%s` is not available in the bootstrap subset (the default variant table serves only Option/Result)"
+             "user-defined enum match arm `%s` is not available in the bootstrap subset (the VariantId fix has landed, but user-enum support stays gated until the positive driver-path end-to-end proof lands)"
              (if seg1 = "" then seg2 else seg1 ^ "::" ^ seg2))
           span;
       List.iter (check_pattern ctx diags) fields
@@ -330,10 +342,12 @@ and check_pattern ctx diags (p : Ast.pattern) =
 and check_arm_pattern ctx diags (p : Ast.pattern) =
   match p with
   | Ast.PatVariant (seg1, seg2, fields, span) ->
+      (* held behind the firewall (E9035) — VariantId fix landed, the
+         positive driver-path proof is absent (see check_pattern) *)
       if not (builtin_variant_of seg1 seg2) then
         reject diags "E9035"
           (Printf.sprintf
-             "user-defined enum match arm `%s` is not available in the bootstrap subset (the default variant table serves only Option/Result)"
+             "user-defined enum match arm `%s` is not available in the bootstrap subset (the VariantId fix has landed, but user-enum support stays gated until the positive driver-path end-to-end proof lands)"
              (if seg1 = "" then seg2 else seg1 ^ "::" ^ seg2))
           span;
       List.iter
@@ -398,13 +412,15 @@ and check_expr ctx diags (e : Ast.expr) =
   | Ast.Name (n, span) ->
       (* AST form: Ast.Name (name, span) — a user-enum constructor in
          value position (`Red` nullary, or the qualified `Color::Red` the
-         parser folds into a single Name).  The driver's plain
-         lower_function carries no user variant table, so these fail
-         closed at lowering; reject until real enum lowering lands. *)
+         parser folds into a single Name).  User-enum construction is
+         held behind the firewall (E9035): the VariantId fix landed
+         2026-08-27 (specs carry the registry-minted vs_id), but the
+         positive driver-path end-to-end proof is absent — support
+         stays gated until it lands. *)
       if List.mem n ctx.user_variants then
         reject diags "E9035"
           (Printf.sprintf
-             "user-defined enum constructor `%s` is not available in the bootstrap subset (the default variant table serves only Option/Result)"
+             "user-defined enum constructor `%s` is not available in the bootstrap subset (the VariantId fix has landed, but user-enum support stays gated until the positive driver-path end-to-end proof lands)"
              n)
           span
       else
@@ -445,12 +461,18 @@ and check_expr ctx diags (e : Ast.expr) =
   | Ast.Tuple (elems, _) -> List.iter (check_expr ctx diags) elems
   | Ast.StructLit (_, targs, fields, rest, span) ->
       (* AST form: Ast.StructLit (name, targs, fields, rest, span)
-         (parser `Name { f: v, ..rest }`).  The lowerer has no StructLit
-         branch — it falls to "unhandled supported expression form:
-         StructLit"; reject until struct-literal lowering lands. *)
-      reject diags "E9037"
-        "struct literal expressions are not available in the bootstrap subset (seed lowering has no StructLit branch — struct construction is unlowered)"
-        span;
+         (parser `Name { f: v, ..rest }`).  The lowerer implements
+         struct literals: the StructCtor aggregate rule lowers them with
+         the typed registry's DECLARATION-order positions (the same
+         order closure_types materializes into the StructDefs), the
+         aggregate type from the typed channel or the env's type table,
+         and every unresolvable field — unknown name, missing field,
+         duplicate, `..` spread — fails closed at lowering with the
+         reason (never a silent Unit).  Positive end-to-end proof:
+         selfcheck/tg_lowersurface.ml (struct-lit + struct-field
+         proofs, both VM round-tripped).  The field VALUES still get
+         checked here. *)
+      ignore span;
       List.iter (check_type ctx diags false) targs;
       List.iter (fun (_, v) -> check_expr ctx diags v) fields;
       Option.iter (check_expr ctx diags) rest
@@ -488,12 +510,14 @@ and check_expr ctx diags (e : Ast.expr) =
       Option.iter (check_expr ctx diags) i.Ast.if_let_value
   | Ast.Call (callee, targs, args, span) ->
       (* AST form: Ast.Call (Ast.Name n, ...) with n a user-enum ctor
-         (`Green(7)` bare, `Color::Green(7)` folded qualified name). *)
+         (`Green(7)` bare, `Color::Green(7)` folded qualified name) —
+         held behind the firewall (E9035): the VariantId fix landed,
+         the positive driver-path proof is absent. *)
       (match callee with
        | Ast.Name (n, _) when List.mem n ctx.user_variants ->
            reject diags "E9035"
              (Printf.sprintf
-                "user-defined enum constructor `%s` is not available in the bootstrap subset (the default variant table serves only Option/Result)"
+                "user-defined enum constructor `%s` is not available in the bootstrap subset (the VariantId fix has landed, but user-enum support stays gated until the positive driver-path end-to-end proof lands)"
                 n)
              span
        | _ -> ());
@@ -550,14 +574,21 @@ and check_expr ctx diags (e : Ast.expr) =
   | Ast.Unary (_, e, _) -> check_expr ctx diags e
   | Ast.Field (b, _, span) ->
       (* AST form: Ast.Field (base, field_name, span) — a projected read
-         (`p.x`, or the method-call receiver `obj.method(...)`).  Seed
-         lowering has no typed-place Field rule (mir_lower fails closed
-         on every user Field form), and projected operations on places
-         are resource-sensitive (they interact with move/consume
-         semantics); reject until precise. *)
-      reject diags "E9036"
-        "field projections are not available in the bootstrap subset (projected operations on places are resource-sensitive and have no typed-place rule in seed lowering)"
-        span;
+         (`p.x`), or the method-call receiver `obj.method(...)` (the
+         parser produces a Field callee).  The lowerer implements the
+         typed-place (FieldId) rule: the base lowers to a place and the
+         field resolves against the typed nominal registry
+         (func_env.struct_fields) with the SEMANTIC FieldId — tuples
+         project positionally with ConstantIndex — and every
+         unresolvable field fails closed.  Method-call receivers lower
+         through the receiver-typed method rule (the typed place is
+         passed as the SELF argument).  Positive end-to-end proofs
+         (lower + verify + VM round-trip): selfcheck/tg_lowersurface.ml
+         (struct-field, struct-lit, method-call and nested-function
+         proofs).  NOTE: a projected WRITE (`p.x = v`) still has no
+         typed-place writeback rule — Assign rejects non-Name targets
+         with E9036 below. *)
+      ignore span;
       check_expr ctx diags b
   | Ast.Binary (l, _, r, _) ->
       check_expr ctx diags l;
@@ -655,11 +686,20 @@ let expr_form_status : (string * form_status) list =
     ("Array", Accepted);
     ("ArrayRepeat", Rejected "E9038");
     ("Tuple", Accepted);
-    ("StructLit", Rejected "E9037");
+    (* the StructCtor aggregate rule landed (2026-08-27): the literal
+       lowers with the typed registry's declaration-order positions;
+       unresolvable fields and `..` spreads fail closed at lowering
+       (tg_lowersurface's struct-lit + fail-closed proofs) *)
+    ("StructLit", Accepted);
     ("Block", Accepted);
     ("UnsafeBlock", Rejected "E9041");
     ("If", Conditional [ "E9046" ]);
-    ("Call", Conditional [ "E9035"; "E9036"; "E9048" ]);
+    (* Name callees (functions + builtin/user-enum ctors via the
+       variant table) and Field callees (method calls through the
+       receiver-typed rule) lower; user-enum ctor callees reject E9035
+       (VariantId fix landed — gated pending the positive driver-path
+       proof), nominal-qualified non-function names reject E9048 *)
+    ("Call", Conditional [ "E9035"; "E9048" ]);
     ("Index", Accepted);
     ("Range", Rejected "E9039");
     ("Match", Conditional [ "E9035"; "E9043"; "E9044" ]);
@@ -667,10 +707,14 @@ let expr_form_status : (string * form_status) list =
     ("TryOp", Accepted);
     ("Closure", Rejected "E9040");
     ("Unary", Accepted);
-    ("Field", Rejected "E9036");
+    (* the typed-place (FieldId) rule landed (2026-08-27): reads project
+       with the semantic FieldId; unresolvable fields fail closed *)
+    ("Field", Accepted);
     ("Binary", Accepted);
     ("Await", Rejected "E9015");
     ("MacroCall", Rejected "E9049");
+    (* plain Name targets accept; projected writebacks (a[i] = v,
+       p.x = v) still have no typed-place rule in seed lowering *)
     ("Assign", Conditional [ "E9036" ]);
     ("CompoundAssign", Rejected "E9042");
     ("Return", Accepted);

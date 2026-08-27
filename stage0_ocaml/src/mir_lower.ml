@@ -147,44 +147,56 @@ type typed_node = {
    (vm_value.ml), constructed by EnumCtor and read by Discriminant /
    Downcast / ConstantIndex projections.  Variant indices must therefore
    be consistent across construction sites and match arms within one
-   program.  The builtin enums Option (Some=0, None=1) and Result
-   (Ok=0, Err=1) are hardcoded (their payloads come from the enum's
-   type arguments); user enums are declared by the caller through a
-   variant_table (see lower_function_with_variants).  The plain
-   lower_function API (used by the driver) lowers with the builtin
-   table only, so user-defined enum constructs fail closed there with a
-   Seed_bug pointing at lower_function_with_variants.  Every emitted
-   Downcast projection carries the SEMANTIC VariantId derived from the
-   spec's declaration-order index (semantic_variant_id below) — the
-   compile-time identity; the runtime tag stays the declaration-order
-   index, and the verifier/VM reconcile the two through the enum def. *)
+   program.  Every spec carries TWO ORTHOGONAL coordinates (audit P0):
+   the SEMANTIC VariantId (vs_id — the compile-time identity, minted by
+   the resolver and carried through the typechecker's typed nominals
+   (nom_variant_ids) into this table by the driver) and the RUNTIME tag
+   (vs_index — the declaration-order position, used as the EnumCtor tag
+   and the SwitchInt target).  The two are NEVER derived from each
+   other: the lowerer emits the spec's vs_id in every Downcast
+   projection, and the verifier/VM reconcile it through the enum def's
+   vd_id (the runtime tag is def metadata).  The builtin enums Option
+   (Some=0, None=1) and Result (Ok=0, Err=1) are NOT exempted from the
+   semantic registry: their payloads are derived from the enum's type
+   arguments at each use site (the repr), but their IDs come from the
+   same typed-nominal channel (the table's vt_builtin — the kernel's
+   LangItem Option/Result declarations carry resolver ids); user enums
+   are declared by the caller through a variant_table (see
+   lower_function_with_variants).  The plain lower_function API (used
+   by the driver) lowers with the builtin table only, so user-defined
+   enum constructs fail closed there with a Seed_bug pointing at
+   lower_function_with_variants. *)
 
 type variant_spec = {
-  vs_index : int;                   (* tag = declaration-order variant index *)
+  vs_id : Ids.Variant_id.t;         (* SEMANTIC variant identity (registry-minted — never derived from vs_index) *)
+  vs_index : int;                   (* runtime tag = declaration-order variant index *)
   vs_fields : Type_repr.t list;     (* payload field types (concrete) *)
 }
 
-(* Semantic variant identity of a table spec: 1-based declaration order
-   (`Variant_id.make (vs_index + 1)`) — the same deterministic minting
-   the typechecker's fallback registration uses (typecheck.ml: "None ->
-   Ids.Variant_id.make (i + 1)") when no resolver handoff exists, and
-   the scheme the seed's EnumDefs carry.  The semantic id is the
-   compile-time identity; the runtime tag is the declaration-order
-   vd_index (== vs_index), which the VM derives through the enum def
-   when executing a Downcast.  NOTE: a RESOLVER-driven registry mints
-   closure-wide dense ids (non-positional); the driver must then carry
-   the ids in the variant table — the fallback scheme here is the
-   deterministic position-based minting. *)
-let semantic_variant_id (spec : variant_spec) : Ids.Variant_id.t =
-  Ids.Variant_id.make (spec.vs_index + 1)
+(* Semantic variant identity of a table spec: the spec's OWN vs_id —
+   the identity the typechecker captured from the resolver's
+   closure-wide minting (nom_variant_ids) and the driver carried into
+   the table.  NEVER reconstructed from vs_index: the old
+   `Variant_id.make (vs_index + 1)` scheme was the audit P0 — the
+   resolver's ids are closure-wide dense, not declaration positions, so
+   a position-derived id does not belong to the projected base's enum
+   def and the verifier's owner-identity rule rejects the Downcast. *)
+let semantic_variant_id (spec : variant_spec) : Ids.Variant_id.t = spec.vs_id
 
 type variant_table = {
   vt_enums : (string * (string * variant_spec) list) list;  (* enum name -> variant name -> spec *)
   vt_ctors : (string * (string * string)) list;  (* ctor name -> (enum name, variant name) *)
+  vt_builtin : (string * (string * Ids.Variant_id.t) list) list;
+  (* builtin enum name -> variant name -> SEMANTIC VariantId.  The
+     Option/Result identities come from the SAME semantic registry as
+     user enums (the driver reads the typed nominals' nom_variant_ids;
+     the kernel's LangItem declarations carry resolver ids) — never
+     from the declaration positions.  Lowering with a table lacking the
+     registry fails closed. *)
 }
 
-let builtin_variant_spec (enum_name : string) (vname : string) (repr : Type_repr.t) :
-    variant_spec option =
+let builtin_variant_spec (tbl : variant_table) (enum_name : string) (vname : string)
+    (repr : Type_repr.t) : variant_spec option =
   let index_of =
     match enum_name, vname with
     | "Option", "Some" -> Some 0
@@ -196,6 +208,22 @@ let builtin_variant_spec (enum_name : string) (vname : string) (repr : Type_repr
   match index_of with
   | None -> None
   | Some idx ->
+      (* the SEMANTIC identity from the registry — fail closed when the
+         table carries none (the old position-based manufacture is gone) *)
+      let vid =
+        match List.assoc_opt enum_name tbl.vt_builtin with
+        | Some vmap -> (
+            match List.assoc_opt vname vmap with
+            | Some vid -> vid
+            | None ->
+                seed_bug
+                  "builtin variant `%s` of `%s` has no SEMANTIC VariantId in the variant table's registry"
+                  vname enum_name)
+        | None ->
+            seed_bug
+              "builtin enum `%s` has no SEMANTIC VariantId registry in the variant table (Option/Result need the driver's user_variant_table — never position-derived ids)"
+              enum_name
+      in
       let args = match repr with Type_repr.Named (_, args) -> args | _ -> [||] in
       let fields =
         match vname with
@@ -203,7 +231,7 @@ let builtin_variant_spec (enum_name : string) (vname : string) (repr : Type_repr
         | "Err" -> if Array.length args > 1 then [ args.(1) ] else []
         | _ -> []
       in
-      Some { vs_index = idx; vs_fields = fields }
+      Some { vs_id = vid; vs_index = idx; vs_fields = fields }
 
 let variant_spec_of (_env : func_env) (tbl : variant_table) ~(enum_name : string)
     ~(vname : string) ~(repr : Type_repr.t) : variant_spec =
@@ -214,7 +242,7 @@ let variant_spec_of (_env : func_env) (tbl : variant_table) ~(enum_name : string
       | None ->
           seed_bug "unknown variant `%s` of enum `%s` (no variant table entry)" vname enum_name)
   | None -> (
-      match builtin_variant_spec enum_name vname repr with
+      match builtin_variant_spec tbl enum_name vname repr with
       | Some spec -> spec
       | None ->
           seed_bug
@@ -253,7 +281,7 @@ let enum_name_of_ty (env : func_env) (t : Type_repr.t) : string =
       | None -> seed_bug "the match subject's enum type has no name in the lowering env")
   | _ -> seed_bug "variant match subject is not an enum value"
 
-let default_variant_table : variant_table = { vt_enums = []; vt_ctors = [] }
+let default_variant_table : variant_table = { vt_enums = []; vt_ctors = []; vt_builtin = [] }
 
 type lower_state = {
   mutable next_local : int;

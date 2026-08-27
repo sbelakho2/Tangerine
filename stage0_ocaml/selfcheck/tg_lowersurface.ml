@@ -21,7 +21,19 @@
          element reads);
      (d) two function-level defers that must run in reverse declaration
          order (LIFO), observed through mutations of a counter variable
-         that the returned value reads after the defers run.
+         that the returned value reads after the defers run;
+     (e) the struct-field READ/WRITE proof — the positive replacement
+         for the retired E9036/E9037 rejections (the FieldId rule and
+         the StructCtor aggregate rule): make_pair WRITES a Pair from
+         the SOURCE struct literal `Pair { a: a, b: b }` (lowered to
+         the StructCtor aggregate with the registry's declaration-order
+         indices), read_a/read_b READ `.a`/`.b` through the lowered
+         Field projections with the semantic FieldIds, and the whole
+         source-lowered program verifies and the VM round-trips
+         (main = 21 + 42 = 63);
+     (f) the struct-lit proof: `Pair { b: b, a: a }` — the OUT-OF-ORDER
+         literal's values must land at the typed registry's declaration
+         positions, never the source order.
 
    Expected main return: 113 (see the derivation comment in src_text). *)
 
@@ -125,18 +137,35 @@ end
 let int_ty = Type_repr.Int Type_repr.Int
 let string_ty = Type_repr.String
 
-(* ── variant table for the user enum (declaration order) ───────── *)
+(* ── variant table for the user enum (the SEMANTIC ids from the
+      typed registry: this env is resolver-free, so the typechecker's
+      fallback registration mints the canonical 1-based ids; the driver
+      reproduces them below — the vs_id / vs_index split proves the
+      lowerer carries identity and runtime tag independently) ─────── *)
 let color_specs =
   [
-    ("Red", { Mir_lower.vs_index = 0; vs_fields = [] });
-    ("Green", { Mir_lower.vs_index = 1; vs_fields = [ int_ty ] });
-    ("Blue", { Mir_lower.vs_index = 2; vs_fields = [ int_ty; int_ty ] });
+    ("Red", { Mir_lower.vs_id = Ids.Variant_id.make 1; vs_index = 0; vs_fields = [] });
+    ("Green", { Mir_lower.vs_id = Ids.Variant_id.make 2; vs_index = 1; vs_fields = [ int_ty ] });
+    ("Blue", { Mir_lower.vs_id = Ids.Variant_id.make 3; vs_index = 2; vs_fields = [ int_ty; int_ty ] });
   ]
 
 let color_ctors = List.map (fun (n, spec) -> (n, ("Color", n, spec))) color_specs
 
+(* the builtin Option/Result carry their SEMANTIC ids through the same
+   registry channel (vt_builtin): the bare compiler-seeded nominals have
+   no nom_variant_ids, so the canonical no-resolver minting is
+   make (i + 1) — exactly what the driver's user_variant_table produces
+   and what the hand-built EnumDefs below materialize *)
 let variant_table : Mir_lower.variant_table =
-  { vt_enums = [ ("Color", color_specs) ]; vt_ctors = List.map (fun (n, (e, v, _)) -> (n, (e, v))) color_ctors }
+  {
+    vt_enums = [ ("Color", color_specs) ];
+    vt_ctors = List.map (fun (n, (e, v, _)) -> (n, (e, v))) color_ctors;
+    vt_builtin =
+      [
+        ("Option", [ ("Some", Ids.Variant_id.make 1); ("None", Ids.Variant_id.make 2) ]);
+        ("Result", [ ("Ok", Ids.Variant_id.make 1); ("Err", Ids.Variant_id.make 2) ]);
+      ];
+  }
 
 let () =
   let dump = List.mem "--dump" (Array.to_list Sys.argv) in
@@ -224,9 +253,10 @@ end
       (* ── user-enum variant-table proof (re-audit finding: the closure
          driver must feed lowering the typechecker's enum universe — the
          DRIVER's table-builder runs on the TYPED nominal registry and
-         must reproduce the manual Color table above exactly, with the
-         declaration-order indices aligned to the semantic VariantIds
-         that closure_types materializes into the EnumDefs) *)
+         must reproduce the manual Color table above exactly, with each
+         spec's vs_id the SEMANTIC VariantId from nom_variant_ids — the
+         identity the closure_types EnumDefs materialize — and the
+         vs_index the declaration-order position, independently) *)
       let color_nom = List.assoc "Color" tcheck_env.Typecheck.nominals in
       let color_tid = List.assoc "Color" tcheck_env.Typecheck.type_ids in
       let driver_table = Driver.user_variant_table tcheck_env in
@@ -254,24 +284,30 @@ end
                  && (let vd : Seed_mir.variant_def =
                        List.nth ed_variants spec.Mir_lower.vs_index
                      in
-                     Ids.Variant_id.compare vd.Seed_mir.vd_id
+                     (* the spec's vs_id IS the registry's id — the
+                        EnumDef carries the same id at the same
+                        position: never reconstructed from the index *)
+                     Ids.Variant_id.compare spec.Mir_lower.vs_id
                        (List.nth color_nom.Typecheck.nom_variant_ids spec.Mir_lower.vs_index)
-                     = 0))
+                     = 0
+                     && Ids.Variant_id.compare vd.Seed_mir.vd_id spec.Mir_lower.vs_id = 0))
                (List.assoc "Color" driver_table.Mir_lower.vt_enums)
            in
            if ok then
              Printf.printf
-               "  user-enum table: PASS (driver table == manual Color table; vs_index aligns with the semantic VariantIds in the EnumDefs)\n"
+               "  user-enum table: PASS (driver table == manual Color table; each spec's vs_id is the registry's SEMANTIC VariantId, matching the EnumDefs; vs_index is the independent runtime tag)\n"
            else begin
              Printf.printf "  user-enum table: FAIL (semantic VariantId alignment)\n";
              exit 1
            end);
       (* a resolver-driven env: the semantic VariantIds are the
-         resolver's dense closure-wide enumeration, so the second enum's
-         ids are NOT its declaration positions — the driver's
-         table-builder must still reproduce the manual construction
-         shape (name -> index -> payloads; ctor -> (enum, variant)) from
-         the typed nominals alone *)
+         resolver's dense closure-wide enumeration (0-based), so the
+         second enum's ids are NOT its declaration positions — the
+         driver's table-builder must still reproduce the manual
+         construction shape (name -> {vs_id; vs_index} -> payloads;
+         ctor -> (enum, variant)) from the typed nominals alone, and
+         each spec's vs_id must BE the registry's id (the audit P0:
+         never `Variant_id.make (vs_index + 1)`) *)
       let proof_src = {|
 enum A
   A0,
@@ -313,17 +349,20 @@ end
       let a_nom = List.assoc "A" penv.Typecheck.nominals in
       let b_nom = List.assoc "B" penv.Typecheck.nominals in
       let b_ids = b_nom.Typecheck.nom_variant_ids in
+      (* vs_id = the resolver's ids (0-based dense, closure-wide);
+         vs_index = the declaration position — the two are independent
+         coordinates (B's vs_ids [2;3;4] are NOT make (vs_index + 1)) *)
       let a_specs =
         [
-          ("A0", { Mir_lower.vs_index = 0; vs_fields = [] });
-          ("A1", { Mir_lower.vs_index = 1; vs_fields = [ int_ty ] });
+          ("A0", { Mir_lower.vs_id = Ids.Variant_id.make 0; vs_index = 0; vs_fields = [] });
+          ("A1", { Mir_lower.vs_id = Ids.Variant_id.make 1; vs_index = 1; vs_fields = [ int_ty ] });
         ]
       in
       let b_specs =
         [
-          ("B0", { Mir_lower.vs_index = 0; vs_fields = [] });
-          ("B1", { Mir_lower.vs_index = 1; vs_fields = [ int_ty ] });
-          ("B2", { Mir_lower.vs_index = 2; vs_fields = [ int_ty; int_ty ] });
+          ("B0", { Mir_lower.vs_id = Ids.Variant_id.make 2; vs_index = 0; vs_fields = [] });
+          ("B1", { Mir_lower.vs_id = Ids.Variant_id.make 3; vs_index = 1; vs_fields = [ int_ty ] });
+          ("B2", { Mir_lower.vs_id = Ids.Variant_id.make 4; vs_index = 2; vs_fields = [ int_ty; int_ty ] });
         ]
       in
       let p_table = Driver.user_variant_table penv in
@@ -363,17 +402,33 @@ end
                        let vd : Seed_mir.variant_def =
                          List.nth ed_variants spec.Mir_lower.vs_index
                        in
-                       Ids.Variant_id.compare vd.Seed_mir.vd_id
-                         (List.nth b_ids spec.Mir_lower.vs_index)
+                       Ids.Variant_id.compare vd.Seed_mir.vd_id spec.Mir_lower.vs_id
                        = 0))
              b_specs
       in
-      if enums_ok && ctors_ok && ids_ok then
+      (* the audit P0 proof: every spec's vs_id comes FROM THE REGISTRY
+         (nom_variant_ids at the variant's position) and is NOT the
+         position reconstruction `make (vs_index + 1)` — B's ids are the
+         resolver's dense closure-wide [2;3;4], never 1-based positions *)
+      let registry_ok =
+        List.for_all
+          (fun (vname, spec : string * Mir_lower.variant_spec) ->
+            List.assoc_opt vname b_nom.Typecheck.nom_variants <> None
+            && Ids.Variant_id.compare spec.Mir_lower.vs_id
+                 (List.nth b_ids spec.Mir_lower.vs_index)
+               = 0
+            && Ids.Variant_id.compare spec.Mir_lower.vs_id
+                 (Ids.Variant_id.make (spec.Mir_lower.vs_index + 1))
+               <> 0)
+          b_specs
+      in
+      if enums_ok && ctors_ok && ids_ok && registry_ok then
         Printf.printf
-          "  user-enum table (resolver env): PASS (A/B entries in the manual shape; B's semantic VariantIds [2;3;4] are non-positional and aligned with the table indices via the EnumDefs)\n"
+          "  user-enum table (resolver env): PASS (A/B entries in the manual shape; each vs_id is the REGISTRY's id — B's [2;3;4] are non-positional and NOT make (vs_index + 1); the EnumDefs carry the same ids)\n"
       else begin
-        Printf.printf "  user-enum table (resolver env): FAIL (enums_ok=%b ctors_ok=%b ids_ok=%b)\n"
-          enums_ok ctors_ok ids_ok;
+        Printf.printf
+          "  user-enum table (resolver env): FAIL (enums_ok=%b ctors_ok=%b ids_ok=%b registry_ok=%b)\n"
+          enums_ok ctors_ok ids_ok registry_ok;
         exit 1
       end;
       ignore a_nom;
@@ -469,11 +524,12 @@ end
               List.mapi
                 (fun i fs ->
                   {
-                    (* semantic VariantIds are minted 1-based in
-                       declaration order — the same deterministic scheme
-                       the typechecker's fallback registration and
-                       mir_lower's semantic_variant_id use (the lowered
-                       Downcast projections carry these ids) *)
+                    (* this resolver-free program's semantic VariantIds
+                       are the canonical 1-based minting (the
+                       typechecker's fallback registration and the
+                       driver's registry channel agree) — the lowered
+                       Downcast projections carry the SAME vs_ids the
+                       table carries, so these defs reconcile them *)
                     Seed_mir.vd_id = Ids.Variant_id.make (i + 1);
                     vd_index = Ids.Variant_index.make i;
                     vd_payload = payload_def fs;
@@ -493,10 +549,19 @@ end
             |];
         }
       in
-      (match Mir_verify.require_valid prog with
-       | Ok () -> Printf.printf "  MIR verify: PASS (%d functions)\n" (Array.length prog.Seed_mir.functions)
+      (match Mir_verify.require_valid_template prog with
+       | Ok () -> Printf.printf "  MIR verify (template mode): PASS (%d functions)\n" (Array.length prog.Seed_mir.functions)
        | Error errs ->
-           Printf.printf "  MIR verify: FAIL\n";
+           Printf.printf "  MIR verify (template mode): FAIL\n";
+           List.iter (fun e -> Printf.printf "    %s\n" e) errs;
+           Printf.printf "%s\n" (Seed_mir.print_program prog);
+           exit 1);
+      (* the same CONCRETE program must also pass the concrete mode: a
+         concrete function satisfies BOTH verifiers *)
+      (match Mir_verify.require_valid_concrete prog with
+       | Ok () -> Printf.printf "  MIR verify (concrete mode): PASS (%d functions)\n" (Array.length prog.Seed_mir.functions)
+       | Error errs ->
+           Printf.printf "  MIR verify (concrete mode): FAIL\n";
            List.iter (fun e -> Printf.printf "    %s\n" e) errs;
            Printf.printf "%s\n" (Seed_mir.print_program prog);
            exit 1);
@@ -579,15 +644,471 @@ end
        | _ ->
            Printf.printf "  type defs: FAIL\n";
            exit 1);
-      (match lowered.Seed_mir.instance with
-       | { Instance_id.callable = _; type_args = [| Type_repr.Type_param a; Type_repr.Type_param b |] } when
-           Ids_core.Generic_param_id.compare a pid_t = 0
-           && Ids_core.Generic_param_id.compare b pid_u = 0 ->
-           Printf.printf "  template instance: PASS (f[T,U] -> [T;U] in declaration order)\n"
-       | _ ->
-           Printf.printf "  template instance: FAIL\n";
-           exit 1);
-      if dump then Printf.printf "%s\n" (Seed_mir.print_program prog);
+       (match lowered.Seed_mir.instance with
+        | { Instance_id.callable = _; type_args = [| Type_repr.Type_param a; Type_repr.Type_param b |] } when
+            Ids_core.Generic_param_id.compare a pid_t = 0
+            && Ids_core.Generic_param_id.compare b pid_u = 0 ->
+            Printf.printf "  template instance: PASS (f[T,U] -> [T;U] in declaration order)\n"
+        | _ ->
+            Printf.printf "  template instance: FAIL\n";
+            exit 1);
+       (* ── template/concrete verification-mode split (audit P0) ────
+          require_valid_template admits a generic function TEMPLATE —
+          its own declared rigid params in instance args, params,
+          locals, cast targets — while still rejecting undeclared
+          params, inference variables, the Error type, unknown TypeIds
+          and wrong owner identities; require_valid_concrete rejects
+          ANY residual Type_param/Infer_var.  Generic nominal
+          identities resolve through the registry (the same
+          Mono.generic_def array the driver hands to Mono.build)
+          because program.types is concrete-only pre-mono. *)
+       let contains_sub s sub =
+         let ls = String.length s and l = String.length sub in
+         if l = 0 then true
+         else begin
+           let rec go i =
+             if i + l > ls then false
+             else if String.sub s i l = sub then true
+             else go (i + 1)
+           in
+           go 0
+         end
+       in
+       let pid_s = Ids_core.Generic_param_id.make 21 in
+       let pid_t2 = Ids_core.Generic_param_id.make 22 in
+       let ty_s = Type_repr.Type_param pid_s in
+       let ty_t2 = Type_repr.Type_param pid_t2 in
+       let place l = { Seed_mir.local = l; projections = [] } in
+       (* a genuine template: swap[T,U] — instance [T;U], params T/U,
+          locals T/U, a cast to the declared param T *)
+       let swap_tmpl : Seed_mir.function_ =
+         {
+           Seed_mir.name = "swap";
+           instance =
+             Instance_id.make ~callable:(Ids.Callable_id.make 77)
+               ~type_args:[| ty_s; ty_t2 |];
+           params =
+             [|
+               { Type_repr.pt_type = ty_s; pt_convention = Access_effect.Let };
+               { Type_repr.pt_type = ty_t2; pt_convention = Access_effect.Let };
+             |];
+           locals = [| Type_repr.Tuple [| ty_s; ty_t2 |]; ty_s; ty_t2; ty_s; ty_t2 |];
+           blocks =
+             [|
+               {
+                 Seed_mir.id = 0;
+                 statements =
+                   [
+                     Seed_mir.Assign (place 3, Seed_mir.Cast (Seed_mir.Move (place 1), ty_s));
+                     Seed_mir.Assign (place 4, Seed_mir.Use (Seed_mir.Move (place 2)));
+                     Seed_mir.Assign
+                       ( place 0,
+                         Seed_mir.Aggregate
+                           (Seed_mir.TupleAgg, [ Seed_mir.Move (place 3); Seed_mir.Move (place 4) ]) );
+                   ];
+                 terminator = Seed_mir.Ret;
+               };
+             |];
+           entry = 0;
+         }
+       in
+       let tmpl_prog : Seed_mir.program =
+         { Seed_mir.functions = [| swap_tmpl |]; statics = [||]; types = [||] }
+       in
+       (match Mir_verify.require_valid_template tmpl_prog with
+        | Ok () ->
+            Printf.printf
+              "  template-mode verify: PASS (swap[T,U] — declared rigid params in instance/params/locals/cast target)\n"
+        | Error errs ->
+            Printf.printf "  template-mode verify: FAIL\n";
+            List.iter (fun e -> Printf.printf "    %s\n" e) errs;
+            exit 1);
+       (match Mir_verify.require_valid_concrete tmpl_prog with
+        | Error errs when List.exists (fun e -> contains_sub e "unresolved type parameter") errs ->
+            Printf.printf
+              "  concrete-mode verify: PASS (the same template is REJECTED — residual Type_param)\n"
+        | other ->
+            Printf.printf "  concrete-mode verify: FAIL (expected a Type_param rejection, got %s)\n"
+              (match other with
+               | Ok () -> "Ok"
+               | Error errs -> String.concat "; " errs);
+            exit 1);
+       (* negative template-mode proofs: the STILL-REJECTED list *)
+       let undeclared_fn : Seed_mir.function_ =
+         {
+           Seed_mir.name = "undeclared";
+           instance =
+             Instance_id.make ~callable:(Ids.Callable_id.make 79) ~type_args:[| ty_s |];
+           params = [| { Type_repr.pt_type = ty_s; pt_convention = Access_effect.Let } |];
+           (* _2 carries T22, which swap's signature never declared *)
+           locals = [| ty_s; ty_s; ty_t2 |];
+           blocks =
+             [|
+               {
+                 Seed_mir.id = 0;
+                 statements =
+                   [ Seed_mir.Assign (place 2, Seed_mir.Use (Seed_mir.Move (place 1))) ];
+                 terminator = Seed_mir.Ret;
+               };
+             |];
+           entry = 0;
+         }
+       in
+       let infer_fn : Seed_mir.function_ =
+         { undeclared_fn with
+           Seed_mir.name = "infer_fn";
+           locals = [| ty_s; ty_s; Type_repr.Infer_var 5 |] }
+       in
+       let error_fn : Seed_mir.function_ =
+         { undeclared_fn with
+           Seed_mir.name = "error_fn";
+           locals = [| ty_s; ty_s; Type_repr.Error |] }
+       in
+       let unknown_tid_fn : Seed_mir.function_ =
+         { undeclared_fn with
+           Seed_mir.name = "unknown_tid_fn";
+           locals = [| ty_s; ty_s; Type_repr.Named (Ids.Type_id.make 999, [||]) |] }
+       in
+       let reject_tmpl (name : string) (f : Seed_mir.function_) (needle : string) =
+         let p : Seed_mir.program =
+           { Seed_mir.functions = [| f |]; statics = [||]; types = [||] }
+         in
+         match Mir_verify.require_valid_template p with
+         | Error errs when List.exists (fun e -> contains_sub e needle) errs ->
+             Printf.printf "  template-mode reject: PASS (%s — %s)\n" name needle
+         | other ->
+             Printf.printf "  template-mode reject: FAIL (%s — expected %S, got %s)\n" name needle
+               (match other with
+                | Ok () -> "Ok"
+                | Error errs -> String.concat "; " errs);
+             exit 1
+       in
+       reject_tmpl "undeclared generic parameter" undeclared_fn "not declared in this scope";
+       reject_tmpl "inference variable" infer_fn "inference variable";
+       reject_tmpl "Error recovery type" error_fn "Error recovery type";
+       reject_tmpl "unknown TypeId" unknown_tid_fn "unknown TypeId";
+       (* the generic nominal registry: program.types is concrete-only
+          pre-mono, so a generic nominal's field identities and types
+          resolve through the registry — and only with it *)
+       let pair_tid = Ids.Type_id.make 71 in
+       let pid_f = Ids_core.Generic_param_id.make 31 in
+       let pid_g = Ids_core.Generic_param_id.make 32 in
+       let ty_f = Type_repr.Type_param pid_f in
+       let ty_g = Type_repr.Type_param pid_g in
+       let fid_first = Ids.Field_id.make 501 in
+       let fid_second = Ids.Field_id.make 502 in
+       let pair_registry : Mono.generic_def array =
+         [|
+           {
+             Mono.gd_tid = pair_tid;
+             gd_params = [| pid_f; pid_g |];
+             gd_def =
+               Seed_mir.StructDef
+                 {
+                   sd_id = pair_tid;
+                   sd_fields =
+                     [
+                       { Seed_mir.fd_id = fid_first; fd_index = Ids.Field_index.make 0; fd_ty = ty_f };
+                       { Seed_mir.fd_id = fid_second; fd_index = Ids.Field_index.make 1; fd_ty = ty_g };
+                     ];
+                 };
+           };
+         |]
+       in
+       let pair_ty = Type_repr.Named (pair_tid, [| ty_s; ty_t2 |]) in
+       let first_of : Seed_mir.function_ =
+         {
+           Seed_mir.name = "first_of";
+           instance =
+             Instance_id.make ~callable:(Ids.Callable_id.make 78) ~type_args:[| ty_s; ty_t2 |];
+           params = [| { Type_repr.pt_type = pair_ty; pt_convention = Access_effect.Let } |];
+           locals = [| ty_s; pair_ty; ty_s |];
+           blocks =
+             [|
+               {
+                 Seed_mir.id = 0;
+                 statements =
+                   [
+                     Seed_mir.Assign
+                       ( place 2,
+                         Seed_mir.Use
+                           (Seed_mir.Read
+                              { local = 1; projections = [ Seed_mir.Field fid_first ] }) );
+                     Seed_mir.Assign (place 0, Seed_mir.Use (Seed_mir.Move (place 2)));
+                   ];
+                 terminator = Seed_mir.Ret;
+               };
+             |];
+           entry = 0;
+         }
+       in
+       let first_prog : Seed_mir.program =
+         { Seed_mir.functions = [| first_of |]; statics = [||]; types = [||] }
+       in
+       (match Mir_verify.require_valid_template ~generic_types:pair_registry first_prog with
+        | Ok () ->
+            Printf.printf
+              "  registry template verify: PASS (Pair[T,U].first projects through the registry def to T)\n"
+        | Error errs ->
+            Printf.printf "  registry template verify: FAIL\n";
+            List.iter (fun e -> Printf.printf "    %s\n" e) errs;
+            exit 1);
+       (match Mir_verify.require_valid_template first_prog with
+        | Error errs when List.exists (fun e -> contains_sub e "unknown TypeId") errs ->
+            Printf.printf
+              "  registry-less template verify: PASS (Pair[T,U] without the registry is an unknown TypeId)\n"
+        | other ->
+            Printf.printf "  registry-less template verify: FAIL (expected an unknown-TypeId rejection, got %s)\n"
+              (match other with
+               | Ok () -> "Ok"
+               | Error errs -> String.concat "; " errs);
+            exit 1);
+       (match Mir_verify.require_valid_concrete first_prog with
+        | Error errs when List.exists (fun e -> contains_sub e "unresolved type parameter") errs ->
+            Printf.printf "  registry template concrete-mode: PASS (rejected — residual Type_param)\n"
+        | other ->
+            Printf.printf "  registry template concrete-mode: FAIL (expected a Type_param rejection, got %s)\n"
+              (match other with
+               | Ok () -> "Ok"
+               | Error errs -> String.concat "; " errs);
+            exit 1);
+       let wrong_owner : Seed_mir.function_ =
+         { first_of with
+           Seed_mir.name = "wrong_owner";
+           blocks =
+             [|
+               {
+                 Seed_mir.id = 0;
+                 statements =
+                   [
+                     Seed_mir.Assign
+                       ( place 2,
+                         Seed_mir.Use
+                           (Seed_mir.Read
+                              { local = 1; projections = [ Seed_mir.Field (Ids.Field_id.make 999) ] }) );
+                     Seed_mir.Assign (place 0, Seed_mir.Use (Seed_mir.Move (place 2)));
+                   ];
+                 terminator = Seed_mir.Ret;
+               };
+             |] }
+       in
+       let bad_arity : Seed_mir.function_ =
+         { first_of with
+           Seed_mir.name = "bad_arity";
+           params =
+             [|
+               { Type_repr.pt_type = Type_repr.Named (pair_tid, [| ty_s |]);
+                 pt_convention = Access_effect.Let };
+             |];
+           locals = [| ty_s; Type_repr.Named (pair_tid, [| ty_s |]); ty_s |] }
+       in
+       let reject_registry (name : string) (f : Seed_mir.function_) (needle : string) =
+         let p : Seed_mir.program =
+           { Seed_mir.functions = [| f |]; statics = [||]; types = [||] }
+         in
+         match Mir_verify.require_valid_template ~generic_types:pair_registry p with
+         | Error errs when List.exists (fun e -> contains_sub e needle) errs ->
+             Printf.printf "  registry template reject: PASS (%s — %s)\n" name needle
+         | other ->
+             Printf.printf "  registry template reject: FAIL (%s — expected %S, got %s)\n" name
+               needle
+               (match other with
+                | Ok () -> "Ok"
+                | Error errs -> String.concat "; " errs);
+             exit 1
+       in
+       reject_registry "wrong FieldId owner identity" wrong_owner "owner mismatch";
+       reject_registry "registry template arity mismatch" bad_arity "declares";
+       (* template-to-template calls: a call inside a template carries the
+          CALLER's rigid params; the callee resolves by CALLABLE identity
+          and the call's type args substitute the callee's declaration
+          binders (the mono specialization contract) — and bad call
+          arity / bad type-argument arity are still rejected *)
+       let pid_c = Ids_core.Generic_param_id.make 41 in
+       let ty_c = Type_repr.Type_param pid_c in
+       let g_tmpl : Seed_mir.function_ =
+         {
+           Seed_mir.name = "g";
+           instance =
+             Instance_id.make ~callable:(Ids.Callable_id.make 88) ~type_args:[| ty_c |];
+           params = [| { Type_repr.pt_type = ty_c; pt_convention = Access_effect.Let } |];
+           locals = [| ty_c; ty_c |];
+           blocks =
+             [|
+               {
+                 Seed_mir.id = 0;
+                 statements =
+                   [ Seed_mir.Assign (place 0, Seed_mir.Use (Seed_mir.Move (place 1))) ];
+                 terminator = Seed_mir.Ret;
+               };
+             |];
+           entry = 0;
+         }
+       in
+       let f_tmpl : Seed_mir.function_ =
+         {
+           Seed_mir.name = "f";
+           instance =
+             Instance_id.make ~callable:(Ids.Callable_id.make 89) ~type_args:[| ty_s |];
+           params = [| { Type_repr.pt_type = ty_s; pt_convention = Access_effect.Let } |];
+           locals = [| ty_s; ty_s; ty_s |];
+           blocks =
+             [|
+               {
+                 Seed_mir.id = 0;
+                 statements = [];
+                 terminator =
+                   Seed_mir.Call
+                     ( place 2,
+                       Seed_mir.User
+                         (Instance_id.make ~callable:(Ids.Callable_id.make 88)
+                            ~type_args:[| ty_s |]),
+                       [|
+                         { Seed_mir.effect_ = Access_effect.Read;
+                           value = Seed_mir.Move (place 1) };
+                       |],
+                       1,
+                       None );
+               };
+               {
+                 Seed_mir.id = 1;
+                 statements =
+                   [ Seed_mir.Assign (place 0, Seed_mir.Use (Seed_mir.Move (place 2))) ];
+                 terminator = Seed_mir.Ret;
+               };
+             |];
+           entry = 0;
+         }
+       in
+       let call_prog : Seed_mir.program =
+         { Seed_mir.functions = [| f_tmpl; g_tmpl |]; statics = [||]; types = [||] }
+       in
+       (match Mir_verify.require_valid_template call_prog with
+        | Ok () ->
+            Printf.printf
+              "  template-call verify: PASS (f[T] calls g[T] — callee resolved by callable identity, param/ret read under the call's type args)\n"
+        | Error errs ->
+            Printf.printf "  template-call verify: FAIL\n";
+            List.iter (fun e -> Printf.printf "    %s\n" e) errs;
+            exit 1);
+       let bad_arg_count : Seed_mir.function_ =
+         { f_tmpl with
+           Seed_mir.name = "bad_arg_count";
+           blocks =
+             [|
+               {
+                 Seed_mir.id = 0;
+                 statements = [];
+                 terminator =
+                   Seed_mir.Call
+                     ( place 2,
+                       Seed_mir.User
+                         (Instance_id.make ~callable:(Ids.Callable_id.make 88)
+                            ~type_args:[| ty_s |]),
+                       [||],
+                       1,
+                       None );
+               };
+               {
+                 Seed_mir.id = 1;
+                 statements =
+                   [ Seed_mir.Assign (place 0, Seed_mir.Use (Seed_mir.Move (place 2))) ];
+                 terminator = Seed_mir.Ret;
+               };
+             |] }
+       in
+       let bad_type_arity : Seed_mir.function_ =
+         { f_tmpl with
+           Seed_mir.name = "bad_type_arity";
+           blocks =
+             [|
+               {
+                 Seed_mir.id = 0;
+                 statements = [];
+                 terminator =
+                   Seed_mir.Call
+                     ( place 2,
+                       Seed_mir.User
+                         (Instance_id.make ~callable:(Ids.Callable_id.make 88)
+                            ~type_args:[| ty_s; ty_t2 |]),
+                       [|
+                         { Seed_mir.effect_ = Access_effect.Read;
+                           value = Seed_mir.Move (place 1) };
+                       |],
+                       1,
+                       None );
+               };
+               {
+                 Seed_mir.id = 1;
+                 statements =
+                   [ Seed_mir.Assign (place 0, Seed_mir.Use (Seed_mir.Move (place 2))) ];
+                 terminator = Seed_mir.Ret;
+               };
+             |] }
+       in
+       let reject_call (name : string) (f : Seed_mir.function_) (needle : string) =
+         let p : Seed_mir.program =
+           { Seed_mir.functions = [| f; g_tmpl |]; statics = [||]; types = [||] }
+         in
+         match Mir_verify.require_valid_template p with
+         | Error errs when List.exists (fun e -> contains_sub e needle) errs ->
+             Printf.printf "  template-call reject: PASS (%s — %s)\n" name needle
+         | other ->
+             Printf.printf "  template-call reject: FAIL (%s — expected %S, got %s)\n" name needle
+               (match other with
+                | Ok () -> "Ok"
+                | Error errs -> String.concat "; " errs);
+             exit 1
+       in
+       reject_call "bad call argument count" bad_arg_count "argument count mismatch";
+       reject_call "bad type-argument arity" bad_type_arity "declares";
+       (* function constants in a template: a Constant (Function inst)
+          referencing a generic template reads the callee's signature
+          under the constant's type args *)
+       let fnptr_tmpl : Seed_mir.function_ =
+         {
+           Seed_mir.name = "fnptr";
+           instance =
+             Instance_id.make ~callable:(Ids.Callable_id.make 90) ~type_args:[| ty_s |];
+           params = [| { Type_repr.pt_type = ty_s; pt_convention = Access_effect.Let } |];
+           locals =
+             [| ty_s; ty_s;
+                Type_repr.Function
+                  ([| { Type_repr.pt_type = ty_s; pt_convention = Access_effect.Let } |],
+                   ty_s) |];
+           blocks =
+             [|
+               {
+                 Seed_mir.id = 0;
+                 statements =
+                   [
+                     Seed_mir.Assign
+                       ( place 2,
+                         Seed_mir.Use
+                           (Seed_mir.Constant
+                              (Seed_mir.Function
+                                 (Instance_id.make ~callable:(Ids.Callable_id.make 88)
+                                    ~type_args:[| ty_s |]))) );
+                     Seed_mir.Assign (place 0, Seed_mir.Use (Seed_mir.Move (place 1)));
+                   ];
+                 terminator = Seed_mir.Ret;
+               };
+             |];
+           entry = 0;
+         }
+       in
+       (match
+          Mir_verify.require_valid_template
+            { Seed_mir.functions = [| fnptr_tmpl; g_tmpl |]; statics = [||]; types = [||] }
+        with
+        | Ok () ->
+            Printf.printf
+              "  template function-constant verify: PASS (a constant of g[T] reads the callee signature under the call's type args)\n"
+        | Error errs ->
+            Printf.printf "  template function-constant verify: FAIL\n";
+            List.iter (fun e -> Printf.printf "    %s\n" e) errs;
+            exit 1);
+       if dump then Printf.printf "%s\n" (Seed_mir.print_program prog);
       let entry =
         match
           Array.to_list prog.Seed_mir.functions
@@ -615,23 +1136,30 @@ end
                       exit 1
                     end
                 | Error m -> Printf.printf "  main returned: <inspect failed: %s>\n" m)));
-      (* ── struct-field lowering proof (re-audit's first priority: Field
-         access must reach MIR lowering through a typed place (FieldId)
-         rule — the ordinary lowering surface's first item) ─────────
-         A two-field struct Pair: make_pair CONSTRUCTS a Pair value as a
-         StructCtor aggregate with the typed field indices (the seed's
-         aggregate construction form — source-level struct literals are
-         still gated at the frontend), and read_a/read_b read `.a`/`.b`
-         through the LOWERED Field projection.  The proof shows:
+      (* ── struct-field read/write lowering proof (re-audit's first
+         priority: Field access must reach MIR lowering through a typed
+         place (FieldId) rule — the ordinary lowering surface's first
+         item; 2026-08-27 the frontend gate for the WRITE side was also
+         lifted, so make_pair now lowers from the SOURCE struct literal
+         `Pair { a: a, b: b }` — the positive replacement for the
+         retired E9036/E9037 rejections) ─────────────────────────────
+         A two-field struct Pair: make_pair CONSTRUCTS a Pair value
+         from the source-level StructLit (the StructCtor aggregate with
+         the typed field indices), and read_a/read_b read `.a`/`.b`
+         through the LOWERED Field projection.  Every function lowers
+         from source (parse -> typecheck -> lower -> verify -> execute).
+         The proof shows:
          (1) the driver's registry builder (struct_fields_of on the
          TYPED registry — the same source closure_types materializes
          the StructDefs from) reproduces the manual Pair table exactly,
          with the semantic FieldIds;
-         (2) the lowered read functions carry the Field projection with
+         (2) the lowered make_pair carries the StructCtor aggregate with
+         the registry's declaration-order indices;
+         (3) the lowered read functions carry the Field projection with
          the semantic FieldId MATCHING the StructDef installed into
          program.types (the verifier's owner-identity rule);
-         (3) the whole program passes Mir_verify.require_valid and the
-         VM round-trips the field values (main = 21 + 42 = 63). *)
+         (4) the whole program passes Mir_verify.require_valid_concrete
+         and the VM round-trips the field values (main = 21 + 42 = 63). *)
       let field_src = {|
 struct Pair
   a: Int
@@ -639,6 +1167,7 @@ struct Pair
 end
 
 def make_pair(a: Int, b: Int) -> Pair
+  Pair { a: a, b: b }
 end
 
 def read_a(p: Pair) -> Int
@@ -750,49 +1279,12 @@ end
       in
       (* the StructCtor aggregate that CONSTRUCTS the Pair value (the
          seed's post-mono aggregate form: the typed field indices in
-         declaration order; the lowered Field projections resolve
-         through the semantic FieldIds of the def — the declaration
-         position is def metadata, never in the projection) *)
-      let make_pair_fn : Seed_mir.function_ =
-        {
-          Seed_mir.name = "make_pair";
-          instance =
-            Instance_id.make ~callable:(fts_of "make_pair").Typecheck.ts_callable ~type_args:[||];
-          params =
-            [|
-              { Type_repr.pt_convention = Access_effect.Let; pt_type = int_ty };
-              { Type_repr.pt_convention = Access_effect.Let; pt_type = int_ty };
-            |];
-          locals = [| Type_repr.Named (pair_tid, [||]); int_ty; int_ty |];
-          blocks =
-            [|
-              {
-                Seed_mir.id = 0;
-                statements =
-                  [
-                    Seed_mir.Assign
-                      ( { Seed_mir.local = 0; projections = [] },
-                        Seed_mir.Aggregate
-                          ( Seed_mir.StructCtor
-                              ( pair_tid,
-                                [| Ids.Field_index.make 0; Ids.Field_index.make 1 |] ),
-                            [
-                              Seed_mir.Copy { Seed_mir.local = 1; projections = [] };
-                              Seed_mir.Copy { Seed_mir.local = 2; projections = [] };
-                            ] ) );
-                  ];
-                terminator = Seed_mir.Ret;
-              };
-            |];
-          entry = 0;
-        }
-      in
+         declaration order) — now emitted by the LOWERER from the
+         source StructLit, not hand-built: make_pair is lowered from
+         `Pair { a: a, b: b }` exactly like read_a/read_b/main *)
       let fprog : Seed_mir.program =
         {
-          Seed_mir.functions =
-            Array.of_list
-              (make_pair_fn
-               :: List.filter (fun f -> f.Seed_mir.name <> "make_pair") fmir_funcs);
+          Seed_mir.functions = Array.of_list fmir_funcs;
           statics = [||];
           (* the StructDef with the SEMANTIC FieldIds — built manually
              (the harness's style), and cross-checked against the typed
@@ -811,6 +1303,53 @@ end
             |];
         }
       in
+      (* the write-side proof: the LOWERED make_pair must carry the
+         StructCtor aggregate — Pair's tid, the registry's
+         declaration-order indices [0;1], and the params (a=local 1,
+         b=local 2) as the operands *)
+      let fmake_pair =
+        List.find
+          (fun f -> f.Seed_mir.name = "make_pair")
+          (Array.to_list fprog.Seed_mir.functions)
+      in
+      let f_ctor =
+        Array.to_list fmake_pair.Seed_mir.blocks
+        |> List.find_map (fun (b : Seed_mir.block) ->
+               List.find_map
+                 (fun (s : Seed_mir.statement) ->
+                   match s with
+                   | Seed_mir.Assign (_, Seed_mir.Aggregate (Seed_mir.StructCtor (tid, fields), ops))
+                     ->
+                       Some (tid, fields, ops)
+                   | _ -> None)
+                 b.Seed_mir.statements)
+      in
+      (match f_ctor with
+       | Some (tid, fields, ops) ->
+           let index_ok =
+             Ids.Type_id.compare tid pair_tid = 0
+             && Array.length fields = 2
+             && Ids.Field_index.compare fields.(0) (Ids.Field_index.make 0) = 0
+             && Ids.Field_index.compare fields.(1) (Ids.Field_index.make 1) = 0
+           in
+           let op_is_param pos local =
+             match List.nth_opt ops pos with
+             | Some (Seed_mir.Copy p) -> p.Seed_mir.local = local
+             | _ -> false
+           in
+           let pos_ok = op_is_param 0 1 && op_is_param 1 2 in
+           if index_ok && pos_ok then
+             Printf.printf
+               "  struct-field construction: PASS (make_pair lowers the source StructLit to the StructCtor aggregate type#%d with registry indices [0;1] — `a` at position 0, `b` at 1)\n"
+               (Ids.Type_id.to_int tid)
+           else begin
+             Printf.printf "  struct-field construction: FAIL (index_ok=%b pos_ok=%b)\n"
+               index_ok pos_ok;
+             exit 1
+           end
+       | None ->
+           Printf.printf "  struct-field construction: FAIL (no StructCtor aggregate in lowered make_pair)\n";
+           exit 1);
       (* the def-alignment proof: closure_types materializes the SAME
          StructDef from the typed registry (same FieldIds) *)
       let pair_def_ok =
@@ -894,7 +1433,7 @@ end
       Printf.printf
         "  struct-field lowering: PASS (read_a/read_b carry Field projections with FieldId#%d / FieldId#%d, matching the def)\n"
         (Ids.Field_id.to_int fid_a) (Ids.Field_id.to_int fid_b);
-      (match Mir_verify.require_valid fprog with
+      (match Mir_verify.require_valid_concrete fprog with
        | Ok () ->
            Printf.printf "  struct-field MIR verify: PASS (%d functions)\n"
              (Array.length fprog.Seed_mir.functions)
@@ -1466,7 +2005,7 @@ end
         "  nested-function lowering: PASS (seed %s = callable #%d; outer's call references the same id)\n"
         inner_qname inner_cid;
       (* (c) the whole program verifies and the VM runs *)
-      (match Mir_verify.require_valid nprog with
+      (match Mir_verify.require_valid_concrete nprog with
        | Ok () ->
            Printf.printf "  nested-function MIR verify: PASS (%d functions)\n"
              (Array.length nprog.Seed_mir.functions)
@@ -1506,7 +2045,8 @@ end
                 | Error m ->
                     Printf.printf "  nested-function main returned: <inspect failed: %s>\n" m)));;
 
-       (* ── StructLit lowering proof (re-audit's ordinary-surface item: a
+       (* ── StructLit lowering proof (re-audit's ordinary-surface item —
+          the positive replacement for the retired E9037 rejection: a
           struct literal must lower to the StructCtor aggregate — the
           aggregate's type is the struct's Named type and the operand
           positions come from the typed registry (struct_fields_of's
@@ -1735,7 +2275,7 @@ end
              |];
          }
        in
-       (match Mir_verify.require_valid lprog with
+       (match Mir_verify.require_valid_concrete lprog with
         | Ok () ->
             Printf.printf "  struct-lit MIR verify: PASS (%d functions)\n"
               (Array.length lprog.Seed_mir.functions)
@@ -2087,7 +2627,7 @@ end
        end;
        Printf.printf
          "  method-call body: PASS (get_sum's lowered body reads self.a/self.b through the Field projections with the registry's FieldIds)\n";
-       (match Mir_verify.require_valid mprog with
+       (match Mir_verify.require_valid_concrete mprog with
         | Ok () ->
             Printf.printf "  method-call MIR verify: PASS (%d functions)\n"
               (Array.length mprog.Seed_mir.functions)
@@ -2423,7 +2963,7 @@ end
          }
        in
        let noc_prog = Driver.lower_closure ncctx in
-       (match Mir_verify.require_valid noc_prog with
+       (match Mir_verify.require_valid_concrete noc_prog with
         | Ok () ->
             Printf.printf "  no-closure MIR verify: PASS (%d functions)\n"
               (Array.length noc_prog.Seed_mir.functions)
