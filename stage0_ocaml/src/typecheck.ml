@@ -4594,9 +4594,6 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
                                     let eff = Access_effect.read_effect sig_.ts_params.(ai).Type_repr.pt_convention in
                                     go (ate :: acc) (eff :: effects) (i + 1) rest
                                 | None ->
-                                    (if env.state.current_item = "def bare_name_resolve" then
-                                       Printf.eprintf "DBG bn-m: callee=%s arg=%s exp=%s @%d\n" mname
-                                         (type_to_string ate.te_type) (type_to_string pt) a.Ast.ca_span.Span.start);
                                     Error
                                       (err a.Ast.ca_span
                                          (Printf.sprintf "argument %d type mismatch: expected %s, found %s (%s)"
