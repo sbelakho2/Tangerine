@@ -145,6 +145,13 @@ type state = {
   mutable sig_param_ids : (string, (string * Ids.Generic_param_id.t) list) Hashtbl.t;
   mutable next_callable_id : int;
   mutable next_impl_index : int;
+  (* the Box LangItem identity of THIS compilation (re-audit P0 #2): the
+     kernel's strict Box[T] wrapper is transparent in unify and field
+     access, and the Box nominal's tid is registered when the source
+     declaration processes.  Per-compilation state — a fresh compilation
+     starts with None and can never see another compilation's Box
+     identity. *)
+  mutable box_tid : Ids.Type_id.t option;
   mutable current_item : string;
   mutable current_item_params : Ids.Generic_param_id.t list;
   oracle : oracle;
@@ -228,11 +235,11 @@ let fresh_infer_var (st : state) : Type_repr.t =
 (* the kernel's strict Box[T] wrapper is transparent: Box[T] unifies
    with T in both directions and derefs on field/method access (the
    full compiler's Box coercions). The Box nominal's tid is registered
-   when the source declaration processes. *)
-let box_tid : Ids.Type_id.t option ref = ref None
-
-let is_box (id : Ids.Type_id.t) : bool =
-  match !box_tid with Some b -> Ids.Type_id.compare b id = 0 | None -> false
+   when the source declaration processes; the identity lives in the
+   per-compilation `state` record (state.box_tid), never a module
+   global, so one compilation cannot leak its Box into another. *)
+let is_box (bt : Ids.Type_id.t option) (id : Ids.Type_id.t) : bool =
+  match bt with Some b -> Ids.Type_id.compare b id = 0 | None -> false
 
 (* The inference-variable solution journal.  The seed's Infer_var is an
    immutable int with a PER-CALL substitution: a generic value's vars are
@@ -821,10 +828,6 @@ let builtin_constructors (st : state) (opt_p : Ids.Generic_param_id.t)
 
 (* The initial env: the compiler-registered prelude. *)
 let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
-  (* the Box wrapper identity is per-environment: the global only ever
-     tracks the CURRENT env's Box registration, never one leaked from an
-     earlier independent compilation environment in the same process *)
-  box_tid := None;
   var_journal := [];
   let st =
     {
@@ -839,6 +842,7 @@ let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
       sig_param_ids = Hashtbl.create 256;
       next_callable_id = 0;
       next_impl_index = 0;
+      box_tid = None;
       current_item = "<none>";
       current_item_params = [];
       oracle =
@@ -1346,8 +1350,8 @@ and resolve_var (subst : (Type_repr.generic_key * Type_repr.t) list) (v : int) :
   | Some t -> Some t
   | None -> Some (Type_repr.Infer_var v)
 
-let rec unify (subst : (Type_repr.generic_key * Type_repr.t) list ref) (a : Type_repr.t)
-    (b : Type_repr.t) : (unit, string) result =
+let rec unify (box_tid : Ids.Type_id.t option) (subst : (Type_repr.generic_key * Type_repr.t) list ref)
+    (a : Type_repr.t) (b : Type_repr.t) : (unit, string) result =
   let a' =
     match a with
     | Type_repr.Type_param id -> (
@@ -1401,8 +1405,8 @@ let rec unify (subst : (Type_repr.generic_key * Type_repr.t) list ref) (a : Type
           (Printf.sprintf "integer literal does not fit its adopted type %s"
              (int_name_of_kind k))
   | Type_repr.Int_literal _, Type_repr.Int_literal _ -> Ok ()
-  | Type_repr.Named (id, [| t |]), u when is_box id -> unify subst t u
-  | u, Type_repr.Named (id, [| t |]) when is_box id -> unify subst u t
+  | Type_repr.Named (id, [| t |]), u when is_box box_tid id -> unify box_tid subst t u
+  | u, Type_repr.Named (id, [| t |]) when is_box box_tid id -> unify box_tid subst u t
   | Type_repr.Infer_var v, _ ->
       if occurs_key (Type_repr.KVar v) b' then Error "recursive type"
       else begin
@@ -1438,7 +1442,7 @@ let rec unify (subst : (Type_repr.generic_key * Type_repr.t) list ref) (a : Type
       else begin
         let rec go i =
           if i >= Array.length a1 then Ok ()
-          else match unify subst a1.(i) a2.(i) with Ok () -> go (i + 1) | Error m -> Error m
+          else match unify box_tid subst a1.(i) a2.(i) with Ok () -> go (i + 1) | Error m -> Error m
         in
         go 0
       end
@@ -1447,37 +1451,37 @@ let rec unify (subst : (Type_repr.generic_key * Type_repr.t) list ref) (a : Type
       else begin
         let rec go i =
           if i >= Array.length a1 then Ok ()
-          else match unify subst a1.(i) b1.(i) with Ok () -> go (i + 1) | Error m -> Error m
+          else match unify box_tid subst a1.(i) b1.(i) with Ok () -> go (i + 1) | Error m -> Error m
         in
         go 0
       end
   | Type_repr.Fixed_array (t1, n1), Type_repr.Fixed_array (t2, n2) ->
-      if n1 <> n2 then Error "array length mismatch" else unify subst t1 t2
+      if n1 <> n2 then Error "array length mismatch" else unify box_tid subst t1 t2
   | Type_repr.Ref_internal (m1, t1), Type_repr.Ref_internal (m2, t2) ->
-      if m1 <> m2 then Error "reference mutability mismatch" else unify subst t1 t2
+      if m1 <> m2 then Error "reference mutability mismatch" else unify box_tid subst t1 t2
   | Type_repr.Raw_ptr (m1, t1), Type_repr.Raw_ptr (m2, t2) ->
-      if m1 <> m2 then Error "pointer mutability mismatch" else unify subst t1 t2
+      if m1 <> m2 then Error "pointer mutability mismatch" else unify box_tid subst t1 t2
   (* the address-of coercion: an explicit reference unifies with a raw
      pointer over the same pointee (the sync intrinsics take &x) *)
   | Type_repr.Raw_ptr (m1, t1), Type_repr.Ref_internal (_, t2)
   | Type_repr.Ref_internal (_, t1), Type_repr.Raw_ptr (m1, t2) ->
-      if m1 = Type_repr.Mutable then unify subst t1 t2
+      if m1 = Type_repr.Mutable then unify box_tid subst t1 t2
       else Error "pointer mutability mismatch"
   | Type_repr.Named (id1, [| t1 |]), Type_repr.Ref_internal (_, t2)
     when Ids.Type_id.compare id1 b_ptr = 0 || Ids.Type_id.compare id1 b_ptrmut = 0 ->
-      unify subst t1 t2
+      unify box_tid subst t1 t2
   | Type_repr.Ref_internal (_, t1), Type_repr.Named (id2, [| t2 |])
     when Ids.Type_id.compare id2 b_ptr = 0 || Ids.Type_id.compare id2 b_ptrmut = 0 ->
-      unify subst t1 t2
+      unify box_tid subst t1 t2
   | Type_repr.Function (p1, r1), Type_repr.Function (p2, r2) ->
       if Array.length p1 <> Array.length p2 then Error "function arity mismatch"
       else begin
         let rec go i =
-          if i >= Array.length p1 then unify subst r1 r2
+          if i >= Array.length p1 then unify box_tid subst r1 r2
           else if p1.(i).Type_repr.pt_convention <> p2.(i).Type_repr.pt_convention then
             Error "parameter convention mismatch"
           else
-            match unify subst p1.(i).Type_repr.pt_type p2.(i).Type_repr.pt_type with
+            match unify box_tid subst p1.(i).Type_repr.pt_type p2.(i).Type_repr.pt_type with
             | Ok () -> go (i + 1)
             | Error m -> Error m
         in
@@ -1980,7 +1984,7 @@ let rec check_pattern (env : env) (scope : scope) (ty : Type_repr.t) (p : Ast.pa
   | Ast.PatLiteral (e, _) -> (
       match check_expr env scope None e with
       | Ok te -> (
-          match unify (ref []) ty te.te_type with
+          match unify env.state.box_tid (ref []) ty te.te_type with
           | Ok () -> Ok []
           | Error m ->
               Error
@@ -2129,7 +2133,7 @@ let rec check_pattern (env : env) (scope : scope) (ty : Type_repr.t) (p : Ast.pa
       | Ast.PatLiteral (ae, _), Ast.PatLiteral (be, _) -> (
           match check_expr env scope None ae, check_expr env scope None be with
           | Ok ta, Ok tb -> (
-              match unify (ref []) ty ta.te_type, unify (ref []) ty tb.te_type with
+              match unify env.state.box_tid (ref []) ty ta.te_type, unify env.state.box_tid (ref []) ty tb.te_type with
               | Ok (), Ok () -> Ok []
               | _ -> Error (err span "range pattern does not match the subject type"))
           | _ -> Error (err span "range pattern endpoints must be literals"))
@@ -2333,7 +2337,7 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
             let subst = ref [] in
             (match expected with
              | Some exp -> (
-                 match unify subst ty exp with
+                 match unify env.state.box_tid subst ty exp with
                  | Ok () -> ()
                  | Error m -> ignore (return_unify_err span ty exp m))
              | None -> ());
@@ -2358,7 +2362,7 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
                     match check_expr env scope (Some elem_ty) x with
                     | Ok te -> (
                         let subst = ref [] in
-                        match unify subst elem_ty te.te_type with
+                        match unify env.state.box_tid subst elem_ty te.te_type with
                         | Ok () -> go (te :: acc) xs
                         | Error m ->
                             Error
@@ -2460,7 +2464,7 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
                       match check_expr env scope (Some ft') fe with
                       | Ok fte -> (
                           let s2 = ref [] in
-                          match unify s2 ft' fte.te_type with
+                          match unify env.state.box_tid s2 ft' fte.te_type with
                           | Ok () -> go (fte :: acc) fs
                           | Error m ->
                               Error
@@ -2545,7 +2549,7 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
                        | Error m -> Error m
                        | Ok fte -> (
                            let s2 = ref [] in
-                           match unify s2 payload.(i) fte.te_type with
+                           match unify env.state.box_tid s2 payload.(i) fte.te_type with
                            | Ok () -> go (fte :: acc) (i + 1) fs
                            | Error m ->
                                Error
@@ -2587,7 +2591,7 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
           | Error m -> Error m
           | Ok idxe -> (
               let subst = ref [] in
-              (match unify subst idxe.te_type (Type_repr.Int Type_repr.Int) with
+              (match unify env.state.box_tid subst idxe.te_type (Type_repr.Int Type_repr.Int) with
                | Ok () -> ()
                | Error m -> ignore (return_unify_err (Ast.expr_span idx) (Type_repr.Int Type_repr.Int) idxe.te_type m));
               match te.te_type with
@@ -2613,7 +2617,7 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
       | Error m, _ | _, Error m -> Error m
       | Ok ta, Ok tb -> (
           let subst = ref [] in
-          (match unify subst ta.te_type tb.te_type with
+          (match unify env.state.box_tid subst ta.te_type tb.te_type with
            | Ok () -> ()
            | Error m -> ignore (return_unify_err span ta.te_type tb.te_type m));
           Ok
@@ -2758,7 +2762,7 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
           | Error m -> Error m
           | Ok tr -> (
               let subst = ref [] in
-              match check_binary subst op tl.te_type tr.te_type with
+              match check_binary env.state.box_tid subst op tl.te_type tr.te_type with
               | Error m -> Error (err span m)
               | Ok rty ->
                   Ok
@@ -2837,7 +2841,7 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
                            | Error m -> Error m
                            | Ok te -> (
                                let subst = ref [] in
-                               match unify subst elem_ty te.te_type with
+                               match unify env.state.box_tid subst elem_ty te.te_type with
                                | Ok () -> go (te :: acc) xs
                                | Error m ->
                                    Error
@@ -2873,7 +2877,7 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
             | Error m -> Error m
             | Ok te -> (
                 let subst = ref [] in
-                match unify subst ptype te.te_type with
+                match unify env.state.box_tid subst ptype te.te_type with
                 | Ok () ->
                     Ok
                       {
@@ -2899,7 +2903,7 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
             | Error m -> Error m
             | Ok te -> (
                 let subst = ref [] in
-                match check_binary subst op ptype te.te_type with
+                match check_binary env.state.box_tid subst op ptype te.te_type with
                 | Error m -> Error (err span m)
                 | Ok _ ->
                     Ok
@@ -2915,7 +2919,7 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
           match inner with
           | None -> (
               let subst = ref [] in
-              match unify subst rt Type_repr.Unit with
+              match unify env.state.box_tid subst rt Type_repr.Unit with
               | Ok () -> Ok { te_type = Type_repr.Never; te_effects = [||]; te_span = span }
               | Error m ->
                   Error (err span (Printf.sprintf "return type mismatch: function returns %s (%s)" (type_to_string rt) m)))
@@ -2924,7 +2928,7 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
               | Error m -> Error m
               | Ok te -> (
                   let subst = ref [] in
-                  match unify subst rt te.te_type with
+                  match unify env.state.box_tid subst rt te.te_type with
                   | Ok () -> Ok { te_type = Type_repr.Never; te_effects = te.te_effects; te_span = span }
                   | Error m ->
                       Error
@@ -2983,7 +2987,7 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
       | Error m -> Error m
       | Ok tc -> (
           let subst = ref [] in
-          match unify subst tc.te_type Type_repr.Bool with
+          match unify env.state.box_tid subst tc.te_type Type_repr.Bool with
           | Ok () ->
               check_block env { scope with loop_depth = scope.loop_depth + 1 } (Some Type_repr.Unit)
                 w.Ast.wh_body w.Ast.wh_span
@@ -3051,7 +3055,7 @@ and check_stmt (env : env) (scope : scope) (s : Ast.stmt) : (scope, string) resu
               | Error m -> Error m
               | Ok te -> (
                   let subst = ref [] in
-                  (match unify subst ty te.te_type with
+                  (match unify env.state.box_tid subst ty te.te_type with
                    | Ok () -> ()
                    | Error m ->
                        ignore
@@ -3113,7 +3117,7 @@ and check_if (env : env) (scope : scope) (_expected : Type_repr.t option) (i : A
         match check_expr env scope (Some Type_repr.Bool) i.Ast.if_condition with
         | Ok tc -> (
             let subst = ref [] in
-            match unify subst tc.te_type Type_repr.Bool with
+            match unify env.state.box_tid subst tc.te_type Type_repr.Bool with
             | Ok () -> Ok tc.te_effects
             | Error m ->
                 ignore (return_unify_err (Ast.expr_span i.Ast.if_condition) Type_repr.Bool tc.te_type m);
@@ -3175,7 +3179,7 @@ and check_if (env : env) (scope : scope) (_expected : Type_repr.t option) (i : A
       | Error m -> Error m
       | Ok te -> (
           let subst = ref [] in
-          (match unify subst tt.te_type te.te_type with
+          (match unify env.state.box_tid subst tt.te_type te.te_type with
            | Ok () -> ()
            | Error m -> ignore (return_unify_err i.Ast.if_span tt.te_type te.te_type m));
           (* the if's type adopts the concrete integer kind when one arm
@@ -3225,7 +3229,7 @@ and check_match (env : env) (scope : scope) (expected : Type_repr.t option) (m :
                   match acc with
                   | [] -> go (te :: acc) rest
                   | first :: _ -> (
-                      match unify subst first.te_type te.te_type with
+                      match unify env.state.box_tid subst first.te_type te.te_type with
                       | Ok () -> go (te :: acc) rest
                       | Error m ->
                           (* statement-position matches discard each arm's
@@ -3310,7 +3314,7 @@ and check_closure (env : env) (scope : scope) (expected : Type_repr.t option)
   let subst = ref [] in
   (match ret_ty with
    | Some r -> (
-       match unify subst r body.te_type with
+       match unify env.state.box_tid subst r body.te_type with
        | Ok () -> ()
        | Error m ->
            ignore
@@ -3340,18 +3344,19 @@ and check_closure (env : env) (scope : scope) (expected : Type_repr.t option)
 
 and return_ret_err m = Error m
 
-and check_binary (subst : (Type_repr.generic_key * Type_repr.t) list ref) (op : Ast.binary_op)
+and check_binary (box_tid : Ids.Type_id.t option)
+    (subst : (Type_repr.generic_key * Type_repr.t) list ref) (op : Ast.binary_op)
     (lt : Type_repr.t) (rt : Type_repr.t) : (Type_repr.t, string) result =
   match op with
   | Ast.BAnd | Ast.BOr -> (
-      match unify subst lt Type_repr.Bool with
+      match unify box_tid subst lt Type_repr.Bool with
       | Ok () -> (
-          match unify subst rt Type_repr.Bool with
+          match unify box_tid subst rt Type_repr.Bool with
           | Ok () -> Ok Type_repr.Bool
           | Error m -> Error m)
       | Error m -> Error m)
   | Ast.Eq | Ast.NotEq | Ast.Lt | Ast.LtEq | Ast.Gt | Ast.GtEq -> (
-      match unify subst lt rt with
+      match unify box_tid subst lt rt with
       | Ok () -> Ok Type_repr.Bool
       | Error m -> Error m)
   | Ast.Add | Ast.Sub | Ast.Mul | Ast.Div | Ast.Mod -> (
@@ -3493,7 +3498,7 @@ and check_field (env : env) (_scope : scope) (span : Span.span) (base : typed_ex
                (Printf.sprintf "cannot project `.%s` from %s" fname (type_to_string base.te_type))))
   | _ -> (
       match base.te_type with
-      | Type_repr.Named (id, [| inner |]) when is_box id -> (
+      | Type_repr.Named (id, [| inner |]) when is_box env.state.box_tid id -> (
           (* a field on a Box derefs the boxed value (`expr.kind` on a
              Box[Expr]) UNLESS the Box declares the field itself
              (`self.ptr` inside impl Box) *)
@@ -3565,7 +3570,7 @@ and check_name (env : env) (scope : scope) (expected : Type_repr.t option) (n : 
        | Some exp -> (
            (* the expected's params bind to the local's type: a stale
               signature param must not rewrite the local's own bound param *)
-           match unify subst exp t with
+           match unify env.state.box_tid subst exp t with
            | Ok () -> ()
            | Error m -> ignore (return_unify_err span t exp m))
        | None -> ());
@@ -3599,7 +3604,7 @@ and check_name (env : env) (scope : scope) (expected : Type_repr.t option) (n : 
                let subst = ref [] in
                (match expected with
                 | Some exp -> (
-                    match unify subst t exp with
+                    match unify env.state.box_tid subst t exp with
                     | Ok () -> ()
                     | Error m -> ignore (return_unify_err span t exp m))
                 | None -> ());
@@ -3629,7 +3634,7 @@ and check_name (env : env) (scope : scope) (expected : Type_repr.t option) (n : 
                     let subst = ref [] in
                     (match expected with
                      | Some exp -> (
-                         match unify subst t exp with
+                         match unify env.state.box_tid subst t exp with
                          | Ok () -> ()
                          | Error m -> ignore (return_unify_err span t exp m))
                      | None -> ());
@@ -3649,7 +3654,7 @@ and check_name (env : env) (scope : scope) (expected : Type_repr.t option) (n : 
                              (match expected with
                               | Some (Type_repr.Function (ps, r)) ->
                                   let subst = ref [] in
-                                  (match unify subst fn_ty (Type_repr.Function (ps, r)) with
+                                  (match unify env.state.box_tid subst fn_ty (Type_repr.Function (ps, r)) with
                                    | Ok () ->
                                        Ok
                                          {
@@ -3905,7 +3910,7 @@ and check_call (env : env) (scope : scope) (expected : Type_repr.t option)
                       | Error m -> Error m
                       | Ok ate -> (
                           let subst = ref [] in
-                          match unify subst ps.(i).Type_repr.pt_type ate.te_type with
+                          match unify env.state.box_tid subst ps.(i).Type_repr.pt_type ate.te_type with
                           | Ok () -> check_args (ate :: acc) (i + 1) rest
                           | Error m ->
                               Error
@@ -3950,7 +3955,7 @@ and check_closure_call (env : env) (scope : scope) (expected : Type_repr.t optio
                  to x (parity with check_call_sig) *)
               match ate.te_type with
               | Type_repr.Ref_internal (_, inner) -> (
-                  match unify subst ps.(i).Type_repr.pt_type inner with
+                  match unify env.state.box_tid subst ps.(i).Type_repr.pt_type inner with
                   | Ok () -> check_args (ate :: acc) (i + 1) rest
                   | Error m ->
                       Error
@@ -3958,7 +3963,7 @@ and check_closure_call (env : env) (scope : scope) (expected : Type_repr.t optio
                            (Printf.sprintf "argument %d type mismatch: expected %s (%s)"
                               (i + 1) (type_to_string ps.(i).Type_repr.pt_type) m)))
               | _ -> (
-                  match unify subst ps.(i).Type_repr.pt_type ate.te_type with
+                  match unify env.state.box_tid subst ps.(i).Type_repr.pt_type ate.te_type with
                   | Ok () -> check_args (ate :: acc) (i + 1) rest
                   | Error m ->
                       Error
@@ -4047,7 +4052,7 @@ and check_call_sig (env : env) (scope : scope) (expected : Type_repr.t option)
               | Error m -> Error m
               | Ok ate -> (
                   let s2 = ref [] in
-                  match unify s2 pt ate.te_type with
+                  match unify env.state.box_tid s2 pt ate.te_type with
                   | Ok () -> (
                       List.iter
                         (fun (k, v) ->
@@ -4070,7 +4075,7 @@ and check_call_sig (env : env) (scope : scope) (expected : Type_repr.t option)
                                   let rec go i =
                                     if i >= Array.length a1 then Some ()
                                     else
-                                      match unify s4 a1.(i) a2.(i) with
+                                      match unify env.state.box_tid s4 a1.(i) a2.(i) with
                                       | Ok () -> go (i + 1)
                                       | Error _ -> None
                                   in
@@ -4109,7 +4114,7 @@ and check_call_sig (env : env) (scope : scope) (expected : Type_repr.t option)
                       match ate.te_type with
                       | Type_repr.Ref_internal (_, inner) -> (
                           let s3 = ref [] in
-                          match unify s3 pt inner with
+                          match unify env.state.box_tid s3 pt inner with
                           | Ok () ->
                               List.iter
                                 (fun (k, v) ->
@@ -4141,7 +4146,7 @@ and check_call_sig (env : env) (scope : scope) (expected : Type_repr.t option)
       let s3 = ref [] in
       (match expected with
        | Some exp -> (
-           match unify s3 (substitute_fixpoint !subst sig_.ts_return) exp with
+           match unify env.state.box_tid s3 (substitute_fixpoint !subst sig_.ts_return) exp with
            | Ok () -> ()
            | Error _ -> (
                (* nominal/alias fallback: `Vec` and the kernel's `Array` are
@@ -4181,7 +4186,7 @@ and check_call_sig (env : env) (scope : scope) (expected : Type_repr.t option)
                      end)
                  | _ -> (
                      let s5 = ref [] in
-                     match unify s5 a b with
+                     match unify env.state.box_tid s5 a b with
                      | Ok () ->
                          List.iter
                            (fun (k, v) -> if not (List.mem_assoc k !s3) then s3 := (k, v) :: !s3)
@@ -4394,7 +4399,7 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
                       | Error m -> Error m
                       | Ok ate -> (
                           let subst = ref [] in
-                          match unify subst ps.(i).Type_repr.pt_type ate.te_type with
+                          match unify env.state.box_tid subst ps.(i).Type_repr.pt_type ate.te_type with
                           | Ok () -> check_args (ate :: acc) (i + 1) rest
                           | Error m ->
                               Error
@@ -4457,9 +4462,9 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
             let self_ty = sig_.ts_params.(0).Type_repr.pt_type in
             let* () =
               match owner_ty, self_ty with
-              | Type_repr.Fixed_array (t, _), Type_repr.Named (_, [| p |]) -> unify subst p t
+              | Type_repr.Fixed_array (t, _), Type_repr.Named (_, [| p |]) -> unify env.state.box_tid subst p t
               | _ -> (
-                  match unify subst self_ty owner_ty with
+                  match unify env.state.box_tid subst self_ty owner_ty with
                   | Ok () -> Ok ()
                   | Error _ -> (
                       (* a user type that replaced a builtin keeps the
@@ -4490,7 +4495,7 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
                                   let rec go i =
                                     if i >= Array.length a1 then Some ()
                                     else
-                                      match unify s4 a1.(i) a2.(i) with
+                                      match unify env.state.box_tid s4 a1.(i) a2.(i) with
                                       | Ok () -> go (i + 1)
                                       | Error _ -> None
                                   in
@@ -4508,13 +4513,13 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
                       let deref_coerce () =
                         match owner_ty with
                         | Type_repr.Ref_internal (_, inner) -> (
-                            match unify subst self_ty inner with
+                            match unify env.state.box_tid subst self_ty inner with
                             | Ok () -> Some ()
                             | Error _ -> None)
                         | _ -> (
                             match self_ty with
                             | Type_repr.Ref_internal (_, inner) -> (
-                                match unify subst inner owner_ty with
+                                match unify env.state.box_tid subst inner owner_ty with
                                 | Ok () -> Some ()
                                 | Error _ -> None)
                             | _ -> None)
@@ -4562,7 +4567,7 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
                         | Error m -> Error m
                         | Ok ate -> (
                             let s2 = ref [] in
-                            match unify s2 pt ate.te_type with
+                            match unify env.state.box_tid s2 pt ate.te_type with
                             | Ok () -> (
                                 List.iter
                                   (fun (k, v) ->
@@ -4577,7 +4582,7 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
                                   match ate.te_type with
                                   | Type_repr.Ref_internal (_, inner) -> (
                                       let s3 = ref [] in
-                                      match unify s3 pt inner with
+                                      match unify env.state.box_tid s3 pt inner with
                                       | Ok () ->
                                           List.iter
                                             (fun (k, v) ->
@@ -4610,7 +4615,7 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
                 let s3 = ref [] in
                 (match expected with
                  | Some exp -> (
-                     match unify s3 (substitute_fixpoint !subst sig_.ts_return) exp with
+                     match unify env.state.box_tid s3 (substitute_fixpoint !subst sig_.ts_return) exp with
                      | Ok () -> ()
                      | Error _ -> ())
                  | None -> ());
@@ -4755,7 +4760,7 @@ let rec check_function_body (env : env) (extra_tp_bounds : (string * string list
         match d.fn_body with
         | Ast.FnBlock _ -> Ok ()
         | _ -> (
-            match unify subst Type_repr.Unit body.te_type with
+            match unify env.state.box_tid subst Type_repr.Unit body.te_type with
             | Ok () -> Ok ()
             | Error m ->
                 Error
@@ -4763,7 +4768,7 @@ let rec check_function_body (env : env) (extra_tp_bounds : (string * string list
                      (Printf.sprintf "function body type mismatch: expected %s, found %s (%s)"
                         (type_to_string sig_.ts_return) (type_to_string body.te_type) m))))
     | _ -> (
-        match unify subst sig_.ts_return body.te_type with
+        match unify env.state.box_tid subst sig_.ts_return body.te_type with
         | Ok () -> Ok ()
         | Error m ->
             Error
@@ -5258,7 +5263,7 @@ and register_item (env : env) (item : Ast.item) : (env, string) result =
               | Some t -> t
               | None -> fresh_type_id env.state
             in
-            (if d.s_name = "Box" then box_tid := Some tid);
+            (if d.s_name = "Box" then env.state.box_tid <- Some tid);
             let param_tys = Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param (p)) params) in
             let nom : nominal =
               { nom_kind = `Struct; nom_params = params; nom_fields = []; nom_variants = []; nom_where = []; nom_field_ids = []; nom_variant_ids = [] }
@@ -5661,7 +5666,7 @@ let rec register_headers (env : env) (acc : string list) = function
               | Some t -> t
               | None -> fresh_type_id env.state
             in
-            (if d.s_name = "Box" then box_tid := Some tid);
+            (if d.s_name = "Box" then env.state.box_tid <- Some tid);
             let param_tys = Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param (p)) params) in
             let nom : nominal =
               { nom_kind = `Struct; nom_params = params; nom_fields = []; nom_variants = []; nom_where = []; nom_field_ids = []; nom_variant_ids = [] }

@@ -55,3 +55,8 @@ val resolve_method : resolved_program -> Ids.Module_id.t -> string -> string -> 
 (* Module-qualified path lookup (std::core::Option,
    geometry::shapes::Circle, Option::Some). *)
 val resolve_qualified : resolved_program -> Ids.Module_id.t -> string list -> path_target resolution
+
+(* The compatibility-fallback activation count of the resolution (re-audit
+   P0 #1): imports that resolved only through the flat/global unique-name
+   recovery.  Zero = the closure is strict-clean (per-module authority). *)
+val flat_fallback_activations : resolved_program -> int

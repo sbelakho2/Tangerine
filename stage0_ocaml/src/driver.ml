@@ -31,11 +31,14 @@ Commands:
     --manifest FILE
     --target TRIPLE
     --entry NAME
+    --strict                Resolve the closure in strict mode (per-module
+                            authority; no flat unique-name recovery)
   compile ...               Bootstrap compile (interprets the compiler)
     --repo-root ROOT
     --manifest FILE
     --target TRIPLE
     --entry NAME
+    --strict                Resolve the closure in strict mode
     -- <kernel args...>     Passed verbatim to the kernel's bootstrap_main
                             (e.g. -- compile hello.tg -o /tmp/out)
   version                   Print version info
@@ -767,6 +770,13 @@ type boot_opts = {
   manifest : string;
   target : string;
   entry : string option;
+  (* strict resolver mode (re-audit P0 #1): the future compiler's
+     per-module authority — the flat/global unique-name recovery is
+     disabled and every wrong-module import stays unresolved.  The
+     bootstrap closure always runs the strict audit (separate bag);
+     --strict makes the strict run the semantic pipeline, which fails
+     closed on any unresolved import. *)
+  strict : bool;
 }
 
 let default_boot_opts =
@@ -775,6 +785,7 @@ let default_boot_opts =
     manifest = "bootstrap/compiler_kernel.manifest";
     target = "aarch64-apple-darwin";
     entry = None;
+    strict = false;
   }
 
 let boot_specs =
@@ -783,6 +794,7 @@ let boot_specs =
     { name = "--manifest"; takes_value = true; apply = (fun v o -> match v with Some v -> { o with manifest = v } | None -> o) };
     { name = "--target"; takes_value = true; apply = (fun v o -> match v with Some v -> { o with target = v } | None -> o) };
     { name = "--entry"; takes_value = true; apply = (fun v o -> match v with Some v -> { o with entry = Some v } | None -> o) };
+    { name = "--strict"; takes_value = false; apply = (fun _ o -> { o with strict = true }) };
   ]
 
 (* ── @cfg elimination (audit @cfg P0) ──────────────────────────── *)
@@ -979,6 +991,55 @@ let print_subset_firewall (r : subset_result) : unit =
   Printf.printf "  SUBSET_FIREWALL = %s (%d findings across %d module(s))\n"
     (subset_firewall_status r) r.sr_total r.sr_rejected
 
+(* ── Declaration-fixpoint fingerprint (re-audit P0 #3) ───────────
+   The declaration fixpoint converges when the SEMANTIC state stops
+   changing, not when the per-module error COUNT stops decreasing.  The
+   fingerprint covers: the registered definition identities
+   (env.type_ids), the resolved declaration identities (each nominal's
+   registered fields, variants, and their resolver FieldId/VariantId
+   identities), the registered function/constructor/const signatures,
+   and the pending unresolved declaration set (the per-module error
+   reports).  Fully deterministic: every component is sorted before
+   serialization, and the canonical string is hashed with Digest. *)
+let decl_fingerprint (env : Typecheck.env) (errs_by_mod : (string, string list) Hashtbl.t) : string =
+  let buf = Buffer.create 4096 in
+  List.iter
+    (fun (name, tid) ->
+      Buffer.add_string buf (Printf.sprintf "T %s %d\n" name (Ids.Type_id.to_int tid)))
+    (List.sort compare env.Typecheck.type_ids);
+  List.iter
+    (fun (name, nom) ->
+      let fields = List.sort compare (List.map fst nom.Typecheck.nom_fields) in
+      let variants = List.sort compare (List.map fst nom.Typecheck.nom_variants) in
+      let field_ids =
+        List.sort compare (List.map Ids.Field_id.to_int nom.Typecheck.nom_field_ids)
+      in
+      let variant_ids =
+        List.sort compare (List.map Ids.Variant_id.to_int nom.Typecheck.nom_variant_ids)
+      in
+      Buffer.add_string buf
+        (Printf.sprintf "N %s f[%s] v[%s] fi[%s] vi[%s]\n" name
+           (String.concat "," fields)
+           (String.concat "," variants)
+           (String.concat "," (List.map string_of_int field_ids))
+           (String.concat "," (List.map string_of_int variant_ids))))
+    (List.sort compare env.Typecheck.nominals);
+  List.iter
+    (fun (n, _) -> Buffer.add_string buf ("F " ^ n ^ "\n"))
+    (List.sort compare env.Typecheck.functions);
+  List.iter
+    (fun (n, _) -> Buffer.add_string buf ("C " ^ n ^ "\n"))
+    (List.sort compare env.Typecheck.constructors);
+  List.iter
+    (fun (n, _) -> Buffer.add_string buf ("K " ^ n ^ "\n"))
+    (List.sort compare env.Typecheck.consts);
+  List.iter
+    (fun (k, errs) ->
+      Buffer.add_string buf
+        (Printf.sprintf "E %s [%s]\n" k (String.concat ";" (List.sort compare errs))))
+    (List.sort compare (Hashtbl.fold (fun k errs acc -> (k, errs) :: acc) errs_by_mod []));
+  Digest.to_hex (Digest.string (Buffer.contents buf))
+
 (* Everything bootstrap-check and compile share: manifest load, module
    graph, resolver, and the typecheck fixpoint (registration is
    non-fatal, so modules with forward/cyclic references retry with the
@@ -1004,8 +1065,19 @@ type closure_ctx = {
   mutable lowered_methods : int;
 }
 
-let run_closure_pipeline ~(repo_root : string) ~(manifest_path : string) ~(target : Target.t) :
-    (closure_ctx, string) result =
+(* Everything bootstrap-check and compile share: manifest load, module
+   graph, resolver, and the typecheck fixpoint (registration is
+   non-fatal, so modules with forward/cyclic references retry with the
+   growing env until no module makes progress).  The o_calls channel is
+   reset per item inside check_program, so the driver's observable typed
+   call count is sampled after every module check (a lower bound).
+
+   strict=false (the bootstrap-closure default): the resolver runs in
+   recovery mode AND the strict-mode audit runs unconditionally on a
+   separate diagnostic bag; strict=true: the strict run IS the semantic
+   pipeline (fails closed on any unresolved import). *)
+let run_closure_pipeline_impl ~(repo_root : string) ~(manifest_path : string)
+    ~(target : Target.t) ~(strict : bool) : (closure_ctx, string) result =
   match Bootstrap_manifest.load ~repo_root ~manifest_path with
   | Error m -> Error m
   | Ok manifest ->
@@ -1033,7 +1105,36 @@ let run_closure_pipeline ~(repo_root : string) ~(manifest_path : string) ~(targe
          debt. *)
       let subset_result = subset_firewall_of_graph graph in
       print_subset_firewall subset_result;
-      let resolved = Resolver.resolve manifest graph diags in
+      (* ── resolver: strict-mode audit (re-audit P0 #1) ──────────────
+         The bootstrap closure runs the resolver under strict mode (the
+         future compiler's per-module ModuleId/DefId authority: wrong
+         module -> unresolved import; the flat/global unique-name
+         recovery is disabled) on a SEPARATE diagnostic bag, and the
+         strict findings are reported.  The semantic pipeline then runs
+         in recovery mode, whose compatibility-fallback activation
+         count must be exactly zero for the closure to be strict-clean
+         (the audit's requirement before the seed swap).  With --strict
+         the strict run IS the semantic pipeline and fails closed on
+         any finding. *)
+      let resolved =
+        if strict then Resolver.resolve ~strict:true manifest graph diags
+        else begin
+          let audit_diags = Diagnostic.create_bag () in
+          ignore (Resolver.resolve ~strict:true manifest graph audit_diags);
+          let audit_findings = List.length audit_diags.Diagnostic.diagnostics in
+          if audit_findings > 0 then begin
+            Printf.printf
+              "  strict-mode audit: %d import(s) stay unresolved under strict mode (the flat unique-name recovery would mask them):\n"
+              audit_findings;
+            prerr_string (Diagnostic.render (Module_graph.source_map graph) audit_diags);
+            prerr_newline ()
+          end
+          else
+            Printf.printf
+              "  strict-mode audit: CLEAN — the closure resolves under per-module authority (strict-mode diagnostics: 0)\n";
+          Resolver.resolve manifest graph diags
+        end
+      in
       Printf.printf "  resolver: %d expr defs, %d type defs, %d field defs, %d variant defs, %d call candidates\n"
         (List.length resolved.Resolver.expr_defs)
         (List.length resolved.Resolver.type_defs)
@@ -1081,25 +1182,22 @@ let run_closure_pipeline ~(repo_root : string) ~(manifest_path : string) ~(targe
                   decl_pass env' rest)
         in
         let env_after_decls =
+          (* convergence = the semantic fingerprint stops changing
+             (registered definition identities + resolved declaration
+             identities + the pending unresolved set) — NOT the
+             per-module error count; capped at 8 rounds *)
           let rec fixpoint env =
             incr decl_rounds;
-            let before = Hashtbl.copy errs_by_mod in
+            let before = decl_fingerprint env errs_by_mod in
             let env' = decl_pass env nodes in
-            (* keep re-declaring while the declaration error surface
-               shrinks (new resolutions appear), capped like the old
-               retry loop but with idempotent registration *)
-            let improved =
-              Hashtbl.fold
-                (fun k errs acc ->
-                  match Hashtbl.find_opt before k with
-                  | Some old -> acc || List.length errs < List.length old
-                  | None -> acc || errs <> [])
-                errs_by_mod false
-            in
-            if improved && !decl_rounds < 8 then fixpoint env' else env'
+            let after = decl_fingerprint env' errs_by_mod in
+            if after <> before && !decl_rounds < 8 then fixpoint env' else env'
           in
           fixpoint !env
         in
+        Printf.printf
+          "  decl fixpoint: %d round(s); converged on a stable semantic fingerprint (registered type identities + resolved nominal declarations + pending unresolved declaration set)\n"
+          !decl_rounds;
         let rec body_pass env = function
           | [] -> env
           | node :: rest -> (
@@ -1115,6 +1213,15 @@ let run_closure_pipeline ~(repo_root : string) ~(manifest_path : string) ~(targe
                   body_pass env' rest)
         in
         env := body_pass env_after_decls nodes;
+        (* final-state report (re-audit P0 #1): the compatibility-fallback
+           activation count of the closure's resolution — exactly zero
+           means the closure is strict-clean (per-module authority) *)
+        let fallback_activations = Resolver.flat_fallback_activations resolved in
+        Printf.printf "  strict-mode status: %d compatibility-fallback activation(s) — %s\n"
+          fallback_activations
+          (if fallback_activations = 0 then
+            "closure is strict-clean (per-module authority)"
+          else "closure needs kernel-source import repairs (see the fallback sites above)");
         (* identity-handoff invariant: every method the resolver can
            resolve must carry the resolver's CallableId, not a fresh mint *)
         Printf.printf
@@ -1143,6 +1250,13 @@ let run_closure_pipeline ~(repo_root : string) ~(manifest_path : string) ~(targe
             ctx_subset = subset_result;
             lowered_methods = 0 }
       end)
+
+(* Public entry: the bootstrap-closure default — recovery-mode semantic
+   pipeline plus the unconditional strict-mode audit (selfcheck call
+   sites are unchanged). *)
+let run_closure_pipeline ~(repo_root : string) ~(manifest_path : string)
+    ~(target : Target.t) : (closure_ctx, string) result =
+  run_closure_pipeline_impl ~repo_root ~manifest_path ~target ~strict:false
 
 (* Lower every top-level free function of the closure into one Seed MIR
    program (flat namespace; shared by bootstrap-check and compile). *)
@@ -2185,7 +2299,9 @@ let cmd_bootstrap_check (args : string list) : int =
   in
   Printf.printf "TANGERINE OCAML SEED — bootstrap-check\n";
   Printf.printf "  target: %s\n" (Target.to_string target);
-  (match run_closure_pipeline ~repo_root:opts.repo_root ~manifest_path:opts.manifest ~target with
+  Printf.printf "  resolver mode: %s\n" (if opts.strict then "strict (per-module authority)" else "recovery + strict audit");
+  (match run_closure_pipeline_impl ~repo_root:opts.repo_root ~manifest_path:opts.manifest
+           ~target ~strict:opts.strict with
    | Error m ->
        prerr_endline ("error: " ^ m);
        Printf.printf "  RESULT: FAIL\n";
@@ -2352,7 +2468,9 @@ let cmd_compile (args : string list) : int =
   in
   Printf.printf "TANGERINE OCAML SEED — compile\n";
   Printf.printf "  target: %s\n" (Target.to_string target);
-  (match run_closure_pipeline ~repo_root:opts.repo_root ~manifest_path:opts.manifest ~target with
+  Printf.printf "  resolver mode: %s\n" (if opts.strict then "strict (per-module authority)" else "recovery + strict audit");
+  (match run_closure_pipeline_impl ~repo_root:opts.repo_root ~manifest_path:opts.manifest
+           ~target ~strict:opts.strict with
    | Error m ->
        prerr_endline ("error: " ^ m);
        Printf.printf "  RESULT: FAIL\n";

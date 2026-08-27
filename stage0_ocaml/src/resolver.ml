@@ -92,6 +92,9 @@ type tables = {
      zero as the kernel's imports move to per-module authority *)
   tb_strict : bool;
   tb_flat_fallback : int ref;
+  (* exact fallback sites for the strict-mode audit: (requesting module
+     path, searched name, namespace) per activation, source order *)
+  tb_flat_fallback_sites : (string * string * string) list ref;
 }
 
 type callable = CFree of Ids.Module_id.t * int | CMethod of Ids.Module_id.t * int * int
@@ -101,6 +104,7 @@ type state = {
   st_callables : callable list;   (* dense CallableId enumeration order *)
   st_strict : bool;
   st_flat_fallback : int;
+  st_flat_fallback_sites : (string * string * string) list;
 }
 
 type resolved_program = {
@@ -268,19 +272,6 @@ let bare_name_resolve (tables : tables) (m : Ids.Module_id.t) (ns : namespace) (
           | Some d -> Resolved d
           | None -> Unknown))
 
-(* Item lookup within a module's own items. *)
-let item_target (tables : tables) (m : Ids.Module_id.t) (name : string) : path_target list =
-  match scope_of tables m with
-  | None -> []
-  | Some sc ->
-      let vs =
-        match SMap.find_opt name sc.sc_own_values with Some d -> [ PTItem d ] | None -> []
-      in
-      let ts =
-        match SMap.find_opt name sc.sc_own_types with Some d -> [ PTItem d ] | None -> []
-      in
-      vs @ ts
-
 (* Variant lookup: enum (own item of m) + variant name. *)
 let variant_target (tables : tables) (m : Ids.Module_id.t) (enum_name : string)
     (variant_name : string) : path_target list =
@@ -311,7 +302,8 @@ let module_path_of (graph : Module_graph.t) (m : Ids.Module_id.t) : string list 
    compiler mode's per-module ModuleId/DefId authority) it is disabled:
    wrong module -> unresolved import.  Every activation is counted so
    the closure can trend the count to zero. *)
-let global_unique (tables : tables) (name : string) (ns : namespace) : import_target option =
+let global_unique (tables : tables) (req_path : string list) (name : string) (ns : namespace) :
+    import_target option =
   if tables.tb_strict then None
   else
     let found = ref [] in
@@ -329,11 +321,81 @@ let global_unique (tables : tables) (name : string) (ns : namespace) : import_ta
     match List.rev !found with
     | [ def ] ->
         incr tables.tb_flat_fallback;
+        tables.tb_flat_fallback_sites :=
+          (join_path req_path, name, match ns with Value -> "value" | Type -> "type")
+          :: !(tables.tb_flat_fallback_sites);
         Some (ITItem def)
     | _ -> None
 
-let item_or_child (tables : tables) (mid : Ids.Module_id.t) (name : string) : import_target option =
+(* ── Re-export resolution (re-audit P0 #1) ───────────────────────
+   A module's own use-imports make its imported names visible as
+   members of the module for qualified paths (`tg_compiler::types::
+   TypeId` where types.tg does `use tg_compiler::ids::{TypeId, ...}`),
+   and the kernel's cross-module references rely on this model (the
+   flat/global unique-name recovery used to absorb it).  The scan is
+   ON-DEMAND and order-insensitive: the candidate's path resolves
+   through the module graph and its members through phase-1 own-item
+   scopes, so a re-export binding is found even when the re-exporting
+   module's own imports are processed later in manifest order.  The
+   depth cap bounds re-export chains (the kernel's are depth 2). *)
+
+(* Item lookup within a module's own items, then its re-exports. *)
+let rec item_target (graph : Module_graph.t) (tables : tables) (depth : int)
+    (m : Ids.Module_id.t) (name : string) : path_target list =
+  match scope_of tables m with
+  | None -> []
+  | Some sc ->
+      let vs =
+        match SMap.find_opt name sc.sc_own_values with Some d -> [ PTItem d ] | None -> []
+      in
+      let ts =
+        match SMap.find_opt name sc.sc_own_types with Some d -> [ PTItem d ] | None -> []
+      in
+      match vs @ ts with
+      | _ :: _ as own -> own
+      | [] -> List.map (fun d -> PTItem d) (dedup_defs (reexport_scan graph tables (depth + 1) m name))
+
+and reexport_scan (graph : Module_graph.t) (tables : tables) (depth : int)
+    (m : Ids.Module_id.t) (name : string) : Ids.def_id list =
+  if depth > 8 then []
+  else
+    match Module_graph.find_module_by_id graph m with
+    | None -> []
+    | Some node ->
+        let cands = ref [] in
+        List.iter
+          (fun it ->
+            match it.Ast.kind with
+            | Ast.UseDecl u -> (
+                let add (segs : string list) (iname : string) =
+                  if iname = name then
+                    match resolve_path_target graph tables m (depth + 1) segs with
+                    | Resolved (PTModule mid) -> (
+                        match item_or_child graph tables (depth + 1) mid iname with
+                        | Some (ITItem def) -> cands := def :: !cands
+                        | _ -> ())
+                    | _ -> ()
+                in
+                match u.Ast.u_path with
+                | Ast.UseSimple segs -> add segs (last_seg segs)
+                | Ast.UseAliased (segs, alias) -> add segs alias
+                | Ast.UseGroup (segs, uitems) ->
+                    List.iter
+                      (fun ui ->
+                        let iname =
+                          match ui.Ast.ui_alias with Some a -> a | None -> ui.Ast.ui_name
+                        in
+                        add segs iname)
+                      uitems
+                | Ast.UseGlob _ -> ())
+            | _ -> ())
+          node.Module_graph.node_program.Ast.items;
+        List.rev !cands
+
+and item_or_child (graph : Module_graph.t) (tables : tables) (depth : int)
+    (mid : Ids.Module_id.t) (name : string) : import_target option =
   let mod_path = match IntMap.find_opt (Ids.Module_id.to_int mid) tables.tb_module_paths with Some p -> p | None -> [] in
+  let req_path = mod_path in
   let builtin_here = is_builtin_type name || builtin_module_symbol mod_path name in
   match scope_of tables mid with
   | None -> if builtin_here then Some ITBuiltin else None
@@ -349,14 +411,19 @@ let item_or_child (tables : tables) (mid : Ids.Module_id.t) (name : string) : im
               | None ->
                   if builtin_here then Some ITBuiltin
                   else (
-                    match global_unique tables name Type with
-                    | Some t -> Some t
-                    | None -> global_unique tables name Value))))
+                    match dedup_defs (reexport_scan graph tables (depth + 1) mid name) with
+                    | [ d ] -> Some (ITItem d)
+                    | _ -> (
+                        match global_unique tables req_path name Type with
+                        | Some t -> Some t
+                        | None -> global_unique tables req_path name Value)))))
 
 (* Targets a concrete path can name: the path is a module, or a module
    prefix followed by one item name, or a module prefix followed by an
-   enum name and a variant name. *)
-let targets_of_path (graph : Module_graph.t) (tables : tables) (p : string list) : path_target list =
+   enum name and a variant name.  req_path is the requesting module's
+   logical path, used to attribute flat-fallback activations. *)
+and targets_of_path (graph : Module_graph.t) (tables : tables) (req_path : string list)
+    (depth : int) (p : string list) : path_target list =
   match Module_graph.find_module_by_path graph p with
   | Some n -> [ PTModule n.Module_graph.node_id ]
   | None -> (
@@ -373,9 +440,9 @@ let targets_of_path (graph : Module_graph.t) (tables : tables) (p : string list)
               | Some mnode -> (
                   match rest with
                   | [ item_name ] -> (
-                      match item_target tables mnode.Module_graph.node_id item_name with
+                      match item_target graph tables depth mnode.Module_graph.node_id item_name with
                       | [] -> (
-                          match global_unique tables item_name Type with
+                          match global_unique tables req_path item_name Type with
                           | Some (ITItem def) -> [ PTItem def ]
                           | _ -> walk (k - 1))
                       | ts -> ts)
@@ -391,8 +458,8 @@ let targets_of_path (graph : Module_graph.t) (tables : tables) (p : string list)
    enumerated deterministically: crate-relative, super-relative, the
    current module's own subtree, absolute paths, then module-import
    bindings of the first segment. *)
-let resolve_path_target (graph : Module_graph.t) (tables : tables) (m : Ids.Module_id.t)
-    (segs : string list) : path_target resolution =
+and resolve_path_target (graph : Module_graph.t) (tables : tables) (m : Ids.Module_id.t)
+    (depth : int) (segs : string list) : path_target resolution =
   match segs with
   | [] -> Unknown
   | [ single ] -> (
@@ -455,7 +522,7 @@ let resolve_path_target (graph : Module_graph.t) (tables : tables) (m : Ids.Modu
         (fun p ->
           List.iter
             (fun t -> if not (List.mem t !targets) then targets := t :: !targets)
-            (targets_of_path graph tables p))
+            (targets_of_path graph tables current_path depth p))
         !cands;
       (match List.rev !targets with
        | [] -> (
@@ -501,6 +568,7 @@ type st = {
   mutable next_callable : int;
   mutable strict_mode : bool;
   flat_fallback : int ref;
+  flat_fallback_sites : (string * string * string) list ref;
 }
 
 let tables_of (st : st) : tables =
@@ -513,6 +581,7 @@ let tables_of (st : st) : tables =
     tb_module_paths = st.module_paths;
     tb_strict = st.strict_mode;
     tb_flat_fallback = st.flat_fallback;
+    tb_flat_fallback_sites = st.flat_fallback_sites;
   }
 
 (* Register a value definition (first-wins per module). *)
@@ -653,7 +722,7 @@ let add_import_binding (sc : scope) (b : import_binding) : scope =
 let bind_import (graph : Module_graph.t) (diags : Diagnostic.bag)
     (tables : tables) (m : Ids.Module_id.t) (sc : scope) (name : string) (segs : string list)
     (span : Span.span) : scope =
-  match resolve_path_target graph tables m segs with
+  match resolve_path_target graph tables m 0 segs with
   | Resolved (PTModule mid) ->
       add_import_binding sc { ib_name = name; ib_target = ITModule mid; ib_ns = None; ib_span = span }
   | Resolved (PTItem def) ->
@@ -694,14 +763,14 @@ let phase2_node (st : st) (graph : Module_graph.t) (diags : Diagnostic.bag)
             | Ast.UseSimple segs -> bind_import graph diags tables m sc (last_seg segs) segs span
             | Ast.UseAliased (segs, alias) -> bind_import graph diags tables m sc alias segs span
             | Ast.UseGroup (segs, uitems) -> (
-                match resolve_path_target graph tables m segs with
+                match resolve_path_target graph tables m 0 segs with
                 | Resolved (PTModule mid) ->
                     List.fold_left
                       (fun sc ui ->
                         let name =
                           match ui.Ast.ui_alias with Some a -> a | None -> ui.Ast.ui_name
                         in
-                        match item_or_child tables mid ui.Ast.ui_name with
+                        match item_or_child graph tables 0 mid ui.Ast.ui_name with
                         | Some (ITItem def) ->
                             add_import_binding sc
                               { ib_name = name;
@@ -734,7 +803,7 @@ let phase2_node (st : st) (graph : Module_graph.t) (diags : Diagnostic.bag)
                       span;
                     sc)
             | Ast.UseGlob segs -> (
-                match resolve_path_target graph tables m segs with
+                match resolve_path_target graph tables m 0 segs with
                 | Resolved (PTModule mid) ->
                     { sc with sc_globs = { gi_module = mid; gi_span = span } :: sc.sc_globs }
                 | Resolved _ ->
@@ -762,6 +831,11 @@ let phase2_node (st : st) (graph : Module_graph.t) (diags : Diagnostic.bag)
 let phase3_node (st : st) (diags : Diagnostic.bag) (n : Module_graph.module_node) : unit =
   let m = n.Module_graph.node_id in
   let tables = tables_of st in
+  let req_path =
+    match IntMap.find_opt (Ids.Module_id.to_int m) tables.tb_module_paths with
+    | Some p -> p
+    | None -> []
+  in
   List.iter
     (fun (i, it) ->
       match it.Ast.kind with
@@ -776,7 +850,7 @@ let phase3_node (st : st) (diags : Diagnostic.bag) (n : Module_graph.module_node
               match bare_name_resolve tables m Type name with
               | Resolved def -> Some def
               | Unknown -> (
-                  match global_unique tables name Type with
+                  match global_unique tables req_path name Type with
                   | Some (ITItem def) -> Some def
                   | _ -> None)
               | Ambiguous _ -> None
@@ -877,6 +951,7 @@ let resolve ?(strict = false) (manifest : Bootstrap_manifest.t) (graph : Module_
       next_callable = 0;
       strict_mode = strict;
       flat_fallback = ref 0;
+      flat_fallback_sites = ref [];
     }
   in
   iter_nodes manifest graph (phase1_node st graph);
@@ -886,6 +961,12 @@ let resolve ?(strict = false) (manifest : Bootstrap_manifest.t) (graph : Module_
   let fallback = !(st.flat_fallback) in
   Printf.printf "  resolver flat-name fallback activations: %d (strict mode: %s)\n" fallback
     (if strict then "ON" else "off");
+  if not strict && fallback > 0 then begin
+    Printf.printf "  resolver flat-name fallback sites (imports that only resolve via the global unique-name search):\n";
+    List.rev !(st.flat_fallback_sites)
+    |> List.iter (fun (req, name, ns) ->
+           Printf.printf "    %s -> %s (%s)\n" req name ns)
+  end;
   {
     graph;
     expr_defs = List.rev st.expr_defs;
@@ -893,7 +974,12 @@ let resolve ?(strict = false) (manifest : Bootstrap_manifest.t) (graph : Module_
     field_defs = List.rev st.field_defs;
     variant_defs = List.rev st.variant_defs;
     call_candidates = List.rev st.call_candidates;
-    state = { st_tables = tables; st_callables = List.rev st.callables; st_strict = strict; st_flat_fallback = fallback };
+    state =
+      { st_tables = tables;
+        st_callables = List.rev st.callables;
+        st_strict = strict;
+        st_flat_fallback = fallback;
+        st_flat_fallback_sites = List.rev !(st.flat_fallback_sites) };
   }
 
 (* ── Public lookups ─────────────────────────────────────────── *)
@@ -947,4 +1033,12 @@ let resolve_method (rp : resolved_program) (m : Ids.Module_id.t) (target_type : 
 
 let resolve_qualified (rp : resolved_program) (m : Ids.Module_id.t) (segs : string list) :
     path_target resolution =
-  resolve_path_target rp.graph rp.state.st_tables m segs
+  resolve_path_target rp.graph rp.state.st_tables m 0 segs
+
+(* The compatibility-fallback activation count of the resolution (re-audit
+   P0 #1): how many imports resolved only through the flat/global
+   unique-name recovery.  Exactly zero means the closure is strict-clean
+   (per-module authority); every nonzero activation is a strict-mode
+   E2001 finding.  In strict mode the recovery is disabled, so the count
+   is always zero there. *)
+let flat_fallback_activations (rp : resolved_program) : int = rp.state.st_flat_fallback
