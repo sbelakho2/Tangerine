@@ -3904,9 +3904,6 @@ and check_call (env : env) (scope : scope) (expected : Type_repr.t option)
                           match unify subst ps.(i).Type_repr.pt_type ate.te_type with
                           | Ok () -> check_args (ate :: acc) (i + 1) rest
                           | Error m ->
-                              (if env.state.current_item = "def merge_frames" then
-                                 Printf.eprintf "DBG mf-arg1: arg=%s exp=%s @%d\n" (type_to_string ate.te_type)
-                                   (type_to_string ps.(i).Type_repr.pt_type) a.Ast.ca_span.Span.start);
                               Error
                                 (err a.Ast.ca_span
                                    (Printf.sprintf "argument %d type mismatch: expected %s (%s)"
@@ -4396,9 +4393,6 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
                           match unify subst ps.(i).Type_repr.pt_type ate.te_type with
                           | Ok () -> check_args (ate :: acc) (i + 1) rest
                           | Error m ->
-                              (if env.state.current_item = "def merge_frames" then
-                                 Printf.eprintf "DBG mf-arg1: arg=%s exp=%s @%d\n" (type_to_string ate.te_type)
-                                   (type_to_string ps.(i).Type_repr.pt_type) a.Ast.ca_span.Span.start);
                               Error
                                 (err a.Ast.ca_span
                                    (Printf.sprintf "argument %d type mismatch: expected %s (%s)"
