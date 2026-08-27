@@ -65,8 +65,8 @@ let baseline_typecheck_debt : Debt_report.t =
         ("duplicate_decl", 0);
         ("other", 0);
       ];
-    total = 123;
-    primaries = 67;
+    total = 90;
+    primaries = 34;
     secondaries = 56;
   }
 
