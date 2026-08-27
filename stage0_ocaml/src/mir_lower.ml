@@ -57,7 +57,16 @@
      and a Typecheck `consts` registry), but the Mir_lower API carries
      no const/static table and the driver passes `statics = [||]`, so
      names that resolve only to consts/statics fail closed at lowering
-     with Seed_bug.  See the statics TODO at the bottom of the file. *)
+     with Seed_bug.  See the statics TODO at the bottom of the file.
+
+   - Closure (Ast.Closure): NOT lowered — the seed VM can construct
+     closure objects (ClosureAgg -> Vm_value.Closure) but has no
+     closure-CALL path (Seed_mir.Call dispatches compile-time instances
+     only), so the Closure branch fails closed with a precise Seed_bug
+     and Subset rejects the form (E9040).  The typechecker records no
+     closure identity/captures in the typed registry (its check_closure
+     computes the captured-name list but discards it), so the
+     capture-channel is the next step when the VM's closure model lands. *)
 
 exception Seed_bug of string
 
@@ -1320,6 +1329,19 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
                           Array.init reg_len (fun i -> Ids.Field_index.make i) ),
                       ops ) ));
            (copy_place st (cur_place st id), rt)))
+  | Ast.Closure _ ->
+      (* Closure disposition (re-audit lowering-surface item): the seed
+         VM CONSTRUCTS closure objects (ClosureAgg -> Vm_value.Closure as
+         the Tuple [Function; Tuple env] shape; see seed_mir.ml's header)
+         but has NO closure-CALL path — Seed_mir.Call's callee is a
+         compile-time function instance (User/Intrinsic/Extern) only,
+         never a runtime closure VALUE.  A lowered closure could be built
+         but never invoked, so the honest disposition is to fail closed
+         here with the reason; Subset rejects the form up front (E9040)
+         so this branch is unreachable through the driver.  NEVER a
+         silent Unit. *)
+      seed_bug
+        "closure expressions are not lowerable: the seed VM has closure objects (ClosureAgg -> Vm_value.Closure, Tuple [Function; Tuple env]) but no closure-CALL path (Seed_mir.Call dispatches compile-time function instances only, never a runtime closure value); lift the closure to a named function"
   | other -> seed_bug "unhandled supported expression form: %s" (expr_form_name other)
 
 and int_kind_of (t : Type_repr.t) : Type_repr.int_kind =

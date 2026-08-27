@@ -162,6 +162,10 @@ type env = {
   impls : Trait_solver.env;
   current_self : Type_repr.t option;
   current_return : Type_repr.t option;
+  (* the impl block whose methods are being checked (its target name);
+     scoped to impl method bodies, never global — method-lookup candidate
+     preference uses it to disambiguate shared-LangItem aliases *)
+  impl_target : string option;
   (* extended registries (the six fields above are the core contract) *)
   type_ids : (string * Ids.Type_id.t) list;
   type_names : (Ids.Type_id.t * string) list;
@@ -229,6 +233,18 @@ let box_tid : Ids.Type_id.t option ref = ref None
 
 let is_box (id : Ids.Type_id.t) : bool =
   match !box_tid with Some b -> Ids.Type_id.compare b id = 0 | None -> false
+
+(* The inference-variable solution journal.  The seed's Infer_var is an
+   immutable int with a PER-CALL substitution: a generic value's vars are
+   solved by one call (`let m = Map::new()` then `m.insert(k, v)`) and a
+   LATER use (`m.get(k)`) re-reads the binding's STALE unsolved vars — the
+   solution dies with the call's subst.  The kernel's checker types these
+   vars as mutable cells solved in place; the journal emulates that:
+   every unify binding is recorded, every fresh call subst starts from the
+   journal, and local reads resolve through it.  Vars are fresh per
+   instantiation (ids never reused), so a journaled solution can never
+   conflict with a later binding. *)
+let var_journal : (Type_repr.generic_key * Type_repr.t) list ref = ref []
 
 let fresh_callable_id (st : state) : Ids.Callable_id.t =
   let id = st.next_callable_id in
@@ -809,6 +825,7 @@ let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
      tracks the CURRENT env's Box registration, never one leaked from an
      earlier independent compilation environment in the same process *)
   box_tid := None;
+  var_journal := [];
   let st =
     {
       next_type_id = 100;
@@ -1199,6 +1216,20 @@ let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
   Hashtbl.replace st.sig_param_ids "nominal::Map"
     [ ("K", map_k_p); ("V", map_v_p) ];
   Hashtbl.replace st.sig_param_ids "nominal::Set" [ ("T", set_p) ];
+  (* the kernel's `PtrMut { address: ... }` literals (process.tg): the
+     builtin mutable-pointer nominal — one field `address: UInt` *)
+  let ptrm_p = fresh_param_id st in
+  let ptrm_nominal : nominal =
+    {
+      nom_kind = `Struct;
+      nom_params = [ ("T", ptrm_p) ];
+      nom_fields = [ ("address", Type_repr.Int Type_repr.UInt) ];
+      nom_variants = [];
+      nom_where = [];
+      nom_field_ids = [];
+      nom_variant_ids = [];
+    }
+  in
   {
     types;
     type_ids;
@@ -1224,7 +1255,8 @@ let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
     impls;
     current_self = None;
     current_return = None;
-    nominals = [ ("Instant", instant_nominal); ("Any", any_nominal); ("Option", opt_nominal); ("Result", res_nominal) ];
+    impl_target = None;
+    nominals = [ ("Instant", instant_nominal); ("Any", any_nominal); ("Option", opt_nominal); ("Result", res_nominal); ("PtrMut", ptrm_nominal) ];
     constructors = builtin_constructors st opt_p res_p res_e_p;
     consts = [];
     state = st;
@@ -1375,12 +1407,14 @@ let rec unify (subst : (Type_repr.generic_key * Type_repr.t) list ref) (a : Type
       if occurs_key (Type_repr.KVar v) b' then Error "recursive type"
       else begin
         subst := (Type_repr.KVar v, b') :: !subst;
+        var_journal := (Type_repr.KVar v, b') :: !var_journal;
         Ok ()
       end
   | _, Type_repr.Infer_var v ->
       if occurs_key (Type_repr.KVar v) a' then Error "recursive type"
       else begin
         subst := (Type_repr.KVar v, a') :: !subst;
+        var_journal := (Type_repr.KVar v, a') :: !var_journal;
         Ok ()
       end
   | Type_repr.Type_param pa, _ ->
@@ -2064,16 +2098,32 @@ let rec check_pattern (env : env) (scope : scope) (ty : Type_repr.t) (p : Ast.pa
           match check_pattern env scope ty b with
           | Error m -> Error m
           | Ok binds_b -> (
+              (* a name bound in BOTH alternatives must carry the same
+                 type in each; a name bound in only one alternative is
+                 scoped to that alternative (the kernel's bare-variant
+                 or-patterns — `when F32x4 | F64x2 then 128` — bind
+                 disjoint names per arm and rely on this) *)
               let mismatch =
                 List.exists
                   (fun (n, t, _) ->
                     match List.find_opt (fun (k, _, _) -> k = n) binds_b with
                     | Some (_, t2, _) -> Type_repr.compare t t2 <> 0
-                    | None -> true)
+                    | None -> false)
                   binds_a
               in
               if mismatch then Error (err span "or-pattern alternatives bind different types")
-              else Ok binds_a)))
+              else
+                (* the arm's bindings are the UNION of the alternatives'
+                   bindings: a name bound in only one alternative is
+                   scoped to the whole arm when that alternative matched
+                   (the kernel's `FnPtr(..) | Closure(.., ret, ..)`
+                   or-patterns rely on the second alternative's `ret`) *)
+                let extra =
+                  List.filter
+                    (fun (k, _, _) -> not (List.exists (fun (n, _, _) -> n = k) binds_a))
+                    binds_b
+                in
+                Ok (extra @ binds_a))))
   | Ast.RangePattern (a, b, span) -> (
       match a, b with
       | Ast.PatLiteral (ae, _), Ast.PatLiteral (be, _) -> (
@@ -2324,6 +2374,12 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
                   let ty =
                     match expected with
                     | Some (Type_repr.Fixed_array (_, n)) -> Type_repr.Fixed_array (elem_ty, n)
+                    (* an array literal where a `Vec[T]` is expected adopts
+                       the Vec form (the kernel's `[T]` params — `Vec::from
+                       ([x])`, `make_block([...])`) *)
+                    | Some (Type_repr.Named (id, [| _ |]))
+                      when Ids.Type_id.compare id b_array = 0 ->
+                        Type_repr.Named (b_array, [| elem_ty |])
                     | _ -> Type_repr.Fixed_array (elem_ty, List.length elems)
                   in
                   Ok { te_type = ty; te_effects = effects; te_span = span }))))
@@ -2433,6 +2489,91 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
                     in
                     Ok { te_type = lit_ty; te_effects = effects; te_span = span })
           end)
+      | Ok (nom, tid, args) when nom.nom_kind = `Enum -> (
+          (* the braced-VARIANT literal: `Enum::Variant { f: e, ... }` —
+             the split's member is the variant; the literal's fields bind
+             the variant's payload types positionally (the kernel writes
+             braced variant literals in declaration order, matching the
+             pattern arm's positional model) *)
+          let lit_args_r =
+            match targs with
+            | [] -> (
+                match expected with
+                | Some (Type_repr.Named (eid, eargs)) when Ids.Type_id.compare eid tid = 0 ->
+                    Ok eargs
+                | _ -> Ok args)
+            | ts ->
+                let rec go acc = function
+                  | [] -> Ok (Array.of_list (List.rev acc))
+                  | t :: rest -> (
+                      match resolve_type env scope t with
+                      | Ok rt -> go (rt :: acc) rest
+                      | Error m -> Error m)
+                in
+                go [] ts
+          in
+          let* lit_args = lit_args_r in
+          let subst =
+            List.map2 (fun (_, p) a -> (Type_repr.KParam p, a)) nom.nom_params
+              (Array.to_list lit_args)
+          in
+          let len = String.length name in
+          let rec last_pair i =
+            if i <= 0 then None
+            else if name.[i] = ':' && name.[i - 1] = ':' then Some i
+            else last_pair (i - 1)
+          in
+          let member =
+            match last_pair (len - 1) with
+            | Some i when i + 1 < len -> String.sub name (i + 1) (len - i - 1)
+            | _ -> name
+          in
+          (match List.assoc_opt member nom.nom_variants with
+           | None -> Error (err span (Printf.sprintf "unknown variant `%s` of enum `%s`" member name))
+           | Some pty -> (
+               let payload = Array.map (substitute_fixpoint subst) pty in
+               if Array.length payload <> List.length fields then
+                 Error
+                   (err span
+                      (Printf.sprintf "variant `%s` expects %d field(s), literal has %d"
+                         member (Array.length payload) (List.length fields)))
+               else begin
+                 let rec go acc i = function
+                   | [] -> Ok (List.rev acc)
+                   | (fname, fe) :: fs -> (
+                       match check_expr env scope (Some payload.(i)) fe with
+                       | Error m -> Error m
+                       | Ok fte -> (
+                           let s2 = ref [] in
+                           match unify s2 payload.(i) fte.te_type with
+                           | Ok () -> go (fte :: acc) (i + 1) fs
+                           | Error m ->
+                               Error
+                                 (err (Ast.expr_span fe)
+                                    (Printf.sprintf "field `%s` type mismatch: expected %s (%s)"
+                                       fname (type_to_string payload.(i)) m))))
+                 in
+                 match go [] 0 fields with
+                 | Error m -> Error m
+                 | Ok fes -> (
+                     let rest_ok =
+                       match rest with
+                       | None -> Ok [||]
+                       | Some r -> (
+                           match check_expr env scope
+                                   (Some (Type_repr.Named (tid, lit_args))) r
+                           with
+                           | Ok re -> Ok re.te_effects
+                           | Error m -> Error m)
+                     in
+                     match rest_ok with
+                     | Error m -> Error m
+                     | Ok rest_effects ->
+                         let effects =
+                           Array.concat (List.map (fun te -> te.te_effects) fes @ [ rest_effects ])
+                         in
+                         Ok { te_type = Type_repr.Named (tid, lit_args); te_effects = effects; te_span = span })
+               end)))
       | Ok _ -> Error (err span (Printf.sprintf "`%s` is not a struct" name)))
   | Ast.Block (b, span) -> check_block env scope expected b span
   | Ast.UnsafeBlock (_, b, span) -> check_block env scope expected b span
@@ -2634,6 +2775,85 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
              | Error m -> Error m
              | Ok _ -> Ok { te_type = Type_repr.Unit; te_effects = [||]; te_span = span })
         | _ -> Ok { te_type = Type_repr.Unit; te_effects = [||]; te_span = span }
+      else if name = "vec" then
+        (* the kernel declares vec! itself (collections.tg): "vec![a, b,
+           c] is syntax sugar for Vec::from([a, b, c]) — the compiler
+           expands vec! at parse time into an Array literal" — check the
+           elements as an array literal and type the result as Vec *)
+        (match args with
+         | [] -> Ok { te_type = Type_repr.Named (b_array, [||]); te_effects = [||]; te_span = span }
+         | first :: rest -> (
+             let exprs =
+               List.concat_map
+                 (fun a ->
+                   match a with
+                   | Ast.MacroExpr e -> [ e ]
+                   | Ast.MacroTokens (text, _) ->
+                       (* the parser collects a vec! body containing a
+                          depth-0 `::` as one opaque token blob (e.g.
+                          `vec![DefKind::Function, DefKind::Constant]`);
+                          split it on depth-0 commas and check each
+                          segment as a path expression *)
+                       let segs = ref [] in
+                       let cur = Buffer.create 16 in
+                       let dp = ref 0 and db = ref 0 and dg = ref 0 in
+                       String.iter
+                         (fun c ->
+                           match c with
+                           | '(' -> incr dp; Buffer.add_char cur c
+                           | ')' -> if !dp > 0 then decr dp; Buffer.add_char cur c
+                           | '[' -> incr db; Buffer.add_char cur c
+                           | ']' -> if !db > 0 then decr db; Buffer.add_char cur c
+                           | '{' -> incr dg; Buffer.add_char cur c
+                           | '}' -> if !dg > 0 then decr dg; Buffer.add_char cur c
+                           | ',' when !dp = 0 && !db = 0 && !dg = 0 ->
+                               segs := Buffer.contents cur :: !segs;
+                               Buffer.clear cur
+                           | c -> Buffer.add_char cur c)
+                         text;
+                       segs := Buffer.contents cur :: !segs;
+                       List.rev !segs
+                       |> List.map (fun s ->
+                              let s = String.trim s in
+                              if s = "" then Ast.Name ("", span)
+                              else Ast.Name (s, span)))
+                 (first :: rest)
+             in
+             match exprs with
+             | [] -> Ok { te_type = Type_repr.Named (b_array, [||]); te_effects = [||]; te_span = span }
+             | first_e :: rest_e -> (
+                 match check_expr env scope None first_e with
+                 | Error m -> Error m
+                 | Ok te0 -> (
+                     let elem_ty = te0.te_type in
+                     let rec go acc = function
+                       | [] -> Ok (List.rev acc)
+                       | x :: xs -> (
+                           match check_expr env scope (Some elem_ty) x with
+                           | Error m -> Error m
+                           | Ok te -> (
+                               let subst = ref [] in
+                               match unify subst elem_ty te.te_type with
+                               | Ok () -> go (te :: acc) xs
+                               | Error m ->
+                                   Error
+                                     (err (Ast.expr_span x)
+                                        (Printf.sprintf
+                                           "array element type mismatch: expected %s (%s)"
+                                           (type_to_string elem_ty) m))))
+                     in
+                     match go [ te0 ] rest_e with
+                     | Error m -> Error m
+                     | Ok tes ->
+                         let effects =
+                           Array.concat (List.map (fun te -> te.te_effects) tes)
+                         in
+                         Ok
+                           {
+                             te_type = Type_repr.Named (b_array, [| elem_ty |]);
+                             te_effects = effects;
+                             te_span = span;
+                           }))))
       else
         Error (err span (Printf.sprintf "macro call `%s!` is not available in the bootstrap subset" name))
   | Ast.Assign (target, value, span) -> (
@@ -2768,8 +2988,17 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
                 (return_unify_err (Ast.expr_span w.Ast.wh_condition) Type_repr.Bool
                    tc.te_type m);
               Error m))
-  | Ast.LoopExpr (b, span) ->
-      check_block env { scope with loop_depth = scope.loop_depth + 1 } (Some Type_repr.Unit) b span
+  | Ast.LoopExpr (b, span) -> (
+      match
+        check_block env { scope with loop_depth = scope.loop_depth + 1 } (Some Type_repr.Unit) b span
+      with
+      | Error m -> Error m
+      | Ok te ->
+          (* a `loop` falls through ONLY via a break; a return inside is
+             not a fall-through — the loop's value is Never (the kernel's
+             StmtLoop rule; its own loop-with-return bodies end with no
+             tail and rely on the Never normal) *)
+          Ok { te_type = Type_repr.Never; te_effects = te.te_effects; te_span = span })
   | Ast.HandleExpr h -> Error (err h.Ast.h_span "handle/with expressions are not available in the bootstrap subset")
   | Ast.UnlessExpr u -> Error (err u.Ast.un_span "unless expressions are not available in the bootstrap subset")
   | Ast.UntilExpr u -> Error (err u.Ast.ut_span "until expressions are not available in the bootstrap subset")
@@ -2945,11 +3174,21 @@ and check_if (env : env) (scope : scope) (_expected : Type_repr.t option) (i : A
           (match unify subst tt.te_type te.te_type with
            | Ok () -> ()
            | Error m -> ignore (return_unify_err i.Ast.if_span tt.te_type te.te_type m));
+          (* the if's type adopts the concrete integer kind when one arm
+             is a bare literal and the other a concrete int (`if c then 8
+             else u end` is UInt, not IntLiteral — the kernel's literal
+             adoption) *)
+          let if_ty =
+            match tt.te_type, te.te_type with
+            | Type_repr.Int_literal _, Type_repr.Int k -> Type_repr.Int k
+            | Type_repr.Int k, Type_repr.Int_literal _ -> Type_repr.Int k
+            | _ -> substitute_fixpoint !subst tt.te_type
+          in
           let all_effects =
             Array.concat
               (cond_effects :: List.map (fun (te : typed_expr) -> te.te_effects) (tt :: telsif @ [ te ]))
           in
-          Ok { te_type = substitute_fixpoint !subst tt.te_type; te_effects = all_effects; te_span = i.Ast.if_span }))
+          Ok { te_type = if_ty; te_effects = all_effects; te_span = i.Ast.if_span }))
 
 and check_match (env : env) (scope : scope) (expected : Type_repr.t option) (m : Ast.match_expr) :
     (typed_expr, string) result =
@@ -2996,7 +3235,23 @@ and check_match (env : env) (scope : scope) (expected : Type_repr.t option) (m :
     in
     go [] m.Ast.m_arms
   in
-  let ty = match arms with [] -> Type_repr.Unit | first :: _ -> first.te_type in
+  let ty =
+    match arms with
+    | [] -> Type_repr.Unit
+    | first :: _ -> (
+        (* a match over int literals adopts the concrete kind of any
+           concrete int arm (the kernel's literal adoption) *)
+        let rec find_int = function
+          | [] -> first.te_type
+          | (te : typed_expr) :: rest -> (
+              match te.te_type with
+              | Type_repr.Int k -> Type_repr.Int k
+              | _ -> find_int rest)
+        in
+        match find_int arms with
+        | Type_repr.Int k -> Type_repr.Int k
+        | _ -> first.te_type)
+  in
   let effects = Array.concat (List.map (fun (te : typed_expr) -> te.te_effects) arms) in
   Ok { te_type = ty; te_effects = effects; te_span = m.Ast.m_span }
 
@@ -3214,6 +3469,9 @@ and check_place (env : env) (scope : scope) (e : Ast.expr) : (Type_repr.t * bool
 
 and check_field (env : env) (_scope : scope) (span : Span.span) (base : typed_expr)
     (fname : string) : (typed_expr, string) result =
+  (* the base may carry stale unsolved vars from an earlier generic call;
+     resolve them through the journal before projecting *)
+  let base = { base with te_type = substitute_fixpoint !var_journal base.te_type } in
   match int_of_string_opt fname with
   | Some i when i >= 0 -> (
       match base.te_type with
@@ -3309,7 +3567,7 @@ and check_name (env : env) (scope : scope) (expected : Type_repr.t option) (n : 
        | None -> ());
       Ok
         {
-          te_type = substitute_fixpoint !subst t;
+          te_type = substitute_fixpoint (!var_journal @ !subst) t;
           te_effects = [| Access_effect.Read |];
           te_span = span;
         }
@@ -3348,47 +3606,84 @@ and check_name (env : env) (scope : scope) (expected : Type_repr.t option) (n : 
                    te_span = span;
                  }
            | None ->
-               (match List.assoc_opt n env.constructors with
-                | Some cs -> check_call_sig env scope expected cs [] [] span
+               (* the kernel's `use module::{CONST}` imports are not
+                  tracked as scoped names; resolve a bare const to its
+                  unique closure-wide declaration (EFFECT_IO, VERSION,
+                  SYNTHETIC_MODULE_* — the flat-name rule the functions
+                  use) *)
+               (match
+                  match List.assoc_opt n env.consts with
+                  | Some t -> Some t
+                  | None -> (
+                      match
+                        List.filter (fun (k, _) -> Util.has_suffix k ("::" ^ n)) env.consts
+                      with
+                      | [ (_, t) ] -> Some t
+                      | _ -> None)
+                with
+                | Some t ->
+                    let subst = ref [] in
+                    (match expected with
+                     | Some exp -> (
+                         match unify subst t exp with
+                         | Ok () -> ()
+                         | Error m -> ignore (return_unify_err span t exp m))
+                     | None -> ());
+                    Ok
+                      {
+                        te_type = substitute_fixpoint !subst t;
+                        te_effects = [| Access_effect.Read |];
+                        te_span = span;
+                      }
                 | None ->
-                    match List.assoc_opt n env.functions with
-                    | Some fs ->
-                        let fn_ty = Type_repr.Function (fs.ts_params, fs.ts_return) in
-                        (match expected with
-                         | Some (Type_repr.Function (ps, r)) ->
-                             let subst = ref [] in
-                             (match unify subst fn_ty (Type_repr.Function (ps, r)) with
-                              | Ok () ->
-                                  Ok
-                                    {
-                                      te_type = fn_ty;
-                                      te_effects = [| Access_effect.Read |];
-                                      te_span = span;
-                                    }
-                              | Error m ->
-                                  Error
-                                    (err span
-                                       (Printf.sprintf
-                                          "function `%s` has type %s, incompatible with the expected function type (%s)"
-                                          n (type_to_string fn_ty) m)))
-                         | _ ->
-                             if Array.length fs.ts_params = 0 then
-                               check_call_sig env scope expected fs [] [] span
-                             else
-                               Error
-                                 (err span
-                                    (Printf.sprintf
-                                       "`%s` is a function; call it with arguments (or pass it where a function type is expected)"
-                                       n)))
-                    | None -> (
-                        (* a type name used as a value: the static method
-                           dispatch's synthetic receiver (`Type::method`) *)
-                        match List.assoc_opt n env.types with
-                        | Some ty ->
-                            Ok { te_type = ty; te_effects = [| Access_effect.Read |]; te_span = span }
-                        | None ->
-                            env.state.oracle.o_unresolved_calls <- env.state.oracle.o_unresolved_calls + 1;
-                            Error (err span (Printf.sprintf "unknown name `%s`" n))))))
+                    (match List.assoc_opt n env.constructors with
+                     | Some cs -> check_call_sig env scope expected cs [] [] span
+                     | None -> (
+                         match List.assoc_opt n env.functions with
+                         | Some fs ->
+                             let fn_ty = Type_repr.Function (fs.ts_params, fs.ts_return) in
+                             (match expected with
+                              | Some (Type_repr.Function (ps, r)) ->
+                                  let subst = ref [] in
+                                  (match unify subst fn_ty (Type_repr.Function (ps, r)) with
+                                   | Ok () ->
+                                       Ok
+                                         {
+                                           te_type = fn_ty;
+                                           te_effects = [| Access_effect.Read |];
+                                           te_span = span;
+                                         }
+                                   | Error m ->
+                                       Error
+                                         (err span
+                                            (Printf.sprintf
+                                               "function `%s` has type %s, incompatible with the expected function type (%s)"
+                                               n (type_to_string fn_ty) m)))
+                              | _ ->
+                                  if Array.length fs.ts_params = 0 then
+                                    check_call_sig env scope expected fs [] [] span
+                                  else
+                                    Error
+                                      (err span
+                                         (Printf.sprintf
+                                            "`%s` is a function; call it with arguments (or pass it where a function type is expected)"
+                                            n)))
+                         | None -> (
+                             (* a type name used as a value: the static method
+                                dispatch's synthetic receiver (`Type::method`) *)
+                             match List.assoc_opt n env.types with
+                             | Some ty ->
+                                 Ok
+                                   {
+                                     te_type = ty;
+                                     te_effects = [| Access_effect.Read |];
+                                     te_span = span;
+                                   }
+                             | None ->
+                                 env.state.oracle.o_unresolved_calls <-
+                                   env.state.oracle.o_unresolved_calls + 1;
+                                 Error
+                                   (err span (Printf.sprintf "unknown name `%s`" n))))))))
 
 and return_unify_err (span : Span.span) (a : Type_repr.t) (b : Type_repr.t) (m : string) :
     (typed_expr, string) result =
@@ -3498,12 +3793,31 @@ and check_call (env : env) (scope : scope) (expected : Type_repr.t option)
                                  check the args as-is *)
                               check_call_sig env scope expected sig_ targs args span
                             else
-                              check_call_sig env scope expected sig_ targs
-                                ({ Ast.ca_label = None;
-                                   ca_value = Ast.Name (owner, span);
-                                   ca_span = span }
-                                :: args)
-                                span
+                              (* prepend the synthetic receiver ONLY when the
+                                 self parameter's type IS the owner's own
+                                 type.  A `self: StrView`-style first
+                                 parameter (String::from_str_view — the
+                                 kernel passes the view as an EXPLICIT
+                                 argument) must not receive a synthetic
+                                 receiver. *)
+                              let self_is_owner =
+                                match List.assoc_opt owner env.types with
+                                | Some (Type_repr.Named (tid1, _)) -> (
+                                    match sig_.ts_params.(0).Type_repr.pt_type with
+                                    | Type_repr.Named (tid2, _) ->
+                                        Ids.Type_id.compare tid1 tid2 = 0
+                                    | _ -> false)
+                                | _ -> false
+                              in
+                              if self_is_owner then
+                                check_call_sig env scope expected sig_ targs
+                                  ({ Ast.ca_label = None;
+                                     ca_value = Ast.Name (owner, span);
+                                     ca_span = span }
+                                  :: args)
+                                  span
+                              else
+                                check_call_sig env scope expected sig_ targs args span
                         | None -> (
                             (* alias fallback: `Vec` is a builtin alias of the
                                kernel's `Array`; the builtin nominal may carry
@@ -3685,7 +3999,9 @@ and check_call_sig (env : env) (scope : scope) (expected : Type_repr.t option)
       in
       go [] targs
     in
-    let subst : (Type_repr.generic_key * Type_repr.t) list ref = ref [] in
+    (* the call subst starts from the var_journal: a generic value's
+       vars solved by an EARLIER call stay solved for this call *)
+    let subst : (Type_repr.generic_key * Type_repr.t) list ref = ref !var_journal in
     List.iter2
       (fun (_, pid) t -> subst := (Type_repr.KParam pid, t) :: !subst)
       (List.filteri (fun i _ -> i < List.length expl) sig_.ts_params_decl)
@@ -3888,7 +4204,7 @@ and check_call_sig (env : env) (scope : scope) (expected : Type_repr.t option)
         | v :: _, Some exp ->
             let solved = List.mem_assoc (Type_repr.KVar v) !subst in
             if solved then Ok ()
-            else if List.mem v (vars_in exp) then Ok ()
+            else if List.mem v (vars_in (substitute_fixpoint !subst exp)) then Ok ()
             else
               let pname =
                 match
@@ -3963,7 +4279,7 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
   in
   (* candidate owners: the nominal name (with kernel aliases), or — for a
      generic receiver — the trait bounds on its type parameter *)
-  let candidate_owners =
+  let base_owners =
     match owner_name with
     | None -> (
         match owner_ty with
@@ -3979,6 +4295,27 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
         | "String" -> [ oname; "str" ]
         | "str" -> [ oname; "String" ]
         | _ -> [ oname ])
+  in
+  (* impl-target preference: inside an impl block's own method bodies the
+     checker knows the impl's target name (env.impl_target, scoped there
+     only). When the receiver's nominal shares its tid with aliases (the
+     builtin LangItem tid carries BOTH "Vec" and "Array"), try the current
+     impl's target FIRST — the receiver's own tid name stays the base, the
+     impl target only adds the preference — so the source method (e.g.
+     Array::get, T-returning) wins over the builtin alias (Vec::get,
+     Option-returning) inside `impl Array::reverse`. Never applies outside
+     the impl's method bodies (impl_target = None there). *)
+  let candidate_owners =
+    match env.impl_target with
+    | Some t
+      when (match owner_ty with
+            | Type_repr.Named (tid, _) ->
+                List.exists
+                  (fun (n, name) -> Ids.Type_id.compare n tid = 0 && name = t)
+                  env.type_names
+            | _ -> false) ->
+        t :: List.filter (fun o -> o <> t) base_owners
+    | _ -> base_owners
   in
   let rec try_owners = function
     | [] -> None
@@ -4008,7 +4345,34 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
           Some sig_
       | _ -> None
   in
-  match (match try_owners candidate_owners with Some s -> Some s | None -> derived_clone ()) with
+  (* derived to_string: the kernel's universal `def to_string[T: Display]
+     (val: T) -> String` (core.tg) serves every receiver — generic error
+     payloads (`e.to_string()` in impl Result::context), named types with
+     no declared impl (Span, AstItemKind), array elements — and the real
+     compiler resolves `.to_string()` to it without enforcing the Display
+     bound at the call site. Synthesize the signature for any receiver. *)
+  let derived_to_string () =
+    if mname <> "to_string" then None
+    else
+      match owner_ty with
+      | Type_repr.Named _ | Type_repr.Fixed_array _ | Type_repr.Tuple _
+      | Type_repr.String | Type_repr.Int _ | Type_repr.Bool | Type_repr.Char
+      | Type_repr.Float _ | Type_repr.Type_param _ | Type_repr.Infer_var _
+      | Type_repr.Ref_internal _ ->
+          let sig_ =
+            mk_sig env.state ~name:("derived::" ^ oname ^ "::to_string") ~params_decl:[]
+              ~params:[ ("self", Access_effect.Let, owner_ty) ] ~ret:Type_repr.String ~where:[]
+          in
+          env.state.oracle.o_derived_callables <- sig_.ts_callable :: env.state.oracle.o_derived_callables;
+          Some sig_
+      | _ -> None
+  in
+  match
+    match try_owners candidate_owners with
+    | Some s -> Some s
+    | None -> (
+        match derived_clone () with Some s -> Some s | None -> derived_to_string ())
+  with
   | None -> (
       (* a field of function type called on the receiver: `self.func(x)`
          where the struct's field `func` is itself a function value *)
@@ -4065,7 +4429,7 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
           if Array.length sig_.ts_params = 0 then
             Error (err span "internal: method signature without a receiver")
           else begin
-            let subst : (Type_repr.generic_key * Type_repr.t) list ref = ref [] in
+            let subst : (Type_repr.generic_key * Type_repr.t) list ref = ref !var_journal in
             (* pre-instantiate every free generic parameter of the method
                (declared ones and impl/owner-level params the signature
                references) with fresh inference variables (mirrors
@@ -4251,8 +4615,17 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
                   !s3;
                 let ret = substitute_fixpoint !subst sig_.ts_return in
                 let sig_ids = List.map snd sig_.ts_params_decl in
+                (* a param the RECEIVER itself carries (an impl method
+                   called on the impl's own `self` — the receiver's type
+                   uses the impl's rigid params) is legitimately rigid in
+                   the result and must not be flagged *)
+                let receiver_params = params_in owner_ty in
                 let* () =
-                  match List.filter (fun p -> List.mem p sig_ids) (params_in ret) with
+                  match
+                    List.filter
+                      (fun p -> List.mem p sig_ids && not (List.mem p receiver_params))
+                      (params_in ret)
+                  with
                   | [] -> Ok ()
                   | p :: _ ->
                       let pname =
@@ -4534,7 +4907,7 @@ and check_impl (env : env) (d : Ast.impl_decl) : (unit, string) result =
                  d.i_type_params,
                d.i_span ))
   in
-  let env' = { env with current_self = Some target } in
+  let env' = { env with current_self = Some target; impl_target = Some d.i_target_type } in
   let* impl_where = resolve_where env' scope d.i_where in
   let tp_bounds =
     List.map (fun (tp : Ast.type_param) -> (tp.tp_name, tp.tp_bounds)) d.i_type_params

@@ -27,7 +27,12 @@
    - a closure object is recorded as
      `Tuple [Function (ptys, ret); Tuple (env types)]` — the code pointer
      first, the capture tuple second.  ClosureAgg (inst, env_ops) builds a
-     value of this shape.
+     value of this shape.  NOTE (re-audit closure item): closure
+     CONSTRUCTION is representable and verifier-checked, but the callee
+     forms (User/Intrinsic/Extern) carry compile-time identities only —
+     there is no closure-CALL terminator, so the VM can never invoke a
+     runtime closure value.  Closure lowering therefore fails closed
+     (mir_lower's Closure branch) until the call path exists.
 
    Local convention (canonical): Local 0 is the RETURN SLOT, holding the
    function's return type (the reference's "_ret" convention);

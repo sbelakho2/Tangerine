@@ -2240,5 +2240,225 @@ end
             lower_expect_bug "missing_field" "initializes 1 of 2 field(s)";
             lower_expect_bug "unknown_field" "unknown field `c`";
             lower_expect_bug "spread_lit" "`..` spread");
+       (* ── closure disposition proof (re-audit lowering-surface item:
+          "Closure — every implementation needs parse → typecheck →
+          driver lower → verify → VM tests").  The seed VM CONSTRUCTS
+          closure objects (ClosureAgg -> Vm_value.Closure as
+          Tuple [Function; Tuple env]; see seed_mir.ml's header) but has
+          NO closure-CALL path — Seed_mir.Call's callee is a
+          compile-time function instance only, never a runtime closure
+          value — so closure lowering fails CLOSED with a precise
+          seed_bug (never a silent Unit), Subset rejects the form
+          (E9040) as the authoritative frontend firewall, and the
+          oracle's closure row is a documented placeholder (typed
+          closures are not recorded; MIR closures 0 == 0 vacuously).
+          Proof: (a) the lowerer fails closed on `|x| x + 1` with the
+          precise seed_bug message; (b) Subset fires E9040 on the same
+          construct; (c) a closure-free program still lowers through the
+          DRIVER's lower_closure, verifies, and runs. *)
+       let contains_sub s sub =
+         let ls = String.length s and l = String.length sub in
+         if l = 0 then true
+         else begin
+           let rec go i =
+             if i + l > ls then false
+             else if String.sub s i l = sub then true
+             else go (i + 1)
+           in
+           go 0
+         end
+       in
+       let closure_src = {|
+def f() -> Int
+  |x| x + 1
+end
+
+def main() -> Int
+  0
+end
+|} in
+       let closure_file = "<lowersurface-closure>" in
+       (match Source_loader.load_string closure_file closure_src with
+        | Error _ -> failwith "closure proof source load"
+        | Ok csrc ->
+            let csm = Span.create () in
+            let csfid = Span.add_file csm csrc.Source.name csrc in
+            let csdiags = Diagnostic.create_bag () in
+            let cslx = Lexer.create csrc.Source.bytes csfid csdiags in
+            let cstoks = Lexer.lex cslx in
+            let csprog = Parser.parse cstoks csrc.Source.bytes csfid csdiags [ "closure-proof" ] in
+            if Diagnostic.has_errors csdiags then begin
+              Printf.printf "  closure proof: FAIL (parse errors)\n%s\n"
+                (Diagnostic.render csm csdiags);
+              exit 1
+            end;
+            let cs_funcs =
+              List.filter_map
+                (fun i -> match i.Ast.kind with Ast.Function d -> Some d | _ -> None)
+                csprog.Ast.items
+            in
+            let csenv : Mir_lower.func_env =
+              {
+                Mir_lower.types =
+                  [
+                    ("Int", int_ty);
+                    ("Unit", Type_repr.Unit);
+                    ("Bool", Type_repr.Bool);
+                    ("String", string_ty);
+                  ];
+                values = [];
+                callables = [];
+                methods = [];
+                fn_ret = int_ty;
+                struct_fields = [];
+              }
+            in
+            (* (a) the lowerer fails closed with the precise seed_bug —
+               never a silent Unit *)
+            match
+              List.find_opt
+                (fun (d : Ast.function_decl) -> d.Ast.fn_sig.Ast.sig_name = "f")
+                cs_funcs
+            with
+            | None -> failwith "closure proof: no function f"
+            | Some d -> (
+                match
+                  (try
+                     Ok
+                       (Mir_lower.lower_function_with_variants Mir_lower.default_variant_table
+                          csenv "f" 0 [||] [||] d)
+                   with
+                  | Mir_lower.Seed_bug m -> Error m)
+                with
+                | Error m when contains_sub m "no closure-CALL path" ->
+                    Printf.printf "  closure fail-closed: PASS (%s)\n" m
+                | Error m ->
+                    Printf.printf "  closure fail-closed: FAIL (message lacks the reason: %s)\n" m;
+                    exit 1
+                | Ok _ ->
+                    Printf.printf "  closure fail-closed: FAIL (lowered without a Seed_bug)\n";
+                    exit 1);
+            (* (b) Subset's E9040 rejection is authoritative on the same
+               construct, with the E9040 message *)
+            let csdiags2 = Diagnostic.create_bag () in
+            Subset.check csdiags2 csprog;
+            let cs_codes = Diagnostic.codes csdiags2 in
+            if not (List.mem "E9040" cs_codes) then begin
+              Printf.printf "  closure subset: FAIL (E9040 not fired; got [%s])\n"
+                (String.concat "; " cs_codes);
+              exit 1
+            end;
+            let e9040_msg_ok =
+              List.exists
+                (fun d ->
+                  d.Diagnostic.code = "E9040"
+                  && contains_sub d.Diagnostic.message
+                       "closure expressions are not available in the bootstrap subset")
+                csdiags2.Diagnostic.diagnostics
+            in
+            if not e9040_msg_ok then begin
+              Printf.printf "  closure subset: FAIL (E9040 fired without the rejection message)\n";
+              exit 1
+            end;
+            Printf.printf
+              "  closure subset: PASS (E9040 fired — closure expressions are not available in the bootstrap subset)\n");
+       (* (c) the closure-free program still lowers through the DRIVER's
+          lower_closure path, verifies, and runs *)
+       let noc_src = {|
+def add(a: Int, b: Int) -> Int
+  a + b
+end
+
+def main() -> Int
+  add(1, 2)
+end
+|} in
+       let noc_file = Filename.temp_file "tg_lowersurface_noclosure" ".tg" in
+       (let oc = open_out_bin noc_file in
+        output_string oc noc_src;
+        close_out oc);
+       let noc_manifest =
+         match Bootstrap_manifest.single ~file:noc_file ~path:[ "nocproof" ] () with
+         | Ok m -> m
+         | Error e -> failwith ("no-closure proof manifest: " ^ e)
+       in
+       let ncdiags = Diagnostic.create_bag () in
+       let ncgraph = Module_graph.create_with_sources noc_manifest ncdiags in
+       let ncresolved = Resolver.resolve noc_manifest ncgraph ncdiags in
+       let ncnode = List.hd ncgraph.Module_graph.nodes in
+       let ncprog_ast = ncnode.Module_graph.node_program in
+       let ncenv0 = Typecheck.initial_env ~resolved:(Some ncresolved) () in
+       let ncenv =
+         match
+           Typecheck.check_program
+             { ncenv0 with Typecheck.module_path = ncnode.Module_graph.node_path }
+             ncprog_ast
+         with
+         | Error m -> failwith ("no-closure proof typecheck: " ^ m)
+         | Ok (env', errors) ->
+             if errors <> [] then
+               failwith ("no-closure proof typecheck errors: " ^ String.concat "; " errors);
+             env'
+       in
+       Sys.remove noc_file;
+       let nc_target =
+         match Target.unsupported_triple "aarch64-apple-darwin" with
+         | Ok t -> t
+         | Error m -> failwith ("no-closure proof target: " ^ m)
+       in
+       let ncctx : Driver.closure_ctx =
+         {
+           Driver.ctx_repo_root = ".";
+           ctx_manifest_path = noc_file;
+           ctx_target = nc_target;
+           ctx_graph = ncgraph;
+           ctx_resolved = ncresolved;
+           ctx_env = ncenv;
+           ctx_type_errors = [];
+           ctx_items = List.length ncprog_ast.Ast.items;
+           ctx_typed_calls_sample = 0;
+           ctx_decl_rounds = 0;
+           ctx_subset = Driver.subset_firewall_of_graph ncgraph;
+           lowered_methods = 0;
+         }
+       in
+       let noc_prog = Driver.lower_closure ncctx in
+       (match Mir_verify.require_valid noc_prog with
+        | Ok () ->
+            Printf.printf "  no-closure MIR verify: PASS (%d functions)\n"
+              (Array.length noc_prog.Seed_mir.functions)
+        | Error errs ->
+            Printf.printf "  no-closure MIR verify: FAIL\n";
+            List.iter (fun e -> Printf.printf "    %s\n" e) errs;
+            exit 1);
+       let noc_entry =
+         match
+           Array.to_list noc_prog.Seed_mir.functions
+           |> List.find_opt (fun f -> f.Seed_mir.name = "main")
+         with
+         | Some f -> f.Seed_mir.instance
+         | None -> failwith "no-closure proof: no main function"
+       in
+       let noc_host = Host.create ~repo_root:"." ~argv:[||] in
+       (match Vm.run ~program:noc_prog ~entry:noc_entry ~argv:[||] ~host:noc_host with
+        | Error e ->
+            Printf.printf "  no-closure VM: FAIL %s\n" e.Vm.message;
+            exit 1
+        | Ok code ->
+            Printf.printf "  no-closure VM: exit %d\n" code;
+            (match Vm.entry_frame_of ~program:noc_prog ~entry:noc_entry ~argv:[||] with
+             | Error m -> Printf.printf "  no-closure main returned: <inspect failed: %s>\n" m
+             | Ok (cvm, centry_frame) -> (
+                 match Vm.run_inspect cvm centry_frame with
+                 | Ok ret_val ->
+                     Printf.printf "  no-closure main returned: %s\n" ret_val;
+                     if ret_val = "3" then
+                       Printf.printf
+                         "  no-closure RESULT: PASS (add(1,2) = 3 through the driver's lower_closure; the closure-free pipeline is undisturbed)\n"
+                     else begin
+                       Printf.printf "  no-closure RESULT: FAIL (expected 3)\n";
+                       exit 1
+                     end
+                 | Error m -> Printf.printf "  no-closure main returned: <inspect failed: %s>\n" m)));
        ignore lenv2;
        ignore menv2

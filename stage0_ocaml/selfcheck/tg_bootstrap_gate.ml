@@ -56,18 +56,18 @@ let baseline_typecheck_debt : Debt_report.t =
   {
     Debt_report.buckets =
       [
-        ("unresolved_type", 14);
-        ("unresolved_callable", 32);
+        ("unresolved_type", 5);
+        ("unresolved_callable", 14);
         ("unresolved_module", 0);
-        ("cannot_infer_generic", 9);
-        ("type_mismatch", 180);
+        ("cannot_infer_generic", 5);
+        ("type_mismatch", 96);
         ("obligation", 4);
         ("duplicate_decl", 0);
-        ("other", 18);
+        ("other", 8);
       ];
-    total = 257;
-    primaries = 181;
-    secondaries = 76;
+    total = 132;
+    primaries = 76;
+    secondaries = 56;
   }
 
 let fail fmt = Printf.ksprintf (fun s -> Printf.printf "BOOTSTRAP GATE: FAIL: %s\n" s; exit 1) fmt

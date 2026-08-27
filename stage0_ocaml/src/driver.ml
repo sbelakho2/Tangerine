@@ -1398,7 +1398,7 @@ let print_oracle_rows (o : oracle_counts) : bool =
     Printf.printf "  oracle note: MIR side emitted as zeros — lowering skipped (typecheck gate failed)\n"
   else
     Printf.printf
-      "  oracle note: typed-call row's expected side is the recorded o_calls sample (per-item channel; a lower bound); enum/closure rows have no exposed typed channel — both sides are MIR counts\n";
+      "  oracle note: typed-call row's expected side is the recorded o_calls sample (per-item channel; a lower bound); the closure row is a PLACEHOLDER — typed closures are not recorded (check_closure computes the capture list but records no closure identity/captures) and Mir_lower has no Closure branch (E9040, no closure-CALL path in the VM), so its 0 == 0 is vacuous until the VM's closure model lands\n";
   !diff_count > 0 || o.oc_mir_callable_zero > 0
 
 (* The bootstrap entry: --entry overrides; default is the kernel's

@@ -546,7 +546,10 @@ let expr_lower_status : (string * lower_status) list =
     (* `?` lowers for Option/Result subjects with a matching enclosing
        return type *)
     ("TryOp", Lowerable);
-    (* no Closure branch — the expression-name diagnostic table *)
+    (* dedicated always-failing branch: closure expressions fail closed
+       ("closure expressions are not lowerable: ... no closure-CALL path"),
+       and Subset rejects the form (E9040) — the closure disposition
+       (re-audit lowering-surface item) *)
     ("Closure", Unlowerable);
     (* Neg/Not/BitNot lower; Deref/Borrow/BorrowMut pass through *)
     ("Unary", Partial);
