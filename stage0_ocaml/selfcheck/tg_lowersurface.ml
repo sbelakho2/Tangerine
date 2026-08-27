@@ -1121,4 +1121,1124 @@ end
                 Printf.printf
                   "  typed-cast contrast: FAIL (syntax reconstruction reproduced the resolved target)\n";
                 exit 1);
-           ignore pid_t)
+            ignore pid_t;
+           (* ── typed-call proof (re-audit's highest-leverage item: the
+              persistent typed-call channel — the call's node carries the
+              checker-RESOLVED callee CallableId + the SOLVED concrete
+              substitution, and the lowering Call rule consumes it into
+              the User instance, so the mono exact-arity pairing stays
+              exact) ──────────────────────────────────────────────────
+              A generic def idfn[T] called with the explicit concrete
+              type arg `idfn[Int](42)`: the checker resolves T := Int;
+              the map's node at the call's span must carry
+              Some (idfn's CallableId, [| Int |]) — the substitution
+              SOLVED (declaration-owned param mapping, one concrete arg
+              for one declared param), never [||] — and lowering through
+              the DRIVER-built env (the typed_nodes channel present) must
+              emit the Call terminator's User instance with the SAME
+              concrete type_args. *)
+           let call_src = {|
+def idfn[T](x: T) -> T
+  x
+end
+
+def main() -> Int
+  idfn[Int](42)
+end
+|} in
+           let call_file = "<typed-call-proof>" in
+           (match Source_loader.load_string call_file call_src with
+            | Error _ -> failwith "typed-call proof source load"
+            | Ok nsrc ->
+                let nsm = Span.create () in
+                let nfid = Span.add_file nsm nsrc.Source.name nsrc in
+                let ndiags = Diagnostic.create_bag () in
+                let nlx = Lexer.create nsrc.Source.bytes nfid ndiags in
+                let ntoks = Lexer.lex nlx in
+                let nprog = Parser.parse ntoks nsrc.Source.bytes nfid ndiags [ "callproof" ] in
+                if Diagnostic.has_errors ndiags then begin
+                  Printf.printf "  typed-call proof: FAIL (parse errors)\n%s\n"
+                    (Diagnostic.render nsm ndiags);
+                  exit 1
+                end;
+                let nenv =
+                  match Typecheck.check_program (Typecheck.initial_env ()) nprog with
+                  | Error m -> failwith ("typed-call proof typecheck: " ^ m)
+                  | Ok (env', errors) ->
+                      if errors <> [] then
+                        failwith
+                          ("typed-call proof typecheck errors: " ^ String.concat "; " errors);
+                      env'
+                in
+                let idfn_ts =
+                  match List.assoc_opt "idfn" nenv.Typecheck.functions with
+                  | Some ts -> ts
+                  | None -> (
+                      match
+                        List.filter (fun (k, _) -> Util.has_suffix k "::idfn")
+                          nenv.Typecheck.functions
+                      with
+                      | [ (_, ts) ] -> ts
+                      | _ -> failwith "typed-call proof: no typed signature for idfn")
+                in
+                let main_decl =
+                  match
+                    List.find_map
+                      (fun i ->
+                        match i.Ast.kind with
+                        | Ast.Function d when d.Ast.fn_sig.Ast.sig_name = "main" -> Some d
+                        | _ -> None)
+                      nprog.Ast.items
+                  with
+                  | Some d -> d
+                  | None -> failwith "typed-call proof: no main function"
+                in
+                let call_span =
+                  match main_decl.Ast.fn_body with
+                  | Ast.FnExpr (Ast.Call (_, _, _, span)) -> span
+                  | Ast.FnBlock { Ast.b_tail = Some (Ast.Call (_, _, _, span)); _ } -> span
+                  | _ -> failwith "typed-call proof: main body is not `idfn[Int](42)`"
+                in
+                let n_map = Driver.typed_nodes_of nenv in
+                let call_node =
+                  match List.assoc_opt (nfid, call_span.Span.start) n_map with
+                  | Some n -> n
+                  | None ->
+                      Printf.printf
+                        "  typed-call map: FAIL (no typed node for the call's span file#%d[%d..%d))\n"
+                        nfid call_span.Span.start call_span.Span.end_;
+                      exit 1
+                in
+                (* the declaration-owned param mapping: idfn[T] has ONE
+                   declaration param; the persisted substitution must be
+                   its SOLVED concrete image in declaration order *)
+                let decl_arity = List.length idfn_ts.Typecheck.ts_params_decl in
+                (match call_node.Mir_lower.tn_call with
+                 | Some (callable, subst) ->
+                     let ok =
+                       Ids.Callable_id.compare callable idfn_ts.Typecheck.ts_callable = 0
+                       && Array.length subst = decl_arity
+                       && Array.length subst = 1
+                       && Type_repr.compare subst.(0) int_ty = 0
+                     in
+                     if ok then
+                       Printf.printf
+                         "  typed-call map: PASS (call span file#%d[%d..%d) -> (CallableId#%d, [Int]) — the SOLVED concrete substitution, exact-arity %d declared = %d concrete)\n"
+                         nfid call_span.Span.start call_span.Span.end_
+                         (Ids.Callable_id.to_int idfn_ts.Typecheck.ts_callable)
+                         decl_arity (Array.length subst)
+                     else begin
+                       Printf.printf
+                         "  typed-call map: FAIL (tn_call = Some (%d, [%s]); expected Some (CallableId#%d, [Int]))\n"
+                         (Ids.Callable_id.to_int callable)
+                         (String.concat "; "
+                            (Array.to_list
+                               (Array.map
+                                  (fun t ->
+                                    match t with
+                                    | Type_repr.Int _ -> "Int"
+                                    | Type_repr.Type_param p ->
+                                        "Type_param "
+                                        ^ string_of_int (Ids_core.Generic_param_id.to_int p)
+                                    | Type_repr.Infer_var _ -> "Infer_var"
+                                    | _ -> "?")
+                                  subst)))
+                         (Ids.Callable_id.to_int idfn_ts.Typecheck.ts_callable);
+                       exit 1
+                     end
+                 | None ->
+                     Printf.printf "  typed-call map: FAIL (no tn_call on the call's node)\n";
+                     exit 1);
+                (* the lowering leg: lower main through the DRIVER-built
+                   env with the typed_nodes channel present; the emitted
+                   Call terminator's User instance must carry the concrete
+                   type_args (the exact-arity pairing is satisfiable) *)
+                let main_ts =
+                  match List.assoc_opt "main" nenv.Typecheck.functions with
+                  | Some ts -> ts
+                  | None -> (
+                      match
+                        List.filter (fun (k, _) -> Util.has_suffix k "::main")
+                          nenv.Typecheck.functions
+                      with
+                      | [ (_, ts) ] -> ts
+                      | _ -> failwith "typed-call proof: no typed signature for main")
+                in
+                let lowered_main =
+                  Mir_lower.lower_function_with_variants Mir_lower.default_variant_table
+                    ~typed_nodes:(Driver.typed_nodes_of nenv)
+                    { (Driver.lowering_env_of nenv) with Mir_lower.fn_ret = main_ts.Typecheck.ts_return }
+                    "main" (Ids.Callable_id.to_int main_ts.Typecheck.ts_callable)
+                    (Array.of_list
+                       (List.map (fun (_, pid) -> Type_repr.Type_param pid)
+                          main_ts.Typecheck.ts_params_decl))
+                    (Array.map (fun p -> p.Type_repr.pt_convention) main_ts.Typecheck.ts_params)
+                    main_decl
+                in
+                let lowered_instance =
+                  Array.to_list lowered_main.Seed_mir.blocks
+                  |> List.find_map (fun (b : Seed_mir.block) ->
+                         match b.Seed_mir.terminator with
+                         | Seed_mir.Call (_, Seed_mir.User inst, _, _, _) -> Some inst
+                         | _ -> None)
+                in
+                (match lowered_instance with
+                 | Some inst ->
+                     let ok =
+                       Ids.Callable_id.compare inst.Instance_id.callable idfn_ts.Typecheck.ts_callable = 0
+                       && Array.length inst.Instance_id.type_args = decl_arity
+                       && Array.length inst.Instance_id.type_args = 1
+                       && Type_repr.compare inst.Instance_id.type_args.(0) int_ty = 0
+                     in
+                     if ok then
+                       Printf.printf
+                         "  typed-call lowering: PASS (User instance CallableId#%d with concrete type_args [Int] — the exact-arity pairing is satisfiable)\n"
+                         (Ids.Callable_id.to_int idfn_ts.Typecheck.ts_callable)
+                     else begin
+                       Printf.printf
+                         "  typed-call lowering: FAIL (User instance type_args=[%s]; expected [Int])\n"
+                         (String.concat "; "
+                            (Array.to_list
+                               (Array.map
+                                  (fun t -> match t with Type_repr.Int _ -> "Int" | _ -> "?")
+                                  inst.Instance_id.type_args)));
+                       exit 1
+                     end
+                  | None ->
+                      Printf.printf "  typed-call lowering: FAIL (no User Call terminator in lowered main)\n";
+                      exit 1)));
+      (* ── nested-function proof (re-audit: nested defs were missing from
+         closure MIR.  The typechecker registered them and recognized
+         their callable identities, but Driver.lower_closure only lowered
+         top-level functions and impl methods — a nested helper's caller
+         carried the nested callable id with no seed function behind it.
+         The fix is the TYPED callable universe: lower_closure iterates
+         the typechecker's nested registry (qname + typed signature +
+         function_decl, registered during the body pass), each entry
+         lowering exactly like the methods.  This proof runs the REAL
+         Typecheck.check_program (the nested def registers), then the REAL
+         Driver.lower_closure over a closure_ctx, asserting
+         (a) the nested fn's seed function exists with the registry's
+         callable id, (b) the caller's call references that SAME id,
+         (c) the program verifies and the VM runs (outer(21) =
+         inner(21)*2 + 1 = 43). *)
+      let nested_src = {|
+def outer(x: Int) -> Int
+  let v = x
+  def inner(y: Int) -> Int
+    y * 2
+  end
+  inner(v) + 1
+end
+
+def main() -> Int
+  outer(21)
+end
+|} in
+      let nested_file = Filename.temp_file "tg_lowersurface_nested" ".tg" in
+      (let oc = open_out_bin nested_file in
+       output_string oc nested_src;
+       close_out oc);
+      let nested_manifest =
+        match Bootstrap_manifest.single ~file:nested_file ~path:[ "nestedproof" ] () with
+        | Ok m -> m
+        | Error e -> failwith ("nested-function proof manifest: " ^ e)
+      in
+      let ndiags = Diagnostic.create_bag () in
+      let ngraph = Module_graph.create_with_sources nested_manifest ndiags in
+      let nresolved = Resolver.resolve nested_manifest ngraph ndiags in
+      let nnode = List.hd ngraph.Module_graph.nodes in
+      let nprog_ast = nnode.Module_graph.node_program in
+      (* the driver's module_path at body-check time is the node path, so
+         the nested def registers under the qualified name — the same key
+         lower_closure uses as the seed function's name *)
+      let nenv0 = Typecheck.initial_env ~resolved:(Some nresolved) () in
+      let nenv =
+        match
+          Typecheck.check_program
+            { nenv0 with Typecheck.module_path = nnode.Module_graph.node_path }
+            nprog_ast
+        with
+        | Error m -> failwith ("nested-function proof typecheck: " ^ m)
+        | Ok (env', errors) ->
+            if errors <> [] then
+              failwith
+                ("nested-function proof typecheck errors: " ^ String.concat "; " errors);
+            env'
+      in
+      Sys.remove nested_file;
+      let inner_qname = String.concat "::" (nnode.Module_graph.node_path @ [ "inner" ]) in
+      let inner_entry =
+        match
+          List.find_opt
+            (fun (qname, _, _ : string * Typecheck.typed_signature * Ast.function_decl) ->
+              qname = inner_qname)
+            nenv.Typecheck.state.nested_functions
+        with
+        | Some e -> e
+        | None ->
+            Printf.printf
+              "  nested-function registry: FAIL (no entry for %s in %d registration(s))\n"
+              inner_qname (List.length nenv.Typecheck.state.nested_functions);
+            exit 1
+      in
+      let _, inner_ts, inner_fd = inner_entry in
+      let inner_cid = Ids.Callable_id.to_int inner_ts.Typecheck.ts_callable in
+      let inner_has_body =
+        match inner_fd.Ast.fn_body with
+        | Ast.FnBlock _ -> true
+        | _ -> false
+      in
+      if not inner_has_body then begin
+        Printf.printf "  nested-function registry: FAIL (no AST body recorded)\n";
+        exit 1
+      end;
+      Printf.printf
+        "  nested-function registry: PASS (registered %s with callable #%d and its function_decl AST)\n"
+        inner_qname inner_cid;
+      (* the DRIVER's lower_closure path: a real closure_ctx over the
+         single-module graph *)
+      let ntarget =
+        match Target.unsupported_triple "aarch64-apple-darwin" with
+        | Ok t -> t
+        | Error m -> failwith ("nested-function proof target: " ^ m)
+      in
+      let nctx : Driver.closure_ctx =
+        {
+          Driver.ctx_repo_root = ".";
+          ctx_manifest_path = nested_file;
+          ctx_target = ntarget;
+          ctx_graph = ngraph;
+          ctx_resolved = nresolved;
+          ctx_env = nenv;
+          ctx_type_errors = [];
+          ctx_items = List.length nprog_ast.Ast.items;
+          ctx_typed_calls_sample = 0;
+          ctx_decl_rounds = 0;
+          ctx_subset = Driver.subset_firewall_of_graph ngraph;
+          lowered_methods = 0;
+        }
+      in
+      let nprog = Driver.lower_closure nctx in
+      (* (a) the nested fn's seed function exists with the right callable id *)
+      let inner_seed =
+        match
+          Array.to_list nprog.Seed_mir.functions
+          |> List.find_opt (fun f -> f.Seed_mir.name = inner_qname)
+        with
+        | Some f -> f
+        | None ->
+            Printf.printf "  nested-function seed: FAIL (no seed function named %s)\n" inner_qname;
+            exit 1
+      in
+      let seed_cid = Ids.Callable_id.to_int (Instance_id.callable inner_seed.Seed_mir.instance) in
+      if seed_cid <> inner_cid then begin
+        Printf.printf
+          "  nested-function seed: FAIL (seed callable #%d != registry callable #%d)\n"
+          seed_cid inner_cid;
+        exit 1
+      end;
+      (* (b) the caller's call references the same id *)
+      let outer_seed =
+        match
+          Array.to_list nprog.Seed_mir.functions
+          |> List.find_opt (fun f -> f.Seed_mir.name = "outer")
+        with
+        | Some f -> f
+        | None -> failwith "nested-function proof: no outer seed function"
+      in
+      let call_refs_inner =
+        Array.exists
+          (fun (b : Seed_mir.block) ->
+            match b.Seed_mir.terminator with
+            | Seed_mir.Call (_, Seed_mir.User inst, _, _, _) ->
+                Ids.Callable_id.to_int (Instance_id.callable inst) = inner_cid
+            | _ -> false)
+          outer_seed.Seed_mir.blocks
+      in
+      if not call_refs_inner then begin
+        Printf.printf
+          "  nested-function call: FAIL (outer's lowered calls do not reference callable #%d)\n"
+          inner_cid;
+        exit 1
+      end;
+      Printf.printf
+        "  nested-function lowering: PASS (seed %s = callable #%d; outer's call references the same id)\n"
+        inner_qname inner_cid;
+      (* (c) the whole program verifies and the VM runs *)
+      (match Mir_verify.require_valid nprog with
+       | Ok () ->
+           Printf.printf "  nested-function MIR verify: PASS (%d functions)\n"
+             (Array.length nprog.Seed_mir.functions)
+       | Error errs ->
+           Printf.printf "  nested-function MIR verify: FAIL\n";
+           List.iter (fun e -> Printf.printf "    %s\n" e) errs;
+           Printf.printf "%s\n" (Seed_mir.print_program nprog);
+           exit 1);
+      let nentry =
+        match
+          Array.to_list nprog.Seed_mir.functions
+          |> List.find_opt (fun f -> f.Seed_mir.name = "main")
+        with
+        | Some f -> f.Seed_mir.instance
+        | None -> failwith "nested-function proof: no main function"
+      in
+      let nhost = Host.create ~repo_root:"." ~argv:[||] in
+      (match Vm.run ~program:nprog ~entry:nentry ~argv:[||] ~host:nhost with
+       | Error e ->
+           Printf.printf "  nested-function VM: FAIL %s\n" e.Vm.message;
+           exit 1
+       | Ok code ->
+           Printf.printf "  nested-function VM: exit %d\n" code;
+           (match Vm.entry_frame_of ~program:nprog ~entry:nentry ~argv:[||] with
+            | Error m -> Printf.printf "  nested-function main returned: <inspect failed: %s>\n" m
+            | Ok (nvm, nentry_frame) -> (
+                match Vm.run_inspect nvm nentry_frame with
+                | Ok ret_val ->
+                    Printf.printf "  nested-function main returned: %s\n" ret_val;
+                    if ret_val = "43" then
+                      Printf.printf
+                        "  nested-function RESULT: PASS (outer(21) -> inner(21)*2+1 = 43 through the nested seed)\n"
+                    else begin
+                      Printf.printf "  nested-function RESULT: FAIL (expected 43)\n";
+                      exit 1
+                    end
+                | Error m ->
+                    Printf.printf "  nested-function main returned: <inspect failed: %s>\n" m)));;
+
+       (* ── StructLit lowering proof (re-audit's ordinary-surface item: a
+          struct literal must lower to the StructCtor aggregate — the
+          aggregate's type is the struct's Named type and the operand
+          positions come from the typed registry (struct_fields_of's
+          declaration order, the same order closure_types materializes
+          into the StructDefs).  The literal lists the fields OUT OF
+          ORDER (`Pair { b: b, a: a }`) — the values must land at their
+          REGISTRY positions, never the source order.  The aggregate's
+          type comes from the typechecker's resolved type through the
+          typed channel (the StructLit's span node).  The program:
+          make_pair CONSTRUCTS via the literal, read_a/read_b read via
+          the lowered Field projections, and the whole program verifies
+          and the VM round-trips 21 and 42 (main = 63). *)
+       let lit_src = {|
+struct Pair
+  a: Int
+  b: Int
+end
+
+def make_pair(a: Int, b: Int) -> Pair
+  Pair { b: b, a: a }
+end
+
+def read_a(p: Pair) -> Int
+  p.a
+end
+
+def read_b(p: Pair) -> Int
+  p.b
+end
+
+def main() -> Int
+  read_a(make_pair(21, 42)) + read_b(make_pair(21, 42))
+end
+|} in
+       let lit_file = Filename.temp_file "tg_lowersurface_structlit" ".tg" in
+       (let oc = open_out_bin lit_file in
+        output_string oc lit_src;
+        close_out oc);
+       let lit_manifest =
+         match Bootstrap_manifest.single ~file:lit_file ~path:[ "litproof" ] () with
+         | Ok m -> m
+         | Error e -> failwith ("struct-lit proof manifest: " ^ e)
+       in
+       let ldiags = Diagnostic.create_bag () in
+       let lgraph = Module_graph.create_with_sources lit_manifest ldiags in
+       let lresolved = Resolver.resolve lit_manifest lgraph ldiags in
+       let lprog_ast = (List.hd lgraph.Module_graph.nodes).Module_graph.node_program in
+       let lenv =
+         match Typecheck.check_program (Typecheck.initial_env ~resolved:(Some lresolved) ()) lprog_ast with
+         | Error m -> failwith ("struct-lit proof typecheck: " ^ m)
+         | Ok (env', errors) ->
+             if errors <> [] then
+               failwith ("struct-lit proof typecheck errors: " ^ String.concat "; " errors);
+             env'
+       in
+       Sys.remove lit_file;
+       let l_tid = List.assoc "Pair" lenv.Typecheck.type_ids in
+       let l_reg = List.assoc l_tid (Driver.struct_fields_of lenv) in
+       let l_fid name =
+         match List.find_opt (fun (n, _, _) -> n = name) l_reg with
+         | Some (_, fid, _) -> fid
+         | None -> failwith ("struct-lit proof: no registry FieldId for " ^ name)
+       in
+       let l_pos name =
+         let rec go i = function
+           | [] -> failwith ("struct-lit proof: field " ^ name ^ " not in the registry")
+           | (n, _, _) :: rest -> if n = name then i else go (i + 1) rest
+         in
+         go 0 l_reg
+       in
+       let l_fid_a = l_fid "a" and l_fid_b = l_fid "b" in
+       let l_pos_a = l_pos "a" and l_pos_b = l_pos "b" in
+       let l_funcs =
+         List.filter_map
+           (fun i -> match i.Ast.kind with Ast.Function d -> Some d | _ -> None)
+           lprog_ast.Ast.items
+       in
+       let lts_of name =
+         match List.assoc_opt name lenv.Typecheck.functions with
+         | Some ts -> ts
+         | None -> (
+             match List.filter (fun (k, _) -> Util.has_suffix k ("::" ^ name)) lenv.Typecheck.functions with
+             | [ (_, ts) ] -> ts
+             | _ -> failwith ("struct-lit proof: no typed signature for " ^ name))
+       in
+       let lenv2 : Mir_lower.func_env =
+         {
+           Mir_lower.types =
+             [
+               ("Pair", Type_repr.Named (l_tid, [||]));
+               ("Int", int_ty);
+               ("Unit", Type_repr.Unit);
+               ("Bool", Type_repr.Bool);
+               ("String", string_ty);
+             ];
+           values =
+             List.map
+               (fun d ->
+                 let n = d.Ast.fn_sig.Ast.sig_name in
+                 (n, (lts_of n).Typecheck.ts_return))
+               l_funcs;
+           callables =
+             List.map
+               (fun d ->
+                 let n = d.Ast.fn_sig.Ast.sig_name in
+                 ( n,
+                   {
+                     Mir_lower.ce_callable = Ids.Callable_id.to_int (lts_of n).Typecheck.ts_callable;
+                     ce_template_args = [||];
+                     ce_params = [||];
+                   } ))
+               l_funcs;
+           methods = [];
+           fn_ret = int_ty;
+           struct_fields = Driver.struct_fields_of lenv;
+         }
+       in
+       let lmir_funcs =
+         List.map
+           (fun d ->
+             let n = d.Ast.fn_sig.Ast.sig_name in
+             let ts = lts_of n in
+             Mir_lower.lower_function_with_variants Mir_lower.default_variant_table
+               ~typed_nodes:(Driver.typed_nodes_of lenv)
+               { lenv2 with Mir_lower.fn_ret = ts.Typecheck.ts_return }
+               n (Ids.Callable_id.to_int ts.Typecheck.ts_callable) [||] [||] d)
+           l_funcs
+       in
+       let lmake_pair =
+         List.find
+           (fun f -> f.Seed_mir.name = "make_pair")
+           (Array.to_list (Array.of_list lmir_funcs))
+       in
+       (* the typed channel: the StructLit's span node carries the
+          checker-resolved aggregate type (Named (l_tid, [||])) *)
+       let make_pair_decl =
+         List.find
+           (fun (d : Ast.function_decl) -> d.Ast.fn_sig.Ast.sig_name = "make_pair")
+           l_funcs
+       in
+       let lit_span =
+         match make_pair_decl.Ast.fn_body with
+         | Ast.FnBlock { Ast.b_tail = Some (Ast.StructLit (_, _, _, _, span)); _ } -> span
+         | _ -> failwith "struct-lit proof: make_pair body is not a StructLit tail"
+       in
+       (match List.assoc_opt (lit_span.Span.file_id, lit_span.Span.start) (Driver.typed_nodes_of lenv) with
+        | Some node ->
+            if Type_repr.compare node.Mir_lower.tn_type (Type_repr.Named (l_tid, [||])) = 0 then
+              Printf.printf
+                "  struct-lit typed channel: PASS (the literal's span carries the checker-resolved Named(type#%d, [||]))\n"
+                (Ids.Type_id.to_int l_tid)
+            else begin
+              Printf.printf "  struct-lit typed channel: FAIL (resolved type %s)\n"
+                (Seed_mir.print_type node.Mir_lower.tn_type);
+              exit 1
+            end
+        | None ->
+            Printf.printf "  struct-lit typed channel: FAIL (no typed node at the literal's span)\n";
+            exit 1);
+       (* the StructCtor aggregate: the pair tid, the registry-position
+          indices, and the operand VALUES at the REGISTRY positions —
+          the out-of-order literal `{ b: b, a: a }` must place param `a`
+          (local 1) at its registry position and param `b` (local 2) at
+          its registry position *)
+       let l_ctor =
+         Array.to_list lmake_pair.Seed_mir.blocks
+         |> List.find_map (fun (b : Seed_mir.block) ->
+                List.find_map
+                  (fun (s : Seed_mir.statement) ->
+                    match s with
+                    | Seed_mir.Assign (_, Seed_mir.Aggregate (Seed_mir.StructCtor (tid, fields), ops))
+                      ->
+                        Some (tid, fields, ops)
+                    | _ -> None)
+                  b.Seed_mir.statements)
+       in
+       (match l_ctor with
+        | Some (tid, fields, ops) ->
+            let index_ok =
+              Ids.Type_id.compare tid l_tid = 0
+              && Array.length fields = 2
+              && Ids.Field_index.compare fields.(0) (Ids.Field_index.make 0) = 0
+              && Ids.Field_index.compare fields.(1) (Ids.Field_index.make 1) = 0
+            in
+            let op_is_param pos local =
+              match List.nth_opt ops pos with
+              | Some (Seed_mir.Copy p) -> p.Seed_mir.local = local
+              | _ -> false
+            in
+            let pos_ok = op_is_param l_pos_a 1 && op_is_param l_pos_b 2 in
+            if index_ok && pos_ok then
+              Printf.printf
+                "  struct-lit lowering: PASS (StructCtor type#%d with registry indices [0;1]; `a`'s value at registry position %d, `b`'s at %d — the out-of-order literal landed at the typed declaration order)\n"
+                (Ids.Type_id.to_int tid) l_pos_a l_pos_b
+            else begin
+              Printf.printf
+                "  struct-lit lowering: FAIL (index_ok=%b pos_ok=%b; registry order: %s)\n"
+                index_ok pos_ok
+                (String.concat ", " (List.map (fun (n, _, _) -> n) l_reg));
+              exit 1
+            end
+        | None ->
+            Printf.printf "  struct-lit lowering: FAIL (no StructCtor aggregate in make_pair)\n";
+            exit 1);
+       let lprog : Seed_mir.program =
+         {
+           Seed_mir.functions = Array.of_list lmir_funcs;
+           statics = [||];
+           (* the StructDef from the REGISTRY: fd_index = the registry
+              position, fd_id = the registry's semantic FieldId *)
+           types =
+             [|
+               Seed_mir.StructDef
+                 {
+                   sd_id = l_tid;
+                   sd_fields =
+                     List.mapi
+                       (fun i (_, fid, fty) ->
+                         {
+                           Seed_mir.fd_id = fid;
+                           fd_index = Ids.Field_index.make i;
+                           fd_ty = fty;
+                         })
+                       l_reg;
+                 };
+             |];
+         }
+       in
+       (match Mir_verify.require_valid lprog with
+        | Ok () ->
+            Printf.printf "  struct-lit MIR verify: PASS (%d functions)\n"
+              (Array.length lprog.Seed_mir.functions)
+        | Error errs ->
+            Printf.printf "  struct-lit MIR verify: FAIL\n";
+            List.iter (fun e -> Printf.printf "    %s\n" e) errs;
+            Printf.printf "%s\n" (Seed_mir.print_program lprog);
+            exit 1);
+       let lentry =
+         match
+           Array.to_list lprog.Seed_mir.functions
+           |> List.find_opt (fun f -> f.Seed_mir.name = "main")
+         with
+         | Some f -> f.Seed_mir.instance
+         | None -> failwith "struct-lit proof: no main function"
+       in
+       let lhost = Host.create ~repo_root:"." ~argv:[||] in
+       (match Vm.run ~program:lprog ~entry:lentry ~argv:[||] ~host:lhost with
+        | Error e ->
+            Printf.printf "  struct-lit VM: FAIL %s\n" e.Vm.message;
+            exit 1
+        | Ok code ->
+            Printf.printf "  struct-lit VM: exit %d\n" code;
+            (match Vm.entry_frame_of ~program:lprog ~entry:lentry ~argv:[||] with
+             | Error m -> Printf.printf "  struct-lit main returned: <inspect failed: %s>\n" m
+             | Ok (lvm, lentry_frame) -> (
+                 match Vm.run_inspect lvm lentry_frame with
+                 | Ok ret_val ->
+                     Printf.printf "  struct-lit main returned: %s\n" ret_val;
+                     if ret_val = "63" then
+                       Printf.printf
+                         "  struct-lit RESULT: PASS (21 and 42 round-tripped through the StructCtor aggregate and the Field projections)\n"
+                     else begin
+                       Printf.printf "  struct-lit RESULT: FAIL (expected 63)\n";
+                       exit 1
+                     end
+                 | Error m -> Printf.printf "  struct-lit main returned: <inspect failed: %s>\n" m)));
+       ignore l_fid_a;
+       ignore l_fid_b;
+       (* ── method-call lowering proof (re-audit's ordinary-surface item:
+          `obj.method(args)` must lower with the receiver's typed PLACE as
+          the SELF argument (the read-side of the self parameter's
+          convention — the sig contracts ride in the methods table's
+          me_params.(0)), the owner named by the receiver's type, and the
+          resolved method instance — the typed channel's tn_call (the
+          checker-resolved callable + solved substitution) is
+          authoritative when present, else the env's methods-table
+          instance.  The method body lowers too (self.a + self.b through
+          the Field projections) and the emitted User callee resolves
+          against the method's seed function exactly (verifier + VM
+          dispatch instances).  main constructs p via the StructLit and
+          calls p.get_sum() — main returns 42. *)
+       let meth_src = {|
+struct Pair
+  a: Int
+  b: Int
+end
+
+impl Pair
+  def get_sum(self) -> Int
+    self.a + self.b
+  end
+end
+
+def main() -> Int
+  let p = Pair { a: 21, b: 21 }
+  p.get_sum()
+end
+|} in
+       let meth_file = Filename.temp_file "tg_lowersurface_method" ".tg" in
+       (let oc = open_out_bin meth_file in
+        output_string oc meth_src;
+        close_out oc);
+       let meth_manifest =
+         match Bootstrap_manifest.single ~file:meth_file ~path:[ "methodproof" ] () with
+         | Ok m -> m
+         | Error e -> failwith ("method-call proof manifest: " ^ e)
+       in
+       let mdiags = Diagnostic.create_bag () in
+       let mgraph = Module_graph.create_with_sources meth_manifest mdiags in
+       let mresolved = Resolver.resolve meth_manifest mgraph mdiags in
+       let mprog_ast = (List.hd mgraph.Module_graph.nodes).Module_graph.node_program in
+       (* the impl registration needs the declaration fixpoint (Phase C
+          checks the impl before Phase B registers the methods — the
+          driver re-runs to a fixpoint; mirror it here) *)
+       let rec mfix env n =
+         match Typecheck.check_program env mprog_ast with
+         | Error m -> failwith ("method-call proof typecheck: " ^ m)
+         | Ok (env', errors) ->
+             if errors = [] then env'
+             else if n = 0 then
+               failwith ("method-call proof typecheck errors: " ^ String.concat "; " errors)
+             else mfix env' (n - 1)
+       in
+       let menv = mfix (Typecheck.initial_env ~resolved:(Some mresolved) ()) 6 in
+       Sys.remove meth_file;
+       let m_tid = List.assoc "Pair" menv.Typecheck.type_ids in
+       let m_reg = List.assoc m_tid (Driver.struct_fields_of menv) in
+       let m_fid name =
+         match List.find_opt (fun (n, _, _) -> n = name) m_reg with
+         | Some (_, fid, _) -> fid
+         | None -> failwith ("method-call proof: no registry FieldId for " ^ name)
+       in
+       let m_fid_a = m_fid "a" and m_fid_b = m_fid "b" in
+       let m_mts =
+         match List.assoc ("Pair", "get_sum") menv.Typecheck.methods with
+         | ts -> ts
+         | exception Not_found -> failwith "method-call proof: no get_sum method signature"
+       in
+       if Array.length m_mts.Typecheck.ts_params = 0 then
+         failwith "method-call proof: get_sum has no self parameter";
+       let m_funcs =
+         List.filter_map
+           (fun i -> match i.Ast.kind with Ast.Function d -> Some d | _ -> None)
+           mprog_ast.Ast.items
+       in
+       let m_method_decl =
+         match
+           List.find_map
+             (fun i ->
+               match i.Ast.kind with
+               | Ast.ImplBlock d -> (
+                   match
+                     List.find_opt
+                       (fun (m : Ast.function_decl) -> m.Ast.fn_sig.Ast.sig_name = "get_sum")
+                       d.Ast.i_methods
+                   with
+                   | Some m -> Some (d, m)
+                   | None -> None)
+               | _ -> None)
+             mprog_ast.Ast.items
+         with
+         | Some (_, m) -> m
+         | None -> failwith "method-call proof: no get_sum impl method"
+       in
+       let mts_of name =
+         match List.assoc_opt name menv.Typecheck.functions with
+         | Some ts -> ts
+         | None -> (
+             match List.filter (fun (k, _) -> Util.has_suffix k ("::" ^ name)) menv.Typecheck.functions with
+             | [ (_, ts) ] -> ts
+             | _ -> failwith ("method-call proof: no typed signature for " ^ name))
+       in
+       let menv2 : Mir_lower.func_env =
+         {
+           Mir_lower.types =
+             [
+               ("Pair", Type_repr.Named (m_tid, [||]));
+               ("Int", int_ty);
+               ("Unit", Type_repr.Unit);
+               ("Bool", Type_repr.Bool);
+               ("String", string_ty);
+             ];
+           values =
+             List.map
+               (fun d ->
+                 let n = d.Ast.fn_sig.Ast.sig_name in
+                 (n, (mts_of n).Typecheck.ts_return))
+               m_funcs;
+           callables =
+             List.map
+               (fun d ->
+                 let n = d.Ast.fn_sig.Ast.sig_name in
+                 ( n,
+                   {
+                     Mir_lower.ce_callable = Ids.Callable_id.to_int (mts_of n).Typecheck.ts_callable;
+                     ce_template_args = [||];
+                     ce_params = [||];
+                   } ))
+               m_funcs;
+           methods =
+             [
+               ( ("Pair", "get_sum"),
+                 {
+                   Mir_lower.me_instance =
+                     (* the same instance the method body is lowered
+                        under below (callable + declaration-order type
+                        args — [||] for the non-generic method) *)
+                     Instance_id.make ~callable:m_mts.Typecheck.ts_callable
+                       ~type_args:
+                         (Array.of_list
+                            (List.map
+                               (fun (_, pid) -> Type_repr.Type_param pid)
+                               m_mts.Typecheck.ts_params_decl));
+                   me_params = m_mts.Typecheck.ts_params;
+                   me_ret = m_mts.Typecheck.ts_return;
+                 } );
+             ];
+           fn_ret = int_ty;
+           struct_fields = Driver.struct_fields_of menv;
+         }
+       in
+       let mmir_funcs =
+         List.map
+           (fun d ->
+             let n = d.Ast.fn_sig.Ast.sig_name in
+             let ts = mts_of n in
+             Mir_lower.lower_function_with_variants Mir_lower.default_variant_table
+               ~typed_nodes:(Driver.typed_nodes_of menv)
+               { menv2 with Mir_lower.fn_ret = ts.Typecheck.ts_return }
+               n (Ids.Callable_id.to_int ts.Typecheck.ts_callable) [||] [||] d)
+           m_funcs
+       in
+       (* the method body lowers through the same env: the SELF parameter
+          is the receiver-typed place the call passes *)
+       let mmethod_fn =
+         Mir_lower.lower_function_with_variants Mir_lower.default_variant_table
+           ~typed_nodes:(Driver.typed_nodes_of menv)
+           { menv2 with Mir_lower.fn_ret = m_mts.Typecheck.ts_return }
+           m_method_decl.Ast.fn_sig.Ast.sig_name
+           (Ids.Callable_id.to_int m_mts.Typecheck.ts_callable)
+           (Array.of_list
+              (List.map (fun (_, pid) -> Type_repr.Type_param pid) m_mts.Typecheck.ts_params_decl))
+           (Array.map (fun p -> p.Type_repr.pt_convention) m_mts.Typecheck.ts_params)
+           ~param_tys_opt:(Array.map (fun p -> p.Type_repr.pt_type) m_mts.Typecheck.ts_params)
+           m_method_decl
+       in
+       let mprog : Seed_mir.program =
+         {
+           Seed_mir.functions = Array.of_list (mmethod_fn :: mmir_funcs);
+           statics = [||];
+           types =
+             [|
+               Seed_mir.StructDef
+                 {
+                   sd_id = m_tid;
+                   sd_fields =
+                     List.mapi
+                       (fun i (_, fid, fty) ->
+                         {
+                           Seed_mir.fd_id = fid;
+                           fd_index = Ids.Field_index.make i;
+                           fd_ty = fty;
+                         })
+                       m_reg;
+                 };
+             |];
+         }
+       in
+       (* the typed channel: the method call's span node carries
+          tn_call = the checker-resolved callable + solved substitution
+          ([||] for the non-generic method) *)
+       let mmain_decl =
+         List.find
+           (fun (d : Ast.function_decl) -> d.Ast.fn_sig.Ast.sig_name = "main")
+           m_funcs
+       in
+       let mcall_span =
+         match mmain_decl.Ast.fn_body with
+         | Ast.FnBlock { Ast.b_tail = Some (Ast.Call (_, _, _, span)); _ } -> span
+         | _ -> failwith "method-call proof: main body is not a call tail"
+       in
+       (match
+          List.assoc_opt (mcall_span.Span.file_id, mcall_span.Span.start)
+            (Driver.typed_nodes_of menv)
+        with
+        | Some node -> (
+            match node.Mir_lower.tn_call with
+            | Some (callable, subst)
+              when Ids.Callable_id.compare callable m_mts.Typecheck.ts_callable = 0
+                   && Array.length subst = 0 ->
+                Printf.printf
+                  "  method-call typed channel: PASS (the call's span carries tn_call = (CallableId#%d, [||]) — the checker-resolved instance)\n"
+                  (Ids.Callable_id.to_int callable)
+            | Some (callable, subst) ->
+                Printf.printf
+                  "  method-call typed channel: FAIL (tn_call = (CallableId#%d, [%d args]))\n"
+                  (Ids.Callable_id.to_int callable) (Array.length subst);
+                exit 1
+            | None ->
+                Printf.printf "  method-call typed channel: FAIL (no tn_call on the call's node)\n";
+                exit 1)
+        | None ->
+            Printf.printf "  method-call typed channel: FAIL (no typed node at the call's span)\n";
+            exit 1);
+       let mmain_fn =
+         List.find (fun f -> f.Seed_mir.name = "main") (Array.to_list mprog.Seed_mir.functions)
+       in
+       (* the emitted call: the User callee's instance EQUALS the method
+          seed's instance (the verifier/VM dispatch instances exactly),
+          and the receiver is the self argument: a place operand typed
+          Named (m_tid, [||]) with the read-side of the self convention
+          (self is `let`-convention -> Read) *)
+       let mcall =
+         Array.to_list mmain_fn.Seed_mir.blocks
+         |> List.find_map (fun (b : Seed_mir.block) ->
+                match b.Seed_mir.terminator with
+                | Seed_mir.Call (_, Seed_mir.User inst, args, _, _) ->
+                    if
+                      Ids.Callable_id.compare inst.Instance_id.callable
+                        m_mts.Typecheck.ts_callable
+                      = 0
+                    then Some (inst, args)
+                    else None
+                | _ -> None)
+       in
+       (match mcall with
+        | Some (inst, args) ->
+            let inst_ok =
+              Ids.Callable_id.compare inst.Instance_id.callable
+                (Instance_id.callable mmethod_fn.Seed_mir.instance)
+              = 0
+              && Array.length inst.Instance_id.type_args = 0
+              && Array.length (Instance_id.type_args mmethod_fn.Seed_mir.instance) = 0
+            in
+            let self_ok =
+              Array.length args = 1
+              && (match args.(0).Seed_mir.effect_ with Access_effect.Read -> true | _ -> false)
+              && (match args.(0).Seed_mir.value with
+                 | Seed_mir.Copy p -> (
+                     match mmain_fn.Seed_mir.locals.(p.Seed_mir.local) with
+                     | Type_repr.Named (t, _) -> Ids.Type_id.compare t m_tid = 0
+                     | _ -> false)
+                 | _ -> false)
+            in
+            if inst_ok && self_ok then
+              Printf.printf
+                "  method-call lowering: PASS (User callee = the method seed's instance CallableId#%d; the receiver lowers to its typed place and is passed as the SELF argument with the read-side of the `let` self convention)\n"
+                (Ids.Callable_id.to_int (Instance_id.callable mmethod_fn.Seed_mir.instance))
+            else begin
+              Printf.printf "  method-call lowering: FAIL (inst_ok=%b self_ok=%b)\n" inst_ok self_ok;
+              exit 1
+            end
+        | None ->
+            Printf.printf "  method-call lowering: FAIL (no User call to the method instance in main)\n";
+            exit 1);
+       (* the method BODY: self.a + self.b lowers through the Field
+          projections with the registry's semantic FieldIds *)
+       let mbody_fields_ok =
+         Array.exists
+           (fun (b : Seed_mir.block) ->
+             List.exists
+               (fun (s : Seed_mir.statement) ->
+                 match s with
+                 | Seed_mir.Assign (_, Seed_mir.BinaryOp (_, Seed_mir.Copy p1, Seed_mir.Copy p2)) ->
+                     List.exists
+                       (function Seed_mir.Field f -> Ids.Field_id.compare f m_fid_a = 0 | _ -> false)
+                       p1.Seed_mir.projections
+                     && List.exists
+                          (function Seed_mir.Field f -> Ids.Field_id.compare f m_fid_b = 0 | _ -> false)
+                          p2.Seed_mir.projections
+                 | _ -> false)
+               b.Seed_mir.statements)
+           mmethod_fn.Seed_mir.blocks
+       in
+       if not mbody_fields_ok then begin
+         Printf.printf "  method-call body: FAIL (get_sum carries no Field projections for the registry's FieldIds)\n";
+         exit 1
+       end;
+       Printf.printf
+         "  method-call body: PASS (get_sum's lowered body reads self.a/self.b through the Field projections with the registry's FieldIds)\n";
+       (match Mir_verify.require_valid mprog with
+        | Ok () ->
+            Printf.printf "  method-call MIR verify: PASS (%d functions)\n"
+              (Array.length mprog.Seed_mir.functions)
+        | Error errs ->
+            Printf.printf "  method-call MIR verify: FAIL\n";
+            List.iter (fun e -> Printf.printf "    %s\n" e) errs;
+            Printf.printf "%s\n" (Seed_mir.print_program mprog);
+            exit 1);
+       let mentry =
+         match
+           Array.to_list mprog.Seed_mir.functions
+           |> List.find_opt (fun f -> f.Seed_mir.name = "main")
+         with
+         | Some f -> f.Seed_mir.instance
+         | None -> failwith "method-call proof: no main function"
+       in
+       let mhost = Host.create ~repo_root:"." ~argv:[||] in
+       (match Vm.run ~program:mprog ~entry:mentry ~argv:[||] ~host:mhost with
+        | Error e ->
+            Printf.printf "  method-call VM: FAIL %s\n" e.Vm.message;
+            exit 1
+        | Ok code ->
+            Printf.printf "  method-call VM: exit %d\n" code;
+            (match Vm.entry_frame_of ~program:mprog ~entry:mentry ~argv:[||] with
+             | Error m -> Printf.printf "  method-call main returned: <inspect failed: %s>\n" m
+             | Ok (mvm, mentry_frame) -> (
+                 match Vm.run_inspect mvm mentry_frame with
+                 | Ok ret_val ->
+                     Printf.printf "  method-call main returned: %s\n" ret_val;
+                     if ret_val = "42" then
+                       Printf.printf
+                         "  method-call RESULT: PASS (p.get_sum() = self.a + self.b = 21 + 21 through the receiver self-arg and the method seed)\n"
+                     else begin
+                       Printf.printf "  method-call RESULT: FAIL (expected 42)\n";
+                       exit 1
+                     end
+                 | Error m -> Printf.printf "  method-call main returned: <inspect failed: %s>\n" m)));
+       (* ── fail-closed proof: every unresolvable method call and struct
+          literal fails closed with the reason — the receiver/method
+          instance, the literal's field positions, and the spread channel
+          all fail closed instead of producing a silent Nop or a
+          mis-projection.  The env is hand-built (no typed channel, like
+          the harness's other hand-built envs) and each Seed_bug's message
+          must carry the reason. *)
+       let fclose_src = {|
+struct Pair
+  a: Int
+  b: Int
+end
+
+def no_such_method() -> Int
+  let p = Pair { a: 1, b: 2 }
+  p.nope()
+end
+
+def missing_field() -> Pair
+  Pair { a: 1 }
+end
+
+def unknown_field() -> Pair
+  Pair { a: 1, c: 2, b: 3 }
+end
+
+def spread_lit() -> Pair
+  let p = Pair { a: 1, b: 2 }
+  Pair { a: 1, ..p }
+end
+
+def main() -> Int
+  0
+end
+|} in
+       let fclose_file = "<lowersurface-failclosed>" in
+       (match Source_loader.load_string fclose_file fclose_src with
+        | Error _ -> failwith "fail-closed proof source load"
+        | Ok fsrc ->
+            let fsm = Span.create () in
+            let fsfid = Span.add_file fsm fsrc.Source.name fsrc in
+            let fsdiags = Diagnostic.create_bag () in
+            let fslx = Lexer.create fsrc.Source.bytes fsfid fsdiags in
+            let fstoks = Lexer.lex fslx in
+            let fsprog = Parser.parse fstoks fsrc.Source.bytes fsfid fsdiags [ "fclose" ] in
+            if Diagnostic.has_errors fsdiags then begin
+              Printf.printf "  fail-closed proof: FAIL (parse errors)\n%s\n"
+                (Diagnostic.render fsm fsdiags);
+              exit 1
+            end;
+            let fs_funcs =
+              List.filter_map
+                (fun i -> match i.Ast.kind with Ast.Function d -> Some d | _ -> None)
+                fsprog.Ast.items
+            in
+            let fs_tid = l_tid in
+            let fsenv : Mir_lower.func_env =
+              {
+                Mir_lower.types =
+                  [
+                    ("Pair", Type_repr.Named (fs_tid, [||]));
+                    ("Int", int_ty);
+                    ("Unit", Type_repr.Unit);
+                    ("Bool", Type_repr.Bool);
+                    ("String", string_ty);
+                  ];
+                values = [ ("main", int_ty) ];
+                callables = [];
+                methods = [];
+                fn_ret = int_ty;
+                struct_fields =
+                  [ (fs_tid, [ ("a", l_fid_a, int_ty); ("b", l_fid_b, int_ty) ]) ];
+              }
+            in
+            let contains_sub s sub =
+              let ls = String.length s and l = String.length sub in
+              if l = 0 then true
+              else begin
+                let rec go i =
+                  if i + l > ls then false
+                  else if String.sub s i l = sub then true
+                  else go (i + 1)
+                in
+                go 0
+              end
+            in
+            let lower_expect_bug (fname : string) (needle : string) =
+              match
+                List.find_opt
+                  (fun (d : Ast.function_decl) -> d.Ast.fn_sig.Ast.sig_name = fname)
+                  fs_funcs
+              with
+              | None -> failwith ("fail-closed proof: no function " ^ fname)
+              | Some d -> (
+                  match
+                    (try
+                       Ok
+                         (Mir_lower.lower_function_with_variants Mir_lower.default_variant_table
+                            fsenv fname 0 [||] [||] d)
+                     with
+                    | Mir_lower.Seed_bug m -> Error m)
+                  with
+                  | Error m when contains_sub m needle ->
+                      Printf.printf "  fail-closed %s: PASS (%s)\n" fname m
+                  | Error m ->
+                      Printf.printf "  fail-closed %s: FAIL (message lacks %S: %s)\n" fname needle m;
+                      exit 1
+                  | Ok _ ->
+                      Printf.printf "  fail-closed %s: FAIL (lowered without a Seed_bug)\n" fname;
+                      exit 1)
+            in
+            lower_expect_bug "no_such_method" "has no method instance";
+            lower_expect_bug "missing_field" "initializes 1 of 2 field(s)";
+            lower_expect_bug "unknown_field" "unknown field `c`";
+            lower_expect_bug "spread_lit" "`..` spread");
+       ignore lenv2;
+       ignore menv2

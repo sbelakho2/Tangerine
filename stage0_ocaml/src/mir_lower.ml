@@ -71,11 +71,30 @@ type callable_entry = {
   ce_params : Type_repr.param_type array; (* callee parameter contracts (conventions in order) *)
 }
 
+(* The resolved method-instance registry (re-audit: a method call must
+   reach lowering with the receiver's typed place AND the resolved
+   method instance — the `(owner type name, method) -> instance` pair
+   the typechecker's own dispatch uses, carried over from the typed
+   registry's methods table).  Each entry carries the method's typed
+   signature contracts: me_params.(0) is the SELF parameter (its
+   convention is the receiver's access effect at the call site — the
+   receiver lowers to a place and is passed as the self argument with
+   the read-side of that convention), me_ret is the call's result type,
+   and me_instance is the (callable, type_args) identity the method body
+   is lowered under — so the emitted User callee resolves against the
+   callee function in the program (the verifier/VM dispatch instances
+   exactly). *)
+type method_entry = {
+  me_instance : Instance_id.t;
+  me_params : Type_repr.param_type array;
+  me_ret : Type_repr.t;
+}
+
 type func_env = {
   types : (string * Type_repr.t) list;               (* type name -> repr *)
   values : (string * Type_repr.t) list;              (* global value name -> type *)
   callables : (string * callable_entry) list;        (* function name -> resolved entry *)
-  methods : ((string * string) * Instance_id.t) list;  (* (receiver type name, method) -> instance *)
+  methods : ((string * string) * method_entry) list;  (* (receiver type name, method) -> instance + sig contracts *)
   fn_ret : Type_repr.t;
   (* The typed nominal registry (re-audit finding: Field access reached
      MIR lowering without a typed place (FieldId) rule — the lowerer's
@@ -106,6 +125,10 @@ type func_env = {
 type typed_node = {
   tn_type : Type_repr.t;               (* the expr's resolved type *)
   tn_cast_target : Type_repr.t option; (* Ast.Cast: checker-resolved target *)
+  tn_call : (Ids.Callable_id.t * Type_repr.t array) option;
+  (* Ast.Call: the checker-resolved callee CallableId + the SOLVED
+     concrete substitution in declaration order — the exact-arity
+     pairing for the User instance the Call terminator emits *)
 }
 
 (* ── Variant tables ──────────────────────────────────────────────
@@ -962,7 +985,7 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
   | Ast.CompoundAssign (_, _, _, span) ->
       ignore span;
       seed_bug "CompoundAssign reached MIR lowering without a typed-place writeback rule"
-  | Ast.Call (callee, _, args, _) -> lower_call env st callee args
+  | Ast.Call (callee, _, args, span) -> lower_call env st span callee args
   | Ast.TryOp (inner, _) -> (
       (* `?`: match the Option/Result subject; the success variant (tag
          0) supplies the payload as the expression value; the failure
@@ -1194,6 +1217,109 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
               seed_bug
                 "runtime for-loop over a non-array iterable of type %s is not lowered (the seed verifier admits dynamic Index/Len only on Fixed_array bases; lower it to an Array literal for the unrolled path)"
                 (Seed_mir.print_type arr_ty)))
+  | Ast.StructLit (name, targs, fields, rest, span) -> (
+      (* re-audit: the StructCtor aggregate rule — `Type { field: value,
+         ... }` lowers to a StructCtor aggregate whose type is the
+         struct's Named type and whose operand positions are the
+         DECLARATION order (the typed registry's struct_fields entries —
+         the same order closure_types materializes into the StructDefs,
+         so the verifier's aggregate-vs-def count/types check and the
+         VM's field_index_of agree).  The aggregate's type is the
+         checker's resolved type when the typed channel is present —
+         REQUIRED for a generic struct, whose declaration-owned param
+         ids the syntax path cannot reconstruct (a generic struct
+         literal without the channel fails closed); the non-generic
+         case falls back to the env's type table.  Every unresolvable
+         field — unknown name, missing field, duplicate, `..` spread —
+         fails closed with the reason. *)
+      ignore targs;
+      (match rest with
+       | Some _ ->
+           seed_bug
+             "struct literal `%s` with a `..` spread is not lowered (the seed StructCtor form has no spread channel)"
+             name
+       | None -> ());
+      let rt =
+        match typed_node_of st span with
+        | Some node -> node.tn_type
+        | None -> (
+            match List.assoc_opt name env.types with
+            | Some (Type_repr.Named (tid, params)) when Array.length params = 0 ->
+                Type_repr.Named (tid, [||])
+            | Some (Type_repr.Named _) ->
+                seed_bug
+                  "struct literal `%s` has no typed node (a generic struct literal needs the typechecker's resolved type in the typed channel)"
+                  name
+            | _ ->
+                seed_bug "struct literal `%s`: the type is not in the lowering env's type table"
+                  name)
+      in
+      let tid =
+        match rt with
+        | Type_repr.Named (t, _) -> t
+        | _ ->
+            seed_bug "struct literal `%s` resolves to the non-struct type %s" name
+              (Seed_mir.print_type rt)
+      in
+      (match List.assoc_opt tid env.struct_fields with
+       | None ->
+           seed_bug
+             "struct literal `%s` (type#%d): the typed registry has no struct-field entry" name
+             (Ids.Type_id.to_int tid)
+       | Some reg ->
+           let reg_len = List.length reg in
+           let index_of fname =
+             let rec go i = function
+               | [] -> None
+               | (fn, _, _) :: rest -> if fn = fname then Some i else go (i + 1) rest
+             in
+             go 0 reg
+           in
+           (* unknown field names fail closed FIRST — the more precise
+              diagnostic (an unknown name is never a count problem) *)
+           List.iter
+             (fun (fname, _) ->
+               if index_of fname = None then
+                 seed_bug "unknown field `%s` of struct `%s` in struct-literal lowering" fname
+                   name)
+             fields;
+           if List.length fields <> reg_len then
+             seed_bug
+               "struct literal `%s` initializes %d of %d field(s) (the seed StructCtor form needs every field; no defaulting or `..` spread is lowered)"
+               name (List.length fields) reg_len;
+           (* the field VALUES lower in source order, each exactly once,
+              and land at their DECLARATION positions (the typed
+              registry's order) *)
+           let placed = Array.make reg_len None in
+           List.iter
+             (fun (fname, fe) ->
+               match index_of fname with
+               | Some i -> (
+                   match placed.(i) with
+                   | Some _ ->
+                       seed_bug "duplicate field `%s` in the struct literal of `%s`" fname name
+                   | None -> placed.(i) <- Some (fst (lower_expr env st fe)))
+               | None -> ())
+             fields;
+           let ops =
+             Array.to_list placed
+             |> List.map (function
+                  | Some op -> op
+                  | None ->
+                      seed_bug
+                         "struct literal `%s` is missing a field (internal: the count check should have failed closed)"
+                         name)
+           in
+           let id = fresh_local st rt in
+           emit st
+             (Seed_mir.Assign
+                ( cur_place st id,
+                  Seed_mir.Aggregate
+                    ( Seed_mir.StructCtor
+                        ( tid,
+                          Array.init reg_len (fun i -> Ids.Field_index.make i) ),
+                      ops ) ));
+           (copy_place st (cur_place st id), rt)))
   | other -> seed_bug "unhandled supported expression form: %s" (expr_form_name other)
 
 and int_kind_of (t : Type_repr.t) : Type_repr.int_kind =
@@ -1554,8 +1680,8 @@ and lower_loop (env : func_env) (st : lower_state) (b : Ast.block_body) :
   push_block st join_b;
   (Seed_mir.Constant Seed_mir.Unit, Type_repr.Unit)
 
-and lower_call (env : func_env) (st : lower_state) (callee : Ast.expr)
-    (args : Ast.call_arg list) : Seed_mir.operand * Type_repr.t =
+and lower_call (env : func_env) (st : lower_state) (span : Span.span)
+    (callee : Ast.expr) (args : Ast.call_arg list) : Seed_mir.operand * Type_repr.t =
   match callee with
   | Ast.Name (n, _) -> (
       match ctor_of st.variants n with
@@ -1608,18 +1734,129 @@ and lower_call (env : func_env) (st : lower_state) (callee : Ast.expr)
                      arg_ops)
               in
               let next_b = new_block st in
-              (* the concrete call-substitution arrives with the typed
-                 lowering channel; until then, non-generic calls (the
-                 kernel closure has zero generic defs) carry [||] and the
-                 mono arity pairing stays exact. *)
+              (* the typed lowering channel is authoritative: when the
+                 call's span node carries tn_call, the User instance is
+                 the checker-resolved callee + the SOLVED concrete
+                 substitution (the mono exact-arity pairing — declaration
+                 params vs concrete type_args); the [||] path is only the
+                 hand-built selfcheck fallback, where the channel is
+                 absent and the kernel's zero-generic defs stay exact. *)
+              let tn_call = match typed_node_of st span with Some n -> n.tn_call | None -> None in
+              let instance =
+                match tn_call with
+                | Some (callable, type_args) ->
+                    Instance_id.make ~callable ~type_args
+                | None ->
+                    Instance_id.make ~callable:(Ids.Callable_id.make cid) ~type_args:[||]
+              in
               set_terminator_to st
-                (Seed_mir.Call (rp, Seed_mir.User (Instance_id.make ~callable:(Ids.Callable_id.make cid) ~type_args:[||]), arg_vals, next_b, None))
+                (Seed_mir.Call (rp, Seed_mir.User instance, arg_vals, next_b, None))
                 next_b;
               (copy_place st rp, ty)
           | None -> seed_bug "unknown callee '%s' in lowering" n))
-  | Ast.Field (_, mname, span) -> (
-      ignore span;
-      seed_bug "method call `%s` reached lowering without a resolved receiver-typed instance" mname)
+  | Ast.Field (base, mname, span) -> (
+      (* re-audit: the method-call rule — the receiver is lowered to its
+         typed PLACE and passed as the SELF argument with the read-side
+         of the self parameter's convention (the methods' sig contracts
+         are in the registry: me_params.(0) is the self parameter); the
+         receiver's type names the owner ((owner, method) -> instance);
+         the emitted User callee is the method's instance — the typed
+         channel's tn_call (the checker-resolved callable + SOLVED
+         concrete substitution) is authoritative when present, else the
+         registry's me_instance (the identity the method body was
+         lowered under).  Every unresolvable receiver or method fails
+         closed with the reason. *)
+      let rop, rty = lower_expr env st base in
+      let rp = materialize_place st rop in
+      let owner =
+        match rty with
+        | Type_repr.Named (tid, _) -> (
+            match
+              List.find_map
+                (fun (n, r) ->
+                  match r with
+                  | Type_repr.Named (t2, _) when Ids.Type_id.compare t2 tid = 0 -> Some n
+                  | _ -> None)
+                env.types
+            with
+            | Some n -> n
+            | None ->
+                seed_bug
+                  "method call `%s`: the receiver's type#%d has no name in the lowering env's type table"
+                  mname (Ids.Type_id.to_int tid))
+        | _ ->
+            seed_bug "method call `%s`: the receiver is not a nominal (found %s)" mname
+              (Seed_mir.print_type rty)
+      in
+      (match List.assoc_opt (owner, mname) env.methods with
+       | None ->
+           seed_bug
+             "method call `%s`: type `%s` has no method instance in the lowering env's methods table"
+             mname owner
+       | Some me -> (
+           if Array.length me.me_params = 0 then
+             seed_bug
+               "method call `%s`: the method instance of `%s` carries no self parameter" mname
+               owner;
+           let nargs = List.length args in
+           if nargs <> Array.length me.me_params - 1 then
+             seed_bug "method call `%s` of `%s`: expected %d argument(s), got %d" mname owner
+               (Array.length me.me_params - 1) nargs;
+           (* the instance: the typed channel's checker-resolved callable
+              + solved concrete substitution when present (the generic
+              call's concrete args arrive there), else the registry's
+              instance *)
+           let instance =
+             match typed_node_of st span with
+             | Some node -> (
+                 match node.tn_call with
+                 | Some (callable, type_args) ->
+                     Instance_id.make ~callable ~type_args
+                 | None -> me.me_instance)
+             | None -> me.me_instance
+           in
+           let self_conv = me.me_params.(0).Type_repr.pt_convention in
+           let self_eff = Access_effect.read_effect self_conv in
+           (* the receiver's operand form follows the self convention:
+              a consuming self (Sink/Set) TRANSFERS the receiver (Move —
+              never a projected place, the seed VM has no partial-move
+              representation); an Inout self keeps the by-place read
+              form the free-function call path uses (the seed VM reads
+              the arg; the writeback is the documented seed
+              approximation, same as Modify args elsewhere) *)
+           let self_op =
+             match self_eff with
+             | Access_effect.Read | Access_effect.Modify -> Seed_mir.Copy rp
+             | Access_effect.Consume | Access_effect.Initialize -> (
+                 match rp.Seed_mir.projections with
+                 | [] -> Seed_mir.Move rp
+                 | _ ->
+                     seed_bug
+                       "method call `%s`: the consuming self argument cannot be a projected place (the seed VM has no partial-move representation)"
+                       mname)
+           in
+           let arg_ops = List.map (fun a -> fst (lower_expr env st a.Ast.ca_value)) args in
+           let id = fresh_local st me.me_ret in
+           let rp2 = cur_place st id in
+           let arg_vals =
+             Array.of_list
+               ({ Seed_mir.effect_ = self_eff; value = self_op }
+                :: List.mapi
+                     (fun i op ->
+                       {
+                         Seed_mir.effect_ =
+                           (if i + 1 < Array.length me.me_params then
+                             Access_effect.read_effect me.me_params.(i + 1).Type_repr.pt_convention
+                            else Access_effect.Read);
+                         value = op;
+                       })
+                     arg_ops)
+           in
+           let next_b = new_block st in
+           set_terminator_to st
+             (Seed_mir.Call (rp2, Seed_mir.User instance, arg_vals, next_b, None))
+             next_b;
+           (copy_place st rp2, me.me_ret))))
   | _ -> seed_bug "unsupported callee form in lowering"
 
 and emit_defers (env : func_env) (st : lower_state) : unit =

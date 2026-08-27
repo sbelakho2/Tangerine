@@ -65,13 +65,21 @@ type typed_expr = {
    the parser stamps on the AST node.  Every accepted node persists its
    resolved type; casts additionally persist the checker-RESOLVED target
    type (a Named(GenericParamId, ...) carrying the declaration-owned
-   ids — never a positional reconstruction).  The map is populated
-   during check_expr (additive) and exposed to lowering through the
-   driver's typed_nodes_of, where the typed channel is authoritative
-   when a span-keyed entry is present. *)
+   ids — never a positional reconstruction); calls additionally persist
+   the checker-RESOLVED callee identity and the SOLVED concrete
+   substitution (the typed_call's substitution array — substitute_fixpoint
+   over the declaration params, so concrete types land).  The map is
+   populated during check_expr (additive) and exposed to lowering
+   through the driver's typed_nodes_of, where the typed channel is
+   authoritative when a span-keyed entry is present. *)
 type typed_node = {
   tn_type : Type_repr.t;               (* the expr's resolved type *)
   tn_cast_target : Type_repr.t option; (* Ast.Cast: checker-resolved target *)
+  tn_call : (Ids.Callable_id.t * Type_repr.t array) option;
+  (* Ast.Call: the callee's CallableId + the solved concrete
+     substitution in declaration order (the exact-arity pairing the
+     lowering Call rule consumes; [||] and None are distinct: an
+     empty array is a solved zero-arg substitution, None = no call) *)
 }
 
 type typed_call = {
@@ -122,7 +130,13 @@ type state = {
   mutable next_var_id : int;
   mutable failed_items : string list;
   mutable o_handoff_resolved : int;
-  mutable nested_functions : (string * typed_signature) list;
+  (* the nested-function registry (re-audit: nested defs reach closure
+     MIR lowering from HERE — the accepted typed callable universe).
+     Each entry carries the qname, the typed signature (the callable id,
+     params, return) AND the function_decl AST: the driver's lower_closure
+     lowers every registered entry as its own seed function, so callers'
+     calls (which carry the nested callable id) resolve. *)
+  mutable nested_functions : (string * typed_signature * Ast.function_decl) list;
   mutable query_sigs : (string * typed_signature) list;
   mutable o_handoff_fallback : int;
   (* once-only declaration identities: the first allocation of an item's
@@ -2175,8 +2189,17 @@ and check_expr (env : env) (scope : scope) (expected : Type_repr.t option) (e : 
          rule (the target carries the declaration-owned GenericParamIds
          the syntax-driven reconstruction cannot recover). *)
       let cast_target = match e with Ast.Cast _ -> Some te.te_type | _ -> None in
-      Hashtbl.replace env.typed_nodes (te.te_span.Span.file_id, te.te_span.Span.start)
-        { tn_type = te.te_type; tn_cast_target = cast_target };
+      (* a call's tn_call is written by check_call_sig/check_method_call
+         (which run INSIDE check_expr_inner, before this replace); preserve
+         it so the call channel survives the node record *)
+      let key = (te.te_span.Span.file_id, te.te_span.Span.start) in
+      let tn_call =
+        match Hashtbl.find_opt env.typed_nodes key with
+        | Some n -> n.tn_call
+        | None -> None
+      in
+      Hashtbl.replace env.typed_nodes key
+        { tn_type = te.te_type; tn_cast_target = cast_target; tn_call };
       Ok te
   | Error m -> Error m
 
@@ -2825,7 +2848,8 @@ and check_stmt (env : env) (scope : scope) (s : Ast.stmt) : (scope, string) resu
        | Error _ -> Ok scope
        | Ok sig_ ->
            env.state.nested_functions <-
-             (qname, sig_) :: List.remove_assoc qname env.state.nested_functions;
+             (qname, sig_, fd)
+             :: List.filter (fun (k, _, _) -> k <> qname) env.state.nested_functions;
            let env_m = env in
            (* the nested body is checked like the program-level fn body *)
            (match fd.Ast.fn_body with
@@ -3405,13 +3429,13 @@ and lookup_function (env : env) (n : string) : typed_signature option =
       (* nested declarations first (a local helper like table_read), then
          the current module's own declaration, then the closure-wide
          unique suffix *)
-      match List.assoc_opt n env.state.nested_functions with
-      | Some f -> Some f
+      match List.find_opt (fun (k, _, _) -> k = n) env.state.nested_functions with
+      | Some (_, f, _) -> Some f
       | None -> (
           match
-            List.filter (fun (k, _) -> Util.has_suffix k ("::" ^ n)) env.state.nested_functions
+            List.filter (fun (k, _, _) -> Util.has_suffix k ("::" ^ n)) env.state.nested_functions
           with
-          | [ (_, f) ] -> Some f
+          | [ (_, f, _) ] -> Some f
           | _ -> (
               match
                 match env.module_path with
@@ -3902,6 +3926,12 @@ and check_call_sig (env : env) (scope : scope) (expected : Type_repr.t option)
         }
       in
       env.state.oracle.o_calls <- call :: env.state.oracle.o_calls;
+      (* the persistent typed-call channel (re-audit): the node at the
+         call's span carries the callee's CallableId + the SOLVED
+         concrete substitution (declaration order, substitute_fixpoint
+         over the vars) — the exact-arity pairing lowering consumes *)
+      Hashtbl.replace env.typed_nodes (span.Span.file_id, span.Span.start)
+        { tn_type = ret; tn_cast_target = None; tn_call = Some (sig_.ts_callable, substitution) };
       (* the integrated access channel (re-audit P0-11): one record per
          argument, in program order, aligned with the recorded effects;
          each record carries the argument's typed type *)
@@ -4263,6 +4293,11 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
                   }
                 in
                 env.state.oracle.o_calls <- call :: env.state.oracle.o_calls;
+                (* the persistent typed-call channel: same node-keyed
+                   record as check_call_sig — the method's call span
+                   carries the resolved callable + solved substitution *)
+                Hashtbl.replace env.typed_nodes (span.Span.file_id, span.Span.start)
+                  { tn_type = ret; tn_cast_target = None; tn_call = Some (sig_.ts_callable, substitution) };
                 (* the integrated access channel (re-audit P0-11): the
                    receiver first, then the arguments, aligned with
                    all_effects; each record carries the typed type *)
@@ -5160,7 +5195,7 @@ let run_oracle (env : env) (_item_name : string) : string list =
     @ List.map (fun (_, s) -> s.ts_callable) env.methods
     @ List.map (fun (_, s) -> s.ts_callable) env.constructors
     @ List.map (fun (_, s) -> s.ts_callable) st.query_sigs
-    @ List.map (fun (_, s) -> s.ts_callable) st.nested_functions
+    @ List.map (fun (_, s, _) -> s.ts_callable) st.nested_functions
   in
   let is_known c =
     List.exists (fun k -> Ids.Callable_id.compare k c = 0) known_callables

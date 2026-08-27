@@ -165,7 +165,8 @@ let struct_fields_of (env : Typecheck.env) :
    lower_function_with_variants call.  The typed channel is authoritative
    in lowering when a span-keyed entry is present; the cast rule consumes
    the checker-RESOLVED target (declaration-owned GenericParamIds) and
-   never re-derives it from syntax positionally. *)
+   never re-derives it from syntax positionally; the call rule consumes
+   the checker-RESOLVED callee + solved concrete substitution (tn_call). *)
 let typed_nodes_of (env : Typecheck.env) : ((int * int) * Mir_lower.typed_node) list =
   Hashtbl.fold
     (fun key (node : Typecheck.typed_node) acc ->
@@ -173,55 +174,113 @@ let typed_nodes_of (env : Typecheck.env) : ((int * int) * Mir_lower.typed_node) 
         {
           Mir_lower.tn_type = node.Typecheck.tn_type;
           tn_cast_target = node.Typecheck.tn_cast_target;
+          tn_call = node.Typecheck.tn_call;
         } )
       :: acc)
     env.Typecheck.typed_nodes []
 
 let lowering_env_of (env : Typecheck.env) : Mir_lower.func_env =
   (* both the qualified key and the bare name resolve (flat namespace) *)
-  let values =
+  let bare_keys (n : string) : string list =
+    match String.rindex_opt n ':' with
+    | Some i -> [ n; String.sub n (i + 1) (String.length n - i - 1) ]
+    | None -> [ n ]
+  in
+  (* the typed nested-function registry resolves FIRST — the typechecker's
+     lookup_function prefers a local helper (nested def) over the
+     module-qualified top-level names, so the lowering env mirrors that
+     order for both the callable entries and the value (return-type)
+     entries *)
+  let nested_values =
     List.concat_map
-      (fun (n, ts : string * Typecheck.typed_signature) ->
-        let bare =
-          match String.rindex_opt n ':' with
-          | Some i -> [ (String.sub n (i + 1) (String.length n - i - 1), ts.Typecheck.ts_return) ]
-          | None -> []
-        in
-        (n, ts.Typecheck.ts_return) :: bare)
-      env.Typecheck.functions
+      (fun (qname, ts, _ : string * Typecheck.typed_signature * Ast.function_decl) ->
+        List.map (fun k -> (k, ts.Typecheck.ts_return)) (bare_keys qname))
+      env.Typecheck.state.nested_functions
+  in
+  let values =
+    nested_values
+    @ List.concat_map
+        (fun (n, ts : string * Typecheck.typed_signature) ->
+          let bare =
+            match String.rindex_opt n ':' with
+            | Some i -> [ (String.sub n (i + 1) (String.length n - i - 1), ts.Typecheck.ts_return) ]
+            | None -> []
+          in
+          (n, ts.Typecheck.ts_return) :: bare)
+        env.Typecheck.functions
     (* enum variant constructors are callable values: their registered
        result type lets lowering build the EnumCtor aggregate *)
     @ List.map (fun (n, ts) -> (n, ts.Typecheck.ts_return)) env.Typecheck.constructors
   in
-  let callables =
+  let nested_callables =
     List.concat_map
-      (fun (n, ts : string * Typecheck.typed_signature) ->
-        let entry : Mir_lower.callable_entry =
-          {
-            ce_callable = Ids.Callable_id.to_int ts.Typecheck.ts_callable;
-            (* the template instance declares the generic params in
-               declaration order, so the monomorphizer can construct
-               exact substitutions *)
-            ce_template_args =
-              Array.of_list
-                (List.map
-                   (fun (_, pid) -> Type_repr.Type_param pid)
-                   ts.Typecheck.ts_params_decl);
-            ce_params = ts.Typecheck.ts_params;
-          }
-        in
-        let bare =
-          match String.rindex_opt n ':' with
-          | Some i -> [ (String.sub n (i + 1) (String.length n - i - 1), entry) ]
-          | None -> []
-        in
-        (n, entry) :: bare)
-      env.Typecheck.functions
+      (fun (qname, ts, _ : string * Typecheck.typed_signature * Ast.function_decl) ->
+        List.map
+          (fun k ->
+            ( k,
+              {
+                Mir_lower.ce_callable = Ids.Callable_id.to_int ts.Typecheck.ts_callable;
+                (* the template instance declares the generic params in
+                   declaration order, so the monomorphizer can construct
+                   exact substitutions *)
+                ce_template_args =
+                  Array.of_list
+                    (List.map
+                       (fun (_, pid) -> Type_repr.Type_param pid)
+                       ts.Typecheck.ts_params_decl);
+                ce_params = ts.Typecheck.ts_params;
+              } ))
+          (bare_keys qname))
+      env.Typecheck.state.nested_functions
+  in
+  let callables =
+    nested_callables
+    @ List.concat_map
+        (fun (n, ts : string * Typecheck.typed_signature) ->
+          let entry : Mir_lower.callable_entry =
+            {
+              ce_callable = Ids.Callable_id.to_int ts.Typecheck.ts_callable;
+              (* the template instance declares the generic params in
+                 declaration order, so the monomorphizer can construct
+                 exact substitutions *)
+              ce_template_args =
+                Array.of_list
+                  (List.map
+                     (fun (_, pid) -> Type_repr.Type_param pid)
+                     ts.Typecheck.ts_params_decl);
+              ce_params = ts.Typecheck.ts_params;
+            }
+          in
+          let bare =
+            match String.rindex_opt n ':' with
+            | Some i -> [ (String.sub n (i + 1) (String.length n - i - 1), entry) ]
+            | None -> []
+          in
+          (n, entry) :: bare)
+        env.Typecheck.functions
   in
   let methods =
     List.map
       (fun ((t, m), ts : (string * string) * Typecheck.typed_signature) ->
-        ((t, m), Instance_id.make ~callable:ts.Typecheck.ts_callable ~type_args:[||]))
+        ((t, m),
+         {
+           Mir_lower.me_instance =
+             (* the instance identity the method body is lowered under
+                (lower_closure lowers methods with the declaration-order
+                type params from ts_params_decl) — the call-site instance
+                resolves against the callee function exactly *)
+             Instance_id.make ~callable:ts.Typecheck.ts_callable
+               ~type_args:
+                 (Array.of_list
+                    (List.map (fun (_, pid) -> Type_repr.Type_param pid)
+                       ts.Typecheck.ts_params_decl));
+           (* the method's typed signature contracts: self at index 0
+              (its convention is the receiver's access effect at the
+              call site), then the explicit params in order; me_ret is
+              the call's result type *)
+           me_params = ts.Typecheck.ts_params;
+           me_ret = ts.Typecheck.ts_return;
+         }))
       env.Typecheck.methods
   in
   {
@@ -1181,6 +1240,32 @@ let lower_closure (ctx : closure_ctx) : Seed_mir.program =
           | _ -> ())
         node.Module_graph.node_items)
     ctx.ctx_graph.Module_graph.nodes;
+  (* nested functions (re-audit: the typed callable universe is the
+     lowering source — NOT another AST scan).  Every nested def the
+     typechecker registered during the body pass (check_stmt's Item
+     Function case) carries its typed signature AND its function_decl:
+     each lowers exactly like the methods (typed param types, template
+     args from ts_params_decl, conventions from ts_params, the callable
+     id), with the nested fn's qname as the seed function's name.  The
+     seed is keyed by its callable id (the instance), so the callers'
+     calls — which carry that same nested callable id — resolve. *)
+  List.iter
+    (fun (qname, ts, fd : string * Typecheck.typed_signature * Ast.function_decl) ->
+      let f =
+        Mir_lower.lower_function_with_variants ~typed_nodes:(typed_nodes_of ctx.ctx_env)
+          variants
+          { base with Mir_lower.fn_ret = ts.Typecheck.ts_return }
+          qname
+          (Ids.Callable_id.to_int ts.Typecheck.ts_callable)
+          (Array.of_list
+             (List.map (fun (_, pid) -> Type_repr.Type_param pid)
+                ts.Typecheck.ts_params_decl))
+          (Array.map (fun p -> p.Type_repr.pt_convention) ts.Typecheck.ts_params)
+          ~param_tys_opt:(Array.map (fun p -> p.Type_repr.pt_type) ts.Typecheck.ts_params)
+          fd
+      in
+      mir_funcs := f :: !mir_funcs)
+    ctx.ctx_env.Typecheck.state.nested_functions;
   ctx.lowered_methods <- !lowered_methods;
   {
     Seed_mir.functions = Array.of_list (List.rev !mir_funcs);
