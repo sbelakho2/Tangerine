@@ -64,6 +64,13 @@
    17. no read-before-initialize (definite-initialization dataflow);
    18. no read-after-consume (projection-aware moved-state dataflow);
    19. no second consume (single use per place key);
+   19a. no projected Move/Consume anywhere (the seed VM has no partial-move
+       representation: `Move p`/`Consume p` transitions the WHOLE root
+       slot to Moved, ignoring p.projections, so the VM and the
+       projection-aware moved lattice would disagree about the meaning of
+       a projected transfer — every projected Move/Consume is rejected
+       categorically, in both modes and at every operand position, until
+       the VM executes projected moves);
    20. no duplicate drop (destroyed-state dataflow);
    21. no reachable placeholder/unreachable used as a lowering fallback
        (a reachable block whose terminator is Unreachable is rejected;
@@ -957,28 +964,43 @@ let check_ref_operand (ctx : ctx) (fn : function_) (bb_ctx : string) (op : opera
   | Copy p | Read p ->
       check p
   | Move p | Consume p ->
-      (match p.projections, p.local with
-       | [], _ when p.local >= 0 && p.local < Array.length fn.locals -> (
-           match fn.locals.(p.local) with
-           | Type_repr.Ref_internal (_, _) ->
-               add_err ctx
-                 (Printf.sprintf "%s: ref-typed local _%d moved (refs are internal ABI temporaries)"
-                    bb_ctx p.local)
-           | _ -> ())
-       | _ :: _, _ ->
-           (* the seed VM has no partial-move representation: a projected
-              move/consume would lose the distinction between moving a
-              subvalue and moving the whole aggregate, so it is rejected
-              (verifier semantics must never be stronger than the
-              executor's) *)
-           add_err ctx
-             (Printf.sprintf
-                "%s: projected %s of local _%d is not supported (the seed VM has no partial-move representation)"
-                bb_ctx
-                (match op with Move _ -> "move" | Consume _ -> "consume" | _ -> "transfer")
-                p.local)
-       | _ -> ())
+      (* the projected-move rejection lives in
+         check_projected_move_transfer (a projected move is never a
+         legal transfer regardless of the root type); this ref rule
+         covers the bare form only *)
+      (if p.projections = [] && p.local >= 0 && p.local < Array.length fn.locals then
+         match fn.locals.(p.local) with
+         | Type_repr.Ref_internal (_, _) ->
+             add_err ctx
+               (Printf.sprintf "%s: ref-typed local _%d moved (refs are internal ABI temporaries)"
+                  bb_ctx p.local)
+         | _ -> ());
   | Constant _ -> ()
+
+(* ── Categorical projected-Move/Consume rejection (audit P0) ─────────
+   The seed VM has NO partial-move representation: `Move p` /
+   `Consume p` evaluates `move_slot frame.locals.(p.local)` — the WHOLE
+   root slot transitions to Moved, and `p.projections` is ignored.  The
+   verifier's moved lattice is projection-aware (place keys track
+   sub-place ownership), so a projected move would DISAGREE with the
+   executor about the basic meaning of the instruction: the VM would
+   move `root.field` by moving the entire root.  Until the VM executes
+   projected moves, every projected Move/Consume is rejected here —
+   categorically, in both verification modes and at every operand
+   position (statements, aggregate operands, call arguments with
+   Consume/Initialize effects, SwitchInt/Assert conditions).  The VM
+   also traps on the same programs (fail-closed), so no executor can
+   ever observe the root-slot semantics the verifier forbids. *)
+let check_projected_move_transfer (ctx : ctx) (bb_ctx : string) (op : operand) : unit =
+  match op with
+  | Move p | Consume p ->
+      if p.projections <> [] then
+        let kind = match op with Move _ -> "move" | Consume _ -> "consume" | _ -> "transfer" in
+        add_err ctx
+          (Printf.sprintf
+             "%s: projected %s is unsupported by the seed VM (no partial-move representation: a Move/Consume of local _%d through a projection would transition the WHOLE root slot to Moved, disagreeing with the projection-aware moved lattice; rejected until the VM executes projected moves)"
+             bb_ctx kind p.local)
+  | Copy _ | Read _ | Constant _ -> ()
 
 (* Callee-resolution result (see resolve_callee below). *)
 type callee_resolution =
@@ -1014,6 +1036,7 @@ let rec check_operand (ctx : ctx) (fn : function_) (bb_ctx : string) (op : opera
           (Printf.sprintf "%s: read of previously consumed local _%d (key %S)" bb_ctx p.local k);
       place_type ctx fn p
   | Move p ->
+      check_projected_move_transfer ctx bb_ctx op;
       check_ref_operand ctx fn bb_ctx op ~as_call_arg;
       check_place_readable ctx fn bb_ctx p running;
       let k = place_key p in
@@ -1023,6 +1046,7 @@ let rec check_operand (ctx : ctx) (fn : function_) (bb_ctx : string) (op : opera
              p.local k);
       place_type ctx fn p
   | Consume p ->
+      check_projected_move_transfer ctx bb_ctx op;
       check_ref_operand ctx fn bb_ctx op ~as_call_arg;
       check_place_readable ctx fn bb_ctx p running;
       let k = place_key p in

@@ -1431,7 +1431,10 @@ let lower_closure (ctx : closure_ctx) : Seed_mir.program =
 (* MIR-side counts for the completeness oracle: calls, callable#0 uses,
    enum variant operations (EnumCtor aggregates, SetDiscriminant,
    Discriminant rvalues, Downcast projections) and closure objects
-   (ClosureAgg aggregates and function-pointer constants). *)
+   (ClosureAgg aggregates and function-pointer constants), plus the
+   callable-instance SET (re-audit P0 #2): every `User inst` callee of
+   a Call terminator, deduped — the MIR-side identity set the oracle's
+   call row compares against the typed accepted instances. *)
 type mir_stats = {
   ms_functions : int;
   ms_statics : int;
@@ -1440,10 +1443,12 @@ type mir_stats = {
   ms_callable_zero : int;
   ms_enum_ops : int;
   ms_closures : int;
+  ms_callable_instances : Instance_id.t list;
 }
 
 let count_mir_stats (prog : Seed_mir.program) : mir_stats =
   let calls = ref 0 and zeros = ref 0 and enums = ref 0 and closures = ref 0 in
+  let instances = ref [] in
   let scan_place (p : Seed_mir.place) =
     List.iter
       (function
@@ -1495,6 +1500,7 @@ let count_mir_stats (prog : Seed_mir.program) : mir_stats =
                (match callee with
                 | Seed_mir.User inst ->
                     incr calls;
+                    instances := inst :: !instances;
                     if Ids.Callable_id.to_int (Instance_id.callable inst) = 0 then incr zeros
                 | _ -> ());
                Array.iter (fun a -> scan_operand a.Seed_mir.value) args
@@ -1509,7 +1515,8 @@ let count_mir_stats (prog : Seed_mir.program) : mir_stats =
     ms_calls = !calls;
     ms_callable_zero = !zeros;
     ms_enum_ops = !enums;
-    ms_closures = !closures }
+    ms_closures = !closures;
+    ms_callable_instances = List.sort_uniq Instance_id.compare !instances }
 
 (* The completeness-oracle rows.  Returns true when the closure is
    INCOMPLETE (any DIFF or any callable#0 use). *)
@@ -1530,30 +1537,80 @@ type oracle_counts = {
   oc_skipped : bool;
 }
 
+(* The oracle's identity-set channel (re-audit P0 #2).  oracle_counts
+   is a FROZEN public record — tg_pipeline_smoke constructs it
+   literally — so the semantic identity sets ride beside it: each
+   oracle_of_ctx call records (typed accepted callable instances, MIR
+   callable instances) here, and print_oracle_rows consumes them in
+   the same breath.  Single-threaded driver; set immediately before
+   every print. *)
+let oracle_instance_sets : (Instance_id.t list * Instance_id.t list) ref =
+  ref ([], [])
+
 let print_oracle_rows (o : oracle_counts) : bool =
   let diff_count = ref 0 in
   let skipped_note = if o.oc_skipped then " (skipped: typecheck gate failed)" else "" in
-  let row (label : string) (expected : int) (emitted : int) =
+  (* ── counter rows: PLACEHOLDERS (re-audit P0 #2) ────────────────
+     A counter DIFF cannot prove completeness: a missing call and a
+     duplicated different call can have equal counts.  Each row below
+     is retained as a labeled placeholder until the semantic identity
+     SET for its domain exists; none of them closes completeness. *)
+  let counter_row (label : string) (expected : int) (emitted : int) =
     let ok = expected = emitted in
     if not ok then incr diff_count;
-    Printf.printf "  oracle %-40s expected %6d  emitted %6d  %s%s\n" label expected emitted
+    Printf.printf "  oracle %-46s expected %6d  emitted %6d  %s%s\n" label expected emitted
       (if ok then "OK" else "DIFF")
       (if ok then "" else skipped_note)
   in
-  row "typed reachable functions" o.oc_typed_functions o.oc_mir_functions;
-  row "typed methods" o.oc_typed_methods o.oc_mir_methods;
-  row "required static definitions" o.oc_typed_consts o.oc_mir_statics;
-  row "required concrete nominal type defs" o.oc_typed_nominals o.oc_mir_types;
-  row "typed calls" o.oc_typed_calls o.oc_mir_calls;
-  row "enum variant ops (ctor/setdisc/discr/downcast)" o.oc_mir_enum_ops o.oc_mir_enum_ops;
-  row "closure objects (ClosureAgg + fn-ptr consts)" o.oc_mir_closures o.oc_mir_closures;
+  counter_row "typed reachable functions (counter placeholder)" o.oc_typed_functions
+    o.oc_mir_functions;
+  counter_row "typed methods (counter placeholder)" o.oc_typed_methods o.oc_mir_methods;
+  counter_row "required static definitions (counter placeholder)" o.oc_typed_consts
+    o.oc_mir_statics;
+  counter_row "required concrete nominal type defs (counter placeholder)" o.oc_typed_nominals
+    o.oc_mir_types;
+  counter_row "enum variant ops (counter placeholder)" o.oc_mir_enum_ops o.oc_mir_enum_ops;
+  counter_row "closure objects (counter placeholder)" o.oc_mir_closures o.oc_mir_closures;
+  (* ── the callable-instance IDENTITY-SET row (re-audit P0 #2): the
+     only call row that can close completeness — the typed accepted
+     CallableId/InstanceId set (the checker's persistent typed-node
+     channel) vs the MIR callable-instance set (the lowered program's
+     User callees), with the set-difference sizes (missing/extra)
+     reported instead of raw count equality *)
+  let typed_set, mir_set = !oracle_instance_sets in
+  let missing = List.filter (fun i -> not (List.mem i mir_set)) typed_set in
+  let extra = List.filter (fun i -> not (List.mem i typed_set)) mir_set in
+  let set_ok = missing = [] && extra = [] in
+  if not set_ok then incr diff_count;
+  Printf.printf
+    "  oracle callable-instance identity set  typed accepted %6d  MIR emitted %6d  %s%s\n"
+    (List.length typed_set) (List.length mir_set)
+    (if set_ok then "OK" else "DIFF")
+    (if set_ok then "" else skipped_note);
+  Printf.printf
+    "    set difference: %d typed accepted instance(s) missing from MIR, %d MIR instance(s) not typed-accepted (typed-call count sample %d is a lower bound — counts cannot prove completeness, the identity set can)\n"
+    (List.length missing) (List.length extra) o.oc_typed_calls;
+  if not set_ok && not o.oc_skipped then begin
+    let rec take_first n = function
+      | [] -> []
+      | x :: rest when n > 0 -> x :: take_first (n - 1) rest
+      | _ :: _ -> []
+    in
+    List.iter
+      (fun i -> Printf.printf "    missing from MIR: %s\n" (Seed_mir.print_instance i))
+      (take_first 10 missing);
+    List.iter
+      (fun i -> Printf.printf "    extra in MIR: %s\n" (Seed_mir.print_instance i))
+      (take_first 10 extra)
+  end;
   Printf.printf "  oracle calls with concrete callee InstanceId  emitted %6d  callable#0 uses %d\n"
     o.oc_mir_calls o.oc_mir_callable_zero;
   if o.oc_skipped then
-    Printf.printf "  oracle note: MIR side emitted as zeros — lowering skipped (typecheck gate failed)\n"
+    Printf.printf
+      "  oracle note: MIR side emitted as zeros — lowering skipped (typecheck gate failed)\n"
   else
     Printf.printf
-      "  oracle note: typed-call row's expected side is the recorded o_calls sample (per-item channel; a lower bound); the closure row is a PLACEHOLDER — typed closures are not recorded (check_closure computes the capture list but records no closure identity/captures) and Mir_lower has no Closure branch (E9040, no closure-CALL path in the VM), so its 0 == 0 is vacuous until the VM's closure model lands\n";
+      "  oracle note: the counter rows above are PLACEHOLDERS — count equality cannot prove completeness (a missing call and a duplicated different call can have equal counts); the callable-instance identity-set row is the completeness comparison for calls.  The closure row stays a placeholder because typed closures are not recorded (check_closure computes the capture list but records no closure identity/captures) and Mir_lower has no Closure branch (E9040, no closure-CALL path in the VM), so its 0 == 0 is vacuous until the VM's closure model lands\n";
   !diff_count > 0 || o.oc_mir_callable_zero > 0
 
 (* The bootstrap entry: --entry overrides; default is the kernel's
@@ -2176,8 +2233,35 @@ let oracle_of_ctx (ctx : closure_ctx) (stats : mir_stats option) : oracle_counts
           ms_callable_zero = 0;
           ms_enum_ops = 0;
           ms_closures = 0;
+          ms_callable_instances = [];
         }
   in
+  (* the typed accepted CallableId/InstanceId set (re-audit P0 #2):
+     every checker-ACCEPTED call node on the persistent typed channel
+     (span -> (callable, solved concrete substitution)).  Enum-variant
+     constructors are excluded — they lower to EnumCtor aggregates,
+     never to a User callee — and so are the size_of/align_of query
+     sigs (a type-argument special form), so the set is exactly the
+     typed calls that must appear as MIR User callees. *)
+  let env = ctx.ctx_env in
+  let excluded_callables =
+    List.map (fun (_, ts) -> ts.Typecheck.ts_callable) env.Typecheck.constructors
+    @ List.map (fun (_, ts) -> ts.Typecheck.ts_callable) env.Typecheck.state.query_sigs
+  in
+  let is_user_callable (c : Ids.Callable_id.t) : bool =
+    not (List.exists (fun k -> Ids.Callable_id.compare k c = 0) excluded_callables)
+  in
+  let typed_set =
+    Hashtbl.fold
+      (fun _ (n : Typecheck.typed_node) acc ->
+        match n.Typecheck.tn_call with
+        | Some (cid, subst) when is_user_callable cid ->
+            Instance_id.make ~callable:cid ~type_args:subst :: acc
+        | _ -> acc)
+      env.Typecheck.typed_nodes []
+    |> List.sort_uniq Instance_id.compare
+  in
+  oracle_instance_sets := (typed_set, s.ms_callable_instances);
   {
     oc_typed_functions = List.length ctx.ctx_env.Typecheck.functions;
     oc_typed_methods = List.length ctx.ctx_env.Typecheck.methods;
@@ -2195,20 +2279,26 @@ let oracle_of_ctx (ctx : closure_ctx) (stats : mir_stats option) : oracle_counts
     oc_skipped = stats = None;
   }
 
-(* ── The first integrated semantic pass (re-audit P0-11) ─────────────
+(* ── CALL_ARGUMENT_ACCESS_SANITY (re-audit P0-11; re-audit P0 #2 label) ─
    After the typecheck phase, walk the closure env's RECORDED typed
    channels: the typechecker accumulates one Access_check.access per
    checked call argument (place path + callee-side read effect) across
    the whole closure (the channel is not reset per item).  The pass
    (a) feeds the access-effect conflict matrix per statement group (one
    call's argument list) and (b) replays the recorded operations on
-   Resource_check's ownership state lattice per item; findings are
+   Resource_check's per-local state lattice per item; findings are
    returned, nothing in the typechecker is rewritten.
 
-   HONEST NOTE: this is a real pass over the recorded typed channels —
-   the full CFG-based stage (finalize_plan + edge_cleanup consumed by
-   MIR) remains future work.  Additive by construction: it reports
-   findings and cannot change the typecheck debt. *)
+   HONEST LABEL — THIS IS NOT THE OWNERSHIP PASS.  It is a SANITY
+   replay of call-argument accesses recorded during typechecking: the
+   roots are the typed LocalIds of the argument bindings (shadowed
+   locals are distinct roots), the effects are the callee-side
+   conventions, and the replay walks a simplified resource-state
+   lattice.  It does NOT perform the native ownership stage: the real
+   CFG-based pass (finalize_plan + edge_cleanup consumed by MIR) is
+   future work, and nothing about seed equivalence rests on this
+   stage's findings.  Additive by construction: it reports findings
+   and cannot change the typecheck debt. *)
 
 (* Nominal-definition lookup for the pass's copy query (mirror of
    seed_mir.def_repr / mir_verify.find_type, read-only): a struct
@@ -2237,7 +2327,7 @@ let nominal_def_of_tid (env : Typecheck.env) (tid : Ids.Type_id.t) : Type_repr.t
                                  else Type_repr.Tuple pty);
                             })
                           nom.Typecheck.nom_variants),
-                     Type_repr.Never ))
+                      Type_repr.Never ))
       | None -> List.assoc_opt name env.Typecheck.types)
 
 let run_access_resource_pass (ctx : closure_ctx) : Access_check.finding list =
@@ -2251,10 +2341,11 @@ let report_access_resource_pass (ctx : closure_ctx) : unit =
     List.length (List.filter (fun (a : Access_check.access) -> a.a_path <> None) recorded)
   in
   Printf.printf
-    "  access/resource: integrated pass over recorded typed channels: %d call-argument accesses (%d place paths), %d findings\n"
+    "  call-argument access sanity (NOT the ownership pass — the CFG finalize_plan/edge_cleanup cleanup-plan stage is future work; this replay walks the recorded typed channels): %d call-argument accesses (%d place paths, roots keyed by LocalId), %d finding(s)\n"
     (List.length recorded) n_places (List.length findings);
   let status = if findings = [] then "PASS" else "FAIL" in
-  Printf.printf "  ACCESS_RESOURCE_PASS = %s (%d finding(s))\n" status (List.length findings);
+  Printf.printf "  CALL_ARGUMENT_ACCESS_SANITY = %s (%d finding(s))\n" status
+    (List.length findings);
   let printed = ref 0 in
   List.iter
     (fun (f : Access_check.finding) ->
@@ -2267,6 +2358,8 @@ let report_access_resource_pass (ctx : closure_ctx) : unit =
     Printf.printf "    ... (%d more findings suppressed)\n" (List.length findings - 20)
 
 (* ── bootstrap-check (audit §51) ───────────────────────────────── *)
+let take_first (n : int) (l : 'a list) : 'a list =
+  List.rev (snd (List.fold_left (fun (i, acc) x -> if i < n then (i + 1, x :: acc) else (i, acc)) (0, []) l))
 
 (* The artifact path the kernel derives from its own argv: the -o/
    --output value, else the input file minus .tg. *)
@@ -2455,9 +2548,6 @@ let cmd_bootstrap_check (args : string list) : int =
       end)
 
 (* ── compile (audit §49) ───────────────────────────────────────── *)
-
-let take_first (n : int) (l : 'a list) : 'a list =
-  List.rev (snd (List.fold_left (fun (i, acc) x -> if i < n then (i + 1, x :: acc) else (i, acc)) (0, []) l))
 
 let cmd_compile (args : string list) : int =
   let opts, positional = parse_options boot_specs default_boot_opts args in

@@ -267,18 +267,26 @@ let rec eval_operand (vm : t) (frame : frame) (op : Seed_mir.operand) : Vm_value
       match read_place vm frame p with
       | Ok v -> v
       | Error e -> err_trap vm (Vm_value.slot_error_string e))
-  | Seed_mir.Move p -> (
-      match Vm_value.move_slot frame.locals.(p.Seed_mir.local) with
-      | Ok (v, s) ->
-          frame.locals.(p.Seed_mir.local) <- s;
-          v
-      | Error e -> err_trap vm (Vm_value.slot_error_string e))
-  | Seed_mir.Consume p -> (
-      match Vm_value.move_slot frame.locals.(p.Seed_mir.local) with
-      | Ok (v, s) ->
-          frame.locals.(p.Seed_mir.local) <- s;
-          v
-      | Error e -> err_trap vm (Vm_value.slot_error_string e))
+  | Seed_mir.Move p | Seed_mir.Consume p ->
+      (* audit P0: the seed VM has NO partial-move representation — a
+         Move/Consume transitions the WHOLE root slot to Moved and the
+         projections are ignored.  The verifier rejects every projected
+         Move/Consume (categorically, both modes); the VM fails closed
+         on the same programs so that even unverified MIR executed
+         directly can never observe the root-slot semantics the
+         verifier forbids (move root.field must never silently move
+         root). *)
+      if p.Seed_mir.projections <> [] then
+        err_trap vm
+          (Printf.sprintf
+             "projected %s is unsupported by the seed VM (no partial-move representation: a Move/Consume of local _%d through a projection would transition the WHOLE root slot to Moved; the verifier rejects projected moves and the VM fails closed)"
+             (match op with Seed_mir.Move _ -> "move" | _ -> "consume")
+             p.Seed_mir.local);
+      (match Vm_value.move_slot frame.locals.(p.Seed_mir.local) with
+       | Ok (v, s) ->
+           frame.locals.(p.Seed_mir.local) <- s;
+           v
+       | Error e -> err_trap vm (Vm_value.slot_error_string e))
 
 (* Read a place: project through the value.  A Deref projection resolves
    through memory (RawPtr) or through the reference target (Ref).  The

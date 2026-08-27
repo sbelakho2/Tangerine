@@ -34,6 +34,16 @@
      (f) the struct-lit proof: `Pair { b: b, a: a }` — the OUT-OF-ORDER
          literal's values must land at the typed registry's declaration
          positions, never the source order.
+     (g) the projected-move surface proof (audit P0): the lowered
+         surface NEVER emits a projected Move/Consume (the seed VM has
+         no partial-move representation — `Move p` transitions the
+         WHOLE root slot to Moved, ignoring p.projections — so the
+         lowerer moves whole roots only): a full scan of the lowered
+         surface program finds ZERO projected transfers and a non-zero
+         number of whole-root moves (the `?` failure paths), and a
+         source program whose match arm must bind a NON-COPY payload
+         (which would require a projected move) fails closed at
+         lowering with the precise "non-Copy payload binding" Seed_bug.
 
    Expected main return: 113 (see the derivation comment in src_text). *)
 
@@ -565,6 +575,167 @@ end
            List.iter (fun e -> Printf.printf "    %s\n" e) errs;
            Printf.printf "%s\n" (Seed_mir.print_program prog);
            exit 1);
+      (* ── projected-move surface proof (audit P0: the lowerer must
+         never emit a projected Move/Consume — the seed VM has no
+         partial-move representation and `Move p` would transition the
+         WHOLE root slot to Moved, ignoring p.projections — and must
+         fail closed when the source would require one) ────────────── *)
+      (* (1) the FULLY lowered surface program above carries NO
+         projected Move/Consume anywhere: every ownership transfer is a
+         whole-root move (the `?` failure path MOVES the subject into
+         the return slot; match payload binding COPIES Copy payloads).
+         The scan walks statement rvalues and terminator operands (call
+         args, switch/assert conditions) of every function. *)
+      let operand_is_projected_transfer (op : Seed_mir.operand) : bool =
+        match op with
+        | Seed_mir.Move p | Seed_mir.Consume p -> p.Seed_mir.projections <> []
+        | Seed_mir.Copy _ | Seed_mir.Read _ | Seed_mir.Constant _ -> false
+      in
+      let rvalue_transfers (rv : Seed_mir.rvalue) : Seed_mir.operand list =
+        match rv with
+        | Seed_mir.Use op | Seed_mir.Cast (op, _) | Seed_mir.UnaryOp (_, op) -> [ op ]
+        | Seed_mir.Aggregate (_, ops) -> ops
+        | Seed_mir.BinaryOp (_, l, r) -> [ l; r ]
+        | Seed_mir.Ref _ | Seed_mir.RefMut _ | Seed_mir.Discriminant _ | Seed_mir.Len _ -> []
+      in
+      let terminator_transfers (t : Seed_mir.terminator) : Seed_mir.operand list =
+        match t with
+        | Seed_mir.Call (_, _, args, _, _) ->
+            Array.to_list (Array.map (fun a -> a.Seed_mir.value) args)
+        | Seed_mir.SwitchInt (op, _, _) | Seed_mir.Assert (op, _, _, _) -> [ op ]
+        | Seed_mir.Goto _ | Seed_mir.Ret | Seed_mir.Unreachable | Seed_mir.Abort
+        | Seed_mir.Drop _ | Seed_mir.Deinit _ ->
+            []
+      in
+      let projected_transfers = ref 0 and whole_root_moves = ref 0 in
+      Array.iter
+        (fun (fn : Seed_mir.function_) ->
+          Array.iter
+            (fun (b : Seed_mir.block) ->
+              List.iter
+                (function
+                  | Seed_mir.Assign (_, rv) ->
+                      List.iter
+                        (fun op ->
+                          if operand_is_projected_transfer op then incr projected_transfers
+                          else
+                            match op with
+                            | Seed_mir.Move _ | Seed_mir.Consume _ -> incr whole_root_moves
+                            | _ -> ())
+                        (rvalue_transfers rv)
+                  | Seed_mir.StorageLive _ | Seed_mir.StorageDead _
+                  | Seed_mir.SetDiscriminant _ | Seed_mir.Nop ->
+                      ())
+                b.Seed_mir.statements;
+              List.iter
+                (fun op ->
+                  if operand_is_projected_transfer op then incr projected_transfers
+                  else
+                    match op with
+                    | Seed_mir.Move _ | Seed_mir.Consume _ -> incr whole_root_moves
+                    | _ -> ())
+                (terminator_transfers b.Seed_mir.terminator))
+            fn.Seed_mir.blocks)
+        prog.Seed_mir.functions;
+      if !projected_transfers = 0 && !whole_root_moves > 0 then
+        Printf.printf
+          "  projected-move surface: PASS (the lowered program carries %d whole-root Move/Consume transfers — the `?` failure paths — and ZERO projected transfers)\n"
+          !whole_root_moves
+      else begin
+        Printf.printf
+          "  projected-move surface: FAIL (projected transfers: %d, whole-root moves: %d)\n"
+          !projected_transfers !whole_root_moves;
+        exit 1
+      end;
+      (* (2) fail-closed: a match arm that must BIND A NON-COPY PAYLOAD
+         would require a projected move (the payload lives inside the
+         subject's variant), which the seed cannot execute — the
+         lowerer must fail closed with the precise Seed_bug, never emit
+         the projected move *)
+      let ncp_src = {|
+def f(o: Option[String]) -> Int
+  match o {
+    Some(s) => 0,
+    None() => 1
+  }
+end
+|} in
+      (match Source_loader.load_string "<non-copy-payload>" ncp_src with
+       | Error _ -> failwith "non-copy-payload source load"
+       | Ok nsrc ->
+           let nsm = Span.create () in
+           let nfid = Span.add_file nsm nsrc.Source.name nsrc in
+           let ndiags = Diagnostic.create_bag () in
+           let nlx = Lexer.create nsrc.Source.bytes nfid ndiags in
+           let ntoks = Lexer.lex nlx in
+           let nprog = Parser.parse ntoks nsrc.Source.bytes nfid ndiags [ "ncp" ] in
+           (match Typecheck.check_program (Typecheck.initial_env ()) nprog with
+            | Error m -> failwith ("non-copy-payload typecheck: " ^ m)
+            | Ok (nenv, errs) ->
+                if errs <> [] then
+                  failwith ("non-copy-payload typecheck errors: " ^ String.concat "; " errs)
+                else begin
+                  let nf =
+                    match
+                      List.find_opt
+                        (fun i ->
+                          match i.Ast.kind with
+                          | Ast.Function d -> d.Ast.fn_sig.Ast.sig_name = "f"
+                          | _ -> false)
+                        nprog.Ast.items
+                    with
+                    | Some i -> i
+                    | None -> failwith "non-copy-payload: no f function"
+                  in
+                  let nts =
+                    match List.assoc_opt "f" nenv.Typecheck.functions with
+                    | Some ts -> ts
+                    | None -> (
+                        match
+                          List.filter
+                            (fun (k, _) -> Util.has_suffix k "::f")
+                            nenv.Typecheck.functions
+                        with
+                        | [ (_, ts) ] -> ts
+                        | _ -> failwith "non-copy-payload: no typed signature for f")
+                  in
+                  let nfd =
+                    match nf.Ast.kind with
+                    | Ast.Function d -> d
+                    | _ -> failwith "non-copy-payload: f is not a function"
+                  in
+                  (try
+                     ignore
+                       (Mir_lower.lower_function_with_variants variant_table
+                          { env2 with Mir_lower.fn_ret = nts.Typecheck.ts_return }
+                          "f" (Ids.Callable_id.to_int nts.Typecheck.ts_callable) [||] [||] nfd);
+                     Printf.printf
+                       "  non-Copy payload binding: FAIL (lowering succeeded — a projected move would have been emitted)\n";
+                     exit 1
+                   with
+                   | Mir_lower.Seed_bug m ->
+                       let contains_sub s sub =
+                         let ls = String.length s and l = String.length sub in
+                         if l = 0 then true
+                         else begin
+                           let found = ref false in
+                           (try
+                              for i = 0 to ls - l do
+                                if not !found && String.sub s i l = sub then found := true
+                              done
+                            with Invalid_argument _ -> ());
+                           !found
+                         end
+                       in
+                       if contains_sub m "non-Copy payload binding in a variant match arm" then
+                         Printf.printf
+                           "  non-Copy payload binding: PASS (lowering fails closed on a String payload binding: %s)\n"
+                           m
+                       else begin
+                         Printf.printf "  non-Copy payload binding: FAIL (wrong Seed_bug: %s)\n" m;
+                         exit 1
+                       end)
+                end));
       (* template-instance proof: a generic def f[T,U] must get a
          template Instance_id carrying [Type_param T; Type_param U] in
          declaration order, so mono can build exact substitutions *)

@@ -28,6 +28,24 @@
          inside a nested aggregate while leaving raw pointers alive.
      (e) SERIALIZATION: serialize/deserialize round-trips a nested
          value (ints, bool, char, string, array, enum).
+     (f) PROJECTED MOVE/CONSUME FAIL-CLOSED (audit P0): the seed VM has
+         no partial-move representation — `Move p`/`Consume p`
+         transitions the WHOLE root slot to Moved and ignores
+         p.projections — so a projected transfer would disagree with
+         the verifier's projection-aware moved lattice about the basic
+         meaning of the instruction.  The proof has two legs:
+         (1) VERIFIER: `move root.field`, `consume root.field` and a
+         projected Move passed as a Consume-effect call argument are
+         ALL rejected by Mir_verify.require_valid_concrete (and by
+         require_valid_template) with the precise message "projected
+         move/consume is unsupported by the seed VM";
+         (2) VM: the same programs executed DIRECTLY in the VM
+         (bypassing verification, as hand-written MIR would) trap
+         deterministically with the same message — the VM never
+         silently performs the root-slot move.  The two legs together
+         close the audit's middle state: no executor can observe
+         semantics the verifier forbids, and no verified program can
+         carry a projected move at all.
 
    Prints PASS/FAIL per check and a final ALL PASS line. *)
 
@@ -710,6 +728,162 @@ let check_serialization () =
   else
     fail "serialization: round-trip produced a different value"
 
+(* ── (f) projected Move/Consume fail-closed (audit P0) ───────────────
+
+   The seed VM's `Move p`/`Consume p` evaluates move_slot over the WHOLE
+   root local and ignores p.projections — there is no partial-move
+   representation, so `move root.field` would transition the entire root
+   slot to Moved.  The verifier's moved lattice is projection-aware, so
+   the only honest states are "the VM executes projected moves" or
+   "every projected Move/Consume is rejected".  The seed chooses the
+   second, and the VM itself fails closed on the same programs: even
+   hand-written MIR executed directly (no verification) cannot observe
+   the root-slot semantics. *)
+
+let tuple2_ty_str = Type_repr.Tuple [| string_ty; i64 |]
+
+let projected_move_prog (op : Seed_mir.operand) : Seed_mir.program =
+  dyn_index_fn
+    [| string_ty; tuple2_ty_str |]
+    [
+      Seed_mir.Assign
+        ({ local = 1; projections = [] },
+         Seed_mir.Aggregate (Seed_mir.TupleAgg, [ str_op "hello"; int_op 42 ]));
+      Seed_mir.Assign ({ local = 0; projections = [] }, Seed_mir.Use op);
+    ]
+    Seed_mir.Ret
+
+let projected_consume_arg_prog () : Seed_mir.program =
+  let callee =
+    {
+      Seed_mir.name = "take";
+      instance = instance 1;
+      params = [| { Type_repr.pt_convention = Access_effect.Sink; pt_type = string_ty } |];
+      locals = [| i64; string_ty |];
+      blocks =
+        [|
+          {
+            Seed_mir.id = 0;
+            statements = [ Seed_mir.Assign ({ local = 0; projections = [] }, Seed_mir.Use (int_op 0)) ];
+            terminator = Seed_mir.Ret;
+          };
+        |];
+      entry = 0;
+    }
+  in
+  let main =
+    {
+      Seed_mir.name = "main";
+      instance = instance 0;
+      params = [||];
+      locals = [| i64; tuple2_ty_str |];
+      blocks =
+        [|
+          {
+            Seed_mir.id = 0;
+            statements =
+              [
+                Seed_mir.Assign
+                  ({ local = 1; projections = [] },
+                   Seed_mir.Aggregate (Seed_mir.TupleAgg, [ str_op "hello"; int_op 42 ]));
+              ];
+            terminator =
+              Seed_mir.Call
+                ( { local = 0; projections = [] },
+                  Seed_mir.User (instance 1),
+                  [|
+                    {
+                      Seed_mir.effect_ = Access_effect.Consume;
+                      value =
+                        Seed_mir.Move { local = 1; projections = [ Seed_mir.ConstantIndex 0 ] };
+                    };
+                  |],
+                  1,
+                  None );
+          };
+          { Seed_mir.id = 1; statements = []; terminator = Seed_mir.Ret };
+        |];
+      entry = 0;
+    }
+  in
+  { Seed_mir.functions = [| main; callee |]; statics = [||]; types = [||] }
+
+let check_projected_move () =
+  let move_prog =
+    projected_move_prog
+      (Seed_mir.Move { local = 1; projections = [ Seed_mir.ConstantIndex 0 ] })
+  in
+  let consume_prog =
+    projected_move_prog
+      (Seed_mir.Consume { local = 1; projections = [ Seed_mir.ConstantIndex 0 ] })
+  in
+  let arg_prog = projected_consume_arg_prog () in
+  (* leg 1: the verifier rejects every projected transfer — concrete
+     mode (the pre-VM gate) and template mode alike, and at every
+     operand position (statement rvalue, call argument) *)
+  let expect_verify_reject (name : string) (prog : Seed_mir.program) (needle : string) =
+    (match Mir_verify.require_valid_concrete prog with
+     | Error errs when List.exists (fun e -> contains e needle) errs ->
+         pass "%s: verifier rejects with %S (concrete mode)" name needle
+     | Ok () -> fail "%s: verifier ACCEPTED a projected transfer (concrete mode)" name
+     | Error errs ->
+         fail "%s: verifier rejected with the wrong message: %s" name
+           (String.concat "; " errs));
+    (match Mir_verify.require_valid_template prog with
+     | Error errs when List.exists (fun e -> contains e needle) errs ->
+         pass "%s: verifier rejects with %S (template mode)" name needle
+     | Ok () -> fail "%s: verifier ACCEPTED a projected transfer (template mode)" name
+     | Error errs ->
+         fail "%s: verifier rejected with the wrong message (template mode): %s" name
+           (String.concat "; " errs))
+  in
+  expect_verify_reject "projected move" move_prog "projected move is unsupported by the seed VM";
+  expect_verify_reject "projected consume" consume_prog
+    "projected consume is unsupported by the seed VM";
+  expect_verify_reject "projected move as a Consume-effect call arg" arg_prog
+    "projected move is unsupported by the seed VM";
+  (* leg 2: the VM traps on the same programs when executed DIRECTLY
+     (bypassing verification) — the root-slot move never runs *)
+  let expect_vm_trap (name : string) (prog : Seed_mir.program) (needle : string) =
+    match run_program prog with
+    | Error e when contains e.Vm.message needle ->
+        pass "%s: VM traps deterministically with %S (fail-closed, no silent root-slot move)" name
+          needle
+    | Error e ->
+        fail "%s: VM trapped with the wrong message: %s" name e.Vm.message
+    | Ok _ -> fail "%s: VM executed a projected transfer without trapping" name
+  in
+  expect_vm_trap "projected move" move_prog "projected move is unsupported by the seed VM";
+  expect_vm_trap "projected consume" consume_prog
+    "projected consume is unsupported by the seed VM";
+  expect_vm_trap "projected move as a Consume-effect call arg" arg_prog
+    "projected move is unsupported by the seed VM";
+  (* positive control: a WHOLE-ROOT move still verifies and runs (the
+     rejection is about projections, not about moving) *)
+  let root_move_prog =
+    dyn_index_fn
+      [| i64; tuple2_ty_str; tuple2_ty_str |]
+      [
+        Seed_mir.Assign
+          ({ local = 1; projections = [] },
+           Seed_mir.Aggregate (Seed_mir.TupleAgg, [ str_op "hello"; int_op 42 ]));
+        Seed_mir.Assign ({ local = 2; projections = [] }, Seed_mir.Use (Seed_mir.Move { local = 1; projections = [] }));
+        Seed_mir.Assign
+          ({ local = 0; projections = [] },
+           Seed_mir.Use (Seed_mir.Copy { local = 2; projections = [ Seed_mir.ConstantIndex 1 ] }));
+      ]
+      Seed_mir.Ret
+  in
+  (match Mir_verify.require_valid_concrete root_move_prog with
+   | Ok () -> pass "whole-root Move: verifier accepts (the rejection is projection-scoped)"
+   | Error errs ->
+       fail "whole-root Move: verifier rejected it: %s" (String.concat "; " errs));
+  (match run_inspect root_move_prog with
+   | Ok "42" ->
+       pass "whole-root Move: VM moves the whole root slot and the Int element reads back 42"
+   | Ok other -> fail "whole-root Move: unexpected return %s (expected 42)" other
+   | Error m -> fail "whole-root Move: %s" m)
+
 let () =
   Printf.printf "Seed VM kernel-closure primitive self-check\n";
   check_dyn_index ();
@@ -717,6 +891,7 @@ let () =
   check_ref_writeback ();
   check_recursive_drop ();
   check_serialization ();
+  check_projected_move ();
   if !failures = 0 then begin
     Printf.printf "ALL PASS\n";
     exit 0

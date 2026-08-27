@@ -33,6 +33,20 @@
 (* ────────────────────────────────────────────────────────────────
    Public types *)
 
+(* The identity of one scope-local BINDING (re-audit P0 #2: access
+   roots must be keyed by LocalId, not by the variable name — two
+   shadowed locals of the same name are distinct bindings and must
+   never be conflated by the recorded-access replay).  A fresh id is
+   minted for every binding (pattern, param, closure param, for-loop
+   var), so the id is stable across every use of that binding and
+   unique against every other simultaneously-live binding of the item.
+   The access channel's numeric root IS this id (see place_of_expr). *)
+module Local_id = struct
+  type t = int
+  let make (i : int) : t = i
+  let to_int (t : t) : int = t
+end
+
 type typed_signature = {
   ts_name : string;
   ts_params_decl : (string * Ids.Generic_param_id.t) list;
@@ -107,20 +121,18 @@ type oracle = {
   mutable o_missing_effects : int;
   mutable o_derived_callables : Ids.Callable_id.t list;
   mutable o_deferred_params : Ids.Generic_param_id.t list;
-  (* the integrated access/resource channel (re-audit P0-11): one
+  (* the integrated access channel (re-audit P0-11): one
      Access_check.access per checked call argument, accumulated ACROSS
      items (reset_oracle deliberately leaves it alone) so the driver's
      integrated pass walks the whole closure's recorded accesses;
      o_access_seq numbers each recorded call so the pass can delimit
-     statement groups *)
+     statement groups.  The place-path roots are LocalId-keyed
+     (re-audit P0 #2): the root int in each record is the numeric
+     value of the argument binding's Local_id (the scope carries the
+     innermost binding's id, so shadowed locals of the same name are
+     distinct roots — never conflated). *)
   mutable o_accesses : Access_check.access list;
   mutable o_access_seq : int;
-  (* local-name -> stable root id for the integrated pass: scope-local
-     LIST positions shift as bindings accumulate (add_binds prepends), so
-     the channel roots are name-keyed ids assigned on first sight (the
-     pass groups per item, so cross-item aliasing of ids is harmless;
-     shadowed locals of the same name are conservatively conflated) *)
-  mutable o_access_root_ids : (string, int) Hashtbl.t;
 }
 
 (* Mutable check state (per check_program run). *)
@@ -193,6 +205,12 @@ type env = {
 
 type scope = {
   locals : (string * Type_repr.t * bool) list;  (* name, type, mutable *)
+  (* the innermost-first LocalId of each binding, parallel to locals
+     (re-audit P0 #2): name lookup here yields the CURRENT binding's
+     identity, so shadowed locals are distinct access roots *)
+  local_ids : (string * Local_id.t) list;
+  (* fresh-id counter for subsequent bindings of this scope chain *)
+  next_local_id : Local_id.t;
   generics : (string * Ids.Generic_param_id.t) list;
   loop_depth : int;
   capture : (string -> unit) option;
@@ -863,7 +881,6 @@ let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
           o_deferred_params = [];
           o_accesses = [];
           o_access_seq = 0;
-          o_access_root_ids = Hashtbl.create 256;
         };
       debt_by_module = [];
       debt_last_printed =
@@ -1880,22 +1897,22 @@ let rec static_type_of (env : env) (scope : scope) (e : Ast.expr) : Type_repr.t 
       static_type_of env scope inner
   | _ -> None
 
-(* The place path of a call argument: root = the local's index in the
-   scope (stable within the item), projections = the syntactic chain.
-   `&x` / `&mut x` arguments are the place of x (the borrow's effect is
-   the callee-side convention, recorded separately). *)
+(* The place path of a call argument: root = the argument binding's
+   LocalId (the innermost binding of the name in the CURRENT scope —
+   shadowed locals are distinct roots, re-audit P0 #2), projections =
+   the syntactic chain.  A name that is not a scope-local (a function
+   value / global in argument position) has no LocalId and no place:
+   conservative None.  `&x` / `&mut x` arguments are the place of x
+   (the borrow's effect is the callee-side convention, recorded
+   separately). *)
 let rec place_of_expr (env : env) (scope : scope) (e : Ast.expr) : Access_check.access_path option
     =
   match e with
   | Ast.Name (n, _) -> (
-      (* root ids are NAME-keyed (see o_access_root_ids): stable across
-         the item even as bindings accumulate *)
-      match Hashtbl.find_opt env.state.oracle.o_access_root_ids n with
-      | Some i -> Some { Access_check.root = i; Access_check.projections = [] }
-      | None ->
-          let i = Hashtbl.length env.state.oracle.o_access_root_ids in
-          Hashtbl.add env.state.oracle.o_access_root_ids n i;
-          Some { Access_check.root = i; Access_check.projections = [] })
+      match List.assoc_opt n scope.local_ids with
+      | Some lid ->
+          Some { Access_check.root = Local_id.to_int lid; Access_check.projections = [] }
+      | None -> None)
   | Ast.Path _ -> None
   | Ast.Field (base, fname, _) -> (
       match place_of_expr env scope base with
@@ -3014,7 +3031,16 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
   | Ast.ComptimeBlock (_, span) -> Error (err span "comptime blocks are not available in the bootstrap subset")
 
 and add_binds (scope : scope) (binds : (string * Type_repr.t * bool) list) : scope =
-  List.fold_left (fun s (n, t, m) -> { s with locals = (n, t, m) :: s.locals }) scope binds
+  List.fold_left
+    (fun s (n, t, m) ->
+      let lid = s.next_local_id in
+      {
+        s with
+        locals = (n, t, m) :: s.locals;
+        local_ids = (n, lid) :: s.local_ids;
+        next_local_id = Local_id.make (Local_id.to_int lid + 1);
+      })
+    scope binds
 
 and check_block (env : env) (scope : scope) (expected : Type_repr.t option) (b : Ast.block_body)
     (span : Span.span) : (typed_expr, string) result =
@@ -3089,20 +3115,32 @@ and check_stmt (env : env) (scope : scope) (s : Ast.stmt) : (scope, string) resu
              :: List.filter (fun (k, _, _) -> k <> qname) env.state.nested_functions;
            let env_m = env in
            (* the nested body is checked like the program-level fn body *)
-           (match fd.Ast.fn_body with
-            | Ast.FnBlock b ->
-                let body_scope =
-                  {
-                    scope with
-                    locals =
-                      List.mapi
-                        (fun i (p : Ast.param) ->
-                          ( p.Ast.p_name,
-                            sig_.ts_params.(i).Type_repr.pt_type,
-                            true ))
-                        fd.Ast.fn_sig.Ast.sig_params;
-                  }
-                in
+            (match fd.Ast.fn_body with
+             | Ast.FnBlock b ->
+                 (* the nested fn's params are NEW bindings: fresh
+                    LocalIds that CONTINUE the enclosing scope's counter,
+                    so a param shadowing a captured outer local is a
+                    distinct access root (re-audit P0 #2) *)
+                 let n_params = List.length fd.Ast.fn_sig.Ast.sig_params in
+                 let base = Local_id.to_int scope.next_local_id in
+                 let body_scope =
+                   {
+                     scope with
+                     locals =
+                       List.mapi
+                         (fun i (p : Ast.param) ->
+                           ( p.Ast.p_name,
+                             sig_.ts_params.(i).Type_repr.pt_type,
+                             true ))
+                         fd.Ast.fn_sig.Ast.sig_params;
+                     local_ids =
+                       List.mapi
+                         (fun i (p : Ast.param) ->
+                           (p.Ast.p_name, Local_id.make (base + i)))
+                         fd.Ast.fn_sig.Ast.sig_params;
+                     next_local_id = Local_id.make (base + n_params);
+                   }
+                 in
                 (match check_block env_m body_scope (Some sig_.ts_return) b b.b_span with
                  | Ok _ -> Ok scope
                  | Error _ -> Ok scope)
@@ -4061,6 +4099,10 @@ and check_call_sig (env : env) (scope : scope) (expected : Type_repr.t option)
                       let eff = Access_effect.read_effect sig_.ts_params.(i).Type_repr.pt_convention in
                       go (ate :: acc) (eff :: effects) (i + 1) rest)
                   | Error m -> (
+                      if Sys.getenv_opt "TANGERINE_DEBUG_CALL" <> None then
+                        Printf.eprintf "DEBUG-CALL %s arg%d pt=%s found=%s (%s) span=%d-%d\n" sig_.ts_name
+                          (i + 1) (type_to_string pt) (type_to_string ate.te_type) m
+                          a.Ast.ca_span.Span.start a.Ast.ca_span.Span.end_;
                       (* builtin/kernel nominal duality: a user type that
                          replaced a builtin unifies with the builtin by name *)
                       let same_named_arg () =
@@ -4576,6 +4618,11 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
                                 let eff = Access_effect.read_effect sig_.ts_params.(ai).Type_repr.pt_convention in
                                 go (ate :: acc) (eff :: effects) (i + 1) rest)
                             | Error m -> (
+                                if Sys.getenv_opt "TANGERINE_DEBUG_CALL" <> None then
+                                  Printf.eprintf "DEBUG-MCALL %s.%s arg%d pt=%s found=%s (%s) span=%d-%d\n"
+                                    oname mname (i + 1) (type_to_string pt)
+                                    (type_to_string ate.te_type) m a.Ast.ca_span.Span.start
+                                    a.Ast.ca_span.Span.end_;
                                 (* call-site coercion: an explicit-ref argument
                                    derefs to its pointee for a by-value param *)
                                 let deref_ok () =
@@ -4701,7 +4748,8 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
 (* ────────────────────────────────────────────────────────────────
    Items: checking *)
 
-let empty_scope : scope = { locals = []; generics = []; loop_depth = 0; capture = None }
+let empty_scope : scope =
+  { locals = []; local_ids = []; next_local_id = Local_id.make 0; generics = []; loop_depth = 0; capture = None }
 
 let qualified_name (mp : string list) (n : string) : string =
   match mp with [] -> n | segs -> String.concat "::" (segs @ [ n ])
@@ -4729,6 +4777,12 @@ let rec check_function_body (env : env) (extra_tp_bounds : (string * string list
               | Ast.InoutAccess | Ast.Set -> true
               | Ast.LetAccess | Ast.Sink -> false ))
           d.fn_sig.sig_params;
+      (* function params are bindings: one fresh LocalId each (the
+         body's add_binds continues this counter) *)
+      local_ids =
+        List.mapi (fun i (p : Ast.param) -> (p.p_name, Local_id.make i))
+          d.fn_sig.sig_params;
+      next_local_id = Local_id.make (List.length d.fn_sig.sig_params);
       generics = List.map (fun (n, i) -> (n, i)) sig_.ts_params_decl;
       loop_depth = 0;
       capture = None;
