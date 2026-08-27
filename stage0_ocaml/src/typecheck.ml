@@ -2755,11 +2755,7 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
           | Ok tr -> (
               let subst = ref [] in
               match check_binary subst op tl.te_type tr.te_type with
-              | Error m ->
-                  (if env.state.current_item = "def emit_sleb128" then
-                     Printf.eprintf "DBG slb-bin: l=%s r=%s @%d\n" (type_to_string tl.te_type)
-                       (type_to_string tr.te_type) span.Span.start);
-                  Error (err span m)
+              | Error m -> Error (err span m)
               | Ok rty ->
                   Ok
                     {
@@ -2882,9 +2878,6 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
                         te_span = span;
                       }
                 | Error m ->
-                    (if env.state.current_item = "def emit_sleb128" then
-                       Printf.eprintf "DBG slb: exp=%s found=%s @%d\n" (type_to_string ptype)
-                         (type_to_string te.te_type) span.Span.start);
                     Error
                       (err span
                          (Printf.sprintf "assignment type mismatch: expected %s, found %s (%s)"
