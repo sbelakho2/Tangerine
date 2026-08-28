@@ -2111,6 +2111,7 @@ let rec check_pattern (env : env) (scope : scope) (ty : Type_repr.t) (p : Ast.pa
             in
             go [] (List.combine (Array.to_list elems) pats)
           end
+      | Type_repr.Unit when pats = [] -> Ok []
       | _ -> Error (err span "tuple pattern requires a tuple type"))
   | Ast.OrPattern (a, b, span) -> (
       match check_pattern env scope ty a with
