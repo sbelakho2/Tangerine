@@ -418,6 +418,10 @@ and check_arm_pattern ctx diags (p : Ast.pattern) =
                  the literal string (the E9044 string-payload form is
                  retired) *)
               ()
+          | Ast.PatLiteral (Ast.BoolLit _, _) ->
+              (* a bool payload `Some(true)`: the payload must hold the
+                 literal bool (the E9044 bool-payload form is retired) *)
+              ()
           | _ ->
               reject diags "E9044"
                 "variant payload patterns are not available in the bootstrap subset (seed lowering binds payload fields by name, `_` or tuple components only)"
