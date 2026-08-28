@@ -404,6 +404,10 @@ and check_arm_pattern ctx diags (p : Ast.pattern) =
                         "nested variant payload patterns are not available in the bootstrap subset (seed lowering binds payload components by name or `_` only)"
                         (Ast.pattern_span sub))
                 subs
+          | Ast.PatLiteral (Ast.CharLit _, _) ->
+              (* a char payload `Some('#')`: the payload must hold the
+                 literal char (the E9044 char-payload form is retired) *)
+              ()
           | _ ->
               reject diags "E9044"
                 "variant payload patterns are not available in the bootstrap subset (seed lowering binds payload fields by name, `_` or tuple components only)"

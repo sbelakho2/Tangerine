@@ -2068,8 +2068,18 @@ and lower_match (env : func_env) (st : lower_state) (m : Ast.match_expr) :
       in
       seed_bug "unsupported match pattern %s in lowering" pname)
     m.Ast.m_arms;
+  (* the switch targets: SAME-tag arms (a char-payload arm followed by
+     another arm of the same variant — the payload-equality chains
+     route the rest) collapse to the FIRST arm of the tag *)
+  let rec dedup acc = function
+    | [] -> List.rev acc
+    | (tag, blk) :: rest ->
+        if List.mem_assoc tag acc then dedup acc rest
+        else dedup ((tag, blk) :: acc) rest
+  in
+  let targets = dedup [] (List.rev !targets) in
   set_terminator_to st
-    (Seed_mir.SwitchInt (copy_place st switch_op, List.rev !targets, otherwise))
+    (Seed_mir.SwitchInt (copy_place st switch_op, targets, otherwise))
     arm_blocks.(0);
   (* lower each arm body into its block *)
   List.iteri
@@ -2119,6 +2129,53 @@ and lower_match (env : func_env) (st : lower_state) (m : Ast.match_expr) :
                                     ] }) ));
                     st.scope <- (name, id) :: st.scope)
                | Ast.Wildcard _ -> ()
+               | Ast.PatLiteral (Ast.CharLit (c, _), _) -> (
+                   (* a char payload `Some('#')`: the payload position
+                      must hold the literal char — emit the equality
+                      check that falls to the NEXT arm when it fails
+                      (the arm bodies lower sequentially, so the next
+                      arm's block is the fallthrough) *)
+                   let pty =
+                     match List.nth_opt spec.vs_fields j with
+                     | Some t -> t
+                     | None ->
+                         seed_bug "variant `%s` char payload has more fields than the variant" seg2
+                   in
+                   let b = Bytes.of_string c in
+                   let u =
+                     match Utf8.decode_at b 0 with
+                     | Ok (u, _) -> u
+                     | Error _ -> seed_bug "invalid char literal payload in lowering"
+                   in
+                   let pid = fresh_local st pty in
+                   emit st
+                     (Seed_mir.Assign
+                        ( cur_place st pid,
+                          Seed_mir.Use
+                            (Seed_mir.Copy
+                               { Seed_mir.local = sid;
+                                 projections =
+                                   [ Seed_mir.Downcast (semantic_variant_id spec); Seed_mir.ConstantIndex j ]
+                               }) ));
+                   let eq_id = fresh_local st Type_repr.Bool in
+                   emit st
+                     (Seed_mir.Assign
+                        ( cur_place st eq_id,
+                          Seed_mir.BinaryOp
+                            ( Seed_mir.Eq,
+                              copy_place st (cur_place st pid),
+                              Seed_mir.Constant (Seed_mir.Char u) ) ));
+                   let ok_b = new_block st in
+                   let next_b =
+                     if i + 1 < Array.length arm_blocks then arm_blocks.(i + 1)
+                     else otherwise
+                   in
+                   set_terminator_to st
+                     (Seed_mir.SwitchInt
+                        ( Seed_mir.Copy (cur_place st eq_id),
+                          [ (1L, ok_b) ],
+                          next_b ))
+                     ok_b)
                | Ast.PatTuple (subs, _) ->
                    (* a tuple payload `Some((a, b))`: the j-th payload
                       FIELD is the tuple — each component binds through
