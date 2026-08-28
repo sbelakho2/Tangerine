@@ -4639,15 +4639,42 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
                                       | Error _ -> None)
                                   | _ -> None
                                 in
+                                (* the auto-borrow rule (re-audit P0): an
+                                   expected &T with an actual PLACE of T
+                                   synthesizes the shared borrow (Read) —
+                                   never T == &T, and never for literals *)
+                                let borrow_ok () =
+                                  match pt with
+                                  | Type_repr.Ref_internal (_, inner) -> (
+                                      match a.Ast.ca_value with
+                                      | Ast.IntLit _ | Ast.FloatLit _ | Ast.CharLit _ | Ast.BoolLit _ ->
+                                          None
+                                      | _ -> (
+                                          let s3 = ref [] in
+                                          match unify env.state.box_tid s3 inner ate.te_type with
+                                          | Ok () ->
+                                              List.iter
+                                                (fun (k, v) ->
+                                                  if not (List.mem_assoc k !subst) then subst := (k, v) :: !subst)
+                                                !s3;
+                                              Some ()
+                                          | Error _ -> None))
+                                  | _ -> None
+                                in
                                 match deref_ok () with
                                 | Some () ->
                                     let eff = Access_effect.read_effect sig_.ts_params.(ai).Type_repr.pt_convention in
                                     go (ate :: acc) (eff :: effects) (i + 1) rest
-                                | None ->
-                                    Error
-                                      (err a.Ast.ca_span
-                                         (Printf.sprintf "argument %d type mismatch: expected %s, found %s (%s)"
-                                            (i + 1) (type_to_string pt) (type_to_string ate.te_type) m))))
+                                | None -> (
+                                    match borrow_ok () with
+                                    | Some () ->
+                                        let eff = Access_effect.Read in
+                                        go (ate :: acc) (eff :: effects) (i + 1) rest
+                                    | None ->
+                                        Error
+                                          (err a.Ast.ca_span
+                                             (Printf.sprintf "argument %d type mismatch: expected %s, found %s (%s)"
+                                                (i + 1) (type_to_string pt) (type_to_string ate.te_type) m)))))
                       end)
                 in
                 go [] [] 0 args
