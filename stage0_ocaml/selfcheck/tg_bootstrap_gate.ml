@@ -115,13 +115,17 @@ end
     (* field-projection E9036 was DELETED 2026-08-27: the typed-place
        (FieldId) rule landed in mir_lower — p.x now lowers and is VM
        proven in tg_lowersurface's struct-field proof (the positive
-       parse -> typecheck -> lower -> verify -> execute replacement) *)
+       parse -> typecheck -> lower -> verify -> execute replacement).
+       The NAME/Field/Index writeback targets were likewise retired
+       2026-08-28 (the typed-place writeback rule — proven in
+       tg_lowersurface's writeback proof); E9036 remains only for the
+       target forms with NO typed-place rule — the deref target here
+       (the same specimen tg_subset's Assign reject-path uses). *)
     ( "projected assignment writeback (no typed-place writeback rule)",
       "E9036",
-      {|def f() -> Int
-  var a = [1, 2, 3]
-  a[1] = 9
-  a[1]
+      {|def f(p: Ptr[Int]) -> Int
+  *p = 1
+  0
 end
 |} );
   ]

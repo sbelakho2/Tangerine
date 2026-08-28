@@ -275,6 +275,32 @@ let conditional_accept_specimens : (string * string) list =
   x
 end
 |});
+    (* E9048 retired 2026-08-28: the lowerer's qualified static-call
+       path serves the checker's full static-method dispatch (the
+       (owner, method) methods-registry pair with the Vec<->Array /
+       String<->str alias convention, the mangled free function, and
+       the qualified user-enum ctors through the variant table), so the
+       former E9048 rejection specimens are now positive subset
+       accepts — a qualified user-enum variant in VALUE position, a
+       qualified user-enum ctor CALL, and a nominal-qualified static
+       method call *)
+    ("Name (qualified user-enum variant)", {|enum Color
+  Red,
+  Green(Int)
+end
+def f() -> Color
+  Color::Red
+end
+|});
+    ("Name (qualified builtin ctor)", {|def f(o: Option[Int], r: Result[Int, Int]) -> Int
+  let a = Option::Some(1)
+  let b = Result::Ok(2)
+  match a {
+    Some(v) => v,
+    None() => 0
+  }
+end
+|});
     ("If", {|def f() -> Int
   if true then
     1
@@ -288,6 +314,24 @@ end
 end
 def f() -> Int
   g()
+end
+|});
+    ("Call (qualified user-enum ctor)", {|enum Color
+  Red,
+  Green(Int)
+end
+def f() -> Int
+  match Color::Green(7) {
+    Green(v) => v,
+    _ => 0
+  }
+end
+|});
+    ("Call (qualified static method)", {|struct Vec
+  data: Int
+end
+def f() -> Int
+  Vec::new()
 end
 |});
     ("Match", {|def f(x: Int, o: Option[Int]) -> Int
@@ -338,14 +382,6 @@ end
 
 let conditional_reject_specimens : (string * string * string) list =
   [
-    ("Name", "E9048",
-     {|struct Vec
-  data: Int
-end
-def f() -> Int
-  Vec::new()
-end
-|});
     ("If", "E9046",
      {|def f(o: Option[Int]) -> Int
   if let Some(x) = o then
@@ -353,17 +389,6 @@ end
   else
     0
   end
-end
-|});
-    ("Call", "E9048",
-     {|struct Vec
-  data: Int
-end
-def g() -> Int
-  0
-end
-def f() -> Int
-  Vec::new()
 end
 |});
     ("Match", "E9044",

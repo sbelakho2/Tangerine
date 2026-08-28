@@ -258,7 +258,23 @@ let ctor_of (tbl : variant_table) (n : string) : (string * string) option =
       | "None" | "Option::None" -> Some ("Option", "None")
       | "Ok" | "Result::Ok" -> Some ("Result", "Ok")
       | "Err" | "Result::Err" -> Some ("Result", "Err")
-      | _ -> None)
+      | _ -> (
+          (* the qualified user-enum form `Type::Variant` (E9048
+             retirement): the driver's table registers bare ctor names
+             only, so a qualified reference resolves through the enum's
+             own vt_enums entry (the same table the checker's qualified
+             constructor registration names) — the variant must actually
+             exist in the enum's table or the lookup misses (the caller
+             fails closed) *)
+          match String.index_opt n ':' with
+          | Some i when i + 1 < String.length n && n.[i + 1] = ':' ->
+              let qual = String.sub n 0 i in
+              let rest = String.sub n (i + 2) (String.length n - i - 2) in
+              (match List.assoc_opt qual tbl.vt_enums with
+               | Some vmap ->
+                   if List.mem_assoc rest vmap then Some (qual, rest) else None
+               | None -> None)
+          | _ -> None))
 
 let enum_tid_of (env : func_env) (enum_name : string) : Ids.Type_id.t =
   match List.assoc_opt enum_name env.types with
@@ -1852,7 +1868,191 @@ and lower_call (env : func_env) (st : lower_state) (span : Span.span)
                 (Seed_mir.Call (rp, Seed_mir.User instance, arg_vals, next_b, None))
                 next_b;
               (copy_place st rp, ty)
-          | None -> seed_bug "unknown callee '%s' in lowering" n))
+          | None -> (
+              (* ── the qualified static-call path (E9048 retirement:
+                 `Type::method(...)` — the checker's static-method
+                 dispatch lowered.  The resolution mirrors check_call's
+                 qualified arm exactly: the (owner, method) pair in the
+                 methods registry, then the kernel alias convention
+                 (Vec<->Array, String<->str — the checker's base_owners
+                 list), then the mangled free function
+                 (`String::new` -> `string_new`, `Box::new` -> `box_new`
+                 — the checker's mangled fallback).  The call is built
+                 like the receiver-method path but WITHOUT a receiver
+                 operand: the source args map to the method's params
+                 (the constructor-style methods — `new`, `with_capacity`,
+                 `from`, `null` — declare NO self, so me_params carries
+                 exactly the explicit params).  The instance: the typed
+                 channel's tn_call (the checker-resolved callable + SOLVED
+                 concrete substitution) is authoritative when present,
+                 else the registry's me_instance.  Every unresolvable
+                 qualified name fails closed with the reason — the
+                 fail-closed channel that replaced the firewall
+                 rejection. *)
+              let qualified_call () : Seed_mir.operand * Type_repr.t =
+                match String.index_opt n ':' with
+                | Some i when i + 1 < String.length n && n.[i + 1] = ':' ->
+                    let qual = String.sub n 0 i in
+                    let mname = String.sub n (i + 2) (String.length n - i - 2) in
+                    (* the checker's candidate-owner convention: the
+                       nominal's own name first, with the builtin alias
+                       swaps (Vec<->Array, String<->str) *)
+                    let candidate_owners =
+                      match qual with
+                      | "Vec" -> [ "Vec"; "Array" ]
+                      | "Array" -> [ "Array"; "Vec" ]
+                      | "String" -> [ "String"; "str" ]
+                      | "str" -> [ "str"; "String" ]
+                      | q -> [ q ]
+                    in
+                    let rec find_method = function
+                      | [] -> None
+                      | o :: rest -> (
+                          match List.assoc_opt (o, mname) env.methods with
+                          | Some me -> Some me
+                          | None -> find_method rest)
+                    in
+                    (match find_method candidate_owners with
+                     | Some me -> (
+                         let nparams = Array.length me.me_params in
+                         (* the checker PREPENDS a synthetic receiver (the
+                            type used as a value) exactly when the method's
+                            first parameter is a self of the OWNER's own
+                            type (the has_self && self_is_owner test in
+                            check_call); the lowerer mirrors that test to
+                            decide whether the source args map to params
+                            1.. or to params 0.. *)
+                         let self_is_owner =
+                           nparams > 0
+                           && (match me.me_params.(0).Type_repr.pt_type with
+                              | Type_repr.Named (tid1, _) -> (
+                                  match List.assoc_opt qual env.types with
+                                  | Some (Type_repr.Named (tid2, _)) ->
+                                      Ids.Type_id.compare tid1 tid2 = 0
+                                  | _ -> false)
+                              | _ -> false)
+                         in
+                         let expected =
+                           if self_is_owner then nparams - 1 else nparams
+                         in
+                         let nargs = List.length args in
+                         if nargs <> expected then
+                           seed_bug
+                             "qualified call `%s` of `%s`: expected %d argument(s), got %d"
+                             mname qual expected nargs;
+                         if self_is_owner then
+                           seed_bug
+                             "qualified call `%s`: the method takes a receiver (`self: %s`), which the qualified form cannot supply in the seed (the checker's synthetic receiver is the TYPE used as a value — a type-level fiction with no runtime content); call it on a real receiver value instead"
+                             mname (Seed_mir.print_type me.me_params.(0).Type_repr.pt_type);
+                         (* the instance: the typed channel's
+                            checker-resolved callable + solved concrete
+                            substitution when present (the generic call's
+                            concrete args arrive there), else the
+                            registry's instance *)
+                         let instance =
+                           match typed_node_of st span with
+                           | Some node -> (
+                               match node.tn_call with
+                               | Some (callable, type_args) ->
+                                   Instance_id.make ~callable ~type_args
+                               | None -> me.me_instance)
+                           | None -> me.me_instance
+                         in
+                         let arg_ops = List.map (fun a -> fst (lower_expr env st a.Ast.ca_value)) args in
+                         let id = fresh_local st me.me_ret in
+                         let rp = cur_place st id in
+                         let arg_vals =
+                           Array.of_list
+                             (List.mapi
+                                (fun i op ->
+                                  let eff =
+                                    if i < nparams then
+                                      Access_effect.read_effect me.me_params.(i).Type_repr.pt_convention
+                                    else Access_effect.Read
+                                  in
+                                  (* a consuming parameter (Sink/Set) TRANSFERS
+                                     the argument — the same conversion the
+                                     receiver-method path applies to the self
+                                     operand: an unprojected Copy becomes a Move
+                                     (the seed VM has no partial-move
+                                     representation, so a projected place fails
+                                     closed exactly like the receiver path) *)
+                                  let value =
+                                    match eff, op with
+                                    | (Access_effect.Consume | Access_effect.Initialize),
+                                      Seed_mir.Copy p when p.Seed_mir.projections = [] ->
+                                        Seed_mir.Move p
+                                    | _ -> op
+                                  in
+                                  { Seed_mir.effect_ = eff; value })
+                                arg_ops)
+                         in
+                         let next_b = new_block st in
+                         set_terminator_to st
+                           (Seed_mir.Call (rp, Seed_mir.User instance, arg_vals, next_b, None))
+                           next_b;
+                         (copy_place st rp, me.me_ret))
+                     | None -> (
+                         (* the mangled free function: `String::new`
+                            dispatches to the compiler constructor
+                            `string_new` — the same convention check_call's
+                            mangled fallback uses (`box_new`, `vec_filled`,
+                            `set_of`, ...) *)
+                         let mangled = String.lowercase_ascii qual ^ "_" ^ mname in
+                         match List.assoc_opt mangled env.callables with
+                         | None ->
+                             seed_bug "unknown callee '%s' in lowering" n
+                         | Some entry ->
+                             let cid = entry.ce_callable in
+                             let ty =
+                               match List.assoc_opt n env.values with
+                               | Some t -> t
+                               | None -> (
+                                   match List.assoc_opt mangled env.values with
+                                   | Some t -> t
+                                   | None -> Type_repr.Unit)
+                             in
+                             let arg_ops =
+                               List.map (fun a -> fst (lower_expr env st a.Ast.ca_value)) args
+                             in
+                             let id = fresh_local st ty in
+                             let rp = cur_place st id in
+                             let ce_params = entry.ce_params in
+                             let arg_vals =
+                               Array.of_list
+                                 (List.mapi
+                                    (fun i op ->
+                                      {
+                                        Seed_mir.effect_ =
+                                          (if i < Array.length ce_params then
+                                           Access_effect.read_effect ce_params.(i).Type_repr.pt_convention
+                                           else Access_effect.Read);
+                                        value = op;
+                                      })
+                                    arg_ops)
+                             in
+                             let next_b = new_block st in
+                             let tn_call =
+                               match typed_node_of st span with
+                               | Some node -> node.tn_call
+                               | None -> None
+                             in
+                             let instance =
+                               match tn_call with
+                               | Some (callable, type_args) ->
+                                   Instance_id.make ~callable ~type_args
+                               | None ->
+                                   Instance_id.make
+                                     ~callable:(Ids.Callable_id.make cid)
+                                     ~type_args:[||]
+                             in
+                             set_terminator_to st
+                               (Seed_mir.Call (rp, Seed_mir.User instance, arg_vals, next_b, None))
+                               next_b;
+                             (copy_place st rp, ty)))
+                | _ -> seed_bug "unknown callee '%s' in lowering" n
+              in
+              qualified_call ())))
   | Ast.Field (base, mname, span) -> (
       (* re-audit: the method-call rule — the receiver is lowered to its
          typed PLACE and passed as the SELF argument with the read-side

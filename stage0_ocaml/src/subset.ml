@@ -60,7 +60,15 @@ let reject (diags : Diagnostic.bag) code msg span =
    top-level functions nor builtin variant constructors (E9048): the
    lowering env's callables carry top-level functions only, so a
    `Type::method` reference fails closed at lowering with "unknown
-   callee". *)
+   callee".  E9048 was RETIRED 2026-08-28 when the qualified static-call
+   path landed in mir_lower's lower_call Name-arm (the checker's static-
+   method dispatch lowered: the (owner, method) methods-registry pair
+   with the Vec<->Array / String<->str alias convention, the mangled
+   free function, and the qualified user-enum ctors through the variant
+   table); the residual unresolvable qualified names fail closed at
+   lowering with "unknown callee" — the fail-closed channel that
+   replaced the firewall rejection (positive proofs in
+   selfcheck/tg_lowersurface.ml). *)
 
 type ctx = {
   user_variants : string list;
@@ -398,25 +406,11 @@ and check_expr ctx diags (e : Ast.expr) =
   | Ast.IntLit _ | Ast.FloatLit _ | Ast.StringLit _ | Ast.CharLit _ | Ast.BoolLit _
   | Ast.Path _ | Ast.NextExpr _ ->
       ()
-  | Ast.Name (n, span) ->
+  | Ast.Name (n, _) ->
       (* user-enum constructors are lowered through the semantic registry
          (the E9035 gate is retired — the VariantId fix + the
          lowersurface positive proof) *)
-      (match String.index_opt n ':' with
-       | Some i when i + 1 < String.length n && n.[i + 1] = ':' ->
-           let qual = String.sub n 0 i in
-           let rest = String.sub n (i + 2) (String.length n - i - 2) in
-           if
-             (not (List.mem n ctx.functions))
-             && List.mem qual ctx.nominals
-             && not (builtin_variant_of qual rest)
-           then
-             reject diags "E9048"
-               (Printf.sprintf
-                  "qualified method reference `%s` is not available in the bootstrap subset (seed lowering resolves top-level callables only — receiver-typed method calls have no lowering)"
-                  n)
-               span
-       | _ -> ())
+      ignore n
   | Ast.Array (elems, _) -> List.iter (check_expr ctx diags) elems
   | Ast.ArrayRepeat (v, c, span) ->
       (* AST form: Ast.ArrayRepeat (value, count, span) (parser `[v; n]`).
@@ -644,12 +638,22 @@ type form_status =
 
 let expr_form_status : (string * form_status) list =
   [
+    (* the qualified-call surface (E9048 retirement 2026-08-28): the
+       lowerer's Name arm now serves the checker's full static-method
+       dispatch — the qualified user-enum ctors (the variant table's
+       vt_enums qualified form), the (owner, method) methods-registry
+       pair with the Vec<->Array / String<->str alias convention, and the
+       mangled free function (`String::new` -> `string_new`) — so a
+       nominal-qualified name no longer fires E9048; the residual
+       unresolvable qualified names fail closed at lowering with
+       "unknown callee" (the fail-closed channel that replaced the
+       firewall rejection) *)
     ("IntLit", Accepted);
     ("FloatLit", Accepted);
     ("StringLit", Accepted);
     ("CharLit", Accepted);
     ("BoolLit", Accepted);
-    ("Name", Conditional [ "E9035"; "E9048" ]);
+    ("Name", Accepted);
     (* the parser folds qualified names into Name; a Path value never
        exists in a parsed program (Path would fail closed at lowering) *)
     ("Path", Unreachable);
@@ -665,11 +669,12 @@ let expr_form_status : (string * form_status) list =
     ("UnsafeBlock", Rejected "E9041");
     ("If", Conditional [ "E9046" ]);
     (* Name callees (functions + builtin/user-enum ctors via the
-       variant table) and Field callees (method calls through the
-       receiver-typed rule) lower; user-enum ctor callees reject E9035
-       (VariantId fix landed — gated pending the positive driver-path
-       proof), nominal-qualified non-function names reject E9048 *)
-    ("Call", Conditional [ "E9035"; "E9048" ]);
+       variant table), Field callees (method calls through the
+       receiver-typed rule) AND nominal-qualified static calls
+       (`Type::method` through the qualified path — E9048 retired
+       2026-08-28) lower; unresolvable receivers and qualified names
+       fail closed at lowering *)
+    ("Call", Accepted);
     ("Index", Accepted);
     ("Range", Rejected "E9039");
     ("Match", Conditional [ "E9035"; "E9043"; "E9044" ]);

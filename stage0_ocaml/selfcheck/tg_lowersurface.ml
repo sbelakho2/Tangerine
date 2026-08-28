@@ -41,15 +41,56 @@
          through the projected-destination checks, and the VM
          round-trips the writes (main = 42 + 7 + 99 + 99 = 247).
      (h) the projected-move surface proof (audit P0): the lowered
-         surface NEVER emits a projected Move/Consume (the seed VM has
-         no partial-move representation — `Move p` transitions the
-         WHOLE root slot to Moved, ignoring p.projections — so the
-         lowerer moves whole roots only): a full scan of the lowered
-         surface program finds ZERO projected transfers and a non-zero
-         number of whole-root moves (the `?` failure paths), and a
-         source program whose match arm must bind a NON-COPY payload
-         (which would require a projected move) fails closed at
-         lowering with the precise "non-Copy payload binding" Seed_bug.
+          surface NEVER emits a projected Move/Consume (the seed VM has
+          no partial-move representation — `Move p` transitions the
+          WHOLE root slot to Moved, ignoring p.projections — so the
+          lowerer moves whole roots only): a full scan of the lowered
+          surface program finds ZERO projected transfers and a non-zero
+          number of whole-root moves (the `?` failure paths), and a
+          source program whose match arm must bind a NON-COPY payload
+          (which would require a projected move) fails closed at
+          lowering with the precise "non-Copy payload binding" Seed_bug.
+     (i) the QUALIFIED static-call proof (E9048 retirement 2026-08-28 —
+          the positive replacement for the retired firewall rejection):
+          `Type::method(...)` lowers through the qualified path in
+          lower_call's Name-arm, mirroring the checker's static-method
+          dispatch.  Four legs:
+          (i1) the checker-integrated round-trip: `Buf::new()` (the
+               constructor-style method — me_params carries NO self, so
+               the zero source args map to the params exactly) plus the
+               receiver-method push/get round-trip 21+21 through the
+               struct's data field (main = 42); the typed channel's
+               tn_call on the `Buf::new` span is asserted (the
+               checker-resolved callable + solved substitution), the
+               emitted User callee equals the method seed's instance,
+               the program verifies (template AND concrete) and the VM
+               runs.
+          (i2) the Vec<->Array ALIAS leg with the REAL name: a
+               hand-built env (the kernel's alias convention — `Vec` is
+               an alias of `Array`, so `Vec::new` dispatches to the
+               Array impl's `new`) lowers a synthetic `Vec::new()` +
+               `v.push(a)` + `v.get(0)` main whose callees are
+               hand-built seed functions; verifies and the VM runs
+               (main = 42).
+          (i3) the checker-integrated `impl String` leg: `String::new()`
+               (a direct methods-registry hit) plus `String::kind(s)` —
+               a SELF-typed first parameter that is NOT the owner's own
+               type (String is a primitive, not a nominal), so the
+               source passes the receiver as an explicit argument
+               (exactly the kernel's `String::from_str_view(&arg)`
+               pattern); verifies and the VM runs (main = 42).
+          (i4) the qualified ctor leg: `Option::Some(21)`,
+               `Result::Ok(21)` (the builtin variant table's qualified
+               forms) and `Color::Green(21)` (the qualified USER-enum
+               ctor — the variant table's vt_enums qualified form)
+               construct and match round-trip (main = 63).
+          FAIL-CLOSED legs: a self-having method called qualified
+          (`W::touch()` — the checker's synthetic receiver is the TYPE
+          used as a value, a type-level fiction with no runtime
+          content) fails closed at lowering with the precise Seed_bug,
+          and an unresolvable qualified name (`Foo::bar`) fails closed
+          with "unknown callee" — the fail-closed channel that replaced
+          the firewall rejection.
 
    Expected main return: 113 (see the derivation comment in src_text). *)
 
@@ -3427,4 +3468,1224 @@ end
                      end
                  | Error m -> Printf.printf "  no-closure main returned: <inspect failed: %s>\n" m)));
        ignore lenv2;
-       ignore menv2
+       ignore menv2;
+       (* ── qualified static-call proof (E9048 retirement — (i1) the
+          checker-integrated round-trip): `Buf::new()` lowers through
+          the qualified path in lower_call's Name-arm (the methods
+          registry's (owner, method) pair — the constructor-style
+          `new` declares NO self, so the zero source args map to the
+          params exactly), then the receiver-method push/get round-trip
+          the data field (main = 42).  The methods are lowered as seed
+          functions (the same instance the calls emit), the typed
+          channel's tn_call on the `Buf::new` span is asserted (the
+          checker-resolved callable + solved substitution), the program
+          verifies (template AND concrete) and the VM runs. *)
+       let qsrc = {|
+struct Buf
+  data: Int
+end
+
+impl Buf
+  def new() -> Buf
+    Buf { data: 0 }
+  end
+
+  def push(self: Self, sink item: Int) -> Int
+    self.data + item
+  end
+
+  def get(self: Self, i: Int) -> Int
+    self.data + i
+  end
+end
+
+def main() -> Int
+  let v = Buf::new()
+  let a = 21
+  let d1 = v.push(a)
+  let d2 = v.push(a)
+  v.get(d1 + d2)
+end
+|} in
+       let qfile = Filename.temp_file "tg_lowersurface_qualified" ".tg" in
+       (let oc = open_out_bin qfile in
+        output_string oc qsrc;
+        close_out oc);
+       let qmanifest =
+         match Bootstrap_manifest.single ~file:qfile ~path:[ "qproof" ] () with
+         | Ok m -> m
+         | Error e -> failwith ("qualified-call proof manifest: " ^ e)
+       in
+       let qdiags = Diagnostic.create_bag () in
+       let qgraph = Module_graph.create_with_sources qmanifest qdiags in
+       let qresolved = Resolver.resolve qmanifest qgraph qdiags in
+       let qprog_ast = (List.hd qgraph.Module_graph.nodes).Module_graph.node_program in
+       (* the impl registration needs the declaration fixpoint (the
+          driver re-runs check_program to a fixpoint; mirror it here) *)
+       let rec qfix env n =
+         match Typecheck.check_program env qprog_ast with
+         | Error m -> failwith ("qualified-call proof typecheck: " ^ m)
+         | Ok (env', errors) ->
+             if errors = [] then env'
+             else if n = 0 then
+               failwith ("qualified-call proof typecheck errors: " ^ String.concat "; " errors)
+             else qfix env' (n - 1)
+       in
+       let qenv = qfix (Typecheck.initial_env ~resolved:(Some qresolved) ()) 6 in
+       Sys.remove qfile;
+       let q_tid = List.assoc "Buf" qenv.Typecheck.type_ids in
+       let q_reg = List.assoc q_tid (Driver.struct_fields_of qenv) in
+       let q_mts mname =
+         match List.assoc_opt ("Buf", mname) qenv.Typecheck.methods with
+         | Some ts -> ts
+         | None -> failwith ("qualified-call proof: no method signature for Buf::" ^ mname)
+       in
+       let q_new_ts = q_mts "new" in
+       let q_push_ts = q_mts "push" in
+       let q_get_ts = q_mts "get" in
+       if Array.length q_new_ts.Typecheck.ts_params <> 0 then
+         failwith
+           "qualified-call proof: Buf::new declares parameters (the constructor-style method must be self-less for the qualified call)";
+       if Array.length q_push_ts.Typecheck.ts_params <> 2 then
+         failwith "qualified-call proof: Buf::push must declare self + item";
+       let q_funcs =
+         List.filter_map
+           (fun i -> match i.Ast.kind with Ast.Function d -> Some d | _ -> None)
+           qprog_ast.Ast.items
+       in
+       let q_impl_methods =
+         match
+           List.find_map
+             (fun i ->
+               match i.Ast.kind with
+               | Ast.ImplBlock d -> Some d.Ast.i_methods
+               | _ -> None)
+             qprog_ast.Ast.items
+         with
+         | Some ms -> ms
+         | None -> failwith "qualified-call proof: no impl block in the source"
+       in
+       let qts_of name =
+         match List.assoc_opt name qenv.Typecheck.functions with
+         | Some ts -> ts
+         | None -> (
+             match List.filter (fun (k, _) -> Util.has_suffix k ("::" ^ name)) qenv.Typecheck.functions with
+             | [ (_, ts) ] -> ts
+             | _ -> failwith ("qualified-call proof: no typed signature for " ^ name))
+       in
+       let qenv2 : Mir_lower.func_env =
+         {
+           Mir_lower.types =
+             [
+               ("Buf", Type_repr.Named (q_tid, [||]));
+               ("Int", int_ty);
+               ("Unit", Type_repr.Unit);
+               ("Bool", Type_repr.Bool);
+               ("String", string_ty);
+             ];
+           values =
+             List.map
+               (fun d ->
+                 let n = d.Ast.fn_sig.Ast.sig_name in
+                 (n, (qts_of n).Typecheck.ts_return))
+               q_funcs;
+           callables =
+             List.map
+               (fun d ->
+                 let n = d.Ast.fn_sig.Ast.sig_name in
+                 ( n,
+                   {
+                     Mir_lower.ce_callable = Ids.Callable_id.to_int (qts_of n).Typecheck.ts_callable;
+                     ce_template_args = [||];
+                     ce_params = [||];
+                   } ))
+               q_funcs;
+           methods =
+             List.map
+               (fun (m : Ast.function_decl) ->
+                 let ts = q_mts m.Ast.fn_sig.Ast.sig_name in
+                 ( ("Buf", m.Ast.fn_sig.Ast.sig_name),
+                   {
+                     Mir_lower.me_instance =
+                       (* the same instance the method body is lowered
+                          under below (callable + declaration-order type
+                          args — [||] for the non-generic methods) *)
+                       Instance_id.make ~callable:ts.Typecheck.ts_callable
+                         ~type_args:
+                           (Array.of_list
+                              (List.map
+                                 (fun (_, pid) -> Type_repr.Type_param pid)
+                                 ts.Typecheck.ts_params_decl));
+                     me_params = ts.Typecheck.ts_params;
+                     me_ret = ts.Typecheck.ts_return;
+                   } ))
+               q_impl_methods;
+           fn_ret = int_ty;
+           struct_fields = Driver.struct_fields_of qenv;
+         }
+       in
+       let qmir_funcs =
+         List.map
+           (fun d ->
+             let n = d.Ast.fn_sig.Ast.sig_name in
+             let ts = qts_of n in
+             Mir_lower.lower_function_with_variants Mir_lower.default_variant_table
+               ~typed_nodes:(Driver.typed_nodes_of qenv)
+               { qenv2 with Mir_lower.fn_ret = ts.Typecheck.ts_return }
+               n (Ids.Callable_id.to_int ts.Typecheck.ts_callable) [||] [||] d)
+           q_funcs
+       in
+       let qmethod_fn (m : Ast.function_decl) =
+         let ts = q_mts m.Ast.fn_sig.Ast.sig_name in
+         Mir_lower.lower_function_with_variants Mir_lower.default_variant_table
+           ~typed_nodes:(Driver.typed_nodes_of qenv)
+           { qenv2 with Mir_lower.fn_ret = ts.Typecheck.ts_return }
+           m.Ast.fn_sig.Ast.sig_name
+           (Ids.Callable_id.to_int ts.Typecheck.ts_callable)
+           (Array.of_list
+              (List.map (fun (_, pid) -> Type_repr.Type_param pid) ts.Typecheck.ts_params_decl))
+           (Array.map (fun p -> p.Type_repr.pt_convention) ts.Typecheck.ts_params)
+           ~param_tys_opt:(Array.map (fun p -> p.Type_repr.pt_type) ts.Typecheck.ts_params)
+           m
+       in
+       let qprog : Seed_mir.program =
+         {
+           Seed_mir.functions =
+             Array.of_list (qmir_funcs @ List.map qmethod_fn q_impl_methods);
+           statics = [||];
+           types =
+             [|
+               Seed_mir.StructDef
+                 {
+                   sd_id = q_tid;
+                   sd_fields =
+                     List.mapi
+                       (fun i (_, fid, fty) ->
+                         {
+                           Seed_mir.fd_id = fid;
+                           fd_index = Ids.Field_index.make i;
+                           fd_ty = fty;
+                         })
+                       q_reg;
+                 };
+             |];
+         }
+       in
+       (* the typed channel: the `Buf::new` call's span node carries
+          tn_call = the checker-resolved callable + solved substitution
+          ([||] for the non-generic method) *)
+       let qmain_decl =
+         List.find
+           (fun (d : Ast.function_decl) -> d.Ast.fn_sig.Ast.sig_name = "main")
+           q_funcs
+       in
+       let qnew_span =
+         match qmain_decl.Ast.fn_body with
+         | Ast.FnBlock { Ast.b_stmts = Ast.LetBinding (_, _, _, Ast.Call (Ast.Name (n, _), _, [], span), _) :: _; _ }
+           when n = "Buf::new" -> span
+         | _ -> failwith "qualified-call proof: main's first statement is not `let v = Buf::new()`"
+       in
+       (match
+          List.assoc_opt (qnew_span.Span.file_id, qnew_span.Span.start)
+            (Driver.typed_nodes_of qenv)
+        with
+        | Some node -> (
+            match node.Mir_lower.tn_call with
+            | Some (callable, subst)
+              when Ids.Callable_id.compare callable q_new_ts.Typecheck.ts_callable = 0
+                   && Array.length subst = 0 ->
+                Printf.printf
+                  "  qualified-call typed channel: PASS (the `Buf::new` call's span carries tn_call = (CallableId#%d, [||]) — the checker-resolved instance)\n"
+                  (Ids.Callable_id.to_int callable)
+            | Some (callable, subst) ->
+                Printf.printf
+                  "  qualified-call typed channel: FAIL (tn_call = (CallableId#%d, [%d args]))\n"
+                  (Ids.Callable_id.to_int callable) (Array.length subst);
+                exit 1
+            | None ->
+                Printf.printf "  qualified-call typed channel: FAIL (no tn_call on the call's node)\n";
+                exit 1)
+        | None ->
+            Printf.printf "  qualified-call typed channel: FAIL (no typed node at the call's span)\n";
+            exit 1);
+       let qmain_fn =
+         List.find (fun f -> f.Seed_mir.name = "main") (Array.to_list qprog.Seed_mir.functions)
+       in
+       let qfirst_call =
+         Array.to_list qmain_fn.Seed_mir.blocks
+         |> List.find_map (fun (b : Seed_mir.block) ->
+                match b.Seed_mir.terminator with
+                | Seed_mir.Call (_, Seed_mir.User inst, args, _, _)
+                  when Ids.Callable_id.compare inst.Instance_id.callable
+                         q_new_ts.Typecheck.ts_callable = 0 ->
+                    Some args
+                | _ -> None)
+       in
+       (match qfirst_call with
+        | Some args when Array.length args = 0 ->
+            Printf.printf
+              "  qualified-call lowering: PASS (the `Buf::new` call emits a User callee = the method seed's instance CallableId#%d with ZERO arguments — the constructor-style method declares no self, so the zero source args map to the params exactly)\n"
+              (Ids.Callable_id.to_int q_new_ts.Typecheck.ts_callable)
+        | Some args ->
+            Printf.printf
+              "  qualified-call lowering: FAIL (%d arguments emitted)\n" (Array.length args);
+            exit 1
+        | None ->
+            Printf.printf "  qualified-call lowering: FAIL (no User call to the new method instance in main)\n";
+            exit 1);
+       let qpush_get_ok =
+         let seen = Hashtbl.create 4 in
+         Array.iter
+           (fun (b : Seed_mir.block) ->
+             match b.Seed_mir.terminator with
+             | Seed_mir.Call (_, Seed_mir.User inst, _, _, _) ->
+                 let c = Ids.Callable_id.to_int inst.Instance_id.callable in
+                 if c = Ids.Callable_id.to_int q_push_ts.Typecheck.ts_callable
+                    || c = Ids.Callable_id.to_int q_get_ts.Typecheck.ts_callable
+                 then Hashtbl.replace seen c ()
+             | _ -> ())
+           qmain_fn.Seed_mir.blocks;
+         Hashtbl.mem seen (Ids.Callable_id.to_int q_push_ts.Typecheck.ts_callable)
+         && Hashtbl.mem seen (Ids.Callable_id.to_int q_get_ts.Typecheck.ts_callable)
+       in
+       if not qpush_get_ok then begin
+         Printf.printf "  qualified-call receiver methods: FAIL (push/get calls missing)\n";
+         exit 1
+       end;
+       Printf.printf
+         "  qualified-call receiver methods: PASS (main's push/get calls emit the method instances CallableId#%d/#%d)\n"
+         (Ids.Callable_id.to_int q_push_ts.Typecheck.ts_callable)
+         (Ids.Callable_id.to_int q_get_ts.Typecheck.ts_callable);
+       (match Mir_verify.require_valid_template qprog with
+        | Ok () ->
+            Printf.printf "  qualified-call MIR verify (template): PASS (%d functions)\n"
+              (Array.length qprog.Seed_mir.functions)
+        | Error errs ->
+            Printf.printf "  qualified-call MIR verify (template): FAIL\n";
+            List.iter (fun e -> Printf.printf "    %s\n" e) errs;
+            Printf.printf "%s\n" (Seed_mir.print_program qprog);
+            exit 1);
+       (match Mir_verify.require_valid_concrete qprog with
+        | Ok () ->
+            Printf.printf "  qualified-call MIR verify (concrete): PASS (%d functions)\n"
+              (Array.length qprog.Seed_mir.functions)
+        | Error errs ->
+            Printf.printf "  qualified-call MIR verify (concrete): FAIL\n";
+            List.iter (fun e -> Printf.printf "    %s\n" e) errs;
+            Printf.printf "%s\n" (Seed_mir.print_program qprog);
+            exit 1);
+       let qentry =
+         match
+           Array.to_list qprog.Seed_mir.functions
+           |> List.find_opt (fun f -> f.Seed_mir.name = "main")
+         with
+         | Some f -> f.Seed_mir.instance
+         | None -> failwith "qualified-call proof: no main function"
+       in
+       let qhost = Host.create ~repo_root:"." ~argv:[||] in
+       (match Vm.run ~program:qprog ~entry:qentry ~argv:[||] ~host:qhost with
+        | Error e ->
+            Printf.printf "  qualified-call VM: FAIL %s\n" e.Vm.message;
+            exit 1
+        | Ok code ->
+            Printf.printf "  qualified-call VM: exit %d\n" code;
+            (match Vm.entry_frame_of ~program:qprog ~entry:qentry ~argv:[||] with
+             | Error m -> Printf.printf "  qualified-call main returned: <inspect failed: %s>\n" m
+             | Ok (qvm, qentry_frame) -> (
+                 match Vm.run_inspect qvm qentry_frame with
+                 | Ok ret_val ->
+                     Printf.printf "  qualified-call main returned: %s\n" ret_val;
+                     if ret_val = "42" then
+                       Printf.printf
+                         "  qualified-call RESULT: PASS (Buf::new() + push/push + get = 42 through the qualified static-call path and the receiver-method path)\n"
+                     else begin
+                       Printf.printf "  qualified-call RESULT: FAIL (expected 42)\n";
+                       exit 1
+                     end
+                 | Error m ->
+                     Printf.printf "  qualified-call main returned: <inspect failed: %s>\n" m)));;
+
+
+       (* ── qualified-call proof (i2): the Vec<->Array ALIAS leg with the
+          REAL kernel name.  `Vec` is an alias of `Array` (the kernel's
+          `Vec[T] is an alias for Array[T]`), so `Vec::new` dispatches to
+          the Array impl's `new` — the checker's alias fallback in
+          check_call; the lowerer's qualified path mirrors it
+          (candidate owners [Vec; Array] when the direct (Vec, new) key
+          is absent).  The env is hand-built (no checker — the harness
+          cannot register the kernel's `impl[T] Array[T]`), the main AST
+          is synthetic, and the callees (new/push/get) are hand-built
+          seed functions; the program verifies (template AND concrete)
+          and the VM runs (main = 42). *)
+       let va_tid = Ids.Type_id.make 91 in
+       let va_fid = Ids.Field_id.make 601 in
+       let va_vec_ty = Type_repr.Named (va_tid, [||]) in
+       let va_env : Mir_lower.func_env =
+         {
+           Mir_lower.types =
+             [
+               ("Vec", va_vec_ty);
+               ("Array", va_vec_ty);
+               ("Int", int_ty);
+               ("Unit", Type_repr.Unit);
+               ("Bool", Type_repr.Bool);
+             ];
+           values = [];
+           callables = [];
+           methods =
+             [
+               ( ("Array", "new"),
+                 {
+                   Mir_lower.me_instance =
+                     Instance_id.make ~callable:(Ids.Callable_id.make 101) ~type_args:[||];
+                   me_params = [||];
+                   me_ret = va_vec_ty;
+                 } );
+               ( ("Vec", "push"),
+                 {
+                   Mir_lower.me_instance =
+                     Instance_id.make ~callable:(Ids.Callable_id.make 102) ~type_args:[||];
+                   me_params =
+                     [|
+                       { Type_repr.pt_convention = Access_effect.Let; pt_type = va_vec_ty };
+                       { Type_repr.pt_convention = Access_effect.Sink; pt_type = int_ty };
+                     |];
+                   me_ret = int_ty;
+                 } );
+               ( ("Vec", "get"),
+                 {
+                   Mir_lower.me_instance =
+                     Instance_id.make ~callable:(Ids.Callable_id.make 103) ~type_args:[||];
+                   me_params =
+                     [|
+                       { Type_repr.pt_convention = Access_effect.Let; pt_type = va_vec_ty };
+                       { Type_repr.pt_convention = Access_effect.Let; pt_type = int_ty };
+                     |];
+                   me_ret = int_ty;
+                 } );
+             ];
+           fn_ret = int_ty;
+           struct_fields = [ (va_tid, [ ("data", va_fid, int_ty) ]) ];
+         }
+       in
+       let va_span = Span.synthetic in
+       let va_name n = Ast.Name (n, va_span) in
+       let va_arg e = { Ast.ca_label = None; ca_value = e; ca_span = va_span } in
+       let va_call n args = Ast.Call (va_name n, [], args, va_span) in
+       let va_mcall base mname args =
+         Ast.Call (Ast.Field (va_name base, mname, va_span), [], args, va_span)
+       in
+       let va_int i = Ast.IntLit (string_of_int i, va_span) in
+       let va_let name value =
+         Ast.LetBinding (Ast.PatIdent (name, false, va_span), false, None, value, va_span)
+       in
+       let va_main_decl : Ast.function_decl =
+         {
+           Ast.fn_sig =
+             {
+               Ast.sig_name = "main";
+               sig_public = false;
+               sig_async = false;
+               sig_unsafe = false;
+               sig_const = false;
+               sig_pure = false;
+               sig_inline = false;
+               sig_extern = false;
+               sig_type_params = [];
+               sig_params = [];
+               sig_return = None;
+               sig_where = [];
+               sig_span = va_span;
+             };
+           fn_clauses = [];
+           fn_body =
+             Ast.FnBlock
+               {
+                 Ast.b_stmts =
+                   [
+                     va_let "v" (va_call "Vec::new" []);
+                     va_let "a" (va_int 21);
+                     va_let "d1" (va_mcall "v" "push" [ va_arg (va_name "a") ]);
+                     va_let "d2" (va_mcall "v" "push" [ va_arg (va_name "a") ]);
+                   ];
+                 b_tail =
+                   Some
+                     (va_mcall "v" "get"
+                        [ va_arg (Ast.Binary (va_name "d1", Ast.Add, va_name "d2", va_span)) ]);
+                 b_span = va_span;
+               };
+           fn_span = va_span;
+         }
+       in
+       let va_main_fn =
+         Mir_lower.lower_function_with_variants Mir_lower.default_variant_table va_env
+           "main" 100 [||] [||] va_main_decl
+       in
+       let va_place l = { Seed_mir.local = l; projections = [] } in
+       let va_int_op n =
+         Seed_mir.Constant
+           (Seed_mir.Integer (Int_value.of_int64 ~width:64 ~signed:true (Int64.of_int n)))
+       in
+       let va_fn name callable params locals stmts : Seed_mir.function_ =
+         {
+           Seed_mir.name;
+           instance = Instance_id.make ~callable:(Ids.Callable_id.make callable) ~type_args:[||];
+           params;
+           locals;
+           blocks = [| { Seed_mir.id = 0; statements = stmts; terminator = Seed_mir.Ret } |];
+           entry = 0;
+         }
+       in
+       let va_new_fn =
+         va_fn "vec_new" 101 [||] [| va_vec_ty; va_vec_ty |]
+           [
+             Seed_mir.Assign
+               ( va_place 1,
+                 Seed_mir.Aggregate
+                   ( Seed_mir.StructCtor (va_tid, [| Ids.Field_index.make 0 |]),
+                     [ va_int_op 0 ] ) );
+             Seed_mir.Assign (va_place 0, Seed_mir.Use (Seed_mir.Move (va_place 1)));
+           ]
+       in
+       let va_push_fn =
+         va_fn "vec_push" 102
+           [|
+             { Type_repr.pt_convention = Access_effect.Let; pt_type = va_vec_ty };
+             { Type_repr.pt_convention = Access_effect.Sink; pt_type = int_ty };
+           |]
+           [| int_ty; va_vec_ty; int_ty |]
+           [
+             Seed_mir.Assign
+               ( va_place 0,
+                 Seed_mir.BinaryOp
+                   ( Seed_mir.Add,
+                     Seed_mir.Read { local = 1; projections = [ Seed_mir.Field va_fid ] },
+                     Seed_mir.Move (va_place 2) ) );
+           ]
+       in
+       let va_get_fn =
+         va_fn "vec_get" 103
+           [|
+             { Type_repr.pt_convention = Access_effect.Let; pt_type = va_vec_ty };
+             { Type_repr.pt_convention = Access_effect.Let; pt_type = int_ty };
+           |]
+           [| int_ty; va_vec_ty; int_ty |]
+           [
+             Seed_mir.Assign
+               ( va_place 0,
+                 Seed_mir.BinaryOp
+                   ( Seed_mir.Add,
+                     Seed_mir.Read { local = 1; projections = [ Seed_mir.Field va_fid ] },
+                     Seed_mir.Copy (va_place 2) ) );
+           ]
+       in
+       let va_prog : Seed_mir.program =
+         {
+           Seed_mir.functions = [| va_main_fn; va_new_fn; va_push_fn; va_get_fn |];
+           statics = [||];
+           types =
+             [|
+               Seed_mir.StructDef
+                 {
+                   sd_id = va_tid;
+                   sd_fields =
+                     [
+                       { Seed_mir.fd_id = va_fid;
+                         fd_index = Ids.Field_index.make 0;
+                         fd_ty = int_ty };
+                     ];
+                 };
+             |];
+         }
+       in
+       let va_new_call_ok =
+         Array.exists
+           (fun (b : Seed_mir.block) ->
+             match b.Seed_mir.terminator with
+             | Seed_mir.Call (_, Seed_mir.User inst, args, _, _)
+               when Ids.Callable_id.compare inst.Instance_id.callable
+                      (Ids.Callable_id.make 101) = 0
+                    && Array.length args = 0 ->
+                 true
+             | _ -> false)
+           va_main_fn.Seed_mir.blocks
+       in
+       if not va_new_call_ok then begin
+         Printf.printf
+           "  qualified-call alias: FAIL (the `Vec::new` call did not resolve to the Array::new instance with zero args)\n";
+         exit 1
+       end;
+       Printf.printf
+         "  qualified-call alias: PASS (`Vec::new` resolved through the Vec<->Array alias to the Array::new instance CallableId#101 — zero args, no self)\n";
+       (match Mir_verify.require_valid_template va_prog with
+        | Ok () ->
+            Printf.printf "  qualified-call alias MIR verify (template): PASS (4 functions)\n"
+        | Error errs ->
+            Printf.printf "  qualified-call alias MIR verify (template): FAIL\n";
+            List.iter (fun e -> Printf.printf "    %s\n" e) errs;
+            Printf.printf "%s\n" (Seed_mir.print_program va_prog);
+            exit 1);
+       (match Mir_verify.require_valid_concrete va_prog with
+        | Ok () ->
+            Printf.printf "  qualified-call alias MIR verify (concrete): PASS (4 functions)\n"
+        | Error errs ->
+            Printf.printf "  qualified-call alias MIR verify (concrete): FAIL\n";
+            List.iter (fun e -> Printf.printf "    %s\n" e) errs;
+            Printf.printf "%s\n" (Seed_mir.print_program va_prog);
+            exit 1);
+       let va_host = Host.create ~repo_root:"." ~argv:[||] in
+       (match Vm.run ~program:va_prog ~entry:va_main_fn.Seed_mir.instance ~argv:[||] ~host:va_host with
+        | Error e ->
+            Printf.printf "  qualified-call alias VM: FAIL %s\n" e.Vm.message;
+            exit 1
+        | Ok code ->
+            Printf.printf "  qualified-call alias VM: exit %d\n" code;
+            (match Vm.entry_frame_of ~program:va_prog ~entry:va_main_fn.Seed_mir.instance ~argv:[||] with
+             | Error m -> Printf.printf "  qualified-call alias main returned: <inspect failed: %s>\n" m
+             | Ok (vavm, vaentry_frame) -> (
+                 match Vm.run_inspect vavm vaentry_frame with
+                 | Ok ret_val ->
+                     Printf.printf "  qualified-call alias main returned: %s\n" ret_val;
+                     if ret_val = "42" then
+                       Printf.printf
+                         "  qualified-call alias RESULT: PASS (Vec::new() + push/push + get = 42 — the kernel's `Vec::new` name, the alias dispatch, and the VM round-trip)\n"
+                     else begin
+                       Printf.printf "  qualified-call alias RESULT: FAIL (expected 42)\n";
+                       exit 1
+                     end
+                 | Error m ->
+                     Printf.printf "  qualified-call alias main returned: <inspect failed: %s>\n" m)));
+       (* the unresolvable qualified name: `Foo::bar` with no method, no
+          alias, no mangled free function -> "unknown callee" (the
+          fail-closed channel that replaced the firewall rejection) *)
+       (try
+          ignore
+            (Mir_lower.lower_function_with_variants Mir_lower.default_variant_table
+               va_env "main" 100 [||] [||]
+               { va_main_decl with
+                 Ast.fn_body =
+                   Ast.FnExpr (va_call "Foo::bar" [ va_arg (va_int 0) ]) });
+          Printf.printf
+            "  unknown qualified callee: FAIL (lowering succeeded — `Foo::bar` should fail closed)\n";
+          exit 1
+        with
+        | Mir_lower.Seed_bug m ->
+            let contains_sub s sub =
+              let ls = String.length s and l = String.length sub in
+              if l = 0 then true
+              else begin
+                let found = ref false in
+                (try
+                   for i = 0 to ls - l do
+                     if not !found && String.sub s i l = sub then found := true
+                   done
+                 with Invalid_argument _ -> ());
+                !found
+              end
+            in
+            if contains_sub m "unknown callee 'Foo::bar'" then
+              Printf.printf
+                "  unknown qualified callee: PASS (lowering fails closed: %s)\n" m
+            else begin
+              Printf.printf "  unknown qualified callee: FAIL (wrong Seed_bug: %s)\n" m;
+              exit 1
+            end);;
+
+       (* ── qualified-call proof (i3): `impl String` — `String::new()` is
+          a direct methods-registry hit, and `String::kind(s)` exercises
+          the SELF-typed first parameter that is NOT the owner's own
+          type (String is a primitive, not a nominal — the checker's
+          self_is_owner test fails, so the receiver passes as an EXPLICIT
+          argument, exactly the kernel's `String::from_str_view(&arg)`
+          pattern; the lowerer's mirrored test maps the source args to
+          ALL params).  Verifies (template + concrete) and the VM runs
+          (main = 42). *)
+       let sqsrc = {|
+impl String
+  def new() -> String
+    "hi"
+  end
+
+  def kind(sink self: Self) -> Int
+    42
+  end
+end
+
+def main() -> Int
+  String::kind(String::new())
+end
+|} in
+       let sqfile = Filename.temp_file "tg_lowersurface_string" ".tg" in
+       (let oc = open_out_bin sqfile in
+        output_string oc sqsrc;
+        close_out oc);
+       let sqmanifest =
+         match Bootstrap_manifest.single ~file:sqfile ~path:[ "sqproof" ] () with
+         | Ok m -> m
+         | Error e -> failwith ("String qualified-call proof manifest: " ^ e)
+       in
+       let sqdiags = Diagnostic.create_bag () in
+       let sqgraph = Module_graph.create_with_sources sqmanifest sqdiags in
+       let sqresolved = Resolver.resolve sqmanifest sqgraph sqdiags in
+       let sqprog_ast = (List.hd sqgraph.Module_graph.nodes).Module_graph.node_program in
+       let rec sqfix env n =
+         match Typecheck.check_program env sqprog_ast with
+         | Error m -> failwith ("String qualified-call proof typecheck: " ^ m)
+         | Ok (env', errors) ->
+             if errors = [] then env'
+             else if n = 0 then
+               failwith ("String qualified-call proof typecheck errors: " ^ String.concat "; " errors)
+             else sqfix env' (n - 1)
+       in
+       let sqenv = sqfix (Typecheck.initial_env ~resolved:(Some sqresolved) ()) 6 in
+       Sys.remove sqfile;
+       let sq_mts mname =
+         match List.assoc_opt ("String", mname) sqenv.Typecheck.methods with
+         | Some ts -> ts
+         | None -> failwith ("String qualified-call proof: no method signature for String::" ^ mname)
+       in
+       let sq_new_ts = sq_mts "new" in
+       let sq_kind_ts = sq_mts "kind" in
+       if Array.length sq_new_ts.Typecheck.ts_params <> 0 then
+         failwith "String qualified-call proof: String::new declares parameters";
+       if Array.length sq_kind_ts.Typecheck.ts_params <> 1 then
+         failwith "String qualified-call proof: String::kind must declare exactly self";
+       let sq_funcs =
+         List.filter_map
+           (fun i -> match i.Ast.kind with Ast.Function d -> Some d | _ -> None)
+           sqprog_ast.Ast.items
+       in
+       let sq_impl_methods =
+         match
+           List.find_map
+             (fun i ->
+               match i.Ast.kind with
+               | Ast.ImplBlock d -> Some d.Ast.i_methods
+               | _ -> None)
+             sqprog_ast.Ast.items
+         with
+         | Some ms -> ms
+         | None -> failwith "String qualified-call proof: no impl block in the source"
+       in
+       let sqts_of name =
+         match List.assoc_opt name sqenv.Typecheck.functions with
+         | Some ts -> ts
+         | None -> (
+             match List.filter (fun (k, _) -> Util.has_suffix k ("::" ^ name)) sqenv.Typecheck.functions with
+             | [ (_, ts) ] -> ts
+             | _ -> failwith ("String qualified-call proof: no typed signature for " ^ name))
+       in
+       let sqenv2 : Mir_lower.func_env =
+         {
+           Mir_lower.types =
+             [
+               ("String", string_ty);
+               ("Int", int_ty);
+               ("Unit", Type_repr.Unit);
+               ("Bool", Type_repr.Bool);
+               ("Char", Type_repr.Char);
+             ];
+           values =
+             List.map
+               (fun d ->
+                 let n = d.Ast.fn_sig.Ast.sig_name in
+                 (n, (sqts_of n).Typecheck.ts_return))
+               sq_funcs;
+           callables =
+             List.map
+               (fun d ->
+                 let n = d.Ast.fn_sig.Ast.sig_name in
+                 ( n,
+                   {
+                     Mir_lower.ce_callable = Ids.Callable_id.to_int (sqts_of n).Typecheck.ts_callable;
+                     ce_template_args = [||];
+                     ce_params = [||];
+                   } ))
+               sq_funcs;
+           methods =
+             List.map
+               (fun (m : Ast.function_decl) ->
+                 let ts = sq_mts m.Ast.fn_sig.Ast.sig_name in
+                 ( ("String", m.Ast.fn_sig.Ast.sig_name),
+                   {
+                     Mir_lower.me_instance =
+                       Instance_id.make ~callable:ts.Typecheck.ts_callable
+                         ~type_args:
+                           (Array.of_list
+                              (List.map
+                                 (fun (_, pid) -> Type_repr.Type_param pid)
+                                 ts.Typecheck.ts_params_decl));
+                     me_params = ts.Typecheck.ts_params;
+                     me_ret = ts.Typecheck.ts_return;
+                   } ))
+               sq_impl_methods;
+           fn_ret = int_ty;
+           struct_fields = [];
+         }
+       in
+       let sqmir_funcs =
+         List.map
+           (fun d ->
+             let n = d.Ast.fn_sig.Ast.sig_name in
+             let ts = sqts_of n in
+             Mir_lower.lower_function_with_variants Mir_lower.default_variant_table
+               ~typed_nodes:(Driver.typed_nodes_of sqenv)
+               { sqenv2 with Mir_lower.fn_ret = ts.Typecheck.ts_return }
+               n (Ids.Callable_id.to_int ts.Typecheck.ts_callable) [||] [||] d)
+           sq_funcs
+       in
+       let sqmethod_fn (m : Ast.function_decl) =
+         let ts = sq_mts m.Ast.fn_sig.Ast.sig_name in
+         Mir_lower.lower_function_with_variants Mir_lower.default_variant_table
+           ~typed_nodes:(Driver.typed_nodes_of sqenv)
+           { sqenv2 with Mir_lower.fn_ret = ts.Typecheck.ts_return }
+           m.Ast.fn_sig.Ast.sig_name
+           (Ids.Callable_id.to_int ts.Typecheck.ts_callable)
+           (Array.of_list
+              (List.map (fun (_, pid) -> Type_repr.Type_param pid) ts.Typecheck.ts_params_decl))
+           (Array.map (fun p -> p.Type_repr.pt_convention) ts.Typecheck.ts_params)
+           ~param_tys_opt:(Array.map (fun p -> p.Type_repr.pt_type) ts.Typecheck.ts_params)
+           m
+       in
+       let sqprog : Seed_mir.program =
+         {
+           Seed_mir.functions =
+             Array.of_list (sqmir_funcs @ List.map sqmethod_fn sq_impl_methods);
+           statics = [||];
+           types = [||];
+         }
+       in
+       let sqmain_fn =
+         List.find (fun f -> f.Seed_mir.name = "main") (Array.to_list sqprog.Seed_mir.functions)
+       in
+       let sqcalls_ok =
+         let seen = Hashtbl.create 4 in
+         Array.iter
+           (fun (b : Seed_mir.block) ->
+             match b.Seed_mir.terminator with
+             | Seed_mir.Call (_, Seed_mir.User inst, args, _, _) ->
+                 let c = Ids.Callable_id.to_int inst.Instance_id.callable in
+                 if c = Ids.Callable_id.to_int sq_new_ts.Typecheck.ts_callable
+                    && Array.length args = 0
+                 then Hashtbl.replace seen 1 ()
+                 else if c = Ids.Callable_id.to_int sq_kind_ts.Typecheck.ts_callable
+                         && Array.length args = 1
+                 then Hashtbl.replace seen 2 ()
+             | _ -> ())
+           sqmain_fn.Seed_mir.blocks;
+         Hashtbl.mem seen 1 && Hashtbl.mem seen 2
+       in
+       if not sqcalls_ok then begin
+         Printf.printf
+           "  String qualified-call lowering: FAIL (the String::new / String::kind calls are missing or mis-argued)\n";
+         exit 1
+       end;
+       Printf.printf
+         "  String qualified-call lowering: PASS (String::new -> 0 args; String::kind(s) -> 1 arg — the SELF-typed non-owner first parameter is an explicit argument, never a synthetic receiver)\n";
+       (match Mir_verify.require_valid_template sqprog with
+        | Ok () ->
+            Printf.printf "  String qualified-call MIR verify (template): PASS (%d functions)\n"
+              (Array.length sqprog.Seed_mir.functions)
+        | Error errs ->
+            Printf.printf "  String qualified-call MIR verify (template): FAIL\n";
+            List.iter (fun e -> Printf.printf "    %s\n" e) errs;
+            Printf.printf "%s\n" (Seed_mir.print_program sqprog);
+            exit 1);
+       (match Mir_verify.require_valid_concrete sqprog with
+        | Ok () ->
+            Printf.printf "  String qualified-call MIR verify (concrete): PASS (%d functions)\n"
+              (Array.length sqprog.Seed_mir.functions)
+        | Error errs ->
+            Printf.printf "  String qualified-call MIR verify (concrete): FAIL\n";
+            List.iter (fun e -> Printf.printf "    %s\n" e) errs;
+            Printf.printf "%s\n" (Seed_mir.print_program sqprog);
+            exit 1);
+       let sqentry = sqmain_fn.Seed_mir.instance in
+       let sqhost = Host.create ~repo_root:"." ~argv:[||] in
+       (match Vm.run ~program:sqprog ~entry:sqentry ~argv:[||] ~host:sqhost with
+        | Error e ->
+            Printf.printf "  String qualified-call VM: FAIL %s\n" e.Vm.message;
+            exit 1
+        | Ok code ->
+            Printf.printf "  String qualified-call VM: exit %d\n" code;
+            (match Vm.entry_frame_of ~program:sqprog ~entry:sqentry ~argv:[||] with
+             | Error m -> Printf.printf "  String qualified-call main returned: <inspect failed: %s>\n" m
+             | Ok (sqvm, sqentry_frame) -> (
+                 match Vm.run_inspect sqvm sqentry_frame with
+                 | Ok ret_val ->
+                     Printf.printf "  String qualified-call main returned: %s\n" ret_val;
+                     if ret_val = "42" then
+                       Printf.printf
+                         "  String qualified-call RESULT: PASS (String::new() + String::kind(s) = 42 — the qualified constructor and the explicit-argument self-typed method)\n"
+                     else begin
+                       Printf.printf "  String qualified-call RESULT: FAIL (expected 42)\n";
+                       exit 1
+                     end
+
+                 | Error m ->
+                     Printf.printf "  String qualified-call main returned: <inspect failed: %s>\n" m)));;
+
+       (* ── qualified-call proof (i4): the qualified ctor leg —
+          `Option::Some(21)` / `Result::Ok(21)` (the builtin variant
+          table's qualified forms) and `Color::Green(21)` (the qualified
+          USER-enum ctor — the variant table's vt_enums qualified form)
+          construct and match round-trip (main = 63). *)
+       let qc_src = {|
+enum Color
+  Red,
+  Green(Int),
+  Blue(Int, Int)
+end
+
+def main() -> Int
+  let a = Option::Some(21)
+  let b = Result::Ok(21)
+  let c = Color::Green(21)
+  let d = match a {
+    Some(v) => v,
+    None() => 0
+  }
+  let e = match b {
+    Ok(v) => v,
+    Err(_) => 0
+  }
+  let f = match c {
+    Green(v) => v,
+    _ => 0
+  }
+  d + e + f
+end
+|} in
+       let qc_file = Filename.temp_file "tg_lowersurface_qctor" ".tg" in
+       (let oc = open_out_bin qc_file in
+        output_string oc qc_src;
+        close_out oc);
+       let qc_manifest =
+         match Bootstrap_manifest.single ~file:qc_file ~path:[ "qcproof" ] () with
+         | Ok m -> m
+         | Error e -> failwith ("qualified-ctor proof manifest: " ^ e)
+       in
+       let qc_diags = Diagnostic.create_bag () in
+       let qc_graph = Module_graph.create_with_sources qc_manifest qc_diags in
+       let qc_resolved = Resolver.resolve qc_manifest qc_graph qc_diags in
+       let qc_prog_ast = (List.hd qc_graph.Module_graph.nodes).Module_graph.node_program in
+       let qc_env =
+         match Typecheck.check_program (Typecheck.initial_env ~resolved:(Some qc_resolved) ()) qc_prog_ast with
+         | Error m -> failwith ("qualified-ctor proof typecheck: " ^ m)
+         | Ok (env', errors) ->
+             if errors <> [] then
+               failwith ("qualified-ctor proof typecheck errors: " ^ String.concat "; " errors);
+             env'
+       in
+       Sys.remove qc_file;
+       let qc_option_tid = List.assoc "Option" qc_env.Typecheck.type_ids in
+       let qc_result_tid = List.assoc "Result" qc_env.Typecheck.type_ids in
+       let qc_color_tid = List.assoc "Color" qc_env.Typecheck.type_ids in
+       let qc_option_int = Type_repr.Named (qc_option_tid, [| int_ty |]) in
+       let qc_result_int = Type_repr.Named (qc_result_tid, [| int_ty; int_ty |]) in
+       let qc_color_ty = Type_repr.Named (qc_color_tid, [||]) in
+       let qc_ts_of name =
+         match List.assoc_opt name qc_env.Typecheck.functions with
+         | Some ts -> ts
+         | None -> (
+             match List.filter (fun (k, _) -> Util.has_suffix k ("::" ^ name)) qc_env.Typecheck.functions with
+             | [ (_, ts) ] -> ts
+             | _ -> failwith ("qualified-ctor proof: no typed signature for " ^ name))
+       in
+       let qc_funcs =
+         List.filter_map
+           (fun i -> match i.Ast.kind with Ast.Function d -> Some d | _ -> None)
+           qc_prog_ast.Ast.items
+       in
+       let qc_env2 : Mir_lower.func_env =
+         {
+           Mir_lower.types =
+             [
+               ("Color", qc_color_ty);
+               ("Option", Type_repr.Named (qc_option_tid, [| Type_repr.Type_param (Ids.Generic_param_id.make 0) |]));
+               ("Result", Type_repr.Named (qc_result_tid, [| Type_repr.Type_param (Ids.Generic_param_id.make 0); Type_repr.Type_param (Ids.Generic_param_id.make 1) |]));
+               ("Int", int_ty);
+               ("Unit", Type_repr.Unit);
+               ("Bool", Type_repr.Bool);
+               ("String", string_ty);
+             ];
+           values =
+             [
+               ("Option::Some", qc_option_int);
+               ("Option::None", qc_option_int);
+               ("Result::Ok", qc_result_int);
+               ("Result::Err", qc_result_int);
+               ("Color::Red", qc_color_ty);
+               ("Color::Green", qc_color_ty);
+               ("Color::Blue", qc_color_ty);
+             ]
+             @ List.map
+                 (fun d ->
+                   let n = d.Ast.fn_sig.Ast.sig_name in
+                   (n, (qc_ts_of n).Typecheck.ts_return))
+                 qc_funcs;
+           callables =
+             List.map
+               (fun d ->
+                 let n = d.Ast.fn_sig.Ast.sig_name in
+                 ( n,
+                   {
+                     Mir_lower.ce_callable = Ids.Callable_id.to_int (qc_ts_of n).Typecheck.ts_callable;
+                     ce_template_args = [||];
+                     ce_params = [||];
+                   } ))
+               qc_funcs;
+           methods = [];
+           fn_ret = int_ty;
+           struct_fields = Driver.struct_fields_of qc_env;
+         }
+       in
+       let qc_mir_funcs =
+         List.map
+           (fun d ->
+             let n = d.Ast.fn_sig.Ast.sig_name in
+             let ts = qc_ts_of n in
+             Mir_lower.lower_function_with_variants variant_table
+               { qc_env2 with Mir_lower.fn_ret = ts.Typecheck.ts_return }
+               n (Ids.Callable_id.to_int ts.Typecheck.ts_callable) [||] [||] d)
+           qc_funcs
+       in
+       let qc_prog : Seed_mir.program =
+         {
+           Seed_mir.functions = Array.of_list qc_mir_funcs;
+           statics = [||];
+           types =
+             [|
+               Seed_mir.EnumDef
+                 {
+                   ed_id = qc_option_tid;
+                   ed_variants =
+                     [
+                       { Seed_mir.vd_id = Ids.Variant_id.make 1; vd_index = Ids.Variant_index.make 0; vd_payload = Type_repr.Tuple [| int_ty |] };
+                       { Seed_mir.vd_id = Ids.Variant_id.make 2; vd_index = Ids.Variant_index.make 1; vd_payload = Type_repr.Unit };
+                     ];
+                 };
+               Seed_mir.EnumDef
+                 {
+                   ed_id = qc_result_tid;
+                   ed_variants =
+                     [
+                       { Seed_mir.vd_id = Ids.Variant_id.make 1; vd_index = Ids.Variant_index.make 0; vd_payload = Type_repr.Tuple [| int_ty |] };
+                       { Seed_mir.vd_id = Ids.Variant_id.make 2; vd_index = Ids.Variant_index.make 1; vd_payload = Type_repr.Tuple [| int_ty |] };
+                     ];
+                 };
+               Seed_mir.EnumDef
+                 {
+                   ed_id = qc_color_tid;
+                   ed_variants =
+                     [
+                       { Seed_mir.vd_id = Ids.Variant_id.make 1; vd_index = Ids.Variant_index.make 0; vd_payload = Type_repr.Unit };
+                       { Seed_mir.vd_id = Ids.Variant_id.make 2; vd_index = Ids.Variant_index.make 1; vd_payload = Type_repr.Tuple [| int_ty |] };
+                       { Seed_mir.vd_id = Ids.Variant_id.make 3; vd_index = Ids.Variant_index.make 2; vd_payload = Type_repr.Tuple [| int_ty; int_ty |] };
+                     ];
+                 };
+             |];
+         }
+       in
+       (match Mir_verify.require_valid_template qc_prog with
+        | Ok () ->
+            Printf.printf "  qualified-ctor MIR verify (template): PASS (%d functions)\n"
+              (Array.length qc_prog.Seed_mir.functions)
+        | Error errs ->
+            Printf.printf "  qualified-ctor MIR verify (template): FAIL\n";
+            List.iter (fun e -> Printf.printf "    %s\n" e) errs;
+            Printf.printf "%s\n" (Seed_mir.print_program qc_prog);
+            exit 1);
+       (match Mir_verify.require_valid_concrete qc_prog with
+        | Ok () ->
+            Printf.printf "  qualified-ctor MIR verify (concrete): PASS (%d functions)\n"
+              (Array.length qc_prog.Seed_mir.functions)
+        | Error errs ->
+            Printf.printf "  qualified-ctor MIR verify (concrete): FAIL\n";
+            List.iter (fun e -> Printf.printf "    %s\n" e) errs;
+            Printf.printf "%s\n" (Seed_mir.print_program qc_prog);
+            exit 1);
+       let qc_entry =
+         match
+           Array.to_list qc_prog.Seed_mir.functions
+           |> List.find_opt (fun f -> f.Seed_mir.name = "main")
+         with
+         | Some f -> f.Seed_mir.instance
+         | None -> failwith "qualified-ctor proof: no main function"
+       in
+       let qc_host = Host.create ~repo_root:"." ~argv:[||] in
+       (match Vm.run ~program:qc_prog ~entry:qc_entry ~argv:[||] ~host:qc_host with
+        | Error e ->
+            Printf.printf "  qualified-ctor VM: FAIL %s\n" e.Vm.message;
+            exit 1
+        | Ok code ->
+            Printf.printf "  qualified-ctor VM: exit %d\n" code;
+            (match Vm.entry_frame_of ~program:qc_prog ~entry:qc_entry ~argv:[||] with
+             | Error m -> Printf.printf "  qualified-ctor main returned: <inspect failed: %s>\n" m
+             | Ok (qcvm, qcentry_frame) -> (
+                 match Vm.run_inspect qcvm qcentry_frame with
+                 | Ok ret_val ->
+                     Printf.printf "  qualified-ctor main returned: %s\n" ret_val;
+                     if ret_val = "63" then
+                       Printf.printf
+                         "  qualified-ctor RESULT: PASS (Option::Some + Result::Ok + Color::Green = 63 through the qualified ctor path)\n"
+                     else begin
+                       Printf.printf "  qualified-ctor RESULT: FAIL (expected 63)\n";
+                       exit 1
+
+                     end
+                 | Error m ->
+                     Printf.printf "  qualified-ctor main returned: <inspect failed: %s>\n" m)));;
+
+       (* ── qualified-call FAIL-CLOSED legs: a self-having method called
+          qualified (`W::touch()` — the checker's synthetic receiver is
+          the TYPE used as a value, a type-level fiction with no runtime
+          content) fails closed at lowering with the precise Seed_bug,
+          and an unresolvable qualified name (`Foo::bar`) fails closed
+          with "unknown callee" — the fail-closed channel that replaced
+          the firewall rejection. *)
+       let w_src = {|
+struct W
+  x: Int
+end
+
+impl W
+  def touch(inout self: Self) -> Unit inout
+    self.x = self.x + 1
+  end
+end
+
+def main() -> Int
+  W::touch()
+  0
+end
+|} in
+       let w_file = Filename.temp_file "tg_lowersurface_qself" ".tg" in
+       (let oc = open_out_bin w_file in
+        output_string oc w_src;
+        close_out oc);
+       let w_manifest =
+         match Bootstrap_manifest.single ~file:w_file ~path:[ "wproof" ] () with
+         | Ok m -> m
+         | Error e -> failwith ("self-having qualified-call proof manifest: " ^ e)
+       in
+       let w_diags = Diagnostic.create_bag () in
+       let w_graph = Module_graph.create_with_sources w_manifest w_diags in
+       let w_resolved = Resolver.resolve w_manifest w_graph w_diags in
+       let w_prog_ast = (List.hd w_graph.Module_graph.nodes).Module_graph.node_program in
+       let rec wfix env n =
+         match Typecheck.check_program env w_prog_ast with
+         | Error m -> failwith ("self-having qualified-call proof typecheck: " ^ m)
+         | Ok (env', errors) ->
+             if errors = [] then env'
+             else if n = 0 then
+               failwith ("self-having qualified-call proof typecheck errors: " ^ String.concat "; " errors)
+             else wfix env' (n - 1)
+       in
+       let w_env = wfix (Typecheck.initial_env ~resolved:(Some w_resolved) ()) 6 in
+       Sys.remove w_file;
+       let w_tid = List.assoc "W" w_env.Typecheck.type_ids in
+       let w_touch_ts =
+         match List.assoc_opt ("W", "touch") w_env.Typecheck.methods with
+         | Some ts -> ts
+         | None -> failwith "self-having qualified-call proof: no W::touch method signature"
+       in
+       if Array.length w_touch_ts.Typecheck.ts_params = 0 then
+         failwith "self-having qualified-call proof: W::touch declares no self";
+       let w_funcs =
+         List.filter_map
+           (fun i -> match i.Ast.kind with Ast.Function d -> Some d | _ -> None)
+           w_prog_ast.Ast.items
+       in
+       let wts_of name =
+         match List.assoc_opt name w_env.Typecheck.functions with
+         | Some ts -> ts
+         | None -> (
+             match List.filter (fun (k, _) -> Util.has_suffix k ("::" ^ name)) w_env.Typecheck.functions with
+             | [ (_, ts) ] -> ts
+             | _ -> failwith ("self-having qualified-call proof: no typed signature for " ^ name))
+       in
+       let w_env2 : Mir_lower.func_env =
+         {
+           Mir_lower.types =
+             [
+               ("W", Type_repr.Named (w_tid, [||]));
+               ("Int", int_ty);
+               ("Unit", Type_repr.Unit);
+               ("Bool", Type_repr.Bool);
+               ("String", string_ty);
+             ];
+           values =
+             List.map
+               (fun d ->
+                 let n = d.Ast.fn_sig.Ast.sig_name in
+                 (n, (wts_of n).Typecheck.ts_return))
+               w_funcs;
+           callables =
+             List.map
+               (fun d ->
+                 let n = d.Ast.fn_sig.Ast.sig_name in
+                 ( n,
+                   {
+                     Mir_lower.ce_callable = Ids.Callable_id.to_int (wts_of n).Typecheck.ts_callable;
+                     ce_template_args = [||];
+                     ce_params = [||];
+                   } ))
+               w_funcs;
+           methods =
+             [
+               ( ("W", "touch"),
+                 {
+                   Mir_lower.me_instance =
+                     Instance_id.make ~callable:w_touch_ts.Typecheck.ts_callable
+                       ~type_args:
+                         (Array.of_list
+                            (List.map
+                               (fun (_, pid) -> Type_repr.Type_param pid)
+                               w_touch_ts.Typecheck.ts_params_decl));
+                   me_params = w_touch_ts.Typecheck.ts_params;
+                   me_ret = w_touch_ts.Typecheck.ts_return;
+                 } );
+             ];
+           fn_ret = int_ty;
+           struct_fields = Driver.struct_fields_of w_env;
+         }
+       in
+       let w_main_decl =
+         List.find
+           (fun (d : Ast.function_decl) -> d.Ast.fn_sig.Ast.sig_name = "main")
+           w_funcs
+       in
+       let w_main_ts = wts_of "main" in
+       (try
+          ignore
+            (Mir_lower.lower_function_with_variants Mir_lower.default_variant_table
+               ~typed_nodes:(Driver.typed_nodes_of w_env)
+               { w_env2 with Mir_lower.fn_ret = w_main_ts.Typecheck.ts_return }
+               "main" (Ids.Callable_id.to_int w_main_ts.Typecheck.ts_callable) [||] [||]
+               w_main_decl);
+          Printf.printf
+            "  self-having qualified call: FAIL (lowering succeeded — the synthetic receiver would have been emitted)\n";
+          exit 1
+        with
+        | Mir_lower.Seed_bug m ->
+            let contains_sub s sub =
+              let ls = String.length s and l = String.length sub in
+              if l = 0 then true
+              else begin
+                let found = ref false in
+                (try
+                   for i = 0 to ls - l do
+                     if not !found && String.sub s i l = sub then found := true
+                   done
+                 with Invalid_argument _ -> ());
+                !found
+              end
+            in
+            if contains_sub m "takes a receiver" then
+              Printf.printf
+                "  self-having qualified call: PASS (lowering fails closed: %s)\n" m
+            else begin
+              Printf.printf "  self-having qualified call: FAIL (wrong Seed_bug: %s)\n" m;
+              exit 1
+            end)
