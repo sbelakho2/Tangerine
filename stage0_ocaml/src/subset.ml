@@ -170,9 +170,18 @@ let rec check_item ctx diags (i : Ast.item) =
       check_expr ctx diags d.Ast.c_value;
       check_type ctx diags false d.Ast.c_type
   | Ast.StaticDecl d ->
-      reject diags "E9034"
-        "static declarations are not available in the bootstrap subset (statics never reach program.statics in the seed lowering)"
-        d.Ast.st_span;
+      (* literal statics are evaluated into program.statics and the
+         lowering env like literal consts (the E9034 literal static form
+         is retired); the non-literal initializer forms stay rejected
+         until the evaluator grows *)
+      (match d.Ast.st_value with
+       | Ast.IntLit _ | Ast.BoolLit _ | Ast.StringLit _ | Ast.CharLit _
+       | Ast.FloatLit _ ->
+           ()
+       | _ ->
+           reject diags "E9034"
+             "non-literal static initializers are not available in the bootstrap subset (the seed evaluates literal static initializers only)"
+             d.Ast.st_span);
       check_expr ctx diags d.Ast.st_value;
       check_type ctx diags false d.Ast.st_type
   | Ast.TypeAlias d -> check_type ctx diags false d.Ast.ta_value
