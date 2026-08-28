@@ -422,6 +422,10 @@ and check_arm_pattern ctx diags (p : Ast.pattern) =
               (* a bool payload `Some(true)`: the payload must hold the
                  literal bool (the E9044 bool-payload form is retired) *)
               ()
+          | Ast.PatLiteral (Ast.IntLit _, _) ->
+              (* an int payload `Some(2)`: the payload must hold the
+                 literal int (the E9044 int-payload form is retired) *)
+              ()
           | Ast.StructPattern (_, sfields, _) ->
               (* a struct-payload `MirRvalue { kind: rvalue_kind }`: the
                  payload position holds the struct — the named fields
