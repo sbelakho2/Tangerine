@@ -1952,7 +1952,7 @@ and lower_match (env : func_env) (st : lower_state) (m : Ast.match_expr) :
       | [] -> None
       | (a : Ast.match_arm) :: rest -> (
           match a.Ast.ma_pattern with
-          | Ast.Wildcard _ | Ast.PatIdent _ | Ast.PatTuple _ -> Some i
+          | Ast.Wildcard _ | Ast.PatIdent _ | Ast.PatTuple _ | Ast.StructPattern _ -> Some i
           | _ -> go (i + 1) rest)
     in
     go 0 m.Ast.m_arms
