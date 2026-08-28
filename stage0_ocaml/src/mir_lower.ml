@@ -2018,17 +2018,32 @@ and lower_match (env : func_env) (st : lower_state) (m : Ast.match_expr) :
           (* bool literal arms: the VM switches a Bool as 1/0 *)
           targets := ((if b then 1L else 0L), arm_blocks.(i)) :: !targets)
       | Ast.StructPattern (vname0, _, _) -> (
-          (* a struct-pattern arm `Variant { f: x, ... }`: the variant's
-             payload is a struct — the switch dispatches on the variant
-             tag exactly like the PatVariant form *)
-          let enum_name = enum_name_of_ty env subj_ty in
-          let vname =
-            match String.rindex_opt vname0 ':' with
-            | Some i -> String.sub vname0 (i + 1) (String.length vname0 - i - 1)
-            | None -> vname0
-          in
-          let spec = variant_spec_of env st.variants ~enum_name ~vname ~repr:subj_ty in
-          targets := (Int64.of_int spec.vs_index, arm_blocks.(i)) :: !targets)
+          (* a struct-pattern arm `Variant { f: x, ... }`: for an ENUM
+             subject the switch dispatches on the variant tag exactly
+             like the PatVariant form; for a STRUCT subject the arm is
+             the catch-all (the field-equality checks route) *)
+          (match subj_ty with
+           | Type_repr.Named (tid, _) -> (
+               match List.assoc_opt tid env.struct_fields with
+               | Some (_ :: _) -> ()
+               | _ -> (
+                   let enum_name = enum_name_of_ty env subj_ty in
+                   let vname =
+                     match String.rindex_opt vname0 ':' with
+                     | Some i -> String.sub vname0 (i + 1) (String.length vname0 - i - 1)
+                     | None -> vname0
+                   in
+                   let spec = variant_spec_of env st.variants ~enum_name ~vname ~repr:subj_ty in
+                   targets := (Int64.of_int spec.vs_index, arm_blocks.(i)) :: !targets))
+           | _ ->
+               let enum_name = enum_name_of_ty env subj_ty in
+               let vname =
+                 match String.rindex_opt vname0 ':' with
+                 | Some i -> String.sub vname0 (i + 1) (String.length vname0 - i - 1)
+                 | None -> vname0
+               in
+               let spec = variant_spec_of env st.variants ~enum_name ~vname ~repr:subj_ty in
+               targets := (Int64.of_int spec.vs_index, arm_blocks.(i)) :: !targets))
       | Ast.OrPattern (p1, p2, _) ->
           (* an or-pattern arm `A | B`: both alternatives dispatch to
              the same arm block (variant tags and int/char literals) *)
@@ -2081,9 +2096,15 @@ and lower_match (env : func_env) (st : lower_state) (m : Ast.match_expr) :
         else dedup ((tag, blk) :: acc) rest
   in
   let targets = dedup [] (List.rev !targets) in
-  set_terminator_to st
-    (Seed_mir.SwitchInt (copy_place st switch_op, targets, otherwise))
-    arm_blocks.(0);
+  if targets = [] then
+    (* every arm is a catch-all (a binding/struct-pattern/tuple/wildcard
+       arm — the field-equality checks route): go directly to the
+       otherwise instead of switching a non-scalar subject *)
+    set_terminator_to st (Seed_mir.Goto otherwise) arm_blocks.(0)
+  else
+    set_terminator_to st
+      (Seed_mir.SwitchInt (copy_place st switch_op, targets, otherwise))
+      arm_blocks.(0);
   (* lower each arm body into its block *)
   List.iteri
     (fun i (a : Ast.match_arm) ->
@@ -2436,17 +2457,51 @@ and lower_match (env : func_env) (st : lower_state) (m : Ast.match_expr) :
                | _ -> seed_bug "unsupported variant payload pattern in lowering")
              pats)
        | Ast.StructPattern (vname0, sfields, _) -> (
-           (* a struct-payload arm `Variant { f: x, ... }`: the payload
-              position j holds the struct; each field binding projects
-              [Downcast; ConstantIndex j; Field fid] (the semantic
-              FieldId through the typed registry) *)
+           (* a struct-pattern arm `Variant { f: x, ... }`: for an ENUM
+              subject the payload position j holds the struct — the
+              fields bind through [Downcast; ConstantIndex j; Field
+              fid]; for a STRUCT subject the fields bind directly
+              through the FieldIds (the field-equality checks route) *)
            let enum_name = enum_name_of_ty env subj_ty in
            let vname =
              match String.rindex_opt vname0 ':' with
              | Some i -> String.sub vname0 (i + 1) (String.length vname0 - i - 1)
              | None -> vname0
            in
-           let spec = variant_spec_of env st.variants ~enum_name ~vname ~repr:subj_ty in
+           (* the enum spec resolves lazily: a STRUCT subject never
+              needs it (the fields bind directly) *)
+           let spec = lazy (variant_spec_of env st.variants ~enum_name ~vname ~repr:subj_ty) in
+           let is_struct_subject ty =
+             match ty with
+             | Type_repr.Named (tid, _) -> (
+                 match List.assoc_opt tid env.struct_fields with
+                 | Some (_ :: _) -> true
+                 | _ -> false)
+             | _ -> false
+           in
+           let field_projs j fname =
+             if is_struct_subject subj_ty then
+               let projs, fty = field_projection_of env subj_ty fname in
+               ([], projs, fty)
+             else
+               let styp =
+                   match List.nth_opt (Lazy.force spec).vs_fields j with
+                   | Some t -> t
+                   | None ->
+                       seed_bug
+                         "struct-payload arm `%s` has more fields than the variant payload"
+                         vname
+                 in
+                 (match styp with
+                  | Type_repr.Named (tid, _) when List.mem_assoc tid env.struct_fields ->
+                      let projs, fty = field_projection_of env styp fname in
+                      ([ Seed_mir.Downcast (semantic_variant_id (Lazy.force spec)); Seed_mir.ConstantIndex j ], projs, fty)
+                  | _ ->
+                      (* the SPLIT field: the payload position j IS the
+                         field (the braced-variant payload is the split
+                         positional list) *)
+                      ([ Seed_mir.Downcast (semantic_variant_id (Lazy.force spec)); Seed_mir.ConstantIndex j ], [], styp))
+           in
            List.iteri
              (fun j (fname, fpat) ->
                match fpat with
@@ -2454,16 +2509,11 @@ and lower_match (env : func_env) (st : lower_state) (m : Ast.match_expr) :
                    (* the braced-variant payload is the SPLIT field list
                       (the checker records the variant fields
                       positionally) — the field binds through
-                      [Downcast; ConstantIndex j], like `Blue(a, b)` *)
+                      [Downcast; ConstantIndex j], like `Blue(a, b)`;
+                      for a STRUCT subject the field binds directly
+                      through the FieldIds *)
                    ignore fname;
-                   let fty =
-                     match List.nth_opt spec.vs_fields j with
-                     | Some t -> t
-                     | None ->
-                         seed_bug
-                           "struct-payload arm `%s` has more fields than the variant payload"
-                           vname
-                   in
+                   let base_projs, projs, fty = field_projs j fname in
                    if not (copyable_ty fty) then
                      seed_bug
                        "non-Copy struct-payload field binding in a variant match arm is not supported by the seed VM (payload field type %s)"
@@ -2475,9 +2525,7 @@ and lower_match (env : func_env) (st : lower_state) (m : Ast.match_expr) :
                           Seed_mir.Use
                             (Seed_mir.Copy
                                { Seed_mir.local = sid;
-                                 projections =
-                                   [ Seed_mir.Downcast (semantic_variant_id spec); Seed_mir.ConstantIndex j ]
-                               }) ));
+                                 projections = base_projs @ projs }) ));
                    st.scope <- (name, id) :: st.scope)
                | _ -> ())
              sfields)

@@ -436,9 +436,13 @@ and check_arm_pattern ctx diags (p : Ast.pattern) =
                 (fun (_, fpat) ->
                   match fpat with
                   | None | Some (Ast.PatIdent _ | Ast.Wildcard _) -> ()
+                  | Some (Ast.PatLiteral (Ast.BoolLit _, _)) ->
+                      (* a bool-literal struct field `{ owns_state:
+                         true, .. }` checks the field equality *)
+                      ()
                   | Some _ ->
                       reject diags "E9044"
-                        "nested struct-payload bindings are not available in the bootstrap subset (seed lowering binds struct payload fields by name or `_` only)"
+                        "nested struct-payload bindings are not available in the bootstrap subset (seed lowering binds struct payload fields by name, `_` or bool literals only)"
                         (match fpat with Some p -> Ast.pattern_span p | None -> Span.synthetic))
                 sfields
           | _ ->
@@ -476,9 +480,13 @@ and check_arm_pattern ctx diags (p : Ast.pattern) =
         (fun (_, fpat) ->
           match fpat with
           | None | Some (Ast.PatIdent _ | Ast.Wildcard _) -> ()
+          | Some (Ast.PatLiteral (Ast.BoolLit _, _)) ->
+              (* a bool-literal struct field `{ owns_state: true, .. }`
+                 checks the field equality *)
+              ()
           | Some _ ->
               reject diags "E9044"
-                "nested struct-pattern payload bindings are not available in the bootstrap subset (seed lowering binds struct payload fields by name or `_` only)"
+                "nested struct-pattern payload bindings are not available in the bootstrap subset (seed lowering binds struct payload fields by name, `_` or bool literals only)"
                 (match fpat with Some p -> Ast.pattern_span p | None -> Span.synthetic))
         sfields
   | Ast.PatIdent _ ->
