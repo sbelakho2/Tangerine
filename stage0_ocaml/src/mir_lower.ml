@@ -1425,6 +1425,35 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
              "struct literal `%s` with a `..` spread is not lowered (the seed StructCtor form has no spread channel)"
              name
        | None -> ());
+      (match ctor_of st.variants name with
+       | Some (enum_name, vname) ->
+           (* the braced-VARIANT constructor `Enum::Variant { f: e, ... }`:
+              the variant's payload fields are the SPLIT positional list —
+              the EnumCtor's operands are the field values in field
+              declaration order *)
+           let vname_m =
+             match String.rindex_opt vname ':' with
+             | Some i -> String.sub vname (i + 1) (String.length vname - i - 1)
+             | None -> vname
+           in
+           let ty =
+             match List.assoc_opt name env.values with
+             | Some t -> t
+             | None -> seed_bug "enum constructor `%s` has no registered result type in the lowering env" name
+           in
+           let spec = variant_spec_of env st.variants ~enum_name ~vname:vname_m ~repr:ty in
+           let ops =
+             List.map (fun (_, fe) -> fst (lower_expr env st fe)) fields
+           in
+           let id = fresh_local st ty in
+           emit st
+             (Seed_mir.Assign
+                ( cur_place st id,
+                  Seed_mir.Aggregate
+                    ( Seed_mir.EnumCtor (enum_tid_of env enum_name, Ids.Variant_index.make spec.vs_index),
+                      ops ) ));
+           (copy_place st (cur_place st id), ty)
+       | None -> (
       let rt =
         match typed_node_of st span with
         | Some node -> node.tn_type
@@ -1505,7 +1534,7 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
                         ( tid,
                           Array.init reg_len (fun i -> Ids.Field_index.make i) ),
                       ops ) ));
-           (copy_place st (cur_place st id), rt)))
+           (copy_place st (cur_place st id), rt)))))
   | Ast.Closure _ ->
       (* Closure disposition (re-audit lowering-surface item): the seed
          VM CONSTRUCTS closure objects (ClosureAgg -> Vm_value.Closure as
@@ -1857,6 +1886,18 @@ and lower_match (env : func_env) (st : lower_state) (m : Ast.match_expr) :
           | Ok (u, _) ->
               targets := (Int64.of_int (Uchar.to_int u), arm_blocks.(i)) :: !targets
           | Error _ -> seed_bug "invalid char literal arm in lowering")
+      | Ast.StructPattern (vname0, _, _) -> (
+          (* a struct-pattern arm `Variant { f: x, ... }`: the variant's
+             payload is a struct — the switch dispatches on the variant
+             tag exactly like the PatVariant form *)
+          let enum_name = enum_name_of_ty env subj_ty in
+          let vname =
+            match String.rindex_opt vname0 ':' with
+            | Some i -> String.sub vname0 (i + 1) (String.length vname0 - i - 1)
+            | None -> vname0
+          in
+          let spec = variant_spec_of env st.variants ~enum_name ~vname ~repr:subj_ty in
+          targets := (Int64.of_int spec.vs_index, arm_blocks.(i)) :: !targets)
       | Ast.Wildcard _ | Ast.PatIdent _ -> ()
       | p ->
       let pname =
@@ -1933,6 +1974,52 @@ and lower_match (env : func_env) (st : lower_state) (m : Ast.match_expr) :
                      "unsupported variant payload pattern in lowering (tuple payloads fail closed — the E9044 tuple form is not yet retired)"
                | _ -> seed_bug "unsupported variant payload pattern in lowering")
              pats)
+       | Ast.StructPattern (vname0, sfields, _) -> (
+           (* a struct-payload arm `Variant { f: x, ... }`: the payload
+              position j holds the struct; each field binding projects
+              [Downcast; ConstantIndex j; Field fid] (the semantic
+              FieldId through the typed registry) *)
+           let enum_name = enum_name_of_ty env subj_ty in
+           let vname =
+             match String.rindex_opt vname0 ':' with
+             | Some i -> String.sub vname0 (i + 1) (String.length vname0 - i - 1)
+             | None -> vname0
+           in
+           let spec = variant_spec_of env st.variants ~enum_name ~vname ~repr:subj_ty in
+           List.iteri
+             (fun j (fname, fpat) ->
+               match fpat with
+               | Some (Ast.PatIdent (name, _, _)) -> (
+                   (* the braced-variant payload is the SPLIT field list
+                      (the checker records the variant fields
+                      positionally) — the field binds through
+                      [Downcast; ConstantIndex j], like `Blue(a, b)` *)
+                   ignore fname;
+                   let fty =
+                     match List.nth_opt spec.vs_fields j with
+                     | Some t -> t
+                     | None ->
+                         seed_bug
+                           "struct-payload arm `%s` has more fields than the variant payload"
+                           vname
+                   in
+                   if not (copyable_ty fty) then
+                     seed_bug
+                       "non-Copy struct-payload field binding in a variant match arm is not supported by the seed VM (payload field type %s)"
+                       (Seed_mir.print_type fty);
+                   let id = fresh_local st fty in
+                   emit st
+                     (Seed_mir.Assign
+                        ( cur_place st id,
+                          Seed_mir.Use
+                            (Seed_mir.Copy
+                               { Seed_mir.local = sid;
+                                 projections =
+                                   [ Seed_mir.Downcast (semantic_variant_id spec); Seed_mir.ConstantIndex j ]
+                               }) ));
+                   st.scope <- (name, id) :: st.scope)
+               | _ -> ())
+             sfields)
        | Ast.Wildcard _ | Ast.PatLiteral _ -> ()
        | _ -> seed_bug "unsupported match arm pattern in lowering");
       let bval, bty = lower_expr env st a.Ast.ma_body in

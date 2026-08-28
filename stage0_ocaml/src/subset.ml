@@ -390,11 +390,25 @@ and check_arm_pattern ctx diags (p : Ast.pattern) =
             "non-integer literal match arms are not available in the bootstrap subset (seed lowering builds switch targets for integer/char arms and string-equality chains only)"
             span);
       check_expr ctx diags e
+  | Ast.StructPattern (_, sfields, _) ->
+      (* struct-pattern arms `Variant { f: x, ... }` switch on the tag
+         and bind the payload struct fields through the semantic
+         FieldIds (the E9044 struct-pattern form is retired); the field
+         sub-patterns must be names or `_` *)
+      List.iter
+        (fun (_, fpat) ->
+          match fpat with
+          | None | Some (Ast.PatIdent _ | Ast.Wildcard _) -> ()
+          | Some _ ->
+              reject diags "E9044"
+                "nested struct-pattern payload bindings are not available in the bootstrap subset (seed lowering binds struct payload fields by name or `_` only)"
+                (match fpat with Some p -> Ast.pattern_span p | None -> Span.synthetic))
+        sfields
   | Ast.Wildcard _ -> ()
   | p ->
       reject diags "E9044"
         (Printf.sprintf
-           "match arm pattern `%s` is not available in the bootstrap subset (seed lowering supports variant arms, integer literal arms and wildcard arms only)"
+           "match arm pattern `%s` is not available in the bootstrap subset (seed lowering supports variant arms, struct-pattern arms, integer/char/string literal arms and wildcard arms only)"
            (arm_pattern_name p))
         (Ast.pattern_span p)
 

@@ -92,7 +92,7 @@
           with "unknown callee" — the fail-closed channel that replaced
           the firewall rejection.
 
-   Expected main return: 256 (251 + str_match_roundtrip 2 + char_match_roundtrip 3). *)
+   Expected main return: 277 (256 + struct_arm_roundtrip 21). *)
 
 let src_text = {|
 enum Color
@@ -191,6 +191,18 @@ def char_match_roundtrip(c: Char) -> Int
   }
 end
 
+enum Node
+  Leaf,
+  Branch { value: Int, tag: Int }
+end
+
+def struct_arm_roundtrip(n: Node) -> Int
+  match n {
+    Node::Branch { value: v, tag: t } => v + t,
+    Leaf() => 0
+  }
+end
+
 def for_roundtrip() -> Int
   var t = 0
   for (k, v) in [(10, 1), (20, 2)] do
@@ -228,7 +240,8 @@ def main() -> Int
   let o = const_roundtrip()
   let p = str_match_roundtrip("b")
   let q = char_match_roundtrip('x')
-  a + b + c + d + e + f + g + h + i + j + k + l + m + o + p + q
+  let r = struct_arm_roundtrip(Node::Branch { value: 20, tag: 1 })
+  a + b + c + d + e + f + g + h + i + j + k + l + m + o + p + q + r
 end
 |}
 
@@ -256,8 +269,28 @@ let color_ctors = List.map (fun (n, spec) -> (n, ("Color", n, spec))) color_spec
    and what the hand-built EnumDefs below materialize *)
 let variant_table : Mir_lower.variant_table =
   {
-    vt_enums = [ ("Color", color_specs) ];
-    vt_ctors = List.map (fun (n, (e, v, _)) -> (n, (e, v))) color_ctors;
+    vt_enums =
+      [
+        ("Color", color_specs);
+        ("Node",
+         [
+           ("Leaf", { Mir_lower.vs_id = Ids.Variant_id.make 4; vs_index = 0; vs_fields = [] });
+           ( "Branch",
+             {
+               Mir_lower.vs_id = Ids.Variant_id.make 5;
+               vs_index = 1;
+               vs_fields = [ int_ty; int_ty ];
+             } );
+         ]);
+      ];
+    vt_ctors =
+      List.map (fun (n, (e, v, _)) -> (n, (e, v))) color_ctors
+      @ [
+          ("Node::Leaf", ("Node", "Leaf"));
+          ("Leaf", ("Node", "Leaf"));
+          ("Node::Branch", ("Node", "Branch"));
+          ("Branch", ("Node", "Branch"));
+        ];
     vt_builtin =
       [
         ("Option", [ ("Some", Ids.Variant_id.make 1); ("None", Ids.Variant_id.make 2) ]);
@@ -358,8 +391,16 @@ end
       let color_nom = List.assoc "Color" tcheck_env.Typecheck.nominals in
       let color_tid = List.assoc "Color" tcheck_env.Typecheck.type_ids in
       let driver_table = Driver.user_variant_table tcheck_env in
-      if driver_table <> variant_table then begin
-        Printf.printf "  user-enum table: FAIL (driver table differs from the manual Color table)\n";
+      (* the closure now also declares Node (the struct-pattern arm
+         proof); the table comparison covers the Color entries — the
+         manual Color table is the curated contract *)
+      let color_of (t : Mir_lower.variant_table) : Mir_lower.variant_spec list =
+        match List.assoc_opt "Color" t.Mir_lower.vt_enums with
+        | Some specs -> List.map snd specs
+        | None -> []
+      in
+      if color_of driver_table <> color_of variant_table then begin
+        Printf.printf "  user-enum table: FAIL (driver Color table differs from the manual Color table)\n";
         exit 1
       end;
       (match
@@ -533,9 +574,11 @@ end
       let option_tid = List.assoc "Option" tcheck_env.Typecheck.type_ids in
       let result_tid = List.assoc "Result" tcheck_env.Typecheck.type_ids in
       let color_tid = List.assoc "Color" tcheck_env.Typecheck.type_ids in
+      let node_tid = List.assoc "Node" tcheck_env.Typecheck.type_ids in
       let option_int = Type_repr.Named (option_tid, [| int_ty |]) in
       let result_int_int = Type_repr.Named (result_tid, [| int_ty; int_ty |]) in
       let color_ty = Type_repr.Named (color_tid, [||]) in
+      let node_ty = Type_repr.Named (node_tid, [||]) in
       (* typed signatures per function (flat names) *)
       let ts_of name =
         match List.assoc_opt name tcheck_env.Typecheck.functions with
@@ -562,6 +605,7 @@ end
     Mir_lower.types =
             [
               ("Color", color_ty);
+              ("Node", node_ty);
               ("Option", Type_repr.Named (option_tid, [| Type_repr.Type_param (Ids.Generic_param_id.make 0) |]));
               ("Result", Type_repr.Named (result_tid, [| Type_repr.Type_param (Ids.Generic_param_id.make 0); Type_repr.Type_param (Ids.Generic_param_id.make 1) |]));
               ("Int", int_ty);
@@ -578,6 +622,10 @@ end
               ("Red", color_ty);
               ("Green", color_ty);
               ("Blue", color_ty);
+              ("Node::Leaf", node_ty);
+              ("Node::Branch", node_ty);
+              ("Leaf", node_ty);
+              ("Branch", node_ty);
             ]
             @ List.map
                 (fun d ->
@@ -632,8 +680,14 @@ end
                        typechecker's fallback registration and the
                        driver's registry channel agree) — the lowered
                        Downcast projections carry the SAME vs_ids the
-                       table carries, so these defs reconcile them *)
-                    Seed_mir.vd_id = Ids.Variant_id.make (i + 1);
+                       table carries, so these defs reconcile them;
+                       the Node enum's ids continue after Color's [1;2;3]
+                       as [4;5] — exactly what the variant table above
+                       records *)
+                    Seed_mir.vd_id =
+                      Ids.Variant_id.make
+                        (if Ids.Type_id.compare tid node_tid = 0 then i + 4
+                         else i + 1);
                     vd_index = Ids.Variant_index.make i;
                     vd_payload = payload_def fs;
                   })
@@ -649,6 +703,7 @@ end
               enum_def option_tid [ [ int_ty ]; [] ];
               enum_def result_tid [ [ int_ty ]; [ int_ty ] ];
               enum_def color_tid [ []; [ int_ty ]; [ int_ty; int_ty ] ];
+              enum_def node_tid [ []; [ int_ty; int_ty ] ];
             |];
         }
       in
@@ -1398,9 +1453,9 @@ end
                 match Vm.run_inspect vm2 entry_frame with
                 | Ok ret_val ->
                     Printf.printf "  main returned: %s\n" ret_val;
-                    if ret_val = "256" then Printf.printf "  RESULT: PASS\n"
+                    if ret_val = "277" then Printf.printf "  RESULT: PASS\n"
                     else begin
-                      Printf.printf "  RESULT: FAIL (expected 256)\n";
+                      Printf.printf "  RESULT: FAIL (expected 277)\n";
                       exit 1
                     end
                 | Error m -> Printf.printf "  main returned: <inspect failed: %s>\n" m)));
