@@ -212,6 +212,13 @@ def unsafe_roundtrip() -> Int
   x
 end
 
+def binding_arm_roundtrip(o: Option[Int]) -> Int
+  match o {
+    Some(v) => v,
+    other => 0
+  }
+end
+
 enum Node
   Leaf,
   Branch { value: Int, tag: Int }
@@ -265,7 +272,8 @@ def main() -> Int
   let t2 = vec_macro_roundtrip()
   let u = range_roundtrip()
   let v = unsafe_roundtrip()
-  a + b + c + d + e + f + g + h + i + j + k + l + m + o + p + q + r + t2 + u + v
+  let w = binding_arm_roundtrip(Some(5))
+  a + b + c + d + e + f + g + h + i + j + k + l + m + o + p + q + r + t2 + u + v + w
 end
 |}
 
@@ -1477,9 +1485,9 @@ end
                 match Vm.run_inspect vm2 entry_frame with
                 | Ok ret_val ->
                     Printf.printf "  main returned: %s\n" ret_val;
-                    if ret_val = "354" then Printf.printf "  RESULT: PASS\n"
+                    if ret_val = "359" then Printf.printf "  RESULT: PASS\n"
                     else begin
-                      Printf.printf "  RESULT: FAIL (expected 354)\n";
+                      Printf.printf "  RESULT: FAIL (expected 359)\n";
                       exit 1
                     end
                 | Error m -> Printf.printf "  main returned: <inspect failed: %s>\n" m)));

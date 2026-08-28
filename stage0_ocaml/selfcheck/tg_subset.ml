@@ -392,10 +392,10 @@ let conditional_reject_specimens : (string * string * string) list =
 end
 |});
     ("Match", "E9044",
-     {|def f(x: Int) -> Int
+     {|def f(x: (Int, Int)) -> Int
   match x {
-    y => 1,
-    _ => 2
+    (a, b) => a + b,
+    _ => 0
   }
 end
 |});
@@ -430,7 +430,7 @@ let arm_specimens : (string * string list * string) list =
   }
 end
 |});
-    ("arm binding pattern (E9044)", [ "E9044" ],
+    ("arm binding pattern (accepted — the E9044 binding form retired)", [],
      {|def f(x: Int) -> Int
   match x {
     y => 1,
@@ -485,7 +485,7 @@ end
   }
 end
 |});
-    ("bare nullary-variant arm parses as a binding (E9044)", [ "E9044" ],
+    ("bare nullary-variant arm parses as a binding (accepted — the E9044 binding form retired)", [],
      {|def f(o: Option[Int]) -> Int
   match o {
     Some(v) => v,

@@ -438,11 +438,15 @@ and check_arm_pattern ctx diags (p : Ast.pattern) =
                 "nested struct-pattern payload bindings are not available in the bootstrap subset (seed lowering binds struct payload fields by name or `_` only)"
                 (match fpat with Some p -> Ast.pattern_span p | None -> Span.synthetic))
         sfields
+  | Ast.PatIdent _ ->
+      (* a binding arm `when x then` binds the whole subject (the E9044
+         binding-arm form is retired) *)
+      ()
   | Ast.Wildcard _ -> ()
   | p ->
       reject diags "E9044"
         (Printf.sprintf
-           "match arm pattern `%s` is not available in the bootstrap subset (seed lowering supports variant arms, struct-pattern arms, integer/char/string literal arms and wildcard arms only)"
+           "match arm pattern `%s` is not available in the bootstrap subset (seed lowering supports variant arms, struct-pattern arms, integer/char/string literal arms, binding arms and wildcard arms only)"
            (arm_pattern_name p))
         (Ast.pattern_span p)
 

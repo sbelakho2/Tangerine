@@ -1952,7 +1952,7 @@ and lower_match (env : func_env) (st : lower_state) (m : Ast.match_expr) :
       | [] -> None
       | (a : Ast.match_arm) :: rest -> (
           match a.Ast.ma_pattern with
-          | Ast.Wildcard _ -> Some i
+          | Ast.Wildcard _ | Ast.PatIdent _ -> Some i
           | _ -> go (i + 1) rest)
     in
     go 0 m.Ast.m_arms
@@ -2216,6 +2216,9 @@ and lower_match (env : func_env) (st : lower_state) (m : Ast.match_expr) :
                    st.scope <- (name, id) :: st.scope)
                | _ -> ())
              sfields)
+       | Ast.PatIdent (name, _, _) ->
+           (* a binding arm `when x then`: the whole subject binds *)
+           st.scope <- (name, sid) :: st.scope
        | Ast.Wildcard _ | Ast.PatLiteral _ | Ast.OrPattern _ -> ()
        | _ -> seed_bug "unsupported match arm pattern in lowering");
       let bval, bty = lower_expr env st a.Ast.ma_body in
