@@ -623,14 +623,27 @@ and check_expr ctx diags (e : Ast.expr) =
          keeps `debug_assert!` out of the typecheck debt, so without
          this rejection it would sail through to the fail-closed
          lowering branch). *)
-      reject diags "E9049"
-        (Printf.sprintf
-           "macro invocations (`%s!`) are not available in the bootstrap subset (seed lowering has no MacroCall branch)"
-           n)
-        span;
-      List.iter
-        (function Ast.MacroExpr e -> check_expr ctx diags e | Ast.MacroTokens _ -> ())
-        args
+      (match n with
+       | "vec" ->
+           (* `vec![...]` lowers to the array aggregate (the E9049 vec!
+              form is retired); the arguments must be expressions *)
+           List.iter
+             (function
+               | Ast.MacroExpr e -> check_expr ctx diags e
+               | Ast.MacroTokens _ ->
+                   reject diags "E9049"
+                     "vec! with raw token arguments is not available in the bootstrap subset (the seed lowers expression arguments only)"
+                     span)
+             args
+       | _ ->
+           reject diags "E9049"
+             (Printf.sprintf
+                "macro invocations (`%s!`) are not available in the bootstrap subset (seed lowering lowers vec! only)"
+                n)
+             span;
+           List.iter
+             (function Ast.MacroExpr e -> check_expr ctx diags e | Ast.MacroTokens _ -> ())
+           args)
   | Ast.Assign (target, v, span) ->
       (* AST form: Ast.Assign (target, value, span).  The typed-place
          writeback rule landed (2026-08-28): a Name, Field or Index

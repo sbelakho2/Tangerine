@@ -191,6 +191,11 @@ def char_match_roundtrip(c: Char) -> Int
   }
 end
 
+def vec_macro_roundtrip() -> Int
+  let v = vec![10, 20, 30]
+  v[0] + v[1] + v[2]
+end
+
 enum Node
   Leaf,
   Branch { value: Int, tag: Int }
@@ -241,7 +246,8 @@ def main() -> Int
   let p = str_match_roundtrip("b")
   let q = char_match_roundtrip('x')
   let r = struct_arm_roundtrip(Node::Branch { value: 20, tag: 1 })
-  a + b + c + d + e + f + g + h + i + j + k + l + m + o + p + q + r
+  let t2 = vec_macro_roundtrip()
+  a + b + c + d + e + f + g + h + i + j + k + l + m + o + p + q + r + t2
 end
 |}
 
@@ -1453,9 +1459,9 @@ end
                 match Vm.run_inspect vm2 entry_frame with
                 | Ok ret_val ->
                     Printf.printf "  main returned: %s\n" ret_val;
-                    if ret_val = "277" then Printf.printf "  RESULT: PASS\n"
+                    if ret_val = "337" then Printf.printf "  RESULT: PASS\n"
                     else begin
-                      Printf.printf "  RESULT: FAIL (expected 277)\n";
+                      Printf.printf "  RESULT: FAIL (expected 337)\n";
                       exit 1
                     end
                 | Error m -> Printf.printf "  main returned: <inspect failed: %s>\n" m)));

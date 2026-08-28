@@ -981,6 +981,32 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
       let id = fresh_local st rt in
       emit st (Seed_mir.Assign (cur_place st id, Seed_mir.Aggregate (Seed_mir.ArrayAgg, ops)));
       (copy_place st (cur_place st id), rt)
+  | Ast.MacroCall (n, args, _) -> (
+      (* the `vec![...]` macro lowers to the array aggregate (the E9049
+         vec! form is retired); every other macro fails closed *)
+      match n with
+      | "vec" ->
+          let lowered =
+            List.map
+              (fun a ->
+                match a with
+                | Ast.MacroExpr e -> lower_expr env st e
+                | Ast.MacroTokens _ ->
+                    seed_bug "vec! with raw tokens is not lowered (macro argument is not an expression)")
+              args
+          in
+          let ops = List.map fst lowered in
+          let tys = List.map snd lowered in
+          let elem_ty =
+            match tys with
+            | t :: _ -> t
+            | [] -> Type_repr.Unit
+          in
+          let rt = Type_repr.Fixed_array (elem_ty, List.length args) in
+          let id = fresh_local st rt in
+          emit st (Seed_mir.Assign (cur_place st id, Seed_mir.Aggregate (Seed_mir.ArrayAgg, ops)));
+          (copy_place st (cur_place st id), rt)
+      | other -> seed_bug "macro invocation `%s!` is not lowered (only vec! is available)" other)
   | Ast.Index (base, idx, _) -> (
       let base_op, base_ty = lower_expr env st base in
       let bp = materialize_place st base_op in
