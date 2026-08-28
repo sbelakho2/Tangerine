@@ -446,7 +446,7 @@ end
   }
 end
 |});
-    ("variant payload tuple pattern (E9044)", [ "E9044" ],
+    ("variant payload tuple pattern (accepted — the E9044 tuple form retired)", [],
      {|def f(o: Option[(Int, Int)]) -> Int
   match o {
     Some((a, b)) => a + b,

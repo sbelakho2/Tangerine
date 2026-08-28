@@ -233,6 +233,64 @@ let closure_statics (env : Typecheck.env) : (string * Type_repr.t * Seed_mir.con
          if Type_repr.has_type_param ty then None else Some (n, ty, init_of n))
        env.Typecheck.consts)
 
+let closure_types (env : Typecheck.env) : Seed_mir.type_def array =
+  Array.of_list
+    (List.filter_map
+       (fun (name, nom : string * Typecheck.nominal) ->
+         match List.assoc_opt name env.Typecheck.type_ids with
+         | None -> None
+         | Some tid ->
+             if nom.Typecheck.nom_params <> [] then None
+             else
+               (match nom.Typecheck.nom_kind with
+                | `Struct ->
+                    let fids =
+                      if List.length nom.Typecheck.nom_field_ids
+                         = List.length nom.Typecheck.nom_fields
+                      then nom.Typecheck.nom_field_ids
+                      else
+                        List.mapi (fun i _ -> Ids.Field_id.make (i + 1)) nom.Typecheck.nom_fields
+                    in
+                    Some
+                      (Seed_mir.StructDef
+                         {
+                           sd_id = tid;
+                           sd_fields =
+                             List.mapi
+                               (fun i (_, fty) ->
+                                 {
+                                   Seed_mir.fd_id = List.nth fids i;
+                                   fd_index = Ids.Field_index.make i;
+                                   fd_ty = fty;
+                                 })
+                               nom.Typecheck.nom_fields;
+                         })
+                | `Enum ->
+                    let vids =
+                      if List.length nom.Typecheck.nom_variant_ids
+                         = List.length nom.Typecheck.nom_variants
+                      then nom.Typecheck.nom_variant_ids
+                      else
+                        List.mapi (fun i _ -> Ids.Variant_id.make (i + 1)) nom.Typecheck.nom_variants
+                    in
+                    Some
+                      (Seed_mir.EnumDef
+                         {
+                           ed_id = tid;
+                           ed_variants =
+                             List.mapi
+                               (fun i (_, pty) ->
+                                 {
+                                   Seed_mir.vd_id = List.nth vids i;
+                                   vd_index = Ids.Variant_index.make i;
+                                   vd_payload =
+                                     (if Array.length pty = 0 then Type_repr.Unit
+                                      else Type_repr.Tuple pty);
+                                 })
+                               nom.Typecheck.nom_variants;
+                         })))
+       env.Typecheck.nominals)
+
 let struct_fields_of (env : Typecheck.env) :
     (Ids.Type_id.t * (string * Ids.Field_id.t * Type_repr.t) list) list =
   List.filter_map
@@ -588,7 +646,7 @@ let lower_and_report (path : string) (env : Typecheck.env) (program : Ast.progra
       funcs
   in
   let prog =
-    { Seed_mir.functions = Array.of_list mir_funcs; statics = closure_statics env; types = [||] }
+    { Seed_mir.functions = Array.of_list mir_funcs; statics = closure_statics env; types = closure_types env }
   in
   match Mir_verify.require_valid_template ~generic_types:(closure_generic_types env) prog with
   | Error errs ->
@@ -711,7 +769,7 @@ let cmd_interpret (args : string list) : int =
                   funcs
               in
               let prog =
-                { Seed_mir.functions = Array.of_list mir_funcs; statics = closure_statics env; types = [||] }
+                { Seed_mir.functions = Array.of_list mir_funcs; statics = closure_statics env; types = closure_types env }
               in
               (match
                  Mir_verify.require_valid_template
@@ -1372,64 +1430,6 @@ let run_closure_pipeline ~(repo_root : string) ~(manifest_path : string)
    with deterministic field/variant identities; generic nominals are
    deferred to post-mono (the seed types table is concrete-only by
    contract). *)
-let closure_types (env : Typecheck.env) : Seed_mir.type_def array =
-  Array.of_list
-    (List.filter_map
-       (fun (name, nom : string * Typecheck.nominal) ->
-         match List.assoc_opt name env.Typecheck.type_ids with
-         | None -> None
-         | Some tid ->
-             if nom.Typecheck.nom_params <> [] then None
-             else
-               (match nom.Typecheck.nom_kind with
-                | `Struct ->
-                    let fids =
-                      if List.length nom.Typecheck.nom_field_ids
-                         = List.length nom.Typecheck.nom_fields
-                      then nom.Typecheck.nom_field_ids
-                      else
-                        List.mapi (fun i _ -> Ids.Field_id.make (i + 1)) nom.Typecheck.nom_fields
-                    in
-                    Some
-                      (Seed_mir.StructDef
-                         {
-                           sd_id = tid;
-                           sd_fields =
-                             List.mapi
-                               (fun i (_, fty) ->
-                                 {
-                                   Seed_mir.fd_id = List.nth fids i;
-                                   fd_index = Ids.Field_index.make i;
-                                   fd_ty = fty;
-                                 })
-                               nom.Typecheck.nom_fields;
-                         })
-                | `Enum ->
-                    let vids =
-                      if List.length nom.Typecheck.nom_variant_ids
-                         = List.length nom.Typecheck.nom_variants
-                      then nom.Typecheck.nom_variant_ids
-                      else
-                        List.mapi (fun i _ -> Ids.Variant_id.make (i + 1)) nom.Typecheck.nom_variants
-                    in
-                    Some
-                      (Seed_mir.EnumDef
-                         {
-                           ed_id = tid;
-                           ed_variants =
-                             List.mapi
-                               (fun i (_, pty) ->
-                                 {
-                                   Seed_mir.vd_id = List.nth vids i;
-                                   vd_index = Ids.Variant_index.make i;
-                                   vd_payload =
-                                     (if Array.length pty = 0 then Type_repr.Unit
-                                      else Type_repr.Tuple pty);
-                                 })
-                               nom.Typecheck.nom_variants;
-                         })))
-       env.Typecheck.nominals)
-
 (* Materialize program.statics from the typed const registry: declared
    with their types; initializers arrive with the typed-expression
    channel (the subset firewall rejects const uses until then). *)

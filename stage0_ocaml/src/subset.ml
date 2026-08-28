@@ -370,9 +370,22 @@ and check_arm_pattern ctx diags (p : Ast.pattern) =
         (fun f ->
           match f with
           | Ast.PatIdent _ | Ast.Wildcard _ -> ()
+          | Ast.PatTuple (subs, _) ->
+              (* tuple payloads `Some((a, b))` are bound through the
+                 nested ConstantIndex projections (the E9044 tuple form
+                 is retired); the components must be names or `_` *)
+              List.iter
+                (fun sub ->
+                  match sub with
+                  | Ast.PatIdent _ | Ast.Wildcard _ -> ()
+                  | _ ->
+                      reject diags "E9044"
+                        "nested variant payload patterns are not available in the bootstrap subset (seed lowering binds payload components by name or `_` only)"
+                        (Ast.pattern_span sub))
+                subs
           | _ ->
               reject diags "E9044"
-                "variant payload patterns are not available in the bootstrap subset (seed lowering binds payload fields by name or `_` only)"
+                "variant payload patterns are not available in the bootstrap subset (seed lowering binds payload fields by name, `_` or tuple components only)"
                 (Ast.pattern_span f))
         fields
   | Ast.PatLiteral (e, span) -> (

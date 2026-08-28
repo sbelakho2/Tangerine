@@ -1965,13 +1965,55 @@ and lower_match (env : func_env) (st : lower_state) (m : Ast.match_expr) :
                                     ] }) ));
                     st.scope <- (name, id) :: st.scope)
                | Ast.Wildcard _ -> ()
-               | Ast.PatTuple _ ->
-                   (* a tuple payload `Some((a, b))` fails closed until
-                      the registry-substitution plumbing resolves the
-                      instantiated payload through the def table (the
-                      tuple-payload E9044 stays) *)
-                   seed_bug
-                     "unsupported variant payload pattern in lowering (tuple payloads fail closed — the E9044 tuple form is not yet retired)"
+               | Ast.PatTuple (subs, _) ->
+                   (* a tuple payload `Some((a, b))`: the j-th payload
+                      FIELD is the tuple — each component binds through
+                      the nested [Downcast; ConstantIndex j;
+                      ConstantIndex k] projection (the registry's
+                      substituted payload def resolves the tuple) *)
+                   List.iteri
+                     (fun k sub ->
+                       match sub with
+                       | Ast.PatIdent (name, _, _) -> (
+                           let fty =
+                             match List.nth_opt spec.vs_fields j with
+                             | Some t -> (
+                                 match t with
+                                 | Type_repr.Tuple elems when k < Array.length elems ->
+                                     elems.(k)
+                                 | Type_repr.Tuple _ ->
+                                     seed_bug
+                                       "variant tuple payload pattern has more components than the payload tuple"
+                                 | _ ->
+                                     seed_bug
+                                       "variant tuple payload pattern against a non-tuple payload")
+                             | None ->
+                                 seed_bug
+                                   "variant `%s` payload pattern has more fields than the variant"
+                                   seg2
+                           in
+                           if not (copyable_ty fty) then
+                             seed_bug
+                               "non-Copy payload binding in a variant match arm is not supported by the seed VM (payload type %s)"
+                               (Seed_mir.print_type fty);
+                           let id = fresh_local st fty in
+                           emit st
+                             (Seed_mir.Assign
+                                ( cur_place st id,
+                                  Seed_mir.Use
+                                    (Seed_mir.Copy
+                                       { Seed_mir.local = sid;
+                                         projections =
+                                           [
+                                             Seed_mir.Downcast (semantic_variant_id spec);
+                                             Seed_mir.ConstantIndex j;
+                                             Seed_mir.ConstantIndex k;
+                                           ] }) ));
+                           st.scope <- (name, id) :: st.scope)
+                       | Ast.Wildcard _ -> ()
+                       | _ ->
+                           seed_bug "unsupported nested variant payload pattern in lowering")
+                     subs
                | _ -> seed_bug "unsupported variant payload pattern in lowering")
              pats)
        | Ast.StructPattern (vname0, sfields, _) -> (
@@ -2092,15 +2134,38 @@ and lower_call (env : func_env) (st : lower_state) (span : Span.span)
       | Some (enum_name, vname) ->
           (* an enum variant constructor call: `Some(x)`, `Green(7)`,
              `Err("...")` — built as an EnumCtor aggregate with the
-             declaration-order variant index as the tag *)
-          let ty =
+             declaration-order variant index as the tag.  The result
+             type is the constructor's registered type with its OWN free
+             parameters substituted by the argument types (the registry
+             entries carry the declaration-owned GenericParamIds — a
+             positional reconstruction would miss Option's T) *)
+          let ty0 =
             match List.assoc_opt n env.values with
             | Some t -> t
             | None ->
                 seed_bug "enum constructor `%s` has no registered result type in the lowering env" n
           in
+          let arg_ops_ty = List.map (fun a -> lower_expr env st a.Ast.ca_value) args in
+          let arg_ops = List.map fst arg_ops_ty in
+          let arg_tys = List.map snd arg_ops_ty in
+          (* the EnumCtor's operand positions hold the payload fields;
+             a non-Copy payload VALUE (the tuple) passes by Read — the
+             fresh aggregate local is never bitwise-copied *)
+          let arg_ops, arg_tys =
+            match arg_ops, arg_tys with
+            | [ Seed_mir.Copy p ], [ t ] when not (copyable_ty t) ->
+                ([ Seed_mir.Read p ], [ t ])
+            | _ -> (arg_ops, arg_tys)
+          in
+          let params0 = free_params ty0 in
+          let ty =
+            if List.length params0 = List.length arg_tys then
+              Type_repr.substitute
+                (List.map2 (fun p a -> (Type_repr.KParam p, a)) params0 arg_tys)
+                ty0
+            else ty0
+          in
           let spec = variant_spec_of env st.variants ~enum_name ~vname ~repr:ty in
-          let arg_ops = List.map (fun a -> fst (lower_expr env st a.Ast.ca_value)) args in
           let id = fresh_local st ty in
           emit st
             (Seed_mir.Assign
@@ -2116,7 +2181,15 @@ and lower_call (env : func_env) (st : lower_state) (span : Span.span)
               let ty =
                 match List.assoc_opt n env.values with Some t -> t | None -> Type_repr.Unit
               in
-              let arg_ops = List.map (fun a -> fst (lower_expr env st a.Ast.ca_value)) args in
+              let arg_ops_ty = List.map (fun a -> lower_expr env st a.Ast.ca_value) args in
+              let arg_ops =
+                List.map2
+                  (fun op ty ->
+                    match op with
+                    | Seed_mir.Copy p when not (copyable_ty ty) -> Seed_mir.Read p
+                    | op -> op)
+                  (List.map fst arg_ops_ty) (List.map snd arg_ops_ty)
+              in
               let id = fresh_local st ty in
               let rp = cur_place st id in
               (* the typed parameter contracts are authoritative for the
