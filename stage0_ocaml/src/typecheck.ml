@@ -2159,6 +2159,7 @@ let rec check_pattern (env : env) (scope : scope) (ty : Type_repr.t) (p : Ast.pa
 
 and resolve_variant (env : env) (_scope : scope) (span : Span.span) (seg1 : string)
     (seg2 : string) (subject : Type_repr.t) : (Type_repr.t array * string, string) result =
+
   if seg1 = "" then begin
     match subject with
     | Type_repr.Named (tid, args) -> (
