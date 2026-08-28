@@ -553,15 +553,19 @@ and check_expr ctx diags (e : Ast.expr) =
          verifies. *)
       check_expr ctx diags b;
       check_expr ctx diags i
-  | Ast.Range (_, _, _, span) ->
+  | Ast.Range (start, end_, _, span) ->
       (* AST form: Ast.Range (start, end, inclusive, span) (parser
-         `a..b` / `a..=b`).  The lowerer has no Range branch — it falls
-         to "unhandled supported expression form: Range" (a `for x in
-         0..n` iterable reaches the same fail-closed path); reject until
-         range lowering lands. *)
-      reject diags "E9039"
-        "range expressions are not available in the bootstrap subset (seed lowering has no Range branch — iterate an Array literal instead)"
-        span
+         `a..b` / `a..=b`).  Integer ranges `a..b` lower to the counter
+         loop (the E9039 integer-range form is retired); the exclusive
+         `..=` form and non-integer bounds stay rejected. *)
+      (match start with
+       | Ast.IntLit _ -> ()
+       | _ ->
+           reject diags "E9039"
+             "non-integer range bounds are not available in the bootstrap subset (seed lowering counts integer ranges only)"
+             span);
+      check_expr ctx diags start;
+      check_expr ctx diags end_
   | Ast.MatchExpr m ->
       check_expr ctx diags m.Ast.m_subject;
       List.iter

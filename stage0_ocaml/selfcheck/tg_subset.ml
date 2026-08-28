@@ -205,7 +205,7 @@ end
 |});
     ("Range", "E9039",
      {|def f() -> Int
-  0..5
+  x..5
 end
 |});
     ("Closure", "E9040",
@@ -585,7 +585,7 @@ let expr_lower_status : (string * lower_status) list =
     ("Call", Partial);
     ("Index", Lowerable);
     (* no Range branch — the expression-name diagnostic table *)
-    ("Range", Unlowerable);
+    ("Range", Lowerable);
     (* variant arms (builtin table only), integer-literal arms and
        wildcard arms lower; guards, bindings, tuple/struct/or/range and
        non-integer literal arms fail closed *)
