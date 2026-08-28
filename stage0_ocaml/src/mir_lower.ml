@@ -1142,6 +1142,26 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
                in
                emit st (Seed_mir.Assign (dst, Seed_mir.Use vo));
                (copy_place st dst, elem_ty))
+       | Ast.Unary (Ast.Deref, base, _) -> (
+           (* `*p = v`: the base lowers to a place and the write emits
+              through the Deref projection (the E9036 deref-target form
+              is retired) *)
+           let bop, bty = lower_expr env st base in
+           let bp = materialize_place st bop in
+           let pointee_ty =
+             match bty with
+             | Type_repr.Raw_ptr (_, t) | Type_repr.Ref_internal (_, t) -> t
+             | Type_repr.Named (tid, args) -> (
+                 match List.assoc_opt tid env.struct_fields with
+                 | Some _ -> Type_repr.Named (tid, args)
+                 | None -> bty)
+             | _ -> bty
+           in
+           let dst =
+             { bp with Seed_mir.projections = bp.Seed_mir.projections @ [ Seed_mir.Deref ] }
+           in
+           emit st (Seed_mir.Assign (dst, Seed_mir.Use vo));
+           (copy_place st dst, pointee_ty))
        | _ ->
            ignore (vo, vt);
            seed_bug "projected assignment reached MIR lowering without a typed-place writeback rule")

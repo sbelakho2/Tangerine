@@ -401,7 +401,7 @@ end
 |});
     ("Assign", "E9036",
      {|def f(p: Ptr[Int]) -> Int
-  *p = 1
+  *p + 1 = 2
   0
 end
 |});
@@ -615,7 +615,7 @@ let expr_lower_status : (string * lower_status) list =
        rule (2026-08-28: the Assign branch resolves the field through
        the typed nominal registry and emits the constant/dynamic index
        projections); other target forms fail closed *)
-    ("Assign", Partial);
+    ("Assign", Lowerable);
     (* dedicated always-failing branch ("CompoundAssign reached MIR
        lowering without a typed-place writeback rule") *)
     ("CompoundAssign", Unlowerable);

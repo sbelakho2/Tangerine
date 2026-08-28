@@ -666,6 +666,10 @@ and check_expr ctx diags (e : Ast.expr) =
          typed-place writeback rule). *)
       (match target with
        | Ast.Name _ | Ast.Field _ | Ast.Index _ -> ()
+       | Ast.Unary (Ast.Deref, _, _) ->
+           (* `*p = v` writes through the Deref projection (the E9036
+              deref-target form is retired) *)
+           ()
        | _ ->
            reject diags "E9036"
              "projected assignment is not available in the bootstrap subset (writeback through a projection is resource-sensitive and has no typed-place rule in seed lowering)"
