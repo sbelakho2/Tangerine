@@ -268,9 +268,13 @@ and check_stmt ctx diags (s : Ast.stmt) =
                      "nested destructuring let patterns are not available in the bootstrap subset (seed lowering binds tuple components by name or `_` only)"
                      (Ast.pattern_span sub))
              subs
+       | Ast.Wildcard _ ->
+           (* `let _ = e` discards the value (the lowerer's LetBinding
+              handles the wildcard — the E9045 discard form is retired) *)
+           ()
        | _ ->
            reject diags "E9045"
-             "destructuring let-binding patterns are not available in the bootstrap subset (seed lowering binds let patterns by name or tuple components only)"
+             "destructuring let-binding patterns are not available in the bootstrap subset (seed lowering binds let patterns by name, `_` or tuple components only)"
              (Ast.pattern_span p));
       check_pattern ctx diags p;
       Option.iter (check_type ctx diags false) ty;
