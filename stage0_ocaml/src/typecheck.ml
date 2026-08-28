@@ -4801,6 +4801,11 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
                 record_call_accesses env scope
                   ((base, recv_effect, Ast.expr_span base, receiver.te_type)
                   :: zip args arg_effects tes);
+                if Sys.getenv_opt "TANGERINE_DEBUG_MCALL" <> None then
+                  Printf.eprintf "DEBUG-MCALL %s.%s owner=%s sigret=%s ret=%s span=%d-%d\n"
+                    oname mname (type_to_string owner_ty)
+                    (type_to_string sig_.ts_return) (type_to_string ret)
+                    span.Span.start span.Span.end_;
                 Ok { te_type = ret; te_effects = all_effects; te_span = span }
               end
             end

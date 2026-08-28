@@ -18,9 +18,12 @@
    traverse).  The E9037 (StructLit) and Field-side E9036 rejections were
    DELETED 2026-08-27 when the StructCtor aggregate rule and the
    typed-place (FieldId) projection rule landed in mir_lower — their
-   positive parse → typecheck → lower → verify → execute proofs live in
-   selfcheck/tg_lowersurface.ml (E9036 remains for projected
-   ASSIGNMENT writebacks, which still have no typed-place rule). *)
+    positive parse → typecheck → lower → verify → execute proofs live in
+    selfcheck/tg_lowersurface.ml.  E9036 was likewise retired for the
+    projected ASSIGNMENT writebacks 2026-08-28 when the typed-place
+    writeback rule landed in mir_lower's Assign branch (Name/Field/Index
+    targets lower; E9036 remains only for the target forms the lowerer
+    still fails closed on). *)
 
 let rejected_attributes =
   [
@@ -543,9 +546,10 @@ and check_expr ctx diags (e : Ast.expr) =
          passed as the SELF argument).  Positive end-to-end proofs
          (lower + verify + VM round-trip): selfcheck/tg_lowersurface.ml
          (struct-field, struct-lit, method-call and nested-function
-         proofs).  NOTE: a projected WRITE (`p.x = v`) still has no
-         typed-place writeback rule — Assign rejects non-Name targets
-         with E9036 below. *)
+         proofs).  A projected WRITE (`p.x = v`) lowers through the
+         typed-place writeback rule (2026-08-28 — the Assign branch
+         resolves the field through the same registry channel; E9036
+         remains only for target forms without a typed-place rule). *)
       ignore span;
       check_expr ctx diags b
   | Ast.Binary (l, _, r, _) ->
@@ -568,11 +572,19 @@ and check_expr ctx diags (e : Ast.expr) =
         (function Ast.MacroExpr e -> check_expr ctx diags e | Ast.MacroTokens _ -> ())
         args
   | Ast.Assign (target, v, span) ->
-      (* AST form: Ast.Assign (target, value, span) — a projected
-         writeback (`a[i] = v`, `p.x = v`) fails closed at lowering (no
-         typed-place writeback rule).  A plain Name target is fine. *)
+      (* AST form: Ast.Assign (target, value, span).  The typed-place
+         writeback rule landed (2026-08-28): a Name, Field or Index
+         target lowers — the field resolves through the typed nominal
+         registry (the same channel as the read path) and the index is
+         constant or dynamic — so the firewall no longer rejects them;
+         their positive parse -> typecheck -> lower -> verify -> execute
+         proofs live in selfcheck/tg_lowersurface.ml (struct-field and
+         array-index writebacks).  E9036 remains for the target forms
+         the lowerer STILL fails closed on (any target that is not a
+         Name/Field/Index — e.g. a Deref/other-operator target — has no
+         typed-place writeback rule). *)
       (match target with
-       | Ast.Name _ -> ()
+       | Ast.Name _ | Ast.Field _ | Ast.Index _ -> ()
        | _ ->
            reject diags "E9036"
              "projected assignment is not available in the bootstrap subset (writeback through a projection is resource-sensitive and has no typed-place rule in seed lowering)"
@@ -672,7 +684,9 @@ let expr_form_status : (string * form_status) list =
     ("Await", Rejected "E9015");
     ("MacroCall", Rejected "E9049");
     (* plain Name targets accept; projected writebacks (a[i] = v,
-       p.x = v) still have no typed-place rule in seed lowering *)
+       p.x = v) lower through the typed-place writeback rule
+       (2026-08-28); other target forms still have no typed-place rule
+       in seed lowering *)
     ("Assign", Conditional [ "E9036" ]);
     ("CompoundAssign", Rejected "E9042");
     ("Return", Accepted);

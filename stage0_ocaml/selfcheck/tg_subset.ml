@@ -307,6 +307,25 @@ end
   x
 end
 |});
+    (* E9036 retired for the Name/Field/Index writeback targets
+       (2026-08-28 — the typed-place writeback rule landed in
+       mir_lower's Assign branch); the index writeback accept-path
+       specimen is the former E9036 rejection specimen, now a positive
+       subset accept *)
+    ("Assign (index writeback)", {|def f() -> Int
+  var a = [1, 2, 3]
+  a[1] = 9
+  a[1]
+end
+|});
+    ("Assign (field writeback)", {|struct P
+  x: Int
+end
+def f(p: P) -> Int
+  p.x = 9
+  p.x
+end
+|});
     ("For", {|def f() -> Int
   var t = 0
   for x in [1, 2] do
@@ -356,10 +375,9 @@ end
 end
 |});
     ("Assign", "E9036",
-     {|def f() -> Int
-  var a = [1, 2, 3]
-  a[1] = 9
-  a[1]
+     {|def f(p: Ptr[Int]) -> Int
+  *p = 1
+  0
 end
 |});
     ("For", "E9045",
@@ -568,7 +586,10 @@ let expr_lower_status : (string * lower_status) list =
     ("Await", Unlowerable);
     (* no MacroCall branch — the expression-name diagnostic table *)
     ("MacroCall", Unlowerable);
-    (* plain Name targets lower; projected writebacks fail closed *)
+    (* Name/Field/Index targets lower through the typed-place writeback
+       rule (2026-08-28: the Assign branch resolves the field through
+       the typed nominal registry and emits the constant/dynamic index
+       projections); other target forms fail closed *)
     ("Assign", Partial);
     (* dedicated always-failing branch ("CompoundAssign reached MIR
        lowering without a typed-place writeback rule") *)

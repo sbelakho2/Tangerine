@@ -34,7 +34,13 @@
      (f) the struct-lit proof: `Pair { b: b, a: a }` — the OUT-OF-ORDER
          literal's values must land at the typed registry's declaration
          positions, never the source order.
-     (g) the projected-move surface proof (audit P0): the lowered
+     (g) the projected WRITEBACK proof (E9036 retirement): a Field
+         target (`p.a = v`) and an Index target (`a[i] = v` — both the
+         dynamic `Index <local>` and the constant `ConstantIndex`
+         forms) lower through the typed-place writeback rule, verify
+         through the projected-destination checks, and the VM
+         round-trips the writes (main = 42 + 7 + 99 + 99 = 247).
+     (h) the projected-move surface proof (audit P0): the lowered
          surface NEVER emits a projected Move/Consume (the seed VM has
          no partial-move representation — `Move p` transitions the
          WHOLE root slot to Moved, ignoring p.projections — so the
@@ -1642,6 +1648,253 @@ end
                       exit 1
                     end
                  | Error m -> Printf.printf "  struct-field main returned: <inspect failed: %s>\n" m)));
+      (* ── projected writeback proof (E9036 retirement, 2026-08-28):
+         the typed-place writeback rule landed in mir_lower's Assign
+         branch — a Field target (`p.a = v`) resolves the field through
+         the typed nominal registry (the SAME channel as the read path)
+         and emits the Assign to the projected place; an Index target
+         (`a[i] = v`) emits the ConstantIndex form for a literal index
+         and the dynamic `Index <index-local>` form otherwise (the VM
+         bounds-checks the runtime index at execution).  Every function
+         lowers from source (parse -> typecheck -> lower -> verify ->
+         execute).  The proof shows:
+         (1) write_a/write_b carry Assign statements whose DESTINATION
+         place carries the semantic Field projection of the written
+         field, with the value operand;
+         (2) write_idx carries the dynamic Index projection and
+         write_idx_c the ConstantIndex projection on the destination;
+         (3) the whole program passes Mir_verify.require_valid_concrete
+         (the projected destinations are checked: owner identity +
+         initialization);
+         (4) the VM round-trips the writes — the writeback sets the
+         projected component and preserves the rest of the aggregate
+         (main = 42 + 7 + 99 + 99 = 247). *)
+      let wb_src = {|
+struct Pair
+  a: Int
+  b: Int
+end
+
+def write_a(p: Pair, v: Int) -> Int
+  p.a = v
+  p.a
+end
+
+def write_b(p: Pair, v: Int) -> Int
+  p.b = v
+  p.b
+end
+
+def write_idx(a: [Int; 3], i: Int, v: Int) -> Int
+  a[i] = v
+  a[i]
+end
+
+def write_idx_c(a: [Int; 3]) -> Int
+  a[1] = 99
+  a[1]
+end
+
+def main() -> Int
+  write_a(Pair { a: 1, b: 2 }, 42) + write_b(Pair { a: 1, b: 2 }, 7) + write_idx([10, 20, 30], 1, 99) + write_idx_c([1, 2, 3])
+end
+|} in
+      let wb_file = Filename.temp_file "tg_lowersurface_writeback" ".tg" in
+      (let oc = open_out_bin wb_file in
+       output_string oc wb_src;
+       close_out oc);
+      let wb_manifest =
+        match Bootstrap_manifest.single ~file:wb_file ~path:[ "wbproof" ] () with
+        | Ok m -> m
+        | Error e -> failwith ("writeback proof manifest: " ^ e)
+      in
+      let wbdiags = Diagnostic.create_bag () in
+      let wbgraph = Module_graph.create_with_sources wb_manifest wbdiags in
+      let wbresolved = Resolver.resolve wb_manifest wbgraph wbdiags in
+      let wbprog_ast = (List.hd wbgraph.Module_graph.nodes).Module_graph.node_program in
+      let wbenv =
+        match Typecheck.check_program (Typecheck.initial_env ~resolved:(Some wbresolved) ()) wbprog_ast with
+        | Error m -> failwith ("writeback proof typecheck: " ^ m)
+        | Ok (env', errors) ->
+            if errors <> [] then
+              failwith ("writeback proof typecheck errors: " ^ String.concat "; " errors);
+            env'
+      in
+      Sys.remove wb_file;
+      let wb_pair_nom = List.assoc "Pair" wbenv.Typecheck.nominals in
+      let wb_pair_tid = List.assoc "Pair" wbenv.Typecheck.type_ids in
+      let wb_pair_fids = wb_pair_nom.Typecheck.nom_field_ids in
+      if List.length wb_pair_fids <> 2 then
+        failwith ("writeback proof: Pair has " ^ string_of_int (List.length wb_pair_fids) ^ " FieldIds");
+      let wb_fid_a = List.nth wb_pair_fids 0 and wb_fid_b = List.nth wb_pair_fids 1 in
+      let wb_ffuncs =
+        List.filter_map
+          (fun i -> match i.Ast.kind with Ast.Function d -> Some d | _ -> None)
+          wbprog_ast.Ast.items
+      in
+      let wb_fts_of name =
+        match List.assoc_opt name wbenv.Typecheck.functions with
+        | Some ts -> ts
+        | None -> (
+            match
+              List.filter (fun (k, _) -> Util.has_suffix k ("::" ^ name)) wbenv.Typecheck.functions
+            with
+            | [ (_, ts) ] -> ts
+            | _ -> failwith ("writeback proof: no typed signature for " ^ name))
+      in
+      let wbenv2 : Mir_lower.func_env =
+        {
+          Mir_lower.types =
+            [
+              ("Pair", Type_repr.Named (wb_pair_tid, [||]));
+              ("Int", int_ty);
+              ("Unit", Type_repr.Unit);
+              ("Bool", Type_repr.Bool);
+              ("String", string_ty);
+            ];
+          values =
+            List.map
+              (fun d ->
+                let n = d.Ast.fn_sig.Ast.sig_name in
+                (n, (wb_fts_of n).Typecheck.ts_return))
+              wb_ffuncs;
+          callables =
+            List.map
+              (fun d ->
+                let n = d.Ast.fn_sig.Ast.sig_name in
+                ( n,
+                  {
+                    Mir_lower.ce_callable = Ids.Callable_id.to_int (wb_fts_of n).Typecheck.ts_callable;
+                    ce_template_args = [||];
+                    ce_params = [||];
+                  } ))
+              wb_ffuncs;
+          methods = [];
+          fn_ret = int_ty;
+          struct_fields = Driver.struct_fields_of wbenv;
+        }
+      in
+      let wb_mir_funcs =
+        List.map
+          (fun d ->
+            let n = d.Ast.fn_sig.Ast.sig_name in
+            let ts = wb_fts_of n in
+            Mir_lower.lower_function_with_variants Mir_lower.default_variant_table
+              { wbenv2 with Mir_lower.fn_ret = ts.Typecheck.ts_return }
+              n (Ids.Callable_id.to_int ts.Typecheck.ts_callable) [||] [||]
+              ~param_tys_opt:(Array.map (fun p -> p.Type_repr.pt_type) ts.Typecheck.ts_params)
+              d)
+          wb_ffuncs
+      in
+      let wb_pair_def =
+        match
+          Array.to_list (Driver.closure_types wbenv)
+          |> List.find_map (fun d ->
+                 match d with
+                 | Seed_mir.StructDef { sd_id; _ } when Ids.Type_id.compare sd_id wb_pair_tid = 0 ->
+                     Some d
+                 | _ -> None)
+        with
+        | Some d -> d
+        | None -> failwith "writeback proof: no Pair StructDef from closure_types"
+      in
+      let wbprog : Seed_mir.program =
+        { Seed_mir.functions = Array.of_list wb_mir_funcs; statics = [||]; types = [| wb_pair_def |] }
+      in
+      (* the writeback-shape proof: each write function's lowered Assign
+         destination carries the projected place of the written
+         component — Field <semantic id> for the struct fields, the
+         dynamic Index <local> and ConstantIndex for the array writes *)
+      let dest_has_proj (f : Seed_mir.function_) (pred : Seed_mir.projection -> bool) : bool =
+        Array.exists
+          (fun (b : Seed_mir.block) ->
+            List.exists
+              (fun (st : Seed_mir.statement) ->
+                match st with
+                | Seed_mir.Assign (p, Seed_mir.Use (Seed_mir.Copy _ | Seed_mir.Constant _))
+                  when p.Seed_mir.projections <> [] ->
+                    List.exists pred p.Seed_mir.projections
+                | _ -> false)
+              b.Seed_mir.statements)
+          f.Seed_mir.blocks
+      in
+      let wb_write_a =
+        List.find (fun f -> f.Seed_mir.name = "write_a") (Array.to_list wbprog.Seed_mir.functions)
+      in
+      let wb_write_b =
+        List.find (fun f -> f.Seed_mir.name = "write_b") (Array.to_list wbprog.Seed_mir.functions)
+      in
+      let wb_write_idx =
+        List.find (fun f -> f.Seed_mir.name = "write_idx") (Array.to_list wbprog.Seed_mir.functions)
+      in
+      let wb_write_idx_c =
+        List.find (fun f -> f.Seed_mir.name = "write_idx_c") (Array.to_list wbprog.Seed_mir.functions)
+      in
+      let proj_is_field fid = function
+        | Seed_mir.Field f -> Ids.Field_id.compare f fid = 0
+        | _ -> false
+      in
+      let proj_is_dyn_index = function
+        | Seed_mir.Index _ -> true
+        | _ -> false
+      in
+      let proj_is_const_index = function
+        | Seed_mir.ConstantIndex 1 -> true
+        | _ -> false
+      in
+      if
+        not
+          (dest_has_proj wb_write_a (proj_is_field wb_fid_a)
+          && dest_has_proj wb_write_b (proj_is_field wb_fid_b)
+          && dest_has_proj wb_write_idx proj_is_dyn_index
+          && dest_has_proj wb_write_idx_c proj_is_const_index)
+      then begin
+        Printf.printf
+          "  writeback lowering: FAIL (the write functions carry no Assign to the projected destination — expected Field#%d on write_a, Field#%d on write_b, Index <local> on write_idx, ConstantIndex 1 on write_idx_c)\n"
+          (Ids.Field_id.to_int wb_fid_a) (Ids.Field_id.to_int wb_fid_b);
+        exit 1
+      end;
+      Printf.printf
+        "  writeback lowering: PASS (write_a/write_b Assign to the semantic Field projections FieldId#%d/FieldId#%d; write_idx to the dynamic Index <local>; write_idx_c to ConstantIndex 1)\n"
+        (Ids.Field_id.to_int wb_fid_a) (Ids.Field_id.to_int wb_fid_b);
+      (match Mir_verify.require_valid_concrete wbprog with
+       | Ok () ->
+           Printf.printf "  writeback MIR verify: PASS (%d functions)\n"
+             (Array.length wbprog.Seed_mir.functions)
+       | Error errs ->
+           Printf.printf "  writeback MIR verify: FAIL\n";
+           List.iter (fun e -> Printf.printf "    %s\n" e) errs;
+           Printf.printf "%s\n" (Seed_mir.print_program wbprog);
+           exit 1);
+      let wb_entry =
+        match
+          Array.to_list wbprog.Seed_mir.functions
+          |> List.find_opt (fun f -> f.Seed_mir.name = "main")
+        with
+        | Some f -> f.Seed_mir.instance
+        | None -> failwith "writeback proof: no main function"
+      in
+      let wbhost = Host.create ~repo_root:"." ~argv:[||] in
+      (match Vm.run ~program:wbprog ~entry:wb_entry ~argv:[||] ~host:wbhost with
+       | Error e ->
+           Printf.printf "  writeback VM: FAIL %s\n" e.Vm.message;
+           exit 1
+       | Ok code ->
+           Printf.printf "  writeback VM: exit %d\n" code;
+           (match Vm.entry_frame_of ~program:wbprog ~entry:wb_entry ~argv:[||] with
+            | Error m -> Printf.printf "  writeback main returned: <inspect failed: %s>\n" m
+            | Ok (wbvm, wbentry_frame) -> (
+                match Vm.run_inspect wbvm wbentry_frame with
+                | Ok ret_val ->
+                    Printf.printf "  writeback main returned: %s\n" ret_val;
+                    if ret_val = "247" then
+                      Printf.printf
+                        "  writeback RESULT: PASS (field + index writebacks round-tripped through the projected places)\n"
+                    else begin
+                      Printf.printf "  writeback RESULT: FAIL (expected 247)\n";
+                      exit 1
+                    end
+                | Error m -> Printf.printf "  writeback main returned: <inspect failed: %s>\n" m)));
       (* ── typed-cast proof (re-audit: the persistent
          TypedProgram/TypedHIR bridge — the node-keyed typed-expr map and
          its cast-target channel) ─────────────────────────────────────

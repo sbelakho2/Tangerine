@@ -1016,6 +1016,55 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
                    emit st (Seed_mir.Assign (cur_place st id, Seed_mir.Use vo));
                    (copy_place st (cur_place st id), ty)
                | None -> seed_bug "assignment to unknown value '%s'" n))
+       | Ast.Field (base, fname, _) ->
+           (* the typed-place writeback rule (E9036 retirement): the
+              target base lowers to a place and the field resolves
+              against the typed nominal registry — the SAME channel as
+              the read path (field_projection_of) — and the Assign is
+              emitted to the projected place.  The VM executes the
+              projected write (update_place sets the projected
+              component, preserving the rest of the aggregate); the
+              verifier checks the projected destination (owner identity
+              + initialization).  The writeback re-initializes the
+              projected component (the moved-remainder semantics: the
+              root aggregate stays initialized). *)
+           let bop, bty = lower_expr env st base in
+           let bp = materialize_place st bop in
+           let projs, fty = field_projection_of env bty fname in
+           let dst = { bp with Seed_mir.projections = bp.Seed_mir.projections @ projs } in
+           emit st (Seed_mir.Assign (dst, Seed_mir.Use vo));
+           (copy_place st dst, fty)
+       | Ast.Index (base, idx, _) -> (
+           (* the index writeback: the base lowers to a place; a
+              constant index emits the ConstantIndex projection, a
+              nonconstant index is evaluated exactly once into a fresh
+              local and emits the dynamic `Index <local>` projection —
+              the same scheme as the read path (the VM bounds-checks the
+              runtime index value at execution). *)
+           let bop, bty = lower_expr env st base in
+           let bp = materialize_place st bop in
+           let elem_ty = element_type_of bty in
+           match idx with
+           | Ast.IntLit (s, _) -> (
+               match Literal.parse_integer ~span:Span.synthetic s with
+               | Some p when Big_nat.fits_ocaml_int p.Literal.magnitude ->
+                   let k = Big_nat.to_ocaml_int p.Literal.magnitude in
+                   if k < 0 then seed_bug "negative constant index in lowering";
+                   let dst =
+                     { bp with Seed_mir.projections = bp.Seed_mir.projections @ [ Seed_mir.ConstantIndex k ] }
+                   in
+                   emit st (Seed_mir.Assign (dst, Seed_mir.Use vo));
+                   (copy_place st dst, elem_ty)
+               | _ -> seed_bug "index expression is not a constant integer")
+           | _ ->
+               let idx_op, idx_ty = lower_expr env st idx in
+               let iid = fresh_local st idx_ty in
+               emit st (Seed_mir.Assign (cur_place st iid, Seed_mir.Use idx_op));
+               let dst =
+                 { bp with Seed_mir.projections = bp.Seed_mir.projections @ [ Seed_mir.Index iid ] }
+               in
+               emit st (Seed_mir.Assign (dst, Seed_mir.Use vo));
+               (copy_place st dst, elem_ty))
        | _ ->
            ignore (vo, vt);
            seed_bug "projected assignment reached MIR lowering without a typed-place writeback rule")
