@@ -981,6 +981,13 @@ let print_subset_firewall (r : subset_result) : unit =
     (List.length r.sr_modules) r.sr_accepted r.sr_rejected r.sr_total;
   List.iter
     (fun m ->
+      if m.ssm_total > 0 then
+        Printf.printf "    %s: %s\n" m.ssm_key
+          (String.concat ", "
+             (List.map (fun (c, n) -> Printf.sprintf "%s=%d" c n) m.ssm_findings)))
+    r.sr_modules;
+  List.iter
+    (fun m ->
       if m.ssm_total > 0 then begin
         Printf.printf "    module %s: REJECTED (%d findings:" m.ssm_key m.ssm_total;
         List.iter (fun (c, n) -> Printf.printf " %s x%d" c n) m.ssm_findings;
@@ -1062,6 +1069,7 @@ type closure_ctx = {
      Fix 3 deterministic phase split). *)
   ctx_decl_rounds : int;
   ctx_subset : subset_result;
+  ctx_strict_fallbacks : int;
   mutable lowered_methods : int;
 }
 
@@ -1193,7 +1201,13 @@ let run_closure_pipeline_impl ~(repo_root : string) ~(manifest_path : string)
             let after = decl_fingerprint env' errs_by_mod in
             if after <> before && !decl_rounds < 8 then fixpoint env' else env'
           in
-          fixpoint !env
+          let env_final = fixpoint !env in
+          if !decl_rounds >= 8
+             && decl_fingerprint env_final errs_by_mod <> decl_fingerprint !env errs_by_mod
+          then
+            failwith
+              "declaration fixpoint did NOT converge within the 8-round cap — the semantic                fingerprint is still changing (re-audit P1: changed-at-max is a non-convergence                error, never an accept)";
+          env_final
         in
         Printf.printf
           "  decl fixpoint: %d round(s); converged on a stable semantic fingerprint (registered type identities + resolved nominal declarations + pending unresolved declaration set)\n"
@@ -1248,6 +1262,7 @@ let run_closure_pipeline_impl ~(repo_root : string) ~(manifest_path : string)
             ctx_typed_calls_sample = !typed_calls;
             ctx_decl_rounds = !decl_rounds;
             ctx_subset = subset_result;
+            ctx_strict_fallbacks = fallback_activations;
             lowered_methods = 0 }
       end)
 
@@ -2381,6 +2396,160 @@ let kernel_output_path (kernel_args : string list) : string option =
 let artifact_exists ~(repo_root : string) (path : string) : bool =
   if Filename.is_relative path then Sys.file_exists (Filename.concat repo_root path)
   else Sys.file_exists path
+
+(* ── the ONE structured bootstrap closure (re-audit P0: the gate must
+   not reconstruct the pipeline — every consumer inspects this result) ─ *)
+type bootstrap_stages = {
+  bs_ctx : closure_ctx;
+  bs_debt : Debt_report.t;
+  bs_prog : Seed_mir.program option;
+  bs_mir_verify_ok : bool;
+  bs_mono : mono_outcome option;
+  bs_host_report : Host.closure_report option;
+  bs_vm_code : int option;
+  bs_artifact : string option;
+  bs_oracle_incomplete : bool;
+}
+
+let run_bootstrap_closure ~(repo_root : string) ~(manifest_path : string)
+    ~(target : Target.t) ~(entry : string option) ~(kernel_args : string list) :
+    (bootstrap_stages, string) result =
+  match run_closure_pipeline_impl ~repo_root ~manifest_path ~target ~strict:true with
+  | Error m -> Error m
+  | Ok ctx ->
+      let measured_debt =
+        Debt_report.sum_reports
+          (List.map snd ctx.ctx_env.Typecheck.state.debt_by_module)
+      in
+      if ctx.ctx_type_errors <> [] then
+        Ok
+          {
+            bs_ctx = ctx;
+            bs_debt = measured_debt;
+            bs_prog = None;
+            bs_mir_verify_ok = false;
+            bs_mono = None;
+            bs_host_report = None;
+            bs_vm_code = None;
+            bs_artifact = None;
+            bs_oracle_incomplete = true;
+          }
+      else begin
+        let prog = lower_closure ctx in
+        let tpl_ok =
+          match
+            Mir_verify.require_valid_template
+              ~generic_types:(closure_generic_types ctx.ctx_env)
+              prog
+          with
+          | Ok () -> true
+          | Error _ -> false
+        in
+        let stats = count_mir_stats prog in
+        let oracle_incomplete = print_oracle_rows (oracle_of_ctx ctx (Some stats)) in
+        match resolve_bootstrap_entry prog entry with
+        | None ->
+            Ok
+              {
+                bs_ctx = ctx;
+                bs_debt = measured_debt;
+                bs_prog = Some prog;
+                bs_mir_verify_ok = tpl_ok;
+                bs_mono = None;
+                bs_host_report = None;
+                bs_vm_code = None;
+                bs_artifact = None;
+                bs_oracle_incomplete = oracle_incomplete;
+              }
+        | Some (entry_name, entry_id) -> (
+            match
+              run_mono_phase ~entry_name ~entry:entry_id
+                ~generic_types:(closure_generic_types ctx.ctx_env)
+                prog
+            with
+            | Error _ ->
+                Ok
+                  {
+                    bs_ctx = ctx;
+                    bs_debt = measured_debt;
+                    bs_prog = Some prog;
+                    bs_mir_verify_ok = tpl_ok;
+                    bs_mono = None;
+                    bs_host_report = None;
+                    bs_vm_code = None;
+                    bs_artifact = None;
+                    bs_oracle_incomplete = oracle_incomplete;
+                  }
+            | Ok mo ->
+                if mo.mo_residual_type_params > 0 || oracle_incomplete then
+                  Ok
+                    {
+                      bs_ctx = ctx;
+                      bs_debt = measured_debt;
+                      bs_prog = Some prog;
+                      bs_mir_verify_ok = tpl_ok;
+                      bs_mono = Some mo;
+                      bs_host_report = None;
+                      bs_vm_code = None;
+                      bs_artifact = None;
+                      bs_oracle_incomplete = oracle_incomplete;
+                    }
+                else begin
+                  let argv = Array.of_list ("tg-bootstrap" :: kernel_args) in
+                  let host = Host.create ~repo_root ~argv in
+                  let reachable = collect_reachable_host_ids mo.mo_program in
+                  match Host.closure_check_reachable host reachable with
+                  | Error _ ->
+                      Ok
+                        {
+                          bs_ctx = ctx;
+                          bs_debt = measured_debt;
+                          bs_prog = Some prog;
+                          bs_mir_verify_ok = tpl_ok;
+                          bs_mono = Some mo;
+                          bs_host_report = None;
+                          bs_vm_code = None;
+                          bs_artifact = None;
+                          bs_oracle_incomplete = oracle_incomplete;
+                        }
+                  | Ok report -> (
+                      match Vm.run ~program:mo.mo_program ~entry:mo.mo_entry ~argv ~host with
+                      | Error _ ->
+                          Ok
+                            {
+                              bs_ctx = ctx;
+                              bs_debt = measured_debt;
+                              bs_prog = Some prog;
+                              bs_mir_verify_ok = tpl_ok;
+                              bs_mono = Some mo;
+                              bs_host_report = Some report;
+                              bs_vm_code = None;
+                              bs_artifact = None;
+                              bs_oracle_incomplete = oracle_incomplete;
+                            }
+                      | Ok code ->
+                          let artifact =
+                            match code with
+                            | 0 -> (
+                                match kernel_output_path kernel_args with
+                                | Some p when artifact_exists ~repo_root p -> Some p
+                                | _ -> None)
+                            | _ -> None
+                          in
+                          Ok
+                            {
+                              bs_ctx = ctx;
+                              bs_debt = measured_debt;
+                              bs_prog = Some prog;
+                              bs_mir_verify_ok = tpl_ok;
+                              bs_mono = Some mo;
+                              bs_host_report = Some report;
+                              bs_vm_code = Some code;
+                              bs_artifact = artifact;
+                              bs_oracle_incomplete = oracle_incomplete;
+                            })
+        end)
+    end
 
 let cmd_bootstrap_check (args : string list) : int =
   let opts, positional = parse_options boot_specs default_boot_opts args in

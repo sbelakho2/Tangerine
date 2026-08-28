@@ -303,19 +303,10 @@ and check_pattern ctx diags (p : Ast.pattern) =
   match p with
   | Ast.Wildcard _ | Ast.PatIdent _ | Ast.RefPattern _ | Ast.RefMutPattern _ -> ()
   | Ast.PatLiteral (e, _) -> check_expr ctx diags e
-  | Ast.PatVariant (seg1, seg2, fields, span) ->
-      (* AST form: Ast.PatVariant (enum_seg, variant_name, pats, span)
-         (parser: `Enum::Variant(...)` qualified, `Variant(...)` bare).
-         User-enum match arms are held behind the firewall (E9035): the
-         VariantId fix landed 2026-08-27 (specs carry the registry-
-         minted vs_id), but the positive driver-path end-to-end proof
-         is absent — support stays gated until it lands. *)
-      if not (builtin_variant_of seg1 seg2) then
-        reject diags "E9035"
-          (Printf.sprintf
-             "user-defined enum match arm `%s` is not available in the bootstrap subset (the VariantId fix has landed, but user-enum support stays gated until the positive driver-path end-to-end proof lands)"
-             (if seg1 = "" then seg2 else seg1 ^ "::" ^ seg2))
-          span;
+  | Ast.PatVariant (_, _, fields, _) ->
+      (* user-enum match arms: the VariantId fix landed (specs carry the
+         registry-minted vs_id) and the positive driver-path end-to-end
+         proof exists in tg_lowersurface — the E9035 gate is retired *)
       List.iter (check_pattern ctx diags) fields
   | Ast.StructPattern (_, fields, _) ->
       List.iter (fun (_, opt) -> Option.iter (check_pattern ctx diags) opt) fields
@@ -341,15 +332,10 @@ and check_pattern ctx diags (p : Ast.pattern) =
 
 and check_arm_pattern ctx diags (p : Ast.pattern) =
   match p with
-  | Ast.PatVariant (seg1, seg2, fields, span) ->
-      (* held behind the firewall (E9035) — VariantId fix landed, the
-         positive driver-path proof is absent (see check_pattern) *)
-      if not (builtin_variant_of seg1 seg2) then
-        reject diags "E9035"
-          (Printf.sprintf
-             "user-defined enum match arm `%s` is not available in the bootstrap subset (the VariantId fix has landed, but user-enum support stays gated until the positive driver-path end-to-end proof lands)"
-             (if seg1 = "" then seg2 else seg1 ^ "::" ^ seg2))
-          span;
+  | Ast.PatVariant (_, _, fields, _) ->
+      (* user-enum arms are lowered through the semantic registry (the
+         E9035 gate is retired — the VariantId fix + the lowersurface
+         positive proof) *)
       List.iter
         (fun f ->
           match f with
@@ -410,42 +396,24 @@ and check_expr ctx diags (e : Ast.expr) =
   | Ast.Path _ | Ast.NextExpr _ ->
       ()
   | Ast.Name (n, span) ->
-      (* AST form: Ast.Name (name, span) — a user-enum constructor in
-         value position (`Red` nullary, or the qualified `Color::Red` the
-         parser folds into a single Name).  User-enum construction is
-         held behind the firewall (E9035): the VariantId fix landed
-         2026-08-27 (specs carry the registry-minted vs_id), but the
-         positive driver-path end-to-end proof is absent — support
-         stays gated until it lands. *)
-      if List.mem n ctx.user_variants then
-        reject diags "E9035"
-          (Printf.sprintf
-             "user-defined enum constructor `%s` is not available in the bootstrap subset (the VariantId fix has landed, but user-enum support stays gated until the positive driver-path end-to-end proof lands)"
-             n)
-          span
-      else
-        (* AST form: Ast.Name "Type::method" — a nominal-qualified
-           reference that is neither a declared top-level function nor a
-           builtin variant constructor.  The lowering env's callables
-           carry top-level functions only (methods are never consulted
-           by lower_call), so `Vec::new()` fails closed at lowering with
-           "unknown callee"; reject until receiver-typed method lowering
-           lands. *)
-        (match String.index_opt n ':' with
-         | Some i when i + 1 < String.length n && n.[i + 1] = ':' ->
-             let qual = String.sub n 0 i in
-             let rest = String.sub n (i + 2) (String.length n - i - 2) in
-             if
-               (not (List.mem n ctx.functions))
-               && List.mem qual ctx.nominals
-               && not (builtin_variant_of qual rest)
-             then
-               reject diags "E9048"
-                 (Printf.sprintf
-                    "qualified method reference `%s` is not available in the bootstrap subset (seed lowering resolves top-level callables only — receiver-typed method calls have no lowering)"
-                    n)
-                 span
-         | _ -> ())
+      (* user-enum constructors are lowered through the semantic registry
+         (the E9035 gate is retired — the VariantId fix + the
+         lowersurface positive proof) *)
+      (match String.index_opt n ':' with
+       | Some i when i + 1 < String.length n && n.[i + 1] = ':' ->
+           let qual = String.sub n 0 i in
+           let rest = String.sub n (i + 2) (String.length n - i - 2) in
+           if
+             (not (List.mem n ctx.functions))
+             && List.mem qual ctx.nominals
+             && not (builtin_variant_of qual rest)
+           then
+             reject diags "E9048"
+               (Printf.sprintf
+                  "qualified method reference `%s` is not available in the bootstrap subset (seed lowering resolves top-level callables only — receiver-typed method calls have no lowering)"
+                  n)
+               span
+       | _ -> ())
   | Ast.Array (elems, _) -> List.iter (check_expr ctx diags) elems
   | Ast.ArrayRepeat (v, c, span) ->
       (* AST form: Ast.ArrayRepeat (value, count, span) (parser `[v; n]`).
@@ -508,19 +476,9 @@ and check_expr ctx diags (e : Ast.expr) =
       Option.iter (check_block ctx diags) i.Ast.if_else;
       Option.iter (check_pattern ctx diags) i.Ast.if_let_pattern;
       Option.iter (check_expr ctx diags) i.Ast.if_let_value
-  | Ast.Call (callee, targs, args, span) ->
-      (* AST form: Ast.Call (Ast.Name n, ...) with n a user-enum ctor
-         (`Green(7)` bare, `Color::Green(7)` folded qualified name) —
-         held behind the firewall (E9035): the VariantId fix landed,
-         the positive driver-path proof is absent. *)
-      (match callee with
-       | Ast.Name (n, _) when List.mem n ctx.user_variants ->
-           reject diags "E9035"
-             (Printf.sprintf
-                "user-defined enum constructor `%s` is not available in the bootstrap subset (the VariantId fix has landed, but user-enum support stays gated until the positive driver-path end-to-end proof lands)"
-                n)
-             span
-       | _ -> ());
+  | Ast.Call (callee, targs, args, _) ->
+      (* user-enum constructors are lowered through the semantic registry
+         (the E9035 gate is retired) *)
       check_expr ctx diags callee;
       List.iter (check_type ctx diags false) targs;
       List.iter (fun a -> check_expr ctx diags a.Ast.ca_value) args

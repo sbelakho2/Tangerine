@@ -108,42 +108,10 @@ def f() -> Int
   LIMIT
 end
 |} );
-    ( "user-enum match arm beyond the default variant table",
-      "E9035",
-      {|enum Color
-  Red,
-  Green(Int)
-end
-
-def f(c: Color) -> Int
-  match c {
-    Green(g) => g,
-    Red() => 0
-  }
-end
-|} );
-    ( "user-enum construction beyond the default variant table",
-      "E9035",
-      {|enum Color
-  Red,
-  Green(Int)
-end
-
-def make() -> Color
-  Green(7)
-end
-|} );
-    ( "user-enum qualified construction beyond the default variant table",
-      "E9035",
-      {|enum Color
-  Red,
-  Green(Int)
-end
-
-def make() -> Color
-  Color::Green(7)
-end
-|} );
+    (* the user-enum E9035 gate is RETIRED: the VariantId fix landed
+       (specs carry the registry-minted vs_id) and the positive
+       driver-path end-to-end proof exists in tg_lowersurface (the
+       three-variant enum round-trip with payload binding) *)
     (* field-projection E9036 was DELETED 2026-08-27: the typed-place
        (FieldId) rule landed in mir_lower — p.x now lowers and is VM
        proven in tg_lowersurface's struct-field proof (the positive
@@ -176,27 +144,6 @@ let verify_subset_rejection (name : string) (code : string) (src : string) : uni
         fail "subset firewall proof `%s`: expected code %s, got [%s]" name code
           (String.concat "; " got);
       Printf.printf "  subset firewall: `%s` -> %s: PASS\n" name code
-
-(* ── Stage 10 machinery (zero-debt path only) ──────────────────── *)
-
-let kernel_output_path (kernel_args : string list) : string option =
-  let rec go = function
-    | "-o" :: v :: _ | "--output" :: v :: _ -> Some v
-    | _ :: rest -> go rest
-    | [] -> None
-  in
-  match go kernel_args with
-  | Some p -> Some p
-  | None -> (
-      match kernel_args with
-      | file :: _ when not (String.length file >= 1 && file.[0] = '-') ->
-          if Filename.check_suffix file ".tg" then Some (Filename.chop_suffix file ".tg")
-          else Some file
-      | _ -> None)
-
-let artifact_exists ~(repo_root : string) (path : string) : bool =
-  if Filename.is_relative path then Sys.file_exists (Filename.concat repo_root path)
-  else Sys.file_exists path
 
 (* The first integrated access/resource semantic pass (re-audit P0-11):
    the driver runs Access_check.run_closure over the closure env's
@@ -325,14 +272,22 @@ let () =
   Printf.printf "  [1/10] manifest load\n";
   Printf.printf "  [2/10] module graph\n";
   Printf.printf "  [3/10] @cfg elimination\n";
-  Printf.printf "  [4/10] resolver\n";
+  Printf.printf "  [4/10] resolver (strict)\n";
   Printf.printf "  [5/10] typechecker (fixpoint)\n";
+  (* THE canonical closure: the gate consumes Driver.run_bootstrap_closure
+     (strict resolution + subset scan + template verify + mono with the
+     generic registry + concrete verify + static reachable-host proof +
+     VM + artifact) — the gate no longer reconstructs the pipeline. *)
+  let kernel_args =
+    [ "compile"; "tests/differential/corpus/01_defs_arith.tg"; "-o"; "bootstrap_gate.out" ]
+  in
   (match
-     Driver.run_closure_pipeline ~repo_root ~manifest_path:"bootstrap/compiler_kernel.manifest"
-       ~target
+     Driver.run_bootstrap_closure ~repo_root ~manifest_path:"bootstrap/compiler_kernel.manifest"
+       ~target ~entry:None ~kernel_args
    with
    | Error m -> fail "closure pipeline: %s" m
-   | Ok ctx ->
+   | Ok stages ->
+       let ctx = stages.Driver.bs_ctx in
        let n_errs = List.length ctx.ctx_type_errors in
        Printf.printf "  typecheck: %d errors across %d modules / %d items (%d rounds)\n" n_errs
          ctx.ctx_graph.Module_graph.node_count ctx.ctx_items ctx.ctx_decl_rounds;
@@ -350,6 +305,17 @@ let () =
          measured_debt.Debt_report.total measured_debt.Debt_report.primaries
          measured_debt.Debt_report.secondaries;
        check_no_regression measured_debt baseline_typecheck_debt;
+       (* re-audit P0s: the manifest subset firewall and the strict
+          resolution are HARD gates on the actual closure result (never
+          merely printed) *)
+       if ctx.ctx_subset.Driver.sr_total <> 0 then
+         fail
+           "manifest subset firewall: %d unsupported construct(s) in the compiler manifest — \
+            the aggregate gate requires zero" ctx.ctx_subset.Driver.sr_total;
+       if ctx.ctx_strict_fallbacks <> 0 then
+         fail
+           "strict resolution: %d compatibility-fallback activation(s) — the aggregate gate \
+            requires zero (the seed-swap condition)" ctx.ctx_strict_fallbacks;
        (* [6/10] the integrated access/resource pass: RUNS over the
           closure env's recorded typed channels (additive reporting —
           it cannot change the debt numbers above) *)
@@ -369,61 +335,50 @@ let () =
          Printf.printf "BOOTSTRAP GATE: RESULT: PASS (no regression vs the checked baseline)\n";
          exit 0
        end;
-       (* Zero typecheck debt: the full semantic closure must succeed. *)
-       Printf.printf "  [6/10] access/resource checks\n";
+       (* Zero typecheck debt: the full semantic closure must succeed —
+          inspecting the ONE canonical result (the stages were computed
+          by Driver.run_bootstrap_closure with strict resolution, the
+          subset scan, the template verifier + generic registry, mono
+          with the registry, the concrete verifier, the static
+          reachable-host proof, the VM and the artifact). *)
+       Printf.printf "  [6/10] call-argument access sanity\n";
        if n_access_findings > 0 then
          fail
-           "access/resource findings on the closure (%d) — the integrated pass must be clean \
-            before closure PASS (the recorded-typed-channels walk is the integrated semantic \
-            pass; the CFG-based cleanup-plan stage remains future work)" n_access_findings;
-       let prog = Driver.lower_closure ctx in
-       Printf.printf "  [7/10] lowering: PASS (%d functions lowered)\n"
-         (Array.length prog.Seed_mir.functions);
-       (match Mir_verify.require_valid prog with
-        | Error errs ->
-            Printf.printf "  [8/10] MIR verify: FAIL\n";
-            List.iter (fun e -> Printf.printf "    %s\n" e) errs;
-            fail "MIR verify"
-        | Ok () ->
-            Printf.printf "  [8/10] MIR verify: PASS (%d functions)\n"
-              (Array.length prog.Seed_mir.functions));
-       let stats = Driver.count_mir_stats prog in
-       let incomplete = Driver.print_oracle_rows (Driver.oracle_of_ctx ctx (Some stats)) in
-       if incomplete then fail "oracle DIFF rows present — completeness is not closed";
-       (match Driver.resolve_bootstrap_entry prog None with
-        | None -> fail "no bootstrap entry function in the lowered closure"
-        | Some (entry_name, entry) ->
-            (match Driver.run_mono_phase ~entry_name ~entry prog with
-             | Error _ -> fail "mono phase"
-             | Ok mo ->
+           "call-argument access findings on the closure (%d) — the sanity walk must be clean \
+            before closure PASS (this is CALL_ARGUMENT_ACCESS_SANITY, not the native \
+            ownership/resource pass; the CFG-based cleanup-plan stage remains future work)"
+           n_access_findings;
+       (match stages.Driver.bs_prog with
+        | None -> fail "lowering produced no program"
+        | Some prog ->
+            Printf.printf "  [7/10] lowering: PASS (%d functions lowered)\n"
+              (Array.length prog.Seed_mir.functions);
+            if not stages.Driver.bs_mir_verify_ok then fail "template MIR verify";
+            Printf.printf "  [8/10] template MIR verify: PASS (%d functions)\n"
+              (Array.length prog.Seed_mir.functions);
+            if stages.Driver.bs_oracle_incomplete then
+              fail "oracle DIFF rows present — completeness is not closed";
+            (match stages.Driver.bs_mono with
+             | None -> fail "mono phase"
+             | Some mo ->
                  if mo.Driver.mo_residual_type_params > 0 then
                    fail "%d residual Type_param after mono" mo.Driver.mo_residual_type_params;
                  Printf.printf
-                   "  [9/10] mono (reachable closure from entry '%s'): PASS — pre %d -> post %d instances\n"
-                   entry_name mo.Driver.mo_pre_functions mo.Driver.mo_post_functions;
+                   "  [9/10] mono (reachable closure): PASS — pre %d -> post %d instances\n"
+                   mo.Driver.mo_pre_functions mo.Driver.mo_post_functions;
                  Printf.printf "  [10/10] reachable-host closure + VM run + artifact production\n";
-                 let kernel_args =
-                   [ "compile"; "tests/differential/corpus/01_defs_arith.tg"; "-o"; "bootstrap_gate.out" ]
-                 in
-                 let argv = Array.of_list ("tg-bootstrap" :: kernel_args) in
-                 let host = Host.create ~repo_root ~argv in
-                 (match Vm.run ~program:mo.Driver.mo_program ~entry:mo.Driver.mo_entry ~argv ~host with
-                  | Error e ->
-                      let out = Host.stdout_contents host in
-                      if out <> "" then Printf.printf "  kernel stdout:\n%s\n" out;
-                      let err = Host.stderr_contents host in
-                      if err <> "" then Printf.printf "  kernel stderr:\n%s\n" err;
-                      fail "VM bootstrap run: %s" e.Vm.message
-                  | Ok code ->
-                      let out = Host.stdout_contents host in
-                      if out <> "" then Printf.printf "  kernel stdout:\n%s\n" out;
-                      Printf.printf "  VM bootstrap run: exit %d\n" code;
-                      if code <> 0 then fail "nonzero exit from the kernel";
-                      (match kernel_output_path kernel_args with
-                       | None -> fail "no artifact path derivable from the kernel argv"
-                       | Some out_path ->
-                           if not (artifact_exists ~repo_root out_path) then
-                             fail "VM exited 0 but produced no artifact at %s" out_path;
-                           Printf.printf "  artifact produced: %s\n" out_path)));
+                 (match stages.Driver.bs_host_report with
+                  | None -> fail "static reachable-host closure proof missing"
+                  | Some _ ->
+                      Printf.printf "  REACHABLE_HOST_CLOSURE = PASS\n";
+                      (match stages.Driver.bs_vm_code with
+                       | None -> fail "VM bootstrap run missing"
+                       | Some code ->
+                           Printf.printf "  VM bootstrap run: exit %d\n" code;
+                           if code <> 0 then fail "nonzero exit from the kernel";
+                           (match stages.Driver.bs_artifact with
+                            | None -> fail "VM exited 0 but produced no artifact"
+                            | Some out_path ->
+                                Printf.printf "  artifact produced: %s\n" out_path)))));
        Printf.printf "BOOTSTRAP GATE: PASS — full closure through every stage\n";
-       exit 0))
+       exit 0)

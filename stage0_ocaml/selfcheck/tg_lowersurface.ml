@@ -2126,6 +2126,7 @@ end
           ctx_typed_calls_sample = 0;
           ctx_decl_rounds = 0;
           ctx_subset = Driver.subset_firewall_of_graph ngraph;
+          ctx_strict_fallbacks = 0;
           lowered_methods = 0;
         }
       in
@@ -3130,6 +3131,7 @@ end
            ctx_typed_calls_sample = 0;
            ctx_decl_rounds = 0;
            ctx_subset = Driver.subset_firewall_of_graph ncgraph;
+           ctx_strict_fallbacks = 0;
            lowered_methods = 0;
          }
        in
