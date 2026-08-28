@@ -163,6 +163,9 @@ let rec check_item ctx diags (i : Ast.item) =
        | Ast.IntLit _ | Ast.BoolLit _ | Ast.StringLit _ | Ast.CharLit _
        | Ast.FloatLit _ ->
            ()
+       | Ast.Unary (Ast.Neg, Ast.IntLit _, _) ->
+           (* a negated integer initializer `const MIN: Int = -128` *)
+           ()
        | _ ->
            reject diags "E9034"
              "non-literal const initializers are not available in the bootstrap subset (the seed evaluates literal const initializers only)"
@@ -178,6 +181,7 @@ let rec check_item ctx diags (i : Ast.item) =
        | Ast.IntLit _ | Ast.BoolLit _ | Ast.StringLit _ | Ast.CharLit _
        | Ast.FloatLit _ ->
            ()
+       | Ast.Unary (Ast.Neg, Ast.IntLit _, _) -> ()
        | _ ->
            reject diags "E9034"
              "non-literal static initializers are not available in the bootstrap subset (the seed evaluates literal static initializers only)"

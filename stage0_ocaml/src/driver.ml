@@ -182,6 +182,27 @@ let const_values (env : Typecheck.env) (items : Ast.item list) :
                    (Int64.of_int (Big_nat.to_ocaml_int p.Literal.magnitude)))
             else None)
         | None -> None)
+    | Ast.Unary (Ast.Neg, Ast.IntLit (lit, _), _) -> (
+        (* a negated integer initializer `const MIN: Int = -128` *)
+        match Literal.parse_integer ~span:Span.synthetic lit with
+        | Some p -> (
+            let kind =
+              match p.Literal.suffix with
+              | Literal.I8 -> Type_repr.I8 | Literal.I16 -> Type_repr.I16
+              | Literal.I32 -> Type_repr.I32 | Literal.I64 -> Type_repr.I64
+              | Literal.I128 -> Type_repr.I128
+              | Literal.U8 -> Type_repr.U8 | Literal.U16 -> Type_repr.U16
+              | Literal.U32 -> Type_repr.U32 | Literal.U64 -> Type_repr.U64
+              | Literal.U128 -> Type_repr.U128
+              | Literal.Int -> Type_repr.Int | Literal.UInt -> Type_repr.UInt
+              | Literal.No_int_suffix -> Type_repr.Int
+            in
+            if Big_nat.fits_ocaml_int p.Literal.magnitude then
+              Some
+                (Mir_lower.int_constant_of kind
+                   (Int64.neg (Int64.of_int (Big_nat.to_ocaml_int p.Literal.magnitude))))
+            else None)
+        | None -> None)
     | _ -> None
   in
   (* the const declarations in the closure, keyed by the qualified and
