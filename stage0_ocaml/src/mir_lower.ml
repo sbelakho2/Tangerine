@@ -102,6 +102,7 @@ type method_entry = {
 type func_env = {
   types : (string * Type_repr.t) list;               (* type name -> repr *)
   values : (string * Type_repr.t) list;              (* global value name -> type *)
+  consts : (string * (Type_repr.t * Seed_mir.constant)) list;  (* const/static name -> repr + value *)
   callables : (string * callable_entry) list;        (* function name -> resolved entry *)
   methods : ((string * string) * method_entry) list;  (* (receiver type name, method) -> instance + sig contracts *)
   fn_ret : Type_repr.t;
@@ -894,10 +895,13 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
                          [] ) ));
               (copy_place st (cur_place st id), ty)
           | None -> (
-              match List.assoc_opt n env.values with
-              | Some _ ->
-                  seed_bug "function value `%s` reached lowering without a resolved callable identity" n
-              | None -> seed_bug "unknown value '%s' in lowering" n)))
+              match List.assoc_opt n env.consts with
+              | Some (ty, c) -> (Seed_mir.Constant c, ty)
+              | None -> (
+                  match List.assoc_opt n env.values with
+                  | Some _ ->
+                      seed_bug "function value `%s` reached lowering without a resolved callable identity" n
+                  | None -> seed_bug "unknown value '%s' in lowering" n))))
   | Ast.Path (a, b, span) -> (
       ignore span;
       seed_bug "path value `%s::%s` reached lowering without a resolved callable identity" a b)

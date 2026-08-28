@@ -74,7 +74,8 @@ let () =
       in
       let env2 : Mir_lower.func_env =
         {
-          Mir_lower.types =
+          Mir_lower.consts = [];
+    Mir_lower.types =
             [
               ("Int", Type_repr.Int Type_repr.Int);
               ("Unit", Type_repr.Unit);

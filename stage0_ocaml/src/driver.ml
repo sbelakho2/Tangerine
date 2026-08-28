@@ -142,6 +142,97 @@ let lookup_typed_fn (env : Typecheck.env) (name : string) : Typecheck.typed_sign
    identities closure_types materializes into the StructDefs — with the
    same deterministic fallback (1-based declaration order) when the
    identity lists are not parallel to the field lists. *)
+(* The const/static VALUE table: the checker's consts registry carries
+   the declared types; the literal initializers evaluate into
+   Seed_mir.constant values (the E9034 literal forms retire — the
+   driver's statics and the lowering env carry the values; the subset
+   rejects the non-literal forms until the evaluator grows). *)
+let const_values (env : Typecheck.env) (items : Ast.item list) :
+    (string * (Type_repr.t * Seed_mir.constant)) list =
+  let lit_constant (d : Ast.const_decl) : Seed_mir.constant option =
+    match d.Ast.c_value with
+    | Ast.BoolLit (b, _) -> Some (Seed_mir.Bool b)
+    | Ast.CharLit (c, _) -> (
+        let b = Bytes.of_string c in
+        match Utf8.decode_at b 0 with
+        | Ok (u, _) -> Some (Seed_mir.Char u)
+        | Error _ -> None)
+    | Ast.StringLit (s, _) -> Some (Seed_mir.String s)
+    | Ast.FloatLit (lit, _) -> (
+        match float_of_string_opt lit with
+        | Some f -> Some (Seed_mir.Float64 (Int64.bits_of_float f))
+        | None -> None)
+    | Ast.IntLit (lit, _) -> (
+        match Literal.parse_integer ~span:Span.synthetic lit with
+        | Some p -> (
+            let kind =
+              match p.Literal.suffix with
+              | Literal.I8 -> Type_repr.I8 | Literal.I16 -> Type_repr.I16
+              | Literal.I32 -> Type_repr.I32 | Literal.I64 -> Type_repr.I64
+              | Literal.I128 -> Type_repr.I128
+              | Literal.U8 -> Type_repr.U8 | Literal.U16 -> Type_repr.U16
+              | Literal.U32 -> Type_repr.U32 | Literal.U64 -> Type_repr.U64
+              | Literal.U128 -> Type_repr.U128
+              | Literal.Int -> Type_repr.Int | Literal.UInt -> Type_repr.UInt
+              | Literal.No_int_suffix -> Type_repr.Int
+            in
+            if Big_nat.fits_ocaml_int p.Literal.magnitude then
+              Some
+                (Mir_lower.int_constant_of kind
+                   (Int64.of_int (Big_nat.to_ocaml_int p.Literal.magnitude)))
+            else None)
+        | None -> None)
+    | _ -> None
+  in
+  (* the const declarations in the closure, keyed by the qualified and
+     the flat name (the checker registers the qualified names) *)
+  let bare_keys (n : string) : string list =
+    match String.rindex_opt n ':' with
+    | Some i -> [ n; String.sub n (i + 1) (String.length n - i - 1) ]
+    | None -> [ n ]
+  in
+  let decl_of (n : string) : Ast.const_decl option =
+    List.find_map
+      (fun (it : Ast.item) ->
+        match it.Ast.kind with
+        | Ast.ConstDecl d
+          when Typecheck.qualified_name it.Ast.module_path d.c_name = n ->
+            Some d
+        | Ast.StaticDecl d
+          when Typecheck.qualified_name it.Ast.module_path d.st_name = n ->
+            Some
+              {
+                Ast.c_name = d.Ast.st_name;
+                c_public = d.Ast.st_public;
+                c_type = d.Ast.st_type;
+                c_value = d.Ast.st_value;
+                c_span = d.Ast.st_span;
+              }
+        | _ -> None)
+      items
+  in
+  List.concat_map
+    (fun (n, ty : string * Type_repr.t) ->
+      match decl_of n with
+      | None -> []
+      | Some d -> (
+          match lit_constant d with
+          | None -> []
+          | Some c -> List.map (fun k -> (k, (ty, c))) (bare_keys n)))
+    env.Typecheck.consts
+
+let closure_statics (env : Typecheck.env) : (string * Type_repr.t * Seed_mir.constant option) array =
+  let init_of (n : string) : Seed_mir.constant option =
+    match List.assoc_opt n (const_values env []) with
+    | Some (_, c) -> Some c
+    | None -> None
+  in
+  Array.of_list
+    (List.filter_map
+       (fun (n, ty : string * Type_repr.t) ->
+         if Type_repr.has_type_param ty then None else Some (n, ty, init_of n))
+       env.Typecheck.consts)
+
 let struct_fields_of (env : Typecheck.env) :
     (Ids.Type_id.t * (string * Ids.Field_id.t * Type_repr.t) list) list =
   List.filter_map
@@ -182,7 +273,7 @@ let typed_nodes_of (env : Typecheck.env) : ((int * int) * Mir_lower.typed_node) 
       :: acc)
     env.Typecheck.typed_nodes []
 
-let lowering_env_of (env : Typecheck.env) : Mir_lower.func_env =
+let lowering_env_of ?(items : Ast.item list = []) (env : Typecheck.env) : Mir_lower.func_env =
   (* both the qualified key and the bare name resolve (flat namespace) *)
   let bare_keys (n : string) : string list =
     match String.rindex_opt n ':' with
@@ -289,6 +380,7 @@ let lowering_env_of (env : Typecheck.env) : Mir_lower.func_env =
   {
     Mir_lower.types = env.Typecheck.types;
     values;
+    consts = const_values env items;
     callables;
     methods;
     fn_ret = Type_repr.Unit;
@@ -468,7 +560,7 @@ let lower_and_report (path : string) (env : Typecheck.env) (program : Ast.progra
     (String.concat "::" module_path)
     (List.length program.Ast.items)
     (List.length funcs);
-  let base = lowering_env_of env in
+  let base = lowering_env_of ~items:program.Ast.items env in
   let mir_funcs =
     List.mapi
       (fun i d ->
@@ -496,7 +588,7 @@ let lower_and_report (path : string) (env : Typecheck.env) (program : Ast.progra
       funcs
   in
   let prog =
-    { Seed_mir.functions = Array.of_list mir_funcs; statics = [||]; types = [||] }
+    { Seed_mir.functions = Array.of_list mir_funcs; statics = closure_statics env; types = [||] }
   in
   match Mir_verify.require_valid_template ~generic_types:(closure_generic_types env) prog with
   | Error errs ->
@@ -603,7 +695,7 @@ let cmd_interpret (args : string list) : int =
                   (fun i -> match i.Ast.kind with Ast.Function d -> Some d | _ -> None)
                   program.Ast.items
               in
-              let base = lowering_env_of env in
+              let base = lowering_env_of ~items:program.Ast.items env in
               let mir_funcs =
                 List.mapi
                   (fun i d ->
@@ -619,7 +711,7 @@ let cmd_interpret (args : string list) : int =
                   funcs
               in
               let prog =
-                { Seed_mir.functions = Array.of_list mir_funcs; statics = [||]; types = [||] }
+                { Seed_mir.functions = Array.of_list mir_funcs; statics = closure_statics env; types = [||] }
               in
               (match
                  Mir_verify.require_valid_template
@@ -1341,13 +1433,6 @@ let closure_types (env : Typecheck.env) : Seed_mir.type_def array =
 (* Materialize program.statics from the typed const registry: declared
    with their types; initializers arrive with the typed-expression
    channel (the subset firewall rejects const uses until then). *)
-let closure_statics (env : Typecheck.env) : (string * Type_repr.t * Seed_mir.constant option) array =
-  Array.of_list
-    (List.filter_map
-       (fun (n, ty : string * Type_repr.t) ->
-         if Type_repr.has_type_param ty then None else Some (n, ty, None))
-       env.Typecheck.consts)
-
 let lower_closure (ctx : closure_ctx) : Seed_mir.program =
   let base = lowering_env_of ctx.ctx_env in
   let variants = user_variant_table ctx.ctx_env in

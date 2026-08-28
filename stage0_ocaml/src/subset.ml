@@ -155,13 +155,18 @@ let rec check_item ctx diags (i : Ast.item) =
           check_type ctx diags false c.Ast.c_type)
         d.Ast.i_consts
   | Ast.ConstDecl d ->
-      (* AST form: Ast.ConstDecl (parser `const NAME: T = e`); the
-         lowering API carries no const table and every driver caller
-         passes `statics = [||]` (mir_lower §35 TODO), so consts never
-         reach program.statics — reject until real const lowering lands. *)
-      reject diags "E9034"
-        "const declarations are not available in the bootstrap subset (consts never reach program.statics in the seed lowering)"
-        d.Ast.c_span;
+      (* literal consts are evaluated into program.statics and the
+         lowering env (the driver's const_values channel — the E9034
+         literal form is retired); the non-literal initializer forms
+         stay rejected until the evaluator grows *)
+      (match d.Ast.c_value with
+       | Ast.IntLit _ | Ast.BoolLit _ | Ast.StringLit _ | Ast.CharLit _
+       | Ast.FloatLit _ ->
+           ()
+       | _ ->
+           reject diags "E9034"
+             "non-literal const initializers are not available in the bootstrap subset (the seed evaluates literal const initializers only)"
+             d.Ast.c_span);
       check_expr ctx diags d.Ast.c_value;
       check_type ctx diags false d.Ast.c_type
   | Ast.StaticDecl d ->

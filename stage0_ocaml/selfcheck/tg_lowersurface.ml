@@ -92,8 +92,7 @@
           with "unknown callee" — the fail-closed channel that replaced
           the firewall rejection.
 
-   Expected main return: 209 (113 + the tuple-destructuring
-   round-trips: tuple_roundtrip 63 + for_roundtrip 33 = 96). *)
+   Expected main return: 251 (209 + const_roundtrip 42). *)
 
 let src_text = {|
 enum Color
@@ -170,6 +169,12 @@ def tuple_roundtrip() -> Int
   a + b
 end
 
+const ROUNDTRIP_K: Int = 42
+
+def const_roundtrip() -> Int
+  ROUNDTRIP_K
+end
+
 def for_roundtrip() -> Int
   var t = 0
   for (k, v) in [(10, 1), (20, 2)] do
@@ -204,7 +209,8 @@ def main() -> Int
   let i = defer_order()
   let l = tuple_roundtrip()
   let m = for_roundtrip()
-  a + b + c + d + e + f + g + h + i + j + k + l + m
+  let o = const_roundtrip()
+  a + b + c + d + e + f + g + h + i + j + k + l + m + o
 end
 |}
 
@@ -530,7 +536,12 @@ end
       in
       let env2 : Mir_lower.func_env =
         {
-          Mir_lower.types =
+          Mir_lower.consts =
+            [
+              ( "ROUNDTRIP_K",
+                (int_ty, Seed_mir.Integer (Int_value.of_int64 ~width:64 ~signed:true 42L)) );
+            ];
+    Mir_lower.types =
             [
               ("Color", color_ty);
               ("Option", Type_repr.Named (option_tid, [| Type_repr.Type_param (Ids.Generic_param_id.make 0) |]));
@@ -1369,9 +1380,9 @@ end
                 match Vm.run_inspect vm2 entry_frame with
                 | Ok ret_val ->
                     Printf.printf "  main returned: %s\n" ret_val;
-                    if ret_val = "209" then Printf.printf "  RESULT: PASS\n"
+                    if ret_val = "251" then Printf.printf "  RESULT: PASS\n"
                     else begin
-                      Printf.printf "  RESULT: FAIL (expected 209)\n";
+                      Printf.printf "  RESULT: FAIL (expected 251)\n";
                       exit 1
                     end
                 | Error m -> Printf.printf "  main returned: <inspect failed: %s>\n" m)));
@@ -1476,7 +1487,8 @@ end
       in
       let fenv2 : Mir_lower.func_env =
         {
-          Mir_lower.types =
+          Mir_lower.consts = [];
+    Mir_lower.types =
             [
               ("Pair", Type_repr.Named (pair_tid, [||]));
               ("Int", int_ty);
@@ -1806,7 +1818,8 @@ end
       in
       let wbenv2 : Mir_lower.func_env =
         {
-          Mir_lower.types =
+          Mir_lower.consts = [];
+    Mir_lower.types =
             [
               ("Pair", Type_repr.Named (wb_pair_tid, [||]));
               ("Int", int_ty);
@@ -2621,7 +2634,8 @@ end
        in
        let lenv2 : Mir_lower.func_env =
          {
-           Mir_lower.types =
+           Mir_lower.consts = [];
+    Mir_lower.types =
              [
                ("Pair", Type_repr.Named (l_tid, [||]));
                ("Int", int_ty);
@@ -2908,7 +2922,8 @@ end
        in
        let menv2 : Mir_lower.func_env =
          {
-           Mir_lower.types =
+           Mir_lower.consts = [];
+    Mir_lower.types =
              [
                ("Pair", Type_repr.Named (m_tid, [||]));
                ("Int", int_ty);
@@ -3210,7 +3225,8 @@ end
             let fs_tid = l_tid in
             let fsenv : Mir_lower.func_env =
               {
-                Mir_lower.types =
+                Mir_lower.consts = [];
+    Mir_lower.types =
                   [
                     ("Pair", Type_repr.Named (fs_tid, [||]));
                     ("Int", int_ty);
@@ -3326,7 +3342,8 @@ end
             in
             let csenv : Mir_lower.func_env =
               {
-                Mir_lower.types =
+                Mir_lower.consts = [];
+    Mir_lower.types =
                   [
                     ("Int", int_ty);
                     ("Unit", Type_repr.Unit);
@@ -3596,7 +3613,8 @@ end
        in
        let qenv2 : Mir_lower.func_env =
          {
-           Mir_lower.types =
+           Mir_lower.consts = [];
+    Mir_lower.types =
              [
                ("Buf", Type_repr.Named (q_tid, [||]));
                ("Int", int_ty);
@@ -3843,7 +3861,8 @@ end
        let va_vec_ty = Type_repr.Named (va_tid, [||]) in
        let va_env : Mir_lower.func_env =
          {
-           Mir_lower.types =
+           Mir_lower.consts = [];
+    Mir_lower.types =
              [
                ("Vec", va_vec_ty);
                ("Array", va_vec_ty);
@@ -4198,7 +4217,8 @@ end
        in
        let sqenv2 : Mir_lower.func_env =
          {
-           Mir_lower.types =
+           Mir_lower.consts = [];
+    Mir_lower.types =
              [
                ("String", string_ty);
                ("Int", int_ty);
@@ -4420,7 +4440,8 @@ end
        in
        let qc_env2 : Mir_lower.func_env =
          {
-           Mir_lower.types =
+           Mir_lower.consts = [];
+    Mir_lower.types =
              [
                ("Color", qc_color_ty);
                ("Option", Type_repr.Named (qc_option_tid, [| Type_repr.Type_param (Ids.Generic_param_id.make 0) |]));
@@ -4628,7 +4649,8 @@ end
        in
        let w_env2 : Mir_lower.func_env =
          {
-           Mir_lower.types =
+           Mir_lower.consts = [];
+    Mir_lower.types =
              [
                ("W", Type_repr.Named (w_tid, [||]));
                ("Int", int_ty);
