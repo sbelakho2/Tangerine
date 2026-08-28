@@ -305,11 +305,15 @@ and check_stmt ctx diags (s : Ast.stmt) =
          position).  Seed lowering DROPS nested items silently
          (lower_stmt: `Ast.Item _ -> ()`): the nested def is never
          registered as a callable, so any call to it fails closed at
-         lowering with "unknown callee".  Reject until nested items
-         reach the MIR program. *)
-      reject diags "E9047"
-        "nested item definitions are not available in the bootstrap subset (seed lowering drops nested items — a nested def is never registered as a callable)"
-        i.Ast.span;
+         lowering with "unknown callee".  A nested USE is an inert
+         import (the E9047 nested-use form is retired); the other
+         nested items stay rejected until they reach the MIR program. *)
+      (match i.Ast.kind with
+       | Ast.UseDecl _ -> ()
+       | _ ->
+           reject diags "E9047"
+             "nested item definitions are not available in the bootstrap subset (seed lowering drops nested items — a nested def is never registered as a callable)"
+             i.Ast.span);
       check_item ctx diags i
 
 and check_type ctx diags allows_impl (t : Ast.type_expr) =
