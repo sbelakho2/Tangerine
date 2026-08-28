@@ -438,6 +438,12 @@ and check_arm_pattern ctx diags (p : Ast.pattern) =
             "non-integer literal match arms are not available in the bootstrap subset (seed lowering builds switch targets for integer/char arms and string-equality chains only)"
             span);
       check_expr ctx diags e
+  | Ast.OrPattern (a, b, _) ->
+      (* or-pattern arms `A | B` dispatch both alternatives to the same
+         arm block (the E9044 or-pattern form is retired); the
+         alternatives must be serveable forms *)
+      check_arm_pattern ctx diags a;
+      check_arm_pattern ctx diags b
   | Ast.StructPattern (_, sfields, _) ->
       (* struct-pattern arms `Variant { f: x, ... }` switch on the tag
          and bind the payload struct fields through the semantic
