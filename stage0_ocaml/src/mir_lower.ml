@@ -1625,6 +1625,11 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
          silent Unit. *)
       seed_bug
         "closure expressions are not lowerable: the seed VM has closure objects (ClosureAgg -> Vm_value.Closure, Tuple [Function; Tuple env]) but no closure-CALL path (Seed_mir.Call dispatches compile-time function instances only, never a runtime closure value); lift the closure to a named function"
+  | Ast.UnsafeBlock (_, b, _) ->
+      (* an unsafe block lowers its body exactly like a plain block
+         (the seed has no separate unsafe model — the block is the
+         lowered body; the E9041 unsafe-block form is retired) *)
+      lower_block env st b
   | other -> seed_bug "unhandled supported expression form: %s" (expr_form_name other)
 
 and int_kind_of (t : Type_repr.t) : Type_repr.int_kind =

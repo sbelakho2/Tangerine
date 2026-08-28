@@ -204,6 +204,14 @@ def range_roundtrip() -> Int
   t
 end
 
+def unsafe_roundtrip() -> Int
+  var x = 0
+  unsafe "plain block" do
+    x = 7
+  end
+  x
+end
+
 enum Node
   Leaf,
   Branch { value: Int, tag: Int }
@@ -256,7 +264,8 @@ def main() -> Int
   let r = struct_arm_roundtrip(Node::Branch { value: 20, tag: 1 })
   let t2 = vec_macro_roundtrip()
   let u = range_roundtrip()
-  a + b + c + d + e + f + g + h + i + j + k + l + m + o + p + q + r + t2 + u
+  let v = unsafe_roundtrip()
+  a + b + c + d + e + f + g + h + i + j + k + l + m + o + p + q + r + t2 + u + v
 end
 |}
 
@@ -1468,9 +1477,9 @@ end
                 match Vm.run_inspect vm2 entry_frame with
                 | Ok ret_val ->
                     Printf.printf "  main returned: %s\n" ret_val;
-                    if ret_val = "347" then Printf.printf "  RESULT: PASS\n"
+                    if ret_val = "354" then Printf.printf "  RESULT: PASS\n"
                     else begin
-                      Printf.printf "  RESULT: FAIL (expected 347)\n";
+                      Printf.printf "  RESULT: FAIL (expected 354)\n";
                       exit 1
                     end
                 | Error m -> Printf.printf "  main returned: <inspect failed: %s>\n" m)));

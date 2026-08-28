@@ -196,13 +196,7 @@ let rejected_specimens : (string * string * string) list =
   a[0]
 end
 |});
-    ("UnsafeBlock", "E9041",
-     {|def f() -> Int
-  unsafe "r" do
-    1
-  end
-end
-|});
+
     ("Range", "E9039",
      {|def f() -> Int
   x..5
@@ -273,6 +267,12 @@ let conditional_accept_specimens : (string * string) list =
   [
     ("Name", {|def f(x: Int) -> Int
   x
+end
+|});
+    ("UnsafeBlock", {|def f() -> Int
+  unsafe "r" do
+    1
+  end
 end
 |});
     (* E9048 retired 2026-08-28: the lowerer's qualified static-call
@@ -573,8 +573,8 @@ let expr_lower_status : (string * lower_status) list =
        sub-form fails closed ("no spread channel") *)
     ("StructLit", Partial);
     ("Block", Lowerable);
-    (* no UnsafeBlock branch — the expression-name diagnostic table *)
-    ("UnsafeBlock", Unlowerable);
+    (* unsafe blocks lower their body like a plain block *)
+    ("UnsafeBlock", Lowerable);
     (* lower_if ignores the if-let pattern entirely *)
     ("If", Partial);
     (* Name callees lower (functions + builtin/user-enum ctors through

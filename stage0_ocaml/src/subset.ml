@@ -513,9 +513,9 @@ and check_expr ctx diags (e : Ast.expr) =
          `unsafe "reason" do ... end`).  The lowerer has no UnsafeBlock
          branch — it falls to "unhandled supported expression form:
          UnsafeBlock"; reject until an unsafe model lands in the seed. *)
-      reject diags "E9041"
-        "unsafe blocks are not available in the bootstrap subset (seed lowering has no UnsafeBlock branch — the seed VM has no unsafe model)"
-        span;
+      (* unsafe blocks lower their body like a plain block (the E9041
+         form is retired — the seed has no separate unsafe model) *)
+      ignore span;
       check_block ctx diags b
   | Ast.IfExpr i ->
       (* AST form: Ast.IfExpr with if_let_pattern/if_let_value (parser
