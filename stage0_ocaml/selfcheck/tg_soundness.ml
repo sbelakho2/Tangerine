@@ -74,8 +74,42 @@ def f() -> Int
 end
 |}
   in
-  if ok1 && ok2 && ok3 && ok4 then begin
-    Printf.printf "SOUNDNESS = ALL PASS (4 negative proofs)\n";
+  (* re-audit P0 (the swallowed call-return failures): a normal-call
+     tail whose resolved return type fails the expected-type
+     reconciliation MUST be rejected — previously `ignore
+     (same_named_ret ret exp)` discarded the fallback failure *)
+  let ok5 =
+    check_src "free-call-return-mismatch" {|
+def gives_string() -> String
+  "s"
+end
+
+def wants_int() -> Int
+  gives_string()
+end
+|}
+  in
+  (* the method-call equivalent: previously `match unify ... with
+     | Ok () -> () | Error _ -> ()` swallowed the method return *)
+  let ok6 =
+    check_src "method-return-mismatch" {|
+enum E
+  A(Int)
+end
+
+impl E
+  def get(self: Self) -> String
+    "s"
+  end
+end
+
+def wants_int(e: E) -> Int
+  e.get()
+end
+|}
+  in
+  if ok1 && ok2 && ok3 && ok4 && ok5 && ok6 then begin
+    Printf.printf "SOUNDNESS = ALL PASS (6 negative proofs)\n";
     exit 0
   end
   else begin

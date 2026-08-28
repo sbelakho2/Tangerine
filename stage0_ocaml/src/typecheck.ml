@@ -2250,6 +2250,66 @@ and resolve_nominal (env : env) (span : Span.span) (name : string) :
    The expression checker. `check_expr` records every accepted node on
    the oracle channel; `check_expr_inner` is the rule engine. *)
 
+(* ── unify_expected: the ONE sanctioned expected-type reconciliation ──
+   Every expression rule with an enclosing expected type calls this API:
+   ordinary unification first, then the sanctioned nominal/alias
+   reconciliation (the kernel's Vec/Array container aliasing).  It
+   returns the solved substitution or an ERROR — no caller may discard
+   the result.  The invariant: a failed semantic unify can never
+   disappear (re-audit P0: swallowed call-return type failures). *)
+and unify_expected (env : env) (actual : Type_repr.t) (expected : Type_repr.t)
+    (context : string) : ((Type_repr.generic_key * Type_repr.t) list, string) result =
+  let s = ref [] in
+  let merge dst src =
+    List.iter
+      (fun (k, v) -> if not (List.mem_assoc k !dst) then dst := (k, v) :: !dst)
+      !src
+  in
+  let rec same_named a b =
+    match a, b with
+    | Type_repr.Named (id1, a1), Type_repr.Named (id2, a2)
+      when Ids.Type_id.compare id1 id2 <> 0 -> (
+        let n1 = List.assoc_opt id1 env.type_names in
+        let n2 = List.assoc_opt id2 env.type_names in
+        let alias_pair =
+          match n1, n2 with
+          | Some n, Some m ->
+              (n = "Vec" && m = "Array") || (n = "Array" && m = "Vec") || n = m
+          | _ -> false
+        in
+        if not alias_pair || Array.length a1 <> Array.length a2 then None
+        else begin
+          let s4 = ref [] in
+          let rec go i =
+            if i >= Array.length a1 then Some ()
+            else
+              match same_named a1.(i) a2.(i) with
+              | Some () -> go (i + 1)
+              | None -> None
+          in
+          match go 0 with
+          | Some () ->
+              merge s s4;
+              Some ()
+          | None -> None
+        end)
+    | _ -> (
+        let s5 = ref [] in
+        match unify env.state.box_tid s5 a b with
+        | Ok () ->
+            merge s s5;
+            Some ()
+        | Error _ -> None)
+  in
+  match unify env.state.box_tid s actual expected with
+  | Ok () -> Ok !s
+  | Error _ -> (
+      match same_named actual expected with
+      | Some () -> Ok !s
+      | None ->
+          Error
+            (Printf.sprintf "%s: type mismatch: expected %s, found %s" context
+               (type_to_string expected) (type_to_string actual)))
 and check_expr (env : env) (scope : scope) (expected : Type_repr.t option) (e : Ast.expr) :
     (typed_expr, string) result =
   match check_expr_inner env scope expected e with
@@ -4218,63 +4278,26 @@ and check_call_sig (env : env) (scope : scope) (expected : Type_repr.t option)
            (Printf.sprintf "too few arguments for `%s`: expected %d, got %d" sig_.ts_name
               (Array.length sig_.ts_params) (List.length tes)))
     else begin
-      (* return type: unify with the expected type to drive inference *)
-      let s3 = ref [] in
-      (match expected with
-       | Some exp -> (
-           match unify env.state.box_tid s3 (substitute_fixpoint !subst sig_.ts_return) exp with
-           | Ok () -> ()
-           | Error _ -> (
-               (* nominal/alias fallback: `Vec` and the kernel's `Array` are
-                  the same container; unify the type arguments by name *)
-               let ret = substitute_fixpoint !subst sig_.ts_return in
-               let rec same_named_ret a b =
-                 match a, b with
-                 | Type_repr.Named (id1, a1), Type_repr.Named (id2, a2)
-                   when Ids.Type_id.compare id1 id2 <> 0 -> (
-                     let n1 = List.assoc_opt id1 env.type_names in
-                     let n2 = List.assoc_opt id2 env.type_names in
-                     let alias_pair =
-                       match n1, n2 with
-                       | Some n, Some m ->
-                           (n = "Vec" && m = "Array") || (n = "Array" && m = "Vec")
-                           || n = m
-                       | _ -> false
-                     in
-                     if not alias_pair || Array.length a1 <> Array.length a2 then None
-                     else begin
-                       let s4 = ref [] in
-                       let rec go i =
-                         if i >= Array.length a1 then Some ()
-                         else
-                           match same_named_ret a1.(i) a2.(i) with
-                           | Some () -> go (i + 1)
-                           | None -> None
-                       in
-                       match go 0 with
-                       | Some () ->
-                           List.iter
-                             (fun (k, v) ->
-                               if not (List.mem_assoc k !s3) then s3 := (k, v) :: !s3)
-                             !s4;
-                           Some ()
-                       | None -> None
-                     end)
-                 | _ -> (
-                     let s5 = ref [] in
-                     match unify env.state.box_tid s5 a b with
-                     | Ok () ->
-                         List.iter
-                           (fun (k, v) -> if not (List.mem_assoc k !s3) then s3 := (k, v) :: !s3)
-                           !s5;
-                         Some ()
-                     | Error _ -> None)
-               in
-               ignore (same_named_ret ret exp)))
-       | None -> ());
-      List.iter
-        (fun (k, v) -> if not (List.mem_assoc k !subst) then subst := (k, v) :: !subst)
-        !s3;
+      (* return type: reconcile with the expected type to drive
+         inference — the ONE sanctioned path (unify_expected), and a
+         failed reconciliation is a hard error: no swallowed semantic
+         unify (re-audit P0: swallowed call-return type failures) *)
+      let ret_reconciled =
+        match expected with
+        | Some exp -> (
+            match
+              unify_expected env (substitute_fixpoint !subst sig_.ts_return) exp
+                (Printf.sprintf "call `%s` return type" sig_.ts_name)
+            with
+            | Ok solved ->
+                List.iter
+                  (fun (k, v) -> if not (List.mem_assoc k !subst) then subst := (k, v) :: !subst)
+                  solved;
+                Ok ()
+            | Error m -> Error m)
+        | None -> Ok ()
+      in
+      let* () = ret_reconciled in
       let ret = substitute_fixpoint !subst sig_.ts_return in
       (* Residual inference variables: with pre-instantiation every
          signature param already carries a fresh Infer_var; the vars that
@@ -4720,16 +4743,26 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
                      (Printf.sprintf "too few arguments for method `%s`: expected %d, got %d" mname
                         n_req (List.length tes)))
               else begin
-                let s3 = ref [] in
-                (match expected with
-                 | Some exp -> (
-                     match unify env.state.box_tid s3 (substitute_fixpoint !subst sig_.ts_return) exp with
-                     | Ok () -> ()
-                     | Error _ -> ())
-                 | None -> ());
-                List.iter
-                  (fun (k, v) -> if not (List.mem_assoc k !subst) then subst := (k, v) :: !subst)
-                  !s3;
+                (* return type: reconcile with the expected type — the
+                   ONE sanctioned path; a failed reconciliation is a
+                   hard error (no swallowed method-return unify) *)
+                let ret_reconciled =
+                  match expected with
+                  | Some exp -> (
+                      match
+                        unify_expected env (substitute_fixpoint !subst sig_.ts_return) exp
+                          (Printf.sprintf "method `%s` return type" mname)
+                      with
+                      | Ok solved ->
+                          List.iter
+                            (fun (k, v) ->
+                              if not (List.mem_assoc k !subst) then subst := (k, v) :: !subst)
+                            solved;
+                          Ok ()
+                      | Error m -> Error m)
+                  | None -> Ok ()
+                in
+                let* () = ret_reconciled in
                 let ret = substitute_fixpoint !subst sig_.ts_return in
                 let sig_ids = List.map snd sig_.ts_params_decl in
                 (* a param the RECEIVER itself carries (an impl method

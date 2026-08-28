@@ -1179,6 +1179,27 @@ let print_subset_firewall (r : subset_result) : unit =
    and the pending unresolved declaration set (the per-module error
    reports).  Fully deterministic: every component is sorted before
    serialization, and the canonical string is hashed with Digest. *)
+(* error-message normalization: the fresh infer-var ids (?#N) inside
+   error strings are per-round artifacts (the var counter grows across
+   retries), so the fingerprint must not see them as semantic change *)
+let normalize_fp_err (e : string) : string =
+  let b = Buffer.create (String.length e) in
+  let n = String.length e in
+  let i = ref 0 in
+  while !i < n do
+    if !i + 2 <= n && String.sub e !i 2 = "?#" then begin
+      Buffer.add_string b "?#V";
+      let j = ref (!i + 2) in
+      while !j < n && e.[!j] >= '0' && e.[!j] <= '9' do incr j done;
+      i := !j
+    end
+    else begin
+      Buffer.add_char b e.[!i];
+      incr i
+    end
+  done;
+  Buffer.contents b
+
 let decl_fingerprint (env : Typecheck.env) (errs_by_mod : (string, string list) Hashtbl.t) : string =
   let buf = Buffer.create 4096 in
   List.iter
@@ -1214,7 +1235,9 @@ let decl_fingerprint (env : Typecheck.env) (errs_by_mod : (string, string list) 
   List.iter
     (fun (k, errs) ->
       Buffer.add_string buf
-        (Printf.sprintf "E %s [%s]\n" k (String.concat ";" (List.sort compare errs))))
+        (Printf.sprintf "E %s [%s]\n" k
+           (String.concat ";"
+              (List.sort compare (List.map normalize_fp_err errs)))))
     (List.sort compare (Hashtbl.fold (fun k errs acc -> (k, errs) :: acc) errs_by_mod []));
   Digest.to_hex (Digest.string (Buffer.contents buf))
 
@@ -1365,19 +1388,24 @@ let run_closure_pipeline_impl ~(repo_root : string) ~(manifest_path : string)
              (registered definition identities + resolved declaration
              identities + the pending unresolved set) — NOT the
              per-module error count; capped at 8 rounds *)
-          let rec fixpoint env =
+          (* re-audit P1 clean fixpoint: `round(env, n)` carries whether
+             the LAST attempted transition changed the environment — the
+             cap check is `n == MAX` after a CHANGED transition, never a
+             post-hoc inference comparing the final state against the
+             root *)
+          let rec fixpoint env n =
             incr decl_rounds;
             let before = decl_fingerprint env errs_by_mod in
             let env' = decl_pass env nodes in
             let after = decl_fingerprint env' errs_by_mod in
-            if after <> before && !decl_rounds < 8 then fixpoint env' else env'
+            if after = before then (env', true)
+            else if n >= 8 then (env', false)
+            else fixpoint env' (n + 1)
           in
-          let env_final = fixpoint !env in
-          if !decl_rounds >= 8
-             && decl_fingerprint env_final errs_by_mod <> decl_fingerprint !env errs_by_mod
-          then
+          let env_final, converged = fixpoint !env 1 in
+          if not converged then
             failwith
-              "declaration fixpoint did NOT converge within the 8-round cap — the semantic                fingerprint is still changing (re-audit P1: changed-at-max is a non-convergence                error, never an accept)";
+              "declaration fixpoint did NOT converge within the 8-round cap — the semantic fingerprint is still changing at the cap boundary (re-audit P1: changed-at-max is a non-convergence error, never an accept)";
           env_final
         in
         Printf.printf
