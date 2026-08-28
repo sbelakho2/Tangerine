@@ -172,6 +172,23 @@ type state = {
      the last emitted block so the printer only fires on change *)
   mutable debt_by_module : (string * Debt_report.t) list;
   mutable debt_last_printed : string;
+  (* structured per-diagnostic records (audit P0 fix): one record per
+     typecheck diagnostic of the FINAL body pass (the exact set that
+     record_module_debt accounts), carrying the module key, item, the
+     secondary flag, the raw message and the ORIGINAL span — serialized
+     directly from the checker's own data, never re-parsed from rendered
+     text.  Reversed (append order); consumers reverse. *)
+  mutable structured_diags : structured_diag list;
+}
+
+(* The audit's structured diagnostic record: the exact fields the
+   evidence JSONL persists (module, item, is_secondary, message, span). *)
+and structured_diag = {
+  sd_module : string;
+  sd_item : string;
+  sd_secondary : bool;
+  sd_message : string;
+  sd_span : Span.span option;
 }
 
 type env = {
@@ -226,8 +243,17 @@ let assoc_local (name : string) (locals : (string * Type_repr.t * bool) list) :
 let ( let* ) (r : ('a, string) result) (f : 'a -> ('b, string) result) : ('b, string) result =
   match r with Ok x -> f x | Error m -> Error m
 
+(* Structured-diagnostic journal (audit P0 fix): every `err` call records
+   the exact (span, raw message) pair keyed by the FORMATTED string, so
+   the item-boundary sites can attach the ORIGINAL Span.span and the
+   un-suffixed message to each diagnostic WITHOUT re-parsing formatted
+   text.  The journal is cleared per compilation (initial_env). *)
+let err_span_journal : (string, Span.span * string) Hashtbl.t = Hashtbl.create 4096
+
 let err (span : Span.span) (msg : string) : string =
-  Printf.sprintf "%s at file#%d[%d..%d)" msg span.Span.file_id span.Span.start span.Span.end_
+  let formatted = Printf.sprintf "%s at file#%d[%d..%d)" msg span.Span.file_id span.Span.start span.Span.end_ in
+  Hashtbl.replace err_span_journal formatted (span, msg);
+  formatted
 
 let fail span msg = Error (err span msg)
 
@@ -847,6 +873,7 @@ let builtin_constructors (st : state) (opt_p : Ids.Generic_param_id.t)
 (* The initial env: the compiler-registered prelude. *)
 let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
   var_journal := [];
+  Hashtbl.reset err_span_journal;
   let st =
     {
       next_type_id = 100;
@@ -885,6 +912,7 @@ let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
       debt_by_module = [];
       debt_last_printed =
         Debt_report.empty |> Debt_report.to_lines |> String.concat "\n";
+      structured_diags = [];
     }
   in
   let types = builtin_types st in
@@ -5980,6 +6008,27 @@ and check_bodies (env : env) (program : Ast.program) : (env * string list, strin
   in
   let shape_items = List.filter is_shape program.Ast.items in
   let body_items = List.filter (fun i -> not (is_shape i)) program.Ast.items in
+  (* Structured diagnostic channel (audit P0 fix): one record per error of
+     the FINAL body pass, exactly the set record_module_debt accounts (so
+     the JSONL length equals debt_total BY CONSTRUCTION).  The span and
+     the raw message come from the err_span_journal (the exact pair the
+     `err` call recorded — no text parsing); oracle findings and the
+     impl backstop have no span and are recorded as-is. *)
+  let mod_key = String.concat "::" program.Ast.prog_module_path in
+  let record_diag (item : string) (secondary : bool) (m : string) : unit =
+    let message, span =
+      match Hashtbl.find_opt err_span_journal m with
+      | Some (span, raw) -> (raw, Some span)
+      | None -> (m, None)
+    in
+    env.state.structured_diags <-
+      { sd_module = mod_key;
+        sd_item = item;
+        sd_secondary = secondary;
+        sd_message = message;
+        sd_span = span }
+      :: env.state.structured_diags
+  in
   let rec go (errors : string list) = function
     | [] -> Ok (env, List.rev errors)
     | item :: rest -> (
@@ -5990,13 +6039,17 @@ and check_bodies (env : env) (program : Ast.program) : (env * string list, strin
         let secondary = List.mem name env.state.failed_items in
         let tag m = if secondary then "[secondary] " ^ m else m in
         match check_item env item with
-        | Error m -> go (tag (name ^ ": " ^ m) :: errors) rest
+        | Error m ->
+            record_diag name secondary m;
+            go (tag (name ^ ": " ^ m) :: errors) rest
         | Ok () ->
             let findings = run_oracle env name in
+            List.iter (fun f -> record_diag name secondary f) findings;
             go (List.map (fun f -> tag (name ^ ": " ^ f)) findings @ errors) rest)
   in
   let* final_env, errors = go [] (shape_items @ body_items) in
   let backstop = run_impl_backstop final_env in
+  List.iter (fun b -> record_diag "" false b) backstop;
   let all_errors = errors @ backstop in
   record_module_debt final_env program all_errors;
   Ok (final_env, all_errors)

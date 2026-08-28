@@ -43,14 +43,34 @@
 #     evidence              the deterministic tg_evidence phase lines
 #                           (incl. declaration_fixpoint_iterations /
 #                           body_passes, parsed into bootstrap_check)
-#     diagnostics           ocaml-diagnostics.jsonl next to the record
-#                           (re-audit finding 6): one JSON line per
-#                           bootstrap-check diagnostic — module, item,
-#                           category, message, span-file, span-start/end,
-#                           secondary flag — lines sorted
-#                           lexicographically; diagnostics.sha256 is the
-#                           sha256 over the sorted lines (deterministic),
-#                           diagnostics.count the number of lines
+#     diagnostics           the structured per-diagnostic records (audit
+#                           P0 fix): one JSON object per typecheck
+#                           diagnostic, serialized DIRECTLY by the driver
+#                           from the checker's structured channel (never
+#                           scraped from rendered stdout — the old regex
+#                           dropped every span-less diagnostic).  Each
+#                           record carries module, item, is_secondary,
+#                           message, the original span {file,start,end}
+#                           (null when the diagnostic has none) and the
+#                           stable debt category.  diagnostics_artifact
+#                           carries the .diagnostics.jsonl file name, the
+#                           count and the sha256 over the sorted lines
+#                           (deterministic).  ENFORCED: len(diagnostics)
+#                           == debt_total, primary == debt_primary,
+#                           secondary == debt_secondary — a mismatch
+#                           FAILS the script before any record is written
+#     subset                the executable-subset firewall facts:
+#                           total_findings, counts_by_code, and
+#                           modules_with_findings (EVIDENCE_SUBSET* lines
+#                           from the bootstrap-check output)
+#     strict_resolution     the strict-mode audit: its diagnostics and
+#                           compatibility_fallback_activations
+#                           (EVIDENCE_STRICT* lines)
+#     mir                   template_verify / concrete_verify verdicts
+#                           (EVIDENCE_MIR line)
+#     host                  the reachable-host closure verdict and
+#                           declared/implemented counts (EVIDENCE_HOST
+#                           line)
 #     recorded_at_unix/iso  when the record was captured
 #
 #   The record IS the CI artifact for the TESTED PARENT — the SHA it
@@ -169,9 +189,11 @@ printf '%s\n' "$EVIDENCE_OUT" | grep '^evidence ' > "$WORK_DIR/evidence_lines" |
 
 # The bootstrap-check gate output (the gate may FAIL — the record keeps
 # the verdicts; a nonzero exit is expected while the typecheck gate
-# fails and must not abort the record).
+# fails and must not abort the record).  The driver ALSO writes the
+# structured per-diagnostic JSONL (audit P0 fix): the evidence consumes
+# that file directly instead of scraping rendered stdout.
 set +e
-BC_OUT="$(timeout 300 "$TG_BIN" bootstrap-check --repo-root "$ROOT_DIR" 2>&1)"
+BC_OUT="$(timeout 300 "$TG_BIN" bootstrap-check --repo-root "$ROOT_DIR" --diagnostics-jsonl "$WORK_DIR/diagnostics.jsonl" 2>&1)"
 BC_RC=$?
 set -e
 printf '%s\n' "$BC_OUT" > "$WORK_DIR/bc_out"
@@ -265,102 +287,25 @@ typecheck_m = list(re.finditer(
     r"typecheck: (\d+) modules, (\d+) items, (\d+) errors \((\d+) rounds\)", bc_out))
 typecheck_groups = typecheck_m[-1].groups() if typecheck_m else ("", "", "", "")
 
-# ocaml-diagnostics.jsonl (re-audit finding 6): every per-item
-# bootstrap-check line — "<module>: [secondary] <item>: <message> at
-# file#<id>[<start>..<end>)" (the driver emits the "[secondary] "
-# prefix before the item name) — becomes one JSON line with module,
-# item, category (Debt_report.classify ported 1:1 from
-# src/debt_report.ml, in pattern order), the full message, the span
-# file id and byte offsets, and the secondary flag.  Lines are written
-# lexicographically sorted so the content is canonical; the hash is
-# sha256 over exactly those sorted lines (deterministic).
-DEBT_PATTERNS = [
-    ("cannot infer", "cannot_infer_generic"),
-    ("Type_param(s) in concrete execution position", "cannot_infer_generic"),
-    ("unsolved type variable", "cannot_infer_generic"),
-    ("type parameters do not take arguments", "cannot_infer_generic"),
-    ("too many type arguments", "cannot_infer_generic"),
-    ("type parameter `", "cannot_infer_generic"),
-    ("unknown type `", "unresolved_type"),
-    ("unknown nominal type `", "unresolved_type"),
-    ("unknown trait `", "unresolved_type"),
-    ("unknown field `", "unresolved_type"),
-    ("unknown variant `", "unresolved_type"),
-    ("unknown identity", "unresolved_type"),
-    ("Self is only available", "unresolved_type"),
-    ("does not take arguments", "unresolved_type"),
-    ("associated type `", "unresolved_type"),
-    ("trait-object types", "unresolved_type"),
-    ("FieldId", "unresolved_type"),
-    ("VariantId", "unresolved_type"),
-    ("unknown function `", "unresolved_callable"),
-    ("unknown name `", "unresolved_callable"),
-    ("unknown variable `", "unresolved_callable"),
-    ("has no method `", "unresolved_callable"),
-    ("cannot call a value of type ", "unresolved_callable"),
-    ("too many arguments", "unresolved_callable"),
-    ("too few arguments", "unresolved_callable"),
-    ("is a function; call it with arguments", "unresolved_callable"),
-    ("DefId", "unresolved_callable"),
-    ("unresolved call", "unresolved_callable"),
-    ("missing argument access effects", "unresolved_callable"),
-    ("not a module", "unresolved_module"),
-    ("type mismatch", "type_mismatch"),
-    ("cannot cast ", "type_mismatch"),
-    ("cannot index ", "type_mismatch"),
-    ("cannot iterate ", "type_mismatch"),
-    ("cannot dereference ", "type_mismatch"),
-    ("cannot project ", "type_mismatch"),
-    ("operator requires matching numeric operands", "type_mismatch"),
-    ("bitwise operator requires integer operands", "type_mismatch"),
-    ("unary minus requires a number", "type_mismatch"),
-    ("requires Bool", "type_mismatch"),
-    ("requires an integer", "type_mismatch"),
-    ("requires an Option or Result", "type_mismatch"),
-    ("tuple pattern requires a tuple type", "type_mismatch"),
-    ("tuple pattern arity mismatch", "type_mismatch"),
-    ("tuple index ", "type_mismatch"),
-    ("or-pattern alternatives bind different types", "type_mismatch"),
-    ("range pattern ", "type_mismatch"),
-    ("is not a struct", "type_mismatch"),
-    ("is not an enum", "type_mismatch"),
-    ("is not a nominal type", "type_mismatch"),
-    ("type argument(s)", "type_mismatch"),
-    (" field(s)", "type_mismatch"),
-    ("incompatible with the expected function type", "type_mismatch"),
-    ("recursive type", "type_mismatch"),
-    ("unsatisfied", "obligation"),
-    ("obligation", "obligation"),
-    ("trait contract", "obligation"),
-    ("duplicate ", "duplicate_decl"),
-]
-
-
-def classify(message):
-    for sub, cat in DEBT_PATTERNS:
-        if sub in message:
-            return cat
-    return "other"
-
-
-DIAG_RE = re.compile(
-    r"^(.+?): (\[secondary\] )?(.+?): (.+) at file#(\d+)\[(\d+)\.\.(\d+)\)$")
+# Structured per-diagnostic records (audit P0 fix): the driver serializes
+# one JSON object per typecheck diagnostic DIRECTLY from the checker's
+# structured channel (module, item, is_secondary, message, span
+# {file,start,end} — null when the diagnostic has none, category).  The
+# records are consumed from the driver's JSONL file — the lossy
+# stdout-scraping regex is gone, and the debt enforcement below makes a
+# truncated artifact impossible to record.
+DIAG_PATH = os.path.join(work_dir, "diagnostics.jsonl")
+if not os.path.exists(DIAG_PATH):
+    sys.stderr.write(
+        "ocaml_seed_evidence: FAIL — bootstrap-check produced no structured "
+        "diagnostics JSONL at %s; cannot build the evidence record\n" % DIAG_PATH)
+    sys.exit(1)
 diagnostics = []
-for raw in bc_out.splitlines():
-    m = DIAG_RE.match(raw.strip())
-    if not m:
-        continue
-    module, sec, item, message, fid, start, end = m.groups()
-    diagnostics.append({
-        "module": module,
-        "item": item,
-        "category": classify(message),
-        "message": message,
-        "span_file": int(fid),
-        "span_start": int(start),
-        "span_end": int(end),
-        "secondary": sec is not None,
-    })
+with open(DIAG_PATH) as f:
+    for line in f:
+        line = line.strip()
+        if line:
+            diagnostics.append(json.loads(line))
 diagnostics.sort(
     key=lambda d: json.dumps(d, sort_keys=True, separators=(",", ":")))
 diag_content = "\n".join(
@@ -372,8 +317,92 @@ diag_path = record_file[:-5] + ".diagnostics.jsonl"
 with open(diag_path, "w") as f:
     f.write(diag_content)
 
+diag_count = len(diagnostics)
+primary_count = sum(1 for d in diagnostics if not d["is_secondary"])
+secondary_count = sum(1 for d in diagnostics if d["is_secondary"])
+
+# ENFORCE (audit P0 fix): the evidence record is valid only when the
+# structured diagnostics EXACTLY reproduce the gate's own debt report.
+# Any mismatch fails the script before the record is written — an
+# internally incomplete artifact is never recorded.
+def enforce(label, actual, expected):
+    if actual != expected:
+        sys.stderr.write(
+            "ocaml_seed_evidence: FAIL — %s mismatch: diagnostics JSONL has %d, "
+            "bootstrap-check reports debt %d; the evidence record is NOT written\n"
+            % (label, actual, expected))
+        sys.exit(1)
+
+enforce("diagnostics count", diag_count, last_total)
+enforce("primary count", primary_count, last_primary)
+enforce("secondary count", secondary_count, last_secondary)
+
+# Subset / strict-resolution / mir / host facts (audit P0 fix): read
+# from the driver's EVIDENCE_* lines (values are JSON-escaped).
+SUBSET_RE = re.compile(
+    r"^EVIDENCE_SUBSET total_findings=(\d+) accepted=(\d+) rejected=(\d+) modules=(\d+)$")
+SUBSET_COUNT_RE = re.compile(r"^EVIDENCE_SUBSET_COUNT code=(\S+) count=(\d+)$")
+SUBSET_MODULE_RE = re.compile(r"^EVIDENCE_SUBSET_MODULE module=(.+) findings=(\d+)$")
+STRICT_RE = re.compile(
+    r"^EVIDENCE_STRICT diagnostics=(\d+) compatibility_fallback_activations=(\d+)$")
+STRICT_DIAG_RE = re.compile(r"^EVIDENCE_STRICT_DIAG code=(.+) message=(.+) span=(\S+)$")
+MIR_RE = re.compile(r"^EVIDENCE_MIR template_verify=(\S+) concrete_verify=(\S+)$")
+HOST_RE = re.compile(
+    r"^EVIDENCE_HOST reachable_closure=(\S+)(?: reachable=(\d+) declared=(\d+) implemented=(\d+))?$")
+
+
+def unescape_json_str(v):
+    return json.loads('"' + v + '"')
+
+
+subset = {"total_findings": None, "counts_by_code": {}, "modules_with_findings": {}}
+strict_resolution = {"diagnostics": [], "compatibility_fallback_activations": None}
+mir = {"template_verify": None, "concrete_verify": None}
+host = {"reachable_closure": None, "reachable": None, "declared": None, "implemented": None}
+for line in bc_out.splitlines():
+    m = SUBSET_RE.match(line)
+    if m:
+        subset["total_findings"] = int(m.group(1))
+        subset["accepted"] = int(m.group(2))
+        subset["rejected"] = int(m.group(3))
+        continue
+    m = SUBSET_COUNT_RE.match(line)
+    if m:
+        subset["counts_by_code"][unescape_json_str(m.group(1))] = int(m.group(2))
+        continue
+    m = SUBSET_MODULE_RE.match(line)
+    if m:
+        subset["modules_with_findings"][unescape_json_str(m.group(1))] = int(m.group(2))
+        continue
+    m = STRICT_RE.match(line)
+    if m:
+        strict_resolution["diagnostics"] = []
+        strict_resolution["compatibility_fallback_activations"] = int(m.group(2))
+        continue
+    m = STRICT_DIAG_RE.match(line)
+    if m:
+        fid, start, end = (int(x) for x in m.group(3).split(":"))
+        strict_resolution["diagnostics"].append({
+            "code": unescape_json_str(m.group(1)),
+            "message": unescape_json_str(m.group(2)),
+            "span": {"file": fid, "start": start, "end": end},
+        })
+        continue
+    m = MIR_RE.match(line)
+    if m:
+        mir["template_verify"] = m.group(1)
+        mir["concrete_verify"] = m.group(2)
+        continue
+    m = HOST_RE.match(line)
+    if m:
+        host["reachable_closure"] = m.group(1)
+        if m.group(2) is not None:
+            host["reachable"] = int(m.group(2))
+            host["declared"] = int(m.group(3))
+            host["implemented"] = int(m.group(4))
+
 record = {
-    "schema_version": 3,
+    "schema_version": 4,
     "git_commit": rd("git_commit"),
     "git_short_sha": rd("git_short"),
     "git_dirty": rd("git_dirty") == "true",
@@ -414,11 +443,18 @@ record = {
     "evidence": [
         l for l in rd("evidence_lines").splitlines() if l.startswith("evidence ")
     ],
-    "diagnostics": {
+    "diagnostics": diagnostics,
+    "diagnostics_artifact": {
         "artifact": os.path.basename(diag_path),
-        "count": len(diagnostics),
+        "count": diag_count,
+        "primary": primary_count,
+        "secondary": secondary_count,
         "sha256": diag_sha,
     },
+    "subset": subset,
+    "strict_resolution": strict_resolution,
+    "mir": mir,
+    "host": host,
     "recorded_at_unix": rd_int("record_time"),
     "record_file": os.path.basename(record_file),
 }
@@ -456,6 +492,11 @@ required_fields = [
     "tests",
     "selfchecks",
     "bootstrap_check",
+    "diagnostics_artifact",
+    "subset",
+    "strict_resolution",
+    "mir",
+    "host",
 ]
 
 
@@ -487,5 +528,8 @@ PYEOF
 # (f) Print the record.
 python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1])), indent=2))' "$RECORD_FILE"
 printf '\nrecord: %s — evidence for TESTED PARENT %s (the clean tree that was built and tested); the commit containing this record is a NEW SHA and was NOT what was tested\n' "$RECORD_FILE" "$GIT_COMMIT"
-printf 'diagnostics artifact: %s (sha256 %s)\n' "$DIAG_FILE" \
-  "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["diagnostics"]["sha256"])' "$RECORD_FILE")"
+printf 'diagnostics artifact: %s (%d diagnostics: %d primary, %d secondary; sha256 %s)\n' "$DIAG_FILE" \
+  "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["diagnostics_artifact"]["count"])' "$RECORD_FILE")" \
+  "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["diagnostics_artifact"]["primary"])' "$RECORD_FILE")" \
+  "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["diagnostics_artifact"]["secondary"])' "$RECORD_FILE")" \
+  "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["diagnostics_artifact"]["sha256"])' "$RECORD_FILE")"

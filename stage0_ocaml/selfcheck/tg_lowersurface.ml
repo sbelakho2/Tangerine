@@ -2560,6 +2560,7 @@ end
           ctx_decl_rounds = 0;
           ctx_subset = Driver.subset_firewall_of_graph ngraph;
           ctx_strict_fallbacks = 0;
+          ctx_strict_diags = [];
           lowered_methods = 0;
         }
       in
@@ -3567,10 +3568,11 @@ end
            ctx_items = List.length ncprog_ast.Ast.items;
            ctx_typed_calls_sample = 0;
            ctx_decl_rounds = 0;
-           ctx_subset = Driver.subset_firewall_of_graph ncgraph;
-           ctx_strict_fallbacks = 0;
-           lowered_methods = 0;
-         }
+            ctx_subset = Driver.subset_firewall_of_graph ncgraph;
+            ctx_strict_fallbacks = 0;
+            ctx_strict_diags = [];
+            lowered_methods = 0;
+          }
        in
        let noc_prog = Driver.lower_closure ncctx in
        (match Mir_verify.require_valid_concrete noc_prog with

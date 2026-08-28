@@ -348,6 +348,15 @@ end
   }
 end
 |});
+    (* E9049 retired for the vec!/debug_assert! forms (2026-08-28 — the
+       array-aggregate and condition-check lowering branches landed in
+       mir_lower); the vec! accept-path specimen is the former E9049
+       rejection specimen, now a positive subset accept *)
+    ("MacroCall", {|def f() -> Int
+  let a = vec![1, 2, 3]
+  a[1]
+end
+|});
     ("Assign", {|def f() -> Int
   var x = 1
   x = 2
@@ -587,7 +596,7 @@ let expr_lower_status : (string * lower_status) list =
        unresolved receivers fail closed *)
     ("Call", Partial);
     ("Index", Lowerable);
-    (* no Range branch — the expression-name diagnostic table *)
+    (* `a..b` counts with <, `a..=b` with <= — the counter-loop branch *)
     ("Range", Lowerable);
     (* variant arms (builtin table only), integer-literal arms and
        wildcard arms lower; guards, bindings, tuple/struct/or/range and
@@ -612,8 +621,10 @@ let expr_lower_status : (string * lower_status) list =
     ("Field", Lowerable);
     ("Binary", Lowerable);
     ("Await", Unlowerable);
-    (* no MacroCall branch — the expression-name diagnostic table *)
-    ("MacroCall", Unlowerable);
+    (* `vec![...]` lowers to the array aggregate and `debug_assert!(...)`
+       evaluates the condition (the E9049 forms are retired); every
+       other macro fails closed *)
+    ("MacroCall", Partial);
     (* Name/Field/Index targets lower through the typed-place writeback
        rule (2026-08-28: the Assign branch resolves the field through
        the typed nominal registry and emits the constant/dynamic index

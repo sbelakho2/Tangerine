@@ -598,11 +598,10 @@ and check_expr ctx diags (e : Ast.expr) =
   | Ast.Block (b, _) -> check_block ctx diags b
   | Ast.UnsafeBlock (_, b, span) ->
       (* AST form: Ast.UnsafeBlock (reason, body, span) (parser
-         `unsafe "reason" do ... end`).  The lowerer has no UnsafeBlock
-         branch — it falls to "unhandled supported expression form:
-         UnsafeBlock"; reject until an unsafe model lands in the seed. *)
-      (* unsafe blocks lower their body like a plain block (the E9041
-         form is retired — the seed has no separate unsafe model) *)
+         `unsafe "reason" do ... end`).  Unsafe blocks lower their body
+         exactly like a plain block (the E9041 unsafe-block form is
+         retired — the seed has no separate unsafe model); the body gets
+         the same block check. *)
       ignore span;
       check_block ctx diags b
   | Ast.IfExpr i ->
@@ -643,9 +642,9 @@ and check_expr ctx diags (e : Ast.expr) =
       check_expr ctx diags i
   | Ast.Range (start, end_, _, span) ->
       (* AST form: Ast.Range (start, end, inclusive, span) (parser
-         `a..b` / `a..=b`).  Ranges `a..b` lower to the counter loop
-         (the E9039 range form is retired); the exclusive `..=` form
-         stays rejected. *)
+         `a..b` / `a..=b`).  Ranges lower to the counter loop — `a..b`
+         counts with < and `a..=b` with <= (the E9039 range form is
+         retired); both ends are checked like any expression. *)
       ignore span;
       check_expr ctx diags start;
       check_expr ctx diags end_
@@ -859,7 +858,10 @@ let expr_form_status : (string * form_status) list =
        (tg_lowersurface's struct-lit + fail-closed proofs) *)
     ("StructLit", Accepted);
     ("Block", Accepted);
-    ("UnsafeBlock", Rejected "E9041");
+    (* unsafe blocks lower their body exactly like a plain block (the
+       E9041 unsafe-block form is retired — the seed has no separate
+       unsafe model) *)
+    ("UnsafeBlock", Accepted);
     ("If", Conditional [ "E9046" ]);
     (* Name callees (functions + builtin/user-enum ctors via the
        variant table), Field callees (method calls through the
@@ -869,8 +871,15 @@ let expr_form_status : (string * form_status) list =
        fail closed at lowering *)
     ("Call", Accepted);
     ("Index", Accepted);
-    ("Range", Rejected "E9039");
-    ("Match", Conditional [ "E9035"; "E9043"; "E9044" ]);
+    (* integer ranges lower to the counter loop — `a..b` counts with <,
+       `a..=b` with <= (the E9039 range form is retired) *)
+    ("Range", Accepted);
+    (* variant arms against the builtin/user-enum tables, integer-literal
+       arms and wildcard arms accept (the E9035 user-enum gate is
+       retired — the VariantId fix + the lowersurface positive proof);
+       arm guards fire E9043 and the unsupported arm-pattern forms fire
+       E9044 *)
+    ("Match", Conditional [ "E9043"; "E9044" ]);
     ("Cast", Accepted);
     ("TryOp", Accepted);
     ("Closure", Rejected "E9040");
@@ -880,11 +889,13 @@ let expr_form_status : (string * form_status) list =
     ("Field", Accepted);
     ("Binary", Accepted);
     ("Await", Rejected "E9015");
-    ("MacroCall", Rejected "E9049");
-    (* plain Name targets accept; projected writebacks (a[i] = v,
-       p.x = v) lower through the typed-place writeback rule
-       (2026-08-28); other target forms still have no typed-place rule
-       in seed lowering *)
+    (* `vec![...]` lowers to the array aggregate and `debug_assert!(...)`
+       checks the condition (the E9049 forms are retired); any other
+       macro invocation fires E9049 *)
+    ("MacroCall", Conditional [ "E9049" ]);
+    (* Name, Field, Index and Deref targets accept — the typed-place
+       writeback rule lowers them (2026-08-28); the residual target
+       forms still have no typed-place rule in seed lowering *)
     ("Assign", Conditional [ "E9036" ]);
     ("CompoundAssign", Rejected "E9042");
     ("Return", Accepted);

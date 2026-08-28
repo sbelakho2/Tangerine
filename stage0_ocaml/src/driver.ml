@@ -33,12 +33,15 @@ Commands:
     --entry NAME
     --strict                Resolve the closure in strict mode (per-module
                             authority; no flat unique-name recovery)
+    --diagnostics-jsonl P   Write the structured per-diagnostic JSONL (one
+                            JSON object per typecheck diagnostic) to P
   compile ...               Bootstrap compile (interprets the compiler)
     --repo-root ROOT
     --manifest FILE
     --target TRIPLE
     --entry NAME
     --strict                Resolve the closure in strict mode
+    --diagnostics-jsonl P   Write the structured per-diagnostic JSONL to P
     -- <kernel args...>     Passed verbatim to the kernel's bootstrap_main
                             (e.g. -- compile hello.tg -o /tmp/out)
   version                   Print version info
@@ -948,6 +951,11 @@ type boot_opts = {
      --strict makes the strict run the semantic pipeline, which fails
      closed on any unresolved import. *)
   strict : bool;
+  (* audit P0 fix: when set, bootstrap-check writes the structured
+     per-diagnostic JSONL (one JSON object per typecheck diagnostic,
+     serialized directly from the checker's structured channel) to this
+     path instead of the evidence relying on stdout scraping. *)
+  diagnostics_jsonl : string option;
 }
 
 let default_boot_opts =
@@ -957,6 +965,7 @@ let default_boot_opts =
     target = "aarch64-apple-darwin";
     entry = None;
     strict = false;
+    diagnostics_jsonl = None;
   }
 
 let boot_specs =
@@ -966,6 +975,7 @@ let boot_specs =
     { name = "--target"; takes_value = true; apply = (fun v o -> match v with Some v -> { o with target = v } | None -> o) };
     { name = "--entry"; takes_value = true; apply = (fun v o -> match v with Some v -> { o with entry = Some v } | None -> o) };
     { name = "--strict"; takes_value = false; apply = (fun _ o -> { o with strict = true }) };
+    { name = "--diagnostics-jsonl"; takes_value = true; apply = (fun v o -> match v with Some v -> { o with diagnostics_jsonl = Some v } | None -> o) };
   ]
 
 (* ── @cfg elimination (audit @cfg P0) ──────────────────────────── *)
@@ -1264,6 +1274,13 @@ type closure_ctx = {
   ctx_decl_rounds : int;
   ctx_subset : subset_result;
   ctx_strict_fallbacks : int;
+  (* audit P0 fix: the strict-mode audit's diagnostic records (the
+     future compiler's per-module-authority findings on the separate
+     audit bag), so the evidence can persist the strict-resolution
+     diagnostics as structured data — never scraped from rendered
+     stderr.  Emission order; [] in strict mode (the strict run IS the
+     semantic pipeline). *)
+  ctx_strict_diags : Diagnostic.diagnostic list;
   mutable lowered_methods : int;
 }
 
@@ -1286,9 +1303,13 @@ let run_closure_pipeline_impl ~(repo_root : string) ~(manifest_path : string)
       let n = List.length (Bootstrap_manifest.entries manifest) in
       Printf.printf "  manifest: %d entries, version %s\n" n
         (match Bootstrap_manifest.version_of manifest with Some v -> v | None -> "(none)");
-      Printf.printf "  fingerprint: %s\n" (Bootstrap_manifest.fingerprint manifest);
-      let diags = Diagnostic.create_bag () in
-      let graph = Module_graph.create_with_sources manifest diags in
+       Printf.printf "  fingerprint: %s\n" (Bootstrap_manifest.fingerprint manifest);
+       let diags = Diagnostic.create_bag () in
+       (* audit P0 fix: the strict-mode audit findings are stashed here
+          (recovery-mode runs; in strict mode the audit IS the semantic
+          pipeline and the ctx never materializes on resolver errors) *)
+       let strict_audit_diags = ref [] in
+       let graph = Module_graph.create_with_sources manifest diags in
       Printf.printf "  module graph: %d modules, %d items\n" graph.Module_graph.node_count
         graph.Module_graph.item_count;
       (* ── @cfg elimination (audit @cfg P0) ─────────────────────────
@@ -1334,6 +1355,7 @@ let run_closure_pipeline_impl ~(repo_root : string) ~(manifest_path : string)
           else
             Printf.printf
               "  strict-mode audit: CLEAN — the closure resolves under per-module authority (strict-mode diagnostics: 0)\n";
+          strict_audit_diags := List.rev audit_diags.Diagnostic.diagnostics;
           Resolver.resolve manifest graph diags
         end
       in
@@ -1462,6 +1484,7 @@ let run_closure_pipeline_impl ~(repo_root : string) ~(manifest_path : string)
             ctx_decl_rounds = !decl_rounds;
             ctx_subset = subset_result;
             ctx_strict_fallbacks = fallback_activations;
+            ctx_strict_diags = !strict_audit_diags;
             lowered_methods = 0 }
       end)
 
@@ -2510,6 +2533,91 @@ let report_access_resource_pass (ctx : closure_ctx) : unit =
 let take_first (n : int) (l : 'a list) : 'a list =
   List.rev (snd (List.fold_left (fun (i, acc) x -> if i < n then (i + 1, x :: acc) else (i, acc)) (0, []) l))
 
+(* ── structured diagnostics JSONL (audit P0 fix) ─────────────────
+   Hand-rolled JSON serialization (no external library): the evidence
+   needs exactly one object-per-line shape, so a minimal correct
+   escape function suffices.  The records come from the typechecker's
+   structured channel (Typecheck.state.structured_diags) — original
+   spans and raw messages, never re-parsed from rendered text. *)
+let json_escape (s : string) : string =
+  let b = Buffer.create (String.length s + 16) in
+  String.iter
+    (function
+      | '"' -> Buffer.add_string b "\\\""
+      | '\\' -> Buffer.add_string b "\\\\"
+      | '\n' -> Buffer.add_string b "\\n"
+      | '\r' -> Buffer.add_string b "\\r"
+      | '\t' -> Buffer.add_string b "\\t"
+      | c when Char.code c < 0x20 ->
+          Buffer.add_string b (Printf.sprintf "\\u%04x" (Char.code c))
+      | c -> Buffer.add_char b c)
+    s;
+  Buffer.contents b
+
+let json_string (s : string) : string = "\"" ^ json_escape s ^ "\""
+
+let span_to_json (s : Span.span) : string =
+  Printf.sprintf "{\"file\":%d,\"start\":%d,\"end\":%d}" s.Span.file_id s.Span.start
+    s.Span.end_
+
+let write_diagnostics_jsonl ~(path : string) (ds : Typecheck.structured_diag list) : unit =
+  let oc = open_out path in
+  (try
+     List.iter
+       (fun d ->
+         Printf.fprintf oc
+           "{\"module\":%s,\"item\":%s,\"is_secondary\":%b,\"message\":%s,\"span\":%s,\"category\":%s}\n"
+           (json_string d.Typecheck.sd_module)
+           (json_string d.Typecheck.sd_item)
+           d.Typecheck.sd_secondary
+           (json_string d.Typecheck.sd_message)
+           (match d.Typecheck.sd_span with Some s -> span_to_json s | None -> "null")
+           (json_string (Debt_report.classify d.Typecheck.sd_message)))
+       (List.rev ds)
+   with e ->
+     close_out_noerr oc;
+     raise e);
+  close_out oc
+
+(* ── EVIDENCE_* fact lines (audit P0 fix) ─────────────────────────
+   The script reads the subset / strict-resolution / mir / host facts
+   from the bootstrap-check output; each is printed as a stable
+   machine-readable line (values JSON-escaped where they are free
+   text). *)
+
+let print_subset_evidence (r : subset_result) : unit =
+  let counts = Hashtbl.create 16 in
+  List.iter
+    (fun m ->
+      List.iter
+        (fun (c, n) ->
+          Hashtbl.replace counts c (n + Option.value ~default:0 (Hashtbl.find_opt counts c)))
+        m.ssm_findings)
+    r.sr_modules;
+  Printf.printf "EVIDENCE_SUBSET total_findings=%d accepted=%d rejected=%d modules=%d\n"
+    r.sr_total r.sr_accepted r.sr_rejected (List.length r.sr_modules);
+  List.iter
+    (fun (c, n) -> Printf.printf "EVIDENCE_SUBSET_COUNT code=%s count=%d\n" c n)
+    (List.sort compare (Hashtbl.fold (fun c n acc -> (c, n) :: acc) counts []));
+  List.iter
+    (fun m ->
+      if m.ssm_total > 0 then
+        Printf.printf "EVIDENCE_SUBSET_MODULE module=%s findings=%d\n"
+          (json_escape m.ssm_key) m.ssm_total)
+    r.sr_modules
+
+let print_strict_evidence (ds : Diagnostic.diagnostic list) (fallbacks : int) : unit =
+  Printf.printf "EVIDENCE_STRICT diagnostics=%d compatibility_fallback_activations=%d\n"
+    (List.length ds) fallbacks;
+  List.iter
+    (fun (d : Diagnostic.diagnostic) ->
+      Printf.printf "EVIDENCE_STRICT_DIAG code=%s message=%s span=%d:%d:%d\n"
+        (json_escape d.Diagnostic.code)
+        (json_escape d.Diagnostic.message)
+        d.Diagnostic.span.Span.file_id d.Diagnostic.span.Span.start
+        d.Diagnostic.span.Span.end_)
+    ds
+
 (* The artifact path the kernel derives from its own argv: the -o/
    --output value, else the input file minus .tg. *)
 let kernel_output_path (kernel_args : string list) : string option =
@@ -2703,6 +2811,13 @@ let cmd_bootstrap_check (args : string list) : int =
        Printf.printf "  RESULT: FAIL\n";
        1
    | Ok ctx ->
+       (match opts.diagnostics_jsonl with
+        | Some p ->
+            write_diagnostics_jsonl ~path:p
+              ctx.ctx_env.Typecheck.state.structured_diags
+        | None -> ());
+       print_subset_evidence ctx.ctx_subset;
+       print_strict_evidence ctx.ctx_strict_diags ctx.ctx_strict_fallbacks;
        Printf.printf "  typecheck: %d modules, %d items, %d errors (%d rounds)\n"
          ctx.ctx_graph.Module_graph.node_count ctx.ctx_items (List.length ctx.ctx_type_errors)
          ctx.ctx_decl_rounds;
@@ -2715,6 +2830,8 @@ let cmd_bootstrap_check (args : string list) : int =
          Printf.printf "  mono: skipped (typecheck gate failed)\n";
          Printf.printf "  FRONTEND_SEMANTIC_GATE = FAIL\n";
          Printf.printf "  BOOTSTRAP_EXECUTABLE_CLOSURE = INCOMPLETE\n";
+         Printf.printf "EVIDENCE_MIR template_verify=skipped concrete_verify=skipped\n";
+         Printf.printf "EVIDENCE_HOST reachable_closure=skipped\n";
          Printf.printf "  RESULT: FAIL\n";
          1
        end
@@ -2728,6 +2845,8 @@ let cmd_bootstrap_check (args : string list) : int =
           | Error errs ->
               Printf.printf "  SEED_MIR_STRUCTURAL_GATE = FAIL\n";
               List.iter (fun e -> Printf.printf "    %s\n" e) errs;
+              Printf.printf "EVIDENCE_MIR template_verify=fail concrete_verify=skipped\n";
+              Printf.printf "EVIDENCE_HOST reachable_closure=skipped\n";
               Printf.printf "  RESULT = WIP\n";
               1
           | Ok () ->
@@ -2739,6 +2858,8 @@ let cmd_bootstrap_check (args : string list) : int =
               (match resolve_bootstrap_entry prog opts.entry with
                | None ->
                    Printf.printf "  mono: skipped (no entry function in the closure)\n";
+                   Printf.printf "EVIDENCE_MIR template_verify=pass concrete_verify=skipped\n";
+                   Printf.printf "EVIDENCE_HOST reachable_closure=skipped\n";
                    Printf.printf "  BOOTSTRAP_EXECUTABLE_CLOSURE = INCOMPLETE\n";
                    Printf.printf "  RESULT = WIP\n";
                    1
@@ -2749,11 +2870,24 @@ let cmd_bootstrap_check (args : string list) : int =
                        prog
                    with
                    | Error _ ->
+                       Printf.printf "EVIDENCE_MIR template_verify=pass concrete_verify=skipped\n";
+                       Printf.printf "EVIDENCE_HOST reachable_closure=skipped\n";
                        Printf.printf "  BOOTSTRAP_EXECUTABLE_CLOSURE = INCOMPLETE\n";
                        Printf.printf "  RESULT = WIP\n";
                        1
                    | Ok mo ->
+                       (* audit P0 fix: the post-mono concrete verification
+                          is a recorded fact (same check tg_evidence runs);
+                          it does not change the gate's verdicts *)
+                       let concrete_ok =
+                         match Mir_verify.require_valid mo.mo_program with
+                         | Ok () -> true
+                         | Error _ -> false
+                       in
+                       Printf.printf "EVIDENCE_MIR template_verify=pass concrete_verify=%s\n"
+                         (if concrete_ok then "pass" else "fail");
                        if mo.mo_residual_type_params > 0 || incomplete then begin
+                         Printf.printf "EVIDENCE_HOST reachable_closure=skipped\n";
                          Printf.printf "  BOOTSTRAP_EXECUTABLE_CLOSURE = INCOMPLETE\n";
                          Printf.printf "  RESULT = WIP\n";
                          1
@@ -2789,6 +2923,8 @@ let cmd_bootstrap_check (args : string list) : int =
                                 "  REACHABLE_HOST_CLOSURE = FAIL (%d reachable host id(s): %s)\n"
                                 (List.length reachable) (String.concat ", " reachable_names);
                               List.iter (fun p -> Printf.printf "    %s\n" p) problems;
+                              Printf.printf "EVIDENCE_HOST reachable_closure=fail reachable=%d declared=0 implemented=0\n"
+                                (List.length reachable);
                               Printf.printf "  BOOTSTRAP_EXECUTABLE_CLOSURE = INCOMPLETE\n";
                               Printf.printf "  RESULT: FAIL\n";
                               1
@@ -2797,6 +2933,8 @@ let cmd_bootstrap_check (args : string list) : int =
                                 "  REACHABLE_HOST_CLOSURE = PASS (%d reachable host id(s) [%s], %d with executable bindings, all exact typed signatures)\n"
                                 report.Host.declared (String.concat ", " reachable_names)
                                 report.Host.implemented;
+                              Printf.printf "EVIDENCE_HOST reachable_closure=pass reachable=%d declared=%d implemented=%d\n"
+                                (List.length reachable) report.Host.declared report.Host.implemented;
                               Printf.printf "  BOOTSTRAP_EXECUTABLE_CLOSURE = PASS\n";
                               (match
                                  Vm.run ~program:mo.mo_program ~entry:mo.mo_entry ~argv ~host
