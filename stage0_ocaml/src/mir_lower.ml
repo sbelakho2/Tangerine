@@ -2014,6 +2014,9 @@ and lower_match (env : func_env) (st : lower_state) (m : Ast.match_expr) :
           | Ok (u, _) ->
               targets := (Int64.of_int (Uchar.to_int u), arm_blocks.(i)) :: !targets
           | Error _ -> seed_bug "invalid char literal arm in lowering")
+      | Ast.PatLiteral (Ast.BoolLit (b, _), _) -> (
+          (* bool literal arms: the VM switches a Bool as 1/0 *)
+          targets := ((if b then 1L else 0L), arm_blocks.(i)) :: !targets)
       | Ast.StructPattern (vname0, _, _) -> (
           (* a struct-pattern arm `Variant { f: x, ... }`: the variant's
              payload is a struct — the switch dispatches on the variant

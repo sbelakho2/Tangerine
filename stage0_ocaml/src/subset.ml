@@ -444,9 +444,9 @@ and check_arm_pattern ctx diags (p : Ast.pattern) =
         fields
   | Ast.PatLiteral (e, span) -> (
       match e with
-      | Ast.IntLit _ | Ast.CharLit _ ->
-          (* int/char literal arms switch on the tag (the E9044 forms
-             are retired) *)
+      | Ast.IntLit _ | Ast.CharLit _ | Ast.BoolLit _ ->
+          (* int/char/bool literal arms switch on the tag (the E9044
+             forms are retired) *)
           ()
       | Ast.StringLit _ ->
           (* string literal arms lower to the equality chain (the E9044
