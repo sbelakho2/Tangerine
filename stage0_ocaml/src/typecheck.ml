@@ -2354,12 +2354,14 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
             let effects = Array.concat (List.map (fun te -> te.te_effects) tes) in
             let ty = Type_repr.Tuple tys in
             let subst = ref [] in
-            (match expected with
-             | Some exp -> (
-                 match unify env.state.box_tid subst ty exp with
-                 | Ok () -> ()
-                 | Error m -> ignore (return_unify_err span ty exp m))
-             | None -> ());
+            let* _ =
+              match expected with
+              | None -> Ok ()
+              | Some exp -> (
+                  match unify env.state.box_tid subst ty exp with
+                  | Ok () -> Ok ()
+                  | Error m -> Error m)
+            in
             Ok { te_type = substitute_fixpoint !subst ty; te_effects = effects; te_span = span }))
   | Ast.Array (elems, span) -> (
       match elems with
@@ -2610,9 +2612,11 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
           | Error m -> Error m
           | Ok idxe -> (
               let subst = ref [] in
-              (match unify env.state.box_tid subst idxe.te_type (Type_repr.Int Type_repr.Int) with
-               | Ok () -> ()
-               | Error m -> ignore (return_unify_err (Ast.expr_span idx) (Type_repr.Int Type_repr.Int) idxe.te_type m));
+              let* _ =
+                match unify env.state.box_tid subst idxe.te_type (Type_repr.Int Type_repr.Int) with
+                | Ok () -> Ok ()
+                | Error m -> Error m
+              in
               match te.te_type with
               | Type_repr.Fixed_array (t, _) ->
                   Ok { te_type = t; te_effects = Array.append te.te_effects [| Access_effect.Read |]; te_span = span }
@@ -2636,9 +2640,11 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
       | Error m, _ | _, Error m -> Error m
       | Ok ta, Ok tb -> (
           let subst = ref [] in
-          (match unify env.state.box_tid subst ta.te_type tb.te_type with
-           | Ok () -> ()
-           | Error m -> ignore (return_unify_err span ta.te_type tb.te_type m));
+          let* _ =
+            match unify env.state.box_tid subst ta.te_type tb.te_type with
+            | Ok () -> Ok ()
+            | Error m -> Error m
+          in
           Ok
             {
               te_type = Type_repr.Tuple [| ta.te_type; tb.te_type |];
@@ -3083,13 +3089,15 @@ and check_stmt (env : env) (scope : scope) (s : Ast.stmt) : (scope, string) resu
               | Error m -> Error m
               | Ok te -> (
                   let subst = ref [] in
-                  (match unify env.state.box_tid subst ty te.te_type with
-                   | Ok () -> ()
-                   | Error m ->
-                       ignore
-                         (err span
-                            (Printf.sprintf "let binding type mismatch: expected %s, found %s (%s)"
-                               (type_to_string ty) (type_to_string te.te_type) m)));
+                  let* _ =
+                    match unify env.state.box_tid subst ty te.te_type with
+                    | Ok () -> Ok ()
+                    | Error m ->
+                        Error
+                          (err span
+                             (Printf.sprintf "let binding type mismatch: expected %s, found %s (%s)"
+                                (type_to_string ty) (type_to_string te.te_type) m))
+                  in
                   match check_pattern env scope (substitute_fixpoint !subst ty) pat with
                   | Error m -> Error m
                   | Ok binds ->
@@ -3110,11 +3118,8 @@ and check_stmt (env : env) (scope : scope) (s : Ast.stmt) : (scope, string) resu
          helpers like layout_engine's table_read resolve *)
       let qname = String.concat "::" (env.module_path @ [ fd.Ast.fn_sig.Ast.sig_name ]) in
       (match resolve_signature env scope fd.Ast.fn_sig [] ~key:qname with
-       | Error _ -> Ok scope
+       | Error m -> Error m
        | Ok sig_ ->
-           env.state.nested_functions <-
-             (qname, sig_, fd)
-             :: List.filter (fun (k, _, _) -> k <> qname) env.state.nested_functions;
            let env_m = env in
            (* the nested body is checked like the program-level fn body *)
             (match fd.Ast.fn_body with
@@ -3144,8 +3149,12 @@ and check_stmt (env : env) (scope : scope) (s : Ast.stmt) : (scope, string) resu
                    }
                  in
                 (match check_block env_m body_scope (Some sig_.ts_return) b b.b_span with
-                 | Ok _ -> Ok scope
-                 | Error _ -> Ok scope)
+                 | Ok _ ->
+                     env.state.nested_functions <-
+                       (qname, sig_, fd)
+                       :: List.filter (fun (k, _, _) -> k <> qname) env.state.nested_functions;
+                     Ok scope
+                 | Error m -> Error m)
             | _ -> Ok scope))
   | Ast.Item _ -> Ok scope   (* other nested items are checked at program level *)
 
@@ -3229,9 +3238,11 @@ and check_if (env : env) (scope : scope) (expected : Type_repr.t option) (i : As
       | Error m -> Error m
       | Ok te -> (
           let subst = ref [] in
-          (match unify env.state.box_tid subst tt.te_type te.te_type with
-           | Ok () -> ()
-           | Error m -> ignore (return_unify_err i.Ast.if_span tt.te_type te.te_type m));
+          let* _ =
+            match unify env.state.box_tid subst tt.te_type te.te_type with
+            | Ok () -> Ok ()
+            | Error m -> Error m
+          in
           (* the if's type adopts the concrete integer kind when one arm
              is a bare literal and the other a concrete int (`if c then 8
              else u end` is UInt, not IntLiteral — the kernel's literal
@@ -3290,14 +3301,11 @@ and check_match (env : env) (scope : scope) (expected : Type_repr.t option) (m :
                       match unify env.state.box_tid subst first.te_type te.te_type with
                       | Ok () -> go (te :: acc) rest
                       | Error m ->
-                          (* statement-position matches discard each arm's
-                             value (the kernel uses `match x when C then
-                             side_effect() else () end`); the arms only need
-                             to be mutually compatible, so a mismatch is
-                             reported on the oracle channel instead of
-                             rejecting the program *)
-                          ignore (return_unify_err arm.Ast.ma_span first.te_type te.te_type m);
-                          go (te :: acc) rest))))
+                          (* arm incompatibility is a real semantic failure:
+                             return_unify_err is a pure constructor — the
+                             former 'reported on the oracle channel' claim
+                             was false; the arm must fail *)
+                          Error m))))
     in
     go [] m.Ast.m_arms
   in
@@ -3624,14 +3632,16 @@ and check_name (env : env) (scope : scope) (expected : Type_repr.t option) (n : 
   match assoc_local n scope.locals with
       | Some (t, _) ->
       let subst = ref [] in
-      (match expected with
-       | Some exp -> (
-           (* the expected's params bind to the local's type: a stale
-              signature param must not rewrite the local's own bound param *)
-           match unify env.state.box_tid subst exp t with
-           | Ok () -> ()
-           | Error m -> ignore (return_unify_err span t exp m))
-       | None -> ());
+      let* _ =
+        match expected with
+        | Some exp -> (
+            (* the expected's params bind to the local's type: a stale
+               signature param must not rewrite the local's own bound param *)
+            match unify env.state.box_tid subst exp t with
+            | Ok () -> Ok ()
+            | Error m -> Error m)
+        | None -> Ok ()
+      in
       Ok
         {
           te_type = substitute_fixpoint (!var_journal @ !subst) t;
@@ -3660,12 +3670,14 @@ and check_name (env : env) (scope : scope) (expected : Type_repr.t option) (n : 
            with
            | Some t ->
                let subst = ref [] in
-               (match expected with
-                | Some exp -> (
-                    match unify env.state.box_tid subst t exp with
-                    | Ok () -> ()
-                    | Error m -> ignore (return_unify_err span t exp m))
-                | None -> ());
+               let* _ =
+                 match expected with
+                 | Some exp -> (
+                     match unify env.state.box_tid subst t exp with
+                     | Ok () -> Ok ()
+                     | Error m -> Error m)
+                 | None -> Ok ()
+               in
                Ok
                  {
                    te_type = substitute_fixpoint !subst t;
@@ -3690,12 +3702,14 @@ and check_name (env : env) (scope : scope) (expected : Type_repr.t option) (n : 
                 with
                 | Some t ->
                     let subst = ref [] in
-                    (match expected with
-                     | Some exp -> (
-                         match unify env.state.box_tid subst t exp with
-                         | Ok () -> ()
-                         | Error m -> ignore (return_unify_err span t exp m))
-                     | None -> ());
+                    let* _ =
+                      match expected with
+                      | Some exp -> (
+                          match unify env.state.box_tid subst t exp with
+                          | Ok () -> Ok ()
+                          | Error m -> Error m)
+                      | None -> Ok ()
+                    in
                     Ok
                       {
                         te_type = substitute_fixpoint !subst t;
