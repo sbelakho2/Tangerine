@@ -422,6 +422,21 @@ and check_arm_pattern ctx diags (p : Ast.pattern) =
               (* a bool payload `Some(true)`: the payload must hold the
                  literal bool (the E9044 bool-payload form is retired) *)
               ()
+          | Ast.StructPattern (_, sfields, _) ->
+              (* a struct-payload `MirRvalue { kind: rvalue_kind }`: the
+                 payload position holds the struct — the named fields
+                 bind through the semantic FieldIds (the E9044
+                 struct-payload form is retired); the sub-patterns must
+                 be names or `_` *)
+              List.iter
+                (fun (_, fpat) ->
+                  match fpat with
+                  | None | Some (Ast.PatIdent _ | Ast.Wildcard _) -> ()
+                  | Some _ ->
+                      reject diags "E9044"
+                        "nested struct-payload bindings are not available in the bootstrap subset (seed lowering binds struct payload fields by name or `_` only)"
+                        (match fpat with Some p -> Ast.pattern_span p | None -> Span.synthetic))
+                sfields
           | _ ->
               reject diags "E9044"
                 "variant payload patterns are not available in the bootstrap subset (seed lowering binds payload fields by name, `_` or tuple components only)"

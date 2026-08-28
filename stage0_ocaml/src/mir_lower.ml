@@ -2303,6 +2303,40 @@ and lower_match (env : func_env) (st : lower_state) (m : Ast.match_expr) :
                           [ (1L, ok_b) ],
                           next_b ))
                      ok_b)
+               | Ast.StructPattern (_, sfields, _) -> (
+                   (* a struct-payload `MirRvalue { kind: rvalue_kind }`:
+                      the payload position j holds the struct — the
+                      named fields bind through [Downcast;
+                      ConstantIndex j; Field fid] (the semantic
+                      FieldId through the typed registry) *)
+                   let styp =
+                     match List.nth_opt spec.vs_fields j with
+                     | Some t -> t
+                     | None ->
+                         seed_bug "variant `%s` struct payload has more fields than the variant" seg2
+                   in
+                   List.iter
+                     (fun (fname, fpat) ->
+                       match fpat with
+                       | Some (Ast.PatIdent (name, _, _)) -> (
+                           let projs, fty = field_projection_of env styp fname in
+                           if not (copyable_ty fty) then
+                             seed_bug
+                               "non-Copy struct-payload field binding in a variant match arm is not supported by the seed VM (payload field type %s)"
+                               (Seed_mir.print_type fty);
+                           let id = fresh_local st fty in
+                           emit st
+                             (Seed_mir.Assign
+                                ( cur_place st id,
+                                  Seed_mir.Use
+                                    (Seed_mir.Copy
+                                       { Seed_mir.local = sid;
+                                         projections =
+                                           [ Seed_mir.Downcast (semantic_variant_id spec); Seed_mir.ConstantIndex j ]
+                                           @ projs }) ));
+                           st.scope <- (name, id) :: st.scope)
+                       | _ -> ())
+                     sfields)
                | Ast.PatTuple (subs, _) ->
                    (* a tuple payload `Some((a, b))`: the j-th payload
                       FIELD is the tuple — each component binds through
