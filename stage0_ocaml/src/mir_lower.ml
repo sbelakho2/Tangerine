@@ -1782,14 +1782,21 @@ and lower_match (env : func_env) (st : lower_state) (m : Ast.match_expr) :
      fallthrough.  The seed's SwitchInt carries int tags only, so the
      string arms cannot join the switch — the chain is the executable
      form. *)
-  let string_lit_of (a : Ast.match_arm) : string option =
+  let string_lit_of (a : Ast.match_arm) : string list =
+    (* a string-literal arm, or an or-pattern of string literals — all
+       alternatives dispatch to the same arm body *)
     match a.Ast.ma_pattern with
-    | Ast.PatLiteral (Ast.StringLit (s, _), _) -> Some s
-    | _ -> None
+    | Ast.PatLiteral (Ast.StringLit (s, _), _) -> [ s ]
+    | Ast.OrPattern (p1, p2, _) -> (
+        match p1, p2 with
+        | Ast.PatLiteral (Ast.StringLit (s1, _), _), Ast.PatLiteral (Ast.StringLit (s2, _), _) ->
+            [ s1; s2 ]
+        | _ -> [])
+    | _ -> []
   in
   if
     subj_ty = Type_repr.String
-    && List.exists (fun a -> string_lit_of a <> None) m.Ast.m_arms
+    && List.exists (fun a -> string_lit_of a <> []) m.Ast.m_arms
   then begin
     let result_id = ref 0 in
     let result_ty : Type_repr.t option ref = ref None in
@@ -1805,32 +1812,41 @@ and lower_match (env : func_env) (st : lower_state) (m : Ast.match_expr) :
       | [] -> fall_b
       | (a : Ast.match_arm) :: rest -> (
           match string_lit_of a with
-          | None -> emit_chain rest fall_b
-          | Some lit ->
+          | [] -> emit_chain rest fall_b
+          | lits ->
               let then_b = new_block st in
-              let eq_id = fresh_local st Type_repr.Bool in
-              emit st
-                (Seed_mir.Assign
-                   ( cur_place st eq_id,
-                     Seed_mir.BinaryOp
-                       ( Seed_mir.Eq,
-                         Seed_mir.Read (cur_place st sid),
-                         Seed_mir.Constant (Seed_mir.String lit) ) ));
-              let next_fall = new_block st in
-              set_terminator_to st
-                (Seed_mir.SwitchInt
-                   ( Seed_mir.Copy (cur_place st eq_id),
-                     [ (1L, then_b) ],
-                     next_fall ))
-                then_b;
+              (* each alternative tests `sid == lit`; the chain of
+                 alternatives falls to the next arm when none matches *)
+              let rec emit_alts alts (cont : int) =
+                match alts with
+                | [] -> cont
+                | lit :: more ->
+                    let eq_id = fresh_local st Type_repr.Bool in
+                    emit st
+                      (Seed_mir.Assign
+                         ( cur_place st eq_id,
+                           Seed_mir.BinaryOp
+                             ( Seed_mir.Eq,
+                               Seed_mir.Read (cur_place st sid),
+                               Seed_mir.Constant (Seed_mir.String lit) ) ));
+                    let next_fall = new_block st in
+                    set_terminator_to st
+                      (Seed_mir.SwitchInt
+                         ( Seed_mir.Copy (cur_place st eq_id),
+                           [ (1L, then_b) ],
+                           next_fall ))
+                      then_b;
+                    emit_alts more next_fall
+              in
+              let last_fall = emit_alts lits fall_b in
               let bval, bty = lower_expr env st a.Ast.ma_body in
               ensure_result bty;
               emit st (Seed_mir.Assign (cur_place st !result_id, Seed_mir.Use bval));
-              set_terminator_to st (Seed_mir.Goto join_b) next_fall;
-              emit_chain rest next_fall)
+              set_terminator_to st (Seed_mir.Goto join_b) last_fall;
+              emit_chain rest last_fall)
     in
     let fall = emit_chain m.Ast.m_arms join_b in
-    (match List.find_opt (fun (a : Ast.match_arm) -> string_lit_of a = None) m.Ast.m_arms with
+    (match List.find_opt (fun (a : Ast.match_arm) -> string_lit_of a = []) m.Ast.m_arms with
      | Some a ->
          if st.cur_block <> fall then set_terminator_to st (Seed_mir.Goto fall) fall;
          let bval, bty = lower_expr env st a.Ast.ma_body in
@@ -1924,6 +1940,32 @@ and lower_match (env : func_env) (st : lower_state) (m : Ast.match_expr) :
           in
           let spec = variant_spec_of env st.variants ~enum_name ~vname ~repr:subj_ty in
           targets := (Int64.of_int spec.vs_index, arm_blocks.(i)) :: !targets)
+      | Ast.OrPattern (p1, p2, _) ->
+          (* an or-pattern arm `A | B`: both alternatives dispatch to
+             the same arm block (variant tags and int/char literals) *)
+          let add_alt (p : Ast.pattern) =
+            match p with
+            | Ast.PatVariant (seg1, seg2, _, _) -> (
+                let enum_name =
+                  if seg1 = "" then enum_name_of_ty env subj_ty
+                  else seg1
+                in
+                let spec = variant_spec_of env st.variants ~enum_name ~vname:seg2 ~repr:subj_ty in
+                targets := (Int64.of_int spec.vs_index, arm_blocks.(i)) :: !targets)
+            | Ast.PatLiteral (Ast.IntLit (lit, _), _) -> (
+                match int_of_string_opt lit with
+                | Some v -> targets := (Int64.of_int v, arm_blocks.(i)) :: !targets
+                | None -> seed_bug "non-integer literal or-pattern alternative in lowering")
+            | Ast.PatLiteral (Ast.CharLit (c, _), _) -> (
+                let b = Bytes.of_string c in
+                match Utf8.decode_at b 0 with
+                | Ok (u, _) ->
+                    targets := (Int64.of_int (Uchar.to_int u), arm_blocks.(i)) :: !targets
+                | Error _ -> seed_bug "invalid char literal or-pattern alternative in lowering")
+            | _ -> seed_bug "unsupported or-pattern alternative in lowering"
+          in
+          add_alt p1;
+          add_alt p2
       | Ast.Wildcard _ | Ast.PatIdent _ -> ()
       | p ->
       let pname =
@@ -2088,7 +2130,7 @@ and lower_match (env : func_env) (st : lower_state) (m : Ast.match_expr) :
                    st.scope <- (name, id) :: st.scope)
                | _ -> ())
              sfields)
-       | Ast.Wildcard _ | Ast.PatLiteral _ -> ()
+       | Ast.Wildcard _ | Ast.PatLiteral _ | Ast.OrPattern _ -> ()
        | _ -> seed_bug "unsupported match arm pattern in lowering");
       let bval, bty = lower_expr env st a.Ast.ma_body in
       ensure_result bty;
