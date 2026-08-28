@@ -3147,7 +3147,7 @@ and check_stmt (env : env) (scope : scope) (s : Ast.stmt) : (scope, string) resu
             | _ -> Ok scope))
   | Ast.Item _ -> Ok scope   (* other nested items are checked at program level *)
 
-and check_if (env : env) (scope : scope) (_expected : Type_repr.t option) (i : Ast.if_expr) :
+and check_if (env : env) (scope : scope) (expected : Type_repr.t option) (i : Ast.if_expr) :
     (typed_expr, string) result =
   let* cond_effects =
     match i.Ast.if_let_pattern with
@@ -3187,7 +3187,7 @@ and check_if (env : env) (scope : scope) (_expected : Type_repr.t option) (i : A
             | Error _ -> scope)
         | None -> scope)
   in
-  let* tt = check_block env then_scope None i.Ast.if_then i.Ast.if_then.Ast.b_span in
+  let* tt = check_block env then_scope expected i.Ast.if_then i.Ast.if_then.Ast.b_span in
   let* telsif =
     let rec go acc = function
       | [] -> Ok (List.rev acc)
@@ -3195,7 +3195,12 @@ and check_if (env : env) (scope : scope) (_expected : Type_repr.t option) (i : A
           match check_expr env scope (Some Type_repr.Bool) c with
           | Error m -> Error m
           | Ok _ -> (
-              match check_block env scope (Some tt.te_type) b b.Ast.b_span with
+              let b_exp =
+                match tt.te_type with
+                | Type_repr.Never -> expected
+                | _ -> Some tt.te_type
+              in
+              match check_block env scope b_exp b b.Ast.b_span with
               | Ok tb -> go (tb :: acc) rest
               | Error m -> Error m))
     in
@@ -3213,7 +3218,12 @@ and check_if (env : env) (scope : scope) (_expected : Type_repr.t option) (i : A
       in
       Ok { te_type = Type_repr.Unit; te_effects = all_effects; te_span = i.Ast.if_span })
   | Some eb -> (
-      match check_block env scope (Some tt.te_type) eb eb.Ast.b_span with
+      let eb_exp =
+        match tt.te_type with
+        | Type_repr.Never -> expected
+        | _ -> Some tt.te_type
+      in
+      match check_block env scope eb_exp eb eb.Ast.b_span with
       | Error m -> Error m
       | Ok te -> (
           let subst = ref [] in
@@ -3258,7 +3268,15 @@ and check_match (env : env) (scope : scope) (expected : Type_repr.t option) (m :
               let expected' =
                 match acc with
                 | [] -> expected
-                | first :: _ -> Some first.te_type
+                | first :: _ -> (
+                    (* a Never arm (an infinite loop / return-only arm)
+                       contributes no value type: the following arms must
+                       fall back to the enclosing expected so a
+                       Result::Err(e) tail still solves its T from the
+                       match's Result context *)
+                    match first.te_type with
+                    | Type_repr.Never -> expected
+                    | _ -> Some first.te_type)
               in
               match check_expr env arm_scope expected' arm.Ast.ma_body with
               | Error m -> Error m
