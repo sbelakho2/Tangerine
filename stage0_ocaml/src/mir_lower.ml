@@ -1952,7 +1952,7 @@ and lower_match (env : func_env) (st : lower_state) (m : Ast.match_expr) :
       | [] -> None
       | (a : Ast.match_arm) :: rest -> (
           match a.Ast.ma_pattern with
-          | Ast.Wildcard _ | Ast.PatIdent _ -> Some i
+          | Ast.Wildcard _ | Ast.PatIdent _ | Ast.PatTuple _ -> Some i
           | _ -> go (i + 1) rest)
     in
     go 0 m.Ast.m_arms
@@ -2440,6 +2440,95 @@ and lower_match (env : func_env) (st : lower_state) (m : Ast.match_expr) :
        | Ast.PatIdent (name, _, _) ->
            (* a binding arm `when x then`: the whole subject binds *)
            st.scope <- (name, sid) :: st.scope
+       | Ast.PatTuple (subs, _) -> (
+           (* a tuple arm `(a, b) => ...`: the elements bind through the
+              ConstantIndex projections; a nested-variant element
+              `(Field(fa), ...)` checks the element discriminant and
+              binds the nested payload *)
+           let elem_ty k =
+             match subj_ty with
+             | Type_repr.Tuple elems when k < Array.length elems -> elems.(k)
+             | _ -> seed_bug "tuple arm pattern against a non-tuple subject type"
+           in
+           List.iteri
+             (fun k sub ->
+               match sub with
+               | Ast.PatIdent (name, _, _) -> (
+                   let fty = elem_ty k in
+                   let id = fresh_local st fty in
+                   emit st
+                     (Seed_mir.Assign
+                        ( cur_place st id,
+                          Seed_mir.Use
+                            (Seed_mir.Copy
+                               { Seed_mir.local = sid;
+                                 projections = [ Seed_mir.ConstantIndex k ] }) ));
+                   st.scope <- (name, id) :: st.scope)
+               | Ast.PatVariant (seg1, seg2, spats, _) -> (
+                   let ety = elem_ty k in
+                   let eid = fresh_local st ety in
+                   emit st
+                     (Seed_mir.Assign
+                        ( cur_place st eid,
+                          Seed_mir.Use
+                            (Seed_mir.Copy
+                               { Seed_mir.local = sid;
+                                 projections = [ Seed_mir.ConstantIndex k ] }) ));
+                   let nested_spec =
+                     variant_spec_of env st.variants ~enum_name:seg1 ~vname:seg2 ~repr:ety
+                   in
+                   let did = fresh_local st (Type_repr.Int Type_repr.UInt) in
+                   emit st
+                     (Seed_mir.Assign
+                        (cur_place st did, Seed_mir.Discriminant (cur_place st eid)));
+                   let eq_id = fresh_local st Type_repr.Bool in
+                   emit st
+                     (Seed_mir.Assign
+                        ( cur_place st eq_id,
+                          Seed_mir.BinaryOp
+                            ( Seed_mir.Eq,
+                              copy_place st (cur_place st did),
+                              Seed_mir.Constant
+                                (int_constant_of Type_repr.UInt
+                                   (Int64.of_int nested_spec.vs_index)) ) ));
+                   let ok_b = new_block st in
+                   set_terminator_to st
+                     (Seed_mir.SwitchInt
+                        ( Seed_mir.Copy (cur_place st eq_id),
+                          [ (1L, ok_b) ],
+                          otherwise ))
+                     ok_b;
+                   List.iteri
+                     (fun j spat ->
+                       match spat with
+                       | Ast.PatIdent (name, _, _) -> (
+                           let fty =
+                             match List.nth_opt nested_spec.vs_fields j with
+                             | Some t -> t
+                             | None ->
+                                 seed_bug
+                                   "tuple arm nested-variant payload has more fields than the variant"
+                           in
+                           let id = fresh_local st fty in
+                           emit st
+                             (Seed_mir.Assign
+                                ( cur_place st id,
+                                  Seed_mir.Use
+                                    (Seed_mir.Copy
+                                       { Seed_mir.local = sid;
+                                         projections =
+                                           [
+                                             Seed_mir.ConstantIndex k;
+                                             Seed_mir.Downcast (semantic_variant_id nested_spec);
+                                             Seed_mir.ConstantIndex j;
+                                           ] }) ));
+                           st.scope <- (name, id) :: st.scope)
+                       | Ast.Wildcard _ -> ()
+                       | _ -> seed_bug "unsupported tuple arm nested sub-pattern in lowering")
+                     spats)
+               | Ast.Wildcard _ -> ()
+               | _ -> seed_bug "unsupported tuple arm sub-pattern in lowering")
+             subs)
        | Ast.Wildcard _ | Ast.PatLiteral _ | Ast.OrPattern _ -> ()
        | _ -> seed_bug "unsupported match arm pattern in lowering");
       let bval, bty = lower_expr env st a.Ast.ma_body in

@@ -392,9 +392,9 @@ let conditional_reject_specimens : (string * string * string) list =
 end
 |});
     ("Match", "E9044",
-     {|def f(x: (Int, Int)) -> Int
+     {|def f(x: Int) -> Int
   match x {
-    (a, b) => a + b,
+    1..=5 => 1,
     _ => 0
   }
 end
@@ -438,7 +438,7 @@ end
   }
 end
 |});
-    ("arm tuple pattern (E9044)", [ "E9044" ],
+    ("arm tuple pattern (accepted — the E9044 tuple-arm form retired)", [],
      {|def f(x: (Int, Int)) -> Int
   match x {
     (a, b) => a + b,

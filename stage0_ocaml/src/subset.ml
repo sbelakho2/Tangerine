@@ -481,6 +481,31 @@ and check_arm_pattern ctx diags (p : Ast.pattern) =
       (* a binding arm `when x then` binds the whole subject (the E9044
          binding-arm form is retired) *)
       ()
+  | Ast.PatTuple (subs, _) ->
+      (* a tuple arm `(a, b) => ...` binds the elements through the
+         ConstantIndex projections (the E9044 tuple-arm form is
+         retired); a nested-variant element checks the discriminant and
+         binds the nested payload; the sub-patterns must be names,
+         `_` or nested variants with name/`_` payloads *)
+      List.iter
+        (fun sub ->
+          match sub with
+          | Ast.PatIdent _ | Ast.Wildcard _ -> ()
+          | Ast.PatVariant (_, _, spats, _) ->
+              List.iter
+                (fun spat ->
+                  match spat with
+                  | Ast.PatIdent _ | Ast.Wildcard _ -> ()
+                  | _ ->
+                      reject diags "E9044"
+                        "nested tuple arm payload sub-patterns are not available in the bootstrap subset (seed lowering binds nested payloads by name or `_` only)"
+                        (Ast.pattern_span spat))
+                spats
+          | _ ->
+              reject diags "E9044"
+                "nested tuple arm sub-patterns are not available in the bootstrap subset (seed lowering binds tuple arm elements by name, `_` or nested variants only)"
+                (Ast.pattern_span sub))
+        subs
   | Ast.Wildcard _ -> ()
   | p ->
       reject diags "E9044"
