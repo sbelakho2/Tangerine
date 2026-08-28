@@ -2463,9 +2463,10 @@ and top_level_opaque_macro_syntax (p : parser) (close : Token.kind) : bool =
           else scan (idx + 1) paren (max 0 (bracket - 1)) brace
       | Token.LBrace -> scan (idx + 1) paren bracket (brace + 1)
       | Token.RBrace -> scan (idx + 1) paren bracket (max 0 (brace - 1))
-      | Token.Colon | Token.ColonColon ->
+      | Token.Colon ->
           if paren = 0 && bracket = 0 && brace = 0 then true
           else scan (idx + 1) paren bracket brace
+      | Token.ColonColon -> scan (idx + 1) paren bracket brace
       | _ -> scan (idx + 1) paren bracket brace
   in
   scan p.pos 0 0 0
