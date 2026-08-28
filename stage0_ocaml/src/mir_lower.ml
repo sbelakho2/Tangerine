@@ -2176,6 +2176,94 @@ and lower_match (env : func_env) (st : lower_state) (m : Ast.match_expr) :
                           [ (1L, ok_b) ],
                           next_b ))
                      ok_b)
+               | Ast.PatVariant (seg1, seg2, _, _) -> (
+                   (* a nested-variant payload `Some(Live)`: the payload
+                      position must hold the nested variant — its
+                      discriminant must equal the nested variant's tag;
+                      fall to the NEXT arm when it fails *)
+                   let pty =
+                     match List.nth_opt spec.vs_fields j with
+                     | Some t -> t
+                     | None ->
+                         seed_bug "variant `%s` nested payload has more fields than the variant" seg2
+                   in
+                   let nested_spec =
+                     variant_spec_of env st.variants ~enum_name:seg1 ~vname:seg2 ~repr:pty
+                   in
+                   let pid = fresh_local st pty in
+                   emit st
+                     (Seed_mir.Assign
+                        ( cur_place st pid,
+                          Seed_mir.Use
+                            (Seed_mir.Copy
+                               { Seed_mir.local = sid;
+                                 projections =
+                                   [ Seed_mir.Downcast (semantic_variant_id spec); Seed_mir.ConstantIndex j ]
+                               }) ));
+                   let did = fresh_local st (Type_repr.Int Type_repr.UInt) in
+                   emit st
+                     (Seed_mir.Assign
+                        (cur_place st did, Seed_mir.Discriminant (cur_place st pid)));
+                   let eq_id = fresh_local st Type_repr.Bool in
+                   emit st
+                     (Seed_mir.Assign
+                        ( cur_place st eq_id,
+                          Seed_mir.BinaryOp
+                            ( Seed_mir.Eq,
+                              copy_place st (cur_place st did),
+                              Seed_mir.Constant
+                                (int_constant_of Type_repr.UInt
+                                   (Int64.of_int nested_spec.vs_index)) ) ));
+                   let ok_b = new_block st in
+                   let next_b =
+                     if i + 1 < Array.length arm_blocks then arm_blocks.(i + 1)
+                     else otherwise
+                   in
+                   set_terminator_to st
+                     (Seed_mir.SwitchInt
+                        ( Seed_mir.Copy (cur_place st eq_id),
+                          [ (1L, ok_b) ],
+                          next_b ))
+                     ok_b)
+               | Ast.PatLiteral (Ast.StringLit (slit, _), _) -> (
+                   (* a string payload `Some("ast")`: the payload
+                      position must hold the literal string — the
+                      equality; fall to the NEXT arm when it fails *)
+                   let pty =
+                     match List.nth_opt spec.vs_fields j with
+                     | Some t -> t
+                     | None ->
+                         seed_bug "variant `%s` string payload has more fields than the variant" seg2
+                   in
+                   let pid = fresh_local st pty in
+                   emit st
+                     (Seed_mir.Assign
+                        ( cur_place st pid,
+                          Seed_mir.Use
+                            (Seed_mir.Read
+                               { Seed_mir.local = sid;
+                                 projections =
+                                   [ Seed_mir.Downcast (semantic_variant_id spec); Seed_mir.ConstantIndex j ]
+                               }) ));
+                   let eq_id = fresh_local st Type_repr.Bool in
+                   emit st
+                     (Seed_mir.Assign
+                        ( cur_place st eq_id,
+                          Seed_mir.BinaryOp
+                            ( Seed_mir.Eq,
+                              copy_place st (cur_place st pid),
+                              Seed_mir.Constant (Seed_mir.String slit) ) ));
+                   let ok_b = new_block st in
+                   let next_b =
+                     if i + 1 < Array.length arm_blocks then arm_blocks.(i + 1)
+                     else otherwise
+                   in
+                   set_terminator_to st
+                     (Seed_mir.SwitchInt
+                        ( Seed_mir.Copy (cur_place st eq_id),
+                          [ (1L, ok_b) ],
+                          next_b ))
+                     ok_b)
                | Ast.PatTuple (subs, _) ->
                    (* a tuple payload `Some((a, b))`: the j-th payload
                       FIELD is the tuple — each component binds through

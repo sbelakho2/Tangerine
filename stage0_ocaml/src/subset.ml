@@ -408,6 +408,16 @@ and check_arm_pattern ctx diags (p : Ast.pattern) =
               (* a char payload `Some('#')`: the payload must hold the
                  literal char (the E9044 char-payload form is retired) *)
               ()
+          | Ast.PatVariant (_, _, _, _) ->
+              (* a nested-variant payload `Some(Live)`: the payload must
+                 hold the nested variant (the E9044 nested-variant
+                 payload form is retired) *)
+              ()
+          | Ast.PatLiteral (Ast.StringLit _, _) ->
+              (* a string payload `Some("ast")`: the payload must hold
+                 the literal string (the E9044 string-payload form is
+                 retired) *)
+              ()
           | _ ->
               reject diags "E9044"
                 "variant payload patterns are not available in the bootstrap subset (seed lowering binds payload fields by name, `_` or tuple components only)"
