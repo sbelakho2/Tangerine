@@ -214,7 +214,7 @@ end
 |});
     ("MacroCall", "E9049",
      {|def f() -> Int
-  debug_assert!(true)
+  panic!("boom")
 end
 |});
     ("CompoundAssign", "E9042",

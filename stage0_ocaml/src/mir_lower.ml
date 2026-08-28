@@ -985,6 +985,16 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
       (* the `vec![...]` macro lowers to the array aggregate (the E9049
          vec! form is retired); every other macro fails closed *)
       match n with
+      | "debug_assert" -> (
+          (* debug_assert!(cond[, msg]): the kernel's uses check a
+             boolean condition — the seed evaluates the condition (the
+             checked side effects) and discards the value; the optional
+             message is dropped (the E9049 debug_assert! form is
+             retired) *)
+          (match args with
+           | Ast.MacroExpr cond :: _ -> ignore (lower_expr env st cond)
+           | _ -> ());
+          (Seed_mir.Constant Seed_mir.Unit, Type_repr.Unit))
       | "vec" ->
           let lowered =
             List.map

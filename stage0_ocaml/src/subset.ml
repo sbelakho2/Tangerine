@@ -632,6 +632,15 @@ and check_expr ctx diags (e : Ast.expr) =
          this rejection it would sail through to the fail-closed
          lowering branch). *)
       (match n with
+       | "debug_assert" ->
+           (* debug_assert!(cond[, msg]): the condition is checked and
+              the value discarded (the E9049 debug_assert! form is
+              retired) *)
+           List.iter
+             (function
+               | Ast.MacroExpr e -> check_expr ctx diags e
+               | Ast.MacroTokens _ -> ())
+             args
        | "vec" ->
            (* `vec![...]` lowers to the array aggregate (the E9049 vec!
               form is retired); the arguments must be expressions *)
