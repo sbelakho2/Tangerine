@@ -454,7 +454,7 @@ end
   }
 end
 |});
-    ("string literal arm (E9044)", [ "E9044" ],
+    ("string literal arm (accepted — the E9044 string form retired)", [],
      {|def f(s: String) -> Int
   match s {
     "a" => 1,

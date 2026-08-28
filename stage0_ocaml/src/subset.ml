@@ -377,10 +377,17 @@ and check_arm_pattern ctx diags (p : Ast.pattern) =
         fields
   | Ast.PatLiteral (e, span) -> (
       match e with
-      | Ast.IntLit _ -> ()
+      | Ast.IntLit _ | Ast.CharLit _ ->
+          (* int/char literal arms switch on the tag (the E9044 forms
+             are retired) *)
+          ()
+      | Ast.StringLit _ ->
+          (* string literal arms lower to the equality chain (the E9044
+             string form is retired) *)
+          ()
       | _ ->
           reject diags "E9044"
-            "non-integer literal match arms are not available in the bootstrap subset (seed lowering builds switch targets for integer literal arms only)"
+            "non-integer literal match arms are not available in the bootstrap subset (seed lowering builds switch targets for integer/char arms and string-equality chains only)"
             span);
       check_expr ctx diags e
   | Ast.Wildcard _ -> ()

@@ -92,7 +92,7 @@
           with "unknown callee" — the fail-closed channel that replaced
           the firewall rejection.
 
-   Expected main return: 251 (209 + const_roundtrip 42). *)
+   Expected main return: 256 (251 + str_match_roundtrip 2 + char_match_roundtrip 3). *)
 
 let src_text = {|
 enum Color
@@ -175,6 +175,22 @@ def const_roundtrip() -> Int
   ROUNDTRIP_K
 end
 
+def str_match_roundtrip(s: String) -> Int
+  match s {
+    "a" => 1,
+    "b" => 2,
+    _ => 0
+  }
+end
+
+def char_match_roundtrip(c: Char) -> Int
+  match c {
+    'x' => 3,
+    'y' => 4,
+    _ => 0
+  }
+end
+
 def for_roundtrip() -> Int
   var t = 0
   for (k, v) in [(10, 1), (20, 2)] do
@@ -210,7 +226,9 @@ def main() -> Int
   let l = tuple_roundtrip()
   let m = for_roundtrip()
   let o = const_roundtrip()
-  a + b + c + d + e + f + g + h + i + j + k + l + m + o
+  let p = str_match_roundtrip("b")
+  let q = char_match_roundtrip('x')
+  a + b + c + d + e + f + g + h + i + j + k + l + m + o + p + q
 end
 |}
 
@@ -1380,9 +1398,9 @@ end
                 match Vm.run_inspect vm2 entry_frame with
                 | Ok ret_val ->
                     Printf.printf "  main returned: %s\n" ret_val;
-                    if ret_val = "251" then Printf.printf "  RESULT: PASS\n"
+                    if ret_val = "256" then Printf.printf "  RESULT: PASS\n"
                     else begin
-                      Printf.printf "  RESULT: FAIL (expected 251)\n";
+                      Printf.printf "  RESULT: FAIL (expected 256)\n";
                       exit 1
                     end
                 | Error m -> Printf.printf "  main returned: <inspect failed: %s>\n" m)));

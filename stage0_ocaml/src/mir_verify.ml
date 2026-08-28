@@ -1456,7 +1456,7 @@ let check_rvalue (ctx : ctx) (fn : function_) (bb_ctx : string) (declared : IntS
                  None
                end
            | Eq | Ne ->
-               if same && is_scalar ctx lt then Some Type_repr.Bool
+               if same && (is_scalar ctx lt || lt = Type_repr.String) then Some Type_repr.Bool
                else begin
                  add_err ctx
                    (Printf.sprintf "%s: equality operator requires matching scalar operands" bb_ctx);
