@@ -1362,10 +1362,10 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
               ignore (lower_block env st f.Ast.for_body))
             elems;
           (Seed_mir.Constant Seed_mir.Unit, Type_repr.Unit)
-      | Ast.Range (start_e, end_e, _, _) -> (
+      | Ast.Range (start_e, end_e, inclusive, _) -> (
           (* `for x in a..b`: the counter counts from a to b; the loop
              variable binds the counter (the E9039 range form is
-             retired) *)
+             retired); `a..=b` compares with <= *)
           let start_op, start_ty = lower_expr env st start_e in
           let end_op, _ = lower_expr env st end_e in
           let cid = fresh_local st start_ty in
@@ -1383,7 +1383,7 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
             (Seed_mir.Assign
                ( cur_place st cnd_id,
                  Seed_mir.BinaryOp
-                   ( Seed_mir.Lt,
+                   ( (if inclusive then Seed_mir.Le else Seed_mir.Lt),
                      copy_place st (cur_place st cid),
                      copy_place st (cur_place st eid) ) ));
           set_terminator st

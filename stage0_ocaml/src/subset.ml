@@ -635,15 +635,10 @@ and check_expr ctx diags (e : Ast.expr) =
       check_expr ctx diags i
   | Ast.Range (start, end_, _, span) ->
       (* AST form: Ast.Range (start, end, inclusive, span) (parser
-         `a..b` / `a..=b`).  Integer ranges `a..b` lower to the counter
-         loop (the E9039 integer-range form is retired); the exclusive
-         `..=` form and non-integer bounds stay rejected. *)
-      (match start with
-       | Ast.IntLit _ -> ()
-       | _ ->
-           reject diags "E9039"
-             "non-integer range bounds are not available in the bootstrap subset (seed lowering counts integer ranges only)"
-             span);
+         `a..b` / `a..=b`).  Ranges `a..b` lower to the counter loop
+         (the E9039 range form is retired); the exclusive `..=` form
+         stays rejected. *)
+      ignore span;
       check_expr ctx diags start;
       check_expr ctx diags end_
   | Ast.MatchExpr m ->

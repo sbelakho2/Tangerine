@@ -197,11 +197,6 @@ let rejected_specimens : (string * string * string) list =
 end
 |});
 
-    ("Range", "E9039",
-     {|def f() -> Int
-  x..5
-end
-|});
     ("Closure", "E9040",
      {|def f() -> Int
   |x| x + 1
@@ -273,6 +268,14 @@ end
   unsafe "r" do
     1
   end
+end
+|});
+    ("Range", {|def f() -> Int
+  var t = 0
+  for x in 0..5 do
+    t = t + x
+  end
+  t
 end
 |});
     (* E9048 retired 2026-08-28: the lowerer's qualified static-call
