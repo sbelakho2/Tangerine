@@ -544,17 +544,45 @@ and stmt_has_loop_exit (s : Ast.stmt) : bool =
 
 (* ── Type mapping (syntax type → repr) ────────────────────────── *)
 
+let free_params (ty : Type_repr.t) : Ids.Generic_param_id.t list =
+  let acc = ref [] in
+  let rec walk ty =
+    match ty with
+    | Type_repr.Type_param id -> if not (List.mem id !acc) then acc := id :: !acc
+    | Type_repr.Infer_var _ | Type_repr.Int_literal _ | Type_repr.Error -> ()
+    | Type_repr.Raw_ptr (_, t) | Type_repr.Ref_internal (_, t) | Type_repr.Fixed_array (t, _) ->
+        walk t
+    | Type_repr.Tuple elems | Type_repr.Named (_, elems) -> Array.iter walk elems
+    | Type_repr.Function (ps, r) ->
+        Array.iter (fun p -> walk p.Type_repr.pt_type) ps;
+        walk r
+    | Type_repr.Unit | Type_repr.Bool | Type_repr.Char | Type_repr.Int _ | Type_repr.Float _
+    | Type_repr.String | Type_repr.Never ->
+        ()
+  in
+  walk ty;
+  List.rev !acc
+
 let rec type_of_syntax (env : func_env) (t : Ast.type_expr) : Type_repr.t =
   match t with
   | Ast.Named (name, args, _) -> (
       match List.assoc_opt name env.types with
       | Some r ->
-          let subst =
-            List.mapi
-              (fun i _ -> (Type_repr.KParam (Ids.Generic_param_id.make i), type_of_syntax env (List.nth args i)))
-              args
-          in
-          Type_repr.substitute subst r
+          (* the substitution binds the registered type's OWN free
+             parameters (declaration-owned GenericParamIds) — never a
+             positional make i reconstruction, which would miss the
+             canonical builtin ids (Option's T etc.) *)
+          let params = free_params r in
+          if List.length params <> List.length args then
+            seed_bug "type `%s` expects %d type argument(s), got %d" name
+              (List.length params) (List.length args)
+          else
+            let subst =
+              List.map2
+                (fun p a -> (Type_repr.KParam p, type_of_syntax env a))
+                params args
+            in
+            Type_repr.substitute subst r
       | None -> (
           match name with
           | "Int" -> Type_repr.Int Type_repr.Int
@@ -575,7 +603,10 @@ let rec type_of_syntax (env : func_env) (t : Ast.type_expr) : Type_repr.t =
   | Ast.Slice (inner, _) -> Type_repr.Fixed_array (type_of_syntax env inner, 0)
   | Ast.Option (inner, _) -> (
       match List.assoc_opt "Option" env.types with
-      | Some r -> Type_repr.substitute [ (Type_repr.KParam (Ids.Generic_param_id.make 0), type_of_syntax env inner) ] r
+      | Some r -> (
+          match free_params r with
+          | [ p ] -> Type_repr.substitute [ (Type_repr.KParam p, type_of_syntax env inner) ] r
+          | _ -> seed_bug "Option type has no canonical single parameter in lowering")
       | None -> seed_bug "Option type not in env")
   | Ast.Ref (inner, m, _) -> Type_repr.Ref_internal ((if m then Type_repr.Mutable else Type_repr.Immutable), type_of_syntax env inner)
   | Ast.RawPtr (inner, m, _) -> Type_repr.Raw_ptr ((if m then Type_repr.Mutable else Type_repr.Immutable), type_of_syntax env inner)
@@ -1223,24 +1254,50 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
           let arr_op, arr_ty = lower_expr env st f.Ast.for_iterable in
           let arr_id = materialize_place st arr_op in
           let elem_ty = element_type_of arr_ty in
+          let elem_ty_of_tuple k =
+            match elem_ty with
+            | Type_repr.Tuple elems when k < Array.length elems -> elems.(k)
+            | _ -> seed_bug "destructuring for-loop pattern against a non-tuple element type"
+          in
           let bindings =
             match f.Ast.for_pattern with
-            | Ast.PatIdent (n, _, _) -> [ (n, fresh_local st elem_ty) ]
+            | Ast.PatIdent (n, _, _) -> [ (n, fresh_local st elem_ty, None) ]
             | Ast.Wildcard _ -> []
+            | Ast.PatTuple (subs, _) ->
+                (* a destructuring loop `for (a, b) in arr`: each
+                   component is bound through the element's tuple
+                   ConstantIndex projection *)
+                List.mapi
+                  (fun k sub ->
+                    match sub with
+                    | Ast.PatIdent (n, _, _) ->
+                        (n, fresh_local st (elem_ty_of_tuple k), Some k)
+                    | Ast.Wildcard _ ->
+                        ("__wild" ^ string_of_int k, fresh_local st (elem_ty_of_tuple k), Some k)
+                    | _ -> seed_bug "unsupported destructuring for-loop pattern in lowering")
+                  subs
             | _ -> seed_bug "unsupported for-loop pattern in lowering (bind by name or _)"
           in
-          List.iter (fun (n, id) -> st.scope <- (n, id) :: st.scope) bindings;
+          List.iter
+            (fun (n, id, _) ->
+              if not (String.starts_with ~prefix:"__wild" n) then st.scope <- (n, id) :: st.scope)
+            bindings;
           List.iteri
             (fun i _ ->
               List.iter
-                (fun (_, id) ->
+                (fun (_, id, k) ->
+                  let projections =
+                    match k with
+                    | None -> [ Seed_mir.ConstantIndex i ]
+                    | Some k -> [ Seed_mir.ConstantIndex i; Seed_mir.ConstantIndex k ]
+                  in
                   emit st
                     (Seed_mir.Assign
                        ( cur_place st id,
                          Seed_mir.Use
                            (Seed_mir.Copy
                               { Seed_mir.local = arr_id.Seed_mir.local;
-                                projections = [ Seed_mir.ConstantIndex i ] }) )))
+                                projections = arr_id.Seed_mir.projections @ projections }) )))
                 bindings;
               ignore (lower_block env st f.Ast.for_body))
             elems;
@@ -1279,22 +1336,45 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
                 (Seed_mir.SwitchInt
                    (copy_place st (cur_place st cnd_id), [ (1L, body_b) ], join_b));
               push_block st body_b;
+              let elem_ty_of_tuple k =
+                match elem_ty with
+                | Type_repr.Tuple elems when k < Array.length elems -> elems.(k)
+                | _ -> seed_bug "destructuring for-loop pattern against a non-tuple element type"
+              in
               let bindings =
                 match f.Ast.for_pattern with
-                | Ast.PatIdent (n, _, _) -> [ (n, fresh_local st elem_ty) ]
+                | Ast.PatIdent (n, _, _) -> [ (n, fresh_local st elem_ty, None) ]
                 | Ast.Wildcard _ -> []
+                | Ast.PatTuple (subs, _) ->
+                    List.mapi
+                      (fun k sub ->
+                        match sub with
+                        | Ast.PatIdent (n, _, _) ->
+                            (n, fresh_local st (elem_ty_of_tuple k), Some k)
+                        | Ast.Wildcard _ ->
+                            ("__wild" ^ string_of_int k, fresh_local st (elem_ty_of_tuple k), Some k)
+                        | _ -> seed_bug "unsupported destructuring for-loop pattern in lowering")
+                      subs
                 | _ -> seed_bug "unsupported for-loop pattern in lowering (bind by name or _)"
               in
-              List.iter (fun (n, id) -> st.scope <- (n, id) :: st.scope) bindings;
               List.iter
-                (fun (_, id) ->
+                (fun (n, id, _) ->
+                  if not (String.starts_with ~prefix:"__wild" n) then st.scope <- (n, id) :: st.scope)
+                bindings;
+              List.iter
+                (fun (_, id, k) ->
+                  let projections =
+                    match k with
+                    | None -> [ Seed_mir.Index cid ]
+                    | Some k -> [ Seed_mir.Index cid; Seed_mir.ConstantIndex k ]
+                  in
                   emit st
                     (Seed_mir.Assign
                        ( cur_place st id,
                          Seed_mir.Use
                            (Seed_mir.Copy
                               { Seed_mir.local = arr_id.Seed_mir.local;
-                                projections = [ Seed_mir.Index cid ] }) )))
+                                projections }) )))
                 bindings;
               let saved_break = st.break_target in
               let saved_continue = st.continue_target in
@@ -1504,18 +1584,43 @@ and lower_stmt (env : func_env) (st : lower_state) (s : Ast.stmt) : unit =
       ignore (lower_expr env st e)
   | Ast.LetBinding (pat, _, _ty, value, _) ->
       let vo, vt = lower_expr env st value in
-      let name =
-        match pat with
-        | Ast.PatIdent (n, _, _) -> Some n
-        | _ -> None
-      in
       let id = fresh_local st vt in
       emit st (Seed_mir.Assign (cur_place st id, Seed_mir.Use vo));
-      (match name with
-       | Some n ->
-           st.local_names <- (id, n) :: st.local_names;
-           st.scope <- (n, id) :: st.scope
-       | None -> ())
+      let bind_name n bind_id =
+        st.local_names <- (bind_id, n) :: st.local_names;
+        st.scope <- (n, bind_id) :: st.scope
+      in
+      (match pat with
+       | Ast.PatIdent (n, _, _) -> bind_name n id
+       | Ast.PatTuple (subs, _) ->
+           (* a destructuring let `let (a, b) = t`: the tuple value is
+              materialized and each component bound through its
+              ConstantIndex projection *)
+           List.iteri
+             (fun k sub ->
+               match sub with
+               | Ast.PatIdent (n, _, _) ->
+                   let cty =
+                     match vt with
+                     | Type_repr.Tuple elems when k < Array.length elems -> elems.(k)
+                     | _ ->
+                         seed_bug
+                           "destructuring let pattern against a non-tuple value type"
+                   in
+                   let cid = fresh_local st cty in
+                   emit st
+                     (Seed_mir.Assign
+                        ( cur_place st cid,
+                          Seed_mir.Use
+                            (Seed_mir.Copy
+                               { Seed_mir.local = id;
+                                 projections = [ Seed_mir.ConstantIndex k ] }) ));
+                   bind_name n cid
+               | Ast.Wildcard _ -> ()
+               | _ -> seed_bug "unsupported destructuring let pattern in lowering")
+             subs
+       | Ast.Wildcard _ | Ast.PatLiteral _ -> ()
+       | _ -> ())
   | Ast.DeferStmt (b, _) ->
       (* FRONTEND-SUPPORTED (not yet executable-seed-supported per the
          audit): the function-level LIFO stack is an approximation —
@@ -1730,6 +1835,13 @@ and lower_match (env : func_env) (st : lower_state) (m : Ast.match_expr) :
                                     ] }) ));
                     st.scope <- (name, id) :: st.scope)
                | Ast.Wildcard _ -> ()
+               | Ast.PatTuple _ ->
+                   (* a tuple payload `Some((a, b))` fails closed until
+                      the registry-substitution plumbing resolves the
+                      instantiated payload through the def table (the
+                      tuple-payload E9044 stays) *)
+                   seed_bug
+                     "unsupported variant payload pattern in lowering (tuple payloads fail closed — the E9044 tuple form is not yet retired)"
                | _ -> seed_bug "unsupported variant payload pattern in lowering")
              pats)
        | Ast.Wildcard _ | Ast.PatLiteral _ -> ()

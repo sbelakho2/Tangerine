@@ -408,7 +408,7 @@ end
     ("For", "E9045",
      {|def f() -> Int
   var t = 0
-  for (k, v) in m do
+  for (k, (v, w)) in m do
     t = t + 1
   end
   t
@@ -500,7 +500,7 @@ end
    wildcard forms must fire nothing. *)
 let pattern_specimens : (string * string list * string) list =
   [
-    ("destructuring let (E9045)", [ "E9045" ],
+    ("destructuring let (accepted — E9045 tuple form retired)", [],
      {|def f() -> Int
   let (a, b) = (1, 2)
   a + b
@@ -512,7 +512,7 @@ end
   x
 end
 |});
-    ("destructuring for pattern (E9045)", [ "E9045" ],
+    ("destructuring for pattern (accepted — E9045 tuple form retired)", [],
      {|def f() -> Int
   var t = 0
   for (k, v) in m do

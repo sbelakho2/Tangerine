@@ -92,7 +92,8 @@
           with "unknown callee" — the fail-closed channel that replaced
           the firewall rejection.
 
-   Expected main return: 113 (see the derivation comment in src_text). *)
+   Expected main return: 209 (113 + the tuple-destructuring
+   round-trips: tuple_roundtrip 63 + for_roundtrip 33 = 96). *)
 
 let src_text = {|
 enum Color
@@ -164,6 +165,20 @@ def for_sum() -> Int
   total
 end
 
+def tuple_roundtrip() -> Int
+  let (a, b) = (21, 42)
+  a + b
+end
+
+def for_roundtrip() -> Int
+  var t = 0
+  for (k, v) in [(10, 1), (20, 2)] do
+    t = t + k + v
+  end
+  t
+end
+
+
 def defer_order() -> Int
   var acc = 0
   defer
@@ -187,7 +202,9 @@ def main() -> Int
   let k = unwrap_res_or_zero(res_chain(1, 0))
   let h = for_sum()
   let i = defer_order()
-  a + b + c + d + e + f + g + h + i + j + k
+  let l = tuple_roundtrip()
+  let m = for_roundtrip()
+  a + b + c + d + e + f + g + h + i + j + k + l + m
 end
 |}
 
@@ -606,7 +623,11 @@ end
             |];
         }
       in
-      (match Mir_verify.require_valid_template prog with
+      (match
+         Mir_verify.require_valid_template
+           ~generic_types:(Driver.closure_generic_types tcheck_env)
+           prog
+       with
        | Ok () -> Printf.printf "  MIR verify (template mode): PASS (%d functions)\n" (Array.length prog.Seed_mir.functions)
        | Error errs ->
            Printf.printf "  MIR verify (template mode): FAIL\n";
@@ -1348,9 +1369,9 @@ end
                 match Vm.run_inspect vm2 entry_frame with
                 | Ok ret_val ->
                     Printf.printf "  main returned: %s\n" ret_val;
-                    if ret_val = "113" then Printf.printf "  RESULT: PASS\n"
+                    if ret_val = "209" then Printf.printf "  RESULT: PASS\n"
                     else begin
-                      Printf.printf "  RESULT: FAIL (expected 113)\n";
+                      Printf.printf "  RESULT: FAIL (expected 209)\n";
                       exit 1
                     end
                 | Error m -> Printf.printf "  main returned: <inspect failed: %s>\n" m)));

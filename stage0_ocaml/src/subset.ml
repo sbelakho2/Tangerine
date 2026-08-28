@@ -249,9 +249,23 @@ and check_stmt ctx diags (s : Ast.stmt) =
          destructuring form until typed-pattern lowering lands. *)
       (match p with
        | Ast.PatIdent _ -> ()
+       | Ast.PatTuple (subs, _) ->
+           (* tuple destructuring lets `let (a, b) = t` are lowered
+              through the tuple ConstantIndex projections (the E9045
+              tuple form is retired); the nested sub-patterns must be
+              names or `_` *)
+           List.iter
+             (fun sub ->
+               match sub with
+               | Ast.PatIdent _ | Ast.Wildcard _ -> ()
+               | _ ->
+                   reject diags "E9045"
+                     "nested destructuring let patterns are not available in the bootstrap subset (seed lowering binds tuple components by name or `_` only)"
+                     (Ast.pattern_span sub))
+             subs
        | _ ->
            reject diags "E9045"
-             "destructuring let-binding patterns are not available in the bootstrap subset (seed lowering binds let patterns by name only — the destructured names would be unbound at lowering)"
+             "destructuring let-binding patterns are not available in the bootstrap subset (seed lowering binds let patterns by name or tuple components only)"
              (Ast.pattern_span p));
       check_pattern ctx diags p;
       Option.iter (check_type ctx diags false) ty;
@@ -604,9 +618,23 @@ and check_expr ctx diags (e : Ast.expr) =
          pattern"); reject the destructuring form (E9045). *)
       (match f.Ast.for_pattern with
        | Ast.PatIdent _ | Ast.Wildcard _ -> ()
+       | Ast.PatTuple (subs, _) ->
+           (* destructuring loops `for (a, b) in arr` are lowered through
+              the element tuple ConstantIndex projections (the E9045
+              tuple form is retired); the sub-patterns must be names or
+              `_` *)
+           List.iter
+             (fun sub ->
+               match sub with
+               | Ast.PatIdent _ | Ast.Wildcard _ -> ()
+               | _ ->
+                   reject diags "E9045"
+                     "nested destructuring for-loop patterns are not available in the bootstrap subset (seed lowering binds tuple components by name or `_` only)"
+                     (Ast.pattern_span sub))
+             subs
        | p ->
            reject diags "E9045"
-             "destructuring for-loop patterns are not available in the bootstrap subset (seed lowering binds the loop variable by name or `_` only)"
+             "destructuring for-loop patterns are not available in the bootstrap subset (seed lowering binds the loop variable by name, `_` or tuple components only)"
              (Ast.pattern_span p));
       check_pattern ctx diags f.Ast.for_pattern;
       check_expr ctx diags f.Ast.for_iterable;
