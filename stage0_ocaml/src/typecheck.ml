@@ -1537,13 +1537,6 @@ let rec unify (box_tid : Ids.Type_id.t option) (subst : (Type_repr.generic_key *
         var_journal := (Type_repr.KVar v, a') :: !var_journal;
         Ok ()
       end
-  | Type_repr.Type_param pa, Type_repr.Ref_internal (_, Type_repr.Type_param pb)
-    when Ids.Generic_param_id.compare pa pb = 0 ->
-      (* the borrow-of-the-same rigid (`m.get(&key)` against
-         `key: K`): the native accepts the auto-borrow — the arg's
-         reference unifies with the value parameter over the same
-         binder (the borrow is a read-only view of the same K) *)
-      Ok ()
   | Type_repr.Type_param pa, _ ->
       (* RIGID: a declaration binder absent from the substitution has
          not been instantiated — it is rigid within its own declaration
@@ -1588,18 +1581,11 @@ let rec unify (box_tid : Ids.Type_id.t option) (subst : (Type_repr.generic_key *
       if m1 <> m2 then Error "reference mutability mismatch" else unify box_tid subst t1 t2
   | Type_repr.Raw_ptr (m1, t1), Type_repr.Raw_ptr (m2, t2) ->
       if m1 <> m2 then Error "pointer mutability mismatch" else unify box_tid subst t1 t2
-  (* the address-of coercion: an explicit reference unifies with a raw
-     pointer over the same pointee (the sync intrinsics take &x) *)
-  | Type_repr.Raw_ptr (m1, t1), Type_repr.Ref_internal (_, t2)
-  | Type_repr.Ref_internal (_, t1), Type_repr.Raw_ptr (m1, t2) ->
-      if m1 = Type_repr.Mutable then unify box_tid subst t1 t2
-      else Error "pointer mutability mismatch"
-  | Type_repr.Named (id1, [| t1 |]), Type_repr.Ref_internal (_, t2)
-    when Ids.Type_id.compare id1 b_ptr = 0 || Ids.Type_id.compare id1 b_ptrmut = 0 ->
-      unify box_tid subst t1 t2
-  | Type_repr.Ref_internal (_, t1), Type_repr.Named (id2, [| t2 |])
-    when Ids.Type_id.compare id2 b_ptr = 0 || Ids.Type_id.compare id2 b_ptrmut = 0 ->
-      unify box_tid subst t1 t2
+  (* STRICT (the audit's coercion-boundary rule): pointer/reference
+     conversions are NOT fundamental type equality — raw pointers,
+     Ptr[T]/PtrMut[T] nominals, and references are distinct; the
+     address-of / deref / auto-borrow adaptations live at the
+     CALL-BOUNDARY (the call-arg reconciliation), never in unify *)
   (* STRICT (the native model): a reference and a value are NOT
      interchangeable in fundamental equality — RefInternal unifies only
      with RefInternal over equal mutability (the audit: &T == T must
