@@ -314,9 +314,15 @@ and check_stmt ctx diags (s : Ast.stmt) =
          nested items stay rejected until they reach the MIR program. *)
       (match i.Ast.kind with
        | Ast.UseDecl _ -> ()
+       | Ast.Function _ ->
+           (* a nested function def is registered in the checker's
+              nested_functions registry and lowered by the driver as its
+              own seed function (the E9047 nested-def form is retired);
+              calls carry the nested callable id *)
+           ()
        | _ ->
            reject diags "E9047"
-             "nested item definitions are not available in the bootstrap subset (seed lowering drops nested items — a nested def is never registered as a callable)"
+             "nested item definitions are not available in the bootstrap subset (seed lowering drops nested items — only nested functions are registered as callables)"
              i.Ast.span);
       check_item ctx diags i
 
