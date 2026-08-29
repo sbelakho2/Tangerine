@@ -2803,6 +2803,15 @@ and parse_if_expr (p : parser) (start : Span.span) : Ast.expr =
     else else_block := Some (parse_block_body p [ Token.KwEnd ])
   end;
   ignore (eat p Token.KwEnd);
+  (* the if-expr's span must END at the `end` token, not at the NEXT
+     token: the parse_factor continuation check uses
+     source_has_newline (span-end, current) to refuse cross-line
+     multiplicative merges — a span that swallowed the next line's
+     first token would hide the newline and merge
+     `end\n*current_loop_entry` into `end * current_loop_entry` *)
+  let end_span =
+    if p.pos > 0 then p.tokens.(p.pos - 1).Token.span else cur_span p
+  in
   Ast.IfExpr (fresh_node_id p,
     {
       Ast.if_condition = cond;
@@ -2811,7 +2820,7 @@ and parse_if_expr (p : parser) (start : Span.span) : Ast.expr =
       if_else = !else_block;
       if_let_pattern = !let_pat;
       if_let_value = !let_val;
-      if_span = span_merged p start (cur_span p);
+      if_span = span_merged p start end_span;
     })
 
 and parse_unless_expr (p : parser) (start : Span.span) : Ast.expr =
