@@ -347,6 +347,8 @@ STRICT_RE = re.compile(
     r"^EVIDENCE_STRICT diagnostics=(\d+) compatibility_fallback_activations=(\d+)$")
 STRICT_DIAG_RE = re.compile(r"^EVIDENCE_STRICT_DIAG code=(.+) message=(.+) span=(\S+)$")
 MIR_RE = re.compile(r"^EVIDENCE_MIR template_verify=(\S+) concrete_verify=(\S+)$")
+PROFILE_RE = re.compile(r"^EVIDENCE_PROFILE total_findings=(\d+)$")
+PROFILE_COUNT_RE = re.compile(r"^EVIDENCE_PROFILE_COUNT kind=(.+) count=(\d+)$")
 HOST_RE = re.compile(
     r"^EVIDENCE_HOST reachable_closure=(\S+)(?: reachable=(\d+) declared=(\d+) implemented=(\d+))?$")
 
@@ -393,6 +395,14 @@ for line in bc_out.splitlines():
     if m:
         mir["template_verify"] = m.group(1)
         mir["concrete_verify"] = m.group(2)
+        continue
+    m = PROFILE_RE.match(line)
+    if m:
+        typed_profile["total_findings"] = int(m.group(1))
+        continue
+    m = PROFILE_COUNT_RE.match(line)
+    if m:
+        typed_profile["counts_by_kind"][unescape_json_str(m.group(1))] = int(m.group(2))
         continue
     m = HOST_RE.match(line)
     if m:
