@@ -137,7 +137,7 @@ set +e
 timeout 420 _build/default/selfcheck/tg_bootstrap_gate.exe --repo-root .. >/tmp/ocaml_bootstrap_gate.out 2>&1
 GATE_STATUS=$?
 set -e
-SUBSET_N="$(grep -oE 'SUBSET_FIREWALL = FAIL \([0-9]+ findings' /tmp/ocaml_bootstrap_check.out | grep -oE '[0-9]+ findings' | grep -oE '^[0-9]+')"
+SUBSET_N="$(grep -oE 'SUBSET_FIREWALL = (PASS|FAIL \([0-9]+ findings)' /tmp/ocaml_bootstrap_check.out | head -1 | grep -oE 'PASS|[0-9]+' | head -1)"
 if [ "$GATE_STATUS" -eq 0 ]; then
   echo "check_ocaml_seed_health: FULL COMPLETENESS: gate PASS (subset zero)"
   echo "PASS" > /tmp/ocaml_full_completeness_verdict.txt
@@ -152,5 +152,5 @@ if [ "$SELFCHECK_FAIL" -ne 0 ]; then
 fi
 
 echo "check_ocaml_seed_health: tests=${TESTS} (pinned exact inventory) component_selfchecks=${SELFCHECK_COUNT}/24 selfcheck_fail=0 typecheck_debt=${DEBT_TOTAL:-$TC_COUNT} subset_findings=${SUBSET_N:-?}"
-echo "check_ocaml_seed_health: DEVELOPMENT HEALTH PASS — ${SELFCHECK_COUNT} component selfchecks green of 24 selfcheck executables; tg_bootstrap_gate is the FULL-COMPLETENESS gate, reported separately above (RED by design while the subset is nonzero; PASS only at subset zero). This is NOT a compiler-closure PASS — run check_ocaml_bootstrap_complete.sh for the closure gate"
+echo "check_ocaml_seed_health: DEVELOPMENT HEALTH PASS — ${SELFCHECK_COUNT} component selfchecks green of 24 selfcheck executables; tg_bootstrap_gate is the FULL-COMPLETENESS gate, reported separately above (PASS at subset zero; RED while the subset is nonzero). This is NOT a compiler-closure PASS — run check_ocaml_bootstrap_complete.sh for the closure gate"
 echo "check_ocaml_seed_health: seed health ALL REQUIRED CHECKS PASSED (this is NOT a compiler-closure PASS — run check_ocaml_bootstrap_complete.sh for the closure gate)"
