@@ -1463,6 +1463,12 @@ let rec unify (box_tid : Ids.Type_id.t option) (subst : (Type_repr.generic_key *
           (Printf.sprintf "integer literal does not fit its adopted type %s"
              (int_name_of_kind k))
   | Type_repr.Int_literal _, Type_repr.Int_literal _ -> Ok ()
+  | Type_repr.Int _, Type_repr.Int _ ->
+      (* the native's int-kind adaptation: any integer kind unifies
+         with any other at the value level (the codegen's i32 offset
+         params take default-Int returns; u32 adapts to i32, Int to
+         u8, ...) — the value bit-adapts to the parameter's width *)
+      Ok ()
   | Type_repr.Named (id, [| t |]), u when is_box box_tid id -> unify box_tid subst t u
   | u, Type_repr.Named (id, [| t |]) when is_box box_tid id -> unify box_tid subst u t
   | Type_repr.Infer_var v, _ ->
