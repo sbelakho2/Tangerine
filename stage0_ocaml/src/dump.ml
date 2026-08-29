@@ -57,30 +57,30 @@ let unary_op_str = function
 
 let rec dump_expr d (e : Ast.expr) =
   match e with
-  | Ast.IntLit (v, _) -> emit d ("Int(" ^ v ^ ")")
-  | Ast.FloatLit (v, _) -> emit d ("Float(" ^ v ^ ")")
-  | Ast.StringLit (v, _) -> emit d ("String(\"" ^ v ^ "\")")
-  | Ast.CharLit (v, _) -> emit d ("Char('" ^ v ^ "')")
-  | Ast.BoolLit (b, _) -> emit d ("Bool(" ^ string_of_bool b ^ ")")
-  | Ast.Name (n, _) -> emit d ("Name(" ^ n ^ ")")
-  | Ast.Path (a, b, _) -> emit d ("Path(" ^ a ^ "::" ^ b ^ ")")
-  | Ast.Array (elems, _) ->
+  | Ast.IntLit (_, v, _) -> emit d ("Int(" ^ v ^ ")")
+  | Ast.FloatLit (_, v, _) -> emit d ("Float(" ^ v ^ ")")
+  | Ast.StringLit (_, v, _) -> emit d ("String(\"" ^ v ^ "\")")
+  | Ast.CharLit (_, v, _) -> emit d ("Char('" ^ v ^ "')")
+  | Ast.BoolLit (_, b, _) -> emit d ("Bool(" ^ string_of_bool b ^ ")")
+  | Ast.Name (_, n, _) -> emit d ("Name(" ^ n ^ ")")
+  | Ast.Path (_, a, b, _) -> emit d ("Path(" ^ a ^ "::" ^ b ^ ")")
+  | Ast.Array (_, elems, _) ->
       emit d "Array";
       push d;
       List.iter (dump_expr d) elems;
       pop d
-  | Ast.ArrayRepeat (v, c, _) ->
+  | Ast.ArrayRepeat (_, v, c, _) ->
       emit d "ArrayRepeat";
       push d;
       dump_expr d v;
       dump_expr d c;
       pop d
-  | Ast.Tuple (elems, _) ->
+  | Ast.Tuple (_, elems, _) ->
       emit d "Tuple";
       push d;
       List.iter (dump_expr d) elems;
       pop d
-  | Ast.StructLit (name, _, fields, rest, _) ->
+  | Ast.StructLit (_, name, _, fields, rest, _) ->
       emit d ("StructLit(" ^ name ^ ")");
       push d;
       List.iter
@@ -98,17 +98,17 @@ let rec dump_expr d (e : Ast.expr) =
            pop d
        | None -> ());
       pop d
-  | Ast.Block (b, _) ->
+  | Ast.Block (_, b, _) ->
       emit d "Block";
       push d;
       dump_block d b;
       pop d
-  | Ast.UnsafeBlock (reason, b, _) ->
+  | Ast.UnsafeBlock (_, reason, b, _) ->
       emit d ("UnsafeBlock(" ^ reason ^ ")");
       push d;
       dump_block d b;
       pop d
-  | Ast.IfExpr i ->
+  | Ast.IfExpr (_, i) ->
       emit d "If";
       push d;
       emit d "Cond:";
@@ -135,7 +135,7 @@ let rec dump_expr d (e : Ast.expr) =
            pop d
        | None -> ());
       pop d
-  | Ast.Call (callee, _, args, _) ->
+  | Ast.Call (_, callee, _, args, _) ->
       emit d "Call";
       push d;
       emit d "Callee:";
@@ -157,19 +157,19 @@ let rec dump_expr d (e : Ast.expr) =
         pop d
       end;
       pop d
-  | Ast.Index (base, idx, _) ->
+  | Ast.Index (_, base, idx, _) ->
       emit d "Index";
       push d;
       dump_expr d base;
       dump_expr d idx;
       pop d
-  | Ast.Range (s, e, incl, _) ->
+  | Ast.Range (_, s, e, incl, _) ->
       emit d (if incl then "RangeInclusive" else "Range");
       push d;
       dump_expr d s;
       dump_expr d e;
       pop d
-  | Ast.MatchExpr m ->
+  | Ast.MatchExpr (_, m) ->
       emit d "Match";
       push d;
       emit d "Subject:";
@@ -195,18 +195,18 @@ let rec dump_expr d (e : Ast.expr) =
           pop d)
         m.Ast.m_arms;
       pop d
-  | Ast.Cast (e, t, _) ->
+  | Ast.Cast (_, e, t, _) ->
       emit d "Cast";
       push d;
       dump_expr d e;
       dump_type d t;
       pop d
-  | Ast.TryOp (e, _) ->
+  | Ast.TryOp (_, e, _) ->
       emit d "TryOp";
       push d;
       dump_expr d e;
       pop d
-  | Ast.Closure c ->
+  | Ast.Closure (_, c) ->
       emit d "Closure";
       push d;
       if c.Ast.cl_params <> [] then begin
@@ -220,28 +220,28 @@ let rec dump_expr d (e : Ast.expr) =
       dump_expr d c.Ast.cl_body;
       pop d;
       pop d
-  | Ast.Unary (op, e, _) ->
+  | Ast.Unary (_, op, e, _) ->
       emit d ("Unary(" ^ unary_op_str op ^ ")");
       push d;
       dump_expr d e;
       pop d
-  | Ast.Field (base, f, _) ->
+  | Ast.Field (_, base, f, _) ->
       emit d ("Field(." ^ f ^ ")");
       push d;
       dump_expr d base;
       pop d
-  | Ast.Binary (l, op, r, _) ->
+  | Ast.Binary (_, l, op, r, _) ->
       emit d ("Binary(" ^ binary_op_str op ^ ")");
       push d;
       dump_expr d l;
       dump_expr d r;
       pop d
-  | Ast.AwaitExpr (e, _) ->
+  | Ast.AwaitExpr (_, e, _) ->
       emit d "Await";
       push d;
       dump_expr d e;
       pop d
-  | Ast.MacroCall (name, args, _) ->
+  | Ast.MacroCall (_, name, args, _) ->
       emit d ("MacroCall(" ^ name ^ ")");
       push d;
       List.iter
@@ -250,19 +250,19 @@ let rec dump_expr d (e : Ast.expr) =
           | Ast.MacroTokens (text, _) -> emit d ("MacroTokens(" ^ text ^ ")"))
         args;
       pop d
-  | Ast.Assign (t, v, _) ->
+  | Ast.Assign (_, t, v, _) ->
       emit d "Assign";
       push d;
       dump_expr d t;
       dump_expr d v;
       pop d
-  | Ast.CompoundAssign (t, op, v, _) ->
+  | Ast.CompoundAssign (_, t, op, v, _) ->
       emit d ("CompoundAssign(" ^ binary_op_str op ^ ")");
       push d;
       dump_expr d t;
       dump_expr d v;
       pop d
-  | Ast.ReturnExpr (e, _) ->
+  | Ast.ReturnExpr (_, e, _) ->
       emit d "Return";
       (match e with
        | Some e ->
@@ -270,7 +270,7 @@ let rec dump_expr d (e : Ast.expr) =
            dump_expr d e;
            pop d
        | None -> ())
-  | Ast.BreakExpr (e, _) ->
+  | Ast.BreakExpr (_, e, _) ->
       emit d "Break";
       (match e with
        | Some e ->
@@ -279,7 +279,7 @@ let rec dump_expr d (e : Ast.expr) =
            pop d
        | None -> ())
   | Ast.NextExpr _ -> emit d "Next"
-  | Ast.ForExpr f ->
+  | Ast.ForExpr (_, f) ->
       emit d "For";
       push d;
       dump_pattern d f.Ast.for_pattern;
@@ -292,7 +292,7 @@ let rec dump_expr d (e : Ast.expr) =
       dump_block d f.Ast.for_body;
       pop d;
       pop d
-  | Ast.WhileExpr w ->
+  | Ast.WhileExpr (_, w) ->
       emit d "While";
       push d;
       emit d "Cond:";
@@ -304,12 +304,12 @@ let rec dump_expr d (e : Ast.expr) =
       dump_block d w.Ast.wh_body;
       pop d;
       pop d
-  | Ast.LoopExpr (b, _) ->
+  | Ast.LoopExpr (_, b, _) ->
       emit d "Loop";
       push d;
       dump_block d b;
       pop d
-  | Ast.HandleExpr h ->
+  | Ast.HandleExpr (_, h) ->
       emit d ("Handle(" ^ h.Ast.h_effect_name ^ ")");
       push d;
       dump_expr d h.Ast.h_expr;
@@ -321,7 +321,7 @@ let rec dump_expr d (e : Ast.expr) =
           pop d)
         h.Ast.h_arms;
       pop d
-  | Ast.UnlessExpr u ->
+  | Ast.UnlessExpr (_, u) ->
       emit d "Unless";
       push d;
       emit d "Cond:";
@@ -333,7 +333,7 @@ let rec dump_expr d (e : Ast.expr) =
       dump_block d u.Ast.un_body;
       pop d;
       pop d
-  | Ast.UntilExpr u ->
+  | Ast.UntilExpr (_, u) ->
       emit d "Until";
       push d;
       emit d "Cond:";
@@ -345,7 +345,7 @@ let rec dump_expr d (e : Ast.expr) =
       dump_block d u.Ast.ut_body;
       pop d;
       pop d
-  | Ast.TryBlock t ->
+  | Ast.TryBlock (_, t) ->
       emit d "TryBlock";
       push d;
       emit d "Body:";
@@ -367,7 +367,7 @@ let rec dump_expr d (e : Ast.expr) =
            pop d
        | None -> ());
       pop d
-  | Ast.ComptimeBlock (b, _) ->
+  | Ast.ComptimeBlock (_, b, _) ->
       emit d "Comptime";
       push d;
       dump_block d b;

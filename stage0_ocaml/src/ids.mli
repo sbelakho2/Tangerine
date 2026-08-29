@@ -24,6 +24,7 @@ module Field_id = Ids_core.Field_id
 module Variant_id = Ids_core.Variant_id
 module Callable_id = Ids_core.Callable_id
 module Generic_param_id = Ids_core.Generic_param_id
+module Node_id = Ids_core.Node_id
 
 (* Per-struct / per-enum declaration-order positions used by Seed MIR
    projections and discriminant tags (0..n-1). *)

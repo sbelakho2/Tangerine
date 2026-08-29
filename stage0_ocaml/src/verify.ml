@@ -22,19 +22,19 @@ let rec verify_expr diags ctx (e : Ast.expr) =
   | Ast.IntLit _ | Ast.FloatLit _ | Ast.StringLit _ | Ast.CharLit _ | Ast.BoolLit _
   | Ast.Name _ | Ast.NextExpr _ ->
       ()
-  | Ast.Path (_, _, _) -> ()
-  | Ast.Array (elems, _) -> List.iter (verify_expr diags ctx) elems
-  | Ast.ArrayRepeat (v, c, _) ->
+  | Ast.Path (_, _, _, _) -> ()
+  | Ast.Array (_, elems, _) -> List.iter (verify_expr diags ctx) elems
+  | Ast.ArrayRepeat (_, v, c, _) ->
       verify_expr diags ctx v;
       verify_expr diags ctx c
-  | Ast.Tuple (elems, _) -> List.iter (verify_expr diags ctx) elems
-  | Ast.StructLit (_, targs, fields, rest, _) ->
+  | Ast.Tuple (_, elems, _) -> List.iter (verify_expr diags ctx) elems
+  | Ast.StructLit (_, _, targs, fields, rest, _) ->
       List.iter (verify_type diags ctx) targs;
       List.iter (fun (_, v) -> verify_expr diags ctx v) fields;
       Option.iter (verify_expr diags ctx) rest
-  | Ast.Block (b, _) -> verify_block diags ctx b
-  | Ast.UnsafeBlock (_, b, _) -> verify_block diags ctx b
-  | Ast.IfExpr i ->
+  | Ast.Block (_, b, _) -> verify_block diags ctx b
+  | Ast.UnsafeBlock (_, _, b, _) -> verify_block diags ctx b
+  | Ast.IfExpr (_, i) ->
       verify_span diags i.Ast.if_span "if expr";
       verify_expr diags ctx i.Ast.if_condition;
       verify_block diags ctx i.Ast.if_then;
@@ -46,17 +46,17 @@ let rec verify_expr diags ctx (e : Ast.expr) =
       Option.iter (verify_block diags ctx) i.Ast.if_else;
       Option.iter (verify_pattern diags ctx) i.Ast.if_let_pattern;
       Option.iter (verify_expr diags ctx) i.Ast.if_let_value
-  | Ast.Call (callee, targs, args, _) ->
+  | Ast.Call (_, callee, targs, args, _) ->
       verify_expr diags ctx callee;
       List.iter (verify_type diags ctx) targs;
       List.iter (fun a -> verify_expr diags ctx a.Ast.ca_value) args
-  | Ast.Index (b, i, _) ->
+  | Ast.Index (_, b, i, _) ->
       verify_expr diags ctx b;
       verify_expr diags ctx i
-  | Ast.Range (s, e, _, _) ->
+  | Ast.Range (_, s, e, _, _) ->
       verify_expr diags ctx s;
       verify_expr diags ctx e
-  | Ast.MatchExpr m ->
+  | Ast.MatchExpr (_, m) ->
       verify_span diags m.Ast.m_span "match expr";
       verify_expr diags ctx m.Ast.m_subject;
       List.iter
@@ -66,45 +66,45 @@ let rec verify_expr diags ctx (e : Ast.expr) =
           Option.iter (verify_expr diags ctx) arm.Ast.ma_guard;
           verify_expr diags ctx arm.Ast.ma_body)
         m.Ast.m_arms
-  | Ast.Cast (e, t, _) ->
+  | Ast.Cast (_, e, t, _) ->
       verify_expr diags ctx e;
       verify_type diags ctx t
-  | Ast.TryOp (e, _) -> verify_expr diags ctx e
-  | Ast.Closure c ->
+  | Ast.TryOp (_, e, _) -> verify_expr diags ctx e
+  | Ast.Closure (_, c) ->
       verify_span diags c.Ast.cl_span "closure";
       List.iter (fun p -> verify_span diags p.Ast.cp_span "closure") c.Ast.cl_params;
       Option.iter (verify_type diags ctx) c.Ast.cl_return;
       verify_expr diags ctx c.Ast.cl_body
-  | Ast.Unary (_, e, _) -> verify_expr diags ctx e
-  | Ast.Field (b, _, _) -> verify_expr diags ctx b
-  | Ast.Binary (l, _, r, _) ->
+  | Ast.Unary (_, _, e, _) -> verify_expr diags ctx e
+  | Ast.Field (_, b, _, _) -> verify_expr diags ctx b
+  | Ast.Binary (_, l, _, r, _) ->
       verify_expr diags ctx l;
       verify_expr diags ctx r
-  | Ast.AwaitExpr (e, _) -> verify_expr diags ctx e
-  | Ast.MacroCall (_, args, _) ->
+  | Ast.AwaitExpr (_, e, _) -> verify_expr diags ctx e
+  | Ast.MacroCall (_, _, args, _) ->
       List.iter
         (function
           | Ast.MacroExpr e -> verify_expr diags ctx e
           | Ast.MacroTokens (_, s) -> verify_span diags s "macro token tree")
         args
-  | Ast.Assign (t, v, _) ->
+  | Ast.Assign (_, t, v, _) ->
       verify_expr diags ctx t;
       verify_expr diags ctx v
-  | Ast.CompoundAssign (t, _, v, _) ->
+  | Ast.CompoundAssign (_, t, _, v, _) ->
       verify_expr diags ctx t;
       verify_expr diags ctx v
-  | Ast.ReturnExpr (e, _) | Ast.BreakExpr (e, _) -> Option.iter (verify_expr diags ctx) e
-  | Ast.ForExpr f ->
+  | Ast.ReturnExpr (_, e, _) | Ast.BreakExpr (_, e, _) -> Option.iter (verify_expr diags ctx) e
+  | Ast.ForExpr (_, f) ->
       verify_span diags f.Ast.for_span "for expr";
       verify_pattern diags ctx f.Ast.for_pattern;
       verify_expr diags ctx f.Ast.for_iterable;
       verify_block diags ctx f.Ast.for_body
-  | Ast.WhileExpr w ->
+  | Ast.WhileExpr (_, w) ->
       verify_span diags w.Ast.wh_span "while expr";
       verify_expr diags ctx w.Ast.wh_condition;
       verify_block diags ctx w.Ast.wh_body
-  | Ast.LoopExpr (b, _) -> verify_block diags ctx b
-  | Ast.HandleExpr h ->
+  | Ast.LoopExpr (_, b, _) -> verify_block diags ctx b
+  | Ast.HandleExpr (_, h) ->
       verify_span diags h.Ast.h_span "handle expr";
       verify_expr diags ctx h.Ast.h_expr;
       List.iter
@@ -112,16 +112,16 @@ let rec verify_expr diags ctx (e : Ast.expr) =
           List.iter (verify_pattern diags ctx) params;
           verify_expr diags ctx body)
         h.Ast.h_arms
-  | Ast.UnlessExpr u ->
+  | Ast.UnlessExpr (_, u) ->
       verify_span diags u.Ast.un_span "unless expr";
       verify_expr diags ctx u.Ast.un_condition;
       verify_block diags ctx u.Ast.un_body;
       Option.iter (verify_block diags ctx) u.Ast.un_else
-  | Ast.UntilExpr u ->
+  | Ast.UntilExpr (_, u) ->
       verify_span diags u.Ast.ut_span "until expr";
       verify_expr diags ctx u.Ast.ut_condition;
       verify_block diags ctx u.Ast.ut_body
-  | Ast.TryBlock t ->
+  | Ast.TryBlock (_, t) ->
       verify_span diags t.Ast.tr_span "try block";
       verify_block diags ctx t.Ast.tr_body;
       List.iter
@@ -130,7 +130,7 @@ let rec verify_expr diags ctx (e : Ast.expr) =
           verify_block diags ctx b)
         t.Ast.tr_catches;
       Option.iter (verify_block diags ctx) t.Ast.tr_finally
-  | Ast.ComptimeBlock (b, _) -> verify_block diags ctx b
+  | Ast.ComptimeBlock (_, b, _) -> verify_block diags ctx b
 
 and verify_block diags ctx (b : Ast.block_body) =
   verify_span diags b.Ast.b_span "block body";

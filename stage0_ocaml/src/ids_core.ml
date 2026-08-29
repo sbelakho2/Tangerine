@@ -76,6 +76,18 @@ module Generic_param_id = struct
   let of_int (i : int) : t = i
 end
 
+(* Per-expression AST node identity, minted by the parser (a fresh
+   counter per parse).  The OCaml AST has no native NodeId, so the
+   typed-node bridge (typecheck -> lowering) is keyed by this instead
+   of (file_id, span.start), which two nested expressions can share. *)
+module Node_id = struct
+  type t = int
+  let make (i : int) : t = i
+  let compare (a : t) (b : t) = compare a b
+  let to_int (t : t) = t
+  let of_int (i : int) : t = i
+end
+
 (* Per-struct / per-enum declaration-order positions (Seed MIR
    projections and discriminant tags): 0..n-1 within the owner. *)
 module Field_index = struct

@@ -265,45 +265,45 @@ and macro_arg =
   | MacroTokens of string * Span.span
 
 and expr =
-  | IntLit of string * Span.span
-  | FloatLit of string * Span.span
-  | StringLit of string * Span.span
-  | CharLit of string * Span.span
-  | BoolLit of bool * Span.span
-  | Name of string * Span.span
-  | Path of string * string * Span.span
-  | Array of expr list * Span.span
-  | ArrayRepeat of expr * expr * Span.span
-  | Tuple of expr list * Span.span
-  | StructLit of string * type_expr list * (string * expr) list * expr option * Span.span
-  | Block of block_body * Span.span
-  | UnsafeBlock of string * block_body * Span.span
-  | IfExpr of if_expr
-  | Call of expr * type_expr list * call_arg list * Span.span
-  | Index of expr * expr * Span.span
-  | Range of expr * expr * bool * Span.span
-  | MatchExpr of match_expr
-  | Cast of expr * type_expr * Span.span
-  | TryOp of expr * Span.span
-  | Closure of closure_expr
-  | Unary of unary_op * expr * Span.span
-  | Field of expr * string * Span.span
-  | Binary of expr * binary_op * expr * Span.span
-  | AwaitExpr of expr * Span.span
-  | MacroCall of string * macro_arg list * Span.span
-  | Assign of expr * expr * Span.span
-  | CompoundAssign of expr * binary_op * expr * Span.span
-  | ReturnExpr of expr option * Span.span
-  | BreakExpr of expr option * Span.span
-  | NextExpr of Span.span
-  | ForExpr of for_expr
-  | WhileExpr of while_expr
-  | LoopExpr of block_body * Span.span
-  | HandleExpr of handle_expr
-  | UnlessExpr of unless_expr
-  | UntilExpr of until_expr
-  | TryBlock of try_block
-  | ComptimeBlock of block_body * Span.span
+  | IntLit of Ids.Node_id.t * string * Span.span
+  | FloatLit of Ids.Node_id.t * string * Span.span
+  | StringLit of Ids.Node_id.t * string * Span.span
+  | CharLit of Ids.Node_id.t * string * Span.span
+  | BoolLit of Ids.Node_id.t * bool * Span.span
+  | Name of Ids.Node_id.t * string * Span.span
+  | Path of Ids.Node_id.t * string * string * Span.span
+  | Array of Ids.Node_id.t * expr list * Span.span
+  | ArrayRepeat of Ids.Node_id.t * expr * expr * Span.span
+  | Tuple of Ids.Node_id.t * expr list * Span.span
+  | StructLit of Ids.Node_id.t * string * type_expr list * (string * expr) list * expr option * Span.span
+  | Block of Ids.Node_id.t * block_body * Span.span
+  | UnsafeBlock of Ids.Node_id.t * string * block_body * Span.span
+  | IfExpr of Ids.Node_id.t * if_expr
+  | Call of Ids.Node_id.t * expr * type_expr list * call_arg list * Span.span
+  | Index of Ids.Node_id.t * expr * expr * Span.span
+  | Range of Ids.Node_id.t * expr * expr * bool * Span.span
+  | MatchExpr of Ids.Node_id.t * match_expr
+  | Cast of Ids.Node_id.t * expr * type_expr * Span.span
+  | TryOp of Ids.Node_id.t * expr * Span.span
+  | Closure of Ids.Node_id.t * closure_expr
+  | Unary of Ids.Node_id.t * unary_op * expr * Span.span
+  | Field of Ids.Node_id.t * expr * string * Span.span
+  | Binary of Ids.Node_id.t * expr * binary_op * expr * Span.span
+  | AwaitExpr of Ids.Node_id.t * expr * Span.span
+  | MacroCall of Ids.Node_id.t * string * macro_arg list * Span.span
+  | Assign of Ids.Node_id.t * expr * expr * Span.span
+  | CompoundAssign of Ids.Node_id.t * expr * binary_op * expr * Span.span
+  | ReturnExpr of Ids.Node_id.t * expr option * Span.span
+  | BreakExpr of Ids.Node_id.t * expr option * Span.span
+  | NextExpr of Ids.Node_id.t * Span.span
+  | ForExpr of Ids.Node_id.t * for_expr
+  | WhileExpr of Ids.Node_id.t * while_expr
+  | LoopExpr of Ids.Node_id.t * block_body * Span.span
+  | HandleExpr of Ids.Node_id.t * handle_expr
+  | UnlessExpr of Ids.Node_id.t * unless_expr
+  | UntilExpr of Ids.Node_id.t * until_expr
+  | TryBlock of Ids.Node_id.t * try_block
+  | ComptimeBlock of Ids.Node_id.t * block_body * Span.span
 
 and binary_op =
   | BOr | BAnd | BitOr | BitXor | BitAnd | Shl | Shr | Add | Sub | Mul | Div
@@ -384,24 +384,49 @@ and pattern =
 
 let expr_span (e : expr) : Span.span =
   match e with
-  | IntLit (_, s) | FloatLit (_, s) | StringLit (_, s) | CharLit (_, s)
-  | BoolLit (_, s) | Name (_, s) | Path (_, _, s) | Array (_, s)
-  | ArrayRepeat (_, _, s) | Tuple (_, s) | StructLit (_, _, _, _, s)
-  | Block (_, s) | UnsafeBlock (_, _, s) | Call (_, _, _, s) | Index (_, _, s)
-  | Range (_, _, _, s) | Cast (_, _, s) | TryOp (_, s) | Unary (_, _, s)
-  | Field (_, _, s) | Binary (_, _, _, s) | AwaitExpr (_, s)
-  | MacroCall (_, _, s) | Assign (_, _, s) | CompoundAssign (_, _, _, s)
-  | ReturnExpr (_, s) | BreakExpr (_, s) | NextExpr s | LoopExpr (_, s)
-  | ComptimeBlock (_, s) -> s
-  | IfExpr e -> e.if_span
-  | MatchExpr e -> e.m_span
-  | Closure e -> e.cl_span
-  | ForExpr e -> e.for_span
-  | WhileExpr e -> e.wh_span
-  | HandleExpr e -> e.h_span
-  | UnlessExpr e -> e.un_span
-  | UntilExpr e -> e.ut_span
-  | TryBlock e -> e.tr_span
+  | IntLit (_, _, s) | FloatLit (_, _, s) | StringLit (_, _, s) | CharLit (_, _, s)
+  | BoolLit (_, _, s) | Name (_, _, s) | Path (_, _, _, s) | Array (_, _, s)
+  | ArrayRepeat (_, _, _, s) | Tuple (_, _, s) | StructLit (_, _, _, _, _, s)
+  | Block (_, _, s) | UnsafeBlock (_, _, _, s) | Call (_, _, _, _, s)
+  | Index (_, _, _, s) | Range (_, _, _, _, s) | Cast (_, _, _, s) | TryOp (_, _, s)
+  | Unary (_, _, _, s) | Field (_, _, _, s) | Binary (_, _, _, _, s)
+  | AwaitExpr (_, _, s) | MacroCall (_, _, _, s) | Assign (_, _, _, s)
+  | CompoundAssign (_, _, _, _, s) | ReturnExpr (_, _, s) | BreakExpr (_, _, s)
+  | NextExpr (_, s) | LoopExpr (_, _, s) | ComptimeBlock (_, _, s) -> s
+  | IfExpr (_, e) -> e.if_span
+  | MatchExpr (_, e) -> e.m_span
+  | Closure (_, e) -> e.cl_span
+  | ForExpr (_, e) -> e.for_span
+  | WhileExpr (_, e) -> e.wh_span
+  | HandleExpr (_, e) -> e.h_span
+  | UnlessExpr (_, e) -> e.un_span
+  | UntilExpr (_, e) -> e.ut_span
+  | TryBlock (_, e) -> e.tr_span
+
+(* Every expression node carries a parser-minted NodeId (the AST has no
+   native NodeId, so identity is per-node rather than per-span: two nested
+   expressions can share a start position, which would make a span-keyed
+   typed-node bridge unsound). *)
+let expr_node_id (e : expr) : Ids.Node_id.t =
+  match e with
+  | IntLit (n, _, _) | FloatLit (n, _, _) | StringLit (n, _, _) | CharLit (n, _, _)
+  | BoolLit (n, _, _) | Name (n, _, _) | Path (n, _, _, _) | Array (n, _, _)
+  | ArrayRepeat (n, _, _, _) | Tuple (n, _, _) | StructLit (n, _, _, _, _, _)
+  | Block (n, _, _) | UnsafeBlock (n, _, _, _) | Call (n, _, _, _, _)
+  | Index (n, _, _, _) | Range (n, _, _, _, _) | Cast (n, _, _, _) | TryOp (n, _, _)
+  | Unary (n, _, _, _) | Field (n, _, _, _) | Binary (n, _, _, _, _)
+  | AwaitExpr (n, _, _) | MacroCall (n, _, _, _) | Assign (n, _, _, _)
+  | CompoundAssign (n, _, _, _, _) | ReturnExpr (n, _, _) | BreakExpr (n, _, _)
+  | NextExpr (n, _) | LoopExpr (n, _, _) | ComptimeBlock (n, _, _) -> n
+  | IfExpr (n, _) | MatchExpr (n, _) | Closure (n, _) | ForExpr (n, _)
+  | WhileExpr (n, _) | HandleExpr (n, _) | UnlessExpr (n, _) | UntilExpr (n, _)
+  | TryBlock (n, _) -> n
+
+(* NodeId for synthetic expressions minted outside the parser (the
+   typechecker's synthetic receiver names).  Negative ids never collide
+   with parser-minted ids, and the typed-node bridge is only consumed
+   for AST nodes the parser produced. *)
+let synthetic_node_id : Ids.Node_id.t = Ids.Node_id.make (-1)
 
 let type_span (t : type_expr) : Span.span =
   match t with

@@ -7,6 +7,14 @@
      a warning; the grammar is the spec here).
    - E1100: expected-token parse errors. *)
 
+(* Node identity must be unique across the WHOLE program: each
+   Parser.parse call would otherwise restart its counter at 0 and two
+   expressions in different files would share an id — the same
+   collision class the (file_id, span.start) key had.  The parser
+   record's next_node_id is seeded from this process-global counter and
+   synced back when the parse completes. *)
+let node_id_global = ref 0
+
 type parser = {
   tokens : Token.t array;
   source : string;
@@ -19,6 +27,7 @@ type parser = {
   mutable extern_abi_context : bool;
   mutable match_arm_cols : int list;
   mutable type_arg_depth : int;
+  mutable next_node_id : int;
 }
 
 let make tokens source file_id diags =
@@ -34,6 +43,7 @@ let make tokens source file_id diags =
     extern_abi_context = false;
     match_arm_cols = [];
     type_arg_depth = 0;
+    next_node_id = !node_id_global;
   }
 
 (* Module identity is provided by the manifest loader, never derived from
@@ -92,6 +102,15 @@ let expected p what =
 (* Span from a start span to the last consumed token's end. *)
 let span_end (p : parser) (start : Span.span) : Span.span =
   Span.make start.Span.start p.prev_end p.file_id
+
+(* Fresh per-expression NodeId (the AST has no native NodeId; the parser
+   mints one per expression node so the typed-node bridge is never keyed
+   by span identity). *)
+let fresh_node_id (p : parser) : Ids.Node_id.t =
+  let n = p.next_node_id in
+  p.next_node_id <- p.next_node_id + 1;
+  node_id_global := p.next_node_id;
+  Ids.Node_id.make n
 
 (* The parser is single-file: every span shares one file id, so merges
    cannot cross files and the total merge is safe. *)
@@ -701,7 +720,7 @@ and parse_stmt (p : parser) (_terminators : Token.kind list) : Ast.stmt =
        | None ->
            err p "E1100" "expected item" (cur_span p);
            ignore (advance p);
-           Ast.ExprStmt (Ast.Name ("", start), start))
+           Ast.ExprStmt (Ast.Name (fresh_node_id p, "", start), start))
   | Token.At ->
       let attrs = parse_attributes p in
       (match parse_item_with_attrs p attrs with
@@ -731,7 +750,7 @@ and parse_stmt (p : parser) (_terminators : Token.kind list) : Ast.stmt =
            parse_expr_stmt p start
        | _ ->
            ignore (advance p);
-           Ast.ExprStmt (Ast.NextExpr (span_end p start), span_end p start))
+           Ast.ExprStmt (Ast.NextExpr (fresh_node_id p, span_end p start), span_end p start))
   | _ -> parse_expr_stmt p start
 
 and parse_expr_stmt (p : parser) (start : Span.span) : Ast.stmt =
@@ -741,7 +760,7 @@ and parse_expr_stmt (p : parser) (start : Span.span) : Ast.stmt =
   | Token.Eq ->
       ignore (advance p);
       let v = parse_expr p in
-      Ast.ExprStmt (Ast.Assign (e, v, span_end p start), span_end p start)
+      Ast.ExprStmt (Ast.Assign (fresh_node_id p, e, v, span_end p start), span_end p start)
   | Token.PlusEq | Token.MinusEq | Token.StarEq | Token.SlashEq | Token.PercentEq ->
       let op =
         match k with
@@ -754,7 +773,7 @@ and parse_expr_stmt (p : parser) (start : Span.span) : Ast.stmt =
       ignore (advance p);
       let v = parse_expr p in
       Ast.ExprStmt
-        (Ast.CompoundAssign (e, op, v, span_end p start),
+        (Ast.CompoundAssign (fresh_node_id p, e, op, v, span_end p start),
          span_end p start)
   | _ -> Ast.ExprStmt (e, span_end p start)
 
@@ -908,7 +927,7 @@ and parse_optional_type_args (p : parser) : Ast.type_expr list =
         | Token.Integer lit ->
             ignore (advance p);
             args :=
-              Ast.ConstExpr (Ast.IntLit (lit, span_merged p start (cur_span p)), span_merged p start (cur_span p))
+              Ast.ConstExpr (Ast.IntLit (fresh_node_id p, lit, span_merged p start (cur_span p)), span_merged p start (cur_span p))
               :: !args
         | _ -> args := parse_type p :: !args;
       if not (at p Token.RBracket) then ignore (eat p Token.Comma)
@@ -1481,7 +1500,7 @@ and parse_extern_static (p : parser) : Ast.item =
           st_public = false;
           st_mutable = mutable_;
           st_type = ty;
-          st_value = Ast.Name ("", Span.synthetic);
+          st_value = Ast.Name (fresh_node_id p, "", Span.synthetic);
           st_span = span_end p start;
         };
     attributes = [];
@@ -1669,7 +1688,7 @@ and parse_logical_or (p : parser) : Ast.expr =
     let start = cur_span p in
     ignore (advance p);
     let right = parse_logical_and p in
-    left := Ast.Binary (!left, Ast.BOr, right, span_end p start)
+    left := Ast.Binary (fresh_node_id p, !left, Ast.BOr, right, span_end p start)
   done;
   !left
 
@@ -1679,7 +1698,7 @@ and parse_logical_and (p : parser) : Ast.expr =
     let start = cur_span p in
     ignore (advance p);
     let right = parse_range p in
-    left := Ast.Binary (!left, Ast.BAnd, right, span_end p start)
+    left := Ast.Binary (fresh_node_id p, !left, Ast.BAnd, right, span_end p start)
   done;
   !left
 
@@ -1694,10 +1713,10 @@ and parse_range (p : parser) : Ast.expr =
       | Token.Comma | Token.RParen | Token.RBracket | Token.RBrace | Token.KwEnd
       | Token.KwThen | Token.KwDo | Token.KwElse | Token.KwElsif | Token.KwWhen
       | Token.Eof | Token.Semi ->
-          Ast.Name ("", Span.synthetic)
+          Ast.Name (fresh_node_id p, "", Span.synthetic)
       | _ -> parse_equality p
     in
-    Ast.Range (left, right, inclusive, span_end p start)
+    Ast.Range (fresh_node_id p, left, right, inclusive, span_end p start)
   end
   else left
 
@@ -1708,7 +1727,7 @@ and parse_equality (p : parser) : Ast.expr =
     let op = if at p Token.EqEq then Ast.Eq else Ast.NotEq in
     ignore (advance p);
     let right = parse_comparison p in
-    left := Ast.Binary (!left, op, right, span_end p start)
+    left := Ast.Binary (fresh_node_id p, !left, op, right, span_end p start)
   done;
   !left
 
@@ -1725,7 +1744,7 @@ and parse_comparison (p : parser) : Ast.expr =
     in
     ignore (advance p);
     let right = parse_bitwise_or p in
-    left := Ast.Binary (!left, op, right, span_end p start)
+    left := Ast.Binary (fresh_node_id p, !left, op, right, span_end p start)
   done;
   !left
 
@@ -1735,7 +1754,7 @@ and parse_bitwise_or (p : parser) : Ast.expr =
     let start = cur_span p in
     ignore (advance p);
     let right = parse_bitwise_xor p in
-    left := Ast.Binary (!left, Ast.BitOr, right, span_end p start)
+    left := Ast.Binary (fresh_node_id p, !left, Ast.BitOr, right, span_end p start)
   done;
   !left
 
@@ -1745,7 +1764,7 @@ and parse_bitwise_xor (p : parser) : Ast.expr =
     let start = cur_span p in
     ignore (advance p);
     let right = parse_bitwise_and p in
-    left := Ast.Binary (!left, Ast.BitXor, right, span_end p start)
+    left := Ast.Binary (fresh_node_id p, !left, Ast.BitXor, right, span_end p start)
   done;
   !left
 
@@ -1755,7 +1774,7 @@ and parse_bitwise_and (p : parser) : Ast.expr =
     let start = cur_span p in
     ignore (advance p);
     let right = parse_shift p in
-    left := Ast.Binary (!left, Ast.BitAnd, right, span_end p start)
+    left := Ast.Binary (fresh_node_id p, !left, Ast.BitAnd, right, span_end p start)
   done;
   !left
 
@@ -1766,7 +1785,7 @@ and parse_shift (p : parser) : Ast.expr =
     let op = if at p Token.Shl then Ast.Shl else Ast.Shr in
     ignore (advance p);
     let right = parse_term p in
-    left := Ast.Binary (!left, op, right, span_end p start)
+    left := Ast.Binary (fresh_node_id p, !left, op, right, span_end p start)
   done;
   !left
 
@@ -1795,7 +1814,7 @@ and parse_term (p : parser) : Ast.expr =
     let op = if at p Token.Plus then Ast.Add else Ast.Sub in
     ignore (advance p);
     let right = parse_factor p in
-    left := Ast.Binary (!left, op, right, span_end p start)
+    left := Ast.Binary (fresh_node_id p, !left, op, right, span_end p start)
   done;
   !left
 
@@ -1828,7 +1847,7 @@ and parse_factor (p : parser) : Ast.expr =
         end
       in
       let right = parse_unary p in
-      left := Ast.Binary (!left, op, right, span_end p start);
+      left := Ast.Binary (fresh_node_id p, !left, op, right, span_end p start);
       loop ()
     end
   in
@@ -1841,36 +1860,36 @@ and parse_unary (p : parser) : Ast.expr =
   | Token.Minus ->
       ignore (advance p);
       let inner = parse_unary p in
-      Ast.Unary (Ast.Neg, inner, span_end p start)
+      Ast.Unary (fresh_node_id p, Ast.Neg, inner, span_end p start)
   | Token.Bang ->
       ignore (advance p);
       let inner = parse_unary p in
-      Ast.Unary (Ast.Not, inner, span_end p start)
+      Ast.Unary (fresh_node_id p, Ast.Not, inner, span_end p start)
   | Token.Tilde ->
       ignore (advance p);
       let inner = parse_unary p in
-      Ast.Unary (Ast.BitNot, inner, span_end p start)
+      Ast.Unary (fresh_node_id p, Ast.BitNot, inner, span_end p start)
   | Token.Amp ->
       let amp_span = cur_span p in
       ignore (advance p);
       if at p Token.KwMut && (peek p).Token.span.Span.start = amp_span.Span.end_ then begin
         ignore (advance p);
         let inner = parse_unary p in
-        Ast.Unary (Ast.BorrowMut, inner, span_end p start)
+        Ast.Unary (fresh_node_id p, Ast.BorrowMut, inner, span_end p start)
       end
       else begin
         let inner = parse_unary p in
-        Ast.Unary (Ast.Borrow, inner, span_end p start)
+        Ast.Unary (fresh_node_id p, Ast.Borrow, inner, span_end p start)
       end
   | Token.Star ->
       ignore (advance p);
       if at p Token.Star then ignore (advance p);
       let inner = parse_unary p in
-      Ast.Unary (Ast.Deref, inner, span_end p start)
+      Ast.Unary (fresh_node_id p, Ast.Deref, inner, span_end p start)
   | Token.KwAwait ->
       ignore (advance p);
       let inner = parse_unary p in
-      Ast.AwaitExpr (inner, span_end p start)
+      Ast.AwaitExpr (fresh_node_id p, inner, span_end p start)
   | _ -> parse_postfix p
 
 and parse_postfix (p : parser) : Ast.expr =
@@ -1880,7 +1899,7 @@ and parse_postfix (p : parser) : Ast.expr =
     | Token.Question ->
         let start = cur_span p in
         ignore (advance p);
-        e := Ast.TryOp (!e, span_end p start);
+        e := Ast.TryOp (fresh_node_id p, !e, span_end p start);
         loop ()
     | Token.Dot ->
         let start = cur_span p in
@@ -1888,7 +1907,7 @@ and parse_postfix (p : parser) : Ast.expr =
         (match kind p with
          | Token.Integer idx ->
              ignore (advance p);
-             e := Ast.Field (!e, idx, span_end p start);
+             e := Ast.Field (fresh_node_id p, !e, idx, span_end p start);
              loop ()
          | _ -> (
              match soft_ident_kind (kind p) with
@@ -1902,13 +1921,15 @@ and parse_postfix (p : parser) : Ast.expr =
                    let args = parse_call_args p in
                    e :=
                      Ast.Call
-                       (Ast.Field (!e, name, span_end p start), type_args, args,
+                       (fresh_node_id p,
+                       Ast.Field (fresh_node_id p, !e, name, span_end p start), type_args, args,
                         span_end p start);
                    if at p Token.LBrace then begin
                      let cl = parse_trailing_closure p in
                      e :=
                        Ast.Call
-                         (Ast.Field (!e, name, span_end p start), type_args, cl,
+                         (fresh_node_id p,
+                          Ast.Field (fresh_node_id p, !e, name, span_end p start), type_args, cl,
                           span_end p start)
                    end
                  end
@@ -1916,38 +1937,32 @@ and parse_postfix (p : parser) : Ast.expr =
                    let cl = parse_trailing_closure p in
                    e :=
                      Ast.Call
-                       (Ast.Field (!e, name, span_end p start), type_args, cl,
+                       (fresh_node_id p,
+                        Ast.Field (fresh_node_id p, !e, name, span_end p start), type_args, cl,
                         span_end p start)
                  end
-                 else e := Ast.Field (!e, name, span_end p start);
+                 else e := Ast.Field (fresh_node_id p, !e, name, span_end p start);
                  loop ()
              | None ->
                  expected p "field name after '.'";
                  loop ()))
     | Token.LParen ->
-        (* a `(` at the start of a new line after a statement-form
-           expression begins a NEW statement (a parenthesized value), not
-           a call application: `if ... end` followed by `()` parses as
-           two statements (the statement-boundary semantics) *)
-        let statement_form e =
-          match e with
-          | Ast.WhileExpr _ | Ast.ForExpr _ | Ast.LoopExpr _ | Ast.MatchExpr _
-          | Ast.IfExpr _ | Ast.Block _ | Ast.UnsafeBlock _ | Ast.NextExpr _
-          | Ast.BreakExpr _ | Ast.ReturnExpr _ | Ast.Assign _
-          | Ast.CompoundAssign _ | Ast.Cast _ | Ast.Binary _ ->
-              true
-          | _ -> false
-        in
-        (* the statement-form's span can extend into the following
-           token (the if-expr span merges the next token); the
-           statement boundary is the last CONSUMED token's end *)
+        (* a `(` at the start of a NEW LINE never continues the previous
+           expression (native at_postfix_start parity): it begins a NEW
+           statement — `if ... end` followed by `()` parses as two
+           statements, and a trailing `xs.pop()` followed by `()` must
+           not become `pop()()` (a call on the pop result, which would
+           type as a call of an Option value) *)
+        (* the previous expression's span can extend into the following
+           token (the if-expr span merges the next token); the statement
+           boundary is the last CONSUMED token's end *)
         let boundary = Span.make p.prev_end p.prev_end p.file_id in
-        if statement_form !e && source_has_newline p boundary (cur_span p)
+        if source_has_newline p boundary (cur_span p)
         then ()
         else begin
           let start = cur_span p in
           let args = parse_call_args p in
-          e := Ast.Call (!e, [], args, span_end p start);
+          e := Ast.Call (fresh_node_id p, !e, [], args, span_end p start);
           loop ()
         end
     | Token.LBracket ->
@@ -1957,7 +1972,7 @@ and parse_postfix (p : parser) : Ast.expr =
            — a known query name followed by a bracketed type and a call *)
         let query_name =
           match !e with
-          | Ast.Name (n, _) when n = "size_of" || n = "align_of" -> Some n
+          | Ast.Name (_, n, _) when n = "size_of" || n = "align_of" -> Some n
           | _ -> None
         in
         if query_name <> None then begin
@@ -1965,32 +1980,32 @@ and parse_postfix (p : parser) : Ast.expr =
           expect p Token.RBracket "']' in type application";
           if at p Token.LParen then begin
             let args = parse_call_args p in
-            e := Ast.Call (Ast.Name (Option.get query_name, start), [ ty ], args, span_end p start);
+            e := Ast.Call (fresh_node_id p, Ast.Name (fresh_node_id p, Option.get query_name, start), [ ty ], args, span_end p start);
             loop ()
           end
           else begin
             (* not a call: fall back to the index interpretation *)
-            e := Ast.Index (Ast.Name (Option.get query_name, start), Ast.Name ("", start), span_end p start);
+            e := Ast.Index (fresh_node_id p, Ast.Name (fresh_node_id p, Option.get query_name, start), Ast.Name (fresh_node_id p, "", start), span_end p start);
             loop ()
           end
         end
         else begin
           let idx = parse_expr p in
           expect p Token.RBracket "']' in index";
-          e := Ast.Index (!e, idx, span_end p start);
+          e := Ast.Index (fresh_node_id p, !e, idx, span_end p start);
           loop ()
         end
     | Token.KwAs ->
         let start = cur_span p in
         ignore (advance p);
         let ty = parse_type p in
-        e := Ast.Cast (!e, ty, span_end p start);
+        e := Ast.Cast (fresh_node_id p, !e, ty, span_end p start);
         loop ()
     | Token.Ident i when i.Token.spelling = "is" ->
         let start = cur_span p in
         ignore (advance p);
         let ty = parse_type p in
-        e := Ast.Cast (!e, ty, span_end p start);
+        e := Ast.Cast (fresh_node_id p, !e, ty, span_end p start);
         loop ()
     | Token.Pipe when (peek_at p 1).Token.kind = Token.Gt
                       && (peek p).Token.span.Span.end_ = (peek_at p 1).Token.span.Span.start ->
@@ -2000,7 +2015,7 @@ and parse_postfix (p : parser) : Ast.expr =
         let rhs = parse_postfix p in
         e :=
           Ast.Call
-            (rhs, [],
+            (fresh_node_id p, rhs, [],
              [ { Ast.ca_label = None; ca_value = !e; ca_span = start } ],
              span_end p start);
         loop ()
@@ -2062,7 +2077,7 @@ and parse_trailing_closure (p : parser) : Ast.call_arg list =
     if at p Token.KwEnd then begin
       let b = parse_block_body p [ Token.KwEnd ] in
       expect p Token.KwEnd "'end' in trailing closure";
-      block_to_expr b
+      block_to_expr p b
     end
     else parse_expr p
   in
@@ -2075,34 +2090,34 @@ and parse_trailing_closure (p : parser) : Ast.call_arg list =
       cl_span = span_end p start;
     }
   in
-  [ { Ast.ca_label = None; ca_value = Ast.Closure cl; ca_span = span_end p start } ]
+  [ { Ast.ca_label = None; ca_value = Ast.Closure (fresh_node_id p, cl); ca_span = span_end p start } ]
 
-and block_to_expr (b : Ast.block_body) : Ast.expr =
+and block_to_expr (p : parser) (b : Ast.block_body) : Ast.expr =
   match b.Ast.b_tail with
   | Some e -> e
-  | None -> Ast.Name ("", Span.synthetic)
+  | None -> Ast.Name (fresh_node_id p, "", Span.synthetic)
 
 and parse_primary (p : parser) : Ast.expr =
   let start = cur_span p in
   match kind p with
   | Token.Integer lit ->
       ignore (advance p);
-      Ast.IntLit (lit, start)
+      Ast.IntLit (fresh_node_id p, lit, start)
   | Token.Float lit ->
       ignore (advance p);
-      Ast.FloatLit (lit, start)
+      Ast.FloatLit (fresh_node_id p, lit, start)
   | Token.String s ->
       ignore (advance p);
-      Ast.StringLit (s, start)
+      Ast.StringLit (fresh_node_id p, s, start)
   | Token.Char c ->
       ignore (advance p);
-      Ast.CharLit (c, start)
+      Ast.CharLit (fresh_node_id p, c, start)
   | Token.KwTrue ->
       ignore (advance p);
-      Ast.BoolLit (true, start)
+      Ast.BoolLit (fresh_node_id p, true, start)
   | Token.KwFalse ->
       ignore (advance p);
-      Ast.BoolLit (false, start)
+      Ast.BoolLit (fresh_node_id p, false, start)
   | Token.KwSelfValue ->
       let start = cur_span p in
       ignore (advance p);
@@ -2117,11 +2132,11 @@ and parse_primary (p : parser) : Ast.expr =
         end;
         if at p Token.LParen then begin
           let args = parse_call_args p in
-          Ast.Call (Ast.Name (!full, span_end p start), [], args, span_end p start)
+          Ast.Call (fresh_node_id p, Ast.Name (fresh_node_id p, !full, span_end p start), [], args, span_end p start)
         end
-        else Ast.Name (!full, span_end p start)
+        else Ast.Name (fresh_node_id p, !full, span_end p start)
       end
-      else Ast.Name ("self", span_end p start)
+      else Ast.Name (fresh_node_id p, "self", span_end p start)
   | Token.KwSelfTy ->
       let start = cur_span p in
       ignore (advance p);
@@ -2140,18 +2155,18 @@ and parse_primary (p : parser) : Ast.expr =
           parse_end_struct_literal p !full [] start
         else if at p Token.LParen then begin
           let args = parse_call_args p in
-          Ast.Call (Ast.Name (!full, span_end p start), [], args, span_end p start)
+          Ast.Call (fresh_node_id p, Ast.Name (fresh_node_id p, !full, span_end p start), [], args, span_end p start)
         end
-        else Ast.Name (!full, span_end p start)
+        else Ast.Name (fresh_node_id p, !full, span_end p start)
       end
-      else Ast.Name ("Self", span_end p start)
+      else Ast.Name (fresh_node_id p, "Self", span_end p start)
   | Token.Ident _ | Token.KwSuper | Token.KwCrate ->
       parse_ident_expr p start
   | Token.LParen ->
       ignore (advance p);
       if at p Token.RParen then begin
         ignore (advance p);
-        Ast.Tuple ([], span_end p start)
+        Ast.Tuple (fresh_node_id p, [], span_end p start)
       end
       else begin
         let first = parse_expr p in
@@ -2162,7 +2177,7 @@ and parse_primary (p : parser) : Ast.expr =
             else elems := parse_expr p :: !elems
           done;
           expect p Token.RParen "')' in tuple";
-          Ast.Tuple (List.rev !elems, span_end p start)
+          Ast.Tuple (fresh_node_id p, List.rev !elems, span_end p start)
         end
         else begin
           expect p Token.RParen "')' in group";
@@ -2173,14 +2188,14 @@ and parse_primary (p : parser) : Ast.expr =
       ignore (advance p);
       if at p Token.RBracket then begin
         ignore (advance p);
-        Ast.Array ([], span_end p start)
+        Ast.Array (fresh_node_id p, [], span_end p start)
       end
       else begin
         let first = parse_expr p in
         if eat p Token.Semi then begin
           let count = parse_expr p in
           expect p Token.RBracket "']' in array repeat";
-          Ast.ArrayRepeat (first, count, span_end p start)
+          Ast.ArrayRepeat (fresh_node_id p, first, count, span_end p start)
         end
         else begin
           let elems = ref [ first ] in
@@ -2206,7 +2221,7 @@ and parse_primary (p : parser) : Ast.expr =
           in
           more ();
           expect p Token.RBracket "']' in array literal";
-          Ast.Array (List.rev !elems, span_end p start)
+          Ast.Array (fresh_node_id p, List.rev !elems, span_end p start)
         end
       end
   | Token.LBrace ->
@@ -2216,7 +2231,7 @@ and parse_primary (p : parser) : Ast.expr =
         ignore (advance p);
         let body = parse_block_body p [ Token.RBrace ] in
         expect p Token.RBrace "'}' in block";
-        Ast.Block (body, span_end p start)
+        Ast.Block (fresh_node_id p, body, span_end p start)
       end
   | Token.Pipe -> parse_pipe_closure p start
   | Token.KwDo ->
@@ -2232,15 +2247,15 @@ and parse_primary (p : parser) : Ast.expr =
       in
       let body = parse_block_body p [ Token.KwEnd ] in
       expect p Token.KwEnd "'end' in do-block";
-      if params = [] then Ast.Block (body, span_end p start)
+      if params = [] then Ast.Block (fresh_node_id p, body, span_end p start)
       else
-        Ast.Closure
+        Ast.Closure (fresh_node_id p,
           {
             Ast.cl_params = params;
             cl_return = None;
-            cl_body = block_to_expr body;
+            cl_body = block_to_expr p body;
             cl_span = span_end p start;
-          }
+          })
   | Token.KwIf -> parse_if_expr p start
   | Token.KwUnless -> parse_unless_expr p start
   | Token.KwMatch -> parse_match_expr p start
@@ -2267,7 +2282,7 @@ and parse_primary (p : parser) : Ast.expr =
       in
       if next_is_name_ctx then begin
         ignore (advance p);
-        Ast.Name ("handle", span_end p start)
+        Ast.Name (fresh_node_id p, "handle", span_end p start)
       end
       else parse_handle_expr p start
   | Token.KwUnsafe -> parse_unsafe_block p start
@@ -2275,27 +2290,27 @@ and parse_primary (p : parser) : Ast.expr =
       ignore (advance p);
       let body = parse_block_body p [ Token.KwEnd ] in
       expect p Token.KwEnd "'end' in defer block";
-      Ast.Block (body, span_end p start)
+      Ast.Block (fresh_node_id p, body, span_end p start)
   | Token.KwAsync ->
       ignore (advance p);
       let body = parse_block_body p [ Token.KwEnd ] in
       expect p Token.KwEnd "'end' in async block";
-      Ast.Block (body, span_end p start)
+      Ast.Block (fresh_node_id p, body, span_end p start)
   | Token.KwComptime ->
       ignore (advance p);
       let body = parse_block_body p [ Token.KwEnd ] in
       expect p Token.KwEnd "'end' in comptime block";
-      Ast.ComptimeBlock (body, span_end p start)
+      Ast.ComptimeBlock (fresh_node_id p, body, span_end p start)
   | Token.KwReturn ->
       ignore (advance p);
       if is_expr_start p then
-        Ast.ReturnExpr (Some (parse_expr p), span_end p start)
-      else Ast.ReturnExpr (None, span_end p start)
+        Ast.ReturnExpr (fresh_node_id p, Some (parse_expr p), span_end p start)
+      else Ast.ReturnExpr (fresh_node_id p, None, span_end p start)
   | Token.KwBreak ->
       ignore (advance p);
       if is_expr_start p then
-        Ast.BreakExpr (Some (parse_expr p), span_end p start)
-      else Ast.BreakExpr (None, span_end p start)
+        Ast.BreakExpr (fresh_node_id p, Some (parse_expr p), span_end p start)
+      else Ast.BreakExpr (fresh_node_id p, None, span_end p start)
   | _ -> (
       (* Soft keywords usable as expressions (e.g. `mod(17, 5)`, and
          `next` as an identifier — the production parser's
@@ -2305,7 +2320,7 @@ and parse_primary (p : parser) : Ast.expr =
       | None ->
           expected p "expression";
           ignore (advance p);
-          Ast.Name ("", span_end p start))
+          Ast.Name (fresh_node_id p, "", span_end p start))
 
 and parse_ident_expr (p : parser) (start : Span.span) : Ast.expr =
   let first = expect_ident p in
@@ -2314,8 +2329,8 @@ and parse_ident_expr (p : parser) (start : Span.span) : Ast.expr =
     match kind p with
     | Token.String s ->
         ignore (advance p);
-        Ast.StringLit (s, span_end p start)
-    | _ -> Ast.Name ("b", span_end p start)
+        Ast.StringLit (fresh_node_id p, s, span_end p start)
+    | _ -> Ast.Name (fresh_node_id p, "b", span_end p start)
   else if first = "asm" then begin
     (* asm!(...) / asm(...) inline assembly *)
     if at p Token.Bang then ignore (advance p);
@@ -2333,8 +2348,8 @@ and parse_ident_expr (p : parser) (start : Span.span) : Ast.expr =
           else text
         in
         let _ = payload_start and _ = close_span in
-        Ast.MacroCall ("asm", [ Ast.MacroTokens (text, start) ], span_end p start)
-    | _ -> Ast.Name ("asm", start)
+        Ast.MacroCall (fresh_node_id p, "asm", [ Ast.MacroTokens (text, start) ], span_end p start)
+    | _ -> Ast.Name (fresh_node_id p, "asm", start)
   end
   else if eat p Token.ColonColon then begin
     (* multi-segment path: A::B::C *)
@@ -2348,9 +2363,9 @@ and parse_ident_expr (p : parser) (start : Span.span) : Ast.expr =
       parse_struct_literal p !full type_args start
     else if at p Token.LParen then begin
       let args = parse_call_args p in
-      Ast.Call (Ast.Name (!full, span_end p start), type_args, args, span_end p start)
+      Ast.Call (fresh_node_id p, Ast.Name (fresh_node_id p, !full, span_end p start), type_args, args, span_end p start)
     end
-    else Ast.Name (!full, span_end p start)
+    else Ast.Name (fresh_node_id p, !full, span_end p start)
   end
   else begin
     let type_args = parse_optional_expr_type_args p (Some first) in
@@ -2366,9 +2381,9 @@ and parse_ident_expr (p : parser) (start : Span.span) : Ast.expr =
         parse_end_struct_literal p !full type_args start
       else if at p Token.LParen then begin
         let args = parse_call_args p in
-        Ast.Call (Ast.Name (!full, span_end p start), type_args, args, span_end p start)
+        Ast.Call (fresh_node_id p, Ast.Name (fresh_node_id p, !full, span_end p start), type_args, args, span_end p start)
       end
-      else Ast.Name (!full, span_end p start)
+      else Ast.Name (fresh_node_id p, !full, span_end p start)
     end
     else if at p Token.LBrace && is_struct_literal_context p then
       parse_struct_literal p first type_args start
@@ -2380,15 +2395,15 @@ and parse_ident_expr (p : parser) (start : Span.span) : Ast.expr =
       ignore (advance p);
       let args = parse_macro_args p close in
       expect p close (if close = Token.RParen then "')' in macro call" else "']' in macro call");
-      Ast.MacroCall (first, args, span_end p start)
+      Ast.MacroCall (fresh_node_id p, first, args, span_end p start)
     end
     else if at p Token.LParen then begin
       (* a type-application call: `size_of[T]()` — the bracketed type
          arguments belong to the call, not to the postfix index *)
       let args = parse_call_args p in
-      Ast.Call (Ast.Name (first, span_end p start), type_args, args, span_end p start)
+      Ast.Call (fresh_node_id p, Ast.Name (fresh_node_id p, first, span_end p start), type_args, args, span_end p start)
     end
-    else Ast.Name (first, span_end p start)
+    else Ast.Name (fresh_node_id p, first, span_end p start)
   end
 
 and collect_raw_until_rparen (p : parser) : string * Span.span =
@@ -2578,13 +2593,13 @@ and parse_struct_literal (p : parser) (name : string) (targs : Ast.type_expr lis
         let value = parse_expr p in
         fields := (fname, value) :: !fields
       end
-      else fields := (fname, Ast.Name (fname, fstart)) :: !fields;
+      else fields := (fname, Ast.Name (fresh_node_id p, fname, fstart)) :: !fields;
       if not (at p Token.RBrace) && not (at_kw_end_as_terminator p) then ignore (eat p Token.Comma)
     end
   done;
   if at p Token.KwEnd then ignore (advance p)
   else expect p Token.RBrace "'}' in struct literal";
-  Ast.StructLit (name, targs, List.rev !fields, !rest, span_end p start)
+  Ast.StructLit (fresh_node_id p, name, targs, List.rev !fields, !rest, span_end p start)
 
 and parse_end_struct_literal (p : parser) (name : string) (targs : Ast.type_expr list) (start : Span.span) : Ast.expr =
   let fields = ref [] in
@@ -2595,7 +2610,7 @@ and parse_end_struct_literal (p : parser) (name : string) (targs : Ast.type_expr
     fields := (fname, value) :: !fields
   done;
   expect p Token.KwEnd "'end' in struct literal";
-  Ast.StructLit (name, targs, List.rev !fields, None, span_end p start)
+  Ast.StructLit (fresh_node_id p, name, targs, List.rev !fields, None, span_end p start)
 
 and parse_map_literal (p : parser) (start : Span.span) : Ast.expr =
   ignore (advance p);
@@ -2607,11 +2622,11 @@ and parse_map_literal (p : parser) (start : Span.span) : Ast.expr =
       else key
     in
     let entry_span = span_merged p (Ast.expr_span key) (Ast.expr_span value) in
-    entries := Ast.Tuple ([ key; value ], entry_span) :: !entries;
+    entries := Ast.Tuple (fresh_node_id p, [ key; value ], entry_span) :: !entries;
     if not (at p Token.RBrace) then ignore (eat p Token.Comma)
   done;
   expect p Token.RBrace "'}' in map literal";
-  Ast.Array (List.rev !entries, span_end p start)
+  Ast.Array (fresh_node_id p, List.rev !entries, span_end p start)
 
 and parse_brace_closure (p : parser) (start : Span.span) : Ast.expr =
   ignore (advance p);
@@ -2620,13 +2635,13 @@ and parse_brace_closure (p : parser) (start : Span.span) : Ast.expr =
   expect p Token.Pipe "'|' in closure";
   let body = parse_expr p in
   expect p Token.RBrace "'}' in closure";
-  Ast.Closure
+  Ast.Closure (fresh_node_id p,
     {
       Ast.cl_params = params;
       cl_return = None;
       cl_body = body;
       cl_span = span_end p start;
-    }
+    })
 
 and parse_closure_params (p : parser) : Ast.closure_param list =
   let params = ref [] in
@@ -2674,13 +2689,13 @@ and parse_pipe_closure (p : parser) (start : Span.span) : Ast.expr =
   expect p Token.Pipe "'|' in closure";
   let ret = if eat p Token.Arrow then Some (parse_type p) else None in
   let body = parse_expr p in
-  Ast.Closure
+  Ast.Closure (fresh_node_id p,
     {
       Ast.cl_params = params;
       cl_return = ret;
       cl_body = body;
       cl_span = span_end p start;
-    }
+    })
 
 and parse_if_expr (p : parser) (start : Span.span) : Ast.expr =
   ignore (advance p);
@@ -2788,7 +2803,7 @@ and parse_if_expr (p : parser) (start : Span.span) : Ast.expr =
     else else_block := Some (parse_block_body p [ Token.KwEnd ])
   end;
   ignore (eat p Token.KwEnd);
-  Ast.IfExpr
+  Ast.IfExpr (fresh_node_id p,
     {
       Ast.if_condition = cond;
       if_then = then_block;
@@ -2797,7 +2812,7 @@ and parse_if_expr (p : parser) (start : Span.span) : Ast.expr =
       if_let_pattern = !let_pat;
       if_let_value = !let_val;
       if_span = span_merged p start (cur_span p);
-    }
+    })
 
 and parse_unless_expr (p : parser) (start : Span.span) : Ast.expr =
   ignore (advance p);
@@ -2812,13 +2827,13 @@ and parse_unless_expr (p : parser) (start : Span.span) : Ast.expr =
     else None
   in
   ignore (eat p Token.KwEnd);
-  Ast.UnlessExpr
+  Ast.UnlessExpr (fresh_node_id p,
     {
       Ast.un_condition = cond;
       un_body = body;
       un_else = else_block;
       un_span = span_end p start;
-    }
+    })
 
 and parse_match_expr (p : parser) (start : Span.span) : Ast.expr =
   ignore (advance p);
@@ -2912,12 +2927,12 @@ and parse_match_expr (p : parser) (start : Span.span) : Ast.expr =
     if !pushed then p.match_arm_cols <- List.tl p.match_arm_cols;
     expect p Token.KwEnd "'end' in match expression"
   end;
-  Ast.MatchExpr
+  Ast.MatchExpr (fresh_node_id p,
     {
       Ast.m_subject = subject;
       m_arms = List.rev !arms;
       m_span = span_end p start;
-    }
+    })
 
 (* Arm body: a single expression, or a block when statements follow.
    Mirrors the reference parser's multi-expression arm wrapping. *)
@@ -2925,10 +2940,10 @@ and parse_match_arm_body (p : parser) (arm_start : Span.span) : Ast.expr =
   let at_arm_terminator () =
     at p Token.KwWhen || at_kw_end_as_terminator p || at p Token.KwElse || at_eof p
   in
-  if at_arm_terminator () then Ast.Tuple ([], arm_start)
+  if at_arm_terminator () then Ast.Tuple (fresh_node_id p, [], arm_start)
   else if at p Token.KwLet || at p Token.KwMut || at p Token.At then begin
     let block = parse_block_body p [ Token.KwWhen; Token.KwElse; Token.KwEnd ] in
-    Ast.Block (block, span_merged p arm_start (cur_span p))
+    Ast.Block (fresh_node_id p, block, span_merged p arm_start (cur_span p))
   end
   else begin
     let expr0 = parse_expr p in
@@ -2938,7 +2953,7 @@ and parse_match_arm_body (p : parser) (arm_start : Span.span) : Ast.expr =
           let start = cur_span p in
           ignore (advance p);
           let v = parse_expr p in
-          Ast.Assign (expr0, v, span_end p start)
+          Ast.Assign (fresh_node_id p, expr0, v, span_end p start)
       | Token.PlusEq | Token.MinusEq | Token.StarEq | Token.SlashEq | Token.PercentEq ->
           let start = cur_span p in
           let op =
@@ -2951,7 +2966,7 @@ and parse_match_arm_body (p : parser) (arm_start : Span.span) : Ast.expr =
           in
           ignore (advance p);
           let v = parse_expr p in
-          Ast.CompoundAssign (expr0, op, v, span_end p start)
+          Ast.CompoundAssign (fresh_node_id p, expr0, op, v, span_end p start)
       | _ -> expr0
     in
     while eat p Token.Semi do () done;
@@ -2985,7 +3000,7 @@ and parse_match_arm_body (p : parser) (arm_start : Span.span) : Ast.expr =
           b_span = span_merged p arm_start (cur_span p);
         }
       in
-      Ast.Block (block, span_merged p arm_start (cur_span p))
+      Ast.Block (fresh_node_id p, block, span_merged p arm_start (cur_span p))
     end
   end
 
@@ -3001,13 +3016,13 @@ and parse_for_expr (p : parser) (start : Span.span) : Ast.expr =
   ignore (eat p Token.KwDo);
   let body = parse_block_body p [ Token.KwEnd ] in
   expect p Token.KwEnd "'end' in for loop";
-  Ast.ForExpr
+  Ast.ForExpr (fresh_node_id p,
     {
       Ast.for_pattern = pat;
       for_iterable = iterable;
       for_body = body;
       for_span = span_end p start;
-    }
+    })
 
 and parse_while_expr (p : parser) (start : Span.span) : Ast.expr =
   ignore (advance p);
@@ -3015,12 +3030,12 @@ and parse_while_expr (p : parser) (start : Span.span) : Ast.expr =
   ignore (eat p Token.KwDo);
   let body = parse_block_body p [ Token.KwEnd ] in
   expect p Token.KwEnd "'end' in while loop";
-  Ast.WhileExpr
+  Ast.WhileExpr (fresh_node_id p,
     {
       Ast.wh_condition = cond;
       wh_body = body;
       wh_span = span_end p start;
-    }
+    })
 
 and parse_until_expr (p : parser) (start : Span.span) : Ast.expr =
   ignore (advance p);
@@ -3028,19 +3043,19 @@ and parse_until_expr (p : parser) (start : Span.span) : Ast.expr =
   ignore (eat p Token.KwDo);
   let body = parse_block_body p [ Token.KwEnd ] in
   expect p Token.KwEnd "'end' in until loop";
-  Ast.UntilExpr
+  Ast.UntilExpr (fresh_node_id p,
     {
       Ast.ut_condition = cond;
       ut_body = body;
       ut_span = span_end p start;
-    }
+    })
 
 and parse_loop_expr (p : parser) (start : Span.span) : Ast.expr =
   ignore (advance p);
   ignore (eat p Token.KwDo);
   let body = parse_block_body p [ Token.KwEnd ] in
   expect p Token.KwEnd "'end' in loop";
-  Ast.LoopExpr (body, span_end p start)
+  Ast.LoopExpr (fresh_node_id p, body, span_end p start)
 
 and parse_try_expr (p : parser) (start : Span.span) : Ast.expr =
   ignore (advance p);
@@ -3060,13 +3075,13 @@ and parse_try_expr (p : parser) (start : Span.span) : Ast.expr =
     else None
   in
   ignore (eat p Token.KwEnd);
-  Ast.TryBlock
+  Ast.TryBlock (fresh_node_id p,
     {
       Ast.tr_body = body;
       tr_catches = List.rev !catches;
       tr_finally = finally;
       tr_span = span_end p start;
-    }
+    })
 
 and parse_handle_expr (p : parser) (start : Span.span) : Ast.expr =
   ignore (advance p);
@@ -3086,18 +3101,18 @@ and parse_handle_expr (p : parser) (start : Span.span) : Ast.expr =
     end;
     let body =
       if eat p Token.FatArrow then parse_expr p
-      else block_to_expr (parse_block_body p [ Token.KwEnd ])
+      else block_to_expr p (parse_block_body p [ Token.KwEnd ])
     in
     arms := (op, List.rev !params, body) :: !arms
   done;
   ignore (eat p Token.KwEnd);
-  Ast.HandleExpr
+  Ast.HandleExpr (fresh_node_id p,
     {
       Ast.h_expr = e;
       h_effect_name = !effect_name;
       h_arms = List.rev !arms;
       h_span = span_end p start;
-    }
+    })
 
 and parse_unsafe_block (p : parser) (start : Span.span) : Ast.expr =
   ignore (advance p);
@@ -3120,7 +3135,7 @@ and parse_unsafe_block (p : parser) (start : Span.span) : Ast.expr =
     end
     else parse_block_body p [ Token.KwEnd ]
   in
-  Ast.UnsafeBlock (reason, body, span_end p start)
+  Ast.UnsafeBlock (fresh_node_id p, reason, body, span_end p start)
 
 (* ────────────────────────────────────────────────────────────────
    Patterns *)
@@ -3245,27 +3260,27 @@ and parse_single_pattern (p : parser) : Ast.pattern =
          | Token.Integer hi ->
              ignore (advance p);
              Ast.RangePattern
-               (Ast.PatLiteral (Ast.IntLit (lit, start), start),
-                Ast.PatLiteral (Ast.IntLit (hi, span_end p start), span_end p start),
+               (Ast.PatLiteral (Ast.IntLit (fresh_node_id p, lit, start), start),
+                Ast.PatLiteral (Ast.IntLit (fresh_node_id p, hi, span_end p start), span_end p start),
                 span_end p start)
          | Token.Char hi ->
              ignore (advance p);
              Ast.RangePattern
-               (Ast.PatLiteral (Ast.IntLit (lit, start), start),
-                Ast.PatLiteral (Ast.CharLit (hi, span_end p start), span_end p start),
+               (Ast.PatLiteral (Ast.IntLit (fresh_node_id p, lit, start), start),
+                Ast.PatLiteral (Ast.CharLit (fresh_node_id p, hi, span_end p start), span_end p start),
                 span_end p start)
          | _ ->
              Ast.RangePattern
-               (Ast.PatLiteral (Ast.IntLit (lit, start), start),
+               (Ast.PatLiteral (Ast.IntLit (fresh_node_id p, lit, start), start),
                 Ast.Wildcard (Span.synthetic), span_end p start))
       end
-      else Ast.PatLiteral (Ast.IntLit (lit, span_end p start), span_end p start)
+      else Ast.PatLiteral (Ast.IntLit (fresh_node_id p, lit, span_end p start), span_end p start)
   | Token.Float lit ->
       ignore (advance p);
-      Ast.PatLiteral (Ast.FloatLit (lit, span_end p start), span_end p start)
+      Ast.PatLiteral (Ast.FloatLit (fresh_node_id p, lit, span_end p start), span_end p start)
   | Token.String s ->
       ignore (advance p);
-      Ast.PatLiteral (Ast.StringLit (s, span_end p start), span_end p start)
+      Ast.PatLiteral (Ast.StringLit (fresh_node_id p, s, span_end p start), span_end p start)
   | Token.Char c ->
       ignore (advance p);
       if at p Token.DotDot || at p Token.DotDotEq then begin
@@ -3274,17 +3289,17 @@ and parse_single_pattern (p : parser) : Ast.pattern =
         | Token.Char hi ->
             ignore (advance p);
             Ast.RangePattern
-              (Ast.PatLiteral (Ast.CharLit (c, start), start),
-               Ast.PatLiteral (Ast.CharLit (hi, span_end p start), span_end p start),
+              (Ast.PatLiteral (Ast.CharLit (fresh_node_id p, c, start), start),
+               Ast.PatLiteral (Ast.CharLit (fresh_node_id p, hi, span_end p start), span_end p start),
                span_end p start)
         | _ ->
-            Ast.PatLiteral (Ast.CharLit (c, span_end p start), span_end p start)
+            Ast.PatLiteral (Ast.CharLit (fresh_node_id p, c, span_end p start), span_end p start)
       end
-      else Ast.PatLiteral (Ast.CharLit (c, span_end p start), span_end p start)
+      else Ast.PatLiteral (Ast.CharLit (fresh_node_id p, c, span_end p start), span_end p start)
   | Token.KwTrue | Token.KwFalse ->
       let b = at p Token.KwTrue in
       ignore (advance p);
-      Ast.PatLiteral (Ast.BoolLit (b, span_end p start), span_end p start)
+      Ast.PatLiteral (Ast.BoolLit (fresh_node_id p, b, span_end p start), span_end p start)
   | Token.KwSelfValue ->
       ignore (advance p);
       Ast.PatIdent ("self", false, span_end p start)
@@ -3402,4 +3417,6 @@ and is_expr_start (p : parser) : bool =
 
 let parse (tokens : Token.t list) source file_id diags module_path : Ast.program =
   let p = make (Array.of_list tokens) source file_id diags in
-  parse_program p module_path
+  let prog = parse_program p module_path in
+  node_id_global := p.next_node_id;
+  prog

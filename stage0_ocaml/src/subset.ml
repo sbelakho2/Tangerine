@@ -163,7 +163,7 @@ let rec check_item ctx diags (i : Ast.item) =
        | Ast.IntLit _ | Ast.BoolLit _ | Ast.StringLit _ | Ast.CharLit _
        | Ast.FloatLit _ ->
            ()
-       | Ast.Unary (Ast.Neg, Ast.IntLit _, _) ->
+       | Ast.Unary (_, Ast.Neg, Ast.IntLit _, _) ->
            (* a negated integer initializer `const MIN: Int = -128` *)
            ()
        | _ ->
@@ -181,7 +181,7 @@ let rec check_item ctx diags (i : Ast.item) =
        | Ast.IntLit _ | Ast.BoolLit _ | Ast.StringLit _ | Ast.CharLit _
        | Ast.FloatLit _ ->
            ()
-       | Ast.Unary (Ast.Neg, Ast.IntLit _, _) -> ()
+       | Ast.Unary (_, Ast.Neg, Ast.IntLit _, _) -> ()
        | _ ->
            reject diags "E9034"
              "non-literal static initializers are not available in the bootstrap subset (the seed evaluates literal static initializers only)"
@@ -541,33 +541,33 @@ and arm_pattern_name (p : Ast.pattern) : string =
 
 and check_expr ctx diags (e : Ast.expr) =
   match e with
-  | Ast.AwaitExpr (_, s) ->
+  | Ast.AwaitExpr (_, _, s) ->
       reject diags "E9015" "await expressions are not available in the bootstrap subset" s
-  | Ast.HandleExpr h ->
+  | Ast.HandleExpr (_, h) ->
       reject diags "E9016" "handle/with expressions are not available in the bootstrap subset"
         h.Ast.h_span
-  | Ast.UnlessExpr u ->
+  | Ast.UnlessExpr (_, u) ->
       reject diags "E9017" "unless expressions are not available in the bootstrap subset"
         u.Ast.un_span
-  | Ast.UntilExpr u ->
+  | Ast.UntilExpr (_, u) ->
       reject diags "E9018" "until expressions are not available in the bootstrap subset"
         u.Ast.ut_span
-  | Ast.TryBlock t ->
+  | Ast.TryBlock (_, t) ->
       reject diags "E9019" "try/catch/finally blocks are not available in the bootstrap subset"
         t.Ast.tr_span
-  | Ast.ComptimeBlock (_, s) ->
+  | Ast.ComptimeBlock (_, _, s) ->
       reject diags "E9006" "comptime blocks are not available in the bootstrap subset" s
   | Ast.IntLit _ | Ast.FloatLit _ | Ast.StringLit _ | Ast.CharLit _ | Ast.BoolLit _
   | Ast.Path _ | Ast.NextExpr _ ->
       ()
-  | Ast.Name (n, _) ->
+  | Ast.Name (_, n, _) ->
       (* user-enum constructors are lowered through the semantic registry
          (the E9035 gate is retired — the VariantId fix + the
          lowersurface positive proof) *)
       ignore n
-  | Ast.Array (elems, _) -> List.iter (check_expr ctx diags) elems
-  | Ast.ArrayRepeat (v, c, span) ->
-      (* AST form: Ast.ArrayRepeat (value, count, span) (parser `[v; n]`).
+  | Ast.Array (_, elems, _) -> List.iter (check_expr ctx diags) elems
+  | Ast.ArrayRepeat (_, v, c, span) ->
+      (* AST form: Ast.ArrayRepeat (_, value, count, span) (parser `[v; n]`).
          The lowerer's expression-name diagnostic table has no
          ArrayRepeat branch — it falls to "unhandled supported
          expression form: ArrayRepeat"; reject until array-repeat
@@ -577,9 +577,9 @@ and check_expr ctx diags (e : Ast.expr) =
         span;
       check_expr ctx diags v;
       check_expr ctx diags c
-  | Ast.Tuple (elems, _) -> List.iter (check_expr ctx diags) elems
-  | Ast.StructLit (_, targs, fields, rest, span) ->
-      (* AST form: Ast.StructLit (name, targs, fields, rest, span)
+  | Ast.Tuple (_, elems, _) -> List.iter (check_expr ctx diags) elems
+  | Ast.StructLit (_, _, targs, fields, rest, span) ->
+      (* AST form: Ast.StructLit (_, name, targs, fields, rest, span)
          (parser `Name { f: v, ..rest }`).  The lowerer implements
          struct literals: the StructCtor aggregate rule lowers them with
          the typed registry's DECLARATION-order positions (the same
@@ -595,17 +595,17 @@ and check_expr ctx diags (e : Ast.expr) =
       List.iter (check_type ctx diags false) targs;
       List.iter (fun (_, v) -> check_expr ctx diags v) fields;
       Option.iter (check_expr ctx diags) rest
-  | Ast.Block (b, _) -> check_block ctx diags b
-  | Ast.UnsafeBlock (_, b, span) ->
-      (* AST form: Ast.UnsafeBlock (reason, body, span) (parser
+  | Ast.Block (_, b, _) -> check_block ctx diags b
+  | Ast.UnsafeBlock (_, _, b, span) ->
+      (* AST form: Ast.UnsafeBlock (_, reason, body, span) (parser
          `unsafe "reason" do ... end`).  Unsafe blocks lower their body
          exactly like a plain block (the E9041 unsafe-block form is
          retired — the seed has no separate unsafe model); the body gets
          the same block check. *)
       ignore span;
       check_block ctx diags b
-  | Ast.IfExpr i ->
-      (* AST form: Ast.IfExpr with if_let_pattern/if_let_value (parser
+  | Ast.IfExpr (_, i) ->
+      (* AST form: Ast.IfExpr (_, with) if_let_pattern/if_let_value (parser
          `if let <pat> = <expr> then`).  Seed lowering ignores the
          if-let pattern entirely (lower_if has no if-let arm), so the
          branch would lower unconditionally; reject the if-let form
@@ -626,13 +626,13 @@ and check_expr ctx diags (e : Ast.expr) =
       Option.iter (check_block ctx diags) i.Ast.if_else;
       Option.iter (check_pattern ctx diags) i.Ast.if_let_pattern;
       Option.iter (check_expr ctx diags) i.Ast.if_let_value
-  | Ast.Call (callee, targs, args, _) ->
+  | Ast.Call (_, callee, targs, args, _) ->
       (* user-enum constructors are lowered through the semantic registry
          (the E9035 gate is retired) *)
       check_expr ctx diags callee;
       List.iter (check_type ctx diags false) targs;
       List.iter (fun a -> check_expr ctx diags a.Ast.ca_value) args
-  | Ast.Index (b, i, _) ->
+  | Ast.Index (_, b, i, _) ->
       (* NOTE: dynamic runtime indexing is NOT rejected — the Index fix
          landed (mir_lower lowers a nonconstant `a[i]` to the dynamic
          Seed_mir.Index <index_local> projection, and the VM executes it
@@ -640,15 +640,15 @@ and check_expr ctx diags (e : Ast.expr) =
          verifies. *)
       check_expr ctx diags b;
       check_expr ctx diags i
-  | Ast.Range (start, end_, _, span) ->
-      (* AST form: Ast.Range (start, end, inclusive, span) (parser
+  | Ast.Range (_, start, end_, _, span) ->
+      (* AST form: Ast.Range (_, start, end, inclusive, span) (parser
          `a..b` / `a..=b`).  Ranges lower to the counter loop — `a..b`
          counts with < and `a..=b` with <= (the E9039 range form is
          retired); both ends are checked like any expression. *)
       ignore span;
       check_expr ctx diags start;
       check_expr ctx diags end_
-  | Ast.MatchExpr m ->
+  | Ast.MatchExpr (_, m) ->
       check_expr ctx diags m.Ast.m_subject;
       List.iter
         (fun arm ->
@@ -662,11 +662,11 @@ and check_expr ctx diags (e : Ast.expr) =
           check_arm_pattern ctx diags arm.Ast.ma_pattern;
           check_expr ctx diags arm.Ast.ma_body)
         m.Ast.m_arms
-  | Ast.Cast (e, t, _) ->
+  | Ast.Cast (_, e, t, _) ->
       check_expr ctx diags e;
       check_type ctx diags false t
-  | Ast.TryOp (e, _) -> check_expr ctx diags e
-  | Ast.Closure c ->
+  | Ast.TryOp (_, e, _) -> check_expr ctx diags e
+  | Ast.Closure (_, c) ->
       (* AST form: Ast.Closure (params, body) (parser pipe closure
          `|x| e` or do-block closure `fn |x| ... end`).  The lowerer has
          no Closure branch — it falls to "unhandled supported
@@ -678,9 +678,9 @@ and check_expr ctx diags (e : Ast.expr) =
       List.iter (fun p -> Option.iter (check_type ctx diags true) p.Ast.cp_type) c.Ast.cl_params;
       Option.iter (check_type ctx diags false) c.Ast.cl_return;
       check_expr ctx diags c.Ast.cl_body
-  | Ast.Unary (_, e, _) -> check_expr ctx diags e
-  | Ast.Field (b, _, span) ->
-      (* AST form: Ast.Field (base, field_name, span) — a projected read
+  | Ast.Unary (_, _, e, _) -> check_expr ctx diags e
+  | Ast.Field (_, b, _, span) ->
+      (* AST form: Ast.Field (_, base, field_name, span) — a projected read
          (`p.x`), or the method-call receiver `obj.method(...)` (the
          parser produces a Field callee).  The lowerer implements the
          typed-place (FieldId) rule: the base lowers to a place and the
@@ -698,11 +698,11 @@ and check_expr ctx diags (e : Ast.expr) =
          remains only for target forms without a typed-place rule). *)
       ignore span;
       check_expr ctx diags b
-  | Ast.Binary (l, _, r, _) ->
+  | Ast.Binary (_, l, _, r, _) ->
       check_expr ctx diags l;
       check_expr ctx diags r
-  | Ast.MacroCall (n, args, span) ->
-      (* AST form: Ast.MacroCall (name, args, span) — `name!(...)`.  The
+  | Ast.MacroCall (_, n, args, span) ->
+      (* AST form: Ast.MacroCall (_, name, args, span) — `name!(...)`.  The
          lowerer has no MacroCall branch — it falls to "unhandled
          supported expression form: MacroCall"; reject until macro
          lowering lands (the typechecker's debug_assert special case
@@ -739,8 +739,8 @@ and check_expr ctx diags (e : Ast.expr) =
            List.iter
              (function Ast.MacroExpr e -> check_expr ctx diags e | Ast.MacroTokens _ -> ())
            args)
-  | Ast.Assign (target, v, span) ->
-      (* AST form: Ast.Assign (target, value, span).  The typed-place
+  | Ast.Assign (_, target, v, span) ->
+      (* AST form: Ast.Assign (_, target, value, span).  The typed-place
          writeback rule landed (2026-08-28): a Name, Field or Index
          target lowers — the field resolves through the typed nominal
          registry (the same channel as the read path) and the index is
@@ -753,7 +753,7 @@ and check_expr ctx diags (e : Ast.expr) =
          typed-place writeback rule). *)
       (match target with
        | Ast.Name _ | Ast.Field _ | Ast.Index _ -> ()
-       | Ast.Unary (Ast.Deref, _, _) ->
+       | Ast.Unary (_, Ast.Deref, _, _) ->
            (* `*p = v` writes through the Deref projection (the E9036
               deref-target form is retired) *)
            ()
@@ -763,8 +763,8 @@ and check_expr ctx diags (e : Ast.expr) =
              span);
       check_expr ctx diags target;
       check_expr ctx diags v
-  | Ast.CompoundAssign (target, _, v, span) ->
-      (* AST form: Ast.CompoundAssign (target, op, value, span).  The
+  | Ast.CompoundAssign (_, target, _, v, span) ->
+      (* AST form: Ast.CompoundAssign (_, target, op, value, span).  The
          lowerer has NO CompoundAssign branch at all — even a plain Name
          target (`x += 1`) fails closed with "CompoundAssign reached MIR
          lowering without a typed-place writeback rule"; reject the
@@ -774,9 +774,9 @@ and check_expr ctx diags (e : Ast.expr) =
         span;
       check_expr ctx diags target;
       check_expr ctx diags v
-  | Ast.ReturnExpr (e, _) | Ast.BreakExpr (e, _) -> Option.iter (check_expr ctx diags) e
-  | Ast.ForExpr f ->
-      (* AST form: Ast.ForExpr with a destructuring loop pattern
+  | Ast.ReturnExpr (_, e, _) | Ast.BreakExpr (_, e, _) -> Option.iter (check_expr ctx diags) e
+  | Ast.ForExpr (_, f) ->
+      (* AST form: Ast.ForExpr (_, with) a destructuring loop pattern
          (`for (k, v) in m do`).  Seed lowering binds the loop variable
          by name or `_` only (lower ForExpr: "unsupported for-loop
          pattern"); reject the destructuring form (E9045). *)
@@ -803,10 +803,10 @@ and check_expr ctx diags (e : Ast.expr) =
       check_pattern ctx diags f.Ast.for_pattern;
       check_expr ctx diags f.Ast.for_iterable;
       check_block ctx diags f.Ast.for_body
-  | Ast.WhileExpr w ->
+  | Ast.WhileExpr (_, w) ->
       check_expr ctx diags w.Ast.wh_condition;
       check_block ctx diags w.Ast.wh_body
-  | Ast.LoopExpr (b, _) -> check_block ctx diags b
+  | Ast.LoopExpr (_, b, _) -> check_block ctx diags b
 
 let check (diags : Diagnostic.bag) (program : Ast.program) =
   let ctx = collect_ctx program in

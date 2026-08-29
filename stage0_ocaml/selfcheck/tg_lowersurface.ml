@@ -958,7 +958,7 @@ end
               sig_span = Span.synthetic;
             };
           fn_clauses = [];
-          fn_body = Ast.FnExpr (Ast.IntLit ("0", Span.synthetic));
+          fn_body = Ast.FnExpr (Ast.IntLit (Ids.Node_id.make 0, "0", Span.synthetic));
           fn_span = Span.synthetic;
         }
       in
@@ -2129,11 +2129,12 @@ end
              | Some d -> d
              | None -> failwith "typed-cast proof: no cast_proof function"
            in
-           let ty_ast, cast_span, inner_span =
+           let ty_ast, cast_nid, inner_nid, cast_span, _inner_span =
              match cast_fn_decl.Ast.fn_body with
-             | Ast.FnExpr (Ast.Cast (Ast.Name (_, ispan), ty, span)) -> (ty, span, ispan)
-             | Ast.FnBlock { Ast.b_tail = Some (Ast.Cast (Ast.Name (_, ispan), ty, span)); _ } ->
-                 (ty, span, ispan)
+             | Ast.FnExpr (Ast.Cast (cn, Ast.Name (inn, _, ispan), ty, span)) ->
+                 (ty, cn, inn, span, ispan)
+             | Ast.FnBlock { Ast.b_tail = Some (Ast.Cast (cn, Ast.Name (inn, _, ispan), ty, span)); _ } ->
+                 (ty, cn, inn, span, ispan)
              | _ -> failwith "typed-cast proof: cast_proof body is not `p as Ptr[U]`"
            in
            let cast_ts =
@@ -2159,7 +2160,7 @@ end
            in
            let map = Driver.typed_nodes_of cenv in
            let cast_node =
-             match List.assoc_opt (cfid, cast_span.Span.start) map with
+             match List.assoc_opt cast_nid map with
              | Some n -> n
              | None ->
                  Printf.printf
@@ -2197,7 +2198,7 @@ end
            end;
            (* the inner `p` node is NOT a cast: the channel distinguishes
               the cast-target field from the plain expr type *)
-           (match List.assoc_opt (cfid, inner_span.Span.start) map with
+           (match List.assoc_opt inner_nid map with
             | Some inner_node when inner_node.Mir_lower.tn_cast_target = None -> ()
             | Some _ ->
                 Printf.printf "  typed-cast map: FAIL (the inner `p` node carries a cast target)\n";
@@ -2336,15 +2337,15 @@ end
                   | Some d -> d
                   | None -> failwith "typed-call proof: no main function"
                 in
-                let call_span =
+                let call_nid, call_span =
                   match main_decl.Ast.fn_body with
-                  | Ast.FnExpr (Ast.Call (_, _, _, span)) -> span
-                  | Ast.FnBlock { Ast.b_tail = Some (Ast.Call (_, _, _, span)); _ } -> span
+                  | Ast.FnExpr (Ast.Call (n, _, _, _, span)) -> (n, span)
+                  | Ast.FnBlock { Ast.b_tail = Some (Ast.Call (n, _, _, _, span)); _ } -> (n, span)
                   | _ -> failwith "typed-call proof: main body is not `idfn[Int](42)`"
                 in
                 let n_map = Driver.typed_nodes_of nenv in
                 let call_node =
-                  match List.assoc_opt (nfid, call_span.Span.start) n_map with
+                  match List.assoc_opt call_nid n_map with
                   | Some n -> n
                   | None ->
                       Printf.printf
@@ -2794,12 +2795,12 @@ end
            (fun (d : Ast.function_decl) -> d.Ast.fn_sig.Ast.sig_name = "make_pair")
            l_funcs
        in
-       let lit_span =
+       let lit_nid =
          match make_pair_decl.Ast.fn_body with
-         | Ast.FnBlock { Ast.b_tail = Some (Ast.StructLit (_, _, _, _, span)); _ } -> span
+         | Ast.FnBlock { Ast.b_tail = Some (Ast.StructLit (n, _, _, _, _, _)); _ } -> n
          | _ -> failwith "struct-lit proof: make_pair body is not a StructLit tail"
        in
-       (match List.assoc_opt (lit_span.Span.file_id, lit_span.Span.start) (Driver.typed_nodes_of lenv) with
+       (match List.assoc_opt lit_nid (Driver.typed_nodes_of lenv) with
         | Some node ->
             if Type_repr.compare node.Mir_lower.tn_type (Type_repr.Named (l_tid, [||])) = 0 then
               Printf.printf
@@ -3131,14 +3132,13 @@ end
            (fun (d : Ast.function_decl) -> d.Ast.fn_sig.Ast.sig_name = "main")
            m_funcs
        in
-       let mcall_span =
+       let mcall_nid =
          match mmain_decl.Ast.fn_body with
-         | Ast.FnBlock { Ast.b_tail = Some (Ast.Call (_, _, _, span)); _ } -> span
+         | Ast.FnBlock { Ast.b_tail = Some (Ast.Call (n, _, _, _, _)); _ } -> n
          | _ -> failwith "method-call proof: main body is not a call tail"
        in
        (match
-          List.assoc_opt (mcall_span.Span.file_id, mcall_span.Span.start)
-            (Driver.typed_nodes_of menv)
+          List.assoc_opt mcall_nid (Driver.typed_nodes_of menv)
         with
         | Some node -> (
             match node.Mir_lower.tn_call with
@@ -3825,15 +3825,14 @@ end
            (fun (d : Ast.function_decl) -> d.Ast.fn_sig.Ast.sig_name = "main")
            q_funcs
        in
-       let qnew_span =
+       let qnew_nid, _qnew_span =
          match qmain_decl.Ast.fn_body with
-         | Ast.FnBlock { Ast.b_stmts = Ast.LetBinding (_, _, _, Ast.Call (Ast.Name (n, _), _, [], span), _) :: _; _ }
-           when n = "Buf::new" -> span
+         | Ast.FnBlock { Ast.b_stmts = Ast.LetBinding (_, _, _, Ast.Call (n, Ast.Name (_, nname, _), _, [], span), _) :: _; _ }
+           when nname = "Buf::new" -> (n, span)
          | _ -> failwith "qualified-call proof: main's first statement is not `let v = Buf::new()`"
        in
        (match
-          List.assoc_opt (qnew_span.Span.file_id, qnew_span.Span.start)
-            (Driver.typed_nodes_of qenv)
+          List.assoc_opt qnew_nid (Driver.typed_nodes_of qenv)
         with
         | Some node -> (
             match node.Mir_lower.tn_call with
@@ -4016,13 +4015,13 @@ end
          }
        in
        let va_span = Span.synthetic in
-       let va_name n = Ast.Name (n, va_span) in
+       let va_name n = Ast.Name (Ids.Node_id.make 0, n, va_span) in
        let va_arg e = { Ast.ca_label = None; ca_value = e; ca_span = va_span } in
-       let va_call n args = Ast.Call (va_name n, [], args, va_span) in
+       let va_call n args = Ast.Call (Ids.Node_id.make 0, va_name n, [], args, va_span) in
        let va_mcall base mname args =
-         Ast.Call (Ast.Field (va_name base, mname, va_span), [], args, va_span)
+         Ast.Call (Ids.Node_id.make 0, Ast.Field (Ids.Node_id.make 0, va_name base, mname, va_span), [], args, va_span)
        in
-       let va_int i = Ast.IntLit (string_of_int i, va_span) in
+       let va_int i = Ast.IntLit (Ids.Node_id.make 0, string_of_int i, va_span) in
        let va_let name value =
          Ast.LetBinding (Ast.PatIdent (name, false, va_span), false, None, value, va_span)
        in
@@ -4058,7 +4057,7 @@ end
                  b_tail =
                    Some
                      (va_mcall "v" "get"
-                        [ va_arg (Ast.Binary (va_name "d1", Ast.Add, va_name "d2", va_span)) ]);
+                        [ va_arg (Ast.Binary (Ids.Node_id.make 0, va_name "d1", Ast.Add, va_name "d2", va_span)) ]);
                  b_span = va_span;
                };
            fn_span = va_span;

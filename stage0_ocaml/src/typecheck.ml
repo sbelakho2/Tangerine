@@ -212,12 +212,11 @@ type env = {
   module_id : Ids.Module_id.t;
   resolved : Resolver.resolved_program option;
   module_path : string list;
-  (* the persistent typed-node map (re-audit bridge): span identity
-     (file_id, start) -> resolved node.  Populated during check_expr;
-     the mutable table is shared across the `{ env with ... }` record
-     updates, so the final env the driver receives holds every accepted
-     node's channel entry. *)
-  typed_nodes : (int * int, typed_node) Hashtbl.t;
+  (* the persistent typed-node map (re-audit bridge): NodeId -> resolved
+     node.  Populated during check_expr; the mutable table is shared
+     across the `{ env with ... }` record updates, so the final env the
+     driver receives holds every accepted node's channel entry. *)
+  typed_nodes : (Ids.Node_id.t, typed_node) Hashtbl.t;
 }
 
 type scope = {
@@ -1591,7 +1590,7 @@ let vars_in (ty : Type_repr.t) : int list =
 
 let resolve_constant_int (e : Ast.expr) : (int, string) result =
   match e with
-  | Ast.IntLit (spelling, span) -> (
+  | Ast.IntLit (_, spelling, span) -> (
       match Literal.parse_integer ~span spelling with
       | Some p when Big_nat.fits_ocaml_int p.Literal.magnitude ->
           Ok (Big_nat.to_ocaml_int p.Literal.magnitude)
@@ -1888,10 +1887,10 @@ let field_id_of (env : env) (owner_name : string) (fname : string) : Ids.Field_i
    recoverable here without the full checker). *)
 let rec static_type_of (env : env) (scope : scope) (e : Ast.expr) : Type_repr.t option =
   match e with
-  | Ast.Name (n, _) -> (
+  | Ast.Name (_, n, _) -> (
       match assoc_local n scope.locals with Some (t, _) -> Some t | None -> None)
   | Ast.Path _ -> None
-  | Ast.Field (base, fname, _span) -> (
+  | Ast.Field (_, base, fname, _span) -> (
       match static_type_of env scope base with
       | None -> None
       | Some bt -> (
@@ -1916,12 +1915,12 @@ let rec static_type_of (env : env) (scope : scope) (e : Ast.expr) : Type_repr.t 
                   | _ -> None)
               | None -> None)
           | _ -> None))
-  | Ast.Index (base, _, _) -> (
+  | Ast.Index (_, base, _, _) -> (
       match static_type_of env scope base with
       | Some (Type_repr.Fixed_array (t, _)) -> Some t
       | Some (Type_repr.Named (_, [| t |])) -> Some t
       | _ -> None)
-  | Ast.Unary (Ast.Borrow, inner, _) | Ast.Unary (Ast.BorrowMut, inner, _) ->
+  | Ast.Unary (_, Ast.Borrow, inner, _) | Ast.Unary (_, Ast.BorrowMut, inner, _) ->
       static_type_of env scope inner
   | _ -> None
 
@@ -1936,13 +1935,13 @@ let rec static_type_of (env : env) (scope : scope) (e : Ast.expr) : Type_repr.t 
 let rec place_of_expr (env : env) (scope : scope) (e : Ast.expr) : Access_check.access_path option
     =
   match e with
-  | Ast.Name (n, _) -> (
+  | Ast.Name (_, n, _) -> (
       match List.assoc_opt n scope.local_ids with
       | Some lid ->
           Some { Access_check.root = Local_id.to_int lid; Access_check.projections = [] }
       | None -> None)
   | Ast.Path _ -> None
-  | Ast.Field (base, fname, _) -> (
+  | Ast.Field (_, base, fname, _) -> (
       match place_of_expr env scope base with
       | None -> None
       | Some p -> (
@@ -1962,7 +1961,7 @@ let rec place_of_expr (env : env) (scope : scope) (e : Ast.expr) : Access_check.
                   Access_check.projections = p.Access_check.projections @ [ Access_check.Field fid ];
                 }
           | None -> None))
-  | Ast.Index (base, _, _) -> (
+  | Ast.Index (_, base, _, _) -> (
       match place_of_expr env scope base with
       | None -> None
       | Some p ->
@@ -1971,9 +1970,9 @@ let rec place_of_expr (env : env) (scope : scope) (e : Ast.expr) : Access_check.
               p with
               Access_check.projections = p.Access_check.projections @ [ Access_check.Index ];
             })
-  | Ast.Unary (Ast.Borrow, inner, _) | Ast.Unary (Ast.BorrowMut, inner, _) ->
+  | Ast.Unary (_, Ast.Borrow, inner, _) | Ast.Unary (_, Ast.BorrowMut, inner, _) ->
       place_of_expr env scope inner
-  | Ast.Unary (Ast.Deref, inner, _) -> (
+  | Ast.Unary (_, Ast.Deref, inner, _) -> (
       match place_of_expr env scope inner with
       | None -> None
       | Some p ->
@@ -2344,7 +2343,7 @@ and check_expr (env : env) (scope : scope) (expected : Type_repr.t option) (e : 
   | Ok te ->
       env.state.oracle.o_exprs <- te :: env.state.oracle.o_exprs;
       (* the persistent typed-node bridge: record the accepted node by
-         span identity (file_id, start).  A cast node's te_type IS the
+         its parser-minted NodeId.  A cast node's te_type IS the
          checker-resolved target type; the dedicated tn_cast_target
          field keeps the channel self-describing for the lowering Cast
          rule (the target carries the declaration-owned GenericParamIds
@@ -2353,7 +2352,7 @@ and check_expr (env : env) (scope : scope) (expected : Type_repr.t option) (e : 
       (* a call's tn_call is written by check_call_sig/check_method_call
          (which run INSIDE check_expr_inner, before this replace); preserve
          it so the call channel survives the node record *)
-      let key = (te.te_span.Span.file_id, te.te_span.Span.start) in
+      let key = Ast.expr_node_id e in
       let tn_call =
         match Hashtbl.find_opt env.typed_nodes key with
         | Some n -> n.tn_call
@@ -2367,7 +2366,7 @@ and check_expr (env : env) (scope : scope) (expected : Type_repr.t option) (e : 
 and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
     (e : Ast.expr) : (typed_expr, string) result =
   match e with
-  | Ast.IntLit (spelling, span) -> (
+  | Ast.IntLit (_, spelling, span) -> (
       match Literal.parse_integer ~span spelling with
       | None -> Error (err span "malformed integer literal")
       | Some p -> (
@@ -2408,24 +2407,24 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
                      (Literal.range_error p
                       ^ " (a literal that does not fit its type is a TYPE error, never zeroed)"))
               else Ok { te_type = Type_repr.Int_literal p.Literal.magnitude; te_effects = [||]; te_span = span }))
-  | Ast.FloatLit (_, span) -> (
+  | Ast.FloatLit (_, _, span) -> (
       match expected with
       | Some (Type_repr.Float Type_repr.F32) ->
           Ok { te_type = Type_repr.Float Type_repr.F32; te_effects = [||]; te_span = span }
       | _ -> Ok { te_type = Type_repr.Float Type_repr.F64; te_effects = [||]; te_span = span })
-  | Ast.StringLit (_, span) ->
+  | Ast.StringLit (_, _, span) ->
       Ok { te_type = Type_repr.String; te_effects = [||]; te_span = span }
-  | Ast.CharLit (c, span) -> (
+  | Ast.CharLit (_, c, span) -> (
       (* Uchar validation: the spelling must decode to exactly one scalar *)
       match Utf8.decode_at (Bytes.of_string c) 0 with
       | Ok (_, next) when next = String.length c ->
           Ok { te_type = Type_repr.Char; te_effects = [||]; te_span = span }
       | _ -> Error (err span "char literal is not a single Unicode scalar"))
-  | Ast.BoolLit (_, span) ->
+  | Ast.BoolLit (_, _, span) ->
       Ok { te_type = Type_repr.Bool; te_effects = [||]; te_span = span }
-  | Ast.Name (n, span) -> check_name env scope expected n span
-  | Ast.Path (a, b, span) -> check_name env scope expected (a ^ "::" ^ b) span
-  | Ast.Tuple (elems, span) -> (
+  | Ast.Name (nid, n, span) -> check_name env scope expected nid n span
+  | Ast.Path (nid, a, b, span) -> check_name env scope expected nid (a ^ "::" ^ b) span
+  | Ast.Tuple (_, elems, span) -> (
       if elems = [] then Ok { te_type = Type_repr.Unit; te_effects = [||]; te_span = span }
       else
         let rec go acc = function
@@ -2451,7 +2450,7 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
                   | Error m -> Error m)
             in
             Ok { te_type = substitute_fixpoint !subst ty; te_effects = effects; te_span = span }))
-  | Ast.Array (elems, span) -> (
+  | Ast.Array (_, elems, span) -> (
       match elems with
       | [] -> (
           match expected with
@@ -2496,7 +2495,7 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
                     | _ -> Type_repr.Fixed_array (elem_ty, List.length elems)
                   in
                   Ok { te_type = ty; te_effects = effects; te_span = span }))))
-  | Ast.ArrayRepeat (v, c, span) -> (
+  | Ast.ArrayRepeat (_, v, c, span) -> (
       match check_expr env scope None v with
       | Error m -> Error m
       | Ok te -> (
@@ -2505,7 +2504,7 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
           | Ok n when n < 0 -> Error (err span "negative array repeat count")
           | Ok n ->
               Ok { te_type = Type_repr.Fixed_array (te.te_type, n); te_effects = te.te_effects; te_span = span }))
-  | Ast.StructLit (name, targs, fields, rest, span) -> (
+  | Ast.StructLit (_, name, targs, fields, rest, span) -> (
       match resolve_nominal env span name with
       | Error m -> Error m
       | Ok (nom, tid, _) when nom.nom_kind = `Struct -> (
@@ -2688,11 +2687,12 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
                          Ok { te_type = Type_repr.Named (tid, lit_args); te_effects = effects; te_span = span })
                end)))
       | Ok _ -> Error (err span (Printf.sprintf "`%s` is not a struct" name)))
-  | Ast.Block (b, span) -> check_block env scope expected b span
-  | Ast.UnsafeBlock (_, b, span) -> check_block env scope expected b span
-  | Ast.IfExpr i -> check_if env scope expected i
-  | Ast.Call (callee, targs, args, span) -> check_call env scope expected callee targs args span
-  | Ast.Index (base, idx, span) -> (
+  | Ast.Block (_, b, span) -> check_block env scope expected b span
+  | Ast.UnsafeBlock (_, _, b, span) -> check_block env scope expected b span
+  | Ast.IfExpr (_, i) -> check_if env scope expected i
+  | Ast.Call (nid, callee, targs, args, span) ->
+      check_call env scope expected nid callee targs args span
+  | Ast.Index (_, base, idx, span) -> (
       match check_expr env scope None base with
       | Error m -> Error m
       | Ok te -> (
@@ -2723,7 +2723,7 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
                   Error
                     (err span
                        (Printf.sprintf "cannot index a value of type %s" (type_to_string te.te_type))))))
-  | Ast.Range (a, b, _, span) -> (
+  | Ast.Range (_, a, b, _, span) -> (
       match check_expr env scope None a, check_expr env scope None b with
       | Error m, _ | _, Error m -> Error m
       | Ok ta, Ok tb -> (
@@ -2739,8 +2739,8 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
               te_effects = Array.append ta.te_effects tb.te_effects;
               te_span = span;
             }))
-  | Ast.MatchExpr m -> check_match env scope expected m
-  | Ast.Cast (inner, ty, span) -> (
+  | Ast.MatchExpr (_, m) -> check_match env scope expected m
+  | Ast.Cast (_, inner, ty, span) -> (
       match check_expr env scope None inner with
       | Error m -> Error m
       | Ok te -> (
@@ -2777,7 +2777,7 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
                      (Printf.sprintf "cannot cast %s to %s" (type_to_string te.te_type)
                         (type_to_string tgt)))
               else Ok { te_type = tgt; te_effects = te.te_effects; te_span = span })))
-  | Ast.TryOp (inner, span) -> (
+  | Ast.TryOp (_, inner, span) -> (
       match check_expr env scope None inner with
       | Error m -> Error m
       | Ok te -> (
@@ -2797,8 +2797,8 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
                 (err span
                    (Printf.sprintf "`?` requires an Option or Result, found %s"
                       (type_to_string te.te_type)))))
-  | Ast.Closure c -> check_closure env scope expected c
-  | Ast.Unary (op, inner, span) -> (
+  | Ast.Closure (_, c) -> check_closure env scope expected c
+  | Ast.Unary (_, op, inner, span) -> (
       match check_expr env scope None inner with
       | Error m -> Error m
       | Ok te -> (
@@ -2828,9 +2828,25 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
                   (* a generic pointer: the pointee is the parameter
                      itself until the instantiation resolves *)
                   Ok { te_type = te.te_type; te_effects = Array.append te.te_effects [| Access_effect.Read |]; te_span = span }
-              | _ ->
-                  Error
-                    (err span (Printf.sprintf "cannot dereference %s" (type_to_string te.te_type))))
+              | _ -> (
+                  (* native parity (types.tg ExprRawDeref): a deref whose
+                     operand is a VALUE expression (call/cast/field/index)
+                     passes the operand's type through when it is not a
+                     pointer — `*(p as Int)` is the raw address-deref
+                     spelling and the cast is value-level. Only a deref of
+                     a bare NAME is strict (native: "safe dereference
+                     removed; access through the parameter is direct"). *)
+                  match inner with
+                  | Ast.Name _ | Ast.Path _ ->
+                      Error
+                        (err span (Printf.sprintf "cannot dereference %s" (type_to_string te.te_type)))
+                  | _ ->
+                      Ok
+                        {
+                          te_type = te.te_type;
+                          te_effects = Array.append te.te_effects [| Access_effect.Read |];
+                          te_span = span;
+                        }))
           | Ast.Neg -> (
               match te.te_type with
               | Type_repr.Int _ | Type_repr.Float _ ->
@@ -2863,11 +2879,11 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
                     (err span
                        (Printf.sprintf "bitwise not requires an integer, found %s"
                           (type_to_string te.te_type))))))
-  | Ast.Field (base, fname, span) -> (
+  | Ast.Field (_, base, fname, span) -> (
       match check_expr env scope None base with
       | Error m -> Error m
       | Ok te -> check_field env scope span te fname)
-  | Ast.Binary (l, op, r, span) -> (
+  | Ast.Binary (_, l, op, r, span) -> (
       match check_expr env scope None l with
       | Error m -> Error m
       | Ok tl -> (
@@ -2884,8 +2900,8 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
                       te_effects = Array.append tl.te_effects tr.te_effects;
                       te_span = span;
                     })))
-  | Ast.AwaitExpr (_, span) -> Error (err span "await is not available in the bootstrap subset")
-  | Ast.MacroCall (name, args, span) ->
+  | Ast.AwaitExpr (_, _, span) -> Error (err span "await is not available in the bootstrap subset")
+  | Ast.MacroCall (_, name, args, span) ->
       (* debug_assert!(cond[, msg]): the kernel's 3 uses (ffi) are a
          check on a boolean condition — check the condition, drop the
          optional message, yield Unit *)
@@ -2936,8 +2952,8 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
                        List.rev !segs
                        |> List.map (fun s ->
                               let s = String.trim s in
-                              if s = "" then Ast.Name ("", span)
-                              else Ast.Name (s, span)))
+                              if s = "" then Ast.Name (Ast.synthetic_node_id, "", span)
+                              else Ast.Name (Ast.synthetic_node_id, s, span)))
                  (first :: rest)
              in
              match exprs with
@@ -2977,7 +2993,7 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
                            }))))
       else
         Error (err span (Printf.sprintf "macro call `%s!` is not available in the bootstrap subset" name))
-  | Ast.Assign (target, value, span) -> (
+  | Ast.Assign (_, target, value, span) -> (
       match check_place env scope target with
       | Error m -> Error m
       | Ok (ptype, _) -> (
@@ -3003,7 +3019,7 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
                       (err span
                          (Printf.sprintf "assignment type mismatch: expected %s, found %s (%s)"
                             (type_to_string ptype) (type_to_string te.te_type) m)))))
-  | Ast.CompoundAssign (target, op, value, span) -> (
+  | Ast.CompoundAssign (_, target, op, value, span) -> (
       match check_place env scope target with
       | Error m -> Error m
       | Ok (ptype, _) -> (
@@ -3025,7 +3041,7 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
                         te_effects = Array.append [| Access_effect.Modify |] te.te_effects;
                         te_span = span;
                       })))
-  | Ast.ReturnExpr (inner, span) -> (
+  | Ast.ReturnExpr (_, inner, span) -> (
       match env.current_return with
       | None -> Error (err span "return outside a function")
       | Some rt -> (
@@ -3048,7 +3064,7 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
                         (err span
                            (Printf.sprintf "return type mismatch: function returns %s, found %s (%s)"
                               (type_to_string rt) (type_to_string te.te_type) m))))))
-  | Ast.BreakExpr (inner, span) -> (
+  | Ast.BreakExpr (_, inner, span) -> (
       if scope.loop_depth = 0 then Error (err span "break outside a loop")
       else
         match inner with
@@ -3057,12 +3073,12 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
             match check_expr env scope (Some Type_repr.Unit) e with
             | Ok te -> Ok { te_type = Type_repr.Unit; te_effects = te.te_effects; te_span = span }
             | Error m -> Error m))
-  | Ast.NextExpr span -> (
+  | Ast.NextExpr (_, span) -> (
       (* the Swift seed's semantics: a bare `next` without a loop target
          is a Unit statement, not an error (the kernel relies on the
          tail-`next` identifier form in cfg_synthetic_alloc) *)
       Ok { te_type = Type_repr.Unit; te_effects = [||]; te_span = span })
-  | Ast.ForExpr f -> (
+  | Ast.ForExpr (_, f) -> (
       match check_expr env scope None f.Ast.for_iterable with
       | Error m -> Error m
       | Ok te -> (
@@ -3094,24 +3110,24 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
               | Ok binds ->
                   let scope = add_binds scope binds in
                   check_block env { scope with loop_depth = scope.loop_depth + 1 }
-                    (Some Type_repr.Unit) f.Ast.for_body f.Ast.for_span)))
-  | Ast.WhileExpr w -> (
+                    None f.Ast.for_body f.Ast.for_span)))
+  | Ast.WhileExpr (_, w) -> (
       match check_expr env scope (Some Type_repr.Bool) w.Ast.wh_condition with
       | Error m -> Error m
       | Ok tc -> (
           let subst = ref [] in
           match unify env.state.box_tid subst tc.te_type Type_repr.Bool with
           | Ok () ->
-              check_block env { scope with loop_depth = scope.loop_depth + 1 } (Some Type_repr.Unit)
+              check_block env { scope with loop_depth = scope.loop_depth + 1 } None
                 w.Ast.wh_body w.Ast.wh_span
           | Error m ->
               ignore
                 (return_unify_err (Ast.expr_span w.Ast.wh_condition) Type_repr.Bool
                    tc.te_type m);
               Error m))
-  | Ast.LoopExpr (b, span) -> (
+  | Ast.LoopExpr (_, b, span) -> (
       match
-        check_block env { scope with loop_depth = scope.loop_depth + 1 } (Some Type_repr.Unit) b span
+        check_block env { scope with loop_depth = scope.loop_depth + 1 } None b span
       with
       | Error m -> Error m
       | Ok te ->
@@ -3120,11 +3136,11 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
              StmtLoop rule; its own loop-with-return bodies end with no
              tail and rely on the Never normal) *)
           Ok { te_type = Type_repr.Never; te_effects = te.te_effects; te_span = span })
-  | Ast.HandleExpr h -> Error (err h.Ast.h_span "handle/with expressions are not available in the bootstrap subset")
-  | Ast.UnlessExpr u -> Error (err u.Ast.un_span "unless expressions are not available in the bootstrap subset")
-  | Ast.UntilExpr u -> Error (err u.Ast.ut_span "until expressions are not available in the bootstrap subset")
-  | Ast.TryBlock t -> Error (err t.Ast.tr_span "try/catch/finally blocks are not available in the bootstrap subset")
-  | Ast.ComptimeBlock (_, span) -> Error (err span "comptime blocks are not available in the bootstrap subset")
+  | Ast.HandleExpr (_, h) -> Error (err h.Ast.h_span "handle/with expressions are not available in the bootstrap subset")
+  | Ast.UnlessExpr (_, u) -> Error (err u.Ast.un_span "unless expressions are not available in the bootstrap subset")
+  | Ast.UntilExpr (_, u) -> Error (err u.Ast.ut_span "until expressions are not available in the bootstrap subset")
+  | Ast.TryBlock (_, t) -> Error (err t.Ast.tr_span "try/catch/finally blocks are not available in the bootstrap subset")
+  | Ast.ComptimeBlock (_, _, span) -> Error (err span "comptime blocks are not available in the bootstrap subset")
 
 and add_binds (scope : scope) (binds : (string * Type_repr.t * bool) list) : scope =
   List.fold_left
@@ -3197,7 +3213,7 @@ and check_stmt (env : env) (scope : scope) (s : Ast.stmt) : (scope, string) resu
   | Ast.AttributeStmt (_, _) -> Ok scope
   | Ast.Attributed (_, inner, _) -> check_stmt env scope inner
   | Ast.DeferStmt (b, span) -> (
-      match check_block env scope (Some Type_repr.Unit) b span with
+      match check_block env scope None b span with
       | Ok _ -> Ok scope
       | Error m -> Error m)
   | Ast.Item { Ast.kind = Ast.Function fd; _ } ->
@@ -3236,7 +3252,13 @@ and check_stmt (env : env) (scope : scope) (s : Ast.stmt) : (scope, string) resu
                      next_local_id = Local_id.make (base + n_params);
                    }
                  in
-                (match check_block env_m body_scope (Some sig_.ts_return) b b.b_span with
+                (match
+                   check_block env_m body_scope
+                     (match sig_.ts_return with
+                     | Type_repr.Unit -> None
+                     | _ -> Some sig_.ts_return)
+                     b b.b_span
+                 with
                  | Ok _ ->
                      env.state.nested_functions <-
                        (qname, sig_, fd)
@@ -3556,7 +3578,7 @@ and check_binary (box_tid : Ids.Type_id.t option)
 
 and check_place (env : env) (scope : scope) (e : Ast.expr) : (Type_repr.t * bool, string) result =
   match e with
-  | Ast.Name (n, span) -> (
+  | Ast.Name (_, n, span) -> (
       match assoc_local n scope.locals with
       | Some (t, mutable_) -> Ok (t, mutable_)
       | None -> (
@@ -3572,7 +3594,7 @@ and check_place (env : env) (scope : scope) (e : Ast.expr) : (Type_repr.t * bool
               match List.assoc_opt n env.consts with
               | Some t -> Ok (t, true)
               | None -> Error (err span (Printf.sprintf "unknown variable `%s`" n)))))
-  | Ast.Field (base, fname, span) -> (
+  | Ast.Field (_, base, fname, span) -> (
       match check_place env scope base with
       | Error m -> Error m
       | Ok (bt, bmut) -> (
@@ -3592,7 +3614,7 @@ and check_place (env : env) (scope : scope) (e : Ast.expr) : (Type_repr.t * bool
           with
           | Ok te -> Ok (te.te_type, bmut)
           | Error m -> Error m))
-  | Ast.Index (base, idx, span) -> (
+  | Ast.Index (_, base, idx, span) -> (
       match check_place env scope base with
       | Error m -> Error m
       | Ok (bt, bmut) -> (
@@ -3613,7 +3635,7 @@ and check_place (env : env) (scope : scope) (e : Ast.expr) : (Type_repr.t * bool
               | Ok _ ->
                   Error (err span (Printf.sprintf "cannot index a value of type %s" (type_to_string bt)))
               | Error m -> Error m)))
-  | Ast.Unary (Ast.Deref, e, _) -> (
+  | Ast.Unary (_, Ast.Deref, e, _) -> (
       (* the pointer-write place: *(ptr) = value *)
       match check_expr env scope None e with
       | Error m -> Error m
@@ -3715,8 +3737,8 @@ and check_field (env : env) (_scope : scope) (span : Span.span) (base : typed_ex
             (err span
                (Printf.sprintf "cannot project `.%s` from %s" fname (type_to_string base.te_type))))
 
-and check_name (env : env) (scope : scope) (expected : Type_repr.t option) (n : string)
-    (span : Span.span) : (typed_expr, string) result =
+and check_name (env : env) (scope : scope) (expected : Type_repr.t option)
+    (node_id : Ids.Node_id.t) (n : string) (span : Span.span) : (typed_expr, string) result =
   match assoc_local n scope.locals with
       | Some (t, _) ->
       let subst = ref [] in
@@ -3806,7 +3828,7 @@ and check_name (env : env) (scope : scope) (expected : Type_repr.t option) (n : 
                       }
                 | None ->
                     (match List.assoc_opt n env.constructors with
-                     | Some cs -> check_call_sig env scope expected cs [] [] span
+                     | Some cs -> check_call_sig env scope expected node_id cs [] [] span
                      | None -> (
                          match List.assoc_opt n env.functions with
                          | Some fs ->
@@ -3830,7 +3852,7 @@ and check_name (env : env) (scope : scope) (expected : Type_repr.t option) (n : 
                                                n (type_to_string fn_ty) m)))
                               | _ ->
                                   if Array.length fs.ts_params = 0 then
-                                    check_call_sig env scope expected fs [] [] span
+                                    check_call_sig env scope expected node_id fs [] [] span
                                   else
                                     Error
                                       (err span
@@ -3913,18 +3935,18 @@ and lookup_function (env : env) (n : string) : typed_signature option =
                   | _ -> None))))
 
 and check_call (env : env) (scope : scope) (expected : Type_repr.t option)
-    (callee : Ast.expr) (targs : Ast.type_expr list) (args : Ast.call_arg list)
-    (span : Span.span) : (typed_expr, string) result =
+    (node_id : Ids.Node_id.t) (callee : Ast.expr) (targs : Ast.type_expr list)
+    (args : Ast.call_arg list) (span : Span.span) : (typed_expr, string) result =
   match callee with
-  | Ast.Name (n, _) when (n = "size_of" || n = "align_of") && targs <> [] -> (
+  | Ast.Name (_, n, _) when (n = "size_of" || n = "align_of") && targs <> [] -> (
       (* the type-query special form: size_of[T]() / align_of[T]() — the
          stable, once-minted signature so the oracle sees a known DefId *)
       match List.assoc_opt n env.state.query_sigs with
-      | Some query_sig -> check_call_sig env scope expected query_sig targs args span
+      | Some query_sig -> check_call_sig env scope expected node_id query_sig targs args span
       | None ->
           env.state.oracle.o_unresolved_calls <- env.state.oracle.o_unresolved_calls + 1;
           Error (err span (Printf.sprintf "unknown function `%s`" n)))
-  | Ast.Name (n, _) -> (
+  | Ast.Name (_, n, _) -> (
       match assoc_local n scope.locals with
       | Some (Type_repr.Function (ps, _), _) ->
           check_closure_call env scope expected n ps args span
@@ -3932,10 +3954,10 @@ and check_call (env : env) (scope : scope) (expected : Type_repr.t option)
           Error (err span (Printf.sprintf "cannot call a value of type %s" (type_to_string t)))
       | None -> (
           match List.assoc_opt n env.constructors with
-          | Some cs -> check_call_sig env scope expected cs targs args span
+          | Some cs -> check_call_sig env scope expected node_id cs targs args span
           | None -> (
               match lookup_function env n with
-              | Some fs -> check_call_sig env scope expected fs targs args span
+              | Some fs -> check_call_sig env scope expected node_id fs targs args span
               | None -> (
                   (* static method call `Type::method(...)`: the receiver is
                      the type itself; check args against params 1.. *)
@@ -3960,7 +3982,7 @@ and check_call (env : env) (scope : scope) (expected : Type_repr.t option)
                               (* a static/associated method without a receiver
                                  (e.g. `Vec::new`, `Vec::with_capacity`):
                                  check the args as-is *)
-                              check_call_sig env scope expected sig_ targs args span
+                              check_call_sig env scope expected node_id sig_ targs args span
                             else
                               (* prepend the synthetic receiver ONLY when the
                                  self parameter's type IS the owner's own
@@ -3979,14 +4001,14 @@ and check_call (env : env) (scope : scope) (expected : Type_repr.t option)
                                 | _ -> false
                               in
                               if self_is_owner then
-                                check_call_sig env scope expected sig_ targs
+                                check_call_sig env scope expected node_id sig_ targs
                                   ({ Ast.ca_label = None;
-                                     ca_value = Ast.Name (owner, span);
+                                     ca_value = Ast.Name (Ast.synthetic_node_id, owner, span);
                                      ca_span = span }
                                   :: args)
                                   span
                               else
-                                check_call_sig env scope expected sig_ targs args span
+                                check_call_sig env scope expected node_id sig_ targs args span
                         | None -> (
                             (* alias fallback: `Vec` is a builtin alias of the
                                kernel's `Array`; the builtin nominal may carry
@@ -4023,7 +4045,7 @@ and check_call (env : env) (scope : scope) (expected : Type_repr.t option)
                               | [] -> (
                                   match mangled with
                                   | Some sig_ ->
-                                      check_call_sig env scope expected sig_ targs args span
+                                      check_call_sig env scope expected node_id sig_ targs args span
                                   | None ->
                                       env.state.oracle.o_unresolved_calls <-
                                         env.state.oracle.o_unresolved_calls + 1;
@@ -4038,11 +4060,11 @@ and check_call (env : env) (scope : scope) (expected : Type_repr.t option)
                                         && sig_.ts_param_names.(0) = "self"
                                       in
                                       if not has_self2 then
-                                        check_call_sig env scope expected sig_ targs args span
+                                        check_call_sig env scope expected node_id sig_ targs args span
                                       else
-                                        check_call_sig env scope expected sig_ targs
+                                        check_call_sig env scope expected node_id sig_ targs
                                           ({ Ast.ca_label = None;
-                                             ca_value = Ast.Name (owner, span);
+                                             ca_value = Ast.Name (Ast.synthetic_node_id, owner, span);
                                              ca_span = span }
                                           :: args)
                                           span
@@ -4052,9 +4074,12 @@ and check_call (env : env) (scope : scope) (expected : Type_repr.t option)
                   | _ ->
                       env.state.oracle.o_unresolved_calls <- env.state.oracle.o_unresolved_calls + 1;
                       Error (err span (Printf.sprintf "unknown function `%s`" n))))))
-  | Ast.Path (a, b, _) ->
-      check_call env scope expected (Ast.Name (a ^ "::" ^ b, Span.synthetic)) targs args span
-  | Ast.Field (base, mname, _) -> check_method_call env scope expected base mname targs args span
+  | Ast.Path (_, a, b, _) ->
+      check_call env scope expected node_id
+        (Ast.Name (Ast.synthetic_node_id, a ^ "::" ^ b, Span.synthetic))
+        targs args span
+  | Ast.Field (_, base, mname, _) ->
+      check_method_call env scope expected node_id base mname targs args span
   | _ -> (
       match check_expr env scope None callee with
       | Error m -> Error m
@@ -4152,8 +4177,8 @@ and check_closure_call (env : env) (scope : scope) (expected : Type_repr.t optio
       end
 
 and check_call_sig (env : env) (scope : scope) (expected : Type_repr.t option)
-    (sig_ : typed_signature) (targs : Ast.type_expr list) (args : Ast.call_arg list)
-    (span : Span.span) : (typed_expr, string) result =
+    (node_id : Ids.Node_id.t) (sig_ : typed_signature) (targs : Ast.type_expr list)
+    (args : Ast.call_arg list) (span : Span.span) : (typed_expr, string) result =
   let n_params = List.length sig_.ts_params_decl in
   if List.length targs > n_params then
     Error (err span (Printf.sprintf "too many type arguments for `%s`" sig_.ts_name))
@@ -4379,10 +4404,10 @@ and check_call_sig (env : env) (scope : scope) (expected : Type_repr.t option)
       in
       env.state.oracle.o_calls <- call :: env.state.oracle.o_calls;
       (* the persistent typed-call channel (re-audit): the node at the
-         call's span carries the callee's CallableId + the SOLVED
+         call's NodeId carries the callee's CallableId + the SOLVED
          concrete substitution (declaration order, substitute_fixpoint
          over the vars) — the exact-arity pairing lowering consumes *)
-      Hashtbl.replace env.typed_nodes (span.Span.file_id, span.Span.start)
+      Hashtbl.replace env.typed_nodes node_id
         { tn_type = ret; tn_cast_target = None; tn_call = Some (sig_.ts_callable, substitution) };
       (* the integrated access channel (re-audit P0-11): one record per
          argument, in program order, aligned with the recorded effects;
@@ -4400,7 +4425,8 @@ and check_call_sig (env : env) (scope : scope) (expected : Type_repr.t option)
   end
 
 and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option)
-    (base : Ast.expr) (mname : string) (targs : Ast.type_expr list) (args : Ast.call_arg list)
+    (node_id : Ids.Node_id.t) (base : Ast.expr) (mname : string)
+    (targs : Ast.type_expr list) (args : Ast.call_arg list)
     (span : Span.span) : (typed_expr, string) result =
   let* receiver = check_expr env scope None base in
   let owner_ty = receiver.te_type in
@@ -4845,9 +4871,9 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
                 in
                 env.state.oracle.o_calls <- call :: env.state.oracle.o_calls;
                 (* the persistent typed-call channel: same node-keyed
-                   record as check_call_sig — the method's call span
+                   record as check_call_sig — the method's call node
                    carries the resolved callable + solved substitution *)
-                Hashtbl.replace env.typed_nodes (span.Span.file_id, span.Span.start)
+                Hashtbl.replace env.typed_nodes node_id
                   { tn_type = ret; tn_cast_target = None; tn_call = Some (sig_.ts_callable, substitution) };
                 (* the integrated access channel (re-audit P0-11): the
                    receiver first, then the arguments, aligned with
@@ -4926,7 +4952,17 @@ let rec check_function_body (env : env) (extra_tp_bounds : (string * string list
     let* () = check_where_obligations env' d.fn_span ("function `" ^ sig_.ts_name ^ "`") sig_.ts_where in
     let* body =
       match d.fn_body with
-      | Ast.FnBlock b -> check_block env' scope (Some sig_.ts_return) b b.b_span
+      | Ast.FnBlock b ->
+          (* a Unit-returning fn's block tail is DISCARDED (types.tg
+             parity: the production rule below unifies nothing for a
+             FnBlock); passing Some Unit into the tail would wrongly
+             require the trailing statement's value to be Unit —
+             `xs.pop()` as the last statement of a Unit fn is legal *)
+          check_block env' scope
+            (match sig_.ts_return with
+            | Type_repr.Unit -> None
+            | _ -> Some sig_.ts_return)
+            b b.b_span
       | Ast.FnExpr e -> check_expr env' scope (Some sig_.ts_return) e
       | Ast.FnSignatureOnly ->
           Ok { te_type = sig_.ts_return; te_effects = [||]; te_span = sig_.ts_span }

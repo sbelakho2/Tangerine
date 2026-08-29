@@ -123,7 +123,8 @@ type func_env = {
 
 (* ── The persistent typed-node channel (re-audit: TypedProgram/TypedHIR
       bridge) ─────────────────────────────────────────────────────
-   Span identity (file_id, start) -> the typechecker's resolved node.
+   NodeId (the parser-minted per-expression node identity) -> the
+   typechecker's resolved node.
    The typed channel is AUTHORITATIVE when present: a cast's resolved
    target comes from the checker's Named(GenericParamId, ...) with the
    declaration-owned ids, never from type_of_syntax's positional
@@ -313,15 +314,15 @@ type lower_state = {
   mutable continue_target : int option;
   variants : variant_table;              (* enum variant/constructor identity *)
   mutable defer_stack : Ast.block_body list;  (* function-level defer bodies; head = most recent *)
-  (* the persistent typed-node channel: span identity (file_id, start)
-     -> the typechecker's resolved node ([] = channel absent) *)
-  typed_nodes : ((int * int) * typed_node) list;
+  (* the persistent typed-node channel: NodeId -> the typechecker's
+     resolved node ([] = channel absent) *)
+  typed_nodes : (Ids.Node_id.t * typed_node) list;
 }
 
 (* The typed-node channel lookup: the typechecker's resolved node for an
-   expr's span identity, when the channel is present. *)
-let typed_node_of (st : lower_state) (span : Span.span) : typed_node option =
-  List.assoc_opt (span.Span.file_id, span.Span.start) st.typed_nodes
+   expr's NodeId, when the channel is present. *)
+let typed_node_of (st : lower_state) (node_id : Ids.Node_id.t) : typed_node option =
+  List.assoc_opt node_id st.typed_nodes
 
 let new_block (st : lower_state) : int =
   let id = st.next_block in
@@ -445,41 +446,41 @@ let rec copyable_ty (t : Type_repr.t) : bool =
 let rec expr_has_return (e : Ast.expr) : bool =
   match e with
   | Ast.ReturnExpr _ -> true
-  | Ast.Block (b, _) -> block_has_return b
-  | Ast.IfExpr i ->
+  | Ast.Block (_, b, _) -> block_has_return b
+  | Ast.IfExpr (_, i) ->
       expr_has_return i.Ast.if_condition
       || block_has_return i.Ast.if_then
       || List.exists (fun (_, b) -> block_has_return b) i.Ast.if_elsif
       || (match i.Ast.if_else with Some b -> block_has_return b | None -> false)
       || (match i.Ast.if_let_value with Some v -> expr_has_return v | None -> false)
-  | Ast.MatchExpr m ->
+  | Ast.MatchExpr (_, m) ->
       expr_has_return m.Ast.m_subject
       || List.exists
            (fun arm ->
              expr_has_return arm.Ast.ma_body
              || (match arm.Ast.ma_guard with Some g -> expr_has_return g | None -> false))
            m.Ast.m_arms
-  | Ast.WhileExpr w -> expr_has_return w.Ast.wh_condition || block_has_return w.Ast.wh_body
-  | Ast.LoopExpr (b, _) -> block_has_return b
-  | Ast.ForExpr f -> expr_has_return f.Ast.for_iterable || block_has_return f.Ast.for_body
-  | Ast.UntilExpr u -> expr_has_return u.Ast.ut_condition || block_has_return u.Ast.ut_body
-  | Ast.UnlessExpr u ->
+  | Ast.WhileExpr (_, w) -> expr_has_return w.Ast.wh_condition || block_has_return w.Ast.wh_body
+  | Ast.LoopExpr (_, b, _) -> block_has_return b
+  | Ast.ForExpr (_, f) -> expr_has_return f.Ast.for_iterable || block_has_return f.Ast.for_body
+  | Ast.UntilExpr (_, u) -> expr_has_return u.Ast.ut_condition || block_has_return u.Ast.ut_body
+  | Ast.UnlessExpr (_, u) ->
       expr_has_return u.Ast.un_condition
       || block_has_return u.Ast.un_body
       || (match u.Ast.un_else with Some b -> block_has_return b | None -> false)
-  | Ast.Call (c, _, args, _) ->
+  | Ast.Call (_, c, _, args, _) ->
       expr_has_return c || List.exists (fun a -> expr_has_return a.Ast.ca_value) args
-  | Ast.Index (b, i, _) | Ast.Binary (b, _, i, _) | Ast.CompoundAssign (b, _, i, _) ->
+  | Ast.Index (_, b, i, _) | Ast.Binary (_, b, _, i, _) | Ast.CompoundAssign (_, b, _, i, _) ->
       expr_has_return b || expr_has_return i
-  | Ast.Unary (_, e, _) | Ast.TryOp (e, _) | Ast.Cast (e, _, _) | Ast.AwaitExpr (e, _) ->
+  | Ast.Unary (_, _, e, _) | Ast.TryOp (_, e, _) | Ast.Cast (_, e, _, _) | Ast.AwaitExpr (_, e, _) ->
       expr_has_return e
-  | Ast.Field (b, _, _) | Ast.Assign (b, _, _) ->
+  | Ast.Field (_, b, _, _) | Ast.Assign (_, b, _, _) ->
       expr_has_return b
-  | Ast.BreakExpr (Some e, _) -> expr_has_return e
-  | Ast.BreakExpr (None, _) -> false
-  | Ast.Tuple (es, _) | Ast.Array (es, _) -> List.exists expr_has_return es
-  | Ast.ArrayRepeat (e1, e2, _) -> expr_has_return e1 || expr_has_return e2
-  | Ast.Range (e1, e2, _, _) -> expr_has_return e1 || expr_has_return e2
+  | Ast.BreakExpr (_, Some e, _) -> expr_has_return e
+  | Ast.BreakExpr (_, None, _) -> false
+  | Ast.Tuple (_, es, _) | Ast.Array (_, es, _) -> List.exists expr_has_return es
+  | Ast.ArrayRepeat (_, e1, e2, _) -> expr_has_return e1 || expr_has_return e2
+  | Ast.Range (_, e1, e2, _, _) -> expr_has_return e1 || expr_has_return e2
   | _ -> false
 
 and block_has_return (b : Ast.block_body) : bool =
@@ -497,38 +498,38 @@ and stmt_has_return (s : Ast.stmt) : bool =
 let rec expr_has_loop_exit (e : Ast.expr) : bool =
   match e with
   | Ast.BreakExpr _ | Ast.NextExpr _ -> true
-  | Ast.Block (b, _) -> block_has_loop_exit b
-  | Ast.IfExpr i ->
+  | Ast.Block (_, b, _) -> block_has_loop_exit b
+  | Ast.IfExpr (_, i) ->
       expr_has_loop_exit i.Ast.if_condition
       || block_has_loop_exit i.Ast.if_then
       || List.exists (fun (_, b) -> block_has_loop_exit b) i.Ast.if_elsif
       || (match i.Ast.if_else with Some b -> block_has_loop_exit b | None -> false)
-  | Ast.MatchExpr m ->
+  | Ast.MatchExpr (_, m) ->
       expr_has_loop_exit m.Ast.m_subject
       || List.exists
            (fun arm ->
              expr_has_loop_exit arm.Ast.ma_body
              || (match arm.Ast.ma_guard with Some g -> expr_has_loop_exit g | None -> false))
            m.Ast.m_arms
-  | Ast.WhileExpr w -> expr_has_loop_exit w.Ast.wh_condition || block_has_loop_exit w.Ast.wh_body
-  | Ast.LoopExpr (b, _) -> block_has_loop_exit b
-  | Ast.ForExpr f -> expr_has_loop_exit f.Ast.for_iterable || block_has_loop_exit f.Ast.for_body
-  | Ast.UntilExpr u -> expr_has_loop_exit u.Ast.ut_condition || block_has_loop_exit u.Ast.ut_body
-  | Ast.UnlessExpr u ->
+  | Ast.WhileExpr (_, w) -> expr_has_loop_exit w.Ast.wh_condition || block_has_loop_exit w.Ast.wh_body
+  | Ast.LoopExpr (_, b, _) -> block_has_loop_exit b
+  | Ast.ForExpr (_, f) -> expr_has_loop_exit f.Ast.for_iterable || block_has_loop_exit f.Ast.for_body
+  | Ast.UntilExpr (_, u) -> expr_has_loop_exit u.Ast.ut_condition || block_has_loop_exit u.Ast.ut_body
+  | Ast.UnlessExpr (_, u) ->
       expr_has_loop_exit u.Ast.un_condition
       || block_has_loop_exit u.Ast.un_body
       || (match u.Ast.un_else with Some b -> block_has_loop_exit b | None -> false)
-  | Ast.Call (c, _, args, _) ->
+  | Ast.Call (_, c, _, args, _) ->
       expr_has_loop_exit c || List.exists (fun a -> expr_has_loop_exit a.Ast.ca_value) args
-  | Ast.Index (b, i, _) | Ast.Binary (b, _, i, _) | Ast.CompoundAssign (b, _, i, _) ->
+  | Ast.Index (_, b, i, _) | Ast.Binary (_, b, _, i, _) | Ast.CompoundAssign (_, b, _, i, _) ->
       expr_has_loop_exit b || expr_has_loop_exit i
-  | Ast.Unary (_, e, _) | Ast.TryOp (e, _) | Ast.Cast (e, _, _) | Ast.AwaitExpr (e, _) ->
+  | Ast.Unary (_, _, e, _) | Ast.TryOp (_, e, _) | Ast.Cast (_, e, _, _) | Ast.AwaitExpr (_, e, _) ->
       expr_has_loop_exit e
-  | Ast.Field (b, _, _) | Ast.Assign (b, _, _) ->
+  | Ast.Field (_, b, _, _) | Ast.Assign (_, b, _, _) ->
       expr_has_loop_exit b
-  | Ast.Tuple (es, _) | Ast.Array (es, _) -> List.exists expr_has_loop_exit es
-  | Ast.ArrayRepeat (e1, e2, _) -> expr_has_loop_exit e1 || expr_has_loop_exit e2
-  | Ast.Range (e1, e2, _, _) -> expr_has_loop_exit e1 || expr_has_loop_exit e2
+  | Ast.Tuple (_, es, _) | Ast.Array (_, es, _) -> List.exists expr_has_loop_exit es
+  | Ast.ArrayRepeat (_, e1, e2, _) -> expr_has_loop_exit e1 || expr_has_loop_exit e2
+  | Ast.Range (_, e1, e2, _, _) -> expr_has_loop_exit e1 || expr_has_loop_exit e2
   | _ -> false
 
 and block_has_loop_exit (b : Ast.block_body) : bool =
@@ -835,7 +836,7 @@ let rec field_projection_of (env : func_env) (bty : Type_repr.t) (fname : string
 let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
     Seed_mir.operand * Type_repr.t =
   match e with
-  | Ast.IntLit (lit, _) -> (
+  | Ast.IntLit (_, lit, _) -> (
       match Literal.parse_integer ~span:Span.synthetic lit with
       | Some p -> (
           let kind =
@@ -858,18 +859,18 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
             (Seed_mir.Constant (int_constant_of_words kind lo hi), Type_repr.Int kind)
           else seed_bug "integer literal exceeds 128 bits in lowering")
       | None -> seed_bug "unparseable integer literal '%s'" lit)
-  | Ast.FloatLit (lit, _) -> (
+  | Ast.FloatLit (_, lit, _) -> (
       match float_of_string_opt lit with
       | Some f -> (Seed_mir.Constant (Seed_mir.Float64 (Int64.bits_of_float f)), Type_repr.Float Type_repr.F64)
       | None -> seed_bug "unparseable float literal '%s'" lit)
-  | Ast.StringLit (s, _) -> (Seed_mir.Constant (Seed_mir.String s), Type_repr.String)
-  | Ast.CharLit (c, _) -> (
+  | Ast.StringLit (_, s, _) -> (Seed_mir.Constant (Seed_mir.String s), Type_repr.String)
+  | Ast.CharLit (_, c, _) -> (
       let b = Bytes.of_string c in
       match Utf8.decode_at b 0 with
       | Ok (u, _) -> (Seed_mir.Constant (Seed_mir.Char u), Type_repr.Char)
       | Error _ -> seed_bug "invalid char literal")
-  | Ast.BoolLit (b, _) -> (Seed_mir.Constant (Seed_mir.Bool b), Type_repr.Bool)
-  | Ast.Name (n, _) -> (
+  | Ast.BoolLit (_, b, _) -> (Seed_mir.Constant (Seed_mir.Bool b), Type_repr.Bool)
+  | Ast.Name (_, n, _) -> (
       match List.assoc_opt n st.scope with
       | Some id -> (
           match local_type st id with
@@ -902,10 +903,10 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
                   | Some _ ->
                       seed_bug "function value `%s` reached lowering without a resolved callable identity" n
                   | None -> seed_bug "unknown value '%s' in lowering" n))))
-  | Ast.Path (a, b, span) -> (
+  | Ast.Path (_, a, b, span) -> (
       ignore span;
       seed_bug "path value `%s::%s` reached lowering without a resolved callable identity" a b)
-  | Ast.Binary (l, op, r, _) ->
+  | Ast.Binary (_, l, op, r, _) ->
       let lo, lt = lower_expr env st l in
       let ro, _rt = lower_expr env st r in
       let result_ty =
@@ -919,7 +920,7 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
         (Seed_mir.Assign
            (cur_place st id, Seed_mir.BinaryOp (bin_op_of op, lo, ro)));
       (copy_place st (cur_place st id), result_ty)
-  | Ast.Unary (op, inner, _) -> (
+  | Ast.Unary (_, op, inner, _) -> (
       match op with
       | Ast.Neg ->
           let io, it = lower_expr env st inner in
@@ -941,7 +942,8 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
           (copy_place st (cur_place st id), it)
       | Ast.Deref | Ast.Borrow | Ast.BorrowMut ->
           lower_expr env st inner)
-  | Ast.Cast (inner, ty, span) ->
+  | Ast.Cast (nid, inner, ty, span) ->
+      ignore span;
       let io, _ = lower_expr env st inner in
       (* the typed channel is authoritative when present: the target is
          the checker's resolved type (declaration-owned GenericParamIds),
@@ -949,7 +951,7 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
          (re-audit: `x as Ptr[U]` must lower Ptr[U]'s U, not the
          builtin's own param or a synthetic positional id) *)
       let rt =
-        match typed_node_of st span with
+        match typed_node_of st nid with
         | Some node -> (
             match node.tn_cast_target with
             | Some tgt -> tgt
@@ -959,7 +961,7 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
       let id = fresh_local st rt in
       emit st (Seed_mir.Assign (cur_place st id, Seed_mir.Cast (io, rt)));
       (copy_place st (cur_place st id), rt)
-  | Ast.Tuple (elems, _) ->
+  | Ast.Tuple (_, elems, _) ->
       (* each element is lowered exactly once *)
       let lowered = List.map (fun e -> lower_expr env st e) elems in
       let ops = List.map fst lowered in
@@ -968,7 +970,7 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
       let id = fresh_local st rt in
       emit st (Seed_mir.Assign (cur_place st id, Seed_mir.Aggregate (Seed_mir.TupleAgg, ops)));
       (copy_place st (cur_place st id), rt)
-  | Ast.Array (elems, _) ->
+  | Ast.Array (_, elems, _) ->
       let lowered = List.map (fun e -> lower_expr env st e) elems in
       let ops = List.map fst lowered in
       let tys = List.map snd lowered in
@@ -981,7 +983,7 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
       let id = fresh_local st rt in
       emit st (Seed_mir.Assign (cur_place st id, Seed_mir.Aggregate (Seed_mir.ArrayAgg, ops)));
       (copy_place st (cur_place st id), rt)
-  | Ast.MacroCall (n, args, _) -> (
+  | Ast.MacroCall (_, n, args, _) -> (
       (* the `vec![...]` macro lowers to the array aggregate (the E9049
          vec! form is retired); every other macro fails closed *)
       match n with
@@ -1017,12 +1019,12 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
           emit st (Seed_mir.Assign (cur_place st id, Seed_mir.Aggregate (Seed_mir.ArrayAgg, ops)));
           (copy_place st (cur_place st id), rt)
       | other -> seed_bug "macro invocation `%s!` is not lowered (only vec! is available)" other)
-  | Ast.Index (base, idx, _) -> (
+  | Ast.Index (_, base, idx, _) -> (
       let base_op, base_ty = lower_expr env st base in
       let bp = materialize_place st base_op in
       let elem_ty = element_type_of base_ty in
       match idx with
-      | Ast.IntLit (s, _) -> (
+      | Ast.IntLit (_, s, _) -> (
           match Literal.parse_integer ~span:Span.synthetic s with
           | Some p when Big_nat.fits_ocaml_int p.Literal.magnitude ->
               let k = Big_nat.to_ocaml_int p.Literal.magnitude in
@@ -1047,7 +1049,7 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
             { bp with Seed_mir.projections = bp.Seed_mir.projections @ [ Seed_mir.Index iid ] }
           in
           (Seed_mir.Copy p, elem_ty))
-  | Ast.Field (base, fname, _span) ->
+  | Ast.Field (_, base, fname, _span) ->
       (* re-audit: the typed-place (FieldId) rule — lower the base to a
          place, resolve the base's type against the typed nominal
          registry (func_env.struct_fields) and emit the semantic FieldId
@@ -1058,22 +1060,22 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
       let projs, fty = field_projection_of env bty fname in
       ( Seed_mir.Copy { bp with Seed_mir.projections = bp.Seed_mir.projections @ projs },
         fty )
-  | Ast.IfExpr i -> lower_if env st i
-  | Ast.MatchExpr m -> lower_match env st m
-  | Ast.WhileExpr w -> lower_while env st w
-  | Ast.LoopExpr (b, _) -> lower_loop env st b
-  | Ast.Block (b, _) -> lower_block env st b
-  | Ast.ReturnExpr (Some e, _) ->
+  | Ast.IfExpr (_, i) -> lower_if env st i
+  | Ast.MatchExpr (_, m) -> lower_match env st m
+  | Ast.WhileExpr (_, w) -> lower_while env st w
+  | Ast.LoopExpr (_, b, _) -> lower_loop env st b
+  | Ast.Block (_, b, _) -> lower_block env st b
+  | Ast.ReturnExpr (_, Some e, _) ->
       let vo, _ = lower_expr env st e in
       emit_defers env st;
       emit st (Seed_mir.Assign (cur_place st 0, Seed_mir.Use vo));
       set_terminator st Seed_mir.Ret;
       (Seed_mir.Constant Seed_mir.Unit, Type_repr.Unit)
-  | Ast.ReturnExpr (None, _) ->
+  | Ast.ReturnExpr (_, None, _) ->
       emit_defers env st;
       set_terminator st Seed_mir.Ret;
       (Seed_mir.Constant Seed_mir.Unit, Type_repr.Unit)
-  | Ast.BreakExpr (v, _) -> (
+  | Ast.BreakExpr (_, v, _) -> (
       match st.break_target with
       | Some b ->
           let _ = v in
@@ -1086,10 +1088,10 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
           set_terminator st (Seed_mir.Goto b);
           (Seed_mir.Constant Seed_mir.Unit, Type_repr.Unit)
       | None -> seed_bug "next outside loop in lowering")
-  | Ast.Assign (target, value, _) ->
+  | Ast.Assign (_, target, value, _) ->
       let vo, vt = lower_expr env st value in
       (match target with
-       | Ast.Name (n, _) -> (
+       | Ast.Name (_, n, _) -> (
            match List.assoc_opt n st.scope with
            | Some id -> (
                emit st (Seed_mir.Assign (cur_place st id, Seed_mir.Use vo));
@@ -1103,7 +1105,7 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
                    emit st (Seed_mir.Assign (cur_place st id, Seed_mir.Use vo));
                    (copy_place st (cur_place st id), ty)
                | None -> seed_bug "assignment to unknown value '%s'" n))
-       | Ast.Field (base, fname, _) ->
+       | Ast.Field (_, base, fname, _) ->
            (* the typed-place writeback rule (E9036 retirement): the
               target base lowers to a place and the field resolves
               against the typed nominal registry — the SAME channel as
@@ -1121,7 +1123,7 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
            let dst = { bp with Seed_mir.projections = bp.Seed_mir.projections @ projs } in
            emit st (Seed_mir.Assign (dst, Seed_mir.Use vo));
            (copy_place st dst, fty)
-       | Ast.Index (base, idx, _) -> (
+       | Ast.Index (_, base, idx, _) -> (
            (* the index writeback: the base lowers to a place; a
               constant index emits the ConstantIndex projection, a
               nonconstant index is evaluated exactly once into a fresh
@@ -1132,7 +1134,7 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
            let bp = materialize_place st bop in
            let elem_ty = element_type_of bty in
            match idx with
-           | Ast.IntLit (s, _) -> (
+           | Ast.IntLit (_, s, _) -> (
                match Literal.parse_integer ~span:Span.synthetic s with
                | Some p when Big_nat.fits_ocaml_int p.Literal.magnitude ->
                    let k = Big_nat.to_ocaml_int p.Literal.magnitude in
@@ -1152,7 +1154,7 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
                in
                emit st (Seed_mir.Assign (dst, Seed_mir.Use vo));
                (copy_place st dst, elem_ty))
-       | Ast.Unary (Ast.Deref, base, _) -> (
+       | Ast.Unary (_, Ast.Deref, base, _) -> (
            (* `*p = v`: the base lowers to a place and the write emits
               through the Deref projection (the E9036 deref-target form
               is retired) *)
@@ -1175,11 +1177,13 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
        | _ ->
            ignore (vo, vt);
            seed_bug "projected assignment reached MIR lowering without a typed-place writeback rule")
-  | Ast.CompoundAssign (_, _, _, span) ->
+  | Ast.CompoundAssign (_, _, _, _, span) ->
       ignore span;
       seed_bug "CompoundAssign reached MIR lowering without a typed-place writeback rule"
-  | Ast.Call (callee, _, args, span) -> lower_call env st span callee args
-  | Ast.TryOp (inner, _) -> (
+  | Ast.Call (nid, callee, _, args, span) ->
+      ignore span;
+      lower_call env st nid callee args
+  | Ast.TryOp (_, inner, _) -> (
       (* `?`: match the Option/Result subject; the success variant (tag
          0) supplies the payload as the expression value; the failure
          variant early-returns from the enclosing function with the
@@ -1297,7 +1301,7 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
       ( Seed_mir.Copy
           { Seed_mir.local = sid; projections = [ Seed_mir.Downcast ok_vid; Seed_mir.ConstantIndex 0 ] },
         payload_ty ))
-  | Ast.ForExpr f -> (
+  | Ast.ForExpr (_, f) -> (
       (* A for-loop over a compile-time Array literal is UNROLLED into
          per-element body copies with ConstantIndex element reads.
          Any other iterable lowers to a runtime counter loop: the
@@ -1307,7 +1311,7 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
          projection — the VM executes the dynamic Index form and
          bounds-checks the runtime index value at execution. *)
       match f.Ast.for_iterable with
-      | Ast.Array (elems, _) ->
+      | Ast.Array (_, elems, _) ->
           if block_has_loop_exit f.Ast.for_body then
             seed_bug
               "break/next inside a literal-unrolled for loop (the unrolled seed form has no loop structure to target)";
@@ -1362,7 +1366,7 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
               ignore (lower_block env st f.Ast.for_body))
             elems;
           (Seed_mir.Constant Seed_mir.Unit, Type_repr.Unit)
-      | Ast.Range (start_e, end_e, inclusive, _) -> (
+      | Ast.Range (_, start_e, end_e, inclusive, _) -> (
           (* `for x in a..b`: the counter counts from a to b; the loop
              variable binds the counter (the E9039 range form is
              retired); `a..=b` compares with <= *)
@@ -1510,7 +1514,7 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
               seed_bug
                 "runtime for-loop over a non-array iterable of type %s is not lowered (the seed verifier admits dynamic Index/Len only on Fixed_array bases; lower it to an Array literal for the unrolled path)"
                 (Seed_mir.print_type arr_ty)))
-  | Ast.StructLit (name, targs, fields, rest, span) -> (
+  | Ast.StructLit (nid, name, targs, fields, rest, _span) -> (
       (* re-audit: the StructCtor aggregate rule — `Type { field: value,
          ... }` lowers to a StructCtor aggregate whose type is the
          struct's Named type and whose operand positions are the
@@ -1562,7 +1566,7 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
            (copy_place st (cur_place st id), ty)
        | None -> (
       let rt =
-        match typed_node_of st span with
+        match typed_node_of st nid with
         | Some node -> node.tn_type
         | None -> (
             match List.assoc_opt name env.types with
@@ -1655,7 +1659,7 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
          silent Unit. *)
       seed_bug
         "closure expressions are not lowerable: the seed VM has closure objects (ClosureAgg -> Vm_value.Closure, Tuple [Function; Tuple env]) but no closure-CALL path (Seed_mir.Call dispatches compile-time function instances only, never a runtime closure value); lift the closure to a named function"
-  | Ast.UnsafeBlock (_, b, _) ->
+  | Ast.UnsafeBlock (_, _, b, _) ->
       (* an unsafe block lowers its body exactly like a plain block
          (the seed has no separate unsafe model — the block is the
          lowered body; the E9041 unsafe-block form is retired) *)
@@ -1674,7 +1678,7 @@ and expr_form_name (e : Ast.expr) : string =
   | Ast.StringLit _ -> "StringLit"
   | Ast.CharLit _ -> "CharLit"
   | Ast.BoolLit _ -> "BoolLit"
-  | Ast.Name (n, _) -> "Name " ^ n
+  | Ast.Name (_, n, _) -> "Name " ^ n
   | Ast.Path _ -> "Path"
   | Ast.Array _ -> "Array"
   | Ast.ArrayRepeat _ -> "ArrayRepeat"
@@ -1694,7 +1698,7 @@ and expr_form_name (e : Ast.expr) : string =
   | Ast.Field _ -> "Field"
   | Ast.Binary _ -> "Binary"
   | Ast.AwaitExpr _ -> "Await"
-  | Ast.MacroCall (n, _, _) -> "MacroCall " ^ n
+  | Ast.MacroCall (_, n, _, _) -> "MacroCall " ^ n
   | Ast.Assign _ -> "Assign"
   | Ast.CompoundAssign _ -> "CompoundAssign"
   | Ast.ReturnExpr _ -> "Return"
@@ -1711,7 +1715,7 @@ and expr_form_name (e : Ast.expr) : string =
 
 and target_type (env : func_env) (target : Ast.expr) : Type_repr.t =
   match target with
-  | Ast.Name (n, _) -> (
+  | Ast.Name (_, n, _) -> (
       match List.assoc_opt n env.values with
       | Some ty -> ty
       | None -> seed_bug "assignment target '%s' unknown" n)
@@ -1872,10 +1876,10 @@ and lower_match (env : func_env) (st : lower_state) (m : Ast.match_expr) :
     (* a string-literal arm, or an or-pattern of string literals — all
        alternatives dispatch to the same arm body *)
     match a.Ast.ma_pattern with
-    | Ast.PatLiteral (Ast.StringLit (s, _), _) -> [ s ]
+    | Ast.PatLiteral (Ast.StringLit (_, s, _), _) -> [ s ]
     | Ast.OrPattern (p1, p2, _) -> (
         match p1, p2 with
-        | Ast.PatLiteral (Ast.StringLit (s1, _), _), Ast.PatLiteral (Ast.StringLit (s2, _), _) ->
+        | Ast.PatLiteral (Ast.StringLit (_, s1, _), _), Ast.PatLiteral (Ast.StringLit (_, s2, _), _) ->
             [ s1; s2 ]
         | _ -> [])
     | _ -> []
@@ -2003,18 +2007,18 @@ and lower_match (env : func_env) (st : lower_state) (m : Ast.match_expr) :
           in
           let spec = variant_spec_of env st.variants ~enum_name ~vname:seg2 ~repr:subj_ty in
           targets := (Int64.of_int spec.vs_index, arm_blocks.(i)) :: !targets)
-      | Ast.PatLiteral (Ast.IntLit (s, _), _) -> (
+      | Ast.PatLiteral (Ast.IntLit (_, s, _), _) -> (
           match int_of_string_opt s with
           | Some v -> targets := (Int64.of_int v, arm_blocks.(i)) :: !targets
           | None -> seed_bug "non-integer literal match arm in lowering")
-      | Ast.PatLiteral (Ast.CharLit (c, _), _) -> (
+      | Ast.PatLiteral (Ast.CharLit (_, c, _), _) -> (
           (* char literal arms: the VM switches on the Uchar as Int *)
           let b = Bytes.of_string c in
           match Utf8.decode_at b 0 with
           | Ok (u, _) ->
               targets := (Int64.of_int (Uchar.to_int u), arm_blocks.(i)) :: !targets
           | Error _ -> seed_bug "invalid char literal arm in lowering")
-      | Ast.PatLiteral (Ast.BoolLit (b, _), _) -> (
+      | Ast.PatLiteral (Ast.BoolLit (_, b, _), _) -> (
           (* bool literal arms: the VM switches a Bool as 1/0 *)
           targets := ((if b then 1L else 0L), arm_blocks.(i)) :: !targets)
       | Ast.StructPattern (vname0, _, _) -> (
@@ -2056,11 +2060,11 @@ and lower_match (env : func_env) (st : lower_state) (m : Ast.match_expr) :
                 in
                 let spec = variant_spec_of env st.variants ~enum_name ~vname:seg2 ~repr:subj_ty in
                 targets := (Int64.of_int spec.vs_index, arm_blocks.(i)) :: !targets)
-            | Ast.PatLiteral (Ast.IntLit (lit, _), _) -> (
+            | Ast.PatLiteral (Ast.IntLit (_, lit, _), _) -> (
                 match int_of_string_opt lit with
                 | Some v -> targets := (Int64.of_int v, arm_blocks.(i)) :: !targets
                 | None -> seed_bug "non-integer literal or-pattern alternative in lowering")
-            | Ast.PatLiteral (Ast.CharLit (c, _), _) -> (
+            | Ast.PatLiteral (Ast.CharLit (_, c, _), _) -> (
                 let b = Bytes.of_string c in
                 match Utf8.decode_at b 0 with
                 | Ok (u, _) ->
@@ -2153,7 +2157,7 @@ and lower_match (env : func_env) (st : lower_state) (m : Ast.match_expr) :
                                     ] }) ));
                     st.scope <- (name, id) :: st.scope)
                | Ast.Wildcard _ -> ()
-               | Ast.PatLiteral (Ast.CharLit (c, _), _) -> (
+               | Ast.PatLiteral (Ast.CharLit (_, c, _), _) -> (
                    (* a char payload `Some('#')`: the payload position
                       must hold the literal char — emit the equality
                       check that falls to the NEXT arm when it fails
@@ -2249,7 +2253,7 @@ and lower_match (env : func_env) (st : lower_state) (m : Ast.match_expr) :
                           [ (1L, ok_b) ],
                           next_b ))
                      ok_b)
-               | Ast.PatLiteral (Ast.StringLit (slit, _), _) -> (
+               | Ast.PatLiteral (Ast.StringLit (_, slit, _), _) -> (
                    (* a string payload `Some("ast")`: the payload
                       position must hold the literal string — the
                       equality; fall to the NEXT arm when it fails *)
@@ -2288,7 +2292,7 @@ and lower_match (env : func_env) (st : lower_state) (m : Ast.match_expr) :
                           [ (1L, ok_b) ],
                           next_b ))
                      ok_b)
-               | Ast.PatLiteral (Ast.BoolLit (b, _), _) -> (
+               | Ast.PatLiteral (Ast.BoolLit (_, b, _), _) -> (
                    (* a bool payload `Some(true)`: the payload must hold
                       the literal bool — the equality; fall to the NEXT
                       arm when it fails *)
@@ -2361,7 +2365,7 @@ and lower_match (env : func_env) (st : lower_state) (m : Ast.match_expr) :
                            st.scope <- (name, id) :: st.scope)
                        | _ -> ())
                      sfields)
-               | Ast.PatLiteral (Ast.IntLit (s, _), _) -> (
+               | Ast.PatLiteral (Ast.IntLit (_, s, _), _) -> (
                    (* an int payload `Some(2)`: the payload must hold
                       the literal int — the equality; fall to the NEXT
                       arm when it fails *)
@@ -2685,10 +2689,10 @@ and lower_loop (env : func_env) (st : lower_state) (b : Ast.block_body) :
   push_block st join_b;
   (Seed_mir.Constant Seed_mir.Unit, Type_repr.Unit)
 
-and lower_call (env : func_env) (st : lower_state) (span : Span.span)
+and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
     (callee : Ast.expr) (args : Ast.call_arg list) : Seed_mir.operand * Type_repr.t =
   match callee with
-  | Ast.Name (n, _) -> (
+  | Ast.Name (_, n, _) -> (
       match ctor_of st.variants n with
       | Some (enum_name, vname) ->
           (* an enum variant constructor call: `Some(x)`, `Green(7)`,
@@ -2777,7 +2781,7 @@ and lower_call (env : func_env) (st : lower_state) (span : Span.span)
                  params vs concrete type_args); the [||] path is only the
                  hand-built selfcheck fallback, where the channel is
                  absent and the kernel's zero-generic defs stay exact. *)
-              let tn_call = match typed_node_of st span with Some n -> n.tn_call | None -> None in
+              let tn_call = match typed_node_of st node_id with Some n -> n.tn_call | None -> None in
               let instance =
                 match tn_call with
                 | Some (callable, type_args) ->
@@ -2871,7 +2875,7 @@ and lower_call (env : func_env) (st : lower_state) (span : Span.span)
                             concrete args arrive there), else the
                             registry's instance *)
                          let instance =
-                           match typed_node_of st span with
+                           match typed_node_of st node_id with
                            | Some node -> (
                                match node.tn_call with
                                | Some (callable, type_args) ->
@@ -2954,7 +2958,7 @@ and lower_call (env : func_env) (st : lower_state) (span : Span.span)
                              in
                              let next_b = new_block st in
                              let tn_call =
-                               match typed_node_of st span with
+                               match typed_node_of st node_id with
                                | Some node -> node.tn_call
                                | None -> None
                              in
@@ -2974,7 +2978,8 @@ and lower_call (env : func_env) (st : lower_state) (span : Span.span)
                 | _ -> seed_bug "unknown callee '%s' in lowering" n
               in
               qualified_call ())))
-  | Ast.Field (base, mname, span) -> (
+  | Ast.Field (nid, base, mname, span) -> (
+      ignore span;
       (* re-audit: the method-call rule — the receiver is lowered to its
          typed PLACE and passed as the SELF argument with the read-side
          of the self parameter's convention (the methods' sig contracts
@@ -3027,7 +3032,7 @@ and lower_call (env : func_env) (st : lower_state) (span : Span.span)
               call's concrete args arrive there), else the registry's
               instance *)
            let instance =
-             match typed_node_of st span with
+             match typed_node_of st nid with
              | Some node -> (
                  match node.tn_call with
                  | Some (callable, type_args) ->
@@ -3085,7 +3090,7 @@ and emit_defers (env : func_env) (st : lower_state) : unit =
 (* ── Function lowering ────────────────────────────────────────── *)
 
 let lower_function_with_variants
-    ?(typed_nodes : ((int * int) * typed_node) list = [])
+    ?(typed_nodes : (Ids.Node_id.t * typed_node) list = [])
     ?(param_tys_opt : Type_repr.t array option) (variants : variant_table)
     (env : func_env) (name : string)
     (callable : int) (template_args : Type_repr.t array)

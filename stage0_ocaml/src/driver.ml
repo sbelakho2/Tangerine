@@ -154,18 +154,18 @@ let const_values (env : Typecheck.env) (items : Ast.item list) :
     (string * (Type_repr.t * Seed_mir.constant)) list =
   let lit_constant (d : Ast.const_decl) : Seed_mir.constant option =
     match d.Ast.c_value with
-    | Ast.BoolLit (b, _) -> Some (Seed_mir.Bool b)
-    | Ast.CharLit (c, _) -> (
+    | Ast.BoolLit (_, b, _) -> Some (Seed_mir.Bool b)
+    | Ast.CharLit (_, c, _) -> (
         let b = Bytes.of_string c in
         match Utf8.decode_at b 0 with
         | Ok (u, _) -> Some (Seed_mir.Char u)
         | Error _ -> None)
-    | Ast.StringLit (s, _) -> Some (Seed_mir.String s)
-    | Ast.FloatLit (lit, _) -> (
+    | Ast.StringLit (_, s, _) -> Some (Seed_mir.String s)
+    | Ast.FloatLit (_, lit, _) -> (
         match float_of_string_opt lit with
         | Some f -> Some (Seed_mir.Float64 (Int64.bits_of_float f))
         | None -> None)
-    | Ast.IntLit (lit, _) -> (
+    | Ast.IntLit (_, lit, _) -> (
         match Literal.parse_integer ~span:Span.synthetic lit with
         | Some p -> (
             let kind =
@@ -185,7 +185,7 @@ let const_values (env : Typecheck.env) (items : Ast.item list) :
                    (Int64.of_int (Big_nat.to_ocaml_int p.Literal.magnitude)))
             else None)
         | None -> None)
-    | Ast.Unary (Ast.Neg, Ast.IntLit (lit, _), _) -> (
+    | Ast.Unary (_, Ast.Neg, Ast.IntLit (_, lit, _), _) -> (
         (* a negated integer initializer `const MIN: Int = -128` *)
         match Literal.parse_integer ~span:Span.synthetic lit with
         | Some p -> (
@@ -335,15 +335,15 @@ let struct_fields_of (env : Typecheck.env) :
     env.Typecheck.nominals
 
 (* ── The persistent typed-node bridge (re-audit: TypedProgram/TypedHIR) ──
-   The typechecker's node-keyed map (span identity (file_id, start) ->
-   resolved node) crosses into lowering as Mir_lower's typed_nodes
-   channel, threaded alongside lowering_env_of into every
-   lower_function_with_variants call.  The typed channel is authoritative
-   in lowering when a span-keyed entry is present; the cast rule consumes
-   the checker-RESOLVED target (declaration-owned GenericParamIds) and
-   never re-derives it from syntax positionally; the call rule consumes
-   the checker-RESOLVED callee + solved concrete substitution (tn_call). *)
-let typed_nodes_of (env : Typecheck.env) : ((int * int) * Mir_lower.typed_node) list =
+   The typechecker's node-keyed map (NodeId -> resolved node) crosses
+   into lowering as Mir_lower's typed_nodes channel, threaded alongside
+   lowering_env_of into every lower_function_with_variants call.  The
+   typed channel is authoritative in lowering when a node-keyed entry is
+   present; the cast rule consumes the checker-RESOLVED target
+   (declaration-owned GenericParamIds) and never re-derives it from
+   syntax positionally; the call rule consumes the checker-RESOLVED
+   callee + solved concrete substitution (tn_call). *)
+let typed_nodes_of (env : Typecheck.env) : (Ids.Node_id.t * Mir_lower.typed_node) list =
   Hashtbl.fold
     (fun key (node : Typecheck.typed_node) acc ->
       ( key,

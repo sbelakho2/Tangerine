@@ -76,6 +76,15 @@ module Generic_param_id : sig
   val of_int : int -> t
 end
 
+(* Per-expression AST node identity, minted by the parser. *)
+module Node_id : sig
+  type t
+  val make : int -> t
+  val compare : t -> t -> int
+  val to_int : t -> int
+  val of_int : int -> t
+end
+
 (* Per-struct / per-enum declaration-order positions used by Seed MIR
    projections and discriminant tags (0..n-1). *)
 module Field_index : sig
