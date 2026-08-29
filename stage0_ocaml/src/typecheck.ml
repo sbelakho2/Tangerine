@@ -232,6 +232,11 @@ type env = {
      lowering consumes the semantic identities instead of re-interpreting
      the syntactic Ast.pattern. *)
   typed_patterns : (Ids.Node_id.t * int, Typed_pattern.t) Hashtbl.t;
+  (* the audit's typed-iterable authority: the FOR-loop's semantic
+     pattern (and the resolved element type), keyed by the ForExpr's
+     NodeId — MIR lowering consumes the semantic tree instead of
+     re-interpreting the raw pattern syntax *)
+  typed_for_patterns : (Ids.Node_id.t, Typed_pattern.t * Type_repr.t) Hashtbl.t;
 }
 
 type scope = {
@@ -1334,6 +1339,7 @@ let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
     module_path = [];
     typed_nodes = Hashtbl.create 256;
     typed_patterns = Hashtbl.create 256;
+    typed_for_patterns = Hashtbl.create 64;
   }
 
 (* ────────────────────────────────────────────────────────────────
@@ -3398,7 +3404,7 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
          is a Unit statement, not an error (the kernel relies on the
          tail-`next` identifier form in cfg_synthetic_alloc) *)
       Ok { te_type = Type_repr.Unit; te_effects = [||]; te_span = span })
-  | Ast.ForExpr (_, f) -> (
+  | Ast.ForExpr (nid, f) -> (
       match check_expr env scope None f.Ast.for_iterable with
       | Error m -> Error m
       | Ok te -> (
@@ -3427,7 +3433,12 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
           | Some et -> (
               match check_pattern env scope et f.Ast.for_pattern with
               | Error m -> Error m
-              | Ok (_, binds) ->
+              | Ok (tp, binds) ->
+                  (* the typed-iterable channel: record the SEMANTIC
+                     pattern + the resolved element type under the
+                     ForExpr's NodeId — lowering consumes this, never
+                     the raw syntax *)
+                  Hashtbl.replace env.typed_for_patterns nid (tp, et);
                   let scope = add_binds scope binds in
                   check_block env { scope with loop_depth = scope.loop_depth + 1 }
                     None f.Ast.for_body f.Ast.for_span)))

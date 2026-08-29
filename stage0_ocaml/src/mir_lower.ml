@@ -363,7 +363,17 @@ type lower_state = {
      driver path always carries the channel, so a missing entry there is
      a checker/lowerer contradiction and fails loudly) *)
   typed_patterns : ((Ids.Node_id.t * int) * Typed_pattern.t) list;
+  (* the typed-iterable channel (the audit): ForExpr NodeId -> the
+     loop's SEMANTIC pattern + resolved element type — the lowering
+     consumes this instead of re-interpreting the raw pattern syntax *)
+  typed_for_patterns : (Ids.Node_id.t * (Typed_pattern.t * Type_repr.t)) list;
 }
+
+(* The typed-iterable lookup: the ForExpr's semantic pattern + element
+   type from the typechecker's channel. *)
+let typed_for_of (st : lower_state) (node_id : Ids.Node_id.t) :
+    (Typed_pattern.t * Type_repr.t) option =
+  List.assoc_opt node_id st.typed_for_patterns
 
 (* The typed-node channel lookup: the typechecker's resolved node for an
    expr's NodeId, when the channel is present. *)
@@ -1356,7 +1366,24 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
       ( Seed_mir.Copy
           { Seed_mir.local = sid; projections = [ Seed_mir.Downcast ok_vid; Seed_mir.ConstantIndex 0 ] },
         payload_ty ))
-  | Ast.ForExpr (_, f) -> (
+  | Ast.ForExpr (fid, f) -> (
+      (* the SEMANTIC bindings: the typechecker's typed-for channel
+         (the audit: the for-pattern is resolved ONCE into the semantic
+         tree; lowering consumes it, never the raw syntax) *)
+      let semantic_bindings_of (tp : Typed_pattern.t) :
+          (string * int * int list) list =
+        let rec go path p =
+          match p with
+          | Typed_pattern.TP_wildcard -> []
+          | Typed_pattern.TP_binding (n, ty, _) ->
+              [ (n, fresh_local st ty, List.rev path) ]
+          | Typed_pattern.TP_tuple (_, pats) ->
+              List.concat_map (fun (k, sub) -> go (k :: path) sub)
+                (List.mapi (fun k sub -> (k, sub)) pats)
+          | _ -> seed_bug "unsupported for-loop pattern in lowering (the semantic tree)"
+        in
+        go [] tp
+      in
       (* A for-loop over a compile-time Array literal is UNROLLED into
          per-element body copies with ConstantIndex element reads.
          Any other iterable lowers to a runtime counter loop: the
@@ -1373,29 +1400,48 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
           let arr_op, arr_ty = lower_expr env st f.Ast.for_iterable in
           let arr_id = materialize_place st arr_op in
           let elem_ty = element_type_of arr_ty in
-          let elem_ty_of_tuple k =
-            match elem_ty with
-            | Type_repr.Tuple elems when k < Array.length elems -> elems.(k)
-            | _ -> seed_bug "destructuring for-loop pattern against a non-tuple element type"
-          in
           let bindings =
-            match f.Ast.for_pattern with
-            | Ast.PatIdent (n, _, _) -> [ (n, fresh_local st elem_ty, None) ]
-            | Ast.Wildcard _ -> []
-            | Ast.PatTuple (subs, _) ->
-                (* a destructuring loop `for (a, b) in arr`: each
-                   component is bound through the element's tuple
-                   ConstantIndex projection *)
-                List.mapi
-                  (fun k sub ->
-                    match sub with
-                    | Ast.PatIdent (n, _, _) ->
-                        (n, fresh_local st (elem_ty_of_tuple k), Some k)
-                    | Ast.Wildcard _ ->
-                        ("__wild" ^ string_of_int k, fresh_local st (elem_ty_of_tuple k), Some k)
-                    | _ -> seed_bug "unsupported destructuring for-loop pattern in lowering")
-                  subs
-            | _ -> seed_bug "unsupported for-loop pattern in lowering (bind by name or _)"
+            match typed_for_of st fid with
+            | Some (tp, _) ->
+                (* the semantic channel is authoritative *)
+                List.map
+                  (fun (n, id, path) ->
+                    let path =
+                      match path with
+                      | [] -> None
+                      | [ k ] -> Some k
+                      | _ -> seed_bug "nested tuple for-loop pattern against a flat unroll element"
+                    in
+                    (n, id, path))
+                  (semantic_bindings_of tp)
+            | None ->
+                (* hand-built selfcheck envs only: the syntactic
+                   fallback (the driver path always carries the
+                   channel) *)
+                let elem_ty_of_tuple k =
+                  match elem_ty with
+                  | Type_repr.Tuple elems when k < Array.length elems -> elems.(k)
+                  | _ ->
+                      seed_bug
+                        "destructuring for-loop pattern against a non-tuple element type"
+                in
+                (match f.Ast.for_pattern with
+                 | Ast.PatIdent (n, _, _) -> [ (n, fresh_local st elem_ty, None) ]
+                 | Ast.Wildcard _ -> []
+                 | Ast.PatTuple (subs, _) ->
+                     List.mapi
+                       (fun k sub ->
+                         match sub with
+                         | Ast.PatIdent (n, _, _) ->
+                             (n, fresh_local st (elem_ty_of_tuple k), Some k)
+                         | Ast.Wildcard _ ->
+                             ("__wild" ^ string_of_int k,
+                              fresh_local st (elem_ty_of_tuple k), Some k)
+                         | _ ->
+                             seed_bug
+                               "unsupported destructuring for-loop pattern in lowering")
+                       subs
+                 | _ -> seed_bug "unsupported for-loop pattern in lowering (bind by name or _)")
           in
           List.iter
             (fun (n, id, _) ->
@@ -1506,26 +1552,49 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
                 (Seed_mir.SwitchInt
                    (copy_place st (cur_place st cnd_id), [ (1L, body_b) ], join_b));
               push_block st body_b;
-              let elem_ty_of_tuple k =
-                match elem_ty with
-                | Type_repr.Tuple elems when k < Array.length elems -> elems.(k)
-                | _ -> seed_bug "destructuring for-loop pattern against a non-tuple element type"
-              in
               let bindings =
-                match f.Ast.for_pattern with
-                | Ast.PatIdent (n, _, _) -> [ (n, fresh_local st elem_ty, None) ]
-                | Ast.Wildcard _ -> []
-                | Ast.PatTuple (subs, _) ->
-                    List.mapi
-                      (fun k sub ->
-                        match sub with
-                        | Ast.PatIdent (n, _, _) ->
-                            (n, fresh_local st (elem_ty_of_tuple k), Some k)
-                        | Ast.Wildcard _ ->
-                            ("__wild" ^ string_of_int k, fresh_local st (elem_ty_of_tuple k), Some k)
-                        | _ -> seed_bug "unsupported destructuring for-loop pattern in lowering")
-                      subs
-                | _ -> seed_bug "unsupported for-loop pattern in lowering (bind by name or _)"
+                match typed_for_of st fid with
+                | Some (tp, _) ->
+                    List.map
+                      (fun (n, id, path) ->
+                        let path =
+                          match path with
+                          | [] -> None
+                          | [ k ] -> Some k
+                          | _ ->
+                              seed_bug
+                                "nested tuple for-loop pattern against a runtime counter element"
+                        in
+                        (n, id, path))
+                      (semantic_bindings_of tp)
+                | None ->
+                    (* hand-built selfcheck envs only: the syntactic
+                       fallback (the driver path always carries the
+                       channel) *)
+                    let elem_ty_of_tuple k =
+                      match elem_ty with
+                      | Type_repr.Tuple elems when k < Array.length elems -> elems.(k)
+                      | _ ->
+                          seed_bug
+                            "destructuring for-loop pattern against a non-tuple element type"
+                    in
+                    (match f.Ast.for_pattern with
+                     | Ast.PatIdent (n, _, _) -> [ (n, fresh_local st elem_ty, None) ]
+                     | Ast.Wildcard _ -> []
+                     | Ast.PatTuple (subs, _) ->
+                         List.mapi
+                           (fun k sub ->
+                             match sub with
+                             | Ast.PatIdent (n, _, _) ->
+                                 (n, fresh_local st (elem_ty_of_tuple k), Some k)
+                             | Ast.Wildcard _ ->
+                                 ("__wild" ^ string_of_int k,
+                                  fresh_local st (elem_ty_of_tuple k), Some k)
+                             | _ ->
+                                 seed_bug
+                                   "unsupported destructuring for-loop pattern in lowering")
+                           subs
+                     | _ -> seed_bug "unsupported for-loop pattern in lowering (bind by name or _)")
               in
               List.iter
                 (fun (n, id, _) ->
@@ -3490,6 +3559,7 @@ and emit_defers (env : func_env) (st : lower_state) : unit =
 let lower_function_with_variants
     ?(typed_nodes : (Ids.Node_id.t * typed_node) list = [])
     ?(typed_patterns : ((Ids.Node_id.t * int) * Typed_pattern.t) list = [])
+    ?(typed_for_patterns : (Ids.Node_id.t * (Typed_pattern.t * Type_repr.t)) list = [])
     ?(param_tys_opt : Type_repr.t array option) (variants : variant_table)
     (env : func_env) (name : string)
     (callable : int) (template_args : Type_repr.t array)
@@ -3510,6 +3580,7 @@ let lower_function_with_variants
       defer_stack = [];
       typed_nodes;
       typed_patterns;
+      typed_for_patterns;
     }
   in
   (* local 0 = return slot *)
