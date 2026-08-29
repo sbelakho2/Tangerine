@@ -3005,6 +3005,7 @@ end
           ctx_typed_calls_sample = 0;
           ctx_decl_rounds = 0;
           ctx_subset = Driver.subset_firewall_of_graph ngraph;
+          ctx_profile_findings = 0;
           ctx_strict_fallbacks = 0;
           ctx_strict_diags = [];
           lowered_methods = 0;
@@ -4014,6 +4015,7 @@ end
            ctx_typed_calls_sample = 0;
            ctx_decl_rounds = 0;
             ctx_subset = Driver.subset_firewall_of_graph ncgraph;
+            ctx_profile_findings = 0;
             ctx_strict_fallbacks = 0;
             ctx_strict_diags = [];
             lowered_methods = 0;
