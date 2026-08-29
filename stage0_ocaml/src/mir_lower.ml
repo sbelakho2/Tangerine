@@ -1865,254 +1865,129 @@ and lower_match (env : func_env) (st : lower_state) (m : Ast.match_expr) :
   then seed_bug "multiple wildcard arms in match lowering";
   if List.exists (fun (a : Ast.match_arm) -> a.Ast.ma_guard <> None) m.Ast.m_arms then
     seed_bug "match arm guards are not supported in seed lowering";
-  (* ── string-literal arms ──
-     A match on a String subject with string-literal arms (and at most
-     one wildcard) lowers to an equality chain: each arm tests
-     `sid == lit` and branches to its body; the wildcard is the final
-     fallthrough.  The seed's SwitchInt carries int tags only, so the
-     string arms cannot join the switch — the chain is the executable
-     form. *)
-  let string_lit_of (a : Ast.match_arm) : string list =
-    (* a string-literal arm, or an or-pattern of string literals — all
-       alternatives dispatch to the same arm body *)
-    match a.Ast.ma_pattern with
-    | Ast.PatLiteral (Ast.StringLit (_, s, _), _) -> [ s ]
-    | Ast.OrPattern (p1, p2, _) -> (
-        match p1, p2 with
-        | Ast.PatLiteral (Ast.StringLit (_, s1, _), _), Ast.PatLiteral (Ast.StringLit (_, s2, _), _) ->
-            [ s1; s2 ]
-        | _ -> [])
-    | _ -> []
-  in
-  if
-    subj_ty = Type_repr.String
-    && List.exists (fun a -> string_lit_of a <> []) m.Ast.m_arms
-  then begin
-    let result_id = ref 0 in
-    let result_ty : Type_repr.t option ref = ref None in
-    let ensure_result ty =
-      match !result_ty with
-      | None ->
-          result_id := fresh_local st ty;
-          result_ty := Some ty
-      | Some _ -> ()
-    in
-    let rec emit_chain arms (fall_b : int) =
-      match arms with
-      | [] -> fall_b
-      | (a : Ast.match_arm) :: rest -> (
-          match string_lit_of a with
-          | [] -> emit_chain rest fall_b
-          | lits ->
-              let then_b = new_block st in
-              (* each alternative tests `sid == lit`; the chain of
-                 alternatives falls to the next arm when none matches *)
-              let rec emit_alts alts (cont : int) =
-                match alts with
-                | [] -> cont
-                | lit :: more ->
-                    let eq_id = fresh_local st Type_repr.Bool in
-                    emit st
-                      (Seed_mir.Assign
-                         ( cur_place st eq_id,
-                           Seed_mir.BinaryOp
-                             ( Seed_mir.Eq,
-                               Seed_mir.Read (cur_place st sid),
-                               Seed_mir.Constant (Seed_mir.String lit) ) ));
-                    let next_fall = new_block st in
-                    set_terminator_to st
-                      (Seed_mir.SwitchInt
-                         ( Seed_mir.Copy (cur_place st eq_id),
-                           [ (1L, then_b) ],
-                           next_fall ))
-                      then_b;
-                    emit_alts more next_fall
-              in
-              let last_fall = emit_alts lits fall_b in
-              let bval, bty = lower_expr env st a.Ast.ma_body in
-              ensure_result bty;
-              emit st (Seed_mir.Assign (cur_place st !result_id, Seed_mir.Use bval));
-              set_terminator_to st (Seed_mir.Goto join_b) last_fall;
-              emit_chain rest last_fall)
-    in
-    let fall = emit_chain m.Ast.m_arms join_b in
-    (match List.find_opt (fun (a : Ast.match_arm) -> string_lit_of a = []) m.Ast.m_arms with
-     | Some a ->
-         if st.cur_block <> fall then set_terminator_to st (Seed_mir.Goto fall) fall;
-         let bval, bty = lower_expr env st a.Ast.ma_body in
-         ensure_result bty;
-         emit st (Seed_mir.Assign (cur_place st !result_id, Seed_mir.Use bval));
-         set_terminator_to st (Seed_mir.Goto join_b) join_b
-     | None ->
-         if st.cur_block <> join_b then set_terminator_to st (Seed_mir.Goto join_b) join_b);
-    match !result_ty with
-    | Some ty -> (copy_place st (cur_place st !result_id), ty)
-    | None -> (Seed_mir.Constant Seed_mir.Unit, Type_repr.Unit)
-  end
-  else begin
+  (* ── the ordered decision chain (re-audit P0) ──
+     Each arm's pattern is TESTED in source order: a true test enters
+     the arm's body, a false test proceeds to the NEXT arm's test, and
+     the final fallthrough is a deterministic non-exhaustive abort.
+     Source order is preserved by construction (first-match semantics),
+     so a wildcard/binding catch-all BEFORE a later specific arm wins;
+     same-tag payload arms interleave correctly because a failed
+     payload test routes to the next arm's TEST, never to the next
+     arm's body block. *)
   let arm_blocks = Array.of_list (List.map (fun _ -> new_block st) m.Ast.m_arms) in
-  let wildcard_idx =
-    let rec go i = function
-      | [] -> None
-      | (a : Ast.match_arm) :: rest -> (
-          match a.Ast.ma_pattern with
-          | Ast.Wildcard _ | Ast.PatIdent _ | Ast.PatTuple _ | Ast.StructPattern _ -> Some i
-          | _ -> go (i + 1) rest)
-    in
-    go 0 m.Ast.m_arms
+  let test_blocks = Array.of_list (List.map (fun _ -> new_block st) m.Ast.m_arms) in
+  let abort_b = new_block st in
+  let fail_b i = if i + 1 < Array.length test_blocks then test_blocks.(i + 1) else abort_b in
+  (* the dispatch chain: the continuation block closes with a Goto into
+     the FIRST test (no separate entry block), and every test leaves the
+     current block AT the next test (or the abort) — so the tests need
+     no block entry of their own, and the arm bodies are lowered
+     afterwards into their own blocks *)
+  let first_b =
+    if Array.length test_blocks = 0 then abort_b
+    else test_blocks.(0)
   in
-  (* The switch's otherwise: the wildcard arm's block when one exists,
-     else a dedicated Abort block.  The Abort form is important for the
-     verifier's definite-initialization dataflow: the switch's otherwise
-     target is a JOIN predecessor, so routing the fallthrough to the
-     join block itself would make the match result look
-     possibly-uninitialized there.  An Abort block has no successors, so
-     the join's only predecessors are the arms (each of which assigns
-     the result).  Reaching the Abort at runtime means the match was
-     non-exhaustive — a deterministic trap, never silent. *)
-  let abort_block = ref None in
-  let otherwise =
-    match wildcard_idx with
-    | Some i -> arm_blocks.(i)
-    | None ->
-        let b = new_block st in
-        abort_block := Some b;
-        b
-  in
-  let has_variant =
-    List.exists (fun (a : Ast.match_arm) -> match a.Ast.ma_pattern with Ast.PatVariant _ -> true | _ -> false) m.Ast.m_arms
-  in
-  let switch_op =
-    if has_variant then begin
-      (* enum subject: the discriminant test over the variant tags *)
-      let did = fresh_local st (Type_repr.Int Type_repr.UInt) in
-      emit st (Seed_mir.Assign (cur_place st did, Seed_mir.Discriminant (cur_place st sid)));
-      cur_place st did
-    end
-    else cur_place st sid
-  in
-  let targets = ref [] in
+  set_terminator_to st (Seed_mir.Goto first_b) first_b;
   List.iteri
     (fun i (a : Ast.match_arm) ->
-      match a.Ast.ma_pattern with
+      let then_b = arm_blocks.(i) in
+      let next_b = fail_b i in
+      (match a.Ast.ma_pattern with
       | Ast.PatVariant (seg1, seg2, _, _) -> (
           let enum_name =
             if seg1 = "" then enum_name_of_ty env subj_ty
             else begin
-              (* qualified `Enum::Variant`: trust the qualifier *)
               if List.assoc_opt seg1 env.types = None then
                 seed_bug "variant qualifier `%s` is not a known type in lowering" seg1;
               seg1
             end
           in
           let spec = variant_spec_of env st.variants ~enum_name ~vname:seg2 ~repr:subj_ty in
-          targets := (Int64.of_int spec.vs_index, arm_blocks.(i)) :: !targets)
-      | Ast.PatLiteral (Ast.IntLit (_, s, _), _) -> (
-          match int_of_string_opt s with
-          | Some v -> targets := (Int64.of_int v, arm_blocks.(i)) :: !targets
-          | None -> seed_bug "non-integer literal match arm in lowering")
-      | Ast.PatLiteral (Ast.CharLit (_, c, _), _) -> (
-          (* char literal arms: the VM switches on the Uchar as Int *)
-          let b = Bytes.of_string c in
-          match Utf8.decode_at b 0 with
-          | Ok (u, _) ->
-              targets := (Int64.of_int (Uchar.to_int u), arm_blocks.(i)) :: !targets
-          | Error _ -> seed_bug "invalid char literal arm in lowering")
-      | Ast.PatLiteral (Ast.BoolLit (_, b, _), _) -> (
-          (* bool literal arms: the VM switches a Bool as 1/0 *)
-          targets := ((if b then 1L else 0L), arm_blocks.(i)) :: !targets)
-      | Ast.StructPattern (vname0, _, _) -> (
-          (* a struct-pattern arm `Variant { f: x, ... }`: for an ENUM
-             subject the switch dispatches on the variant tag exactly
-             like the PatVariant form; for a STRUCT subject the arm is
-             the catch-all (the field-equality checks route) *)
-          (match subj_ty with
-           | Type_repr.Named (tid, _) -> (
-               match List.assoc_opt tid env.struct_fields with
-               | Some (_ :: _) -> ()
-               | _ -> (
-                   let enum_name = enum_name_of_ty env subj_ty in
-                   let vname =
-                     match String.rindex_opt vname0 ':' with
-                     | Some i -> String.sub vname0 (i + 1) (String.length vname0 - i - 1)
-                     | None -> vname0
-                   in
-                   let spec = variant_spec_of env st.variants ~enum_name ~vname ~repr:subj_ty in
-                   targets := (Int64.of_int spec.vs_index, arm_blocks.(i)) :: !targets))
-           | _ ->
-               let enum_name = enum_name_of_ty env subj_ty in
-               let vname =
-                 match String.rindex_opt vname0 ':' with
-                 | Some i -> String.sub vname0 (i + 1) (String.length vname0 - i - 1)
-                 | None -> vname0
-               in
-               let spec = variant_spec_of env st.variants ~enum_name ~vname ~repr:subj_ty in
-               targets := (Int64.of_int spec.vs_index, arm_blocks.(i)) :: !targets))
-      | Ast.OrPattern (p1, p2, _) ->
-          (* an or-pattern arm `A | B`: both alternatives dispatch to
-             the same arm block (variant tags and int/char literals) *)
-          let add_alt (p : Ast.pattern) =
-            match p with
-            | Ast.PatVariant (seg1, seg2, _, _) -> (
-                let enum_name =
-                  if seg1 = "" then enum_name_of_ty env subj_ty
-                  else seg1
-                in
-                let spec = variant_spec_of env st.variants ~enum_name ~vname:seg2 ~repr:subj_ty in
-                targets := (Int64.of_int spec.vs_index, arm_blocks.(i)) :: !targets)
-            | Ast.PatLiteral (Ast.IntLit (_, lit, _), _) -> (
-                match int_of_string_opt lit with
-                | Some v -> targets := (Int64.of_int v, arm_blocks.(i)) :: !targets
-                | None -> seed_bug "non-integer literal or-pattern alternative in lowering")
-            | Ast.PatLiteral (Ast.CharLit (_, c, _), _) -> (
-                let b = Bytes.of_string c in
-                match Utf8.decode_at b 0 with
-                | Ok (u, _) ->
-                    targets := (Int64.of_int (Uchar.to_int u), arm_blocks.(i)) :: !targets
-                | Error _ -> seed_bug "invalid char literal or-pattern alternative in lowering")
-            | _ -> seed_bug "unsupported or-pattern alternative in lowering"
+          (* the discriminant test: subject tag == this variant's tag *)
+          let did = fresh_local st (Type_repr.Int Type_repr.UInt) in
+          emit st (Seed_mir.Assign (cur_place st did, Seed_mir.Discriminant (cur_place st sid)));
+          let eq_id = fresh_local st Type_repr.Bool in
+          emit st
+            (Seed_mir.Assign
+               ( cur_place st eq_id,
+                 Seed_mir.BinaryOp
+                   ( Seed_mir.Eq,
+                     copy_place st (cur_place st did),
+                     Seed_mir.Constant
+                       (int_constant_of Type_repr.UInt (Int64.of_int spec.vs_index)) ) ));
+          set_terminator_to st
+            (Seed_mir.SwitchInt (Seed_mir.Copy (cur_place st eq_id), [ (1L, then_b) ], next_b))
+            next_b)
+      | Ast.PatLiteral (Ast.IntLit (_, lit, _), _) -> (
+          let v =
+            match int_of_string_opt lit with
+            | Some v -> v
+            | None -> seed_bug "non-integer literal match arm in lowering"
           in
-          add_alt p1;
-          add_alt p2
-      | Ast.Wildcard _ | Ast.PatIdent _ -> ()
-      | p ->
-      let pname =
-        match p with
-        | Ast.PatVariant _ -> "PatVariant"
-        | Ast.PatIdent _ -> "PatIdent"
-        | Ast.PatTuple _ -> "PatTuple"
-        | Ast.PatLiteral _ -> "PatLiteral"
-        | Ast.Wildcard _ -> "Wildcard"
-        | Ast.StructPattern _ -> "StructPattern"
-        | Ast.OrPattern _ -> "OrPattern"
-        | Ast.RangePattern _ -> "RangePattern"
-        | _ -> "other"
-      in
-      seed_bug "unsupported match pattern %s in lowering" pname)
+          let eq_id = fresh_local st Type_repr.Bool in
+          emit st
+            (Seed_mir.Assign
+               ( cur_place st eq_id,
+                 Seed_mir.BinaryOp
+                   ( Seed_mir.Eq,
+                     copy_place st (cur_place st sid),
+                     Seed_mir.Constant
+                       (int_constant_of (int_kind_of subj_ty) (Int64.of_int v)) ) ));
+          set_terminator_to st
+            (Seed_mir.SwitchInt (Seed_mir.Copy (cur_place st eq_id), [ (1L, then_b) ], next_b))
+            next_b)
+      | Ast.PatLiteral (Ast.CharLit (_, c, _), _) -> (
+          (* the char test switches the subject DIRECTLY on its
+             codepoint: the seed's SwitchInt dispatches Char values, and
+             the VM has no Eq on Char — the equality form is not
+             executable *)
+          let b = Bytes.of_string c in
+          let u =
+            match Utf8.decode_at b 0 with
+            | Ok (u, _) -> u
+            | Error _ -> seed_bug "invalid char literal match arm in lowering"
+          in
+          set_terminator_to st
+            (Seed_mir.SwitchInt
+               ( copy_place st (cur_place st sid),
+                 [ (Int64.of_int (Uchar.to_int u), then_b) ],
+                 next_b ))
+            next_b)
+      | Ast.PatLiteral (Ast.BoolLit (_, bv, _), _) -> (
+          (* the bool test switches the subject DIRECTLY (the VM
+             dispatches Bool as 1/0) *)
+          set_terminator_to st
+            (Seed_mir.SwitchInt
+               ( copy_place st (cur_place st sid),
+                 [ ((if bv then 1L else 0L), then_b) ],
+                 next_b ))
+            next_b)
+      | Ast.PatLiteral (Ast.StringLit (_, sl, _), _) -> (
+          let eq_id = fresh_local st Type_repr.Bool in
+          emit st
+            (Seed_mir.Assign
+               ( cur_place st eq_id,
+                 Seed_mir.BinaryOp
+                   ( Seed_mir.Eq,
+                     Seed_mir.Read (cur_place st sid),
+                     Seed_mir.Constant (Seed_mir.String sl) ) ));
+          set_terminator_to st
+            (Seed_mir.SwitchInt (Seed_mir.Copy (cur_place st eq_id), [ (1L, then_b) ], next_b))
+            next_b)
+      | Ast.Wildcard _ | Ast.PatIdent _ | Ast.PatTuple _ | Ast.StructPattern _ | Ast.OrPattern _
+      | Ast.PatLiteral _ | Ast.RefPattern _ | Ast.RefMutPattern _ | Ast.RangePattern _ ->
+          (* the catch-all test: enter the body directly (the
+             field-equality checks inside the body route the failures
+             to the next arm's test) *)
+          set_terminator_to st (Seed_mir.Goto then_b) next_b))
     m.Ast.m_arms;
-  (* the switch targets: SAME-tag arms (a char-payload arm followed by
-     another arm of the same variant — the payload-equality chains
-     route the rest) collapse to the FIRST arm of the tag *)
-  let rec dedup acc = function
-    | [] -> List.rev acc
-    | (tag, blk) :: rest ->
-        if List.mem_assoc tag acc then dedup acc rest
-        else dedup ((tag, blk) :: acc) rest
-  in
-  let targets = dedup [] (List.rev !targets) in
-  if targets = [] then
-    (* every arm is a catch-all (a binding/struct-pattern/tuple/wildcard
-       arm — the field-equality checks route): go directly to the
-       otherwise instead of switching a non-scalar subject *)
-    set_terminator_to st (Seed_mir.Goto otherwise) arm_blocks.(0)
-  else
-    set_terminator_to st
-      (Seed_mir.SwitchInt (copy_place st switch_op, targets, otherwise))
-      arm_blocks.(0);
+  (* the non-exhaustive abort: the current block is already the abort
+     block (the last test's continuation), so it closes directly *)
+  set_terminator st Seed_mir.Abort;
   (* lower each arm body into its block *)
   List.iteri
     (fun i (a : Ast.match_arm) ->
-      if i > 0 then push_block st arm_blocks.(i);
+      push_block st arm_blocks.(i);
       (match a.Ast.ma_pattern with
        | Ast.PatVariant (seg1, seg2, pats, _) -> (
            let enum_name =
@@ -2195,8 +2070,8 @@ and lower_match (env : func_env) (st : lower_state) (m : Ast.match_expr) :
                               Seed_mir.Constant (Seed_mir.Char u) ) ));
                    let ok_b = new_block st in
                    let next_b =
-                     if i + 1 < Array.length arm_blocks then arm_blocks.(i + 1)
-                     else otherwise
+                     if i + 1 < Array.length test_blocks then test_blocks.(i + 1)
+                     else abort_b
                    in
                    set_terminator_to st
                      (Seed_mir.SwitchInt
@@ -2244,8 +2119,8 @@ and lower_match (env : func_env) (st : lower_state) (m : Ast.match_expr) :
                                    (Int64.of_int nested_spec.vs_index)) ) ));
                    let ok_b = new_block st in
                    let next_b =
-                     if i + 1 < Array.length arm_blocks then arm_blocks.(i + 1)
-                     else otherwise
+                     if i + 1 < Array.length test_blocks then test_blocks.(i + 1)
+                     else abort_b
                    in
                    set_terminator_to st
                      (Seed_mir.SwitchInt
@@ -2283,8 +2158,8 @@ and lower_match (env : func_env) (st : lower_state) (m : Ast.match_expr) :
                               Seed_mir.Constant (Seed_mir.String slit) ) ));
                    let ok_b = new_block st in
                    let next_b =
-                     if i + 1 < Array.length arm_blocks then arm_blocks.(i + 1)
-                     else otherwise
+                     if i + 1 < Array.length test_blocks then test_blocks.(i + 1)
+                     else abort_b
                    in
                    set_terminator_to st
                      (Seed_mir.SwitchInt
@@ -2322,8 +2197,8 @@ and lower_match (env : func_env) (st : lower_state) (m : Ast.match_expr) :
                               Seed_mir.Constant (Seed_mir.Bool b) ) ));
                    let ok_b = new_block st in
                    let next_b =
-                     if i + 1 < Array.length arm_blocks then arm_blocks.(i + 1)
-                     else otherwise
+                     if i + 1 < Array.length test_blocks then test_blocks.(i + 1)
+                     else abort_b
                    in
                    set_terminator_to st
                      (Seed_mir.SwitchInt
@@ -2400,8 +2275,8 @@ and lower_match (env : func_env) (st : lower_state) (m : Ast.match_expr) :
                               Seed_mir.Constant (int_constant_of (int_kind_of pty) (Int64.of_int v)) ) ));
                    let ok_b = new_block st in
                    let next_b =
-                     if i + 1 < Array.length arm_blocks then arm_blocks.(i + 1)
-                     else otherwise
+                     if i + 1 < Array.length test_blocks then test_blocks.(i + 1)
+                     else abort_b
                    in
                    set_terminator_to st
                      (Seed_mir.SwitchInt
@@ -2587,13 +2462,13 @@ and lower_match (env : func_env) (st : lower_state) (m : Ast.match_expr) :
                               Seed_mir.Constant
                                 (int_constant_of Type_repr.UInt
                                    (Int64.of_int nested_spec.vs_index)) ) ));
-                   let ok_b = new_block st in
-                   set_terminator_to st
-                     (Seed_mir.SwitchInt
-                        ( Seed_mir.Copy (cur_place st eq_id),
-                          [ (1L, ok_b) ],
-                          otherwise ))
-                     ok_b;
+                    let ok_b = new_block st in
+                    set_terminator_to st
+                      (Seed_mir.SwitchInt
+                         ( Seed_mir.Copy (cur_place st eq_id),
+                           [ (1L, ok_b) ],
+                           fail_b i ))
+                      ok_b;
                    List.iteri
                      (fun j spat ->
                        match spat with
@@ -2630,24 +2505,14 @@ and lower_match (env : func_env) (st : lower_state) (m : Ast.match_expr) :
       let bval, bty = lower_expr env st a.Ast.ma_body in
       ensure_result bty;
       emit st (Seed_mir.Assign (cur_place st !result_id, Seed_mir.Use bval));
-      if i = Array.length arm_blocks - 1 then begin
-        match !abort_block with
-        | Some abort_b ->
-            (* close the arm block; fill the Abort fallthrough through
-               the dead-block pattern; leave the join open *)
-            set_terminator st (Seed_mir.Goto join_b);
-            push_block st abort_b;
-            set_terminator st Seed_mir.Abort;
-            push_block st join_b
-        | None -> set_terminator_to st (Seed_mir.Goto join_b) join_b
-      end
-      else set_terminator st (Seed_mir.Goto join_b))
+      set_terminator st (Seed_mir.Goto join_b))
     m.Ast.m_arms;
-  (* join block stays open for the continuation *)
+  (* the join block stays open for the continuation: every arm body
+     branches to it, and the match result flows out through it *)
+  push_block st join_b;
   match !result_ty with
   | Some ty -> (copy_place st (cur_place st !result_id), ty)
   | None -> (Seed_mir.Constant Seed_mir.Unit, Type_repr.Unit)
-  end
 
 and lower_while (env : func_env) (st : lower_state) (w : Ast.while_expr) :
     Seed_mir.operand * Type_repr.t =

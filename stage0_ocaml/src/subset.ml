@@ -465,12 +465,16 @@ and check_arm_pattern ctx diags (p : Ast.pattern) =
             "non-integer literal match arms are not available in the bootstrap subset (seed lowering builds switch targets for integer/char arms and string-equality chains only)"
             span);
       check_expr ctx diags e
-  | Ast.OrPattern (a, b, _) ->
-      (* or-pattern arms `A | B` dispatch both alternatives to the same
-         arm block (the E9044 or-pattern form is retired); the
-         alternatives must be serveable forms *)
-      check_arm_pattern ctx diags a;
-      check_arm_pattern ctx diags b
+  | Ast.OrPattern (_, _, span) ->
+      (* re-audit P0 #4/#8: or-patterns are RE-GATED until TypedPattern
+         exists — the checker may place names from the alternatives in
+         the arm scope while the lowerer emits no corresponding
+         bindings (a direct checker/lowerer contradiction), and the
+         ordered decision chain has no alternative-testing interface
+         yet (an or-arm would fire for every subject). *)
+      reject diags "E9044"
+        "or-pattern match arms are not available in the bootstrap subset (re-gated until the TypedPattern ordered-alternative interface lands — or-arm bindings and alternative testing are not sound yet)"
+        span
   | Ast.StructPattern (_, sfields, _) ->
       (* struct-pattern arms `Variant { f: x, ... }` switch on the tag
          and bind the payload struct fields through the semantic
@@ -489,10 +493,19 @@ and check_arm_pattern ctx diags (p : Ast.pattern) =
                 "nested struct-pattern payload bindings are not available in the bootstrap subset (seed lowering binds struct payload fields by name, `_` or bool literals only)"
                 (match fpat with Some p -> Ast.pattern_span p | None -> Span.synthetic))
         sfields
-  | Ast.PatIdent _ ->
+  | Ast.PatIdent (name, _, _) ->
       (* a binding arm `when x then` binds the whole subject (the E9044
-         binding-arm form is retired) *)
-      ()
+         binding-arm form is retired) — UNLESS the identifier names a
+         known nullary variant (re-audit P0 #3: bare-identifier pattern
+         resolution must be SEMANTIC, not syntactic — `when NotFound
+         then` must dispatch on the variant, never silently bind) *)
+      if List.mem name ctx.user_variants then
+        reject diags "E9044"
+          (Printf.sprintf
+             "bare identifier arm `%s` names a known nullary variant (re-gated until TypedPattern resolves identifier patterns semantically — a bare-variant arm must dispatch on the tag, never bind as a catch-all)"
+             name)
+          (Ast.pattern_span (Ast.PatIdent (name, false, Span.synthetic)))
+      else ()
   | Ast.PatTuple (subs, _) ->
       (* a tuple arm `(a, b) => ...` binds the elements through the
          ConstantIndex projections (the E9044 tuple-arm form is

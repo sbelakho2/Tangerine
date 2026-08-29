@@ -92,7 +92,10 @@
           with "unknown callee" — the fail-closed channel that replaced
           the firewall rejection.
 
-   Expected main return: 277 (256 + struct_arm_roundtrip 21). *)
+   Expected main return: 368 (the lowersurface corpus + the
+   struct-arm round-trip 21 + the ordered-match adversarial proofs:
+   wildcard-first int 1+1, wildcard-first string 1, same-tag payload
+   interleave 1+3+2). *)
 
 let src_text = {|
 enum Color
@@ -219,6 +222,39 @@ def binding_arm_roundtrip(o: Option[Int]) -> Int
   }
 end
 
+// ── ordered-match adversarial proofs (re-audit P0 #5/#6/#7) ──
+// (i) wildcard BEFORE a later literal: first-match must take the
+//     wildcard for ANY subject — the old switch form would dispatch
+//     the literal tag to the LATER arm and break source order
+def wildcard_first(n: Int) -> Int
+  match n {
+    _ => 1,
+    0 => 2
+  }
+end
+
+// (ii) the string ordering: a wildcard before a string literal must
+//      win for the literal subject — the retired equality-chain path
+//      skipped non-string arms and would have returned the string
+//      arm's body
+def wildcard_first_str(s: String) -> Int
+  match s {
+    _ => 1,
+    "abc" => 2
+  }
+end
+
+// (iii) interleaved same-tag payload arms: Some(1) is tested FIRST, a
+//       failed payload check falls to the NEXT arm's TEST (None), and
+//       Some(_) catches the remaining Some payloads
+def same_tag_first(o: Option[Int]) -> Int
+  match o {
+    Some(1) => 1,
+    None() => 2,
+    Some(_) => 3
+  }
+end
+
 enum Node
   Leaf,
   Branch { value: Int, tag: Int }
@@ -273,7 +309,13 @@ def main() -> Int
   let u = range_roundtrip()
   let v = unsafe_roundtrip()
   let w = binding_arm_roundtrip(Some(5))
-  a + b + c + d + e + f + g + h + i + j + k + l + m + o + p + q + r + t2 + u + v + w
+  let x1 = wildcard_first(0)
+  let x2 = wildcard_first(7)
+  let x3 = wildcard_first_str("abc")
+  let x4 = same_tag_first(Some(1))
+  let x5 = same_tag_first(Some(2))
+  let x6 = same_tag_first(None())
+  a + b + c + d + e + f + g + h + i + j + k + l + m + o + p + q + r + t2 + u + v + w + x1 + x2 + x3 + x4 + x5 + x6
 end
 |}
 
@@ -1485,9 +1527,9 @@ end
                 match Vm.run_inspect vm2 entry_frame with
                 | Ok ret_val ->
                     Printf.printf "  main returned: %s\n" ret_val;
-                    if ret_val = "359" then Printf.printf "  RESULT: PASS\n"
+                    if ret_val = "368" then Printf.printf "  RESULT: PASS\n"
                     else begin
-                      Printf.printf "  RESULT: FAIL (expected 359)\n";
+                      Printf.printf "  RESULT: FAIL (expected 368)\n";
                       exit 1
                     end
                 | Error m -> Printf.printf "  main returned: <inspect failed: %s>\n" m)));
