@@ -321,6 +321,14 @@ let () =
          fail
            "manifest subset firewall: %d unsupported construct(s) in the compiler manifest — \
             the aggregate gate requires zero" ctx.ctx_subset.Driver.sr_total;
+       (* the TYPED-PROFILE firewall (the audit's P0): the syntactic
+          subset says the parser sees no categorically forbidden form;
+          the typed profile says every TYPED use of an accepted form is
+          executable — the aggregate gate requires BOTH zero *)
+       if ctx.ctx_profile_findings <> 0 then
+         fail
+           "typed semantic profile: %d not-yet-executable typed use(s) in the compiler manifest —             the aggregate gate requires zero (the audit: subset-zero does not mean executable closure)"
+           ctx.ctx_profile_findings;
        if ctx.ctx_strict_fallbacks <> 0 then
          fail
            "strict resolution: %d compatibility-fallback activation(s) — the aggregate gate \

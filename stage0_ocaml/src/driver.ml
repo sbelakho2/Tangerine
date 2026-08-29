@@ -1356,6 +1356,7 @@ type closure_ctx = {
      Fix 3 deterministic phase split). *)
   ctx_decl_rounds : int;
   ctx_subset : subset_result;
+  ctx_profile_findings : int;
   ctx_strict_fallbacks : int;
   (* audit P0 fix: the strict-mode audit's diagnostic records (the
      future compiler's per-module-authority findings on the separate
@@ -1554,6 +1555,22 @@ let run_closure_pipeline_impl ~(repo_root : string) ~(manifest_path : string)
             (fun key errs acc -> List.map (fun e -> key ^ ": " ^ e) errs @ acc)
             errs_by_mod []
         in
+        (* ── the TYPED-PROFILE firewall (the audit's P0): the
+           syntactic subset gate says the parser sees no categorically
+           forbidden AST form — it does NOT prove every TYPED use of
+           an accepted form is executable.  This check runs after
+           typing over the typed closure. *)
+        let profile_items =
+          List.concat_map (fun node -> node.Module_graph.node_items) (topological_nodes graph)
+        in
+        let profile_findings = Typed_profile.check !env profile_items in
+        Printf.printf "  TYPED_PROFILE = %s (%d findings)\n"
+          (if profile_findings = [] then "PASS" else "FAIL")
+          (List.length profile_findings);
+        List.iter
+          (fun f ->
+            Printf.printf "    %s: %s\n" f.Typed_profile.f_kind f.Typed_profile.f_message)
+          profile_findings;
         Ok
           { ctx_repo_root = repo_root;
             ctx_manifest_path = manifest_path;
@@ -1566,6 +1583,7 @@ let run_closure_pipeline_impl ~(repo_root : string) ~(manifest_path : string)
             ctx_typed_calls_sample = !typed_calls;
             ctx_decl_rounds = !decl_rounds;
             ctx_subset = subset_result;
+            ctx_profile_findings = List.length profile_findings;
             ctx_strict_fallbacks = fallback_activations;
             ctx_strict_diags = !strict_audit_diags;
             lowered_methods = 0 }
