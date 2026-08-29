@@ -1479,6 +1479,13 @@ let rec unify (box_tid : Ids.Type_id.t option) (subst : (Type_repr.generic_key *
         var_journal := (Type_repr.KVar v, a') :: !var_journal;
         Ok ()
       end
+  | Type_repr.Type_param pa, Type_repr.Ref_internal (_, Type_repr.Type_param pb)
+    when Ids.Generic_param_id.compare pa pb = 0 ->
+      (* the borrow-of-the-same rigid (`m.get(&key)` against
+         `key: K`): the native accepts the auto-borrow — the arg's
+         reference unifies with the value parameter over the same
+         binder (the borrow is a read-only view of the same K) *)
+      Ok ()
   | Type_repr.Type_param pa, _ ->
       (* RIGID: a declaration binder absent from the substitution has
          not been instantiated — it is rigid within its own declaration
