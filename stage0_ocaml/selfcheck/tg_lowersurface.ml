@@ -631,6 +631,116 @@ end
                                  (match other with Ok v -> v | Error m -> "<" ^ m ^ ">");
                                exit 1)))
                 end));
+      (* ── const-call pattern round-trip proof (the `when DT_DIR()`
+         form, 2026-08-29): a match on a NON-enum subject (u8) whose
+         arm patterns are zero-arg const functions.  The checker
+         resolves each name through the const-fn registry and types the
+         arm as the function's literal value (TP_literal); the ordered
+         match-CFG lowers the integer tests; the VM returns 2 for
+         f(8) — the DT_REG arm (a wrong test value would return 9). *)
+      let dtsrc = {|
+def DT_UNKNOWN() -> u8 = 0
+def DT_DIR() -> u8 = 4
+def DT_REG() -> u8 = 8
+
+def main() -> Int
+  var d: u8 = 8
+  match d
+  when DT_DIR() then 1
+  when DT_REG() then 2
+  when DT_UNKNOWN() then 3
+  when _ then 9
+  end
+end
+|} in
+      (match Source_loader.load_string "<const-call>" dtsrc with
+       | Error _ -> failwith "const-call source load"
+       | Ok dsrc ->
+           let dsm = Span.create () in
+           let dfid = Span.add_file dsm dsrc.Source.name dsrc in
+           let ddiags = Diagnostic.create_bag () in
+           let dlx = Lexer.create dsrc.Source.bytes dfid ddiags in
+           let dtoks = Lexer.lex dlx in
+           let dprog = Parser.parse dtoks dsrc.Source.bytes dfid ddiags [ "dt" ] in
+           (match Typecheck.check_program (Typecheck.initial_env ()) dprog with
+            | Error m -> failwith ("const-call typecheck: " ^ m)
+            | Ok (denv, derrs) ->
+                if derrs <> [] then
+                  failwith ("const-call typecheck errors: " ^ String.concat "; " derrs)
+                else begin
+                  let dbase = Driver.lowering_env_of ~items:dprog.Ast.items denv in
+                  let dvariants = Driver.user_variant_table denv in
+                  let dmain_decl =
+                    match
+                      List.find_opt
+                        (fun i ->
+                          match i.Ast.kind with
+                          | Ast.Function d -> d.Ast.fn_sig.Ast.sig_name = "main"
+                          | _ -> false)
+                        dprog.Ast.items
+                    with
+                    | Some i -> i
+                    | None -> failwith "const-call: no main function"
+                  in
+                  let dts =
+                    match List.assoc_opt "main" denv.Typecheck.functions with
+                    | Some ts -> ts
+                    | None -> (
+                        match
+                          List.filter (fun (k, _) -> Util.has_suffix k "::main")
+                            denv.Typecheck.functions
+                        with
+                        | [ (_, ts) ] -> ts
+                        | _ -> failwith "const-call: no typed signature for main")
+                  in
+                  let dmain_fn =
+                    match dmain_decl.Ast.kind with
+                    | Ast.Function d ->
+                        Mir_lower.lower_function_with_variants
+                          ~typed_nodes:(Driver.typed_nodes_of denv)
+                          ~typed_patterns:(Driver.typed_patterns_of denv)
+                          dvariants
+                          { dbase with Mir_lower.fn_ret = dts.Typecheck.ts_return }
+                          "main"
+                          (Ids.Callable_id.to_int dts.Typecheck.ts_callable)
+                          [||] [||] d
+                    | _ -> failwith "const-call: main is not a function"
+                  in
+                  let dprog_mir = { Seed_mir.functions = [| dmain_fn |]; statics = [||]; types = [||] } in
+                  (match Mir_verify.require_valid_concrete dprog_mir with
+                   | Ok () ->
+                       Printf.printf
+                         "  const-call pattern verify (concrete mode): PASS\n"
+                   | Error errs ->
+                       Printf.printf "  const-call pattern verify (concrete mode): FAIL\n";
+                       List.iter (fun e -> Printf.printf "    %s\n" e) errs;
+                       Printf.printf "%s\n" (Seed_mir.print_program dprog_mir);
+                       exit 1);
+                  let d_entry = dmain_fn.Seed_mir.instance in
+                  let dhost = Host.create ~repo_root:"." ~argv:[||] in
+                  (match Vm.run ~program:dprog_mir ~entry:d_entry ~argv:[||] ~host:dhost with
+                   | Error e ->
+                       Printf.printf "  const-call VM: FAIL %s\n" e.Vm.message;
+                       exit 1
+                   | Ok code -> (
+                       match
+                         Vm.entry_frame_of ~program:dprog_mir ~entry:d_entry ~argv:[||]
+                       with
+                       | Error m ->
+                           Printf.printf "  const-call VM: <inspect failed: %s>\n" m;
+                           exit 1
+                       | Ok (dvm, dframe) -> (
+                           match Vm.run_inspect dvm dframe with
+                           | Ok "2" ->
+                               Printf.printf
+                                 "  const-call pattern round-trip: PASS (main = 2 — the u8 match took the DT_REG arm; exit %d)\n"
+                                 code
+                           | other ->
+                               Printf.printf
+                                 "  const-call pattern round-trip: FAIL (expected 2, got %s)\n"
+                                 (match other with Ok v -> v | Error m -> "<" ^ m ^ ">");
+                               exit 1)))
+                end));
       let tcheck_env =
         match Typecheck.check_program env program with
         | Error m -> Printf.printf "  typecheck: FAIL %s\n" m; exit 1

@@ -2668,12 +2668,23 @@ and lower_match_typed (env : func_env) (st : lower_state) (nid : Ids.Node_id.t)
        derived from the subject type) *)
     match c with
     | Seed_mir.Integer _ ->
+        (* re-derive the constant's int kind from the CHECKED subject
+           type: the const-call form (`when DT_DIR()`) records the
+           const fn's return kind (u8) while the subject's lowered local
+           may carry the value's default kind — the Eq operands must
+           agree *)
+        let c =
+          match subj_ty, c with
+          | Type_repr.Int k, Seed_mir.Integer v ->
+              Seed_mir.Constant (int_constant_of k (Int_value.to_int64 v))
+          | _ -> Seed_mir.Constant c
+        in
         let eq_id = fresh_local st Type_repr.Bool in
         emit st
           (Seed_mir.Assign
              ( cur_place st eq_id,
                Seed_mir.BinaryOp
-                 ( Seed_mir.Eq, copy_place st subject_place, Seed_mir.Constant c ) ));
+                 ( Seed_mir.Eq, copy_place st subject_place, c ) ));
         set_terminator_to st
           (Seed_mir.SwitchInt (Seed_mir.Copy (cur_place st eq_id), [ (1L, then_b) ], else_b))
           else_b

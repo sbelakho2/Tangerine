@@ -142,6 +142,12 @@ type state = {
   mutable next_var_id : int;
   mutable failed_items : string list;
   mutable o_handoff_resolved : int;
+  (* the const-function registry: zero-arg functions whose body is a
+     literal (`def DT_DIR() -> u8 = 4`) — their constant value backs the
+     `when DT_DIR()` literal-pattern form the native accepts (a match on
+     a non-enum subject whose arm patterns are const calls).  Filled by
+     check_function_item (idempotently), keyed by the qualified name. *)
+  const_fns : (string, Seed_mir.constant * Type_repr.t) Hashtbl.t;
   (* the nested-function registry (re-audit: nested defs reach closure
      MIR lowering from HERE — the accepted typed callable universe).
      Each entry carries the qname, the typed signature (the callable id,
@@ -887,6 +893,7 @@ let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
       failed_items = [];
       o_handoff_resolved = 0;
       nested_functions = [];
+      const_fns = Hashtbl.create 64;
       query_sigs = [];
       o_handoff_fallback = 0;
       sig_param_ids = Hashtbl.create 256;
@@ -2157,7 +2164,39 @@ let rec check_pattern (env : env) (scope : scope) (ty : Type_repr.t) (p : Ast.pa
       | Error m -> Error m)
   | Ast.PatVariant (seg1, seg2, pats, span) -> (
       match resolve_variant env scope span seg1 seg2 ty with
-      | Error m -> Error m
+      | Error m -> (
+          (* the const-call fallback: `when DT_DIR()` on a NON-enum
+             subject — the name is a zero-arg const function, and the
+             pattern is its literal value (the native-accepted form) *)
+          if seg1 = "" && pats = [] then begin
+            let key =
+              match env.module_path with
+              | [] -> seg2
+              | mp -> String.concat "::" (mp @ [ seg2 ])
+            in
+            let found =
+              match Hashtbl.find_opt env.state.const_fns key with
+              | Some v -> Some v
+              | None ->
+                  (* the fill keys by the item's module_path (the
+                     file-path-derived qname for a single file) while the
+                     pattern's env.module_path may be [] — fall back to
+                     the unique `::name` suffix *)
+                  let suffix = "::" ^ seg2 in
+                  let rec find = function
+                    | [] -> None
+                    | (k, v) :: rest ->
+                        if Util.has_suffix k suffix then Some v else find rest
+                  in
+                  find
+                    (Hashtbl.fold (fun k v acc -> (k, v) :: acc)
+                       env.state.const_fns [])
+            in
+            match found with
+            | Some (c, _) -> Ok (Typed_pattern.TP_literal (c, ty), [])
+            | None -> Error m
+          end
+          else Error m)
       | Ok (field_tys, _, vid) ->
           if List.length pats <> Array.length field_tys then
             Error
@@ -5219,7 +5258,18 @@ and check_function_item (env : env) (mp : string list) (d : Ast.function_decl) :
   match List.assoc_opt qname env.functions with
   | None ->
       Error (err d.fn_span (Printf.sprintf "internal: function `%s` was not registered" qname))
-  | Some sig_ -> check_function_body env [] sig_ d
+  | Some sig_ ->
+      (* register the const-function value: a zero-arg function whose
+         body is a literal backs the `when NAME()` literal-pattern form
+         (the native accepts matching a non-enum subject with const-call
+         patterns); idempotent so the fixpoint can re-run the module *)
+      (match d.fn_body with
+       | Ast.FnExpr e when d.fn_sig.sig_params = [] -> (
+           match pattern_literal_constant e sig_.ts_return with
+           | Ok c -> Hashtbl.replace env.state.const_fns qname (c, sig_.ts_return)
+           | Error _ -> ())
+       | _ -> ());
+      check_function_body env [] sig_ d
 
 and check_struct (env : env) (d : Ast.struct_decl) : (unit, string) result =
   match List.assoc_opt d.s_name env.nominals, List.assoc_opt d.s_name env.types with
