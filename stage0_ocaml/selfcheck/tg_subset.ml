@@ -497,11 +497,19 @@ end
   }
 end
 |});
-    ("bare nullary-variant arm parses as a binding (accepted — the E9044 binding form retired)", [],
+    ("bare nullary-variant arm (accepted — the semantic TypedPattern resolution dispatches on the tag; the E9044 bare-identifier re-gate is retired)", [],
      {|def f(o: Option[Int]) -> Int
   match o {
     Some(v) => v,
     None => 0
+  }
+end
+|});
+    ("or-pattern arm (accepted — the semantic TypedPattern alternative interface lowers it; the E9044 or-pattern re-gate is retired)", [],
+     {|def f(o: Option[Int]) -> Int
+  match o {
+    Some(x) | Some(y) => x + y,
+    _ => 0
   }
 end
 |});

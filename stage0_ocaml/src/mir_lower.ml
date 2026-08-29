@@ -251,8 +251,48 @@ let variant_spec_of (_env : func_env) (tbl : variant_table) ~(enum_name : string
             "unknown variant `%s` of enum `%s` in lowering (user enums require lower_function_with_variants)"
             vname enum_name)
 
-let ctor_of (tbl : variant_table) (n : string) : (string * string) option =
-  match List.assoc_opt n tbl.vt_ctors with
+(* The SEMANTIC spec lookup (re-audit P0 #3): the typed-pattern channel
+   carries the variant's VARIANT ID — the identity the typechecker
+   resolved from the typed nominal registry (nom_variant_ids) — so the
+   lowerer resolves the spec BY ID through the same variant table the
+   name-keyed path uses (the driver builds both channels from the same
+   typed nominals).  The enum name comes from the match subject's type
+   (the checker resolved the pattern against that subject, so the
+   variant necessarily belongs to its enum). *)
+let variant_spec_of_id (_env : func_env) (tbl : variant_table) ~(enum_name : string)
+    (vid : Ids.Variant_id.t) ~(repr : Type_repr.t) : variant_spec =
+  match List.assoc_opt enum_name tbl.vt_enums with
+  | Some varmap -> (
+      match List.find_opt (fun (_, spec) -> Ids.Variant_id.compare spec.vs_id vid = 0) varmap with
+      | Some (_, spec) -> spec
+      | None ->
+          seed_bug "variant id #%d of enum `%s` has no variant table entry"
+            (Ids.Variant_id.to_int vid) enum_name)
+  | None -> (
+      (* the builtin Option/Result: the registry carries the SEMANTIC ids
+         (vt_builtin), so resolve the variant NAME by id and build the
+         spec through the builtin channel (the runtime tags Some=0,
+         None=1, Ok=0, Err=1 are the builtin table's constants) *)
+      match List.assoc_opt enum_name tbl.vt_builtin with
+      | Some vmap -> (
+          match List.find_opt (fun (_, id) -> Ids.Variant_id.compare id vid = 0) vmap with
+          | Some (vname, _) -> (
+              match builtin_variant_spec tbl enum_name vname repr with
+              | Some spec -> spec
+              | None ->
+                  seed_bug
+                    "builtin variant id #%d of enum `%s` has no builtin spec (id %d)"
+                    (Ids.Variant_id.to_int vid) enum_name (Ids.Variant_id.to_int vid))
+          | None ->
+              seed_bug
+                "builtin variant id #%d of enum `%s` has no SEMANTIC VariantId registry entry"
+                (Ids.Variant_id.to_int vid) enum_name)
+      | None ->
+          seed_bug
+            "enum `%s` has no SEMANTIC VariantId registry in the variant table (the typed-pattern path needs the driver's registry channel)"
+            enum_name)
+
+let ctor_of (tbl : variant_table) (n : string) : (string * string) option =  match List.assoc_opt n tbl.vt_ctors with
   | Some pair -> Some pair
   | None -> (
       match n with
@@ -317,12 +357,23 @@ type lower_state = {
   (* the persistent typed-node channel: NodeId -> the typechecker's
      resolved node ([] = channel absent) *)
   typed_nodes : (Ids.Node_id.t * typed_node) list;
+  (* the typed-pattern channel (re-audit P0 #3): (match NodeId, arm
+     index) -> the arm's SEMANTIC pattern tree, resolved ONCE by the
+     typechecker ([] = channel absent — hand-built selfcheck envs; the
+     driver path always carries the channel, so a missing entry there is
+     a checker/lowerer contradiction and fails loudly) *)
+  typed_patterns : ((Ids.Node_id.t * int) * Typed_pattern.t) list;
 }
 
 (* The typed-node channel lookup: the typechecker's resolved node for an
    expr's NodeId, when the channel is present. *)
 let typed_node_of (st : lower_state) (node_id : Ids.Node_id.t) : typed_node option =
   List.assoc_opt node_id st.typed_nodes
+
+(* The typed-pattern channel lookup: the typechecker's semantic pattern
+   tree for a match arm (match NodeId, arm index). *)
+let typed_pattern_of (st : lower_state) (key : Ids.Node_id.t * int) : Typed_pattern.t option =
+  List.assoc_opt key st.typed_patterns
 
 let new_block (st : lower_state) : int =
   let id = st.next_block in
@@ -1061,7 +1112,7 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
       ( Seed_mir.Copy { bp with Seed_mir.projections = bp.Seed_mir.projections @ projs },
         fty )
   | Ast.IfExpr (_, i) -> lower_if env st i
-  | Ast.MatchExpr (_, m) -> lower_match env st m
+  | Ast.MatchExpr (nid, m) -> lower_match env st nid m
   | Ast.WhileExpr (_, w) -> lower_while env st w
   | Ast.LoopExpr (_, b, _) -> lower_loop env st b
   | Ast.Block (_, b, _) -> lower_block env st b
@@ -1832,7 +1883,19 @@ and lower_if (env : func_env) (st : lower_state) (i : Ast.if_expr) : Seed_mir.op
   if !has_result then (copy_place st (cur_place st !result_id), !result_ty)
   else (Seed_mir.Constant Seed_mir.Unit, Type_repr.Unit)
 
-and lower_match (env : func_env) (st : lower_state) (m : Ast.match_expr) :
+and lower_match (env : func_env) (st : lower_state) (nid : Ids.Node_id.t)
+    (m : Ast.match_expr) : Seed_mir.operand * Type_repr.t =
+  (* the typed-pattern channel (re-audit P0 #3): when the channel is
+     present (the driver path — the typechecker always ran), the arm
+     patterns are CONSUMED as the SEMANTIC trees (VariantIds, binding
+     names/types, constants, field names) and a missing entry is a
+     checker/lowerer contradiction that fails loudly; when the channel
+     is absent (hand-built selfcheck envs), lowering falls back to the
+     syntax-driven interpretation. *)
+  if st.typed_patterns = [] then lower_match_syntactic env st m
+  else lower_match_typed env st nid m
+
+and lower_match_syntactic (env : func_env) (st : lower_state) (m : Ast.match_expr) :
     Seed_mir.operand * Type_repr.t =
   let subj_op, subj_ty = lower_expr env st m.Ast.m_subject in
   let sid = fresh_local st subj_ty in
@@ -2514,6 +2577,461 @@ and lower_match (env : func_env) (st : lower_state) (m : Ast.match_expr) :
   | Some ty -> (copy_place st (cur_place st !result_id), ty)
   | None -> (Seed_mir.Constant Seed_mir.Unit, Type_repr.Unit)
 
+and lower_match_typed (env : func_env) (st : lower_state) (nid : Ids.Node_id.t)
+    (m : Ast.match_expr) : Seed_mir.operand * Type_repr.t =
+  let subj_op, subj_ty = lower_expr env st m.Ast.m_subject in
+  let sid = fresh_local st subj_ty in
+  let subj_use =
+    match subj_op with
+    | Seed_mir.Copy p when not (copyable_ty subj_ty) -> Seed_mir.Read p
+    | op -> op
+  in
+  emit st (Seed_mir.Assign (cur_place st sid, Seed_mir.Use subj_use));
+  let join_b = new_block st in
+  let result_id = ref 0 in
+  let result_ty : Type_repr.t option ref = ref None in
+  let ensure_result ty =
+    match !result_ty with
+    | None ->
+        result_id := fresh_local st ty;
+        result_ty := Some ty
+    | Some _ -> ()
+  in
+  (* the arm's SEMANTIC pattern trees (the channel is authoritative: the
+     typechecker resolves every accepted arm ONCE — a missing entry is
+     the checker/lowerer contradiction the re-audit forbids) *)
+  let arm_tps =
+    List.mapi
+      (fun i (_a : Ast.match_arm) ->
+        match typed_pattern_of st (nid, i) with
+        | Some tp -> tp
+        | None ->
+            seed_bug
+              "match arm %d has no typed pattern on the channel (the typechecker must resolve every arm's pattern once — re-audit P0 #3)"
+              i)
+      m.Ast.m_arms
+  in
+  if
+    List.length
+      (List.filter
+         (fun tp -> match tp with Typed_pattern.TP_wildcard -> true | _ -> false)
+         arm_tps)
+    > 1
+  then seed_bug "multiple wildcard arms in match lowering";
+  if List.exists (fun (a : Ast.match_arm) -> a.Ast.ma_guard <> None) m.Ast.m_arms then
+    seed_bug "match arm guards are not supported in seed lowering";
+  let arm_blocks = Array.of_list (List.map (fun _ -> new_block st) m.Ast.m_arms) in
+  let test_blocks = Array.of_list (List.map (fun _ -> new_block st) m.Ast.m_arms) in
+  let abort_b = new_block st in
+  let fail_b i = if i + 1 < Array.length test_blocks then test_blocks.(i + 1) else abort_b in
+  let first_b =
+    if Array.length test_blocks = 0 then abort_b
+    else test_blocks.(0)
+  in
+  set_terminator_to st (Seed_mir.Goto first_b) first_b;
+  let subject_place = cur_place st sid in
+  let is_struct_subject ty =
+    match ty with
+    | Type_repr.Named (tid, _) -> (
+        match List.assoc_opt tid env.struct_fields with
+        | Some (_ :: _) -> true
+        | _ -> false)
+    | _ -> false
+  in
+  (* the SEMANTIC discriminant test: the variant's identity is the
+     typechecker's VariantId, resolved through the same variant table the
+     name-keyed path uses (the driver builds both channels from the same
+     typed nominals) *)
+  let rec discriminant_test (enum_name : string) (base : Seed_mir.place)
+      (vid : Ids.Variant_id.t) (repr : Type_repr.t) (then_b : int) (else_b : int) : unit =
+    let spec = variant_spec_of_id env st.variants ~enum_name vid ~repr in
+    let did = fresh_local st (Type_repr.Int Type_repr.UInt) in
+    emit st (Seed_mir.Assign (cur_place st did, Seed_mir.Discriminant base));
+    let eq_id = fresh_local st Type_repr.Bool in
+    emit st
+      (Seed_mir.Assign
+         ( cur_place st eq_id,
+           Seed_mir.BinaryOp
+             ( Seed_mir.Eq,
+               copy_place st (cur_place st did),
+               Seed_mir.Constant (int_constant_of Type_repr.UInt (Int64.of_int spec.vs_index)) ) ));
+    set_terminator_to st
+      (Seed_mir.SwitchInt (Seed_mir.Copy (cur_place st eq_id), [ (1L, then_b) ], else_b))
+      else_b
+  and subject_literal_test (c : Seed_mir.constant) (then_b : int) (else_b : int) : unit =
+    (* the subject tests consume the CHECKER's constant (the int literal
+       carries the subject's kind — the same kind the syntactic path
+       derived from the subject type) *)
+    match c with
+    | Seed_mir.Integer _ ->
+        let eq_id = fresh_local st Type_repr.Bool in
+        emit st
+          (Seed_mir.Assign
+             ( cur_place st eq_id,
+               Seed_mir.BinaryOp
+                 ( Seed_mir.Eq, copy_place st subject_place, Seed_mir.Constant c ) ));
+        set_terminator_to st
+          (Seed_mir.SwitchInt (Seed_mir.Copy (cur_place st eq_id), [ (1L, then_b) ], else_b))
+          else_b
+    | Seed_mir.Char u ->
+        set_terminator_to st
+          (Seed_mir.SwitchInt (copy_place st subject_place, [ (Int64.of_int (Uchar.to_int u), then_b) ], else_b))
+          else_b
+    | Seed_mir.Bool b ->
+        set_terminator_to st
+          (Seed_mir.SwitchInt (copy_place st subject_place, [ ((if b then 1L else 0L), then_b) ], else_b))
+          else_b
+    | Seed_mir.String _ ->
+        let eq_id = fresh_local st Type_repr.Bool in
+        emit st
+          (Seed_mir.Assign
+             ( cur_place st eq_id,
+               Seed_mir.BinaryOp
+                 ( Seed_mir.Eq, Seed_mir.Read subject_place, Seed_mir.Constant c ) ));
+        set_terminator_to st
+          (Seed_mir.SwitchInt (Seed_mir.Copy (cur_place st eq_id), [ (1L, then_b) ], else_b))
+          else_b
+    | _ -> seed_bug "unsupported literal match arm in lowering"
+  and bind_struct_field ?(plan : (string * int) list option) (sty : Type_repr.t)
+      (base_p : Seed_mir.place) (fail : int) (fname : string) (fp : Typed_pattern.t) : unit =
+    (* a struct-pattern field: the SEMANTIC FieldId comes from the typed
+       nominal registry (field_projection_of), and the field's type is
+       the registry's substituted type.  In an or-pattern alternative the
+       field projects into the SHARED interface local (plan) — every
+       alternative's success path must define the SAME local, or the
+       verifier's definite-init dataflow rejects the body's read. *)
+    match fp with
+    | Typed_pattern.TP_binding (name, _, _) -> (
+        let projs, fty = field_projection_of env sty fname in
+        if not (copyable_ty fty) then
+          seed_bug
+            "non-Copy struct-pattern field binding is not supported by the seed VM (field type %s)"
+            (Seed_mir.print_type fty);
+        let id =
+          match plan with Some p -> List.assoc name p | None -> fresh_local st fty
+        in
+        emit st
+          (Seed_mir.Assign
+             ( cur_place st id,
+               Seed_mir.Use
+                 (Seed_mir.Copy
+                    { base_p with Seed_mir.projections = base_p.Seed_mir.projections @ projs }) ));
+        (match plan with Some _ -> () | None -> st.scope <- (name, id) :: st.scope))
+    | Typed_pattern.TP_wildcard -> ()
+    | Typed_pattern.TP_literal (c, fty) -> (
+        (* a literal struct field `{ owns_state: true, .. }` checks the
+           field equality and falls to the next arm's test when it fails *)
+        let projs, _ = field_projection_of env sty fname in
+        let pid = fresh_local st fty in
+        emit st
+          (Seed_mir.Assign
+             ( cur_place st pid,
+               Seed_mir.Use
+                 (Seed_mir.Copy
+                    { base_p with Seed_mir.projections = base_p.Seed_mir.projections @ projs }) ));
+        let eq_id = fresh_local st Type_repr.Bool in
+        emit st
+          (Seed_mir.Assign
+             ( cur_place st eq_id,
+               Seed_mir.BinaryOp
+                 ( Seed_mir.Eq, copy_place st (cur_place st pid), Seed_mir.Constant c ) ));
+        let ok_b = new_block st in
+        set_terminator_to st
+          (Seed_mir.SwitchInt (Seed_mir.Copy (cur_place st eq_id), [ (1L, ok_b) ], fail))
+          ok_b)
+    | _ -> seed_bug "unsupported struct-pattern field sub-pattern in lowering"
+  and bind_payloads ?(plan : (string * int) list option) (vid : Ids.Variant_id.t)
+      (base : Seed_mir.place) (fail : int) (j : int) (tp : Typed_pattern.t) : unit =
+    (* bind/check the j-th payload of the variant at [base]; the
+       projection carries the SEMANTIC VariantId (the VM derives the
+       runtime tag through the enum def) and the payload positions are
+       indexed with ConstantIndex (the reference's TupleIndex form) *)
+    let proj = { base with Seed_mir.projections = base.Seed_mir.projections @ [ Seed_mir.Downcast vid; Seed_mir.ConstantIndex j ] } in
+    match tp with
+    | Typed_pattern.TP_wildcard -> ()
+    | Typed_pattern.TP_binding (name, fty, _) -> (
+        if not (copyable_ty fty) then
+          seed_bug
+            "non-Copy payload binding in a variant match arm is not supported by the seed VM (a projected Move is not executable; payload type %s)"
+            (Seed_mir.print_type fty);
+        let id =
+          match plan with Some p -> List.assoc name p | None -> fresh_local st fty
+        in
+        emit st (Seed_mir.Assign (cur_place st id, Seed_mir.Use (Seed_mir.Copy proj)));
+        (match plan with Some _ -> () | None -> st.scope <- (name, id) :: st.scope))
+    | Typed_pattern.TP_literal (c, fty) -> (
+        (* a literal payload `Some('#')` / `Some("ast")` / `Some(true)` /
+           `Some(2)`: the payload position must hold the literal — the
+           equality; fall to the next arm's test when it fails *)
+        let pid = fresh_local st fty in
+        let use_op =
+          match c with Seed_mir.String _ -> Seed_mir.Read proj | _ -> Seed_mir.Copy proj
+        in
+        emit st (Seed_mir.Assign (cur_place st pid, Seed_mir.Use use_op));
+        let eq_id = fresh_local st Type_repr.Bool in
+        emit st
+          (Seed_mir.Assign
+             ( cur_place st eq_id,
+               Seed_mir.BinaryOp
+                 ( Seed_mir.Eq, copy_place st (cur_place st pid), Seed_mir.Constant c ) ));
+        let ok_b = new_block st in
+        set_terminator_to st
+          (Seed_mir.SwitchInt (Seed_mir.Copy (cur_place st eq_id), [ (1L, ok_b) ], fail))
+          ok_b)
+    | Typed_pattern.TP_variant (nvid, nty, npats) -> (
+        (* a nested-variant payload `Some(Live)`: the payload position
+           must hold the nested variant — its discriminant must equal the
+           nested variant's tag; the nested payloads bind through the
+           nested Downcast (the checker's semantic tree) *)
+        let pid = fresh_local st nty in
+        emit st (Seed_mir.Assign (cur_place st pid, Seed_mir.Use (Seed_mir.Copy proj)));
+        let ok_b = new_block st in
+        discriminant_test (enum_name_of_ty env nty) (cur_place st pid) nvid nty ok_b fail;
+        (* continue the nested payload bindings in the success block *)
+        st.cur_block <- ok_b;
+        List.iteri (fun k np -> bind_payloads ?plan nvid (cur_place st pid) fail k np) npats)
+    | Typed_pattern.TP_struct (_, sty, sfields) -> (
+        (* a struct-payload `MirRvalue { kind: rvalue_kind }`: the
+           payload position holds the struct — the named fields bind
+           through [Downcast; ConstantIndex j; Field fid] (the semantic
+           FieldId through the typed registry) *)
+        List.iter (fun (fname, fp) -> bind_struct_field ?plan sty proj fail fname fp) sfields)
+    | Typed_pattern.TP_tuple (_, elems) -> (
+        (* a tuple payload `Some((a, b))`: each component binds through
+           the nested [Downcast; ConstantIndex j; ConstantIndex k]
+           projection *)
+        List.iteri
+          (fun k ep ->
+            match ep with
+            | Typed_pattern.TP_binding (name, fty, _) -> (
+                if not (copyable_ty fty) then
+                  seed_bug
+                    "non-Copy payload binding in a variant match arm is not supported by the seed VM (payload type %s)"
+                    (Seed_mir.print_type fty);
+                let id =
+                  match plan with Some p -> List.assoc name p | None -> fresh_local st fty
+                in
+                emit st
+                  (Seed_mir.Assign
+                     ( cur_place st id,
+                       Seed_mir.Use
+                         (Seed_mir.Copy
+                            { base with
+                              Seed_mir.projections =
+                                base.Seed_mir.projections
+                                @ [ Seed_mir.Downcast vid; Seed_mir.ConstantIndex j; Seed_mir.ConstantIndex k ]
+                            }) ));
+                (match plan with Some _ -> () | None -> st.scope <- (name, id) :: st.scope))
+            | Typed_pattern.TP_wildcard -> ()
+            | _ -> seed_bug "unsupported nested variant payload pattern in lowering")
+          elems)
+    | Typed_pattern.TP_range _ ->
+        seed_bug "range pattern payload in lowering"
+    | Typed_pattern.TP_or _ ->
+        seed_bug "or-pattern payload in lowering (the subset rejects or-pattern payloads)"
+  in
+  (* the ordered decision chain: each arm's SEMANTIC pattern is TESTED in
+     source order; a true test enters the arm's body, a false test
+     proceeds to the next arm's test, and the final fallthrough is the
+     deterministic non-exhaustive abort *)
+  List.iteri
+    (fun i tp ->
+      let then_b = arm_blocks.(i) in
+      let next_b = fail_b i in
+      match tp with
+      | Typed_pattern.TP_variant (vid, _, _) ->
+          discriminant_test (enum_name_of_ty env subj_ty) subject_place vid subj_ty then_b next_b
+      | Typed_pattern.TP_literal (c, _) -> subject_literal_test c then_b next_b
+      | Typed_pattern.TP_or (alts, _) -> (
+          (* the ordered alternative chain: each alternative tests; a
+             match enters the arm body with the common binding interface
+             bound by the matching alternative, a miss proceeds to the
+             NEXT alternative, and the last miss proceeds to the next
+             arm's test *)
+          let rec flatten acc = function
+            | [] -> List.rev acc
+            | Typed_pattern.TP_or (sub, _) :: rest -> flatten (flatten acc sub) rest
+            | alt :: rest -> flatten (alt :: acc) rest
+          in
+          let alts = flatten [] alts in
+          (* the COMMON binding interface: one SHARED local per interface
+             name, seeded in the scope before the alternatives — every
+             alternative's success path projects into the SAME local, so
+             the verifier's definite-init dataflow admits the body's read
+             (a per-alternative fresh local would leave the body reading
+             a possibly-uninitialized local) *)
+          let plan =
+            match alts with
+            | [] -> []
+            | first :: _ ->
+                let binding_ty name =
+                  match List.find_opt (fun (n, _, _) -> n = name) (Typed_pattern.bindings first) with
+                  | Some (_, ty, _) -> ty
+                  | None -> subj_ty
+                in
+                List.map
+                  (fun (name, _ty, _mut_) ->
+                    match first with
+                    | Typed_pattern.TP_binding (n, _, _) when n = name ->
+                        (* a whole-subject binding: the subject IS the
+                           binding (no copy — non-Copy subjects) *)
+                        (name, sid)
+                    | _ -> (name, fresh_local st (binding_ty name)))
+                  (Typed_pattern.bindings first)
+          in
+          List.iter (fun (name, id) -> st.scope <- (name, id) :: st.scope) plan;
+          let rec go_alts = function
+            | [] -> set_terminator_to st (Seed_mir.Goto next_b) next_b
+            | [ alt ] -> emit_alt_test alt next_b
+            | alt :: rest -> (
+                let next_alt_b = new_block st in
+                emit_alt_test alt next_alt_b;
+                (* emit_alt_test leaves the current block AT its else
+                   continuation — the next alternative's test block — so
+                   no push_block here (the continuation was already
+                   opened by the alternative's terminator) *)
+                go_alts rest)
+          and emit_alt_test alt else_b =
+            match alt with
+            | Typed_pattern.TP_variant (vid, _, pats) -> (
+                let ok_b = new_block st in
+                discriminant_test (enum_name_of_ty env subj_ty) subject_place vid subj_ty ok_b else_b;
+                (* continue the payload bindings in the success block *)
+                st.cur_block <- ok_b;
+                List.iteri (fun j p -> bind_payloads ~plan vid subject_place else_b j p) pats;
+                set_terminator_to st (Seed_mir.Goto then_b) else_b)
+            | Typed_pattern.TP_literal (c, _) -> (
+                let ok_b = new_block st in
+                subject_literal_test c ok_b else_b;
+                st.cur_block <- ok_b;
+                set_terminator_to st (Seed_mir.Goto then_b) else_b)
+            | Typed_pattern.TP_binding (name, _, _) -> (
+                (* the whole-subject binding is the plan's sid entry (or
+                   the name when the interface is a plain binding) *)
+                if not (List.mem_assoc name plan) then
+                  st.scope <- (name, sid) :: st.scope;
+                set_terminator_to st (Seed_mir.Goto then_b) else_b)
+            | Typed_pattern.TP_wildcard ->
+                set_terminator_to st (Seed_mir.Goto then_b) else_b
+            | Typed_pattern.TP_struct (_, sty, sfields) -> (
+                List.iter (fun (fname, fp) -> bind_struct_field ~plan sty subject_place else_b fname fp) sfields;
+                set_terminator_to st (Seed_mir.Goto then_b) else_b)
+            | Typed_pattern.TP_tuple (_, elems) -> (
+                List.iteri
+                  (fun k ep ->
+                    match ep with
+                    | Typed_pattern.TP_binding (name, fty, _) -> (
+                        if not (copyable_ty fty) then
+                          seed_bug
+                            "non-Copy element binding in an or-pattern alternative is not supported by the seed VM (element type %s)"
+                            (Seed_mir.print_type fty);
+                        let id =
+                          match List.assoc_opt name plan with
+                          | Some id -> id
+                          | None -> fresh_local st fty
+                        in
+                        emit st
+                          (Seed_mir.Assign
+                             ( cur_place st id,
+                               Seed_mir.Use
+                                 (Seed_mir.Copy
+                                    { Seed_mir.local = sid; projections = [ Seed_mir.ConstantIndex k ] }) ));
+                        if not (List.mem_assoc name plan) then
+                          st.scope <- (name, id) :: st.scope)
+                    | Typed_pattern.TP_wildcard -> ()
+                    | _ -> seed_bug "unsupported tuple or-pattern alternative sub-pattern in lowering")
+                  elems;
+                set_terminator_to st (Seed_mir.Goto then_b) else_b)
+            | Typed_pattern.TP_range _ ->
+                seed_bug "range pattern in an or-pattern alternative in lowering"
+            | Typed_pattern.TP_or _ ->
+                seed_bug "nested or-pattern alternative in lowering (the checker flattens)"
+          in
+          go_alts alts)
+      | Typed_pattern.TP_wildcard | Typed_pattern.TP_binding _ | Typed_pattern.TP_struct _
+      | Typed_pattern.TP_tuple _ ->
+          (* the catch-all test: enter the body directly (the field
+             equality checks inside the body route the failures to the
+             next arm's test) *)
+          set_terminator_to st (Seed_mir.Goto then_b) next_b
+      | Typed_pattern.TP_range _ ->
+          seed_bug "range match arms are not available in the seed lowering")
+    arm_tps;
+  (* the non-exhaustive abort: the current block is already the abort
+     block (the last test's continuation), so it closes directly *)
+  set_terminator st Seed_mir.Abort;
+  (* lower each arm body into its block *)
+  List.iteri
+    (fun i (a : Ast.match_arm) ->
+      let tp = List.nth arm_tps i in
+      push_block st arm_blocks.(i);
+      (match tp with
+       | Typed_pattern.TP_variant (vid, _, pats) ->
+           List.iteri (fun j p -> bind_payloads vid subject_place (fail_b i) j p) pats
+       | Typed_pattern.TP_struct (_, sty, sfields) -> (
+           (* a struct-pattern arm: for a STRUCT subject the fields bind
+              directly through the semantic FieldIds; a non-struct subject
+              is a checker/lowerer contradiction (the checker resolves
+              braced-variant patterns to TP_variant, never TP_struct) *)
+           if is_struct_subject subj_ty then
+             List.iter (fun (fname, fp) -> bind_struct_field sty subject_place (fail_b i) fname fp) sfields
+           else
+             seed_bug
+               "struct-pattern arm against a non-struct subject type %s in lowering"
+               (Seed_mir.print_type subj_ty))
+       | Typed_pattern.TP_binding (name, _, _) ->
+           (* a binding arm: the whole subject binds *)
+           st.scope <- (name, sid) :: st.scope
+       | Typed_pattern.TP_tuple (_, elems) -> (
+           (* a tuple arm: the elements bind through the ConstantIndex
+              projections; a nested-variant element checks the element
+              discriminant and binds the nested payload *)
+           List.iteri
+             (fun k ep ->
+               match ep with
+               | Typed_pattern.TP_binding (name, fty, _) -> (
+                   if not (copyable_ty fty) then
+                     seed_bug
+                       "non-Copy element binding in a tuple match arm is not supported by the seed VM (element type %s)"
+                       (Seed_mir.print_type fty);
+                   let id = fresh_local st fty in
+                   emit st
+                     (Seed_mir.Assign
+                        ( cur_place st id,
+                          Seed_mir.Use
+                            (Seed_mir.Copy
+                               { Seed_mir.local = sid; projections = [ Seed_mir.ConstantIndex k ] }) ));
+                   st.scope <- (name, id) :: st.scope)
+               | Typed_pattern.TP_variant (nvid, nty, npats) -> (
+                   let eid = fresh_local st nty in
+                   emit st
+                     (Seed_mir.Assign
+                        ( cur_place st eid,
+                          Seed_mir.Use
+                            (Seed_mir.Copy
+                               { Seed_mir.local = sid; projections = [ Seed_mir.ConstantIndex k ] }) ));
+                   let ok_b = new_block st in
+                   discriminant_test (enum_name_of_ty env nty) (cur_place st eid) nvid nty ok_b (fail_b i);
+                   st.cur_block <- ok_b;
+                   List.iteri (fun j np -> bind_payloads nvid (cur_place st eid) (fail_b i) j np) npats)
+               | Typed_pattern.TP_wildcard -> ()
+               | _ -> seed_bug "unsupported tuple arm sub-pattern in lowering")
+             elems)
+       | Typed_pattern.TP_wildcard | Typed_pattern.TP_literal _ | Typed_pattern.TP_or _ -> ()
+       | Typed_pattern.TP_range _ ->
+           seed_bug "range match arms are not available in the seed lowering");
+      let bval, bty = lower_expr env st a.Ast.ma_body in
+      ensure_result bty;
+      emit st (Seed_mir.Assign (cur_place st !result_id, Seed_mir.Use bval));
+      set_terminator st (Seed_mir.Goto join_b))
+    m.Ast.m_arms;
+  (* the join block stays open for the continuation: every arm body
+     branches to it, and the match result flows out through it *)
+  push_block st join_b;
+  match !result_ty with
+  | Some ty -> (copy_place st (cur_place st !result_id), ty)
+  | None -> (Seed_mir.Constant Seed_mir.Unit, Type_repr.Unit)
+
 and lower_while (env : func_env) (st : lower_state) (w : Ast.while_expr) :
     Seed_mir.operand * Type_repr.t =
   let head_b = new_block st in
@@ -2956,6 +3474,7 @@ and emit_defers (env : func_env) (st : lower_state) : unit =
 
 let lower_function_with_variants
     ?(typed_nodes : (Ids.Node_id.t * typed_node) list = [])
+    ?(typed_patterns : ((Ids.Node_id.t * int) * Typed_pattern.t) list = [])
     ?(param_tys_opt : Type_repr.t array option) (variants : variant_table)
     (env : func_env) (name : string)
     (callable : int) (template_args : Type_repr.t array)
@@ -2975,6 +3494,7 @@ let lower_function_with_variants
       variants;
       defer_stack = [];
       typed_nodes;
+      typed_patterns;
     }
   in
   (* local 0 = return slot *)

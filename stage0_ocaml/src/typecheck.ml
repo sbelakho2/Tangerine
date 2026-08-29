@@ -217,6 +217,12 @@ type env = {
      across the `{ env with ... }` record updates, so the final env the
      driver receives holds every accepted node's channel entry. *)
   typed_nodes : (Ids.Node_id.t, typed_node) Hashtbl.t;
+  (* the typed-pattern channel (re-audit P0 #3): (match NodeId, arm
+     index) -> the arm's SEMANTIC pattern tree, resolved ONCE by
+     check_pattern (the same mutable-table sharing as typed_nodes).  MIR
+     lowering consumes the semantic identities instead of re-interpreting
+     the syntactic Ast.pattern. *)
+  typed_patterns : (Ids.Node_id.t * int, Typed_pattern.t) Hashtbl.t;
 }
 
 type scope = {
@@ -1312,6 +1318,7 @@ let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
     resolved;
     module_path = [];
     typed_nodes = Hashtbl.create 256;
+    typed_patterns = Hashtbl.create 256;
   }
 
 (* ────────────────────────────────────────────────────────────────
@@ -2018,28 +2025,140 @@ let default_literal (ty : Type_repr.t) : Type_repr.t =
 
 
 
+(* The int kind a literal pattern adopts from the subject (the same
+   defaulting the lowerer's int_kind_of uses: an unsuffixed Int_literal
+   subject is Int). *)
+let pattern_int_kind_of (t : Type_repr.t) : Type_repr.int_kind =
+  match t with
+  | Type_repr.Int k -> k
+  | _ -> Type_repr.Int
+
+(* Convert a pattern's literal expr to the SEED constant (the semantic
+   form the lowerer tests against).  The int literal adopts the subject's
+   kind — the checker's unified type — exactly like the lowerer's
+   int_constant_of (int_kind_of subj_ty); the range itself is the
+   checker's existing authority (check_expr validates the literal), and
+   the magnitude crosses as unsigned 128-bit words so the full
+   i128/u128 domain is representable (no OCaml-int intermediate). *)
+let pattern_literal_constant (e : Ast.expr) (subject : Type_repr.t)
+    : (Seed_mir.constant, string) result =
+  let int_constant (lit : string) : (Seed_mir.constant, string) result =
+    match Literal.parse_integer ~span:Span.synthetic lit with
+    | Some p -> (
+        let kind =
+          match p.Literal.suffix with
+          | Literal.I8 -> Type_repr.I8 | Literal.I16 -> Type_repr.I16
+          | Literal.I32 -> Type_repr.I32 | Literal.I64 -> Type_repr.I64
+          | Literal.I128 -> Type_repr.I128
+          | Literal.U8 -> Type_repr.U8 | Literal.U16 -> Type_repr.U16
+          | Literal.U32 -> Type_repr.U32 | Literal.U64 -> Type_repr.U64
+          | Literal.U128 -> Type_repr.U128
+          | Literal.Int -> Type_repr.Int | Literal.UInt -> Type_repr.UInt
+          | Literal.No_int_suffix -> pattern_int_kind_of subject
+        in
+        if Big_nat.fits_unsigned p.Literal.magnitude 128 then begin
+          let lo, hi = Big_nat.to_words_128 p.Literal.magnitude in
+          Ok
+            (Seed_mir.Integer
+               (Int_value.of_words ~width:(int_width kind) ~signed:(int_signed kind)
+                  ~bits_lo:lo ~bits_hi:hi))
+        end
+        else Error (err (Ast.expr_span e) "integer literal pattern exceeds 128 bits"))
+    | None -> Error (err (Ast.expr_span e) "unparseable integer literal pattern")
+  in
+  match e with
+  | Ast.IntLit (_, lit, _) -> int_constant lit
+  | Ast.CharLit (_, c, _) -> (
+      let b = Bytes.of_string c in
+      match Utf8.decode_at b 0 with
+      | Ok (u, _) -> Ok (Seed_mir.Char u)
+      | Error _ -> Error (err (Ast.expr_span e) "invalid char literal pattern"))
+  | Ast.BoolLit (_, b, _) -> Ok (Seed_mir.Bool b)
+  | Ast.StringLit (_, s, _) -> Ok (Seed_mir.String s)
+  | Ast.FloatLit (_, lit, _) -> (
+      match float_of_string_opt lit with
+      | Some f -> Ok (Seed_mir.Float64 (Int64.bits_of_float f))
+      | None -> Error (err (Ast.expr_span e) "unparseable float literal pattern"))
+  | Ast.Unary (_, Ast.Neg, Ast.IntLit (_, lit, _), _) -> (
+      (* a negated integer pattern `-1` (the parse folds the sign) *)
+      match int_constant lit with
+      | Ok (Seed_mir.Integer v) -> Ok (Seed_mir.Integer (Int_value.neg v))
+      | Ok _ -> Error (err (Ast.expr_span e) "unparseable integer literal pattern")
+      | Error m -> Error m)
+  | _ -> Error (err (Ast.expr_span e) "literal patterns require a literal expression")
+
+(* The SEMANTIC variant identity of a nominal's variant at `index`: the
+   nominal's nom_variant_ids entry when parallel to nom_variants (the
+   resolver-minted identity the driver's user_variant_table carries),
+   else the deterministic 1-based minting (the no-resolver world's
+   canonical identity — the SAME fallback the driver's builtin registry
+   uses, so the lowered specs agree). *)
+let variant_id_of_nominal (nom : nominal) (index : int) : Ids.Variant_id.t =
+  if List.length nom.nom_variant_ids = List.length nom.nom_variants then
+    match List.nth_opt nom.nom_variant_ids index with
+    | Some vid -> vid
+    | None -> Ids.Variant_id.make (index + 1)
+  else Ids.Variant_id.make (index + 1)
+
+(* The SEMANTIC resolution of a bare identifier pattern (the audit's
+   "bare identifiers are not semantically resolved as patterns"
+   finding): a name that names a known NULLARY VARIANT of the subject's
+   enum is a variant pattern — it must dispatch on the tag, never bind
+   as a catch-all.  The subject's enum nominal is the authority (the
+   name must be one of ITS variants with an empty payload), and the id
+   is the nominal's semantic identity. *)
+let nullary_variant_of_subject (env : env) (subject : Type_repr.t) (name : string) :
+    Ids.Variant_id.t option =
+  match subject with
+  | Type_repr.Named (tid, _) -> (
+      match List.assoc_opt tid env.type_names with
+      | Some ename -> (
+          match List.assoc_opt ename env.nominals with
+          | Some nom when nom.nom_kind = `Enum -> (
+              let rec find i = function
+                | [] -> None
+                | (vname, pty) :: rest ->
+                    if vname = name then
+                      if Array.length pty = 0 then Some (variant_id_of_nominal nom i)
+                      else None
+                    else find (i + 1) rest
+              in
+              find 0 nom.nom_variants)
+          | _ -> None)
+      | None -> None)
+  | _ -> None
+
 let rec check_pattern (env : env) (scope : scope) (ty : Type_repr.t) (p : Ast.pattern) :
-    ((string * Type_repr.t * bool) list, string) result =
+    (Typed_pattern.t * (string * Type_repr.t * bool) list, string) result =
   match p with
-  | Ast.Wildcard _ -> Ok []
-  | Ast.PatIdent (name, mut_, _) -> Ok [ (name, ty, mut_) ]
-  | Ast.RefPattern (name, _) -> Ok [ (name, ty, false) ]
-  | Ast.RefMutPattern (name, _) -> Ok [ (name, ty, true) ]
+  | Ast.Wildcard _ -> Ok (Typed_pattern.TP_wildcard, [])
+  | Ast.PatIdent (name, mut_, _) -> (
+      match nullary_variant_of_subject env ty name with
+      | Some vid ->
+          (* the name is a KNOWN NULLARY VARIANT of the subject enum:
+             the arm dispatches on the tag (the semantic fix) *)
+          Ok (Typed_pattern.TP_variant (vid, ty, []), [])
+      | None -> Ok (Typed_pattern.TP_binding (name, ty, mut_), [ (name, ty, mut_) ]))
+  | Ast.RefPattern (name, _) -> Ok (Typed_pattern.TP_binding (name, ty, false), [ (name, ty, false) ])
+  | Ast.RefMutPattern (name, _) -> Ok (Typed_pattern.TP_binding (name, ty, true), [ (name, ty, true) ])
   | Ast.PatLiteral (e, _) -> (
       match check_expr env scope None e with
       | Ok te -> (
           match unify env.state.box_tid (ref []) ty te.te_type with
-          | Ok () -> Ok []
           | Error m ->
               Error
                 (err (Ast.expr_span e)
                    (Printf.sprintf "pattern type mismatch: expected %s, found %s (%s)"
-                      (type_to_string ty) (type_to_string te.te_type) m)))
+                      (type_to_string ty) (type_to_string te.te_type) m))
+          | Ok () -> (
+              match pattern_literal_constant e ty with
+              | Error m -> Error m
+              | Ok c -> Ok (Typed_pattern.TP_literal (c, ty), [])))
       | Error m -> Error m)
   | Ast.PatVariant (seg1, seg2, pats, span) -> (
       match resolve_variant env scope span seg1 seg2 ty with
       | Error m -> Error m
-      | Ok (field_tys, _) ->
+      | Ok (field_tys, _, vid) ->
           if List.length pats <> Array.length field_tys then
             Error
               (err span
@@ -2050,10 +2169,14 @@ let rec check_pattern (env : env) (scope : scope) (ty : Type_repr.t) (p : Ast.pa
               | [] -> Ok (List.rev acc)
               | (ft, sub) :: rest -> (
                   match check_pattern env scope ft sub with
-                  | Ok binds -> go (binds @ acc) rest
+                  | Ok (tp, binds) -> go ((tp, binds) :: acc) rest
                   | Error m -> Error m)
             in
-            go [] (List.combine (Array.to_list field_tys) pats)
+            match go [] (List.combine (Array.to_list field_tys) pats) with
+            | Error m -> Error m
+            | Ok subs ->
+                let tps, binds = List.split subs in
+                Ok (Typed_pattern.TP_variant (vid, ty, tps), List.concat binds)
           end)
   | Ast.StructPattern (name, fields, span) -> (
       match resolve_nominal env span name with
@@ -2077,22 +2200,27 @@ let rec check_pattern (env : env) (scope : scope) (ty : Type_repr.t) (p : Ast.pa
             | None ->
                 Error (err span (Printf.sprintf "unknown field `%s` of struct `%s`" fname name))
           in
-          let rec go acc = function
-            | [] -> Ok (List.rev acc)
+          let rec go acc_binds acc_fields = function
+            | [] -> Ok (List.rev acc_fields, List.concat (List.rev acc_binds))
             | (fname, sub) :: rest -> (
                 match field_ty fname with
                 | Error m -> Error m
                 | Ok ft -> (
                     let sub = match sub with Some s -> s | None -> Ast.PatIdent (fname, false, span) in
                     match check_pattern env scope ft sub with
-                    | Ok binds -> go (binds @ acc) rest
+                    | Ok (tp, binds) -> go (binds :: acc_binds) ((fname, tp) :: acc_fields) rest
                     | Error m -> Error m))
           in
-          go [] fields)
+          (match go [] [] fields with
+           | Error m -> Error m
+           | Ok (tps, binds) -> Ok (Typed_pattern.TP_struct (tid, ty, tps), binds)))
       | Ok (nom, _, args) when nom.nom_kind = `Enum -> (
           (* the braced-variant pattern: `Enum::Variant { f1, .. }` —
              the split's member is the variant; the pattern's fields bind
-             the variant's payload types positionally *)
+             the variant's payload types positionally (the checker's
+             positional view — semantically the pattern IS a variant
+             pattern with a positional payload, so the semantic tree
+             records TP_variant with the variant's identity) *)
           let len = String.length name in
           let rec last_pair i =
             if i <= 0 then None
@@ -2105,6 +2233,10 @@ let rec check_pattern (env : env) (scope : scope) (ty : Type_repr.t) (p : Ast.pa
             | _ -> name
           in
           let subst = List.map2 (fun (_, p) a -> (Type_repr.KParam p, a)) nom.nom_params (Array.to_list args) in
+          let rec find_variant idx = function
+            | [] -> None
+            | (vname, _) :: rest -> if vname = member then Some idx else find_variant (idx + 1) rest
+          in
           match List.assoc_opt member nom.nom_variants with
           | None -> Error (err span (Printf.sprintf "unknown variant `%s` of enum `%s`" member name))
           | Some pty -> (
@@ -2113,15 +2245,18 @@ let rec check_pattern (env : env) (scope : scope) (ty : Type_repr.t) (p : Ast.pa
                 Error (err span (Printf.sprintf "variant `%s` expects %d field(s), pattern has %d" member
                           (Array.length payload) (List.length fields)))
               else begin
-                let rec go acc i = function
-                  | [] -> Ok (List.rev acc)
+                let vid = variant_id_of_nominal nom (match find_variant 0 nom.nom_variants with Some i -> i | None -> 0) in
+                let rec go acc_binds acc_tps i = function
+                  | [] -> Ok (List.rev acc_tps, List.concat (List.rev acc_binds))
                   | (fname, sub) :: rest -> (
                       let sub = match sub with Some s -> s | None -> Ast.PatIdent (fname, false, span) in
                       match check_pattern env scope payload.(i) sub with
-                      | Ok binds -> go (binds @ acc) (i + 1) rest
+                      | Ok (tp, binds) -> go (binds :: acc_binds) (tp :: acc_tps) (i + 1) rest
                       | Error m -> Error m)
                 in
-                go [] 0 fields
+                match go [] [] 0 fields with
+                | Error m -> Error m
+                | Ok (tps, binds) -> Ok (Typed_pattern.TP_variant (vid, ty, tps), binds)
               end))
       | Ok _ -> Error (err span (Printf.sprintf "`%s` is not a struct" name)))
   | Ast.PatTuple (pats, span) -> (
@@ -2129,64 +2264,94 @@ let rec check_pattern (env : env) (scope : scope) (ty : Type_repr.t) (p : Ast.pa
       | Type_repr.Tuple elems ->
           if List.length pats <> Array.length elems then Error (err span "tuple pattern arity mismatch")
           else begin
-            let rec go acc = function
-              | [] -> Ok (List.rev acc)
+            let rec go acc_binds acc_tps = function
+              | [] -> Ok (List.rev acc_tps, List.concat (List.rev acc_binds))
               | (ft, sub) :: rest -> (
                   match check_pattern env scope ft sub with
-                  | Ok binds -> go (binds @ acc) rest
+                  | Ok (tp, binds) -> go (binds :: acc_binds) (tp :: acc_tps) rest
                   | Error m -> Error m)
             in
-            go [] (List.combine (Array.to_list elems) pats)
+            match go [] [] (List.combine (Array.to_list elems) pats) with
+            | Error m -> Error m
+            | Ok (tps, binds) -> Ok (Typed_pattern.TP_tuple (ty, tps), binds)
           end
-      | Type_repr.Unit when pats = [] -> Ok []
+      | Type_repr.Unit when pats = [] -> Ok (Typed_pattern.TP_tuple (ty, []), [])
       | _ -> Error (err span "tuple pattern requires a tuple type"))
   | Ast.OrPattern (a, b, span) -> (
-      match check_pattern env scope ty a with
-      | Error m -> Error m
-      | Ok binds_a -> (
-          match check_pattern env scope ty b with
-          | Error m -> Error m
-          | Ok binds_b -> (
-              (* a name bound in BOTH alternatives must carry the same
-                 type in each; a name bound in only one alternative is
-                 scoped to that alternative (the kernel's bare-variant
-                 or-patterns — `when F32x4 | F64x2 then 128` — bind
-                 disjoint names per arm and rely on this) *)
-              let mismatch =
-                List.exists
-                  (fun (n, t, _) ->
-                    match List.find_opt (fun (k, _, _) -> k = n) binds_b with
-                    | Some (_, t2, _) -> Type_repr.compare t t2 <> 0
-                    | None -> false)
-                  binds_a
-              in
-              if mismatch then Error (err span "or-pattern alternatives bind different types")
-              else
-                (* the arm's bindings are the UNION of the alternatives'
-                   bindings: a name bound in only one alternative is
-                   scoped to the whole arm when that alternative matched
-                   (the kernel's `FnPtr(..) | Closure(.., ret, ..)`
-                   or-patterns rely on the second alternative's `ret`) *)
-                let extra =
-                  List.filter
-                    (fun (k, _, _) -> not (List.exists (fun (n, _, _) -> n = k) binds_a))
-                    binds_b
-                in
-                Ok (extra @ binds_a))))
+      match check_pattern env scope ty a, check_pattern env scope ty b with
+      | Error m, _ | _, Error m -> Error m
+      | Ok (ta, binds_a), Ok (tb, binds_b) -> (
+          (* the COMMON BINDING INTERFACE (the audit's exact requirement):
+             both alternatives must bind the SAME names with the same
+             mutability and compatible types — `A(x) | B(y)` is REJECTED
+             (an or-arm can bind one set of names soundly; disjoint names
+             would leave half the interface unbound when the other
+             alternative matched) *)
+          let names_a = Typed_pattern.interface_names ta in
+          let names_b = Typed_pattern.interface_names tb in
+          if names_a <> names_b then
+            Error
+              (err span
+                 "or-pattern alternatives bind different names (an or-pattern requires the same binding names in every alternative — `A(x) | B(y)` is rejected)")
+          else begin
+            let rec check_binds = function
+              | [] -> Ok ()
+              | (n, t, m) :: rest -> (
+                  match List.find_opt (fun (k, _, _) -> k = n) binds_b with
+                  | None ->
+                      Error
+                        (err span
+                           (Printf.sprintf "or-pattern binding `%s` is not bound by the other alternative" n))
+                  | Some (_, t2, m2) -> (
+                      if m <> m2 then
+                        Error
+                          (err span
+                             (Printf.sprintf "or-pattern binding `%s` has different mutability between alternatives" n))
+                      else begin
+                        let subst = ref [] in
+                        match unify env.state.box_tid subst t t2 with
+                        | Ok () -> check_binds rest
+                        | Error e ->
+                            Error
+                              (err span
+                                 (Printf.sprintf "or-pattern binding `%s` has incompatible types (%s vs %s: %s)"
+                                    n (type_to_string t) (type_to_string t2) e))
+                      end))
+            in
+            match check_binds binds_a with
+            | Error m -> Error m
+            | Ok () ->
+                Ok
+                  ( Typed_pattern.TP_or ([ ta; tb ], Typed_pattern.binding_names ta),
+                    binds_a )
+          end))
   | Ast.RangePattern (a, b, span) -> (
       match a, b with
       | Ast.PatLiteral (ae, _), Ast.PatLiteral (be, _) -> (
           match check_expr env scope None ae, check_expr env scope None be with
           | Ok ta, Ok tb -> (
               match unify env.state.box_tid (ref []) ty ta.te_type, unify env.state.box_tid (ref []) ty tb.te_type with
-              | Ok (), Ok () -> Ok []
+              | Ok (), Ok () -> (
+                  match pattern_literal_constant ae ty, pattern_literal_constant be ty with
+                  | Ok ca, Ok cb -> Ok (Typed_pattern.TP_range (ty, ca, cb, false), [])
+                  | Error m, _ | _, Error m -> Error m)
               | _ -> Error (err span "range pattern does not match the subject type"))
           | _ -> Error (err span "range pattern endpoints must be literals"))
       | _ -> Error (err span "range pattern endpoints must be literals"))
 
 and resolve_variant (env : env) (_scope : scope) (span : Span.span) (seg1 : string)
-    (seg2 : string) (subject : Type_repr.t) : (Type_repr.t array * string, string) result =
-
+    (seg2 : string) (subject : Type_repr.t) :
+    (Type_repr.t array * string * Ids.Variant_id.t, string) result =
+  (* the variant's SEMANTIC identity (nom_variant_ids at the variant's
+     position — the SAME identity the driver's user_variant_table and
+     the lowering's variant specs carry) *)
+  let find_variant nom vname =
+    let rec find i = function
+      | [] -> None
+      | (n, _) :: rest -> if n = vname then Some i else find (i + 1) rest
+    in
+    find 0 nom.nom_variants
+  in
   if seg1 = "" then begin
     match subject with
     | Type_repr.Named (tid, args) -> (
@@ -2197,7 +2362,12 @@ and resolve_variant (env : env) (_scope : scope) (span : Span.span) (seg1 : stri
                 match List.assoc_opt seg2 nom.nom_variants with
                 | Some field_tys ->
                     let subst = List.map2 (fun (_, p) a -> (Type_repr.KParam p, a)) nom.nom_params (Array.to_list args) in
-                    Ok (Array.map (substitute_fixpoint subst) field_tys, name)
+                    let vid =
+                      match find_variant nom seg2 with
+                      | Some i -> variant_id_of_nominal nom i
+                      | None -> Ids.Variant_id.make 1
+                    in
+                    Ok (Array.map (substitute_fixpoint subst) field_tys, name, vid)
                 | None ->
                     env.state.oracle.o_unknown_variants <- env.state.oracle.o_unknown_variants + 1;
                     Error (err span (Printf.sprintf "unknown variant `%s` of enum `%s`" seg2 name)))
@@ -2225,7 +2395,12 @@ and resolve_variant (env : env) (_scope : scope) (span : Span.span) (seg1 : stri
               | _ -> args
             in
             let subst = List.map2 (fun (_, p) a -> (Type_repr.KParam p, a)) nom.nom_params (Array.to_list sargs) in
-            Ok (Array.map (substitute_fixpoint subst) field_tys, seg1)
+            let vid =
+              match find_variant nom seg2 with
+              | Some i -> variant_id_of_nominal nom i
+              | None -> Ids.Variant_id.make 1
+            in
+            Ok (Array.map (substitute_fixpoint subst) field_tys, seg1, vid)
         | None ->
             env.state.oracle.o_unknown_variants <- env.state.oracle.o_unknown_variants + 1;
             Error (err span (Printf.sprintf "unknown variant `%s` of enum `%s`" seg2 seg1)))
@@ -2739,7 +2914,7 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
               te_effects = Array.append ta.te_effects tb.te_effects;
               te_span = span;
             }))
-  | Ast.MatchExpr (_, m) -> check_match env scope expected m
+  | Ast.MatchExpr (nid, m) -> check_match env scope expected nid m
   | Ast.Cast (_, inner, ty, span) -> (
       match check_expr env scope None inner with
       | Error m -> Error m
@@ -3107,7 +3282,7 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
           | Some et -> (
               match check_pattern env scope et f.Ast.for_pattern with
               | Error m -> Error m
-              | Ok binds ->
+              | Ok (_, binds) ->
                   let scope = add_binds scope binds in
                   check_block env { scope with loop_depth = scope.loop_depth + 1 }
                     None f.Ast.for_body f.Ast.for_span)))
@@ -3183,7 +3358,7 @@ and check_stmt (env : env) (scope : scope) (s : Ast.stmt) : (scope, string) resu
           | Ok te -> (
               match check_pattern env scope (default_literal te.te_type) pat with
               | Error m -> Error m
-              | Ok binds ->
+              | Ok (_, binds) ->
                   Ok (add_binds scope (List.map (fun (n, t, _) -> (n, t, mut_)) binds))))
       | Some tye -> (
           match resolve_type env scope tye with
@@ -3204,7 +3379,7 @@ and check_stmt (env : env) (scope : scope) (s : Ast.stmt) : (scope, string) resu
                   in
                   match check_pattern env scope (substitute_fixpoint !subst ty) pat with
                   | Error m -> Error m
-                  | Ok binds ->
+                  | Ok (_, binds) ->
                       Ok (add_binds scope (List.map (fun (n, t, _) -> (n, t, mut_)) binds))))))
   | Ast.ExprStmt (e, _) -> (
       match check_expr env scope None e with
@@ -3291,7 +3466,7 @@ and check_if (env : env) (scope : scope) (expected : Type_repr.t option) (i : As
             | Ok te -> (
                 match check_pattern env scope te.te_type pat with
                 | Error m -> Error m
-                | Ok binds ->
+                | Ok (_, binds) ->
                     Ok (Array.append te.te_effects (Array.of_list (List.map (fun _ -> Access_effect.Read) binds))))))
   in
   let then_scope =
@@ -3303,7 +3478,7 @@ and check_if (env : env) (scope : scope) (expected : Type_repr.t option) (i : As
             match check_expr env scope None v with
             | Ok te -> (
                 match check_pattern env scope te.te_type pat with
-                | Ok binds -> add_binds scope binds
+                | Ok (_, binds) -> add_binds scope binds
                 | Error _ -> scope)
             | Error _ -> scope)
         | None -> scope)
@@ -3369,16 +3544,20 @@ and check_if (env : env) (scope : scope) (expected : Type_repr.t option) (i : As
           in
           Ok { te_type = if_ty; te_effects = all_effects; te_span = i.Ast.if_span }))
 
-and check_match (env : env) (scope : scope) (expected : Type_repr.t option) (m : Ast.match_expr) :
-    (typed_expr, string) result =
+and check_match (env : env) (scope : scope) (expected : Type_repr.t option) (nid : Ids.Node_id.t)
+    (m : Ast.match_expr) : (typed_expr, string) result =
   let* subject = check_expr env scope None m.Ast.m_subject in
   let* arms =
-    let rec go acc = function
+    let rec go idx acc = function
       | [] -> Ok (List.rev acc)
       | (arm : Ast.match_arm) :: rest -> (
           match check_pattern env scope subject.te_type arm.Ast.ma_pattern with
           | Error m -> Error m
-          | Ok binds -> (
+          | Ok (tp, binds) -> (
+              (* the arm's semantic pattern tree on the typed-pattern
+                 channel (keyed by the match's node id + the arm index —
+                 the match_arm record carries no node id of its own) *)
+              Hashtbl.replace env.typed_patterns (nid, idx) tp;
               let arm_scope = add_binds scope binds in
               let* () =
                 match arm.Ast.ma_guard with
@@ -3406,10 +3585,10 @@ and check_match (env : env) (scope : scope) (expected : Type_repr.t option) (m :
               | Ok te -> (
                   let subst = ref [] in
                   match acc with
-                  | [] -> go (te :: acc) rest
+                  | [] -> go (idx + 1) (te :: acc) rest
                   | first :: _ -> (
                       match unify env.state.box_tid subst first.te_type te.te_type with
-                      | Ok () -> go (te :: acc) rest
+                      | Ok () -> go (idx + 1) (te :: acc) rest
                       | Error m ->
                           (* arm incompatibility is a real semantic failure:
                              return_unify_err is a pure constructor — the
@@ -3417,7 +3596,7 @@ and check_match (env : env) (scope : scope) (expected : Type_repr.t option) (m :
                              was false; the arm must fail *)
                           Error m))))
     in
-    go [] m.Ast.m_arms
+    go 0 [] m.Ast.m_arms
   in
   let ty =
     match arms with

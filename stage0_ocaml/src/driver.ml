@@ -355,6 +355,15 @@ let typed_nodes_of (env : Typecheck.env) : (Ids.Node_id.t * Mir_lower.typed_node
       :: acc)
     env.Typecheck.typed_nodes []
 
+(* The typed-pattern channel (re-audit P0 #3): (match NodeId, arm index)
+   -> the arm's SEMANTIC pattern tree, resolved ONCE by the typechecker.
+   The lowerer consumes the semantic identities (VariantId, binding
+   names/types, constants, field names) instead of re-interpreting the
+   syntactic Ast.pattern. *)
+let typed_patterns_of (env : Typecheck.env) :
+    ((Ids.Node_id.t * int) * Typed_pattern.t) list =
+  Hashtbl.fold (fun key tp acc -> (key, tp) :: acc) env.Typecheck.typed_patterns []
+
 let lowering_env_of ?(items : Ast.item list = []) (env : Typecheck.env) : Mir_lower.func_env =
   (* both the qualified key and the bare name resolve (flat namespace) *)
   let bare_keys (n : string) : string list =
@@ -664,6 +673,7 @@ let lower_and_report (path : string) (env : Typecheck.env) (program : Ast.progra
           | None -> [||]
         in
         Mir_lower.lower_function_with_variants ~typed_nodes:(typed_nodes_of env)
+                    ~typed_patterns:(typed_patterns_of env)
           (user_variant_table env)
           { base with Mir_lower.fn_ret }
           d.Ast.fn_sig.Ast.sig_name callable template_args conventions d)
@@ -787,6 +797,7 @@ let cmd_interpret (args : string list) : int =
                       | None -> (Type_repr.Unit, i)
                     in
                     Mir_lower.lower_function_with_variants ~typed_nodes:(typed_nodes_of env)
+                    ~typed_patterns:(typed_patterns_of env)
                       (user_variant_table env)
                       { base with Mir_lower.fn_ret }
                       d.Ast.fn_sig.Ast.sig_name callable [||] [||] d)
@@ -1526,6 +1537,7 @@ let lower_closure (ctx : closure_ctx) : Seed_mir.program =
           in
           let f =
             Mir_lower.lower_function_with_variants ~typed_nodes:(typed_nodes_of ctx.ctx_env)
+                    ~typed_patterns:(typed_patterns_of ctx.ctx_env)
               variants
               { base with Mir_lower.fn_ret }
               fd.Ast.fn_sig.Ast.sig_name callable [||] [||] fd
@@ -1549,6 +1561,7 @@ let lower_closure (ctx : closure_ctx) : Seed_mir.program =
                       let f =
                         Mir_lower.lower_function_with_variants
                           ~typed_nodes:(typed_nodes_of ctx.ctx_env)
+                          ~typed_patterns:(typed_patterns_of ctx.ctx_env)
                           variants
                           { base with Mir_lower.fn_ret = ts.Typecheck.ts_return }
                           m.Ast.fn_sig.Ast.sig_name
@@ -1580,6 +1593,7 @@ let lower_closure (ctx : closure_ctx) : Seed_mir.program =
     (fun (qname, ts, fd : string * Typecheck.typed_signature * Ast.function_decl) ->
       let f =
         Mir_lower.lower_function_with_variants ~typed_nodes:(typed_nodes_of ctx.ctx_env)
+                    ~typed_patterns:(typed_patterns_of ctx.ctx_env)
           variants
           { base with Mir_lower.fn_ret = ts.Typecheck.ts_return }
           qname
