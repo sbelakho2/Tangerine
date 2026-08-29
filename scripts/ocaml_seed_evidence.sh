@@ -317,6 +317,36 @@ diag_path = record_file[:-5] + ".diagnostics.jsonl"
 with open(diag_path, "w") as f:
     f.write(diag_content)
 
+# the typed-profile artifact (the audit's item 15): the per-finding
+# JSONL written by the driver next to the diagnostics file, hashed,
+# with the exact count enforced against the EVIDENCE_PROFILE total.
+profile_findings = []
+driver_profile_path = os.path.join(work_dir, "diagnostics.typedprofile.jsonl")
+profile_path = record_file[:-5] + ".typedprofile.jsonl"
+if os.path.exists(driver_profile_path):
+    with open(driver_profile_path) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                profile_findings.append(json.loads(line))
+    profile_findings.sort(
+        key=lambda d: json.dumps(d, sort_keys=True, separators=(",", ":")))
+    profile_content = "\n".join(
+        json.dumps(d, sort_keys=True, separators=(",", ":")) for d in profile_findings)
+    if profile_content:
+        profile_content += "\n"
+    with open(profile_path, "w") as f:
+        f.write(profile_content)
+    typed_profile["findings_artifact"] = os.path.basename(profile_path)
+    typed_profile["findings_sha256"] = hashlib.sha256(profile_content.encode()).hexdigest()
+if typed_profile["total_findings"] is not None:
+    if len(profile_findings) != typed_profile["total_findings"]:
+        sys.stderr.write(
+            "ocaml_seed_evidence: FAIL — typed-profile mismatch: the JSONL has %d findings, "
+            "bootstrap-check reports %d; the evidence record is NOT written\n"
+            % (len(profile_findings), typed_profile["total_findings"]))
+        sys.exit(1)
+
 diag_count = len(diagnostics)
 primary_count = sum(1 for d in diagnostics if not d["is_secondary"])
 secondary_count = sum(1 for d in diagnostics if d["is_secondary"])
