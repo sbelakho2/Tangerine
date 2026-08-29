@@ -427,7 +427,7 @@ end
                 if errs <> [] then failwith ("mat typecheck errors: " ^ String.concat "; " errs)
                 else begin
                   let tys = Driver.closure_types env_m in
-                  let sts = Driver.closure_statics env_m in
+                  let sts = Driver.closure_statics env_m mat_prog.Ast.items in
                   let struct_ok =
                     Array.exists
                       (fun d ->

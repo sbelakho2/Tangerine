@@ -58,6 +58,8 @@ type typed_signature = {
   ts_span : Span.span;
 }
 
+type expr_use = Value | Discarded
+
 type nominal = {
   nom_kind : [ `Struct | `Enum ];
   nom_params : (string * Ids.Generic_param_id.t) list;
@@ -1469,12 +1471,12 @@ let rec unify (box_tid : Ids.Type_id.t option) (subst : (Type_repr.generic_key *
           (Printf.sprintf "integer literal does not fit its adopted type %s"
              (int_name_of_kind k))
   | Type_repr.Int_literal _, Type_repr.Int_literal _ -> Ok ()
-  | Type_repr.Int _, Type_repr.Int _ ->
-      (* the native's int-kind adaptation: any integer kind unifies
-         with any other at the value level (the codegen's i32 offset
-         params take default-Int returns; u32 adapts to i32, Int to
-         u8, ...) — the value bit-adapts to the parameter's width *)
-      Ok ()
+  | Type_repr.Int k1, Type_repr.Int k2 ->
+      (* STRICT (the native model): integer kinds unify only when
+         identical — the IntLiteral adoption above is the only kind
+         adaptation in fundamental equality (the audit: ordinary Int
+         must not silently satisfy a u8 declaration) *)
+      if k1 = k2 then Ok () else Error "integer kind mismatch"
   | Type_repr.Named (id, [| t |]), u when is_box box_tid id -> unify box_tid subst t u
   | u, Type_repr.Named (id, [| t |]) when is_box box_tid id -> unify box_tid subst u t
   | Type_repr.Infer_var v, _ ->
@@ -1524,22 +1526,18 @@ let rec unify (box_tid : Ids.Type_id.t option) (subst : (Type_repr.generic_key *
         go 0
       end
   | Type_repr.Tuple a1, Type_repr.Tuple b1 ->
-      (* the native's tuple compatibility: arity and element divergences
-         are accepted at the value level (the codegen's
-         dispatch_methods ctx table is Map[String, (String, Int)] while
-         the MirProgram's is Map[String, (DefId, String, Int)] — the
-         value bit-copies the prefix the reader consumes), but the
-         common prefix still SOLVES inference variables (a fresh Vec
-         element var unifies with the pushed tuple shape) *)
-      let n = min (Array.length a1) (Array.length b1) in
-      let rec go i =
-        if i >= n then Ok ()
-        else
-          match unify box_tid subst a1.(i) b1.(i) with
-          | Ok () -> go (i + 1)
-          | Error _ -> go (i + 1)
-      in
-      go 0
+      (* STRICT (the native model): tuples unify only with the SAME
+         arity and every corresponding element (the audit: global
+         tuple prefix compatibility is not bootstrap simplification —
+         it changes the language's type system) *)
+      if Array.length a1 <> Array.length b1 then Error "tuple arity mismatch"
+      else begin
+        let rec go i =
+          if i >= Array.length a1 then Ok ()
+          else match unify box_tid subst a1.(i) b1.(i) with Ok () -> go (i + 1) | Error m -> Error m
+        in
+        go 0
+      end
   | Type_repr.Fixed_array (t1, n1), Type_repr.Fixed_array (t2, n2) ->
       if n1 <> n2 then Error "array length mismatch" else unify box_tid subst t1 t2
   | Type_repr.Ref_internal (m1, t1), Type_repr.Ref_internal (m2, t2) ->
@@ -1558,11 +1556,11 @@ let rec unify (box_tid : Ids.Type_id.t option) (subst : (Type_repr.generic_key *
   | Type_repr.Ref_internal (_, t1), Type_repr.Named (id2, [| t2 |])
     when Ids.Type_id.compare id2 b_ptr = 0 || Ids.Type_id.compare id2 b_ptrmut = 0 ->
       unify box_tid subst t1 t2
-  (* the deref coercion: an explicit reference unifies with its pointee
-     at the value level (the native accepts `Option::Some(&x)` against
-     Option[T] — the borrow is a read-only view of the same value) *)
-  | Type_repr.Ref_internal (_, t1), t2 -> unify box_tid subst t1 t2
-  | t1, Type_repr.Ref_internal (_, t2) -> unify box_tid subst t1 t2
+  (* STRICT (the native model): a reference and a value are NOT
+     interchangeable in fundamental equality — RefInternal unifies only
+     with RefInternal over equal mutability (the audit: &T == T must
+     not become a global rule); source-level auto-borrow/deref is a
+     CALL-BOUNDARY adaptation, handled in the call-arg reconciliation *)
   | Type_repr.Function (p1, r1), Type_repr.Function (p2, r2) ->
       if Array.length p1 <> Array.length p2 then Error "function arity mismatch"
       else begin
@@ -2349,21 +2347,7 @@ let rec check_pattern (env : env) (scope : scope) (ty : Type_repr.t) (p : Ast.pa
             | Ok (tps, binds) -> Ok (Typed_pattern.TP_tuple (ty, tps), binds)
           end
       | Type_repr.Unit when pats = [] -> Ok (Typed_pattern.TP_tuple (ty, []), [])
-      | _ ->
-          (* the native accepts a tuple pattern against ANY subject:
-             the bindings adopt the subject's type (the kernel's
-             `for (pid, pset) in pm` iterates a Set[String] with a
-             tuple pattern — the bindings carry the element type) *)
-          let rec go acc_binds acc_tps = function
-            | [] -> Ok (List.rev acc_tps, List.concat (List.rev acc_binds))
-            | sub :: rest -> (
-                match check_pattern env scope ty sub with
-                | Ok (tp, binds) -> go (binds :: acc_binds) (tp :: acc_tps) rest
-                | Error m -> Error m)
-          in
-          (match go [] [] pats with
-           | Error m -> Error m
-           | Ok (tps, binds) -> Ok (Typed_pattern.TP_tuple (ty, tps), binds)))
+      | _ -> Error (err span "tuple pattern requires a tuple type"))
   | Ast.OrPattern (a, b, span) -> (
       match check_pattern env scope ty a, check_pattern env scope ty b with
       | Error m, _ | _, Error m -> Error m
@@ -2586,48 +2570,13 @@ and unify_expected (env : env) (actual : Type_repr.t) (expected : Type_repr.t)
               (n = "Vec" && m = "Array") || (n = "Array" && m = "Vec") || n = m
           | _ -> false
         in
-        (* the name-based rule, with the native's SHARED-VARIANT
-           fallback: enum values unify across nominals when they share
-           the variants (the kernel pushes AccessProjection::Field(...)
-           — an enum value with variant Field(FieldId, String) — into a
-           Vec[TypedPlaceProj] whose Field(FieldId, String) matches:
-           the value's variant identity is the tag the consumer reads).
-           The rule is symmetric: the SMALLER variant set must be
-           covered by the larger one. *)
-        let shared_variant () =
-          match n1, n2 with
-          | Some na, Some nb -> (
-              match List.assoc_opt na env.nominals, List.assoc_opt nb env.nominals with
-              | Some nom_a, Some nom_b
-                when nom_a.nom_kind = `Enum && nom_b.nom_kind = `Enum
-                     && Array.length a1 = Array.length a2 -> (
-                  let variants_of nom = List.map fst nom.nom_variants in
-                  let va = variants_of nom_a in
-                  let vb = variants_of nom_b in
-                  let shared =
-                    List.exists (fun vname -> List.mem vname vb) va
-                  in
-                  if not shared then None
-                  else begin
-                    let s6 = ref [] in
-                    let rec go i =
-                      if i >= Array.length a1 then Some ()
-                      else
-                        match same_named a1.(i) a2.(i) with
-                        | Some () -> go (i + 1)
-                        | None -> None
-                    in
-                    match go 0 with
-                    | Some () ->
-                        merge s s6;
-                        Some ()
-                    | None -> None
-                  end)
-              | _ -> None)
-          | _ -> None
-        in
-        if not alias_pair || Array.length a1 <> Array.length a2 then
-          match shared_variant () with Some () -> Some () | None -> None
+        (* STRICT (the native model): nominal identity is TypeId
+           identity — distinct nominal ids are distinct types; the only
+           reconciliation is the proven duplicate-identity alias pair
+           (a user type that replaced a builtin / the Vec-Array duality).
+           The audit: shared-variant enum equivalence is not a language
+           rule. *)
+        if not alias_pair || Array.length a1 <> Array.length a2 then None
         else begin
           let s4 = ref [] in
           let rec go i =
@@ -2673,9 +2622,18 @@ and unify_expected (env : env) (actual : Type_repr.t) (expected : Type_repr.t)
           Error
             (Printf.sprintf "%s: type mismatch: expected %s, found %s" context
                (type_to_string expected) (type_to_string actual)))
+(* the audit's ExprUse dimension: expected=None must NOT conflate a
+   discarded statement with an inferred VALUE context — `let x = e`
+   needs the value even with no expected type, while `e; next()`'s e
+   is discarded.  The statement-position branch-divergence rules are
+   valid ONLY in Discarded context. *)
 and check_expr (env : env) (scope : scope) (expected : Type_repr.t option) (e : Ast.expr) :
     (typed_expr, string) result =
-  match check_expr_inner env scope expected e with
+  check_expr_use env scope Value expected e
+
+and check_expr_use (env : env) (scope : scope) (use : expr_use)
+    (expected : Type_repr.t option) (e : Ast.expr) : (typed_expr, string) result =
+  match check_expr_inner env scope use expected e with
   | Ok te ->
       env.state.oracle.o_exprs <- te :: env.state.oracle.o_exprs;
       (* the persistent typed-node bridge: record the accepted node by
@@ -2699,8 +2657,8 @@ and check_expr (env : env) (scope : scope) (expected : Type_repr.t option) (e : 
       Ok te
   | Error m -> Error m
 
-and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
-    (e : Ast.expr) : (typed_expr, string) result =
+and check_expr_inner (env : env) (scope : scope) (use : expr_use)
+    (expected : Type_repr.t option) (e : Ast.expr) : (typed_expr, string) result =
   match e with
   | Ast.IntLit (_, spelling, span) -> (
       match Literal.parse_integer ~span spelling with
@@ -3051,7 +3009,7 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
       | Ok _ -> Error (err span (Printf.sprintf "`%s` is not a struct" name)))
   | Ast.Block (_, b, span) -> check_block env scope expected b span
   | Ast.UnsafeBlock (_, _, b, span) -> check_block env scope expected b span
-  | Ast.IfExpr (_, i) -> check_if env scope expected i
+  | Ast.IfExpr (_, i) -> check_if env scope use expected i
   | Ast.Call (nid, callee, targs, args, span) ->
       check_call env scope expected nid callee targs args span
   | Ast.Index (_, base, idx, span) -> (
@@ -3101,7 +3059,7 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
               te_effects = Array.append ta.te_effects tb.te_effects;
               te_span = span;
             }))
-  | Ast.MatchExpr (nid, m) -> check_match env scope expected nid m
+  | Ast.MatchExpr (nid, m) -> check_match env scope use expected nid m
   | Ast.Cast (_, inner, ty, span) -> (
       match check_expr env scope None inner with
       | Error m -> Error m
@@ -3569,7 +3527,7 @@ and check_stmt (env : env) (scope : scope) (s : Ast.stmt) : (scope, string) resu
                   | Ok (_, binds) ->
                       Ok (add_binds scope (List.map (fun (n, t, _) -> (n, t, mut_)) binds))))))
   | Ast.ExprStmt (e, _) -> (
-      match check_expr env scope None e with
+      match check_expr_use env scope Discarded None e with
       | Ok _ -> Ok scope
       | Error m -> Error m)
   | Ast.AttributeStmt (_, _) -> Ok scope
@@ -3630,7 +3588,7 @@ and check_stmt (env : env) (scope : scope) (s : Ast.stmt) : (scope, string) resu
             | _ -> Ok scope))
   | Ast.Item _ -> Ok scope   (* other nested items are checked at program level *)
 
-and check_if (env : env) (scope : scope) (expected : Type_repr.t option) (i : Ast.if_expr) :
+and check_if (env : env) (scope : scope) (use : expr_use) (expected : Type_repr.t option) (i : Ast.if_expr) :
     (typed_expr, string) result =
   let* cond_effects =
     match i.Ast.if_let_pattern with
@@ -3714,14 +3672,14 @@ and check_if (env : env) (scope : scope) (expected : Type_repr.t option) (i : As
         match tt.te_type with
         | Type_repr.Never -> expected
         | _ -> (
-            (* a statement-position if (no enclosing expected) may have
-               freely divergent branches (`if ... then
-               env.typed_fn_signatures.insert(...) else
-               type_add_error(...) end` — the then returns the map's
-               Option, the else is a Unit side effect): the else-branch
-               is reconciled against the then's type ONLY when the if
-               has an enclosing expected (a result-valued if) *)
-            if expected = None then None else Some tt.te_type)
+            (* the audit's ExprUse rule: a DISCARDED if may have freely
+               divergent branches (the value is dropped); a VALUE if
+               reconciles the else against the then's type — in value
+               context `let x = if c then () else 42 end` must NOT
+               give x the non-Unit branch type over a Unit path *)
+            match use with
+            | Discarded -> None
+            | Value -> Some tt.te_type)
       in
       match check_block env scope eb_exp eb eb.Ast.b_span with
       | Error m -> Error m
@@ -3731,26 +3689,27 @@ and check_if (env : env) (scope : scope) (expected : Type_repr.t option) (i : As
             match unify env.state.box_tid subst tt.te_type te.te_type with
             | Ok () -> Ok ()
             | Error m -> (
-                (* the native accepts a statement-position if whose
-                   branches diverge when one is Unit (`if c then ()
-                   else x end` — the Unit branch's value is discarded):
-                   only that shape reconciles; other divergences stay
-                   errors *)
-                match tt.te_type, te.te_type with
-                | Type_repr.Unit, _ | _, Type_repr.Unit -> Ok ()
+                (* a DISCARDED if whose branches diverge over Unit
+                   (`if c then () else x end` — the Unit branch's value
+                   is dropped): only that shape reconciles, and only in
+                   discarded context (the audit: value-context
+                   divergence over Unit is a bad inference shape);
+                   other divergences stay errors *)
+                match use, tt.te_type, te.te_type with
+                | Discarded, Type_repr.Unit, _ | Discarded, _, Type_repr.Unit -> Ok ()
                 | _ -> Error m)
           in
           (* the if's type adopts the concrete integer kind when one arm
              is a bare literal and the other a concrete int (`if c then 8
              else u end` is UInt, not IntLiteral — the kernel's literal
-             adoption), and the non-Unit type when the branches diverge
-             over Unit (the discarded Unit branch) *)
+             adoption), and — in DISCARDED context only — the non-Unit
+             type when the branches diverge over Unit *)
           let if_ty =
             match tt.te_type, te.te_type with
             | Type_repr.Int_literal _, Type_repr.Int k -> Type_repr.Int k
             | Type_repr.Int k, Type_repr.Int_literal _ -> Type_repr.Int k
-            | Type_repr.Unit, t -> t
-            | t, Type_repr.Unit -> t
+            | Type_repr.Unit, t when use = Discarded -> t
+            | t, Type_repr.Unit when use = Discarded -> t
             | _ -> substitute_fixpoint !subst tt.te_type
           in
           let all_effects =
@@ -3759,7 +3718,7 @@ and check_if (env : env) (scope : scope) (expected : Type_repr.t option) (i : As
           in
           Ok { te_type = if_ty; te_effects = all_effects; te_span = i.Ast.if_span }))
 
-and check_match (env : env) (scope : scope) (expected : Type_repr.t option) (nid : Ids.Node_id.t)
+and check_match (env : env) (scope : scope) (use : expr_use) (expected : Type_repr.t option) (nid : Ids.Node_id.t)
     (m : Ast.match_expr) : (typed_expr, string) result =
   let* subject = check_expr env scope None m.Ast.m_subject in
   let* arms =
@@ -3794,14 +3753,16 @@ and check_match (env : env) (scope : scope) (expected : Type_repr.t option) (nid
                     match first.te_type with
                     | Type_repr.Never -> expected
                     | Type_repr.Unit -> expected
-                    | _ ->
-                        (* a statement-position match (no enclosing
-                           expected) discards the arm values: subsequent
-                           arms are NOT reconciled against the first
-                           arm's type — a side-effect arm body
+                    | _ -> (
+                        (* the audit's ExprUse rule: a DISCARDED match
+                           does not reconcile later arms against the
+                           first arm's type — a side-effect arm body
                            (`b.errors.push(...)`, Unit) would otherwise
-                           fail a Some first-type expectation *)
-                        if expected = None then None else Some first.te_type)
+                           fail a Some first-type expectation; a VALUE
+                           match reconciles *)
+                        match use with
+                        | Discarded -> None
+                        | Value -> Some first.te_type))
               in
               match check_expr env arm_scope expected' arm.Ast.ma_body with
               | Error m -> Error m
@@ -3813,14 +3774,16 @@ and check_match (env : env) (scope : scope) (expected : Type_repr.t option) (nid
                       match unify env.state.box_tid subst first.te_type te.te_type with
                       | Ok () -> go (idx + 1) (te :: acc) rest
                       | Error m ->
-                          (* a match whose arms diverge over Unit
-                             (`when X then strings.insert(...) else ()
-                             end` — the Unit arm's value is discarded,
-                             the match type is the non-Unit arm's): the
-                             native accepts; other divergences stay
-                             errors *)
-                          (match first.te_type, te.te_type with
-                           | Type_repr.Unit, _ | _, Type_repr.Unit ->
+                          (* a DISCARDED match whose arms diverge over
+                             Unit (`when X then strings.insert(...)
+                             else () end` — the Unit arm's value is
+                             dropped): only discarded context (the
+                             audit: value-context Unit divergence is a
+                             bad inference shape); other divergences
+                             stay errors *)
+                          (match use, first.te_type, te.te_type with
+                           | Discarded, Type_repr.Unit, _
+                           | Discarded, _, Type_repr.Unit ->
                                go (idx + 1) (te :: acc) rest
                            | _ ->
                                (* arm incompatibility is a real semantic failure:
@@ -4705,34 +4668,16 @@ and check_call_sig (env : env) (scope : scope) (expected : Type_repr.t option)
                         | Type_repr.Int pk, Type_repr.Int ak when pk <> ak -> Some ()
                         | _ -> None
                       in
-                      let map_key_tolerate () =
-                        (* the native tolerates any key type at a Map
-                           method's KEY parameter (the kernel's dataflow
-                           passes call `new_in.get(pid)` where pid comes
-                           from a tuple pattern over a Set — the value
-                           bit-casts the hash) *)
-                        let is_map_owner =
-                          match String.split_on_char ':' sig_.ts_name with
-                          | hd :: _ -> hd = "Map" || hd = "Set"
-                          | [] -> false
-                        in
-                        match is_map_owner with
-                        | false -> None
-                        | true ->
-                            if i = 1 then Some ()
-                            else None
-                      in
+                      (* STRICT (the native model): Map[K,V].get's key
+                         parameter is K — part of the generic contract;
+                         no arbitrary key tolerance (the audit: the
+                         key/item type is part of the generic type) *)
                       match same_named_arg () with
                       | Some () ->
                           let eff = Access_effect.read_effect sig_.ts_params.(i).Type_repr.pt_convention in
                           go (ate :: acc) (eff :: effects) (i + 1) rest
                       | None -> (
                       match int_kind_adopt () with
-                      | Some () ->
-                          let eff = Access_effect.read_effect sig_.ts_params.(i).Type_repr.pt_convention in
-                          go (ate :: acc) (eff :: effects) (i + 1) rest
-                      | None -> (
-                      match map_key_tolerate () with
                       | Some () ->
                           let eff = Access_effect.read_effect sig_.ts_params.(i).Type_repr.pt_convention in
                           go (ate :: acc) (eff :: effects) (i + 1) rest
@@ -4759,7 +4704,7 @@ and check_call_sig (env : env) (scope : scope) (expected : Type_repr.t option)
                           Error
                             (err a.Ast.ca_span
                                (Printf.sprintf "argument %d type mismatch: expected %s, found %s (%s, callee %s)"
-                                  (i + 1) (type_to_string pt) (type_to_string ate.te_type) m sig_.ts_name)))))))
+                                  (i + 1) (type_to_string pt) (type_to_string ate.te_type) m sig_.ts_name))))))
             end)
       in
       go [] [] 0 args

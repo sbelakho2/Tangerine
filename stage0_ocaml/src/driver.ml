@@ -306,9 +306,14 @@ let const_values (env : Typecheck.env) (items : Ast.item list) :
           | Some c -> List.map (fun k -> (k, (ty, c))) (bare_keys n)))
     env.Typecheck.consts
 
-let closure_statics (env : Typecheck.env) : (string * Type_repr.t * Seed_mir.constant option) array =
+let closure_statics (env : Typecheck.env) (items : Ast.item list) :
+    (string * Type_repr.t * Seed_mir.constant option) array =
+  (* the audit (mutable statics, P0): const_values locates each
+     declaration by scanning the SUPPLIED item list — the previous
+     `const_values env []` could never recover the declarations, so the
+     statics table silently lost every initializer *)
   let init_of (n : string) : Seed_mir.constant option =
-    match List.assoc_opt n (const_values env []) with
+    match List.assoc_opt n (const_values env items) with
     | Some (_, c) -> Some c
     | None -> None
   in
@@ -741,7 +746,7 @@ let lower_and_report (path : string) (env : Typecheck.env) (program : Ast.progra
       funcs
   in
   let prog =
-    { Seed_mir.functions = Array.of_list mir_funcs; statics = closure_statics env; types = closure_types env }
+    { Seed_mir.functions = Array.of_list mir_funcs; statics = closure_statics env program.Ast.items; types = closure_types env }
   in
   match Mir_verify.require_valid_template ~generic_types:(closure_generic_types env) prog with
   | Error errs ->
@@ -865,7 +870,7 @@ let cmd_interpret (args : string list) : int =
                   funcs
               in
               let prog =
-                { Seed_mir.functions = Array.of_list mir_funcs; statics = closure_statics env; types = closure_types env }
+                { Seed_mir.functions = Array.of_list mir_funcs; statics = closure_statics env program.Ast.items; types = closure_types env }
               in
               (match
                  Mir_verify.require_valid_template
@@ -1669,9 +1674,12 @@ let lower_closure (ctx : closure_ctx) : Seed_mir.program =
       mir_funcs := f :: !mir_funcs)
     ctx.ctx_env.Typecheck.state.nested_functions;
   ctx.lowered_methods <- !lowered_methods;
+  let all_items =
+    List.concat_map (fun node -> node.Module_graph.node_items) ctx.ctx_graph.Module_graph.nodes
+  in
   {
     Seed_mir.functions = Array.of_list (List.rev !mir_funcs);
-    statics = closure_statics ctx.ctx_env;
+    statics = closure_statics ctx.ctx_env all_items;
     types = closure_types ctx.ctx_env;
   }
 
