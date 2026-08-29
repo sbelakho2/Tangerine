@@ -735,9 +735,117 @@ end
                                Printf.printf
                                  "  const-call pattern round-trip: PASS (main = 2 — the u8 match took the DT_REG arm; exit %d)\n"
                                  code
-                           | other ->
+                           | Ok other_s ->
                                Printf.printf
                                  "  const-call pattern round-trip: FAIL (expected 2, got %s)\n"
+                                 other_s;
+                               exit 1
+                           | Error m ->
+                               Printf.printf
+                                 "  const-call pattern round-trip: FAIL (expected 2, got <%s>)\n" m;
+                               exit 1)))
+                end));
+      (* ── the RUNTIME Vec iteration round-trip proof (the audit's
+         typed-iterable requirement): a `for x in v` over a runtime
+         Vec[Int] lowers to the counter loop with the dynamic
+         Seed_mir.Index; the VM bounds-checks the runtime index and
+         the sum of [10, 20, 30] is 60.  The lowerer's typed-for
+         channel is authoritative for the loop pattern. *)
+      let vlsrc = {|
+def main() -> Int
+  var v: [Int; 3] = [10, 20, 30]
+  var sum = 0
+  for x in v do
+    sum = sum + x
+  end
+  sum
+end
+|} in
+      (match Source_loader.load_string "<vec-loop>" vlsrc with
+       | Error _ -> failwith "vec-loop source load"
+       | Ok vsrc ->
+           let vsm = Span.create () in
+           let vfid = Span.add_file vsm vsrc.Source.name vsrc in
+           let vdiags = Diagnostic.create_bag () in
+           let vlx = Lexer.create vsrc.Source.bytes vfid vdiags in
+           let vtoks = Lexer.lex vlx in
+           let vprog = Parser.parse vtoks vsrc.Source.bytes vfid vdiags [ "vl" ] in
+           (match Typecheck.check_program (Typecheck.initial_env ()) vprog with
+            | Error m -> failwith ("vec-loop typecheck: " ^ m)
+            | Ok (venv, verrs) ->
+                if verrs <> [] then
+                  failwith ("vec-loop typecheck errors: " ^ String.concat "; " verrs)
+                else begin
+                  let vbase = Driver.lowering_env_of ~items:vprog.Ast.items venv in
+                  let vvariants = Driver.user_variant_table venv in
+                  let vmain_decl =
+                    match
+                      List.find_opt
+                        (fun i ->
+                          match i.Ast.kind with
+                          | Ast.Function d -> d.Ast.fn_sig.Ast.sig_name = "main"
+                          | _ -> false)
+                        vprog.Ast.items
+                    with
+                    | Some i -> i
+                    | None -> failwith "vec-loop: no main function"
+                  in
+                  let vts =
+                    match List.assoc_opt "main" venv.Typecheck.functions with
+                    | Some ts -> ts
+                    | None -> (
+                        match
+                          List.filter (fun (k, _) -> Util.has_suffix k "::main")
+                            venv.Typecheck.functions
+                        with
+                        | [ (_, ts) ] -> ts
+                        | _ -> failwith "vec-loop: no typed signature for main")
+                  in
+                  let vmain_fn =
+                    match vmain_decl.Ast.kind with
+                    | Ast.Function d ->
+                        Mir_lower.lower_function_with_variants
+                          ~typed_nodes:(Driver.typed_nodes_of venv)
+                          ~typed_patterns:(Driver.typed_patterns_of venv)
+                          ~typed_for_patterns:(Driver.typed_for_patterns_of venv)
+                          vvariants
+                          { vbase with Mir_lower.fn_ret = vts.Typecheck.ts_return }
+                          "main" (Ids.Callable_id.to_int vts.Typecheck.ts_callable)
+                          [||] [||] d
+                    | _ -> failwith "vec-loop: main is not a function"
+                  in
+                  let vprog_mir =
+                    { Seed_mir.functions = [| vmain_fn |]; statics = [||]; types = [||] }
+                  in
+                  (match Mir_verify.require_valid_concrete vprog_mir with
+                   | Ok () ->
+                       Printf.printf "  runtime Vec iteration verify (concrete mode): PASS\n"
+                   | Error errs ->
+                       Printf.printf "  runtime Vec iteration verify (concrete mode): FAIL\n";
+                       List.iter (fun e -> Printf.printf "    %s\n" e) errs;
+                       exit 1);
+                  let v_entry = vmain_fn.Seed_mir.instance in
+                  let vhost = Host.create ~repo_root:"." ~argv:[||] in
+                  (match Vm.run ~program:vprog_mir ~entry:v_entry ~argv:[||] ~host:vhost with
+                   | Error e ->
+                       Printf.printf "  runtime Vec iteration VM: FAIL %s\n" e.Vm.message;
+                       exit 1
+                   | Ok code -> (
+                       match
+                         Vm.entry_frame_of ~program:vprog_mir ~entry:v_entry ~argv:[||]
+                       with
+                       | Error m ->
+                           Printf.printf "  runtime Vec iteration VM: <inspect failed: %s>\n" m;
+                           exit 1
+                       | Ok (vvm, vframe) -> (
+                           match Vm.run_inspect vvm vframe with
+                           | Ok "60" ->
+                               Printf.printf
+                                 "  runtime Vec iteration round-trip: PASS (main = 60 — the sum of [10,20,30]; exit %d)\n"
+                                 code
+                           | other ->
+                               Printf.printf
+                                 "  runtime Vec iteration round-trip: FAIL (expected 60, got %s)\n"
                                  (match other with Ok v -> v | Error m -> "<" ^ m ^ ">");
                                exit 1)))
                 end));

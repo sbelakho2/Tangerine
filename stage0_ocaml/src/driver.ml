@@ -426,6 +426,10 @@ let typed_nodes_of (env : Typecheck.env) : (Ids.Node_id.t * Mir_lower.typed_node
    The lowerer consumes the semantic identities (VariantId, binding
    names/types, constants, field names) instead of re-interpreting the
    syntactic Ast.pattern. *)
+let typed_for_patterns_of (env : Typecheck.env) :
+    (Ids.Node_id.t * (Typed_pattern.t * Type_repr.t)) list =
+  Hashtbl.fold (fun k v acc -> (k, v) :: acc) env.Typecheck.typed_for_patterns []
+
 let typed_patterns_of (env : Typecheck.env) :
     ((Ids.Node_id.t * int) * Typed_pattern.t) list =
   Hashtbl.fold (fun key tp acc -> (key, tp) :: acc) env.Typecheck.typed_patterns []
@@ -740,6 +744,7 @@ let lower_and_report (path : string) (env : Typecheck.env) (program : Ast.progra
         in
         Mir_lower.lower_function_with_variants ~typed_nodes:(typed_nodes_of env)
                     ~typed_patterns:(typed_patterns_of env)
+                    ~typed_for_patterns:(typed_for_patterns_of env)
           (user_variant_table env)
           { base with Mir_lower.fn_ret }
           d.Ast.fn_sig.Ast.sig_name callable template_args conventions d)
@@ -864,6 +869,7 @@ let cmd_interpret (args : string list) : int =
                     in
                     Mir_lower.lower_function_with_variants ~typed_nodes:(typed_nodes_of env)
                     ~typed_patterns:(typed_patterns_of env)
+                    ~typed_for_patterns:(typed_for_patterns_of env)
                       (user_variant_table env)
                       { base with Mir_lower.fn_ret }
                       d.Ast.fn_sig.Ast.sig_name callable [||] [||] d)
@@ -1602,7 +1608,9 @@ let lower_closure (ctx : closure_ctx) : Seed_mir.program =
             | None -> (Type_repr.Unit, 0)
           in
           let f =
-            Mir_lower.lower_function_with_variants ~typed_nodes:(typed_nodes_of ctx.ctx_env)
+            Mir_lower.lower_function_with_variants
+              ~typed_for_patterns:(typed_for_patterns_of ctx.ctx_env)
+              ~typed_nodes:(typed_nodes_of ctx.ctx_env)
                     ~typed_patterns:(typed_patterns_of ctx.ctx_env)
               variants
               { base with Mir_lower.fn_ret }

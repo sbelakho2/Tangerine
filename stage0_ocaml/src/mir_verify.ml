@@ -346,10 +346,15 @@ let project_type (ctx : ctx) (ty : Type_repr.t) (proj : projection) : Type_repr.
          compile time, so only the base shape constrains the projected
          type; the index local's existence/initialization/type are
          checked in check_projection_owners and the runtime bounds are
-         checked by the VM at execution. *)
+         checked by the VM at execution.  The runtime Vec/Array base
+         (the named Array nominal, type-id 0) is admitted — the VM's
+         dynamic Index handles the Array value. *)
       ignore li;
       match resolve_or_self ctx ty with
       | Type_repr.Fixed_array (elem, _) -> Some elem
+      | Type_repr.Named (id, [| elem |])
+        when Ids.Type_id.compare id (Ids.Type_id.make 0) = 0 ->
+          Some elem
       | _ -> None)
   | Downcast vid -> (
       match ty with
@@ -1518,6 +1523,9 @@ let check_rvalue (ctx : ctx) (fn : function_) (bb_ctx : string) (declared : IntS
       | Some ty -> (
           match resolve_or_self ctx ty with
           | Type_repr.Fixed_array _ -> Some (Type_repr.Int Type_repr.UInt)
+          | Type_repr.Named (id, _)
+            when Ids.Type_id.compare id (Ids.Type_id.make 0) = 0 ->
+              Some (Type_repr.Int Type_repr.UInt)
           | _ ->
               add_err ctx
                 (Printf.sprintf "%s: len of non-array value of type %s" bb_ctx

@@ -469,10 +469,10 @@ let materialize_place (st : lower_state) (op : Seed_mir.operand) : Seed_mir.plac
 let element_type_of (t : Type_repr.t) : Type_repr.t =
   match t with
   | Type_repr.Fixed_array (e, _) -> e
+  | Type_repr.Named (id, [| e |]) when Ids.Type_id.compare id (Ids.Type_id.make 0) = 0 -> e
   | Type_repr.String -> Type_repr.Char
   | Type_repr.Tuple _ -> Type_repr.Int Type_repr.Int
-  | _ -> seed_bug "element access on a non-iterable type %s (the lowering env carries no type-substituted element lookup for named Vec/Array types; the dynamic Seed_mir.Index projection itself is executable — the verifier only admits it on Fixed_array bases)"
-           (Seed_mir.print_type t)
+  | _ -> seed_bug "element access on a non-iterable type %s" (Seed_mir.print_type t)
 
 (* Conservative copyability for payload binding: the verifier's enum
    rule is recursive (an enum is Copy iff every variant payload is Copy)
@@ -1635,9 +1635,119 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
               push_block st join_b;
               (Seed_mir.Constant Seed_mir.Unit, Type_repr.Unit)
           | _ ->
-              seed_bug
-                "runtime for-loop over a non-array iterable of type %s is not lowered (the seed verifier admits dynamic Index/Len only on Fixed_array bases; lower it to an Array literal for the unrolled path)"
-                (Seed_mir.print_type arr_ty)))
+              (* the runtime collection loop: the counter counts from 0
+                 to Len(container); each iteration reads the element
+                 through the dynamic Seed_mir.Index <counter> — the VM
+                 bounds-checks the runtime index (the audit: runtime
+                 Vec/Array iteration is a required typed subform) *)
+              let arr_id = materialize_place st arr_op in
+              let len_id = fresh_local st (Type_repr.Int Type_repr.UInt) in
+              emit st
+                (Seed_mir.Assign
+                   (cur_place st len_id, Seed_mir.Len arr_id));
+              let cid = fresh_local st (Type_repr.Int Type_repr.UInt) in
+              emit st
+                (Seed_mir.Assign
+                   (cur_place st cid,
+                    Seed_mir.Use (Seed_mir.Constant (int_constant_of Type_repr.UInt 0L))));
+              let head_b = new_block st in
+              let body_b = new_block st in
+              let incr_b = new_block st in
+              let join_b = new_block st in
+              set_terminator st (Seed_mir.Goto head_b);
+              push_block st head_b;
+              let cnd_id = fresh_local st Type_repr.Bool in
+              emit st
+                (Seed_mir.Assign
+                   ( cur_place st cnd_id,
+                     Seed_mir.BinaryOp
+                       ( Seed_mir.Lt,
+                         copy_place st (cur_place st cid),
+                         copy_place st (cur_place st len_id) ) ));
+              set_terminator st
+                (Seed_mir.SwitchInt
+                   (copy_place st (cur_place st cnd_id), [ (1L, body_b) ], join_b));
+              push_block st body_b;
+              let elem_ty = element_type_of arr_ty in
+              let bindings =
+                match typed_for_of st fid with
+                | Some (tp, _) ->
+                    List.map
+                      (fun (n, id, path) ->
+                        let path =
+                          match path with
+                          | [] -> None
+                          | [ k ] -> Some k
+                          | _ ->
+                              seed_bug
+                                "nested tuple for-loop pattern against a runtime collection element"
+                        in
+                        (n, id, path))
+                      (semantic_bindings_of tp)
+                | None ->
+                    let elem_ty_of_tuple k =
+                      match elem_ty with
+                      | Type_repr.Tuple elems when k < Array.length elems -> elems.(k)
+                      | _ ->
+                          seed_bug
+                            "destructuring for-loop pattern against a non-tuple element type"
+                    in
+                    (match f.Ast.for_pattern with
+                     | Ast.PatIdent (n, _, _) -> [ (n, fresh_local st elem_ty, None) ]
+                     | Ast.Wildcard _ -> []
+                     | Ast.PatTuple (subs, _) ->
+                         List.mapi
+                           (fun k sub ->
+                             match sub with
+                             | Ast.PatIdent (n, _, _) ->
+                                 (n, fresh_local st (elem_ty_of_tuple k), Some k)
+                             | Ast.Wildcard _ ->
+                                 ("__wild" ^ string_of_int k,
+                                  fresh_local st (elem_ty_of_tuple k), Some k)
+                             | _ ->
+                                 seed_bug
+                                   "unsupported destructuring for-loop pattern in lowering")
+                           subs
+                     | _ -> seed_bug "unsupported for-loop pattern in lowering (bind by name or _)")
+              in
+              List.iter
+                (fun (n, id, _) ->
+                  if not (String.starts_with ~prefix:"__wild" n) then st.scope <- (n, id) :: st.scope)
+                bindings;
+              List.iter
+                (fun (_, id, k) ->
+                  let projections =
+                    match k with
+                    | None -> [ Seed_mir.Index cid ]
+                    | Some k -> [ Seed_mir.Index cid; Seed_mir.ConstantIndex k ]
+                  in
+                  emit st
+                    (Seed_mir.Assign
+                       ( cur_place st id,
+                         Seed_mir.Use
+                           (Seed_mir.Copy
+                              { Seed_mir.local = arr_id.Seed_mir.local;
+                                projections = arr_id.Seed_mir.projections @ projections }) )))
+                bindings;
+              let saved_break = st.break_target in
+              let saved_continue = st.continue_target in
+              st.break_target <- Some join_b;
+              st.continue_target <- Some incr_b;
+              ignore (lower_block env st f.Ast.for_body);
+              st.break_target <- saved_break;
+              st.continue_target <- saved_continue;
+              set_terminator st (Seed_mir.Goto incr_b);
+              push_block st incr_b;
+              emit st
+                (Seed_mir.Assign
+                   ( cur_place st cid,
+                     Seed_mir.BinaryOp
+                       ( Seed_mir.Add,
+                         copy_place st (cur_place st cid),
+                         Seed_mir.Constant (int_constant_of Type_repr.UInt 1L) ) ));
+              set_terminator st (Seed_mir.Goto head_b);
+              push_block st join_b;
+              (Seed_mir.Constant Seed_mir.Unit, Type_repr.Unit)))
   | Ast.StructLit (nid, name, targs, fields, rest, _span) -> (
       (* re-audit: the StructCtor aggregate rule — `Type { field: value,
          ... }` lowers to a StructCtor aggregate whose type is the
