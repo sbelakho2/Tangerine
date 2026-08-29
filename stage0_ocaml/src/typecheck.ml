@@ -60,6 +60,38 @@ type typed_signature = {
 
 type expr_use = Value | Discarded
 
+(* the native's FlowResult (the audit's highest-value finding): block
+   and statement typing carry the normal fallthrough type PLUS the
+   divergence edges (return/break/continue).  A loop's normal is Unit
+   regardless of its body's tail type; a return/break/continue
+   statement makes the normal continuation unreachable (fr_normal =
+   None = Never); the `loop` form is Never ONLY when no edge can exit
+   it.  This replaces the collapsed typed_expr model where a loop's
+   body tail could leak as the loop's expression type (the enormous
+   `expected (), found Bool` cluster). *)
+type flow_result = {
+  fr_normal : Type_repr.t option;  (* None = the normal continuation is unreachable *)
+  fr_may_return : bool;
+  fr_may_break : bool;
+  fr_may_continue : bool;
+}
+
+let flow_normal (fr : flow_result) : Type_repr.t =
+  match fr.fr_normal with Some t -> t | None -> Type_repr.Never
+
+let flow_join (a : flow_result) (b : flow_result) : flow_result =
+  {
+    fr_normal =
+      (match a.fr_normal, b.fr_normal with
+       | Some _, Some _ -> (if b.fr_normal = a.fr_normal then a.fr_normal else a.fr_normal)
+       | Some t, None -> Some t
+       | None, Some t -> Some t
+       | None, None -> None);
+    fr_may_return = a.fr_may_return || b.fr_may_return;
+    fr_may_break = a.fr_may_break || b.fr_may_break;
+    fr_may_continue = a.fr_may_continue || b.fr_may_continue;
+  }
+
 type nominal = {
   nom_kind : [ `Struct | `Enum ];
   nom_params : (string * Ids.Generic_param_id.t) list;
@@ -3019,8 +3051,14 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
                          Ok { te_type = Type_repr.Named (tid, lit_args); te_effects = effects; te_span = span })
                end)))
       | Ok _ -> Error (err span (Printf.sprintf "`%s` is not a struct" name)))
-  | Ast.Block (_, b, span) -> check_block env scope expected b span
-  | Ast.UnsafeBlock (_, _, b, span) -> check_block env scope expected b span
+  | Ast.Block (_, b, span) -> (
+      match check_block env scope expected b span with
+      | Error m -> Error m
+      | Ok fr -> Ok { te_type = flow_normal fr; te_effects = [||]; te_span = span })
+  | Ast.UnsafeBlock (_, _, b, span) -> (
+      match check_block env scope expected b span with
+      | Error m -> Error m
+      | Ok fr -> Ok { te_type = flow_normal fr; te_effects = [||]; te_span = span })
   | Ast.IfExpr (_, i) -> check_if env scope use expected i
   | Ast.Call (nid, callee, targs, args, span) ->
       check_call env scope expected nid callee targs args span
@@ -3446,17 +3484,40 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
                      the raw syntax *)
                   Hashtbl.replace env.typed_for_patterns nid (tp, et);
                   let scope = add_binds scope binds in
-                  check_block env { scope with loop_depth = scope.loop_depth + 1 }
-                    None f.Ast.for_body f.Ast.for_span)))
+                  (match
+                     check_block env { scope with loop_depth = scope.loop_depth + 1 } None
+                       f.Ast.for_body f.Ast.for_span
+                   with
+                   | Error m -> Error m
+                   | Ok _fr ->
+                       (* the native for-rule: the loop's NORMAL result
+                          is Unit regardless of its body's tail type
+                          (a loop body tail like `errors.push(...)`
+                          must not leak Bool as the loop's type);
+                          return paths are carried separately *)
+                       Ok
+                         { te_type = Type_repr.Unit;
+                           te_effects = [||];
+                           te_span = f.Ast.for_span }))))
   | Ast.WhileExpr (_, w) -> (
       match check_expr env scope (Some Type_repr.Bool) w.Ast.wh_condition with
       | Error m -> Error m
       | Ok tc -> (
           let subst = ref [] in
           match unify env.state.box_tid subst tc.te_type Type_repr.Bool with
-          | Ok () ->
-              check_block env { scope with loop_depth = scope.loop_depth + 1 } None
-                w.Ast.wh_body w.Ast.wh_span
+          | Ok () -> (
+              match
+                check_block env { scope with loop_depth = scope.loop_depth + 1 } None
+                  w.Ast.wh_body w.Ast.wh_span
+              with
+              | Error m -> Error m
+              | Ok _fr ->
+                  (* the native while-rule: a normal while can execute
+                     zero times, so its normal result is Unit *)
+                  Ok
+                    { te_type = Type_repr.Unit;
+                      te_effects = [||];
+                      te_span = w.Ast.wh_span })
           | Error m ->
               ignore
                 (return_unify_err (Ast.expr_span w.Ast.wh_condition) Type_repr.Bool
@@ -3467,12 +3528,17 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
         check_block env { scope with loop_depth = scope.loop_depth + 1 } None b span
       with
       | Error m -> Error m
-      | Ok te ->
-          (* a `loop` falls through ONLY via a break; a return inside is
-             not a fall-through — the loop's value is Never (the kernel's
-             StmtLoop rule; its own loop-with-return bodies end with no
-             tail and rely on the Never normal) *)
-          Ok { te_type = Type_repr.Never; te_effects = te.te_effects; te_span = span })
+      | Ok fr ->
+          (* the native loop-rule: `loop` falls through ONLY via a
+             break (or a return); a body with NO exit edge is Never.
+             Treating a breakable loop as Never corrupts unreachable
+             analysis and every later block-tail calculation. *)
+          Ok
+            { te_type =
+                (if fr.fr_may_break || fr.fr_may_return then Type_repr.Unit
+                 else Type_repr.Never);
+              te_effects = [||];
+              te_span = span })
   | Ast.HandleExpr (_, h) -> Error (err h.Ast.h_span "handle/with expressions are not available in the bootstrap subset")
   | Ast.UnlessExpr (_, u) -> Error (err u.Ast.un_span "unless expressions are not available in the bootstrap subset")
   | Ast.UntilExpr (_, u) -> Error (err u.Ast.ut_span "until expressions are not available in the bootstrap subset")
@@ -3492,25 +3558,60 @@ and add_binds (scope : scope) (binds : (string * Type_repr.t * bool) list) : sco
     scope binds
 
 and check_block (env : env) (scope : scope) (expected : Type_repr.t option) (b : Ast.block_body)
-    (span : Span.span) : (typed_expr, string) result =
-  let rec go_stmts (scope : scope) = function
+    (_span : Span.span) : (flow_result, string) result =
+  let rec go_stmts (scope : scope) (acc : flow_result) = function
     | [] -> (
+        (* the tail: when a prior statement made the normal continuation
+           unreachable, the tail is still checked for diagnostics but no
+           longer contributes to the block's semantic normal (the
+           native unreachable-tail rule) *)
         match b.Ast.b_tail with
-        | None -> Ok ({ te_type = Type_repr.Unit; te_effects = [||]; te_span = span }, scope)
+        | None ->
+            Ok
+              {
+                fr_normal =
+                  (if acc.fr_normal = None then None else Some Type_repr.Unit);
+                fr_may_return = acc.fr_may_return;
+                fr_may_break = acc.fr_may_break;
+                fr_may_continue = acc.fr_may_continue;
+              }
         | Some e -> (
             match check_expr env scope expected e with
-            | Ok te -> Ok (te, scope)
+            | Ok te ->
+                Ok
+                  {
+                    fr_normal =
+                      (if acc.fr_normal = None then None else Some te.te_type);
+                    fr_may_return = acc.fr_may_return;
+                    fr_may_break = acc.fr_may_break;
+                    fr_may_continue = acc.fr_may_continue;
+                  }
             | Error m -> Error m))
     | s :: rest -> (
         match check_stmt env scope s with
         | Error m -> Error m
-        | Ok scope' -> go_stmts scope' rest)
+        | Ok (scope', fr) -> (
+            let acc' =
+              {
+                fr_normal =
+                  (if fr.fr_normal = None then None else acc.fr_normal);
+                fr_may_return = acc.fr_may_return || fr.fr_may_return;
+                fr_may_break = acc.fr_may_break || fr.fr_may_break;
+                fr_may_continue = acc.fr_may_continue || fr.fr_may_continue;
+              }
+            in
+            (* after a divergent statement the normal continuation is
+               unreachable: later statements are still checked for
+               diagnostics but never contribute a normal value *)
+            if fr.fr_normal = None then go_stmts scope' acc' rest
+            else go_stmts scope' acc' rest))
   in
-  match go_stmts scope b.Ast.b_stmts with
-  | Error m -> Error m
-  | Ok (te, _) -> Ok te
+  go_stmts scope
+    { fr_normal = Some Type_repr.Unit; fr_may_return = false; fr_may_break = false; fr_may_continue = false }
+    b.Ast.b_stmts
 
-and check_stmt (env : env) (scope : scope) (s : Ast.stmt) : (scope, string) result =
+and check_stmt (env : env) (scope : scope) (s : Ast.stmt) :
+    (scope * flow_result, string) result =
   match s with
   | Ast.LetBinding (pat, mut_, ty_opt, value, span) -> (
       match ty_opt with
@@ -3525,7 +3626,14 @@ and check_stmt (env : env) (scope : scope) (s : Ast.stmt) : (scope, string) resu
                    | Ast.Name (nid, _, _) | Ast.Field (nid, _, _, _) ->
                        Hashtbl.replace env.typed_let_patterns nid tp
                    | _ -> ());
-                  Ok (add_binds scope (List.map (fun (n, t, _) -> (n, t, mut_)) binds))))
+                  Ok
+                    ( add_binds scope (List.map (fun (n, t, _) -> (n, t, mut_)) binds),
+                      {
+                        fr_normal = Some te.te_type;
+                        fr_may_return = false;
+                        fr_may_break = false;
+                        fr_may_continue = false;
+                      } )))
       | Some tye -> (
           match resolve_type env scope tye with
           | Error m -> Error m
@@ -3546,16 +3654,53 @@ and check_stmt (env : env) (scope : scope) (s : Ast.stmt) : (scope, string) resu
                   match check_pattern env scope (substitute_fixpoint !subst ty) pat with
                   | Error m -> Error m
                   | Ok (_, binds) ->
-                      Ok (add_binds scope (List.map (fun (n, t, _) -> (n, t, mut_)) binds))))))
+                      Ok
+                        ( add_binds scope (List.map (fun (n, t, _) -> (n, t, mut_)) binds),
+                          {
+                            fr_normal = Some ty;
+                            fr_may_return = false;
+                            fr_may_break = false;
+                            fr_may_continue = false;
+                          } )))))
   | Ast.ExprStmt (e, _) -> (
       match check_expr_use env scope Discarded None e with
-      | Ok _ -> Ok scope
+      | Ok te -> (
+          (* the divergence edges: a statement-position return/break/
+             next makes the normal continuation unreachable (the
+             native's FlowResult — a tail after `return` must never
+             contribute to the surrounding block's type) *)
+          let fr =
+            match e with
+            | Ast.ReturnExpr _ ->
+                { fr_normal = None; fr_may_return = true; fr_may_break = false; fr_may_continue = false }
+            | Ast.BreakExpr _ ->
+                { fr_normal = None; fr_may_break = true; fr_may_return = false; fr_may_continue = false }
+            | Ast.NextExpr _ ->
+                { fr_normal = None; fr_may_continue = true; fr_may_return = false; fr_may_break = false }
+            | _ ->
+                {
+                  fr_normal = Some te.te_type;
+                  fr_may_return = false;
+                  fr_may_break = false;
+                  fr_may_continue = false;
+                }
+          in
+          Ok (scope, fr))
       | Error m -> Error m)
-  | Ast.AttributeStmt (_, _) -> Ok scope
+  | Ast.AttributeStmt (_, _) ->
+      Ok (scope, { fr_normal = Some Type_repr.Unit; fr_may_return = false; fr_may_break = false; fr_may_continue = false })
   | Ast.Attributed (_, inner, _) -> check_stmt env scope inner
   | Ast.DeferStmt (b, span) -> (
       match check_block env scope None b span with
-      | Ok _ -> Ok scope
+      | Ok _ ->
+          Ok
+            ( scope,
+              {
+                fr_normal = Some Type_repr.Unit;
+                fr_may_return = false;
+                fr_may_break = false;
+                fr_may_continue = false;
+              } )
       | Error m -> Error m)
   | Ast.Item { Ast.kind = Ast.Function fd; _ } ->
       (* a nested function declaration: register it (the qualified name
@@ -3600,14 +3745,23 @@ and check_stmt (env : env) (scope : scope) (s : Ast.stmt) : (scope, string) resu
                      | _ -> Some sig_.ts_return)
                      b b.b_span
                  with
-                 | Ok _ ->
+                 | Ok _fr ->
                      env.state.nested_functions <-
                        (qname, sig_, fd)
                        :: List.filter (fun (k, _, _) -> k <> qname) env.state.nested_functions;
-                     Ok scope
+                     Ok
+                       ( scope,
+                         {
+                           fr_normal = Some Type_repr.Unit;
+                           fr_may_return = false;
+                           fr_may_break = false;
+                           fr_may_continue = false;
+                         } )
                  | Error m -> Error m)
-            | _ -> Ok scope))
-  | Ast.Item _ -> Ok scope   (* other nested items are checked at program level *)
+            | _ ->
+                Ok (scope, { fr_normal = Some Type_repr.Unit; fr_may_return = false; fr_may_break = false; fr_may_continue = false })))
+  | Ast.Item _ ->
+      Ok (scope, { fr_normal = Some Type_repr.Unit; fr_may_return = false; fr_may_break = false; fr_may_continue = false })  (* other nested items are checked at program level *)
 
 and check_if (env : env) (scope : scope) (use : expr_use) (expected : Type_repr.t option) (i : Ast.if_expr) :
     (typed_expr, string) result =
@@ -3658,6 +3812,7 @@ and check_if (env : env) (scope : scope) (use : expr_use) (expected : Type_repr.
     match i.Ast.if_else with None -> None | Some _ -> expected
   in
   let* tt = check_block env then_scope then_exp i.Ast.if_then i.Ast.if_then.Ast.b_span in
+  let tt_ty = flow_normal tt in
   let* telsif =
     let rec go acc = function
       | [] -> Ok (List.rev acc)
@@ -3666,10 +3821,10 @@ and check_if (env : env) (scope : scope) (use : expr_use) (expected : Type_repr.
           | Error m -> Error m
           | Ok _ -> (
               let b_exp =
-                match i.Ast.if_else, tt.te_type with
+                match i.Ast.if_else, tt_ty with
                 | None, _ -> None
                 | Some _, Type_repr.Never -> expected
-                | Some _, _ -> Some tt.te_type
+                | Some _, _ -> Some tt_ty
               in
               match check_block env scope b_exp b b.Ast.b_span with
               | Ok tb -> go (tb :: acc) rest
@@ -3685,12 +3840,12 @@ and check_if (env : env) (scope : scope) (use : expr_use) (expected : Type_repr.
          of the branch type *)
       let all_effects =
         Array.concat
-          (cond_effects :: List.map (fun (te : typed_expr) -> te.te_effects) (tt :: telsif))
+          (cond_effects :: List.map (fun (_fr : flow_result) -> [||]) (tt :: telsif))
       in
       Ok { te_type = Type_repr.Unit; te_effects = all_effects; te_span = i.Ast.if_span })
   | Some eb -> (
       let eb_exp =
-        match tt.te_type with
+        match tt_ty with
         | Type_repr.Never -> expected
         | _ -> (
             (* the audit's ExprUse rule: a DISCARDED if may have freely
@@ -3700,14 +3855,14 @@ and check_if (env : env) (scope : scope) (use : expr_use) (expected : Type_repr.
                give x the non-Unit branch type over a Unit path *)
             match use with
             | Discarded -> None
-            | Value -> Some tt.te_type)
+            | Value -> Some tt_ty)
       in
       match check_block env scope eb_exp eb eb.Ast.b_span with
       | Error m -> Error m
       | Ok te -> (
           let subst = ref [] in
           let* _ =
-            match unify env.state.box_tid subst tt.te_type te.te_type with
+            match unify env.state.box_tid subst tt_ty (flow_normal te) with
             | Ok () -> Ok ()
             | Error m -> (
                 (* a DISCARDED if whose branches diverge over Unit
@@ -3716,7 +3871,7 @@ and check_if (env : env) (scope : scope) (use : expr_use) (expected : Type_repr.
                    discarded context (the audit: value-context
                    divergence over Unit is a bad inference shape);
                    other divergences stay errors *)
-                match use, tt.te_type, te.te_type with
+                match use, tt_ty, flow_normal te with
                 | Discarded, Type_repr.Unit, _ | Discarded, _, Type_repr.Unit -> Ok ()
                 | _ -> Error m)
           in
@@ -3726,16 +3881,16 @@ and check_if (env : env) (scope : scope) (use : expr_use) (expected : Type_repr.
              adoption), and — in DISCARDED context only — the non-Unit
              type when the branches diverge over Unit *)
           let if_ty =
-            match tt.te_type, te.te_type with
+            match tt_ty, flow_normal te with
             | Type_repr.Int_literal _, Type_repr.Int k -> Type_repr.Int k
             | Type_repr.Int k, Type_repr.Int_literal _ -> Type_repr.Int k
             | Type_repr.Unit, t when use = Discarded -> t
             | t, Type_repr.Unit when use = Discarded -> t
-            | _ -> substitute_fixpoint !subst tt.te_type
+            | _ -> substitute_fixpoint !subst tt_ty
           in
           let all_effects =
             Array.concat
-              (cond_effects :: List.map (fun (te : typed_expr) -> te.te_effects) (tt :: telsif @ [ te ]))
+              (cond_effects :: List.map (fun (_fr : flow_result) -> [||]) (tt :: telsif @ [ te ]))
           in
           Ok { te_type = if_ty; te_effects = all_effects; te_span = i.Ast.if_span }))
 
@@ -5383,9 +5538,25 @@ let rec check_function_body (env : env) (extra_tp_bounds : (string * string list
             | Type_repr.Unit -> None
             | _ -> Some sig_.ts_return)
             b b.b_span
-      | Ast.FnExpr e -> check_expr env' scope (Some sig_.ts_return) e
+      | Ast.FnExpr e -> (
+          match check_expr env' scope (Some sig_.ts_return) e with
+          | Error m -> Error m
+          | Ok te ->
+              Ok
+                {
+                  fr_normal = Some te.te_type;
+                  fr_may_return = false;
+                  fr_may_break = false;
+                  fr_may_continue = false;
+                })
       | Ast.FnSignatureOnly ->
-          Ok { te_type = sig_.ts_return; te_effects = [||]; te_span = sig_.ts_span }
+          Ok
+            {
+              fr_normal = Some sig_.ts_return;
+              fr_may_return = false;
+              fr_may_break = false;
+              fr_may_continue = false;
+            }
     in
     let subst = ref [] in
     (* the production rule (types.tg): a Unit-returning function
@@ -5397,21 +5568,23 @@ let rec check_function_body (env : env) (extra_tp_bounds : (string * string list
         match d.fn_body with
         | Ast.FnBlock _ -> Ok ()
         | _ -> (
-            match unify env.state.box_tid subst Type_repr.Unit body.te_type with
+            match unify env.state.box_tid subst Type_repr.Unit (flow_normal body) with
             | Ok () -> Ok ()
             | Error m ->
                 Error
                   (err d.fn_span
                      (Printf.sprintf "function body type mismatch: expected %s, found %s (%s)"
-                        (type_to_string sig_.ts_return) (type_to_string body.te_type) m))))
+                        (type_to_string sig_.ts_return)
+                        (type_to_string (flow_normal body)) m))))
     | _ -> (
-        match unify env.state.box_tid subst sig_.ts_return body.te_type with
+        match unify env.state.box_tid subst sig_.ts_return (flow_normal body) with
         | Ok () -> Ok ()
         | Error m ->
             Error
               (err d.fn_span
                  (Printf.sprintf "function body type mismatch: expected %s, found %s (%s)"
-                    (type_to_string sig_.ts_return) (type_to_string body.te_type) m)))
+                    (type_to_string sig_.ts_return)
+                    (type_to_string (flow_normal body)) m)))
   in
   env.impls.param_bounds <- saved;
   result
