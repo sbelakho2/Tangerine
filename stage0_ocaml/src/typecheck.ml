@@ -270,6 +270,7 @@ type env = {
   nominals : (string * nominal) list;
   constructors : (string * typed_signature) list;
   consts : (string * Type_repr.t) list;
+  statics : (string * Type_repr.t) list;  (* the MUTABLE statics: a const is immutable and must never become an assignable global place — the audit's ConstId vs StaticId separation *)
   state : state;
   module_id : Ids.Module_id.t;
   resolved : Resolver.resolved_program option;
@@ -1391,6 +1392,7 @@ let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
     nominals = [ ("Instant", instant_nominal); ("Any", any_nominal); ("Option", opt_nominal); ("Result", res_nominal); ("PtrMut", ptrm_nominal) ];
     constructors = builtin_constructors st opt_p res_p res_e_p;
     consts = [];
+    statics = [];
     state = st;
     module_id = Ids.Module_id.make 0;
     resolved;
@@ -4167,29 +4169,35 @@ and check_place (env : env) (scope : scope) (e : Ast.expr) : (Type_repr.t * bool
       match assoc_local n scope.locals with
       | Some (t, mutable_) -> Ok (t, mutable_)
       | None -> (
-          (* a static is an assignable global: resolve it through the
-             module-qualified consts, then the bare name *)
-          match
-            match env.module_path with
-            | [] -> None
-            | mp -> List.assoc_opt (String.concat "::" (mp @ [ n ])) env.consts
-          with
+          (* a MUTABLE STATIC is an assignable global — a CONST is
+             immutable and must never be a place (the audit's ConstId
+             vs StaticId separation): resolve through the statics
+             registry (module-qualified, then the bare name, then the
+             unique `::name` suffix for the single-file path mismatch) *)
+          let statics_lookup n =
+            let qualified =
+              match env.module_path with
+              | [] -> None
+              | mp -> List.assoc_opt (String.concat "::" (mp @ [ n ])) env.statics
+            in
+            match qualified with
+            | Some t -> Some t
+            | None -> (
+                match List.assoc_opt n env.statics with
+                | Some t -> Some t
+                | None -> (
+                    let suffix = "::" ^ n in
+                    match
+                      List.find_opt (fun (k, _) -> Util.has_suffix k suffix) env.statics
+                    with
+                    | Some (_, t) -> Some t
+                    | None -> None))
+          in
+          match statics_lookup n with
           | Some t -> Ok (t, true)
-          | None -> (
-              match List.assoc_opt n env.consts with
-              | Some t -> Ok (t, true)
-              | None -> (
-                  (* the single-file module-path mismatch: the consts
-                     are keyed by the item's qualified name (the
-                     file-derived module) while the expression's
-                     env.module_path may be [] — fall back to the
-                     unique `::name` suffix *)
-                  let suffix = "::" ^ n in
-                  match
-                    List.find_opt (fun (k, _) -> Util.has_suffix k suffix) env.consts
-                  with
-                  | Some (_, t) -> Ok (t, true)
-                  | None -> Error (err span (Printf.sprintf "unknown variable `%s`" n))))))
+          | None ->
+              (* a CONST read is a VALUE, not a place *)
+              Error (err span (Printf.sprintf "unknown variable `%s`" n))))
   | Ast.Field (_, base, fname, span) -> (
       match check_place env scope base with
       | Error m -> Error m
@@ -4335,6 +4343,35 @@ and check_field (env : env) (_scope : scope) (span : Span.span) (base : typed_ex
 
 and check_name (env : env) (scope : scope) (expected : Type_repr.t option)
     (node_id : Ids.Node_id.t) (n : string) (span : Span.span) : (typed_expr, string) result =
+  (* the MUTABLE-static read (the ConstId vs StaticId separation): a
+     static is a global VALUE from the statics registry — the
+     module-qualified lookup, then the bare name, then the unique
+     `::name` suffix for the single-file path mismatch; the helper
+     returns the full result so the fallback nesting below is
+     untouched *)
+  let static_read () : (typed_expr, string) result option =
+    let found =
+      let qualified =
+        match env.module_path with
+        | [] -> None
+        | mp -> List.assoc_opt (String.concat "::" (mp @ [ n ])) env.statics
+      in
+      match qualified with
+      | Some t -> Some t
+      | None -> (
+          match List.assoc_opt n env.statics with
+          | Some t -> Some t
+          | None -> (
+              let suffix = "::" ^ n in
+              match List.find_opt (fun (k, _) -> Util.has_suffix k suffix) env.statics with
+              | Some (_, t) -> Some t
+              | None -> None))
+    in
+    match found with
+    | Some t ->
+        Some (Ok { te_type = t; te_effects = [| Access_effect.Read |]; te_span = span })
+    | None -> None
+  in
   match assoc_local n scope.locals with
       | Some (t, _) ->
       let subst = ref [] in
@@ -4355,6 +4392,9 @@ and check_name (env : env) (scope : scope) (expected : Type_repr.t option)
           te_span = span;
         }
   | None -> (
+      match static_read () with
+      | Some r -> r
+      | None -> (
       match n with
       | "self" -> (
           (* the implicit receiver: impl methods may reference `self`
@@ -4474,7 +4514,7 @@ and check_name (env : env) (scope : scope) (expected : Type_repr.t option)
                                  env.state.oracle.o_unresolved_calls <-
                                    env.state.oracle.o_unresolved_calls + 1;
                                  Error
-                                   (err span (Printf.sprintf "unknown name `%s`" n))))))))
+                                   (err span (Printf.sprintf "unknown name `%s`" n)))))))))
 
 and return_unify_err (span : Span.span) (a : Type_repr.t) (b : Type_repr.t) (m : string) :
     (typed_expr, string) result =
@@ -5789,7 +5829,7 @@ and check_const (env : env) (mp : string list) (d : Ast.const_decl) : (unit, str
       | Error m -> Error m)
 
 and check_static (env : env) (mp : string list) (d : Ast.static_decl) : (unit, string) result =
-  match List.assoc_opt (qualified_name mp d.st_name) env.consts with
+  match List.assoc_opt (qualified_name mp d.st_name) env.statics with
   | None -> Error (err d.st_span "internal: static was not registered")
   | Some ty -> (
       match check_expr env empty_scope (Some ty) d.st_value with
@@ -6314,7 +6354,7 @@ and register_item (env : env) (item : Ast.item) : (env, string) result =
   | Ast.StaticDecl d ->
       let qname = qualified_name item.module_path d.st_name in
       let* ty = resolve_type env empty_scope d.st_type in
-      Ok { env with consts = (qname, ty) :: List.remove_assoc qname env.consts }
+      Ok { env with statics = (qname, ty) :: List.remove_assoc qname env.statics }
   | Ast.TypeAlias d ->
       let params =
         let key = "alias::" ^ qualified_name item.module_path d.ta_name in
@@ -6423,7 +6463,7 @@ let item_param_ids (env : env) (item : Ast.item) : Ids.Generic_param_id.t list =
       | Some t -> params_in t
       | None -> [])
   | Ast.StaticDecl d -> (
-      match List.assoc_opt (qualified_name item.module_path d.st_name) env.consts with
+      match List.assoc_opt (qualified_name item.module_path d.st_name) env.statics with
       | Some t -> params_in t
       | None -> [])
   | _ -> []

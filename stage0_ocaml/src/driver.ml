@@ -304,7 +304,7 @@ let const_values (env : Typecheck.env) (items : Ast.item list) :
           match lit_constant d ty with
           | None -> []
           | Some c -> List.map (fun k -> (k, (ty, c))) (bare_keys n)))
-    env.Typecheck.consts
+    (env.Typecheck.consts @ env.Typecheck.statics)
 
 let closure_statics (env : Typecheck.env) (items : Ast.item list) :
     (string * Type_repr.t * Seed_mir.constant option) array =
@@ -321,7 +321,7 @@ let closure_statics (env : Typecheck.env) (items : Ast.item list) :
     (List.filter_map
        (fun (n, ty : string * Type_repr.t) ->
          if Type_repr.has_type_param ty then None else Some (n, ty, init_of n))
-       env.Typecheck.consts)
+       env.Typecheck.statics)
 
 let closure_types (env : Typecheck.env) : Seed_mir.type_def array =
   Array.of_list
@@ -552,12 +552,15 @@ let lowering_env_of ?(items : Ast.item list = []) (env : Typecheck.env) : Mir_lo
       | x :: _ -> x
       | [] -> q
     in
+    (* the STATICS registry is the assignable global universe (the
+       ConstId vs StaticId separation) — the lowering's global slots
+       come from here, never from the immutable consts *)
     List.filter_map
       (fun (n, ty : string * Type_repr.t) ->
         if Type_repr.has_type_param ty then None
         else
           let prefix =
-            List.take_while (fun (m, _) -> m <> n) env.Typecheck.consts
+            List.take_while (fun (m, _) -> m <> n) env.Typecheck.statics
           in
           let idx =
             List.length (List.filter (fun (_, t) -> not (Type_repr.has_type_param t)) prefix)
@@ -565,7 +568,7 @@ let lowering_env_of ?(items : Ast.item list = []) (env : Typecheck.env) : Mir_lo
           (* the lowering addresses globals by their BARE name — the
              same single-file module-path convention the checker uses *)
           Some (bare_of n, (idx, ty)))
-      env.Typecheck.consts
+      env.Typecheck.statics
   in
   {
     Mir_lower.types = env.Typecheck.types;

@@ -407,7 +407,7 @@ struct Point
   x: Int
   y: Int
 end
-const MAX_POINTS: Int = 10
+static MAX_POINTS: Int = 10
 def main() -> Int
   0
 end
@@ -585,6 +585,9 @@ end
                       types = ctypes;
                     }
                   in
+                  Array.iter
+                    (fun (sn, _, so) -> Printf.eprintf "DBG ctor statics: %s opt=%b\n" sn (so <> None))
+                    cprog_mir.Seed_mir.statics;
                   (match
                      Mir_verify.require_valid_template
                        ~generic_types:(Driver.closure_generic_types cenv)
