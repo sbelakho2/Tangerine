@@ -317,9 +317,12 @@ diag_path = record_file[:-5] + ".diagnostics.jsonl"
 with open(diag_path, "w") as f:
     f.write(diag_content)
 
-# the typed-profile artifact (the audit's item 15): the per-finding
-# JSONL written by the driver next to the diagnostics file, hashed,
-# with the exact count enforced against the EVIDENCE_PROFILE total.
+# the typed-profile facts (the audit's item 15): initialized before
+# the per-finding artifact block below consumes them
+typed_profile = {"total_findings": None, "counts_by_kind": {}, "findings_artifact": None, "findings_sha256": None}
+# the typed-profile artifact: the per-finding JSONL written by the
+# driver next to the diagnostics file, hashed, with the exact count
+# enforced against the EVIDENCE_PROFILE total.
 profile_findings = []
 driver_profile_path = os.path.join(work_dir, "diagnostics.typedprofile.jsonl")
 profile_path = record_file[:-5] + ".typedprofile.jsonl"
@@ -391,7 +394,6 @@ subset = {"total_findings": None, "counts_by_code": {}, "modules_with_findings":
 strict_resolution = {"diagnostics": [], "compatibility_fallback_activations": None}
 mir = {"template_verify": None, "concrete_verify": None}
 host = {"reachable_closure": None, "reachable": None, "declared": None, "implemented": None}
-typed_profile = {"total_findings": None, "counts_by_kind": {}, "findings_artifact": None, "findings_sha256": None}
 for line in bc_out.splitlines():
     m = SUBSET_RE.match(line)
     if m:
