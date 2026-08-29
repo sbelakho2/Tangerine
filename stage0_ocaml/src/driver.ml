@@ -427,7 +427,7 @@ let typed_nodes_of (env : Typecheck.env) : (Ids.Node_id.t * Mir_lower.typed_node
    names/types, constants, field names) instead of re-interpreting the
    syntactic Ast.pattern. *)
 let typed_for_patterns_of (env : Typecheck.env) :
-    (Ids.Node_id.t * (Typed_pattern.t * Type_repr.t)) list =
+    (Ids.Node_id.t * Typecheck.typed_for) list =
   Hashtbl.fold (fun k v acc -> (k, v) :: acc) env.Typecheck.typed_for_patterns []
 
 let typed_let_patterns_of (env : Typecheck.env) :
@@ -1687,6 +1687,8 @@ let lower_closure (ctx : closure_ctx) : Seed_mir.program =
                         Mir_lower.lower_function_with_variants
                           ~typed_nodes:(typed_nodes_of ctx.ctx_env)
                           ~typed_patterns:(typed_patterns_of ctx.ctx_env)
+                          ~typed_for_patterns:(typed_for_patterns_of ctx.ctx_env)
+                          ~typed_let_patterns:(typed_let_patterns_of ctx.ctx_env)
                           variants
                           { base with Mir_lower.fn_ret = ts.Typecheck.ts_return }
                           m.Ast.fn_sig.Ast.sig_name
@@ -1719,6 +1721,8 @@ let lower_closure (ctx : closure_ctx) : Seed_mir.program =
       let f =
         Mir_lower.lower_function_with_variants ~typed_nodes:(typed_nodes_of ctx.ctx_env)
                     ~typed_patterns:(typed_patterns_of ctx.ctx_env)
+                    ~typed_for_patterns:(typed_for_patterns_of ctx.ctx_env)
+                    ~typed_let_patterns:(typed_let_patterns_of ctx.ctx_env)
           variants
           { base with Mir_lower.fn_ret = ts.Typecheck.ts_return }
           qname

@@ -69,6 +69,27 @@ type expr_use = Value | Discarded
    it.  This replaces the collapsed typed_expr model where a loop's
    body tail could leak as the loop's expression type (the enormous
    `expected (), found Bool` cluster). *)
+(* the typed-iterable record (the audit's item 13): the iteration
+   kind is resolved ONCE during typing from the iterable's semantic
+   type; Typed_profile and Mir_lower consume the SAME fact — no one
+   re-classifies the iterable later. *)
+type iteration_kind =
+  | IterRange
+  | IterFixedArray
+  | IterVec
+  | IterMap
+  | IterSet
+  | IterString
+  | IterTuple
+  | IterOther
+
+type typed_for = {
+  tf_pattern : Typed_pattern.t;
+  tf_iterable_type : Type_repr.t;
+  tf_element_type : Type_repr.t;
+  tf_iteration_kind : iteration_kind;
+}
+
 type flow_result = {
   fr_normal : Type_repr.t option;  (* None = the normal continuation is unreachable *)
   fr_may_return : bool;
@@ -268,7 +289,7 @@ type env = {
      pattern (and the resolved element type), keyed by the ForExpr's
      NodeId — MIR lowering consumes the semantic tree instead of
      re-interpreting the raw pattern syntax *)
-  typed_for_patterns : (Ids.Node_id.t, Typed_pattern.t * Type_repr.t) Hashtbl.t;
+  typed_for_patterns : (Ids.Node_id.t, typed_for) Hashtbl.t;
   (* the typed-LET channel (the audit: every binding pattern site is
      resolved ONCE into the semantic tree; MIR lowering consumes it
      instead of re-interpreting the raw syntax) — keyed by the
@@ -3463,12 +3484,34 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
           | Some et -> (
               match check_pattern env scope et f.Ast.for_pattern with
               | Error m -> Error m
-              | Ok (tp, binds) ->
+              | Ok (tp, binds) -> (
                   (* the typed-iterable channel: record the SEMANTIC
-                     pattern + the resolved element type under the
-                     ForExpr's NodeId — lowering consumes this, never
-                     the raw syntax *)
-                  Hashtbl.replace env.typed_for_patterns nid (tp, et);
+                     pattern + the resolved element type + the iteration
+                     kind under the ForExpr's NodeId — the SAME fact
+                     Typed_profile and Mir_lower consume *)
+                  let kind =
+                    match te.te_type with
+                    | Type_repr.Int _ -> IterRange
+                    | Type_repr.Fixed_array _ -> IterFixedArray
+                    | Type_repr.Named (id, [| _ |])
+                      when Ids.Type_id.compare id b_array = 0 ->
+                        IterVec
+                    | Type_repr.String -> IterString
+                    | Type_repr.Tuple _ -> IterTuple
+                    | Type_repr.Named (id, _) -> (
+                        match List.assoc_opt id env.type_names with
+                        | Some "Map" -> IterMap
+                        | Some "Set" -> IterSet
+                        | _ -> IterOther)
+                    | _ -> IterOther
+                  in
+                  Hashtbl.replace env.typed_for_patterns nid
+                    {
+                      tf_pattern = tp;
+                      tf_iterable_type = te.te_type;
+                      tf_element_type = et;
+                      tf_iteration_kind = kind;
+                    };
                   let scope = add_binds scope binds in
                   (match
                      check_block env { scope with loop_depth = scope.loop_depth + 1 } None
@@ -3484,7 +3527,7 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
                        Ok
                          { te_type = Type_repr.Unit;
                            te_effects = [||];
-                           te_span = f.Ast.for_span }))))
+                           te_span = f.Ast.for_span })))))
   | Ast.WhileExpr (_, w) -> (
       match check_expr env scope (Some Type_repr.Bool) w.Ast.wh_condition with
       | Error m -> Error m

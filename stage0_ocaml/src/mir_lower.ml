@@ -367,14 +367,14 @@ type lower_state = {
   (* the typed-iterable channel (the audit): ForExpr NodeId -> the
      loop's SEMANTIC pattern + resolved element type — the lowering
      consumes this instead of re-interpreting the raw pattern syntax *)
-  typed_for_patterns : (Ids.Node_id.t * (Typed_pattern.t * Type_repr.t)) list;
+  typed_for_patterns : (Ids.Node_id.t * Typecheck.typed_for) list;
   typed_let_patterns : (Ids.Node_id.t * Typed_pattern.t) list;
 }
 
 (* The typed-iterable lookup: the ForExpr's semantic pattern + element
    type from the typechecker's channel. *)
 let typed_for_of (st : lower_state) (node_id : Ids.Node_id.t) :
-    (Typed_pattern.t * Type_repr.t) option =
+    Typecheck.typed_for option =
   List.assoc_opt node_id st.typed_for_patterns
 
 let typed_let_of (st : lower_state) (node_id : Ids.Node_id.t) :
@@ -1425,8 +1425,9 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
           let elem_ty = element_type_of arr_ty in
           let bindings =
             match typed_for_of st fid with
-            | Some (tp, _) ->
+            | Some tf ->
                 (* the semantic channel is authoritative *)
+                let tp = tf.Typecheck.tf_pattern in
                 List.map
                   (fun (n, id, path) ->
                     let path =
@@ -1577,7 +1578,8 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
               push_block st body_b;
               let bindings =
                 match typed_for_of st fid with
-                | Some (tp, _) ->
+                | Some tf ->
+                    let tp = tf.Typecheck.tf_pattern in
                     List.map
                       (fun (n, id, path) ->
                         let path =
@@ -1694,7 +1696,8 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
               let elem_ty = element_type_of arr_ty in
               let bindings =
                 match typed_for_of st fid with
-                | Some (tp, _) ->
+                | Some tf ->
+                    let tp = tf.Typecheck.tf_pattern in
                     List.map
                       (fun (n, id, path) ->
                         let path =
@@ -3764,7 +3767,7 @@ and emit_defers (env : func_env) (st : lower_state) : unit =
 let lower_function_with_variants
     ?(typed_nodes : (Ids.Node_id.t * typed_node) list = [])
     ?(typed_patterns : ((Ids.Node_id.t * int) * Typed_pattern.t) list = [])
-    ?(typed_for_patterns : (Ids.Node_id.t * (Typed_pattern.t * Type_repr.t)) list = [])
+    ?(typed_for_patterns : (Ids.Node_id.t * Typecheck.typed_for) list = [])
     ?(typed_let_patterns : (Ids.Node_id.t * Typed_pattern.t) list = [])
     ?(param_tys_opt : Type_repr.t array option) (variants : variant_table)
     (env : func_env) (name : string)

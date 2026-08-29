@@ -18,36 +18,20 @@ type finding = {
 }
 
 let check (env : Typecheck.env) (items : Ast.item list) : finding list =
-  let b_array = Ids.Type_id.make 0 in
   let findings = ref [] in
-  let iterable_kind (ty : Type_repr.t) : string option =
-    match ty with
-    | Type_repr.Int _ -> Some "Range"
-    | Type_repr.Fixed_array _ -> Some "Fixed_array"
-    | Type_repr.Named (id, [| _ |]) when Ids.Type_id.compare id b_array = 0 ->
-        Some "Array/Vec"
-    | Type_repr.String -> Some "String"
-    | Type_repr.Named (id, args) -> (
-        match List.assoc_opt id env.Typecheck.type_names with
-        | Some ("Map" | "Set") when Array.length args >= 1 -> Some "Map/Set"
-        | _ -> None)
-    | Type_repr.Tuple _ -> Some "Tuple"
-    | _ -> None
-  in
   let check_expr (e : Ast.expr) =
     match e with
     | Ast.ForExpr (fid, f) -> (
-        (* the typed iterable kind from the typed-node channel: the
-           typechecker's resolved node for the iterable expression *)
-        let it_ty =
-          match Hashtbl.find_opt env.Typecheck.typed_nodes fid with
-          | Some tn -> Some tn.Typecheck.tn_type
-          | None -> None
-        in
-        match it_ty with
-        | Some ty -> (
-            match iterable_kind ty with
-            | Some ("Map" | "Set" | "Tuple") ->
+        (* the typed-iterable record (the audit's item 13): the
+           typechecker resolved the iteration kind ONCE from the
+           iterable's semantic type — the profile consumes that SAME
+           fact instead of re-reading the ForExpr node's tn_type (the
+           loop's RESULT type, which is Unit under the FlowResult
+           port) *)
+        match Hashtbl.find_opt env.Typecheck.typed_for_patterns fid with
+        | Some tf -> (
+            match tf.Typecheck.tf_iteration_kind with
+            | Typecheck.IterMap | Typecheck.IterSet | Typecheck.IterTuple ->
                 findings :=
                   { f_kind = "for-iterable";
                     f_span = Ast.expr_span f.Ast.for_iterable;
@@ -57,23 +41,29 @@ let check (env : Typecheck.env) (items : Ast.item list) : finding list =
                   :: !findings
             | _ -> ())
         | None -> ())
-    | Ast.Call (_, callee, _, _args, span) -> (
-        (* a closure call: the callee is a FIELD of function type
-           (`case.func()`, `self.handler(...)`) — the seed lowers only
-           the statically-known callables; a bare Name resolves through
-           the registered function table (qualified-suffix identity) *)
-        let is_closure_field =
-          match callee with
-          | Ast.Field (_, _, _, _) -> true
-          | _ -> false
+    | Ast.Call (nid, callee, _, _args, span) -> (
+        (* the audit's item 14: the semantic question is whether the
+           typed call node has a RESOLVED callable — the callee's
+           syntax (Field vs Name) is irrelevant (ordinary
+           `obj.method(...)` is a Field-callee with a resolved
+           tn_call).  A resolved tn_call = a direct call; an
+           UNRESOLVED call through a callable value = an actual
+           closure call. *)
+        let resolved =
+          match Hashtbl.find_opt env.Typecheck.typed_nodes nid with
+          | Some tn -> tn.Typecheck.tn_call <> None
+          | None -> false
         in
-        if is_closure_field then
-          findings :=
-            { f_kind = "closure-call";
-              f_span = span;
-              f_message = "call through a function-valued field (a closure value call is not lowered by the seed)" }
-            :: !findings
+        if resolved then ()
         else
+          match callee with
+          | Ast.Field (_, _, _, _) ->
+              findings :=
+                { f_kind = "closure-call";
+                  f_span = span;
+                  f_message = "call through a function-valued field with no resolved callable (a closure value call is not lowered by the seed)" }
+                :: !findings
+          | _ -> (
           match callee with
           | Ast.Name (_, n, _) -> (
               (* the registered universe: the functions (suffix-
@@ -98,7 +88,7 @@ let check (env : Typecheck.env) (items : Ast.item list) : finding list =
                     f_span = span;
                     f_message = "call to an unregistered callable `" ^ n ^ "` (a closure value call is not lowered by the seed)" }
                   :: !findings)
-          | _ -> ())
+          | _ -> ()))
     | _ -> ()
   in
   let rec check_stmt (st : Ast.stmt) =
