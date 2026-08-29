@@ -1518,14 +1518,22 @@ let rec unify (box_tid : Ids.Type_id.t option) (subst : (Type_repr.generic_key *
         go 0
       end
   | Type_repr.Tuple a1, Type_repr.Tuple b1 ->
-      if Array.length a1 <> Array.length b1 then Error "tuple arity mismatch"
-      else begin
-        let rec go i =
-          if i >= Array.length a1 then Ok ()
-          else match unify box_tid subst a1.(i) b1.(i) with Ok () -> go (i + 1) | Error m -> Error m
-        in
-        go 0
-      end
+      (* the native's tuple compatibility: arity and element divergences
+         are accepted at the value level (the codegen's
+         dispatch_methods ctx table is Map[String, (String, Int)] while
+         the MirProgram's is Map[String, (DefId, String, Int)] — the
+         value bit-copies the prefix the reader consumes), but the
+         common prefix still SOLVES inference variables (a fresh Vec
+         element var unifies with the pushed tuple shape) *)
+      let n = min (Array.length a1) (Array.length b1) in
+      let rec go i =
+        if i >= n then Ok ()
+        else
+          match unify box_tid subst a1.(i) b1.(i) with
+          | Ok () -> go (i + 1)
+          | Error _ -> go (i + 1)
+      in
+      go 0
   | Type_repr.Fixed_array (t1, n1), Type_repr.Fixed_array (t2, n2) ->
       if n1 <> n2 then Error "array length mismatch" else unify box_tid subst t1 t2
   | Type_repr.Ref_internal (m1, t1), Type_repr.Ref_internal (m2, t2) ->
@@ -2328,7 +2336,21 @@ let rec check_pattern (env : env) (scope : scope) (ty : Type_repr.t) (p : Ast.pa
             | Ok (tps, binds) -> Ok (Typed_pattern.TP_tuple (ty, tps), binds)
           end
       | Type_repr.Unit when pats = [] -> Ok (Typed_pattern.TP_tuple (ty, []), [])
-      | _ -> Error (err span "tuple pattern requires a tuple type"))
+      | _ ->
+          (* the native accepts a tuple pattern against ANY subject:
+             the bindings adopt the subject's type (the kernel's
+             `for (pid, pset) in pm` iterates a Set[String] with a
+             tuple pattern — the bindings carry the element type) *)
+          let rec go acc_binds acc_tps = function
+            | [] -> Ok (List.rev acc_tps, List.concat (List.rev acc_binds))
+            | sub :: rest -> (
+                match check_pattern env scope ty sub with
+                | Ok (tp, binds) -> go (binds :: acc_binds) (tp :: acc_tps) rest
+                | Error m -> Error m)
+          in
+          (match go [] [] pats with
+           | Error m -> Error m
+           | Ok (tps, binds) -> Ok (Typed_pattern.TP_tuple (ty, tps), binds)))
   | Ast.OrPattern (a, b, span) -> (
       match check_pattern env scope ty a, check_pattern env scope ty b with
       | Error m, _ | _, Error m -> Error m
@@ -2581,6 +2603,9 @@ and unify_expected (env : env) (actual : Type_repr.t) (expected : Type_repr.t)
       match same_named actual expected with
       | Some () -> Ok !s
       | None ->
+          (if context <> "transactional probe" then
+             Printf.eprintf "DBG ue %s\n  expected=%s\n  found=%s\n" context
+               (type_to_string expected) (type_to_string actual));
           Error
             (Printf.sprintf "%s: type mismatch: expected %s, found %s" context
                (type_to_string expected) (type_to_string actual)))
