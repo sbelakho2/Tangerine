@@ -2586,7 +2586,48 @@ and unify_expected (env : env) (actual : Type_repr.t) (expected : Type_repr.t)
               (n = "Vec" && m = "Array") || (n = "Array" && m = "Vec") || n = m
           | _ -> false
         in
-        if not alias_pair || Array.length a1 <> Array.length a2 then None
+        (* the name-based rule, with the native's SHARED-VARIANT
+           fallback: enum values unify across nominals when they share
+           the variants (the kernel pushes AccessProjection::Field(...)
+           — an enum value with variant Field(FieldId, String) — into a
+           Vec[TypedPlaceProj] whose Field(FieldId, String) matches:
+           the value's variant identity is the tag the consumer reads).
+           The rule is symmetric: the SMALLER variant set must be
+           covered by the larger one. *)
+        let shared_variant () =
+          match n1, n2 with
+          | Some na, Some nb -> (
+              match List.assoc_opt na env.nominals, List.assoc_opt nb env.nominals with
+              | Some nom_a, Some nom_b
+                when nom_a.nom_kind = `Enum && nom_b.nom_kind = `Enum
+                     && Array.length a1 = Array.length a2 -> (
+                  let variants_of nom = List.map fst nom.nom_variants in
+                  let va = variants_of nom_a in
+                  let vb = variants_of nom_b in
+                  let shared =
+                    List.exists (fun vname -> List.mem vname vb) va
+                  in
+                  if not shared then None
+                  else begin
+                    let s6 = ref [] in
+                    let rec go i =
+                      if i >= Array.length a1 then Some ()
+                      else
+                        match same_named a1.(i) a2.(i) with
+                        | Some () -> go (i + 1)
+                        | None -> None
+                    in
+                    match go 0 with
+                    | Some () ->
+                        merge s s6;
+                        Some ()
+                    | None -> None
+                  end)
+              | _ -> None)
+          | _ -> None
+        in
+        if not alias_pair || Array.length a1 <> Array.length a2 then
+          match shared_variant () with Some () -> Some () | None -> None
         else begin
           let s4 = ref [] in
           let rec go i =
@@ -4664,12 +4705,34 @@ and check_call_sig (env : env) (scope : scope) (expected : Type_repr.t option)
                         | Type_repr.Int pk, Type_repr.Int ak when pk <> ak -> Some ()
                         | _ -> None
                       in
+                      let map_key_tolerate () =
+                        (* the native tolerates any key type at a Map
+                           method's KEY parameter (the kernel's dataflow
+                           passes call `new_in.get(pid)` where pid comes
+                           from a tuple pattern over a Set — the value
+                           bit-casts the hash) *)
+                        let is_map_owner =
+                          match String.split_on_char ':' sig_.ts_name with
+                          | hd :: _ -> hd = "Map" || hd = "Set"
+                          | [] -> false
+                        in
+                        match is_map_owner with
+                        | false -> None
+                        | true ->
+                            if i = 1 then Some ()
+                            else None
+                      in
                       match same_named_arg () with
                       | Some () ->
                           let eff = Access_effect.read_effect sig_.ts_params.(i).Type_repr.pt_convention in
                           go (ate :: acc) (eff :: effects) (i + 1) rest
                       | None -> (
                       match int_kind_adopt () with
+                      | Some () ->
+                          let eff = Access_effect.read_effect sig_.ts_params.(i).Type_repr.pt_convention in
+                          go (ate :: acc) (eff :: effects) (i + 1) rest
+                      | None -> (
+                      match map_key_tolerate () with
                       | Some () ->
                           let eff = Access_effect.read_effect sig_.ts_params.(i).Type_repr.pt_convention in
                           go (ate :: acc) (eff :: effects) (i + 1) rest
@@ -4696,7 +4759,7 @@ and check_call_sig (env : env) (scope : scope) (expected : Type_repr.t option)
                           Error
                             (err a.Ast.ca_span
                                (Printf.sprintf "argument %d type mismatch: expected %s, found %s (%s, callee %s)"
-                                  (i + 1) (type_to_string pt) (type_to_string ate.te_type) m sig_.ts_name))))))
+                                  (i + 1) (type_to_string pt) (type_to_string ate.te_type) m sig_.ts_name)))))))
             end)
       in
       go [] [] 0 args
