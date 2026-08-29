@@ -538,10 +538,36 @@ let lowering_env_of ?(items : Ast.item list = []) (env : Typecheck.env) : Mir_lo
          }))
       env.Typecheck.methods
   in
+  (* the GLOBAL-storage channel (the audit's mutable statics): the
+     static name -> (program.statics index, type) — the SAME filtered
+     order closure_statics builds (non-generic consts), so -1 - idx
+     addresses the VM's statics slot *)
+  let statics =
+    let bare_of (q : string) : string =
+      match List.rev (String.split_on_char ':' q) with
+      | x :: _ -> x
+      | [] -> q
+    in
+    List.filter_map
+      (fun (n, ty : string * Type_repr.t) ->
+        if Type_repr.has_type_param ty then None
+        else
+          let prefix =
+            List.take_while (fun (m, _) -> m <> n) env.Typecheck.consts
+          in
+          let idx =
+            List.length (List.filter (fun (_, t) -> not (Type_repr.has_type_param t)) prefix)
+          in
+          (* the lowering addresses globals by their BARE name — the
+             same single-file module-path convention the checker uses *)
+          Some (bare_of n, (idx, ty)))
+      env.Typecheck.consts
+  in
   {
     Mir_lower.types = env.Typecheck.types;
     values;
     consts = const_values env items;
+    statics;
     callables;
     methods;
     fn_ret = Type_repr.Unit;

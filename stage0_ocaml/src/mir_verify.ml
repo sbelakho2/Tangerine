@@ -362,7 +362,18 @@ let project_type (ctx : ctx) (ty : Type_repr.t) (proj : projection) : Type_repr.
       | _ -> None)
 
 let place_type (ctx : ctx) (fn : function_) (p : place) : Type_repr.t option =
-  if p.local < 0 || p.local >= Array.length fn.locals then None
+  (* the GLOBAL storage root: a negative local addresses the VM's
+     statics slot (-1 - local) — exempt from the frame locals *)
+  if p.local < 0 then
+    if p.projections = [] then begin
+      let idx = -1 - p.local in
+      if idx >= 0 && idx < Array.length ctx.prog.Seed_mir.statics then
+        let (_, ty, _) = ctx.prog.Seed_mir.statics.(idx) in
+        Some ty
+      else None
+    end
+    else None
+  else if p.local >= Array.length fn.locals then None
   else
     List.fold_left
       (fun acc proj ->
@@ -924,7 +935,13 @@ let check_projection_owners (ctx : ctx) (fn : function_) (bb_ctx : string)
 
 let check_place_readable (ctx : ctx) (fn : function_) (bb_ctx : string)
     (p : place) (running : IntSet.t) : unit =
-  if p.local < 0 || p.local >= Array.length fn.locals then
+  if p.local < 0 then begin
+    (* the global root: no initialization tracking in the running set *)
+    check_projection_owners ctx fn bb_ctx running p;
+    if p.projections <> [] && place_type ctx fn p = None then
+      add_err ctx (Printf.sprintf "%s: invalid projection chain on static slot _%d" bb_ctx (-1 - p.local))
+  end
+  else if p.local >= Array.length fn.locals then
     add_err ctx (Printf.sprintf "%s: place references undefined local _%d" bb_ctx p.local)
   else begin
     if not (IntSet.mem p.local running) then
@@ -936,7 +953,11 @@ let check_place_readable (ctx : ctx) (fn : function_) (bb_ctx : string)
 
 let check_dest_place (ctx : ctx) (fn : function_) (bb_ctx : string) (p : place)
     (running : IntSet.t) : unit =
-  if p.local < 0 || p.local >= Array.length fn.locals then
+  if p.local < 0 then begin
+    (* the global root: no initialization tracking in the running set *)
+    check_projection_owners ctx fn bb_ctx running p
+  end
+  else if p.local >= Array.length fn.locals then
     add_err ctx (Printf.sprintf "%s: assignment to undefined local _%d" bb_ctx p.local)
   else begin
     check_projection_owners ctx fn bb_ctx running p;

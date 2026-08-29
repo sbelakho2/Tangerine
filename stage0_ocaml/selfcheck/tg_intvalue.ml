@@ -175,6 +175,7 @@ let lower_env () : Mir_lower.func_env =
   let int t = Type_repr.Int t in
   {
     Mir_lower.consts = [];
+    statics = [];
     Mir_lower.types =
       [
         ("Int", int Type_repr.Int);

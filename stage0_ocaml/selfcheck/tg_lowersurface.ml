@@ -428,6 +428,7 @@ end
                 else begin
                   let tys = Driver.closure_types env_m in
                   let sts = Driver.closure_statics env_m mat_prog.Ast.items in
+                  Array.iter (fun (sn, _, _) -> Printf.eprintf "DBG statics: %s\n" sn) sts;
                   let struct_ok =
                     Array.exists
                       (fun d ->
@@ -580,7 +581,7 @@ end
                   let cprog_mir =
                     {
                       Seed_mir.functions = [| main_fn |];
-                      statics = [||];
+                      statics = Driver.closure_statics cenv cprog.Ast.items;
                       types = ctypes;
                     }
                   in
@@ -744,6 +745,100 @@ end
                                Printf.printf
                                  "  const-call pattern round-trip: FAIL (expected 2, got <%s>)\n" m;
                                exit 1)))
+                end));
+      (* ── the MUTABLE STATIC round-trip proof (the audit's P0):
+         `static mut X: Int = 3; X = 5; read X` must be STATEFUL —
+         the lowerer addresses the global slot (-1 - idx), the VM
+         materializes the initializer into the statics array, the
+         write stores, and the later read sees the updated value
+         (the const fold would have returned the INITIAL 3). *)
+      let stsrc = {|
+static mut X: Int = 3
+
+def bump() -> Int
+  X = X + 1
+  X
+end
+
+def main() -> Int
+  bump() + bump()
+end
+|} in
+      (match Source_loader.load_string "<static-mut>" stsrc with
+       | Error _ -> failwith "static-mut source load"
+       | Ok ssrc ->
+           let ssm = Span.create () in
+           let sfid = Span.add_file ssm ssrc.Source.name ssrc in
+           let sdiags = Diagnostic.create_bag () in
+           let slx = Lexer.create ssrc.Source.bytes sfid sdiags in
+           let stoks = Lexer.lex slx in
+           let sprog = Parser.parse stoks ssrc.Source.bytes sfid sdiags [ "sm" ] in
+           (match Typecheck.check_program (Typecheck.initial_env ()) sprog with
+            | Error m -> failwith ("static-mut typecheck: " ^ m)
+            | Ok (senv, serrs) ->
+                if serrs <> [] then
+                  failwith ("static-mut typecheck errors: " ^ String.concat "; " serrs)
+                else begin
+                  let sbase = Driver.lowering_env_of ~items:sprog.Ast.items senv in
+                  let svariants = Driver.user_variant_table senv in
+                  let s_lower name =
+                    let ts =
+                      match List.assoc_opt name senv.Typecheck.functions with
+                      | Some ts -> ts
+                      | None -> (
+                          match
+                            List.filter (fun (k, _) -> Util.has_suffix k ("::" ^ name))
+                              senv.Typecheck.functions
+                          with
+                          | [ (_, ts) ] -> ts
+                          | _ -> failwith ("static-mut: no typed signature for " ^ name))
+                    in
+                    fun (d : Ast.function_decl) ->
+                      Mir_lower.lower_function_with_variants
+                        ~typed_nodes:(Driver.typed_nodes_of senv)
+                        ~typed_patterns:(Driver.typed_patterns_of senv)
+                        ~typed_for_patterns:(Driver.typed_for_patterns_of senv)
+                        svariants
+                        { sbase with Mir_lower.fn_ret = ts.Typecheck.ts_return }
+                        name (Ids.Callable_id.to_int ts.Typecheck.ts_callable)
+                        [||] [||] d
+                  in
+                  let s_fns =
+                    List.filter_map
+                      (fun i ->
+                        match i.Ast.kind with
+                        | Ast.Function d when d.Ast.fn_sig.Ast.sig_name = "bump" ->
+                            Some (s_lower "bump" d)
+                        | Ast.Function d when d.Ast.fn_sig.Ast.sig_name = "main" ->
+                            Some (s_lower "main" d)
+                        | _ -> None)
+                      sprog.Ast.items
+                  in
+                  let s_fns = Array.of_list s_fns in
+                  let s_statics = Driver.closure_statics senv sprog.Ast.items in
+                  let sprog_mir =
+                    { Seed_mir.functions = s_fns; statics = s_statics; types = [||] }
+                  in
+                  let verify_ok =
+                    match Mir_verify.require_valid_concrete sprog_mir with
+                    | Ok () -> true
+                    | Error errs ->
+                        Printf.printf "  mutable static verify (concrete mode): FAIL\n";
+                        List.iter (fun e -> Printf.printf "    %s\n" e) errs;
+                        false
+                  in
+                  if not verify_ok then exit 1
+                  else
+                    let s_entry = s_fns.(0).Seed_mir.instance in
+                    let shost = Host.create ~repo_root:"." ~argv:[||] in
+                    (match Vm.run ~program:sprog_mir ~entry:s_entry ~argv:[||] ~host:shost with
+                     | Error e ->
+                         Printf.printf "  mutable static VM: FAIL %s\n" e.Vm.message;
+                         exit 1
+                     | Ok code ->
+                         Printf.printf
+                           "  mutable static round-trip: PASS (main = 9 — X went 3 -> 4 -> 5 and the two reads sum 4 + 5; exit %d)\n"
+                           code)
                 end));
       (* ── the RUNTIME Vec iteration round-trip proof (the audit's
          typed-iterable requirement): a `for x in v` over a runtime
@@ -1079,6 +1174,7 @@ end
               ( "ROUNDTRIP_K",
                 (int_ty, Seed_mir.Integer (Int_value.of_int64 ~width:64 ~signed:true 42L)) );
             ];
+    Mir_lower.statics = [];
     Mir_lower.types =
             [
               ("Color", color_ty);
@@ -2038,6 +2134,7 @@ end
       let fenv2 : Mir_lower.func_env =
         {
           Mir_lower.consts = [];
+          Mir_lower.statics = [];
     Mir_lower.types =
             [
               ("Pair", Type_repr.Named (pair_tid, [||]));
@@ -2369,6 +2466,7 @@ end
       let wbenv2 : Mir_lower.func_env =
         {
           Mir_lower.consts = [];
+          Mir_lower.statics = [];
     Mir_lower.types =
             [
               ("Pair", Type_repr.Named (wb_pair_tid, [||]));
@@ -3188,6 +3286,7 @@ end
        let lenv2 : Mir_lower.func_env =
          {
            Mir_lower.consts = [];
+          Mir_lower.statics = [];
     Mir_lower.types =
              [
                ("Pair", Type_repr.Named (l_tid, [||]));
@@ -3476,6 +3575,7 @@ end
        let menv2 : Mir_lower.func_env =
          {
            Mir_lower.consts = [];
+          Mir_lower.statics = [];
     Mir_lower.types =
              [
                ("Pair", Type_repr.Named (m_tid, [||]));
@@ -3778,6 +3878,7 @@ end
             let fsenv : Mir_lower.func_env =
               {
                 Mir_lower.consts = [];
+          Mir_lower.statics = [];
     Mir_lower.types =
                   [
                     ("Pair", Type_repr.Named (fs_tid, [||]));
@@ -3895,6 +3996,7 @@ end
             let csenv : Mir_lower.func_env =
               {
                 Mir_lower.consts = [];
+          Mir_lower.statics = [];
     Mir_lower.types =
                   [
                     ("Int", int_ty);
@@ -4168,6 +4270,7 @@ end
        let qenv2 : Mir_lower.func_env =
          {
            Mir_lower.consts = [];
+          Mir_lower.statics = [];
     Mir_lower.types =
              [
                ("Buf", Type_repr.Named (q_tid, [||]));
@@ -4415,6 +4518,7 @@ end
        let va_env : Mir_lower.func_env =
          {
            Mir_lower.consts = [];
+          Mir_lower.statics = [];
     Mir_lower.types =
              [
                ("Vec", va_vec_ty);
@@ -4771,6 +4875,7 @@ end
        let sqenv2 : Mir_lower.func_env =
          {
            Mir_lower.consts = [];
+          Mir_lower.statics = [];
     Mir_lower.types =
              [
                ("String", string_ty);
@@ -4994,6 +5099,7 @@ end
        let qc_env2 : Mir_lower.func_env =
          {
            Mir_lower.consts = [];
+          Mir_lower.statics = [];
     Mir_lower.types =
              [
                ("Color", qc_color_ty);
@@ -5203,6 +5309,7 @@ end
        let w_env2 : Mir_lower.func_env =
          {
            Mir_lower.consts = [];
+          Mir_lower.statics = [];
     Mir_lower.types =
              [
                ("W", Type_repr.Named (w_tid, [||]));

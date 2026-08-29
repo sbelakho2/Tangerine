@@ -42,6 +42,7 @@ and ref_target =
 and frame = {
   fn : int;
   locals : slot array;
+  statics : slot array;  (* the GLOBAL storage: index = -1 - place.local *)
   mutable block : int;
   mutable stmt : int;
 }
@@ -58,6 +59,7 @@ type slot_error =
   | ReadMoved
   | ReadUninitialized
   | MoveMoved
+  | SlotOob of int
   | DropDropped
   | InitializeLive
   | InitializeDropped
@@ -65,6 +67,7 @@ type slot_error =
 let slot_error_string = function
   | ReadMoved -> "read of a moved slot"
   | ReadUninitialized -> "read of an uninitialized slot"
+  | SlotOob i -> "static slot out of bounds: " ^ string_of_int i
   | MoveMoved -> "move of a moved slot"
   | DropDropped -> "drop of a dropped slot"
   | InitializeLive -> "initialization of a live slot"

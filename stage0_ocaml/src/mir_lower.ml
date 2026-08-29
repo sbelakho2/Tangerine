@@ -103,6 +103,7 @@ type func_env = {
   types : (string * Type_repr.t) list;               (* type name -> repr *)
   values : (string * Type_repr.t) list;              (* global value name -> type *)
   consts : (string * (Type_repr.t * Seed_mir.constant)) list;  (* const/static name -> repr + value *)
+  statics : (string * (int * Type_repr.t)) list;  (* static/global name -> (program.statics index, type) — the MUTABLE GLOBAL storage root *)
   callables : (string * callable_entry) list;        (* function name -> resolved entry *)
   methods : ((string * string) * method_entry) list;  (* (receiver type name, method) -> instance + sig contracts *)
   fn_ret : Type_repr.t;
@@ -961,13 +962,21 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
                          [] ) ));
               (copy_place st (cur_place st id), ty)
           | None -> (
-              match List.assoc_opt n env.consts with
-              | Some (ty, c) -> (Seed_mir.Constant c, ty)
+              match List.assoc_opt n env.statics with
+              | Some (idx, ty) ->
+                  (* the GLOBAL read: the place.local convention
+                     -1 - idx addresses the VM's statics slot — the
+                     read is stateful, NOT the const fold *)
+                  ( Seed_mir.Copy { Seed_mir.local = -1 - idx; projections = [] },
+                    ty )
               | None -> (
-                  match List.assoc_opt n env.values with
-                  | Some _ ->
-                      seed_bug "function value `%s` reached lowering without a resolved callable identity" n
-                  | None -> seed_bug "unknown value '%s' in lowering" n))))
+                  match List.assoc_opt n env.consts with
+                      | Some (ty, c) -> (Seed_mir.Constant c, ty)
+                      | None -> (
+                          match List.assoc_opt n env.values with
+                          | Some _ ->
+                              seed_bug "function value `%s` reached lowering without a resolved callable identity" n
+                          | None -> seed_bug "unknown value '%s' in lowering" n)))))
   | Ast.Path (_, a, b, span) -> (
       ignore span;
       seed_bug "path value `%s::%s` reached lowering without a resolved callable identity" a b)
@@ -1164,12 +1173,21 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
                | Some ty -> (copy_place st (cur_place st id), ty)
                | None -> (vo, vt))
            | None -> (
-               match List.assoc_opt n env.values with
-               | Some ty ->
-                   let id = fresh_local st ty in
-                   emit st (Seed_mir.Assign (cur_place st id, Seed_mir.Use vo));
-                   (copy_place st (cur_place st id), ty)
-               | None -> seed_bug "assignment to unknown value '%s'" n))
+               match List.assoc_opt n env.statics with
+               | Some (idx, _) ->
+                   (* the GLOBAL write: store into the statics slot *)
+                   emit st
+                     (Seed_mir.Assign
+                        ( { Seed_mir.local = -1 - idx; projections = [] },
+                          Seed_mir.Use vo ));
+                   (vo, vt)
+               | None -> (
+                   match List.assoc_opt n env.values with
+                       | Some ty ->
+                           let id = fresh_local st ty in
+                           emit st (Seed_mir.Assign (cur_place st id, Seed_mir.Use vo));
+                           (copy_place st (cur_place st id), ty)
+                       | None -> seed_bug "assignment to unknown value '%s'" n)))
        | Ast.Field (_, base, fname, _) ->
            (* the typed-place writeback rule (E9036 retirement): the
               target base lowers to a place and the field resolves

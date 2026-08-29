@@ -3984,7 +3984,18 @@ and check_place (env : env) (scope : scope) (e : Ast.expr) : (Type_repr.t * bool
           | None -> (
               match List.assoc_opt n env.consts with
               | Some t -> Ok (t, true)
-              | None -> Error (err span (Printf.sprintf "unknown variable `%s`" n)))))
+              | None -> (
+                  (* the single-file module-path mismatch: the consts
+                     are keyed by the item's qualified name (the
+                     file-derived module) while the expression's
+                     env.module_path may be [] — fall back to the
+                     unique `::name` suffix *)
+                  let suffix = "::" ^ n in
+                  match
+                    List.find_opt (fun (k, _) -> Util.has_suffix k suffix) env.consts
+                  with
+                  | Some (_, t) -> Ok (t, true)
+                  | None -> Error (err span (Printf.sprintf "unknown variable `%s`" n))))))
   | Ast.Field (_, base, fname, span) -> (
       match check_place env scope base with
       | Error m -> Error m
@@ -4186,11 +4197,15 @@ and check_name (env : env) (scope : scope) (expected : Type_repr.t option)
                    te_span = span;
                  }
            | None ->
-               (* the kernel's `use module::{CONST}` imports are not
-                  tracked as scoped names; resolve a bare const to its
-                  unique closure-wide declaration (EFFECT_IO, VERSION,
-                  SYNTHETIC_MODULE_* — the flat-name rule the functions
-                  use) *)
+               (* the single-file module-path mismatch: the consts are
+                  keyed by the item's qualified name (the file-derived
+                  module) while the expression's env.module_path may be
+                  [] — the unique `::name` suffix fallback (a static
+                  read must resolve through this same channel); the
+                  kernel's `use module::{CONST}` imports are not
+                  tracked as scoped names, so a bare const resolves to
+                  its unique closure-wide declaration (EFFECT_IO,
+                  VERSION, SYNTHETIC_MODULE_* — the flat-name rule) *)
                (match
                   match List.assoc_opt n env.consts with
                   | Some t -> Some t
