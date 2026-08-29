@@ -68,9 +68,9 @@ let baseline_typecheck_debt : Debt_report.t =
         ("duplicate_decl", 0);
         ("other", 0);
       ];
-    total = 196;
-    primaries = 110;
-    secondaries = 86;
+    total = 160;
+    primaries = 77;
+    secondaries = 83;
   }
 
 let fail fmt = Printf.ksprintf (fun s -> Printf.printf "BOOTSTRAP GATE: FAIL: %s\n" s; exit 1) fmt
@@ -341,7 +341,7 @@ let () =
          Printf.printf "  [10/10] host closure + VM + artifacts: deferred (typecheck debt)\n";
          Printf.printf "BOOTSTRAP GATE: typecheck debt %d (at/below the checked baseline) — semantic stages deferred\n"
            n_errs;
-         Printf.printf "BOOTSTRAP GATE: RESULT: PASS (no regression vs the checked baseline)\n";
+         Printf.printf "BOOTSTRAP GATE: RESULT: DEVELOPMENT DEBT GATE: PASS (no regression vs the checked baseline; FULL COMPLETENESS: NOT RUN / DEFERRED — the typecheck debt is nonzero)\n";
          exit 0
        end;
        (* Zero typecheck debt: the full semantic closure must succeed —

@@ -102,9 +102,13 @@ if [ -z "$TC_COUNT" ]; then
   exit 1
 fi
 
-# Debt policy (re-audit P0): no regression vs the LAST ACCEPTED EVIDENCE
-# record (the 196-baseline is not sacred — only growth beyond +20% of
-# the last accepted record is a hard fail; smaller growth is a warning).
+# Debt policy (the audit's P1 directive): MONOTONIC no-regression vs
+# the LAST ACCEPTED EVIDENCE record on BOTH axes —
+#   head.total   <= accepted_parent.total
+#   head.primary <= accepted_parent.primary
+# with an explicit, reviewed override for intentional soundness
+# discoveries.  No +20% tolerance; a primary regression fails even
+# when the total stays flat.
 EVIDENCE_JSON="$(ls -1 "$ROOT/bootstrap/evidence/ocaml/" 2>/dev/null | grep -v history | grep -E '^[0-9a-f]{7}_.*\.json$' | sort | tail -1)"
 if [ -n "$EVIDENCE_JSON" ]; then
   EVIDENCE_JSON="$ROOT/bootstrap/evidence/ocaml/$EVIDENCE_JSON"
@@ -122,13 +126,15 @@ DEBT_PRIMARY="$(grep -oE 'debt_primary: [0-9]+' /tmp/ocaml_bootstrap_check.out |
 DEBT_SECONDARY="$(grep -oE 'debt_secondary: [0-9]+' /tmp/ocaml_bootstrap_check.out | tail -1 | grep -oE '[0-9]+$')"
 if [ -n "$REC_TOTAL" ] && [ -n "$DEBT_TOTAL" ]; then
   echo "check_ocaml_seed_health: debt policy — vs the last accepted evidence record $(basename "$EVIDENCE_JSON") (debt_total $REC_TOTAL / debt_primary $REC_PRIMARY / debt_secondary $REC_SECONDARY)"
-  if [ "$DEBT_TOTAL" -gt $((REC_TOTAL * 6 / 5)) ]; then
-    echo "check_ocaml_seed_health: FAIL — debt_total grew more than +20%% vs the evidence record ($DEBT_TOTAL > $REC_TOTAL)"
+  if [ -n "$REC_PRIMARY" ] && [ -n "$DEBT_PRIMARY" ] && [ "$DEBT_PRIMARY" -gt "$REC_PRIMARY" ]; then
+    echo "check_ocaml_seed_health: FAIL — debt_primary grew vs the evidence record ($DEBT_PRIMARY > $REC_PRIMARY)"
     exit 1
   fi
   if [ "$DEBT_TOTAL" -gt "$REC_TOTAL" ]; then
-    echo "check_ocaml_seed_health: WARNING — debt grew vs the evidence record (the baseline is not sacred; only >+20%% growth fails)"
+    echo "check_ocaml_seed_health: FAIL — debt_total grew vs the evidence record ($DEBT_TOTAL > $REC_TOTAL)"
+    exit 1
   fi
+  echo "check_ocaml_seed_health: debt policy — monotonic no-regression: PASS"
 fi
 
 # FULL-COMPLETENESS gate: tg_bootstrap_gate — reported separately,
@@ -139,11 +145,11 @@ GATE_STATUS=$?
 set -e
 SUBSET_N="$(grep -oE 'SUBSET_FIREWALL = (PASS|FAIL \([0-9]+ findings)' /tmp/ocaml_bootstrap_check.out | head -1 | grep -oE 'PASS|[0-9]+' | head -1)"
 if [ "$GATE_STATUS" -eq 0 ]; then
-  echo "check_ocaml_seed_health: FULL COMPLETENESS: gate PASS (subset zero)"
-  echo "PASS" > /tmp/ocaml_full_completeness_verdict.txt
+  echo "check_ocaml_seed_health: DEVELOPMENT DEBT GATE: PASS (no regression vs the checked baseline)"
+  echo "DEBT-GATE-PASS (FULL COMPLETENESS: NOT RUN / DEFERRED)" > /tmp/ocaml_full_completeness_verdict.txt
 else
-  echo "check_ocaml_seed_health: FULL COMPLETENESS: gate RED (subset=${SUBSET_N:-?} findings — expected while the subset is nonzero) (gate exit $GATE_STATUS — informational; this lane is development health, the gate is reported separately)"
-  echo "RED (subset=${SUBSET_N:-?})" > /tmp/ocaml_full_completeness_verdict.txt
+  echo "check_ocaml_seed_health: DEVELOPMENT DEBT GATE: RED (gate exit $GATE_STATUS — informational; this lane is development health, the gate is reported separately)"
+  echo "DEBT-GATE-RED" > /tmp/ocaml_full_completeness_verdict.txt
 fi
 
 if [ "$SELFCHECK_FAIL" -ne 0 ]; then
@@ -152,5 +158,5 @@ if [ "$SELFCHECK_FAIL" -ne 0 ]; then
 fi
 
 echo "check_ocaml_seed_health: tests=${TESTS} (pinned exact inventory) component_selfchecks=${SELFCHECK_COUNT}/24 selfcheck_fail=0 typecheck_debt=${DEBT_TOTAL:-$TC_COUNT} subset_findings=${SUBSET_N:-?}"
-echo "check_ocaml_seed_health: DEVELOPMENT HEALTH PASS — ${SELFCHECK_COUNT} component selfchecks green of 24 selfcheck executables; tg_bootstrap_gate is the FULL-COMPLETENESS gate, reported separately above (PASS at subset zero; RED while the subset is nonzero). This is NOT a compiler-closure PASS — run check_ocaml_bootstrap_complete.sh for the closure gate"
+echo "check_ocaml_seed_health: DEVELOPMENT HEALTH PASS — ${SELFCHECK_COUNT} component selfchecks green of 24 selfcheck executables; tg_bootstrap_gate is the DEVELOPMENT DEBT GATE, reported separately above. FULL COMPLETENESS is NOT RUN / DEFERRED while the typecheck debt is nonzero — run check_ocaml_bootstrap_complete.sh for the true closure gate"
 echo "check_ocaml_seed_health: seed health ALL REQUIRED CHECKS PASSED (this is NOT a compiler-closure PASS — run check_ocaml_bootstrap_complete.sh for the closure gate)"
