@@ -237,6 +237,11 @@ type env = {
      NodeId — MIR lowering consumes the semantic tree instead of
      re-interpreting the raw pattern syntax *)
   typed_for_patterns : (Ids.Node_id.t, Typed_pattern.t * Type_repr.t) Hashtbl.t;
+  (* the typed-LET channel (the audit: every binding pattern site is
+     resolved ONCE into the semantic tree; MIR lowering consumes it
+     instead of re-interpreting the raw syntax) — keyed by the
+     VALUE expression's NodeId *)
+  typed_let_patterns : (Ids.Node_id.t, Typed_pattern.t) Hashtbl.t;
 }
 
 type scope = {
@@ -1340,6 +1345,7 @@ let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
     typed_nodes = Hashtbl.create 256;
     typed_patterns = Hashtbl.create 256;
     typed_for_patterns = Hashtbl.create 64;
+    typed_let_patterns = Hashtbl.create 64;
   }
 
 (* ────────────────────────────────────────────────────────────────
@@ -3514,7 +3520,11 @@ and check_stmt (env : env) (scope : scope) (s : Ast.stmt) : (scope, string) resu
           | Ok te -> (
               match check_pattern env scope (default_literal te.te_type) pat with
               | Error m -> Error m
-              | Ok (_, binds) ->
+              | Ok (tp, binds) ->
+                  (match value with
+                   | Ast.Name (nid, _, _) | Ast.Field (nid, _, _, _) ->
+                       Hashtbl.replace env.typed_let_patterns nid tp
+                   | _ -> ());
                   Ok (add_binds scope (List.map (fun (n, t, _) -> (n, t, mut_)) binds))))
       | Some tye -> (
           match resolve_type env scope tye with

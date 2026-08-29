@@ -368,6 +368,7 @@ type lower_state = {
      loop's SEMANTIC pattern + resolved element type — the lowering
      consumes this instead of re-interpreting the raw pattern syntax *)
   typed_for_patterns : (Ids.Node_id.t * (Typed_pattern.t * Type_repr.t)) list;
+  typed_let_patterns : (Ids.Node_id.t * Typed_pattern.t) list;
 }
 
 (* The typed-iterable lookup: the ForExpr's semantic pattern + element
@@ -375,6 +376,10 @@ type lower_state = {
 let typed_for_of (st : lower_state) (node_id : Ids.Node_id.t) :
     (Typed_pattern.t * Type_repr.t) option =
   List.assoc_opt node_id st.typed_for_patterns
+
+let typed_let_of (st : lower_state) (node_id : Ids.Node_id.t) :
+    Typed_pattern.t option =
+  List.assoc_opt node_id st.typed_let_patterns
 
 (* The typed-node channel lookup: the typechecker's resolved node for an
    expr's NodeId, when the channel is present. *)
@@ -1991,37 +1996,109 @@ and lower_stmt (env : func_env) (st : lower_state) (s : Ast.stmt) : unit =
         st.local_names <- (bind_id, n) :: st.local_names;
         st.scope <- (n, bind_id) :: st.scope
       in
-      (match pat with
-       | Ast.PatIdent (n, _, _) -> bind_name n id
-       | Ast.PatTuple (subs, _) ->
-           (* a destructuring let `let (a, b) = t`: the tuple value is
-              materialized and each component bound through its
-              ConstantIndex projection *)
-           List.iteri
-             (fun k sub ->
-               match sub with
-               | Ast.PatIdent (n, _, _) ->
-                   let cty =
-                     match vt with
-                     | Type_repr.Tuple elems when k < Array.length elems -> elems.(k)
-                     | _ ->
-                         seed_bug
-                           "destructuring let pattern against a non-tuple value type"
-                   in
-                   let cid = fresh_local st cty in
-                   emit st
-                     (Seed_mir.Assign
-                        ( cur_place st cid,
-                          Seed_mir.Use
-                            (Seed_mir.Copy
-                               { Seed_mir.local = id;
-                                 projections = [ Seed_mir.ConstantIndex k ] }) ));
-                   bind_name n cid
-               | Ast.Wildcard _ -> ()
-               | _ -> seed_bug "unsupported destructuring let pattern in lowering")
-             subs
-       | Ast.Wildcard _ | Ast.PatLiteral _ -> ()
-       | _ -> ())
+      (* the SEMANTIC bindings: the typechecker's typed-let channel
+         (the audit: the let-pattern is resolved ONCE into the semantic
+         tree; lowering consumes it, never the raw syntax) *)
+      let semantic_bindings_of (tp : Typed_pattern.t) : (string * int * int list) list =
+        let rec go path p =
+          match p with
+          | Typed_pattern.TP_wildcard -> []
+          | Typed_pattern.TP_binding (n, ty, _) ->
+              (* the ROOT binding reuses the materialized value local;
+                 a projected binding gets a fresh component local *)
+              [ (n, (if path = [] then id else fresh_local st ty), List.rev path) ]
+          | Typed_pattern.TP_tuple (_, pats) ->
+              List.concat_map (fun (k, sub) -> go (k :: path) sub)
+                (List.mapi (fun k sub -> (k, sub)) pats)
+          | _ -> seed_bug "unsupported let pattern in lowering (the semantic tree)"
+        in
+        go [] tp
+      in
+      let bindings =
+        match value with
+        | Ast.Name (nid, _, _) | Ast.Field (nid, _, _, _) -> (
+            match typed_let_of st nid with
+            | Some tp -> semantic_bindings_of tp
+            | None ->
+                (* the syntactic fallback: only for hand-built selfcheck
+                   envs (the driver path always carries the channel) *)
+                (match pat with
+                 | Ast.PatIdent (n, _, _) -> [ (n, id, []) ]
+                 | Ast.PatTuple (subs, _) ->
+                     List.mapi
+                       (fun k sub ->
+                         match sub with
+                         | Ast.PatIdent (n, _, _) ->
+                             let cty =
+                               match vt with
+                               | Type_repr.Tuple elems
+                                 when k < Array.length elems ->
+                                   elems.(k)
+                               | _ ->
+                                   seed_bug
+                                     "destructuring let pattern against a non-tuple value type"
+                             in
+                             (n, fresh_local st cty, [ k ])
+                         | Ast.Wildcard _ ->
+                             ("__wild" ^ string_of_int k,
+                              fresh_local st
+                                (match vt with
+                                 | Type_repr.Tuple elems when k < Array.length elems ->
+                                     elems.(k)
+                                 | _ -> Type_repr.Unit),
+                              [ k ])
+                         | _ ->
+                             seed_bug
+                               "unsupported destructuring let pattern in lowering")
+                       subs
+                 | Ast.Wildcard _ | Ast.PatLiteral _ -> []
+                 | _ -> []))
+        | _ -> (
+            match pat with
+            | Ast.PatIdent (n, _, _) -> [ (n, id, []) ]
+            | Ast.PatTuple (subs, _) ->
+                List.mapi
+                  (fun k sub ->
+                    match sub with
+                    | Ast.PatIdent (n, _, _) ->
+                        let cty =
+                          match vt with
+                          | Type_repr.Tuple elems when k < Array.length elems -> elems.(k)
+                          | _ ->
+                              seed_bug
+                                "destructuring let pattern against a non-tuple value type"
+                        in
+                        (n, fresh_local st cty, [ k ])
+                    | Ast.Wildcard _ ->
+                        ("__wild" ^ string_of_int k, fresh_local st Type_repr.Unit, [ k ])
+                    | _ -> seed_bug "unsupported destructuring let pattern in lowering")
+                  subs
+            | Ast.Wildcard _ | Ast.PatLiteral _ -> []
+            | _ -> [])
+      in
+      List.iter
+        (fun (n, bind_id, path) ->
+          match path with
+          | [] -> bind_name n bind_id
+          | ks ->
+              let cty =
+                match vt with
+                | Type_repr.Tuple elems
+                  when List.length ks = 1 && List.hd ks < Array.length elems ->
+                    elems.(List.hd ks)
+                | _ -> seed_bug "destructuring let against a non-tuple value type"
+              in
+              let cid = fresh_local st cty in
+              emit st
+                (Seed_mir.Assign
+                   ( cur_place st cid,
+                     Seed_mir.Use
+                       (Seed_mir.Copy
+                          { Seed_mir.local = id;
+                            projections =
+                              List.map (fun k -> Seed_mir.ConstantIndex k) ks }) ));
+              bind_name n cid)
+        bindings
   | Ast.DeferStmt (b, _) ->
       (* FRONTEND-SUPPORTED (not yet executable-seed-supported per the
          audit): the function-level LIFO stack is an approximation —
@@ -3688,6 +3765,7 @@ let lower_function_with_variants
     ?(typed_nodes : (Ids.Node_id.t * typed_node) list = [])
     ?(typed_patterns : ((Ids.Node_id.t * int) * Typed_pattern.t) list = [])
     ?(typed_for_patterns : (Ids.Node_id.t * (Typed_pattern.t * Type_repr.t)) list = [])
+    ?(typed_let_patterns : (Ids.Node_id.t * Typed_pattern.t) list = [])
     ?(param_tys_opt : Type_repr.t array option) (variants : variant_table)
     (env : func_env) (name : string)
     (callable : int) (template_args : Type_repr.t array)
@@ -3709,6 +3787,7 @@ let lower_function_with_variants
       typed_nodes;
       typed_patterns;
       typed_for_patterns;
+      typed_let_patterns;
     }
   in
   (* local 0 = return slot *)

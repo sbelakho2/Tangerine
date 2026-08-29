@@ -840,6 +840,92 @@ end
                            "  mutable static round-trip: PASS (main = 9 — X went 3 -> 4 -> 5 and the two reads sum 4 + 5; exit %d)\n"
                            code)
                 end));
+      (* ── the destructuring-LET round-trip proof (the audit's
+         TypedPattern-at-every-pattern-site): `let (a, b) = (10, 20)`
+         resolves ONCE into the semantic TP_tuple through the
+         typed-let channel; the lowerer binds a and b through the
+         ConstantIndex projections — main = a + b = 30. *)
+      let dlsrc = {|
+def main() -> Int
+  let (a, b) = (10, 20)
+  a + b
+end
+|} in
+      (match Source_loader.load_string "<destruct-let>" dlsrc with
+       | Error _ -> failwith "destruct-let source load"
+       | Ok dsrc ->
+           let dsm = Span.create () in
+           let dfid = Span.add_file dsm dsrc.Source.name dsrc in
+           let ddiags = Diagnostic.create_bag () in
+           let dlx = Lexer.create dsrc.Source.bytes dfid ddiags in
+           let dtoks = Lexer.lex dlx in
+           let dprog = Parser.parse dtoks dsrc.Source.bytes dfid ddiags [ "dl" ] in
+           (match Typecheck.check_program (Typecheck.initial_env ()) dprog with
+            | Error m -> failwith ("destruct-let typecheck: " ^ m)
+            | Ok (denv, derrs) ->
+                if derrs <> [] then
+                  failwith ("destruct-let typecheck errors: " ^ String.concat "; " derrs)
+                else begin
+                  let dbase = Driver.lowering_env_of ~items:dprog.Ast.items denv in
+                  let dvariants = Driver.user_variant_table denv in
+                  let dmain_decl =
+                    match
+                      List.find_opt
+                        (fun i ->
+                          match i.Ast.kind with
+                          | Ast.Function d -> d.Ast.fn_sig.Ast.sig_name = "main"
+                          | _ -> false)
+                        dprog.Ast.items
+                    with
+                    | Some i -> i
+                    | None -> failwith "destruct-let: no main function"
+                  in
+                  let dts =
+                    match List.assoc_opt "main" denv.Typecheck.functions with
+                    | Some ts -> ts
+                    | None -> (
+                        match
+                          List.filter (fun (k, _) -> Util.has_suffix k "::main")
+                            denv.Typecheck.functions
+                        with
+                        | [ (_, ts) ] -> ts
+                        | _ -> failwith "destruct-let: no typed signature for main")
+                  in
+                  let dmain_fn =
+                    match dmain_decl.Ast.kind with
+                    | Ast.Function d ->
+                        Mir_lower.lower_function_with_variants
+                          ~typed_nodes:(Driver.typed_nodes_of denv)
+                          ~typed_patterns:(Driver.typed_patterns_of denv)
+                          ~typed_for_patterns:(Driver.typed_for_patterns_of denv)
+                          ~typed_let_patterns:(Driver.typed_let_patterns_of denv)
+                          dvariants
+                          { dbase with Mir_lower.fn_ret = dts.Typecheck.ts_return }
+                          "main" (Ids.Callable_id.to_int dts.Typecheck.ts_callable)
+                          [||] [||] d
+                    | _ -> failwith "destruct-let: main is not a function"
+                  in
+                  let dprog_mir =
+                    { Seed_mir.functions = [| dmain_fn |]; statics = [||]; types = [||] }
+                  in
+                  (match Mir_verify.require_valid_concrete dprog_mir with
+                   | Ok () ->
+                       Printf.printf "  destructuring-let verify (concrete mode): PASS\n"
+                   | Error errs ->
+                       Printf.printf "  destructuring-let verify (concrete mode): FAIL\n";
+                       List.iter (fun e -> Printf.printf "    %s\n" e) errs;
+                       exit 1);
+                  let d_entry = dmain_fn.Seed_mir.instance in
+                  let dhost = Host.create ~repo_root:"." ~argv:[||] in
+                  (match Vm.run ~program:dprog_mir ~entry:d_entry ~argv:[||] ~host:dhost with
+                   | Error e ->
+                       Printf.printf "  destructuring-let VM: FAIL %s\n" e.Vm.message;
+                       exit 1
+                   | Ok code ->
+                       Printf.printf
+                         "  destructuring-let round-trip: PASS (main = 30 — a + b from the tuple; exit %d)\n"
+                         code)
+                end));
       (* ── the RUNTIME Vec iteration round-trip proof (the audit's
          typed-iterable requirement): a `for x in v` over a runtime
          Vec[Int] lowers to the counter loop with the dynamic
