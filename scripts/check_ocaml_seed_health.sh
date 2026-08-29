@@ -8,10 +8,11 @@
 # diagnostic). This script pins NO debt scalar of its own.
 #   1. the pinned OCaml/Dune toolchain
 #   2. dune build (warnings are errors)
-#   3. the EXACT unit-test inventory: 226 passed, 0 failed
-#      (the committed pre-wave1 inventory was 216; the in-flight wave1
-#      manifest/module-graph/debt tests brought it to 226 — the pin is
-#      the exact CURRENT inventory; ANY change up or down fails)
+#   3. the EXACT unit-test inventory: 230 passed, 0 failed
+#      (the committed pre-wave1 inventory was 216; the wave1 tests
+#      brought it to 226; the P0 typechecking regressions (pop_scope,
+#      zero-argument method tails) brought it to 230 — the pin is the
+#      exact CURRENT inventory; ANY change up or down fails)
 #   4. EVERY self-check executable enumerated in selfcheck/dune (a new
 #      self-check is automatically required; each must exit 0 and print
 #      its PASS marker)
@@ -28,7 +29,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-PINNED_TEST_INVENTORY=226
+PINNED_TEST_INVENTORY=230
 
 if [ -f scripts/check_ocaml_toolchain.sh ]; then
   scripts/check_ocaml_toolchain.sh

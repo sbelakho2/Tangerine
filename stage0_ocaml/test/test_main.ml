@@ -175,6 +175,7 @@ let manifest_suite () =
     ]
 
 let () =
+  Test_typecheck_regressions.suite ();
   sha256_suite ();
   Test_utf8.suite ();
   Test_span_source.suite ();
