@@ -453,6 +453,7 @@ record = {
     },
     "subset": subset,
     "strict_resolution": strict_resolution,
+    "typed_profile": typed_profile,
     "mir": mir,
     "host": host,
     "recorded_at_unix": rd_int("record_time"),

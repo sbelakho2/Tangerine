@@ -1412,7 +1412,8 @@ type closure_ctx = {
    separate diagnostic bag; strict=true: the strict run IS the semantic
    pipeline (fails closed on any unresolved import). *)
 let run_closure_pipeline_impl ~(repo_root : string) ~(manifest_path : string)
-    ~(target : Target.t) ~(strict : bool) : (closure_ctx, string) result =
+    ~(target : Target.t) ~(strict : bool) ?(profile_jsonl : string option)
+    () : (closure_ctx, string) result =
   match Bootstrap_manifest.load ~repo_root ~manifest_path with
   | Error m -> Error m
   | Ok manifest ->
@@ -1603,6 +1604,44 @@ let run_closure_pipeline_impl ~(repo_root : string) ~(manifest_path : string)
           (fun f ->
             Printf.printf "    %s: %s\n" f.Typed_profile.f_kind f.Typed_profile.f_message)
           profile_findings;
+        (* the evidence channel (the audit's item 15): the structured
+           typed-profile facts + the per-finding JSONL, with the exact
+           count enforced by the evidence script *)
+        Printf.printf "EVIDENCE_PROFILE total_findings=%d\n"
+          (List.length profile_findings);
+        let kind_counts = Hashtbl.create 16 in
+        List.iter
+          (fun f ->
+            let k = f.Typed_profile.f_kind in
+            Hashtbl.replace kind_counts k
+              (1 + (match Hashtbl.find_opt kind_counts k with Some n -> n | None -> 0)))
+          profile_findings;
+        let json_escape (v : string) : string =
+          let b = Buffer.create (String.length v) in
+          String.iter
+            (fun c ->
+              match c with
+              | '"' -> Buffer.add_string b "\\\""
+              | '\\' -> Buffer.add_string b "\\\\"
+              | c -> Buffer.add_char b c)
+            v;
+          Buffer.contents b
+        in
+        Hashtbl.iter
+          (fun k n ->
+            Printf.printf "EVIDENCE_PROFILE_COUNT kind=%s count=%d\n" (json_escape k) n)
+          kind_counts;
+        (match profile_jsonl with
+         | Some path ->
+             let oc = open_out path in
+             List.iter
+               (fun f ->
+                 Printf.fprintf oc "{\"kind\": \"%s\", \"message\": \"%s\"}\n"
+                   (json_escape f.Typed_profile.f_kind)
+                   (json_escape f.Typed_profile.f_message))
+               profile_findings;
+             close_out oc
+         | None -> ());
         Ok
           { ctx_repo_root = repo_root;
             ctx_manifest_path = manifest_path;
@@ -1626,7 +1665,7 @@ let run_closure_pipeline_impl ~(repo_root : string) ~(manifest_path : string)
    sites are unchanged). *)
 let run_closure_pipeline ~(repo_root : string) ~(manifest_path : string)
     ~(target : Target.t) : (closure_ctx, string) result =
-  run_closure_pipeline_impl ~repo_root ~manifest_path ~target ~strict:false
+  run_closure_pipeline_impl ~repo_root ~manifest_path ~target ~strict:false ()
 
 (* Lower every top-level free function of the closure into one Seed MIR
    program (flat namespace; shared by bootstrap-check and compile). *)
@@ -2802,7 +2841,7 @@ type bootstrap_stages = {
 let run_bootstrap_closure ~(repo_root : string) ~(manifest_path : string)
     ~(target : Target.t) ~(entry : string option) ~(kernel_args : string list) :
     (bootstrap_stages, string) result =
-  match run_closure_pipeline_impl ~repo_root ~manifest_path ~target ~strict:true with
+  match run_closure_pipeline_impl ~repo_root ~manifest_path ~target ~strict:true () with
   | Error m -> Error m
   | Ok ctx ->
       let measured_debt =
@@ -2950,8 +2989,15 @@ let cmd_bootstrap_check (args : string list) : int =
   Printf.printf "TANGERINE OCAML SEED — bootstrap-check\n";
   Printf.printf "  target: %s\n" (Target.to_string target);
   Printf.printf "  resolver mode: %s\n" (if opts.strict then "strict (per-module authority)" else "recovery + strict audit");
-  (match run_closure_pipeline_impl ~repo_root:opts.repo_root ~manifest_path:opts.manifest
-           ~target ~strict:opts.strict with
+  let profile_jsonl =
+    match opts.diagnostics_jsonl with
+    | Some p -> Some (Filename.chop_suffix p ".jsonl" ^ ".typedprofile.jsonl")
+    | None -> None
+  in
+  (match
+     run_closure_pipeline_impl ~repo_root:opts.repo_root ~manifest_path:opts.manifest
+       ~target ~strict:opts.strict ?profile_jsonl ()
+   with
    | Error m ->
        prerr_endline ("error: " ^ m);
        Printf.printf "  RESULT: FAIL\n";
@@ -3146,8 +3192,15 @@ let cmd_compile (args : string list) : int =
   Printf.printf "TANGERINE OCAML SEED — compile\n";
   Printf.printf "  target: %s\n" (Target.to_string target);
   Printf.printf "  resolver mode: %s\n" (if opts.strict then "strict (per-module authority)" else "recovery + strict audit");
-  (match run_closure_pipeline_impl ~repo_root:opts.repo_root ~manifest_path:opts.manifest
-           ~target ~strict:opts.strict with
+  let profile_jsonl =
+    match opts.diagnostics_jsonl with
+    | Some p -> Some (Filename.chop_suffix p ".jsonl" ^ ".typedprofile.jsonl")
+    | None -> None
+  in
+  (match
+     run_closure_pipeline_impl ~repo_root:opts.repo_root ~manifest_path:opts.manifest
+       ~target ~strict:opts.strict ?profile_jsonl ()
+   with
    | Error m ->
        prerr_endline ("error: " ^ m);
        Printf.printf "  RESULT: FAIL\n";
