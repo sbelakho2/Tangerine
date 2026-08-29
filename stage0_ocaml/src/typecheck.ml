@@ -3690,11 +3690,26 @@ and check_match (env : env) (scope : scope) (expected : Type_repr.t option) (nid
                       match unify env.state.box_tid subst first.te_type te.te_type with
                       | Ok () -> go (idx + 1) (te :: acc) rest
                       | Error m ->
-                          (* arm incompatibility is a real semantic failure:
+                          (* a statement-position match whose arms diverge
+                             over Unit (`when X then strings.insert(...)
+                             else () end` — the Unit arm's value is
+                             discarded): the native accepts; other
+                             divergences stay errors *)
+                          (match first.te_type, te.te_type with
+                           | Type_repr.Unit, _ | _, Type_repr.Unit
+                             when expected = None ->
+                               go (idx + 1) (te :: acc) rest
+                           | _ ->
+                               (* arm incompatibility is a real semantic failure:
                              return_unify_err is a pure constructor — the
                              former 'reported on the oracle channel' claim
                              was false; the arm must fail *)
-                          Error m))))
+                               Error
+                                 (err arm.Ast.ma_span
+                                    (Printf.sprintf
+                                       "type mismatch: expected %s, found %s (%s)"
+                                       (type_to_string first.te_type)
+                                       (type_to_string te.te_type) m)))))))
     in
     go 0 [] m.Ast.m_arms
   in
