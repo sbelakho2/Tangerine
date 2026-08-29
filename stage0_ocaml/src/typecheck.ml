@@ -3598,8 +3598,15 @@ and check_if (env : env) (scope : scope) (expected : Type_repr.t option) (i : As
       let eb_exp =
         match tt.te_type with
         | Type_repr.Never -> expected
-        | Type_repr.Unit -> None
-        | _ -> Some tt.te_type
+        | _ -> (
+            (* a statement-position if (no enclosing expected) may have
+               freely divergent branches (`if ... then
+               env.typed_fn_signatures.insert(...) else
+               type_add_error(...) end` — the then returns the map's
+               Option, the else is a Unit side effect): the else-branch
+               is reconciled against the then's type ONLY when the if
+               has an enclosing expected (a result-valued if) *)
+            if expected = None then None else Some tt.te_type)
       in
       match check_block env scope eb_exp eb eb.Ast.b_span with
       | Error m -> Error m
