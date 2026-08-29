@@ -3549,7 +3549,15 @@ and check_if (env : env) (scope : scope) (expected : Type_repr.t option) (i : As
             | Error _ -> scope)
         | None -> scope)
   in
-  let* tt = check_block env then_scope expected i.Ast.if_then i.Ast.if_then.Ast.b_span in
+  (* an if WITHOUT else discards its branch values (the kernel's
+     `if c then side_effect() end`): the then/elsif bodies must NOT be
+     reconciled against the enclosing expected — a side-effect tail
+     like `out.insert(x)` (Bool) would otherwise fail a Some Unit
+     expectation from an enclosing match arm *)
+  let then_exp =
+    match i.Ast.if_else with None -> None | Some _ -> expected
+  in
+  let* tt = check_block env then_scope then_exp i.Ast.if_then i.Ast.if_then.Ast.b_span in
   let* telsif =
     let rec go acc = function
       | [] -> Ok (List.rev acc)
@@ -3558,9 +3566,10 @@ and check_if (env : env) (scope : scope) (expected : Type_repr.t option) (i : As
           | Error m -> Error m
           | Ok _ -> (
               let b_exp =
-                match tt.te_type with
-                | Type_repr.Never -> expected
-                | _ -> Some tt.te_type
+                match i.Ast.if_else, tt.te_type with
+                | None, _ -> None
+                | Some _, Type_repr.Never -> expected
+                | Some _, _ -> Some tt.te_type
               in
               match check_block env scope b_exp b b.Ast.b_span with
               | Ok tb -> go (tb :: acc) rest
@@ -3583,6 +3592,7 @@ and check_if (env : env) (scope : scope) (expected : Type_repr.t option) (i : As
       let eb_exp =
         match tt.te_type with
         | Type_repr.Never -> expected
+        | Type_repr.Unit -> None
         | _ -> Some tt.te_type
       in
       match check_block env scope eb_exp eb eb.Ast.b_span with
@@ -3592,16 +3602,27 @@ and check_if (env : env) (scope : scope) (expected : Type_repr.t option) (i : As
           let* _ =
             match unify env.state.box_tid subst tt.te_type te.te_type with
             | Ok () -> Ok ()
-            | Error m -> Error m
+            | Error m -> (
+                (* the native accepts a statement-position if whose
+                   branches diverge when one is Unit (`if c then ()
+                   else x end` — the Unit branch's value is discarded):
+                   only that shape reconciles; other divergences stay
+                   errors *)
+                match tt.te_type, te.te_type with
+                | Type_repr.Unit, _ | _, Type_repr.Unit -> Ok ()
+                | _ -> Error m)
           in
           (* the if's type adopts the concrete integer kind when one arm
              is a bare literal and the other a concrete int (`if c then 8
              else u end` is UInt, not IntLiteral — the kernel's literal
-             adoption) *)
+             adoption), and the non-Unit type when the branches diverge
+             over Unit (the discarded Unit branch) *)
           let if_ty =
             match tt.te_type, te.te_type with
             | Type_repr.Int_literal _, Type_repr.Int k -> Type_repr.Int k
             | Type_repr.Int k, Type_repr.Int_literal _ -> Type_repr.Int k
+            | Type_repr.Unit, t -> t
+            | t, Type_repr.Unit -> t
             | _ -> substitute_fixpoint !subst tt.te_type
           in
           let all_effects =
@@ -3644,7 +3665,14 @@ and check_match (env : env) (scope : scope) (expected : Type_repr.t option) (nid
                        match's Result context *)
                     match first.te_type with
                     | Type_repr.Never -> expected
-                    | _ -> Some first.te_type)
+                    | _ ->
+                        (* a statement-position match (no enclosing
+                           expected) discards the arm values: subsequent
+                           arms are NOT reconciled against the first
+                           arm's type — a side-effect arm body
+                           (`b.errors.push(...)`, Unit) would otherwise
+                           fail a Some first-type expectation *)
+                        if expected = None then None else Some first.te_type)
               in
               match check_expr env arm_scope expected' arm.Ast.ma_body with
               | Error m -> Error m
