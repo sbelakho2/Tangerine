@@ -108,8 +108,24 @@ def wants_int(e: E) -> Int
 end
 |}
   in
-  if ok1 && ok2 && ok3 && ok4 && ok5 && ok6 then begin
-    Printf.printf "SOUNDNESS = ALL PASS (6 negative proofs)\n";
+  (* index/range expected-type failures: a typed element position
+     that contradicts the container element type must be rejected *)
+  let ok7 =
+    check_src "index-return-mismatch" {|
+def f(v: Vec[Int]) -> String
+  v[0]
+end
+|}
+  in
+  let ok8 =
+    check_src "tuple-index-return-mismatch" {|
+def f(t: (Int, Int)) -> String
+  t.0
+end
+|}
+  in
+  if ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 then begin
+    Printf.printf "SOUNDNESS = ALL PASS (8 negative proofs)\n";
     exit 0
   end
   else begin

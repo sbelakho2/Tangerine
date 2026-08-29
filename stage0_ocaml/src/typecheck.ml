@@ -2459,6 +2459,26 @@ and resolve_nominal (env : env) (span : Span.span) (name : string) :
    returns the solved substitution or an ERROR — no caller may discard
    the result.  The invariant: a failed semantic unify can never
    disappear (re-audit P0: swallowed call-return type failures). *)
+(* try_unify_transactional: the DELIBERATE SPECULATIVE probe — returns
+   the solved substitution or None; a caller that uses this API is
+   explicitly probing (receiver reconciliation, overload fallbacks),
+   never constraining semantics.  The invariant: every SEMANTIC
+   constraint goes through unify_expected/unify_required, whose errors
+   cannot be discarded. *)
+and try_unify_transactional (env : env) (actual : Type_repr.t) (expected : Type_repr.t) :
+    (Type_repr.generic_key * Type_repr.t) list option =
+  match unify_expected env actual expected "transactional probe" with
+  | Ok solved -> Some solved
+  | Error _ -> None
+
+(* unify_required: the SEMANTIC hard constraint — the failure is an
+   error and the caller MUST propagate it (the audit's systemic rule:
+   no failed semantic unify can disappear).  Equivalent to
+   unify_expected but the name makes the intent explicit. *)
+and unify_required (env : env) (actual : Type_repr.t) (expected : Type_repr.t)
+    (context : string) : ((Type_repr.generic_key * Type_repr.t) list, string) result =
+  unify_expected env actual expected context
+
 and unify_expected (env : env) (actual : Type_repr.t) (expected : Type_repr.t)
     (context : string) : ((Type_repr.generic_key * Type_repr.t) list, string) result =
   let s = ref [] in
