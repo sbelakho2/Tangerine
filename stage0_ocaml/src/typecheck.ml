@@ -63,6 +63,7 @@ type nominal = {
   nom_params : (string * Ids.Generic_param_id.t) list;
   nom_fields : (string * Type_repr.t) list;          (* struct, in param scope *)
   nom_variants : (string * Type_repr.t array) list;  (* enum, in param scope *)
+  nom_variant_field_names : (string * string list) list;  (* braced-field names per variant, parallel to nom_variants *)
   nom_where : (Type_repr.t * string list) list;      (* resolved where predicates *)
   nom_field_ids : Ids.Field_id.t list;               (* resolver identities, parallel to nom_fields *)
   nom_variant_ids : Ids.Variant_id.t list;           (* resolver identities, parallel to nom_variants *)
@@ -1169,6 +1170,7 @@ let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
       nom_params = [];
       nom_fields = [];
       nom_variants = [];
+      nom_variant_field_names = [];
       nom_where = [];
       nom_field_ids = [];
       nom_variant_ids = [];
@@ -1188,6 +1190,7 @@ let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
       nom_params = [];
       nom_fields = [];
       nom_variants = [];
+      nom_variant_field_names = [];
       nom_where = [];
       nom_field_ids = [];
       nom_variant_ids = [];
@@ -1246,6 +1249,7 @@ let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
       nom_fields = [];
       nom_variants =
         [ ("Some", [| Type_repr.Type_param opt_p |]); ("None", [||]) ];
+      nom_variant_field_names = [];
       nom_where = [];
       nom_field_ids = [];
       nom_variant_ids = [];
@@ -1261,6 +1265,7 @@ let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
           ("Ok", [| Type_repr.Type_param res_p |]);
           ("Err", [| Type_repr.Type_param res_e_p |]);
         ];
+      nom_variant_field_names = [];
       nom_where = [];
       nom_field_ids = [];
       nom_variant_ids = [];
@@ -1286,6 +1291,7 @@ let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
       nom_params = [ ("T", ptrm_p) ];
       nom_fields = [ ("address", Type_repr.Int Type_repr.UInt) ];
       nom_variants = [];
+      nom_variant_field_names = [];
       nom_where = [];
       nom_field_ids = [];
       nom_variant_ids = [];
@@ -1552,6 +1558,11 @@ let rec unify (box_tid : Ids.Type_id.t option) (subst : (Type_repr.generic_key *
   | Type_repr.Ref_internal (_, t1), Type_repr.Named (id2, [| t2 |])
     when Ids.Type_id.compare id2 b_ptr = 0 || Ids.Type_id.compare id2 b_ptrmut = 0 ->
       unify box_tid subst t1 t2
+  (* the deref coercion: an explicit reference unifies with its pointee
+     at the value level (the native accepts `Option::Some(&x)` against
+     Option[T] — the borrow is a read-only view of the same value) *)
+  | Type_repr.Ref_internal (_, t1), t2 -> unify box_tid subst t1 t2
+  | t1, Type_repr.Ref_internal (_, t2) -> unify box_tid subst t1 t2
   | Type_repr.Function (p1, r1), Type_repr.Function (p2, r2) ->
       if Array.length p1 <> Array.length p2 then Error "function arity mismatch"
       else begin
@@ -1710,6 +1721,8 @@ let rec resolve_type (env : env) (scope : scope) (t : Ast.type_expr) : (Type_rep
 
 and resolve_named (env : env) (scope : scope) (span : Span.span) (name : string)
     (args : Ast.type_expr list) : (Type_repr.t, string) result =
+  (if name = "IntrinsicId" then
+     Printf.eprintf "DBG rn IntrinsicId span=%d\n" span.Span.start);
   match List.assoc_opt name scope.generics with
   | Some id ->
       if args <> [] then Error (err span "type parameters do not take arguments")
@@ -2603,9 +2616,19 @@ and unify_expected (env : env) (actual : Type_repr.t) (expected : Type_repr.t)
       match same_named actual expected with
       | Some () -> Ok !s
       | None ->
-          (if context <> "transactional probe" then
-             Printf.eprintf "DBG ue %s\n  expected=%s\n  found=%s\n" context
-               (type_to_string expected) (type_to_string actual));
+          (if context <> "transactional probe" then (
+             let name_of_id i = match List.assoc_opt i env.type_names with
+               | Some n -> n | None -> "?"
+             in
+             let rec ids_of ty acc = match ty with
+               | Type_repr.Named (i, args) ->
+                   let acc' = Array.fold_left (fun a t -> ids_of t a) acc args in
+                   (name_of_id i ^ "@" ^ string_of_int (Ids.Type_id.to_int i)) :: acc'
+               | _ -> acc
+             in
+             Printf.eprintf "DBG ue %s\n  expected=%s [%s]\n  found=%s [%s]\n" context
+               (type_to_string expected) (String.concat "," (ids_of expected []))
+               (type_to_string actual) (String.concat "," (ids_of actual []))));
           Error
             (Printf.sprintf "%s: type mismatch: expected %s, found %s" context
                (type_to_string expected) (type_to_string actual)))
@@ -2916,26 +2939,52 @@ and check_expr_inner (env : env) (scope : scope) (expected : Type_repr.t option)
            | None -> Error (err span (Printf.sprintf "unknown variant `%s` of enum `%s`" member name))
            | Some pty -> (
                let payload = Array.map (substitute_fixpoint subst) pty in
+               (if name = "MirTerminatorKind::MirCall" then
+                  Printf.eprintf "DBG MirCall payload: %s\n"
+                    (String.concat " | " (Array.to_list (Array.map type_to_string payload))));
                if Array.length payload <> List.length fields then
                  Error
                    (err span
                       (Printf.sprintf "variant `%s` expects %d field(s), literal has %d"
                          member (Array.length payload) (List.length fields)))
                else begin
+                 (* the kernel writes braced variant literals in NAME
+                    order, which may differ from the declaration order
+                    (MirCall puts `intrinsic` before `unwind` while the
+                    declaration has `unwind` first); the native binds
+                    the fields BY NAME — resolve each literal field to
+                    its declared position *)
+                 let declared_names =
+                   match List.assoc_opt member nom.nom_variant_field_names with
+                   | Some ns -> ns
+                   | None -> []
+                 in
+                 let field_pos fname =
+                   let rec find i = function
+                     | [] -> None
+                     | n :: rest -> if n = fname then Some i else find (i + 1) rest
+                   in
+                   find 0 declared_names
+                 in
                  let rec go acc i = function
                    | [] -> Ok (List.rev acc)
                    | (fname, fe) :: fs -> (
-                       match check_expr env scope (Some payload.(i)) fe with
+                       let idx =
+                         match field_pos fname with
+                         | Some p -> p
+                         | None -> i
+                       in
+                       match check_expr env scope (Some payload.(idx)) fe with
                        | Error m -> Error m
                        | Ok fte -> (
                            let s2 = ref [] in
-                           match unify env.state.box_tid s2 payload.(i) fte.te_type with
+                           match unify env.state.box_tid s2 payload.(idx) fte.te_type with
                            | Ok () -> go (fte :: acc) (i + 1) fs
                            | Error m ->
                                Error
                                  (err (Ast.expr_span fe)
                                     (Printf.sprintf "field `%s` type mismatch: expected %s (%s)"
-                                       fname (type_to_string payload.(i)) m))))
+                                       fname (type_to_string payload.(idx)) m))))
                  in
                  match go [] 0 fields with
                  | Error m -> Error m
@@ -3703,6 +3752,7 @@ and check_match (env : env) (scope : scope) (expected : Type_repr.t option) (nid
                        match's Result context *)
                     match first.te_type with
                     | Type_repr.Never -> expected
+                    | Type_repr.Unit -> expected
                     | _ ->
                         (* a statement-position match (no enclosing
                            expected) discards the arm values: subsequent
@@ -3722,14 +3772,14 @@ and check_match (env : env) (scope : scope) (expected : Type_repr.t option) (nid
                       match unify env.state.box_tid subst first.te_type te.te_type with
                       | Ok () -> go (idx + 1) (te :: acc) rest
                       | Error m ->
-                          (* a statement-position match whose arms diverge
-                             over Unit (`when X then strings.insert(...)
-                             else () end` — the Unit arm's value is
-                             discarded): the native accepts; other
-                             divergences stay errors *)
+                          (* a match whose arms diverge over Unit
+                             (`when X then strings.insert(...) else ()
+                             end` — the Unit arm's value is discarded,
+                             the match type is the non-Unit arm's): the
+                             native accepts; other divergences stay
+                             errors *)
                           (match first.te_type, te.te_type with
-                           | Type_repr.Unit, _ | _, Type_repr.Unit
-                             when expected = None ->
+                           | Type_repr.Unit, _ | _, Type_repr.Unit ->
                                go (idx + 1) (te :: acc) rest
                            | _ ->
                                (* arm incompatibility is a real semantic failure:
@@ -5820,7 +5870,7 @@ and register_item (env : env) (item : Ast.item) : (env, string) result =
             (if d.s_name = "Box" then env.state.box_tid <- Some tid);
             let param_tys = Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param (p)) params) in
             let nom : nominal =
-              { nom_kind = `Struct; nom_params = params; nom_fields = []; nom_variants = []; nom_where = []; nom_field_ids = []; nom_variant_ids = [] }
+              { nom_kind = `Struct; nom_params = params; nom_fields = []; nom_variants = []; nom_variant_field_names = []; nom_where = []; nom_field_ids = []; nom_variant_ids = [] }
             in
             (* a user definition of a builtin name REPLACES the builtin *)
             let env' =
@@ -5873,6 +5923,7 @@ and register_item (env : env) (item : Ast.item) : (env, string) result =
           nom_params = params;
           nom_fields = fields;
           nom_variants = [];
+          nom_variant_field_names = [];
           nom_where = where;
           nom_field_ids = field_ids;
           nom_variant_ids = [];
@@ -5911,7 +5962,7 @@ and register_item (env : env) (item : Ast.item) : (env, string) result =
             in
             let param_tys = Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param (p)) params) in
             let nom : nominal =
-              { nom_kind = `Enum; nom_params = params; nom_fields = []; nom_variants = []; nom_where = []; nom_field_ids = []; nom_variant_ids = [] }
+              { nom_kind = `Enum; nom_params = params; nom_fields = []; nom_variants = []; nom_variant_field_names = []; nom_where = []; nom_field_ids = []; nom_variant_ids = [] }
             in
             let env' =
               {
@@ -5963,12 +6014,23 @@ and register_item (env : env) (item : Ast.item) : (env, string) result =
             | None -> Ids.Variant_id.make (i + 1))
           variants
       in
+      let field_names =
+        List.map
+          (fun (v : Ast.variant_decl) ->
+            ( v.v_name,
+              List.filter_map
+                (fun (vf : Ast.variant_field) ->
+                  match vf.vf_name with Some n -> Some n | None -> None)
+                v.v_fields ))
+          d.e_variants
+      in
       let nom : nominal =
         {
           nom_kind = `Enum;
           nom_params = params;
           nom_fields = [];
           nom_variants = variants;
+          nom_variant_field_names = field_names;
           nom_where = where;
           nom_field_ids = [];
           nom_variant_ids = variant_ids;
@@ -6223,7 +6285,7 @@ let rec register_headers (env : env) (acc : string list) = function
             (if d.s_name = "Box" then env.state.box_tid <- Some tid);
             let param_tys = Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param (p)) params) in
             let nom : nominal =
-              { nom_kind = `Struct; nom_params = params; nom_fields = []; nom_variants = []; nom_where = []; nom_field_ids = []; nom_variant_ids = [] }
+              { nom_kind = `Struct; nom_params = params; nom_fields = []; nom_variants = []; nom_variant_field_names = []; nom_where = []; nom_field_ids = []; nom_variant_ids = [] }
             in
             let env' =
               {
@@ -6261,7 +6323,7 @@ let rec register_headers (env : env) (acc : string list) = function
             in
             let param_tys = Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param (p)) params) in
             let nom : nominal =
-              { nom_kind = `Enum; nom_params = params; nom_fields = []; nom_variants = []; nom_where = []; nom_field_ids = []; nom_variant_ids = [] }
+              { nom_kind = `Enum; nom_params = params; nom_fields = []; nom_variants = []; nom_variant_field_names = []; nom_where = []; nom_field_ids = []; nom_variant_ids = [] }
             in
             let env' =
               {
