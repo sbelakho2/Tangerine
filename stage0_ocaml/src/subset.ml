@@ -72,6 +72,12 @@ let reject (diags : Diagnostic.bag) code msg span =
 
 type ctx = {
   user_variants : string list;
+  (* the field-less (nullary) variant names, bare and qualified — the
+     static-initializer gate (E9034 retirement) accepts a nullary
+     variant VALUE (`Option::None`, `Color::Red`, bare `None`) because
+     the driver's const_values records it as an Enum constant; a
+     non-nullary ctor in value position is not a value *)
+  nullary_variants : string list;
   nominals : string list;
   functions : string list;
 }
@@ -80,6 +86,7 @@ type ctx = {
    module and extern blocks, the realistic nesting for seed enums). *)
 let collect_ctx (program : Ast.program) : ctx =
   let variants = ref [] in
+  let nullary = ref [] in
   let nominals = ref [] in
   let functions = ref [] in
   let rec item i =
@@ -89,7 +96,11 @@ let collect_ctx (program : Ast.program) : ctx =
         List.iter
           (fun v ->
             variants := v.Ast.v_name :: !variants;
-            variants := (d.Ast.e_name ^ "::" ^ v.Ast.v_name) :: !variants)
+            variants := (d.Ast.e_name ^ "::" ^ v.Ast.v_name) :: !variants;
+            if v.Ast.v_fields = [] then begin
+              nullary := v.Ast.v_name :: !nullary;
+              nullary := (d.Ast.e_name ^ "::" ^ v.Ast.v_name) :: !nullary
+            end)
           d.Ast.e_variants
     | Ast.StructDef d -> nominals := d.Ast.s_name :: !nominals
     | Ast.Function d -> functions := d.Ast.fn_sig.Ast.sig_name :: !functions
@@ -98,7 +109,12 @@ let collect_ctx (program : Ast.program) : ctx =
     | _ -> ()
   in
   List.iter item program.Ast.items;
-  { user_variants = !variants; nominals = !nominals; functions = !functions }
+  {
+    user_variants = !variants;
+    nullary_variants = !nullary;
+    nominals = !nominals;
+    functions = !functions;
+  }
 
 (* A variant pattern the default variant table can serve: the builtin
    enums Option (Some=0, None=1) and Result (Ok=0, Err=1), in bare or
@@ -109,6 +125,20 @@ let builtin_variant_of (seg1 : string) (seg2 : string) : bool =
   | "Option" -> seg2 = "Some" || seg2 = "None"
   | "Result" -> seg2 = "Ok" || seg2 = "Err"
   | _ -> false
+
+(* The nullary ctor-name set the static-initializer evaluator records
+   (E9034 ctor retirement): the builtin `Option::None` — None is the
+   only nullary builtin variant (Some/Ok/Err carry payloads) — plus the
+   user enum's field-less variants in bare or qualified form.  A
+   non-nullary ctor name in value position is a function, never a
+   static value. *)
+let nullary_variant_name (ctx : ctx) (n : string) : bool =
+  match String.index_opt n ':' with
+  | Some i when i + 1 < String.length n && n.[i + 1] = ':' ->
+      let qual = String.sub n 0 i in
+      let vname = String.sub n (i + 2) (String.length n - i - 2) in
+      (qual = "Option" && vname = "None") || List.mem n ctx.nullary_variants
+  | _ -> n = "None" || List.mem n ctx.nullary_variants
 
 let rec check_item ctx diags (i : Ast.item) =
   List.iter
@@ -175,16 +205,43 @@ let rec check_item ctx diags (i : Ast.item) =
   | Ast.StaticDecl d ->
       (* literal statics are evaluated into program.statics and the
          lowering env like literal consts (the E9034 literal static form
-         is retired); the non-literal initializer forms stay rejected
-         until the evaluator grows *)
+         is retired); the ctor initializer forms the driver's evaluator
+         records — a nullary enum-variant VALUE (`Option::None`, bare
+         `None`, a user enum's field-less variant), the empty container
+         (`Vec::new()`) and an EMPTY struct literal
+         (`SystemAllocator {}`) — are retired 2026-08-29 (each records a
+         constant carrying the declared instantiated type); the
+         remaining non-literal forms (calls with arguments, non-empty
+         struct literals, arbitrary expressions) stay rejected until the
+         evaluator grows *)
       (match d.Ast.st_value with
        | Ast.IntLit _ | Ast.BoolLit _ | Ast.StringLit _ | Ast.CharLit _
        | Ast.FloatLit _ ->
            ()
-       | Ast.Unary (_, Ast.Neg, Ast.IntLit _, _) -> ()
+       | Ast.Unary (_, Ast.Neg, Ast.IntLit _, _) ->
+           (* a negated integer initializer `static MIN: Int = -128` *)
+           ()
+       | Ast.Name (_, n, _) when nullary_variant_name ctx n ->
+           (* a nullary variant ctor value: `Option::None` *)
+           ()
+       | Ast.Call (_, callee, _, args, _) -> (
+           (* the empty container: `Vec::new()` (the kernel alias
+              `Array::new` served by the same qualified static-call
+              path) with no arguments *)
+           match callee with
+           | Ast.Name (_, cname, _)
+             when (cname = "Vec::new" || cname = "Array::new") && args = [] ->
+               ()
+           | _ ->
+               reject diags "E9034"
+                 "non-literal static initializers are not available in the bootstrap subset (the seed evaluates literal, nullary-variant-ctor, `Vec::new` and empty struct-literal initializers only)"
+                 d.Ast.st_span)
+       | Ast.StructLit (_, _, _, [], None, _) ->
+           (* an EMPTY struct literal: `SystemAllocator {}` *)
+           ()
        | _ ->
            reject diags "E9034"
-             "non-literal static initializers are not available in the bootstrap subset (the seed evaluates literal static initializers only)"
+             "non-literal static initializers are not available in the bootstrap subset (the seed evaluates literal, nullary-variant-ctor, `Vec::new` and empty struct-literal initializers only)"
              d.Ast.st_span);
       check_expr ctx diags d.Ast.st_value;
       check_type ctx diags false d.Ast.st_type

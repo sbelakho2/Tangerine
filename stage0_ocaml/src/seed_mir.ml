@@ -64,6 +64,21 @@ type constant =
   | Char of Uchar.t
   | String of string
   | Function of Instance_id.t
+  (* Static-initializer ctor constants (E9034 retirement 2026-08-29):
+     the driver's const_values records a nullary enum-variant ctor value
+     (`Option::None`), an EMPTY struct literal (`SystemAllocator {}`) and
+     the empty container (`Vec::new()`) as constants so a static read
+     lowers to a Constant operand.  Each carries the checker's
+     INSTANTIATED monotype — the declared static type — because the
+     instantiation is not recoverable from the program's def table alone
+     (verify_statics' constant_type comparison is exact against the
+     declared type).  The VM materializes the runtime shapes: Enum is
+     the variant's runtime tag (vs_index — the EnumCtor convention, the
+     same position closure_types materializes as vd_index), Struct/Array
+     the empty aggregates. *)
+  | Enum of Ids.Variant_index.t * Type_repr.t
+  | Struct of Type_repr.t
+  | Array of Type_repr.t
 
 (* Projections are SEMANTIC (re-audit finding: the seed's projections
    must carry the field/variant identity, not the declaration-order
@@ -289,6 +304,10 @@ let rec print_constant (c : constant) : string =
   | Char ch -> Printf.sprintf "'U+%04X'" (Uchar.to_int ch)
   | String s -> Printf.sprintf "\"%s\"" s
   | Function inst -> "fn " ^ print_instance inst
+  | Enum (vi, ty) ->
+      Printf.sprintf "enum-ctor#%d %s" (Ids.Variant_index.to_int vi) (print_type ty)
+  | Struct ty -> Printf.sprintf "struct {}: %s" (print_type ty)
+  | Array ty -> Printf.sprintf "[]: %s" (print_type ty)
 
 and print_instance (inst : Instance_id.t) : string =
   Printf.sprintf "inst{callable#%d; [%s]}"

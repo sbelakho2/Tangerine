@@ -446,6 +446,191 @@ end
                     exit 1
                   end
                 end));
+      (* ── static-ctor initializer round-trip proof (E9034 ctor
+         retirement 2026-08-29): `static mut K: Option[Int] =
+         Option::None` is DECLARED and READ.  The driver's const_values
+         records the nullary-variant constant (Enum with None's runtime
+         tag 1 and the declared INSTANTIATED type Option[Int]); the
+         lowerer's Name path reads the static as a Constant operand;
+         the verifier passes in both modes; the VM round-trips the enum
+         value through a match (main = 1 — the None arm; a misrecorded
+         tag would take the Some arm and return 2) ───────────────── *)
+      let ctor_src = {|
+static mut K: Option[Int] = Option::None
+static mut N: Option[Int] = None
+def main() -> Int
+  let k = K
+  match k {
+    Some(v) => 2,
+    None() => 1
+  }
+end
+|} in
+      (match Source_loader.load_string "<static-ctor>" ctor_src with
+       | Error _ -> failwith "static-ctor source load"
+       | Ok csrc ->
+           let csm = Span.create () in
+           let cfid = Span.add_file csm csrc.Source.name csrc in
+           let cdiags = Diagnostic.create_bag () in
+           let clx = Lexer.create csrc.Source.bytes cfid cdiags in
+           let ctoks = Lexer.lex clx in
+           let cprog = Parser.parse ctoks csrc.Source.bytes cfid cdiags [ "ctor" ] in
+           (match Typecheck.check_program (Typecheck.initial_env ()) cprog with
+            | Error m -> failwith ("static-ctor typecheck: " ^ m)
+            | Ok (cenv, errs) ->
+                if errs <> [] then
+                  failwith ("static-ctor typecheck errors: " ^ String.concat "; " errs)
+                else begin
+                  let option_tid = List.assoc "Option" cenv.Typecheck.type_ids in
+                  let int_ty = Type_repr.Int Type_repr.Int in
+                  let consts = Driver.const_values cenv cprog.Ast.items in
+                  (* the const channel: K carries an Enum constant with
+                     None's runtime tag (declaration position 1 in
+                     [Some; None]) and the declared instantiated type *)
+                  let k_ok =
+                    match List.assoc_opt "ctor::K" consts with
+                    | Some (ty, Seed_mir.Enum (vi, cty)) ->
+                        Ids.Variant_index.to_int vi = 1
+                        && (match ty with
+                           | Type_repr.Named (tid, [| Type_repr.Int Type_repr.Int |]) ->
+                               Ids.Type_id.compare tid option_tid = 0
+                           | _ -> false)
+                        && Type_repr.compare ty cty = 0
+                    | _ -> false
+                  in
+                  (* the bare `None` ctor resolves through the same
+                     nominal registry (first-wins like vt_ctors) *)
+                  let n_ok =
+                    match List.assoc_opt "ctor::N" consts with
+                    | Some (ty, Seed_mir.Enum (vi, cty)) ->
+                        Ids.Variant_index.to_int vi = 1
+                        && Type_repr.compare ty cty = 0
+                    | _ -> false
+                  in
+                  if not (k_ok && n_ok) then begin
+                    Printf.printf
+                      "  static-ctor constant: FAIL (consts channel missing/malformed; k_ok=%b n_ok=%b)\n"
+                      k_ok n_ok;
+                    exit 1
+                  end;
+                  let cbase = Driver.lowering_env_of ~items:cprog.Ast.items cenv in
+                  let cvariants = Driver.user_variant_table cenv in
+                  let main_decl =
+                    match
+                      List.find_opt
+                        (fun i ->
+                          match i.Ast.kind with
+                          | Ast.Function d -> d.Ast.fn_sig.Ast.sig_name = "main"
+                          | _ -> false)
+                        cprog.Ast.items
+                    with
+                    | Some i -> i
+                    | None -> failwith "static-ctor: no main function"
+                  in
+                  let cts =
+                    match List.assoc_opt "main" cenv.Typecheck.functions with
+                    | Some ts -> ts
+                    | None -> (
+                        match
+                          List.filter (fun (k, _) -> Util.has_suffix k "::main")
+                            cenv.Typecheck.functions
+                        with
+                        | [ (_, ts) ] -> ts
+                        | _ -> failwith "static-ctor: no typed signature for main")
+                  in
+                  let main_fn =
+                    match main_decl.Ast.kind with
+                    | Ast.Function d ->
+                        Mir_lower.lower_function_with_variants
+                          ~typed_nodes:(Driver.typed_nodes_of cenv)
+                          ~typed_patterns:(Driver.typed_patterns_of cenv)
+                          cvariants
+                          { cbase with Mir_lower.fn_ret = cts.Typecheck.ts_return }
+                          "main"
+                          (Ids.Callable_id.to_int cts.Typecheck.ts_callable)
+                          [||] [||] d
+                    | _ -> failwith "static-ctor: main is not a function"
+                  in
+                  (* the Option[Int] concrete def (post-mono shape): the
+                     variant payloads Tuple[Int] / Unit with the
+                     canonical 1-based semantic ids — the same minting
+                     the driver's registry channel and the variant
+                     table's vt_builtin use *)
+                  let ctypes =
+                    [|
+                      Seed_mir.EnumDef
+                        {
+                          ed_id = option_tid;
+                          ed_variants =
+                            [
+                              {
+                                Seed_mir.vd_id = Ids.Variant_id.make 1;
+                                vd_index = Ids.Variant_index.make 0;
+                                vd_payload = Type_repr.Tuple [| int_ty |];
+                              };
+                              {
+                                Seed_mir.vd_id = Ids.Variant_id.make 2;
+                                vd_index = Ids.Variant_index.make 1;
+                                vd_payload = Type_repr.Unit;
+                              };
+                            ];
+                        };
+                    |]
+                  in
+                  let cprog_mir =
+                    {
+                      Seed_mir.functions = [| main_fn |];
+                      statics = [||];
+                      types = ctypes;
+                    }
+                  in
+                  (match
+                     Mir_verify.require_valid_template
+                       ~generic_types:(Driver.closure_generic_types cenv)
+                       cprog_mir
+                   with
+                   | Ok () ->
+                       Printf.printf
+                         "  static-ctor verify (template mode): PASS (the Enum constant carries its declared instantiated type)\n"
+                   | Error errs ->
+                       Printf.printf "  static-ctor verify (template mode): FAIL\n";
+                       List.iter (fun e -> Printf.printf "    %s\n" e) errs;
+                       Printf.printf "%s\n" (Seed_mir.print_program cprog_mir);
+                       exit 1);
+                  (match Mir_verify.require_valid_concrete cprog_mir with
+                   | Ok () ->
+                       Printf.printf
+                         "  static-ctor verify (concrete mode): PASS (Option[Int] def reconciles the None tag)\n"
+                   | Error errs ->
+                       Printf.printf "  static-ctor verify (concrete mode): FAIL\n";
+                       List.iter (fun e -> Printf.printf "    %s\n" e) errs;
+                       Printf.printf "%s\n" (Seed_mir.print_program cprog_mir);
+                       exit 1);
+                  let c_entry = main_fn.Seed_mir.instance in
+                  let chost = Host.create ~repo_root:"." ~argv:[||] in
+                  (match Vm.run ~program:cprog_mir ~entry:c_entry ~argv:[||] ~host:chost with
+                   | Error e ->
+                       Printf.printf "  static-ctor VM: FAIL %s\n" e.Vm.message;
+                       exit 1
+                   | Ok code -> (
+                       match
+                         Vm.entry_frame_of ~program:cprog_mir ~entry:c_entry ~argv:[||]
+                       with
+                       | Error m ->
+                           Printf.printf "  static-ctor VM: <inspect failed: %s>\n" m;
+                           exit 1
+                       | Ok (cvm, cframe) -> (
+                           match Vm.run_inspect cvm cframe with
+                           | Ok "1" ->
+                               Printf.printf
+                                 "  static-ctor round-trip: PASS (main = 1 — the read of `K` lowered to the Enum constant and the VM matched None's tag 1; exit %d)\n"
+                                 code
+                           | other ->
+                               Printf.printf
+                                 "  static-ctor round-trip: FAIL (expected 1, got %s)\n"
+                                 (match other with Ok v -> v | Error m -> "<" ^ m ^ ">");
+                               exit 1)))
+                end));
       let tcheck_env =
         match Typecheck.check_program env program with
         | Error m -> Printf.printf "  typecheck: FAIL %s\n" m; exit 1

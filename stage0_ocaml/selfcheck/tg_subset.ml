@@ -390,6 +390,21 @@ end
   t
 end
 |});
+    (* E9034 retired for the ctor static initializers (2026-08-29): the
+       driver's const_values records a nullary enum-variant VALUE
+       (`Option::None` — also the bare `None` and user nullary-variant
+       forms), the empty container (`Vec::new()`) and an EMPTY struct
+       literal (`SystemAllocator {}`) as constants carrying the declared
+       instantiated type — the forms are positive subset accepts *)
+    ("StaticDecl (ctor initializers)", {|static mut K: Option[Int] = Option::None
+static mut V: Vec[Int] = Vec::new()
+struct S
+end
+static mut X: S = S {}
+def f() -> Int
+  0
+end
+|});
   ]
 
 let conditional_reject_specimens : (string * string * string) list =
@@ -424,6 +439,23 @@ end
     t = t + 1
   end
   t
+end
+|});
+    (* E9034's remaining static-initializer reject paths: calls with
+       arguments, non-empty struct literals and arbitrary expressions
+       stay rejected until the evaluator grows (the retired forms —
+       literal, nullary-variant-ctor, `Vec::new`, empty struct-literal —
+       are the accept-path specimens above) *)
+    ("StaticDecl (arg call)", "E9034",
+     {|static mut L: Mutex = Mutex::new()
+def f() -> Int
+  0
+end
+|});
+    ("StaticDecl (non-empty struct literal)", "E9034",
+     {|static mut A: AtomicInt = AtomicInt { value: 0 }
+def f() -> Int
+  0
 end
 |});
   ]

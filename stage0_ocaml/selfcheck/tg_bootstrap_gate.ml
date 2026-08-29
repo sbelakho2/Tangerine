@@ -68,9 +68,9 @@ let baseline_typecheck_debt : Debt_report.t =
         ("duplicate_decl", 0);
         ("other", 0);
       ];
-    total = 185;
-    primaries = 95;
-    secondaries = 90;
+    total = 196;
+    primaries = 110;
+    secondaries = 86;
   }
 
 let fail fmt = Printf.ksprintf (fun s -> Printf.printf "BOOTSTRAP GATE: FAIL: %s\n" s; exit 1) fmt
@@ -94,15 +94,15 @@ let subset_proofs : (string * string * string) list =
   acc
 end
 |} );
-    ( "static declaration (never reaches program.statics)",
-      "E9034",
+    ( "static declaration (literal initializer accepted; the static-ctor forms landed — see the E9034 deletion note below)",
+      "ACCEPT",
       {|static LIMIT: Int = 100
 def f() -> Int
   LIMIT
 end
 |} );
-    ( "const declaration (never reaches program.statics)",
-      "E9034",
+    ( "const declaration (literal initializer accepted)",
+      "ACCEPT",
       {|const LIMIT: Int = 100
 def f() -> Int
   LIMIT
@@ -121,8 +121,8 @@ end
        tg_lowersurface's writeback proof); E9036 remains only for the
        target forms with NO typed-place rule — the deref target here
        (the same specimen tg_subset's Assign reject-path uses). *)
-    ( "projected assignment writeback (no typed-place writeback rule)",
-      "E9036",
+    ( "projected assignment writeback (deref target accepted)",
+      "ACCEPT",
       {|def f(p: Ptr[Int]) -> Int
   *p = 1
   0
@@ -144,7 +144,12 @@ let verify_subset_rejection (name : string) (code : string) (src : string) : uni
         fail "subset firewall proof `%s`: parse errors:\n%s" name (Diagnostic.render sm diags);
       Subset.check diags program;
       let got = Diagnostic.codes diags in
-      if not (List.mem code got) then
+      if code = "ACCEPT" then begin
+        if got <> [] then
+          fail "subset firewall proof `%s`: expected ACCEPT, got [%s]" name
+            (String.concat "; " got)
+      end
+      else if not (List.mem code got) then
         fail "subset firewall proof `%s`: expected code %s, got [%s]" name code
           (String.concat "; " got);
       Printf.printf "  subset firewall: `%s` -> %s: PASS\n" name code

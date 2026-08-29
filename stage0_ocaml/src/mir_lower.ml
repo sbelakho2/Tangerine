@@ -437,6 +437,10 @@ let constant_type_of (c : Seed_mir.constant) : Type_repr.t =
   | Seed_mir.Char _ -> Type_repr.Char
   | Seed_mir.String _ -> Type_repr.String
   | Seed_mir.Function _ -> Type_repr.Function ([||], Type_repr.Unit)
+  (* the ctor constants carry the declared instantiated type (the
+     driver records it); materializing one into a local keeps the
+     constant's own type *)
+  | Seed_mir.Enum (_, ty) | Seed_mir.Struct ty | Seed_mir.Array ty -> ty
 
 (* Turn an operand into a place (materializing constants into a local). *)
 let materialize_place (st : lower_state) (op : Seed_mir.operand) : Seed_mir.place =

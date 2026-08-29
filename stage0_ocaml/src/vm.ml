@@ -262,7 +262,15 @@ let rec eval_operand (vm : t) (frame : frame) (op : Seed_mir.operand) : Vm_value
       | Seed_mir.Float64 f -> Vm_value.Float64 f
       | Seed_mir.Char c -> Vm_value.Char c
       | Seed_mir.String s -> Vm_value.String s
-      | Seed_mir.Function inst -> Vm_value.Function inst)
+      | Seed_mir.Function inst -> Vm_value.Function inst
+      (* the ctor constants: the runtime shapes of a nullary enum-variant
+         value (the tag is the EnumCtor convention's vs_index), an empty
+         struct literal and the empty Vec::new() container — a static
+         read lowering to these constants executes as the aggregate *)
+      | Seed_mir.Enum (vi, _) ->
+          Vm_value.Enum (Ids.Variant_index.to_int vi, [||])
+      | Seed_mir.Struct _ -> Vm_value.Struct [||]
+      | Seed_mir.Array _ -> Vm_value.Array [||])
   | Seed_mir.Copy p | Seed_mir.Read p -> (
       match read_place vm frame p with
       | Ok v -> v

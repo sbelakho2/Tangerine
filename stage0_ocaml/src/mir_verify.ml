@@ -1067,6 +1067,11 @@ and constant_type (ctx : ctx) (c : constant) : Type_repr.t =
   | Char _ -> Type_repr.Char
   | String _ -> Type_repr.String
   | Function inst -> function_constant_type ctx inst
+  (* the ctor constants carry the declared INSTANTIATED monotype (the
+     driver records it from the typed const registry — the instantiation
+     is not recoverable from the def table alone), so the static's
+     declared type compares exactly *)
+  | Enum (_, ty) | Struct ty | Array ty -> ty
 
 and function_constant_type (ctx : ctx) (inst : Instance_id.t) : Type_repr.t =
   match resolve_callee ctx inst with

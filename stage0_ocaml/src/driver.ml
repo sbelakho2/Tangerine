@@ -149,10 +149,44 @@ let lookup_typed_fn (env : Typecheck.env) (name : string) : Typecheck.typed_sign
    the declared types; the literal initializers evaluate into
    Seed_mir.constant values (the E9034 literal forms retire — the
    driver's statics and the lowering env carry the values; the subset
-   rejects the non-literal forms until the evaluator grows). *)
+   rejects the non-literal forms until the evaluator grows).  The ctor
+   initializer forms (E9034 ctor retirement 2026-08-29) evaluate into
+   the new constant forms: a nullary enum-variant value (`Option::None`
+   — the variant's runtime tag is its declaration-order position in the
+   typed nominal's variant list, the SAME position user_variant_table
+   and closure_types materialize as vs_index/vd_index, the EnumCtor tag
+   convention; the builtin Option/Result go through the same registry),
+   an EMPTY struct literal (`SystemAllocator {}`) and the empty
+   container (`Vec::new()`).  Each ctor constant carries the checker's
+   instantiated declared type, so verify_statics' constant_type
+   comparison is exact. *)
 let const_values (env : Typecheck.env) (items : Ast.item list) :
     (string * (Type_repr.t * Seed_mir.constant)) list =
-  let lit_constant (d : Ast.const_decl) : Seed_mir.constant option =
+  let variant_tag (qual : string) (vname : string) : int option =
+    if qual = "" then
+      (* a bare ctor name (`None`): the FIRST nominal carrying the
+         variant — the same first-wins convention the variant table's
+         vt_ctors channel uses *)
+      let rec find = function
+        | [] -> None
+        | (_, nom) :: rest -> (
+            match
+              List.assoc_opt vname
+                (List.mapi (fun i (vn, _) -> (vn, i)) nom.Typecheck.nom_variants)
+            with
+            | Some i -> Some i
+            | None -> find rest)
+      in
+      find env.Typecheck.nominals
+    else
+      match List.filter (fun (name, _) -> name = qual) env.Typecheck.nominals with
+      | (_, nom) :: _ ->
+          List.assoc_opt vname
+            (List.mapi (fun i (vn, _) -> (vn, i)) nom.Typecheck.nom_variants)
+      | [] -> None
+  in
+  let lit_constant (d : Ast.const_decl) (ty : Type_repr.t) :
+      Seed_mir.constant option =
     match d.Ast.c_value with
     | Ast.BoolLit (_, b, _) -> Some (Seed_mir.Bool b)
     | Ast.CharLit (_, c, _) -> (
@@ -206,6 +240,33 @@ let const_values (env : Typecheck.env) (items : Ast.item list) :
                    (Int64.neg (Int64.of_int (Big_nat.to_ocaml_int p.Literal.magnitude))))
             else None)
         | None -> None)
+    | Ast.Name (_, n, _) -> (
+        (* a nullary enum-variant ctor value (`Option::None`, or a bare
+           `None` / user-enum nullary variant) — the ctor constant *)
+        match String.index_opt n ':' with
+        | Some i when i + 1 < String.length n && n.[i + 1] = ':' ->
+            let qual = String.sub n 0 i in
+            let vname = String.sub n (i + 2) (String.length n - i - 2) in
+            Option.map
+              (fun tag -> Seed_mir.Enum (Ids.Variant_index.make tag, ty))
+              (variant_tag qual vname)
+        | _ ->
+            Option.map
+              (fun tag -> Seed_mir.Enum (Ids.Variant_index.make tag, ty))
+              (variant_tag "" n))
+    | Ast.Call (_, callee, _, args, _) -> (
+        (* `Vec::new()` (the empty container — the kernel alias
+           `Array::new` served by the same qualified static-call path) *)
+        match callee with
+        | Ast.Name (_, cname, _)
+          when (cname = "Vec::new" || cname = "Array::new") && args = [] ->
+            Some (Seed_mir.Array ty)
+        | _ -> None)
+    | Ast.StructLit (_, _, _, [], None, _) ->
+        (* an EMPTY struct literal (`SystemAllocator {}`) — the
+           non-empty literal forms stay outside the evaluated set (the
+           subset keeps rejecting them) *)
+        Some (Seed_mir.Struct ty)
     | _ -> None
   in
   (* the const declarations in the closure, keyed by the qualified and
@@ -240,7 +301,7 @@ let const_values (env : Typecheck.env) (items : Ast.item list) :
       match decl_of n with
       | None -> []
       | Some d -> (
-          match lit_constant d with
+          match lit_constant d ty with
           | None -> []
           | Some c -> List.map (fun k -> (k, (ty, c))) (bare_keys n)))
     env.Typecheck.consts
