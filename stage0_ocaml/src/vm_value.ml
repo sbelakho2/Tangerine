@@ -17,6 +17,8 @@ type t =
   | Struct of t array
   | Enum of int * t array          (* variant index, payload *)
   | Array of t array
+  | Set of t list                 (* the runtime Set: the element list *)
+  | Map of (t * t) list           (* the runtime Map: the key-value pairs *)
   | Function of Instance_id.t
   | Closure of Instance_id.t * t array
   | RawPtr of Vm_memory.pointer
@@ -219,6 +221,18 @@ let rec serialize_value (buf : Buffer.t) (v : t) : unit =
       Buffer.add_char buf (Char.chr 0x0A);
       put_u64 buf (Int64.of_int (Array.length elems));
       Array.iter (serialize_value buf) elems
+  | Set elems ->
+      Buffer.add_char buf (Char.chr 0x0E);
+      put_u64 buf (Int64.of_int (List.length elems));
+      List.iter (serialize_value buf) elems
+  | Map pairs ->
+      Buffer.add_char buf (Char.chr 0x0F);
+      put_u64 buf (Int64.of_int (List.length pairs));
+      List.iter
+        (fun (k, v) ->
+          serialize_value buf k;
+          serialize_value buf v)
+        pairs
   | Enum (tag, payload) ->
       Buffer.add_char buf (Char.chr 0x0B);
       put_u64 buf (Int64.of_int tag);
@@ -314,6 +328,21 @@ let rec deserialize_value (c : cursor) : t =
       let region = cursor_count c in
       let offset = cursor_count c in
       Ref (Region { Vm_memory.region; offset })
+  | 0x0E ->
+      let rec elems acc n =
+        if n = 0 then List.rev acc
+        else elems (deserialize_value c :: acc) (n - 1)
+      in
+      Set (elems [] (cursor_count c))
+  | 0x0F ->
+      let rec pairs acc n =
+        if n = 0 then List.rev acc
+        else
+          let k = deserialize_value c in
+          let v = deserialize_value c in
+          pairs ((k, v) :: acc) (n - 1)
+      in
+      Map (pairs [] (cursor_count c))
   | tag -> failwith (Printf.sprintf "vm serialization: unknown tag 0x%02x" tag)
 
 and cursor_elems (c : cursor) : t array =
@@ -336,6 +365,8 @@ let deserialize (bytes : Bytes.t) : t =
 let rec drop_glue (m : Vm_memory.t) (v : t) : unit =
   match v with
   | Tuple elems | Struct elems | Array elems -> Array.iter (drop_glue m) elems
+  | Set elems -> List.iter (drop_glue m) elems
+  | Map pairs -> List.iter (fun (k, v) -> drop_glue m k; drop_glue m v) pairs
   | Enum (_, payload) -> Array.iter (drop_glue m) payload
   | Ref (Region p) -> (
       match Vm_memory.free m p with

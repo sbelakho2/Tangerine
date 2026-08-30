@@ -116,15 +116,15 @@ let check_dyn_index () =
        (dyn_index_fn
           [| i64; i64; i64; i64 |]
           [
-            Seed_mir.Assign ({ local = 1; projections = [] }, Seed_mir.Use (int_op 1));
+            Seed_mir.Assign ({ root = Seed_mir.Local 1; projections = [] }, Seed_mir.Use (int_op 1));
             Seed_mir.Assign
-              ({ local = 2; projections = [] },
+              ({ root = Seed_mir.Local 2; projections = [] },
                Seed_mir.Aggregate (Seed_mir.ArrayAgg, [ int_op 10; int_op 20; int_op 30 ]));
             Seed_mir.Assign
-              ({ local = 3; projections = [] },
+              ({ root = Seed_mir.Local 3; projections = [] },
                Seed_mir.Use
-                 (Seed_mir.Copy { local = 2; projections = [ Seed_mir.Index 1 ] }));
-            Seed_mir.Assign ({ local = 0; projections = [] }, Seed_mir.Use (Seed_mir.Copy { local = 3; projections = [] }));
+                 (Seed_mir.Copy { root = Seed_mir.Local 2; projections = [ Seed_mir.Index 1 ] }));
+            Seed_mir.Assign ({ root = Seed_mir.Local 0; projections = [] }, Seed_mir.Use (Seed_mir.Copy { root = Seed_mir.Local 3; projections = [] }));
           ]
           Seed_mir.Ret)
    with
@@ -137,17 +137,17 @@ let check_dyn_index () =
        (dyn_index_fn
           [| i64; i64; i64 |]
           [
-            Seed_mir.Assign ({ local = 1; projections = [] }, Seed_mir.Use (int_op 1));
+            Seed_mir.Assign ({ root = Seed_mir.Local 1; projections = [] }, Seed_mir.Use (int_op 1));
             Seed_mir.Assign
-              ({ local = 2; projections = [] },
+              ({ root = Seed_mir.Local 2; projections = [] },
                Seed_mir.Aggregate (Seed_mir.ArrayAgg, [ int_op 10; int_op 20; int_op 30 ]));
             Seed_mir.Assign
-              ({ local = 2; projections = [ Seed_mir.Index 1 ] },
+              ({ root = Seed_mir.Local 2; projections = [ Seed_mir.Index 1 ] },
                Seed_mir.Use (int_op 99));
             Seed_mir.Assign
-              ({ local = 0; projections = [] },
+              ({ root = Seed_mir.Local 0; projections = [] },
                Seed_mir.Use
-                 (Seed_mir.Copy { local = 2; projections = [ Seed_mir.Index 1 ] }));
+                 (Seed_mir.Copy { root = Seed_mir.Local 2; projections = [ Seed_mir.Index 1 ] }));
           ]
           Seed_mir.Ret)
    with
@@ -160,15 +160,15 @@ let check_dyn_index () =
        (dyn_index_fn
           [| i64; i64; i64; i64 |]
           [
-            Seed_mir.Assign ({ local = 1; projections = [] }, Seed_mir.Use (int_op 5));
+            Seed_mir.Assign ({ root = Seed_mir.Local 1; projections = [] }, Seed_mir.Use (int_op 5));
             Seed_mir.Assign
-              ({ local = 2; projections = [] },
+              ({ root = Seed_mir.Local 2; projections = [] },
                Seed_mir.Aggregate (Seed_mir.ArrayAgg, [ int_op 10; int_op 20; int_op 30 ]));
             Seed_mir.Assign
-              ({ local = 3; projections = [] },
+              ({ root = Seed_mir.Local 3; projections = [] },
                Seed_mir.Use
-                 (Seed_mir.Copy { local = 2; projections = [ Seed_mir.Index 1 ] }));
-            Seed_mir.Assign ({ local = 0; projections = [] }, Seed_mir.Use (Seed_mir.Copy { local = 3; projections = [] }));
+                 (Seed_mir.Copy { root = Seed_mir.Local 2; projections = [ Seed_mir.Index 1 ] }));
+            Seed_mir.Assign ({ root = Seed_mir.Local 0; projections = [] }, Seed_mir.Use (Seed_mir.Copy { root = Seed_mir.Local 3; projections = [] }));
           ]
           Seed_mir.Ret)
    with
@@ -182,15 +182,15 @@ let check_dyn_index () =
        (dyn_index_fn
           [| i64; i64; i64; i64 |]
           [
-            Seed_mir.Assign ({ local = 1; projections = [] }, Seed_mir.Use (Seed_mir.Constant (int_value (-1L))));
+            Seed_mir.Assign ({ root = Seed_mir.Local 1; projections = [] }, Seed_mir.Use (Seed_mir.Constant (int_value (-1L))));
             Seed_mir.Assign
-              ({ local = 2; projections = [] },
+              ({ root = Seed_mir.Local 2; projections = [] },
                Seed_mir.Aggregate (Seed_mir.ArrayAgg, [ int_op 10; int_op 20; int_op 30 ]));
             Seed_mir.Assign
-              ({ local = 3; projections = [] },
+              ({ root = Seed_mir.Local 3; projections = [] },
                Seed_mir.Use
-                 (Seed_mir.Copy { local = 2; projections = [ Seed_mir.Index 1 ] }));
-            Seed_mir.Assign ({ local = 0; projections = [] }, Seed_mir.Use (Seed_mir.Copy { local = 3; projections = [] }));
+                 (Seed_mir.Copy { root = Seed_mir.Local 2; projections = [ Seed_mir.Index 1 ] }));
+            Seed_mir.Assign ({ root = Seed_mir.Local 0; projections = [] }, Seed_mir.Use (Seed_mir.Copy { root = Seed_mir.Local 3; projections = [] }));
           ]
           Seed_mir.Ret)
    with
@@ -204,15 +204,15 @@ let check_dyn_index () =
        (dyn_index_fn
           [| i64; i64; i64; i64 |]
           [
-            Seed_mir.Assign ({ local = 1; projections = [] }, Seed_mir.Use (int_op 0));
+            Seed_mir.Assign ({ root = Seed_mir.Local 1; projections = [] }, Seed_mir.Use (int_op 0));
             Seed_mir.Assign
-              ({ local = 2; projections = [] },
+              ({ root = Seed_mir.Local 2; projections = [] },
                Seed_mir.Aggregate (Seed_mir.TupleAgg, [ int_op 7; int_op 8 ]));
             Seed_mir.Assign
-              ({ local = 3; projections = [] },
+              ({ root = Seed_mir.Local 3; projections = [] },
                Seed_mir.Use
-                 (Seed_mir.Copy { local = 2; projections = [ Seed_mir.Index 1 ] }));
-            Seed_mir.Assign ({ local = 0; projections = [] }, Seed_mir.Use (Seed_mir.Copy { local = 3; projections = [] }));
+                 (Seed_mir.Copy { root = Seed_mir.Local 2; projections = [ Seed_mir.Index 1 ] }));
+            Seed_mir.Assign ({ root = Seed_mir.Local 0; projections = [] }, Seed_mir.Use (Seed_mir.Copy { root = Seed_mir.Local 3; projections = [] }));
           ]
           Seed_mir.Ret)
    with
@@ -234,24 +234,24 @@ let check_dyn_index () =
                 { id = 0;
                   statements =
                     [
-                      Seed_mir.Assign ({ local = 1; projections = [] }, Seed_mir.Use (int_op 2));
-                      Seed_mir.Assign ({ local = 2; projections = [] }, Seed_mir.Use (str_op "abc"));
+                      Seed_mir.Assign ({ root = Seed_mir.Local 1; projections = [] }, Seed_mir.Use (int_op 2));
+                      Seed_mir.Assign ({ root = Seed_mir.Local 2; projections = [] }, Seed_mir.Use (str_op "abc"));
                       Seed_mir.Assign
-                        ({ local = 3; projections = [] },
+                        ({ root = Seed_mir.Local 3; projections = [] },
                          Seed_mir.Use
-                           (Seed_mir.Copy { local = 2; projections = [ Seed_mir.Index 1 ] }));
+                           (Seed_mir.Copy { root = Seed_mir.Local 2; projections = [ Seed_mir.Index 1 ] }));
                     ];
                   terminator =
                     Seed_mir.SwitchInt
-                      (Seed_mir.Copy { local = 3; projections = [] },
+                      (Seed_mir.Copy { root = Seed_mir.Local 3; projections = [] },
                        [ (99L, 1) ], 2) };
                 { id = 1;
                   statements =
-                    [ Seed_mir.Assign ({ local = 0; projections = [] }, Seed_mir.Use (int_op 1)) ];
+                    [ Seed_mir.Assign ({ root = Seed_mir.Local 0; projections = [] }, Seed_mir.Use (int_op 1)) ];
                   terminator = Seed_mir.Ret };
                 { id = 2;
                   statements =
-                    [ Seed_mir.Assign ({ local = 0; projections = [] }, Seed_mir.Use (int_op 0)) ];
+                    [ Seed_mir.Assign ({ root = Seed_mir.Local 0; projections = [] }, Seed_mir.Use (int_op 0)) ];
                   terminator = Seed_mir.Ret };
               |];
             entry = 0 };
@@ -280,42 +280,42 @@ let check_pointer () =
                 { id = 0;
                   statements =
                     [
-                      Seed_mir.Assign ({ local = 1; projections = [] }, Seed_mir.Use (int_op 4242));
+                      Seed_mir.Assign ({ root = Seed_mir.Local 1; projections = [] }, Seed_mir.Use (int_op 4242));
                       Seed_mir.Assign
-                        ({ local = 2; projections = [] },
+                        ({ root = Seed_mir.Local 2; projections = [] },
                          Seed_mir.Cast (int_op 0, raw_ptr_ty));
                       (* store the u64 through the RawPtr *)
                       Seed_mir.Assign
-                        ({ local = 2; projections = [ Seed_mir.Deref ] },
-                         Seed_mir.Use (Seed_mir.Copy { local = 1; projections = [] }));
+                        ({ root = Seed_mir.Local 2; projections = [ Seed_mir.Deref ] },
+                         Seed_mir.Use (Seed_mir.Copy { root = Seed_mir.Local 1; projections = [] }));
                       (* load it back *)
                       Seed_mir.Assign
-                        ({ local = 3; projections = [] },
+                        ({ root = Seed_mir.Local 3; projections = [] },
                          Seed_mir.Use
-                           (Seed_mir.Copy { local = 2; projections = [ Seed_mir.Deref ] }));
+                           (Seed_mir.Copy { root = Seed_mir.Local 2; projections = [ Seed_mir.Deref ] }));
                       (* String round-trip through the same pointer *)
                       Seed_mir.Assign
-                        ({ local = 4; projections = [] }, Seed_mir.Use (str_op "hello, seed"));
+                        ({ root = Seed_mir.Local 4; projections = [] }, Seed_mir.Use (str_op "hello, seed"));
                       Seed_mir.Assign
-                        ({ local = 2; projections = [ Seed_mir.Deref ] },
-                         Seed_mir.Use (Seed_mir.Copy { local = 4; projections = [] }));
+                        ({ root = Seed_mir.Local 2; projections = [ Seed_mir.Deref ] },
+                         Seed_mir.Use (Seed_mir.Copy { root = Seed_mir.Local 4; projections = [] }));
                       Seed_mir.Assign
-                        ({ local = 5; projections = [] },
+                        ({ root = Seed_mir.Local 5; projections = [] },
                          Seed_mir.Use
-                           (Seed_mir.Copy { local = 2; projections = [ Seed_mir.Deref ] }));
+                           (Seed_mir.Copy { root = Seed_mir.Local 2; projections = [ Seed_mir.Deref ] }));
                       Seed_mir.Assign
-                        ({ local = 6; projections = [] },
+                        ({ root = Seed_mir.Local 6; projections = [] },
                          Seed_mir.BinaryOp
                            ( Seed_mir.Eq,
-                             Seed_mir.Copy { local = 5; projections = [] },
+                             Seed_mir.Copy { root = Seed_mir.Local 5; projections = [] },
                              str_op "hello, seed" ));
                     ];
                   terminator =
                     Seed_mir.Assert
-                      (Seed_mir.Copy { local = 6; projections = [] }, true,
+                      (Seed_mir.Copy { root = Seed_mir.Local 6; projections = [] }, true,
                        "string deref round-trip mismatch", 1) };
                 { id = 1;
-                  statements = [ Seed_mir.Assign ({ local = 0; projections = [] }, Seed_mir.Use (Seed_mir.Copy { local = 3; projections = [] })) ];
+                  statements = [ Seed_mir.Assign ({ root = Seed_mir.Local 0; projections = [] }, Seed_mir.Use (Seed_mir.Copy { root = Seed_mir.Local 3; projections = [] })) ];
                   terminator = Seed_mir.Ret };
               |];
             entry = 0 };
@@ -349,13 +349,13 @@ let check_pointer () =
                 { id = 0;
                   statements =
                     [
-                      Seed_mir.Assign ({ local = 1; projections = [] }, Seed_mir.Use (int_op 5));
+                      Seed_mir.Assign ({ root = Seed_mir.Local 1; projections = [] }, Seed_mir.Use (int_op 5));
                       Seed_mir.Assign
-                        ({ local = 2; projections = [] },
+                        ({ root = Seed_mir.Local 2; projections = [] },
                          Seed_mir.Cast (int_op 0, raw_ptr_ty));
                       Seed_mir.Assign
-                        ({ local = 2; projections = [ Seed_mir.Deref ] },
-                         Seed_mir.Use (Seed_mir.Copy { local = 1; projections = [] }));
+                        ({ root = Seed_mir.Local 2; projections = [ Seed_mir.Deref ] },
+                         Seed_mir.Use (Seed_mir.Copy { root = Seed_mir.Local 1; projections = [] }));
                     ];
                   terminator = Seed_mir.Ret };
               |];
@@ -390,15 +390,15 @@ let check_pointer () =
                 { id = 0;
                   statements =
                     [
-                      Seed_mir.Assign ({ local = 1; projections = [] }, Seed_mir.Use (int_op 7));
+                      Seed_mir.Assign ({ root = Seed_mir.Local 1; projections = [] }, Seed_mir.Use (int_op 7));
                       Seed_mir.Assign
-                        ({ local = 2; projections = [] },
+                        ({ root = Seed_mir.Local 2; projections = [] },
                          Seed_mir.Cast (int_op 0, raw_ptr_ty));
                       Seed_mir.Assign
-                        ({ local = 3; projections = [] },
+                        ({ root = Seed_mir.Local 3; projections = [] },
                          Seed_mir.Use
-                           (Seed_mir.Copy { local = 2; projections = [ Seed_mir.Deref ] }));
-                      Seed_mir.Assign ({ local = 0; projections = [] }, Seed_mir.Use (Seed_mir.Copy { local = 3; projections = [] }));
+                           (Seed_mir.Copy { root = Seed_mir.Local 2; projections = [ Seed_mir.Deref ] }));
+                      Seed_mir.Assign ({ root = Seed_mir.Local 0; projections = [] }, Seed_mir.Use (Seed_mir.Copy { root = Seed_mir.Local 3; projections = [] }));
                     ];
                   terminator = Seed_mir.Ret };
               |];
@@ -433,23 +433,23 @@ let check_ref_writeback () =
        (dyn_index_fn
           [| i64; i64; ref_ty; i64 |]
           [
-            Seed_mir.Assign ({ local = 1; projections = [] }, Seed_mir.Use (int_op 7));
+            Seed_mir.Assign ({ root = Seed_mir.Local 1; projections = [] }, Seed_mir.Use (int_op 7));
             Seed_mir.Assign
-              ({ local = 2; projections = [] },
-               Seed_mir.RefMut { local = 1; projections = [] });
+              ({ root = Seed_mir.Local 2; projections = [] },
+               Seed_mir.RefMut { root = Seed_mir.Local 1; projections = [] });
             Seed_mir.Assign
-              ({ local = 2; projections = [ Seed_mir.Deref ] },
+              ({ root = Seed_mir.Local 2; projections = [ Seed_mir.Deref ] },
                Seed_mir.Use (int_op 99));
             Seed_mir.Assign
-              ({ local = 3; projections = [] },
+              ({ root = Seed_mir.Local 3; projections = [] },
                Seed_mir.Use
-                 (Seed_mir.Copy { local = 2; projections = [ Seed_mir.Deref ] }));
+                 (Seed_mir.Copy { root = Seed_mir.Local 2; projections = [ Seed_mir.Deref ] }));
             Seed_mir.Assign
-              ({ local = 0; projections = [] },
+              ({ root = Seed_mir.Local 0; projections = [] },
                Seed_mir.BinaryOp
                  ( Seed_mir.Add,
-                   Seed_mir.Copy { local = 1; projections = [] },
-                   Seed_mir.Copy { local = 3; projections = [] } ));
+                   Seed_mir.Copy { root = Seed_mir.Local 1; projections = [] },
+                   Seed_mir.Copy { root = Seed_mir.Local 3; projections = [] } ));
           ]
           Seed_mir.Ret)
    with
@@ -464,20 +464,20 @@ let check_ref_writeback () =
           [| i64; tuple2_ty; ref_ty; i64; i64 |]
           [
             Seed_mir.Assign
-              ({ local = 1; projections = [] },
+              ({ root = Seed_mir.Local 1; projections = [] },
                Seed_mir.Aggregate (Seed_mir.TupleAgg, [ int_op 5; int_op 6 ]));
             Seed_mir.Assign
-              ({ local = 2; projections = [] },
-               Seed_mir.RefMut { local = 1; projections = [ Seed_mir.ConstantIndex 1 ] });
+              ({ root = Seed_mir.Local 2; projections = [] },
+               Seed_mir.RefMut { root = Seed_mir.Local 1; projections = [ Seed_mir.ConstantIndex 1 ] });
             Seed_mir.Assign
-              ({ local = 2; projections = [ Seed_mir.Deref ] },
+              ({ root = Seed_mir.Local 2; projections = [ Seed_mir.Deref ] },
                Seed_mir.Use (int_op 77));
             Seed_mir.Assign
-              ({ local = 3; projections = [] },
+              ({ root = Seed_mir.Local 3; projections = [] },
                Seed_mir.Use
                  (Seed_mir.Copy
-                    { local = 1; projections = [ Seed_mir.ConstantIndex 1 ] }));
-            Seed_mir.Assign ({ local = 0; projections = [] }, Seed_mir.Use (Seed_mir.Copy { local = 3; projections = [] }));
+                    { root = Seed_mir.Local 1; projections = [ Seed_mir.ConstantIndex 1 ] }));
+            Seed_mir.Assign ({ root = Seed_mir.Local 0; projections = [] }, Seed_mir.Use (Seed_mir.Copy { root = Seed_mir.Local 3; projections = [] }));
           ]
           Seed_mir.Ret)
    with
@@ -491,26 +491,26 @@ let check_ref_writeback () =
     let statements =
       [
         Seed_mir.Assign
-          ({ local = 2; projections = [] },
+          ({ root = Seed_mir.Local 2; projections = [] },
            Seed_mir.Cast (int_op 0, raw_ptr_ty));
         Seed_mir.Assign
-          ({ local = 3; projections = [] },
-           Seed_mir.Ref { local = 2; projections = [ Seed_mir.Deref ] });
+          ({ root = Seed_mir.Local 3; projections = [] },
+           Seed_mir.Ref { root = Seed_mir.Local 2; projections = [ Seed_mir.Deref ] });
       ]
       @
       if write then
         [
           Seed_mir.Assign
-            ({ local = 3; projections = [ Seed_mir.Deref ] },
+            ({ root = Seed_mir.Local 3; projections = [ Seed_mir.Deref ] },
              Seed_mir.Use (int_op 1));
         ]
       else
         [
           Seed_mir.Assign
-            ({ local = 4; projections = [] },
+            ({ root = Seed_mir.Local 4; projections = [] },
              Seed_mir.Use
-               (Seed_mir.Copy { local = 3; projections = [ Seed_mir.Deref ] }));
-          Seed_mir.Assign ({ local = 0; projections = [] }, Seed_mir.Use (Seed_mir.Copy { local = 4; projections = [] }));
+               (Seed_mir.Copy { root = Seed_mir.Local 3; projections = [ Seed_mir.Deref ] }));
+          Seed_mir.Assign ({ root = Seed_mir.Local 0; projections = [] }, Seed_mir.Use (Seed_mir.Copy { root = Seed_mir.Local 4; projections = [] }));
         ]
     in
     {
@@ -577,18 +577,18 @@ let drop_program () : Seed_mir.program =
               { id = 0;
                 statements =
                   [
-                    Seed_mir.Assign ({ local = 1; projections = [] }, Seed_mir.Use (str_op "hello"));
+                    Seed_mir.Assign ({ root = Seed_mir.Local 1; projections = [] }, Seed_mir.Use (str_op "hello"));
                     Seed_mir.Assign
-                      ({ local = 2; projections = [] },
+                      ({ root = Seed_mir.Local 2; projections = [] },
                        Seed_mir.Aggregate (Seed_mir.TupleAgg, [ int_op 10; int_op 20 ]));
                     Seed_mir.Assign
-                      ({ local = 3; projections = [] },
+                      ({ root = Seed_mir.Local 3; projections = [] },
                        Seed_mir.Aggregate
                          ( Seed_mir.TupleAgg,
-                           [ Seed_mir.Move { local = 1; projections = [] };
-                             Seed_mir.Move { local = 2; projections = [] } ] ));
+                           [ Seed_mir.Move { root = Seed_mir.Local 1; projections = [] };
+                             Seed_mir.Move { root = Seed_mir.Local 2; projections = [] } ] ));
                   ];
-                terminator = Seed_mir.Drop ({ local = 3; projections = [] }, 1, None) };
+                terminator = Seed_mir.Drop ({ root = Seed_mir.Local 3; projections = [] }, 1, None) };
               { id = 1; statements = []; terminator = Seed_mir.Ret };
             |];
           entry = 0 };
@@ -630,10 +630,10 @@ let check_recursive_drop () =
             locals = [| Type_repr.Unit; string_ty |];
             blocks =
               [|
-                { id = 0; statements = [ Seed_mir.Assign ({ local = 1; projections = [] }, Seed_mir.Use (str_op "x")) ];
-                  terminator = Seed_mir.Drop ({ local = 1; projections = [] }, 1, None) };
+                { id = 0; statements = [ Seed_mir.Assign ({ root = Seed_mir.Local 1; projections = [] }, Seed_mir.Use (str_op "x")) ];
+                  terminator = Seed_mir.Drop ({ root = Seed_mir.Local 1; projections = [] }, 1, None) };
                 { id = 1; statements = [];
-                  terminator = Seed_mir.Drop ({ local = 1; projections = [] }, 2, None) };
+                  terminator = Seed_mir.Drop ({ root = Seed_mir.Local 1; projections = [] }, 2, None) };
                 { id = 2; statements = []; terminator = Seed_mir.Ret };
               |];
             entry = 0 };
@@ -657,15 +657,15 @@ let check_recursive_drop () =
             locals = [| i64; string_ty; i64 |];
             blocks =
               [|
-                { id = 0; statements = [ Seed_mir.Assign ({ local = 1; projections = [] }, Seed_mir.Use (str_op "x")) ];
-                  terminator = Seed_mir.Drop ({ local = 1; projections = [] }, 1, None) };
+                { id = 0; statements = [ Seed_mir.Assign ({ root = Seed_mir.Local 1; projections = [] }, Seed_mir.Use (str_op "x")) ];
+                  terminator = Seed_mir.Drop ({ root = Seed_mir.Local 1; projections = [] }, 1, None) };
                 { id = 1;
                   statements =
                     [
                       Seed_mir.Assign
-                        ({ local = 2; projections = [] },
-                         Seed_mir.Use (Seed_mir.Copy { local = 1; projections = [] }));
-                      Seed_mir.Assign ({ local = 0; projections = [] }, Seed_mir.Use (Seed_mir.Copy { local = 2; projections = [] }));
+                        ({ root = Seed_mir.Local 2; projections = [] },
+                         Seed_mir.Use (Seed_mir.Copy { root = Seed_mir.Local 1; projections = [] }));
+                      Seed_mir.Assign ({ root = Seed_mir.Local 0; projections = [] }, Seed_mir.Use (Seed_mir.Copy { root = Seed_mir.Local 2; projections = [] }));
                     ];
                   terminator = Seed_mir.Ret };
               |];
@@ -747,9 +747,9 @@ let projected_move_prog (op : Seed_mir.operand) : Seed_mir.program =
     [| string_ty; tuple2_ty_str |]
     [
       Seed_mir.Assign
-        ({ local = 1; projections = [] },
+        ({ root = Seed_mir.Local 1; projections = [] },
          Seed_mir.Aggregate (Seed_mir.TupleAgg, [ str_op "hello"; int_op 42 ]));
-      Seed_mir.Assign ({ local = 0; projections = [] }, Seed_mir.Use op);
+      Seed_mir.Assign ({ root = Seed_mir.Local 0; projections = [] }, Seed_mir.Use op);
     ]
     Seed_mir.Ret
 
@@ -764,7 +764,7 @@ let projected_consume_arg_prog () : Seed_mir.program =
         [|
           {
             Seed_mir.id = 0;
-            statements = [ Seed_mir.Assign ({ local = 0; projections = [] }, Seed_mir.Use (int_op 0)) ];
+            statements = [ Seed_mir.Assign ({ root = Seed_mir.Local 0; projections = [] }, Seed_mir.Use (int_op 0)) ];
             terminator = Seed_mir.Ret;
           };
         |];
@@ -784,18 +784,18 @@ let projected_consume_arg_prog () : Seed_mir.program =
             statements =
               [
                 Seed_mir.Assign
-                  ({ local = 1; projections = [] },
+                  ({ root = Seed_mir.Local 1; projections = [] },
                    Seed_mir.Aggregate (Seed_mir.TupleAgg, [ str_op "hello"; int_op 42 ]));
               ];
             terminator =
               Seed_mir.Call
-                ( { local = 0; projections = [] },
+                ( { root = Seed_mir.Local 0; projections = [] },
                   Seed_mir.User (instance 1),
                   [|
                     {
                       Seed_mir.effect_ = Access_effect.Consume;
                       value =
-                        Seed_mir.Move { local = 1; projections = [ Seed_mir.ConstantIndex 0 ] };
+                        Seed_mir.Move { root = Seed_mir.Local 1; projections = [ Seed_mir.ConstantIndex 0 ] };
                     };
                   |],
                   1,
@@ -811,11 +811,11 @@ let projected_consume_arg_prog () : Seed_mir.program =
 let check_projected_move () =
   let move_prog =
     projected_move_prog
-      (Seed_mir.Move { local = 1; projections = [ Seed_mir.ConstantIndex 0 ] })
+      (Seed_mir.Move { root = Seed_mir.Local 1; projections = [ Seed_mir.ConstantIndex 0 ] })
   in
   let consume_prog =
     projected_move_prog
-      (Seed_mir.Consume { local = 1; projections = [ Seed_mir.ConstantIndex 0 ] })
+      (Seed_mir.Consume { root = Seed_mir.Local 1; projections = [ Seed_mir.ConstantIndex 0 ] })
   in
   let arg_prog = projected_consume_arg_prog () in
   (* leg 1: the verifier rejects every projected transfer — concrete
@@ -865,12 +865,12 @@ let check_projected_move () =
       [| i64; tuple2_ty_str; tuple2_ty_str |]
       [
         Seed_mir.Assign
-          ({ local = 1; projections = [] },
+          ({ root = Seed_mir.Local 1; projections = [] },
            Seed_mir.Aggregate (Seed_mir.TupleAgg, [ str_op "hello"; int_op 42 ]));
-        Seed_mir.Assign ({ local = 2; projections = [] }, Seed_mir.Use (Seed_mir.Move { local = 1; projections = [] }));
+        Seed_mir.Assign ({ root = Seed_mir.Local 2; projections = [] }, Seed_mir.Use (Seed_mir.Move { root = Seed_mir.Local 1; projections = [] }));
         Seed_mir.Assign
-          ({ local = 0; projections = [] },
-           Seed_mir.Use (Seed_mir.Copy { local = 2; projections = [ Seed_mir.ConstantIndex 1 ] }));
+          ({ root = Seed_mir.Local 0; projections = [] },
+           Seed_mir.Use (Seed_mir.Copy { root = Seed_mir.Local 2; projections = [ Seed_mir.ConstantIndex 1 ] }));
       ]
       Seed_mir.Ret
   in

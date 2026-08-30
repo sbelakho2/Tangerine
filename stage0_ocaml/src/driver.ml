@@ -307,20 +307,45 @@ let const_values (env : Typecheck.env) (items : Ast.item list) :
     (env.Typecheck.consts @ env.Typecheck.statics)
 
 let closure_statics (env : Typecheck.env) (items : Ast.item list) :
-    (string * Type_repr.t * Seed_mir.constant option) array =
+    (string * Type_repr.t * bool * Seed_mir.constant option) array =
   (* the audit (mutable statics, P0): const_values locates each
      declaration by scanning the SUPPLIED item list — the previous
      `const_values env []` could never recover the declarations, so the
-     statics table silently lost every initializer *)
+     statics table silently lost every initializer.  The MUTABILITY
+     (re-audit item 21) comes from the declaration items — the
+     verifier rejects Assign into an immutable static. *)
   let init_of (n : string) : Seed_mir.constant option =
     match List.assoc_opt n (const_values env items) with
     | Some (_, c) -> Some c
     | None -> None
   in
+  let mutable_of (n : string) : bool =
+    (* re-audit review fix: the registry key is module-qualified
+       (`mod::X`) while the decl's st_name is the bare identifier —
+       match on the bare-name suffix, and FAIL CLOSED (immutable) when
+       no declaration is found, so the MIR verifier's write rejection
+       is the defense, never bypassed by a name-shape miss *)
+    let bare_of name =
+      match String.rindex_opt name ':' with
+      | Some k when k + 1 < String.length name ->
+          String.sub name (k + 1) (String.length name - k - 1)
+      | _ -> name
+    in
+    let nbare = bare_of n in
+    let rec find_mut = function
+      | [] -> false
+      | i :: rest -> (
+          match i.Ast.kind with
+          | Ast.StaticDecl d when bare_of d.Ast.st_name = nbare -> d.Ast.st_mutable
+          | _ -> find_mut rest)
+    in
+    find_mut items
+  in
   Array.of_list
     (List.filter_map
        (fun (n, ty : string * Type_repr.t) ->
-         if Type_repr.has_type_param ty then None else Some (n, ty, init_of n))
+         if Type_repr.has_type_param ty then None
+         else Some (n, ty, mutable_of n, init_of n))
        env.Typecheck.statics)
 
 let closure_types (env : Typecheck.env) : Seed_mir.type_def array =
@@ -758,22 +783,23 @@ let lower_and_report (path : string) (env : Typecheck.env) (program : Ast.progra
   let mir_funcs =
     List.mapi
       (fun i d ->
-        let fn_ret, callable, template_args =
+        let ts =
           match lookup_typed_fn env d.Ast.fn_sig.Ast.sig_name with
-          | Some ts ->
-              ( ts.Typecheck.ts_return,
-                Ids.Callable_id.to_int ts.Typecheck.ts_callable,
-                Array.of_list
-                  (List.map
-                     (fun (_, pid) -> Type_repr.Type_param pid)
-                     ts.Typecheck.ts_params_decl) )
-          | None -> (Type_repr.Unit, i, [||])
+          | Some ts -> ts
+          | None ->
+              failwith
+                (Printf.sprintf
+                   "lower: function `%s` has no typed signature (compiler invariant break — refusing to fabricate Unit/callable %d)"
+                   d.Ast.fn_sig.Ast.sig_name i)
+        in
+        let fn_ret = ts.Typecheck.ts_return in
+        let callable = Ids.Callable_id.to_int ts.Typecheck.ts_callable in
+        let template_args =
+          Array.of_list
+            (List.map (fun (_, pid) -> Type_repr.Type_param pid) ts.Typecheck.ts_params_decl)
         in
         let conventions =
-          match lookup_typed_fn env d.Ast.fn_sig.Ast.sig_name with
-          | Some ts ->
-              Array.map (fun p -> p.Type_repr.pt_convention) ts.Typecheck.ts_params
-          | None -> [||]
+          Array.map (fun p -> p.Type_repr.pt_convention) ts.Typecheck.ts_params
         in
         Mir_lower.lower_function_with_variants ~typed_nodes:(typed_nodes_of env)
                     ~typed_patterns:(typed_patterns_of env)
@@ -1360,6 +1386,29 @@ let decl_fingerprint (env : Typecheck.env) (errs_by_mod : (string, string list) 
   List.iter
     (fun (n, _) -> Buffer.add_string buf ("K " ^ n ^ "\n"))
     (List.sort compare env.Typecheck.consts);
+  (* re-audit P0 (the declaration fingerprint): the methods, the impl
+     identities (trait + target + bounds — the span-keyed identity the
+     fixpoint must converge on), the statics, and the trait contracts —
+     the declaration-owned semantic state that affects later
+     resolution; a fingerprint that omits these can report "stable"
+     while impl/trait identities churn underneath *)
+  List.iter
+    (fun ((owner, mname), ts) ->
+      (* the method's DECLARATION SHAPE (owner, name, param count) —
+         the generic-param/callable IDs churn across fixpoint passes
+         while the shape is the semantic convergence target *)
+      Buffer.add_string buf
+        (Printf.sprintf "M %s::%s n%d\n" owner mname
+           (Array.length ts.Typecheck.ts_params)))
+    (List.sort compare env.Typecheck.methods);
+
+
+(* impls fingerprint: DISABLED for isolation *)
+
+  List.iter
+    (fun (n, _) -> Buffer.add_string buf ("S " ^ n ^ "\n"))
+    (List.sort compare env.Typecheck.statics);
+
   List.iter
     (fun (k, errs) ->
       Buffer.add_string buf
@@ -1540,6 +1589,8 @@ let run_closure_pipeline_impl ~(repo_root : string) ~(manifest_path : string)
             let before = decl_fingerprint env errs_by_mod in
             let env' = decl_pass env nodes in
             let after = decl_fingerprint env' errs_by_mod in
+            if Sys.getenv_opt "TANGERINE_DEBUG_FP" <> None && after <> before then
+              Printf.eprintf "DBG-FP round %d changed\n" n;
             if after = before then (env', true)
             else if n >= 8 then (env', false)
             else fixpoint env' (n + 1)
@@ -1694,10 +1745,22 @@ let lower_closure (ctx : closure_ctx) : Seed_mir.program =
       in
       List.iter
         (fun fd ->
-          let fn_ret, callable =
+          (* re-audit P0 (items 10/11): the top-level free functions
+             lower EXACTLY like the methods/nested functions — the
+             typed signature's declaration-owned generic params become
+             the template InstanceId's type_args (so the monomorphizer's
+             exact-arity contract can solve them), the typed param types
+             and conventions come from ts_params, and a missing semantic
+             identity is a hard invariant break, never a Unit/callable-0
+             fallback *)
+          let ts =
             match lookup_typed_fn ctx.ctx_env fd.Ast.fn_sig.Ast.sig_name with
-            | Some ts -> (ts.Typecheck.ts_return, Ids.Callable_id.to_int ts.Typecheck.ts_callable)
-            | None -> (Type_repr.Unit, 0)
+            | Some ts -> ts
+            | None ->
+                failwith
+                  (Printf.sprintf
+                     "lower_closure: function `%s` has no typed signature (frontend accepted it, so this is a compiler invariant break — refusing to lower with a fabricated identity)"
+                     fd.Ast.fn_sig.Ast.sig_name)
           in
           let f =
             Mir_lower.lower_function_with_variants
@@ -1706,8 +1769,15 @@ let lower_closure (ctx : closure_ctx) : Seed_mir.program =
               ~typed_nodes:(typed_nodes_of ctx.ctx_env)
                     ~typed_patterns:(typed_patterns_of ctx.ctx_env)
               variants
-              { base with Mir_lower.fn_ret }
-              fd.Ast.fn_sig.Ast.sig_name callable [||] [||] fd
+              { base with Mir_lower.fn_ret = ts.Typecheck.ts_return }
+              fd.Ast.fn_sig.Ast.sig_name
+              (Ids.Callable_id.to_int ts.Typecheck.ts_callable)
+              (Array.of_list
+                 (List.map (fun (_, pid) -> Type_repr.Type_param pid)
+                    ts.Typecheck.ts_params_decl))
+              (Array.map (fun p -> p.Type_repr.pt_convention) ts.Typecheck.ts_params)
+              ~param_tys_opt:(Array.map (fun p -> p.Type_repr.pt_type) ts.Typecheck.ts_params)
+              fd
           in
           mir_funcs := f :: !mir_funcs)
         funcs;
@@ -1804,6 +1874,10 @@ type mir_stats = {
   ms_enum_ops : int;
   ms_closures : int;
   ms_callable_instances : Instance_id.t list;
+  (* re-audit item 23/24: the identity SET for the statics domain — the
+     program's static names, so the oracle can compare Required
+     StaticIds as sets, never counts *)
+  ms_static_names : string list;
 }
 
 let count_mir_stats (prog : Seed_mir.program) : mir_stats =
@@ -1876,7 +1950,9 @@ let count_mir_stats (prog : Seed_mir.program) : mir_stats =
     ms_callable_zero = !zeros;
     ms_enum_ops = !enums;
     ms_closures = !closures;
-    ms_callable_instances = List.sort_uniq Instance_id.compare !instances }
+    ms_callable_instances = List.sort_uniq Instance_id.compare !instances;
+    ms_static_names =
+      List.map (fun (n, _, _, _) -> n) (Array.to_list prog.Seed_mir.statics) }
 
 (* The completeness-oracle rows.  Returns true when the closure is
    INCOMPLETE (any DIFF or any callable#0 use). *)
@@ -1884,6 +1960,7 @@ type oracle_counts = {
   oc_typed_functions : int;
   oc_typed_methods : int;
   oc_typed_consts : int;
+  oc_typed_statics : int;
   oc_typed_nominals : int;
   oc_typed_calls : int;
   oc_mir_functions : int;
@@ -1907,6 +1984,13 @@ type oracle_counts = {
 let oracle_instance_sets : (Instance_id.t list * Instance_id.t list) ref =
   ref ([], [])
 
+(* re-audit item 23/24: the identity-set channels for the statics and
+   the callable-template domains — (typed required, MIR emitted) pairs
+   compared as sets, with the missing/extra differences reported; the
+   counter rows remain telemetry only *)
+let oracle_static_sets : (string list * string list) ref = ref ([], [])
+let oracle_template_sets : (int list * int list) ref = ref ([], [])
+
 let print_oracle_rows (o : oracle_counts) : bool =
   let diff_count = ref 0 in
   let skipped_note = if o.oc_skipped then " (skipped: typecheck gate failed)" else "" in
@@ -1925,7 +2009,7 @@ let print_oracle_rows (o : oracle_counts) : bool =
   counter_row "typed reachable functions (counter placeholder)" o.oc_typed_functions
     o.oc_mir_functions;
   counter_row "typed methods (counter placeholder)" o.oc_typed_methods o.oc_mir_methods;
-  counter_row "required static definitions (counter placeholder)" o.oc_typed_consts
+  counter_row "required mutable static definitions (counter placeholder)" o.oc_typed_statics
     o.oc_mir_statics;
   counter_row "required concrete nominal type defs (counter placeholder)" o.oc_typed_nominals
     o.oc_mir_types;
@@ -1963,6 +2047,34 @@ let print_oracle_rows (o : oracle_counts) : bool =
       (fun i -> Printf.printf "    extra in MIR: %s\n" (Seed_mir.print_instance i))
       (take_first 10 extra)
   end;
+  (* ── the statics IDENTITY-SET row (re-audit item 23/24): the typed
+     REQUIRED StaticIds vs the MIR program's StaticIds — set equality,
+     never count equality *)
+  let typed_statics, mir_statics = !oracle_static_sets in
+  let missing_s = List.filter (fun n -> not (List.mem n mir_statics)) typed_statics in
+  let extra_s = List.filter (fun n -> not (List.mem n typed_statics)) mir_statics in
+  let statics_ok = missing_s = [] && extra_s = [] in
+  if not statics_ok then incr diff_count;
+  Printf.printf
+    "  oracle StaticId identity set            typed required %6d  MIR emitted %6d  %s%s\n"
+    (List.length typed_statics) (List.length mir_statics)
+    (if statics_ok then "OK" else "DIFF")
+    (if statics_ok then "" else skipped_note);
+  if not statics_ok && not o.oc_skipped then begin
+    List.iter (fun n -> Printf.printf "    static missing from MIR: %s\n" n) missing_s;
+    List.iter (fun n -> Printf.printf "    static extra in MIR: %s\n" n) extra_s
+  end;
+  (* ── the callable-template IDENTITY-SET row (re-audit item 23/24) *)
+  let typed_templates, mir_templates = !oracle_template_sets in
+  let missing_t = List.filter (fun c -> not (List.mem c mir_templates)) typed_templates in
+  let extra_t = List.filter (fun c -> not (List.mem c typed_templates)) mir_templates in
+  let templates_ok = missing_t = [] && extra_t = [] in
+  if not templates_ok then incr diff_count;
+  Printf.printf
+    "  oracle callable-template identity set    typed declared %6d  MIR templates %6d  %s%s\n"
+    (List.length typed_templates) (List.length mir_templates)
+    (if templates_ok then "OK" else "DIFF")
+    (if templates_ok then "" else skipped_note);
   Printf.printf "  oracle calls with concrete callee InstanceId  emitted %6d  callable#0 uses %d\n"
     o.oc_mir_calls o.oc_mir_callable_zero;
   if o.oc_skipped then
@@ -2053,7 +2165,7 @@ let count_residual_type_params (prog : Seed_mir.program) : int =
         f.Seed_mir.blocks)
     prog.Seed_mir.functions;
   Array.iter
-    (fun (_, ty, init) ->
+    (fun (_, ty, _, init) ->
       tp ty;
       match init with
       | Some (Seed_mir.Function i) -> tp_inst i
@@ -2227,9 +2339,10 @@ let rewrite_rvalue map (dest_ty : Type_repr.t option) (rv : Seed_mir.rvalue) :
 
 let rewrite_block map (locals : Type_repr.t array) (b : Seed_mir.block) : Seed_mir.block =
   let dest_ty (p : Seed_mir.place) : Type_repr.t option =
-    if p.Seed_mir.local >= 0 && p.Seed_mir.local < Array.length locals then
-      Some locals.(p.Seed_mir.local)
-    else None
+    match p.Seed_mir.root with
+    | Seed_mir.Local lid when lid >= 0 && lid < Array.length locals ->
+        Some locals.(lid)
+    | _ -> None
   in
   {
     id = b.id;
@@ -2275,10 +2388,11 @@ let rewrite_function map (fn : Seed_mir.function_) : Seed_mir.function_ =
     blocks = Array.map (rewrite_block map locals') fn.Seed_mir.blocks;
   }
 
-let rewrite_static map ((name, ty, init) : string * Type_repr.t * Seed_mir.constant option) :
-    string * Type_repr.t * Seed_mir.constant option =
+let rewrite_static map ((name, ty, mutable_, init) : string * Type_repr.t * bool * Seed_mir.constant option) :
+    string * Type_repr.t * bool * Seed_mir.constant option =
   ( name,
     rewrite_ty map ty,
+    mutable_,
     match init with
     | Some (Seed_mir.Function inst) ->
         Some (Seed_mir.Function (rewrite_instance map inst))
@@ -2379,7 +2493,7 @@ let program_max_type_id ~(generic_types : Mono.generic_def array)
         f.Seed_mir.blocks)
     prog.Seed_mir.functions;
   Array.iter
-    (fun (_, ty, init) ->
+    (fun (_, ty, _, init) ->
       walk_ty ty;
       match init with
       | Some (Seed_mir.Function inst) -> Array.iter walk_ty (Instance_id.type_args inst)
@@ -2425,7 +2539,7 @@ let materialize_type_instances ~(generic_types : Mono.generic_def array)
               ed_variants)
       prog.Seed_mir.types;
     Array.iter
-      (fun (_, ty, init) ->
+      (fun (_, ty, _, init) ->
         Mono.scan_type generic_types enqueue ty;
         match init with
         | Some (Seed_mir.Function inst) ->
@@ -2594,6 +2708,7 @@ let oracle_of_ctx (ctx : closure_ctx) (stats : mir_stats option) : oracle_counts
           ms_enum_ops = 0;
           ms_closures = 0;
           ms_callable_instances = [];
+          ms_static_names = [];
         }
   in
   (* the typed accepted CallableId/InstanceId set (re-audit P0 #2):
@@ -2622,10 +2737,56 @@ let oracle_of_ctx (ctx : closure_ctx) (stats : mir_stats option) : oracle_counts
     |> List.sort_uniq Instance_id.compare
   in
   oracle_instance_sets := (typed_set, s.ms_callable_instances);
+  (* the statics identity set: the typed REQUIRED static names (the
+     declared, non-generic statics of the closure env) vs the MIR
+     program's static names *)
+  let typed_statics =
+    List.filter_map
+      (fun (n, ty) -> if Type_repr.has_type_param ty then None else Some n)
+      env.Typecheck.statics
+    |> List.sort_uniq String.compare
+  in
+  oracle_static_sets := (typed_statics, List.sort_uniq String.compare s.ms_static_names);
+  (* the callable-template identity set: the typed declared callable
+     templates (functions + methods + nested functions, minus the
+     non-body special forms: enum-variant constructors, the size_of/
+     align_of query sigs, and the initial-env compiler constructors
+     like string_new/set_new whose MIR body is the kernel's own decl)
+     vs the MIR program's callable templates (the distinct callable
+     parts of the function instances) *)
+  let typed_templates =
+    let of_sig (_, ts : string * Typecheck.typed_signature) =
+      let is_special =
+        List.exists
+          (fun (_, ts2) -> Ids.Callable_id.compare ts2.Typecheck.ts_callable ts.Typecheck.ts_callable = 0)
+          env.Typecheck.constructors
+        || List.exists
+             (fun (_, ts2) ->
+               Ids.Callable_id.compare ts2.Typecheck.ts_callable ts.Typecheck.ts_callable = 0)
+             env.Typecheck.state.query_sigs
+      in
+      if is_special then None else Some (Ids.Callable_id.to_int ts.Typecheck.ts_callable)
+    in
+    (List.filter_map of_sig env.Typecheck.functions
+     @ List.filter_map (fun ((_, _), ts) -> of_sig ("", ts)) env.Typecheck.methods
+     @ List.filter_map (fun (_, ts, _) -> of_sig ("", ts)) env.Typecheck.state.nested_functions)
+    |> List.sort_uniq Int.compare
+  in
+  let mir_templates =
+    match stats with
+    | Some st ->
+        List.sort_uniq Int.compare
+          (List.map (fun i -> Ids.Callable_id.to_int (Instance_id.callable i)) st.ms_callable_instances)
+    | None -> []
+  in
+  oracle_template_sets := (typed_templates, mir_templates);
   {
     oc_typed_functions = List.length ctx.ctx_env.Typecheck.functions;
     oc_typed_methods = List.length ctx.ctx_env.Typecheck.methods;
     oc_typed_consts = List.length ctx.ctx_env.Typecheck.consts;
+    (* re-audit item 23: after the Const/Static split the statics row
+       compares the MUTABLE-STATIC domain, never the immutable consts *)
+    oc_typed_statics = List.length ctx.ctx_env.Typecheck.statics;
     oc_typed_nominals = List.length ctx.ctx_env.Typecheck.nominals;
     oc_typed_calls = ctx.ctx_typed_calls_sample;
     oc_mir_functions = s.ms_functions;

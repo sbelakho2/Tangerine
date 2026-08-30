@@ -10,7 +10,7 @@
 #   2. dune build (warnings are errors)
 #   3. the EXACT unit-test inventory: 230 passed, 0 failed
 #      (the committed pre-wave1 inventory was 216; the wave1 tests
-#      brought it to 226; the P0 typechecking regressions (pop_scope,
+#      brought it to 230; the P0 typechecking regressions (pop_scope,
 #      zero-argument method tails) brought it to 230 — the pin is the
 #      exact CURRENT inventory; ANY change up or down fails)
 #   4. EVERY self-check executable enumerated in selfcheck/dune (a new
@@ -103,15 +103,25 @@ if [ -z "$TC_COUNT" ]; then
 fi
 
 # Debt policy (the audit's P1 directive): MONOTONIC no-regression vs
-# the LAST ACCEPTED EVIDENCE record on BOTH axes —
-#   head.total   <= accepted_parent.total
-#   head.primary <= accepted_parent.primary
+# the SINGLE ACCEPTED BASELINE POINTER (re-audit item 30) —
+# bootstrap/evidence/ocaml/accepted.json (the tested SHA + the expected
+# debt facts), the SAME machine-readable record tg_bootstrap_gate reads;
+# the gate and this script can no longer drift.  When the accepted
+# record is absent, fall back to the last accepted evidence record.
+#   head.total   <= accepted.total
+#   head.primary <= accepted.primary
 # with an explicit, reviewed override for intentional soundness
 # discoveries.  No +20% tolerance; a primary regression fails even
 # when the total stays flat.
-EVIDENCE_JSON="$(ls -1 "$ROOT/bootstrap/evidence/ocaml/" 2>/dev/null | grep -v history | grep -E '^[0-9a-f]{7}_.*\.json$' | sort | tail -1)"
-if [ -n "$EVIDENCE_JSON" ]; then
-  EVIDENCE_JSON="$ROOT/bootstrap/evidence/ocaml/$EVIDENCE_JSON"
+ACCEPTED_JSON="$ROOT/bootstrap/evidence/ocaml/accepted.json"
+EVIDENCE_JSON=""
+if [ -f "$ACCEPTED_JSON" ]; then
+  EVIDENCE_JSON="$ACCEPTED_JSON"
+else
+  EVIDENCE_JSON="$(ls -1 "$ROOT/bootstrap/evidence/ocaml/" 2>/dev/null | grep -v history | grep -E '^[0-9a-f]{7}_.*\.json$' | sort | tail -1)"
+  if [ -n "$EVIDENCE_JSON" ]; then
+    EVIDENCE_JSON="$ROOT/bootstrap/evidence/ocaml/$EVIDENCE_JSON"
+  fi
 fi
 REC_TOTAL=""
 REC_PRIMARY=""

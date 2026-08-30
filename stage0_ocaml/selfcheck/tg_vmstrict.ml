@@ -58,7 +58,7 @@ let check_div_rem () =
               statements =
                 [
                   Seed_mir.Assign
-                    ({ local = 0; projections = [] },
+                    ({ root = Seed_mir.Local 0; projections = [] },
                      Seed_mir.BinaryOp (op, Seed_mir.Constant (int_constant l),
                        Seed_mir.Constant (int_constant r)));
                 ];
@@ -111,7 +111,7 @@ let check_uninit_return () =
           { id = 0;
             statements = [];
             terminator =
-              Seed_mir.Call ({ local = 0; projections = [] }, Seed_mir.User leaky_inst,
+              Seed_mir.Call ({ root = Seed_mir.Local 0; projections = [] }, Seed_mir.User leaky_inst,
                 [||], 1, None) };
           { id = 1; statements = []; terminator = Seed_mir.Ret };
         |];
@@ -148,7 +148,7 @@ let check_uninit_return () =
           { id = 0;
             statements = [];
             terminator =
-              Seed_mir.Call ({ local = 0; projections = [] }, Seed_mir.User unit_inst,
+              Seed_mir.Call ({ root = Seed_mir.Local 0; projections = [] }, Seed_mir.User unit_inst,
                 [||], 1, None) };
           { id = 1; statements = []; terminator = Seed_mir.Ret };
         |];

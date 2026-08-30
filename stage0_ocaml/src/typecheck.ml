@@ -128,7 +128,20 @@ type typed_expr = {
   te_type : Type_repr.t;
   te_effects : Access_effect.read_effect array;
   te_span : Span.span;
+  (* re-audit P0 (FlowResult at the expression level): every typed
+     expression carries its control flow — the normal continuation
+     (None when unreachable), and the return/break/continue edges.  The
+     structural forms (if/match/block/loops) JOIN their children's
+     flows; the statement layer consumes the flow instead of matching
+     the raw syntax. *)
+  te_flow : flow_result;
 }
+
+let normal_flow (ty : Type_repr.t) : flow_result =
+  { fr_normal = Some ty; fr_may_return = false; fr_may_break = false; fr_may_continue = false }
+
+let diverge_flow ~(may_return : bool) ~(may_break : bool) ~(may_continue : bool) : flow_result =
+  { fr_normal = None; fr_may_return = may_return; fr_may_break = may_break; fr_may_continue = may_continue }
 
 (* The persistent typed-node bridge (re-audit: TypedProgram/TypedHIR).
    Node identity = the expr's span (file_id, start) — the same identity
@@ -1141,6 +1154,27 @@ let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
         ~ret:str_ty ~where:[];
     ]
   in
+  let coll_set_p = fresh_param_id st in
+  let coll_map_k_p = fresh_param_id st in
+  let coll_map_v_p = fresh_param_id st in
+  let collections_builtins =
+    [
+      (* the runtime Set/Map constructors (audit §70): free functions in
+         the mangled convention (`Set::new` -> `set_new`), so the
+         qualified call solves the generic param from the expected type
+         and the lowerer dispatches to the host's intrinsic table *)
+      mk_sig st ~name:"set_new" ~params_decl:[ ("T", coll_set_p) ]
+        ~params:[]
+        ~ret:(Type_repr.Named (b_set, [| Type_repr.Type_param coll_set_p |]))
+        ~where:[];
+      mk_sig st ~name:"map_new" ~params_decl:[ ("K", coll_map_k_p); ("V", coll_map_v_p) ]
+        ~params:[]
+        ~ret:
+          (Type_repr.Named
+             (b_map, [| Type_repr.Type_param coll_map_k_p; Type_repr.Type_param coll_map_v_p |]))
+        ~where:[];
+    ]
+  in
   let opt_p2 = fresh_param_id st in
   let vec_p2 = fresh_param_id st in
   let ptr_p2 = fresh_param_id st in
@@ -1370,7 +1404,7 @@ let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
     functions =
       List.map
         (fun sig_ -> (sig_.ts_name, sig_))
-        (sync_builtins @ libc_builtins @ string_builtins @ str_misc_builtins @ misc_builtins @ [ instant_now_sig; any_sig; regex_builtin ]);
+        (sync_builtins @ libc_builtins @ string_builtins @ collections_builtins @ str_misc_builtins @ misc_builtins @ [ instant_now_sig; any_sig; regex_builtin ]);
     methods =
       List.fold_left
         (fun m sig_ ->
@@ -1761,14 +1795,26 @@ let rec resolve_type (env : env) (scope : scope) (t : Ast.type_expr) : (Type_rep
       match env.current_self with
       | Some t -> Ok t
       | None -> Error (err span "Self is only available inside an impl"))
-  | Ast.DynTrait _ | Ast.ImplTrait _ ->
+  | Ast.DynTrait _ ->
       Error (err (Ast.type_span t) "trait-object types are not available in the bootstrap subset")
+  | Ast.ImplTrait _ ->
+      (* the argument-position impl-trait `fn f(v: impl Trait)` — an
+         anonymous generic bound, the kernel's `validator: impl
+         Validator[T, Clean]`: a fresh inference variable (the concrete
+         type solves at the call site); the method calls on it resolve
+         through the trait contract *)
+      Ok (fresh_infer_var env.state)
   | Ast.Bounded (base, _, _) -> resolve_type env scope base
   | Ast.Option (inner, _) -> (
       match resolve_type env scope inner with
       | Ok t -> Ok (Type_repr.Named (b_option, [| t |]))
       | Error m -> Error m)
-  | Ast.Inferred span -> Error (err span "cannot infer this type; an explicit annotation is required")
+  | Ast.Inferred _ ->
+      (* the anonymous type argument `_` (the kernel's `Tainted[_]`
+         wildcard): a fresh inference variable — the anonymous-arg
+         semantics; the top-level `var x: _` form stays rejected by the
+         subset firewall (E9035) when it reaches an annotation position *)
+      Ok (fresh_infer_var env.state)
 
 and resolve_named (env : env) (scope : scope) (span : Span.span) (name : string)
     (args : Ast.type_expr list) : (Type_repr.t, string) result =
@@ -2739,7 +2785,7 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
                   (err span
                      (Literal.range_error p
                       ^ " (a literal that does not fit its type is a TYPE error, never zeroed)"))
-              else Ok { te_type = Type_repr.Int k; te_effects = [||]; te_span = span })
+              else Ok { te_type = Type_repr.Int k; te_effects = [||]; te_span = span; te_flow = normal_flow (Type_repr.Int k) })
           | None ->
               (* unsuffixed literal: the Int_literal inference type is
                  adopted by the enclosing constraints (the native model);
@@ -2753,26 +2799,26 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
                   (err span
                      (Literal.range_error p
                       ^ " (a literal that does not fit its type is a TYPE error, never zeroed)"))
-              else Ok { te_type = Type_repr.Int_literal p.Literal.magnitude; te_effects = [||]; te_span = span }))
+              else Ok { te_type = Type_repr.Int_literal p.Literal.magnitude; te_effects = [||]; te_span = span; te_flow = normal_flow (Type_repr.Int_literal p.Literal.magnitude) }))
   | Ast.FloatLit (_, _, span) -> (
       match expected with
       | Some (Type_repr.Float Type_repr.F32) ->
-          Ok { te_type = Type_repr.Float Type_repr.F32; te_effects = [||]; te_span = span }
-      | _ -> Ok { te_type = Type_repr.Float Type_repr.F64; te_effects = [||]; te_span = span })
+          Ok { te_type = Type_repr.Float Type_repr.F32; te_effects = [||]; te_span = span; te_flow = normal_flow (Type_repr.Float Type_repr.F32) }
+      | _ -> Ok { te_type = Type_repr.Float Type_repr.F64; te_effects = [||]; te_span = span; te_flow = normal_flow (Type_repr.Float Type_repr.F64) })
   | Ast.StringLit (_, _, span) ->
-      Ok { te_type = Type_repr.String; te_effects = [||]; te_span = span }
+      Ok { te_type = Type_repr.String; te_effects = [||]; te_span = span; te_flow = normal_flow (Type_repr.String) }
   | Ast.CharLit (_, c, span) -> (
       (* Uchar validation: the spelling must decode to exactly one scalar *)
       match Utf8.decode_at (Bytes.of_string c) 0 with
       | Ok (_, next) when next = String.length c ->
-          Ok { te_type = Type_repr.Char; te_effects = [||]; te_span = span }
+          Ok { te_type = Type_repr.Char; te_effects = [||]; te_span = span; te_flow = normal_flow (Type_repr.Char) }
       | _ -> Error (err span "char literal is not a single Unicode scalar"))
   | Ast.BoolLit (_, _, span) ->
-      Ok { te_type = Type_repr.Bool; te_effects = [||]; te_span = span }
+      Ok { te_type = Type_repr.Bool; te_effects = [||]; te_span = span; te_flow = normal_flow (Type_repr.Bool) }
   | Ast.Name (nid, n, span) -> check_name env scope expected nid n span
   | Ast.Path (nid, a, b, span) -> check_name env scope expected nid (a ^ "::" ^ b) span
   | Ast.Tuple (_, elems, span) -> (
-      if elems = [] then Ok { te_type = Type_repr.Unit; te_effects = [||]; te_span = span }
+      if elems = [] then Ok { te_type = Type_repr.Unit; te_effects = [||]; te_span = span; te_flow = normal_flow (Type_repr.Unit) }
       else
         let rec go acc = function
           | [] -> Ok (List.rev acc)
@@ -2796,15 +2842,15 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
                   | Ok () -> Ok ()
                   | Error m -> Error m)
             in
-            Ok { te_type = substitute_fixpoint !subst ty; te_effects = effects; te_span = span }))
+            Ok { te_type = substitute_fixpoint !subst ty; te_effects = effects; te_span = span; te_flow = normal_flow (substitute_fixpoint !subst ty) }))
   | Ast.Array (_, elems, span) -> (
       match elems with
       | [] -> (
           match expected with
           | Some (Type_repr.Fixed_array (t, n)) ->
-              Ok { te_type = Type_repr.Fixed_array (t, n); te_effects = [||]; te_span = span }
+              Ok { te_type = Type_repr.Fixed_array (t, n); te_effects = [||]; te_span = span; te_flow = normal_flow (Type_repr.Fixed_array (t, n)) }
           | Some (Type_repr.Named (id, [| t |])) when Ids.Type_id.compare id b_array = 0 ->
-              Ok { te_type = Type_repr.Named (b_array, [| t |]); te_effects = [||]; te_span = span }
+              Ok { te_type = Type_repr.Named (b_array, [| t |]); te_effects = [||]; te_span = span; te_flow = normal_flow (Type_repr.Named (b_array, [| t |])) }
           | _ -> Error (err span "cannot infer the element type of an empty array"))
       | first :: rest -> (
           match check_expr env scope None first with
@@ -2841,7 +2887,7 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
                         Type_repr.Named (b_array, [| elem_ty |])
                     | _ -> Type_repr.Fixed_array (elem_ty, List.length elems)
                   in
-                  Ok { te_type = ty; te_effects = effects; te_span = span }))))
+                  Ok { te_type = ty; te_effects = effects; te_span = span; te_flow = normal_flow (ty) }))))
   | Ast.ArrayRepeat (_, v, c, span) -> (
       match check_expr env scope None v with
       | Error m -> Error m
@@ -2850,7 +2896,7 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
           | Error m -> Error (err span m)
           | Ok n when n < 0 -> Error (err span "negative array repeat count")
           | Ok n ->
-              Ok { te_type = Type_repr.Fixed_array (te.te_type, n); te_effects = te.te_effects; te_span = span }))
+              Ok { te_type = Type_repr.Fixed_array (te.te_type, n); te_effects = te.te_effects; te_span = span; te_flow = normal_flow (Type_repr.Fixed_array (te.te_type, n)) }))
   | Ast.StructLit (_, name, targs, fields, rest, span) -> (
       match resolve_nominal env span name with
       | Error m -> Error m
@@ -2946,7 +2992,7 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
                     let effects =
                       Array.concat (List.map (fun te -> te.te_effects) fes @ [ rest_effects ])
                     in
-                    Ok { te_type = lit_ty; te_effects = effects; te_span = span })
+                    Ok { te_type = lit_ty; te_effects = effects; te_span = span; te_flow = normal_flow (lit_ty) })
           end)
       | Ok (nom, tid, args) when nom.nom_kind = `Enum -> (
           (* the braced-VARIANT literal: `Enum::Variant { f: e, ... }` —
@@ -3057,17 +3103,19 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
                          let effects =
                            Array.concat (List.map (fun te -> te.te_effects) fes @ [ rest_effects ])
                          in
-                         Ok { te_type = Type_repr.Named (tid, lit_args); te_effects = effects; te_span = span })
+                         Ok { te_type = Type_repr.Named (tid, lit_args); te_effects = effects; te_span = span; te_flow = normal_flow (Type_repr.Named (tid, lit_args)) })
                end)))
       | Ok _ -> Error (err span (Printf.sprintf "`%s` is not a struct" name)))
   | Ast.Block (_, b, span) -> (
       match check_block env scope expected b span with
       | Error m -> Error m
-      | Ok fr -> Ok { te_type = flow_normal fr; te_effects = [||]; te_span = span })
+      | Ok fr ->
+          Ok { te_type = flow_normal fr; te_effects = [||]; te_span = span; te_flow = fr })
   | Ast.UnsafeBlock (_, _, b, span) -> (
       match check_block env scope expected b span with
       | Error m -> Error m
-      | Ok fr -> Ok { te_type = flow_normal fr; te_effects = [||]; te_span = span })
+      | Ok fr ->
+          Ok { te_type = flow_normal fr; te_effects = [||]; te_span = span; te_flow = fr })
   | Ast.IfExpr (_, i) -> check_if env scope use expected i
   | Ast.Call (nid, callee, targs, args, span) ->
       check_call env scope expected nid callee targs args span
@@ -3086,14 +3134,14 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
               in
               match te.te_type with
               | Type_repr.Fixed_array (t, _) ->
-                  Ok { te_type = t; te_effects = Array.append te.te_effects [| Access_effect.Read |]; te_span = span }
+                  Ok { te_type = t; te_effects = Array.append te.te_effects [| Access_effect.Read |]; te_span = span; te_flow = normal_flow (t) }
               | Type_repr.Named (id, [| t |]) when Ids.Type_id.compare id b_array = 0 ->
-                  Ok { te_type = t; te_effects = Array.append te.te_effects [| Access_effect.Read |]; te_span = span }
+                  Ok { te_type = t; te_effects = Array.append te.te_effects [| Access_effect.Read |]; te_span = span; te_flow = normal_flow (t) }
               | Type_repr.Named (id, [| t |]) -> (
                   (* the kernel's Array/Vec containers are indexable *)
                   match List.assoc_opt id env.type_names with
                   | Some ("Array" | "Vec") ->
-                      Ok { te_type = t; te_effects = Array.append te.te_effects [| Access_effect.Read |]; te_span = span }
+                      Ok { te_type = t; te_effects = Array.append te.te_effects [| Access_effect.Read |]; te_span = span; te_flow = normal_flow (t) }
                   | _ ->
                       Error
                         (err span
@@ -3117,6 +3165,7 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
               te_type = Type_repr.Tuple [| ta.te_type; tb.te_type |];
               te_effects = Array.append ta.te_effects tb.te_effects;
               te_span = span;
+              te_flow = normal_flow (Type_repr.Tuple [| ta.te_type; tb.te_type |]);
             }))
   | Ast.MatchExpr (nid, m) -> check_match env scope use expected nid m
   | Ast.Cast (_, inner, ty, span) -> (
@@ -3155,7 +3204,7 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
                   (err span
                      (Printf.sprintf "cannot cast %s to %s" (type_to_string te.te_type)
                         (type_to_string tgt)))
-              else Ok { te_type = tgt; te_effects = te.te_effects; te_span = span })))
+              else Ok { te_type = tgt; te_effects = te.te_effects; te_span = span; te_flow = normal_flow (tgt) })))
   | Ast.TryOp (_, inner, span) -> (
       match check_expr env scope None inner with
       | Error m -> Error m
@@ -3170,7 +3219,7 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
                         | _ -> false)) ->
               (* `?` unwraps the Ok/Some payload: the first type argument
                  (the Result[T,E] carries both) *)
-              Ok { te_type = args.(0); te_effects = te.te_effects; te_span = span }
+              Ok { te_type = args.(0); te_effects = te.te_effects; te_span = span; te_flow = normal_flow (args.(0)) }
           | _ ->
               Error
                 (err span
@@ -3188,6 +3237,7 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
                   te_type = Type_repr.Ref_internal (Type_repr.Immutable, te.te_type);
                   te_effects = Array.append te.te_effects [| Access_effect.Read |];
                   te_span = span;
+                  te_flow = normal_flow (Type_repr.Ref_internal (Type_repr.Immutable, te.te_type));
                 }
           | Ast.BorrowMut ->
               Ok
@@ -3195,18 +3245,19 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
                   te_type = Type_repr.Ref_internal (Type_repr.Mutable, te.te_type);
                   te_effects = Array.append te.te_effects [| Access_effect.Modify |];
                   te_span = span;
+                  te_flow = normal_flow (Type_repr.Ref_internal (Type_repr.Mutable, te.te_type));
                 }
           | Ast.Deref -> (
               match te.te_type with
               | Type_repr.Ref_internal (_, t) | Type_repr.Raw_ptr (_, t) ->
-                  Ok { te_type = t; te_effects = Array.append te.te_effects [| Access_effect.Read |]; te_span = span }
+                  Ok { te_type = t; te_effects = Array.append te.te_effects [| Access_effect.Read |]; te_span = span; te_flow = normal_flow (t) }
               | Type_repr.Named (id, [| t |])
                 when Ids.Type_id.compare id b_ptr = 0 || Ids.Type_id.compare id b_ptrmut = 0 ->
-                  Ok { te_type = t; te_effects = Array.append te.te_effects [| Access_effect.Read |]; te_span = span }
+                  Ok { te_type = t; te_effects = Array.append te.te_effects [| Access_effect.Read |]; te_span = span; te_flow = normal_flow (t) }
               | Type_repr.Type_param _ ->
                   (* a generic pointer: the pointee is the parameter
                      itself until the instantiation resolves *)
-                  Ok { te_type = te.te_type; te_effects = Array.append te.te_effects [| Access_effect.Read |]; te_span = span }
+                  Ok { te_type = te.te_type; te_effects = Array.append te.te_effects [| Access_effect.Read |]; te_span = span; te_flow = normal_flow (te.te_type) }
               | _ -> (
                   (* native parity (types.tg ExprRawDeref): a deref whose
                      operand is a VALUE expression (call/cast/field/index)
@@ -3216,20 +3267,39 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
                      a bare NAME is strict (native: "safe dereference
                      removed; access through the parameter is direct"). *)
                   match inner with
-                  | Ast.Name _ | Ast.Path _ ->
-                      Error
-                        (err span (Printf.sprintf "cannot dereference %s" (type_to_string te.te_type)))
+                  | Ast.Name (_, n, _) | Ast.Path (_, _, n, _) -> (
+                      (* the kernel's inout-param deref writeback
+                         (`*current_loop_entry = ...` — a deref of a
+                         MUTABLE binding is the place-form of the
+                         inout access, not a raw pointer deref): a
+                         deref of a mutable local/param passes the
+                         value through — native's "access through the
+                         parameter is direct" *)
+                      match List.find_opt (fun (ln, _, _) -> ln = n) scope.locals with
+                      | Some (_, _, true) ->
+                          Ok
+                            {
+                              te_type = te.te_type;
+                              te_effects = Array.append te.te_effects [| Access_effect.Read |];
+                              te_span = span;
+                              te_flow = normal_flow (te.te_type);
+                            }
+                      | _ ->
+                          Error
+                            (err span
+                               (Printf.sprintf "cannot dereference %s" (type_to_string te.te_type))))
                   | _ ->
                       Ok
                         {
                           te_type = te.te_type;
                           te_effects = Array.append te.te_effects [| Access_effect.Read |];
                           te_span = span;
+                          te_flow = normal_flow (te.te_type);
                         }))
           | Ast.Neg -> (
               match te.te_type with
               | Type_repr.Int _ | Type_repr.Float _ ->
-                  Ok { te_type = te.te_type; te_effects = te.te_effects; te_span = span }
+                  Ok { te_type = te.te_type; te_effects = te.te_effects; te_span = span; te_flow = normal_flow (te.te_type) }
               | Type_repr.Int_literal _ ->
                   (* a negated unsuffixed literal stays a literal: it must
                      adopt the concrete integer kind of its comparison/
@@ -3240,6 +3310,7 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
                       te_type = te.te_type;
                       te_effects = te.te_effects;
                       te_span = span;
+                      te_flow = normal_flow (te.te_type);
                     }
               | _ ->
                   Error
@@ -3248,11 +3319,11 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
                           (type_to_string te.te_type))))
           | Ast.Not -> (
               match te.te_type with
-              | Type_repr.Bool -> Ok { te_type = te.te_type; te_effects = te.te_effects; te_span = span }
+              | Type_repr.Bool -> Ok { te_type = te.te_type; te_effects = te.te_effects; te_span = span; te_flow = normal_flow (te.te_type) }
               | _ -> Error (err span (Printf.sprintf "`not` requires Bool, found %s" (type_to_string te.te_type))))
           | Ast.BitNot -> (
               match te.te_type with
-              | Type_repr.Int _ -> Ok { te_type = te.te_type; te_effects = te.te_effects; te_span = span }
+              | Type_repr.Int _ -> Ok { te_type = te.te_type; te_effects = te.te_effects; te_span = span; te_flow = normal_flow (te.te_type) }
               | _ ->
                   Error
                     (err span
@@ -3278,6 +3349,7 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
                       te_type = substitute_fixpoint !subst rty;
                       te_effects = Array.append tl.te_effects tr.te_effects;
                       te_span = span;
+                      te_flow = normal_flow (substitute_fixpoint !subst rty);
                     })))
   | Ast.AwaitExpr (_, _, span) -> Error (err span "await is not available in the bootstrap subset")
   | Ast.MacroCall (_, name, args, span) ->
@@ -3289,15 +3361,15 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
         | Ast.MacroExpr cond :: _ ->
             (match check_expr env scope None cond with
              | Error m -> Error m
-             | Ok _ -> Ok { te_type = Type_repr.Unit; te_effects = [||]; te_span = span })
-        | _ -> Ok { te_type = Type_repr.Unit; te_effects = [||]; te_span = span }
+             | Ok _ -> Ok { te_type = Type_repr.Unit; te_effects = [||]; te_span = span; te_flow = normal_flow (Type_repr.Unit) })
+        | _ -> Ok { te_type = Type_repr.Unit; te_effects = [||]; te_span = span; te_flow = normal_flow (Type_repr.Unit) }
       else if name = "vec" then
         (* the kernel declares vec! itself (collections.tg): "vec![a, b,
            c] is syntax sugar for Vec::from([a, b, c]) — the compiler
            expands vec! at parse time into an Array literal" — check the
            elements as an array literal and type the result as Vec *)
         (match args with
-         | [] -> Ok { te_type = Type_repr.Named (b_array, [||]); te_effects = [||]; te_span = span }
+         | [] -> Ok { te_type = Type_repr.Named (b_array, [||]); te_effects = [||]; te_span = span; te_flow = normal_flow (Type_repr.Named (b_array, [||])) }
          | first :: rest -> (
              let exprs =
                List.concat_map
@@ -3336,7 +3408,7 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
                  (first :: rest)
              in
              match exprs with
-             | [] -> Ok { te_type = Type_repr.Named (b_array, [||]); te_effects = [||]; te_span = span }
+             | [] -> Ok { te_type = Type_repr.Named (b_array, [||]); te_effects = [||]; te_span = span; te_flow = normal_flow (Type_repr.Named (b_array, [||])) }
              | first_e :: rest_e -> (
                  match check_expr env scope None first_e with
                  | Error m -> Error m
@@ -3369,6 +3441,7 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
                              te_type = Type_repr.Named (b_array, [| elem_ty |]);
                              te_effects = effects;
                              te_span = span;
+                             te_flow = normal_flow (Type_repr.Named (b_array, [| elem_ty |]));
                            }))))
       else
         Error (err span (Printf.sprintf "macro call `%s!` is not available in the bootstrap subset" name))
@@ -3392,6 +3465,7 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
                         te_type = Type_repr.Unit;
                         te_effects = Array.append [| Access_effect.Modify |] te.te_effects;
                         te_span = span;
+                        te_flow = normal_flow (Type_repr.Unit);
                       }
                 | Error m ->
                     Error
@@ -3419,6 +3493,7 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
                         te_type = Type_repr.Unit;
                         te_effects = Array.append [| Access_effect.Modify |] te.te_effects;
                         te_span = span;
+                        te_flow = normal_flow (Type_repr.Unit);
                       })))
   | Ast.ReturnExpr (_, inner, span) -> (
       match env.current_return with
@@ -3428,7 +3503,12 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
           | None -> (
               let subst = ref [] in
               match unify env.state.box_tid subst rt Type_repr.Unit with
-              | Ok () -> Ok { te_type = Type_repr.Never; te_effects = [||]; te_span = span }
+              | Ok () ->
+                  Ok
+                    { te_type = Type_repr.Never;
+                      te_effects = [||];
+                      te_span = span;
+                      te_flow = diverge_flow ~may_return:true ~may_break:false ~may_continue:false }
               | Error m ->
                   Error (err span (Printf.sprintf "return type mismatch: function returns %s (%s)" (type_to_string rt) m)))
           | Some e -> (
@@ -3437,7 +3517,13 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
               | Ok te -> (
                   let subst = ref [] in
                   match unify env.state.box_tid subst rt te.te_type with
-                  | Ok () -> Ok { te_type = Type_repr.Never; te_effects = te.te_effects; te_span = span }
+                  | Ok () ->
+                      Ok
+                        { te_type = Type_repr.Never;
+                          te_effects = te.te_effects;
+                          te_span = span;
+                          te_flow =
+                            diverge_flow ~may_return:true ~may_break:false ~may_continue:false }
                   | Error m ->
                       Error
                         (err span
@@ -3447,27 +3533,60 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
       if scope.loop_depth = 0 then Error (err span "break outside a loop")
       else
         match inner with
-        | None -> Ok { te_type = Type_repr.Unit; te_effects = [||]; te_span = span }
+        | None ->
+            Ok
+              { te_type = Type_repr.Unit;
+                te_effects = [||];
+                te_span = span;
+                te_flow = diverge_flow ~may_return:false ~may_break:true ~may_continue:false }
         | Some e -> (
             match check_expr env scope (Some Type_repr.Unit) e with
-            | Ok te -> Ok { te_type = Type_repr.Unit; te_effects = te.te_effects; te_span = span }
+            | Ok te ->
+                Ok
+                  { te_type = Type_repr.Unit;
+                    te_effects = te.te_effects;
+                    te_span = span;
+                    te_flow = diverge_flow ~may_return:false ~may_break:true ~may_continue:false }
             | Error m -> Error m))
   | Ast.NextExpr (_, span) -> (
       (* the Swift seed's semantics: a bare `next` without a loop target
          is a Unit statement, not an error (the kernel relies on the
          tail-`next` identifier form in cfg_synthetic_alloc) *)
-      Ok { te_type = Type_repr.Unit; te_effects = [||]; te_span = span })
+      Ok
+        { te_type = Type_repr.Unit;
+          te_effects = [||];
+          te_span = span;
+          te_flow = diverge_flow ~may_return:false ~may_break:false ~may_continue:true })
   | Ast.ForExpr (nid, f) -> (
       match check_expr env scope None f.Ast.for_iterable with
       | Error m -> Error m
       | Ok te -> (
+          (* re-audit P0 (range classification): a `for i in a..b` is
+             classified by the SOURCE shape — the range expression is
+             an iteration form, never the tuple encoding of its
+             endpoints (the old tuple-typed classification reported
+             every range loop as an unsupported IterTuple) *)
           let elem_ty =
-            match te.te_type with
-            | Type_repr.Fixed_array (t, _) -> Some t
+            match f.Ast.for_iterable with
+            | Ast.Range (_, start_e, _, _, _) -> (
+                match check_expr env scope None start_e with
+                | Ok ste -> Some ste.te_type
+                | Error _ -> None)
+            | _ -> (
+                match te.te_type with
+                | Type_repr.Fixed_array (t, _) -> Some t
             | Type_repr.Named (id, [| t |]) when Ids.Type_id.compare id b_array = 0 -> Some t
             | Type_repr.Named (id, args) -> (
                 (* the kernel's Array/Vec/Set containers are iterable;
                    Map iteration binds the (K, V) tuple *)
+                let _ =
+                  if Sys.getenv_opt "TANGERINE_DEBUG_ITER" <> None then
+                    Printf.eprintf "DBG-ITER tid=%d name=%s args=%d\n"
+                      (Ids.Type_id.to_int id)
+                      (match List.assoc_opt id env.type_names with
+                       | Some n -> n | None -> "?")
+                      (Array.length args)
+                in
                 match List.assoc_opt id env.type_names with
                 | Some ("Array" | "Vec" | "Set") when Array.length args = 1 ->
                     Some args.(0)
@@ -3476,7 +3595,7 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
                 | _ -> None)
             | Type_repr.String -> Some Type_repr.Char
             | Type_repr.Tuple _ -> Some (Type_repr.Int Type_repr.Int)
-            | _ -> None
+            | _ -> None)
           in
           match elem_ty with
           | None ->
@@ -3492,20 +3611,23 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
                      kind under the ForExpr's NodeId — the SAME fact
                      Typed_profile and Mir_lower consume *)
                   let kind =
-                    match te.te_type with
-                    | Type_repr.Int _ -> IterRange
-                    | Type_repr.Fixed_array _ -> IterFixedArray
-                    | Type_repr.Named (id, [| _ |])
-                      when Ids.Type_id.compare id b_array = 0 ->
-                        IterVec
-                    | Type_repr.String -> IterString
-                    | Type_repr.Tuple _ -> IterTuple
-                    | Type_repr.Named (id, _) -> (
-                        match List.assoc_opt id env.type_names with
-                        | Some "Map" -> IterMap
-                        | Some "Set" -> IterSet
+                    match f.Ast.for_iterable with
+                    | Ast.Range _ -> IterRange
+                    | _ -> (
+                        match te.te_type with
+                        | Type_repr.Int _ -> IterRange
+                        | Type_repr.Fixed_array _ -> IterFixedArray
+                        | Type_repr.Named (id, [| _ |])
+                          when Ids.Type_id.compare id b_array = 0 ->
+                            IterVec
+                        | Type_repr.String -> IterString
+                        | Type_repr.Tuple _ -> IterTuple
+                        | Type_repr.Named (id, _) -> (
+                            match List.assoc_opt id env.type_names with
+                            | Some "Map" -> IterMap
+                            | Some "Set" -> IterSet
+                            | _ -> IterOther)
                         | _ -> IterOther)
-                    | _ -> IterOther
                   in
                   Hashtbl.replace env.typed_for_patterns nid
                     {
@@ -3529,7 +3651,17 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
                        Ok
                          { te_type = Type_repr.Unit;
                            te_effects = [||];
-                           te_span = f.Ast.for_span })))))
+                           te_span = f.Ast.for_span;
+                           (* the native for-rule (re-audit P0): a for
+                              whose iterable is empty exits normally, so
+                              its normal continuation is Unit; the
+                              body's return edge propagates; break/
+                              continue are consumed by the loop *)
+                           te_flow =
+                             { fr_normal = Some Type_repr.Unit;
+                               fr_may_return = _fr.fr_may_return;
+                               fr_may_break = false;
+                               fr_may_continue = false } })))))
   | Ast.WhileExpr (_, w) -> (
       match check_expr env scope (Some Type_repr.Bool) w.Ast.wh_condition with
       | Error m -> Error m
@@ -3544,11 +3676,19 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
               | Error m -> Error m
               | Ok _fr ->
                   (* the native while-rule: a normal while can execute
-                     zero times, so its normal result is Unit *)
+                     zero times, so its normal result is Unit (re-audit
+                     P0: the condition-false exit is a normal edge —
+                     the body's return propagates; break/continue are
+                     consumed) *)
                   Ok
                     { te_type = Type_repr.Unit;
                       te_effects = [||];
-                      te_span = w.Ast.wh_span })
+                      te_span = w.Ast.wh_span;
+                      te_flow =
+                        { fr_normal = Some Type_repr.Unit;
+                          fr_may_return = _fr.fr_may_return;
+                          fr_may_break = false;
+                          fr_may_continue = false } })
           | Error m ->
               ignore
                 (return_unify_err (Ast.expr_span w.Ast.wh_condition) Type_repr.Bool
@@ -3560,16 +3700,25 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
       with
       | Error m -> Error m
       | Ok fr ->
-          (* the native loop-rule: `loop` falls through ONLY via a
-             break (or a return); a body with NO exit edge is Never.
-             Treating a breakable loop as Never corrupts unreachable
-             analysis and every later block-tail calculation. *)
+          (* the native loop-rule (re-audit P0 fix): `loop` falls
+             through ONLY via a break — a body whose only exits are
+             return/continue has NO normal continuation (Never);
+             treating a return-only loop as Unit corrupts the
+             unreachable analysis.  The body's return edge propagates;
+             break/continue are consumed by the loop. *)
+          let normal =
+            if fr.fr_may_break then Some Type_repr.Unit else None
+          in
           Ok
             { te_type =
-                (if fr.fr_may_break || fr.fr_may_return then Type_repr.Unit
-                 else Type_repr.Never);
+                (match normal with Some _ -> Type_repr.Unit | None -> Type_repr.Never);
               te_effects = [||];
-              te_span = span })
+              te_span = span;
+              te_flow =
+                { fr_normal = normal;
+                  fr_may_return = fr.fr_may_return;
+                  fr_may_break = false;
+                  fr_may_continue = false } })
   | Ast.HandleExpr (_, h) -> Error (err h.Ast.h_span "handle/with expressions are not available in the bootstrap subset")
   | Ast.UnlessExpr (_, u) -> Error (err u.Ast.un_span "unless expressions are not available in the bootstrap subset")
   | Ast.UntilExpr (_, u) -> Error (err u.Ast.ut_span "until expressions are not available in the bootstrap subset")
@@ -3607,15 +3756,30 @@ and check_block (env : env) (scope : scope) (expected : Type_repr.t option) (b :
                 fr_may_continue = acc.fr_may_continue;
               }
         | Some e -> (
-            match check_expr env scope expected e with
+            (* re-audit P0 fix (the A-family tail root): the block tail
+               is checked with the DISCARDED use — a function body whose
+               last form is a statement-position match/if (`match ...
+               when Some(x) then side_effect() when None then () end`)
+               must get the statement-position arm reconcile (Unit
+               divergence allowed), not a value-context "expected
+               Option, found ()".  The tail still contributes its
+               te_type to the block's normal when it has one; the
+               Discarded use only relaxes the branch reconciliation. *)
+            match check_expr_use env scope Discarded expected e with
             | Ok te ->
+                (* re-audit P0 (tail-position divergence): the tail's
+                   OWN flow is consumed — a `return`/diverging tail
+                   makes the block's normal continuation unreachable
+                   (fr_normal = None) instead of leaking a Unit-like
+                   value type into the enclosing continuation *)
                 Ok
                   {
                     fr_normal =
-                      (if acc.fr_normal = None then None else Some te.te_type);
-                    fr_may_return = acc.fr_may_return;
-                    fr_may_break = acc.fr_may_break;
-                    fr_may_continue = acc.fr_may_continue;
+                      (if acc.fr_normal = None || te.te_flow.fr_normal = None then None
+                       else Some te.te_type);
+                    fr_may_return = acc.fr_may_return || te.te_flow.fr_may_return;
+                    fr_may_break = acc.fr_may_break || te.te_flow.fr_may_break;
+                    fr_may_continue = acc.fr_may_continue || te.te_flow.fr_may_continue;
                   }
             | Error m -> Error m))
     | s :: rest -> (
@@ -3653,17 +3817,21 @@ and check_stmt (env : env) (scope : scope) (s : Ast.stmt) :
               match check_pattern env scope (default_literal te.te_type) pat with
               | Error m -> Error m
               | Ok (tp, binds) ->
-                  (match value with
-                   | Ast.Name (nid, _, _) | Ast.Field (nid, _, _, _) ->
-                       Hashtbl.replace env.typed_let_patterns nid tp
-                   | _ -> ());
+                  (* the universal let-pattern channel (re-audit item 9:
+                     the semantic pattern is recorded for EVERY
+                     initializer form, keyed by the initializer's
+                     NodeId — the identity the lowerer's LetBinding
+                     consults; the old Name/Field-only restriction let
+                     `let (a, b) = get_pair()` fall back to raw syntax) *)
+                  Hashtbl.replace env.typed_let_patterns (Ast.expr_node_id value) tp;
                   Ok
                     ( add_binds scope (List.map (fun (n, t, _) -> (n, t, mut_)) binds),
                       {
-                        fr_normal = Some te.te_type;
-                        fr_may_return = false;
-                        fr_may_break = false;
-                        fr_may_continue = false;
+                        fr_normal =
+                          (if te.te_flow.fr_normal = None then None else Some te.te_type);
+                        fr_may_return = te.te_flow.fr_may_return;
+                        fr_may_break = te.te_flow.fr_may_break;
+                        fr_may_continue = te.te_flow.fr_may_continue;
                       } )))
       | Some tye -> (
           match resolve_type env scope tye with
@@ -3684,39 +3852,27 @@ and check_stmt (env : env) (scope : scope) (s : Ast.stmt) :
                   in
                   match check_pattern env scope (substitute_fixpoint !subst ty) pat with
                   | Error m -> Error m
-                  | Ok (_, binds) ->
+                  | Ok (tp, binds) ->
+                      Hashtbl.replace env.typed_let_patterns (Ast.expr_node_id value) tp;
                       Ok
                         ( add_binds scope (List.map (fun (n, t, _) -> (n, t, mut_)) binds),
                           {
-                            fr_normal = Some ty;
-                            fr_may_return = false;
-                            fr_may_break = false;
-                            fr_may_continue = false;
+                            fr_normal =
+                              (if te.te_flow.fr_normal = None then None else Some ty);
+                            fr_may_return = te.te_flow.fr_may_return;
+                            fr_may_break = te.te_flow.fr_may_break;
+                            fr_may_continue = te.te_flow.fr_may_continue;
                           } )))))
   | Ast.ExprStmt (e, _) -> (
       match check_expr_use env scope Discarded None e with
       | Ok te -> (
-          (* the divergence edges: a statement-position return/break/
-             next makes the normal continuation unreachable (the
-             native's FlowResult — a tail after `return` must never
-             contribute to the surrounding block's type) *)
-          let fr =
-            match e with
-            | Ast.ReturnExpr _ ->
-                { fr_normal = None; fr_may_return = true; fr_may_break = false; fr_may_continue = false }
-            | Ast.BreakExpr _ ->
-                { fr_normal = None; fr_may_break = true; fr_may_return = false; fr_may_continue = false }
-            | Ast.NextExpr _ ->
-                { fr_normal = None; fr_may_continue = true; fr_may_return = false; fr_may_break = false }
-            | _ ->
-                {
-                  fr_normal = Some te.te_type;
-                  fr_may_return = false;
-                  fr_may_break = false;
-                  fr_may_continue = false;
-                }
-          in
-          Ok (scope, fr))
+          (* re-audit P0: the statement's flow IS the expression's flow
+             — a statement-position `return x` (or a nested diverging
+             if/match whose expression flow says so) makes the normal
+             continuation unreachable; no raw-syntax special cases
+             here (the divergence edges live in the expression checker,
+             where nested forms join their children's flows) *)
+          Ok (scope, te.te_flow))
       | Error m -> Error m)
   | Ast.AttributeStmt (_, _) ->
       Ok (scope, { fr_normal = Some Type_repr.Unit; fr_may_return = false; fr_may_break = false; fr_may_continue = false })
@@ -3873,7 +4029,14 @@ and check_if (env : env) (scope : scope) (use : expr_use) (expected : Type_repr.
         Array.concat
           (cond_effects :: List.map (fun (_fr : flow_result) -> [||]) (tt :: telsif))
       in
-      Ok { te_type = Type_repr.Unit; te_effects = all_effects; te_span = i.Ast.if_span })
+      let if_flow =
+        List.fold_left flow_join (normal_flow Type_repr.Unit) (tt :: telsif)
+      in
+      Ok
+        { te_type = Type_repr.Unit;
+          te_effects = all_effects;
+          te_span = i.Ast.if_span;
+          te_flow = if_flow })
   | Some eb -> (
       let eb_exp =
         match tt_ty with
@@ -3904,7 +4067,13 @@ and check_if (env : env) (scope : scope) (use : expr_use) (expected : Type_repr.
                    other divergences stay errors *)
                 match use, tt_ty, flow_normal te with
                 | Discarded, Type_repr.Unit, _ | Discarded, _, Type_repr.Unit -> Ok ()
-                | _ -> Error m)
+                | _ -> (
+                    (* re-audit P0 (the divergent-branch rule): a branch
+                       whose normal flow is unreachable (break/return/
+                       next) contributes no value type to the if join —
+                       the surviving branch's type is authoritative *)
+                    if te.fr_normal = None || tt.fr_normal = None then Ok ()
+                    else Error m))
           in
           (* the if's type adopts the concrete integer kind when one arm
              is a bare literal and the other a concrete int (`if c then 8
@@ -3923,10 +4092,18 @@ and check_if (env : env) (scope : scope) (use : expr_use) (expected : Type_repr.
             Array.concat
               (cond_effects :: List.map (fun (_fr : flow_result) -> [||]) (tt :: telsif @ [ te ]))
           in
-          Ok { te_type = if_ty; te_effects = all_effects; te_span = i.Ast.if_span }))
+          let if_flow =
+            List.fold_left flow_join (normal_flow Type_repr.Unit) (tt :: telsif @ [ te ])
+          in
+          Ok
+            { te_type = if_ty;
+              te_effects = all_effects;
+              te_span = i.Ast.if_span;
+              te_flow = if_flow }))
 
 and check_match (env : env) (scope : scope) (use : expr_use) (expected : Type_repr.t option) (nid : Ids.Node_id.t)
     (m : Ast.match_expr) : (typed_expr, string) result =
+
   let* subject = check_expr env scope None m.Ast.m_subject in
   let* arms =
     let rec go idx acc = function
@@ -3971,7 +4148,13 @@ and check_match (env : env) (scope : scope) (use : expr_use) (expected : Type_re
                         | Discarded -> None
                         | Value -> Some first.te_type))
               in
-              match check_expr env arm_scope expected' arm.Ast.ma_body with
+              (* re-audit P0 fix (the A-family root): the arm bodies are
+                 checked under the MATCH's own use — a Discarded match
+                 (statement position) checks its arms with the Discarded
+                 use so the Unit-arm reconcile below actually fires; the
+                 old Value-only check made every `when X then insert(...)
+                 else () end` arm fail "expected Option, found ()" *)
+              match check_expr_use env arm_scope use expected' arm.Ast.ma_body with
               | Error m -> Error m
               | Ok te -> (
                   let subst = ref [] in
@@ -3993,16 +4176,29 @@ and check_match (env : env) (scope : scope) (use : expr_use) (expected : Type_re
                            | Discarded, _, Type_repr.Unit ->
                                go (idx + 1) (te :: acc) rest
                            | _ ->
-                               (* arm incompatibility is a real semantic failure:
+                               (* re-audit P0 (the divergent-arm rule): an
+                                  arm whose normal flow is unreachable
+                                  (break/return/next — `when None then
+                                  break` in a value let) contributes NO
+                                  value type to the arm join; the
+                                  remaining arms reconcile among
+                                  themselves.  A value match whose arms
+                                  ALL diverge keeps the first arm's type
+                                  (the Never join). *)
+                               if te.te_flow.fr_normal = None
+                                  || first.te_flow.fr_normal = None
+                               then go (idx + 1) (te :: acc) rest
+                               else
+                                 (* arm incompatibility is a real semantic failure:
                              return_unify_err is a pure constructor — the
                              former 'reported on the oracle channel' claim
                              was false; the arm must fail *)
-                               Error
-                                 (err arm.Ast.ma_span
-                                    (Printf.sprintf
-                                       "type mismatch: expected %s, found %s (%s)"
-                                       (type_to_string first.te_type)
-                                       (type_to_string te.te_type) m)))))))
+                                 Error
+                                   (err arm.Ast.ma_span
+                                      (Printf.sprintf
+                                         "type mismatch: expected %s, found %s (%s)"
+                                         (type_to_string first.te_type)
+                                         (type_to_string te.te_type) m)))))))
     in
     go 0 [] m.Ast.m_arms
   in
@@ -4024,7 +4220,16 @@ and check_match (env : env) (scope : scope) (use : expr_use) (expected : Type_re
         | _ -> first.te_type)
   in
   let effects = Array.concat (List.map (fun (te : typed_expr) -> te.te_effects) arms) in
-  Ok { te_type = ty; te_effects = effects; te_span = m.Ast.m_span }
+  let match_flow =
+    List.fold_left
+      (fun acc (te : typed_expr) -> flow_join acc te.te_flow)
+      (normal_flow Type_repr.Unit) arms
+  in
+  Ok
+    { te_type = ty;
+      te_effects = effects;
+      te_span = m.Ast.m_span;
+      te_flow = match_flow }
 
 and check_closure (env : env) (scope : scope) (expected : Type_repr.t option)
     (c : Ast.closure_expr) : (typed_expr, string) result =
@@ -4103,7 +4308,11 @@ and check_closure (env : env) (scope : scope) (expected : Type_repr.t option)
              ptypes),
         body.te_type )
   in
-  Ok { te_type = fn_ty; te_effects = body.te_effects; te_span = c.Ast.cl_span }
+  Ok
+    { te_type = fn_ty;
+      te_effects = body.te_effects;
+      te_span = c.Ast.cl_span;
+      te_flow = normal_flow fn_ty }
 
 and return_ret_err m = Error m
 
@@ -4213,7 +4422,7 @@ and check_place (env : env) (scope : scope) (e : Ast.expr) : (Type_repr.t * bool
           in
           match
             check_field env scope span
-              { te_type = bt; te_effects = [||]; te_span = span }
+              { te_type = bt; te_effects = [||]; te_span = span; te_flow = normal_flow (bt) }
               fname
           with
           | Ok te -> Ok (te.te_type, bmut)
@@ -4250,10 +4459,23 @@ and check_place (env : env) (scope : scope) (e : Ast.expr) : (Type_repr.t * bool
             when Ids.Type_id.compare id b_ptr = 0 || Ids.Type_id.compare id b_ptrmut = 0 ->
               Ok (t, true)
           | Type_repr.Type_param _ -> Ok (te.te_type, true)
-          | _ ->
-              Error
-                (err (Ast.expr_span e)
-                   (Printf.sprintf "cannot dereference %s" (type_to_string te.te_type)))))
+          | _ -> (
+              (* the kernel's inout-param deref WRITE place
+                 (`*current_loop_entry = ...` — the deref of a mutable
+                 binding is the place-form of the inout access):
+                 pass the value through with the mutable place flag *)
+              match e with
+              | Ast.Name (_, n, _) | Ast.Path (_, _, n, _) -> (
+                  match List.find_opt (fun (ln, _, _) -> ln = n) scope.locals with
+                  | Some (_, _, true) -> Ok (te.te_type, true)
+                  | _ ->
+                      Error
+                        (err (Ast.expr_span e)
+                           (Printf.sprintf "cannot dereference %s" (type_to_string te.te_type))))
+              | _ ->
+                  Error
+                    (err (Ast.expr_span e)
+                       (Printf.sprintf "cannot dereference %s" (type_to_string te.te_type))))))
   | _ -> Error (err (Ast.expr_span e) "assignment target must be a variable, field or index")
 
 and check_field (env : env) (_scope : scope) (span : Span.span) (base : typed_expr)
@@ -4270,6 +4492,7 @@ and check_field (env : env) (_scope : scope) (span : Span.span) (base : typed_ex
               te_type = elems.(i);
               te_effects = Array.append base.te_effects [| Access_effect.Read |];
               te_span = span;
+              te_flow = normal_flow (elems.(i));
             }
       | Type_repr.Tuple _ -> Error (err span (Printf.sprintf "tuple index %d out of bounds" i))
       | _ ->
@@ -4291,6 +4514,7 @@ and check_field (env : env) (_scope : scope) (span : Span.span) (base : typed_ex
                       te_type = substitute_fixpoint [ (Type_repr.KParam (snd (List.hd nom.nom_params)), inner) ] ft;
                       te_effects = [||];
                       te_span = span;
+                      te_flow = normal_flow (substitute_fixpoint [ (Type_repr.KParam (snd (List.hd nom.nom_params)), inner) ] ft);
                     }
               | None -> check_field env _scope span { base with te_type = inner } fname)
           | _ -> check_field env _scope span { base with te_type = inner } fname)
@@ -4303,7 +4527,7 @@ and check_field (env : env) (_scope : scope) (span : Span.span) (base : typed_ex
           | Some nom when List.mem_assoc fname nom.nom_fields -> (
               match List.assoc_opt fname nom.nom_fields with
               | Some ft ->
-                  Ok { te_type = substitute_fixpoint [ (Type_repr.KParam (snd (List.hd nom.nom_params)), inner) ] ft; te_effects = [||]; te_span = span }
+                  Ok { te_type = substitute_fixpoint [ (Type_repr.KParam (snd (List.hd nom.nom_params)), inner) ] ft; te_effects = [||]; te_span = span; te_flow = normal_flow (substitute_fixpoint [ (Type_repr.KParam (snd (List.hd nom.nom_params)), inner) ] ft) }
               | None -> check_field env _scope span { base with te_type = inner } fname)
           | _ -> check_field env _scope span { base with te_type = inner } fname)
       | Type_repr.Named (tid, args) -> (
@@ -4319,6 +4543,7 @@ and check_field (env : env) (_scope : scope) (span : Span.span) (base : typed_ex
                           te_type = substitute_fixpoint subst ft;
                           te_effects = Array.append base.te_effects [| Access_effect.Read |];
                           te_span = span;
+                          te_flow = normal_flow (substitute_fixpoint subst ft);
                         }
                   | None ->
                       env.state.oracle.o_unknown_fields <- env.state.oracle.o_unknown_fields + 1;
@@ -4369,7 +4594,7 @@ and check_name (env : env) (scope : scope) (expected : Type_repr.t option)
     in
     match found with
     | Some t ->
-        Some (Ok { te_type = t; te_effects = [| Access_effect.Read |]; te_span = span })
+        Some (Ok { te_type = t; te_effects = [| Access_effect.Read |]; te_span = span; te_flow = normal_flow (t) })
     | None -> None
   in
   match assoc_local n scope.locals with
@@ -4390,6 +4615,7 @@ and check_name (env : env) (scope : scope) (expected : Type_repr.t option)
           te_type = substitute_fixpoint (!var_journal @ !subst) t;
           te_effects = [| Access_effect.Read |];
           te_span = span;
+          te_flow = normal_flow (substitute_fixpoint (!var_journal @ !subst) t);
         }
   | None -> (
       match static_read () with
@@ -4401,7 +4627,7 @@ and check_name (env : env) (scope : scope) (expected : Type_repr.t option)
              without declaring it — the impl target is the type *)
           match env.current_self with
           | Some t ->
-              Ok { te_type = t; te_effects = [| Access_effect.Read |]; te_span = span }
+              Ok { te_type = t; te_effects = [| Access_effect.Read |]; te_span = span; te_flow = normal_flow (t) }
           | None ->
               Error (err span "unknown name `self` (not inside an impl)"))
       | _ -> (
@@ -4429,6 +4655,7 @@ and check_name (env : env) (scope : scope) (expected : Type_repr.t option)
                    te_type = substitute_fixpoint !subst t;
                    te_effects = [| Access_effect.Read |];
                    te_span = span;
+                   te_flow = normal_flow (substitute_fixpoint !subst t);
                  }
            | None ->
                (* the single-file module-path mismatch: the consts are
@@ -4465,6 +4692,7 @@ and check_name (env : env) (scope : scope) (expected : Type_repr.t option)
                         te_type = substitute_fixpoint !subst t;
                         te_effects = [| Access_effect.Read |];
                         te_span = span;
+                        te_flow = normal_flow (substitute_fixpoint !subst t);
                       }
                 | None ->
                     (match List.assoc_opt n env.constructors with
@@ -4483,6 +4711,7 @@ and check_name (env : env) (scope : scope) (expected : Type_repr.t option)
                                            te_type = fn_ty;
                                            te_effects = [| Access_effect.Read |];
                                            te_span = span;
+                                           te_flow = normal_flow (fn_ty);
                                          }
                                    | Error m ->
                                        Error
@@ -4509,6 +4738,7 @@ and check_name (env : env) (scope : scope) (expected : Type_repr.t option)
                                      te_type = ty;
                                      te_effects = [| Access_effect.Read |];
                                      te_span = span;
+                                     te_flow = normal_flow (ty);
                                    }
                              | None ->
                                  env.state.oracle.o_unresolved_calls <-
@@ -4755,7 +4985,7 @@ and check_call (env : env) (scope : scope) (expected : Type_repr.t option)
                              Access_effect.read_effect p.Type_repr.pt_convention)
                            tes (Array.to_list ps))
                     in
-                    Ok { te_type = r; te_effects = effects; te_span = span }
+                    Ok { te_type = r; te_effects = effects; te_span = span; te_flow = normal_flow (r) }
                   end)
           | _ ->
               Error
@@ -4813,7 +5043,7 @@ and check_closure_call (env : env) (scope : scope) (expected : Type_repr.t optio
                  Access_effect.read_effect p.Type_repr.pt_convention)
                tes (Array.to_list ps))
         in
-        Ok { te_type = ret; te_effects = effects; te_span = span }
+        Ok { te_type = ret; te_effects = effects; te_span = span; te_flow = normal_flow (ret) }
       end
 
 and check_call_sig (env : env) (scope : scope) (expected : Type_repr.t option)
@@ -4928,11 +5158,35 @@ and check_call_sig (env : env) (scope : scope) (expected : Type_repr.t option)
                         | Type_repr.Int pk, Type_repr.Int ak when pk <> ak -> Some ()
                         | _ -> None
                       in
+                      (* the explicit RefToRawPtr coercion (re-audit P0
+                         item 13): `&x` at an ABI/intrinsic boundary whose
+                         parameter is a raw pointer (Ptr[T]/PtrMut[T] —
+                         __sync_fetch_and_add, __sync_bool_compare_and_swap
+                         and the allocator internals) is the language's
+                         explicit borrow-to-pointer coercion — planned at
+                         the call boundary, never smuggled into unify *)
+                      let ref_to_raw_ptr () =
+                        match pt, ate.te_type with
+                        | Type_repr.Named (pid, [| inner |]), Type_repr.Ref_internal (_, ref_inner) -> (
+                            match List.assoc_opt pid env.type_names with
+                            | Some ("Ptr" | "PtrMut") -> (
+                                let s5 = ref [] in
+                                match unify env.state.box_tid s5 inner ref_inner with
+                                | Ok () -> Some ()
+                                | Error _ -> None)
+                            | _ -> None)
+                        | _ -> None
+                      in
                       (* STRICT (the native model): Map[K,V].get's key
                          parameter is K — part of the generic contract;
                          no arbitrary key tolerance (the audit: the
                          key/item type is part of the generic type) *)
-                      match same_named_arg () with
+                      match ref_to_raw_ptr () with
+                      | Some () ->
+                          let eff = Access_effect.read_effect sig_.ts_params.(i).Type_repr.pt_convention in
+                          go (ate :: acc) (eff :: effects) (i + 1) rest
+                      | None -> (
+                          match same_named_arg () with
                       | Some () ->
                           let eff = Access_effect.read_effect sig_.ts_params.(i).Type_repr.pt_convention in
                           go (ate :: acc) (eff :: effects) (i + 1) rest
@@ -4964,7 +5218,7 @@ and check_call_sig (env : env) (scope : scope) (expected : Type_repr.t option)
                           Error
                             (err a.Ast.ca_span
                                (Printf.sprintf "argument %d type mismatch: expected %s, found %s (%s, callee %s)"
-                                  (i + 1) (type_to_string pt) (type_to_string ate.te_type) m sig_.ts_name))))))
+                                  (i + 1) (type_to_string pt) (type_to_string ate.te_type) m sig_.ts_name)))))))
             end)
       in
       go [] [] 0 args
@@ -5064,7 +5318,7 @@ and check_call_sig (env : env) (scope : scope) (expected : Type_repr.t option)
         | _ -> []
       in
       record_call_accesses env scope (zip args effects tes);
-      Ok { te_type = ret; te_effects = Array.of_list effects; te_span = span }
+      Ok { te_type = ret; te_effects = Array.of_list effects; te_span = span; te_flow = normal_flow (ret) }
     end
   end
 
@@ -5098,6 +5352,10 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
         match oname with
         | "Vec" -> [ oname; "Array" ]
         | "Array" -> [ oname; "Vec" ]
+        | "Set" -> [ oname; "HashSet" ]
+        | "HashSet" -> [ oname; "Set" ]
+        | "Map" -> [ oname; "HashMap" ]
+        | "HashMap" -> [ oname; "Map" ]
         | "String" -> [ oname; "str" ]
         | "str" -> [ oname; "String" ]
         | _ -> [ oname ])
@@ -5220,6 +5478,7 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
                                  Access_effect.read_effect p.Type_repr.pt_convention)
                                tes (Array.to_list ps));
                         te_span = span;
+                        te_flow = normal_flow r;
                       })
           | _ ->
               env.state.oracle.o_unresolved_calls <- env.state.oracle.o_unresolved_calls + 1;
@@ -5537,7 +5796,7 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
                     oname mname (type_to_string owner_ty)
                     (type_to_string sig_.ts_return) (type_to_string ret)
                     span.Span.start span.Span.end_;
-                Ok { te_type = ret; te_effects = all_effects; te_span = span }
+                Ok { te_type = ret; te_effects = all_effects; te_span = span; te_flow = normal_flow (ret) }
               end
             end
           end)
@@ -6061,13 +6320,19 @@ and register_impl (env : env) (d : Ast.impl_decl) : (env, string) result =
       ie_trait = (match d.i_trait_name with Some t -> t | None -> "");
       ie_target = target;
       ie_target_name = d.i_target_type;
-      ie_id = { Trait_solver.module_id = env.module_id; index = env.state.next_impl_index };
+      (* re-audit P0 (impl identity stability): the impl's identity is
+         its SOURCE identity — the parser-minted item span, stable
+         across declaration-fixpoint retries — never a monotonically
+         increasing counter (the counter churned the same impl across
+         the four passes, leaving duplicate semantic copies in the
+         trait-solver table) *)
+      ie_id =
+        { Trait_solver.module_id = env.module_id; index = d.i_span.Span.start };
       ie_params = List.map (fun (tp : Ast.type_param) -> tp.tp_name) d.i_type_params;
       ie_bounds = from_tp @ from_where;
       ie_assoc = assoc;
     }
   in
-  env.state.next_impl_index <- env.state.next_impl_index + 1;
   let env2 =
     {
       env' with

@@ -53,11 +53,14 @@
      lowers the collected defer bodies inline in reverse declaration
      order (LIFO), then assigns the return slot, then emits Ret.
 
-   - Statics/consts: there is AST plumbing (Ast.ConstDecl/Ast.StaticDecl
-     and a Typecheck `consts` registry), but the Mir_lower API carries
-     no const/static table and the driver passes `statics = [||]`, so
-     names that resolve only to consts/statics fail closed at lowering
-     with Seed_bug.  See the statics TODO at the bottom of the file.
+   - Statics/consts: the MUTABLE-static storage is real (the
+     global-place model: Static roots address program.statics slots;
+     the driver feeds closure_statics with the declaration
+     initializers and mutability; the verifier rejects Assign into
+     immutable statics).  CONST references (Ast.ConstDecl — immutable
+     compile-time values) remain unlowered by design: a const is a
+     value, not an addressable global, and a const reference fails
+     closed with Seed_bug rather than inventing a representation.
 
    - Closure (Ast.Closure): NOT lowered — the seed VM can construct
      closure objects (ClosureAgg -> Vm_value.Closure) but has no
@@ -386,6 +389,17 @@ let typed_let_of (st : lower_state) (node_id : Ids.Node_id.t) :
 let typed_node_of (st : lower_state) (node_id : Ids.Node_id.t) : typed_node option =
   List.assoc_opt node_id st.typed_nodes
 
+(* The call's RESULT type: the typed channel's resolved type (the
+   checker's substituted te_type) when present — the raw sig rets carry
+   the declaration-owned generic params, which the verifier rejects in
+   local types ("unresolved type parameter") — else the lowering-side
+   fallback. *)
+let call_result_ty (st : lower_state) (node_id : Ids.Node_id.t)
+    (fallback : Type_repr.t) : Type_repr.t =
+  match typed_node_of st node_id with
+  | Some node -> node.tn_type
+  | None -> fallback
+
 (* The typed-pattern channel lookup: the typechecker's semantic pattern
    tree for a match arm (match NodeId, arm index). *)
 let typed_pattern_of (st : lower_state) (key : Ids.Node_id.t * int) : Typed_pattern.t option =
@@ -411,7 +425,7 @@ let fresh_local (st : lower_state) (ty : Type_repr.t) : int =
   id
 
 let cur_place (_st : lower_state) (id : int) : Seed_mir.place =
-  { Seed_mir.local = id; projections = [] }
+  { Seed_mir.root = Seed_mir.Local id; projections = [] }
 
 let local_type (st : lower_state) (id : int) : Type_repr.t option =
   if id >= 0 && id < Array.length st.locals then Some st.locals.(id) else None
@@ -476,6 +490,16 @@ let element_type_of (t : Type_repr.t) : Type_repr.t =
   match t with
   | Type_repr.Fixed_array (e, _) -> e
   | Type_repr.Named (id, [| e |]) when Ids.Type_id.compare id (Ids.Type_id.make 0) = 0 -> e
+  | Type_repr.Named (id, args)
+    when Ids.Type_id.compare id (Ids.Type_id.make 2) = 0
+         && Array.length args >= 1 ->
+      (* the Set nominal: the element *)
+      args.(0)
+  | Type_repr.Named (id, args)
+    when Ids.Type_id.compare id (Ids.Type_id.make 1) = 0
+         && Array.length args >= 2 ->
+      (* the Map nominal: the (K, V) entry tuple *)
+      Type_repr.Tuple [| args.(0); args.(1) |]
   | Type_repr.String -> Type_repr.Char
   | Type_repr.Tuple _ -> Type_repr.Int Type_repr.Int
   | _ -> seed_bug "element access on a non-iterable type %s" (Seed_mir.print_type t)
@@ -972,7 +996,7 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
                   (* the GLOBAL read: the place.local convention
                      -1 - idx addresses the VM's statics slot — the
                      read is stateful, NOT the const fold *)
-                  ( Seed_mir.Copy { Seed_mir.local = -1 - idx; projections = [] },
+                  ( Seed_mir.Copy { Seed_mir.root = Seed_mir.Static idx; projections = [] },
                     ty )
               | None -> (
                   match List.assoc_opt n env.consts with
@@ -1142,7 +1166,7 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
   | Ast.IfExpr (_, i) -> lower_if env st i
   | Ast.MatchExpr (nid, m) -> lower_match env st nid m
   | Ast.WhileExpr (_, w) -> lower_while env st w
-  | Ast.LoopExpr (_, b, _) -> lower_loop env st b
+  | Ast.LoopExpr (nid, b, _) -> lower_loop env st nid b
   | Ast.Block (_, b, _) -> lower_block env st b
   | Ast.ReturnExpr (_, Some e, _) ->
       let vo, _ = lower_expr env st e in
@@ -1183,7 +1207,7 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
                    (* the GLOBAL write: store into the statics slot *)
                    emit st
                      (Seed_mir.Assign
-                        ( { Seed_mir.local = -1 - idx; projections = [] },
+                        ( { Seed_mir.root = Seed_mir.Static idx; projections = [] },
                           Seed_mir.Use vo ));
                    (vo, vt)
                | None -> (
@@ -1369,7 +1393,7 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
                    ( cur_place st eid,
                      Seed_mir.Use
                        (Seed_mir.Copy
-                          { Seed_mir.local = sid;
+                          { Seed_mir.root = Seed_mir.Local sid;
                             projections =
                               [ Seed_mir.Downcast err_vid; Seed_mir.ConstantIndex 0 ] }) ));
               (match env.fn_ret with
@@ -1387,7 +1411,7 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
       push_block st success;
       set_terminator_to st (Seed_mir.Goto join) join;
       ( Seed_mir.Copy
-          { Seed_mir.local = sid; projections = [ Seed_mir.Downcast ok_vid; Seed_mir.ConstantIndex 0 ] },
+          { Seed_mir.root = Seed_mir.Local sid; projections = [ Seed_mir.Downcast ok_vid; Seed_mir.ConstantIndex 0 ] },
         payload_ty ))
   | Ast.ForExpr (fid, f) -> (
       (* the SEMANTIC bindings: the typechecker's typed-for channel
@@ -1485,7 +1509,7 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
                        ( cur_place st id,
                          Seed_mir.Use
                            (Seed_mir.Copy
-                              { Seed_mir.local = arr_id.Seed_mir.local;
+                              { Seed_mir.root = arr_id.Seed_mir.root;
                                 projections = arr_id.Seed_mir.projections @ projections }) )))
                 bindings;
               ignore (lower_block env st f.Ast.for_body))
@@ -1519,10 +1543,24 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
             (Seed_mir.SwitchInt
                (copy_place st (cur_place st cnd_id), [ (1L, body_b) ], join_b));
           push_block st body_b;
-          (match f.Ast.for_pattern with
-           | Ast.PatIdent (n, _, _) -> st.scope <- (n, cid) :: st.scope
-           | Ast.Wildcard _ -> ()
-           | _ -> seed_bug "unsupported range for-loop pattern in lowering (bind by name or _)");
+          (* re-audit P0 (item 9): the range loop binds through the
+             SEMANTIC pattern when the typed-for channel is present —
+             the driver path always carries it; the raw-syntax match is
+             the hand-built-selfcheck fallback only *)
+          (match typed_for_of st fid with
+           | Some tf -> (
+               match tf.Typecheck.tf_pattern with
+               | Typed_pattern.TP_binding (n, _, _) -> st.scope <- (n, cid) :: st.scope
+               | Typed_pattern.TP_wildcard -> ()
+               | _ ->
+                   seed_bug
+                     "unsupported semantic range for-loop pattern in lowering (a range binds a single name or _)")
+           | None -> (
+               match f.Ast.for_pattern with
+               | Ast.PatIdent (n, _, _) -> st.scope <- (n, cid) :: st.scope
+               | Ast.Wildcard _ -> ()
+               | _ ->
+                   seed_bug "unsupported range for-loop pattern in lowering (bind by name or _)"));
           let saved_break = st.break_target in
           let saved_continue = st.continue_target in
           st.break_target <- Some join_b;
@@ -1637,7 +1675,7 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
                        ( cur_place st id,
                          Seed_mir.Use
                            (Seed_mir.Copy
-                              { Seed_mir.local = arr_id.Seed_mir.local;
+                              { Seed_mir.root = arr_id.Seed_mir.root;
                                 projections }) )))
                 bindings;
               let saved_break = st.break_target in
@@ -1663,9 +1701,72 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
               (* the runtime collection loop: the counter counts from 0
                  to Len(container); each iteration reads the element
                  through the dynamic Seed_mir.Index <counter> — the VM
-                 bounds-checks the runtime index (the audit: runtime
-                 Vec/Array iteration is a required typed subform) *)
+                 bounds-checks the runtime index.  The Set/Map checks
+                 run on the CONTAINER type BEFORE the element
+                 reduction (re-audit order fix: the reduction shadowed
+                 the nominal, so the entries protocol never fired and
+                 the loop fell through to a bogus element access).  For
+                 the Set/Map nominals the ENTRIES protocol is
+                 materialized first (the __intrinsic_set_entries /
+                 __intrinsic_map_entries calls) and the counter runs
+                 over the entries array — never a pretend Set[i] /
+                 Map[i] random access. *)
               let arr_id = materialize_place st arr_op in
+              let is_set =
+                match arr_ty with
+                | Type_repr.Named (id, _)
+                  when Ids.Type_id.compare id (Ids.Type_id.make 2) = 0 ->
+                    true
+                | _ -> false
+              in
+              let is_map =
+                match arr_ty with
+                | Type_repr.Named (id, _)
+                  when Ids.Type_id.compare id (Ids.Type_id.make 1) = 0 ->
+                    true
+                | _ -> false
+              in
+              let elem_ty = element_type_of arr_ty in
+              (* the entries materialization: the Set/Map -> the entries
+                 array, cached in a fresh local typed as the entries
+                 array (the host's __intrinsic_set_entries returns the
+                 element array — the canonical Fixed_array base the
+                 dynamic Index projection needs) *)
+              let entries_ty = Type_repr.Fixed_array (elem_ty, 0) in
+              let container_place =
+                if is_set || is_map then begin
+                  let eid = fresh_local st entries_ty in
+                  let intrinsic =
+                    if is_set then "__intrinsic_set_entries" else "__intrinsic_map_entries"
+                  in
+                  let iid =
+                    match Intrinsic_registry.lookup Intrinsic_registry.manifest ~name:intrinsic with
+                    | Some (iid, _) -> iid
+                    | None -> seed_bug "missing registry declaration for %s" intrinsic
+                  in
+                  let arg_vals =
+                    [|
+                      {
+                        Seed_mir.effect_ = Access_effect.Read;
+                        value = Seed_mir.Copy arr_id;
+                      };
+                    |]
+                  in
+                  let next_b = new_block st in
+                  set_terminator_to st
+                    (Seed_mir.Call
+                       ( cur_place st eid,
+                         Seed_mir.Intrinsic (Intrinsic_registry.Id.to_int iid),
+                         arg_vals, next_b, None ))
+                    next_b;
+                  cur_place st eid
+                end
+                else arr_id
+              in
+              let arr_id = container_place in
+              let arr_ty =
+                if is_set || is_map then entries_ty else arr_ty
+              in
               let len_id = fresh_local st (Type_repr.Int Type_repr.UInt) in
               emit st
                 (Seed_mir.Assign
@@ -1752,7 +1853,7 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
                        ( cur_place st id,
                          Seed_mir.Use
                            (Seed_mir.Copy
-                              { Seed_mir.local = arr_id.Seed_mir.local;
+                              { Seed_mir.root = arr_id.Seed_mir.root;
                                 projections = arr_id.Seed_mir.projections @ projections }) )))
                 bindings;
               let saved_break = st.break_target in
@@ -1994,6 +2095,15 @@ and lower_stmt (env : func_env) (st : lower_state) (s : Ast.stmt) : unit =
   | Ast.LetBinding (pat, _, _ty, value, _) ->
       let vo, vt = lower_expr env st value in
       let id = fresh_local st vt in
+      (* the owning-value binding: a non-Copy initializer transfers
+         ownership (Move) — a bitwise Copy of an owning type is exactly
+         what the verifier rejects (an intrinsic/collection result is
+         owned by the caller, so the single-use binding moves it) *)
+      let vo =
+        match vo with
+        | Seed_mir.Copy p when not (copyable_ty vt) -> Seed_mir.Move p
+        | op -> op
+      in
       emit st (Seed_mir.Assign (cur_place st id, Seed_mir.Use vo));
       let bind_name n bind_id =
         st.local_names <- (bind_id, n) :: st.local_names;
@@ -2018,14 +2128,16 @@ and lower_stmt (env : func_env) (st : lower_state) (s : Ast.stmt) : unit =
         go [] tp
       in
       let bindings =
-        match value with
-        | Ast.Name (nid, _, _) | Ast.Field (nid, _, _, _) -> (
-            match typed_let_of st nid with
-            | Some tp -> semantic_bindings_of tp
-            | None ->
-                (* the syntactic fallback: only for hand-built selfcheck
-                   envs (the driver path always carries the channel) *)
-                (match pat with
+        (* the universal channel (re-audit item 9): the semantic pattern
+           is consulted for EVERY initializer form, keyed by the
+           initializer's NodeId — `let (a, b) = get_pair()` resolves
+           semantically exactly like `let (a, b) = pair`; the syntactic
+           fallback remains only for hand-built selfcheck envs (the
+           driver path always carries the channel) *)
+        match typed_let_of st (Ast.expr_node_id value) with
+        | Some tp -> semantic_bindings_of tp
+        | None -> (
+            match pat with
                  | Ast.PatIdent (n, _, _) -> [ (n, id, []) ]
                  | Ast.PatTuple (subs, _) ->
                      List.mapi
@@ -2055,29 +2167,7 @@ and lower_stmt (env : func_env) (st : lower_state) (s : Ast.stmt) : unit =
                                "unsupported destructuring let pattern in lowering")
                        subs
                  | Ast.Wildcard _ | Ast.PatLiteral _ -> []
-                 | _ -> []))
-        | _ -> (
-            match pat with
-            | Ast.PatIdent (n, _, _) -> [ (n, id, []) ]
-            | Ast.PatTuple (subs, _) ->
-                List.mapi
-                  (fun k sub ->
-                    match sub with
-                    | Ast.PatIdent (n, _, _) ->
-                        let cty =
-                          match vt with
-                          | Type_repr.Tuple elems when k < Array.length elems -> elems.(k)
-                          | _ ->
-                              seed_bug
-                                "destructuring let pattern against a non-tuple value type"
-                        in
-                        (n, fresh_local st cty, [ k ])
-                    | Ast.Wildcard _ ->
-                        ("__wild" ^ string_of_int k, fresh_local st Type_repr.Unit, [ k ])
-                    | _ -> seed_bug "unsupported destructuring let pattern in lowering")
-                  subs
-            | Ast.Wildcard _ | Ast.PatLiteral _ -> []
-            | _ -> [])
+                 | _ -> [])
       in
       List.iter
         (fun (n, bind_id, path) ->
@@ -2097,7 +2187,7 @@ and lower_stmt (env : func_env) (st : lower_state) (s : Ast.stmt) : unit =
                    ( cur_place st cid,
                      Seed_mir.Use
                        (Seed_mir.Copy
-                          { Seed_mir.local = id;
+                          { Seed_mir.root = Seed_mir.Local id;
                             projections =
                               List.map (fun k -> Seed_mir.ConstantIndex k) ks }) ));
               bind_name n cid)
@@ -2368,7 +2458,7 @@ and lower_match_syntactic (env : func_env) (st : lower_state) (m : Ast.match_exp
                          ( cur_place st id,
                            Seed_mir.Use
                              (Seed_mir.Copy
-                                { Seed_mir.local = sid;
+                                { Seed_mir.root = Seed_mir.Local sid;
                                   projections =
                                     [
                                       Seed_mir.Downcast (semantic_variant_id spec);
@@ -2400,7 +2490,7 @@ and lower_match_syntactic (env : func_env) (st : lower_state) (m : Ast.match_exp
                         ( cur_place st pid,
                           Seed_mir.Use
                             (Seed_mir.Copy
-                               { Seed_mir.local = sid;
+                               { Seed_mir.root = Seed_mir.Local sid;
                                  projections =
                                    [ Seed_mir.Downcast (semantic_variant_id spec); Seed_mir.ConstantIndex j ]
                                }) ));
@@ -2443,7 +2533,7 @@ and lower_match_syntactic (env : func_env) (st : lower_state) (m : Ast.match_exp
                         ( cur_place st pid,
                           Seed_mir.Use
                             (Seed_mir.Copy
-                               { Seed_mir.local = sid;
+                               { Seed_mir.root = Seed_mir.Local sid;
                                  projections =
                                    [ Seed_mir.Downcast (semantic_variant_id spec); Seed_mir.ConstantIndex j ]
                                }) ));
@@ -2488,7 +2578,7 @@ and lower_match_syntactic (env : func_env) (st : lower_state) (m : Ast.match_exp
                         ( cur_place st pid,
                           Seed_mir.Use
                             (Seed_mir.Read
-                               { Seed_mir.local = sid;
+                               { Seed_mir.root = Seed_mir.Local sid;
                                  projections =
                                    [ Seed_mir.Downcast (semantic_variant_id spec); Seed_mir.ConstantIndex j ]
                                }) ));
@@ -2527,7 +2617,7 @@ and lower_match_syntactic (env : func_env) (st : lower_state) (m : Ast.match_exp
                         ( cur_place st pid,
                           Seed_mir.Use
                             (Seed_mir.Copy
-                               { Seed_mir.local = sid;
+                               { Seed_mir.root = Seed_mir.Local sid;
                                  projections =
                                    [ Seed_mir.Downcast (semantic_variant_id spec); Seed_mir.ConstantIndex j ]
                                }) ));
@@ -2577,7 +2667,7 @@ and lower_match_syntactic (env : func_env) (st : lower_state) (m : Ast.match_exp
                                 ( cur_place st id,
                                   Seed_mir.Use
                                     (Seed_mir.Copy
-                                       { Seed_mir.local = sid;
+                                       { Seed_mir.root = Seed_mir.Local sid;
                                          projections =
                                            [ Seed_mir.Downcast (semantic_variant_id spec); Seed_mir.ConstantIndex j ]
                                            @ projs }) ));
@@ -2605,7 +2695,7 @@ and lower_match_syntactic (env : func_env) (st : lower_state) (m : Ast.match_exp
                         ( cur_place st pid,
                           Seed_mir.Use
                             (Seed_mir.Copy
-                               { Seed_mir.local = sid;
+                               { Seed_mir.root = Seed_mir.Local sid;
                                  projections =
                                    [ Seed_mir.Downcast (semantic_variant_id spec); Seed_mir.ConstantIndex j ]
                                }) ));
@@ -2665,7 +2755,7 @@ and lower_match_syntactic (env : func_env) (st : lower_state) (m : Ast.match_exp
                                 ( cur_place st id,
                                   Seed_mir.Use
                                     (Seed_mir.Copy
-                                       { Seed_mir.local = sid;
+                                       { Seed_mir.root = Seed_mir.Local sid;
                                          projections =
                                            [
                                              Seed_mir.Downcast (semantic_variant_id spec);
@@ -2747,7 +2837,7 @@ and lower_match_syntactic (env : func_env) (st : lower_state) (m : Ast.match_exp
                         ( cur_place st id,
                           Seed_mir.Use
                             (Seed_mir.Copy
-                               { Seed_mir.local = sid;
+                               { Seed_mir.root = Seed_mir.Local sid;
                                  projections = base_projs @ projs }) ));
                    st.scope <- (name, id) :: st.scope)
                | _ -> ())
@@ -2776,7 +2866,7 @@ and lower_match_syntactic (env : func_env) (st : lower_state) (m : Ast.match_exp
                         ( cur_place st id,
                           Seed_mir.Use
                             (Seed_mir.Copy
-                               { Seed_mir.local = sid;
+                               { Seed_mir.root = Seed_mir.Local sid;
                                  projections = [ Seed_mir.ConstantIndex k ] }) ));
                    st.scope <- (name, id) :: st.scope)
                | Ast.PatVariant (seg1, seg2, spats, _) -> (
@@ -2787,7 +2877,7 @@ and lower_match_syntactic (env : func_env) (st : lower_state) (m : Ast.match_exp
                         ( cur_place st eid,
                           Seed_mir.Use
                             (Seed_mir.Copy
-                               { Seed_mir.local = sid;
+                               { Seed_mir.root = Seed_mir.Local sid;
                                  projections = [ Seed_mir.ConstantIndex k ] }) ));
                    let nested_spec =
                      variant_spec_of env st.variants ~enum_name:seg1 ~vname:seg2 ~repr:ety
@@ -2830,7 +2920,7 @@ and lower_match_syntactic (env : func_env) (st : lower_state) (m : Ast.match_exp
                                 ( cur_place st id,
                                   Seed_mir.Use
                                     (Seed_mir.Copy
-                                       { Seed_mir.local = sid;
+                                       { Seed_mir.root = Seed_mir.Local sid;
                                          projections =
                                            [
                                              Seed_mir.ConstantIndex k;
@@ -3227,7 +3317,7 @@ and lower_match_typed (env : func_env) (st : lower_state) (nid : Ids.Node_id.t)
                              ( cur_place st id,
                                Seed_mir.Use
                                  (Seed_mir.Copy
-                                    { Seed_mir.local = sid; projections = [ Seed_mir.ConstantIndex k ] }) ));
+                                    { Seed_mir.root = Seed_mir.Local sid; projections = [ Seed_mir.ConstantIndex k ] }) ));
                         if not (List.mem_assoc name plan) then
                           st.scope <- (name, id) :: st.scope)
                     | Typed_pattern.TP_wildcard -> ()
@@ -3292,7 +3382,7 @@ and lower_match_typed (env : func_env) (st : lower_state) (nid : Ids.Node_id.t)
                         ( cur_place st id,
                           Seed_mir.Use
                             (Seed_mir.Copy
-                               { Seed_mir.local = sid; projections = [ Seed_mir.ConstantIndex k ] }) ));
+                               { Seed_mir.root = Seed_mir.Local sid; projections = [ Seed_mir.ConstantIndex k ] }) ));
                    st.scope <- (name, id) :: st.scope)
                | Typed_pattern.TP_variant (nvid, nty, npats) -> (
                    let eid = fresh_local st nty in
@@ -3301,7 +3391,7 @@ and lower_match_typed (env : func_env) (st : lower_state) (nid : Ids.Node_id.t)
                         ( cur_place st eid,
                           Seed_mir.Use
                             (Seed_mir.Copy
-                               { Seed_mir.local = sid; projections = [ Seed_mir.ConstantIndex k ] }) ));
+                               { Seed_mir.root = Seed_mir.Local sid; projections = [ Seed_mir.ConstantIndex k ] }) ));
                    let ok_b = new_block st in
                    discriminant_test (enum_name_of_ty env nty) (cur_place st eid) nvid nty ok_b (fail_b i);
                    st.cur_block <- ok_b;
@@ -3347,8 +3437,8 @@ and lower_while (env : func_env) (st : lower_state) (w : Ast.while_expr) :
   push_block st join_b;
   (Seed_mir.Constant Seed_mir.Unit, Type_repr.Unit)
 
-and lower_loop (env : func_env) (st : lower_state) (b : Ast.block_body) :
-    Seed_mir.operand * Type_repr.t =
+and lower_loop (env : func_env) (st : lower_state) (nid : Ids.Node_id.t)
+    (b : Ast.block_body) : Seed_mir.operand * Type_repr.t =
   let body_b = new_block st in
   let join_b = new_block st in
   set_terminator st (Seed_mir.Goto body_b);
@@ -3362,7 +3452,10 @@ and lower_loop (env : func_env) (st : lower_state) (b : Ast.block_body) :
   st.continue_target <- saved_continue;
   set_terminator st (Seed_mir.Goto body_b);
   push_block st join_b;
-  (Seed_mir.Constant Seed_mir.Unit, Type_repr.Unit)
+  (* re-audit P0: the loop's RESULT type is the checker's resolved type
+     — a return-only loop is Never, so the enclosing function tail
+     skips the fallthrough return-slot assignment *)
+  (Seed_mir.Constant Seed_mir.Unit, call_result_ty st nid Type_repr.Unit)
 
 and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
     (callee : Ast.expr) (args : Ast.call_arg list) : Seed_mir.operand * Type_repr.t =
@@ -3419,6 +3512,7 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
               let ty =
                 match List.assoc_opt n env.values with Some t -> t | None -> Type_repr.Unit
               in
+              let ty = call_result_ty st node_id ty in
               let arg_ops_ty = List.map (fun a -> lower_expr env st a.Ast.ca_value) args in
               let arg_ops =
                 List.map2
@@ -3503,6 +3597,10 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
                       | "Array" -> [ "Array"; "Vec" ]
                       | "String" -> [ "String"; "str" ]
                       | "str" -> [ "str"; "String" ]
+                      | "Set" -> [ "Set"; "HashSet" ]
+                      | "HashSet" -> [ "HashSet"; "Set" ]
+                      | "Map" -> [ "Map"; "HashMap" ]
+                      | "HashMap" -> [ "HashMap"; "Map" ]
                       | q -> [ q ]
                     in
                     let rec find_method = function
@@ -3514,7 +3612,71 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
                     in
                     (match find_method candidate_owners with
                      | Some me -> (
-                         let nparams = Array.length me.me_params in
+                         (* the intrinsic channel (audit §70): the
+                            builtin collection methods (Set/Map
+                            constructors + receiver methods) dispatch
+                            to the host's intrinsic table — the
+                            executable closure for the builtin surface.
+                            The constructor-style methods
+                            (`Set::new`, `Map::new`) declare a
+                            SYNTHETIC self (the checker's type-as-value
+                            fiction, prepended by the qualified-call
+                            check), so the intrinsic call DROPS the
+                            receiver and maps the source args onto the
+                            intrinsic's params; the intrinsic signature
+                            is authoritative for the arity (the
+                            registry check below falls through to the
+                            fail-closed receiver rule for methods
+                            without an intrinsic binding). *)
+                         let intrinsic_channel () =
+                           let rec find_intrinsic = function
+                             | [] -> None
+                             | o :: rest -> (
+                                 let iname =
+                                   "__intrinsic_"
+                                   ^ String.lowercase_ascii (o ^ "_" ^ mname)
+                                 in
+                                 match
+                                   Intrinsic_registry.lookup
+                                     Intrinsic_registry.manifest ~name:iname
+                                 with
+                                 | Some (iid, _) -> Some iid
+                                 | None -> find_intrinsic rest)
+                           in
+                           find_intrinsic candidate_owners
+                         in
+                         (match intrinsic_channel () with
+                          | Some iid ->
+                              let arg_ops =
+                                List.map
+                                  (fun a -> fst (lower_expr env st a.Ast.ca_value))
+                                  args
+                              in
+                              let arg_vals =
+                                Array.of_list
+                                  (List.map
+                                     (fun op ->
+                                       {
+                                         Seed_mir.effect_ = Access_effect.Read;
+                                         value = op;
+                                       })
+                                     arg_ops)
+                              in
+                              let id = fresh_local st me.me_ret in
+                              let rp = cur_place st id in
+                              let next_b = new_block st in
+                              set_terminator_to st
+                                (Seed_mir.Call
+                                   ( rp,
+                                     Seed_mir.Intrinsic
+                                       (Intrinsic_registry.Id.to_int iid),
+                                     arg_vals,
+                                     next_b,
+                                     None ))
+                                next_b;
+                              (copy_place st rp, call_result_ty st node_id me.me_ret)
+                          | None ->
+                              let nparams = Array.length me.me_params in
                          (* the checker PREPENDS a synthetic receiver (the
                             type used as a value) exactly when the method's
                             first parameter is a self of the OWNER's own
@@ -3591,7 +3753,7 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
                          set_terminator_to st
                            (Seed_mir.Call (rp, Seed_mir.User instance, arg_vals, next_b, None))
                            next_b;
-                         (copy_place st rp, me.me_ret))
+                         (copy_place st rp, call_result_ty st node_id me.me_ret)))
                      | None -> (
                          (* the mangled free function: `String::new`
                             dispatches to the compiler constructor
@@ -3601,7 +3763,55 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
                          let mangled = String.lowercase_ascii qual ^ "_" ^ mname in
                          match List.assoc_opt mangled env.callables with
                          | None ->
-                             seed_bug "unknown callee '%s' in lowering" n
+                             (* the intrinsic/extern fallback: a
+                                `__intrinsic_*`-named callee dispatches
+                                to the seed host's typed binding table
+                                (the same registry the closure check
+                                resolves) *)
+                             let ty =
+                               match List.assoc_opt n env.values with
+                               | Some t -> t
+                               | None -> Type_repr.Unit
+                             in
+                             let arg_ops =
+                               List.map
+                                 (fun a -> fst (lower_expr env st a.Ast.ca_value))
+                                 args
+                             in
+                             let arg_vals =
+                               Array.of_list
+                                 (List.map
+                                    (fun op ->
+                                      {
+                                        Seed_mir.effect_ = Access_effect.Read;
+                                        value = op;
+                                      })
+                                    arg_ops)
+                             in
+                             let id = fresh_local st ty in
+                             let rp = cur_place st id in
+                             let next_b = new_block st in
+                             let callee_of =
+                               match
+                                 Intrinsic_registry.lookup Intrinsic_registry.manifest
+                                   ~name:n
+                               with
+                               | Some (iid, _) ->
+                                   Seed_mir.Intrinsic (Intrinsic_registry.Id.to_int iid)
+                               | None -> (
+                                   match
+                                     Extern_registry.lookup Extern_registry.manifest
+                                       ~name:n
+                                   with
+                                   | Some (eid, _) ->
+                                       Seed_mir.Extern (Extern_registry.Id.to_int eid)
+                                   | None ->
+                                       seed_bug "unknown callee '%s' in lowering" n)
+                             in
+                             set_terminator_to st
+                               (Seed_mir.Call (rp, callee_of, arg_vals, next_b, None))
+                               next_b;
+                             (copy_place st rp, ty)
                          | Some entry ->
                              let cid = entry.ce_callable in
                              let ty =
@@ -3612,6 +3822,7 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
                                    | Some t -> t
                                    | None -> Type_repr.Unit)
                              in
+                             let ty = call_result_ty st node_id ty in
                              let arg_ops =
                                List.map (fun a -> fst (lower_expr env st a.Ast.ca_value)) args
                              in
@@ -3632,23 +3843,48 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
                                     arg_ops)
                              in
                              let next_b = new_block st in
-                             let tn_call =
-                               match typed_node_of st node_id with
-                               | Some node -> node.tn_call
-                               | None -> None
-                             in
-                             let instance =
-                               match tn_call with
-                               | Some (callable, type_args) ->
-                                   Instance_id.make ~callable ~type_args
-                               | None ->
-                                   Instance_id.make
-                                     ~callable:(Ids.Callable_id.make cid)
-                                     ~type_args:[||]
-                             in
-                             set_terminator_to st
-                               (Seed_mir.Call (rp, Seed_mir.User instance, arg_vals, next_b, None))
-                               next_b;
+                             (* the intrinsic channel (audit §70): a
+                                mangled compiler constructor with an
+                                intrinsic binding (`set_new`,
+                                `map_new` — the free-function surface of
+                                the host's executable closure) dispatches
+                                to the intrinsic table; the User path
+                                stays for the kernel callables with MIR
+                                bodies. *)
+                             let intrinsic_name = "__intrinsic_" ^ mangled in
+                             (match
+                                Intrinsic_registry.lookup Intrinsic_registry.manifest
+                                  ~name:intrinsic_name
+                              with
+                             | Some (iid, _) ->
+                                 set_terminator_to st
+                                   (Seed_mir.Call
+                                      ( rp,
+                                        Seed_mir.Intrinsic
+                                          (Intrinsic_registry.Id.to_int iid),
+                                        arg_vals,
+                                        next_b,
+                                        None ))
+                                   next_b
+                             | None ->
+                                 let tn_call =
+                                   match typed_node_of st node_id with
+                                   | Some node -> node.tn_call
+                                   | None -> None
+                                 in
+                                 let instance =
+                                   match tn_call with
+                                   | Some (callable, type_args) ->
+                                       Instance_id.make ~callable ~type_args
+                                   | None ->
+                                       Instance_id.make
+                                         ~callable:(Ids.Callable_id.make cid)
+                                         ~type_args:[||]
+                                 in
+                                 set_terminator_to st
+                                   (Seed_mir.Call
+                                      (rp, Seed_mir.User instance, arg_vals, next_b, None))
+                                   next_b);
                              (copy_place st rp, ty)))
                 | _ -> seed_bug "unknown callee '%s' in lowering" n
               in
@@ -3752,11 +3988,78 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
                        })
                      arg_ops)
            in
-           let next_b = new_block st in
-           set_terminator_to st
-             (Seed_mir.Call (rp2, Seed_mir.User instance, arg_vals, next_b, None))
-             next_b;
-           (copy_place st rp2, me.me_ret))))
+           (* the intrinsic channel (audit §70): the builtin collection
+              receiver methods (Set/Map insert/contains/len/...) map
+              self + args onto the host's intrinsic table — the
+              executable closure for the builtin surface.  The
+              registry lookup is the DECLARED-symbol check: a builtin
+              method without an intrinsic binding keeps the User path
+              (fail-closed at the VM's instance resolution). *)
+           let intrinsic_name =
+             "__intrinsic_" ^ String.lowercase_ascii (owner ^ "_" ^ mname)
+           in
+           (match
+              Intrinsic_registry.lookup Intrinsic_registry.manifest
+                ~name:intrinsic_name
+            with
+           | Some (iid, isig) ->
+               (* the inout writeback (review fix): the mutating
+                  collection intrinsics (set_insert/map_insert — the
+                  registry declares their RESULT as the updated
+                  collection) cannot mutate the receiver through the
+                  host-call path (args are values), so the call's dest
+                  is typed as the receiver's collection and the result
+                  is written back into the receiver slot — the seed's
+                  inout approximation made real for the runtime
+                  collections.  The writeback fires exactly when the
+                  intrinsic's declared result is a collection AND the
+                  receiver is the same-kind collection. *)
+               let ret_is_collection =
+                 match isig.Intrinsic_registry.ret with
+                 | Type_repr.Named (tid, _)
+                   when Ids.Type_id.compare tid (Intrinsic_registry.Type_id.set) = 0 ->
+                     (match rty with
+                      | Type_repr.Named (tid2, _)
+                        when Ids.Type_id.compare tid2 (Ids.Type_id.make 2) = 0 ->
+                          true
+                      | _ -> false)
+                 | Type_repr.Named (tid, _)
+                   when Ids.Type_id.compare tid (Intrinsic_registry.Type_id.map) = 0 ->
+                     (match rty with
+                      | Type_repr.Named (tid2, _)
+                        when Ids.Type_id.compare tid2 (Ids.Type_id.make 1) = 0 ->
+                          true
+                      | _ -> false)
+                 | _ -> false
+               in
+               let dest_ty = if ret_is_collection then rty else me.me_ret in
+               let did = fresh_local st dest_ty in
+               let drp = cur_place st did in
+               let next_b = new_block st in
+               set_terminator_to st
+                 (Seed_mir.Call
+                    ( drp,
+                      Seed_mir.Intrinsic (Intrinsic_registry.Id.to_int iid),
+                      arg_vals,
+                      next_b,
+                      None ))
+                 next_b;
+               (* the writeback statement lands in the call's
+                  continuation block: set_terminator_to already switched
+                  the current block to `next_b`, so a plain emit appends
+                  to it — the statement sequence then advances there *)
+               if ret_is_collection then
+                 emit st
+                   (Seed_mir.Assign
+                      ( rp,
+                        Seed_mir.Use (Seed_mir.Move drp) ));
+               (copy_place st drp, call_result_ty st nid me.me_ret)
+           | None ->
+               let next_b = new_block st in
+               set_terminator_to st
+                 (Seed_mir.Call (rp2, Seed_mir.User instance, arg_vals, next_b, None))
+                 next_b;
+               (copy_place st rp2, call_result_ty st nid me.me_ret)))))
   | _ -> seed_bug "unsupported callee form in lowering"
 
 and emit_defers (env : func_env) (st : lower_state) : unit =
@@ -3829,7 +4132,13 @@ let lower_function_with_variants
      order) *)
   emit_defers env st;
   (match result with
-   | Some (vo, _) -> emit st (Seed_mir.Assign (cur_place st 0, Seed_mir.Use vo))
+   | Some (vo, ty) ->
+       (* re-audit P0: a Never tail (a return-only loop / diverging
+          tail) never falls through — the explicit return paths assign
+          the slot; assigning a Unit constant would corrupt the slot *)
+       (match ty with
+        | Type_repr.Never -> ()
+        | _ -> emit st (Seed_mir.Assign (cur_place st 0, Seed_mir.Use vo)))
    | None -> ());
   set_terminator st Seed_mir.Ret;
   let params =
@@ -3864,16 +4173,13 @@ let lower_function (env : func_env) (name : string) (callable : int) (fn : Ast.f
     Seed_mir.function_ =
   lower_function_with_variants default_variant_table env name callable [||] [||] fn
 
-(* ── Statics/consts (audit §35) ─────────────────────────────────
-   TODO: Ast.ConstDecl/Ast.StaticDecl exist and the typechecker keeps a
-   `consts` registry, but the Mir_lower API carries no const/static
-   value table and every caller (driver.ml) passes `statics = [||]`.
-   A const/static reference in lowering position therefore reaches
-   lower_expr's Name case without a scope/callable/constructor entry and
-   fails closed with `unknown value` — the seed does not invent a
-   representation for typechecker-registered consts it cannot lower
-   soundly (a const is a value, not an addressable global, and the
-   seed's operands have no init/load form).  Wiring real consts into
+(* ── Statics/consts (audit §35; re-audit item 19 — the stale TODO is
+   gone) ──────────────────────────────────────────────────────────
+   MUTABLE statics are fully wired: the driver's closure_statics feeds
+   (name, type, mutable, initializer) into program.statics; lowering
+   reads/writes Static-root places; the VM materializes the shared
+   slots; the verifier enforces the mutability.  CONST declarations
+   (immutable compile-time values) remain a follow-up: wiring them into
    func_env (name -> (repr, constant)) and lowering Name references to
-   Constant operands is the follow-up; it requires extending the
-   Mir_lower API and the driver's lowering_env_of together. *)
+   Constant operands requires extending the Mir_lower API and the
+   driver's lowering_env_of together. *)

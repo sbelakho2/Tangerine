@@ -49,7 +49,7 @@ let mk_fn (param_ty : Type_repr.t) (slot1_ty : Type_repr.t) : Seed_mir.function_
           statements =
             [
               Seed_mir.Assign
-                ( { Seed_mir.local = 0; projections = [] },
+                ( { Seed_mir.root = Seed_mir.Local 0; projections = [] },
                   Seed_mir.Use
                     (Seed_mir.Constant
                        (Seed_mir.Integer (Int_value.of_int64 ~width:64 ~signed:true 42L))) );

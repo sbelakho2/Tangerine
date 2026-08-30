@@ -79,6 +79,7 @@ let named (id : Ids.Type_id.t) (args : Type_repr.t array) : Type_repr.t =
   Type_repr.Named (id, args)
 let option_of (t : Type_repr.t) : Type_repr.t = named Type_id.option_ [| t |]
 let vec_of (t : Type_repr.t) : Type_repr.t = named Type_id.vec [| t |]
+let tuple_of (elems : Type_repr.t array) : Type_repr.t = Type_repr.Tuple elems
 let map_of (k : Type_repr.t) (v : Type_repr.t) : Type_repr.t = named Type_id.map [| k; v |]
 let set_of (t : Type_repr.t) : Type_repr.t = named Type_id.set [| t |]
 let ruby_value : Type_repr.t = named Type_id.ruby_value [||]
@@ -179,6 +180,35 @@ let signature_to_string (s : signature) : string =
 let manifest : t =
   let entries =
     [
+      ( "__intrinsic_map_new",
+        sig_ ~params:[||] ~ret:(map_of (param Type_param.k) (param Type_param.v)) );
+      ( "__intrinsic_map_get",
+        sig_
+          ~params:[| map_of (param Type_param.k) (param Type_param.v); param Type_param.k |]
+          ~ret:(option_of (param Type_param.v)) );
+      ( "__intrinsic_map_insert",
+        sig_
+          ~params:
+            [| map_of (param Type_param.k) (param Type_param.v); param Type_param.k;
+               param Type_param.v |]
+          ~ret:(map_of (param Type_param.k) (param Type_param.v)) );
+      ( "__intrinsic_map_contains_key",
+        sig_
+          ~params:[| map_of (param Type_param.k) (param Type_param.v); param Type_param.k |]
+          ~ret:ty_bool );
+      ( "__intrinsic_map_len",
+        sig_ ~params:[| map_of (param Type_param.k) (param Type_param.v) |] ~ret:ty_int );
+      ( "__intrinsic_map_entries",
+        sig_
+          ~params:[| map_of (param Type_param.k) (param Type_param.v) |]
+          ~ret:(vec_of (tuple_of [| param Type_param.k; param Type_param.v |])) );
+      ( "__intrinsic_set_new",
+        sig_ ~params:[||] ~ret:(set_of (param Type_param.t)) );
+      ( "__intrinsic_set_insert",
+        sig_ ~params:[| set_of (param Type_param.t); param Type_param.t |]
+          ~ret:(set_of (param Type_param.t)) );
+      ( "__intrinsic_set_contains",
+        sig_ ~params:[| set_of (param Type_param.t); param Type_param.t |] ~ret:ty_bool );
       ( "__intrinsic_map_visit_begin",
         sig_
           ~params:[| map_of (param Type_param.k) (param Type_param.v) |]

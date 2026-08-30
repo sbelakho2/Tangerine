@@ -160,8 +160,8 @@ let call_fn (name : string) (cid : int) (callee : Seed_mir.callee)
     | None -> ([], [||], [| ret_ty |])
     | Some (arg_ty, c) ->
         ( [ Seed_mir.Assign
-              ({ local = 1; projections = [] }, Seed_mir.Use (Seed_mir.Constant c)) ],
-          [| { Seed_mir.effect_ = Access_effect.Read; value = Seed_mir.Copy { local = 1; projections = [] } } |],
+              ({ root = Seed_mir.Local 1; projections = [] }, Seed_mir.Use (Seed_mir.Constant c)) ],
+          [| { Seed_mir.effect_ = Access_effect.Read; value = Seed_mir.Copy { root = Seed_mir.Local 1; projections = [] } } |],
           [| ret_ty; arg_ty |] )
   in
   {
@@ -173,7 +173,7 @@ let call_fn (name : string) (cid : int) (callee : Seed_mir.callee)
       [|
         { id = 0;
           statements;
-          terminator = Seed_mir.Call ({ local = 0; projections = [] }, callee, args, 1, None) };
+          terminator = Seed_mir.Call ({ root = Seed_mir.Local 0; projections = [] }, callee, args, 1, None) };
         { id = 1; statements = []; terminator = Seed_mir.Ret };
       |];
     entry = 0;
@@ -279,9 +279,11 @@ let check_vm_dispatch () =
                  other
            | Error m -> fail "char-to-string inspect failed: %s" m))
    | Ok _ -> fail "char-to-string program returned a non-zero exit code");
-  (* declared-but-unbound symbol traps fail-closed *)
+  (* declared-but-unbound symbol traps fail-closed (the intrinsic
+     table's declared names without a host binding: __intrinsic_set_remove
+     is declared in the registry but has no binding in the default host) *)
   let p6 =
-    call_program (Seed_mir.Intrinsic (intrinsic_id "__intrinsic_set_len"))
+    call_program (Seed_mir.Intrinsic (intrinsic_id "__intrinsic_set_remove"))
       (Some (Type_repr.Unit, Seed_mir.Unit)) Type_repr.Unit
   in
   let e6 = p6.Seed_mir.functions.(0).Seed_mir.instance in

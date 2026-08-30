@@ -47,7 +47,7 @@ let int_const (n : int64) : Seed_mir.constant =
 let inst (n : int) : Instance_id.t =
   Instance_id.make ~callable:(Ids.Callable_id.make n) ~type_args:[||]
 
-let place (l : int) : Seed_mir.place = { Seed_mir.local = l; projections = [] }
+let place (l : int) : Seed_mir.place = { Seed_mir.root = Seed_mir.Local l; projections = [] }
 
 let copy (l : int) : Seed_mir.operand = Seed_mir.Copy (place l)
 let move (l : int) : Seed_mir.operand = Seed_mir.Move (place l)
@@ -619,7 +619,7 @@ let base_runtime_index () : Seed_mir.program =
                        [ const_op (int_const 10L); const_op (int_const 20L); const_op (int_const 30L) ]));
                 assign 2 (use_op (const_op (int_const 1L)));
                 assign 3
-                  (use_op (Seed_mir.Copy { Seed_mir.local = 1; projections = [ Seed_mir.Index 2 ] }));
+                  (use_op (Seed_mir.Copy { Seed_mir.root = Seed_mir.Local 1; projections = [ Seed_mir.Index 2 ] }));
                 assign 0 (use_op (copy 3));
               ];
             terminator = Seed_mir.Ret;
@@ -646,7 +646,7 @@ let mut_i1 () : Seed_mir.program =
                  [ const_op (int_const 10L); const_op (int_const 20L); const_op (int_const 30L) ]));
           assign 2 (use_op (const_op (int_const 1L)));
           assign 3
-            (use_op (Seed_mir.Copy { Seed_mir.local = 1; projections = [ Seed_mir.Index 9 ] }));
+            (use_op (Seed_mir.Copy { Seed_mir.root = Seed_mir.Local 1; projections = [ Seed_mir.Index 9 ] }));
           assign 0 (use_op (copy 3));
         ] };
   prog
@@ -667,7 +667,7 @@ let mut_i2 () : Seed_mir.program =
                (Seed_mir.ArrayAgg,
                  [ const_op (int_const 10L); const_op (int_const 20L); const_op (int_const 30L) ]));
           assign 3
-            (use_op (Seed_mir.Copy { Seed_mir.local = 1; projections = [ Seed_mir.Index 2 ] }));
+            (use_op (Seed_mir.Copy { Seed_mir.root = Seed_mir.Local 1; projections = [ Seed_mir.Index 2 ] }));
           assign 0 (use_op (copy 3));
         ] };
   prog
@@ -690,7 +690,7 @@ let mut_i3 () : Seed_mir.program =
                  [ const_op (int_const 10L); const_op (int_const 20L); const_op (int_const 30L) ]));
           assign 2 (use_op (const_op (Seed_mir.String "x")));
           assign 3
-            (use_op (Seed_mir.Copy { Seed_mir.local = 1; projections = [ Seed_mir.Index 2 ] }));
+            (use_op (Seed_mir.Copy { Seed_mir.root = Seed_mir.Local 1; projections = [ Seed_mir.Index 2 ] }));
           assign 0 (use_op (copy 3));
         ] };
   prog
@@ -717,7 +717,7 @@ let runtime_oob_prog () : Seed_mir.program =
                 assign 1 (Seed_mir.Aggregate (Seed_mir.ArrayAgg, [ const_op (int_const 10L) ]));
                 assign 2 (use_op (const_op (int_const 2L)));
                 assign 3
-                  (use_op (Seed_mir.Copy { Seed_mir.local = 1; projections = [ Seed_mir.Index 2 ] }));
+                  (use_op (Seed_mir.Copy { Seed_mir.root = Seed_mir.Local 1; projections = [ Seed_mir.Index 2 ] }));
                 assign 0 (use_op (copy 3));
               ];
             terminator = Seed_mir.Ret;
@@ -889,8 +889,8 @@ let valid_k1_field_owner_same () : Seed_mir.program =
               [ assign 0
                   (use_op
                      (Seed_mir.Copy
-                        { Seed_mir.local = 1;
-                          projections = [ Seed_mir.Field (Ids.Field_id.make 0) ] })) ];
+                        { Seed_mir.root = Seed_mir.Local 1;
+        projections = [ Seed_mir.Field (Ids.Field_id.make 0) ] })) ];
             terminator = Seed_mir.Ret };
         |];
       entry = 0;
@@ -915,8 +915,8 @@ let mut_k2_field_owner_mismatch () : Seed_mir.program =
               [ assign 0
                   (use_op
                      (Seed_mir.Copy
-                        { Seed_mir.local = 1;
-                          projections = [ Seed_mir.Field (Ids.Field_id.make 1) ] })) ];
+                        { Seed_mir.root = Seed_mir.Local 1;
+        projections = [ Seed_mir.Field (Ids.Field_id.make 1) ] })) ];
             terminator = Seed_mir.Ret };
         |];
       entry = 0;
@@ -940,8 +940,8 @@ let valid_k3_variant_owner_same () : Seed_mir.program =
               [ assign 0
                   (use_op
                      (Seed_mir.Copy
-                        { Seed_mir.local = 1;
-                          projections = [ Seed_mir.Downcast (Ids.Variant_id.make 0) ] })) ];
+                        { Seed_mir.root = Seed_mir.Local 1;
+        projections = [ Seed_mir.Downcast (Ids.Variant_id.make 0) ] })) ];
             terminator = Seed_mir.Ret };
         |];
       entry = 0;
@@ -966,8 +966,8 @@ let mut_k4_variant_owner_mismatch () : Seed_mir.program =
               [ assign 0
                   (use_op
                      (Seed_mir.Copy
-                        { Seed_mir.local = 1;
-                          projections = [ Seed_mir.Downcast (Ids.Variant_id.make 2) ] })) ];
+                        { Seed_mir.root = Seed_mir.Local 1;
+        projections = [ Seed_mir.Downcast (Ids.Variant_id.make 2) ] })) ];
             terminator = Seed_mir.Ret };
         |];
       entry = 0;

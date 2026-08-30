@@ -86,7 +86,7 @@ let tparam (n : int) : Type_repr.t = Type_repr.Type_param (Ids.Generic_param_id.
 let inst (callable : int) (args : Type_repr.t array) : Instance_id.t =
   Instance_id.make ~callable:(Ids.Callable_id.make callable) ~type_args:args
 
-let place (l : int) : Seed_mir.place = { Seed_mir.local = l; projections = [] }
+let place (l : int) : Seed_mir.place = { Seed_mir.root = Seed_mir.Local l; projections = [] }
 
 let copy (l : int) : Seed_mir.operand = Seed_mir.Copy (place l)
 let move_ (l : int) : Seed_mir.operand = Seed_mir.Move (place l)
@@ -588,7 +588,7 @@ let check_type_instances () =
             [ assign 5
                 (Seed_mir.BinaryOp
                    ( Seed_mir.Eq,
-                     Seed_mir.Copy { local = 2; projections = [ Seed_mir.Field fid_first ] },
+                     Seed_mir.Copy { root = Seed_mir.Local 2; projections = [ Seed_mir.Field fid_first ] },
                      int_op 1 )) ];
           terminator = Seed_mir.Assert (copy 5, true, "Pair[Int].first != 1", 3) };
         { Seed_mir.id = 3;

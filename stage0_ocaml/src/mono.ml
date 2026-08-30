@@ -437,7 +437,7 @@ let build ~(entry : Instance_id.t) ?(generic_types : generic_def array = [||])
          (Printf.sprintf "mono: no template function for the entry instance %s"
             (Seed_mir.print_instance entry)));
   Array.iter
-    (fun (_, _, init) ->
+    (fun (_, _, _, init) ->
       match init with
       | Some (Function inst) -> enqueue_instance inst
       | _ -> ())

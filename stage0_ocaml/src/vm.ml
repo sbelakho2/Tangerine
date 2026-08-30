@@ -139,7 +139,7 @@ let type_of_local (vm : t) (fn_idx : int) (local : int) : Type_repr.t =
     (* the GLOBAL root: the type comes from the program.statics table *)
     let sidx = -1 - local in
     if sidx >= 0 && sidx < Array.length vm.program.Seed_mir.statics then
-      let (_, ty, _) = vm.program.Seed_mir.statics.(sidx) in
+      let (_, ty, _, _) = vm.program.Seed_mir.statics.(sidx) in
       ty
     else err_trap vm (Printf.sprintf "static slot out of range: %d" sidx)
   end
@@ -298,21 +298,21 @@ let rec eval_operand (vm : t) (frame : frame) (op : Seed_mir.operand) : Vm_value
           (Printf.sprintf
              "projected %s is unsupported by the seed VM (no partial-move representation: a Move/Consume of local _%d through a projection would transition the WHOLE root slot to Moved; the verifier rejects projected moves and the VM fails closed)"
              (match op with Seed_mir.Move _ -> "move" | _ -> "consume")
-             p.Seed_mir.local);
+             (Seed_mir.root_key p.Seed_mir.root));
       let slot =
-        if p.Seed_mir.local < 0 then
-          let sidx = -1 - p.Seed_mir.local in
+        if Seed_mir.root_is_static p.Seed_mir.root then
+          let sidx = Seed_mir.root_static_index p.Seed_mir.root in
           if sidx >= Array.length frame.statics then
             err_trap vm ("static slot out of bounds: " ^ string_of_int sidx)
           else frame.statics.(sidx)
-        else frame.locals.(p.Seed_mir.local)
+        else frame.locals.((Seed_mir.root_key p.Seed_mir.root))
       in
       (match Vm_value.move_slot slot with
        | Ok (v, s) ->
-           (if p.Seed_mir.local < 0 then
-              let sidx = -1 - p.Seed_mir.local in
+           (if Seed_mir.root_is_static p.Seed_mir.root then
+              let sidx = Seed_mir.root_static_index p.Seed_mir.root in
               frame.statics.(sidx) <- s
-            else frame.locals.(p.Seed_mir.local) <- s);
+            else frame.locals.((Seed_mir.root_key p.Seed_mir.root)) <- s);
            v
        | Error e -> err_trap vm (Vm_value.slot_error_string e))
 
@@ -325,16 +325,16 @@ and read_place (vm : t) (frame : frame) (p : Seed_mir.place) :
     (Vm_value.t, Vm_value.slot_error) result =
   step_limit vm;
   let base =
-    if p.Seed_mir.local < 0 then
-      let sidx = -1 - p.Seed_mir.local in
+    if Seed_mir.root_is_static p.Seed_mir.root then
+      let sidx = Seed_mir.root_static_index p.Seed_mir.root in
       if sidx >= Array.length frame.statics then
         Error (Vm_value.SlotOob sidx)
       else Vm_value.read_slot frame.statics.(sidx)
-    else Vm_value.read_slot frame.locals.(p.Seed_mir.local)
+    else Vm_value.read_slot frame.locals.((Seed_mir.root_key p.Seed_mir.root))
   in
   match base with
   | Ok b ->
-      let base_ty = type_of_local vm frame.fn p.Seed_mir.local in
+      let base_ty = type_of_local vm frame.fn (Seed_mir.root_key p.Seed_mir.root) in
       Ok (project_read vm frame b base_ty p.Seed_mir.projections)
   | Error e -> Error e
 
@@ -407,7 +407,7 @@ and project_read (vm : t) (frame : frame) (base : Vm_value.t) (base_ty : Type_re
                (* a real reference: resolve the target place, then
                   continue the remaining projections on the target value *)
                let tv =
-                 match read_place vm tf { Seed_mir.local = l; projections = projs } with
+                 match read_place vm tf { Seed_mir.root = Seed_mir.Local l; projections = projs } with
                  | Ok v -> v
                  | Error e -> err_trap vm (Vm_value.slot_error_string e)
                in
@@ -469,40 +469,40 @@ and memory_store (vm : t) (ptr : Vm_memory.pointer) (v : Vm_value.t) : unit =
 let rec write_place (vm : t) (frame : frame) (p : Seed_mir.place) (v : Vm_value.t) : unit =
   step_limit vm;
   let statics_slot () =
-    let sidx = -1 - p.Seed_mir.local in
+    let sidx = Seed_mir.root_static_index p.Seed_mir.root in
     if sidx >= Array.length frame.statics then
       err_trap vm ("static slot out of bounds: " ^ string_of_int sidx)
     else frame.statics.(sidx)
   in
   match p.Seed_mir.projections with
   | [] -> (
-      if p.Seed_mir.local < 0 then
+      if Seed_mir.root_is_static p.Seed_mir.root then
         match Vm_value.write_slot (statics_slot ()) v with
-        | Ok s -> frame.statics.(-1 - p.Seed_mir.local) <- s
+        | Ok s -> frame.statics.(Seed_mir.root_static_index p.Seed_mir.root) <- s
         | Error e -> err_trap vm (Vm_value.slot_error_string e)
       else
-        match Vm_value.write_slot frame.locals.(p.Seed_mir.local) v with
-        | Ok s -> frame.locals.(p.Seed_mir.local) <- s
+        match Vm_value.write_slot frame.locals.((Seed_mir.root_key p.Seed_mir.root)) v with
+        | Ok s -> frame.locals.((Seed_mir.root_key p.Seed_mir.root)) <- s
         | Error e -> err_trap vm (Vm_value.slot_error_string e))
   | projs -> (
       let base =
-        if p.Seed_mir.local < 0 then Vm_value.read_slot (statics_slot ())
-        else Vm_value.read_slot frame.locals.(p.Seed_mir.local)
+        if Seed_mir.root_is_static p.Seed_mir.root then Vm_value.read_slot (statics_slot ())
+        else Vm_value.read_slot frame.locals.((Seed_mir.root_key p.Seed_mir.root))
       in
       let base =
         match base with
         | Ok b -> b
         | Error e -> err_trap vm (Vm_value.slot_error_string e)
       in
-      let base_ty = type_of_local vm frame.fn p.Seed_mir.local in
+      let base_ty = type_of_local vm frame.fn (Seed_mir.root_key p.Seed_mir.root) in
       let updated = update_place vm frame base base_ty projs v in
-      if p.Seed_mir.local < 0 then
+      if Seed_mir.root_is_static p.Seed_mir.root then
         match Vm_value.write_slot (statics_slot ()) updated with
-        | Ok s -> frame.statics.(-1 - p.Seed_mir.local) <- s
+        | Ok s -> frame.statics.(Seed_mir.root_static_index p.Seed_mir.root) <- s
         | Error e -> err_trap vm (Vm_value.slot_error_string e)
       else
-        match Vm_value.write_slot frame.locals.(p.Seed_mir.local) updated with
-        | Ok s -> frame.locals.(p.Seed_mir.local) <- s
+        match Vm_value.write_slot frame.locals.((Seed_mir.root_key p.Seed_mir.root)) updated with
+        | Ok s -> frame.locals.((Seed_mir.root_key p.Seed_mir.root)) <- s
       | Error e -> err_trap vm (Vm_value.slot_error_string e))
 
 and update_place (vm : t) (frame : frame) (base : Vm_value.t) (base_ty : Type_repr.t)
@@ -582,7 +582,7 @@ and update_place (vm : t) (frame : frame) (base : Vm_value.t) (base_ty : Type_re
                  remaining projections extend the target path; the ref
                  value itself is unchanged *)
               write_place vm tf
-                { Seed_mir.local = l; projections = projs @ rest }
+                { Seed_mir.root = Seed_mir.Local l; projections = projs @ rest }
                 v;
               base
           | Vm_value.Ref (Vm_value.Region _) ->
@@ -723,7 +723,7 @@ let rec eval_rvalue (vm : t) (frame : frame) (rv : Seed_mir.rvalue) : Vm_value.t
   match rv with
   | Seed_mir.Use op -> eval_operand vm frame op
   | Seed_mir.Ref p | Seed_mir.RefMut p ->
-      if p.Seed_mir.local < 0 || p.Seed_mir.local >= Array.length frame.locals then
+      if Seed_mir.root_is_static p.Seed_mir.root || (Seed_mir.root_key p.Seed_mir.root) >= Array.length frame.locals then
         err_trap vm "ref of out-of-range local";
       if List.exists (function Seed_mir.Deref -> true | _ -> false) p.Seed_mir.projections then
         (* computed-value source (e.g. `&*ptr`): the target is not a
@@ -734,7 +734,7 @@ let rec eval_rvalue (vm : t) (frame : frame) (rv : Seed_mir.rvalue) : Vm_value.t
          | Error e -> err_trap vm (Vm_value.slot_error_string e))
       else
         (* real reference: record the target (frame, local, projections) *)
-        Vm_value.Ref (Vm_value.Place (frame, p.Seed_mir.local, p.Seed_mir.projections))
+        Vm_value.Ref (Vm_value.Place (frame, (Seed_mir.root_key p.Seed_mir.root), p.Seed_mir.projections))
   | Seed_mir.Aggregate (kind, ops) ->
       let vals = Array.of_list (List.map (eval_operand vm frame) ops) in
       (match kind with
@@ -964,11 +964,11 @@ let rec exec_terminator (vm : t) (frame : frame) (term : Seed_mir.terminator) : 
            frame.block <- next;
            frame.stmt <- 0)
   | Seed_mir.Drop (p, next, _) ->
-      do_drop vm frame p.Seed_mir.local;
+      do_drop vm frame (Seed_mir.root_key p.Seed_mir.root);
       frame.block <- next;
       frame.stmt <- 0
   | Seed_mir.Deinit (p, next, _) ->
-      do_drop vm frame p.Seed_mir.local;
+      do_drop vm frame (Seed_mir.root_key p.Seed_mir.root);
       frame.block <- next;
       frame.stmt <- 0
   | Seed_mir.Assert (op, expected, msg, target) -> (
@@ -1098,6 +1098,8 @@ and value_kind (v : Vm_value.t) : string =
   | Vm_value.Struct _ -> "struct"
   | Vm_value.Enum _ -> "enum"
   | Vm_value.Array _ -> "array"
+  | Vm_value.Set _ -> "set"
+  | Vm_value.Map _ -> "map"
   | Vm_value.Function _ -> "fn"
   | Vm_value.Closure _ -> "closure"
   | Vm_value.RawPtr _ -> "ptr"
@@ -1107,7 +1109,7 @@ and value_kind (v : Vm_value.t) : string =
 (* ── the GLOBAL storage ──────────────────────────────── *)
 let statics_initial_values (program : Seed_mir.program) : Vm_value.slot array =
   Array.map
-    (fun (_, _ty, c) ->
+    (fun (_, _ty, _, c) ->
       match c with
       | None -> Vm_value.Uninitialized
       | Some c -> (

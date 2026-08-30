@@ -98,7 +98,23 @@ type projection =
   | ConstantIndex of int
   | Downcast of Ids.Variant_id.t
 
-type place = { local : int; projections : projection list }
+(* The place ROOT (re-audit item 20): the explicit Local | Static
+   split — a global place is a Static root, never a negative integer
+   smuggled into the local namespace.  Every layer pattern-matches the
+   root; `root_key` gives the storage index used by the frame/statics
+   machinery (locals 0..n-1; statics -1-i, the documented convention). *)
+type place_root = Local of int | Static of int
+
+let root_key (r : place_root) : int =
+  match r with Local i -> i | Static i -> -1 - i
+
+let root_is_static (r : place_root) : bool =
+  match r with Local _ -> false | Static _ -> true
+
+let root_static_index (r : place_root) : int =
+  match r with Static i -> i | Local _ -> -1
+
+type place = { root : place_root; projections : projection list }
 
 type operand =
   | Copy of place
@@ -229,7 +245,10 @@ let def_repr (d : type_def) : Type_repr.t =
 
 type program = {
   functions : function_ array;
-  statics : (string * Type_repr.t * constant option) array;
+  (* the static table (re-audit item 21): name, declared type,
+     MUTABILITY (an immutable static rejects Assign at verification —
+     the same fail-closed defense-in-depth as the frontend), initializer *)
+  statics : (string * Type_repr.t * bool * constant option) array;
   types : type_def array;
 }
 
@@ -315,7 +334,12 @@ and print_instance (inst : Instance_id.t) : string =
     (String.concat ", " (Array.to_list (Array.map print_type (Instance_id.type_args inst))))
 
 let print_place (p : place) : string =
-  let s = ref (Printf.sprintf "_%d" p.local) in
+  let s =
+    ref
+      (match p.root with
+       | Local i -> Printf.sprintf "_%d" i
+       | Static i -> Printf.sprintf "static#%d" i)
+  in
   List.iter
     (function
       | Deref -> s := "(*" ^ !s ^ ")"
@@ -450,11 +474,13 @@ let print_function (fn : function_) : string =
   Buffer.add_string buf "}\n";
   Buffer.contents buf
 
-let print_static (name : string) (ty : Type_repr.t) (init : constant option) : string =
+let print_static (name : string) (ty : Type_repr.t) (mutable_ : bool)
+    (init : constant option) : string =
+  let m = if mutable_ then " mut" else "" in
   match init with
   | Some c ->
-      Printf.sprintf "static %s: %s = %s;" name (print_type ty) (print_constant c)
-  | None -> Printf.sprintf "static %s: %s;" name (print_type ty)
+      Printf.sprintf "static%s %s: %s = %s;" m name (print_type ty) (print_constant c)
+  | None -> Printf.sprintf "static%s %s: %s;" m name (print_type ty)
 
 let print_program (prog : program) : string =
   let buf = Buffer.create 512 in
@@ -482,8 +508,8 @@ let print_program (prog : program) : string =
     prog.types;
   if Array.length prog.types > 0 then Buffer.add_char buf '\n';
   Array.iter
-    (fun (name, ty, init) ->
-      Buffer.add_string buf (print_static name ty init ^ "\n"))
+    (fun (name, ty, mutable_, init) ->
+      Buffer.add_string buf (print_static name ty mutable_ init ^ "\n"))
     prog.statics;
   if Array.length prog.statics > 0 then Buffer.add_char buf '\n';
   Array.iter

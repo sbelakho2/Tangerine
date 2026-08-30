@@ -428,7 +428,6 @@ end
                 else begin
                   let tys = Driver.closure_types env_m in
                   let sts = Driver.closure_statics env_m mat_prog.Ast.items in
-                  Array.iter (fun (sn, _, _) -> Printf.eprintf "DBG statics: %s\n" sn) sts;
                   let struct_ok =
                     Array.exists
                       (fun d ->
@@ -437,7 +436,7 @@ end
                         | _ -> false)
                       tys
                   in
-                  let static_ok = Array.exists (fun (n, _, _) -> n = "mat::MAX_POINTS") sts in
+                  let static_ok = Array.exists (fun (n, _, _, _) -> n = "mat::MAX_POINTS") sts in
                   if struct_ok && static_ok then
                     Printf.printf
                       "  closure materialization: PASS (Point struct def + MAX_POINTS static from the typed registry)\n"
@@ -586,7 +585,7 @@ end
                     }
                   in
                   Array.iter
-                    (fun (sn, _, so) -> Printf.eprintf "DBG ctor statics: %s opt=%b\n" sn (so <> None))
+                    (fun (sn, _, _, so) -> Printf.eprintf "DBG ctor statics: %s opt=%b\n" sn (so <> None))
                     cprog_mir.Seed_mir.statics;
                   (match
                      Mir_verify.require_valid_template
@@ -843,6 +842,91 @@ end
                            "  mutable static round-trip: PASS (main = 9 — X went 3 -> 4 -> 5 and the two reads sum 4 + 5; exit %d)\n"
                            code)
                 end));
+      (* ── the immutable-static defense-in-depth proof (re-audit item
+         21): a hand-built program whose main Assigns into a static
+         declared WITHOUT `mut` must FAIL concrete verification — the
+         mutability reaches the MIR layer, so a const/static
+         conflation can never smuggle a write past the verifier. *)
+      let im_statics = [| ("X", Type_repr.Int Type_repr.Int, false, Some (Seed_mir.Integer (Int_value.of_int64 ~width:64 ~signed:true 3L))) |] in
+      let im_main =
+        {
+          Seed_mir.instance = Instance_id.make ~callable:(Ids.Callable_id.make 777) ~type_args:[||];
+          name = "main";
+          params = [||];
+          locals = [| Type_repr.Int Type_repr.Int |];
+          entry = 0;
+          blocks =
+            [|
+              {
+                Seed_mir.id = 0;
+                statements =
+                  [
+                    Seed_mir.Assign
+                      ({ Seed_mir.root = Seed_mir.Static 0; projections = [] },
+                       Seed_mir.Use
+                         (Seed_mir.Constant
+                            (Seed_mir.Integer
+                               (Int_value.of_int64 ~width:64 ~signed:true 5L))));
+                  ];
+                terminator = Seed_mir.Ret;
+              };
+            |];
+        }
+      in
+      let im_prog = { Seed_mir.functions = [| im_main |]; statics = im_statics; types = [||] } in
+      (match Mir_verify.require_valid_concrete im_prog with
+       | Error errs when List.exists (fun e -> Util.has_suffix e "static _0 (the declaration is not `mut`; the verifier rejects the write at the MIR layer)" || Util.has_suffix e "immutable static") errs ->
+           Printf.printf
+             "  immutable-static verify: PASS (the MIR verifier rejects Assign into a static declared without `mut`)\n"
+       | Error errs ->
+           Printf.printf "  immutable-static verify: FAIL (wrong errors)\n";
+           List.iter (fun e -> Printf.printf "    %s\n" e) errs;
+           exit 1
+       | Ok () ->
+           Printf.printf
+             "  immutable-static verify: FAIL (the verifier accepted an Assign into an immutable static)\n";
+           exit 1);
+
+      (* ── the break-value profile rejection proof (re-audit item 27):
+         the typed profile conservatively rejects the value-carrying
+         `break <value>` form — the spec has not locked whether it
+         contributes a loop-expression value, so the profile holds the
+         executable-closure bar until the conformance test exists. *)
+      let bvsrc = {|
+def main() -> Int
+  var acc = 0
+  while acc < 10 do
+    if acc == 3 then
+      break 99
+    end
+    acc = acc + 1
+  end
+  acc
+end
+|} in
+      (match Source_loader.load_string "<break-value>" bvsrc with
+       | Error _ -> failwith "break-value source load"
+       | Ok bvsrc2 ->
+           let bvm = Span.create () in
+           let bvfid = Span.add_file bvm bvsrc2.Source.name bvsrc2 in
+           let bvdiags = Diagnostic.create_bag () in
+           let bvlx = Lexer.create bvsrc2.Source.bytes bvfid bvdiags in
+           let bvtoks = Lexer.lex bvlx in
+           let bvprog = Parser.parse bvtoks bvsrc2.Source.bytes bvfid bvdiags [ "bv" ] in
+           (match Typecheck.check_program (Typecheck.initial_env ()) bvprog with
+            | Error m -> failwith ("break-value typecheck: " ^ m)
+            | Ok (bvenv, bverrs) ->
+                if bverrs <> [] then
+                  failwith ("break-value typecheck errors: " ^ String.concat "; " bverrs)
+                else
+                  let bvfindings = Typed_profile.check bvenv bvprog.Ast.items in
+                  if List.exists (fun f -> f.Typed_profile.f_kind = "break-value") bvfindings then
+                    Printf.printf
+                      "  break-value profile: PASS (the typed profile rejects value-carrying `break <value>`)\n"
+                  else begin
+                    Printf.printf "  break-value profile: FAIL (no break-value finding)\n";
+                    exit 1
+                  end));
       (* ── the destructuring-LET round-trip proof (the audit's
          TypedPattern-at-every-pattern-site): `let (a, b) = (10, 20)`
          resolves ONCE into the semantic TP_tuple through the
@@ -929,6 +1013,525 @@ end
                          "  destructuring-let round-trip: PASS (main = 30 — a + b from the tuple; exit %d)\n"
                          code)
                 end));
+      (* ── the runtime SET iteration round-trip proof (the audit's
+         iterable semantics): `for x in s` over a runtime Set[Int]
+         materializes the entries protocol and sums the elements —
+         main = 6 for {1, 2, 3}. *)
+      let srsrc = {|
+def main() -> Int
+  var s: Set[Int] = Set::new()
+  s.insert(1)
+  s.insert(2)
+  s.insert(3)
+  var sum = 0
+  for x in s do
+    sum = sum + x
+  end
+  sum
+end
+|} in
+      (match Source_loader.load_string "<set-loop>" srsrc with
+       | Error _ -> failwith "set-loop source load"
+       | Ok ssrc ->
+           let ssm = Span.create () in
+           let sfid = Span.add_file ssm ssrc.Source.name ssrc in
+           let sdiags = Diagnostic.create_bag () in
+           let slx = Lexer.create ssrc.Source.bytes sfid sdiags in
+           let stoks = Lexer.lex slx in
+           let sprog = Parser.parse stoks ssrc.Source.bytes sfid sdiags [ "sl" ] in
+           (match Typecheck.check_program (Typecheck.initial_env ()) sprog with
+            | Error m -> failwith ("set-loop typecheck: " ^ m)
+            | Ok (senv, serrs) ->
+                if serrs <> [] then
+                  failwith ("set-loop typecheck errors: " ^ String.concat "; " serrs)
+                else begin
+                  let sbase = Driver.lowering_env_of ~items:sprog.Ast.items senv in
+                  let svariants = Driver.user_variant_table senv in
+                  let smain_decl =
+                    match
+                      List.find_opt
+                        (fun i ->
+                          match i.Ast.kind with
+                          | Ast.Function d -> d.Ast.fn_sig.Ast.sig_name = "main"
+                          | _ -> false)
+                        sprog.Ast.items
+                    with
+                    | Some i -> i
+                    | None -> failwith "set-loop: no main function"
+                  in
+                  let sts =
+                    match List.assoc_opt "main" senv.Typecheck.functions with
+                    | Some ts -> ts
+                    | None -> (
+                        match
+                          List.filter (fun (k, _) -> Util.has_suffix k "::main")
+                            senv.Typecheck.functions
+                        with
+                        | [ (_, ts) ] -> ts
+                        | _ -> failwith "set-loop: no typed signature for main")
+                  in
+                  let smain_fn =
+                    match smain_decl.Ast.kind with
+                    | Ast.Function d ->
+                        Mir_lower.lower_function_with_variants
+                          ~typed_nodes:(Driver.typed_nodes_of senv)
+                          ~typed_patterns:(Driver.typed_patterns_of senv)
+                          ~typed_for_patterns:(Driver.typed_for_patterns_of senv)
+                          ~typed_let_patterns:(Driver.typed_let_patterns_of senv)
+                          svariants
+                          { sbase with Mir_lower.fn_ret = sts.Typecheck.ts_return }
+                          "main" (Ids.Callable_id.to_int sts.Typecheck.ts_callable)
+                          [||] [||] d
+                    | _ -> failwith "set-loop: main is not a function"
+                  in
+                  let sprog_mir =
+                    { Seed_mir.functions = [| smain_fn |]; statics = [||]; types = [||] }
+                  in
+                  (match Mir_verify.require_valid_concrete sprog_mir with
+                   | Ok () ->
+                       Printf.printf "  runtime Set iteration verify (concrete mode): PASS\n"
+                   | Error errs ->
+                       Printf.printf "  runtime Set iteration verify (concrete mode): FAIL\n";
+                       List.iter (fun e -> Printf.printf "    %s\n" e) errs;
+                       exit 1);
+                  let sentry = smain_fn.Seed_mir.instance in
+                  let shost = Host.create ~repo_root:"." ~argv:[||] in
+                  (match Vm.run ~program:sprog_mir ~entry:sentry ~argv:[||] ~host:shost with
+                   | Error e ->
+                       Printf.printf "  runtime Set iteration VM: FAIL %s\n" e.Vm.message;
+                       exit 1
+                   | Ok code -> (
+                       match
+                         Vm.entry_frame_of ~program:sprog_mir ~entry:sentry ~argv:[||]
+                       with
+                       | Error m ->
+                           Printf.printf "  runtime Set iteration VM: <inspect failed: %s>\n" m;
+                           exit 1
+                       | Ok (svm, sframe) -> (
+                           match Vm.run_inspect svm sframe with
+                           | Ok "6" ->
+                               Printf.printf
+                                 "  runtime Set iteration round-trip: PASS (main = 6 — the sum of {1,2,3}; exit %d)\n"
+                                 code
+                           | other ->
+                               Printf.printf
+                                 "  runtime Set iteration round-trip: FAIL (expected 6, got %s)\n"
+                                 (match other with Ok v -> v | Error m -> "<" ^ m ^ ">");
+                               exit 1)))
+                end));
+      (* ── the RUNTIME Map iteration round-trip proof (re-audit item
+         17 — the audit singled Map out: the compiler kernel itself
+         makes heavy use of Map iteration): `for (k, v) in m` over a
+         runtime Map[Int, Int] materializes the entries protocol
+         (__intrinsic_map_entries) and the destructuring pattern binds
+         k/v through the tuple projections — main = 66 = the sum of
+         1+10, 2+20, 3+30. *)
+      let mrsrc = {|
+def main() -> Int
+  var m: Map[Int, Int] = Map::new()
+  m.insert(1, 10)
+  m.insert(2, 20)
+  m.insert(3, 30)
+  var sum = 0
+  for (k, v) in m do
+    sum = sum + k + v
+  end
+  sum
+end
+|} in
+      (match Source_loader.load_string "<map-loop>" mrsrc with
+       | Error _ -> failwith "map-loop source load"
+       | Ok mrsrc2 ->
+           let mrm = Span.create () in
+           let mrfid = Span.add_file mrm mrsrc2.Source.name mrsrc2 in
+           let mrdiags = Diagnostic.create_bag () in
+           let mrlx = Lexer.create mrsrc2.Source.bytes mrfid mrdiags in
+           let mrtoks = Lexer.lex mrlx in
+           let mrprog = Parser.parse mrtoks mrsrc2.Source.bytes mrfid mrdiags [ "mr" ] in
+           (match Typecheck.check_program (Typecheck.initial_env ()) mrprog with
+            | Error m -> failwith ("map-loop typecheck: " ^ m)
+            | Ok (mrenv, mrerrs) ->
+                if mrerrs <> [] then
+                  failwith ("map-loop typecheck errors: " ^ String.concat "; " mrerrs)
+                else begin
+                  let mrbase = Driver.lowering_env_of ~items:mrprog.Ast.items mrenv in
+                  let mrvariants = Driver.user_variant_table mrenv in
+                  let mrmain_decl =
+                    match
+                      List.find_opt
+                        (fun i ->
+                          match i.Ast.kind with
+                          | Ast.Function d -> d.Ast.fn_sig.Ast.sig_name = "main"
+                          | _ -> false)
+                        mrprog.Ast.items
+                    with
+                    | Some i -> i
+                    | None -> failwith "map-loop: no main function"
+                  in
+                  let mrts =
+                    match List.assoc_opt "main" mrenv.Typecheck.functions with
+                    | Some ts -> ts
+                    | None -> (
+                        match
+                          List.filter (fun (k, _) -> Util.has_suffix k "::main")
+                            mrenv.Typecheck.functions
+                        with
+                        | [ (_, ts) ] -> ts
+                        | _ -> failwith "map-loop: no typed signature for main")
+                  in
+                  let mrmain_fn =
+                    match mrmain_decl.Ast.kind with
+                    | Ast.Function d ->
+                        Mir_lower.lower_function_with_variants
+                          ~typed_nodes:(Driver.typed_nodes_of mrenv)
+                          ~typed_patterns:(Driver.typed_patterns_of mrenv)
+                          ~typed_for_patterns:(Driver.typed_for_patterns_of mrenv)
+                          ~typed_let_patterns:(Driver.typed_let_patterns_of mrenv)
+                          mrvariants
+                          { mrbase with Mir_lower.fn_ret = mrts.Typecheck.ts_return }
+                          "main" (Ids.Callable_id.to_int mrts.Typecheck.ts_callable)
+                          [||] [||] d
+                    | _ -> failwith "map-loop: main is not a function"
+                  in
+                  let mrprog_mir =
+                    { Seed_mir.functions = [| mrmain_fn |]; statics = [||]; types = [||] }
+                  in
+                  (match Mir_verify.require_valid_concrete mrprog_mir with
+                   | Ok () ->
+                       Printf.printf "  runtime Map iteration verify (concrete mode): PASS\n"
+                   | Error errs ->
+                       Printf.printf "  runtime Map iteration verify (concrete mode): FAIL\n";
+                       List.iter (fun e -> Printf.printf "    %s\n" e) errs;
+                       exit 1);
+                  let mrentry = mrmain_fn.Seed_mir.instance in
+                  let mrhost = Host.create ~repo_root:"." ~argv:[||] in
+                  (match Vm.run ~program:mrprog_mir ~entry:mrentry ~argv:[||] ~host:mrhost with
+                   | Error e ->
+                       Printf.printf "  runtime Map iteration VM: FAIL %s\n" e.Vm.message;
+                       exit 1
+                   | Ok code -> (
+                       match
+                         Vm.entry_frame_of ~program:mrprog_mir ~entry:mrentry ~argv:[||]
+                       with
+                       | Error m ->
+                           Printf.printf "  runtime Map iteration VM: <inspect failed: %s>\n" m;
+                           exit 1
+                       | Ok (mrvm, mrframe) -> (
+                           match Vm.run_inspect mrvm mrframe with
+                           | Ok "66" ->
+                               Printf.printf
+                                 "  runtime Map iteration round-trip: PASS (main = 66 — the sum of {1:10, 2:20, 3:30} through the entries protocol; exit %d)\n"
+                                 code
+                           | other ->
+                               Printf.printf
+                                 "  runtime Map iteration round-trip: FAIL (expected 66, got %s)\n"
+                                 (match other with Ok v -> v | Error m -> "<" ^ m ^ ">");
+                               exit 1)))
+                end));
+      (* ── the RUNTIME String iteration round-trip proof (re-audit
+         item 17 — the seed's documented Unicode decision: String
+         indices are BYTE indices, consistent with Len's String.length
+         and the ConstantIndex projection; the loop counts the bytes
+         of a 3-byte UTF-8 string, so `for c in s` over "abc" runs the
+         counter over Len = 3). *)
+      let stsrc = {|
+def main() -> Int
+  var s: String = "abc"
+  var n = 0
+  for c in s do
+    n = n + 1
+  end
+  n
+end
+|} in
+      (match Source_loader.load_string "<str-loop>" stsrc with
+       | Error _ -> failwith "str-loop source load"
+       | Ok stsrc2 ->
+           let stm = Span.create () in
+           let stfid = Span.add_file stm stsrc2.Source.name stsrc2 in
+           let stdiags = Diagnostic.create_bag () in
+           let stlx = Lexer.create stsrc2.Source.bytes stfid stdiags in
+           let sttoks = Lexer.lex stlx in
+           let stprog = Parser.parse sttoks stsrc2.Source.bytes stfid stdiags [ "st" ] in
+           (match Typecheck.check_program (Typecheck.initial_env ()) stprog with
+            | Error m -> failwith ("str-loop typecheck: " ^ m)
+            | Ok (stenv, sterrs) ->
+                if sterrs <> [] then
+                  failwith ("str-loop typecheck errors: " ^ String.concat "; " sterrs)
+                else begin
+                  let stbase = Driver.lowering_env_of ~items:stprog.Ast.items stenv in
+                  let stvariants = Driver.user_variant_table stenv in
+                  let stmain_decl =
+                    match
+                      List.find_opt
+                        (fun i ->
+                          match i.Ast.kind with
+                          | Ast.Function d -> d.Ast.fn_sig.Ast.sig_name = "main"
+                          | _ -> false)
+                        stprog.Ast.items
+                    with
+                    | Some i -> i
+                    | None -> failwith "str-loop: no main function"
+                  in
+                  let stts =
+                    match List.assoc_opt "main" stenv.Typecheck.functions with
+                    | Some ts -> ts
+                    | None -> (
+                        match
+                          List.filter (fun (k, _) -> Util.has_suffix k "::main")
+                            stenv.Typecheck.functions
+                        with
+                        | [ (_, ts) ] -> ts
+                        | _ -> failwith "str-loop: no typed signature for main")
+                  in
+                  let stmain_fn =
+                    match stmain_decl.Ast.kind with
+                    | Ast.Function d ->
+                        Mir_lower.lower_function_with_variants
+                          ~typed_nodes:(Driver.typed_nodes_of stenv)
+                          ~typed_patterns:(Driver.typed_patterns_of stenv)
+                          ~typed_for_patterns:(Driver.typed_for_patterns_of stenv)
+                          ~typed_let_patterns:(Driver.typed_let_patterns_of stenv)
+                          stvariants
+                          { stbase with Mir_lower.fn_ret = stts.Typecheck.ts_return }
+                          "main" (Ids.Callable_id.to_int stts.Typecheck.ts_callable)
+                          [||] [||] d
+                    | _ -> failwith "str-loop: main is not a function"
+                  in
+                  let stprog_mir =
+                    { Seed_mir.functions = [| stmain_fn |]; statics = [||]; types = [||] }
+                  in
+                  (match Mir_verify.require_valid_concrete stprog_mir with
+                   | Ok () ->
+                       Printf.printf "  runtime String iteration verify (concrete mode): PASS\n"
+                   | Error errs ->
+                       Printf.printf "  runtime String iteration verify (concrete mode): FAIL\n";
+                       List.iter (fun e -> Printf.printf "    %s\n" e) errs;
+                       exit 1);
+                  let stentry = stmain_fn.Seed_mir.instance in
+                  let sthost = Host.create ~repo_root:"." ~argv:[||] in
+                  (match Vm.run ~program:stprog_mir ~entry:stentry ~argv:[||] ~host:sthost with
+                   | Error e ->
+                       Printf.printf "  runtime String iteration VM: FAIL %s\n" e.Vm.message;
+                       exit 1
+                   | Ok code -> (
+                       match
+                         Vm.entry_frame_of ~program:stprog_mir ~entry:stentry ~argv:[||]
+                       with
+                       | Error m ->
+                           Printf.printf "  runtime String iteration VM: <inspect failed: %s>\n" m;
+                           exit 1
+                       | Ok (stvm, stframe) -> (
+                           match Vm.run_inspect stvm stframe with
+                           | Ok "3" ->
+                               Printf.printf
+                                 "  runtime String iteration round-trip: PASS (main = 3 — the byte-index counter over \"abc\" under the seed's documented Unicode convention; exit %d)\n"
+                                 code
+                           | other ->
+                               Printf.printf
+                                 "  runtime String iteration round-trip: FAIL (expected 3, got %s)\n"
+                                 (match other with Ok v -> v | Error m -> "<" ^ m ^ ">");
+                               exit 1)))
+                end));
+      (* ── the FlowResult expression-level proofs (re-audit P0):
+         (a) the NESTED divergence — a `break` inside an `if` inside a
+         `loop` propagates through the if's joined flow, so the loop's
+         normal continuation exists and the loop falls through
+         (main = 3); (b) the LOOP-RETURN rule — a `loop` whose only
+         exit is `return` has NO normal continuation (Never), and the
+         function still returns 4 through the VM. *)
+      let flsrc = {|
+def main() -> Int
+  var acc = 0
+  loop
+    if acc >= 3 then
+      break
+    end
+    acc = acc + 1
+  end
+  acc
+end
+|} in
+      let flsrc2 = {|
+def main() -> Int
+  loop
+    return 4
+  end
+end
+|} in
+      (match Source_loader.load_string "<flow-nested-break>" flsrc with
+       | Error _ -> failwith "flow-nested-break source load"
+       | Ok fls -> (
+           let flm = Span.create () in
+           let flfid = Span.add_file flm fls.Source.name fls in
+           let fldiags = Diagnostic.create_bag () in
+           let fllx = Lexer.create fls.Source.bytes flfid fldiags in
+           let fltoks = Lexer.lex fllx in
+           let flprog = Parser.parse fltoks fls.Source.bytes flfid fldiags [ "fl" ] in
+           match Typecheck.check_program (Typecheck.initial_env ()) flprog with
+           | Error m -> failwith ("flow-nested-break typecheck: " ^ m)
+           | Ok (flenv, flerrs) ->
+               if flerrs <> [] then
+                 failwith ("flow-nested-break typecheck errors: " ^ String.concat "; " flerrs)
+               else begin
+                 let flbase = Driver.lowering_env_of ~items:flprog.Ast.items flenv in
+                 let flvariants = Driver.user_variant_table flenv in
+                 let flmain_decl =
+                   match
+                     List.find_opt
+                       (fun i ->
+                         match i.Ast.kind with
+                         | Ast.Function d -> d.Ast.fn_sig.Ast.sig_name = "main"
+                         | _ -> false)
+                       flprog.Ast.items
+                   with
+                   | Some i -> i
+                   | None -> failwith "flow-nested-break: no main"
+                 in
+                 let flts =
+                   match List.assoc_opt "main" flenv.Typecheck.functions with
+                   | Some ts -> ts
+                   | None -> (
+                       match
+                         List.filter (fun (k, _) -> Util.has_suffix k "::main")
+                           flenv.Typecheck.functions
+                       with
+                       | [ (_, ts) ] -> ts
+                       | _ -> failwith "flow-nested-break: no main signature")
+                 in
+                 let flmain_fn =
+                   match flmain_decl.Ast.kind with
+                   | Ast.Function d ->
+                       Mir_lower.lower_function_with_variants
+                         ~typed_nodes:(Driver.typed_nodes_of flenv)
+                         ~typed_patterns:(Driver.typed_patterns_of flenv)
+                         ~typed_for_patterns:(Driver.typed_for_patterns_of flenv)
+                         ~typed_let_patterns:(Driver.typed_let_patterns_of flenv)
+                         flvariants
+                         { flbase with Mir_lower.fn_ret = flts.Typecheck.ts_return }
+                         "main" (Ids.Callable_id.to_int flts.Typecheck.ts_callable)
+                         [||] [||] d
+                   | _ -> failwith "flow-nested-break: main not a function"
+                 in
+                 let flprog_mir =
+                   { Seed_mir.functions = [| flmain_fn |]; statics = [||]; types = [||] }
+                 in
+                 (match Mir_verify.require_valid_concrete flprog_mir with
+                  | Ok () ->
+                      Printf.printf "  flow nested-break-in-loop verify (concrete mode): PASS\n"
+                  | Error errs ->
+                      Printf.printf "  flow nested-break-in-loop verify (concrete mode): FAIL\n";
+                      List.iter (fun e -> Printf.printf "    %s\n" e) errs;
+                      exit 1);
+                 let flentry = flmain_fn.Seed_mir.instance in
+                 let flhost = Host.create ~repo_root:"." ~argv:[||] in
+                 (match Vm.run ~program:flprog_mir ~entry:flentry ~argv:[||] ~host:flhost with
+                  | Error e ->
+                      Printf.printf "  flow nested-break-in-loop VM: FAIL %s\n" e.Vm.message;
+                      exit 1
+                  | Ok code -> (
+                      match
+                        Vm.entry_frame_of ~program:flprog_mir ~entry:flentry ~argv:[||]
+                      with
+                      | Error m ->
+                          Printf.printf "  flow nested-break-in-loop VM: <inspect failed: %s>\n" m;
+                          exit 1
+                      | Ok (flvm, flframe) -> (
+                          match Vm.run_inspect flvm flframe with
+                          | Ok "3" ->
+                              Printf.printf
+                                "  flow nested-break-in-loop round-trip: PASS (main = 3 — the break inside the if joined through the if's flow; exit %d)\n"
+                                code
+                          | other ->
+                              Printf.printf
+                                "  flow nested-break-in-loop round-trip: FAIL (expected 3, got %s)\n"
+                                (match other with Ok v -> v | Error m -> "<" ^ m ^ ">");
+                              exit 1)))
+               end));
+      (match Source_loader.load_string "<flow-loop-return>" flsrc2 with
+       | Error _ -> failwith "flow-loop-return source load"
+       | Ok fls2 -> (
+           let flm2 = Span.create () in
+           let flfid2 = Span.add_file flm2 fls2.Source.name fls2 in
+           let fld2 = Diagnostic.create_bag () in
+           let fllx2 = Lexer.create fls2.Source.bytes flfid2 fld2 in
+           let flt2 = Lexer.lex fllx2 in
+           let flp2 = Parser.parse flt2 fls2.Source.bytes flfid2 fld2 [ "fl2" ] in
+           match Typecheck.check_program (Typecheck.initial_env ()) flp2 with
+           | Error m -> failwith ("flow-loop-return typecheck: " ^ m)
+           | Ok (flenv2, flerrs2) ->
+               if flerrs2 <> [] then
+                 failwith ("flow-loop-return typecheck errors: " ^ String.concat "; " flerrs2)
+               else begin
+                 let flb2 = Driver.lowering_env_of ~items:flp2.Ast.items flenv2 in
+                 let flv2 = Driver.user_variant_table flenv2 in
+                 let flmd2 =
+                   match
+                     List.find_opt
+                       (fun i ->
+                         match i.Ast.kind with
+                         | Ast.Function d -> d.Ast.fn_sig.Ast.sig_name = "main"
+                         | _ -> false)
+                       flp2.Ast.items
+                   with
+                   | Some i -> i
+                   | None -> failwith "flow-loop-return: no main"
+                 in
+                 let flts2 =
+                   match List.assoc_opt "main" flenv2.Typecheck.functions with
+                   | Some ts -> ts
+                   | None -> (
+                       match
+                         List.filter (fun (k, _) -> Util.has_suffix k "::main")
+                           flenv2.Typecheck.functions
+                       with
+                       | [ (_, ts) ] -> ts
+                       | _ -> failwith "flow-loop-return: no main signature")
+                 in
+                 let flfn2 =
+                   match flmd2.Ast.kind with
+                   | Ast.Function d ->
+                       Mir_lower.lower_function_with_variants
+                         ~typed_nodes:(Driver.typed_nodes_of flenv2)
+                         ~typed_patterns:(Driver.typed_patterns_of flenv2)
+                         ~typed_for_patterns:(Driver.typed_for_patterns_of flenv2)
+                         ~typed_let_patterns:(Driver.typed_let_patterns_of flenv2)
+                         flv2
+                         { flb2 with Mir_lower.fn_ret = flts2.Typecheck.ts_return }
+                         "main" (Ids.Callable_id.to_int flts2.Typecheck.ts_callable)
+                         [||] [||] d
+                   | _ -> failwith "flow-loop-return: main not a function"
+                 in
+                 let flp2m = { Seed_mir.functions = [| flfn2 |]; statics = [||]; types = [||] } in
+                 (match Mir_verify.require_valid_concrete flp2m with
+                  | Ok () -> Printf.printf "  flow loop-return verify (concrete mode): PASS\n"
+                  | Error errs ->
+                      Printf.printf "  flow loop-return verify (concrete mode): FAIL\n";
+                      List.iter (fun e -> Printf.printf "    %s\n" e) errs;
+                      exit 1);
+                 let fle2 = flfn2.Seed_mir.instance in
+                 let flh2 = Host.create ~repo_root:"." ~argv:[||] in
+                 (match Vm.run ~program:flp2m ~entry:fle2 ~argv:[||] ~host:flh2 with
+                  | Error e ->
+                      Printf.printf "  flow loop-return VM: FAIL %s\n" e.Vm.message;
+                      exit 1
+                  | Ok code -> (
+                      match Vm.entry_frame_of ~program:flp2m ~entry:fle2 ~argv:[||] with
+                      | Error m ->
+                          Printf.printf "  flow loop-return VM: <inspect failed: %s>\n" m;
+                          exit 1
+                      | Ok (flv2m, flf2) -> (
+                          match Vm.run_inspect flv2m flf2 with
+                          | Ok "4" ->
+                              Printf.printf
+                                "  flow loop-return round-trip: PASS (main = 4 — a return-only loop has no normal continuation and still returns through the VM; exit %d)\n"
+                                code
+                          | other ->
+                              Printf.printf
+                                "  flow loop-return round-trip: FAIL (expected 4, got %s)\n"
+                                (match other with Ok v -> v | Error m -> "<" ^ m ^ ">");
+                              exit 1)))
+               end));
       (* ── the RUNTIME Vec iteration round-trip proof (the audit's
          typed-iterable requirement): a `for x in v` over a runtime
          Vec[Int] lowers to the counter loop with the dynamic
@@ -1663,7 +2266,7 @@ end
        let pid_t2 = Ids_core.Generic_param_id.make 22 in
        let ty_s = Type_repr.Type_param pid_s in
        let ty_t2 = Type_repr.Type_param pid_t2 in
-       let place l = { Seed_mir.local = l; projections = [] } in
+       let place l = { Seed_mir.root = Seed_mir.Local l; projections = [] } in
        (* a genuine template: swap[T,U] — instance [T;U], params T/U,
           locals T/U, a cast to the declared param T *)
        let swap_tmpl : Seed_mir.function_ =
@@ -1818,7 +2421,7 @@ end
                        ( place 2,
                          Seed_mir.Use
                            (Seed_mir.Read
-                              { local = 1; projections = [ Seed_mir.Field fid_first ] }) );
+                              { root = Seed_mir.Local 1; projections = [ Seed_mir.Field fid_first ] }) );
                      Seed_mir.Assign (place 0, Seed_mir.Use (Seed_mir.Move (place 2)));
                    ];
                  terminator = Seed_mir.Ret;
@@ -1870,7 +2473,7 @@ end
                        ( place 2,
                          Seed_mir.Use
                            (Seed_mir.Read
-                              { local = 1; projections = [ Seed_mir.Field (Ids.Field_id.make 999) ] }) );
+                              { root = Seed_mir.Local 1; projections = [ Seed_mir.Field (Ids.Field_id.make 999) ] }) );
                      Seed_mir.Assign (place 0, Seed_mir.Use (Seed_mir.Move (place 2)));
                    ];
                  terminator = Seed_mir.Ret;
@@ -2321,7 +2924,7 @@ end
            in
            let op_is_param pos local =
              match List.nth_opt ops pos with
-             | Some (Seed_mir.Copy p) -> p.Seed_mir.local = local
+             | Some (Seed_mir.Copy p) -> p.Seed_mir.root = Seed_mir.Local local
              | _ -> false
            in
            let pos_ok = op_is_param 0 1 && op_is_param 1 2 in
@@ -3475,7 +4078,7 @@ end
             in
             let op_is_param pos local =
               match List.nth_opt ops pos with
-              | Some (Seed_mir.Copy p) -> p.Seed_mir.local = local
+              | Some (Seed_mir.Copy p) -> p.Seed_mir.root = Seed_mir.Local local
               | _ -> false
             in
             let pos_ok = op_is_param l_pos_a 1 && op_is_param l_pos_b 2 in
@@ -3829,7 +4432,7 @@ end
               && (match args.(0).Seed_mir.effect_ with Access_effect.Read -> true | _ -> false)
               && (match args.(0).Seed_mir.value with
                  | Seed_mir.Copy p -> (
-                     match mmain_fn.Seed_mir.locals.(p.Seed_mir.local) with
+                     match mmain_fn.Seed_mir.locals.(Seed_mir.root_key p.Seed_mir.root) with
                      | Type_repr.Named (t, _) -> Ids.Type_id.compare t m_tid = 0
                      | _ -> false)
                  | _ -> false)
@@ -4707,7 +5310,7 @@ end
          Mir_lower.lower_function_with_variants Mir_lower.default_variant_table va_env
            "main" 100 [||] [||] va_main_decl
        in
-       let va_place l = { Seed_mir.local = l; projections = [] } in
+       let va_place l = { Seed_mir.root = Seed_mir.Local l; projections = [] } in
        let va_int_op n =
          Seed_mir.Constant
            (Seed_mir.Integer (Int_value.of_int64 ~width:64 ~signed:true (Int64.of_int n)))
@@ -4745,7 +5348,7 @@ end
                ( va_place 0,
                  Seed_mir.BinaryOp
                    ( Seed_mir.Add,
-                     Seed_mir.Read { local = 1; projections = [ Seed_mir.Field va_fid ] },
+                     Seed_mir.Read { root = Seed_mir.Local 1; projections = [ Seed_mir.Field va_fid ] },
                      Seed_mir.Move (va_place 2) ) );
            ]
        in
@@ -4761,7 +5364,7 @@ end
                ( va_place 0,
                  Seed_mir.BinaryOp
                    ( Seed_mir.Add,
-                     Seed_mir.Read { local = 1; projections = [ Seed_mir.Field va_fid ] },
+                     Seed_mir.Read { root = Seed_mir.Local 1; projections = [ Seed_mir.Field va_fid ] },
                      Seed_mir.Copy (va_place 2) ) );
            ]
        in

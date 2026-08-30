@@ -85,6 +85,7 @@ let lower_and_check ~repo_root (env : Typecheck.env) (program : Ast.program) : u
       oc_typed_functions = List.length env.Typecheck.functions;
       oc_typed_methods = List.length env.Typecheck.methods;
       oc_typed_consts = List.length env.Typecheck.consts;
+      oc_typed_statics = List.length env.Typecheck.statics;
       oc_typed_nominals = List.length env.Typecheck.nominals;
       oc_typed_calls = List.length env.state.oracle.o_calls;
       oc_mir_functions = stats.Driver.ms_functions;
@@ -250,6 +251,7 @@ let () =
            oc_typed_functions = List.length env.Typecheck.functions;
            oc_typed_methods = List.length env.Typecheck.methods;
            oc_typed_consts = List.length env.Typecheck.consts;
+           oc_typed_statics = List.length env.Typecheck.statics;
            oc_typed_nominals = List.length env.Typecheck.nominals;
            oc_typed_calls = typed_calls_sample;
            oc_mir_functions = stats.Driver.ms_functions;

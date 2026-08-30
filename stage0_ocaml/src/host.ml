@@ -133,6 +133,21 @@ let arg_mismatch expected : (Vm_value.t, string) result =
   Error ("argument mismatch: expected " ^ expected)
 
 (* () -> Unit *)
+(* the raw adapter: the argument/result conversions are the caller's
+   responsibility (used for the runtime Set/Map intrinsics whose
+   values are Vm_value.t arrays) — the signature is still written once
+   here and checked against the registry declaration *)
+let adapter_raw (param_tys : Type_repr.t list) (ret : Type_repr.t)
+    (invoke : t -> Vm_value.t array -> (Vm_value.t, string) result) : adapter =
+  {
+    signature =
+      {
+        param_types = List.map type_key param_tys;
+        return_type = type_key ret;
+      };
+    invoke;
+  }
+
 let adapter_ret_unit (f : t -> unit) : adapter =
   {
     signature = { param_types = []; return_type = type_key Type_repr.Unit };
@@ -251,6 +266,102 @@ let extern_binding (name : string) (a : adapter) : binding =
 
 let binding_manifest : binding list =
   [
+    intrinsic_binding "__intrinsic_set_new"
+      (adapter_raw [] (Type_repr.Int Type_repr.Int) (fun _ args ->
+           match args with
+           | [||] -> Ok (Vm_value.Set [])
+           | _ -> arg_mismatch "no arguments"));
+    intrinsic_binding "__intrinsic_map_new"
+      (adapter_raw [] Type_repr.Unit (fun _ args ->
+           match args with
+           | [||] -> Ok (Vm_value.Map [])
+           | _ -> arg_mismatch "no arguments"));
+    intrinsic_binding "__intrinsic_set_contains"
+      (adapter_raw [ Type_repr.Unit; Type_repr.Unit ] Type_repr.Bool (fun _ args ->
+           match args with
+           | [| Vm_value.Set elems; item |] ->
+               Ok (Vm_value.Bool (List.exists (fun e -> Vm_value.equal e item) elems))
+           | _ -> arg_mismatch "(Set, item)"));
+    intrinsic_binding "__intrinsic_set_insert"
+      (adapter_raw [ Type_repr.Unit; Type_repr.Unit ] Type_repr.Unit (fun _ args ->
+           (* re-audit review fix: the inout receiver cannot be mutated
+              through the VM's host-call path (args are values), so the
+              intrinsic RETURNS the updated set and the lowerer's
+              receiver channel writes it back into the receiver slot *)
+           match args with
+           | [| Vm_value.Set elems; item |] ->
+               let existed = List.exists (fun e -> Vm_value.equal e item) elems in
+               Ok
+                 (Vm_value.Set
+                    (if existed then elems else elems @ [ item ]))
+           | _ -> arg_mismatch "(Set, item)"));
+    intrinsic_binding "__intrinsic_set_len"
+      (adapter_raw [ Type_repr.Unit ] (Type_repr.Int Type_repr.Int) (fun _ args ->
+           match args with
+           | [| Vm_value.Set elems |] ->
+               Ok
+                 (Vm_value.Int
+                    (Int_value.of_int64 ~width:64 ~signed:true
+                       (Int64.of_int (List.length elems))))
+           | _ -> arg_mismatch "(Set)"));
+    intrinsic_binding "__intrinsic_set_entries"
+      (adapter_raw [ Type_repr.Unit ] Type_repr.Unit (fun _ args ->
+           match args with
+           | [| Vm_value.Set elems |] ->
+               Ok (Vm_value.Array (Array.of_list elems))
+           | _ -> arg_mismatch "(Set)"));
+    intrinsic_binding "__intrinsic_map_contains_key"
+      (adapter_raw [ Type_repr.Unit; Type_repr.Unit ] Type_repr.Bool (fun _ args ->
+           match args with
+           | [| Vm_value.Map pairs; key |] ->
+               Ok
+                 (Vm_value.Bool
+                    (List.exists (fun (k, _) -> Vm_value.equal k key) pairs))
+           | _ -> arg_mismatch "(Map, key)"));
+    intrinsic_binding "__intrinsic_map_get"
+      (adapter_raw [ Type_repr.Unit; Type_repr.Unit ] Type_repr.Unit (fun _ args ->
+           match args with
+           | [| Vm_value.Map pairs; key |] -> (
+               match List.find_opt (fun (k, _) -> Vm_value.equal k key) pairs with
+               | Some (_, v) ->
+                   Ok (Vm_value.Enum (0, [| v |]))
+               | None -> Ok (Vm_value.Enum (1, [||])))
+           | _ -> arg_mismatch "(Map, key)"));
+    intrinsic_binding "__intrinsic_map_insert"
+      (adapter_raw [ Type_repr.Unit; Type_repr.Unit; Type_repr.Unit ] Type_repr.Unit
+        (fun _ args ->
+          (* re-audit review fix: RETURN the updated map — the lowerer's
+             receiver channel writes it back into the inout slot *)
+          match args with
+          | [| Vm_value.Map pairs; key; value |] ->
+              let new_pairs =
+                match List.find_opt (fun (k, _) -> Vm_value.equal k key) pairs with
+                | Some _ ->
+                    List.map
+                      (fun (k, v) -> if Vm_value.equal k key then (k, value) else (k, v))
+                      pairs
+                | None -> pairs @ [ (key, value) ]
+              in
+              Ok (Vm_value.Map new_pairs)
+          | _ -> arg_mismatch "(Map, key, value)"));
+    intrinsic_binding "__intrinsic_map_len"
+      (adapter_raw [ Type_repr.Unit ] (Type_repr.Int Type_repr.Int) (fun _ args ->
+           match args with
+           | [| Vm_value.Map pairs |] ->
+               Ok
+                 (Vm_value.Int
+                    (Int_value.of_int64 ~width:64 ~signed:true
+                       (Int64.of_int (List.length pairs))))
+           | _ -> arg_mismatch "(Map)"));
+    intrinsic_binding "__intrinsic_map_entries"
+      (adapter_raw [ Type_repr.Unit ] Type_repr.Unit (fun _ args ->
+           match args with
+           | [| Vm_value.Map pairs |] ->
+               Ok
+                 (Vm_value.Array
+                    (Array.of_list
+                       (List.map (fun (k, v) -> Vm_value.Tuple [| k; v |]) pairs)))
+           | _ -> arg_mismatch "(Map)"));
     intrinsic_binding "print"
       (adapter_string_ret_unit (fun t s -> emit_stdout t s));
     intrinsic_binding "println"

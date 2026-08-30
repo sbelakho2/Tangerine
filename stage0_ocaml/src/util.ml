@@ -14,6 +14,35 @@ let has_prefix s p =
   let lp = String.length p and ls = String.length s in
   lp <= ls && String.sub s 0 lp = p
 
+let find_key_value_pos (s : string) (key_pat : string) : int option =
+  let rec go i =
+    if i + String.length key_pat > String.length s then None
+    else if String.sub s i (String.length key_pat) = key_pat then Some i
+    else go (i + 1)
+  in
+  go 0
+
+(* Re-audit item 30: the minimal JSON key->value reader the gate uses
+   for the single accepted-baseline pointer (bootstrap/evidence/ocaml/
+   accepted.json) — `"key": 172` -> Some "172". *)
+let find_key_value (s : string) (key_pat : string) : string option =
+  match find_key_value_pos s key_pat with
+  | None -> None
+  | Some i ->
+      let rest = String.sub s i (String.length s - i) in
+      match String.index_opt rest ':' with
+      | None -> None
+      | Some c ->
+          let after = String.trim (String.sub rest (c + 1) (String.length rest - c - 1)) in
+          let rec take_digits acc k =
+            if k >= String.length after then acc
+            else
+              match after.[k] with
+              | '0' .. '9' -> take_digits (acc ^ String.make 1 after.[k]) (k + 1)
+              | _ -> acc
+          in
+          (match take_digits "" 0 with "" -> None | v -> Some v)
+
 let has_suffix s p =
   let lp = String.length p and ls = String.length s in
   lp <= ls && String.sub s (ls - lp) lp = p

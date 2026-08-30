@@ -339,6 +339,9 @@ let project_type (ctx : ctx) (ty : Type_repr.t) (proj : projection) : Type_repr.
       match resolve_or_self ctx ty with
       | Type_repr.Fixed_array (elem, n) when i >= 0 && i < n -> Some elem
       | Type_repr.Tuple elems when i >= 0 && i < Array.length elems -> Some elems.(i)
+      (* re-audit item 17: the String byte-index projection (the seed's
+         documented byte convention) — the projected element is Char *)
+      | Type_repr.String -> Some Type_repr.Char
       | _ -> None)
   | Index li -> (
       (* dynamic-index form: the payload is the LOCAL whose runtime
@@ -355,6 +358,7 @@ let project_type (ctx : ctx) (ty : Type_repr.t) (proj : projection) : Type_repr.
       | Type_repr.Named (id, [| elem |])
         when Ids.Type_id.compare id (Ids.Type_id.make 0) = 0 ->
           Some elem
+      | Type_repr.String -> Some Type_repr.Char
       | _ -> None)
   | Downcast vid -> (
       match ty with
@@ -362,25 +366,41 @@ let project_type (ctx : ctx) (ty : Type_repr.t) (proj : projection) : Type_repr.
       | _ -> None)
 
 let place_type (ctx : ctx) (fn : function_) (p : place) : Type_repr.t option =
-  (* the GLOBAL storage root: a negative local addresses the VM's
-     statics slot (-1 - local) — exempt from the frame locals *)
-  if p.local < 0 then
-    if p.projections = [] then begin
-      let idx = -1 - p.local in
-      if idx >= 0 && idx < Array.length ctx.prog.Seed_mir.statics then
-        let (_, ty, _) = ctx.prog.Seed_mir.statics.(idx) in
-        Some ty
-      else None
-    end
-    else None
-  else if p.local >= Array.length fn.locals then None
-  else
-    List.fold_left
-      (fun acc proj ->
-        match acc with
-        | None -> None
-        | Some ty -> project_type ctx ty proj)
-      (Some fn.locals.(p.local)) p.projections
+  (* the explicit root (re-audit item 20): a Static root addresses the
+     program's statics table directly — exempt from the frame locals *)
+  match p.root with
+  | Seed_mir.Static idx ->
+      if p.projections = [] then
+        if idx >= 0 && idx < Array.length ctx.prog.Seed_mir.statics then
+          let (_, ty, _, _) = ctx.prog.Seed_mir.statics.(idx) in
+          Some ty
+        else None
+      else
+        (* the projected global (re-audit item 20): the projection walk
+           applies to the static's declared type exactly like a local
+           aggregate — the old negative-root branch rejected any
+           projection, disagreeing with the VM's projection machinery *)
+        List.fold_left
+          (fun acc proj ->
+            match acc with None -> None | Some ty -> project_type ctx ty proj)
+          (match
+             if idx >= 0 && idx < Array.length ctx.prog.Seed_mir.statics then
+               let (_, ty, _, _) = ctx.prog.Seed_mir.statics.(idx) in
+               Some ty
+             else None
+           with
+          | Some ty -> Some ty
+          | None -> None)
+          p.projections
+  | Seed_mir.Local lid ->
+      if lid >= Array.length fn.locals then None
+      else
+        List.fold_left
+          (fun acc proj ->
+            match acc with
+            | None -> None
+            | Some ty -> project_type ctx ty proj)
+          (Some fn.locals.(lid)) p.projections
 
 (* ──────────────────────────────────────────────────────────────────
    Place keys for the moved/destroyed lattices (reference-mirroring).
@@ -548,13 +568,13 @@ let init_in_sets (fn : function_) (tbl : (int, block) Hashtbl.t) : (int, IntSet.
     let out = ref new_in in
     List.iter
       (function
-        | Assign (p, _) -> out := IntSet.add p.local !out
+        | Assign (p, _) -> out := IntSet.add (root_key p.root) !out
         | StorageLive _ -> ()
         | StorageDead l -> out := IntSet.remove l !out
         | SetDiscriminant _ | Nop -> ())
       b.statements;
     (match b.terminator with
-     | Call (dest, _, _, _, _) -> out := IntSet.add dest.local !out
+     | Call (dest, _, _, _, _) -> out := IntSet.add (root_key dest.root) !out
      | _ -> ());
     !out
   in
@@ -609,7 +629,7 @@ let init_in_sets (fn : function_) (tbl : (int, block) Hashtbl.t) : (int, IntSet.
 
 let operand_moved_targets (moved : StrSet.t IntMap.t) (op : operand) : StrSet.t IntMap.t =
   match op with
-  | Move p | Consume p -> key_insert moved p.local (place_key p)
+  | Move p | Consume p -> key_insert moved (root_key p.root) (place_key p)
   | Copy _ | Read _ | Constant _ -> moved
 
 let rvalue_moved_targets (moved : StrSet.t IntMap.t) (rv : rvalue) : StrSet.t IntMap.t =
@@ -649,7 +669,7 @@ let moved_in_sets (fn : function_) (tbl : (int, block) Hashtbl.t) : (int, StrSet
       (function
         | Assign (p, rv) ->
             out := rvalue_moved_targets !out rv;
-            out := key_clear !out p.local (place_key p)
+            out := key_clear !out (root_key p.root) (place_key p)
         | StorageLive l | StorageDead l -> out := IntMap.remove l !out
         | SetDiscriminant _ | Nop -> ())
       b.statements;
@@ -724,12 +744,12 @@ let destroyed_in_sets (fn : function_) (tbl : (int, block) Hashtbl.t) :
     let out = ref new_in in
     List.iter
       (function
-        | Assign (p, _) -> out := key_clear !out p.local (place_key p)
+        | Assign (p, _) -> out := key_clear !out (root_key p.root) (place_key p)
         | StorageLive l | StorageDead l -> out := IntMap.remove l !out
         | SetDiscriminant _ | Nop -> ())
       b.statements;
     (match b.terminator with
-     | Drop (p, _, _) | Deinit (p, _, _) -> out := key_insert !out p.local (place_key p)
+     | Drop (p, _, _) | Deinit (p, _, _) -> out := key_insert !out (root_key p.root) (place_key p)
      | _ -> ());
     !out
   in
@@ -864,6 +884,10 @@ let check_projection_owners (ctx : ctx) (fn : function_) (bb_ctx : string)
                     (Printf.sprintf "%s: tuple index %d out of bounds (arity %d)" bb_ctx i
                        (Array.length elems))
                 else go elems.(i) rest
+            (* re-audit item 17: String byte-index projection — the
+               seed's documented byte convention (the VM extracts the
+               byte at the index into a Char) *)
+            | Type_repr.String -> go Type_repr.Char rest
             | _ ->
                 add_err ctx
                   (Printf.sprintf "%s: index projection on non-array type %s" bb_ctx
@@ -894,6 +918,7 @@ let check_projection_owners (ctx : ctx) (fn : function_) (bb_ctx : string)
              end);
             (match resolve_or_self ctx ty with
              | Type_repr.Fixed_array (elem, _) -> go elem rest
+             | Type_repr.String -> go Type_repr.Char rest
              | _ ->
                  add_err ctx
                    (Printf.sprintf "%s: index projection on non-array type %s" bb_ctx
@@ -930,44 +955,55 @@ let check_projection_owners (ctx : ctx) (fn : function_) (bb_ctx : string)
                   (Printf.sprintf "%s: variant projection on non-enum type %s" bb_ctx
                      (Seed_mir.print_type ty))))
   in
-  if p.local >= 0 && p.local < Array.length fn.locals then
-    go fn.locals.(p.local) p.projections
+  (* the explicit root (re-audit item 20): the projection-owner walk
+     bases on the LOCAL's type or the STATIC's declared type — the
+     negative-root indexing crash is gone *)
+  let base_ty =
+    match p.root with
+    | Seed_mir.Local lid when lid >= 0 && lid < Array.length fn.locals ->
+        Some fn.locals.(lid)
+    | Seed_mir.Static idx when idx >= 0 && idx < Array.length ctx.prog.Seed_mir.statics ->
+        let (_, ty, _, _) = ctx.prog.Seed_mir.statics.(idx) in
+        Some ty
+    | _ -> None
+  in
+  (match base_ty with Some ty -> go ty p.projections | None -> ())
 
 let check_place_readable (ctx : ctx) (fn : function_) (bb_ctx : string)
     (p : place) (running : IntSet.t) : unit =
-  if p.local < 0 then begin
+  if root_key p.root < 0 then begin
     (* the global root: no initialization tracking in the running set *)
     check_projection_owners ctx fn bb_ctx running p;
     if p.projections <> [] && place_type ctx fn p = None then
-      add_err ctx (Printf.sprintf "%s: invalid projection chain on static slot _%d" bb_ctx (-1 - p.local))
+      add_err ctx (Printf.sprintf "%s: invalid projection chain on static slot _%d" bb_ctx (Seed_mir.root_static_index p.root))
   end
-  else if p.local >= Array.length fn.locals then
-    add_err ctx (Printf.sprintf "%s: place references undefined local _%d" bb_ctx p.local)
+  else if (root_key p.root) >= Array.length fn.locals then
+    add_err ctx (Printf.sprintf "%s: place references undefined local _%d" bb_ctx (root_key p.root))
   else begin
-    if not (IntSet.mem p.local running) then
-      add_err ctx (Printf.sprintf "%s: use of possibly-uninitialized local _%d" bb_ctx p.local);
+    if not (IntSet.mem (root_key p.root) running) then
+      add_err ctx (Printf.sprintf "%s: use of possibly-uninitialized local _%d" bb_ctx (root_key p.root));
     check_projection_owners ctx fn bb_ctx running p;
     if p.projections <> [] && place_type ctx fn p = None then
-      add_err ctx (Printf.sprintf "%s: invalid projection chain on local _%d" bb_ctx p.local)
+      add_err ctx (Printf.sprintf "%s: invalid projection chain on local _%d" bb_ctx (root_key p.root))
   end
 
 let check_dest_place (ctx : ctx) (fn : function_) (bb_ctx : string) (p : place)
     (running : IntSet.t) : unit =
-  if p.local < 0 then begin
+  if root_key p.root < 0 then begin
     (* the global root: no initialization tracking in the running set *)
     check_projection_owners ctx fn bb_ctx running p
   end
-  else if p.local >= Array.length fn.locals then
-    add_err ctx (Printf.sprintf "%s: assignment to undefined local _%d" bb_ctx p.local)
+  else if (root_key p.root) >= Array.length fn.locals then
+    add_err ctx (Printf.sprintf "%s: assignment to undefined local _%d" bb_ctx (root_key p.root))
   else begin
     check_projection_owners ctx fn bb_ctx running p;
     if p.projections <> [] then begin
-      if not (IntSet.mem p.local running) then
+      if not (IntSet.mem (root_key p.root) running) then
         add_err ctx
           (Printf.sprintf "%s: assign into field of possibly-uninitialized local _%d" bb_ctx
-             p.local);
+             (root_key p.root));
       if place_type ctx fn p = None then
-        add_err ctx (Printf.sprintf "%s: invalid projection chain on local _%d" bb_ctx p.local)
+        add_err ctx (Printf.sprintf "%s: invalid projection chain on local _%d" bb_ctx (root_key p.root))
     end
   end
 
@@ -977,8 +1013,9 @@ let check_dest_place (ctx : ctx) (fn : function_) (bb_ctx : string) (p : place)
 let check_ref_operand (ctx : ctx) (fn : function_) (bb_ctx : string) (op : operand)
     ~(as_call_arg : bool) : unit =
   let check p =
-    if p.projections = [] && p.local >= 0 && p.local < Array.length fn.locals then
-      match fn.locals.(p.local) with
+    if p.projections = [] && not (root_is_static p.root)
+       && (root_key p.root) >= 0 && (root_key p.root) < Array.length fn.locals
+    then match fn.locals.(root_key p.root) with
       | Type_repr.Ref_internal (_, _) when not as_call_arg ->
           add_err ctx
             (Printf.sprintf
@@ -994,18 +1031,19 @@ let check_ref_operand (ctx : ctx) (fn : function_) (bb_ctx : string) (op : opera
          check_projected_move_transfer (a projected move is never a
          legal transfer regardless of the root type); this ref rule
          covers the bare form only *)
-      (if p.projections = [] && p.local >= 0 && p.local < Array.length fn.locals then
-         match fn.locals.(p.local) with
+      (if p.projections = [] && not (root_is_static p.root)
+          && (root_key p.root) >= 0 && (root_key p.root) < Array.length fn.locals
+        then match fn.locals.(root_key p.root) with
          | Type_repr.Ref_internal (_, _) ->
              add_err ctx
                (Printf.sprintf "%s: ref-typed local _%d moved (refs are internal ABI temporaries)"
-                  bb_ctx p.local)
+                  bb_ctx (root_key p.root))
          | _ -> ());
   | Constant _ -> ()
 
 (* ── Categorical projected-Move/Consume rejection (audit P0) ─────────
    The seed VM has NO partial-move representation: `Move p` /
-   `Consume p` evaluates `move_slot frame.locals.(p.local)` — the WHOLE
+   `Consume p` evaluates `move_slot frame.locals.((root_key p.root)` — the WHOLE
    root slot transitions to Moved, and `p.projections` is ignored.  The
    verifier's moved lattice is projection-aware (place keys track
    sub-place ownership), so a projected move would DISAGREE with the
@@ -1025,7 +1063,7 @@ let check_projected_move_transfer (ctx : ctx) (bb_ctx : string) (op : operand) :
         add_err ctx
           (Printf.sprintf
              "%s: projected %s is unsupported by the seed VM (no partial-move representation: a Move/Consume of local _%d through a projection would transition the WHOLE root slot to Moved, disagreeing with the projection-aware moved lattice; rejected until the VM executes projected moves)"
-             bb_ctx kind p.local)
+             bb_ctx kind (root_key p.root))
   | Copy _ | Read _ | Constant _ -> ()
 
 (* Callee-resolution result (see resolve_callee below). *)
@@ -1041,9 +1079,9 @@ let rec check_operand (ctx : ctx) (fn : function_) (bb_ctx : string) (op : opera
       check_ref_operand ctx fn bb_ctx op ~as_call_arg;
       check_place_readable ctx fn bb_ctx p running;
       let k = place_key p in
-      if key_moved moved p.local k then
+      if key_moved moved (root_key p.root) k then
         add_err ctx
-          (Printf.sprintf "%s: copy of previously moved place _%d (key %S)" bb_ctx p.local k);
+          (Printf.sprintf "%s: copy of previously moved place _%d (key %S)" bb_ctx (root_key p.root) k);
       (match place_type ctx fn p with
        | Some ty ->
            if not (is_copy ctx ty) then
@@ -1057,29 +1095,29 @@ let rec check_operand (ctx : ctx) (fn : function_) (bb_ctx : string) (op : opera
       check_ref_operand ctx fn bb_ctx op ~as_call_arg;
       check_place_readable ctx fn bb_ctx p running;
       let k = place_key p in
-      if key_moved moved p.local k then
+      if key_moved moved (root_key p.root) k then
         add_err ctx
-          (Printf.sprintf "%s: read of previously consumed local _%d (key %S)" bb_ctx p.local k);
+          (Printf.sprintf "%s: read of previously consumed local _%d (key %S)" bb_ctx (root_key p.root) k);
       place_type ctx fn p
   | Move p ->
       check_projected_move_transfer ctx bb_ctx op;
       check_ref_operand ctx fn bb_ctx op ~as_call_arg;
       check_place_readable ctx fn bb_ctx p running;
       let k = place_key p in
-      if key_moved moved p.local k then
+      if key_moved moved (root_key p.root) k then
         add_err ctx
           (Printf.sprintf "%s: use-after-move (second consume) of local _%d (key %S)" bb_ctx
-             p.local k);
+             (root_key p.root) k);
       place_type ctx fn p
   | Consume p ->
       check_projected_move_transfer ctx bb_ctx op;
       check_ref_operand ctx fn bb_ctx op ~as_call_arg;
       check_place_readable ctx fn bb_ctx p running;
       let k = place_key p in
-      if key_moved moved p.local k then
+      if key_moved moved (root_key p.root) k then
         add_err ctx
-          (Printf.sprintf "%s: consume of previously consumed local _%d (key %S)" bb_ctx p.local
-             k);
+          (Printf.sprintf "%s: consume of previously consumed local _%d (key %S)" bb_ctx
+             (root_key p.root) k);
       place_type ctx fn p
   | Constant c -> Some (constant_type ctx c)
 
@@ -1445,9 +1483,9 @@ let check_rvalue (ctx : ctx) (fn : function_) (bb_ctx : string) (declared : IntS
   | Ref p | RefMut p -> (
       check_place_readable ctx fn bb_ctx p running;
       let k = place_key p in
-      if key_moved moved p.local k then
+      if key_moved moved (root_key p.root) k then
         add_err ctx
-          (Printf.sprintf "%s: ref of previously consumed local _%d (key %S)" bb_ctx p.local k);
+          (Printf.sprintf "%s: ref of previously consumed local _%d (key %S)" bb_ctx (root_key p.root) k);
       match place_type ctx fn p with
       | Some t -> Some (Type_repr.Ref_internal (Type_repr.Mutable, t))
       | None -> None)
@@ -1522,9 +1560,9 @@ let check_rvalue (ctx : ctx) (fn : function_) (bb_ctx : string) (declared : IntS
   | Discriminant p -> (
       check_place_readable ctx fn bb_ctx p running;
       let k = place_key p in
-      if key_moved moved p.local k then
+      if key_moved moved (root_key p.root) k then
         add_err ctx
-          (Printf.sprintf "%s: discriminant of previously consumed local _%d" bb_ctx p.local);
+          (Printf.sprintf "%s: discriminant of previously consumed local _%d" bb_ctx (root_key p.root));
       match place_type ctx fn p with
       | Some ty -> (
           match enum_def_arity ctx ty with
@@ -1538,8 +1576,8 @@ let check_rvalue (ctx : ctx) (fn : function_) (bb_ctx : string) (declared : IntS
   | Len p -> (
       check_place_readable ctx fn bb_ctx p running;
       let k = place_key p in
-      if key_moved moved p.local k then
-        add_err ctx (Printf.sprintf "%s: len of previously consumed local _%d" bb_ctx p.local);
+      if key_moved moved (root_key p.root) k then
+        add_err ctx (Printf.sprintf "%s: len of previously consumed local _%d" bb_ctx (root_key p.root));
       match place_type ctx fn p with
       | Some ty -> (
           match resolve_or_self ctx ty with
@@ -1547,6 +1585,11 @@ let check_rvalue (ctx : ctx) (fn : function_) (bb_ctx : string) (declared : IntS
           | Type_repr.Named (id, _)
             when Ids.Type_id.compare id (Ids.Type_id.make 0) = 0 ->
               Some (Type_repr.Int Type_repr.UInt)
+          (* re-audit item 17: the seed's documented Unicode decision —
+             String indices are BYTE indices, consistent with Len's
+             String.length — so Len(String) is the byte count, exactly
+             what the VM computes *)
+          | Type_repr.String -> Some (Type_repr.Int Type_repr.UInt)
           | _ ->
               add_err ctx
                 (Printf.sprintf "%s: len of non-array value of type %s" bb_ctx
@@ -1753,12 +1796,12 @@ let check_terminator (ctx : ctx) (fn : function_) (bb_ctx : string) (t : termina
       Option.iter check_target unwind;
       check_place_readable ctx fn bb_ctx p running;
       let k = place_key p in
-      if key_moved moved p.local k then
+      if key_moved moved (root_key p.root) k then
         add_err ctx
           (Printf.sprintf "%s: drop of previously moved/consumed local _%d (key %S)" bb_ctx
-             p.local k);
-      if destroyed_key_conflict destroyed p.local k then
-        add_err ctx (Printf.sprintf "%s: duplicate drop of local _%d (key %S)" bb_ctx p.local k)
+             (root_key p.root) k);
+      if destroyed_key_conflict destroyed (root_key p.root) k then
+        add_err ctx (Printf.sprintf "%s: duplicate drop of local _%d (key %S)" bb_ctx (root_key p.root) k)
   | Assert (op, _, _, target) -> (
       check_target target;
       match check_operand ctx fn bb_ctx op running moved ~as_call_arg:false with
@@ -1932,6 +1975,21 @@ let verify_function (ctx : ctx) (fn : function_) : unit =
                             "%s: value stored into aggregate (refs must only be assigned to plain temps)"
                             bb_ctx)
                  | _ -> ());
+                (* re-audit item 21: static MUTABILITY reaches MIR
+                   verification — an Assign into an immutable static is
+                   rejected here, not only at the frontend (defense in
+                   depth: the global place's declaration is the table's
+                   mutable flag, so the const/static conflation cannot
+                   smuggle a write past the verifier) *)
+                (if root_key p.root < 0 then
+                   let sidx = Seed_mir.root_static_index p.root in
+                   if sidx >= 0 && sidx < Array.length ctx.prog.Seed_mir.statics then
+                     let (_, _, mutable_, _) = ctx.prog.Seed_mir.statics.(sidx) in
+                     if not mutable_ then
+                       add_err ctx
+                         (Printf.sprintf
+                            "%s: assignment to immutable static _%d (the declaration is not `mut`; the verifier rejects the write at the MIR layer)"
+                            bb_ctx sidx));
                 check_dest_place ctx fn bb_ctx p !running;
                  (match place_type ctx fn p with
                   | Some dst_ty -> (
@@ -1946,16 +2004,16 @@ let verify_function (ctx : ctx) (fn : function_) : unit =
                                 (Seed_mir.print_type t) (Seed_mir.print_type dst_ty))
                      | None -> ())
                  | None -> ());
-                running := IntSet.add p.local !running;
+                running := IntSet.add (root_key p.root) !running;
                 moved := rvalue_moved_targets !moved rv;
                 let akey = place_key p in
-                if p.projections <> [] && akey <> "*" && key_moved !moved p.local "" then
+                if p.projections <> [] && akey <> "*" && key_moved !moved (root_key p.root) "" then
                   add_err ctx
                     (Printf.sprintf
                        "%s: assign into a field of consumed local _%d (the whole root was moved out)"
-                       bb_ctx p.local);
-                moved := key_clear !moved p.local akey;
-                destroyed := key_clear !destroyed p.local akey
+                       bb_ctx (root_key p.root));
+                moved := key_clear !moved (root_key p.root) akey;
+                destroyed := key_clear !destroyed (root_key p.root) akey
             | StorageLive l ->
                 if l < 0 || l >= Array.length fn.locals then
                   add_err ctx (Printf.sprintf "%s: StorageLive for undefined local _%d" bb_ctx l)
@@ -1975,10 +2033,10 @@ let verify_function (ctx : ctx) (fn : function_) : unit =
             | SetDiscriminant (p, vid) ->
                 check_place_readable ctx fn bb_ctx p !running;
                 let k = place_key p in
-                if key_moved !moved p.local k then
+                if key_moved !moved (root_key p.root) k then
                   add_err ctx
                     (Printf.sprintf "%s: SetDiscriminant of previously consumed local _%d" bb_ctx
-                       p.local);
+                       (root_key p.root));
                 (match place_type ctx fn p with
                  | Some ty -> (
                      match enum_variant_payload ctx ty vid with
@@ -2002,12 +2060,12 @@ let verify_function (ctx : ctx) (fn : function_) : unit =
         check_terminator ctx fn bb_ctx b.terminator !running !moved !destroyed;
         (match b.terminator with
          | Call (dest, _, _, _, _) ->
-             running := IntSet.add dest.local !running;
+             running := IntSet.add (root_key dest.root) !running;
              let dkey = place_key dest in
-             moved := key_clear !moved dest.local dkey;
-             destroyed := key_clear !destroyed dest.local dkey
+             moved := key_clear !moved (root_key dest.root) dkey;
+             destroyed := key_clear !destroyed (root_key dest.root) dkey
          | Drop (p, _, _) | Deinit (p, _, _) ->
-             destroyed := key_insert !destroyed p.local (place_key p)
+             destroyed := key_insert !destroyed (root_key p.root) (place_key p)
          | _ -> ()))
       fn.blocks
   end
@@ -2051,7 +2109,7 @@ let verify_registry (ctx : ctx) : unit =
 
 let verify_statics (ctx : ctx) : unit =
   Array.iter
-    (fun (name, ty, init) ->
+    (fun (name, ty, _, init) ->
       let what = Printf.sprintf "static %s" name in
       (* statics are module-level: nothing is declared, so template mode
          rejects Type_params here exactly like concrete mode *)

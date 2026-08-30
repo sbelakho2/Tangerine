@@ -54,7 +54,45 @@
    the primary count and the secondary count.  The MONOTONIC scalars
    moving UP fails the gate; moving down is progress, not a regression.
    The per-category buckets are diagnostic context only (a category may
-   rise while the total falls — re-audit finding 5). *)
+   rise while the total falls — re-audit finding 5).
+
+   Re-audit item 30: the hardcoded baseline below is the FALLBACK; the
+   SINGLE machine-readable pointer is bootstrap/evidence/ocaml/
+   accepted.json (the tested SHA + the expected debt facts), which the
+   gate and the health script both read — the two can no longer drift.
+   When the accepted record is present, its debt facts replace the
+   fallback scalars. *)
+let baseline_from_file (repo_root : string) : Debt_report.t option =
+  let path = Filename.concat repo_root "bootstrap/evidence/ocaml/accepted.json" in
+  match In_channel.open_bin path with
+  | exception _ -> None
+  | ic ->
+      let content = In_channel.input_all ic in
+      close_in ic;
+      let int_of_key key =
+        let pat = "\"" ^ key ^ "\"" in
+        match Util.find_key_value content pat with
+        | Some v -> int_of_string v
+        | None -> 0
+      in
+      let total = int_of_key "debt_total" in
+      let primaries = int_of_key "debt_primary" in
+      let secondaries = int_of_key "debt_secondary" in
+      if total <= 0 || primaries <= 0 || secondaries <= 0 then begin
+        Printf.printf
+          "  WARNING: bootstrap/evidence/ocaml/accepted.json is missing or malformed (debt_total %d, debt_primary %d, debt_secondary %d) — falling back to the hardcoded baseline\n"
+          total primaries secondaries;
+        None
+      end
+      else
+        Some
+          {
+            Debt_report.buckets =
+              List.map (fun c -> (c, 0)) Debt_report.categories;
+            total;
+            primaries;
+            secondaries;
+          }
 let baseline_typecheck_debt : Debt_report.t =
   {
     Debt_report.buckets =
@@ -259,12 +297,23 @@ let () =
   in
   Printf.printf "TANGERINE OCAML SEED — BOOTSTRAP COMPLETENESS GATE (tg_bootstrap_gate)\n";
   Printf.printf "  repo-root: %s; target: %s\n" repo_root target_str;
-  Printf.printf "  checked typecheck-debt baseline: total %d, primary %d, secondary %d\n"
-    baseline_typecheck_debt.Debt_report.total baseline_typecheck_debt.Debt_report.primaries
-    baseline_typecheck_debt.Debt_report.secondaries;
+  let baseline =
+    match baseline_from_file repo_root with
+    | Some b when b.Debt_report.total > 0 ->
+        Printf.printf
+          "  checked typecheck-debt baseline (bootstrap/evidence/ocaml/accepted.json — the single accepted pointer): total %d, primary %d, secondary %d\n"
+          b.Debt_report.total b.Debt_report.primaries b.Debt_report.secondaries;
+        b
+    | _ ->
+        Printf.printf
+          "  checked typecheck-debt baseline (hardcoded fallback — no accepted.json): total %d, primary %d, secondary %d\n"
+          baseline_typecheck_debt.Debt_report.total baseline_typecheck_debt.Debt_report.primaries
+          baseline_typecheck_debt.Debt_report.secondaries;
+        baseline_typecheck_debt
+  in
   List.iter
     (fun (c, n) -> Printf.printf "    baseline %s: %d\n" c n)
-    baseline_typecheck_debt.Debt_report.buckets;
+    baseline.Debt_report.buckets;
   let target =
     match Target.unsupported_triple target_str with
     | Ok t -> t
@@ -313,7 +362,7 @@ let () =
        Printf.printf "  measured debt: total %d, primary %d, secondary %d\n"
          measured_debt.Debt_report.total measured_debt.Debt_report.primaries
          measured_debt.Debt_report.secondaries;
-       check_no_regression measured_debt baseline_typecheck_debt;
+       check_no_regression measured_debt baseline;
        (* re-audit P0s: the manifest subset firewall and the strict
           resolution are HARD gates on the actual closure result (never
           merely printed) *)
