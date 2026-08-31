@@ -923,6 +923,9 @@ let rec field_projection_of (env : func_env) (bty : Type_repr.t) (fname : string
             "named field `.%s` on a tuple base in lowering (tuples have no FieldId — use the numeric ConstantIndex form)"
             fname
       | _ ->
+          (if Sys.getenv_opt "TANGERINE_DEBUG_CALL" <> None then
+             Printf.eprintf "DEBUG-FIELDACCESS fname=%s base=%s\n" fname
+               (Seed_mir.print_type bty));
           seed_bug "field access on non-struct type %s in lowering" (Seed_mir.print_type bty))
 
 (* ── Expression lowering ──────────────────────────────────────── *)
@@ -3927,6 +3930,8 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
          lowered under).  Every unresolvable receiver or method fails
          closed with the reason. *)
       let rop, rty = lower_expr env st base in
+      (if Sys.getenv_opt "TANGERINE_DEBUG_CALL" <> None && mname = "strong_count" then
+         Printf.eprintf "DEBUG-FBASE mname=%s rty=%s\n" mname (Seed_mir.print_type rty));
       let rp = materialize_place st rop in
       let owner =
         match rty with
@@ -4051,6 +4056,10 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
                      if subst = [] then me.me_ret
                      else Type_repr.substitute subst me.me_ret)
            in
+           (if Sys.getenv_opt "TANGERINE_DEBUG_CALL" <> None && mname = "as_ref" then
+              Printf.eprintf "DEBUG-ASREF owner=%s rty=%s ret=%s dest=%s\n" owner
+                (Seed_mir.print_type rty) (Seed_mir.print_type me.me_ret)
+                (Seed_mir.print_type recv_dest_ty));
            let id = fresh_local st recv_dest_ty in
            let rp2 = cur_place st id in
            let arg_vals =
@@ -4129,15 +4138,17 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
                          acc (Array.to_list a1) (Array.to_list a2)
                    | _ -> acc
                  in
+                 let subst_ty t =
+                   match me.me_params with
+                   | [||] -> t
+                   | _ ->
+                       let self_ty = me.me_params.(0).Type_repr.pt_type in
+                       let subst = subst_against self_ty rty [] in
+                       if subst = [] then t else Type_repr.substitute subst t
+                 in
                  match dest_ty with
-                 | Type_repr.Named (_, _) -> (
-                     match me.me_params with
-                     | [||] -> dest_ty
-                     | _ ->
-                         let self_ty = me.me_params.(0).Type_repr.pt_type in
-                         let subst = subst_against self_ty rty [] in
-                         Type_repr.substitute subst dest_ty)
-                 | _ -> dest_ty
+                 | Type_repr.Named (_, _) -> subst_ty dest_ty
+                 | _ -> subst_ty dest_ty
                in
                let _ =
                  if Sys.getenv_opt "TANGERINE_DEBUG_PT" <> None then
