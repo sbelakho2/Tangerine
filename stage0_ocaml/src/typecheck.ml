@@ -3896,7 +3896,6 @@ and check_block (env : env) (scope : scope) (expected : Type_repr.t option) (b :
                   {
                     fr_normal =
                       (if acc.fr_normal = None || te.te_flow.fr_normal = None then None
-                       else if te.te_type = Type_repr.Unit then None
                        else Some te.te_type);
                     fr_may_return = acc.fr_may_return || te.te_flow.fr_may_return;
                     fr_may_break = acc.fr_may_break || te.te_flow.fr_may_break;
@@ -6218,12 +6217,16 @@ let rec check_function_body (env : env) (extra_tp_bounds : (string * string list
           match check_expr env' scope (Some sig_.ts_return) e with
           | Error m -> Error m
           | Ok te ->
+              (* the expression body's flow IS the function body's flow:
+                 an expression body containing divergence (return/break/
+                 next) must carry its computed flow forward — never
+                 re-derived from the type or the syntax *)
               Ok
                 {
-                  fr_normal = Some te.te_type;
-                  fr_may_return = false;
-                  fr_may_break = false;
-                  fr_may_continue = false;
+                  fr_normal = te.te_flow.fr_normal;
+                  fr_may_return = te.te_flow.fr_may_return;
+                  fr_may_break = te.te_flow.fr_may_break;
+                  fr_may_continue = te.te_flow.fr_may_continue;
                 })
       | Ast.FnSignatureOnly ->
           Ok
