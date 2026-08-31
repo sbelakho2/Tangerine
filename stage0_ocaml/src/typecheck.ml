@@ -362,7 +362,8 @@ let err (span : Span.span) (msg : string) : string =
                     || it = "def inline_calls_in_function" || it = "def lower_program"
                     || it = "def check_stmt" || it = "def check_expr" || it = "def allocate_locals"
                     || it = "def collect_dep_file" || it = "def lower_expr_to_rvalue"
-                    || it = "def type_check_typed" -> (
+                    || it = "def type_check_typed" || it = "def mir_emit_partial_drop_chain"
+                    || it = "def lower_program" -> (
          let loc =
            match !debug_source_map with
            | Some sm -> (
@@ -1719,7 +1720,12 @@ let rec unify (box_tid : Ids.Type_id.t option) (subst : (Type_repr.generic_key *
         in
         go 0
       end
-  | _ -> Error "type mismatch"
+  | _ ->
+      (if Sys.getenv_opt "TANGERINE_DEBUG_CALL" <> None then
+         Printf.eprintf "DEBUG-UNIFYFALL %s vs %s item=%s\n" (type_to_string a')
+           (type_to_string b')
+           (match !current_item_global with Some s -> s | None -> "?"));
+      Error "type mismatch"
 
 (* Substitute through the bindings until fixpoint. *)
 let substitute_fixpoint (subst : (Type_repr.generic_key * Type_repr.t) list) (ty : Type_repr.t) :
@@ -3960,6 +3966,20 @@ and check_stmt (env : env) (scope : scope) (s : Ast.stmt) :
                             fr_may_continue = te.te_flow.fr_may_continue;
                           } )))))
   | Ast.ExprStmt (e, _) -> (
+      (if Sys.getenv_opt "TANGERINE_DEBUG_CALL" <> None then
+         match !current_item_global with
+         | Some it when it = "def check_stmt" || it = "def check_expr" || it = "def lower_program"
+                        || it = "def mir_emit_partial_drop_chain" ->
+             let loc =
+               match !debug_source_map with
+               | Some sm -> (
+                   match Span.resolve sm (Ast.expr_span e) with
+                   | Some (f, l, _) -> f ^ ":" ^ string_of_int l
+                   | None -> "?")
+               | None -> "?"
+             in
+             Printf.eprintf "DEBUG-STMT %s at %s\n" it loc
+         | _ -> ());
       match check_expr_use env scope Discarded None e with
       | Ok te -> (
           (* re-audit P0: the statement's flow IS the expression's flow
@@ -4160,6 +4180,11 @@ and check_if (env : env) (scope : scope) (use : expr_use) (expected : Type_repr.
             match unify env.state.box_tid subst tt_ty (flow_normal te) with
             | Ok () -> Ok ()
             | Error m -> (
+                (if Sys.getenv_opt "TANGERINE_DEBUG_CALL" <> None then
+                   Printf.eprintf "DEBUG-IFJOIN use=%s tt=%s te=%s item=%s\n"
+                     (match use with Discarded -> "D" | Value -> "V")
+                     (type_to_string tt_ty) (type_to_string (flow_normal te))
+                     (match !current_item_global with Some s -> s | None -> "?"));
                 (* a DISCARDED if whose branches diverge over Unit
                    (`if c then () else x end` — the Unit branch's value
                    is dropped): only that shape reconciles, and only in
