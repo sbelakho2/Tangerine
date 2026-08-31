@@ -348,8 +348,28 @@ let err_span_journal : (string, Span.span * string) Hashtbl.t = Hashtbl.create 4
 let debug_source_map : Span.source_map option ref = ref None
 let current_item_global : string option ref = ref None
 let current_mod_global : string list ref = ref []
+let type_names_global : (Ids.Type_id.t * string) list ref = ref []
 
 let err (span : Span.span) (msg : string) : string =
+  (if Sys.getenv_opt "TANGERINE_DEBUG_CALL" <> None then
+     match !current_item_global with
+     | Some it when it = "def check_item" || it = "def check_stmt" || it = "def check_expr"
+                    || it = "def merge_frames" || it = "def lr_call" || it = "def codegen_intrinsic"
+                    || it = "def bare_name_resolve" || it = "def resolve_bare_type_name"
+                    || it = "def resolve_bare_callable" || it = "def compile_file_core"
+                    || it = "def compile_multiple_files" || it = "def compile_startup_entry"
+                    || it = "def run_mir_completeness_oracle" || it = "def mir_emit_partial_drop_chain"
+                    || it = "def inline_calls_in_function" -> (
+         let loc =
+           match !debug_source_map with
+           | Some sm -> (
+               match Span.resolve sm span with
+               | Some (f, l, _) -> f ^ ":" ^ string_of_int l
+               | None -> "?")
+           | None -> "?"
+         in
+         Printf.eprintf "DEBUG-ERR %s | %s | at %s\n" it msg loc)
+     | _ -> ());
   let formatted = Printf.sprintf "%s at file#%d[%d..%d)" msg span.Span.file_id span.Span.start span.Span.end_ in
   Hashtbl.replace err_span_journal formatted (span, msg);
   formatted
@@ -1638,7 +1658,14 @@ let rec unify (box_tid : Ids.Type_id.t option) (subst : (Type_repr.generic_key *
       if
         Ids.Type_id.compare id1 id2 <> 0
         || Array.length a1 <> Array.length a2
-      then Error "type mismatch"
+      then (
+        (if Sys.getenv_opt "TANGERINE_DEBUG_CALL" <> None then
+           let it = match !current_item_global with Some s -> s | None -> "?" in
+           let name1 = match List.assoc_opt id1 !type_names_global with Some n -> n | None -> "?" in
+           let name2 = match List.assoc_opt id2 !type_names_global with Some n -> n | None -> "?" in
+           Printf.eprintf "DEBUG-UNIFYMM id1=%d(%s) id2=%d(%s) item=%s\n"
+             (Ids.Type_id.to_int id1) name1 (Ids.Type_id.to_int id2) name2 it);
+        Error "type mismatch")
       else begin
         let rec go i =
           if i >= Array.length a1 then Ok ()
@@ -1895,17 +1922,20 @@ and resolve_named (env : env) (scope : scope) (span : Span.span) (name : string)
                             (Printf.sprintf
                                "associated type `%s` of `%s` is not available in the bootstrap subset"
                                assoc head))
-                   | Error _ -> (
-                       (* flat-namespace fallback: a module-qualified type
-                          spelling resolves by its last segment *)
-                       let last =
-                         match List.rev (String.split_on_char ':' name) with
-                         | x :: _ -> x
-                         | [] -> name
-                       in
-                       match List.assoc_opt last env.types with
-                       | Some entry -> Ok entry
-                       | None -> Error (err span ("unknown type `" ^ name ^ "`")))))
+                    | Error _ -> (
+                        (* flat-namespace fallback: a module-qualified type
+                           spelling resolves by its last segment *)
+                        let last =
+                          match List.rev (String.split_on_char ':' name) with
+                          | x :: _ -> x
+                          | [] -> name
+                        in
+                        if Sys.getenv_opt "TANGERINE_DEBUG_CALL" <> None then
+                          Printf.eprintf "DEBUG-QUAL name=%s head=%s last=%s found=%b\n" name head
+                            last (List.mem_assoc last env.types);
+                        match List.assoc_opt last env.types with
+                        | Some entry -> Ok entry
+                        | None -> Error (err span ("unknown type `" ^ name ^ "`")))))
           | None -> (
               match List.assoc_opt name env.types with
               | None -> Error (err span ("unknown type `" ^ name ^ "`"))
@@ -4038,7 +4068,9 @@ and check_if (env : env) (scope : scope) (use : expr_use) (expected : Type_repr.
      like `out.insert(x)` (Bool) would otherwise fail a Some Unit
      expectation from an enclosing match arm *)
   let then_exp =
-    match i.Ast.if_else with None -> None | Some _ -> expected
+    match use with
+    | Discarded -> None
+    | Value -> (match i.Ast.if_else with None -> None | Some _ -> expected)
   in
   let* tt = check_block env then_scope then_exp i.Ast.if_then i.Ast.if_then.Ast.b_span in
   let tt_ty = flow_normal tt in
@@ -4050,10 +4082,13 @@ and check_if (env : env) (scope : scope) (use : expr_use) (expected : Type_repr.
           | Error m -> Error m
           | Ok _ -> (
               let b_exp =
-                match i.Ast.if_else, tt_ty with
-                | None, _ -> None
-                | Some _, Type_repr.Never -> expected
-                | Some _, _ -> Some tt_ty
+                match use with
+                | Discarded -> None
+                | Value -> (
+                    match i.Ast.if_else, tt_ty with
+                    | None, _ -> None
+                    | Some _, Type_repr.Never -> expected
+                    | Some _, _ -> Some tt_ty)
               in
               match check_block env scope b_exp b b.Ast.b_span with
               | Ok tb -> go (tb :: acc) rest
@@ -4202,7 +4237,17 @@ and check_match (env : env) (scope : scope) (use : expr_use) (expected : Type_re
               in
               let expected' =
                 match acc with
-                | [] -> expected
+                | [] -> (
+                    (* a DISCARDED match's arm values are dropped: the
+                       first arm must NOT be reconciled against the
+                       enclosing expected (a side-effect arm body like
+                       `verifier_check_ref_operand(...)`, Unit, would
+                       fail a Some Option expectation from the function
+                       tail); a VALUE match's first arm drives inference
+                       from the expected *)
+                    match use with
+                    | Discarded -> None
+                    | Value -> expected)
                 | first :: _ -> (
                     (* a Never arm (an infinite loop / return-only arm)
                        contributes no value type: the following arms must
@@ -5228,10 +5273,18 @@ and check_call_sig (env : env) (scope : scope) (expected : Type_repr.t option)
                       let eff = Access_effect.read_effect sig_.ts_params.(i).Type_repr.pt_convention in
                       go (ate :: acc) (eff :: effects) (i + 1) rest)
                   | Error m -> (
-                      if Sys.getenv_opt "TANGERINE_DEBUG_CALL" <> None then
-                        Printf.eprintf "DEBUG-CALL %s arg%d pt=%s found=%s (%s) span=%d-%d\n" sig_.ts_name
-                          (i + 1) (type_to_string pt) (type_to_string ate.te_type) m
-                          a.Ast.ca_span.Span.start a.Ast.ca_span.Span.end_;
+                      if Sys.getenv_opt "TANGERINE_DEBUG_CALL" <> None then begin
+                        let loc =
+                          match !debug_source_map with
+                          | Some sm -> (
+                              match Span.resolve sm a.Ast.ca_span with
+                              | Some (f, l, _) -> f ^ ":" ^ string_of_int l
+                              | None -> "?")
+                          | None -> "?"
+                        in
+                        Printf.eprintf "DEBUG-CALL %s arg%d pt=%s found=%s (%s) at %s\n" sig_.ts_name
+                          (i + 1) (type_to_string pt) (type_to_string ate.te_type) m loc
+                      end;
                       (* builtin/kernel nominal duality: a user type that
                          replaced a builtin unifies with the builtin by name *)
                       let same_named_arg () =
@@ -5357,7 +5410,21 @@ and check_call_sig (env : env) (scope : scope) (expected : Type_repr.t option)
                   (fun (k, v) -> if not (List.mem_assoc k !subst) then subst := (k, v) :: !subst)
                   solved;
                 Ok ()
-            | Error m -> Error m)
+            | Error m ->
+                if Sys.getenv_opt "TANGERINE_DEBUG_CALL" <> None then begin
+                  let loc =
+                    match !debug_source_map with
+                    | Some sm -> (
+                        match Span.resolve sm span with
+                        | Some (f, l, _) -> f ^ ":" ^ string_of_int l
+                        | None -> "?")
+                    | None -> "?"
+                  in
+                  Printf.eprintf "DEBUG-CRET %s ret=%s expected=%s err=%s at %s\n" sig_.ts_name
+                    (type_to_string (substitute_fixpoint !subst sig_.ts_return))
+                    (match expected with Some e -> type_to_string e | None -> "?") m loc
+                end;
+                Error m)
         | None -> Ok ()
       in
       let* () = ret_reconciled in
@@ -6607,6 +6674,7 @@ and register_item (env : env) (item : Ast.item) : (env, string) result =
                 nominals = (d.s_name, nom) :: env.nominals;
               }
             in
+            type_names_global := (tid, d.s_name) :: !type_names_global;
             (None, env')
       in
       let tid = List.assoc d.s_name env_base.type_ids in
@@ -7021,6 +7089,7 @@ let rec register_headers (env : env) (acc : string list) = function
                 nominals = (d.s_name, nom) :: env.nominals;
               }
             in
+            type_names_global := (tid, d.s_name) :: !type_names_global;
             register_headers env' acc rest
           end
       | Ast.EnumDef d ->
@@ -7238,6 +7307,15 @@ and check_bodies (env : env) (program : Ast.program) : (env * string list, strin
         let tag m = if secondary then "[secondary] " ^ m else m in
         match check_item env item with
         | Error m ->
+            (if Sys.getenv_opt "TANGERINE_DEBUG_CALL" <> None then
+               let sp =
+                 match Hashtbl.find_opt err_span_journal m with
+                 | Some (s, raw) ->
+                     Printf.sprintf " span=%d:%d raw=%s" s.Span.file_id s.Span.start raw
+                 | None -> ""
+               in
+               Printf.eprintf "DEBUG-ITEMFAIL %s::%s %s%s\n"
+                 (String.concat "::" program.Ast.prog_module_path) name m sp);
             record_diag name secondary m;
             go (tag (name ^ ": " ^ m) :: errors) rest
         | Ok () ->
