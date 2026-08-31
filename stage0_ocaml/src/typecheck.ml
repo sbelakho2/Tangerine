@@ -2887,7 +2887,21 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
       | _ -> Error (err span "char literal is not a single Unicode scalar"))
   | Ast.BoolLit (_, _, span) ->
       Ok { te_type = Type_repr.Bool; te_effects = [||]; te_span = span; te_flow = normal_flow (Type_repr.Bool) }
-  | Ast.Name (nid, n, span) -> check_name env scope expected nid n span
+  | Ast.Name (nid, n, span) ->
+      (if Sys.getenv_opt "TANGERINE_DEBUG_CALL" <> None && span.Span.file_id = 35 then
+         let loc =
+           match !debug_source_map with
+           | Some sm -> (
+               match Span.resolve sm span with
+               | Some (f, l, c) -> f ^ ":" ^ string_of_int l ^ ":" ^ string_of_int c
+               | None -> "?")
+           | None -> "?"
+         in
+         Printf.eprintf "DEBUG-NAME name=%s exp=%s at=%s item=%s\n" n
+           (match expected with Some e -> type_to_string e | None -> "none")
+           loc
+           (match !current_item_global with Some s -> s | None -> "?"));
+      check_name env scope expected nid n span
   | Ast.Path (nid, a, b, span) -> check_name env scope expected nid (a ^ "::" ^ b) span
   | Ast.Tuple (_, elems, span) -> (
       if elems = [] then Ok { te_type = Type_repr.Unit; te_effects = [||]; te_span = span; te_flow = normal_flow (Type_repr.Unit) }
@@ -3299,6 +3313,13 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
                       (type_to_string te.te_type)))))
   | Ast.Closure (_, c) -> check_closure env scope expected c
   | Ast.Unary (_, op, inner, span) -> (
+      (if Sys.getenv_opt "TANGERINE_DEBUG_CALL" <> None then
+         match op with
+         | Ast.Borrow | Ast.BorrowMut ->
+             Printf.eprintf "DEBUG-BORROW expected=%s item=%s\n"
+               (match expected with Some e -> type_to_string e | None -> "none")
+               (match !current_item_global with Some s -> s | None -> "?")
+         | _ -> ());
       match check_expr env scope None inner with
       | Error m -> Error m
       | Ok te -> (
@@ -5268,7 +5289,33 @@ and check_call_sig (env : env) (scope : scope) (expected : Type_repr.t option)
               match check_expr env scope (Some pt) a.Ast.ca_value with
               | Error m -> Error m
               | Ok ate -> (
+                  (* Tangerine call-site coercion: an explicit-ref argument
+                     `&x`/`&mut x` to a by-value parameter derefs to x.
+                     The deref is tried FIRST: a bare generic var (`Map::new()`
+                     untyped receivers) must bind to the pointee, not to the
+                     ref — binding var := &T first would corrupt the map's key
+                     type for every later use. A pt that is itself a ref
+                     (&K params) falls through to the direct unify. *)
+                  let deref_first () =
+                    match ate.te_type with
+                    | Type_repr.Ref_internal (_, inner) -> (
+                        let s3 = ref [] in
+                        match unify env.state.box_tid s3 pt inner with
+                        | Ok () ->
+                            List.iter
+                              (fun (k, v) ->
+                                if not (List.mem_assoc k !subst) then subst := (k, v) :: !subst)
+                              !s3;
+                            Some ()
+                        | Error _ -> None)
+                    | _ -> None
+                  in
                   let s2 = ref [] in
+                  match deref_first () with
+                  | Some () ->
+                      let eff = Access_effect.read_effect sig_.ts_params.(i).Type_repr.pt_convention in
+                      go (ate :: acc) (eff :: effects) (i + 1) rest
+                  | None -> (
                   match unify env.state.box_tid s2 pt ate.te_type with
                   | Ok () -> (
                       List.iter
@@ -5388,7 +5435,7 @@ and check_call_sig (env : env) (scope : scope) (expected : Type_repr.t option)
                           Error
                             (err a.Ast.ca_span
                                (Printf.sprintf "argument %d type mismatch: expected %s, found %s (%s, callee %s)"
-                                  (i + 1) (type_to_string pt) (type_to_string ate.te_type) m sig_.ts_name)))))))
+                                  (i + 1) (type_to_string pt) (type_to_string ate.te_type) m sig_.ts_name))))))))
             end)
       in
       go [] [] 0 args
@@ -5808,19 +5855,49 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
                         Error (err a.Ast.ca_span "too many arguments")
                       else begin
                         let pt = substitute_fixpoint !subst sig_.ts_params.(ai).Type_repr.pt_type in
-                        match check_expr env scope (Some pt) a.Ast.ca_value with
-                        | Error m -> Error m
-                        | Ok ate -> (
-                            let s2 = ref [] in
-                            match unify env.state.box_tid s2 pt ate.te_type with
-                            | Ok () -> (
-                                List.iter
-                                  (fun (k, v) ->
-                                    if not (List.mem_assoc k !subst) then subst := (k, v) :: !subst)
-                                  !s2;
-                                let eff = Access_effect.read_effect sig_.ts_params.(ai).Type_repr.pt_convention in
-                                go (ate :: acc) (eff :: effects) (i + 1) rest)
-                            | Error m -> (
+                        (if Sys.getenv_opt "TANGERINE_DEBUG_CALL" <> None then
+                           match !current_item_global with
+                           | Some it when it = "def resolve_bare_type_name" || it = "def resolve_bare_callable"
+                                          || it = "def bare_name_resolve" ->
+                               Printf.eprintf "DEBUG-MARGP m=%s arg%d pt=%s\n" mname (i + 1)
+                                 (type_to_string pt)
+                           | _ -> ());
+                         match check_expr env scope (Some pt) a.Ast.ca_value with
+                         | Error m -> Error m
+                         | Ok ate -> (
+                             (* the call-site deref FIRST (see the
+                                free-function path): an explicit-ref
+                                argument to a by-value param binds the
+                                param's var to the pointee, not the ref *)
+                             let deref_first () =
+                               match ate.te_type with
+                               | Type_repr.Ref_internal (_, inner) -> (
+                                   let s3 = ref [] in
+                                   match unify env.state.box_tid s3 pt inner with
+                                   | Ok () ->
+                                       List.iter
+                                         (fun (k, v) ->
+                                           if not (List.mem_assoc k !subst) then subst := (k, v) :: !subst)
+                                         !s3;
+                                       Some ()
+                                   | Error _ -> None)
+                               | _ -> None
+                             in
+                             let s2 = ref [] in
+                             match deref_first () with
+                             | Some () ->
+                                 let eff = Access_effect.read_effect sig_.ts_params.(ai).Type_repr.pt_convention in
+                                 go (ate :: acc) (eff :: effects) (i + 1) rest
+                             | None -> (
+                             match unify env.state.box_tid s2 pt ate.te_type with
+                             | Ok () -> (
+                                 List.iter
+                                   (fun (k, v) ->
+                                     if not (List.mem_assoc k !subst) then subst := (k, v) :: !subst)
+                                   !s2;
+                                 let eff = Access_effect.read_effect sig_.ts_params.(ai).Type_repr.pt_convention in
+                                 go (ate :: acc) (eff :: effects) (i + 1) rest)
+                             | Error m -> (
                                 if Sys.getenv_opt "TANGERINE_DEBUG_CALL" <> None then
                                   Printf.eprintf "DEBUG-MCALL %s.%s arg%d pt=%s found=%s (%s) span=%d-%d\n"
                                     oname mname (i + 1) (type_to_string pt)
@@ -5877,7 +5954,7 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
                                         Error
                                           (err a.Ast.ca_span
                                              (Printf.sprintf "argument %d type mismatch: expected %s, found %s (%s)"
-                                                (i + 1) (type_to_string pt) (type_to_string ate.te_type) m)))))
+                                                (i + 1) (type_to_string pt) (type_to_string ate.te_type) m))))))
                       end)
                 in
                 go [] [] 0 args
