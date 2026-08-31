@@ -340,6 +340,9 @@ let ( let* ) (r : ('a, string) result) (f : 'a -> ('b, string) result) : ('b, st
    un-suffixed message to each diagnostic WITHOUT re-parsing formatted
    text.  The journal is cleared per compilation (initial_env). *)
 let err_span_journal : (string, Span.span * string) Hashtbl.t = Hashtbl.create 4096
+let debug_source_map : Span.source_map option ref = ref None
+let current_item_global : string option ref = ref None
+let current_mod_global : string list ref = ref []
 
 let err (span : Span.span) (msg : string) : string =
   let formatted = Printf.sprintf "%s at file#%d[%d..%d)" msg span.Span.file_id span.Span.start span.Span.end_ in
@@ -1580,7 +1583,14 @@ let rec unify (box_tid : Ids.Type_id.t option) (subst : (Type_repr.generic_key *
          identical — the IntLiteral adoption above is the only kind
          adaptation in fundamental equality (the audit: ordinary Int
          must not silently satisfy a u8 declaration) *)
-      if k1 = k2 then Ok () else Error "integer kind mismatch"
+      if k1 = k2 then Ok ()
+      else (
+        if Sys.getenv_opt "TANGERINE_DEBUG_CALL" <> None then
+          Printf.eprintf "DEBUG-INTKIND %s vs %s item=%s mod=%s\n"
+            (int_name_of_kind k1) (int_name_of_kind k2)
+            (match !current_item_global with Some s -> s | None -> "?")
+            (String.concat "::" !current_mod_global);
+        Error "integer kind mismatch")
   | Type_repr.Named (id, [| t |]), u when is_box box_tid id -> unify box_tid subst t u
   | u, Type_repr.Named (id, [| t |]) when is_box box_tid id -> unify box_tid subst u t
   | Type_repr.Infer_var v, _ ->
@@ -5767,7 +5777,24 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
                               if not (List.mem_assoc k !subst) then subst := (k, v) :: !subst)
                             solved;
                           Ok ()
-                      | Error m -> Error m)
+                      | Error m ->
+                          (if Sys.getenv_opt "TANGERINE_DEBUG_CALL" <> None then
+                             let loc =
+                               match !debug_source_map with
+                               | Some sm -> (
+                                   match Span.resolve sm span with
+                                   | Some (f, l, _) -> Printf.sprintf "%s:%d" f l
+                                   | None -> "?")
+                               | None -> "?"
+                             in
+                             Printf.eprintf
+                               "DEBUG-MRET %s.%s oname=%s owner=%s sigret=%s expected=%s err=%s at %s\n"
+                               oname mname (match owner_name with Some n -> n | None -> "<none>")
+                               (type_to_string owner_ty)
+                               (type_to_string (substitute_fixpoint !subst sig_.ts_return))
+                               (match expected with Some e -> type_to_string e | None -> "<none>")
+                               m loc);
+                          Error m)
                   | None -> Ok ()
                 in
                 let* () = ret_reconciled in
@@ -7076,6 +7103,8 @@ and check_bodies (env : env) (program : Ast.program) : (env * string list, strin
     | item :: rest -> (
         let name = Ast.item_summary item.Ast.kind in
         env.state.current_item <- name;
+        current_item_global := Some name;
+        current_mod_global := program.Ast.prog_module_path;
         env.state.current_item_params <- item_param_ids env item;
         reset_oracle env;
         let secondary = List.mem name env.state.failed_items in

@@ -1566,6 +1566,7 @@ let run_closure_pipeline_impl ~(repo_root : string) ~(manifest_path : string)
         (* identity handoff (audit Fix 2): the typechecker consumes the
            resolver's semantic identities instead of rediscovering them *)
         let env = ref (Typecheck.initial_env ~resolved:(Some resolved) ()) in
+        Typecheck.debug_source_map := Some (Module_graph.source_map graph);
         let errs_by_mod : (string, string list) Hashtbl.t = Hashtbl.create 64 in
         let items = ref 0 in
         let typed_calls = ref 0 in
