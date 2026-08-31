@@ -3970,6 +3970,7 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
             | "String" -> "str"
             | "Vec" -> "Array"
             | "Array" -> "Vec"
+            | "List" -> "Array"
             | _ -> owner)
       in
       (match List.assoc_opt (owner, mname) env.methods with
@@ -4172,7 +4173,7 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
                set_terminator_to st
                  (Seed_mir.Call (rp2, Seed_mir.User instance, arg_vals, next_b, None))
                  next_b;
-               (copy_place st rp2, call_result_ty st nid me.me_ret)))))
+               (copy_place st rp2, recv_dest_ty)))))
   | _ -> seed_bug "unsupported callee form in lowering"
 
 and emit_defers (env : func_env) (st : lower_state) : unit =
