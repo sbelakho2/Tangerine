@@ -1613,10 +1613,18 @@ let rec unify (box_tid : Ids.Type_id.t option) (subst : (Type_repr.generic_key *
          and must never be bound by unification (the native model).
          Pre-instantiation covers every generic use; anything reaching
          this arm is an uninstantiated leak and must be reported. *)
+      (if Sys.getenv_opt "TANGERINE_DEBUG_CALL" <> None then
+         Printf.eprintf "DEBUG-RIGID1 P#%d vs %s item=%s\n"
+           (Ids.Generic_param_id.to_int pa) (type_to_string b')
+           (match !current_item_global with Some s -> s | None -> "?"));
       Error
         (Printf.sprintf "cannot unify rigid generic parameter P#%d with %s"
            (Ids.Generic_param_id.to_int pa) (type_to_string b'))
   | _, Type_repr.Type_param pb ->
+      (if Sys.getenv_opt "TANGERINE_DEBUG_CALL" <> None then
+         Printf.eprintf "DEBUG-RIGID2 %s vs P#%d item=%s\n"
+           (type_to_string a') (Ids.Generic_param_id.to_int pb)
+           (match !current_item_global with Some s -> s | None -> "?"));
       Error
         (Printf.sprintf "cannot unify rigid generic parameter P#%d with %s"
            (Ids.Generic_param_id.to_int pb) (type_to_string a'))
@@ -4668,7 +4676,29 @@ and check_name (env : env) (scope : scope) (expected : Type_repr.t option)
                signature param must not rewrite the local's own bound param *)
             match unify env.state.box_tid subst exp t with
             | Ok () -> Ok ()
-            | Error m -> Error m)
+            | Error m1 -> (
+                (* the call-site deref parity: a by-value expected with a
+                   ref-typed local (the kernel's `key_ref: K` params fed
+                   `&K` place values from the visit intrinsics) derefs the
+                   local's pointee — the same rule the call paths apply *)
+                match t with
+                | Type_repr.Ref_internal (_, inner) -> (
+                    match unify env.state.box_tid subst exp inner with
+                    | Ok () -> Ok ()
+                    | Error m2 ->
+                        if Sys.getenv_opt "TANGERINE_DEBUG_CALL" <> None then
+                          Printf.eprintf "DEBUG-CKNAME name=%s exp=%s local=%s err=%s span=file#%d[%d..%d) item=%s\n"
+                            n (type_to_string exp) (type_to_string t) m2 span.Span.file_id
+                            span.Span.start span.Span.end_
+                            (match !current_item_global with Some s -> s | None -> "?");
+                        Error m2)
+                | _ ->
+                    if Sys.getenv_opt "TANGERINE_DEBUG_CALL" <> None then
+                      Printf.eprintf "DEBUG-CKNAME name=%s exp=%s local=%s err=%s span=file#%d[%d..%d) item=%s\n"
+                        n (type_to_string exp) (type_to_string t) m1 span.Span.file_id
+                        span.Span.start span.Span.end_
+                        (match !current_item_global with Some s -> s | None -> "?");
+                    Error m1))
         | None -> Ok ()
       in
       Ok
@@ -6261,9 +6291,15 @@ and check_item (env : env) (item : Ast.item) : (unit, string) result =
   | Ast.ExternBlock d -> check_extern env d
   | Ast.ModuleDef _ -> check_module env item
   | Ast.UseDecl _ -> Ok ()
-  | Ast.CapabilityDecl _ | Ast.EffectDecl _ | Ast.RationaleBlock _ | Ast.EditionDecl _
-  | Ast.MacroDecl _ ->
+  | Ast.CapabilityDecl _ | Ast.EffectDecl _ | Ast.RationaleBlock _ | Ast.EditionDecl _ ->
       Error (err item.span "item kind is not available in the bootstrap subset")
+  | Ast.MacroDecl _ ->
+      (* a macro DEFINITION is opaque to the typechecker (the bootstrap
+         subset has no expansion machinery); the executable-subset
+         firewall is the separate authority that counts the E-code
+         finding — the typechecker itself must not fail the closure on
+         the declared-but-unsupported item *)
+      Ok ()
 
 (* ────────────────────────────────────────────────────────────────
    Registration pass (the resolver's registries, pass A) *)
