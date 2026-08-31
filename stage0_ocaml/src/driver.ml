@@ -1403,7 +1403,26 @@ let decl_fingerprint (env : Typecheck.env) (errs_by_mod : (string, string list) 
     (List.sort compare env.Typecheck.methods);
 
 
-(* impls fingerprint: DISABLED for isolation *)
+  List.iter
+    (fun (ie : Trait_solver.impl_entry) ->
+      (* the impl's declaration semantics: the span-keyed identity, the
+         trait, the target NAME, and the where-bound trait names — the
+         canonical, churn-free projection (the generic-param IDs churn
+         across fixpoint passes while the resolver owns the semantic
+         identities; the fingerprint converges on the declaration
+         shapes) *)
+      Buffer.add_string buf
+        (Printf.sprintf "I %d %s %s b[%s]\n" ie.Trait_solver.ie_id.Trait_solver.index
+           ie.Trait_solver.ie_trait ie.Trait_solver.ie_target_name
+           (String.concat ","
+              (List.map
+                 (fun b -> b.Trait_solver.trait_name)
+                 ie.Trait_solver.ie_bounds))))
+    (List.sort
+       (fun a b ->
+         compare a.Trait_solver.ie_id.Trait_solver.index
+           b.Trait_solver.ie_id.Trait_solver.index)
+       env.Typecheck.impls.Trait_solver.impls);
 
   List.iter
     (fun (n, _) -> Buffer.add_string buf ("S " ^ n ^ "\n"))
@@ -1450,6 +1469,9 @@ type closure_ctx = {
      semantic pipeline). *)
   ctx_strict_diags : Diagnostic.diagnostic list;
   mutable lowered_methods : int;
+  (* re-audit P0-E: the CFG resource dataflow program (the authoritative
+     path-sensitive ownership pass) — set once the template MIR exists *)
+  mutable ctx_cfg_program : Seed_mir.program option;
 }
 
 (* Everything bootstrap-check and compile share: manifest load, module
@@ -1711,7 +1733,8 @@ let run_closure_pipeline_impl ~(repo_root : string) ~(manifest_path : string)
             ctx_profile_findings = List.length profile_findings;
             ctx_strict_fallbacks = fallback_activations;
             ctx_strict_diags = !strict_audit_diags;
-            lowered_methods = 0 }
+            lowered_methods = 0;
+            ctx_cfg_program = None }
       end)
 
 (* Public entry: the bootstrap-closure default — recovery-mode semantic
@@ -2862,11 +2885,25 @@ let report_access_resource_pass (ctx : closure_ctx) : unit =
     List.length (List.filter (fun (a : Access_check.access) -> a.a_path <> None) recorded)
   in
   Printf.printf
-    "  call-argument access sanity (NOT the ownership pass — the CFG finalize_plan/edge_cleanup cleanup-plan stage is future work; this replay walks the recorded typed channels): %d call-argument accesses (%d place paths, roots keyed by LocalId), %d finding(s)\n"
+    "  call-argument access sanity (the linear replay — the CFG resource dataflow below is the authoritative path-sensitive pass): %d call-argument accesses (%d place paths, roots keyed by LocalId), %d finding(s)\n"
     (List.length recorded) n_places (List.length findings);
   let status = if findings = [] then "PASS" else "FAIL" in
   Printf.printf "  CALL_ARGUMENT_ACCESS_SANITY = %s (%d finding(s))\n" status
     (List.length findings);
+  (* re-audit P0-E: the CFG resource dataflow — the path-sensitive
+     lattice over the MIR control flow (merge joins, loop fixpoints,
+     conditional-initialization and use-after-consume per path) — the
+     authoritative ownership stage; the linear replay remains an
+     additional diagnostic *)
+  let cfg_findings =
+    match ctx.ctx_cfg_program with
+    | None -> []
+    | Some prog -> Resource_check.cfg_check_program prog
+  in
+  let cfg_status = if cfg_findings = [] then "PASS" else "FAIL" in
+  Printf.printf "  CFG_RESOURCE_DATAFLOW = %s (%d finding(s))\n" cfg_status
+    (List.length cfg_findings);
+  List.iter (fun f -> Printf.printf "    %s\n" f) cfg_findings;
   let printed = ref 0 in
   List.iter
     (fun (f : Access_check.finding) ->

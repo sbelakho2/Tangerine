@@ -1643,6 +1643,242 @@ end
                                 (match other with Ok v -> v | Error m -> "<" ^ m ^ ">");
                               exit 1)))
                end));
+      (* ── the insertion-contract canary (re-audit P0-B): the exact
+         Tangerine contracts — Set::insert -> Bool (whether an existing
+         equivalent element was replaced), Map::insert -> Option[old V]
+         (the displaced old value) — while the mutation travels through
+         the host writebacks: r1 = true, r2 = false, o1 = None,
+         o2 = Some(10) — main = 1 + 2 + 4 + 10 = 17. *)
+      let ixc = {|
+def main() -> Int
+  var s: Set[Int] = Set::new()
+  var m: Map[Int, Int] = Map::new()
+  var acc = 0
+  if !s.insert(1) then acc = acc + 1 end
+  if s.insert(1) then acc = acc + 2 end
+  match m.insert(1, 10)
+  when Option::None then acc = acc + 4
+  when Option::Some(_) then ()
+  end
+  match m.insert(1, 20)
+  when Option::Some(old) then acc = acc + old
+  when Option::None then ()
+  end
+  acc
+end
+|} in
+      (match Source_loader.load_string "<insert-contract>" ixc with
+       | Error _ -> failwith "insert-contract source load"
+       | Ok ixc2 -> (
+           let ixm = Span.create () in
+           let ixfid = Span.add_file ixm ixc2.Source.name ixc2 in
+           let ixdiags = Diagnostic.create_bag () in
+           let ixlx = Lexer.create ixc2.Source.bytes ixfid ixdiags in
+           let ixtoks = Lexer.lex ixlx in
+           let ixprog = Parser.parse ixtoks ixc2.Source.bytes ixfid ixdiags [ "ix" ] in
+           match Typecheck.check_program (Typecheck.initial_env ()) ixprog with
+           | Error m -> failwith ("insert-contract typecheck: " ^ m)
+           | Ok (ixenv, ixerrs) ->
+               if ixerrs <> [] then
+                 failwith ("insert-contract typecheck errors: " ^ String.concat "; " ixerrs)
+               else begin
+                 let ixbase = Driver.lowering_env_of ~items:ixprog.Ast.items ixenv in
+                 let ixvariants = Driver.user_variant_table ixenv in
+                 let ixmd =
+                   match
+                     List.find_opt
+                       (fun i ->
+                         match i.Ast.kind with
+                         | Ast.Function d -> d.Ast.fn_sig.Ast.sig_name = "main"
+                         | _ -> false)
+                       ixprog.Ast.items
+                   with
+                   | Some i -> i
+                   | None -> failwith "insert-contract: no main"
+                 in
+                 let ixts =
+                   match List.assoc_opt "main" ixenv.Typecheck.functions with
+                   | Some ts -> ts
+                   | None -> (
+                       match
+                         List.filter (fun (k, _) -> Util.has_suffix k "::main")
+                           ixenv.Typecheck.functions
+                       with
+                       | [ (_, ts) ] -> ts
+                       | _ -> failwith "insert-contract: no main signature")
+                 in
+                 let ixfn =
+                   match ixmd.Ast.kind with
+                   | Ast.Function d ->
+                       Mir_lower.lower_function_with_variants
+                         ~typed_nodes:(Driver.typed_nodes_of ixenv)
+                         ~typed_patterns:(Driver.typed_patterns_of ixenv)
+                         ~typed_for_patterns:(Driver.typed_for_patterns_of ixenv)
+                         ~typed_let_patterns:(Driver.typed_let_patterns_of ixenv)
+                         ixvariants
+                         { ixbase with Mir_lower.fn_ret = ixts.Typecheck.ts_return }
+                         "main" (Ids.Callable_id.to_int ixts.Typecheck.ts_callable)
+                         [||] [||] d
+                   | _ -> failwith "insert-contract: main not a function"
+                 in
+                 let ixprog_mir =
+                   { Seed_mir.functions = [| ixfn |];
+                     statics = [||];
+                     (* the Option[Int] concrete def (the checker's
+                        LangItem nominal id 3) — the Some/None variants
+                        with the canonical 1-based semantic ids *)
+                     types =
+                       [|
+                         Seed_mir.EnumDef
+                           {
+                             ed_id = Ids.Type_id.make 3;
+                             ed_variants =
+                               [
+                                 {
+                                   Seed_mir.vd_id = Ids.Variant_id.make 1;
+                                   vd_index = Ids.Variant_index.make 0;
+                                   vd_payload = Type_repr.Tuple [| Type_repr.Int Type_repr.Int |];
+                                 };
+                                 {
+                                   Seed_mir.vd_id = Ids.Variant_id.make 2;
+                                   vd_index = Ids.Variant_index.make 1;
+                                   vd_payload = Type_repr.Unit;
+                                 };
+                               ];
+                           };
+                       |] }
+                 in
+                 (match Mir_verify.require_valid_concrete ixprog_mir with
+                  | Ok () -> Printf.printf "  insert-contract verify (concrete mode): PASS\n"
+                  | Error errs ->
+                      Printf.printf "  insert-contract verify (concrete mode): FAIL\n";
+                      List.iter (fun e -> Printf.printf "    %s\n" e) errs;
+                      exit 1);
+                 let ixentry = ixfn.Seed_mir.instance in
+                 let ixhost = Host.create ~repo_root:"." ~argv:[||] in
+                 (match Vm.run ~program:ixprog_mir ~entry:ixentry ~argv:[||] ~host:ixhost with
+                  | Error e -> Printf.printf "  insert-contract VM: FAIL %s\n" e.Vm.message; exit 1
+                  | Ok code -> (
+                      match Vm.entry_frame_of ~program:ixprog_mir ~entry:ixentry ~argv:[||] with
+                      | Error m ->
+                          Printf.printf "  insert-contract VM: <inspect failed: %s>\n" m;
+                          exit 1
+                      | Ok (ixvm, ixframe) -> (
+                          match Vm.run_inspect ixvm ixframe with
+                          | Ok "17" ->
+                              Printf.printf
+                                "  insert-contract round-trip: PASS (main = 17 — r1 false, r2 true, o1 None, o2 Some(10) — the exact Set/Map insertion contracts with the mutations through the writebacks; exit %d)\n"
+                                code
+                          | other ->
+                              Printf.printf
+                                "  insert-contract round-trip: FAIL (expected 17, got %s)\n"
+                                (match other with Ok v -> v | Error m -> "<" ^ m ^ ">");
+                              exit 1)))
+               end));
+      (* ── the Set (Initialize) calling-convention round-trip proof
+         (re-audit P0-A): `def init_it(set x: Int); x = 42; end` — the
+         caller's place is NOT read before the call, the callee's
+         parameter enters uninitialized, the callee initializes it, the
+         definite-init check passes at return, and the initialized value
+         copies back — main = 42. *)
+      let sssrc = {|
+def init_it(set x: Int)
+  x = 42
+end
+def main() -> Int
+  var a = 0
+  init_it(a)
+  a
+end
+|} in
+      (match Source_loader.load_string "<set-abi>" sssrc with
+       | Error _ -> failwith "set-abi source load"
+       | Ok sssrc2 -> (
+           let ssm2 = Span.create () in
+           let ssfid = Span.add_file ssm2 sssrc2.Source.name sssrc2 in
+           let ssdiags = Diagnostic.create_bag () in
+           let sslx = Lexer.create sssrc2.Source.bytes ssfid ssdiags in
+           let sstoks = Lexer.lex sslx in
+           let ssprog = Parser.parse sstoks sssrc2.Source.bytes ssfid ssdiags [ "ss" ] in
+           match Typecheck.check_program (Typecheck.initial_env ()) ssprog with
+           | Error m -> failwith ("set-abi typecheck: " ^ m)
+           | Ok (ssenv, sserrs) ->
+               if sserrs <> [] then
+                 failwith ("set-abi typecheck errors: " ^ String.concat "; " sserrs)
+               else begin
+                 let ssbase = Driver.lowering_env_of ~items:ssprog.Ast.items ssenv in
+                 let ssvariants = Driver.user_variant_table ssenv in
+                 let ssdecls = Hashtbl.create 4 in
+                 List.iter
+                   (fun i ->
+                     match i.Ast.kind with
+                     | Ast.Function d ->
+                         let ts =
+                           match List.assoc_opt d.Ast.fn_sig.Ast.sig_name ssenv.Typecheck.functions with
+                           | Some ts -> ts
+                           | None -> (
+                               match
+                                 List.filter
+                                   (fun (k, _) ->
+                                     Util.has_suffix k ("::" ^ d.Ast.fn_sig.Ast.sig_name))
+                                   ssenv.Typecheck.functions
+                               with
+                               | [ (_, ts) ] -> ts
+                               | _ -> failwith "set-abi: no signature")
+                         in
+                         Hashtbl.replace ssdecls d.Ast.fn_sig.Ast.sig_name (d, ts)
+                     | _ -> ())
+                   ssprog.Ast.items;
+                 let ss_lower name =
+                   let d, ts = Hashtbl.find ssdecls name in
+                   Mir_lower.lower_function_with_variants
+                     ~typed_nodes:(Driver.typed_nodes_of ssenv)
+                     ~typed_patterns:(Driver.typed_patterns_of ssenv)
+                     ~typed_for_patterns:(Driver.typed_for_patterns_of ssenv)
+                     ~typed_let_patterns:(Driver.typed_let_patterns_of ssenv)
+                     ssvariants
+                     { ssbase with Mir_lower.fn_ret = ts.Typecheck.ts_return }
+                     name (Ids.Callable_id.to_int ts.Typecheck.ts_callable)
+                     (Array.of_list
+                        (List.map (fun (_, pid) -> Type_repr.Type_param pid)
+                           ts.Typecheck.ts_params_decl))
+                     (Array.map (fun p -> p.Type_repr.pt_convention) ts.Typecheck.ts_params)
+                     ~param_tys_opt:
+                       (Array.map (fun p -> p.Type_repr.pt_type) ts.Typecheck.ts_params)
+                     d
+                 in
+                 let ssprog_mir =
+                   { Seed_mir.functions = [| ss_lower "init_it"; ss_lower "main" |];
+                     statics = [||];
+                     types = [||] }
+                 in
+                 (match Mir_verify.require_valid_concrete ssprog_mir with
+                  | Ok () -> Printf.printf "  Set-ABI verify (concrete mode): PASS\n"
+                  | Error errs ->
+                      Printf.printf "  Set-ABI verify (concrete mode): FAIL\n";
+                      List.iter (fun e -> Printf.printf "    %s\n" e) errs;
+                      exit 1);
+                 let ssentry = (ss_lower "main").Seed_mir.instance in
+                 let sshost = Host.create ~repo_root:"." ~argv:[||] in
+                 (match Vm.run ~program:ssprog_mir ~entry:ssentry ~argv:[||] ~host:sshost with
+                  | Error e -> Printf.printf "  Set-ABI VM: FAIL %s\n" e.Vm.message; exit 1
+                  | Ok code -> (
+                      match Vm.entry_frame_of ~program:ssprog_mir ~entry:ssentry ~argv:[||] with
+                      | Error m ->
+                          Printf.printf "  Set-ABI VM: <inspect failed: %s>\n" m;
+                          exit 1
+                      | Ok (ssvm, ssframe) -> (
+                          match Vm.run_inspect ssvm ssframe with
+                          | Ok "42" ->
+                              Printf.printf
+                                "  Set-ABI round-trip: PASS (main = 42 — the Initialize argument was not read, entered the callee uninitialized, and the initialized value copied back; exit %d)\n"
+                                code
+                          | other ->
+                              Printf.printf
+                                "  Set-ABI round-trip: FAIL (expected 42, got %s)\n"
+                                (match other with Ok v -> v | Error m -> "<" ^ m ^ ">");
+                              exit 1)))
+               end));
       (* ── the RUNTIME Vec iteration round-trip proof (the audit's
          typed-iterable requirement): a `for x in v` over a runtime
          Vec[Int] lowers to the counter loop with the dynamic
@@ -3910,6 +4146,7 @@ end
           ctx_strict_fallbacks = 0;
           ctx_strict_diags = [];
           lowered_methods = 0;
+          ctx_cfg_program = None;
         }
       in
       let nprog = Driver.lower_closure nctx in
@@ -4924,6 +5161,7 @@ end
             ctx_strict_fallbacks = 0;
             ctx_strict_diags = [];
             lowered_methods = 0;
+            ctx_cfg_program = None;
           }
        in
        let noc_prog = Driver.lower_closure ncctx in

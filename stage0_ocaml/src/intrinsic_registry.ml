@@ -20,7 +20,10 @@ module Id = struct
 end
 
 type signature = {
-  params : Type_repr.t array;
+  (* re-audit P0-C: the intrinsic/extern signature carries the full
+     ParamType (convention + type), so MIR verification can enforce
+     argument effects and types with the same strength as User calls *)
+  params : Type_repr.param_type array;
   ret : Type_repr.t;
 }
 
@@ -100,14 +103,29 @@ let ruby_id : Type_repr.t = named Type_id.ruby_id [||]
 let param (id : Ids.Generic_param_id.t) : Type_repr.t = Type_repr.Type_param id
 
 let sig_ ~(params : Type_repr.t array) ~(ret : Type_repr.t) : signature =
-  { params; ret }
+  { params = Array.map (fun t -> { Type_repr.pt_type = t; pt_convention = Access_effect.Let }) params;
+    ret }
+
+(* the convention-aware signature: the collection self-args and the
+   inout intrinsics declare their exact access conventions *)
+let sig_conv ~(params : (Access_effect.t * Type_repr.t) array)
+    ~(ret : Type_repr.t) : signature =
+  {
+    params =
+      Array.map
+        (fun (c, t) -> { Type_repr.pt_type = t; pt_convention = c })
+        params;
+    ret;
+  }
 
 (* Structural equality and rendering (used by the closure check's
    signature-mismatch reporting). *)
 let signature_equal (a : signature) (b : signature) : bool =
   Array.length a.params = Array.length b.params
   && Type_repr.compare a.ret b.ret = 0
-  && Array.for_all2 (fun x y -> Type_repr.compare x y = 0) a.params b.params
+  && Array.for_all2
+       (fun x y -> Type_repr.compare x.Type_repr.pt_type y.Type_repr.pt_type = 0)
+       a.params b.params
 
 let named_name (id : Ids.Type_id.t) : string =
   let n = Ids.Type_id.to_int id in
@@ -174,7 +192,7 @@ let rec ty_to_string (ty : Type_repr.t) : string =
   | Type_repr.Never -> "!"
 
 let signature_to_string (s : signature) : string =
-  "(" ^ String.concat ", " (Array.to_list (Array.map ty_to_string s.params))
+  "(" ^ String.concat ", " (Array.to_list (Array.map (fun p -> ty_to_string p.Type_repr.pt_type) s.params))
   ^ ") -> " ^ ty_to_string s.ret
 
 (* ———————————————————————————————————————————————————————————————
@@ -200,11 +218,12 @@ let manifest : t =
           ~params:[| map_of (param Type_param.k) (param Type_param.v); param Type_param.k |]
           ~ret:(option_of (param Type_param.v)) );
       ( "__intrinsic_map_insert",
-        sig_
+        sig_conv
           ~params:
-            [| map_of (param Type_param.k) (param Type_param.v); param Type_param.k;
-               param Type_param.v |]
-          ~ret:(map_of (param Type_param.k) (param Type_param.v)) );
+            [| (Access_effect.Inout, map_of (param Type_param.k) (param Type_param.v));
+               (Access_effect.Let, param Type_param.k);
+               (Access_effect.Sink, param Type_param.v) |]
+          ~ret:(option_of (param Type_param.v)) );
       ( "__intrinsic_map_contains_key",
         sig_
           ~params:[| map_of (param Type_param.k) (param Type_param.v); param Type_param.k |]
@@ -218,8 +237,11 @@ let manifest : t =
       ( "__intrinsic_set_new",
         sig_ ~params:[||] ~ret:(set_of (param Type_param.t)) );
       ( "__intrinsic_set_insert",
-        sig_ ~params:[| set_of (param Type_param.t); param Type_param.t |]
-          ~ret:(set_of (param Type_param.t)) );
+        sig_conv
+          ~params:
+            [| (Access_effect.Inout, set_of (param Type_param.t));
+               (Access_effect.Sink, param Type_param.t) |]
+          ~ret:ty_bool );
       ( "__intrinsic_set_contains",
         sig_ ~params:[| set_of (param Type_param.t); param Type_param.t |] ~ret:ty_bool );
       ( "__intrinsic_map_visit_begin",

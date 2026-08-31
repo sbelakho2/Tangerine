@@ -315,9 +315,85 @@ let enum_variant_payload (ctx : ctx) (ty : Type_repr.t) (vid : Ids.Variant_index
       else None
   | _ -> None
 
+(* re-audit P0-C: the intrinsic registry's declared types use its own
+   placeholder id domain (option=1, vec=2, map=3, set=4) while the MIR
+   carries the checker-minted LangItem ids (array=0, map=1, set=2,
+   option=3).  The verifier maps the registry ids onto the checker ids
+   before the compatibility comparison, so argument and destination
+   types are checked for every intrinsic exactly like User calls. *)
+let registry_type_to_checker (ty : Type_repr.t) : Type_repr.t =
+  let rec go t =
+    match t with
+    | Type_repr.Named (tid, args) ->
+        let tid' =
+          if Ids.Type_id.compare tid (Intrinsic_registry.Type_id.option_) = 0 then
+            Ids.Type_id.make 3
+          else if Ids.Type_id.compare tid (Intrinsic_registry.Type_id.vec) = 0 then
+            Ids.Type_id.make 0
+          else if Ids.Type_id.compare tid (Intrinsic_registry.Type_id.map) = 0 then
+            Ids.Type_id.make 1
+          else if Ids.Type_id.compare tid (Intrinsic_registry.Type_id.set) = 0 then
+            Ids.Type_id.make 2
+          else tid
+        in
+        Type_repr.Named (tid', Array.map go args)
+    | Type_repr.Fixed_array (e, n) -> Type_repr.Fixed_array (go e, n)
+    | Type_repr.Tuple elems -> Type_repr.Tuple (Array.map go elems)
+    | t -> t
+  in
+  go ty
+
+let rec intrinsic_type_compatible (ctx : ctx) (declared : Type_repr.t) (actual : Type_repr.t) : bool =
+  match declared with
+  | Type_repr.Type_param _ -> true
+  | Type_repr.Unit -> true
+  | Type_repr.Named (id1, a1) -> (
+      let id1' =
+        if Ids.Type_id.compare id1 (Intrinsic_registry.Type_id.option_) = 0 then
+          Ids.Type_id.make 3
+        else if Ids.Type_id.compare id1 (Intrinsic_registry.Type_id.vec) = 0 then
+          Ids.Type_id.make 0
+        else if Ids.Type_id.compare id1 (Intrinsic_registry.Type_id.map) = 0 then
+          Ids.Type_id.make 1
+        else if Ids.Type_id.compare id1 (Intrinsic_registry.Type_id.set) = 0 then
+          Ids.Type_id.make 2
+        else id1
+      in
+      match actual with
+      | Type_repr.Named (id2, a2)
+        when Ids.Type_id.compare id1' id2 = 0 && Array.length a1 = Array.length a2 ->
+          Array.for_all2 (fun d a -> intrinsic_type_compatible ctx d a) a1 a2
+      (* the entries cache is lowered as the Fixed_array form — the
+         declared Vec[T] element matches the fixed array's element *)
+      | Type_repr.Fixed_array (e2, _)
+        when Ids.Type_id.compare id1' (Ids.Type_id.make 0) = 0
+             && Array.length a1 = 1 ->
+          intrinsic_type_compatible ctx a1.(0) e2
+      | _ -> false)
+  | Type_repr.Fixed_array (e1, n1) -> (
+      match actual with
+      | Type_repr.Fixed_array (e2, n2) when n1 = n2 ->
+          intrinsic_type_compatible ctx e1 e2
+      | _ -> false)
+  | Type_repr.Tuple a1 -> (
+      match actual with
+      | Type_repr.Tuple a2 when Array.length a1 = Array.length a2 ->
+          Array.for_all2 (fun d a -> intrinsic_type_compatible ctx d a) a1 a2
+      | _ -> false)
+  | declared' -> types_compatible ctx (registry_type_to_checker declared') actual
+
 let enum_def_arity (ctx : ctx) (ty : Type_repr.t) : int option =
   match resolve_or_self ctx ty with
   | Type_repr.Function (variants, Type_repr.Never) -> Some (Array.length variants)
+  (* the checker's Option/Result LangItem nominals are the canonical
+     two-variant enums — the program's types table carries their defs
+     only when the closure materialized them, so the verifier knows
+     the arity by the semantic id (the same id domain the checker
+     mints for every use) *)
+  | Type_repr.Named (tid, _)
+    when Ids.Type_id.compare tid (Ids.Type_id.make 3) = 0
+         || Ids.Type_id.compare tid (Ids.Type_id.make 4) = 0 ->
+      Some 2
   | _ -> None
 
 (* The type produced by applying one projection; None = illegal.
@@ -362,7 +438,22 @@ let project_type (ctx : ctx) (ty : Type_repr.t) (proj : projection) : Type_repr.
       | _ -> None)
   | Downcast vid -> (
       match ty with
-      | Type_repr.Named (tid, args) -> enum_variant_ty ctx tid args vid
+      | Type_repr.Named (tid, args) -> (
+          match enum_variant_ty ctx tid args vid with
+          | Some t -> Some t
+          | None ->
+              (* re-audit P0-B: the checker's Option/Result LangItem
+                 nominals are the canonical two-variant enums — variant 0
+                 (Some/Ok) carries the payload argument; the program's
+                 types table carries their defs only when the closure
+                 materialized them, so the verifier resolves the payload
+                 by the semantic id *)
+              if (Ids.Type_id.compare tid (Ids.Type_id.make 3) = 0
+                  || Ids.Type_id.compare tid (Ids.Type_id.make 4) = 0)
+                 && Ids.Variant_id.to_int vid = 0
+                 && Array.length args > 0
+              then Some args.(0)
+              else None)
       | _ -> None)
 
 let place_type (ctx : ctx) (fn : function_) (p : place) : Type_repr.t option =
@@ -580,7 +671,20 @@ let init_in_sets (fn : function_) (tbl : (int, block) Hashtbl.t) : (int, IntSet.
   in
   let in_set = Hashtbl.create 16 and out_set = Hashtbl.create 16 in
   (* locals: _0 is the return slot; params occupy _1 .. _n *)
-  let entry_init = IntSet.of_list (List.init (Array.length fn.params) (fun i -> i + 1)) in
+  (* re-audit P0-A: a Set (Initialize) parameter enters the function
+     UNINITIALIZED — the definite-initialization dataflow must not
+     believe it is live at entry; the callee must initialize it before
+     every successful return *)
+  let entry_init =
+    IntSet.of_list
+      (List.filter
+         (fun lid ->
+           let pidx = lid - 1 in
+           pidx < 0 || pidx >= Array.length fn.params
+           || (Access_effect.read_effect fn.params.(pidx).Type_repr.pt_convention
+              <> Access_effect.Initialize))
+         (List.init (Array.length fn.params) (fun i -> i + 1)))
+  in
   Hashtbl.add in_set fn.entry entry_init;
   let work = Queue.create () in
   let in_work = Hashtbl.create 16 in
@@ -1663,11 +1767,55 @@ let check_call (ctx : ctx) (fn : function_) (bb_ctx : string) (dest : place)
               add_err ctx
                 (Printf.sprintf "%s: intrinsic `%s` expects %d argument(s), got %d" bb_ctx name
                    (Array.length sig_.Intrinsic_registry.params) (Array.length args));
-            (* the declared registry signature carries no access
-               conventions (its params are plain types), so argument
-               effects are not checked here; the lowerer's receiver
-               channel records the inout Modify on the collection
-               self-arg and the host binding validates the value side *)
+            (* re-audit P0-C: the registry signatures now carry the full
+               ParamType conventions — each argument's access effect is
+               checked against the declared read-side exactly like User
+               calls *)
+            Array.iteri
+              (fun k a ->
+                if k < Array.length sig_.Intrinsic_registry.params then
+                  let declared =
+                    Access_effect.read_effect
+                      sig_.Intrinsic_registry.params.(k).Type_repr.pt_convention
+                  in
+                  if a.Seed_mir.effect_ <> declared then
+                    add_err ctx
+                      (Printf.sprintf
+                         "%s: intrinsic `%s` argument %d carries effect %s but the declaration requires %s"
+                         bb_ctx name (k + 1) (Seed_mir.print_effect a.Seed_mir.effect_)
+                         (Seed_mir.print_effect declared));
+                  (* the declared parameter TYPE (the registry's
+                     placeholder domain, mapped to the checker ids) —
+                     the generic placeholders accept any actual *)
+                  let declared_ty =
+                    sig_.Intrinsic_registry.params.(k).Type_repr.pt_type
+                  in
+                  match a.Seed_mir.value with
+                  | Seed_mir.Constant _ -> ()
+                  | Seed_mir.Copy p | Seed_mir.Read p | Seed_mir.Move p
+                  | Seed_mir.Consume p -> (
+                      match place_type ctx fn p with
+                      | Some aty ->
+                          if not (intrinsic_type_compatible ctx declared_ty aty) then
+                            add_err ctx
+                              (Printf.sprintf
+                                 "%s: intrinsic `%s` argument %d type mismatch: expected %s got %s"
+                                 bb_ctx name (k + 1)
+                                 (Seed_mir.print_type (registry_type_to_checker declared_ty))
+                                 (Seed_mir.print_type aty))
+                      | None -> ()))
+              args;
+            (* the destination type against the declared result *)
+            (match place_type ctx fn dest with
+             | Some dty -> (
+                 let declared_ret = sig_.Intrinsic_registry.ret in
+                 if not (intrinsic_type_compatible ctx declared_ret dty) then
+                   add_err ctx
+                     (Printf.sprintf
+                        "%s: intrinsic `%s` destination type %s does not match declared result %s"
+                        bb_ctx name (Seed_mir.print_type dty)
+                        (Seed_mir.print_type (registry_type_to_checker declared_ret))))
+             | None -> ());
             ())
   | Extern i ->
       if i < 0 then

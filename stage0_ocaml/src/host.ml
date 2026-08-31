@@ -65,11 +65,24 @@ type signature = {
   return_type : string;
 }
 
+(* re-audit P0-B: the host-call RESULT separates the language-visible
+   value from the mutation writebacks — an inout intrinsic mutates
+   through the writeback channel (arg index -> new value) and returns
+   the EXACT Tangerine contract (Set::insert -> Bool, Map::insert ->
+   Option[old V]) in the value slot.  The old collection-return-as-
+   mutation-transport convention is gone. *)
+type host_result = {
+  value : Vm_value.t;
+  writebacks : (int * Vm_value.t) list;
+}
+
+let plain_result (v : Vm_value.t) : host_result = { value = v; writebacks = [] }
+
 type binding = {
   id : host_id;
   name : string;
   signature : signature;
-  invoke : t -> Vm_value.t array -> (Vm_value.t, string) result;
+  invoke : t -> Vm_value.t array -> (host_result, string) result;
 }
 
 (* The process surface (audit §44): real spawning through
@@ -126,7 +139,7 @@ let stderr_contents (t : t) : string = Buffer.contents t.stderr
 
 type adapter = {
   signature : signature;
-  invoke : t -> Vm_value.t array -> (Vm_value.t, string) result;
+  invoke : t -> Vm_value.t array -> (host_result, string) result;
 }
 
 let arg_mismatch expected : (Vm_value.t, string) result =
@@ -145,6 +158,23 @@ let adapter_raw (param_tys : Type_repr.t list) (ret : Type_repr.t)
         param_types = List.map type_key param_tys;
         return_type = type_key ret;
       };
+    invoke =
+      (fun t args ->
+        match invoke t args with
+        | Ok v -> Ok (plain_result v)
+        | Error m -> Error m);
+  }
+
+(* the writeback-capable raw adapter: the invoke returns the language
+   value AND the (arg index -> new value) mutation writebacks *)
+let adapter_raw_wb (param_tys : Type_repr.t list) (ret : Type_repr.t)
+    (invoke : t -> Vm_value.t array -> (host_result, string) result) : adapter =
+  {
+    signature =
+      {
+        param_types = List.map type_key param_tys;
+        return_type = type_key ret;
+      };
     invoke;
   }
 
@@ -156,8 +186,8 @@ let adapter_ret_unit (f : t -> unit) : adapter =
         match args with
         | [||] ->
             f t;
-            Ok Vm_value.Unit
-        | _ -> arg_mismatch "no arguments");
+            Ok (plain_result Vm_value.Unit)
+        | _ -> Error "argument mismatch: expected no arguments");
   }
 
 (* () -> Never: f produces the deterministic host error message. *)
@@ -168,7 +198,7 @@ let adapter_ret_never (f : t -> string) : adapter =
       (fun t args ->
         match args with
         | [||] -> Error (f t)
-        | _ -> arg_mismatch "no arguments");
+        | _ -> Error "argument mismatch: expected no arguments");
   }
 
 (* String -> Unit *)
@@ -182,8 +212,8 @@ let adapter_string_ret_unit (f : t -> string -> unit) : adapter =
         match args with
         | [| Vm_value.String s |] ->
             f t s;
-            Ok Vm_value.Unit
-        | _ -> arg_mismatch "String");
+            Ok (plain_result Vm_value.Unit)
+        | _ -> Error "argument mismatch: expected String");
   }
 
 (* String -> Never: f produces the deterministic host error message. *)
@@ -196,7 +226,7 @@ let adapter_string_ret_never (f : t -> string -> string) : adapter =
       (fun t args ->
         match args with
         | [| Vm_value.String s |] -> Error (f t s)
-        | _ -> arg_mismatch "String");
+        | _ -> Error "argument mismatch: expected String");
   }
 
 (* Int -> String *)
@@ -208,8 +238,8 @@ let adapter_int_ret_string (f : t -> Int_value.t -> string) : adapter =
     invoke =
       (fun t args ->
         match args with
-        | [| Vm_value.Int i |] -> Ok (Vm_value.String (f t i))
-        | _ -> arg_mismatch "Int");
+        | [| Vm_value.Int i |] -> Ok (plain_result (Vm_value.String (f t i)))
+        | _ -> Error "argument mismatch: expected Int");
   }
 
 (* Bool -> String *)
@@ -221,8 +251,8 @@ let adapter_bool_ret_string (f : t -> bool -> string) : adapter =
     invoke =
       (fun t args ->
         match args with
-        | [| Vm_value.Bool b |] -> Ok (Vm_value.String (f t b))
-        | _ -> arg_mismatch "Bool");
+        | [| Vm_value.Bool b |] -> Ok (plain_result (Vm_value.String (f t b)))
+        | _ -> Error "argument mismatch: expected Bool");
   }
 
 (* Char -> String *)
@@ -234,8 +264,8 @@ let adapter_char_ret_string (f : t -> Uchar.t -> string) : adapter =
     invoke =
       (fun t args ->
         match args with
-        | [| Vm_value.Char c |] -> Ok (Vm_value.String (f t c))
-        | _ -> arg_mismatch "Char");
+        | [| Vm_value.Char c |] -> Ok (plain_result (Vm_value.String (f t c)))
+        | _ -> Error "argument mismatch: expected Char");
   }
 
 (* String -> Int *)
@@ -247,8 +277,8 @@ let adapter_string_ret_int (f : t -> string -> Int_value.t) : adapter =
     invoke =
       (fun t args ->
         match args with
-        | [| Vm_value.String s |] -> Ok (Vm_value.Int (f t s))
-        | _ -> arg_mismatch "String");
+        | [| Vm_value.String s |] -> Ok (plain_result (Vm_value.Int (f t s)))
+        | _ -> Error "argument mismatch: expected String");
   }
 
 (* Binding ids are resolved from the declared registries by name, so the
@@ -283,18 +313,18 @@ let binding_manifest : binding list =
                Ok (Vm_value.Bool (List.exists (fun e -> Vm_value.equal e item) elems))
            | _ -> arg_mismatch "(Set, item)"));
     intrinsic_binding "__intrinsic_set_insert"
-      (adapter_raw [ Type_repr.Unit; Type_repr.Unit ] Type_repr.Unit (fun _ args ->
-           (* re-audit review fix: the inout receiver cannot be mutated
-              through the VM's host-call path (args are values), so the
-              intrinsic RETURNS the updated set and the lowerer's
-              receiver channel writes it back into the receiver slot *)
+      (adapter_raw_wb [ Type_repr.Unit; Type_repr.Unit ] Type_repr.Bool (fun _ args ->
+           (* re-audit P0-B: the exact Tangerine contract — the
+              language value is Bool (whether an existing equivalent
+              element was replaced) and the mutation travels through
+              the explicit writeback channel *)
            match args with
            | [| Vm_value.Set elems; item |] ->
                let existed = List.exists (fun e -> Vm_value.equal e item) elems in
-               Ok
-                 (Vm_value.Set
-                    (if existed then elems else elems @ [ item ]))
-           | _ -> arg_mismatch "(Set, item)"));
+               let new_elems = if existed then elems else elems @ [ item ] in
+               Ok { value = Vm_value.Bool existed;
+                    writebacks = [ (0, Vm_value.Set new_elems) ] }
+           | _ -> Error "argument mismatch: expected (Set, item)"));
     intrinsic_binding "__intrinsic_set_len"
       (adapter_raw [ Type_repr.Unit ] (Type_repr.Int Type_repr.Int) (fun _ args ->
            match args with
@@ -328,22 +358,29 @@ let binding_manifest : binding list =
                | None -> Ok (Vm_value.Enum (1, [||])))
            | _ -> arg_mismatch "(Map, key)"));
     intrinsic_binding "__intrinsic_map_insert"
-      (adapter_raw [ Type_repr.Unit; Type_repr.Unit; Type_repr.Unit ] Type_repr.Unit
-        (fun _ args ->
-          (* re-audit review fix: RETURN the updated map — the lowerer's
-             receiver channel writes it back into the inout slot *)
+      (adapter_raw_wb
+         [ Type_repr.Unit; Type_repr.Unit; Type_repr.Unit ]
+         Type_repr.Unit (fun _ args ->
+          (* re-audit P0-B: the exact Tangerine contract — the language
+             value is Option[old V] (the displaced old value) and the
+             mutation travels through the explicit writeback channel *)
           match args with
-          | [| Vm_value.Map pairs; key; value |] ->
-              let new_pairs =
-                match List.find_opt (fun (k, _) -> Vm_value.equal k key) pairs with
-                | Some _ ->
+          | [| Vm_value.Map pairs; key; value |] -> (
+              match List.find_opt (fun (k, _) -> Vm_value.equal k key) pairs with
+              | Some (_, old) ->
+                  let new_pairs =
                     List.map
                       (fun (k, v) -> if Vm_value.equal k key then (k, value) else (k, v))
                       pairs
-                | None -> pairs @ [ (key, value) ]
-              in
-              Ok (Vm_value.Map new_pairs)
-          | _ -> arg_mismatch "(Map, key, value)"));
+                  in
+                  Ok
+                    { value = Vm_value.Enum (0, [| old |]);
+                      writebacks = [ (0, Vm_value.Map new_pairs) ] }
+              | None ->
+                  Ok
+                    { value = Vm_value.Enum (1, [||]);
+                      writebacks = [ (0, Vm_value.Map (pairs @ [ (key, value) ])) ] })
+          | _ -> Error "argument mismatch: expected (Map, key, value)"));
     intrinsic_binding "__intrinsic_map_len"
       (adapter_raw [ Type_repr.Unit ] (Type_repr.Int Type_repr.Int) (fun _ args ->
            match args with
@@ -519,7 +556,7 @@ let closure_check (t : t) : (closure_report, string list) result =
       match List.find_opt (fun b -> b.name = name) t.bindings with
       | None -> ()
       | Some b ->
-          let decl_params = Array.to_list (Array.map type_key dsig.Intrinsic_registry.params) in
+          let decl_params = Array.to_list (Array.map (fun p -> type_key p.Type_repr.pt_type) dsig.Intrinsic_registry.params) in
           let decl_ret = type_key dsig.Intrinsic_registry.ret in
           if decl_params <> b.signature.param_types then
             problem "signature mismatch for %s: declared params [%s], binding params [%s]"
@@ -587,7 +624,7 @@ let closure_check_reachable (t : t) (reachable : host_id list) :
                 incr implemented;
                 bound_names := name :: !bound_names;
                 let decl_params =
-                  Array.to_list (Array.map type_key dsig.Intrinsic_registry.params)
+                  Array.to_list (Array.map (fun p -> type_key p.Type_repr.pt_type) dsig.Intrinsic_registry.params)
                 in
                 let decl_ret = type_key dsig.Intrinsic_registry.ret in
                 if decl_params <> b.signature.param_types then

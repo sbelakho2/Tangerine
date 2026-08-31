@@ -842,7 +842,10 @@ let builtin_methods (st : state) (vec_p : Ids.Generic_param_id.t) (opt_p : Ids.G
       ("get", [ par "key" let_ map_k ], opt map_v, hash_eq, let_);
       ("contains_key", [ par "key" let_ map_k ], b_ty, hash_eq, let_);
       ("set", [ par "key" let_ map_k; par "value" sink map_v ], unit, hash_eq, inout);
-      ("insert", [ par "key" let_ map_k; par "value" sink map_v ], unit, hash_eq, inout);
+      (* re-audit P0-B: the exact Tangerine contract — Map::insert
+         returns Option[old V] (the displaced old value); the mutation
+         travels through the intrinsic writeback channel *)
+      ("insert", [ par "key" let_ map_k; par "value" sink map_v ], opt map_v, hash_eq, inout);
       ("remove", [ par "key" let_ map_k ], opt map_v, hash_eq, let_);
       ("keys", [], vec map_k, [], let_);
       ("values", [], vec map_v, [], let_);
@@ -4080,13 +4083,39 @@ and check_if (env : env) (scope : scope) (use : expr_use) (expected : Type_repr.
              else u end` is UInt, not IntLiteral — the kernel's literal
              adoption), and — in DISCARDED context only — the non-Unit
              type when the branches diverge over Unit *)
+          (* re-audit P0 (one branch-join primitive): the if's VALUE type
+             comes from the NORMAL branches only — a branch whose normal
+             flow is unreachable (return/break/next) contributes no value
+             type; zero normal branches yield Never; the first normal
+             branch's type is authoritative (with the kernel's literal
+             adoption over the normal set), and in DISCARDED context the
+             non-Unit type still wins over a Unit path. *)
+          let normal_tys =
+            List.filter_map (fun (fr : flow_result) -> fr.fr_normal)
+              (tt :: telsif @ [ te ])
+          in
           let if_ty =
-            match tt_ty, flow_normal te with
-            | Type_repr.Int_literal _, Type_repr.Int k -> Type_repr.Int k
-            | Type_repr.Int k, Type_repr.Int_literal _ -> Type_repr.Int k
-            | Type_repr.Unit, t when use = Discarded -> t
-            | t, Type_repr.Unit when use = Discarded -> t
-            | _ -> substitute_fixpoint !subst tt_ty
+            match normal_tys with
+            | [] -> Type_repr.Never
+            | first_t :: _ -> (
+                let rec find_int = function
+                  | [] -> first_t
+                  | Type_repr.Int k :: _ -> Type_repr.Int k
+                  | _ :: rest -> find_int rest
+                in
+                match find_int normal_tys with
+                | Type_repr.Int k -> Type_repr.Int k
+                | _ -> (
+                    match first_t, use with
+                    | Type_repr.Unit, Discarded ->
+                        (match
+                           List.find_opt
+                             (fun t -> t <> Type_repr.Unit)
+                             (List.tl normal_tys)
+                         with
+                        | Some t -> t
+                        | None -> Type_repr.Unit)
+                    | _ -> substitute_fixpoint !subst first_t))
           in
           let all_effects =
             Array.concat
@@ -4212,19 +4241,31 @@ and check_match (env : env) (scope : scope) (use : expr_use) (expected : Type_re
   let ty =
     match arms with
     | [] -> Type_repr.Unit
-    | first :: _ -> (
-        (* a match over int literals adopts the concrete kind of any
-           concrete int arm (the kernel's literal adoption) *)
-        let rec find_int = function
-          | [] -> first.te_type
-          | (te : typed_expr) :: rest -> (
-              match te.te_type with
-              | Type_repr.Int k -> Type_repr.Int k
-              | _ -> find_int rest)
+    | _ :: _ -> (
+        (* re-audit P0 (one branch-join primitive): the match's VALUE
+           type comes from the NORMAL arms only — a diverging arm
+           (break/return/next) contributes no value type; zero normal
+           arms yield Never; the first normal arm's type is
+           authoritative (with the kernel's literal adoption over the
+           normal set) *)
+        let normal_arms =
+          List.filter
+            (fun (te : typed_expr) -> te.te_flow.fr_normal <> None)
+            arms
         in
-        match find_int arms with
-        | Type_repr.Int k -> Type_repr.Int k
-        | _ -> first.te_type)
+        match normal_arms with
+        | [] -> Type_repr.Never
+        | nte :: _ -> (
+            let rec find_int = function
+              | [] -> nte.te_type
+              | (te : typed_expr) :: rest -> (
+                  match te.te_type with
+                  | Type_repr.Int k -> Type_repr.Int k
+                  | _ -> find_int rest)
+            in
+            match find_int normal_arms with
+            | Type_repr.Int k -> Type_repr.Int k
+            | _ -> nte.te_type))
   in
   let effects = Array.concat (List.map (fun (te : typed_expr) -> te.te_effects) arms) in
   let match_flow =
@@ -5525,7 +5566,7 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
                 if not (List.mem_assoc (Type_repr.KParam pid) !subst) then
                   subst := (Type_repr.KParam pid, fresh_infer_var env.state) :: !subst)
               all_params;
-            let self_ty = sig_.ts_params.(0).Type_repr.pt_type in
+            let self_ty = substitute_fixpoint !subst sig_.ts_params.(0).Type_repr.pt_type in
             let* () =
               match owner_ty, self_ty with
               | Type_repr.Fixed_array (t, _), Type_repr.Named (_, [| p |]) -> unify env.state.box_tid subst p t
@@ -5786,6 +5827,11 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
                 (* the persistent typed-call channel: same node-keyed
                    record as check_call_sig — the method's call node
                    carries the resolved callable + solved substitution *)
+                let _ =
+                  if Sys.getenv_opt "TANGERINE_DEBUG_PT" <> None then
+                    Printf.eprintf "DBG-TN method %s.%s node=%d ret=%s\n" oname mname
+                      (Ids.Node_id.to_int node_id) (type_to_string ret)
+                in
                 Hashtbl.replace env.typed_nodes node_id
                   { tn_type = ret; tn_cast_target = None; tn_call = Some (sig_.ts_callable, substitution) };
                 (* the integrated access channel (re-audit P0-11): the

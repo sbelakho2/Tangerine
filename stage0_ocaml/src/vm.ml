@@ -904,7 +904,19 @@ let rec exec_terminator (vm : t) (frame : frame) (term : Seed_mir.terminator) : 
       frame.block <- find targets;
       frame.stmt <- 0)
   | Seed_mir.Call (dest, callee, args, next, _unwind) ->
-      let arg_vals = Array.map (fun a -> eval_operand vm frame a.Seed_mir.value) args in
+      (* re-audit P0-A (the four-effect ABI): an Initialize argument is
+         writable storage that does not need to contain a readable value
+         yet — it is NOT read before the call (the old pre-eval trapped
+         on an uninitialized caller place before the callee could
+         initialize it) *)
+      let arg_vals =
+        Array.map
+          (fun a ->
+            match a.Seed_mir.effect_ with
+            | Access_effect.Initialize -> Vm_value.Unit
+            | _ -> eval_operand vm frame a.Seed_mir.value)
+          args
+      in
       (match callee with
        | Seed_mir.User inst ->
            let fn_idx =
@@ -925,12 +937,21 @@ let rec exec_terminator (vm : t) (frame : frame) (term : Seed_mir.terminator) : 
                stmt = 0 }
            in
            (try
-              (* params occupy locals _1 .. _n (local _0 is the return slot) *)
+              (* params occupy locals _1 .. _n (local _0 is the return
+                 slot).  A Set (Initialize) parameter enters the callee
+                 as an UNINITIALIZED output place — the callee must
+                 initialize it before returning; every other convention
+                 enters as the copied Live value. *)
               Array.iteri
-                (fun i _slot -> callee_frame.locals.(i + 1) <- Vm_value.Live arg_vals.(i))
+                (fun i _slot ->
+                  if i < Array.length args
+                     && args.(i).Seed_mir.effect_ = Access_effect.Initialize
+                  then callee_frame.locals.(i + 1) <- Vm_value.Uninitialized
+                  else callee_frame.locals.(i + 1) <- Vm_value.Live arg_vals.(i))
                 (Array.sub arg_vals 0 (Array.length fn.Seed_mir.params));
               run_frame vm callee_frame
             with Exit -> ());
+
            (* The return slot is the callee's declared return value.  For a
               Unit-typed return it may legitimately be left Uninitialized
               (return Unit then); for any other declared return type an
@@ -962,7 +983,7 @@ let rec exec_terminator (vm : t) (frame : frame) (term : Seed_mir.terminator) : 
            Array.iteri
              (fun i a ->
                match a.Seed_mir.effect_ with
-               | Access_effect.Modify | Access_effect.Initialize -> (
+               | Access_effect.Modify -> (
                    match a.Seed_mir.value with
                    | Seed_mir.Copy p | Seed_mir.Read p | Seed_mir.Move p -> (
                        match callee_frame.locals.(i + 1) with
@@ -970,7 +991,21 @@ let rec exec_terminator (vm : t) (frame : frame) (term : Seed_mir.terminator) : 
                        | _ -> ())
                    | Seed_mir.Constant _ | Seed_mir.Consume _ ->
                        err_trap vm
-                         "inout argument is not a place (a Modify/Initialize call argument must be a place channel)")
+                         "inout argument is not a place (a Modify call argument must be a place channel)")
+               | Access_effect.Initialize -> (
+                   (* re-audit P0-A: a Set parameter must be definitely
+                      initialized on every successful return — an
+                      uninitialized Set parameter at return is an
+                      invariant failure; the initialized value copies
+                      back into the caller's place *)
+                   match a.Seed_mir.value with
+                   | Seed_mir.Copy p | Seed_mir.Read p | Seed_mir.Move p -> (
+                       match callee_frame.locals.(i + 1) with
+                       | Vm_value.Live v -> write_place vm frame p v
+                       | _ ->
+                           err_trap vm
+                             "callee returned with an uninitialized Set (Initialize) parameter")
+                   | _ -> ())
                | _ -> ())
              args;
            vm.frames <- List.tl vm.frames;
@@ -981,29 +1016,19 @@ let rec exec_terminator (vm : t) (frame : frame) (term : Seed_mir.terminator) : 
            vm.host_calls <- vm.host_calls + 1;
            if vm.host_calls > vm.limits.max_host_calls then
              err_trap vm "host call limit exceeded";
-           let ret = call_host vm host_callee arg_vals in
-           (* re-audit P0 (the host-call inout channel): a
-              Modify/Initialize argument is a PLACE channel — when the
-              adapter's returned value has the SAME runtime kind as the
-              argument's original value (a collection argument and a
-              collection-returning adapter — the intrinsic's real
-              mutation transport), the returned value copies back into
-              the caller's place, so the mutation survives the
-              value-based host ABI. *)
-           Array.iter
-             (fun a ->
-               match a.Seed_mir.effect_ with
-               | Access_effect.Modify | Access_effect.Initialize -> (
-                   match a.Seed_mir.value with
-                   | Seed_mir.Copy p | Seed_mir.Read p | Seed_mir.Move p -> (
-                       match ret, eval_operand vm frame a.Seed_mir.value with
-                       | Vm_value.Set _, Vm_value.Set _ | Vm_value.Map _, Vm_value.Map _ ->
-                           write_place vm frame p ret
-                       | _ -> ())
-                   | _ -> ())
-               | _ -> ())
-             args;
-           write_place vm frame dest ret;
+           let hr = call_host vm host_callee arg_vals in
+           (* re-audit P0-B: the intrinsic's mutation writebacks are
+              explicit (arg index -> new value) — each writeback copies
+              into the argument's caller place *)
+           List.iter
+             (fun (i, v) ->
+               if i >= 0 && i < Array.length args then
+                 match args.(i).Seed_mir.value with
+                 | Seed_mir.Copy p | Seed_mir.Read p | Seed_mir.Move p ->
+                     write_place vm frame p v
+                 | _ -> ())
+             hr.Host.writebacks;
+           write_place vm frame dest hr.Host.value;
            frame.block <- next;
            frame.stmt <- 0)
   | Seed_mir.Drop (p, next, _) ->
@@ -1034,7 +1059,7 @@ let rec exec_terminator (vm : t) (frame : frame) (term : Seed_mir.terminator) : 
    (audit §70). Dispatch resolves the registry index to a binding id and
    invokes the binding's `invoke`; a declared symbol without a binding
    fails closed, and an invoke error becomes a deterministic trap. *)
-and call_host (vm : t) (callee : Seed_mir.callee) (args : Vm_value.t array) : Vm_value.t =
+and call_host (vm : t) (callee : Seed_mir.callee) (args : Vm_value.t array) : Host.host_result =
   let id =
     match callee with
     | Seed_mir.Intrinsic i -> Host.Intrinsic (Intrinsic_registry.Id.make i)
@@ -1060,7 +1085,7 @@ and call_host (vm : t) (callee : Seed_mir.callee) (args : Vm_value.t array) : Vm
           (Printf.sprintf "host call %s: arity mismatch (binding arity %d, got %d)"
              b.Host.name (List.length b.Host.signature.Host.param_types) (Array.length args));
       (match b.Host.invoke vm.host args with
-       | Ok v -> v
+       | Ok r -> r
        | Error msg -> err_trap vm (Printf.sprintf "host call %s: %s" b.Host.name msg))
 
 and run_frame (vm : t) (frame : frame) : unit =

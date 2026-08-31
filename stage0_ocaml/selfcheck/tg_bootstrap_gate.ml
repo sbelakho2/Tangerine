@@ -63,36 +63,89 @@
    When the accepted record is present, its debt facts replace the
    fallback scalars. *)
 let baseline_from_file (repo_root : string) : Debt_report.t option =
+  (* re-audit P0-G: accepted.json is a tiny IMMUTABLE POINTER —
+     evidence_record + evidence_sha256 + approval — with NO copied
+     measurement fields.  The gate loads the pointer, verifies the
+     record's SHA-256, loads the generated evidence record, and reads
+     the debt facts FROM THAT RECORD.  A pointer whose record is
+     missing or hash-mismatched is rejected (fall back to the
+     hardcoded baseline with a loud warning); the class of error where
+     the pointer and the record describe different builds is
+     impossible. *)
   let path = Filename.concat repo_root "bootstrap/evidence/ocaml/accepted.json" in
   match In_channel.open_bin path with
   | exception _ -> None
   | ic ->
       let content = In_channel.input_all ic in
       close_in ic;
-      let int_of_key key =
-        let pat = "\"" ^ key ^ "\"" in
-        match Util.find_key_value content pat with
-        | Some v -> int_of_string v
-        | None -> 0
+      let key_of key =
+        (* the pointer's STRING values (the record filename, the SHA):
+           the digits-only generic reader cannot parse them, so extract
+           the quoted JSON string after `"key": ` *)
+        let pat = "\"" ^ key ^ "\": \"" in
+        match Util.find_key_value_pos content pat with
+        | None -> ""
+        | Some i -> (
+            let rest = String.sub content (i + String.length pat)
+                (String.length content - i - String.length pat) in
+            match String.index_opt rest '"' with
+            | None -> ""
+            | Some j -> String.sub rest 0 j)
       in
-      let total = int_of_key "debt_total" in
-      let primaries = int_of_key "debt_primary" in
-      let secondaries = int_of_key "debt_secondary" in
-      if total <= 0 || primaries <= 0 || secondaries <= 0 then begin
+      let record_name = key_of "evidence_record" in
+      let expected_sha = key_of "evidence_sha256" in
+      if record_name = "" || expected_sha = "" then begin
         Printf.printf
-          "  WARNING: bootstrap/evidence/ocaml/accepted.json is missing or malformed (debt_total %d, debt_primary %d, debt_secondary %d) — falling back to the hardcoded baseline\n"
-          total primaries secondaries;
+          "  WARNING: accepted.json is not a pointer record (missing evidence_record/evidence_sha256) — falling back to the hardcoded baseline\n";
         None
       end
-      else
-        Some
-          {
-            Debt_report.buckets =
-              List.map (fun c -> (c, 0)) Debt_report.categories;
-            total;
-            primaries;
-            secondaries;
-          }
+      else begin
+        let rec_path = Filename.concat repo_root ("bootstrap/evidence/ocaml/" ^ record_name) in
+        match In_channel.open_bin rec_path with
+        | exception _ ->
+            Printf.printf
+              "  WARNING: accepted pointer's evidence record %s is missing — falling back to the hardcoded baseline\n"
+              record_name;
+            None
+        | ic2 ->
+            let rec_content = In_channel.input_all ic2 in
+            close_in ic2;
+            let actual_sha =
+              Digest.to_hex (Digest.string rec_content)
+            in
+            if actual_sha <> expected_sha then begin
+              Printf.printf
+                "  WARNING: accepted pointer's evidence record %s hash mismatch (record %s, pointer %s) — falling back to the hardcoded baseline\n"
+                record_name actual_sha expected_sha;
+              None
+            end
+            else begin
+              let int_of_key key =
+                let pat = "\"" ^ key ^ "\"" in
+                match Util.find_key_value rec_content pat with
+                | Some v -> int_of_string v
+                | None -> 0
+              in
+              let total = int_of_key "debt_total" in
+              let primaries = int_of_key "debt_primary" in
+              let secondaries = int_of_key "debt_secondary" in
+              if total <= 0 || primaries <= 0 || secondaries <= 0 then begin
+                Printf.printf
+                  "  WARNING: evidence record %s has malformed debt facts — falling back to the hardcoded baseline\n"
+                  record_name;
+                None
+              end
+              else
+                Some
+                  {
+                    Debt_report.buckets =
+                      List.map (fun c -> (c, 0)) Debt_report.categories;
+                    total;
+                    primaries;
+                    secondaries;
+                  }
+            end
+      end
 let baseline_typecheck_debt : Debt_report.t =
   {
     Debt_report.buckets =

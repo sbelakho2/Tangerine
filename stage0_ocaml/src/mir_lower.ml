@@ -2938,7 +2938,19 @@ and lower_match_syntactic (env : func_env) (st : lower_state) (m : Ast.match_exp
        | _ -> seed_bug "unsupported match arm pattern in lowering");
       let bval, bty = lower_expr env st a.Ast.ma_body in
       ensure_result bty;
-      emit st (Seed_mir.Assign (cur_place st !result_id, Seed_mir.Use bval));
+      (* a Unit arm in a discarded/statement-position match contributes
+         no result value (the checker's branch-join: a divergent/Unit
+         arm is dropped in Discarded context) — the result slot stays
+         the surviving arms' type.  The `()` literal lowers to the
+         EMPTY TUPLE, the Unit-equivalent form. *)
+      let is_unit_ty ty =
+        ty = Type_repr.Unit
+        || match ty with
+           | Type_repr.Tuple a -> Array.length a = 0
+           | _ -> false
+      in
+      (if not (is_unit_ty bty) then
+         emit st (Seed_mir.Assign (cur_place st !result_id, Seed_mir.Use bval)));
       set_terminator st (Seed_mir.Goto join_b))
     m.Ast.m_arms;
   (* the join block stays open for the continuation: every arm body
@@ -3404,7 +3416,19 @@ and lower_match_typed (env : func_env) (st : lower_state) (nid : Ids.Node_id.t)
            seed_bug "range match arms are not available in the seed lowering");
       let bval, bty = lower_expr env st a.Ast.ma_body in
       ensure_result bty;
-      emit st (Seed_mir.Assign (cur_place st !result_id, Seed_mir.Use bval));
+      (* a Unit arm in a discarded/statement-position match contributes
+         no result value (the checker's branch-join: a divergent/Unit
+         arm is dropped in Discarded context) — the result slot stays
+         the surviving arms' type.  The `()` literal lowers to the
+         EMPTY TUPLE, the Unit-equivalent form. *)
+      let is_unit_ty ty =
+        ty = Type_repr.Unit
+        || match ty with
+           | Type_repr.Tuple a -> Array.length a = 0
+           | _ -> false
+      in
+      (if not (is_unit_ty bty) then
+         emit st (Seed_mir.Assign (cur_place st !result_id, Seed_mir.Use bval)));
       set_terminator st (Seed_mir.Goto join_b))
     m.Ast.m_arms;
   (* the join block stays open for the continuation: every arm body
@@ -3972,7 +3996,43 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
                        mname)
            in
            let arg_ops = List.map (fun a -> fst (lower_expr env st a.Ast.ca_value)) args in
-           let id = fresh_local st me.me_ret in
+           (* the receiver-channel result local: the CHECKER-resolved
+              return (the solved substitution — Option[Int], never the
+              raw Option[V] declaration binder the verifier rejects in
+              local types); falls back to substituting the method's
+              declaration binders against the receiver's type *)
+           let rec subst_against self_ty receiver_ty acc =
+             match self_ty, receiver_ty with
+             | Type_repr.Named (id1, a1), Type_repr.Named (id2, a2)
+               when Ids.Type_id.compare id1 id2 = 0
+                    && Array.length a1 = Array.length a2 ->
+                 List.fold_left2
+                   (fun acc s r ->
+                     match s with
+                     | Type_repr.Type_param p -> (Type_repr.KParam p, r) :: acc
+                     | Type_repr.Named (_, sa) when Array.length sa > 0 -> (
+                         match r with
+                         | Type_repr.Named (_, ra)
+                           when Array.length ra = Array.length sa ->
+                             subst_against s r acc
+                         | _ -> acc)
+                     | _ -> acc)
+                   acc (Array.to_list a1) (Array.to_list a2)
+             | _ -> acc
+           in
+           let recv_dest_ty =
+             match call_result_ty st nid me.me_ret with
+             | t when not (Type_repr.has_type_param t) -> t
+             | _ -> (
+                 match me.me_params with
+                 | [||] -> me.me_ret
+                 | _ ->
+                     let self_ty = me.me_params.(0).Type_repr.pt_type in
+                     let subst = subst_against self_ty rty [] in
+                     if subst = [] then me.me_ret
+                     else Type_repr.substitute subst me.me_ret)
+           in
+           let id = fresh_local st recv_dest_ty in
            let rp2 = cur_place st id in
            let arg_vals =
              Array.of_list
@@ -4002,37 +4062,69 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
               Intrinsic_registry.lookup Intrinsic_registry.manifest
                 ~name:intrinsic_name
             with
-           | Some (iid, isig) ->
-               (* the inout writeback (review fix): the mutating
-                  collection intrinsics (set_insert/map_insert — the
-                  registry declares their RESULT as the updated
-                  collection) cannot mutate the receiver through the
-                  host-call path (args are values), so the call's dest
-                  is typed as the receiver's collection and the result
-                  is written back into the receiver slot — the seed's
-                  inout approximation made real for the runtime
-                  collections.  The writeback fires exactly when the
-                  intrinsic's declared result is a collection AND the
-                  receiver is the same-kind collection. *)
-               let ret_is_collection =
-                 match isig.Intrinsic_registry.ret with
-                 | Type_repr.Named (tid, _)
-                   when Ids.Type_id.compare tid (Intrinsic_registry.Type_id.set) = 0 ->
-                     (match rty with
-                      | Type_repr.Named (tid2, _)
-                        when Ids.Type_id.compare tid2 (Ids.Type_id.make 2) = 0 ->
-                          true
-                      | _ -> false)
-                 | Type_repr.Named (tid, _)
-                   when Ids.Type_id.compare tid (Intrinsic_registry.Type_id.map) = 0 ->
-                     (match rty with
-                      | Type_repr.Named (tid2, _)
-                        when Ids.Type_id.compare tid2 (Ids.Type_id.make 1) = 0 ->
-                          true
-                      | _ -> false)
-                 | _ -> false
+           | Some (iid, _isig) ->
+               (* re-audit P0-B: the collection mutation now travels
+                  through the VM's host-call WRITEBACK channel (the
+                  adapters return the exact Tangerine contract in the
+                  value slot and the mutation in the writebacks), so
+                  the receiver-writeback hack is deleted — the call's
+                  dest is the SOURCE method's result type (Set::insert
+                  -> Bool, Map::insert -> Option[V]) and the call
+                  expression returns that value directly.  The dest
+                  local's type is the CHECKER's resolved return (the
+                  solved substitution — Option[Int], never the raw
+                  Option[V] declaration binder the verifier rejects) *)
+               (* the checker records the method-call node's resolved
+                  return; when the channel lookup misses, fall back to
+                  substituting the method's declaration binders against
+                  the RECEIVER's type (the self parameter's structure —
+                  Map[K, V] vs the receiver's Map[Int, Int] solves
+                  V := Int) so the dest never carries a raw binder *)
+               let dest_ty =
+                 match call_result_ty st nid me.me_ret with
+                 | Type_repr.Named (_, _) as t
+                   when List.exists
+                          (fun p ->
+                            Type_repr.has_type_param p.Type_repr.pt_type)
+                          (Array.to_list me.me_params) ->
+                     t
+                 | t -> t
                in
-               let dest_ty = if ret_is_collection then rty else me.me_ret in
+               let dest_ty =
+                 let rec subst_against self_ty receiver_ty acc =
+                   match self_ty, receiver_ty with
+                   | Type_repr.Named (id1, a1), Type_repr.Named (id2, a2)
+                     when Ids.Type_id.compare id1 id2 = 0
+                          && Array.length a1 = Array.length a2 ->
+                       List.fold_left2
+                         (fun acc s r ->
+                           match s with
+                           | Type_repr.Type_param p ->
+                               (Type_repr.KParam p, r) :: acc
+                           | Type_repr.Named (_, sa) when Array.length sa > 0 ->
+                               (match r with
+                                | Type_repr.Named (_, ra) when Array.length ra = Array.length sa ->
+                                    subst_against s r acc
+                                | _ -> acc)
+                           | _ -> acc)
+                         acc (Array.to_list a1) (Array.to_list a2)
+                   | _ -> acc
+                 in
+                 match dest_ty with
+                 | Type_repr.Named (_, _) -> (
+                     match me.me_params with
+                     | [||] -> dest_ty
+                     | _ ->
+                         let self_ty = me.me_params.(0).Type_repr.pt_type in
+                         let subst = subst_against self_ty rty [] in
+                         Type_repr.substitute subst dest_ty)
+                 | _ -> dest_ty
+               in
+               let _ =
+                 if Sys.getenv_opt "TANGERINE_DEBUG_PT" <> None then
+                   Printf.eprintf "DBG-DEST2 %s rty=%s dest=%s\n" intrinsic_name
+                     (Typecheck.type_to_string rty) (Typecheck.type_to_string dest_ty)
+               in
                let did = fresh_local st dest_ty in
                let drp = cur_place st did in
                let next_b = new_block st in
@@ -4044,16 +4136,7 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
                       next_b,
                       None ))
                  next_b;
-               (* the writeback statement lands in the call's
-                  continuation block: set_terminator_to already switched
-                  the current block to `next_b`, so a plain emit appends
-                  to it — the statement sequence then advances there *)
-               if ret_is_collection then
-                 emit st
-                   (Seed_mir.Assign
-                      ( rp,
-                        Seed_mir.Use (Seed_mir.Move drp) ));
-               (copy_place st drp, call_result_ty st nid me.me_ret)
+               (copy_place st drp, dest_ty)
            | None ->
                let next_b = new_block st in
                set_terminator_to st
