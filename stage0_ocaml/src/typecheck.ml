@@ -6007,6 +6007,14 @@ and check_methods (env : env) (owner : string) (extra_tp_bounds : (string * stri
     | (m : Ast.function_decl) :: rest -> (
         match List.assoc_opt (owner, m.fn_sig.sig_name) env.methods with
         | None ->
+            if Sys.getenv_opt "TANGERINE_DEBUG_CALL" <> None then begin
+              let matching =
+                List.filter (fun ((o, _), _) -> o = owner) env.methods
+                |> List.map (fun ((_, n), _) -> n) |> String.concat ", "
+              in
+              Printf.eprintf "DEBUG-MNOTREG owner=%s method=%s methods=[%s]\n" owner
+                m.fn_sig.sig_name matching
+            end;
             Error
               (err m.fn_span
                  (Printf.sprintf "internal: method `%s::%s` was not registered" owner
@@ -6140,13 +6148,20 @@ and check_impl (env : env) (d : Ast.impl_decl) : (unit, string) result =
     match d.i_for_type, d.i_trait_name with
     | Some ft, None -> resolve_type env scope ft
     | _ ->
+        (* the target may be one of the impl's OWN generic parameters
+           (`impl[T, I: Iterator[T]] I` — the target I is the impl's
+           param, never I[<impl params>]); only a nominal target carries
+           the impl's params as type arguments *)
+        let impl_param_names = List.map (fun (tp : Ast.type_param) -> tp.tp_name) d.i_type_params in
+        let target_args =
+          if List.mem d.i_target_type impl_param_names then []
+          else
+            List.map
+              (fun (tp : Ast.type_param) -> Ast.Named (tp.tp_name, [], tp.tp_span))
+              d.i_type_params
+        in
         resolve_type env scope
-          (Ast.Named
-             ( d.i_target_type,
-               List.map
-                 (fun (tp : Ast.type_param) -> Ast.Named (tp.tp_name, [], tp.tp_span))
-                 d.i_type_params,
-               d.i_span ))
+          (Ast.Named (d.i_target_type, target_args, d.i_span))
   in
   let env' = { env with current_self = Some target; impl_target = Some d.i_target_type } in
   let* impl_where = resolve_where env' scope d.i_where in
@@ -6274,7 +6289,11 @@ and register_methods (env : env) (owner : string) (methods : Ast.function_decl l
           resolve_signature env empty_scope m.fn_sig extra_params
             ~key:(owner ^ "::" ^ m.fn_sig.sig_name)
         with
-        | Error e -> Error e
+        | Error e ->
+            if Sys.getenv_opt "TANGERINE_DEBUG_CALL" <> None then
+              Printf.eprintf "DEBUG-MSIGFAIL owner=%s method=%s err=%s\n" owner
+                m.fn_sig.sig_name e;
+            Error e
         | Ok sig_ ->
             (* identity handoff (audit Fix 2): the resolver owns method
                callable identity — use its CallableId when it resolves;
@@ -6359,13 +6378,16 @@ and register_impl (env : env) (d : Ast.impl_decl) : (env, string) result =
     match d.i_for_type, d.i_trait_name with
     | Some ft, None -> resolve_type env scope ft
     | _ ->
+        let impl_param_names = List.map (fun (tp : Ast.type_param) -> tp.tp_name) d.i_type_params in
+        let target_args =
+          if List.mem d.i_target_type impl_param_names then []
+          else
+            List.map
+              (fun (tp : Ast.type_param) -> Ast.Named (tp.tp_name, [], tp.tp_span))
+              d.i_type_params
+        in
         resolve_type env scope
-          (Ast.Named
-             ( d.i_target_type,
-               List.map
-                 (fun (tp : Ast.type_param) -> Ast.Named (tp.tp_name, [], tp.tp_span))
-                 d.i_type_params,
-               d.i_span ))
+          (Ast.Named (d.i_target_type, target_args, d.i_span))
   in
   let env' = { env with current_self = Some target } in
   let* impl_where = resolve_where env' scope d.i_where in
@@ -6431,14 +6453,21 @@ and register_impl (env : env) (d : Ast.impl_decl) : (env, string) result =
     | None -> Ok ()
     | Some t -> (
         match List.assoc_opt t env2.impls.trait_contracts with
-        | None -> Error (err d.i_span (Printf.sprintf "unknown trait `%s` in impl" t))
+        | None ->
+            if Sys.getenv_opt "TANGERINE_DEBUG_CALL" <> None then
+              Printf.eprintf "DEBUG-IMPLFAIL trait=%s target=%s err=unknown trait\n" t
+                d.i_target_type;
+            Error (err d.i_span (Printf.sprintf "unknown trait `%s` in impl" t))
         | Some tmethods ->
             let mnames = List.map (fun (m : Ast.function_decl) -> m.fn_sig.sig_name) d.i_methods in
             if List.for_all (fun n -> List.mem n tmethods) mnames then Ok ()
-            else
+            else (
+              if Sys.getenv_opt "TANGERINE_DEBUG_CALL" <> None then
+                Printf.eprintf "DEBUG-IMPLFAIL trait=%s target=%s err=contract-mismatch methods=[%s] contract=[%s]\n"
+                  t d.i_target_type (String.concat "," mnames) (String.concat "," tmethods);
               Error
                 (err d.i_span
-                   (Printf.sprintf "impl of trait `%s` declares methods not in the trait contract" t)))
+                   (Printf.sprintf "impl of trait `%s` declares methods not in the trait contract" t))))
   in
   register_methods env2 d.i_target_type d.i_methods impl_params impl_where
 
@@ -6966,6 +6995,42 @@ let rec register_headers (env : env) (acc : string list) = function
                 type_ids = (d.e_name, tid) :: List.remove_assoc d.e_name env.type_ids;
                 type_names = (tid, d.e_name) :: env.type_names;
                 nominals = (d.e_name, nom) :: env.nominals;
+              }
+            in
+            register_headers env' acc rest
+          end
+      | Ast.TraitDef d ->
+          (* trait names are usable as TYPES in signatures (the kernel's
+             `-> Iterator[T]` return positions); register the trait in the
+             type tables so resolve_named finds it (traits are never
+             value-lowered, but the signature surface resolves) *)
+          if List.mem_assoc d.t_name env.types then register_headers env acc rest
+          else begin
+            let params =
+              let key = "trait::" ^ d.t_name in
+              match Hashtbl.find_opt env.state.sig_param_ids key with
+              | Some ids -> ids
+              | None ->
+                  let ids =
+                    List.map
+                      (fun (tp : Ast.type_param) -> (tp.tp_name, fresh_param_id env.state))
+                      d.t_type_params
+                  in
+                  Hashtbl.add env.state.sig_param_ids key ids;
+                  ids
+            in
+            let tid =
+              match List.assoc_opt d.t_name env.type_ids with
+              | Some t -> t
+              | None -> fresh_type_id env.state
+            in
+            let param_tys = Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param (p)) params) in
+            let env' =
+              {
+                env with
+                types = (d.t_name, Type_repr.Named (tid, param_tys)) :: List.remove_assoc d.t_name env.types;
+                type_ids = (d.t_name, tid) :: List.remove_assoc d.t_name env.type_ids;
+                type_names = (tid, d.t_name) :: env.type_names;
               }
             in
             register_headers env' acc rest
