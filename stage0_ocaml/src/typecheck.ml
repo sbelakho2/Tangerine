@@ -4093,7 +4093,14 @@ and check_if (env : env) (scope : scope) (use : expr_use) (expected : Type_repr.
               (cond_effects :: List.map (fun (_fr : flow_result) -> [||]) (tt :: telsif @ [ te ]))
           in
           let if_flow =
-            List.fold_left flow_join (normal_flow Type_repr.Unit) (tt :: telsif @ [ te ])
+            (* re-audit P0 (the join identity): a COMPLETE if/else has no
+               implicit fallthrough path — the join starts from an
+               unreachable normal continuation, so a both-branches-return
+               if reports fr_normal = None (the old Unit identity
+               introduced a false normal path) *)
+            List.fold_left flow_join
+              (diverge_flow ~may_return:false ~may_break:false ~may_continue:false)
+              (tt :: telsif @ [ te ])
           in
           Ok
             { te_type = if_ty;
@@ -4221,9 +4228,12 @@ and check_match (env : env) (scope : scope) (use : expr_use) (expected : Type_re
   in
   let effects = Array.concat (List.map (fun (te : typed_expr) -> te.te_effects) arms) in
   let match_flow =
+    (* re-audit P0 (the join identity): an exhaustive match has no
+       implicit fallthrough — the join starts from an unreachable
+       normal continuation *)
     List.fold_left
       (fun acc (te : typed_expr) -> flow_join acc te.te_flow)
-      (normal_flow Type_repr.Unit) arms
+      (diverge_flow ~may_return:false ~may_break:false ~may_continue:false) arms
   in
   Ok
     { te_type = ty;

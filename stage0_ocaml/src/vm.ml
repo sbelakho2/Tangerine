@@ -951,6 +951,28 @@ let rec exec_terminator (vm : t) (frame : frame) (term : Seed_mir.terminator) : 
                    (Printf.sprintf "callee %s returned with a non-live return slot"
                       fn.Seed_mir.name)
            in
+           (* re-audit P0 (the inout calling convention): a
+              Modify/Initialize argument is a PLACE channel — the
+              callee's parameter local aliases the caller's storage via
+              explicit deterministic copy-in/copy-out.  The callee runs
+              on the copied value; after it returns, the (possibly
+              modified) parameter local copies back into the caller's
+              place.  Without this, `def mutate(inout x: Int) ...;
+              mutate(a)` would silently discard the mutation. *)
+           Array.iteri
+             (fun i a ->
+               match a.Seed_mir.effect_ with
+               | Access_effect.Modify | Access_effect.Initialize -> (
+                   match a.Seed_mir.value with
+                   | Seed_mir.Copy p | Seed_mir.Read p | Seed_mir.Move p -> (
+                       match callee_frame.locals.(i + 1) with
+                       | Vm_value.Live v -> write_place vm frame p v
+                       | _ -> ())
+                   | Seed_mir.Constant _ | Seed_mir.Consume _ ->
+                       err_trap vm
+                         "inout argument is not a place (a Modify/Initialize call argument must be a place channel)")
+               | _ -> ())
+             args;
            vm.frames <- List.tl vm.frames;
            write_place vm frame dest ret;
            frame.block <- next;
@@ -960,6 +982,27 @@ let rec exec_terminator (vm : t) (frame : frame) (term : Seed_mir.terminator) : 
            if vm.host_calls > vm.limits.max_host_calls then
              err_trap vm "host call limit exceeded";
            let ret = call_host vm host_callee arg_vals in
+           (* re-audit P0 (the host-call inout channel): a
+              Modify/Initialize argument is a PLACE channel — when the
+              adapter's returned value has the SAME runtime kind as the
+              argument's original value (a collection argument and a
+              collection-returning adapter — the intrinsic's real
+              mutation transport), the returned value copies back into
+              the caller's place, so the mutation survives the
+              value-based host ABI. *)
+           Array.iter
+             (fun a ->
+               match a.Seed_mir.effect_ with
+               | Access_effect.Modify | Access_effect.Initialize -> (
+                   match a.Seed_mir.value with
+                   | Seed_mir.Copy p | Seed_mir.Read p | Seed_mir.Move p -> (
+                       match ret, eval_operand vm frame a.Seed_mir.value with
+                       | Vm_value.Set _, Vm_value.Set _ | Vm_value.Map _, Vm_value.Map _ ->
+                           write_place vm frame p ret
+                       | _ -> ())
+                   | _ -> ())
+               | _ -> ())
+             args;
            write_place vm frame dest ret;
            frame.block <- next;
            frame.stmt <- 0)

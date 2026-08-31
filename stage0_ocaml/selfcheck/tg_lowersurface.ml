@@ -1532,6 +1532,117 @@ end
                                 (match other with Ok v -> v | Error m -> "<" ^ m ^ ">");
                               exit 1)))
                end));
+      (* ── the inout calling-convention round-trip proof (re-audit
+         P0): `def bump(inout x: Int); x = x + 1; end` — the VM copies
+         the argument value into the callee's parameter local, the
+         callee mutates it, and the Modify effect copies it back into
+         the caller's place — main = 3 after two bumps of 1 (the old
+         VM silently discarded the mutation). *)
+      let iosrc = {|
+def bump(inout x: Int)
+  x = x + 1
+end
+def main() -> Int
+  var a = 1
+  bump(a)
+  bump(a)
+  a
+end
+|} in
+      (match Source_loader.load_string "<inout-bump>" iosrc with
+       | Error _ -> failwith "inout-bump source load"
+       | Ok iosrc2 -> (
+           let iom = Span.create () in
+           let iofid = Span.add_file iom iosrc2.Source.name iosrc2 in
+           let iodiags = Diagnostic.create_bag () in
+           let iolx = Lexer.create iosrc2.Source.bytes iofid iodiags in
+           let iotoks = Lexer.lex iolx in
+           let ioprog = Parser.parse iotoks iosrc2.Source.bytes iofid iodiags [ "io" ] in
+           match Typecheck.check_program (Typecheck.initial_env ()) ioprog with
+           | Error m -> failwith ("inout-bump typecheck: " ^ m)
+           | Ok (ioenv, ioerrs) ->
+               if ioerrs <> [] then
+                 failwith ("inout-bump typecheck errors: " ^ String.concat "; " ioerrs)
+               else begin
+                 let iobase = Driver.lowering_env_of ~items:ioprog.Ast.items ioenv in
+                 let iovariants = Driver.user_variant_table ioenv in
+                 let lower_fn name fd ts =
+                   Mir_lower.lower_function_with_variants
+                     ~typed_nodes:(Driver.typed_nodes_of ioenv)
+                     ~typed_patterns:(Driver.typed_patterns_of ioenv)
+                     ~typed_for_patterns:(Driver.typed_for_patterns_of ioenv)
+                     ~typed_let_patterns:(Driver.typed_let_patterns_of ioenv)
+                     iovariants
+                     { iobase with Mir_lower.fn_ret = ts.Typecheck.ts_return }
+                     name (Ids.Callable_id.to_int ts.Typecheck.ts_callable)
+                     (Array.of_list
+                        (List.map (fun (_, pid) -> Type_repr.Type_param pid)
+                           ts.Typecheck.ts_params_decl))
+                     (Array.map (fun p -> p.Type_repr.pt_convention) ts.Typecheck.ts_params)
+                     ~param_tys_opt:
+                       (Array.map (fun p -> p.Type_repr.pt_type) ts.Typecheck.ts_params)
+                     fd
+                 in
+                 let io_ts name =
+                   match List.assoc_opt name ioenv.Typecheck.functions with
+                   | Some ts -> ts
+                   | None -> (
+                       match
+                         List.filter (fun (k, _) -> Util.has_suffix k ("::" ^ name))
+                           ioenv.Typecheck.functions
+                       with
+                       | [ (_, ts) ] -> ts
+                       | _ -> failwith ("inout-bump: no " ^ name ^ " signature"))
+                 in
+                 let iodecls = Hashtbl.create 4 in
+                 List.iter
+                   (fun i ->
+                     match i.Ast.kind with
+                     | Ast.Function d ->
+                         Hashtbl.replace iodecls d.Ast.fn_sig.Ast.sig_name
+                           (d, io_ts d.Ast.fn_sig.Ast.sig_name)
+                     | _ -> ())
+                   ioprog.Ast.items;
+                 let iobump_fn =
+                   let d, ts = Hashtbl.find iodecls "bump" in
+                   lower_fn "bump" d ts
+                 in
+                 let iofn =
+                   let d, ts = Hashtbl.find iodecls "main" in
+                   lower_fn "main" d ts
+                 in
+                 let ioprog_mir =
+                   { Seed_mir.functions = [| iobump_fn; iofn |]; statics = [||]; types = [||] }
+                 in
+                 (match Mir_verify.require_valid_concrete ioprog_mir with
+                  | Ok () -> Printf.printf "  inout writeback verify (concrete mode): PASS\n"
+                  | Error errs ->
+                      Printf.printf "  inout writeback verify (concrete mode): FAIL\n";
+                      List.iter (fun e -> Printf.printf "    %s\n" e) errs;
+                      exit 1);
+                 let ioentry = iofn.Seed_mir.instance in
+                 let iohost = Host.create ~repo_root:"." ~argv:[||] in
+                 (match Vm.run ~program:ioprog_mir ~entry:ioentry ~argv:[||] ~host:iohost with
+                  | Error e ->
+                      Printf.printf "  inout writeback VM: FAIL %s\n" e.Vm.message;
+                      exit 1
+                  | Ok code -> (
+                      match Vm.entry_frame_of ~program:ioprog_mir ~entry:ioentry ~argv:[||] with
+                      | Error m ->
+                          Printf.printf "  inout writeback VM: <inspect failed: %s>\n" m;
+                          exit 1
+                      | Ok (iovm, ioframe) -> (
+                          match Vm.run_inspect iovm ioframe with
+                          | Ok "3" ->
+                              Printf.printf
+                                "  inout writeback round-trip: PASS (main = 3 — the Modify effect copied the callee's mutation back into the caller's place; exit %d)\n"
+                                code
+                          | other ->
+                              Printf.printf
+                                "  inout writeback round-trip: FAIL (expected 3, got %s)\n"
+                                (match other with Ok v -> v | Error m -> "<" ^ m ^ ">");
+                              exit 1)))
+               end));
       (* ── the RUNTIME Vec iteration round-trip proof (the audit's
          typed-iterable requirement): a `for x in v` over a runtime
          Vec[Int] lowers to the counter loop with the dynamic

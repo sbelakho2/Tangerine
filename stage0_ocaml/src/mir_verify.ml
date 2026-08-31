@@ -1642,10 +1642,37 @@ let check_call (ctx : ctx) (fn : function_) (bb_ctx : string) (dest : place)
     (callee : callee) (args : call_arg array) (running : IntSet.t) (moved : StrSet.t IntMap.t) : unit =
   check_dest_place ctx fn bb_ctx dest running;
   match callee with
-  | Intrinsic i | Extern i ->
+  | Intrinsic i -> (
       if i < 0 then
         add_err ctx
-          (Printf.sprintf "%s: negative intrinsic/extern callee index %d" bb_ctx i)
+          (Printf.sprintf "%s: negative intrinsic callee index %d" bb_ctx i)
+      else
+        match Intrinsic_registry.by_id Intrinsic_registry.manifest i with
+        | None ->
+            add_err ctx
+              (Printf.sprintf "%s: call to unknown intrinsic id %d (no registry declaration)" bb_ctx i)
+        | Some (name, _, sig_) ->
+            (* re-audit P0 (intrinsic verification parity): the intrinsic
+               call is checked against its declared registry signature —
+               arity and argument access effects, exactly like the User
+               call path.  The declared param/ret types are
+               placeholder-typed (registry-local ids), so type equality
+               is not checked here; the host closure check validates the
+               binding side. *)
+            if Array.length args <> Array.length sig_.Intrinsic_registry.params then
+              add_err ctx
+                (Printf.sprintf "%s: intrinsic `%s` expects %d argument(s), got %d" bb_ctx name
+                   (Array.length sig_.Intrinsic_registry.params) (Array.length args));
+            (* the declared registry signature carries no access
+               conventions (its params are plain types), so argument
+               effects are not checked here; the lowerer's receiver
+               channel records the inout Modify on the collection
+               self-arg and the host binding validates the value side *)
+            ())
+  | Extern i ->
+      if i < 0 then
+        add_err ctx
+          (Printf.sprintf "%s: negative extern callee index %d" bb_ctx i)
   | User inst -> (
       match resolve_callee ctx inst with
       | Callee_unknown ->

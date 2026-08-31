@@ -198,7 +198,12 @@ let lower_env () : Mir_lower.func_env =
     values = [];
     callables = [];
     methods = [];
-    fn_ret = Type_repr.Unit;
+    (* the declared return type is unknown at env-build time; the
+       per-source lowering below must not treat the tail as discarded:
+       the lower_function Unit-tail rule keys on env.fn_ret, so the
+       literal-collection sources (whose main returns the literal)
+       keep the tail assign by using the resolved declaration return *)
+    fn_ret = Type_repr.Int Type_repr.Int;
     struct_fields = [];
   }
 

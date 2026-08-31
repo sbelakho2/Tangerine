@@ -36,6 +36,19 @@ let register (t : t) ~name ~(id : Id.t) (sig_ : signature) : t =
 let lookup (t : t) ~name : (Id.t * signature) option =
   List.assoc_opt name t.by_name
 
+(* re-audit P0 (intrinsic MIR verification): the id-based lookup — the
+   manifest's declaration order is the id domain the lowerer mints
+   (Intrinsic_registry.Id.to_int of the lookup result), so the verifier
+   can resolve a raw id back to its declared signature and check arity,
+   argument effects and the destination *)
+let by_id (t : t) (i : int) : (string * Id.t * signature) option =
+  let rec go = function
+    | [] -> None
+    | (n, (id, s)) :: rest ->
+        if Id.to_int id = i then Some (n, id, s) else go rest
+  in
+  go t.by_name
+
 let names (t : t) : string list =
   List.sort compare (List.map fst t.by_name)
 

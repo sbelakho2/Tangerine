@@ -4135,9 +4135,14 @@ let lower_function_with_variants
    | Some (vo, ty) ->
        (* re-audit P0: a Never tail (a return-only loop / diverging
           tail) never falls through — the explicit return paths assign
-          the slot; assigning a Unit constant would corrupt the slot *)
+          the slot; assigning a Unit constant would corrupt the slot.
+          A Unit-returning function whose tail is a VALUE expression
+          (e.g. a trailing `x = x + 1` statement-form assign) discards
+          the tail value — the declared return is Unit and the slot
+          stays the callee's own Unit convention. *)
        (match ty with
         | Type_repr.Never -> ()
+        | _ when env.fn_ret = Type_repr.Unit -> ()
         | _ -> emit st (Seed_mir.Assign (cur_place st 0, Seed_mir.Use vo)))
    | None -> ());
   set_terminator st Seed_mir.Ret;
