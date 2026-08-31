@@ -2897,7 +2897,11 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
   | Ast.BoolLit (_, _, span) ->
       Ok { te_type = Type_repr.Bool; te_effects = [||]; te_span = span; te_flow = normal_flow (Type_repr.Bool) }
   | Ast.Name (nid, n, span) ->
-      (if Sys.getenv_opt "TANGERINE_DEBUG_CALL" <> None && span.Span.file_id = 35 then
+      (if Sys.getenv_opt "TANGERINE_DEBUG_CALL" <> None
+          && (span.Span.file_id = 35
+             || (match !current_item_global with
+                | Some it when it = "def lower_program" || it = "def mir_emit_partial_drop_chain" -> true
+                | _ -> false)) then
          let loc =
            match !debug_source_map with
            | Some sm -> (
@@ -2906,8 +2910,11 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
                | None -> "?")
            | None -> "?"
          in
-         Printf.eprintf "DEBUG-NAME name=%s exp=%s at=%s item=%s\n" n
+         Printf.eprintf "DEBUG-NAME name=%s exp=%s local=%s at=%s item=%s\n" n
            (match expected with Some e -> type_to_string e | None -> "none")
+           (match List.assoc_opt n (List.map (fun (a, b, _) -> (a, b)) scope.locals) with
+            | Some lt -> type_to_string lt
+            | None -> "?")
            loc
            (match !current_item_global with Some s -> s | None -> "?"));
       check_name env scope expected nid n span
@@ -3057,6 +3064,12 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
                       Error (err span (Printf.sprintf "unknown field `%s` of struct `%s`" fname name))
                   | Some ft -> (
                       let ft' = substitute_fixpoint subst ft in
+                      (if Sys.getenv_opt "TANGERINE_DEBUG_CALL" <> None then
+                         match !current_item_global with
+                         | Some it when it = "def lower_program" ->
+                             Printf.eprintf "DEBUG-LITFIELD fname=%s ft=%s\n" fname
+                               (type_to_string ft')
+                         | _ -> ());
                       match check_expr env scope (Some ft') fe with
                       | Ok fte -> (
                           let s2 = ref [] in
@@ -3701,6 +3714,11 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
           in
           match elem_ty with
           | None ->
+              (if Sys.getenv_opt "TANGERINE_DEBUG_CALL" <> None then
+                 Printf.eprintf "DEBUG-FORITER iter_ty=%s item=%s span=%d\n"
+                   (type_to_string te.te_type)
+                   (match !current_item_global with Some s -> s | None -> "?")
+                   f.Ast.for_span.Span.start);
               Error
                 (err f.Ast.for_span
                    (Printf.sprintf "cannot iterate a value of type %s" (type_to_string te.te_type)))
@@ -3939,6 +3957,11 @@ and check_stmt (env : env) (scope : scope) (s : Ast.stmt) :
           match resolve_type env scope tye with
           | Error m -> Error m
           | Ok ty -> (
+              (if Sys.getenv_opt "TANGERINE_DEBUG_CALL" <> None then
+                 match !current_item_global with
+                 | Some it when it = "def lower_program" ->
+                     Printf.eprintf "DEBUG-LETANN ty=%s\n" (type_to_string ty)
+                 | _ -> ());
               match check_expr env scope (Some ty) value with
               | Error m -> Error m
               | Ok te -> (
@@ -6032,6 +6055,14 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
                 in
                 let* () = ret_reconciled in
                 let ret = substitute_fixpoint !subst sig_.ts_return in
+                (if Sys.getenv_opt "TANGERINE_DEBUG_CALL" <> None && mname = "keys" then
+                   Printf.eprintf "DEBUG-MRETKEYS oname=%s ret=%s self=%s\n" oname
+                     (type_to_string ret) (type_to_string owner_ty));
+                (if Sys.getenv_opt "TANGERINE_DEBUG_CALL" <> None && mname = "clone" then
+                   Printf.eprintf "DEBUG-MRETCLONE oname=%s self=%s exp=%s jn=%d\n" oname
+                     (type_to_string owner_ty)
+                     (match expected with Some e -> type_to_string e | None -> "?")
+                     (List.length !var_journal));
                 let sig_ids = List.map snd sig_.ts_params_decl in
                 (* a param the RECEIVER itself carries (an impl method
                    called on the impl's own `self` — the receiver's type
