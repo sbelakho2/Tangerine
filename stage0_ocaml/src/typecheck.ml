@@ -4760,9 +4760,14 @@ and check_name (env : env) (scope : scope) (expected : Type_repr.t option)
                         Error m2)
                 | _ ->
                     if Sys.getenv_opt "TANGERINE_DEBUG_CALL" <> None then
-                      Printf.eprintf "DEBUG-CKNAME name=%s exp=%s local=%s err=%s span=file#%d[%d..%d) item=%s\n"
-                        n (type_to_string exp) (type_to_string t) m1 span.Span.file_id
-                        span.Span.start span.Span.end_
+                      Printf.eprintf "DEBUG-CKNAME name=%s exp=%s local=%s err=%s at=%s item=%s\n"
+                        n (type_to_string exp) (type_to_string t) m1
+                        (match !debug_source_map with
+                        | Some sm -> (
+                            match Span.resolve sm span with
+                            | Some (f, l, _) -> f ^ ":" ^ string_of_int l
+                            | None -> "?")
+                        | None -> "?")
                         (match !current_item_global with Some s -> s | None -> "?");
                     Error m1))
         | None -> Ok ()
