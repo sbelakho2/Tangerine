@@ -241,6 +241,11 @@ type state = {
   mutable box_tid : Ids.Type_id.t option;
   mutable current_item : string;
   mutable current_item_params : Ids.Generic_param_id.t list;
+  (* the argument-position `impl Trait` registry: a fresh infer var per
+     occurrence, each associated with the trait names of its bound
+     (`validator: impl Validator[T, Clean]` — the var's method calls
+     resolve through the trait contract) *)
+  mutable impl_trait_bounds : (int * string list) list;
   oracle : oracle;
   (* diagnostic-debt accounting (audit P1-1): per-module-path debt
      reports, last round wins (mirrors the driver's errs_by_mod), and
@@ -988,6 +993,7 @@ let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
       box_tid = None;
       current_item = "<none>";
       current_item_params = [];
+      impl_trait_bounds = [];
       oracle =
         {
           o_exprs = [];
@@ -1818,13 +1824,28 @@ let rec resolve_type (env : env) (scope : scope) (t : Ast.type_expr) : (Type_rep
       | None -> Error (err span "Self is only available inside an impl"))
   | Ast.DynTrait _ ->
       Error (err (Ast.type_span t) "trait-object types are not available in the bootstrap subset")
-  | Ast.ImplTrait _ ->
+  | Ast.ImplTrait (bound, _) ->
       (* the argument-position impl-trait `fn f(v: impl Trait)` — an
          anonymous generic bound, the kernel's `validator: impl
          Validator[T, Clean]`: a fresh inference variable (the concrete
          type solves at the call site); the method calls on it resolve
-         through the trait contract *)
-      Ok (fresh_infer_var env.state)
+         through the trait contract — the bound's trait names are
+         registered against the var for the method-call receiver path *)
+      let v = fresh_infer_var env.state in
+      let rec trait_names_of (t : Ast.type_expr) : string list =
+        match t with
+        | Ast.Named (n, _, _) -> [ n ]
+        | Ast.TTuple (elems, _) -> List.concat_map trait_names_of elems
+        | Ast.Bounded (base, _, _) -> trait_names_of base
+        | _ -> []
+      in
+      let names = trait_names_of bound in
+      (match v with
+       | Type_repr.Infer_var id ->
+           if names <> [] then
+             env.state.impl_trait_bounds <- (id, names) :: env.state.impl_trait_bounds
+       | _ -> ());
+      Ok v
   | Ast.Bounded (base, _, _) -> resolve_type env scope base
   | Ast.Option (inner, _) -> (
       match resolve_type env scope inner with
@@ -5429,7 +5450,8 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
     | _ -> primitive_name owner_ty
   in
   (* candidate owners: the nominal name (with kernel aliases), or — for a
-     generic receiver — the trait bounds on its type parameter *)
+     generic receiver — the trait bounds on its type parameter; an
+     `impl Trait` receiver resolves through its registered bound traits *)
   let base_owners =
     match owner_name with
     | None -> (
@@ -5437,6 +5459,10 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
         | Type_repr.Type_param pid -> (
             match List.assoc_opt pid env.impls.Trait_solver.param_bounds with
             | Some bounds -> List.map fst bounds
+            | None -> [])
+        | Type_repr.Infer_var vid -> (
+            match List.assoc_opt vid env.state.impl_trait_bounds with
+            | Some names -> names
             | None -> [])
         | _ -> [])
     | Some oname -> (
