@@ -3944,9 +3944,28 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
                 seed_bug
                   "method call `%s`: the receiver's type#%d has no name in the lowering env's type table"
                   mname (Ids.Type_id.to_int tid))
+        | Type_repr.String -> "String"
+        | Type_repr.Int _ -> "Int"
+        | Type_repr.Float _ -> "Float"
+        | Type_repr.Bool -> "Bool"
+        | Type_repr.Char -> "Char"
         | _ ->
             seed_bug "method call `%s`: the receiver is not a nominal (found %s)" mname
               (Seed_mir.print_type rty)
+      in
+      (* the kernel's owner aliases (the checker's try_aliases): a `str`
+         receiver spells String-owner methods and vice versa; the
+         Vec/Array aliasing covers the collections constructors *)
+      let owner =
+        match List.assoc_opt (owner, mname) env.methods with
+        | Some _ -> owner
+        | None -> (
+            match owner with
+            | "str" -> "String"
+            | "String" -> "str"
+            | "Vec" -> "Array"
+            | "Array" -> "Vec"
+            | _ -> owner)
       in
       (match List.assoc_opt (owner, mname) env.methods with
        | None ->

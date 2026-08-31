@@ -3896,6 +3896,7 @@ and check_block (env : env) (scope : scope) (expected : Type_repr.t option) (b :
                   {
                     fr_normal =
                       (if acc.fr_normal = None || te.te_flow.fr_normal = None then None
+                       else if te.te_type = Type_repr.Unit then None
                        else Some te.te_type);
                     fr_may_return = acc.fr_may_return || te.te_flow.fr_may_return;
                     fr_may_break = acc.fr_may_break || te.te_flow.fr_may_break;
