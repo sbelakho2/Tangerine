@@ -359,12 +359,15 @@ let err (span : Span.span) (msg : string) : string =
                     || it = "def resolve_bare_callable" || it = "def compile_file_core"
                     || it = "def compile_multiple_files" || it = "def compile_startup_entry"
                     || it = "def run_mir_completeness_oracle" || it = "def mir_emit_partial_drop_chain"
-                    || it = "def inline_calls_in_function" -> (
+                    || it = "def inline_calls_in_function" || it = "def lower_program"
+                    || it = "def check_stmt" || it = "def check_expr" || it = "def allocate_locals"
+                    || it = "def collect_dep_file" || it = "def lower_expr_to_rvalue"
+                    || it = "def type_check_typed" -> (
          let loc =
            match !debug_source_map with
            | Some sm -> (
                match Span.resolve sm span with
-               | Some (f, l, _) -> f ^ ":" ^ string_of_int l
+               | Some (f, l, c) -> f ^ ":" ^ string_of_int l ^ ":" ^ string_of_int c
                | None -> "?")
            | None -> "?"
          in
