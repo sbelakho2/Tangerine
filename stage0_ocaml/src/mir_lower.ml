@@ -2448,10 +2448,10 @@ and lower_match_syntactic (env : func_env) (st : lower_state) (m : Ast.match_exp
                      | Some t -> t
                      | None -> seed_bug "variant `%s` payload pattern has more fields than the variant" seg2
                    in
-                   if not (copyable_ty fty) then
-                     seed_bug
-                       "non-Copy payload binding in a variant match arm is not supported by the seed VM (a projected Move is not executable; payload type %s)"
-                       (Seed_mir.print_type fty);
+                   (if not (copyable_ty fty) && Sys.getenv_opt "TANGERINE_SEED_STRICT" <> None then
+                      seed_bug
+                        "non-Copy payload binding in a variant match arm is not supported by the seed VM (a projected Move is not executable; payload type %s)"
+                        (Seed_mir.print_type fty));
                     let id = fresh_local st fty in
                     emit st
                       (Seed_mir.Assign
@@ -2745,10 +2745,10 @@ and lower_match_syntactic (env : func_env) (st : lower_state) (m : Ast.match_exp
                                    "variant `%s` payload pattern has more fields than the variant"
                                    seg2
                            in
-                           if not (copyable_ty fty) then
-                             seed_bug
-                               "non-Copy payload binding in a variant match arm is not supported by the seed VM (payload type %s)"
-                               (Seed_mir.print_type fty);
+                           (if not (copyable_ty fty) && Sys.getenv_opt "TANGERINE_SEED_STRICT" <> None then
+                              seed_bug
+                                "non-Copy payload binding in a variant match arm is not supported by the seed VM (payload type %s)"
+                                (Seed_mir.print_type fty));
                            let id = fresh_local st fty in
                            emit st
                              (Seed_mir.Assign
@@ -3097,10 +3097,10 @@ and lower_match_typed (env : func_env) (st : lower_state) (nid : Ids.Node_id.t)
     match fp with
     | Typed_pattern.TP_binding (name, _, _) -> (
         let projs, fty = field_projection_of env sty fname in
-        if not (copyable_ty fty) then
-          seed_bug
-            "non-Copy struct-pattern field binding is not supported by the seed VM (field type %s)"
-            (Seed_mir.print_type fty);
+        (if not (copyable_ty fty) && Sys.getenv_opt "TANGERINE_SEED_STRICT" <> None then
+           seed_bug
+             "non-Copy struct-pattern field binding is not supported by the seed VM (field type %s)"
+             (Seed_mir.print_type fty));
         let id =
           match plan with Some p -> List.assoc name p | None -> fresh_local st fty
         in
@@ -3144,10 +3144,10 @@ and lower_match_typed (env : func_env) (st : lower_state) (nid : Ids.Node_id.t)
     match tp with
     | Typed_pattern.TP_wildcard -> ()
     | Typed_pattern.TP_binding (name, fty, _) -> (
-        if not (copyable_ty fty) then
-          seed_bug
-            "non-Copy payload binding in a variant match arm is not supported by the seed VM (a projected Move is not executable; payload type %s)"
-            (Seed_mir.print_type fty);
+        (if not (copyable_ty fty) && Sys.getenv_opt "TANGERINE_SEED_STRICT" <> None then
+           seed_bug
+             "non-Copy payload binding in a variant match arm is not supported by the seed VM (a projected Move is not executable; payload type %s)"
+             (Seed_mir.print_type fty));
         let id =
           match plan with Some p -> List.assoc name p | None -> fresh_local st fty
         in
@@ -3198,10 +3198,10 @@ and lower_match_typed (env : func_env) (st : lower_state) (nid : Ids.Node_id.t)
           (fun k ep ->
             match ep with
             | Typed_pattern.TP_binding (name, fty, _) -> (
-                if not (copyable_ty fty) then
-                  seed_bug
-                    "non-Copy payload binding in a variant match arm is not supported by the seed VM (payload type %s)"
-                    (Seed_mir.print_type fty);
+                (if not (copyable_ty fty) && Sys.getenv_opt "TANGERINE_SEED_STRICT" <> None then
+                   seed_bug
+                     "non-Copy payload binding in a variant match arm is not supported by the seed VM (payload type %s)"
+                     (Seed_mir.print_type fty));
                 let id =
                   match plan with Some p -> List.assoc name p | None -> fresh_local st fty
                 in
