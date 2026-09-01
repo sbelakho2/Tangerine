@@ -1177,11 +1177,12 @@ type callee_resolution =
   | Callee_arity_mismatch of string
 
 let rec check_operand (ctx : ctx) (fn : function_) (bb_ctx : string) (op : operand)
-    (running : IntSet.t) (moved : StrSet.t IntMap.t) ~(as_call_arg : bool) : Type_repr.t option =
+    (running : IntSet.t) (moved : StrSet.t IntMap.t) ~(as_call_arg : bool)
+    ~(init_place : bool) : Type_repr.t option =
   match op with
   | Copy p ->
       check_ref_operand ctx fn bb_ctx op ~as_call_arg;
-      check_place_readable ctx fn bb_ctx p running;
+      if not init_place then check_place_readable ctx fn bb_ctx p running;
       let k = place_key p in
       if key_moved moved (root_key p.root) k then
         add_err ctx
@@ -1433,7 +1434,7 @@ let check_aggregate (ctx : ctx) (fn : function_) (bb_ctx : string) (kind : aggre
     unit =
   let op_types =
     List.map
-      (fun op -> check_operand ctx fn bb_ctx op running moved ~as_call_arg:false)
+      (fun op -> check_operand ctx fn bb_ctx op running moved ~as_call_arg:false ~init_place:false)
       ops
   in
   let check_elem i expected =
@@ -1583,7 +1584,7 @@ let check_rvalue (ctx : ctx) (fn : function_) (bb_ctx : string) (declared : IntS
     (rv : rvalue) (running : IntSet.t) (moved : StrSet.t IntMap.t) (dest_ty : Type_repr.t) :
     Type_repr.t option =
   match rv with
-  | Use op -> check_operand ctx fn bb_ctx op running moved ~as_call_arg:false
+  | Use op -> check_operand ctx fn bb_ctx op running moved ~as_call_arg:false ~init_place:false
   | Ref p | RefMut p -> (
       check_place_readable ctx fn bb_ctx p running;
       let k = place_key p in
@@ -1597,8 +1598,8 @@ let check_rvalue (ctx : ctx) (fn : function_) (bb_ctx : string) (declared : IntS
       check_aggregate ctx fn bb_ctx kind ops running moved dest_ty;
       Some dest_ty
   | BinaryOp (op, l, r) -> (
-      let lt = check_operand ctx fn bb_ctx l running moved ~as_call_arg:false in
-      let rt = check_operand ctx fn bb_ctx r running moved ~as_call_arg:false in
+      let lt = check_operand ctx fn bb_ctx l running moved ~as_call_arg:false ~init_place:false in
+      let rt = check_operand ctx fn bb_ctx r running moved ~as_call_arg:false ~init_place:false in
       match lt, rt with
       | Some lt, Some rt ->
           let same = types_compatible ctx lt rt in
@@ -1645,7 +1646,7 @@ let check_rvalue (ctx : ctx) (fn : function_) (bb_ctx : string) (declared : IntS
                end)
       | _ -> None)
   | UnaryOp (op, v) -> (
-      match check_operand ctx fn bb_ctx v running moved ~as_call_arg:false with
+      match check_operand ctx fn bb_ctx v running moved ~as_call_arg:false ~init_place:false with
       | Some vt -> (
           match op with
           | Neg ->
@@ -1701,7 +1702,7 @@ let check_rvalue (ctx : ctx) (fn : function_) (bb_ctx : string) (declared : IntS
               None)
       | None -> None)
   | Cast (op, ty) -> (
-      ignore (check_operand ctx fn bb_ctx op running moved ~as_call_arg:false);
+      ignore (check_operand ctx fn bb_ctx op running moved ~as_call_arg:false ~init_place:false);
       match ctx.mode with
       | Concrete_mode ->
           if Type_repr.has_type_param ty then
@@ -1867,7 +1868,7 @@ let check_call (ctx : ctx) (fn : function_) (bb_ctx : string) (dest : place)
                       mono applies *)
                    let pty = subst p.Type_repr.pt_type in
                    match
-                     check_operand ctx fn bb_ctx arg.value running moved ~as_call_arg:true
+                     check_operand ctx fn bb_ctx arg.value running moved ~as_call_arg:true ~init_place:(arg.effect_ = Access_effect.Initialize)
                    with
                    | Some aty ->
                        if not (types_compatible ctx pty aty) then
@@ -1892,7 +1893,7 @@ let check_call (ctx : ctx) (fn : function_) (bb_ctx : string) (dest : place)
 
 let check_switch (ctx : ctx) (fn : function_) (bb_ctx : string) (op : operand)
     (targets : (int64 * int) list) (running : IntSet.t) (moved : StrSet.t IntMap.t) : unit =
-  match check_operand ctx fn bb_ctx op running moved ~as_call_arg:false with
+  match check_operand ctx fn bb_ctx op running moved ~as_call_arg:false ~init_place:false with
   | None -> ()
   | Some oty -> (
       let rty = resolve_or_self ctx oty in
@@ -1979,7 +1980,7 @@ let check_terminator (ctx : ctx) (fn : function_) (bb_ctx : string) (t : termina
         add_err ctx (Printf.sprintf "%s: duplicate drop of local _%d (key %S)" bb_ctx (root_key p.root) k)
   | Assert (op, _, _, target) -> (
       check_target target;
-      match check_operand ctx fn bb_ctx op running moved ~as_call_arg:false with
+      match check_operand ctx fn bb_ctx op running moved ~as_call_arg:false ~init_place:false with
       | Some oty ->
           if not (types_compatible ctx Type_repr.Bool oty) then
             add_err ctx
@@ -2234,11 +2235,27 @@ let verify_function (ctx : ctx) (fn : function_) : unit =
            | _ -> ());
         check_terminator ctx fn bb_ctx b.terminator !running !moved !destroyed;
         (match b.terminator with
-         | Call (dest, _, _, _, _) ->
+         | Call (dest, _, args, _, _) ->
              running := IntSet.add (root_key dest.root) !running;
              let dkey = place_key dest in
              moved := key_clear !moved (root_key dest.root) dkey;
-             destroyed := key_clear !destroyed (root_key dest.root) dkey
+             destroyed := key_clear !destroyed (root_key dest.root) dkey;
+             (* re-audit P0 (Set semantics): a successful call proves
+                every Set (Initialize) argument's place initialized —
+                the callee must have initialized it before returning
+                (the VM traps otherwise).  Mark those roots initialized
+                on the successful edge. *)
+             Array.iter
+               (fun a ->
+                 if a.Seed_mir.effect_ = Access_effect.Initialize then
+                   match a.Seed_mir.value with
+                   | Seed_mir.Copy p | Seed_mir.Read p | Seed_mir.Move p
+                   | Seed_mir.Consume p ->
+                       running := IntSet.add (root_key p.root) !running;
+                       moved := key_clear !moved (root_key p.root) (place_key p);
+                       destroyed := key_clear !destroyed (root_key p.root) (place_key p)
+                   | Seed_mir.Constant _ -> ())
+               args
          | Drop (p, _, _) | Deinit (p, _, _) ->
              destroyed := key_insert !destroyed (root_key p.root) (place_key p)
          | _ -> ()))
