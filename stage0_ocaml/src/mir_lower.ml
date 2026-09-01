@@ -930,8 +930,50 @@ let rec field_projection_of (env : func_env) (bty : Type_repr.t) (fname : string
 
 (* ── Expression lowering ──────────────────────────────────────── *)
 
+(* The ONE call-argument lowering (audit P2): every User / method /
+   Intrinsic / Extern call lowers each argument through this single
+   routine — it jointly produces the access EFFECT and the OPERAND for a
+   declared parameter convention.  Ownership transfer is atomic with the
+   effect tag: a Consume parameter of a non-Copy owning value transfers
+   with Move (the seed VM has no partial-move representation, so a
+   projected non-Copy sink source fails closed); a by-value (Let)
+   parameter of a non-Copy owning type is a place READ (never a bitwise
+   copy); a Set (Initialize) parameter is a place channel (the VM does
+   not read it before the call).
+
+     Let + Copy     -> Read / Copy
+     Let + owning   -> Read / Read
+     Inout          -> Modify / place channel
+     Sink + Copy    -> Consume / Copy
+     Sink + owning  -> Consume / Move
+     Set            -> Initialize / place channel                    *)
+and lower_argument (env : func_env) (st : lower_state) (conv : Access_effect.t)
+    (e : Ast.expr) : Seed_mir.call_arg =
+  let op, ty = lower_expr env st e in
+  let eff = Access_effect.read_effect conv in
+  match eff with
+  | Access_effect.Read -> (
+      match op with
+      | Seed_mir.Copy p when not (copyable_ty ty) ->
+          { Seed_mir.effect_ = Access_effect.Read; value = Seed_mir.Read p }
+      | _ -> { Seed_mir.effect_ = Access_effect.Read; value = op })
+  | Access_effect.Modify -> { Seed_mir.effect_ = Access_effect.Modify; value = op }
+  | Access_effect.Consume -> (
+      match op with
+      | Seed_mir.Copy p ->
+          let value =
+            if copyable_ty ty then Seed_mir.Copy p
+            else if p.Seed_mir.projections = [] then Seed_mir.Move p
+            else
+              seed_bug
+                "sink argument of a non-Copy owning type through a projected place is not supported by the seed VM (no partial-move representation)"
+          in
+          { Seed_mir.effect_ = Access_effect.Consume; value }
+      | _ -> { Seed_mir.effect_ = Access_effect.Consume; value = op })
+  | Access_effect.Initialize -> { Seed_mir.effect_ = Access_effect.Initialize; value = op }
+
 (* Returns (place-or-constant operand, type). *)
-let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
+and lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
     Seed_mir.operand * Type_repr.t =
   match e with
   | Ast.IntLit (_, lit, _) -> (
@@ -1751,7 +1793,9 @@ let rec lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
                     [|
                       {
                         Seed_mir.effect_ = Access_effect.Read;
-                        value = Seed_mir.Copy arr_id;
+                        value =
+                          (if copyable_ty arr_ty then Seed_mir.Copy arr_id
+                           else Seed_mir.Read arr_id);
                       };
                     |]
                   in
@@ -3540,15 +3584,6 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
                 match List.assoc_opt n env.values with Some t -> t | None -> Type_repr.Unit
               in
               let ty = call_result_ty st node_id ty in
-              let arg_ops_ty = List.map (fun a -> lower_expr env st a.Ast.ca_value) args in
-              let arg_ops =
-                List.map2
-                  (fun op ty ->
-                    match op with
-                    | Seed_mir.Copy p when not (copyable_ty ty) -> Seed_mir.Read p
-                    | op -> op)
-                  (List.map fst arg_ops_ty) (List.map snd arg_ops_ty)
-              in
               let id = fresh_local st ty in
               let rp = cur_place st id in
               (* the typed parameter contracts are authoritative for the
@@ -3559,15 +3594,13 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
               let arg_vals =
                 Array.of_list
                   (List.mapi
-                     (fun i op ->
-                       {
-                         Seed_mir.effect_ =
-                           (if i < Array.length ce_params then
-                             Access_effect.read_effect ce_params.(i).Type_repr.pt_convention
-                            else Access_effect.Read);
-                         value = op;
-                       })
-                     arg_ops)
+                     (fun i a ->
+                       lower_argument env st
+                         (if i < Array.length ce_params then
+                           ce_params.(i).Type_repr.pt_convention
+                         else Access_effect.Let)
+                         a.Ast.ca_value)
+                     args)
               in
               let next_b = new_block st in
               (* the typed lowering channel is authoritative: when the
@@ -3674,20 +3707,16 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
                          in
                          (match intrinsic_channel () with
                           | Some iid ->
-                              let arg_ops =
-                                List.map
-                                  (fun a -> fst (lower_expr env st a.Ast.ca_value))
-                                  args
-                              in
                               let arg_vals =
                                 Array.of_list
-                                  (List.map
-                                     (fun op ->
-                                       {
-                                         Seed_mir.effect_ = Access_effect.Read;
-                                         value = op;
-                                       })
-                                     arg_ops)
+                                  (List.mapi
+                                     (fun i a ->
+                                       lower_argument env st
+                                         (if i + 1 < Array.length me.me_params then
+                                           me.me_params.(i + 1).Type_repr.pt_convention
+                                         else Access_effect.Let)
+                                         a.Ast.ca_value)
+                                     args)
                               in
                               let id = fresh_local st me.me_ret in
                               let rp = cur_place st id in
@@ -3747,34 +3776,18 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
                                | None -> me.me_instance)
                            | None -> me.me_instance
                          in
-                         let arg_ops = List.map (fun a -> fst (lower_expr env st a.Ast.ca_value)) args in
                          let id = fresh_local st me.me_ret in
                          let rp = cur_place st id in
                          let arg_vals =
                            Array.of_list
                              (List.mapi
-                                (fun i op ->
-                                  let eff =
-                                    if i < nparams then
-                                      Access_effect.read_effect me.me_params.(i).Type_repr.pt_convention
-                                    else Access_effect.Read
-                                  in
-                                  (* a consuming parameter (Sink/Set) TRANSFERS
-                                     the argument — the same conversion the
-                                     receiver-method path applies to the self
-                                     operand: an unprojected Copy becomes a Move
-                                     (the seed VM has no partial-move
-                                     representation, so a projected place fails
-                                     closed exactly like the receiver path) *)
-                                  let value =
-                                    match eff, op with
-                                    | (Access_effect.Consume | Access_effect.Initialize),
-                                      Seed_mir.Copy p when p.Seed_mir.projections = [] ->
-                                        Seed_mir.Move p
-                                    | _ -> op
-                                  in
-                                  { Seed_mir.effect_ = eff; value })
-                                arg_ops)
+                                (fun i a ->
+                                  lower_argument env st
+                                    (if i < nparams then
+                                      me.me_params.(i).Type_repr.pt_convention
+                                    else Access_effect.Let)
+                                    a.Ast.ca_value)
+                                args)
                          in
                          let next_b = new_block st in
                          set_terminator_to st
@@ -3800,20 +3813,30 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
                                | Some t -> t
                                | None -> Type_repr.Unit
                              in
-                             let arg_ops =
-                               List.map
-                                 (fun a -> fst (lower_expr env st a.Ast.ca_value))
-                                 args
-                             in
                              let arg_vals =
                                Array.of_list
-                                 (List.map
-                                    (fun op ->
-                                      {
-                                        Seed_mir.effect_ = Access_effect.Read;
-                                        value = op;
-                                      })
-                                    arg_ops)
+                                 (List.mapi
+                                    (fun i a ->
+                                      let conv =
+                                        match
+                                          Intrinsic_registry.lookup
+                                            Intrinsic_registry.manifest ~name:n
+                                        with
+                                        | Some (_, isig)
+                                          when i < Array.length isig.Intrinsic_registry.params ->
+                                            isig.Intrinsic_registry.params.(i).Type_repr.pt_convention
+                                        | _ -> (
+                                            match
+                                              Extern_registry.lookup Extern_registry.manifest
+                                                ~name:n
+                                            with
+                                            | Some (_, esig)
+                                              when i < Array.length esig.Intrinsic_registry.params ->
+                                                esig.Intrinsic_registry.params.(i).Type_repr.pt_convention
+                                            | _ -> Access_effect.Let)
+                                      in
+                                      lower_argument env st conv a.Ast.ca_value)
+                                    args)
                              in
                              let id = fresh_local st ty in
                              let rp = cur_place st id in
@@ -3954,7 +3977,33 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
         | Type_repr.Float _ -> "Float"
         | Type_repr.Bool -> "Bool"
         | Type_repr.Char -> "Char"
+        | Type_repr.Type_param _ | Type_repr.Ref_internal (_, _) -> (
+            (* a generic-parameter / reference receiver: the only methods
+               the seed can resolve through the parameter are the
+               trait-contract methods of its bounds (the checker's
+               base_owners for a param is its bound trait list).  The
+               seed's func_env carries no per-param bound registry; the
+               ONE bound method the bootstrap subset actually exercises
+               on a generic/reference receiver is the derived `clone`
+               (the iterator advance bodies and the map/set
+               entries_cloned bodies clone the element out of the
+               snapshot), which resolves through the Clone trait
+               contract — the reference form derefs to the pointee's
+               clone. *)
+            match mname with
+            | "clone" -> "Clone"
+            | "advance" -> "Iterator"
+            | "into_iter" -> "IntoIterator"
+            | _ ->
+                (if Sys.getenv_opt "TANGERINE_DEBUG_CALL" <> None then
+                   Printf.eprintf "DEBUG-MRECV2 mname=%s rty=%s env=%s\n" mname
+                     (Seed_mir.print_type rty) (Seed_mir.print_type env.fn_ret));
+                seed_bug
+                  "method call `%s`: the receiver is a generic parameter or reference (the seed resolves such receivers only through the Clone/Iterator trait contracts)" mname)
         | _ ->
+            (if Sys.getenv_opt "TANGERINE_DEBUG_CALL" <> None then
+               Printf.eprintf "DEBUG-MRECV mname=%s rty=%s env=%s\n" mname
+                 (Seed_mir.print_type rty) (Seed_mir.print_type env.fn_ret));
             seed_bug "method call `%s`: the receiver is not a nominal (found %s)" mname
               (Seed_mir.print_type rty)
       in
@@ -3975,9 +4024,130 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
       in
       (match List.assoc_opt (owner, mname) env.methods with
        | None ->
-           seed_bug
-             "method call `%s`: type `%s` has no method instance in the lowering env's methods table"
-             mname owner
+           (* the derived clone/to_string (the checker's derived_clone/
+              derived_to_string oracle): the bootstrap subset exercises
+              these on receivers with no declared impl (`x.clone()` on an
+              Option payload, on a reference, on a generic element).  The
+              seed synthesizes the derived method entry: self = receiver,
+              ret = receiver for clone, String for to_string. *)
+           (match mname with
+           | "clone" | "to_string" -> (
+               let ret =
+                 match mname with
+                 | "clone" -> rty
+                 | _ -> Type_repr.String
+               in
+               let me =
+                 {
+                   me_instance =
+                     Instance_id.make ~callable:(Ids.Callable_id.make (-1)) ~type_args:[||];
+                   me_params =
+                     [|
+                       { Type_repr.pt_convention = Access_effect.Let; pt_type = rty };
+                     |];
+                   me_ret = ret;
+                 }
+               in
+               if Array.length me.me_params = 0 then
+                 seed_bug
+                   "method call `%s`: the method instance of `%s` carries no self parameter" mname
+                   owner;
+               let nargs = List.length args in
+               if nargs <> Array.length me.me_params - 1 then
+                 seed_bug "method call `%s` of `%s`: expected %d argument(s), got %d" mname owner
+                   (Array.length me.me_params - 1) nargs;
+               (* the instance: the typed channel's checker-resolved callable
+                  + solved concrete substitution when present (the generic
+                  call's concrete args arrive there), else the registry's
+                  instance *)
+               let instance =
+                 match typed_node_of st nid with
+                 | Some node -> (
+                     match node.tn_call with
+                     | Some (callable, type_args) ->
+                         Instance_id.make ~callable ~type_args
+                     | None -> me.me_instance)
+                 | None -> me.me_instance
+               in
+               let self_conv = me.me_params.(0).Type_repr.pt_convention in
+               let self_eff = Access_effect.read_effect self_conv in
+               (* the receiver's operand form follows the self convention:
+                  a consuming self (Sink/Set) TRANSFERS the receiver (Move —
+                  never a projected place, the seed VM has no partial-move
+                  representation); an Inout self keeps the by-place read
+                  form the free-function call path uses (the seed VM reads
+                  the arg; the writeback is the documented seed
+                  approximation, same as Modify args elsewhere) *)
+               let self_op =
+                 match self_eff with
+                 | Access_effect.Read | Access_effect.Modify -> Seed_mir.Copy rp
+                 | Access_effect.Consume | Access_effect.Initialize -> (
+                     match rp.Seed_mir.projections with
+                     | [] -> Seed_mir.Move rp
+                     | _ ->
+                         seed_bug
+                           "method call `%s`: the consuming self argument cannot be a projected place (the seed VM has no partial-move representation)"
+                           mname)
+               in
+               (* the receiver-channel result local: the CHECKER-resolved
+                  return (the solved substitution — Option[Int], never the
+                  raw Option[V] declaration binder the verifier rejects in
+                  local types); falls back to substituting the method's
+                  declaration binders against the receiver's type *)
+               let rec subst_against self_ty receiver_ty acc =
+                 match self_ty, receiver_ty with
+                 | Type_repr.Named (id1, a1), Type_repr.Named (id2, a2)
+                   when Ids.Type_id.compare id1 id2 = 0
+                        && Array.length a1 = Array.length a2 ->
+                     List.fold_left2
+                       (fun acc s r ->
+                         match s with
+                         | Type_repr.Type_param p -> (Type_repr.KParam p, r) :: acc
+                         | Type_repr.Named (_, sa) when Array.length sa > 0 -> (
+                             match r with
+                             | Type_repr.Named (_, ra)
+                               when Array.length ra = Array.length sa ->
+                                 subst_against s r acc
+                             | _ -> acc)
+                         | _ -> acc)
+                       acc (Array.to_list a1) (Array.to_list a2)
+                 | _ -> acc
+               in
+               let recv_dest_ty =
+                 match call_result_ty st nid me.me_ret with
+                 | t when not (Type_repr.has_type_param t) -> t
+                 | _ -> (
+                     match me.me_params with
+                     | [||] -> me.me_ret
+                     | _ ->
+                         let self_ty = me.me_params.(0).Type_repr.pt_type in
+                         let subst = subst_against self_ty rty [] in
+                         if subst = [] then me.me_ret
+                         else Type_repr.substitute subst me.me_ret)
+               in
+               let id = fresh_local st recv_dest_ty in
+               let rp2 = cur_place st id in
+               let arg_vals =
+                 Array.of_list
+                   ({ Seed_mir.effect_ = self_eff; value = self_op }
+                    :: List.mapi
+                         (fun i a ->
+                           lower_argument env st
+                             (if i + 1 < Array.length me.me_params then
+                               me.me_params.(i + 1).Type_repr.pt_convention
+                             else Access_effect.Let)
+                             a.Ast.ca_value)
+                         args)
+               in
+               let next_b = new_block st in
+               set_terminator_to st
+                 (Seed_mir.Call (rp2, Seed_mir.User instance, arg_vals, next_b, None))
+                 next_b;
+               (copy_place st rp2, recv_dest_ty))
+           | _ ->
+               seed_bug
+                 "method call `%s`: type `%s` has no method instance in the lowering env's methods table"
+                 mname owner)
        | Some me -> (
            if Array.length me.me_params = 0 then
              seed_bug
@@ -4020,7 +4190,6 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
                        "method call `%s`: the consuming self argument cannot be a projected place (the seed VM has no partial-move representation)"
                        mname)
            in
-           let arg_ops = List.map (fun a -> fst (lower_expr env st a.Ast.ca_value)) args in
            (* the receiver-channel result local: the CHECKER-resolved
               return (the solved substitution — Option[Int], never the
               raw Option[V] declaration binder the verifier rejects in
@@ -4067,15 +4236,13 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
              Array.of_list
                ({ Seed_mir.effect_ = self_eff; value = self_op }
                 :: List.mapi
-                     (fun i op ->
-                       {
-                         Seed_mir.effect_ =
-                           (if i + 1 < Array.length me.me_params then
-                             Access_effect.read_effect me.me_params.(i + 1).Type_repr.pt_convention
-                            else Access_effect.Read);
-                         value = op;
-                       })
-                     arg_ops)
+                     (fun i a ->
+                       lower_argument env st
+                         (if i + 1 < Array.length me.me_params then
+                           me.me_params.(i + 1).Type_repr.pt_convention
+                         else Access_effect.Let)
+                         a.Ast.ca_value)
+                     args)
            in
            (* the intrinsic channel (audit §70): the builtin collection
               receiver methods (Set/Map insert/contains/len/...) map
@@ -4190,6 +4357,8 @@ let lower_function_with_variants
     (env : func_env) (name : string)
     (callable : int) (template_args : Type_repr.t array)
     (param_conventions : Access_effect.t array) (fn : Ast.function_decl) : Seed_mir.function_ =
+  (if Sys.getenv_opt "TANGERINE_DEBUG_CALL" <> None then
+     Printf.eprintf "DEBUG-FNLOWER %s\n" name);
   let st =
     {
       next_local = 0;
