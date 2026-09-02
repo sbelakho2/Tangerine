@@ -53,7 +53,7 @@ type typed_signature = {
   ts_params : Type_repr.param_type array;
   ts_param_names : string array;
   ts_return : Type_repr.t;
-  ts_where : (Type_repr.t * string list) list;
+  ts_where : (Type_repr.t * (string * Type_repr.t array) list) list;
   ts_callable : Ids.Callable_id.t;
   ts_span : Span.span;
 }
@@ -119,7 +119,8 @@ type nominal = {
   nom_fields : (string * Type_repr.t) list;          (* struct, in param scope *)
   nom_variants : (string * Type_repr.t array) list;  (* enum, in param scope *)
   nom_variant_field_names : (string * string list) list;  (* braced-field names per variant, parallel to nom_variants *)
-  nom_where : (Type_repr.t * string list) list;      (* resolved where predicates *)
+  nom_where : (Type_repr.t * (string * Type_repr.t array) list) list;
+      (* resolved where predicates *)
   nom_field_ids : Ids.Field_id.t list;               (* resolver identities, parallel to nom_fields *)
   nom_variant_ids : Ids.Variant_id.t list;           (* resolver identities, parallel to nom_variants *)
 }
@@ -420,6 +421,12 @@ let is_box (bt : Ids.Type_id.t option) (id : Ids.Type_id.t) : bool =
    conflict with a later binding. *)
 let var_journal : (Type_repr.generic_key * Type_repr.t) list ref = ref []
 
+(* The final journal — the driver's typed-channel readers substitute the
+   pattern trees through it (re-audit P12: the bind types are resolved
+   LAZILY at read time because the vars bind during later statements of
+   the same item). *)
+let final_journal () : (Type_repr.generic_key * Type_repr.t) list = !var_journal
+
 let fresh_callable_id (st : state) : Ids.Callable_id.t =
   let id = st.next_callable_id in
   st.next_callable_id <- id + 1;
@@ -496,7 +503,7 @@ let primitive_name (t : Type_repr.t) : string option =
 (* ─── signature construction helper ─── *)
 let mk_sig (st : state) ~(name : string) ~(params_decl : (string * Ids.Generic_param_id.t) list)
     ~(params : (string * Access_effect.t * Type_repr.t) list) ~(ret : Type_repr.t)
-    ~(where : (Type_repr.t * string list) list) : typed_signature =
+    ~(where : (Type_repr.t * (string * Type_repr.t array) list) list) : typed_signature =
   {
     ts_name = name;
     ts_params_decl = params_decl;
@@ -715,7 +722,7 @@ let builtin_methods (st : state) (vec_p : Ids.Generic_param_id.t) (opt_p : Ids.G
   let simple ~(owner : string) ~(owner_ty : Type_repr.t) ~(name : string)
       ~(params : (string * Access_effect.t * Type_repr.t) list) ~(ret : Type_repr.t)
       ~(decl : (string * Ids.Generic_param_id.t) list)
-      ~(where : (Type_repr.t * string list) list)
+      ~(where : (Type_repr.t * (string * Type_repr.t array) list) list)
       ~(recv_conv : Access_effect.t) : (string * string) * typed_signature =
     ((owner, name),
      mk_sig st ~name:("builtin::" ^ owner ^ "::" ^ name) ~params_decl:decl
@@ -821,7 +828,8 @@ let builtin_methods (st : state) (vec_p : Ids.Generic_param_id.t) (opt_p : Ids.G
       ("first", [], opt vec_t, [], let_);
       ("last", [], opt vec_t, [], let_);
       ("reserve", [ par "extra" let_ i_ty ], unit, [], inout);
-      ("contains", [ par "value" let_ vec_t ], b_ty, [ (vec_t, [ "Eq" ]) ], let_);
+      ("contains", [ par "value" let_ vec_t ], b_ty,
+       [ (vec_t, [ ("Eq", [||]) ]) ], let_);
     ]
   in
   let m_vec =
@@ -866,7 +874,7 @@ let builtin_methods (st : state) (vec_p : Ids.Generic_param_id.t) (opt_p : Ids.G
   let map_k = Type_repr.Type_param map_k_p in
   let map_v = Type_repr.Type_param map_v_p in
   let map_self = Type_repr.Named (b_map, [| map_k; map_v |]) in
-  let hash_eq = [ (map_k, [ "Hash"; "Eq" ]) ] in
+  let hash_eq = [ (map_k, [ ("Hash", [||]); ("Eq", [||]) ]) ] in
   let m_map =
     [
       ("len", [], i_ty, [], let_);
@@ -877,8 +885,8 @@ let builtin_methods (st : state) (vec_p : Ids.Generic_param_id.t) (opt_p : Ids.G
       (* re-audit P0-B: the exact Tangerine contract — Map::insert
          returns Option[old V] (the displaced old value); the mutation
          travels through the intrinsic writeback channel *)
-      ("insert", [ par "key" let_ map_k; par "value" sink map_v ], opt map_v, hash_eq, inout);
-      ("remove", [ par "key" let_ map_k ], opt map_v, hash_eq, let_);
+      ("insert", [ par "key" sink map_k; par "value" sink map_v ], opt map_v, hash_eq, inout);
+      ("remove", [ par "key" let_ map_k ], opt map_v, hash_eq, inout);
       ("keys", [], vec map_k, [], let_);
       ("values", [], vec map_v, [], let_);
       ("clear", [], unit, [], inout);
@@ -892,9 +900,12 @@ let builtin_methods (st : state) (vec_p : Ids.Generic_param_id.t) (opt_p : Ids.G
     [
       ("len", [], i_ty, [], let_);
       ("is_empty", [], b_ty, [], let_);
-      ("insert", [ par "value" sink set_t ], b_ty, [ (set_t, [ "Hash"; "Eq" ]) ], inout);
-      ("contains", [ par "value" let_ set_t ], b_ty, [ (set_t, [ "Hash"; "Eq" ]) ], let_);
-      ("remove", [ par "value" let_ set_t ], b_ty, [ (set_t, [ "Hash"; "Eq" ]) ], let_);
+      ("insert", [ par "value" sink set_t ], b_ty,
+       [ (set_t, [ ("Hash", [||]); ("Eq", [||]) ]) ], inout);
+      ("contains", [ par "value" let_ set_t ], b_ty,
+       [ (set_t, [ ("Hash", [||]); ("Eq", [||]) ]) ], let_);
+      ("remove", [ par "value" let_ set_t ], b_ty,
+       [ (set_t, [ ("Hash", [||]); ("Eq", [||]) ]) ], inout);
     ]
     |> List.map (fun (n, p, r, w, rc) -> simple ~owner:"Set" ~owner_ty:set_self ~name:n ~params:p ~ret:r ~decl:[ ("T", set_p) ] ~where:w ~recv_conv:rc)
   in
@@ -952,9 +963,54 @@ let builtin_methods (st : state) (vec_p : Ids.Generic_param_id.t) (opt_p : Ids.G
             mk_sig st ~name:("builtin::" ^ owner ^ "::" ^ name) ~params_decl:[]
               ~params ~ret ~where:[]))
   in
-  m_string @ m_str @ m_int @ m_uint @ m_small_int @ m_float @ m_bool @ m_char
-  @ m_vec @ m_array @ m_opt @ m_res @ m_map @ m_set @ m_display @ m_hash @ m_eq
-  @ m_traits
+  let all_methods =
+    m_string @ m_str @ m_int @ m_uint @ m_small_int @ m_float @ m_bool @ m_char
+    @ m_vec @ m_array @ m_opt @ m_res @ m_map @ m_set @ m_display @ m_hash @ m_eq
+    @ m_traits
+  in
+  (* P4 (std as the semantic authority): the builtin collection method
+     signatures must agree with the intrinsic registry's declared
+     conventions for the same operations — a startup assertion, so a
+     builtin/std/registry drift fails immediately instead of silently
+     diverging the canaries from the full-manifest behavior. *)
+  (let conv_of (owner : string) (mname : string) (k : int) : Access_effect.t option =
+     match
+       Intrinsic_registry.lookup Intrinsic_registry.manifest
+         ~name:("__intrinsic_" ^ String.lowercase_ascii owner ^ "_" ^ mname)
+     with
+     | Some (_, isig) when k < Array.length isig.Intrinsic_registry.params ->
+         Some isig.Intrinsic_registry.params.(k).Type_repr.pt_convention
+     | _ -> None
+   in
+   List.iter
+     (fun ((owner, mname), sig_) ->
+       ignore owner; ignore mname; ignore sig_;
+       match String.index_opt sig_.ts_name ':' with
+       | Some i when i + 2 < String.length sig_.ts_name ->
+           let owner = String.sub sig_.ts_name 0 i in
+           let mname =
+             String.sub sig_.ts_name (i + 2) (String.length sig_.ts_name - i - 2)
+           in
+           (* the receiver slot (index 0) + the explicit params; the
+              registry's param 0 is the receiver (Inout for the
+              mutating collections) *)
+           Array.iteri
+             (fun k p ->
+               match conv_of owner mname k with
+               | Some declared ->
+                   let builtin = Access_effect.read_effect p.Type_repr.pt_convention in
+                   let declared = Access_effect.read_effect declared in
+                   if builtin <> declared then
+                     failwith
+                       (Printf.sprintf
+                          "P4 builtin/registry drift: builtin %s::%s parameter %d convention %s disagrees with the intrinsic registry's %s"
+                          owner mname (k + 1) (Seed_mir.print_effect builtin)
+                          (Seed_mir.print_effect declared))
+               | None -> ())
+             sig_.ts_params
+       | _ -> ())
+     all_methods);
+  all_methods
 
 (* ─── builtin variant constructors ───
    LangItem unification (audit Fix 4): the constructors share the
@@ -1043,6 +1099,16 @@ let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
       structured_diags = [];
     }
   in
+  (* callable-domain separation (identity-handoff fix): the resolver's
+     CallableIds occupy 0 .. count-1 and register_methods ADOPTS them
+     for methods; the checker's own fresh mints must start above that
+     domain, or a later mint numerically collides with an adopted id and
+     two unrelated functions (an adopted method and a freshly minted
+     free/nested function) land on ONE instance identity — the seed-MIR
+     duplicate-function-instance audit failure. *)
+  (match resolved with
+   | Some rp -> st.next_callable_id <- max st.next_callable_id (Resolver.callable_count rp)
+   | None -> ());
   let types = builtin_types st in
   let types = ("isize", Type_repr.Int Type_repr.Int) :: types in
   (* the canonical sync intrinsics and type-query builtins: ONE
@@ -1739,6 +1805,34 @@ let substitute_fixpoint (subst : (Type_repr.generic_key * Type_repr.t) list) (ty
   in
   go 0 ty
 
+(* re-audit P12: substitute the checker's journal through a semantic
+   pattern tree (the match/let/for pattern channels) — the bind types
+   must never carry an unsolved infer var into lowering. *)
+let subst_pattern_tp (tp : Typed_pattern.t) : Typed_pattern.t =
+  let rec go (p : Typed_pattern.t) : Typed_pattern.t =
+    match p with
+    | Typed_pattern.TP_wildcard -> p
+    | Typed_pattern.TP_literal (c, ty) ->
+        Typed_pattern.TP_literal (c, substitute_fixpoint !var_journal ty)
+    | Typed_pattern.TP_binding (n, ty, m) ->
+        Typed_pattern.TP_binding (n, substitute_fixpoint !var_journal ty, m)
+    | Typed_pattern.TP_variant (vid, ty, pats) ->
+        Typed_pattern.TP_variant
+          (vid, substitute_fixpoint !var_journal ty, List.map go pats)
+    | Typed_pattern.TP_struct (tid, ty, fields) ->
+        Typed_pattern.TP_struct
+          (tid, substitute_fixpoint !var_journal ty,
+           List.map (fun (fn, fp) -> (fn, go fp)) fields)
+    | Typed_pattern.TP_tuple (ty, pats) ->
+        Typed_pattern.TP_tuple
+          (substitute_fixpoint !var_journal ty, List.map go pats)
+    | Typed_pattern.TP_or (pats, names) ->
+        Typed_pattern.TP_or (List.map go pats, names)
+    | Typed_pattern.TP_range (ty, a, b, c) ->
+        Typed_pattern.TP_range (substitute_fixpoint !var_journal ty, a, b, c)
+  in
+  go tp
+
 let params_in (ty : Type_repr.t) : Ids.Generic_param_id.t list =
   let acc = ref [] in
   let rec walk ty =
@@ -2023,11 +2117,28 @@ let resolve_signature (env : env) (scope : scope) (sig_ : Ast.function_sig)
     | None -> Ok Type_repr.Unit
   in
   let* where =
+    let rec go_bs acc = function
+      | [] -> Ok (List.rev acc)
+      | (bname, bargs) :: rest -> (
+          let rec go_args acc = function
+            | [] -> Ok (List.rev acc)
+            | a :: rest2 -> (
+                match resolve_type env scope a with
+                | Ok rt -> go_args (rt :: acc) rest2
+                | Error m -> Error m)
+          in
+          match go_args [] bargs with
+          | Error m -> Error m
+          | Ok rt -> go_bs ((bname, Array.of_list rt) :: acc) rest)
+    in
     let rec go acc = function
       | [] -> Ok (List.rev acc)
       | (wp : Ast.where_predicate) :: rest -> (
           match resolve_type env scope wp.Ast.wp_type with
-          | Ok wt -> go ((wt, wp.Ast.wp_bounds) :: acc) rest
+          | Ok wt -> (
+              match go_bs [] wp.Ast.wp_bounds with
+              | Error m -> Error m
+              | Ok bs -> go ((wt, bs) :: acc) rest)
           | Error m -> Error m)
     in
     go [] sig_.Ast.sig_where
@@ -2049,14 +2160,30 @@ let resolve_signature (env : env) (scope : scope) (sig_ : Ast.function_sig)
    Generic-context entry: register the parameter bounds into the
    solver's live registry. *)
 
-let solver_param_bounds (decl : (string * Ids.Generic_param_id.t) list)
-    (tp_bounds : (string * string list) list) (where : (Type_repr.t * string list) list) :
+let solver_param_bounds (env : env) (scope : scope)
+    (decl : (string * Ids.Generic_param_id.t) list)
+    (tp_bounds : (string * (string * Ast.type_expr list) list) list)
+    (where : (Type_repr.t * (string * Type_repr.t array) list) list) :
     (Ids.Generic_param_id.t * (string * Type_repr.t array) list) list =
+  (* resolve a bound's type ARGUMENTS in the param scope (Iterator[T]
+     -> ("Iterator", [| T |])); an unresolvable arg fails soft to
+     empty — the obligation machinery reports the shape errors *)
+  let resolve_bound_args (bname : string) (bargs : Ast.type_expr list) =
+    let rec go acc = function
+      | [] -> (bname, Array.of_list (List.rev acc))
+      | a :: rest -> (
+          match resolve_type env scope a with
+          | Ok rt -> go (rt :: acc) rest
+          | Error _ -> (bname, [||]))
+    in
+    go [] bargs
+  in
   List.map
     (fun (name, id) ->
       let declared =
         match List.assoc_opt name tp_bounds with
-        | Some bs -> List.map (fun b -> (b, [||])) bs
+        | Some bs ->
+            List.map (fun (b, bargs) -> resolve_bound_args b bargs) bs
         | None -> []
       in
       let from_where =
@@ -2064,7 +2191,7 @@ let solver_param_bounds (decl : (string * Ids.Generic_param_id.t) list)
           (fun (wt, bs) ->
             match wt with
             | Type_repr.Type_param wid when Ids.Generic_param_id.compare wid id = 0 ->
-                Some (List.map (fun b -> (b, [||])) bs)
+                Some bs
             | _ -> None)
           where
         |> List.concat
@@ -3751,7 +3878,7 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
                   in
                   Hashtbl.replace env.typed_for_patterns nid
                     {
-                      tf_pattern = tp;
+                      tf_pattern = subst_pattern_tp tp;
                       tf_iterable_type = te.te_type;
                       tf_element_type = et;
                       tf_iteration_kind = kind;
@@ -3942,8 +4069,14 @@ and check_stmt (env : env) (scope : scope) (s : Ast.stmt) :
                      initializer form, keyed by the initializer's
                      NodeId — the identity the lowerer's LetBinding
                      consults; the old Name/Field-only restriction let
-                     `let (a, b) = get_pair()` fall back to raw syntax) *)
-                  Hashtbl.replace env.typed_let_patterns (Ast.expr_node_id value) tp;
+                     `let (a, b) = get_pair()` fall back to raw syntax).
+                     The bind types are substituted through the journal
+                     (re-audit P12: a let-bound INDEX element
+                     `let ch = chain_union[ci]` from a
+                     var-initialized container would otherwise carry an
+                     unsolved infer var into the lowering) *)
+                  Hashtbl.replace env.typed_let_patterns
+                    (Ast.expr_node_id value) (subst_pattern_tp tp);
                   Ok
                     ( add_binds scope (List.map (fun (n, t, _) -> (n, t, mut_)) binds),
                       {
@@ -3978,7 +4111,8 @@ and check_stmt (env : env) (scope : scope) (s : Ast.stmt) :
                   match check_pattern env scope (substitute_fixpoint !subst ty) pat with
                   | Error m -> Error m
                   | Ok (tp, binds) ->
-                      Hashtbl.replace env.typed_let_patterns (Ast.expr_node_id value) tp;
+                      Hashtbl.replace env.typed_let_patterns
+                        (Ast.expr_node_id value) (subst_pattern_tp tp);
                       Ok
                         ( add_binds scope (List.map (fun (n, t, _) -> (n, t, mut_)) binds),
                           {
@@ -4297,7 +4431,7 @@ and check_match (env : env) (scope : scope) (use : expr_use) (expected : Type_re
               (* the arm's semantic pattern tree on the typed-pattern
                  channel (keyed by the match's node id + the arm index —
                  the match_arm record carries no node id of its own) *)
-              Hashtbl.replace env.typed_patterns (nid, idx) tp;
+              Hashtbl.replace env.typed_patterns (nid, idx) (subst_pattern_tp tp);
               let arm_scope = add_binds scope binds in
               let* () =
                 match arm.Ast.ma_guard with
@@ -4638,23 +4772,33 @@ and check_place (env : env) (scope : scope) (e : Ast.expr) : (Type_repr.t * bool
       match check_place env scope base with
       | Error m -> Error m
       | Ok (bt, bmut) -> (
-          match bt with
-          | Type_repr.Fixed_array (t, _) -> Ok (t, bmut)
-          | Type_repr.Named (id, [| t |]) when Ids.Type_id.compare id b_array = 0 -> Ok (t, bmut)
-          | Type_repr.Named (id, [| t |]) -> (
-              (* the kernel's Array/Vec containers are indexable *)
-              match List.assoc_opt id env.type_names with
-              | Some ("Array" | "Vec") -> Ok (t, bmut)
-              | _ -> (
-                  match check_expr env scope None idx with
-                  | Ok _ ->
-                      Error (err span (Printf.sprintf "cannot index a value of type %s" (type_to_string bt)))
-                  | Error m -> Error m))
-          | _ -> (
-              match check_expr env scope None idx with
-              | Ok _ ->
-                  Error (err span (Printf.sprintf "cannot index a value of type %s" (type_to_string bt)))
-              | Error m -> Error m)))
+          (* the index expression is ALWAYS checked (re-audit P12: the
+             typed-channel nodes inside an index-target — e.g. the
+             `len()` call in `v[v.len() - 1] = x` — must be recorded,
+             or the typed profile misreads the call as an unresolved
+             closure call and the lowering has no typed node for it) *)
+          match check_expr env scope None idx with
+          | Error m -> Error m
+          | Ok _ -> (
+              match bt with
+              | Type_repr.Fixed_array (t, _) -> Ok (t, bmut)
+              | Type_repr.Named (id, [| t |])
+                when Ids.Type_id.compare id b_array = 0 ->
+                  Ok (t, bmut)
+              | Type_repr.Named (id, [| t |]) -> (
+                  (* the kernel's Array/Vec containers are indexable *)
+                  match List.assoc_opt id env.type_names with
+                  | Some ("Array" | "Vec") -> Ok (t, bmut)
+                  | _ ->
+                      Error
+                        (err span
+                           (Printf.sprintf "cannot index a value of type %s"
+                              (type_to_string bt))))
+              | _ ->
+                  Error
+                    (err span
+                       (Printf.sprintf "cannot index a value of type %s"
+                          (type_to_string bt))))))
   | Ast.Unary (_, Ast.Deref, e, _) -> (
       (* the pointer-write place: *(ptr) = value *)
       match check_expr env scope None e with
@@ -4987,14 +5131,14 @@ and return_unify_err (span : Span.span) (a : Type_repr.t) (b : Type_repr.t) (m :
                  (type_to_string b) m))
 
 and check_where_obligations (env : env) (span : Span.span) (owner : string)
-    (wps : (Type_repr.t * string list) list) : (unit, string) result =
+    (wps : (Type_repr.t * (string * Type_repr.t array) list) list) : (unit, string) result =
   let rec go_wps = function
     | [] -> Ok ()
     | (wt, bs) :: rest -> (
         let rec go_bs = function
           | [] -> Ok ()
-          | b :: rest2 -> (
-              let ob = { Trait_solver.trait_name = b; self_ty = wt; type_args = [||] } in
+          | (b, bargs) :: rest2 -> (
+              let ob = { Trait_solver.trait_name = b; self_ty = wt; type_args = bargs } in
               let r = Trait_solver.solve env.impls ob in
               env.state.oracle.o_obligations <- (ob, r) :: env.state.oracle.o_obligations;
               match r with
@@ -5052,7 +5196,12 @@ and check_call (env : env) (scope : scope) (expected : Type_repr.t option)
           Error (err span (Printf.sprintf "unknown function `%s`" n)))
   | Ast.Name (_, n, _) -> (
       match assoc_local n scope.locals with
-      | Some (Type_repr.Function (ps, _), _) ->
+      | Some (Type_repr.Function (ps, _) as ft, _) ->
+          (* re-audit P12: register the callee node's fn type — the
+             typed-profile lowerability decision (closure-call findings
+             fire only for non-function-typed callees) reads it *)
+          Hashtbl.replace env.typed_nodes (Ast.expr_node_id callee)
+            { tn_type = ft; tn_cast_target = None; tn_call = None };
           check_closure_call env scope expected n ps args span
       | Some (t, _) ->
           Error (err span (Printf.sprintf "cannot call a value of type %s" (type_to_string t)))
@@ -5182,7 +5331,37 @@ and check_call (env : env) (scope : scope) (expected : Type_repr.t option)
       check_call env scope expected node_id
         (Ast.Name (Ast.synthetic_node_id, a ^ "::" ^ b, Span.synthetic))
         targs args span
-  | Ast.Field (_, base, mname, _) ->
+  | Ast.Field (nid_f, base, mname, _) ->
+      (* re-audit P12: a function-valued field callee (`(self.func)(v)`)
+         — register the callee node's fn type so the typed-profile
+         lowerability decision can see it; method calls register nothing
+         (their Field node's type is not the callee) *)
+      (match static_type_of env scope base with
+       | Some bt -> (
+           let bt =
+             match bt with
+             | Type_repr.Ref_internal (_, t) | Type_repr.Raw_ptr (_, t) -> t
+             | Type_repr.Named (id, [| t |])
+               when Ids.Type_id.compare id b_ptr = 0
+                    || Ids.Type_id.compare id b_ptrmut = 0 ->
+                 t
+             | _ -> bt
+           in
+           match bt with
+           | Type_repr.Named (tid, _) -> (
+               match List.assoc_opt tid env.type_names with
+               | Some oname -> (
+                   match List.assoc_opt oname env.nominals with
+                   | Some nom when nom.nom_kind = `Struct -> (
+                       match List.assoc_opt mname nom.nom_fields with
+                       | Some (Type_repr.Function _ as ft) ->
+                           Hashtbl.replace env.typed_nodes nid_f
+                             { tn_type = ft; tn_cast_target = None; tn_call = None }
+                       | Some _ | None -> ())
+                   | _ -> ())
+               | None -> ())
+           | _ -> ())
+       | None -> ());
       check_method_call env scope expected node_id base mname targs args span
   | _ -> (
       match check_expr env scope None callee with
@@ -5672,7 +5851,7 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
     | [] -> None
     | o :: rest -> (
         match List.assoc_opt (o, mname) env.methods with
-        | Some sig_ -> Some sig_
+        | Some sig_ -> Some (o, sig_)
         | None -> try_owners rest)
   in
   (* the nominal owner name (used by receiver unification below) *)
@@ -5718,12 +5897,19 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
           Some sig_
       | _ -> None
   in
-  match
+  (if Sys.getenv_opt "TANGERINE_DEBUG_METHODCALL" <> None then
+     Printf.eprintf "DBG-MCALL mname=%s owner_ty=%s owners=[%s] found=%b span=%d:%d\n"
+       mname (type_to_string owner_ty) (String.concat ";" candidate_owners)
+       (try_owners candidate_owners <> None) span.Span.start span.Span.end_);
+  let resolved_owner, resolved_sig =
     match try_owners candidate_owners with
-    | Some s -> Some s
+    | Some (o, s) -> (Some o, Some s)
     | None -> (
-        match derived_clone () with Some s -> Some s | None -> derived_to_string ())
-  with
+        match derived_clone () with
+        | Some s -> (None, Some s)
+        | None -> (None, derived_to_string ()))
+  in
+  match resolved_sig with
   | None -> (
       (* a field of function type called on the receiver: `self.func(x)`
          where the struct's field `func` is itself a function value *)
@@ -5794,34 +5980,77 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
               @ params_in sig_.ts_return
             in
             let decl_params = List.map snd sig_.ts_params_decl in
-            let all_params =
-              decl_params @ List.filter (fun p -> not (List.mem p decl_params)) sig_free
-            in
-            List.iter
-              (fun pid ->
-                if not (List.mem_assoc (Type_repr.KParam pid) !subst) then
-                  subst := (Type_repr.KParam pid, fresh_infer_var env.state) :: !subst)
-              all_params;
-            let self_ty = substitute_fixpoint !subst sig_.ts_params.(0).Type_repr.pt_type in
-            let* () =
-              match owner_ty, self_ty with
-              | Type_repr.Fixed_array (t, _), Type_repr.Named (_, [| p |]) -> unify env.state.box_tid subst p t
-              | _ -> (
-                  match unify env.state.box_tid subst self_ty owner_ty with
-                  | Ok () -> Ok ()
-                  | Error _ -> (
-                      (* a user type that replaced a builtin keeps the
-                         builtin-registered methods: unify by type NAME *)
-                      let same_name () =
-                        match self_ty, owner_ty with
-                        | Type_repr.Named (id1, a1), Type_repr.Named (id2, a2)
-                          when Ids.Type_id.compare id1 id2 <> 0 -> (
-                            (* the method key's owner name is the authority:
-                               the builtin Vec nominal is named "Array", so
-                               (Vec, len) matches a receiver named "Vec" *)
-                            let n1 = List.assoc_opt id1 env.type_names in
-                            let n2 = List.assoc_opt id2 env.type_names in
-                            let names_agree =
+             let all_params =
+               decl_params @ List.filter (fun p -> not (List.mem p decl_params)) sig_free
+             in
+             (* a method called on a receiver that carries the SAME rigid
+                binder the signature declares (a sibling method of the
+                SAME impl — `self.len()` inside `impl[T] Array[T]`
+                resolves the impl's Array::len whose decl param T IS the
+                item's own T, and the receiver is Vec[T-of-the-same-
+                impl]) must NOT have that decl param pre-instantiated:
+                the fresh var would resolve-equal with the receiver's
+                rigid param (resolve_param follows the KParam binding to
+                the very same var) and the receiver unify would
+                short-circuit `equal` WITHOUT binding the var, freezing
+                an unsolved Infer_var into the recorded substitution.
+                The decl param stays unbound and the recorded
+                substitution keeps the DECL param itself, which the
+                enclosing fn declares (the residual-param guard below
+                already exempts params_in owner_ty).  Only the DECL
+                params the receiver itself carries qualify — a receiver
+                whose element is a DIFFERENT (or no) binder keeps full
+                pre-instantiation so the receiver unify solves the var. *)
+             let receiver_params = params_in owner_ty in
+             let receiver_decl_params =
+               List.filter
+                 (fun (_, pid) -> List.mem pid receiver_params)
+                 sig_.ts_params_decl
+               |> List.map snd
+             in
+             (match owner_ty, resolved_owner with
+              | Type_repr.Type_param pid, Some tro ->
+                  (* the receiver's trait bound that actually matched:
+                     the bound's args name the trait method's params *)
+                  (match List.assoc_opt pid env.impls.param_bounds with
+                   | Some bounds -> (
+                       match List.find_opt (fun (tb, _) -> tb = tro) bounds with
+                       | Some (_, args)
+                         when List.length sig_.ts_params_decl = Array.length args ->
+                           Array.iter2
+                             (fun (_, pid_t) a ->
+                               if not (List.mem_assoc (Type_repr.KParam pid_t) !subst) then
+                                 subst := (Type_repr.KParam pid_t, a) :: !subst)
+                             (Array.of_list sig_.ts_params_decl) args
+                       | Some _ | None -> ())
+                   | None -> ())
+              | _ -> ());
+             List.iter
+               (fun pid ->
+                 if not (List.mem pid receiver_decl_params) then
+                   if not (List.mem_assoc (Type_repr.KParam pid) !subst) then
+                     subst := (Type_repr.KParam pid, fresh_infer_var env.state) :: !subst)
+               all_params;
+             let self_ty = substitute_fixpoint !subst sig_.ts_params.(0).Type_repr.pt_type in
+             let* () =
+               match owner_ty, self_ty with
+               | Type_repr.Fixed_array (t, _), Type_repr.Named (_, [| p |]) -> unify env.state.box_tid subst p t
+               | _ -> (
+                   match unify env.state.box_tid subst self_ty owner_ty with
+                   | Ok () -> Ok ()
+                   | Error _ -> (
+                       (* a user type that replaced a builtin keeps the
+                          builtin-registered methods: unify by type NAME *)
+                       let same_name () =
+                         match self_ty, owner_ty with
+                         | Type_repr.Named (id1, a1), Type_repr.Named (id2, a2)
+                           when Ids.Type_id.compare id1 id2 <> 0 -> (
+                             (* the method key's owner name is the authority:
+                                the builtin Vec nominal is named "Array", so
+                                (Vec, len) matches a receiver named "Vec" *)
+                             let n1 = List.assoc_opt id1 env.type_names in
+                             let n2 = List.assoc_opt id2 env.type_names in
+                             let names_agree =
                               match n1, n2 with
                               | Some n, Some m -> n = m || n = oname || m = oname
                               | _ -> false
@@ -6043,13 +6272,13 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
                                    | None -> "?")
                                | None -> "?"
                              in
-                             Printf.eprintf
-                               "DEBUG-MRET %s.%s oname=%s owner=%s sigret=%s expected=%s err=%s at %s\n"
-                               oname mname (match owner_name with Some n -> n | None -> "<none>")
-                               (type_to_string owner_ty)
-                               (type_to_string (substitute_fixpoint !subst sig_.ts_return))
-                               (match expected with Some e -> type_to_string e | None -> "<none>")
-                               m loc);
+                              Printf.eprintf
+                                "DEBUG-MRET %s.%s oname=%s owner=%s sigret=%s expected=%s err=%s at %s\n"
+                                oname mname (match owner_name with Some n -> n | None -> "<none>")
+                                (type_to_string owner_ty)
+                                (type_to_string (substitute_fixpoint !subst sig_.ts_return))
+                                (match expected with Some e -> type_to_string e | None -> "<none>")
+                                m loc);
                           Error m)
                   | None -> Ok ()
                 in
@@ -6161,7 +6390,8 @@ let impl_param_key (env : env) (d : Ast.impl_decl) : string =
   Printf.sprintf "impl::%s::%d:%d-%d" (qualified_name env.module_path d.i_target_type)
     d.i_span.Span.file_id d.i_span.Span.start d.i_span.Span.end_
 
-let rec check_function_body (env : env) (extra_tp_bounds : (string * string list) list)
+let rec check_function_body (env : env)
+    (extra_tp_bounds : (string * (string * Ast.type_expr list) list) list)
     (sig_ : typed_signature) (d : Ast.function_decl) : (unit, string) result =
   let scope =
     let n_ast = List.length d.fn_sig.sig_params in
@@ -6196,7 +6426,8 @@ let rec check_function_body (env : env) (extra_tp_bounds : (string * string list
   in
   let saved = env.impls.param_bounds in
   env.impls.param_bounds <-
-    solver_param_bounds sig_.ts_params_decl (extra_tp_bounds @ own_tp_bounds) sig_.ts_where;
+    solver_param_bounds env scope sig_.ts_params_decl
+      (extra_tp_bounds @ own_tp_bounds) sig_.ts_where;
   let env' = { env with current_return = Some sig_.ts_return } in
   let result =
     let* () = check_where_obligations env' d.fn_span ("function `" ^ sig_.ts_name ^ "`") sig_.ts_where in
@@ -6268,7 +6499,8 @@ let rec check_function_body (env : env) (extra_tp_bounds : (string * string list
   env.impls.param_bounds <- saved;
   result
 
-and check_methods (env : env) (owner : string) (extra_tp_bounds : (string * string list) list)
+and check_methods (env : env) (owner : string)
+    (extra_tp_bounds : (string * (string * Ast.type_expr list) list) list)
     (methods : Ast.function_decl list) : (unit, string) result =
   let rec go = function
     | [] -> Ok ()
@@ -6320,12 +6552,12 @@ and check_struct (env : env) (d : Ast.struct_decl) : (unit, string) result =
       let tp_bounds =
         List.map (fun (tp : Ast.type_param) -> (tp.tp_name, tp.tp_bounds)) d.s_type_params
       in
+      let scope = { empty_scope with generics = List.map (fun (n, i) -> (n, i)) nom.nom_params } in
       let saved = env.impls.param_bounds in
-      env.impls.param_bounds <- solver_param_bounds nom.nom_params tp_bounds nom.nom_where;
+      env.impls.param_bounds <- solver_param_bounds env scope nom.nom_params tp_bounds nom.nom_where;
       let result =
         let* () = check_where_obligations env d.s_span ("struct `" ^ d.s_name ^ "`") nom.nom_where in
         let* () =
-          let scope = { empty_scope with generics = List.map (fun (n, i) -> (n, i)) nom.nom_params } in
           let rec go = function
             | [] -> Ok ()
             | (f : Ast.field_decl) :: rest -> (
@@ -6354,8 +6586,9 @@ and check_enum (env : env) (d : Ast.enum_decl) : (unit, string) result =
       let tp_bounds =
         List.map (fun (tp : Ast.type_param) -> (tp.tp_name, tp.tp_bounds)) d.e_type_params
       in
+      let scope = { empty_scope with generics = List.map (fun (n, i) -> (n, i)) nom.nom_params } in
       let saved = env.impls.param_bounds in
-      env.impls.param_bounds <- solver_param_bounds nom.nom_params tp_bounds nom.nom_where;
+      env.impls.param_bounds <- solver_param_bounds env scope nom.nom_params tp_bounds nom.nom_where;
       let result = check_where_obligations env d.e_span ("enum `" ^ d.e_name ^ "`") nom.nom_where in
       env.impls.param_bounds <- saved;
       result)
@@ -6371,7 +6604,7 @@ and check_trait (env : env) (d : Ast.trait_decl) : (unit, string) result =
     List.map (fun (tp : Ast.type_param) -> (tp.tp_name, tp.tp_bounds)) d.t_type_params
   in
   let saved = env'.impls.param_bounds in
-  env'.impls.param_bounds <- solver_param_bounds params tp_bounds where;
+  env'.impls.param_bounds <- solver_param_bounds env' scope params tp_bounds where;
   let result =
     let* () = check_where_obligations env' d.t_span ("trait `" ^ d.t_name ^ "`") where in
     let rec go = function
@@ -6437,7 +6670,7 @@ and check_impl (env : env) (d : Ast.impl_decl) : (unit, string) result =
     List.map (fun (tp : Ast.type_param) -> (tp.tp_name, tp.tp_bounds)) d.i_type_params
   in
   let saved = env'.impls.param_bounds in
-  env'.impls.param_bounds <- solver_param_bounds impl_params tp_bounds impl_where;
+  env'.impls.param_bounds <- solver_param_bounds env' scope impl_params tp_bounds impl_where;
   let result =
     let* () = check_where_obligations env' d.i_span ("impl for `" ^ d.i_target_type ^ "`") impl_where in
     check_methods env' d.i_target_type tp_bounds d.i_methods
@@ -6543,19 +6776,37 @@ and check_item (env : env) (item : Ast.item) : (unit, string) result =
    Registration pass (the resolver's registries, pass A) *)
 
 and resolve_where (env : env) (scope : scope) (wps : Ast.where_predicate list) :
-    ((Type_repr.t * string list) list, string) result =
+    ((Type_repr.t * (string * Type_repr.t array) list) list, string) result =
+  let rec go_bs acc = function
+    | [] -> Ok (List.rev acc)
+    | (bname, bargs) :: rest -> (
+        let rec go_args acc = function
+          | [] -> Ok (List.rev acc)
+          | a :: rest2 -> (
+              match resolve_type env scope a with
+              | Ok rt -> go_args (rt :: acc) rest2
+              | Error m -> Error m)
+        in
+        match go_args [] bargs with
+        | Error m -> Error m
+        | Ok rt -> go_bs ((bname, Array.of_list rt) :: acc) rest)
+  in
   let rec go acc = function
     | [] -> Ok (List.rev acc)
     | (wp : Ast.where_predicate) :: rest -> (
         match resolve_type env scope wp.wp_type with
-        | Ok wt -> go ((wt, wp.wp_bounds) :: acc) rest
+        | Ok wt -> (
+            match go_bs [] wp.wp_bounds with
+            | Error m -> Error m
+            | Ok bs -> go ((wt, bs) :: acc) rest)
         | Error m -> Error m)
   in
   go [] wps
 
 and register_methods (env : env) (owner : string) (methods : Ast.function_decl list)
     (extra_params : (string * Ids.Generic_param_id.t) list)
-    (where_extra : (Type_repr.t * string list) list) : (env, string) result =
+    (where_extra : (Type_repr.t * (string * Type_repr.t array) list) list)
+    : (env, string) result =
   let rec go env = function
     | [] -> Ok env
     | (m : Ast.function_decl) :: rest -> (
@@ -6679,7 +6930,7 @@ and register_impl (env : env) (d : Ast.impl_decl) : (env, string) result =
     List.concat_map
       (fun (tp : Ast.type_param) ->
         List.map
-          (fun b ->
+          (fun (b, _bargs) ->
             {
               Trait_solver.trait_name = b;
               self_ty = Type_repr.Type_param (List.assoc tp.tp_name impl_params);
@@ -6691,7 +6942,10 @@ and register_impl (env : env) (d : Ast.impl_decl) : (env, string) result =
   let from_where =
     List.concat_map
       (fun (wt, bs) ->
-        List.map (fun b -> { Trait_solver.trait_name = b; self_ty = wt; type_args = [||] }) bs)
+        List.map
+          (fun (b, _bargs) ->
+            { Trait_solver.trait_name = b; self_ty = wt; type_args = [||] })
+          bs)
       impl_where
   in
   let entry : Trait_solver.impl_entry =

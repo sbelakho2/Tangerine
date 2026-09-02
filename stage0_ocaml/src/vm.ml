@@ -279,26 +279,30 @@ let rec eval_operand (vm : t) (frame : frame) (op : Seed_mir.operand) : Vm_value
       | Seed_mir.Enum (vi, _) ->
           Vm_value.Enum (Ids.Variant_index.to_int vi, [||])
       | Seed_mir.Struct _ -> Vm_value.Struct [||]
-      | Seed_mir.Array _ -> Vm_value.Array [||])
+      | Seed_mir.Array _ -> Vm_value.Array [||]
+      | Seed_mir.Map _ -> Vm_value.Map []
+      | Seed_mir.Set _ -> Vm_value.Set [])
   | Seed_mir.Copy p | Seed_mir.Read p -> (
       match read_place vm frame p with
       | Ok v -> v
       | Error e -> err_trap vm (Vm_value.slot_error_string e))
   | Seed_mir.Move p | Seed_mir.Consume p ->
-      (* audit P0: the seed VM has NO partial-move representation — a
-         Move/Consume transitions the WHOLE root slot to Moved and the
-         projections are ignored.  The verifier rejects every projected
-         Move/Consume (categorically, both modes); the VM fails closed
-         on the same programs so that even unverified MIR executed
-         directly can never observe the root-slot semantics the
-         verifier forbids (move root.field must never silently move
-         root). *)
-      if p.Seed_mir.projections <> [] then
-        err_trap vm
-          (Printf.sprintf
-             "projected %s is unsupported by the seed VM (no partial-move representation: a Move/Consume of local _%d through a projection would transition the WHOLE root slot to Moved; the verifier rejects projected moves and the VM fails closed)"
-             (match op with Seed_mir.Move _ -> "move" | _ -> "consume")
-             (Seed_mir.root_key p.Seed_mir.root));
+      (* re-audit P12: the partial-move representation — a projected
+         Move/Consume reads the projected COMPONENT (never the whole
+         root) and writes the Moved hole marker into the component; the
+         root slot stays Live with the hole and the drop glue skips the
+         Moved components.  The verifier's moved lattice tracks the
+         same per-path keys, so the dataflow and the executor agree. *)
+      if p.Seed_mir.projections <> [] then begin
+        let v =
+          match read_place vm frame p with
+          | Ok v -> v
+          | Error e -> err_trap vm (Vm_value.slot_error_string e)
+        in
+        write_place vm frame p Vm_value.MovedOut;
+        v
+      end
+      else begin
       let slot =
         if Seed_mir.root_is_static p.Seed_mir.root then
           let sidx = Seed_mir.root_static_index p.Seed_mir.root in
@@ -315,6 +319,7 @@ let rec eval_operand (vm : t) (frame : frame) (op : Seed_mir.operand) : Vm_value
             else frame.locals.((Seed_mir.root_key p.Seed_mir.root)) <- s);
            v
        | Error e -> err_trap vm (Vm_value.slot_error_string e))
+      end
 
 (* Read a place: project through the value.  A Deref projection resolves
    through memory (RawPtr) or through the reference target (Ref).  The
@@ -340,6 +345,13 @@ and read_place (vm : t) (frame : frame) (p : Seed_mir.place) :
 
 and project_read (vm : t) (frame : frame) (base : Vm_value.t) (base_ty : Type_repr.t)
     (projs : Seed_mir.projection list) : Vm_value.t =
+  match base with
+  | Vm_value.MovedOut ->
+      (* re-audit P12: reading through a partial-move hole is an
+         invariant break — the verifier's moved lattice blocks the path
+         before execution; the VM traps as defense-in-depth *)
+      err_trap vm "read through a moved-out (partial-move) component"
+  | _ -> (
   match projs with
   | [] -> base
   | proj :: rest ->
@@ -414,7 +426,7 @@ and project_read (vm : t) (frame : frame) (base : Vm_value.t) (base_ty : Type_re
                recurse tv
            | Vm_value.Ref (Vm_value.Region ptr) -> recurse (memory_load vm ptr)
            | Vm_value.RawPtr ptr -> recurse (memory_load vm ptr)
-           | _ -> err_trap vm "deref on non-pointer"))
+           | _ -> err_trap vm "deref on non-pointer")))
 
 (* The dynamic-index form: the payload is a LOCAL whose value is the
    runtime index (the seed's dynamic-index convention).  The local is
@@ -466,7 +478,7 @@ and memory_store (vm : t) (ptr : Vm_memory.pointer) (v : Vm_value.t) : unit =
       Bytes.blit bytes 0 r.Vm_memory.bytes ptr.Vm_memory.offset blen
 
 (* Write a value into a place (assign). *)
-let rec write_place (vm : t) (frame : frame) (p : Seed_mir.place) (v : Vm_value.t) : unit =
+and write_place (vm : t) (frame : frame) (p : Seed_mir.place) (v : Vm_value.t) : unit =
   step_limit vm;
   let statics_slot () =
     let sidx = Seed_mir.root_static_index p.Seed_mir.root in
@@ -846,6 +858,18 @@ let rec eval_rvalue (vm : t) (frame : frame) (rv : Seed_mir.rvalue) : Vm_value.t
               else Vm_value.Char (Uchar.of_int (Int64.to_int (Int_value.to_int64 i)))
           | Vm_value.Char _ -> vv
           | _ -> err_trap vm "invalid cast to char")
+      | Type_repr.Named _ | Type_repr.Tuple _ | Type_repr.Fixed_array _ ->
+          (* re-audit P12: the enum-rebrand cast — the `?` failure path
+             moves the WHOLE subject (Result[Int, E] -> Result[String,
+             E]) when the two instantiate the same enum: the runtime
+             value (tag + payload slots) is already the identical
+             Err(E), so the cast passes the value through.  Anything
+             that is not already the runtime shape of the target is an
+             invariant break. *)
+          (match vv with
+           | Vm_value.Enum _ | Vm_value.Struct _ | Vm_value.Array _ | Vm_value.Tuple _ ->
+               vv
+           | _ -> err_trap vm "enum-rebrand cast of a non-aggregate value")
       | _ -> err_trap vm "cast to unsupported type")
 
 and int_width = function
@@ -917,8 +941,29 @@ let rec exec_terminator (vm : t) (frame : frame) (term : Seed_mir.terminator) : 
             | _ -> eval_operand vm frame a.Seed_mir.value)
           args
       in
+      (* re-audit P12: the closure-VALUE call — the FnValue callee is a
+         RUNTIME fn value: `Vm_value.Function inst` (a plain
+         named-function pointer — the kernel's fn-typed params/fields)
+         or `Vm_value.Closure (inst, caps)` (a closure object; the
+         capture tuple binds the callee's trailing env parameters, the
+         Swift reference's convention).  Both execute the same
+         user-call machinery below. *)
+      let inst, caps =
+        match callee with
+        | Seed_mir.User inst -> (inst, [||])
+        | Seed_mir.FnValue op -> (
+            match eval_operand vm frame op with
+            | Vm_value.Function inst -> (inst, [||])
+            | Vm_value.Closure (inst, caps) -> (inst, caps)
+            | _ ->
+                err_trap vm
+                  "fn-value call: callee operand is not a function value")
+        | Seed_mir.Intrinsic _ | Seed_mir.Extern _ ->
+            ( Instance_id.make ~callable:(Ids.Callable_id.make (-1)) ~type_args:[||],
+              [||] )
+      in
       (match callee with
-       | Seed_mir.User inst ->
+       | Seed_mir.User _ | Seed_mir.FnValue _ ->
            let fn_idx =
              match find_fn vm inst with
              | Some idx -> idx
@@ -942,13 +987,14 @@ let rec exec_terminator (vm : t) (frame : frame) (term : Seed_mir.terminator) : 
                  as an UNINITIALIZED output place — the callee must
                  initialize it before returning; every other convention
                  enters as the copied Live value. *)
+              let all_args = Array.append arg_vals caps in
               Array.iteri
                 (fun i _slot ->
                   if i < Array.length args
                      && args.(i).Seed_mir.effect_ = Access_effect.Initialize
                   then callee_frame.locals.(i + 1) <- Vm_value.Uninitialized
-                  else callee_frame.locals.(i + 1) <- Vm_value.Live arg_vals.(i))
-                (Array.sub arg_vals 0 (Array.length fn.Seed_mir.params));
+                  else callee_frame.locals.(i + 1) <- Vm_value.Live all_args.(i))
+                (Array.sub all_args 0 (Array.length fn.Seed_mir.params));
               run_frame vm callee_frame
             with Exit -> ());
 
@@ -1064,7 +1110,8 @@ and call_host (vm : t) (callee : Seed_mir.callee) (args : Vm_value.t array) : Ho
     match callee with
     | Seed_mir.Intrinsic i -> Host.Intrinsic (Intrinsic_registry.Id.make i)
     | Seed_mir.Extern i -> Host.Extern (Extern_registry.Id.make i)
-    | Seed_mir.User _ -> err_trap vm "internal: user call routed to host dispatch"
+    | Seed_mir.User _ | Seed_mir.FnValue _ ->
+        err_trap vm "internal: user/fn-value call routed to host dispatch"
   in
   match Host.lookup_binding vm.host id with
   | None ->
@@ -1076,7 +1123,7 @@ and call_host (vm : t) (callee : Seed_mir.callee) (args : Vm_value.t array) : Ho
             | Seed_mir.Intrinsic i ->
                 Printf.sprintf "intrinsic#%d" (Intrinsic_registry.Id.to_int i)
             | Seed_mir.Extern i -> Printf.sprintf "extern#%d" (Extern_registry.Id.to_int i)
-            | Seed_mir.User _ -> "?")
+            | Seed_mir.User _ | Seed_mir.FnValue _ -> "?")
       in
       err_trap vm (Printf.sprintf "host call %s has no binding (fail-closed)" label)
   | Some b ->
@@ -1173,6 +1220,7 @@ and value_kind (v : Vm_value.t) : string =
   | Vm_value.RawPtr _ -> "ptr"
   | Vm_value.Ref _ -> "ref"
   | Vm_value.Null -> "null"
+  | Vm_value.MovedOut -> "moved-out-hole"
 
 (* ── the GLOBAL storage ──────────────────────────────── *)
 let statics_initial_values (program : Seed_mir.program) : Vm_value.slot array =
@@ -1193,7 +1241,9 @@ let statics_initial_values (program : Seed_mir.program) : Vm_value.slot array =
           | Seed_mir.Enum (vi, _) ->
               Vm_value.Live (Vm_value.Enum (Ids.Variant_index.to_int vi, [||]))
           | Seed_mir.Struct _ -> Vm_value.Live (Vm_value.Struct [||])
-          | Seed_mir.Array _ -> Vm_value.Live (Vm_value.Array [||])))
+          | Seed_mir.Array _ -> Vm_value.Live (Vm_value.Array [||])
+          | Seed_mir.Map _ -> Vm_value.Live (Vm_value.Map [])
+          | Seed_mir.Set _ -> Vm_value.Live (Vm_value.Set [])))
     program.Seed_mir.statics
 
 (* Build an entry frame without running (inspection). *)

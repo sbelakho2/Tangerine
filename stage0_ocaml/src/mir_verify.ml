@@ -1145,29 +1145,21 @@ let check_ref_operand (ctx : ctx) (fn : function_) (bb_ctx : string) (op : opera
          | _ -> ());
   | Constant _ -> ()
 
-(* ── Categorical projected-Move/Consume rejection (audit P0) ─────────
-   The seed VM has NO partial-move representation: `Move p` /
-   `Consume p` evaluates `move_slot frame.locals.((root_key p.root)` — the WHOLE
-   root slot transitions to Moved, and `p.projections` is ignored.  The
-   verifier's moved lattice is projection-aware (place keys track
-   sub-place ownership), so a projected move would DISAGREE with the
-   executor about the basic meaning of the instruction: the VM would
-   move `root.field` by moving the entire root.  Until the VM executes
-   projected moves, every projected Move/Consume is rejected here —
-   categorically, in both verification modes and at every operand
-   position (statements, aggregate operands, call arguments with
-   Consume/Initialize effects, SwitchInt/Assert conditions).  The VM
-   also traps on the same programs (fail-closed), so no executor can
-   ever observe the root-slot semantics the verifier forbids. *)
+(* ── Projected Move/Consume (the partial-move representation) ────────
+   re-audit P12: the seed VM now EXECUTES projected moves — a
+   Move/Consume of `root.field` reads the projected component and
+   writes the Moved hole marker INTO the component (the root slot
+   stays Live with the hole; the drop glue skips Moved components).
+   The verifier's moved lattice is projection-aware (place keys track
+   sub-place ownership), so the dataflow and the executor agree: the
+   moved path is consumed, the un-moved remainder of the root stays
+   readable, and a second consume of the same path is a use-after-move.
+   The categorical rejection is retired. *)
 let check_projected_move_transfer (ctx : ctx) (bb_ctx : string) (op : operand) : unit =
+  ignore ctx;
+  ignore bb_ctx;
   match op with
-  | Move p | Consume p ->
-      if p.projections <> [] then
-        let kind = match op with Move _ -> "move" | Consume _ -> "consume" | _ -> "transfer" in
-        add_err ctx
-          (Printf.sprintf
-             "%s: projected %s is unsupported by the seed VM (no partial-move representation: a Move/Consume of local _%d through a projection would transition the WHOLE root slot to Moved, disagreeing with the projection-aware moved lattice; rejected until the VM executes projected moves)"
-             bb_ctx kind (root_key p.root))
+  | Move p | Consume p -> ignore p
   | Copy _ | Read _ | Constant _ -> ()
 
 (* Callee-resolution result (see resolve_callee below). *)
@@ -1240,7 +1232,7 @@ and constant_type (ctx : ctx) (c : constant) : Type_repr.t =
      driver records it from the typed const registry — the instantiation
      is not recoverable from the def table alone), so the static's
      declared type compares exactly *)
-  | Enum (_, ty) | Struct ty | Array ty -> ty
+  | Enum (_, ty) | Struct ty | Array ty | Map ty | Set ty -> ty
 
 and function_constant_type (ctx : ctx) (inst : Instance_id.t) : Type_repr.t =
   match resolve_callee ctx inst with
@@ -1702,7 +1694,22 @@ let check_rvalue (ctx : ctx) (fn : function_) (bb_ctx : string) (declared : IntS
               None)
       | None -> None)
   | Cast (op, ty) -> (
-      ignore (check_operand ctx fn bb_ctx op running moved ~as_call_arg:false ~init_place:false);
+      let oty =
+        check_operand ctx fn bb_ctx op running moved ~as_call_arg:false ~init_place:false
+      in
+      (* re-audit P12: the enum-rebrand cast — the `?` failure path
+         moves the WHOLE subject between two instantiations of the SAME
+         enum (Result[Int, E] -> Result[String, E]); the operand's type
+         must be the same enum family as the target (the runtime
+         tag/payload layout is identical, so the value passes through) *)
+      let enum_rebrand =
+        match oty, ty with
+        | Some o, Type_repr.Named (tid_t, _) -> (
+            match resolve_or_self ctx o with
+            | Type_repr.Named (tid_o, _) -> Ids.Type_id.compare tid_o tid_t = 0
+            | _ -> false)
+        | _ -> false
+      in
       match ctx.mode with
       | Concrete_mode ->
           if Type_repr.has_type_param ty then
@@ -1710,6 +1717,7 @@ let check_rvalue (ctx : ctx) (fn : function_) (bb_ctx : string) (declared : IntS
               (Printf.sprintf "%s: cast target %s carries an unresolved type parameter" bb_ctx
                  (Seed_mir.print_type ty));
           if is_scalar ctx ty then Some ty
+          else if enum_rebrand then Some ty
           else begin
             add_err ctx
               (Printf.sprintf "%s: cast target %s is not a scalar/pointer type" bb_ctx
@@ -1759,19 +1767,94 @@ let check_call (ctx : ctx) (fn : function_) (bb_ctx : string) (dest : place)
         | Some (name, _, sig_) ->
             (* re-audit P0 (intrinsic verification parity): the intrinsic
                call is checked against its declared registry signature —
-               arity and argument access effects, exactly like the User
-               call path.  The declared param/ret types are
-               placeholder-typed (registry-local ids), so type equality
-               is not checked here; the host closure check validates the
-               binding side. *)
+               arity, argument access effects, a REAL substitution
+               accumulated across the arguments and the destination
+               (repeated generic placeholders must be consistent), Unit
+               exactly, constants by their constant type, and the
+               effect/operand-category contract (Consume/Initialize/
+               Modify require a place channel). *)
             if Array.length args <> Array.length sig_.Intrinsic_registry.params then
               add_err ctx
                 (Printf.sprintf "%s: intrinsic `%s` expects %d argument(s), got %d" bb_ctx name
                    (Array.length sig_.Intrinsic_registry.params) (Array.length args));
-            (* re-audit P0-C: the registry signatures now carry the full
-               ParamType conventions — each argument's access effect is
-               checked against the declared read-side exactly like User
-               calls *)
+            let subst = ref [] in
+            let rec bind (declared : Type_repr.t) (actual : Type_repr.t) : unit =
+              match declared with
+              | Type_repr.Type_param pid -> (
+                  match List.assoc_opt (Type_repr.KParam pid) !subst with
+                  | Some prev ->
+                      if not (types_compatible ctx prev actual) then
+                        add_err ctx
+                          (Printf.sprintf
+                             "%s: intrinsic `%s` generic parameter is used inconsistently (earlier %s, now %s)"
+                             bb_ctx name (Seed_mir.print_type prev)
+                             (Seed_mir.print_type actual))
+                  | None -> subst := (Type_repr.KParam pid, actual) :: !subst)
+              | Type_repr.Named (id1, a1) -> (
+                  let id1' =
+                    if Ids.Type_id.compare id1 (Intrinsic_registry.Type_id.option_) = 0 then
+                      Ids.Type_id.make 3
+                    else if Ids.Type_id.compare id1 (Intrinsic_registry.Type_id.vec) = 0 then
+                      Ids.Type_id.make 0
+                    else if Ids.Type_id.compare id1 (Intrinsic_registry.Type_id.map) = 0 then
+                      Ids.Type_id.make 1
+                    else if Ids.Type_id.compare id1 (Intrinsic_registry.Type_id.set) = 0 then
+                      Ids.Type_id.make 2
+                    else id1
+                  in
+                  match actual with
+                  | Type_repr.Named (id2, a2)
+                    when Ids.Type_id.compare id1' id2 = 0 && Array.length a1 = Array.length a2 ->
+                      Array.iter2 (fun d a -> bind d a) a1 a2
+                  | Type_repr.Fixed_array (e2, _)
+                    when Ids.Type_id.compare id1' (Ids.Type_id.make 0) = 0
+                         && Array.length a1 = 1 ->
+                      bind a1.(0) e2
+                  | _ ->
+                      add_err ctx
+                        (Printf.sprintf
+                           "%s: intrinsic `%s` argument type mismatch: expected %s got %s" bb_ctx
+                           name
+                           (Seed_mir.print_type (registry_type_to_checker declared))
+                           (Seed_mir.print_type actual)))
+              | Type_repr.Unit -> (
+                  (* a declared Unit parameter is exactly Unit — never a
+                     wildcard *)
+                  if not (types_compatible ctx Type_repr.Unit actual) then
+                    add_err ctx
+                      (Printf.sprintf
+                         "%s: intrinsic `%s` argument type mismatch: expected Unit got %s" bb_ctx
+                         name (Seed_mir.print_type actual)))
+              | Type_repr.Fixed_array (e1, n1) -> (
+                  match actual with
+                  | Type_repr.Fixed_array (e2, n2) when n1 = n2 -> bind e1 e2
+                  | _ ->
+                      add_err ctx
+                        (Printf.sprintf
+                           "%s: intrinsic `%s` argument type mismatch: expected %s got %s" bb_ctx
+                           name
+                           (Seed_mir.print_type (registry_type_to_checker declared))
+                           (Seed_mir.print_type actual)))
+              | Type_repr.Tuple a1 -> (
+                  match actual with
+                  | Type_repr.Tuple a2 when Array.length a1 = Array.length a2 ->
+                      Array.iter2 (fun d a -> bind d a) a1 a2
+                  | _ ->
+                      add_err ctx
+                        (Printf.sprintf
+                           "%s: intrinsic `%s` argument type mismatch: expected %s got %s" bb_ctx
+                           name
+                           (Seed_mir.print_type (registry_type_to_checker declared))
+                           (Seed_mir.print_type actual)))
+              | declared' ->
+                  if not (types_compatible ctx (registry_type_to_checker declared') actual) then
+                    add_err ctx
+                      (Printf.sprintf
+                         "%s: intrinsic `%s` argument type mismatch: expected %s got %s" bb_ctx
+                         name
+                         (Seed_mir.print_type (registry_type_to_checker declared'))
+                         (Seed_mir.print_type actual))
+            in
             Array.iteri
               (fun k a ->
                 if k < Array.length sig_.Intrinsic_registry.params then
@@ -1785,43 +1868,186 @@ let check_call (ctx : ctx) (fn : function_) (bb_ctx : string) (dest : place)
                          "%s: intrinsic `%s` argument %d carries effect %s but the declaration requires %s"
                          bb_ctx name (k + 1) (Seed_mir.print_effect a.Seed_mir.effect_)
                          (Seed_mir.print_effect declared));
-                  (* the declared parameter TYPE (the registry's
-                     placeholder domain, mapped to the checker ids) —
-                     the generic placeholders accept any actual *)
+                  (* the effect/operand-category contract: Initialize /
+                     Modify arguments must be PLACE channels (a constant
+                     cannot be written back).  A Consume of a constant is
+                     the VALUE copy (`set.insert(5)` — the sink of a
+                     literal) — the constant is immutable, the callee
+                     receives the copied value, nothing transfers. *)
+                  (match a.Seed_mir.effect_ with
+                   | Access_effect.Initialize | Access_effect.Modify -> (
+                       match a.Seed_mir.value with
+                       | Seed_mir.Constant _ ->
+                           add_err ctx
+                             (Printf.sprintf
+                                "%s: intrinsic `%s` argument %d has effect %s but is a constant (a place channel is required)"
+                                bb_ctx name (k + 1)
+                                (Seed_mir.print_effect a.Seed_mir.effect_))
+                       | _ -> ())
+                   | Access_effect.Read | Access_effect.Consume -> ());
                   let declared_ty =
                     sig_.Intrinsic_registry.params.(k).Type_repr.pt_type
                   in
-                  match a.Seed_mir.value with
-                  | Seed_mir.Constant _ -> ()
-                  | Seed_mir.Copy p | Seed_mir.Read p | Seed_mir.Move p
-                  | Seed_mir.Consume p -> (
-                      match place_type ctx fn p with
-                      | Some aty ->
-                          if not (intrinsic_type_compatible ctx declared_ty aty) then
-                            add_err ctx
-                              (Printf.sprintf
-                                 "%s: intrinsic `%s` argument %d type mismatch: expected %s got %s"
-                                 bb_ctx name (k + 1)
-                                 (Seed_mir.print_type (registry_type_to_checker declared_ty))
-                                 (Seed_mir.print_type aty))
-                      | None -> ()))
+                  let actual_ty =
+                    match a.Seed_mir.value with
+                    | Seed_mir.Constant c -> Some (constant_type ctx c)
+                    | Seed_mir.Copy p | Seed_mir.Read p | Seed_mir.Move p
+                    | Seed_mir.Consume p -> place_type ctx fn p
+                  in
+                  (match actual_ty with
+                   | Some aty -> bind declared_ty aty
+                   | None -> ()))
               args;
-            (* the destination type against the declared result *)
+            (* the destination type against the declared result — under
+               the SAME substitution: a generic placeholder in the result
+               must be consistent with the arguments' bindings *)
             (match place_type ctx fn dest with
-             | Some dty -> (
-                 let declared_ret = sig_.Intrinsic_registry.ret in
-                 if not (intrinsic_type_compatible ctx declared_ret dty) then
-                   add_err ctx
-                     (Printf.sprintf
-                        "%s: intrinsic `%s` destination type %s does not match declared result %s"
-                        bb_ctx name (Seed_mir.print_type dty)
-                        (Seed_mir.print_type (registry_type_to_checker declared_ret))))
+             | Some dty -> bind sig_.Intrinsic_registry.ret dty
              | None -> ());
             ())
   | Extern i ->
+      (* re-audit P7: the extern call is checked against its declared
+         registry signature — arity, argument access effects, the
+         argument/destination types (registry-placeholder domain mapped
+         to the checker ids), exactly like the Intrinsic path.  The
+         seed's extern surface is the manifest closure's extern
+         declarations (std/ffi.tg etc.), transcribed into the registry;
+         a call to an unregistered index is an invariant break. *)
       if i < 0 then
         add_err ctx
           (Printf.sprintf "%s: negative extern callee index %d" bb_ctx i)
+      else begin
+        let sig_ =
+          Extern_registry.manifest.Extern_registry.by_name
+          |> List.find_map (fun (_name, (id, s)) ->
+                 if Extern_registry.Id.to_int id = i then Some s else None)
+        in
+        match sig_ with
+        | None ->
+            add_err ctx
+              (Printf.sprintf "%s: extern callee index %d is not registered in the extern registry" bb_ctx i)
+        | Some esig ->
+            if Array.length args <> Array.length esig.Intrinsic_registry.params then
+              add_err ctx
+                (Printf.sprintf "%s: extern call expects %d argument(s), got %d" bb_ctx
+                   (Array.length esig.Intrinsic_registry.params) (Array.length args));
+            Array.iteri
+              (fun k a ->
+                if k < Array.length esig.Intrinsic_registry.params then
+                  let declared =
+                    Access_effect.read_effect
+                      esig.Intrinsic_registry.params.(k).Type_repr.pt_convention
+                  in
+                  if a.Seed_mir.effect_ <> declared then
+                    add_err ctx
+                      (Printf.sprintf
+                         "%s: extern argument %d carries effect %s but the declaration requires %s"
+                         bb_ctx (k + 1) (Seed_mir.print_effect a.Seed_mir.effect_)
+                         (Seed_mir.print_effect declared));
+                  let declared_ty =
+                    esig.Intrinsic_registry.params.(k).Type_repr.pt_type
+                  in
+                  let actual_ty =
+                    match a.Seed_mir.value with
+                    | Seed_mir.Constant c -> Some (constant_type ctx c)
+                    | Seed_mir.Copy p | Seed_mir.Read p | Seed_mir.Move p
+                    | Seed_mir.Consume p -> place_type ctx fn p
+                  in
+                  (match actual_ty with
+                   | Some aty ->
+                       if not (intrinsic_type_compatible ctx declared_ty aty) then
+                         add_err ctx
+                           (Printf.sprintf
+                              "%s: extern argument %d type mismatch: expected %s got %s" bb_ctx
+                              (k + 1)
+                              (Seed_mir.print_type (registry_type_to_checker declared_ty))
+                              (Seed_mir.print_type aty))
+                   | None -> ()))
+              args;
+            (match place_type ctx fn dest with
+             | Some dty ->
+                 if not (intrinsic_type_compatible ctx esig.Intrinsic_registry.ret dty) then
+                   add_err ctx
+                     (Printf.sprintf
+                        "%s: extern destination type %s does not match declared result %s"
+                        bb_ctx (Seed_mir.print_type dty)
+                        (Seed_mir.print_type (registry_type_to_checker esig.Intrinsic_registry.ret)))
+             | None -> ())
+      end
+  | FnValue op -> (
+      (* re-audit P12: the closure-VALUE call — the callee operand must
+         evaluate to a function value: its type is a fn type, the
+         argument count matches the fn type's params, the args' effects
+         match the declared conventions (the fn type's params carry
+         them), and the destination equals the fn type's return. *)
+      match
+        check_operand ctx fn bb_ctx op running moved ~as_call_arg:false
+          ~init_place:false
+      with
+      | None -> ()
+      | Some oty -> (
+          match resolve_or_self ctx oty with
+          | Type_repr.Function (ptys, ret) -> (
+              if Array.length args <> Array.length ptys then
+                add_err ctx
+                  (Printf.sprintf
+                     "%s: fn-value call argument count mismatch: expected %d got %d" bb_ctx
+                     (Array.length ptys) (Array.length args));
+              Array.iteri
+                (fun i arg ->
+                  (match arg.effect_ with
+                   | Access_effect.Read -> ()
+                   | Access_effect.Modify | Access_effect.Initialize
+                   | Access_effect.Consume -> (
+                       match arg.value with
+                       | Constant _ ->
+                           add_err ctx
+                             (Printf.sprintf
+                                "%s: fn-value call arg %d has effect %s but is a constant (that effect requires a place operand)"
+                                bb_ctx i (Seed_mir.print_effect arg.effect_))
+                       | _ -> ()));
+                  if i < Array.length ptys then
+                    let expected =
+                      Access_effect.read_effect ptys.(i).Type_repr.pt_convention
+                    in
+                    if arg.effect_ <> expected then
+                      add_err ctx
+                        (Printf.sprintf
+                           "%s: fn-value call arg %d effect %s does not match the fn type's %s convention (expected %s)"
+                           bb_ctx i (Seed_mir.print_effect arg.effect_)
+                           (Access_effect.to_string ptys.(i).Type_repr.pt_convention)
+                           (Seed_mir.print_effect expected));
+                  match
+                    check_operand ctx fn bb_ctx arg.value running moved ~as_call_arg:true
+                      ~init_place:(arg.effect_ = Access_effect.Initialize)
+                  with
+                  | Some aty -> (
+                      if i < Array.length ptys
+                         && not
+                              (types_compatible ctx ptys.(i).Type_repr.pt_type aty)
+                      then
+                        add_err ctx
+                          (Printf.sprintf
+                             "%s: fn-value call arg %d type mismatch: expected %s got %s"
+                             bb_ctx i
+                             (Seed_mir.print_type ptys.(i).Type_repr.pt_type)
+                             (Seed_mir.print_type aty)))
+                  | None -> ())
+                args;
+              match place_type ctx fn dest with
+              | Some dty ->
+                  if not (types_compatible ctx dty ret) then
+                    add_err ctx
+                      (Printf.sprintf
+                         "%s: fn-value call destination type %s does not match the fn type's return %s"
+                         bb_ctx (Seed_mir.print_type dty)
+                         (Seed_mir.print_type ret))
+              | None -> ())
+          | _ ->
+              add_err ctx
+                (Printf.sprintf
+                   "%s: fn-value call: callee operand has non-function type %s" bb_ctx
+                   (Seed_mir.print_type oty))))
   | User inst -> (
       match resolve_callee ctx inst with
       | Callee_unknown ->
@@ -2037,6 +2263,7 @@ let check_embedded_types (ctx : ctx) (fn : function_) : unit =
        | Call (_, callee, args, _, _) -> (
            (match callee with
             | User inst -> Array.iter (check_what "call instance") (Instance_id.type_args inst)
+            | FnValue op -> check_operand op
             | Intrinsic _ | Extern _ -> ());
            Array.iter (fun arg -> check_operand arg.value) args)
        | SwitchInt (op, _, _) | Assert (op, _, _, _) -> check_operand op

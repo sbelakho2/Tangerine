@@ -1042,3 +1042,12 @@ let resolve_qualified (rp : resolved_program) (m : Ids.Module_id.t) (segs : stri
    E2001 finding.  In strict mode the recovery is disabled, so the count
    is always zero there. *)
 let flat_fallback_activations (rp : resolved_program) : int = rp.state.st_flat_fallback
+
+(* The size of the resolver's CallableId domain: the resolver mints ids
+   0 .. n-1 and every mint is recorded in st_callables, so the count is
+   exact.  The typechecker adopts these ids for methods via the identity
+   handoff, so ITS OWN minting must never enter this domain — otherwise
+   an adopted method id and a later checker mint of the same number put
+   two UNRELATED functions on one instance identity (the seed-MIR
+   duplicate-function-instance audit failure). *)
+let callable_count (rp : resolved_program) : int = List.length rp.state.st_callables

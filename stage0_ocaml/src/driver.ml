@@ -132,6 +132,15 @@ let lookup_typed_fn (env : Typecheck.env) (name : string) : Typecheck.typed_sign
       | [ (_, ts) ] -> Some ts
       | _ -> None)
 
+(* The module-qualified typed-fn lookup (re-audit P12): the closure's
+   duplicate bare names (`to_string` exists in core/csv/fmt) make the
+   bare suffix-ambiguous; the module path from the graph node disambiguates. *)
+let lookup_typed_fn_qualified (env : Typecheck.env) (module_path : string list)
+    (name : string) : Typecheck.typed_signature option =
+  match List.assoc_opt (String.concat "::" (module_path @ [ name ])) env.Typecheck.functions with
+  | Some ts -> Some ts
+  | None -> lookup_typed_fn env name
+
 (* ── Struct-field registry (re-audit finding: Field access reached MIR
       lowering without a typed place (FieldId) rule — the lowerer's only
       struct-field emission channel was the out-of-scope typed registry) ──
@@ -211,7 +220,14 @@ let const_values (env : Typecheck.env) (items : Ast.item list) :
               | Literal.U32 -> Type_repr.U32 | Literal.U64 -> Type_repr.U64
               | Literal.U128 -> Type_repr.U128
               | Literal.Int -> Type_repr.Int | Literal.UInt -> Type_repr.UInt
-              | Literal.No_int_suffix -> Type_repr.Int
+              | Literal.No_int_suffix -> (
+                  (* re-audit: an unsuffixed integer initializer adopts
+                     the DECLARED type's concrete kind (`mut x: u8 = 0`
+                     initializes with the U8 constant, not the Int 0 the
+                     verifier would reject) *)
+                  match ty with
+                  | Type_repr.Int k -> k
+                  | _ -> Type_repr.Int)
             in
             if Big_nat.fits_ocaml_int p.Literal.magnitude then
               Some
@@ -406,8 +422,35 @@ let closure_types (env : Typecheck.env) : Seed_mir.type_def array =
                          })))
        env.Typecheck.nominals)
 
-let struct_fields_of (env : Typecheck.env) :
-    (Ids.Type_id.t * (string * Ids.Field_id.t * Type_repr.t) list) list =
+let struct_fields_of ?(items : Ast.item list = []) (env : Typecheck.env) :
+    (Ids.Type_id.t * (string * Ids.Field_id.t * Type_repr.t * Ast.expr option) list) list =
+  (* re-audit P12: the struct-literal DEFAULTS — a field declared with
+     `= <expr>` (`place_move_states: Map[...] = Map::new()`) is
+     optional in literals; the literal lowering fills the missing
+     fields with the default expression.  The defaults come from the
+     closure's struct DECLARATIONS (the checker's nominal table carries
+     no defaults). *)
+  let defaults : (string * (string * Ast.expr) list) list =
+    List.filter_map
+      (fun (it : Ast.item) ->
+        match it.Ast.kind with
+        | Ast.StructDef d ->
+            Some
+              ( d.Ast.s_name,
+                List.filter_map
+                  (fun (fd : Ast.field_decl) ->
+                    match fd.Ast.f_default with
+                    | Some e -> Some (fd.Ast.f_name, e)
+                    | None -> None)
+                  d.Ast.s_fields )
+        | _ -> None)
+      items
+  in
+  let default_of (oname : string) (fname : string) : Ast.expr option =
+    match List.assoc_opt oname defaults with
+    | Some fs -> List.assoc_opt fname fs
+    | None -> None
+  in
   List.filter_map
     (fun (name, nom : string * Typecheck.nominal) ->
       match List.assoc_opt name env.Typecheck.type_ids with
@@ -421,7 +464,8 @@ let struct_fields_of (env : Typecheck.env) :
           Some
             ( tid,
               List.mapi
-                (fun i (fname, fty) -> (fname, List.nth fids i, fty))
+                (fun i (fname, fty) ->
+                  (fname, List.nth fids i, fty, default_of name fname))
                 nom.Typecheck.nom_fields ))
     env.Typecheck.nominals
 
@@ -435,13 +479,58 @@ let struct_fields_of (env : Typecheck.env) :
    syntax positionally; the call rule consumes the checker-RESOLVED
    callee + solved concrete substitution (tn_call). *)
 let typed_nodes_of (env : Typecheck.env) : (Ids.Node_id.t * Mir_lower.typed_node) list =
+  (* re-audit P12: the node types are substituted through the final
+     journal — a call's resolved type can carry an infer var that binds
+     LATER in the same item (`var v = Vec::new(); v.push(x)` — the
+     call node's Vec[?] only becomes Vec[T] after the push) *)
+  (* the final journal, INDEXED once (the list-assoc per var would be
+     quadratic over the closure's nodes); the bounded fixpoint resolves
+     var-to-var chains without iterating the whole journal *)
+  let jtbl : (Type_repr.generic_key, Type_repr.t) Hashtbl.t =
+    Hashtbl.create 65536
+  in
+  List.iter (fun (k, v) -> Hashtbl.replace jtbl k v) (Typecheck.final_journal ());
+  let rec sub1 (ty : Type_repr.t) : Type_repr.t =
+    match ty with
+    | Type_repr.Type_param id -> (
+        match Hashtbl.find_opt jtbl (Type_repr.KParam id) with
+        | Some s -> s
+        | None -> ty)
+    | Type_repr.Infer_var v -> (
+        match Hashtbl.find_opt jtbl (Type_repr.KVar v) with
+        | Some s -> s
+        | None -> ty)
+    | Type_repr.Raw_ptr (m, inner) -> Type_repr.Raw_ptr (m, sub1 inner)
+    | Type_repr.Ref_internal (m, inner) -> Type_repr.Ref_internal (m, sub1 inner)
+    | Type_repr.Tuple elems -> Type_repr.Tuple (Array.map sub1 elems)
+    | Type_repr.Fixed_array (inner, n) -> Type_repr.Fixed_array (sub1 inner, n)
+    | Type_repr.Named (id, args) -> Type_repr.Named (id, Array.map sub1 args)
+    | Type_repr.Function (params, ret) ->
+        Type_repr.Function
+          (Array.map (fun p -> { p with Type_repr.pt_type = sub1 p.Type_repr.pt_type }) params,
+           sub1 ret)
+    | Type_repr.Unit | Type_repr.Bool | Type_repr.Char | Type_repr.Int _
+    | Type_repr.Float _ | Type_repr.String | Type_repr.Int_literal _
+    | Type_repr.Error | Type_repr.Never ->
+        ty
+  in
+  let sub ty =
+    let rec go n ty =
+      let ty' = sub1 ty in
+      if Type_repr.compare ty ty' = 0 || n > 8 then ty' else go (n + 1) ty'
+    in
+    go 0 ty
+  in
   Hashtbl.fold
     (fun key (node : Typecheck.typed_node) acc ->
       ( key,
         {
-          Mir_lower.tn_type = node.Typecheck.tn_type;
-          tn_cast_target = node.Typecheck.tn_cast_target;
-          tn_call = node.Typecheck.tn_call;
+          Mir_lower.tn_type = sub node.Typecheck.tn_type;
+          tn_cast_target = Option.map sub node.Typecheck.tn_cast_target;
+          tn_call =
+            (match node.Typecheck.tn_call with
+             | Some (c, targs) -> Some (c, Array.map sub targs)
+             | None -> None);
         } )
       :: acc)
     env.Typecheck.typed_nodes []
@@ -451,17 +540,48 @@ let typed_nodes_of (env : Typecheck.env) : (Ids.Node_id.t * Mir_lower.typed_node
    The lowerer consumes the semantic identities (VariantId, binding
    names/types, constants, field names) instead of re-interpreting the
    syntactic Ast.pattern. *)
+let subst_pattern (tp : Typed_pattern.t) : Typed_pattern.t =
+  let subst = Typecheck.final_journal () in
+  let rec go (p : Typed_pattern.t) : Typed_pattern.t =
+    match p with
+    | Typed_pattern.TP_wildcard -> p
+    | Typed_pattern.TP_literal (c, ty) ->
+        Typed_pattern.TP_literal (c, Typecheck.substitute_fixpoint subst ty)
+    | Typed_pattern.TP_binding (n, ty, m) ->
+        Typed_pattern.TP_binding (n, Typecheck.substitute_fixpoint subst ty, m)
+    | Typed_pattern.TP_variant (vid, ty, pats) ->
+        Typed_pattern.TP_variant
+          (vid, Typecheck.substitute_fixpoint subst ty, List.map go pats)
+    | Typed_pattern.TP_struct (tid, ty, fields) ->
+        Typed_pattern.TP_struct
+          (tid, Typecheck.substitute_fixpoint subst ty,
+           List.map (fun (fn, fp) -> (fn, go fp)) fields)
+    | Typed_pattern.TP_tuple (ty, pats) ->
+        Typed_pattern.TP_tuple
+          (Typecheck.substitute_fixpoint subst ty, List.map go pats)
+    | Typed_pattern.TP_or (pats, names) ->
+        Typed_pattern.TP_or (List.map go pats, names)
+    | Typed_pattern.TP_range (ty, a, b, c) ->
+        Typed_pattern.TP_range (Typecheck.substitute_fixpoint subst ty, a, b, c)
+  in
+  go tp
+
 let typed_for_patterns_of (env : Typecheck.env) :
     (Ids.Node_id.t * Typecheck.typed_for) list =
-  Hashtbl.fold (fun k v acc -> (k, v) :: acc) env.Typecheck.typed_for_patterns []
+  Hashtbl.fold
+    (fun k v acc ->
+      (k, { v with Typecheck.tf_pattern = subst_pattern v.Typecheck.tf_pattern }) :: acc)
+    env.Typecheck.typed_for_patterns []
 
 let typed_let_patterns_of (env : Typecheck.env) :
     (Ids.Node_id.t * Typed_pattern.t) list =
-  Hashtbl.fold (fun k v acc -> (k, v) :: acc) env.Typecheck.typed_let_patterns []
+  Hashtbl.fold (fun k v acc -> (k, subst_pattern v) :: acc)
+    env.Typecheck.typed_let_patterns []
 
 let typed_patterns_of (env : Typecheck.env) :
     ((Ids.Node_id.t * int) * Typed_pattern.t) list =
-  Hashtbl.fold (fun key tp acc -> (key, tp) :: acc) env.Typecheck.typed_patterns []
+  Hashtbl.fold (fun key tp acc -> (key, subst_pattern tp) :: acc)
+    env.Typecheck.typed_patterns []
 
 let lowering_env_of ?(items : Ast.item list = []) (env : Typecheck.env) : Mir_lower.func_env =
   (* both the qualified key and the bare name resolve (flat namespace) *)
@@ -564,6 +684,10 @@ let lowering_env_of ?(items : Ast.item list = []) (env : Typecheck.env) : Mir_lo
               the call's result type *)
            me_params = ts.Typecheck.ts_params;
            me_ret = ts.Typecheck.ts_return;
+           me_has_self =
+             Array.length ts.Typecheck.ts_params > 0
+             && Array.length ts.Typecheck.ts_param_names > 0
+             && ts.Typecheck.ts_param_names.(0) = "self";
          }))
       env.Typecheck.methods
   in
@@ -603,7 +727,7 @@ let lowering_env_of ?(items : Ast.item list = []) (env : Typecheck.env) : Mir_lo
     callables;
     methods;
     fn_ret = Type_repr.Unit;
-    struct_fields = struct_fields_of env;
+    struct_fields = struct_fields_of ~items env;
   }
 
 (* ── User-enum variant table (re-audit finding: the closure driver never
@@ -784,7 +908,7 @@ let lower_and_report (path : string) (env : Typecheck.env) (program : Ast.progra
     List.mapi
       (fun i d ->
         let ts =
-          match lookup_typed_fn env d.Ast.fn_sig.Ast.sig_name with
+          match lookup_typed_fn_qualified env [] d.Ast.fn_sig.Ast.sig_name with
           | Some ts -> ts
           | None ->
               failwith
@@ -1713,9 +1837,12 @@ let run_closure_pipeline_impl ~(repo_root : string) ~(manifest_path : string)
              let oc = open_out path in
              List.iter
                (fun f ->
-                 Printf.fprintf oc "{\"kind\": \"%s\", \"message\": \"%s\"}\n"
+                 Printf.fprintf oc
+                   "{\"kind\": \"%s\", \"message\": \"%s\", \"span\": \"%d:%d:%d\"}\n"
                    (json_escape f.Typed_profile.f_kind)
-                   (json_escape f.Typed_profile.f_message))
+                   (json_escape f.Typed_profile.f_message)
+                   f.Typed_profile.f_span.Span.file_id f.Typed_profile.f_span.Span.start
+                   f.Typed_profile.f_span.Span.end_)
                profile_findings;
              close_out oc
          | None -> ());
@@ -1756,10 +1883,23 @@ let run_closure_pipeline ~(repo_root : string) ~(manifest_path : string)
    with their types; initializers arrive with the typed-expression
    channel (the subset firewall rejects const uses until then). *)
 let lower_closure (ctx : closure_ctx) : Seed_mir.program =
-  let base = lowering_env_of ctx.ctx_env in
+  let all_items =
+    List.concat_map (fun node -> node.Module_graph.node_items) ctx.ctx_graph.Module_graph.nodes
+  in
+  let base = lowering_env_of ~items:all_items ctx.ctx_env in
   let variants = user_variant_table ctx.ctx_env in
   let mir_funcs = ref [] in
   let lowered_methods = ref 0 in
+  (* TANGERINE_DEBUG_DUP: record every lowering with its provenance so the
+     structural gate's duplicate-instance audit can name the offenders *)
+  let dup_debug = Sys.getenv_opt "TANGERINE_DEBUG_DUP" <> None in
+  let lowered_src = ref [] in
+  let note (f : Seed_mir.function_) (loc : string) =
+    if dup_debug then
+      lowered_src :=
+        (Seed_mir.print_instance f.Seed_mir.instance, f.Seed_mir.name, loc)
+        :: !lowered_src
+  in
   List.iter
     (fun node ->
       let funcs =
@@ -1778,7 +1918,10 @@ let lower_closure (ctx : closure_ctx) : Seed_mir.program =
              identity is a hard invariant break, never a Unit/callable-0
              fallback *)
           let ts =
-            match lookup_typed_fn ctx.ctx_env fd.Ast.fn_sig.Ast.sig_name with
+            match
+              lookup_typed_fn_qualified ctx.ctx_env node.Module_graph.node_path
+                fd.Ast.fn_sig.Ast.sig_name
+            with
             | Some ts -> ts
             | None ->
                 failwith
@@ -1803,7 +1946,10 @@ let lower_closure (ctx : closure_ctx) : Seed_mir.program =
               ~param_tys_opt:(Array.map (fun p -> p.Type_repr.pt_type) ts.Typecheck.ts_params)
               fd
           in
-          mir_funcs := f :: !mir_funcs)
+          mir_funcs := f :: !mir_funcs;
+          note f
+            (Printf.sprintf "free fn in module %s"
+               (String.concat "::" node.Module_graph.node_path)))
         funcs;
       (* methods: every callable in the typed universe reaches Seed MIR —
          the impl methods lower with their typed signatures (the audit's
@@ -1837,7 +1983,14 @@ let lower_closure (ctx : closure_ctx) : Seed_mir.program =
                           m
                       in
                       mir_funcs := f :: !mir_funcs;
-                      incr lowered_methods
+                      incr lowered_methods;
+                      note f
+                        (Printf.sprintf "method %s on %s%s in module %s"
+                           m.Ast.fn_sig.Ast.sig_name d.Ast.i_target_type
+                           (match d.Ast.i_trait_name with
+                            | Some t -> Printf.sprintf " via trait %s" t
+                            | None -> "")
+                           (String.concat "::" node.Module_graph.node_path))
                   | None -> ())
                 d.Ast.i_methods)
           | _ -> ())
@@ -1870,14 +2023,70 @@ let lower_closure (ctx : closure_ctx) : Seed_mir.program =
           ~param_tys_opt:(Array.map (fun p -> p.Type_repr.pt_type) ts.Typecheck.ts_params)
           fd
       in
-      mir_funcs := f :: !mir_funcs)
+      mir_funcs := f :: !mir_funcs;
+      note f (Printf.sprintf "nested fn %s" qname))
     ctx.ctx_env.Typecheck.state.nested_functions;
   ctx.lowered_methods <- !lowered_methods;
-  let all_items =
-    List.concat_map (fun node -> node.Module_graph.node_items) ctx.ctx_graph.Module_graph.nodes
+  (* instance-uniqueness (the duplicate-function-instance audit): the
+     lowered function list must contain each instance identity AT MOST
+     once.  The same instance can legitimately be produced by several
+     AST sites — a source file that declares a function twice (the
+     kernel's duplicate-definition tolerance registers the name once),
+     an owner that is reached under two spellings the resolver aliases
+     (impl String vs impl str, or the builtin-type collapse where every
+     `impl Eq for <builtin>` shares one resolver CallableId), or an
+     impl method re-declared across two impl blocks of one type.  In
+     every such case the checker's typed universe already collapsed the
+     sites onto one identity, so the LOWERED program keeps the FIRST
+     lowering (monomorphization's find-template first-wins semantics)
+     and drops the later duplicates — never a second function on the
+     same instance. *)
+  let functions =
+    let seen = Hashtbl.create 4096 in
+    List.filter
+      (fun (f : Seed_mir.function_) ->
+        let key = Seed_mir.print_instance f.Seed_mir.instance in
+        if Hashtbl.mem seen key then false
+        else begin
+          Hashtbl.add seen key ();
+          true
+        end)
+      (List.rev !mir_funcs)
   in
+  if dup_debug then begin
+    let tbl = Hashtbl.create 256 in
+    List.iter
+      (fun (inst, name, loc) ->
+        let cur =
+          match Hashtbl.find_opt tbl inst with Some l -> l | None -> []
+        in
+        Hashtbl.replace tbl inst ((name, loc) :: cur))
+      !lowered_src;
+    let dups = ref 0 in
+    Hashtbl.iter
+      (fun inst entries ->
+        if List.length entries > 1 then begin
+          incr dups;
+          Printf.eprintf "DUP-INSTANCE %s (%d lowerings):\n" inst
+            (List.length entries);
+          List.iter
+            (fun (name, loc) -> Printf.eprintf "  fn %s  [%s]\n" name loc)
+            entries
+        end)
+      tbl;
+    Printf.eprintf "DUP-SUMMARY duplicate instances=%d lowered functions=%d\n"
+      !dups (List.length !lowered_src);
+    let seen = Hashtbl.create 256 in
+    List.iter
+      (fun ((owner, mname) as k, ts) ->
+        if Hashtbl.mem seen k then
+          Printf.eprintf "DUP-METHODS-KEY owner=%s method=%s callable#%d\n"
+            owner mname (Ids.Callable_id.to_int ts.Typecheck.ts_callable)
+        else Hashtbl.add seen k ())
+      ctx.ctx_env.Typecheck.methods
+  end;
   {
-    Seed_mir.functions = Array.of_list (List.rev !mir_funcs);
+    Seed_mir.functions = Array.of_list functions;
     statics = closure_statics ctx.ctx_env all_items;
     types = closure_types ctx.ctx_env;
   }
@@ -1960,6 +2169,7 @@ let count_mir_stats (prog : Seed_mir.program) : mir_stats =
                     incr calls;
                     instances := inst :: !instances;
                     if Ids.Callable_id.to_int (Instance_id.callable inst) = 0 then incr zeros
+                | Seed_mir.FnValue op -> scan_operand op
                 | _ -> ());
                Array.iter (fun a -> scan_operand a.Seed_mir.value) args
            | Seed_mir.SwitchInt (op, _, _) | Seed_mir.Assert (op, _, _, _) -> scan_operand op
@@ -2248,7 +2458,8 @@ let collect_reachable_host_ids (prog : Seed_mir.program) : Host.host_id list =
               match callee with
               | Seed_mir.Intrinsic i -> add (Host.Intrinsic (Intrinsic_registry.Id.make i))
               | Seed_mir.Extern i -> add (Host.Extern (Extern_registry.Id.make i))
-              | Seed_mir.User inst -> resolve_user inst)
+              | Seed_mir.User inst -> resolve_user inst
+              | Seed_mir.FnValue _ -> ())
           | _ -> ())
         f.Seed_mir.blocks)
     prog.Seed_mir.functions;
@@ -2382,6 +2593,7 @@ let rewrite_block map (locals : Type_repr.t array) (b : Seed_mir.block) : Seed_m
            let callee' =
              match callee with
              | Seed_mir.User inst -> Seed_mir.User (rewrite_instance map inst)
+             | Seed_mir.FnValue op -> Seed_mir.FnValue (rewrite_operand map op)
              | c -> c
            in
            Seed_mir.Call
@@ -2510,6 +2722,7 @@ let program_max_type_id ~(generic_types : Mono.generic_def array)
           | Seed_mir.Call (_, callee, args, _, _) ->
               (match callee with
                | Seed_mir.User inst -> Array.iter walk_ty (Instance_id.type_args inst)
+               | Seed_mir.FnValue op -> walk_operand op
                | _ -> ());
               Array.iter (fun a -> walk_operand a.Seed_mir.value) args
           | Seed_mir.SwitchInt (op, _, _) | Seed_mir.Assert (op, _, _, _) -> walk_operand op
@@ -3239,6 +3452,37 @@ let cmd_bootstrap_check (args : string list) : int =
           | Error errs ->
               Printf.printf "  SEED_MIR_STRUCTURAL_GATE = FAIL\n";
               List.iter (fun e -> Printf.printf "    %s\n" e) errs;
+              (if Sys.getenv_opt "TANGERINE_DEBUG_DUP" <> None then
+                 let tbl = Hashtbl.create 256 in
+                 Array.iter
+                   (fun (f : Seed_mir.function_) ->
+                     let k = Seed_mir.print_instance f.Seed_mir.instance in
+                     let cur =
+                       match Hashtbl.find_opt tbl k with
+                       | Some l -> l
+                       | None -> []
+                     in
+                     Hashtbl.replace tbl k (f.Seed_mir.name :: cur))
+                   prog.Seed_mir.functions;
+                 Hashtbl.iter
+                   (fun k names ->
+                     if List.length names > 1 then
+                       Printf.eprintf "GATE-DUP %s names=[%s]\n" k
+                         (String.concat " | " names))
+                   tbl);
+              (if Sys.getenv_opt "TANGERINE_DEBUG_GATE" <> None then
+                 Array.iter
+                   (fun (f : Seed_mir.function_) ->
+                     if f.Seed_mir.name = "record_block_exit_plan"
+                        || f.Seed_mir.name = "block_exit_key"
+                        || f.Seed_mir.name = "windows"
+                        || f.Seed_mir.name = "layout_new"
+                        || f.Seed_mir.name = "layout_array"
+                        || f.Seed_mir.name = "layout_from_size_align_unchecked"
+                     then
+                       Printf.printf "  --- fn %s ---\n%s\n" f.Seed_mir.name
+                         (Seed_mir.print_function f))
+                   prog.Seed_mir.functions);
               Printf.printf "EVIDENCE_MIR template_verify=fail concrete_verify=skipped\n";
               Printf.printf "EVIDENCE_HOST reachable_closure=skipped\n";
               Printf.printf "  RESULT = WIP\n";

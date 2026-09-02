@@ -70,9 +70,19 @@ and param = {
 
 and access_convention = LetAccess | InoutAccess | Sink | Set
 
-and type_param = { tp_name : string; tp_bounds : string list; tp_span : Span.span }
+and type_param = {
+  tp_name : string;
+  (* a bound carries its type ARGUMENTS (Iterator[T] -> "Iterator", [T])
+     — the trait contract's args are semantic, never dropped *)
+  tp_bounds : (string * type_expr list) list;
+  tp_span : Span.span;
+}
 
-and where_predicate = { wp_type : type_expr; wp_bounds : string list; wp_span : Span.span }
+and where_predicate = {
+  wp_type : type_expr;
+  wp_bounds : (string * type_expr list) list;
+  wp_span : Span.span;
+}
 
 and function_body = FnBlock of block_body | FnExpr of expr | FnSignatureOnly
 

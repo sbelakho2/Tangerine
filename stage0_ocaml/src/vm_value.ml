@@ -24,6 +24,11 @@ type t =
   | RawPtr of Vm_memory.pointer
   | Ref of ref_target
   | Null
+  | MovedOut
+  (* re-audit P12: the partial-move HOLE — the projected component of a
+     moved-out aggregate.  Reads of the hole trap (defense-in-depth —
+     the verifier's moved lattice already blocks the path), and the
+     drop glue skips it, so a moved-out field never double-drops. *)
 
 (* Reference targets (the audit's real-references rule):
    - `Place (frame, local, projections)` — a REAL reference: the target
@@ -246,9 +251,9 @@ let rec serialize_value (buf : Buffer.t) (v : t) : unit =
       Buffer.add_char buf (Char.chr 0x0D);
       put_u64 buf (Int64.of_int p.Vm_memory.region);
       put_u64 buf (Int64.of_int p.Vm_memory.offset)
-  | Ref (Place _) | Function _ | Closure _ | Null ->
+  | Ref (Place _) | Function _ | Closure _ | Null | MovedOut ->
       failwith
-        "vm serialization: value is not serializable (ref to a place / function / closure / null)"
+        "vm serialization: value is not serializable (ref to a place / function / closure / null / moved-out hole)"
 
 let serialize (v : t) : Bytes.t =
   let buf = Buffer.create 32 in
@@ -373,5 +378,5 @@ let rec drop_glue (m : Vm_memory.t) (v : t) : unit =
       | Ok () -> ()
       | Error e -> failwith ("vm drop glue: " ^ Vm_memory.mem_error_string e))
   | Unit | Bool _ | Int _ | Float32 _ | Float64 _ | Char _ | String _
-  | Function _ | Closure _ | RawPtr _ | Ref (Place _) | Null ->
+  | Function _ | Closure _ | RawPtr _ | Ref (Place _) | Null | MovedOut ->
       ()

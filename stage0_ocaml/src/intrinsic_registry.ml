@@ -221,7 +221,7 @@ let manifest : t =
         sig_conv
           ~params:
             [| (Access_effect.Inout, map_of (param Type_param.k) (param Type_param.v));
-               (Access_effect.Let, param Type_param.k);
+               (Access_effect.Sink, param Type_param.k);
                (Access_effect.Sink, param Type_param.v) |]
           ~ret:(option_of (param Type_param.v)) );
       ( "__intrinsic_map_contains_key",

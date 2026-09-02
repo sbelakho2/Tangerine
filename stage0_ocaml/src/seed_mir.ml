@@ -79,6 +79,8 @@ type constant =
   | Enum of Ids.Variant_index.t * Type_repr.t
   | Struct of Type_repr.t
   | Array of Type_repr.t
+  | Map of Type_repr.t
+  | Set of Type_repr.t
 
 (* Projections are SEMANTIC (re-audit finding: the seed's projections
    must carry the field/variant identity, not the declaration-order
@@ -127,6 +129,7 @@ type callee =
   | User of Instance_id.t
   | Intrinsic of int
   | Extern of int
+  | FnValue of operand
 
 (* NOTE: the audit contract spells the access-effect field `effect`; OCaml
    5.4 reserves `effect` as a keyword, so the field is spelled `effect_`. *)
@@ -327,6 +330,8 @@ let rec print_constant (c : constant) : string =
       Printf.sprintf "enum-ctor#%d %s" (Ids.Variant_index.to_int vi) (print_type ty)
   | Struct ty -> Printf.sprintf "struct {}: %s" (print_type ty)
   | Array ty -> Printf.sprintf "[]: %s" (print_type ty)
+  | Map ty -> Printf.sprintf "{}: %s" (print_type ty)
+  | Set ty -> Printf.sprintf "set{}: %s" (print_type ty)
 
 and print_instance (inst : Instance_id.t) : string =
   Printf.sprintf "inst{callable#%d; [%s]}"
@@ -370,6 +375,7 @@ let print_callee = function
   | User inst -> print_instance inst
   | Intrinsic i -> Printf.sprintf "intrinsic#%d" i
   | Extern i -> Printf.sprintf "extern#%d" i
+  | FnValue op -> Printf.sprintf "fn-value(%s)" (print_operand op)
 
 let print_rvalue (rv : rvalue) : string =
   match rv with

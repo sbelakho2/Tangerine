@@ -60,3 +60,9 @@ val resolve_qualified : resolved_program -> Ids.Module_id.t -> string list -> pa
    P0 #1): imports that resolved only through the flat/global unique-name
    recovery.  Zero = the closure is strict-clean (per-module authority). *)
 val flat_fallback_activations : resolved_program -> int
+
+(* The size of the resolver's CallableId domain (ids 0 .. n-1).  The
+   typechecker's own fresh callable mints must start at this count so an
+   adopted method id can never numerically collide with a later mint
+   (the duplicate-function-instance audit failure). *)
+val callable_count : resolved_program -> int

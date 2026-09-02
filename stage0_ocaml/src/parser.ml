@@ -423,10 +423,12 @@ and parse_function_name_and_type_params (p : parser) : string * Ast.type_param l
   (!name, tps)
 
 (* A bound name, optionally with type arguments (e.g. `Iterator[T]`). *)
-and parse_bound_name (p : parser) : string =
+and parse_bound_name (p : parser) : string * Ast.type_expr list =
   let name = expect_ident p in
-  if at p Token.LBracket || at p Token.Lt then ignore (parse_optional_type_args p);
-  name
+  let args =
+    if at p Token.LBracket || at p Token.Lt then parse_optional_type_args p else []
+  in
+  (name, args)
 
 and parse_optional_type_params (p : parser) : Ast.type_param list =
   if not (at p Token.LBracket) && not (at p Token.Lt) then []
@@ -566,9 +568,9 @@ and parse_optional_where_clause (p : parser) : Ast.where_predicate list =
       let start = cur_span p in
       let ty = parse_type p in
       if eat p Token.Colon then begin
-        let bounds = ref [ expect_ident p ] in
+        let bounds = ref [ parse_bound_name p ] in
         while eat p Token.Plus do
-          bounds := expect_ident p :: !bounds
+          bounds := parse_bound_name p :: !bounds
         done;
         preds :=
           { Ast.wp_type = ty; wp_bounds = List.rev !bounds; wp_span = span_end p start }

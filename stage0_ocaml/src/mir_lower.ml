@@ -100,6 +100,13 @@ type method_entry = {
   me_instance : Instance_id.t;
   me_params : Type_repr.param_type array;
   me_ret : Type_repr.t;
+  (* re-audit P12: the method DECLARES an explicit `self` parameter
+     (the checker's has_self — ts_param_names.(0) = "self").  The
+     qualified-call arity test uses THIS, never the first param's
+     TYPE: a static method whose first param happens to be owner-typed
+     (`Array::from(items: [T])` — the checker resolves `[T]` to the
+     Vec form) would otherwise be misread as a receiver. *)
+  me_has_self : bool;
 }
 
 type func_env = {
@@ -122,7 +129,8 @@ type func_env = {
      (the substitution's param list is derived from env.types' Named
      (tid, params) entries, which the driver keeps aligned with the
      nominals — the same scheme type_of_syntax uses). *)
-  struct_fields : (Ids.Type_id.t * (string * Ids.Field_id.t * Type_repr.t) list) list;
+  struct_fields :
+    (Ids.Type_id.t * (string * Ids.Field_id.t * Type_repr.t * Ast.expr option) list) list;
 }
 
 (* ── The persistent typed-node channel (re-audit: TypedProgram/TypedHIR
@@ -470,7 +478,9 @@ let constant_type_of (c : Seed_mir.constant) : Type_repr.t =
   (* the ctor constants carry the declared instantiated type (the
      driver records it); materializing one into a local keeps the
      constant's own type *)
-  | Seed_mir.Enum (_, ty) | Seed_mir.Struct ty | Seed_mir.Array ty -> ty
+  | Seed_mir.Enum (_, ty) | Seed_mir.Struct ty | Seed_mir.Array ty
+  | Seed_mir.Map ty | Seed_mir.Set ty ->
+      ty
 
 (* Turn an operand into a place (materializing constants into a local). *)
 let materialize_place (st : lower_state) (op : Seed_mir.operand) : Seed_mir.place =
@@ -842,7 +852,7 @@ let registry_field_of (env : func_env) (tid : Ids.Type_id.t) (fname : string) :
     (Ids.Field_id.t * Type_repr.t) option =
   let rec go = function
     | [] -> None
-    | (n, fid, fty) :: rest ->
+    | (n, fid, fty, _default) :: rest ->
         if n = fname then Some (fid, fty) else go rest
   in
   match List.assoc_opt tid env.struct_fields with
@@ -852,7 +862,81 @@ let registry_field_of (env : func_env) (tid : Ids.Type_id.t) (fname : string) :
 (* Resolve `fname` on `bty`: the projection chain to APPEND to the base
    place and the field's type (the nominal's params substituted with the
    base type's arguments).  Fails closed on every unresolvable case. *)
-let rec field_projection_of (env : func_env) (bty : Type_repr.t) (fname : string) :
+(* re-audit P12: the per-type DEFAULT VALUE operand — what the native
+   fills a literal-omitted field with (the recursive struct aggregate
+   covers `lang_items: LangItems` in the MirProgram literals) *)
+let rec default_operand_of (env : func_env) (st : lower_state)
+    (lit_name : string) (fname : string) (t : Type_repr.t) : Seed_mir.operand =
+  match t with
+  | Type_repr.Unit -> Seed_mir.Constant Seed_mir.Unit
+  | Type_repr.Bool -> Seed_mir.Constant (Seed_mir.Bool false)
+  | Type_repr.Char -> Seed_mir.Constant (Seed_mir.Char (Uchar.of_int 0))
+  | Type_repr.Int k -> Seed_mir.Constant (int_constant_of k 0L)
+  | Type_repr.Float Type_repr.F32 -> Seed_mir.Constant (Seed_mir.Float32 0l)
+  | Type_repr.Float Type_repr.F64 -> Seed_mir.Constant (Seed_mir.Float64 0L)
+  | Type_repr.String -> Seed_mir.Constant (Seed_mir.String "")
+  | Type_repr.Named (tid, args)
+    when Ids.Type_id.compare tid (Ids.Type_id.make 0) = 0 ->
+      Seed_mir.Constant (Seed_mir.Array (Type_repr.Named (tid, args)))
+  | Type_repr.Named (tid, args)
+    when Ids.Type_id.compare tid (Ids.Type_id.make 1) = 0 ->
+      Seed_mir.Constant (Seed_mir.Map (Type_repr.Named (tid, args)))
+  | Type_repr.Named (tid, args)
+    when Ids.Type_id.compare tid (Ids.Type_id.make 2) = 0 ->
+      Seed_mir.Constant (Seed_mir.Set (Type_repr.Named (tid, args)))
+  | Type_repr.Named (tid, args)
+    when Ids.Type_id.compare tid (Ids.Type_id.make 3) = 0 ->
+      Seed_mir.Constant (Seed_mir.Enum (Ids.Variant_index.make 0, Type_repr.Named (tid, args)))
+  | Type_repr.Fixed_array (e, n) ->
+      Seed_mir.Constant (Seed_mir.Array (Type_repr.Fixed_array (e, n)))
+  | Type_repr.Tuple elems ->
+      (* a tuple default: the per-component defaults aggregated *)
+      if
+        Array.for_all
+          (fun c ->
+            match c with
+            | Type_repr.Int _ | Type_repr.Bool | Type_repr.Char | Type_repr.Float _
+            | Type_repr.Unit ->
+                true
+            | _ -> false)
+          elems
+      then Seed_mir.Constant (Seed_mir.Struct (Type_repr.Tuple elems))
+      else
+        seed_bug
+          "struct literal `%s` is missing the field `%s`: no declared default and the type %s has no seed type-default"
+          lit_name fname (Seed_mir.print_type t)
+  | Type_repr.Named (tid, _args) -> (
+      (* a STRUCT-typed field: the all-defaulted aggregate (every field
+         defaulted recursively) *)
+      match List.assoc_opt tid env.struct_fields with
+      | Some reg when reg <> [] -> (
+          let ops =
+            List.mapi
+              (fun i (fn, _fid, _fty, _de) ->
+                match List.nth reg i with
+                | (_, _, _, Some de) -> fst (lower_expr env st de)
+                | (_, _, fty2, None) -> default_operand_of env st lit_name fn fty2)
+              reg
+          in
+          let id = fresh_local st t in
+          emit st
+            (Seed_mir.Assign
+               ( cur_place st id,
+                 Seed_mir.Aggregate
+                   ( Seed_mir.StructCtor
+                       (tid, Array.init (List.length reg) (fun i -> Ids.Field_index.make i)),
+                     ops ) ));
+          copy_place st (cur_place st id))
+      | _ ->
+          seed_bug
+            "struct literal `%s` is missing the field `%s`: no declared default and the type %s has no seed type-default"
+            lit_name fname (Seed_mir.print_type t))
+  | _ ->
+      seed_bug
+        "struct literal `%s` is missing the field `%s`: no declared default and the type %s has no seed type-default"
+        lit_name fname (Seed_mir.print_type t)
+
+and field_projection_of (env : func_env) (bty : Type_repr.t) (fname : string) :
     Seed_mir.projection list * Type_repr.t =
   match int_of_string_opt fname with
   | Some i when i >= 0 -> (
@@ -870,6 +954,15 @@ let rec field_projection_of (env : func_env) (bty : Type_repr.t) (fname : string
       match bty with
       | Type_repr.Named (tid, args) -> (
           let own = registry_field_of env tid fname in
+          (if Sys.getenv_opt "TANGERINE_DEBUG_FIELD" <> None
+              && (fname = "node_id" || fname = "kind")
+           then
+             Printf.eprintf "DBG-FIELD tid=%d fname=%s own=%b reg=%d fn=%s\n"
+               (Ids.Type_id.to_int tid) fname (own <> None)
+               (match List.assoc_opt tid env.struct_fields with
+                | Some r -> List.length r
+                | None -> -1)
+               (Seed_mir.print_type env.fn_ret));
           match transparent_nominal_name_of env tid with
           | Some name when own = None -> (
               (* the Box/Ptr/PtrMut deref-on-field transparency: the
@@ -924,8 +1017,8 @@ let rec field_projection_of (env : func_env) (bty : Type_repr.t) (fname : string
             fname
       | _ ->
           (if Sys.getenv_opt "TANGERINE_DEBUG_CALL" <> None then
-             Printf.eprintf "DEBUG-FIELDACCESS fname=%s base=%s\n" fname
-               (Seed_mir.print_type bty));
+             Printf.eprintf "DEBUG-FIELDACCESS fname=%s base=%s fn=%s\n" fname
+               (Seed_mir.print_type bty) (Seed_mir.print_type env.fn_ret));
           seed_bug "field access on non-struct type %s in lowering" (Seed_mir.print_type bty))
 
 (* ── Expression lowering ──────────────────────────────────────── *)
@@ -963,10 +1056,12 @@ and lower_argument (env : func_env) (st : lower_state) (conv : Access_effect.t)
       | Seed_mir.Copy p ->
           let value =
             if copyable_ty ty then Seed_mir.Copy p
-            else if p.Seed_mir.projections = [] then Seed_mir.Move p
-            else
-              seed_bug
-                "sink argument of a non-Copy owning type through a projected place is not supported by the seed VM (no partial-move representation)"
+            else Seed_mir.Move p
+            (* re-audit P12: a PROJECTED sink of a non-Copy owning
+               value lowers as the projected Move — the VM executes the
+               partial move (the component transfers, the MovedOut hole
+               stays behind; the drop glue skips it), and the
+               verifier's moved lattice tracks the moved path *)
           in
           { Seed_mir.effect_ = Access_effect.Consume; value }
       | _ -> { Seed_mir.effect_ = Access_effect.Consume; value = op })
@@ -976,7 +1071,7 @@ and lower_argument (env : func_env) (st : lower_state) (conv : Access_effect.t)
 and lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
     Seed_mir.operand * Type_repr.t =
   match e with
-  | Ast.IntLit (_, lit, _) -> (
+  | Ast.IntLit (nid, lit, _) -> (
       match Literal.parse_integer ~span:Span.synthetic lit with
       | Some p -> (
           let kind =
@@ -988,7 +1083,17 @@ and lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
             | Literal.U32 -> Type_repr.U32 | Literal.U64 -> Type_repr.U64
             | Literal.U128 -> Type_repr.U128
             | Literal.Int -> Type_repr.Int | Literal.UInt -> Type_repr.UInt
-            | Literal.No_int_suffix -> Type_repr.Int
+            | Literal.No_int_suffix -> (
+                (* re-audit: an unsuffixed integer literal in a context
+                   whose checker-resolved type is a concrete Int kind
+                   (`align == 0` where align: UInt) adopts that kind —
+                   the checker coerced the literal to the operand's type *)
+                match typed_node_of st nid with
+                | Some node -> (
+                    match node.tn_type with
+                    | Type_repr.Int k -> k
+                    | _ -> Type_repr.Int)
+                | None -> Type_repr.Int)
           in
           let magnitude = p.Literal.magnitude in
           if Big_nat.fits_ocaml_int magnitude then
@@ -1427,11 +1532,29 @@ and lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
            if Type_repr.compare subj_ty env.fn_ret = 0 then
              emit st
                (Seed_mir.Assign (cur_place st 0, Seed_mir.Use (Seed_mir.Move (cur_place st sid))))
-           else if not (copyable_ty e) then
-             seed_bug
-               "`?` Result failure reconstruction is not lowerable for a non-Copy error payload %s (the seed VM's Move ignores projections, so extracting Err's payload from the subject and rebuilding it cannot move the value; pass the value by place or make the payload Copy)"
-               (Seed_mir.print_type e)
-            else begin
+           else
+             (* re-audit P12: the SAME-ENUM-FAMILY rebrand — when the
+                subject and the enclosing return instantiate the SAME
+                enum (Result[Int, E] vs Result[String, E]), the failure
+                path's runtime value is ALREADY the identical Err(E):
+                the tag is 1 and the payload slot holds the E.  The
+                seed emits the whole-subject Move plus the enum-rebrand
+                Cast (the VM passes the value through; the verifier
+                accepts the same-tid enum cast) — NO projected payload
+                extraction, so non-Copy error payloads lower. *)
+             (match subj_ty, env.fn_ret with
+              | Type_repr.Named (sid1, _), Type_repr.Named (rid1, _)
+                when Ids.Type_id.compare sid1 rid1 = 0 ->
+                  emit st
+                    (Seed_mir.Assign
+                       ( cur_place st 0,
+                         Seed_mir.Cast (Seed_mir.Move (cur_place st sid), env.fn_ret) ))
+              | _ ->
+                  if not (copyable_ty e) then
+                    seed_bug
+                      "`?` Result failure reconstruction is not lowerable for a non-Copy error payload %s (the seed VM's Move ignores projections, so extracting Err's payload from the subject and rebuilding it cannot move the value; pass the value by place or make the payload Copy)"
+                      (Seed_mir.print_type e)
+                  else begin
               let eid = fresh_local st e in
               emit st
                 (Seed_mir.Assign
@@ -1450,7 +1573,7 @@ and lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
                            ( Seed_mir.EnumCtor (ret_tid, Ids.Variant_index.make 1),
                              [ Seed_mir.Copy (cur_place st eid) ] ) ))
               | _ -> seed_bug "`?` Result failure reconstruction: enclosing return is not a nominal")
-           end
+                  end)
        | true, None -> seed_bug "`?` Result subject without an error payload");
       set_terminator st Seed_mir.Ret;
       push_block st success;
@@ -1468,6 +1591,9 @@ and lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
           match p with
           | Typed_pattern.TP_wildcard -> []
           | Typed_pattern.TP_binding (n, ty, _) ->
+              (if Sys.getenv_opt "TANGERINE_DEBUG_PAT" <> None then
+                 Printf.eprintf "DEBUG-FORBIND bind=%s ty=%s\n" n
+                   (Seed_mir.print_type ty));
               [ (n, fresh_local st ty, List.rev path) ]
           | Typed_pattern.TP_tuple (_, pats) ->
               List.concat_map (fun (k, sub) -> go (k :: path) sub)
@@ -1627,6 +1753,10 @@ and lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
           (Seed_mir.Constant Seed_mir.Unit, Type_repr.Unit))
       | _ -> (
           let arr_op, arr_ty = lower_expr env st f.Ast.for_iterable in
+          (if Sys.getenv_opt "TANGERINE_DEBUG_FORLOW" <> None
+              && (match arr_ty with Type_repr.Infer_var _ -> true | _ -> false)
+           then
+             Printf.eprintf "DEBUG-FORLOW-VAR it=%s\n" (Seed_mir.print_type arr_ty));
           match arr_ty with
           | Type_repr.Fixed_array (elem_ty, _) ->
               let arr_id = materialize_place st arr_op in
@@ -1845,6 +1975,9 @@ and lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
               let bindings =
                 match typed_for_of st fid with
                 | Some tf ->
+                    (if Sys.getenv_opt "TANGERINE_DEBUG_FORLOW" <> None then
+                       Printf.eprintf "DEBUG-FORLOW arr_ty=%s elem=%s\n"
+                         (Seed_mir.print_type arr_ty) (Seed_mir.print_type elem_ty));
                     let tp = tf.Typecheck.tf_pattern in
                     List.map
                       (fun (n, id, path) ->
@@ -2005,7 +2138,7 @@ and lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
            let index_of fname =
              let rec go i = function
                | [] -> None
-               | (fn, _, _) :: rest -> if fn = fname then Some i else go (i + 1) rest
+               | (fn, _, _, _) :: rest -> if fn = fname then Some i else go (i + 1) rest
              in
              go 0 reg
            in
@@ -2017,13 +2150,13 @@ and lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
                  seed_bug "unknown field `%s` of struct `%s` in struct-literal lowering" fname
                    name)
              fields;
-           if List.length fields <> reg_len then
-             seed_bug
-               "struct literal `%s` initializes %d of %d field(s) (the seed StructCtor form needs every field; no defaulting or `..` spread is lowered)"
-               name (List.length fields) reg_len;
            (* the field VALUES lower in source order, each exactly once,
               and land at their DECLARATION positions (the typed
-              registry's order) *)
+              registry's order).  re-audit P12: a field the literal OMITS
+              is filled by its DECLARED DEFAULT (`place_move_states:
+              Map[...] = Map::new()`) — the native struct-defaulting the
+              kernel's TypeEnv literals rely on; a missing field with NO
+              declared default stays fail-closed. *)
            let placed = Array.make reg_len None in
            List.iter
              (fun (fname, fe) ->
@@ -2037,12 +2170,20 @@ and lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
              fields;
            let ops =
              Array.to_list placed
-             |> List.map (function
+             |> List.mapi (fun i op ->
+                  match op with
                   | Some op -> op
-                  | None ->
-                      seed_bug
-                         "struct literal `%s` is missing a field (internal: the count check should have failed closed)"
-                         name)
+                  | None -> (
+                      match List.nth reg i with
+                      | (_, _, _, Some de) -> fst (lower_expr env st de)
+                      | (fname, _, fty, None) ->
+                          (* re-audit P12: the TYPE default — the native
+                             fills a literal-omitted field with the
+                             field type's default value (empty
+                             containers, zero scalars, None, "", and
+                             STRUCT fields as the all-defaulted
+                             aggregate) *)
+                          default_operand_of env st name fname fty))
            in
            let id = fresh_local st rt in
            emit st
@@ -2495,22 +2636,28 @@ and lower_match_syntactic (env : func_env) (st : lower_state) (m : Ast.match_exp
                      | Some t -> t
                      | None -> seed_bug "variant `%s` payload pattern has more fields than the variant" seg2
                    in
-                   (if not (copyable_ty fty) && Sys.getenv_opt "TANGERINE_SEED_STRICT" <> None then
-                      seed_bug
-                        "non-Copy payload binding in a variant match arm is not supported by the seed VM (a projected Move is not executable; payload type %s)"
-                        (Seed_mir.print_type fty));
+                   (* re-audit P10: a non-Copy payload binding transfers
+                      the component via the seed's PARTIAL MOVE (the VM
+                      moves the projected component and leaves the
+                      MovedOut hole; the verifier's moved lattice tracks
+                      the path) — the SEED_STRICT escape hatch is
+                      retired *)
+                   let payload_op =
+                     if copyable_ty fty then
+                       Seed_mir.Copy
+                         { Seed_mir.root = Seed_mir.Local sid;
+                           projections =
+                             [ Seed_mir.Downcast (semantic_variant_id spec);
+                               Seed_mir.ConstantIndex j ] }
+                     else
+                       Seed_mir.Move
+                         { Seed_mir.root = Seed_mir.Local sid;
+                           projections =
+                             [ Seed_mir.Downcast (semantic_variant_id spec);
+                               Seed_mir.ConstantIndex j ] }
+                   in
                     let id = fresh_local st fty in
-                    emit st
-                      (Seed_mir.Assign
-                         ( cur_place st id,
-                           Seed_mir.Use
-                             (Seed_mir.Copy
-                                { Seed_mir.root = Seed_mir.Local sid;
-                                  projections =
-                                    [
-                                      Seed_mir.Downcast (semantic_variant_id spec);
-                                      Seed_mir.ConstantIndex j;
-                                    ] }) ));
+                    emit st (Seed_mir.Assign (cur_place st id, Seed_mir.Use payload_op));
                     st.scope <- (name, id) :: st.scope)
                | Ast.Wildcard _ -> ()
                | Ast.PatLiteral (Ast.CharLit (_, c, _), _) -> (
@@ -2792,23 +2939,28 @@ and lower_match_syntactic (env : func_env) (st : lower_state) (m : Ast.match_exp
                                    "variant `%s` payload pattern has more fields than the variant"
                                    seg2
                            in
-                           (if not (copyable_ty fty) && Sys.getenv_opt "TANGERINE_SEED_STRICT" <> None then
-                              seed_bug
-                                "non-Copy payload binding in a variant match arm is not supported by the seed VM (payload type %s)"
-                                (Seed_mir.print_type fty));
+                           let payload_op =
+                             if copyable_ty fty then
+                               Seed_mir.Copy
+                                 { Seed_mir.root = Seed_mir.Local sid;
+                                   projections =
+                                     [
+                                       Seed_mir.Downcast (semantic_variant_id spec);
+                                       Seed_mir.ConstantIndex j;
+                                       Seed_mir.ConstantIndex k;
+                                     ] }
+                             else
+                               Seed_mir.Move
+                                 { Seed_mir.root = Seed_mir.Local sid;
+                                   projections =
+                                     [
+                                       Seed_mir.Downcast (semantic_variant_id spec);
+                                       Seed_mir.ConstantIndex j;
+                                       Seed_mir.ConstantIndex k;
+                                     ] }
+                           in
                            let id = fresh_local st fty in
-                           emit st
-                             (Seed_mir.Assign
-                                ( cur_place st id,
-                                  Seed_mir.Use
-                                    (Seed_mir.Copy
-                                       { Seed_mir.root = Seed_mir.Local sid;
-                                         projections =
-                                           [
-                                             Seed_mir.Downcast (semantic_variant_id spec);
-                                             Seed_mir.ConstantIndex j;
-                                             Seed_mir.ConstantIndex k;
-                                           ] }) ));
+                           emit st (Seed_mir.Assign (cur_place st id, Seed_mir.Use payload_op));
                            st.scope <- (name, id) :: st.scope)
                        | Ast.Wildcard _ -> ()
                        | _ ->
@@ -3009,6 +3161,16 @@ and lower_match_syntactic (env : func_env) (st : lower_state) (m : Ast.match_exp
 
 and lower_match_typed (env : func_env) (st : lower_state) (nid : Ids.Node_id.t)
     (m : Ast.match_expr) : Seed_mir.operand * Type_repr.t =
+  (* re-audit P12: the match is a SCOPE — every arm's payload bindings
+     (bind_payloads / bind_struct_field / the or-plan interface) are
+     arm-local, exactly like the checker's per-arm add_binds.  The
+     lowering scope is saved here and restored before the match's
+     continuation: an arm binding that SHADOWS an enclosing name (the
+     types.tg check_expr's nested `Type::Adt(tid, args)` inside the
+     `ExprCall(func, args)` arm) must never leak — the later
+     `args[ai].node_id` would otherwise resolve to the inner
+     Vec[Type] payload instead of the outer Vec[Expr]. *)
+  let saved_scope = st.scope in
   let subj_op, subj_ty = lower_expr env st m.Ast.m_subject in
   let sid = fresh_local st subj_ty in
   let subj_use =
@@ -3144,19 +3306,16 @@ and lower_match_typed (env : func_env) (st : lower_state) (nid : Ids.Node_id.t)
     match fp with
     | Typed_pattern.TP_binding (name, _, _) -> (
         let projs, fty = field_projection_of env sty fname in
-        (if not (copyable_ty fty) && Sys.getenv_opt "TANGERINE_SEED_STRICT" <> None then
-           seed_bug
-             "non-Copy struct-pattern field binding is not supported by the seed VM (field type %s)"
-             (Seed_mir.print_type fty));
+        let field_place =
+          { base_p with Seed_mir.projections = base_p.Seed_mir.projections @ projs }
+        in
+        let field_op =
+          if copyable_ty fty then Seed_mir.Copy field_place else Seed_mir.Move field_place
+        in
         let id =
           match plan with Some p -> List.assoc name p | None -> fresh_local st fty
         in
-        emit st
-          (Seed_mir.Assign
-             ( cur_place st id,
-               Seed_mir.Use
-                 (Seed_mir.Copy
-                    { base_p with Seed_mir.projections = base_p.Seed_mir.projections @ projs }) ));
+        emit st (Seed_mir.Assign (cur_place st id, Seed_mir.Use field_op));
         (match plan with Some _ -> () | None -> st.scope <- (name, id) :: st.scope))
     | Typed_pattern.TP_wildcard -> ()
     | Typed_pattern.TP_literal (c, fty) -> (
@@ -3191,14 +3350,13 @@ and lower_match_typed (env : func_env) (st : lower_state) (nid : Ids.Node_id.t)
     match tp with
     | Typed_pattern.TP_wildcard -> ()
     | Typed_pattern.TP_binding (name, fty, _) -> (
-        (if not (copyable_ty fty) && Sys.getenv_opt "TANGERINE_SEED_STRICT" <> None then
-           seed_bug
-             "non-Copy payload binding in a variant match arm is not supported by the seed VM (a projected Move is not executable; payload type %s)"
-             (Seed_mir.print_type fty));
+        let payload_op =
+          if copyable_ty fty then Seed_mir.Copy proj else Seed_mir.Move proj
+        in
         let id =
           match plan with Some p -> List.assoc name p | None -> fresh_local st fty
         in
-        emit st (Seed_mir.Assign (cur_place st id, Seed_mir.Use (Seed_mir.Copy proj)));
+        emit st (Seed_mir.Assign (cur_place st id, Seed_mir.Use payload_op));
         (match plan with Some _ -> () | None -> st.scope <- (name, id) :: st.scope))
     | Typed_pattern.TP_literal (c, fty) -> (
         (* a literal payload `Some('#')` / `Some("ast")` / `Some(true)` /
@@ -3245,23 +3403,21 @@ and lower_match_typed (env : func_env) (st : lower_state) (nid : Ids.Node_id.t)
           (fun k ep ->
             match ep with
             | Typed_pattern.TP_binding (name, fty, _) -> (
-                (if not (copyable_ty fty) && Sys.getenv_opt "TANGERINE_SEED_STRICT" <> None then
-                   seed_bug
-                     "non-Copy payload binding in a variant match arm is not supported by the seed VM (payload type %s)"
-                     (Seed_mir.print_type fty));
+                let comp_place =
+                  { base with
+                    Seed_mir.projections =
+                      base.Seed_mir.projections
+                      @ [ Seed_mir.Downcast vid; Seed_mir.ConstantIndex j; Seed_mir.ConstantIndex k ]
+                  }
+                in
+                let comp_op =
+                  if copyable_ty fty then Seed_mir.Copy comp_place
+                  else Seed_mir.Move comp_place
+                in
                 let id =
                   match plan with Some p -> List.assoc name p | None -> fresh_local st fty
                 in
-                emit st
-                  (Seed_mir.Assign
-                     ( cur_place st id,
-                       Seed_mir.Use
-                         (Seed_mir.Copy
-                            { base with
-                              Seed_mir.projections =
-                                base.Seed_mir.projections
-                                @ [ Seed_mir.Downcast vid; Seed_mir.ConstantIndex j; Seed_mir.ConstantIndex k ]
-                            }) ));
+                emit st (Seed_mir.Assign (cur_place st id, Seed_mir.Use comp_op));
                 (match plan with Some _ -> () | None -> st.scope <- (name, id) :: st.scope))
             | Typed_pattern.TP_wildcard -> ()
             | _ -> seed_bug "unsupported nested variant payload pattern in lowering")
@@ -3481,9 +3637,13 @@ and lower_match_typed (env : func_env) (st : lower_state) (nid : Ids.Node_id.t)
   (* the join block stays open for the continuation: every arm body
      branches to it, and the match result flows out through it *)
   push_block st join_b;
-  match !result_ty with
-  | Some ty -> (copy_place st (cur_place st !result_id), ty)
-  | None -> (Seed_mir.Constant Seed_mir.Unit, Type_repr.Unit)
+  let result =
+    match !result_ty with
+    | Some ty -> (copy_place st (cur_place st !result_id), ty)
+    | None -> (Seed_mir.Constant Seed_mir.Unit, Type_repr.Unit)
+  in
+  st.scope <- saved_scope;
+  result
 
 and lower_while (env : func_env) (st : lower_state) (w : Ast.while_expr) :
     Seed_mir.operand * Type_repr.t =
@@ -3527,6 +3687,40 @@ and lower_loop (env : func_env) (st : lower_state) (nid : Ids.Node_id.t)
      — a return-only loop is Never, so the enclosing function tail
      skips the fallthrough return-slot assignment *)
   (Seed_mir.Constant Seed_mir.Unit, call_result_ty st nid Type_repr.Unit)
+
+(* re-audit P12: the closure-VALUE call channel.  A call whose callee
+   is a RUNTIME function value (a local/param of function type, or a
+   function-valued FIELD `(self.func)(v)`) has no resolved callable —
+   the callee is not a static function.  The seed lowers the fn value
+   as the FnValue callee operand and the VM dispatches it at runtime
+   (the fn-pointer call path).  The declared fn type's parameter
+   conventions drive the argument access effects, exactly like every
+   other call path (audit P2), and the result type is the typed
+   channel's resolved return. *)
+and fn_value_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
+    (fty : Type_repr.t) (fn_op : Seed_mir.operand) (args : Ast.call_arg list) :
+    Seed_mir.operand * Type_repr.t =
+  match fty with
+  | Type_repr.Function (ptys, ret) ->
+      let ty = call_result_ty st node_id ret in
+      let id = fresh_local st ty in
+      let rp = cur_place st id in
+      let arg_vals =
+        Array.of_list
+          (List.mapi
+             (fun i a ->
+               lower_argument env st
+                 (if i < Array.length ptys then ptys.(i).Type_repr.pt_convention
+                  else Access_effect.Let)
+                 a.Ast.ca_value)
+             args)
+      in
+      let next_b = new_block st in
+      set_terminator_to st
+        (Seed_mir.Call (rp, Seed_mir.FnValue fn_op, arg_vals, next_b, None))
+        next_b;
+      (copy_place st rp, ty)
+  | _ -> seed_bug "fn-value call with a non-function callee type %s" (Seed_mir.print_type fty)
 
 and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
     (callee : Ast.expr) (args : Ast.call_arg list) : Seed_mir.operand * Type_repr.t =
@@ -3672,6 +3866,17 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
                     in
                     (match find_method candidate_owners with
                      | Some me -> (
+                         (if Sys.getenv_opt "TANGERINE_DEBUG_QCALL" <> None
+                              && mname = "from"
+                          then
+                            Printf.eprintf
+                              "DBG-QCALL %s::%s nparams=%d self0=%s ret=%s cid=%d\n" qual
+                              mname (Array.length me.me_params)
+                              (if Array.length me.me_params > 0 then
+                                 Seed_mir.print_type me.me_params.(0).Type_repr.pt_type
+                               else "<none>")
+                              (Seed_mir.print_type me.me_ret)
+                              (Ids.Callable_id.to_int (Instance_id.callable me.me_instance)));
                          (* the intrinsic channel (audit §70): the
                             builtin collection methods (Set/Map
                             constructors + receiver methods) dispatch
@@ -3740,15 +3945,23 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
                             check_call); the lowerer mirrors that test to
                             decide whether the source args map to params
                             1.. or to params 0.. *)
+                         (* the checker's exact rule: the synthetic
+                            receiver prepends only when the first param is
+                            NAMED self AND its type IS the owner's own
+                            type (`String::from_str_view(self: StrView)`
+                            passes the view EXPLICITLY — no receiver) *)
                          let self_is_owner =
-                           nparams > 0
-                           && (match me.me_params.(0).Type_repr.pt_type with
-                              | Type_repr.Named (tid1, _) -> (
-                                  match List.assoc_opt qual env.types with
-                                  | Some (Type_repr.Named (tid2, _)) ->
-                                      Ids.Type_id.compare tid1 tid2 = 0
-                                  | _ -> false)
-                              | _ -> false)
+                           me.me_has_self
+                           && (match me.me_params with
+                              | [||] -> false
+                              | _ -> (
+                                  match me.me_params.(0).Type_repr.pt_type with
+                                  | Type_repr.Named (tid1, _) -> (
+                                      match List.assoc_opt qual env.types with
+                                      | Some (Type_repr.Named (tid2, _)) ->
+                                          Ids.Type_id.compare tid1 tid2 = 0
+                                      | _ -> false)
+                                  | _ -> false))
                          in
                          let expected =
                            if self_is_owner then nparams - 1 else nparams
@@ -3938,7 +4151,20 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
                              (copy_place st rp, ty)))
                 | _ -> seed_bug "unknown callee '%s' in lowering" n
               in
-              qualified_call ())))
+              (* re-audit P12: the closure-VALUE call — `f(x)` where
+                 `f` is a local/parameter of function type.  No resolved
+                 callable exists because the callee is a RUNTIME fn
+                 value, not a static function; the seed lowers the
+                 local's fn value as the FnValue callee operand and the
+                 VM dispatches it at runtime. *)
+              (match List.assoc_opt n st.scope with
+               | Some id -> (
+                   match local_type st id with
+                   | Some (Type_repr.Function _ as fty) ->
+                       fn_value_call env st node_id fty
+                         (Seed_mir.Copy (cur_place st id)) args
+                   | _ -> qualified_call ())
+               | None -> qualified_call ()))))
   | Ast.Field (nid, base, mname, span) -> (
       ignore span;
       (* re-audit: the method-call rule — the receiver is lowered to its
@@ -3956,6 +4182,49 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
       (if Sys.getenv_opt "TANGERINE_DEBUG_CALL" <> None && mname = "strong_count" then
          Printf.eprintf "DEBUG-FBASE mname=%s rty=%s\n" mname (Seed_mir.print_type rty));
       let rp = materialize_place st rop in
+      (* re-audit P12: the function-valued FIELD call `(self.func)(v)` —
+         when the receiver nominal declares `mname` as a FIELD of
+         function type, the call dispatches the field's runtime fn value
+         through the FnValue callee, NEVER a method instance.  A nominal
+         cannot declare a field and a method with the same name, so the
+         function-typed field wins when present; unknown fields keep the
+         method path's fail-closed reporting. *)
+      let fn_field_callee =
+        match rty with
+        | Type_repr.Named (tid, args) -> (
+            match registry_field_of env tid mname with
+            | Some (fid, fty) ->
+                let params = nominal_params_of env tid in
+                let fty' =
+                  if Array.length params = Array.length args then
+                    Type_repr.substitute
+                      (List.mapi
+                         (fun i p ->
+                           match p with
+                           | Type_repr.Type_param pid ->
+                               (Type_repr.KParam pid, args.(i))
+                           | _ ->
+                               (Type_repr.KParam (Ids.Generic_param_id.make 0),
+                                Type_repr.Unit))
+                         (Array.to_list params))
+                      fty
+                  else fty
+                in
+                (match fty' with
+                 | Type_repr.Function _ ->
+                     Some
+                       ( Seed_mir.Copy
+                           { rp with
+                             Seed_mir.projections =
+                               rp.Seed_mir.projections @ [ Seed_mir.Field fid ] },
+                         fty' )
+                 | _ -> None)
+            | None -> None)
+        | _ -> None
+      in
+      match fn_field_callee with
+      | Some (fn_op, fty) -> fn_value_call env st node_id fty fn_op args
+      | None -> (
       let owner =
         match rty with
         | Type_repr.Named (tid, _) -> (
@@ -3967,33 +4236,40 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
                   | _ -> None)
                 env.types
             with
-            | Some n -> n
+            | Some n -> [ n ]
             | None ->
                 seed_bug
                   "method call `%s`: the receiver's type#%d has no name in the lowering env's type table"
                   mname (Ids.Type_id.to_int tid))
-        | Type_repr.String -> "String"
-        | Type_repr.Int _ -> "Int"
-        | Type_repr.Float _ -> "Float"
-        | Type_repr.Bool -> "Bool"
-        | Type_repr.Char -> "Char"
-        | Type_repr.Type_param _ | Type_repr.Ref_internal (_, _) -> (
+        | Type_repr.String -> [ "String" ]
+        | Type_repr.Int _ -> [ "Int" ]
+        | Type_repr.Float _ -> [ "Float" ]
+        | Type_repr.Bool -> [ "Bool" ]
+        | Type_repr.Char -> [ "Char" ]
+        | Type_repr.Fixed_array _ -> [ "Array" ]
+        | Type_repr.Type_param _ | Type_repr.Infer_var _ | Type_repr.Ref_internal (_, _) -> (
             (* a generic-parameter / reference receiver: the only methods
                the seed can resolve through the parameter are the
                trait-contract methods of its bounds (the checker's
                base_owners for a param is its bound trait list).  The
-               seed's func_env carries no per-param bound registry; the
-               ONE bound method the bootstrap subset actually exercises
-               on a generic/reference receiver is the derived `clone`
-               (the iterator advance bodies and the map/set
-               entries_cloned bodies clone the element out of the
-               snapshot), which resolves through the Clone trait
-               contract — the reference form derefs to the pointee's
-               clone. *)
+               seed's func_env carries no per-param bound registry, so
+               the contract methods resolve through a per-name CANDIDATE
+               trait list (the checker's authority is the actual bound;
+               the candidates cover the traits the kernel's bounds use —
+               `impl Validator[...]` receivers spell `validate`, the
+               Validate-trait spell is the same name in a module outside
+               the closure).  Each candidate owner is tried at the
+               methods lookup below. *)
             match mname with
-            | "clone" -> "Clone"
-            | "advance" -> "Iterator"
-            | "into_iter" -> "IntoIterator"
+            | "clone" -> [ "Clone" ]
+            | "advance" -> [ "Iterator" ]
+            | "into_iter" -> [ "IntoIterator" ]
+            | "to_string" -> [ "Display"; "ToString" ]
+            | "fmt" -> [ "Display" ]
+            | "read" -> [ "Read" ]
+            | "write" -> [ "Write" ]
+            | "flush" -> [ "Write" ]
+            | "validate" -> [ "Validator"; "Validate" ]
             | _ ->
                 (if Sys.getenv_opt "TANGERINE_DEBUG_CALL" <> None then
                    Printf.eprintf "DEBUG-MRECV2 mname=%s rty=%s env=%s\n" mname
@@ -4010,17 +4286,45 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
       (* the kernel's owner aliases (the checker's try_aliases): a `str`
          receiver spells String-owner methods and vice versa; the
          Vec/Array aliasing covers the collections constructors *)
+      (* the kernel's owner aliases (the checker's try_aliases) as a
+         CANDIDATE search: the Vec nominal is named "Array"/"Vec"/"List"
+         in the checker's tables (the first name for the tid wins the
+         find_map), and the builtin methods register under all three —
+         but the extra sigs (as_ptr_address etc.) only under "Vec".  A
+         receiver that resolves to ANY alias spelling must reach the
+         owner where the method is actually registered. *)
       let owner =
-        match List.assoc_opt (owner, mname) env.methods with
-        | Some _ -> owner
+        (* each candidate owner expands to EVERY name the receiver's
+           nominal carries in the checker's tables (typealiases like
+           `typealias Duration = Timespec`, and the Vec/Array/List
+           alias spellings all share one tid) — the method lookup then
+           reaches the owner where the method is actually registered *)
+        let expand o =
+          match List.assoc_opt o env.types with
+          | Some (Type_repr.Named (tid, _)) ->
+              List.filter_map
+                (fun (n, r) ->
+                  match r with
+                  | Type_repr.Named (t2, _)
+                    when Ids.Type_id.compare t2 tid = 0 ->
+                      Some n
+                  | _ -> None)
+                env.types
+          | _ -> (
+              match o with
+              | "str" -> [ "String"; "str" ]
+              | "String" -> [ "str"; "String" ]
+              | o -> [ o ])
+        in
+        let candidates = List.concat_map expand owner in
+        match
+          List.find_map
+            (fun o -> if List.mem_assoc (o, mname) env.methods then Some o else None)
+            candidates
+        with
+        | Some o -> o
         | None -> (
-            match owner with
-            | "str" -> "String"
-            | "String" -> "str"
-            | "Vec" -> "Array"
-            | "Array" -> "Vec"
-            | "List" -> "Array"
-            | _ -> owner)
+            match owner with o :: _ -> o | [] -> "?")
       in
       (match List.assoc_opt (owner, mname) env.methods with
        | None ->
@@ -4046,6 +4350,7 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
                        { Type_repr.pt_convention = Access_effect.Let; pt_type = rty };
                      |];
                    me_ret = ret;
+                   me_has_self = true;
                  }
                in
                if Array.length me.me_params = 0 then
@@ -4340,7 +4645,7 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
                set_terminator_to st
                  (Seed_mir.Call (rp2, Seed_mir.User instance, arg_vals, next_b, None))
                  next_b;
-               (copy_place st rp2, recv_dest_ty)))))
+               (copy_place st rp2, recv_dest_ty))))))
   | _ -> seed_bug "unsupported callee form in lowering"
 
 and emit_defers (env : func_env) (st : lower_state) : unit =

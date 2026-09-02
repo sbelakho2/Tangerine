@@ -104,14 +104,33 @@ let check (env : Typecheck.env) (items : Ast.item list) : finding list =
           | Some tn -> tn.Typecheck.tn_call <> None
           | None -> false
         in
-        if resolved then ()
+        (* re-audit P12: an unresolved callee is only a finding when its
+           TYPE is not a function type.  A callee of function type
+           (a fn-typed local/param, or a function-valued field) is a
+           RUNTIME fn value: the seed lowers it through the FnValue
+           callee channel (mir_lower's fn_value_call) and the VM
+           dispatches it — the closure-call profile claims support for
+           exactly that surface.  A NON-function-typed unresolved
+           callee stays a finding: the seed cannot lower it. *)
+        let callee_fn_ty =
+          match callee with
+          | Ast.Field (cnid, _, _, _) | Ast.Name (cnid, _, _) | Ast.Path (cnid, _, _, _) -> (
+              match Hashtbl.find_opt env.Typecheck.typed_nodes cnid with
+              | Some tn -> (
+                  match tn.Typecheck.tn_type with
+                  | Type_repr.Function _ -> true
+                  | _ -> false)
+              | None -> false)
+          | _ -> false
+        in
+        if resolved || callee_fn_ty then ()
         else
           match callee with
           | Ast.Field (_, _, _, _) ->
               findings :=
                 { f_kind = "closure-call";
                   f_span = span;
-                  f_message = "call through a function-valued field with no resolved callable (a closure value call is not lowered by the seed)" }
+                  f_message = "call through a non-function-typed field with no resolved callable (the seed can only lower calls through fn-typed values)" }
                 :: !findings
           | _ -> (
           match callee with
@@ -136,7 +155,7 @@ let check (env : Typecheck.env) (items : Ast.item list) : finding list =
                 findings :=
                   { f_kind = "closure-call";
                     f_span = span;
-                    f_message = "call to an unregistered callable `" ^ n ^ "` (a closure value call is not lowered by the seed)" }
+                    f_message = "call to an unregistered callable `" ^ n ^ "` (a closure value call through a non-function-typed callee is not lowered by the seed)" }
                   :: !findings)
           | _ -> ());
         check_expr callee;

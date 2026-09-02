@@ -309,6 +309,7 @@ let walk_instances (body : function_) (f : Instance_id.t -> unit) : unit =
       | Call (_, callee, args, _, _) -> (
           (match callee with
            | User i -> f i
+           | FnValue op -> scan_operand op
            | Intrinsic _ | Extern _ -> ());
           Array.iter (fun a -> scan_operand a.value) args)
       | SwitchInt (op, _, _) | Assert (op, _, _, _) -> scan_operand op
@@ -422,6 +423,7 @@ let build ~(entry : Instance_id.t) ?(generic_types : generic_def array = [||])
           | Call (_, callee, args, _, _) ->
               (match callee with
                | User i -> scan_inst i
+               | FnValue op -> scan_operand op
                | Intrinsic _ | Extern _ -> ());
               Array.iter (fun a -> scan_operand a.value) args
           | SwitchInt (op, _, _) | Assert (op, _, _, _) -> scan_operand op

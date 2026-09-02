@@ -2411,11 +2411,12 @@ end
           !projected_transfers !whole_root_moves;
         exit 1
       end;
-      (* (2) fail-closed: a match arm that must BIND A NON-COPY PAYLOAD
-         would require a projected move (the payload lives inside the
-         subject's variant), which the seed cannot execute — the
-         lowerer must fail closed with the precise Seed_bug, never emit
-         the projected move *)
+      (* (2) re-audit P10: a match arm that binds a NON-COPY PAYLOAD
+         now lowers through the seed's PARTIAL move — the payload
+         component transfers with the projected Move (the VM leaves the
+         MovedOut hole; the drop glue skips it; the verifier's moved
+         lattice tracks the path).  The lowering must SUCCEED and the
+         binding must be a PROJECTED Move, never a fail-closed bug. *)
       let ncp_src = {|
 def f(o: Option[String]) -> Int
   match o {
@@ -2468,37 +2469,34 @@ end
                     | Ast.Function d -> d
                     | _ -> failwith "non-copy-payload: f is not a function"
                   in
-                  (try
-                     ignore
-                       (Mir_lower.lower_function_with_variants variant_table
-                          { env2 with Mir_lower.fn_ret = nts.Typecheck.ts_return }
-                          "f" (Ids.Callable_id.to_int nts.Typecheck.ts_callable) [||] [||] nfd);
-                     Printf.printf
-                       "  non-Copy payload binding: FAIL (lowering succeeded — a projected move would have been emitted)\n";
-                     exit 1
-                   with
-                   | Mir_lower.Seed_bug m ->
-                       let contains_sub s sub =
-                         let ls = String.length s and l = String.length sub in
-                         if l = 0 then true
-                         else begin
-                           let found = ref false in
-                           (try
-                              for i = 0 to ls - l do
-                                if not !found && String.sub s i l = sub then found := true
-                              done
-                            with Invalid_argument _ -> ());
-                           !found
-                         end
-                       in
-                       if contains_sub m "non-Copy payload binding in a variant match arm" then
-                         Printf.printf
-                           "  non-Copy payload binding: PASS (lowering fails closed on a String payload binding: %s)\n"
-                           m
-                       else begin
-                         Printf.printf "  non-Copy payload binding: FAIL (wrong Seed_bug: %s)\n" m;
-                         exit 1
-                       end)
+                  let nf_mir =
+                    Mir_lower.lower_function_with_variants variant_table
+                      { env2 with Mir_lower.fn_ret = nts.Typecheck.ts_return }
+                      "f" (Ids.Callable_id.to_int nts.Typecheck.ts_callable) [||] [||] nfd
+                  in
+                  (* the Some(s) arm's payload binding must be a
+                     PROJECTED Move of the Downcast+index path *)
+                  let projected_binds = ref 0 in
+                  Array.iter
+                    (fun (b : Seed_mir.block) ->
+                      List.iter
+                        (fun (s : Seed_mir.statement) ->
+                          match s with
+                          | Seed_mir.Assign (_, Seed_mir.Use (Seed_mir.Move p)) ->
+                              if p.Seed_mir.projections <> [] then incr projected_binds
+                          | _ -> ())
+                        b.Seed_mir.statements)
+                    nf_mir.Seed_mir.blocks;
+                  if !projected_binds > 0 then
+                    Printf.printf
+                      "  non-Copy payload binding: PASS (the String payload binding lowered as %d projected Move(s) — the seed partial-move representation)\n"
+                      !projected_binds
+                  else begin
+                    Printf.printf
+                      "  non-Copy payload binding: FAIL (no projected Move in the lowered Some(s) arm)\n";
+                    Printf.printf "%s\n" (Seed_mir.print_function nf_mir);
+                    exit 1
+                  end
                 end));
       (* template-instance proof: a generic def f[T,U] must get a
          template Instance_id carrying [Type_param T; Type_param U] in
@@ -3145,7 +3143,7 @@ end
       if List.length pair_fids <> 2 then
         failwith ("struct-field proof: Pair has " ^ string_of_int (List.length pair_fids) ^ " FieldIds");
       let fid_a = List.nth pair_fids 0 and fid_b = List.nth pair_fids 1 in
-      let pair_fields = [ ("a", fid_a, int_ty); ("b", fid_b, int_ty) ] in
+      let pair_fields = [ ("a", fid_a, int_ty, None); ("b", fid_b, int_ty, None) ] in
       let driver_pair_fields = List.assoc pair_tid (Driver.struct_fields_of fenv) in
       if driver_pair_fields <> pair_fields then begin
         Printf.printf
@@ -3302,7 +3300,7 @@ end
         | Some sd_fields ->
             List.length sd_fields = 2
             && List.for_all
-                 (fun (fname, fid, _ : string * Ids.Field_id.t * Type_repr.t) ->
+                 (fun (fname, fid, _, _ : string * Ids.Field_id.t * Type_repr.t * Ast.expr option) ->
                    List.exists
                      (fun (fd : Seed_mir.field_def) ->
                        Ids.Field_id.compare fd.Seed_mir.fd_id fid = 0
@@ -4297,14 +4295,14 @@ end
        let l_tid = List.assoc "Pair" lenv.Typecheck.type_ids in
        let l_reg = List.assoc l_tid (Driver.struct_fields_of lenv) in
        let l_fid name =
-         match List.find_opt (fun (n, _, _) -> n = name) l_reg with
-         | Some (_, fid, _) -> fid
+         match List.find_opt (fun (n, _, _, _) -> n = name) l_reg with
+         | Some (_, fid, _, _) -> fid
          | None -> failwith ("struct-lit proof: no registry FieldId for " ^ name)
        in
        let l_pos name =
          let rec go i = function
            | [] -> failwith ("struct-lit proof: field " ^ name ^ " not in the registry")
-           | (n, _, _) :: rest -> if n = name then i else go (i + 1) rest
+           | (n, _, _, _) :: rest -> if n = name then i else go (i + 1) rest
          in
          go 0 l_reg
        in
@@ -4438,7 +4436,7 @@ end
               Printf.printf
                 "  struct-lit lowering: FAIL (index_ok=%b pos_ok=%b; registry order: %s)\n"
                 index_ok pos_ok
-                (String.concat ", " (List.map (fun (n, _, _) -> n) l_reg));
+                (String.concat ", " (List.map (fun (n, _, _, _) -> n) l_reg));
               exit 1
             end
         | None ->
@@ -4457,7 +4455,7 @@ end
                    sd_id = l_tid;
                    sd_fields =
                      List.mapi
-                       (fun i (_, fid, fty) ->
+                       (fun i (_, fid, fty, _) ->
                          {
                            Seed_mir.fd_id = fid;
                            fd_index = Ids.Field_index.make i;
@@ -4508,6 +4506,123 @@ end
                  | Error m -> Printf.printf "  struct-lit main returned: <inspect failed: %s>\n" m)));
        ignore l_fid_a;
        ignore l_fid_b;
+       (* ── partial-move proof (re-audit P12/P10/P5): a SINK argument
+          through a projected place of a non-Copy owning type lowers as
+          the projected Move — the VM executes the partial move (the
+          component transfers, the MovedOut hole stays behind, the drop
+          glue skips it) and the verifier's moved lattice tracks the
+          moved path, so a SECOND consume of the same path is a
+          use-after-move while the OTHER fields stay readable. *)
+       let pm_src = {|
+struct Holder
+  a: String
+  b: String
+end
+
+def take(s: String) -> Int
+  s.len()
+end
+
+def main() -> Int
+  let h = Holder { a: "hello", b: "world" }
+  take(h.a) + take(h.b)
+end
+|} in
+       let pm_file = Filename.temp_file "tg_lowersurface_partialmove" ".tg" in
+       (let oc = open_out_bin pm_file in
+        output_string oc pm_src;
+        close_out oc);
+       let pm_manifest =
+         match Bootstrap_manifest.single ~file:pm_file ~path:[ "pmproof" ] () with
+         | Ok m -> m
+         | Error e -> failwith ("partial-move proof manifest: " ^ e)
+       in
+       let pmdiags = Diagnostic.create_bag () in
+       let pmgraph = Module_graph.create_with_sources pm_manifest pmdiags in
+       let pmresolved = Resolver.resolve pm_manifest pmgraph pmdiags in
+       let pprog_ast = (List.hd pmgraph.Module_graph.nodes).Module_graph.node_program in
+       let rec pmfix env n =
+         match Typecheck.check_program env pprog_ast with
+         | Error m -> failwith ("partial-move proof typecheck: " ^ m)
+         | Ok (env', errors) ->
+             if errors <> [] then
+               failwith ("partial-move proof typecheck errors: " ^ String.concat "; " errors)
+             else if n = 0 then env'
+             else pmfix env' (n - 1)
+       in
+       let penv = pmfix (Typecheck.initial_env ~resolved:(Some pmresolved) ()) 8 in
+       let pbase = Driver.lowering_env_of ~items:pprog_ast.Ast.items penv in
+       let pvariants = Driver.user_variant_table penv in
+       let ptyped_nodes = Driver.typed_nodes_of penv in
+       let ptyped_patterns = Driver.typed_patterns_of penv in
+       let ptyped_for = Driver.typed_for_patterns_of penv in
+       let ptyped_let = Driver.typed_let_patterns_of penv in
+       let pmir_funcs =
+         List.filter_map
+           (fun i -> match i.Ast.kind with Ast.Function fd -> Some fd | _ -> None)
+           pprog_ast.Ast.items
+         |> List.map (fun fd ->
+                match Driver.lookup_typed_fn_qualified penv [] fd.Ast.fn_sig.Ast.sig_name with
+                | None -> failwith ("partial-move proof: no typed sig for " ^ fd.Ast.fn_sig.Ast.sig_name)
+                | Some ts ->
+                    Mir_lower.lower_function_with_variants
+                      ~typed_nodes:ptyped_nodes ~typed_patterns:ptyped_patterns
+                      ~typed_for_patterns:ptyped_for ~typed_let_patterns:ptyped_let
+                      pvariants { pbase with Mir_lower.fn_ret = ts.Typecheck.ts_return }
+                      fd.Ast.fn_sig.Ast.sig_name
+                      (Ids.Callable_id.to_int ts.Typecheck.ts_callable)
+                      (Array.of_list
+                         (List.map (fun (_, pid) -> Type_repr.Type_param pid)
+                            ts.Typecheck.ts_params_decl))
+                      (Array.map (fun p -> p.Type_repr.pt_convention) ts.Typecheck.ts_params)
+                      ~param_tys_opt:(Array.map (fun p -> p.Type_repr.pt_type) ts.Typecheck.ts_params)
+                      fd)
+       in
+       let pprog : Seed_mir.program =
+         {
+           Seed_mir.functions = Array.of_list pmir_funcs;
+           statics = [||];
+           types = Driver.closure_types penv;
+         }
+       in
+       (match Mir_verify.require_valid_concrete pprog with
+        | Ok () ->
+            Printf.printf
+              "  partial-move MIR verify: PASS (the projected sink moves lower and the moved lattice accepts the disjoint second consume)\n"
+        | Error errs ->
+            Printf.printf "  partial-move MIR verify: FAIL\n";
+            List.iter (fun e -> Printf.printf "    %s\n" e) errs;
+            Printf.printf "%s\n" (Seed_mir.print_program pprog);
+            exit 1);
+       let pentry =
+         match
+           Array.to_list pprog.Seed_mir.functions
+           |> List.find_opt (fun f -> f.Seed_mir.name = "main")
+         with
+         | Some f -> f.Seed_mir.instance
+         | None -> failwith "partial-move proof: no main function"
+       in
+       let phost = Host.create ~repo_root:"." ~argv:[||] in
+       (match Vm.run ~program:pprog ~entry:pentry ~argv:[||] ~host:phost with
+        | Error e ->
+            Printf.printf "  partial-move VM: FAIL %s\n" e.Vm.message;
+            exit 1
+        | Ok _code -> (
+            match Vm.entry_frame_of ~program:pprog ~entry:pentry ~argv:[||] with
+            | Error m -> Printf.printf "  partial-move main returned: <inspect failed: %s>\n" m
+            | Ok (pvm, pentry_frame) -> (
+                match Vm.run_inspect pvm pentry_frame with
+                | Ok ret_val ->
+                    Printf.printf "  partial-move main returned: %s\n" ret_val;
+                    if ret_val = "10" then
+                      Printf.printf
+                        "  partial-move RESULT: PASS (the two projected field moves transferred independently; 5 + 5 round-tripped)\n"
+                    else begin
+                      Printf.printf "  partial-move RESULT: FAIL (expected 10)\n";
+                      exit 1
+                    end
+                | Error m -> Printf.printf "  partial-move main returned: <inspect failed: %s>\n" m)));
+       Sys.remove pm_file;
        (* ── method-call lowering proof (re-audit's ordinary-surface item:
           `obj.method(args)` must lower with the receiver's typed PLACE as
           the SELF argument (the read-side of the self parameter's
@@ -4568,8 +4683,8 @@ end
        let m_tid = List.assoc "Pair" menv.Typecheck.type_ids in
        let m_reg = List.assoc m_tid (Driver.struct_fields_of menv) in
        let m_fid name =
-         match List.find_opt (fun (n, _, _) -> n = name) m_reg with
-         | Some (_, fid, _) -> fid
+         match List.find_opt (fun (n, _, _, _) -> n = name) m_reg with
+         | Some (_, fid, _, _) -> fid
          | None -> failwith ("method-call proof: no registry FieldId for " ^ name)
        in
        let m_fid_a = m_fid "a" and m_fid_b = m_fid "b" in
@@ -4657,6 +4772,10 @@ end
                                m_mts.Typecheck.ts_params_decl));
                    me_params = m_mts.Typecheck.ts_params;
                    me_ret = m_mts.Typecheck.ts_return;
+                   me_has_self =
+                     Array.length m_mts.Typecheck.ts_params > 0
+                     && Array.length m_mts.Typecheck.ts_param_names > 0
+                     && m_mts.Typecheck.ts_param_names.(0) = "self";
                  } );
              ];
            fn_ret = int_ty;
@@ -4699,7 +4818,7 @@ end
                    sd_id = m_tid;
                    sd_fields =
                      List.mapi
-                       (fun i (_, fid, fty) ->
+                       (fun i (_, fid, fty, _) ->
                          {
                            Seed_mir.fd_id = fid;
                            fd_index = Ids.Field_index.make i;
@@ -4932,7 +5051,7 @@ end
                 methods = [];
                 fn_ret = int_ty;
                 struct_fields =
-                  [ (fs_tid, [ ("a", l_fid_a, int_ty); ("b", l_fid_b, int_ty) ]) ];
+                  [ (fs_tid, [ ("a", l_fid_a, int_ty, None); ("b", l_fid_b, int_ty, None) ]) ];
               }
             in
             let contains_sub s sub =
@@ -4973,9 +5092,55 @@ end
                       exit 1)
             in
             lower_expect_bug "no_such_method" "has no method instance";
-            lower_expect_bug "missing_field" "initializes 1 of 2 field(s)";
             lower_expect_bug "unknown_field" "unknown field `c`";
-            lower_expect_bug "spread_lit" "`..` spread");
+            lower_expect_bug "spread_lit" "`..` spread";
+            (* re-audit P12: the missing `b: Int` field now DEFAULTS to
+               0 (the native's type-defaulting) — the literal lowers with
+               the zero constant at the b position *)
+            begin
+              let mf_d =
+                match
+                  List.find_opt
+                    (fun (d : Ast.function_decl) -> d.Ast.fn_sig.Ast.sig_name = "missing_field")
+                    fs_funcs
+                with
+                | Some d -> d
+                | None -> failwith "fail-closed proof: no function missing_field"
+              in
+              let mf_mir =
+                try
+                  Mir_lower.lower_function_with_variants Mir_lower.default_variant_table
+                    fsenv "missing_field" 0 [||] [||] mf_d
+                with
+                | Mir_lower.Seed_bug m ->
+                    Printf.printf "  fail-closed missing_field: FAIL (unexpected Seed_bug: %s)\n" m;
+                    exit 1
+              in
+              let ctor_ops =
+                Array.to_list mf_mir.Seed_mir.blocks
+                |> List.find_map (fun (b : Seed_mir.block) ->
+                       List.find_map
+                         (fun (s : Seed_mir.statement) ->
+                           match s with
+                           | Seed_mir.Assign
+                               (_, Seed_mir.Aggregate (Seed_mir.StructCtor _, ops)) ->
+                               Some ops
+                           | _ -> None)
+                         b.Seed_mir.statements)
+              in
+              match ctor_ops with
+              | Some [ Seed_mir.Constant (Seed_mir.Integer _); _ ] ->
+                  Printf.printf
+                    "  fail-closed missing_field: PASS (the omitted `b: Int` field defaulted to the zero constant)\n"
+              | Some _ ->
+                  Printf.printf
+                    "  fail-closed missing_field: FAIL (the defaulted ctor does not carry [0; ...])\n";
+                  exit 1
+              | None ->
+                  Printf.printf
+                    "  fail-closed missing_field: FAIL (no StructCtor in the lowered function)\n";
+                  exit 1
+            end);
        (* ── closure disposition proof (re-audit lowering-surface item:
           "Closure — every implementation needs parse → typecheck →
           driver lower → verify → VM tests").  The seed VM CONSTRUCTS
@@ -5355,6 +5520,10 @@ end
                                  ts.Typecheck.ts_params_decl));
                      me_params = ts.Typecheck.ts_params;
                      me_ret = ts.Typecheck.ts_return;
+                     me_has_self =
+                       Array.length ts.Typecheck.ts_params > 0
+                       && Array.length ts.Typecheck.ts_param_names > 0
+                       && ts.Typecheck.ts_param_names.(0) = "self";
                    } ))
                q_impl_methods;
            fn_ret = int_ty;
@@ -5397,7 +5566,7 @@ end
                    sd_id = q_tid;
                    sd_fields =
                      List.mapi
-                       (fun i (_, fid, fty) ->
+                       (fun i (_, fid, fty, _) ->
                          {
                            Seed_mir.fd_id = fid;
                            fd_index = Ids.Field_index.make i;
@@ -5578,6 +5747,7 @@ end
                      Instance_id.make ~callable:(Ids.Callable_id.make 101) ~type_args:[||];
                    me_params = [||];
                    me_ret = va_vec_ty;
+                   me_has_self = false;
                  } );
                ( ("Vec", "push"),
                  {
@@ -5589,6 +5759,7 @@ end
                        { Type_repr.pt_convention = Access_effect.Sink; pt_type = int_ty };
                      |];
                    me_ret = int_ty;
+                   me_has_self = true;
                  } );
                ( ("Vec", "get"),
                  {
@@ -5600,10 +5771,11 @@ end
                        { Type_repr.pt_convention = Access_effect.Let; pt_type = int_ty };
                      |];
                    me_ret = int_ty;
+                   me_has_self = true;
                  } );
              ];
            fn_ret = int_ty;
-           struct_fields = [ (va_tid, [ ("data", va_fid, int_ty) ]) ];
+           struct_fields = [ (va_tid, [ ("data", va_fid, int_ty, None) ]) ];
          }
        in
        let va_span = Span.synthetic in
@@ -5957,6 +6129,10 @@ end
                                  ts.Typecheck.ts_params_decl));
                      me_params = ts.Typecheck.ts_params;
                      me_ret = ts.Typecheck.ts_return;
+                     me_has_self =
+                       Array.length ts.Typecheck.ts_params > 0
+                       && Array.length ts.Typecheck.ts_param_names > 0
+                       && ts.Typecheck.ts_param_names.(0) = "self";
                    } ))
                sq_impl_methods;
            fn_ret = int_ty;
@@ -6389,6 +6565,10 @@ end
                                w_touch_ts.Typecheck.ts_params_decl));
                    me_params = w_touch_ts.Typecheck.ts_params;
                    me_ret = w_touch_ts.Typecheck.ts_return;
+                   me_has_self =
+                     Array.length w_touch_ts.Typecheck.ts_params > 0
+                     && Array.length w_touch_ts.Typecheck.ts_param_names > 0
+                     && w_touch_ts.Typecheck.ts_param_names.(0) = "self";
                  } );
              ];
            fn_ret = int_ty;
