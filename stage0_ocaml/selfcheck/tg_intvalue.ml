@@ -197,6 +197,7 @@ let lower_env () : Mir_lower.func_env =
       ];
     values = [];
     callables = [];
+    callables_by_callable = [];
     methods = [];
     (* the declared return type is unknown at env-build time; the
        per-source lowering below must not treat the tail as discarded:
@@ -205,6 +206,7 @@ let lower_env () : Mir_lower.func_env =
        keep the tail assign by using the resolved declaration return *)
     fn_ret = Type_repr.Int Type_repr.Int;
     struct_fields = [];
+                enum_payloads = [];
   }
 
 let collect_int_constants (fn : Seed_mir.function_) : Int_value.t list =

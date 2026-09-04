@@ -329,9 +329,9 @@ let string_ty = Type_repr.String
       lowerer carries identity and runtime tag independently) ─────── *)
 let color_specs =
   [
-    ("Red", { Mir_lower.vs_id = Ids.Variant_id.make 1; vs_index = 0; vs_fields = [] });
-    ("Green", { Mir_lower.vs_id = Ids.Variant_id.make 2; vs_index = 1; vs_fields = [ int_ty ] });
-    ("Blue", { Mir_lower.vs_id = Ids.Variant_id.make 3; vs_index = 2; vs_fields = [ int_ty; int_ty ] });
+    ("Red", { Mir_lower.vs_id = Ids.Variant_id.make 1; vs_index = 0; vs_fields = []; vs_field_names = [] });
+    ("Green", { Mir_lower.vs_id = Ids.Variant_id.make 2; vs_index = 1; vs_fields = [ int_ty ]; vs_field_names = [] });
+    ("Blue", { Mir_lower.vs_id = Ids.Variant_id.make 3; vs_index = 2; vs_fields = [ int_ty; int_ty ]; vs_field_names = [] });
   ]
 
 let color_ctors = List.map (fun (n, spec) -> (n, ("Color", n, spec))) color_specs
@@ -348,13 +348,14 @@ let variant_table : Mir_lower.variant_table =
         ("Color", color_specs);
         ("Node",
          [
-           ("Leaf", { Mir_lower.vs_id = Ids.Variant_id.make 4; vs_index = 0; vs_fields = [] });
-           ( "Branch",
-             {
-               Mir_lower.vs_id = Ids.Variant_id.make 5;
-               vs_index = 1;
-               vs_fields = [ int_ty; int_ty ];
-             } );
+           ("Leaf", { Mir_lower.vs_id = Ids.Variant_id.make 4; vs_index = 0; vs_fields = []; vs_field_names = [] });
+            ( "Branch",
+              {
+                Mir_lower.vs_id = Ids.Variant_id.make 5;
+                vs_index = 1;
+                vs_fields = [ int_ty; int_ty ];
+                vs_field_names = [];
+              } );
          ]);
       ];
     vt_ctors =
@@ -2104,15 +2105,15 @@ end
          coordinates (B's vs_ids [2;3;4] are NOT make (vs_index + 1)) *)
       let a_specs =
         [
-          ("A0", { Mir_lower.vs_id = Ids.Variant_id.make 0; vs_index = 0; vs_fields = [] });
-          ("A1", { Mir_lower.vs_id = Ids.Variant_id.make 1; vs_index = 1; vs_fields = [ int_ty ] });
+          ("A0", { Mir_lower.vs_id = Ids.Variant_id.make 0; vs_index = 0; vs_fields = []; vs_field_names = [] });
+          ("A1", { Mir_lower.vs_id = Ids.Variant_id.make 1; vs_index = 1; vs_fields = [ int_ty ]; vs_field_names = [] });
         ]
       in
       let b_specs =
         [
-          ("B0", { Mir_lower.vs_id = Ids.Variant_id.make 2; vs_index = 0; vs_fields = [] });
-          ("B1", { Mir_lower.vs_id = Ids.Variant_id.make 3; vs_index = 1; vs_fields = [ int_ty ] });
-          ("B2", { Mir_lower.vs_id = Ids.Variant_id.make 4; vs_index = 2; vs_fields = [ int_ty; int_ty ] });
+          ("B0", { Mir_lower.vs_id = Ids.Variant_id.make 2; vs_index = 0; vs_fields = []; vs_field_names = [] });
+          ("B1", { Mir_lower.vs_id = Ids.Variant_id.make 3; vs_index = 1; vs_fields = [ int_ty ]; vs_field_names = [] });
+          ("B2", { Mir_lower.vs_id = Ids.Variant_id.make 4; vs_index = 2; vs_fields = [ int_ty; int_ty ]; vs_field_names = [] });
         ]
       in
       let p_table = Driver.user_variant_table penv in
@@ -2256,8 +2257,11 @@ end
                   } ))
               funcs;
           methods = [];
+          callables_by_callable = [];
           fn_ret = int_ty;
           struct_fields = Driver.struct_fields_of tcheck_env;
+          enum_payloads = Driver.enum_payloads_of tcheck_env;
+
         }
       in
       let mir_funcs =
@@ -3198,8 +3202,10 @@ end
                   } ))
               ffuncs;
           methods = [];
+          callables_by_callable = [];
           fn_ret = int_ty;
           struct_fields = Driver.struct_fields_of fenv;
+          enum_payloads = Driver.enum_payloads_of fenv;
         }
       in
       let fmir_funcs =
@@ -3530,8 +3536,10 @@ end
                   } ))
               wb_ffuncs;
           methods = [];
+          callables_by_callable = [];
           fn_ret = int_ty;
           struct_fields = Driver.struct_fields_of wbenv;
+          enum_payloads = Driver.enum_payloads_of wbenv;
         }
       in
       let wb_mir_funcs =
@@ -4351,8 +4359,10 @@ end
                    } ))
                l_funcs;
            methods = [];
+          callables_by_callable = [];
            fn_ret = int_ty;
            struct_fields = Driver.struct_fields_of lenv;
+          enum_payloads = Driver.enum_payloads_of lenv;
          }
        in
        let lmir_funcs =
@@ -4778,8 +4788,10 @@ end
                      && m_mts.Typecheck.ts_param_names.(0) = "self";
                  } );
              ];
+           callables_by_callable = [];
            fn_ret = int_ty;
            struct_fields = Driver.struct_fields_of menv;
+          enum_payloads = Driver.enum_payloads_of menv;
          }
        in
        let mmir_funcs =
@@ -5048,10 +5060,12 @@ end
                   ];
                 values = [ ("main", int_ty) ];
                 callables = [];
+                callables_by_callable = [];
                 methods = [];
                 fn_ret = int_ty;
                 struct_fields =
                   [ (fs_tid, [ ("a", l_fid_a, int_ty, None); ("b", l_fid_b, int_ty, None) ]) ];
+                enum_payloads = [];
               }
             in
             let contains_sub s sub =
@@ -5211,9 +5225,11 @@ end
                   ];
                 values = [];
                 callables = [];
+                callables_by_callable = [];
                 methods = [];
                 fn_ret = int_ty;
                 struct_fields = [];
+                enum_payloads = [];
               }
             in
             (* (a) the lowerer fails closed with the precise seed_bug —
@@ -5526,8 +5542,10 @@ end
                        && ts.Typecheck.ts_param_names.(0) = "self";
                    } ))
                q_impl_methods;
+           callables_by_callable = [];
            fn_ret = int_ty;
            struct_fields = Driver.struct_fields_of qenv;
+          enum_payloads = Driver.enum_payloads_of qenv;
          }
        in
        let qmir_funcs =
@@ -5739,6 +5757,7 @@ end
              ];
            values = [];
            callables = [];
+                callables_by_callable = [];
            methods =
              [
                ( ("Array", "new"),
@@ -5776,6 +5795,7 @@ end
              ];
            fn_ret = int_ty;
            struct_fields = [ (va_tid, [ ("data", va_fid, int_ty, None) ]) ];
+                enum_payloads = [];
          }
        in
        let va_span = Span.synthetic in
@@ -6135,8 +6155,10 @@ end
                        && ts.Typecheck.ts_param_names.(0) = "self";
                    } ))
                sq_impl_methods;
+           callables_by_callable = [];
            fn_ret = int_ty;
            struct_fields = [];
+                enum_payloads = [];
          }
        in
        let sqmir_funcs =
@@ -6354,8 +6376,10 @@ end
                    } ))
                qc_funcs;
            methods = [];
+          callables_by_callable = [];
            fn_ret = int_ty;
            struct_fields = Driver.struct_fields_of qc_env;
+          enum_payloads = Driver.enum_payloads_of qc_env;
          }
        in
        let qc_mir_funcs =
@@ -6571,8 +6595,10 @@ end
                      && w_touch_ts.Typecheck.ts_param_names.(0) = "self";
                  } );
              ];
+           callables_by_callable = [];
            fn_ret = int_ty;
            struct_fields = Driver.struct_fields_of w_env;
+          enum_payloads = Driver.enum_payloads_of w_env;
          }
        in
        let w_main_decl =

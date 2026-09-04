@@ -453,21 +453,46 @@ let struct_fields_of ?(items : Ast.item list = []) (env : Typecheck.env) :
   in
   List.filter_map
     (fun (name, nom : string * Typecheck.nominal) ->
-      match List.assoc_opt name env.Typecheck.type_ids with
-      | None -> None
-      | Some tid ->
-          let nf = List.length nom.Typecheck.nom_fields in
-          let fids =
-            if List.length nom.Typecheck.nom_field_ids = nf then nom.Typecheck.nom_field_ids
-            else List.mapi (fun i _ -> Ids.Field_id.make (i + 1)) nom.Typecheck.nom_fields
-          in
-          Some
-            ( tid,
-              List.mapi
-                (fun i (fname, fty) ->
-                  (fname, List.nth fids i, fty, default_of name fname))
-                nom.Typecheck.nom_fields ))
+      (* struct-only: an ENUM nominal carries no fields, and its empty
+         registry entry would make mir_lower's copyable_ty resolve the
+         enum def as Copy (an empty field list is vacuously all-Copy)
+         while the verifier's recursive enum rule (Copy iff every
+         variant payload is Copy) rejects the bitwise copy of an enum
+         with an owning payload *)
+      if nom.Typecheck.nom_kind <> `Struct then None
+      else
+        match List.assoc_opt name env.Typecheck.type_ids with
+        | None -> None
+        | Some tid ->
+            let nf = List.length nom.Typecheck.nom_fields in
+            let fids =
+              if List.length nom.Typecheck.nom_field_ids = nf then nom.Typecheck.nom_field_ids
+              else List.mapi (fun i _ -> Ids.Field_id.make (i + 1)) nom.Typecheck.nom_fields
+            in
+            Some
+              ( tid,
+                List.mapi
+                  (fun i (fname, fty) ->
+                    (fname, List.nth fids i, fty, default_of name fname))
+                  nom.Typecheck.nom_fields ))
     env.Typecheck.nominals
+
+(* The ENUM defs' variant payload shapes for the lowering's copyability
+   rule (mirror of the reference's recursive enum rule: an enum is Copy
+   iff every variant payload is Copy — a payload-less enum is Copy). *)
+let enum_payloads_of (env : Typecheck.env) :
+    (Ids.Type_id.t * (string * Type_repr.t list) list) list =
+  List.filter_map
+    (fun (name, nom : string * Typecheck.nominal) ->
+      match nom.Typecheck.nom_kind with
+      | `Struct -> None
+      | `Enum -> (
+          match List.assoc_opt name env.Typecheck.type_ids with
+          | None -> None
+          | Some tid ->
+              Some (tid, List.map (fun (vname, pty) -> (vname, Array.to_list pty)) nom.Typecheck.nom_variants)))
+    env.Typecheck.nominals
+
 
 (* ── The persistent typed-node bridge (re-audit: TypedProgram/TypedHIR) ──
    The typechecker's node-keyed map (NodeId -> resolved node) crosses
@@ -485,11 +510,19 @@ let typed_nodes_of (env : Typecheck.env) : (Ids.Node_id.t * Mir_lower.typed_node
      call node's Vec[?] only becomes Vec[T] after the push) *)
   (* the final journal, INDEXED once (the list-assoc per var would be
      quadratic over the closure's nodes); the bounded fixpoint resolves
-     var-to-var chains without iterating the whole journal *)
+     var-to-var chains without iterating the whole journal.  The journal
+     is newest-first (unify prepends every binding), and a var CAN be
+     rebound when a later unification runs against a stale earlier
+     binding (the fn-end return-slot unify starts from an empty subst —
+     it re-solves a var the body's calls already bound).  The checker's
+     own reads resolve through list-assoc = the NEWEST binding wins, so
+     the table below keeps the FIRST-seen (newest) entry per key. *)
   let jtbl : (Type_repr.generic_key, Type_repr.t) Hashtbl.t =
     Hashtbl.create 65536
   in
-  List.iter (fun (k, v) -> Hashtbl.replace jtbl k v) (Typecheck.final_journal ());
+  List.iter
+    (fun (k, v) -> if not (Hashtbl.mem jtbl k) then Hashtbl.add jtbl k v)
+    (Typecheck.final_journal ());
   let rec sub1 (ty : Type_repr.t) : Type_repr.t =
     match ty with
     | Type_repr.Type_param id -> (
@@ -523,9 +556,10 @@ let typed_nodes_of (env : Typecheck.env) : (Ids.Node_id.t * Mir_lower.typed_node
   in
   Hashtbl.fold
     (fun key (node : Typecheck.typed_node) acc ->
+      let tn = sub node.Typecheck.tn_type in
       ( key,
         {
-          Mir_lower.tn_type = sub node.Typecheck.tn_type;
+          Mir_lower.tn_type = tn;
           tn_cast_target = Option.map sub node.Typecheck.tn_cast_target;
           tn_call =
             (match node.Typecheck.tn_call with
@@ -725,15 +759,22 @@ let lowering_env_of ?(items : Ast.item list = []) (env : Typecheck.env) : Mir_lo
     consts = const_values env items;
     statics;
     callables;
+    (* the by-callable index over the QUALIFIED entries only — the
+       bare-name duplicates (a `check_expr` in several modules) would
+       alias each other's parameter conventions *)
+    callables_by_callable =
+      List.filter_map
+        (fun (n, entry : string * Mir_lower.callable_entry) ->
+          if String.contains n ':' then Some (entry.Mir_lower.ce_callable, entry) else None)
+        callables;
     methods;
     fn_ret = Type_repr.Unit;
     struct_fields = struct_fields_of ~items env;
+    enum_payloads = enum_payloads_of env;
   }
 
 (* ── User-enum variant table (re-audit finding: the closure driver never
-      fed lowering the typechecker's enum/VariantId universe) ─────────
-
-   mir_lower's variant_table (vt_enums: enum name -> variant name ->
+      fed lowering the typechecker's enum/VariantId universe) ─────────   mir_lower's variant_table (vt_enums: enum name -> variant name ->
    {vs_id; vs_index; vs_fields}; vt_ctors: bare ctor name -> (enum name,
    variant name)) is built HERE from the TYPED nominal registry — the
    same semantic registry closure_types reads for the EnumDefs — never
@@ -773,6 +814,10 @@ let user_variant_table (env : Typecheck.env) : Mir_lower.variant_table =
                           Mir_lower.vs_id = List.nth nom.Typecheck.nom_variant_ids i;
                           vs_index = i;
                           vs_fields = Array.to_list pty;
+                          vs_field_names =
+                            (match List.assoc_opt vname nom.Typecheck.nom_variant_field_names with
+                             | Some ns -> ns
+                             | None -> []);
                         } ))
                     nom.Typecheck.nom_variants )
             end)
@@ -809,6 +854,110 @@ let user_variant_table (env : Typecheck.env) : Mir_lower.variant_table =
       enums
   in
   { Mir_lower.vt_enums = enums; vt_ctors = ctors; vt_builtin = builtin_ids }
+
+(* The checker's type-query sigs (size_of[T]()/align_of[T]() — the
+   compile-time type-query special forms) as the template verifier's
+   query registry: their calls record the query callable + the caller's
+   resolved type args, and no lowered MIR function exists for a query
+   sig (a compile-time form has no runtime body), so the verifier
+   resolves those callees against this registry.  The registry also
+   carries every registered METHOD and FUNCTION signature whose
+   callable has NO lowered MIR body: the compiler-BUILTIN method
+   surface (Ptr::write/read/as_ref/as_mut/drop_in_place — the checker's
+   initial-env registrations, which no source module implements) and
+   the extern-declared names (memcpy, __sync_*, sched_yield — typed
+   sigs with no lowered body either).  Template-mode calls to any of
+   them resolve through this registry with the full parameter
+   contracts (the call's type args substitute the declaration binders;
+   the args' effects and types and the destination are checked against
+   the substituted params/ret exactly like a real callee).  Body-ful
+   callables never reach the registry — resolve_callee finds their
+   lowered template functions by callable identity first — and the
+   ~lowered filter excludes their callables here too, so the registry
+   cannot shadow or collide with a real callee. *)
+let closure_query_sigs ?(lowered = None)
+    (env : Typecheck.env) : Mir_verify.query_sig list =
+  let excluded =
+    let tbl = Hashtbl.create 256 in
+    (match lowered with
+     | None -> ()
+     | Some p ->
+         Array.iter
+           (fun (f : Seed_mir.function_) ->
+             Hashtbl.replace tbl (Instance_id.callable f.Seed_mir.instance) ())
+           p.Seed_mir.functions);
+    tbl
+  in
+  let sig_of (ts : Typecheck.typed_signature) : Mir_verify.query_sig option =
+    if Hashtbl.mem excluded ts.Typecheck.ts_callable then None
+    else
+      Some
+        {
+          Mir_verify.qs_callable = ts.Typecheck.ts_callable;
+          qs_decl =
+            Array.of_list
+              (List.map (fun (_, pid) -> Type_repr.Type_param pid)
+                 ts.Typecheck.ts_params_decl);
+          qs_params = ts.Typecheck.ts_params;
+          qs_ret = ts.Typecheck.ts_return;
+        }
+  in
+  (* the synthesized contract sigs (derived Clone::clone / derived
+     to_string — created per accepted call site when no real method or
+     impl exists: `key_ref.clone()` on a `&K` visit-ref, `.clone()` on an
+     Option payload, `.to_string()` on an error payload).  They are
+     body-less contracts (no source module lowers them), so template-mode
+     calls to them must resolve against the registry exactly like the
+     compiler-builtin methods.  Each derived sig declares ONE generic
+     binder for the receiver type (the checker mints the fresh parameter
+     and the call's instance arg carries the solved receiver type), so
+     the registry entry substitutes the declaration binder exactly like
+     every other registered sig — the monomorphizer's exact-arity
+     contract holds (one carried type argument per declared binder), and
+     a generic caller's specialization substitutes the receiver type
+     through the call's instance args.  Their types may reference
+     inference vars solved by later items — substitute through the final
+     journal when building the entries. *)
+  let jtbl_subst =
+    Typecheck.substitute_fixpoint (Typecheck.final_journal ())
+  in
+  let add_derived (sig_list : Mir_verify.query_sig list)
+      (ts : Typecheck.typed_signature) : Mir_verify.query_sig list =
+    if Hashtbl.mem excluded ts.Typecheck.ts_callable then sig_list
+    else
+      {
+        Mir_verify.qs_callable = ts.Typecheck.ts_callable;
+        qs_decl =
+          Array.of_list
+            (List.map (fun (_, pid) -> Type_repr.Type_param pid)
+               ts.Typecheck.ts_params_decl);
+        qs_params =
+          Array.map
+            (fun (p : Type_repr.param_type) ->
+              { p with Type_repr.pt_type = jtbl_subst p.Type_repr.pt_type })
+            ts.Typecheck.ts_params;
+        qs_ret = jtbl_subst ts.Typecheck.ts_return;
+      }
+      :: sig_list
+  in
+  let qs = List.fold_left (fun acc (_, ts) -> add_derived acc ts) [] env.Typecheck.state.derived_sigs in
+  let add_sigs (sig_list : Mir_verify.query_sig list) (ts : Typecheck.typed_signature) :
+      Mir_verify.query_sig list =
+    match sig_of ts with Some q -> q :: sig_list | None -> sig_list
+  in
+  let qs =
+    List.fold_left add_sigs qs
+      (List.map snd env.Typecheck.state.query_sigs)
+  in
+  let qs =
+    List.fold_left add_sigs qs
+      (List.map snd env.Typecheck.methods)
+  in
+  let qs =
+    List.fold_left add_sigs qs
+      (List.map snd env.Typecheck.functions)
+  in
+  qs
 
 (* The generic nominal registry for the monomorphizer (re-audit finding:
    "generic nominal type definitions disappear before MIR").  closure_types
@@ -937,7 +1086,11 @@ let lower_and_report (path : string) (env : Typecheck.env) (program : Ast.progra
   let prog =
     { Seed_mir.functions = Array.of_list mir_funcs; statics = closure_statics env program.Ast.items; types = closure_types env }
   in
-  match Mir_verify.require_valid_template ~generic_types:(closure_generic_types env) prog with
+  match
+         Mir_verify.require_valid_template ~generic_types:(closure_generic_types env)
+               ~box_tid:(env.Typecheck.state.box_tid)
+           ~query_sigs:(closure_query_sigs ~lowered:(Some prog) env) prog
+       with
   | Error errs ->
       Printf.printf "// MIR verify FAILED:\n";
       List.iter (fun e -> Printf.printf "//   %s\n" e) errs;
@@ -1065,8 +1218,10 @@ let cmd_interpret (args : string list) : int =
               in
               (match
                  Mir_verify.require_valid_template
-                   ~generic_types:(closure_generic_types env)
-                   prog
+                     ~box_tid:(env.Typecheck.state.box_tid)
+                     ~generic_types:(closure_generic_types env)
+                     ~query_sigs:(closure_query_sigs env)
+                     prog
                with
                | Error errs ->
                    List.iter (fun e -> Printf.printf "  %s\n" e) errs;
@@ -2474,6 +2629,14 @@ type mono_outcome = {
   mo_post_instances : int;
   mo_type_instances : int;
   mo_residual_type_params : int;
+  (* the body-less-registered sigs plus the materializer's rewrite the
+     post-mono concrete verification resolves kept calls through (see
+     run_mono_phase): consumers that re-verify mo_program reproduce the
+     same registry with the same fresh-instance-id reconciliation *)
+  mo_query_sigs : Mir_verify.query_sig list;
+  mo_post_rewrite : Type_repr.t -> Type_repr.t;
+  mo_box_instances : Ids.Type_id.t list;
+  mo_materialized_from : int;
 }
 
 (* ── Post-mono type materialization (re-audit finding: "generic nominal
@@ -2624,15 +2787,27 @@ let rewrite_function map (fn : Seed_mir.function_) : Seed_mir.function_ =
     blocks = Array.map (rewrite_block map locals') fn.Seed_mir.blocks;
   }
 
+let rewrite_constant (map) (c : Seed_mir.constant) : Seed_mir.constant =
+  match c with
+  (* ctor constants carry the checker's INSTANTIATED monotype (see
+     Seed_mir.constant): after the materializer mints fresh defs for the
+     generic instances, the monotype must follow the same rewrite, or a
+     static's initializer type disagrees with its (rewritten) declared
+     type *)
+  | Seed_mir.Enum (tag, ty) -> Seed_mir.Enum (tag, rewrite_ty map ty)
+  | Seed_mir.Struct ty -> Seed_mir.Struct (rewrite_ty map ty)
+  | Seed_mir.Array ty -> Seed_mir.Array (rewrite_ty map ty)
+  | Seed_mir.Map ty -> Seed_mir.Map (rewrite_ty map ty)
+  | Seed_mir.Set ty -> Seed_mir.Set (rewrite_ty map ty)
+  | Seed_mir.Function inst -> Seed_mir.Function (rewrite_instance map inst)
+  | c -> c
+
 let rewrite_static map ((name, ty, mutable_, init) : string * Type_repr.t * bool * Seed_mir.constant option) :
     string * Type_repr.t * bool * Seed_mir.constant option =
   ( name,
     rewrite_ty map ty,
     mutable_,
-    match init with
-    | Some (Seed_mir.Function inst) ->
-        Some (Seed_mir.Function (rewrite_instance map inst))
-    | init -> init )
+    Option.map (rewrite_constant map) init )
 
 let rewrite_def map (d : Seed_mir.type_def) : Seed_mir.type_def =
   match d with
@@ -2747,15 +2922,34 @@ let program_max_type_id ~(generic_types : Mono.generic_def array)
 
 let materialize_type_instances ~(generic_types : Mono.generic_def array)
     ~(type_instances : Mono.type_instance list) (prog : Seed_mir.program) :
-    (Seed_mir.program, string list) result =
-  if Array.length generic_types = 0 then Ok prog
+    (Seed_mir.program * (Ids.Type_id.t * Type_repr.t array * Ids.Type_id.t) list,
+     string list)
+    result =
+  if Array.length generic_types = 0 then Ok (prog, [])
   else begin
     let errors = ref [] in
     let err msg = errors := msg :: !errors in
+    (* the BUILTIN runtime nominals (the checker's semantic ids 0=Vec/
+       Array, 1=Map, 2=Set, 5=Ptr, 6=PtrMut): the pipeline keys their
+       runtime semantics on the original ids (mir_lower's Index/entries/
+       deref desugaring, the verifier's projection, deref and intrinsic-
+       signature rules, the VM's value tags), so their concrete
+       instances are NEVER remapped to fresh defs — a fresh field-less
+       def would collapse the base to an empty structural form and
+       every id-keyed rule would miss it.  Option/Result (3/4) ARE
+       materialized: their instance operations are def-driven (the
+       two-variant enum shape), and the materialized defs carry the
+       semantic VariantIds. *)
+    let is_builtin_container (tid : Ids.Type_id.t) : bool =
+      let t = Ids.Type_id.to_int tid in
+      t = 0 || t = 1 || t = 2 || t = 5 || t = 6
+    in
     let seen : Mono.type_instance list ref = ref [] in
     let queue : Mono.type_instance Queue.t = Queue.create () in
     let enqueue (ti : Mono.type_instance) =
-      if not (List.exists (Mono.type_instance_equal ti) !seen) then begin
+      if not (is_builtin_container ti.Mono.ti_tid)
+         && not (List.exists (Mono.type_instance_equal ti) !seen)
+      then begin
         seen := ti :: !seen;
         Queue.add ti queue
       end
@@ -2781,6 +2975,9 @@ let materialize_type_instances ~(generic_types : Mono.generic_def array)
         match init with
         | Some (Seed_mir.Function inst) ->
             Array.iter (Mono.scan_type generic_types enqueue) (Instance_id.type_args inst)
+        | Some (Seed_mir.Enum (_, mty)) | Some (Seed_mir.Struct mty)
+        | Some (Seed_mir.Array mty) | Some (Seed_mir.Map mty) | Some (Seed_mir.Set mty) ->
+            Mono.scan_type generic_types enqueue mty
         | _ -> ())
       prog.Seed_mir.statics;
     let next_tid = ref (program_max_type_id ~generic_types prog + 1) in
@@ -2850,29 +3047,241 @@ let materialize_type_instances ~(generic_types : Mono.generic_def array)
     | [] ->
         let map = List.rev !map in
         let materialized = List.rev !materialized in
+        (* the EXCLUDED builtin nominals (Vec/Array/Map/Set/Ptr/PtrMut —
+           never remapped to fresh instances) still need their canonical
+           defs in the concrete types table: aggregate/field/copy checks
+           resolve them by tid, and the registry's template defs carry
+           the true semantic FieldIds and concrete field types.  The
+           defs are emitted once per tid, unsubstituted (their field
+           types reference no declared params). *)
+        let canonical_defs =
+          let added = Hashtbl.create 8 in
+          List.filter_map
+            (fun (gd : Mono.generic_def) ->
+              let t = Ids.Type_id.to_int gd.Mono.gd_tid in
+              let is_builtin = t = 0 || t = 1 || t = 2 || t = 5 || t = 6 in
+              if not is_builtin || Hashtbl.mem added gd.Mono.gd_tid then None
+              else begin
+                Hashtbl.add added gd.Mono.gd_tid ();
+                Some gd.Mono.gd_def
+              end)
+            (Array.to_list generic_types)
+        in
+        let extra_defs = materialized @ canonical_defs in
         Ok
-          {
-            Seed_mir.functions = Array.map (rewrite_function map) prog.Seed_mir.functions;
-            statics = Array.map (rewrite_static map) prog.Seed_mir.statics;
-            types =
-              Array.append
-                (Array.map (rewrite_def map) prog.Seed_mir.types)
-                (Array.of_list (List.map (rewrite_def map) materialized));
-          }
+          ( {
+              Seed_mir.functions = Array.map (rewrite_function map) prog.Seed_mir.functions;
+              statics = Array.map (rewrite_static map) prog.Seed_mir.statics;
+              types =
+                Array.append
+                  (Array.map (rewrite_def map) prog.Seed_mir.types)
+                  (Array.of_list (List.map (rewrite_def map) extra_defs));
+            },
+            map )
     | errs -> Error (List.rev errs)
+  end
+
+(* Debug (TANGERINE_DEBUG_MONO_NAMES): report every typed-call callee
+   instance whose callable has NO lowered template in the seed program —
+   the surface the monomorphizer fails on ("no template function for
+   instance") — with the callable's registered name and signature
+   (functions / methods / nested functions / query sigs / derived
+   sigs), so a failing instance can be traced to its source
+   registration without re-deriving callable numbering. *)
+let debug_mono_poison_names (ctx : closure_ctx) (prog : Seed_mir.program) : unit =
+  if Sys.getenv_opt "TANGERINE_DEBUG_MONO_NAMES" = None then ()
+  else begin
+    let env = ctx.ctx_env in
+    let names = Hashtbl.create 16384 in
+    let sig_names = Hashtbl.create 16384 in
+    let note (kind : string) (display : string) (ts : Typecheck.typed_signature) =
+      let c = Ids.Callable_id.to_int ts.Typecheck.ts_callable in
+      Hashtbl.replace names c (Printf.sprintf "[%s] %s" kind display);
+      Hashtbl.replace sig_names c ts
+    in
+    List.iter
+      (fun (n, ts) -> note "fn" n ts)
+      env.Typecheck.functions;
+    List.iter
+      (fun ((o, m), ts) -> note "method" (o ^ "::" ^ m) ts)
+      env.Typecheck.methods;
+    List.iter
+      (fun (qname, ts, _) -> note "nested" qname ts)
+      env.Typecheck.state.nested_functions;
+    List.iter (fun (n, ts) -> note "query" n ts) env.Typecheck.state.query_sigs;
+    List.iter (fun (_, ts) -> note "derived" ts.Typecheck.ts_name ts)
+      env.Typecheck.state.derived_sigs;
+    let templates = Hashtbl.create 16384 in
+    Array.iter
+      (fun (f : Seed_mir.function_) ->
+        Hashtbl.replace templates (Ids.Callable_id.to_int (Instance_id.callable f.Seed_mir.instance))
+          ())
+      prog.Seed_mir.functions;
+    (* the typed channel's raw records may carry the caller's generic
+       params / unsolved infer vars (the lowering channel substitutes
+       them through the final journal); mirror that substitution so the
+       poison surface is the CONCRETE instance set the mono actually
+       looks up *)
+    let jtbl : (Type_repr.generic_key, Type_repr.t) Hashtbl.t = Hashtbl.create 65536 in
+    List.iter
+      (fun (k, v) -> if not (Hashtbl.mem jtbl k) then Hashtbl.add jtbl k v)
+      (Typecheck.final_journal ());
+    let rec sub1 (ty : Type_repr.t) : Type_repr.t =
+      match ty with
+      | Type_repr.Type_param id -> (
+          match Hashtbl.find_opt jtbl (Type_repr.KParam id) with
+          | Some s -> s
+          | None -> ty)
+      | Type_repr.Infer_var v -> (
+          match Hashtbl.find_opt jtbl (Type_repr.KVar v) with
+          | Some s -> s
+          | None -> ty)
+      | Type_repr.Raw_ptr (m, inner) -> Type_repr.Raw_ptr (m, sub1 inner)
+      | Type_repr.Ref_internal (m, inner) -> Type_repr.Ref_internal (m, sub1 inner)
+      | Type_repr.Tuple elems -> Type_repr.Tuple (Array.map sub1 elems)
+      | Type_repr.Fixed_array (inner, n) -> Type_repr.Fixed_array (sub1 inner, n)
+      | Type_repr.Named (id, args) -> Type_repr.Named (id, Array.map sub1 args)
+      | Type_repr.Function (params, ret) ->
+          Type_repr.Function
+            (Array.map (fun p -> { p with Type_repr.pt_type = sub1 p.Type_repr.pt_type }) params,
+             sub1 ret)
+      | Type_repr.Unit | Type_repr.Bool | Type_repr.Char | Type_repr.Int _
+      | Type_repr.Float _ | Type_repr.String | Type_repr.Int_literal _
+      | Type_repr.Error | Type_repr.Never ->
+          ty
+    in
+    let sub ty =
+      let rec go n ty =
+        let ty' = sub1 ty in
+        if Type_repr.compare ty ty' = 0 || n > 8 then ty' else go (n + 1) ty'
+      in
+      go 0 ty
+    in
+    let poison = Hashtbl.create 1024 in
+    let poison_arg (ty : Type_repr.t) =
+      if Type_repr.has_type_param ty then "P:" ^ Seed_mir.print_type ty else Seed_mir.print_type ty
+    in
+    Hashtbl.iter
+      (fun _ (node : Typecheck.typed_node) ->
+        match node.Typecheck.tn_call with
+        | Some (callable, targs) ->
+            let targs = Array.map sub targs in
+            if
+              not (Array.exists Type_repr.has_type_param targs)
+              && not (Array.exists (fun t -> match t with Type_repr.Infer_var _ -> true | _ -> false) targs)
+            then begin
+              let c = Ids.Callable_id.to_int callable in
+              if not (Hashtbl.mem templates c) then begin
+                let key =
+                  Printf.sprintf "inst{callable#%d; [%s]}" c
+                    (String.concat "; " (Array.to_list (Array.map poison_arg targs)))
+                in
+                let cur =
+                  match Hashtbl.find_opt poison key with Some n -> n | None -> 0
+                in
+                Hashtbl.replace poison key (cur + 1)
+              end
+            end
+        | None -> ())
+      env.Typecheck.typed_nodes;
+    let key_int (k : string) : int =
+      let n = String.index k '#' in
+      let rest = String.sub k (n + 1) (String.length k - n - 1) in
+      let semi = String.index rest ';' in
+      int_of_string (String.sub rest 0 semi)
+    in
+    let n = Hashtbl.length poison in
+    Printf.printf "  mono-debug: %d poisoned typed-call instance shape(s) (callable has no lowered template)\n" n;
+    (* caller map: for a poison callable, the lowered bodies that call it
+       (with the call site's concrete args), so the family can be traced
+       to its source use *)
+    let callers : (int, (string * Instance_id.t) list) Hashtbl.t = Hashtbl.create 1024 in
+    Array.iter
+      (fun (f : Seed_mir.function_) ->
+        let body = f in
+        Array.iter
+          (fun (b : Seed_mir.block) ->
+            match b.Seed_mir.terminator with
+            | Seed_mir.Call (_, Seed_mir.User inst, _, _, _) ->
+                let c = Ids.Callable_id.to_int (Instance_id.callable inst) in
+                if not (Hashtbl.mem templates c) then begin
+                  let cur =
+                    match Hashtbl.find_opt callers c with Some l -> l | None -> []
+                  in
+                  Hashtbl.replace callers c ((body.Seed_mir.name, inst) :: cur)
+                end
+            | _ -> ())
+          body.Seed_mir.blocks)
+      prog.Seed_mir.functions;
+    Hashtbl.fold
+      (fun k count acc ->
+        let c = key_int k in
+        (c, k, count) :: acc)
+      poison []
+    |> List.sort (fun (a, _, _) (b, _, _) -> compare a b)
+    |> List.iter (fun (c, k, count) ->
+           let nm =
+             match Hashtbl.find_opt names c with
+             | Some s -> s
+             | None -> "UNREGISTERED-in-checker-tables"
+           in
+           Printf.printf "  mono-poison %s x%d  %s\n" k count nm;
+           (match Hashtbl.find_opt callers c with
+            | Some cl ->
+                let seen_caller = Hashtbl.create 16 in
+                List.iter
+                  (fun (fname, _) ->
+                    if not (Hashtbl.mem seen_caller fname) then begin
+                      Hashtbl.add seen_caller fname ();
+                      Printf.printf "    called from: %s\n" fname
+                    end)
+                  (List.sort compare cl)
+            | None -> ());
+           match Hashtbl.find_opt sig_names c with
+           | Some ts ->
+               Printf.printf "    decl=%d params=%s ret=%s\n"
+                 (List.length ts.Typecheck.ts_params_decl)
+                 (String.concat ", "
+                    (Array.to_list
+                       (Array.map
+                          (fun (p : Type_repr.param_type) ->
+                            Seed_mir.print_type p.Type_repr.pt_type)
+                          ts.Typecheck.ts_params)))
+                 (Seed_mir.print_type ts.Typecheck.ts_return)
+           | None -> ());
+    flush stdout
   end
 
 (* Mono the lowered closure from the bootstrap entry; report pre/post
    function and instance counts; require zero residual Type_param and a
    clean Mir_verify.require_valid_concrete (post-mono = concrete mode)
-   of the mono'd program. *)
+   of the mono'd program.  The optional query_sigs registry (the same
+   body-less-registered surface the template verifier resolves) is the
+   mono's ~registered_only authority — a call to a callable with a
+   typed sig but no lowered template (extern-declared names,
+   compiler-builtin methods/constructors, derived clone/to_string sigs,
+   size_of/align_of type queries) is kept concrete instead of failing —
+   and the post-mono concrete verification resolves those same callees
+   against the registry. *)
 let run_mono_phase ~(entry_name : string) ~(entry : Instance_id.t)
     ?(generic_types : Mono.generic_def array = [||])
+    ?(box_tid : Ids.Type_id.t option = None)
+    ?(query_sigs : Mir_verify.query_sig list = [])
     (prog : Seed_mir.program) : (mono_outcome, string list) result =
   Printf.printf "  mono: entry '%s' (%s)\n" entry_name (Seed_mir.print_instance entry);
   let type_instances = ref [] in
+  (* the body-less callable surface: callable -> declared-parameter
+     count (the registry's qs_decl carries the declaration-order
+     binders) *)
+  let registered_only (c : Ids.Callable_id.t) : int option =
+    List.find_opt
+      (fun (q : Mir_verify.query_sig) ->
+        Ids.Callable_id.compare q.Mir_verify.qs_callable c = 0)
+      query_sigs
+    |> Option.map (fun q -> Array.length q.Mir_verify.qs_decl)
+  in
   match
-    Mono.build ~entry ~generic_types
+    Mono.build ~entry ~generic_types ~registered_only
       ~on_type_instance:(fun ti -> type_instances := ti :: !type_instances)
       prog
   with
@@ -2890,7 +3299,7 @@ let run_mono_phase ~(entry_name : string) ~(entry : Instance_id.t)
            Printf.printf "  mono: TYPE MATERIALIZATION FAILED\n";
            List.iter (fun e -> Printf.printf "    %s\n" e) errs;
            Error errs
-       | Ok final_prog ->
+       | Ok (final_prog, mat_map) ->
            let n_type_instances =
              Array.length final_prog.Seed_mir.types - Array.length prog.Seed_mir.types
            in
@@ -2914,13 +3323,55 @@ let run_mono_phase ~(entry_name : string) ~(entry : Instance_id.t)
            Printf.printf
              "  mono: post-instance count %d; residual Type_param positions %d (walked params/locals/instance args/operands/callees/statics/type defs)\n"
              post residual;
-           (match Mir_verify.require_valid_concrete final_prog with
+           (* the body-less-registered sigs the concrete verifier
+              resolves kept calls against are checker-side and mention
+              the ORIGINAL generic nominal template ids: the verifier's
+              post_rewrite (the materializer's (tid, args) -> fresh-id
+              map) reconciles them with the rewritten program, or a kept
+              call's destination (a rewritten local) disagrees with the
+              registered callee's return *)
+            let box_instances =
+              match box_tid with
+              | None -> []
+              | Some bt ->
+                  List.filter_map
+                    (fun (t, _, ntid) ->
+                      if Ids.Type_id.compare t bt = 0 then Some ntid else None)
+                    mat_map
+            in
+            let materialized_from =
+              program_max_type_id ~generic_types prog + 1
+            in
+            (match
+               Mir_verify.require_valid_concrete ~box_tid ~box_instances
+                 ~materialized_from
+                 ~post_rewrite:(rewrite_ty mat_map) ~query_sigs final_prog
+             with
             | Error errs ->
                 Printf.printf "  MONO_MIR_STRUCTURAL_GATE = FAIL\n";
                 List.iter (fun e -> Printf.printf "    %s\n" e) errs;
+                (if Sys.getenv_opt "TANGERINE_DEBUG_MONO_FNS" <> None then
+                   Array.iter
+                     (fun (f : Seed_mir.function_) ->
+                       let name = f.Seed_mir.name in
+                       if
+                         List.exists
+                           (fun frag ->
+                             let ln = String.length name and lf = String.length frag in
+                             lf > 0 && lf <= ln
+                             && (let rec go i =
+                                   if i + lf > ln then false
+                                   else if String.sub name i lf = frag then true
+                                   else go (i + 1)
+                                 in
+                                 go 0))
+                           [ "join"; "expand_expr"; "typed_kind_for"; "link_elf64" ]
+                       then Printf.printf "  --- fn %s ---\n%s\n" name
+                         (Seed_mir.print_function f))
+                     final_prog.Seed_mir.functions);
                 Error errs
             | Ok () ->
-                Printf.printf "  MONO_MIR_STRUCTURAL_GATE = PASS (%d functions)\n" post;
+                Printf.printf "  MONO_MIR_STRUCTURAL_GATE = PASS (%d functions) [seed-materialized-boundary=%d]\n" post materialized_from;
                 Ok
                   { mo_program = final_prog;
                     mo_entry = entry;
@@ -2929,7 +3380,11 @@ let run_mono_phase ~(entry_name : string) ~(entry : Instance_id.t)
                     mo_post_functions = post;
                     mo_post_instances = post;
                     mo_type_instances = n_type_instances;
-                    mo_residual_type_params = residual }))
+                    mo_residual_type_params = residual;
+                    mo_query_sigs = query_sigs;
+                    mo_post_rewrite = rewrite_ty mat_map;
+                    mo_box_instances = box_instances;
+                    mo_materialized_from = materialized_from }))
 
 let oracle_of_ctx (ctx : closure_ctx) (stats : mir_stats option) : oracle_counts =
   let s =
@@ -3281,8 +3736,10 @@ let run_bootstrap_closure ~(repo_root : string) ~(manifest_path : string)
         let tpl_ok =
           match
             Mir_verify.require_valid_template
-              ~generic_types:(closure_generic_types ctx.ctx_env)
-              prog
+                ~box_tid:(ctx.ctx_env.Typecheck.state.box_tid)
+                ~generic_types:(closure_generic_types ctx.ctx_env)
+                ~query_sigs:(closure_query_sigs ~lowered:(Some prog) ctx.ctx_env)
+                prog
           with
           | Ok () -> true
           | Error _ -> false
@@ -3306,7 +3763,9 @@ let run_bootstrap_closure ~(repo_root : string) ~(manifest_path : string)
         | Some (entry_name, entry_id) -> (
             match
               run_mono_phase ~entry_name ~entry:entry_id
+                ~box_tid:(ctx.ctx_env.Typecheck.state.box_tid)
                 ~generic_types:(closure_generic_types ctx.ctx_env)
+                ~query_sigs:(closure_query_sigs ~lowered:(Some prog) ctx.ctx_env)
                 prog
             with
             | Error _ ->
@@ -3446,11 +3905,20 @@ let cmd_bootstrap_check (args : string list) : int =
          let prog = lower_closure ctx in
          (match
             Mir_verify.require_valid_template
-              ~generic_types:(closure_generic_types ctx.ctx_env)
-              prog
+                ~box_tid:(ctx.ctx_env.Typecheck.state.box_tid)
+                ~generic_types:(closure_generic_types ctx.ctx_env)
+                ~query_sigs:(closure_query_sigs ~lowered:(Some prog) ctx.ctx_env)
+                prog
           with
           | Error errs ->
               Printf.printf "  SEED_MIR_STRUCTURAL_GATE = FAIL\n";
+              (if Sys.getenv_opt "TANGERINE_DEBUG_NAMES" <> None then
+                 List.iter
+                   (fun (tid, name) ->
+                     Printf.eprintf "DBG-TYPE %d %s\n" (Ids.Type_id.to_int tid) name)
+                   (List.sort
+                      (fun (a, _) (b, _) -> Ids.Type_id.compare a b)
+                      !Typecheck.type_names_global));
               List.iter (fun e -> Printf.printf "    %s\n" e) errs;
               (if Sys.getenv_opt "TANGERINE_DEBUG_DUP" <> None then
                  let tbl = Hashtbl.create 256 in
@@ -3470,19 +3938,89 @@ let cmd_bootstrap_check (args : string list) : int =
                        Printf.eprintf "GATE-DUP %s names=[%s]\n" k
                          (String.concat " | " names))
                    tbl);
-              (if Sys.getenv_opt "TANGERINE_DEBUG_GATE" <> None then
-                 Array.iter
-                   (fun (f : Seed_mir.function_) ->
-                     if f.Seed_mir.name = "record_block_exit_plan"
-                        || f.Seed_mir.name = "block_exit_key"
-                        || f.Seed_mir.name = "windows"
-                        || f.Seed_mir.name = "layout_new"
-                        || f.Seed_mir.name = "layout_array"
-                        || f.Seed_mir.name = "layout_from_size_align_unchecked"
-                     then
-                       Printf.printf "  --- fn %s ---\n%s\n" f.Seed_mir.name
-                         (Seed_mir.print_function f))
-                   prog.Seed_mir.functions);
+                (if Sys.getenv_opt "TANGERINE_DEBUG_GATE" <> None then
+                  let gate_dump_names =
+                    [ "record_block_exit_plan"; "block_exit_key"; "windows";
+                      "layout_new"; "layout_array"; "layout_from_size_align_unchecked";
+                      "pool_new"; "to_string";
+                      "arena_new"; "arena_reset"; "arena_destroy";
+                      "alloc_zeroed"; "alloc_array"; "box_new"; "dealloc";
+                      "dealloc_array"; "alloc"; "reallocate";
+                      "global_allocator_lock"; "unique_ptr_new";
+                      "allocate"; "deallocate";
+                      "try_unwrap"; "upgrade"; "downgrade"; "into_inner";
+                      "_zip_pair"; "entries_cloned"; "union"; "intersection";
+                      "strong_count"; "weak_count";
+                      "drop"; "clone"; "get"; "sub"; "len"; "first"; "last";
+                      "advance"; "format";
+                      "panic"; "panic_unwind"; "catch_unwind";
+                      "unwrap"; "unwrap_err"; "expect"; "expect_err";
+                      "starts_with"; "ends_with"; "rfind"; "last_index_of";
+                      "context"; "with_context"; "source"; "eq"; "values";
+                      "insert"; "remove"; "keys"; "new";
+                      "address_of"; "address_of_mut";
+                      "tg_vec_to_ruby"; "tg_map_to_ruby"; "ruby_stop";
+                      "ruby_eval"; "ruby_require"; "gem_name_to_module";
+                      "taint"; "taint_with_span"; "taint_merge"; "validate";
+                      "analyze_taint_flows";
+                      "read_to_end"; "read_line"; "read_exact"; "flush";
+                      "refill"; "fill_buf"; "read"; "write";
+                      "flush_buffer"; "parse_int"; "parse_u64_le";
+                      "close"; "read_to_vec"; "read_dir"; "create_dir_all";
+                      "parse_bench_args"; "_poll_fd_append";
+                      "path_canonicalize"; "load_baseline"; "get_env_bool";
+                      "has_flag_short"; "has_flag"; "wait_pid"; "wait_any";
+                      "set_current_dir"; "current_dir"; "run_benchmark";
+                      "run_benchmarks"; "determine_iterations";
+                      "should_run_bench"; "set_env"; "remove_env";
+                      "get_env"; "run_command"; "read_byte"; "write_byte";
+                      "with_cause"; "Timeval::to_bytes"; "Timespec::to_bytes"; "Timespec::from_bytes"; "read_byte"; "compute_statistics";
+                      "flags_after_double_dash"; "first_positional_arg";
+                      "path_parent"; "path_join"; "path_filename";
+                      "Command::spawn"; "compute_statistics";
+                      "list_directory"; "remove_dir_all";
+                      "compare_with_baseline"; "string_vec_to_argv";
+                      "env_keys"; "positional_args"; "get_flag_value";
+                      "pow10"; "run_command"; "read_dir"; "read_to_vec";
+                       "source"; "fmt"; "eq" ]
+                  in
+                  let gate_dump_extra =
+                    match Sys.getenv_opt "TANGERINE_DEBUG_GATE_EXTRA" with
+                    | Some s -> String.split_on_char ',' s
+                    | None -> []
+                  in
+                  let want_dump name =
+                    List.mem name gate_dump_names
+                    || List.exists
+                         (fun frag ->
+                           let ln = String.length name and lf = String.length frag in
+                           if lf = 0 || lf > ln then false
+                           else
+                             let rec go i =
+                               if i + lf > ln then false
+                               else if String.sub name i lf = frag then true
+                               else go (i + 1)
+                             in
+                             go 0)
+                         gate_dump_extra
+                  in
+                  (match Sys.getenv_opt "TANGERINE_DEBUG_GATE_FILE" with
+                   | Some path ->
+                       let oc = open_out path in
+                       Array.iter
+                         (fun (f : Seed_mir.function_) ->
+                           if want_dump f.Seed_mir.name then
+                             Printf.fprintf oc "  --- fn %s ---\n%s\n" f.Seed_mir.name
+                               (Seed_mir.print_function f))
+                         prog.Seed_mir.functions;
+                       close_out oc
+                   | None ->
+                       Array.iter
+                         (fun (f : Seed_mir.function_) ->
+                           if want_dump f.Seed_mir.name then
+                             Printf.printf "  --- fn %s ---\n%s\n" f.Seed_mir.name
+                               (Seed_mir.print_function f))
+                         prog.Seed_mir.functions));
               Printf.printf "EVIDENCE_MIR template_verify=fail concrete_verify=skipped\n";
               Printf.printf "EVIDENCE_HOST reachable_closure=skipped\n";
               Printf.printf "  RESULT = WIP\n";
@@ -3490,6 +4028,7 @@ let cmd_bootstrap_check (args : string list) : int =
           | Ok () ->
               Printf.printf "  SEED_MIR_STRUCTURAL_GATE = PASS (%d functions)\n"
                 (Array.length prog.Seed_mir.functions);
+              debug_mono_poison_names ctx prog;
               let stats = count_mir_stats prog in
               let incomplete = print_oracle_rows (oracle_of_ctx ctx (Some stats)) in
               Printf.printf "  FRONTEND_SEMANTIC_GATE = PASS\n";
@@ -3502,9 +4041,15 @@ let cmd_bootstrap_check (args : string list) : int =
                    Printf.printf "  RESULT = WIP\n";
                    1
                | Some (entry_name, entry) -> (
+                   debug_mono_poison_names ctx prog;
+                   let mono_query_sigs =
+                     closure_query_sigs ~lowered:(Some prog) ctx.ctx_env
+                   in
                    match
                      run_mono_phase ~entry_name ~entry
+                       ~box_tid:(ctx.ctx_env.Typecheck.state.box_tid)
                        ~generic_types:(closure_generic_types ctx.ctx_env)
+                       ~query_sigs:mono_query_sigs
                        prog
                    with
                    | Error _ ->
@@ -3518,7 +4063,15 @@ let cmd_bootstrap_check (args : string list) : int =
                           is a recorded fact (same check tg_evidence runs);
                           it does not change the gate's verdicts *)
                        let concrete_ok =
-                         match Mir_verify.require_valid mo.mo_program with
+                         match
+                           Mir_verify.require_valid_concrete
+                             ~box_tid:(ctx.ctx_env.Typecheck.state.box_tid)
+                             ~query_sigs:mo.mo_query_sigs
+                             ~post_rewrite:mo.mo_post_rewrite
+                             ~box_instances:mo.mo_box_instances
+                             ~materialized_from:mo.mo_materialized_from
+                             mo.mo_program
+                         with
                          | Ok () -> true
                          | Error _ -> false
                        in
@@ -3667,8 +4220,10 @@ let cmd_compile (args : string list) : int =
          let prog = lower_closure ctx in
          (match
             Mir_verify.require_valid_template
-              ~generic_types:(closure_generic_types ctx.ctx_env)
-              prog
+                ~box_tid:(ctx.ctx_env.Typecheck.state.box_tid)
+                ~generic_types:(closure_generic_types ctx.ctx_env)
+                ~query_sigs:(closure_query_sigs ~lowered:(Some prog) ctx.ctx_env)
+                prog
           with
           | Error errs ->
               Printf.printf "compile: FAILED — SEED_MIR_STRUCTURAL_GATE: %s\n" (String.concat "; " errs);
@@ -3683,7 +4238,9 @@ let cmd_compile (args : string list) : int =
               | Some (entry_name, entry) -> (
                   match
                     run_mono_phase ~entry_name ~entry
+                      ~box_tid:(ctx.ctx_env.Typecheck.state.box_tid)
                       ~generic_types:(closure_generic_types ctx.ctx_env)
+                      ~query_sigs:(closure_query_sigs ~lowered:(Some prog) ctx.ctx_env)
                       prog
                   with
                   | Error _ ->

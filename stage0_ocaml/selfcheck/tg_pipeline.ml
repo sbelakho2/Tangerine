@@ -103,8 +103,10 @@ let () =
               program.Ast.items
             |> List.mapi (fun i (n, e) -> (n, { e with Mir_lower.ce_callable = i }));
           methods = [];
+          callables_by_callable = [];
           fn_ret = Type_repr.Int Type_repr.Int;
           struct_fields = [];
+                enum_payloads = [];
         }
       in
       let mir_funcs =

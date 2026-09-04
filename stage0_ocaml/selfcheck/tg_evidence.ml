@@ -170,20 +170,32 @@ let () =
       let structural, mono_gate, pre, post, residual =
         if n_errors = 0 then begin
           let prog = Driver.lower_closure ctx in
+          let query_sigs =
+            Driver.closure_query_sigs ~lowered:(Some prog) ctx.Driver.ctx_env
+          in
+          let registered_only (c : Ids.Callable_id.t) : int option =
+            List.find_opt
+              (fun (q : Mir_verify.query_sig) ->
+                Ids.Callable_id.compare q.Mir_verify.qs_callable c = 0)
+              query_sigs
+            |> Option.map (fun q -> Array.length q.Mir_verify.qs_decl)
+          in
           match Mir_verify.require_valid prog with
           | Error _ -> ("FAIL", "SKIPPED", 0, 0, 0)
           | Ok () -> (
               match Driver.resolve_bootstrap_entry prog None with
               | None -> ("PASS", "SKIPPED", 0, 0, 0)
               | Some (_, entry) -> (
-                  match Mono.build ~entry prog with
+                  match Mono.build ~entry ~registered_only prog with
                   | Error _ -> ("PASS", "FAIL", Array.length prog.Seed_mir.functions, 0, 0)
                   | Ok fns ->
                       let mono_prog = { prog with Seed_mir.functions = fns } in
                       let pre = Array.length prog.Seed_mir.functions in
                       let post = Array.length fns in
                       let residual = Driver.count_residual_type_params mono_prog in
-                      (match Mir_verify.require_valid mono_prog with
+                      (match
+                         Mir_verify.require_valid_concrete ~query_sigs mono_prog
+                       with
                        | Error _ -> ("PASS", "FAIL", pre, post, residual)
                        | Ok () -> ("PASS", "PASS", pre, post, residual))))
         end

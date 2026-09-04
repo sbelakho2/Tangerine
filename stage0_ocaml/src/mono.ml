@@ -19,17 +19,32 @@
      internal errors (the lowerer must preserve generic substitutions
      through lowering);
    - every instance is specialized AT MOST once (a seen-set by instance);
-   - duplicate instances must be identical: re-discovering an instance
-     re-specializes it and compares structurally with the cached body —
-     an inconsistency is an error;
+   - re-discovering an instance is a no-op: the template lookup is
+     first-wins over the immutable input program and specialization is
+     deterministic, so a re-discovered instance would re-specialize to
+     the identical body (the input's one-function-per-callable check
+     above is the consistency authority); the drain's seen-set is a
+     Hashtbl, keeping the per-call-site duplicate test constant-time
+     instead of quadratic over the closure;
    - a generic call with an instance whose type arguments cannot be made
      concrete (an unsolved substitution) is fail-closed: the residual
      type parameter is reported and the build fails;
+   - a call whose callee has NO lowered template is fail-closed UNLESS
+     the callable is REGISTERED as body-less (the driver's
+     ~registered_only surface: extern-declared names, the
+     compiler-builtin method/constructor sigs, the derived
+     clone/to_string sigs and the size_of/align_of type queries — the
+     typed signatures the template verifier resolves through its
+     query-sig registry).  Such a call is already concrete and is KEPT
+     in the output as-is (no body can exist for it), under the same
+     exact-arity contract: the call's type arguments must number
+     exactly the sig's declared generic parameters;
    - the input program must not register two functions under one
      callable identity;
    - every embedded instance in the output (call callees, function
-     constants, closure aggregates) must be concrete AND present in the
-     output — "every generic call points to a concrete instance". *)
+     constants, closure aggregates) must be concrete AND either present
+     in the output or a kept body-less-registered call — "every generic
+     call points to a concrete instance". *)
 
 open Seed_mir
 
@@ -322,9 +337,13 @@ let walk_instances (body : function_) (f : Instance_id.t -> unit) : unit =
    body/signature is walked for concrete Named mentions of generic
    nominals and each first-discovered (tid, args) fires the hook (in
    discovery order).  With the defaults (empty registry, no-op hook)
-   the behavior is exactly the function-only monomorphizer. *)
+   the behavior is exactly the function-only monomorphizer.  The
+   optional registered_only surface (callable -> declared-parameter
+   count) names the typed-but-body-less callables whose concrete calls
+   the drain keeps instead of failing on the missing template. *)
 let build ~(entry : Instance_id.t) ?(generic_types : generic_def array = [||])
     ?(on_type_instance : type_instance -> unit = fun _ -> ())
+    ?(registered_only : (Ids.Callable_id.t -> int option) = fun _ -> None)
     (prog : program) : (function_ array, string list) result =
   let errors = ref [] in
   let err msg = errors := msg :: !errors in
@@ -339,33 +358,66 @@ let build ~(entry : Instance_id.t) ?(generic_types : generic_def array = [||])
              (Seed_mir.print_instance f.instance))
       else Hashtbl.add seen_callables (Instance_id.callable f.instance) ())
     prog.functions;
+  (* find_template is by-callable FIRST-WINS over the immutable input
+     program, so every lookup of one callable returns the same template:
+     memoize the template per callable (the per-call linear scan would
+     be O(templates × calls) over the closure). *)
+  let template_tbl : (Ids.Callable_id.t, function_) Hashtbl.t = Hashtbl.create 4096 in
+  Array.iter
+    (fun (f : function_) ->
+      let c = Instance_id.callable f.instance in
+      if not (Hashtbl.mem template_tbl c) then Hashtbl.add template_tbl c f)
+    prog.functions;
   let queue : work_item Queue.t = Queue.create () in
-  let seen : Instance_id.t list ref = ref [] in
-  let cache : (Instance_id.t * function_) list ref = ref [] in
+  (* membership and the body cache are Hashtbls (the drain would
+     otherwise be quadratic over the seen list at every call site);
+     the queue order alone is the deterministic output order *)
+  let seen : (Instance_id.t, unit) Hashtbl.t = Hashtbl.create 65536 in
+  let cache : (Instance_id.t, function_) Hashtbl.t = Hashtbl.create 65536 in
+  let cache_order : function_ list ref = ref [] in
+  (* body-less-registered call instances the drain kept (concrete calls
+     to callables with a typed sig but no lowered template): the final
+     validation must not demand a specialization for them *)
+  let kept_bodyless : (Instance_id.t, unit) Hashtbl.t = Hashtbl.create 1024 in
   let enqueue ~(template : function_) (inst : Instance_id.t) =
-    if List.mem inst !seen then begin
-      (* duplicate instance: must be identical *)
-      match List.assoc_opt inst !cache with
-      | Some cached ->
-          let fresh = specialize template inst in
-          if fresh <> cached then
-            err
-              (Printf.sprintf "mono: inconsistent duplicate instance %s (two specializations of the same instance differ)"
-                 (Seed_mir.print_instance inst))
-      | None -> ()
-    end
+    if Hashtbl.mem seen inst then ()
     else begin
-      seen := inst :: !seen;
+      Hashtbl.add seen inst ();
       Queue.add { instance = inst; fn = template } queue
     end
   in
   let enqueue_instance (inst : Instance_id.t) =
-    match find_template prog inst with
+    match Hashtbl.find_opt template_tbl (Instance_id.callable inst) with
     | Some tmpl -> enqueue ~template:tmpl inst
-    | None ->
-        err
-          (Printf.sprintf "mono: no template function for instance %s"
-             (Seed_mir.print_instance inst))
+    | None -> (
+        (* No lowered template: the callee may still be a REGISTERED
+           body-less callable — an extern-declared name, a
+           compiler-builtin method/constructor, a derived clone/
+           to_string sig or a size_of/align_of type-query — whose typed
+           signature lives in the checker's tables but which no source
+           module implements (the template verifier resolves the same
+           calls through its query-sig registry).  Such a call is
+           already CONCRETE and needs no specialization: it is kept in
+           the output as-is (the caller's substitution was already
+           applied to its instance) and verified against the registered
+           sig post-mono.  The exact-arity contract applies unchanged:
+           the call's type arguments must number exactly the sig's
+           declared generic parameters (the driver's registry carries
+           the same declaration the template verifier used, so an
+           arity disagreement is the same internal error). *)
+        match registered_only (Instance_id.callable inst) with
+        | None ->
+            err
+              (Printf.sprintf "mono: no template function for instance %s"
+                 (Seed_mir.print_instance inst))
+        | Some declared ->
+            let carried = Array.length (Instance_id.type_args inst) in
+            if declared <> carried then
+              err
+                (Printf.sprintf
+                   "mono: body-less callee %s declares %d generic parameter(s) but the call carries %d type argument(s)"
+                   (Seed_mir.print_instance inst) declared carried)
+            else Hashtbl.replace kept_bodyless inst ())
   in
   (* the concrete type-instance queue: dedup by (tid, args); the hook
      fires at FIRST discovery, so the driver's materialization sees each
@@ -432,7 +484,7 @@ let build ~(entry : Instance_id.t) ?(generic_types : generic_def array = [||])
     end
   in
   (* seed: entry + static initializers *)
-  (match find_template prog entry with
+  (match Hashtbl.find_opt template_tbl (Instance_id.callable entry) with
    | Some tmpl -> enqueue ~template:tmpl entry
    | None ->
        err
@@ -460,7 +512,8 @@ let build ~(entry : Instance_id.t) ?(generic_types : generic_def array = [||])
     | Error m -> err m
     | Ok subst ->
         let body = specialize_under subst wi.fn wi.instance in
-        cache := (wi.instance, body) :: !cache;
+        Hashtbl.replace cache wi.instance body;
+        cache_order := body :: !cache_order;
         walk_instances body (fun inst -> enqueue_instance (subst_instance subst inst));
         scan_body_types body
   done;
@@ -469,9 +522,10 @@ let build ~(entry : Instance_id.t) ?(generic_types : generic_def array = [||])
   let concrete (inst : Instance_id.t) =
     not (Array.exists Type_repr.has_type_param (Instance_id.type_args inst))
   in
-  let in_output (inst : Instance_id.t) = List.mem_assoc inst !cache in
+  let in_output (inst : Instance_id.t) = Hashtbl.mem cache inst in
   List.iter
-    (fun (inst, body) ->
+    (fun (body : function_) ->
+      let inst = body.instance in
       if not (concrete inst) then
         err
           (Printf.sprintf "mono: instance %s has unresolved type arguments" (Seed_mir.print_instance inst));
@@ -494,11 +548,11 @@ let build ~(entry : Instance_id.t) ?(generic_types : generic_def array = [||])
             err
               (Printf.sprintf "mono: call in %s points to instance %s with unresolved type arguments"
                  body.name (Seed_mir.print_instance i));
-          if not (in_output i) then
+          if not (in_output i) && not (Hashtbl.mem kept_bodyless i) then
             err
               (Printf.sprintf "mono: call in %s points to instance %s that was never specialized"
                  body.name (Seed_mir.print_instance i))))
-    !cache;
+    !cache_order;
   match !errors with
-  | [] -> Ok (Array.of_list (List.rev (List.map snd !cache)))
+  | [] -> Ok (Array.of_list (List.rev !cache_order))
   | errs -> Error (List.rev errs)

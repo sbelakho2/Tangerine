@@ -115,6 +115,14 @@ type func_env = {
   consts : (string * (Type_repr.t * Seed_mir.constant)) list;  (* const/static name -> repr + value *)
   statics : (string * (int * Type_repr.t)) list;  (* static/global name -> (program.statics index, type) — the MUTABLE GLOBAL storage root *)
   callables : (string * callable_entry) list;        (* function name -> resolved entry *)
+  (* the by-CALLABLE index of the same entries (qualified keys only, no
+     bare-name duplicates): a bare function name can collide across
+     modules (`types.tg` and `resource_check.tg` both declare
+     `check_expr`), and the ARGUMENT CONVENTIONS must come from the
+     CHECKER-RESOLVED callee's own signature (the typed channel's
+     tn_call callable id), never from whichever module's same-named
+     entry won the bare-name lookup *)
+  callables_by_callable : (int * callable_entry) list;
   methods : ((string * string) * method_entry) list;  (* (receiver type name, method) -> instance + sig contracts *)
   fn_ret : Type_repr.t;
   (* The typed nominal registry (re-audit finding: Field access reached
@@ -131,6 +139,15 @@ type func_env = {
      nominals — the same scheme type_of_syntax uses). *)
   struct_fields :
     (Ids.Type_id.t * (string * Ids.Field_id.t * Type_repr.t * Ast.expr option) list) list;
+  (* the enum defs' variant payload shapes (name -> variant names with
+     their DECLARATION-scope payload types), for the copyability rule —
+     an enum is bit-copyable iff every variant's payload is bit-copyable
+     (a payload-less enum is Copy), the verifier's recursive enum rule.
+     Without the payload shapes the lowerer must classify every user enum
+     as owning (move), which disagrees with the reference model's Copy
+     answer for the payload-less enum kinds (AccessEffect,
+     AccessConvention, TokenKind-adjacent kinds). *)
+  enum_payloads : (Ids.Type_id.t * (string * Type_repr.t list) list) list;
 }
 
 (* ── The persistent typed-node channel (re-audit: TypedProgram/TypedHIR
@@ -185,6 +202,7 @@ type variant_spec = {
   vs_id : Ids.Variant_id.t;         (* SEMANTIC variant identity (registry-minted — never derived from vs_index) *)
   vs_index : int;                   (* runtime tag = declaration-order variant index *)
   vs_fields : Type_repr.t list;     (* payload field types (concrete) *)
+  vs_field_names : string list;     (* DECLARATION-order braced-field names ([] = positional payload / unknown) *)
 }
 
 (* Semantic variant identity of a table spec: the spec's OWN vs_id —
@@ -245,7 +263,7 @@ let builtin_variant_spec (tbl : variant_table) (enum_name : string) (vname : str
         | "Err" -> if Array.length args > 1 then [ args.(1) ] else []
         | _ -> []
       in
-      Some { vs_id = vid; vs_index = idx; vs_fields = fields }
+      Some { vs_id = vid; vs_index = idx; vs_fields = fields; vs_field_names = [] }
 
 let variant_spec_of (_env : func_env) (tbl : variant_table) ~(enum_name : string)
     ~(vname : string) ~(repr : Type_repr.t) : variant_spec =
@@ -514,21 +532,175 @@ let element_type_of (t : Type_repr.t) : Type_repr.t =
   | Type_repr.Tuple _ -> Type_repr.Int Type_repr.Int
   | _ -> seed_bug "element access on a non-iterable type %s" (Seed_mir.print_type t)
 
-(* Conservative copyability for payload binding: the verifier's enum
-   rule is recursive (an enum is Copy iff every variant payload is Copy)
-   but the lowering has no def table, so Named values are conservatively
-   non-copy (a projected Move is wrong: the seed VM's Move ignores
-   projections, so non-copy payload binding fails closed). *)
-let rec copyable_ty (t : Type_repr.t) : bool =
+(* Copyability for payload binding: the verifier's rule is recursive and
+   def-resolved (a struct is Copy iff every field is Copy, an enum iff
+   every variant payload is Copy) — but the lowering has no def table, so
+   Named values used to be conservatively non-copy.  The typed field
+   registry (env.struct_fields — every STRUCT nominal of the closure,
+   generic templates included, in the nominal's own parameter scope)
+   restores the verifier's structural rule for the raw-pointer handles
+   and scalar structs (Ptr[T] = {address: UInt} is Copy), while the
+   OWNED LangItem nominals (collections/Option/Result/Box — the seed
+   ownership model) and the compiler-only nominals with no declared
+   fields stay conservative non-copy. *)
+let rec copyable_ty env (t : Type_repr.t) : bool =
+  copyable_ty_seen env [] t
+
+and copyable_ty_seen env (seen : Ids.Type_id.t list) (t : Type_repr.t) : bool =
   match t with
   | Type_repr.Unit | Type_repr.Bool | Type_repr.Char | Type_repr.Int _
   | Type_repr.Float _ | Type_repr.Raw_ptr _ | Type_repr.Ref_internal _
   | Type_repr.Function _ | Type_repr.Never | Type_repr.Error ->
       true
   | Type_repr.String -> false
-  | Type_repr.Tuple elems -> Array.for_all copyable_ty elems
-  | Type_repr.Fixed_array (e, _) -> copyable_ty e
-  | Type_repr.Named _ | Type_repr.Type_param _ | Type_repr.Infer_var _ | Type_repr.Int_literal _ -> false
+  | Type_repr.Tuple elems -> Array.for_all (copyable_ty_seen env seen) elems
+  | Type_repr.Fixed_array (e, _) -> copyable_ty_seen env seen e
+  | Type_repr.Named (tid, _args) ->
+      if List.exists (fun s -> Ids.Type_id.compare s tid = 0) seen then false
+      else
+        let seen' = tid :: seen in
+        let owned_langitem =
+          List.exists
+            (fun (n, ty) ->
+              match ty with
+              | Type_repr.Named (t2, _) ->
+                  Ids.Type_id.compare t2 tid = 0
+                  && List.mem n
+                       [ "Vec"; "Array"; "List"; "Map"; "HashMap"; "Set"; "HashSet";
+                         "Option"; "Result"; "Box"; "Rc"; "WeakRc"; "UniquePtr";
+                         "ArcStrong"; "WeakArc"; "RcInner"; "ArcInnerWeak" ]
+              | _ -> false)
+            env.types
+        in
+        if owned_langitem then false
+        else
+          (match List.assoc_opt tid env.struct_fields with
+           | Some fields ->
+               (* the field types are recorded in the nominal's own
+                  parameter scope — a field that MENTIONS the nominal's
+                  own param stays conservative non-copy (S[T] { x: T } is
+                  Copy only for Copy args), while a field that never
+                  mentions it (Ptr[T] = { address: UInt }) is Copy for
+                  every instantiation — the same def-structural rule the
+                  verifier's property engine applies *)
+               List.for_all
+                 (fun (_fname, _fid, fty, _default) -> copyable_ty_seen env seen' fty)
+                 fields
+           | None -> (
+               match List.assoc_opt tid env.enum_payloads with
+               | None -> false
+               | Some variants ->
+                   (* an enum is Copy iff every variant's payload is Copy
+                      (the verifier's recursive enum rule); a payload-less
+                      enum is Copy *)
+                   List.for_all
+                     (fun (_vname, pty) -> List.for_all (copyable_ty_seen env seen') pty)
+                     variants))
+  | Type_repr.Type_param _ | Type_repr.Infer_var _ | Type_repr.Int_literal _ -> false
+
+(* Whether a value type is DEFINITELY owned — never Copy under the
+   verifier's rule — WITHOUT a def table: the owned builtin nominals the
+   verifier classifies by name (the LangItem universe: the collections,
+   Option/Result, Box) and the owned scalars (String).  User structs are
+   deliberately EXCLUDED: the verifier resolves their defs (a struct of
+   scalars is Copy), so their value form keeps the Copy operand (the
+   method-call surface's contract) — the Read conversion applies only
+   where ownership is definite. *)
+let rec owned_ty (env : func_env) (t : Type_repr.t) : bool =
+  match t with
+  | Type_repr.String -> true
+  | Type_repr.Type_param _ | Type_repr.Infer_var _ | Type_repr.Int_literal _ -> true
+  | Type_repr.Named (tid, args) ->
+      let owned_named =
+        List.exists
+          (fun (n, ty) ->
+            match ty with
+            | Type_repr.Named (t2, _) ->
+                Ids.Type_id.compare t2 tid = 0
+                && List.mem n
+                     [ "Vec"; "Array"; "List"; "Map"; "HashMap"; "Set"; "HashSet";
+                       "Option"; "Result"; "Box" ]
+            | _ -> false)
+          env.types
+      in
+      owned_named || Array.exists (owned_ty env) args
+  | Type_repr.Tuple elems -> Array.exists (owned_ty env) elems
+  | Type_repr.Fixed_array (e, _) -> owned_ty env e
+  | Type_repr.Unit | Type_repr.Bool | Type_repr.Char | Type_repr.Int _
+  | Type_repr.Float _ | Type_repr.Raw_ptr _ | Type_repr.Ref_internal _
+  | Type_repr.Function _ | Type_repr.Never | Type_repr.Error ->
+      false
+
+(* The Box nominal's tid (identified by NAME through env.types — the
+   same name-anchored scheme the typechecker uses). *)
+let box_tid_of (env : func_env) : Ids.Type_id.t option =
+  List.find_map
+    (fun (name, r) ->
+      match r with
+      | Type_repr.Named (t, _) when name = "Box" -> Some t
+      | _ -> None)
+    env.types
+
+(* The arm-join store rule mirrors the VERIFIER's type compatibility
+   (types_compatible's leading clauses), not a raw Type_repr.compare: a
+   checker-accepted join can pair arm value types that differ only in
+   the forms the checker unifies transparently —
+     - Box[T] vs T (the checker's transparent-Box unify — an
+       ExprMethodCall arm's recv payload is Box[Expr] while the
+       wildcard arm's `value` is Expr: the join slot takes the first
+       arm's type and the second arm's store was dropped, leaving the
+       slot uninitialized on the wildcard path);
+     - Int_literal vs a concrete integer kind whose range fits (the
+       `Option::None`-vs-`Option::Some(8)` arm kinds: the None ctor's
+       resolved type stays Option[int-literal] while the Some arms
+       adopt Option[Int]).
+   The verifier accepts the resulting store (the same rules), so a
+   compatible-but-not-identical arm value must STORE — dropping it is
+   the possibly-uninitialized-join class.  Types the verifier rejects
+   (String-into-Int arms — the checker's Discarded-context drops) stay
+   dropped. *)
+let rec int_literal_fits_kind (k : Type_repr.int_kind) (m : Big_nat.t) : bool =
+  let p : Literal.parsed_integer =
+    { original = ""; radix = 10; magnitude = m; suffix = Literal.No_int_suffix;
+      span = Span.synthetic }
+  in
+  let signed =
+    match k with
+    | Type_repr.I8 | Type_repr.I16 | Type_repr.I32 | Type_repr.I64 | Type_repr.Int ->
+        true
+    | Type_repr.U8 | Type_repr.U16 | Type_repr.U32 | Type_repr.U64
+    | Type_repr.U128 | Type_repr.I128 | Type_repr.UInt ->
+        false
+  in
+  let width =
+    match k with
+    | Type_repr.I8 | Type_repr.U8 -> 8
+    | Type_repr.I16 | Type_repr.U16 -> 16
+    | Type_repr.I32 | Type_repr.U32 -> 32
+    | Type_repr.I64 | Type_repr.U64 -> 64
+    | Type_repr.I128 | Type_repr.U128 -> 128
+    | Type_repr.Int | Type_repr.UInt -> 64
+  in
+  if signed then Literal.fits_signed p width else Literal.fits_unsigned p width
+
+and join_types_compatible (env : func_env) (a : Type_repr.t) (b : Type_repr.t) : bool =
+  let is_box tid =
+    match box_tid_of env with Some bt -> Ids.Type_id.compare tid bt = 0 | None -> false
+  in
+  match a, b with
+  | Type_repr.Named (ta, [| t |]), u when is_box ta -> join_types_compatible env t u
+  | u, Type_repr.Named (ta, [| t |]) when is_box ta -> join_types_compatible env u t
+  | Type_repr.Named (ta, aargs), Type_repr.Named (tb, bargs)
+    when Ids.Type_id.compare ta tb = 0 && Array.length aargs = Array.length bargs ->
+      let ok = ref true in
+      Array.iteri
+        (fun i t -> if not (join_types_compatible env t bargs.(i)) then ok := false)
+        aargs;
+      !ok
+  | Type_repr.Int_literal m, Type_repr.Int k | Type_repr.Int k, Type_repr.Int_literal m ->
+      int_literal_fits_kind k m
+  | Type_repr.Int_literal _, Type_repr.Int_literal _ -> true
+  | _ -> Type_repr.compare a b = 0
 
 (* ── Defer machinery ─────────────────────────────────────────────
 
@@ -748,6 +920,46 @@ let operand_of_value (_st : lower_state) (v : Seed_mir.constant) : Seed_mir.oper
 
 let copy_place (_st : lower_state) (p : Seed_mir.place) : Seed_mir.operand =
   Seed_mir.Copy p
+
+(* The owning-value JOIN rule: a bitwise Copy of a non-Copy owning
+   value is exactly what the verifier rejects, so every value position
+   that hands an owning value to a join/aggregate local converts the
+   Copy to a READ of the source place — the same convention the
+   call-argument lowering applies to Let parameters, the aggregate
+   constructors apply to owning fields and the match lowering applies
+   to its subject: the read loads the value's bytes without consuming
+   the source slot (the seed's join locals are plain value slots; a
+   Move here would consume a possibly-still-live enclosing local — the
+   if/match arm-value class where the arm tail names a live `out`). *)
+let owned_read (env : func_env) (oty : Type_repr.t) (op : Seed_mir.operand) :
+    Seed_mir.operand =
+  match op with
+  | Seed_mir.Copy p when not (copyable_ty env oty) -> Seed_mir.Read p
+  | op -> op
+
+(* The ref-ABI aliasing rule: a let-bound REFERENCE (the Ptr::as_ref
+   result — a compiler-builtin ABI temporary that may only ever appear
+   as a direct call argument) must never be copied into a second local
+   (`_3 = _2` is a ref-typed value used outside a call argument).  When
+   the initializer is a bare read of an existing local (a call
+   destination), the binding ALIASES that local instead: no assignment
+   is emitted and the name resolves to the source local. *)
+let ref_binding_source (vt : Type_repr.t) (vo : Seed_mir.operand) : int option =
+  match vt, vo with
+  | Type_repr.Ref_internal (_, _), (Seed_mir.Copy p | Seed_mir.Read p) -> (
+      match p.Seed_mir.root with
+      | Seed_mir.Local lid when p.Seed_mir.projections = [] -> Some lid
+      | _ -> None)
+  | _ -> None
+
+(* Whether a type is the seed's Unit form (Unit or the empty tuple —
+   the `()` literal lowers to the empty tuple).  A statement-position
+   if/match arm whose value is Unit contributes no result to the join. *)
+let is_unit_ty (ty : Type_repr.t) : bool =
+  ty = Type_repr.Unit
+  || match ty with
+     | Type_repr.Tuple a -> Array.length a = 0
+     | _ -> false
 
 (* Map an AST binary operator to Seed MIR. *)
 let bin_op_of (op : Ast.binary_op) : Seed_mir.bin_op =
@@ -1047,15 +1259,24 @@ and lower_argument (env : func_env) (st : lower_state) (conv : Access_effect.t)
   match eff with
   | Access_effect.Read -> (
       match op with
-      | Seed_mir.Copy p when not (copyable_ty ty) ->
+      | Seed_mir.Copy p when not (copyable_ty env ty) ->
           { Seed_mir.effect_ = Access_effect.Read; value = Seed_mir.Read p }
       | _ -> { Seed_mir.effect_ = Access_effect.Read; value = op })
-  | Access_effect.Modify -> { Seed_mir.effect_ = Access_effect.Modify; value = op }
+  | Access_effect.Modify -> (
+      (* an inout-declared parameter whose argument is a CONSTANT (the
+         kernel's `emit_uleb128(&mut buf, 1)` — the callee mutates its
+         own copy of the value and the writeback to a constant would be
+         meaningless; the checker sanctions the shape) lowers with the
+         READ effect — the value transfers by value, no writeback
+         channel (the verifier's modify-is-a-constant rejection) *)
+      match op with
+      | Seed_mir.Constant _ -> { Seed_mir.effect_ = Access_effect.Read; value = op }
+      | _ -> { Seed_mir.effect_ = Access_effect.Modify; value = op })
   | Access_effect.Consume -> (
       match op with
       | Seed_mir.Copy p ->
           let value =
-            if copyable_ty ty then Seed_mir.Copy p
+            if copyable_ty env ty then Seed_mir.Copy p
             else Seed_mir.Move p
             (* re-audit P12: a PROJECTED sink of a non-Copy owning
                value lowers as the projected Move — the VM executes the
@@ -1115,7 +1336,7 @@ and lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
       | Ok (u, _) -> (Seed_mir.Constant (Seed_mir.Char u), Type_repr.Char)
       | Error _ -> seed_bug "invalid char literal")
   | Ast.BoolLit (_, b, _) -> (Seed_mir.Constant (Seed_mir.Bool b), Type_repr.Bool)
-  | Ast.Name (_, n, _) -> (
+  | Ast.Name (nid, n, _) -> (
       match List.assoc_opt n st.scope with
       | Some id -> (
           match local_type st id with
@@ -1131,6 +1352,13 @@ and lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
                 | None ->
                     seed_bug "enum constructor `%s` has no registered result type in the lowering env" n
               in
+              (* the checker's resolved result type (the value's node
+                 record, journal-substituted) is authoritative when the
+                 typed channel is present — a nullary ctor declares a
+                 generic param (`Option::None` declares T) that no
+                 argument can bind, so the raw declaration form must
+                 never reach a local *)
+              let ty = call_result_ty st nid ty in
               let spec = variant_spec_of env st.variants ~enum_name ~vname ~repr:ty in
               let id = fresh_local st ty in
               emit st
@@ -1159,19 +1387,36 @@ and lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
   | Ast.Path (_, a, b, span) -> (
       ignore span;
       seed_bug "path value `%s::%s` reached lowering without a resolved callable identity" a b)
-  | Ast.Binary (_, l, op, r, _) ->
+   | Ast.Binary (_, l, op, r, _) ->
       let lo, lt = lower_expr env st l in
-      let ro, _rt = lower_expr env st r in
+      let ro, rt = lower_expr env st r in
       let result_ty =
         match op with
         | Ast.Eq | Ast.NotEq | Ast.Lt | Ast.LtEq | Ast.Gt | Ast.GtEq | Ast.BOr | Ast.BAnd ->
             Type_repr.Bool
         | _ -> lt
       in
+      (* the String CONCAT/comparison read rule: `+` on Strings is the
+         seed's concat operator and ==/!=/< comparisons execute on
+         String CONTENT (the VM's BinaryOp executes String ^ and the
+         ordering/equality forms), and these operations READ their
+         operands — an owning String place never enters a BinaryOp as a
+         bitwise Copy (the verifier's no-copy-of-non-Copy rule; the
+         same conversion lower_argument applies to Let parameters).
+         The conversion also covers a generic element type (the
+         T-param element comparisons in the kernel's Copy-bounded
+         container methods): a possibly-owning place never enters a
+         BinaryOp as a bitwise Copy — a place READ is the legal form. *)
+      let string_op (opnd : Seed_mir.operand) (oty : Type_repr.t) : Seed_mir.operand =
+        match opnd with
+        | Seed_mir.Copy p when not (copyable_ty env oty) -> Seed_mir.Read p
+        | _ -> opnd
+      in
       let id = fresh_local st result_ty in
       emit st
         (Seed_mir.Assign
-           (cur_place st id, Seed_mir.BinaryOp (bin_op_of op, lo, ro)));
+           ( cur_place st id,
+             Seed_mir.BinaryOp (bin_op_of op, string_op lo lt, string_op ro rt) ));
       (copy_place st (cur_place st id), result_ty)
   | Ast.Unary (_, op, inner, _) -> (
       match op with
@@ -1193,11 +1438,74 @@ and lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
           emit st
             (Seed_mir.Assign (cur_place st id, Seed_mir.BinaryOp (Seed_mir.BitXor, io, all_ones)));
           (copy_place st (cur_place st id), it)
-      | Ast.Deref | Ast.Borrow | Ast.BorrowMut ->
+      | Ast.Deref ->
+          (* a VALUE-position raw deref read (deref of addr — the
+             Slice::get pointee load): materialize the base PLACE and
+             return the READ of the place-with-Deref projection.  A
+             read LOADS the pointee (the backing element stays owned
+             by its container); it is never a bitwise Copy of a
+             possibly-owning pointee and never a Move (a Move would
+             write the Moved hole into the payload). *)
+          let io, it = lower_expr env st inner in
+          let p = materialize_place st io in
+          (* the generic-pointer model: a deref of an UNINSTANTIATED
+             generic operand passes the operand through (`*item` in
+             Set::unwrap's `item: T` — the pointee IS the parameter
+             until the instantiation resolves), so the lowering emits
+             NO Deref projection over the param — a plain self read
+             (a Deref projection over a non-pointer T would be the
+             verifier's deref-on-non-pointer finding) *)
+          let generic_self_deref =
+            match it with Type_repr.Type_param _ -> true | _ -> false
+          in
+          let pointee_ty =
+            match it with
+            | Type_repr.Raw_ptr (_, t) | Type_repr.Ref_internal (_, t) -> t
+            | Type_repr.Named (id, args)
+              when (Ids.Type_id.compare id (Ids.Type_id.make 5) = 0
+                    || Ids.Type_id.compare id (Ids.Type_id.make 6) = 0
+                    || Option.is_some (transparent_nominal_name_of env id))
+                   && Array.length args = 1 ->
+                (* the Ptr/PtrMut handle nominals AND the kernel's Box
+                   wrapper (transparent_nominal_name_of — the checker's
+                   deref-on-field/place transparency: Box[T] derefs to
+                   its single type argument, so a `*box` read loads the
+                   CONTENT, never the wrapper) *)
+                args.(0)
+            | _ -> it
+          in
+          (* the checker's deref pass-through (types.tg ExprRawDeref):
+             a deref whose operand is NOT a pointer-like kind was
+             accepted only as the pass-through forms — a deref of a
+             VALUE expression (`*(p as Int)` — the raw-address spelling
+             whose type is value-level) or the kernel's
+             inout-param deref writeback (`*current_loop_entry = ...` —
+             "access through the parameter is direct").  Those emit NO
+             Deref projection: the read/write is the operand place
+             itself (a projection over the non-pointer local would be
+             the verifier's deref-on-non-pointer finding). *)
+          let projs =
+            if generic_self_deref then p.Seed_mir.projections
+            else
+              match it with
+              | Type_repr.Raw_ptr _ | Type_repr.Ref_internal _
+              | Type_repr.Named _ when
+                    (match it with
+                     | Type_repr.Named (id, _) ->
+                         Ids.Type_id.compare id (Ids.Type_id.make 5) = 0
+                         || Ids.Type_id.compare id (Ids.Type_id.make 6) = 0
+                         || Option.is_some (transparent_nominal_name_of env id)
+                     | _ -> false) ->
+                  p.Seed_mir.projections @ [ Seed_mir.Deref ]
+              | _ -> p.Seed_mir.projections
+          in
+          ( Seed_mir.Read { p with Seed_mir.projections = projs },
+            pointee_ty )
+      | Ast.Borrow | Ast.BorrowMut ->
           lower_expr env st inner)
   | Ast.Cast (nid, inner, ty, span) ->
       ignore span;
-      let io, _ = lower_expr env st inner in
+      let io, it = lower_expr env st inner in
       (* the typed channel is authoritative when present: the target is
          the checker's resolved type (declaration-owned GenericParamIds),
          not type_of_syntax's positional KParam(make i) reconstruction
@@ -1211,32 +1519,73 @@ and lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
             | None -> node.tn_type)
         | None -> type_of_syntax env ty
       in
+      (* the cast operand of a non-Copy value is a place READ, never a
+         bitwise Copy (the verifier's no-copy-of-non-Copy rule — the
+         ffi address_of casts of a generic inout value, `v as Ptr[T]`) *)
+      let io =
+        match io with
+        | Seed_mir.Copy p when not (copyable_ty env it) -> Seed_mir.Read p
+        | _ -> io
+      in
       let id = fresh_local st rt in
       emit st (Seed_mir.Assign (cur_place st id, Seed_mir.Cast (io, rt)));
       (copy_place st (cur_place st id), rt)
   | Ast.Tuple (_, elems, _) ->
-      (* each element is lowered exactly once *)
+      (* each element is lowered exactly once; an OWNING element value
+         transfers into the tuple by Move (the tuple construction
+         consumes the element's slot — `_zip_pair`'s `(a, b)` of owning
+         params is a verifier copy-of-non-Copy finding as a bitwise
+         Copy) *)
+      if elems = [] then
+        (* the unit literal `()`: the checker types it Type_repr.Unit —
+           the lowering materializes the UNIT CONSTANT, never an
+           empty-tuple aggregate local (an empty-tuple local would be a
+           Tuple[||]-typed value and every Unit-expecting site — enum
+           payloads, aggregates, params — would fail the verifier's
+           Unit-vs-empty-tuple compatibility, the `expected () got ()`
+           aggregate class) *)
+        (Seed_mir.Constant Seed_mir.Unit, Type_repr.Unit)
+      else begin
       let lowered = List.map (fun e -> lower_expr env st e) elems in
-      let ops = List.map fst lowered in
+      let ops = List.map2 (fun (op, ty) _ -> owned_read env ty op) lowered lowered in
       let tys = List.map snd lowered in
       let rt = Type_repr.Tuple (Array.of_list tys) in
       let id = fresh_local st rt in
       emit st (Seed_mir.Assign (cur_place st id, Seed_mir.Aggregate (Seed_mir.TupleAgg, ops)));
       (copy_place st (cur_place st id), rt)
-  | Ast.Array (_, elems, _) ->
+      end
+  | Ast.Array (nid, elems, _) ->
       let lowered = List.map (fun e -> lower_expr env st e) elems in
-      let ops = List.map fst lowered in
+      let ops = List.map2 (fun (op, ty) _ -> owned_read env ty op) lowered lowered in
       let tys = List.map snd lowered in
       let elem_ty =
         match tys with
         | t :: _ -> t
         | [] -> Type_repr.Unit
       in
-      let rt = Type_repr.Fixed_array (elem_ty, List.length elems) in
+      (* re-audit (the literal-kind channel, VEC-form): the checker
+         records an array literal checked against a Vec[T] expectation
+         (`Vec::from([x])`, `entries.append([item])` — the kernel's
+         Vec-param call sites) as the Named Vec form (the array
+         handler's expected-adoption); the aggregate local must carry
+         the CHECKER's form — Vec values are the runtime ArrayAgg shape
+         (the VM builds Vm_value.Array from an ArrayAgg into a Vec-typed
+         slot) — never the raw Fixed_array form that fails the callee's
+         Vec element check (`expected type#0[..] got [..; n]`) *)
+      let rt =
+        match typed_node_of st nid with
+        | Some node -> (
+            match node.tn_type with
+            | Type_repr.Named (id, [| e |])
+              when Ids.Type_id.compare id (Ids.Type_id.make 0) = 0 ->
+                Type_repr.Named (id, [| e |])
+            | _ -> Type_repr.Fixed_array (elem_ty, List.length elems))
+        | None -> Type_repr.Fixed_array (elem_ty, List.length elems)
+      in
       let id = fresh_local st rt in
       emit st (Seed_mir.Assign (cur_place st id, Seed_mir.Aggregate (Seed_mir.ArrayAgg, ops)));
       (copy_place st (cur_place st id), rt)
-  | Ast.MacroCall (_, n, args, _) -> (
+  | Ast.MacroCall (mnid, n, args, _) -> (
       (* the `vec![...]` macro lowers to the array aggregate (the E9049
          vec! form is retired); every other macro fails closed *)
       match n with
@@ -1260,14 +1609,30 @@ and lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
                     seed_bug "vec! with raw tokens is not lowered (macro argument is not an expression)")
               args
           in
-          let ops = List.map fst lowered in
+          let ops = List.map2 (fun (op, ty) _ -> owned_read env ty op) lowered lowered in
           let tys = List.map snd lowered in
           let elem_ty =
             match tys with
             | t :: _ -> t
             | [] -> Type_repr.Unit
           in
-          let rt = Type_repr.Fixed_array (elem_ty, List.length args) in
+          (* the vec! macro IS Vec (the checker types every vec! call
+             node as the Named Vec form — the kernel declares vec! as
+             Vec::from sugar); the aggregate local must carry the
+             checker's Vec nominal, never the Fixed-array fallback (the
+             `expected Vec[..] got [..; n]` call/field classes at the
+             kernel's vec! call sites — Vec values are the runtime
+             ArrayAgg shape built into a Vec-typed slot) *)
+          let rt =
+            match typed_node_of st mnid with
+            | Some node -> (
+                match node.tn_type with
+                | Type_repr.Named (id, [| e |])
+                  when Ids.Type_id.compare id (Ids.Type_id.make 0) = 0 ->
+                    Type_repr.Named (id, [| e |])
+                | _ -> Type_repr.Fixed_array (elem_ty, List.length args))
+            | None -> Type_repr.Fixed_array (elem_ty, List.length args)
+          in
           let id = fresh_local st rt in
           emit st (Seed_mir.Assign (cur_place st id, Seed_mir.Aggregate (Seed_mir.ArrayAgg, ops)));
           (copy_place st (cur_place st id), rt)
@@ -1285,7 +1650,13 @@ and lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
               let p =
                 { bp with Seed_mir.projections = bp.Seed_mir.projections @ [ Seed_mir.ConstantIndex k ] }
               in
-              (Seed_mir.Copy p, elem_ty)
+              (* the element VALUE of an owning element type is a place
+                 READ, never a bitwise Copy (the verifier's
+                 no-copy-of-non-Copy rule — the container keeps the
+                 element; the Map/Array iteration reads of generic
+                 element types are the copy-of-T class) *)
+              if copyable_ty env elem_ty then (Seed_mir.Copy p, elem_ty)
+              else (Seed_mir.Read p, elem_ty)
           | _ -> seed_bug "index expression is not a constant integer")
       | _ ->
           (* nonconstant index: evaluate the index expression exactly
@@ -1301,7 +1672,8 @@ and lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
           let p =
             { bp with Seed_mir.projections = bp.Seed_mir.projections @ [ Seed_mir.Index iid ] }
           in
-          (Seed_mir.Copy p, elem_ty))
+          if copyable_ty env elem_ty then (Seed_mir.Copy p, elem_ty)
+          else (Seed_mir.Read p, elem_ty))
   | Ast.Field (_, base, fname, _span) ->
       (* re-audit: the typed-place (FieldId) rule — lower the base to a
          place, resolve the base's type against the typed nominal
@@ -1311,23 +1683,48 @@ and lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
       let bop, bty = lower_expr env st base in
       let bp = materialize_place st bop in
       let projs, fty = field_projection_of env bty fname in
-      ( Seed_mir.Copy { bp with Seed_mir.projections = bp.Seed_mir.projections @ projs },
-        fty )
-  | Ast.IfExpr (_, i) -> lower_if env st i
+      (* the field VALUE of a non-Copy field type is a place READ, never
+         a bitwise Copy (the verifier's no-copy-of-non-Copy rule — the
+         tuple-component and owning-field reads of generic/owning field
+         types, `pair[1]` in the Map entry-visit bodies, are the
+         copy-of-T class) *)
+      let p = { bp with Seed_mir.projections = bp.Seed_mir.projections @ projs } in
+      if copyable_ty env fty then (Seed_mir.Copy p, fty) else (Seed_mir.Read p, fty)
+  | Ast.IfExpr (nid, i) -> lower_if env st nid i
   | Ast.MatchExpr (nid, m) -> lower_match env st nid m
   | Ast.WhileExpr (_, w) -> lower_while env st w
   | Ast.LoopExpr (nid, b, _) -> lower_loop env st nid b
   | Ast.Block (_, b, _) -> lower_block env st b
   | Ast.ReturnExpr (_, Some e, _) ->
-      let vo, _ = lower_expr env st e in
+      let vo, vt = lower_expr env st e in
+      (* an explicit return CONSUMES the value: a non-Copy owning value
+         transfers to the return slot by Move (the source local is dead
+         after the return) — never a bitwise Copy (the verifier's
+         no-copy-of-non-Copy rule; the same conversion lower_argument
+         applies to Consume arguments) *)
+      let vo =
+        match vo with
+        | Seed_mir.Copy p when not (copyable_ty env vt) -> Seed_mir.Move p
+        | _ -> vo
+      in
       emit_defers env st;
       emit st (Seed_mir.Assign (cur_place st 0, Seed_mir.Use vo));
       set_terminator st Seed_mir.Ret;
-      (Seed_mir.Constant Seed_mir.Unit, Type_repr.Unit)
+      (* an explicit return is a DIVERGING expression: its block/arm
+         tail can never fall through to a value consumer.  Lowering it
+         with the Never type (not Unit) lets the enclosing arm-join /
+         if-arm / function-tail logic recognize the divergence — a
+         return-form arm contributes no join value and a function whose
+         tail is a return never fabricates a Unit store into its return
+         slot (the `assign mismatch: () into Option/Visibility/Map`
+         class of the parser/keyword fns whose bodies end in
+         `return ...` statements or whose match arms all end in
+         `return ...`) *)
+      (Seed_mir.Constant Seed_mir.Unit, Type_repr.Never)
   | Ast.ReturnExpr (_, None, _) ->
       emit_defers env st;
       set_terminator st Seed_mir.Ret;
-      (Seed_mir.Constant Seed_mir.Unit, Type_repr.Unit)
+      (Seed_mir.Constant Seed_mir.Unit, Type_repr.Never)
   | Ast.BreakExpr (_, v, _) -> (
       match st.break_target with
       | Some b ->
@@ -1335,22 +1732,39 @@ and lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
           set_terminator st (Seed_mir.Goto b);
           (Seed_mir.Constant Seed_mir.Unit, Type_repr.Unit)
       | None -> seed_bug "break outside loop in lowering")
-  | Ast.NextExpr _ -> (
-      match st.continue_target with
-      | Some b ->
-          set_terminator st (Seed_mir.Goto b);
-          (Seed_mir.Constant Seed_mir.Unit, Type_repr.Unit)
-      | None -> seed_bug "next outside loop in lowering")
-  | Ast.Assign (_, target, value, _) ->
-      let vo, vt = lower_expr env st value in
+   | Ast.NextExpr _ -> (
+       match st.continue_target with
+       | Some b ->
+           set_terminator st (Seed_mir.Goto b);
+           (Seed_mir.Constant Seed_mir.Unit, Type_repr.Unit)
+       | None -> seed_bug "next outside loop in lowering")
+   | Ast.Assign (_, target, value, _) ->
+       (* the assign TRANSFER rule: assigning an owning value into a
+          destination is a MOVE of the source (the seed has no
+          bitwise-copy of non-Copy values — the verifier's rule 16 —
+          and a let-bound/var target takes over ownership of the value;
+          a source that is a fresh call/aggregate temp is single-use, a
+          named source is consumed by the assignment).  The Copy form
+          survives only for trivially-copyable values.
+          The assignment EXPRESSION's value is UNIT — exactly the
+          checker's Assign typing (te_type = Unit): the write is the
+          effect, and an assign-tail never contributes a value to an
+          enclosing if/match arm join (the lowering's old
+          value-returning form made the checker-Unit assign tails
+          fabricate non-Unit arm values — the String-into-Int /
+          Bool-into-Option arm-join mismatches). *)
+       let assign_value (ty : Type_repr.t) (op : Seed_mir.operand) : Seed_mir.operand =
+         match op with
+         | Seed_mir.Copy p when not (copyable_ty env ty) -> Seed_mir.Move p
+         | op -> op
+       in
+       let vo, vt = lower_expr env st value in
+      let vo = assign_value vt vo in
       (match target with
        | Ast.Name (_, n, _) -> (
            match List.assoc_opt n st.scope with
-           | Some id -> (
-               emit st (Seed_mir.Assign (cur_place st id, Seed_mir.Use vo));
-               match local_type st id with
-               | Some ty -> (copy_place st (cur_place st id), ty)
-               | None -> (vo, vt))
+           | Some id ->
+               emit st (Seed_mir.Assign (cur_place st id, Seed_mir.Use vo))
            | None -> (
                match List.assoc_opt n env.statics with
                | Some (idx, _) ->
@@ -1358,15 +1772,13 @@ and lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
                    emit st
                      (Seed_mir.Assign
                         ( { Seed_mir.root = Seed_mir.Static idx; projections = [] },
-                          Seed_mir.Use vo ));
-                   (vo, vt)
+                          Seed_mir.Use vo ))
                | None -> (
-                   match List.assoc_opt n env.values with
-                       | Some ty ->
-                           let id = fresh_local st ty in
-                           emit st (Seed_mir.Assign (cur_place st id, Seed_mir.Use vo));
-                           (copy_place st (cur_place st id), ty)
-                       | None -> seed_bug "assignment to unknown value '%s'" n)))
+                  match List.assoc_opt n env.values with
+                      | Some ty ->
+                          let id = fresh_local st ty in
+                          emit st (Seed_mir.Assign (cur_place st id, Seed_mir.Use vo))
+                      | None -> seed_bug "assignment to unknown value '%s'" n)))
        | Ast.Field (_, base, fname, _) ->
            (* the typed-place writeback rule (E9036 retirement): the
               target base lowers to a place and the field resolves
@@ -1382,9 +1794,9 @@ and lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
            let bop, bty = lower_expr env st base in
            let bp = materialize_place st bop in
            let projs, fty = field_projection_of env bty fname in
+           ignore fty;
            let dst = { bp with Seed_mir.projections = bp.Seed_mir.projections @ projs } in
-           emit st (Seed_mir.Assign (dst, Seed_mir.Use vo));
-           (copy_place st dst, fty)
+           emit st (Seed_mir.Assign (dst, Seed_mir.Use vo))
        | Ast.Index (_, base, idx, _) -> (
            (* the index writeback: the base lowers to a place; a
               constant index emits the ConstantIndex projection, a
@@ -1395,6 +1807,7 @@ and lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
            let bop, bty = lower_expr env st base in
            let bp = materialize_place st bop in
            let elem_ty = element_type_of bty in
+           ignore elem_ty;
            match idx with
            | Ast.IntLit (_, s, _) -> (
                match Literal.parse_integer ~span:Span.synthetic s with
@@ -1404,44 +1817,53 @@ and lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
                    let dst =
                      { bp with Seed_mir.projections = bp.Seed_mir.projections @ [ Seed_mir.ConstantIndex k ] }
                    in
-                   emit st (Seed_mir.Assign (dst, Seed_mir.Use vo));
-                   (copy_place st dst, elem_ty)
+                   emit st (Seed_mir.Assign (dst, Seed_mir.Use vo))
                | _ -> seed_bug "index expression is not a constant integer")
-           | _ ->
-               let idx_op, idx_ty = lower_expr env st idx in
-               let iid = fresh_local st idx_ty in
-               emit st (Seed_mir.Assign (cur_place st iid, Seed_mir.Use idx_op));
-               let dst =
-                 { bp with Seed_mir.projections = bp.Seed_mir.projections @ [ Seed_mir.Index iid ] }
-               in
-               emit st (Seed_mir.Assign (dst, Seed_mir.Use vo));
-               (copy_place st dst, elem_ty))
+            | _ ->
+                let idx_op, idx_ty = lower_expr env st idx in
+                let iid = fresh_local st idx_ty in
+                emit st (Seed_mir.Assign (cur_place st iid, Seed_mir.Use idx_op));
+                let dst =
+                  { bp with Seed_mir.projections = bp.Seed_mir.projections @ [ Seed_mir.Index iid ] }
+                in
+                emit st (Seed_mir.Assign (dst, Seed_mir.Use vo)))
        | Ast.Unary (_, Ast.Deref, base, _) -> (
            (* `*p = v`: the base lowers to a place and the write emits
               through the Deref projection (the E9036 deref-target form
-              is retired) *)
+              is retired) — EXCEPT the checker's deref pass-through
+              (types.tg ExprRawDeref): a deref whose operand is NOT a
+              pointer-like kind was accepted only as the pass-through
+              forms — the kernel's inout-param deref writeback
+              (`*current_loop_entry = ...` — "access through the
+              parameter is direct").  Those emit NO Deref projection:
+              the write is the operand place itself (a projection over
+              the non-pointer local would be the verifier's
+              deref-on-non-pointer finding — the mirror of the
+              read-side pass-through below). *)
            let bop, bty = lower_expr env st base in
            let bp = materialize_place st bop in
-           let pointee_ty =
+           let pointer_base =
              match bty with
-             | Type_repr.Raw_ptr (_, t) | Type_repr.Ref_internal (_, t) -> t
-             | Type_repr.Named (tid, args) -> (
-                 match List.assoc_opt tid env.struct_fields with
-                 | Some _ -> Type_repr.Named (tid, args)
-                 | None -> bty)
-             | _ -> bty
+             | Type_repr.Raw_ptr _ | Type_repr.Ref_internal _ -> true
+             | Type_repr.Named (tid, _) ->
+                 Ids.Type_id.compare tid (Ids.Type_id.make 5) = 0
+                 || Ids.Type_id.compare tid (Ids.Type_id.make 6) = 0
+                 || Option.is_some (transparent_nominal_name_of env tid)
+             | _ -> false
            in
            let dst =
-             { bp with Seed_mir.projections = bp.Seed_mir.projections @ [ Seed_mir.Deref ] }
+             if pointer_base then
+               { bp with Seed_mir.projections = bp.Seed_mir.projections @ [ Seed_mir.Deref ] }
+             else bp
            in
-           emit st (Seed_mir.Assign (dst, Seed_mir.Use vo));
-           (copy_place st dst, pointee_ty))
+           emit st (Seed_mir.Assign (dst, Seed_mir.Use vo)))
        | _ ->
            ignore (vo, vt);
-           seed_bug "projected assignment reached MIR lowering without a typed-place writeback rule")
-  | Ast.CompoundAssign (_, _, _, _, span) ->
-      ignore span;
-      seed_bug "CompoundAssign reached MIR lowering without a typed-place writeback rule"
+           seed_bug "projected assignment reached MIR lowering without a typed-place writeback rule");
+      (Seed_mir.Constant Seed_mir.Unit, Type_repr.Unit)
+   | Ast.CompoundAssign (_, _, _, _, span) ->
+       ignore span;
+       seed_bug "CompoundAssign reached MIR lowering without a typed-place writeback rule"
   | Ast.Call (nid, callee, _, args, span) ->
       ignore span;
       lower_call env st nid callee args
@@ -1457,7 +1879,17 @@ and lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
          position is indexed positionally). *)
       let subj_op, subj_ty = lower_expr env st inner in
       let sid = fresh_local st subj_ty in
-      emit st (Seed_mir.Assign (cur_place st sid, Seed_mir.Use subj_op));
+      (* the subject enters the subject local by place READ when it is a
+         Copy of a non-Copy value — never a bitwise Copy (the verifier's
+         no-copy-of-non-Copy rule; parity with the match-subject rule).
+         The failure path MOVES the subject local into the return slot,
+         so the read materialization is safe for every subject shape. *)
+      let subj_use =
+        match subj_op with
+        | Seed_mir.Copy p when not (copyable_ty env subj_ty) -> Seed_mir.Read p
+        | _ -> subj_op
+      in
+      emit st (Seed_mir.Assign (cur_place st sid, Seed_mir.Use subj_use));
       (* the error channel is the identity: for Result[T, E] the
          enclosing function's return must be Result[_, E] (the success
          types may differ); for Option[T] the return must be Option[_] *)
@@ -1550,7 +1982,7 @@ and lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
                        ( cur_place st 0,
                          Seed_mir.Cast (Seed_mir.Move (cur_place st sid), env.fn_ret) ))
               | _ ->
-                  if not (copyable_ty e) then
+                  if not (copyable_ty env e) then
                     seed_bug
                       "`?` Result failure reconstruction is not lowerable for a non-Copy error payload %s (the seed VM's Move ignores projections, so extracting Err's payload from the subject and rebuilding it cannot move the value; pass the value by place or make the payload Copy)"
                       (Seed_mir.print_type e)
@@ -1924,7 +2356,7 @@ and lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
                       {
                         Seed_mir.effect_ = Access_effect.Read;
                         value =
-                          (if copyable_ty arr_ty then Seed_mir.Copy arr_id
+                          (if copyable_ty env arr_ty then Seed_mir.Copy arr_id
                            else Seed_mir.Read arr_id);
                       };
                     |]
@@ -2028,13 +2460,26 @@ and lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
                     | None -> [ Seed_mir.Index cid ]
                     | Some k -> [ Seed_mir.Index cid; Seed_mir.ConstantIndex k ]
                   in
-                  emit st
-                    (Seed_mir.Assign
-                       ( cur_place st id,
-                         Seed_mir.Use
-                           (Seed_mir.Copy
-                              { Seed_mir.root = arr_id.Seed_mir.root;
-                                projections = arr_id.Seed_mir.projections @ projections }) )))
+                  (* the loop binding of a NON-Copy element/component is
+                     a place READ, never a bitwise Copy (the verifier's
+                     no-copy-of-non-Copy rule — the Map/Set entry-visit
+                     and tuple-component bindings of owning element
+                     types are the copy-of-T class: the container keeps
+                     the element and the body's clone/push consumes the
+                     read image) *)
+                  let bty =
+                    match local_type st id with
+                    | Some t -> t
+                    | None -> Type_repr.Unit
+                  in
+                  let value =
+                    let p =
+                      { Seed_mir.root = arr_id.Seed_mir.root;
+                        projections = arr_id.Seed_mir.projections @ projections }
+                    in
+                    if copyable_ty env bty then Seed_mir.Copy p else Seed_mir.Read p
+                  in
+                  emit st (Seed_mir.Assign (cur_place st id, Seed_mir.Use value)))
                 bindings;
               let saved_break = st.break_target in
               let saved_continue = st.continue_target in
@@ -2077,8 +2522,33 @@ and lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
              "struct literal `%s` with a `..` spread is not lowered (the seed StructCtor form has no spread channel)"
              name
        | None -> ());
+      (* a name collision guard (re-audit): a STRUCT literal whose name
+         is ALSO an enum-variant ctor name (`Box { ptr: ptr }` when some
+         OTHER module's enum declares a `Box` variant — types.tg's
+         DeinitPlan) must lower through the STRUCT path — the checker's
+         resolved type for the literal is the STRUCT nominal, never the
+         colliding variant's enum.  The braced-VARIANT path runs only
+         when the checker agrees the literal's type IS the ctor's owning
+         enum (a channel-less hand-built env keeps the ctor-first
+         fallback). *)
+      let literal_resolved_tid =
+        match typed_node_of st nid with
+        | Some node -> (
+            match node.tn_type with
+            | Type_repr.Named (t, _) -> Some t
+            | _ -> None)
+        | None -> None
+      in
+      let ctor_agrees =
+        match ctor_of st.variants name with
+        | None -> false
+        | Some (enum_name, _) -> (
+            match literal_resolved_tid with
+            | Some tid -> Ids.Type_id.compare (enum_tid_of env enum_name) tid = 0
+            | None -> true)
+      in
       (match ctor_of st.variants name with
-       | Some (enum_name, vname) ->
+       | Some (enum_name, vname) when ctor_agrees ->
            (* the braced-VARIANT constructor `Enum::Variant { f: e, ... }`:
               the variant's payload fields are the SPLIT positional list —
               the EnumCtor's operands are the field values in field
@@ -2093,10 +2563,72 @@ and lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
              | Some t -> t
              | None -> seed_bug "enum constructor `%s` has no registered result type in the lowering env" name
            in
-           let spec = variant_spec_of env st.variants ~enum_name ~vname:vname_m ~repr:ty in
-           let ops =
-             List.map (fun (_, fe) -> fst (lower_expr env st fe)) fields
-           in
+            let spec = variant_spec_of env st.variants ~enum_name ~vname:vname_m ~repr:ty in
+            (* the braced literal may write its fields in NAME order while
+               the payload's declaration order differs (the kernel's
+               `MirTerminatorKind::MirCall { ..., intrinsic: ..., unwind:
+               ... }` puts intrinsic before unwind while the declaration
+               has unwind first — the checker binds every literal field to
+               its DECLARED payload position by name); the EnumCtor's
+               operand positions are the DECLARATION order (the layout
+               the EnumDefs/variant payloads and the VM use), so the
+               field values are placed at their declared positions
+               whenever the registry carries the declaration-order field
+               names — exactly the struct-literal rule.  When the names
+               are unknown (a positional/untabled payload) the source
+               order IS the declaration order and the values lower
+               straight through. *)
+            let lower_field_value (_, fe) =
+              let op, oty = lower_expr env st fe in
+              (* an owning (non-Copy) field value enters the aggregate
+                 by place READ, never a bitwise Copy (the EnumCtor
+                 path's payload rule — the aggregate consumes the
+                 value's slot) *)
+              match op with
+              | Seed_mir.Copy p when not (copyable_ty env oty) -> Seed_mir.Read p
+              | _ -> op
+            in
+            let ops =
+              if spec.vs_field_names <> [] then begin
+                let reg_len = List.length spec.vs_field_names in
+                let index_of fname =
+                  let rec go i = function
+                    | [] -> None
+                    | fn :: rest -> if fn = fname then Some i else go (i + 1) rest
+                  in
+                  go 0 spec.vs_field_names
+                in
+                (if List.length fields <> reg_len then
+                   seed_bug
+                     "braced variant literal `%s::%s` has %d field(s) but the variant declares %d braced field(s)"
+                     enum_name vname_m (List.length fields) reg_len);
+                List.iter
+                  (fun (fname, _) ->
+                    if index_of fname = None then
+                      seed_bug "unknown field `%s` of variant `%s::%s` in braced-variant literal lowering"
+                        fname enum_name vname_m)
+                  fields;
+                let placed = Array.make reg_len None in
+                List.iter
+                  (fun (fname, fe) ->
+                    match index_of fname with
+                    | Some i -> (
+                        match placed.(i) with
+                        | Some _ ->
+                            seed_bug "duplicate field `%s` in the braced-variant literal of `%s::%s`"
+                              fname enum_name vname_m
+                        | None -> placed.(i) <- Some (lower_field_value (fname, fe)))
+                    | None -> ())
+                  fields;
+                Array.to_list placed |> List.map (function
+                    | Some op -> op
+                    | None ->
+                        seed_bug
+                          "braced-variant literal `%s::%s` omitted the declared field (no default channel for variant fields)"
+                          enum_name vname_m)
+              end
+              else List.map lower_field_value fields
+            in
            let id = fresh_local st ty in
            emit st
              (Seed_mir.Assign
@@ -2104,9 +2636,9 @@ and lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
                   Seed_mir.Aggregate
                     ( Seed_mir.EnumCtor (enum_tid_of env enum_name, Ids.Variant_index.make spec.vs_index),
                       ops ) ));
-           (copy_place st (cur_place st id), ty)
-       | None -> (
-      let rt =
+            (copy_place st (cur_place st id), ty)
+       | _ -> (
+       let rt =
         match typed_node_of st nid with
         | Some node -> node.tn_type
         | None -> (
@@ -2157,34 +2689,56 @@ and lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
               Map[...] = Map::new()`) — the native struct-defaulting the
               kernel's TypeEnv literals rely on; a missing field with NO
               declared default stays fail-closed. *)
-           let placed = Array.make reg_len None in
-           List.iter
-             (fun (fname, fe) ->
-               match index_of fname with
-               | Some i -> (
-                   match placed.(i) with
-                   | Some _ ->
-                       seed_bug "duplicate field `%s` in the struct literal of `%s`" fname name
-                   | None -> placed.(i) <- Some (fst (lower_expr env st fe)))
-               | None -> ())
-             fields;
-           let ops =
-             Array.to_list placed
-             |> List.mapi (fun i op ->
-                  match op with
-                  | Some op -> op
-                  | None -> (
-                      match List.nth reg i with
-                      | (_, _, _, Some de) -> fst (lower_expr env st de)
-                      | (fname, _, fty, None) ->
-                          (* re-audit P12: the TYPE default — the native
-                             fills a literal-omitted field with the
-                             field type's default value (empty
-                             containers, zero scalars, None, "", and
-                             STRUCT fields as the all-defaulted
-                             aggregate) *)
-                          default_operand_of env st name fname fty))
-           in
+            let placed = Array.make reg_len None in
+            List.iter
+              (fun (fname, fe) ->
+                match index_of fname with
+                | Some i -> (
+                    match placed.(i) with
+                    | Some _ ->
+                        seed_bug "duplicate field `%s` in the struct literal of `%s`" fname name
+                    | None -> placed.(i) <- Some (lower_expr env st fe))
+                | None -> ())
+              fields;
+            let ops =
+              Array.to_list placed
+              |> List.mapi (fun i op ->
+                   match op with
+                   | Some (op, oty) ->
+                       (* an owning (non-Copy) field value enters the
+                          StructCtor aggregate by place READ, never a
+                          bitwise Copy (the aggregate consumes the value's
+                          slot; the EnumCtor payload path applies the same
+                          rule) *)
+                       (match op with
+                        | Seed_mir.Copy p when not (copyable_ty env oty) -> Seed_mir.Read p
+                        | _ -> op)
+                    | None -> (
+                        match List.nth reg i with
+                        | (_, _, _, Some de) ->
+                            (* the declared-default value is lowered like
+                               an explicit field value: an OWNING default
+                               (the MirProgram `engine_env: TypeEnv =
+                               engine_env_empty()` field — a call result
+                               typed with the owning struct) enters the
+                               StructCtor aggregate by place READ, never a
+                               bitwise Copy (the no-copy-of-non-Copy rule
+                               — the same conversion the explicit-field
+                               branch applies) *)
+                            let dop, doty = lower_expr env st de in
+                            (match dop with
+                             | Seed_mir.Copy p when not (copyable_ty env doty) ->
+                                 Seed_mir.Read p
+                             | _ -> dop)
+                        | (fname, _, fty, None) ->
+                            (* re-audit P12: the TYPE default — the native
+                               fills a literal-omitted field with the
+                               field type's default value (empty
+                               containers, zero scalars, None, "", and
+                               STRUCT fields as the all-defaulted
+                               aggregate) *)
+                            default_operand_of env st name fname fty))
+            in
            let id = fresh_local st rt in
            emit st
              (Seed_mir.Assign
@@ -2282,17 +2836,27 @@ and lower_stmt (env : func_env) (st : lower_state) (s : Ast.stmt) : unit =
       ignore (lower_expr env st e)
   | Ast.LetBinding (pat, _, _ty, value, _) ->
       let vo, vt = lower_expr env st value in
-      let id = fresh_local st vt in
-      (* the owning-value binding: a non-Copy initializer transfers
-         ownership (Move) — a bitwise Copy of an owning type is exactly
-         what the verifier rejects (an intrinsic/collection result is
-         owned by the caller, so the single-use binding moves it) *)
-      let vo =
-        match vo with
-        | Seed_mir.Copy p when not (copyable_ty vt) -> Seed_mir.Move p
-        | op -> op
+      (* the ref-ABI aliasing rule: a REF-typed initializer (a call
+         destination — Ptr::as_ref/as_mut never return owned storage)
+         binds the NAME to the source local itself; the ref is an ABI
+         temporary that may never be copied into a second local *)
+      let alias_id = ref_binding_source vt vo in
+      let id =
+        match alias_id with Some lid -> lid | None -> fresh_local st vt
       in
-      emit st (Seed_mir.Assign (cur_place st id, Seed_mir.Use vo));
+      (match alias_id with
+       | Some _ -> ()
+       | None ->
+           (* the owning-value binding: a non-Copy initializer transfers
+              ownership (Move) — a bitwise Copy of an owning type is exactly
+              what the verifier rejects (an intrinsic/collection result is
+              owned by the caller, so the single-use binding moves it) *)
+           let vo =
+             match vo with
+             | Seed_mir.Copy p when not (copyable_ty env vt) -> Seed_mir.Move p
+             | op -> op
+           in
+           emit st (Seed_mir.Assign (cur_place st id, Seed_mir.Use vo)));
       let bind_name n bind_id =
         st.local_names <- (bind_id, n) :: st.local_names;
         st.scope <- (n, bind_id) :: st.scope
@@ -2370,14 +2934,19 @@ and lower_stmt (env : func_env) (st : lower_state) (s : Ast.stmt) : unit =
                 | _ -> seed_bug "destructuring let against a non-tuple value type"
               in
               let cid = fresh_local st cty in
-              emit st
-                (Seed_mir.Assign
-                   ( cur_place st cid,
-                     Seed_mir.Use
-                       (Seed_mir.Copy
-                          { Seed_mir.root = Seed_mir.Local id;
-                            projections =
-                              List.map (fun k -> Seed_mir.ConstantIndex k) ks }) ));
+              (* the destructured component of an OWNING tuple type
+                 binds by place READ, never a bitwise Copy (the
+                 verifier's no-copy-of-non-Copy rule — the
+                 `let (_, old) = pair.remove(idx)` shapes over generic
+                 element types; a projected Move is not expressible in
+                 the seed's whole-root move model, so the read image is
+                 the binding form) *)
+              let p =
+                { Seed_mir.root = Seed_mir.Local id;
+                  projections = List.map (fun k -> Seed_mir.ConstantIndex k) ks }
+              in
+              let value = if copyable_ty env cty then Seed_mir.Copy p else Seed_mir.Read p in
+              emit st (Seed_mir.Assign (cur_place st cid, Seed_mir.Use value));
               bind_name n cid)
         bindings
   | Ast.DeferStmt (b, _) ->
@@ -2393,12 +2962,80 @@ and lower_stmt (env : func_env) (st : lower_state) (s : Ast.stmt) : unit =
   | Ast.Item _ -> ()
   | Ast.AttributeStmt _ | Ast.Attributed _ -> ()
 
-and lower_if (env : func_env) (st : lower_state) (i : Ast.if_expr) : Seed_mir.operand * Type_repr.t =
+and lower_if (env : func_env) (st : lower_state) (nid : Ids.Node_id.t) (i : Ast.if_expr) : Seed_mir.operand * Type_repr.t =
   let arms = (i.Ast.if_condition, i.Ast.if_then) :: i.Ast.if_elsif in
   let join_b = new_block st in
   let result_ty = ref Type_repr.Unit in
   let result_id = ref 0 in
   let has_result = ref false in
+  (* An ELSE-LESS if can never produce a definite VALUE: its
+     condition-false path falls through with no arm value, so any
+     result local created from the then-arm's value would be read
+     uninitialized on that path (the use-of-possibly-uninitialized
+     class in the types.tg nested `when Some(k) then if cond then
+     map.insert(...) end` arms — insert's Option[Int] image was joined
+     into a result local the false path never assigned).  Only a
+     COMPLETE if (with an else) materializes a join value. *)
+  let value_if = i.Ast.if_else <> None in
+  (* a STATEMENT-position (Discarded) if — the checker's resolved type
+     of the if NODE is Unit — contributes no join value even when its
+     arms' tails are non-Unit (a statement-position `if ... then
+     map.insert(...) else map.insert(...) end` — the inserts' Option[old]
+     images are dropped by the checker's Discarded use; joining them
+     into a result local read by the continuation is the
+     possibly-uninitialized-join class). *)
+  let value_if =
+    value_if
+    &&
+    (match typed_node_of st nid with
+     | Some node when is_unit_ty node.tn_type -> false
+     | _ -> true)
+  in
+  (* A Unit-valued arm (a statement-position if arm) contributes NO
+     result value: creating a result local for it and joining it into
+     the continuation would leave the result local uninitialized on the
+     condition-false path (an else-less `if ... then dealloc(...)` arm
+     read through the enclosing arm's join — the use-of-possibly-
+     uninitialized class in the Rc/Arc drop bodies).  A non-Unit arm
+     value transfers into the shared result local by Move when it is
+     an owning (non-Copy) value — a bitwise Copy of an owning arm
+     result is a verifier no-copy-of-non-Copy finding. *)
+  let arm_value bval bty =
+    if !has_result || not value_if then ()
+    else if not (is_unit_ty bty) then begin
+      result_ty := bty;
+      result_id := fresh_local st bty;
+      has_result := true
+    end;
+    (* A Unit-valued arm contributes no join value (statement-position
+       if arms — `if ... then acc = ... else () end` inside a loop
+       body), and a DISCARDED if's arms never reconcile in the checker,
+       so an arm whose value type differs from the join slot's type
+       (the first non-Unit arm's type) is a value the checker dropped —
+       storing it would be a verifier assign mismatch (the
+       String-into-Int / String-into-Bool arm-join classes). *)
+    if
+      !has_result
+      && not (is_unit_ty bty)
+      && join_types_compatible env bty !result_ty
+    then
+      emit st
+        (Seed_mir.Assign (cur_place st !result_id, Seed_mir.Use (owned_read env bty bval)))
+  in
+  (* A DIVERGING arm (its lowered value type is Never — a call to a
+     Never-returning callee like `panic(...)`, a return-only loop):
+     the arm contributes no join value, and its tail can never reach
+     the join — the value is never stored and the tail terminates with
+     the seed's Abort (the callee never returns; a store of the Never
+     value into the typed join slot would be a verifier assign
+     mismatch and the dataflow would demand a bogus initialization). *)
+  let diverged = ref false in
+  let arm_value_never = function
+    | Some (_op, ty) when Type_repr.compare ty Type_repr.Never = 0 ->
+        diverged := true
+    | Some (bval, bty) -> arm_value bval bty
+    | None -> ()
+  in
   (* Emit an arm chain; returns the block where the else/join continues. *)
   let rec emit_arms arms (fall_b : int) : int =
     match arms with
@@ -2412,14 +3049,11 @@ and lower_if (env : func_env) (st : lower_state) (i : Ast.if_expr) : Seed_mir.op
         set_terminator_to st
           (Seed_mir.SwitchInt (copy_place st (cur_place st cid), [ (1L, then_b) ], next_fall))
           then_b;
-        let bval, bty = lower_block env st b in
-        if not !has_result then begin
-          result_ty := bty;
-          result_id := fresh_local st bty;
-          has_result := true
-        end;
-        emit st (Seed_mir.Assign (cur_place st !result_id, Seed_mir.Use bval));
-        set_terminator_to st (Seed_mir.Goto join_b) next_fall;
+        let bval = Some (lower_block env st b) in
+        arm_value_never bval;
+        (if !diverged then set_terminator_to st Seed_mir.Abort next_fall
+         else set_terminator_to st (Seed_mir.Goto join_b) next_fall);
+        diverged := false;
         emit_arms rest next_fall
   in
   let else_cont = emit_arms arms join_b in
@@ -2427,20 +3061,23 @@ and lower_if (env : func_env) (st : lower_state) (i : Ast.if_expr) : Seed_mir.op
    | Some eb ->
        if st.cur_block <> else_cont then
          set_terminator_to st (Seed_mir.Goto else_cont) else_cont;
-       let eb_val, eb_ty = lower_block env st eb in
-       if not !has_result then begin
-         result_ty := eb_ty;
-         result_id := fresh_local st eb_ty;
-         has_result := true
-       end;
-       emit st (Seed_mir.Assign (cur_place st !result_id, Seed_mir.Use eb_val));
-       set_terminator_to st (Seed_mir.Goto join_b) join_b
+       arm_value_never (Some (lower_block env st eb));
+       (if !diverged then set_terminator_to st Seed_mir.Abort join_b
+        else set_terminator_to st (Seed_mir.Goto join_b) join_b);
+       diverged := false
    | None ->
        if st.cur_block <> join_b then
          set_terminator_to st (Seed_mir.Goto join_b) join_b);
-  (* the join block stays open for the continuation *)
-  if !has_result then (copy_place st (cur_place st !result_id), !result_ty)
-  else (Seed_mir.Constant Seed_mir.Unit, Type_repr.Unit)
+   (* the join block stays open for the continuation *)
+   if !has_result then (copy_place st (cur_place st !result_id), !result_ty)
+   else
+     (* re-audit (the diverge-tail class): an if whose every branch
+        diverges (return/break) never stores an arm value — the
+        checker's resolved type is Never and the enclosing function
+        tail must skip the fallthrough return-slot assignment instead
+        of storing a fabricated Unit value (the `assign mismatch: ()
+        into Visibility` class) *)
+     (Seed_mir.Constant Seed_mir.Unit, call_result_ty st nid Type_repr.Unit)
 
 and lower_match (env : func_env) (st : lower_state) (nid : Ids.Node_id.t)
     (m : Ast.match_expr) : Seed_mir.operand * Type_repr.t =
@@ -2456,6 +3093,7 @@ and lower_match (env : func_env) (st : lower_state) (nid : Ids.Node_id.t)
 
 and lower_match_syntactic (env : func_env) (st : lower_state) (m : Ast.match_expr) :
     Seed_mir.operand * Type_repr.t =
+  let saved_scope = st.scope in
   let subj_op, subj_ty = lower_expr env st m.Ast.m_subject in
   let sid = fresh_local st subj_ty in
   (* the match subject is READ, never copied: a non-Copy subject
@@ -2464,7 +3102,7 @@ and lower_match_syntactic (env : func_env) (st : lower_state) (m : Ast.match_exp
      the executable projection *)
   let subj_use =
     match subj_op with
-    | Seed_mir.Copy p when not (copyable_ty subj_ty) -> Seed_mir.Read p
+    | Seed_mir.Copy p when not (copyable_ty env subj_ty) -> Seed_mir.Read p
     | op -> op
   in
   emit st (Seed_mir.Assign (cur_place st sid, Seed_mir.Use subj_use));
@@ -2610,6 +3248,10 @@ and lower_match_syntactic (env : func_env) (st : lower_state) (m : Ast.match_exp
   List.iteri
     (fun i (a : Ast.match_arm) ->
       push_block st arm_blocks.(i);
+      (* re-audit (the arm-scope class): the arm starts from the match's
+         saved scope — sibling arms' payload bindings never leak (the
+         syntactic mirror of the typed arm rule) *)
+      st.scope <- saved_scope;
       (match a.Ast.ma_pattern with
        | Ast.PatVariant (seg1, seg2, pats, _) -> (
            let enum_name =
@@ -2643,7 +3285,7 @@ and lower_match_syntactic (env : func_env) (st : lower_state) (m : Ast.match_exp
                       the path) — the SEED_STRICT escape hatch is
                       retired *)
                    let payload_op =
-                     if copyable_ty fty then
+                     if copyable_ty env fty then
                        Seed_mir.Copy
                          { Seed_mir.root = Seed_mir.Local sid;
                            projections =
@@ -2777,12 +3419,20 @@ and lower_match_syntactic (env : func_env) (st : lower_state) (m : Ast.match_exp
                                    [ Seed_mir.Downcast (semantic_variant_id spec); Seed_mir.ConstantIndex j ]
                                }) ));
                    let eq_id = fresh_local st Type_repr.Bool in
+                   (* the payload STRING (an owning value) is compared by
+                      READ, never a bitwise Copy (the no-copy-of-non-Copy
+                      rule — `_p == "ast"` payload tests copy the String
+                      slot) *)
+                   let eq_op =
+                     if copyable_ty env pty then copy_place st (cur_place st pid)
+                     else Seed_mir.Read (cur_place st pid)
+                   in
                    emit st
                      (Seed_mir.Assign
                         ( cur_place st eq_id,
                           Seed_mir.BinaryOp
                             ( Seed_mir.Eq,
-                              copy_place st (cur_place st pid),
+                              eq_op,
                               Seed_mir.Constant (Seed_mir.String slit) ) ));
                    let ok_b = new_block st in
                    let next_b =
@@ -2851,7 +3501,7 @@ and lower_match_syntactic (env : func_env) (st : lower_state) (m : Ast.match_exp
                        match fpat with
                        | Some (Ast.PatIdent (name, _, _)) -> (
                            let projs, fty = field_projection_of env styp fname in
-                           if not (copyable_ty fty) then
+                           if not (copyable_ty env fty) then
                              seed_bug
                                "non-Copy struct-payload field binding in a variant match arm is not supported by the seed VM (payload field type %s)"
                                (Seed_mir.print_type fty);
@@ -2940,7 +3590,7 @@ and lower_match_syntactic (env : func_env) (st : lower_state) (m : Ast.match_exp
                                    seg2
                            in
                            let payload_op =
-                             if copyable_ty fty then
+                             if copyable_ty env fty then
                                Seed_mir.Copy
                                  { Seed_mir.root = Seed_mir.Local sid;
                                    projections =
@@ -3026,7 +3676,7 @@ and lower_match_syntactic (env : func_env) (st : lower_state) (m : Ast.match_exp
                       through the FieldIds *)
                    ignore fname;
                    let base_projs, projs, fty = field_projs j fname in
-                   if not (copyable_ty fty) then
+                   if not (copyable_ty env fty) then
                      seed_bug
                        "non-Copy struct-payload field binding in a variant match arm is not supported by the seed VM (payload field type %s)"
                        (Seed_mir.print_type fty);
@@ -3054,30 +3704,45 @@ and lower_match_syntactic (env : func_env) (st : lower_state) (m : Ast.match_exp
              | Type_repr.Tuple elems when k < Array.length elems -> elems.(k)
              | _ -> seed_bug "tuple arm pattern against a non-tuple subject type"
            in
-           List.iteri
-             (fun k sub ->
-               match sub with
-               | Ast.PatIdent (name, _, _) -> (
-                   let fty = elem_ty k in
-                   let id = fresh_local st fty in
-                   emit st
-                     (Seed_mir.Assign
-                        ( cur_place st id,
-                          Seed_mir.Use
-                            (Seed_mir.Copy
-                               { Seed_mir.root = Seed_mir.Local sid;
-                                 projections = [ Seed_mir.ConstantIndex k ] }) ));
-                   st.scope <- (name, id) :: st.scope)
-               | Ast.PatVariant (seg1, seg2, spats, _) -> (
-                   let ety = elem_ty k in
-                   let eid = fresh_local st ety in
-                   emit st
-                     (Seed_mir.Assign
-                        ( cur_place st eid,
-                          Seed_mir.Use
-                            (Seed_mir.Copy
-                               { Seed_mir.root = Seed_mir.Local sid;
-                                 projections = [ Seed_mir.ConstantIndex k ] }) ));
+            List.iteri
+              (fun k sub ->
+                match sub with
+                | Ast.PatIdent (name, _, _) -> (
+                    let fty = elem_ty k in
+                    let id = fresh_local st fty in
+                    (* an OWNING tuple element binds through the READ of
+                       the slot (the tuple-arm element of a match whose
+                       subject is a live tuple — `match (a.advance(),
+                       b.advance())` — the element image is loaded, never
+                       bitwise-copied; the seed's Read convention) *)
+                    let elem_op =
+                      if copyable_ty env fty then
+                        Seed_mir.Copy
+                          { Seed_mir.root = Seed_mir.Local sid;
+                            projections = [ Seed_mir.ConstantIndex k ] }
+                      else
+                        Seed_mir.Read
+                          { Seed_mir.root = Seed_mir.Local sid;
+                            projections = [ Seed_mir.ConstantIndex k ] }
+                    in
+                    emit st
+                      (Seed_mir.Assign (cur_place st id, Seed_mir.Use elem_op));
+                    st.scope <- (name, id) :: st.scope)
+                | Ast.PatVariant (seg1, seg2, spats, _) -> (
+                    let ety = elem_ty k in
+                    let eid = fresh_local st ety in
+                    let elem_op =
+                      if copyable_ty env ety then
+                        Seed_mir.Copy
+                          { Seed_mir.root = Seed_mir.Local sid;
+                            projections = [ Seed_mir.ConstantIndex k ] }
+                      else
+                        Seed_mir.Read
+                          { Seed_mir.root = Seed_mir.Local sid;
+                            projections = [ Seed_mir.ConstantIndex k ] }
+                    in
+                    emit st
+                      (Seed_mir.Assign (cur_place st eid, Seed_mir.Use elem_op));
                    let nested_spec =
                      variant_spec_of env st.variants ~enum_name:seg1 ~vname:seg2 ~repr:ety
                    in
@@ -3135,29 +3800,62 @@ and lower_match_syntactic (env : func_env) (st : lower_state) (m : Ast.match_exp
              subs)
        | Ast.Wildcard _ | Ast.PatLiteral _ | Ast.OrPattern _ -> ()
        | _ -> seed_bug "unsupported match arm pattern in lowering");
-      let bval, bty = lower_expr env st a.Ast.ma_body in
-      ensure_result bty;
-      (* a Unit arm in a discarded/statement-position match contributes
-         no result value (the checker's branch-join: a divergent/Unit
-         arm is dropped in Discarded context) — the result slot stays
-         the surviving arms' type.  The `()` literal lowers to the
-         EMPTY TUPLE, the Unit-equivalent form. *)
-      let is_unit_ty ty =
-        ty = Type_repr.Unit
-        || match ty with
-           | Type_repr.Tuple a -> Array.length a = 0
-           | _ -> false
-      in
-      (if not (is_unit_ty bty) then
-         emit st (Seed_mir.Assign (cur_place st !result_id, Seed_mir.Use bval)));
-      set_terminator st (Seed_mir.Goto join_b))
-    m.Ast.m_arms;
-  (* the join block stays open for the continuation: every arm body
-     branches to it, and the match result flows out through it *)
-  push_block st join_b;
-  match !result_ty with
-  | Some ty -> (copy_place st (cur_place st !result_id), ty)
-  | None -> (Seed_mir.Constant Seed_mir.Unit, Type_repr.Unit)
+       let bval, bty = lower_expr env st a.Ast.ma_body in
+       (* a DIVERGING arm (the lowered value type is Never — a call to a
+          Never-returning callee like `panic(...)`, a return-only loop):
+          the arm contributes no join value and its tail never reaches
+          the join (the callee never returns) — nothing is stored into
+          the result slot and the tail terminates with the seed's Abort
+          (a store of the Never value would be a verifier assign
+          mismatch, and a Never-typed first arm must not determine the
+          join slot's type). *)
+       (if Type_repr.compare bty Type_repr.Never = 0 then
+          set_terminator st Seed_mir.Abort
+        else begin
+       ensure_result bty;
+       (* a Unit arm in a discarded/statement-position match contributes
+          no result value (the checker's branch-join: a divergent/Unit
+          arm is dropped in Discarded context) — the result slot stays
+          the surviving arms' type.  The `()` literal lowers to the
+          EMPTY TUPLE, the Unit-equivalent form.  A non-Unit arm value
+          transfers into the join result by Move when owning (a
+          bitwise Copy of an owning arm result is a verifier
+          no-copy-of-non-Copy finding).  When the match's JOIN type is
+          Unit (a statement-position match — its arms' value forms are
+          dropped by the checker's Discarded use: `when None then
+          self.inner = Option::None end` — the assign expr's value is
+          the assigned Option) the result slot receives the Unit
+          constant, NEVER the arm's value: the slot is Unit-typed and a
+          value store would be a type mismatch (and a value read of the
+          assigned field would be an ownership leak of the join
+          local). *)
+       (match !result_ty with
+        | Some rt when is_unit_ty rt ->
+            emit st
+              (Seed_mir.Assign
+                 (cur_place st !result_id,
+                  Seed_mir.Use (Seed_mir.Constant Seed_mir.Unit)))
+        | Some rt ->
+            (* the join slot receives an arm value only when the arm's
+               value type matches the slot's type — a DISCARDED match's
+               arms never reconcile in the checker, so a mismatched
+               later arm's value is dropped (storing it would be a
+               verifier assign mismatch — the arm-join classes) *)
+            (if not (is_unit_ty bty) && join_types_compatible env bty rt then
+               emit st
+                 (Seed_mir.Assign
+                    (cur_place st !result_id, Seed_mir.Use (owned_read env bty bval))))
+        | None -> ());
+       set_terminator st (Seed_mir.Goto join_b)
+        end))
+     m.Ast.m_arms;
+   (* the join block stays open for the continuation: every arm body
+      branches to it, and the match result flows out through it *)
+   push_block st join_b;
+   st.scope <- saved_scope;
+   match !result_ty with
+   | Some ty -> (copy_place st (cur_place st !result_id), ty)
+   | None -> (Seed_mir.Constant Seed_mir.Unit, Type_repr.Unit)
 
 and lower_match_typed (env : func_env) (st : lower_state) (nid : Ids.Node_id.t)
     (m : Ast.match_expr) : Seed_mir.operand * Type_repr.t =
@@ -3175,7 +3873,7 @@ and lower_match_typed (env : func_env) (st : lower_state) (nid : Ids.Node_id.t)
   let sid = fresh_local st subj_ty in
   let subj_use =
     match subj_op with
-    | Seed_mir.Copy p when not (copyable_ty subj_ty) -> Seed_mir.Read p
+    | Seed_mir.Copy p when not (copyable_ty env subj_ty) -> Seed_mir.Read p
     | op -> op
   in
   emit st (Seed_mir.Assign (cur_place st sid, Seed_mir.Use subj_use));
@@ -3189,6 +3887,19 @@ and lower_match_typed (env : func_env) (st : lower_state) (nid : Ids.Node_id.t)
         result_ty := Some ty
     | Some _ -> ()
   in
+  (* a STATEMENT-position (Discarded) match — the checker's resolved type
+     of the match NODE is Unit — contributes NO join value: the arms'
+     tail values (a statement-position arm whose tail is a
+     map-insert/assign image — the insert's Option[old] image, an
+     assign's written value) are dropped by the checker's Discarded use,
+     so the lowering must NOT materialize a first-arm-typed result slot
+     that only SOME arms store — the join read on the other arms' paths
+     is the possibly-uninitialized-join class.  Pre-seeding the join as
+     Unit makes every arm store the Unit constant into the result slot
+     (the join stays initialized on every path). *)
+  (match typed_node_of st nid with
+   | Some node when is_unit_ty node.tn_type -> ensure_result Type_repr.Unit
+   | _ -> ());
   (* the arm's SEMANTIC pattern trees (the channel is authoritative: the
      typechecker resolves every accepted arm ONCE — a missing entry is
      the checker/lowerer contradiction the re-audit forbids) *)
@@ -3310,7 +4021,7 @@ and lower_match_typed (env : func_env) (st : lower_state) (nid : Ids.Node_id.t)
           { base_p with Seed_mir.projections = base_p.Seed_mir.projections @ projs }
         in
         let field_op =
-          if copyable_ty fty then Seed_mir.Copy field_place else Seed_mir.Move field_place
+          if copyable_ty env fty then Seed_mir.Copy field_place else Seed_mir.Move field_place
         in
         let id =
           match plan with Some p -> List.assoc name p | None -> fresh_local st fty
@@ -3351,7 +4062,7 @@ and lower_match_typed (env : func_env) (st : lower_state) (nid : Ids.Node_id.t)
     | Typed_pattern.TP_wildcard -> ()
     | Typed_pattern.TP_binding (name, fty, _) -> (
         let payload_op =
-          if copyable_ty fty then Seed_mir.Copy proj else Seed_mir.Move proj
+          if copyable_ty env fty then Seed_mir.Copy proj else Seed_mir.Move proj
         in
         let id =
           match plan with Some p -> List.assoc name p | None -> fresh_local st fty
@@ -3364,26 +4075,42 @@ and lower_match_typed (env : func_env) (st : lower_state) (nid : Ids.Node_id.t)
            equality; fall to the next arm's test when it fails *)
         let pid = fresh_local st fty in
         let use_op =
-          match c with Seed_mir.String _ -> Seed_mir.Read proj | _ -> Seed_mir.Copy proj
+          match c with
+          | Seed_mir.String _ -> Seed_mir.Read proj
+          | _ -> if copyable_ty env fty then Seed_mir.Copy proj else Seed_mir.Read proj
         in
         emit st (Seed_mir.Assign (cur_place st pid, Seed_mir.Use use_op));
         let eq_id = fresh_local st Type_repr.Bool in
+        (* the payload local of an OWNING literal type (a String payload
+           `Some("ast")`) is compared by READ, never a bitwise Copy (the
+           no-copy-of-non-Copy rule) *)
+        let eq_op =
+          if copyable_ty env fty then copy_place st (cur_place st pid)
+          else Seed_mir.Read (cur_place st pid)
+        in
         emit st
           (Seed_mir.Assign
              ( cur_place st eq_id,
                Seed_mir.BinaryOp
-                 ( Seed_mir.Eq, copy_place st (cur_place st pid), Seed_mir.Constant c ) ));
+                 ( Seed_mir.Eq, eq_op, Seed_mir.Constant c ) ));
         let ok_b = new_block st in
         set_terminator_to st
           (Seed_mir.SwitchInt (Seed_mir.Copy (cur_place st eq_id), [ (1L, ok_b) ], fail))
           ok_b)
     | Typed_pattern.TP_variant (nvid, nty, npats) -> (
-        (* a nested-variant payload `Some(Live)`: the payload position
-           must hold the nested variant — its discriminant must equal the
-           nested variant's tag; the nested payloads bind through the
-           nested Downcast (the checker's semantic tree) *)
+        (* a nested-variant payload `Some(Live)` / `Err(IOError::EOF)`:
+           the payload position must hold the nested variant — its
+           discriminant must equal the nested variant's tag; the nested
+           payloads bind through the nested Downcast (the checker's
+           semantic tree).  An OWNING payload (IOError with owning
+           fields) binds through the READ of the slot (the variant's
+           image is loaded for the test; the seed's Read convention,
+           never a bitwise Copy) *)
         let pid = fresh_local st nty in
-        emit st (Seed_mir.Assign (cur_place st pid, Seed_mir.Use (Seed_mir.Copy proj)));
+        let payload_op =
+          if copyable_ty env nty then Seed_mir.Copy proj else Seed_mir.Read proj
+        in
+        emit st (Seed_mir.Assign (cur_place st pid, Seed_mir.Use payload_op));
         let ok_b = new_block st in
         discriminant_test (enum_name_of_ty env nty) (cur_place st pid) nvid nty ok_b fail;
         (* continue the nested payload bindings in the success block *)
@@ -3411,7 +4138,7 @@ and lower_match_typed (env : func_env) (st : lower_state) (nid : Ids.Node_id.t)
                   }
                 in
                 let comp_op =
-                  if copyable_ty fty then Seed_mir.Copy comp_place
+                  if copyable_ty env fty then Seed_mir.Copy comp_place
                   else Seed_mir.Move comp_place
                 in
                 let id =
@@ -3431,6 +4158,9 @@ and lower_match_typed (env : func_env) (st : lower_state) (nid : Ids.Node_id.t)
      source order; a true test enters the arm's body, a false test
      proceeds to the next arm's test, and the final fallthrough is the
      deterministic non-exhaustive abort *)
+  let arm_plans : (string * int) list option array =
+    Array.make (List.length m.Ast.m_arms) None
+  in
   List.iteri
     (fun i tp ->
       let then_b = arm_blocks.(i) in
@@ -3476,6 +4206,7 @@ and lower_match_typed (env : func_env) (st : lower_state) (nid : Ids.Node_id.t)
                     | _ -> (name, fresh_local st (binding_ty name)))
                   (Typed_pattern.bindings first)
           in
+          arm_plans.(i) <- Some plan;
           List.iter (fun (name, id) -> st.scope <- (name, id) :: st.scope) plan;
           let rec go_alts = function
             | [] -> set_terminator_to st (Seed_mir.Goto next_b) next_b
@@ -3518,7 +4249,7 @@ and lower_match_typed (env : func_env) (st : lower_state) (nid : Ids.Node_id.t)
                   (fun k ep ->
                     match ep with
                     | Typed_pattern.TP_binding (name, fty, _) -> (
-                        if not (copyable_ty fty) then
+                        if not (copyable_ty env fty) then
                           seed_bug
                             "non-Copy element binding in an or-pattern alternative is not supported by the seed VM (element type %s)"
                             (Seed_mir.print_type fty);
@@ -3562,6 +4293,25 @@ and lower_match_typed (env : func_env) (st : lower_state) (nid : Ids.Node_id.t)
     (fun i (a : Ast.match_arm) ->
       let tp = List.nth arm_tps i in
       push_block st arm_blocks.(i);
+      (* re-audit (the arm-scope class): each arm starts from the MATCH's
+         saved scope — the previous arms' payload bindings must not leak
+         into this arm's body (the checker's per-arm add_binds: an arm
+         whose pattern does NOT bind a name still sees the OUTER names,
+         never a sibling arm's bindings — the kernel's resolve_expr /
+         codegen_rvalue cross-arm reads, where a later arm's body
+         referenced a name bound only by an earlier arm's payload and
+         the lowering resolved it to the earlier arm's local — the
+         possibly-uninitialized-join reads of the payload locals).  The
+         arm bindings below shadow the restored scope for THIS arm
+         only. *)
+      st.scope <- saved_scope;
+      (* the or-pattern arm's COMMON interface bindings are re-pushed for
+         the body (they were seeded before the alternatives' tests — the
+         shared locals every alternative projects into; the body must
+         see them under the restored scope) *)
+      (match arm_plans.(i) with
+       | Some plan -> List.iter (fun (name, id) -> st.scope <- (name, id) :: st.scope) plan
+       | None -> ());
       (match tp with
        | Typed_pattern.TP_variant (vid, _, pats) ->
            List.iteri (fun j p -> bind_payloads vid subject_place (fail_b i) j p) pats
@@ -3579,71 +4329,137 @@ and lower_match_typed (env : func_env) (st : lower_state) (nid : Ids.Node_id.t)
        | Typed_pattern.TP_binding (name, _, _) ->
            (* a binding arm: the whole subject binds *)
            st.scope <- (name, sid) :: st.scope
-       | Typed_pattern.TP_tuple (_, elems) -> (
-           (* a tuple arm: the elements bind through the ConstantIndex
-              projections; a nested-variant element checks the element
-              discriminant and binds the nested payload *)
-           List.iteri
-             (fun k ep ->
-               match ep with
-               | Typed_pattern.TP_binding (name, fty, _) -> (
-                   if not (copyable_ty fty) then
-                     seed_bug
-                       "non-Copy element binding in a tuple match arm is not supported by the seed VM (element type %s)"
-                       (Seed_mir.print_type fty);
-                   let id = fresh_local st fty in
-                   emit st
-                     (Seed_mir.Assign
-                        ( cur_place st id,
-                          Seed_mir.Use
-                            (Seed_mir.Copy
-                               { Seed_mir.root = Seed_mir.Local sid; projections = [ Seed_mir.ConstantIndex k ] }) ));
-                   st.scope <- (name, id) :: st.scope)
-               | Typed_pattern.TP_variant (nvid, nty, npats) -> (
-                   let eid = fresh_local st nty in
-                   emit st
-                     (Seed_mir.Assign
-                        ( cur_place st eid,
-                          Seed_mir.Use
-                            (Seed_mir.Copy
-                               { Seed_mir.root = Seed_mir.Local sid; projections = [ Seed_mir.ConstantIndex k ] }) ));
-                   let ok_b = new_block st in
-                   discriminant_test (enum_name_of_ty env nty) (cur_place st eid) nvid nty ok_b (fail_b i);
-                   st.cur_block <- ok_b;
-                   List.iteri (fun j np -> bind_payloads nvid (cur_place st eid) (fail_b i) j np) npats)
-               | Typed_pattern.TP_wildcard -> ()
-               | _ -> seed_bug "unsupported tuple arm sub-pattern in lowering")
-             elems)
+        | Typed_pattern.TP_tuple (_, elems) -> (
+            (* a tuple arm: the elements bind through the ConstantIndex
+               projections; a nested-variant element checks the element
+               discriminant and binds the nested payload.  An OWNING
+               element (`match (a.advance(), b.advance())` — the pair's
+               Option elements) binds through the READ of the slot (the
+               seed's load-without-consume convention; the bitwise Copy
+               of an owning value is a verifier no-copy finding) *)
+            List.iteri
+              (fun k ep ->
+                match ep with
+                | Typed_pattern.TP_binding (name, fty, _) -> (
+                    let elem_op =
+                      if copyable_ty env fty then
+                        Seed_mir.Copy
+                          { Seed_mir.root = Seed_mir.Local sid; projections = [ Seed_mir.ConstantIndex k ] }
+                      else
+                        Seed_mir.Read
+                          { Seed_mir.root = Seed_mir.Local sid; projections = [ Seed_mir.ConstantIndex k ] }
+                    in
+                    let id = fresh_local st fty in
+                    emit st (Seed_mir.Assign (cur_place st id, Seed_mir.Use elem_op));
+                    st.scope <- (name, id) :: st.scope)
+                | Typed_pattern.TP_variant (nvid, nty, npats) -> (
+                    let elem_op =
+                      if copyable_ty env nty then
+                        Seed_mir.Copy
+                          { Seed_mir.root = Seed_mir.Local sid; projections = [ Seed_mir.ConstantIndex k ] }
+                      else
+                        Seed_mir.Read
+                          { Seed_mir.root = Seed_mir.Local sid; projections = [ Seed_mir.ConstantIndex k ] }
+                    in
+                    let eid = fresh_local st nty in
+                    emit st
+                      (Seed_mir.Assign (cur_place st eid, Seed_mir.Use elem_op));
+                    let ok_b = new_block st in
+                    discriminant_test (enum_name_of_ty env nty) (cur_place st eid) nvid nty ok_b (fail_b i);
+                    st.cur_block <- ok_b;
+                    List.iteri (fun j np -> bind_payloads nvid (cur_place st eid) (fail_b i) j np) npats)
+                | Typed_pattern.TP_wildcard -> ()
+                | _ -> seed_bug "unsupported tuple arm sub-pattern in lowering")
+              elems)
        | Typed_pattern.TP_wildcard | Typed_pattern.TP_literal _ | Typed_pattern.TP_or _ -> ()
        | Typed_pattern.TP_range _ ->
            seed_bug "range match arms are not available in the seed lowering");
-      let bval, bty = lower_expr env st a.Ast.ma_body in
-      ensure_result bty;
-      (* a Unit arm in a discarded/statement-position match contributes
-         no result value (the checker's branch-join: a divergent/Unit
-         arm is dropped in Discarded context) — the result slot stays
-         the surviving arms' type.  The `()` literal lowers to the
-         EMPTY TUPLE, the Unit-equivalent form. *)
-      let is_unit_ty ty =
-        ty = Type_repr.Unit
-        || match ty with
-           | Type_repr.Tuple a -> Array.length a = 0
-           | _ -> false
-      in
-      (if not (is_unit_ty bty) then
-         emit st (Seed_mir.Assign (cur_place st !result_id, Seed_mir.Use bval)));
-      set_terminator st (Seed_mir.Goto join_b))
-    m.Ast.m_arms;
-  (* the join block stays open for the continuation: every arm body
-     branches to it, and the match result flows out through it *)
-  push_block st join_b;
-  let result =
-    match !result_ty with
-    | Some ty -> (copy_place st (cur_place st !result_id), ty)
-    | None -> (Seed_mir.Constant Seed_mir.Unit, Type_repr.Unit)
-  in
-  st.scope <- saved_scope;
-  result
+        let bval, bty = lower_expr env st a.Ast.ma_body in
+        (* a DIVERGING arm (the lowered value type is Never — a call to
+           a Never-returning callee like `panic(...)`, a return-only
+           loop — OR the arm body ENDS in an explicit `return ...`: the
+           return lowering already assigned the fn return slot and
+           closed the arm's block with Ret, so the arm contributes no
+           join value and its post-Ret block is unreachable).  The
+           return test reads the block state: a return-ENDED arm leaves
+           the current block empty (the arm block was closed with Ret);
+           an arm with an INNER return followed by a normal tail
+           continues with statements in the current block and stores its
+           value normally.  Without this a return-form arm's
+           `(Unit, Unit)` value would fabricate a Unit result slot for
+           an all-return match — the `assign mismatch: () into
+           Option/Visibility` class of the parser matches. *)
+        let arm_ends_in_return =
+          st.cur_stmts = []
+          && (match st.blocks with
+             | { Seed_mir.id = bid; terminator = Seed_mir.Ret; _ } :: _
+               when bid = arm_blocks.(i) ->
+                 true
+             | _ -> false)
+        in
+        (if Type_repr.compare bty Type_repr.Never = 0 then
+           set_terminator st Seed_mir.Abort
+         else if arm_ends_in_return then
+           set_terminator st Seed_mir.Abort
+         else begin
+        ensure_result bty;
+        (* a Unit arm in a discarded/statement-position match contributes
+           no result value (the checker's branch-join: a divergent/Unit
+           arm is dropped in Discarded context) — the result slot stays
+           the surviving arms' type.  The `()` literal lowers to the
+           EMPTY TUPLE, the Unit-equivalent form.  A non-Unit arm value
+           transfers into the join result by Move when owning (a
+           bitwise Copy of an owning arm result — the Option/Result
+           arm-join class — is a verifier no-copy-of-non-Copy finding).
+           When the match's JOIN type is Unit (a statement-position
+           match — the arms' value forms are dropped by the checker's
+           Discarded use) the result slot receives the Unit constant,
+           never the arm's value (a value store into the Unit-typed
+           slot would be a type mismatch — `when None then
+           self.inner = Option::None end` — and a read of the assigned
+           field would leak the join local's ownership). *)
+         (match !result_ty with
+          | Some rt when is_unit_ty rt ->
+              emit st
+                (Seed_mir.Assign
+                   (cur_place st !result_id,
+                    Seed_mir.Use (Seed_mir.Constant Seed_mir.Unit)))
+          | Some rt ->
+              (* the join slot receives an arm value only when the arm's
+                 value type matches the slot's type — a DISCARDED
+                 match's arms never reconcile in the checker, so a
+                 mismatched later arm's value is dropped (storing it
+                 would be a verifier assign mismatch — the arm-join
+                 classes) *)
+              (if not (is_unit_ty bty) && join_types_compatible env bty rt then
+                 emit st
+                   (Seed_mir.Assign
+                      (cur_place st !result_id, Seed_mir.Use (owned_read env bty bval))))
+          | None -> ());
+         set_terminator st (Seed_mir.Goto join_b)
+          end))
+       m.Ast.m_arms;
+    (* the join block stays open for the continuation: every arm body
+       branches to it, and the match result flows out through it *)
+    push_block st join_b;
+    let result =
+      match !result_ty with
+      | Some ty -> (copy_place st (cur_place st !result_id), ty)
+      | None ->
+          (* re-audit (the diverge-tail class): a match whose arms ALL
+             diverge (every arm ends in return/break — `match peek(p)
+             when TokenKind::Pub then ... return Visibility::Public
+             ...` — never stores an arm value, so the result slot never
+             exists; the checker's resolved type for such a match is
+             Never, and the enclosing function tail must SKIP the
+             fallthrough return-slot assignment instead of storing a
+             fabricated Unit value (the `assign mismatch: () into
+             Visibility` class — the same contract lower_loop applies to
+             return-only loops) *)
+          (Seed_mir.Constant Seed_mir.Unit, call_result_ty st nid Type_repr.Unit)
+    in
+    st.scope <- saved_scope;
+    result
 
 and lower_while (env : func_env) (st : lower_state) (w : Ast.while_expr) :
     Seed_mir.operand * Type_repr.t =
@@ -3746,20 +4562,54 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
           let arg_tys = List.map snd arg_ops_ty in
           (* the EnumCtor's operand positions hold the payload fields;
              a non-Copy payload VALUE (the tuple) passes by Read — the
-             fresh aggregate local is never bitwise-copied *)
-          let arg_ops, arg_tys =
-            match arg_ops, arg_tys with
-            | [ Seed_mir.Copy p ], [ t ] when not (copyable_ty t) ->
-                ([ Seed_mir.Read p ], [ t ])
-            | _ -> (arg_ops, arg_tys)
+             fresh aggregate local is never bitwise-copied.  The
+             conversion applies to EVERY payload component (the
+             multi-field ctor payloads — `make_stmt(StmtKind::StmtLet
+             (pat, ty, value, is_mutable), ...)` — each owning field
+             read converts; the old single-arg-only rule left the
+             parser's owning-payload copies in place) *)
+          let arg_ops =
+            List.map2
+              (fun op ty ->
+                match op with
+                | Seed_mir.Copy p when not (copyable_ty env ty) -> Seed_mir.Read p
+                | op -> op)
+              arg_ops arg_tys
           in
           let params0 = free_params ty0 in
-          let ty =
+          let subst_ty =
             if List.length params0 = List.length arg_tys then
-              Type_repr.substitute
-                (List.map2 (fun p a -> (Type_repr.KParam p, a)) params0 arg_tys)
-                ty0
-            else ty0
+              Some
+                (Type_repr.substitute
+                   (List.map2 (fun p a -> (Type_repr.KParam p, a)) params0 arg_tys)
+                   ty0)
+            else None
+          in
+          (* the checker's resolved result type (the call node's tn_type,
+             substituted through the final journal) is authoritative when
+             the typed channel is present: the arity-based reconstruction
+             above only binds the params the ARGUMENTS cover, so a
+             builtin ctor with MORE declaration params than payload
+             arguments (Result::Ok/Err declare T and E but supply only
+             the payload arg; Option::None/Vec-style nullary forms
+             declare params with no argument at all) keeps the raw
+             declaration params unsolved in the aggregate local — the
+             local must carry the checker's solved instantiation (the
+             fn's return/context type), exactly like every other call
+             path's call_result_ty.  BUT when the argument-derived
+             substitution DOES solve every declaration param (the
+             one-arg single-param ctors — `Option::Some(Box::new(x))`),
+             the argument-derived type is authoritative: the checker's
+             unify erases the Box wrapper through its transparent-Box
+             convention (Some(Box::new(x)) records Option[String]
+             instead of Option[Box[String]]), and the ctor aggregate's
+             local must carry the REAL payload type (Option[Box[String]])
+             or the verifier's aggregate-vs-def element check fails on
+             every op — the aggregate element mismatch class. *)
+          let ty =
+            match subst_ty with
+            | Some t when not (Type_repr.has_type_param t) -> t
+            | _ -> call_result_ty st node_id ty0
           in
           let spec = variant_spec_of env st.variants ~enum_name ~vname ~repr:ty in
           let id = fresh_local st ty in
@@ -3771,7 +4621,30 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
                      arg_ops ) ));
           (copy_place st (cur_place st id), ty)
       | None -> (
-          match List.assoc_opt n env.callables with
+          (* re-audit (the bare-name collision class): a bare callee
+             name can be registered by several modules (`check_expr` in
+             types.tg and resource_check.tg) and the bare-key lookup
+             picks whichever module registered first — the argument
+             conventions must come from the CHECKER-RESOLVED callee (the
+             typed channel's tn_call callable id), never from the
+             colliding same-named entry (the read-vs-inout effect
+             mismatches of the kernel's own checker fns) *)
+          let entry_by_callable =
+            match typed_node_of st node_id with
+            | Some node -> (
+                match node.tn_call with
+                | Some (callable, _) ->
+                    List.assoc_opt (Ids.Callable_id.to_int callable)
+                      env.callables_by_callable
+                | None -> None)
+            | None -> None
+          in
+          let entry =
+            match entry_by_callable with
+            | Some e -> Some e
+            | None -> List.assoc_opt n env.callables
+          in
+          match entry with
           | Some entry ->
               let cid = entry.ce_callable in
               let ty =
@@ -3923,19 +4796,19 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
                                          a.Ast.ca_value)
                                      args)
                               in
-                              let id = fresh_local st me.me_ret in
-                              let rp = cur_place st id in
-                              let next_b = new_block st in
-                              set_terminator_to st
-                                (Seed_mir.Call
-                                   ( rp,
-                                     Seed_mir.Intrinsic
-                                       (Intrinsic_registry.Id.to_int iid),
-                                     arg_vals,
-                                     next_b,
-                                     None ))
-                                next_b;
-                              (copy_place st rp, call_result_ty st node_id me.me_ret)
+                               let id = fresh_local st (call_result_ty st node_id me.me_ret) in
+                               let rp = cur_place st id in
+                               let next_b = new_block st in
+                               set_terminator_to st
+                                 (Seed_mir.Call
+                                    ( rp,
+                                      Seed_mir.Intrinsic
+                                        (Intrinsic_registry.Id.to_int iid),
+                                      arg_vals,
+                                      next_b,
+                                      None ))
+                                 next_b;
+                               (copy_place st rp, call_result_ty st node_id me.me_ret)
                           | None ->
                               let nparams = Array.length me.me_params in
                          (* the checker PREPENDS a synthetic receiver (the
@@ -3989,7 +4862,14 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
                                | None -> me.me_instance)
                            | None -> me.me_instance
                          in
-                         let id = fresh_local st me.me_ret in
+                         (* the local's type: the checker's RESOLVED
+                            result (the call node's journal-substituted
+                            tn_type) — the raw sig ret carries the
+                            method's declaration-owned params (Vec::new's
+                            T), which the aggregate/return context solved;
+                            a local typed with the raw decl would fail the
+                            template verifier's declared-params rule *)
+                         let id = fresh_local st (call_result_ty st node_id me.me_ret) in
                          let rp = cur_place st id in
                          let arg_vals =
                            Array.of_list
@@ -4075,37 +4955,44 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
                                (Seed_mir.Call (rp, callee_of, arg_vals, next_b, None))
                                next_b;
                              (copy_place st rp, ty)
-                         | Some entry ->
-                             let cid = entry.ce_callable in
-                             let ty =
-                               match List.assoc_opt n env.values with
-                               | Some t -> t
-                               | None -> (
-                                   match List.assoc_opt mangled env.values with
-                                   | Some t -> t
-                                   | None -> Type_repr.Unit)
-                             in
-                             let ty = call_result_ty st node_id ty in
-                             let arg_ops =
-                               List.map (fun a -> fst (lower_expr env st a.Ast.ca_value)) args
-                             in
-                             let id = fresh_local st ty in
-                             let rp = cur_place st id in
-                             let ce_params = entry.ce_params in
-                             let arg_vals =
-                               Array.of_list
-                                 (List.mapi
-                                    (fun i op ->
-                                      {
-                                        Seed_mir.effect_ =
-                                          (if i < Array.length ce_params then
-                                           Access_effect.read_effect ce_params.(i).Type_repr.pt_convention
-                                           else Access_effect.Read);
-                                        value = op;
-                                      })
-                                    arg_ops)
-                             in
-                             let next_b = new_block st in
+                          | Some entry ->
+                              let cid = entry.ce_callable in
+                              let ty =
+                                match List.assoc_opt n env.values with
+                                | Some t -> t
+                                | None -> (
+                                    match List.assoc_opt mangled env.values with
+                                    | Some t -> t
+                                    | None -> Type_repr.Unit)
+                              in
+                              let ty = call_result_ty st node_id ty in
+                              let id = fresh_local st ty in
+                              let rp = cur_place st id in
+                              let ce_params = entry.ce_params in
+                              (* the ONE call-argument lowering (audit
+                                 P2): every argument goes through
+                                 lower_argument, which jointly produces
+                                 the access EFFECT and the OPERAND for
+                                 the declared parameter convention —
+                                 a Consume (Sink) parameter of a
+                                 non-Copy owning value transfers with
+                                 Move, never a bitwise Copy (the raw
+                                 op-through path above emitted the
+                                 Consume effect with the UNCONVERTED
+                                 Copy operand — the Box::new(value)
+                                 copy-of-non-Copy class) *)
+                              let arg_vals =
+                                Array.of_list
+                                  (List.mapi
+                                     (fun i a ->
+                                       lower_argument env st
+                                         (if i < Array.length ce_params then
+                                          ce_params.(i).Type_repr.pt_convention
+                                         else Access_effect.Let)
+                                         a.Ast.ca_value)
+                                     args)
+                              in
+                              let next_b = new_block st in
                              (* the intrinsic channel (audit §70): a
                                 mangled compiler constructor with an
                                 intrinsic binding (`set_new`,
@@ -4179,6 +5066,23 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
          lowered under).  Every unresolvable receiver or method fails
          closed with the reason. *)
       let rop, rty = lower_expr env st base in
+      (* the typed-node channel is keyed by the CALL expr's NodeId (the
+         checker's check_method_call records the method-call node's
+         tn_call/tn_type under the Call node), while this branch's AST
+         pattern binds the FIELD node's id — the CALL node is queried
+         first (the checker-resolved callee + solved substitution live
+         there), the Field node record (fn-typed fields only) second *)
+      let typed_of_method_call (nid_f : Ids.Node_id.t) : typed_node option =
+        match typed_node_of st node_id with
+        | Some n -> Some n
+        | None -> typed_node_of st nid_f
+      in
+      let call_result_of_method_call (nid_f : Ids.Node_id.t)
+          (fallback : Type_repr.t) : Type_repr.t =
+        match typed_node_of st node_id with
+        | Some n -> n.tn_type
+        | None -> call_result_ty st nid_f fallback
+      in
       (if Sys.getenv_opt "TANGERINE_DEBUG_CALL" <> None && mname = "strong_count" then
          Printf.eprintf "DEBUG-FBASE mname=%s rty=%s\n" mname (Seed_mir.print_type rty));
       let rp = materialize_place st rop in
@@ -4361,20 +5265,20 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
                if nargs <> Array.length me.me_params - 1 then
                  seed_bug "method call `%s` of `%s`: expected %d argument(s), got %d" mname owner
                    (Array.length me.me_params - 1) nargs;
-               (* the instance: the typed channel's checker-resolved callable
-                  + solved concrete substitution when present (the generic
-                  call's concrete args arrive there), else the registry's
-                  instance *)
-               let instance =
-                 match typed_node_of st nid with
-                 | Some node -> (
-                     match node.tn_call with
-                     | Some (callable, type_args) ->
-                         Instance_id.make ~callable ~type_args
-                     | None -> me.me_instance)
-                 | None -> me.me_instance
-               in
-               let self_conv = me.me_params.(0).Type_repr.pt_convention in
+             (* the instance: the typed channel's checker-resolved callable
+                + solved concrete substitution when present (the generic
+                call's concrete args arrive there), else the registry's
+                instance *)
+                 let instance =
+                   match typed_of_method_call nid with
+                   | Some node -> (
+                       match node.tn_call with
+                       | Some (callable, type_args) ->
+                           Instance_id.make ~callable ~type_args
+                       | None -> me.me_instance)
+                   | None -> me.me_instance
+                 in
+                let self_conv = me.me_params.(0).Type_repr.pt_convention in
                let self_eff = Access_effect.read_effect self_conv in
                (* the receiver's operand form follows the self convention:
                   a consuming self (Sink/Set) TRANSFERS the receiver (Move —
@@ -4383,23 +5287,37 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
                   form the free-function call path uses (the seed VM reads
                   the arg; the writeback is the documented seed
                   approximation, same as Modify args elsewhere) *)
-               let self_op =
-                 match self_eff with
-                 | Access_effect.Read | Access_effect.Modify -> Seed_mir.Copy rp
-                 | Access_effect.Consume | Access_effect.Initialize -> (
-                     match rp.Seed_mir.projections with
-                     | [] -> Seed_mir.Move rp
-                     | _ ->
-                         seed_bug
-                           "method call `%s`: the consuming self argument cannot be a projected place (the seed VM has no partial-move representation)"
-                           mname)
+               let self_ty =
+                 match rty with
+                 | Type_repr.Ref_internal (_, t) | Type_repr.Raw_ptr (_, t) -> t
+                 | t -> t
                in
-               (* the receiver-channel result local: the CHECKER-resolved
-                  return (the solved substitution — Option[Int], never the
-                  raw Option[V] declaration binder the verifier rejects in
-                  local types); falls back to substituting the method's
-                  declaration binders against the receiver's type *)
-               let rec subst_against self_ty receiver_ty acc =
+                let self_op =
+                  match self_eff with
+                  | Access_effect.Read | Access_effect.Modify -> (
+                      (* a by-value (Let) self of a non-Copy type is a
+                         place READ, never a bitwise Copy (the
+                         verifier's no-copy-of-non-Copy rule — parity
+                         with lower_argument's Let+owning conversion;
+                         the env-aware copyable_ty resolves user
+                         structs through their defs (a struct of
+                         scalars is Copy, so its Copy form is kept) *)
+                      if copyable_ty env self_ty then Seed_mir.Copy rp
+                      else Seed_mir.Read rp)
+                  | Access_effect.Consume | Access_effect.Initialize -> (
+                      match rp.Seed_mir.projections with
+                      | [] -> Seed_mir.Move rp
+                      | _ ->
+                          seed_bug
+                            "method call `%s`: the consuming self argument cannot be a projected place (the seed VM has no partial-move representation)"
+                            mname)
+                in
+            (* the receiver-channel result local: the CHECKER-resolved
+               return (the solved substitution — Ptr[T-of-the-enclosing-
+               fn] is legitimately param-carrying in a template; the raw
+               method-decl binder is what the verifier rejects, and only
+               the channel-less fallback below can produce it) *)
+            let rec subst_against self_ty receiver_ty acc =
                  match self_ty, receiver_ty with
                  | Type_repr.Named (id1, a1), Type_repr.Named (id2, a2)
                    when Ids.Type_id.compare id1 id2 = 0
@@ -4418,19 +5336,27 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
                        acc (Array.to_list a1) (Array.to_list a2)
                  | _ -> acc
                in
-               let recv_dest_ty =
-                 match call_result_ty st nid me.me_ret with
-                 | t when not (Type_repr.has_type_param t) -> t
-                 | _ -> (
-                     match me.me_params with
-                     | [||] -> me.me_ret
-                     | _ ->
-                         let self_ty = me.me_params.(0).Type_repr.pt_type in
-                         let subst = subst_against self_ty rty [] in
-                         if subst = [] then me.me_ret
-                         else Type_repr.substitute subst me.me_ret)
-               in
-               let id = fresh_local st recv_dest_ty in
+                (* the receiver-channel result local: the CHECKER-resolved
+                   return (the solved substitution — Ptr[T-of-the-enclosing-
+                   fn] is legitimately param-carrying in a template; the raw
+                   method-decl binder is what the verifier rejects, and only
+                   the channel-less fallback below can produce it) *)
+                let recv_dest_ty =
+                  match typed_node_of st node_id with
+                  | Some n -> n.tn_type
+                  | None -> (
+                      let t = call_result_ty st nid me.me_ret in
+                      if not (Type_repr.has_type_param t) then t
+                      else
+                        match me.me_params with
+                        | [||] -> me.me_ret
+                        | _ ->
+                            let self_ty = me.me_params.(0).Type_repr.pt_type in
+                            let subst = subst_against self_ty rty [] in
+                            if subst = [] then me.me_ret
+                            else Type_repr.substitute subst me.me_ret)
+                in
+                let id = fresh_local st recv_dest_ty in
                let rp2 = cur_place st id in
                let arg_vals =
                  Array.of_list
@@ -4462,20 +5388,20 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
            if nargs <> Array.length me.me_params - 1 then
              seed_bug "method call `%s` of `%s`: expected %d argument(s), got %d" mname owner
                (Array.length me.me_params - 1) nargs;
-           (* the instance: the typed channel's checker-resolved callable
-              + solved concrete substitution when present (the generic
-              call's concrete args arrive there), else the registry's
-              instance *)
-           let instance =
-             match typed_node_of st nid with
-             | Some node -> (
-                 match node.tn_call with
-                 | Some (callable, type_args) ->
-                     Instance_id.make ~callable ~type_args
-                 | None -> me.me_instance)
-             | None -> me.me_instance
-           in
-           let self_conv = me.me_params.(0).Type_repr.pt_convention in
+            (* the instance: the typed channel's checker-resolved callable
+               + solved concrete substitution when present (the generic
+               call's concrete args arrive there), else the registry's
+               instance *)
+            let instance =
+              match typed_of_method_call nid with
+              | Some node -> (
+                  match node.tn_call with
+                  | Some (callable, type_args) ->
+                      Instance_id.make ~callable ~type_args
+                  | None -> me.me_instance)
+              | None -> me.me_instance
+            in
+            let self_conv = me.me_params.(0).Type_repr.pt_convention in
            let self_eff = Access_effect.read_effect self_conv in
            (* the receiver's operand form follows the self convention:
               a consuming self (Sink/Set) TRANSFERS the receiver (Move —
@@ -4484,17 +5410,31 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
               form the free-function call path uses (the seed VM reads
               the arg; the writeback is the documented seed
               approximation, same as Modify args elsewhere) *)
-           let self_op =
-             match self_eff with
-             | Access_effect.Read | Access_effect.Modify -> Seed_mir.Copy rp
-             | Access_effect.Consume | Access_effect.Initialize -> (
-                 match rp.Seed_mir.projections with
-                 | [] -> Seed_mir.Move rp
-                 | _ ->
-                     seed_bug
-                       "method call `%s`: the consuming self argument cannot be a projected place (the seed VM has no partial-move representation)"
-                       mname)
+           let self_ty =
+             match rty with
+             | Type_repr.Ref_internal (_, t) | Type_repr.Raw_ptr (_, t) -> t
+             | t -> t
            in
+            let self_op =
+              match self_eff with
+              | Access_effect.Read | Access_effect.Modify -> (
+                  (* a by-value (Let) self of a non-Copy type is a place
+                     READ, never a bitwise Copy (the verifier's
+                     no-copy-of-non-Copy rule — parity with
+                     lower_argument's Let+owning conversion; the
+                     env-aware copyable_ty resolves user structs
+                     through their defs, so a struct of scalars keeps
+                     its Copy form) *)
+                  if copyable_ty env self_ty then Seed_mir.Copy rp
+                  else Seed_mir.Read rp)
+              | Access_effect.Consume | Access_effect.Initialize -> (
+                  match rp.Seed_mir.projections with
+                  | [] -> Seed_mir.Move rp
+                  | _ ->
+                      seed_bug
+                        "method call `%s`: the consuming self argument cannot be a projected place (the seed VM has no partial-move representation)"
+                        mname)
+            in
            (* the receiver-channel result local: the CHECKER-resolved
               return (the solved substitution — Option[Int], never the
               raw Option[V] declaration binder the verifier rejects in
@@ -4519,19 +5459,22 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
                    acc (Array.to_list a1) (Array.to_list a2)
              | _ -> acc
            in
-           let recv_dest_ty =
-             match call_result_ty st nid me.me_ret with
-             | t when not (Type_repr.has_type_param t) -> t
-             | _ -> (
-                 match me.me_params with
-                 | [||] -> me.me_ret
-                 | _ ->
-                     let self_ty = me.me_params.(0).Type_repr.pt_type in
-                     let subst = subst_against self_ty rty [] in
-                     if subst = [] then me.me_ret
-                     else Type_repr.substitute subst me.me_ret)
-           in
-           (if Sys.getenv_opt "TANGERINE_DEBUG_CALL" <> None && mname = "as_ref" then
+            let recv_dest_ty =
+              match typed_node_of st node_id with
+              | Some n -> n.tn_type
+              | None -> (
+                  let t = call_result_ty st nid me.me_ret in
+                  if not (Type_repr.has_type_param t) then t
+                  else
+                    match me.me_params with
+                    | [||] -> me.me_ret
+                    | _ ->
+                        let self_ty = me.me_params.(0).Type_repr.pt_type in
+                        let subst = subst_against self_ty rty [] in
+                        if subst = [] then me.me_ret
+                        else Type_repr.substitute subst me.me_ret)
+            in
+            (if Sys.getenv_opt "TANGERINE_DEBUG_CALL" <> None && mname = "as_ref" then
               Printf.eprintf "DEBUG-ASREF owner=%s rty=%s ret=%s dest=%s\n" owner
                 (Seed_mir.print_type rty) (Seed_mir.print_type me.me_ret)
                 (Seed_mir.print_type recv_dest_ty));
@@ -4581,16 +5524,16 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
                   the RECEIVER's type (the self parameter's structure —
                   Map[K, V] vs the receiver's Map[Int, Int] solves
                   V := Int) so the dest never carries a raw binder *)
-               let dest_ty =
-                 match call_result_ty st nid me.me_ret with
-                 | Type_repr.Named (_, _) as t
-                   when List.exists
-                          (fun p ->
-                            Type_repr.has_type_param p.Type_repr.pt_type)
-                          (Array.to_list me.me_params) ->
-                     t
-                 | t -> t
-               in
+                let dest_ty =
+                  match call_result_of_method_call nid me.me_ret with
+                  | Type_repr.Named (_, _) as t
+                    when List.exists
+                           (fun p ->
+                             Type_repr.has_type_param p.Type_repr.pt_type)
+                           (Array.to_list me.me_params) ->
+                      t
+                  | t -> t
+                in
                let dest_ty =
                  let rec subst_against self_ty receiver_ty acc =
                    match self_ty, receiver_ty with
@@ -4718,22 +5661,65 @@ let lower_function_with_variants
      the return slot is assigned, so mutations made by the defers are
      observable in the returned value (explicit returns lower the same
      order) *)
-  emit_defers env st;
-  (match result with
-   | Some (vo, ty) ->
-       (* re-audit P0: a Never tail (a return-only loop / diverging
-          tail) never falls through — the explicit return paths assign
-          the slot; assigning a Unit constant would corrupt the slot.
-          A Unit-returning function whose tail is a VALUE expression
-          (e.g. a trailing `x = x + 1` statement-form assign) discards
-          the tail value — the declared return is Unit and the slot
-          stays the callee's own Unit convention. *)
-       (match ty with
-        | Type_repr.Never -> ()
-        | _ when env.fn_ret = Type_repr.Unit -> ()
-        | _ -> emit st (Seed_mir.Assign (cur_place st 0, Seed_mir.Use vo)))
-   | None -> ());
-  set_terminator st Seed_mir.Ret;
+   emit_defers env st;
+   let tail_terminated = ref false in
+   (match result with
+    | Some (vo, ty) ->
+        (* re-audit P0: a Never tail (a return-only loop / diverging
+           tail — a tail-position `panic(...)` call whose success block
+           is the CURRENT block) never falls through — the explicit
+           return paths assign the slot; assigning a Unit constant would
+           corrupt the slot and leaving the (CFG-reachable) success
+           block open for the final Ret fabricates a return path that
+           never assigned the slot (the verifier's `return with the
+           return slot _0 not definitely initialized` class — the
+           codegen/object panicking tails).  The diverging tail closes
+           with the seed's Abort.  A Unit-returning function whose tail
+           is a VALUE expression (e.g. a trailing `x = x + 1`
+           statement-form assign) discards the tail value — the
+           declared return is Unit and the slot stays the callee's own
+           Unit convention. *)
+        (match ty with
+         | Type_repr.Never ->
+             tail_terminated := true;
+             set_terminator st Seed_mir.Abort
+         | _ when env.fn_ret = Type_repr.Unit -> ()
+         | _ when env.fn_ret = Type_repr.Never ->
+             (* a Never-returning function (its body's tail is a call to
+                a diverging callee — `panic` ends in
+                `__intrinsic_abort()`, which the registry types Unit):
+                the tail value can never be stored into the Never-typed
+                return slot (a `() into !` assign mismatch) — the slot
+                only receives values on the body's explicit-return paths
+                (there are none for a genuine Never fn) *)
+             ()
+         | _ ->
+             (* the implicit return consumes the tail value exactly like
+                an explicit return: a non-Copy owning value MOVES into the
+                return slot (the local is dead after the return — a
+                bitwise copy would be a verifier no-copy-of-non-Copy
+                finding) *)
+             let vo =
+               match vo with
+               | Seed_mir.Copy p when not (copyable_ty env ty) -> Seed_mir.Move p
+               | _ -> vo
+             in
+             emit st (Seed_mir.Assign (cur_place st 0, Seed_mir.Use vo)))
+    | None -> ());
+   if not !tail_terminated then
+     (match fn.Ast.fn_body with
+      | Ast.FnSignatureOnly ->
+          (* a SIGNATURE-ONLY function (the kernel's @intrinsic-declared
+             stubs — `black_box[T]`, `type_name[T]` — whose body is the
+             bare attribute): the seed has no executable body to return
+             from — the entry block ends with the seed's Abort (an
+             uninitialized return-slot Ret would be the verifier's
+             `return with the return slot _0 not definitely
+             initialized` class; the @intrinsic marker is the NATIVE
+             backend's contract and the stub is never invoked by the
+             seed — native-intrinsic calls never reach it) *)
+          set_terminator st Seed_mir.Abort
+      | _ -> set_terminator st Seed_mir.Ret);
   let params =
     Array.of_list
       (List.mapi

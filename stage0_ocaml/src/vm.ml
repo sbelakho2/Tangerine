@@ -777,21 +777,36 @@ let rec eval_rvalue (vm : t) (frame : frame) (rv : Seed_mir.rvalue) : Vm_value.t
            | Seed_mir.Gt -> Vm_value.Bool (a > b)
            | Seed_mir.Ge -> Vm_value.Bool (a >= b)
            | _ -> err_trap vm "invalid string binary op")
-       | Vm_value.Float64 a, Vm_value.Float64 b -> (
-           let fa = Int64.float_of_bits a and fb = Int64.float_of_bits b in
-           match op with
-           | Seed_mir.Add -> Vm_value.Float64 (Int64.bits_of_float (fa +. fb))
-           | Seed_mir.Sub -> Vm_value.Float64 (Int64.bits_of_float (fa -. fb))
-           | Seed_mir.Mul -> Vm_value.Float64 (Int64.bits_of_float (fa *. fb))
-           | Seed_mir.Div -> Vm_value.Float64 (Int64.bits_of_float (fa /. fb))
-           | Seed_mir.Eq -> Vm_value.Bool (fa = fb)
-           | Seed_mir.Ne -> Vm_value.Bool (fa <> fb)
-           | Seed_mir.Lt -> Vm_value.Bool (fa < fb)
-           | Seed_mir.Le -> Vm_value.Bool (fa <= fb)
-           | Seed_mir.Gt -> Vm_value.Bool (fa > fb)
-           | Seed_mir.Ge -> Vm_value.Bool (fa >= fb)
-           | _ -> err_trap vm "invalid float binary op")
-       | _ -> err_trap vm "binary op on unsupported value pair")
+        | Vm_value.Float64 a, Vm_value.Float64 b -> (
+            let fa = Int64.float_of_bits a and fb = Int64.float_of_bits b in
+            match op with
+            | Seed_mir.Add -> Vm_value.Float64 (Int64.bits_of_float (fa +. fb))
+            | Seed_mir.Sub -> Vm_value.Float64 (Int64.bits_of_float (fa -. fb))
+            | Seed_mir.Mul -> Vm_value.Float64 (Int64.bits_of_float (fa *. fb))
+            | Seed_mir.Div -> Vm_value.Float64 (Int64.bits_of_float (fa /. fb))
+            | Seed_mir.Eq -> Vm_value.Bool (fa = fb)
+            | Seed_mir.Ne -> Vm_value.Bool (fa <> fb)
+            | Seed_mir.Lt -> Vm_value.Bool (fa < fb)
+            | Seed_mir.Le -> Vm_value.Bool (fa <= fb)
+            | Seed_mir.Gt -> Vm_value.Bool (fa > fb)
+            | Seed_mir.Ge -> Vm_value.Bool (fa >= fb)
+            | _ -> err_trap vm "invalid float binary op")
+        | ( Vm_value.Enum _, Vm_value.Enum _
+          | Vm_value.Tuple _, Vm_value.Tuple _
+          | Vm_value.Struct _, Vm_value.Struct _
+          | Vm_value.Array _, Vm_value.Array _
+          | Vm_value.Char _, Vm_value.Char _
+          | Vm_value.Float32 _, Vm_value.Float32 _ ) -> (
+            (* aggregate/scalar equality beyond the int/bool/string
+               primitives — the checker's fundamental equality accepts
+               whole-enum/struct/tuple operands (`tok.kind == kind`, the
+               parser's token-kind dispatch), so the runtime compares the
+               values structurally (Vm_value.equal: tags + payloads) *)
+            match op with
+            | Seed_mir.Eq -> Vm_value.Bool (Vm_value.equal lv rv)
+            | Seed_mir.Ne -> Vm_value.Bool (not (Vm_value.equal lv rv))
+            | _ -> err_trap vm "ordering on aggregate operands")
+        | _ -> err_trap vm "binary op on unsupported value pair")
   | Seed_mir.UnaryOp (op, v) -> (
       let vv = eval_operand vm frame v in
       match op, vv with

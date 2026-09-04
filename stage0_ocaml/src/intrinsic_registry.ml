@@ -267,15 +267,21 @@ let manifest : t =
           ~params:[| set_of (param Type_param.t); param Type_param.t |]
           ~ret:(option_of (ref_ (param Type_param.t))) );
       ( "__intrinsic_set_remove",
-        sig_ ~params:[| set_of (param Type_param.t); param Type_param.t |] ~ret:ty_bool );
+        sig_conv
+          ~params:
+            [| (Access_effect.Inout, set_of (param Type_param.t));
+               (Access_effect.Let, param Type_param.t) |]
+          ~ret:ty_bool );
       ( "__intrinsic_set_drain_one",
-        sig_
-          ~params:[| set_of (param Type_param.t) |]
+        sig_conv
+          ~params:[| (Access_effect.Inout, set_of (param Type_param.t)) |]
           ~ret:(option_of (param Type_param.t)) );
       ( "__intrinsic_set_len",
         sig_ ~params:[| set_of (param Type_param.t) |] ~ret:ty_int );
       ( "__intrinsic_set_clear",
-        sig_ ~params:[| set_of (param Type_param.t) |] ~ret:ty_unit );
+        sig_conv
+          ~params:[| (Access_effect.Inout, set_of (param Type_param.t)) |]
+          ~ret:ty_unit );
       ( "__intrinsic_set_entries",
         sig_ ~params:[| set_of (param Type_param.t) |] ~ret:(vec_of (param Type_param.t)) );
       (* I/O and conversion surface with real host semantics; the host

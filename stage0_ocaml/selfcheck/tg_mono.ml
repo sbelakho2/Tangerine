@@ -15,8 +15,10 @@ let let_param (ty : Type_repr.t) : Type_repr.param_type = { Type_repr.pt_convent
          both execute under the Seed VM and the mono output verifies;
      (b) DUPLICATE SPECIALIZATION: the same instance discovered twice
          reuses one specialization — the output holds the instance
-         exactly once (the seen-set/cache dedup) and the internal
-         re-specialization consistency check passes;
+         exactly once (the seen-set/cache dedup; the template lookup is
+         first-wins over the immutable input program, so a
+         re-discovered instance would re-specialize to the identical
+         body and the re-specialization is skipped);
      (c) EXACT-ARITY ENFORCEMENT: a template declaring 2 parameters with
          a call instance carrying 1 argument, and a 1-parameter template
          with a 2-argument instance, fail Mono.build with the internal
@@ -528,7 +530,7 @@ let mono_with_types ~(generic_types : Mono.generic_def array)
          Driver.materialize_type_instances ~generic_types ~type_instances:queued mono_prog
        with
        | Error errs -> Error errs
-       | Ok final_prog -> Ok (final_prog, queued))
+       | Ok (final_prog, _) -> Ok (final_prog, queued))
 
 let check_type_instances () =
   let pair_tid = Ids.Type_id.make 8 in

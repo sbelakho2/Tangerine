@@ -54,6 +54,13 @@ type typed_signature = {
   ts_param_names : string array;
   ts_return : Type_repr.t;
   ts_where : (Type_repr.t * (string * Type_repr.t array) list) list;
+  (* re-audit (the anonymous-signature-binder class): the declared
+     binders minted for the signature's anonymous `_` / `impl Trait`
+     slots, with the trait bounds the impl-trait slots declared — the
+     fn-body checker registers them into the solver's param_bounds so
+     method calls on the anonymous binder resolve through the contract *)
+  ts_anon_bounds :
+    (Ids.Generic_param_id.t * (string * Type_repr.t array) list) list;
   ts_callable : Ids.Callable_id.t;
   ts_span : Span.span;
 }
@@ -226,11 +233,23 @@ type state = {
      calls (which carry the nested callable id) resolve. *)
   mutable nested_functions : (string * typed_signature * Ast.function_decl) list;
   mutable query_sigs : (string * typed_signature) list;
+  (* the synthesized contract sigs (derived Clone::clone /
+     derived to_string): one per accepted call site, carrying the exact
+     receiver/return types the call was checked against.  The seed
+     verifier resolves those body-less contract calls through this
+     registry (the same query-sig channel as the compiler-builtin
+     methods and the type queries). *)
+  mutable derived_sigs : (Ids.Callable_id.t * typed_signature) list;
   mutable o_handoff_fallback : int;
   (* once-only declaration identities: the first allocation of an item's
      generic-parameter ids is recorded and reused by every later
      registration attempt, so retry rounds never create stale ids *)
   mutable sig_param_ids : (string, (string * Ids.Generic_param_id.t) list) Hashtbl.t;
+  (* re-audit (the anonymous-signature-binder class): the declared
+     binders minted for each signature's anonymous `_` / `impl Trait`
+     slots, memoized per key like sig_param_ids — deterministic across
+     the fixpoint re-registrations *)
+  mutable anon_sig_ids : (string, (string * Ids.Generic_param_id.t) list) Hashtbl.t;
   mutable next_callable_id : int;
   mutable next_impl_index : int;
   (* the Box LangItem identity of THIS compilation (re-audit P0 #2): the
@@ -328,6 +347,17 @@ type scope = {
   generics : (string * Ids.Generic_param_id.t) list;
   loop_depth : int;
   capture : (string -> unit) option;
+  (* re-audit (the anonymous-signature-binder class): resolve_signature
+     pre-mints DECLARED generic binders for every anonymous `_` /
+     `impl Trait` slot of a function signature (they must not stay
+     unbound Infer_vars — the lowered fn would carry an unresolved
+     inference variable into the verifier's concrete/template
+     discipline); the queue is consumed positionally by resolve_type's
+     Ast.Inferred / Ast.ImplTrait cases.  Empty everywhere outside
+     signature resolution. *)
+  anon_slots : Type_repr.t list ref;
+  anon_bounds :
+    (Ids.Generic_param_id.t * (string * Type_repr.t array) list) list ref;
 }
 
 let assoc_local (name : string) (locals : (string * Type_repr.t * bool) list) :
@@ -421,6 +451,21 @@ let is_box (bt : Ids.Type_id.t option) (id : Ids.Type_id.t) : bool =
    conflict with a later binding. *)
 let var_journal : (Type_repr.generic_key * Type_repr.t) list ref = ref []
 
+(* The var-binding mirror (re-audit): the NEWEST journal solution per
+   Infer_var id — the rebind re-alignment and the end-of-check readers
+   consult it instead of a linear journal scan (the journal holds every
+   bind since compilation start). *)
+let journal_var_tbl : (int, Type_repr.t) Hashtbl.t = Hashtbl.create 65536
+
+let journal_bind_var (v : int) (t : Type_repr.t) : unit =
+  var_journal := (Type_repr.KVar v, t) :: !var_journal;
+  Hashtbl.replace journal_var_tbl v t
+
+(* re-audit (the orphaned-inner-var class): re-align recursion depth
+   guard — the rebind re-alignment cascades through the journal's older
+   bindings; the cap bounds pathological rebind chains. *)
+let realign_depth : int ref = ref 0
+
 (* The final journal — the driver's typed-channel readers substitute the
    pattern trees through it (re-audit P12: the bind types are resolved
    LAZILY at read time because the vars bind during later statements of
@@ -512,6 +557,7 @@ let mk_sig (st : state) ~(name : string) ~(params_decl : (string * Ids.Generic_p
     ts_param_names = Array.of_list (List.map (fun (n, _, _) -> n) params);
     ts_return = ret;
     ts_where = where;
+    ts_anon_bounds = [];
     ts_callable = fresh_callable_id st;
     ts_span = Span.synthetic;
   }
@@ -948,8 +994,16 @@ let builtin_methods (st : state) (vec_p : Ids.Generic_param_id.t) (opt_p : Ids.G
      (`fn f[T: Hash](x: T)`) dispatches through candidate_owners = the
      bound trait names; the methods table must carry (Hash, hash),
      (Eq, eq), (Display, fmt), (Clone, clone) keys whose self is the
-     trait's generic parameter, so the bound's methods resolve *)
-  let generic_self = Type_repr.Type_param (fresh_param_id st) in
+     trait's generic parameter, so the bound's methods resolve.  The
+     generic parameter IS a declared binder (params_decl carries it):
+     every call instantiates it — the recorded instance type args
+     carry the solved receiver type and the template verifier's
+     substitution maps the contract's own rigid param to the actual
+     receiver (a params_decl:[] contract would leave the foreign rigid
+     in the MIR and every bound-generic method call would fail the
+     argument check against an unrelated template's parameter). *)
+  let generic_self_p = fresh_param_id st in
+  let generic_self = Type_repr.Type_param generic_self_p in
   let m_traits =
     [
       ("Hash", "hash", [ ("self", let_, generic_self) ], i_ty);
@@ -960,7 +1014,8 @@ let builtin_methods (st : state) (vec_p : Ids.Generic_param_id.t) (opt_p : Ids.G
     ]
     |> List.map (fun (owner, name, params, ret) ->
            ((owner, name),
-            mk_sig st ~name:("builtin::" ^ owner ^ "::" ^ name) ~params_decl:[]
+            mk_sig st ~name:("builtin::" ^ owner ^ "::" ^ name)
+              ~params_decl:[ ("Self", generic_self_p) ]
               ~params ~ret ~where:[]))
   in
   let all_methods =
@@ -1055,6 +1110,8 @@ let builtin_constructors (st : state) (opt_p : Ids.Generic_param_id.t)
 (* The initial env: the compiler-registered prelude. *)
 let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
   var_journal := [];
+  Hashtbl.reset journal_var_tbl;
+  realign_depth := 0;
   Hashtbl.reset err_span_journal;
   let st =
     {
@@ -1066,8 +1123,10 @@ let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
       nested_functions = [];
       const_fns = Hashtbl.create 64;
       query_sigs = [];
+      derived_sigs = [];
       o_handoff_fallback = 0;
       sig_param_ids = Hashtbl.create 256;
+      anon_sig_ids = Hashtbl.create 64;
       next_callable_id = 0;
       next_impl_index = 0;
       box_tid = None;
@@ -1657,7 +1716,21 @@ let rec unify (box_tid : Ids.Type_id.t option) (subst : (Type_repr.generic_key *
           span = Span.synthetic }
       in
       let fits = if int_signed k then Literal.fits_signed p (int_width k) else Literal.fits_unsigned p (int_width k) in
-      if fits then Ok ()
+      if fits then (
+        (* a VAR-bound literal adoptions re-binds the var to the concrete
+           kind: `var data = Vec::new(); data.push(0xff)` — the first
+           push's arg-unify pinned the receiver's element var to
+           Int_literal; the fn-end `Vec[u8]` return must REBIND the var
+           to u8 (not merely adopt past the stale literal binding), or
+           the call-instance substitutions keep resolving to Int_literal
+           (the `expected u8 got Int` call-arg class of the encoder
+           fns' byte pushes) *)
+        (match b with
+         | Type_repr.Infer_var v ->
+             subst := (Type_repr.KVar v, Type_repr.Int k) :: !subst;
+             journal_bind_var v (Type_repr.Int k)
+         | _ -> ());
+        Ok ())
       else
         Error
           (Printf.sprintf "integer literal does not fit its adopted type %s"
@@ -1668,11 +1741,16 @@ let rec unify (box_tid : Ids.Type_id.t option) (subst : (Type_repr.generic_key *
           span = Span.synthetic }
       in
       let fits = if int_signed k then Literal.fits_signed p (int_width k) else Literal.fits_unsigned p (int_width k) in
-      if fits then Ok ()
-      else
-        Error
-          (Printf.sprintf "integer literal does not fit its adopted type %s"
-             (int_name_of_kind k))
+      if fits then begin
+        match a with
+        | Type_repr.Infer_var v ->
+            subst := (Type_repr.KVar v, Type_repr.Int k) :: !subst;
+            journal_bind_var v (Type_repr.Int k)
+        | _ -> ()
+      end;
+      if fits then Ok () else Error
+        (Printf.sprintf "integer literal does not fit its adopted type %s"
+           (int_name_of_kind k))
   | Type_repr.Int_literal _, Type_repr.Int_literal _ -> Ok ()
   | Type_repr.Int k1, Type_repr.Int k2 ->
       (* STRICT (the native model): integer kinds unify only when
@@ -1692,15 +1770,48 @@ let rec unify (box_tid : Ids.Type_id.t option) (subst : (Type_repr.generic_key *
   | Type_repr.Infer_var v, _ ->
       if occurs_key (Type_repr.KVar v) b' then Error "recursive type"
       else begin
+        (* re-audit (the orphaned-inner-var class): a REBIND of an
+           already-bound var (the fn-end return-slot unify starts from an
+           EMPTY subst and re-solves a var the body's calls already bound)
+           must re-align the OLD binding's nested vars against the NEW
+           value.  Without the re-align, an inner var that the earlier
+           bind embedded (`buffer.push(Option::None)` binds the
+           receiver's element var to Option[?#2424], then a later rebind
+           of the element var to Option[T] clobbers the chain) has NO
+           journal entry of its own — it is orphaned forever, and every
+           end-of-check substitution leaves Option[?#2424] in the
+           recorded node: the unresolved-inference-variable findings and
+           the dropped-arm-store possibly-uninitialized joins.  A failed
+           re-align (the stale binding and the new value genuinely
+           disagree) is ignored — the rebind still wins for v, exactly
+           like today. *)
+         (match Hashtbl.find_opt journal_var_tbl v with
+          | Some t_old when Type_repr.compare t_old b' <> 0 ->
+              let s_r = ref [] in
+              if !realign_depth < 64 then begin
+                incr realign_depth;
+                ignore (unify box_tid s_r t_old b');
+                decr realign_depth
+              end
+          | _ -> ());
         subst := (Type_repr.KVar v, b') :: !subst;
-        var_journal := (Type_repr.KVar v, b') :: !var_journal;
+        journal_bind_var v b';
         Ok ()
       end
   | _, Type_repr.Infer_var v ->
       if occurs_key (Type_repr.KVar v) a' then Error "recursive type"
       else begin
+        (match Hashtbl.find_opt journal_var_tbl v with
+         | Some t_old when Type_repr.compare t_old a' <> 0 ->
+             let s_r = ref [] in
+             if !realign_depth < 64 then begin
+               incr realign_depth;
+               ignore (unify box_tid s_r t_old a');
+               decr realign_depth
+             end
+         | _ -> ());
         subst := (Type_repr.KVar v, a') :: !subst;
-        var_journal := (Type_repr.KVar v, a') :: !var_journal;
+        journal_bind_var v a';
         Ok ()
       end
   | Type_repr.Type_param pa, _ ->
@@ -1957,11 +2068,17 @@ let rec resolve_type (env : env) (scope : scope) (t : Ast.type_expr) : (Type_rep
   | Ast.ImplTrait (bound, _) ->
       (* the argument-position impl-trait `fn f(v: impl Trait)` — an
          anonymous generic bound, the kernel's `validator: impl
-         Validator[T, Clean]`: a fresh inference variable (the concrete
-         type solves at the call site); the method calls on it resolve
-         through the trait contract — the bound's trait names are
-         registered against the var for the method-call receiver path *)
-      let v = fresh_infer_var env.state in
+         Validator[T, Clean]`.  Inside a SIGNATURE resolution
+         (resolve_signature pre-minted declared binders for every
+         anonymous slot) the slot consumes the declared binder — an
+         anonymous generic parameter of the function — and the bound's
+         trait names + resolved args are collected for the solver's
+         param_bounds (method calls on the binder resolve through the
+         trait contract, exactly like a named `T: Trait` parameter).
+         Outside signature resolution the slot is a fresh inference
+         variable (the concrete type solves at the call site); the
+         bound's trait names are registered against the var for the
+         method-call receiver path. *)
       let rec trait_names_of (t : Ast.type_expr) : string list =
         match t with
         | Ast.Named (n, _, _) -> [ n ]
@@ -1970,12 +2087,40 @@ let rec resolve_type (env : env) (scope : scope) (t : Ast.type_expr) : (Type_rep
         | _ -> []
       in
       let names = trait_names_of bound in
-      (match v with
-       | Type_repr.Infer_var id ->
+      (match !(scope.anon_slots) with
+       | Type_repr.Type_param pid :: rest ->
+           scope.anon_slots := rest;
+           (* resolve the bound's arguments in the signature scope (the
+              kernel's `impl Validator[T, Clean]` — T/Clean resolve to
+              the signature's own declared binders) *)
+           let bound_args =
+             match bound with
+             | Ast.Named (_, args, _) -> (
+                 let rec go acc = function
+                   | [] -> Ok (List.rev acc)
+                   | a :: rest2 -> (
+                       match resolve_type env scope a with
+                       | Ok rt -> go (rt :: acc) rest2
+                       | Error m -> Error m)
+                 in
+                 match go [] args with
+                 | Ok rt -> rt
+                 | Error _ -> [])
+             | _ -> []
+           in
            if names <> [] then
-             env.state.impl_trait_bounds <- (id, names) :: env.state.impl_trait_bounds
-       | _ -> ());
-      Ok v
+             scope.anon_bounds :=
+               (pid, List.map (fun n -> (n, Array.of_list bound_args)) names)
+               :: !(scope.anon_bounds);
+           Ok (Type_repr.Type_param pid)
+       | _ ->
+           let v = fresh_infer_var env.state in
+           (match v with
+            | Type_repr.Infer_var id ->
+                if names <> [] then
+                  env.state.impl_trait_bounds <- (id, names) :: env.state.impl_trait_bounds
+            | _ -> ());
+           Ok v)
   | Ast.Bounded (base, _, _) -> resolve_type env scope base
   | Ast.Option (inner, _) -> (
       match resolve_type env scope inner with
@@ -1983,10 +2128,21 @@ let rec resolve_type (env : env) (scope : scope) (t : Ast.type_expr) : (Type_rep
       | Error m -> Error m)
   | Ast.Inferred _ ->
       (* the anonymous type argument `_` (the kernel's `Tainted[_]`
-         wildcard): a fresh inference variable — the anonymous-arg
-         semantics; the top-level `var x: _` form stays rejected by the
-         subset firewall (E9035) when it reaches an annotation position *)
-      Ok (fresh_infer_var env.state)
+         wildcard).  Inside a SIGNATURE resolution the slot consumes a
+         pre-minted DECLARED binder (an anonymous generic parameter of
+         the function — the seed's mono can declare it and every call
+         site instantiates it; a bare Infer_var in the lowered fn
+         signature would carry an unresolved inference variable into
+         the verifier's concrete/template discipline).  Outside
+         signature resolution it stays a fresh inference variable — the
+         anonymous-arg semantics; the top-level `var x: _` form stays
+         rejected by the subset firewall (E9035) when it reaches an
+         annotation position *)
+      (match !(scope.anon_slots) with
+       | (Type_repr.Type_param _ as slot) :: rest ->
+           scope.anon_slots := rest;
+           Ok slot
+       | _ -> Ok (fresh_infer_var env.state))
 
 and resolve_named (env : env) (scope : scope) (span : Span.span) (name : string)
     (args : Ast.type_expr list) : (Type_repr.t, string) result =
@@ -2094,8 +2250,65 @@ let resolve_signature (env : env) (scope : scope) (sig_ : Ast.function_sig)
     in
     own @ extra_params
   in
+  (* re-audit (the anonymous-signature-binder class): count the
+     signature's anonymous `_` / `impl Trait` slots in resolution order
+     (params, then the return type, then the where clauses) and pre-mint
+     one DECLARED generic binder per slot (memoized per key, like the
+     named params — deterministic across the fixpoint re-registrations).
+     resolve_type's anonymous cases consume the queue, so the lowered
+     signature's params/return carry Type_params the mono can declare,
+     never unbound Infer_vars. *)
+  let anon_slots_decl =
+    let rec count_anon (t : Ast.type_expr) : int =
+      match t with
+      | Ast.Inferred _ | Ast.ImplTrait _ -> 1
+      | Ast.Named (_, args, _) -> List.fold_left (fun a e -> a + count_anon e) 0 args
+      | Ast.TTuple (elems, _) ->
+          List.fold_left (fun a e -> a + count_anon e) 0 elems
+      | Ast.Ref (inner, _, _) | Ast.RawPtr (inner, _, _) | Ast.Slice (inner, _)
+      | Ast.Bounded (inner, _, _) | Ast.Option (inner, _) ->
+          count_anon inner
+      | Ast.FnPtr (ps, r, _) ->
+          List.fold_left (fun a e -> a + count_anon e) 0 (ps @ [ r ])
+      | Ast.TArray (e, _, _) -> count_anon e
+      | Ast.AssocBinding (_, v, _) -> count_anon v
+      | _ -> 0
+    in
+    let n =
+      List.fold_left
+        (fun a (p : Ast.param) -> a + count_anon p.Ast.p_type)
+        0 sig_.Ast.sig_params
+      + (match sig_.Ast.sig_return with Some r -> count_anon r | None -> 0)
+      + List.fold_left
+          (fun a (wp : Ast.where_predicate) ->
+            a + count_anon wp.Ast.wp_type
+            + List.fold_left
+                (fun a2 (_, bargs) ->
+                  List.fold_left (fun a3 e -> a3 + count_anon e) a2 bargs)
+                a wp.Ast.wp_bounds)
+          0 sig_.Ast.sig_where
+    in
+    match Hashtbl.find_opt env.state.anon_sig_ids key with
+    | Some ids when List.length ids = n -> ids
+    | _ ->
+        let ids =
+          List.init n (fun _ -> ("_", fresh_param_id env.state))
+        in
+        Hashtbl.replace env.state.anon_sig_ids key ids;
+        ids
+  in
+  let anon_queue =
+    List.map (fun (_, pid) -> Type_repr.Type_param pid) anon_slots_decl
+  in
+  let anon_bounds :
+      (Ids.Generic_param_id.t * (string * Type_repr.t array) list) list ref =
+    ref []
+  in
   let scope =
-    { scope with generics = List.map (fun (n, i) -> (n, i)) params_decl @ scope.generics }
+    { scope with
+      generics = List.map (fun (n, i) -> (n, i)) params_decl @ scope.generics;
+      anon_slots = ref anon_queue;
+      anon_bounds }
   in
   let* params =
     let rec go acc = function
@@ -2146,12 +2359,13 @@ let resolve_signature (env : env) (scope : scope) (sig_ : Ast.function_sig)
   Ok
     {
       ts_name = sig_.Ast.sig_name;
-      ts_params_decl = params_decl;
+      ts_params_decl = params_decl @ anon_slots_decl;
       ts_params = Array.of_list params;
       ts_param_names =
         Array.of_list (List.map (fun (p : Ast.param) -> p.Ast.p_name) sig_.Ast.sig_params);
       ts_return = ret;
       ts_where = where;
+      ts_anon_bounds = List.rev !anon_bounds;
       ts_callable = fresh_callable_id env.state;
       ts_span = sig_.Ast.sig_span;
     }
@@ -2994,20 +3208,55 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
                      (Literal.range_error p
                       ^ " (a literal that does not fit its type is a TYPE error, never zeroed)"))
               else Ok { te_type = Type_repr.Int k; te_effects = [||]; te_span = span; te_flow = normal_flow (Type_repr.Int k) })
-          | None ->
+          | None -> (
               (* unsuffixed literal: the Int_literal inference type is
                  adopted by the enclosing constraints (the native model);
                  only the 128-bit-wide sanity bound is checked here *)
-              if
-                not
-                  (Literal.fits_unsigned
-                     p (int_width Type_repr.U128))
-              then
-                Error
-                  (err span
-                     (Literal.range_error p
-                      ^ " (a literal that does not fit its type is a TYPE error, never zeroed)"))
-              else Ok { te_type = Type_repr.Int_literal p.Literal.magnitude; te_effects = [||]; te_span = span; te_flow = normal_flow (Type_repr.Int_literal p.Literal.magnitude) }))
+              match expected with
+              | Some (Type_repr.Int k) ->
+                  (* re-audit (the literal-kind channel): an unsuffixed
+                     literal checked against a CONCRETE integer expected
+                     type (the equality/arithmetic operand partner, a
+                     typed local/param, a cast-free call argument) records
+                     the coerced kind here — the typed-node bridge must
+                     carry `align == 0` / `align - 1` (align: UInt) as UInt
+                     constants, never the raw Int_literal form the
+                     lowering's No_int_suffix fallback defaults to Int *)
+                  let fits =
+                    if int_signed k then Literal.fits_signed p (int_width k)
+                    else Literal.fits_unsigned p (int_width k)
+                  in
+                  if not fits then
+                    Error
+                      (err span
+                         (Literal.range_error p
+                          ^ " (a literal that does not fit its type is a TYPE error, never zeroed)"))
+                  else
+                    Ok
+                      {
+                        te_type = Type_repr.Int k;
+                        te_effects = [||];
+                        te_span = span;
+                        te_flow = normal_flow (Type_repr.Int k);
+                      }
+              | _ ->
+                  if
+                    not
+                      (Literal.fits_unsigned
+                         p (int_width Type_repr.U128))
+                  then
+                    Error
+                      (err span
+                         (Literal.range_error p
+                          ^ " (a literal that does not fit its type is a TYPE error, never zeroed)"))
+                  else
+                    Ok
+                      {
+                        te_type = Type_repr.Int_literal p.Literal.magnitude;
+                        te_effects = [||];
+                        te_span = span;
+                        te_flow = normal_flow (Type_repr.Int_literal p.Literal.magnitude);
+                      })))
   | Ast.FloatLit (_, _, span) -> (
       match expected with
       | Some (Type_repr.Float Type_repr.F32) ->
@@ -3049,14 +3298,31 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
   | Ast.Tuple (_, elems, span) -> (
       if elems = [] then Ok { te_type = Type_repr.Unit; te_effects = [||]; te_span = span; te_flow = normal_flow (Type_repr.Unit) }
       else
-        let rec go acc = function
+        (* re-audit (the literal-kind channel, TUPLE elements): a
+           concrete expected tuple forwards each element's expected type
+           to the element checks so an unsuffixed literal element records
+           the concrete kind (the checker's IntLiteral adoption) instead
+           of the raw Int_literal that would leak into the MIR aggregate *)
+        let elem_exps =
+          match expected with
+          | Some (Type_repr.Tuple ets) when Array.length ets = List.length elems ->
+              Some (Array.to_list ets)
+          | _ -> None
+        in
+        let rec go acc i = function
           | [] -> Ok (List.rev acc)
           | x :: rest -> (
-              match check_expr env scope None x with
-              | Ok te -> go (te :: acc) rest
+              let x_exp =
+                match elem_exps with
+                | Some l -> (
+                    match List.nth_opt l i with Some t -> Some t | None -> None)
+                | None -> None
+              in
+              match check_expr env scope x_exp x with
+              | Ok te -> go (te :: acc) (i + 1) rest
               | Error m -> Error m)
         in
-        match go [] elems with
+        match go [] 0 elems with
         | Error m -> Error m
         | Ok tes -> (
             let tys = Array.of_list (List.map (fun te -> te.te_type) tes) in
@@ -3082,14 +3348,31 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
               Ok { te_type = Type_repr.Named (b_array, [| t |]); te_effects = [||]; te_span = span; te_flow = normal_flow (Type_repr.Named (b_array, [| t |])) }
           | _ -> Error (err span "cannot infer the element type of an empty array"))
       | first :: rest -> (
-          match check_expr env scope None first with
+          (* re-audit (the literal-kind channel, ARRAY elements): a
+             concrete expected aggregate forwards its ELEMENT type to
+             every element check — `[0xC5, 0x58]` at a [u8; 2] / Vec[u8]
+             parameter records each element with the concrete U8 kind
+             (the checker's IntLiteral adoption), never the raw
+             Int_literal the no-expected path records (`Vec::from([..])`
+             byte tables — the lowering then emits the aggregate with
+             Int_literal elements and the verifier's element check
+             fails against the callee's u8 element type) *)
+          let elem_exp =
+            match expected with
+            | Some (Type_repr.Fixed_array (t, _)) -> Some t
+            | Some (Type_repr.Named (id, [| t |]))
+              when Ids.Type_id.compare id b_array = 0 ->
+                Some t
+            | _ -> None
+          in
+          match check_expr env scope elem_exp first with
           | Error m -> Error m
           | Ok te0 -> (
               let elem_ty = te0.te_type in
               let rec go acc = function
                 | [] -> Ok (List.rev acc)
                 | x :: xs -> (
-                    match check_expr env scope (Some elem_ty) x with
+                    match check_expr env scope elem_exp x with
                     | Ok te -> (
                         let subst = ref [] in
                         match unify env.state.box_tid subst elem_ty te.te_type with
@@ -3118,7 +3401,15 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
                   in
                   Ok { te_type = ty; te_effects = effects; te_span = span; te_flow = normal_flow (ty) }))))
   | Ast.ArrayRepeat (_, v, c, span) -> (
-      match check_expr env scope None v with
+      (* the repeated value adopts the expected array's element type when
+         one is known (the literal-kind channel: `[0u8; 64]`-style value
+         repeats at a concrete element kind) *)
+      let v_exp =
+        match expected with
+        | Some (Type_repr.Fixed_array (t, _)) -> Some t
+        | _ -> None
+      in
+      match check_expr env scope v_exp v with
       | Error m -> Error m
       | Ok te -> (
           match resolve_constant_int c with
@@ -3199,7 +3490,14 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
                          | _ -> ());
                       match check_expr env scope (Some ft') fe with
                       | Ok fte -> (
-                          let s2 = ref [] in
+                          (* journal-seeded: the field expr's raw type may
+                             reference vars the body's earlier calls bound
+                             (`RingBuffer { buf: buf }` — buf's element var
+                             was bound to Option[?#] by the push); a FRESH
+                             subst would re-bind the whole element var to
+                             the field type, clobbering the inner binding
+                             and leaving the nested var unsolved forever *)
+                          let s2 = ref !var_journal in
                           match unify env.state.box_tid s2 ft' fte.te_type with
                           | Ok () -> go (fte :: acc) fs
                           | Error m ->
@@ -3395,6 +3693,30 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
             | Ok () -> Ok ()
             | Error m -> Error m
           in
+          (* re-audit (the literal-kind channel, RANGE bounds): a bare
+             unsuffixed literal bound is checked with no expected (the
+             bounds are only unified afterwards), so `0..n` with
+             n: UInt leaves the `0` node as Int_literal — the lowering
+             then defaults the range counter to Int and the end-limit
+             store fails the verifier (`assign type mismatch: UInt into
+             Int` — the bench/pow10 `for _ in 0..n` counters).  When
+             one bound is a concrete integer kind, the literal bound's
+             node is re-recorded with that kind, exactly like the
+             binop-left adoption. *)
+          let adopt_literal (e : Ast.expr) (k : Type_repr.int_kind) : unit =
+            match e with
+            | Ast.IntLit (nid, _, _) ->
+                Hashtbl.replace env.typed_nodes nid
+                  { tn_type = Type_repr.Int k; tn_cast_target = None; tn_call = None }
+            | Ast.Unary (_, Ast.Neg, Ast.IntLit (nid, _, _), _) ->
+                Hashtbl.replace env.typed_nodes nid
+                  { tn_type = Type_repr.Int k; tn_cast_target = None; tn_call = None }
+            | _ -> ()
+          in
+          (match ta.te_type, tb.te_type with
+           | Type_repr.Int_literal _, Type_repr.Int k -> adopt_literal a k
+           | Type_repr.Int k, Type_repr.Int_literal _ -> adopt_literal b k
+           | _ -> ());
           Ok
             {
               te_type = Type_repr.Tuple [| ta.te_type; tb.te_type |];
@@ -3469,7 +3791,15 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
                (match expected with Some e -> type_to_string e | None -> "none")
                (match !current_item_global with Some s -> s | None -> "?")
          | _ -> ());
-      match check_expr env scope None inner with
+      (* re-audit (the literal-kind channel): a NEGATED unsuffixed literal
+         in a concrete integer context (`size - -1`, `x > -4096` with a
+         UInt/i64 partner) must record the coerced kind on the literal's
+         own node — the negation passes its operand's type through, so the
+         enclosing expected propagates 1:1 to the inner check *)
+      let inner_expected =
+        match op with Ast.Neg -> expected | _ -> None
+      in
+      match check_expr env scope inner_expected inner with
       | Error m -> Error m
       | Ok te -> (
           match op with
@@ -3585,14 +3915,72 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
               let subst = ref [] in
               match check_binary env.state.box_tid subst op tl.te_type tr.te_type with
               | Error m -> Error (err span m)
-              | Ok rty ->
+              | Ok rty -> (
+                  let rty = substitute_fixpoint !subst rty in
+                  (* re-audit (the literal-kind channel, LEFT operand): the
+                     left operand of a binary is checked with NO expected
+                     type — its own type is only known once the right side
+                     is checked — so an unsuffixed integer literal there
+                     records Int_literal.  When the right operand carried a
+                     concrete integer kind the checker's IntLiteral
+                     adoption coerced the pair (`0 == align`, `1 & mask`
+                     with align: UInt); re-record the left literal's node
+                     with that same kind so the lowering emits the UInt
+                     constant the verifier's operand-type equality
+                     requires. *)
+                  (match tl.te_type, tr.te_type with
+                   | Type_repr.Int_literal _, Type_repr.Int k -> (
+                       (* the adoption cascades through a NESTED binop
+                          tree: `(0x03 << 6) | (src & 0x07)` with
+                          src: u8 — the inner shift's operands are both
+                          unsuffixed literals, so the shift node itself
+                          recorded Int_literal and the outer | adoption
+                          cannot see a literal leaf to re-record.  Every
+                          Int_literal-recorded node on the left spine is
+                          re-recorded with the concrete kind (the shift
+                          temp then lowers as U8 and its own literal
+                          leaves keep Int — a consistent operand pair),
+                          exactly like the direct-literal adoption. *)
+                       let rec record_spine (e : Ast.expr) : unit =
+                         match e with
+                         | Ast.IntLit (nid, _, _) ->
+                             Hashtbl.replace env.typed_nodes nid
+                               { tn_type = Type_repr.Int k; tn_cast_target = None; tn_call = None }
+                         | Ast.Unary (_, Ast.Neg, Ast.IntLit (nid, _, _), _) ->
+                             Hashtbl.replace env.typed_nodes nid
+                               { tn_type = Type_repr.Int k; tn_cast_target = None; tn_call = None }
+                         | Ast.Binary (nid, l, _, r, _) -> (
+                             (* re-record the nested binop NODE when its
+                                OWN recorded type is the raw Int_literal
+                                form (a nested binop that already joined a
+                                concrete kind keeps it); the subtree is
+                                all-literal whenever it typed Int_literal,
+                                so its literal leaves are adopted
+                                unconditionally (their own records decide
+                                the lowered constant kinds) *)
+                             (match Hashtbl.find_opt env.typed_nodes nid with
+                              | Some { tn_type = Type_repr.Int_literal _; _ } ->
+                                  Hashtbl.replace env.typed_nodes nid
+                                    { tn_type = Type_repr.Int k; tn_cast_target = None;
+                                      tn_call = None }
+                              | _ -> ());
+                             record_spine l;
+                             record_spine r)
+                         | Ast.Block (_, b, _) -> (
+                             match b.Ast.b_tail with
+                             | Some t -> record_spine t
+                             | None -> ())
+                         | _ -> ()
+                       in
+                       record_spine l)
+                   | _ -> ());
                   Ok
                     {
-                      te_type = substitute_fixpoint !subst rty;
+                      te_type = rty;
                       te_effects = Array.append tl.te_effects tr.te_effects;
                       te_span = span;
-                      te_flow = normal_flow (substitute_fixpoint !subst rty);
-                    })))
+                      te_flow = normal_flow rty;
+                    }))))
   | Ast.AwaitExpr (_, _, span) -> Error (err span "await is not available in the bootstrap subset")
   | Ast.MacroCall (_, name, args, span) ->
       (* debug_assert!(cond[, msg]): the kernel's 3 uses (ffi) are a
@@ -3812,7 +4200,33 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
             match f.Ast.for_iterable with
             | Ast.Range (_, start_e, _, _, _) -> (
                 match check_expr env scope None start_e with
-                | Ok ste -> Some ste.te_type
+                | Ok ste ->
+                    (* the element-type probe re-checks the range's start
+                       bound with no expected, OVERWRITING the Range
+                       handler's concrete-kind record of a bare literal
+                       (`for _ in 0..n` — the range handler adopted the
+                       end's UInt onto the `0`, then this probe reset the
+                       node to Int_literal, defaulting the lowered counter
+                       to Int).  Re-adopt when the range's END bound (the
+                       tuple te_type recorded at the iterable check)
+                       carries a concrete integer kind. *)
+                    (match te.te_type with
+                     | Type_repr.Tuple [| _; Type_repr.Int k |] -> (
+                         match ste.te_type with
+                         | Type_repr.Int_literal _ -> (
+                             match start_e with
+                             | Ast.IntLit (nid, _, _) ->
+                                 Hashtbl.replace env.typed_nodes nid
+                                   { tn_type = Type_repr.Int k; tn_cast_target = None;
+                                     tn_call = None }
+                             | Ast.Unary (_, Ast.Neg, Ast.IntLit (nid, _, _), _) ->
+                                 Hashtbl.replace env.typed_nodes nid
+                                   { tn_type = Type_repr.Int k; tn_cast_target = None;
+                                     tn_call = None }
+                             | _ -> ())
+                         | _ -> ())
+                     | _ -> ());
+                    Some ste.te_type
                 | Error _ -> None)
             | _ -> (
                 match te.te_type with
@@ -3884,12 +4298,17 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
                       tf_iteration_kind = kind;
                     };
                   let scope = add_binds scope binds in
-                  (match
-                     check_block env { scope with loop_depth = scope.loop_depth + 1 } None
-                       f.Ast.for_body f.Ast.for_span
-                   with
-                   | Error m -> Error m
-                   | Ok _fr ->
+                   (match
+                      check_block env { scope with loop_depth = scope.loop_depth + 1 } None
+                        f.Ast.for_body f.Ast.for_span
+                    with
+                    | Error m -> Error m
+                    | Ok _fr ->
+                        (* a loop body's tail value is dropped (the
+                           dropped-value join class — see the while rule) *)
+                        (match f.Ast.for_body.Ast.b_tail with
+                         | Some t -> relabel_dropped_value env t
+                         | None -> ());
                        (* the native for-rule: the loop's NORMAL result
                           is Unit regardless of its body's tail type
                           (a loop body tail like `errors.push(...)`
@@ -3922,6 +4341,14 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
               with
               | Error m -> Error m
               | Ok _fr ->
+                  (* a loop body's tail value is dropped (the while's
+                     result is Unit — the dropped-value join class: a
+                     body-tail statement match over an insert image with
+                     a () arm must not leave a first-arm-typed join
+                     slot behind) *)
+                  (match w.Ast.wh_body.Ast.b_tail with
+                   | Some t -> relabel_dropped_value env t
+                   | None -> ());
                   (* the native while-rule: a normal while can execute
                      zero times, so its normal result is Unit (re-audit
                      P0: the condition-false exit is a normal edge —
@@ -3947,6 +4374,9 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
       with
       | Error m -> Error m
       | Ok fr ->
+          (* a loop body's tail value is dropped (the dropped-value join
+             class — see the while rule) *)
+          (match b.Ast.b_tail with Some t -> relabel_dropped_value env t | None -> ());
           (* the native loop-rule (re-audit P0 fix): `loop` falls
              through ONLY via a break — a body whose only exits are
              return/continue has NO normal continuation (Never);
@@ -4139,6 +4569,24 @@ and check_stmt (env : env) (scope : scope) (s : Ast.stmt) :
          | _ -> ());
       match check_expr_use env scope Discarded None e with
       | Ok te -> (
+          (* re-audit (the dropped-value join class): a STATEMENT's value
+             can never be observed — the checker records every join node
+             (match/if) along the expression's DROPPED-VALUE spine as
+             Unit, so the lowering never materializes a first-arm-typed
+             join slot that only SOME arms store (a statement-position
+             `match ... when Some(k) then map.insert(...) when None then
+             () end` — the insert's Option image joined into a slot the
+             () arm never assigns, and the lowering's dead join-store
+             reads it — the use-of-possibly-uninitialized-join class of
+             the kernel's checker/encoder fns).  The relabel follows the
+             value spine ONLY (match arms' bodies, if branch tails, block
+             tails) — it never enters let-bound initializers, call
+             arguments or other value-carrying sub-positions, and it
+             never touches block TAILS checked as expressions (a
+             function body tail is an observable value — the fn-end
+             return unify — even though it is checked with the same
+             Discarded use). *)
+          relabel_dropped_value env e;
           (* re-audit P0: the statement's flow IS the expression's flow
              — a statement-position `return x` (or a nested diverging
              if/match whose expression flow says so) makes the normal
@@ -4153,6 +4601,9 @@ and check_stmt (env : env) (scope : scope) (s : Ast.stmt) :
   | Ast.DeferStmt (b, span) -> (
       match check_block env scope None b span with
       | Ok _ ->
+          (* a defer body's tail value is dropped (the dropped-value
+             join class — see the while rule) *)
+          (match b.Ast.b_tail with Some t -> relabel_dropped_value env t | None -> ());
           Ok
             ( scope,
               {
@@ -4220,8 +4671,48 @@ and check_stmt (env : env) (scope : scope) (s : Ast.stmt) :
                  | Error m -> Error m)
             | _ ->
                 Ok (scope, { fr_normal = Some Type_repr.Unit; fr_may_return = false; fr_may_break = false; fr_may_continue = false })))
-  | Ast.Item _ ->
-      Ok (scope, { fr_normal = Some Type_repr.Unit; fr_may_return = false; fr_may_break = false; fr_may_continue = false })  (* other nested items are checked at program level *)
+   | Ast.Item _ ->
+       Ok (scope, { fr_normal = Some Type_repr.Unit; fr_may_return = false; fr_may_break = false; fr_may_continue = false })  (* other nested items are checked at program level *)
+
+and relabel_dropped_value (env : env) (e : Ast.expr) : unit =
+  (* re-audit (the dropped-value join class): a statement expression's
+     value is discarded, so every match/if node whose value feeds ONLY
+     the discarded result is recorded as Unit (the typechecker's
+     Discarded use keeps the ARM checks as-is — a statement match's
+     arms may still diverge over Unit freely — only the join NODES the
+     lowering reads become Unit).  The walk follows the DROPPED-VALUE
+     SPINE: a match's arm bodies, an if's branch tails, a block's tail.
+      Value-carrying sub-positions (let initializers, call arguments,
+      match subjects, index bases, ...) are never entered: their values
+      are observed. *)
+  let rec go (e : Ast.expr) : unit =
+    match e with
+    | Ast.MatchExpr (nid, m) ->
+        Hashtbl.replace env.typed_nodes nid
+          { tn_type = Type_repr.Unit; tn_cast_target = None; tn_call = None };
+        List.iter (fun (a : Ast.match_arm) -> go a.Ast.ma_body) m.Ast.m_arms
+    | Ast.IfExpr (nid, i) ->
+        Hashtbl.replace env.typed_nodes nid
+          { tn_type = Type_repr.Unit; tn_cast_target = None; tn_call = None };
+        (match i.Ast.if_then.Ast.b_tail with
+         | Some t -> go t
+         | None -> ());
+        List.iter
+          (fun (_, b) ->
+            match b.Ast.b_tail with Some t -> go t | None -> ())
+          i.Ast.if_elsif;
+        (match i.Ast.if_else with
+         | Some eb -> (
+             match eb.Ast.b_tail with Some t -> go t | None -> ())
+         | None -> ())
+    | Ast.Block (_, b, _) -> (
+        match b.Ast.b_tail with Some t -> go t | None -> ())
+    | Ast.UnsafeBlock (_, _, b, _) -> (
+        match b.Ast.b_tail with Some t -> go t | None -> ())
+    | _ -> ()
+  in
+  go e
+
 
 and check_if (env : env) (scope : scope) (use : expr_use) (expected : Type_repr.t option) (i : Ast.if_expr) :
     (typed_expr, string) result =
@@ -4292,8 +4783,54 @@ and check_if (env : env) (scope : scope) (use : expr_use) (expected : Type_repr.
                     | Some _, _ -> Some tt_ty)
               in
               match check_block env scope b_exp b b.Ast.b_span with
-              | Ok tb -> go (tb :: acc) rest
-              | Error m -> Error m))
+              | Ok tb ->
+                  (* the elsif arm reconciles against the then-arm's join
+                     exactly like the else arm below — in a DISCARDED if
+                     the arm checks get no expected (the block tail's
+                     value is dropped), so an elsif arm's OWN ctor vars
+                     (the `Result::Ok(..)` fresh E/T vars of the
+                     elsif arms in a kernel if/elsif/else chain) would
+                     otherwise never bind, leaking unresolved
+                     inference variables into the lowered locals and the
+                     fn-return joins (`local carries an unresolved
+                     inference variable` + the `Result[.., ?#N] into
+                     Result[.., ?#N]` assign class of the
+                     process/bench wait fns).  The Unit divergence in
+                     discarded context and diverged (normal=None) arms
+                     stay exempt, exactly like the else-arm rule. *)
+                   (match tt_ty, flow_normal tb with
+                    | Type_repr.Unit, _ when use = Discarded -> go (tb :: acc) rest
+                    | _, Type_repr.Unit when use = Discarded -> go (tb :: acc) rest
+                    | _ -> (
+                        match tt.fr_normal, tb.fr_normal with
+                        | None, _ | _, None -> go (tb :: acc) rest
+                        | Some _, Some _ ->
+                            (* the elsif arm is reconciled AGAINST the
+                               join (its vars bind INTO the chain toward
+                               the then-arm's vars — the join resolves
+                               newest-first, so the join's bindings must
+                               not re-bind the elsif arm's own ctor vars
+                               in the opposite direction, or the elsif
+                               vars become unreachable chain tails that
+                               never resolve: the unresolved-inference-
+                               variable residuals of the kernel's
+                               if/elsif/else Result::Ok chains).  In
+                               DISCARDED context the reconcile is
+                               best-effort (a discarded if may have
+                               freely divergent branch types — a
+                               successful unify still journals the
+                               var-join bindings; a failure is not a
+                               new semantic error). *)
+                            let subst2 = ref !var_journal in
+                            (match
+                               unify env.state.box_tid subst2 (flow_normal tb) tt_ty
+                             with
+                             | Ok () -> go (tb :: acc) rest
+                              | Error err2 -> (
+                                  match use with
+                                  | Discarded -> go (tb :: acc) rest
+                                  | Value -> Error err2))))
+               | Error m -> Error m))
     in
     go [] i.Ast.if_elsif
   in
@@ -4395,8 +4932,85 @@ and check_if (env : env) (scope : scope) (use : expr_use) (expected : Type_repr.
                          with
                         | Some t -> t
                         | None -> Type_repr.Unit)
-                    | _ -> substitute_fixpoint !subst first_t))
+                    | _ -> (
+                        (* the join is substituted through the LIVE
+                           journal (seeded with the else/elsif reconcile
+                           bindings): an elsif arm's reconciled ctor vars
+                           are journaled as var-to-var chains, and the
+                           join type must carry the CHAIN TIP (`?#5`),
+                           not the first arm's stale var — the enclosing
+                           fn-return unify then binds the tip directly
+                           instead of rebinding the head and leaving the
+                           tip dangling (the unresolved-inference-variable
+                           residuals of the if/elsif/else Ok-arm chains) *)
+                         substitute_fixpoint (!var_journal @ !subst) first_t)))
           in
+          (* re-audit (the literal-kind channel, BRANCH join): a VALUE if
+             whose normal arms mix a bare unsuffixed literal with a
+             concrete integer kind (`if c then 8 else block_size end` —
+             block_size: UInt) joins to the concrete kind, but the
+             literal arm's OWN node was checked with no expected type and
+             records Int_literal — the lowering then reads the raw
+             Int_literal (defaulting it to Int) for the arm's constant
+             AND for the if-result local type (lower_if types its join
+             local from the first arm's lowered type), producing the
+             Int-vs-UInt operand mismatches (`min_block + (align - 1)`
+             after `let min_block = if block_size < 8 then 8 else
+             block_size end`).  Re-record every NORMAL arm's tail literal
+             node with the joined kind so the constant and the local both
+             lower as UInt. *)
+          (match if_ty with
+           | Type_repr.Int k -> (
+               let rec tail_literal_node (e : Ast.expr) : Ids.Node_id.t option =
+                 match e with
+                 | Ast.IntLit (nid, _, _) -> Some nid
+                 | Ast.Unary (_, Ast.Neg, inner, _) -> tail_literal_node inner
+                 | Ast.Block (_, b, _) -> (
+                     match b.Ast.b_tail with
+                     | Some t -> tail_literal_node t
+                     | None -> None)
+                 | Ast.IfExpr (_, i) -> (
+                     (* a match ARM whose value is a complete if/else of
+                        literals (`when SimdAdd then if is_int then
+                        0x4E208400 else 0x4E20D400 end` — the neon
+                        encoder): the arm's tail literal sits under the
+                        branch tails — record the FIRST branch's literal
+                        (all branch literals share the joined kind) *)
+                     match
+                       tail_literal_node (Ast.Block (Ast.synthetic_node_id, i.Ast.if_then, Span.synthetic))
+                     with
+                     | Some _ as s -> s
+                     | None -> (
+                         match i.Ast.if_elsif with
+                         | (_, b) :: _ ->
+                             tail_literal_node
+                               (Ast.Block (Ast.synthetic_node_id, b, Span.synthetic))
+                         | [] -> (
+                             match i.Ast.if_else with
+                             | Some eb ->
+                                 tail_literal_node
+                                   (Ast.Block (Ast.synthetic_node_id, eb, Span.synthetic))
+                             | None -> None)))
+                 | _ -> None
+               in
+               let record_arm_literal (fr : flow_result) (arm_block : Ast.block_body) =
+                 match fr.fr_normal with
+                 | Some (Type_repr.Int_literal _) -> (
+                     match tail_literal_node (Ast.Block (Ast.synthetic_node_id, arm_block, arm_block.b_span)) with
+                     | Some nid ->
+                         Hashtbl.replace env.typed_nodes nid
+                           { tn_type = Type_repr.Int k; tn_cast_target = None; tn_call = None }
+                     | None -> ())
+                 | _ -> ()
+               in
+               record_arm_literal tt i.Ast.if_then;
+               List.iter2
+                 (fun (_c, b) fr -> record_arm_literal fr b)
+                 i.Ast.if_elsif telsif;
+               (match i.Ast.if_else with
+                | Some eb -> record_arm_literal te eb
+                | None -> ()))
+           | _ -> ());
           let all_effects =
             Array.concat
               (cond_effects :: List.map (fun (_fr : flow_result) -> [||]) (tt :: telsif @ [ te ]))
@@ -4483,10 +5097,16 @@ and check_match (env : env) (scope : scope) (use : expr_use) (expected : Type_re
               match check_expr_use env arm_scope use expected' arm.Ast.ma_body with
               | Error m -> Error m
               | Ok te -> (
-                  let subst = ref [] in
                   match acc with
                   | [] -> go (idx + 1) (te :: acc) rest
                   | first :: _ -> (
+                      (* journal-seeded arm join: the arms' raw types
+                         reference the ctor/join vars the body bound
+                         earlier; a FRESH subst re-binds the whole top
+                         var to the first arm's type, detaching every
+                         nested var (`Err(e)`-arm's Result T) from the
+                         solver forever *)
+                      let subst = ref !var_journal in
                       match unify env.state.box_tid subst first.te_type te.te_type with
                       | Ok () -> go (idx + 1) (te :: acc) rest
                       | Error m ->
@@ -4555,8 +5175,106 @@ and check_match (env : env) (scope : scope) (use : expr_use) (expected : Type_re
             in
             match find_int normal_arms with
             | Type_repr.Int k -> Type_repr.Int k
-            | _ -> nte.te_type))
+            | joined -> (
+                (* re-audit (the literal-kind channel, MATCH join, bare
+                   form): a VALUE match whose normal arms are ALL bare
+                   unsuffixed literals joins to the raw Int_literal form
+                   (find_int finds no concrete kind).  When the match
+                   carries a CONCRETE integer expected (a non-Unit
+                   function body whose tail is such a match — the
+                   codegen/object encoders `match width when 1 then
+                   0x08DFFC00 ... end` returning u32/u8/u16), the join
+                   adopts the expected kind exactly like the mixed-literal
+                   join below — otherwise every arm's literal stays
+                   Int_literal, the lowering defaults it to Int, and the
+                   return-slot store fails the verifier (`assign type
+                   mismatch: Int into U32` — the codegen/object encoder
+                   class).  The adoption is range-checked against every
+                   normal literal arm (an out-of-range literal keeps the
+                   Int_literal join and fails the enclosing expected
+                   unify with the range diagnostic). *)
+                match expected with
+                | Some (Type_repr.Int k) ->
+                    let literal_fits =
+                      List.for_all
+                        (fun (te : typed_expr) ->
+                          match te.te_type with
+                          | Type_repr.Int_literal m ->
+                              let p : Literal.parsed_integer =
+                                { original = ""; radix = 10; magnitude = m;
+                                  suffix = Literal.No_int_suffix; span = Span.synthetic }
+                              in
+                              if int_signed k then Literal.fits_signed p (int_width k)
+                              else Literal.fits_unsigned p (int_width k)
+                          | _ -> true)
+                        normal_arms
+                    in
+                    if literal_fits then Type_repr.Int k else joined
+                | _ -> joined)))
   in
+  (* re-audit (the literal-kind channel, MATCH join): same contract as
+     the if-join — a value match whose normal arms mix a bare
+     unsuffixed literal with a concrete integer kind (`when Some(n)
+     then n when None then 0 end` with n: UInt) joins to the concrete
+     kind, but each literal arm's OWN node was checked without a
+     concrete expected and records Int_literal; re-record the normal
+     literal arms' tail nodes with the joined kind so the match result
+     local and constants lower with the concrete kind. *)
+   (match ty with
+    | Type_repr.Int k -> (
+        List.iter2
+          (fun (arm : Ast.match_arm) (te : typed_expr) ->
+            match te.te_type with
+            | Type_repr.Int_literal _ -> (
+                (* record EVERY literal under the arm's tail tree (a
+                   direct literal, a block-tail literal, or all branch
+                   tails of a tail if/else of literals — the neon
+                   encoder arms `when SimdAdd then if is_int then ... 
+                   else ... end`) with the joined kind *)
+                let rec record_tails (e : Ast.expr) : unit =
+                  match e with
+                  | Ast.IntLit (nid, _, _) ->
+                      Hashtbl.replace env.typed_nodes nid
+                        { tn_type = Type_repr.Int k; tn_cast_target = None; tn_call = None }
+                  | Ast.Unary (_, Ast.Neg, Ast.IntLit (nid, _, _), _) ->
+                      Hashtbl.replace env.typed_nodes nid
+                        { tn_type = Type_repr.Int k; tn_cast_target = None; tn_call = None }
+                  | Ast.Unary (_, _, inner, _) -> record_tails inner
+                  | Ast.Block (_, b, _) -> (
+                      match b.Ast.b_tail with
+                      | Some t -> record_tails t
+                      | None -> ())
+                  | Ast.IfExpr (_, i) ->
+                      record_tails (Ast.Block (Ast.synthetic_node_id, i.Ast.if_then, Span.synthetic));
+                      List.iter
+                        (fun (_, b) ->
+                          record_tails (Ast.Block (Ast.synthetic_node_id, b, Span.synthetic)))
+                        i.Ast.if_elsif;
+                      (match i.Ast.if_else with
+                       | Some eb ->
+                           record_tails
+                             (Ast.Block (Ast.synthetic_node_id, eb, Span.synthetic))
+                       | None -> ())
+                  | Ast.MatchExpr (_, m) ->
+                      (* a tail NESTED match of literals (the encoder
+                         shape `when Arch::X86_64 then match kind when
+                         ... then 1 ... end end`): record every nested
+                         arm's tail literal with the enclosing joined
+                         kind — the nested match's own join stays
+                         Int_literal (its expected never arrived through
+                         the outer arm), and without the descent the
+                         inner constants lower as Int against the u16
+                         return slot (`assign type mismatch: Int into
+                         u16` — the coff/object encoder class) *)
+                      List.iter
+                        (fun (narm : Ast.match_arm) -> record_tails narm.Ast.ma_body)
+                        m.Ast.m_arms
+                  | _ -> ()
+                in
+                record_tails arm.Ast.ma_body)
+            | _ -> ())
+          m.Ast.m_arms arms)
+   | _ -> ());
   let effects = Array.concat (List.map (fun (te : typed_expr) -> te.te_effects) arms) in
   let match_flow =
     (* re-audit P0 (the join identity): an exhaustive match has no
@@ -5500,10 +6218,20 @@ and check_call_sig (env : env) (scope : scope) (expected : Type_repr.t option)
       decl_params
       @ List.filter (fun p -> not (List.mem p decl_params)) sig_free
     in
+    (* the caller's own rigid params (the enclosing fn's declaration
+       binders) that a contract signature references WITHOUT declaring
+       them keep their rigidity in the call — pre-instantiating a
+       caller-own param freezes the fresh var exactly like the method
+       path (the receiver/argument unifications would resolve BOTH
+       sides to the same var and short-circuit equal without binding;
+       the caller declares the param, so a result referencing it is
+       legitimate) *)
+    let scope_rigid = List.map snd scope.generics in
     List.iter
       (fun pid ->
-        if not (List.mem_assoc (Type_repr.KParam pid) !subst) then
-          subst := (Type_repr.KParam pid, fresh_infer_var env.state) :: !subst)
+        if not (List.mem pid scope_rigid && not (List.mem pid decl_params)) then
+          if not (List.mem_assoc (Type_repr.KParam pid) !subst) then
+            subst := (Type_repr.KParam pid, fresh_infer_var env.state) :: !subst)
       all_params;
     let* tes, effects =
       let rec go (acc : typed_expr list) (effects : Access_effect.read_effect list) i = function
@@ -5743,11 +6471,26 @@ and check_call_sig (env : env) (scope : scope) (expected : Type_repr.t option)
       in
       let wps = List.map (fun (wt, bs) -> (substitute_fixpoint !subst wt, bs)) sig_.ts_where in
       let* () = check_where_obligations env span sig_.ts_name wps in
+      (* re-audit (the literal-kind channel, CALL INSTANCE): the recorded
+         substitution must carry the RAW inference var for a
+         pre-instantiated declaration param (the call's own fresh
+         binder), never the eager snapshot of that var's CURRENT journal
+         solution.  A var solved by the call's literal argument
+         (`out.push(0xC5)` — the receiver Vec element binds the fresh T
+         var to Int_literal) can be RE-solved by a LATER enclosing
+         unification (the fn-end return slot against the declared
+         Vec[u8]) — the newest journal binding wins, and the driver's
+         typed-channel build chases the raw var through the final
+         journal.  An eager Int_literal snapshot would freeze the stale
+         solution into the call instance forever (the callee param
+         Vec[Int_literal] vs the Vec[u8] receiver — the int-literal
+         mismatch class). *)
       let substitution =
         Array.of_list
           (List.map
              (fun (_, pid) ->
                match List.assoc_opt (Type_repr.KParam pid) !subst with
+               | Some (Type_repr.Infer_var _ as v) -> v
                | Some t -> substitute_fixpoint !subst t
                | None -> Type_repr.Type_param pid)
              sig_.ts_params_decl)
@@ -5788,7 +6531,22 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
     (targs : Ast.type_expr list) (args : Ast.call_arg list)
     (span : Span.span) : (typed_expr, string) result =
   let* receiver = check_expr env scope None base in
-  let owner_ty = receiver.te_type in
+  let owner_ty_raw = receiver.te_type in
+  (* the auto-deref receiver rule: a REF-typed receiver (`key_ref: &K`
+     — the record-visit intrinsics yield the live key's ADDRESS as an
+     Option[&K], and the arm binds the reference) carries no impls of
+     its own: references are internal ABI temporaries, so method
+     resolution derefs to the pointee — `key_ref.clone()` resolves the
+     Clone contract of K itself (the concrete clone instance reads the
+     key IN PLACE through the ref, per the std clone-aware traversal
+     contract).  The receiver ARGUMENT stays the original reference
+     value (by-value ABI parameters of owning types receive the value
+     by address; the verifier applies the call-boundary deref rule). *)
+  let owner_ty =
+    match owner_ty_raw with
+    | Type_repr.Ref_internal (_, t) -> t
+    | _ -> owner_ty_raw
+  in
   let owner_name =
     match owner_ty with
     | Type_repr.Named (tid, _) -> (
@@ -5858,7 +6616,20 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
   let oname = match owner_name with Some n -> n | None -> "" in
   (* derived Clone: the kernel relies on Clone for its core types
      (Type, Expr, Span, Option, ...) without declaring the impls; every
-     seed value is Clone-able, so synthesize the signature *)
+     seed value is Clone-able, so synthesize the signature.  The
+     synthesized sig declares ONE generic binder for the RECEIVER TYPE
+     (a fresh parameter; the call's recorded instance arg carries the
+     receiver type — solved through the receiver-self unification and
+     the final journal like any generic method call) instead of
+     embedding the call site's AMBIENT type (a caller-own rigid
+     Type_param or a concrete type) directly in the registry sig:
+     the monomorphizer substitutes the call's instance args when it
+     specializes the enclosing function, and the template/concrete
+     verifiers substitute the sig's declaration binders under the call's
+     instance args — an ambient-embedding sig (params_decl:[]) can never
+     be specialized and its self/ret type goes stale in every
+     specialization of a generic caller ("expected T<param> got
+     <concrete>" after mono). *)
   let derived_clone () =
     if mname <> "clone" then None
     else
@@ -5867,11 +6638,15 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
       | Type_repr.String | Type_repr.Int _ | Type_repr.Bool | Type_repr.Char
       | Type_repr.Float _ | Type_repr.Type_param _ | Type_repr.Infer_var _
       | Type_repr.Ref_internal _ ->
+          let self_p = fresh_param_id env.state in
           let sig_ =
-            mk_sig env.state ~name:("derived::" ^ oname ^ "::clone") ~params_decl:[]
-              ~params:[ ("self", Access_effect.Let, owner_ty) ] ~ret:owner_ty ~where:[]
+            mk_sig env.state ~name:("derived::" ^ oname ^ "::clone")
+              ~params_decl:[ ("T", self_p) ]
+              ~params:[ ("self", Access_effect.Let, Type_repr.Type_param self_p) ]
+              ~ret:(Type_repr.Type_param self_p) ~where:[]
           in
           env.state.oracle.o_derived_callables <- sig_.ts_callable :: env.state.oracle.o_derived_callables;
+          env.state.derived_sigs <- (sig_.ts_callable, sig_) :: env.state.derived_sigs;
           Some sig_
       | _ -> None
   in
@@ -5880,7 +6655,9 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
      payloads (`e.to_string()` in impl Result::context), named types with
      no declared impl (Span, AstItemKind), array elements — and the real
      compiler resolves `.to_string()` to it without enforcing the Display
-     bound at the call site. Synthesize the signature for any receiver. *)
+     bound at the call site. Synthesize the signature for any receiver;
+     like the derived clone it declares ONE binder for the receiver type
+     (see above — the mono/verifier substitution contract). *)
   let derived_to_string () =
     if mname <> "to_string" then None
     else
@@ -5889,11 +6666,15 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
       | Type_repr.String | Type_repr.Int _ | Type_repr.Bool | Type_repr.Char
       | Type_repr.Float _ | Type_repr.Type_param _ | Type_repr.Infer_var _
       | Type_repr.Ref_internal _ ->
+          let self_p = fresh_param_id env.state in
           let sig_ =
-            mk_sig env.state ~name:("derived::" ^ oname ^ "::to_string") ~params_decl:[]
-              ~params:[ ("self", Access_effect.Let, owner_ty) ] ~ret:Type_repr.String ~where:[]
+            mk_sig env.state ~name:("derived::" ^ oname ^ "::to_string")
+              ~params_decl:[ ("T", self_p) ]
+              ~params:[ ("self", Access_effect.Let, Type_repr.Type_param self_p) ]
+              ~ret:Type_repr.String ~where:[]
           in
           env.state.oracle.o_derived_callables <- sig_.ts_callable :: env.state.oracle.o_derived_callables;
+          env.state.derived_sigs <- (sig_.ts_callable, sig_) :: env.state.derived_sigs;
           Some sig_
       | _ -> None
   in
@@ -6001,41 +6782,76 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
                 params the receiver itself carries qualify — a receiver
                 whose element is a DIFFERENT (or no) binder keeps full
                 pre-instantiation so the receiver unify solves the var. *)
-             let receiver_params = params_in owner_ty in
-             let receiver_decl_params =
-               List.filter
-                 (fun (_, pid) -> List.mem pid receiver_params)
-                 sig_.ts_params_decl
-               |> List.map snd
-             in
-             (match owner_ty, resolved_owner with
-              | Type_repr.Type_param pid, Some tro ->
-                  (* the receiver's trait bound that actually matched:
-                     the bound's args name the trait method's params *)
-                  (match List.assoc_opt pid env.impls.param_bounds with
-                   | Some bounds -> (
-                       match List.find_opt (fun (tb, _) -> tb = tro) bounds with
-                       | Some (_, args)
-                         when List.length sig_.ts_params_decl = Array.length args ->
-                           Array.iter2
-                             (fun (_, pid_t) a ->
-                               if not (List.mem_assoc (Type_repr.KParam pid_t) !subst) then
-                                 subst := (Type_repr.KParam pid_t, a) :: !subst)
-                             (Array.of_list sig_.ts_params_decl) args
-                       | Some _ | None -> ())
-                   | None -> ())
-              | _ -> ());
-             List.iter
-               (fun pid ->
-                 if not (List.mem pid receiver_decl_params) then
-                   if not (List.mem_assoc (Type_repr.KParam pid) !subst) then
-                     subst := (Type_repr.KParam pid, fresh_infer_var env.state) :: !subst)
-               all_params;
-             let self_ty = substitute_fixpoint !subst sig_.ts_params.(0).Type_repr.pt_type in
-             let* () =
-               match owner_ty, self_ty with
-               | Type_repr.Fixed_array (t, _), Type_repr.Named (_, [| p |]) -> unify env.state.box_tid subst p t
-               | _ -> (
+              let receiver_params = params_in owner_ty in
+              let receiver_decl_params =
+                List.filter
+                  (fun (_, pid) -> List.mem pid receiver_params)
+                  sig_.ts_params_decl
+                |> List.map snd
+              in
+              (* the enclosing fn's OWN rigid params (the method's
+                 declaration binders — the current scope's generics).
+                 A contract signature that references them WITHOUT
+                 declaring them (the derived Clone/to_string sigs
+                 synthesized from the receiver type, whose self/ret ARE
+                 the receiver's type) must keep those params RIGID in
+                 the call: pre-instantiating a caller-own param with a
+                 fresh var freezes it — the receiver unify resolves
+                 BOTH sides (the substituted self and the receiver's
+                 rigid param, which resolve_param follows to the very
+                 same var) to the same var and short-circuits `equal`
+                 without ever binding it, leaking the unsolved
+                 Infer_var into the recorded call node and every
+                 destination local.  The caller's own fn declares the
+                 param, so a result referencing it is legitimate —
+                 exactly the sibling-impl rule above, generalized from
+                 receiver-carried DECL params to any caller-scope
+                 binder the sig leaks. *)
+              let scope_rigid = List.map snd scope.generics in
+              (match owner_ty, resolved_owner with
+               | Type_repr.Type_param pid, Some tro ->
+                   (* the receiver's trait bound that actually matched:
+                      the bound's args name the trait method's params.
+                      A trait method's signature declares the trait's
+                      params AND the Self binder (`Iterator[T]`'s
+                      advance declares [T_trait; Self]), so the bound's
+                      args — positional over the TRAIT's params — bind
+                      the FIRST decl params, and Self is left for the
+                      pre-instantiation + receiver unify.  The old
+                      exact-arity guard never fired for a multi-decl
+                      trait sig (2 decls vs 1 bound arg), leaving the
+                      trait's own param unsolved: every bound-generic
+                      call through the contract (`self.inner.advance()`
+                      on `I: Iterator[T]` in the adapters) froze an
+                      unsolved Infer_var into the recorded call's
+                      result. *)
+                   (match List.assoc_opt pid env.impls.param_bounds with
+                    | Some bounds -> (
+                        match List.find_opt (fun (tb, _) -> tb = tro) bounds with
+                        | Some (_, args)
+                          when Array.length args > 0
+                               && Array.length args <= List.length sig_.ts_params_decl ->
+                            Array.iter2
+                              (fun (_, pid_t) a ->
+                                if not (List.mem_assoc (Type_repr.KParam pid_t) !subst) then
+                                  subst := (Type_repr.KParam pid_t, a) :: !subst)
+                              (Array.of_list (List.take (Array.length args) sig_.ts_params_decl))
+                              args
+                        | Some _ | None -> ())
+                    | None -> ())
+               | _ -> ());
+              List.iter
+                (fun pid ->
+                  if not (List.mem pid receiver_decl_params) then
+                    if not (List.mem pid scope_rigid && not (List.mem pid decl_params)) then
+                      if not (List.mem_assoc (Type_repr.KParam pid) !subst) then
+                        subst := (Type_repr.KParam pid, fresh_infer_var env.state) :: !subst)
+                all_params;
+               let self_ty = substitute_fixpoint !subst sig_.ts_params.(0).Type_repr.pt_type in
+               let* () =
+                 match owner_ty, self_ty with
+                | Type_repr.Fixed_array (t, _), Type_repr.Named (_, [| p |]) -> unify env.state.box_tid subst p t
+                | _ -> (
                    match unify env.state.box_tid subst self_ty owner_ty with
                    | Ok () -> Ok ()
                    | Error _ -> (
@@ -6149,27 +6965,27 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
                                 free-function path): an explicit-ref
                                 argument to a by-value param binds the
                                 param's var to the pointee, not the ref *)
-                             let deref_first () =
-                               match ate.te_type with
-                               | Type_repr.Ref_internal (_, inner) -> (
-                                   let s3 = ref [] in
-                                   match unify env.state.box_tid s3 pt inner with
-                                   | Ok () ->
-                                       List.iter
-                                         (fun (k, v) ->
-                                           if not (List.mem_assoc k !subst) then subst := (k, v) :: !subst)
-                                         !s3;
-                                       Some ()
-                                   | Error _ -> None)
-                               | _ -> None
-                             in
-                             let s2 = ref [] in
-                             match deref_first () with
-                             | Some () ->
-                                 let eff = Access_effect.read_effect sig_.ts_params.(ai).Type_repr.pt_convention in
-                                 go (ate :: acc) (eff :: effects) (i + 1) rest
-                             | None -> (
-                             match unify env.state.box_tid s2 pt ate.te_type with
+                              let deref_first () =
+                                match ate.te_type with
+                                | Type_repr.Ref_internal (_, inner) -> (
+                                    let s3 = ref [] in
+                                    match unify env.state.box_tid s3 pt inner with
+                                    | Ok () ->
+                                        List.iter
+                                          (fun (k, v) ->
+                                            if not (List.mem_assoc k !subst) then subst := (k, v) :: !subst)
+                                          !s3;
+                                        Some ()
+                                    | Error _ -> None)
+                                | _ -> None
+                              in
+                              let s2 = ref [] in
+                              match deref_first () with
+                              | Some () ->
+                                  let eff = Access_effect.read_effect sig_.ts_params.(ai).Type_repr.pt_convention in
+                                  go (ate :: acc) (eff :: effects) (i + 1) rest
+                              | None -> (
+                              match unify env.state.box_tid s2 pt ate.te_type with
                              | Ok () -> (
                                  List.iter
                                    (fun (k, v) ->
@@ -6323,11 +7139,18 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
                 let* () = check_where_obligations env span ("method `" ^ mname ^ "`") wps in
                 let recv_effect = Access_effect.read_effect sig_.ts_params.(0).Type_repr.pt_convention in
                 let all_effects = Array.of_list (recv_effect :: arg_effects) in
+                (* the lazy substitution record — same contract as
+                   check_call_sig: a pre-instantiated declaration param
+                   records its RAW inference var so the driver's final
+                   journal chase resolves the newest solution (`out.push
+                   (0xC5)`'s T var re-solved to u8 by the fn-end return
+                   slot), never an eager Int_literal snapshot *)
                 let substitution =
                   Array.of_list
                     (List.map
                        (fun (_, pid) ->
                          match List.assoc_opt (Type_repr.KParam pid) !subst with
+                         | Some (Type_repr.Infer_var _ as v) -> v
                          | Some t -> substitute_fixpoint !subst t
                          | None -> Type_repr.Type_param pid)
                        sig_.ts_params_decl)
@@ -6381,7 +7204,8 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
    Items: checking *)
 
 let empty_scope : scope =
-  { locals = []; local_ids = []; next_local_id = Local_id.make 0; generics = []; loop_depth = 0; capture = None }
+  { locals = []; local_ids = []; next_local_id = Local_id.make 0; generics = [];
+    loop_depth = 0; capture = None; anon_slots = ref []; anon_bounds = ref [] }
 
 let qualified_name (mp : string list) (n : string) : string =
   match mp with [] -> n | segs -> String.concat "::" (segs @ [ n ])
@@ -6419,15 +7243,32 @@ let rec check_function_body (env : env)
       generics = List.map (fun (n, i) -> (n, i)) sig_.ts_params_decl;
       loop_depth = 0;
       capture = None;
+      anon_slots = ref [];
+      anon_bounds = ref [];
     }
   in
   let own_tp_bounds =
     List.map (fun (tp : Ast.type_param) -> (tp.tp_name, tp.tp_bounds)) d.fn_sig.sig_type_params
   in
   let saved = env.impls.param_bounds in
-  env.impls.param_bounds <-
+  let pb =
     solver_param_bounds env scope sig_.ts_params_decl
-      (extra_tp_bounds @ own_tp_bounds) sig_.ts_where;
+      (extra_tp_bounds @ own_tp_bounds) sig_.ts_where
+  in
+  (* re-audit (the anonymous-signature-binder class): the impl-trait
+     slots' synthesized bounds join the solver registry — a method call
+     on the anonymous binder (`validator.validate(tainted)` on `impl
+     Validator[T, Clean]`) resolves through the trait contract exactly
+     like a named `T: Trait` parameter *)
+  let pb =
+    List.map
+      (fun (pid, bs) ->
+        match List.assoc_opt pid sig_.ts_anon_bounds with
+        | Some abs -> (pid, bs @ abs)
+        | None -> (pid, bs))
+      pb
+  in
+  env.impls.param_bounds <- pb;
   let env' = { env with current_return = Some sig_.ts_return } in
   let result =
     let* () = check_where_obligations env' d.fn_span ("function `" ^ sig_.ts_name ^ "`") sig_.ts_where in
@@ -6439,11 +7280,28 @@ let rec check_function_body (env : env)
              FnBlock); passing Some Unit into the tail would wrongly
              require the trailing statement's value to be Unit —
              `xs.pop()` as the last statement of a Unit fn is legal *)
-          check_block env' scope
-            (match sig_.ts_return with
-            | Type_repr.Unit -> None
-            | _ -> Some sig_.ts_return)
-            b b.b_span
+          (match check_block env' scope
+                   (match sig_.ts_return with
+                   | Type_repr.Unit -> None
+                   | _ -> Some sig_.ts_return)
+                   b b.b_span
+           with
+           | Error m -> Error m
+           | Ok fr ->
+               (* a Unit-returning fn's BODY-TAIL value is dropped too
+                  (the fn-end production unifies nothing for the
+                  FnBlock): the tail spine's join nodes are recorded as
+                  Unit so the lowering never materializes a
+                  first-arm-typed join slot (the dropped-value join
+                  class — the statement-rule sibling for Unit fn
+                  bodies) *)
+               (match sig_.ts_return with
+                | Type_repr.Unit -> (
+                    match b.Ast.b_tail with
+                    | Some t -> relabel_dropped_value env' t
+                    | None -> ())
+                | _ -> ());
+               Ok fr)
       | Ast.FnExpr e -> (
           match check_expr env' scope (Some sig_.ts_return) e with
           | Error m -> Error m
@@ -6468,7 +7326,18 @@ let rec check_function_body (env : env)
               fr_may_continue = false;
             }
     in
-    let subst = ref [] in
+    (* the final return-slot unification is journal-seeded: the body's
+       var bindings are the LIVE state — the tail expression's raw
+       scope type references vars the body's calls already solved, and a
+       FRESH subst would re-bind a whole top-level var to the return
+       type, clobbering the body's inner structure and leaving every
+       var nested inside the earlier binding permanently unsolved (the
+       `Option[Result[?#, E]]` residual class: the fn-end binds the
+       arm-join var whole and ?# — the Ok's own T — never gets bound).
+       Seeding from the journal makes the unify RESOLVE each var to its
+       current binding first, so the comparison descends into the
+       structure and solves the residual nested vars. *)
+    let subst = ref !var_journal in
     (* the production rule (types.tg): a Unit-returning function
        DISCARDS its trailing statement's value (`if c then advance(p)
        end` where advance returns a Token) — only the FnExpr form
@@ -6830,8 +7699,37 @@ and register_methods (env : env) (owner : string) (methods : Ast.function_decl l
                     Resolver.resolve_method rp env.module_id owner m.Ast.fn_sig.Ast.sig_name
                   with
                   | Resolver.Resolved cid ->
-                      env.state.o_handoff_resolved <- env.state.o_handoff_resolved + 1;
-                      { sig_ with ts_callable = cid }
+                      (* occupancy guard (re-audit): the resolver registers
+                         EVERY builtin-target impl (str, String, Array,
+                         Int, ...) under ONE shared builtin_def methods
+                         map with last-wins clobbering per method name —
+                         two different (owner, method) keys (str::to_string
+                         vs Array::to_string) can therefore resolve to the
+                         SAME CallableId.  Adopting the duplicate would put
+                         two sigs with DIFFERENT declaration shapes on one
+                         instance identity — the seed-MIR callee lookup
+                         then matches a call of one method to the other's
+                         template and reports the decl/type-args arity
+                         mismatch (callable#1102, [] vs [T]).
+                         The checker's own registry is the occupancy
+                         authority: an id already carried by a DIFFERENT
+                         method entry falls back to this sig's fresh
+                         mint, which keeps every method's identity
+                         unique. *)
+                      let key_here = (owner, m.Ast.fn_sig.Ast.sig_name) in
+                      let held_by_other =
+                        List.exists
+                          (fun ((o2, m2), s2) ->
+                            (o2, m2) <> key_here
+                            && Ids.Callable_id.compare s2.ts_callable cid = 0)
+                          env.methods
+                      in
+                      if held_by_other then (
+                        env.state.o_handoff_fallback <- env.state.o_handoff_fallback + 1;
+                        sig_)
+                      else (
+                        env.state.o_handoff_resolved <- env.state.o_handoff_resolved + 1;
+                        { sig_ with ts_callable = cid })
                   | _ ->
                       env.state.o_handoff_fallback <- env.state.o_handoff_fallback + 1;
                       sig_)
@@ -7248,10 +8146,64 @@ and register_item (env : env) (item : Ast.item) : (env, string) result =
         List.map (fun (tp : Ast.type_param) -> (tp.tp_name, fresh_param_id env1.state))
           d.t_type_params
       in
+      (* the trait name is ALSO a type (the kernel's `source(self) ->
+         Option[Error]` trait-object positions): register the trait's
+         type entry and an empty-struct nominal so the closure's def
+         materialization and the template verifier's TypeId registry
+         carry it — a trait mentioned in a local/return type with no
+         def is the verifier's unknown-TypeId class *)
+      let env1 =
+        match List.assoc_opt d.t_name env1.nominals with
+        | Some _ -> env1
+        | None ->
+            let tid =
+              match List.assoc_opt d.t_name env1.type_ids with
+              | Some t -> t
+              | None -> fresh_type_id env1.state
+            in
+            let param_tys =
+              Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param p) params)
+            in
+            let nom : nominal =
+              {
+                nom_kind = `Struct;
+                nom_params = params;
+                nom_fields = [];
+                nom_variants = [];
+                nom_variant_field_names = [];
+                nom_where = [];
+                nom_field_ids = [];
+                nom_variant_ids = [];
+              }
+            in
+            {
+              env1 with
+              types =
+                (d.t_name, Type_repr.Named (tid, param_tys))
+                :: List.remove_assoc d.t_name env1.types;
+              type_ids = (d.t_name, tid) :: List.remove_assoc d.t_name env1.type_ids;
+              type_names = (tid, d.t_name) :: env1.type_names;
+              nominals = (d.t_name, nom) :: env1.nominals;
+            }
+      in
       let scope = { empty_scope with generics = params } in
       let* where = resolve_where env1 scope d.t_where in
-      let env2 = { env1 with current_self = Some (Type_repr.Type_param (fresh_param_id env1.state)) } in
-      register_methods env2 d.t_name d.t_methods params where
+      (* the trait's SELF is a real binder of every trait method signature:
+         the methods' sigs reference it (self: Self, -> Self), so it must
+         be part of ts_params_decl — the per-call instantiation then
+         substitutes it (receiver/argument unifications solve it) and the
+         recorded call instance carries the solved receiver type, which
+         the template verifier substitutes back.  A decl WITHOUT the Self
+         binder leaves the trait's own rigid parameter in the lowered MIR
+         (a foreign param of an unrelated template) and every
+         bound-generic call through the contract — `x.clone()` on a
+         `T: Clone` element, `self.advance()` inside an Iterator default
+         body — fails the argument check against it. *)
+      let trait_self_p = fresh_param_id env1.state in
+      let env2 = { env1 with current_self = Some (Type_repr.Type_param trait_self_p) } in
+      register_methods env2 d.t_name d.t_methods
+        (params @ [ ("Self", trait_self_p) ])
+        where
   | Ast.ImplBlock d -> register_impl env d
   | Ast.ConstDecl d ->
       let qname = qualified_name item.module_path d.c_name in

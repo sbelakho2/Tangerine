@@ -99,6 +99,20 @@ module IntSet = Set.Make (Int)
 module StrSet = Set.Make (String)
 module IntMap = Map.Make (Int)
 
+(* A checker query signature: callable id, declaration params (the
+   template's own rigid Type_params), the full parameter contracts and
+   the return type.  Covers the type-query special forms (size_of/
+   align_of — no params) AND every compiler-builtin method surface with
+   no lowered MIR body (Ptr::write/read/as_ref/as_mut/drop_in_place —
+   the checker registers their typed sigs but no source module lowers a
+   body, so template-mode calls to them resolve against this registry). *)
+type query_sig = {
+  qs_callable : Ids.Callable_id.t;
+  qs_decl : Type_repr.t array;
+  qs_params : Type_repr.param_type array;
+  qs_ret : Type_repr.t;
+}
+
 type mode =
   | Template_mode (* pre-mono: declared rigid Type_params permitted *)
   | Concrete_mode (* post-mono: zero Type_param/Infer_var/Error anywhere *)
@@ -108,7 +122,105 @@ type ctx = {
   errors : string list ref;
   mode : mode;
   generic_types : Mono.generic_def array; (* generic nominal templates; used in Template_mode *)
+  query_sigs : query_sig list;
+  (* the checker's type-query special forms (size_of[T]()/align_of[T]()
+     — compile-time queries with no lowered MIR function); used in
+     Template_mode only *)
+  (* the checker's registered Box nominal tid (its transparent-Box
+     convention — Box[T] unifies with T in both directions, so the
+     verifier's compatibility and projection rules erase the wrapper
+     exactly where the checker does; None when the compilation has no
+     Box declaration) *)
+  box_tid : Ids.Type_id.t option;
+  (* Concrete_mode post-mono: the driver's type-instance materializer
+     mints a FRESH TypeId per concrete generic-nominal instance and
+     rewrites the program's Named mentions to it.  The body-less
+     registered sigs (query_sigs) are checker-side and still mention
+     the ORIGINAL template ids, so a registered callee's substituted
+     types pass through this rewrite after the call's type arguments
+     replace its declaration binders — otherwise a kept call's
+     destination (a rewritten local) disagrees with the registered
+     callee's return.  Identity in Template_mode. *)
+  post_rewrite : Type_repr.t -> Type_repr.t;
+  (* Concrete_mode post-mono: the FRESH TypeIds the materializer minted
+     for the checker's transparent Box nominal instances (the map's
+     (box_tid, args) -> fresh entries).  Box[T] unifies with T in both
+     directions (types_compatible, deref pointee, projection chains),
+     and a materialized Box[T] mention — Named (fresh, [T]) — must stay
+     transparent exactly like the original-tid mention. *)
+  box_instances : Ids.Type_id.t list;
+  (* Concrete_mode post-mono: the first TypeId the materializer could
+     have minted (program_max_type_id + 1 pre-materialization).  Two
+     DIFFERENT fresh tids at or above this boundary can only be
+     materialized instances of generic templates; comparing their
+     concrete def shapes one level deep reconciles the instances the
+     checker's own compatibility split apart (a literal-solved instance
+     vs its integer-kind instance, a Box-wrapped instance vs the erased
+     mention) without ever weakening NOMINAL identity for user types. *)
+  materialized_from : int;
+  (* recursion guard for the materialized-instance shape comparison *)
+  compat_depth : int ref;
 }
+
+(* Whether a TypeId is the checker's transparent Box nominal — the
+   original tid OR a materialized instance def the driver minted for
+   it (both are transparent over their single type argument). *)
+let is_box_tid (ctx : ctx) (tid : Ids.Type_id.t) : bool =
+  List.exists
+    (fun b -> Ids.Type_id.compare b tid = 0)
+    (match ctx.box_tid with Some b -> b :: ctx.box_instances | None -> ctx.box_instances)
+
+(* The checker's 64-bit alias pairs (the language model — abi_layout:
+   "Int is the i64 alias", "UInt is the u64 alias"): Int and I64 are the
+   same 64-bit signed value domain, UInt and U64 the same 64-bit
+   unsigned domain.  The seed Int_value representation is
+   (width, signed) — a 64-bit signed constant is indistinguishably an
+   Int or an I64 value — so the checker records I64/U64 literals and
+   declarations whose lowered constants the verifier necessarily reads
+   as Int/UInt; the aliases reconcile the two spellings of one domain
+   everywhere a type is compared, exactly like the checker's own
+   int_kind_adopt call-boundary rule. *)
+let int_kind_alias (a : Type_repr.int_kind) (b : Type_repr.int_kind) : bool =
+  a = b
+  ||
+  match a, b with
+  | Type_repr.Int, Type_repr.I64 | Type_repr.I64, Type_repr.Int -> true
+  | Type_repr.UInt, Type_repr.U64 | Type_repr.U64, Type_repr.UInt -> true
+  | _ -> false
+
+let int_kind_width (k : Type_repr.int_kind) : int =
+  match k with
+  | Type_repr.I8 | Type_repr.U8 -> 8
+  | Type_repr.I16 | Type_repr.U16 -> 16
+  | Type_repr.I32 | Type_repr.U32 -> 32
+  | Type_repr.I64 | Type_repr.U64 | Type_repr.Int | Type_repr.UInt -> 64
+  | Type_repr.I128 | Type_repr.U128 -> 128
+
+let int_kind_signed (k : Type_repr.int_kind) : bool =
+  match k with
+  | Type_repr.I8 | Type_repr.I16 | Type_repr.I32 | Type_repr.I64 | Type_repr.I128
+  | Type_repr.Int ->
+      true
+  | Type_repr.U8 | Type_repr.U16 | Type_repr.U32 | Type_repr.U64 | Type_repr.U128
+  | Type_repr.UInt ->
+      false
+
+(* The checker's IntLiteral adoption (typecheck's unify literal-vs-kind
+   rule), mirrored at the MIR: an unsuffixed literal whose checker
+   record never adopted a concrete kind (a generic binding solved by a
+   literal argument — `out.push(0xC5)` binding the receiver Vec's
+   element var) stays Int_literal in the lowered slots/instances, and
+   the MIR compares it like the checker did: compatible with any
+   concrete integer kind whose range fits the magnitude.  Range
+   authority stays the magnitude (never a silent truncation) — exactly
+   the checker's fits decision. *)
+let int_literal_fits (k : Type_repr.int_kind) (m : Big_nat.t) : bool =
+  let p : Literal.parsed_integer =
+    { original = ""; radix = 10; magnitude = m; suffix = Literal.No_int_suffix;
+      span = Span.synthetic }
+  in
+  if int_kind_signed k then Literal.fits_signed p (int_kind_width k)
+  else Literal.fits_unsigned p (int_kind_width k)
 
 let add_err (ctx : ctx) (msg : string) =
   ctx.errors := msg :: !(ctx.errors)
@@ -225,7 +337,26 @@ let resolve_or_self (ctx : ctx) (ty : Type_repr.t) : Type_repr.t =
    copyability resolves its def and applies the same recursive rule
    (struct Copy iff all fields Copy). *)
 let is_copy (ctx : ctx) (ty : Type_repr.t) : bool =
-  (Type_properties.of_type ~resolve_def:(fun tid -> find_type ctx tid) ty).is_copy
+  (* the builtin runtime nominals' canonical def shapes: the driver's
+     type-instance materializer never remaps Vec/Array/Map/Set/Ptr/PtrMut
+     instances (their runtime semantics are keyed on the original ids),
+     so in Concrete_mode they have no def-table entry; their
+     copyability is their canonical runtime shape — the handle nominals
+     (Vec/Map/Set values are pointer-represented containers; Ptr/PtrMut
+     are the address handles) are Copy, exactly as their registry
+     template defs resolved pre-mono (Vec/Map/Set declare no fields;
+     Ptr/PtrMut declare `address: UInt`) *)
+  Type_properties.of_type
+    ~resolve_def:(fun tid ->
+      match find_type ctx tid with
+      | Some t -> Some t
+      | None -> (
+          match Ids.Type_id.to_int tid with
+          | 0 | 1 | 2 -> Some (Type_repr.Tuple [||])
+          | 5 | 6 -> Some (Type_repr.Tuple [| Type_repr.Int Type_repr.UInt |])
+          | _ -> None))
+    ty
+    |> fun p -> p.Type_properties.is_copy
 
 (* Type compatibility.  NOMINAL-vs-NOMINAL comparisons are identity
    comparisons: Named (TypeId, args) is compatible with Named
@@ -250,14 +381,68 @@ let rec types_compatible (ctx : ctx) (a : Type_repr.t) (b : Type_repr.t) : bool 
          declaration binder (template bodies legitimately compare their
          own params against themselves — locals, aggregates, casts) *)
       Ids.Generic_param_id.compare pa pb = 0
+  | Type_repr.Named (ta, [| t |]), u when is_box_tid ctx ta ->
+      (* the checker's transparent-Box unify (typecheck's is_box rule):
+         Box[T] erases to T in both directions — a Box-wrapped value
+         passes where its content is expected and vice versa (`&lhs`
+         with lhs: Box[Expr] at an `expr: Expr` parameter, an Option
+         payload that the checker recorded erased), so the lowered MIR
+         compares through the wrapper exactly where the checker did *)
+      types_compatible ctx t u
+  | u, Type_repr.Named (ta, [| t |]) when is_box_tid ctx ta ->
+      types_compatible ctx u t
+  | Type_repr.Fixed_array (t, _), Type_repr.Named (id, [| e |])
+    when Ids.Type_id.compare id (Ids.Type_id.make 0) = 0 ->
+      (* the checker's fixed-array→Vec element rule (typecheck's method
+         dispatch unifies a [T; n]-typed receiver against a Vec[T]
+         method's self by element — `let known = [...]` bound values
+         used through Vec methods like `.contains`).  The two forms are
+         the same runtime value (Vm_value.Array — the ArrayAgg fills
+         both), so a Fixed-array actual is compatible with a Vec
+         expectation exactly when their elements are; the Vec nominal
+         is matched on the concrete type#0 base, never a user nominal. *)
+      types_compatible ctx t e
+  | Type_repr.Named (id, [| e |]), Type_repr.Fixed_array (t, _)
+    when Ids.Type_id.compare id (Ids.Type_id.make 0) = 0 ->
+      (* the mirror direction (the expected/actual pair may arrive in
+         either order at the call-arg/aggregate checks) *)
+      types_compatible ctx t e
   | Type_repr.Named (ta, aargs), Type_repr.Named (tb, bargs) ->
-      ta = tb
-      && Array.length aargs = Array.length bargs
-      && (let ok = ref true in
-          Array.iteri
-            (fun i t -> if not (types_compatible ctx aargs.(i) t) then ok := false)
-            bargs;
-          !ok)
+      (ta = tb
+       && Array.length aargs = Array.length bargs
+       && (let ok = ref true in
+           Array.iteri
+             (fun i t -> if not (types_compatible ctx aargs.(i) t) then ok := false)
+             bargs;
+           !ok))
+      ||
+      (* Concrete_mode, two DIFFERENT fresh ids at/above the
+         materializer's boundary: both are materialized instances of
+         generic templates, and the checker's own compatibility can
+         split one semantic value across two instances (a literal-solved
+         instance vs its integer-kind instance — the lowered slots keep
+         the raw Int_literal; a Box-wrapped mention vs the transparently
+         erased mention).  The instances' concrete def shapes reconcile
+         them — recursion bounded by the depth guard, so a
+         self-referencing generic (Node[Int] vs Node[String] through an
+         Option[Box[Node]] field) terminates.  NOMINAL identity for
+         user-declared types is never weakened: a fresh id can only be
+         a materialized instance. *)
+      (ctx.mode = Concrete_mode
+      && Ids.Type_id.to_int ta >= ctx.materialized_from
+      && Ids.Type_id.to_int tb >= ctx.materialized_from
+      && (if !(ctx.compat_depth) > 8 then false
+          else begin
+            incr ctx.compat_depth;
+            let r =
+              match find_def ctx ta, find_def ctx tb with
+              | Some da, Some db ->
+                  types_compatible ctx (Seed_mir.def_repr da) (Seed_mir.def_repr db)
+              | _ -> false
+            in
+            decr ctx.compat_depth;
+            r
+          end))
   | Type_repr.Named _, _ | _, Type_repr.Named _ ->
       (* one side nominal, the other structural: the comparison is
          structural-by-nature, so the nominal side is resolved — but
@@ -270,7 +455,16 @@ let rec types_compatible (ctx : ctx) (a : Type_repr.t) (b : Type_repr.t) : bool 
   | Type_repr.Unit, Type_repr.Unit -> true
   | Type_repr.Bool, Type_repr.Bool -> true
   | Type_repr.Char, Type_repr.Char -> true
-  | Type_repr.Int k1, Type_repr.Int k2 -> k1 = k2
+  | Type_repr.Int k1, Type_repr.Int k2 -> int_kind_alias k1 k2
+  | Type_repr.Int_literal m, Type_repr.Int k
+  | Type_repr.Int k, Type_repr.Int_literal m ->
+      (* the checker's literal adoption: an unsuffixed literal's record
+         is compatible with any concrete integer kind its magnitude fits
+         (the lowered slots/instances of a literal-solved generic keep
+         the raw Int_literal — `out.push(0xC5)` — and compare exactly
+         like the checker unified them) *)
+      int_literal_fits k m
+  | Type_repr.Int_literal _, Type_repr.Int_literal _ -> true
   | Type_repr.Float f1, Type_repr.Float f2 -> f1 = f2
   | Type_repr.String, Type_repr.String -> true
   | Type_repr.Raw_ptr (m1, t1), Type_repr.Raw_ptr (m2, t2) ->
@@ -297,6 +491,107 @@ let rec types_compatible (ctx : ctx) (a : Type_repr.t) (b : Type_repr.t) : bool 
           !ok)
       && types_compatible ctx r1 r2
   | Type_repr.Never, Type_repr.Never -> true
+  | _ -> false
+
+(* The ABI address-of allowance (the checker's sanctioned
+   ref_to_raw_ptr call-site coercion, mirrored at the MIR call
+   boundary): a borrow argument `&x` against a Ptr[T]/PtrMut[T]
+   parameter — the __sync_* primitives, the allocator internals —
+   LOWERS to the place x itself (the seed represents the address by
+   the place), so the callee's Ptr[pointee] parameter accepts an
+   actual of the pointee type exactly when the expected nominal's def
+   is the raw-pointer handle — the single-{address: UInt}-field struct
+   shape — and the pointee matches the actual.  The checker applies
+   the coercion only there (never in unify), so the mirror stays
+   equally narrow. *)
+(* The checker's IntLiteral adoption at a call ARGUMENT whose expected
+   was still an unsolved inference variable when the literal was
+   checked (`var data = Vec::new(); data.push(0xff)` — the push's
+   value param is the receiver's element var, solved only later by the
+   fn-return to Vec[u8]): the literal records Int_literal and LOWERS
+   as the default Int-kind constant, so an Integer CONSTANT argument
+   is accepted at any integer-kind parameter whose range fits its
+   magnitude — exactly the checker's fits decision, never a silent
+   truncation (the encoder fns' `data.push(0xff)`-style byte pushes —
+   the `expected u8 got Int` call-arg class). *)
+let const_int_arg_fits_ok (_ctx : ctx) (arg : Seed_mir.operand)
+    (expected : Type_repr.t) : bool =
+  let int_fits_64 (k : Type_repr.int_kind) (v : int64) : bool =
+    if int_kind_signed k then
+      (* the signed range of the parameter kind: -(2^(w-1)) .. 2^(w-1)-1 *)
+      if int_kind_width k = 64 then true
+      else
+        let upper = Int64.shift_left 1L (int_kind_width k - 1) in
+        Int64.compare v (Int64.neg upper) >= 0 && Int64.compare v (Int64.sub upper 1L) <= 0
+    else
+      (* an unsigned parameter accepts any non-negative magnitude
+         below 2^w (255 fits u8 — the checker's fits_unsigned) *)
+      if v < 0L then false
+      else if int_kind_width k = 64 then true
+      else
+        let upper = Int64.shift_left 1L (int_kind_width k) in
+        Int64.compare v (Int64.sub upper 1L) <= 0
+  in
+  match arg with
+  | Seed_mir.Constant (Seed_mir.Integer v) -> (
+      match expected with
+      | Type_repr.Int k ->
+          if v.Int_value.width > 64 then false
+          else int_fits_64 k (Int_value.to_int64 v)
+      | Type_repr.Int_literal _ -> true
+      | _ -> false)
+  | _ -> false
+
+let ptr_addr_ok (ctx : ctx) (expected : Type_repr.t) (actual : Type_repr.t) : bool =
+  match expected with
+  | Type_repr.Named (tid, [| pointee |]) -> (
+      match find_def ctx tid with
+      | Some (Seed_mir.StructDef { sd_fields; _ }) -> (
+          match sd_fields with
+          | [ f ]
+            when
+              (match f.Seed_mir.fd_ty with
+               | Type_repr.Int Type_repr.UInt -> true
+               | _ -> false) ->
+              types_compatible ctx pointee actual
+          | _ -> false)
+      | _ -> false)
+  | _ -> false
+
+(* The call-boundary DEREF rule (the checker's sanctioned deref-first
+   adaptation, mirrored at the MIR call boundary): an argument of REF
+   type at a BY-VALUE parameter derefs to its pointee — `key_ref` (the
+   live key's ADDRESS, yielded by the record-visit intrinsics as
+   Option[&K]) passed to the intrinsic's opaque `key_ref: K`
+   parameter, and the &K receiver of a Clone-contract call whose self
+   parameter is K (the seed's by-value ABI for owning parameters
+   passes the value by address — the ref argument IS the address).
+   The argument operand is the ref-typed READ the lowering emits, so
+   the verifier accepts actual = &t against expected = t. *)
+let deref_arg_ok (ctx : ctx) (expected : Type_repr.t) (actual : Type_repr.t) : bool =
+  match actual with
+  | Type_repr.Ref_internal (_, t) -> types_compatible ctx expected t
+  | _ -> false
+
+(* Whether a type is the raw-pointer HANDLE nominal (Ptr[T]/PtrMut[T]
+   — the single-{address: UInt}-field struct): the cast surface
+   (`x as Ptr[T]` — the seed's raw address rebrand, address_of) and
+   the verifier's scalar/pointer cast-target matrix treat it as the
+   pointer class it is. *)
+let is_ptr_handle (ctx : ctx) (ty : Type_repr.t) : bool =
+  match ty with
+  | Type_repr.Named (tid, _) -> (
+      match find_def ctx tid with
+      | Some (Seed_mir.StructDef { sd_fields; _ }) -> (
+          match sd_fields with
+          | [ f ]
+            when
+              (match f.Seed_mir.fd_ty with
+               | Type_repr.Int Type_repr.UInt -> true
+               | _ -> false) ->
+              true
+          | _ -> false)
+      | _ -> false)
   | _ -> false
 
 (* Whether the resolved type is an ENUM def (Function with Never ret),
@@ -380,6 +675,15 @@ let rec intrinsic_type_compatible (ctx : ctx) (declared : Type_repr.t) (actual :
       | Type_repr.Tuple a2 when Array.length a1 = Array.length a2 ->
           Array.for_all2 (fun d a -> intrinsic_type_compatible ctx d a) a1 a2
       | _ -> false)
+  | Type_repr.Int _
+    when (match actual with Type_repr.Int _ -> true | _ -> false) ->
+      (* the int-kind adoption rule (the checker's int_kind_adopt call
+         boundary — the kernel passes width-typed values where a plain
+         Int is declared, and the VM's Int_value adapters convert by
+         width): an intrinsic/registry parameter accepts ANY integer
+         kind (__intrinsic_int_to_string receives UInt receivers
+         through the derived to_string surface) *)
+      true
   | declared' -> types_compatible ctx (registry_type_to_checker declared') actual
 
 let enum_def_arity (ctx : ctx) (ty : Type_repr.t) : int option =
@@ -396,6 +700,27 @@ let enum_def_arity (ctx : ctx) (ty : Type_repr.t) : int option =
       Some 2
   | _ -> None
 
+(* The raw-pointer HANDLE nominals — the checker's builtin Ptr (id 5)
+   and PtrMut (id 6): the source `struct Ptr[T] { address: UInt }`
+   pointer class whose VALUES the seed VM represents as RawPtr (deref
+   reads/writes go through the simulated memory).  The Rc/Weak/Arc
+   stdlib impls deref THROUGH them — `self.ptr.as_mut().refcount`
+   (Ptr::as_mut's registered return type IS the PtrMut nominal, never
+   a Ref_internal) and the raw-deref PLACE form (deref of self.ptr
+   then a field) — so a Deref projection legally applies to the handle
+   nominal with pointee = its single type argument, exactly the deref
+   rule the checker applies at its field/place layer (typecheck.ml's
+   b_ptr/b_ptrmut cases).  The check runs on the UNRESOLVED form: the
+   handle's def (when materialized) is the address-UInt struct, whose
+   structural resolution must not hide the pointer class. *)
+let ptr_handle_pointee (ty : Type_repr.t) : Type_repr.t option =
+  match ty with
+  | Type_repr.Named (id, [| t |])
+    when Ids.Type_id.compare id (Ids.Type_id.make 5) = 0
+         || Ids.Type_id.compare id (Ids.Type_id.make 6) = 0 ->
+      Some t
+  | _ -> None
+
 (* The type produced by applying one projection; None = illegal.
    Field/Downcast resolve the SEMANTIC id in the projected base's own
    def (the owner-identity rule); ConstantIndex also admits Tuple bases
@@ -404,21 +729,44 @@ let enum_def_arity (ctx : ctx) (ty : Type_repr.t) : int option =
 let project_type (ctx : ctx) (ty : Type_repr.t) (proj : projection) : Type_repr.t option =
   match proj with
   | Deref -> (
-      match resolve_or_self ctx ty with
-      | Type_repr.Ref_internal (_, t) | Type_repr.Raw_ptr (_, t) -> Some t
-      | _ -> None)
+      (* deref over the reference/raw-pointer kinds, the Ptr/PtrMut
+         handle nominals (the seed's pointer values) AND the checker's
+         transparent Box nominal (its deref-on-field/place rule — the
+         Box wrapper derefs to its single type argument, the kernel's
+         `*expr` over a Box[Expr] binding) *)
+      match ptr_handle_pointee ty with
+      | Some t -> Some t
+      | None -> (
+          match ty with
+          | Type_repr.Named (id, [| t |]) when is_box_tid ctx id -> Some t
+          | _ -> (
+              match resolve_or_self ctx ty with
+              | Type_repr.Ref_internal (_, t) | Type_repr.Raw_ptr (_, t) -> Some t
+              | _ -> None)))
   | Field fid -> (
       match ty with
       | Type_repr.Named (tid, args) -> struct_field_ty ctx tid args fid
       | _ -> None)
   | ConstantIndex i -> (
-      match resolve_or_self ctx ty with
+      (* the runtime Vec/Array base (the named Array nominal, type-id
+         0) is admitted BEFORE def resolution — the same rule as the
+         dynamic Index: the Vec[T] def (a field-less declaration whose
+         runtime value is a heap header) must not collapse the base to
+         its empty structural form (the fs/time kernels' `buf[0] = ...`
+         byte-pack writers are the class) *)
+      match ty with
+      | Type_repr.Named (id, [| elem |])
+        when Ids.Type_id.compare id (Ids.Type_id.make 0) = 0 ->
+          Some elem
       | Type_repr.Fixed_array (elem, n) when i >= 0 && i < n -> Some elem
-      | Type_repr.Tuple elems when i >= 0 && i < Array.length elems -> Some elems.(i)
-      (* re-audit item 17: the String byte-index projection (the seed's
-         documented byte convention) — the projected element is Char *)
-      | Type_repr.String -> Some Type_repr.Char
-      | _ -> None)
+      | _ -> (
+          match resolve_or_self ctx ty with
+          | Type_repr.Fixed_array (elem, n) when i >= 0 && i < n -> Some elem
+          | Type_repr.Tuple elems when i >= 0 && i < Array.length elems -> Some elems.(i)
+          (* re-audit item 17: the String byte-index projection (the seed's
+             documented byte convention) — the projected element is Char *)
+          | Type_repr.String -> Some Type_repr.Char
+          | _ -> None))
   | Index li -> (
       (* dynamic-index form: the payload is the LOCAL whose runtime
          integer value is the index.  The runtime value is unknown at
@@ -427,15 +775,21 @@ let project_type (ctx : ctx) (ty : Type_repr.t) (proj : projection) : Type_repr.
          checked in check_projection_owners and the runtime bounds are
          checked by the VM at execution.  The runtime Vec/Array base
          (the named Array nominal, type-id 0) is admitted — the VM's
-         dynamic Index handles the Array value. *)
+         dynamic Index handles the Array value.  The nominal-by-id form
+         is matched BEFORE def resolution: the Vec[T] def (a field-less
+         declaration in std/collections.tg — the runtime value is a
+         heap header, never a struct value) must not collapse the
+         base to its empty structural form. *)
       ignore li;
-      match resolve_or_self ctx ty with
-      | Type_repr.Fixed_array (elem, _) -> Some elem
+      match ty with
       | Type_repr.Named (id, [| elem |])
         when Ids.Type_id.compare id (Ids.Type_id.make 0) = 0 ->
           Some elem
-      | Type_repr.String -> Some Type_repr.Char
-      | _ -> None)
+      | _ -> (
+          match resolve_or_self ctx ty with
+          | Type_repr.Fixed_array (elem, _) -> Some elem
+          | Type_repr.String -> Some Type_repr.Char
+          | _ -> None))
   | Downcast vid -> (
       match ty with
       | Type_repr.Named (tid, args) -> (
@@ -733,7 +1087,23 @@ let init_in_sets (fn : function_) (tbl : (int, block) Hashtbl.t) : (int, IntSet.
 
 let operand_moved_targets (moved : StrSet.t IntMap.t) (op : operand) : StrSet.t IntMap.t =
   match op with
-  | Move p | Consume p -> key_insert moved (root_key p.root) (place_key p)
+  | Move p | Consume p ->
+      (* the "*"-boundary rule (the Rc/Weak class): a transfer whose
+         place chain crosses a Deref or dynamic-Index boundary consumes
+         a MEMORY/container-domain component — the VM writes the Moved
+         hole into the region payload (or the indexed element), never
+         into the root local's own slot — so the ROOT stays Live and
+         its own fields stay readable (the Rc::try_unwrap payload move
+         is followed by as_mut/dealloc reads of the root's ptr field;
+         the Arc drop's weak-count re-read happens after the
+         refcount-payload decrement).  Recording the "*" whole-value
+         key made every later read of the root look consumed.  The
+         memory domain is not root-keyed, so nothing is recorded; the
+         root-keyed lattice still tracks every field/whole-root
+         transfer exactly. *)
+      (match place_key p with
+       | "*" -> moved
+       | key -> key_insert moved (root_key p.root) key)
   | Copy _ | Read _ | Constant _ -> moved
 
 let rvalue_moved_targets (moved : StrSet.t IntMap.t) (rv : rvalue) : StrSet.t IntMap.t =
@@ -745,7 +1115,17 @@ let rvalue_moved_targets (moved : StrSet.t IntMap.t) (rv : rvalue) : StrSet.t In
 
 let terminator_moved_targets (moved : StrSet.t IntMap.t) (t : terminator) : StrSet.t IntMap.t =
   match t with
-  | Call (_, _, args, _, _) -> Array.fold_left (fun acc a -> operand_moved_targets acc a.value) moved args
+  | Call (dest, _, args, _, _) ->
+      (* the call DESTINATION is a definition: the moved-state dataflow
+         clears the dest root exactly like an Assign destination — a
+         loop that re-runs a call (`cursor = visit_next(...)` — the
+         call lands in a fresh temp per iteration and the temp is moved
+         into the cursor) would otherwise carry the temp's moved state
+         from the previous iteration around the back edge and report a
+         spurious second consume on every iteration after the first *)
+      key_clear
+        (Array.fold_left (fun acc a -> operand_moved_targets acc a.value) moved args)
+        (root_key dest.root) (place_key dest)
   | SwitchInt (op, _, _) | Assert (op, _, _, _) -> operand_moved_targets moved op
   | _ -> moved
 
@@ -930,12 +1310,21 @@ let check_projection_owners (ctx : ctx) (fn : function_) (bb_ctx : string)
     | proj :: rest -> (
         match proj with
         | Deref -> (
-            match resolve_or_self ctx ty with
-            | Type_repr.Ref_internal (_, t) | Type_repr.Raw_ptr (_, t) -> go t rest
-            | _ ->
-                add_err ctx
-                  (Printf.sprintf "%s: deref projection on non-pointer type %s" bb_ctx
-                     (Seed_mir.print_type ty)))
+            (* deref over the reference/raw-pointer kinds, the Ptr/PtrMut
+               handle nominals AND the transparent Box nominal (mirror
+               of project_type) *)
+            match ptr_handle_pointee ty with
+            | Some t -> go t rest
+            | None -> (
+                match ty with
+                | Type_repr.Named (id, [| t |]) when is_box_tid ctx id -> go t rest
+                | _ -> (
+                    match resolve_or_self ctx ty with
+                    | Type_repr.Ref_internal (_, t) | Type_repr.Raw_ptr (_, t) -> go t rest
+                    | _ ->
+                        add_err ctx
+                          (Printf.sprintf "%s: deref projection on non-pointer type %s" bb_ctx
+                             (Seed_mir.print_type ty)))))
         | Field fid -> (
             (* the native owner-identity invariant: the projected
                FieldId must belong to the projected base's OWN struct
@@ -973,6 +1362,22 @@ let check_projection_owners (ctx : ctx) (fn : function_) (bb_ctx : string)
                   (Printf.sprintf "%s: field projection on non-struct type %s" bb_ctx
                      (Seed_mir.print_type ty)))
         | ConstantIndex i -> (
+            (* the runtime Vec/Array base (the named Array nominal,
+               type-id 0) is admitted BEFORE def resolution — the same
+               rule as the dynamic Index and project_type: the Vec[T]
+               def (a field-less declaration) must not collapse the
+               base to its empty structural form (the fs/time kernels'
+               `buf[0] = ...` byte-pack writers are the class) *)
+            match ty with
+            | Type_repr.Named (id, [| elem |])
+              when Ids.Type_id.compare id (Ids.Type_id.make 0) = 0 ->
+                go elem rest
+            | Type_repr.Fixed_array (elem, n) ->
+                if i < 0 || i >= n then
+                  add_err ctx
+                    (Printf.sprintf "%s: index %d out of bounds for array of length %d" bb_ctx i n)
+                else go elem rest
+            | _ -> (
             match resolve_or_self ctx ty with
             | Type_repr.Fixed_array (elem, n) ->
                 if i < 0 || i >= n then
@@ -995,7 +1400,7 @@ let check_projection_owners (ctx : ctx) (fn : function_) (bb_ctx : string)
             | _ ->
                 add_err ctx
                   (Printf.sprintf "%s: index projection on non-array type %s" bb_ctx
-                     (Seed_mir.print_type ty)))
+                     (Seed_mir.print_type ty))))
         | Index li ->
             (* dynamic-index form: the payload is the LOCAL whose runtime
                integer value is the index.  The index local must exist,
@@ -1020,13 +1425,22 @@ let check_projection_owners (ctx : ctx) (fn : function_) (bb_ctx : string)
                       "%s: dynamic index local _%d has non-integer index type %s" bb_ctx li
                       (Seed_mir.print_type fn.locals.(li)))
              end);
-            (match resolve_or_self ctx ty with
-             | Type_repr.Fixed_array (elem, _) -> go elem rest
-             | Type_repr.String -> go Type_repr.Char rest
-             | _ ->
-                 add_err ctx
-                   (Printf.sprintf "%s: index projection on non-array type %s" bb_ctx
-                      (Seed_mir.print_type ty)))
+             (match ty with
+              | Type_repr.Named (id, [| elem |])
+                when Ids.Type_id.compare id (Ids.Type_id.make 0) = 0 ->
+                  (* the Vec/Array nominal base (the field-less source
+                     declaration): the dynamic Index admits it by id
+                     BEFORE def resolution (its def must not collapse
+                     the base to the empty structural form) *)
+                  go elem rest
+              | _ -> (
+                  match resolve_or_self ctx ty with
+                  | Type_repr.Fixed_array (elem, _) -> go elem rest
+                  | Type_repr.String -> go Type_repr.Char rest
+                  | _ ->
+                      add_err ctx
+                        (Printf.sprintf "%s: index projection on non-array type %s" bb_ctx
+                           (Seed_mir.print_type ty))))
         | Downcast vid -> (
             (* the native owner-identity invariant for variants: the
                projected VariantId must belong to the projected base's
@@ -1170,7 +1584,7 @@ type callee_resolution =
 
 let rec check_operand (ctx : ctx) (fn : function_) (bb_ctx : string) (op : operand)
     (running : IntSet.t) (moved : StrSet.t IntMap.t) ~(as_call_arg : bool)
-    ~(init_place : bool) : Type_repr.t option =
+    ~(init_place : bool) ~(as_place_arg : bool) : Type_repr.t option =
   match op with
   | Copy p ->
       check_ref_operand ctx fn bb_ctx op ~as_call_arg;
@@ -1181,7 +1595,13 @@ let rec check_operand (ctx : ctx) (fn : function_) (bb_ctx : string) (op : opera
           (Printf.sprintf "%s: copy of previously moved place _%d (key %S)" bb_ctx (root_key p.root) k);
       (match place_type ctx fn p with
        | Some ty ->
-           if not (is_copy ctx ty) then
+           (* the by-place arg rule: a MODIFY/Initialize call argument
+              passes its PLACE (the callee reads/writes through the
+              address) — the operand's Copy form is the place channel,
+              never a bitwise value copy, so the no-copy-of-non-Copy
+              rule does not apply to it (`drop` glue calling the
+              owning handle's inout method with `modify: _1`) *)
+           if not (as_place_arg || is_copy ctx ty) then
              add_err ctx
                (Printf.sprintf
                   "%s: copy of non-Copy value of type %s (a bitwise copy of an owning type must be moved, consumed or passed by place)"
@@ -1266,13 +1686,95 @@ and find_function_by_instance (ctx : ctx) (inst : Instance_id.t) : function_ opt
    applies (declaration-order positional KParam substitution).  A
    type-argument arity disagreement fails closed. *)
 
+(* The registered body-less callee fallback (shared by both modes): a
+   call whose callable is registered in the checker's tables with a
+   typed signature but which NO source module lowers (the type-query
+   special forms size_of/align_of, extern-declared names, the
+   compiler-builtin method/constructor sigs, the derived clone/to_string
+   sigs).  The call's type args substitute the signature's declaration
+   binders and the fake callee carries the signature's declared params
+   and return slot; the exact-arity contract applies (the call's type
+   arguments must number exactly the declaration binders).  Template
+   verification never executes the fake; the mono output keeps these
+   calls as concrete User callees (Mono.build's ~registered_only
+   surface), so the post-mono concrete verification resolves them here
+   too. *)
+and resolve_registered_fallback (ctx : ctx) (inst : Instance_id.t) : callee_resolution =
+  match
+    List.find_opt
+      (fun q -> Ids.Callable_id.compare q.qs_callable (Instance_id.callable inst) = 0)
+      ctx.query_sigs
+  with
+  | None -> Callee_unknown
+  | Some q -> (
+      let decl = q.qs_decl in
+      let args = Instance_id.type_args inst in
+      let decl_params =
+        Array.to_list decl
+        |> List.map (function
+             | Type_repr.Type_param p -> Some p
+             | _ -> None)
+      in
+      if
+        List.exists Option.is_none decl_params
+        || List.length decl_params <> Array.length args
+      then
+        Callee_arity_mismatch
+          (Printf.sprintf
+             "callee %s is a registered body-less signature declaring %d generic parameter(s) but the call carries %d type argument(s)"
+             (Seed_mir.print_instance inst) (Array.length decl) (Array.length args))
+      else
+        let subst =
+          List.combine
+            (List.map
+               (fun p -> Type_repr.KParam (Option.get p))
+               decl_params)
+            (Array.to_list args)
+        in
+        let fake : function_ =
+          {
+            Seed_mir.name = "<body-less registered callee>";
+            instance = inst;
+            params = q.qs_params;
+            locals = [| q.qs_ret |];
+            blocks = [||];
+            entry = 0;
+          }
+        in
+        (* Concrete_mode: the materializer rewrote the program's generic
+           instances to fresh TypeIds, so the substituted signature
+           types pass through the same rewrite before any comparison *)
+        Callee_ok (fake, fun ty -> ctx.post_rewrite (Type_repr.substitute subst ty)))
+
 and resolve_callee (ctx : ctx) (inst : Instance_id.t) : callee_resolution =
   match ctx.mode with
   | Concrete_mode -> (
       match find_function_by_instance ctx inst with
       | Some f -> Callee_ok (f, fun ty -> ty)
-      | None -> Callee_unknown)
+      | None ->
+          (* the mono output legitimately keeps calls to the registered
+             body-less surface (extern-declared names, compiler-builtin
+             methods/constructors, derived clone/to_string sigs, the
+             size_of/align_of type queries): no lowered function can
+             exist for them, so they resolve against the same registry
+             the template verifier uses *)
+          resolve_registered_fallback ctx inst)
   | Template_mode -> (
+      (* EXACT-instance first: when a lowered function carries the call's
+         exact instance identity (a NON-generic callee — its template
+         instance declares zero type args — is always lowered under its
+         own instance, so a zero-arg call matches it exactly), it is the
+         callee — never a same-callable generic sibling.  The resolver's
+         CallableId domain is shared by every method registered for a
+         type (the kernel's impl-registry can hand one id to two
+         (owner, method) sigs — e.g. the source `impl str to_string` and
+         the generic `impl[T] Array to_string` both adopt the id of the
+         kernel's universal to_string), so a by-callable search alone
+         can pick the WRONG template and fail the arity check against
+         the call's own type args. *)
+      (match find_function_by_instance ctx inst with
+       | Some f -> Callee_ok (f, fun ty -> ty)
+       | None -> (
       match
         Array.to_list ctx.prog.functions
         |> List.find_opt (fun f ->
@@ -1280,7 +1782,7 @@ and resolve_callee (ctx : ctx) (inst : Instance_id.t) : callee_resolution =
                  (Instance_id.callable inst)
                = 0)
       with
-      | None -> Callee_unknown
+      | None -> resolve_registered_fallback ctx inst
       | Some cf ->
           let decl = Instance_id.type_args cf.instance in
           let args = Instance_id.type_args inst in
@@ -1306,7 +1808,7 @@ and resolve_callee (ctx : ctx) (inst : Instance_id.t) : callee_resolution =
                    decl_params)
                 (Array.to_list args)
             in
-            Callee_ok (cf, fun ty -> Type_repr.substitute subst ty))
+            Callee_ok (cf, fun ty -> Type_repr.substitute subst ty))))
 
 (* ──────────────────────────────────────────────────────────────────
    Rvalue checking — returns the rvalue's type (None when already
@@ -1314,7 +1816,7 @@ and resolve_callee (ctx : ctx) (inst : Instance_id.t) : callee_resolution =
 
 let is_int_like (ctx : ctx) (ty : Type_repr.t) : bool =
   match resolve_or_self ctx ty with
-  | Type_repr.Int _ -> true
+  | Type_repr.Int _ | Type_repr.Int_literal _ -> true
   | _ -> false
 
 let is_float_like (ctx : ctx) (ty : Type_repr.t) : bool =
@@ -1329,8 +1831,8 @@ let is_char_like (ctx : ctx) (ty : Type_repr.t) : bool =
 
 let is_scalar (ctx : ctx) (ty : Type_repr.t) : bool =
   match resolve_or_self ctx ty with
-  | Type_repr.Int _ | Type_repr.Float _ | Type_repr.Bool | Type_repr.Char
-  | Type_repr.Raw_ptr _ ->
+  | Type_repr.Int _ | Type_repr.Int_literal _ | Type_repr.Float _
+  | Type_repr.Bool | Type_repr.Char | Type_repr.Raw_ptr _ ->
       true
   | _ -> false
 
@@ -1426,7 +1928,7 @@ let check_aggregate (ctx : ctx) (fn : function_) (bb_ctx : string) (kind : aggre
     unit =
   let op_types =
     List.map
-      (fun op -> check_operand ctx fn bb_ctx op running moved ~as_call_arg:false ~init_place:false)
+      (fun op -> check_operand ctx fn bb_ctx op running moved ~as_call_arg:false ~init_place:false ~as_place_arg:false)
       ops
   in
   let check_elem i expected =
@@ -1456,14 +1958,29 @@ let check_aggregate (ctx : ctx) (fn : function_) (bb_ctx : string) (kind : aggre
             (Printf.sprintf "%s: tuple aggregate into non-tuple type %s" bb_ctx
                (Seed_mir.print_type dest_ty)))
   | ArrayAgg -> (
-      match rty with
-      | Type_repr.Fixed_array (elem, n) ->
-          check_count n;
+      (* the runtime Vec/Array nominal base (type-id 0) is admitted —
+         the checker records an array literal checked against a Vec
+         expectation as the Named Vec form and the lowering emits the
+         ArrayAgg into the Vec-typed local (the runtime value IS the
+         heap Vec — Vm_value.Array — built from an ArrayAgg, exactly
+         like the Fixed_array local's Vm_value.Array).  The nominal is
+         matched on the UNRESOLVED dest (its field-less def would
+         collapse the base to the empty structural form — the same rule
+         as the ConstantIndex/dynamic-Index projections). *)
+      match dest_ty with
+      | Type_repr.Named (id, [| elem |])
+        when Ids.Type_id.compare id (Ids.Type_id.make 0) = 0 ->
+          check_count (List.length ops);
           List.iteri (fun i _ -> check_elem i elem) ops
-      | _ ->
-          add_err ctx
-            (Printf.sprintf "%s: array aggregate into non-array type %s" bb_ctx
-               (Seed_mir.print_type dest_ty)))
+      | _ -> (
+          match rty with
+          | Type_repr.Fixed_array (elem, n) ->
+              check_count n;
+              List.iteri (fun i _ -> check_elem i elem) ops
+          | _ ->
+              add_err ctx
+                (Printf.sprintf "%s: array aggregate into non-array type %s" bb_ctx
+                   (Seed_mir.print_type dest_ty))))
   | StructCtor (tid, fields) -> (
       match dest_ty with
       | Type_repr.Named (dtid, _) when dtid = tid -> (
@@ -1576,7 +2093,7 @@ let check_rvalue (ctx : ctx) (fn : function_) (bb_ctx : string) (declared : IntS
     (rv : rvalue) (running : IntSet.t) (moved : StrSet.t IntMap.t) (dest_ty : Type_repr.t) :
     Type_repr.t option =
   match rv with
-  | Use op -> check_operand ctx fn bb_ctx op running moved ~as_call_arg:false ~init_place:false
+  | Use op -> check_operand ctx fn bb_ctx op running moved ~as_call_arg:false ~init_place:false ~as_place_arg:false
   | Ref p | RefMut p -> (
       check_place_readable ctx fn bb_ctx p running;
       let k = place_key p in
@@ -1590,15 +2107,38 @@ let check_rvalue (ctx : ctx) (fn : function_) (bb_ctx : string) (declared : IntS
       check_aggregate ctx fn bb_ctx kind ops running moved dest_ty;
       Some dest_ty
   | BinaryOp (op, l, r) -> (
-      let lt = check_operand ctx fn bb_ctx l running moved ~as_call_arg:false ~init_place:false in
-      let rt = check_operand ctx fn bb_ctx r running moved ~as_call_arg:false ~init_place:false in
+      let lt = check_operand ctx fn bb_ctx l running moved ~as_call_arg:false ~init_place:false ~as_place_arg:false in
+      let rt = check_operand ctx fn bb_ctx r running moved ~as_call_arg:false ~init_place:false ~as_place_arg:false in
       match lt, rt with
       | Some lt, Some rt ->
           let same = types_compatible ctx lt rt in
-          if not same then
-            add_err ctx
-              (Printf.sprintf "%s: binary op operands have different types: %s and %s" bb_ctx
-                 (Seed_mir.print_type lt) (Seed_mir.print_type rt));
+          (* the checker's arithmetic/bitwise acceptance (check_binary):
+             ANY integer-kind pair is a legal arithmetic/bitwise operand
+             pair (the result carries the left operand's kind — the seed
+             VM truncates to the left value's width/signedness), so the
+             mixed pairs the checker records (`parse_u64_le`'s
+             `value | (buf[i] as u64) << (i * 8)` — a U64 value shifted
+             by an Int count) must not fail the MIR operand rule; only
+             the non-integer classes require exact matching operands *)
+           let int_pair = is_int_like ctx lt && is_int_like ctx rt in
+           (* the operand-difference diagnostic applies to the classes
+              the checker rejects (Eq/ordering over differing scalars,
+              non-integer arithmetic mixes) — a mixed INTEGER-kind pair
+              under an arithmetic/bitwise operator is the checker's
+              accepted LHS-kind-coercion form (check_binary returns the
+              left operand's kind for any integer-kind pair), so it is
+              NOT an operand error: only the operator's own class check
+              below gates it. *)
+           let numeric_int_mix =
+             match op with
+             | Add | Sub | Mul | Div | Rem | BitAnd | BitOr | BitXor | Shl | Shr ->
+                 int_pair
+             | And | Or | Eq | Ne | Lt | Le | Gt | Ge -> false
+           in
+           if not same && not numeric_int_mix then
+             add_err ctx
+               (Printf.sprintf "%s: binary op operands have different types: %s and %s" bb_ctx
+                  (Seed_mir.print_type lt) (Seed_mir.print_type rt));
           (match op with
            | And | Or -> (
                match resolve_or_self ctx lt with
@@ -1607,29 +2147,98 @@ let check_rvalue (ctx : ctx) (fn : function_) (bb_ctx : string) (declared : IntS
                    add_err ctx (Printf.sprintf "%s: logical operator requires Bool operands" bb_ctx);
                    None)
            | BitAnd | BitOr | BitXor | Shl | Shr ->
-               if same && is_int_like ctx lt then Some lt
+               if (same || int_pair) && is_int_like ctx lt then Some lt
                else begin
                  add_err ctx
                    (Printf.sprintf "%s: bitwise operator requires matching integer operands" bb_ctx);
                  None
                end
-           | Add | Sub | Mul | Div | Rem ->
-               if same && (is_int_like ctx lt || is_float_like ctx lt) then Some lt
-               else begin
-                 add_err ctx
-                   (Printf.sprintf "%s: arithmetic operator requires matching numeric operands"
-                      bb_ctx);
-                 None
-               end
-           | Eq | Ne ->
-               if same && (is_scalar ctx lt || lt = Type_repr.String) then Some Type_repr.Bool
-               else begin
-                 add_err ctx
-                   (Printf.sprintf "%s: equality operator requires matching scalar operands" bb_ctx);
-                 None
-               end
+            | Add ->
+                (* the String concat rule (the seed's `+` on Strings is
+                   the concat operator — the VM's BinaryOp Add executes
+                   String ^ String — so Add accepts two matching String
+                   operands exactly like the numeric kinds) *)
+                if int_pair || (same && (is_float_like ctx lt || lt = Type_repr.String))
+                then Some lt
+                else begin
+                  add_err ctx
+                    (Printf.sprintf "%s: arithmetic operator requires matching numeric operands"
+                       bb_ctx);
+                  None
+                end
+            | Sub | Mul | Div | Rem ->
+                if int_pair || (same && is_float_like ctx lt) then Some lt
+                else begin
+                  add_err ctx
+                    (Printf.sprintf "%s: arithmetic operator requires matching numeric operands"
+                       bb_ctx);
+                  None
+                end
+            | Eq | Ne ->
+                (* the operands must be matching scalars (or String
+                   content) — except in TEMPLATE mode, where equality
+                   over the function's OWN declared rigid params is a
+                   template-legitimate form (the instantiation-time
+                   operand class — mono's concrete re-verification
+                   checks the instantiated scalars; the kernel's
+                   Copy-bounded container element comparisons
+                   (`Array[T]::starts_with`'s `a != b`) lower exactly
+                   this shape).  The checker's fundamental equality
+                   (check_binary's unify) ALSO accepts whole ENUM /
+                   STRUCT / TUPLE operands of one type (`peek(p) ==
+                   kind` — the parser's token-kind dispatch compares two
+                   TokenKind enum values), and the VM's Eq/Ne execute
+                   them structurally (Vm_value.equal — tag + payloads),
+                   so the MIR rule admits the same aggregate class. *)
+                let param_ok =
+                  match lt with
+                  | Type_repr.Type_param pid -> (
+                      match ctx.mode with
+                      | Template_mode ->
+                          IntSet.mem (Ids.Generic_param_id.to_int pid)
+                            (declared_params fn)
+                      | Concrete_mode -> false)
+                  | _ -> false
+                in
+                let aggregate_ok =
+                  if is_scalar ctx lt || lt = Type_repr.String || param_ok then true
+                  else
+                    match resolve_or_self ctx lt with
+                    | Type_repr.Tuple _ | Type_repr.Fixed_array _
+                    | Type_repr.Function (_, Type_repr.Never) ->
+                        true
+                    | Type_repr.Named (tid, _) ->
+                        (* an unresolvable nominal (no def in the
+                           table/registry) is a template legitimately
+                           carrying its own def-less shape only when it is
+                           a declared enum/struct of the registry in
+                           template mode; conservatively admit the
+                           builtin Option/Result ids (their defs may be
+                           unmaterialized) *)
+                        Ids.Type_id.compare tid (Ids.Type_id.make 3) = 0
+                        || Ids.Type_id.compare tid (Ids.Type_id.make 4) = 0
+                        || Ids.Type_id.compare tid (Ids.Type_id.make 1) = 0
+                        || Ids.Type_id.compare tid (Ids.Type_id.make 2) = 0
+                    | _ -> false
+                in
+                if same && aggregate_ok then Some Type_repr.Bool
+                else begin
+                  add_err ctx
+                    (Printf.sprintf
+                       "%s: equality operator requires matching scalar operands (%s and %s)"
+                       bb_ctx (Seed_mir.print_type lt) (Seed_mir.print_type rt));
+                  None
+                end
            | Lt | Le | Gt | Ge ->
-               if same && (is_int_like ctx lt || is_float_like ctx lt || is_char_like ctx lt)
+               (* String joins the ordered set: the kernel's lexicographic
+                  String ordering (`elem < sorted[pos]` — canonical_effect
+                  _set_render's insertion sort) is accepted by the checker
+                  and executed by the VM, exactly like the equality rule's
+                  String admission above *)
+               if
+                 same
+                 && (is_int_like ctx lt || is_float_like ctx lt
+                    || is_char_like ctx lt || lt = Type_repr.String)
                then Some Type_repr.Bool
                else begin
                  add_err ctx
@@ -1638,7 +2247,7 @@ let check_rvalue (ctx : ctx) (fn : function_) (bb_ctx : string) (declared : IntS
                end)
       | _ -> None)
   | UnaryOp (op, v) -> (
-      match check_operand ctx fn bb_ctx v running moved ~as_call_arg:false ~init_place:false with
+      match check_operand ctx fn bb_ctx v running moved ~as_call_arg:false ~init_place:false ~as_place_arg:false with
       | Some vt -> (
           match op with
           | Neg ->
@@ -1677,25 +2286,30 @@ let check_rvalue (ctx : ctx) (fn : function_) (bb_ctx : string) (declared : IntS
         add_err ctx (Printf.sprintf "%s: len of previously consumed local _%d" bb_ctx (root_key p.root));
       match place_type ctx fn p with
       | Some ty -> (
-          match resolve_or_self ctx ty with
-          | Type_repr.Fixed_array _ -> Some (Type_repr.Int Type_repr.UInt)
+          (* the Vec/Array nominal base is matched by id BEFORE def
+             resolution (its field-less def must not collapse the
+             base to the empty structural form) *)
+          match ty with
           | Type_repr.Named (id, _)
             when Ids.Type_id.compare id (Ids.Type_id.make 0) = 0 ->
               Some (Type_repr.Int Type_repr.UInt)
-          (* re-audit item 17: the seed's documented Unicode decision —
-             String indices are BYTE indices, consistent with Len's
-             String.length — so Len(String) is the byte count, exactly
-             what the VM computes *)
-          | Type_repr.String -> Some (Type_repr.Int Type_repr.UInt)
-          | _ ->
-              add_err ctx
-                (Printf.sprintf "%s: len of non-array value of type %s" bb_ctx
-                   (Seed_mir.print_type ty));
-              None)
+          | _ -> (
+              match resolve_or_self ctx ty with
+              | Type_repr.Fixed_array _ -> Some (Type_repr.Int Type_repr.UInt)
+              (* re-audit item 17: the seed's documented Unicode decision —
+                 String indices are BYTE indices, consistent with Len's
+                 String.length, so Len(String) is the byte count, exactly
+                 what the VM computes *)
+              | Type_repr.String -> Some (Type_repr.Int Type_repr.UInt)
+              | _ ->
+                  add_err ctx
+                    (Printf.sprintf "%s: len of non-array value of type %s" bb_ctx
+                       (Seed_mir.print_type ty));
+                  None))
       | None -> None)
   | Cast (op, ty) -> (
       let oty =
-        check_operand ctx fn bb_ctx op running moved ~as_call_arg:false ~init_place:false
+        check_operand ctx fn bb_ctx op running moved ~as_call_arg:false ~init_place:false ~as_place_arg:false
       in
       (* re-audit P12: the enum-rebrand cast — the `?` failure path
          moves the WHOLE subject between two instantiations of the SAME
@@ -1705,9 +2319,17 @@ let check_rvalue (ctx : ctx) (fn : function_) (bb_ctx : string) (declared : IntS
       let enum_rebrand =
         match oty, ty with
         | Some o, Type_repr.Named (tid_t, _) -> (
-            match resolve_or_self ctx o with
+            (* the DIRECT comparison first: the operand's place type IS
+               the nominal (Result[Vec[u8], E] -> Result[String, E]);
+               resolving it to the def (findable for the builtin enums
+               through the generic registry) would structurally collapse
+               the Named identity and defeat the family check *)
+            match o with
             | Type_repr.Named (tid_o, _) -> Ids.Type_id.compare tid_o tid_t = 0
-            | _ -> false)
+            | _ -> (
+                match resolve_or_self ctx o with
+                | Type_repr.Named (tid_o, _) -> Ids.Type_id.compare tid_o tid_t = 0
+                | _ -> false))
         | _ -> false
       in
       match ctx.mode with
@@ -1716,7 +2338,7 @@ let check_rvalue (ctx : ctx) (fn : function_) (bb_ctx : string) (declared : IntS
             add_err ctx
               (Printf.sprintf "%s: cast target %s carries an unresolved type parameter" bb_ctx
                  (Seed_mir.print_type ty));
-          if is_scalar ctx ty then Some ty
+          if is_scalar ctx ty || is_ptr_handle ctx ty then Some ty
           else if enum_rebrand then Some ty
           else begin
             add_err ctx
@@ -1728,8 +2350,12 @@ let check_rvalue (ctx : ctx) (fn : function_) (bb_ctx : string) (declared : IntS
           (* template mode: a cast to a DECLARED rigid param is a
              template-legitimate position (its scalar class is an
              instantiation-time fact); every other target must pass the
-             scalar/pointer matrix, and the target may only reference
-             the function's own declared params *)
+             scalar/pointer matrix — with the SAME same-enum-family
+             rebrand acceptance as concrete mode (the `?` failure path
+             moves the whole subject between instantiations of one enum,
+             Result[Int, E] -> Result[String, E]; the runtime layout is
+             identical, and the target may only reference the
+             function's own declared params *)
           (match ty with
            | Type_repr.Type_param pid ->
                if not (IntSet.mem (Ids.Generic_param_id.to_int pid) declared) then
@@ -1738,15 +2364,16 @@ let check_rvalue (ctx : ctx) (fn : function_) (bb_ctx : string) (declared : IntS
                       "%s: cast target references generic parameter T%d that is not declared by this function's signature"
                       bb_ctx (Ids.Generic_param_id.to_int pid));
                Some ty
-           | _ ->
-               check_type_walk ctx bb_ctx "cast target" declared ty;
-               if is_scalar ctx ty then Some ty
-               else begin
-                 add_err ctx
-                   (Printf.sprintf "%s: cast target %s is not a scalar/pointer type" bb_ctx
-                      (Seed_mir.print_type ty));
-                 None
-               end))
+            | _ ->
+                check_type_walk ctx bb_ctx "cast target" declared ty;
+                if is_scalar ctx ty || is_ptr_handle ctx ty then Some ty
+                else if enum_rebrand then Some ty
+                else begin
+                  add_err ctx
+                    (Printf.sprintf "%s: cast target %s is not a scalar/pointer type" bb_ctx
+                       (Seed_mir.print_type ty));
+                  None
+                end))
 
 (* ──────────────────────────────────────────────────────────────────
    Terminator checking *)
@@ -1778,12 +2405,55 @@ let check_call (ctx : ctx) (fn : function_) (bb_ctx : string) (dest : place)
                 (Printf.sprintf "%s: intrinsic `%s` expects %d argument(s), got %d" bb_ctx name
                    (Array.length sig_.Intrinsic_registry.params) (Array.length args));
             let subst = ref [] in
+            (* the declared types live in the registry's own TypeId
+               domain; bind maps them to the checker's domain per Named
+               node.  Concrete_mode additionally resolves the bindings
+               accumulated so far and follows the materializer rewrite
+               (the declared mention must land on the same fresh
+               instance as the rewritten program side) — a registry id
+               numerically collides with a checker id (registry
+               Option = 1 = the checker's Map), so the rewrite must run
+               INSIDE bind after the domain mapping, never on a
+               pre-mapped type.  Template_mode keeps the raw path. *)
+            let arg_kind = ref (-1) in
+            let chk (t : Type_repr.t) : Type_repr.t =
+              (* the registry->checker id translation is applied ONCE:
+                 template mode translates per Named node below (raw
+                 registry-domain types flow through bind); concrete mode
+                 translates whole declared types at bind entry (the
+                 domain collision between registry and checker ids makes
+                 a second translation corrupt — registry Option = 1 =
+                 the checker's Map) *)
+              match ctx.mode with
+              | Concrete_mode -> t
+              | Template_mode -> registry_type_to_checker t
+            in
+            let raw_arg = ref Type_repr.Unit in
             let rec bind (declared : Type_repr.t) (actual : Type_repr.t) : unit =
+              raw_arg := declared;
+              let declared =
+                match ctx.mode with
+                | Concrete_mode ->
+                    (* the call sites pre-converted the raw registry sig
+                       types to the checker domain ONCE (a second
+                       conversion would corrupt the substituted checker
+                       values — registry Option = 1 = the checker's
+                       Map); here the accumulated bindings resolve and
+                       the materializer rewrite lands the declared
+                       mention on the same fresh instance as the
+                       rewritten program side *)
+                    ctx.post_rewrite
+                      (Type_repr.substitute (List.rev !subst) declared)
+                | Template_mode -> declared
+              in
               match declared with
               | Type_repr.Type_param pid -> (
                   match List.assoc_opt (Type_repr.KParam pid) !subst with
                   | Some prev ->
-                      if not (types_compatible ctx prev actual) then
+                      if not
+                           (types_compatible ctx prev actual
+                           || deref_arg_ok ctx prev actual)
+                      then
                         add_err ctx
                           (Printf.sprintf
                              "%s: intrinsic `%s` generic parameter is used inconsistently (earlier %s, now %s)"
@@ -1792,15 +2462,22 @@ let check_call (ctx : ctx) (fn : function_) (bb_ctx : string) (dest : place)
                   | None -> subst := (Type_repr.KParam pid, actual) :: !subst)
               | Type_repr.Named (id1, a1) -> (
                   let id1' =
-                    if Ids.Type_id.compare id1 (Intrinsic_registry.Type_id.option_) = 0 then
-                      Ids.Type_id.make 3
-                    else if Ids.Type_id.compare id1 (Intrinsic_registry.Type_id.vec) = 0 then
-                      Ids.Type_id.make 0
-                    else if Ids.Type_id.compare id1 (Intrinsic_registry.Type_id.map) = 0 then
-                      Ids.Type_id.make 1
-                    else if Ids.Type_id.compare id1 (Intrinsic_registry.Type_id.set) = 0 then
-                      Ids.Type_id.make 2
-                    else id1
+                    match ctx.mode with
+                    | Concrete_mode -> id1
+                    | Template_mode -> (
+                        if
+                          Ids.Type_id.compare id1 (Intrinsic_registry.Type_id.option_) = 0
+                        then Ids.Type_id.make 3
+                        else if
+                          Ids.Type_id.compare id1 (Intrinsic_registry.Type_id.vec) = 0
+                        then Ids.Type_id.make 0
+                        else if
+                          Ids.Type_id.compare id1 (Intrinsic_registry.Type_id.map) = 0
+                        then Ids.Type_id.make 1
+                        else if
+                          Ids.Type_id.compare id1 (Intrinsic_registry.Type_id.set) = 0
+                        then Ids.Type_id.make 2
+                        else id1)
                   in
                   match actual with
                   | Type_repr.Named (id2, a2)
@@ -1811,13 +2488,47 @@ let check_call (ctx : ctx) (fn : function_) (bb_ctx : string) (dest : place)
                          && Array.length a1 = 1 ->
                       bind a1.(0) e2
                   | _ ->
+                      let dbg =
+                        if Sys.getenv_opt "TANGERINE_DEBUG_INTRIN" <> None then begin
+                          let arg_ts =
+                            String.concat ";"
+                              (Array.to_list
+                                 (Array.map
+                                    (fun a ->
+                                      Seed_mir.print_type
+                                        (match a.Seed_mir.value with
+                                         | Copy p | Read p | Move p | Consume p -> (
+                                             match place_type ctx fn p with
+                                             | Some t -> t
+                                             | None -> Type_repr.Unit)
+                                         | Constant c -> constant_type ctx c))
+                                    args))
+                          in
+                          Printf.sprintf " [arg=%d rawdecl=%s argtypes=%s dest=%s]"
+                            !arg_kind (Seed_mir.print_type !raw_arg) arg_ts
+                            (match place_type ctx fn dest with
+                             | Some t -> Seed_mir.print_type t
+                             | None -> "?")
+                        end
+                        else ""
+                      in
                       add_err ctx
                         (Printf.sprintf
-                           "%s: intrinsic `%s` argument type mismatch: expected %s got %s" bb_ctx
-                           name
-                           (Seed_mir.print_type (registry_type_to_checker declared))
-                           (Seed_mir.print_type actual)))
-              | Type_repr.Unit -> (
+                           "%s: intrinsic `%s` argument type mismatch: expected %s got %s%s"
+                           bb_ctx name
+                           (Seed_mir.print_type (chk declared))
+                           (Seed_mir.print_type actual) dbg))
+               | Type_repr.Int _
+                 when (match actual with Type_repr.Int _ -> true | _ -> false) ->
+                   (* the int-kind adoption rule (the checker's
+                      int_kind_adopt call boundary — the kernel passes
+                      width-typed values where a plain Int is declared,
+                      and the VM's Int_value adapters convert by width):
+                      an intrinsic parameter accepts ANY integer kind
+                      (__intrinsic_int_to_string receives UInt receivers
+                      through the derived to_string surface) *)
+                   ()
+               | Type_repr.Unit -> (
                   (* a declared Unit parameter is exactly Unit — never a
                      wildcard *)
                   if not (types_compatible ctx Type_repr.Unit actual) then
@@ -1829,31 +2540,82 @@ let check_call (ctx : ctx) (fn : function_) (bb_ctx : string) (dest : place)
                   match actual with
                   | Type_repr.Fixed_array (e2, n2) when n1 = n2 -> bind e1 e2
                   | _ ->
+                      let dbg =
+                        if Sys.getenv_opt "TANGERINE_DEBUG_INTRIN" <> None then begin
+                          let arg_ts =
+                            String.concat ";"
+                              (Array.to_list
+                                 (Array.map
+                                    (fun a ->
+                                      Seed_mir.print_type
+                                        (match a.Seed_mir.value with
+                                         | Copy p | Read p | Move p | Consume p -> (
+                                             match place_type ctx fn p with
+                                             | Some t -> t
+                                             | None -> Type_repr.Unit)
+                                         | Constant c -> constant_type ctx c))
+                                    args))
+                          in
+                          Printf.sprintf " [arg=%d rawdecl=%s argtypes=%s dest=%s]"
+                            !arg_kind (Seed_mir.print_type !raw_arg) arg_ts
+                            (match place_type ctx fn dest with
+                             | Some t -> Seed_mir.print_type t
+                             | None -> "?")
+                        end
+                        else ""
+                      in
                       add_err ctx
                         (Printf.sprintf
-                           "%s: intrinsic `%s` argument type mismatch: expected %s got %s" bb_ctx
-                           name
-                           (Seed_mir.print_type (registry_type_to_checker declared))
-                           (Seed_mir.print_type actual)))
+                           "%s: intrinsic `%s` argument type mismatch: expected %s got %s%s"
+                           bb_ctx name
+                           (Seed_mir.print_type (chk declared))
+                           (Seed_mir.print_type actual) dbg))
               | Type_repr.Tuple a1 -> (
                   match actual with
                   | Type_repr.Tuple a2 when Array.length a1 = Array.length a2 ->
                       Array.iter2 (fun d a -> bind d a) a1 a2
                   | _ ->
+                      let dbg =
+                        if Sys.getenv_opt "TANGERINE_DEBUG_INTRIN" <> None then begin
+                          let arg_ts =
+                            String.concat ";"
+                              (Array.to_list
+                                 (Array.map
+                                    (fun a ->
+                                      Seed_mir.print_type
+                                        (match a.Seed_mir.value with
+                                         | Copy p | Read p | Move p | Consume p -> (
+                                             match place_type ctx fn p with
+                                             | Some t -> t
+                                             | None -> Type_repr.Unit)
+                                         | Constant c -> constant_type ctx c))
+                                    args))
+                          in
+                          Printf.sprintf " [arg=%d rawdecl=%s argtypes=%s dest=%s]"
+                            !arg_kind (Seed_mir.print_type !raw_arg) arg_ts
+                            (match place_type ctx fn dest with
+                             | Some t -> Seed_mir.print_type t
+                             | None -> "?")
+                        end
+                        else ""
+                      in
                       add_err ctx
                         (Printf.sprintf
-                           "%s: intrinsic `%s` argument type mismatch: expected %s got %s" bb_ctx
-                           name
-                           (Seed_mir.print_type (registry_type_to_checker declared))
-                           (Seed_mir.print_type actual)))
-              | declared' ->
-                  if not (types_compatible ctx (registry_type_to_checker declared') actual) then
-                    add_err ctx
-                      (Printf.sprintf
-                         "%s: intrinsic `%s` argument type mismatch: expected %s got %s" bb_ctx
-                         name
-                         (Seed_mir.print_type (registry_type_to_checker declared'))
-                         (Seed_mir.print_type actual))
+                           "%s: intrinsic `%s` argument type mismatch: expected %s got %s%s"
+                           bb_ctx name
+                           (Seed_mir.print_type (chk declared))
+                           (Seed_mir.print_type actual) dbg))
+               | declared' ->
+                   if not
+                        (types_compatible ctx (chk declared') actual
+                        || deref_arg_ok ctx (chk declared') actual)
+                   then
+                     add_err ctx
+                       (Printf.sprintf
+                          "%s: intrinsic `%s` argument type mismatch: expected %s got %s" bb_ctx
+                          name
+                          (Seed_mir.print_type (chk declared'))
+                          (Seed_mir.print_type actual))
             in
             Array.iteri
               (fun k a ->
@@ -1862,6 +2624,7 @@ let check_call (ctx : ctx) (fn : function_) (bb_ctx : string) (dest : place)
                     Access_effect.read_effect
                       sig_.Intrinsic_registry.params.(k).Type_repr.pt_convention
                   in
+                  arg_kind := k;
                   if a.Seed_mir.effect_ <> declared then
                     add_err ctx
                       (Printf.sprintf
@@ -1895,14 +2658,22 @@ let check_call (ctx : ctx) (fn : function_) (bb_ctx : string) (dest : place)
                     | Seed_mir.Consume p -> place_type ctx fn p
                   in
                   (match actual_ty with
-                   | Some aty -> bind declared_ty aty
+                   | Some aty ->
+                       bind
+                         (match ctx.mode with
+                          | Concrete_mode -> registry_type_to_checker declared_ty
+                          | Template_mode -> declared_ty)
+                         aty
                    | None -> ()))
               args;
-            (* the destination type against the declared result — under
-               the SAME substitution: a generic placeholder in the result
-               must be consistent with the arguments' bindings *)
             (match place_type ctx fn dest with
-             | Some dty -> bind sig_.Intrinsic_registry.ret dty
+             | Some dty ->
+                 bind
+                   (match ctx.mode with
+                    | Concrete_mode ->
+                        registry_type_to_checker sig_.Intrinsic_registry.ret
+                    | Template_mode -> sig_.Intrinsic_registry.ret)
+                   dty
              | None -> ());
             ())
   | Extern i ->
@@ -1955,7 +2726,11 @@ let check_call (ctx : ctx) (fn : function_) (bb_ctx : string) (dest : place)
                   in
                   (match actual_ty with
                    | Some aty ->
-                       if not (intrinsic_type_compatible ctx declared_ty aty) then
+                       if
+                         not
+                           (intrinsic_type_compatible ctx declared_ty aty
+                           || ptr_addr_ok ctx (registry_type_to_checker declared_ty) aty)
+                       then
                          add_err ctx
                            (Printf.sprintf
                               "%s: extern argument %d type mismatch: expected %s got %s" bb_ctx
@@ -1982,7 +2757,7 @@ let check_call (ctx : ctx) (fn : function_) (bb_ctx : string) (dest : place)
          them), and the destination equals the fn type's return. *)
       match
         check_operand ctx fn bb_ctx op running moved ~as_call_arg:false
-          ~init_place:false
+          ~init_place:false ~as_place_arg:false
       with
       | None -> ()
       | Some oty -> (
@@ -2020,6 +2795,7 @@ let check_call (ctx : ctx) (fn : function_) (bb_ctx : string) (dest : place)
                   match
                     check_operand ctx fn bb_ctx arg.value running moved ~as_call_arg:true
                       ~init_place:(arg.effect_ = Access_effect.Initialize)
+                      ~as_place_arg:(arg.effect_ = Access_effect.Modify || arg.effect_ = Access_effect.Initialize)
                   with
                   | Some aty -> (
                       if i < Array.length ptys
@@ -2065,8 +2841,16 @@ let check_call (ctx : ctx) (fn : function_) (bb_ctx : string) (dest : place)
           Array.iteri
             (fun i arg ->
               (match arg.effect_ with
-               | Access_effect.Read -> ()
-               | Access_effect.Modify | Access_effect.Initialize | Access_effect.Consume -> (
+               | Access_effect.Read | Access_effect.Consume -> ()
+               | Access_effect.Modify | Access_effect.Initialize -> (
+                   (* Modify/Initialize are PLACE CHANNELS (the callee's
+                      mutation copies back into the caller's storage) —
+                      a constant has no storage, so those effects require
+                      a place operand.  A Consume argument transfers a
+                      VALUE: a constant operand is an immutable value the
+                      callee copies in, exactly like the Read form, so
+                      Consume-of-a-constant is legal (the io kernel's
+                      `vec.resize(len, 0)` fill constants). *)
                    match arg.value with
                    | Constant _ ->
                        add_err ctx
@@ -2076,50 +2860,65 @@ let check_call (ctx : ctx) (fn : function_) (bb_ctx : string) (dest : place)
                    | _ -> ()));
               match (if i < Array.length cf.params then Some cf.params.(i) else None) with
                | Some p -> (
-                   (* the documented exactness rule: a call argument's
-                      access effect must be the read-side of the callee's
-                      parameter convention (Let->Read, Inout->Modify,
-                      Sink->Consume, Set->Initialize) *)
-                   let expected = Access_effect.read_effect p.Type_repr.pt_convention in
-                   if arg.effect_ <> expected then
-                     add_err ctx
-                       (Printf.sprintf
-                          "%s: call arg %d effect %s does not match the callee's %s convention (expected %s)"
-                          bb_ctx i (Seed_mir.print_effect arg.effect_)
-                          (Access_effect.to_string p.Type_repr.pt_convention)
-                          (Seed_mir.print_effect expected));
+                    (* the documented exactness rule: a call argument's
+                       access effect must be the read-side of the callee's
+                       parameter convention (Let->Read, Inout->Modify,
+                       Sink->Consume, Set->Initialize).  The kernel's
+                       sanctioned inout-of-a-literal shape (`emit_uleb128
+                       (&mut buf, 1)` — the callee's `inout value: u64`
+                       receives a literal whose writeback would be
+                       meaningless) lowers with the READ effect on the
+                       constant operand; the verifier accepts the
+                       downgrade exactly there. *)
+                    let expected = Access_effect.read_effect p.Type_repr.pt_convention in
+                    let inout_const_downgrade =
+                      match p.Type_repr.pt_convention, arg.effect_, arg.value with
+                      | Access_effect.Inout, Access_effect.Read, Seed_mir.Constant _ -> true
+                      | _ -> false
+                    in
+                    if arg.effect_ <> expected && not inout_const_downgrade then
+                      add_err ctx
+                        (Printf.sprintf
+                           "%s: call arg %d effect %s does not match the callee's %s convention (expected %s)"
+                           bb_ctx i (Seed_mir.print_effect arg.effect_)
+                           (Access_effect.to_string p.Type_repr.pt_convention)
+                           (Seed_mir.print_effect expected));
                    (* template mode: the callee's param type is read under
                       the substitution (its declaration binders <- this
                       call's type args), the same specialization contract
                       mono applies *)
                    let pty = subst p.Type_repr.pt_type in
                    match
-                     check_operand ctx fn bb_ctx arg.value running moved ~as_call_arg:true ~init_place:(arg.effect_ = Access_effect.Initialize)
+                     check_operand ctx fn bb_ctx arg.value running moved ~as_call_arg:true ~init_place:(arg.effect_ = Access_effect.Initialize) ~as_place_arg:(arg.effect_ = Access_effect.Modify || arg.effect_ = Access_effect.Initialize)
                    with
-                   | Some aty ->
-                       if not (types_compatible ctx pty aty) then
-                         add_err ctx
-                           (Printf.sprintf "%s: call arg %d type mismatch: expected %s got %s"
-                              bb_ctx i (Seed_mir.print_type pty)
-                              (Seed_mir.print_type aty))
-                   | None -> ())
-               | None -> ())
-            args;
-          let ret_ty =
-            subst (if Array.length cf.locals > 0 then cf.locals.(0) else Type_repr.Unit)
-          in
-          match place_type ctx fn dest with
-          | Some dty ->
-              if not (types_compatible ctx dty ret_ty) then
-                add_err ctx
-                  (Printf.sprintf
-                     "%s: call destination type %s does not match callee return type %s" bb_ctx
-                     (Seed_mir.print_type dty) (Seed_mir.print_type ret_ty))
-          | None -> ()))
+                    | Some aty ->
+                        if not
+                             (types_compatible ctx pty aty || ptr_addr_ok ctx pty aty
+                              || deref_arg_ok ctx pty aty
+                              || const_int_arg_fits_ok ctx arg.value pty)
+                        then
+                          add_err ctx
+                            (Printf.sprintf "%s: call arg %d type mismatch: expected %s got %s"
+                               bb_ctx i
+                               (Seed_mir.print_type pty) (Seed_mir.print_type aty))
+                    | None -> ())
+                | None -> ())
+             args;
+           let ret_ty =
+             subst (if Array.length cf.locals > 0 then cf.locals.(0) else Type_repr.Unit)
+           in
+           match place_type ctx fn dest with
+           | Some dty ->
+               if not (types_compatible ctx dty ret_ty) then
+                 add_err ctx
+                   (Printf.sprintf
+                      "%s: call destination type %s does not match callee return type %s" bb_ctx
+                      (Seed_mir.print_type dty) (Seed_mir.print_type ret_ty))
+           | None -> ()))
 
 let check_switch (ctx : ctx) (fn : function_) (bb_ctx : string) (op : operand)
     (targets : (int64 * int) list) (running : IntSet.t) (moved : StrSet.t IntMap.t) : unit =
-  match check_operand ctx fn bb_ctx op running moved ~as_call_arg:false ~init_place:false with
+  match check_operand ctx fn bb_ctx op running moved ~as_call_arg:false ~init_place:false ~as_place_arg:false with
   | None -> ()
   | Some oty -> (
       let rty = resolve_or_self ctx oty in
@@ -2206,7 +3005,7 @@ let check_terminator (ctx : ctx) (fn : function_) (bb_ctx : string) (t : termina
         add_err ctx (Printf.sprintf "%s: duplicate drop of local _%d (key %S)" bb_ctx (root_key p.root) k)
   | Assert (op, _, _, target) -> (
       check_target target;
-      match check_operand ctx fn bb_ctx op running moved ~as_call_arg:false ~init_place:false with
+      match check_operand ctx fn bb_ctx op running moved ~as_call_arg:false ~init_place:false ~as_place_arg:false with
       | Some oty ->
           if not (types_compatible ctx Type_repr.Bool oty) then
             add_err ctx
@@ -2598,11 +3397,43 @@ let verify_all (ctx : ctx) (prog : program) : (unit, string list) result =
   | errs -> Error (List.rev errs)
 
 let require_valid_template ?(generic_types : Mono.generic_def array = [||])
+    ?(query_sigs : query_sig list = []) ?(box_tid : Ids.Type_id.t option = None)
     (prog : program) : (unit, string list) result =
-  verify_all { prog; errors = ref []; mode = Template_mode; generic_types } prog
+  verify_all
+    {
+      prog;
+      errors = ref [];
+      mode = Template_mode;
+      generic_types;
+      query_sigs;
+      box_tid;
+      post_rewrite = (fun ty -> ty);
+      box_instances = [];
+      materialized_from = max_int;
+      compat_depth = ref 0;
+    }
+    prog
 
-let require_valid_concrete (prog : program) : (unit, string list) result =
-  verify_all { prog; errors = ref []; mode = Concrete_mode; generic_types = [||] } prog
+let require_valid_concrete ?(query_sigs : query_sig list = [])
+    ?(post_rewrite : Type_repr.t -> Type_repr.t = fun ty -> ty)
+    ?(box_instances : Ids.Type_id.t list = [])
+    ?(materialized_from : int = max_int)
+    ?(box_tid : Ids.Type_id.t option = None)
+    (prog : program) : (unit, string list) result =
+  verify_all
+    {
+      prog;
+      errors = ref [];
+      mode = Concrete_mode;
+      generic_types = [||];
+      query_sigs;
+      box_tid;
+      post_rewrite;
+      box_instances;
+      materialized_from;
+      compat_depth = ref 0;
+    }
+    prog
 
 (* Deprecated strict alias: the pre-existing entry point is the CONCRETE
    (post-mono) verifier — never the template mode.  Callers that want
