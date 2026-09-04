@@ -494,29 +494,20 @@ let enum_payloads_of (env : Typecheck.env) :
     env.Typecheck.nominals
 
 
-(* ── The persistent typed-node bridge (re-audit: TypedProgram/TypedHIR) ──
-   The typechecker's node-keyed map (NodeId -> resolved node) crosses
-   into lowering as Mir_lower's typed_nodes channel, threaded alongside
-   lowering_env_of into every lower_function_with_variants call.  The
-   typed channel is authoritative in lowering when a node-keyed entry is
-   present; the cast rule consumes the checker-RESOLVED target
-   (declaration-owned GenericParamIds) and never re-derives it from
-   syntax positionally; the call rule consumes the checker-RESOLVED
-   callee + solved concrete substitution (tn_call). *)
-let typed_nodes_of (env : Typecheck.env) : (Ids.Node_id.t * Mir_lower.typed_node) list =
-  (* re-audit P12: the node types are substituted through the final
-     journal — a call's resolved type can carry an infer var that binds
-     LATER in the same item (`var v = Vec::new(); v.push(x)` — the
-     call node's Vec[?] only becomes Vec[T] after the push) *)
-  (* the final journal, INDEXED once (the list-assoc per var would be
-     quadratic over the closure's nodes); the bounded fixpoint resolves
-     var-to-var chains without iterating the whole journal.  The journal
-     is newest-first (unify prepends every binding), and a var CAN be
-     rebound when a later unification runs against a stale earlier
-     binding (the fn-end return-slot unify starts from an empty subst —
-     it re-solves a var the body's calls already bound).  The checker's
-     own reads resolve through list-assoc = the NEWEST binding wins, so
-     the table below keeps the FIRST-seen (newest) entry per key. *)
+(* ── The final-journal chase (re-audit P12) — shared by typed_nodes_of,
+   the oracle's typed accepted-instance set, and the mono-poison debug —
+   a resolved type can carry an infer var that binds LATER in the same
+   item (`var v = Vec::new(); v.push(x)` — the call node's Vec[?] only
+   becomes Vec[T] after the push).  The journal is newest-first (unify
+   prepends every binding), and a var CAN be rebound when a later
+   unification runs against a stale earlier binding (the fn-end
+   return-slot unify starts from an empty subst — it re-solves a var the
+   body's calls already bound).  The indexed table keeps the FIRST-seen
+   (newest) entry per key (list-assoc per var would be quadratic over
+   the closure's nodes; the checker's own reads resolve newest-first),
+   and the bounded fixpoint resolves var-to-var chains without iterating
+   the whole journal. *)
+let final_journal_subst () : Type_repr.t -> Type_repr.t =
   let jtbl : (Type_repr.generic_key, Type_repr.t) Hashtbl.t =
     Hashtbl.create 65536
   in
@@ -554,6 +545,23 @@ let typed_nodes_of (env : Typecheck.env) : (Ids.Node_id.t * Mir_lower.typed_node
     in
     go 0 ty
   in
+  sub
+
+(* ── The persistent typed-node bridge (re-audit: TypedProgram/TypedHIR) ──
+   The typechecker's node-keyed map (NodeId -> resolved node) crosses
+   into lowering as Mir_lower's typed_nodes channel, threaded alongside
+   lowering_env_of into every lower_function_with_variants call.  The
+   typed channel is authoritative in lowering when a node-keyed entry is
+   present; the cast rule consumes the checker-RESOLVED target
+   (declaration-owned GenericParamIds) and never re-derives it from
+   syntax positionally; the call rule consumes the checker-RESOLVED
+   callee + solved concrete substitution (tn_call), substituted through
+   the final journal exactly like every other consumer of the typed
+   channel (the oracle's accepted-instance set and the mono-poison
+   surface share final_journal_subst, so no consumer can see a stale
+   pre-journal var where another sees the resolved type). *)
+let typed_nodes_of (env : Typecheck.env) : (Ids.Node_id.t * Mir_lower.typed_node) list =
+  let sub = final_journal_subst () in
   Hashtbl.fold
     (fun key (node : Typecheck.typed_node) acc ->
       let tn = sub node.Typecheck.tn_type in
@@ -2262,6 +2270,12 @@ type mir_stats = {
   ms_enum_ops : int;
   ms_closures : int;
   ms_callable_instances : Instance_id.t list;
+  (* re-audit item 23/24: the identity SET for the callable-template
+     domain — the distinct callables of the program's FUNCTION
+     INSTANCES (the emitted template bodies), so the oracle can compare
+     typed declared callable templates against the templates that
+     actually lowered, as sets *)
+  ms_fn_templates : int list;
   (* re-audit item 23/24: the identity SET for the statics domain — the
      program's static names, so the oracle can compare Required
      StaticIds as sets, never counts *)
@@ -2340,6 +2354,13 @@ let count_mir_stats (prog : Seed_mir.program) : mir_stats =
     ms_enum_ops = !enums;
     ms_closures = !closures;
     ms_callable_instances = List.sort_uniq Instance_id.compare !instances;
+    ms_fn_templates =
+      List.sort_uniq Int.compare
+        (Array.to_list
+           (Array.map
+              (fun (f : Seed_mir.function_) ->
+                Ids.Callable_id.to_int (Instance_id.callable f.Seed_mir.instance))
+              prog.Seed_mir.functions));
     ms_static_names =
       List.map (fun (n, _, _, _) -> n) (Array.to_list prog.Seed_mir.statics) }
 
@@ -2373,6 +2394,11 @@ type oracle_counts = {
 let oracle_instance_sets : (Instance_id.t list * Instance_id.t list) ref =
   ref ([], [])
 
+(* TANGERINE_DEBUG_ORACLE: the FULL chased typed accepted set (before
+   the User-dispatch-domain filter), so the diagnostics can report how
+   many accepted instances sit outside the comparison domain *)
+let oracle_raw_typed_set : Instance_id.t list ref = ref []
+
 (* re-audit item 23/24: the identity-set channels for the statics and
    the callable-template domains — (typed required, MIR emitted) pairs
    compared as sets, with the missing/extra differences reported; the
@@ -2380,20 +2406,258 @@ let oracle_instance_sets : (Instance_id.t list * Instance_id.t list) ref =
 let oracle_static_sets : (string list * string list) ref = ref ([], [])
 let oracle_template_sets : (int list * int list) ref = ref ([], [])
 
+(* TANGERINE_DEBUG_ORACLE: the FULL typed declared template set (before
+   the emitted-body-domain filter), so the diagnostics can report the
+   declared-but-bodyless registrations *)
+let oracle_raw_template_set : int list ref = ref []
+
+(* TANGERINE_DEBUG_ORACLE: the callable-id -> registered-name table for
+   the missing/extra diagnostics (built by oracle_of_ctx, consumed by
+   print_oracle_rows in the same breath — single-threaded driver). *)
+let oracle_name_tbl : (int, string) Hashtbl.t option ref = ref None
+
+(* TANGERINE_DEBUG_ORACLE: NodeId -> enclosing-item display (module path
+   + fn/method/impl name), so a missing/extra instance can be traced to
+   the exact source item whose body recorded the call. *)
+let oracle_node_tbl : (int, string) Hashtbl.t option ref = ref None
+
+(* TANGERINE_DEBUG_ORACLE: the raw (NodeId, chased instance) records of
+   the typed side, so the diagnostics can name every span that produced
+   a missing instance. *)
+let oracle_typed_entries : (int * Instance_id.t) list ref = ref []
+
+(* TANGERINE_DEBUG_ORACLE: dump every MIR User callee instance grouped
+   by its enclosing seed function, so a missing/extra instance can be
+   matched against what the lowering ACTUALLY emitted per function. *)
+let debug_dump_mir_calls (prog : Seed_mir.program) : unit =
+  if Sys.getenv_opt "TANGERINE_DEBUG_ORACLE" <> None then begin
+    let counts = Hashtbl.create 65536 in
+    let key_of (fn : string) (inst : Instance_id.t) : string =
+      Printf.sprintf "%s -> %s" fn (Seed_mir.print_instance inst)
+    in
+    Array.iter
+      (fun (f : Seed_mir.function_) ->
+        Array.iter
+          (fun (b : Seed_mir.block) ->
+            match b.Seed_mir.terminator with
+            | Seed_mir.Call (_, Seed_mir.User inst, _, _, _) ->
+                let k = key_of f.Seed_mir.name inst in
+                Hashtbl.replace counts k
+                  (1 + Option.value ~default:0 (Hashtbl.find_opt counts k))
+            | _ -> ())
+          f.Seed_mir.blocks)
+      prog.Seed_mir.functions;
+    let lines =
+      Hashtbl.fold (fun k c acc -> (c, k) :: acc) counts []
+      |> List.sort (fun (c1, k1) (c2, k2) ->
+             let c = compare c2 c1 in
+             if c <> 0 then c else String.compare k1 k2)
+    in
+    Printf.printf "    ORACLE-DEBUG MIR call terminators by fn (count, fn -> instance): %d distinct\n"
+      (List.length lines);
+    List.iter
+      (fun (c, k) -> Printf.printf "    ORACLE-DEBUG MIR-call %d  %s\n" c k)
+      lines;
+    let want_full name =
+      List.exists
+        (fun frag ->
+          let ln = String.length name and lf = String.length frag in
+          if lf = 0 || lf > ln then false
+          else
+            let rec go i =
+              if i + lf > ln then false
+              else if String.sub name i lf = frag then true
+              else go (i + 1)
+            in
+            go 0)
+        [ "codegen_new"; "resolve_bare_type_name"; "trait_id_for"; "type_env_new" ]
+    in
+    Array.iter
+      (fun (f : Seed_mir.function_) ->
+        if want_full f.Seed_mir.name then
+          Printf.printf "ORACLE-DEBUG FN %s\n%s\n" f.Seed_mir.name
+            (Seed_mir.print_function f))
+      prog.Seed_mir.functions
+  end
+
+(* Debug-only (TANGERINE_DEBUG_ORACLE): walk every item body of the
+   closure and index each expression NodeId under its enclosing item's
+   display name.  The walk covers every expr position that can carry a
+   checked call (statement/expr nests, match/if arms, patterns' literal
+   exprs, nested fn items, impl/struct/trait method bodies, const/static
+   initializers); nested ModuleDef/EditionDecl bodies are separate graph
+   nodes and are skipped here. *)
+let build_oracle_node_table (ctx : closure_ctx) : unit =
+  let tbl = Hashtbl.create 200000 in
+  oracle_node_tbl := Some tbl;
+  let rec walk_block (display : string) (bb : Ast.block_body) : unit =
+    List.iter (fun st -> walk_stmt display st) bb.Ast.b_stmts;
+    Option.iter (walk_expr display) bb.Ast.b_tail
+  and walk_stmt (display : string) (st : Ast.stmt) : unit =
+    match st with
+    | Ast.LetBinding (_, _, _, e, _) -> walk_expr display e
+    | Ast.ExprStmt (e, _) -> walk_expr display e
+    | Ast.Attributed (_, s, _) -> walk_stmt display s
+    | Ast.DeferStmt (bb, _) -> walk_block display bb
+    | Ast.Item it -> walk_item display it
+    | Ast.AttributeStmt _ -> ()
+  and walk_fn (display : string) (fd : Ast.function_decl) : unit =
+    match fd.Ast.fn_body with
+    | Ast.FnBlock bb -> walk_block display bb
+    | Ast.FnExpr e -> walk_expr display e
+    | Ast.FnSignatureOnly -> ()
+  and walk_item (outer : string) (it : Ast.item) : unit =
+    match it.Ast.kind with
+    | Ast.Function fd ->
+        let d = outer ^ "::" ^ fd.Ast.fn_sig.Ast.sig_name in
+        walk_fn d fd
+    | Ast.ImplBlock d ->
+        let base = outer ^ "::impl(" ^ d.Ast.i_target_type ^ ")" in
+        List.iter (fun m -> walk_fn (base ^ "::" ^ m.Ast.fn_sig.Ast.sig_name) m) d.Ast.i_methods;
+        List.iter (fun c -> walk_expr (base ^ "::const " ^ c.Ast.c_name) c.Ast.c_value)
+          d.Ast.i_consts
+    | Ast.StructDef d ->
+        let base = outer ^ "::" ^ d.Ast.s_name in
+        List.iter
+          (fun m -> walk_fn (base ^ "::" ^ m.Ast.fn_sig.Ast.sig_name) m)
+          d.Ast.s_methods;
+        List.iter
+          (fun (f : Ast.field_decl) ->
+            Option.iter (walk_expr (base ^ "::field " ^ f.Ast.f_name)) f.Ast.f_default)
+          d.Ast.s_fields
+    | Ast.TraitDef d ->
+        let base = outer ^ "::trait(" ^ d.Ast.t_name ^ ")" in
+        List.iter (fun m -> walk_fn (base ^ "::" ^ m.Ast.fn_sig.Ast.sig_name) m) d.Ast.t_methods
+    | Ast.TestDecl td -> walk_block (outer ^ "::test " ^ td.Ast.test_name) td.Ast.test_body
+    | Ast.ConstDecl cd -> walk_expr (outer ^ "::const " ^ cd.Ast.c_name) cd.Ast.c_value
+    | Ast.StaticDecl sd -> walk_expr (outer ^ "::static " ^ sd.Ast.st_name) sd.Ast.st_value
+    | Ast.MacroDecl md -> walk_block (outer ^ "::macro " ^ md.Ast.mac_name) md.Ast.mac_body
+    | Ast.ExternBlock eb ->
+        List.iter (walk_item (outer ^ "::extern")) eb.Ast.ex_items
+    | Ast.ModuleDef _ | Ast.EditionDecl _ | Ast.UseDecl _ | Ast.TypeAlias _
+    | Ast.CapabilityDecl _ | Ast.EffectDecl _ | Ast.RationaleBlock _ | Ast.EnumDef _ ->
+        ()
+  and walk_pat (display : string) (p : Ast.pattern) : unit =
+    match p with
+    | Ast.PatLiteral (e, _) -> walk_expr display e
+    | Ast.PatVariant (_, _, pats, _) | Ast.PatTuple (pats, _) ->
+        List.iter (walk_pat display) pats
+    | Ast.StructPattern (_, fields, _) ->
+        List.iter
+          (fun (_, po) -> Option.iter (walk_pat display) po)
+          fields
+    | Ast.OrPattern (a, b, _) ->
+        walk_pat display a;
+        walk_pat display b
+    | Ast.RangePattern (a, b, _) ->
+        walk_pat display a;
+        walk_pat display b
+    | Ast.Wildcard _ | Ast.PatIdent _ | Ast.RefPattern _ | Ast.RefMutPattern _ -> ()
+  and walk_expr (display : string) (e : Ast.expr) : unit =
+    Hashtbl.replace tbl (Ids.Node_id.to_int (Ast.expr_node_id e)) display;
+    match e with
+    | Ast.IntLit _ | Ast.FloatLit _ | Ast.StringLit _ | Ast.CharLit _ | Ast.BoolLit _
+    | Ast.Name _ | Ast.Path _ | Ast.NextExpr _ ->
+        ()
+    | Ast.Array (_, es, _) | Ast.Tuple (_, es, _) -> List.iter (walk_expr display) es
+    | Ast.ArrayRepeat (_, a, b, _) ->
+        walk_expr display a;
+        walk_expr display b
+    | Ast.StructLit (_, _, _, fields, spread, _) ->
+        List.iter (fun (_, v) -> walk_expr display v) fields;
+        Option.iter (walk_expr display) spread
+    | Ast.Block (_, bb, _) | Ast.UnsafeBlock (_, _, bb, _) | Ast.LoopExpr (_, bb, _)
+    | Ast.ComptimeBlock (_, bb, _) ->
+        walk_block display bb
+    | Ast.IfExpr (_, ie) ->
+        walk_expr display ie.Ast.if_condition;
+        walk_block display ie.Ast.if_then;
+        List.iter
+          (fun (c, b) ->
+            walk_expr display c;
+            walk_block display b)
+          ie.Ast.if_elsif;
+        Option.iter (walk_block display) ie.Ast.if_else;
+        Option.iter (walk_pat display) ie.Ast.if_let_pattern;
+        Option.iter (walk_expr display) ie.Ast.if_let_value
+    | Ast.Call (_, f, _, args, _) ->
+        walk_expr display f;
+        List.iter (fun (a : Ast.call_arg) -> walk_expr display a.Ast.ca_value) args
+    | Ast.Index (_, a, b, _) | Ast.Binary (_, a, _, b, _) | Ast.Assign (_, a, b, _)
+    | Ast.CompoundAssign (_, a, _, b, _) ->
+        walk_expr display a;
+        walk_expr display b
+    | Ast.Range (_, a, b, _, _) ->
+        walk_expr display a;
+        walk_expr display b
+    | Ast.MatchExpr (_, me) ->
+        walk_expr display me.Ast.m_subject;
+        List.iter
+          (fun (ma : Ast.match_arm) ->
+            walk_pat display ma.Ast.ma_pattern;
+            Option.iter (walk_expr display) ma.Ast.ma_guard;
+            walk_expr display ma.Ast.ma_body)
+          me.Ast.m_arms
+    | Ast.Cast (_, a, _, _) | Ast.TryOp (_, a, _) | Ast.Unary (_, _, a, _)
+    | Ast.Field (_, a, _, _) | Ast.AwaitExpr (_, a, _) ->
+        walk_expr display a
+    | Ast.Closure (_, ce) -> walk_expr display ce.Ast.cl_body
+    | Ast.MacroCall (_, _, margs, _) ->
+        List.iter
+          (function Ast.MacroExpr e -> walk_expr display e | Ast.MacroTokens _ -> ())
+          margs
+    | Ast.ReturnExpr (_, o, _) | Ast.BreakExpr (_, o, _) ->
+        Option.iter (walk_expr display) o
+    | Ast.ForExpr (_, fe) ->
+        walk_pat display fe.Ast.for_pattern;
+        walk_expr display fe.Ast.for_iterable;
+        walk_block display fe.Ast.for_body
+    | Ast.WhileExpr (_, we) ->
+        walk_expr display we.Ast.wh_condition;
+        walk_block display we.Ast.wh_body
+    | Ast.HandleExpr (_, he) ->
+        walk_expr display he.Ast.h_expr;
+        List.iter
+          (fun (_, pats, body) ->
+            List.iter (walk_pat display) pats;
+            walk_expr display body)
+          he.Ast.h_arms
+    | Ast.UnlessExpr (_, ue) ->
+        walk_expr display ue.Ast.un_condition;
+        walk_block display ue.Ast.un_body;
+        Option.iter (walk_block display) ue.Ast.un_else
+    | Ast.UntilExpr (_, ue) ->
+        walk_expr display ue.Ast.ut_condition;
+        walk_block display ue.Ast.ut_body
+    | Ast.TryBlock (_, tb) ->
+        walk_block display tb.Ast.tr_body;
+        List.iter
+          (fun (p, bb) ->
+            walk_pat display p;
+            walk_block display bb)
+          tb.Ast.tr_catches;
+        Option.iter (walk_block display) tb.Ast.tr_finally
+  in
+  List.iter
+    (fun (node : Module_graph.module_node) ->
+      let outer = String.concat "::" node.Module_graph.node_path in
+      List.iter (walk_item outer) node.Module_graph.node_items)
+    ctx.ctx_graph.Module_graph.nodes
+
 let print_oracle_rows (o : oracle_counts) : bool =
   let diff_count = ref 0 in
   let skipped_note = if o.oc_skipped then " (skipped: typecheck gate failed)" else "" in
   (* ── counter rows: PLACEHOLDERS (re-audit P0 #2) ────────────────
      A counter DIFF cannot prove completeness: a missing call and a
-     duplicated different call can have equal counts.  Each row below
-     is retained as a labeled placeholder until the semantic identity
-     SET for its domain exists; none of them closes completeness. *)
+     duplicated different call can have equal counts.  Each row below is
+     printed as labeled TELEMETRY ONLY — it never counts toward the
+     verdict.  The verdict is carried by the identity-SET rows (the
+     semantic comparisons with per-element missing/extra reporting):
+     count equality cannot close completeness, set equality can. *)
   let counter_row (label : string) (expected : int) (emitted : int) =
-    let ok = expected = emitted in
-    if not ok then incr diff_count;
     Printf.printf "  oracle %-46s expected %6d  emitted %6d  %s%s\n" label expected emitted
-      (if ok then "OK" else "DIFF")
-      (if ok then "" else skipped_note)
+      (if expected = emitted then "OK" else "DIFF")
+      (if expected = emitted then "" else skipped_note)
   in
   counter_row "typed reachable functions (counter placeholder)" o.oc_typed_functions
     o.oc_mir_functions;
@@ -2404,13 +2668,24 @@ let print_oracle_rows (o : oracle_counts) : bool =
     o.oc_mir_types;
   counter_row "enum variant ops (counter placeholder)" o.oc_mir_enum_ops o.oc_mir_enum_ops;
   counter_row "closure objects (counter placeholder)" o.oc_mir_closures o.oc_mir_closures;
+  let debug_oracle = Sys.getenv_opt "TANGERINE_DEBUG_ORACLE" <> None in
   (* ── the callable-instance IDENTITY-SET row (re-audit P0 #2): the
-     only call row that can close completeness — the typed accepted
+     call row that can close completeness — the typed accepted
      CallableId/InstanceId set (the checker's persistent typed-node
-     channel) vs the MIR callable-instance set (the lowered program's
-     User callees), with the set-difference sizes (missing/extra)
-     reported instead of raw count equality *)
+     channel, chased through the final journal EXACTLY like the
+     lowering's typed channel, and restricted to the USER-DISPATCH
+     callable domain — see oracle_of_ctx: the builtin intrinsic-surface
+     method calls and the derived synthetic contracts are resolved off
+     the User channel by the lowering by design, so they are reported as
+     domain telemetry below, never as missing instances) vs the MIR
+     callable-instance set (the lowered program's User callees), with
+     the set-difference sizes (missing/extra) reported instead of raw
+     count equality.  Missing = an accepted instance of a LIVE
+     User-dispatched callable that no emitted call carries (a dropped
+     call or a divergent substitution); extra = an emitted User instance
+     the checker never accepted (a phantom call). *)
   let typed_set, mir_set = !oracle_instance_sets in
+  let raw_typed_set = !oracle_raw_typed_set in
   let missing = List.filter (fun i -> not (List.mem i mir_set)) typed_set in
   let extra = List.filter (fun i -> not (List.mem i typed_set)) mir_set in
   let set_ok = missing = [] && extra = [] in
@@ -2423,18 +2698,72 @@ let print_oracle_rows (o : oracle_counts) : bool =
   Printf.printf
     "    set difference: %d typed accepted instance(s) missing from MIR, %d MIR instance(s) not typed-accepted (typed-call count sample %d is a lower bound — counts cannot prove completeness, the identity set can)\n"
     (List.length missing) (List.length extra) o.oc_typed_calls;
+  if not o.oc_skipped then
+    Printf.printf
+      "    out-of-domain: %d typed accepted instance(s) of callables the lowering dispatches off the User channel (builtin intrinsic surface, derived contracts, static initializers — reported, never compared)\n"
+      (List.length raw_typed_set - List.length typed_set);
   if not set_ok && not o.oc_skipped then begin
     let rec take_first n = function
       | [] -> []
       | x :: rest when n > 0 -> x :: take_first (n - 1) rest
       | _ :: _ -> []
     in
+    let name_of (i : Instance_id.t) : string =
+      match !oracle_name_tbl with
+      | Some t -> (
+          match Hashtbl.find_opt t (Ids.Callable_id.to_int (Instance_id.callable i)) with
+          | Some n -> n
+          | None -> "?")
+      | None -> "?"
+    in
     List.iter
-      (fun i -> Printf.printf "    missing from MIR: %s\n" (Seed_mir.print_instance i))
+      (fun i ->
+        Printf.printf "    missing from MIR: %s  (%s)\n" (Seed_mir.print_instance i)
+          (name_of i))
       (take_first 10 missing);
     List.iter
-      (fun i -> Printf.printf "    extra in MIR: %s\n" (Seed_mir.print_instance i))
-      (take_first 10 extra)
+      (fun i ->
+        Printf.printf "    extra in MIR: %s  (%s)\n" (Seed_mir.print_instance i) (name_of i))
+      (take_first 10 extra);
+    if debug_oracle then begin
+      let ctx_of (i : Instance_id.t) : string list =
+        List.filter_map
+          (fun (nid, inst) ->
+            if Instance_id.compare inst i <> 0 then None
+            else
+              match !oracle_node_tbl with
+              | Some t -> (
+                  match Hashtbl.find_opt t nid with
+                  | Some c -> Some c
+                  | None -> Some (Printf.sprintf "node#%d (no AST context)" nid))
+              | None -> Some "?")
+          !oracle_typed_entries
+        |> List.sort_uniq String.compare
+      in
+      Printf.printf "    ORACLE-DEBUG missing-from-MIR count=%d\n" (List.length missing);
+      List.iter
+        (fun i ->
+          Printf.printf "    ORACLE-DEBUG missing inst %s (%s)\n"
+            (Seed_mir.print_instance i) (name_of i);
+          List.iter (fun c -> Printf.printf "      missing in: %s\n" c) (ctx_of i))
+        missing;
+      Printf.printf "    ORACLE-DEBUG extra-in-MIR count=%d\n" (List.length extra);
+      List.iter
+        (fun i ->
+          Printf.printf "    ORACLE-DEBUG extra inst %s (%s)\n" (Seed_mir.print_instance i)
+            (name_of i))
+        extra;
+      let out_of_domain =
+        List.filter (fun i -> not (List.mem i typed_set)) raw_typed_set
+      in
+      Printf.printf "    ORACLE-DEBUG out-of-domain count=%d\n"
+        (List.length out_of_domain);
+      List.iter
+        (fun i ->
+          Printf.printf "    ORACLE-DEBUG out-of-domain inst %s (%s)\n"
+            (Seed_mir.print_instance i) (name_of i))
+        (take_first 25 out_of_domain)
+    end
   end;
   (* ── the statics IDENTITY-SET row (re-audit item 23/24): the typed
      REQUIRED StaticIds vs the MIR program's StaticIds — set equality,
@@ -2455,6 +2784,7 @@ let print_oracle_rows (o : oracle_counts) : bool =
   end;
   (* ── the callable-template IDENTITY-SET row (re-audit item 23/24) *)
   let typed_templates, mir_templates = !oracle_template_sets in
+  let raw_typed_templates = !oracle_raw_template_set in
   let missing_t = List.filter (fun c -> not (List.mem c mir_templates)) typed_templates in
   let extra_t = List.filter (fun c -> not (List.mem c typed_templates)) mir_templates in
   let templates_ok = missing_t = [] && extra_t = [] in
@@ -2464,6 +2794,48 @@ let print_oracle_rows (o : oracle_counts) : bool =
     (List.length typed_templates) (List.length mir_templates)
     (if templates_ok then "OK" else "DIFF")
     (if templates_ok then "" else skipped_note);
+  if not o.oc_skipped then
+    Printf.printf
+      "    declared-but-bodyless: %d registered callable(s) with no closure body to lower (compiler-builtin/extern/trait-contract sigs — reported, never compared)\n"
+      (List.length raw_typed_templates - List.length typed_templates);
+  if not templates_ok && not o.oc_skipped then begin
+    let name_of (c : int) : string =
+      match !oracle_name_tbl with
+      | Some t -> ( match Hashtbl.find_opt t c with Some n -> n | None -> "?")
+      | None -> "?"
+    in
+    let rec take_first n = function
+      | [] -> []
+      | x :: rest when n > 0 -> x :: take_first (n - 1) rest
+      | _ :: _ -> []
+    in
+    List.iter
+      (fun c -> Printf.printf "    template missing from MIR: callable#%d (%s)\n" c (name_of c))
+      (take_first 10 missing_t);
+    List.iter
+      (fun c -> Printf.printf "    template extra in MIR: callable#%d (%s)\n" c (name_of c))
+      (take_first 10 extra_t);
+    if debug_oracle then begin
+      Printf.printf "    ORACLE-DEBUG template missing count=%d\n" (List.length missing_t);
+      List.iter
+        (fun c ->
+          Printf.printf "    ORACLE-DEBUG template missing callable#%d (%s)\n" c (name_of c))
+        missing_t;
+      Printf.printf "    ORACLE-DEBUG template extra count=%d\n" (List.length extra_t);
+      List.iter
+        (fun c -> Printf.printf "    ORACLE-DEBUG template extra callable#%d (%s)\n" c (name_of c))
+        extra_t;
+      let out_of_domain =
+        List.filter (fun c -> not (List.mem c typed_templates)) raw_typed_templates
+      in
+      Printf.printf "    ORACLE-DEBUG declared-but-bodyless count=%d\n"
+        (List.length out_of_domain);
+      List.iter
+        (fun c ->
+          Printf.printf "    ORACLE-DEBUG declared-but-bodyless callable#%d (%s)\n" c (name_of c))
+        (take_first 30 out_of_domain)
+    end
+  end;
   Printf.printf "  oracle calls with concrete callee InstanceId  emitted %6d  callable#0 uses %d\n"
     o.oc_mir_calls o.oc_mir_callable_zero;
   if o.oc_skipped then
@@ -2471,7 +2843,7 @@ let print_oracle_rows (o : oracle_counts) : bool =
       "  oracle note: MIR side emitted as zeros — lowering skipped (typecheck gate failed)\n"
   else
     Printf.printf
-      "  oracle note: the counter rows above are PLACEHOLDERS — count equality cannot prove completeness (a missing call and a duplicated different call can have equal counts); the callable-instance identity-set row is the completeness comparison for calls.  The closure row stays a placeholder because typed closures are not recorded (check_closure computes the capture list but records no closure identity/captures) and Mir_lower has no Closure branch (E9040, no closure-CALL path in the VM), so its 0 == 0 is vacuous until the VM's closure model lands\n";
+      "  oracle note: the counter rows above are PLACEHOLDERS — count equality cannot prove completeness (a missing call and a duplicated different call can have equal counts); the verdict is carried by the identity-SET rows, and the callable-instance identity-set row is the completeness comparison for calls.  The callable-instance and callable-template rows compare WITHIN the emitted-User / emitted-body callable domains: accepted calls to callables the lowering dispatches off the User channel (the builtin intrinsic surface — Map/Set/Array/Vec/String/Int receiver methods whose bodies are intrinsic wrappers — the derived clone/to_string contracts, static-initializer expressions) and declared-but-bodyless registrations (compiler-builtin/extern/trait-contract sigs) are reported as out-of-domain telemetry, never as missing instances/templates.  The closure row stays a placeholder because typed closures are not recorded (check_closure computes the capture list but records no closure identity/captures) and Mir_lower has no Closure branch (E9040, no closure-CALL path in the VM), so its 0 == 0 is vacuous until the VM's closure model lands\n";
   !diff_count > 0 || o.oc_mir_callable_zero > 0
 
 (* The bootstrap entry: --entry overrides; default is the kernel's
@@ -3122,41 +3494,7 @@ let debug_mono_poison_names (ctx : closure_ctx) (prog : Seed_mir.program) : unit
        them through the final journal); mirror that substitution so the
        poison surface is the CONCRETE instance set the mono actually
        looks up *)
-    let jtbl : (Type_repr.generic_key, Type_repr.t) Hashtbl.t = Hashtbl.create 65536 in
-    List.iter
-      (fun (k, v) -> if not (Hashtbl.mem jtbl k) then Hashtbl.add jtbl k v)
-      (Typecheck.final_journal ());
-    let rec sub1 (ty : Type_repr.t) : Type_repr.t =
-      match ty with
-      | Type_repr.Type_param id -> (
-          match Hashtbl.find_opt jtbl (Type_repr.KParam id) with
-          | Some s -> s
-          | None -> ty)
-      | Type_repr.Infer_var v -> (
-          match Hashtbl.find_opt jtbl (Type_repr.KVar v) with
-          | Some s -> s
-          | None -> ty)
-      | Type_repr.Raw_ptr (m, inner) -> Type_repr.Raw_ptr (m, sub1 inner)
-      | Type_repr.Ref_internal (m, inner) -> Type_repr.Ref_internal (m, sub1 inner)
-      | Type_repr.Tuple elems -> Type_repr.Tuple (Array.map sub1 elems)
-      | Type_repr.Fixed_array (inner, n) -> Type_repr.Fixed_array (sub1 inner, n)
-      | Type_repr.Named (id, args) -> Type_repr.Named (id, Array.map sub1 args)
-      | Type_repr.Function (params, ret) ->
-          Type_repr.Function
-            (Array.map (fun p -> { p with Type_repr.pt_type = sub1 p.Type_repr.pt_type }) params,
-             sub1 ret)
-      | Type_repr.Unit | Type_repr.Bool | Type_repr.Char | Type_repr.Int _
-      | Type_repr.Float _ | Type_repr.String | Type_repr.Int_literal _
-      | Type_repr.Error | Type_repr.Never ->
-          ty
-    in
-    let sub ty =
-      let rec go n ty =
-        let ty' = sub1 ty in
-        if Type_repr.compare ty ty' = 0 || n > 8 then ty' else go (n + 1) ty'
-      in
-      go 0 ty
-    in
+    let sub = final_journal_subst () in
     let poison = Hashtbl.create 1024 in
     let poison_arg (ty : Type_repr.t) =
       if Type_repr.has_type_param ty then "P:" ^ Seed_mir.print_type ty else Seed_mir.print_type ty
@@ -3400,6 +3738,7 @@ let oracle_of_ctx (ctx : closure_ctx) (stats : mir_stats option) : oracle_counts
           ms_enum_ops = 0;
           ms_closures = 0;
           ms_callable_instances = [];
+          ms_fn_templates = [];
           ms_static_names = [];
         }
   in
@@ -3407,28 +3746,121 @@ let oracle_of_ctx (ctx : closure_ctx) (stats : mir_stats option) : oracle_counts
      every checker-ACCEPTED call node on the persistent typed channel
      (span -> (callable, solved concrete substitution)).  Enum-variant
      constructors are excluded — they lower to EnumCtor aggregates,
-     never to a User callee — and so are the size_of/align_of query
-     sigs (a type-argument special form), so the set is exactly the
-     typed calls that must appear as MIR User callees. *)
+     never to a User callee.  The size_of/align_of query sigs are NOT
+     excluded: pre-mono their calls ARE emitted as User callees (the
+     type-argument special form's instance carries the queried type; the
+     monomorphizer resolves them through the registered-only registry),
+     so excluding them would report every one as a spurious extra-in-MIR
+     instance.  The recorded substitution is chased through the final
+     journal EXACTLY like the lowering's typed channel
+     (final_journal_subst — the same helper typed_nodes_of applies): a
+     call's type args can carry raw infer vars that only the final
+     journal resolves (`var v = Vec::new(); v.push(x)` — the push call's
+     raw Vec[?] becomes Vec[<resolved>] only after the whole item is
+     checked), and the MIR side's User callee instances ARE the chased
+     records.  Comparing the raw records against the chased MIR callees
+     would report every journal-resolved call site as a spurious
+     missing/extra pair (inst{callable#N; [?x]} raw vs
+     inst{callable#N; [T_y]} chased — the same call).
+     THE USER-DISPATCH DOMAIN (re-audit P0 #2, final semantics): the
+     typed set is compared against the MIR User-callee set WITHIN the
+     callable domain the seed actually dispatches as User calls.  The
+     lowering deliberately rewrites whole classes of accepted calls off
+     the User channel — builtin collection/String method calls
+     (Map/Set/Array/Vec/Int/... receiver methods whose declared body is
+     a compiler intrinsic wrapper) dispatch to the host's intrinsic
+     table (Mir_lower's intrinsic channel, keyed on
+     `__intrinsic_<owner>_<method>` registry bindings), and the derived
+     synthetic contracts (Clone::clone/to_string minted per accepted
+     call site when no real impl exists) resolve post-mono through the
+     registered-only registry — so a raw typed-vs-User comparison would
+     report those accepted calls as missing from MIR forever.  The
+     comparison domain is therefore the MIR User-callee callables: every
+     typed accepted instance of a callable the program dispatches as
+     User must appear in the emitted User-callee set (a dropped call or
+     a divergent substitution of a LIVE callable is a real finding), and
+     every emitted User instance must be typed-accepted (no phantom
+     call).  Accepted calls to callables outside the domain (intrinsic
+     host dispatch, derived contracts, static-initializer expressions)
+     are reported by the counts below, never as missing instances. *)
   let env = ctx.ctx_env in
   let excluded_callables =
     List.map (fun (_, ts) -> ts.Typecheck.ts_callable) env.Typecheck.constructors
-    @ List.map (fun (_, ts) -> ts.Typecheck.ts_callable) env.Typecheck.state.query_sigs
   in
   let is_user_callable (c : Ids.Callable_id.t) : bool =
     not (List.exists (fun k -> Ids.Callable_id.compare k c = 0) excluded_callables)
   in
+  let chase = final_journal_subst () in
+  let debug_oracle = Sys.getenv_opt "TANGERINE_DEBUG_ORACLE" <> None in
+  (* the node -> enclosing-item index, built ALWAYS (the fold needs it to
+     exclude the accepted calls whose AST site is NOT lowered as a seed
+     function body: static/const initializers (the seed statics' constant
+     channel carries no Call terminators), struct-field defaults, test and
+     macro bodies); the debug diagnostics reuse the same index *)
+  oracle_typed_entries := [];
+  build_oracle_node_table ctx;
+  (* a call node whose enclosing item is not lowered as a seed function
+     body never emits a Call terminator — its accepted record is
+     out-of-domain by construction.  The walker's display strings mark
+     the non-lowered item kinds with a space-padded tag (`::static `,
+     `::const `, `::field `, `::macro `, `::test `) that no lowered
+     fn/method/impl display can contain (names join with `::` and never
+     carry a space). *)
+  let contains_sub (hay : string) (needle : string) : bool =
+    let ln = String.length hay and lf = String.length needle in
+    if lf = 0 || lf > ln then false
+    else
+      let rec go i = if i + lf > ln then false else if String.sub hay i lf = needle then true else go (i + 1) in
+      go 0
+  in
+  let node_is_lowered_body (key : int) : bool =
+    match !oracle_node_tbl with
+    | Some t -> (
+        match Hashtbl.find_opt t key with
+        | Some d ->
+            not
+              (List.exists
+                 (contains_sub d)
+                 [ "::static "; "::const "; "::field "; "::macro "; "::test " ])
+        | None -> true)
+    | None -> true
+  in
+  (* the User-dispatch callable domain: the callable parts of the MIR's
+     User callee instances *)
+  let mir_domain =
+    List.sort_uniq Int.compare
+      (List.map
+         (fun i -> Ids.Callable_id.to_int (Instance_id.callable i))
+         s.ms_callable_instances)
+  in
+  let in_domain (c : Ids.Callable_id.t) : bool =
+    List.mem (Ids.Callable_id.to_int c) mir_domain
+  in
   let typed_set =
     Hashtbl.fold
-      (fun _ (n : Typecheck.typed_node) acc ->
+      (fun key (n : Typecheck.typed_node) acc ->
         match n.Typecheck.tn_call with
-        | Some (cid, subst) when is_user_callable cid ->
-            Instance_id.make ~callable:cid ~type_args:subst :: acc
+        | Some (cid, subst)
+          when is_user_callable cid
+               && node_is_lowered_body (Ids.Node_id.to_int key) ->
+            let inst = Instance_id.make ~callable:cid ~type_args:(Array.map chase subst) in
+            if debug_oracle then
+              oracle_typed_entries :=
+                (Ids.Node_id.to_int key, inst) :: !oracle_typed_entries;
+            inst :: acc
         | _ -> acc)
       env.Typecheck.typed_nodes []
     |> List.sort_uniq Instance_id.compare
   in
-  oracle_instance_sets := (typed_set, s.ms_callable_instances);
+  oracle_raw_typed_set := typed_set;
+  (* the row's typed side: the accepted instances of User-dispatch
+     callables only (the raw accepted set minus the intrinsic/derived/
+     static-initializer classes the lowering resolves off the User
+     channel) *)
+  let typed_domain_set =
+    List.filter (fun i -> in_domain (Instance_id.callable i)) typed_set
+  in
+  oracle_instance_sets := (typed_domain_set, s.ms_callable_instances);
   (* the statics identity set: the typed REQUIRED static names (the
      declared, non-generic statics of the closure env) vs the MIR
      program's static names *)
@@ -3439,13 +3871,24 @@ let oracle_of_ctx (ctx : closure_ctx) (stats : mir_stats option) : oracle_counts
     |> List.sort_uniq String.compare
   in
   oracle_static_sets := (typed_statics, List.sort_uniq String.compare s.ms_static_names);
-  (* the callable-template identity set: the typed declared callable
-     templates (functions + methods + nested functions, minus the
-     non-body special forms: enum-variant constructors, the size_of/
-     align_of query sigs, and the initial-env compiler constructors
-     like string_new/set_new whose MIR body is the kernel's own decl)
-     vs the MIR program's callable templates (the distinct callable
-     parts of the function instances) *)
+  (* the callable-template identity set (re-audit item 23/24): the
+     typed declared callable templates (functions + methods + nested
+     functions, minus the non-body special forms: enum-variant
+     constructors and the size_of/align_of query sigs) vs the MIR
+     program's callable templates (the distinct callable parts of the
+     LOWERED FUNCTION INSTANCES — the template bodies the seed actually
+     emits; the callee-based set is NOT the template domain, it is the
+     instance row's domain).  THE EMITTED-BODY DOMAIN: the typed side of
+     the identity comparison is restricted to the declared callables the
+     closure actually emits bodies for — the registered-only surface
+     (compiler-builtin fn/method sigs like memcpy/__sync_*,
+     trait-contract sigs like Read::read/Clone::clone, extern-declared
+     names) is registered but has NO closure body to lower, so the
+     declared-but-bodyless callables are reported as telemetry, never as
+     missing templates.  The identity claim: every emitted template
+     body's callable is a declared callable template (extra = 0 — no
+     phantom body), and every declared-with-body template lowers (the
+     in-domain typed templates all appear on the MIR side). *)
   let typed_templates =
     let of_sig (_, ts : string * Typecheck.typed_signature) =
       let is_special =
@@ -3465,13 +3908,34 @@ let oracle_of_ctx (ctx : closure_ctx) (stats : mir_stats option) : oracle_counts
     |> List.sort_uniq Int.compare
   in
   let mir_templates =
-    match stats with
-    | Some st ->
-        List.sort_uniq Int.compare
-          (List.map (fun i -> Ids.Callable_id.to_int (Instance_id.callable i)) st.ms_callable_instances)
-    | None -> []
+    match stats with Some st -> st.ms_fn_templates | None -> []
   in
-  oracle_template_sets := (typed_templates, mir_templates);
+  let template_domain_set =
+    List.filter (fun c -> List.mem c mir_templates) typed_templates
+  in
+  oracle_raw_template_set := typed_templates;
+  oracle_template_sets := (template_domain_set, mir_templates);
+  (* the callable-id -> registered-name table for the oracle's
+     missing/extra diagnostics (TANGERINE_DEBUG_ORACLE) *)
+  let names = Hashtbl.create 16384 in
+  let note (kind : string) (display : string) (ts : Typecheck.typed_signature) =
+    Hashtbl.replace names (Ids.Callable_id.to_int ts.Typecheck.ts_callable)
+      (Printf.sprintf "[%s] %s" kind display)
+  in
+  List.iter (fun (n, ts) -> note "fn" n ts) env.Typecheck.functions;
+  List.iter (fun ((o, m), ts) -> note "method" (o ^ "::" ^ m) ts) env.Typecheck.methods;
+  List.iter (fun (qname, ts, _) -> note "nested" qname ts) env.Typecheck.state.nested_functions;
+  List.iter (fun (n, ts) -> note "query" n ts) env.Typecheck.state.query_sigs;
+  List.iter (fun (n, ts) -> note "ctor" n ts) env.Typecheck.constructors;
+  List.iter (fun (_, ts) -> note "derived" ts.Typecheck.ts_name ts) env.Typecheck.state.derived_sigs;
+  oracle_name_tbl := Some names;
+  if Sys.getenv_opt "TANGERINE_DEBUG_ORACLE" <> None then begin
+    Printf.printf "    ORACLE-DEBUG callable-name table (%d entries)\n"
+      (Hashtbl.length names);
+    Hashtbl.iter
+      (fun c n -> Printf.printf "    ORACLE-DEBUG name callable#%d (%s)\n" c n)
+      names
+  end;
   {
     oc_typed_functions = List.length ctx.ctx_env.Typecheck.functions;
     oc_typed_methods = List.length ctx.ctx_env.Typecheck.methods;
@@ -4029,9 +4493,10 @@ let cmd_bootstrap_check (args : string list) : int =
               Printf.printf "  SEED_MIR_STRUCTURAL_GATE = PASS (%d functions)\n"
                 (Array.length prog.Seed_mir.functions);
               debug_mono_poison_names ctx prog;
-              let stats = count_mir_stats prog in
-              let incomplete = print_oracle_rows (oracle_of_ctx ctx (Some stats)) in
-              Printf.printf "  FRONTEND_SEMANTIC_GATE = PASS\n";
+        let stats = count_mir_stats prog in
+        let incomplete = print_oracle_rows (oracle_of_ctx ctx (Some stats)) in
+        if Sys.getenv_opt "TANGERINE_DEBUG_ORACLE" <> None then debug_dump_mir_calls prog;
+        Printf.printf "  FRONTEND_SEMANTIC_GATE = PASS\n";
               (match resolve_bootstrap_entry prog opts.entry with
                | None ->
                    Printf.printf "  mono: skipped (no entry function in the closure)\n";
