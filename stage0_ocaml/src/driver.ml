@@ -3629,9 +3629,423 @@ let debug_mono_poison_names (ctx : closure_ctx) (prog : Seed_mir.program) : unit
                             Seed_mir.print_type p.Type_repr.pt_type)
                           ts.Typecheck.ts_params)))
                  (Seed_mir.print_type ts.Typecheck.ts_return)
-           | None -> ());
+            | None -> ());
     flush stdout
   end
+
+(* ── Post-mono body-less User-callee audit (env-gated debug) ───────
+   The mono'd program's User calls whose callee instance has NO emitted
+   body are the "kept body-less" surface (registered-only callables —
+   extern-declared names, compiler-builtin methods, derived
+   clone/to_string sigs, size_of/align_of type queries).  The mono gate
+   accepts them (their sigs resolve through the query-sig registry), but
+   the VM has no dispatch for a User callee without a function.  This
+   dump names every such call site (caller, block, callee instance, the
+   callable's registered name/sig, and whether the name exists in the
+   intrinsic/extern registries — the host-channel rewrite candidates). *)
+let debug_missing_user_callees (ctx : closure_ctx) (prog : Seed_mir.program) : unit =
+  if Sys.getenv_opt "TANGERINE_DEBUG_MISSING_USER" = None then ()
+  else begin
+    let env = ctx.ctx_env in
+    let names = Hashtbl.create 16384 in
+    let sig_names = Hashtbl.create 16384 in
+    let note (kind : string) (display : string) (ts : Typecheck.typed_signature) =
+      let c = Ids.Callable_id.to_int ts.Typecheck.ts_callable in
+      Hashtbl.replace names c (Printf.sprintf "[%s] %s" kind display);
+      Hashtbl.replace sig_names c ts
+    in
+    List.iter (fun (n, ts) -> note "fn" n ts) env.Typecheck.functions;
+    List.iter
+      (fun ((o, m), ts) -> note "method" (o ^ "::" ^ m) ts)
+      env.Typecheck.methods;
+    List.iter
+      (fun (qname, ts, _) -> note "nested" qname ts)
+      env.Typecheck.state.nested_functions;
+    List.iter (fun (n, ts) -> note "query" n ts) env.Typecheck.state.query_sigs;
+    List.iter (fun (_, ts) -> note "derived" ts.Typecheck.ts_name ts)
+      env.Typecheck.state.derived_sigs;
+    let emitted = Hashtbl.create 65536 in
+    Array.iter
+      (fun (f : Seed_mir.function_) ->
+        Hashtbl.replace emitted (Instance_id.callable f.Seed_mir.instance) ())
+      prog.Seed_mir.functions;
+    let found = ref 0 in
+    Array.iter
+      (fun (f : Seed_mir.function_) ->
+        Array.iteri
+          (fun (_b : int) (blk : Seed_mir.block) ->
+            match blk.Seed_mir.terminator with
+            | Seed_mir.Call (_, Seed_mir.User inst, _, _, _) ->
+                if not (Hashtbl.mem emitted (Instance_id.callable inst)) then begin
+                  incr found;
+                  let c = Ids.Callable_id.to_int (Instance_id.callable inst) in
+                  let nm =
+                    match Hashtbl.find_opt names c with
+                    | Some s -> s
+                    | None -> "UNREGISTERED-in-checker-tables"
+                  in
+                  Printf.printf
+                    "  missing-user %s bb%d -> inst{callable#%d; [%s]}  %s\n"
+                    f.Seed_mir.name blk.Seed_mir.id c
+                    (String.concat "; "
+                       (Array.to_list
+                          (Array.map
+                             (fun t ->
+                               if Type_repr.has_type_param t then
+                                 "P:" ^ Seed_mir.print_type t
+                               else Seed_mir.print_type t)
+                             (Instance_id.type_args inst))))
+                    nm;
+                  (match Hashtbl.find_opt sig_names c with
+                   | Some ts ->
+                       Printf.printf "      sig params=%s ret=%s\n"
+                         (String.concat ", "
+                            (Array.to_list
+                               (Array.map
+                                  (fun (p : Type_repr.param_type) ->
+                                    Seed_mir.print_type p.Type_repr.pt_type)
+                                  ts.Typecheck.ts_params)))
+                         (Seed_mir.print_type ts.Typecheck.ts_return)
+                   | None -> ())
+                end
+            | _ -> ())
+          f.Seed_mir.blocks)
+      prog.Seed_mir.functions;
+    Printf.printf "  missing-user total %d body-less User call(s) with no emitted function\n" !found;
+    flush stdout
+  end
+
+(* ── Post-mono host-channel normalization (audit §70 re-audit) ──────
+   The mono keeps concrete calls to REGISTERED-ONLY callables (typed
+   sigs, no lowered body — extern-declared names, compiler-builtin
+   methods) in the output as `User` callees with no emitted function.
+   The VM has no dispatch for a User callee without a function: every
+   mono'd program that passes the structural gate and then DYNAMICALLY
+   reaches such a call traps ("call to unknown instance").  The seed's
+   executable channel for the host surface is the Intrinsic/Extern
+   callee form (Vm.call_host), so this pass rewrites the body-less User
+   calls onto the host channel when the callable's REGISTERED NAME
+   resolves in the intrinsic/extern registries — the same name-based
+   resolution the lowering's intrinsic channel uses.  A body-less
+   callable whose name resolves NOWHERE stays User (fail closed: the VM
+   traps deterministically if it is ever reached — no host semantic
+   exists for it).  In-table User calls whose function's name is itself
+   an intrinsic-registry symbol (the kernel's io print/println surface —
+   real bodies whose execution needs raw-pointer syscalls the seed host
+   cannot provide; the registry binding IS the seed semantics) are
+   normalized to the intrinsic channel the same way, under the same
+   exact-transcription guard (the registered callable's signature must
+   be byte-identical to the registry's declaration).  Runs
+   post-materialization, PRE-concrete-verify: the structural gate then
+   verifies the exact program the VM executes. *)
+
+type reg_callable_kind = RC_fn of string | RC_method of string * string
+
+let reg_callable_name_of_env (env : Typecheck.env) :
+    Ids.Callable_id.t -> reg_callable_kind option =
+  let tbl = Hashtbl.create 65536 in
+  List.iter
+    (fun (n, ts) ->
+      Hashtbl.replace tbl (Ids.Callable_id.to_int ts.Typecheck.ts_callable) (RC_fn n))
+    env.Typecheck.functions;
+  List.iter
+    (fun ((o, m), ts) ->
+      Hashtbl.replace tbl
+        (Ids.Callable_id.to_int ts.Typecheck.ts_callable)
+        (RC_method (o, m)))
+    env.Typecheck.methods;
+  List.iter
+    (fun (qname, ts, _) ->
+      Hashtbl.replace tbl
+        (Ids.Callable_id.to_int ts.Typecheck.ts_callable)
+        (RC_fn qname))
+    env.Typecheck.state.nested_functions;
+  List.iter
+    (fun (n, ts) ->
+      Hashtbl.replace tbl (Ids.Callable_id.to_int ts.Typecheck.ts_callable) (RC_fn n))
+    env.Typecheck.state.query_sigs;
+  List.iter
+    (fun (_, ts) ->
+      Hashtbl.replace tbl
+        (Ids.Callable_id.to_int ts.Typecheck.ts_callable)
+        (RC_fn ts.Typecheck.ts_name))
+    env.Typecheck.state.derived_sigs;
+  fun c -> Hashtbl.find_opt tbl (Ids.Callable_id.to_int c)
+
+(* The checker's registered signature per callable (params, return) —
+   the declaration surface the mono'd User calls were verified against;
+   the host-channel rewrite's exact-transcription gate compares the
+   registry declarations against it. *)
+let reg_callable_sig_of_env (env : Typecheck.env) :
+    Ids.Callable_id.t -> (Type_repr.param_type array * Type_repr.t) option =
+  let tbl = Hashtbl.create 65536 in
+  let add (ts : Typecheck.typed_signature) =
+    Hashtbl.replace tbl (Ids.Callable_id.to_int ts.Typecheck.ts_callable)
+      (ts.Typecheck.ts_params, ts.Typecheck.ts_return)
+  in
+  List.iter (fun (_, ts) -> add ts) env.Typecheck.functions;
+  List.iter (fun (_, ts) -> add ts) env.Typecheck.methods;
+  List.iter (fun (_, ts, _) -> add ts) env.Typecheck.state.nested_functions;
+  List.iter (fun (_, ts) -> add ts) env.Typecheck.state.query_sigs;
+  List.iter (fun (_, ts) -> add ts) env.Typecheck.state.derived_sigs;
+  fun c -> Hashtbl.find_opt tbl (Ids.Callable_id.to_int c)
+
+let bare_reg_name (name : string) : string =
+  (* the checker's function keys are module-qualified ("std::args::fn");
+     the registry keys are the bare source names ("fn") *)
+  match String.rindex_opt name ':' with
+  | Some i when i > 0 && name.[i - 1] = ':' && i + 1 < String.length name ->
+      String.sub name (i + 1) (String.length name - i - 1)
+  | _ -> name
+
+(* the checker's candidate-owner alias convention (the same list the
+   lowering's qualified-call channel uses): a builtin method registered
+   under one owner name dispatches through any alias owner's intrinsic
+   binding *)
+let candidate_owners (qual : string) : string list =
+  match qual with
+  | "Vec" -> [ "Vec"; "Array" ]
+  | "Array" -> [ "Array"; "Vec" ]
+  | "String" -> [ "String"; "str" ]
+  | "str" -> [ "str"; "String" ]
+  | "Set" -> [ "Set"; "HashSet" ]
+  | "HashSet" -> [ "HashSet"; "Set" ]
+  | "Map" -> [ "Map"; "HashMap" ]
+  | "HashMap" -> [ "HashMap"; "Map" ]
+  | q -> [ q ]
+
+(* ── The host-channel normalization pass ────────────────────────────
+
+   The rewrite to the Intrinsic/Extern channel is type-preserving ONLY
+   when the registry's declared signature is EXACTLY the checker's
+   registered signature for the callable (the same transcription; the
+   concrete verifier checks Intrinsic/Extern callees against the
+   registry sigs, while the mono'd User calls were checked against the
+   checker sigs — a drift would fail the post-mono gate on a rewrite
+   that previously passed).  Every rewrite is therefore gated on exact
+   per-parameter type+convention and return equality between the two
+   declarations; a drifted or unregistered name stays User (fail closed
+   at the VM exactly like today). *)
+let host_channel_normalize
+    ?(reg_name : Ids.Callable_id.t -> reg_callable_kind option = fun _ -> None)
+    ?(reg_sig : Ids.Callable_id.t -> (Type_repr.param_type array * Type_repr.t) option =
+       fun _ -> None)
+    (prog : Seed_mir.program) : Seed_mir.program * int * int =
+  let emitted_callable = Hashtbl.create 65536 in
+  Array.iter
+    (fun (f : Seed_mir.function_) ->
+      Hashtbl.replace emitted_callable
+        (Ids.Callable_id.to_int (Instance_id.callable f.Seed_mir.instance))
+        ())
+    prog.Seed_mir.functions;
+  let rewritten = ref 0 in
+  let leftover = ref 0 in
+  let debug = Sys.getenv_opt "TANGERINE_DEBUG_HOST_CHANNEL" <> None in
+  let rewrite_callee (f : Seed_mir.function_) (inst : Instance_id.t)
+      (args : Seed_mir.call_arg array) : Seed_mir.callee =
+    let callable = Instance_id.callable inst in
+    let nargs = Array.length args in
+    let bodyless = not (Hashtbl.mem emitted_callable (Ids.Callable_id.to_int callable)) in
+    (* the checker's registered signature for the callable (params, ret)
+       — the sig the mono'd User call was verified against *)
+    let checker_sig =
+      match reg_sig callable with Some s -> Some s | None -> None
+    in
+    (* exact transcription check: registry declaration == checker
+       declaration (types AND conventions, so the verifier's effect and
+       type checks on the rewritten call reproduce the query-sig checks
+       exactly).  The type comparison is the registry-aware
+       alpha-equivalence: the registry signatures live in the registry's
+       OWN placeholder TypeId domain (mir_verify maps option/vec/map/set
+       onto the checker's LangItem ids array=0/map=1/set=2/option=3),
+       while the checker's registered signatures carry the checker-minted
+       nominal ids AND per-registration generic binder ids — so a raw
+       Type_repr.compare can never agree on a generic signature (every
+       map/set/array intrinsic would drift and stay fail-closed User
+       forever).  The rewrite is therefore gated on the SAME
+       compatibility the post-mono concrete verifier will apply to the
+       rewritten Intrinsic call (registry domain remapped to the checker
+       domain, generic binder positions alpha-equivalent), with arity and
+       per-parameter conventions still compared exactly.  A drifted
+       registry declaration fails the alpha check and keeps the call
+       User (fail closed), exactly as before. *)
+    let rec alpha_compatible (a : Type_repr.t) (b : Type_repr.t) : bool =
+      match a, b with
+      | Type_repr.Type_param _, Type_repr.Type_param _ -> true
+      | Type_repr.Named (_, a1), Type_repr.Named (_, b1) ->
+          Array.length a1 = Array.length b1
+          && Array.for_all2 alpha_compatible a1 b1
+      | Type_repr.Fixed_array (e1, n1), Type_repr.Fixed_array (e2, n2) ->
+          n1 = n2 && alpha_compatible e1 e2
+      | Type_repr.Tuple a1, Type_repr.Tuple a2 ->
+          Array.length a1 = Array.length a2
+          && Array.for_all2 alpha_compatible a1 a2
+      | Type_repr.Function (p1, r1), Type_repr.Function (p2, r2) ->
+          Array.length p1 = Array.length p2
+          && Array.for_all2
+               (fun x y ->
+                 x.Type_repr.pt_convention = y.Type_repr.pt_convention
+                 && alpha_compatible x.Type_repr.pt_type y.Type_repr.pt_type)
+               p1 p2
+          && alpha_compatible r1 r2
+      | a, b -> Type_repr.compare a b = 0
+    in
+    (* the pointer/ref-bearing signatures keep the STRICT comparison:
+       their seed semantics are not implementable on the value-model
+       host (no refs into hash-table storage), so a rewrite must never
+       be invented for them by the alpha relaxation — a strict-compare
+       drift keeps them User (fail closed), exactly as before *)
+    let rec has_ref_kind (t : Type_repr.t) : bool =
+      match t with
+      | Type_repr.Ref_internal _ | Type_repr.Raw_ptr _ -> true
+      | Type_repr.Named (_, args) -> Array.exists has_ref_kind args
+      | Type_repr.Fixed_array (e, _) -> has_ref_kind e
+      | Type_repr.Tuple elems -> Array.exists has_ref_kind elems
+      | Type_repr.Function (p, r) ->
+          Array.exists
+            (fun (p : Type_repr.param_type) -> has_ref_kind p.Type_repr.pt_type)
+            p
+          || has_ref_kind r
+      | _ -> false
+    in
+    let registry_exact (_name : string) (params : Type_repr.param_type array)
+        (ret : Type_repr.t) : bool =
+      match checker_sig with
+      | None -> false
+      | Some (chk_params, chk_ret) ->
+          Array.length params = nargs
+          && Array.length params = Array.length chk_params
+          && Array.for_all2
+               (fun a b ->
+                 a.Type_repr.pt_convention = b.Type_repr.pt_convention
+                 &&
+                 let reg_ty = Mir_verify.registry_type_to_checker a.Type_repr.pt_type in
+                 if has_ref_kind reg_ty || has_ref_kind b.Type_repr.pt_type then
+                   Type_repr.compare reg_ty b.Type_repr.pt_type = 0
+                 else alpha_compatible reg_ty b.Type_repr.pt_type)
+               params chk_params
+          &&
+          let reg_ret = Mir_verify.registry_type_to_checker ret in
+          if has_ref_kind reg_ret || has_ref_kind chk_ret then
+            Type_repr.compare reg_ret chk_ret = 0
+          else alpha_compatible reg_ret chk_ret
+    in
+    let use_intrinsic (iid : Intrinsic_registry.Id.t) (name : string) : Seed_mir.callee =
+      let sig_ = snd (Option.get (Intrinsic_registry.lookup Intrinsic_registry.manifest ~name)) in
+      if registry_exact name sig_.Intrinsic_registry.params sig_.Intrinsic_registry.ret then begin
+        incr rewritten;
+        if debug then
+          Printf.printf "  host-channel %s: %s (%s) -> Intrinsic %s\n" f.Seed_mir.name
+            (Seed_mir.print_instance inst) (if bodyless then "bodyless" else "in-table")
+            name;
+        Seed_mir.Intrinsic (Intrinsic_registry.Id.to_int iid)
+      end
+      else begin
+        if bodyless then incr leftover;
+        if debug then
+          Printf.printf "  host-channel %s: %s intrinsic %s sig drift/arity — kept User\n"
+            f.Seed_mir.name (Seed_mir.print_instance inst) name;
+        Seed_mir.User inst
+      end
+    in
+    let use_extern (eid : Extern_registry.Id.t) (name : string) : Seed_mir.callee =
+      let sig_ = snd (Option.get (Extern_registry.lookup Extern_registry.manifest ~name)) in
+      if registry_exact name sig_.Intrinsic_registry.params sig_.Intrinsic_registry.ret then begin
+        incr rewritten;
+        if debug then
+          Printf.printf "  host-channel %s: %s (bodyless) -> Extern %s\n" f.Seed_mir.name
+            (Seed_mir.print_instance inst) name;
+        Seed_mir.Extern (Extern_registry.Id.to_int eid)
+      end
+      else begin
+        if bodyless then incr leftover;
+        if debug then
+          Printf.printf "  host-channel %s: %s extern %s sig drift/arity — kept User\n"
+            f.Seed_mir.name (Seed_mir.print_instance inst) name;
+        Seed_mir.User inst
+      end
+    in
+    match reg_name callable with
+    | None ->
+        if debug then
+          Printf.printf "  host-channel %s: %s UNREGISTERED callable#%d\n" f.Seed_mir.name
+            (Seed_mir.print_instance inst) (Ids.Callable_id.to_int callable);
+        if bodyless then incr leftover;
+        Seed_mir.User inst
+    | Some (RC_fn qn) ->
+        let bare = bare_reg_name qn in
+        let names = if bare = qn then [ bare ] else [ bare; qn ] in
+        let rec via_intrinsic = function
+          | [] -> (
+              let rec via_extern = function
+                | [] ->
+                    if debug then
+                      Printf.printf "  host-channel %s: %s no registry hit for %s\n"
+                        f.Seed_mir.name (Seed_mir.print_instance inst)
+                        (String.concat ", " names);
+                    if bodyless then incr leftover;
+                    Seed_mir.User inst
+                | n :: rest -> (
+                    match Extern_registry.lookup Extern_registry.manifest ~name:n with
+                    | Some (eid, _) -> use_extern eid n
+                    | None -> via_extern rest)
+              in
+              via_extern names)
+          | n :: rest -> (
+              match Intrinsic_registry.lookup Intrinsic_registry.manifest ~name:n with
+              | Some (iid, _) -> use_intrinsic iid n
+              | None -> via_intrinsic rest)
+        in
+        if bodyless then via_intrinsic names
+        else
+          (* in-table: normalize only when the function's own name IS an
+             intrinsic-registry symbol (the io print surface whose real
+             body the seed host cannot execute — the registry binding is
+             the seed semantics) *)
+          (match Intrinsic_registry.lookup Intrinsic_registry.manifest ~name:bare with
+           | Some (iid, _) -> use_intrinsic iid bare
+           | None -> Seed_mir.User inst)
+    | Some (RC_method (owner, mname)) ->
+        if not bodyless then Seed_mir.User inst
+        else begin
+          let rec find_intrinsic = function
+            | [] ->
+                incr leftover;
+                Seed_mir.User inst
+            | o :: rest -> (
+                let iname = "__intrinsic_" ^ String.lowercase_ascii (o ^ "_" ^ mname) in
+                match Intrinsic_registry.lookup Intrinsic_registry.manifest ~name:iname with
+                | Some (iid, _) -> use_intrinsic iid iname
+                | None -> find_intrinsic rest)
+          in
+          find_intrinsic (candidate_owners owner)
+        end
+  in
+  let functions =
+    Array.map
+      (fun (f : Seed_mir.function_) ->
+        let blocks =
+          Array.map
+            (fun (b : Seed_mir.block) ->
+              match b.Seed_mir.terminator with
+              | Seed_mir.Call (dest, Seed_mir.User inst, args, next, unwind) ->
+                  {
+                    b with
+                    Seed_mir.terminator =
+                      Seed_mir.Call
+                        ( dest,
+                          rewrite_callee f inst args,
+                          args,
+                          next,
+                          unwind );
+                  }
+              | _ -> b)
+            f.Seed_mir.blocks
+        in
+        { f with Seed_mir.blocks })
+      prog.Seed_mir.functions
+  in
+  ({ prog with Seed_mir.functions }, !rewritten, !leftover)
 
 (* Mono the lowered closure from the bootstrap entry; report pre/post
    function and instance counts; require zero residual Type_param and a
@@ -3648,6 +4062,9 @@ let run_mono_phase ~(entry_name : string) ~(entry : Instance_id.t)
     ?(generic_types : Mono.generic_def array = [||])
     ?(box_tid : Ids.Type_id.t option = None)
     ?(query_sigs : Mir_verify.query_sig list = [])
+    ?(reg_name : Ids.Callable_id.t -> reg_callable_kind option = fun _ -> None)
+    ?(reg_sig : Ids.Callable_id.t -> (Type_repr.param_type array * Type_repr.t) option =
+      fun _ -> None)
     (prog : Seed_mir.program) : (mono_outcome, string list) result =
   Printf.printf "  mono: entry '%s' (%s)\n" entry_name (Seed_mir.print_instance entry);
   let type_instances = ref [] in
@@ -3680,7 +4097,20 @@ let run_mono_phase ~(entry_name : string) ~(entry : Instance_id.t)
            Printf.printf "  mono: TYPE MATERIALIZATION FAILED\n";
            List.iter (fun e -> Printf.printf "    %s\n" e) errs;
            Error errs
-       | Ok (final_prog, mat_map) ->
+        | Ok (final_prog0, mat_map) ->
+           (* re-audit §70: the host-channel normalization — the mono'd
+              output's body-less User callees (registered-only
+              callables with typed sigs but no lowered body) have no
+              VM dispatch; rewrite them onto the Intrinsic/Extern
+              channel when their registered name resolves in the
+              registries, so the concrete verification below checks
+              the EXACT program the VM will run. *)
+           let final_prog, n_rewritten, n_leftover =
+             host_channel_normalize ~reg_name ~reg_sig final_prog0
+           in
+           Printf.printf
+             "  mono: host-channel normalization: rewrote %d body-less User call(s) to Intrinsic/Extern; %d remain User (no host binding, fail-closed at the VM)\n"
+             n_rewritten n_leftover;
            let n_type_instances =
              Array.length final_prog.Seed_mir.types - Array.length prog.Seed_mir.types
            in
@@ -4293,6 +4723,8 @@ let run_bootstrap_closure ~(repo_root : string) ~(manifest_path : string)
                 ~box_tid:(ctx.ctx_env.Typecheck.state.box_tid)
                 ~generic_types:(closure_generic_types ctx.ctx_env)
                 ~query_sigs:(closure_query_sigs ~lowered:(Some prog) ctx.ctx_env)
+                ~reg_name:(reg_callable_name_of_env ctx.ctx_env)
+                ~reg_sig:(reg_callable_sig_of_env ctx.ctx_env)
                 prog
             with
             | Error _ ->
@@ -4309,6 +4741,7 @@ let run_bootstrap_closure ~(repo_root : string) ~(manifest_path : string)
                     bs_oracle_incomplete = oracle_incomplete;
                   }
             | Ok mo ->
+                debug_missing_user_callees ctx mo.mo_program;
                 if mo.mo_residual_type_params > 0 || oracle_incomplete then
                   Ok
                     {
@@ -4578,6 +5011,8 @@ let cmd_bootstrap_check (args : string list) : int =
                        ~box_tid:(ctx.ctx_env.Typecheck.state.box_tid)
                        ~generic_types:(closure_generic_types ctx.ctx_env)
                        ~query_sigs:mono_query_sigs
+                       ~reg_name:(reg_callable_name_of_env ctx.ctx_env)
+                       ~reg_sig:(reg_callable_sig_of_env ctx.ctx_env)
                        prog
                    with
                    | Error _ ->
@@ -4586,11 +5021,12 @@ let cmd_bootstrap_check (args : string list) : int =
                        Printf.printf "  BOOTSTRAP_EXECUTABLE_CLOSURE = INCOMPLETE\n";
                        Printf.printf "  RESULT = WIP\n";
                        1
-                   | Ok mo ->
-                       (* audit P0 fix: the post-mono concrete verification
-                          is a recorded fact (same check tg_evidence runs);
-                          it does not change the gate's verdicts *)
-                       let concrete_ok =
+                    | Ok mo ->
+                        debug_missing_user_callees ctx mo.mo_program;
+                        (* audit P0 fix: the post-mono concrete verification
+                           is a recorded fact (same check tg_evidence runs);
+                           it does not change the gate's verdicts *)
+                        let concrete_ok =
                          match
                            Mir_verify.require_valid_concrete
                              ~box_tid:(ctx.ctx_env.Typecheck.state.box_tid)
@@ -4769,14 +5205,17 @@ let cmd_compile (args : string list) : int =
                       ~box_tid:(ctx.ctx_env.Typecheck.state.box_tid)
                       ~generic_types:(closure_generic_types ctx.ctx_env)
                       ~query_sigs:(closure_query_sigs ~lowered:(Some prog) ctx.ctx_env)
+                      ~reg_name:(reg_callable_name_of_env ctx.ctx_env)
+                      ~reg_sig:(reg_callable_sig_of_env ctx.ctx_env)
                       prog
                   with
                   | Error _ ->
                       Printf.printf "compile: FAILED — mono phase\n";
                       Printf.printf "  RESULT: FAIL\n";
                       1
-                  | Ok mo ->
-                      if mo.mo_residual_type_params > 0 then begin
+                   | Ok mo ->
+                       debug_missing_user_callees ctx mo.mo_program;
+                       if mo.mo_residual_type_params > 0 then begin
                         Printf.printf "compile: FAILED — %d residual Type_param after mono\n"
                           mo.mo_residual_type_params;
                         Printf.printf "  RESULT: FAIL\n";

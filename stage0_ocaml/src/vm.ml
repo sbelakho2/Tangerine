@@ -126,7 +126,13 @@ let step_limit (vm : t) : unit =
 let err_trap vm msg =
   let where =
     match vm.frames with
-    | f :: _ -> Printf.sprintf " (fn %d bb%d stmt %d)" f.fn f.block f.stmt
+    | f :: _ ->
+        let caller =
+          if f.fn >= 0 && f.fn < Array.length vm.program.Seed_mir.functions then
+            vm.program.Seed_mir.functions.(f.fn).Seed_mir.name
+          else "?"
+        in
+        Printf.sprintf " (in %s: fn %d bb%d stmt %d)" caller f.fn f.block f.stmt
     | [] -> " (entry frame)"
   in
   raise (Failure ("vm trap: " ^ msg ^ where))
@@ -982,7 +988,15 @@ let rec exec_terminator (vm : t) (frame : frame) (term : Seed_mir.terminator) : 
            let fn_idx =
              match find_fn vm inst with
              | Some idx -> idx
-             | None -> err_trap vm "call to unknown instance"
+             | None ->
+                 let caller_name =
+                   if frame.fn >= 0 && frame.fn < Array.length vm.program.Seed_mir.functions
+                   then vm.program.Seed_mir.functions.(frame.fn).Seed_mir.name
+                   else "?"
+                 in
+                 err_trap vm
+                   (Printf.sprintf "call to unknown instance %s (in %s)"
+                      (Seed_mir.print_instance inst) caller_name)
            in
            vm.frames <- frame :: vm.frames;
            if List.length vm.frames > vm.limits.max_depth then
@@ -1152,6 +1166,9 @@ and call_host (vm : t) (callee : Seed_mir.callee) (args : Vm_value.t array) : Ho
 
 and run_frame (vm : t) (frame : frame) : unit =
   let fn = vm.program.Seed_mir.functions.(frame.fn) in
+  let fn_tag () =
+    Printf.sprintf "%s(inst %s)" fn.Seed_mir.name (Seed_mir.print_instance fn.Seed_mir.instance)
+  in
   let rec go () =
     let block = fn.Seed_mir.blocks.(frame.block) in
     if frame.stmt < List.length block.Seed_mir.statements then begin
@@ -1163,8 +1180,8 @@ and run_frame (vm : t) (frame : frame) : unit =
        with Failure msg ->
          raise
            (Failure
-              (Printf.sprintf "%s [fn %d bb%d id=%d stmts=%d]"
-                 msg frame.fn frame.block
+              (Printf.sprintf "%s [fn %d %s bb%d id=%d stmts=%d]"
+                 msg frame.fn (fn_tag ()) frame.block
                  (if frame.block < Array.length fn.Seed_mir.blocks then fn.Seed_mir.blocks.(frame.block).Seed_mir.id else -1)
                  (if frame.block < Array.length fn.Seed_mir.blocks then List.length fn.Seed_mir.blocks.(frame.block).Seed_mir.statements else -1))))
     end
@@ -1173,7 +1190,10 @@ and run_frame (vm : t) (frame : frame) : unit =
          exec_terminator vm frame block.Seed_mir.terminator;
          go ()
        with Failure msg ->
-         raise (Failure (Printf.sprintf "%s [fn %d bb%d term]" msg frame.fn frame.block)))
+         raise
+           (Failure
+              (Printf.sprintf "%s [fn %d %s bb%d term]" msg frame.fn (fn_tag ())
+                 frame.block)))
   in
   go ()
 
@@ -1295,7 +1315,16 @@ let entry_frame_of ~(program : Seed_mir.program) ~(entry : Instance_id.t) ~(argv
              block = fn.Seed_mir.entry;
              stmt = 0 }
          in
-         Array.iteri (fun i s -> entry_frame.locals.(i) <- Vm_value.Live (Vm_value.String s)) argv;
+         (* The legacy argv-in-locals handoff fills the entry frame's
+            EXISTING local slots only — a small entry function (fewer
+            locals than argv entries) must not index out of bounds (the
+            kernel reads its argv through the host's argv externs
+            tg_get_argc/_tg_arg_copy, never through these slots). *)
+         Array.iteri
+           (fun i s ->
+             if i < Array.length entry_frame.locals then
+               entry_frame.locals.(i) <- Vm_value.Live (Vm_value.String s))
+           argv;
          Ok (vm, entry_frame)
        with
       | Failure msg -> Error msg)

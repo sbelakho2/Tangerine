@@ -284,6 +284,67 @@ let manifest : t =
           ~ret:ty_unit );
       ( "__intrinsic_set_entries",
         sig_ ~params:[| set_of (param Type_param.t) |] ~ret:(vec_of (param Type_param.t)) );
+      (* The Vec/Array host surface (std/collections.tg + std/core.tg's
+         extern declarations — the growable-array family).  The runtime
+         form is the checker's Array nominal (Vec/Array/List are name
+         aliases of the same nominal), so the declared signatures use the
+         `vec` placeholder, which the verifier maps onto the checker's
+         Array id (mir_verify.registry_type_to_checker).  The pop/get
+         VALUE ABIs and the inout mutation conventions transcribe the
+         extern declarations exactly (pop -> Option[T] via the runtime
+         empty/Some contract; get is the CHECKED value read — the std
+         OOB policy is a panic, which the host binding enforces as a
+         deterministic trap). *)
+      ( "__intrinsic_array_new",
+        sig_ ~params:[||] ~ret:(vec_of (param Type_param.t)) );
+      ( "__intrinsic_array_with_capacity",
+        sig_ ~params:[| ty_int |] ~ret:(vec_of (param Type_param.t)) );
+      ( "__intrinsic_array_len",
+        sig_ ~params:[| vec_of (param Type_param.t) |] ~ret:ty_int );
+      ( "__intrinsic_array_capacity",
+        sig_ ~params:[| vec_of (param Type_param.t) |] ~ret:ty_int );
+      ( "__intrinsic_array_push",
+        sig_conv
+          ~params:
+            [| (Access_effect.Inout, vec_of (param Type_param.t));
+               (Access_effect.Sink, param Type_param.t) |]
+          ~ret:ty_unit );
+      ( "__intrinsic_array_pop",
+        sig_conv
+          ~params:[| (Access_effect.Inout, vec_of (param Type_param.t)) |]
+          ~ret:(option_of (param Type_param.t)) );
+      ( "__intrinsic_array_get",
+        sig_
+          ~params:[| vec_of (param Type_param.t); ty_int |]
+          ~ret:(param Type_param.t) );
+      ( "__intrinsic_array_set",
+        sig_conv
+          ~params:
+            [| (Access_effect.Inout, vec_of (param Type_param.t));
+               (Access_effect.Let, ty_int);
+               (Access_effect.Sink, param Type_param.t) |]
+          ~ret:ty_unit );
+      ( "__intrinsic_array_remove",
+        sig_conv
+          ~params:
+            [| (Access_effect.Inout, vec_of (param Type_param.t));
+               (Access_effect.Let, ty_int) |]
+          ~ret:(param Type_param.t) );
+      ( "__intrinsic_array_insert",
+        sig_conv
+          ~params:
+            [| (Access_effect.Inout, vec_of (param Type_param.t));
+               (Access_effect.Let, ty_int);
+               (Access_effect.Sink, param Type_param.t) |]
+          ~ret:ty_unit );
+      ( "__intrinsic_array_clear",
+        sig_conv
+          ~params:[| (Access_effect.Inout, vec_of (param Type_param.t)) |]
+          ~ret:ty_unit );
+      ( "__intrinsic_array_contains",
+        sig_
+          ~params:[| vec_of (param Type_param.t); param Type_param.t |]
+          ~ret:ty_bool );
       (* I/O and conversion surface with real host semantics; the host
          binding table (Host.binding_manifest) implements every one of
          these. panic/abort raise a deterministic host error. *)

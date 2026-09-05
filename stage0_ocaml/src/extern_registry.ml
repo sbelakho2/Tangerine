@@ -43,6 +43,7 @@ let manifest : t =
   let ty_u8 = Intrinsic_registry.ty_u8 in
   let ty_i32 = Intrinsic_registry.ty_i32 in
   let ty_float = Intrinsic_registry.ty_float in
+  let ty_string = Intrinsic_registry.ty_string in
   let ptr = Intrinsic_registry.ptr in
   let ptr_u8 = Intrinsic_registry.ptr_u8 in
   let ruby_value = Intrinsic_registry.ruby_value in
@@ -125,6 +126,12 @@ let manifest : t =
       (* std/ffi.tg — shared refcount primitives. *)
       e "__sync_fetch_and_add" [| ptr ty_uint; ty_uint |] ty_uint;
       e "__sync_fetch_and_sub" [| ptr ty_uint; ty_uint |] ty_uint;
+      (* std/args.tg — the kernel argv channel.  The seed host hands the
+         mono'd kernel its argv (Host.argv — the same array Vm.run
+         receives); the kernel's argc/argv externs read it through this
+         declared surface. *)
+      e "tg_get_argc" [||] ty_int;
+      e "_tg_arg_copy" [| ty_int |] ty_string;
     ]
   in
   let tbl = ref empty in

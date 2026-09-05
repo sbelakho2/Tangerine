@@ -379,6 +379,28 @@ let binding_manifest : binding list =
            | [| Vm_value.Set elems |] ->
                Ok (Vm_value.Array (Array.of_list elems))
            | _ -> arg_mismatch "(Set)"));
+    intrinsic_binding "__intrinsic_set_drain_one"
+      (adapter_raw_wb [ Type_repr.Unit ] Type_repr.Unit (fun _ args ->
+           (* the drain contract: extract an arbitrary element as an
+              owned Option[T] and shrink the set through the writeback
+              channel (the seed set is unordered, so the head is the
+              deterministic pick) *)
+           match args with
+           | [| Vm_value.Set elems |] -> (
+               match elems with
+               | [] -> Ok { value = Vm_value.Enum (1, [||]);
+                            writebacks = [ (0, Vm_value.Set []) ] }
+               | x :: rest ->
+                   Ok { value = Vm_value.Enum (0, [| x |]);
+                        writebacks = [ (0, Vm_value.Set rest) ] })
+           | _ -> Error "argument mismatch: expected (Set)"));
+    intrinsic_binding "__intrinsic_set_clear"
+      (adapter_raw_wb [ Type_repr.Unit ] Type_repr.Unit (fun _ args ->
+           match args with
+           | [| Vm_value.Set _ |] ->
+               Ok { value = Vm_value.Unit;
+                    writebacks = [ (0, Vm_value.Set []) ] }
+           | _ -> Error "argument mismatch: expected (Set)"));
     intrinsic_binding "__intrinsic_map_contains_key"
       (adapter_raw [ Type_repr.Unit; Type_repr.Unit ] Type_repr.Bool (fun _ args ->
            match args with
@@ -438,6 +460,164 @@ let binding_manifest : binding list =
                     (Array.of_list
                        (List.map (fun (k, v) -> Vm_value.Tuple [| k; v |]) pairs)))
            | _ -> arg_mismatch "(Map)"));
+    (* ── The Vec/Array host surface (the growable-array family) ──────
+       The seed's runtime Vec/Array form is Vm_value.Array (the
+       element tree).  Growth is implicit: a push extends the OCaml
+       array and the mutation travels through the writeback channel
+       (the same inout convention the Set/Map adapters use), so
+       len == capacity always holds — the capacity queries only feed
+       the kernel's geometric-growth decisions, which the implicit
+       growth makes moot.  The VALUE ABIs transcribe the kernel
+       contracts: pop -> Option[T] (Some payload / None on empty),
+       get/remove are the CHECKED reads — out-of-range is the std's
+       OOB panic, enforced as a deterministic host error (the VM
+       traps). *)
+    intrinsic_binding "__intrinsic_array_new"
+      (adapter_raw [] Type_repr.Unit (fun _ args ->
+           match args with
+           | [||] -> Ok (Vm_value.Array [||])
+           | _ -> arg_mismatch "no arguments"));
+    intrinsic_binding "__intrinsic_array_with_capacity"
+      (adapter_raw [ Type_repr.Unit ] Type_repr.Unit (fun _ args ->
+           (* the preallocation hint is advisory: the seed's implicit
+              growth makes capacity a query-only quantity, so the
+              empty result is the full semantic *)
+           match args with
+           | [| Vm_value.Int _ |] -> Ok (Vm_value.Array [||])
+           | _ -> arg_mismatch "(Int)"));
+    intrinsic_binding "__intrinsic_array_len"
+      (adapter_raw [ Type_repr.Unit ] (Type_repr.Int Type_repr.Int) (fun _ args ->
+           match args with
+           | [| Vm_value.Array elems |] ->
+               Ok
+                 (Vm_value.Int
+                    (Int_value.of_int64 ~width:64 ~signed:true
+                       (Int64.of_int (Array.length elems))))
+           | _ -> arg_mismatch "(Array)"));
+    intrinsic_binding "__intrinsic_array_capacity"
+      (adapter_raw [ Type_repr.Unit ] (Type_repr.Int Type_repr.Int) (fun _ args ->
+           (* len == capacity on the implicit-growth seed representation *)
+           match args with
+           | [| Vm_value.Array elems |] ->
+               Ok
+                 (Vm_value.Int
+                    (Int_value.of_int64 ~width:64 ~signed:true
+                       (Int64.of_int (Array.length elems))))
+           | _ -> arg_mismatch "(Array)"));
+    intrinsic_binding "__intrinsic_array_push"
+      (adapter_raw_wb [ Type_repr.Unit; Type_repr.Unit ] Type_repr.Unit (fun _ args ->
+           match args with
+           | [| Vm_value.Array elems; item |] ->
+               Ok
+                 { value = Vm_value.Unit;
+                   writebacks = [ (0, Vm_value.Array (Array.append elems [| item |])) ] }
+           | _ -> Error "argument mismatch: expected (Array, item)"));
+    intrinsic_binding "__intrinsic_array_pop"
+      (adapter_raw_wb [ Type_repr.Unit ] Type_repr.Unit (fun _ args ->
+           (* the exact Tangerine contract: the language value is
+              Option[T] — Some(the last element) or None on empty —
+              and the shrink travels through the writeback channel *)
+           match args with
+           | [| Vm_value.Array elems |] ->
+               let n = Array.length elems in
+               if n = 0 then
+                 Ok
+                   { value = Vm_value.Enum (1, [||]);
+                     writebacks = [ (0, Vm_value.Array elems) ] }
+               else
+                 Ok
+                   { value = Vm_value.Enum (0, [| elems.(n - 1) |]);
+                     writebacks = [ (0, Vm_value.Array (Array.sub elems 0 (n - 1))) ] }
+           | _ -> Error "argument mismatch: expected (Array)"));
+    intrinsic_binding "__intrinsic_array_get"
+      (adapter_raw [ Type_repr.Unit; Type_repr.Unit ] Type_repr.Unit (fun _ args ->
+           (* VALUE ABI, CHECKED: out-of-range is the std's defined OOB
+              panic — a deterministic host error the VM traps on *)
+           match args with
+           | [| Vm_value.Array elems; Vm_value.Int i |] ->
+               let idx = Int64.to_int (Int_value.to_int64 i) in
+               if idx < 0 || idx >= Array.length elems then
+                 Error
+                   (Printf.sprintf
+                      "__intrinsic_array_get: index %d out of bounds (len %d)" idx
+                      (Array.length elems))
+               else Ok elems.(idx)
+           | _ -> arg_mismatch "(Array, Int)"));
+    intrinsic_binding "__intrinsic_array_set"
+      (adapter_raw_wb
+         [ Type_repr.Unit; Type_repr.Unit; Type_repr.Unit ]
+         Type_repr.Unit (fun _ args ->
+          match args with
+          | [| Vm_value.Array elems; Vm_value.Int i; value |] ->
+              let idx = Int64.to_int (Int_value.to_int64 i) in
+              if idx < 0 || idx >= Array.length elems then
+                Error
+                  (Printf.sprintf
+                     "__intrinsic_array_set: index %d out of bounds (len %d)" idx
+                     (Array.length elems))
+              else begin
+                let new_elems = Array.copy elems in
+                new_elems.(idx) <- value;
+                Ok { value = Vm_value.Unit;
+                     writebacks = [ (0, Vm_value.Array new_elems) ] }
+              end
+          | _ -> Error "argument mismatch: expected (Array, Int, value)"));
+    intrinsic_binding "__intrinsic_array_remove"
+      (adapter_raw_wb [ Type_repr.Unit; Type_repr.Unit ] Type_repr.Unit (fun _ args ->
+           (* VALUE ABI, CHECKED: the removed element is the language
+              value and the shifted remainder travels through the
+              writeback channel *)
+           match args with
+           | [| Vm_value.Array elems; Vm_value.Int i |] ->
+               let idx = Int64.to_int (Int_value.to_int64 i) in
+               let n = Array.length elems in
+               if idx < 0 || idx >= n then
+                 Error
+                   (Printf.sprintf
+                      "__intrinsic_array_remove: index %d out of bounds (len %d)" idx n)
+               else
+                 Ok
+                   { value = elems.(idx);
+                     writebacks =
+                       [ (0,
+                          Vm_value.Array
+                            (Array.append (Array.sub elems 0 idx)
+                               (Array.sub elems (idx + 1) (n - idx - 1)))) ] }
+           | _ -> Error "argument mismatch: expected (Array, Int)"));
+    intrinsic_binding "__intrinsic_array_insert"
+      (adapter_raw_wb
+         [ Type_repr.Unit; Type_repr.Unit; Type_repr.Unit ]
+         Type_repr.Unit (fun _ args ->
+          match args with
+          | [| Vm_value.Array elems; Vm_value.Int i; item |] ->
+              let idx = Int64.to_int (Int_value.to_int64 i) in
+              let n = Array.length elems in
+              if idx < 0 || idx > n then
+                Error
+                  (Printf.sprintf
+                     "__intrinsic_array_insert: index %d out of bounds (len %d)" idx n)
+              else
+                Ok
+                  { value = Vm_value.Unit;
+                    writebacks =
+                      [ (0,
+                         Vm_value.Array
+                           (Array.append (Array.sub elems 0 idx)
+                              (Array.append [| item |] (Array.sub elems idx (n - idx))))) ] }
+          | _ -> Error "argument mismatch: expected (Array, Int, item)"));
+    intrinsic_binding "__intrinsic_array_clear"
+      (adapter_raw_wb [ Type_repr.Unit ] Type_repr.Unit (fun _ args ->
+           match args with
+           | [| Vm_value.Array _ |] ->
+               Ok { value = Vm_value.Unit;
+                    writebacks = [ (0, Vm_value.Array [||]) ] }
+           | _ -> Error "argument mismatch: expected (Array)"));
+    intrinsic_binding "__intrinsic_array_contains"
+      (adapter_raw [ Type_repr.Unit; Type_repr.Unit ] Type_repr.Bool (fun _ args ->
+           match args with
+           | [| Vm_value.Array elems; item |] ->
+               Ok (Vm_value.Bool (Array.exists (fun e -> Vm_value.equal e item) elems))
+           | _ -> arg_mismatch "(Array, item)"));
     intrinsic_binding "print"
       (adapter_string_ret_unit (fun t s -> emit_stdout t s));
     intrinsic_binding "println"
@@ -462,6 +642,27 @@ let binding_manifest : binding list =
        is a no-op. This is the real semantic, not a fabricated value. *)
     extern_binding "__sync_synchronize"
       (adapter_ret_unit (fun _ -> ()));
+    (* std/args.tg — the kernel argv channel (the same argv Vm.run
+       received): tg_get_argc returns the argv length and _tg_arg_copy
+       the i-th argv string (the kernel's raw_arg_count/raw_arg_copy). *)
+    extern_binding "tg_get_argc"
+      (adapter_raw [] (Type_repr.Int Type_repr.Int) (fun t args ->
+           match args with
+           | [||] ->
+               Ok
+                 (Vm_value.Int
+                    (Int_value.of_int64 ~width:64 ~signed:true
+                       (Int64.of_int (Array.length t.argv))))
+           | _ -> arg_mismatch "no arguments"));
+    extern_binding "_tg_arg_copy"
+      (adapter_raw [ Type_repr.Int Type_repr.Int ] Type_repr.String (fun t args ->
+           match args with
+           | [| Vm_value.Int i |] ->
+               let n = Int64.to_int (Int_value.to_int64 i) in
+               if n < 0 || n >= Array.length t.argv then
+                 Error "argument mismatch: argv index out of range"
+               else Ok (Vm_value.String t.argv.(n))
+           | _ -> arg_mismatch "Int"));
   ]
 
 let binding_of_manifest (name : string) : binding option =
