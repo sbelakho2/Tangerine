@@ -286,7 +286,28 @@ let adapter_string_ret_int (f : t -> string -> Int_value.t) : adapter =
    identity; the SIGNATURE is the adapter's independent declaration. *)
 let intrinsic_binding (name : string) (a : adapter) : binding =
   match Intrinsic_registry.lookup Intrinsic_registry.manifest ~name with
-  | Some (id, _) -> { id = Intrinsic id; name; signature = a.signature; invoke = a.invoke }
+  | Some (id, sig_) ->
+      (* the signature of an intrinsic binding is the REGISTRY's declared
+         signature, never the adapter's hand-written one: the intrinsic
+         surface is generic (Map[P#0, P#1], Set[P#0], ...), so an
+         adapter-side concrete/Unit-shaped signature could never match
+         the declared surface the calls were verified against (the
+         reachable-host closure's exact-signature check), and the VM's
+         dispatch arity check must see the DECLARED arity.  The adapter
+         supplies only the invoke semantics. *)
+      {
+        id = Intrinsic id;
+        name;
+        signature =
+          {
+            param_types =
+              List.map
+                (fun (p : Type_repr.param_type) -> type_key p.Type_repr.pt_type)
+                (Array.to_list sig_.Intrinsic_registry.params);
+            return_type = type_key sig_.Intrinsic_registry.ret;
+          };
+        invoke = a.invoke;
+      }
   | None -> failwith (Printf.sprintf "host binding '%s': not a declared intrinsic" name)
 
 let extern_binding (name : string) (a : adapter) : binding =
@@ -312,6 +333,24 @@ let binding_manifest : binding list =
            | [| Vm_value.Set elems; item |] ->
                Ok (Vm_value.Bool (List.exists (fun e -> Vm_value.equal e item) elems))
            | _ -> arg_mismatch "(Set, item)"));
+    intrinsic_binding "__intrinsic_set_remove"
+      (adapter_raw_wb [ Type_repr.Unit; Type_repr.Unit ] Type_repr.Bool (fun _ args ->
+           (* the exact Tangerine contract: the language value is Bool
+              (whether the element was present and removed) and the
+              mutation travels through the explicit writeback channel *)
+           match args with
+           | [| Vm_value.Set elems; item |] ->
+               let rec remove acc = function
+                 | [] -> (false, List.rev acc)
+                 | x :: rest when Vm_value.equal x item ->
+                     (true, List.rev_append acc rest)
+                 | x :: rest -> remove (x :: acc) rest
+               in
+               let removed, new_elems = remove [] elems in
+               Ok
+                 { value = Vm_value.Bool removed;
+                   writebacks = [ (0, Vm_value.Set new_elems) ] }
+           | _ -> Error "argument mismatch: expected (Set, item)"));
     intrinsic_binding "__intrinsic_set_insert"
       (adapter_raw_wb [ Type_repr.Unit; Type_repr.Unit ] Type_repr.Bool (fun _ args ->
            (* re-audit P0-B: the exact Tangerine contract — the

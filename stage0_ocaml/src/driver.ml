@@ -2037,6 +2037,11 @@ let run_closure_pipeline ~(repo_root : string) ~(manifest_path : string)
 
 (* Lower every top-level free function of the closure into one Seed MIR
    program (flat namespace; shared by bootstrap-check and compile). *)
+(* the fn-decl spans (file_id, start) of the duplicate-instance bodies
+   the instance-uniqueness filter below drops (filled by lower_closure,
+   consumed by oracle_of_ctx — the single-threaded driver runs lowering
+   before the oracle). *)
+let oracle_dropped_decl_spans : (int * int) list ref = ref []
 (* Materialize program.types from the typed nominal registry (audit P0-8):
    concrete (non-generic) structs/enums become StructDef/EnumDef entries
    with deterministic field/variant identities; generic nominals are
@@ -2057,6 +2062,15 @@ let lower_closure (ctx : closure_ctx) : Seed_mir.program =
      structural gate's duplicate-instance audit can name the offenders *)
   let dup_debug = Sys.getenv_opt "TANGERINE_DEBUG_DUP" <> None in
   let lowered_src = ref [] in
+  (* per-lowering fn-decl spans, parallel to !mir_funcs (both prepend in
+     the same order) — the instance-uniqueness filter below reports the
+     DROPPED duplicate bodies' decl spans to the oracle, so accepted
+     call records inside a body the seed never emits can be excluded *)
+  let lowered_decl_spans = ref [] in
+  let note_decl (f : Seed_mir.function_) (span : Span.span) =
+    ignore f;
+    lowered_decl_spans := (span.Span.file_id, span.Span.start) :: !lowered_decl_spans
+  in
   let note (f : Seed_mir.function_) (loc : string) =
     if dup_debug then
       lowered_src :=
@@ -2110,6 +2124,7 @@ let lower_closure (ctx : closure_ctx) : Seed_mir.program =
               fd
           in
           mir_funcs := f :: !mir_funcs;
+          note_decl f fd.Ast.fn_span;
           note f
             (Printf.sprintf "free fn in module %s"
                (String.concat "::" node.Module_graph.node_path)))
@@ -2147,6 +2162,7 @@ let lower_closure (ctx : closure_ctx) : Seed_mir.program =
                       in
                       mir_funcs := f :: !mir_funcs;
                       incr lowered_methods;
+                      note_decl f m.Ast.fn_span;
                       note f
                         (Printf.sprintf "method %s on %s%s in module %s"
                            m.Ast.fn_sig.Ast.sig_name d.Ast.i_target_type
@@ -2187,6 +2203,7 @@ let lower_closure (ctx : closure_ctx) : Seed_mir.program =
           fd
       in
       mir_funcs := f :: !mir_funcs;
+      note_decl f fd.Ast.fn_span;
       note f (Printf.sprintf "nested fn %s" qname))
     ctx.ctx_env.Typecheck.state.nested_functions;
   ctx.lowered_methods <- !lowered_methods;
@@ -2206,15 +2223,20 @@ let lower_closure (ctx : closure_ctx) : Seed_mir.program =
      same instance. *)
   let functions =
     let seen = Hashtbl.create 4096 in
-    List.filter
-      (fun (f : Seed_mir.function_) ->
+    let kept = ref [] in
+    let dropped_spans = ref [] in
+    List.iter2
+      (fun (f : Seed_mir.function_) (decl_span : int * int) ->
         let key = Seed_mir.print_instance f.Seed_mir.instance in
-        if Hashtbl.mem seen key then false
+        if Hashtbl.mem seen key then dropped_spans := decl_span :: !dropped_spans
         else begin
           Hashtbl.add seen key ();
-          true
+          kept := f :: !kept
         end)
       (List.rev !mir_funcs)
+      (List.rev !lowered_decl_spans);
+    oracle_dropped_decl_spans := !dropped_spans;
+    List.rev !kept
   in
   if dup_debug then begin
     let tbl = Hashtbl.create 256 in
@@ -2416,10 +2438,14 @@ let oracle_raw_template_set : int list ref = ref []
    print_oracle_rows in the same breath — single-threaded driver). *)
 let oracle_name_tbl : (int, string) Hashtbl.t option ref = ref None
 
-(* TANGERINE_DEBUG_ORACLE: NodeId -> enclosing-item display (module path
-   + fn/method/impl name), so a missing/extra instance can be traced to
-   the exact source item whose body recorded the call. *)
-let oracle_node_tbl : (int, string) Hashtbl.t option ref = ref None
+(* TANGERINE_DEBUG_ORACLE: NodeId -> (enclosing-item display, enclosing
+   fn-decl span (file_id, start)), so a missing/extra instance can be
+   traced to the exact source item whose body recorded the call, and
+   records inside a duplicate-function-instance body that the lowering
+   dedup DROPPED can be excluded (a dropped body never emits its
+   calls). *)
+let oracle_node_tbl : (int, string * (int * int)) Hashtbl.t option ref =
+  ref None
 
 (* TANGERINE_DEBUG_ORACLE: the raw (NodeId, chased instance) records of
    the typed side, so the diagnostics can name every span that produced
@@ -2480,31 +2506,36 @@ let debug_dump_mir_calls (prog : Seed_mir.program) : unit =
       prog.Seed_mir.functions
   end
 
-(* Debug-only (TANGERINE_DEBUG_ORACLE): walk every item body of the
-   closure and index each expression NodeId under its enclosing item's
-   display name.  The walk covers every expr position that can carry a
-   checked call (statement/expr nests, match/if arms, patterns' literal
-   exprs, nested fn items, impl/struct/trait method bodies, const/static
+(* Walk every item body of the closure and index each expression NodeId
+   under (enclosing item display, enclosing fn-decl span).  The walk
+   covers every expr position that can carry a checked call
+   (statement/expr nests, match/if arms, patterns' literal exprs, nested
+   fn items, impl/struct/trait method bodies, const/static
    initializers); nested ModuleDef/EditionDecl bodies are separate graph
-   nodes and are skipped here. *)
+   nodes and are skipped here.  The fn-decl span lets the oracle exclude
+   accepted records inside duplicate-function-instance bodies the
+   lowering DEDUP dropped (they never emit their calls); the display
+   tags the item kinds that never lower at all (`::static `, `::const `,
+   `::field `, `::macro `, `::test `, `::trait(`, `::struct(`). *)
 let build_oracle_node_table (ctx : closure_ctx) : unit =
-  let tbl = Hashtbl.create 200000 in
+  let tbl : (int, string * (int * int)) Hashtbl.t = Hashtbl.create 200000 in
   oracle_node_tbl := Some tbl;
-  let rec walk_block (display : string) (bb : Ast.block_body) : unit =
-    List.iter (fun st -> walk_stmt display st) bb.Ast.b_stmts;
-    Option.iter (walk_expr display) bb.Ast.b_tail
-  and walk_stmt (display : string) (st : Ast.stmt) : unit =
+  let span_key (s : Span.span) : int * int = (s.Span.file_id, s.Span.start) in
+  let rec walk_block (display : string) (dspan : int * int) (bb : Ast.block_body) : unit =
+    List.iter (fun st -> walk_stmt display dspan st) bb.Ast.b_stmts;
+    Option.iter (walk_expr display dspan) bb.Ast.b_tail
+  and walk_stmt (display : string) (dspan : int * int) (st : Ast.stmt) : unit =
     match st with
-    | Ast.LetBinding (_, _, _, e, _) -> walk_expr display e
-    | Ast.ExprStmt (e, _) -> walk_expr display e
-    | Ast.Attributed (_, s, _) -> walk_stmt display s
-    | Ast.DeferStmt (bb, _) -> walk_block display bb
+    | Ast.LetBinding (_, _, _, e, _) -> walk_expr display dspan e
+    | Ast.ExprStmt (e, _) -> walk_expr display dspan e
+    | Ast.Attributed (_, s, _) -> walk_stmt display dspan s
+    | Ast.DeferStmt (bb, _) -> walk_block display dspan bb
     | Ast.Item it -> walk_item display it
     | Ast.AttributeStmt _ -> ()
   and walk_fn (display : string) (fd : Ast.function_decl) : unit =
     match fd.Ast.fn_body with
-    | Ast.FnBlock bb -> walk_block display bb
-    | Ast.FnExpr e -> walk_expr display e
+    | Ast.FnBlock bb -> walk_block display (span_key fd.Ast.fn_span) bb
+    | Ast.FnExpr e -> walk_expr display (span_key fd.Ast.fn_span) e
     | Ast.FnSignatureOnly -> ()
   and walk_item (outer : string) (it : Ast.item) : unit =
     match it.Ast.kind with
@@ -2514,129 +2545,141 @@ let build_oracle_node_table (ctx : closure_ctx) : unit =
     | Ast.ImplBlock d ->
         let base = outer ^ "::impl(" ^ d.Ast.i_target_type ^ ")" in
         List.iter (fun m -> walk_fn (base ^ "::" ^ m.Ast.fn_sig.Ast.sig_name) m) d.Ast.i_methods;
-        List.iter (fun c -> walk_expr (base ^ "::const " ^ c.Ast.c_name) c.Ast.c_value)
+        List.iter
+          (fun c ->
+            walk_expr (base ^ "::const " ^ c.Ast.c_name) (span_key c.Ast.c_span) c.Ast.c_value)
           d.Ast.i_consts
     | Ast.StructDef d ->
-        let base = outer ^ "::" ^ d.Ast.s_name in
+        let base = outer ^ "::struct(" ^ d.Ast.s_name ^ ")" in
         List.iter
           (fun m -> walk_fn (base ^ "::" ^ m.Ast.fn_sig.Ast.sig_name) m)
           d.Ast.s_methods;
         List.iter
           (fun (f : Ast.field_decl) ->
-            Option.iter (walk_expr (base ^ "::field " ^ f.Ast.f_name)) f.Ast.f_default)
+            Option.iter (walk_expr (base ^ "::field " ^ f.Ast.f_name) (span_key f.Ast.f_span))
+              f.Ast.f_default)
           d.Ast.s_fields
     | Ast.TraitDef d ->
         let base = outer ^ "::trait(" ^ d.Ast.t_name ^ ")" in
         List.iter (fun m -> walk_fn (base ^ "::" ^ m.Ast.fn_sig.Ast.sig_name) m) d.Ast.t_methods
-    | Ast.TestDecl td -> walk_block (outer ^ "::test " ^ td.Ast.test_name) td.Ast.test_body
-    | Ast.ConstDecl cd -> walk_expr (outer ^ "::const " ^ cd.Ast.c_name) cd.Ast.c_value
-    | Ast.StaticDecl sd -> walk_expr (outer ^ "::static " ^ sd.Ast.st_name) sd.Ast.st_value
-    | Ast.MacroDecl md -> walk_block (outer ^ "::macro " ^ md.Ast.mac_name) md.Ast.mac_body
+    | Ast.TestDecl td ->
+        walk_block (outer ^ "::test " ^ td.Ast.test_name) (span_key td.Ast.test_span)
+          td.Ast.test_body
+    | Ast.ConstDecl cd ->
+        walk_expr (outer ^ "::const " ^ cd.Ast.c_name) (span_key cd.Ast.c_span) cd.Ast.c_value
+    | Ast.StaticDecl sd ->
+        walk_expr (outer ^ "::static " ^ sd.Ast.st_name) (span_key sd.Ast.st_span)
+          sd.Ast.st_value
+    | Ast.MacroDecl md ->
+        walk_block (outer ^ "::macro " ^ md.Ast.mac_name) (span_key md.Ast.mac_span)
+          md.Ast.mac_body
     | Ast.ExternBlock eb ->
         List.iter (walk_item (outer ^ "::extern")) eb.Ast.ex_items
     | Ast.ModuleDef _ | Ast.EditionDecl _ | Ast.UseDecl _ | Ast.TypeAlias _
     | Ast.CapabilityDecl _ | Ast.EffectDecl _ | Ast.RationaleBlock _ | Ast.EnumDef _ ->
         ()
-  and walk_pat (display : string) (p : Ast.pattern) : unit =
+  and walk_pat (display : string) (dspan : int * int) (p : Ast.pattern) : unit =
     match p with
-    | Ast.PatLiteral (e, _) -> walk_expr display e
+    | Ast.PatLiteral (e, _) -> walk_expr display dspan e
     | Ast.PatVariant (_, _, pats, _) | Ast.PatTuple (pats, _) ->
-        List.iter (walk_pat display) pats
+        List.iter (walk_pat display dspan) pats
     | Ast.StructPattern (_, fields, _) ->
         List.iter
-          (fun (_, po) -> Option.iter (walk_pat display) po)
+          (fun (_, po) -> Option.iter (walk_pat display dspan) po)
           fields
     | Ast.OrPattern (a, b, _) ->
-        walk_pat display a;
-        walk_pat display b
+        walk_pat display dspan a;
+        walk_pat display dspan b
     | Ast.RangePattern (a, b, _) ->
-        walk_pat display a;
-        walk_pat display b
+        walk_pat display dspan a;
+        walk_pat display dspan b
     | Ast.Wildcard _ | Ast.PatIdent _ | Ast.RefPattern _ | Ast.RefMutPattern _ -> ()
-  and walk_expr (display : string) (e : Ast.expr) : unit =
-    Hashtbl.replace tbl (Ids.Node_id.to_int (Ast.expr_node_id e)) display;
+  and walk_expr (display : string) (dspan : int * int) (e : Ast.expr) : unit =
+    Hashtbl.replace tbl (Ids.Node_id.to_int (Ast.expr_node_id e)) (display, dspan);
     match e with
     | Ast.IntLit _ | Ast.FloatLit _ | Ast.StringLit _ | Ast.CharLit _ | Ast.BoolLit _
     | Ast.Name _ | Ast.Path _ | Ast.NextExpr _ ->
         ()
-    | Ast.Array (_, es, _) | Ast.Tuple (_, es, _) -> List.iter (walk_expr display) es
+    | Ast.Array (_, es, _) | Ast.Tuple (_, es, _) -> List.iter (walk_expr display dspan) es
     | Ast.ArrayRepeat (_, a, b, _) ->
-        walk_expr display a;
-        walk_expr display b
+        walk_expr display dspan a;
+        walk_expr display dspan b
     | Ast.StructLit (_, _, _, fields, spread, _) ->
-        List.iter (fun (_, v) -> walk_expr display v) fields;
-        Option.iter (walk_expr display) spread
+        List.iter (fun (_, v) -> walk_expr display dspan v) fields;
+        Option.iter (walk_expr display dspan) spread
     | Ast.Block (_, bb, _) | Ast.UnsafeBlock (_, _, bb, _) | Ast.LoopExpr (_, bb, _)
     | Ast.ComptimeBlock (_, bb, _) ->
-        walk_block display bb
+        walk_block display dspan bb
     | Ast.IfExpr (_, ie) ->
-        walk_expr display ie.Ast.if_condition;
-        walk_block display ie.Ast.if_then;
+        walk_expr display dspan ie.Ast.if_condition;
+        walk_block display dspan ie.Ast.if_then;
         List.iter
           (fun (c, b) ->
-            walk_expr display c;
-            walk_block display b)
+            walk_expr display dspan c;
+            walk_block display dspan b)
           ie.Ast.if_elsif;
-        Option.iter (walk_block display) ie.Ast.if_else;
-        Option.iter (walk_pat display) ie.Ast.if_let_pattern;
-        Option.iter (walk_expr display) ie.Ast.if_let_value
+        Option.iter (walk_block display dspan) ie.Ast.if_else;
+        Option.iter (walk_pat display dspan) ie.Ast.if_let_pattern;
+        Option.iter (walk_expr display dspan) ie.Ast.if_let_value
     | Ast.Call (_, f, _, args, _) ->
-        walk_expr display f;
-        List.iter (fun (a : Ast.call_arg) -> walk_expr display a.Ast.ca_value) args
+        walk_expr display dspan f;
+        List.iter (fun (a : Ast.call_arg) -> walk_expr display dspan a.Ast.ca_value) args
     | Ast.Index (_, a, b, _) | Ast.Binary (_, a, _, b, _) | Ast.Assign (_, a, b, _)
     | Ast.CompoundAssign (_, a, _, b, _) ->
-        walk_expr display a;
-        walk_expr display b
+        walk_expr display dspan a;
+        walk_expr display dspan b
     | Ast.Range (_, a, b, _, _) ->
-        walk_expr display a;
-        walk_expr display b
+        walk_expr display dspan a;
+        walk_expr display dspan b
     | Ast.MatchExpr (_, me) ->
-        walk_expr display me.Ast.m_subject;
+        walk_expr display dspan me.Ast.m_subject;
         List.iter
           (fun (ma : Ast.match_arm) ->
-            walk_pat display ma.Ast.ma_pattern;
-            Option.iter (walk_expr display) ma.Ast.ma_guard;
-            walk_expr display ma.Ast.ma_body)
+            walk_pat display dspan ma.Ast.ma_pattern;
+            Option.iter (walk_expr display dspan) ma.Ast.ma_guard;
+            walk_expr display dspan ma.Ast.ma_body)
           me.Ast.m_arms
     | Ast.Cast (_, a, _, _) | Ast.TryOp (_, a, _) | Ast.Unary (_, _, a, _)
     | Ast.Field (_, a, _, _) | Ast.AwaitExpr (_, a, _) ->
-        walk_expr display a
-    | Ast.Closure (_, ce) -> walk_expr display ce.Ast.cl_body
+        walk_expr display dspan a
+    | Ast.Closure (_, ce) -> walk_expr display dspan ce.Ast.cl_body
     | Ast.MacroCall (_, _, margs, _) ->
         List.iter
-          (function Ast.MacroExpr e -> walk_expr display e | Ast.MacroTokens _ -> ())
+          (function
+            | Ast.MacroExpr e -> walk_expr display dspan e
+            | Ast.MacroTokens _ -> ())
           margs
     | Ast.ReturnExpr (_, o, _) | Ast.BreakExpr (_, o, _) ->
-        Option.iter (walk_expr display) o
+        Option.iter (walk_expr display dspan) o
     | Ast.ForExpr (_, fe) ->
-        walk_pat display fe.Ast.for_pattern;
-        walk_expr display fe.Ast.for_iterable;
-        walk_block display fe.Ast.for_body
+        walk_pat display dspan fe.Ast.for_pattern;
+        walk_expr display dspan fe.Ast.for_iterable;
+        walk_block display dspan fe.Ast.for_body
     | Ast.WhileExpr (_, we) ->
-        walk_expr display we.Ast.wh_condition;
-        walk_block display we.Ast.wh_body
+        walk_expr display dspan we.Ast.wh_condition;
+        walk_block display dspan we.Ast.wh_body
     | Ast.HandleExpr (_, he) ->
-        walk_expr display he.Ast.h_expr;
+        walk_expr display dspan he.Ast.h_expr;
         List.iter
           (fun (_, pats, body) ->
-            List.iter (walk_pat display) pats;
-            walk_expr display body)
+            List.iter (walk_pat display dspan) pats;
+            walk_expr display dspan body)
           he.Ast.h_arms
     | Ast.UnlessExpr (_, ue) ->
-        walk_expr display ue.Ast.un_condition;
-        walk_block display ue.Ast.un_body;
-        Option.iter (walk_block display) ue.Ast.un_else
+        walk_expr display dspan ue.Ast.un_condition;
+        walk_block display dspan ue.Ast.un_body;
+        Option.iter (walk_block display dspan) ue.Ast.un_else
     | Ast.UntilExpr (_, ue) ->
-        walk_expr display ue.Ast.ut_condition;
-        walk_block display ue.Ast.ut_body
+        walk_expr display dspan ue.Ast.ut_condition;
+        walk_block display dspan ue.Ast.ut_body
     | Ast.TryBlock (_, tb) ->
-        walk_block display tb.Ast.tr_body;
+        walk_block display dspan tb.Ast.tr_body;
         List.iter
           (fun (p, bb) ->
-            walk_pat display p;
-            walk_block display bb)
+            walk_pat display dspan p;
+            walk_block display dspan bb)
           tb.Ast.tr_catches;
-        Option.iter (walk_block display) tb.Ast.tr_finally
+        Option.iter (walk_block display dspan) tb.Ast.tr_finally
   in
   List.iter
     (fun (node : Module_graph.module_node) ->
@@ -2734,7 +2777,7 @@ let print_oracle_rows (o : oracle_counts) : bool =
               match !oracle_node_tbl with
               | Some t -> (
                   match Hashtbl.find_opt t nid with
-                  | Some c -> Some c
+                  | Some (c, _) -> Some c
                   | None -> Some (Printf.sprintf "node#%d (no AST context)" nid))
               | None -> Some "?")
           !oracle_typed_entries
@@ -3792,13 +3835,18 @@ let oracle_of_ctx (ctx : closure_ctx) (stats : mir_stats option) : oracle_counts
   in
   let chase = final_journal_subst () in
   let debug_oracle = Sys.getenv_opt "TANGERINE_DEBUG_ORACLE" <> None in
-  (* the node -> enclosing-item index, built ALWAYS (the fold needs it to
-     exclude the accepted calls whose AST site is NOT lowered as a seed
-     function body: static/const initializers (the seed statics' constant
-     channel carries no Call terminators), struct-field defaults, test and
-     macro bodies); the debug diagnostics reuse the same index *)
+  (* the node -> enclosing-item index, built ALWAYS when the MIR side is
+     live (the fold needs it to exclude the accepted calls whose AST site
+     is NOT lowered as a seed function body: static/const initializers
+     (the seed statics' constant channel carries no Call terminators),
+     struct-field defaults, test and macro bodies); the debug diagnostics
+     reuse the same index *)
   oracle_typed_entries := [];
-  build_oracle_node_table ctx;
+  if stats <> None then build_oracle_node_table ctx
+  else begin
+    oracle_node_tbl := None;
+    oracle_typed_entries := []
+  end;
   (* a call node whose enclosing item is not lowered as a seed function
      body never emits a Call terminator — its accepted record is
      out-of-domain by construction.  The walker's display strings mark
@@ -3817,13 +3865,27 @@ let oracle_of_ctx (ctx : closure_ctx) (stats : mir_stats option) : oracle_counts
     match !oracle_node_tbl with
     | Some t -> (
         match Hashtbl.find_opt t key with
-        | Some d ->
+        | Some (d, _) ->
             not
               (List.exists
                  (contains_sub d)
-                 [ "::static "; "::const "; "::field "; "::macro "; "::test " ])
+                 [ "::static "; "::const "; "::field "; "::macro "; "::test ";
+                   "::trait("; "::struct(" ])
         | None -> true)
     | None -> true
+  in
+  (* a call node inside a duplicate-function-instance body that the
+     lowering's instance-uniqueness filter DROPPED (the same typed
+     signature collapsed onto one emitted function — the kept first
+     lowering) never emits its calls either: exclude by the enclosing
+     fn-decl span *)
+  let node_decl_dropped (key : int) : bool =
+    match !oracle_node_tbl with
+    | Some t -> (
+        match Hashtbl.find_opt t key with
+        | Some (_, dspan) -> List.mem dspan !oracle_dropped_decl_spans
+        | None -> false)
+    | None -> false
   in
   (* the User-dispatch callable domain: the callable parts of the MIR's
      User callee instances *)
@@ -3842,7 +3904,8 @@ let oracle_of_ctx (ctx : closure_ctx) (stats : mir_stats option) : oracle_counts
         match n.Typecheck.tn_call with
         | Some (cid, subst)
           when is_user_callable cid
-               && node_is_lowered_body (Ids.Node_id.to_int key) ->
+               && node_is_lowered_body (Ids.Node_id.to_int key)
+               && not (node_decl_dropped (Ids.Node_id.to_int key)) ->
             let inst = Instance_id.make ~callable:cid ~type_args:(Array.map chase subst) in
             if debug_oracle then
               oracle_typed_entries :=
