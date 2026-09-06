@@ -101,6 +101,13 @@ type t = {
   program : Seed_mir.program;
   fn_index : (Instance_id.t, int) Hashtbl.t;  (* lookup only; iteration is never semantic *)
   memory : Vm_memory.t;
+  (* The P1-26 canonical drop-plan table: per concrete TypeId the
+     ordered (field/payload path, needs_drop) plan derived ONCE from
+     program.types; the destruction sites (do_drop, the assign-overwrite
+     drop) consult it by the local/place TYPE and fall back to the
+     structural value glue only for types whose plan is not
+     materialized. *)
+  drop_plans : Drop_plan.table;
   mutable host : Host.t;
   limits : limits;
   mutable steps : int;
@@ -647,16 +654,118 @@ and uchar_utf8_encode (c : Uchar.t) : string =
         | 2 -> Char.chr (0x80 lor ((cp lsr 6) land 0x3F))
         | _ -> Char.chr (0x80 lor (cp land 0x3F)))
 
+(* ── The P1-26 typed drop ──────────────────────────────────────────
+   The canonical per-concrete-TypeId drop plans (drop_plan.ml, built
+   once per program) drive every destruction site where the type is
+   known.  drop_value_typed consults the plan of the value's TYPE: a
+   materialized plan enumerates the def's components (declaration
+   order; the runtime enum tag selects the live variant), and each
+   component's value is dropped recursively under its own type — the
+   recursion is derived ONCE per type (the plan table), never re-derived
+   per value.  A type with no materialized plan (String, the container/
+   pointer handle nominals, tuples, references, ...) falls back to the
+   structural value glue — exactly the sanctioned fallback.  The
+   traversal order equals the glue's (depth-first, declaration order),
+   so a plan-driven drop frees exactly what the glue frees, in the same
+   order; a shape/type mismatch (defensive; verified programs cannot
+   produce one) falls back to the glue on the whole value. *)
+let rec drop_value_typed (vm : t) (ty : Type_repr.t) (v : Vm_value.t) : unit =
+  match Drop_plan.plan_of_type vm.drop_plans ty with
+  | None -> Vm_value.drop_glue vm.memory v
+  | Some plan -> (
+      match v with
+      | Vm_value.Struct elems ->
+          List.iter
+            (fun (c : Drop_plan.component) ->
+              match c.Drop_plan.variant with
+              | Some _ -> ()
+              | None ->
+                  if c.Drop_plan.index >= 0 && c.Drop_plan.index < Array.length elems then
+                    drop_value_typed vm c.Drop_plan.ty elems.(c.Drop_plan.index))
+            plan.Drop_plan.components
+      | Vm_value.Enum (tag, payload) ->
+          List.iter
+            (fun (c : Drop_plan.component) ->
+              match c.Drop_plan.variant with
+              | Some t when t = tag ->
+                  if c.Drop_plan.index >= 0 && c.Drop_plan.index < Array.length payload then
+                    drop_value_typed vm c.Drop_plan.ty payload.(c.Drop_plan.index)
+              | _ -> ())
+            plan.Drop_plan.components
+      | _ -> Vm_value.drop_glue vm.memory v)
+
+(* re-audit P0-9 / P1-26: drop the old value at a place about to be
+   OVERWRITTEN by an assignment — resolve the current component value
+   WITHOUT trapping on a MovedOut hole and run the typed drop over it
+   (the plan-driven recursion frees region-backed refs and is a no-op
+   for everything else; plan-less values fall back to the structural
+   glue). *)
+let drop_old_value_at (vm : t) (frame : frame) (p : Seed_mir.place) : unit =
+  let ty_of_place () : Type_repr.t =
+    let root_ty = type_of_local vm frame.fn (Seed_mir.root_key p.Seed_mir.root) in
+    List.fold_left (fun ty proj -> proj_type_of vm ty proj) root_ty p.Seed_mir.projections
+  in
+  let drop_slot s =
+    match s with
+    | Vm_value.Live v -> drop_value_typed vm (ty_of_place ()) v
+    | Vm_value.Uninitialized | Vm_value.Moved | Vm_value.Dropped -> ()
+  in
+  if Seed_mir.root_is_static p.Seed_mir.root then
+    let sidx = Seed_mir.root_static_index p.Seed_mir.root in
+    if sidx < Array.length frame.statics then drop_slot frame.statics.(sidx)
+  else begin
+    let local = Seed_mir.root_key p.Seed_mir.root in
+    if local >= 0 && local < Array.length frame.locals then
+      match p.Seed_mir.projections with
+      | [] -> drop_slot frame.locals.(local)
+      | _projs -> (
+          (* the projected overwrite: only the exact leaf component's
+             old value is replaced — walk the aggregate tree without
+             trapping on MovedOut holes *)
+          let rec leaf_value (v : Vm_value.t) (projs : Seed_mir.projection list) :
+              Vm_value.t option =
+            match projs with
+            | [] -> Some v
+            | proj :: rest -> (
+                match proj, v with
+                | Seed_mir.Field fid, Vm_value.Struct fields -> (
+                    let i = field_index_of vm (type_of_local vm frame.fn local) fid in
+                    if i >= 0 && i < Array.length fields then
+                      match fields.(i) with
+                      | Vm_value.MovedOut -> None
+                      | fv -> leaf_value fv rest
+                    else None)
+                | Seed_mir.ConstantIndex k, (Vm_value.Tuple elems | Vm_value.Array elems)
+                  when k >= 0 && k < Array.length elems -> (
+                    match elems.(k) with
+                    | Vm_value.MovedOut -> None
+                    | ev -> leaf_value ev rest)
+                | Seed_mir.Downcast _, Vm_value.Enum (_, payload) ->
+                    if Array.length payload > 0 then leaf_value payload.(0) rest else None
+                | _ -> None)
+          in
+          match frame.locals.(local) with
+          | Vm_value.Live v -> (
+              match leaf_value v p.Seed_mir.projections with
+              | Some old -> drop_value_typed vm (ty_of_place ()) old
+              | None -> ())
+          | _ -> ())
+  end
+
 (* A needs_drop value requires a Drop terminator; the verifier has already
    checked the plan.  The drop is RECURSIVE: the value's contained
    components run their drop glue first (aggregates depth-first; every
    region-backed ref inside is freed), then the outer slot transitions.
-   Moved/Uninitialized slots are no-ops and a second drop of a Dropped
-   slot traps — exactly the slot machine in vm_value.ml. *)
+   The VM knows the local's TYPE (fn.locals), so the drop runs through
+   the local's canonical drop plan (P1-26) instead of re-deriving the
+   recursion per value; values whose plan is not materialized fall back
+   to the structural glue.  Moved/Uninitialized slots are no-ops and a
+   second drop of a Dropped slot traps — exactly the slot machine in
+   vm_value.ml. *)
 let do_drop (vm : t) (frame : frame) (local : int) : unit =
   match frame.locals.(local) with
   | Vm_value.Live v ->
-      Vm_value.drop_glue vm.memory v;
+      drop_value_typed vm (type_of_local vm frame.fn local) v;
       frame.locals.(local) <- Vm_value.Dropped
   | Vm_value.Moved | Vm_value.Uninitialized -> ()
   | Vm_value.Dropped -> err_trap vm (Vm_value.slot_error_string Vm_value.DropDropped)
@@ -972,6 +1081,13 @@ let rec exec_terminator (vm : t) (frame : frame) (term : Seed_mir.terminator) : 
       let inst, caps =
         match callee with
         | Seed_mir.User inst -> (inst, [||])
+        | Seed_mir.Derived (c, args) ->
+            (* audit P0-5: the compiler-synthesized derived contract
+               class — the callee names the derived function under the
+               SAME callable identity its emitted (specialized) body
+               carries, so the dispatch is exactly the user-call
+               machinery *)
+            (Instance_id.make ~callable:c ~type_args:args, [||])
         | Seed_mir.FnValue op -> (
             match eval_operand vm frame op with
             | Vm_value.Function inst -> (inst, [||])
@@ -979,12 +1095,17 @@ let rec exec_terminator (vm : t) (frame : frame) (term : Seed_mir.terminator) : 
             | _ ->
                 err_trap vm
                   "fn-value call: callee operand is not a function value")
+        | Seed_mir.TypeQuery (k, _) ->
+            err_trap vm
+              (Printf.sprintf
+                 "type-query call `%s` reached the VM: the seed has no layout authority to fold the query (audit P0-5 — the TypeQuery callee must be resolved by layout folding or a precise host channel, never a body-less User callee; deterministic trap)"
+                 (Seed_mir.type_query_name k))
         | Seed_mir.Intrinsic _ | Seed_mir.Extern _ ->
             ( Instance_id.make ~callable:(Ids.Callable_id.make (-1)) ~type_args:[||],
               [||] )
       in
       (match callee with
-       | Seed_mir.User _ | Seed_mir.FnValue _ ->
+       | Seed_mir.User _ | Seed_mir.FnValue _ | Seed_mir.Derived _ ->
            let fn_idx =
              match find_fn vm inst with
              | Some idx -> idx
@@ -1087,6 +1208,7 @@ let rec exec_terminator (vm : t) (frame : frame) (term : Seed_mir.terminator) : 
            write_place vm frame dest ret;
            frame.block <- next;
            frame.stmt <- 0
+       | Seed_mir.TypeQuery _ -> assert false (* trapped above, before dispatch *)
        | Seed_mir.Intrinsic _ | Seed_mir.Extern _ as host_callee ->
            vm.host_calls <- vm.host_calls + 1;
            if vm.host_calls > vm.limits.max_host_calls then
@@ -1137,10 +1259,11 @@ let rec exec_terminator (vm : t) (frame : frame) (term : Seed_mir.terminator) : 
 and call_host (vm : t) (callee : Seed_mir.callee) (args : Vm_value.t array) : Host.host_result =
   let id =
     match callee with
-    | Seed_mir.Intrinsic i -> Host.Intrinsic (Intrinsic_registry.Id.make i)
-    | Seed_mir.Extern i -> Host.Extern (Extern_registry.Id.make i)
-    | Seed_mir.User _ | Seed_mir.FnValue _ ->
-        err_trap vm "internal: user/fn-value call routed to host dispatch"
+    | Seed_mir.Intrinsic (i, _) -> Host.Intrinsic (Intrinsic_registry.Id.make i)
+    | Seed_mir.Extern (i, _) -> Host.Extern (Extern_registry.Id.make i)
+    | Seed_mir.User _ | Seed_mir.FnValue _ | Seed_mir.Derived _
+    | Seed_mir.TypeQuery _ ->
+        err_trap vm "internal: user/fn-value/derived/type-query call routed to host dispatch"
   in
   match Host.lookup_binding vm.host id with
   | None ->
@@ -1149,17 +1272,25 @@ and call_host (vm : t) (callee : Seed_mir.callee) (args : Vm_value.t array) : Ho
         | Some name -> name
         | None -> (
             match callee with
-            | Seed_mir.Intrinsic i ->
+            | Seed_mir.Intrinsic (i, _) ->
                 Printf.sprintf "intrinsic#%d" (Intrinsic_registry.Id.to_int i)
-            | Seed_mir.Extern i -> Printf.sprintf "extern#%d" (Extern_registry.Id.to_int i)
-            | Seed_mir.User _ | Seed_mir.FnValue _ -> "?")
+            | Seed_mir.Extern (i, _) ->
+                Printf.sprintf "extern#%d" (Extern_registry.Id.to_int i)
+            | Seed_mir.User _ | Seed_mir.FnValue _ | Seed_mir.Derived _
+            | Seed_mir.TypeQuery _ ->
+                "?")
       in
       err_trap vm (Printf.sprintf "host call %s has no binding (fail-closed)" label)
   | Some b ->
-      if Array.length args <> List.length b.Host.signature.Host.param_types then
+      if
+        Array.length args
+        <> Array.length b.Host.declared.Signature_identity.sig_params
+      then
         err_trap vm
           (Printf.sprintf "host call %s: arity mismatch (binding arity %d, got %d)"
-             b.Host.name (List.length b.Host.signature.Host.param_types) (Array.length args));
+             b.Host.name
+             (Array.length b.Host.declared.Signature_identity.sig_params)
+             (Array.length args));
       (match b.Host.invoke vm.host args with
        | Ok r -> r
        | Error msg -> err_trap vm (Printf.sprintf "host call %s: %s" b.Host.name msg))
@@ -1201,6 +1332,15 @@ and exec_statement (vm : t) (frame : frame) (st : Seed_mir.statement) : unit =
   step_limit vm;
   match st with
   | Seed_mir.Assign (dest, rv) ->
+      (* re-audit P0-9: an assignment over a LIVE owning place drops the
+         old exact value FIRST (drop_glue frees region-backed refs;
+         scalars/strings/aggregates-without-regions and MovedOut holes
+         are no-ops), so an overwrite can never leak the replaced
+         value's resources.  The lowering still emits explicit Drop
+         terminators for the scope-end glue; this is the overwrite
+         boundary the verifier's destroyed-lattice models as
+         destroyed-by-assignment. *)
+      drop_old_value_at vm frame dest;
       let v = eval_rvalue vm frame rv in
       write_place vm frame dest v
   | Seed_mir.StorageLive l ->
@@ -1295,6 +1435,7 @@ let entry_frame_of ~(program : Seed_mir.program) ~(entry : Instance_id.t) ~(argv
              program;
              fn_index;
              memory = Vm_memory.create ();
+             drop_plans = Drop_plan.of_program program;
              host = Host.create ~repo_root:"." ~argv:[||];
              limits = default_limits;
              steps = 0;

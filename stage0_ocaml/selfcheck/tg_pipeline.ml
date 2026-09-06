@@ -107,6 +107,7 @@ let () =
           fn_ret = Type_repr.Int Type_repr.Int;
           struct_fields = [];
                 enum_payloads = [];
+          copy_cache = Type_properties.create_cache ();
         }
       in
       let mir_funcs =

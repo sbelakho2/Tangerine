@@ -29,10 +29,25 @@
      first, the capture tuple second.  ClosureAgg (inst, env_ops) builds a
      value of this shape.  NOTE (re-audit closure item): closure
      CONSTRUCTION is representable and verifier-checked, but the callee
-     forms (User/Intrinsic/Extern) carry compile-time identities only —
-     there is no closure-CALL terminator, so the VM can never invoke a
-     runtime closure value.  Closure lowering therefore fails closed
-     (mir_lower's Closure branch) until the call path exists.
+     forms carry compile-time identities only — there is no closure-CALL
+     terminator, so the VM can never invoke a runtime closure value.
+     Closure lowering therefore fails closed (mir_lower's Closure branch)
+     until the call path exists.
+
+   Callee classes (audit P0-5): the callee's SEMANTIC CLASS flows from
+   the checker (the typed channel's record) through lowering into this
+   enum, so the mono'd program never needs a name-based host rewrite.
+   User/Derived callees name the emitted-body identity to specialize and
+   execute (Derived = the compiler-synthesized derived contracts, whose
+   real bodies lower under the SAME callable identity the calls
+   reference); Intrinsic/Extern callees name the registry index of the
+   declared host binding (plus the call's instance type args, opaque to
+   this module); TypeQuery names the compile-time type-query form
+   (size_of/align_of — no runtime body: it is resolved by layout folding
+   or a precise host channel, never a body-less User); FnValue is the
+   runtime function-value callee (the closure-call path).  A User callee
+   in the mono output without an emitted body is an invariant violation
+   (the driver's assert_no_bodyless_user_calls ICEs).
 
    Local convention (canonical): Local 0 is the RETURN SLOT, holding the
    function's return type (the reference's "_ret" convention);
@@ -49,8 +64,10 @@
    int is the continuation target exactly like a Call's success block;
    the drop-glue function is implied by the destroyed place's concrete
    type (the Seed VM resolves it), never named here.  Intrinsic/Extern
-   callee payloads are registry indices owned by the Seed VM layer; they
-   are opaque to this module. *)
+   callee payloads are registry indices owned by the Seed VM layer
+   (opaque to this module); the second payload element is the call's
+   instance type args (metadata carried through mono for the exact-arity
+   discipline). *)
 
 (* The typed-bitvector integer authority (audit §38). *)
 type int_value = Int_value.t
@@ -125,11 +142,51 @@ type operand =
   | Consume of place
   | Constant of constant
 
+(* ── The typed callee class (audit P0-5) ───────────────────────────
+   The callee's SEMANTIC CLASS flows from the checker (the typed channel's
+   record) through lowering into this enum, so the mono'd program never
+   needs a name-based host rewrite: a call whose callee class is
+   User/Derived names the emitted-body identity to specialize and
+   execute; Intrinsic/Extern name the registry index (the declared host
+   binding) plus the call's instance type args; TypeQuery names the
+   compile-time type-query form (size_of/align_of — no runtime body, the
+   callee is resolved by layout folding or a precise host channel, never
+   a body-less User); FnValue is the runtime function-value callee (the
+   closure-call path).  A User callee that reaches the mono'd program
+   WITHOUT an emitted body is an invariant violation (the driver's
+   assert_no_bodyless_user_calls ICEs). *)
+
+type type_query_kind = SizeOf | AlignOf
+
+let type_query_name (k : type_query_kind) : string =
+  match k with SizeOf -> "size_of" | AlignOf -> "align_of"
+
 type callee =
   | User of Instance_id.t
-  | Intrinsic of int
-  | Extern of int
+  | Intrinsic of int * Type_repr.t array
+  | Extern of int * Type_repr.t array
+  | Derived of Ids.Callable_id.t * Type_repr.t array
+  | TypeQuery of type_query_kind * Type_repr.t array
   | FnValue of operand
+
+(* The emitted-body identity a body-carrying callee class names: User
+   directly; Derived names the compiler-synthesized derived-contract
+   function under the SAME callable identity the call sites reference. *)
+let callee_instance (c : callee) : Instance_id.t option =
+  match c with
+  | User inst -> Some inst
+  | Derived (callable, args) -> Some (Instance_id.make ~callable ~type_args:args)
+  | Intrinsic _ | Extern _ | TypeQuery _ | FnValue _ -> None
+
+(* The class-carried type arguments (the call's instance args) — the
+   only type positions a callee carries besides the User instance. *)
+let callee_type_args (c : callee) : Type_repr.t array =
+  match c with
+  | User inst -> Instance_id.type_args inst
+  | Intrinsic (_, args) | Extern (_, args) | Derived (_, args)
+  | TypeQuery (_, args) ->
+      args
+  | FnValue _ -> [||]
 
 (* NOTE: the audit contract spells the access-effect field `effect`; OCaml
    5.4 reserves `effect` as a keyword, so the field is spelled `effect_`. *)
@@ -373,8 +430,18 @@ let print_un_op = function Neg -> "Neg" | Not -> "Not"
 
 let print_callee = function
   | User inst -> print_instance inst
-  | Intrinsic i -> Printf.sprintf "intrinsic#%d" i
-  | Extern i -> Printf.sprintf "extern#%d" i
+  | Intrinsic (i, args) ->
+      Printf.sprintf "intrinsic#%d[%s]" i
+        (String.concat ", " (Array.to_list (Array.map print_type args)))
+  | Extern (i, args) ->
+      Printf.sprintf "extern#%d[%s]" i
+        (String.concat ", " (Array.to_list (Array.map print_type args)))
+  | Derived (c, args) ->
+      Printf.sprintf "derived callable#%d [%s]" (Ids.Callable_id.to_int c)
+        (String.concat ", " (Array.to_list (Array.map print_type args)))
+  | TypeQuery (k, args) ->
+      Printf.sprintf "%s[%s]" (type_query_name k)
+        (String.concat ", " (Array.to_list (Array.map print_type args)))
   | FnValue op -> Printf.sprintf "fn-value(%s)" (print_operand op)
 
 let print_rvalue (rv : rvalue) : string =

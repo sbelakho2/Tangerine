@@ -17,10 +17,10 @@ NOT. A module's family is never stronger than its committed evidence,
 and the shipped-std claims are never stronger than the families.
 
 **The enumeration is the gate.** The module list is COMPUTED from the
-`std/*.tg` glob — never typed. This tree enumerates **132 modules**
+`std/*.tg` glob — never typed. This tree enumerates **133 modules**
 (the reviewer's table enumerated 133: `std/postgres.tg` was merged into
 `std/db.tg` and `std/hash_tests.tg` was removed in earlier waves). A
-**new** `std/*.tg` file (a 133th module) has no contract, and the
+**new** `std/*.tg` file (a 134th module) has no contract, and the
 completeness gate FAILS until it receives a contract + proof tests —
 adding a module to std/ without completing its verification is
 impossible by construction.
@@ -30,7 +30,7 @@ impossible by construction.
 | Family | Minimum proof (the contract) | Modules |
 |--------|-------------------------------|---------|
 | `kernel` | the bootstrap ladder compiles the module at every stage (bootstrap/compiler_kernel.manifest + run_bootstrap.sh); the E106 sweep keeps it parse-clean | 14 |
-| `native` | a committed native behavior suite (tests/unit/*_rigor.tg, tests/*_test.tg) exercises the module's public API via `tg test` | 48 |
+| `native` | a committed native behavior suite (tests/unit/*_rigor.tg, tests/*_test.tg) exercises the module's public API via `tg test` | 49 |
 | `lane` | a committed CI lane verifies check + object + link/import smoke and the module's own @test suites where declared | 7 |
 | `parse-clean` | the E106 sweep only: `tg check` zero-diagnostics + the forbidden-syntax backstop (tests/run_stdlib_e106_sweep.sh) | 45 |
 | `experimental` | parse-clean only; the module is flagged experimental (item 33 stable-subset policy) and is EXPLICITLY EXCLUDED from the shipped-std behavior claims | 18 |
@@ -98,6 +98,7 @@ impossible by construction.
 | `exec` | native | `tests/exec_conservation_test.tg`; `tests/exec_admission_freeze_test.tg`; `tests/exec_global_executor_test.tg`; `tests/exec_par_family_test.tg`; `tests/exec_victim_range_test.tg` |
 | `ffi` | kernel | `bootstrap/compiler_kernel.manifest`; `tests/run_stdlib_e106_sweep.sh` |
 | `fft` | parse-clean | `tests/run_stdlib_e106_sweep.sh` |
+| `fixed` | native | `tests/unit/test_fixed_containers.tg` — the fixed-capacity collections (ArrayVec/RingBuffer/SpscQueue with split endpoints): the ownership-transferring push/pop semantics, the full-queue rejection that returns the item unconsumed, the ring wrap through the mask fast path, and the SPSC round trip (test_fixed_containers.tg); the capacity-per-type concrete structs are the kernel's expressible form (no const-generic value parameters) |
 | `float_control` | lane | `tests/run_stdlib_e106_sweep.sh`; `std/float_control.tg` |
 | `fmt` | kernel | `bootstrap/compiler_kernel.manifest`; `tests/run_stdlib_e106_sweep.sh` |
 | `fs` | kernel | `bootstrap/compiler_kernel.manifest`; `tests/run_stdlib_e106_sweep.sh` |
@@ -204,14 +205,14 @@ impossible by construction.
    feature rows, with the affected modules listed in `modules = [...]`),
    grouped here in the `experimental` family with the parse-clean minimum
    proof, and **explicitly excluded from the shipped-std-100%% claim**.
-   The claim covers the 114 non-experimental modules; the 18 experimental
+   The claim covers the 115 non-experimental modules; the 18 experimental
    modules remain in `std/` (parse-clean, never removed) but carry no
    behavior or target claim until their targets are served and their
    evidence lands.
 
 **The affected modules (18):** `android`, `cocoa`, `effects`, `embedded`, `gfx_gpu`, `gpu`, `gpu_metal`, `gpu_vulkan`, `gpu_webgpu`, `gui`, `hal`, `ios`, `kernel`, `simd`, `wasi`, `wasm`, `wasm_js`, `windows`.
 
-**The shipped-std-100% claim.** The claim is: every one of the 114
+**The shipped-std-100% claim.** The claim is: every one of the 115
 shipped (non-experimental) modules belongs to a family with a committed
 minimum proof, and every module — shipped or experimental — is
 parse-clean under the E106 sweep. The experimental modules are named

@@ -494,136 +494,50 @@ let enum_payloads_of (env : Typecheck.env) :
     env.Typecheck.nominals
 
 
-(* ── The final-journal chase (re-audit P12) — shared by typed_nodes_of,
-   the oracle's typed accepted-instance set, and the mono-poison debug —
-   a resolved type can carry an infer var that binds LATER in the same
-   item (`var v = Vec::new(); v.push(x)` — the call node's Vec[?] only
-   becomes Vec[T] after the push).  The journal is newest-first (unify
-   prepends every binding), and a var CAN be rebound when a later
-   unification runs against a stale earlier binding (the fn-end
-   return-slot unify starts from an empty subst — it re-solves a var the
-   body's calls already bound).  The indexed table keeps the FIRST-seen
-   (newest) entry per key (list-assoc per var would be quadratic over
-   the closure's nodes; the checker's own reads resolve newest-first),
-   and the bounded fixpoint resolves var-to-var chains without iterating
-   the whole journal. *)
-let final_journal_subst () : Type_repr.t -> Type_repr.t =
-  let jtbl : (Type_repr.generic_key, Type_repr.t) Hashtbl.t =
-    Hashtbl.create 65536
-  in
-  List.iter
-    (fun (k, v) -> if not (Hashtbl.mem jtbl k) then Hashtbl.add jtbl k v)
-    (Typecheck.final_journal ());
-  let rec sub1 (ty : Type_repr.t) : Type_repr.t =
-    match ty with
-    | Type_repr.Type_param id -> (
-        match Hashtbl.find_opt jtbl (Type_repr.KParam id) with
-        | Some s -> s
-        | None -> ty)
-    | Type_repr.Infer_var v -> (
-        match Hashtbl.find_opt jtbl (Type_repr.KVar v) with
-        | Some s -> s
-        | None -> ty)
-    | Type_repr.Raw_ptr (m, inner) -> Type_repr.Raw_ptr (m, sub1 inner)
-    | Type_repr.Ref_internal (m, inner) -> Type_repr.Ref_internal (m, sub1 inner)
-    | Type_repr.Tuple elems -> Type_repr.Tuple (Array.map sub1 elems)
-    | Type_repr.Fixed_array (inner, n) -> Type_repr.Fixed_array (sub1 inner, n)
-    | Type_repr.Named (id, args) -> Type_repr.Named (id, Array.map sub1 args)
-    | Type_repr.Function (params, ret) ->
-        Type_repr.Function
-          (Array.map (fun p -> { p with Type_repr.pt_type = sub1 p.Type_repr.pt_type }) params,
-           sub1 ret)
-    | Type_repr.Unit | Type_repr.Bool | Type_repr.Char | Type_repr.Int _
-    | Type_repr.Float _ | Type_repr.String | Type_repr.Int_literal _
-    | Type_repr.Error | Type_repr.Never ->
-        ty
-  in
-  let sub ty =
-    let rec go n ty =
-      let ty' = sub1 ty in
-      if Type_repr.compare ty ty' = 0 || n > 8 then ty' else go (n + 1) ty'
-    in
-    go 0 ty
-  in
-  sub
-
-(* ── The persistent typed-node bridge (re-audit: TypedProgram/TypedHIR) ──
-   The typechecker's node-keyed map (NodeId -> resolved node) crosses
-   into lowering as Mir_lower's typed_nodes channel, threaded alongside
-   lowering_env_of into every lower_function_with_variants call.  The
-   typed channel is authoritative in lowering when a node-keyed entry is
-   present; the cast rule consumes the checker-RESOLVED target
-   (declaration-owned GenericParamIds) and never re-derives it from
-   syntax positionally; the call rule consumes the checker-RESOLVED
-   callee + solved concrete substitution (tn_call), substituted through
-   the final journal exactly like every other consumer of the typed
-   channel (the oracle's accepted-instance set and the mono-poison
-   surface share final_journal_subst, so no consumer can see a stale
-   pre-journal var where another sees the resolved type). *)
+(* ── The persistent typed-node bridge (audit P0-8: the ALREADY-FINAL
+   typed channel — there is no journal chase anywhere downstream).
+   Typecheck.finalize_inference runs ONCE at the successful end of type
+   checking (after the declaration fixpoint and every item-body check)
+   and rewrites every accepted typed channel in place with the final
+   substitution — chasing Var -> Var -> ... -> Concrete chains, rejecting
+   cycles, asserting no genuinely dangling infer var survives in a
+   concrete position — then stores the immutable snapshot in the env and
+   CLEARS the mutable journal.  The readers below are therefore plain
+   folds over the already-final contents; the 0be387d-era read-time
+   chase (final_journal_subst) is gone, so every consumer — typed_nodes_of,
+   the typed-pattern bridges, the oracle's typed accepted-instance set,
+   the mono-poison debug — sees exactly the same final facts with no
+   per-consumer re-chase. *)
 let typed_nodes_of (env : Typecheck.env) : (Ids.Node_id.t * Mir_lower.typed_node) list =
-  let sub = final_journal_subst () in
   Hashtbl.fold
     (fun key (node : Typecheck.typed_node) acc ->
-      let tn = sub node.Typecheck.tn_type in
       ( key,
         {
-          Mir_lower.tn_type = tn;
-          tn_cast_target = Option.map sub node.Typecheck.tn_cast_target;
-          tn_call =
-            (match node.Typecheck.tn_call with
-             | Some (c, targs) -> Some (c, Array.map sub targs)
-             | None -> None);
+          Mir_lower.tn_type = node.Typecheck.tn_type;
+          tn_cast_target = node.Typecheck.tn_cast_target;
+          tn_call = node.Typecheck.tn_call;
         } )
       :: acc)
     env.Typecheck.typed_nodes []
 
 (* The typed-pattern channel (re-audit P0 #3): (match NodeId, arm index)
-   -> the arm's SEMANTIC pattern tree, resolved ONCE by the typechecker.
+   -> the arm's SEMANTIC pattern tree, resolved ONCE by the typechecker
+   and finalized by finalize_inference (typed_patterns /
+   typed_let_patterns / typed_for_patterns carry the chased final types).
    The lowerer consumes the semantic identities (VariantId, binding
    names/types, constants, field names) instead of re-interpreting the
    syntactic Ast.pattern. *)
-let subst_pattern (tp : Typed_pattern.t) : Typed_pattern.t =
-  let subst = Typecheck.final_journal () in
-  let rec go (p : Typed_pattern.t) : Typed_pattern.t =
-    match p with
-    | Typed_pattern.TP_wildcard -> p
-    | Typed_pattern.TP_literal (c, ty) ->
-        Typed_pattern.TP_literal (c, Typecheck.substitute_fixpoint subst ty)
-    | Typed_pattern.TP_binding (n, ty, m) ->
-        Typed_pattern.TP_binding (n, Typecheck.substitute_fixpoint subst ty, m)
-    | Typed_pattern.TP_variant (vid, ty, pats) ->
-        Typed_pattern.TP_variant
-          (vid, Typecheck.substitute_fixpoint subst ty, List.map go pats)
-    | Typed_pattern.TP_struct (tid, ty, fields) ->
-        Typed_pattern.TP_struct
-          (tid, Typecheck.substitute_fixpoint subst ty,
-           List.map (fun (fn, fp) -> (fn, go fp)) fields)
-    | Typed_pattern.TP_tuple (ty, pats) ->
-        Typed_pattern.TP_tuple
-          (Typecheck.substitute_fixpoint subst ty, List.map go pats)
-    | Typed_pattern.TP_or (pats, names) ->
-        Typed_pattern.TP_or (List.map go pats, names)
-    | Typed_pattern.TP_range (ty, a, b, c) ->
-        Typed_pattern.TP_range (Typecheck.substitute_fixpoint subst ty, a, b, c)
-  in
-  go tp
-
 let typed_for_patterns_of (env : Typecheck.env) :
     (Ids.Node_id.t * Typecheck.typed_for) list =
-  Hashtbl.fold
-    (fun k v acc ->
-      (k, { v with Typecheck.tf_pattern = subst_pattern v.Typecheck.tf_pattern }) :: acc)
-    env.Typecheck.typed_for_patterns []
+  Hashtbl.fold (fun k v acc -> (k, v) :: acc) env.Typecheck.typed_for_patterns []
 
 let typed_let_patterns_of (env : Typecheck.env) :
     (Ids.Node_id.t * Typed_pattern.t) list =
-  Hashtbl.fold (fun k v acc -> (k, subst_pattern v) :: acc)
-    env.Typecheck.typed_let_patterns []
+  Hashtbl.fold (fun k v acc -> (k, v) :: acc) env.Typecheck.typed_let_patterns []
 
 let typed_patterns_of (env : Typecheck.env) :
     ((Ids.Node_id.t * int) * Typed_pattern.t) list =
-  Hashtbl.fold (fun key tp acc -> (key, subst_pattern tp) :: acc)
-    env.Typecheck.typed_patterns []
+  Hashtbl.fold (fun key tp acc -> (key, tp) :: acc) env.Typecheck.typed_patterns []
 
 let lowering_env_of ?(items : Ast.item list = []) (env : Typecheck.env) : Mir_lower.func_env =
   (* both the qualified key and the bare name resolve (flat namespace) *)
@@ -779,6 +693,7 @@ let lowering_env_of ?(items : Ast.item list = []) (env : Typecheck.env) : Mir_lo
     fn_ret = Type_repr.Unit;
     struct_fields = struct_fields_of ~items env;
     enum_payloads = enum_payloads_of env;
+    copy_cache = Type_properties.create_cache ();
   }
 
 (* ── User-enum variant table (re-audit finding: the closure driver never
@@ -923,12 +838,11 @@ let closure_query_sigs ?(lowered = None)
      every other registered sig — the monomorphizer's exact-arity
      contract holds (one carried type argument per declared binder), and
      a generic caller's specialization substitutes the receiver type
-     through the call's instance args.  Their types may reference
-     inference vars solved by later items — substitute through the final
-     journal when building the entries. *)
-  let jtbl_subst =
-    Typecheck.substitute_fixpoint (Typecheck.final_journal ())
-  in
+     through the call's instance args.  Their types may have referenced
+     inference vars solved by later items — finalize_inference (audit
+     P0-8) rewrote every derived sig with the final substitution before
+     lowering, so the entries below are read as-is; there is no journal
+     chase left to run. *)
   let add_derived (sig_list : Mir_verify.query_sig list)
       (ts : Typecheck.typed_signature) : Mir_verify.query_sig list =
     if Hashtbl.mem excluded ts.Typecheck.ts_callable then sig_list
@@ -939,12 +853,8 @@ let closure_query_sigs ?(lowered = None)
           Array.of_list
             (List.map (fun (_, pid) -> Type_repr.Type_param pid)
                ts.Typecheck.ts_params_decl);
-        qs_params =
-          Array.map
-            (fun (p : Type_repr.param_type) ->
-              { p with Type_repr.pt_type = jtbl_subst p.Type_repr.pt_type })
-            ts.Typecheck.ts_params;
-        qs_ret = jtbl_subst ts.Typecheck.ts_return;
+        qs_params = ts.Typecheck.ts_params;
+        qs_ret = ts.Typecheck.ts_return;
       }
       :: sig_list
   in
@@ -1730,6 +1640,144 @@ let decl_fingerprint (env : Typecheck.env) (errs_by_mod : (string, string list) 
    growing env until no module makes progress).  The o_calls channel is
    reset per item inside check_program, so the driver's observable typed
    call count is sampled after every module check (a lower bound). *)
+(* ── audit P0-6: InstanceId-collision discipline ─────────────────
+   Every function body lower_closure emits is constructed together with
+   an instance_provenance record naming the SEMANTIC source declaration
+   it was lowered from.  The provenance map (InstanceId ->
+   instance_provenance) is maintained across the whole lowering:
+     - a NEW instance enters the map;
+     - a duplicate instance whose provenance is EXACTLY the same
+       semantic declaration (same registration identity, same
+       declaration, same generic substitutions, same origin) is the
+       same-declaration-twice case — allowed, the first lowering is
+       kept, the pair is recorded in the audit;
+     - a duplicate instance from a DIFFERENT declaration is a hard ICE
+       naming both provenances (two genuinely distinct declarations
+       sharing one instance identity is an ambiguous compilation —
+       silently emitting either body would be wrong).
+
+   Function declarations carry no parser-minted NodeId (the parser mints
+   ids for EXPRESSION nodes only, and the checker keys declarations by
+   their registration identity: the module-qualified fn name / the
+   (owner, method) key), so the declaration's identity in the
+   provenance is:
+     def_id              — the checker's registration identity render
+                           ("fn::<qname>" / "method::<owner>::<m>" /
+                           "test::<qname>" / nested qname)
+     declaration_node_id — a synthetic NEGATIVE NodeId minted
+                           deterministically per fn-decl span key
+                           (file_id, decl start) during lowering, so the
+                           same AST declaration always maps to one node
+                           id and distinct declarations never share one
+     declaration_span    — the fn-decl span
+     generic_arguments   — the instance's type arguments
+      origin_kind         — FreeFn | ImplMethod | TraitMethod | Builtin |
+                            NestedFn | DerivedFn *)
+
+type provenance_origin =
+  | FreeFn
+  | ImplMethod
+  | TraitMethod
+  | Builtin
+  | NestedFn
+  | DerivedFn
+
+type instance_provenance = {
+  prov_instance_id : Instance_id.t;
+  prov_callable_id : Ids.Callable_id.t;
+  prov_def_id : string;
+  prov_declaration_node_id : int;
+  prov_declaration_span : Span.span;
+  prov_generic_arguments : Type_repr.t array;
+  prov_origin_kind : provenance_origin;
+}
+
+let provenance_origin_name (o : provenance_origin) : string =
+  match o with
+  | FreeFn -> "FreeFn"
+  | ImplMethod -> "ImplMethod"
+  | TraitMethod -> "TraitMethod"
+  | Builtin -> "Builtin"
+  | NestedFn -> "NestedFn"
+  | DerivedFn -> "DerivedFn"
+
+let provenance_origin_equal (a : provenance_origin) (b : provenance_origin) : bool =
+  match a, b with
+  | FreeFn, FreeFn | ImplMethod, ImplMethod | TraitMethod, TraitMethod
+  | Builtin, Builtin | NestedFn, NestedFn | DerivedFn, DerivedFn ->
+      true
+  | _ -> false
+
+(* the same-declaration-twice predicate (audit P0-6): the ONLY allowed
+   duplicate is the same semantic source declaration discovered twice
+   through graph traversal — equal registration identity, equal
+   declaration (same span key), equal generic substitutions, equal
+   origin kind.  Anything else is an identity collision. *)
+let provenance_same_declaration (a : instance_provenance) (b : instance_provenance) : bool =
+  a.prov_def_id = b.prov_def_id
+  && a.prov_declaration_node_id = b.prov_declaration_node_id
+  && a.prov_declaration_span.Span.file_id = b.prov_declaration_span.Span.file_id
+  && a.prov_declaration_span.Span.start = b.prov_declaration_span.Span.start
+  && a.prov_declaration_span.Span.end_ = b.prov_declaration_span.Span.end_
+  && Array.length a.prov_generic_arguments = Array.length b.prov_generic_arguments
+  && Array.for_all2
+       (fun x y -> Type_repr.compare x y = 0)
+       a.prov_generic_arguments b.prov_generic_arguments
+  && provenance_origin_equal a.prov_origin_kind b.prov_origin_kind
+
+let render_provenance (p : instance_provenance) : string =
+  Printf.sprintf
+    "{ instance %s | callable#%d | def %s | origin %s | decl node#%d span %d:%d-%d | %d generic argument(s) }"
+    (Seed_mir.print_instance p.prov_instance_id)
+    (Ids.Callable_id.to_int p.prov_callable_id) p.prov_def_id
+    (provenance_origin_name p.prov_origin_kind) p.prov_declaration_node_id
+    p.prov_declaration_span.Span.file_id p.prov_declaration_span.Span.start
+    p.prov_declaration_span.Span.end_
+    (Array.length p.prov_generic_arguments)
+
+(* ── audit P0-7: the per-compilation audit/diagnostic state ────────
+   The completeness-oracle channels and the P0-6 provenance map live in
+   ONE per-compilation mutable record owned by closure_ctx (ctx_audit),
+   never in module-global refs — a second compilation on the same driver
+   process starts from a fresh audit and cannot observe another
+   compilation's lowering/oracle state.  (The checker's inference
+   journal is per-compilation too: finalize_inference — audit P0-8 —
+   freezes it into env.final_subst and clears the mutable journal at
+   the successful end of type checking, before this audit or any other
+   post-typing consumer reads the typed channels.) *)
+type closure_audit = {
+  (* the P0-6 provenance map: InstanceId -> the provenance of the
+     KEPT (first) lowering; same-declaration-twice pairs the discipline
+     allowed are recorded separately *)
+  mutable aud_prov_map : (Instance_id.t, instance_provenance) Hashtbl.t;
+  mutable aud_same_decl_dedup : (instance_provenance * instance_provenance) list;
+  (* the completeness-oracle channels (re-audit P0 #2 / items 23/24) —
+     built by oracle_of_ctx, consumed by print_oracle_rows in the same
+     breath *)
+  mutable aud_instance_sets : (Instance_id.t list * Instance_id.t list);
+  mutable aud_raw_typed_set : Instance_id.t list;
+  mutable aud_static_sets : (string list * string list);
+  mutable aud_template_sets : (int list * int list);
+  mutable aud_raw_template_set : int list;
+  mutable aud_name_tbl : (int, string) Hashtbl.t option;
+  mutable aud_node_tbl : (int, string * (int * int)) Hashtbl.t option;
+  mutable aud_typed_entries : (int * Instance_id.t) list;
+}
+
+let fresh_closure_audit () : closure_audit =
+  {
+    aud_prov_map = Hashtbl.create 8192;
+    aud_same_decl_dedup = [];
+    aud_instance_sets = ([], []);
+    aud_raw_typed_set = [];
+    aud_static_sets = ([], []);
+    aud_template_sets = ([], []);
+    aud_raw_template_set = [];
+    aud_name_tbl = None;
+    aud_node_tbl = None;
+    aud_typed_entries = [];
+  }
+
 type closure_ctx = {
   ctx_repo_root : string;
   ctx_manifest_path : string;
@@ -1755,6 +1803,9 @@ type closure_ctx = {
      stderr.  Emission order; [] in strict mode (the strict run IS the
      semantic pipeline). *)
   ctx_strict_diags : Diagnostic.diagnostic list;
+  (* audit P0-7: the per-compilation audit/diagnostic state (oracle
+     channels + the P0-6 provenance map) — never module-global refs *)
+  mutable ctx_audit : closure_audit;
   mutable lowered_methods : int;
   (* re-audit P0-E: the CFG resource dataflow program (the authoritative
      path-sensitive ownership pass) — set once the template MIR exists *)
@@ -1952,6 +2003,25 @@ let run_closure_pipeline_impl ~(repo_root : string) ~(manifest_path : string)
             (fun key errs acc -> List.map (fun e -> key ^ ": " ^ e) errs @ acc)
             errs_by_mod []
         in
+        (* ── audit P0-8: the ONE inference-finalization point of the
+           closure.  Runs at the successful end of type checking — the
+           declaration fixpoint has converged and EVERY item body of
+           every module has been checked (a var may resolve later in the
+           same item, so only finalizing here, when the journal can no
+           longer grow, covers every late binding) — and only on a
+           zero-error closure (the accepted typed channels describe the
+           program handed to lowering; a closure with type errors never
+           lowers).  finalize_inference rewrites every accepted typed
+           channel in place with the final substitution (typed nodes,
+           typed patterns, registered signatures, statics/consts, the
+           derived/query contract sigs), asserts no inference variable
+           survives in a concrete position, stores the immutable
+           snapshot in the env, and clears the mutable journal — MIR
+           lowering and every post-typing consumer (typed_nodes_of, the
+           pattern bridges, closure_query_sigs, the oracle set, the
+           mono-poison debug) read the ALREADY-FINAL channel contents
+           and never chase a mutable historical journal again. *)
+        (if type_errors = [] then env := Typecheck.finalize_inference !env);
         (* ── the TYPED-PROFILE firewall (the audit's P0): the
            syntactic subset gate says the parser sees no categorically
            forbidden AST form — it does NOT prove every TYPED use of
@@ -2024,6 +2094,7 @@ let run_closure_pipeline_impl ~(repo_root : string) ~(manifest_path : string)
             ctx_profile_findings = List.length profile_findings;
             ctx_strict_fallbacks = fallback_activations;
             ctx_strict_diags = !strict_audit_diags;
+            ctx_audit = fresh_closure_audit ();
             lowered_methods = 0;
             ctx_cfg_program = None }
       end)
@@ -2037,11 +2108,6 @@ let run_closure_pipeline ~(repo_root : string) ~(manifest_path : string)
 
 (* Lower every top-level free function of the closure into one Seed MIR
    program (flat namespace; shared by bootstrap-check and compile). *)
-(* the fn-decl spans (file_id, start) of the duplicate-instance bodies
-   the instance-uniqueness filter below drops (filled by lower_closure,
-   consumed by oracle_of_ctx — the single-threaded driver runs lowering
-   before the oracle). *)
-let oracle_dropped_decl_spans : (int * int) list ref = ref []
 (* Materialize program.types from the typed nominal registry (audit P0-8):
    concrete (non-generic) structs/enums become StructDef/EnumDef entries
    with deterministic field/variant identities; generic nominals are
@@ -2062,20 +2128,84 @@ let lower_closure (ctx : closure_ctx) : Seed_mir.program =
      structural gate's duplicate-instance audit can name the offenders *)
   let dup_debug = Sys.getenv_opt "TANGERINE_DEBUG_DUP" <> None in
   let lowered_src = ref [] in
-  (* per-lowering fn-decl spans, parallel to !mir_funcs (both prepend in
-     the same order) — the instance-uniqueness filter below reports the
-     DROPPED duplicate bodies' decl spans to the oracle, so accepted
-     call records inside a body the seed never emits can be excluded *)
-  let lowered_decl_spans = ref [] in
-  let note_decl (f : Seed_mir.function_) (span : Span.span) =
-    ignore f;
-    lowered_decl_spans := (span.Span.file_id, span.Span.start) :: !lowered_decl_spans
-  in
   let note (f : Seed_mir.function_) (loc : string) =
     if dup_debug then
       lowered_src :=
         (Seed_mir.print_instance f.Seed_mir.instance, f.Seed_mir.name, loc)
         :: !lowered_src
+  in
+  (* ── audit P0-6: the per-lowering declaration-identity machinery ──
+     Function declarations carry no parser-minted NodeId, so each
+     distinct fn-decl span key is minted a synthetic NEGATIVE NodeId on
+     first sight (deterministic: the lowering walks the graph in a fixed
+     order) — the same AST declaration always maps to the same node id,
+     distinct declarations never share one.  The provenance map enforces
+     the InstanceId-collision discipline: a duplicate instance is kept
+     only when its provenance is the SAME semantic declaration (see
+     provenance_same_declaration); anything else is a hard ICE naming
+     both the existing and the incoming provenance. *)
+  let audit = ctx.ctx_audit in
+  Hashtbl.reset audit.aud_prov_map;
+  audit.aud_same_decl_dedup <- [];
+  let decl_node_ids : (int * int, int) Hashtbl.t = Hashtbl.create 8192 in
+  let next_decl_node = ref (-2) in
+  let decl_node_of (span : Span.span) : int =
+    let k = (span.Span.file_id, span.Span.start) in
+    match Hashtbl.find_opt decl_node_ids k with
+    | Some n -> n
+    | None ->
+        let n = !next_decl_node in
+        next_decl_node := n - 1;
+        Hashtbl.add decl_node_ids k n;
+        n
+  in
+  let span_key (s : Span.span) : int * int = (s.Span.file_id, s.Span.start) in
+  let prov_of (ts : Typecheck.typed_signature) (def_id : string)
+      (origin : provenance_origin) (decl : Span.span)
+      (f : Seed_mir.function_) : instance_provenance =
+    {
+      prov_instance_id = f.Seed_mir.instance;
+      prov_callable_id = ts.Typecheck.ts_callable;
+      prov_def_id = def_id;
+      prov_declaration_node_id = decl_node_of decl;
+      prov_declaration_span = decl;
+      prov_generic_arguments = Instance_id.type_args f.Seed_mir.instance;
+      prov_origin_kind = origin;
+    }
+  in
+  (* admit one lowered body through the InstanceId-collision discipline:
+     first lowering of an instance enters the map; an EXACT same
+     declaration re-discovery is allowed and keeps the first lowering;
+     any other collision is a hard ICE. *)
+  let admit (f : Seed_mir.function_) (prov : instance_provenance) : unit =
+    let inst = f.Seed_mir.instance in
+    match Hashtbl.find_opt audit.aud_prov_map inst with
+    | None ->
+        Hashtbl.add audit.aud_prov_map inst prov;
+        mir_funcs := f :: !mir_funcs
+    | Some existing ->
+        if provenance_same_declaration existing prov then
+          audit.aud_same_decl_dedup <- (existing, prov) :: audit.aud_same_decl_dedup
+        else
+          failwith
+            (Printf.sprintf
+               "ICE: InstanceId collision: existing: %s\nICE: InstanceId collision: incoming: %s\n\
+                (two genuinely distinct declarations share one instance identity — the checker's \
+                registration must give every distinct declaration its own callable id; refusing to \
+                emit an ambiguous compilation)"
+               (render_provenance existing) (render_provenance prov))
+  in
+  (* the canonical-declaration gate (audit P0-6): the checker registers
+     a free fn / method key ONCE, from its canonical declaration, and a
+     module that declares the same name twice (the kernel's
+     duplicate-definition tolerance — codegen.tg carries whole duplicated
+     regions) marks every other copy duplicate.  Only the canonical
+     declaration's body is lowered: the non-canonical copies are not
+     part of the typed program. *)
+  let is_canonical_decl (reg_key : string) (decl : Span.span) : bool =
+    match Hashtbl.find_opt ctx.ctx_env.Typecheck.state.decl_keys reg_key with
+    | Some k -> k = span_key decl
+    | None -> true
   in
   List.iter
     (fun node ->
@@ -2094,6 +2224,9 @@ let lower_closure (ctx : closure_ctx) : Seed_mir.program =
              and conventions come from ts_params, and a missing semantic
              identity is a hard invariant break, never a Unit/callable-0
              fallback *)
+          let qname =
+            String.concat "::" (node.Module_graph.node_path @ [ fd.Ast.fn_sig.Ast.sig_name ])
+          in
           let ts =
             match
               lookup_typed_fn_qualified ctx.ctx_env node.Module_graph.node_path
@@ -2106,28 +2239,29 @@ let lower_closure (ctx : closure_ctx) : Seed_mir.program =
                      "lower_closure: function `%s` has no typed signature (frontend accepted it, so this is a compiler invariant break — refusing to lower with a fabricated identity)"
                      fd.Ast.fn_sig.Ast.sig_name)
           in
-          let f =
-            Mir_lower.lower_function_with_variants
-              ~typed_for_patterns:(typed_for_patterns_of ctx.ctx_env)
-              ~typed_let_patterns:(typed_let_patterns_of ctx.ctx_env)
-              ~typed_nodes:(typed_nodes_of ctx.ctx_env)
-                    ~typed_patterns:(typed_patterns_of ctx.ctx_env)
-              variants
-              { base with Mir_lower.fn_ret = ts.Typecheck.ts_return }
-              fd.Ast.fn_sig.Ast.sig_name
-              (Ids.Callable_id.to_int ts.Typecheck.ts_callable)
-              (Array.of_list
-                 (List.map (fun (_, pid) -> Type_repr.Type_param pid)
-                    ts.Typecheck.ts_params_decl))
-              (Array.map (fun p -> p.Type_repr.pt_convention) ts.Typecheck.ts_params)
-              ~param_tys_opt:(Array.map (fun p -> p.Type_repr.pt_type) ts.Typecheck.ts_params)
-              fd
-          in
-          mir_funcs := f :: !mir_funcs;
-          note_decl f fd.Ast.fn_span;
-          note f
-            (Printf.sprintf "free fn in module %s"
-               (String.concat "::" node.Module_graph.node_path)))
+          if is_canonical_decl ("fn::" ^ qname) fd.Ast.fn_span then begin
+            let f =
+              Mir_lower.lower_function_with_variants
+                ~typed_for_patterns:(typed_for_patterns_of ctx.ctx_env)
+                ~typed_let_patterns:(typed_let_patterns_of ctx.ctx_env)
+                ~typed_nodes:(typed_nodes_of ctx.ctx_env)
+                      ~typed_patterns:(typed_patterns_of ctx.ctx_env)
+                variants
+                { base with Mir_lower.fn_ret = ts.Typecheck.ts_return }
+                fd.Ast.fn_sig.Ast.sig_name
+                (Ids.Callable_id.to_int ts.Typecheck.ts_callable)
+                (Array.of_list
+                   (List.map (fun (_, pid) -> Type_repr.Type_param pid)
+                      ts.Typecheck.ts_params_decl))
+                (Array.map (fun p -> p.Type_repr.pt_convention) ts.Typecheck.ts_params)
+                ~param_tys_opt:(Array.map (fun p -> p.Type_repr.pt_type) ts.Typecheck.ts_params)
+                fd
+            in
+            admit f (prov_of ts qname FreeFn fd.Ast.fn_span f);
+            note f
+              (Printf.sprintf "free fn in module %s"
+                 (String.concat "::" node.Module_graph.node_path))
+          end)
         funcs;
       (* methods: every callable in the typed universe reaches Seed MIR —
          the impl methods lower with their typed signatures (the audit's
@@ -2143,33 +2277,42 @@ let lower_closure (ctx : closure_ctx) : Seed_mir.program =
                       ctx.ctx_env.Typecheck.methods
                   with
                   | Some ts ->
-                      let f =
-                        Mir_lower.lower_function_with_variants
-                          ~typed_nodes:(typed_nodes_of ctx.ctx_env)
-                          ~typed_patterns:(typed_patterns_of ctx.ctx_env)
-                          ~typed_for_patterns:(typed_for_patterns_of ctx.ctx_env)
-                          ~typed_let_patterns:(typed_let_patterns_of ctx.ctx_env)
-                          variants
-                          { base with Mir_lower.fn_ret = ts.Typecheck.ts_return }
-                          m.Ast.fn_sig.Ast.sig_name
-                          (Ids.Callable_id.to_int ts.Typecheck.ts_callable)
-                          (Array.of_list
-                             (List.map (fun (_, pid) -> Type_repr.Type_param pid)
-                                ts.Typecheck.ts_params_decl))
-                          (Array.map (fun p -> p.Type_repr.pt_convention) ts.Typecheck.ts_params)
-                          ~param_tys_opt:(Array.map (fun p -> p.Type_repr.pt_type) ts.Typecheck.ts_params)
-                          m
+                      let reg_key =
+                        "method::" ^ d.Ast.i_target_type ^ "::" ^ m.Ast.fn_sig.Ast.sig_name
                       in
-                      mir_funcs := f :: !mir_funcs;
-                      incr lowered_methods;
-                      note_decl f m.Ast.fn_span;
-                      note f
-                        (Printf.sprintf "method %s on %s%s in module %s"
-                           m.Ast.fn_sig.Ast.sig_name d.Ast.i_target_type
-                           (match d.Ast.i_trait_name with
-                            | Some t -> Printf.sprintf " via trait %s" t
-                            | None -> "")
-                           (String.concat "::" node.Module_graph.node_path))
+                      if is_canonical_decl reg_key m.Ast.fn_span then begin
+                        let f =
+                          Mir_lower.lower_function_with_variants
+                            ~typed_nodes:(typed_nodes_of ctx.ctx_env)
+                            ~typed_patterns:(typed_patterns_of ctx.ctx_env)
+                            ~typed_for_patterns:(typed_for_patterns_of ctx.ctx_env)
+                            ~typed_let_patterns:(typed_let_patterns_of ctx.ctx_env)
+                            variants
+                            { base with Mir_lower.fn_ret = ts.Typecheck.ts_return }
+                            m.Ast.fn_sig.Ast.sig_name
+                            (Ids.Callable_id.to_int ts.Typecheck.ts_callable)
+                            (Array.of_list
+                               (List.map (fun (_, pid) -> Type_repr.Type_param pid)
+                                  ts.Typecheck.ts_params_decl))
+                            (Array.map (fun p -> p.Type_repr.pt_convention) ts.Typecheck.ts_params)
+                            ~param_tys_opt:(Array.map (fun p -> p.Type_repr.pt_type) ts.Typecheck.ts_params)
+                            m
+                        in
+                        admit f
+                          (prov_of ts reg_key
+                             (match d.Ast.i_trait_name with
+                              | Some _ -> TraitMethod
+                              | None -> ImplMethod)
+                             m.Ast.fn_span f);
+                        incr lowered_methods;
+                        note f
+                          (Printf.sprintf "method %s on %s%s in module %s"
+                             m.Ast.fn_sig.Ast.sig_name d.Ast.i_target_type
+                             (match d.Ast.i_trait_name with
+                              | Some t -> Printf.sprintf " via trait %s" t
+                              | None -> "")
+                             (String.concat "::" node.Module_graph.node_path))
+                      end
                   | None -> ())
                 d.Ast.i_methods)
           | _ -> ())
@@ -2202,64 +2345,52 @@ let lower_closure (ctx : closure_ctx) : Seed_mir.program =
           ~param_tys_opt:(Array.map (fun p -> p.Type_repr.pt_type) ts.Typecheck.ts_params)
           fd
       in
-      mir_funcs := f :: !mir_funcs;
-      note_decl f fd.Ast.fn_span;
+      admit f (prov_of ts qname NestedFn fd.Ast.fn_span f);
       note f (Printf.sprintf "nested fn %s" qname))
     ctx.ctx_env.Typecheck.state.nested_functions;
+  (* ── derived-operation synthesis (audit P0-12) ────────────────────
+     Every derived signature the checker accepted (state.derived_sigs —
+     the derived Clone::clone / to_string / eq / scalar-hash ops minted
+     per call site when no registered impl exists) lowers here as a REAL
+     compiler-generated function: Mir_derive.synthesize emits the body
+     (per-field clone/rendering over the receiver's nominal def; the
+     signature carries the receiver's own generic carriers, so the
+     function is a genuine template the monomorphizer specializes).  The
+     emitted function carries the SAME callable identity every call site
+     references — the closure's function table and the callable table
+     agree, the verifier checks a real body, and no body-less derived
+     User call can reach the VM. *)
+  let seen_derived = Hashtbl.create 256 in
+  List.iter
+    (fun ((callable, ts) : Ids.Callable_id.t * Typecheck.typed_signature) ->
+      if not (Hashtbl.mem seen_derived callable) then begin
+        Hashtbl.add seen_derived callable ();
+        let f = Mir_derive.synthesize ctx.ctx_env ts in
+        admit f (prov_of ts ts.Typecheck.ts_name DerivedFn ts.Typecheck.ts_span f);
+        note f (Printf.sprintf "derived op %s" ts.Typecheck.ts_name)
+      end)
+    ctx.ctx_env.Typecheck.state.derived_sigs;
   ctx.lowered_methods <- !lowered_methods;
-  (* instance-uniqueness (the duplicate-function-instance audit): the
-     lowered function list must contain each instance identity AT MOST
-     once.  The same instance can legitimately be produced by several
-     AST sites — a source file that declares a function twice (the
-     kernel's duplicate-definition tolerance registers the name once),
-     an owner that is reached under two spellings the resolver aliases
-     (impl String vs impl str, or the builtin-type collapse where every
-     `impl Eq for <builtin>` shares one resolver CallableId), or an
-     impl method re-declared across two impl blocks of one type.  In
-     every such case the checker's typed universe already collapsed the
-     sites onto one identity, so the LOWERED program keeps the FIRST
-     lowering (monomorphization's find-template first-wins semantics)
-     and drops the later duplicates — never a second function on the
-     same instance. *)
-  let functions =
-    let seen = Hashtbl.create 4096 in
-    let kept = ref [] in
-    let dropped_spans = ref [] in
-    List.iter2
-      (fun (f : Seed_mir.function_) (decl_span : int * int) ->
-        let key = Seed_mir.print_instance f.Seed_mir.instance in
-        if Hashtbl.mem seen key then dropped_spans := decl_span :: !dropped_spans
-        else begin
-          Hashtbl.add seen key ();
-          kept := f :: !kept
-        end)
-      (List.rev !mir_funcs)
-      (List.rev !lowered_decl_spans);
-    oracle_dropped_decl_spans := !dropped_spans;
-    List.rev !kept
-  in
+  (* audit P0-6 report: the map holds every emitted instance exactly
+     once, the same-declaration-twice list the discipline allowed, and
+     the checker's duplicate-declaration list (the non-canonical copies
+     the canonical gate skipped) *)
+  let functions = List.rev !mir_funcs in
   if dup_debug then begin
-    let tbl = Hashtbl.create 256 in
-    List.iter
-      (fun (inst, name, loc) ->
-        let cur =
-          match Hashtbl.find_opt tbl inst with Some l -> l | None -> []
-        in
-        Hashtbl.replace tbl inst ((name, loc) :: cur))
-      !lowered_src;
     let dups = ref 0 in
-    Hashtbl.iter
-      (fun inst entries ->
-        if List.length entries > 1 then begin
-          incr dups;
-          Printf.eprintf "DUP-INSTANCE %s (%d lowerings):\n" inst
-            (List.length entries);
-          List.iter
-            (fun (name, loc) -> Printf.eprintf "  fn %s  [%s]\n" name loc)
-            entries
-        end)
-      tbl;
-    Printf.eprintf "DUP-SUMMARY duplicate instances=%d lowered functions=%d\n"
+    List.iter
+      (fun (existing, incoming) ->
+        incr dups;
+        Printf.eprintf "DUP-INSTANCE (same declaration re-discovered — kept first) %s\n  existing: %s\n  incoming: %s\n"
+          (Seed_mir.print_instance existing.prov_instance_id)
+          (render_provenance existing) (render_provenance incoming))
+      audit.aud_same_decl_dedup;
+    List.iter
+      (fun (reg_key, canon, dup) ->
+        Printf.eprintf "DUP-DECL %s canonical decl %d:%d duplicate decl %d:%d (skipped)\n"
+          reg_key (fst canon) (snd canon) (fst dup) (snd dup))
+      (List.rev ctx.ctx_env.Typecheck.state.dup_decls);
+    Printf.eprintf "DUP-SUMMARY same-declaration dedup=%d lowered functions=%d\n"
       !dups (List.length !lowered_src);
     let seen = Hashtbl.create 256 in
     List.iter
@@ -2282,7 +2413,18 @@ let lower_closure (ctx : closure_ctx) : Seed_mir.program =
    (ClosureAgg aggregates and function-pointer constants), plus the
    callable-instance SET (re-audit P0 #2): every `User inst` callee of
    a Call terminator, deduped — the MIR-side identity set the oracle's
-   call row compares against the typed accepted instances. *)
+   call row compares against the typed accepted instances.
+
+   The ~exclude_callables surface (audit P0-12): the compiler-synthesized
+   DERIVED functions (Mir_derive bodies).  Their templates and their
+   internal User callees (the render intrinsics, the universal
+   to_string) have no checker-side AST nodes — like the static-
+   initializer expressions, they are lowering-generated internals, so
+   the identity rows exclude them (their own emitted instances and the
+   calls inside their bodies) exactly as the derived contracts were
+   reported out-of-domain before the synthesized bodies landed.  The
+   calls REAL bodies make to the derived callables stay counted on both
+   sides. *)
 type mir_stats = {
   ms_functions : int;
   ms_statics : int;
@@ -2304,7 +2446,15 @@ type mir_stats = {
   ms_static_names : string list;
 }
 
-let count_mir_stats (prog : Seed_mir.program) : mir_stats =
+let count_mir_stats ?(exclude_callables : Ids.Callable_id.t list = [])
+    (prog : Seed_mir.program) : mir_stats =
+  let excluded = Hashtbl.create 256 in
+  List.iter
+    (fun c -> Hashtbl.replace excluded (Ids.Callable_id.to_int c) ())
+    exclude_callables;
+  let is_excluded_fn (f : Seed_mir.function_) : bool =
+    Hashtbl.mem excluded (Ids.Callable_id.to_int (Instance_id.callable f.Seed_mir.instance))
+  in
   let calls = ref 0 and zeros = ref 0 and enums = ref 0 and closures = ref 0 in
   let instances = ref [] in
   let scan_place (p : Seed_mir.place) =
@@ -2339,6 +2489,10 @@ let count_mir_stats (prog : Seed_mir.program) : mir_stats =
   in
   Array.iter
     (fun (f : Seed_mir.function_) ->
+      (* the synthesized derived bodies are lowering-generated internals
+         (their templates and internal User callees have no checker-side
+         nodes): skip them in the identity rows *)
+      if not (is_excluded_fn f) then
       Array.iter
         (fun (b : Seed_mir.block) ->
           List.iter
@@ -2352,20 +2506,28 @@ let count_mir_stats (prog : Seed_mir.program) : mir_stats =
                   incr enums
               | _ -> ())
             b.Seed_mir.statements;
-          (match b.Seed_mir.terminator with
-           | Seed_mir.Call (dest, callee, args, _, _) ->
-               scan_place dest;
-               (match callee with
-                | Seed_mir.User inst ->
-                    incr calls;
-                    instances := inst :: !instances;
-                    if Ids.Callable_id.to_int (Instance_id.callable inst) = 0 then incr zeros
-                | Seed_mir.FnValue op -> scan_operand op
-                | _ -> ());
-               Array.iter (fun a -> scan_operand a.Seed_mir.value) args
-           | Seed_mir.SwitchInt (op, _, _) | Seed_mir.Assert (op, _, _, _) -> scan_operand op
-           | Seed_mir.Drop (p, _, _) | Seed_mir.Deinit (p, _, _) -> scan_place p
-           | _ -> ()))
+           (match b.Seed_mir.terminator with
+            | Seed_mir.Call (dest, callee, args, _, _) ->
+                scan_place dest;
+                (match callee with
+                 | Seed_mir.User inst ->
+                     incr calls;
+                     instances := inst :: !instances;
+                     if Ids.Callable_id.to_int (Instance_id.callable inst) = 0 then incr zeros
+                 | Seed_mir.Derived (c, cargs) ->
+                     (* audit P0-5: the derived-contract class names the
+                        same emitted-body instance the call references —
+                        counted like a User callee for the identity rows *)
+                     let inst = Instance_id.make ~callable:c ~type_args:cargs in
+                     incr calls;
+                     instances := inst :: !instances;
+                     if Ids.Callable_id.to_int c = 0 then incr zeros
+                 | Seed_mir.FnValue op -> scan_operand op
+                 | _ -> ());
+                Array.iter (fun a -> scan_operand a.Seed_mir.value) args
+            | Seed_mir.SwitchInt (op, _, _) | Seed_mir.Assert (op, _, _, _) -> scan_operand op
+            | Seed_mir.Drop (p, _, _) | Seed_mir.Deinit (p, _, _) -> scan_place p
+            | _ -> ()))
         f.Seed_mir.blocks)
     prog.Seed_mir.functions;
   { ms_functions = Array.length prog.Seed_mir.functions;
@@ -2382,7 +2544,9 @@ let count_mir_stats (prog : Seed_mir.program) : mir_stats =
            (Array.map
               (fun (f : Seed_mir.function_) ->
                 Ids.Callable_id.to_int (Instance_id.callable f.Seed_mir.instance))
-              prog.Seed_mir.functions));
+              (Array.of_list
+                 (Array.to_list prog.Seed_mir.functions
+                  |> List.filter (fun f -> not (is_excluded_fn f))))));
     ms_static_names =
       List.map (fun (n, _, _, _) -> n) (Array.to_list prog.Seed_mir.statics) }
 
@@ -2406,83 +2570,45 @@ type oracle_counts = {
   oc_skipped : bool;
 }
 
-(* The oracle's identity-set channel (re-audit P0 #2).  oracle_counts
-   is a FROZEN public record — tg_pipeline_smoke constructs it
-   literally — so the semantic identity sets ride beside it: each
-   oracle_of_ctx call records (typed accepted callable instances, MIR
-   callable instances) here, and print_oracle_rows consumes them in
-   the same breath.  Single-threaded driver; set immediately before
-   every print. *)
-let oracle_instance_sets : (Instance_id.t list * Instance_id.t list) ref =
-  ref ([], [])
-
-(* TANGERINE_DEBUG_ORACLE: the FULL chased typed accepted set (before
-   the User-dispatch-domain filter), so the diagnostics can report how
-   many accepted instances sit outside the comparison domain *)
-let oracle_raw_typed_set : Instance_id.t list ref = ref []
-
-(* re-audit item 23/24: the identity-set channels for the statics and
-   the callable-template domains — (typed required, MIR emitted) pairs
-   compared as sets, with the missing/extra differences reported; the
-   counter rows remain telemetry only *)
-let oracle_static_sets : (string list * string list) ref = ref ([], [])
-let oracle_template_sets : (int list * int list) ref = ref ([], [])
-
-(* TANGERINE_DEBUG_ORACLE: the FULL typed declared template set (before
-   the emitted-body-domain filter), so the diagnostics can report the
-   declared-but-bodyless registrations *)
-let oracle_raw_template_set : int list ref = ref []
-
-(* TANGERINE_DEBUG_ORACLE: the callable-id -> registered-name table for
-   the missing/extra diagnostics (built by oracle_of_ctx, consumed by
-   print_oracle_rows in the same breath — single-threaded driver). *)
-let oracle_name_tbl : (int, string) Hashtbl.t option ref = ref None
-
-(* TANGERINE_DEBUG_ORACLE: NodeId -> (enclosing-item display, enclosing
-   fn-decl span (file_id, start)), so a missing/extra instance can be
-   traced to the exact source item whose body recorded the call, and
-   records inside a duplicate-function-instance body that the lowering
-   dedup DROPPED can be excluded (a dropped body never emits its
-   calls). *)
-let oracle_node_tbl : (int, string * (int * int)) Hashtbl.t option ref =
-  ref None
-
-(* TANGERINE_DEBUG_ORACLE: the raw (NodeId, chased instance) records of
-   the typed side, so the diagnostics can name every span that produced
-   a missing instance. *)
-let oracle_typed_entries : (int * Instance_id.t) list ref = ref []
-
 (* TANGERINE_DEBUG_ORACLE: dump every MIR User callee instance grouped
    by its enclosing seed function, so a missing/extra instance can be
    matched against what the lowering ACTUALLY emitted per function. *)
 let debug_dump_mir_calls (prog : Seed_mir.program) : unit =
   if Sys.getenv_opt "TANGERINE_DEBUG_ORACLE" <> None then begin
-    let counts = Hashtbl.create 65536 in
-    let key_of (fn : string) (inst : Instance_id.t) : string =
-      Printf.sprintf "%s -> %s" fn (Seed_mir.print_instance inst)
-    in
-    Array.iter
-      (fun (f : Seed_mir.function_) ->
-        Array.iter
-          (fun (b : Seed_mir.block) ->
+    (* audit P1-23: the counting key is the caller's source fn name
+       paired with the STRUCTURAL callee instance — the instance is
+       grouped by Instance_id, rendered only for the printed row *)
+    let counts : (string * Instance_id.t, int) Hashtbl.t = Hashtbl.create 65536 in
+  Array.iter
+    (fun (f : Seed_mir.function_) ->
+      Array.iter
+        (fun (b : Seed_mir.block) ->
             match b.Seed_mir.terminator with
-            | Seed_mir.Call (_, Seed_mir.User inst, _, _, _) ->
-                let k = key_of f.Seed_mir.name inst in
-                Hashtbl.replace counts k
-                  (1 + Option.value ~default:0 (Hashtbl.find_opt counts k))
+            | Seed_mir.Call (_, callee, _, _, _) -> (
+                match Seed_mir.callee_instance callee with
+                | Some inst ->
+                    let k = (f.Seed_mir.name, inst) in
+                    Hashtbl.replace counts k
+                      (1 + Option.value ~default:0 (Hashtbl.find_opt counts k))
+                | None -> ())
             | _ -> ())
           f.Seed_mir.blocks)
       prog.Seed_mir.functions;
     let lines =
-      Hashtbl.fold (fun k c acc -> (c, k) :: acc) counts []
-      |> List.sort (fun (c1, k1) (c2, k2) ->
+      Hashtbl.fold (fun (fn, inst) c acc -> (c, fn, inst) :: acc) counts []
+      |> List.sort (fun (c1, fn1, i1) (c2, fn2, i2) ->
              let c = compare c2 c1 in
-             if c <> 0 then c else String.compare k1 k2)
+             if c <> 0 then c
+             else
+               let s = String.compare fn1 fn2 in
+               if s <> 0 then s else Instance_id.compare i1 i2)
     in
     Printf.printf "    ORACLE-DEBUG MIR call terminators by fn (count, fn -> instance): %d distinct\n"
       (List.length lines);
     List.iter
-      (fun (c, k) -> Printf.printf "    ORACLE-DEBUG MIR-call %d  %s\n" c k)
+      (fun (c, fn, inst) ->
+        Printf.printf "    ORACLE-DEBUG MIR-call %d  %s -> %s\n" c fn
+          (Seed_mir.print_instance inst))
       lines;
     let want_full name =
       List.exists
@@ -2512,14 +2638,15 @@ let debug_dump_mir_calls (prog : Seed_mir.program) : unit =
    (statement/expr nests, match/if arms, patterns' literal exprs, nested
    fn items, impl/struct/trait method bodies, const/static
    initializers); nested ModuleDef/EditionDecl bodies are separate graph
-   nodes and are skipped here.  The fn-decl span lets the oracle exclude
-   accepted records inside duplicate-function-instance bodies the
-   lowering DEDUP dropped (they never emit their calls); the display
-   tags the item kinds that never lower at all (`::static `, `::const `,
-   `::field `, `::macro `, `::test `, `::trait(`, `::struct(`). *)
+   nodes and are skipped here.  The display tags the item kinds that
+   never lower at all (`::static `, `::const `, `::field `, `::macro `,
+   `::test `, `::trait(`, `::struct(`).  audit P0-6/P0-7: the table
+   lives in the ctx's per-compilation audit (never a global), and it
+   describes the REAL typed program — duplicate declarations are no
+   longer body-checked, so no dropped-body exclusion exists. *)
 let build_oracle_node_table (ctx : closure_ctx) : unit =
   let tbl : (int, string * (int * int)) Hashtbl.t = Hashtbl.create 200000 in
-  oracle_node_tbl := Some tbl;
+  ctx.ctx_audit.aud_node_tbl <- Some tbl;
   let span_key (s : Span.span) : int * int = (s.Span.file_id, s.Span.start) in
   let rec walk_block (display : string) (dspan : int * int) (bb : Ast.block_body) : unit =
     List.iter (fun st -> walk_stmt display dspan st) bb.Ast.b_stmts;
@@ -2687,7 +2814,7 @@ let build_oracle_node_table (ctx : closure_ctx) : unit =
       List.iter (walk_item outer) node.Module_graph.node_items)
     ctx.ctx_graph.Module_graph.nodes
 
-let print_oracle_rows (o : oracle_counts) : bool =
+let print_oracle_rows (audit : closure_audit) (o : oracle_counts) : bool =
   let diff_count = ref 0 in
   let skipped_note = if o.oc_skipped then " (skipped: typecheck gate failed)" else "" in
   (* ── counter rows: PLACEHOLDERS (re-audit P0 #2) ────────────────
@@ -2727,8 +2854,8 @@ let print_oracle_rows (o : oracle_counts) : bool =
      User-dispatched callable that no emitted call carries (a dropped
      call or a divergent substitution); extra = an emitted User instance
      the checker never accepted (a phantom call). *)
-  let typed_set, mir_set = !oracle_instance_sets in
-  let raw_typed_set = !oracle_raw_typed_set in
+  let typed_set, mir_set = audit.aud_instance_sets in
+  let raw_typed_set = audit.aud_raw_typed_set in
   let missing = List.filter (fun i -> not (List.mem i mir_set)) typed_set in
   let extra = List.filter (fun i -> not (List.mem i typed_set)) mir_set in
   let set_ok = missing = [] && extra = [] in
@@ -2752,7 +2879,7 @@ let print_oracle_rows (o : oracle_counts) : bool =
       | _ :: _ -> []
     in
     let name_of (i : Instance_id.t) : string =
-      match !oracle_name_tbl with
+      match audit.aud_name_tbl with
       | Some t -> (
           match Hashtbl.find_opt t (Ids.Callable_id.to_int (Instance_id.callable i)) with
           | Some n -> n
@@ -2774,13 +2901,13 @@ let print_oracle_rows (o : oracle_counts) : bool =
           (fun (nid, inst) ->
             if Instance_id.compare inst i <> 0 then None
             else
-              match !oracle_node_tbl with
+              match audit.aud_node_tbl with
               | Some t -> (
                   match Hashtbl.find_opt t nid with
                   | Some (c, _) -> Some c
                   | None -> Some (Printf.sprintf "node#%d (no AST context)" nid))
               | None -> Some "?")
-          !oracle_typed_entries
+          audit.aud_typed_entries
         |> List.sort_uniq String.compare
       in
       Printf.printf "    ORACLE-DEBUG missing-from-MIR count=%d\n" (List.length missing);
@@ -2811,7 +2938,7 @@ let print_oracle_rows (o : oracle_counts) : bool =
   (* ── the statics IDENTITY-SET row (re-audit item 23/24): the typed
      REQUIRED StaticIds vs the MIR program's StaticIds — set equality,
      never count equality *)
-  let typed_statics, mir_statics = !oracle_static_sets in
+  let typed_statics, mir_statics = audit.aud_static_sets in
   let missing_s = List.filter (fun n -> not (List.mem n mir_statics)) typed_statics in
   let extra_s = List.filter (fun n -> not (List.mem n typed_statics)) mir_statics in
   let statics_ok = missing_s = [] && extra_s = [] in
@@ -2826,8 +2953,8 @@ let print_oracle_rows (o : oracle_counts) : bool =
     List.iter (fun n -> Printf.printf "    static extra in MIR: %s\n" n) extra_s
   end;
   (* ── the callable-template IDENTITY-SET row (re-audit item 23/24) *)
-  let typed_templates, mir_templates = !oracle_template_sets in
-  let raw_typed_templates = !oracle_raw_template_set in
+  let typed_templates, mir_templates = audit.aud_template_sets in
+  let raw_typed_templates = audit.aud_raw_template_set in
   let missing_t = List.filter (fun c -> not (List.mem c mir_templates)) typed_templates in
   let extra_t = List.filter (fun c -> not (List.mem c typed_templates)) mir_templates in
   let templates_ok = missing_t = [] && extra_t = [] in
@@ -2843,7 +2970,7 @@ let print_oracle_rows (o : oracle_counts) : bool =
       (List.length raw_typed_templates - List.length typed_templates);
   if not templates_ok && not o.oc_skipped then begin
     let name_of (c : int) : string =
-      match !oracle_name_tbl with
+      match audit.aud_name_tbl with
       | Some t -> ( match Hashtbl.find_opt t c with Some n -> n | None -> "?")
       | None -> "?"
     in
@@ -2959,13 +3086,18 @@ let count_residual_type_params (prog : Seed_mir.program) : int =
               | Seed_mir.Assign (_, rv) -> scan_rvalue rv
               | _ -> ())
             b.Seed_mir.statements;
-          (match b.Seed_mir.terminator with
-           | Seed_mir.Call (_, callee, args, _, _) ->
-               (match callee with
-                | Seed_mir.User i -> tp_inst i
-                | _ -> ());
-               Array.iter (fun a -> scan_operand a.Seed_mir.value) args
-           | _ -> ()))
+           (match b.Seed_mir.terminator with
+            | Seed_mir.Call (_, callee, args, _, _) ->
+                (match callee with
+                 | Seed_mir.User i -> tp_inst i
+                 | Seed_mir.Derived (c, cargs) ->
+                     tp_inst (Instance_id.make ~callable:c ~type_args:cargs)
+                 | Seed_mir.Intrinsic (_, iargs) | Seed_mir.Extern (_, iargs)
+                 | Seed_mir.TypeQuery (_, iargs) ->
+                     Array.iter tp iargs
+                 | Seed_mir.FnValue op -> scan_operand op);
+                Array.iter (fun a -> scan_operand a.Seed_mir.value) args
+            | _ -> ()))
         f.Seed_mir.blocks)
     prog.Seed_mir.functions;
   Array.iter
@@ -3026,10 +3158,14 @@ let collect_reachable_host_ids (prog : Seed_mir.program) : Host.host_id list =
           match b.Seed_mir.terminator with
           | Seed_mir.Call (_, callee, _, _, _) -> (
               match callee with
-              | Seed_mir.Intrinsic i -> add (Host.Intrinsic (Intrinsic_registry.Id.make i))
-              | Seed_mir.Extern i -> add (Host.Extern (Extern_registry.Id.make i))
+              | Seed_mir.Intrinsic (i, _) ->
+                  add (Host.Intrinsic (Intrinsic_registry.Id.make i))
+              | Seed_mir.Extern (i, _) ->
+                  add (Host.Extern (Extern_registry.Id.make i))
               | Seed_mir.User inst -> resolve_user inst
-              | Seed_mir.FnValue _ -> ())
+              | Seed_mir.Derived (c, cargs) ->
+                  resolve_user (Instance_id.make ~callable:c ~type_args:cargs)
+              | Seed_mir.FnValue _ | Seed_mir.TypeQuery _ -> ())
           | _ -> ())
         f.Seed_mir.blocks)
     prog.Seed_mir.functions;
@@ -3044,14 +3180,13 @@ type mono_outcome = {
   mo_post_instances : int;
   mo_type_instances : int;
   mo_residual_type_params : int;
-  (* the body-less-registered sigs plus the materializer's rewrite the
+  (* the body-less-registered sigs plus the canonical-cache rewrite the
      post-mono concrete verification resolves kept calls through (see
      run_mono_phase): consumers that re-verify mo_program reproduce the
-     same registry with the same fresh-instance-id reconciliation *)
+     same registry against the same canonical generic-instance ids *)
   mo_query_sigs : Mir_verify.query_sig list;
   mo_post_rewrite : Type_repr.t -> Type_repr.t;
   mo_box_instances : Ids.Type_id.t list;
-  mo_materialized_from : int;
 }
 
 (* ── Post-mono type materialization (re-audit finding: "generic nominal
@@ -3059,73 +3194,84 @@ type mono_outcome = {
    Mono.build's queue (the on_type_instance channel) lists every
    CONCRETE instance of a generic nominal the specialized bodies and
    signatures mention, in first-discovery order.  This assembles the
-   final types table: for each queued (tid, args) the generic
-   template's fields/variants are substituted under the KParam-keyed
-   table (Mono.type_substitution — the same positional machinery as the
-   function templates), and the result carries a FRESH TypeId — the
-   semantic identity of a concrete instance is (tid, args), so two
-   instances (Pair[Int], Pair[String]) must never share one def.  Every
-   Named (tid, args) in the program (bodies, statics, defs) is then
-   rewritten to the fresh TypeId; StructCtor/EnumCtor aggregate kinds
-   are rewritten through their destination's rewritten type.  The
-   materialization is a FIXPOINT: the substituted field types can
-   reveal further instances (Pair[Vec[Int]], Pair[Pair[Int]], ...),
-   queued in materialization order; instances embedded in the pre-mono
-   defs/statics (invisible to the body walk) are queued here too.  Fail
-   closed: an instance whose tid has no generic template, or an arity
-   disagreement, is an internal error.  The materialized defs carry the
-   SEMANTIC FieldId/VariantId of the original def (fd_id/vd_id are
+   final types table: for each instance the generic template's
+   fields/variants are substituted under the KParam-keyed table
+   (Mono.type_substitution — the same positional machinery as the
+   function templates), and the def carries its CANONICAL specialized
+   TypeId (audit P0-13): every consumer interns through ONE
+   Canonical_type_instance cache, so the same (template, args) always
+   yields the same canonical id and no two specialized ids for one
+   instance are ever minted — while two genuinely different instances
+   (Pair[Int], Pair[String]) never share one def.  Every Named (tid,
+   args) in the program (bodies, statics, defs) is then rewritten
+   through the same cache to its canonical TypeId; StructCtor/EnumCtor
+   aggregate kinds are rewritten through their destination's rewritten
+   type.  The materialization is a FIXPOINT: the substituted field
+   types can reveal further instances (Pair[Vec[Int]], Pair[Pair[Int]],
+   ...), queued in materialization order; instances embedded in the
+   pre-mono defs/statics (invisible to the body walk) are queued here
+   too.  Fail closed: an instance whose tid has no generic template, or
+   an arity disagreement, is an internal error.  The materialized defs
+   carry the SEMANTIC FieldId/VariantId of the original def (fd_id/
+   vd_id are
    copied, never re-minted); fd_index/vd_index stay the declaration
    order. *)
 
-let array_eq (cmp : 'a -> 'a -> int) (a : 'a array) (b : 'a array) : bool =
-  Array.length a = Array.length b
-  && Array.for_all2 (fun x y -> cmp x y = 0) a b
+(* ── Canonical-instance mention rewrite ─────────────────────────────
+   A Named (tid, args) mention of a generic nominal rewrites through
+   the shared canonical cache: the instance's canonical key (the args
+   normalized before keying — 64-bit alias pairs and literal defaulting)
+   looks up its single canonical specialized id, so mentions spelled
+   differently but denoting one instance (I64 vs Int, a literal-solved
+   arg vs its integer-kind) reach the SAME def, while a genuine
+   different instance never matches.  The lookup keys on the RAW args
+   (exactly the key intern was called with), then the mention's args
+   are rewritten recursively — a nested Pair[Pair[Int]] mention rewrites
+   its inner instance too.  A mention whose instance was never interned
+   (the excluded builtin runtime nominals, a template with no
+   materializable mention) passes through unchanged. *)
 
-let rec rewrite_ty (map : (Ids.Type_id.t * Type_repr.t array * Ids.Type_id.t) list)
-    (ty : Type_repr.t) : Type_repr.t =
+let rec rewrite_ty (ct : Canonical_type_instance.t) (ty : Type_repr.t) : Type_repr.t =
   match ty with
   | Type_repr.Named (tid, args) ->
-      let args' = Array.map (rewrite_ty map) args in
-      (match
-         List.find_opt
-           (fun (t, a, _) -> Ids.Type_id.compare t tid = 0 && array_eq Type_repr.compare a args)
-           map
-       with
-       | Some (_, _, ntid) -> Type_repr.Named (ntid, args')
-       | None -> Type_repr.Named (tid, args'))
-  | Type_repr.Raw_ptr (m, t) -> Type_repr.Raw_ptr (m, rewrite_ty map t)
-  | Type_repr.Ref_internal (m, t) -> Type_repr.Ref_internal (m, rewrite_ty map t)
-  | Type_repr.Tuple elems -> Type_repr.Tuple (Array.map (rewrite_ty map) elems)
-  | Type_repr.Fixed_array (t, n) -> Type_repr.Fixed_array (rewrite_ty map t, n)
+      let ntid =
+        match Canonical_type_instance.lookup ct tid args with
+        | Some ntid -> ntid
+        | None -> tid
+      in
+      Type_repr.Named (ntid, Array.map (rewrite_ty ct) args)
+  | Type_repr.Raw_ptr (m, t) -> Type_repr.Raw_ptr (m, rewrite_ty ct t)
+  | Type_repr.Ref_internal (m, t) -> Type_repr.Ref_internal (m, rewrite_ty ct t)
+  | Type_repr.Tuple elems -> Type_repr.Tuple (Array.map (rewrite_ty ct) elems)
+  | Type_repr.Fixed_array (t, n) -> Type_repr.Fixed_array (rewrite_ty ct t, n)
   | Type_repr.Function (params, ret) ->
       Type_repr.Function
         ( Array.map
-            (fun p -> { p with Type_repr.pt_type = rewrite_ty map p.Type_repr.pt_type })
+            (fun p -> { p with Type_repr.pt_type = rewrite_ty ct p.Type_repr.pt_type })
             params,
-          rewrite_ty map ret )
+          rewrite_ty ct ret )
   | ty -> ty
 
-let rewrite_instance (map) (inst : Instance_id.t) : Instance_id.t =
+let rewrite_instance (ct : Canonical_type_instance.t) (inst : Instance_id.t) : Instance_id.t =
   Instance_id.make ~callable:(Instance_id.callable inst)
-    ~type_args:(Array.map (rewrite_ty map) (Instance_id.type_args inst))
+    ~type_args:(Array.map (rewrite_ty ct) (Instance_id.type_args inst))
 
-let rewrite_operand map (op : Seed_mir.operand) : Seed_mir.operand =
+let rewrite_operand (ct : Canonical_type_instance.t) (op : Seed_mir.operand) : Seed_mir.operand =
   match op with
   | Seed_mir.Constant (Seed_mir.Function inst) ->
-      Seed_mir.Constant (Seed_mir.Function (rewrite_instance map inst))
+      Seed_mir.Constant (Seed_mir.Function (rewrite_instance ct inst))
   | op -> op
 
 (* Aggregate kinds carry the owner TypeId but not the instance args; the
    instance is the DESTINATION's type.  The verifier requires the kind
    tid to equal the dest's Named tid, so after the dest's type was
-   rewritten to its fresh instance tid, the kind follows.  (Aggregates
-   target plain locals in valid programs; the root local type is the
-   dest type.) *)
-let rewrite_rvalue map (dest_ty : Type_repr.t option) (rv : Seed_mir.rvalue) :
-    Seed_mir.rvalue =
+   rewritten to its canonical instance tid, the kind follows.
+   (Aggregates target plain locals in valid programs; the root local
+   type is the dest type.) *)
+let rewrite_rvalue (ct : Canonical_type_instance.t) (dest_ty : Type_repr.t option)
+    (rv : Seed_mir.rvalue) : Seed_mir.rvalue =
   match rv with
-  | Seed_mir.Use op -> Seed_mir.Use (rewrite_operand map op)
+  | Seed_mir.Use op -> Seed_mir.Use (rewrite_operand ct op)
   | Seed_mir.Ref p -> Seed_mir.Ref p
   | Seed_mir.RefMut p -> Seed_mir.RefMut p
   | Seed_mir.Aggregate (kind, ops) ->
@@ -3139,18 +3285,19 @@ let rewrite_rvalue map (dest_ty : Type_repr.t option) (rv : Seed_mir.rvalue) :
             match dest_ty with
             | Some (Type_repr.Named (ntid, _)) -> Seed_mir.EnumCtor (ntid, vid)
             | _ -> Seed_mir.EnumCtor (tid, vid))
-        | Seed_mir.ClosureAgg inst -> Seed_mir.ClosureAgg (rewrite_instance map inst)
+        | Seed_mir.ClosureAgg inst -> Seed_mir.ClosureAgg (rewrite_instance ct inst)
         | k -> k
       in
-      Seed_mir.Aggregate (kind', List.map (rewrite_operand map) ops)
+      Seed_mir.Aggregate (kind', List.map (rewrite_operand ct) ops)
   | Seed_mir.BinaryOp (o, l, r) ->
-      Seed_mir.BinaryOp (o, rewrite_operand map l, rewrite_operand map r)
-  | Seed_mir.UnaryOp (o, op) -> Seed_mir.UnaryOp (o, rewrite_operand map op)
+      Seed_mir.BinaryOp (o, rewrite_operand ct l, rewrite_operand ct r)
+  | Seed_mir.UnaryOp (o, op) -> Seed_mir.UnaryOp (o, rewrite_operand ct op)
   | Seed_mir.Discriminant p -> Seed_mir.Discriminant p
   | Seed_mir.Len p -> Seed_mir.Len p
-  | Seed_mir.Cast (op, ty) -> Seed_mir.Cast (rewrite_operand map op, rewrite_ty map ty)
+  | Seed_mir.Cast (op, ty) -> Seed_mir.Cast (rewrite_operand ct op, rewrite_ty ct ty)
 
-let rewrite_block map (locals : Type_repr.t array) (b : Seed_mir.block) : Seed_mir.block =
+let rewrite_block (ct : Canonical_type_instance.t) (locals : Type_repr.t array)
+    (b : Seed_mir.block) : Seed_mir.block =
   let dest_ty (p : Seed_mir.place) : Type_repr.t option =
     match p.Seed_mir.root with
     | Seed_mir.Local lid when lid >= 0 && lid < Array.length locals ->
@@ -3162,7 +3309,7 @@ let rewrite_block map (locals : Type_repr.t array) (b : Seed_mir.block) : Seed_m
     statements =
       List.map
         (function
-          | Seed_mir.Assign (p, rv) -> Seed_mir.Assign (p, rewrite_rvalue map (dest_ty p) rv)
+          | Seed_mir.Assign (p, rv) -> Seed_mir.Assign (p, rewrite_rvalue ct (dest_ty p) rv)
           | st -> st)
         b.statements;
     terminator =
@@ -3170,61 +3317,70 @@ let rewrite_block map (locals : Type_repr.t array) (b : Seed_mir.block) : Seed_m
        | Seed_mir.Call (dest, callee, args, next, unwind) ->
            let callee' =
              match callee with
-             | Seed_mir.User inst -> Seed_mir.User (rewrite_instance map inst)
-             | Seed_mir.FnValue op -> Seed_mir.FnValue (rewrite_operand map op)
-             | c -> c
+             | Seed_mir.User inst -> Seed_mir.User (rewrite_instance ct inst)
+             | Seed_mir.FnValue op -> Seed_mir.FnValue (rewrite_operand ct op)
+             | Seed_mir.Intrinsic (i, iargs) ->
+                 Seed_mir.Intrinsic (i, Array.map (rewrite_ty ct) iargs)
+             | Seed_mir.Extern (i, eargs) ->
+                 Seed_mir.Extern (i, Array.map (rewrite_ty ct) eargs)
+             | Seed_mir.Derived (c, cargs) ->
+                 Seed_mir.Derived (c, Array.map (rewrite_ty ct) cargs)
+             | Seed_mir.TypeQuery (k, qargs) ->
+                 Seed_mir.TypeQuery (k, Array.map (rewrite_ty ct) qargs)
            in
            Seed_mir.Call
              ( dest,
                callee',
                Array.map
-                 (fun a -> { a with Seed_mir.value = rewrite_operand map a.Seed_mir.value })
+                 (fun a -> { a with Seed_mir.value = rewrite_operand ct a.Seed_mir.value })
                  args,
                next,
                unwind )
        | Seed_mir.SwitchInt (op, targets, default) ->
-           Seed_mir.SwitchInt (rewrite_operand map op, targets, default)
+           Seed_mir.SwitchInt (rewrite_operand ct op, targets, default)
        | Seed_mir.Assert (op, expected, msg, target) ->
-           Seed_mir.Assert (rewrite_operand map op, expected, msg, target)
+           Seed_mir.Assert (rewrite_operand ct op, expected, msg, target)
        | t -> t);
   }
 
-let rewrite_function map (fn : Seed_mir.function_) : Seed_mir.function_ =
-  let locals' = Array.map (rewrite_ty map) fn.Seed_mir.locals in
+let rewrite_function (ct : Canonical_type_instance.t) (fn : Seed_mir.function_) :
+    Seed_mir.function_ =
+  let locals' = Array.map (rewrite_ty ct) fn.Seed_mir.locals in
   {
     fn with
-    instance = rewrite_instance map fn.Seed_mir.instance;
+    instance = rewrite_instance ct fn.Seed_mir.instance;
     params =
       Array.map
-        (fun p -> { p with Type_repr.pt_type = rewrite_ty map p.Type_repr.pt_type })
+        (fun p -> { p with Type_repr.pt_type = rewrite_ty ct p.Type_repr.pt_type })
         fn.Seed_mir.params;
     locals = locals';
-    blocks = Array.map (rewrite_block map locals') fn.Seed_mir.blocks;
+    blocks = Array.map (rewrite_block ct locals') fn.Seed_mir.blocks;
   }
 
-let rewrite_constant (map) (c : Seed_mir.constant) : Seed_mir.constant =
+let rewrite_constant (ct : Canonical_type_instance.t) (c : Seed_mir.constant) : Seed_mir.constant =
   match c with
   (* ctor constants carry the checker's INSTANTIATED monotype (see
-     Seed_mir.constant): after the materializer mints fresh defs for the
-     generic instances, the monotype must follow the same rewrite, or a
-     static's initializer type disagrees with its (rewritten) declared
-     type *)
-  | Seed_mir.Enum (tag, ty) -> Seed_mir.Enum (tag, rewrite_ty map ty)
-  | Seed_mir.Struct ty -> Seed_mir.Struct (rewrite_ty map ty)
-  | Seed_mir.Array ty -> Seed_mir.Array (rewrite_ty map ty)
-  | Seed_mir.Map ty -> Seed_mir.Map (rewrite_ty map ty)
-  | Seed_mir.Set ty -> Seed_mir.Set (rewrite_ty map ty)
-  | Seed_mir.Function inst -> Seed_mir.Function (rewrite_instance map inst)
+     Seed_mir.constant): after the materializer emits the canonical
+     defs for the generic instances, the monotype must follow the same
+     rewrite, or a static's initializer type disagrees with its
+     (rewritten) declared type *)
+  | Seed_mir.Enum (tag, ty) -> Seed_mir.Enum (tag, rewrite_ty ct ty)
+  | Seed_mir.Struct ty -> Seed_mir.Struct (rewrite_ty ct ty)
+  | Seed_mir.Array ty -> Seed_mir.Array (rewrite_ty ct ty)
+  | Seed_mir.Map ty -> Seed_mir.Map (rewrite_ty ct ty)
+  | Seed_mir.Set ty -> Seed_mir.Set (rewrite_ty ct ty)
+  | Seed_mir.Function inst -> Seed_mir.Function (rewrite_instance ct inst)
   | c -> c
 
-let rewrite_static map ((name, ty, mutable_, init) : string * Type_repr.t * bool * Seed_mir.constant option) :
+let rewrite_static (ct : Canonical_type_instance.t)
+    ((name, ty, mutable_, init) : string * Type_repr.t * bool * Seed_mir.constant option) :
     string * Type_repr.t * bool * Seed_mir.constant option =
   ( name,
-    rewrite_ty map ty,
+    rewrite_ty ct ty,
     mutable_,
-    Option.map (rewrite_constant map) init )
+    Option.map (rewrite_constant ct) init )
 
-let rewrite_def map (d : Seed_mir.type_def) : Seed_mir.type_def =
+let rewrite_def (ct : Canonical_type_instance.t) (d : Seed_mir.type_def) : Seed_mir.type_def =
   match d with
   | Seed_mir.StructDef { sd_id; sd_fields } ->
       Seed_mir.StructDef
@@ -3232,7 +3388,7 @@ let rewrite_def map (d : Seed_mir.type_def) : Seed_mir.type_def =
           sd_id;
           sd_fields =
             List.map
-              (fun f -> { f with Seed_mir.fd_ty = rewrite_ty map f.Seed_mir.fd_ty })
+              (fun f -> { f with Seed_mir.fd_ty = rewrite_ty ct f.Seed_mir.fd_ty })
               sd_fields;
         }
   | Seed_mir.EnumDef { ed_id; ed_variants } ->
@@ -3241,15 +3397,16 @@ let rewrite_def map (d : Seed_mir.type_def) : Seed_mir.type_def =
           ed_id;
           ed_variants =
             List.map
-              (fun v -> { v with Seed_mir.vd_payload = rewrite_ty map v.Seed_mir.vd_payload })
+              (fun v -> { v with Seed_mir.vd_payload = rewrite_ty ct v.Seed_mir.vd_payload })
               ed_variants;
         }
 
 (* The largest TypeId the program can see: every def id, every generic
    registry tid and every Named mention in bodies/statics/defs.  The
-   fresh instance TypeIds are minted above it, so a fresh id can never
-   alias an existing identity (a body's unrewritten Named tid must not
-   start resolving to a materialized def). *)
+   canonical type-instance cache's mint starts above it, so a canonical
+   specialized id can never alias an existing identity (a body's
+   unrewritten Named tid must not start resolving to a materialized
+   def). *)
 let program_max_type_id ~(generic_types : Mono.generic_def array)
     (prog : Seed_mir.program) : int =
   let acc = ref 0 in
@@ -3309,12 +3466,14 @@ let program_max_type_id ~(generic_types : Mono.generic_def array)
               | _ -> ())
             b.Seed_mir.statements;
           match b.Seed_mir.terminator with
-          | Seed_mir.Call (_, callee, args, _, _) ->
+          | Seed_mir.Call (_, callee, args, _, _) -> (
               (match callee with
                | Seed_mir.User inst -> Array.iter walk_ty (Instance_id.type_args inst)
-               | Seed_mir.FnValue op -> walk_operand op
-               | _ -> ());
-              Array.iter (fun a -> walk_operand a.Seed_mir.value) args
+               | Seed_mir.Intrinsic (_, iargs) | Seed_mir.Extern (_, iargs)
+               | Seed_mir.Derived (_, iargs) | Seed_mir.TypeQuery (_, iargs) ->
+                   Array.iter walk_ty iargs
+               | Seed_mir.FnValue op -> walk_operand op);
+              Array.iter (fun a -> walk_operand a.Seed_mir.value) args)
           | Seed_mir.SwitchInt (op, _, _) | Seed_mir.Assert (op, _, _, _) -> walk_operand op
           | _ -> ())
         f.Seed_mir.blocks)
@@ -3336,6 +3495,7 @@ let program_max_type_id ~(generic_types : Mono.generic_def array)
   !acc
 
 let materialize_type_instances ~(generic_types : Mono.generic_def array)
+    ?(canonical : Canonical_type_instance.t option = None)
     ~(type_instances : Mono.type_instance list) (prog : Seed_mir.program) :
     (Seed_mir.program * (Ids.Type_id.t * Type_repr.t array * Ids.Type_id.t) list,
      string list)
@@ -3344,8 +3504,17 @@ let materialize_type_instances ~(generic_types : Mono.generic_def array)
   else begin
     let errors = ref [] in
     let err msg = errors := msg :: !errors in
-    (* the BUILTIN runtime nominals (the checker's semantic ids 0=Vec/
-       Array, 1=Map, 2=Set, 5=Ptr, 6=PtrMut): the pipeline keys their
+    (* the canonical interning cache: when the caller shares the table
+       Mono.build already interned its discoveries into (audit P0-13),
+       this drain reuses those ids; otherwise a table is created here,
+       its mint starting above the largest TypeId the program can see.
+       The cache is the ONLY mint: enqueue interns each instance and a
+       canonical key that is already present — from the mono queue, the
+       defs/statics scans below or an earlier fixpoint discovery — is
+       never queued again, so no two specialized ids for one instance
+       are ever minted.  The BUILTIN runtime nominals (the checker's
+       semantic ids 0=Vec/Array, 1=Map, 2=Set, 5=Ptr, 6=PtrMut) are
+       excluded by the cache's default policy: the pipeline keys their
        runtime semantics on the original ids (mir_lower's Index/entries/
        deref desugaring, the verifier's projection, deref and intrinsic-
        signature rules, the VM's value tags), so their concrete
@@ -3355,19 +3524,27 @@ let materialize_type_instances ~(generic_types : Mono.generic_def array)
        materialized: their instance operations are def-driven (the
        two-variant enum shape), and the materialized defs carry the
        semantic VariantIds. *)
-    let is_builtin_container (tid : Ids.Type_id.t) : bool =
-      let t = Ids.Type_id.to_int tid in
-      t = 0 || t = 1 || t = 2 || t = 5 || t = 6
+    let ct =
+      match canonical with
+      | Some ct -> ct
+      | None ->
+          Canonical_type_instance.create
+            ~mint_from:(program_max_type_id ~generic_types prog + 1)
+            ()
     in
-    let seen : Mono.type_instance list ref = ref [] in
     let queue : Mono.type_instance Queue.t = Queue.create () in
+    (* the canonical ids already queued (or drained): each canonical
+       instance is enqueued at most once, so its def is materialized
+       exactly once, under its single canonical id *)
+    let queued : (int, unit) Hashtbl.t = Hashtbl.create 64 in
     let enqueue (ti : Mono.type_instance) =
-      if not (is_builtin_container ti.Mono.ti_tid)
-         && not (List.exists (Mono.type_instance_equal ti) !seen)
-      then begin
-        seen := ti :: !seen;
-        Queue.add ti queue
-      end
+      match Canonical_type_instance.intern ct ti.Mono.ti_tid ti.Mono.ti_args with
+      | None -> ()
+      | Some (id, _) ->
+          if not (Hashtbl.mem queued (Ids.Type_id.to_int id)) then begin
+            Hashtbl.add queued (Ids.Type_id.to_int id) ();
+            Queue.add ti queue
+          end
     in
     (* seed: the mono queue (first-discovery order), then instances
        embedded in the pre-mono defs and statics — those are invisible
@@ -3395,12 +3572,14 @@ let materialize_type_instances ~(generic_types : Mono.generic_def array)
             Mono.scan_type generic_types enqueue mty
         | _ -> ())
       prog.Seed_mir.statics;
-    let next_tid = ref (program_max_type_id ~generic_types prog + 1) in
     let map : (Ids.Type_id.t * Type_repr.t array * Ids.Type_id.t) list ref = ref [] in
     let materialized : Seed_mir.type_def list ref = ref [] in
-    (* drain: materialize each queued instance; the substituted field
-       types can reveal further instances (the fixpoint), queued in
-       materialization order *)
+    (* drain: materialize each queued instance under its canonical id
+       (the instance's raw args — the spelling that was actually
+       discovered — substitute the template, so the def's field types
+       keep the discovered spelling); the substituted field types can
+       reveal further instances (the fixpoint), queued in materialization
+       order *)
     while not (Queue.is_empty queue) do
       let ti = Queue.pop queue in
       match Mono.find_generic generic_types ti.Mono.ti_tid with
@@ -3415,48 +3594,56 @@ let materialize_type_instances ~(generic_types : Mono.generic_def array)
           match Mono.type_substitution gd ti.Mono.ti_args with
           | Error m -> err m
           | Ok subst ->
-              let ntid = Ids.Type_id.make !next_tid in
-              incr next_tid;
-              let def =
-                match gd.Mono.gd_def with
-                | Seed_mir.StructDef { sd_fields; _ } ->
-                    Seed_mir.StructDef
-                      {
-                        sd_id = ntid;
-                        sd_fields =
-                          List.map
-                            (fun f ->
-                              {
-                                f with
-                                Seed_mir.fd_ty = Type_repr.substitute subst f.Seed_mir.fd_ty;
-                              })
-                            sd_fields;
-                      }
-                | Seed_mir.EnumDef { ed_variants; _ } ->
-                    Seed_mir.EnumDef
-                      {
-                        ed_id = ntid;
-                        ed_variants =
-                          List.map
-                            (fun v ->
-                              {
-                                v with
-                                Seed_mir.vd_payload =
-                                  Type_repr.substitute subst v.Seed_mir.vd_payload;
-                              })
-                            ed_variants;
-                      }
-              in
-              map := (ti.Mono.ti_tid, ti.Mono.ti_args, ntid) :: !map;
-              materialized := def :: !materialized;
-              (match def with
-               | Seed_mir.StructDef { sd_fields; _ } ->
-                   List.iter (fun f -> Mono.scan_type generic_types enqueue f.Seed_mir.fd_ty)
-                     sd_fields
-               | Seed_mir.EnumDef { ed_variants; _ } ->
-                   List.iter
-                     (fun v -> Mono.scan_type generic_types enqueue v.Seed_mir.vd_payload)
-                     ed_variants))
+              (match Canonical_type_instance.lookup ct ti.Mono.ti_tid ti.Mono.ti_args with
+               | None ->
+                   err
+                     (Printf.sprintf
+                        "mono: internal error — queued concrete type instance type#%d[%s] was never interned"
+                        (Ids.Type_id.to_int ti.Mono.ti_tid)
+                        (String.concat ", "
+                           (Array.to_list (Array.map Seed_mir.print_type ti.Mono.ti_args))))
+               | Some ntid ->
+                   let def =
+                     match gd.Mono.gd_def with
+                     | Seed_mir.StructDef { sd_fields; _ } ->
+                         Seed_mir.StructDef
+                           {
+                             sd_id = ntid;
+                             sd_fields =
+                               List.map
+                                 (fun f ->
+                                   {
+                                     f with
+                                     Seed_mir.fd_ty = Type_repr.substitute subst f.Seed_mir.fd_ty;
+                                   })
+                                 sd_fields;
+                           }
+                     | Seed_mir.EnumDef { ed_variants; _ } ->
+                         Seed_mir.EnumDef
+                           {
+                             ed_id = ntid;
+                             ed_variants =
+                               List.map
+                                 (fun v ->
+                                   {
+                                     v with
+                                     Seed_mir.vd_payload =
+                                       Type_repr.substitute subst v.Seed_mir.vd_payload;
+                                   })
+                                 ed_variants;
+                           }
+                   in
+                   map := (ti.Mono.ti_tid, ti.Mono.ti_args, ntid) :: !map;
+                   materialized := def :: !materialized;
+                   (match def with
+                    | Seed_mir.StructDef { sd_fields; _ } ->
+                        List.iter
+                          (fun f -> Mono.scan_type generic_types enqueue f.Seed_mir.fd_ty)
+                          sd_fields
+                    | Seed_mir.EnumDef { ed_variants; _ } ->
+                        List.iter
+                          (fun v -> Mono.scan_type generic_types enqueue v.Seed_mir.vd_payload)
+                          ed_variants)))
     done;
     match !errors with
     | [] ->
@@ -3485,12 +3672,13 @@ let materialize_type_instances ~(generic_types : Mono.generic_def array)
         let extra_defs = materialized @ canonical_defs in
         Ok
           ( {
-              Seed_mir.functions = Array.map (rewrite_function map) prog.Seed_mir.functions;
-              statics = Array.map (rewrite_static map) prog.Seed_mir.statics;
+              Seed_mir.functions =
+                Array.map (rewrite_function ct) prog.Seed_mir.functions;
+              statics = Array.map (rewrite_static ct) prog.Seed_mir.statics;
               types =
                 Array.append
-                  (Array.map (rewrite_def map) prog.Seed_mir.types)
-                  (Array.of_list (List.map (rewrite_def map) extra_defs));
+                  (Array.map (rewrite_def ct) prog.Seed_mir.types)
+                  (Array.of_list (List.map (rewrite_def ct) extra_defs));
             },
             map )
     | errs -> Error (List.rev errs)
@@ -3532,45 +3720,42 @@ let debug_mono_poison_names (ctx : closure_ctx) (prog : Seed_mir.program) : unit
         Hashtbl.replace templates (Ids.Callable_id.to_int (Instance_id.callable f.Seed_mir.instance))
           ())
       prog.Seed_mir.functions;
-    (* the typed channel's raw records may carry the caller's generic
-       params / unsolved infer vars (the lowering channel substitutes
-       them through the final journal); mirror that substitution so the
-       poison surface is the CONCRETE instance set the mono actually
-       looks up *)
-    let sub = final_journal_subst () in
-    let poison = Hashtbl.create 1024 in
+    (* the typed channel is ALREADY final (audit P0-8: finalize_inference
+       rewrote every node with the chased final substitution before
+       lowering), so the records below ARE the concrete instance set the
+       mono actually looks up — no mirror substitution remains *)
+    (* audit P1-23: the poisoned-shape counter keys on the STRUCTURAL
+       instance (callable id + concrete type args), never on a rendered
+       string; the row label is rendered only for the printed line *)
+    let poison : (Instance_id.t, int) Hashtbl.t = Hashtbl.create 1024 in
     let poison_arg (ty : Type_repr.t) =
       if Type_repr.has_type_param ty then "P:" ^ Seed_mir.print_type ty else Seed_mir.print_type ty
     in
+    let poison_row (inst : Instance_id.t) : string =
+      Printf.sprintf "inst{callable#%d; [%s]}"
+        (Ids.Callable_id.to_int (Instance_id.callable inst))
+        (String.concat "; "
+           (Array.to_list (Array.map poison_arg (Instance_id.type_args inst))))
+    in
     Hashtbl.iter
       (fun _ (node : Typecheck.typed_node) ->
-        match node.Typecheck.tn_call with
+        match Typecheck.tc_callee_instance node.Typecheck.tn_call with
         | Some (callable, targs) ->
-            let targs = Array.map sub targs in
             if
               not (Array.exists Type_repr.has_type_param targs)
               && not (Array.exists (fun t -> match t with Type_repr.Infer_var _ -> true | _ -> false) targs)
             then begin
               let c = Ids.Callable_id.to_int callable in
               if not (Hashtbl.mem templates c) then begin
-                let key =
-                  Printf.sprintf "inst{callable#%d; [%s]}" c
-                    (String.concat "; " (Array.to_list (Array.map poison_arg targs)))
-                in
+                let inst = Instance_id.make ~callable ~type_args:targs in
                 let cur =
-                  match Hashtbl.find_opt poison key with Some n -> n | None -> 0
+                  match Hashtbl.find_opt poison inst with Some n -> n | None -> 0
                 in
-                Hashtbl.replace poison key (cur + 1)
+                Hashtbl.replace poison inst (cur + 1)
               end
             end
         | None -> ())
       env.Typecheck.typed_nodes;
-    let key_int (k : string) : int =
-      let n = String.index k '#' in
-      let rest = String.sub k (n + 1) (String.length k - n - 1) in
-      let semi = String.index rest ';' in
-      int_of_string (String.sub rest 0 semi)
-    in
     let n = Hashtbl.length poison in
     Printf.printf "  mono-debug: %d poisoned typed-call instance shape(s) (callable has no lowered template)\n" n;
     (* caller map: for a poison callable, the lowered bodies that call it
@@ -3583,30 +3768,33 @@ let debug_mono_poison_names (ctx : closure_ctx) (prog : Seed_mir.program) : unit
         Array.iter
           (fun (b : Seed_mir.block) ->
             match b.Seed_mir.terminator with
-            | Seed_mir.Call (_, Seed_mir.User inst, _, _, _) ->
-                let c = Ids.Callable_id.to_int (Instance_id.callable inst) in
-                if not (Hashtbl.mem templates c) then begin
-                  let cur =
-                    match Hashtbl.find_opt callers c with Some l -> l | None -> []
-                  in
-                  Hashtbl.replace callers c ((body.Seed_mir.name, inst) :: cur)
-                end
+            | Seed_mir.Call (_, callee, _, _, _) -> (
+                match Seed_mir.callee_instance callee with
+                | Some inst ->
+                    let c = Ids.Callable_id.to_int (Instance_id.callable inst) in
+                    if not (Hashtbl.mem templates c) then begin
+                      let cur =
+                        match Hashtbl.find_opt callers c with Some l -> l | None -> []
+                      in
+                      Hashtbl.replace callers c ((body.Seed_mir.name, inst) :: cur)
+                    end
+                | None -> ())
             | _ -> ())
           body.Seed_mir.blocks)
       prog.Seed_mir.functions;
     Hashtbl.fold
-      (fun k count acc ->
-        let c = key_int k in
-        (c, k, count) :: acc)
+      (fun inst count acc ->
+        let c = Ids.Callable_id.to_int (Instance_id.callable inst) in
+        (c, inst, count) :: acc)
       poison []
     |> List.sort (fun (a, _, _) (b, _, _) -> compare a b)
-    |> List.iter (fun (c, k, count) ->
+    |> List.iter (fun (c, inst, count) ->
            let nm =
              match Hashtbl.find_opt names c with
              | Some s -> s
              | None -> "UNREGISTERED-in-checker-tables"
            in
-           Printf.printf "  mono-poison %s x%d  %s\n" k count nm;
+           Printf.printf "  mono-poison %s x%d  %s\n" (poison_row inst) count nm;
            (match Hashtbl.find_opt callers c with
             | Some cl ->
                 let seen_caller = Hashtbl.create 16 in
@@ -3675,39 +3863,42 @@ let debug_missing_user_callees (ctx : closure_ctx) (prog : Seed_mir.program) : u
         Array.iteri
           (fun (_b : int) (blk : Seed_mir.block) ->
             match blk.Seed_mir.terminator with
-            | Seed_mir.Call (_, Seed_mir.User inst, _, _, _) ->
-                if not (Hashtbl.mem emitted (Instance_id.callable inst)) then begin
-                  incr found;
-                  let c = Ids.Callable_id.to_int (Instance_id.callable inst) in
-                  let nm =
-                    match Hashtbl.find_opt names c with
-                    | Some s -> s
-                    | None -> "UNREGISTERED-in-checker-tables"
-                  in
-                  Printf.printf
-                    "  missing-user %s bb%d -> inst{callable#%d; [%s]}  %s\n"
-                    f.Seed_mir.name blk.Seed_mir.id c
-                    (String.concat "; "
-                       (Array.to_list
-                          (Array.map
-                             (fun t ->
-                               if Type_repr.has_type_param t then
-                                 "P:" ^ Seed_mir.print_type t
-                               else Seed_mir.print_type t)
-                             (Instance_id.type_args inst))))
-                    nm;
-                  (match Hashtbl.find_opt sig_names c with
-                   | Some ts ->
-                       Printf.printf "      sig params=%s ret=%s\n"
-                         (String.concat ", "
-                            (Array.to_list
-                               (Array.map
-                                  (fun (p : Type_repr.param_type) ->
-                                    Seed_mir.print_type p.Type_repr.pt_type)
-                                  ts.Typecheck.ts_params)))
-                         (Seed_mir.print_type ts.Typecheck.ts_return)
-                   | None -> ())
-                end
+            | Seed_mir.Call (_, callee, _, _, _) -> (
+                match Seed_mir.callee_instance callee with
+                | Some inst ->
+                    if not (Hashtbl.mem emitted (Instance_id.callable inst)) then begin
+                      incr found;
+                      let c = Ids.Callable_id.to_int (Instance_id.callable inst) in
+                      let nm =
+                        match Hashtbl.find_opt names c with
+                        | Some s -> s
+                        | None -> "UNREGISTERED-in-checker-tables"
+                      in
+                      Printf.printf
+                        "  missing-user %s bb%d -> inst{callable#%d; [%s]}  %s\n"
+                        f.Seed_mir.name blk.Seed_mir.id c
+                        (String.concat "; "
+                           (Array.to_list
+                              (Array.map
+                                 (fun t ->
+                                   if Type_repr.has_type_param t then
+                                     "P:" ^ Seed_mir.print_type t
+                                   else Seed_mir.print_type t)
+                                 (Instance_id.type_args inst))))
+                        nm;
+                      (match Hashtbl.find_opt sig_names c with
+                       | Some ts ->
+                           Printf.printf "      sig params=%s ret=%s\n"
+                             (String.concat ", "
+                                (Array.to_list
+                                   (Array.map
+                                      (fun (p : Type_repr.param_type) ->
+                                        Seed_mir.print_type p.Type_repr.pt_type)
+                                      ts.Typecheck.ts_params)))
+                             (Seed_mir.print_type ts.Typecheck.ts_return)
+                       | None -> ())
+                    end
+                | None -> ())
             | _ -> ())
           f.Seed_mir.blocks)
       prog.Seed_mir.functions;
@@ -3715,337 +3906,42 @@ let debug_missing_user_callees (ctx : closure_ctx) (prog : Seed_mir.program) : u
     flush stdout
   end
 
-(* ── Post-mono host-channel normalization (audit §70 re-audit) ──────
-   The mono keeps concrete calls to REGISTERED-ONLY callables (typed
-   sigs, no lowered body — extern-declared names, compiler-builtin
-   methods) in the output as `User` callees with no emitted function.
-   The VM has no dispatch for a User callee without a function: every
-   mono'd program that passes the structural gate and then DYNAMICALLY
-   reaches such a call traps ("call to unknown instance").  The seed's
-   executable channel for the host surface is the Intrinsic/Extern
-   callee form (Vm.call_host), so this pass rewrites the body-less User
-   calls onto the host channel when the callable's REGISTERED NAME
-   resolves in the intrinsic/extern registries — the same name-based
-   resolution the lowering's intrinsic channel uses.  A body-less
-   callable whose name resolves NOWHERE stays User (fail closed: the VM
-   traps deterministically if it is ever reached — no host semantic
-   exists for it).  In-table User calls whose function's name is itself
-   an intrinsic-registry symbol (the kernel's io print/println surface —
-   real bodies whose execution needs raw-pointer syscalls the seed host
-   cannot provide; the registry binding IS the seed semantics) are
-   normalized to the intrinsic channel the same way, under the same
-   exact-transcription guard (the registered callable's signature must
-   be byte-identical to the registry's declaration).  Runs
-   post-materialization, PRE-concrete-verify: the structural gate then
-   verifies the exact program the VM executes. *)
-
-type reg_callable_kind = RC_fn of string | RC_method of string * string
-
-let reg_callable_name_of_env (env : Typecheck.env) :
-    Ids.Callable_id.t -> reg_callable_kind option =
-  let tbl = Hashtbl.create 65536 in
-  List.iter
-    (fun (n, ts) ->
-      Hashtbl.replace tbl (Ids.Callable_id.to_int ts.Typecheck.ts_callable) (RC_fn n))
-    env.Typecheck.functions;
-  List.iter
-    (fun ((o, m), ts) ->
-      Hashtbl.replace tbl
-        (Ids.Callable_id.to_int ts.Typecheck.ts_callable)
-        (RC_method (o, m)))
-    env.Typecheck.methods;
-  List.iter
-    (fun (qname, ts, _) ->
-      Hashtbl.replace tbl
-        (Ids.Callable_id.to_int ts.Typecheck.ts_callable)
-        (RC_fn qname))
-    env.Typecheck.state.nested_functions;
-  List.iter
-    (fun (n, ts) ->
-      Hashtbl.replace tbl (Ids.Callable_id.to_int ts.Typecheck.ts_callable) (RC_fn n))
-    env.Typecheck.state.query_sigs;
-  List.iter
-    (fun (_, ts) ->
-      Hashtbl.replace tbl
-        (Ids.Callable_id.to_int ts.Typecheck.ts_callable)
-        (RC_fn ts.Typecheck.ts_name))
-    env.Typecheck.state.derived_sigs;
-  fun c -> Hashtbl.find_opt tbl (Ids.Callable_id.to_int c)
-
-(* The checker's registered signature per callable (params, return) —
-   the declaration surface the mono'd User calls were verified against;
-   the host-channel rewrite's exact-transcription gate compares the
-   registry declarations against it. *)
-let reg_callable_sig_of_env (env : Typecheck.env) :
-    Ids.Callable_id.t -> (Type_repr.param_type array * Type_repr.t) option =
-  let tbl = Hashtbl.create 65536 in
-  let add (ts : Typecheck.typed_signature) =
-    Hashtbl.replace tbl (Ids.Callable_id.to_int ts.Typecheck.ts_callable)
-      (ts.Typecheck.ts_params, ts.Typecheck.ts_return)
-  in
-  List.iter (fun (_, ts) -> add ts) env.Typecheck.functions;
-  List.iter (fun (_, ts) -> add ts) env.Typecheck.methods;
-  List.iter (fun (_, ts, _) -> add ts) env.Typecheck.state.nested_functions;
-  List.iter (fun (_, ts) -> add ts) env.Typecheck.state.query_sigs;
-  List.iter (fun (_, ts) -> add ts) env.Typecheck.state.derived_sigs;
-  fun c -> Hashtbl.find_opt tbl (Ids.Callable_id.to_int c)
-
-let bare_reg_name (name : string) : string =
-  (* the checker's function keys are module-qualified ("std::args::fn");
-     the registry keys are the bare source names ("fn") *)
-  match String.rindex_opt name ':' with
-  | Some i when i > 0 && name.[i - 1] = ':' && i + 1 < String.length name ->
-      String.sub name (i + 1) (String.length name - i - 1)
-  | _ -> name
-
-(* the checker's candidate-owner alias convention (the same list the
-   lowering's qualified-call channel uses): a builtin method registered
-   under one owner name dispatches through any alias owner's intrinsic
-   binding *)
-let candidate_owners (qual : string) : string list =
-  match qual with
-  | "Vec" -> [ "Vec"; "Array" ]
-  | "Array" -> [ "Array"; "Vec" ]
-  | "String" -> [ "String"; "str" ]
-  | "str" -> [ "str"; "String" ]
-  | "Set" -> [ "Set"; "HashSet" ]
-  | "HashSet" -> [ "HashSet"; "Set" ]
-  | "Map" -> [ "Map"; "HashMap" ]
-  | "HashMap" -> [ "HashMap"; "Map" ]
-  | q -> [ q ]
-
-(* ── The host-channel normalization pass ────────────────────────────
-
-   The rewrite to the Intrinsic/Extern channel is type-preserving ONLY
-   when the registry's declared signature is EXACTLY the checker's
-   registered signature for the callable (the same transcription; the
-   concrete verifier checks Intrinsic/Extern callees against the
-   registry sigs, while the mono'd User calls were checked against the
-   checker sigs — a drift would fail the post-mono gate on a rewrite
-   that previously passed).  Every rewrite is therefore gated on exact
-   per-parameter type+convention and return equality between the two
-   declarations; a drifted or unregistered name stays User (fail closed
-   at the VM exactly like today). *)
-let host_channel_normalize
-    ?(reg_name : Ids.Callable_id.t -> reg_callable_kind option = fun _ -> None)
-    ?(reg_sig : Ids.Callable_id.t -> (Type_repr.param_type array * Type_repr.t) option =
-       fun _ -> None)
-    (prog : Seed_mir.program) : Seed_mir.program * int * int =
-  let emitted_callable = Hashtbl.create 65536 in
+(* ── assert_no_bodyless_user_calls (audit P0-5) ─────────────────────
+   The callee class flows from the checker through lowering into mono:
+   every registered-only callable (a compiler-builtin method, a derived
+   op, a type query, an extern declaration) classified at CHECK time as
+   Intrinsic / Extern / Derived / TypeQuery, so the mono'd program's
+   remaining User callees must ALL have an emitted (specialized) body.
+   A body-less User callee in the mono output is therefore an INVARIANT
+   VIOLATION — the class was mis-typed at check time or the body
+   synthesis failed — and fails the mono phase with the offending
+   instances named.  This assert REPLACES the deleted post-mono
+   host_channel_normalize: its fail-closed guarantees are kept, because
+   the calls the rewrite previously fixed now arrive already on the
+   right channel. *)
+let assert_no_bodyless_user_calls (prog : Seed_mir.program) : string list =
+  let emitted = Hashtbl.create 65536 in
   Array.iter
     (fun (f : Seed_mir.function_) ->
-      Hashtbl.replace emitted_callable
-        (Ids.Callable_id.to_int (Instance_id.callable f.Seed_mir.instance))
-        ())
+      Hashtbl.replace emitted f.Seed_mir.instance ())
     prog.Seed_mir.functions;
-  let rewritten = ref 0 in
-  let leftover = ref 0 in
-  let debug = Sys.getenv_opt "TANGERINE_DEBUG_HOST_CHANNEL" <> None in
-  let rewrite_callee (f : Seed_mir.function_) (inst : Instance_id.t)
-      (args : Seed_mir.call_arg array) : Seed_mir.callee =
-    let callable = Instance_id.callable inst in
-    let nargs = Array.length args in
-    let bodyless = not (Hashtbl.mem emitted_callable (Ids.Callable_id.to_int callable)) in
-    (* the checker's registered signature for the callable (params, ret)
-       — the sig the mono'd User call was verified against *)
-    let checker_sig =
-      match reg_sig callable with Some s -> Some s | None -> None
-    in
-    (* exact transcription check: registry declaration == checker
-       declaration (types AND conventions, so the verifier's effect and
-       type checks on the rewritten call reproduce the query-sig checks
-       exactly).  The type comparison is the registry-aware
-       alpha-equivalence: the registry signatures live in the registry's
-       OWN placeholder TypeId domain (mir_verify maps option/vec/map/set
-       onto the checker's LangItem ids array=0/map=1/set=2/option=3),
-       while the checker's registered signatures carry the checker-minted
-       nominal ids AND per-registration generic binder ids — so a raw
-       Type_repr.compare can never agree on a generic signature (every
-       map/set/array intrinsic would drift and stay fail-closed User
-       forever).  The rewrite is therefore gated on the SAME
-       compatibility the post-mono concrete verifier will apply to the
-       rewritten Intrinsic call (registry domain remapped to the checker
-       domain, generic binder positions alpha-equivalent), with arity and
-       per-parameter conventions still compared exactly.  A drifted
-       registry declaration fails the alpha check and keeps the call
-       User (fail closed), exactly as before. *)
-    let rec alpha_compatible (a : Type_repr.t) (b : Type_repr.t) : bool =
-      match a, b with
-      | Type_repr.Type_param _, Type_repr.Type_param _ -> true
-      | Type_repr.Named (_, a1), Type_repr.Named (_, b1) ->
-          Array.length a1 = Array.length b1
-          && Array.for_all2 alpha_compatible a1 b1
-      | Type_repr.Fixed_array (e1, n1), Type_repr.Fixed_array (e2, n2) ->
-          n1 = n2 && alpha_compatible e1 e2
-      | Type_repr.Tuple a1, Type_repr.Tuple a2 ->
-          Array.length a1 = Array.length a2
-          && Array.for_all2 alpha_compatible a1 a2
-      | Type_repr.Function (p1, r1), Type_repr.Function (p2, r2) ->
-          Array.length p1 = Array.length p2
-          && Array.for_all2
-               (fun x y ->
-                 x.Type_repr.pt_convention = y.Type_repr.pt_convention
-                 && alpha_compatible x.Type_repr.pt_type y.Type_repr.pt_type)
-               p1 p2
-          && alpha_compatible r1 r2
-      | a, b -> Type_repr.compare a b = 0
-    in
-    (* the pointer/ref-bearing signatures keep the STRICT comparison:
-       their seed semantics are not implementable on the value-model
-       host (no refs into hash-table storage), so a rewrite must never
-       be invented for them by the alpha relaxation — a strict-compare
-       drift keeps them User (fail closed), exactly as before *)
-    let rec has_ref_kind (t : Type_repr.t) : bool =
-      match t with
-      | Type_repr.Ref_internal _ | Type_repr.Raw_ptr _ -> true
-      | Type_repr.Named (_, args) -> Array.exists has_ref_kind args
-      | Type_repr.Fixed_array (e, _) -> has_ref_kind e
-      | Type_repr.Tuple elems -> Array.exists has_ref_kind elems
-      | Type_repr.Function (p, r) ->
-          Array.exists
-            (fun (p : Type_repr.param_type) -> has_ref_kind p.Type_repr.pt_type)
-            p
-          || has_ref_kind r
-      | _ -> false
-    in
-    let registry_exact (_name : string) (params : Type_repr.param_type array)
-        (ret : Type_repr.t) : bool =
-      match checker_sig with
-      | None -> false
-      | Some (chk_params, chk_ret) ->
-          Array.length params = nargs
-          && Array.length params = Array.length chk_params
-          && Array.for_all2
-               (fun a b ->
-                 a.Type_repr.pt_convention = b.Type_repr.pt_convention
-                 &&
-                 let reg_ty = Mir_verify.registry_type_to_checker a.Type_repr.pt_type in
-                 if has_ref_kind reg_ty || has_ref_kind b.Type_repr.pt_type then
-                   Type_repr.compare reg_ty b.Type_repr.pt_type = 0
-                 else alpha_compatible reg_ty b.Type_repr.pt_type)
-               params chk_params
-          &&
-          let reg_ret = Mir_verify.registry_type_to_checker ret in
-          if has_ref_kind reg_ret || has_ref_kind chk_ret then
-            Type_repr.compare reg_ret chk_ret = 0
-          else alpha_compatible reg_ret chk_ret
-    in
-    let use_intrinsic (iid : Intrinsic_registry.Id.t) (name : string) : Seed_mir.callee =
-      let sig_ = snd (Option.get (Intrinsic_registry.lookup Intrinsic_registry.manifest ~name)) in
-      if registry_exact name sig_.Intrinsic_registry.params sig_.Intrinsic_registry.ret then begin
-        incr rewritten;
-        if debug then
-          Printf.printf "  host-channel %s: %s (%s) -> Intrinsic %s\n" f.Seed_mir.name
-            (Seed_mir.print_instance inst) (if bodyless then "bodyless" else "in-table")
-            name;
-        Seed_mir.Intrinsic (Intrinsic_registry.Id.to_int iid)
-      end
-      else begin
-        if bodyless then incr leftover;
-        if debug then
-          Printf.printf "  host-channel %s: %s intrinsic %s sig drift/arity — kept User\n"
-            f.Seed_mir.name (Seed_mir.print_instance inst) name;
-        Seed_mir.User inst
-      end
-    in
-    let use_extern (eid : Extern_registry.Id.t) (name : string) : Seed_mir.callee =
-      let sig_ = snd (Option.get (Extern_registry.lookup Extern_registry.manifest ~name)) in
-      if registry_exact name sig_.Intrinsic_registry.params sig_.Intrinsic_registry.ret then begin
-        incr rewritten;
-        if debug then
-          Printf.printf "  host-channel %s: %s (bodyless) -> Extern %s\n" f.Seed_mir.name
-            (Seed_mir.print_instance inst) name;
-        Seed_mir.Extern (Extern_registry.Id.to_int eid)
-      end
-      else begin
-        if bodyless then incr leftover;
-        if debug then
-          Printf.printf "  host-channel %s: %s extern %s sig drift/arity — kept User\n"
-            f.Seed_mir.name (Seed_mir.print_instance inst) name;
-        Seed_mir.User inst
-      end
-    in
-    match reg_name callable with
-    | None ->
-        if debug then
-          Printf.printf "  host-channel %s: %s UNREGISTERED callable#%d\n" f.Seed_mir.name
-            (Seed_mir.print_instance inst) (Ids.Callable_id.to_int callable);
-        if bodyless then incr leftover;
-        Seed_mir.User inst
-    | Some (RC_fn qn) ->
-        let bare = bare_reg_name qn in
-        let names = if bare = qn then [ bare ] else [ bare; qn ] in
-        let rec via_intrinsic = function
-          | [] -> (
-              let rec via_extern = function
-                | [] ->
-                    if debug then
-                      Printf.printf "  host-channel %s: %s no registry hit for %s\n"
-                        f.Seed_mir.name (Seed_mir.print_instance inst)
-                        (String.concat ", " names);
-                    if bodyless then incr leftover;
-                    Seed_mir.User inst
-                | n :: rest -> (
-                    match Extern_registry.lookup Extern_registry.manifest ~name:n with
-                    | Some (eid, _) -> use_extern eid n
-                    | None -> via_extern rest)
-              in
-              via_extern names)
-          | n :: rest -> (
-              match Intrinsic_registry.lookup Intrinsic_registry.manifest ~name:n with
-              | Some (iid, _) -> use_intrinsic iid n
-              | None -> via_intrinsic rest)
-        in
-        if bodyless then via_intrinsic names
-        else
-          (* in-table: normalize only when the function's own name IS an
-             intrinsic-registry symbol (the io print surface whose real
-             body the seed host cannot execute — the registry binding is
-             the seed semantics) *)
-          (match Intrinsic_registry.lookup Intrinsic_registry.manifest ~name:bare with
-           | Some (iid, _) -> use_intrinsic iid bare
-           | None -> Seed_mir.User inst)
-    | Some (RC_method (owner, mname)) ->
-        if not bodyless then Seed_mir.User inst
-        else begin
-          let rec find_intrinsic = function
-            | [] ->
-                incr leftover;
-                Seed_mir.User inst
-            | o :: rest -> (
-                let iname = "__intrinsic_" ^ String.lowercase_ascii (o ^ "_" ^ mname) in
-                match Intrinsic_registry.lookup Intrinsic_registry.manifest ~name:iname with
-                | Some (iid, _) -> use_intrinsic iid iname
-                | None -> find_intrinsic rest)
-          in
-          find_intrinsic (candidate_owners owner)
-        end
-  in
-  let functions =
-    Array.map
-      (fun (f : Seed_mir.function_) ->
-        let blocks =
-          Array.map
-            (fun (b : Seed_mir.block) ->
-              match b.Seed_mir.terminator with
-              | Seed_mir.Call (dest, Seed_mir.User inst, args, next, unwind) ->
-                  {
-                    b with
-                    Seed_mir.terminator =
-                      Seed_mir.Call
-                        ( dest,
-                          rewrite_callee f inst args,
-                          args,
-                          next,
-                          unwind );
-                  }
-              | _ -> b)
-            f.Seed_mir.blocks
-        in
-        { f with Seed_mir.blocks })
-      prog.Seed_mir.functions
-  in
-  ({ prog with Seed_mir.functions }, !rewritten, !leftover)
+  let violations = ref [] in
+  Array.iter
+    (fun (f : Seed_mir.function_) ->
+      Array.iter
+        (fun (b : Seed_mir.block) ->
+          match b.Seed_mir.terminator with
+          | Seed_mir.Call (_, Seed_mir.User inst, _, _, _)
+            when not (Hashtbl.mem emitted inst) ->
+              violations :=
+                Printf.sprintf
+                  "body-less User callee %s (called from %s): no emitted body exists for the instance — the callee class was mis-typed at check time (a registered-only callable must classify as Intrinsic/Extern/Derived/TypeQuery) or the body synthesis failed"
+                  (Seed_mir.print_instance inst) f.Seed_mir.name
+                :: !violations
+          | _ -> ())
+        f.Seed_mir.blocks)
+    prog.Seed_mir.functions;
+  List.rev !violations
 
 (* Mono the lowered closure from the bootstrap entry; report pre/post
    function and instance counts; require zero residual Type_param and a
@@ -4057,17 +3953,28 @@ let host_channel_normalize
    compiler-builtin methods/constructors, derived clone/to_string sigs,
    size_of/align_of type queries) is kept concrete instead of failing —
    and the post-mono concrete verification resolves those same callees
-   against the registry. *)
+   against the registry.  Audit P0-5: the class threading made the
+   registered-only surface unreachable as User callees (the checker
+   classified it at check time), so no post-mono host-channel rewrite
+   runs; assert_no_bodyless_user_calls fails the phase on any User
+   callee without an emitted body. *)
 let run_mono_phase ~(entry_name : string) ~(entry : Instance_id.t)
     ?(generic_types : Mono.generic_def array = [||])
     ?(box_tid : Ids.Type_id.t option = None)
     ?(query_sigs : Mir_verify.query_sig list = [])
-    ?(reg_name : Ids.Callable_id.t -> reg_callable_kind option = fun _ -> None)
-    ?(reg_sig : Ids.Callable_id.t -> (Type_repr.param_type array * Type_repr.t) option =
-      fun _ -> None)
     (prog : Seed_mir.program) : (mono_outcome, string list) result =
   Printf.printf "  mono: entry '%s' (%s)\n" entry_name (Seed_mir.print_instance entry);
   let type_instances = ref [] in
+  (* audit P0-13: the ONE canonical generic-instance cache shared by the
+     mono queue, the materializer and the post-mono concrete verifier.
+     Its mint starts above the largest TypeId the program can see, so a
+     canonical specialized id can never alias an existing identity; the
+     ids are minted in first-discovery order (deterministic). *)
+  let canonical =
+    Canonical_type_instance.create
+      ~mint_from:(program_max_type_id ~generic_types prog + 1)
+      ()
+  in
   (* the body-less callable surface: callable -> declared-parameter
      count (the registry's qs_decl carries the declaration-order
      binders) *)
@@ -4079,7 +3986,7 @@ let run_mono_phase ~(entry_name : string) ~(entry : Instance_id.t)
     |> Option.map (fun q -> Array.length q.Mir_verify.qs_decl)
   in
   match
-    Mono.build ~entry ~generic_types ~registered_only
+    Mono.build ~entry ~generic_types ~registered_only ~canonical:(Some canonical)
       ~on_type_instance:(fun ti -> type_instances := ti :: !type_instances)
       prog
   with
@@ -4092,28 +3999,28 @@ let run_mono_phase ~(entry_name : string) ~(entry : Instance_id.t)
       let pre = Array.length prog.Seed_mir.functions in
       let post = Array.length fns in
       let queued = List.rev !type_instances in
-      (match materialize_type_instances ~generic_types ~type_instances:queued mono_prog with
+      (match
+         materialize_type_instances ~generic_types ~canonical:(Some canonical)
+           ~type_instances:queued mono_prog
+       with
        | Error errs ->
            Printf.printf "  mono: TYPE MATERIALIZATION FAILED\n";
            List.iter (fun e -> Printf.printf "    %s\n" e) errs;
            Error errs
-        | Ok (final_prog0, mat_map) ->
-           (* re-audit §70: the host-channel normalization — the mono'd
-              output's body-less User callees (registered-only
-              callables with typed sigs but no lowered body) have no
-              VM dispatch; rewrite them onto the Intrinsic/Extern
-              channel when their registered name resolves in the
-              registries, so the concrete verification below checks
-              the EXACT program the VM will run. *)
-           let final_prog, n_rewritten, n_leftover =
-             host_channel_normalize ~reg_name ~reg_sig final_prog0
-           in
-           Printf.printf
-             "  mono: host-channel normalization: rewrote %d body-less User call(s) to Intrinsic/Extern; %d remain User (no host binding, fail-closed at the VM)\n"
-             n_rewritten n_leftover;
-           let n_type_instances =
-             Array.length final_prog.Seed_mir.types - Array.length prog.Seed_mir.types
-           in
+         | Ok (final_prog0, mat_map) ->
+            (* audit P0-5: the callee class threading REPLACES the
+               deleted post-mono host-channel normalization — every
+               User callee the mono output carries must have an emitted
+               body, otherwise the phase fails naming the instance *)
+            let final_prog = final_prog0 in
+            let bodyless_user_errs = assert_no_bodyless_user_calls final_prog in
+            Printf.printf
+              "  mono: body-less User callee audit (assert_no_bodyless_user_calls): %d violation(s) — every remaining User callee has an emitted body (the registered-only surface classified at check time; the post-mono host-channel rewrite is gone)\n"
+              (List.length bodyless_user_errs);
+            List.iter (fun m -> Printf.printf "    %s\n" m) bodyless_user_errs;
+            let n_type_instances =
+              Array.length final_prog.Seed_mir.types - Array.length prog.Seed_mir.types
+            in
            let residual = count_residual_type_params final_prog in
            Printf.printf
              "  mono: build OK — pre %d template function(s) -> post %d specialized instance(s)\n"
@@ -4129,18 +4036,21 @@ let run_mono_phase ~(entry_name : string) ~(entry : Instance_id.t)
                           (Array.to_list (Array.map Seed_mir.print_type ti.Mono.ti_args))))
                    queued));
            Printf.printf
-             "  mono: materialized %d concrete type instance def(s); final types table %d entries\n"
-             n_type_instances (Array.length final_prog.Seed_mir.types);
+             "  mono: materialized %d concrete type instance def(s) under %d canonical specialized id(s); final types table %d entries\n"
+             n_type_instances
+             (Canonical_type_instance.count canonical)
+             (Array.length final_prog.Seed_mir.types);
            Printf.printf
              "  mono: post-instance count %d; residual Type_param positions %d (walked params/locals/instance args/operands/callees/statics/type defs)\n"
              post residual;
            (* the body-less-registered sigs the concrete verifier
               resolves kept calls against are checker-side and mention
               the ORIGINAL generic nominal template ids: the verifier's
-              post_rewrite (the materializer's (tid, args) -> fresh-id
-              map) reconciles them with the rewritten program, or a kept
-              call's destination (a rewritten local) disagrees with the
-              registered callee's return *)
+              post_rewrite (the SAME canonical cache the materializer
+              rewrote the program through) reconciles them with the
+              rewritten program, or a kept call's destination (a
+              rewritten local) disagrees with the registered callee's
+              return *)
             let box_instances =
               match box_tid with
               | None -> []
@@ -4150,13 +4060,9 @@ let run_mono_phase ~(entry_name : string) ~(entry : Instance_id.t)
                       if Ids.Type_id.compare t bt = 0 then Some ntid else None)
                     mat_map
             in
-            let materialized_from =
-              program_max_type_id ~generic_types prog + 1
-            in
             (match
                Mir_verify.require_valid_concrete ~box_tid ~box_instances
-                 ~materialized_from
-                 ~post_rewrite:(rewrite_ty mat_map) ~query_sigs final_prog
+                 ~post_rewrite:(rewrite_ty canonical) ~query_sigs final_prog
              with
             | Error errs ->
                 Printf.printf "  MONO_MIR_STRUCTURAL_GATE = FAIL\n";
@@ -4180,22 +4086,30 @@ let run_mono_phase ~(entry_name : string) ~(entry : Instance_id.t)
                        then Printf.printf "  --- fn %s ---\n%s\n" name
                          (Seed_mir.print_function f))
                      final_prog.Seed_mir.functions);
-                Error errs
-            | Ok () ->
-                Printf.printf "  MONO_MIR_STRUCTURAL_GATE = PASS (%d functions) [seed-materialized-boundary=%d]\n" post materialized_from;
-                Ok
-                  { mo_program = final_prog;
-                    mo_entry = entry;
-                    mo_entry_name = entry_name;
-                    mo_pre_functions = pre;
-                    mo_post_functions = post;
-                    mo_post_instances = post;
-                    mo_type_instances = n_type_instances;
-                    mo_residual_type_params = residual;
-                    mo_query_sigs = query_sigs;
-                    mo_post_rewrite = rewrite_ty mat_map;
-                    mo_box_instances = box_instances;
-                    mo_materialized_from = materialized_from }))
+                 Error errs
+             | Ok () ->
+                 if bodyless_user_errs <> [] then begin
+                   Printf.printf "  NO_BODYLESS_USER_CALLEES = FAIL (%d violation(s))\n"
+                     (List.length bodyless_user_errs);
+                   Error bodyless_user_errs
+                 end
+                 else begin
+                 Printf.printf
+                   "  MONO_MIR_STRUCTURAL_GATE = PASS (%d functions) [canonical-type-instances=%d]\n"
+                   post (Canonical_type_instance.count canonical);
+                 Ok
+                   { mo_program = final_prog;
+                     mo_entry = entry;
+                     mo_entry_name = entry_name;
+                     mo_pre_functions = pre;
+                     mo_post_functions = post;
+                     mo_post_instances = post;
+                     mo_type_instances = n_type_instances;
+                     mo_residual_type_params = residual;
+                     mo_query_sigs = query_sigs;
+                     mo_post_rewrite = rewrite_ty canonical;
+                     mo_box_instances = box_instances }
+                 end))
 
 let oracle_of_ctx (ctx : closure_ctx) (stats : mir_stats option) : oracle_counts =
   let s =
@@ -4224,17 +4138,14 @@ let oracle_of_ctx (ctx : closure_ctx) (stats : mir_stats option) : oracle_counts
      type-argument special form's instance carries the queried type; the
      monomorphizer resolves them through the registered-only registry),
      so excluding them would report every one as a spurious extra-in-MIR
-     instance.  The recorded substitution is chased through the final
-     journal EXACTLY like the lowering's typed channel
-     (final_journal_subst — the same helper typed_nodes_of applies): a
-     call's type args can carry raw infer vars that only the final
-     journal resolves (`var v = Vec::new(); v.push(x)` — the push call's
-     raw Vec[?] becomes Vec[<resolved>] only after the whole item is
-     checked), and the MIR side's User callee instances ARE the chased
-     records.  Comparing the raw records against the chased MIR callees
-     would report every journal-resolved call site as a spurious
-     missing/extra pair (inst{callable#N; [?x]} raw vs
-     inst{callable#N; [T_y]} chased — the same call).
+     instance.  The recorded substitutions are ALREADY final (audit
+     P0-8: finalize_inference rewrote every accepted typed node with the
+     chased final substitution before lowering — a call's raw Vec[?]
+     became Vec[<resolved>] exactly like the MIR side's User callee
+     instances, which are built from the same finalized records), so the
+     typed records and the MIR callees agree spelling-for-spelling —
+     comparing the raw records against the MIR callees can never report
+     a journal-resolved call site as a spurious missing/extra pair.
      THE USER-DISPATCH DOMAIN (re-audit P0 #2, final semantics): the
      typed set is compared against the MIR User-callee set WITHIN the
      callable domain the seed actually dispatches as User calls.  The
@@ -4263,19 +4174,20 @@ let oracle_of_ctx (ctx : closure_ctx) (stats : mir_stats option) : oracle_counts
   let is_user_callable (c : Ids.Callable_id.t) : bool =
     not (List.exists (fun k -> Ids.Callable_id.compare k c = 0) excluded_callables)
   in
-  let chase = final_journal_subst () in
   let debug_oracle = Sys.getenv_opt "TANGERINE_DEBUG_ORACLE" <> None in
   (* the node -> enclosing-item index, built ALWAYS when the MIR side is
      live (the fold needs it to exclude the accepted calls whose AST site
      is NOT lowered as a seed function body: static/const initializers
      (the seed statics' constant channel carries no Call terminators),
      struct-field defaults, test and macro bodies); the debug diagnostics
-     reuse the same index *)
-  oracle_typed_entries := [];
+     reuse the same index.  audit P0-7: the index and the raw-typed
+     entries live in the ctx's per-compilation audit record. *)
+  let audit = ctx.ctx_audit in
+  audit.aud_typed_entries <- [];
   if stats <> None then build_oracle_node_table ctx
   else begin
-    oracle_node_tbl := None;
-    oracle_typed_entries := []
+    audit.aud_node_tbl <- None;
+    audit.aud_typed_entries <- []
   end;
   (* a call node whose enclosing item is not lowered as a seed function
      body never emits a Call terminator — its accepted record is
@@ -4292,7 +4204,7 @@ let oracle_of_ctx (ctx : closure_ctx) (stats : mir_stats option) : oracle_counts
       go 0
   in
   let node_is_lowered_body (key : int) : bool =
-    match !oracle_node_tbl with
+    match audit.aud_node_tbl with
     | Some t -> (
         match Hashtbl.find_opt t key with
         | Some (d, _) ->
@@ -4304,19 +4216,10 @@ let oracle_of_ctx (ctx : closure_ctx) (stats : mir_stats option) : oracle_counts
         | None -> true)
     | None -> true
   in
-  (* a call node inside a duplicate-function-instance body that the
-     lowering's instance-uniqueness filter DROPPED (the same typed
-     signature collapsed onto one emitted function — the kept first
-     lowering) never emits its calls either: exclude by the enclosing
-     fn-decl span *)
-  let node_decl_dropped (key : int) : bool =
-    match !oracle_node_tbl with
-    | Some t -> (
-        match Hashtbl.find_opt t key with
-        | Some (_, dspan) -> List.mem dspan !oracle_dropped_decl_spans
-        | None -> false)
-    | None -> false
-  in
+  (* audit P0-6: there is NO dropped-body exclusion anymore — duplicate
+     declarations are not body-checked and never lower, so the oracle
+     describes the real typed program: every accepted call record sits
+     in a body the seed emits. *)
   (* the User-dispatch callable domain: the callable parts of the MIR's
      User callee instances *)
   let mir_domain =
@@ -4331,21 +4234,20 @@ let oracle_of_ctx (ctx : closure_ctx) (stats : mir_stats option) : oracle_counts
   let typed_set =
     Hashtbl.fold
       (fun key (n : Typecheck.typed_node) acc ->
-        match n.Typecheck.tn_call with
+        match Typecheck.tc_callee_instance n.Typecheck.tn_call with
         | Some (cid, subst)
           when is_user_callable cid
-               && node_is_lowered_body (Ids.Node_id.to_int key)
-               && not (node_decl_dropped (Ids.Node_id.to_int key)) ->
-            let inst = Instance_id.make ~callable:cid ~type_args:(Array.map chase subst) in
+               && node_is_lowered_body (Ids.Node_id.to_int key) ->
+            let inst = Instance_id.make ~callable:cid ~type_args:subst in
             if debug_oracle then
-              oracle_typed_entries :=
-                (Ids.Node_id.to_int key, inst) :: !oracle_typed_entries;
+              audit.aud_typed_entries <-
+                (Ids.Node_id.to_int key, inst) :: audit.aud_typed_entries;
             inst :: acc
         | _ -> acc)
       env.Typecheck.typed_nodes []
     |> List.sort_uniq Instance_id.compare
   in
-  oracle_raw_typed_set := typed_set;
+  audit.aud_raw_typed_set <- typed_set;
   (* the row's typed side: the accepted instances of User-dispatch
      callables only (the raw accepted set minus the intrinsic/derived/
      static-initializer classes the lowering resolves off the User
@@ -4353,7 +4255,7 @@ let oracle_of_ctx (ctx : closure_ctx) (stats : mir_stats option) : oracle_counts
   let typed_domain_set =
     List.filter (fun i -> in_domain (Instance_id.callable i)) typed_set
   in
-  oracle_instance_sets := (typed_domain_set, s.ms_callable_instances);
+  audit.aud_instance_sets <- (typed_domain_set, s.ms_callable_instances);
   (* the statics identity set: the typed REQUIRED static names (the
      declared, non-generic statics of the closure env) vs the MIR
      program's static names *)
@@ -4363,7 +4265,7 @@ let oracle_of_ctx (ctx : closure_ctx) (stats : mir_stats option) : oracle_counts
       env.Typecheck.statics
     |> List.sort_uniq String.compare
   in
-  oracle_static_sets := (typed_statics, List.sort_uniq String.compare s.ms_static_names);
+  audit.aud_static_sets <- (typed_statics, List.sort_uniq String.compare s.ms_static_names);
   (* the callable-template identity set (re-audit item 23/24): the
      typed declared callable templates (functions + methods + nested
      functions, minus the non-body special forms: enum-variant
@@ -4406,8 +4308,8 @@ let oracle_of_ctx (ctx : closure_ctx) (stats : mir_stats option) : oracle_counts
   let template_domain_set =
     List.filter (fun c -> List.mem c mir_templates) typed_templates
   in
-  oracle_raw_template_set := typed_templates;
-  oracle_template_sets := (template_domain_set, mir_templates);
+  audit.aud_raw_template_set <- typed_templates;
+  audit.aud_template_sets <- (template_domain_set, mir_templates);
   (* the callable-id -> registered-name table for the oracle's
      missing/extra diagnostics (TANGERINE_DEBUG_ORACLE) *)
   let names = Hashtbl.create 16384 in
@@ -4421,7 +4323,7 @@ let oracle_of_ctx (ctx : closure_ctx) (stats : mir_stats option) : oracle_counts
   List.iter (fun (n, ts) -> note "query" n ts) env.Typecheck.state.query_sigs;
   List.iter (fun (n, ts) -> note "ctor" n ts) env.Typecheck.constructors;
   List.iter (fun (_, ts) -> note "derived" ts.Typecheck.ts_name ts) env.Typecheck.state.derived_sigs;
-  oracle_name_tbl := Some names;
+  audit.aud_name_tbl <- Some names;
   if Sys.getenv_opt "TANGERINE_DEBUG_ORACLE" <> None then begin
     Printf.printf "    ORACLE-DEBUG callable-name table (%d entries)\n"
       (Hashtbl.length names);
@@ -4701,8 +4603,12 @@ let run_bootstrap_closure ~(repo_root : string) ~(manifest_path : string)
           | Ok () -> true
           | Error _ -> false
         in
-        let stats = count_mir_stats prog in
-        let oracle_incomplete = print_oracle_rows (oracle_of_ctx ctx (Some stats)) in
+        let stats =
+          count_mir_stats
+            ~exclude_callables:(List.map fst ctx.ctx_env.Typecheck.state.derived_sigs)
+            prog
+        in
+        let oracle_incomplete = print_oracle_rows ctx.ctx_audit (oracle_of_ctx ctx (Some stats)) in
         match resolve_bootstrap_entry prog entry with
         | None ->
             Ok
@@ -4723,8 +4629,6 @@ let run_bootstrap_closure ~(repo_root : string) ~(manifest_path : string)
                 ~box_tid:(ctx.ctx_env.Typecheck.state.box_tid)
                 ~generic_types:(closure_generic_types ctx.ctx_env)
                 ~query_sigs:(closure_query_sigs ~lowered:(Some prog) ctx.ctx_env)
-                ~reg_name:(reg_callable_name_of_env ctx.ctx_env)
-                ~reg_sig:(reg_callable_sig_of_env ctx.ctx_env)
                 prog
             with
             | Error _ ->
@@ -4852,7 +4756,7 @@ let cmd_bootstrap_check (args : string list) : int =
        if ctx.ctx_type_errors <> [] then begin
          (* honest: lowering/mono are unreachable — print the oracle rows
             with zeros and the skipped note, then fail the gate *)
-         ignore (print_oracle_rows (oracle_of_ctx ctx None));
+         ignore (print_oracle_rows ctx.ctx_audit (oracle_of_ctx ctx None));
          Printf.printf "  mono: skipped (typecheck gate failed)\n";
          Printf.printf "  FRONTEND_SEMANTIC_GATE = FAIL\n";
          Printf.printf "  BOOTSTRAP_EXECUTABLE_CLOSURE = INCOMPLETE\n";
@@ -4880,24 +4784,28 @@ let cmd_bootstrap_check (args : string list) : int =
                       (fun (a, _) (b, _) -> Ids.Type_id.compare a b)
                       !Typecheck.type_names_global));
               List.iter (fun e -> Printf.printf "    %s\n" e) errs;
-              (if Sys.getenv_opt "TANGERINE_DEBUG_DUP" <> None then
-                 let tbl = Hashtbl.create 256 in
-                 Array.iter
-                   (fun (f : Seed_mir.function_) ->
-                     let k = Seed_mir.print_instance f.Seed_mir.instance in
-                     let cur =
-                       match Hashtbl.find_opt tbl k with
-                       | Some l -> l
-                       | None -> []
-                     in
-                     Hashtbl.replace tbl k (f.Seed_mir.name :: cur))
-                   prog.Seed_mir.functions;
-                 Hashtbl.iter
-                   (fun k names ->
-                     if List.length names > 1 then
-                       Printf.eprintf "GATE-DUP %s names=[%s]\n" k
-                         (String.concat " | " names))
-                   tbl);
+               (if Sys.getenv_opt "TANGERINE_DEBUG_DUP" <> None then
+                  (* audit P1-23: the duplicate-instance filter groups by
+                     the STRUCTURAL instance identity — the rendered
+                     instance string is only the row label, never the key *)
+                  let tbl : (Instance_id.t, string list) Hashtbl.t = Hashtbl.create 256 in
+                  Array.iter
+                    (fun (f : Seed_mir.function_) ->
+                      let k = f.Seed_mir.instance in
+                      let cur =
+                        match Hashtbl.find_opt tbl k with
+                        | Some l -> l
+                        | None -> []
+                      in
+                      Hashtbl.replace tbl k (f.Seed_mir.name :: cur))
+                    prog.Seed_mir.functions;
+                  Hashtbl.iter
+                    (fun inst names ->
+                      if List.length names > 1 then
+                        Printf.eprintf "GATE-DUP %s names=[%s]\n"
+                          (Seed_mir.print_instance inst)
+                          (String.concat " | " names))
+                    tbl);
                 (if Sys.getenv_opt "TANGERINE_DEBUG_GATE" <> None then
                   let gate_dump_names =
                     [ "record_block_exit_plan"; "block_exit_key"; "windows";
@@ -4989,8 +4897,12 @@ let cmd_bootstrap_check (args : string list) : int =
               Printf.printf "  SEED_MIR_STRUCTURAL_GATE = PASS (%d functions)\n"
                 (Array.length prog.Seed_mir.functions);
               debug_mono_poison_names ctx prog;
-        let stats = count_mir_stats prog in
-        let incomplete = print_oracle_rows (oracle_of_ctx ctx (Some stats)) in
+        let stats =
+          count_mir_stats
+            ~exclude_callables:(List.map fst ctx.ctx_env.Typecheck.state.derived_sigs)
+            prog
+        in
+        let incomplete = print_oracle_rows ctx.ctx_audit (oracle_of_ctx ctx (Some stats)) in
         if Sys.getenv_opt "TANGERINE_DEBUG_ORACLE" <> None then debug_dump_mir_calls prog;
         Printf.printf "  FRONTEND_SEMANTIC_GATE = PASS\n";
               (match resolve_bootstrap_entry prog opts.entry with
@@ -5011,8 +4923,6 @@ let cmd_bootstrap_check (args : string list) : int =
                        ~box_tid:(ctx.ctx_env.Typecheck.state.box_tid)
                        ~generic_types:(closure_generic_types ctx.ctx_env)
                        ~query_sigs:mono_query_sigs
-                       ~reg_name:(reg_callable_name_of_env ctx.ctx_env)
-                       ~reg_sig:(reg_callable_sig_of_env ctx.ctx_env)
                        prog
                    with
                    | Error _ ->
@@ -5033,7 +4943,6 @@ let cmd_bootstrap_check (args : string list) : int =
                              ~query_sigs:mo.mo_query_sigs
                              ~post_rewrite:mo.mo_post_rewrite
                              ~box_instances:mo.mo_box_instances
-                             ~materialized_from:mo.mo_materialized_from
                              mo.mo_program
                          with
                          | Ok () -> true
@@ -5205,8 +5114,6 @@ let cmd_compile (args : string list) : int =
                       ~box_tid:(ctx.ctx_env.Typecheck.state.box_tid)
                       ~generic_types:(closure_generic_types ctx.ctx_env)
                       ~query_sigs:(closure_query_sigs ~lowered:(Some prog) ctx.ctx_env)
-                      ~reg_name:(reg_callable_name_of_env ctx.ctx_env)
-                      ~reg_sig:(reg_callable_sig_of_env ctx.ctx_env)
                       prog
                   with
                   | Error _ ->

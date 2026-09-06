@@ -133,33 +133,35 @@ type ctx = {
      Box declaration) *)
   box_tid : Ids.Type_id.t option;
   (* Concrete_mode post-mono: the driver's type-instance materializer
-     mints a FRESH TypeId per concrete generic-nominal instance and
-     rewrites the program's Named mentions to it.  The body-less
-     registered sigs (query_sigs) are checker-side and still mention
-     the ORIGINAL template ids, so a registered callee's substituted
-     types pass through this rewrite after the call's type arguments
-     replace its declaration binders — otherwise a kept call's
-     destination (a rewritten local) disagrees with the registered
-     callee's return.  Identity in Template_mode. *)
+     interns every concrete generic-nominal instance through the ONE
+     canonical cache (audit P0-13) — same (template, args) always
+     yields the same canonical specialized TypeId — and rewrites the
+     program's Named mentions to it.  The body-less registered sigs
+     (query_sigs) are checker-side and still mention the ORIGINAL
+     template ids, so a registered callee's substituted types pass
+     through the same canonical-cache rewrite after the call's type
+     arguments replace its declaration binders — otherwise a kept
+     call's destination (a rewritten local) disagrees with the
+     registered callee's return.  Identity in Template_mode. *)
   post_rewrite : Type_repr.t -> Type_repr.t;
-  (* Concrete_mode post-mono: the FRESH TypeIds the materializer minted
-     for the checker's transparent Box nominal instances (the map's
-     (box_tid, args) -> fresh entries).  Box[T] unifies with T in both
-     directions (types_compatible, deref pointee, projection chains),
-     and a materialized Box[T] mention — Named (fresh, [T]) — must stay
-     transparent exactly like the original-tid mention. *)
+  (* Concrete_mode post-mono: the canonical specialized TypeIds the
+     materializer minted for the checker's transparent Box nominal
+     instances (the cache's (box_tid, args) entries).  Box[T] unifies
+     with T in both directions (types_compatible, deref pointee,
+     projection chains), and a materialized Box[T] mention — Named
+     (fresh, [T]) — must stay transparent exactly like the
+     original-tid mention. *)
   box_instances : Ids.Type_id.t list;
-  (* Concrete_mode post-mono: the first TypeId the materializer could
-     have minted (program_max_type_id + 1 pre-materialization).  Two
-     DIFFERENT fresh tids at or above this boundary can only be
-     materialized instances of generic templates; comparing their
-     concrete def shapes one level deep reconciles the instances the
-     checker's own compatibility split apart (a literal-solved instance
-     vs its integer-kind instance, a Box-wrapped instance vs the erased
-     mention) without ever weakening NOMINAL identity for user types. *)
-  materialized_from : int;
-  (* recursion guard for the materialized-instance shape comparison *)
-  compat_depth : int ref;
+  (* The P1-25 copyability cache: the Type_properties engine memoizes
+     its answers per canonical (TypeId, args) instance; the cache is
+     bound to this ctx's def table (program + registry), so one ctx
+     never mixes two tables' answers. *)
+  copy_cache : Type_properties.cache;
+  (* The P1-26 canonical drop-plan table: per concrete TypeId, the
+     ordered (field/payload path, needs_drop) plan derived once from the
+     program's defs (drop_plan.ml).  The drop accounting consults it
+     when a whole-root drop destroys a local (destroyed_keys_of_drop). *)
+  drop_plans : Drop_plan.table;
 }
 
 (* Whether a TypeId is the checker's transparent Box nominal — the
@@ -327,15 +329,16 @@ let resolve_or_self (ctx : ctx) (ty : Type_repr.t) : Type_repr.t =
   | Some t -> t
   | None -> ty
 
-(* Copy property authority (re-audit §36): the seed's property engine
-   (Type_properties.of_type) with the program's def table as the Named
+(* Copy property authority (re-audit §36 / P1-25): the seed's property
+   engine (Type_properties) with the program's def table as the Named
    resolver.  The engine's rules: scalars/String-owned/immutable refs
    and genuine function pointers behave as before; a def_repr'd enum
    (Function(payloads, Never)) is Copy iff EVERY variant payload is Copy
    — an enum with an owning payload (Result[Int, String]) must be moved,
    consumed or passed by place, never bitwise-copied; a Named type's
    copyability resolves its def and applies the same recursive rule
-   (struct Copy iff all fields Copy). *)
+   (struct Copy iff all fields Copy).  The ctx-level cache memoizes the
+   engine's answers per canonical (TypeId, args) instance (P1-25). *)
 let is_copy (ctx : ctx) (ty : Type_repr.t) : bool =
   (* the builtin runtime nominals' canonical def shapes: the driver's
      type-instance materializer never remaps Vec/Array/Map/Set/Ptr/PtrMut
@@ -346,17 +349,17 @@ let is_copy (ctx : ctx) (ty : Type_repr.t) : bool =
      are the address handles) are Copy, exactly as their registry
      template defs resolved pre-mono (Vec/Map/Set declare no fields;
      Ptr/PtrMut declare `address: UInt`) *)
-  Type_properties.of_type
-    ~resolve_def:(fun tid ->
+  Type_properties.of_type_cached ctx.copy_cache
+    (Some (fun tid ->
       match find_type ctx tid with
       | Some t -> Some t
       | None -> (
           match Ids.Type_id.to_int tid with
           | 0 | 1 | 2 -> Some (Type_repr.Tuple [||])
           | 5 | 6 -> Some (Type_repr.Tuple [| Type_repr.Int Type_repr.UInt |])
-          | _ -> None))
+          | _ -> None)))
     ty
-    |> fun p -> p.Type_properties.is_copy
+  |> fun p -> p.Type_properties.is_copy
 
 (* Type compatibility.  NOMINAL-vs-NOMINAL comparisons are identity
    comparisons: Named (TypeId, args) is compatible with Named
@@ -408,6 +411,19 @@ let rec types_compatible (ctx : ctx) (a : Type_repr.t) (b : Type_repr.t) : bool 
          either order at the call-arg/aggregate checks) *)
       types_compatible ctx t e
   | Type_repr.Named (ta, aargs), Type_repr.Named (tb, bargs) ->
+      (* NOMINAL identity is EXACT canonical-id equality (audit P0-13):
+         two materialized instances of generic templates are the same
+         type exactly when they are the SAME canonical specialized id —
+         the shared Canonical_type_instance cache interns every consumer,
+         so logically identical instances (the checker's literal-solved
+         vs integer-kind spellings, the 64-bit alias spellings) always
+         materialize under ONE id, never under two defs the verifier
+         would have to reconcile by comparing their concrete def shapes
+         one level deep.  Distinct canonical ids — genuinely different
+         instances (Pair[Int] vs Pair[String]) — are never compatible,
+         however similar their def shapes; the args compare pairwise
+         under the same compatibility, exactly like every other
+         same-id pair. *)
       (ta = tb
        && Array.length aargs = Array.length bargs
        && (let ok = ref true in
@@ -415,34 +431,6 @@ let rec types_compatible (ctx : ctx) (a : Type_repr.t) (b : Type_repr.t) : bool 
              (fun i t -> if not (types_compatible ctx aargs.(i) t) then ok := false)
              bargs;
            !ok))
-      ||
-      (* Concrete_mode, two DIFFERENT fresh ids at/above the
-         materializer's boundary: both are materialized instances of
-         generic templates, and the checker's own compatibility can
-         split one semantic value across two instances (a literal-solved
-         instance vs its integer-kind instance — the lowered slots keep
-         the raw Int_literal; a Box-wrapped mention vs the transparently
-         erased mention).  The instances' concrete def shapes reconcile
-         them — recursion bounded by the depth guard, so a
-         self-referencing generic (Node[Int] vs Node[String] through an
-         Option[Box[Node]] field) terminates.  NOMINAL identity for
-         user-declared types is never weakened: a fresh id can only be
-         a materialized instance. *)
-      (ctx.mode = Concrete_mode
-      && Ids.Type_id.to_int ta >= ctx.materialized_from
-      && Ids.Type_id.to_int tb >= ctx.materialized_from
-      && (if !(ctx.compat_depth) > 8 then false
-          else begin
-            incr ctx.compat_depth;
-            let r =
-              match find_def ctx ta, find_def ctx tb with
-              | Some da, Some db ->
-                  types_compatible ctx (Seed_mir.def_repr da) (Seed_mir.def_repr db)
-              | _ -> false
-            in
-            decr ctx.compat_depth;
-            r
-          end))
   | Type_repr.Named _, _ | _, Type_repr.Named _ ->
       (* one side nominal, the other structural: the comparison is
          structural-by-nature, so the nominal side is resolved — but
@@ -924,6 +912,21 @@ let destroyed_key_conflict (destroyed : StrSet.t IntMap.t) (root : int) (key : s
           m <> "*" && (m = key || (m <> "" && String.starts_with ~prefix:(m ^ ".") key)))
         set
 
+(* P1-26 drop-plan consult: a whole-root Drop/Deinit of a LOCAL destroys
+   the local's owning component paths — the destroyed lattice records
+   the canonical type-level plan's needs_drop paths (per concrete
+   TypeId, drop_plan.ml) alongside the root key, so a later drop of any
+   owning component of the same root is a duplicate-drop finding,
+   exactly as the VM's do_drop (which drops the whole root slot for any
+   key) traps on the second drop of the root local.  A value whose type
+   has no materialized plan contributes only its own key (the
+   structural-glue fallback). *)
+let destroyed_keys_of_drop (ctx : ctx) (fn : function_) (p : place) : string list =
+  match p.root with
+  | Local l when p.projections = [] && l >= 0 && l < Array.length fn.locals ->
+      Drop_plan.owning_paths ctx.drop_plans fn.locals.(l)
+  | _ -> []
+
 (* ──────────────────────────────────────────────────────────────────
    Constants *)
 
@@ -1205,7 +1208,7 @@ let moved_in_sets (fn : function_) (tbl : (int, block) Hashtbl.t) : (int, StrSet
 (* ──────────────────────────────────────────────────────────────────
    Destroyed-state dataflow (duplicate-drop detection across blocks). *)
 
-let destroyed_in_sets (fn : function_) (tbl : (int, block) Hashtbl.t) :
+let destroyed_in_sets (ctx : ctx) (fn : function_) (tbl : (int, block) Hashtbl.t) :
     (int, StrSet.t IntMap.t) Hashtbl.t =
   let preds = Hashtbl.create 16 in
   Hashtbl.iter (fun id _ -> Hashtbl.replace preds id []) tbl;
@@ -1233,7 +1236,11 @@ let destroyed_in_sets (fn : function_) (tbl : (int, block) Hashtbl.t) :
         | SetDiscriminant _ | Nop -> ())
       b.statements;
     (match b.terminator with
-     | Drop (p, _, _) | Deinit (p, _, _) -> out := key_insert !out (root_key p.root) (place_key p)
+     | Drop (p, _, _) | Deinit (p, _, _) ->
+         out := key_insert !out (root_key p.root) (place_key p);
+         List.iter
+           (fun k -> out := key_insert !out (root_key p.root) k)
+           (destroyed_keys_of_drop ctx fn p)
      | _ -> ());
     !out
   in
@@ -2075,20 +2082,50 @@ let check_aggregate (ctx : ctx) (fn : function_) (bb_ctx : string) (kind : aggre
                      "%s: closure aggregate instance parameter count %d does not match the closure signature %d"
                      bb_ctx (Array.length f.params) (Array.length sig_params))
               else
-                Array.iteri
-                  (fun i p ->
-                    if
-                      not
-                        (types_compatible ctx (subst p.Type_repr.pt_type)
-                           sig_params.(i).Type_repr.pt_type)
-                    then
+                (* re-audit P0-4: the closure signature comparison is
+                   the SHARED signature-identity matcher — arity, each
+                   parameter's access convention exact, types
+                   alpha-equivalent under ONE binder bijection across
+                   the whole signature (params AND return), never a
+                   pt_type-only walk.  Both sides live in the same
+                   lowered-program domain (the callee side read under
+                   the same type-argument substitution the argument
+                   checks apply), so no canonicalization is needed. *)
+                let callee_sig : Signature_identity.signature =
+                  {
+                    Signature_identity.sig_params =
+                      Array.map
+                        (fun (p : Type_repr.param_type) ->
+                          { p with Type_repr.pt_type = subst p.Type_repr.pt_type })
+                        f.params;
+                    sig_ret = ret;
+                  }
+                in
+                let closure_sig : Signature_identity.signature =
+                  { Signature_identity.sig_params = sig_params; sig_ret = sig_ret }
+                in
+                if
+                  not
+                    (Signature_identity.signatures_match callee_sig closure_sig)
+                then
+                  match Signature_identity.first_mismatch callee_sig closure_sig with
+                  | Some (Signature_identity.Mismatch_param i) ->
+                      let render (p : Type_repr.param_type) =
+                        Access_effect.to_string p.Type_repr.pt_convention
+                        ^ " "
+                        ^ Seed_mir.print_type p.Type_repr.pt_type
+                      in
                       add_err ctx
                         (Printf.sprintf
-                           "%s: closure aggregate instance parameter %d type mismatch" bb_ctx i))
-                  f.params;
-              if not (types_compatible ctx ret sig_ret) then
-                add_err ctx
-                  (Printf.sprintf "%s: closure aggregate instance return type mismatch" bb_ctx)))
+                           "%s: closure aggregate instance parameter %d (%s) does not match the closure signature's parameter (%s)"
+                           bb_ctx i
+                           (render callee_sig.Signature_identity.sig_params.(i))
+                           (render closure_sig.Signature_identity.sig_params.(i)))
+                  | Some Signature_identity.Mismatch_return ->
+                      add_err ctx
+                        (Printf.sprintf
+                           "%s: closure aggregate instance return type mismatch" bb_ctx)
+                  | Some (Signature_identity.Mismatch_arity _) | None -> ()))
 let check_rvalue (ctx : ctx) (fn : function_) (bb_ctx : string) (declared : IntSet.t)
     (rv : rvalue) (running : IntSet.t) (moved : StrSet.t IntMap.t) (dest_ty : Type_repr.t) :
     Type_repr.t option =
@@ -2381,8 +2418,105 @@ let check_rvalue (ctx : ctx) (fn : function_) (bb_ctx : string) (declared : IntS
 let check_call (ctx : ctx) (fn : function_) (bb_ctx : string) (dest : place)
     (callee : callee) (args : call_arg array) (running : IntSet.t) (moved : StrSet.t IntMap.t) : unit =
   check_dest_place ctx fn bb_ctx dest running;
+  (* the emitted-body callee check — shared by the User class and the
+     Derived class (audit P0-5): a Derived callee names the
+     compiler-synthesized derived contract under the SAME callable
+     identity its real emitted body carries, so both dispatch through
+     the instance resolver *)
+  let check_user_callee (inst : Instance_id.t) : unit =
+    match resolve_callee ctx inst with
+    | Callee_unknown ->
+        add_err ctx
+          (Printf.sprintf "%s: call to unknown function instance %s" bb_ctx
+             (Seed_mir.print_instance inst))
+    | Callee_arity_mismatch m ->
+        add_err ctx (Printf.sprintf "%s: call to instance %s: %s" bb_ctx
+                        (Seed_mir.print_instance inst) m)
+    | Callee_ok (cf, subst) -> (
+        if Array.length args <> Array.length cf.params then
+          add_err ctx
+            (Printf.sprintf "%s: call argument count mismatch: expected %d got %d" bb_ctx
+               (Array.length cf.params) (Array.length args));
+        Array.iteri
+          (fun i arg ->
+            (match arg.effect_ with
+             | Access_effect.Read | Access_effect.Consume -> ()
+             | Access_effect.Modify | Access_effect.Initialize -> (
+                 (* Modify/Initialize are PLACE CHANNELS (the callee's
+                    mutation copies back into the caller's storage) —
+                    a constant has no storage, so those effects require
+                    a place operand.  A Consume argument transfers a
+                    VALUE: a constant operand is an immutable value the
+                    callee copies in, exactly like the Read form, so
+                    Consume-of-a-constant is legal (the io kernel's
+                    `vec.resize(len, 0)` fill constants). *)
+                 match arg.value with
+                 | Constant _ ->
+                     add_err ctx
+                       (Printf.sprintf
+                          "%s: call arg %d has effect %s but is a constant (that effect requires a place operand)"
+                          bb_ctx i (Seed_mir.print_effect arg.effect_))
+                 | _ -> ()));
+            match (if i < Array.length cf.params then Some cf.params.(i) else None) with
+             | Some p -> (
+                  (* the documented exactness rule: a call argument's
+                     access effect must be the read-side of the callee's
+                     parameter convention (Let->Read, Inout->Modify,
+                     Sink->Consume, Set->Initialize).  The kernel's
+                     sanctioned inout-of-a-literal shape (`emit_uleb128
+                     (&mut buf, 1)` — the callee's `inout value: u64`
+                     receives a literal whose writeback would be
+                     meaningless) lowers with the READ effect on the
+                     constant operand; the verifier accepts the
+                     downgrade exactly there. *)
+                  let expected = Access_effect.read_effect p.Type_repr.pt_convention in
+                  let inout_const_downgrade =
+                    match p.Type_repr.pt_convention, arg.effect_, arg.value with
+                    | Access_effect.Inout, Access_effect.Read, Seed_mir.Constant _ -> true
+                    | _ -> false
+                  in
+                  if arg.effect_ <> expected && not inout_const_downgrade then
+                    add_err ctx
+                      (Printf.sprintf
+                         "%s: call arg %d effect %s does not match the callee's %s convention (expected %s)"
+                         bb_ctx i (Seed_mir.print_effect arg.effect_)
+                         (Access_effect.to_string p.Type_repr.pt_convention)
+                         (Seed_mir.print_effect expected));
+                   (* template mode: the callee's param type is read under
+                      the substitution (its declaration binders <- this
+                      call's type args), the same specialization contract
+                      mono applies *)
+                   let pty = subst p.Type_repr.pt_type in
+                   match
+                     check_operand ctx fn bb_ctx arg.value running moved ~as_call_arg:true ~init_place:(arg.effect_ = Access_effect.Initialize) ~as_place_arg:(arg.effect_ = Access_effect.Modify || arg.effect_ = Access_effect.Initialize)
+                   with
+                    | Some aty ->
+                        if not
+                             (types_compatible ctx pty aty || ptr_addr_ok ctx pty aty
+                              || deref_arg_ok ctx pty aty
+                              || const_int_arg_fits_ok ctx arg.value pty)
+                        then
+                          add_err ctx
+                            (Printf.sprintf "%s: call arg %d type mismatch: expected %s got %s"
+                               bb_ctx i
+                               (Seed_mir.print_type pty) (Seed_mir.print_type aty))
+                    | None -> ())
+                | None -> ())
+             args;
+          let ret_ty =
+            subst (if Array.length cf.locals > 0 then cf.locals.(0) else Type_repr.Unit)
+          in
+          match place_type ctx fn dest with
+          | Some dty ->
+              if not (types_compatible ctx dty ret_ty) then
+                add_err ctx
+                  (Printf.sprintf
+                     "%s: call destination type %s does not match callee return type %s" bb_ctx
+                     (Seed_mir.print_type dty) (Seed_mir.print_type ret_ty))
+          | None -> ())
+  in
   match callee with
-  | Intrinsic i -> (
+  | Intrinsic (i, _iargs) -> (
       if i < 0 then
         add_err ctx
           (Printf.sprintf "%s: negative intrinsic callee index %d" bb_ctx i)
@@ -2676,7 +2810,7 @@ let check_call (ctx : ctx) (fn : function_) (bb_ctx : string) (dest : place)
                    dty
              | None -> ());
             ())
-  | Extern i ->
+  | Extern (i, _eargs) ->
       (* re-audit P7: the extern call is checked against its declared
          registry signature — arity, argument access effects, the
          argument/destination types (registry-placeholder domain mapped
@@ -2824,97 +2958,37 @@ let check_call (ctx : ctx) (fn : function_) (bb_ctx : string) (dest : place)
                 (Printf.sprintf
                    "%s: fn-value call: callee operand has non-function type %s" bb_ctx
                    (Seed_mir.print_type oty))))
-  | User inst -> (
-      match resolve_callee ctx inst with
-      | Callee_unknown ->
-          add_err ctx
-            (Printf.sprintf "%s: call to unknown function instance %s" bb_ctx
-               (Seed_mir.print_instance inst))
-      | Callee_arity_mismatch m ->
-          add_err ctx (Printf.sprintf "%s: call to instance %s: %s" bb_ctx
-                          (Seed_mir.print_instance inst) m)
-      | Callee_ok (cf, subst) -> (
-          if Array.length args <> Array.length cf.params then
-            add_err ctx
-              (Printf.sprintf "%s: call argument count mismatch: expected %d got %d" bb_ctx
-                 (Array.length cf.params) (Array.length args));
-          Array.iteri
-            (fun i arg ->
-              (match arg.effect_ with
-               | Access_effect.Read | Access_effect.Consume -> ()
-               | Access_effect.Modify | Access_effect.Initialize -> (
-                   (* Modify/Initialize are PLACE CHANNELS (the callee's
-                      mutation copies back into the caller's storage) —
-                      a constant has no storage, so those effects require
-                      a place operand.  A Consume argument transfers a
-                      VALUE: a constant operand is an immutable value the
-                      callee copies in, exactly like the Read form, so
-                      Consume-of-a-constant is legal (the io kernel's
-                      `vec.resize(len, 0)` fill constants). *)
-                   match arg.value with
-                   | Constant _ ->
-                       add_err ctx
-                         (Printf.sprintf
-                            "%s: call arg %d has effect %s but is a constant (that effect requires a place operand)"
-                            bb_ctx i (Seed_mir.print_effect arg.effect_))
-                   | _ -> ()));
-              match (if i < Array.length cf.params then Some cf.params.(i) else None) with
-               | Some p -> (
-                    (* the documented exactness rule: a call argument's
-                       access effect must be the read-side of the callee's
-                       parameter convention (Let->Read, Inout->Modify,
-                       Sink->Consume, Set->Initialize).  The kernel's
-                       sanctioned inout-of-a-literal shape (`emit_uleb128
-                       (&mut buf, 1)` — the callee's `inout value: u64`
-                       receives a literal whose writeback would be
-                       meaningless) lowers with the READ effect on the
-                       constant operand; the verifier accepts the
-                       downgrade exactly there. *)
-                    let expected = Access_effect.read_effect p.Type_repr.pt_convention in
-                    let inout_const_downgrade =
-                      match p.Type_repr.pt_convention, arg.effect_, arg.value with
-                      | Access_effect.Inout, Access_effect.Read, Seed_mir.Constant _ -> true
-                      | _ -> false
-                    in
-                    if arg.effect_ <> expected && not inout_const_downgrade then
-                      add_err ctx
-                        (Printf.sprintf
-                           "%s: call arg %d effect %s does not match the callee's %s convention (expected %s)"
-                           bb_ctx i (Seed_mir.print_effect arg.effect_)
-                           (Access_effect.to_string p.Type_repr.pt_convention)
-                           (Seed_mir.print_effect expected));
-                   (* template mode: the callee's param type is read under
-                      the substitution (its declaration binders <- this
-                      call's type args), the same specialization contract
-                      mono applies *)
-                   let pty = subst p.Type_repr.pt_type in
-                   match
-                     check_operand ctx fn bb_ctx arg.value running moved ~as_call_arg:true ~init_place:(arg.effect_ = Access_effect.Initialize) ~as_place_arg:(arg.effect_ = Access_effect.Modify || arg.effect_ = Access_effect.Initialize)
-                   with
-                    | Some aty ->
-                        if not
-                             (types_compatible ctx pty aty || ptr_addr_ok ctx pty aty
-                              || deref_arg_ok ctx pty aty
-                              || const_int_arg_fits_ok ctx arg.value pty)
-                        then
-                          add_err ctx
-                            (Printf.sprintf "%s: call arg %d type mismatch: expected %s got %s"
-                               bb_ctx i
-                               (Seed_mir.print_type pty) (Seed_mir.print_type aty))
-                    | None -> ())
-                | None -> ())
-             args;
-           let ret_ty =
-             subst (if Array.length cf.locals > 0 then cf.locals.(0) else Type_repr.Unit)
-           in
-           match place_type ctx fn dest with
-           | Some dty ->
-               if not (types_compatible ctx dty ret_ty) then
-                 add_err ctx
-                   (Printf.sprintf
-                      "%s: call destination type %s does not match callee return type %s" bb_ctx
-                      (Seed_mir.print_type dty) (Seed_mir.print_type ret_ty))
-           | None -> ()))
+  | User inst -> check_user_callee inst
+  | Derived (c, cargs) ->
+      (* audit P0-5: the compiler-synthesized derived contract class —
+         the callee names the derived function under the SAME callable
+         identity the emitted body carries, so the emitted-body checks
+         (instance resolution, arity, per-argument conventions, the
+         destination) apply exactly like a User callee *)
+      check_user_callee (Instance_id.make ~callable:c ~type_args:cargs)
+  | TypeQuery (k, qargs) ->
+      (* audit P0-5: the compile-time type-query class (size_of/
+         align_of).  The query has NO runtime parameters: the call must
+         carry zero arguments, the destination is the UInt the query
+         returns, and the queried type args obey the mode's type-param
+         discipline (concrete post-mono — a TypeQuery whose queried
+         type is not concrete at the concrete gate is an error). *)
+      let what = Printf.sprintf "%s query" (Seed_mir.type_query_name k) in
+      let declared = declared_params fn in
+      Array.iter
+        (fun ty -> check_type_walk ctx bb_ctx what declared ty)
+        qargs;
+      if Array.length args <> 0 then
+        add_err ctx
+          (Printf.sprintf "%s: %s takes no runtime arguments (got %d)" bb_ctx what
+             (Array.length args));
+      (match place_type ctx fn dest with
+       | Some dty ->
+           if not (types_compatible ctx (Type_repr.Int Type_repr.UInt) dty) then
+             add_err ctx
+               (Printf.sprintf "%s: %s destination type %s is not UInt" bb_ctx what
+                  (Seed_mir.print_type dty))
+       | None -> ())
 
 let check_switch (ctx : ctx) (fn : function_) (bb_ctx : string) (op : operand)
     (targets : (int64 * int) list) (running : IntSet.t) (moved : StrSet.t IntMap.t) : unit =
@@ -3061,9 +3135,20 @@ let check_embedded_types (ctx : ctx) (fn : function_) : unit =
       (match b.terminator with
        | Call (_, callee, args, _, _) -> (
            (match callee with
-            | User inst -> Array.iter (check_what "call instance") (Instance_id.type_args inst)
-            | FnValue op -> check_operand op
-            | Intrinsic _ | Extern _ -> ());
+            | User inst ->
+                Array.iter (check_what "call instance") (Instance_id.type_args inst)
+            | Derived (_, cargs) ->
+                Array.iter (check_what "derived callee instance") cargs
+            | TypeQuery (k, qargs) ->
+                Array.iter
+                  (check_what
+                     (Printf.sprintf "%s query" (Seed_mir.type_query_name k)))
+                  qargs
+            | Intrinsic (_, iargs) ->
+                Array.iter (check_what "intrinsic callee instance") iargs
+            | Extern (_, eargs) ->
+                Array.iter (check_what "extern callee instance") eargs
+            | FnValue op -> check_operand op);
            Array.iter (fun arg -> check_operand arg.value) args)
        | SwitchInt (op, _, _) | Assert (op, _, _, _) -> check_operand op
        | Drop _ | Deinit _ | Goto _ | Ret | Unreachable | Abort -> ()))
@@ -3149,7 +3234,7 @@ let verify_function (ctx : ctx) (fn : function_) : unit =
     let reachable = reachable_blocks fn tbl in
     let in_sets = init_in_sets fn tbl in
     let moved_sets = moved_in_sets fn tbl in
-    let destroyed_sets = destroyed_in_sets fn tbl in
+    let destroyed_sets = destroyed_in_sets ctx fn tbl in
     Array.iter
       (fun b ->
         let bb_ctx = Printf.sprintf "%s bb%d" fn_ctx b.id in
@@ -3282,9 +3367,12 @@ let verify_function (ctx : ctx) (fn : function_) : unit =
                        destroyed := key_clear !destroyed (root_key p.root) (place_key p)
                    | Seed_mir.Constant _ -> ())
                args
-         | Drop (p, _, _) | Deinit (p, _, _) ->
-             destroyed := key_insert !destroyed (root_key p.root) (place_key p)
-         | _ -> ()))
+          | Drop (p, _, _) | Deinit (p, _, _) ->
+              destroyed := key_insert !destroyed (root_key p.root) (place_key p);
+              List.iter
+                (fun k -> destroyed := key_insert !destroyed (root_key p.root) k)
+                (destroyed_keys_of_drop ctx fn p)
+          | _ -> ()))
       fn.blocks
   end
 
@@ -3409,15 +3497,14 @@ let require_valid_template ?(generic_types : Mono.generic_def array = [||])
       box_tid;
       post_rewrite = (fun ty -> ty);
       box_instances = [];
-      materialized_from = max_int;
-      compat_depth = ref 0;
+      copy_cache = Type_properties.create_cache ();
+      drop_plans = Drop_plan.of_program prog;
     }
     prog
 
 let require_valid_concrete ?(query_sigs : query_sig list = [])
     ?(post_rewrite : Type_repr.t -> Type_repr.t = fun ty -> ty)
     ?(box_instances : Ids.Type_id.t list = [])
-    ?(materialized_from : int = max_int)
     ?(box_tid : Ids.Type_id.t option = None)
     (prog : program) : (unit, string list) result =
   verify_all
@@ -3430,8 +3517,8 @@ let require_valid_concrete ?(query_sigs : query_sig list = [])
       box_tid;
       post_rewrite;
       box_instances;
-      materialized_from;
-      compat_depth = ref 0;
+      copy_cache = Type_properties.create_cache ();
+      drop_plans = Drop_plan.of_program prog;
     }
     prog
 

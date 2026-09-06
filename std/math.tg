@@ -1,6 +1,8 @@
 ## std::math — Mathematics library
 ## Provides trigonometric, logarithmic, exponential, rounding, and special functions,
-## plus arbitrary-precision BigInt and BigDecimal types for finance/engineering.
+## plus arbitrary-precision BigInt and BigDecimal types and the heap-free
+## fixed-point Fixed64/Fixed128 types (explicit rounding modes) for
+## finance/engineering.
 ## Spec: §stdlib.math
 
 module std::math
@@ -258,7 +260,11 @@ impl BigInt
   pub def from_int(value: Int) -> BigInt
     if value == 0 then return BigInt.zero() end
     let neg = value < 0
-    var v: UInt = if neg then (-value) as UInt else value as UInt end
+    ## Unsigned magnitude extraction: a signed negation (`-value`) fails
+    ## for Int::MIN (two's-complement negation of the minimum is not
+    ## representable), so the magnitude is computed as `~value + 1` in
+    ## the unsigned domain with no signed intermediate.
+    var v: UInt = if value >= 0 then value as UInt else ((~value) as UInt) + 1 end
     var digs = Vec[UInt].new()
     while v > 0 do
       digs.push((v & 0xFFFFFFFF) as UInt)
@@ -528,6 +534,32 @@ end
 
 # ─── BigDecimal — Arbitrary-precision decimal ────────────────────────
 
+## Rounding modes for BigDecimal division and rounding (the exact
+## quotient/remainder is rounded explicitly, never truncated implicitly).
+pub enum RoundingMode
+  ## Round toward zero (truncate the fractional part).
+  TowardZero
+  ## Round away from zero.
+  AwayFromZero
+  ## Round toward negative infinity.
+  Floor
+  ## Round toward positive infinity.
+  Ceiling
+  ## Round half away from zero (0.5 rounds up in magnitude).
+  HalfUp
+  ## Round half toward zero (0.5 rounds down in magnitude).
+  HalfDown
+  ## Round half to even (banker's rounding; 0.5 rounds to the even digit).
+  HalfEven
+end
+
+## Errors from BigDecimal arithmetic.
+pub enum DecimalError
+  ## The divisor's unscaled value is zero — division is undefined, and
+  ## reported as an ordinary error (never a precondition abort).
+  DivideByZero
+end
+
 pub struct BigDecimal
   ## Unscaled value (significand)
   unscaled: BigInt
@@ -581,14 +613,26 @@ impl BigDecimal
     }
   end
 
-  pub def div(self, other: BigDecimal, precision: Int = 20) -> BigDecimal
-    let scale_diff = precision - self.scale + other.scale
-    var numerator = self.unscaled
-    if scale_diff > 0 then
-      let factor = BigInt.from_int(10).pow(scale_diff)
-      numerator = numerator.mul(factor)
+  ## Divide by `other`, rounding the exact quotient to `scale` digits
+  ## after the decimal point according to the explicit `rounding` mode.
+  ## Division by zero is an ordinary error result
+  ## (Err(DecimalError::DivideByZero)) — never a precondition abort.
+  pub def div(self, other: BigDecimal, scale: Int, rounding: RoundingMode) -> Result[BigDecimal, DecimalError]
+    if other.unscaled.is_zero() then
+      return Err(DecimalError::DivideByZero)
     end
-    BigDecimal { unscaled: numerator.div(other.unscaled), scale: precision }
+    ## this / other = (self.unscaled / other.unscaled) * 10^(other.scale - self.scale);
+    ## shift the exponent difference into the integer numerator (or the
+    ## divisor when the target scale is coarser than the inputs).
+    let diff = scale - self.scale + other.scale
+    var numerator = self.unscaled
+    var divisor = other.unscaled
+    if diff > 0 then
+      numerator = numerator.mul(BigInt.from_int(10).pow(diff))
+    elsif diff < 0 then
+      divisor = divisor.mul(BigInt.from_int(10).pow(-diff))
+    end
+    Ok(BigDecimal { unscaled: _divide_rounded(numerator, divisor, rounding), scale: scale })
   end
 
   pub def negate(self) -> BigDecimal
@@ -599,22 +643,14 @@ impl BigDecimal
     BigDecimal { unscaled: self.unscaled.abs(), scale: self.scale }
   end
 
-  pub def round(self, new_scale: Int) -> BigDecimal
+  ## Round to `new_scale` digits after the decimal point using the
+  ## explicit `rounding` mode. When `new_scale` >= the current scale
+  ## the value is returned unchanged.
+  pub def round(self, new_scale: Int, rounding: RoundingMode) -> BigDecimal
     if new_scale >= self.scale then return self end
     let diff = self.scale - new_scale
     let divisor = BigInt.from_int(10).pow(diff)
-    let half = divisor.div(BigInt.from_int(2))
-    let remainder = self.unscaled.abs().modulo(divisor)
-    var quotient = self.unscaled.div(divisor)
-    ## Round half-up
-    if remainder.compare(half) >= 0 then
-      if self.unscaled.compare(BigInt.zero()) >= 0 then
-        quotient = quotient.add(BigInt.one())
-      else
-        quotient = quotient.sub(BigInt.one())
-      end
-    end
-    BigDecimal { unscaled: quotient, scale: new_scale }
+    BigDecimal { unscaled: _divide_rounded(self.unscaled, divisor, rounding), scale: new_scale }
   end
 
   pub def compare(self, other: BigDecimal) -> Int
@@ -658,6 +694,38 @@ impl Ord for BigDecimal
   end
 end
 
+impl Hash for BigDecimal
+  ## BigDecimal equality is NUMERICAL and scale-independent (1.0 == 1.00),
+  ## so the hash canonicalizes the scale the same way: the significand is
+  ## stripped of trailing decimal zeros (down to its minimal scale >= 0),
+  ## or scaled up to scale 0 when the stored scale is <= 0.  Numerically
+  ## equal values always canonicalize to the same (significand, scale)
+  ## pair and therefore hash equally.
+  def hash(self: Self) -> Int
+    var u = BigInt { negative: self.unscaled.negative, digits: self.unscaled.digits.clone() }
+    var s = self.scale
+    if u.is_zero() then
+      u = BigInt.zero()
+      s = 0
+    elsif s <= 0 then
+      u = u.mul(BigInt.from_int(10).pow(-s))
+      s = 0
+    else
+      let ten = BigInt.from_int(10)
+      while s > 0 && u.modulo(ten).is_zero() do
+        u = u.div(ten)
+        s = s - 1
+      end
+    end
+    var h: Int = s
+    for i in 0..u.digits.len() do
+      h = h * 31 + (u.digits.get(i).unwrap_or(0u32) as Int)
+    end
+    if u.negative && !u.is_zero() then h = -h end
+    h
+  end
+end
+
 def _align_scales(a: BigDecimal, b: BigDecimal) -> (BigDecimal, BigDecimal)
   if a.scale == b.scale then return (a, b) end
   if a.scale > b.scale then
@@ -669,6 +737,904 @@ def _align_scales(a: BigDecimal, b: BigDecimal) -> (BigDecimal, BigDecimal)
     let a2 = BigDecimal { unscaled: a.unscaled.mul(factor), scale: b.scale }
     (a2, b)
   end
+end
+
+## Truncating division (toward zero) followed by an explicit rounding
+## decision on the exact remainder. `divisor` must be non-zero — the
+## callers guard that. Sign-aware: Floor/Ceiling/Half* behave correctly
+## for negative quotients and for negative divisors.
+def _divide_rounded(numerator: BigInt, divisor: BigInt, rounding: RoundingMode) -> BigInt
+  let q = numerator.div(divisor)
+  let r = numerator.modulo(divisor)
+  if r.is_zero() then return q end
+  let neg = numerator.negative != divisor.negative
+  var bump = false
+  match rounding
+  when RoundingMode::HalfUp then bump = r.abs().add(r.abs()).compare(divisor.abs()) >= 0
+  when RoundingMode::HalfDown then bump = r.abs().add(r.abs()).compare(divisor.abs()) > 0
+  when RoundingMode::HalfEven then
+    let twice = r.abs().add(r.abs())
+    let c = twice.compare(divisor.abs())
+    if c > 0 then
+      bump = true
+    elsif c == 0 then
+      bump = !q.abs().modulo(BigInt.from_int(2)).is_zero()
+    end
+  when RoundingMode::TowardZero then bump = false
+  when RoundingMode::AwayFromZero then bump = true
+  when RoundingMode::Floor then bump = neg
+  when RoundingMode::Ceiling then bump = !neg
+  end
+  if bump then
+    if neg then q.sub(BigInt.one()) else q.add(BigInt.one()) end
+  else
+    q
+  end
+end
+
+# ─── FixedDecimal — fixed-point decimal (finance hot path) ───────────
+## Fixed64 and Fixed128 are fixed-point decimal values whose numeric
+## payload is a single machine integer (no heap, no BigInt) with an
+## explicit decimal scale, and whose arithmetic never depends on the
+## FPU's rounding mode.
+##
+## Value semantics: value = unscaled * 10^-scale, exactly like
+## BigDecimal but with the unscaled value restricted to one machine
+## word (Int for Fixed64, i128 for Fixed128) and scale restricted to
+## ordinary Int arithmetic.  All failing operations return a Result
+## (overflow, division by zero); rounding is always an explicit
+## RoundingMode argument.  The kernel cannot express a const-generic
+## scale (`Fixed64[2]`), so the scale is a runtime field — arithmetic
+## between different scales aligns through the larger scale exactly
+## (multiply up), never by losing digits.  Unscaled magnitudes are
+## bounded: positive <= 2^63-1 (2^127-1), negative >= -2^63 (-2^127);
+## magnitudes in between are representable as the minimum value.
+##
+## All internal arithmetic is done on unsigned 128-bit magnitudes with
+## explicit sign flags, so every operation is exact until the final
+## range check; the default two's-complement wrapping of the machine
+## word is never relied on for correctness (only for the final
+## negate-of-magnitude, where wrapping is exact).
+
+## Errors from fixed-point arithmetic.
+pub enum FixedError
+  ## The divisor's unscaled value is zero.
+  DivideByZero
+  ## The exact result is not representable in the fixed word.
+  Overflow
+  ## The value has a nonzero fraction where an exact integer was
+  ## required (to_bigint of a non-integral value).
+  NotIntegral
+end
+
+# ─── Fixed64 — 64-bit fixed-point decimal ────────────────────────────
+
+pub struct Fixed64
+  unscaled: Int
+  scale: Int
+end
+
+impl Fixed64
+  ## The value zero at scale zero.
+  pub def zero() -> Fixed64
+    Fixed64 { unscaled: 0, scale: 0 }
+  end
+
+  pub def from_int(value: Int) -> Fixed64
+    Fixed64 { unscaled: value, scale: 0 }
+  end
+
+  ## Construct from an unscaled value and an explicit scale.
+  ## The scale may be negative (a value multiple of a power of ten);
+  ## see the module comment for the magnitude bounds.
+  pub def from_parts(unscaled: Int, scale: Int) -> Fixed64
+    Fixed64 { unscaled: unscaled, scale: scale }
+  end
+
+  ## Parse a decimal literal ("-12.50") exactly; digits beyond the
+  ## representable range produce Err.  Like BigDecimal::from_string,
+  ## parsing never rounds.
+  pub def from_string(s: String) -> Result[Fixed64, String]
+    let parsed = _fx_parse(s)?
+    let lim = ((~(0 as u64)) >> 1) as u128
+    if parsed.mag > lim + 1 then return Err("out of range") end
+    if !parsed.neg && parsed.mag > lim then return Err("out of range") end
+    var unscaled: Int = if parsed.mag == 0 then 0 else (if parsed.neg then 0 - (parsed.mag as Int) else (parsed.mag as Int) end) end
+    Ok(Fixed64 { unscaled: unscaled, scale: parsed.scale })
+  end
+
+  pub def scale(self) -> Int
+    self.scale
+  end
+
+  pub def unscaled(self) -> Int
+    self.unscaled
+  end
+
+  ## Add with the operands aligned to the LARGER scale (multiply up —
+  ## exact).  Overflow of the aligned word is an error result.
+  pub def add(self, other: Fixed64) -> Result[Fixed64, FixedError]
+    if self.scale == other.scale then
+      let s = self.unscaled + other.unscaled
+      if self.unscaled >= 0 && other.unscaled >= 0 && s < 0 then
+        return Err(FixedError::Overflow)
+      end
+      if self.unscaled < 0 && other.unscaled < 0 && s >= 0 then
+        return Err(FixedError::Overflow)
+      end
+      return Ok(Fixed64 { unscaled: s, scale: self.scale })
+    end
+    if self.scale < other.scale then
+      let a = self.rescale(other.scale, RoundingMode::TowardZero)?
+      return a.add(other)
+    else
+      let b = other.rescale(self.scale, RoundingMode::TowardZero)?
+      return self.add(b)
+    end
+  end
+
+  ## Subtract with the operands aligned to the LARGER scale (exact).
+  pub def sub(self, other: Fixed64) -> Result[Fixed64, FixedError]
+    if self.scale == other.scale then
+      let d = self.unscaled - other.unscaled
+      if self.unscaled >= 0 && other.unscaled < 0 && d < 0 then
+        return Err(FixedError::Overflow)
+      end
+      if self.unscaled < 0 && other.unscaled >= 0 && d >= 0 then
+        return Err(FixedError::Overflow)
+      end
+      return Ok(Fixed64 { unscaled: d, scale: self.scale })
+    end
+    if self.scale < other.scale then
+      let a = self.rescale(other.scale, RoundingMode::TowardZero)?
+      return a.sub(other)
+    else
+      let b = other.rescale(self.scale, RoundingMode::TowardZero)?
+      return self.sub(b)
+    end
+  end
+
+  ## Negate.  The magnitude of the minimum value is not representable,
+  ## so negating it wraps (kernel two's-complement semantics).
+  pub def negate(self) -> Fixed64
+    Fixed64 { unscaled: 0 - self.unscaled, scale: self.scale }
+  end
+
+  pub def abs(self) -> Fixed64
+    if self.unscaled < 0 then self.negate() else self end
+  end
+
+  ## Exact product; the result scale is the sum of the operand scales.
+  ## Overflow of the word is an error result (no rounding).
+  pub def mul(self, other: Fixed64) -> Result[Fixed64, FixedError]
+    let ma = _fx_mag64(self.unscaled)
+    let mb = _fx_mag64(other.unscaled)
+    let p = ma * mb
+    let lim_neg = (((~(0 as u64)) >> 1) as u128) + 1
+    if p > lim_neg then return Err(FixedError::Overflow) end
+    let neg = (self.unscaled < 0) != (other.unscaled < 0)
+    if !neg && p == lim_neg then return Err(FixedError::Overflow) end
+    var unscaled: Int = if p == 0 then 0 else (if neg then 0 - (p as Int) else (p as Int) end) end
+    Ok(Fixed64 { unscaled: unscaled, scale: self.scale + other.scale })
+  end
+
+  ## Re-express the value at `new_scale` digits after the point,
+  ## rounding explicitly with `rounding` when the scale decreases.
+  ## Scaling up is exact and overflows when the word cannot hold it.
+  pub def rescale(self, new_scale: Int, rounding: RoundingMode) -> Result[Fixed64, FixedError]
+    if new_scale == self.scale then return Ok(self) end
+    let diff = new_scale - self.scale
+    let ma = _fx_mag64(self.unscaled)
+    if diff < 0 then
+      let out = _fx_div_shift(ma, 1, 0 - diff)?
+      let neg = self.unscaled < 0
+      let bump = _fx_bump(out.rmag, out.divisor, out.mag, neg, out.huge, rounding)
+      let qmag = if bump then out.mag + 1 else out.mag end
+      return _fx_make64(neg, qmag, new_scale)
+    end
+    if ma == 0 then return Ok(Fixed64 { unscaled: 0, scale: new_scale }) end
+    let scaled = _fx_mul_pow10(ma, diff)?
+    let neg = self.unscaled < 0
+    _fx_make64(neg, scaled, new_scale)
+  end
+
+  ## Alias for rescale with an explicit rounding mode.
+  pub def round(self, new_scale: Int, rounding: RoundingMode) -> Result[Fixed64, FixedError]
+    self.rescale(new_scale, rounding)
+  end
+
+  ## Divide by `other`, rounding the exact quotient to `scale` digits
+  ## after the point with the explicit `rounding` mode.  Division by
+  ## zero and word overflow are error results.
+  pub def div(self, other: Fixed64, scale: Int, rounding: RoundingMode) -> Result[Fixed64, FixedError]
+    if other.unscaled == 0 then
+      return Err(FixedError::DivideByZero)
+    end
+    if self.unscaled == 0 then
+      return Ok(Fixed64 { unscaled: 0, scale: scale })
+    end
+    let diff = scale - self.scale + other.scale
+    let ma = _fx_mag64(self.unscaled)
+    let mb = _fx_mag64(other.unscaled)
+    var out = _FxDivOut { mag: 0, rmag: 0, divisor: 0, huge: false }
+    if diff < 0 then
+      match _fx_div_shift(ma, mb, 0 - diff)
+      when Ok(v) then out = v
+      when Err(e) then return Err(e)
+      end
+    else
+      match _fx_div_chain(ma, mb, diff)
+      when Ok(v) then out = v
+      when Err(e) then return Err(e)
+      end
+    end
+    let neg = (self.unscaled < 0) != (other.unscaled < 0)
+    let bump = _fx_bump(out.rmag, out.divisor, out.mag, neg, out.huge, rounding)
+    let qmag = if bump then out.mag + 1 else out.mag end
+    _fx_make64(neg, qmag, scale)
+  end
+
+  ## Numerically compare (scale-independent: 1.50 == 1.5).
+  pub def compare(self, other: Fixed64) -> Int
+    if self.scale == other.scale then
+      if self.unscaled < other.unscaled then return -1 end
+      if self.unscaled > other.unscaled then return 1 end
+      return 0
+    end
+    _fx_compare_core(self.unscaled < 0, _fx_mag64(self.unscaled), self.scale,
+      other.unscaled < 0, _fx_mag64(other.unscaled), other.scale)
+  end
+
+  ## Convert to BigDecimal (arbitrary precision) without loss.
+  pub def to_bigdecimal(self) -> BigDecimal
+    BigDecimal { unscaled: BigInt.from_int(self.unscaled), scale: self.scale }
+  end
+
+  ## Convert from BigDecimal, failing when the value does not fit the
+  ## fixed word (no rounding is applied).
+  pub def from_bigdecimal(value: BigDecimal) -> Result[Fixed64, FixedError]
+    match Fixed64::from_string(value.to_string())
+    when Ok(v) then Ok(v)
+    when Err(_) then Err(FixedError::Overflow)
+    end
+  end
+
+  ## Convert from BigInt (exact; out-of-range values produce
+  ## Err(Overflow), no rounding).
+  pub def from_bigint(value: BigInt) -> Result[Fixed64, FixedError]
+    match Fixed64::from_string(value.to_string())
+    when Ok(v) then Ok(v)
+    when Err(_) then Err(FixedError::Overflow)
+    end
+  end
+
+  ## The exact integer value when the fixed value is integral
+  ## (1.00 -> 1); a nonzero fraction produces Err(NotIntegral).
+  pub def to_bigint(self) -> Result[BigInt, FixedError]
+    let neg = self.unscaled < 0
+    if self.scale <= 0 then
+      let base = _fx_bigint_of(neg, _fx_mag64(self.unscaled))
+      if self.scale == 0 then return Ok(base) end
+      return Ok(base.mul(BigInt.from_int(10).pow(0 - self.scale)))
+    end
+    if self.unscaled == 0 then return Ok(BigInt.zero()) end
+    let p = match _fx_mul_pow10(1, self.scale)
+      when Ok(v) then v
+      when Err(_) then return Err(FixedError::NotIntegral)
+    end
+    let mag = _fx_mag64(self.unscaled)
+    let r = mag % p
+    if r != 0 then return Err(FixedError::NotIntegral) end
+    Ok(_fx_bigint_of(neg, mag / p))
+  end
+
+  pub def to_string(self) -> String
+    let neg = self.unscaled < 0
+    let s = _fx_digits(_fx_mag64(self.unscaled))
+    if self.scale == 0 then
+      return if neg then "-" + s else s end
+    end
+    if self.scale < 0 then
+      var out = if neg then "-" + s else s end
+      var z = 0 - self.scale
+      while z > 0 do
+        out.push_str("0")
+        z = z - 1
+      end
+      return out
+    end
+    let pad_len = self.scale - (s.len() as Int) + 1
+    var padded = ""
+    if pad_len > 0 then
+      var z = pad_len
+      while z > 0 do
+        padded.push_str("0")
+        z = z - 1
+      end
+    end
+    padded.push_str(s)
+    let dot_pos = padded.len() - (self.scale as UInt)
+    let sign = if neg then "-" else "" end
+    sign + padded.substring(0, dot_pos as Int) + "." + padded.substring(dot_pos as Int, padded.len() as Int)
+  end
+end
+
+impl Display for Fixed64
+  def fmt(self, inout f: fmt::Formatter) -> fmt::Result
+    f.write_str(self.to_string())
+  end
+end
+
+impl Eq for Fixed64
+  def eq(self, other: Fixed64) -> Bool = self.compare(*other) == 0
+end
+
+impl Ord for Fixed64
+  def cmp(self, other: Fixed64) -> Ordering
+    let ord = self.compare(*other)
+    if ord < 0 then Ordering::Less
+    elsif ord > 0 then Ordering::Greater
+    else Ordering::Equal
+    end
+  end
+end
+
+impl Hash for Fixed64
+  ## Fixed64 equality is NUMERICAL and scale-independent, so the hash
+  ## canonicalizes the value by stripping trailing decimal zeros (the
+  ## same canonical form the comparison uses).
+  def hash(self: Self) -> Int
+    _fx_hash(self.unscaled < 0, _fx_mag64(self.unscaled), self.scale)
+  end
+end
+
+# ─── Fixed128 — 128-bit fixed-point decimal ──────────────────────────
+
+pub struct Fixed128
+  unscaled: i128
+  scale: Int
+end
+
+impl Fixed128
+  pub def zero() -> Fixed128
+    Fixed128 { unscaled: 0, scale: 0 }
+  end
+
+  pub def from_int(value: Int) -> Fixed128
+    Fixed128 { unscaled: (value as i128), scale: 0 }
+  end
+
+  pub def from_parts(unscaled: i128, scale: Int) -> Fixed128
+    Fixed128 { unscaled: unscaled, scale: scale }
+  end
+
+  pub def from_string(s: String) -> Result[Fixed128, String]
+    let parsed = _fx_parse(s)?
+    let lim = (~(0 as u128)) >> 1
+    if parsed.mag > lim + 1 then return Err("out of range") end
+    if !parsed.neg && parsed.mag > lim then return Err("out of range") end
+    var unscaled: i128 = if parsed.mag == 0 then 0 else (if parsed.neg then 0 - (parsed.mag as i128) else (parsed.mag as i128) end) end
+    Ok(Fixed128 { unscaled: unscaled, scale: parsed.scale })
+  end
+
+  pub def scale(self) -> Int
+    self.scale
+  end
+
+  pub def unscaled(self) -> i128
+    self.unscaled
+  end
+
+  pub def add(self, other: Fixed128) -> Result[Fixed128, FixedError]
+    if self.scale == other.scale then
+      let s = self.unscaled + other.unscaled
+      if self.unscaled >= 0 && other.unscaled >= 0 && s < 0 then
+        return Err(FixedError::Overflow)
+      end
+      if self.unscaled < 0 && other.unscaled < 0 && s >= 0 then
+        return Err(FixedError::Overflow)
+      end
+      return Ok(Fixed128 { unscaled: s, scale: self.scale })
+    end
+    if self.scale < other.scale then
+      let a = self.rescale(other.scale, RoundingMode::TowardZero)?
+      return a.add(other)
+    else
+      let b = other.rescale(self.scale, RoundingMode::TowardZero)?
+      return self.add(b)
+    end
+  end
+
+  pub def sub(self, other: Fixed128) -> Result[Fixed128, FixedError]
+    if self.scale == other.scale then
+      let d = self.unscaled - other.unscaled
+      if self.unscaled >= 0 && other.unscaled < 0 && d < 0 then
+        return Err(FixedError::Overflow)
+      end
+      if self.unscaled < 0 && other.unscaled >= 0 && d >= 0 then
+        return Err(FixedError::Overflow)
+      end
+      return Ok(Fixed128 { unscaled: d, scale: self.scale })
+    end
+    if self.scale < other.scale then
+      let a = self.rescale(other.scale, RoundingMode::TowardZero)?
+      return a.sub(other)
+    else
+      let b = other.rescale(self.scale, RoundingMode::TowardZero)?
+      return self.sub(b)
+    end
+  end
+
+  pub def negate(self) -> Fixed128
+    Fixed128 { unscaled: 0 - self.unscaled, scale: self.scale }
+  end
+
+  pub def abs(self) -> Fixed128
+    if self.unscaled < 0 then self.negate() else self end
+  end
+
+  pub def mul(self, other: Fixed128) -> Result[Fixed128, FixedError]
+    let ma = _fx_mag128(self.unscaled)
+    let mb = _fx_mag128(other.unscaled)
+    let lim_neg = ((~(0 as u128)) >> 1) + 1
+    ## The overflow probe divides (an emulated 128-bit division, far
+    ## dearer than the multiply); when both magnitudes fit 64 bits the
+    ## product is below 2^126 and can neither wrap u128 nor exceed the
+    ## 2^127 limit, so the division probe is skipped entirely.
+    let lim64 = ((~(0 as u64)) >> 1) as u128
+    if ma > lim64 || mb > lim64 then
+      if ma > 0 && mb > lim_neg / ma then return Err(FixedError::Overflow) end
+    end
+    let p = ma * mb
+    let neg = (self.unscaled < 0) != (other.unscaled < 0)
+    if !neg && p == lim_neg then return Err(FixedError::Overflow) end
+    var unscaled: i128 = if p == 0 then 0 else (if neg then 0 - (p as i128) else (p as i128) end) end
+    Ok(Fixed128 { unscaled: unscaled, scale: self.scale + other.scale })
+  end
+
+  pub def rescale(self, new_scale: Int, rounding: RoundingMode) -> Result[Fixed128, FixedError]
+    if new_scale == self.scale then return Ok(self) end
+    let diff = new_scale - self.scale
+    let ma = _fx_mag128(self.unscaled)
+    if diff < 0 then
+      let out = _fx_div_shift(ma, 1, 0 - diff)?
+      let neg = self.unscaled < 0
+      let bump = _fx_bump(out.rmag, out.divisor, out.mag, neg, out.huge, rounding)
+      let qmag = if bump then out.mag + 1 else out.mag end
+      return _fx_make128(neg, qmag, new_scale)
+    end
+    if ma == 0 then return Ok(Fixed128 { unscaled: 0, scale: new_scale }) end
+    let scaled = _fx_mul_pow10(ma, diff)?
+    let neg = self.unscaled < 0
+    _fx_make128(neg, scaled, new_scale)
+  end
+
+  pub def round(self, new_scale: Int, rounding: RoundingMode) -> Result[Fixed128, FixedError]
+    self.rescale(new_scale, rounding)
+  end
+
+  pub def div(self, other: Fixed128, scale: Int, rounding: RoundingMode) -> Result[Fixed128, FixedError]
+    if other.unscaled == 0 then
+      return Err(FixedError::DivideByZero)
+    end
+    if self.unscaled == 0 then
+      return Ok(Fixed128 { unscaled: 0, scale: scale })
+    end
+    let diff = scale - self.scale + other.scale
+    let ma = _fx_mag128(self.unscaled)
+    let mb = _fx_mag128(other.unscaled)
+    var out = _FxDivOut { mag: 0, rmag: 0, divisor: 0, huge: false }
+    if diff < 0 then
+      match _fx_div_shift(ma, mb, 0 - diff)
+      when Ok(v) then out = v
+      when Err(e) then return Err(e)
+      end
+    else
+      match _fx_div_chain(ma, mb, diff)
+      when Ok(v) then out = v
+      when Err(e) then return Err(e)
+      end
+    end
+    let neg = (self.unscaled < 0) != (other.unscaled < 0)
+    let bump = _fx_bump(out.rmag, out.divisor, out.mag, neg, out.huge, rounding)
+    let qmag = if bump then out.mag + 1 else out.mag end
+    _fx_make128(neg, qmag, scale)
+  end
+
+  pub def compare(self, other: Fixed128) -> Int
+    if self.scale == other.scale then
+      if self.unscaled < other.unscaled then return -1 end
+      if self.unscaled > other.unscaled then return 1 end
+      return 0
+    end
+    _fx_compare_core(self.unscaled < 0, _fx_mag128(self.unscaled), self.scale,
+      other.unscaled < 0, _fx_mag128(other.unscaled), other.scale)
+  end
+
+  pub def to_bigdecimal(self) -> BigDecimal
+    BigDecimal { unscaled: _fx_bigint_of(self.unscaled < 0, _fx_mag128(self.unscaled)), scale: self.scale }
+  end
+
+  pub def from_bigdecimal(value: BigDecimal) -> Result[Fixed128, FixedError]
+    match Fixed128::from_string(value.to_string())
+    when Ok(v) then Ok(v)
+    when Err(_) then Err(FixedError::Overflow)
+    end
+  end
+
+  ## Convert from BigInt (exact; out-of-range values produce
+  ## Err(Overflow), no rounding).
+  pub def from_bigint(value: BigInt) -> Result[Fixed128, FixedError]
+    match Fixed128::from_string(value.to_string())
+    when Ok(v) then Ok(v)
+    when Err(_) then Err(FixedError::Overflow)
+    end
+  end
+
+  ## The exact integer value when the fixed value is integral; a
+  ## nonzero fraction produces Err(NotIntegral).
+  pub def to_bigint(self) -> Result[BigInt, FixedError]
+    let neg = self.unscaled < 0
+    if self.scale <= 0 then
+      let base = _fx_bigint_of(neg, _fx_mag128(self.unscaled))
+      if self.scale == 0 then return Ok(base) end
+      return Ok(base.mul(BigInt.from_int(10).pow(0 - self.scale)))
+    end
+    if self.unscaled == 0 then return Ok(BigInt.zero()) end
+    let p = match _fx_mul_pow10(1, self.scale)
+      when Ok(v) then v
+      when Err(_) then return Err(FixedError::NotIntegral)
+    end
+    let mag = _fx_mag128(self.unscaled)
+    let r = mag % p
+    if r != 0 then return Err(FixedError::NotIntegral) end
+    Ok(_fx_bigint_of(neg, mag / p))
+  end
+
+  pub def to_string(self) -> String
+    let neg = self.unscaled < 0
+    let s = _fx_digits(_fx_mag128(self.unscaled))
+    if self.scale == 0 then
+      return if neg then "-" + s else s end
+    end
+    if self.scale < 0 then
+      var out = if neg then "-" + s else s end
+      var z = 0 - self.scale
+      while z > 0 do
+        out.push_str("0")
+        z = z - 1
+      end
+      return out
+    end
+    let pad_len = self.scale - (s.len() as Int) + 1
+    var padded = ""
+    if pad_len > 0 then
+      var z = pad_len
+      while z > 0 do
+        padded.push_str("0")
+        z = z - 1
+      end
+    end
+    padded.push_str(s)
+    let dot_pos = padded.len() - (self.scale as UInt)
+    let sign = if neg then "-" else "" end
+    sign + padded.substring(0, dot_pos as Int) + "." + padded.substring(dot_pos as Int, padded.len() as Int)
+  end
+end
+
+impl Display for Fixed128
+  def fmt(self, inout f: fmt::Formatter) -> fmt::Result
+    f.write_str(self.to_string())
+  end
+end
+
+impl Eq for Fixed128
+  def eq(self, other: Fixed128) -> Bool = self.compare(*other) == 0
+end
+
+impl Ord for Fixed128
+  def cmp(self, other: Fixed128) -> Ordering
+    let ord = self.compare(*other)
+    if ord < 0 then Ordering::Less
+    elsif ord > 0 then Ordering::Greater
+    else Ordering::Equal
+    end
+  end
+end
+
+impl Hash for Fixed128
+  def hash(self: Self) -> Int
+    _fx_hash(self.unscaled < 0, _fx_mag128(self.unscaled), self.scale)
+  end
+end
+
+# ─── FixedDecimal internal helpers ───────────────────────────────────
+## All internal arithmetic is sign-magnitude over unsigned 128-bit
+## values.  The multiplication/division probes below compare against
+## `max10` (= floor((2^128-1)/10)): any value strictly larger cannot be
+## multiplied by ten without wrapping, so those paths either dominate
+## the comparison or are genuine overflows.
+
+struct _FxParse
+  neg: Bool
+  mag: u128
+  scale: Int
+end
+
+## Shared parse: sign, integer digits (at least one required, mirroring
+## BigDecimal::from_string), optional fraction digits, no rounding.
+def _fx_parse(s: String) -> Result[_FxParse, String]
+  if s.len() == 0 then return Err("empty string") end
+  var i = 0
+  var neg = false
+  if s.char_at(0) == '-' then
+    neg = true
+    i = 1
+  elsif s.char_at(0) == '+' then
+    i = 1
+  end
+  if i >= s.len() then return Err("no digits") end
+  var mag: u128 = 0
+  var scale: Int = 0
+  var seen_dot = false
+  var int_digits = false
+  let max10 = (~(0 as u128)) / 10
+  while i < s.len() do
+    let ch = s.char_at(i)
+    if ch == '.' && !seen_dot then
+      seen_dot = true
+    elsif ch >= '0' && ch <= '9' then
+      if !seen_dot then
+        int_digits = true
+      else
+        scale = scale + 1
+      end
+      let digit = (ch as Int) - ('0' as Int)
+      if mag >= max10 then return Err("too many digits") end
+      mag = mag * 10 + (digit as u128)
+    else
+      return Err("invalid character")
+    end
+    i = i + 1
+  end
+  if !int_digits then return Err("no integer digits") end
+  Ok(_FxParse { neg: neg, mag: mag, scale: scale })
+end
+
+def _fx_mag64(x: Int) -> u128
+  if x >= 0 then
+    (x as u64) as u128
+  else
+    ((~(x as u64)) + 1) as u128
+  end
+end
+
+def _fx_mag128(x: i128) -> u128
+  if x >= 0 then
+    x as u128
+  else
+    (~(x as u128)) + 1
+  end
+end
+
+## Sign/magnitude -> BigInt (32-bit limbs, least significant first —
+## the same digit convention BigInt::from_int produces).
+def _fx_bigint_of(neg: Bool, mag: u128) -> BigInt
+  var limbs = Vec[UInt].new()
+  var m = mag
+  while m > 0 do
+    limbs.push((m % (4294967296 as u128)) as UInt)
+    m = m >> 32
+  end
+  if limbs.len() == 0 then limbs.push(0u32) end
+  BigInt { negative: neg, digits: limbs }
+end
+
+## Magnitude -> unscaled word, applying the sign.  Magnitudes up to the
+## negative limit (2^63 / 2^127) are representable as the minimum word;
+## `_fx_make64/128` enforce that the exact result stays within bounds.
+def _fx_make64(neg: Bool, mag: u128, scale: Int) -> Result[Fixed64, FixedError]
+  let lim_neg = (((~(0 as u64)) >> 1) as u128) + 1
+  if mag > lim_neg then return Err(FixedError::Overflow) end
+  if !neg && mag == lim_neg then return Err(FixedError::Overflow) end
+  var unscaled: Int = if mag == 0 then 0 else (if neg then 0 - (mag as Int) else (mag as Int) end) end
+  Ok(Fixed64 { unscaled: unscaled, scale: scale })
+end
+
+def _fx_make128(neg: Bool, mag: u128, scale: Int) -> Result[Fixed128, FixedError]
+  let lim_neg = ((~(0 as u128)) >> 1) + 1
+  if mag > lim_neg then return Err(FixedError::Overflow) end
+  if !neg && mag == lim_neg then return Err(FixedError::Overflow) end
+  var unscaled: i128 = if mag == 0 then 0 else (if neg then 0 - (mag as i128) else (mag as i128) end) end
+  Ok(Fixed128 { unscaled: unscaled, scale: scale })
+end
+
+struct _FxDivOut
+  mag: u128
+  rmag: u128
+  divisor: u128
+  huge: Bool
+end
+
+## Compute `ma / (mb * 10^k)` truncated toward zero together with the
+## exact remainder, or the exact result when k >= 39 (the scaled
+## divisor then exceeds every representable magnitude: quotient 0 and
+## the whole dividend as remainder, flagged `huge` for the rounding
+## step).
+def _fx_div_shift(ma: u128, mb: u128, k: Int) -> Result[_FxDivOut, FixedError]
+  if k >= 39 then
+    return Ok(_FxDivOut { mag: 0, rmag: ma, divisor: 0, huge: true })
+  end
+  var divisor = mb
+  var i = 0
+  let max10 = (~(0 as u128)) / 10
+  while i < k do
+    if divisor > max10 then
+      return Ok(_FxDivOut { mag: 0, rmag: ma, divisor: 0, huge: true })
+    end
+    divisor = divisor * 10
+    i = i + 1
+  end
+  let q = ma / divisor
+  let r = ma - q * divisor
+  Ok(_FxDivOut { mag: q, rmag: r, divisor: divisor, huge: false })
+end
+
+## Remainder-chain division: `floor(ma * 10^d / mb)` with the exact
+## final remainder, by producing the decimal digits one at a time
+## (each digit by at most nine subtractions, never by a wide
+## multiplication that could wrap).  The `qmag` probe is a genuine
+## overflow decision (the final quotient cannot be in bounds once a
+## digit step would wrap u128).  The `r` probe is an internal
+## REPRESENTATION boundary, not an overflow decision: `10*r` needs
+## u128 only when the remainder exceeds floor((2^128-1)/10), which
+## requires |divisor| above ~3.4e37; such Fixed128 divisions
+## (a divisor beyond ~2^125 with scale-diff >= 1) report
+## Err(Overflow) even when the exact quotient fits the word — the
+## missing digit step would need 256-bit intermediate arithmetic.
+## Fixed64 (divisors <= 2^63) can never reach the boundary.
+def _fx_div_chain(ma: u128, mb: u128, d: Int) -> Result[_FxDivOut, FixedError]
+  let qint = ma / mb
+  var r = ma - qint * mb
+  var qmag = qint
+  var i = 0
+  let max10 = (~(0 as u128)) / 10
+  while i < d do
+    if qmag >= max10 then return Err(FixedError::Overflow) end
+    if r > max10 then return Err(FixedError::Overflow) end
+    let t = r * 10
+    var digit: u128 = 0
+    while t >= mb do
+      t = t - mb
+      digit = digit + 1
+    end
+    qmag = qmag * 10 + digit
+    r = t
+    i = i + 1
+  end
+  Ok(_FxDivOut { mag: qmag, rmag: r, divisor: mb, huge: false })
+end
+
+## `ma * 10^k` with overflow probes (k is positive).
+def _fx_mul_pow10(ma: u128, k: Int) -> Result[u128, FixedError]
+  var mag = ma
+  var i = 0
+  let max10 = (~(0 as u128)) / 10
+  while i < k do
+    if mag >= max10 then return Err(FixedError::Overflow) end
+    mag = mag * 10
+    i = i + 1
+  end
+  Ok(mag)
+end
+
+## Rounding decision on the exact remainder of a truncation: bump the
+## magnitude by one when the mode demands it.  `r < divisor` must hold
+## unless `huge` (the divisor exceeds u128, so only the strict modes
+## can round a nonzero remainder away from zero).
+def _fx_bump(r: u128, divisor: u128, qmag: u128, neg: Bool, huge: Bool, rounding: RoundingMode) -> Bool
+  if r == 0 then return false end
+  var bump = false
+  if huge then
+    match rounding
+    when RoundingMode::HalfUp then bump = false
+    when RoundingMode::HalfDown then bump = false
+    when RoundingMode::HalfEven then bump = false
+    when RoundingMode::TowardZero then bump = false
+    when RoundingMode::AwayFromZero then bump = true
+    when RoundingMode::Floor then bump = neg
+    when RoundingMode::Ceiling then bump = !neg
+    end
+    return bump
+  end
+  let dr = divisor - r
+  match rounding
+  when RoundingMode::HalfUp then bump = r >= dr
+  when RoundingMode::HalfDown then bump = r > dr
+  when RoundingMode::HalfEven then bump = r > dr || (r == dr && (qmag % 2) == 1)
+  when RoundingMode::TowardZero then bump = false
+  when RoundingMode::AwayFromZero then bump = true
+  when RoundingMode::Floor then bump = neg
+  when RoundingMode::Ceiling then bump = !neg
+  end
+  bump
+end
+
+## Numeric comparison of two sign/magnitude/scale triples.
+def _fx_compare_core(a_neg: Bool, a_mag: u128, a_scale: Int, b_neg: Bool, b_mag: u128, b_scale: Int) -> Int
+  if a_mag == 0 && b_mag == 0 then return 0 end
+  if a_mag == 0 then return if b_neg then 1 else -1 end end
+  if b_mag == 0 then return if a_neg then -1 else 1 end end
+  if a_neg != b_neg then return if a_neg then -1 else 1 end end
+  var cmpmag = 0
+  if a_scale < b_scale then
+    cmpmag = _fx_shift_cmp(a_mag, b_mag, b_scale - a_scale)
+  elsif a_scale > b_scale then
+    cmpmag = 0 - _fx_shift_cmp(b_mag, a_mag, a_scale - b_scale)
+  else
+    if a_mag > b_mag then cmpmag = 1
+    elsif a_mag < b_mag then cmpmag = -1
+    else cmpmag = 0
+    end
+  end
+  if a_neg then 0 - cmpmag else cmpmag end
+end
+
+## Compare x*10^k against y exactly (k >= 1).  A magnitude that would
+## overflow u128 after scaling still exceeds y (y <= 2^127), so the
+## comparison returns early without ever wrapping a multiplication.
+def _fx_shift_cmp(x: u128, y: u128, k: Int) -> Int
+  var m = x
+  var i = 0
+  let max10 = (~(0 as u128)) / 10
+  while i < k do
+    if m > max10 || m > y then
+      return 1
+    end
+    m = m * 10
+    i = i + 1
+  end
+  if m > y then 1 elsif m < y then -1 else 0 end
+end
+
+## Canonical hash consistent with the NUMERICAL equality: strip
+## trailing decimal zeros of the magnitude (which preserves the value
+## and terminates at a magnitude not divisible by ten), then fold the
+## remaining magnitude's 32-bit limbs.
+def _fx_hash(neg: Bool, mag: u128, scale: Int) -> Int
+  var m = mag
+  var sc = scale
+  if m == 0 then
+    sc = 0
+  else
+    while m % 10 == 0 do
+      m = m / 10
+      sc = sc - 1
+    end
+  end
+  var h: Int = sc
+  while m > 0 do
+    h = h * 31 + ((m % (4294967296 as u128)) as Int)
+    m = m >> 32
+  end
+  if neg && mag > 0 then h = 0 - h end
+  h
+end
+
+## Decimal digit string of an unsigned 128-bit magnitude.
+def _fx_digits(mag: u128) -> String
+  if mag == 0 then return "0" end
+  var m = mag
+  var chars = Vec[String].new()
+  while m > 0 do
+    chars.push(((m % 10) as Int).to_string())
+    m = m / 10
+  end
+  var result = ""
+  for i in (0..chars.len()).rev() do
+    result = result + chars.get(i).unwrap_or("0")
+  end
+  result
 end
 
 # ─── Numeric trait extensions ────────────────────────────────────────

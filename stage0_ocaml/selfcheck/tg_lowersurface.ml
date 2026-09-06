@@ -1088,6 +1088,36 @@ end
                   let sprog_mir =
                     { Seed_mir.functions = [| smain_fn |]; statics = [||]; types = [||] }
                   in
+                  (let name_of cid =
+                     try
+                       let (k, _) =
+                         List.find
+                           (fun (_, ts) ->
+                             Ids.Callable_id.compare ts.Typecheck.ts_callable cid = 0)
+                           senv.Typecheck.functions
+                       in
+                       k
+                     with Not_found -> "?"
+                   in
+                   let describe c =
+                     match c with
+                     | Seed_mir.User inst ->
+                         Printf.sprintf "USER %s"
+                           (name_of (Instance_id.callable inst))
+                     | Seed_mir.Intrinsic (i, _) -> Printf.sprintf "INTRINSIC %d" i
+                     | Seed_mir.Extern (i, _) -> Printf.sprintf "EXTERN %d" i
+                     | Seed_mir.Derived (cid, _) ->
+                         Printf.sprintf "DERIVED %s" (name_of cid)
+                     | Seed_mir.TypeQuery (_, _) -> "TYPEQUERY"
+                     | Seed_mir.FnValue _ -> "FNVALUE"
+                   in
+                   Array.iter
+                     (fun b ->
+                       match b.Seed_mir.terminator with
+                       | Seed_mir.Call (_, c, _, _, _) ->
+                           Printf.printf "DBG-CALLEE %s\n" (describe c)
+                       | _ -> ())
+                     smain_fn.Seed_mir.blocks);
                   (match Mir_verify.require_valid_concrete sprog_mir with
                    | Ok () ->
                        Printf.printf "  runtime Set iteration verify (concrete mode): PASS\n"
@@ -2261,7 +2291,7 @@ end
           fn_ret = int_ty;
           struct_fields = Driver.struct_fields_of tcheck_env;
           enum_payloads = Driver.enum_payloads_of tcheck_env;
-
+          copy_cache = Type_properties.create_cache ();
         }
       in
       let mir_funcs =
@@ -3206,6 +3236,7 @@ end
           fn_ret = int_ty;
           struct_fields = Driver.struct_fields_of fenv;
           enum_payloads = Driver.enum_payloads_of fenv;
+          copy_cache = Type_properties.create_cache ();
         }
       in
       let fmir_funcs =
@@ -3540,7 +3571,9 @@ end
           fn_ret = int_ty;
           struct_fields = Driver.struct_fields_of wbenv;
           enum_payloads = Driver.enum_payloads_of wbenv;
-        }
+
+                  copy_cache = Type_properties.create_cache ();
+}
       in
       let wb_mir_funcs =
         List.map
@@ -3945,7 +3978,7 @@ end
                    declaration param; the persisted substitution must be
                    its SOLVED concrete image in declaration order *)
                 let decl_arity = List.length idfn_ts.Typecheck.ts_params_decl in
-                (match call_node.Mir_lower.tn_call with
+                (match Typecheck.tc_callee_instance call_node.Mir_lower.tn_call with
                  | Some (callable, subst) ->
                      let ok =
                        Ids.Callable_id.compare callable idfn_ts.Typecheck.ts_callable = 0
@@ -4151,6 +4184,7 @@ end
           ctx_profile_findings = 0;
           ctx_strict_fallbacks = 0;
           ctx_strict_diags = [];
+          ctx_audit = Driver.fresh_closure_audit ();
           lowered_methods = 0;
           ctx_cfg_program = None;
         }
@@ -4363,7 +4397,9 @@ end
            fn_ret = int_ty;
            struct_fields = Driver.struct_fields_of lenv;
           enum_payloads = Driver.enum_payloads_of lenv;
-         }
+
+                   copy_cache = Type_properties.create_cache ();
+}
        in
        let lmir_funcs =
          List.map
@@ -4792,7 +4828,9 @@ end
            fn_ret = int_ty;
            struct_fields = Driver.struct_fields_of menv;
           enum_payloads = Driver.enum_payloads_of menv;
-         }
+
+                   copy_cache = Type_properties.create_cache ();
+}
        in
        let mmir_funcs =
          List.map
@@ -4858,7 +4896,7 @@ end
           List.assoc_opt mcall_nid (Driver.typed_nodes_of menv)
         with
         | Some node -> (
-            match node.Mir_lower.tn_call with
+            match Typecheck.tc_callee_instance node.Mir_lower.tn_call with
             | Some (callable, subst)
               when Ids.Callable_id.compare callable m_mts.Typecheck.ts_callable = 0
                    && Array.length subst = 0 ->
@@ -5066,6 +5104,7 @@ end
                 struct_fields =
                   [ (fs_tid, [ ("a", l_fid_a, int_ty, None); ("b", l_fid_b, int_ty, None) ]) ];
                 enum_payloads = [];
+              copy_cache = Type_properties.create_cache ();
               }
             in
             let contains_sub s sub =
@@ -5230,6 +5269,7 @@ end
                 fn_ret = int_ty;
                 struct_fields = [];
                 enum_payloads = [];
+              copy_cache = Type_properties.create_cache ();
               }
             in
             (* (a) the lowerer fails closed with the precise seed_bug —
@@ -5340,9 +5380,10 @@ end
             ctx_subset = Driver.subset_firewall_of_graph ncgraph;
             ctx_profile_findings = 0;
             ctx_strict_fallbacks = 0;
-            ctx_strict_diags = [];
-            lowered_methods = 0;
-            ctx_cfg_program = None;
+             ctx_strict_diags = [];
+             ctx_audit = Driver.fresh_closure_audit ();
+             lowered_methods = 0;
+             ctx_cfg_program = None;
           }
        in
        let noc_prog = Driver.lower_closure ncctx in
@@ -5546,7 +5587,9 @@ end
            fn_ret = int_ty;
            struct_fields = Driver.struct_fields_of qenv;
           enum_payloads = Driver.enum_payloads_of qenv;
-         }
+
+                   copy_cache = Type_properties.create_cache ();
+}
        in
        let qmir_funcs =
          List.map
@@ -5613,7 +5656,7 @@ end
           List.assoc_opt qnew_nid (Driver.typed_nodes_of qenv)
         with
         | Some node -> (
-            match node.Mir_lower.tn_call with
+            match Typecheck.tc_callee_instance node.Mir_lower.tn_call with
             | Some (callable, subst)
               when Ids.Callable_id.compare callable q_new_ts.Typecheck.ts_callable = 0
                    && Array.length subst = 0 ->
@@ -5796,6 +5839,7 @@ end
            fn_ret = int_ty;
            struct_fields = [ (va_tid, [ ("data", va_fid, int_ty, None) ]) ];
                 enum_payloads = [];
+         copy_cache = Type_properties.create_cache ();
          }
        in
        let va_span = Span.synthetic in
@@ -5869,7 +5913,7 @@ end
          Array.exists
            (fun (b : Seed_mir.block) ->
              match b.Seed_mir.terminator with
-             | Seed_mir.Call (_, Seed_mir.Intrinsic i, args, _, _)
+             | Seed_mir.Call (_, Seed_mir.Intrinsic (i, _), args, _, _)
                when Array.length args = 0 -> (
                    match Intrinsic_registry.by_id Intrinsic_registry.manifest i with
                    | Some (name, _, _) -> name = "__intrinsic_array_new"
@@ -6058,6 +6102,7 @@ end
            fn_ret = int_ty;
            struct_fields = [];
                 enum_payloads = [];
+         copy_cache = Type_properties.create_cache ();
          }
        in
        let sqmir_funcs =
@@ -6279,7 +6324,9 @@ end
            fn_ret = int_ty;
            struct_fields = Driver.struct_fields_of qc_env;
           enum_payloads = Driver.enum_payloads_of qc_env;
-         }
+
+                   copy_cache = Type_properties.create_cache ();
+}
        in
        let qc_mir_funcs =
          List.map
@@ -6498,7 +6545,9 @@ end
            fn_ret = int_ty;
            struct_fields = Driver.struct_fields_of w_env;
           enum_payloads = Driver.enum_payloads_of w_env;
-         }
+
+                   copy_cache = Type_properties.create_cache ();
+}
        in
        let w_main_decl =
          List.find

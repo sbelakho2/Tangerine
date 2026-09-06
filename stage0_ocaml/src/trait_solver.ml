@@ -77,18 +77,6 @@ let solve_error_string = function
   | UnsatisfiedBound t -> "unsatisfied trait bound `" ^ t ^ "`"
   | RecursiveObligation -> "recursive trait obligation"
 
-let int_kind_key (k : Type_repr.int_kind) : int =
-  match k with
-  | Type_repr.I8 -> 0 | Type_repr.I16 -> 1 | Type_repr.I32 -> 2
-  | Type_repr.I64 -> 3 | Type_repr.I128 -> 4
-  | Type_repr.U8 -> 5 | Type_repr.U16 -> 6 | Type_repr.U32 -> 7
-  | Type_repr.U64 -> 8 | Type_repr.U128 -> 9
-  | Type_repr.Int -> 10 | Type_repr.UInt -> 11
-
-let float_kind_key = function Type_repr.F32 -> 0 | Type_repr.F64 -> 1
-
-let mut_key = function Type_repr.Immutable -> 0 | Type_repr.Mutable -> 1
-
 (* ────────────────────────────────────────────────────────────────
    Structural Copy — the explicit formal rule (audit §25).
    Scalars (Int/Float/Bool/Char/Unit/Never), raw pointers, tuples and
@@ -106,39 +94,6 @@ let rec is_copy (ty : Type_repr.t) : bool =
   | Type_repr.Fixed_array (inner, _) -> is_copy inner
   | Type_repr.Named _ | Type_repr.Function _ | Type_repr.Type_param _ | Type_repr.Infer_var _ | Type_repr.Int_literal _ | Type_repr.Error -> false
 
-(* Canonical identity key of a type for the recursion guard. *)
-let rec type_key (ty : Type_repr.t) : string =
-  match ty with
-  | Type_repr.Unit -> "()"
-  | Type_repr.Bool -> "Bool"
-  | Type_repr.Char -> "Char"
-  | Type_repr.Never -> "Never"
-  | Type_repr.String -> "String"
-  | Type_repr.Int k -> "Int:" ^ string_of_int (int_kind_key k)
-  | Type_repr.Float k -> "Float:" ^ string_of_int (float_kind_key k)
-  | Type_repr.Raw_ptr (m, t) ->
-      "ptr:" ^ string_of_int (mut_key m) ^ "(" ^ type_key t ^ ")"
-  | Type_repr.Ref_internal (m, t) ->
-      "ref:" ^ string_of_int (mut_key m) ^ "(" ^ type_key t ^ ")"
-  | Type_repr.Tuple elems ->
-      "(" ^ String.concat "," (Array.to_list (Array.map type_key elems)) ^ ")"
-  | Type_repr.Fixed_array (t, n) -> Printf.sprintf "[%s;%d]" (type_key t) n
-  | Type_repr.Named (id, args) ->
-      Printf.sprintf "N#%d[%s]" (Ids.Type_id.to_int id)
-        (String.concat "," (Array.to_list (Array.map type_key args)))
-  | Type_repr.Function (params, ret) ->
-      "fn("
-      ^ String.concat "," (Array.to_list (Array.map (fun p -> type_key p.Type_repr.pt_type) params))
-      ^ ")->" ^ type_key ret
-  | Type_repr.Type_param id -> "P#" ^ string_of_int (Ids.Generic_param_id.to_int id)
-  | Type_repr.Infer_var v -> "V#" ^ string_of_int v
-  | Type_repr.Int_literal _ -> "INTLIT"
-  | Type_repr.Error -> "ERR"
-
-let obligation_key (ob : obligation) : string =
-  ob.trait_name ^ "<" ^ String.concat "," (Array.to_list (Array.map type_key ob.type_args))
-  ^ "> for " ^ type_key ob.self_ty
-
 (* The impl's target head Type_id. *)
 let impl_head (ie : impl_entry) : Ids.Type_id.t option =
   match ie.ie_target with
@@ -147,6 +102,16 @@ let impl_head (ie : impl_entry) : Ids.Type_id.t option =
 
 let structurally_equal (a : Type_repr.t) (b : Type_repr.t) : bool =
   Type_repr.compare a b = 0
+
+(* ── audit P1-23 ─────────────────────────────────────────────────
+   Obligation equality for the solver's recursion guard is STRUCTURAL:
+   the trait name is the source-name domain (the language has no trait
+   id), the type content compares by Type_repr.compare — never by a
+   rendered string of the obligation. *)
+let obligation_equal (a : obligation) (b : obligation) : bool =
+  a.trait_name = b.trait_name && structurally_equal a.self_ty b.self_ty
+  && Array.length a.type_args = Array.length b.type_args
+  && Array.for_all2 structurally_equal a.type_args b.type_args
 
 (* Unify the impl's target type with the obligation's self type, binding
    the impl's generic parameters (the substitution is returned). *)
@@ -201,15 +166,16 @@ let rec unify_target (subst : (Type_repr.generic_key * Type_repr.t) list)
    Returns Ok solution (the impl id and its associated-type substitution)
    or a solve_error. Recursion (discharging an impl's own where bounds)
    is guarded by a visited set: revisiting the same (trait, self) key is
-   a RecursiveObligation, never an infinite loop. *)
+   a RecursiveObligation, never an infinite loop.  The membership test
+   is obligation_equal — structural type content, never a string key
+   (audit P1-23). *)
 let solve (env : env) (ob : obligation) : (solution, solve_error) result =
-  let visited : string list ref = ref [] in
+  let visited : obligation list ref = ref [] in
   let rec go depth (ob : obligation) : (solution, solve_error) result =
-    let key = obligation_key ob in
-    if List.mem key !visited then Error RecursiveObligation
+    if List.exists (obligation_equal ob) !visited then Error RecursiveObligation
     else if depth > 64 then Error RecursiveObligation
     else begin
-      visited := key :: !visited;
+      visited := ob :: !visited;
       let result =
         match ob.self_ty with
         | Type_repr.Type_param pid ->
@@ -249,7 +215,7 @@ let solve (env : env) (ob : obligation) : (solution, solve_error) result =
                 | _ -> impl_round depth ())
             | _ -> impl_round depth ())
       in
-      visited := List.filter (fun k -> k <> key) !visited;
+      visited := List.filter (fun v -> not (obligation_equal ob v)) !visited;
       result
     end
   and impl_round (depth : int) () : (solution, solve_error) result =

@@ -148,6 +148,11 @@ type func_env = {
      answer for the payload-less enum kinds (AccessEffect,
      AccessConvention, TokenKind-adjacent kinds). *)
   enum_payloads : (Ids.Type_id.t * (string * Type_repr.t list) list) list;
+  (* The P1-25 copyability cache: the Type_properties engine memoizes
+     its answers per canonical (TypeId, args) instance; the cache is
+     bound to this env's typed registries (one per closure), so answers
+     are never shared across different def tables. *)
+  copy_cache : Type_properties.cache;
 }
 
 (* ── The persistent typed-node channel (re-audit: TypedProgram/TypedHIR
@@ -165,10 +170,11 @@ type func_env = {
 type typed_node = {
   tn_type : Type_repr.t;               (* the expr's resolved type *)
   tn_cast_target : Type_repr.t option; (* Ast.Cast: checker-resolved target *)
-  tn_call : (Ids.Callable_id.t * Type_repr.t array) option;
-  (* Ast.Call: the checker-resolved callee CallableId + the SOLVED
-     concrete substitution in declaration order — the exact-arity
-     pairing for the User instance the Call terminator emits *)
+  tn_call : Typecheck.typed_callee option;
+  (* Ast.Call: the checker-resolved callee CLASS (audit P0-5) + its
+     instance type args — the semantic class decided at CHECK time, so
+     the Call terminator the lowering emits carries the class and no
+     name-based host resolution happens post-mono *)
 }
 
 (* ── Variant tables ──────────────────────────────────────────────
@@ -415,6 +421,31 @@ let typed_let_of (st : lower_state) (node_id : Ids.Node_id.t) :
 let typed_node_of (st : lower_state) (node_id : Ids.Node_id.t) : typed_node option =
   List.assoc_opt node_id st.typed_nodes
 
+(* ── The callee class (audit P0-5) ────────────────────────────────
+   The checker's classed record is AUTHORITATIVE when present: the Call
+   terminator the lowering emits carries the recorded class (User /
+   Intrinsic / Extern / Derived / TypeQuery), so the lowering does not
+   name-resolve host bindings and the mono'd program needs no post-mono
+   rewrite.  The name-based registry lookups survive ONLY as the
+   channel-less fallback for the hand-built selfcheck envs (typed_nodes
+   absent). *)
+
+let callee_of_typed (c : Typecheck.typed_callee) : Seed_mir.callee =
+  match c with
+  | Typecheck.TC_user (callable, targs) ->
+      Seed_mir.User (Instance_id.make ~callable ~type_args:targs)
+  | Typecheck.TC_derived (callable, targs) -> Seed_mir.Derived (callable, targs)
+  | Typecheck.TC_intrinsic (i, targs) -> Seed_mir.Intrinsic (i, targs)
+  | Typecheck.TC_extern (i, targs) -> Seed_mir.Extern (i, targs)
+  | Typecheck.TC_type_query (k, targs) -> Seed_mir.TypeQuery (k, targs)
+
+let classed_callee_of_node (st : lower_state) (node_id : Ids.Node_id.t)
+    (fallback : Seed_mir.callee) : Seed_mir.callee =
+  match typed_node_of st node_id with
+  | Some n -> (
+      match n.tn_call with Some c -> callee_of_typed c | None -> fallback)
+  | None -> fallback
+
 (* The call's RESULT type: the typed channel's resolved type (the
    checker's substituted te_type) when present — the raw sig rets carry
    the declaration-owned generic params, which the verifier rejects in
@@ -532,71 +563,84 @@ let element_type_of (t : Type_repr.t) : Type_repr.t =
   | Type_repr.Tuple _ -> Type_repr.Int Type_repr.Int
   | _ -> seed_bug "element access on a non-iterable type %s" (Seed_mir.print_type t)
 
-(* Copyability for payload binding: the verifier's rule is recursive and
-   def-resolved (a struct is Copy iff every field is Copy, an enum iff
-   every variant payload is Copy) — but the lowering has no def table, so
-   Named values used to be conservatively non-copy.  The typed field
-   registry (env.struct_fields — every STRUCT nominal of the closure,
-   generic templates included, in the nominal's own parameter scope)
-   restores the verifier's structural rule for the raw-pointer handles
-   and scalar structs (Ptr[T] = {address: UInt} is Copy), while the
-   OWNED LangItem nominals (collections/Option/Result/Box — the seed
-   ownership model) and the compiler-only nominals with no declared
-   fields stay conservative non-copy. *)
-let rec copyable_ty env (t : Type_repr.t) : bool =
-  copyable_ty_seen env [] t
+(* Copyability for payload binding (P1-25): the core decision is the
+   type-property engine's (Type_properties.is_trivially_copyable — the
+   verifier's recursive, def-resolved rule: a struct is Copy iff every
+   field is Copy, an enum iff every variant payload is Copy).  The
+   lowering has no def TABLE of its own, so this file's env/def inputs
+   are kept and routed through the engine as its field registry:
+   - env.struct_fields (every STRUCT nominal of the closure, generic
+     templates included, in the nominal's own parameter scope) restores
+     the structural rule for the raw-pointer handles and scalar structs
+     (Ptr[T] = {address: UInt} is Copy);
+   - env.enum_payloads resolves the enum rule (a payload-less enum is
+     Copy; an enum with an owning payload is not);
+   - the OWNED LangItem nominals (collections/Option/Result/Box/Rc/Arc —
+     the seed ownership model) and the compiler-only nominals with no
+     declared fields stay conservative non-copy (the name-anchored
+     pre-check below, exactly the pre-consolidation answers);
+   - the leaf classes the engine answers conservatively but the
+     lowering previously classified outright (function values, Error)
+     are pre-classified below, so consolidation changes nothing the
+     working pipeline lowers.
+   The per-func_env cache memoizes the engine's answers per canonical
+   (TypeId, args) instance. *)
+let owned_langitem_named : string list =
+  [ "Vec"; "Array"; "List"; "Map"; "HashMap"; "Set"; "HashSet";
+    "Option"; "Result"; "Box"; "Rc"; "WeakRc"; "UniquePtr";
+    "ArcStrong"; "WeakArc"; "RcInner"; "ArcInnerWeak" ]
 
-and copyable_ty_seen env (seen : Ids.Type_id.t list) (t : Type_repr.t) : bool =
+let is_owned_langitem (env : func_env) (tid : Ids.Type_id.t) : bool =
+  List.exists
+    (fun (n, ty) ->
+      match ty with
+      | Type_repr.Named (t2, _) ->
+          Ids.Type_id.compare t2 tid = 0 && List.mem n owned_langitem_named
+      | _ -> false)
+    env.types
+
+(* The env def hook: a struct nominal resolves to its field tuple, an
+   enum to its payload function (the def_repr convention the engine's
+   enum rule keys on).  Owned LangItems resolve to NO def — the engine's
+   conservative owned answer, exactly the pre-consolidation langitem
+   rule, at every nesting depth. *)
+let def_of_tid (env : func_env) (tid : Ids.Type_id.t) : Type_repr.t option =
+  if is_owned_langitem env tid then None
+  else
+    match List.assoc_opt tid env.struct_fields with
+    | Some fields ->
+        Some
+          (Type_repr.Tuple
+             (Array.of_list
+                (List.map (fun (_fname, _fid, fty, _default) -> fty) fields)))
+    | None -> (
+        match List.assoc_opt tid env.enum_payloads with
+        | None -> None
+        | Some variants ->
+            Some
+              (Type_repr.Function
+                 ( Array.of_list
+                     (List.map
+                        (fun (_vname, pty) ->
+                          {
+                            Type_repr.pt_convention = Access_effect.Let;
+                            pt_type = Type_repr.Tuple (Array.of_list pty);
+                          })
+                        variants),
+                   Type_repr.Never )))
+
+let copyable_ty (env : func_env) (t : Type_repr.t) : bool =
   match t with
   | Type_repr.Unit | Type_repr.Bool | Type_repr.Char | Type_repr.Int _
   | Type_repr.Float _ | Type_repr.Raw_ptr _ | Type_repr.Ref_internal _
   | Type_repr.Function _ | Type_repr.Never | Type_repr.Error ->
       true
   | Type_repr.String -> false
-  | Type_repr.Tuple elems -> Array.for_all (copyable_ty_seen env seen) elems
-  | Type_repr.Fixed_array (e, _) -> copyable_ty_seen env seen e
-  | Type_repr.Named (tid, _args) ->
-      if List.exists (fun s -> Ids.Type_id.compare s tid = 0) seen then false
-      else
-        let seen' = tid :: seen in
-        let owned_langitem =
-          List.exists
-            (fun (n, ty) ->
-              match ty with
-              | Type_repr.Named (t2, _) ->
-                  Ids.Type_id.compare t2 tid = 0
-                  && List.mem n
-                       [ "Vec"; "Array"; "List"; "Map"; "HashMap"; "Set"; "HashSet";
-                         "Option"; "Result"; "Box"; "Rc"; "WeakRc"; "UniquePtr";
-                         "ArcStrong"; "WeakArc"; "RcInner"; "ArcInnerWeak" ]
-              | _ -> false)
-            env.types
-        in
-        if owned_langitem then false
-        else
-          (match List.assoc_opt tid env.struct_fields with
-           | Some fields ->
-               (* the field types are recorded in the nominal's own
-                  parameter scope — a field that MENTIONS the nominal's
-                  own param stays conservative non-copy (S[T] { x: T } is
-                  Copy only for Copy args), while a field that never
-                  mentions it (Ptr[T] = { address: UInt }) is Copy for
-                  every instantiation — the same def-structural rule the
-                  verifier's property engine applies *)
-               List.for_all
-                 (fun (_fname, _fid, fty, _default) -> copyable_ty_seen env seen' fty)
-                 fields
-           | None -> (
-               match List.assoc_opt tid env.enum_payloads with
-               | None -> false
-               | Some variants ->
-                   (* an enum is Copy iff every variant's payload is Copy
-                      (the verifier's recursive enum rule); a payload-less
-                      enum is Copy *)
-                   List.for_all
-                     (fun (_vname, pty) -> List.for_all (copyable_ty_seen env seen') pty)
-                     variants))
   | Type_repr.Type_param _ | Type_repr.Infer_var _ | Type_repr.Int_literal _ -> false
+  | Type_repr.Named (tid, _) when is_owned_langitem env tid -> false
+  | Type_repr.Tuple _ | Type_repr.Fixed_array _ | Type_repr.Named _ ->
+      Type_properties.is_trivially_copyable ~cache:env.copy_cache
+        ~resolve_def:(def_of_tid env) t
 
 (* Whether a value type is DEFINITELY owned — never Copy under the
    verifier's rule — WITHOUT a def table: the owned builtin nominals the
@@ -2365,7 +2409,7 @@ and lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
                   set_terminator_to st
                     (Seed_mir.Call
                        ( cur_place st eid,
-                         Seed_mir.Intrinsic (Intrinsic_registry.Id.to_int iid),
+                         Seed_mir.Intrinsic (Intrinsic_registry.Id.to_int iid, [||]),
                          arg_vals, next_b, None ))
                     next_b;
                   cur_place st eid
@@ -4632,7 +4676,7 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
           let entry_by_callable =
             match typed_node_of st node_id with
             | Some node -> (
-                match node.tn_call with
+                match Typecheck.tc_callee_instance node.tn_call with
                 | Some (callable, _) ->
                     List.assoc_opt (Ids.Callable_id.to_int callable)
                       env.callables_by_callable
@@ -4669,26 +4713,28 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
                          a.Ast.ca_value)
                      args)
               in
-              let next_b = new_block st in
-              (* the typed lowering channel is authoritative: when the
-                 call's span node carries tn_call, the User instance is
-                 the checker-resolved callee + the SOLVED concrete
-                 substitution (the mono exact-arity pairing — declaration
-                 params vs concrete type_args); the [||] path is only the
-                 hand-built selfcheck fallback, where the channel is
-                 absent and the kernel's zero-generic defs stay exact. *)
-              let tn_call = match typed_node_of st node_id with Some n -> n.tn_call | None -> None in
-              let instance =
-                match tn_call with
-                | Some (callable, type_args) ->
-                    Instance_id.make ~callable ~type_args
-                | None ->
-                    Instance_id.make ~callable:(Ids.Callable_id.make cid) ~type_args:[||]
-              in
-              set_terminator_to st
-                (Seed_mir.Call (rp, Seed_mir.User instance, arg_vals, next_b, None))
-                next_b;
-              (copy_place st rp, ty)
+               let next_b = new_block st in
+               (* the typed lowering channel is authoritative: when the
+                  call's span node carries the callee CLASS (audit P0-5),
+                  the terminator emits the recorded class — a User/
+                  Derived callee is the checker-resolved callable + the
+                  SOLVED concrete substitution (the mono exact-arity
+                  pairing — declaration params vs concrete type_args),
+                  an Intrinsic/Extern callee is the checker-resolved host
+                  binding, a TypeQuery the compile-time query form; the
+                  [||]-instance fallback is only the hand-built selfcheck
+                  path, where the channel is absent and the kernel's
+                  zero-generic defs stay exact. *)
+               let fallback =
+                 Seed_mir.User
+                   (Instance_id.make ~callable:(Ids.Callable_id.make cid)
+                      ~type_args:[||])
+               in
+               let callee = classed_callee_of_node st node_id fallback in
+               set_terminator_to st
+                 (Seed_mir.Call (rp, callee, arg_vals, next_b, None))
+                 next_b;
+               (copy_place st rp, ty)
           | None -> (
               (* ── the qualified static-call path (E9048 retirement:
                  `Type::method(...)` — the checker's static-method
@@ -4783,32 +4829,58 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
                            in
                            find_intrinsic candidate_owners
                          in
-                         (match intrinsic_channel () with
-                          | Some iid ->
-                              let arg_vals =
-                                Array.of_list
-                                  (List.mapi
-                                     (fun i a ->
-                                       lower_argument env st
-                                         (if i + 1 < Array.length me.me_params then
-                                           me.me_params.(i + 1).Type_repr.pt_convention
-                                         else Access_effect.Let)
-                                         a.Ast.ca_value)
-                                     args)
-                              in
-                               let id = fresh_local st (call_result_ty st node_id me.me_ret) in
-                               let rp = cur_place st id in
-                               let next_b = new_block st in
-                               set_terminator_to st
-                                 (Seed_mir.Call
-                                    ( rp,
-                                      Seed_mir.Intrinsic
-                                        (Intrinsic_registry.Id.to_int iid),
-                                      arg_vals,
-                                      next_b,
-                                      None ))
-                                 next_b;
-                               (copy_place st rp, call_result_ty st node_id me.me_ret)
+                          (* the checker's classed record is authoritative
+                             (audit P0-5): a TC_intrinsic record drives the
+                             intrinsic branch; any other recorded class
+                             (User/Derived/...) drives the body path with
+                             the recorded identity.  The registry-name
+                             lookup below survives only as the
+                             channel-less fallback (hand-built selfcheck
+                             envs). *)
+                          let classed =
+                            match typed_node_of st node_id with
+                            | Some node -> node.tn_call
+                            | None -> None
+                          in
+                          let intrinsic_id =
+                            match classed with
+                            | Some (Typecheck.TC_intrinsic (i, _)) -> Some i
+                            | Some _ -> None
+                            | None -> (
+                                match intrinsic_channel () with
+                                | Some iid -> Some (Intrinsic_registry.Id.to_int iid)
+                                | None -> None)
+                          in
+                          (match intrinsic_id with
+                           | Some iid ->
+                               let arg_vals =
+                                 Array.of_list
+                                   (List.mapi
+                                      (fun i a ->
+                                        lower_argument env st
+                                          (if i + 1 < Array.length me.me_params then
+                                            me.me_params.(i + 1).Type_repr.pt_convention
+                                          else Access_effect.Let)
+                                          a.Ast.ca_value)
+                                      args)
+                               in
+                                let id = fresh_local st (call_result_ty st node_id me.me_ret) in
+                                let rp = cur_place st id in
+                                let next_b = new_block st in
+                                let targs =
+                                  match classed with
+                                  | Some (Typecheck.TC_intrinsic (_, targs)) -> targs
+                                  | _ -> [||]
+                                in
+                                set_terminator_to st
+                                  (Seed_mir.Call
+                                     ( rp,
+                                       Seed_mir.Intrinsic (iid, targs),
+                                       arg_vals,
+                                       next_b,
+                                       None ))
+                                  next_b;
+                                (copy_place st rp, call_result_ty st node_id me.me_ret)
                           | None ->
                               let nparams = Array.length me.me_params in
                          (* the checker PREPENDS a synthetic receiver (the
@@ -4848,45 +4920,38 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
                            seed_bug
                              "qualified call `%s`: the method takes a receiver (`self: %s`), which the qualified form cannot supply in the seed (the checker's synthetic receiver is the TYPE used as a value — a type-level fiction with no runtime content); call it on a real receiver value instead"
                              mname (Seed_mir.print_type me.me_params.(0).Type_repr.pt_type);
-                         (* the instance: the typed channel's
-                            checker-resolved callable + solved concrete
-                            substitution when present (the generic call's
-                            concrete args arrive there), else the
-                            registry's instance *)
-                         let instance =
-                           match typed_node_of st node_id with
-                           | Some node -> (
-                               match node.tn_call with
-                               | Some (callable, type_args) ->
-                                   Instance_id.make ~callable ~type_args
-                               | None -> me.me_instance)
-                           | None -> me.me_instance
-                         in
-                         (* the local's type: the checker's RESOLVED
-                            result (the call node's journal-substituted
-                            tn_type) — the raw sig ret carries the
-                            method's declaration-owned params (Vec::new's
-                            T), which the aggregate/return context solved;
-                            a local typed with the raw decl would fail the
-                            template verifier's declared-params rule *)
-                         let id = fresh_local st (call_result_ty st node_id me.me_ret) in
-                         let rp = cur_place st id in
-                         let arg_vals =
-                           Array.of_list
-                             (List.mapi
-                                (fun i a ->
-                                  lower_argument env st
-                                    (if i < nparams then
-                                      me.me_params.(i).Type_repr.pt_convention
-                                    else Access_effect.Let)
-                                    a.Ast.ca_value)
-                                args)
-                         in
-                         let next_b = new_block st in
-                         set_terminator_to st
-                           (Seed_mir.Call (rp, Seed_mir.User instance, arg_vals, next_b, None))
-                           next_b;
-                         (copy_place st rp, call_result_ty st node_id me.me_ret)))
+                          (* the instance: the typed channel's
+                             checker-resolved callee CLASS + solved
+                             concrete substitution when present (the
+                             generic call's concrete args arrive there),
+                             else the registry's instance *)
+                          let fallback_user = Seed_mir.User me.me_instance in
+                          let callee = classed_callee_of_node st node_id fallback_user in
+                          (* the local's type: the checker's RESOLVED
+                             result (the call node's journal-substituted
+                             tn_type) — the raw sig ret carries the
+                             method's declaration-owned params (Vec::new's
+                             T), which the aggregate/return context solved;
+                             a local typed with the raw decl would fail the
+                             template verifier's declared-params rule *)
+                          let id = fresh_local st (call_result_ty st node_id me.me_ret) in
+                          let rp = cur_place st id in
+                          let arg_vals =
+                            Array.of_list
+                              (List.mapi
+                                 (fun i a ->
+                                   lower_argument env st
+                                     (if i < nparams then
+                                       me.me_params.(i).Type_repr.pt_convention
+                                     else Access_effect.Let)
+                                     a.Ast.ca_value)
+                                 args)
+                          in
+                          let next_b = new_block st in
+                          set_terminator_to st
+                            (Seed_mir.Call (rp, callee, arg_vals, next_b, None))
+                            next_b;
+                          (copy_place st rp, call_result_ty st node_id me.me_ret)))
                      | None -> (
                          (* the mangled free function: `String::new`
                             dispatches to the compiler constructor
@@ -4934,23 +4999,23 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
                              let id = fresh_local st ty in
                              let rp = cur_place st id in
                              let next_b = new_block st in
-                             let callee_of =
-                               match
-                                 Intrinsic_registry.lookup Intrinsic_registry.manifest
-                                   ~name:n
-                               with
-                               | Some (iid, _) ->
-                                   Seed_mir.Intrinsic (Intrinsic_registry.Id.to_int iid)
-                               | None -> (
-                                   match
-                                     Extern_registry.lookup Extern_registry.manifest
-                                       ~name:n
-                                   with
-                                   | Some (eid, _) ->
-                                       Seed_mir.Extern (Extern_registry.Id.to_int eid)
-                                   | None ->
-                                       seed_bug "unknown callee '%s' in lowering" n)
-                             in
+                              let callee_of =
+                                match
+                                  Intrinsic_registry.lookup Intrinsic_registry.manifest
+                                    ~name:n
+                                with
+                                | Some (iid, _) ->
+                                    Seed_mir.Intrinsic (Intrinsic_registry.Id.to_int iid, [||])
+                                | None -> (
+                                    match
+                                      Extern_registry.lookup Extern_registry.manifest
+                                        ~name:n
+                                    with
+                                    | Some (eid, _) ->
+                                        Seed_mir.Extern (Extern_registry.Id.to_int eid, [||])
+                                    | None ->
+                                        seed_bug "unknown callee '%s' in lowering" n)
+                              in
                              set_terminator_to st
                                (Seed_mir.Call (rp, callee_of, arg_vals, next_b, None))
                                next_b;
@@ -4993,49 +5058,60 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
                                      args)
                               in
                               let next_b = new_block st in
-                             (* the intrinsic channel (audit §70): a
-                                mangled compiler constructor with an
-                                intrinsic binding (`set_new`,
-                                `map_new` — the free-function surface of
-                                the host's executable closure) dispatches
-                                to the intrinsic table; the User path
-                                stays for the kernel callables with MIR
-                                bodies. *)
+                             (* the checker's classed record is
+                                authoritative (audit P0-5): the intrinsic
+                                channel decision comes from the class; the
+                                registry-name lookup below survives only
+                                as the channel-less fallback (hand-built
+                                selfcheck envs). *)
+                             let classed =
+                               match typed_node_of st node_id with
+                               | Some node -> node.tn_call
+                               | None -> None
+                             in
                              let intrinsic_name = "__intrinsic_" ^ mangled in
-                             (match
-                                Intrinsic_registry.lookup Intrinsic_registry.manifest
-                                  ~name:intrinsic_name
-                              with
-                             | Some (iid, _) ->
-                                 set_terminator_to st
-                                   (Seed_mir.Call
-                                      ( rp,
-                                        Seed_mir.Intrinsic
-                                          (Intrinsic_registry.Id.to_int iid),
-                                        arg_vals,
-                                        next_b,
-                                        None ))
-                                   next_b
-                             | None ->
-                                 let tn_call =
-                                   match typed_node_of st node_id with
-                                   | Some node -> node.tn_call
-                                   | None -> None
-                                 in
-                                 let instance =
-                                   match tn_call with
-                                   | Some (callable, type_args) ->
-                                       Instance_id.make ~callable ~type_args
-                                   | None ->
-                                       Instance_id.make
+                             let intrinsic_id =
+                               match classed with
+                               | Some (Typecheck.TC_intrinsic (i, _)) -> Some i
+                               | Some _ -> None
+                               | None -> (
+                                   match
+                                     Intrinsic_registry.lookup
+                                       Intrinsic_registry.manifest
+                                       ~name:intrinsic_name
+                                   with
+                                   | Some (iid, _) ->
+                                       Some (Intrinsic_registry.Id.to_int iid)
+                                   | None -> None)
+                             in
+                             (match intrinsic_id with
+                              | Some iid ->
+                                  let targs =
+                                    match classed with
+                                    | Some (Typecheck.TC_intrinsic (_, targs)) -> targs
+                                    | _ -> [||]
+                                  in
+                                  set_terminator_to st
+                                    (Seed_mir.Call
+                                       ( rp,
+                                         Seed_mir.Intrinsic (iid, targs),
+                                         arg_vals,
+                                         next_b,
+                                         None ))
+                                    next_b
+                              | None ->
+                                  let fallback =
+                                    Seed_mir.User
+                                      (Instance_id.make
                                          ~callable:(Ids.Callable_id.make cid)
-                                         ~type_args:[||]
-                                 in
-                                 set_terminator_to st
-                                   (Seed_mir.Call
-                                      (rp, Seed_mir.User instance, arg_vals, next_b, None))
-                                   next_b);
-                             (copy_place st rp, ty)))
+                                         ~type_args:[||])
+                                  in
+                                  let callee = classed_callee_of_node st node_id fallback in
+                                  set_terminator_to st
+                                    (Seed_mir.Call
+                                       (rp, callee, arg_vals, next_b, None))
+                                    next_b);
+                              (copy_place st rp, ty)))
                 | _ -> seed_bug "unknown callee '%s' in lowering" n
               in
               (* re-audit P12: the closure-VALUE call — `f(x)` where
@@ -5221,6 +5297,14 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
               | o -> [ o ])
         in
         let candidates = List.concat_map expand owner in
+        (* audit P1-23: this fallback resolves the callee through the
+           checker's REGISTRATION table — keyed by the source owner/
+           method names the declaration registered under (the language's
+           name domain; the typed-node channel's checker-resolved callee
+           above is the structural path and wins when present).  The
+           entry found here is consumed for its STRUCTURAL identities
+           (me_instance/ts_callable); no rendered identity is ever
+           compared. *)
         match
           List.find_map
             (fun o -> if List.mem_assoc (o, mname) env.methods then Some o else None)
@@ -5230,54 +5314,63 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
         | None -> (
             match owner with o :: _ -> o | [] -> "?")
       in
-      (match List.assoc_opt (owner, mname) env.methods with
-       | None ->
-           (* the derived clone/to_string (the checker's derived_clone/
-              derived_to_string oracle): the bootstrap subset exercises
-              these on receivers with no declared impl (`x.clone()` on an
-              Option payload, on a reference, on a generic element).  The
-              seed synthesizes the derived method entry: self = receiver,
-              ret = receiver for clone, String for to_string. *)
-           (match mname with
-           | "clone" | "to_string" -> (
-               let ret =
-                 match mname with
-                 | "clone" -> rty
-                 | _ -> Type_repr.String
-               in
-               let me =
-                 {
-                   me_instance =
-                     Instance_id.make ~callable:(Ids.Callable_id.make (-1)) ~type_args:[||];
-                   me_params =
-                     [|
-                       { Type_repr.pt_convention = Access_effect.Let; pt_type = rty };
-                     |];
-                   me_ret = ret;
-                   me_has_self = true;
-                 }
-               in
-               if Array.length me.me_params = 0 then
-                 seed_bug
-                   "method call `%s`: the method instance of `%s` carries no self parameter" mname
-                   owner;
-               let nargs = List.length args in
-               if nargs <> Array.length me.me_params - 1 then
-                 seed_bug "method call `%s` of `%s`: expected %d argument(s), got %d" mname owner
-                   (Array.length me.me_params - 1) nargs;
-             (* the instance: the typed channel's checker-resolved callable
-                + solved concrete substitution when present (the generic
-                call's concrete args arrive there), else the registry's
+       (match List.assoc_opt (owner, mname) env.methods with
+        | None ->
+            (* the derived operations (audit P0-12: the checker's
+               derived_clone / derived_to_string / derived_eq / scalar
+               hash channel — real compiler-generated functions now, but
+               the SEED lowering of the CALL SITE still needs the method
+               ENTRY shape the call's argument conventions lower
+               against): the bootstrap subset exercises these on
+               receivers with no declared impl (`x.clone()` on an Option
+               payload, on a reference, on a generic element).  The seed
+               synthesizes the derived method entry: self = receiver,
+               ret = receiver for clone/hash-self, String for
+               to_string, Bool for eq (eq carries an explicit `other`
+               parameter like the kernel's `def eq(self, other)`
+               shape). *)
+            (match mname with
+            | "clone" | "to_string" | "eq" | "hash" -> (
+                let ret =
+                  match mname with
+                  | "clone" -> rty
+                  | "hash" -> Type_repr.Int Type_repr.Int
+                  | "eq" -> Type_repr.Bool
+                  | _ -> Type_repr.String
+                in
+                let me =
+                  {
+                    me_instance =
+                      Instance_id.make ~callable:(Ids.Callable_id.make (-1)) ~type_args:[||];
+                    me_params =
+                      (if mname = "eq" then
+                         [|
+                           { Type_repr.pt_convention = Access_effect.Let; pt_type = rty };
+                           { Type_repr.pt_convention = Access_effect.Let; pt_type = rty };
+                         |]
+                       else
+                         [|
+                           { Type_repr.pt_convention = Access_effect.Let; pt_type = rty };
+                         |]);
+                    me_ret = ret;
+                    me_has_self = true;
+                  }
+                in
+                if Array.length me.me_params = 0 then
+                  seed_bug
+                    "method call `%s`: the method instance of `%s` carries no self parameter" mname
+                    owner;
+                let nargs = List.length args in
+                if nargs <> Array.length me.me_params - 1 then
+                  seed_bug "method call `%s` of `%s`: expected %d argument(s), got %d" mname owner
+                    (Array.length me.me_params - 1) nargs;
+             (* the callee: the typed channel's checker-resolved callee
+                CLASS (audit P0-5 — a derived-mint resolution records
+                TC_derived carrying the minted contract callable + the
+                solved substitution) when present, else the registry's
                 instance *)
-                 let instance =
-                   match typed_of_method_call nid with
-                   | Some node -> (
-                       match node.tn_call with
-                       | Some (callable, type_args) ->
-                           Instance_id.make ~callable ~type_args
-                       | None -> me.me_instance)
-                   | None -> me.me_instance
-                 in
+                 let fallback_user = Seed_mir.User me.me_instance in
+                 let callee = classed_callee_of_node st node_id fallback_user in
                 let self_conv = me.me_params.(0).Type_repr.pt_convention in
                let self_eff = Access_effect.read_effect self_conv in
                (* the receiver's operand form follows the self convention:
@@ -5372,13 +5465,13 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
                in
                let next_b = new_block st in
                set_terminator_to st
-                 (Seed_mir.Call (rp2, Seed_mir.User instance, arg_vals, next_b, None))
+                 (Seed_mir.Call (rp2, callee, arg_vals, next_b, None))
                  next_b;
                (copy_place st rp2, recv_dest_ty))
-           | _ ->
-               seed_bug
-                 "method call `%s`: type `%s` has no method instance in the lowering env's methods table"
-                 mname owner)
+            | _ ->
+                seed_bug
+                  "method call `%s`: type `%s` has no method instance in the lowering env's methods table"
+                  mname owner)
        | Some me -> (
            if Array.length me.me_params = 0 then
              seed_bug
@@ -5388,20 +5481,12 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
            if nargs <> Array.length me.me_params - 1 then
              seed_bug "method call `%s` of `%s`: expected %d argument(s), got %d" mname owner
                (Array.length me.me_params - 1) nargs;
-            (* the instance: the typed channel's checker-resolved callable
-               + solved concrete substitution when present (the generic
-               call's concrete args arrive there), else the registry's
-               instance *)
-            let instance =
-              match typed_of_method_call nid with
-              | Some node -> (
-                  match node.tn_call with
-                  | Some (callable, type_args) ->
-                      Instance_id.make ~callable ~type_args
-                  | None -> me.me_instance)
-              | None -> me.me_instance
-            in
-            let self_conv = me.me_params.(0).Type_repr.pt_convention in
+             (* the callee: the typed channel's checker-resolved callee
+                CLASS (audit P0-5 — the receiver-method record) when
+                present, else the registry's instance *)
+             let fallback_user = Seed_mir.User me.me_instance in
+             let callee = classed_callee_of_node st node_id fallback_user in
+             let self_conv = me.me_params.(0).Type_repr.pt_convention in
            let self_eff = Access_effect.read_effect self_conv in
            (* the receiver's operand form follows the self convention:
               a consuming self (Sink/Set) TRANSFERS the receiver (Move —
@@ -5492,21 +5577,38 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
                          a.Ast.ca_value)
                      args)
            in
-           (* the intrinsic channel (audit §70): the builtin collection
+           (* the intrinsic channel (audit P0-5): the builtin collection
               receiver methods (Set/Map insert/contains/len/...) map
               self + args onto the host's intrinsic table — the
-              executable closure for the builtin surface.  The
-              registry lookup is the DECLARED-symbol check: a builtin
-              method without an intrinsic binding keeps the User path
+              executable closure for the builtin surface.  The DECISION
+              is the checker's recorded class (TC_intrinsic when the
+              check-time (owner, method) resolution reached a registry
+              binding); the registry lookup below survives only as the
+              channel-less fallback (hand-built selfcheck envs).  A
+              builtin method without a binding keeps the User path
               (fail-closed at the VM's instance resolution). *)
-           let intrinsic_name =
-             "__intrinsic_" ^ String.lowercase_ascii (owner ^ "_" ^ mname)
+           let classed =
+             match typed_of_method_call nid with
+             | Some node -> node.tn_call
+             | None -> None
            in
-           (match
-              Intrinsic_registry.lookup Intrinsic_registry.manifest
-                ~name:intrinsic_name
-            with
-           | Some (iid, _isig) ->
+           let intrinsic_id =
+             match classed with
+             | Some (Typecheck.TC_intrinsic (i, _)) -> Some i
+             | Some _ -> None
+             | None -> (
+                 let intrinsic_name =
+                   "__intrinsic_" ^ String.lowercase_ascii (owner ^ "_" ^ mname)
+                 in
+                 match
+                   Intrinsic_registry.lookup Intrinsic_registry.manifest
+                     ~name:intrinsic_name
+                 with
+                 | Some (iid, _isig) -> Some (Intrinsic_registry.Id.to_int iid)
+                 | None -> None)
+           in
+           (match intrinsic_id with
+           | Some iid ->
                (* re-audit P0-B: the collection mutation now travels
                   through the VM's host-call WRITEBACK channel (the
                   adapters return the exact Tangerine contract in the
@@ -5568,16 +5670,22 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
                in
                let _ =
                  if Sys.getenv_opt "TANGERINE_DEBUG_PT" <> None then
-                   Printf.eprintf "DBG-DEST2 %s rty=%s dest=%s\n" intrinsic_name
+                   Printf.eprintf "DBG-DEST2 %s rty=%s dest=%s\n"
+                     ("__intrinsic_" ^ String.lowercase_ascii (owner ^ "_" ^ mname))
                      (Typecheck.type_to_string rty) (Typecheck.type_to_string dest_ty)
                in
                let did = fresh_local st dest_ty in
                let drp = cur_place st did in
                let next_b = new_block st in
+               let targs =
+                 match classed with
+                 | Some (Typecheck.TC_intrinsic (_, targs)) -> targs
+                 | _ -> [||]
+               in
                set_terminator_to st
                  (Seed_mir.Call
                     ( drp,
-                      Seed_mir.Intrinsic (Intrinsic_registry.Id.to_int iid),
+                      Seed_mir.Intrinsic (iid, targs),
                       arg_vals,
                       next_b,
                       None ))
@@ -5586,7 +5694,7 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
            | None ->
                let next_b = new_block st in
                set_terminator_to st
-                 (Seed_mir.Call (rp2, Seed_mir.User instance, arg_vals, next_b, None))
+                 (Seed_mir.Call (rp2, callee, arg_vals, next_b, None))
                  next_b;
                (copy_place st rp2, recv_dest_ty))))))
   | _ -> seed_bug "unsupported callee form in lowering"

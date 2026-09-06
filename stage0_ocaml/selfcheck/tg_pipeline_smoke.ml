@@ -99,7 +99,7 @@ let lower_and_check ~repo_root (env : Typecheck.env) (program : Ast.program) : u
       oc_skipped = false;
     }
   in
-  let incomplete = Driver.print_oracle_rows o in
+  let incomplete = Driver.print_oracle_rows (Driver.fresh_closure_audit ()) o in
   if incomplete then
     Printf.printf
       "  oracle note: DIFF rows present — expected for the seed subset (typed methods/nominals are not yet lowered); SMOKE informational only, the closure gate is tg_bootstrap_gate\n";
@@ -265,7 +265,7 @@ let () =
            oc_skipped = false;
          }
        in
-       let incomplete = Driver.print_oracle_rows o in
+       let incomplete = Driver.print_oracle_rows (Driver.fresh_closure_audit ()) o in
         if incomplete then
           Printf.printf
             "  oracle note: DIFF rows present — expected for the seed subset (typed methods/nominals are not yet lowered); SMOKE informational only, the closure gate is tg_bootstrap_gate\n";

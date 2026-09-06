@@ -1,0 +1,1602 @@
+## std::fixed — Fixed-Capacity Collections (core quality)
+## ArrayVec / RingBuffer / SpscQueue — inline storage, no allocator, no locks,
+## ownership-transferring push/pop with exact structural drop.
+##
+## Spec: P1-17 (fixed-capacity collections promoted to core quality) and
+## P1-21 (the fixed-capacity lock-free SPSC queue with split endpoints).
+##
+## ———————————————————————————————————————————————————————————————
+## COMPILE-TIME CAPACITY — the kernel's generics (DECIDED, documented)
+## ———————————————————————————————————————————————————————————————
+## The kernel's generic machinery carries NO const-generic VALUE
+## parameter today: a generic parameter list is a list of TYPE parameters
+## only (GenericParam { name, bounds, default } — no value kind), a type
+## argument list parses TYPE expressions only, and the inline fixed-array
+## spelling `[T; N]` evaluates N through the const-size evaluator
+## (eval_const_size_expr) — a literal or a module-level Int `const` — and
+## forms Type::FixedArray(elem, N) with the count INSIDE the type. A
+## `[T; N]` field whose N is a generic parameter is therefore not
+## expressible, and the std::embedded prototypes that spell
+## `struct ArrayVec[T, const N: UInt]` are the forward specification, not
+## the compilable surface.
+##
+## The promoted core-quality form is therefore the CONCRETE-FIXED-STRUCT
+## per capacity — the pragmatic form the kernel itself uses for its fixed
+## tables (std::kernel.tg: TaskControlBlock tables at [..; 16] /
+## [..; 32], ProcessControlBlock table at [..; 32]) — spelled as
+## ArrayVec4[T]-style names:
+##
+##     ArrayVec4[T],  ArrayVec8[T],  ArrayVec16[T], ArrayVec32[T],
+##     ArrayVec64[T]
+##     RingBuffer4[T], ... (same set; every capacity is a power of two —
+##     the ring indexes with the mask (i + 1) & (N - 1) fast path)
+##     SpscQueue4[T] / SpscTx4[T] / SpscRx4[T] (same set through 32)
+##
+## The capacity is part of the TYPE NAME (a compile-time fact carried by
+## the type identity), the storage is a direct inline field of the struct,
+## and no element type constraint (no T: Copy, no T: Default) is imposed —
+## the promotion over the std::embedded prototypes.
+##
+## ———————————————————————————————————————————————————————————————
+## SLOT MODEL — why the storage is [Option[T]; N] (DECIDED, documented)
+## ———————————————————————————————————————————————————————————————
+## The kernel's destruction protocol is the compiler-generated drop glue
+## over the STRUCT SHAPE (the deinit plans + the pre-generated glue
+## functions walk the concrete type; Type::FixedArray(elem, _) glue walks
+## EVERY element of the inline array). A raw `[T; N]` field of an owning
+## element type therefore cannot hold lazily-initialized slots — the glue
+## would destruct never-initialized memory. The slot-valid invariant is
+## the Option form: every slot is ALWAYS a valid `Option[T]` value
+## (`None` at rest). The structural glue is then EXACT:
+##   - occupied slots (Some) are destructed exactly once, by the glue, at
+##     the container's end of life;
+##   - vacant slots are the None discriminant — their glue is trivial.
+## No custom `deinit`/`Drop` exists on the inline containers (ArrayVec,
+## RingBuffer): owning fields are dropped structurally — the kernel's
+## deinit convention (a struct that owns VALUES holds them structurally
+## and declares no finalizer; a struct that owns MEMORY holds a raw
+## pointer and declares the finalizer — see std::alloc.tg Box/Arc and
+## std::collections.tg SliceBacking).
+##
+## "No initialization of unused storage" is satisfied in the semantic
+## sense: no element T is EVER constructed for an unused slot (no
+## T::default, no element constructor, no per-slot allocation). The only
+## per-slot write at construction is the Option None DISCRIMINANT
+## (a plain tag image; Option::None carries no T). This is the kernel's
+## exact-drop boundary: the None discriminant is what makes the slot
+## glue-trivial, so writing it is REQUIRED by the glue-exactness rule
+## above — raw maybe-uninit slots are not representable in a struct whose
+## glue the compiler generates.
+##
+## Construction spell: `[Option::None, ...]` — an explicit AGGREGATE
+## array literal of N None variants (aggregate construction is the
+## sanctioned ownership-transfer point in the MIR; the repeat form
+## `[x; N]` is Copy-gated and cannot repeat a generic Option[T], so the
+## literal is the only generic-safe initializer). Each capacity struct's
+## `new()` writes exactly N None items.
+##
+## ———————————————————————————————————————————————————————————————
+## PUSH/POP OWNERSHIP CONTRACT
+## ———————————————————————————————————————————————————————————————
+##   push(inout self, sink item) -> Result[Unit, T]
+##     Consumes the item INTO the container. When the container is full
+##     the item was NOT consumed and is returned to the caller as
+##     Result::Err(item) — the sink-rejected-value full policy.
+##   pop(inout self) -> Option[T]
+##     Transfers ownership of the last/front element OUT of the container
+##     (the slot is reset to None; the caller owns the returned value).
+##   Element slot stores target slots that are vacant by construction
+##   (the len/count discipline), so the store's old-value policy — the
+##   MIR emits no old-element drop inside generic bodies (deferred
+##   element type) and the concrete glue drop on the monomorphized
+##   instances — is safe under BOTH policies: the overwritten value is
+##   always a None.
+##
+## ———————————————————————————————————————————————————————————————
+## THE SPSC QUEUE — shared state and the ordering surface (DECIDED)
+## ———————————————————————————————————————————————————————————————
+## SpscQueueN[T] is the shared state record; SpscQueueN::new() splits it
+## into the two UNIQUE endpoints (SpscTxN[T], SpscRxN[T]) — tx pushes
+## only, rx pops only. Unique endpoint ownership is enforced by the
+## registered Drop on both endpoints: the types are not trivially
+## copyable and expose no clone, so an endpoint can only be MOVED
+## (including across a thread boundary; see the UnsafeTransferable gate
+## impls below).
+##
+## The endpoints must be usable from two threads at once, so the state is
+## ONE shared heap record — a single allocation for the whole queue (the
+## queue data itself lives INLINE in the record's slot array; there is no
+## per-element allocation, no lock, no Arc per element, no Arc at all).
+## The split-endpoint ownership model makes one shared allocation
+## unavoidable: two independently-owned values cannot embed one inline
+## buffer. Lifetime is handled by the count-2 protocol (no clones are
+## possible, so the count is exactly 2 -> 1 -> 0): the endpoint that
+## observes the 2 -> 1 transition leaves the record alive for the other
+## endpoint; the endpoint that observes the 1 -> 0 transition runs the
+## record's typed drop glue (drop_in_place — every occupied slot
+## destructed exactly once by the structural glue) and frees the
+## allocation. A producer can never push into freed state: the record is
+## only freed by the LAST endpoint's own drop.
+##
+## The atomics use the KERNEL's atomic surface — the __sync builtin
+## family on plain UInt fields, exactly as std::alloc.tg's Rc/Arc
+## refcounts do (std::atomic is outside the self-hosted kernel closure,
+## so the __sync family is the kernel's one atomic layer). Every access
+## to a shared word is a __sync operation (no plain read or write of a
+## shared word anywhere):
+##   - publication (producer): slot write, THEN __sync_fetch_and_add on
+##     the head counter — the full-barrier RMW publishes the element;
+##   - publication (consumer): slot take, THEN __sync_fetch_and_add on
+##     the tail counter — the full-barrier RMW publishes the free slot;
+##   - the far-side reads (head by rx, tail by tx) are
+##     __sync_fetch_and_add(x, 0) loads.
+## The __sync ops are sequentially consistent (strictly stronger than
+## the Release/Acquire minimum the SPSC protocol needs) — the kernel's
+## __sync surface exposes no narrower ordering primitive, so the
+## publication boundaries carry the full-barrier form. The head and tail
+## counters are monotonic; the lead (head - tail) is the occupancy and
+## the slot index is (counter & (N - 1)) — every capacity here is a
+## power of two.
+##   - tx.push first reads the rx-alive word: once the receiver endpoint
+##     has been dropped the queue is closed and every push returns
+##     Result::Err(item) without touching the slots.  A push that passed
+##     the FIRST probe re-checks rx-alive immediately before publishing
+##     its head RMW: if the receiver dropped while the push was in
+##     flight, the written slot is reverted and the item returned as
+##     Err.  (The close flag and the publish RMW are not one atomic
+##     operation, so a push can still observe a cleared flag only AFTER
+##     its final probe but BEFORE its publish in a vanishingly small
+##     window; such an item is published into a closed queue, can never
+##     be observed, and is destroyed exactly once by the record glue at
+##     the last endpoint drop — memory-safe, and the residual
+##     Ok-after-close window is the documented price of the lock-free
+##     close.)
+##   - rx.pop reads the published head; when head == tail the queue is
+##     empty and pop returns None (pop NEVER blocks).
+## len() reads the far-side counter and is exact at the load instant
+## (the publication order makes a load either before or after the
+## far side's full-barrier publish).
+##
+## The endpoint Drop order is defined: rx.drop first clears rx-alive,
+## then decrements the count; tx.drop decrements the count. Whichever
+## endpoint drops last runs the record's drop_in_place and dealloc.
+
+# Module identity: std::fixed (the file-based module — same convention as
+# std/collections.tg: no `module` block; the file name is the module path).
+use std::core::{Option, Result, Unit, Bool, UInt, panic}
+use std::alloc::{alloc, dealloc}
+
+# [METADATA]
+# module: tg::fixed
+# status: alpha
+# effects: []
+# capabilities: []
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# ArrayVec — fixed-capacity vector (inline [Option[T]; N] storage)
+# ═══════════════════════════════════════════════════════════════════════
+# push consumes the item (Result::Err(item) on full — the rejected value
+# returns to the caller); pop transfers ownership; clear drains and drops
+# the occupied slots through pop; the drop glue over the inline Option
+# slots destructs exactly the occupied elements at end of life.
+
+## Fixed-capacity vector, 4 elements.
+struct ArrayVec4[T]
+  _data: [Option[T]; 4]
+  _len: UInt
+end
+
+impl[T] ArrayVec4[T]
+  def new() -> ArrayVec4[T]
+    ArrayVec4 {
+      _data: [
+        Option::None, Option::None, Option::None, Option::None
+      ],
+      _len: 0
+    }
+  end
+
+  def len(self: Self) -> UInt
+    self._len
+  end
+
+  def capacity(self: Self) -> UInt
+    4
+  end
+
+  def is_empty(self: Self) -> Bool
+    self._len == 0
+  end
+
+  def is_full(self: Self) -> Bool
+    self._len >= 4
+  end
+
+  # Ownership-taking push: consumes the item into slot [_len] (vacant by
+  # the len discipline). On a full vector the item was NOT consumed and is
+  # returned to the caller as Err(item).
+  def push(inout self: Self, sink item: T) -> Result[Unit, T]
+    if self.is_full() then
+      return Result::Err(item)
+    end
+    self._data[self._len] = Option::Some(item)
+    self._len = self._len + 1
+    Result::Ok(())
+  end
+
+  # Ownership-transferring pop: the last occupied slot's Option is taken
+  # (the slot resets to None) and the element moves out to the caller.
+  def pop(inout self: Self) -> Option[T]
+    if self._len == 0 then
+      return Option::None
+    end
+    self._len = self._len - 1
+    self._data[self._len].take()
+  end
+
+  # Drains every occupied slot through pop (each element destructed by
+  # its own drop as the returned Option is discarded — the VecDeque::clear
+  # convention in std::collections.tg).
+  def clear(inout self: Self) -> Unit
+    while self._len > 0 do
+      self.pop()
+    end
+  end
+end
+
+# By-value projected read of a Copy element (slot Option[T] is copied
+# only under T: Copy — sound duplication).
+impl[T: Copy] ArrayVec4[T]
+  def get(self: Self, index: UInt) -> Option[T]
+    if index >= self._len then
+      return Option::None
+    end
+    match self._data[index]
+    when Option::Some(v) then Option::Some(v)
+    when Option::None then Option::None
+    end
+  end
+end
+
+## Fixed-capacity vector, 8 elements.
+struct ArrayVec8[T]
+  _data: [Option[T]; 8]
+  _len: UInt
+end
+
+impl[T] ArrayVec8[T]
+  def new() -> ArrayVec8[T]
+    ArrayVec8 {
+      _data: [
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None
+      ],
+      _len: 0
+    }
+  end
+
+  def len(self: Self) -> UInt
+    self._len
+  end
+
+  def capacity(self: Self) -> UInt
+    8
+  end
+
+  def is_empty(self: Self) -> Bool
+    self._len == 0
+  end
+
+  def is_full(self: Self) -> Bool
+    self._len >= 8
+  end
+
+  def push(inout self: Self, sink item: T) -> Result[Unit, T]
+    if self.is_full() then
+      return Result::Err(item)
+    end
+    self._data[self._len] = Option::Some(item)
+    self._len = self._len + 1
+    Result::Ok(())
+  end
+
+  def pop(inout self: Self) -> Option[T]
+    if self._len == 0 then
+      return Option::None
+    end
+    self._len = self._len - 1
+    self._data[self._len].take()
+  end
+
+  def clear(inout self: Self) -> Unit
+    while self._len > 0 do
+      self.pop()
+    end
+  end
+end
+
+impl[T: Copy] ArrayVec8[T]
+  def get(self: Self, index: UInt) -> Option[T]
+    if index >= self._len then
+      return Option::None
+    end
+    match self._data[index]
+    when Option::Some(v) then Option::Some(v)
+    when Option::None then Option::None
+    end
+  end
+end
+
+## Fixed-capacity vector, 16 elements.
+struct ArrayVec16[T]
+  _data: [Option[T]; 16]
+  _len: UInt
+end
+
+impl[T] ArrayVec16[T]
+  def new() -> ArrayVec16[T]
+    ArrayVec16 {
+      _data: [
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None
+      ],
+      _len: 0
+    }
+  end
+
+  def len(self: Self) -> UInt
+    self._len
+  end
+
+  def capacity(self: Self) -> UInt
+    16
+  end
+
+  def is_empty(self: Self) -> Bool
+    self._len == 0
+  end
+
+  def is_full(self: Self) -> Bool
+    self._len >= 16
+  end
+
+  def push(inout self: Self, sink item: T) -> Result[Unit, T]
+    if self.is_full() then
+      return Result::Err(item)
+    end
+    self._data[self._len] = Option::Some(item)
+    self._len = self._len + 1
+    Result::Ok(())
+  end
+
+  def pop(inout self: Self) -> Option[T]
+    if self._len == 0 then
+      return Option::None
+    end
+    self._len = self._len - 1
+    self._data[self._len].take()
+  end
+
+  def clear(inout self: Self) -> Unit
+    while self._len > 0 do
+      self.pop()
+    end
+  end
+end
+
+impl[T: Copy] ArrayVec16[T]
+  def get(self: Self, index: UInt) -> Option[T]
+    if index >= self._len then
+      return Option::None
+    end
+    match self._data[index]
+    when Option::Some(v) then Option::Some(v)
+    when Option::None then Option::None
+    end
+  end
+end
+
+## Fixed-capacity vector, 32 elements.
+struct ArrayVec32[T]
+  _data: [Option[T]; 32]
+  _len: UInt
+end
+
+impl[T] ArrayVec32[T]
+  def new() -> ArrayVec32[T]
+    ArrayVec32 {
+      _data: [
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None
+      ],
+      _len: 0
+    }
+  end
+
+  def len(self: Self) -> UInt
+    self._len
+  end
+
+  def capacity(self: Self) -> UInt
+    32
+  end
+
+  def is_empty(self: Self) -> Bool
+    self._len == 0
+  end
+
+  def is_full(self: Self) -> Bool
+    self._len >= 32
+  end
+
+  def push(inout self: Self, sink item: T) -> Result[Unit, T]
+    if self.is_full() then
+      return Result::Err(item)
+    end
+    self._data[self._len] = Option::Some(item)
+    self._len = self._len + 1
+    Result::Ok(())
+  end
+
+  def pop(inout self: Self) -> Option[T]
+    if self._len == 0 then
+      return Option::None
+    end
+    self._len = self._len - 1
+    self._data[self._len].take()
+  end
+
+  def clear(inout self: Self) -> Unit
+    while self._len > 0 do
+      self.pop()
+    end
+  end
+end
+
+impl[T: Copy] ArrayVec32[T]
+  def get(self: Self, index: UInt) -> Option[T]
+    if index >= self._len then
+      return Option::None
+    end
+    match self._data[index]
+    when Option::Some(v) then Option::Some(v)
+    when Option::None then Option::None
+    end
+  end
+end
+
+## Fixed-capacity vector, 64 elements.
+struct ArrayVec64[T]
+  _data: [Option[T]; 64]
+  _len: UInt
+end
+
+impl[T] ArrayVec64[T]
+  def new() -> ArrayVec64[T]
+    ArrayVec64 {
+      _data: [
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None
+      ],
+      _len: 0
+    }
+  end
+
+  def len(self: Self) -> UInt
+    self._len
+  end
+
+  def capacity(self: Self) -> UInt
+    64
+  end
+
+  def is_empty(self: Self) -> Bool
+    self._len == 0
+  end
+
+  def is_full(self: Self) -> Bool
+    self._len >= 64
+  end
+
+  def push(inout self: Self, sink item: T) -> Result[Unit, T]
+    if self.is_full() then
+      return Result::Err(item)
+    end
+    self._data[self._len] = Option::Some(item)
+    self._len = self._len + 1
+    Result::Ok(())
+  end
+
+  def pop(inout self: Self) -> Option[T]
+    if self._len == 0 then
+      return Option::None
+    end
+    self._len = self._len - 1
+    self._data[self._len].take()
+  end
+
+  def clear(inout self: Self) -> Unit
+    while self._len > 0 do
+      self.pop()
+    end
+  end
+end
+
+impl[T: Copy] ArrayVec64[T]
+  def get(self: Self, index: UInt) -> Option[T]
+    if index >= self._len then
+      return Option::None
+    end
+    match self._data[index]
+    when Option::Some(v) then Option::Some(v)
+    when Option::None then Option::None
+    end
+  end
+end
+
+# ═══════════════════════════════════════════════════════════════════════
+# RingBuffer — fixed-capacity circular buffer
+# ═══════════════════════════════════════════════════════════════════════
+# Power-of-two capacities ONLY: the ring indexes through the mask fast
+# path ((i + 1) & (N - 1)) — no modulo division anywhere. push consumes
+# the item (Result::Err(item) when full); pop transfers ownership; peek
+# (T: Copy) copies the front element. The drop glue over the inline
+# Option slots destructs exactly the occupied elements at end of life.
+
+## Fixed-capacity ring, 4 elements (power of two).
+struct RingBuffer4[T]
+  _data: [Option[T]; 4]
+  _head: UInt  # next write position
+  _tail: UInt  # next read position
+  _count: UInt
+end
+
+impl[T] RingBuffer4[T]
+  def new() -> RingBuffer4[T]
+    RingBuffer4 {
+      _data: [
+        Option::None, Option::None, Option::None, Option::None
+      ],
+      _head: 0,
+      _tail: 0,
+      _count: 0
+    }
+  end
+
+  def len(self: Self) -> UInt
+    self._count
+  end
+
+  def capacity(self: Self) -> UInt
+    4
+  end
+
+  def is_empty(self: Self) -> Bool
+    self._count == 0
+  end
+
+  def is_full(self: Self) -> Bool
+    self._count == 4
+  end
+
+  # Ownership-taking push at the write position (vacant: the count
+  # discipline guarantees the write slot holds None). Full: the item is
+  # returned to the caller as Err(item).
+  def push(inout self: Self, sink item: T) -> Result[Unit, T]
+    if self.is_full() then
+      return Result::Err(item)
+    end
+    self._data[self._head] = Option::Some(item)
+    self._head = (self._head + 1) & 3
+    self._count = self._count + 1
+    Result::Ok(())
+  end
+
+  # Ownership-transferring pop from the read position (the slot resets to
+  # None). Empty: None.
+  def pop(inout self: Self) -> Option[T]
+    if self.is_empty() then
+      return Option::None
+    end
+    let item = self._data[self._tail].take()
+    self._tail = (self._tail + 1) & 3
+    self._count = self._count - 1
+    item
+  end
+
+  def clear(inout self: Self) -> Unit
+    while self._count > 0 do
+      self.pop()
+    end
+  end
+end
+
+# By-value projected read of the front element (Copy only — sound
+# duplication).
+impl[T: Copy] RingBuffer4[T]
+  def peek(self: Self) -> Option[T]
+    if self.is_empty() then
+      return Option::None
+    end
+    match self._data[self._tail]
+    when Option::Some(v) then Option::Some(v)
+    when Option::None then Option::None
+    end
+  end
+end
+
+## Fixed-capacity ring, 8 elements (power of two).
+struct RingBuffer8[T]
+  _data: [Option[T]; 8]
+  _head: UInt  # next write position
+  _tail: UInt  # next read position
+  _count: UInt
+end
+
+impl[T] RingBuffer8[T]
+  def new() -> RingBuffer8[T]
+    RingBuffer8 {
+      _data: [
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None
+      ],
+      _head: 0,
+      _tail: 0,
+      _count: 0
+    }
+  end
+
+  def len(self: Self) -> UInt
+    self._count
+  end
+
+  def capacity(self: Self) -> UInt
+    8
+  end
+
+  def is_empty(self: Self) -> Bool
+    self._count == 0
+  end
+
+  def is_full(self: Self) -> Bool
+    self._count == 8
+  end
+
+  def push(inout self: Self, sink item: T) -> Result[Unit, T]
+    if self.is_full() then
+      return Result::Err(item)
+    end
+    self._data[self._head] = Option::Some(item)
+    self._head = (self._head + 1) & 7
+    self._count = self._count + 1
+    Result::Ok(())
+  end
+
+  def pop(inout self: Self) -> Option[T]
+    if self.is_empty() then
+      return Option::None
+    end
+    let item = self._data[self._tail].take()
+    self._tail = (self._tail + 1) & 7
+    self._count = self._count - 1
+    item
+  end
+
+  def clear(inout self: Self) -> Unit
+    while self._count > 0 do
+      self.pop()
+    end
+  end
+end
+
+impl[T: Copy] RingBuffer8[T]
+  def peek(self: Self) -> Option[T]
+    if self.is_empty() then
+      return Option::None
+    end
+    match self._data[self._tail]
+    when Option::Some(v) then Option::Some(v)
+    when Option::None then Option::None
+    end
+  end
+end
+
+## Fixed-capacity ring, 16 elements (power of two).
+struct RingBuffer16[T]
+  _data: [Option[T]; 16]
+  _head: UInt  # next write position
+  _tail: UInt  # next read position
+  _count: UInt
+end
+
+impl[T] RingBuffer16[T]
+  def new() -> RingBuffer16[T]
+    RingBuffer16 {
+      _data: [
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None
+      ],
+      _head: 0,
+      _tail: 0,
+      _count: 0
+    }
+  end
+
+  def len(self: Self) -> UInt
+    self._count
+  end
+
+  def capacity(self: Self) -> UInt
+    16
+  end
+
+  def is_empty(self: Self) -> Bool
+    self._count == 0
+  end
+
+  def is_full(self: Self) -> Bool
+    self._count == 16
+  end
+
+  def push(inout self: Self, sink item: T) -> Result[Unit, T]
+    if self.is_full() then
+      return Result::Err(item)
+    end
+    self._data[self._head] = Option::Some(item)
+    self._head = (self._head + 1) & 15
+    self._count = self._count + 1
+    Result::Ok(())
+  end
+
+  def pop(inout self: Self) -> Option[T]
+    if self.is_empty() then
+      return Option::None
+    end
+    let item = self._data[self._tail].take()
+    self._tail = (self._tail + 1) & 15
+    self._count = self._count - 1
+    item
+  end
+
+  def clear(inout self: Self) -> Unit
+    while self._count > 0 do
+      self.pop()
+    end
+  end
+end
+
+impl[T: Copy] RingBuffer16[T]
+  def peek(self: Self) -> Option[T]
+    if self.is_empty() then
+      return Option::None
+    end
+    match self._data[self._tail]
+    when Option::Some(v) then Option::Some(v)
+    when Option::None then Option::None
+    end
+  end
+end
+
+## Fixed-capacity ring, 32 elements (power of two).
+struct RingBuffer32[T]
+  _data: [Option[T]; 32]
+  _head: UInt  # next write position
+  _tail: UInt  # next read position
+  _count: UInt
+end
+
+impl[T] RingBuffer32[T]
+  def new() -> RingBuffer32[T]
+    RingBuffer32 {
+      _data: [
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None
+      ],
+      _head: 0,
+      _tail: 0,
+      _count: 0
+    }
+  end
+
+  def len(self: Self) -> UInt
+    self._count
+  end
+
+  def capacity(self: Self) -> UInt
+    32
+  end
+
+  def is_empty(self: Self) -> Bool
+    self._count == 0
+  end
+
+  def is_full(self: Self) -> Bool
+    self._count == 32
+  end
+
+  def push(inout self: Self, sink item: T) -> Result[Unit, T]
+    if self.is_full() then
+      return Result::Err(item)
+    end
+    self._data[self._head] = Option::Some(item)
+    self._head = (self._head + 1) & 31
+    self._count = self._count + 1
+    Result::Ok(())
+  end
+
+  def pop(inout self: Self) -> Option[T]
+    if self.is_empty() then
+      return Option::None
+    end
+    let item = self._data[self._tail].take()
+    self._tail = (self._tail + 1) & 31
+    self._count = self._count - 1
+    item
+  end
+
+  def clear(inout self: Self) -> Unit
+    while self._count > 0 do
+      self.pop()
+    end
+  end
+end
+
+impl[T: Copy] RingBuffer32[T]
+  def peek(self: Self) -> Option[T]
+    if self.is_empty() then
+      return Option::None
+    end
+    match self._data[self._tail]
+    when Option::Some(v) then Option::Some(v)
+    when Option::None then Option::None
+    end
+  end
+end
+
+## Fixed-capacity ring, 64 elements (power of two).
+struct RingBuffer64[T]
+  _data: [Option[T]; 64]
+  _head: UInt  # next write position
+  _tail: UInt  # next read position
+  _count: UInt
+end
+
+impl[T] RingBuffer64[T]
+  def new() -> RingBuffer64[T]
+    RingBuffer64 {
+      _data: [
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None
+      ],
+      _head: 0,
+      _tail: 0,
+      _count: 0
+    }
+  end
+
+  def len(self: Self) -> UInt
+    self._count
+  end
+
+  def capacity(self: Self) -> UInt
+    64
+  end
+
+  def is_empty(self: Self) -> Bool
+    self._count == 0
+  end
+
+  def is_full(self: Self) -> Bool
+    self._count == 64
+  end
+
+  def push(inout self: Self, sink item: T) -> Result[Unit, T]
+    if self.is_full() then
+      return Result::Err(item)
+    end
+    self._data[self._head] = Option::Some(item)
+    self._head = (self._head + 1) & 63
+    self._count = self._count + 1
+    Result::Ok(())
+  end
+
+  def pop(inout self: Self) -> Option[T]
+    if self.is_empty() then
+      return Option::None
+    end
+    let item = self._data[self._tail].take()
+    self._tail = (self._tail + 1) & 63
+    self._count = self._count - 1
+    item
+  end
+
+  def clear(inout self: Self) -> Unit
+    while self._count > 0 do
+      self.pop()
+    end
+  end
+end
+
+impl[T: Copy] RingBuffer64[T]
+  def peek(self: Self) -> Option[T]
+    if self.is_empty() then
+      return Option::None
+    end
+    match self._data[self._tail]
+    when Option::Some(v) then Option::Some(v)
+    when Option::None then Option::None
+    end
+  end
+end
+
+# ═══════════════════════════════════════════════════════════════════════
+# SpscQueue — fixed-capacity lock-free SPSC queue (split endpoints)
+# ═══════════════════════════════════════════════════════════════════════
+# SpscQueueN[T] is the SHARED STATE record (head/tail publication
+# counters + the inline slot array), constructed ONLY by new(), which
+# returns the two unique endpoints: SpscTxN[T] (pushes only) and
+# SpscRxN[T] (pops only). See the module header for the full design
+# contract (state lifetime, __sync ordering surface, slot discipline).
+
+## Shared state + factory, 4 elements.
+struct SpscQueue4[T]
+  _head: UInt      # published producer counter (producer writes)
+  _tail: UInt      # published consumer counter (consumer writes)
+  _refs: UInt      # live endpoint count: 2 -> 1 -> 0 (drop protocol)
+  _rx_alive: UInt  # 1 while the receiver endpoint lives; 0 once dropped
+  _data: [Option[T]; 4]
+end
+
+struct SpscTx4[T]
+  _state: Ptr[SpscQueue4[T]]
+  _head: UInt  # producer-local counter shadow (never shared)
+end
+
+struct SpscRx4[T]
+  _state: Ptr[SpscQueue4[T]]
+  _tail: UInt  # consumer-local counter shadow (never shared)
+end
+
+impl[T] SpscQueue4[T]
+  # Creates the one shared state record and splits it into the unique
+  # producer and consumer endpoints.
+  def new() -> (SpscTx4[T], SpscRx4[T])
+    let st = alloc[SpscQueue4[T]]()
+    if st.is_null() then
+      panic("SpscQueue4::new: out of memory")
+    end
+    st.write(SpscQueue4[T] {
+      _head: 0,
+      _tail: 0,
+      _refs: 2,
+      _rx_alive: 1,
+      _data: [
+        Option::None, Option::None, Option::None, Option::None
+      ]
+    })
+    (SpscTx4[T] { _state: st, _head: 0 }, SpscRx4[T] { _state: st, _tail: 0 })
+  end
+end
+
+impl[T] SpscTx4[T]
+  def capacity(self: Self) -> UInt
+    4
+  end
+
+  # Ownership-taking publish. Rejected (Err(item), item NOT consumed)
+  # when the receiver endpoint has been dropped or the queue is full.
+  # Publication order: slot write, THEN the head counter's full-barrier
+  # RMW — the consumer's far-side head read observes the element.
+  def push(inout self: Self, sink item: T) -> Result[Unit, T]
+    let st = self._state.as_mut()
+    if __sync_fetch_and_add(&st._rx_alive, 0) == 0 then
+      return Result::Err(item)
+    end
+    let tail = __sync_fetch_and_add(&st._tail, 0)
+    if self._head - tail >= 4 then
+      return Result::Err(item)
+    end
+    st._data[(self._head & 3)] = Option::Some(item)
+    self._head = self._head + 1
+    if __sync_fetch_and_add(&st._rx_alive, 0) == 0 then
+      ## the receiver endpoint dropped while this push was in
+      ## flight: the slot was written but never published —
+      ## revert it and return the item unconsumed (a closed
+      ## queue accepts nothing).
+      match st._data[(self._head & 3)].take()
+      when Option::Some(v) then return Result::Err(v)
+      when Option::None then panic("Spsc push revert: slot unexpectedly empty")
+      end
+    end
+    __sync_fetch_and_add(&st._head, 1)
+    Result::Ok(())
+  end
+
+  # Occupancy as published: the producer's own head minus the consumer's
+  # published tail (exact at the load instant).
+  def len(self: Self) -> UInt
+    let st = self._state.as_mut()
+    let tail = __sync_fetch_and_add(&st._tail, 0)
+    self._head - tail
+  end
+end
+
+impl[T] Drop for SpscTx4[T]
+  def drop(inout self: SpscTx4[T]) -> Unit
+    if !self._state.is_null() then
+      let old = __sync_fetch_and_sub(&self._state.as_mut()._refs, 1)
+      if old == 1 then
+        # Last endpoint: destruct every occupied slot through the record's
+        # structural glue and release the allocation.
+        self._state.drop_in_place()
+        dealloc(self._state)
+      end
+      self._state = Ptr::null()
+    end
+  end
+end
+
+impl[T] UnsafeTransferable for SpscTx4[T]
+  # Opt-in gate (the raw-pointer thread-safety contract in std::core):
+  # the endpoint's pointer stays valid exactly as long as this endpoint
+  # value lives — the shared record is freed only by the LAST endpoint's
+  # drop, never while a tx or rx value that could push/pop is alive.
+end
+
+impl[T] SpscRx4[T]
+  def capacity(self: Self) -> UInt
+    4
+  end
+
+  # Ownership-transferring pop of the oldest published element. Empty
+  # (head == tail): None — pop never blocks. Consumption order: the slot
+  # take happens BEFORE the tail counter's full-barrier RMW — the
+  # producer's far-side tail read observes the freed slot.
+  def pop(inout self: Self) -> Option[T]
+    let st = self._state.as_mut()
+    let head = __sync_fetch_and_add(&st._head, 0)
+    if head == self._tail then
+      return Option::None
+    end
+    let item = st._data[(self._tail & 3)].take()
+    self._tail = self._tail + 1
+    __sync_fetch_and_add(&st._tail, 1)
+    item
+  end
+
+  # Occupancy as published: the producer's published head minus the
+  # consumer's own tail (exact at the load instant).
+  def len(self: Self) -> UInt
+    let st = self._state.as_mut()
+    let head = __sync_fetch_and_add(&st._head, 0)
+    head - self._tail
+  end
+end
+
+impl[T] Drop for SpscRx4[T]
+  def drop(inout self: SpscRx4[T]) -> Unit
+    if !self._state.is_null() then
+      # Close the receive side FIRST: every later push returns Err
+      # without touching the slots.
+      __sync_fetch_and_sub(&self._state.as_mut()._rx_alive, 1)
+      let old = __sync_fetch_and_sub(&self._state.as_mut()._refs, 1)
+      if old == 1 then
+        # Last endpoint: destruct every occupied slot through the record's
+        # structural glue and release the allocation.
+        self._state.drop_in_place()
+        dealloc(self._state)
+      end
+      self._state = Ptr::null()
+    end
+  end
+end
+
+impl[T] UnsafeTransferable for SpscRx4[T]
+  # Opt-in gate (the raw-pointer thread-safety contract in std::core):
+  # the endpoint's pointer stays valid exactly as long as this endpoint
+  # value lives — the shared record is freed only by the LAST endpoint's
+  # drop, never while a tx or rx value that could push/pop is alive.
+end
+
+## Shared state + factory, 8 elements.
+struct SpscQueue8[T]
+  _head: UInt      # published producer counter (producer writes)
+  _tail: UInt      # published consumer counter (consumer writes)
+  _refs: UInt      # live endpoint count: 2 -> 1 -> 0 (drop protocol)
+  _rx_alive: UInt  # 1 while the receiver endpoint lives; 0 once dropped
+  _data: [Option[T]; 8]
+end
+
+struct SpscTx8[T]
+  _state: Ptr[SpscQueue8[T]]
+  _head: UInt  # producer-local counter shadow (never shared)
+end
+
+struct SpscRx8[T]
+  _state: Ptr[SpscQueue8[T]]
+  _tail: UInt  # consumer-local counter shadow (never shared)
+end
+
+impl[T] SpscQueue8[T]
+  def new() -> (SpscTx8[T], SpscRx8[T])
+    let st = alloc[SpscQueue8[T]]()
+    if st.is_null() then
+      panic("SpscQueue8::new: out of memory")
+    end
+    st.write(SpscQueue8[T] {
+      _head: 0,
+      _tail: 0,
+      _refs: 2,
+      _rx_alive: 1,
+      _data: [
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None
+      ]
+    })
+    (SpscTx8[T] { _state: st, _head: 0 }, SpscRx8[T] { _state: st, _tail: 0 })
+  end
+end
+
+impl[T] SpscTx8[T]
+  def capacity(self: Self) -> UInt
+    8
+  end
+
+  def push(inout self: Self, sink item: T) -> Result[Unit, T]
+    let st = self._state.as_mut()
+    if __sync_fetch_and_add(&st._rx_alive, 0) == 0 then
+      return Result::Err(item)
+    end
+    let tail = __sync_fetch_and_add(&st._tail, 0)
+    if self._head - tail >= 8 then
+      return Result::Err(item)
+    end
+    st._data[(self._head & 7)] = Option::Some(item)
+    self._head = self._head + 1
+    if __sync_fetch_and_add(&st._rx_alive, 0) == 0 then
+      ## the receiver endpoint dropped while this push was in
+      ## flight: the slot was written but never published —
+      ## revert it and return the item unconsumed (a closed
+      ## queue accepts nothing).
+      match st._data[(self._head & 7)].take()
+      when Option::Some(v) then return Result::Err(v)
+      when Option::None then panic("Spsc push revert: slot unexpectedly empty")
+      end
+    end
+    __sync_fetch_and_add(&st._head, 1)
+    Result::Ok(())
+  end
+
+  def len(self: Self) -> UInt
+    let st = self._state.as_mut()
+    let tail = __sync_fetch_and_add(&st._tail, 0)
+    self._head - tail
+  end
+end
+
+impl[T] Drop for SpscTx8[T]
+  def drop(inout self: SpscTx8[T]) -> Unit
+    if !self._state.is_null() then
+      let old = __sync_fetch_and_sub(&self._state.as_mut()._refs, 1)
+      if old == 1 then
+        self._state.drop_in_place()
+        dealloc(self._state)
+      end
+      self._state = Ptr::null()
+    end
+  end
+end
+
+impl[T] UnsafeTransferable for SpscTx8[T]
+  # Opt-in gate (the raw-pointer thread-safety contract in std::core):
+  # the endpoint's pointer stays valid exactly as long as this endpoint
+  # value lives — the shared record is freed only by the LAST endpoint's
+  # drop, never while a tx or rx value that could push/pop is alive.
+end
+
+impl[T] SpscRx8[T]
+  def capacity(self: Self) -> UInt
+    8
+  end
+
+  def pop(inout self: Self) -> Option[T]
+    let st = self._state.as_mut()
+    let head = __sync_fetch_and_add(&st._head, 0)
+    if head == self._tail then
+      return Option::None
+    end
+    let item = st._data[(self._tail & 7)].take()
+    self._tail = self._tail + 1
+    __sync_fetch_and_add(&st._tail, 1)
+    item
+  end
+
+  def len(self: Self) -> UInt
+    let st = self._state.as_mut()
+    let head = __sync_fetch_and_add(&st._head, 0)
+    head - self._tail
+  end
+end
+
+impl[T] Drop for SpscRx8[T]
+  def drop(inout self: SpscRx8[T]) -> Unit
+    if !self._state.is_null() then
+      __sync_fetch_and_sub(&self._state.as_mut()._rx_alive, 1)
+      let old = __sync_fetch_and_sub(&self._state.as_mut()._refs, 1)
+      if old == 1 then
+        self._state.drop_in_place()
+        dealloc(self._state)
+      end
+      self._state = Ptr::null()
+    end
+  end
+end
+
+impl[T] UnsafeTransferable for SpscRx8[T]
+  # Opt-in gate (the raw-pointer thread-safety contract in std::core):
+  # the endpoint's pointer stays valid exactly as long as this endpoint
+  # value lives — the shared record is freed only by the LAST endpoint's
+  # drop, never while a tx or rx value that could push/pop is alive.
+end
+
+## Shared state + factory, 16 elements.
+struct SpscQueue16[T]
+  _head: UInt      # published producer counter (producer writes)
+  _tail: UInt      # published consumer counter (consumer writes)
+  _refs: UInt      # live endpoint count: 2 -> 1 -> 0 (drop protocol)
+  _rx_alive: UInt  # 1 while the receiver endpoint lives; 0 once dropped
+  _data: [Option[T]; 16]
+end
+
+struct SpscTx16[T]
+  _state: Ptr[SpscQueue16[T]]
+  _head: UInt  # producer-local counter shadow (never shared)
+end
+
+struct SpscRx16[T]
+  _state: Ptr[SpscQueue16[T]]
+  _tail: UInt  # consumer-local counter shadow (never shared)
+end
+
+impl[T] SpscQueue16[T]
+  def new() -> (SpscTx16[T], SpscRx16[T])
+    let st = alloc[SpscQueue16[T]]()
+    if st.is_null() then
+      panic("SpscQueue16::new: out of memory")
+    end
+    st.write(SpscQueue16[T] {
+      _head: 0,
+      _tail: 0,
+      _refs: 2,
+      _rx_alive: 1,
+      _data: [
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None
+      ]
+    })
+    (SpscTx16[T] { _state: st, _head: 0 }, SpscRx16[T] { _state: st, _tail: 0 })
+  end
+end
+
+impl[T] SpscTx16[T]
+  def capacity(self: Self) -> UInt
+    16
+  end
+
+  def push(inout self: Self, sink item: T) -> Result[Unit, T]
+    let st = self._state.as_mut()
+    if __sync_fetch_and_add(&st._rx_alive, 0) == 0 then
+      return Result::Err(item)
+    end
+    let tail = __sync_fetch_and_add(&st._tail, 0)
+    if self._head - tail >= 16 then
+      return Result::Err(item)
+    end
+    st._data[(self._head & 15)] = Option::Some(item)
+    self._head = self._head + 1
+    if __sync_fetch_and_add(&st._rx_alive, 0) == 0 then
+      ## the receiver endpoint dropped while this push was in
+      ## flight: the slot was written but never published —
+      ## revert it and return the item unconsumed (a closed
+      ## queue accepts nothing).
+      match st._data[(self._head & 15)].take()
+      when Option::Some(v) then return Result::Err(v)
+      when Option::None then panic("Spsc push revert: slot unexpectedly empty")
+      end
+    end
+    __sync_fetch_and_add(&st._head, 1)
+    Result::Ok(())
+  end
+
+  def len(self: Self) -> UInt
+    let st = self._state.as_mut()
+    let tail = __sync_fetch_and_add(&st._tail, 0)
+    self._head - tail
+  end
+end
+
+impl[T] Drop for SpscTx16[T]
+  def drop(inout self: SpscTx16[T]) -> Unit
+    if !self._state.is_null() then
+      let old = __sync_fetch_and_sub(&self._state.as_mut()._refs, 1)
+      if old == 1 then
+        self._state.drop_in_place()
+        dealloc(self._state)
+      end
+      self._state = Ptr::null()
+    end
+  end
+end
+
+impl[T] UnsafeTransferable for SpscTx16[T]
+  # Opt-in gate (the raw-pointer thread-safety contract in std::core):
+  # the endpoint's pointer stays valid exactly as long as this endpoint
+  # value lives — the shared record is freed only by the LAST endpoint's
+  # drop, never while a tx or rx value that could push/pop is alive.
+end
+
+impl[T] SpscRx16[T]
+  def capacity(self: Self) -> UInt
+    16
+  end
+
+  def pop(inout self: Self) -> Option[T]
+    let st = self._state.as_mut()
+    let head = __sync_fetch_and_add(&st._head, 0)
+    if head == self._tail then
+      return Option::None
+    end
+    let item = st._data[(self._tail & 15)].take()
+    self._tail = self._tail + 1
+    __sync_fetch_and_add(&st._tail, 1)
+    item
+  end
+
+  def len(self: Self) -> UInt
+    let st = self._state.as_mut()
+    let head = __sync_fetch_and_add(&st._head, 0)
+    head - self._tail
+  end
+end
+
+impl[T] Drop for SpscRx16[T]
+  def drop(inout self: SpscRx16[T]) -> Unit
+    if !self._state.is_null() then
+      __sync_fetch_and_sub(&self._state.as_mut()._rx_alive, 1)
+      let old = __sync_fetch_and_sub(&self._state.as_mut()._refs, 1)
+      if old == 1 then
+        self._state.drop_in_place()
+        dealloc(self._state)
+      end
+      self._state = Ptr::null()
+    end
+  end
+end
+
+impl[T] UnsafeTransferable for SpscRx16[T]
+  # Opt-in gate (the raw-pointer thread-safety contract in std::core):
+  # the endpoint's pointer stays valid exactly as long as this endpoint
+  # value lives — the shared record is freed only by the LAST endpoint's
+  # drop, never while a tx or rx value that could push/pop is alive.
+end
+
+## Shared state + factory, 32 elements.
+struct SpscQueue32[T]
+  _head: UInt      # published producer counter (producer writes)
+  _tail: UInt      # published consumer counter (consumer writes)
+  _refs: UInt      # live endpoint count: 2 -> 1 -> 0 (drop protocol)
+  _rx_alive: UInt  # 1 while the receiver endpoint lives; 0 once dropped
+  _data: [Option[T]; 32]
+end
+
+struct SpscTx32[T]
+  _state: Ptr[SpscQueue32[T]]
+  _head: UInt  # producer-local counter shadow (never shared)
+end
+
+struct SpscRx32[T]
+  _state: Ptr[SpscQueue32[T]]
+  _tail: UInt  # consumer-local counter shadow (never shared)
+end
+
+impl[T] SpscQueue32[T]
+  def new() -> (SpscTx32[T], SpscRx32[T])
+    let st = alloc[SpscQueue32[T]]()
+    if st.is_null() then
+      panic("SpscQueue32::new: out of memory")
+    end
+    st.write(SpscQueue32[T] {
+      _head: 0,
+      _tail: 0,
+      _refs: 2,
+      _rx_alive: 1,
+      _data: [
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None,
+        Option::None, Option::None, Option::None, Option::None
+      ]
+    })
+    (SpscTx32[T] { _state: st, _head: 0 }, SpscRx32[T] { _state: st, _tail: 0 })
+  end
+end
+
+impl[T] SpscTx32[T]
+  def capacity(self: Self) -> UInt
+    32
+  end
+
+  def push(inout self: Self, sink item: T) -> Result[Unit, T]
+    let st = self._state.as_mut()
+    if __sync_fetch_and_add(&st._rx_alive, 0) == 0 then
+      return Result::Err(item)
+    end
+    let tail = __sync_fetch_and_add(&st._tail, 0)
+    if self._head - tail >= 32 then
+      return Result::Err(item)
+    end
+    st._data[(self._head & 31)] = Option::Some(item)
+    self._head = self._head + 1
+    if __sync_fetch_and_add(&st._rx_alive, 0) == 0 then
+      ## the receiver endpoint dropped while this push was in
+      ## flight: the slot was written but never published —
+      ## revert it and return the item unconsumed (a closed
+      ## queue accepts nothing).
+      match st._data[(self._head & 31)].take()
+      when Option::Some(v) then return Result::Err(v)
+      when Option::None then panic("Spsc push revert: slot unexpectedly empty")
+      end
+    end
+    __sync_fetch_and_add(&st._head, 1)
+    Result::Ok(())
+  end
+
+  def len(self: Self) -> UInt
+    let st = self._state.as_mut()
+    let tail = __sync_fetch_and_add(&st._tail, 0)
+    self._head - tail
+  end
+end
+
+impl[T] Drop for SpscTx32[T]
+  def drop(inout self: SpscTx32[T]) -> Unit
+    if !self._state.is_null() then
+      let old = __sync_fetch_and_sub(&self._state.as_mut()._refs, 1)
+      if old == 1 then
+        self._state.drop_in_place()
+        dealloc(self._state)
+      end
+      self._state = Ptr::null()
+    end
+  end
+end
+
+impl[T] UnsafeTransferable for SpscTx32[T]
+  # Opt-in gate (the raw-pointer thread-safety contract in std::core):
+  # the endpoint's pointer stays valid exactly as long as this endpoint
+  # value lives — the shared record is freed only by the LAST endpoint's
+  # drop, never while a tx or rx value that could push/pop is alive.
+end
+
+impl[T] SpscRx32[T]
+  def capacity(self: Self) -> UInt
+    32
+  end
+
+  def pop(inout self: Self) -> Option[T]
+    let st = self._state.as_mut()
+    let head = __sync_fetch_and_add(&st._head, 0)
+    if head == self._tail then
+      return Option::None
+    end
+    let item = st._data[(self._tail & 31)].take()
+    self._tail = self._tail + 1
+    __sync_fetch_and_add(&st._tail, 1)
+    item
+  end
+
+  def len(self: Self) -> UInt
+    let st = self._state.as_mut()
+    let head = __sync_fetch_and_add(&st._head, 0)
+    head - self._tail
+  end
+end
+
+impl[T] Drop for SpscRx32[T]
+  def drop(inout self: SpscRx32[T]) -> Unit
+    if !self._state.is_null() then
+      __sync_fetch_and_sub(&self._state.as_mut()._rx_alive, 1)
+      let old = __sync_fetch_and_sub(&self._state.as_mut()._refs, 1)
+      if old == 1 then
+        self._state.drop_in_place()
+        dealloc(self._state)
+      end
+      self._state = Ptr::null()
+    end
+  end
+end
+
+impl[T] UnsafeTransferable for SpscRx32[T]
+  # Opt-in gate (the raw-pointer thread-safety contract in std::core):
+  # the endpoint's pointer stays valid exactly as long as this endpoint
+  # value lives — the shared record is freed only by the LAST endpoint's
+  # drop, never while a tx or rx value that could push/pop is alive.
+end
+
+# ═══════════════════════════════════════════════════════════════════════
+# Usage notes
+# ═══════════════════════════════════════════════════════════════════════
+#
+#   use std::fixed
+#
+#   # ArrayVec (capacity in the type name — see the module header for the
+#   # compile-time-capacity design decision):
+#   let mut v: ArrayVec8[String] = ArrayVec8::new()
+#   match v.push("a".to_string())
+#   when Result::Ok(_) then ()
+#   when Result::Err(item) then ()  # full: the item returns to the caller
+#   end
+#   match v.pop()
+#   when Option::Some(s) then ()
+#   when Option::None then ()
+#   end
+#
+#   # RingBuffer (power-of-two capacity — mask indexing):
+#   let mut rb: RingBuffer16[Int] = RingBuffer16::new()
+#
+#   # SPSC split endpoints (the shared state record lives until BOTH
+#   # endpoints drop; move the endpoints into the two threads):
+#   let (tx, rx): (SpscTx8[Task], SpscRx8[Task]) = SpscQueue8::new()
+#   # tx.push(task)   -> Result[Unit, Task]   (Err returns the item)
+#   # rx.pop()        -> Option[Task]

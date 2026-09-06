@@ -876,6 +876,257 @@ def abs(x: Int) -> Int
 end
 
 # ———————————————————————————————————————————————————————————————
+# Explicit integer overflow semantics (audit P1-5) — Int / UInt
+# ———————————————————————————————————————————————————————————————
+# The kernel integer surface (Int = the host signed 64-bit integer,
+# UInt = the host unsigned 64-bit integer) defines `+` `-` `*` as raw
+# two's-complement operations that wrap on overflow at every optimization
+# level. The P1-5 audit decision — signed `+`/`-`/`*` becoming
+# CHECKED/TRAPPING by default, with wrap/saturate/check spelled out
+# explicitly — is a language-wide semantic change (the checker's
+# primitive-method tables, the intrinsic lowering, and the codegen arms
+# across the compiler). THIS PASS implements only the explicit method
+# surface in the std, so programs can state the semantics they rely on:
+#
+#   wrapping_add / wrapping_sub / wrapping_mul        (two's-complement wrap)
+#   saturating_add / saturating_sub / saturating_mul  (clamp to the bounds)
+#   checked_add / checked_sub / checked_mul           (Option[Int]/Option[UInt]
+#                                                      — None on overflow; the
+#                                                      kernel's no-alloc Option
+#                                                      convention, see the
+#                                                      SmallErrorCode split)
+#
+# The default `+`/`-`/`*` lowering is UNCHANGED by this pass; the
+# trapping default is pending the full language change. The bodies are
+# written so they are correct under the CURRENT wrapping default AND
+# remain correct under a future trapping default:
+#
+#   - wrapping_* compute through the UNSIGNED 64-bit view (`self as u64`
+#     — the same-width bit reinterpretation the kernel's existing
+#     ptr/to_bits conversions use). Unsigned arithmetic is defined to
+#     wrap modulo 2^64, so the result never depends on the signed
+#     default; when the default-op decision lands, the compiler may route
+#     these names straight to the overflow-suppressed lowering.
+#   - checked_* detect overflow by SIGN arithmetic on the wrapped
+#     unsigned result: no operation in the test can itself trap
+#     (addition/subtraction only combine same-sign cases already shown
+#     safe; multiplication is bounded by a division of the magnitudes).
+#   - saturating_* clamp the checked_* result to the Int bounds, spelled
+#     as bit patterns (2^63 = MIN's bit pattern, 2^63 - 1 = MAX's) so no
+#     out-of-range integer literal is ever constructed.
+#
+# Literal handling is the kernel's usual Int-literal rule: an integer
+# literal is the inference-only IntLiteral type, coerced by unification
+# to the concrete integer type of its context — a literal ARGUMENT
+# (`a.wrapping_add(1)`) coerces to the parameter's Int/UInt exactly like
+# every existing kernel Int/UInt API, and literal receivers bind through
+# a typed context the same way the existing Int method surface does.
+
+impl Int
+  def wrapping_add(self: Self, other: Self) -> Self
+    ((self as u64) + (other as u64)) as Int
+  end
+
+  def wrapping_sub(self: Self, other: Self) -> Self
+    ((self as u64) - (other as u64)) as Int
+  end
+
+  def wrapping_mul(self: Self, other: Self) -> Self
+    ((self as u64) * (other as u64)) as Int
+  end
+
+  def checked_add(self: Self, other: Self) -> Option[Self]
+    let a = self as u64
+    let b = other as u64
+    let s = a + b
+    let a_neg = (a >> 63) == 1
+    let b_neg = (b >> 63) == 1
+    let s_neg = (s >> 63) == 1
+    # Signed overflow occurs exactly when both operands share a sign and
+    # the wrapped sum's sign differs from theirs.
+    if (a_neg && b_neg && !s_neg) || (!a_neg && !b_neg && s_neg) then
+      Option::None
+    else
+      Option::Some(s as Int)
+    end
+  end
+
+  def checked_sub(self: Self, other: Self) -> Option[Self]
+    let a = self as u64
+    let b = other as u64
+    let r = a - b
+    let a_neg = (a >> 63) == 1
+    let b_neg = (b >> 63) == 1
+    let r_neg = (r >> 63) == 1
+    # a - b overflows only when the operands' signs DIFFER and the wrapped
+    # difference's sign differs from the minuend's: a >= 0 with b < 0 can
+    # exceed MAX (the wrapped result turns negative); a < 0 with b >= 0
+    # can underflow MIN (the wrapped result turns positive). Same-sign
+    # operands can never overflow.
+    if (!a_neg && b_neg && r_neg) || (a_neg && !b_neg && !r_neg) then
+      Option::None
+    else
+      Option::Some(r as Int)
+    end
+  end
+
+  def checked_mul(self: Self, other: Self) -> Option[Self]
+    let a = self as u64
+    let b = other as u64
+    let a_neg = (a >> 63) == 1
+    let b_neg = (b >> 63) == 1
+    # The magnitudes in u64 (|MIN| = 2^63 is exactly representable).
+    let am = if a_neg then 0 - a else a end
+    let bm = if b_neg then 0 - b else b end
+    if bm == 0 then
+      Option::Some(0)
+    else
+      let p = am * bm
+      # The divide-back probe (the std/alloc.tg layout_array idiom): a
+      # wrapped u64 product divided back by a nonzero factor can never
+      # equal the other factor, so a mismatch means |product| >= 2^64 —
+      # out of the i64 range no matter the sign.
+      if p / bm != am then
+        Option::None
+      elsif a_neg == b_neg then
+        # Positive product: representable up to MAX = 2^63 - 1.
+        if p > ((1 as u64) << 63) - 1 then
+          Option::None
+        else
+          Option::Some(p as Int)
+        end
+      else
+        # Negative product: representable down to MIN = -2^63 (the bit
+        # pattern 2^63, i.e. p == 2^63, is exactly MIN).
+        if p > ((1 as u64) << 63) then
+          Option::None
+        else
+          Option::Some((0 - p) as Int)
+        end
+      end
+    end
+  end
+
+  def saturating_add(self: Self, other: Self) -> Self
+    match self.checked_add(other)
+    when Option::Some(v) then v
+    when Option::None then
+      # Overflow requires equal signs: negative operands underflow to
+      # MIN, positive operands overflow to MAX.
+      if ((self as u64) >> 63) == 1 then
+        ((1 as u64) << 63) as Int
+      else
+        (((1 as u64) << 63) - 1) as Int
+      end
+    end
+  end
+
+  def saturating_sub(self: Self, other: Self) -> Self
+    match self.checked_sub(other)
+    when Option::Some(v) then v
+    when Option::None then
+      # a - b overflows upward when a >= 0 and b < 0, downward when
+      # a < 0 and b >= 0 — the clamp follows self's sign.
+      if ((self as u64) >> 63) == 1 then
+        ((1 as u64) << 63) as Int
+      else
+        (((1 as u64) << 63) - 1) as Int
+      end
+    end
+  end
+
+  def saturating_mul(self: Self, other: Self) -> Self
+    match self.checked_mul(other)
+    when Option::Some(v) then v
+    when Option::None then
+      # The clamp follows the product's mathematical sign: same operand
+      # signs overflow positive (MAX), mixed signs overflow negative (MIN).
+      let a_neg = ((self as u64) >> 63) == 1
+      let b_neg = ((other as u64) >> 63) == 1
+      if a_neg == b_neg then
+        (((1 as u64) << 63) - 1) as Int
+      else
+        ((1 as u64) << 63) as Int
+      end
+    end
+  end
+end
+
+impl UInt
+  # UInt arithmetic is the unsigned 64-bit domain: wrap modulo 2^64 is
+  # its defining property, so the wrapping_* bodies are the plain
+  # operators (the audit's checked/trapping default targets SIGNED
+  # arithmetic; if a later decision extends trapping to unsigned, these
+  # names must route to the overflow-suppressed lowering instead).
+  def wrapping_add(self: Self, other: Self) -> Self
+    self + other
+  end
+
+  def wrapping_sub(self: Self, other: Self) -> Self
+    self - other
+  end
+
+  def wrapping_mul(self: Self, other: Self) -> Self
+    self * other
+  end
+
+  def checked_add(self: Self, other: Self) -> Option[Self]
+    let r = self + other
+    # Unsigned overflow: the wrapped sum is smaller than an operand.
+    if r < self then
+      Option::None
+    else
+      Option::Some(r)
+    end
+  end
+
+  def checked_sub(self: Self, other: Self) -> Option[Self]
+    if self < other then
+      Option::None
+    else
+      Option::Some(self - other)
+    end
+  end
+
+  def checked_mul(self: Self, other: Self) -> Option[Self]
+    # The divide-back overflow probe (the std/alloc.tg layout_array
+    # idiom): the wrapped product divided back by a nonzero factor can
+    # never equal the other factor.
+    if other == 0 then
+      Option::Some(0)
+    else
+      let r = self * other
+      if r / other != self then
+        Option::None
+      else
+        Option::Some(r)
+      end
+    end
+  end
+
+  def saturating_add(self: Self, other: Self) -> Self
+    match self.checked_add(other)
+    when Option::Some(v) then v
+    when Option::None then (0 as UInt) - 1
+    end
+  end
+
+  def saturating_sub(self: Self, other: Self) -> Self
+    match self.checked_sub(other)
+    when Option::Some(v) then v
+    when Option::None then 0 as UInt
+    end
+  end
+
+  def saturating_mul(self: Self, other: Self) -> Self
+    match self.checked_mul(other)
+    when Option::Some(v) then v
+    when Option::None then (0 as UInt) - 1
+    end
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
 # Option[T] methods
 # ———————————————————————————————————————————————————————————————
 
@@ -1193,6 +1444,156 @@ end
 impl Display for ErrorKind
   def fmt(self: Self) -> String
     self.code() + ": " + self.description()
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# SmallErrorCode + ErrorDetails — the allocation-free error payload
+# and the separable diagnostics (audit P1-22)
+# ———————————————————————————————————————————————————————————————
+# Result[T, E] allocates exactly when E is a String-bearing type: the Err
+# arm constructs the payload, and a String payload (or an error enum with
+# String fields) therefore allocates on EVERY failure path. Kernel hot
+# paths (parsers, codecs, protocol loops, arithmetic boundaries) fail
+# with the SMALL payload instead:
+#
+#   Result[T, SmallErrorCode]
+#
+# SmallErrorCode is a zero-payload variant enum: bit-copyable (Copy by
+# the compiler's trivially-copyable structural property — no explicit
+# marker impl is written, per the kernel model), no String field, no drop
+# glue, no heap traffic. Constructing Result::Err(SmallErrorCode::X)
+# stores one tag — the failure path of a Result carrying the small code
+# constructs no String and allocates nothing.
+#
+# Diagnostics stay SEPARABLE: the human-readable ErrorDetails
+# { code, message } is assembled only at the COLD boundary (the
+# reporting/observability site) through into_details / attach_details —
+# the String allocation happens THERE, never in the code that returned
+# the code. The variant categories mirror the ErrorKind E-code set, with
+# the addition of Overflow for the arithmetic surfaces (audit P1-5); the
+# numeric code() values are stable and append-only (they may cross
+# process/ABI boundaries).
+
+enum SmallErrorCode
+  NotFound
+  PermissionDenied
+  InvalidInput
+  InvalidData
+  TimedOut
+  ConnectionRefused
+  ConnectionReset
+  AlreadyExists
+  WouldBlock
+  Interrupted
+  OutOfMemory
+  Unsupported
+  Overflow
+  Other
+end
+
+impl SmallErrorCode
+  # The stable numeric code. NOTE: this is the plain-Int, no-allocation
+  # spelling — distinct from ErrorKind::code, which renders the E-code
+  # String for diagnostics.
+  def code(self: Self) -> Int
+    match self
+    when SmallErrorCode::NotFound then 1
+    when SmallErrorCode::PermissionDenied then 2
+    when SmallErrorCode::InvalidInput then 3
+    when SmallErrorCode::InvalidData then 4
+    when SmallErrorCode::TimedOut then 5
+    when SmallErrorCode::ConnectionRefused then 6
+    when SmallErrorCode::ConnectionReset then 7
+    when SmallErrorCode::AlreadyExists then 8
+    when SmallErrorCode::WouldBlock then 9
+    when SmallErrorCode::Interrupted then 10
+    when SmallErrorCode::OutOfMemory then 11
+    when SmallErrorCode::Unsupported then 12
+    when SmallErrorCode::Overflow then 13
+    when SmallErrorCode::Other then 14
+    end
+  end
+
+  # The cold-boundary lift: build the diagnostic details (with the
+  # human-readable message) from the small code. The message String is
+  # supplied — and allocated — by the reporting site.
+  def into_details(self: Self, sink message: String) -> ErrorDetails
+    ErrorDetails { code: self, message: message }
+  end
+end
+
+impl Eq for SmallErrorCode
+  def eq(self: Self, other: Self) -> Bool
+    self.code() == other.code()
+  end
+end
+
+impl Display for SmallErrorCode
+  def fmt(self: Self) -> String
+    match self
+    when SmallErrorCode::NotFound then "NotFound"
+    when SmallErrorCode::PermissionDenied then "PermissionDenied"
+    when SmallErrorCode::InvalidInput then "InvalidInput"
+    when SmallErrorCode::InvalidData then "InvalidData"
+    when SmallErrorCode::TimedOut then "TimedOut"
+    when SmallErrorCode::ConnectionRefused then "ConnectionRefused"
+    when SmallErrorCode::ConnectionReset then "ConnectionReset"
+    when SmallErrorCode::AlreadyExists then "AlreadyExists"
+    when SmallErrorCode::WouldBlock then "WouldBlock"
+    when SmallErrorCode::Interrupted then "Interrupted"
+    when SmallErrorCode::OutOfMemory then "OutOfMemory"
+    when SmallErrorCode::Unsupported then "Unsupported"
+    when SmallErrorCode::Overflow then "Overflow"
+    when SmallErrorCode::Other then "Other"
+    end
+  end
+end
+
+# The cold-boundary diagnostic: the small code plus the message the
+# reporting site attaches. Construction allocates the message ONLY — it
+# is the boundary where hot-path codes become reportable errors.
+struct ErrorDetails
+  code: SmallErrorCode
+  message: String
+end
+
+impl ErrorDetails
+  def new(code: SmallErrorCode, sink message: String) -> ErrorDetails
+    ErrorDetails { code: code, message: message }
+  end
+end
+
+impl Error for ErrorDetails
+  def message(self: Self) -> String
+    self.message.clone()
+  end
+end
+
+impl Display for ErrorDetails
+  def fmt(self: Self) -> String
+    self.message.clone()
+  end
+end
+
+impl Clone for ErrorDetails
+  def clone(self: Self) -> ErrorDetails
+    ErrorDetails {
+      code: self.code,
+      message: self.message.clone()
+    }
+  end
+end
+
+# Lift a small-code Result to the diagnostic boundary: on Err the code is
+# paired with the message into ErrorDetails (the message is consumed and
+# reported only there — the Ok path never touches it). This is the
+# cold-boundary twin of Result::context for the no-alloc payload.
+def attach_details[T](sink r: Result[T, SmallErrorCode], sink message: String) -> Result[T, ErrorDetails]
+  match r
+  when Result::Ok(v) then Result::Ok(v)
+  when Result::Err(code) then
+    Result::Err(ErrorDetails { code: code, message: message })
   end
 end
 

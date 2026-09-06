@@ -157,21 +157,47 @@ let diverge_flow ~(may_return : bool) ~(may_break : bool) ~(may_continue : bool)
    resolved type; casts additionally persist the checker-RESOLVED target
    type (a Named(GenericParamId, ...) carrying the declaration-owned
    ids — never a positional reconstruction); calls additionally persist
-   the checker-RESOLVED callee identity and the SOLVED concrete
-   substitution (the typed_call's substitution array — substitute_fixpoint
-   over the declaration params, so concrete types land).  The map is
-   populated during check_expr (additive) and exposed to lowering
-   through the driver's typed_nodes_of, where the typed channel is
-   authoritative when a span-keyed entry is present. *)
+   the checker-RESOLVED callee CLASS (audit P0-5) — the semantic class
+   decided HERE at check time from the resolution context and the
+   host registries, so names are dead as semantic identifiers by
+   lowering — with the call's instance type args (the SOLVED concrete
+   substitution — substitute_fixpoint over the declaration params, so
+   concrete types land; [||] and None are distinct: an empty array is a
+   solved zero-arg substitution, None = no call).  The map is populated
+   during check_expr (additive) and exposed to lowering through the
+   driver's typed_nodes_of, where the typed channel is authoritative
+   when a span-keyed entry is present. *)
+type typed_callee =
+  | TC_user of Ids.Callable_id.t * Type_repr.t array
+  | TC_intrinsic of int * Type_repr.t array
+  | TC_extern of int * Type_repr.t array
+  | TC_derived of Ids.Callable_id.t * Type_repr.t array
+  | TC_type_query of Seed_mir.type_query_kind * Type_repr.t array
+
 type typed_node = {
   tn_type : Type_repr.t;               (* the expr's resolved type *)
   tn_cast_target : Type_repr.t option; (* Ast.Cast: checker-resolved target *)
-  tn_call : (Ids.Callable_id.t * Type_repr.t array) option;
-  (* Ast.Call: the callee's CallableId + the solved concrete
-     substitution in declaration order (the exact-arity pairing the
-     lowering Call rule consumes; [||] and None are distinct: an
-     empty array is a solved zero-arg substitution, None = no call) *)
+  tn_call : typed_callee option;
+  (* Ast.Call: the checker-resolved callee CLASS + its instance type
+     args (the exact-arity pairing the lowering Call rule consumes).
+     A body-carrying callee (TC_user/TC_derived) resolves to a lowered
+     function; TC_intrinsic/TC_extern name the registry binding;
+     TC_type_query names the compile-time type-query form — no class
+     may reach the mono'd program as a body-less User callee *)
 }
+
+(* The emitted-body callable identity of a classed callee record — the
+   TC_user/TC_derived projection (derived contracts carry the SAME
+   callable identity their synthesized bodies lower under).  None for
+   the host/type-query classes and for a record-less node (no lowered
+   function exists for those callee classes). *)
+let tc_callee_instance (c : typed_callee option) :
+    (Ids.Callable_id.t * Type_repr.t array) option =
+  match c with
+  | Some (TC_user (callable, args)) | Some (TC_derived (callable, args)) ->
+      Some (callable, args)
+  | Some (TC_intrinsic _) | Some (TC_extern _) | Some (TC_type_query _) -> None
+  | None -> None
 
 type typed_call = {
   target : Ids.Callable_id.t option;
@@ -218,6 +244,25 @@ type state = {
   mutable next_param_id : int;
   mutable next_var_id : int;
   mutable failed_items : string list;
+  (* declaration-identity discipline (audit P0-6): registration key ->
+     the fn-decl span key (file_id, decl start) of the CANONICAL
+     declaration that first registered it.  Keys: free fn
+     "fn::<qname>", test "test::<qname>", method "method::<owner>::<m>".
+     A later AST site that registers the same key from a DIFFERENT
+     declaration is a duplicate definition of the canonical one: its
+     body is never type-checked (check_function_item / check_methods /
+     the trait-default body walk) and the driver's lower_closure never
+     lowers it, so the typed universe and the lowered program contain
+     exactly the canonical declarations — two genuinely distinct
+     declarations can never share one callable identity.  The same
+     canonical declaration re-registering across the driver's fixpoint
+     rounds compares equal by its own span key and refreshes in place. *)
+  mutable decl_keys : (string, (int * int)) Hashtbl.t;
+  (* the duplicate declarations rejected by the discipline above —
+     (registration key, canonical decl key, duplicate decl key) — for
+     the driver's provenance audit.  Deduped, so fixpoint re-rounds
+     never accumulate *)
+  mutable dup_decls : (string * (int * int) * (int * int)) list;
   mutable o_handoff_resolved : int;
   (* the const-function registry: zero-arg functions whose body is a
      literal (`def DT_DIR() -> u8 = 4`) — their constant value backs the
@@ -291,7 +336,39 @@ and structured_diag = {
   sd_span : Span.span option;
 }
 
+(* The immutable inference-finalization snapshot (audit P0-8).  Built ONCE
+   by finalize_inference at the successful end of type checking (after the
+   driver's declaration fixpoint and every item-body check — a var may
+   resolve later in the same item, so finalization at the very end covers
+   it), when every accepted typed channel is rewritten in place and the
+   mutable journal is cleared.  Downstream consumers (MIR lowering, the
+   typed-node/pattern bridges, the query-sig registry, the debug oracle)
+   read the ALREADY-FINAL channel contents and never chase a mutable
+   historical journal again; fs_solutions is the chased final map they
+   would have chased with (kept for provenance/audit — never written
+   after finalize). *)
+type final_substitution = {
+  fs_solutions : (int, Type_repr.t) Hashtbl.t;  (* Infer_var id -> fully-chased final type *)
+  fs_var_count : int;  (* distinct journaled Infer_var solutions chased *)
+}
+
 type env = {
+  (* ── audit P1-23: SOURCE-NAME registration keys ────────────────
+     The registries below (types, functions, methods, nominals,
+     constructors, consts, statics, type_ids/type_names) are keyed by
+     source-level qualified names — the language's name-resolution
+     domain: `f(...)` calls, `x.m(...)` method dispatch and
+     `Type::V(...)` constructors are spelled and resolved under these
+     names, and state.decl_keys pins each name key to exactly one
+     canonical declaration, so a name key identifies one declaration.
+     They are NOT semantic identities: the semantic identity is minted
+     at registration and carried INSIDE the entry (typed_signature
+     .ts_callable, the nominal's TypeId/FieldId/VariantId lists), and
+     every downstream consumer (mono, mir_verify, lowering, the
+     driver's oracle tables) keys on those structural ids — never on a
+     rendered identity string.  A CallableId-keyed method table would
+     only be reachable AFTER name resolution, so the name key is the
+     registration/lookup domain, not a substitute for it. *)
   types : (string * Type_repr.t) list;
   functions : (string * typed_signature) list;
   methods : ((string * string) * typed_signature) list;
@@ -334,6 +411,13 @@ type env = {
      instead of re-interpreting the raw syntax) — keyed by the
      VALUE expression's NodeId *)
   typed_let_patterns : (Ids.Node_id.t, Typed_pattern.t) Hashtbl.t;
+  (* the inference-finalization snapshot (audit P0-8): None until
+     finalize_inference runs at the successful end of type checking,
+     then the immutable chased solution map — every accepted typed
+     channel above has been rewritten in place with it and the mutable
+     journal is cleared, so downstream consumers never chase the
+     historical journal again *)
+  final_subst : final_substitution option;
 }
 
 type scope = {
@@ -466,11 +550,14 @@ let journal_bind_var (v : int) (t : Type_repr.t) : unit =
    bindings; the cap bounds pathological rebind chains. *)
 let realign_depth : int ref = ref 0
 
-(* The final journal — the driver's typed-channel readers substitute the
-   pattern trees through it (re-audit P12: the bind types are resolved
-   LAZILY at read time because the vars bind during later statements of
-   the same item). *)
-let final_journal () : (Type_repr.generic_key * Type_repr.t) list = !var_journal
+(* audit P0-8: the journal is INTERNAL to type checking.  Its lifetime
+   ends at finalize_inference, which runs once at the successful end of
+   type checking: it snapshots the newest binding per var into the
+   immutable env.final_subst, rewrites every accepted typed channel in
+   place with the chased final types, and CLEARS the mutable journal —
+   no post-typing consumer ever reads a historical journal again (there
+   is deliberately no exported reader left; the old final_journal
+   accessor the driver's read-time chase used is gone with the chase). *)
 
 let fresh_callable_id (st : state) : Ids.Callable_id.t =
   let id = st.next_callable_id in
@@ -544,6 +631,209 @@ let primitive_name (t : Type_repr.t) : string option =
   | Type_repr.Unit -> Some "Unit"
   | Type_repr.Never -> Some "Never"
   | _ -> None
+
+(* ─── callee-class authority (audit P0-5) ──────────────────────────
+   The classification of a RESOLVED callee at check-record time.  The
+   decision uses the same resolution the deleted post-mono host-channel
+   rewrite performed (the registered-name tables, the intrinsic registry,
+   the extern registry, the derived/query registries) — but here, so the
+   class flows from the typed record through lowering to mono and names
+   are dead as semantic identifiers by lowering:
+   - a query-sig resolution (size_of/align_of) is a TypeQuery;
+   - a method resolution whose (owner, method) resolves to a registry
+     intrinsic binding (under the owner-alias convention, with the
+     registry-exact signature gate) is an Intrinsic;
+   - a free-function/constructor resolution whose registered name
+     resolves in the intrinsic/extern registries (same gate) is an
+     Intrinsic/Extern;
+   - a derived-mint resolution (clone/to_string/eq/scalar-hash on a
+     receiver with no registered impl) is a Derived;
+   - everything else is a User (a real lowered body must exist — the
+     driver's assert_no_bodyless_user_calls ICEs on a body-less User). *)
+
+(* How check_call_sig's caller resolved the signature — the only context
+   the bare signature does not carry (a static-method resolution must be
+   classified against the method's OWNER aliases, never as a free
+   function). *)
+type call_class_hint =
+  | CCH_query
+  | CCH_function
+  | CCH_static_method of string * string (* owner, method *)
+  | CCH_constructor
+
+let bare_reg_name (name : string) : string =
+  (* registered function keys are module-qualified ("std::args::fn");
+     the registry keys are the bare source names ("fn") *)
+  match String.rindex_opt name ':' with
+  | Some i when i > 0 && name.[i - 1] = ':' && i + 1 < String.length name ->
+      String.sub name (i + 1) (String.length name - i - 1)
+  | _ -> name
+
+(* the builtin owner-alias convention — the same candidate list the
+   method dispatch and the registry lookups use (Vec<->Array,
+   String<->str, Set<->HashSet, Map<->HashMap) *)
+let callee_owner_aliases (owner : string) : string list =
+  match owner with
+  | "Vec" -> [ "Vec"; "Array" ]
+  | "Array" -> [ "Array"; "Vec" ]
+  | "String" -> [ "String"; "str" ]
+  | "str" -> [ "str"; "String" ]
+  | "Set" -> [ "Set"; "HashSet" ]
+  | "HashSet" -> [ "HashSet"; "Set" ]
+  | "Map" -> [ "Map"; "HashMap" ]
+  | "HashMap" -> [ "HashMap"; "Map" ]
+  | q -> [ q ]
+
+(* the registry-exact transcription gate (the post-mono rewrite's
+   exact-transcription guard, reproduced at check time): the registry
+   declaration must equal the checker's registered declaration by arity,
+   per-parameter conventions and the SHARED signature-identity matcher
+   (Signature_identity — the ONE matcher of the typed->host boundary),
+   with the strict comparison for pointer/ref-bearing signatures.  A
+   drifted declaration never becomes a host call (fail closed). *)
+let rec registry_ty_has_ref_kind (t : Type_repr.t) : bool =
+  match t with
+  | Type_repr.Ref_internal _ | Type_repr.Raw_ptr _ -> true
+  | Type_repr.Named (_, args) -> Array.exists registry_ty_has_ref_kind args
+  | Type_repr.Fixed_array (e, _) -> registry_ty_has_ref_kind e
+  | Type_repr.Tuple elems -> Array.exists registry_ty_has_ref_kind elems
+  | Type_repr.Function (p, r) ->
+      Array.exists
+        (fun (p : Type_repr.param_type) -> registry_ty_has_ref_kind p.Type_repr.pt_type)
+        p
+      || registry_ty_has_ref_kind r
+  | _ -> false
+
+let registry_decl_exact ~(argc : int) (checker : typed_signature)
+    (params : Type_repr.param_type array) (ret : Type_repr.t) : bool =
+  Array.length params = argc
+  && Array.length params = Array.length checker.ts_params
+  &&
+  Signature_identity.signatures_match
+    ~canon_left:Signature_identity.canonicalize_registry_placeholder
+    ~strict_when:(fun a b -> registry_ty_has_ref_kind a || registry_ty_has_ref_kind b)
+    { Signature_identity.sig_params = params; sig_ret = ret }
+    {
+      Signature_identity.sig_params = checker.ts_params;
+      sig_ret = checker.ts_return;
+    }
+
+(* the intrinsic-registry binding of a method under the owner-alias
+   convention — "__intrinsic_<owner>_<method>", aliases in order — gated
+   on the exact transcription of the registry declaration against the
+   checker's signature.  None when no alias binding exists or the
+   declaration drifted (fail closed). *)
+let method_intrinsic_of ~(owner : string) (mname : string) (checker : typed_signature)
+    ~(argc : int) : int option =
+  let rec find = function
+    | [] -> None
+    | o :: rest -> (
+        let iname = "__intrinsic_" ^ String.lowercase_ascii (o ^ "_" ^ mname) in
+        match Intrinsic_registry.lookup Intrinsic_registry.manifest ~name:iname with
+        | Some (iid, isig) ->
+            if
+              registry_decl_exact ~argc checker isig.Intrinsic_registry.params
+                isig.Intrinsic_registry.ret
+            then Some (Intrinsic_registry.Id.to_int iid)
+            else None
+        | None -> find rest)
+  in
+  find (callee_owner_aliases owner)
+
+(* the host binding of a free-function/constructor registered name — the
+   intrinsic registry first, then the extern registry — under the same
+   exact-transcription gate. *)
+let host_binding_of_name (name : string) (checker : typed_signature) ~(argc : int) :
+    [ `Intrinsic of int | `Extern of int | `None ] =
+  match Intrinsic_registry.lookup Intrinsic_registry.manifest ~name with
+  | Some (iid, isig) ->
+      if registry_decl_exact ~argc checker isig.Intrinsic_registry.params isig.Intrinsic_registry.ret
+      then `Intrinsic (Intrinsic_registry.Id.to_int iid)
+      else `None
+  | None -> (
+      match Extern_registry.lookup Extern_registry.manifest ~name with
+      | Some (eid, esig) ->
+          if registry_decl_exact ~argc checker esig.Intrinsic_registry.params esig.Intrinsic_registry.ret
+          then `Extern (Extern_registry.Id.to_int eid)
+          else `None
+      | None -> `None)
+
+(* ── The classifier: the resolution context of ONE checked call -> the
+   semantic callee class carried by the typed record.  `argc` is the
+   number of call arguments (the receiver included for method forms) and
+   `type_args` the solved instance substitution in declaration order.
+   The derived-mint resolution (check_method_call with NO registered
+   method — resolved_owner = None) always classifies Derived: the minted
+   signatures are recorded in state.derived_sigs the moment they fire and
+   every one of them synthesizes a real body (P0-12), so no membership
+   scan is needed at the call sites. *)
+let type_query_kind_of_name (n : string) : Seed_mir.type_query_kind option =
+  match n with
+  | "size_of" -> Some Seed_mir.SizeOf
+  | "align_of" -> Some Seed_mir.AlignOf
+  | _ -> None
+
+let classify_callee ~(hint : call_class_hint) (sig_ : typed_signature)
+    ~(argc : int) ~(type_args : Type_repr.t array) : typed_callee =
+  let callable = sig_.ts_callable in
+  match hint with
+  | CCH_query -> (
+      match type_query_kind_of_name sig_.ts_name with
+      | Some k -> TC_type_query (k, type_args)
+      | None ->
+          failwith
+            (Printf.sprintf
+               "internal: the type-query special form resolved the unrecognized query signature `%s`"
+               sig_.ts_name))
+  | CCH_constructor ->
+      (* enum-variant ctors lower to EnumCtor aggregates, never to a
+         User callee — the class is inert bookkeeping for the oracle *)
+      TC_user (callable, type_args)
+  | CCH_static_method (owner, mname) ->
+      (match method_intrinsic_of ~owner mname sig_ ~argc with
+       | Some i -> TC_intrinsic (i, type_args)
+       | None -> TC_user (callable, type_args))
+  | CCH_function ->
+      let bare = bare_reg_name sig_.ts_name in
+      (* the mangled-host convention (audit §70): a compiler builtin
+         registered under the MANGLED free-function name (`Set::new` ->
+         `set_new`, `Map::new` -> `map_new`) binds the host intrinsic
+         declared under "__intrinsic_" ^ mangled.  The removed
+         post-mono host-channel rewrite performed this dispatch at
+         lowering; the check-time classifier must reproduce it (names
+         are dead as semantic identifiers by lowering), otherwise these
+         body-less host callables classify User and every call to them
+         references a function instance that is never lowered. *)
+      let names =
+        let base = if bare = sig_.ts_name then [ bare ] else [ bare; sig_.ts_name ] in
+        if String.starts_with ~prefix:"__intrinsic_" bare then base
+        else base @ [ "__intrinsic_" ^ bare ]
+      in
+      let rec via_host = function
+        | [] -> TC_user (callable, type_args)
+        | n :: rest -> (
+            match host_binding_of_name n sig_ ~argc with
+            | `Intrinsic i -> TC_intrinsic (i, type_args)
+            | `Extern i -> TC_extern (i, type_args)
+            | `None -> via_host rest)
+      in
+      via_host names
+
+(* The receiver-method classifier: the resolved owner is known from the
+   method dispatch (check_method_call's try_owners).  A Some owner names
+   the registered method's (owner, method) resolution (classified
+   against the intrinsic registry); a None owner means the resolution
+   MINTED a derived contract (clone/to_string/eq/scalar-hash on a
+   receiver with no registered impl) — the minted signature is a Derived
+   (its real body is synthesized under the SAME callable identity). *)
+let classify_method_callee ~(owner : string option) (mname : string)
+    (sig_ : typed_signature) ~(argc : int) ~(type_args : Type_repr.t array) : typed_callee =
+  match owner with
+  | Some o -> (
+      match method_intrinsic_of ~owner:o mname sig_ ~argc with
+      | Some i -> TC_intrinsic (i, type_args)
+      | None -> TC_user (sig_.ts_callable, type_args))
+  | None -> TC_derived (sig_.ts_callable, type_args)
 
 (* ─── signature construction helper ─── *)
 let mk_sig (st : state) ~(name : string) ~(params_decl : (string * Ids.Generic_param_id.t) list)
@@ -865,8 +1155,14 @@ let builtin_methods (st : state) (vec_p : Ids.Generic_param_id.t) (opt_p : Ids.G
       ("len", [], i_ty, [], let_);
       ("is_empty", [], b_ty, [], let_);
       ("push", [ par "value" sink vec_t ], unit, [], inout);
-      ("pop", [], opt vec_t, [], let_);
-      ("get", [ par "i" let_ i_ty ], opt vec_t, [], let_);
+      (* re-audit P0-4: pop/get transcribe the kernel surface exactly
+         (std/collections.tg: `def pop(inout self: Self) -> Option[T]`
+         and the registry's __intrinsic_array_pop/__intrinsic_array_get
+         declarations — pop mutates through the inout receiver, get is
+         the OOB-panic value read returning T, never a checked
+         Option) *)
+      ("pop", [], opt vec_t, [], inout);
+      ("get", [ par "i" let_ i_ty ], vec_t, [], let_);
       ("set", [ par "i" let_ i_ty; par "value" sink vec_t ], unit, [], inout);
       ("clear", [], unit, [], inout);
       ("as_ptr", [], ptr vec_t, [], let_);
@@ -1025,45 +1321,74 @@ let builtin_methods (st : state) (vec_p : Ids.Generic_param_id.t) (opt_p : Ids.G
   in
   (* P4 (std as the semantic authority): the builtin collection method
      signatures must agree with the intrinsic registry's declared
-     conventions for the same operations — a startup assertion, so a
+     signatures for the same operations — a startup assertion, so a
      builtin/std/registry drift fails immediately instead of silently
-     diverging the canaries from the full-manifest behavior. *)
-  (let conv_of (owner : string) (mname : string) (k : int) : Access_effect.t option =
-     match
-       Intrinsic_registry.lookup Intrinsic_registry.manifest
-         ~name:("__intrinsic_" ^ String.lowercase_ascii owner ^ "_" ^ mname)
-     with
-     | Some (_, isig) when k < Array.length isig.Intrinsic_registry.params ->
-         Some isig.Intrinsic_registry.params.(k).Type_repr.pt_convention
-     | _ -> None
+     diverging the canaries from the full-manifest behavior.  The
+     comparison is the SHARED signature-identity matcher (audit
+     P0-1..P0-4 — Signature_identity, the ONE matcher of the
+     typed→host boundary): the registry declaration is canonicalized
+     into the checker domain (the registry Vec family's alias fold plus
+     the LangItem adoption table) and then compared by arity, exact
+     per-parameter conventions, and alpha-equivalent types under one
+     binder bijection across the whole signature (params AND return).
+     The builtin side is checker-domain already (each alias class is one
+     TypeId).  A builtin method registered under an alias owner
+     (Vec/Array, str/String, Set/HashSet, Map/HashMap) must agree with
+     the alias owner's registry binding — the same alias convention the
+     lowering's qualified-call channel uses. *)
+  (let reg_intrinsic_sig (owner : string) (mname : string) :
+       Intrinsic_registry.signature option =
+     let aliases =
+       match owner with
+       | "Vec" -> [ "Vec"; "Array" ]
+       | "Array" -> [ "Array"; "Vec" ]
+       | "String" -> [ "String"; "str" ]
+       | "str" -> [ "str"; "String" ]
+       | "Set" -> [ "Set"; "HashSet" ]
+       | "HashSet" -> [ "HashSet"; "Set" ]
+       | "Map" -> [ "Map"; "HashMap" ]
+       | "HashMap" -> [ "HashMap"; "Map" ]
+       | q -> [ q ]
+     in
+     let rec find = function
+       | [] -> None
+       | o :: rest -> (
+           match
+             Intrinsic_registry.lookup Intrinsic_registry.manifest
+               ~name:("__intrinsic_" ^ String.lowercase_ascii o ^ "_" ^ mname)
+           with
+           | Some (_, isig) -> Some isig
+           | None -> find rest)
+     in
+     find aliases
    in
    List.iter
-     (fun ((owner, mname), sig_) ->
-       ignore owner; ignore mname; ignore sig_;
-       match String.index_opt sig_.ts_name ':' with
-       | Some i when i + 2 < String.length sig_.ts_name ->
-           let owner = String.sub sig_.ts_name 0 i in
-           let mname =
-             String.sub sig_.ts_name (i + 2) (String.length sig_.ts_name - i - 2)
+     (fun ((owner, mname), ts) ->
+       match reg_intrinsic_sig owner mname with
+       | None -> ()
+       | Some isig ->
+           (* the builtin ts_params carry the receiver slot (index 0)
+              + the explicit params; the registry's param 0 is the
+              receiver too — the arity check below requires the two
+              transcriptions to line up exactly *)
+           let builtin : Signature_identity.signature =
+             {
+               Signature_identity.sig_params = ts.ts_params;
+               sig_ret = ts.ts_return;
+             }
            in
-           (* the receiver slot (index 0) + the explicit params; the
-              registry's param 0 is the receiver (Inout for the
-              mutating collections) *)
-           Array.iteri
-             (fun k p ->
-               match conv_of owner mname k with
-               | Some declared ->
-                   let builtin = Access_effect.read_effect p.Type_repr.pt_convention in
-                   let declared = Access_effect.read_effect declared in
-                   if builtin <> declared then
-                     failwith
-                       (Printf.sprintf
-                          "P4 builtin/registry drift: builtin %s::%s parameter %d convention %s disagrees with the intrinsic registry's %s"
-                          owner mname (k + 1) (Seed_mir.print_effect builtin)
-                          (Seed_mir.print_effect declared))
-               | None -> ())
-             sig_.ts_params
-       | _ -> ())
+           let declared = Signature_identity.of_registry isig in
+           if
+             not
+               (Signature_identity.signatures_match
+                  ~canon_left:Signature_identity.canonicalize_registry_placeholder
+                  declared builtin)
+           then
+             failwith
+               (Printf.sprintf
+                  "P4 builtin/registry drift: builtin %s::%s has signature %s, which disagrees with the intrinsic registry's %s (identity rules: exact TypeIds after canonicalization, conventions exact, binders alpha-equivalent under one bijection)"
+                  owner mname (Signature_identity.to_string builtin)
+                  (Signature_identity.to_string declared)))
      all_methods);
   all_methods
 
@@ -1119,6 +1444,8 @@ let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
       next_param_id = 1000;
       next_var_id = 0;
       failed_items = [];
+      decl_keys = Hashtbl.create 8192;
+      dup_decls = [];
       o_handoff_resolved = 0;
       nested_functions = [];
       const_fns = Hashtbl.create 64;
@@ -1596,6 +1923,7 @@ let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
     typed_patterns = Hashtbl.create 256;
     typed_for_patterns = Hashtbl.create 64;
     typed_let_patterns = Hashtbl.create 64;
+    final_subst = None;
   }
 
 (* ────────────────────────────────────────────────────────────────
@@ -5792,7 +6120,9 @@ and check_name (env : env) (scope : scope) (expected : Type_repr.t option)
                       }
                 | None ->
                     (match List.assoc_opt n env.constructors with
-                     | Some cs -> check_call_sig env scope expected node_id cs [] [] span
+                     | Some cs ->
+                         check_call_sig env scope expected node_id cs [] [] span
+                           ~hint:CCH_constructor
                      | None -> (
                          match List.assoc_opt n env.functions with
                          | Some fs ->
@@ -5818,6 +6148,7 @@ and check_name (env : env) (scope : scope) (expected : Type_repr.t option)
                               | _ ->
                                   if Array.length fs.ts_params = 0 then
                                     check_call_sig env scope expected node_id fs [] [] span
+                                      ~hint:CCH_function
                                   else
                                     Error
                                       (err span
@@ -5908,7 +6239,9 @@ and check_call (env : env) (scope : scope) (expected : Type_repr.t option)
       (* the type-query special form: size_of[T]() / align_of[T]() — the
          stable, once-minted signature so the oracle sees a known DefId *)
       match List.assoc_opt n env.state.query_sigs with
-      | Some query_sig -> check_call_sig env scope expected node_id query_sig targs args span
+      | Some query_sig ->
+          check_call_sig env scope expected node_id query_sig targs args span
+            ~hint:CCH_query
       | None ->
           env.state.oracle.o_unresolved_calls <- env.state.oracle.o_unresolved_calls + 1;
           Error (err span (Printf.sprintf "unknown function `%s`" n)))
@@ -5925,10 +6258,12 @@ and check_call (env : env) (scope : scope) (expected : Type_repr.t option)
           Error (err span (Printf.sprintf "cannot call a value of type %s" (type_to_string t)))
       | None -> (
           match List.assoc_opt n env.constructors with
-          | Some cs -> check_call_sig env scope expected node_id cs targs args span
+          | Some cs ->
+              check_call_sig env scope expected node_id cs targs args span ~hint:CCH_constructor
           | None -> (
               match lookup_function env n with
-              | Some fs -> check_call_sig env scope expected node_id fs targs args span
+              | Some fs ->
+                  check_call_sig env scope expected node_id fs targs args span ~hint:CCH_function
               | None -> (
                   (* static method call `Type::method(...)`: the receiver is
                      the type itself; check args against params 1.. *)
@@ -5954,6 +6289,7 @@ and check_call (env : env) (scope : scope) (expected : Type_repr.t option)
                                  (e.g. `Vec::new`, `Vec::with_capacity`):
                                  check the args as-is *)
                               check_call_sig env scope expected node_id sig_ targs args span
+                                ~hint:(CCH_static_method (owner, mname))
                             else
                               (* prepend the synthetic receiver ONLY when the
                                  self parameter's type IS the owner's own
@@ -5978,8 +6314,10 @@ and check_call (env : env) (scope : scope) (expected : Type_repr.t option)
                                      ca_span = span }
                                   :: args)
                                   span
+                                  ~hint:(CCH_static_method (owner, mname))
                               else
                                 check_call_sig env scope expected node_id sig_ targs args span
+                                  ~hint:(CCH_static_method (owner, mname))
                         | None -> (
                             (* alias fallback: `Vec` is a builtin alias of the
                                kernel's `Array`; the builtin nominal may carry
@@ -6017,6 +6355,7 @@ and check_call (env : env) (scope : scope) (expected : Type_repr.t option)
                                   match mangled with
                                   | Some sig_ ->
                                       check_call_sig env scope expected node_id sig_ targs args span
+                                        ~hint:CCH_function
                                   | None ->
                                       env.state.oracle.o_unresolved_calls <-
                                         env.state.oracle.o_unresolved_calls + 1;
@@ -6032,6 +6371,7 @@ and check_call (env : env) (scope : scope) (expected : Type_repr.t option)
                                       in
                                       if not has_self2 then
                                         check_call_sig env scope expected node_id sig_ targs args span
+                                          ~hint:(CCH_static_method (alias_owner, mname))
                                       else
                                         check_call_sig env scope expected node_id sig_ targs
                                           ({ Ast.ca_label = None;
@@ -6039,6 +6379,7 @@ and check_call (env : env) (scope : scope) (expected : Type_repr.t option)
                                              ca_span = span }
                                           :: args)
                                           span
+                                          ~hint:(CCH_static_method (alias_owner, mname))
                                   | None -> try_aliases rest)
                             in
                             try_aliases owner_nom_names))
@@ -6179,7 +6520,8 @@ and check_closure_call (env : env) (scope : scope) (expected : Type_repr.t optio
 
 and check_call_sig (env : env) (scope : scope) (expected : Type_repr.t option)
     (node_id : Ids.Node_id.t) (sig_ : typed_signature) (targs : Ast.type_expr list)
-    (args : Ast.call_arg list) (span : Span.span) : (typed_expr, string) result =
+    (args : Ast.call_arg list) (span : Span.span) ~(hint : call_class_hint) :
+    (typed_expr, string) result =
   let n_params = List.length sig_.ts_params_decl in
   if List.length targs > n_params then
     Error (err span (Printf.sprintf "too many type arguments for `%s`" sig_.ts_name))
@@ -6510,7 +6852,12 @@ and check_call_sig (env : env) (scope : scope) (expected : Type_repr.t option)
          concrete substitution (declaration order, substitute_fixpoint
          over the vars) — the exact-arity pairing lowering consumes *)
       Hashtbl.replace env.typed_nodes node_id
-        { tn_type = ret; tn_cast_target = None; tn_call = Some (sig_.ts_callable, substitution) };
+        { tn_type = ret;
+          tn_cast_target = None;
+          tn_call =
+            Some
+              (classify_callee ~hint sig_ ~argc:(List.length tes)
+                 ~type_args:substitution) };
       (* the integrated access channel (re-audit P0-11): one record per
          argument, in program order, aligned with the recorded effects;
          each record carries the argument's typed type *)
@@ -6614,69 +6961,106 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
   in
   (* the nominal owner name (used by receiver unification below) *)
   let oname = match owner_name with Some n -> n | None -> "" in
-  (* derived Clone: the kernel relies on Clone for its core types
-     (Type, Expr, Span, Option, ...) without declaring the impls; every
-     seed value is Clone-able, so synthesize the signature.  The
-     synthesized sig declares ONE generic binder for the RECEIVER TYPE
-     (a fresh parameter; the call's recorded instance arg carries the
-     receiver type — solved through the receiver-self unification and
-     the final journal like any generic method call) instead of
-     embedding the call site's AMBIENT type (a caller-own rigid
-     Type_param or a concrete type) directly in the registry sig:
-     the monomorphizer substitutes the call's instance args when it
-     specializes the enclosing function, and the template/concrete
-     verifiers substitute the sig's declaration binders under the call's
-     instance args — an ambient-embedding sig (params_decl:[]) can never
-     be specialized and its self/ret type goes stale in every
-     specialization of a generic caller ("expected T<param> got
-     <concrete>" after mono). *)
+  (* ── Derived operations (audit P0-12): the derived clone / to_string /
+     eq (and the scalar Int-kind hash) channel.  The kernel relies on
+     Clone / Display / Eq for its core types (Type, Expr, Span, Option,
+     ...) without declaring the impls, so the checker synthesizes the
+     operation signature when the method lookup finds no registered
+     impl.  The minted signature is the TEMPLATE of a real
+     compiler-generated function: its generic parameters are the
+     RECEIVER's OWN generic carriers (params_in owner_ty — a concrete
+     receiver declares none and embeds its concrete self/ret types; a
+     receiver spelled with the enclosing item's params declares exactly
+     those params and keeps them rigid through the receiver-self
+     unification), so the call's recorded instance args substitute the
+     template exactly like any other generic call and the
+     monomorphizer can specialize the synthesized body.  NO body-less
+     registration survives: the driver's lowering emits one Seed MIR
+     function per accepted derived signature (mir_derive.ml lowers the
+     body from the receiver's nominal def — per-field aggregate clone,
+     per-field structural equality, per-field rendering, the all-value
+     clone for Copy carriers) and the synthesized function carries the
+     SAME callable identity every call site references — the verifier
+     checks a real body, the mono specializes a real template and the
+     VM executes a real function. *)
+  let derived_mint (op : string)
+      ~(params : Type_repr.t -> (string * Access_effect.t * Type_repr.t) list)
+      ~(ret : Type_repr.t -> Type_repr.t) : typed_signature option =
+    match owner_ty with
+    | Type_repr.Named _ | Type_repr.Fixed_array _ | Type_repr.Tuple _
+    | Type_repr.String | Type_repr.Int _ | Type_repr.Bool | Type_repr.Char
+    | Type_repr.Float _ | Type_repr.Type_param _ | Type_repr.Infer_var _
+    | Type_repr.Raw_ptr _ | Type_repr.Ref_internal _ ->
+        let seen = ref [] in
+        let decl =
+          List.filter_map
+            (fun p ->
+              if List.mem p !seen then None
+              else begin
+                seen := p :: !seen;
+                Some p
+              end)
+            (params_in owner_ty)
+        in
+        let params_decl = List.mapi (fun i p -> ("T" ^ string_of_int i, p)) decl in
+        let sig_ =
+          mk_sig env.state ~name:("derived::" ^ oname ^ "::" ^ op)
+            ~params_decl ~params:(params owner_ty) ~ret:(ret owner_ty) ~where:[]
+        in
+        env.state.oracle.o_derived_callables <-
+          sig_.ts_callable :: env.state.oracle.o_derived_callables;
+        env.state.derived_sigs <- (sig_.ts_callable, sig_) :: env.state.derived_sigs;
+        Some sig_
+    | _ -> None
+  in
   let derived_clone () =
     if mname <> "clone" then None
     else
-      match owner_ty with
-      | Type_repr.Named _ | Type_repr.Fixed_array _ | Type_repr.Tuple _
-      | Type_repr.String | Type_repr.Int _ | Type_repr.Bool | Type_repr.Char
-      | Type_repr.Float _ | Type_repr.Type_param _ | Type_repr.Infer_var _
-      | Type_repr.Ref_internal _ ->
-          let self_p = fresh_param_id env.state in
-          let sig_ =
-            mk_sig env.state ~name:("derived::" ^ oname ^ "::clone")
-              ~params_decl:[ ("T", self_p) ]
-              ~params:[ ("self", Access_effect.Let, Type_repr.Type_param self_p) ]
-              ~ret:(Type_repr.Type_param self_p) ~where:[]
-          in
-          env.state.oracle.o_derived_callables <- sig_.ts_callable :: env.state.oracle.o_derived_callables;
-          env.state.derived_sigs <- (sig_.ts_callable, sig_) :: env.state.derived_sigs;
-          Some sig_
-      | _ -> None
+      derived_mint "clone"
+        ~params:(fun ty -> [ ("self", Access_effect.Let, ty) ])
+        ~ret:(fun ty -> ty)
   in
   (* derived to_string: the kernel's universal `def to_string[T: Display]
      (val: T) -> String` (core.tg) serves every receiver — generic error
      payloads (`e.to_string()` in impl Result::context), named types with
      no declared impl (Span, AstItemKind), array elements — and the real
      compiler resolves `.to_string()` to it without enforcing the Display
-     bound at the call site. Synthesize the signature for any receiver;
-     like the derived clone it declares ONE binder for the receiver type
-     (see above — the mono/verifier substitution contract). *)
+     bound at the call site.  The synthesized body renders the receiver
+     through the compiler's scalar render intrinsics (per-field for
+     aggregates), so the derived op is a real function, never a
+     body-less contract. *)
   let derived_to_string () =
     if mname <> "to_string" then None
     else
-      match owner_ty with
-      | Type_repr.Named _ | Type_repr.Fixed_array _ | Type_repr.Tuple _
-      | Type_repr.String | Type_repr.Int _ | Type_repr.Bool | Type_repr.Char
-      | Type_repr.Float _ | Type_repr.Type_param _ | Type_repr.Infer_var _
-      | Type_repr.Ref_internal _ ->
-          let self_p = fresh_param_id env.state in
-          let sig_ =
-            mk_sig env.state ~name:("derived::" ^ oname ^ "::to_string")
-              ~params_decl:[ ("T", self_p) ]
-              ~params:[ ("self", Access_effect.Let, Type_repr.Type_param self_p) ]
-              ~ret:Type_repr.String ~where:[]
-          in
-          env.state.oracle.o_derived_callables <- sig_.ts_callable :: env.state.oracle.o_derived_callables;
-          env.state.derived_sigs <- (sig_.ts_callable, sig_) :: env.state.derived_sigs;
-          Some sig_
-      | _ -> None
+      derived_mint "to_string"
+        ~params:(fun ty -> [ ("self", Access_effect.Let, ty) ])
+        ~ret:(fun _ -> Type_repr.String)
+  in
+  (* derived eq (the kernel's `def eq(self: Self, other: Self) -> Bool`
+     shape): when no impl registers the method the derived body compares
+     the receiver structurally — the checker's fundamental equality
+     accepts the same whole-value operand class (check_binary's unify)
+     and the seed VM executes structural equality on aggregate values. *)
+  let derived_eq () =
+    if mname <> "eq" then None
+    else
+      derived_mint "eq"
+        ~params:(fun ty ->
+          [ ("self", Access_effect.Let, ty); ("other", Access_effect.Let, ty) ])
+        ~ret:(fun _ -> Type_repr.Bool)
+  in
+  (* derived scalar hash (the kernel's impl Hash bodies hash their
+     integer id fields — `self.id.hash()` with self.id: Int — std/hash.tg
+     is outside the bootstrap closure, so no impl registers Int::hash):
+     an Int-kind receiver hashes to its own numeric value (the canonical
+     integer hash). *)
+  let derived_scalar_hash () =
+    match owner_ty with
+    | Type_repr.Int _ when mname = "hash" ->
+        derived_mint "hash"
+          ~params:(fun ty -> [ ("self", Access_effect.Let, ty) ])
+          ~ret:(fun _ -> Type_repr.Int Type_repr.Int)
+    | _ -> None
   in
   (if Sys.getenv_opt "TANGERINE_DEBUG_METHODCALL" <> None then
      Printf.eprintf "DBG-MCALL mname=%s owner_ty=%s owners=[%s] found=%b span=%d:%d\n"
@@ -6685,10 +7069,19 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
   let resolved_owner, resolved_sig =
     match try_owners candidate_owners with
     | Some (o, s) -> (Some o, Some s)
-    | None -> (
-        match derived_clone () with
-        | Some s -> (None, Some s)
-        | None -> (None, derived_to_string ()))
+    | None ->
+        let found = ref None in
+        let try_mint (m : typed_signature option) : unit =
+          if !found = None then
+            match m with
+            | Some s -> found := Some s
+            | None -> ()
+        in
+        try_mint (derived_clone ());
+        try_mint (derived_eq ());
+        try_mint (derived_to_string ());
+        try_mint (derived_scalar_hash ());
+        (None, !found)
   in
   match resolved_sig with
   | None -> (
@@ -7169,14 +7562,23 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
                 env.state.oracle.o_calls <- call :: env.state.oracle.o_calls;
                 (* the persistent typed-call channel: same node-keyed
                    record as check_call_sig — the method's call node
-                   carries the resolved callable + solved substitution *)
+                   carries the resolved callee CLASS (audit P0-5: the
+                   receiver-method resolution's (owner, method) is
+                   classified against the intrinsic registry at check
+                   time; a derived mint classifies Derived) + the solved
+                   substitution *)
                 let _ =
                   if Sys.getenv_opt "TANGERINE_DEBUG_PT" <> None then
                     Printf.eprintf "DBG-TN method %s.%s node=%d ret=%s\n" oname mname
                       (Ids.Node_id.to_int node_id) (type_to_string ret)
                 in
                 Hashtbl.replace env.typed_nodes node_id
-                  { tn_type = ret; tn_cast_target = None; tn_call = Some (sig_.ts_callable, substitution) };
+                  { tn_type = ret;
+                    tn_cast_target = None;
+                    tn_call =
+                      Some
+                        (classify_method_callee ~owner:resolved_owner mname sig_
+                           ~argc:(Array.length all_effects) ~type_args:substitution) };
                 (* the integrated access channel (re-audit P0-11): the
                    receiver first, then the arguments, aligned with
                    all_effects; each record carries the typed type *)
@@ -7209,6 +7611,29 @@ let empty_scope : scope =
 
 let qualified_name (mp : string list) (n : string) : string =
   match mp with [] -> n | segs -> String.concat "::" (segs @ [ n ])
+
+(* audit P0-6: function declarations carry no parser-minted NodeId (the
+   parser mints ids for EXPRESSION nodes only), so the per-declaration
+   identity of the checker's registration is the fn-decl span key
+   (file_id, start) — distinct for distinct declarations, stable across
+   the fixpoint re-registration rounds, and shared by the driver's
+   lowering and the audit's node walker. *)
+let fn_decl_key (s : Span.span) : int * int = (s.Span.file_id, s.Span.start)
+
+let note_dup_decl (env : env) (reg_key : string) (canon : int * int)
+    (dup : int * int) : unit =
+  if not (List.mem (reg_key, canon, dup) env.state.dup_decls) then
+    env.state.dup_decls <- (reg_key, canon, dup) :: env.state.dup_decls
+
+(* audit P0-6: is this AST declaration the CANONICAL registration of
+   `reg_key`?  None (no canonical recorded — registrations that never
+   ran the discipline) and the canonical decl itself are accepted; a
+   DIFFERENT declaration holding the key is a duplicate definition and
+   is rejected (never type-checked, never lowered). *)
+let is_canonical_decl (env : env) (reg_key : string) (d : Span.span) : bool =
+  match Hashtbl.find_opt env.state.decl_keys reg_key with
+  | Some k -> k = fn_decl_key d
+  | None -> true
 
 let impl_param_key (env : env) (d : Ast.impl_decl) : string =
   Printf.sprintf "impl::%s::%d:%d-%d" (qualified_name env.module_path d.i_target_type)
@@ -7389,9 +7814,18 @@ and check_methods (env : env) (owner : string)
                  (Printf.sprintf "internal: method `%s::%s` was not registered" owner
                     m.fn_sig.sig_name))
         | Some sig_ -> (
-            match check_function_body env extra_tp_bounds sig_ m with
-            | Ok () -> go rest
-            | Error m -> Error m))
+            (* audit P0-6: the method's AST declaration must be the
+               CANONICAL registration of (owner, name); a duplicate
+               declaration that lost the registration (the key is held
+               by a different decl) is never body-checked — its calls
+               must not enter the typed channels, because the seed never
+               emits its body *)
+            let reg_key = "method::" ^ owner ^ "::" ^ m.fn_sig.sig_name in
+            if not (is_canonical_decl env reg_key m.fn_span) then go rest
+            else
+              match check_function_body env extra_tp_bounds sig_ m with
+              | Ok () -> go rest
+              | Error m -> Error m))
   in
   go methods
 
@@ -7402,17 +7836,27 @@ and check_function_item (env : env) (mp : string list) (d : Ast.function_decl) :
   | None ->
       Error (err d.fn_span (Printf.sprintf "internal: function `%s` was not registered" qname))
   | Some sig_ ->
-      (* register the const-function value: a zero-arg function whose
-         body is a literal backs the `when NAME()` literal-pattern form
-         (the native accepts matching a non-enum subject with const-call
-         patterns); idempotent so the fixpoint can re-run the module *)
-      (match d.fn_body with
-       | Ast.FnExpr e when d.fn_sig.sig_params = [] -> (
-           match pattern_literal_constant e sig_.ts_return with
-           | Ok c -> Hashtbl.replace env.state.const_fns qname (c, sig_.ts_return)
-           | Error _ -> ())
-       | _ -> ());
-      check_function_body env [] sig_ d
+      (* audit P0-6: only the CANONICAL declaration of the qname is
+         body-checked.  A module that declares the same function twice
+         (the kernel's duplicate-definition tolerance registers the name
+         once — codegen.tg carries whole duplicated regions) must not
+         record the second copy's calls: the seed lowers exactly the
+         canonical declaration's body, and the typed channels describe
+         the real typed program. *)
+      let reg_key = "fn::" ^ qname in
+      if not (is_canonical_decl env reg_key d.fn_span) then Ok ()
+      else (
+        (* register the const-function value: a zero-arg function whose
+           body is a literal backs the `when NAME()` literal-pattern form
+           (the native accepts matching a non-enum subject with const-call
+           patterns); idempotent so the fixpoint can re-run the module *)
+        (match d.fn_body with
+         | Ast.FnExpr e when d.fn_sig.sig_params = [] -> (
+             match pattern_literal_constant e sig_.ts_return with
+             | Ok c -> Hashtbl.replace env.state.const_fns qname (c, sig_.ts_return)
+             | Error _ -> ())
+         | _ -> ());
+        check_function_body env [] sig_ d)
 
 and check_struct (env : env) (d : Ast.struct_decl) : (unit, string) result =
   match List.assoc_opt d.s_name env.nominals, List.assoc_opt d.s_name env.types with
@@ -7485,9 +7929,14 @@ and check_trait (env : env) (d : Ast.trait_decl) : (unit, string) result =
               match List.assoc_opt (d.t_name, m.fn_sig.sig_name) env'.methods with
               | None -> Error (err m.fn_span "internal: trait method was not registered")
               | Some sig_ -> (
-                  match check_function_body env' tp_bounds sig_ m with
-                  | Ok () -> go rest
-                  | Error e -> Error e)))
+                  (* audit P0-6: default bodies of non-canonical duplicate
+                     trait-method declarations are never checked *)
+                  let reg_key = "method::" ^ d.t_name ^ "::" ^ m.fn_sig.sig_name in
+                  if not (is_canonical_decl env' reg_key m.fn_span) then go rest
+                  else
+                    match check_function_body env' tp_bounds sig_ m with
+                    | Ok () -> go rest
+                    | Error e -> Error e)))
     in
     go d.t_methods
   in
@@ -7597,30 +8046,35 @@ and check_item (env : env) (item : Ast.item) : (unit, string) result =
       match List.assoc_opt qname env.functions with
       | None -> Error (err item.span "internal: test was not registered")
       | Some sig_ ->
-          let d' =
-            {
-              Ast.fn_sig =
-                {
-                  sig_name = d.test_name;
-                  sig_public = false;
-                  sig_async = false;
-                  sig_unsafe = false;
-                  sig_const = false;
-                  sig_pure = false;
-                  sig_inline = false;
-                  sig_extern = false;
-                  sig_type_params = [];
-                  sig_params = [];
-                  sig_return = None;
-                  sig_where = [];
-                  sig_span = d.test_span;
-                };
-              fn_clauses = [];
-              fn_body = Ast.FnBlock d.test_body;
-              fn_span = d.test_span;
-            }
-          in
-          check_function_body env [] sig_ d')
+          (* audit P0-6: only the canonical declaration of a duplicated
+             test name is body-checked (see check_function_item) *)
+          let reg_key = "test::" ^ qname in
+          if not (is_canonical_decl env reg_key d.test_span) then Ok ()
+          else
+            let d' =
+              {
+                Ast.fn_sig =
+                  {
+                    sig_name = d.test_name;
+                    sig_public = false;
+                    sig_async = false;
+                    sig_unsafe = false;
+                    sig_const = false;
+                    sig_pure = false;
+                    sig_inline = false;
+                    sig_extern = false;
+                    sig_type_params = [];
+                    sig_params = [];
+                    sig_return = None;
+                    sig_where = [];
+                    sig_span = d.test_span;
+                  };
+                fn_clauses = [];
+                fn_body = Ast.FnBlock d.test_body;
+                fn_span = d.test_span;
+              }
+            in
+            check_function_body env [] sig_ d')
   | Ast.StructDef d -> check_struct env d
   | Ast.EnumDef d -> check_enum env d
   | Ast.TraitDef d -> check_trait env d
@@ -7679,70 +8133,100 @@ and register_methods (env : env) (owner : string) (methods : Ast.function_decl l
   let rec go env = function
     | [] -> Ok env
     | (m : Ast.function_decl) :: rest -> (
-        match
-          resolve_signature env empty_scope m.fn_sig extra_params
-            ~key:(owner ^ "::" ^ m.fn_sig.sig_name)
-        with
-        | Error e ->
-            if Sys.getenv_opt "TANGERINE_DEBUG_CALL" <> None then
-              Printf.eprintf "DEBUG-MSIGFAIL owner=%s method=%s err=%s\n" owner
-                m.fn_sig.sig_name e;
-            Error e
-        | Ok sig_ ->
-            (* identity handoff (audit Fix 2): the resolver owns method
-               callable identity — use its CallableId when it resolves;
-               fall back to the fresh mint only when it cannot *)
-            let sig_ =
-              match env.resolved with
-              | Some rp -> (
-                  match
-                    Resolver.resolve_method rp env.module_id owner m.Ast.fn_sig.Ast.sig_name
-                  with
-                  | Resolver.Resolved cid ->
-                      (* occupancy guard (re-audit): the resolver registers
-                         EVERY builtin-target impl (str, String, Array,
-                         Int, ...) under ONE shared builtin_def methods
-                         map with last-wins clobbering per method name —
-                         two different (owner, method) keys (str::to_string
-                         vs Array::to_string) can therefore resolve to the
-                         SAME CallableId.  Adopting the duplicate would put
-                         two sigs with DIFFERENT declaration shapes on one
-                         instance identity — the seed-MIR callee lookup
-                         then matches a call of one method to the other's
-                         template and reports the decl/type-args arity
-                         mismatch (callable#1102, [] vs [T]).
-                         The checker's own registry is the occupancy
-                         authority: an id already carried by a DIFFERENT
-                         method entry falls back to this sig's fresh
-                         mint, which keeps every method's identity
-                         unique. *)
-                      let key_here = (owner, m.Ast.fn_sig.Ast.sig_name) in
-                      let held_by_other =
-                        List.exists
-                          (fun ((o2, m2), s2) ->
-                            (o2, m2) <> key_here
-                            && Ids.Callable_id.compare s2.ts_callable cid = 0)
-                          env.methods
-                      in
-                      if held_by_other then (
-                        env.state.o_handoff_fallback <- env.state.o_handoff_fallback + 1;
-                        sig_)
-                      else (
-                        env.state.o_handoff_resolved <- env.state.o_handoff_resolved + 1;
-                        { sig_ with ts_callable = cid })
-                  | _ ->
-                      env.state.o_handoff_fallback <- env.state.o_handoff_fallback + 1;
-                      sig_)
-              | None -> sig_
-            in
-            let sig_ = { sig_ with ts_where = where_extra @ sig_.ts_where } in
-            let key = (owner, sig_.ts_name) in
-            (* idempotent registration (audit Fix 3): re-registration
-               replaces, never appends a duplicate declaration *)
-            let env' =
-              { env with methods = (key, sig_) :: List.remove_assoc key env.methods }
-            in
-            go env' rest)
+        (* audit P0-6 declaration-identity gate: the FIRST declaration of
+           an (owner, method) key is the canonical one and registers;
+           the SAME declaration re-registers (fixpoint rounds, and the
+           impl/struct/trait shape refresh) and replaces in place; a
+           DIFFERENT declaration holding the same key is a duplicate
+           definition — it never registers (no sig, no resolver
+           adoption, no fresh mint), its body is never checked, and the
+           driver never lowers it.  The typed universe therefore holds
+           one semantic declaration per key, and two genuinely distinct
+           declarations can never collapse onto one callable identity. *)
+        let reg_key = "method::" ^ owner ^ "::" ^ m.Ast.fn_sig.Ast.sig_name in
+        let decl_here = fn_decl_key m.Ast.fn_span in
+        match Hashtbl.find_opt env.state.decl_keys reg_key with
+        | Some canon when canon <> decl_here ->
+            note_dup_decl env reg_key canon decl_here;
+            go env rest
+        | _ -> (
+            match
+              resolve_signature env empty_scope m.fn_sig extra_params
+                ~key:(owner ^ "::" ^ m.fn_sig.sig_name)
+            with
+            | Error e ->
+                if Sys.getenv_opt "TANGERINE_DEBUG_CALL" <> None then
+                  Printf.eprintf "DEBUG-MSIGFAIL owner=%s method=%s err=%s\n" owner
+                    m.fn_sig.sig_name e;
+                Error e
+            | Ok sig_ ->
+                (* the canonical declaration records its identity; a
+                   first registration sets it, a re-registration of the
+                   same declaration keeps it *)
+                Hashtbl.replace env.state.decl_keys reg_key decl_here;
+                (* identity handoff (audit Fix 2): the resolver owns method
+                   callable identity — use its CallableId when it resolves;
+                   fall back to the fresh mint only when it cannot *)
+                let sig_ =
+                  match env.resolved with
+                  | Some rp -> (
+                      match
+                        Resolver.resolve_method rp env.module_id owner
+                          m.Ast.fn_sig.Ast.sig_name
+                      with
+                      | Resolver.Resolved cid ->
+                          (* occupancy guard (re-audit): the resolver
+                             registers EVERY builtin-target impl (str,
+                             String, Array, Int, ...) under ONE shared
+                             builtin_def methods map with last-wins
+                             clobbering per method name — two different
+                             (owner, method) keys (str::to_string vs
+                             Array::to_string) can therefore resolve to
+                             the SAME CallableId.  Adopting the duplicate
+                             would put two sigs with DIFFERENT declaration
+                             shapes on one instance identity — the
+                             seed-MIR callee lookup then matches a call of
+                             one method to the other's template and
+                             reports the decl/type-args arity mismatch
+                             (callable#1102, [] vs [T]).
+                             The checker's own registry is the occupancy
+                             authority: an id already carried by a
+                             DIFFERENT method entry falls back to this
+                             sig's fresh mint, which keeps every method's
+                             identity unique (audit P0-6: verified — the
+                             checker's mints start above the resolver's
+                             adopted domain, so the fallback mint can
+                             never equal an adopted id). *)
+                          let key_here = (owner, m.Ast.fn_sig.Ast.sig_name) in
+                          let held_by_other =
+                            List.exists
+                              (fun ((o2, m2), s2) ->
+                                (o2, m2) <> key_here
+                                && Ids.Callable_id.compare s2.ts_callable cid = 0)
+                              env.methods
+                          in
+                          if held_by_other then (
+                            env.state.o_handoff_fallback <-
+                              env.state.o_handoff_fallback + 1;
+                            sig_)
+                          else (
+                            env.state.o_handoff_resolved <-
+                              env.state.o_handoff_resolved + 1;
+                            { sig_ with ts_callable = cid })
+                      | _ ->
+                          env.state.o_handoff_fallback <-
+                            env.state.o_handoff_fallback + 1;
+                          sig_)
+                  | None -> sig_
+                in
+                let sig_ = { sig_ with ts_where = where_extra @ sig_.ts_where } in
+                let key = (owner, sig_.ts_name) in
+                (* idempotent registration (audit Fix 3): re-registration
+                   replaces, never appends a duplicate declaration *)
+                let env' =
+                  { env with methods = (key, sig_) :: List.remove_assoc key env.methods }
+                in
+                go env' rest))
   in
   go env methods
 
@@ -7901,32 +8385,65 @@ and register_item (env : env) (item : Ast.item) : (env, string) result =
   match item.Ast.kind with
   | Ast.Function d ->
       let qname = qualified_name item.module_path d.fn_sig.sig_name in
-      if List.mem_assoc qname env.functions then
+      let reg_key = "fn::" ^ qname in
+      if List.mem_assoc qname env.functions then begin
+        (* audit P0-6: the duplicate-function tolerance keeps the FIRST
+           registration.  The canonical declaration re-registering in a
+           later fixpoint round compares equal by its own decl key and is
+           silently ignored; a DIFFERENT declaration holding the qname is
+           a duplicate definition and is recorded for the body pass and
+           the lowering to skip. *)
+        (match Hashtbl.find_opt env.state.decl_keys reg_key with
+         | Some canon when canon <> fn_decl_key d.fn_span ->
+             note_dup_decl env reg_key canon (fn_decl_key d.fn_span)
+         | _ -> ());
         Error (err item.span (Printf.sprintf "duplicate function `%s`" qname))
+      end
       else begin
         let* sig_ = resolve_signature env empty_scope d.fn_sig [] ~key:qname in
+        Hashtbl.replace env.state.decl_keys reg_key (fn_decl_key d.fn_span);
         (* the qualified-def form `def Type::method(...)` is a method
            declaration: it also enters the method table under
-           (Type, method) so `x.method()` dispatches to it *)
+           (Type, method) so `x.method()` dispatches to it — under the
+           same declaration-identity gate as register_methods (a
+           different declaration already holding the method key is a
+           duplicate method, never a clobber) *)
         let env_m =
           match String.index_opt d.fn_sig.sig_name ':' with
           | Some i when i + 2 < String.length d.fn_sig.sig_name ->
               let owner = String.sub d.fn_sig.sig_name 0 i in
-              let mname = String.sub d.fn_sig.sig_name (i + 2) (String.length d.fn_sig.sig_name - i - 2) in
+              let mname =
+                String.sub d.fn_sig.sig_name (i + 2)
+                  (String.length d.fn_sig.sig_name - i - 2)
+              in
+              let mkey = "method::" ^ owner ^ "::" ^ mname in
               let key = (owner, mname) in
-              { env with methods = (key, sig_) :: List.remove_assoc key env.methods }
+              (match Hashtbl.find_opt env.state.decl_keys mkey with
+               | Some canon when canon <> fn_decl_key d.fn_span ->
+                   note_dup_decl env mkey canon (fn_decl_key d.fn_span);
+                   env
+               | _ ->
+                   Hashtbl.replace env.state.decl_keys mkey (fn_decl_key d.fn_span);
+                   { env with methods = (key, sig_) :: List.remove_assoc key env.methods })
           | _ -> env
         in
         Ok { env_m with functions = (qname, sig_) :: env.functions }
       end
   | Ast.TestDecl d ->
       let qname = qualified_name item.module_path d.test_name in
-      if List.mem_assoc qname env.functions then
+      let reg_key = "test::" ^ qname in
+      if List.mem_assoc qname env.functions then begin
+        (match Hashtbl.find_opt env.state.decl_keys reg_key with
+         | Some canon when canon <> fn_decl_key d.test_span ->
+             note_dup_decl env reg_key canon (fn_decl_key d.test_span)
+         | _ -> ());
         Error (err item.span (Printf.sprintf "duplicate test `%s`" qname))
+      end
       else begin
         let sig_ =
           mk_sig env.state ~name:qname ~params_decl:[] ~params:[] ~ret:Type_repr.Unit ~where:[]
         in
+        Hashtbl.replace env.state.decl_keys reg_key (fn_decl_key d.test_span);
         Ok { env with functions = (qname, sig_) :: env.functions }
       end
   | Ast.StructDef d -> (
@@ -8391,6 +8908,315 @@ let run_impl_backstop (env : env) : string list =
              ie.Trait_solver.ie_trait))
     env.impls.Trait_solver.impls
 
+(* rewrite every entry of a mutable typed channel in place with a pure
+   per-value rewrite (collect-then-replace — never a fresh table, so
+   every alias of the channel sees the final contents). *)
+let rewrite_hashtbl (tbl : ('k, 'v) Hashtbl.t) (f : 'v -> 'v) : unit =
+  let keys = Hashtbl.fold (fun k _ acc -> k :: acc) tbl [] in
+  List.iter
+    (fun k -> match Hashtbl.find_opt tbl k with Some v -> Hashtbl.replace tbl k (f v) | None -> ())
+    keys
+
+(* ── audit P0-8: inference finalization (the ONE finalization point) ──
+
+   finalize_inference runs ONCE per compilation, at the successful end of
+   type checking: after the driver's declaration fixpoint has converged
+   and after EVERY item body of every module has been checked (a var may
+   resolve later in the same item — `var v = Vec::new(); v.push(x)` — so
+   finalizing only at the very end, when the journal can no longer grow,
+   covers every late binding), and only when the closure carries zero
+   type errors (the accepted typed universe is exactly the program handed
+   to lowering).
+
+   What it does:
+   1. constructs the FINAL substitution map — the newest journaled
+      solution per Infer_var id (the journal is newest-first and a var
+      CAN be rebound by a later unification, e.g. the fn-end return-slot
+      unify re-solves a var the body's calls already bound; the newest
+      binding is the final one, exactly what the checker's own reads and
+      the old read-time chases resolved);
+   2. chases every Var -> Var -> ... -> Concrete chain to its end with
+      memoization; a chain that cycles back onto a var already on its own
+      path is an internal inference cycle (the unifier's occurs checks
+      reject direct self-occurrence, so a surviving cycle is a journal
+      inconsistency) and an ICE;
+   3. rewrites EVERY accepted typed channel ONCE with the chased map —
+      the typed nodes (tn_type / tn_cast_target / tn_call type_args), the
+      recorded call substitutions, the typed patterns
+      (typed_patterns / typed_let_patterns / typed_for_patterns), the
+      registered signatures (functions / methods / constructors / nested
+      functions / query sigs / derived contract sigs — params, returns,
+      where predicates), the statics/consts declarations, and the
+      oracle's recorded call/obligation records.  fn-level DECL binders
+      (Type_param — the declared `T`/`_`/impl-Trait binders from the
+      anonymous-signature-binder work) are rigid and stay exactly as
+      declared; only Infer_vars are chased;
+   4. asserts no inference variable survives in a concrete position —
+      an Infer_var still present after the chase is GENUINELY dangling
+      (never journaled, or its chain never ended): an ICE.  Declared
+      binders are exempt by construction (they are Type_params, not
+      Infer_vars);
+   5. stores the immutable snapshot (env.final_subst) and CLEARS the
+      mutable journal, so MIR lowering and every post-typing consumer
+      read the already-final channel contents and can never chase a
+      mutable historical journal again.
+
+   Int_literal normalization: literal adoption happens through the var
+   journal during checking, so the chase above is the normalization —
+   a literal-solved var ends at the concrete record the unifier's
+   rebinds fixed (the fn-end `Vec[u8]` class) or at its final literal
+   form, exactly the record the MIR/verifier domain defines (a literal
+   record is compatible with any concrete kind its magnitude fits).
+   Alias classes (Vec/Array, Map/HashMap, Set/HashSet, String/str) are
+   ONE TypeId by construction in this checker domain, so no alias fold
+   remains at this boundary. *)
+let finalize_inference (env : env) : env =
+  match env.final_subst with
+  | Some _ ->
+      (* idempotence guard: exactly one finalization per compilation.
+         A re-finalization attempt with a LIVE journal means new checks
+         ran after the channels were already finalized (their fresh
+         vars could never be chased) — refuse loudly instead of
+         silently lowering stale channels. *)
+      if !var_journal <> [] then
+        failwith
+          "ICE finalize_inference: a second finalization was attempted on an already-finalized env with a live inference journal (checks ran after finalization — their variables can never be chased; refuse to lower a stale typed universe)"
+      else env
+  | None ->
+      (* 1+2. snapshot the journal's newest binding per var and chase the
+         chains (cycle = ICE, dangling = left as the raw var for the
+         concrete-position assert below to reject). *)
+      let raw : (int, Type_repr.t) Hashtbl.t = Hashtbl.create 65536 in
+      Hashtbl.iter (fun (v : int) (t : Type_repr.t) -> Hashtbl.replace raw v t) journal_var_tbl;
+      let solved : (int, Type_repr.t) Hashtbl.t = Hashtbl.create 65536 in
+      let in_progress : (int, unit) Hashtbl.t = Hashtbl.create 64 in
+      let cycle_ice (v : int) : 'a =
+        failwith
+          (Printf.sprintf
+             "ICE finalize_inference: inference-variable cycle involving ?#%d (the unification journal is inconsistent — a Var -> Var chain cycles back on itself, which the unifier's occurs checks must have bypassed)"
+             v)
+      in
+      let rec chase_var (v : int) : Type_repr.t =
+        match Hashtbl.find_opt solved v with
+        | Some t -> t
+        | None ->
+            if Hashtbl.mem in_progress v then cycle_ice v
+            else begin
+              Hashtbl.add in_progress v ();
+              let t =
+                match Hashtbl.find_opt raw v with
+                | None ->
+                    (* a residual inference var that NO enclosing
+                       unification ever bound by the end of type
+                       checking (the deferred-residual policy: a call
+                       checked with no expected type leaves its
+                       unconstrained params open for a LATER enclosing
+                       unification — e.g. `let r = Result::Ok(21)`
+                       whose error param the surrounding statements
+                       never constrain).  By finalization every channel
+                       must be concrete for mono; a var that reached
+                       the end still free has no observable values, so
+                       the bottom type is its sound image. *)
+                    Type_repr.Never
+                | Some t -> chase_ty t
+              in
+              Hashtbl.remove in_progress v;
+              Hashtbl.replace solved v t;
+              t
+            end
+      and chase_ty (ty : Type_repr.t) : Type_repr.t =
+        match ty with
+        | Type_repr.Infer_var v -> chase_var v
+        | Type_repr.Raw_ptr (m, inner) -> Type_repr.Raw_ptr (m, chase_ty inner)
+        | Type_repr.Ref_internal (m, inner) -> Type_repr.Ref_internal (m, chase_ty inner)
+        | Type_repr.Tuple elems -> Type_repr.Tuple (Array.map chase_ty elems)
+        | Type_repr.Fixed_array (inner, n) -> Type_repr.Fixed_array (chase_ty inner, n)
+        | Type_repr.Named (id, args) -> Type_repr.Named (id, Array.map chase_ty args)
+        | Type_repr.Function (params, ret) ->
+            Type_repr.Function
+              ( Array.map
+                  (fun (p : Type_repr.param_type) ->
+                    { p with Type_repr.pt_type = chase_ty p.Type_repr.pt_type })
+                  params,
+                chase_ty ret )
+        | Type_repr.Unit | Type_repr.Bool | Type_repr.Char | Type_repr.Int _
+        | Type_repr.Float _ | Type_repr.String | Type_repr.Type_param _
+        | Type_repr.Int_literal _ | Type_repr.Error | Type_repr.Never ->
+            ty
+      in
+      (* pre-chase every journaled var so the snapshot is complete (the
+         channel rewrites below then only consult the memo) *)
+      Hashtbl.iter (fun (v : int) _ -> ignore (chase_var v)) raw;
+      let fs = { fs_solutions = solved; fs_var_count = Hashtbl.length raw } in
+      let dangling_ice (ctx : string) (vs : int list) : unit =
+        failwith
+          (Printf.sprintf
+             "ICE finalize_inference: %d unresolved inference variable(s) in a concrete position of %s: %s (a genuinely dangling var in an accepted typed channel is an internal error; an abstract signature slot must be a DECLARED binder, never an unbound Infer_var)"
+             (List.length vs) ctx
+             (String.concat "," (List.map (fun v -> "?#" ^ string_of_int v) vs)))
+      in
+      let chase_assert (ctx : string) (ty : Type_repr.t) : Type_repr.t =
+        let ty' = chase_ty ty in
+        (match vars_in ty' with [] -> () | vs -> dangling_ice ctx vs);
+        ty'
+      in
+      let rewrite_pattern (ctx : string) (p : Typed_pattern.t) : Typed_pattern.t =
+        let rec go (p : Typed_pattern.t) : Typed_pattern.t =
+          match p with
+          | Typed_pattern.TP_wildcard -> p
+          | Typed_pattern.TP_literal (c, ty) ->
+              Typed_pattern.TP_literal (c, chase_assert (ctx ^ "/literal") ty)
+          | Typed_pattern.TP_binding (n, ty, m) ->
+              Typed_pattern.TP_binding (n, chase_assert (ctx ^ "/binding") ty, m)
+          | Typed_pattern.TP_variant (vid, ty, pats) ->
+              Typed_pattern.TP_variant
+                (vid, chase_assert (ctx ^ "/variant") ty, List.map go pats)
+          | Typed_pattern.TP_struct (tid, ty, fields) ->
+              Typed_pattern.TP_struct
+                (tid, chase_assert (ctx ^ "/struct") ty,
+                 List.map (fun (fn, fp) -> (fn, go fp)) fields)
+          | Typed_pattern.TP_tuple (ty, pats) ->
+              Typed_pattern.TP_tuple (chase_assert (ctx ^ "/tuple") ty, List.map go pats)
+          | Typed_pattern.TP_or (pats, names) ->
+              Typed_pattern.TP_or (List.map go pats, names)
+          | Typed_pattern.TP_range (ty, a, b, c) ->
+              Typed_pattern.TP_range (chase_assert (ctx ^ "/range") ty, a, b, c)
+        in
+        go p
+      in
+      (* 3. rewrite the persistent typed channels once, with the assert *)
+      (* 3. rewrite the persistent typed channels once, with the assert *)
+      rewrite_hashtbl env.typed_nodes (fun (n : typed_node) ->
+          let key = "typed node" in
+          let chase_callee (c : typed_callee) : typed_callee =
+            let chase_args (args : Type_repr.t array) = Array.map (chase_assert key) args in
+            match c with
+            | TC_user (callable, targs) -> TC_user (callable, chase_args targs)
+            | TC_intrinsic (i, targs) -> TC_intrinsic (i, chase_args targs)
+            | TC_extern (i, targs) -> TC_extern (i, chase_args targs)
+            | TC_derived (callable, targs) -> TC_derived (callable, chase_args targs)
+            | TC_type_query (k, targs) -> TC_type_query (k, chase_args targs)
+          in
+          {
+            tn_type = chase_assert key n.tn_type;
+            tn_cast_target = Option.map (chase_assert key) n.tn_cast_target;
+            tn_call = Option.map chase_callee n.tn_call;
+          });
+      rewrite_hashtbl env.typed_patterns (rewrite_pattern "typed_patterns");
+      rewrite_hashtbl env.typed_let_patterns (rewrite_pattern "typed_let_patterns");
+      rewrite_hashtbl env.typed_for_patterns (fun (tf : typed_for) ->
+          {
+            tf with
+            tf_pattern = rewrite_pattern "typed_for_patterns" tf.tf_pattern;
+            tf_iterable_type = chase_assert "typed_for.iterable_type" tf.tf_iterable_type;
+            tf_element_type = chase_assert "typed_for.element_type" tf.tf_element_type;
+          });
+      (* 3b. the registered signature channels *)
+      let subst_sig (ctx : string) (ts : typed_signature) : typed_signature =
+        {
+          ts with
+          ts_params =
+            Array.map
+              (fun (p : Type_repr.param_type) ->
+                { p with Type_repr.pt_type = chase_assert ctx p.Type_repr.pt_type })
+              ts.ts_params;
+          ts_return = chase_assert ctx ts.ts_return;
+          ts_where =
+            List.map
+              (fun (ty, bounds) ->
+                ( chase_assert ctx ty,
+                  List.map (fun (n, args) -> (n, Array.map (chase_assert ctx) args)) bounds ))
+              ts.ts_where;
+          ts_anon_bounds =
+            List.map
+              (fun (pid, bounds) ->
+                (pid, List.map (fun (n, args) -> (n, Array.map (chase_assert ctx) args)) bounds))
+              ts.ts_anon_bounds;
+        }
+      in
+      let subst_sig_entry (ctx : string) ((n, ts) : string * typed_signature) =
+        (n, subst_sig ctx ts)
+      in
+      (* 4. build the final env: the immutable sig/decl lists rewritten;
+         the mutable state tables rewritten in place *)
+      let env' =
+        {
+          env with
+          functions = List.map (subst_sig_entry "signature(fn)") env.functions;
+          methods =
+            List.map
+              (fun ((o, m), ts) -> ((o, m), subst_sig "signature(method)" ts))
+              env.methods;
+          constructors = List.map (subst_sig_entry "signature(constructor)") env.constructors;
+          consts = List.map (fun (n, ty) -> (n, chase_assert "const" ty)) env.consts;
+          statics = List.map (fun (n, ty) -> (n, chase_assert "static" ty)) env.statics;
+          final_subst = Some fs;
+        }
+      in
+      env'.state.nested_functions <-
+        List.map
+          (fun (q, ts, d) -> (q, subst_sig "signature(nested fn)" ts, d))
+          env.state.nested_functions;
+      env'.state.query_sigs <-
+        List.map (subst_sig_entry "signature(query)") env.state.query_sigs;
+      env'.state.derived_sigs <-
+        List.map
+          (fun (c, ts) -> (c, subst_sig "signature(derived contract)" ts))
+          env.state.derived_sigs;
+      rewrite_hashtbl env'.state.const_fns
+        (fun ((c : Seed_mir.constant), ty) -> (c, chase_assert "const-fn value" ty));
+      (* 3c. the oracle's recorded accepted channels (call substitutions,
+         expression types, obligations) — dead after finalize (counts are
+         taken during the body pass), rewritten for the invariant that no
+         accepted channel carries a journaled var *)
+      (let o = env'.state.oracle in
+       let sub_expr (te : typed_expr) : typed_expr =
+         {
+           te with
+           te_type = chase_ty te.te_type;
+           te_flow =
+             { te.te_flow with fr_normal = Option.map chase_ty te.te_flow.fr_normal };
+         }
+       in
+       o.o_exprs <- List.map sub_expr o.o_exprs;
+       o.o_calls <-
+         List.map
+           (fun (c : typed_call) ->
+             {
+               c with
+               substitution = Array.map chase_ty c.substitution;
+               return_type = chase_ty c.return_type;
+               args = Array.map sub_expr c.args;
+             })
+           o.o_calls;
+       o.o_obligations <-
+         List.map
+           (fun (ob, r) ->
+             let ob' =
+               {
+                 ob with
+                 Trait_solver.self_ty = chase_ty ob.Trait_solver.self_ty;
+                 type_args = Array.map chase_ty ob.Trait_solver.type_args;
+               }
+             in
+             ( ob',
+               match r with
+               | Ok (s : Trait_solver.solution) ->
+                   Ok
+                     {
+                       s with
+                       Trait_solver.assoc_subst =
+                         List.map (fun (n, t) -> (n, chase_ty t)) s.Trait_solver.assoc_subst;
+                     }
+               | Error _ as e -> e ))
+           o.o_obligations);
+      (* 5. the journal is now history: clear it so no consumer can chase
+         a mutable journal again — every channel above already carries
+         the final facts *)
+      var_journal := [];
+      Hashtbl.reset journal_var_tbl;
+      env'
+
 (* ────────────────────────────────────────────────────────────────
    Public API *)
 
@@ -8684,7 +9510,16 @@ and check_bodies (env : env) (program : Ast.program) : (env * string list, strin
 and check_program (env : env) (program : Ast.program) : (env * string list, string) result =
   let* env_d, decl_errors = check_declarations env program in
   let* env_b, body_errors = check_bodies env_d program in
-  Ok (env_b, decl_errors @ body_errors)
+  let all_errors = decl_errors @ body_errors in
+  (* audit P0-8: the single-module flow's ONE inference-finalization
+     point — every declaration and every item body has been checked (the
+     journal can no longer grow), so on a zero-error check the returned
+     env's accepted typed channels are rewritten with the final
+     substitution, the immutable snapshot is stored, and the mutable
+     journal is cleared before the env is handed to lowering.  A
+     check with errors never finalizes (its channels are not lowered). *)
+  if all_errors = [] then Ok (finalize_inference env_b, [])
+  else Ok (env_b, all_errors)
 
 (* Public classification entry over the checker's error strings. *)
 let debt_report (errors : string list) : Debt_report.t = Debt_report.of_errors errors

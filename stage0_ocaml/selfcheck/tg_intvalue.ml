@@ -207,6 +207,7 @@ let lower_env () : Mir_lower.func_env =
     fn_ret = Type_repr.Int Type_repr.Int;
     struct_fields = [];
                 enum_payloads = [];
+    copy_cache = Type_properties.create_cache ();
   }
 
 let collect_int_constants (fn : Seed_mir.function_) : Int_value.t list =

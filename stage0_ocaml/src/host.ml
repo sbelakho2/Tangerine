@@ -26,44 +26,27 @@ type host_id =
 (* One binding table for the whole host surface. A symbol WITHOUT an
    `invoke` is not implemented — the record type requires the function, so
    "bound" and "has an executable invoke" are the same predicate. *)
-(* Canonical type key for signature comparison. *)
-let rec type_key (ty : Type_repr.t) : string =
-  match ty with
-  | Type_repr.Unit -> "Unit"
-  | Type_repr.Bool -> "Bool"
-  | Type_repr.Int k -> (
-      match k with
-      | Type_repr.I8 -> "i8" | Type_repr.I16 -> "i16" | Type_repr.I32 -> "i32"
-      | Type_repr.I64 -> "i64" | Type_repr.I128 -> "i128"
-      | Type_repr.U8 -> "u8" | Type_repr.U16 -> "u16" | Type_repr.U32 -> "u32"
-      | Type_repr.U64 -> "u64" | Type_repr.U128 -> "u128"
-      | Type_repr.Int -> "Int" | Type_repr.UInt -> "UInt")
-  | Type_repr.Float k -> (match k with Type_repr.F32 -> "f32" | Type_repr.F64 -> "f64")
-  | Type_repr.Char -> "Char"
-  | Type_repr.String -> "String"
-  | Type_repr.Tuple elems -> "(" ^ String.concat "," (Array.to_list (Array.map type_key elems)) ^ ")"
-  | Type_repr.Named (id, args) ->
-      "T#" ^ string_of_int (Ids.Type_id.to_int id)
-      ^ (if Array.length args = 0 then ""
-         else "[" ^ String.concat "," (Array.to_list (Array.map type_key args)) ^ "]")
-  | Type_repr.Fixed_array (t, _) -> "[" ^ type_key t ^ "]"
-  | Type_repr.Raw_ptr (_, t) -> "ptr<" ^ type_key t ^ ">"
-  | Type_repr.Ref_internal (_, t) -> "ref<" ^ type_key t ^ ">"
-  | Type_repr.Infer_var v -> Printf.sprintf "?#%d" v
+(* A binding's signature is TYPED (access convention + type per
+   parameter, plus the return) and is carried TWICE (audit P0-3): the
+   binding record carries THREE signature/execution fields —
 
-  | Type_repr.Int_literal _ -> "int-literal"
+     `declared` (the audit's `declared_signature` role): the
+     REGISTRY-owned declaration — the language ABI the VM dispatches
+     against (its arity is the dispatch arity authority, vm.ml
+     call_host) and the declaration the source-derived closure was
+     verified against;
+     `adapter` (the audit's `adapter_signature` role): the EXECUTABLE
+     ADAPTER's OWN independent declaration — the adapter describes its
+     ABI itself (the generic schemas below, written once at the
+     adapter);
+     `invoke`: the executable semantics.
 
-  | Type_repr.Error -> "error"
-
-  | Type_repr.Type_param id -> "P#" ^ string_of_int (Ids.Generic_param_id.to_int id)
-  | Type_repr.Function (ps, r) ->
-      "fn(" ^ String.concat "," (Array.to_list (Array.map (fun p -> type_key p.Type_repr.pt_type) ps)) ^ ")->" ^ type_key r
-  | Type_repr.Never -> "!"
-
-type signature = {
-  param_types : string list;
-  return_type : string;
-}
+   Host construction compares the two declarations with the SHARED
+   signature-identity matcher (alpha-equivalent under one binder
+   bijection, exact TypeId equality after canonicalization, conventions
+   compared exactly — P0-1/P0-2/P0-4), so a drift between the adapter
+   and the registry is a real, caught error, never a self-comparison. *)
+type signature = Signature_identity.signature
 
 (* re-audit P0-B: the host-call RESULT separates the language-visible
    value from the mutation writebacks — an inout intrinsic mutates
@@ -81,7 +64,13 @@ let plain_result (v : Vm_value.t) : host_result = { value = v; writebacks = [] }
 type binding = {
   id : host_id;
   name : string;
-  signature : signature;
+  (* the registry-owned declaration — the P0-3 `declared_signature`
+     role (the VM's arity authority, vm.ml call_host) *)
+  declared : signature;
+  (* the adapter's own independent declaration — the P0-3
+     `adapter_signature` role (written at the adapter, never copied
+     from the registry) *)
+  adapter : signature;
   invoke : t -> Vm_value.t array -> (host_result, string) result;
 }
 
@@ -125,39 +114,115 @@ let stderr_contents (t : t) : string = Buffer.contents t.stderr
    semantics are not implementable on this seed host, so no stub is
    shipped. closure_check fails on them and the VM traps. *)
 
-(* ── Independent typed binding adapters (host P1) ───────────────────
+(* ── Independent typed binding adapters (host P1, audit P0-3) ──────
 
    Each executable binding is declared through a typed ADAPTER that
-   independently encodes the symbol's signature. The OCaml function type
-   the adapter accepts fixes the argument/result conversion, and the
-   signature strings are written ONCE at the adapter — never copied from
-   the registry declaration. `intrinsic_binding`/`extern_binding` then
-   pair the adapter with the registry-declared id, and closure_check
-   compares the ADAPTER's signature against the registry's
-   source-derived declaration: a drift between the two is a real,
-   caught error, not a self-comparison. *)
+   independently encodes the symbol's signature — written ONCE at the
+   adapter (in the registries' OWN generic schema language: Set[P0],
+   inout Map[P0, P1], Option[P0] — never a fake concrete shape, and
+   never copied from the registry declaration).  The OCaml function
+   type the adapter accepts fixes the argument/result conversion.
+   `intrinsic_binding`/`extern_binding` then pair the adapter with the
+   registry-declared id, and host construction validates the two
+   declarations with the SHARED signature-identity matcher
+   (alpha_equivalent(canonicalize declared, canonicalize adapter));
+   the closure checks re-run the same comparison against the host's
+   OWN registries.  A drift between the adapter and the registry is a
+   real, caught error, not a self-comparison. *)
+
+(* the adapter's OWN placeholder-binder domain (audit P0-3).  The
+   adapters write their generic schemas with their OWN generic
+   parameters — P0 for the single-element families (Set/Array/Vec),
+   P0/P1 for the map key/value family — never with the registries'
+   T/K/V binder ids (Intrinsic_registry.Type_param).  The binder ids
+   are chosen OUTSIDE the registry domain (the registries use 0..1), so
+   agreement between the adapter's independent declaration and the
+   registry's declaration can never be an artifact of shared binder
+   identity: it is established only by the shared matcher's binder
+   BIJECTION over the whole signature (a first-occurrence pair binds
+   both directions; a later occurrence must agree with both maps). *)
+let p0 = Intrinsic_registry.param (Ids.Generic_param_id.make 10)
+let p1 = Intrinsic_registry.param (Ids.Generic_param_id.make 11)
+
+(* the registry placeholder-domain building blocks the adapters write
+   their independent declarations with (the shared schema constructors:
+   the named collection forms and the scalar types) *)
+let set_of = Intrinsic_registry.set_of
+let map_of = Intrinsic_registry.map_of
+let vec_of = Intrinsic_registry.vec_of
+let option_of = Intrinsic_registry.option_of
+let tuple_of = Intrinsic_registry.tuple_of
+let ty_int = Intrinsic_registry.ty_int
+let ty_bool = Intrinsic_registry.ty_bool
+let ty_string = Intrinsic_registry.ty_string
 
 type adapter = {
   signature : signature;
   invoke : t -> Vm_value.t array -> (host_result, string) result;
 }
 
+(* ── Host lookup equality (audit P0-11) ─────────────────────────────
+
+   The collection containment ops (set contains/insert/remove, map
+   contains-key/get/insert, array contains) compare element/key values
+   to decide presence.  Structural equality must NEVER report an
+   arbitrary resource-containing aggregate as Eq: the seed's one OWNED
+   value shape is a region-backed reference (Ref (Region p) — the value
+   the drop glue frees, and a resource can only ever have ONE owner), so
+   a purely structural comparison over aggregates that carry such refs
+   would equate distinct owners (or alias copies) and let containment
+   invent a false positive.  The lookup equality therefore REFUSES —
+   returns false — as soon as either side contains a region-backed ref
+   anywhere in its tree (fail-closed: no ownership decision is ever made
+   through Eq on a resource carrier).  Non-resource values (scalars,
+   strings, plain records/enums/arrays/sets/maps of them) compare with
+   the plain structural equality. *)
+let rec has_owned_ref (v : Vm_value.t) : bool =
+  match v with
+  | Vm_value.Tuple elems | Vm_value.Struct elems | Vm_value.Array elems
+  | Vm_value.Enum (_, elems) ->
+      Array.exists has_owned_ref elems
+  | Vm_value.Set elems -> List.exists has_owned_ref elems
+  | Vm_value.Map pairs -> List.exists (fun (k, v) -> has_owned_ref k || has_owned_ref v) pairs
+  | Vm_value.Closure (_, caps) -> Array.exists has_owned_ref caps
+  | Vm_value.Ref (Vm_value.Region _) -> true
+  | Vm_value.Unit | Vm_value.Bool _ | Vm_value.Int _ | Vm_value.Float32 _
+  | Vm_value.Float64 _ | Vm_value.Char _ | Vm_value.String _
+  | Vm_value.Function _ | Vm_value.RawPtr _ | Vm_value.Ref (Vm_value.Place _)
+  | Vm_value.Null | Vm_value.MovedOut ->
+      false
+
+(* the collection-lookup equality (see above). *)
+let lookup_eq (a : Vm_value.t) (b : Vm_value.t) : bool =
+  not (has_owned_ref a) && not (has_owned_ref b) && Vm_value.equal a b
+
 let arg_mismatch expected : (Vm_value.t, string) result =
   Error ("argument mismatch: expected " ^ expected)
 
-(* () -> Unit *)
+(* the (convention, type) parameter list -> typed signature *)
+let mk_sig (params : (Access_effect.t * Type_repr.t) list) (ret : Type_repr.t) : signature =
+  {
+    Signature_identity.sig_params =
+      Array.of_list
+        (List.map
+           (fun (c, ty) -> { Type_repr.pt_convention = c; pt_type = ty })
+           params);
+    sig_ret = ret;
+  }
+
+(* the by-value (let) parameter list shorthand *)
+let lets (tys : Type_repr.t list) : (Access_effect.t * Type_repr.t) list =
+  List.map (fun ty -> (Access_effect.Let, ty)) tys
+
 (* the raw adapter: the argument/result conversions are the caller's
-   responsibility (used for the runtime Set/Map intrinsics whose
-   values are Vm_value.t arrays) — the signature is still written once
-   here and checked against the registry declaration *)
-let adapter_raw (param_tys : Type_repr.t list) (ret : Type_repr.t)
+   responsibility (used for the runtime Set/Map/Array intrinsics whose
+   values are Vm_value.t arrays) — the typed signature is written once
+   here (conventions AND generic types) and checked against the
+   registry declaration by the closure checks *)
+let adapter_raw (params : (Access_effect.t * Type_repr.t) list) (ret : Type_repr.t)
     (invoke : t -> Vm_value.t array -> (Vm_value.t, string) result) : adapter =
   {
-    signature =
-      {
-        param_types = List.map type_key param_tys;
-        return_type = type_key ret;
-      };
+    signature = mk_sig params ret;
     invoke =
       (fun t args ->
         match invoke t args with
@@ -167,20 +232,13 @@ let adapter_raw (param_tys : Type_repr.t list) (ret : Type_repr.t)
 
 (* the writeback-capable raw adapter: the invoke returns the language
    value AND the (arg index -> new value) mutation writebacks *)
-let adapter_raw_wb (param_tys : Type_repr.t list) (ret : Type_repr.t)
+let adapter_raw_wb (params : (Access_effect.t * Type_repr.t) list) (ret : Type_repr.t)
     (invoke : t -> Vm_value.t array -> (host_result, string) result) : adapter =
-  {
-    signature =
-      {
-        param_types = List.map type_key param_tys;
-        return_type = type_key ret;
-      };
-    invoke;
-  }
+  { signature = mk_sig params ret; invoke }
 
 let adapter_ret_unit (f : t -> unit) : adapter =
   {
-    signature = { param_types = []; return_type = type_key Type_repr.Unit };
+    signature = mk_sig [] Type_repr.Unit;
     invoke =
       (fun t args ->
         match args with
@@ -193,7 +251,7 @@ let adapter_ret_unit (f : t -> unit) : adapter =
 (* () -> Never: f produces the deterministic host error message. *)
 let adapter_ret_never (f : t -> string) : adapter =
   {
-    signature = { param_types = []; return_type = type_key Type_repr.Never };
+    signature = mk_sig [] Type_repr.Never;
     invoke =
       (fun t args ->
         match args with
@@ -204,9 +262,7 @@ let adapter_ret_never (f : t -> string) : adapter =
 (* String -> Unit *)
 let adapter_string_ret_unit (f : t -> string -> unit) : adapter =
   {
-    signature =
-      { param_types = [ type_key Type_repr.String ];
-        return_type = type_key Type_repr.Unit };
+    signature = mk_sig (lets [ Type_repr.String ]) Type_repr.Unit;
     invoke =
       (fun t args ->
         match args with
@@ -219,9 +275,7 @@ let adapter_string_ret_unit (f : t -> string -> unit) : adapter =
 (* String -> Never: f produces the deterministic host error message. *)
 let adapter_string_ret_never (f : t -> string -> string) : adapter =
   {
-    signature =
-      { param_types = [ type_key Type_repr.String ];
-        return_type = type_key Type_repr.Never };
+    signature = mk_sig (lets [ Type_repr.String ]) Type_repr.Never;
     invoke =
       (fun t args ->
         match args with
@@ -232,9 +286,7 @@ let adapter_string_ret_never (f : t -> string -> string) : adapter =
 (* Int -> String *)
 let adapter_int_ret_string (f : t -> Int_value.t -> string) : adapter =
   {
-    signature =
-      { param_types = [ type_key (Type_repr.Int Type_repr.Int) ];
-        return_type = type_key Type_repr.String };
+    signature = mk_sig (lets [ ty_int ]) Type_repr.String;
     invoke =
       (fun t args ->
         match args with
@@ -245,9 +297,7 @@ let adapter_int_ret_string (f : t -> Int_value.t -> string) : adapter =
 (* Bool -> String *)
 let adapter_bool_ret_string (f : t -> bool -> string) : adapter =
   {
-    signature =
-      { param_types = [ type_key Type_repr.Bool ];
-        return_type = type_key Type_repr.String };
+    signature = mk_sig (lets [ Type_repr.Bool ]) Type_repr.String;
     invoke =
       (fun t args ->
         match args with
@@ -258,9 +308,7 @@ let adapter_bool_ret_string (f : t -> bool -> string) : adapter =
 (* Char -> String *)
 let adapter_char_ret_string (f : t -> Uchar.t -> string) : adapter =
   {
-    signature =
-      { param_types = [ type_key Type_repr.Char ];
-        return_type = type_key Type_repr.String };
+    signature = mk_sig (lets [ Type_repr.Char ]) Type_repr.String;
     invoke =
       (fun t args ->
         match args with
@@ -271,9 +319,7 @@ let adapter_char_ret_string (f : t -> Uchar.t -> string) : adapter =
 (* String -> Int *)
 let adapter_string_ret_int (f : t -> string -> Int_value.t) : adapter =
   {
-    signature =
-      { param_types = [ type_key Type_repr.String ];
-        return_type = type_key (Type_repr.Int Type_repr.Int) };
+    signature = mk_sig (lets [ Type_repr.String ]) ty_int;
     invoke =
       (fun t args ->
         match args with
@@ -281,68 +327,150 @@ let adapter_string_ret_int (f : t -> string -> Int_value.t) : adapter =
         | _ -> Error "argument mismatch: expected String");
   }
 
+(* the canonicalization every registry-domain declaration goes through
+   before identity comparison (alias fold + the single LangItem
+   adoption table) *)
+let canonicalize_registry (ty : Type_repr.t) : Type_repr.t =
+  Signature_identity.canonicalize_registry_placeholder ty
+
+(* a (convention type) parameter rendered for diagnostics *)
+let param_contract (p : Type_repr.param_type) : string =
+  Access_effect.to_string p.Type_repr.pt_convention
+  ^ " "
+  ^ Intrinsic_registry.ty_to_string p.Type_repr.pt_type
+
 (* Binding ids are resolved from the declared registries by name, so the
    executable closure and the declarations can never drift apart in
-   identity; the SIGNATURE is the adapter's independent declaration. *)
+   identity.  Audit P0-3: a binding carries BOTH the registry-owned
+   `declared` signature (the VM's dispatch arity authority) AND the
+   adapter's independently written `adapter` signature; host
+   construction validates alpha_equivalent(canonicalize declared,
+   canonicalize adapter) with the correct binder/nominal rules, so the
+   adapter is a genuine independent specification, not a
+   self-comparison. *)
 let intrinsic_binding (name : string) (a : adapter) : binding =
   match Intrinsic_registry.lookup Intrinsic_registry.manifest ~name with
   | Some (id, sig_) ->
-      (* the signature of an intrinsic binding is the REGISTRY's declared
-         signature, never the adapter's hand-written one: the intrinsic
-         surface is generic (Map[P#0, P#1], Set[P#0], ...), so an
-         adapter-side concrete/Unit-shaped signature could never match
-         the declared surface the calls were verified against (the
-         reachable-host closure's exact-signature check), and the VM's
-         dispatch arity check must see the DECLARED arity.  The adapter
-         supplies only the invoke semantics. *)
-      {
-        id = Intrinsic id;
-        name;
-        signature =
-          {
-            param_types =
-              List.map
-                (fun (p : Type_repr.param_type) -> type_key p.Type_repr.pt_type)
-                (Array.to_list sig_.Intrinsic_registry.params);
-            return_type = type_key sig_.Intrinsic_registry.ret;
-          };
-        invoke = a.invoke;
-      }
+      let declared = Signature_identity.of_registry sig_ in
+      if
+        not
+          (Signature_identity.signatures_match
+             ~canon_left:canonicalize_registry ~canon_right:canonicalize_registry
+             declared a.signature)
+      then
+        failwith
+          (Printf.sprintf
+             "host binding '%s': the adapter's independent signature %s does not match \
+              the registry declaration %s (identity rules: exact TypeIds after \
+              canonicalization, conventions exact, binders alpha-equivalent under one \
+              bijection)"
+             name (Signature_identity.to_string a.signature)
+             (Signature_identity.to_string declared));
+      { id = Intrinsic id; name; declared; adapter = a.signature; invoke = a.invoke }
   | None -> failwith (Printf.sprintf "host binding '%s': not a declared intrinsic" name)
 
 let extern_binding (name : string) (a : adapter) : binding =
   match Extern_registry.lookup Extern_registry.manifest ~name with
-  | Some (id, _) -> { id = Extern id; name; signature = a.signature; invoke = a.invoke }
+  | Some (id, sig_) ->
+      let declared = Signature_identity.of_registry sig_ in
+      if
+        not
+          (Signature_identity.signatures_match
+             ~canon_left:canonicalize_registry ~canon_right:canonicalize_registry
+             declared a.signature)
+      then
+        failwith
+          (Printf.sprintf
+             "host binding '%s': the adapter's independent signature %s does not match \
+              the registry declaration %s (identity rules: exact TypeIds after \
+              canonicalization, conventions exact, binders alpha-equivalent under one \
+              bijection)"
+             name (Signature_identity.to_string a.signature)
+             (Signature_identity.to_string declared));
+      { id = Extern id; name; declared; adapter = a.signature; invoke = a.invoke }
   | None -> failwith (Printf.sprintf "host binding '%s': not a declared extern" name)
+
+(* ────────────────────────────────────────────────────────────────────
+   The collection surface's OWNERSHIP semantics (audit P0-11).
+   Vm_value values are immutable trees, and the seed's only OWNED value
+   shape is a region-backed reference (Ref (Region p) — the one shape
+   the VM's drop glue frees; a live duplicate of an owned value would
+   double-free).  The adapters below implement the Tangerine ownership
+   contracts on that value model with these rules:
+
+     • a sink parameter's value ARRIVES MOVED (the VM's Consume/Move
+       operand left the caller's slot Moved — the caller no longer
+       owns it), so the adapter TAKES the exact value object: the
+       caller's moved value BECOMES the stored element/key — it is
+       placed into the writeback collection and never copied, and
+       never appears anywhere else in a live value;
+     • the element-returning ops (pop, remove, drain_one) EXTRACT:
+       the element appears in the returned Option/value and NOT in the
+       writeback collection — ownership transfers exactly once;
+     • set(Array)/remove(Array)/insert(Array)/set-insert-REPLACE
+       RELINQUISH the displaced old element exactly once: after the
+       call the old element is in no live value (neither the writeback
+       nor the return) — the writeback is a fresh collection sharing
+       only the retained elements, and the caller's moved-in value is
+       the one stored;
+     • a FAILED bounds check consumes NOTHING: the check runs before
+       any mutation, the adapter returns an error, and no writeback is
+       produced (the VM traps on the error);
+     • the WRITEBACK channel never duplicates an aggregate: each
+       element/key object of the old collection either stays (shared
+       into the new collection — single live owner, the old collection
+       value is dead the moment its slot was moved) or leaves with the
+       returned value — never both;
+     • containment decisions use lookup_eq (above), which never
+       reports a resource-containing aggregate Eq.
+
+   The map insert key path preserves the STORED key on replacement
+   (the map keeps its key identity — the incoming sink key is consumed
+   by the call and never stored when the key existed; the VALUE is
+   always replaced and the old one returned as the language's
+   Option[old V]).  The set insert REPLACES the stored element with
+   the incoming item (the caller's moved value becomes the stored
+   element) and returns the std presence Bool (true = the key already
+   existed). *)
 
 let binding_manifest : binding list =
   [
     intrinsic_binding "__intrinsic_set_new"
-      (adapter_raw [] (Type_repr.Int Type_repr.Int) (fun _ args ->
+      (adapter_raw [] (set_of p0) (fun _ args ->
            match args with
            | [||] -> Ok (Vm_value.Set [])
            | _ -> arg_mismatch "no arguments"));
     intrinsic_binding "__intrinsic_map_new"
-      (adapter_raw [] Type_repr.Unit (fun _ args ->
+      (adapter_raw [] (map_of p0 p1) (fun _ args ->
            match args with
            | [||] -> Ok (Vm_value.Map [])
            | _ -> arg_mismatch "no arguments"));
     intrinsic_binding "__intrinsic_set_contains"
-      (adapter_raw [ Type_repr.Unit; Type_repr.Unit ] Type_repr.Bool (fun _ args ->
+      (adapter_raw (lets [ set_of p0; p0 ]) ty_bool (fun _ args ->
+           (* pure read: the containment decision uses lookup_eq — a
+              resource-containing aggregate is never reported Eq *)
            match args with
            | [| Vm_value.Set elems; item |] ->
-               Ok (Vm_value.Bool (List.exists (fun e -> Vm_value.equal e item) elems))
+               Ok (Vm_value.Bool (List.exists (fun e -> lookup_eq e item) elems))
            | _ -> arg_mismatch "(Set, item)"));
     intrinsic_binding "__intrinsic_set_remove"
-      (adapter_raw_wb [ Type_repr.Unit; Type_repr.Unit ] Type_repr.Bool (fun _ args ->
+      (adapter_raw_wb
+         [ (Access_effect.Inout, set_of p0); (Access_effect.Let, p0) ]
+         ty_bool (fun _ args ->
            (* the exact Tangerine contract: the language value is Bool
               (whether the element was present and removed) and the
-              mutation travels through the explicit writeback channel *)
+              mutation travels through the explicit writeback channel.
+              The item is a read-only key (Let — never consumed); the
+              REMOVED element is relinquished exactly once: it appears
+              in no live value after the call (not in the writeback,
+              not in the return).  An element is only ever removed when
+              lookup_eq matched it — no removal decision is made
+              through equality on resource carriers. *)
            match args with
            | [| Vm_value.Set elems; item |] ->
                let rec remove acc = function
                  | [] -> (false, List.rev acc)
-                 | x :: rest when Vm_value.equal x item ->
+                 | x :: rest when lookup_eq x item ->
                      (true, List.rev_append acc rest)
                  | x :: rest -> remove (x :: acc) rest
                in
@@ -352,20 +480,34 @@ let binding_manifest : binding list =
                    writebacks = [ (0, Vm_value.Set new_elems) ] }
            | _ -> Error "argument mismatch: expected (Set, item)"));
     intrinsic_binding "__intrinsic_set_insert"
-      (adapter_raw_wb [ Type_repr.Unit; Type_repr.Unit ] Type_repr.Bool (fun _ args ->
-           (* re-audit P0-B: the exact Tangerine contract — the
-              language value is Bool (whether an existing equivalent
-              element was replaced) and the mutation travels through
-              the explicit writeback channel *)
+      (adapter_raw_wb
+         [ (Access_effect.Inout, set_of p0); (Access_effect.Sink, p0) ]
+         ty_bool (fun _ args ->
+           (* the exact Tangerine contract (std REPLACEMENT contract):
+              the sink item arrives MOVED and the caller no longer owns
+              it — the adapter TAKES the exact value object and it
+              BECOMES the stored element.  On the fresh path it is
+              appended; on the found path the FIRST lookup_eq-equal
+              stored element is REPLACED by the incoming item (the
+              displaced old element is relinquished exactly once — it
+              is in no live value afterward, and the old set value is
+              dead).  The language value is the presence Bool: `true`
+              when the key already existed (its slot was replaced),
+              `false` when a fresh slot was created. *)
            match args with
            | [| Vm_value.Set elems; item |] ->
-               let existed = List.exists (fun e -> Vm_value.equal e item) elems in
-               let new_elems = if existed then elems else elems @ [ item ] in
+               let rec insert acc = function
+                 | [] -> (false, List.rev_append acc [ item ])
+                 | x :: rest when lookup_eq x item ->
+                     (true, List.rev_append acc (item :: rest))
+                 | x :: rest -> insert (x :: acc) rest
+               in
+               let existed, new_elems = insert [] elems in
                Ok { value = Vm_value.Bool existed;
                     writebacks = [ (0, Vm_value.Set new_elems) ] }
            | _ -> Error "argument mismatch: expected (Set, item)"));
     intrinsic_binding "__intrinsic_set_len"
-      (adapter_raw [ Type_repr.Unit ] (Type_repr.Int Type_repr.Int) (fun _ args ->
+      (adapter_raw (lets [ set_of p0 ]) ty_int (fun _ args ->
            match args with
            | [| Vm_value.Set elems |] ->
                Ok
@@ -374,13 +516,14 @@ let binding_manifest : binding list =
                        (Int64.of_int (List.length elems))))
            | _ -> arg_mismatch "(Set)"));
     intrinsic_binding "__intrinsic_set_entries"
-      (adapter_raw [ Type_repr.Unit ] Type_repr.Unit (fun _ args ->
+      (adapter_raw (lets [ set_of p0 ]) (vec_of p0) (fun _ args ->
            match args with
            | [| Vm_value.Set elems |] ->
                Ok (Vm_value.Array (Array.of_list elems))
            | _ -> arg_mismatch "(Set)"));
     intrinsic_binding "__intrinsic_set_drain_one"
-      (adapter_raw_wb [ Type_repr.Unit ] Type_repr.Unit (fun _ args ->
+      (adapter_raw_wb [ (Access_effect.Inout, set_of p0) ] (option_of p0)
+         (fun _ args ->
            (* the drain contract: extract an arbitrary element as an
               owned Option[T] and shrink the set through the writeback
               channel (the seed set is unordered, so the head is the
@@ -395,43 +538,64 @@ let binding_manifest : binding list =
                         writebacks = [ (0, Vm_value.Set rest) ] })
            | _ -> Error "argument mismatch: expected (Set)"));
     intrinsic_binding "__intrinsic_set_clear"
-      (adapter_raw_wb [ Type_repr.Unit ] Type_repr.Unit (fun _ args ->
+      (adapter_raw_wb [ (Access_effect.Inout, set_of p0) ] Type_repr.Unit (fun _ args ->
            match args with
            | [| Vm_value.Set _ |] ->
                Ok { value = Vm_value.Unit;
                     writebacks = [ (0, Vm_value.Set []) ] }
            | _ -> Error "argument mismatch: expected (Set)"));
     intrinsic_binding "__intrinsic_map_contains_key"
-      (adapter_raw [ Type_repr.Unit; Type_repr.Unit ] Type_repr.Bool (fun _ args ->
+      (adapter_raw (lets [ map_of p0 p1; p0 ]) ty_bool (fun _ args ->
+           (* pure read; the key decision uses lookup_eq — a
+              resource-containing key aggregate is never reported Eq *)
            match args with
            | [| Vm_value.Map pairs; key |] ->
                Ok
                  (Vm_value.Bool
-                    (List.exists (fun (k, _) -> Vm_value.equal k key) pairs))
+                    (List.exists (fun (k, _) -> lookup_eq k key) pairs))
            | _ -> arg_mismatch "(Map, key)"));
     intrinsic_binding "__intrinsic_map_get"
-      (adapter_raw [ Type_repr.Unit; Type_repr.Unit ] Type_repr.Unit (fun _ args ->
+      (adapter_raw (lets [ map_of p0 p1; p0 ]) (option_of p1) (fun _ args ->
+           (* pure read (surface-bound V: Copy — the returned value
+              aliases the map's stored value only for copy payloads;
+              containment/lookup never compares resource carriers) *)
            match args with
            | [| Vm_value.Map pairs; key |] -> (
-               match List.find_opt (fun (k, _) -> Vm_value.equal k key) pairs with
+               match List.find_opt (fun (k, _) -> lookup_eq k key) pairs with
                | Some (_, v) ->
                    Ok (Vm_value.Enum (0, [| v |]))
                | None -> Ok (Vm_value.Enum (1, [||])))
            | _ -> arg_mismatch "(Map, key)"));
     intrinsic_binding "__intrinsic_map_insert"
       (adapter_raw_wb
-         [ Type_repr.Unit; Type_repr.Unit; Type_repr.Unit ]
-         Type_repr.Unit (fun _ args ->
-          (* re-audit P0-B: the exact Tangerine contract — the language
-             value is Option[old V] (the displaced old value) and the
-             mutation travels through the explicit writeback channel *)
+         [
+           (Access_effect.Inout, map_of p0 p1);
+           (Access_effect.Sink, p0);
+           (Access_effect.Sink, p1);
+         ]
+         (option_of p1) (fun _ args ->
+          (* the exact Tangerine contract (audit P0-B / P0-11): the
+             language value is Option[old V] — the displaced old value,
+             returned OWNED (it appears in no live value but the
+             Option) — and the mutation travels through the explicit
+             writeback channel.  The sink key and sink value arrive
+             MOVED and are TAKEN by the adapter (never copied):
+             • key ABSENT: both the incoming key and the incoming
+               value become the stored pair;
+             • key PRESENT (first lookup_eq match): the STORED key is
+               PRESERVED (the map keeps its key identity — the
+               incoming sink key is consumed by the call and stored
+               nowhere), the incoming sink VALUE becomes the stored
+               value, and the OLD value is relinquished into the
+               returned Option exactly once.  The writeback is a fresh
+               pair list sharing only the retained pairs/keys. *)
           match args with
           | [| Vm_value.Map pairs; key; value |] -> (
-              match List.find_opt (fun (k, _) -> Vm_value.equal k key) pairs with
+              match List.find_opt (fun (k, _) -> lookup_eq k key) pairs with
               | Some (_, old) ->
                   let new_pairs =
                     List.map
-                      (fun (k, v) -> if Vm_value.equal k key then (k, value) else (k, v))
+                      (fun (k, v) -> if lookup_eq k key then (k, value) else (k, v))
                       pairs
                   in
                   Ok
@@ -443,7 +607,7 @@ let binding_manifest : binding list =
                       writebacks = [ (0, Vm_value.Map (pairs @ [ (key, value) ])) ] })
           | _ -> Error "argument mismatch: expected (Map, key, value)"));
     intrinsic_binding "__intrinsic_map_len"
-      (adapter_raw [ Type_repr.Unit ] (Type_repr.Int Type_repr.Int) (fun _ args ->
+      (adapter_raw (lets [ map_of p0 p1 ]) ty_int (fun _ args ->
            match args with
            | [| Vm_value.Map pairs |] ->
                Ok
@@ -452,7 +616,8 @@ let binding_manifest : binding list =
                        (Int64.of_int (List.length pairs))))
            | _ -> arg_mismatch "(Map)"));
     intrinsic_binding "__intrinsic_map_entries"
-      (adapter_raw [ Type_repr.Unit ] Type_repr.Unit (fun _ args ->
+      (adapter_raw (lets [ map_of p0 p1 ])
+         (vec_of (tuple_of [| p0; p1 |])) (fun _ args ->
            match args with
            | [| Vm_value.Map pairs |] ->
                Ok
@@ -471,14 +636,19 @@ let binding_manifest : binding list =
        contracts: pop -> Option[T] (Some payload / None on empty),
        get/remove are the CHECKED reads — out-of-range is the std's
        OOB panic, enforced as a deterministic host error (the VM
-       traps). *)
+       traps).  Ownership (audit P0-11): the sink item of push/set/
+       insert arrives MOVED and is TAKEN — the exact value object
+       becomes the stored element; the displaced element of set is
+       relinquished exactly once; pop/remove EXTRACT the element into
+       the return so it leaves the collection exactly once; a failed
+       bounds check consumes NOTHING (error before any writeback). *)
     intrinsic_binding "__intrinsic_array_new"
-      (adapter_raw [] Type_repr.Unit (fun _ args ->
+      (adapter_raw [] (vec_of p0) (fun _ args ->
            match args with
            | [||] -> Ok (Vm_value.Array [||])
            | _ -> arg_mismatch "no arguments"));
     intrinsic_binding "__intrinsic_array_with_capacity"
-      (adapter_raw [ Type_repr.Unit ] Type_repr.Unit (fun _ args ->
+      (adapter_raw (lets [ ty_int ]) (vec_of p0) (fun _ args ->
            (* the preallocation hint is advisory: the seed's implicit
               growth makes capacity a query-only quantity, so the
               empty result is the full semantic *)
@@ -486,7 +656,7 @@ let binding_manifest : binding list =
            | [| Vm_value.Int _ |] -> Ok (Vm_value.Array [||])
            | _ -> arg_mismatch "(Int)"));
     intrinsic_binding "__intrinsic_array_len"
-      (adapter_raw [ Type_repr.Unit ] (Type_repr.Int Type_repr.Int) (fun _ args ->
+      (adapter_raw (lets [ vec_of p0 ]) ty_int (fun _ args ->
            match args with
            | [| Vm_value.Array elems |] ->
                Ok
@@ -495,7 +665,7 @@ let binding_manifest : binding list =
                        (Int64.of_int (Array.length elems))))
            | _ -> arg_mismatch "(Array)"));
     intrinsic_binding "__intrinsic_array_capacity"
-      (adapter_raw [ Type_repr.Unit ] (Type_repr.Int Type_repr.Int) (fun _ args ->
+      (adapter_raw (lets [ vec_of p0 ]) ty_int (fun _ args ->
            (* len == capacity on the implicit-growth seed representation *)
            match args with
            | [| Vm_value.Array elems |] ->
@@ -505,18 +675,31 @@ let binding_manifest : binding list =
                        (Int64.of_int (Array.length elems))))
            | _ -> arg_mismatch "(Array)"));
     intrinsic_binding "__intrinsic_array_push"
-      (adapter_raw_wb [ Type_repr.Unit; Type_repr.Unit ] Type_repr.Unit (fun _ args ->
-           match args with
-           | [| Vm_value.Array elems; item |] ->
-               Ok
-                 { value = Vm_value.Unit;
-                   writebacks = [ (0, Vm_value.Array (Array.append elems [| item |])) ] }
-           | _ -> Error "argument mismatch: expected (Array, item)"));
+      (adapter_raw_wb
+         [ (Access_effect.Inout, vec_of p0); (Access_effect.Sink, p0) ]
+         Type_repr.Unit (fun _ args ->
+          (* take-not-copy: the sink item arrives MOVED (the caller's
+             slot is already consumed) — the exact value object is
+             appended and becomes the new last element; the writeback
+             array shares the retained elements with the (now dead)
+             old array value, so no element is ever held by two live
+             values.  Nothing here copies the item. *)
+          match args with
+          | [| Vm_value.Array elems; item |] ->
+              Ok
+                { value = Vm_value.Unit;
+                  writebacks = [ (0, Vm_value.Array (Array.append elems [| item |])) ] }
+          | _ -> Error "argument mismatch: expected (Array, item)"));
     intrinsic_binding "__intrinsic_array_pop"
-      (adapter_raw_wb [ Type_repr.Unit ] Type_repr.Unit (fun _ args ->
+      (adapter_raw_wb [ (Access_effect.Inout, vec_of p0) ] (option_of p0)
+         (fun _ args ->
            (* the exact Tangerine contract: the language value is
               Option[T] — Some(the last element) or None on empty —
-              and the shrink travels through the writeback channel *)
+              and the shrink travels through the writeback channel.
+              Element ownership TRANSFERS to the caller exactly once:
+              on the Some path the last element appears ONLY in the
+              returned Option — the writeback array (a sub-array
+              sharing the remaining elements) never contains it. *)
            match args with
            | [| Vm_value.Array elems |] ->
                let n = Array.length elems in
@@ -530,9 +713,12 @@ let binding_manifest : binding list =
                      writebacks = [ (0, Vm_value.Array (Array.sub elems 0 (n - 1))) ] }
            | _ -> Error "argument mismatch: expected (Array)"));
     intrinsic_binding "__intrinsic_array_get"
-      (adapter_raw [ Type_repr.Unit; Type_repr.Unit ] Type_repr.Unit (fun _ args ->
+      (adapter_raw (lets [ vec_of p0; ty_int ]) p0 (fun _ args ->
            (* VALUE ABI, CHECKED: out-of-range is the std's defined OOB
-              panic — a deterministic host error the VM traps on *)
+              panic — a deterministic host error the VM traps on; a
+              failed check consumes NOTHING.  A successful get is a
+              pure READ (surface-bound T: Copy — the value aliases the
+              array's stored element only for copy payloads). *)
            match args with
            | [| Vm_value.Array elems; Vm_value.Int i |] ->
                let idx = Int64.to_int (Int_value.to_int64 i) in
@@ -545,8 +731,17 @@ let binding_manifest : binding list =
            | _ -> arg_mismatch "(Array, Int)"));
     intrinsic_binding "__intrinsic_array_set"
       (adapter_raw_wb
-         [ Type_repr.Unit; Type_repr.Unit; Type_repr.Unit ]
+         [ (Access_effect.Inout, vec_of p0); (Access_effect.Let, ty_int);
+           (Access_effect.Sink, p0) ]
          Type_repr.Unit (fun _ args ->
+          (* ownership semantics: the bounds check runs FIRST — a
+             failed check consumes NOTHING (an error, no writeback).
+             On success the sink value arrives MOVED and is TAKEN —
+             the exact value object becomes the stored element at the
+             index — and the OLD element is relinquished exactly once
+             (it appears in no live value afterward: the writeback
+             array is a shallow copy sharing only the retained
+             elements, and the old array value is dead). *)
           match args with
           | [| Vm_value.Array elems; Vm_value.Int i; value |] ->
               let idx = Int64.to_int (Int_value.to_int64 i) in
@@ -563,10 +758,16 @@ let binding_manifest : binding list =
               end
           | _ -> Error "argument mismatch: expected (Array, Int, value)"));
     intrinsic_binding "__intrinsic_array_remove"
-      (adapter_raw_wb [ Type_repr.Unit; Type_repr.Unit ] Type_repr.Unit (fun _ args ->
+      (adapter_raw_wb
+         [ (Access_effect.Inout, vec_of p0); (Access_effect.Let, ty_int) ]
+         p0 (fun _ args ->
            (* VALUE ABI, CHECKED: the removed element is the language
               value and the shifted remainder travels through the
-              writeback channel *)
+              writeback channel.  Element ownership TRANSFERS to the
+              caller exactly once: the removed element appears ONLY in
+              the returned value — the writeback shares only the
+              retained prefix/suffix.  The bounds check runs FIRST — a
+              failed check consumes NOTHING. *)
            match args with
            | [| Vm_value.Array elems; Vm_value.Int i |] ->
                let idx = Int64.to_int (Int_value.to_int64 i) in
@@ -586,8 +787,14 @@ let binding_manifest : binding list =
            | _ -> Error "argument mismatch: expected (Array, Int)"));
     intrinsic_binding "__intrinsic_array_insert"
       (adapter_raw_wb
-         [ Type_repr.Unit; Type_repr.Unit; Type_repr.Unit ]
+         [ (Access_effect.Inout, vec_of p0); (Access_effect.Let, ty_int);
+           (Access_effect.Sink, p0) ]
          Type_repr.Unit (fun _ args ->
+          (* the bounds check runs FIRST — a failed check consumes
+             NOTHING (an error, no writeback).  On success the sink
+             item arrives MOVED and is TAKEN: the exact value object
+             is placed at the index and the writeback shares only the
+             retained elements. *)
           match args with
           | [| Vm_value.Array elems; Vm_value.Int i; item |] ->
               let idx = Int64.to_int (Int_value.to_int64 i) in
@@ -606,17 +813,21 @@ let binding_manifest : binding list =
                               (Array.append [| item |] (Array.sub elems idx (n - idx))))) ] }
           | _ -> Error "argument mismatch: expected (Array, Int, item)"));
     intrinsic_binding "__intrinsic_array_clear"
-      (adapter_raw_wb [ Type_repr.Unit ] Type_repr.Unit (fun _ args ->
+      (adapter_raw_wb [ (Access_effect.Inout, vec_of p0) ] Type_repr.Unit (fun _ args ->
+           (* every element is relinquished: the writeback is empty and
+              none of the old elements appears in any live value *)
            match args with
            | [| Vm_value.Array _ |] ->
                Ok { value = Vm_value.Unit;
                     writebacks = [ (0, Vm_value.Array [||]) ] }
            | _ -> Error "argument mismatch: expected (Array)"));
     intrinsic_binding "__intrinsic_array_contains"
-      (adapter_raw [ Type_repr.Unit; Type_repr.Unit ] Type_repr.Bool (fun _ args ->
+      (adapter_raw (lets [ vec_of p0; p0 ]) ty_bool (fun _ args ->
+           (* pure read; the containment decision uses lookup_eq — a
+              resource-containing element is never reported Eq *)
            match args with
            | [| Vm_value.Array elems; item |] ->
-               Ok (Vm_value.Bool (Array.exists (fun e -> Vm_value.equal e item) elems))
+               Ok (Vm_value.Bool (Array.exists (fun e -> lookup_eq e item) elems))
            | _ -> arg_mismatch "(Array, item)"));
     intrinsic_binding "print"
       (adapter_string_ret_unit (fun t s -> emit_stdout t s));
@@ -627,7 +838,11 @@ let binding_manifest : binding list =
     intrinsic_binding "panic"
       (adapter_string_ret_never (fun _ s -> Printf.sprintf "panic: %s" s));
     intrinsic_binding "__intrinsic_abort"
-      (adapter_ret_never (fun _ -> "__intrinsic_abort: process aborted"));
+      (adapter_raw [] Type_repr.Unit (fun _ _ ->
+           (* the std declares () -> Unit (std/core.tg); the seed host
+              semantics are the deterministic abort error, which traps
+              the VM before any value materializes *)
+           Error "__intrinsic_abort: process aborted"));
     intrinsic_binding "__intrinsic_int_to_string"
       (adapter_int_ret_string (fun _ i -> Int_value.to_string i));
     intrinsic_binding "__intrinsic_bool_to_string"
@@ -646,7 +861,7 @@ let binding_manifest : binding list =
        received): tg_get_argc returns the argv length and _tg_arg_copy
        the i-th argv string (the kernel's raw_arg_count/raw_arg_copy). *)
     extern_binding "tg_get_argc"
-      (adapter_raw [] (Type_repr.Int Type_repr.Int) (fun t args ->
+      (adapter_raw [] ty_int (fun t args ->
            match args with
            | [||] ->
                Ok
@@ -655,7 +870,7 @@ let binding_manifest : binding list =
                        (Int64.of_int (Array.length t.argv))))
            | _ -> arg_mismatch "no arguments"));
     extern_binding "_tg_arg_copy"
-      (adapter_raw [ Type_repr.Int Type_repr.Int ] Type_repr.String (fun t args ->
+      (adapter_raw (lets [ ty_int ]) ty_string (fun t args ->
            match args with
            | [| Vm_value.Int i |] ->
                let n = Int64.to_int (Int_value.to_int64 i) in
@@ -773,6 +988,45 @@ type closure_report = {
   bound : string list;
 }
 
+(* The registry's declaration vs the binding's INDEPENDENT adapter
+   declaration, compared with the SHARED signature-identity matcher
+   (audit P0-3/P0-4): arity, every parameter's convention and type
+   (alpha-equivalent under one binder bijection), and the return —
+   exact TypeIds after each side's registry-domain canonicalization
+   (canonicalize_registry — defined with the adapters above).  Returns
+   the rendered problem, or None when the signatures are identical. *)
+let check_binding_signature (reachable : bool) (name : string)
+    (dsig : Intrinsic_registry.signature) (b : binding) : string option =
+  let prefix = if reachable then " for reachable" else "" in
+  let declared = Signature_identity.of_registry dsig in
+  let canon_left = canonicalize_registry and canon_right = canonicalize_registry in
+  if
+    not
+      (Signature_identity.signatures_match ~canon_left ~canon_right declared
+         b.adapter)
+  then
+    match
+      Signature_identity.first_mismatch ~canon_left ~canon_right declared b.adapter
+    with
+    | Some (Signature_identity.Mismatch_arity (nd, na)) ->
+        Some
+          (Printf.sprintf "signature mismatch%s for %s: declared arity %d, binding arity %d"
+             prefix name nd na)
+    | Some (Signature_identity.Mismatch_param i) ->
+        Some
+          (Printf.sprintf
+             "signature mismatch%s for %s: parameter %d disagrees (declared %s; binding %s)"
+             prefix name (i + 1)
+             (param_contract declared.Signature_identity.sig_params.(i))
+             (param_contract b.adapter.Signature_identity.sig_params.(i)))
+    | Some Signature_identity.Mismatch_return ->
+        Some
+          (Printf.sprintf "return mismatch%s for %s: declared %s, binding %s" prefix name
+             (Intrinsic_registry.ty_to_string declared.Signature_identity.sig_ret)
+             (Intrinsic_registry.ty_to_string b.adapter.Signature_identity.sig_ret))
+    | None -> None
+  else None
+
 let closure_check (t : t) : (closure_report, string list) result =
   let module SS = Set.Make (String) in
   let problems = ref [] in
@@ -795,14 +1049,10 @@ let closure_check (t : t) : (closure_report, string list) result =
     (fun (name, dsig) ->
       match List.find_opt (fun b -> b.name = name) t.bindings with
       | None -> ()
-      | Some b ->
-          let decl_params = Array.to_list (Array.map (fun p -> type_key p.Type_repr.pt_type) dsig.Intrinsic_registry.params) in
-          let decl_ret = type_key dsig.Intrinsic_registry.ret in
-          if decl_params <> b.signature.param_types then
-            problem "signature mismatch for %s: declared params [%s], binding params [%s]"
-              name (String.concat ", " decl_params) (String.concat ", " b.signature.param_types);
-          if decl_ret <> b.signature.return_type then
-            problem "return mismatch for %s: declared %s, binding %s" name decl_ret b.signature.return_type)
+      | Some b -> (
+          match check_binding_signature false name dsig b with
+          | Some p -> problem "%s" p
+          | None -> ()))
     declared;
   let extras = SS.diff impl_names decl_names in
   if not (SS.is_empty extras) then
@@ -863,18 +1113,9 @@ let closure_check_reachable (t : t) (reachable : host_id list) :
             | Some b ->
                 incr implemented;
                 bound_names := name :: !bound_names;
-                let decl_params =
-                  Array.to_list (Array.map (fun p -> type_key p.Type_repr.pt_type) dsig.Intrinsic_registry.params)
-                in
-                let decl_ret = type_key dsig.Intrinsic_registry.ret in
-                if decl_params <> b.signature.param_types then
-                  problem
-                    "signature mismatch for reachable %s: declared params [%s], binding params [%s]"
-                    name (String.concat ", " decl_params)
-                    (String.concat ", " b.signature.param_types);
-                if decl_ret <> b.signature.return_type then
-                  problem "return mismatch for reachable %s: declared %s, binding %s" name
-                    decl_ret b.signature.return_type)
+                (match check_binding_signature true name dsig b with
+                 | Some p -> problem "%s" p
+                 | None -> ()))
       end)
     reachable;
   match List.rev !problems with

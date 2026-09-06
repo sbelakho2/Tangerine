@@ -62,16 +62,25 @@ type work_item = {
    mentioning Named (TypeId, args) where args carry no Type_params is a
    CONCRETE instance of a generic nominal (Pair[Int] where Pair[T]'s
    template def has Type_param fields) — a required concrete type
-   definition.  The identity of such an instance is exactly (TypeId,
-   [concrete substitutions]), and the instances are queued ALONGSIDE
-   the function instances during the drain: every specialized body is
-   walked for Named mentions, each (tid, args) whose tid names a
-   generic template is queued at most once (dedup by (tid, args)), and
-   the queue is exposed in first-discovery order through build's
-   on_type_instance hook.  The materialization itself (substituting the
-   template's field/variant types under the KParam-keyed table and
-   minting fresh TypeIds) is the driver's post-mono assembly
-   (Driver.materialize_type_instances). *)
+   definition.  The instances are queued ALONGSIDE the function
+   instances during the drain: every specialized body is walked for
+   Named mentions, each mention whose tid names a generic template is
+   queued at most once, and the queue is exposed in first-discovery
+   order through build's on_type_instance hook.  The materialization
+   itself (substituting the template's field/variant types under the
+   KParam-keyed table and minting the instance TypeIds) is the driver's
+   post-mono assembly (Driver.materialize_type_instances).
+
+   CANONICAL identity (audit P0-13): when build is handed the shared
+   Canonical_type_instance.t cache (the optional ~canonical table the
+   driver creates once and passes to the queue, the materializer and
+   the verifier alike), discovery and dedup run on the CANONICAL key —
+   CanonicalTypeInstance { generic_def_id; canonical_type_args } with
+   the args normalized before keying (64-bit alias pairs and literal
+   defaulting; never an unsolved Infer_var) — so the queue fires each
+   logically identical instance exactly once and interns it to its one
+   canonical specialized id at first discovery.  Without the table the
+   queue dedups by the raw (tid, args) spelling, exactly as before. *)
 
 type type_instance = {
   ti_tid : Ids.Type_id.t;      (* the generic nominal's TypeId *)
@@ -242,12 +251,24 @@ let specialize_under (subst : (Type_repr.generic_key * Type_repr.t) list)
     | Assign (p, rv) -> Assign (p, subst_rvalue rv)
     | s -> s
   in
+  let subst_callee_args (args : Type_repr.t array) : Type_repr.t array =
+    Array.map subst_ty args
+  in
   let subst_terminator t =
     match t with
-    | Call (dest, User i, args, next, unwind) ->
+    | Call (dest, callee, args, next, unwind) ->
+        let callee' =
+          match callee with
+          | User i -> User (subst_instance subst i)
+          | Derived (c, cargs) -> Derived (c, subst_callee_args cargs)
+          | Intrinsic (i, iargs) -> Intrinsic (i, subst_callee_args iargs)
+          | Extern (i, eargs) -> Extern (i, subst_callee_args eargs)
+          | TypeQuery (k, qargs) -> TypeQuery (k, subst_callee_args qargs)
+          | FnValue op -> FnValue (subst_operand op)
+        in
         Call
           ( dest,
-            User (subst_instance subst i),
+            callee',
             Array.map (fun a -> { a with value = subst_operand a.value }) args,
             next,
             unwind )
@@ -322,10 +343,16 @@ let walk_instances (body : function_) (f : Instance_id.t -> unit) : unit =
         b.statements;
       match b.terminator with
       | Call (_, callee, args, _, _) -> (
+          (* the callee-class instance surface (audit P0-5): a User
+             callee and a Derived callee (the compiler-synthesized
+             derived contracts — real bodies under the SAME callable the
+             call references) both name an emitted-body instance the
+             drain must specialize *)
           (match callee with
            | User i -> f i
+           | Derived (c, args) -> f (Instance_id.make ~callable:c ~type_args:args)
            | FnValue op -> scan_operand op
-           | Intrinsic _ | Extern _ -> ());
+           | Intrinsic _ | Extern _ | TypeQuery _ -> ());
           Array.iter (fun a -> scan_operand a.value) args)
       | SwitchInt (op, _, _) | Assert (op, _, _, _) -> scan_operand op
       | _ -> ())
@@ -335,13 +362,17 @@ let walk_instances (body : function_) (f : Instance_id.t -> unit) : unit =
    registry and on_type_instance hook implement the concrete
    type-instance queue: when a registry is supplied, every specialized
    body/signature is walked for concrete Named mentions of generic
-   nominals and each first-discovered (tid, args) fires the hook (in
+   nominals and each first-discovered instance fires the hook (in
    discovery order).  With the defaults (empty registry, no-op hook)
    the behavior is exactly the function-only monomorphizer.  The
+   optional ~canonical table (the shared Canonical_type_instance cache)
+   makes the queue's membership canonical — same (template, args)
+   always fires and interns exactly once, across every consumer.  The
    optional registered_only surface (callable -> declared-parameter
    count) names the typed-but-body-less callables whose concrete calls
    the drain keeps instead of failing on the missing template. *)
 let build ~(entry : Instance_id.t) ?(generic_types : generic_def array = [||])
+    ?(canonical : Canonical_type_instance.t option = None)
     ?(on_type_instance : type_instance -> unit = fun _ -> ())
     ?(registered_only : (Ids.Callable_id.t -> int option) = fun _ -> None)
     (prog : program) : (function_ array, string list) result =
@@ -419,15 +450,34 @@ let build ~(entry : Instance_id.t) ?(generic_types : generic_def array = [||])
                    (Seed_mir.print_instance inst) declared carried)
             else Hashtbl.replace kept_bodyless inst ())
   in
-  (* the concrete type-instance queue: dedup by (tid, args); the hook
-     fires at FIRST discovery, so the driver's materialization sees each
-     required instance exactly once, in deterministic order *)
-  let type_seen : type_instance list ref = ref [] in
+  (* the concrete type-instance queue: the hook fires at FIRST
+     discovery, so the driver's materialization sees each required
+     instance exactly once, in deterministic order.  With the shared
+     canonical table the membership is the CANONICAL key — same
+     (template, args) fires once regardless of alias/literal arg
+     spelling, and the instance is interned to its one canonical
+     specialized id at first discovery (audit P0-13).  Without the
+     table the membership is the raw (tid, args) spelling, exactly as
+     before. *)
+  let type_seen : Canonical_type_instance.canonical_type_instance list ref = ref [] in
+  let type_seen_raw : type_instance list ref = ref [] in
   let queue_type_instance (ti : type_instance) =
-    if not (List.exists (type_instance_equal ti) !type_seen) then begin
-      type_seen := ti :: !type_seen;
-      on_type_instance ti
-    end
+    match canonical with
+    | None ->
+        if not (List.exists (type_instance_equal ti) !type_seen_raw) then begin
+          type_seen_raw := ti :: !type_seen_raw;
+          on_type_instance ti
+        end
+    | Some t ->
+        let key = Canonical_type_instance.key_of ti.ti_tid ti.ti_args in
+        if not (List.exists (Canonical_type_instance.equal_key key) !type_seen) then begin
+          type_seen := key :: !type_seen;
+          (* intern at first discovery: the one mint for this instance's
+             canonical specialized id (None for the excluded builtin
+             runtime nominals — Vec/Map/Set/Ptr/PtrMut never remap) *)
+          ignore (Canonical_type_instance.intern t ti.ti_tid ti.ti_args);
+          on_type_instance ti
+        end
   in
   let scan_ty (ty : Type_repr.t) = scan_type generic_types queue_type_instance ty in
   let scan_inst (inst : Instance_id.t) =
@@ -457,13 +507,21 @@ let build ~(entry : Instance_id.t) ?(generic_types : generic_def array = [||])
   in
   (* walk every type position of a specialized body/signature: its own
      instance args, params, locals, then every rvalue type (cast
-     targets, function constants, closure aggregates, callee instances,
-     call argument operands) *)
+     targets, function constants, closure aggregates, callee instances
+     and the class-carried callee type args, call argument operands) *)
   let scan_body_types (body : function_) =
     if Array.length generic_types > 0 then begin
       scan_inst body.instance;
       Array.iter (fun p -> scan_ty p.Type_repr.pt_type) body.params;
       Array.iter scan_ty body.locals;
+      let scan_callee_types (callee : callee) : unit =
+        match callee with
+        | User i -> scan_inst i
+        | Derived (_, args) | Intrinsic (_, args) | Extern (_, args)
+        | TypeQuery (_, args) ->
+            Array.iter scan_ty args
+        | FnValue op -> scan_operand op
+      in
       Array.iter
         (fun b ->
           List.iter
@@ -473,10 +531,7 @@ let build ~(entry : Instance_id.t) ?(generic_types : generic_def array = [||])
             b.statements;
           match b.terminator with
           | Call (_, callee, args, _, _) ->
-              (match callee with
-               | User i -> scan_inst i
-               | FnValue op -> scan_operand op
-               | Intrinsic _ | Extern _ -> ());
+              scan_callee_types callee;
               Array.iter (fun a -> scan_operand a.value) args
           | SwitchInt (op, _, _) | Assert (op, _, _, _) -> scan_operand op
           | _ -> ())

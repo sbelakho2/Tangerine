@@ -191,7 +191,7 @@ let call_program (callee : Seed_mir.callee) (arg : (Type_repr.t * Seed_mir.const
 let check_vm_dispatch () =
   (* __intrinsic_int_to_string(42) -> "42" through the real binding *)
   let p1 =
-    call_program (Seed_mir.Intrinsic (intrinsic_id "__intrinsic_int_to_string"))
+    call_program (Seed_mir.Intrinsic (intrinsic_id "__intrinsic_int_to_string", [||]))
       (Some (Type_repr.Int Type_repr.Int, int_constant 42L)) Type_repr.String
   in
   let entry = p1.Seed_mir.functions.(0).Seed_mir.instance in
@@ -210,7 +210,7 @@ let check_vm_dispatch () =
    | Ok _ -> fail "int-to-string program returned a non-zero exit code");
   (* println("...") writes the Host stdout buffer through the binding *)
   let p2 =
-    call_program (Seed_mir.Intrinsic (intrinsic_id "println"))
+    call_program (Seed_mir.Intrinsic (intrinsic_id "println", [||]))
       (Some (Type_repr.String, Seed_mir.String "hello from host self-check"))
       Type_repr.Unit
   in
@@ -226,7 +226,7 @@ let check_vm_dispatch () =
    | Ok _ -> fail "println program returned a non-zero exit code");
   (* panic("boom") -> deterministic host error *)
   let p3 =
-    call_program (Seed_mir.Intrinsic (intrinsic_id "panic"))
+    call_program (Seed_mir.Intrinsic (intrinsic_id "panic", [||]))
       (Some (Type_repr.String, Seed_mir.String "boom")) Type_repr.Never
   in
   let e3 = p3.Seed_mir.functions.(0).Seed_mir.instance in
@@ -237,7 +237,7 @@ let check_vm_dispatch () =
    | Error e -> fail "panic produced the wrong error: %s" e.Vm.message
    | Ok _ -> fail "panic program returned instead of raising a host error");
   (* __intrinsic_abort() -> deterministic host error (zero-arity binding) *)
-  let p4 = call_program (Seed_mir.Intrinsic (intrinsic_id "__intrinsic_abort")) None Type_repr.Unit in
+  let p4 = call_program (Seed_mir.Intrinsic (intrinsic_id "__intrinsic_abort", [||])) None Type_repr.Unit in
   let e4 = p4.Seed_mir.functions.(0).Seed_mir.instance in
   let host4 = Host.create ~repo_root:"." ~argv:[||] in
   (match Vm.run ~program:p4 ~entry:e4 ~argv:[||] ~host:host4 with
@@ -247,7 +247,7 @@ let check_vm_dispatch () =
    | Ok _ -> fail "__intrinsic_abort program returned instead of raising a host error");
   (* __sync_synchronize() -> Unit through the Extern dispatch path *)
   let p5 =
-    call_program (Seed_mir.Extern (extern_id "__sync_synchronize")) None Type_repr.Unit
+    call_program (Seed_mir.Extern (extern_id "__sync_synchronize", [||])) None Type_repr.Unit
   in
   let e5 = p5.Seed_mir.functions.(0).Seed_mir.instance in
   let host5 = Host.create ~repo_root:"." ~argv:[||] in
@@ -259,7 +259,7 @@ let check_vm_dispatch () =
      C3 A9: the host must use the Stage0 UTF-8 scalar encoder, not
      String.make 1 (Uchar.to_char c) (which truncates non-ASCII). *)
   let p7 =
-    call_program (Seed_mir.Intrinsic (intrinsic_id "__intrinsic_char_to_string"))
+    call_program (Seed_mir.Intrinsic (intrinsic_id "__intrinsic_char_to_string", [||]))
       (Some (Type_repr.Char, Seed_mir.Char (Uchar.of_int 0xE9))) Type_repr.String
   in
   let e7 = p7.Seed_mir.functions.(0).Seed_mir.instance in
@@ -280,10 +280,11 @@ let check_vm_dispatch () =
            | Error m -> fail "char-to-string inspect failed: %s" m))
    | Ok _ -> fail "char-to-string program returned a non-zero exit code");
   (* declared-but-unbound symbol traps fail-closed (the intrinsic
-     table's declared names without a host binding: __intrinsic_set_remove
-     is declared in the registry but has no binding in the default host) *)
+     table's declared names without a host binding: the map/set record-
+     visit traversal intrinsics are declared in the registry but have
+     no binding in the default host) *)
   let p6 =
-    call_program (Seed_mir.Intrinsic (intrinsic_id "__intrinsic_set_remove"))
+    call_program (Seed_mir.Intrinsic (intrinsic_id "__intrinsic_map_visit_begin", [||]))
       (Some (Type_repr.Unit, Seed_mir.Unit)) Type_repr.Unit
   in
   let e6 = p6.Seed_mir.functions.(0).Seed_mir.instance in
@@ -320,9 +321,9 @@ let check_reachable_closure_boundary () =
   let prog_a =
     { Seed_mir.functions =
         [| call_fn "use_bound_intrinsic" 1
-             (Seed_mir.Intrinsic (intrinsic_id "__intrinsic_int_to_string"))
+             (Seed_mir.Intrinsic (intrinsic_id "__intrinsic_int_to_string", [||]))
              (Some (Type_repr.Int Type_repr.Int, int_constant 42L)) Type_repr.String;
-           call_fn "use_unbound_extern" 2 (Seed_mir.Extern (extern_id "rb_funcall")) None
+           call_fn "use_unbound_extern" 2 (Seed_mir.Extern (extern_id "rb_funcall", [||])) None
              Type_repr.Unit |];
       statics = [||];
       types = [||] }
@@ -352,7 +353,7 @@ let check_reachable_closure_boundary () =
   let prog_b =
     { Seed_mir.functions =
         [| call_fn "use_bound_intrinsic" 1
-             (Seed_mir.Intrinsic (intrinsic_id "__intrinsic_int_to_string"))
+             (Seed_mir.Intrinsic (intrinsic_id "__intrinsic_int_to_string", [||]))
              (Some (Type_repr.Int Type_repr.Int, int_constant 42L)) Type_repr.String |];
       statics = [||];
       types = [||] }
@@ -379,7 +380,7 @@ let check_reachable_closure_boundary () =
     { Seed_mir.functions =
         [| call_fn "println" 7 (Seed_mir.User println_inst) None Type_repr.Unit;
            call_fn "use_bound_intrinsic" 1
-             (Seed_mir.Intrinsic (intrinsic_id "__intrinsic_int_to_string"))
+             (Seed_mir.Intrinsic (intrinsic_id "__intrinsic_int_to_string", [||]))
              (Some (Type_repr.Int Type_repr.Int, int_constant 42L)) Type_repr.String |];
       statics = [||];
       types = [||] }
