@@ -170,6 +170,20 @@ struct CodegenCtx
   data: CodeBuffer
   rodata: CodeBuffer
   debug_current_fn: String
+  # (P1-6) the declared floating-point mode of the function CURRENTLY
+  # being emitted — MirFunction.fp_fast, set ONLY by the function
+  # attribute @fp(fast) (mir.tg's lower_program PASS 2 — the same
+  # item-attribute channel as the P1-18 hints). The STRICT IEEE mode is
+  # the default (false) — its semantics are the CANONICAL SPEC in
+  # types.tg (the FP-mode module doc above the Type enum). Optimization
+  # level never reaches codegen (no opt_level field exists here — -O
+  # flags are consumed solely by mir.tg's optimize_mir_verified), so
+  # this flag is attribute-only and -O3 can never silently enable fast
+  # math. Stamped per function at codegen_function's fp-mode stamp site
+  # (the debug_current_fn precedent — the stamp precedes every body
+  # emission); the float emission sites consult it when the @fp(fast)
+  # fast paths land (TODO P1-6 markers there).
+  current_fp_fast: Bool = false
   # Track BSS size for uninitialized globals
   bss_size: Int
   bss_symbols: Vec[AsmSymbol]  # Symbols in .bss
@@ -1049,6 +1063,7 @@ def codegen_new(target: AsmTarget) -> CodegenCtx
     data: buf_new(),
     rodata: buf_new(),
     debug_current_fn: "".to_string(),
+    current_fp_fast: false,
     bss_size: 0,
     bss_symbols: Vec::new(),
     string_pool: Map::new(),
@@ -1231,6 +1246,14 @@ end
 # all of them). The former W64-for-compound fallback is now derived from the
 # Repr decision table through codegen_type_repr instead of being re-decided
 # here.
+# The register/memory WIDTH a value occupies in the frame and at every
+# sized load/store. The primitive rows are the ABI widths the extern
+# boundary relies on (audit P1-13): Bool is the 1-byte _Bool/bool width,
+# i8/u8 the C char width (the Tangerine Char is the 4-byte Unicode
+# scalar and does NOT serve the C char ABI), i16/u16 the C short width,
+# i32/u32 the C int width, i64/u64/Int/UInt the C long/long-long/pointer
+# widths. Loading/storing at these widths is what makes narrow C extern
+# returns and parameters exact (see normalize_extern_return).
 def storage_width_of(inout ctx: CodegenCtx, ty: Type) -> MemWidth
   match codegen_type_repr(ctx, ty)
   when Repr::Immediate then
@@ -2191,6 +2214,24 @@ end
 # +4294967295 instead of -1. Full-width returns (Int/I64/U64/pointers)
 # are already exact and pass through unchanged; the extension is
 # idempotent for properly-formed values.
+# (audit P1-13 — narrow C returns, bool/char ABI): C `char`/`short`/
+# `_Bool` returns arrive in the low 8/16/32 bits of the return register
+# (a C callee extends them to int per its declared type; _Bool is 0/1).
+# They need no normalization here because the post-call store is
+# width-masked (storage_width_of: Bool -> W8 zero-extension, i8/u8 ->
+# W8, i16/u16 -> W16) and every later load re-extends with the
+# declared type's signedness (storage_signedness_of). The Tangerine
+# `Char` type is the 4-byte Unicode scalar (W32, sign-extended), NOT the
+# C `char` (1 byte): the C `char` ABI is served by i8/u8 parameter and
+# return types at the FFI surface. Bool at the C boundary is the 1-byte
+# `_Bool`/`bool` (CType::Bool width 1 in bindgen's c_type_size), and the
+# extern return/argument slots carry its 0/1 value in W8.
+# (audit P1-13 — return ownership): the returned register is raw data;
+# whether the Tangerine caller OWNS what it denotes is fixed by the
+# DECLARED return type at the call site (owning wrappers such as
+# std::ffi::Owned[T]/CString carry their own drop discipline; a raw Ptr
+# return is caller-borrowed until wrapped). Nothing in the register
+# itself transfers ownership.
 def normalize_extern_return(inout ctx: CodegenCtx, rr: PhysReg, dest_ty: Type) -> Unit
   match dest_ty
   when Type::I32 then
@@ -2426,21 +2467,49 @@ end
 # argument registers — x0/rdi = ptr, x1/rsi = value (or order for load),
 # x2/rdx = order/desired, x3/rcx = weak, x4/r8 = success_order, x5/r9 =
 # failure_order. Order codes (ordering_to_c in std::atomic): 0 = Relaxed
-# ... 5 = SeqCst. AArch64 emits the strongest form unconditionally
-# (LDAR/STLR/LSE-al — correct for every ordering). x86-64 reads the
-# ordering where it matters: the SeqCst STORE is the xchg-based store
-# (the implicitly-locked exchange) while the weaker stores are plain
-# MOVs (TSO gives a plain store the release semantics); the SeqCst LOAD
-# stays the plain MOV — the total order is TSO + the xchg-store
-# discipline. The compare_exchange `expected` argument is the ADDRESS of
-# the expected slot (in/out: the current value is written back on
-# failure).
+# ... 5 = SeqCst.
+#
+# ORDERING DISCIPLINE (P1-20 — the per-ordering lowering, memory_model.md
+# §16.8): the emitters serve AT LEAST the requested ordering, exactly
+# where the ISA has a cheaper form, and the strongest form where it does
+# not:
+#   * AArch64 load: Relaxed = plain LDR; Acquire/SeqCst = LDAR (an
+#     acquire load; the LDAR/STLR pair is the SC-load/SC-store
+#     discipline on the supported ARMv8.3+ LSE-required cores).
+#   * AArch64 store: Relaxed = plain STR; Release/SeqCst = STLR.
+#   * x86-64 load: plain MOV for every ordering (TSO: loads are
+#     acquire; SC loads = plain MOV under the xchg-store discipline).
+#   * x86-64 store: SeqCst = the xchg-based store (the implicitly
+#     locked exchange); Relaxed/Release = plain MOVs (TSO gives a
+#     plain store the release semantics).
+#   * RMW/exchange both arches: the strongest form unconditionally
+#     (AArch64: the LSE-al family — LDADDAL/CASAL/SWPAL; x86: the
+#     LOCKed ops) — correct for every ordering, including Relaxed
+#     (stronger-than-requested is always legal). The per-ordering
+#     A/L variants (LDADD/LDADDA/LDADDL …) are the TODO in §16.8.1.
+#   * compare_exchange both arches: the strongest form for BOTH the
+#     success and the failure path (CASAL / lock cmpxchg), so every
+#     legal (success, failure) pair is served; failure-order dispatch
+#     is the TODO in §16.8.1.
+#   * fence: per-ordering — see the fence arms below (AArch64: DMB
+#     ISHLD for Acquire, DMB ISH for Release/AcqRel/SeqCst, nothing
+#     for Relaxed; x86-64: MFENCE only for SeqCst — TSO needs no
+#     instruction for the weaker fence orders).
+#
+# The compare_exchange `expected` argument is the ADDRESS of the
+# expected slot (in/out: the current value is written back on failure);
+# the `weak` flag is accepted for ABI compatibility — the emitters use
+# the single-attempt strong form (weak CAS is a PERMISSION to fail
+# spuriously, so the strong form is always conformant).
 #
 # LSE CONTRACT: the AArch64 RMWs (LDADDAL/CASAL/SWPAL — the LSE-al family
 # below) require the ARMv8.1 LSE extension; the aarch64 target's contract
 # is LSE-REQUIRED (see asm.tg's target feature table — the driver's
-# --target documentation). The LL/SC (ldaxr/stlxr) fallback is the future
-# portable mode, not the current emission.
+# --target documentation). The ldaxr/stlxr LL/SC fallback is the future
+# portable mode, not the current emission. The SeqCst store/load
+# discipline (STLR/LDAR as the SC pair) additionally assumes the ARMv8.3+
+# cumulative semantics of the pair, which the LSE-required core baseline
+# (Apple Silicon / Neoverse class) provides (memory_model.md §16.8).
 def emit_atomic_intrinsic(inout ctx: CodegenCtx, name: String) -> Bool
   let (op, width) = atomic_intrinsic_op_and_width(name)
   match ctx.target.arch
@@ -2488,11 +2557,16 @@ def a64_ldar_enc(width: Int) -> u32
 end
 
 def a64_stlr_enc(width: Int) -> u32
+  # STLR bases verified against the AArch64 ISA (assembled + disassembled):
+  # STLRB = 0x089FFC00 | Rn<<5 | Rt, STLRH = 0x489FFC00, STLR (w) =
+  # 0x889FFC00, STLR (x) = 0xC89FFC00 (e.g. stlr x1,[x0] = 0xC89FFC01).
+  # The former constants (…1F7C00) were NOT valid STLR encodings (P1-20
+  # audit: an AArch64 atomic store emitted an unallocated instruction word).
   match width
-  when 1 then 0x001F7C00
-  when 2 then 0x401F7C00
-  when 4 then 0x801F7C00
-  when 8 then 0xC01F7C00
+  when 1 then 0x089FFC00
+  when 2 then 0x489FFC00
+  when 4 then 0x889FFC00
+  when 8 then 0xC89FFC00
   when _ then 0x00000000
   end  end
 end
@@ -2571,18 +2645,74 @@ end
 def emit_atomic_intrinsic_a64(inout ctx: CodegenCtx, op: String, width: Int) -> Unit
   match op
   when "fence" then
+    # Per-ordering fence. The order code arrives in x0 (the fence's
+    # only argument): 0 = Relaxed, 2 = Acquire, 3 = Release,
+    # 4 = AcqRel, 5 = SeqCst. Relaxed = no instruction. Acquire =
+    # DMB ISHLD (the load-acquire barrier). Release/AcqRel/SeqCst =
+    # DMB ISH (full): a release fence must also keep later loads from
+    # being observed before the prior stores (a store->load crossing
+    # that the store-store-only DMB ISHST does NOT prevent) — the full
+    # barrier is the mapping clang/gcc emit (memory_model.md §16.8.1).
+    let lbl_fence_ld = ".Latomic_fence_ld." + ctx.fn_counter.to_string()
+    let lbl_fence_done = ".Latomic_fence_done." + ctx.fn_counter.to_string()
+    ctx.fn_counter = ctx.fn_counter + 1
+    a64_cmp_ri(&mut ctx.text, A64::X0, 0)
+    a64_bcond(&mut ctx.text, a64_cc_eq(), lbl_fence_done.clone())
+    a64_cmp_ri(&mut ctx.text, A64::X0, 2)
+    a64_bcond(&mut ctx.text, a64_cc_eq(), lbl_fence_ld.clone())
     a64_dmb_ish(&mut ctx.text)
+    a64_b(&mut ctx.text, lbl_fence_done.clone())
+    def_label(&mut ctx.text, lbl_fence_ld.clone())
+    a64_dmb_ishld(&mut ctx.text)
+    def_label(&mut ctx.text, lbl_fence_done.clone())
   when "load" then
-    # LDAR (acquire) — correct for every ordering (Relaxed is served
-    # stronger, never weaker).
+    # Per-ordering load. The order code arrives in x1. Relaxed (0) =
+    # plain LDR (atomicity only); Acquire (2) and SeqCst (5) = LDAR —
+    # an acquire load, which under the LDAR/STLR SC discipline is
+    # also the SeqCst load. An out-of-domain code (Release/AcqRel —
+    # UB per memory_model.md §16.3) deterministically takes the LDAR
+    # arm (strongest form).
+    let lbl_ld_rel = ".Latomic_load_relaxed." + ctx.fn_counter.to_string()
+    let lbl_ld_done = ".Latomic_load_done." + ctx.fn_counter.to_string()
+    ctx.fn_counter = ctx.fn_counter + 1
+    a64_cmp_ri(&mut ctx.text, A64::X1, 0)
+    a64_bcond(&mut ctx.text, a64_cc_eq(), lbl_ld_rel.clone())
+    # LDAR Xt/Wt, [x0] — acquire; the result register is x0.
     emit32_le(&mut ctx.text, a64_ldar_enc(width) | (a64_code(A64::X0) << 5) | a64_code(A64::X0))
+    a64_b(&mut ctx.text, lbl_ld_done.clone())
+    def_label(&mut ctx.text, lbl_ld_rel.clone())
+    # Plain load (Relaxed): LDRB/LDRH/LDR(W)/LDR into x0 (W loads
+    # zero-extend into x0).
+    match width
+    when 1 then a64_ldrb(&mut ctx.text, A64::X0, A64::X0, 0)
+    when 2 then a64_ldrh(&mut ctx.text, A64::X0, A64::X0, 0)
+    when 4 then a64_ldr_w(&mut ctx.text, A64::X0, A64::X0, 0)
+    when 8 then a64_ldr(&mut ctx.text, A64::X0, A64::X0, 0)
+    end
+    def_label(&mut ctx.text, lbl_ld_done.clone())
   when "store" then
-    # STLR (release) with the value in x1 — the SeqCst store on
-    # AArch64: the LDAR/STLR pair is SC on ARMv8 (a SeqCst store is
-    # STLR + the acquire/release pair discipline, exactly what the
-    # LDAR/STLR implementation provides), so the ordering argument
-    # needs no branch here.
+    # Per-ordering store. The order code arrives in x2. Relaxed (0) =
+    # plain STR; Release (3) and SeqCst (5) = STLR (a SeqCst store on
+    # AArch64 is STLR — the LDAR/STLR pair provides the SC
+    # discipline). An out-of-domain code (Acquire/AcqRel — UB per
+    # memory_model.md §16.3) deterministically takes the STLR arm.
+    let lbl_st_rel = ".Latomic_store_relaxed." + ctx.fn_counter.to_string()
+    let lbl_st_done = ".Latomic_store_done." + ctx.fn_counter.to_string()
+    ctx.fn_counter = ctx.fn_counter + 1
+    a64_cmp_ri(&mut ctx.text, A64::X2, 0)
+    a64_bcond(&mut ctx.text, a64_cc_eq(), lbl_st_rel.clone())
+    # STLR Xt/Wt, [x0] — release, value in x1.
     emit32_le(&mut ctx.text, a64_stlr_enc(width) | (a64_code(A64::X0) << 5) | a64_code(A64::X1))
+    a64_b(&mut ctx.text, lbl_st_done.clone())
+    def_label(&mut ctx.text, lbl_st_rel.clone())
+    # Plain store (Relaxed): STRB/STRH/STR(W)/STR from x1 into [x0].
+    match width
+    when 1 then a64_strb(&mut ctx.text, A64::X1, A64::X0, 0)
+    when 2 then a64_strh(&mut ctx.text, A64::X1, A64::X0, 0)
+    when 4 then a64_str_w(&mut ctx.text, A64::X1, A64::X0, 0)
+    when 8 then a64_str(&mut ctx.text, A64::X1, A64::X0, 0)
+    end
+    def_label(&mut ctx.text, lbl_st_done.clone())
   when "exchange" then
     # SWPAL w1, w9, [x0] — old value in w9.
     emit32_le(&mut ctx.text, a64_swpal_enc(width) | (a64_code(A64::X1) << 16) | (a64_code(A64::X0) << 5) | a64_code(A64::X9))
@@ -2674,19 +2804,36 @@ end
 
 def emit_atomic_intrinsic_x64(inout ctx: CodegenCtx, op: String, width: Int) -> Unit
   # x86-64: arg regs rdi..r9. Loads are plain MOVs (TSO: loads are
-  # acquire). The SeqCst STORE is the xchg-based store (`xchg [rdi],
-  # rsi` — the implicitly-locked exchange); the weaker stores
-  # (Relaxed/Release/AcqRel) are plain MOVs — TSO gives a plain store
-  # the release semantics, so only SeqCst needs the full-strength form
-  # (a plain MOV is not a sequentially-consistent store by itself). The
-  # SeqCst LOAD stays the plain MOV: TSO + the xchg-store discipline
-  # provides the total order. The RMW/CAS family uses the LOCKed forms
-  # (seq-cst strength); the fence is MFENCE.
+  # acquire — every load ordering, Relaxed through SeqCst, is the same
+  # plain MOV; the SeqCst load relies on the xchg-store discipline for
+  # the total order). The SeqCst STORE is the xchg-based store (`xchg
+  # [rdi], rsi` — the implicitly-locked exchange); the weaker stores
+  # (Relaxed/Release/AcqRel-in-domain codes) are plain MOVs — TSO gives
+  # a plain store the release semantics, so only SeqCst needs the
+  # full-strength form (a plain MOV is not a sequentially-consistent
+  # store by itself). The RMW/CAS family uses the LOCKed forms
+  # (seq-cst strength — correct for every ordering, since stronger is
+  # always legal and x86 atomic RMWs are inherently locked). The fence
+  # is per-ordering: MFENCE for SeqCst only (the weaker fence orders
+  # need no instruction under TSO — see the fence arm above).
   match op
   when "fence" then
+    # Per-ordering fence. The order code arrives in rdi (the fence's
+    # only argument): SeqCst (5) = MFENCE; Relaxed (0), Acquire (2),
+    # Release (3) and AcqRel (4) = NO instruction — x86-TSO already
+    # provides the acquire/load and release/store ordering these
+    # fences request, and the Tangerine emitter never reorders, so the
+    # compiler-barrier role is vacuous (this is exactly the mapping
+    # clang/gcc emit for atomic_thread_fence on x86-64; memory_model.md
+    # §16.8.2).
+    let lbl_fence_weak = ".Latomic_fence_weak." + ctx.fn_counter.to_string()
+    ctx.fn_counter = ctx.fn_counter + 1
+    x64_cmp_ri(&mut ctx.text, X64::RDI, 5)
+    x64_jcc(&mut ctx.text, CC::NE, lbl_fence_weak.clone())
     emit8(&mut ctx.text, 0x0F)
     emit8(&mut ctx.text, 0xAE)
     emit8(&mut ctx.text, 0xF0)   # mfence
+    def_label(&mut ctx.text, lbl_fence_weak.clone())
   when "load" then
     match width
     when 1 then emit8(&mut ctx.text, 0x0F); emit8(&mut ctx.text, 0xB6); emit8(&mut ctx.text, 0x07)  # movzx eax, byte [rdi]
@@ -2836,6 +2983,44 @@ def emit_x64_rmw_cas_loop(inout ctx: CodegenCtx, width: Int, op: String) -> Unit
   end
   x64_jcc(&mut ctx.text, CC::NE, lbl_loop.clone())
 end
+
+# ———————————————————————————————————————————————————————————————
+# P1-20 TODO — per-ordering RMW and CAS failure-order dispatch
+# ———————————————————————————————————————————————————————————————
+# The RMW/exchange/CAS arms above serve the STRONGEST form for every
+# ordering. That is always correct (an implementation may serve any
+# ordering stronger than requested — memory_model.md §16.2), so there
+# is no correctness gap today; the exact instruction mapping for a
+# future weaker-than-strong emission:
+#
+# AArch64 RMWs (LSE — order code arrives in x2; branch like the store
+# arm above on 0/2/3/4/5). The A/L flag bits are A = 0x800000,
+# L = 0x400000 over the plain base (verified): for the op base of the
+# width, emit base | (A/L) | (Rs<<16) | (Rn<<5) | Rt with
+#   Relaxed → plain base            (e.g. LDADD  x1,x9,[x0] = 0xF8210009)
+#   Acquire → base | 0x800000       (LDADDA — 0xF8A10009)
+#   Release → base | 0x400000       (LDADDL — 0xF8610009)
+#   AcqRel/SeqCst → base | 0xC00000 (LDADDAL — current emission)
+# Bases (per size bits[31:30]): the *_al_enc tables above minus
+# 0xC00000 give the plain base for the same op+width; for AND/OR/XOR/
+# SWP use their own tables (ldclr/ldeor/ldset/swp — same flag bits).
+#
+# AArch64 CAS success/failure dispatch (order codes in x4 = success,
+# x5 = failure; the current CASAL serves both at acq_rel strength):
+# the failure path is a READ, so an exact lowering needs the LL/SC
+# fallback (the future portable mode): relaxed/relaxed →
+# LDXR/STXR loop (LDXR bases 0x085F7C00/0x485F7C00/0x885F7C00/
+# 0xC85F7C00; STXR bases 0x08007C00/0x48007C00/0x88007C00/0xC8007C00),
+# acquire failure reads → LDAXR (LDXR base + 0x8000), release success
+# stores → STLXR (STXR base + 0x8000); the ldaxr/stlxr LL/SC contract
+# is already the documented future mode (§16.8.1).
+#
+# x86-64: an atomic RMW/CAS is inherently a LOCKed op (the atomicity
+# requires the lock prefix; xchg is implicitly locked), and a LOCKed
+# op is a full barrier, so Relaxed RMW/CAS on x86 is served at
+# seq_cst strength by the hardware — no weaker instruction exists for
+# a width-exact atomic RMW. Only the fence and the store distinguish
+# orders on x86 (both implemented above).
 
 # CALL reg (indirect)
 def emit_call_r(inout ctx: CodegenCtx, r: PhysReg) -> Unit
@@ -5631,6 +5816,27 @@ def codegen_float_binop(inout ctx: CodegenCtx, op: MirBinOp, dst: PhysReg, scrat
     end
     a64_fmov_dx(&mut ctx.text, A64V::V0, dst_gpr)
     a64_fmov_dx(&mut ctx.text, A64V::V1, scratch_gpr)
+    # (P1-6 @fp(fast) fast paths — STRICT default; canonical FP-mode
+    # spec in types.tg above enum Type): every arm below emits the exact
+    # IEEE-754 sequence, and the arithmetic/comparison instruction
+    # stream is IDENTICAL for strict and @fp(fast) functions until the
+    # fast paths land. When they do, ctx.current_fp_fast (the emitted
+    # function's MirFunction.fp_fast) is the ONLY gate:
+    #   - Div: reciprocal approximation (A64 FRECPE + Newton-Raphson
+    #     refinement, then multiply) instead of a64_fdiv_ddd — needs
+    #     new asm.tg encoders and a precision-budget review (bare
+    #     FRECPE is not acceptable even in fast mode);
+    #   - Mul/Add/Sub: FMA contraction (fmadd/fmla) needs a
+    #     three-operand a*b+c pattern that MirBinOp cannot express — a
+    #     codegen statement-window peephole or an fp_fast-gated MIR
+    #     fusion pass (strict mode NEVER contracts);
+    #   - Reassociation: a no-op at this emitter level — each MirBinOp
+    #     is one instruction over already-evaluated operands
+    #     (single-expression trees); any reassociation must be an
+    #     fp_fast-gated MIR rewrite pass;
+    #   - finite-only assumptions: the six comparisons keep the strict
+    #     NaN/signed-zero sequences — no unordered-handling exists to
+    #     skip at these sites (NaN payloads are bit-preserved).
     match op
     when MirBinOp::Add then a64_fadd_ddd(&mut ctx.text, A64V::V0, A64V::V0, A64V::V1)
     when MirBinOp::Sub then a64_fsub_ddd(&mut ctx.text, A64V::V0, A64V::V0, A64V::V1)
@@ -5694,6 +5900,22 @@ def codegen_float_binop(inout ctx: CodegenCtx, op: MirBinOp, dst: PhysReg, scrat
     emit8(&mut ctx.text, 0x4C)
     emit8(&mut ctx.text, 0x24)
     emit8(&mut ctx.text, 0xF8)
+    # (P1-6 @fp(fast) fast paths — STRICT default; canonical FP-mode
+    # spec in types.tg above enum Type): identical-emission rule as the
+    # AArch64 arm above — the x86-64 stream below is unchanged in both
+    # modes until ctx.current_fp_fast-gated paths land:
+    #   - Div: reciprocal approximation (rcpps/rcpss-based or
+    #     Newton-Raphson-refined mulsd) instead of divsd — needs a
+    #     precision-budget review (never bare RCPSS for doubles);
+    #   - Mul/Add/Sub: FMA contraction (vfmadd132sd etc.) needs a
+    #     three-operand a*b+c pattern MirBinOp cannot express — a
+    #     statement-window peephole or an fp_fast-gated MIR fusion pass
+    #     (strict mode NEVER contracts);
+    #   - Reassociation: no-op at this emitter level (single-expression
+    #     trees) — any reassociation must be an fp_fast-gated MIR
+    #     rewrite pass;
+    #   - finite-only assumptions: comparisons keep the strict
+    #     NaN/signed-zero sequences (no unordered handling to skip).
     match op
     when MirBinOp::Add then
       # addsd xmm0, xmm1
@@ -6842,6 +7064,22 @@ end
 #   - that local has a stable stack home the callee can write into
 #     (AArch64 passes the indirect-return pointer via x8; x86-64 has no sret
 #     here — the result crosses in the value register instead).
+# The rule is exact for the compiler's INTERNAL call ABI (the sret slot is
+# reserved in allocate_locals when category_uses_sret, the caller's x8
+# setup and the callee's save/reload of x8 are symmetric, and the epilogue
+# copies the return slot to the x8 buffer with a byte-exact tail — 8-byte
+# chunks then 4/2/1-byte tails for the residual, never a rounded copy).
+# NOTE (audit P1-13 — extern/C returns): a REAL C callee returning a
+# composite follows the platform C ABI, which differs from this internal
+# rule exactly where the category is ScalarPair: AAPCS64 returns a <=16-
+# byte composite in x0/x1 (or in v0/v1 for a 1-2-member HFA/HVA), NOT via
+# x8; only >16-byte (memory-class) returns use x8. x86-64 SysV returns
+# <=16-byte composites in rax:rdx (INTEGER) / xmm0:xmm1 (SSE), and larger
+# ones via a hidden first-argument pointer (RDI). There is no dual-ABI
+# infrastructure for extern results today (classify_return is shared by
+# compiled and extern callees), so by-value composite extern returns are
+# not representable — the required split is keyed on callee kind at the
+# extern call branch of codegen_call.
 # classify_argument (AbiArg) is the paired authority on the ARGUMENT side of
 # the ABI: the two functions together (classify_return + classify_argument)
 # are the single classify pair that decides how every value crosses the call
@@ -7352,7 +7590,35 @@ def codegen_call(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, dest: Place, c
             # 32 bits of the return register (eax/w0) with unspecified
             # upper bits — normalize (sign/zero-extend) before the
             # post-call store so a C -1 reads as -1 (see
-            # normalize_extern_return).
+            # normalize_extern_return). Narrower C returns (char/short/
+            # _Bool) are masked at the store or re-extended at each load
+            # (storage widths/signedness), so no normalization is needed
+            # for them.
+            # (audit P1-13 — C-ABI exactness TODO): the ARGUMENTS of this
+            # extern call were pushed by the shared classify_argument loop
+            # above, which uses the compiler's UNIFORM internal
+            # by-reference convention for every 9..16-byte aggregate
+            # (ScalarPair) and >16-byte aggregate (ByAddress): the
+            # aggregate's ADDRESS travels in one register/stack slot. That
+            # is exact only for extern parameters whose C type is a
+            # POINTER. A real-C callee declared with a struct BY VALUE
+            # expects the platform C ABI — AArch64 AAPCS64: composites
+            # <=16 bytes in GP registers x0-x7 (split into eightbytes; an
+            # all-float HFA <=4 members in v0-v7, an all-vector HVA <=4
+            # members likewise), >16 bytes in memory (copied, never a
+            # pointer); x86-64 SysV: eightbyte classification into
+            # INTEGER/SSE registers, >16 bytes (or unclassifiable) in
+            # memory. The emitter has no per-callee ABI split (extern vs
+            # compiled share classify_argument/classify_return), no
+            # float-class register arguments (floats cross in GP slots),
+            # and no HFA/HVA classification, so by-value composite extern
+            # parameters and by-value composite extern returns (C: AArch64
+            # x0/x1 or x8-sret; x86-64 rax:rdx or hidden-RDI sret) are NOT
+            # representable yet. Rule to implement: key the arg/return
+            # classification on callee kind (ctx.extern_fns membership —
+            # this branch) and, for externs, classify the DECLARED
+            # parameter/return types by the platform C ABI instead of the
+            # internal by-reference model.
             normalize_extern_return(ctx, rr, &dest_ty)
           else if ctx.reachable_fns.contains(&resolved_fn_name) then
  # Function has a compiled body — call it directly. the callee
@@ -10093,6 +10359,27 @@ def codegen_float_binop(inout ctx: CodegenCtx, op: MirBinOp, dst: PhysReg, scrat
     end
     a64_fmov_dx(&mut ctx.text, A64V::V0, dst_gpr)
     a64_fmov_dx(&mut ctx.text, A64V::V1, scratch_gpr)
+    # (P1-6 @fp(fast) fast paths — STRICT default; canonical FP-mode
+    # spec in types.tg above enum Type): every arm below emits the exact
+    # IEEE-754 sequence, and the arithmetic/comparison instruction
+    # stream is IDENTICAL for strict and @fp(fast) functions until the
+    # fast paths land. When they do, ctx.current_fp_fast (the emitted
+    # function's MirFunction.fp_fast) is the ONLY gate:
+    #   - Div: reciprocal approximation (A64 FRECPE + Newton-Raphson
+    #     refinement, then multiply) instead of a64_fdiv_ddd — needs
+    #     new asm.tg encoders and a precision-budget review (bare
+    #     FRECPE is not acceptable even in fast mode);
+    #   - Mul/Add/Sub: FMA contraction (fmadd/fmla) needs a
+    #     three-operand a*b+c pattern that MirBinOp cannot express — a
+    #     codegen statement-window peephole or an fp_fast-gated MIR
+    #     fusion pass (strict mode NEVER contracts);
+    #   - Reassociation: a no-op at this emitter level — each MirBinOp
+    #     is one instruction over already-evaluated operands
+    #     (single-expression trees); any reassociation must be an
+    #     fp_fast-gated MIR rewrite pass;
+    #   - finite-only assumptions: the six comparisons keep the strict
+    #     NaN/signed-zero sequences — no unordered-handling exists to
+    #     skip at these sites (NaN payloads are bit-preserved).
     match op
     when MirBinOp::Add then a64_fadd_ddd(&mut ctx.text, A64V::V0, A64V::V0, A64V::V1)
     when MirBinOp::Sub then a64_fsub_ddd(&mut ctx.text, A64V::V0, A64V::V0, A64V::V1)
@@ -10156,6 +10443,22 @@ def codegen_float_binop(inout ctx: CodegenCtx, op: MirBinOp, dst: PhysReg, scrat
     emit8(&mut ctx.text, 0x4C)
     emit8(&mut ctx.text, 0x24)
     emit8(&mut ctx.text, 0xF8)
+    # (P1-6 @fp(fast) fast paths — STRICT default; canonical FP-mode
+    # spec in types.tg above enum Type): identical-emission rule as the
+    # AArch64 arm above — the x86-64 stream below is unchanged in both
+    # modes until ctx.current_fp_fast-gated paths land:
+    #   - Div: reciprocal approximation (rcpps/rcpss-based or
+    #     Newton-Raphson-refined mulsd) instead of divsd — needs a
+    #     precision-budget review (never bare RCPSS for doubles);
+    #   - Mul/Add/Sub: FMA contraction (vfmadd132sd etc.) needs a
+    #     three-operand a*b+c pattern MirBinOp cannot express — a
+    #     statement-window peephole or an fp_fast-gated MIR fusion pass
+    #     (strict mode NEVER contracts);
+    #   - Reassociation: no-op at this emitter level (single-expression
+    #     trees) — any reassociation must be an fp_fast-gated MIR
+    #     rewrite pass;
+    #   - finite-only assumptions: comparisons keep the strict
+    #     NaN/signed-zero sequences (no unordered handling to skip).
     match op
     when MirBinOp::Add then
       # addsd xmm0, xmm1
@@ -11304,6 +11607,22 @@ end
 #   - that local has a stable stack home the callee can write into
 #     (AArch64 passes the indirect-return pointer via x8; x86-64 has no sret
 #     here — the result crosses in the value register instead).
+# The rule is exact for the compiler's INTERNAL call ABI (the sret slot is
+# reserved in allocate_locals when category_uses_sret, the caller's x8
+# setup and the callee's save/reload of x8 are symmetric, and the epilogue
+# copies the return slot to the x8 buffer with a byte-exact tail — 8-byte
+# chunks then 4/2/1-byte tails for the residual, never a rounded copy).
+# NOTE (audit P1-13 — extern/C returns): a REAL C callee returning a
+# composite follows the platform C ABI, which differs from this internal
+# rule exactly where the category is ScalarPair: AAPCS64 returns a <=16-
+# byte composite in x0/x1 (or in v0/v1 for a 1-2-member HFA/HVA), NOT via
+# x8; only >16-byte (memory-class) returns use x8. x86-64 SysV returns
+# <=16-byte composites in rax:rdx (INTEGER) / xmm0:xmm1 (SSE), and larger
+# ones via a hidden first-argument pointer (RDI). There is no dual-ABI
+# infrastructure for extern results today (classify_return is shared by
+# compiled and extern callees), so by-value composite extern returns are
+# not representable — the required split is keyed on callee kind at the
+# extern call branch of codegen_call.
 # classify_argument (AbiArg) is the paired authority on the ARGUMENT side of
 # the ABI: the two functions together (classify_return + classify_argument)
 # are the single classify pair that decides how every value crosses the call
@@ -11814,7 +12133,35 @@ def codegen_call(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, dest: Place, c
             # 32 bits of the return register (eax/w0) with unspecified
             # upper bits — normalize (sign/zero-extend) before the
             # post-call store so a C -1 reads as -1 (see
-            # normalize_extern_return).
+            # normalize_extern_return). Narrower C returns (char/short/
+            # _Bool) are masked at the store or re-extended at each load
+            # (storage widths/signedness), so no normalization is needed
+            # for them.
+            # (audit P1-13 — C-ABI exactness TODO): the ARGUMENTS of this
+            # extern call were pushed by the shared classify_argument loop
+            # above, which uses the compiler's UNIFORM internal
+            # by-reference convention for every 9..16-byte aggregate
+            # (ScalarPair) and >16-byte aggregate (ByAddress): the
+            # aggregate's ADDRESS travels in one register/stack slot. That
+            # is exact only for extern parameters whose C type is a
+            # POINTER. A real-C callee declared with a struct BY VALUE
+            # expects the platform C ABI — AArch64 AAPCS64: composites
+            # <=16 bytes in GP registers x0-x7 (split into eightbytes; an
+            # all-float HFA <=4 members in v0-v7, an all-vector HVA <=4
+            # members likewise), >16 bytes in memory (copied, never a
+            # pointer); x86-64 SysV: eightbyte classification into
+            # INTEGER/SSE registers, >16 bytes (or unclassifiable) in
+            # memory. The emitter has no per-callee ABI split (extern vs
+            # compiled share classify_argument/classify_return), no
+            # float-class register arguments (floats cross in GP slots),
+            # and no HFA/HVA classification, so by-value composite extern
+            # parameters and by-value composite extern returns (C: AArch64
+            # x0/x1 or x8-sret; x86-64 rax:rdx or hidden-RDI sret) are NOT
+            # representable yet. Rule to implement: key the arg/return
+            # classification on callee kind (ctx.extern_fns membership —
+            # this branch) and, for externs, classify the DECLARED
+            # parameter/return types by the platform C ABI instead of the
+            # internal by-reference model.
             normalize_extern_return(ctx, rr, &dest_ty)
           else if ctx.reachable_fns.contains(&resolved_fn_name) then
  # Function has a compiled body — call it directly. the callee
@@ -14723,12 +15070,42 @@ def codegen_function(inout ctx: CodegenCtx, func: MirFunction) -> Unit
 
   let fn_start = buf_pos(&ctx.text)
   ctx.debug_current_fn = func.name.clone()
+  # (P1-6 fp-mode stamp site): record the function's DECLARED floating-
+  # point mode for the body emission below (the float emission sites —
+  # codegen_float_binop's op/compare cases and the codegen_rvalue cast
+  # sites — read ctx.current_fp_fast once the TODO P1-6 fast paths
+  # land). The flag
+  # is set EXCLUSIVELY from MirFunction.fp_fast, which lower_program's
+  # PASS 2 stamps from the @fp(fast) item attribute — nothing else in
+  # the compiler sets it (no optimizer pass reads it; opt_level never
+  # flows into CodegenCtx), so an -O3 build never silently compiles a
+  # function under fast math: unannotated functions keep the STRICT
+  # IEEE default — the CANONICAL SPEC in types.tg (the FP-mode module
+  # doc above the Type enum). The mode is recorded per symbol here (the
+  # ELF writer exposes no per-function metadata section today — TODO
+  # P1-6: surface the mode in emitted function metadata when object
+  # emission gains attribute support); the emitted instructions are
+  # identical in both modes until the fast paths at the float emission
+  # sites land.
+  ctx.current_fp_fast = func.fp_fast
   let symbol_name = func.name.clone()
   let entry_label = match ctx.fn_alias.get(&symbol_name)
   when Option::Some(label) then label.clone()
   when Option::None then symbol_name.clone()
   end
 
+  # (P1-18 @cold consumption point): the function's DECLARED @cold hint
+  # (MirFunction.attr_cold — stamped from the item's attribute list at
+  # MIR lowering, see mir.tg's lower_program PASS 2) is a code-LAYOUT
+  # request. The object emission has NO cold-section support today: the
+  # ELF writer (object.tg) fixes one code section (.text) and every
+  # function symbol is registered Section::Text here, so a @cold function
+  # still sits in .text (correctness never depends on the hint). TODO
+  # (P1-18): when the object emission gains per-function section support,
+  # route attr_cold functions into a cold section at this site (the
+  # symbol's section is the only wiring point; codegen_function emits the
+  # body into ctx.text either way).
+  #
   # Emit function symbol
   add_symbol(&mut ctx.text, AsmSymbol {
     name: symbol_name.clone(),

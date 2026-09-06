@@ -8,6 +8,10 @@
 ##   - No hidden allocations
 ##   - Deterministic execution
 ##   - Safe abstractions over unsafe hardware access
+##   - Safely typed MMIO: one unsafe `from_address` binds a register
+##     handle to its address; read/write/modify afterwards are safe,
+##     width-exact volatile operations typed by the value type and the
+##     access mode
 ##   - Compatible with no_alloc mode
 ##
 ## Spec: §stdlib.embedded
@@ -15,6 +19,7 @@
 module std::embedded
 
 use std::core::{Option, Result, Unit, Bool, Display}
+use std::alloc::{size_of}
 use std::ffi::{FfiSlice, Ptr, ffi_slice_new}
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -206,80 +211,343 @@ end
 # §3  Memory-Mapped I/O & Register Abstraction
 # ═══════════════════════════════════════════════════════════════════════
 
-## A memory-mapped register at a fixed address.
-## Provides type-safe volatile access with read/write/modify operations.
-pub struct Register[T: Copy]
-  address: UInt
+# ─── Raw MMIO Addresses ────────────────────────────────────────────
+
+## A raw address of a memory-mapped peripheral register. A RawAddress is
+## an opaque token, NOT a pointer: it cannot be dereferenced and no
+## Ptr/PtrMut can be produced from it in safe code, so a register handle
+## bound to a RawAddress can never leak a raw pointer. Conversion to and
+## from the integer address is explicit (from_uint / as_uint).
+pub struct RawAddress
+  value: UInt
 end
 
-impl[T: Copy] Register[T]
-  ## Create a register descriptor for a given address.
-  pub const def at(address: UInt) -> Register[T]
-    Register[T] { address: address }
+impl RawAddress
+  ## Wrap a raw integer address (e.g. a device-block base).
+  pub const def from_uint(value: UInt) -> RawAddress
+    RawAddress { value: value }
   end
 
-  ## Read the register value (volatile).
-  @inline(always)
-  pub def read(self) -> T
-    volatile_read(self.address as Ptr[T])
+  ## Unwrap the raw integer address.
+  pub const def as_uint(self) -> UInt
+    self.value
   end
 
-  ## Write a value to the register (volatile).
-  @inline(always)
-  pub def write(self, value: T) -> Unit
-    volatile_write(self.address as PtrMut[T], value)
-  end
-
-  ## Read-modify-write the register.
-  @inline(always)
-  pub def modify(self, f: def(T) -> T) -> Unit
-    volatile_modify(self.address as PtrMut[T], f)
-  end
-
-  ## Get the raw pointer to this register.
-  pub def ptr(self) -> PtrMut[T]
-    self.address as PtrMut[T]
+  ## Whether the address is naturally aligned to `size` bytes — the
+  ## MMIO alignment contract checked at Register::from_address.
+  pub def is_aligned_to(self, size: UInt) -> Bool
+    self.value % size == 0
   end
 end
 
-## Convenience type for 32-bit MMIO registers.
-pub type Reg32 = Register[u32]
+# ─── Access Modes ──────────────────────────────────────────────────
 
-## Convenience type for 16-bit MMIO registers.
-pub type Reg16 = Register[u16]
-
-## Convenience type for 8-bit MMIO registers.
-pub type Reg8 = Register[u8]
-
-## Read-only register wrapper.
-pub struct ReadOnly[T: Copy]
-  reg: Register[T]
+## Access-mode marker: the register supports volatile reads only.
+pub struct ReadOnlyMode
 end
 
-impl[T: Copy] ReadOnly[T]
-  pub const def at(address: UInt) -> ReadOnly[T]
-    ReadOnly[T] { reg: Register[T].at(address) }
+## Access-mode marker: the register supports volatile writes only.
+pub struct WriteOnlyMode
+end
+
+## Access-mode marker: the register supports volatile reads, writes and
+## read-modify-writes.
+pub struct ReadWriteMode
+end
+
+# ─── The Access-Typed Register ─────────────────────────────────────
+
+## A memory-mapped register at a fixed RawAddress, typed over the value
+## type `T` and the access mode `Access` (ReadOnlyMode / WriteOnlyMode /
+## ReadWriteMode).
+##
+## Safety model — one unsafe construction, then safe access:
+##   - Construction from an arbitrary address requires the `unsafe`
+##     context (`unsafe Register[T, Access]::from_address(...)`) and is
+##     the ONLY unsafe point of the API. The width and alignment
+##     invariants are enforced there (they panic — they are not
+##     unchecked preconditions);
+##   - WIDTH INVARIANT: `T` is one of u8 / u16 / u32 / u64. Enforced at
+##     construction (size_of[T]() must be 1/2/4/8 bytes) and at the type
+##     level: the volatile read/write/modify accessors exist only for
+##     the u8/u16/u32/u64 instantiations below, so an access width is
+##     always exactly the register width;
+##   - ALIGNMENT: the address must be naturally aligned to the access
+##     width (size_of[T]() bytes). The volatile load/store arms are
+##     plain ldr/str-family accesses and MMIO registers on the
+##     peripheral buses require natural alignment, so a misaligned
+##     binding panics at construction instead of faulting at access
+##     time (the aarch64/x86-64 host targets tolerate unaligned normal
+##     accesses; MMIO semantics still require the natural alignment);
+##   - VOLATILITY: every access routes through the width-exact volatile
+##     runtime arms (volatile_read8/16/32/64 and volatile_write8/16/32/64
+##     — the `_tg_volatile_*` externs), which are opaque call boundaries
+##     the optimizer can neither elide nor reorder;
+##   - NO POINTER ESCAPE: a register value stores only a RawAddress
+##     token and offers no pointer accessor; `T` and `Access` are
+##     phantom type parameters (the struct stores the address only,
+##     mirroring Ptr[T]). A register handle is one word, Copy,
+##     allocation-free and drop-free.
+##
+## The mode aliases ReadOnly[T] / WriteOnly[T] / ReadWrite[T] below
+## spell the common instantiations.
+pub struct Register[T, Access]
+  address: RawAddress
+end
+
+impl[T, Access] Register[T, Access]
+  ## Bind a register handle to an MMIO address — the single unsafe
+  ## construction point. Every subsequent read()/write()/modify() on
+  ## the handle is safe.
+  ##
+  ## # Safety
+  ## The caller must guarantee that `address` references a real MMIO
+  ## register of size_of[T]() bytes that is mapped and stays mapped for
+  ## the whole lifetime of the handle.
+  ##
+  ## Panics (never UB) when an invariant is violated:
+  ##   - size_of[T]() is not 1/2/4/8 (T is not u8/u16/u32/u64);
+  ##   - the address is not naturally aligned to size_of[T]().
+  pub unsafe def from_address(address: RawAddress) -> Register[T, Access]
+    let width = size_of[T]()
+    if width != 1 && width != 2 && width != 4 && width != 8 then
+      panic("Register::from_address: T must be u8/u16/u32/u64 (size_of[T]() = " + width.to_string() + " bytes)")
+    end
+    if !address.is_aligned_to(width) then
+      panic("Register::from_address: unaligned MMIO address (must be aligned to " + width.to_string() + " bytes)")
+    end
+    Register[T, Access] { address: address }
   end
 
+  ## The raw address the register handle is bound to (register-block
+  ## navigation: derive sibling registers from the unwrapped address).
+  pub def raw_address(self) -> RawAddress
+    self.address
+  end
+end
+
+# ─── Access-Mode Aliases ───────────────────────────────────────────
+
+## A read-only MMIO register handle — Register[T, ReadOnlyMode].
+##
+## Example:
+##   let status = unsafe { ReadOnly[u32].from_address(RawAddress::from_uint(0x4002_1000)) }
+##   let s: u32 = status.read()
+pub type ReadOnly[T] = Register[T, ReadOnlyMode]
+
+## A write-only MMIO register handle — Register[T, WriteOnlyMode].
+##
+## Example:
+##   let ctrl = unsafe { WriteOnly[u32].from_address(RawAddress::from_uint(0x4002_1004)) }
+##   ctrl.write(0x1)
+pub type WriteOnly[T] = Register[T, WriteOnlyMode]
+
+## A read-write MMIO register handle — Register[T, ReadWriteMode].
+##
+## Example:
+##   let cr = unsafe { ReadWrite[u32].from_address(RawAddress::from_uint(0x4002_1008)) }
+##   cr.modify(|v| v | 0x20)
+pub type ReadWrite[T] = Register[T, ReadWriteMode]
+
+## Convenience alias for 32-bit MMIO registers (read-write).
+pub type Reg32 = Register[u32, ReadWriteMode]
+
+## Convenience alias for 16-bit MMIO registers (read-write).
+pub type Reg16 = Register[u16, ReadWriteMode]
+
+## Convenience alias for 8-bit MMIO registers (read-write).
+pub type Reg8 = Register[u8, ReadWriteMode]
+
+# ─── Width-Exact Volatile Accessors ────────────────────────────────
+# The accessor impls are per (width, mode) instantiation on purpose: the
+# volatile runtime arms are width-typed externs (volatile_read8...
+# volatile_write64) and the language has no type-level dispatch to pick
+# the arm from a generic T, so the safe read/write/modify surface is
+# monomorphized here for exactly the four sanctioned widths. Generic
+# code can carry Register[T, Access] values (construction, address
+# queries, block navigation) but performs its MMIO accesses on concrete
+# instantiations — a Register[u32, ...] handle is a 32-bit register by
+# construction.
+
+# ─── 8-bit registers ───────────────────────────────────────────────
+
+impl Register[u8, ReadOnlyMode]
+  ## Read the register value (width-exact volatile byte load).
   @inline(always)
-  pub def read(self) -> T
-    self.reg.read()
+  pub def read(self) -> u8
+    volatile_read8(self.address.as_uint())
   end
 end
 
-## Write-only register wrapper.
-pub struct WriteOnly[T: Copy]
-  reg: Register[T]
-end
-
-impl[T: Copy] WriteOnly[T]
-  pub const def at(address: UInt) -> WriteOnly[T]
-    WriteOnly[T] { reg: Register[T].at(address) }
-  end
-
+impl Register[u8, WriteOnlyMode]
+  ## Write the register value (width-exact volatile byte store).
   @inline(always)
-  pub def write(self, value: T) -> Unit
-    self.reg.write(value)
+  pub def write(self, value: u8) -> Unit
+    volatile_write8(self.address.as_uint(), value)
+  end
+end
+
+impl Register[u8, ReadWriteMode]
+  ## Read the register value (width-exact volatile byte load).
+  @inline(always)
+  pub def read(self) -> u8
+    volatile_read8(self.address.as_uint())
+  end
+
+  ## Write the register value (width-exact volatile byte store).
+  @inline(always)
+  pub def write(self, value: u8) -> Unit
+    volatile_write8(self.address.as_uint(), value)
+  end
+
+  ## Read-modify-write: apply `f` to the current value and store the
+  ## result (two width-exact volatile arms; not atomic against a
+  ## concurrent writer).
+  @inline(always)
+  pub def modify(self, f: def(u8) -> u8) -> Unit
+    let current = volatile_read8(self.address.as_uint())
+    volatile_write8(self.address.as_uint(), f(current))
+  end
+end
+
+# ─── 16-bit registers ──────────────────────────────────────────────
+
+impl Register[u16, ReadOnlyMode]
+  ## Read the register value (width-exact volatile halfword load).
+  @inline(always)
+  pub def read(self) -> u16
+    volatile_read16(self.address.as_uint())
+  end
+end
+
+impl Register[u16, WriteOnlyMode]
+  ## Write the register value (width-exact volatile halfword store).
+  @inline(always)
+  pub def write(self, value: u16) -> Unit
+    volatile_write16(self.address.as_uint(), value)
+  end
+end
+
+impl Register[u16, ReadWriteMode]
+  ## Read the register value (width-exact volatile halfword load).
+  @inline(always)
+  pub def read(self) -> u16
+    volatile_read16(self.address.as_uint())
+  end
+
+  ## Write the register value (width-exact volatile halfword store).
+  @inline(always)
+  pub def write(self, value: u16) -> Unit
+    volatile_write16(self.address.as_uint(), value)
+  end
+
+  ## Read-modify-write: apply `f` to the current value and store the
+  ## result (two width-exact volatile arms; not atomic against a
+  ## concurrent writer).
+  @inline(always)
+  pub def modify(self, f: def(u16) -> u16) -> Unit
+    let current = volatile_read16(self.address.as_uint())
+    volatile_write16(self.address.as_uint(), f(current))
+  end
+end
+
+# ─── 32-bit registers ──────────────────────────────────────────────
+
+impl Register[u32, ReadOnlyMode]
+  ## Read the register value (width-exact volatile word load).
+  @inline(always)
+  pub def read(self) -> u32
+    volatile_read32(self.address.as_uint())
+  end
+end
+
+impl Register[u32, WriteOnlyMode]
+  ## Write the register value (width-exact volatile word store).
+  @inline(always)
+  pub def write(self, value: u32) -> Unit
+    volatile_write32(self.address.as_uint(), value)
+  end
+end
+
+impl Register[u32, ReadWriteMode]
+  ## Read the register value (width-exact volatile word load).
+  @inline(always)
+  pub def read(self) -> u32
+    volatile_read32(self.address.as_uint())
+  end
+
+  ## Write the register value (width-exact volatile word store).
+  @inline(always)
+  pub def write(self, value: u32) -> Unit
+    volatile_write32(self.address.as_uint(), value)
+  end
+
+  ## Read-modify-write: apply `f` to the current value and store the
+  ## result (two width-exact volatile arms; not atomic against a
+  ## concurrent writer).
+  @inline(always)
+  pub def modify(self, f: def(u32) -> u32) -> Unit
+    let current = volatile_read32(self.address.as_uint())
+    volatile_write32(self.address.as_uint(), f(current))
+  end
+
+  ## Set the bits of `mask` (read-modify-write OR).
+  @inline(always)
+  pub def set_bits(self, mask: u32) -> Unit
+    self.modify(|v| v | mask)
+  end
+
+  ## Clear the bits of `mask` (read-modify-write AND-NOT).
+  @inline(always)
+  pub def clear_bits(self, mask: u32) -> Unit
+    self.modify(|v| v & !mask)
+  end
+
+  ## Toggle the bits of `mask` (read-modify-write XOR).
+  @inline(always)
+  pub def toggle_bits(self, mask: u32) -> Unit
+    self.modify(|v| v ^ mask)
+  end
+end
+
+# ─── 64-bit registers ──────────────────────────────────────────────
+
+impl Register[u64, ReadOnlyMode]
+  ## Read the register value (width-exact volatile doubleword load).
+  @inline(always)
+  pub def read(self) -> u64
+    volatile_read64(self.address.as_uint())
+  end
+end
+
+impl Register[u64, WriteOnlyMode]
+  ## Write the register value (width-exact volatile doubleword store).
+  @inline(always)
+  pub def write(self, value: u64) -> Unit
+    volatile_write64(self.address.as_uint(), value)
+  end
+end
+
+impl Register[u64, ReadWriteMode]
+  ## Read the register value (width-exact volatile doubleword load).
+  @inline(always)
+  pub def read(self) -> u64
+    volatile_read64(self.address.as_uint())
+  end
+
+  ## Write the register value (width-exact volatile doubleword store).
+  @inline(always)
+  pub def write(self, value: u64) -> Unit
+    volatile_write64(self.address.as_uint(), value)
+  end
+
+  ## Read-modify-write: apply `f` to the current value and store the
+  ## result (two width-exact volatile arms; not atomic against a
+  ## concurrent writer).
+  @inline(always)
+  pub def modify(self, f: def(u64) -> u64) -> Unit
+    let current = volatile_read64(self.address.as_uint())
+    volatile_write64(self.address.as_uint(), f(current))
   end
 end
 

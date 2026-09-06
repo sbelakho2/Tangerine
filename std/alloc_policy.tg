@@ -1,0 +1,593 @@
+# std::alloc_policy — allocator policy as a first-class library contract
+# (audit item P1-12)
+#
+# The audit contract: hot paths need EXPLICIT guarantees about where the
+# objects they touch come from — a slab allocator for the fixed-size
+# object pools, a bump arena per market-data packet/batch, a
+# preallocated order pool, a fixed-capacity ring, NO allocator in the
+# matching loop (finance), and (embedded) a static arena + ArrayVec +
+# fixed ring with no heap at all. Memory safety does not require a
+# universal general-purpose allocator — it requires that every hot loop
+# CHOOSES a policy and that the choice is a first-class, documented
+# fact of the module that owns the loop.
+#
+# This module makes the policy a first-class library contract:
+#   - AllocPolicy — the policy MARKERS (enum): Heap / Arena / Slab /
+#     Fixed / None, with the audit's mapping spelled out on the enum;
+#   - BumpArena — the deterministic bump (arena) allocator: owned
+#     (new) or borrowed (with_buffer) backing, alloc/reset, no
+#     individual free, zero-overhead reset;
+#   - SlabPool[T] — the fixed-size typed object pool: preallocated
+#     slots, acquire/release index hand-off over an intrusive free
+#     list, no heap churn after init, exact drop of live occupants
+#     with deterministic ascending teardown.
+#
+# WHERE THE POLICIES LIVE IN THE KERNEL STD (the call surface this
+# module documents and marks):
+#   - std::alloc (kernel family) is the low-level allocator authority:
+#     trait Allocator, SystemAllocator (the runtime memory authority
+#     behind _tg_mem_alloc/_tg_mem_free), ArenaAllocator/ArenaBuf
+#     (policy: Arena), PoolAllocator (policy: Slab), the layout API and
+#     the global alloc functions. Its alignment contract (any
+#     power-of-two align <= 16; over-aligned requests are explicit
+#     errors) is inherited verbatim by every allocation in this module.
+#   - std::collections::Vec growth is HEAP by construction: push lowers
+#     to the compiler intrinsic __intrinsic_array_push (the runtime
+#     allocator), so a general allocator parameter on Vec[T, A] is
+#     kernel type-system/codegen work — documented future work below.
+#   - std::fixed (native family) delivers the policy Fixed/None forms:
+#     ArrayVecN / RingBufferN / SpscQueueN with inline [Option[T]; N]
+#     storage, no allocator, no locks.
+#   - This module (std::alloc_policy) adds the policy markers and the
+#     deterministic policy forms (BumpArena, SlabPool[T]) that the
+#     audit's hot paths call directly.
+#
+# DROP DISCIPLINE (deallocate exactly once): an owner of MEMORY holds a
+# raw pointer and declares the finalizer — the std::alloc Box/Arc and
+# std::fixed SpscQueue split-endpoint record pattern. Both BumpArena
+# and SlabPool are plain structs (raw Ptr + UInt fields) with a
+# registered `impl Drop`: the Drop releases exactly the init-time
+# allocations once and nulls every field, so a bit-copied owner cannot
+# double-free (the std::alloc ArenaAllocator/PoolAllocator convention).
+# A struct that owns VALUES holds them structurally and declares no
+# finalizer — here the SlabPool occupant VALUES are owned by raw
+# memory, so their destruction is the pool's own Drop/clear duty (each
+# live occupant destructed exactly once, in ascending slot order).
+#
+# THREAD SAFETY: BumpArena and SlabPool are single-owner, NOT
+# thread-safe. Nothing in this module locks; the per-pool free list and
+# the bump pointer are plain fields of one owning value. (The runtime
+# allocator's own locks behind global_alloc/global_dealloc apply only
+# at init/teardown.)
+#
+# Module identity: std::alloc_policy (the file-based module — same
+# convention as std/collections.tg and std/fixed.tg: no `module` block;
+# the file name is the module path).
+
+use std::core::{Option, Result, Unit, Bool, UInt, Int, panic}
+use std::alloc::{global_alloc, global_dealloc, size_of, align_of}
+
+# [METADATA]
+# module: tg::alloc_policy
+# status: alpha
+# effects: []
+# capabilities: []
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# AllocPolicy — the policy markers (the P1-12 audit contract in one type)
+# ═══════════════════════════════════════════════════════════════════════
+
+# The audit contract, in one type: every hot path chooses ONE allocation
+# policy up front, and the marker makes the choice a first-class,
+# documented fact. The mapping the audit item names:
+#
+#   Heap  — general-purpose allocation. The std::alloc authority
+#           (SystemAllocator / the global alloc / the runtime behind
+#           String/Vec/Map growth) and today's Vec growth path (the
+#           __intrinsic_array_push intrinsic). The default when no
+#           fixed bound exists; never the choice INSIDE a bounded hot
+#           loop.
+#   Arena — the bump arena: BumpArena (this module) and std::alloc's
+#           ArenaAllocator/ArenaBuf. Per market-data packet / per
+#           batch: deterministic bump pointer, free-all at reset or
+#           teardown, no individual free.
+#   Slab  — the fixed-size object pool: SlabPool[T] (this module) and
+#           std::alloc's PoolAllocator. Preallocated slots for
+#           per-symbol / per-order state; acquire/release index
+#           hand-off; no heap churn after init.
+#   Fixed — the inline fixed-capacity containers of std::fixed
+#           (ArrayVecN / RingBufferN / SpscQueueN): the capacity is
+#           part of the type name, the storage is inline [Option[T]; N],
+#           and there is no allocation after construction.
+#   None  — no allocator in the path at all: fixed.tg containers,
+#           BumpArena::with_buffer over a static buffer (embedded), and
+#           the finance matching loop, which touches only preallocated
+#           pools and rings and never calls an allocator.
+#
+# The audit's hot-path mapping (the sentence to quote in code review):
+#   matching loop (finance)     -> None (or Fixed for bounded staging);
+#                                  no allocator call exists in the loop
+#   market-data packet / batch  -> Arena (BumpArena; free-all at the
+#                                  packet/batch boundary)
+#   per-symbol state / orders   -> Slab (SlabPool[T] / PoolAllocator:
+#                                  preallocated, acquire/release only)
+#   bounded queues              -> Fixed (the fixed-capacity rings)
+#   embedded                    -> None + Fixed + with_buffer (static
+#                                  arena, ArrayVec, fixed ring — no heap
+#                                  at all after static init)
+#   Vec growth                  -> Heap today (intrinsic growth); the
+#                                  arena-provided builder and the
+#                                  Vec[T, A] / Map[K, V, H, A] forms are
+#                                  documented future work (module header)
+enum AllocPolicy
+  Heap
+  Arena
+  Slab
+  Fixed
+  None
+end
+
+# ═══════════════════════════════════════════════════════════════════════
+# BumpArena — deterministic bump (arena) allocator
+# ═══════════════════════════════════════════════════════════════════════
+# The policy form of std::alloc's ArenaAllocator: identical alignment
+# contract and identical bump math, plus the borrowed-buffer form
+# (with_buffer) that makes the arena usable over a static/owned buffer
+# with NO allocation of its own (embedded policy). BumpArena is
+# NOT thread-safe. reset() is a single store — zero-overhead free-all;
+# it never touches the buffer contents (no memset), so bump
+# determinism across resets is exact: after a reset the same alloc
+# sequence returns the same addresses.
+#
+# ALIGNMENT CONTRACT (inherited from std::alloc, the SAME policy as
+# SystemAllocator/ArenaAllocator): the owned backing buffer comes from
+# the global allocator, whose payload is 16-byte-aligned, so any
+# power-of-two align <= 16 is satisfied by the aligned-offset math; an
+# align 0, a non-power-of-two, or an align > 16 is an EXPLICIT error
+# (panic). For with_buffer the CALLER supplies the backing and must
+# provide a buffer aligned to the maximum align that will be requested
+# (16 for the full contract); the arena cannot verify a borrowed
+# buffer's alignment.
+#
+# Exhaustion: alloc returns a null pointer (never a partial bump); the
+# caller observes it and resets or extends the arena — allocation
+# failures inside a batch are a policy decision, not a panic. A
+# zero-size alloc returns null without advancing the bump pointer
+# (the std::alloc zero-size contract).
+
+struct BumpArena
+  _buffer: Ptr[u8]    # the backing buffer (owned by new, borrowed by with_buffer)
+  _capacity: UInt     # total backing bytes
+  _offset: UInt       # the bump pointer (next allocation offset)
+  _owns: UInt         # 1 = new() owns the backing (Drop releases); 0 = borrowed
+end
+
+impl BumpArena
+  # Owned arena: allocates the backing ONCE from the global allocator
+  # (16-byte-aligned payload) and releases it exactly once at Drop.
+  # Allocation happens only here — every later operation (alloc/reset)
+  # is bump-pointer work with no allocator involvement.
+  def new(capacity: UInt) -> BumpArena
+    let buffer = global_alloc(capacity, 16)
+    if capacity != 0 && buffer.is_null() then
+      panic("BumpArena::new: allocation failed - out of memory")
+    end
+    BumpArena {
+      _buffer: buffer,
+      _capacity: capacity,
+      _offset: 0,
+      _owns: 1
+    }
+  end
+
+  # Borrowed arena: bumps over a CALLER-OWNED buffer (static/global
+  # memory for the embedded policy, a preallocated region, etc.). The
+  # arena never frees it — Drop is a no-op on the backing — and the
+  # caller must keep the buffer alive (and aligned) for the arena's
+  # whole lifetime.
+  def with_buffer(buffer: Ptr[u8], capacity: UInt) -> BumpArena
+    BumpArena {
+      _buffer: buffer,
+      _capacity: capacity,
+      _offset: 0,
+      _owns: 0
+    }
+  end
+
+  def capacity(self: Self) -> UInt
+    self._capacity
+  end
+
+  # Bytes bumped so far (the deterministic bump pointer position).
+  def used(self: Self) -> UInt
+    self._offset
+  end
+
+  def remaining(self: Self) -> UInt
+    self._capacity - self._offset
+  end
+
+  # The raw backing buffer (owned or borrowed). Read-only access to the
+  # arena's memory for the caller that needs to hand the batch out;
+  # writes to it must respect the bump discipline (bytes above _offset
+  # belong to the next alloc).
+  def buffer(self: Self) -> Ptr[u8]
+    self._buffer
+  end
+
+  # Allocate `size` bytes aligned to `align` (power of two <= 16).
+  # Returns null on exhaustion; panics on an out-of-contract align.
+  # No individual free exists — the whole arena is reclaimed by
+  # reset() or by Drop.
+  def alloc(inout self: Self, size: UInt, align: UInt) -> Ptr[u8]
+    if align == 0 || (align & (align - 1)) != 0 then
+      panic("BumpArena::alloc: align must be a power of two")
+    end
+    if align > 16 then
+      panic("BumpArena::alloc: align " + align.to_string() + " > 16 not supported - the backing buffer is 16-byte-aligned")
+    end
+    if size == 0 then
+      return Ptr::null()
+    end
+    if self._buffer.is_null() || self._capacity == 0 then
+      return Ptr::null()
+    end
+
+    # Align the current bump offset (the same aligned-offset math as
+    # std::alloc's ArenaAllocator, with the same overflow guards).
+    let align_mask = align - 1
+    let aligned_offset = (self._offset + align_mask) & ~align_mask
+
+    if aligned_offset < self._offset then
+      return Ptr::null()
+    end
+
+    let end_offset = aligned_offset + size
+    if end_offset < aligned_offset then
+      return Ptr::null()
+    end
+
+    if end_offset > self._capacity then
+      return Ptr::null()  # exhausted: the caller resets or extends
+    end
+
+    let ptr = self._buffer.offset(aligned_offset as Int)
+    self._offset = end_offset
+    ptr
+  end
+
+  # Zero-overhead free-all: ONE store to the bump pointer. The buffer
+  # contents are untouched, so a reset-then-realloc cycle returns the
+  # SAME addresses for the same sequence (deterministic bump).
+  def reset(inout self: Self) -> Unit
+    self._offset = 0
+  end
+end
+
+impl Drop for BumpArena
+  def drop(inout self: BumpArena) -> Unit
+    # Release the backing exactly once (owned arenas only) so a
+    # bit-copied arena cannot double-own (and double-free) the buffer;
+    # idempotent with the field nulling below.
+    if self._owns != 0 && !self._buffer.is_null() && self._capacity != 0 then
+      global_dealloc(self._buffer, self._capacity, 16)
+    end
+    self._buffer = Ptr::null()
+    self._capacity = 0
+    self._offset = 0
+    self._owns = 0
+  end
+end
+
+# ═══════════════════════════════════════════════════════════════════════
+# SlabPool[T] — fixed-size typed object pool (the slab policy)
+# ═══════════════════════════════════════════════════════════════════════
+# Preallocated slots for the per-symbol / per-order hot path: init does
+# the pool's allocations (the slot arena + the free-list/occupancy
+# metadata); acquire/release/clear afterwards are pure free-list work —
+# NO heap churn after init. SlabPool is NOT thread-safe.
+#
+# INDEX HAND-OFF: acquire(inout, sink item) consumes the item into a
+# free slot and returns the slot INDEX; release(inout, index) moves the
+# occupant back out (ownership transfers to the caller) and returns it.
+# The index is an opaque handle into the pool — the language has no
+# safe reference types, so value-in/value-out index hand-off is the
+# sound surface (never a raw pointer into the slab). release on an
+# out-of-range or already-vacant index returns None (a double release
+# is a no-op, never a corruption).
+#
+# SLOT MEMORY + EXACT DROP: the slot arena is raw bytes; a slot holds a
+# live T exactly while its occupancy flag is 1. acquire writes the item
+# first and sets the flag LAST (the flag is the drop authority);
+# release clears the flag FIRST after moving the value out. Teardown —
+# both clear() and the registered Drop — walks the slots in ASCENDING
+# index order and destructs every live occupant exactly once (clear
+# through release-and-discard, Drop through drop_in_place on the live
+# slots), then clear leaves a fully reusable empty pool and Drop
+# releases the init-time allocations.
+#
+# The free list is intrusive over the metadata buffer: _free_next[i] is
+# the next free slot after i, with the sentinel END = _capacity; the
+# list is LIFO (release pushes onto the head), so a freshly released
+# slot is the next one acquire hands out — deterministic reuse.
+#
+# ALIGNMENT CONTRACT (inherited from std::alloc): the slot arena comes
+# from the global allocator (16-byte-aligned payload), so element types
+# with align_of <= 16 are served; an element alignment above 16 is an
+# EXPLICIT error at new() (the pool cannot honor over-aligned slots).
+
+struct SlabPool[T]
+  _slots: Ptr[u8]      # the element arena: capacity * stride bytes
+  _stride: UInt        # element stride in bytes (size_of[T])
+  _slots_bytes: UInt   # capacity * stride — the exact release size
+  _free_next: Ptr[u8]  # free-list metadata: capacity UInt words (next[i])
+  _live: Ptr[u8]       # occupancy metadata: capacity UInt words (0/1)
+  _meta_bytes: UInt    # capacity * word — the exact release size
+  _capacity: UInt      # slot count; also the free-list END sentinel
+  _free_head: UInt     # free-list head; == _capacity when the pool is full
+  _len: UInt           # live occupant count
+end
+
+impl[T] SlabPool[T]
+  # Creates a pool of `capacity` preallocated slots. All pool
+  # allocations happen here (slot arena + two metadata buffers, each
+  # through the global allocator) and are released exactly once by
+  # Drop. A zero capacity creates an empty pool that rejects every
+  # acquire.
+  def new(capacity: UInt) -> SlabPool[T]
+    if capacity == 0 then
+      return SlabPool {
+        _slots: Ptr::null(),
+        _stride: 0,
+        _slots_bytes: 0,
+        _free_next: Ptr::null(),
+        _live: Ptr::null(),
+        _meta_bytes: 0,
+        _capacity: 0,
+        _free_head: 0,
+        _len: 0
+      }
+    end
+    let elem_stride = size_of[T]()
+    if elem_stride == 0 then
+      panic("SlabPool::new: zero-size element types are not supported")
+    end
+    let elem_align = align_of[T]()
+    if elem_align == 0 || (elem_align & (elem_align - 1)) != 0 then
+      panic("SlabPool::new: element alignment must be a power of two")
+    end
+    if elem_align > 16 then
+      panic("SlabPool::new: element alignment " + elem_align.to_string() + " > 16 not supported - the backing buffer is 16-byte-aligned")
+    end
+    let word = size_of[UInt]()
+    let slots_bytes = elem_stride * capacity
+    if slots_bytes / capacity != elem_stride then
+      panic("SlabPool::new: slot arena overflow")
+    end
+    let meta_bytes = word * capacity
+    if meta_bytes / capacity != word then
+      panic("SlabPool::new: metadata overflow")
+    end
+    let slots = global_alloc(slots_bytes, 16)
+    let free_next = global_alloc(meta_bytes, 16)
+    let live = global_alloc(meta_bytes, 16)
+    if (slots_bytes != 0 && slots.is_null()) || free_next.is_null() || live.is_null() then
+      panic("SlabPool::new: allocation failed - out of memory")
+    end
+
+    # Wire the free list (next[i] = i + 1, the last slot links to the
+    # END sentinel) and clear every occupancy flag.
+    mut i: UInt = 0
+    while i < capacity do
+      let next_ptr = (free_next as Int + (i as Int) * (word as Int)) as Ptr[UInt]
+      next_ptr.write(i + 1)
+      let live_ptr = (live as Int + (i as Int) * (word as Int)) as Ptr[UInt]
+      live_ptr.write(0)
+      i = i + 1
+    end
+
+    SlabPool {
+      _slots: slots,
+      _stride: elem_stride,
+      _slots_bytes: slots_bytes,
+      _free_next: free_next,
+      _live: live,
+      _meta_bytes: meta_bytes,
+      _capacity: capacity,
+      _free_head: 0,
+      _len: 0
+    }
+  end
+
+  def capacity(self: Self) -> UInt
+    self._capacity
+  end
+
+  # Live occupant count (occupied slots).
+  def len(self: Self) -> UInt
+    self._len
+  end
+
+  def is_empty(self: Self) -> Bool
+    self._len == 0
+  end
+
+  def is_full(self: Self) -> Bool
+    self._len >= self._capacity
+  end
+
+  # Whether the slot currently holds a live occupant.
+  def occupied(self: Self, index: UInt) -> Bool
+    if index >= self._capacity then
+      return false
+    end
+    let word = size_of[UInt]() as Int
+    let live_ptr = (self._live as Int + (index as Int) * word) as Ptr[UInt]
+    live_ptr.read() != 0
+  end
+
+  # Ownership-taking acquire: consumes the item into a free slot and
+  # returns the slot index. A full pool (no free slot) does NOT consume
+  # the item — it is returned to the caller as Err(item) (the
+  # sink-rejected-value full policy of std::fixed). Allocation-free.
+  def acquire(inout self: Self, sink item: T) -> Result[UInt, T]
+    if self._free_head >= self._capacity then
+      return Result::Err(item)
+    end
+    let idx = self._free_head
+    let word = size_of[UInt]() as Int
+    let next_ptr = (self._free_next as Int + (idx as Int) * word) as Ptr[UInt]
+    self._free_head = next_ptr.read()
+    # The item lands in the slot BEFORE the occupancy flag is set (the
+    # flag is the drop authority; nothing in between can panic).
+    let slot = (self._slots as Int + (idx as Int) * (self._stride as Int)) as Ptr[T]
+    slot.write(item)
+    let live_ptr = (self._live as Int + (idx as Int) * word) as Ptr[UInt]
+    live_ptr.write(1)
+    self._len = self._len + 1
+    Result::Ok(idx)
+  end
+
+  # Ownership-transferring release: moves the live occupant of `index`
+  # out (the caller owns the returned value), clears the flag and
+  # pushes the slot onto the free-list head (LIFO: the next acquire
+  # reuses this slot — deterministic). None for an out-of-range or
+  # already-vacant index (a double release is a no-op). Allocation-free.
+  def release(inout self: Self, index: UInt) -> Option[T]
+    if index >= self._capacity then
+      return Option::None
+    end
+    let word = size_of[UInt]() as Int
+    let live_ptr = (self._live as Int + (index as Int) * word) as Ptr[UInt]
+    if live_ptr.read() == 0 then
+      return Option::None
+    end
+    let slot = (self._slots as Int + (index as Int) * (self._stride as Int)) as Ptr[T]
+    let value = slot.read()
+    live_ptr.write(0)
+    let next_ptr = (self._free_next as Int + (index as Int) * word) as Ptr[UInt]
+    next_ptr.write(self._free_head)
+    self._free_head = index
+    self._len = self._len - 1
+    Option::Some(value)
+  end
+
+  # Deterministic teardown of the live occupants: a single ascending
+  # scan of the slots; every live occupant is released (its drop runs
+  # as the returned Option is discarded — the std::fixed ArrayVec::clear
+  # / std::collections VecDeque::clear drop convention) and every slot
+  # returns to the free list. The pool is fully reusable afterwards
+  # (len 0; acquires reuse the freed slots in LIFO order). Note: this
+  # drops the occupant VALUES — an occupant that owns resources (a
+  # String) releases its own memory through its own drop; the pool's
+  # metadata itself is untouched by any allocator.
+  def clear(inout self: Self) -> Unit
+    mut i: UInt = 0
+    while i < self._capacity do
+      self.release(i)
+      i = i + 1
+    end
+  end
+end
+
+# By-value projected read of an occupant (Copy only — sound
+# duplication: the slot keeps its value; teardown still drops it).
+impl[T: Copy] SlabPool[T]
+  def get(self: Self, index: UInt) -> Option[T]
+    if index >= self._capacity then
+      return Option::None
+    end
+    let word = size_of[UInt]() as Int
+    let live_ptr = (self._live as Int + (index as Int) * word) as Ptr[UInt]
+    if live_ptr.read() == 0 then
+      return Option::None
+    end
+    let slot = (self._slots as Int + (index as Int) * (self._stride as Int)) as Ptr[T]
+    let value = slot.read()
+    Option::Some(value)
+  end
+end
+
+impl[T] Drop for SlabPool[T]
+  def drop(inout self: SlabPool[T]) -> Unit
+    # Teardown: destruct every live occupant EXACTLY ONCE — the same
+    # deterministic ascending scan as clear(), over the occupancy
+    # flags (the drop authority) — then release the three init-time
+    # allocations and null every field, so a bit-copied pool cannot
+    # double-free (the std::alloc ArenaAllocator/PoolAllocator
+    # convention).
+    if !self._slots.is_null() && self._capacity != 0 then
+      let word = size_of[UInt]() as Int
+      mut i: UInt = 0
+      while i < self._capacity do
+        let live_ptr = (self._live as Int + (i as Int) * word) as Ptr[UInt]
+        if live_ptr.read() != 0 then
+          let slot = (self._slots as Int + (i as Int) * (self._stride as Int)) as Ptr[T]
+          slot.drop_in_place()
+        end
+        i = i + 1
+      end
+      global_dealloc(self._free_next, self._meta_bytes, 16)
+      global_dealloc(self._live, self._meta_bytes, 16)
+      global_dealloc(self._slots, self._slots_bytes, 16)
+    end
+    self._slots = Ptr::null()
+    self._free_next = Ptr::null()
+    self._live = Ptr::null()
+    self._capacity = 0
+    self._free_head = 0
+    self._len = 0
+    self._slots_bytes = 0
+    self._meta_bytes = 0
+  end
+end
+
+# ═══════════════════════════════════════════════════════════════════════
+# Usage notes
+# ═══════════════════════════════════════════════════════════════════════
+#
+#   use std::alloc_policy
+#
+#   # Per-batch bump arena (the market-data-packet policy): the packet
+#   # decoder bumps its records out of one arena and free-alls at the
+#   # packet boundary — no per-record allocator traffic:
+#   var batch = std::alloc_policy::BumpArena::new(4096)
+#   let hdr = batch.alloc(64, 8)
+#   let body = batch.alloc(256, 16)
+#   # ... fill the packet from hdr/body ...
+#   batch.reset()   # one store reclaims the whole batch
+#
+#   # The per-symbol slab (orders/state records; preallocated once):
+#   var pool = std::alloc_policy::SlabPool[Int].new(1024)
+#   match pool.acquire(42)
+#   when Result::Ok(slot) then
+#     # ... use the opaque slot index as the record's handle ...
+#     let _ = pool.release(slot)   # or release(slot) and own the value
+#   when Result::Err(item) then ()  # pool full: the item returns
+#   end
+#
+#   # The no-allocator matching loop (finance): a fixed-capacity ring
+#   # funded from a preallocated slab — the loop body allocates NOTHING
+#   # (policy: None/Fixed; the fill happens outside the match cycle):
+#   var fund = std::alloc_policy::SlabPool[Int].new(8)
+#   var ring = std::fixed::RingBuffer8[Int].new()
+#   match fund.acquire(100)   # one prefill per ring slot
+#   when Result::Ok(slot) then
+#     let _ = ring.push(slot)
+#   when Result::Err(_) then ()
+#   end
+#   # ... the matching loop pops ring / releases fund indices only ...
+#
+#   # Embedded/static (policy: None): the arena borrows a static buffer
+#   # and the containers are std::fixed's inline forms — no heap at all.
+#
+# FUTURE WORK (documented gaps, kept OUT of this module's contract):
+#   - A general allocator parameter on the growable containers
+#     (Vec[T, A], Map[K, V, H, A]) needs kernel work: Vec growth lowers
+#     to the __intrinsic_array_push intrinsic (the runtime allocator),
+#     so an arena-provided Vec is not expressible from std today.
+#     Bounded hot paths use this module's policy forms instead.
+#   - Const-generic capacity (ArrayVecN-style forms spelled
+#     ArrayVec[T, N]) is likewise kernel type-system work — see the
+#     std::fixed header's compile-time-capacity decision.

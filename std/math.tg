@@ -7,7 +7,7 @@
 
 module std::math
 
-use std::core::{Option, Result, Display, Clone, Eq, Ord, Hash, Default, From}
+use std::core::{Option, Result, SmallErrorCode, Display, Clone, Eq, Ord, Hash, Default, From}
 use std::fmt
 
 # [METADATA]
@@ -719,7 +719,10 @@ impl Hash for BigDecimal
     end
     var h: Int = s
     for i in 0..u.digits.len() do
-      h = h * 31 + (u.digits.get(i).unwrap_or(0u32) as Int)
+      # P1-5 wrap-intent sweep: the limb hash-mix folds through the
+      # unsigned 64-bit view (bit-identical to the former Int fold) so
+      # the default signed overflow trap cannot fire on accumulation.
+      h = ((h as u64) * 31u64 + (u.digits.get(i).unwrap_or(0u32) as u64)) as Int
     end
     if u.negative && !u.is_zero() then h = -h end
     h
@@ -795,8 +798,26 @@ end
 ## range check; the default two's-complement wrapping of the machine
 ## word is never relied on for correctness (only for the final
 ## negate-of-magnitude, where wrapping is exact).
+##
+## Audit P1-3 explicit-policy surface: add/sub/mul/div/rescale are all
+## CHECKED Result forms (overflow and division by zero are Err, never
+## silent); rounding is always an explicit RoundingMode argument with
+## the seven modes enumerated above; checked_rescale names the checked
+## rescale form; the wrapping_* family spells out two's-complement
+## wrap of the unscaled word (64-bit for Fixed64, 128-bit for
+## Fixed128); and the saturating_* family clamps the unscaled word to
+## its bounds instead.  No fixed-point operation reads or depends on
+## the ambient FPU rounding mode.
 
 ## Errors from fixed-point arithmetic.
+##
+## Audit P1-22 hot-path contract: constructing or returning a FixedError
+## allocates nothing — it is a zero-payload tag (bit-copyable, no String
+## field, no drop glue), so Result[T, FixedError] failure paths are
+## allocation-free.  Human-readable diagnostics are deliberately kept off
+## the hot path: they exist only as the String-bearing ErrorDetails
+## assembled at the cold reporting/observability boundary, where the tag
+## is lifted via code() -> SmallErrorCode and SmallErrorCode::into_details.
 pub enum FixedError
   ## The divisor's unscaled value is zero.
   DivideByZero
@@ -805,6 +826,20 @@ pub enum FixedError
   ## The value has a nonzero fraction where an exact integer was
   ## required (to_bigint of a non-integral value).
   NotIntegral
+end
+
+impl FixedError
+  ## The Audit P1-22 bridge to the std::core no-alloc error subsystem:
+  ## the stable code for this tag — plain-tag match, no allocation on
+  ## any path.  The SmallErrorCode it yields carries the numeric code()
+  ## used at the cold boundary to build the String-bearing ErrorDetails.
+  pub def code(self: Self) -> SmallErrorCode
+    match self
+    when FixedError::DivideByZero then SmallErrorCode::InvalidInput
+    when FixedError::Overflow then SmallErrorCode::Overflow
+    when FixedError::NotIntegral then SmallErrorCode::InvalidInput
+    end
+  end
 end
 
 # ─── Fixed64 — 64-bit fixed-point decimal ────────────────────────────
@@ -839,7 +874,10 @@ impl Fixed64
     let lim = ((~(0 as u64)) >> 1) as u128
     if parsed.mag > lim + 1 then return Err("out of range") end
     if !parsed.neg && parsed.mag > lim then return Err("out of range") end
-    var unscaled: Int = if parsed.mag == 0 then 0 else (if parsed.neg then 0 - (parsed.mag as Int) else (parsed.mag as Int) end) end
+    # P1-5: the negative value is spelled on the unsigned 64-bit view —
+    # mag == 2^63 is exactly MIN (representable) and the trapping
+    # default must never fire on the negation.
+    var unscaled: Int = if parsed.mag == 0 then 0 else (if parsed.neg then ((0 as u64) - (parsed.mag as u64)) as Int else (parsed.mag as Int) end) end
     Ok(Fixed64 { unscaled: unscaled, scale: parsed.scale })
   end
 
@@ -855,14 +893,12 @@ impl Fixed64
   ## exact).  Overflow of the aligned word is an error result.
   pub def add(self, other: Fixed64) -> Result[Fixed64, FixedError]
     if self.scale == other.scale then
-      let s = self.unscaled + other.unscaled
-      if self.unscaled >= 0 && other.unscaled >= 0 && s < 0 then
-        return Err(FixedError::Overflow)
+      # P1-5: word overflow must report Err — the checked_* surface
+      # detects it without any trapping default signed op in the body.
+      match self.unscaled.checked_add(other.unscaled)
+      when Option::Some(s) then return Ok(Fixed64 { unscaled: s, scale: self.scale })
+      when Option::None then return Err(FixedError::Overflow)
       end
-      if self.unscaled < 0 && other.unscaled < 0 && s >= 0 then
-        return Err(FixedError::Overflow)
-      end
-      return Ok(Fixed64 { unscaled: s, scale: self.scale })
     end
     if self.scale < other.scale then
       let a = self.rescale(other.scale, RoundingMode::TowardZero)?
@@ -876,14 +912,12 @@ impl Fixed64
   ## Subtract with the operands aligned to the LARGER scale (exact).
   pub def sub(self, other: Fixed64) -> Result[Fixed64, FixedError]
     if self.scale == other.scale then
-      let d = self.unscaled - other.unscaled
-      if self.unscaled >= 0 && other.unscaled < 0 && d < 0 then
-        return Err(FixedError::Overflow)
+      # P1-5: word overflow must report Err — the checked_* surface
+      # detects it without any trapping default signed op in the body.
+      match self.unscaled.checked_sub(other.unscaled)
+      when Option::Some(d) then return Ok(Fixed64 { unscaled: d, scale: self.scale })
+      when Option::None then return Err(FixedError::Overflow)
       end
-      if self.unscaled < 0 && other.unscaled >= 0 && d >= 0 then
-        return Err(FixedError::Overflow)
-      end
-      return Ok(Fixed64 { unscaled: d, scale: self.scale })
     end
     if self.scale < other.scale then
       let a = self.rescale(other.scale, RoundingMode::TowardZero)?
@@ -895,13 +929,99 @@ impl Fixed64
   end
 
   ## Negate.  The magnitude of the minimum value is not representable,
-  ## so negating it wraps (kernel two's-complement semantics).
+  ## so negating it wraps (kernel two's-complement semantics).  P1-5:
+  ## the wrap is the explicit unsigned 64-bit view — the trapping
+  ## default never fires on the documented wrap.
   pub def negate(self) -> Fixed64
-    Fixed64 { unscaled: 0 - self.unscaled, scale: self.scale }
+    Fixed64 { unscaled: ((0 as u64) - (self.unscaled as u64)) as Int, scale: self.scale }
   end
 
   pub def abs(self) -> Fixed64
     if self.unscaled < 0 then self.negate() else self end
+  end
+
+  ## Two's-complement wrapping add of the UNSCALED words (mod 2^64),
+  ## result at the operand scale.  Equal scales only — a scale
+  ## mismatch is a programming error (panic); add() (Result, aligned)
+  ## is the cross-scale form.
+  pub def wrapping_add(self, other: Fixed64) -> Fixed64
+    pre self.scale == other.scale, "wrapping_add: equal scales required; add() is the aligned cross-scale form"
+    let unscaled = ((self.unscaled as u64) + (other.unscaled as u64)) as Int
+    Fixed64 { unscaled: unscaled, scale: self.scale }
+  end
+
+  ## Two's-complement wrapping subtract of the UNSCALED words (mod 2^64),
+  ## result at the operand scale.  Equal scales only (panic otherwise);
+  ## sub() (Result, aligned) is the cross-scale form.
+  pub def wrapping_sub(self, other: Fixed64) -> Fixed64
+    pre self.scale == other.scale, "wrapping_sub: equal scales required; sub() is the aligned cross-scale form"
+    let unscaled = ((self.unscaled as u64) - (other.unscaled as u64)) as Int
+    Fixed64 { unscaled: unscaled, scale: self.scale }
+  end
+
+  ## Two's-complement wrapping product of the UNSCALED words (mod 2^64);
+  ## the result scale is the sum of the operand scales, as in mul().
+  pub def wrapping_mul(self, other: Fixed64) -> Fixed64
+    let unscaled = ((self.unscaled as u64) * (other.unscaled as u64)) as Int
+    Fixed64 { unscaled: unscaled, scale: self.scale + other.scale }
+  end
+
+  ## Saturating add at the operand scale: an overflowing word clamps
+  ## to Int::MAX (positive overflow) or Int::MIN (negative overflow).
+  ## Overflow is detected by the two's-complement sign rules on the
+  ## wrapping u64 view, so no operation in the body can itself trap.
+  ## Equal scales only (panic otherwise); add() (Result) is the
+  ## aligned cross-scale form.
+  pub def saturating_add(self, other: Fixed64) -> Fixed64
+    pre self.scale == other.scale, "saturating_add: equal scales required; add() is the aligned cross-scale form"
+    let a = self.unscaled as u64
+    let b = other.unscaled as u64
+    let s = a + b
+    let lim = (~(0 as u64)) >> 1
+    let a_neg = a > lim
+    let b_neg = b > lim
+    let s_neg = s > lim
+    if (a_neg && b_neg && !s_neg) || (!a_neg && !b_neg && s_neg) then
+      let unscaled: Int = if a_neg then (lim + 1) as Int else lim as Int end
+      return Fixed64 { unscaled: unscaled, scale: self.scale }
+    end
+    Fixed64 { unscaled: s as Int, scale: self.scale }
+  end
+
+  ## Saturating subtract at the operand scale: an overflowing word
+  ## clamps to Int::MAX (overflow upward) or Int::MIN (overflow
+  ## downward), following self's sign.  Sign-rule detection on the
+  ## wrapping u64 view — no trapping operation.  Equal scales only
+  ## (panic otherwise); sub() (Result) is the aligned cross-scale form.
+  pub def saturating_sub(self, other: Fixed64) -> Fixed64
+    pre self.scale == other.scale, "saturating_sub: equal scales required; sub() is the aligned cross-scale form"
+    let a = self.unscaled as u64
+    let b = other.unscaled as u64
+    let r = a - b
+    let lim = (~(0 as u64)) >> 1
+    let a_neg = a > lim
+    let b_neg = b > lim
+    let r_neg = r > lim
+    if (!a_neg && b_neg && r_neg) || (a_neg && !b_neg && !r_neg) then
+      let unscaled: Int = if a_neg then (lim + 1) as Int else lim as Int end
+      return Fixed64 { unscaled: unscaled, scale: self.scale }
+    end
+    Fixed64 { unscaled: r as Int, scale: self.scale }
+  end
+
+  ## Saturating product: word overflow clamps to Int::MAX (positive
+  ## product) or Int::MIN (negative product).  Overflow detection is
+  ## mul()'s magnitude probe — no trapping operation; the result
+  ## scale is the sum of the operand scales, as in mul().
+  pub def saturating_mul(self, other: Fixed64) -> Fixed64
+    match self.mul(other)
+    when Ok(v) then v
+    when Err(_) then
+      let neg = (self.unscaled < 0) != (other.unscaled < 0)
+      let lim = (~(0 as u64)) >> 1
+      let unscaled: Int = if neg then (lim + 1) as Int else lim as Int end
+      Fixed64 { unscaled: unscaled, scale: self.scale + other.scale }
+    end
   end
 
   ## Exact product; the result scale is the sum of the operand scales.
@@ -914,7 +1034,10 @@ impl Fixed64
     if p > lim_neg then return Err(FixedError::Overflow) end
     let neg = (self.unscaled < 0) != (other.unscaled < 0)
     if !neg && p == lim_neg then return Err(FixedError::Overflow) end
-    var unscaled: Int = if p == 0 then 0 else (if neg then 0 - (p as Int) else (p as Int) end) end
+    # P1-5: the negative product is spelled on the unsigned 64-bit view
+    # (0 - p mod 2^64) — p == 2^63 is the exact-MIN product (-2^63,
+    # representable), and the trapping default must never fire on it.
+    var unscaled: Int = if p == 0 then 0 else (if neg then ((0 as u64) - (p as u64)) as Int else (p as Int) end) end
     Ok(Fixed64 { unscaled: unscaled, scale: self.scale + other.scale })
   end
 
@@ -940,6 +1063,14 @@ impl Fixed64
 
   ## Alias for rescale with an explicit rounding mode.
   pub def round(self, new_scale: Int, rounding: RoundingMode) -> Result[Fixed64, FixedError]
+    self.rescale(new_scale, rounding)
+  end
+
+  ## Audit-named alias: rescale IS the checked form — scaling down
+  ## rounds explicitly (never silently discards digits) and scaling up
+  ## reports word overflow as Err, so an out-of-range result is never
+  ## produced silently.
+  pub def checked_rescale(self, new_scale: Int, rounding: RoundingMode) -> Result[Fixed64, FixedError]
     self.rescale(new_scale, rounding)
   end
 
@@ -1173,6 +1304,90 @@ impl Fixed128
     if self.unscaled < 0 then self.negate() else self end
   end
 
+  ## Two's-complement wrapping add of the UNSCALED words (mod 2^128),
+  ## result at the operand scale.  Equal scales only — a scale
+  ## mismatch is a programming error (panic); add() (Result, aligned)
+  ## is the cross-scale form.
+  pub def wrapping_add(self, other: Fixed128) -> Fixed128
+    pre self.scale == other.scale, "wrapping_add: equal scales required; add() is the aligned cross-scale form"
+    let unscaled = ((self.unscaled as u128) + (other.unscaled as u128)) as i128
+    Fixed128 { unscaled: unscaled, scale: self.scale }
+  end
+
+  ## Two's-complement wrapping subtract of the UNSCALED words (mod 2^128),
+  ## result at the operand scale.  Equal scales only (panic otherwise);
+  ## sub() (Result, aligned) is the cross-scale form.
+  pub def wrapping_sub(self, other: Fixed128) -> Fixed128
+    pre self.scale == other.scale, "wrapping_sub: equal scales required; sub() is the aligned cross-scale form"
+    let unscaled = ((self.unscaled as u128) - (other.unscaled as u128)) as i128
+    Fixed128 { unscaled: unscaled, scale: self.scale }
+  end
+
+  ## Two's-complement wrapping product of the UNSCALED words (mod 2^128);
+  ## the result scale is the sum of the operand scales, as in mul().
+  pub def wrapping_mul(self, other: Fixed128) -> Fixed128
+    let unscaled = ((self.unscaled as u128) * (other.unscaled as u128)) as i128
+    Fixed128 { unscaled: unscaled, scale: self.scale + other.scale }
+  end
+
+  ## Saturating add at the operand scale: an overflowing word clamps
+  ## to i128::MAX (positive overflow) or i128::MIN (negative overflow).
+  ## Overflow is detected by the two's-complement sign rules on the
+  ## wrapping u128 view, so no operation in the body can itself trap.
+  ## Equal scales only (panic otherwise); add() (Result) is the
+  ## aligned cross-scale form.
+  pub def saturating_add(self, other: Fixed128) -> Fixed128
+    pre self.scale == other.scale, "saturating_add: equal scales required; add() is the aligned cross-scale form"
+    let a = self.unscaled as u128
+    let b = other.unscaled as u128
+    let s = a + b
+    let lim = (~(0 as u128)) >> 1
+    let a_neg = a > lim
+    let b_neg = b > lim
+    let s_neg = s > lim
+    if (a_neg && b_neg && !s_neg) || (!a_neg && !b_neg && s_neg) then
+      let unscaled: i128 = if a_neg then (lim + 1) as i128 else lim as i128 end
+      return Fixed128 { unscaled: unscaled, scale: self.scale }
+    end
+    Fixed128 { unscaled: s as i128, scale: self.scale }
+  end
+
+  ## Saturating subtract at the operand scale: an overflowing word
+  ## clamps to i128::MAX (overflow upward) or i128::MIN (overflow
+  ## downward), following self's sign.  Sign-rule detection on the
+  ## wrapping u128 view — no trapping operation.  Equal scales only
+  ## (panic otherwise); sub() (Result) is the aligned cross-scale form.
+  pub def saturating_sub(self, other: Fixed128) -> Fixed128
+    pre self.scale == other.scale, "saturating_sub: equal scales required; sub() is the aligned cross-scale form"
+    let a = self.unscaled as u128
+    let b = other.unscaled as u128
+    let r = a - b
+    let lim = (~(0 as u128)) >> 1
+    let a_neg = a > lim
+    let b_neg = b > lim
+    let r_neg = r > lim
+    if (!a_neg && b_neg && r_neg) || (a_neg && !b_neg && !r_neg) then
+      let unscaled: i128 = if a_neg then (lim + 1) as i128 else lim as i128 end
+      return Fixed128 { unscaled: unscaled, scale: self.scale }
+    end
+    Fixed128 { unscaled: r as i128, scale: self.scale }
+  end
+
+  ## Saturating product: word overflow clamps to i128::MAX (positive
+  ## product) or i128::MIN (negative product).  Overflow detection is
+  ## mul()'s magnitude probe — no trapping operation; the result
+  ## scale is the sum of the operand scales, as in mul().
+  pub def saturating_mul(self, other: Fixed128) -> Fixed128
+    match self.mul(other)
+    when Ok(v) then v
+    when Err(_) then
+      let neg = (self.unscaled < 0) != (other.unscaled < 0)
+      let lim = (~(0 as u128)) >> 1
+      let unscaled: i128 = if neg then (lim + 1) as i128 else lim as i128 end
+      Fixed128 { unscaled: unscaled, scale: self.scale + other.scale }
+    end
+  end
+
   pub def mul(self, other: Fixed128) -> Result[Fixed128, FixedError]
     let ma = _fx_mag128(self.unscaled)
     let mb = _fx_mag128(other.unscaled)
@@ -1210,6 +1425,14 @@ impl Fixed128
   end
 
   pub def round(self, new_scale: Int, rounding: RoundingMode) -> Result[Fixed128, FixedError]
+    self.rescale(new_scale, rounding)
+  end
+
+  ## Audit-named alias: rescale IS the checked form — scaling down
+  ## rounds explicitly (never silently discards digits) and scaling up
+  ## reports word overflow as Err, so an out-of-range result is never
+  ## produced silently.
+  pub def checked_rescale(self, new_scale: Int, rounding: RoundingMode) -> Result[Fixed128, FixedError]
     self.rescale(new_scale, rounding)
   end
 
@@ -1437,7 +1660,10 @@ def _fx_make64(neg: Bool, mag: u128, scale: Int) -> Result[Fixed64, FixedError]
   let lim_neg = (((~(0 as u64)) >> 1) as u128) + 1
   if mag > lim_neg then return Err(FixedError::Overflow) end
   if !neg && mag == lim_neg then return Err(FixedError::Overflow) end
-  var unscaled: Int = if mag == 0 then 0 else (if neg then 0 - (mag as Int) else (mag as Int) end) end
+  # P1-5: the negative word is spelled on the unsigned 64-bit view —
+  # mag == 2^63 is exactly MIN (representable) and the trapping
+  # default must never fire on the negation.
+  var unscaled: Int = if mag == 0 then 0 else (if neg then ((0 as u64) - (mag as u64)) as Int else (mag as Int) end) end
   Ok(Fixed64 { unscaled: unscaled, scale: scale })
 end
 
@@ -1614,7 +1840,10 @@ def _fx_hash(neg: Bool, mag: u128, scale: Int) -> Int
   end
   var h: Int = sc
   while m > 0 do
-    h = h * 31 + ((m % (4294967296 as u128)) as Int)
+    # P1-5 wrap-intent sweep: the limb hash-mix folds through the
+    # unsigned 64-bit view (bit-identical to the former Int fold) so the
+    # default signed overflow trap cannot fire on accumulation.
+    h = ((h as u64) * 31u64 + ((m % (4294967296 as u128)) as u64)) as Int
     m = m >> 32
   end
   if neg && mag > 0 then h = 0 - h end

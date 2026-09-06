@@ -29,9 +29,11 @@ use tg_compiler::ids::{
 use tg_compiler::ast::{
   Program, Item, ItemKind, FunctionDecl, StructDecl, EnumDecl, TraitDecl, ImplDecl,
   UseDecl, AstPath, ExternItem, NominalKind, AccessConvention,
+  Attribute,
   TypeExpr, TypeExprKind, Param, GenericParam,
   Block, Stmt, StmtKind, Expr, ExprKind, Pattern, PatternKind,
-  BudgetAnnotation, BudgetConstraint, LayoutAttrs, layout_attrs_plain
+  BudgetAnnotation, BudgetConstraint, LayoutAttrs, layout_attrs_plain,
+  expr_is_place_like
 }
 # (ONE AnalyzedProgram): the ONE TypedCFG the pipeline builds
 # (compiler_core's analyze_parsed — build_typed_cfg ONCE) is passed through
@@ -46,6 +48,71 @@ use tg_compiler::resource_check::{AnalyzedProgram, TypedCFG, analysis_context_ne
 # ———————————————————————————————————————————————————————————————
 # Type Representation
 # ———————————————————————————————————————————————————————————————
+
+# ———————————————————————————————————————————————————————————————
+# (P1-6) FLOATING-POINT MODES — the STRICT DEFAULT (CANONICAL SPEC)
+# ———————————————————————————————————————————————————————————————
+# Every function compiles in the STRICT floating-point mode unless its
+# declaration carries the item attribute @fp(fast) — the ONLY mode
+# selector in the compiler. The attribute is recorded generically by
+# the parser (parser.tg's parse_attributes, which also validates the
+# @fp(fast) shape fail-closed with E110), stamped onto
+# MirFunction.fp_fast at mir.tg's lower_program PASS 2 (the same
+# item-attribute channel as the P1-18 @inline/@cold hints), carried
+# through monomorphization, and consulted only by codegen (per emitted
+# function). An OPTIMIZATION LEVEL NEVER selects a mode: -O flags are
+# consumed solely by mir.tg's optimize_mir_verified, whose passes are
+# float-semantics-neutral (constant folding is integer-only — float
+# constants are never folded or reassociated), so an -O3 build is never
+# silently fast. MirFunction.fp_fast is never read by any optimizer
+# pass; only the attribute sets it.
+#
+# STRICT mode specifies, for every scalar float operation (the four
+# arithmetic ops + six comparisons emitted at codegen.tg's
+# codegen_float_binop, the int<->float casts at its codegen_rvalue cast
+# sites, and float constants):
+#
+#   * NaN comparison semantics — the IEEE-754 ORDERED comparison rules
+#     with no exception delivery: a comparison with a NaN operand is
+#     FALSE for ==, <, <=, > and >=, and TRUE for !=. Emission: A64
+#     FCMP + CSET under EQ/NE/MI/LS/GT/GE (or the x86-64 SSE compare
+#     sequences) — the unordered NaN case sets no condition except NE.
+#   * Signed zero — +0.0 == -0.0 compares equal; zero results carry
+#     the IEEE-754 round-to-nearest-even sign (e.g. (+0.0) + (-0.0) =
+#     +0.0 and (-0.0) + (-0.0) = -0.0); loads/stores/moves preserve
+#     the sign bit exactly. No emitted sequence canonicalizes or
+#     flushes zero.
+#   * float -> int conversion — the SPECIFIED (trap-free, fully
+#     defined) per-target rule, unchanged by @fp(fast):
+#       - AArch64: FCVTZS — truncation toward zero; a NaN operand
+#         gives 0; a value outside the signed 64-bit range SATURATES
+#         (a value >= 2^63 gives INT64_MAX, a value < -2^63 gives
+#         INT64_MIN);
+#       - x86-64: CVTTSD2SI — a NaN operand or any out-of-range value
+#         gives the integer indefinite 0x8000000000000000 (INT64_MIN).
+#     @fp(fast)'s finite-only assumption never demotes an invalid
+#     conversion to undefined behavior — the cast rule above always
+#     holds.
+#   * No contraction — every arithmetic operation rounds EXACTLY once:
+#     an a*b+c pattern compiles to a multiply and an add, each rounded
+#     separately; no fmadd/fmla fusion ever occurs in strict mode.
+#   * No reassociation — operand evaluation order and association are
+#     fixed by the source and the MIR; no pass reorders or
+#     re-associates float operations.
+#   * Subnormals preserved — no flush-to-zero anywhere: codegen never
+#     writes FPCR/MXCSR (or any FP control register) and no emitted
+#     instruction flushes subnormals.
+#   * Rounding — round-to-nearest-even, the target's default FPCR /
+#     MXCSR state (never modified by codegen).
+#
+# @fp(fast) is the opt-in, PER-FUNCTION relaxation of the above
+# (reassociation, reciprocal approximations, contraction/FMA,
+# finite-only assumptions). The fast paths are listed as TODO P1-6
+# markers at the float-emission sites in codegen.tg, all gated on the
+# emitted function's mode; until they land, @fp(fast) functions emit
+# the identical strict instruction sequences — the mode is recorded
+# state (MirFunction.fp_fast -> codegen ctx.current_fp_fast), never
+# silently applied math.
 
 enum Type
   # Primitive types
@@ -199,14 +266,20 @@ end
 # MIR reads declaration types from this table — never from TypeExpr again.
 # The record ALSO carries the DECLARED EFFECT SET (the parsed
 # `effect[...]`-style annotation names interned through the EffectRegistry —
-# the EffectIds, or the std effectful-function seeds) and the DECLARED
-# BUDGET (the @budget annotation's limit — the typed record) so the
-# effect/budget semantics survive checking into the MIR.
+# the EffectIds, or the std effectful-function seeds), the DECLARED
+# BUDGET (the @budget annotation's limit — the typed record) and the
+# EFFECT-CLASS ANNOTATIONS (the recognized @no_alloc / @no_block / @no_io /
+# @irq_safe / @interrupt claims — the @effects(no_alloc, no_block, no_io)
+# list spelling included — parsed from the item's attributes — audit
+# P1-2/P1-16; the checker's classifier PROVES them, see
+# check_effect_class_annotations) so the effect/budget semantics survive
+# checking into the MIR.
 struct FnSignature
   params: Vec[ParamType]
   ret_type: Type
   declared_effects: Vec[EffectId] = Vec::new()
   declared_budget: Option[TypedBudget] = Option::None
+  effect_annotations: Vec[EffectAnnotation] = Vec::new()
 end
 
 # The TYPED budget record of a function/method declaration — the
@@ -220,6 +293,60 @@ end
 struct TypedBudgetConstraint
   metric: String
   limit: String
+end
+
+# ———————————————————————————————————————————————————————————————
+# (audit P1-2 / P1-16) effect-class annotations — the typed annotation
+# domain
+# ———————————————————————————————————————————————————————————————
+# The declared per-function annotations the checker PROVES by classifying
+# the function's body into three behavioral classes (EffectClass) and
+# propagating the classes through the recorded call graph to a fixed point
+# (the pass at check_effect_class_annotations):
+#   @no_alloc  — the function never heap-allocates (no Vec/String growth,
+#                no closure boxing, no heap-backed formatting, and every
+#                function it calls has known allocation behavior);
+#   @no_block  — the function never blocks;
+#   @no_io     — the function never performs I/O;
+#   @irq_safe  — @no_alloc + @no_block + @no_io (the single-attribute
+#                spelling of the interrupt-handler contract);
+#   @interrupt — the interrupt-handler marker (audit P1-16 completion):
+#                the marker CLAIMS the same irq-safe contract as
+#                @irq_safe — all three classes are forbidden inside a
+#                handler — and the companion
+#                @effects(no_alloc, no_block, no_io) spelling (also
+#                supported by the checker below) names the same claims
+#                compositionally. The handler-runtime/vector-table
+#                integration beyond the proof stays the embedded route's
+#                own pass (driver.tg's collect_interrupt_fns).
+# The annotations are parsed from the EXISTING item-attribute mechanism
+# (parse_attributes → Item.attrs — the @effects(...) argument list rides
+# the generic Attribute.args); unknown attribute names keep their existing
+# behavior untouched.
+enum EffectClass
+  Alloc
+  Block
+  Io
+end
+
+enum EffectAnnotation
+  NoAlloc
+  NoBlock
+  NoIo
+  IrqSafe
+  Interrupt
+end
+
+# One recognized annotation claim with its attribute span (the diagnostic
+# reports the attribute that failed to hold) and the attribute's form AS
+# WRITTEN — attr_form is the source spelling the diagnostic echoes
+# ("no_alloc", "interrupt" or the full parenthesized
+# "effects(no_alloc, no_block, no_io)" list — empty falls back to the
+# canonical effect_class_attribute_name spelling).
+struct EffectClassClaim
+  anno: EffectAnnotation
+  span: Span
+  attr_form: String = ""
 end
 
 # Plain type name of a TypeExpr, mirroring mir.tg's impl_type_name
@@ -1875,6 +2002,15 @@ struct TypeEnv
   typed_expr_types: Map[Int, Type]
   local_id_counter: Int
   local_ids: Vec[Map[String, Int]]
+  # (audit P1-1, first pass): the ACTIVE `with <expr> as let/inout <name>`
+  # scoped-access bindings — one entry per enclosing with-block whose body
+  # is being checked, pushed before the body and popped after it. The
+  # store/capture gates (StmtAssign targets, closure captures) consult the
+  # stack by SEMANTIC local id, so a shadowing binding of the same name is
+  # never mistaken for the access. The binding's own lexical scope (the
+  # body) is an ordinary push_scope/pop_scope, which is what makes an
+  # out-of-block use an unknown symbol.
+  scoped_access_stack: Vec[ScopedAccessBinding]
   resolutions: Option[ResolvedNames]
   typed_call_targets: Map[Int, DefId]
  # (final): call expr node id -> the type checker's SOLVED generic
@@ -1982,6 +2118,52 @@ struct TypeEnv
   # internal calls are the implementation of those declared effects,
   # never checked against its own declarations.
   fn_effect_modules: Map[String, Vec[String]] = Map::new()
+  # ———————————————————————————————————————————————
+  # (audit P1-2 / P1-16) the effect-CLASS tables — the @no_alloc /
+  # @no_block / @no_io / @irq_safe / @interrupt proof machinery (def-key
+  # domain — fn_effect_def_key, the SAME key the call-recording sites
+  # use)
+  # ———————————————————————————————————————————————
+  # The checker PROVES the declared annotations by classifying every
+  # body-bearing function into the behavioral classes (Alloc / Block /
+  # Io) and propagating the classes through the recorded call graph
+  # (fn_call_graph) to a fixed point (check_effect_class_annotations).
+  # The tables:
+  #   fn_class_claims     — def-key -> the recognized annotation claims
+  #                         (attribute spans and the as-written
+  #                         attribute form ride along for the
+  #                         diagnostics); registered only for functions
+  #                         whose item carries the attributes;
+  #   fn_class_names      — def-key -> display name of every BODY-BEARING
+  #                         function/method in the compilation (the
+  #                         presence test: a callee whose key is absent
+  #                         has no body here and classifies foreign/
+  #                         unknown unless a seed/clean record covers it);
+  #   fn_class_direct     — def-key -> the classes the function's OWN
+  #                         body performs (heap constructors, closure
+  #                         boxing, growing String/container operations,
+  #                         heap-backed formatting, raw syscalls, calls
+  #                         into seeded externs);
+  #   fn_class_evidence   — def-key -> one evidence phrase per class slot
+  #                         ([0]=Alloc [1]=Block [2]=Io — the first site
+  #                         that dirtied the class; empty slot = no
+  #                         evidence yet; effect_class_slot_index);
+  #   fn_class_set        — def-key -> the FINAL computed class set (the
+  #                         fixed-point result: direct + transitive);
+  #   fn_class_clean      — the def-keys of router-classified benign
+  #                         intrinsic externs (bodyless callees known to
+  #                         never allocate/block/perform I/O);
+  #   fn_class_edge_names — caller key -> callee key -> the callee's
+  #                         source name at the call site (the extern-seed
+  #                         lookups and the diagnostics for bodyless
+  #                         callees).
+  fn_class_claims: Map[String, Vec[EffectClassClaim]] = Map::new()
+  fn_class_names: Map[String, String] = Map::new()
+  fn_class_direct: Map[String, Vec[EffectClass]] = Map::new()
+  fn_class_evidence: Map[String, Vec[String]] = Map::new()
+  fn_class_set: Map[String, Vec[EffectClass]] = Map::new()
+  fn_class_clean: Set[String] = Set::new()
+  fn_class_edge_names: Map[String, Map[String, String]] = Map::new()
   # ———————————————————————————————————————————————
   # the algebraic-effects typed records
   # ———————————————————————————————————————————————
@@ -2324,6 +2506,19 @@ struct LocalBinding
   ty: Type
 end
 
+# (audit P1-1, first pass): one ACTIVE with-scoped access binding (the
+# `with <expr> as let/inout <name>` statement). local_id is the semantic
+# local id the body's uses of <name> resolve to (the entry of the
+# scoped_access_stack in TypeEnv); effect is Read for the `let` form and
+# Modify for the `inout` form. The record exists ONLY while the with body
+# is checked; out-of-body uses of the name are unknown symbols (the name's
+# lexical scope is the body).
+struct ScopedAccessBinding
+  local_id: Int
+  name: String
+  effect: AccessEffect
+end
+
 # ———————————————————————————————————————————————————————————————
 # Pattern Binding Plans 
 # ———————————————————————————————————————————————————————————————
@@ -2405,8 +2600,12 @@ end
 
 def projection_key_hash(k: ProjectionKey) -> Int
   match k
-  when ProjectionKey::Field(f) then f.owner.id * 31 + f.index
-  when ProjectionKey::Variant(v) then 1000000 + v.owner.id * 31 + v.index
+  # P1-5 wrap-intent sweep: hash-mix arithmetic is computed through the
+  # UNSIGNED 64-bit view ((x as UInt) — same-width bit reinterpretation)
+  # so the fold wraps modulo 2^64 explicitly and the default signed
+  # +-*-trapping rule can never fire inside the hash.
+  when ProjectionKey::Field(f) then ((f.owner.id as UInt) * 31 + (f.index as UInt)) as Int
+  when ProjectionKey::Variant(v) then ((v.owner.id as UInt) * 31 + v.index + 1000000) as Int
   when ProjectionKey::TupleIndex(t) then 2000000 + t
   when ProjectionKey::Index(i) then 3000000 + i
   end  end
@@ -2429,7 +2628,11 @@ impl Hash for ProjectionChain
     var h = 0
     var i = 0
     while i < self.keys.len() do
-      h = h * 31 + projection_key_hash(&self.keys[i])
+      # P1-5 wrap-intent sweep: the h * 31 + key hash-mix folds through
+      # the unsigned 64-bit view (bit-identical to the former Int fold,
+      # which wrapped modulo 2^64 at the machine level) so the default
+      # signed overflow trap cannot fire on hash accumulation.
+      h = ((h as UInt) * 31 + (projection_key_hash(&self.keys[i]) as UInt)) as Int
       i = i + 1
     end
     h
@@ -4191,6 +4394,7 @@ def type_env_new() -> TypeEnv
     subst: Map::new(),
     var_counter: 0,
     scopes: Vec::new(),
+    scoped_access_stack: Vec::new(),
     check_ctx: "",
     current_module_path: Vec::new(),
     strict_resolution: false,
@@ -6869,6 +7073,18 @@ end
 #   E0229 — Trait argument count mismatch (the full TraitRef, not the head)
 #   E0230 — Impl method obligations/effects beyond the trait contract
 #   E0231 — Impl missing an associated type the trait declares
+# (audit P1-2 / P1-16 — the effect-class annotations):
+#   E0232 — An effect-class annotation (@no_alloc / @no_block / @no_io /
+#           @irq_safe / @interrupt, or an @effects(no_alloc[, no_block
+#           [, no_io]]) claim list) does not hold: the checker's
+#           transitive classification over the call graph proved the
+#           forbidden class (a heap allocation, a blocking operation or
+#           an I/O operation on some path, including calls whose behavior
+#           is unknown)
+#   E0233 — A malformed @effects(...) attribute — it names an
+#           unrecognized class (only no_alloc / no_block / no_io are
+#           supported) or names none at all (fail closed at the claim
+#           extraction)
 
 # ———————————————————————————————————————————————————————————————
 # Type Checking
@@ -7114,6 +7330,16 @@ def type_check_program_env(inout env: TypeEnv, program: Program) -> Unit
   # analyzer in std::effects is tooling).
   env.check_ctx = "effect-set-check"
   check_effect_sets(env)
+  
+ # (audit P1-2 — the effect-class annotations): after every function
+  # body is checked and scanned, classify the annotated functions'
+  # behavior (alloc / block / io) over the recorded call graph and
+  # enforce the @no_alloc / @no_block / @no_io / @irq_safe claims —
+  # annotation = PROVEN-or-ERROR (see check_effect_class_annotations).
+  # Runs on the typed compilation path only (the permissive editor path
+  # records no call graph — the pass self-gates).
+  env.check_ctx = "effect-class-annotation-check"
+  check_effect_class_annotations(env)
   
  # (literal range authority): the end-of-check range decisions — every
   # integer literal against its target's exact bounds (the suffix type,
@@ -7698,7 +7924,17 @@ def check_item(inout env: TypeEnv, program: Program, item: Item, item_idx: Int) 
       end
     when Option::None then ()
     end
-    check_function(env, f, owner_key, &f_owner)
+    # (audit P1-2 / P1-16): the effect-class annotation claims (@no_alloc
+    # / @no_block / @no_io / @irq_safe / @interrupt, plus the
+    # @effects(no_alloc, no_block, no_io) list form) parsed from the
+    # item's attributes through the EXISTING attribute mechanism. The
+    # claims ride into the typed FnSignature record (effect_annotations)
+    # and the classifier's claim table (fn_class_claims) and are
+    # PROVEN-or-ERROR by the end-of-check pass
+    # (check_effect_class_annotations). Unknown attribute names are
+    # untouched (their existing behavior is unchanged).
+    let effect_claims = effect_class_claims_of(env, &item.attrs)
+    check_function(env, f, owner_key, &f_owner, &effect_claims)
   when ItemKind::ItemImpl(i) then
     if fn_keys.len() == i.methods.len() then
       check_impl(env, i, &fn_keys)
@@ -7923,6 +8159,1138 @@ def check_effect_sets(inout env: TypeEnv) -> Unit
       end
     end
     di = di + 1
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# (audit P1-2 / P1-16) Effect-class annotations — @no_alloc / @no_block
+# / @no_io / @irq_safe / @interrupt / @effects(no_alloc, no_block,
+# no_io) — the proven-or-error checker
+# ———————————————————————————————————————————————————————————————
+# The per-function annotations declare allocation/blocking/IO behavior;
+# this checker PROVES them by classifying every body-bearing function
+# into the behavioral classes (Alloc / Block / Io) and propagating the
+# classes through the recorded call graph (fn_call_graph — the SAME
+# def-key domain the effect discipline uses) to a fixed point, then
+# comparing each annotated function's final set against its claims.
+#
+# The classification (single-pass conservative):
+#   - the DIRECT set of a function comes from its own body's constructs
+#     (recorded by the pass-4 scans, effect_class_scan_fn_body): the
+#     heap-allocating intrinsic family (Vec/Array/Map/Set/String
+#     constructors and growth operations — through the checker's
+#     typed_intrinsics router), closure boxing, heap-backed formatting,
+#     String concatenation, the raw syscall intrinsics, and indirect
+#     calls through a closure/function-pointer VALUE (the callee's body
+#     is unknowable at the site);
+#   - a call to a callee whose BODY is in this compilation contributes
+#     the callee's own (transitive) set — fixed point over the module
+#     set;
+#   - a call to a BODYLESS callee (an extern/foreign declaration, a
+#     bodyless builtin) classifies through the maintained seed tables
+#     (the runtime's __intrinsic_* / _tg_* extern surface) or — when the
+#     name is NOT seeded — as ALL THREE classes: a function whose
+#     allocation/blocking/IO behavior is unknown is conservatively
+#     capable of everything, so "@no_alloc calling an unknown function
+#     MUST FAIL" (the audit's fail-closed rule);
+#   - the benign intrinsic family (read-only ops the router classifies
+#     and that never allocate/block/do I/O) records the callee as KNOWN
+#     CLEAN (fn_class_clean) — the mirror image of the dirty seeds.
+#
+# Enforcement (annotation = proven-or-error):
+#   - @no_alloc forbids Alloc; @no_block forbids Block; @no_io forbids
+#     Io; @irq_safe forbids all three; @interrupt forbids all three too
+#     (audit P1-16: an @interrupt marker IS the handler spelling of the
+#     irq-safe contract, so a handler must satisfy the same transitive
+#     proof as an @irq_safe function); the @effects(no_alloc, no_block,
+#     no_io) list forbids exactly the classes it names. A function whose
+#     final set contains a forbidden class reports one E0232 diagnostic
+#     per class at the ATTRIBUTE's span, with the evidence phrase of the
+#     first site that dirtied the class — a violation under @interrupt
+#     names the HANDLER (the annotated function), and a claim written as
+#     @effects(...) is echoed with its full as-written list.
+#   - a malformed @effects(...) list (an unrecognized class name, or no
+#     names at all) is an E0233 at the attribute — fail closed at the
+#     claim extraction, before any proof runs.
+#   - NO annotation = NO claims: unannotated functions are never checked
+#     and never report; their bodies still classify, so an annotated
+#     function is proven THROUGH them.
+#   - std-module functions are NOT exempt here (unlike the effect-set
+#     discipline, which exempts the trusted base because it seeds every
+#     std function's declared effects): a class claim is a per-function
+#     proof, and the classifier only evaluates functions that CARRY an
+#     annotation.
+#
+# The P1-16 interrupt-handler checklist (what the three-class proof
+# permits and forbids INSIDE an annotated handler):
+#   CLEAN (permitted — the body classifies into no dirty class):
+#     - atomic operations — the __intrinsic_atomic_* load/store/RMW/CAS/
+#       fence extern family (pure CPU operations; seeded clean below);
+#     - fixed-capacity buffers — an in-place [T; N] local (the embedded
+#       RingBuffer's backing store), whose element access routes to no
+#       heap intrinsic at all;
+#     - volatile MMIO access — the _tg_volatile_read*/_write* externs
+#       (a width-exact volatile load/store; a memory access, not an I/O
+#       operation; seeded clean below).
+#   BLOCKED (a dirty class — E0232):
+#     - heap allocation and growth (Vec/String/Map/Set construction,
+#       closure boxing, heap-backed formatting);
+#     - blocking mutexes and the kernel wait primitives whose lock path
+#       yields to the scheduler (the pthread wait family is unseeded —
+#       ALL three classes, fail closed — and sched_yield seeds Block);
+#     - filesystem and networking (the libc_*/_tg_* read/write/open
+#       surface and the raw Syscall intrinsics — the seeded ones are
+#       Io/Block, the unseeded ones conservatively ALL three classes;
+#       either way the class proof fails);
+#     - sleep (sleep/usleep/nanosleep — Block, seeded below);
+#     - unbounded scheduling (sched_yield — Block, seeded below).
+#
+# Deliberately deferred (TODOs):
+#   - the P1-16 handler-runtime/vector-table integration BEYOND the
+#     proof (the vector-table collection remains the embedded route's
+#     own pass — driver.tg's collect_interrupt_fns; the @interrupt and
+#     @effects(...) claims themselves ARE enforced here);
+#   - cross-module effect-class summaries beyond the compilation
+#     closure: modules typecheck as ONE merged program (merge_imported_
+#     deps), so classification covers the whole closure and foreign
+#     functions are unknown unless seeded — a future module-at-a-time
+#     checker would treat foreign headers' annotations as their
+#     summaries;
+#   - optimization/codegen uses of the proven classes (a @no_alloc
+#     function's body is a candidate for the allocator-free targets).
+#
+# Known soundness boundary (documented): implicitly-executed code that
+# the source AST never calls — implicit drop glue of values whose type
+# has a user Drop/deinit impl, and the MIR's string_from_static
+# coercions at String-promise sites — is not part of the recorded call
+# graph and is not classified. The proof covers what the body can CALL;
+# a future pass may lower drop sites into the graph.
+
+# The attribute spelling of an annotation (diagnostics and the
+# extraction's reverse mapping).
+def effect_class_attribute_name(anno: EffectAnnotation) -> String
+  match anno
+  when EffectAnnotation::NoAlloc then "no_alloc"
+  when EffectAnnotation::NoBlock then "no_block"
+  when EffectAnnotation::NoIo then "no_io"
+  when EffectAnnotation::IrqSafe then "irq_safe"
+  when EffectAnnotation::Interrupt then "interrupt"
+  end
+end
+
+# Recognize one effect-class attribute NAME from the existing attribute
+# mechanism (parse_attributes records every @name; ONLY the five names
+# below are claims — any other attribute name keeps its existing
+# behavior untouched).
+def effect_class_annotation_of_name(name: String) -> Option[EffectAnnotation]
+  if name == "no_alloc" then return Option::Some(EffectAnnotation::NoAlloc) end
+  if name == "no_block" then return Option::Some(EffectAnnotation::NoBlock) end
+  if name == "no_io" then return Option::Some(EffectAnnotation::NoIo) end
+  if name == "irq_safe" then return Option::Some(EffectAnnotation::IrqSafe) end
+  if name == "interrupt" then return Option::Some(EffectAnnotation::Interrupt) end
+  Option::None
+end
+
+# Recognize one @effects(...) argument (the P1-16 compositional claim
+# list — parse_attributes stores the parenthesized idents in
+# Attribute.args). ONLY the three class names below are accepted; any
+# other argument is an E0233 (fail closed at the claim extraction).
+def effect_class_annotation_of_effects_arg(arg: String) -> Option[EffectAnnotation]
+  if arg == "no_alloc" then return Option::Some(EffectAnnotation::NoAlloc) end
+  if arg == "no_block" then return Option::Some(EffectAnnotation::NoBlock) end
+  if arg == "no_io" then return Option::Some(EffectAnnotation::NoIo) end
+  Option::None
+end
+
+# The claim's attribute form AS WRITTEN — the E0232 diagnostic echoes
+# the source spelling: the arg-less names ("no_alloc", "interrupt") and
+# the @effects(...) form ("effects(no_alloc, no_block, no_io)").
+def effect_class_claim_spelling(claim: EffectClassClaim) -> String
+  if claim.attr_form.len() > 0 then claim.attr_form.clone() else effect_class_attribute_name(claim.anno) end
+end
+
+def effect_class_claim_contains(claims: Vec[EffectClassClaim], anno: EffectAnnotation) -> Bool
+  for c in claims do
+    if c.anno == anno then return true end
+  end
+  false
+end
+
+# The recognized claims of an item's attribute list — ordered, deduped
+# by annotation, spans preserved (the diagnostics report the attribute
+# that failed). Two spellings are recognized:
+#   - the arg-less claim names (@no_alloc / @no_block / @no_io /
+#     @irq_safe / @interrupt — effect_class_annotation_of_name);
+#   - the @effects(no_alloc[, no_block[, no_io]]) list (audit P1-16) —
+#     parse_attributes stores the parenthesized idents in attr.args;
+#     each named class becomes its own claim under the attribute's span,
+#     and the claim carries the full as-written form for the
+#     diagnostics. The list is fail-closed: an EMPTY list or an
+#     UNRECOGNIZED class name is an E0233 at the attribute (a malformed
+#     claim never silently becomes a weaker claim).
+# Unknown attribute names are ignored (unchanged behavior).
+def effect_class_claims_of(inout env: TypeEnv, attrs: Vec[Attribute]) -> Vec[EffectClassClaim]
+  var out = Vec::new()
+  for attr in attrs do
+    if attr.name == "effects" then
+      if attr.args.len() == 0 then
+        add_error_with_code(env, "@effects() must name at least one class — use @effects(no_alloc, no_block, no_io) or the arg-less @no_alloc / @no_block / @no_io / @irq_safe / @interrupt attributes", attr.span, "E0233")
+      else
+        # The full as-written form the diagnostics echo.
+        var form = "effects(".to_string()
+        var ai = 0
+        while ai < attr.args.len() do
+          if ai > 0 then form = form + ", " end
+          form = form + attr.args[ai].clone()
+          ai = ai + 1
+        end
+        form = form + ")"
+        for arg in attr.args do
+          match effect_class_annotation_of_effects_arg(&arg)
+          when Option::Some(anno) then
+            if !effect_class_claim_contains(&out, &anno) then
+              out.push(EffectClassClaim { anno: anno, span: attr.span, attr_form: form.clone() })
+            end
+          when Option::None then
+            add_error_with_code(env, "unrecognized @effects class `" + arg.clone() + "` — @effects supports no_alloc, no_block and no_io only", attr.span, "E0233")
+          end
+        end
+      end
+    else
+      match effect_class_annotation_of_name(&attr.name)
+      when Option::Some(anno) then
+        if !effect_class_claim_contains(&out, &anno) then
+          out.push(EffectClassClaim { anno: anno, span: attr.span, attr_form: attr.name.clone() })
+        end
+      when Option::None then ()
+      end
+    end
+  end
+  out
+end
+
+# The annotation-only view of a claims list (the typed signature record
+# stores the annotations without spans).
+def effect_class_annos_of_claims(claims: Vec[EffectClassClaim]) -> Vec[EffectAnnotation]
+  var out = Vec::new()
+  for c in claims do
+    out.push(c.anno)
+  end
+  out
+end
+
+# The classes an annotation FORBIDS. @interrupt (audit P1-16) claims
+# the SAME classes as @irq_safe: an interrupt handler must be provably
+# irq-safe — no allocation, no blocking, no I/O — and the enforcement
+# step applies the identical transitive proof to both spellings (the
+# @effects(no_alloc, no_block, no_io) list forbids each class it names,
+# claim by claim).
+def effect_class_forbidden_classes(anno: EffectAnnotation) -> Vec[EffectClass]
+  match anno
+  when EffectAnnotation::NoAlloc then Vec::from([EffectClass::Alloc])
+  when EffectAnnotation::NoBlock then Vec::from([EffectClass::Block])
+  when EffectAnnotation::NoIo then Vec::from([EffectClass::Io])
+  when EffectAnnotation::IrqSafe then Vec::from([EffectClass::Alloc, EffectClass::Block, EffectClass::Io])
+  when EffectAnnotation::Interrupt then Vec::from([EffectClass::Alloc, EffectClass::Block, EffectClass::Io])
+  end
+end
+
+# The class word for messages ("allocation" / "blocking" / "I/O").
+def effect_class_word(c: EffectClass) -> String
+  match c
+  when EffectClass::Alloc then "allocation"
+  when EffectClass::Block then "blocking"
+  when EffectClass::Io then "I/O"
+  end
+end
+
+# The violation phrase ("may heap-allocate" / "may block" / "may
+# perform I/O").
+def effect_class_phrase(c: EffectClass) -> String
+  match c
+  when EffectClass::Alloc then "may heap-allocate"
+  when EffectClass::Block then "may block"
+  when EffectClass::Io then "may perform I/O"
+  end
+end
+
+# The evidence-slot index of a class (the fn_class_evidence vector is
+# positional: [0]=Alloc [1]=Block [2]=Io).
+def effect_class_slot_index(c: EffectClass) -> Int
+  match c
+  when EffectClass::Alloc then 0
+  when EffectClass::Block then 1
+  when EffectClass::Io then 2
+  end
+end
+
+# Set containment over class sets (identity is enum equality).
+def effect_class_set_contains(set: Vec[EffectClass], c: EffectClass) -> Bool
+  for e in set do
+    if e == c then return true end
+  end
+  false
+end
+
+# The evidence phrase recorded for a (function, class) slot — the empty
+# string when the slot was never filled.
+def effect_class_evidence_of(env: TypeEnv, key: String, c: EffectClass) -> String
+  let slot = effect_class_slot_index(c)
+  match env.fn_class_evidence.get(key.clone())
+  when Option::Some(evs) then
+    if slot < evs.len() then evs[slot].clone() else "".to_string() end
+  when Option::None then "".to_string()
+  end
+end
+
+# Record the evidence phrase for a (function, class) slot — the FIRST
+# site wins (the earliest dirtied the class; later sites only grow the
+# class set).
+def effect_class_evidence_set(inout env: TypeEnv, key: String, c: EffectClass, text: String) -> Unit
+  let slot = effect_class_slot_index(c)
+  var evs = Vec::new()
+  match env.fn_class_evidence.get(key.clone())
+  when Option::Some(cur) then evs = cur.clone()
+  when Option::None then ()
+  end
+  while evs.len() < 3 do
+    evs.push("".to_string())
+  end
+  if evs[slot].len() == 0 then
+    evs[slot] = text
+    env.fn_class_evidence.insert(key.clone(), evs)
+  end
+end
+
+# Mark a class dirty on a function's DIRECT set with its evidence (the
+# pass-4 scans' recording helper). The class set is deduped; the
+# evidence slot is first-wins.
+def effect_class_mark_direct(inout env: TypeEnv, key: String, c: EffectClass, evidence: String) -> Unit
+  if key == "" then return end
+  var direct = Vec::new()
+  match env.fn_class_direct.get(key.clone())
+  when Option::Some(cur) then direct = cur.clone()
+  when Option::None then ()
+  end
+  if !effect_class_set_contains(&direct, &c) then
+    direct.push(c)
+    env.fn_class_direct.insert(key.clone(), direct)
+  end
+  effect_class_evidence_set(env, key, c, evidence)
+end
+
+# The call-site edge name record (caller key -> callee key -> the
+# callee's source name) — the seed lookups and the diagnostics for the
+# bodyless callees read it.
+def effect_class_record_edge_name(inout env: TypeEnv, caller: String, callee: String, name: String) -> Unit
+  if caller == "" || callee == "" then return end
+  match env.fn_class_edge_names.get(caller.clone())
+  when Option::Some(inner) then
+    if !inner.contains_key(callee.clone()) then
+      var inner2 = inner.clone()
+      inner2.insert(callee.clone(), name.clone())
+      env.fn_class_edge_names.insert(caller.clone(), inner2)
+    end
+  when Option::None then
+    var inner = Map::new()
+    inner.insert(callee.clone(), name.clone())
+    env.fn_class_edge_names.insert(caller.clone(), inner)
+  end
+end
+
+def effect_class_edge_name_of(env: TypeEnv, caller: String, callee: String) -> Option[String]
+  match env.fn_class_edge_names.get(caller.clone())
+  when Option::Some(inner) then
+    match inner.get(callee.clone())
+    when Option::Some(n) then Option::Some(n.clone())
+    when Option::None then Option::None
+    end
+  when Option::None then Option::None
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# The intrinsic/extern class tables — the seeded bodyless callees
+# ———————————————————————————————————————————————————————————————
+# A call whose callee has no body in this compilation classifies:
+#   1. through the checker's typed_intrinsics router when the call node
+#      carries an IntrinsicId (effect_class_intrinsic_classes) — a dirty
+#      id marks its classes at the call site; a benign id records the
+#      callee as KNOWN CLEAN (fn_class_clean, the fixpoint's
+#      bodyless-callee exemption);
+#   2. through the extern-name seed table (effect_class_extern_seed) for
+#      the non-intrinsic runtime externs (_tg_* / libc_* families) and
+#      as a fallback for the intrinsic names;
+#   3. otherwise the callee is UNKNOWN — all three classes (the
+#      fail-closed rule: an unannotated/unknown function's behavior is
+#      conservatively everything).
+# The seed tables are an EXPLICITLY MAINTAINED list of the runtime's
+# extern surface; a missing seed degrades to unknown (never to clean),
+# so the checker stays sound as the surface grows.
+
+# The intrinsic family's class table (empty = benign — the router
+# classified the op and it never allocates/blocks/does I/O). The dirty
+# set is the heap-constructing/growing/formatting family plus the raw
+# syscall and I/O surfaces.
+def effect_class_intrinsic_classes(iid: IntrinsicId) -> Vec[EffectClass]
+  match iid
+  when IntrinsicId::ArrayNew then Vec::from([EffectClass::Alloc])
+  when IntrinsicId::ArrayWithCapacity then Vec::from([EffectClass::Alloc])
+  when IntrinsicId::ArrayFromList then Vec::from([EffectClass::Alloc])
+  when IntrinsicId::ArrayPush then Vec::from([EffectClass::Alloc])
+  when IntrinsicId::ArrayInsert then Vec::from([EffectClass::Alloc])
+  when IntrinsicId::ArrayExtend then Vec::from([EffectClass::Alloc])
+  when IntrinsicId::ArrayResize then Vec::from([EffectClass::Alloc])
+  when IntrinsicId::ArrayReplace then Vec::from([EffectClass::Alloc])
+  when IntrinsicId::ArraySlice then Vec::from([EffectClass::Alloc])
+  when IntrinsicId::ArrayJoin then Vec::from([EffectClass::Alloc])
+  when IntrinsicId::MapNew then Vec::from([EffectClass::Alloc])
+  when IntrinsicId::MapPush then Vec::from([EffectClass::Alloc])
+  when IntrinsicId::MapInsert then Vec::from([EffectClass::Alloc])
+  when IntrinsicId::MapClone then Vec::from([EffectClass::Alloc])
+  when IntrinsicId::MapKeys then Vec::from([EffectClass::Alloc])
+  when IntrinsicId::MapValues then Vec::from([EffectClass::Alloc])
+  when IntrinsicId::MapEntries then Vec::from([EffectClass::Alloc])
+  when IntrinsicId::SetNew then Vec::from([EffectClass::Alloc])
+  when IntrinsicId::SetInsert then Vec::from([EffectClass::Alloc])
+  when IntrinsicId::SetClone then Vec::from([EffectClass::Alloc])
+  when IntrinsicId::SetEntries then Vec::from([EffectClass::Alloc])
+  when IntrinsicId::MapJoinCollect then Vec::from([EffectClass::Alloc])
+  when IntrinsicId::SplitLinesTrim then Vec::from([EffectClass::Alloc])
+  when IntrinsicId::TrimMatches then Vec::from([EffectClass::Alloc])
+  when IntrinsicId::ToLowercase then Vec::from([EffectClass::Alloc])
+  when IntrinsicId::StringReplace then Vec::from([EffectClass::Alloc])
+  when IntrinsicId::StringSplit then Vec::from([EffectClass::Alloc])
+  when IntrinsicId::StringTrim then Vec::from([EffectClass::Alloc])
+  when IntrinsicId::StringToLowercase then Vec::from([EffectClass::Alloc])
+  when IntrinsicId::StringSplitLines then Vec::from([EffectClass::Alloc])
+  when IntrinsicId::StringNew then Vec::from([EffectClass::Alloc])
+  when IntrinsicId::StringPush then Vec::from([EffectClass::Alloc])
+  when IntrinsicId::StringPushStr then Vec::from([EffectClass::Alloc])
+  when IntrinsicId::StringReserve then Vec::from([EffectClass::Alloc])
+  when IntrinsicId::StringClone then Vec::from([EffectClass::Alloc])
+  when IntrinsicId::StringFromStatic then Vec::from([EffectClass::Alloc])
+  when IntrinsicId::StringFromBytes then Vec::from([EffectClass::Alloc])
+  when IntrinsicId::StrConcat then Vec::from([EffectClass::Alloc])
+  when IntrinsicId::StrCopy then Vec::from([EffectClass::Alloc])
+  when IntrinsicId::StrSlice then Vec::from([EffectClass::Alloc])
+  when IntrinsicId::StrToString then Vec::from([EffectClass::Alloc])
+  when IntrinsicId::IntToString then Vec::from([EffectClass::Alloc])
+  when IntrinsicId::FloatToString then Vec::from([EffectClass::Alloc])
+  when IntrinsicId::BoolToString then Vec::from([EffectClass::Alloc])
+  when IntrinsicId::CharToString then Vec::from([EffectClass::Alloc])
+  when IntrinsicId::IntToStr then Vec::from([EffectClass::Alloc])
+  when IntrinsicId::FloatToStr then Vec::from([EffectClass::Alloc])
+  when IntrinsicId::ToString then Vec::from([EffectClass::Alloc])
+  when IntrinsicId::AsBytes then Vec::from([EffectClass::Alloc])
+  when IntrinsicId::Bytes then Vec::from([EffectClass::Alloc])
+  when IntrinsicId::CStringNew then Vec::from([EffectClass::Alloc])
+  when IntrinsicId::MemAlloc then Vec::from([EffectClass::Alloc])
+  when IntrinsicId::Clone then Vec::from([EffectClass::Alloc])
+  when IntrinsicId::ReadFileToStringNative then Vec::from([EffectClass::Alloc, EffectClass::Io])
+  when IntrinsicId::Syscall1 then Vec::from([EffectClass::Alloc, EffectClass::Block, EffectClass::Io])
+  when IntrinsicId::Syscall2 then Vec::from([EffectClass::Alloc, EffectClass::Block, EffectClass::Io])
+  when IntrinsicId::Syscall3 then Vec::from([EffectClass::Alloc, EffectClass::Block, EffectClass::Io])
+  when IntrinsicId::Syscall4 then Vec::from([EffectClass::Alloc, EffectClass::Block, EffectClass::Io])
+  when IntrinsicId::Syscall5 then Vec::from([EffectClass::Alloc, EffectClass::Block, EffectClass::Io])
+  when IntrinsicId::Syscall6 then Vec::from([EffectClass::Alloc, EffectClass::Block, EffectClass::Io])
+  when IntrinsicId::SysWrite then Vec::from([EffectClass::Io, EffectClass::Block])
+  when IntrinsicId::SysRead then Vec::from([EffectClass::Io, EffectClass::Block])
+  when IntrinsicId::SysOpen then Vec::from([EffectClass::Io, EffectClass::Block])
+  when IntrinsicId::SysClose then Vec::from([EffectClass::Io])
+  when IntrinsicId::SysExit then Vec::from([EffectClass::Io])
+  when IntrinsicId::StdoutString then Vec::from([EffectClass::Io])
+  when IntrinsicId::StderrString then Vec::from([EffectClass::Io])
+  when IntrinsicId::Output then Vec::from([EffectClass::Io])
+  when IntrinsicId::Status then Vec::from([EffectClass::Io])
+  when IntrinsicId::OpenWindows then Vec::from([EffectClass::Io])
+  when _ then Vec::new()
+  end
+end
+
+# The extern-NAME seed table (the bodyless non-intrinsic runtime
+# externs; the intrinsic names fall back here too when a call site never
+# routed). Option::Some(classes) — the classes the extern may perform
+# (Some(empty) = KNOWN BENIGN — the pure runtime helpers); Option::None
+# = unknown (all three classes).
+def effect_class_extern_seed(name: String) -> Option[Vec[EffectClass]]
+  if name.starts_with("_tg_volatile") then
+    # The volatile/MMIO load/store intrinsics (_tg_volatile_read* /
+    # _tg_volatile_write*) — a width-exact volatile memory access: a
+    # CPU load/store that the optimizer cannot elide or reorder, NEVER a
+    # heap allocation, a blocking wait or an I/O operation. The audit
+    # P1-16 interrupt-handler checklist permits MMIO register access in
+    # a handler, so this family classifies CLEAN.
+    return Option::Some(Vec::new())
+  end
+  if name.starts_with("_tg_hash") || name.starts_with("_tg_eq") then
+    # Pure key hashing/equality helpers.
+    return Option::Some(Vec::new())
+  end
+  if name.starts_with("_tg_str_") then
+    # Pure raw-string helpers (_tg_str_skip...).
+    return Option::Some(Vec::new())
+  end
+  if name == "_tg_read_vec_u8" || name == "_tg_write_vec_u8" || name == "libc_write" || name == "libc_read" then
+    return Option::Some(Vec::from([EffectClass::Io, EffectClass::Block]))
+  end
+  if name == "sleep" || name == "usleep" || name == "nanosleep" || name == "sched_yield" then
+    # The sleep/scheduling family (the libc externs std::time and
+    # std::thread declare): a call that suspends the caller (sleeps for
+    # a duration) or yields the scheduler quantum — the audit P1-16
+    # blocked list (sleep and unbounded scheduling) classifies Block.
+    return Option::Some(Vec::from([EffectClass::Block]))
+  end
+  if name == "_tg_arg" || name == "_tg_arg_copy" || name == "_tg_env_entry" || name == "_tg_env_count" then
+    return Option::Some(Vec::from([EffectClass::Io]))
+  end
+  if name.starts_with("__intrinsic_simd") then
+    # The SIMD lane intrinsics are pure arithmetic.
+    return Option::Some(Vec::new())
+  end
+  if name.starts_with("__intrinsic_atomic_") then
+    # The atomic load/store/exchange/CAS/fetch/RMW/fence extern family —
+    # pure CPU operations (never allocation, blocking or I/O). The audit
+    # P1-16 interrupt-handler checklist permits atomic ops in a handler
+    # (the lock-free FIFO case), so this family classifies CLEAN.
+    return Option::Some(Vec::new())
+  end
+  if name == "__intrinsic_mem_free" || name == "__intrinsic_mem_copy" || name == "__intrinsic_mem_set" || name == "__intrinsic_mem_zero" then
+    return Option::Some(Vec::new())
+  end
+  if name == "__intrinsic_abort" || name == "__intrinsic_longjmp" then
+    return Option::Some(Vec::new())
+  end
+  if name.starts_with("__intrinsic_") then
+    # An intrinsic extern the call-site router did not classify (a gated
+    # legacy name or a name outside the router) — unknown.
+    return Option::None
+  end
+  Option::None
+end
+
+# The backstop growth-method tables — the method calls on the BUILTIN
+# heap types (String / Vec-Array / Map / Set / the Box-Rc families)
+# whose names are growth-prone. Normally these calls resolve through the
+# std wrapper bodies (the call graph + the intrinsic router classify
+# them); the backstop fires only for the calls that record neither a
+# callee DefId nor an IntrinsicId, so a name alone must decide.
+def effect_class_string_growth_method(name: String) -> Bool
+  if name == "push" || name == "push_str" || name == "insert" || name == "extend" || name == "append" || name == "prepend" || name == "reserve" || name == "resize" || name == "clone" || name == "from_static" || name == "from_bytes" then
+    return true
+  end
+  false
+end
+
+def effect_class_container_growth_method(name: String) -> Bool
+  if name == "push" || name == "insert" || name == "extend" || name == "append" || name == "reserve" || name == "with_capacity" || name == "clone" then
+    return true
+  end
+  false
+end
+
+# Whether a receiver type is one of the builtin heap types the backstop
+# gates on (a user type's same-named method never classifies).
+def effect_class_receiver_is_builtin_heap(env: TypeEnv, ty: Type) -> Bool
+  match ty
+  when Type::String then true
+  when Type::Adt(tid, _) then
+    tid.id == env.lang_items.vec || tid.id == env.lang_items.array ||
+    tid.id == env.lang_items.map || tid.id == env.lang_items.set ||
+    tid.id == env.lang_items.box_ || tid.id == env.lang_items.rc ||
+    tid.id == env.lang_items.unique_ptr || tid.id == env.lang_items.arc_strong
+  when _ then false
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# The direct-scan walkers — one body walk per body-bearing function,
+# run by the pass-4 hooks AFTER the body is fully checked (so the typed
+# per-node records exist)
+# ———————————————————————————————————————————————————————————————
+# The scan records the DIRECT class evidence into fn_class_direct /
+# fn_class_evidence under the function's def-key and the call-edge names
+# into fn_class_edge_names. The recursion mirrors the capture-scan
+# walkers (scan_block / scan_stmt / scan_expr); every sub-expression is
+# visited — including closure bodies and handler arms (conservative: a
+# closure created in the body may run within it).
+
+def effect_class_scan_fn_body(inout env: TypeEnv, key: String, body: FnBody) -> Unit
+  match body
+  when FnBody::FnBlock(block) then effect_class_scan_block(env, key, &block)
+  when FnBody::FnExpr(expr) then effect_class_scan_expr(env, key, &expr)
+  when _ then ()
+  end
+end
+
+def effect_class_scan_block(inout env: TypeEnv, key: String, block: Block) -> Unit
+  var i = 0
+  while i < block.stmts.len() do
+    effect_class_scan_stmt(env, key, &block.stmts[i])
+    i = i + 1
+  end
+end
+
+def effect_class_scan_pattern_literal(inout env: TypeEnv, key: String, pat: Pattern) -> Unit
+  match pat.kind
+  when PatternKind::Literal(e) then effect_class_scan_expr(env, key, &e)
+  when _ then ()
+  end
+end
+
+def effect_class_scan_stmt(inout env: TypeEnv, key: String, st: Stmt) -> Unit
+  match st.kind
+  when StmtKind::StmtLet(_, _, init, _) then effect_class_scan_expr(env, key, &init)
+  when StmtKind::StmtAssign(target, value) then
+    effect_class_scan_expr(env, key, &target)
+    effect_class_scan_expr(env, key, &value)
+  when StmtKind::StmtCompoundAssign(_, target, value) then
+    effect_class_scan_expr(env, key, &target)
+    effect_class_scan_expr(env, key, &value)
+  when StmtKind::StmtIf(if_stmt) then
+    effect_class_scan_if(env, key, &if_stmt)
+  when StmtKind::StmtMatch(m) then
+    effect_class_scan_expr(env, key, &m.scrutinee)
+    var ai = 0
+    while ai < m.arms.len() do
+      effect_class_scan_pattern_literal(env, key, &m.arms[ai].pattern)
+      match m.arms[ai].guard_expr
+      when Option::Some(g) then effect_class_scan_expr(env, key, &g)
+      when Option::None then ()
+      end
+      effect_class_scan_block(env, key, &m.arms[ai].body)
+      ai = ai + 1
+    end
+  when StmtKind::StmtWhile(cond, body) then
+    effect_class_scan_expr(env, key, &cond)
+    effect_class_scan_block(env, key, &body)
+  when StmtKind::StmtFor(fs) then
+    effect_class_scan_expr(env, key, &fs.iter)
+    effect_class_scan_block(env, key, &fs.body)
+  when StmtKind::StmtLoop(body) then effect_class_scan_block(env, key, &body)
+  when StmtKind::StmtReturn(val_opt) then
+    match val_opt
+    when Option::Some(v) then effect_class_scan_expr(env, key, &v)
+    when Option::None then ()
+    end
+  when StmtKind::StmtBreak(val_opt) then
+    match val_opt
+    when Option::Some(v) then effect_class_scan_expr(env, key, &v)
+    when Option::None then ()
+    end
+  when StmtKind::StmtContinue then ()
+  when StmtKind::StmtExpr(e) then effect_class_scan_expr(env, key, &e)
+  when StmtKind::StmtUnsafe(_, body) then effect_class_scan_block(env, key, &body)
+  when StmtKind::StmtDefer(body) then effect_class_scan_block(env, key, &body)
+  when StmtKind::StmtGuard(cond, else_action) then
+    effect_class_scan_expr(env, key, &cond)
+    match else_action
+    when GuardElse::Return(val_opt) then
+      match val_opt
+      when Option::Some(v) then effect_class_scan_expr(env, key, &v)
+      when Option::None then ()
+      end
+    when GuardElse::Panic(_) then ()
+    when GuardElse::Break(val_opt) then
+      match val_opt
+      when Option::Some(v) then effect_class_scan_expr(env, key, &v)
+      when Option::None then ()
+      end
+    when GuardElse::Continue then ()
+    end
+  when StmtKind::StmtTry(body, catches, finally_block) then
+    effect_class_scan_block(env, key, &body)
+    var ci = 0
+    while ci < catches.len() do
+      effect_class_scan_block(env, key, &catches[ci].body)
+      ci = ci + 1
+    end
+    match finally_block
+    when Option::Some(fb) then effect_class_scan_block(env, key, &fb)
+    when Option::None then ()
+    end
+  when StmtKind::StmtWith(expr, _, body) then
+    effect_class_scan_expr(env, key, &expr)
+    effect_class_scan_block(env, key, &body)
+  when StmtKind::StmtHandleWith(expr, handlers) then
+    effect_class_scan_expr(env, key, &expr)
+    var hi = 0
+    while hi < handlers.len() do
+      var hai = 0
+      while hai < handlers[hi].arms.len() do
+        effect_class_scan_block(env, key, &handlers[hi].arms[hai].body)
+        hai = hai + 1
+      end
+      hi = hi + 1
+    end
+  end
+end
+
+# The shared if/elsif/else walker (both StmtIf and the ExprIf form).
+def effect_class_scan_if(inout env: TypeEnv, key: String, if_stmt: IfStmt) -> Unit
+  effect_class_scan_expr(env, key, &if_stmt.cond)
+  effect_class_scan_block(env, key, &if_stmt.then_block)
+  var ei = 0
+  while ei < if_stmt.elsif_branches.len() do
+    effect_class_scan_expr(env, key, &if_stmt.elsif_branches[ei].0)
+    effect_class_scan_block(env, key, &if_stmt.elsif_branches[ei].1)
+    ei = ei + 1
+  end
+  match if_stmt.else_block
+  when Option::Some(b) then effect_class_scan_block(env, key, &b)
+  when Option::None then ()
+  end
+end
+
+def effect_class_scan_expr(inout env: TypeEnv, key: String, e: Expr) -> Unit
+  match e.kind
+  when ExprKind::ExprIntLit(_) then ()
+  when ExprKind::ExprFloatLit(_) then ()
+  when ExprKind::ExprStringLit(_) then ()
+  when ExprKind::ExprCharLit(_) then ()
+  when ExprKind::ExprBoolLit(_) then ()
+  when ExprKind::ExprNilLit then ()
+  when ExprKind::ExprIdent(_) then ()
+  when ExprKind::ExprSelfRef then ()
+  when ExprKind::ExprPath(_) then ()
+  when ExprKind::ExprArrayLit(elems) then
+    var i = 0
+    while i < elems.len() do
+      effect_class_scan_expr(env, key, &elems[i])
+      i = i + 1
+    end
+  when ExprKind::ExprTupleLit(elems) then
+    var i = 0
+    while i < elems.len() do
+      effect_class_scan_expr(env, key, &elems[i])
+      i = i + 1
+    end
+  when ExprKind::ExprStructLit(_, fields) then
+    var i = 0
+    while i < fields.len() do
+      effect_class_scan_expr(env, key, &fields[i].1)
+      i = i + 1
+    end
+  when ExprKind::ExprMapLit(entries) then
+    var i = 0
+    while i < entries.len() do
+      effect_class_scan_expr(env, key, &entries[i].0)
+      effect_class_scan_expr(env, key, &entries[i].1)
+      i = i + 1
+    end
+  when ExprKind::ExprBinaryOp(op, lhs, rhs) then
+    match op
+    when BinOp::Add then
+      # The `+` concatenation on an owned String is heap-backed — the
+      # direct site marks Alloc when either operand is typed String
+      # (the typed operand types were recorded by the body check).
+      var lhs_ty = Option::None
+      match env.typed_expr_types.get(lhs.node_id)
+      when Option::Some(t) then lhs_ty = Option::Some(resolve_type_var(env, t))
+      when Option::None then ()
+      end
+      var rhs_ty = Option::None
+      match env.typed_expr_types.get(rhs.node_id)
+      when Option::Some(t) then rhs_ty = Option::Some(resolve_type_var(env, t))
+      when Option::None then ()
+      end
+      var is_concat = false
+      match lhs_ty
+      when Option::Some(t) then if is_string_type(&t) then is_concat = true end
+      when Option::None then ()
+      end
+      if !is_concat then
+        match rhs_ty
+        when Option::Some(t) then if is_string_type(&t) then is_concat = true end
+        when Option::None then ()
+        end
+      end
+      if is_concat then
+        effect_class_mark_direct(env, key, EffectClass::Alloc, "string concatenation with `+` (heap-backed String result)".to_string())
+      end
+    when _ then ()
+    end
+    effect_class_scan_expr(env, key, &lhs)
+    effect_class_scan_expr(env, key, &rhs)
+  when ExprKind::ExprUnaryOp(_, inner) then effect_class_scan_expr(env, key, &inner)
+  when ExprKind::ExprFieldAccess(base, _) then effect_class_scan_expr(env, key, &base)
+  when ExprKind::ExprMethodCall(recv, method, _, args) then
+    effect_class_scan_expr(env, key, &recv)
+    var ai = 0
+    while ai < args.len() do
+      effect_class_scan_expr(env, key, &args[ai])
+      ai = ai + 1
+    end
+    effect_class_scan_call_site(env, key, e, &method)
+  when ExprKind::ExprIndex(base, idx) then
+    effect_class_scan_expr(env, key, &base)
+    effect_class_scan_expr(env, key, &idx)
+  when ExprKind::ExprCall(func, args) then
+    effect_class_scan_expr(env, key, &func)
+    var ai = 0
+    while ai < args.len() do
+      effect_class_scan_expr(env, key, &args[ai])
+      ai = ai + 1
+    end
+    let no_method = "".to_string()
+    effect_class_scan_call_site(env, key, e, &no_method)
+  when ExprKind::ExprClosure(_, _, body) then
+    # Boxing a closure is a heap allocation at creation; the body is
+    # scanned conservatively (the closure may run within this function).
+    effect_class_mark_direct(env, key, EffectClass::Alloc, "boxes a closure (a heap closure allocation)".to_string())
+    effect_class_scan_expr(env, key, &body)
+  when ExprKind::ExprAccess(inner) then effect_class_scan_expr(env, key, &inner)
+  when ExprKind::ExprRawDeref(inner) then effect_class_scan_expr(env, key, &inner)
+  when ExprKind::ExprIf(if_stmt) then effect_class_scan_if(env, key, &if_stmt)
+  when ExprKind::ExprMatch(m) then
+    effect_class_scan_expr(env, key, &m.scrutinee)
+    var ai = 0
+    while ai < m.arms.len() do
+      effect_class_scan_pattern_literal(env, key, &m.arms[ai].pattern)
+      match m.arms[ai].guard_expr
+      when Option::Some(g) then effect_class_scan_expr(env, key, &g)
+      when Option::None then ()
+      end
+      effect_class_scan_block(env, key, &m.arms[ai].body)
+      ai = ai + 1
+    end
+  when ExprKind::ExprBlock(block) then effect_class_scan_block(env, key, &block)
+  when ExprKind::ExprUnsafe(_, block) then effect_class_scan_block(env, key, &block)
+  when ExprKind::ExprAsync(block) then effect_class_scan_block(env, key, &block)
+  when ExprKind::ExprAwait(inner) then effect_class_scan_expr(env, key, &inner)
+  when ExprKind::ExprTry(inner) then effect_class_scan_expr(env, key, &inner)
+  when ExprKind::ExprRange(start, end_, _) then
+    match start
+    when Option::Some(s) then effect_class_scan_expr(env, key, &s)
+    when Option::None then ()
+    end
+    match end_
+    when Option::Some(e) then effect_class_scan_expr(env, key, &e)
+    when Option::None then ()
+    end
+  when ExprKind::ExprCast(inner, _) then effect_class_scan_expr(env, key, &inner)
+  when ExprKind::ExprTypeCheck(inner, _) then effect_class_scan_expr(env, key, &inner)
+  when ExprKind::ExprComptime(_) then
+    # A comptime block executes at COMPILE time — its constructs are not
+    # the runtime behavior of the enclosing function.
+    ()
+  when ExprKind::ExprEnumVariant(_, args) then
+    var ai = 0
+    while ai < args.len() do
+      effect_class_scan_expr(env, key, &args[ai])
+      ai = ai + 1
+    end
+  when ExprKind::ExprAssign(target, value) then
+    effect_class_scan_expr(env, key, &target)
+    effect_class_scan_expr(env, key, &value)
+  when ExprKind::ExprPipe(lhs, rhs) then
+    effect_class_scan_expr(env, key, &lhs)
+    effect_class_scan_expr(env, key, &rhs)
+  when ExprKind::ExprMacroCall(_, args) then
+    var ai = 0
+    while ai < args.len() do
+      effect_class_scan_expr(env, key, &args[ai])
+      ai = ai + 1
+    end
+  when ExprKind::ExprError(_) then ()
+  end
+end
+
+# The per-call-site classification (shared by ExprCall and
+# ExprMethodCall):
+#   1. the checker's typed_intrinsics attachment (the router) decides
+#      the intrinsic calls and the builtin-container/String method
+#      calls: a dirty id marks its classes here; a benign id records the
+#      callee as KNOWN CLEAN (fn_class_clean — the bodyless-callee
+#      exemption at the fixpoint);
+#   2. the growth-method backstop marks the builtin-heap method calls
+#      that routed neither an IntrinsicId nor a callee DefId;
+#   3. a resolved callee DefId records the call-edge name (the
+#      fixpoint's seed lookup and diagnostics); a call WITHOUT a
+#      resolved target (a closure/function-pointer VALUE, an unknown
+#      callee) is UNKNOWN — all three classes, fail closed.
+def effect_class_scan_call_site(inout env: TypeEnv, key: String, call_expr: Expr, method_name: String) -> Unit
+  var iid_opt = Option::None
+  match env.typed_intrinsics.get(call_expr.node_id)
+  when Option::Some(iid) then iid_opt = Option::Some(iid)
+  when Option::None then ()
+  end
+  var intrinsic_dirty = false
+  match iid_opt
+  when Option::Some(iid) then
+    let classes = effect_class_intrinsic_classes(iid)
+    if classes.len() > 0 then
+      intrinsic_dirty = true
+      for c in classes do
+        effect_class_mark_direct(env, key, c, "the intrinsic operation may " + effect_class_word(c) + " (a heap/growth/format/syscall op)".to_string())
+      end
+    end
+  when Option::None then ()
+  end
+  # The callee's DefId (the checker's typed target) and the call-edge
+  # name.
+  var callee_key = "".to_string()
+  var callee_name = "".to_string()
+  match env.typed_call_targets.get(call_expr.node_id)
+  when Option::Some(did) then
+    callee_key = fn_effect_def_key(env, &did)
+    callee_name = method_name.clone()
+    if callee_name.len() == 0 then
+      match callee_ident_name(&call_expr)
+      when Option::Some(n) then callee_name = n.clone()
+      when Option::None then ()
+      end
+    end
+    if callee_key.len() > 0 then
+      effect_class_record_edge_name(env, key.clone(), callee_key.clone(), callee_name.clone())
+      # A BENIGN router-classified intrinsic callee is known clean (the
+      # bodyless-callee fixpoint exemption).
+      match iid_opt
+      when Option::Some(iid) then
+        if !intrinsic_dirty then
+          env.fn_class_clean.insert(callee_key)
+        end
+      when Option::None then ()
+      end
+    end
+  when Option::None then ()
+  end
+  # The growth-method backstop: a method call on the builtin heap types
+  # that routed NO intrinsic and NO callee DefId (method_name is non-
+  # empty only for ExprMethodCall).
+  if !intrinsic_dirty && callee_key.len() == 0 && method_name.len() > 0 then
+    match call_expr.kind
+    when ExprKind::ExprMethodCall(recv, _, _, _) then
+      match env.typed_expr_types.get(recv.node_id)
+      when Option::Some(rt) then
+        let recv_ty = resolve_type_var(env, rt)
+        if effect_class_receiver_is_builtin_heap(env, &recv_ty) then
+          var is_growth = false
+          match recv_ty
+          when Type::String then
+            if effect_class_string_growth_method(method_name) then is_growth = true end
+          when _ then
+            if effect_class_container_growth_method(method_name) then is_growth = true end
+          end
+          if is_growth then
+            effect_class_mark_direct(env, key, EffectClass::Alloc, "the method `" + method_name + "` on a builtin heap type may allocate/reallocate".to_string())
+          end
+        end
+      when Option::None then ()
+      end
+    when _ then ()
+    end
+  end
+  # An UNRESOLVED direct call (a closure or function-pointer VALUE
+  # callee, an unknown computed callee) is UNKNOWN — all three classes
+  # may occur and no body or summary exists to rule any out.
+  if !intrinsic_dirty && callee_key.len() == 0 && method_name.len() == 0 then
+    let msg = "a call through a closure or function-pointer value (the callee's ".to_string()
+    effect_class_mark_direct(env, key, EffectClass::Alloc, msg + "allocation behavior cannot be proven)".to_string())
+    effect_class_mark_direct(env, key, EffectClass::Block, msg + "blocking behavior cannot be proven)".to_string())
+    effect_class_mark_direct(env, key, EffectClass::Io, msg + "I/O behavior cannot be proven)".to_string())
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# The end-of-check pass — the fixed point and the enforcement
+# ———————————————————————————————————————————————————————————————
+
+# The bodyless-callee evidence phrase (per class), used when the callee
+# has no body and no seed (the unknown case).
+def effect_class_unknown_evidence(name: String, c: EffectClass) -> String
+  "calls `" + name + "` — a function whose " + effect_class_word(c) + " behavior is unknown (no body or class summary in this compilation)"
+end
+
+# The transitive propagation across ONE call edge, used by the fixed
+# point: caller picks up the callee's final classes and the first-wins
+# evidence. Returns true when the caller's set grew.
+def effect_class_propagate_edge(inout env: TypeEnv, caller: String, callee: String) -> Bool
+  var changed = false
+  var callee_name = "".to_string()
+  match env.fn_class_names.get(callee.clone())
+  when Option::Some(n) then callee_name = n.clone()
+  when Option::None then ()
+  end
+  if callee_name.len() == 0 then
+    match effect_class_edge_name_of(env, caller.clone(), callee.clone())
+    when Option::Some(n) then callee_name = n.clone()
+    when Option::None then ()
+    end
+  end
+  var caller_set = Vec::new()
+  match env.fn_class_set.get(caller.clone())
+  when Option::Some(cs) then caller_set = cs.clone()
+  when Option::None then ()
+  end
+  if env.fn_class_names.contains_key(callee.clone()) then
+    # The callee has a body in this compilation — its final set (the
+    # fixed point computes it in the same round sweep) is the callee's
+    # contribution.
+    var callee_set = Vec::new()
+    match env.fn_class_set.get(callee.clone())
+    when Option::Some(cs2) then callee_set = cs2.clone()
+    when Option::None then ()
+    end
+    for c in callee_set do
+      if !effect_class_set_contains(&caller_set, &c) then
+        caller_set.push(c)
+        changed = true
+        # The first-wins evidence: the caller's own evidence, else the
+        # callee's evidence, else the chain text.
+        if effect_class_evidence_of(env, caller.clone(), c).len() == 0 then
+          let cev = effect_class_evidence_of(env, callee.clone(), c)
+          if cev.len() > 0 then
+            effect_class_evidence_set(env, caller.clone(), c, cev)
+          else
+            effect_class_evidence_set(env, caller.clone(), c, "the " + effect_class_word(c) + " may occur through a call chain into `" + callee_name + "`")
+          end
+        end
+      end
+    end
+  elsif !env.fn_class_clean.contains(callee.clone()) then
+    # A BODYLESS callee (an extern/foreign declaration, a bodyless
+    # builtin): the extern-name seed decides, and an UNSEEDED name is
+    # UNKNOWN — all three classes (fail closed).
+    var seed_classes = Option::None
+    if callee_name.len() > 0 then
+      seed_classes = effect_class_extern_seed(&callee_name)
+    end
+    match seed_classes
+    when Option::Some(classes) then
+      if classes.len() == 0 then
+        # Known benign (the pure runtime helpers) — contributes nothing.
+        ()
+      else
+        for c in classes do
+          if !effect_class_set_contains(&caller_set, &c) then
+            caller_set.push(c)
+            changed = true
+            if effect_class_evidence_of(env, caller.clone(), c).len() == 0 then
+              effect_class_evidence_set(env, caller.clone(), c, "calls `" + callee_name + "` — a seeded " + effect_class_word(c) + " extern")
+            end
+          end
+        end
+      end
+    when Option::None then
+      # Unknown behavior — every class may occur.
+      for c in Vec::from([EffectClass::Alloc, EffectClass::Block, EffectClass::Io]) do
+        if !effect_class_set_contains(&caller_set, &c) then
+          caller_set.push(c)
+          changed = true
+          if effect_class_evidence_of(env, caller.clone(), c).len() == 0 then
+            let disp = if callee_name.len() > 0 then callee_name.clone() else callee.clone() end
+            effect_class_evidence_set(env, caller.clone(), c, effect_class_unknown_evidence(&disp, c))
+          end
+        end
+      end
+    end
+  end
+  if changed then
+    env.fn_class_set.insert(caller.clone(), caller_set)
+  end
+  changed
+end
+
+# The end-of-check enforcement pass: fixed point over the recorded call
+# graph (seeded from the direct scans), then the annotated functions'
+# claims vs their final class sets.
+def check_effect_class_annotations(inout env: TypeEnv) -> Unit
+  # The permissive (editor) path records no resolutions, no call graph
+  # and no typed targets — the proof machinery is inert there (the
+  # pass-4 hooks gate on the same condition).
+  match env.resolutions
+  when Option::Some(_) then ()
+  when Option::None then return
+  end
+  if env.fn_class_claims.len() == 0 then return end
+
+  # 1. The fixed point — the reachable closure from the claimed
+  #    functions, iterated to a fixed point (mirroring the effect-set
+  #    discipline's sweep).
+  #    The direct sets seed every body-bearing function; the round sweep
+  #    then folds every reachable callee's set into its callers until no
+  #    set changes.
+  var reachable = Set::new()
+  var todo = Vec::new()
+  for (ck, _) in env.fn_class_claims do
+    if !reachable.contains(&ck) then
+      reachable.insert(ck.clone())
+      todo.push(ck)
+    end
+  end
+  var ti = 0
+  while ti < todo.len() do
+    let cur = todo[ti].clone()
+    match env.fn_call_graph.get(cur.clone())
+    when Option::Some(callees) then
+      for ck in callees do
+        if !reachable.contains(ck) then
+          reachable.insert(ck.clone())
+          todo.push(ck.clone())
+        end
+      end
+    when Option::None then ()
+    end
+    ti = ti + 1
+  end
+  # Seed the final sets from the direct scans.
+  for ck in reachable do
+    var seed = Vec::new()
+    match env.fn_class_direct.get(ck.clone())
+    when Option::Some(d) then seed = d.clone()
+    when Option::None then ()
+    end
+    env.fn_class_set.insert(ck.clone(), seed)
+  end
+  var changed = true
+  while changed do
+    changed = false
+    for ck in reachable do
+      match env.fn_call_graph.get(ck.clone())
+      when Option::Some(callees) then
+        for ckey in callees do
+          if effect_class_propagate_edge(env, ck.clone(), ckey.clone()) then
+            changed = true
+          end
+        end
+      when Option::None then ()
+      end
+    end
+  end
+
+  # 2. Enforcement — one E0232 diagnostic per violated forbidden class,
+  #    at the attribute's span. The message echoes the claim's
+  #    as-written attribute form (effect_class_claim_spelling) and names
+  #    the annotated function — under @interrupt that function IS the
+  #    handler, and the diagnostic says so ("@interrupt handler `...`").
+  for (key, claims) in env.fn_class_claims do
+    let fname = match env.fn_class_names.get(key.clone())
+    when Option::Some(n) then n.clone()
+    when Option::None then key.clone()
+    end
+    var final_set = Vec::new()
+    match env.fn_class_set.get(key.clone())
+    when Option::Some(fs) then final_set = fs.clone()
+    when Option::None then ()
+    end
+    for claim in claims do
+      let forbidden = effect_class_forbidden_classes(claim.anno)
+      for fc in forbidden do
+        if effect_class_set_contains(&final_set, &fc) then
+          let evidence = effect_class_evidence_of(env, key.clone(), fc)
+          let ev = if evidence.len() > 0 then evidence else "the checker could not rule out " + effect_class_word(fc) + " on any path".to_string() end
+          let subject = match claim.anno
+          when EffectAnnotation::Interrupt then "handler"
+          when _ then "function"
+          end
+          add_error_with_code(env,
+            "@" + effect_class_claim_spelling(claim) + " " + subject + " `" + fname + "` " + effect_class_phrase(fc) + ": " + ev,
+            claim.span,
+            "E0232")
+        end
+      end
+    end
   end
 end
 
@@ -8449,7 +9817,7 @@ def wcet_cost_expr(env: TypeEnv, e: Expr) -> Int
   end  end
 end
 
-def check_function(inout env: TypeEnv, f: FunctionDecl, owner_key: String, f_owner: DefId) -> Unit
+def check_function(inout env: TypeEnv, f: FunctionDecl, owner_key: String, f_owner: DefId, effect_claims: Vec[EffectClassClaim]) -> Unit
   push_scope(env)
   env.check_ctx = "fn:" + f.name
   
@@ -8529,7 +9897,22 @@ def check_function(inout env: TypeEnv, f: FunctionDecl, owner_key: String, f_own
   env.fn_declared_effect_spans.insert(decl_key.clone(), f.span)
   env.fn_effect_modules.insert(decl_key.clone(), env.current_module_path.clone())
   let declared_budget = typed_budget_of(&f.budget_val)
-  env.typed_fn_signatures.insert(owner_key, FnSignature { params: fn_param_types, ret_type: ret_type.clone(), declared_effects: declared_effects, declared_budget: declared_budget })
+  # (audit P1-2): register the function's effect-class presence under the
+  # same def-key — the body-bearing name (the classifier's body test and
+  # the diagnostics) and the recognized annotation claims (the checker's
+  # PROVEN-or-ERROR table). The same claims ride the typed signature
+  # record below (effect_annotations — the typed storage the MIR-side
+  # consumers read). Registration is gated on the resolution presence:
+  # the permissive editor path records no call graph, so the class proof
+  # machinery is inert there.
+  let effect_annotations = effect_class_annos_of_claims(&effect_claims)
+  if env.resolutions.is_some() then
+    env.fn_class_names.insert(decl_key.clone(), f.name.clone())
+    if effect_claims.len() > 0 then
+      env.fn_class_claims.insert(decl_key.clone(), effect_claims.clone())
+    end
+  end
+  env.typed_fn_signatures.insert(owner_key, FnSignature { params: fn_param_types, ret_type: ret_type.clone(), declared_effects: declared_effects, declared_budget: declared_budget, effect_annotations: effect_annotations })
   
  # every `return expr` in the body unifies immediately with the
   # declared return type (unconditional — not dependent on the last
@@ -8537,7 +9920,7 @@ def check_function(inout env: TypeEnv, f: FunctionDecl, owner_key: String, f_own
   env.expected_return = Option::Some(ret_type.clone())
   # Check body (the body's call sites record into this function's computed
   # effect set — current_fn_key is the def-key registration used above).
-  env.current_fn_key = decl_key
+  env.current_fn_key = decl_key.clone()
   match f.body
   when FnBody::FnBlock(block) then
     let body_flow = check_block(env, &block, true)
@@ -8556,6 +9939,16 @@ def check_function(inout env: TypeEnv, f: FunctionDecl, owner_key: String, f_own
     # transfer_consume mirror at the FnExpr body check).
     record_projected_consume(env, &expr)
   when _ then ()
+  end
+  # (audit P1-2): scan the function's OWN body for the direct
+  # effect-class evidence (heap constructors, closure boxing, growing
+  # String/container operations, formatting, raw syscalls, indirect
+  # calls). The scan runs after the body check so the typed per-node
+  # records (typed_expr_types / typed_intrinsics / typed_call_targets)
+  # are complete; the transitivity rides the recorded call graph at the
+  # end-of-check pass (check_effect_class_annotations).
+  if env.resolutions.is_some() then
+    effect_class_scan_fn_body(env, &decl_key, &f.body)
   end
   env.current_fn_key = ""
   env.expected_return = Option::None
@@ -9399,6 +10792,18 @@ def check_impl(inout env: TypeEnv, i: ImplDecl, method_keys: Vec[String]) -> Uni
       record_projected_consume(env, &expr)
     when _ then ()
     end
+    # (audit P1-2): register the method as a BODY-BEARING callable and
+    # scan its body for the direct effect-class evidence (the same role
+    # check_function's scan plays for free functions). Methods carry no
+    # annotation channel today (the parser attaches item attributes only
+    # at top-level items), so no claims register here — the body scan is
+    # what lets an annotated free function be PROVEN through a method
+    # call chain.
+    if env.resolutions.is_some() then
+      let m_class_key = fn_effect_def_key(env, &m_owner)
+      env.fn_class_names.insert(m_class_key.clone(), m.name.clone())
+      effect_class_scan_fn_body(env, &m_class_key, &m.body)
+    end
     env.current_fn_key = ""
     env.expected_return = Option::None
 
@@ -9461,6 +10866,145 @@ def check_block(inout env: TypeEnv, block: Block, is_value: Bool) -> FlowResult
   }
 end
 
+# ———————————————————————————————————————————————————————————————
+# (audit P1-1, first pass) Scoped-Access Gates
+# ———————————————————————————————————————————————————————————————
+# The `with <expr> as let/inout <name>` binding is a BLOCK-BOUND access:
+# the access value is never first-class. The first pass enforces (a) the
+# scope rule — the name binds in the body's own lexical scope, so any use
+# outside the block is an ordinary unknown-symbol error — and (b) the
+# store/capture rules below. The mutation-vs-read discipline (reads
+# allowed under let, projected mutation allowed only under inout) is
+# enforced at the STATEMENT level (assignment targets); the parameter
+# conventions have no analogous per-statement gate in the checker for
+# value types, so the access gate intentionally mirrors the access-effect
+# model directly. Compound-assignment statements (StmtCompoundAssign) do
+# not have a check_stmt arm in the current snapshot (they are rejected
+# earlier as unsupported); when that arm lands it must run the same
+# check_scoped_access_store_target gate on its target. The container half
+# of the audit (the Map get_read / get_modify entry-ACCESSOR contract) is
+# IMPLEMENTED: a with-scoped-access statement may source from a Map-entry
+# accessor call (map_accessor_name_of below; the by-key `as inout`
+# write-back lowers in mir.tg's lower_with_access_stmt / the accessor
+# methods live on Map in std/collections.tg). The closure forms
+# (Map::with_value / with_value_mut — a closure parameter cannot carry the
+# let/inout access conventions in this language) are not expressible and
+# stay PENDING; the owning-access-value frame mirror stays pending too —
+# both are documented in the StmtWith check arm below.
+
+# The semantic local id of an expression's ROOT local — the target/use is
+# a place chain rooted at an identifier (a with-bound name is an ordinary
+# local to every other consumer). Nodes checked by check_expr always have
+# their typed resolution recorded; a missing record (a checker-internal
+# failure class) yields Option::None, which the gates treat as "not an
+# access root" (never a fabricated match).
+def expr_root_local_id(env: TypeEnv, expr: Expr) -> Option[Int]
+  match expr.kind
+  when ExprKind::ExprIdent(_) then
+    if expr.node_id != 0 then
+      match env.typed_ident_resolutions.get(expr.node_id)
+      when Option::Some(lid) then Option::Some(lid)
+      when Option::None then Option::None
+      end
+    else
+      Option::None
+    end
+  when ExprKind::ExprFieldAccess(base, _) then expr_root_local_id(env, &base)
+  when ExprKind::ExprIndex(base, _) then expr_root_local_id(env, &base)
+  when ExprKind::ExprCast(inner, _) then expr_root_local_id(env, &inner)
+  when ExprKind::ExprAccess(inner) then expr_root_local_id(env, &inner)
+  when _ then Option::None
+  end  end
+end
+
+# The innermost ACTIVE with-scoped access binding whose semantic local id
+# the expression's root denotes, or Option::None. Inner stack entries win
+# (a nested with-body checked inside an outer with-body shadows nothing —
+# names resolve by id, so only the binding the name ACTUALLY resolves to
+# matches).
+def scoped_access_binding_of(env: TypeEnv, expr: Expr) -> Option[ScopedAccessBinding]
+  match expr_root_local_id(env, expr)
+  when Option::Some(lid) then
+    var i = env.scoped_access_stack.len()
+    while i > 0 do
+      i = i - 1
+      if env.scoped_access_stack[i].local_id == lid then
+        return Option::Some(ScopedAccessBinding {
+          local_id: lid,
+          name: env.scoped_access_stack[i].name.clone(),
+          effect: env.scoped_access_stack[i].effect
+        })
+      end
+    end
+    Option::None
+  when Option::None then Option::None
+  end  end
+end
+
+# (audit P1-1, container half): the MAP-ENTRY ACCESSOR test — the name of
+# the accessor a with-scoped-access EXPRESSION sources from, or "" when
+# EXPR is not a Map-entry accessor call. A Map-entry accessor call is a
+# method call named `get_read` / `get_modify` (the std Map methods declared
+# in std/collections.tg) with at least the key argument and a receiver
+# whose TYPED type is the std Map — the receiver gate keeps a same-named
+# user method on a user type out of the container contract. The accessors
+# return the map's VALUE type V; the StmtWith arm binds V through the
+# ordinary value-binding path (a snapshot entry read on block entry) and —
+# for the modify-side accessor under `as inout` — the MIR lowers the
+# fallthrough write-back as the by-key entry store (mir.tg's
+# lower_with_access_stmt). This recognition deliberately does NOT extend
+# expr_is_place_like (ast.tg): that canonical predicate feeds generic
+# address-taking decisions (field-access bases, raw-deref operands,
+# inout-receiver spills) where a method call is never place-like — the
+# accessor's write-back is a by-key store, not an address materialization.
+def map_accessor_name_of(env: TypeEnv, expr: Expr) -> String
+  match expr.kind
+  when ExprKind::ExprMethodCall(recv, name, _, args) then
+    if (name == "get_read" || name == "get_modify") && args.len() >= 1 then
+      match env.typed_expr_types.get(recv.node_id)
+      when Option::Some(rt) then
+        let rty = resolve_type_var(env, rt)
+        if type_bare_name_of(env, &rty) == "Map" then name.clone() else "" end
+      when Option::None then ""
+      end
+    else
+      ""
+    end
+  when _ then ""
+  end  end
+end
+
+# The store gate for an ASSIGNMENT target (StmtAssign — the only
+# assignment statement the checker currently accepts; compound assignments
+# are documented above). The block-bound access value cannot be stored:
+# a WHOLE-name store (the target is the bare name) would rebind the access
+# and is rejected for both effects; a PROJECTED store through the access
+# mutates the accessed value — rejected under the read-only `let` access,
+# the sanctioned mutation form under `inout`.
+def check_scoped_access_store_target(inout env: TypeEnv, target: Expr, span: Span) -> Unit
+  match scoped_access_binding_of(env, &target)
+  when Option::Some(b) then
+    # whole-name store: the target IS the bare access name (unwrap the
+    # call-argument `&place` marker, which the caller may wrap the target
+    # in). Projected stores (x.field = v) mutate the accessed value.
+    let whole_store = match target.kind
+    when ExprKind::ExprIdent(_) then true
+    when ExprKind::ExprAccess(inner) then
+      match inner.kind
+      when ExprKind::ExprIdent(_) then true
+      when _ then false
+      end
+    when _ then false
+    end
+    if whole_store then
+      type_add_error(env, "cannot store the with-scoped access value `" + b.name + "`: a block-bound access value is not a first-class value and cannot be reassigned (mutate through its fields under `as inout`, or read a Copy value out of the access instead)", span)
+    elsif b.effect == AccessEffect::Read then
+      type_add_error(env, "cannot mutate through the with-scoped access `" + b.name + "`: the `let` access is read-only (declare the access `as inout` for projected mutation)", span)
+    end
+  when Option::None then ()
+  end  end
+end
+
 def check_stmt(inout env: TypeEnv, stmt: Stmt) -> FlowResult
   let result = match stmt.kind
   when StmtKind::StmtLet(pattern, ty_opt, value, is_mut) then
@@ -9491,6 +11035,12 @@ def check_stmt(inout env: TypeEnv, stmt: Stmt) -> FlowResult
     flow_normal(Type::Unit)
   when StmtKind::StmtAssign(target, value) then
     let target_type = check_expr(env, &target)
+    # (audit P1-1, first pass): the store gate — a target rooted at an
+    # active with-scoped access binding stores the block-bound access
+    # value (whole-name stores) or mutates through it (projected stores:
+    # rejected under `let`, the sanctioned form under `inout`). The target
+    # has just been checked, so its root resolution is recorded.
+    check_scoped_access_store_target(env, &target, stmt.span)
     let value_type = check_expr(env, &value)
     unify(env, target_type, value_type, stmt.span)
     # (partial moves): the assignment's projected records — the store into
@@ -9854,15 +11404,155 @@ def check_stmt(inout env: TypeEnv, stmt: Stmt) -> FlowResult
       may_continue: false,
       may_throw: false
     }
-  when StmtKind::StmtWith(_, _, _) then
- # (g): unsupported feature — an explicit diagnostic, never a silent
-    # Unit fallback (MIR has no with lowering).
- # `with` is a teardown-guarding form (context manager) whose exit
-    # paths are exceptional in shape and the resource CFG models none of
-    # them — rejected here, at the type checker, before the resource
-    # checker or MIR ever see it.
-    type_add_error(env, "exceptions are not supported — no throwing path may bypass teardown: with is rejected", stmt.span)
-    flow_normal(Type::Error)
+  when StmtKind::StmtWith(expr, pat, body) then
+    # ————————————————————————————————————————————————
+    # (audit P1-1, first pass): the SCOPED-ACCESS statement —
+    # `with EXPR as let NAME <block> end` (a block-bound READ access to
+    # EXPR) and `with EXPR as inout NAME <block> end` (a block-bound
+    # READ/WRITE access). The parser guarantees a bare Ident(name,
+    # is_mut) pattern with is_mut carrying the effect (false = let,
+    # true = inout).
+    #
+    # The NAME is a SCOPED LOCAL: it is bound in the body's own lexical
+    # scope (push_scope/check_block/pop_scope), so a use outside the
+    # block is an ordinary unknown-symbol error and the block is checked
+    # with the name resolving to EXPR's typed place/value through the
+    # standard binding machinery (bind_var + check_pattern — the same
+    # semantic local id the MIR maps to its ONE materialized local).
+    # No new type form is introduced: the access value is EXPR's ordinary
+    # type.
+    #
+    # ENFORCED (first pass): (a) whole-value stores of the access value
+    # (a bare-name assignment target) are rejected for both effects;
+    # (b) projected stores through the name are rejected under `let`
+    # (read-only) and accepted under `inout` (the canonical
+    # `level.qty += delta` form — see check_scoped_access_store_target);
+    # (c) closure captures of the name are rejected (a block-bound access
+    # value must not escape its block — the capture gate in the
+    # ExprClosure arm); (d) `inout` requires EXPR to be a simple
+    #     place/accessor and rejects return/break/continue that ESCAPE the
+    #     body (the first-pass write-back lowering only runs on the
+    #     fallthrough exit); (e) owning/resource access values are rejected
+    #     (they need the resource-CFG/move mirror — the reason the
+    #     accessor half is Copy-bound).
+    #
+    # THE CONTAINER HALF (implemented — the Map entry accessor): EXPR may
+    # be a MAP-ENTRY ACCESSOR call — `map.get_read(key)` (the read side)
+    # or `map.get_modify(key)` (the modify side) — the std Map methods
+    # declared in std/collections.tg, recognized here by
+    # map_accessor_name_of (name + Map receiver). The accessor's V: Copy
+    # impl bound keeps the access value Copy, so the owning gate (e)
+    # above never fires for an accessor. The block machinery consumes the
+    # accessor exactly like the value/place forms:
+    #   - the name binds V and the block-entry materialization is the
+    #     ENTRY READ of the entry — a SNAPSHOT (the get_read/get_modify
+    #     call lowers as an ordinary method read; a missing entry TRAPS
+    #     inside the accessor body — the accessor contract has no absent
+    #     case in the first pass);
+    #   - under `as inout` the fallthrough WRITE-BACK of the MODIFY-side
+    #     accessor lowers as the BY-KEY ENTRY STORE (mir.tg's
+    #     lower_with_access_stmt re-lowers the accessor's receiver place
+    #     and key expression into a __intrinsic_map_insert call) — never a
+    #     place store, and only over Copy keys (get_modify's impl requires
+    #     K: Copy so the write-back can re-evaluate the key expression
+    #     without aliasing the map's stored key image).
+    # REMAINING (documented, not implemented): the closure forms —
+    # Map::with_value(key, |let v| ...) / with_value_mut(key,
+    # |inout v| ...), which after inlining would compile away — are NOT
+    # expressible: a closure parameter cannot carry the let/inout access
+    # conventions in this language (closure parameters are plain patterns,
+    # see parser.tg's parse_closure_params), so the closure forms stay
+    # pending at the syntax/convention level (TODO at the std accessors).
+    # The resource-checker frame mirror for OWNING access values (the
+    # bind_pattern registration of the access binding's source place and
+    # the write-back copy's move discipline) is pending in resource_check's
+    # StmtWith arm; escape-taint for reads (a Copy value READ out of the
+    # access and returned/passed is sound under the first-pass snapshot
+    # semantics and is allowed, mirroring the parameter conventions, which
+    # have no store/escape gate for value types either).
+    # ————————————————————————————————————————————————
+    let access_ty = check_expr(env, &expr)
+    mut bind_is_inout = false
+    mut bind_name = ""
+    match pat.kind
+    when PatternKind::Ident(n, im) then
+      bind_name = n.clone()
+      bind_is_inout = im
+    when _ then
+      type_add_error(env, "the with-scoped access requires a bare identifier binding after `as let`/`as inout`", pat.span)
+    end
+    # (e): the owning-state gate. The first-pass lowering materializes
+    # the access as one Copy-typed local; an owning access value (String,
+    # Vec, Box, resource types...) needs the resource-CFG frame mirror and
+    # move/alias discipline (the Map-entry accessor half above is COPY-
+    # bound for this reason) — reject here, before the resource checker
+    # or MIR see it, with an explicit diagnostic.
+    match type_properties_of(env, &access_ty)
+    when TypeProperties { owns_state: true, .. } then
+      type_add_error(env, "with-scoped access over an owning type is not supported in the first pass: the block-bound access value needs the resource-CFG/move mirror (use a Copy value type; the owning Map-entry accessor and Map::with_value forms arrive with that mirror)", stmt.span)
+    when _ then ()
+    end
+    # (d): the inout form binds the access value to a place whose address
+    # the write-back lowering can materialize — or to the MODIFY-SIDE
+    # Map-entry accessor (`map.get_modify(key)`), whose write-back the MIR
+    # lowers as the by-key entry store instead of a place store. The
+    # READ-side accessor (get_read) has a by-value receiver and therefore
+    # no write-back target: under `as inout` it is rejected with its own
+    # diagnostic.
+    if bind_is_inout && !expr_is_place_like(&expr) then
+      let accessor_name = map_accessor_name_of(env, &expr)
+      if accessor_name != "" then
+        if accessor_name == "get_read" then
+          type_add_error(env, "`as inout` with-scoped access cannot source from the read-side accessor `Map::get_read`: its by-value receiver leaves no map place for the write-back (use the modify-side accessor `Map::get_modify`, whose write-back lowers as the by-key entry store)", stmt.span)
+        end
+      else
+        type_add_error(env, "`as inout` with-scoped access requires the expression to be a simple place or a Map-entry accessor call (`Map::get_modify(key)`) in the first pass (the write-back lowering materializes the place's address or emits the by-key entry store)", stmt.span)
+      end
+    end
+    push_scope(env)
+    # The binding: the pattern's variant identity is resolved by the
+    # junction (a no-op for the bare-identifier pattern) and check_pattern
+    # binds the name, records the semantic local id (pattern node ->
+    # local, the entry the MIR's record_semantic_pattern_local reads) and
+    # registers the typed local. The source place of the binding is EXPR's
+    # typed place (RawUnknown fallback for value expressions) — the
+    # access is a READ of that source; no move/consumption semantics
+    # attach (owning types are rejected above, so the binding plan is
+    # never a Consume).
+    resolve_pattern_variants(env, &pat, access_ty)
+    check_pattern(env, &pat, access_ty, binding_source_place(env, &expr, "with access"))
+    var access_lid = -1
+    match env.pattern_binding_resolutions.get(pat.node_id)
+    when Option::Some(lid) then access_lid = lid
+    when Option::None then ()
+    end
+    if bind_name != "" && access_lid >= 0 then
+      let access_effect = if bind_is_inout then AccessEffect::Modify else AccessEffect::Read end
+      env.scoped_access_stack.push(ScopedAccessBinding { local_id: access_lid, name: bind_name.clone(), effect: access_effect })
+    end
+    let body_flow = check_block(env, &body, false)
+    if bind_name != "" && access_lid >= 0 then
+      env.scoped_access_stack.pop()
+    end
+    pop_scope(env)
+    # (d): a return/break/continue that escapes the inout body would skip
+    # the fallthrough write-back — rejected in the first pass (breaks of
+    # loops NESTED inside the body are consumed by those loops and never
+    # surface here).
+    if bind_is_inout && (body_flow.may_return || body_flow.may_break || body_flow.may_continue) then
+      type_add_error(env, "return/break/continue that escape the `as inout` with-block are not supported in the first pass: the write-back of the scoped access would be skipped on the escaping exit", stmt.span)
+    end
+    # The with-block is NOT itself a break/continue/return target: the
+    # body's divergence edges propagate to the enclosing loop/function
+    # unchanged (a `return` inside a `let` with-body still returns from
+    # the enclosing function; an `inout` body has none by the gate above).
+    FlowResult {
+      normal: Type::Unit,
+      may_return: body_flow.may_return,
+      may_break: body_flow.may_break,
+      may_continue: body_flow.may_continue,
+      may_throw: false
+    }
   when _ then
  # (g): every remaining statement kind is an explicit diagnostic —
     # there is no silent `Type::Unit` fallback for unhandled statements.
@@ -10943,6 +12633,18 @@ def convention_to_effect(c: AccessConvention) -> AccessEffect
 end
 
 def record_arg_effect(inout env: TypeEnv, arg: Expr, c: AccessConvention) -> Unit
+  # (audit P1-13 — the FFI ownership boundary): a borrowed access value
+  # (`&place` — the ExprAccess marker) can never satisfy an
+  # ownership-transfer (Sink) parameter. `sink` means the callee takes the
+  # VALUE (it may destroy it, keep it past the call, or — at the extern
+  # boundary — free/register it as an escaping callback context); a borrow
+  # of the place is exactly the value the callee must NOT be handed. The
+  # rejection fires for EVERY call whose callee carries the convention —
+  # compiled functions AND extern functions (extern declarations bind as
+  # FnPtr values whose per-parameter conventions come from the extern
+  # declaration's own conventions), so a sink extern parameter enforces the
+  # same rule as a sink method parameter.
+  check_borrowed_access_not_sunk(env, &arg, c)
   let effect = convention_to_effect(c)
   env.typed_access_effects.insert(arg.node_id, effect)
   match arg.kind
@@ -10956,6 +12658,24 @@ def record_arg_effect(inout env: TypeEnv, arg: Expr, c: AccessConvention) -> Uni
   # same site the checker's frame lattice marks it Consumed.
   if effect == AccessEffect::Consume then
     record_projected_consume(env, &arg)
+  end
+end
+
+# (audit P1-13): reject passing a borrowed access value into a Sink
+# parameter. Only the Sink convention is guarded: the ExprAccess marker
+# denotes a BORROW of a place — the callee may read (or, under the
+# inout/set conventions, write or initialize) the caller's storage, but
+# never own it; a Sink parameter must receive the owned value itself
+# (the caller must not use it afterwards — enforced by the resource
+# checker's consume tracking). Fire BEFORE the effect is recorded so the
+# error is the primary diagnostic, never a downstream consume artifact.
+def check_borrowed_access_not_sunk(inout env: TypeEnv, arg: Expr, c: AccessConvention) -> Unit
+  if c == AccessConvention::Sink then
+    match arg.kind
+    when ExprKind::ExprAccess(_) then
+      type_add_error(env, "cannot pass a borrowed access value (`&place`) to a sink parameter: sink (takes-ownership) parameters must receive the owned value itself — the callee may destroy it or keep it past the call; at the FFI boundary this is the escaping-context rule (an extern ownership-transfer parameter, e.g. a callback context, must be handed the owned value, never a borrow of a caller local)", arg.span)
+    when _ then ()
+    end
   end
 end
 
@@ -15675,6 +17395,26 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
         end
       when Option::None then ()
       end
+      # (audit P1-1, first pass): the scoped-access capture gate — a
+      # closure defined INSIDE a with-block must not capture the
+      # with-bound access value (the block-bound access value is not
+      # first-class and must not escape its block through the closure
+      # env; under the first-pass snapshot semantics a read-out Copy
+      # value remains available through the access's fields). The stack
+      # holds every ENCLOSING with-block currently being checked, so a
+      # nested with inside an outer with cannot leak the outer binding
+      # either.
+      var ws = env.scoped_access_stack.len()
+      var captured_access_name = ""
+      while ws > 0 && captured_access_name == "" do
+        ws = ws - 1
+        if env.scoped_access_stack[ws].local_id == cap_entries[cei].0 then
+          captured_access_name = env.scoped_access_stack[ws].name.clone()
+        end
+      end
+      if captured_access_name != "" then
+        type_add_error(env, "cannot capture the with-scoped access value `" + captured_access_name + "` into a closure: a block-bound access value is not first-class and must not escape its block (read a Copy value out of the access instead)", body.span)
+      end
       cei = cei + 1
     end
     env.closure_captures.insert(expr.node_id, scan.uses)
@@ -18193,7 +19933,7 @@ def resolve_pending_int_literals(inout env: TypeEnv) -> Unit
     for p in sig.params do
       new_params.push(ParamType { ty: default_int_literal_type(env, &p.ty), convention: p.convention })
     end
-    new_sigs.insert(key, FnSignature { params: new_params, ret_type: default_int_literal_type(env, &sig.ret_type), declared_effects: sig.declared_effects.clone(), declared_budget: sig.declared_budget.clone() })
+    new_sigs.insert(key, FnSignature { params: new_params, ret_type: default_int_literal_type(env, &sig.ret_type), declared_effects: sig.declared_effects.clone(), declared_budget: sig.declared_budget.clone(), effect_annotations: sig.effect_annotations.clone() })
   end
   env.typed_fn_signatures = new_sigs
   var new_statics = Map::new()
@@ -19195,7 +20935,7 @@ def type_check_typed(inout env: TypeEnv, program: Program, resolutions: Resolved
     for sp in sig_rec.params do
       chased_params.push(ParamType { ty: resolve_type_var(env, sp.ty), convention: sp.convention })
     end
-    typed_fn_sigs.insert(sig_key, FnSignature { params: chased_params, ret_type: resolve_type_var(env, sig_rec.ret_type), declared_effects: sig_rec.declared_effects.clone(), declared_budget: sig_rec.declared_budget.clone() })
+    typed_fn_sigs.insert(sig_key, FnSignature { params: chased_params, ret_type: resolve_type_var(env, sig_rec.ret_type), declared_effects: sig_rec.declared_effects.clone(), declared_budget: sig_rec.declared_budget.clone(), effect_annotations: sig_rec.effect_annotations.clone() })
   end
   var typed_static_tys = Map::new()
   for (st_key, st_ty) in env.typed_static_types do

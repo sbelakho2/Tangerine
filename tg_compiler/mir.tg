@@ -142,6 +142,55 @@ struct MirFunction
   # driver's budget analysis enumerates the consumes. IR-synthesized
   # functions carry none.
   declared_budget: Option[TypedBudget] = Option::None
+  # (P1-18) The function's DECLARED inlining/code-placement hints — the
+  # @inline / @inline(always) / @noinline / @cold function attributes,
+  # stamped from the function ITEM's attribute list at lowering
+  # (lower_program's PASS 2 — the same attribute storage every function
+  # attribute uses; impl methods cannot carry item attributes and
+  # IR-synthesized functions (drop glue, closures) lower with none).
+  # The hints are ADVISORY — no correctness rule ever depends on them:
+  #   attr_inline_hint   — @inline (bare): recorded; the optimizer's own
+  #                        size-driven rules decide (a function under the
+  #                        inliner's thresholds is inlined with or without
+  #                        the hint);
+  #   attr_inline_always — @inline(always): the inliner's FORCED set — the
+  #                        size thresholds do not apply (the safety guards
+  #                        outrank the hint: extern bodies, recursion, and
+  #                        the call-site non-Read-place-argument guard);
+  #   attr_noinline      — @noinline (and the std spelling @inline(never)):
+  #                        the inliner's hard exclusion — such a function
+  #                        is never inlined at any call site;
+  #   attr_cold          — @cold: a code-LAYOUT request for the emitter
+  #                        (a cold section when the object emission gains
+  #                        section support — see the TODO at
+  #                        codegen_function's symbol-emission site).
+  attr_inline_hint: Bool = false
+  attr_inline_always: Bool = false
+  attr_noinline: Bool = false
+  attr_cold: Bool = false
+  # (P1-6) The function's DECLARED floating-point mode — @fp(fast) — the
+  # ONLY spelling of the fp mode attribute (the strict form is the
+  # DEFAULT; there is no @fp(strict) to record — its absence IS strict).
+  # Stamped from the function ITEM's attribute list at lowering
+  # (lower_program's PASS 2 — the same attribute storage and channel as
+  # the P1-18 hints above; impl methods cannot carry item attributes and
+  # IR-synthesized functions (drop glue, closures) lower with none, so
+  # they are always strict). The mode relaxes the STRICT IEEE-754 rules
+  # (specified canonically in types.tg's FP-mode module doc — above the
+  # Type enum) for THIS function's float operations: reassociation,
+  # reciprocal approximations, FMA/contraction, and finite-only
+  # assumptions. The optimization level NEVER selects a mode: -O flags
+  # flow only into optimize_mir_verified, whose passes are
+  # float-semantics-neutral (constant folding is integer-only — float
+  # constants are never folded — and no pass reads or sets fp_fast), so
+  # -O3 can never silently enable fast math. Consulted only by codegen,
+  # per emitted function: after inlining, an @fp(fast) callee's
+  # operations inside a STRICT caller are emitted under the caller's
+  # strict mode (safe); a strict callee inlined into an @fp(fast) caller
+  # is emitted fast — a future fast-mode MIR rewrite
+  # (contraction/reassociation) must be mode-aware per operation, not
+  # per function (TODO P1-6).
+  fp_fast: Bool = false
   span: Span
 end
 
@@ -618,6 +667,11 @@ def duplicate_function(func: MirFunction) -> MirFunction
     contracts: func.contracts.clone(),
     declared_effects: func.declared_effects.clone(),
     declared_budget: func.declared_budget.clone(),
+    attr_inline_hint: func.attr_inline_hint,
+    attr_inline_always: func.attr_inline_always,
+    attr_noinline: func.attr_noinline,
+    attr_cold: func.attr_cold,
+    fp_fast: func.fp_fast,
     span: func.span.clone()
   }
 end
@@ -1139,6 +1193,25 @@ struct MirBuilder
   # finish_function's current_fn reset (the budget lowering reads the
   # per-function limits from here while lowering the body).
   current_fn_budget: Option[TypedBudget] = Option::None
+  # (P1-18) The DECLARED inlining/code-placement hints of the function
+  # item currently being lowered — @inline / @inline(always) / @noinline
+  # / @cold — recorded from the item's attribute list in lower_program's
+  # PASS 2 (the fn arm, before lower_function), stamped onto the lowered
+  # MirFunction at lower_function's hint write site (mirroring the
+  # current_fn_budget flow), and cleared at the end of the fn arm — an
+  # impl method or IR-synthesized function must never inherit a
+  # neighbour's hints.
+  pending_attr_inline_hint: Bool = false
+  pending_attr_inline_always: Bool = false
+  pending_attr_noinline: Bool = false
+  pending_attr_cold: Bool = false
+  # (P1-6) The DECLARED floating-point mode of the function item
+  # currently being lowered — @fp(fast) (the strict default is the
+  # absence of the attribute). Same pending-state flow as the P1-18
+  # hints: recorded from item.attrs in lower_program's PASS 2 and
+  # stamped onto the lowered MirFunction at lower_function's fp-mode
+  # write site.
+  pending_attr_fp_fast: Bool = false
   local_counter: Int
   block_counter: Int
   temp_counter: Int
@@ -4953,6 +5026,42 @@ def lower_program(program: Program, analyzed: AnalyzedProgram) -> Result[MirProg
       # fallback. Codegen emits this name as the symbol and the fn_alias
       # identity label.
       let emission_name = mir_fn_emission_name(b, item_idx2, &owner_path2, f.name.clone())
+      # (P1-18 hint recording): the function's DECLARED inlining/
+      # code-placement hints — @inline / @inline(always) / @noinline /
+      # @cold — read from the ITEM's attribute list (item.attrs — the same
+      # attribute storage every function attribute — @cfg / @test /
+      # @bench / @link_section / @interrupt — uses), recorded as the
+      # builder's pending state, and stamped onto the lowered MirFunction
+      # at lower_function's hint write site. @inline(never) — the std
+      # spelling of the noinline hint (std/debug.tg's breakpoint) — and
+      # @noinline are equivalent. The hints are advisory (no correctness
+      # rule depends on them); malformed shapes were already rejected at
+      # parse time (parser.tg's parse_attributes). (P1-6) @fp(fast) — the
+      # DECLARED floating-point mode — is recorded in the same pass (the
+      # fp mode is NOT advisory: the strict default is a correctness
+      # rule, and the attribute is the ONLY way a function leaves it).
+      b.pending_attr_inline_hint = false
+      b.pending_attr_inline_always = false
+      b.pending_attr_noinline = false
+      b.pending_attr_cold = false
+      b.pending_attr_fp_fast = false
+      for fn_attr in item.attrs do
+        if fn_attr.name == "inline" then
+          if fn_attr.args.len() == 1 && fn_attr.args[0] == "always" then
+            b.pending_attr_inline_always = true
+          elsif fn_attr.args.len() == 1 && fn_attr.args[0] == "never" then
+            b.pending_attr_noinline = true
+          else
+            b.pending_attr_inline_hint = true
+          end
+        elsif fn_attr.name == "noinline" then
+          b.pending_attr_noinline = true
+        elsif fn_attr.name == "cold" then
+          b.pending_attr_cold = true
+        elsif fn_attr.name == "fp" then
+          b.pending_attr_fp_fast = true
+        end
+      end
       match lower_function(&mut b, &f, emission_name)
       when Option::Some(mir_fn) then
         functions.push(mir_fn)
@@ -4961,6 +5070,16 @@ def lower_program(program: Program, analyzed: AnalyzedProgram) -> Result[MirProg
       b.current_fn_key = ""
       b.current_callable = Option::None
       b.current_closure_node = Option::None
+      # (P1-18): clear the pending hint state — an impl method (whose
+      # declaration cannot carry item attributes) or IR-synthesized
+      # function must never inherit this item's hints.
+      b.pending_attr_inline_hint = false
+      b.pending_attr_inline_always = false
+      b.pending_attr_noinline = false
+      b.pending_attr_cold = false
+      # (P1-6): clear the pending fp mode with the hints — the strict
+      # default must never leak into a neighbour's function.
+      b.pending_attr_fp_fast = false
     when ItemKind::ItemStatic(s) then
       statics.push(lower_static(&mut b, &s))
     when ItemKind::ItemConst(c) then
@@ -5417,7 +5536,34 @@ def lower_function(inout b: MirBuilder, f: FunctionDecl, emission_name: String) 
   when Option::None then ()
   end
   b.current_fn_budget = fn_sig.declared_budget.clone()
- # the TIME metric's ENTRY stamp — the first statement of the entry
+ # (the MirFunction attr-hint WRITE SITE): stamp the item's DECLARED
+  # @inline / @inline(always) / @noinline / @cold hints (the builder's
+  # pending state — recorded from item.attrs at lower_program's PASS 2)
+  # onto the lowered function. The hints are ADVISORY (see the MirFunction
+  # field docs); codegen and the inliner read only these stamped fields —
+  # the AST's item attributes are never interpreted after lowering.
+  match b.current_fn
+  when Option::Some(fn_ref4) then
+    fn_ref4.attr_inline_hint = b.pending_attr_inline_hint
+    fn_ref4.attr_inline_always = b.pending_attr_inline_always
+    fn_ref4.attr_noinline = b.pending_attr_noinline
+    fn_ref4.attr_cold = b.pending_attr_cold
+  when Option::None then ()
+  end
+  # (P1-6) (the MirFunction fp-mode WRITE SITE): stamp the item's
+  # DECLARED @fp(fast) mode (the builder's pending state — recorded from
+  # item.attrs at lower_program's PASS 2, alongside the attr hints above)
+  # onto the lowered function. The STRICT IEEE default is the absence of
+  # the attribute; codegen reads this stamped field — the AST's item
+  # attributes are never interpreted after lowering. Impl methods and
+  # IR-synthesized functions lower with the pending state clear (false),
+  # so they are always strict.
+  match b.current_fn
+  when Option::Some(fn_ref5) then
+    fn_ref5.fp_fast = b.pending_attr_fp_fast
+  when Option::None then ()
+  end
+  # the TIME metric's ENTRY stamp — the first statement of the entry
   # block (block 0, current at this point — before the contracts and the
   # body lower): MirEffectRecord("__tg_budget_time_start") — codegen
   # stamps THIS INVOCATION's frame time slot (FrameInfo's
@@ -5816,7 +5962,22 @@ end
 def lower_extern_fn(inout b: MirBuilder, ef: ExternFn, abi: String) -> MirFunction
   # Create an extern function declaration.
   # This has no body — codegen will emit a relocation against the symbol name.
- # the extern's declared parameter/return types come from the pre-pass
+ # (audit P1-13 — ownership metadata across the extern boundary): the
+  # extern declaration's per-parameter AccessConvention markers are NOT
+  # dropped here. They survive in two places: (1) the typed signature
+  # record (types.tg registers externs as FnPtr values whose ParamTypes
+  # keep the conventions), which drives call-site argument effects
+  # (record_arg_effect / convention_to_effect) and therefore the access +
+  # resource checker enforcement (a sink extern consumes its argument; a
+  # borrowed-access argument to a sink extern is rejected); and (2) the
+  # ABI shape below — the param TYPE registry (mir_signature_param_types)
+  # wraps an `inout` convention as RefInternal, so the address-carrying
+  # convention survives into the register/stack slot the MIR and codegen
+  # use. The MirLocal itself is type-only (codegen classifies types, never
+  # conventions); the convention lives on the typed call-site effects and
+  # on the RefInternal wrap, and the raw extern symbol receives its
+  # arguments exactly as the declaration's C ABI prescribes.
+  # the extern's declared parameter/return types come from the pre-pass
   # registries, which were populated from the typed signature table (the
   # checker's resolved declaration record — never TypeExpr again); a
   # missing entry is an internal error (fail-closed).
@@ -8074,10 +8235,13 @@ def lower_stmt(inout b: MirBuilder, stmt: Stmt) -> Unit
     match stmt.kind
     when StmtKind::StmtCompoundAssign(op, target, value) then
       let place = lower_place(b, &target)
+      let target_ty = mir_place_type(&place, b)
       let lhs_operand = lower_expr(b, &target, stmt.span)
       let rhs_operand = lower_expr(b, &value, stmt.span)
       let mir_op = lower_binop(op)
-      let rvalue = MirRvalue { kind: MirRvalueKind::MirBinOp(mir_op, lhs_operand, rhs_operand) }
+      # `x op= y` is `x = x op y` — the P1-5 signed rule applies to the
+      # compound forms too (the target's type is the operation's type).
+      let rvalue = mir_emit_arith_binop_rvalue(b, mir_op, &target_ty, &lhs_operand, &rhs_operand, stmt.span)
       push_assign(b, place, rvalue, stmt.span)
       return
     when _ then ()
@@ -8136,14 +8300,30 @@ def lower_stmt(inout b: MirBuilder, stmt: Stmt) -> Unit
       return
     when _ then ()
     end
-  elsif kind_name == "StmtTry" || kind_name == "StmtWith" then
+  elsif kind_name == "StmtTry" then
     # REJECTED at the type checker — exceptions are not supported
     # (no exception runtime in the backend, no Throw/Unwind/Handler edges
     # in the resource CFG). MIR must fail CLOSED here, never silently skip
     # the statement: the pre-lower_stmt fell through this dispatch
-    # and silently ERASED try/with blocks — exactly the class of
+    # and silently ERASED try blocks — exactly the class of
     # bypass that could skip Drop/defer teardown on an exceptional path.
-    b.errors.push("exceptions are not supported — no throwing path may bypass teardown: " + kind_name + " reached MIR lowering")
+    b.errors.push("exceptions are not supported — no throwing path may bypass teardown: StmtTry reached MIR lowering")
+  elsif kind_name == "StmtWith" then
+    # (audit P1-1, first pass): the scoped-access statement — the type
+    # checker accepts it (and rejects owning access values and escaping
+    # inout control flow), so the MIR lowers it; fail closed only when the
+    # statement is NOT the checker's bare-Ident scoped-access shape.
+    match stmt.kind
+    when StmtKind::StmtWith(expr, pat, body) then
+      match pat.kind
+      when PatternKind::Ident(_, _) then
+        lower_with_access_stmt(b, &expr, &pat, &body, stmt.span)
+        return
+      when _ then
+        b.errors.push("internal error: unsupported with statement shape reached MIR lowering (expected the scoped-access bare-identifier binding)")
+      end
+    when _ then ()
+    end
   elsif kind_name == "StmtHandleWith" then
     match stmt.kind
     when StmtKind::StmtHandleWith(expr, handlers) then
@@ -8152,6 +8332,162 @@ def lower_stmt(inout b: MirBuilder, stmt: Stmt) -> Unit
     when _ then ()
     end
   end
+end
+
+# (audit P1-1, first pass): lower the SCOPED-ACCESS statement —
+# `with EXPR as let NAME <block> end` (read-only) and
+# `with EXPR as inout NAME <block> end` (read/write). The access
+# materializes as ONE fresh local:
+#   1. EXPR's value is copied into the local on entry (the checker only
+#      accepts Copy-type access values in this pass, so no drop/glue
+#      machinery is involved);
+#   2. the body is lowered as a nested lexical block (lower_block — the
+#      resource checker analyzed it under its own block key, so its scope
+#      cleanup edges are emitted) and every use of NAME reads/writes the
+#      SAME local — the checker bound NAME's semantic id to this local via
+#      record_semantic_pattern_local, so the body's identifier uses need
+#      no per-node rewriting: zero extra copies;
+#   3. the `inout` form writes the local back after the body's
+#      fallthrough (the type checker rejects return/break/continue that
+#      escape the inout body, so the fallthrough write-back is the only
+#      exit that needs it). The write-back has TWO shapes:
+#        - a simple-place EXPR (ident/field/index/deref) stores the local
+#          back into EXPR's place (lower_place materializes its address);
+#        - a MAP-ENTRY ACCESSOR EXPR (`map.get_modify(key)` — the
+#          container half of the audit) re-lowers the accessor's receiver
+#          place and key expression into the BY-KEY ENTRY STORE
+#          (mir_emit_accessor_writeback below — an __intrinsic_map_insert
+#          call over the access local's image; the checker's StmtWith arm
+#          gated the shape through map_accessor_name_of, so the
+#          read-side get_read never reaches this branch).
+# The closure forms (Map::with_value / with_value_mut — where the access
+# is a view into the container and the closure form compiles away after
+# inlining) are not expressible: a closure parameter cannot carry the
+# let/inout access conventions in this language — documented in the
+# types.tg StmtWith arm. A `with` statement inside a PROJECTED for-loop
+# whose inout source is the iterated place is likewise pending: the loop's
+# mutation scan does not yet see the write-back store.
+def lower_with_access_stmt(inout b: MirBuilder, expr: Expr, pat: Pattern, body: Block, span: Span) -> Unit
+  mut bind_name = ""
+  mut is_inout = false
+  match pat.kind
+  when PatternKind::Ident(name, im) then
+    bind_name = name.clone()
+    is_inout = im
+  when _ then ()
+  end
+  match lower_expr_to_rvalue(b, &expr, span)
+  when Result::Ok(rvalue) then
+    let inferred_ty = mir_source_expr_ty(b, &expr)
+    let local_id = add_local(b, bind_name, inferred_ty, is_inout, span)
+    record_semantic_pattern_local(b, &pat, local_id, "with access binding")
+    push_assign(b, place_local(local_id), rvalue, span)
+    lower_block(b, &body)
+    if is_inout then
+      # The write-back: a Map-entry accessor EXPR (the container half)
+      # writes back through the by-key entry store; every other inout
+      # source is the first-pass simple place, stored back through
+      # lower_place.
+      if !mir_emit_accessor_writeback(b, &expr, local_id, span) then
+        let dest_place = lower_place(b, &expr)
+        push_assign(b, dest_place, move_rvalue(operand_copy_local(local_id)), span)
+      end
+    end
+  when Result::Err(e) then
+    b.errors.push(e)
+  end
+end
+
+# (audit P1-1, container half): the BY-KEY WRITE-BACK of the modify-side
+# Map-entry accessor (`map.get_modify(key)` as the `as inout` source of a
+# with-scoped-access statement). The block's access local holds the entry
+# SNAPSHOT the body mutated; on the fallthrough exit this helper stores
+# that image back into the map entry under the accessor's key through a
+# synthesized __intrinsic_map_insert call — the SAME replacement contract
+# as Map::insert (the map keeps its stored key identity; the entry existed
+# at the block entry — the entry read trapped otherwise — so the
+# replacement always lands on a found record). The receiver place and the
+# key expression are re-lowered from the accessor call (the checker's
+# get_modify impl bound K: Copy makes the re-evaluation sound: the map's
+# stored key image is never aliased by the second key evaluation, and no
+# key/value drop glue exists for the Copy types). The call's Option[V]
+# destination (the replaced old-value image) is discarded exactly like a
+# discarded Map::insert result over Copy values.
+#
+# Returns true when EXPR was a get_modify accessor call and the entry
+# store was emitted (or an internal error was recorded for an impossible
+# accessor shape); false keeps the simple-place write-back path in
+# lower_with_access_stmt. The checker's StmtWith arm is the shape
+# authority (map_accessor_name_of); the shape mirrors
+# mir_emit_map_insert_owned minus its owning-key drop branch.
+def mir_emit_accessor_writeback(inout b: MirBuilder, expr: Expr, local_id: MirLocalId, span: Span) -> Bool
+  match expr.kind
+  when ExprKind::ExprMethodCall(recv, name, _, args) then
+    if name != "get_modify" then
+      return false
+    end
+    if args.len() < 1 then
+      b.errors.push("internal error: a Map::get_modify accessor call without its key argument reached the with write-back lowering (node " + expr.node_id.to_string() + ")")
+      return true
+    end
+    if !expr_is_place_like(&recv) then
+      b.errors.push("internal error: the with-scoped access write-back needs the accessor's map receiver as a place (node " + expr.node_id.to_string() + ")")
+      return true
+    end
+    let recv_place = lower_place(b, &recv)
+    let recv_place_ty = mir_place_type(recv_place, b)
+    let recv_ty = mir_source_expr_ty(b, &recv)
+    let recv_op = mir_recv_operand(b, recv_place, &recv_place_ty, recv_ty, span)
+    # The entry's value type V (the receiver Map's second type argument):
+    # the intrinsic's destination is the discarded Option[V] of the
+    # replacement contract.
+    mut v_ty = Type::Unit
+    match recv_ty
+    when Type::Adt(_, rargs) then
+      if rargs.len() >= 2 then v_ty = rargs[1].clone() end
+    when _ then ()
+    end
+    let opt_tmp = add_temp(b, mir_option_type(b, v_ty), span)
+    let ins_callee = MirOperand {
+      kind: MirOperandKind::MirConstant(MirConstant {
+        kind: MirConstantKind::MirFnItem("__intrinsic_map_insert".to_string()),
+        ty: Type::FnPtr(Vec::new(), Box::new(Type::Unit), Vec::new()),
+        instance: Option::None
+      })
+    }
+    # The key argument: the accessor call's key expression re-lowered at
+    # the write-back. Its typed access effect (a plain read under the
+    # accessor's let key convention) keeps the operand a by-value
+    # MirCopy, which marshals per the key's size class exactly like the
+    # std wrappers' intrinsic calls.
+    let key_arg = MirCallArg {
+      effect: AccessEffect::Read,
+      value: MirCallValue::Value(lower_expr(b, &args[0], span))
+    }
+    # The value argument: the block-bound access local (the snapshot
+    # image the body mutated) crosses as a place — the sink-value
+    # convention of the intrinsic's declared signature.
+    let val_arg = MirCallArg {
+      effect: AccessEffect::Consume,
+      value: MirCallValue::Place(place_local(local_id))
+    }
+    let succ_blk = create_block(b)
+    var ins_args = Vec::new()
+    ins_args.push(MirCallArg { effect: AccessEffect::Modify, value: MirCallValue::Value(recv_op) })
+    ins_args.push(key_arg)
+    ins_args.push(val_arg)
+    set_terminator(b, MirTerminatorKind::MirCall {
+      dest: place_local(opt_tmp),
+      func: ins_callee,
+      args: ins_args,
+      success: succ_blk,
+      intrinsic: Option::None,
+      unwind: Option::None
+    }, span)
+    switch_to_block(b, succ_blk)
+    true
+  when _ then false
+  end  end
 end
 
 # The frame-slot key of a handler dispatcher's frame in the CALLER's stack
@@ -8633,11 +8969,334 @@ def lr_deref(inout b: MirBuilder, inner: Expr, span: Span) -> MirRvalue
   MirRvalue { kind: MirRvalueKind::MirMove(inner_op) }
 end
 
-def lr_binary(inout b: MirBuilder, op: BinOp, left: Expr, right: Expr, span: Span) -> MirRvalue
+# ———————————————————————————————————————————————————————————————
+# P1-5 — the signed-integer arithmetic rule (INSERTION POINT)
+# ———————————————————————————————————————————————————————————————
+# Language rule (audit P1-5), implemented HERE at the typed->MIR
+# lowering choke point for SOURCE binary-operator expressions:
+#
+#   `+` `-` `*` on SIGNED integer types (Int, i8/i16/i32/i64, isize)
+#   are CHECKED/TRAPPING by default at every optimization level: when
+#   the two's-complement result does not fit the type's width, control
+#   traps at the operation (a MirAssert terminator — the SAME trap
+#   mechanism the compiler uses for bounds checks / asserts: codegen
+#   emits test/jcc/UD2-or-UDF, wasm emits eqz/if/unreachable). There is
+#   no wrap-around: programs that want modular arithmetic state it
+#   explicitly through the std surface (std/core.tg) —
+#       wrapping_add/sub/mul     two's-complement wrap (via the u64
+#                                 view; unsigned arithmetic is exempt)
+#       checked_add/sub/mul      Option[Int] — None on overflow
+#       saturating_add/sub/mul   clamp to the Int bounds
+#   — and checked_* is the Option surface by design.
+#
+# EXEMPT by construction:
+#   - UNSIGNED kinds (UInt, u8..u64, usize) and Float NEVER check —
+#     unsigned is defined to wrap modulo 2^width; Float has no integer
+#     overflow (see the P1-6 fp notes);
+#   - i128/u128 have no arithmetic lowering in this compiler (codegen
+#     has no 128-bit binop emission — the types are FFI ScalarPair
+#     storage only), so the rule covers every width the compiler can
+#     actually evaluate (<= 64 bits);
+#   - SYNTHESIZED IR arithmetic (compiler-generated loop-counter
+#     increments, projected-for index bumps, drop-glue address math)
+#     never routes through the source expression lowering and stays
+#     plain. ASSUMED BOUNDED: an index/counter is bounded by a real
+#     collection length or step count, which cannot approach 2^63 in
+#     practice — same exemption the codebase applies to counters and
+#     indices everywhere (e.g. layout_engine.tg's modulo-bounded layout
+#     hashes stay plain `h * 33`; only genuinely unbounded HASH-MIXING
+#     accumulation was swept to the explicit unsigned view, see the
+#     wrapping_* sweep sites). A future range/width analysis may lift
+#     the assumption per-site.
+#
+# OPTIMIZER NOTE (TODO P1-5): the checks are emitted unconditionally
+# and survive every optimization level (they are added at lowering,
+# before optimize_mir runs). The existing proof machinery that STRIPS
+# provably-valid checks is eliminate_bounds_checks (mir.tg — it proves
+# MirAssert/BoundsCheck terms redundant from dominating comparisons and
+# replaces them with unconditional gotos; GVN shares the proof idiom at
+# the BoundsCheck-only arm). Overflow checks SHOULD be stripped by the
+# same machinery when the operands' ranges make overflow impossible
+# (constant operands, dominating length/counter bounds): extend
+# eliminate_bounds_checks' proof lattice to AssertMessage::Overflow
+# terms — do NOT build a separate range-analysis pass; the lowering
+# here deliberately keeps the flag as a plain dominating-comparison
+# chain so the existing BoundsCheck proof rules apply almost verbatim.
+#
+# DETECTION SEMANTICS (two's-complement wrap detection at width w):
+#   - width 64 (Int/i64/isize): add — both operands same sign and the
+#     result sign differs; sub — operands differ in sign and the result
+#     sign differs from the minuend's; mul — the DIVIDE-BACK probe
+#     (the audit's prescribed method): q = wrap(a*b)/b and overflow is
+#     exactly "q != a" for b != 0 (a wrapped product divided back by a
+#     nonzero factor can never equal the other factor — the
+#     std/alloc.tg layout_array idiom, shared with std/core.tg's
+#     checked_mul). The probe's two hardware-trap edges are guarded by
+#     explicit branches (their behavior diverges across x86 #DE and
+#     AArch64's defined sdiv): b == 0 -> product 0 is always safe, and
+#     b == -1 -> overflow exactly when r == a with a < 0 (a == MIN —
+#     wrap(-a) == a <=> a in {0, MIN}); every other (r, b) divides
+#     cleanly on both targets. The exact-MIN product (2^32 * -2^31 =
+#     -2^63) divides back cleanly (r/b == a) and is NOT an overflow.
+#   - width 8/16/32: operands are masked to their width payload, biased
+#     to their signed value (u - 2*(u & 2^(w-1)) — branch-free
+#     sign-extension, no arithmetic-shift reliance), the operation runs
+#     in the 64-bit register (the widest width available — the products
+#     of w-bit values can never leave i64 for w <= 32), and overflow is
+#     exactly "the result leaves [-(2^(w-1)), 2^(w-1)-1]". The result
+#     is delivered through the compiler's canonical narrowing
+#     IntToInt cast (the same mask codegen applies to every `as i8`
+#     style cast), so the stored value matches the language's cast
+#     representation.
+#   - mul at 64 bits uses the divide-back probe because no wider
+#     arithmetic exists to widen into: codegen has no 128-bit binop
+#     emission (i64 pairs cannot widen to i128), so the audit's
+#     "widest available width" fallback is the guarded divide-back
+#     above, exactly like std/core.tg's checked_mul.
+#
+# The trap message is AssertMessage::Overflow(MirBinOp) — a
+# deterministic, op-specific diagnostic ("integer overflow: signed
+# addition/subtraction/multiplication", see format_assert_message).
+# ———————————————————————————————————————————————————————————————
+
+# The signed width of an integer TYPE in the checked set (0 = not in
+# scope of the P1-5 signed rule: unsigned kinds, Float, Bool, Char,
+# String concat, enums, i128/u128 — everything exempt above).
+def mir_signed_arith_width(ty: Type) -> Int
+  match ty
+  when Type::Int then 64
+  when Type::I8 then 8
+  when Type::I16 then 16
+  when Type::I32 then 32
+  when Type::I64 then 64
+  when Type::ISize then 64
+  when _ then 0
+  end  end
+end
+
+# The typed result type of a SOURCE binary-op expression (the typed
+# tree entry — the checker records one TypedExpr per node). Synthesized
+# expressions (node_id 0) return Type::Unit, which routes through the
+# PLAIN (unchecked) path: synthesized IR never participates in the
+# source-level signed rule (see the bounded-arithmetic assumption
+# above).
+def mir_binop_result_type(b: MirBuilder, expr: Expr) -> Type
+  if expr.node_id == 0 then Type::Unit else mir_source_expr_ty(b, &expr) end
+end
+
+# Terminate the current block with the overflow trap: when flag is
+# true (the signed op overflowed) execution traps — MirAssert with
+# expected=false is the compiler's conditional-trap terminator (codegen:
+# test/jcc-to-target/UD2·UDF; wasm: eqz/if/unreachable), the SAME
+# mechanism bounds checks and contract asserts use. The continuation
+# block after the assert becomes the lowering's current block, so the
+# op's result is only ever consumed past the check.
+def mir_emit_overflow_assert(inout b: MirBuilder, flag_local: MirLocalId, mir_op: MirBinOp, span: Span) -> Unit
+  let cont_blk = create_block(b)
+  set_terminator(b, MirTerminatorKind::MirAssert {
+    cond: operand_copy_local(flag_local),
+    expected: false,
+    msg: AssertMessage::Overflow(mir_op),
+    target: cont_blk,
+    unwind: Option::None
+  }, span)
+  switch_to_block(b, cont_blk)
+end
+
+# 64-bit signed check (Int/i64/isize — the width the register file
+# actually evaluates). Sign tricks only — every comparison is a plain
+# dominating-condition chain so the future eliminate_bounds_checks-style
+# stripper (TODO above) can prove the flag false from range facts.
+def mir_emit_checked_wide_arith(inout b: MirBuilder, mir_op: MirBinOp, result_ty: Type, left_op: MirOperand, right_op: MirOperand, span: Span) -> MirRvalue
+  let int_ty = Type::Int
+  let l_local = add_temp(b, int_ty, span)
+  push_assign(b, place_local(l_local), MirRvalue { kind: MirRvalueKind::MirCast(CastKind::IntToInt, left_op, int_ty) }, span)
+  let r_local = add_temp(b, int_ty, span)
+  push_assign(b, place_local(r_local), MirRvalue { kind: MirRvalueKind::MirCast(CastKind::IntToInt, right_op, int_ty) }, span)
+  let res_local = add_temp(b, int_ty, span)
+  let op_rvalue = MirRvalue { kind: MirRvalueKind::MirBinOp(mir_op, operand_copy_local(l_local), operand_copy_local(r_local)) }
+  push_assign(b, place_local(res_local), op_rvalue, span)
+  let zero_op = operand_int(0)
+  let neg_l = add_temp(b, Type::Bool, span)
+  push_assign(b, place_local(neg_l), MirRvalue { kind: MirRvalueKind::MirBinOp(MirBinOp::Lt, operand_copy_local(l_local), zero_op) }, span)
+  let neg_r = add_temp(b, Type::Bool, span)
+  push_assign(b, place_local(neg_r), MirRvalue { kind: MirRvalueKind::MirBinOp(MirBinOp::Lt, operand_copy_local(r_local), zero_op) }, span)
+  let neg_res = add_temp(b, Type::Bool, span)
+  push_assign(b, place_local(neg_res), MirRvalue { kind: MirRvalueKind::MirBinOp(MirBinOp::Lt, operand_copy_local(res_local), zero_op) }, span)
+  var flag_local = neg_l
+  match mir_op
+  when MirBinOp::Add then
+    # both operands same sign and the wrapped result's sign differs.
+    let f_l = add_temp(b, Type::Bool, span)
+    push_assign(b, place_local(f_l), MirRvalue { kind: MirRvalueKind::MirBinOp(MirBinOp::Ne, operand_copy_local(neg_l), operand_copy_local(neg_res)) }, span)
+    let f_r = add_temp(b, Type::Bool, span)
+    push_assign(b, place_local(f_r), MirRvalue { kind: MirRvalueKind::MirBinOp(MirBinOp::Ne, operand_copy_local(neg_r), operand_copy_local(neg_res)) }, span)
+    flag_local = add_temp(b, Type::Bool, span)
+    push_assign(b, place_local(flag_local), MirRvalue { kind: MirRvalueKind::MirBinOp(MirBinOp::BitAnd, operand_copy_local(f_l), operand_copy_local(f_r)) }, span)
+    mir_emit_overflow_assert(b, flag_local, mir_op, span)
+  when MirBinOp::Sub then
+    # operands differ in sign AND the wrapped result's sign differs from
+    # the minuend's (a - b overflows only then; a = MIN, b = 0 and
+    # a = -2^62, b = 2^62 — the exact-MIN results — stay clean).
+    let d_neg = add_temp(b, Type::Bool, span)
+    push_assign(b, place_local(d_neg), MirRvalue { kind: MirRvalueKind::MirBinOp(MirBinOp::Ne, operand_copy_local(neg_l), operand_copy_local(neg_r)) }, span)
+    let f_min = add_temp(b, Type::Bool, span)
+    push_assign(b, place_local(f_min), MirRvalue { kind: MirRvalueKind::MirBinOp(MirBinOp::Ne, operand_copy_local(neg_res), operand_copy_local(neg_l)) }, span)
+    flag_local = add_temp(b, Type::Bool, span)
+    push_assign(b, place_local(flag_local), MirRvalue { kind: MirRvalueKind::MirBinOp(MirBinOp::BitAnd, operand_copy_local(d_neg), operand_copy_local(f_min)) }, span)
+    mir_emit_overflow_assert(b, flag_local, mir_op, span)
+  when MirBinOp::Mul then
+    # THE 64-bit product needs the full divide-back probe (the sign-of-
+    # product shortcut is NOT exact here: a wrapped product that lands
+    # back on the product's sign — MIN*MIN -> 0, (2^32+1)*(2^32+5) — is
+    # invisible to a sign test). Divide-back is exact: with b != 0,
+    # r/b == a  <=>  the product fit i64 (a wrapped r/b can never equal
+    # the other factor — the std/alloc.tg layout_array idiom, also the
+    # checked_mul body in std/core.tg). The guards below keep the
+    # divide off the two hardware-trap edges whose behavior diverges
+    # across x86 (idiv #DE) and AArch64 (sdiv defined):
+    #   b == 0  -> product 0, never an overflow (skip the divide);
+    #   b == -1 -> r = wrap(-a): overflow exactly when r == a (a < 0,
+    #              i.e. a == MIN — wrap(-a) == a <=> a in {0, MIN});
+    #              MIN / -1 must never reach the divide.
+    # All other (r, b) pairs divide cleanly on both targets.
+    let b_zero = add_temp(b, Type::Bool, span)
+    push_assign(b, place_local(b_zero), MirRvalue { kind: MirRvalueKind::MirBinOp(MirBinOp::Eq, operand_copy_local(r_local), zero_op) }, span)
+    let b_m1 = add_temp(b, Type::Bool, span)
+    push_assign(b, place_local(b_m1), MirRvalue { kind: MirRvalueKind::MirBinOp(MirBinOp::Eq, operand_copy_local(r_local), operand_int(-1)) }, span)
+    let after_blk = create_block(b)
+    let b_nz_blk = create_block(b)
+    let b_m1_blk = create_block(b)
+    let div_blk = create_block(b)
+    # b == 0: safe (the zero-operand guard); proceed to the b == -1 test
+    # otherwise.
+    set_terminator(b, MirTerminatorKind::MirSwitchInt {
+      op: operand_copy_local(b_zero),
+      targets: Vec::from([SwitchTarget { value: 0, target: b_nz_blk }]),
+      default_target: after_blk
+    }, span)
+    switch_to_block(b, b_nz_blk)
+    set_terminator(b, MirTerminatorKind::MirSwitchInt {
+      op: operand_copy_local(b_m1),
+      targets: Vec::from([SwitchTarget { value: 0, target: div_blk }]),
+      default_target: b_m1_blk
+    }, span)
+    # b == -1 arm: overflow exactly when r == a with a < 0 (a == MIN).
+    switch_to_block(b, b_m1_blk)
+    let m1_neg = add_temp(b, Type::Bool, span)
+    push_assign(b, place_local(m1_neg), MirRvalue { kind: MirRvalueKind::MirBinOp(MirBinOp::Lt, operand_copy_local(l_local), zero_op) }, span)
+    let m1_eq = add_temp(b, Type::Bool, span)
+    push_assign(b, place_local(m1_eq), MirRvalue { kind: MirRvalueKind::MirBinOp(MirBinOp::Eq, operand_copy_local(res_local), operand_copy_local(l_local)) }, span)
+    let m1_flag = add_temp(b, Type::Bool, span)
+    push_assign(b, place_local(m1_flag), MirRvalue { kind: MirRvalueKind::MirBinOp(MirBinOp::BitAnd, operand_copy_local(m1_neg), operand_copy_local(m1_eq)) }, span)
+    set_terminator(b, MirTerminatorKind::MirAssert {
+      cond: operand_copy_local(m1_flag),
+      expected: false,
+      msg: AssertMessage::Overflow(mir_op),
+      target: after_blk,
+      unwind: Option::None
+    }, span)
+    # divide-back arm: q = r / b; overflow when q != a.
+    switch_to_block(b, div_blk)
+    let q_local = add_temp(b, int_ty, span)
+    push_assign(b, place_local(q_local), MirRvalue { kind: MirRvalueKind::MirBinOp(MirBinOp::Div, operand_copy_local(res_local), operand_copy_local(r_local)) }, span)
+    let div_flag = add_temp(b, Type::Bool, span)
+    push_assign(b, place_local(div_flag), MirRvalue { kind: MirRvalueKind::MirBinOp(MirBinOp::Ne, operand_copy_local(q_local), operand_copy_local(l_local)) }, span)
+    set_terminator(b, MirTerminatorKind::MirAssert {
+      cond: operand_copy_local(div_flag),
+      expected: false,
+      msg: AssertMessage::Overflow(mir_op),
+      target: after_blk,
+      unwind: Option::None
+    }, span)
+    # The b == 0 safe path reaches here directly (its terminator is the
+    # MirGoto-free fallthrough of the FIRST switch: the switch's default
+    # arm is after_blk itself, so no goto is needed).
+    switch_to_block(b, after_blk)
+  when _ then ()
+  end
+  MirRvalue { kind: MirRvalueKind::MirCast(CastKind::IntToInt, operand_copy_local(res_local), result_ty) }
+end
+
+# Sub-64-bit signed check (i8/i16/i32): mask the operand payloads,
+# sign-extend them branch-free (u - 2*(u & 2^(w-1)) — no arithmetic
+# shift, whose x86/AArch64 encodings diverge), evaluate in the 64-bit
+# register (the widest width available; a w-bit product can never leave
+# i64), and trap when the exact result leaves the w-bit range.
+def mir_emit_checked_small_arith(inout b: MirBuilder, mir_op: MirBinOp, width: Int, result_ty: Type, left_op: MirOperand, right_op: MirOperand, span: Span) -> MirRvalue
+  let int_ty = Type::Int
+  let mask_c = operand_int((1 << width) - 1)
+  let bias_c = operand_int(1 << (width - 1))
+  let lo_c = operand_int(0 - (1 << (width - 1)))
+  let hi_c = operand_int((1 << (width - 1)) - 1)
+  let raw_l = add_temp(b, int_ty, span)
+  push_assign(b, place_local(raw_l), MirRvalue { kind: MirRvalueKind::MirCast(CastKind::IntToInt, left_op, int_ty) }, span)
+  let raw_r = add_temp(b, int_ty, span)
+  push_assign(b, place_local(raw_r), MirRvalue { kind: MirRvalueKind::MirCast(CastKind::IntToInt, right_op, int_ty) }, span)
+  let u_l = add_temp(b, int_ty, span)
+  push_assign(b, place_local(u_l), MirRvalue { kind: MirRvalueKind::MirBinOp(MirBinOp::BitAnd, operand_copy_local(raw_l), mask_c) }, span)
+  let z_l = add_temp(b, int_ty, span)
+  push_assign(b, place_local(z_l), MirRvalue { kind: MirRvalueKind::MirBinOp(MirBinOp::BitAnd, operand_copy_local(u_l), bias_c) }, span)
+  let d_l = add_temp(b, int_ty, span)
+  push_assign(b, place_local(d_l), MirRvalue { kind: MirRvalueKind::MirBinOp(MirBinOp::Add, operand_copy_local(z_l), operand_copy_local(z_l)) }, span)
+  let s_l = add_temp(b, int_ty, span)
+  push_assign(b, place_local(s_l), MirRvalue { kind: MirRvalueKind::MirBinOp(MirBinOp::Sub, operand_copy_local(u_l), operand_copy_local(d_l)) }, span)
+  let u_r = add_temp(b, int_ty, span)
+  push_assign(b, place_local(u_r), MirRvalue { kind: MirRvalueKind::MirBinOp(MirBinOp::BitAnd, operand_copy_local(raw_r), mask_c) }, span)
+  let z_r = add_temp(b, int_ty, span)
+  push_assign(b, place_local(z_r), MirRvalue { kind: MirRvalueKind::MirBinOp(MirBinOp::BitAnd, operand_copy_local(u_r), bias_c) }, span)
+  let d_r = add_temp(b, int_ty, span)
+  push_assign(b, place_local(d_r), MirRvalue { kind: MirRvalueKind::MirBinOp(MirBinOp::Add, operand_copy_local(z_r), operand_copy_local(z_r)) }, span)
+  let s_r = add_temp(b, int_ty, span)
+  push_assign(b, place_local(s_r), MirRvalue { kind: MirRvalueKind::MirBinOp(MirBinOp::Sub, operand_copy_local(u_r), operand_copy_local(d_r)) }, span)
+  let res_local = add_temp(b, int_ty, span)
+  let op_rvalue = MirRvalue { kind: MirRvalueKind::MirBinOp(mir_op, operand_copy_local(s_l), operand_copy_local(s_r)) }
+  push_assign(b, place_local(res_local), op_rvalue, span)
+  let ge_lo = add_temp(b, Type::Bool, span)
+  push_assign(b, place_local(ge_lo), MirRvalue { kind: MirRvalueKind::MirBinOp(MirBinOp::Ge, operand_copy_local(res_local), lo_c) }, span)
+  let le_hi = add_temp(b, Type::Bool, span)
+  push_assign(b, place_local(le_hi), MirRvalue { kind: MirRvalueKind::MirBinOp(MirBinOp::Le, operand_copy_local(res_local), hi_c) }, span)
+  let in_range = add_temp(b, Type::Bool, span)
+  push_assign(b, place_local(in_range), MirRvalue { kind: MirRvalueKind::MirBinOp(MirBinOp::BitAnd, operand_copy_local(ge_lo), operand_copy_local(le_hi)) }, span)
+  let flag_local = add_temp(b, Type::Bool, span)
+  push_assign(b, place_local(flag_local), MirRvalue { kind: MirRvalueKind::MirUnOp(MirUnOp::Not, operand_copy_local(in_range)) }, span)
+  mir_emit_overflow_assert(b, flag_local, mir_op, span)
+  MirRvalue { kind: MirRvalueKind::MirCast(CastKind::IntToInt, operand_copy_local(res_local), result_ty) }
+end
+
+# The single typed->MIR dispatch for source binary operations: plain
+# MirBinOp rvalue when the operation is outside the signed checked set
+# (comparisons, string concat, unsigned/Float arithmetic, synthesized
+# IR), the checked sequence + MirAssert overflow trap when the RESULT
+# type is a signed integer kind and the op is Add/Sub/Mul. The result
+# type is the typed-tree authority (the checker unified the operands to
+# it), so the operand width is the result width.
+def mir_emit_arith_binop_rvalue(inout b: MirBuilder, mir_op: MirBinOp, result_ty: Type, left_op: MirOperand, right_op: MirOperand, span: Span) -> MirRvalue
+  let checked_op = match mir_op
+    when MirBinOp::Add then true
+    when MirBinOp::Sub then true
+    when MirBinOp::Mul then true
+    when _ then false
+  end
+  if checked_op then
+    let width = mir_signed_arith_width(&result_ty)
+    if width == 64 then
+      mir_emit_checked_wide_arith(b, mir_op, &result_ty, &left_op, &right_op, span)
+    elsif width > 0 then
+      mir_emit_checked_small_arith(b, mir_op, width, &result_ty, &left_op, &right_op, span)
+    else
+      MirRvalue { kind: MirRvalueKind::MirBinOp(mir_op, left_op, right_op) }
+    end
+  else
+    MirRvalue { kind: MirRvalueKind::MirBinOp(mir_op, left_op, right_op) }
+  end
+end
+
+def lr_binary(inout b: MirBuilder, op: BinOp, left: Expr, right: Expr, span: Span, result_ty: Type) -> MirRvalue
   let left_op = lower_expr(b, left, span)
   let right_op = lower_expr(b, right, span)
   let mir_op = lower_binop(op)
-  MirRvalue { kind: MirRvalueKind::MirBinOp(mir_op, left_op, right_op) }
+  mir_emit_arith_binop_rvalue(b, mir_op, &result_ty, &left_op, &right_op, span)
 end
 
 def lr_unary(inout b: MirBuilder, op: UnOp, inner: Expr, span: Span) -> MirRvalue
@@ -10159,7 +10818,9 @@ def lower_expr_to_rvalue(inout b: MirBuilder, expr: Expr, span: Span) -> Result[
     
   elsif kind_name == "ExprBinaryOp" then
     match expr.kind
-    when ExprKind::ExprBinaryOp(op, left, right) then return Result::Ok(lr_binary(b, op, &left, &right, span))
+    when ExprKind::ExprBinaryOp(op, left, right) then
+      let bt_ty = mir_binop_result_type(b, &expr)
+      return Result::Ok(lr_binary(b, op, &left, &right, span, &bt_ty))
     when _ then
       return Result::Err("internal error: expr_kind_name/ExprKind mismatch during MIR lowering")
     end
@@ -14803,6 +15464,16 @@ def format_mir_function(names: Map[Int, String], param_names: Map[Int, String], 
   if func.is_unsafe then out = out + "unsafe " end
   if func.is_async then out = out + "async " end
   if func.is_extern then out = out + "extern \"" + func.extern_abi.clone() + "\" " end
+  # (P1-18) the declared function-attribute hints — rendered for the MIR
+  # dumps so the stamped @inline / @noinline / @cold state is inspectable.
+  if func.attr_inline_hint then out = out + "@inline " end
+  if func.attr_inline_always then out = out + "@inline(always) " end
+  if func.attr_noinline then out = out + "@noinline " end
+  if func.attr_cold then out = out + "@cold " end
+  # (P1-6) the declared floating-point mode — rendered for the MIR dumps
+  # so the stamped @fp(fast) state is inspectable (the strict default
+  # renders as no attribute).
+  if func.fp_fast then out = out + "@fp(fast) " end
 
   out = out + "fn " + func.name.clone() + "("
   var first = true
@@ -14952,7 +15623,15 @@ def format_assert_message(names: Map[Int, String], param_names: Map[Int, String]
   when AssertMessage::BoundsCheck(idx, len) then
     "\"index out of bounds: \" + index=" + format_operand(names, param_names, &idx) + " len=" + format_operand(names, param_names, &len)
   when AssertMessage::Overflow(op) then
-    "\"arithmetic overflow: " + format_binop(op) + "\""
+    # Deterministic, op-specific P1-5 trap diagnostics (the signed
+    # `+`/`-`/`*` overflow traps emit these; see the P1-5 insertion
+    # point above lr_binary).
+    match op
+    when MirBinOp::Add then "\"integer overflow: signed addition\""
+    when MirBinOp::Sub then "\"integer overflow: signed subtraction\""
+    when MirBinOp::Mul then "\"integer overflow: signed multiplication\""
+    when _ then "\"integer overflow\""
+    end
   when AssertMessage::DivisionByZero then "\"division by zero\""
   when AssertMessage::RemainderByZero then "\"remainder by zero\""
   when AssertMessage::NullPointer then "\"null pointer dereference\""
@@ -15199,6 +15878,18 @@ end
 # ———————————————————————————————————————————————————————————————
 # MIR Optimizations
 # ———————————————————————————————————————————————————————————————
+# (P1-6) FP SEMANTICS FIREWALL: the optimization level NEVER enables
+# fast math. opt_level selects only the structural pass set below; every
+# pass is float-semantics-neutral — constant folding evaluates INTEGER
+# constants only (try_fold_binop / extract_int_constant; float constants
+# are never folded or reassociated), GVN merges only bit-identical
+# computations, and no pass reads or writes MirFunction.fp_fast. The
+# function attribute @fp(fast) (stamped at lower_program's PASS 2 — see
+# MirFunction.fp_fast) is the ONLY fp-mode selector in the compiler, and
+# it is consulted solely at codegen — so an -O3 build compiles every
+# unannotated function under the strict IEEE default, never silently
+# under fast math. A future contraction/reassociation/FMA pass must be
+# gated per operation on the emitting function's fp_fast (TODO P1-6).
 
 def optimize_mir(inout program: MirProgram, opt_level: Int) -> Unit
   optimize_mir_verified(program, opt_level, false)
@@ -15213,8 +15904,10 @@ end
 # false) and rely on the pipeline's single post-opt verification.
 #
 # The per-function sub-pass sequence is EXACTLY optimize_function's (DCE ->
-# copy propagation -> constant folding -> [GVN -> LICM -> bounds-check
-# elimination] -> move simplification -> final DCE), executed as program-wide
+# copy propagation -> constant folding -> constant propagation -> dead
+# store elimination -> CFG simplification -> strength reduction -> [GVN ->
+# LICM -> bounds-check elimination] -> move simplification -> final DCE),
+# executed as program-wide
 # BATCHES: the passes are per-function (no cross-function data), so batching
 # preserves the per-function result byte-for-byte while allowing a verifier
 # checkpoint BETWEEN every transformative pass.
@@ -15237,6 +15930,26 @@ def optimize_mir_verified(inout program: MirProgram, opt_level: Int, verify_ever
 
   for f in program.functions do fold_constants(f) end
   if verify_everything then verifier_program_checkpoint(program, "constant folding") end
+
+  for f in program.functions do fold_enum_ctor_reads(f) end
+  if verify_everything then verifier_program_checkpoint(program, "enum-ctor read folding") end
+
+  # (P1-9): constant propagation (with integrated folding of newly literal
+  # ops), dead store elimination, CFG simplification (empty-goto-chain
+  # collapse), and strength reduction (unsigned mul-by-2^k -> shl) — all
+  # local conservative per-function passes at the same level as DCE/copy
+  # propagation/folding above. See the pass banners after fold_constants.
+  for f in program.functions do propagate_constants(f) end
+  if verify_everything then verifier_program_checkpoint(program, "constant propagation") end
+
+  for f in program.functions do eliminate_dead_stores(f) end
+  if verify_everything then verifier_program_checkpoint(program, "dead store elimination") end
+
+  for f in program.functions do simplify_cfg(f) end
+  if verify_everything then verifier_program_checkpoint(program, "CFG simplification") end
+
+  for f in program.functions do strength_reduction(f) end
+  if verify_everything then verifier_program_checkpoint(program, "strength reduction") end
 
   if opt_level >= 2 then
     for f in program.functions do global_value_numbering(f) end
@@ -15294,7 +16007,12 @@ end
 # - Only inline functions with fewer than INLINE_THRESHOLD statements
 # - Don't inline recursive functions
 # - Don't inline extern functions
-# - Inline #[inline] and #[inline(always)] annotated functions
+# - The DECLARED function hints (P1-18) override the size heuristic:
+#   @inline(always) forces inlining (the safety guards above outrank the
+#   hint); @noinline / @inline(never) forbid it. A bare @inline stays
+#   optimizer-driven — the size rules decide.
+# - The call-site guard (call_has_non_read_place_arg) outranks every
+#   hint: such a call always falls back to a real call.
 
 const INLINE_STMT_THRESHOLD: Int = 30
 const INLINE_BLOCK_THRESHOLD: Int = 5
@@ -15410,12 +16128,29 @@ def should_inline(f: MirFunction, recursive_fns: Set[String]) -> Bool
     return false
   end
   
+  # (P1-18): @noinline / @inline(never) — the DECLARED hard exclusion: a
+  # noinline-annotated function is never inlined at any call site,
+  # whatever its size (the hint's contract — std/debug.tg's breakpoint
+  # relies on a real call frame). This outranks even the forced
+  # @inline(always) request.
+  if f.attr_noinline then
+    return false
+  end
+
   # Don't inline recursive functions
   let fn_name = f.name.clone()
   if recursive_fns.contains(&fn_name) then
     return false
   end
   
+  # (P1-18): @inline(always) — the FORCED set: the size thresholds do not
+  # apply. The safety guards above (extern bodies, recursion) and the
+  # call-site non-Read-place-argument guard outrank the hint — forcing is
+  # "wherever the infrastructure allows".
+  if f.attr_inline_always then
+    return true
+  end
+
   # Count statements
   var stmt_count = 0
   for block in f.blocks do
@@ -15970,6 +16705,18 @@ def optimize_function(inout f: MirFunction, opt_level: Int) -> Unit
   
   # Constant folding
   fold_constants(f)
+
+  # Enum-constructor read folding (discriminant/switch folding of inline
+  # enum values — same position as the optimize_mir_verified batch).
+  fold_enum_ctor_reads(f)
+
+  # (P1-9): constant propagation, dead store elimination, CFG
+  # simplification and strength reduction — the same local conservative
+  # set optimize_mir_verified batches (the sequences MUST stay in sync).
+  propagate_constants(f)
+  eliminate_dead_stores(f)
+  simplify_cfg(f)
+  strength_reduction(f)
   
   if opt_level >= 2 then
     # Global Value Numbering — eliminate redundant computations
@@ -16407,137 +17154,2184 @@ def extract_bool_constant(op: MirOperand) -> Option[Bool]
 end
 
 # ———————————————————————————————————————————————————————————————
-# Bounds-Check Elimination
+# Enum-Constructor Read Folding (scalar replacement of small ADTs)
 # ———————————————————————————————————————————————————————————————
 #
-# Removes redundant bounds checks when we can prove the index is within bounds.
-# This optimization uses value range analysis to track known bounds on variables.
+# (P1-11) Enums are lowered INLINE in this compiler: a variant
+# construction (lr_enum_construct / lr_enum_record_construct) emits a
+# MirAggregate(Struct(enum_tid, ["_tag", "0", ...]), [tag, payload ops]),
+# and a match's discriminant read emits MirDiscriminant(scrut_local) plus
+# a MirSwitchInt on that discriminant (lower_match_to_place). This pass
+# folds the constructed-value read path when the construction and the
+# reads sit in the SAME basic block with no intervening write:
 #
-# Cases handled:
-# 1. Index is a constant within 0..len (when len is known)
-# 2. Index was already checked earlier (dominates current check)
-# 3. Loop induction variable with known range
-# 4. Index derived from len (e.g., len-1 is always valid if len > 0)
-
-struct ValueRange
-  min: Option[Int]  # Known lower bound (inclusive)
-  max: Option[Int]  # Known upper bound (inclusive)
-end
-
-def eliminate_bounds_checks(inout f: MirFunction) -> Unit
-  # Track known ranges for each local
-  var ranges: Map[Int, ValueRange] = Map::new()
-  
-  # Track proven assertions (block_id, local_id) -> proven valid
-  var proven_checks: Set[(Int, Int, String)] = Set::new()  # (block_id, local_id, array_local_id)
-  
-  # Iterate through blocks in dominator order
-  let dom_info = compute_dominators(f)
-  let rpo = compute_reverse_postorder(f)
-  
-  # Initialize ranges for constants we can extract
+#   R1 — track a bare local whose in-block store is an enum constructor
+#        aggregate whose FIRST field is the "_tag" constant.
+#   R2 — a MirDiscriminant read of a tracked local folds to the tag
+#        constant (the aggregate's first operand is the discriminant the
+#        lowering wrote; codegen reads the SAME word back, so the fold is
+#        value-exact). The folded constant is remembered for R3.
+#   R3 — a MirSwitchInt terminator whose discriminant operand is a local
+#        with a known folded constant (or a literal constant) folds to an
+#        unconditional goto of the unique matching arm (or the default arm
+#        when no arm matches). The now-unreachable arms are removed by the
+#        later dead-code pass, so `match Some(x) { ... }`-style code stops
+#        building the aggregate and stops branching on the tag.
+#
+# Conservative restrictions:
+#   - the ctor and the reads must be in the SAME block and the local must
+#     not be written in between (any later store to the root — whole or
+#     projected — and any MirRef of the root kills the tracking);
+#   - only Copy payloads are ever forwarded — and in fact payloads are
+#     NEVER forwarded: the per-function passes have no access to the
+#     program's variant table, so the tag constant cannot be mapped to the
+#     downcast VariantId(vid) that pattern-binding reads
+#     (scrut.Variant(vid).Field(j) — bind_match_arm_pattern_locals) use,
+#     and an INLINE enum's payload offsets are variant-specific (the
+#     layout engine's per-variant payload offsets). A same-block payload
+#     read `x = Copy(L.Variant(vid).Field(j))` folds to the ctor's
+#     payload op j ONLY when vid IS the constructed variant — which needs
+#     the tag -> variant table — so downcast payload reads are left
+#     untouched (fold the discriminant + the switch instead; the survivor
+#     arm then reads the payload out of the aggregate it owns). TODO
+#     (exact rule for a program-level pass): with access to the enum's
+#     MirTypeDef variants (discriminant per VariantId), fold a payload
+#     read of L.Variant(vid).Field(j) to ctor op j+1 when the ctor's tag
+#     constant equals vid's discriminant AND every payload op is of a Copy
+#     type (never forward owning payloads — the move would duplicate the
+#     drop).
+def fold_enum_ctor_reads(inout f: MirFunction) -> Unit
   for block in f.blocks do
-    for stmt in block.statements do
-      match stmt.kind
-      when MirStatementKind::MirAssign(place, rvalue) then
-        if place.projections.is_empty() then
-          match extract_int_constant_from_rvalue(&rvalue)
-          when Option::Some(val) then
-            ranges.insert(place.local.id, ValueRange {
-              min: Option::Some(val),
-              max: Option::Some(val)
-            })
-          when Option::None then ()
-          end
-        end
-      when _ then ()
-      end
-    end
-  end
-  
-  # Now eliminate redundant bounds checks
-  for block in f.blocks do
+    var ctor_tags: Map[Int, Int] = Map::new()     # local -> ctor variant tag
+    var discr_consts: Map[Int, Int] = Map::new()  # local -> folded discriminant const
     var new_stmts = Vec::new()
-    
     for stmt in block.statements do
       match stmt.kind
       when MirStatementKind::MirAssign(place, rvalue) then
+        let root = place.local.id
+        var out_rvalue = rvalue
         if place.projections.is_empty() then
-          match extract_int_constant_from_rvalue(&rvalue)
-          when Option::Some(val) then
-            ranges.insert(place.local.id, ValueRange {
-              min: Option::Some(val),
-              max: Option::Some(val)
-            })
-          when Option::None then
-            ranges.remove(place.local.id)
+          # R2: fold a discriminant read of a tracked ctor local.
+          match rvalue.kind
+          when MirRvalueKind::MirDiscriminant(dplace) then
+            if dplace.projections.is_empty() then
+              match ctor_tags.get(dplace.local.id)
+              when Option::Some(tag) then
+                out_rvalue = MirRvalue {
+                  kind: MirRvalueKind::MirMove(MirOperand {
+                    kind: MirOperandKind::MirConstant(MirConstant {
+                      kind: MirConstantKind::MirInt(tag),
+                      ty: Type::Int,
+                      instance: Option::None
+                    })
+                  })
+                }
+                discr_consts.insert(place.local.id, tag)
+              when Option::None then ()
+              end
+            end
+          when _ then ()
           end
         end
-        new_stmts.push(stmt.clone())
+        # A MirRef of a tracked local kills the tracking (the alias could
+        # change the local at the terminator's call).
+        match rvalue.kind
+        when MirRvalueKind::MirRef(ref_place) then
+          ctor_tags.remove(ref_place.local.id)
+          discr_consts.remove(ref_place.local.id)
+        when _ then ()
+        end
+        # Any later store to the root (whole or projected) kills it.
+        ctor_tags.remove(root)
+        discr_consts.remove(root)
+        if place.projections.is_empty() then
+          # R1: track an inline enum constructor store.
+          match out_rvalue.kind
+          when MirRvalueKind::MirAggregate(AggregateKind::Struct(tid, fnames), ops) then
+            if fnames.len() > 0 && fnames[0] == "_tag" && ops.len() > 0 then
+              match extract_int_constant(&ops[0])
+              when Option::Some(tag) then ctor_tags.insert(root, tag)
+              when Option::None then ()
+              end
+            end
+          when MirRvalueKind::MirMove(op) then
+            # Bare copies propagate a folded discriminant value.
+            match op.kind
+            when MirOperandKind::MirCopy(src) then
+              if src.projections.is_empty() then
+                match discr_consts.get(src.local.id)
+                when Option::Some(c) then discr_consts.insert(root, c)
+                when Option::None then ()
+                end
+              end
+            when _ then ()
+            end
+          when _ then ()
+          end
+        end
+        new_stmts.push(MirStatement {
+          kind: MirStatementKind::MirAssign(place, out_rvalue),
+          span: stmt.span
+        })
       when _ then
         new_stmts.push(stmt.clone())
       end
     end
-    
-    # Check terminator for bounds assertions
+    block.statements = new_stmts
+    # R3: fold a switch on a folded (or literal) discriminant constant.
     match block.terminator.kind
-    when MirTerminatorKind::MirAssert(op, expected, msg, success, cleanup) then
-      match msg
-      when AssertMessage::BoundsCheck(index_op, len_op) then
-        # Extract local IDs from operands
-        let index_local = extract_local_from_operand(&index_op)
-        let len_local = extract_local_from_operand(&len_op)
-        match index_local
-        when Option::Some(idx_lid) then
-          match len_local
-          when Option::Some(len_lid) then
-            # Check if we can prove this bounds check
-            if can_prove_bounds_check(idx_lid, len_lid, &ranges, block.id, &proven_checks) then
-              # Replace assertion with unconditional goto to success
-              block.terminator = MirTerminator {
-                kind: MirTerminatorKind::MirGoto(success),
-                span: block.terminator.span.clone()
-              }
-            else
-              # Record this check as proven for dominated blocks
-              let _ = proven_checks.insert((block.id.id, idx_lid.id, len_lid.id.to_string()))
-            end
+    when MirTerminatorKind::MirSwitchInt { op, targets, default_target } then
+      var const_val: Option[Int] = Option::None
+      match op.kind
+      when MirOperandKind::MirCopy(p) then
+        if p.projections.is_empty() then
+          match discr_consts.get(p.local.id)
+          when Option::Some(c) then const_val = Option::Some(c)
           when Option::None then ()
           end
-        when Option::None then ()
+        end
+      when MirOperandKind::MirConstant(c) then
+        match c.kind
+        when MirConstantKind::MirInt(v) then const_val = Option::Some(v)
+        when _ then ()
+        end
+      when _ then ()
+      end
+      match const_val
+      when Option::Some(cv) then
+        var match_target: Option[MirBlockId] = Option::None
+        var match_count = 0
+        for t in targets do
+          if t.value == cv then
+            match_target = Option::Some(t.target)
+            match_count = match_count + 1
+          end
+        end
+        # A duplicate arm value makes the branch ambiguous — keep the switch.
+        if match_count <= 1 then
+          let dest = match match_target
+          when Option::Some(mt) then mt
+          when Option::None then default_target
+          end
+          block.terminator = MirTerminator {
+            kind: MirTerminatorKind::MirGoto(dest),
+            span: block.terminator.span.clone()
+          }
+        end
+      when Option::None then ()
+      end
+    when _ then ()
+    end
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Constant Propagation
+# ———————————————————————————————————————————————————————————————
+#
+# (P1-9) Block-local constant propagation with integrated folding. A plain
+# local that is assigned a scalar constant keeps that exact value until the
+# local is written again; reads of the local (MirCopy of the bare local —
+# value reads only; moves, consumes, refs and projected reads are never
+# substituted) are replaced by the constant, and the now-literal binop/unop
+# statements are folded through the shared folding machinery
+# (try_fold_rvalue / try_fold_binop / try_fold_unop), so a chain of
+# constants ripples to a fixed point in ONE forward sweep per block (no
+# lattice, no cross-block dataflow — a local constant that is written on
+# any other path is simply not tracked here).
+#
+# Soundness rules:
+#   - only value-exact scalar constant kinds are propagated (Int/Bool/
+#     Char/Unit/ZeroSized); floats are excluded so the pass never performs
+#     float arithmetic (the P1-6 FP-semantics firewall — see the banner at
+#     optimize_mir_verified), and strings/statics/fn items are addresses
+#     that are never substituted into value positions;
+#   - a write to a local's ROOT (any MirAssign destination rooted at the
+#     local, projected or bare) kills its tracked constant;
+#   - taking a reference to a tracked local (MirRef) kills it — the alias
+#     can observe or change the local on paths this block-local pass does
+#     not see. MirRef is the only alias creation in the MIR (call-place
+#     arguments and deref stores are terminator-level effects that never
+#     cross a block's statement list, and calls sit in terminators — the
+#     reads THROUGH a ref are reads of the ref local, which is itself never
+#     tracked because it holds a RefInternal value, never a constant);
+#   - folding only ever REPLACES a pure computation by its value: the
+#     overflow-check chains of the P1-5 checked signed arithmetic are
+#     MirAssert terminators computed from the same (bit-identical) result
+#     value the fold preserves, so a folded signed op keeps trapping
+#     exactly when it trapped before (the check reads the stored result,
+#     not the operator).
+#
+# The folding legacy stamps integer results Type::Int regardless of the
+# operation's width; retype_folded_constant restamps a folded integer
+# constant with the DESTINATION local's declared type so the propagated
+# value is type-true end to end.
+
+# The declared type of a local (params are members of f.locals too).
+def mir_opt_local_type(f: MirFunction, lid: Int) -> Option[Type]
+  for l in f.locals do
+    if l.id.id == lid then
+      return Option::Some(l.ty.clone())
+    end
+  end
+  Option::None
+end
+
+# The UNSIGNED integer kinds — the only kinds strength reduction rewrites
+# (the P1-5 checked overflow set is the signed kinds; unsigned arithmetic
+# is modular and carries no MirAssert chain).
+def mir_type_is_unsigned_int(ty: Type) -> Bool
+  match ty
+  when Type::UInt then true
+  when Type::U8 then true
+  when Type::U16 then true
+  when Type::U32 then true
+  when Type::U64 then true
+  when Type::USize then true
+  when _ then false
+  end  end
+end
+
+# Every integer kind (signed and unsigned) — the retype domain for folded
+# integer constants.
+def mir_type_is_int_kind(ty: Type) -> Bool
+  match ty
+  when Type::Int then true
+  when Type::I8 then true
+  when Type::I16 then true
+  when Type::I32 then true
+  when Type::I64 then true
+  when Type::ISize then true
+  when Type::UInt then true
+  when Type::U8 then true
+  when Type::U16 then true
+  when Type::U32 then true
+  when Type::U64 then true
+  when Type::USize then true
+  when _ then false
+  end  end
+end
+
+# Constant kinds eligible for value propagation (see the soundness rules
+# above — value-exact scalars only).
+def constant_propagatable(c: MirConstant) -> Bool
+  match c.kind
+  when MirConstantKind::MirInt(_) then true
+  when MirConstantKind::MirBool(_) then true
+  when MirConstantKind::MirChar(_) then true
+  when MirConstantKind::MirUnit then true
+  when MirConstantKind::MirZeroSized then true
+  when _ then false
+  end  end
+end
+
+# Replace a value read (MirCopy of a BARE tracked local) by the tracked
+# constant. MirMovePlace/MirConsume/MirRead keep their place semantics
+# (a move/consume invalidates the source — substituting a constant would
+# silently drop that invalidation) and projected reads never equal the
+# whole-local constant.
+def substitute_operand_constants(inout op: MirOperand, map: Map[Int, MirConstant]) -> Unit
+  match op.kind
+  when MirOperandKind::MirCopy(place) then
+    if place.projections.is_empty() then
+      match map.get(place.local.id)
+      when Option::Some(c) then
+        op.kind = MirOperandKind::MirConstant(c)
+      when Option::None then ()
+      end
+    end
+  when _ then ()
+  end  end
+end
+
+def substitute_rvalue_constants(inout rv: MirRvalue, map: Map[Int, MirConstant]) -> Unit
+  match rv.kind
+  when MirRvalueKind::MirMove(op) then substitute_operand_constants(&mut op, map)
+  when MirRvalueKind::MirBinOp(_, lhs, rhs) then
+    substitute_operand_constants(&mut lhs, map)
+    substitute_operand_constants(&mut rhs, map)
+  when MirRvalueKind::MirUnOp(_, op) then substitute_operand_constants(&mut op, map)
+  when MirRvalueKind::MirAggregate(_, ops) then
+    for o in ops do
+      substitute_operand_constants(&mut o, map)
+    end
+  when MirRvalueKind::MirCast(_, op, _) then substitute_operand_constants(&mut op, map)
+  when MirRvalueKind::MirRepeat(op, _) then substitute_operand_constants(&mut op, map)
+  when _ then ()
+  end  end
+end
+
+def substitute_call_arg_constants(inout arg: MirCallArg, map: Map[Int, MirConstant]) -> Unit
+  match arg.value
+  when MirCallValue::Value(op) then substitute_operand_constants(&mut op, map)
+  when MirCallValue::Place(_) then ()
+  end  end
+end
+
+def substitute_terminator_constants(inout term: MirTerminator, map: Map[Int, MirConstant]) -> Unit
+  match term.kind
+  when MirTerminatorKind::MirSwitchInt { op: var discr, targets, default_target } then
+    substitute_operand_constants(&mut discr, map)
+  when MirTerminatorKind::MirCall { dest, func: var callee, args: var args_val, success, unwind, intrinsic } then
+    substitute_operand_constants(&mut callee, map)
+    for arg_inner in args_val do
+      substitute_call_arg_constants(&mut arg_inner, map)
+    end
+  when MirTerminatorKind::MirAssert { cond: var cond_op, expected, msg, target, unwind } then
+    substitute_operand_constants(&mut cond_op, map)
+  when _ then ()
+  end  end
+end
+
+# Restamp a folded integer constant with the destination's declared type.
+# The fold result is returned unchanged when no restamp applies.
+def retype_folded_constant(rv: MirRvalue, dest_ty: Type) -> MirRvalue
+  match rv.kind
+  when MirRvalueKind::MirMove(op) then
+    match op.kind
+    when MirOperandKind::MirConstant(c) then
+      match c.kind
+      when MirConstantKind::MirInt(value) then
+        if mir_type_is_int_kind(&dest_ty) then
+          return MirRvalue {
+            kind: MirRvalueKind::MirMove(MirOperand {
+              kind: MirOperandKind::MirConstant(MirConstant {
+                kind: MirConstantKind::MirInt(value),
+                ty: dest_ty,
+                instance: Option::None
+              })
+            })
+          }
         end
       when _ then ()
       end
     when _ then ()
     end
-    
+  when _ then ()
+  end
+  rv
+end
+
+def propagate_constants(inout f: MirFunction) -> Unit
+  for block in f.blocks do
+    var const_map: Map[Int, MirConstant] = Map::new()
+    var new_stmts = Vec::new()
+    for stmt in block.statements do
+      match stmt.kind
+      when MirStatementKind::MirAssign(place, rvalue) then
+        # A MirRef anywhere in the rvalue kills the referenced local's
+        # tracked constant (alias escape — see the banner above).
+        match rvalue.kind
+        when MirRvalueKind::MirRef(ref_place) then
+          const_map.remove(ref_place.local.id)
+        when _ then ()
+        end
+        # Substitute tracked constants into the value reads.
+        substitute_rvalue_constants(&mut rvalue, &const_map)
+        # Fold a (now) literal binop/unop through the shared machinery —
+        # only for BARE destinations (a projected store's folded result
+        # would need the field's type, which this pass does not chase).
+        var out_rvalue = rvalue
+        if place.projections.is_empty() then
+          match try_fold_rvalue(&rvalue)
+          when Option::Some(folded) then
+            out_rvalue = folded
+          when Option::None then ()
+          end
+        end
+        # Restamp a folded integer constant with the destination's type.
+        if place.projections.is_empty() then
+          match mir_opt_local_type(f, place.local.id)
+          when Option::Some(dty) then
+            out_rvalue = retype_folded_constant(out_rvalue, dty)
+          when Option::None then ()
+          end
+        end
+        # The store replaces the local's value — the tracked entry (if
+        # any) is stale.
+        const_map.remove(place.local.id)
+        # Track a freshly stored scalar constant for later reads in this
+        # block.
+        if place.projections.is_empty() then
+          match out_rvalue.kind
+          when MirRvalueKind::MirMove(op) then
+            match op.kind
+            when MirOperandKind::MirConstant(c) then
+              if constant_propagatable(&c) then
+                const_map.insert(place.local.id, c)
+              end
+            when _ then ()
+            end
+          when _ then ()
+          end
+        end
+        new_stmts.push(MirStatement {
+          kind: MirStatementKind::MirAssign(place, out_rvalue),
+          span: stmt.span
+        })
+      when MirStatementKind::MirContractCheck(contract, op) then
+        substitute_operand_constants(&mut op, &const_map)
+        new_stmts.push(MirStatement {
+          kind: MirStatementKind::MirContractCheck(contract, op),
+          span: stmt.span
+        })
+      when MirStatementKind::MirEffectRecord(name, op) then
+        substitute_operand_constants(&mut op, &const_map)
+        new_stmts.push(MirStatement {
+          kind: MirStatementKind::MirEffectRecord(name, op),
+          span: stmt.span
+        })
+      when MirStatementKind::MirEffectPerform(eid, op_index, name, payload_ptr, result_ptr) then
+        substitute_operand_constants(&mut payload_ptr, &const_map)
+        substitute_operand_constants(&mut result_ptr, &const_map)
+        new_stmts.push(MirStatement {
+          kind: MirStatementKind::MirEffectPerform(eid, op_index, name, payload_ptr, result_ptr),
+          span: stmt.span
+        })
+      when MirStatementKind::MirEffectFrameEnter(eid, op_count, bitmap, name, env_ptr) then
+        substitute_operand_constants(&mut env_ptr, &const_map)
+        new_stmts.push(MirStatement {
+          kind: MirStatementKind::MirEffectFrameEnter(eid, op_count, bitmap, name, env_ptr),
+          span: stmt.span
+        })
+      when _ then
+        new_stmts.push(stmt.clone())
+      end
+    end
+    block.statements = new_stmts
+    # The terminator executes after every statement of the block — the
+    # block-final map is the one that applies.
+    substitute_terminator_constants(&mut block.terminator, &const_map)
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Dead Store Elimination
+# ———————————————————————————————————————————————————————————————
+#
+# (P1-9) Whole-local dead store elimination. A local whose value is NEVER
+# read anywhere in the function (and is never the target of a MirDeinit, a
+# call destination, or a reference) is fully dead: every store to it can be
+# removed. The soundness argument is the drop-chain invariant of this IR:
+# an overwrite or scope-exit drop of a live OWNING value is materialized as
+# an explicit MirDeinit terminator chain (lower_assign_drop_chain /
+# emit_cfg_deinit_returns) BEFORE the overwriting store — so when NO
+# MirDeinit anywhere in the function mentions the local, no value ever
+# stored into it is dropped anywhere: the stored values are either
+# trivially-droppable (their stores are pure-value writes) or live only on
+# paths that terminate the process (MirAbort/MirUnreachable), where no
+# drop ever runs either way. Deleting such stores changes nothing
+# observable.
+#
+# Conservative restrictions:
+#   - the local must have NO read anywhere (operand reads, MirRef bases,
+#     discriminant/len places, phi sources, place-valued call arguments —
+#     a callee could read or write through a place argument), no MirDeinit
+#     on it (its values are never dropped, see above), no call destination
+#     writes, and it must not be a parameter;
+#   - local 0 is the function's RETURN PLACE (start_function's "_ret"
+#     convention — locals[0] holds the value MirReturn leaves behind): its
+#     stores are the function's result even though no statement reads the
+#     slot, and are NEVER eliminated;
+#   - a projected store (field/element/deref write) rooted at the local,
+#     or a store whose rvalue carries a side effect (a MirConsume — the
+#     invalidation must run), disqualifies the local entirely — only bare,
+#     pure-value stores of fully-dead locals are deleted;
+#   - a store whose rvalue reads the local itself disqualifies it (the
+#     self-read is counted by the read scan — conservative).
+#
+# MirStorageLive/MirStorageDead markers for an eliminated local are left
+# in place (stack-slot bookkeeping only; the verifier accepts them).
+
+def collect_operand_read(op: MirOperand, inout set: Set[Int]) -> Unit
+  match op.kind
+  when MirOperandKind::MirCopy(place) then set.insert(place.local.id)
+  when MirOperandKind::MirMovePlace(place) then set.insert(place.local.id)
+  when MirOperandKind::MirRead(place) then set.insert(place.local.id)
+  when MirOperandKind::MirConsume(place) then set.insert(place.local.id)
+  when _ then ()
+  end  end
+end
+
+def collect_rvalue_reads(rv: MirRvalue, inout set: Set[Int]) -> Unit
+  match rv.kind
+  when MirRvalueKind::MirMove(op) then collect_operand_read(&op, set)
+  when MirRvalueKind::MirRef(place) then set.insert(place.local.id)
+  when MirRvalueKind::MirAggregate(_, ops) then
+    for op in ops do
+      collect_operand_read(&op, set)
+    end
+  when MirRvalueKind::MirBinOp(_, lhs, rhs) then
+    collect_operand_read(&lhs, set)
+    collect_operand_read(&rhs, set)
+  when MirRvalueKind::MirUnOp(_, op) then collect_operand_read(&op, set)
+  when MirRvalueKind::MirDiscriminant(place) then set.insert(place.local.id)
+  when MirRvalueKind::MirLen(place) then set.insert(place.local.id)
+  when MirRvalueKind::MirCast(_, op, _) then collect_operand_read(&op, set)
+  when MirRvalueKind::MirRepeat(op, _) then collect_operand_read(&op, set)
+  when MirRvalueKind::MirPhi(entries) then
+    for entry in entries do
+      set.insert(entry.1.id)
+    end
+  end  end
+end
+
+# (P1-8) Call-argument kill refinement on top of the whole-local pass. A
+# call argument carries an AccessEffect (the typed authority — see
+# call_arg_effect / convention_access_effect at lowering): the MIR-level
+# effects map Read=let, Modify=inout, Consume=sink, Initialize=set. The
+# SOUND, LOCAL use of the effects for store elimination:
+#
+#   SET (Initialize) args on a BARE local: the callee treats the slot as
+#   UNINITIALIZED — it never reads the incoming content. The call is
+#   therefore NOT a read of the local, and a local whose only reads are
+#   set args is fully dead: every store to it is removed (the callee
+#   overwrites the slot before any read of it can happen — the pass-3
+#   whole-local rule).
+#
+#   SINK (Consume) args on a BARE local: the callee takes ownership of the
+#   local's CURRENT value — the call IS a read (the last one: after it the
+#   local is dead until re-stored, and valid MIR never reads it before the
+#   re-store). The last store before the call is live; every earlier store
+#   that is overwritten before any read is dead. Pass 4 deletes exactly
+#   those stores when the local's stores are all bare, pure, and confined
+#   to a single block (the exact liveness rule: a store is deleted iff the
+#   local is not live after it, with live-ness seeded from every consume
+#   site reachable from the store block's end and from the store block's
+#   own consume terminator).
+#
+# TODO (exact rule, deliberately NOT implemented): forwarding or dead-
+# store reasoning THROUGH inout (Modify) and let (Read) place arguments
+# would need a may-alias/pointer analysis — a callee holding a place may
+# retain and use it beyond the call, and inout args are both read and
+# written — so Modify/Read place arguments keep counting as genuine reads
+# (the conservative status quo). By-value scalar locals cannot alias (they
+# have no address), which is exactly why the sink/set rules above are
+# sound; anything more general must wait for a real alias model.
+
+def mir_operand_bare_root(op: MirOperand) -> Option[Int]
+  match op.kind
+  when MirOperandKind::MirCopy(p) then
+    if p.projections.is_empty() then Option::Some(p.local.id) else Option::None end
+  when MirOperandKind::MirMovePlace(p) then
+    if p.projections.is_empty() then Option::Some(p.local.id) else Option::None end
+  when MirOperandKind::MirRead(p) then
+    if p.projections.is_empty() then Option::Some(p.local.id) else Option::None end
+  when MirOperandKind::MirConsume(p) then
+    if p.projections.is_empty() then Option::Some(p.local.id) else Option::None end
+  when _ then Option::None
+  end
+end
+
+# Classify a call argument's reads. genuine = a read that keeps stores
+# alive (Read/Modify effects — conservative for Modify; place-valued args
+# with any other shape); init_kills = locals passed by SET on a bare
+# operand (never read by the callee); consume_kills = locals passed by
+# SINK on a bare operand (read AT the call — the local's final read);
+# consume_blocks records the block of each consume kill for pass 4.
+def collect_call_arg_read(arg: MirCallArg, block_id: Int, inout genuine: Set[Int], inout init_kills: Set[Int], inout consume_kills: Set[Int], inout consume_blocks: Map[Int, Set[Int]]) -> Unit
+  match arg.value
+  when MirCallValue::Place(p) then
+    match arg.effect
+    when AccessEffect::Read then genuine.insert(p.local.id)
+    when AccessEffect::Modify then genuine.insert(p.local.id)
+    when AccessEffect::Initialize then
+      if p.projections.is_empty() then
+        init_kills.insert(p.local.id)
+      else
+        genuine.insert(p.local.id)
+      end
+    when AccessEffect::Consume then
+      if p.projections.is_empty() then
+        consume_kills.insert(p.local.id)
+        match consume_blocks.get(p.local.id)
+        when Option::Some(ids) then
+          var new_ids = ids
+          new_ids.insert(block_id)
+          consume_blocks.insert(p.local.id, new_ids)
+        when Option::None then
+          var s = Set::new()
+          s.insert(block_id)
+          consume_blocks.insert(p.local.id, s)
+        end
+      else
+        genuine.insert(p.local.id)
+      end
+    end
+  when MirCallValue::Value(op) then
+    match arg.effect
+    when AccessEffect::Read then collect_operand_read(&op, &mut genuine)
+    when AccessEffect::Modify then collect_operand_read(&op, &mut genuine)
+    when AccessEffect::Initialize then
+      match mir_operand_bare_root(&op)
+      when Option::Some(lid) then init_kills.insert(lid)
+      when Option::None then collect_operand_read(&op, &mut genuine)
+      end
+    when AccessEffect::Consume then
+      match mir_operand_bare_root(&op)
+      when Option::Some(lid) then
+        consume_kills.insert(lid)
+        match consume_blocks.get(lid)
+        when Option::Some(ids) then
+          var new_ids = ids
+          new_ids.insert(block_id)
+          consume_blocks.insert(lid, new_ids)
+        when Option::None then
+          var s = Set::new()
+          s.insert(block_id)
+          consume_blocks.insert(lid, s)
+        end
+      when Option::None then collect_operand_read(&op, &mut genuine)
+      end
+    end
+  end
+end
+
+def collect_terminator_reads(term: MirTerminator, block_id: Int, inout genuine: Set[Int], inout init_kills: Set[Int], inout consume_kills: Set[Int], inout consume_blocks: Map[Int, Set[Int]]) -> Unit
+  match term.kind
+  when MirTerminatorKind::MirSwitchInt { op, targets, default_target } then
+    collect_operand_read(&op, &mut genuine)
+  when MirTerminatorKind::MirCall { dest, func, args, success, unwind, intrinsic } then
+    collect_operand_read(&func, &mut genuine)
+    for arg in args do
+      collect_call_arg_read(&arg, block_id, &mut genuine, &mut init_kills, &mut consume_kills, &mut consume_blocks)
+    end
+  when MirTerminatorKind::MirAssert { cond, expected, msg, target, unwind } then
+    collect_operand_read(&cond, &mut genuine)
+    # a BoundsCheck message carries the index/len operands the trap
+    # diagnostic formats when the check FAILS — those values are read at
+    # runtime and keep their locals alive for dead-store elimination
+    match msg
+    when AssertMessage::BoundsCheck(index_op, len_op) then
+      collect_operand_read(&index_op, &mut genuine)
+      collect_operand_read(&len_op, &mut genuine)
+    when _ then ()
+    end
+  when _ then ()
+  end
+end
+
+def eliminate_dead_stores(inout f: MirFunction) -> Unit
+  var param_set: Set[Int] = Set::new()
+  for p in f.params do
+    param_set.insert(p.id.id)
+  end
+  # local 0 is the function's return place — its stores are the result.
+  param_set.insert(0)
+
+  var read_set: Set[Int] = Set::new()
+  var drop_set: Set[Int] = Set::new()
+  var calldest_set: Set[Int] = Set::new()
+  var disqual_set: Set[Int] = Set::new()
+  # (P1-8) call-argument kill classification (see the banner above).
+  var init_kill_set: Set[Int] = Set::new()
+  var consume_kill_set: Set[Int] = Set::new()
+  var consume_blocks: Map[Int, Set[Int]] = Map::new()
+
+  # PASS 1 — collect the whole-function facts.
+  for block in f.blocks do
+    for stmt in block.statements do
+      match stmt.kind
+      when MirStatementKind::MirAssign(place, rvalue) then
+        if !place.projections.is_empty() then
+          # a projected store is not eliminable — its root local cannot
+          # be treated as fully dead
+          disqual_set.insert(place.local.id)
+        else
+          if rvalue_has_side_effect(&rvalue) then
+            # a consume-bearing store must stay (source invalidation)
+            disqual_set.insert(place.local.id)
+          end
+        end
+        collect_rvalue_reads(&rvalue, &mut read_set)
+      when MirStatementKind::MirContractCheck(_, op) then
+        collect_operand_read(&op, &mut read_set)
+      when MirStatementKind::MirEffectRecord(_, op) then
+        collect_operand_read(&op, &mut read_set)
+      when MirStatementKind::MirEffectPerform(_, _, _, payload_ptr, result_ptr) then
+        collect_operand_read(&payload_ptr, &mut read_set)
+        collect_operand_read(&result_ptr, &mut read_set)
+      when MirStatementKind::MirEffectFrameEnter(_, _, _, _, env_ptr) then
+        collect_operand_read(&env_ptr, &mut read_set)
+      when _ then ()
+      end
+    end
+    collect_terminator_reads(&block.terminator, block.id.id, &mut read_set, &mut init_kill_set, &mut consume_kill_set, &mut consume_blocks)
+    match block.terminator.kind
+    when MirTerminatorKind::MirDeinit { place, deinit_fn, target, unwind } then
+      drop_set.insert(place.local.id)
+    when MirTerminatorKind::MirCall { dest, func, args, success, unwind, intrinsic } then
+      calldest_set.insert(dest.local.id)
+    when _ then ()
+    end
+  end
+
+  # PASS 2 — a local is eligible when none of the exclusion facts hold.
+  # A local with a SINK (consume) call argument is NOT eligible — the sink
+  # reads the current value, so its stores may feed the call (pass 4
+  # deletes exactly the non-feeding ones). A local whose only reads are
+  # SET (init) arguments IS eligible: the callee never reads the slot.
+  var eligible: Map[Int, Bool] = Map::new()
+  for l in f.locals do
+    let lid = l.id.id
+    if !param_set.contains(&lid) &&
+       !read_set.contains(&lid) &&
+       !consume_kill_set.contains(&lid) &&
+       !drop_set.contains(&lid) &&
+       !calldest_set.contains(&lid) &&
+       !disqual_set.contains(&lid) then
+      eligible.insert(lid, true)
+    end
+  end
+
+  # PASS 3 — delete every bare store to an eligible local.
+  for block in f.blocks do
+    var new_stmts = Vec::new()
+    for stmt in block.statements do
+      var keep = true
+      match stmt.kind
+      when MirStatementKind::MirAssign(place, _) then
+        if place.projections.is_empty() then
+          match eligible.get(place.local.id)
+          when Option::Some(_) then keep = false
+          when Option::None then ()
+          end
+        end
+      when _ then ()
+      end
+      if keep then
+        new_stmts.push(stmt.clone())
+      end
+    end
     block.statements = new_stmts
   end
-  
-  # Range propagation for loop induction variables
-  propagate_loop_ranges(f, &mut ranges)
-  
-  # Second pass with better range information
-  for block in f.blocks do
-    match block.terminator.kind
-    when MirTerminatorKind::MirAssert(op, expected, msg, success, cleanup) then
-      match msg
-      when AssertMessage::BoundsCheck(index_op, len_op) then
-        let index_local = extract_local_from_operand(&index_op)
-        let len_local = extract_local_from_operand(&len_op)
-        match index_local
-        when Option::Some(idx_lid) then
-          match len_local
-          when Option::Some(len_lid) then
-            if can_prove_bounds_check(idx_lid, len_lid, &ranges, block.id, &proven_checks) then
-              block.terminator = MirTerminator {
-                kind: MirTerminatorKind::MirGoto(success),
-                span: block.terminator.span.clone()
-              }
+
+  # PASS 4 — (P1-8) the sink-kill ordered refinement. Candidates: locals
+  # whose only reads are bare SINK call arguments (no genuine reads, no
+  # exclusion facts) and whose stores are all bare, pure, and confined to
+  # one block. A store is dead iff the local is not live after it; liveness
+  # is seeded from every consume site reachable from the store block's end
+  # (and the store block's own consume terminator), then threaded backward
+  # through the block (a store makes earlier stores dead; a live store is
+  # the one whose value reaches a read).
+  for lid in consume_kill_set do
+    if param_set.contains(&lid) ||
+       read_set.contains(&lid) ||
+       drop_set.contains(&lid) ||
+       calldest_set.contains(&lid) ||
+       disqual_set.contains(&lid) then
+      next
+    end
+    var store_block: Option[Int] = Option::None
+    var store_ok = true
+    for block in f.blocks do
+      if !store_ok then
+        break
+      end
+      for stmt in block.statements do
+        if !store_ok then
+          break
+        end
+        match stmt.kind
+        when MirStatementKind::MirAssign(place, _) then
+          if place.local.id == lid && place.projections.is_empty() then
+            match store_block
+            when Option::Some(sb) then
+              if sb != block.id.id then
+                store_ok = false
+              end
+            when Option::None then store_block = Option::Some(block.id.id)
+            end
+          end
+        when _ then ()
+        end
+      end
+    end
+    if !store_ok then
+      next
+    end
+    match store_block
+    when Option::Some(sb) then
+      # live_out of the store block: is a consume site reachable from the
+      # block's end (or is the block itself a consume site)?
+      var live_seed = false
+      var consume_sites: Set[Int] = Set::new()
+      match consume_blocks.get(lid)
+      when Option::Some(sites) then consume_sites = sites
+      when Option::None then ()
+      end
+      if consume_sites.contains(&sb) then
+        live_seed = true
+      end
+      match get_block(f, MirBlockId { id: sb })
+      when Option::Some(sb_block) then
+        var visited: Set[Int] = Set::new()
+        var work = Vec::new()
+        for succ_id in terminator_successor_ids(&sb_block.terminator) do
+          work.push(succ_id)
+        end
+        while !work.is_empty() && !live_seed do
+          match work.pop()
+          when Option::Some(bid) then
+            if visited.contains(&bid) then
+              ()
+            else
+              visited.insert(bid)
+              if consume_sites.contains(&bid) then
+                live_seed = true
+              else
+                match get_block(f, MirBlockId { id: bid })
+                when Option::Some(block) then
+                  for succ_id in terminator_successor_ids(&block.terminator) do
+                    work.push(succ_id)
+                  end
+                when Option::None then ()
+                end
+              end
             end
           when Option::None then ()
           end
+        end
+      when Option::None then ()
+      end
+      # Delete the dead stores of the block by reverse scan.
+      match get_block(f, MirBlockId { id: sb })
+      when Option::Some(sb_block) then
+        var live = live_seed
+        var keep_stmts = Vec::new()
+        var si = sb_block.statements.len()
+        while si > 0 do
+          si = si - 1
+          var keep = true
+          match sb_block.statements[si].kind
+          when MirStatementKind::MirAssign(place, _) then
+            if place.local.id == lid && place.projections.is_empty() then
+              if live then
+                # this store feeds a later read — keep it; earlier stores
+                # are overwritten by it and are dead
+                live = false
+              else
+                keep = false
+              end
+            end
+          when _ then ()
+          end
+          if keep then
+            keep_stmts.push(sb_block.statements[si].clone())
+          end
+        end
+        # keep_stmts was built in reverse order — restore the order.
+        var ordered = Vec::new()
+        var ki = keep_stmts.len()
+        while ki > 0 do
+          ki = ki - 1
+          ordered.push(keep_stmts[ki].clone())
+        end
+        match get_block_index(f, MirBlockId { id: sb })
+        when Option::Some(idx) then f.blocks[idx].statements = ordered
         when Option::None then ()
+        end
+      when Option::None then ()
+      end
+    when Option::None then ()
+    end
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# CFG Simplification
+# ———————————————————————————————————————————————————————————————
+#
+# (P1-9) Collapse chains of EMPTY blocks that end in an unconditional
+# goto, redirecting every successor edge (goto, switch arm, call
+# success/unwind, assert target/unwind, deinit target/unwind) past the
+# merged blocks. An empty block carries no statements — merging it changes
+# no execution order and skips no effect (there are no statements between
+# the edge and the goto to lose). Conservative restrictions:
+#   - only blocks with an EMPTY statement list are merged (a block holding
+#     MirStorageLive/MirStorageDead/Nop markers is not "empty" for this
+#     pass);
+#   - the entry block is never merged;
+#   - a natural-loop header is never merged (its back-edge structure must
+#     survive; the natural-loop machinery of loop_invariant_code_motion is
+#     reused);
+#   - an empty-block CYCLE is an empty infinite loop — merging its members
+#     would erase a hang, so every member of a cycle is excluded;
+#   - blocks that become unreachable after the edge redirection are left
+#     for the DCE pass (eliminate_dead_code), which removes every
+#     unreachable block regardless of contents.
+#
+# Unreachable-block elimination itself (blocks with no predecessors,
+# including blocks that end in MirUnreachable/MirAbort) is the job of
+# eliminate_dead_code's entry-reachability sweep — this pass only removes
+# the reachable empty-goto blocks it merges.
+
+# The goto target of a block with no statements, when it is a plain
+# unconditional goto to a DIFFERENT block and the block is not the entry.
+# Option::None for every other shape — such blocks are never merged.
+def cfg_empty_goto_target(block: MirBlock, entry_id: Int) -> Option[Int]
+  if block.id.id == entry_id then
+    return Option::None
+  end
+  if !block.statements.is_empty() then
+    return Option::None
+  end
+  match block.terminator.kind
+  when MirTerminatorKind::MirGoto(target) then
+    if target.id == block.id.id then Option::None else Option::Some(target.id) end
+  when _ then Option::None
+  end  end
+end
+
+# Follow a chain of removable empty-goto blocks to the first block that is
+# NOT being removed (the hop cap guards a malformed cycle; the cycle
+# exclusion above keeps chains acyclic in practice).
+def cfg_resolve_target(target_id: Int, removable: Set[Int], goto_target: Map[Int, Int]) -> Int
+  var current = target_id
+  var hops = 0
+  while hops < 64 do
+    if !removable.contains(&current) then
+      return current
+    end
+    match goto_target.get(current)
+    when Option::Some(next_id) then
+      if next_id == current then
+        return current
+      end
+      current = next_id
+    when Option::None then
+      return current
+    end
+    hops = hops + 1
+  end
+  current
+end
+
+# Rewrite EVERY successor edge of a terminator that points at from_id to
+# point at to_id. The older redirect_terminator_edge (used by LICM's
+# preheader insertion) covers only MirGoto/MirSwitchInt; the
+# call/assert/deinit successors are exactly the edges this CFG pass must
+# rewrite too.
+def redirect_terminator_successor(inout term: MirTerminator, from_id: Int, to_id: Int) -> Unit
+  match term.kind
+  when MirTerminatorKind::MirGoto(target) then
+    if target.id == from_id then
+      term.kind = MirTerminatorKind::MirGoto(MirBlockId { id: to_id })
+    end
+  when MirTerminatorKind::MirSwitchInt(op, targets, default_target) then
+    var new_targets = Vec::new()
+    for t in targets do
+      if t.target.id == from_id then
+        new_targets.push(SwitchTarget { value: t.value, target: MirBlockId { id: to_id } })
+      else
+        new_targets.push(t)
+      end
+    end
+    let new_fallback = if default_target.id == from_id then MirBlockId { id: to_id } else default_target end
+    term.kind = MirTerminatorKind::MirSwitchInt { op: op, targets: new_targets, default_target: new_fallback }
+  when MirTerminatorKind::MirCall { dest, func, args, success, unwind, intrinsic } then
+    let new_success = if success.id == from_id then MirBlockId { id: to_id } else success end
+    let new_unwind = match unwind
+      when Option::Some(uw) then
+        if uw.id == from_id then Option::Some(MirBlockId { id: to_id }) else Option::Some(uw) end
+      when Option::None then Option::None
+      end
+    term.kind = MirTerminatorKind::MirCall { dest: dest, func: func, args: args, success: new_success, unwind: new_unwind, intrinsic: intrinsic }
+  when MirTerminatorKind::MirAssert { cond, expected, msg, target, unwind } then
+    let new_target = if target.id == from_id then MirBlockId { id: to_id } else target end
+    let new_unwind = match unwind
+      when Option::Some(uw) then
+        if uw.id == from_id then Option::Some(MirBlockId { id: to_id }) else Option::Some(uw) end
+      when Option::None then Option::None
+      end
+    term.kind = MirTerminatorKind::MirAssert { cond: cond, expected: expected, msg: msg, target: new_target, unwind: new_unwind }
+  when MirTerminatorKind::MirDeinit { place, deinit_fn, target, unwind } then
+    let new_target = if target.id == from_id then MirBlockId { id: to_id } else target end
+    let new_unwind = match unwind
+      when Option::Some(uw) then
+        if uw.id == from_id then Option::Some(MirBlockId { id: to_id }) else Option::Some(uw) end
+      when Option::None then Option::None
+      end
+    term.kind = MirTerminatorKind::MirDeinit { place: place, deinit_fn: deinit_fn, target: new_target, unwind: new_unwind }
+  when _ then ()
+  end  end
+end
+
+def simplify_cfg(inout f: MirFunction) -> Unit
+  # Compute the natural-loop header ids (loop headers are never merged).
+  let loops = find_natural_loops(f)
+  var header_set: Set[Int] = Set::new()
+  for loop_info in loops do
+    header_set.insert(loop_info.header.id)
+  end
+
+  # The merge is a fixpoint: each pass removes at least one block (or
+  # nothing remains to do), and redirecting edges can never create new
+  # empty-goto blocks — the cap is a defensive bound on pathological
+  # chains.
+  var pass = 0
+  while pass < 16 do
+    pass = pass + 1
+
+    # Identify this iteration's mergeable empty-goto blocks.
+    var removable: Set[Int] = Set::new()
+    var goto_target: Map[Int, Int] = Map::new()
+    for block in f.blocks do
+      if !header_set.contains(&block.id.id) then
+        match cfg_empty_goto_target(&block, f.entry_block.id)
+        when Option::Some(target_id) then
+          removable.insert(block.id.id)
+          goto_target.insert(block.id.id, target_id)
+        when Option::None then ()
+        end
+      end
+    end
+
+    # Empty-block CYCLE guard: an empty-block cycle is an empty infinite
+    # loop — merging its members away would erase a hang. Every block
+    # whose goto chain revisits a block is part of such a cycle; exclude
+    # all of its members from removal.
+    var cycle: Set[Int] = Set::new()
+    for cand_id in removable do
+      if !cycle.contains(&cand_id) then
+        var seen: Set[Int] = Set::new()
+        var cur = cand_id
+        var hops = 0
+        var cyclic = false
+        while hops < 64 do
+          hops = hops + 1
+          if seen.contains(&cur) then
+            cyclic = true
+            break
+          end
+          seen.insert(cur)
+          match goto_target.get(cur)
+          when Option::Some(next_id) then cur = next_id
+          when Option::None then break
+          end
+        end
+        if cyclic then
+          for s in seen do
+            cycle.insert(s)
+          end
+        end
+      end
+    end
+    for cid in cycle do
+      removable.remove(&cid)
+    end
+
+    if removable.is_empty() then
+      break
+    end
+
+    # Redirect every successor edge that points at a removable block to
+    # its final surviving target.
+    var idx = 0
+    while idx < f.blocks.len() do
+      if !removable.contains(&f.blocks[idx].id.id) then
+        let succ_ids = terminator_successor_ids(&f.blocks[idx].terminator)
+        var s_idx = 0
+        while s_idx < succ_ids.len() do
+          let succ = succ_ids[s_idx]
+          if removable.contains(&succ) then
+            let resolved = cfg_resolve_target(succ, &removable, &goto_target)
+            redirect_terminator_successor(&mut f.blocks[idx].terminator, succ, resolved)
+          end
+          s_idx = s_idx + 1
+        end
+      end
+      idx = idx + 1
+    end
+
+    # Drop the merged blocks (mirror eliminate_dead_code's rebuild).
+    var survivors = Vec::new()
+    for block in f.blocks do
+      if !removable.contains(&block.id.id) then
+        survivors.push(block.clone())
+      end
+    end
+    f.blocks = survivors
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Strength Reduction
+# ———————————————————————————————————————————————————————————————
+#
+# (P1-9) Multiply by a literal power of two on an UNSIGNED integer kind
+# folds to a shift-left: x * 2^k and x << k are bit-exact for unsigned
+# modular arithmetic at every width (both wrap identically), and unsigned
+# multiplication carries no overflow trap — the P1-5 checked set (the
+# MirAssert Overflow chains emitted at lowering) covers the SIGNED kinds
+# only. SIGNED kinds are deliberately never folded: the checked lowering
+# of a signed multiply keeps its MirAssert chain bound to the multiply's
+# exact result value, and folding signed to shift-left would change which
+# statements the chain reads — skipping signed entirely is the
+# conservative call (per the P1-5 audit note, prefer skipping signed).
+# Float multiplication is never folded (no fast-math implication is ever
+# made by an optimizer pass).
+
+# Option::Some(k) when v == 2^k with k >= 1 (multiplication by 1 is left
+# alone); Option::None otherwise (non-positive, non-power-of-two, or the
+# 2^63 bit pattern — a negative Int — which is skipped conservatively).
+def constant_power_of_two_shift(v: Int) -> Option[Int]
+  if v <= 1 then
+    return Option::None
+  end
+  var probe = v
+  var k = 0
+  while probe > 0 do
+    if (probe & 1) == 1 then
+      # the single set bit must be the top bit of the probe
+      if (probe >> 1) == 0 then
+        return Option::Some(k)
+      else
+        return Option::None
+      end
+    end
+    probe = probe >> 1
+    k = k + 1
+  end
+  Option::None
+end
+
+# Fold one Mul statement when its destination local is an unsigned
+# integer kind and exactly one operand is a literal power of two. The
+# VALUE side becomes the shift subject; the shift amount is the constant's
+# log2. MirBinOp::Mul over two constants is left for constant folding.
+def strength_reduce_mul(place: Place, rvalue: MirRvalue, f: MirFunction) -> Option[MirRvalue]
+  match rvalue.kind
+  when MirRvalueKind::MirBinOp(MirBinOp::Mul, lhs, rhs) then
+    match mir_opt_local_type(f, place.local.id)
+    when Option::Some(dty) then
+      if mir_type_is_unsigned_int(&dty) then
+        let lc = extract_int_constant(&lhs)
+        let rc = extract_int_constant(&rhs)
+        match lc
+        when Option::Some(lv) then
+          match rc
+          when Option::Some(_) then
+            # both operands constant — constant folding handles it
+            Option::None
+          when Option::None then
+            # 2^k * rhs == rhs << k
+            match constant_power_of_two_shift(lv)
+            when Option::Some(k) then
+              Option::Some(MirRvalue {
+                kind: MirRvalueKind::MirBinOp(MirBinOp::Shl, rhs, operand_int(k))
+              })
+            when Option::None then Option::None
+            end
+          end
+        when Option::None then
+          match rc
+          when Option::Some(rv) then
+            # lhs * 2^k == lhs << k
+            match constant_power_of_two_shift(rv)
+            when Option::Some(k) then
+              Option::Some(MirRvalue {
+                kind: MirRvalueKind::MirBinOp(MirBinOp::Shl, lhs, operand_int(k))
+              })
+            when Option::None then Option::None
+            end
+          when Option::None then Option::None
+          end
+        end
+      else
+        Option::None
+      end
+    when Option::None then Option::None
+    end
+  when _ then Option::None
+  end  end
+end
+
+def strength_reduction(inout f: MirFunction) -> Unit
+  for block in f.blocks do
+    var new_stmts = Vec::new()
+    for stmt in block.statements do
+      match stmt.kind
+      when MirStatementKind::MirAssign(place, rvalue) then
+        if place.projections.is_empty() then
+          match strength_reduce_mul(&place, &rvalue, f)
+          when Option::Some(reduced) then
+            new_stmts.push(MirStatement {
+              kind: MirStatementKind::MirAssign(place, reduced),
+              span: stmt.span
+            })
+          when Option::None then
+            new_stmts.push(stmt.clone())
+          end
+        else
+          new_stmts.push(stmt.clone())
+        end
+      when _ then
+        new_stmts.push(stmt.clone())
+      end
+    end
+    block.statements = new_stmts
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# P1-9 audit items NOT implemented (with the exact reason each is out of
+# scope for the tractable local-conservative set above):
+#   - redundant drop elimination: in this IR every overwrite/scope-exit
+#     drop of a live value is an explicit MirDeinit terminator chain the
+#     checker planned (lower_assign_drop_chain / emit_cfg_deinit_returns);
+#     a chain exists exactly when the dropped value needs a real
+#     destructor run, and those runs are observable semantics — a sound
+#     "redundant" drop pass would need to prove the dropped value's
+#     destructor trivial, which requires the program-level deinit-plan /
+#     type table (per-function passes see only MirFunction). Where values
+#     are provably never read AND their destructors trivial, lowering
+#     emits no chain at all — nothing is left to remove. A future pass
+#     WITH the plan table may revisit (P1-9 TODO).
+#   - SCCP: full sparse conditional constant propagation needs the
+#     CFG/lattice machinery (the local block constant propagation above is
+#     its per-block fragment); the dominator/range machinery inside
+#     eliminate_bounds_checks is the natural lattice to extend (P1-9
+#     TODO).
+#   - mem2reg: a full SSA conversion pass EXISTS but is dormant
+#     (convert_to_ssa, mir.tg:19571) — it is not wired into the optimizer
+#     pipeline, and nothing else emits MirPhi; wiring it needs phi-aware
+#     codegen validation first (P1-9 TODO).
+#   - SROA / aggregate scalar replacement: needs field-liveness analysis
+#     across blocks plus drop-plan awareness for aggregate OWNING fields
+#     (P1-9 TODO).
+#   - load/store forwarding from access facts: no access-fact (provenance)
+#     analysis exists at MIR level; all forwarding would have to be
+#     built from scratch on refs/place args (P1-9 TODO).
+#   - devirtualization after monomorphization: monomorphization rewrites
+#     every call site to its concrete instance payload (instance-keyed
+#     MirFnItem constants — mono.tg rewrite_call_sites_in_program); full
+#     devirtualization of dispatch-table/indirect calls would need
+#     whole-program reachability over the dispatch metadata
+#     (mir.dispatch_methods) (P1-9 TODO).
+#   - induction-variable analysis: bounds-check elimination proves the
+#     canonical counter shapes (nonnegative-init, nonnegative-increment
+#     induction locals capped by a guard comparison — see the pass banner)
+#     but does NOT rewrite induction expressions — full IV analysis/
+#     strength reduction on ivs is absent (P1-9 TODO).
+#   - redundant retain/release elimination for unique Arc/Rc: Arc exists
+#     in std (std/sync.tg) but its refcount operations are ordinary MIR
+#     field/atomic operations inside Arc clone/drop bodies and drop-glue —
+#     there is no MIR-level retain/release construct and no uniqueness
+#     proof available per function (P1-9 TODO).
+#   - tail calls: deferred — needs ABI/register-allocation decisions
+#     (P1-9 TODO).
+#   - register allocation and target instruction combining: OUT OF SCOPE
+#     for MIR — they operate on the LIR of P1-7 (exact TODO: "the LIR of
+#     P1-7"; no MIR-level placeholder exists).
+
+# ———————————————————————————————————————————————————————————————
+# Bounds-Check Elimination
+# ———————————————————————————————————————————————————————————————
+#
+# Removes MirAssert/BoundsCheck terms when the index can be proven in
+# bounds. The proof lattice is a forward must-dataflow over the CFG that
+# threads, per local:
+#   - a CAP: local i < local B — the strict upper bound a dominating
+#     comparison (Lt(i, B) / Gt(B, i)) in the SAME block established on
+#     the branch edge where the comparison is TRUE, carried until i or B
+#     is written again (kills: stores to the key or the cap local, call
+#     destinations, place / write-effect call arguments, MirDeinit,
+#     MirRef of the local);
+#   - an UB: local i < const c — the same shape with a constant bound.
+#
+# Cross-block facts are merged by requiring every predecessor to carry the
+# SAME fact (identical cap local / identical const) — a fact that holds on
+# every path into the block. The entry facts are iterated to a fixed point
+# (bounded, Gauss-Seidel over the reverse postorder), so the canonical
+# induction shapes are proven without a separate loop-IV fixpoint:
+#
+# Case (a): `for i in 0..a.len() { ... a[i] ... }` — the range-for lowering
+# stores the length into a loop-bound local, the header compares
+# i < bound and the bound local is never written inside the loop; every
+# a[i] check whose len operand is the SAME bound local (or a length temp
+# of the same array — see the provenance rule below) is proven.
+#
+# Case (b): `while i < n { ... a[i] ... }` where n == a.len() (n is a
+# length temp of the array, established before the loop) and i only
+# increments: the cap is n; the len provenance rule bridges two DIFFERENT
+# locals holding the same length.
+#
+#   len provenance: a local is a "length temp of array A" when it is
+#   assigned exactly ONCE in the whole function and that store is
+#   `x = MirLen(place_local(A))`, or a bare copy of such a store whose
+#   single def is dominated by the length temp's single def. A cap
+#   i < C proves i < L for the check's len local L when C and L are both
+#   length temps of the SAME array A, A is never written anywhere in the
+#   function (no store / deinit / call destination / place or write-
+#   effect call argument / MirRef), and the single defs of C and L
+#   dominate the check block — then both hold the same value at the check.
+#   (Provenance is deliberately NOT tracked through MirCall results: the
+#   runtime length wrappers hide the array identity behind the callee, and
+#   a guessed identity would prove an unsound elimination.)
+#
+# Nonnegative lower bound: an index local i is proven >= 0 when it is an
+# induction local of an enclosing natural loop whose only in-loop stores
+# are nonnegative increments (i = i + k / i = k + i with constant k >= 0,
+# also via a single-use temp t = i + k; i = Move(Copy(t)) with t's only
+# def in the same block) and whose every out-of-loop predecessor of the
+# header ends with a constant >= 0 store into i — every executed value
+# inside the loop is then init + (sums of nonnegative increments) >= 0.
+#
+# Conservative restrictions:
+#   - only bare-local index/len operands are proven (no projections); a
+#     MirConstant index operand is proven against a MirConstant len
+#     operand;
+#   - the previous "already proven in a dominating block" rule is GONE: it
+#     inserted a record keyed on the CHECK'S OWN BLOCK for every check it
+#     could NOT prove in pass 1, and pass 2 then re-proved the same check
+#     from that record (self-proving) — every check was eliminated, sound
+#     or not. No dominance reuse exists in this rewrite: each elimination
+#     is value-proven from the cap/const-bound facts above;
+#   - the unsafe indexing API is untouched (this pass only removes
+#     provable checks; it never rewrites an index expression).
+
+# The per-local facts threaded by the bounds-check dataflow.
+struct MirBoundsState
+  caps: Map[Int, Int]   # local id -> cap local id  (value < value-of-cap-local)
+  ubs: Map[Int, Int]    # local id -> exclusive const upper bound (value < c)
+end
+
+# A comparison proposal recorded from an assignment `dst = Lt/Gt(lhs, rhs)`
+# with a supported operand shape; applied to the branch edges where dst
+# evaluates to 1 (the comparison is TRUE).
+struct MirBoundsProposal
+  key_local: Int        # the local whose bound the comparison proves
+  is_cap: Bool          # true: key_local < cap_local; false: key_local < ub_const
+  cap_local: Int
+  ub_const: Int
+end
+
+def mir_bounds_empty_state() -> MirBoundsState
+  MirBoundsState { caps: Map::new(), ubs: Map::new() }
+end
+
+def mir_bounds_clone_state(st: MirBoundsState) -> MirBoundsState
+  var caps = Map::new()
+  for entry in st.caps.entries() do
+    caps.insert(entry.0, entry.1)
+  end
+  var ubs = Map::new()
+  for entry in st.ubs.entries() do
+    ubs.insert(entry.0, entry.1)
+  end
+  MirBoundsState { caps: caps, ubs: ubs }
+end
+
+# Kill every fact about `lid` and every cap that names `lid` (a cap
+# i < C is void the moment C's value changes).
+def mir_bounds_state_kill_local(inout st: MirBoundsState, lid: Int) -> Unit
+  st.caps.remove(lid)
+  st.ubs.remove(lid)
+  var cap_patch = Vec::new()
+  for entry in st.caps.entries() do
+    if entry.1 == lid then
+      cap_patch.push(entry.0)
+    end
+  end
+  for k in cap_patch do
+    st.caps.remove(k)
+  end
+end
+
+# The must-merge: a fact survives only when BOTH states carry the SAME
+# fact (identical cap local / identical exclusive const).
+def mir_bounds_state_meet(a: MirBoundsState, b: MirBoundsState) -> MirBoundsState
+  var out = mir_bounds_empty_state()
+  var cands = Vec::new()
+  for entry in a.caps.entries() do
+    cands.push((entry.0, entry.1))
+  end
+  for cand in cands do
+    match b.caps.get(cand.0)
+    when Option::Some(v) then
+      if v == cand.1 then
+        out.caps.insert(cand.0, cand.1)
+      end
+    when Option::None then ()
+    end
+  end
+  var ub_cands = Vec::new()
+  for entry in a.ubs.entries() do
+    ub_cands.push((entry.0, entry.1))
+  end
+  for cand in ub_cands do
+    match b.ubs.get(cand.0)
+    when Option::Some(v) then
+      if v == cand.1 then
+        out.ubs.insert(cand.0, cand.1)
+      end
+    when Option::None then ()
+    end
+  end
+  out
+end
+
+def mir_bounds_insert_edge(inout out: Map[Int, MirBoundsState], succ: Int, st: MirBoundsState) -> Unit
+  match out.get(succ)
+  when Option::Some(existing) then
+    let merged = mir_bounds_state_meet(existing, st)
+    out.insert(succ, merged)
+  when Option::None then
+    out.insert(succ, st)
+  end  end
+end
+
+# A copy of the state with one comparison proposal applied.
+def mir_bounds_state_apply(st: MirBoundsState, prop: MirBoundsProposal) -> MirBoundsState
+  var out = mir_bounds_clone_state(st)
+  if prop.is_cap then
+    out.caps.insert(prop.key_local, prop.cap_local)
+  else
+    out.ubs.insert(prop.key_local, prop.ub_const)
+  end
+  out
+end
+
+# The comparison-proposal of an Lt/Gt binop when the operand shapes are
+# supported: (local, local) yields a cap, (local, const) on the bounded
+# side yields an exclusive const bound.
+def mir_bounds_cmp_proposal(op: MirBinOp, lhs: MirOperand, rhs: MirOperand) -> Option[MirBoundsProposal]
+  let l_const = extract_int_constant(lhs)
+  let r_const = extract_int_constant(rhs)
+  var l_lid = -1
+  var r_lid = -1
+  match lhs.kind
+  when MirOperandKind::MirCopy(p) then
+    if p.projections.is_empty() then l_lid = p.local.id end
+  when MirOperandKind::MirMovePlace(p) then
+    if p.projections.is_empty() then l_lid = p.local.id end
+  when _ then ()
+  end
+  match rhs.kind
+  when MirOperandKind::MirCopy(p) then
+    if p.projections.is_empty() then r_lid = p.local.id end
+  when MirOperandKind::MirMovePlace(p) then
+    if p.projections.is_empty() then r_lid = p.local.id end
+  when _ then ()
+  end
+  if op == MirBinOp::Lt then
+    # TRUE: lhs < rhs — the left side is bounded by the right side.
+    if l_lid != -1 then
+      if r_lid != -1 then
+        return Option::Some(MirBoundsProposal { key_local: l_lid, is_cap: true, cap_local: r_lid, ub_const: 0 })
+      end
+      match r_const
+      when Option::Some(c) then
+        return Option::Some(MirBoundsProposal { key_local: l_lid, is_cap: false, cap_local: 0, ub_const: c })
+      when Option::None then return Option::None
+      end
+    end
+    return Option::None
+  end
+  if op == MirBinOp::Gt then
+    # TRUE: rhs < lhs — the right side is bounded by the left side.
+    if r_lid != -1 then
+      if l_lid != -1 then
+        return Option::Some(MirBoundsProposal { key_local: r_lid, is_cap: true, cap_local: l_lid, ub_const: 0 })
+      end
+      match l_const
+      when Option::Some(c) then
+        return Option::Some(MirBoundsProposal { key_local: r_lid, is_cap: false, cap_local: 0, ub_const: c })
+      when Option::None then return Option::None
+      end
+    end
+    return Option::None
+  end
+  Option::None
+end
+
+# Thread one statement over the cap/ub facts; comparison proposals are
+# recorded for the block's terminator switch.
+def mir_bounds_thread_statement(inout st: MirBoundsState, inout proposals: Map[Int, MirBoundsProposal], stmt: MirStatement) -> Unit
+  match stmt.kind
+  when MirStatementKind::MirAssign(place, rvalue) then
+    let root = place.local.id
+    var ref_target: Option[Int] = Option::None
+    match rvalue.kind
+    when MirRvalueKind::MirRef(ref_place) then ref_target = Option::Some(ref_place.local.id)
+    when _ then ()
+    end
+    # A pure bare-copy source captured BEFORE the kill (a self-copy keeps
+    # the facts — the value is unchanged).
+    var copy_src: Option[Int] = Option::None
+    var copy_is_self = false
+    if place.projections.is_empty() then
+      match rvalue.kind
+      when MirRvalueKind::MirMove(op) then
+        match op.kind
+        when MirOperandKind::MirCopy(src) then
+          if src.projections.is_empty() then
+            if src.local.id == root then
+              copy_is_self = true
+            else
+              copy_src = Option::Some(src.local.id)
+            end
+          end
+        when _ then ()
+        end
+      when _ then ()
+      end
+    end
+    mir_bounds_state_kill_local(&mut st, root)
+    match ref_target
+    when Option::Some(rt) then mir_bounds_state_kill_local(&mut st, rt)
+    when Option::None then ()
+    end
+    if place.projections.is_empty() then
+      if !copy_is_self then
+        match copy_src
+        when Option::Some(src_id) then
+          match st.caps.get(src_id)
+          when Option::Some(c) then st.caps.insert(root, c)
+          when Option::None then ()
+          end
+          match st.ubs.get(src_id)
+          when Option::Some(u) then st.ubs.insert(root, u)
+          when Option::None then ()
+          end
+        when Option::None then ()
+        end
+      end
+      # A stale comparison proposal dies with the local's reassignment;
+      # only the supported comparison shapes record (or re-record) one.
+      proposals.remove(place.local.id)
+      match rvalue.kind
+      when MirRvalueKind::MirBinOp(op, lhs, rhs) then
+        if op == MirBinOp::Lt || op == MirBinOp::Gt then
+          match mir_bounds_cmp_proposal(op, &lhs, &rhs)
+          when Option::Some(prop) then proposals.insert(place.local.id, prop)
+          when Option::None then ()
+          end
+        end
+      when _ then ()
+      end
+    end
+  when _ then ()
+  end  end
+end
+
+# Terminator-level kills: call destinations, place/write-effect call
+# arguments and MirDeinit targets can change a local's value.
+def mir_bounds_terminator_kills(inout st: MirBoundsState, term: MirTerminator) -> Unit
+  match term.kind
+  when MirTerminatorKind::MirCall { dest, func, args, success, unwind, intrinsic } then
+    mir_bounds_state_kill_local(&mut st, dest.local.id)
+    for arg in args do
+      match arg.value
+      when MirCallValue::Place(p) then
+        mir_bounds_state_kill_local(&mut st, p.local.id)
+      when MirCallValue::Value(op) then
+        match arg.effect
+        when AccessEffect::Read then ()
+        when AccessEffect::Modify then
+          match op.kind
+          when MirOperandKind::MirCopy(p) then mir_bounds_state_kill_local(&mut st, p.local.id)
+          when MirOperandKind::MirMovePlace(p) then mir_bounds_state_kill_local(&mut st, p.local.id)
+          when MirOperandKind::MirConsume(p) then mir_bounds_state_kill_local(&mut st, p.local.id)
+          when MirOperandKind::MirRead(p) then mir_bounds_state_kill_local(&mut st, p.local.id)
+          when _ then ()
+          end
+        when AccessEffect::Consume then
+          match op.kind
+          when MirOperandKind::MirCopy(p) then mir_bounds_state_kill_local(&mut st, p.local.id)
+          when MirOperandKind::MirMovePlace(p) then mir_bounds_state_kill_local(&mut st, p.local.id)
+          when MirOperandKind::MirConsume(p) then mir_bounds_state_kill_local(&mut st, p.local.id)
+          when MirOperandKind::MirRead(p) then mir_bounds_state_kill_local(&mut st, p.local.id)
+          when _ then ()
+          end
+        when AccessEffect::Initialize then
+          match op.kind
+          when MirOperandKind::MirCopy(p) then mir_bounds_state_kill_local(&mut st, p.local.id)
+          when MirOperandKind::MirMovePlace(p) then mir_bounds_state_kill_local(&mut st, p.local.id)
+          when MirOperandKind::MirConsume(p) then mir_bounds_state_kill_local(&mut st, p.local.id)
+          when MirOperandKind::MirRead(p) then mir_bounds_state_kill_local(&mut st, p.local.id)
+          when _ then ()
+          end
+        end
+      end
+    end
+  when MirTerminatorKind::MirDeinit { place, deinit_fn, target, unwind } then
+    mir_bounds_state_kill_local(&mut st, place.local.id)
+  when _ then ()
+  end  end
+end
+
+# The per-successor edge states of a terminator. The comparison proposal
+# recorded for the switch's discriminant local is applied to the edge(s)
+# taken when that local evaluates to 1 (the TRUE arm): the target edges
+# with value 1 when exactly one exists, otherwise the default edge when no
+# target has value 1.
+def mir_bounds_terminator_edges(st: MirBoundsState, proposals: Map[Int, MirBoundsProposal], term: MirTerminator) -> Map[Int, MirBoundsState]
+  var out: Map[Int, MirBoundsState] = Map::new()
+  match term.kind
+  when MirTerminatorKind::MirGoto(target) then
+    mir_bounds_insert_edge(&mut out, target.id, st)
+  when MirTerminatorKind::MirSwitchInt(op, targets, default_target) then
+    var prop: Option[MirBoundsProposal] = Option::None
+    match op.kind
+    when MirOperandKind::MirCopy(p) then
+      if p.projections.is_empty() then
+        match proposals.get(p.local.id)
+        when Option::Some(pr) then prop = Option::Some(pr)
+        when Option::None then ()
+        end
+      end
+    when _ then ()
+    end
+    var true_count = 0
+    for t in targets do
+      if t.value == 1 then
+        true_count = true_count + 1
+      end
+    end
+    for t in targets do
+      var edge_st = st
+      match prop
+      when Option::Some(pr) then
+        if t.value == 1 && true_count == 1 then
+          edge_st = mir_bounds_state_apply(st, pr)
+        end
+      when Option::None then ()
+      end
+      mir_bounds_insert_edge(&mut out, t.target.id, edge_st)
+    end
+    var def_st = st
+    match prop
+    when Option::Some(pr) then
+      if true_count == 0 then
+        def_st = mir_bounds_state_apply(st, pr)
+      end
+    when Option::None then ()
+    end
+    mir_bounds_insert_edge(&mut out, default_target.id, def_st)
+  when MirTerminatorKind::MirCall { dest, func, args, success, unwind, intrinsic } then
+    mir_bounds_insert_edge(&mut out, success.id, st)
+    match unwind
+    when Option::Some(uw) then mir_bounds_insert_edge(&mut out, uw.id, st)
+    when Option::None then ()
+    end
+  when MirTerminatorKind::MirAssert { cond, expected, msg, target, unwind } then
+    mir_bounds_insert_edge(&mut out, target.id, st)
+    match unwind
+    when Option::Some(uw) then mir_bounds_insert_edge(&mut out, uw.id, st)
+    when Option::None then ()
+    end
+  when MirTerminatorKind::MirDeinit { place, deinit_fn, target, unwind } then
+    mir_bounds_insert_edge(&mut out, target.id, st)
+    match unwind
+    when Option::Some(uw) then mir_bounds_insert_edge(&mut out, uw.id, st)
+    when Option::None then ()
+    end
+  when _ then ()
+  end
+  out
+end
+
+def mir_bounds_store_is_increment(f: MirFunction, block_id: Int, place: Place, rv: MirRvalue, x: Int) -> Bool
+  if !place.projections.is_empty() then
+    return false
+  end
+  if place.local.id != x then
+    return false
+  end
+  match rv.kind
+  when MirRvalueKind::MirBinOp(MirBinOp::Add, lhs, rhs) then
+    if mir_operand_is_bare_local(&lhs, x) then
+      match extract_int_constant(&rhs)
+      when Option::Some(k) then
+        if k >= 0 then return true end
+      when Option::None then ()
+      end
+      return false
+    end
+    if mir_operand_is_bare_local(&rhs, x) then
+      match extract_int_constant(&lhs)
+      when Option::Some(k) then
+        if k >= 0 then return true end
+      when Option::None then ()
+      end
+      return false
+    end
+    return false
+  when MirRvalueKind::MirMove(op) then
+    match op.kind
+    when MirOperandKind::MirCopy(src) then
+      if src.projections.is_empty() then
+        let t = src.local.id
+        if t == x then
+          return false
+        end
+        return mir_bounds_temp_iv_add_in_block(f, block_id, t, x)
+      end
+      return false
+    when _ then
+      return false
+    end
+  when _ then
+    return false
+  end
+  false
+end
+
+def mir_operand_is_bare_local(op: MirOperand, lid: Int) -> Bool
+  match op.kind
+  when MirOperandKind::MirCopy(p) then
+    if p.projections.is_empty() then
+      return p.local.id == lid
+    end
+    return false
+  when MirOperandKind::MirMovePlace(p) then
+    if p.projections.is_empty() then
+      return p.local.id == lid
+    end
+    return false
+  when _ then
+    return false
+  end
+  false
+end
+
+# True when local t is assigned EXACTLY ONCE in the whole function, in
+# block_id, by t = x + k / t = k + x with constant k >= 0 — the canonical
+# increment-temp shape of the lowering (t = i + 1; i = Move(Copy(t))).
+def mir_bounds_temp_iv_add_in_block(f: MirFunction, block_id: Int, t: Int, x: Int) -> Bool
+  var defs = 0
+  var def_ok = true
+  for block in f.blocks do
+    for stmt in block.statements do
+      match stmt.kind
+      when MirStatementKind::MirAssign(place, rvalue) then
+        if place.projections.is_empty() && place.local.id == t then
+          defs = defs + 1
+          if block.id.id != block_id then
+            def_ok = false
+          else
+            match rvalue.kind
+            when MirRvalueKind::MirBinOp(MirBinOp::Add, lhs, rhs) then
+              if mir_operand_is_bare_local(&lhs, x) then
+                match extract_int_constant(&rhs)
+                when Option::Some(k) then
+                  if k < 0 then def_ok = false end
+                when Option::None then def_ok = false
+                end
+              elsif mir_operand_is_bare_local(&rhs, x) then
+                match extract_int_constant(&lhs)
+                when Option::Some(k) then
+                  if k < 0 then def_ok = false end
+                when Option::None then def_ok = false
+                end
+              else
+                def_ok = false
+              end
+            when _ then
+              def_ok = false
+            end
+          end
+        end
+      when _ then ()
+      end
+    end
+  end
+  if defs == 1 && def_ok then true else false end
+end
+
+def mir_rvalue_int_const(rv: MirRvalue) -> Option[Int]
+  match rv.kind
+  when MirRvalueKind::MirMove(op) then
+    extract_int_constant(&op)
+  when _ then Option::None
+  end  end
+end
+
+def mir_idom_dominates(dom_idom: Map[Int, Int], a_id: Int, b_id: Int) -> Bool
+  var cur = b_id
+  var hops = 0
+  while hops < 4096 do
+    if cur == a_id then
+      return true
+    end
+    match dom_idom.get(cur)
+    when Option::Some(dom) then
+      if dom == cur then
+        return false
+      end
+      cur = dom
+    when Option::None then
+      return false
+    end
+    hops = hops + 1
+  end
+  false
+end
+
+# The length-temp provenance (local -> array local) and the def-block map
+# of every single-store local. Provenance requires exactly one store in
+# the whole function, of the shape x = MirLen(place_local(A)), or a bare
+# copy of such a store whose source's def dominates the copy.
+def mir_bounds_len_facts(f: MirFunction) -> (Map[Int, Int], Map[Int, Int])
+  var store_count: Map[Int, Int] = Map::new()
+  var def_block: Map[Int, Int] = Map::new()
+  var is_len_def: Map[Int, Int] = Map::new()
+  for block in f.blocks do
+    for stmt in block.statements do
+      match stmt.kind
+      when MirStatementKind::MirAssign(place, rvalue) then
+        let root = place.local.id
+        match store_count.get(root)
+        when Option::Some(n) then store_count.insert(root, n + 1)
+        when Option::None then store_count.insert(root, 1)
+        end
+        def_block.insert(root, block.id.id)
+        if place.projections.is_empty() then
+          match rvalue.kind
+          when MirRvalueKind::MirLen(arr_place) then
+            if arr_place.projections.is_empty() then
+              is_len_def.insert(root, arr_place.local.id)
+            end
+          when _ then ()
+          end
+        end
+      when _ then ()
+      end
+    end
+  end
+  var len_prov: Map[Int, Int] = Map::new()
+  var single_def: Map[Int, Int] = Map::new()
+  for l in f.locals do
+    let lid = l.id.id
+    match store_count.get(lid)
+    when Option::Some(n) then
+      if n == 1 then
+        match def_block.get(lid)
+        when Option::Some(db) then single_def.insert(lid, db)
+        when Option::None then ()
+        end
+        match is_len_def.get(lid)
+        when Option::Some(arr) then len_prov.insert(lid, arr)
+        when Option::None then ()
+        end
+      end
+    when Option::None then ()
+    end
+  end
+  let dom_info = compute_dominators(f)
+  var rounds = 0
+  var changed = true
+  while changed && rounds < 16 do
+    changed = false
+    rounds = rounds + 1
+    for block in f.blocks do
+      for stmt in block.statements do
+        match stmt.kind
+        when MirStatementKind::MirAssign(place, rvalue) then
+          if place.projections.is_empty() then
+            match rvalue.kind
+            when MirRvalueKind::MirMove(op) then
+              match op.kind
+              when MirOperandKind::MirCopy(src) then
+                if src.projections.is_empty() then
+                  match len_prov.get(src.local.id)
+                  when Option::Some(arr) then
+                    match def_block.get(src.local.id)
+                    when Option::Some(src_def) then
+                      if mir_idom_dominates(&dom_info.idom, src_def, block.id.id) then
+                        match single_def.get(place.local.id)
+                        when Option::Some(_) then
+                          match len_prov.get(place.local.id)
+                          when Option::None then
+                            len_prov.insert(place.local.id, arr)
+                            changed = true
+                          when Option::Some(_) then ()
+                          end
+                        when Option::None then ()
+                        end
+                      end
+                    when Option::None then ()
+                    end
+                  when Option::None then ()
+                  end
+                end
+              when _ then ()
+              end
+            when _ then ()
+            end
+          end
+        when _ then ()
+        end
+      end
+    end
+  end
+  (len_prov, single_def)
+end
+
+# The array locals whose length cannot change anywhere in the function:
+# no store (whole or projected), no MirDeinit, no call destination, no
+# place or write-effect call argument, no MirRef.
+def mir_bounds_mutated_roots(f: MirFunction) -> Set[Int]
+  var written: Set[Int] = Set::new()
+  for block in f.blocks do
+    for stmt in block.statements do
+      match stmt.kind
+      when MirStatementKind::MirAssign(place, rvalue) then
+        written.insert(place.local.id)
+        match rvalue.kind
+        when MirRvalueKind::MirRef(ref_place) then written.insert(ref_place.local.id)
+        when _ then ()
+        end
+      when _ then ()
+      end
+    end
+    match block.terminator.kind
+    when MirTerminatorKind::MirDeinit { place, deinit_fn, target, unwind } then
+      written.insert(place.local.id)
+    when MirTerminatorKind::MirCall { dest, func, args, success, unwind, intrinsic } then
+      written.insert(dest.local.id)
+      for arg in args do
+        match arg.value
+        when MirCallValue::Place(p) then written.insert(p.local.id)
+        when MirCallValue::Value(op) then
+          match arg.effect
+          when AccessEffect::Read then ()
+          when AccessEffect::Modify then
+            match op.kind
+            when MirOperandKind::MirCopy(p) then written.insert(p.local.id)
+            when MirOperandKind::MirMovePlace(p) then written.insert(p.local.id)
+            when MirOperandKind::MirConsume(p) then written.insert(p.local.id)
+            when MirOperandKind::MirRead(p) then written.insert(p.local.id)
+            when _ then ()
+            end
+          when AccessEffect::Consume then
+            match op.kind
+            when MirOperandKind::MirCopy(p) then written.insert(p.local.id)
+            when MirOperandKind::MirMovePlace(p) then written.insert(p.local.id)
+            when MirOperandKind::MirConsume(p) then written.insert(p.local.id)
+            when MirOperandKind::MirRead(p) then written.insert(p.local.id)
+            when _ then ()
+            end
+          when AccessEffect::Initialize then
+            match op.kind
+            when MirOperandKind::MirCopy(p) then written.insert(p.local.id)
+            when MirOperandKind::MirMovePlace(p) then written.insert(p.local.id)
+            when MirOperandKind::MirConsume(p) then written.insert(p.local.id)
+            when MirOperandKind::MirRead(p) then written.insert(p.local.id)
+            when _ then ()
+            end
+          end
+        end
+      end
+    when _ then ()
+    end
+  end
+  written
+end
+
+# Per-block set of induction locals provably >= 0 inside the block (see the
+# pass banner): only nonnegative increments inside an enclosing natural
+# loop and a constant >= 0 initial store in every out-of-loop predecessor
+# of the loop header.
+def mir_bounds_iv_lo_facts(f: MirFunction) -> Map[Int, Set[Int]]
+  var out: Map[Int, Set[Int]] = Map::new()
+  for block in f.blocks do
+    out.insert(block.id.id, Set::new())
+  end
+  let loops = find_natural_loops(f)
+  var params: Set[Int] = Set::new()
+  for p in f.params do
+    params.insert(p.id.id)
+  end
+  for loop_info in loops do
+    let header_id = loop_info.header.id
+    var candidates: Set[Int] = Set::new()
+    for bid in loop_info.blocks do
+      match get_block(f, MirBlockId { id: bid })
+      when Option::Some(block) then
+        for stmt in block.statements do
+          match stmt.kind
+          when MirStatementKind::MirAssign(place, rvalue) then
+            candidates.insert(place.local.id)
+          when _ then ()
+          end
+        end
+      when Option::None then ()
+      end
+    end
+    for cand in candidates do
+      if params.contains(&cand) then
+        continue
+      end
+      var is_iv = true
+      for bid in loop_info.blocks do
+        if !is_iv then
+          break
+        end
+        match get_block(f, MirBlockId { id: bid })
+        when Option::Some(block) then
+          for stmt in block.statements do
+            if !is_iv then
+              break
+            end
+            match stmt.kind
+            when MirStatementKind::MirAssign(place, rvalue) then
+              if place.local.id == cand then
+                if !mir_bounds_store_is_increment(f, bid, &place, &rvalue, cand) then
+                  is_iv = false
+                end
+              end
+            when _ then ()
+            end
+          end
+        when Option::None then ()
+        end
+      end
+      if !is_iv then
+        continue
+      end
+      var outside_preds: Vec[Int] = Vec::new()
+      for block in f.blocks do
+        let pred_id = block.id.id
+        if loop_contains_block(loop_info, pred_id) then
+          continue
+        end
+        for succ_id in terminator_successor_ids(&block.terminator) do
+          if succ_id == header_id then
+            outside_preds.push(pred_id)
+            break
+          end
+        end
+      end
+      if outside_preds.is_empty() then
+        continue
+      end
+      var init_ok = true
+      var init_seen = false
+      for pred_id in outside_preds do
+        if !init_ok then
+          break
+        end
+        match get_block(f, MirBlockId { id: pred_id })
+        when Option::Some(pred_block) then
+          var found_last = false
+          var si = pred_block.statements.len()
+          while si > 0 && !found_last do
+            si = si - 1
+            match pred_block.statements[si].kind
+            when MirStatementKind::MirAssign(place, rvalue) then
+              if place.local.id == cand then
+                found_last = true
+                if !place.projections.is_empty() then
+                  init_ok = false
+                else
+                  match mir_rvalue_int_const(&rvalue)
+                  when Option::Some(c) then
+                    if c < 0 then
+                      init_ok = false
+                    else
+                      init_seen = true
+                    end
+                  when Option::None then
+                    init_ok = false
+                  end
+                end
+              end
+            when _ then ()
+            end
+          end
+          if !found_last then
+            init_ok = false
+          end
+        when Option::None then
+          init_ok = false
+        end
+      end
+      if !init_ok || !init_seen then
+        continue
+      end
+      for bid in loop_info.blocks do
+        match out.get(bid)
+        when Option::Some(ids) then
+          var new_ids = ids
+          new_ids.insert(cand)
+          out.insert(bid, new_ids)
+        when Option::None then ()
+        end
+      end
+    end
+  end
+  out
+end
+
+def eliminate_bounds_checks(inout f: MirFunction) -> Unit
+  # — function-wide facts —
+  let (len_prov, def_blocks) = mir_bounds_len_facts(f)
+  let mutated = mir_bounds_mutated_roots(f)
+  let lo_ok = mir_bounds_iv_lo_facts(f)
+  let dom_info = compute_dominators(f)
+  let rpo = compute_reverse_postorder(f)
+
+  # — forward must-dataflow: block-entry cap/ub states —
+  var entry_states: Map[Int, MirBoundsState] = Map::new()
+  for bid in rpo do
+    entry_states.insert(bid, mir_bounds_empty_state())
+  end
+  var terminal_states: Map[Int, MirBoundsState] = Map::new()
+  var iter = 0
+  while iter < 12 do
+    iter = iter + 1
+    var next_states: Map[Int, MirBoundsState] = Map::new()
+    for bid in rpo do
+      let in_state = match entry_states.get(bid)
+      when Option::Some(s) then s
+      when Option::None then mir_bounds_empty_state()
+      end
+      let block_opt = get_block(f, MirBlockId { id: bid })
+      match block_opt
+      when Option::Some(block) then
+        var st = mir_bounds_clone_state(in_state)
+        var proposals: Map[Int, MirBoundsProposal] = Map::new()
+        for stmt in block.statements do
+          mir_bounds_thread_statement(&mut st, &mut proposals, &stmt)
+        end
+        mir_bounds_terminator_kills(&mut st, &block.terminator)
+        if iter == 12 then
+          terminal_states.insert(bid, mir_bounds_clone_state(st))
+        end
+        let edges = mir_bounds_terminator_edges(st, proposals, &block.terminator)
+        for entry in edges.entries() do
+          match next_states.get(entry.0)
+          when Option::Some(existing) then
+            let merged = mir_bounds_state_meet(existing, entry.1)
+            next_states.insert(entry.0, merged)
+          when Option::None then
+            next_states.insert(entry.0, entry.1)
+          end
+        end
+      when Option::None then ()
+      end
+    end
+    entry_states = next_states
+  end
+
+  # — elimination: replace provable checks with a goto to the target —
+  for block in f.blocks do
+    match block.terminator.kind
+    when MirTerminatorKind::MirAssert { cond, expected, msg, target, unwind } then
+      match msg
+      when AssertMessage::BoundsCheck(index_op, len_op) then
+        let st = match terminal_states.get(block.id.id)
+        when Option::Some(s) then s
+        when Option::None then mir_bounds_empty_state()
+        end
+        if mir_bounds_prove_check(f, &st, &index_op, &len_op, block.id.id, &len_prov, &def_blocks, &mutated, &lo_ok, &dom_info.idom) then
+          block.terminator = MirTerminator {
+            kind: MirTerminatorKind::MirGoto(target),
+            span: block.terminator.span.clone()
+          }
         end
       when _ then ()
       end
@@ -16564,122 +19358,164 @@ def extract_local_from_operand(op: MirOperand) -> Option[MirLocalId]
   end  end
 end
 
-def extract_int_constant_from_rvalue(rv: MirRvalue) -> Option[Int]
-  match rv.kind
-  when MirRvalueKind::MirMove(op) then
-    extract_int_constant(&op)
-  when _ then Option::None
-  end  end
+# True when local `lid` is provably >= 0 at the END of block_id: it is an
+# induction local of an enclosing loop (the lo_ok table), or its last bare
+# store in the block stores a constant >= 0, or copies a bare local that
+# resolves the same way (the canonical a[i] shape copies the loop counter
+# into a fresh index temp right before the check).
+def mir_bounds_idx_lo_ok(f: MirFunction, block_id: Int, lid: Int, lo_ok: Map[Int, Set[Int]]) -> Bool
+  var cur = lid
+  var hops = 0
+  while hops < 8 do
+    match lo_ok.get(block_id)
+    when Option::Some(ivs) then
+      if ivs.contains(&cur) then
+        return true
+      end
+    when Option::None then ()
+    end
+    match get_block(f, MirBlockId { id: block_id })
+    when Option::None then return false
+    when Option::Some(block) then
+      var found_last = false
+      var si = block.statements.len()
+      while si > 0 && !found_last do
+        si = si - 1
+        match block.statements[si].kind
+        when MirStatementKind::MirAssign(place, rvalue) then
+          if place.local.id == cur then
+            found_last = true
+            if place.projections.is_empty() then
+              match mir_rvalue_int_const(&rvalue)
+              when Option::Some(c) then
+                if c >= 0 then
+                  return true
+                end
+              when Option::None then
+                match rvalue.kind
+                when MirRvalueKind::MirMove(op) then
+                  match op.kind
+                  when MirOperandKind::MirCopy(src) then
+                    if src.projections.is_empty() then
+                      cur = src.local.id
+                    else
+                      return false
+                    end
+                  when _ then return false
+                  end
+                when _ then return false
+                end
+              end
+            else
+              return false
+            end
+          end
+        when _ then ()
+        end
+      end
+      if !found_last then
+        return false
+      end
+    end
+    hops = hops + 1
+  end
+  false
 end
 
-def can_prove_bounds_check(index_local: MirLocalId, len_local: MirLocalId, ranges: Map[Int, ValueRange],
-                            block_id: MirBlockId, proven: Set[(Int, Int, String)]) -> Bool
-  # Check 1: Index is a constant in [0, len)
-  match ranges.get(index_local.id)
-  when Option::Some(idx_range) then
-    match idx_range.min
-    when Option::Some(min_val) then
-      match idx_range.max
-      when Option::Some(max_val) then
-        if min_val >= 0 then
-          match ranges.get(len_local.id)
-          when Option::Some(len_range) then
-            match len_range.min
-            when Option::Some(min_len) then
-              if max_val < min_len then
-                return true
-              end
-            when Option::None then ()
-            end
-          when Option::None then ()
-          end
+# Prove 0 <= index < len for a BoundsCheck terminator at block_id, from
+# the terminator-time cap/ub state and the function-wide facts (see the
+# pass banner for the exact rules).
+def mir_bounds_prove_check(
+  f: MirFunction,
+  st: MirBoundsState,
+  index_op: MirOperand,
+  len_op: MirOperand,
+  block_id: Int,
+  len_prov: Map[Int, Int],
+  def_blocks: Map[Int, Int],
+  mutated: Set[Int],
+  lo_ok: Map[Int, Set[Int]],
+  dom_idom: Map[Int, Int]
+) -> Bool
+  let idx_local = extract_local_from_operand(index_op)
+  let len_local = extract_local_from_operand(len_op)
+  match idx_local
+  when Option::Some(i_lid) then
+    # The index's lower bound: >= 0 when it is an induction local of an
+    # enclosing loop with a nonnegative constant init (the iv table), or
+    # a same-block copy/const store of such a local.
+    let idx_lo_ok = mir_bounds_idx_lo_ok(f, block_id, i_lid.id, lo_ok)
+    if !idx_lo_ok then
+      return false
+    end
+    # Rule A: the length operand is a constant and the state carries a
+    # const upper bound below it.
+    match extract_int_constant(len_op)
+    when Option::Some(lc) then
+      match st.ubs.get(i_lid.id)
+      when Option::Some(u) then
+        if u <= lc then
+          return true
         end
       when Option::None then ()
       end
     when Option::None then ()
     end
-  when Option::None then ()
-  end
-  
-  # Check 2: Already proven in a dominating block
-  # (Simplified: check if same index/len pair was checked in an earlier block)
-  let proven_key = (block_id.id, index_local.id, len_local.id.to_string())
-  if proven.contains(&proven_key) then
-    return true
-  end
-  
-  false
-end
-
-def propagate_loop_ranges(f: MirFunction, inout ranges: Map[Int, ValueRange]) -> Unit
-  # Find loop induction variables and compute their ranges
-  let loops = find_natural_loops(f)
-  
-  for loop_info in loops do
-    # Find induction variable patterns:
-    # 1. i starts at 0 (or known value)
-    # 2. i increments by constant each iteration
-    # 3. Loop condition is i < len
-    
-    # Look for typical induction patterns in loop blocks
-    for block_id in loop_info.blocks do
-      match get_block(f, MirBlockId { id: block_id })
-      when Option::Some(block) then
-        for stmt in block.statements do
-          match stmt.kind
-          when MirStatementKind::MirAssign(place, rvalue) then
-            # Pattern: i = i + 1
-            match rvalue.kind
-            when MirRvalueKind::MirBinOp(MirBinOp::Add, lhs, rhs) then
-              match lhs.kind
-              when MirOperandKind::MirCopy(src_place) then
-                match extract_int_constant(&rhs)
-                when Option::Some(step) then
-                  if src_place.local.id == place.local.id && place.projections.is_empty() then
-                    # Found an induction variable
-                    let start = match ranges.get(place.local.id)
-                    when Option::Some(range) then
-                      match range.min
-                      when Option::Some(min_val) then min_val
-                      when Option::None then 0
-                      end
-                    when Option::None then 0
-                    end
-                    if step > 0 then
-                      let _ = ranges.insert(place.local.id, ValueRange {
-                        min: Option::Some(start),
-                        max: Option::None  # Unknown upper bound without more analysis
-                      })
-                    end
+    # Rules B and C need the check's length to be a bare local.
+    match len_local
+    when Option::Some(l_lid) then
+      match st.caps.get(i_lid.id)
+      when Option::Some(cap_id) then
+        # Rule B: the cap local IS the check's length local.
+        if cap_id == l_lid.id then
+          return true
+        end
+        # Rule C: the cap and the length are length temps of the SAME
+        # array, the array is never mutated, and both single defs
+        # dominate the check — both locals then hold the same value.
+        match len_prov.get(cap_id)
+        when Option::Some(arr_c) then
+          match len_prov.get(l_lid.id)
+          when Option::Some(arr_l) then
+            if arr_c == arr_l && !mutated.contains(&arr_c) then
+              match def_blocks.get(cap_id)
+              when Option::Some(def_c) then
+                match def_blocks.get(l_lid.id)
+                when Option::Some(def_l) then
+                  if mir_idom_dominates(&dom_idom, def_c, block_id) &&
+                     mir_idom_dominates(&dom_idom, def_l, block_id) then
+                    return true
                   end
                 when Option::None then ()
                 end
-              when _ then ()
+              when Option::None then ()
               end
-            when _ then ()
             end
-          when _ then ()
+          when Option::None then ()
           end
-        end
-        
-        # Check loop exit condition
-        match block.terminator.kind
-        when MirTerminatorKind::MirSwitchInt { op: cond_op, targets, default_target } then
-          # If we have i < len as condition, we know i is bounded
-          match cond_op.kind
-          when MirOperandKind::MirCopy(p) then
-            # Track that this variable is bounded by the loop
-            if !p.projections.is_empty() then
-              ()  # Skip complex projections
-            end
-          when _ then ()
-          end
-        when _ then ()
+        when Option::None then ()
         end
       when Option::None then ()
       end
+    when Option::None then ()
     end
-  end
+    false
+  when Option::None then
+    # Constant index: prove 0 <= c < len against a constant length.
+    match extract_int_constant(index_op)
+    when Option::Some(c) then
+      if c < 0 then
+        false
+      else
+        match extract_int_constant(len_op)
+        when Option::Some(lc) then c < lc
+        when Option::None then false
+        end
+      end
+    when Option::None then
+      false
+    end
+  end  end
 end
 
 def simplify_moves(inout f: MirFunction) -> Unit

@@ -1,0 +1,2857 @@
+# Tangerine Compiler — LIR (Low-Level IR) module
+# Self-hosting compiler written in Tangerine
+#
+# Audit P1-7 slice: a TRUE low-level IR standing between semantic MIR and
+# machine code, so register allocation becomes a standalone pass instead of
+# the direct emitter's inline RegAllocState. The direct emitter in
+# codegen.tg is untouched; this module is purely additive and default-off
+# (see the TANGERINE_LIR gate in driver.tg's compile_lir_route).
+#
+# Desired end-to-end pipeline (the audit's target):
+#   TypedProgram -> Ownership MIR -> semantic optimization -> LIR ->
+#   machine legalization -> register allocation -> peephole/scheduling ->
+#   object emission.
+# This module implements the LIR stage of that pipeline for a CORE aarch64
+# integer subset. MIR keeps moves/drops/ownership/typed places/high-level
+# aggregates; LIR has virtual registers, basic blocks, load/store, machine-
+# width arithmetic, compare/branch, call ABI operands and explicit spill
+# slots. Once the safety semantics are proven in MIR, they need no runtime
+# representation: drops/ownership are already resolved into MIR deinit
+# terms BEFORE this stage, so LIR never sees them — and anything outside
+# the supported subset FAILS CLOSED (see the legalization contract below;
+# never a silent miscompile).
+#
+# ── Legalization contract (what lowers, and how) ──────────────────────
+#
+# SUPPORTED MIR INPUT (the current subset — aarch64 host only):
+#   Functions: non-extern bodies whose parameter/return types are Int,
+#     UInt or Unit. Local types may be Int/UInt/Bool. Integer scalar
+#     locals map 1:1 to virtual registers; every local whose value may
+#     need memory (spill segments, live-across-a-call values) is also
+#     assigned an 8-byte FP-relative spill slot by the allocator. Int/
+#     UInt values are 64-bit machine words throughout; Bool values are
+#     0/1 held in a full word (internal to LIR — Bool never crosses a
+#     call ABI in this subset).
+#   Statements: MirStorageLive/MirStorageDead/MirNop (no-ops); MirAssign
+#     with rvalues: MirMove over a scalar local/constant, MirBinOp over
+#     Int/UInt operands (Add/Sub/Mul/BitAnd/BitOr/BitXor/Shl/Shr; the
+#     comparisons Eq/Ne/Lt/Le/Gt/Ge produce Bool locals), MirUnOp (Neg on
+#     Int; BitNot on Int/UInt), MirCast IntToInt (64-bit forms),
+#     MirPhi (handled as predecessor-edge copies — see below).
+#   Terminators: MirGoto, MirReturn, MirUnreachable/MirAbort (trap),
+#     MirSwitchInt over a scalar local, MirCall with a direct MirFnItem
+#     callee, Int/UInt args (aarch64 x0-x7; overflow args on the caller
+#     stack in 16-byte slots — the codegen.tg convention), unwind None,
+#     no intrinsic.
+#   Phi: MIR is not SSA (the convert_to_ssa pass is dormant; nothing in
+#     the active pipeline emits MirPhi). MirPhi rvalues in a successor
+#     block are lowered as unconditional parallel MOVES at the END of the
+#     predecessor (the codegen.tg emit_phi_copies convention: edge copies
+#     run before the terminator), cycle-safe via one scratch virtual
+#     register.
+#
+# LIR OUTPUT:
+#   LirFunction: virtual-register count (vregs 0..7 are FIXED precolored
+#     ABI registers x0..x7 — never interval-allocated, only read at
+#     parameter binding and written by call-argument moves), params (one
+#     virtual register per parameter; ABI class derives from the index:
+#     0..7 register class x0..x7, >= 8 stack class at [FP+16+16k]),
+#     blocks, entry block. Statements: Move / Binop / Unop / Cmp / Cset /
+#     frame loads (stack parameters) / caller stack-argument pushes.
+#     Terminators: Jump / Switch / Ret / Trap / Call. Spill slots are
+#     per-virtual-register homes chosen by the register allocator;
+#     machine width is 64 bits for this slice.
+#
+# LIR INVARIANTS (the allocator/emitter are written to preserve them):
+#   I1 flag discipline: only LirCmp writes NZCV. Cset and the Switch
+#     terminator's compare-and-branch consume the flags of the most
+#     recent LirCmp in program order within the same block. The
+#     allocator inserts ONLY flag-neutral code (aarch64 ldr/str/stur/
+#     ldur/orr/movz/movk add/sub — none write NZCV), so a Cmp's consumer
+#     is never separated from it by a flag-writing instruction.
+#   I2 call clobber: every allocatable register is caller-saved (pool
+#     x9..x14). A value live across a call is split at the call: a
+#     register-resident pre-call segment stores to its spill slot right
+#     before the call; a register-resident post-call segment whose first
+#     event is a read reloads from that slot at its first use. Fixed
+#     x0..x7 are disjoint from the pool, so ABI precoloring can never
+#     collide with an allocated value.
+#   I3 positions: each statement/terminator occupies one linear position
+#     per block in function emission order; per-vreg interval hulls are
+#     computed over those positions and cut at every call position. The
+#     allocator and the emitter walk the function in the SAME order, so
+#     decision lookups (the segment containing a position) are always
+#     consistent.
+#
+# FAIL-CLOSED LOWERING: lower_mir_fn_to_lir returns Result::Err with a
+#   reason naming the construct and the rule when ANY unsupported
+#   construct appears. The driver route surfaces the error; it never
+#   silently falls back per function.
+#
+# ── TODOs (exact rules each needs) ─────────────────────────────────────
+#   TODO-agg   aggregates/enums: lower MirAggregate to per-field stores
+#              from layout_engine offsets; MirDeinit glue is ALREADY a
+#              separate MIR function and lowers through the generic call
+#              path once byte copies exist.
+#   TODO-drop  MirDeinit terminators / destruction chains: legalize only
+#              after aggregate representation lands (rule: destruction
+#              targets become calls to the drop-glue label resolved via
+#              MirProgram.drop_glue_fns; never inline drops).
+#   TODO-div   Div/Mod: a64 sdiv/udiv + msub; must lower the
+#              division-by-zero MirAssert first (rule: assert -> compare
+#              + branch to a trap block; LirCond needs no additions).
+#   TODO-wid   I8/I16/I32/U8/U16/U32/ISize/USize locals and params: add
+#              LirWidth and width-masked load/store (a64 ldrb/ldrh/
+#              ldr_w/strb/strh/str_w) with the codegen storage_signedness
+#              extension rule — today every value is a full 64-bit word.
+#   TODO-fp    Float/F32/F64: a separate register class + a64 vector/
+#              float encoders; new class in the allocator.
+#   TODO-sret  ScalarPair/ByAddress returns: x8 sret slot + copy-out
+#              epilogue (mirror allocate_locals' sret_offset rule).
+#   TODO-cc    callee-saved pool (x19..x28) with save/restore in the
+#              prologue/epilogue, growing the pool from x9..x14 toward
+#              the audit's 28-register target (needs reclaiming the
+#              x15/x16/x17 scratch set with dedicated address encoders).
+#   TODO-peep  scheduling backlog: move elimination via subsumption,
+#              cmp+branch fusion beyond the zero-test encoders added in
+#              asm.tg (a64_cbz/a64_cbnz), fallthrough block layout,
+#              constant rematerialization.
+#   TODO-runt  entry argc/argv capture for "main" is wired through
+#              codegen.tg's emit_save_argc_argv ctx helper (see
+#              lir_emit_function); a self-contained LIR capture is TODO.
+#
+# ── aarch64 ABI conventions used (mirroring codegen.tg) ───────────────
+#   Parameters 0..7 in x0..x7; parameters >= 8 at [FP + 16 + 16*k] in
+#   16-byte caller slots (FP = the frame pointer after stp fp,lr).
+#   Return value in x0. Frame: stp fp,lr [sp,#-16]!; mov fp,sp;
+#   sub sp,sp,#frame; spill slot i at [FP - 8 - 8*i]. Spill/address
+#   scratch is x15; instruction temporaries are x16/x17 — all three are
+#   outside the allocatable pool, so the pool is exactly x9..x14.
+
+use std::core::{Option, Result, panic}
+use std::collections::{Vec, Map, Set}
+
+use tg_compiler::types::{Type}
+use tg_compiler::mir::{
+  MirProgram, MirFunction, MirBlock, MirLocal, MirStatement,
+  MirStatementKind, MirTerminator, MirTerminatorKind,
+  MirRvalue, MirRvalueKind, MirOperand, MirOperandKind,
+  MirConstant, MirConstantKind, MirCallArg, MirCallValue,
+  MirBinOp, MirUnOp, CastKind,
+  Place, Projection, MirLocalId, MirBlockId
+}
+use tg_compiler::asm::{
+  CodeBuffer, buf_new, buf_pos, emit8, emit32_le, emit64_le,
+  def_label, add_fixup, add_reloc, add_symbol, align_to, resolve_fixups,
+  merge_code_buffer,
+  Arch, OsAbi, AsmTarget, Section, SymBinding, SymKind, AsmSymbol,
+  FixupKind, RelocKind,
+  A64, a64_code,
+  a64_add_rri, a64_add_rrr, a64_sub_rri, a64_sub_rrr, a64_sub_sp_sp_r,
+  a64_mul_rrr, a64_and_rrr, a64_orr_rrr, a64_eor_rrr,
+  a64_lsl_rrr, a64_lsl, a64_lsr_rrr, a64_lsr, a64_asr_rrr, a64_asr,
+  a64_neg, a64_mvn,
+  a64_mov_rr, a64_mov_ri,
+  a64_ldr, a64_str, a64_ldur, a64_stur,
+  a64_cmp_rr, a64_cmp_ri,
+  a64_cset, a64_cbz, a64_cbnz,
+  a64_b, a64_bcond, a64_bl,
+  a64_ret, a64_stp_pre, a64_ldp_post, a64_ldr_post, a64_udf,
+  a64_cc_eq, a64_cc_ne, a64_cc_cs, a64_cc_cc,
+  a64_cc_lt, a64_cc_le, a64_cc_gt, a64_cc_ge,
+  a64_cc_hi, a64_cc_ls
+}
+use tg_compiler::object::{ObjectFile, build_object}
+use tg_compiler::linker::{LinkerInput, link_executable}
+use tg_compiler::runtime::{runtime_ctx_new, emit_all_runtime}
+use tg_compiler::codegen::{
+  CodegenCtx, codegen_new, emit_argc_argv_data, emit_allocator_runtime_data,
+  emit_runtime_str_concat, emit_runtime_str_chars, emit_save_argc_argv
+}
+
+# ———————————————————————————————————————————————————————————————
+# Register model
+# ———————————————————————————————————————————————————————————————
+# Virtual registers are plain Int ids: 0..7 are FIXED (precolored) ABI
+# registers x0..x7; ordinary virtual registers start at 8. Fixed vregs
+# are never interval-allocated: their physical register IS the vreg id.
+# This keeps the precolored argument/result traffic disjoint from the
+# allocatable pool by construction (invariant I2).
+
+# Fixed (precolored) ABI virtual register count: ids 0..7 == x0..x7.
+def lir_fixed_vregs() -> Int = 8
+
+# First ordinary virtual register id.
+def lir_first_alloc_vreg() -> Int = 8
+
+# The allocatable pool for this slice: x9..x14 (caller-saved; x15 =
+# address scratch, x16/x17 = instruction temporaries, x18 = platform,
+# x19+ = callee-saved — reserved; see TODO-cc).
+def lir_pool_regs() -> Vec[Int]
+  var out: Vec[Int] = Vec::new()
+  out.push(9)
+  out.push(10)
+  out.push(11)
+  out.push(12)
+  out.push(13)
+  out.push(14)
+  out
+end
+
+def lir_reg_a64(id: Int) -> A64
+  match id
+  when 0 then A64::X0
+  when 1 then A64::X1
+  when 2 then A64::X2
+  when 3 then A64::X3
+  when 4 then A64::X4
+  when 5 then A64::X5
+  when 6 then A64::X6
+  when 7 then A64::X7
+  when 8 then A64::X8
+  when 9 then A64::X9
+  when 10 then A64::X10
+  when 11 then A64::X11
+  when 12 then A64::X12
+  when 13 then A64::X13
+  when 14 then A64::X14
+  when 15 then A64::X15
+  when 16 then A64::X16
+  when 17 then A64::X17
+  when 18 then A64::X18
+  when 19 then A64::X19
+  when 20 then A64::X20
+  when 21 then A64::X21
+  when 22 then A64::X22
+  when 23 then A64::X23
+  when 24 then A64::X24
+  when 25 then A64::X25
+  when 26 then A64::X26
+  when 27 then A64::X27
+  when 28 then A64::X28
+  when 29 then A64::FP
+  when 30 then A64::LR
+  when _ then panic("lir_reg_a64: no register for id " + id.to_string())
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# LIR IR — Slice 1
+# ———————————————————————————————————————————————————————————————
+# Machine-width arithmetic: 64-bit words on aarch64 for this slice (the
+# TODO-wid rules hold the narrower widths). Explicit spill slots: the
+# allocator's per-vreg 8-byte homes, FP-relative (emitted as load/store
+# code at the points the allocation decides — never implicit).
+
+struct LirBlock
+  id: Int
+  stmts: Vec[LirStmt]
+  term: LirTerm
+end
+
+struct LirFunction
+  name: String
+  # Total virtual-register count (ids 0..vregs-1; 0..7 are fixed ABI).
+  vregs: Int
+  # Parameter virtual registers, in ABI order. ABI class derives from the
+  # index: i < 8 -> x_i (register class); i >= 8 -> the caller's stack
+  # slot [FP + 16 + 16*(i-8)] (stack class) — the aarch64 rule.
+  params: Vec[Int]
+  # The return-slot virtual register (the value MirReturn returns) when
+  # the function's return type is a scalar.
+  ret_vreg: Option[Int]
+  blocks: Vec[LirBlock]
+  entry_block: Int
+end
+
+enum LirValue
+  LirReg(Int)   # a virtual register (fixed id 0..7, or an ordinary id)
+  LirImm(Int)   # 64-bit immediate payload
+end
+
+# Comparison condition: signed forms plus the unsigned aarch64 forms
+# (unsigned LT = LO/cc, LE = LS, GT = HI, GE = HS/cs). Unsignedness is
+# decided at lowering from the MIR operand types, never re-derived.
+enum LirCond
+  LirEq
+  LirNe
+  LirLt
+  LirLe
+  LirGt
+  LirGe
+  LirUlt
+  LirUle
+  LirUgt
+  LirUge
+end
+
+enum LirBinOp
+  LirAdd
+  LirSub
+  LirMul
+  LirAnd
+  LirOr
+  LirXor
+  LirShl
+  LirAsr     # signed (arithmetic) shift right
+  LirLsr     # unsigned (logical) shift right
+end
+
+enum LirUnOp
+  LirNeg
+  LirBitNot
+end
+
+enum LirStmtKind
+  # dst vreg <- Reg(vreg)|Imm
+  LirMove(Int, LirValue)
+  # op, dst vreg, left operand (register), right operand (reg or imm)
+  LirBinop(LirBinOp, Int, LirValue, LirValue)
+  # op, dst vreg, src vreg
+  LirUnop(LirUnOp, Int, Int)
+  # sets NZCV (invariant I1); left register, right reg or imm
+  LirCmp(LirValue, LirValue)
+  # dst = (flags satisfy cond) ? 1 : 0 — reads the flags of the most
+  # recent LirCmp in program order (I1)
+  LirCset(LirCond, Int)
+  # Load the 8-byte stack-parameter word at [FP + offset] (offset >= 16;
+  # used only to bind parameters at index >= 8 at function entry)
+  LirLoadFrame(Int, Int)
+  # Caller-side stack argument: reserve one 16-byte slot below SP and
+  # store the value there (the aarch64 caller-slot convention)
+  LirPushArg(Int)
+end
+
+struct LirStmt
+  kind: LirStmtKind
+end
+
+struct LirSwitchArm
+  value: Int
+  target: Int
+end
+
+enum LirTermKind
+  LirJump(Int)                            # target block id
+  LirSwitch(Int, Vec[LirSwitchArm], Int)  # vreg, arms, default block
+  LirRet(Option[Int])                     # Some(vreg): load value to x0
+  LirTrap
+  # Direct call: target = the callee's emission name; args = the arg
+  # vregs (args 0..7 moved into fixed x0..x7 and args >= 8 pushed via
+  # LirPushArg statements in DESCENDING index order immediately before
+  # this terminator); stack_args = the number of pushed 16-byte caller
+  # slots (SP cleanup after the call); dest = the result vreg (Some when
+  # the callee's return type is a scalar); success = the MirCall success
+  # block (jumped to after the dest write).
+  LirCall(String, Vec[Int], Int, Option[Int], Int)
+end
+
+struct LirTerm
+  kind: LirTermKind
+end
+
+# ———————————————————————————————————————————————————————————————
+# Scalar-subset type helpers
+# ———————————————————————————————————————————————————————————————
+
+# Is the type a 64-bit integer machine word of this slice (Int/UInt)?
+def lir_is_int_word(ty: Type) -> Bool
+  match ty
+  when Type::Int then true
+  when Type::UInt then true
+  when _ then false
+  end
+end
+
+# Is the type an allowed Bool local (comparison results/constants)?
+def lir_is_bool_word(ty: Type) -> Bool
+  match ty
+  when Type::Bool then true
+  when _ then false
+  end
+end
+
+# Any scalar this slice can place in a virtual register.
+def lir_is_scalar_word(ty: Type) -> Bool
+  lir_is_int_word(ty) || lir_is_bool_word(ty)
+end
+
+# Unsignedness of an integer word (false for signed Int).
+def lir_is_unsigned(ty: Type) -> Bool
+  match ty
+  when Type::UInt then true
+  when _ then false
+  end
+end
+
+# The aarch64 condition code of a LirCond (Cset and branches).
+def lir_cond_code(c: LirCond) -> u32
+  match c
+  when LirCond::LirEq then a64_cc_eq()
+  when LirCond::LirNe then a64_cc_ne()
+  when LirCond::LirLt then a64_cc_lt()
+  when LirCond::LirLe then a64_cc_le()
+  when LirCond::LirGt then a64_cc_gt()
+  when LirCond::LirGe then a64_cc_ge()
+  when LirCond::LirUlt then a64_cc_cc()  # unsigned lower = LO (CC)
+  when LirCond::LirUle then a64_cc_ls()
+  when LirCond::LirUgt then a64_cc_hi()
+  when LirCond::LirUge then a64_cc_cs()  # unsigned higher-or-same = HS
+  end
+end
+
+# The LirCond for an MIR integer comparison under the operands'
+# signedness.
+def lir_cond_of(op: MirBinOp, unsigned: Bool) -> LirCond
+  if unsigned then
+    match op
+    when MirBinOp::Eq then LirCond::LirEq
+    when MirBinOp::Ne then LirCond::LirNe
+    when MirBinOp::Lt then LirCond::LirUlt
+    when MirBinOp::Le then LirCond::LirUle
+    when MirBinOp::Gt then LirCond::LirUgt
+    when MirBinOp::Ge then LirCond::LirUge
+    when _ then panic("lir_cond_of: non-comparison op")
+    end
+  else
+    match op
+    when MirBinOp::Eq then LirCond::LirEq
+    when MirBinOp::Ne then LirCond::LirNe
+    when MirBinOp::Lt then LirCond::LirLt
+    when MirBinOp::Le then LirCond::LirLe
+    when MirBinOp::Gt then LirCond::LirGt
+    when MirBinOp::Ge then LirCond::LirGe
+    when _ then panic("lir_cond_of: non-comparison op")
+    end
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Lowering: MIR -> LIR (Slice 2)
+# ———————————————————————————————————————————————————————————————
+# Fail-closed: every unsupported construct returns Result::Err with a
+# rule-naming message. See the module header for the supported subset.
+
+struct LirLowerCtx
+  fn_name: String
+  # MirLocalId.id -> type (locals include parameters in this MIR)
+  local_tys: Map[Int, Type]
+  # MirLocalId.id -> virtual register
+  vreg_of: Map[Int, Int]
+  next_vreg: Int
+  # Per-block statement accumulation, keyed by block id
+  block_stmts: Map[Int, Vec[LirStmt]]
+  # Per-block terminator, keyed by block id
+  block_terms: Map[Int, LirTerm]
+  # One function-wide scratch virtual register for parallel-move cycles
+  scratch: Int
+end
+
+def lir_lower_ctx_new(f: MirFunction) -> LirLowerCtx
+  var local_tys: Map[Int, Type] = Map::new()
+  var li = 0
+  while li < f.locals.len() do
+    local_tys.insert(f.locals[li].id.id, f.locals[li].ty.clone())
+    li = li + 1
+  end
+  var vreg_of: Map[Int, Int] = Map::new()
+  var next = lir_first_alloc_vreg()
+  var block_stmts: Map[Int, Vec[LirStmt]] = Map::new()
+  var block_terms: Map[Int, LirTerm] = Map::new()
+  # The scratch vreg is reserved up front (id 8) so parallel-move cycle
+  # breaking can always materialize; ordinary vregs follow.
+  let scratch = next
+  next = next + 1
+  # Assign the return slot first (locals[0] is the return place).
+  if f.locals.len() > 0 && lir_is_scalar_word(f.locals[0].ty) then
+    vreg_of.insert(f.locals[0].id.id, next)
+    next = next + 1
+  end
+  # Parameters in declaration order (they also appear in locals).
+  var pi = 0
+  while pi < f.params.len() do
+    let p = f.params[pi]
+    if !vreg_of.contains_key(&p.id.id) then
+      if lir_is_scalar_word(p.ty) then
+        vreg_of.insert(p.id.id, next)
+        next = next + 1
+      end
+    end
+    pi = pi + 1
+  end
+  LirLowerCtx {
+    fn_name: f.name.clone(),
+    local_tys: local_tys,
+    vreg_of: vreg_of,
+    next_vreg: next,
+    block_stmts: block_stmts,
+    block_terms: block_terms,
+    scratch: scratch
+  }
+end
+
+# A fresh ordinary virtual register (lowered temporaries).
+def lir_fresh_vreg(inout ctx: LirLowerCtx) -> Int
+  let id = ctx.next_vreg
+  ctx.next_vreg = id + 1
+  id
+end
+
+# The type of a MIR local by id (parameters included).
+def lir_local_ty(ctx: LirLowerCtx, id: Int) -> Type
+  match ctx.local_tys.get(id)
+  when Option::Some(ty) then ty.clone()
+  when Option::None then panic("lir_local_ty: no local " + id.to_string() + " in " + ctx.fn_name)
+  end
+end
+
+# Virtual register for a scalar local (allocating one on first touch).
+# Fail-closed for non-scalar locals.
+def lir_vreg_of_local(inout ctx: LirLowerCtx, id: Int) -> Result[Int, String]
+  match ctx.vreg_of.get(id)
+  when Option::Some(v) then Result::Ok(v)
+  when Option::None then
+    let ty = lir_local_ty(ctx, id)
+    if lir_is_scalar_word(ty) then
+      let v = lir_fresh_vreg(ctx)
+      ctx.vreg_of.insert(id, v)
+      Result::Ok(v)
+    else
+      Result::Err("lir: local " + id.to_string() + " in " + ctx.fn_name + " has unsupported type (only Int/UInt/Bool locals lower; aggregates/enums/refs/strings need TODO-agg)")
+    end
+  end
+end
+
+# Fail-closed whole-function shape check (types/params/return/contracts).
+def lir_check_fn_shape(f: MirFunction) -> Result[Unit, String]
+  match f.ret_type
+  when Type::Unit then ()
+  when Type::Int then ()
+  when Type::UInt then ()
+  when _ then
+    return Result::Err("lir: function " + f.name + " returns an unsupported type (only Unit/Int/UInt lower; TODO-wid/TODO-agg hold the other rules)")
+  end
+  var pi = 0
+  while pi < f.params.len() do
+    let pty = f.params[pi].ty
+    if !lir_is_int_word(pty) then
+      return Result::Err("lir: parameter " + f.params[pi].name + " of " + f.name + " has an unsupported type (only Int/UInt parameters lower; Bool/aggregate parameters need TODO-agg/TODO-wid)")
+    end
+    pi = pi + 1
+  end
+  var li = 0
+  while li < f.locals.len() do
+    let lty = f.locals[li].ty
+    if !lir_is_scalar_word(lty) then
+      return Result::Err("lir: local " + f.locals[li].name + " of " + f.name + " has an unsupported type (only Int/UInt/Bool locals lower; TODO-agg/TODO-wid)")
+    end
+    li = li + 1
+  end
+  if f.contracts.len() > 0 then
+    return Result::Err("lir: function " + f.name + " carries MIR contracts (agentic contract lowering has no rule yet)")
+  end
+  Result::Ok(())
+end
+
+# A place used as a scalar value: local without projections.
+def lir_place_scalar_local(place: Place) -> Option[Int]
+  if place.projections.len() == 0 then
+    Option::Some(place.local.id)
+  else
+    Option::None
+  end
+end
+
+# The scalar local id of a place-like MIR operand (Copy/MovePlace/Read/
+# Consume), or Option::None for a scalar constant. Rejects every operand
+# shape outside the scalar subset (fail-closed).
+def lir_operand_scalar(ctx: LirLowerCtx, op: MirOperand) -> Result[Option[Int], String]
+  match op.kind
+  when MirOperandKind::MirCopy(place) then
+    lir_operand_place_local(ctx, place)
+  when MirOperandKind::MirMovePlace(place) then
+    lir_operand_place_local(ctx, place)
+  when MirOperandKind::MirRead(place) then
+    lir_operand_place_local(ctx, place)
+  when MirOperandKind::MirConsume(place) then
+    # Ownership moves of SCALARS have no runtime representation: the
+    # value is copied and MIR's storage accounting handles the local
+    # (the legalization contract — no drops exist for scalars).
+    lir_operand_place_local(ctx, place)
+  when MirOperandKind::MirConstant(cst) then
+    match cst.kind
+    when MirConstantKind::MirInt(_) then Result::Ok(Option::None)
+    when MirConstantKind::MirBool(_) then Result::Ok(Option::None)
+    when MirConstantKind::MirUnit then Result::Ok(Option::None)
+    when _ then Result::Err("lir: " + ctx.fn_name + ": non-integer/bool constant operands do not lower (TODO-agg/TODO-fp)")
+    end
+  end
+end
+
+def lir_operand_place_local(ctx: LirLowerCtx, place: Place) -> Result[Option[Int], String]
+  match lir_place_scalar_local(place)
+  when Option::Some(id) then
+    if lir_is_scalar_word(lir_local_ty(ctx, id)) then
+      Result::Ok(Option::Some(id))
+    else
+      Result::Err("lir: " + ctx.fn_name + ": operand place of a non-scalar local does not lower (TODO-agg)")
+    end
+  when Option::None then
+    Result::Err("lir: " + ctx.fn_name + ": projected/deref places do not lower in the scalar slice (TODO-agg)")
+  end
+end
+
+# The static MIR type of an operand (locals by id; constants carry ty).
+def lir_operand_ty(ctx: LirLowerCtx, op: MirOperand) -> Result[Type, String]
+  match op.kind
+  when MirOperandKind::MirConstant(cst) then Result::Ok(cst.ty.clone())
+  when MirOperandKind::MirCopy(place) then Result::Ok(lir_local_ty(ctx, place.local.id))
+  when MirOperandKind::MirMovePlace(place) then Result::Ok(lir_local_ty(ctx, place.local.id))
+  when MirOperandKind::MirRead(place) then Result::Ok(lir_local_ty(ctx, place.local.id))
+  when MirOperandKind::MirConsume(place) then Result::Ok(lir_local_ty(ctx, place.local.id))
+  end
+end
+
+# Signedness of an operand pair: both sides must be Int or both UInt.
+# Mixed signedness is rejected (fail-closed; an explicit cast is the
+# documented remedy).
+def lir_operand_signedness(ctx: LirLowerCtx, left: MirOperand, right: MirOperand) -> Result[Bool, String]
+  match lir_operand_ty(ctx, left)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(lt) then
+    match lir_operand_ty(ctx, right)
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(rt) then
+      if !lir_is_int_word(lt) || !lir_is_int_word(rt) then
+        return Result::Err("lir: " + ctx.fn_name + ": binop/comparison operands must be Int/UInt (bool/aggregate arithmetic is outside the slice)")
+      end
+      let lu = lir_is_unsigned(lt)
+      let ru = lir_is_unsigned(rt)
+      if lu != ru then
+        return Result::Err("lir: " + ctx.fn_name + ": mixed Int/UInt arithmetic does not lower (an explicit cast is required; fail-closed)")
+      end
+      Result::Ok(lu)
+    end
+  end
+end
+
+# Register value of an operand: a local's vreg, or a fresh temporary
+# loaded with the immediate for a constant (constants are materialized,
+# never folded — the optimizer owns folding).
+def lir_value_of_operand(inout ctx: LirLowerCtx, block_id: Int, op: MirOperand) -> Result[Int, String]
+  match lir_operand_scalar(ctx, op)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(oval) then
+    match oval
+    when Option::Some(src_id) then
+      let src_v = match lir_vreg_of_local(ctx, src_id)
+      when Result::Ok(v) then v
+      when Result::Err(e) then return Result::Err(e)
+      end
+      Result::Ok(src_v)
+    when Option::None then
+      match op.kind
+      when MirOperandKind::MirConstant(cst) then
+        let tmp = lir_fresh_vreg(ctx)
+        lir_emit_move_vreg(ctx, block_id, tmp, LirValue::LirImm(lir_const_imm(cst)))
+        Result::Ok(tmp)
+      when _ then Result::Err("lir: " + ctx.fn_name + ": operand did not resolve to a scalar local")
+      end
+    end
+  end
+end
+
+# The immediate payload of a scalar MIR constant (MirUnit yields 0; it is
+# only ever moved into Unit destinations, which have no virtual register).
+def lir_const_imm(cst: MirConstant) -> Int
+  match cst.kind
+  when MirConstantKind::MirInt(v) then v
+  when MirConstantKind::MirBool(b) then if b then 1 else 0 end
+  when MirConstantKind::MirUnit then 0
+  when _ then panic("lir_const_imm: non-scalar constant")
+  end
+end
+
+# Append a statement to a block's accumulated list.
+def lir_append_stmt(inout ctx: LirLowerCtx, block_id: Int, kind: LirStmtKind) -> Unit
+  match ctx.block_stmts.get(block_id)
+  when Option::Some(list) then
+    var l = list.clone()
+    l.push(LirStmt { kind: kind })
+    ctx.block_stmts.insert(block_id, l)
+  when Option::None then
+    var l: Vec[LirStmt] = Vec::new()
+    l.push(LirStmt { kind: kind })
+    ctx.block_stmts.insert(block_id, l)
+  end
+end
+
+def lir_emit_move_vreg(inout ctx: LirLowerCtx, block_id: Int, dst: Int, val: LirValue) -> Unit
+  lir_append_stmt(ctx, block_id, LirStmtKind::LirMove(dst, val))
+end
+# ———————————————————————————————————————————————————————————————
+# Lowering — statements and rvalues
+# ———————————————————————————————————————————————————————————————
+
+# Prefix a block's statement list with the entry parameter bindings.
+def lir_append_bindings(inout ctx: LirLowerCtx, block_id: Int, binds: Vec[LirStmt]) -> Unit
+  match ctx.block_stmts.get(block_id)
+  when Option::Some(list) then
+    var merged: Vec[LirStmt] = Vec::new()
+    var bi = 0
+    while bi < binds.len() do
+      merged.push(binds[bi].clone())
+      bi = bi + 1
+    end
+    var si = 0
+    while si < list.len() do
+      merged.push(list[si].clone())
+      si = si + 1
+    end
+    ctx.block_stmts.insert(block_id, merged)
+  when Option::None then
+    ctx.block_stmts.insert(block_id, binds.clone())
+  end
+end
+
+# Record a block's terminator.
+def lir_set_term(inout ctx: LirLowerCtx, block_id: Int, kind: LirTermKind) -> Unit
+  ctx.block_terms.insert(block_id, LirTerm { kind: kind })
+end
+
+# Lower one MirAssign statement into LIR statements of the block.
+def lir_lower_assign(inout ctx: LirLowerCtx, block_id: Int, place: Place, rvalue: MirRvalue) -> Result[Unit, String]
+  match lir_place_scalar_local(place)
+  when Option::Some(dst_id) then
+    if !lir_is_scalar_word(lir_local_ty(ctx, dst_id)) then
+      return Result::Err("lir: " + ctx.fn_name + ": assignment into a non-scalar local does not lower (TODO-agg)")
+    end
+    let dst_ty = lir_local_ty(ctx, dst_id)
+    let dst_v = match lir_vreg_of_local(ctx, dst_id)
+    when Result::Ok(v) then v
+    when Result::Err(e) then return Result::Err(e)
+    end
+    match rvalue.kind
+    when MirRvalueKind::MirPhi(_) then
+      # Phi rvalues are lowered as PREDECESSOR-EDGE copies (see the
+      # terminator lowering); the in-block occurrence is a no-op (the
+      # codegen.tg emit_phi_copies convention).
+      Result::Ok(())
+    when MirRvalueKind::MirMove(op) then
+      lir_lower_move_value(ctx, block_id, dst_ty, dst_v, op)
+    when MirRvalueKind::MirCast(kind, op, target_ty) then
+      match kind
+      when CastKind::IntToInt then
+        if !lir_is_int_word(dst_ty) then
+          return Result::Err("lir: " + ctx.fn_name + ": IntToInt cast into a non-integer destination does not lower")
+        end
+        match target_ty
+        when Type::Int then ()
+        when Type::UInt then ()
+        when _ then
+          return Result::Err("lir: " + ctx.fn_name + ": only 64-bit IntToInt casts lower (width-changing casts need TODO-wid)")
+        end
+        # 64-bit Int <-> UInt casts are value-preserving on the machine
+        # word (the arm above already restricted the target type).
+        lir_lower_move_value(ctx, block_id, dst_ty, dst_v, op)
+      when _ then
+        Result::Err("lir: " + ctx.fn_name + ": only IntToInt casts lower (float/pointer/transmute casts need TODO-fp/TODO-agg)")
+      end
+    when MirRvalueKind::MirBinOp(op, left, right) then
+      lir_lower_binop(ctx, block_id, dst_ty, dst_v, op, left, right)
+    when MirRvalueKind::MirUnOp(op, operand) then
+      lir_lower_unop(ctx, block_id, dst_ty, dst_v, op, operand)
+    when MirRvalueKind::MirRef(_) then
+      Result::Err("lir: " + ctx.fn_name + ": MirRef (address-of) does not lower (references need TODO-agg)")
+    when MirRvalueKind::MirAggregate(_, _) then
+      Result::Err("lir: " + ctx.fn_name + ": aggregate construction does not lower (TODO-agg)")
+    when MirRvalueKind::MirDiscriminant(_) then
+      Result::Err("lir: " + ctx.fn_name + ": discriminant reads do not lower (enums need TODO-agg)")
+    when MirRvalueKind::MirLen(_) then
+      Result::Err("lir: " + ctx.fn_name + ": length reads do not lower (collections need TODO-agg)")
+    when MirRvalueKind::MirRepeat(_, _) then
+      Result::Err("lir: " + ctx.fn_name + ": array-repeat does not lower (TODO-agg)")
+    end
+  when Option::None then
+    Result::Err("lir: " + ctx.fn_name + ": assignment into a projected/deref place does not lower in the scalar slice (TODO-agg)")
+  end
+end
+
+# Move/cast a scalar operand into dst_v.
+def lir_lower_move_value(inout ctx: LirLowerCtx, block_id: Int, dst_ty: Type, dst_v: Int, op: MirOperand) -> Result[Unit, String]
+  match op.kind
+  when MirOperandKind::MirConstant(cst) then
+    if !lir_is_scalar_word(dst_ty) then
+      return Result::Err("lir: " + ctx.fn_name + ": constant into a non-scalar destination (TODO-agg)")
+    end
+    match cst.kind
+    when MirConstantKind::MirInt(_) then
+      if lir_is_int_word(dst_ty) then
+        lir_emit_move_vreg(ctx, block_id, dst_v, LirValue::LirImm(lir_const_imm(cst)))
+        Result::Ok(())
+      else
+        Result::Err("lir: " + ctx.fn_name + ": integer constant into a Bool destination does not lower (Bool locals hold comparison results and Bool constants only)")
+      end
+    when MirConstantKind::MirBool(_) then
+      if lir_is_bool_word(dst_ty) then
+        lir_emit_move_vreg(ctx, block_id, dst_v, LirValue::LirImm(lir_const_imm(cst)))
+        Result::Ok(())
+      else
+        Result::Err("lir: " + ctx.fn_name + ": Bool constant into a non-Bool destination does not lower")
+      end
+    when MirConstantKind::MirUnit then
+      Result::Err("lir: " + ctx.fn_name + ": unit constant move into a scalar destination does not lower")
+    when _ then
+      Result::Err("lir: " + ctx.fn_name + ": non-integer/bool constant moves do not lower (TODO-agg/TODO-fp)")
+    end
+  when MirOperandKind::MirCopy(_) then
+    lir_emit_move_from_place(ctx, block_id, dst_v, op)
+  when MirOperandKind::MirMovePlace(_) then
+    lir_emit_move_from_place(ctx, block_id, dst_v, op)
+  when MirOperandKind::MirRead(_) then
+    lir_emit_move_from_place(ctx, block_id, dst_v, op)
+  when MirOperandKind::MirConsume(_) then
+    # Scalar ownership move: the value is read and MIR's storage
+    # accounting owns the local (the legalization contract — no runtime
+    # drop exists for scalars).
+    lir_emit_move_from_place(ctx, block_id, dst_v, op)
+  end
+end
+
+# Move dst_v <- the scalar local named by a place-like operand.
+def lir_emit_move_from_place(inout ctx: LirLowerCtx, block_id: Int, dst_v: Int, op: MirOperand) -> Result[Unit, String]
+  match lir_operand_scalar(ctx, op)
+  when Result::Err(e) then Result::Err(e)
+  when Result::Ok(oval) then
+    match oval
+    when Option::Some(src_id) then
+      let src_v = match lir_vreg_of_local(ctx, src_id)
+      when Result::Ok(v) then v
+      when Result::Err(e) then return Result::Err(e)
+      end
+      if src_v != dst_v then
+        lir_emit_move_vreg(ctx, block_id, dst_v, LirValue::LirReg(src_v))
+      end
+      Result::Ok(())
+    when Option::None then
+      Result::Err("lir: " + ctx.fn_name + ": place-like operand did not resolve to a scalar local")
+    end
+  end
+end
+
+# Right operand of a binop: registers stay registers; scalar constants
+# stay immediates (the emitter materializes as needed).
+def lir_binop_rhs(ctx: LirLowerCtx, op: MirOperand) -> Result[LirValue, String]
+  match op.kind
+  when MirOperandKind::MirConstant(cst) then
+    match cst.kind
+    when MirConstantKind::MirInt(_) then Result::Ok(LirValue::LirImm(lir_const_imm(cst)))
+    when MirConstantKind::MirBool(_) then Result::Ok(LirValue::LirImm(lir_const_imm(cst)))
+    when MirConstantKind::MirUnit then Result::Err("lir: " + ctx.fn_name + ": unit constant cannot be a binop operand")
+    when _ then Result::Err("lir: " + ctx.fn_name + ": non-scalar constant binop operand (TODO-agg)")
+    end
+  when MirOperandKind::MirCopy(place) then
+    lir_rhs_from_place(ctx, place)
+  when MirOperandKind::MirMovePlace(place) then
+    lir_rhs_from_place(ctx, place)
+  when MirOperandKind::MirRead(place) then
+    lir_rhs_from_place(ctx, place)
+  when MirOperandKind::MirConsume(place) then
+    lir_rhs_from_place(ctx, place)
+  end
+end
+
+def lir_rhs_from_place(inout ctx: LirLowerCtx, place: Place) -> Result[LirValue, String]
+  match lir_place_scalar_local(place)
+  when Option::Some(id) then
+    let v = match lir_vreg_of_local(ctx, id)
+    when Result::Ok(vv) then vv
+    when Result::Err(e) then return Result::Err(e)
+    end
+    Result::Ok(LirValue::LirReg(v))
+  when Option::None then
+    Result::Err("lir: " + ctx.fn_name + ": projected/deref binop operand does not lower (TODO-agg)")
+  end
+end
+
+def lir_lower_binop(inout ctx: LirLowerCtx, block_id: Int, dst_ty: Type, dst_v: Int, op: MirBinOp, left: MirOperand, right: MirOperand) -> Result[Unit, String]
+  match op
+  when MirBinOp::Add then
+    lir_lower_int_binop(ctx, block_id, dst_ty, dst_v, LirBinOp::LirAdd, left, right)
+  when MirBinOp::Sub then
+    lir_lower_int_binop(ctx, block_id, dst_ty, dst_v, LirBinOp::LirSub, left, right)
+  when MirBinOp::Mul then
+    lir_lower_int_binop(ctx, block_id, dst_ty, dst_v, LirBinOp::LirMul, left, right)
+  when MirBinOp::BitAnd then
+    lir_lower_int_binop(ctx, block_id, dst_ty, dst_v, LirBinOp::LirAnd, left, right)
+  when MirBinOp::BitOr then
+    lir_lower_int_binop(ctx, block_id, dst_ty, dst_v, LirBinOp::LirOr, left, right)
+  when MirBinOp::BitXor then
+    lir_lower_int_binop(ctx, block_id, dst_ty, dst_v, LirBinOp::LirXor, left, right)
+  when MirBinOp::Shl then
+    lir_lower_int_binop(ctx, block_id, dst_ty, dst_v, LirBinOp::LirShl, left, right)
+  when MirBinOp::Shr then
+    match lir_operand_signedness(ctx, left, right)
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(unsigned) then
+      if unsigned then
+        lir_lower_int_binop(ctx, block_id, dst_ty, dst_v, LirBinOp::LirLsr, left, right)
+      else
+        lir_lower_int_binop(ctx, block_id, dst_ty, dst_v, LirBinOp::LirAsr, left, right)
+      end
+    end
+  when MirBinOp::Div then
+    Result::Err("lir: " + ctx.fn_name + ": integer division does not lower yet (TODO-div: sdiv/udiv + msub, with the division-by-zero MirAssert lowered first)")
+  when MirBinOp::Mod then
+    Result::Err("lir: " + ctx.fn_name + ": integer remainder does not lower yet (TODO-div: sdiv/udiv + msub)")
+  when MirBinOp::Eq then lir_lower_cmp(ctx, block_id, dst_v, op, left, right)
+  when MirBinOp::Ne then lir_lower_cmp(ctx, block_id, dst_v, op, left, right)
+  when MirBinOp::Lt then lir_lower_cmp(ctx, block_id, dst_v, op, left, right)
+  when MirBinOp::Le then lir_lower_cmp(ctx, block_id, dst_v, op, left, right)
+  when MirBinOp::Gt then lir_lower_cmp(ctx, block_id, dst_v, op, left, right)
+  when MirBinOp::Ge then lir_lower_cmp(ctx, block_id, dst_v, op, left, right)
+  end
+end
+
+def lir_lower_int_binop(inout ctx: LirLowerCtx, block_id: Int, dst_ty: Type, dst_v: Int, lop: LirBinOp, left: MirOperand, right: MirOperand) -> Result[Unit, String]
+  if !lir_is_int_word(dst_ty) then
+    return Result::Err("lir: " + ctx.fn_name + ": arithmetic writes a non-integer destination (only Int/UInt destinations lower)")
+  end
+  match lir_operand_signedness(ctx, left, right)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(_) then ()
+  end
+  let lv = match lir_value_of_operand(ctx, block_id, left)
+  when Result::Ok(v) then v
+  when Result::Err(e) then return Result::Err(e)
+  end
+  let rv = match lir_binop_rhs(ctx, right)
+  when Result::Ok(v) then v
+  when Result::Err(e) then return Result::Err(e)
+  end
+  lir_append_stmt(ctx, block_id, LirStmtKind::LirBinop(lop, dst_v, LirValue::LirReg(lv), rv))
+  Result::Ok(())
+end
+
+# An integer comparison (Eq..Ge) materializing 0/1 into a Bool
+# destination via Cmp + Cset (invariant I1 keeps the pair fused).
+def lir_lower_cmp(inout ctx: LirLowerCtx, block_id: Int, dst_v: Int, op: MirBinOp, left: MirOperand, right: MirOperand) -> Result[Unit, String]
+  let unsigned = match lir_operand_signedness(ctx, left, right)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(u) then u
+  end
+  let lv = match lir_value_of_operand(ctx, block_id, left)
+  when Result::Ok(v) then v
+  when Result::Err(e) then return Result::Err(e)
+  end
+  let rv = match lir_binop_rhs(ctx, right)
+  when Result::Ok(v) then v
+  when Result::Err(e) then return Result::Err(e)
+  end
+  let cond = lir_cond_of(op, unsigned)
+  lir_append_stmt(ctx, block_id, LirStmtKind::LirCmp(LirValue::LirReg(lv), rv))
+  lir_append_stmt(ctx, block_id, LirStmtKind::LirCset(cond, dst_v))
+  Result::Ok(())
+end
+
+def lir_lower_unop(inout ctx: LirLowerCtx, block_id: Int, dst_ty: Type, dst_v: Int, op: MirUnOp, operand: MirOperand) -> Result[Unit, String]
+  match op
+  when MirUnOp::Not then
+    Result::Err("lir: " + ctx.fn_name + ": Bool Not does not lower (bool arithmetic is outside the slice; branch on the value instead)")
+  when MirUnOp::Neg then
+    if !lir_is_int_word(dst_ty) then
+      return Result::Err("lir: " + ctx.fn_name + ": Neg writes a non-integer destination")
+    end
+    let sv = match lir_value_of_operand(ctx, block_id, operand)
+    when Result::Ok(v) then v
+    when Result::Err(e) then return Result::Err(e)
+    end
+    lir_append_stmt(ctx, block_id, LirStmtKind::LirUnop(LirUnOp::LirNeg, dst_v, sv))
+    Result::Ok(())
+  when MirUnOp::BitNot then
+    if !lir_is_int_word(dst_ty) then
+      return Result::Err("lir: " + ctx.fn_name + ": BitNot writes a non-integer destination")
+    end
+    let sv = match lir_value_of_operand(ctx, block_id, operand)
+    when Result::Ok(v) then v
+    when Result::Err(e) then return Result::Err(e)
+    end
+    lir_append_stmt(ctx, block_id, LirStmtKind::LirUnop(LirUnOp::LirBitNot, dst_v, sv))
+    Result::Ok(())
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Lowering — terminators
+# ———————————————————————————————————————————————————————————————
+
+# Successor block ids of an MIR terminator (codegen.tg's successor list —
+# the phi-edge scan authority).
+def lir_succ_ids(term: MirTerminator) -> Vec[Int]
+  var succs: Vec[Int] = Vec::new()
+  match term.kind
+  when MirTerminatorKind::MirGoto(target) then
+    succs.push(target.id)
+  when MirTerminatorKind::MirSwitchInt { op, targets, default_target } then
+    var ti = 0
+    while ti < targets.len() do
+      succs.push(targets[ti].target.id)
+      ti = ti + 1
+    end
+    succs.push(default_target.id)
+  when MirTerminatorKind::MirCall { dest, func, args, success, unwind, intrinsic } then
+    succs.push(success.id)
+  when MirTerminatorKind::MirDeinit { place, deinit_fn, target, unwind } then
+    succs.push(target.id)
+  when MirTerminatorKind::MirAssert { cond, expected, msg, target, unwind } then
+    succs.push(target.id)
+  when _ then ()
+  end
+  succs
+end
+
+# Is local id `s` the DESTINATION of a pending parallel move other than
+# index `skip`?
+def lir_parallel_is_pending_dst(pending: Vec[(Int, Int)], s: Int, skip: Int) -> Bool
+  var i = 0
+  while i < pending.len() do
+    if i != skip then
+      if pending[i].0 == s then
+        return true
+      end
+    end
+    i = i + 1
+  end
+  false
+end
+
+# Resolve a parallel move problem (dst, src) LOCAL pairs into a safe
+# sequential LirMove sequence appended to the current block: sources are
+# read before any of their writers; cycles are broken with the function's
+# scratch virtual register (canonical algorithm: emit free moves until
+# stuck, save a cycle source to the scratch, then walk the chain of pairs
+# whose destination equals the saved source back to the saved pair).
+def lir_emit_parallel_moves(inout ctx: LirLowerCtx, block_id: Int, pairs: Vec[(Int, Int)]) -> Result[Unit, String]
+  var pending: Vec[(Int, Int)] = Vec::new()
+  var pi = 0
+  while pi < pairs.len() do
+    let dst_id = pairs[pi].0
+    let src_id = pairs[pi].1
+    let dst_v = match lir_vreg_of_local(ctx, dst_id)
+    when Result::Ok(v) then v
+    when Result::Err(e) then return Result::Err(e)
+    end
+    let src_v = match lir_vreg_of_local(ctx, src_id)
+    when Result::Ok(v) then v
+    when Result::Err(e) then return Result::Err(e)
+    end
+    if dst_v != src_v then
+      pending.push((dst_v, src_v))
+    end
+    pi = pi + 1
+  end
+  while pending.len() > 0 do
+    var progress = false
+    var i = 0
+    while i < pending.len() do
+      let d = pending[i].0
+      let s = pending[i].1
+      if s == d then
+        var pruned: Vec[(Int, Int)] = Vec::new()
+        var j = 0
+        while j < pending.len() do
+          if j != i then
+            pruned.push(pending[j])
+          end
+          j = j + 1
+        end
+        pending = pruned
+        progress = true
+      elsif !lir_parallel_is_pending_dst(pending, s, i) then
+        lir_append_stmt(ctx, block_id, LirStmtKind::LirMove(d, LirValue::LirReg(s)))
+        var pruned: Vec[(Int, Int)] = Vec::new()
+        var j = 0
+        while j < pending.len() do
+          if j != i then
+            pruned.push(pending[j])
+          end
+          j = j + 1
+        end
+        pending = pruned
+        progress = true
+      else
+        i = i + 1
+      end
+    end
+    if !progress then
+      # A cycle: save the source of the first pair to the scratch, then
+      # follow the chain of pairs whose destination equals the saved
+      # source until the chain returns to the first pair's destination;
+      # close with the scratch move.
+      let d0 = pending[0].0
+      let s0 = pending[0].1
+      lir_append_stmt(ctx, block_id, LirStmtKind::LirMove(ctx.scratch, LirValue::LirReg(s0)))
+      var cur = s0
+      while cur != d0 do
+        var found = false
+        var ci = 0
+        while ci < pending.len() do
+          if pending[ci].0 == cur then
+            let dd = pending[ci].0
+            let ss = pending[ci].1
+            lir_append_stmt(ctx, block_id, LirStmtKind::LirMove(dd, LirValue::LirReg(ss)))
+            var pruned: Vec[(Int, Int)] = Vec::new()
+            var j = 0
+            while j < pending.len() do
+              if j != ci then
+                pruned.push(pending[j])
+              end
+              j = j + 1
+            end
+            pending = pruned
+            cur = ss
+            found = true
+            ci = pending.len() + 1
+          else
+            ci = ci + 1
+          end
+        end
+        if !found then
+          return Result::Err("lir: " + ctx.fn_name + ": internal parallel-move cycle resolution failure (fail-closed)")
+        end
+      end
+      lir_append_stmt(ctx, block_id, LirStmtKind::LirMove(d0, LirValue::LirReg(ctx.scratch)))
+      var pruned: Vec[(Int, Int)] = Vec::new()
+      var j = 0
+      while j < pending.len() do
+        if pending[j].0 != d0 then
+          pruned.push(pending[j])
+        end
+        j = j + 1
+      end
+      pending = pruned
+    end
+  end
+  Result::Ok(())
+end
+
+# Gather the phi-edge (dst, src) local pairs every successor expects from
+# the current block, then append their cycle-safe copies to the current
+# block's statements (the codegen.tg emit_phi_copies convention: copies
+# run at the end of the predecessor, before its terminator).
+def lir_lower_phi_edges(inout ctx: LirLowerCtx, f: MirFunction, block: MirBlock) -> Result[Unit, String]
+  let succs = lir_succ_ids(block.terminator)
+  let cur_id = block.id.id
+  var si = 0
+  while si < succs.len() do
+    let succ_id = succs[si]
+    if succ_id < f.blocks.len() then
+      var pairs: Vec[(Int, Int)] = Vec::new()
+      let succ_block = f.blocks[succ_id]
+      var st_i = 0
+      while st_i < succ_block.statements.len() do
+        let stmt = succ_block.statements[st_i]
+        match stmt.kind
+        when MirStatementKind::MirAssign(place, rvalue) then
+          match rvalue.kind
+          when MirRvalueKind::MirPhi(ph_entries) then
+            var pe = 0
+            while pe < ph_entries.len() do
+              if ph_entries[pe].0.id == cur_id then
+                pairs.push((place.local.id, ph_entries[pe].1.id))
+              end
+              pe = pe + 1
+            end
+          when _ then ()
+          end
+        when _ then ()
+        end
+        st_i = st_i + 1
+      end
+      if pairs.len() > 0 then
+        match lir_emit_parallel_moves(ctx, block.id.id, pairs)
+        when Result::Err(e) then return Result::Err(e)
+        when Result::Ok(_) then ()
+        end
+      end
+    end
+    si = si + 1
+  end
+  Result::Ok(())
+end
+
+# Lower one block's terminator (phi edges first, then the terminator;
+# call argument moves/pushes precede the call terminator).
+def lir_lower_terminator(inout ctx: LirLowerCtx, f: MirFunction, block: MirBlock) -> Result[Unit, String]
+  let block_id = block.id.id
+  match block.terminator.kind
+  when MirTerminatorKind::MirGoto(target) then
+    match lir_lower_phi_edges(ctx, f, block)
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(_) then ()
+    end
+    lir_set_term(ctx, block_id, LirTermKind::LirJump(target.id))
+    Result::Ok(())
+  when MirTerminatorKind::MirSwitchInt { op, targets, default_target } then
+    match lir_lower_phi_edges(ctx, f, block)
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(_) then ()
+    end
+    lir_lower_switch(ctx, block_id, op, targets, default_target)
+  when MirTerminatorKind::MirReturn then
+    let rv: Option[Int] = if f.locals.len() > 0 then
+      match ctx.vreg_of.get(f.locals[0].id.id)
+      when Option::Some(v) then Option::Some(v)
+      when Option::None then Option::None
+      end
+    else
+      Option::None
+    end
+    lir_set_term(ctx, block_id, LirTermKind::LirRet(rv))
+    Result::Ok(())
+  when MirTerminatorKind::MirUnreachable then
+    lir_set_term(ctx, block_id, LirTermKind::LirTrap)
+    Result::Ok(())
+  when MirTerminatorKind::MirAbort then
+    lir_set_term(ctx, block_id, LirTermKind::LirTrap)
+    Result::Ok(())
+  when MirTerminatorKind::MirCall { dest, func, args, success, unwind, intrinsic } then
+    match lir_lower_phi_edges(ctx, f, block)
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(_) then ()
+    end
+    match unwind
+    when Option::Some(_) then
+      return Result::Err("lir: " + ctx.fn_name + ": calls with an unwind continuation do not lower (unwinding needs TODO-drop)")
+    when Option::None then ()
+    end
+    match intrinsic
+    when Option::Some(_) then
+      return Result::Err("lir: " + ctx.fn_name + ": intrinsic calls do not lower (no intrinsic body exists in the LIR subset)")
+    when Option::None then ()
+    end
+    match func.kind
+    when MirOperandKind::MirConstant(cst) then
+      match cst.kind
+      when MirConstantKind::MirFnItem(callee_name) then
+        lir_lower_call(ctx, block_id, callee_name, dest, args, success)
+      when _ then
+        Result::Err("lir: " + ctx.fn_name + ": non-function-item call operands do not lower (fn items only; indirect needs TODO-agg)")
+      end
+    when _ then
+      Result::Err("lir: " + ctx.fn_name + ": indirect call operands do not lower (fn pointers/closures need TODO-agg)")
+    end
+  when MirTerminatorKind::MirDeinit { place, deinit_fn, target, unwind } then
+    Result::Err("lir: " + ctx.fn_name + ": MirDeinit does not lower in the scalar slice (drops/cleanup need TODO-drop)")
+  when MirTerminatorKind::MirAssert { cond, expected, msg, target, unwind } then
+    Result::Err("lir: " + ctx.fn_name + ": MirAssert does not lower yet (bounds/overflow asserts need the TODO-div trap-block rule)")
+  end
+end
+
+# Lower a MirSwitchInt: a register operand is compared per arm (value
+# equality) with branches to the arm targets, falling through the default
+# jump; a CONSTANT operand resolves statically.
+def lir_lower_switch(inout ctx: LirLowerCtx, block_id: Int, op: MirOperand, targets: Vec[SwitchTarget], default_target: MirBlockId) -> Result[Unit, String]
+  match op.kind
+  when MirOperandKind::MirConstant(cst) then
+    match cst.kind
+    when MirConstantKind::MirInt(v) then
+      var ti = 0
+      var chosen: Option[Int] = Option::None
+      while ti < targets.len() do
+        if targets[ti].value == v then
+          chosen = Option::Some(targets[ti].target.id)
+          ti = targets.len() + 1
+        else
+          ti = ti + 1
+        end
+      end
+      match chosen
+      when Option::Some(tid) then
+        lir_set_term(ctx, block_id, LirTermKind::LirJump(tid))
+        Result::Ok(())
+      when Option::None then
+        lir_set_term(ctx, block_id, LirTermKind::LirJump(default_target.id))
+        Result::Ok(())
+      end
+    when _ then
+      Result::Err("lir: " + ctx.fn_name + ": constant switch operands must be integers (fail-closed)")
+    end
+  when _ then
+    let vreg = match lir_value_of_operand(ctx, block_id, op)
+    when Result::Ok(v) then v
+    when Result::Err(e) then return Result::Err(e)
+    end
+    var arms: Vec[LirSwitchArm] = Vec::new()
+    var ti = 0
+    while ti < targets.len() do
+      arms.push(LirSwitchArm { value: targets[ti].value, target: targets[ti].target.id })
+      ti = ti + 1
+    end
+    lir_set_term(ctx, block_id, LirTermKind::LirSwitch(vreg, arms, default_target.id))
+    Result::Ok(())
+  end
+end
+
+# Lower a MirCall terminator: move args 0..7 into the fixed ABI vregs
+# (x0..x7), push args >= 8 in DESCENDING index order (16-byte caller
+# slots — the codegen.tg aarch64 convention), and register the call
+# terminator (SP cleanup and the success jump are emitted with it).
+def lir_lower_call(inout ctx: LirLowerCtx, block_id: Int, callee_name: String, dest: Place, args: Vec[MirCallArg], success: MirBlockId) -> Result[Unit, String]
+  if args.len() > 32 then
+    return Result::Err("lir: " + ctx.fn_name + ": calls with more than 32 arguments do not lower (fail-closed; the caller-slot area below that is bounded by construction)")
+  end
+  # Destination: a scalar local receives the x0 result; a Unit
+  # destination carries no vreg; aggregates fail closed.
+  var dest_v: Option[Int] = Option::None
+  match lir_place_scalar_local(dest)
+  when Option::Some(dst_id) then
+    let dty = lir_local_ty(ctx, dst_id)
+    if lir_is_int_word(dty) then
+      let v = match lir_vreg_of_local(ctx, dst_id)
+      when Result::Ok(vv) then vv
+      when Result::Err(e) then return Result::Err(e)
+      end
+      dest_v = Option::Some(v)
+    elsif lir_is_bool_word(dty) then
+      return Result::Err("lir: " + ctx.fn_name + ": calls writing Bool destinations do not lower (bool call results need TODO-wid's ABI rule)")
+    end
+  when Option::None then
+    return Result::Err("lir: " + ctx.fn_name + ": call destination with projections does not lower (TODO-agg)")
+  end
+  # Arguments: MirCallValue::Value only (Place args are the by-reference
+  # aggregate convention), typed Int/UInt.
+  var arg_vregs: Vec[Int] = Vec::new()
+  var ai = 0
+  while ai < args.len() do
+    match args[ai].value
+    when MirCallValue::Value(op) then
+      let aty = match lir_operand_ty(ctx, op)
+      when Result::Err(e) then return Result::Err(e)
+      when Result::Ok(t) then t
+      end
+      if !lir_is_int_word(aty) then
+        return Result::Err("lir: " + ctx.fn_name + ": call arguments must be Int/UInt in this slice (Bool/aggregate arguments need TODO-agg)")
+      end
+      let av = match lir_value_of_operand(ctx, block_id, op)
+      when Result::Ok(v) then v
+      when Result::Err(e) then return Result::Err(e)
+      end
+      arg_vregs.push(av)
+    when MirCallValue::Place(_) then
+      return Result::Err("lir: " + ctx.fn_name + ": by-reference (Place) call arguments do not lower (aggregates need TODO-agg)")
+    end
+    ai = ai + 1
+  end
+  var mi = 0
+  while mi < arg_vregs.len() && mi < 8 do
+    lir_append_stmt(ctx, block_id, LirStmtKind::LirMove(mi, LirValue::LirReg(arg_vregs[mi])))
+    mi = mi + 1
+  end
+  # Overflow args in DESCENDING index order so arg[8] ends up at the top
+  # of the caller stack area ([FP + 16] from the callee's frame).
+  var si = arg_vregs.len()
+  while si > 8 do
+    si = si - 1
+    lir_append_stmt(ctx, block_id, LirStmtKind::LirPushArg(arg_vregs[si]))
+  end
+  let stack_count = if arg_vregs.len() > 8 then arg_vregs.len() - 8 else 0 end
+  lir_set_term(ctx, block_id, LirTermKind::LirCall(callee_name.clone(), arg_vregs, stack_count, dest_v, success.id))
+  Result::Ok(())
+end
+
+# ———————————————————————————————————————————————————————————————
+# Lowering — whole function (Slice 2 entry point)
+# ———————————————————————————————————————————————————————————————
+
+def lower_mir_fn_to_lir(f: MirFunction) -> Result[LirFunction, String]
+  match lir_check_fn_shape(f)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(_) then ()
+  end
+  var ctx = lir_lower_ctx_new(f)
+
+  # Entry parameter binding: parameters 0..7 arrive in x0..x7 (the fixed
+  # vregs 0..7); parameters >= 8 arrive at [FP + 16 + 16*k], k = index-8.
+  var binds: Vec[LirStmt] = Vec::new()
+  var bi = 0
+  while bi < f.params.len() do
+    match ctx.vreg_of.get(f.params[bi].id.id)
+    when Option::Some(pv) then
+      if bi < 8 then
+        binds.push(LirStmt { kind: LirStmtKind::LirMove(pv, LirValue::LirReg(bi)) })
+      else
+        let k = bi - 8
+        binds.push(LirStmt { kind: LirStmtKind::LirLoadFrame(pv, 16 + 16 * k) })
+      end
+    when Option::None then ()
+    end
+    bi = bi + 1
+  end
+  if f.blocks.len() > 0 then
+    lir_append_bindings(&mut ctx, f.blocks[0].id.id, binds)
+  end
+
+  # Phase 1: the statements of every block.
+  var b0 = 0
+  while b0 < f.blocks.len() do
+    let block = f.blocks[b0]
+    var si = 0
+    while si < block.statements.len() do
+      let stmt = block.statements[si]
+      match stmt.kind
+      when MirStatementKind::MirStorageLive(_) then ()
+      when MirStatementKind::MirStorageDead(_) then ()
+      when MirStatementKind::MirNop then ()
+      when MirStatementKind::MirAssign(place, rvalue) then
+        match lir_lower_assign(&mut ctx, block.id.id, place, rvalue)
+        when Result::Err(e) then return Result::Err(e)
+        when Result::Ok(_) then ()
+        end
+      when MirStatementKind::MirContractCheck(_, _) then
+        return Result::Err("lir: " + f.name + ": contract-check statements do not lower (no rule yet)")
+      when MirStatementKind::MirBudgetConsume(_, _) then
+        return Result::Err("lir: " + f.name + ": budget statements do not lower (no rule yet)")
+      when MirStatementKind::MirEffectRecord(_, _) then
+        return Result::Err("lir: " + f.name + ": effect statements do not lower (no rule yet)")
+      when MirStatementKind::MirEffectPerform(_, _, _, _, _) then
+        return Result::Err("lir: " + f.name + ": effect-perform statements do not lower (no rule yet)")
+      when MirStatementKind::MirEffectFrameEnter(_, _, _, _, _) then
+        return Result::Err("lir: " + f.name + ": effect-frame statements do not lower (no rule yet)")
+      when MirStatementKind::MirEffectFrameExit then
+        return Result::Err("lir: " + f.name + ": effect-frame statements do not lower (no rule yet)")
+      end
+      si = si + 1
+    end
+    b0 = b0 + 1
+  end
+
+  # Phase 2: terminators (phi edges and call argument moves are appended
+  # to the CURRENT block's statements, immediately before its terminator).
+  var b1 = 0
+  while b1 < f.blocks.len() do
+    let block = f.blocks[b1]
+    match lir_lower_terminator(&mut ctx, f, block)
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(_) then ()
+    end
+    b1 = b1 + 1
+  end
+
+  # Assemble the LirFunction: blocks keep the MIR order (the MIR builder
+  # guarantees the entry block is blocks[0]; codegen.tg emits in the same
+  # order and the direct emitter relies on it).
+  var lir_blocks: Vec[LirBlock] = Vec::new()
+  var bk = 0
+  while bk < f.blocks.len() do
+    let mblock = f.blocks[bk]
+    var stmts: Vec[LirStmt] = Vec::new()
+    match ctx.block_stmts.get(mblock.id.id)
+    when Option::Some(list) then stmts = list.clone()
+    when Option::None then ()
+    end
+    var term = LirTerm { kind: LirTermKind::LirTrap }
+    match ctx.block_terms.get(mblock.id.id)
+    when Option::Some(t) then term = t.clone()
+    when Option::None then ()
+    end
+    lir_blocks.push(LirBlock { id: mblock.id.id, stmts: stmts, term: term })
+    bk = bk + 1
+  end
+  var params: Vec[Int] = Vec::new()
+  var pi = 0
+  while pi < f.params.len() do
+    match ctx.vreg_of.get(f.params[pi].id.id)
+    when Option::Some(pv) then params.push(pv)
+    when Option::None then ()
+    end
+    pi = pi + 1
+  end
+  # The return-slot vreg (locals[0] is the return place; Unit-returning
+  # functions carry None — MirReturn lowers to a bare Ret).
+  var ret_vreg: Option[Int] = Option::None
+  if f.locals.len() > 0 then
+    match ctx.vreg_of.get(f.locals[0].id.id)
+    when Option::Some(v) then ret_vreg = Option::Some(v)
+    when Option::None then ()
+    end
+  end
+  let entry = if f.blocks.len() > 0 then f.blocks[0].id.id else 0 end
+  Result::Ok(LirFunction {
+    name: f.name.clone(),
+    vregs: ctx.next_vreg,
+    params: params,
+    ret_vreg: ret_vreg,
+    blocks: lir_blocks,
+    entry_block: entry
+  })
+end
+
+# ———————————————————————————————————————————————————————————————
+# Peephole — Slice 5 (trivially-safe rewrites only)
+# ———————————————————————————————————————————————————————————————
+# Implemented: self-move elimination (Move d <- Reg(d) is a no-op).
+# Compare-and-branch FUSION where the encoders allow it lives in the
+# emitter (a LirSwitch arm with value 0 lowers to cbz/cbnz — see
+# lir_emit_switch); the scheduling backlog is TODO-peep in the header.
+# Every rewrite preserves interval/position bookkeeping, so the peephole
+# runs on the IR BEFORE allocation and only removes statements.
+
+def lir_peephole_stmts(stmts: Vec[LirStmt]) -> Vec[LirStmt]
+  var out: Vec[LirStmt] = Vec::new()
+  var i = 0
+  while i < stmts.len() do
+    let stmt = stmts[i]
+    var keep = true
+    match stmt.kind
+    when LirStmtKind::LirMove(dst, val) then
+      match val
+      when LirValue::LirReg(src) then
+        if dst == src then
+          keep = false
+        end
+      when _ then ()
+      end
+    when _ then ()
+    end
+    if keep then
+      out.push(stmt.clone())
+    end
+    i = i + 1
+  end
+  out
+end
+
+def lir_peephole(f: LirFunction) -> LirFunction
+  var blocks: Vec[LirBlock] = Vec::new()
+  var bi = 0
+  while bi < f.blocks.len() do
+    let b = f.blocks[bi]
+    blocks.push(LirBlock {
+      id: b.id,
+      stmts: lir_peephole_stmts(b.stmts),
+      term: b.term.clone()
+    })
+    bi = bi + 1
+  end
+  LirFunction {
+    name: f.name.clone(),
+    vregs: f.vregs,
+    params: f.params.clone(),
+    ret_vreg: f.ret_vreg,
+    blocks: blocks,
+    entry_block: f.entry_block
+  }
+end
+# ———————————————————————————————————————————————————————————————
+# Linear-scan register allocation (Slice 3)
+# ———————————————————————————————————————————————————————————————
+# Intervals: per-vreg convex hulls over the linearized positions (I3),
+# cut at every call position (I2). Allocation is a single first-fit scan
+# over the resulting segments sorted by start: each segment gets one pool
+# register for its whole span, or memory (then every def stores and every
+# use loads, and the segment's vreg gets a spill slot). Caller-saved pool
+# x9..x14 only — a register-resident pre-call segment stores to its slot
+# right before the call; a register-resident post-call segment whose
+# first event is a read reloads at that first read. Everything the
+# emitter needs (segment decisions, store-before-call records, first-read
+# reload records) is PRECOMPUTED here, so emission stays stateless.
+
+struct LirSeg
+  start: Int
+  end: Int     # inclusive
+  vreg: Int
+  phys: Int    # aarch64 register id, or -1 when memory-resident
+  slot: Int    # spill-slot index, or -1
+  needs_reload: Bool
+end
+
+struct LirAlloc
+  slots: Int                 # number of 8-byte spill slots
+  frame_bytes: Int           # 16-aligned frame allocation size
+  segs_of: Map[Int, Vec[LirSeg]]   # vreg -> segments, sorted by start
+  # (call position, vreg): store the register value to its slot right
+  # before the call at that position
+  spills: Vec[(Int, Int)]
+  # (position, vreg): the post-call segment's FIRST read — reload the
+  # slot into the segment register before the instruction at that
+  # position
+  reloads: Vec[(Int, Int)]
+end
+
+struct LirOcc
+  pos: Int
+  is_def: Bool
+end
+
+# Record one occurrence (def or use) for a vreg during the linearization
+# walk. Fixed vregs (0..7) are excluded: they are never allocated and the
+# emitter resolves them directly to x0..x7.
+def lir_occ_push(inout occs: Map[Int, Vec[LirOcc]], vreg: Int, pos: Int, is_def: Bool) -> Unit
+  if vreg >= lir_first_alloc_vreg() then
+    match occs.get(vreg)
+    when Option::Some(list) then
+      var l = list.clone()
+      l.push(LirOcc { pos: pos, is_def: is_def })
+      occs.insert(vreg, l)
+    when Option::None then
+      var l: Vec[LirOcc] = Vec::new()
+      l.push(LirOcc { pos: pos, is_def: is_def })
+      occs.insert(vreg, l)
+    end
+  end
+end
+
+# A statement's vregs: (defs, uses). Imm/`unit` payloads carry nothing.
+def lir_stmt_occ(occ_kind: LirStmtKind, inout defs: Vec[Int], inout uses: Vec[Int]) -> Unit
+  match occ_kind
+  when LirStmtKind::LirMove(dst, val) then
+    defs.push(dst)
+    match val
+    when LirValue::LirReg(src) then uses.push(src)
+    when _ then ()
+    end
+  when LirStmtKind::LirBinop(_, dst, left, right) then
+    defs.push(dst)
+    match left
+    when LirValue::LirReg(lv) then uses.push(lv)
+    when _ then ()
+    end
+    match right
+    when LirValue::LirReg(rv) then uses.push(rv)
+    when _ then ()
+    end
+  when LirStmtKind::LirUnop(_, dst, src) then
+    defs.push(dst)
+    uses.push(src)
+  when LirStmtKind::LirCmp(left, right) then
+    match left
+    when LirValue::LirReg(lv) then uses.push(lv)
+    when _ then ()
+    end
+    match right
+    when LirValue::LirReg(rv) then uses.push(rv)
+    when _ then ()
+    end
+  when LirStmtKind::LirCset(_, dst) then
+    defs.push(dst)
+  when LirStmtKind::LirLoadFrame(dst, _) then
+    defs.push(dst)
+  when LirStmtKind::LirPushArg(vreg) then
+    uses.push(vreg)
+  end
+end
+
+# A terminator's vreg traffic at its own position: Call reads no vregs at
+# the call position itself (argument moves/pushes are statements before
+# it) and defines dest AFTER the clobber; Ret reads the return vreg.
+# Jump/Switch/Trap read nothing here beyond the switch operand.
+def lir_term_occ(kind: LirTermKind, inout defs: Vec[Int], inout uses: Vec[Int]) -> Unit
+  match kind
+  when LirTermKind::LirJump(_) then ()
+  when LirTermKind::LirSwitch(vreg, _, _) then uses.push(vreg)
+  when LirTermKind::LirRet(rv) then
+    match rv
+    when Option::Some(v) then uses.push(v)
+    when Option::None then ()
+    end
+  when LirTermKind::LirTrap then ()
+  when LirTermKind::LirCall(_, _, _, dest, _) then
+    match dest
+    when Option::Some(v) then defs.push(v)
+    when Option::None then ()
+    end
+  end
+end
+
+# Is a terminator a direct call? (Only calls cut intervals.)
+def lir_term_is_call(kind: LirTermKind) -> Bool
+  match kind
+  when LirTermKind::LirCall(_, _, _, _, _) then true
+  when _ then false
+  end
+end
+
+
+# The earliest use at or after `from` (defs do not satisfy a use).
+def lir_first_use_after(occs: Vec[LirOcc], from: Int) -> Option[Int]
+  var i = 0
+  while i < occs.len() do
+    let o = occs[i]
+    if o.pos >= from && !o.is_def then
+      return Option::Some(o.pos)
+    end
+    i = i + 1
+  end
+  Option::None
+end
+
+# The earliest def at or after `from`.
+def lir_first_def_after(occs: Vec[LirOcc], from: Int) -> Option[Int]
+  var i = 0
+  while i < occs.len() do
+    let o = occs[i]
+    if o.pos >= from && o.is_def then
+      return Option::Some(o.pos)
+    end
+    i = i + 1
+  end
+  Option::None
+end
+
+# Linearize the function (block order, statements then terminator per
+# block), collecting per-vreg occurrences and the call positions. The
+# emitter walks in EXACTLY this order (I3).
+def lir_linearize(f: LirFunction, inout occs: Map[Int, Vec[LirOcc]], inout calls: Vec[Int]) -> Unit
+  var pos = 0
+  var bi = 0
+  while bi < f.blocks.len() do
+    let b = f.blocks[bi]
+    var si = 0
+    while si < b.stmts.len() do
+      var defs: Vec[Int] = Vec::new()
+      var uses: Vec[Int] = Vec::new()
+      lir_stmt_occ(b.stmts[si].kind, defs, uses)
+      var di = 0
+      while di < defs.len() do
+        lir_occ_push(occs, defs[di], pos, true)
+        di = di + 1
+      end
+      var ui = 0
+      while ui < uses.len() do
+        lir_occ_push(occs, uses[ui], pos, false)
+        ui = ui + 1
+      end
+      pos = pos + 1
+      si = si + 1
+    end
+    var tdefs: Vec[Int] = Vec::new()
+    var tuses: Vec[Int] = Vec::new()
+    lir_term_occ(b.term.kind, tdefs, tuses)
+    var tdi = 0
+    while tdi < tdefs.len() do
+      lir_occ_push(occs, tdefs[tdi], pos, true)
+      tdi = tdi + 1
+    end
+    var tui = 0
+    while tui < tuses.len() do
+      lir_occ_push(occs, tuses[tui], pos, false)
+      tui = tui + 1
+    end
+    if lir_term_is_call(b.term.kind) then
+      calls.push(pos)
+    end
+    pos = pos + 1
+    bi = bi + 1
+  end
+end
+
+# Build the initial (undecided) segments of a vreg: the convex hull
+# [first, last] cut at every call position strictly inside it. Position
+# p of a call cuts [.., p-1] | [p, ..]: the pre-call side excludes the
+# call (values read there live in statements before the call), and the
+# post-call side starts at the call (the dest def writes after the
+# clobber).
+def lir_build_vreg_segs(occs: Vec[LirOcc], vreg: Int, calls: Vec[Int]) -> Vec[LirSeg]
+  var segs: Vec[LirSeg] = Vec::new()
+  if occs.len() == 0 then
+    return segs
+  end
+  let first = occs[0].pos
+  let last = occs[occs.len() - 1].pos
+  var cur = first
+  var ci = 0
+  while ci < calls.len() do
+    let c = calls[ci]
+    if c > first && c <= last then
+      if cur <= c - 1 then
+        segs.push(LirSeg { start: cur, end: c - 1, vreg: vreg, phys: -1, slot: -1, needs_reload: false })
+      end
+      cur = c
+    end
+    ci = ci + 1
+  end
+  segs.push(LirSeg { start: cur, end: last, vreg: vreg, phys: -1, slot: -1, needs_reload: false })
+  segs
+end
+
+# Does this vreg need a spill slot? Yes when any segment is memory-
+# resident, or when a register-resident segment ends right before a call
+# (its value must survive the call through the slot). Everything else
+# (pure-register values that never cross a call) needs no slot.
+def lir_vreg_needs_slot(segs: Vec[LirSeg], calls_set: Set[Int]) -> Bool
+  var i = 0
+  while i < segs.len() do
+    let s = segs[i]
+    if s.phys < 0 then
+      return true
+    end
+    if calls_set.contains(&(s.end + 1)) then
+      return true
+    end
+    i = i + 1
+  end
+  false
+end
+
+# The linear-scan entry: decide every segment, then assign slots.
+# Deterministic: segments are considered in (start, vreg) order; pool
+# registers are tried in lir_pool_regs order; slots are numbered by vreg
+# order.
+def lir_alloc_registers(f: LirFunction) -> LirAlloc
+  var occs: Map[Int, Vec[LirOcc]] = Map::new()
+  var calls: Vec[Int] = Vec::new()
+  lir_linearize(f, occs, calls)
+  var calls_set: Set[Int] = Set::new()
+  var ci = 0
+  while ci < calls.len() do
+    calls_set.insert(calls[ci])
+    ci = ci + 1
+  end
+  var pool = lir_pool_regs()
+
+  # Build every vreg's segment list and the global consideration order.
+  var segs_of: Map[Int, Vec[LirSeg]] = Map::new()
+  var order: Vec[(Int, Int)] = Vec::new()   # (start, vreg) pairs
+  var v = lir_first_alloc_vreg()
+  while v < f.vregs do
+    match occs.get(v)
+    when Option::Some(list) then
+      var segs = lir_build_vreg_segs(list, v, calls)
+      if segs.len() > 0 then
+        segs_of.insert(v, segs)
+        var si = 0
+        while si < segs.len() do
+          order.push((segs[si].start, v))
+          si = si + 1
+        end
+      end
+    when Option::None then ()
+    end
+    v = v + 1
+  end
+
+  # Stable insertion sort of `order` by start (duplicates keep vreg
+  # order because the sort is stable).
+  var oi = 1
+  while oi < order.len() do
+    let cur_start = order[oi].0
+    let cur_vreg = order[oi].1
+    var j = oi
+    while j > 0 && order[j - 1].0 > cur_start do
+      order[j] = order[j - 1]
+      j = j - 1
+    end
+    if j != oi then
+      order[j] = (cur_start, cur_vreg)
+    end
+    oi = oi + 1
+  end
+
+  # First-fit scan over the sorted segments. active holds (end, phys) of
+  # register-resident segments whose end >= the current start.
+  var active: Vec[(Int, Int)] = Vec::new()
+  var oi2 = 0
+  while oi2 < order.len() do
+    let cur_start = order[oi2].0
+    let cur_vreg = order[oi2].1
+    let seg_list = match segs_of.get(cur_vreg)
+    when Option::Some(l) then l.clone()
+    when Option::None then Vec::new()
+    end
+    # The segment being decided is the first one of this vreg whose start
+    # equals cur_start.
+    var seg_index = 0
+    while seg_list[seg_index].start != cur_start do
+      seg_index = seg_index + 1
+    end
+    # Expire finished active segments.
+    var kept: Vec[(Int, Int)] = Vec::new()
+    var ai = 0
+    while ai < active.len() do
+      if active[ai].0 >= cur_start then
+        kept.push(active[ai])
+      end
+      ai = ai + 1
+    end
+    active = kept
+    # First-fit over the pool.
+    var chosen = -1
+    var pi = 0
+    while pi < pool.len() do
+      let cand = pool[pi]
+      var busy = false
+      var bi = 0
+      while bi < active.len() do
+        if active[bi].1 == cand then
+          busy = true
+          bi = active.len() + 1
+        else
+          bi = bi + 1
+        end
+      end
+      if !busy then
+        chosen = cand
+        pi = pool.len() + 1
+      else
+        pi = pi + 1
+      end
+    end
+    # Rewrite the decided segment.
+    var updated = seg_list.clone()
+    if chosen >= 0 then
+      updated[seg_index] = LirSeg {
+        start: seg_list[seg_index].start,
+        end: seg_list[seg_index].end,
+        vreg: cur_vreg,
+        phys: chosen,
+        slot: -1,
+        needs_reload: false
+      }
+      active.push((seg_list[seg_index].end, chosen))
+    else
+      updated[seg_index] = LirSeg {
+        start: seg_list[seg_index].start,
+        end: seg_list[seg_index].end,
+        vreg: cur_vreg,
+        phys: -1,
+        slot: -1,
+        needs_reload: false
+      }
+    end
+    segs_of.insert(cur_vreg, updated)
+    oi2 = oi2 + 1
+  end
+
+  # Slot numbering (vreg order) for vregs that need a home.
+  var slot_of: Map[Int, Int] = Map::new()
+  var next_slot = 0
+  var sv = lir_first_alloc_vreg()
+  while sv < f.vregs do
+    match segs_of.get(sv)
+    when Option::Some(segs) then
+      if lir_vreg_needs_slot(segs, calls_set) then
+        slot_of.insert(sv, next_slot)
+        next_slot = next_slot + 1
+      end
+    when Option::None then ()
+    end
+    sv = sv + 1
+  end
+
+  # Finalize: slot indexes, reload flags, spill/reload records. A post-
+  # call register segment whose FIRST event is a read needs one reload at
+  # that read (its value crossed the call in the slot); a pre-call
+  # register segment ending at a call stores at the call.
+  var spills: Vec[(Int, Int)] = Vec::new()
+  var reloads: Vec[(Int, Int)] = Vec::new()
+  var fv = lir_first_alloc_vreg()
+  while fv < f.vregs do
+    match segs_of.get(fv)
+    when Option::Some(segs) then
+      match slot_of.get(fv)
+      when Option::Some(slot_id) then
+        var updated = segs.clone()
+        var si = 0
+        while si < updated.len() do
+          let s = updated[si]
+          if s.phys < 0 then
+            updated[si] = LirSeg { start: s.start, end: s.end, vreg: s.vreg, phys: s.phys, slot: slot_id, needs_reload: false }
+          elsif calls_set.contains(&(s.end + 1)) then
+            # Register-resident pre-call segment: store at the call.
+            spills.push((s.end + 1, fv))
+            updated[si] = LirSeg { start: s.start, end: s.end, vreg: s.vreg, phys: s.phys, slot: slot_id, needs_reload: false }
+          end
+          si = si + 1
+        end
+        segs_of.insert(fv, updated)
+      when Option::None then ()
+      end
+    when Option::None then ()
+    end
+    fv = fv + 1
+  end
+  # Reload flags: independent of slot presence (a value can cross a call
+  # only through its slot, so a reloading segment's vreg always HAS a
+  # slot — the store side guaranteed it above).
+  var rv = lir_first_alloc_vreg()
+  while rv < f.vregs do
+    match segs_of.get(rv)
+    when Option::Some(segs) then
+      var updated = segs.clone()
+      var si = 0
+      while si < updated.len() do
+        let s = updated[si]
+        if s.phys >= 0 && calls_set.contains(&s.start) then
+          # The segment starts AT a call: decide whether its first event
+          # is a read (the dest def would count as the first event when
+          # present at the same position).
+          match occs.get(rv)
+          when Option::Some(list) then
+            let first_use = lir_first_use_after(list, s.start)
+            let first_def = lir_first_def_after(list, s.start)
+            var reload = false
+            match first_use
+            when Option::Some(upos) then
+              match first_def
+              when Option::Some(dpos) then
+                if upos < dpos then
+                  reload = true
+                end
+              when Option::None then reload = true
+              end
+            when Option::None then ()
+            end
+            if reload then
+              updated[si] = LirSeg { start: s.start, end: s.end, vreg: s.vreg, phys: s.phys, slot: s.slot, needs_reload: true }
+              match first_use
+              when Option::Some(upos) then
+                reloads.push((upos, rv))
+              when Option::None then ()
+              end
+            end
+          when Option::None then ()
+          end
+        end
+        si = si + 1
+      end
+      segs_of.insert(rv, updated)
+    when Option::None then ()
+    end
+    rv = rv + 1
+  end
+
+  # Frame size: slots are 8 bytes each at [FP - 8 - 8*slot], 16-aligned.
+  let raw = next_slot * 8
+  var aligned = raw
+  let rem = raw % 16
+  if rem != 0 then
+    aligned = raw + (16 - rem)
+  end
+  LirAlloc {
+    slots: next_slot,
+    frame_bytes: aligned,
+    segs_of: segs_of,
+    spills: spills,
+    reloads: reloads
+  }
+end
+
+# ———————————————————————————————————————————————————————————————
+# Allocation query helpers (used by the emitter)
+# ———————————————————————————————————————————————————————————————
+
+# The segment of `vreg` containing position `p` (last segment with
+# start <= p <= end). Callers guarantee the position lies inside the
+# vreg's hull.
+def lir_seg_at(segs: Vec[LirSeg], p: Int) -> Option[LirSeg]
+  var found = Option::None
+  var i = 0
+  while i < segs.len() do
+    let s = segs[i]
+    if s.start <= p && p <= s.end then
+      found = Option::Some(s)
+    end
+    i = i + 1
+  end
+  found
+end
+
+
+# Does the reload record list reload vreg `vreg` at position `pos`?
+def lir_reload_at(reloads: Vec[(Int, Int)], pos: Int, vreg: Int) -> Bool
+  var i = 0
+  while i < reloads.len() do
+    if reloads[i].0 == pos && reloads[i].1 == vreg then
+      return true
+    end
+    i = i + 1
+  end
+  false
+end
+
+# The FP offset of spill slot `slot`: [FP - 8 - 8*slot].
+def lir_slot_offset(slot: Int) -> Int
+  -(8 + 8 * slot)
+end
+# ———————————————————————————————————————————————————————————————
+# aarch64 emission (Slice 4)
+# ———————————————————————————————————————————————————————————————
+# Emits an allocated LirFunction into ctx.text reusing the asm.tg a64
+# encoders. Layout conventions (mirroring codegen.tg):
+#   prologue: stp fp,lr,[sp,#-16]!; mov fp,sp; sub sp,sp,#frame
+#   spill slot i at [FP - 8 - 8*i]
+#   entry of "main"/"_start" captures argc/argv via codegen.tg's
+#   emit_save_argc_argv (the shared ctx helper; TODO-runt)
+#   parameters >= 8 are bound from [FP + 16 + 16*k]
+# The emitter is stateless: every load/store/reload/spill decision comes
+# from the precomputed LirAlloc (Slice 3), keyed by the linear position
+# of the statement/terminator being emitted (invariant I3 — this walk is
+# identical to lir_linearize's).
+
+# The a64 register for a fixed (precolored) vreg id 0..7, or any other
+# register id (used for pool/temp/scratch registers).
+def lir_block_label(fn_name: String, block_id: Int) -> String
+  ".L" + fn_name + ".bb" + block_id.to_string()
+end
+
+# 8-byte memory access [base + off] with the codegen.tg aarch64 offset
+# strategy (scaled ldr/str for aligned non-negative, ldur/stur for
+# -256..255, address computation through X15 — reserved, never
+# allocated — beyond that). is_load selects load/store.
+def lir_emit_mem8(inout ctx: CodegenCtx, dst: A64, base: A64, off: Int, is_load: Bool) -> Unit
+  if off >= 0 && (off % 8) == 0 && off < 32768 then
+    if is_load then
+      a64_ldr(&mut ctx.text, dst, base, off as u32)
+    else
+      a64_str(&mut ctx.text, dst, base, off as u32)
+    end
+  elsif off >= -256 && off <= 255 then
+    if is_load then
+      a64_ldur(&mut ctx.text, dst, base, off as i32)
+    else
+      a64_stur(&mut ctx.text, dst, base, off as i32)
+    end
+  elsif off < 0 then
+    # Large negative offset: address = base - abs(off), via X15.
+    let abs_off = -off
+    a64_mov_ri(&mut ctx.text, A64::X15, abs_off)
+    a64_sub_rrr(&mut ctx.text, A64::X15, base, A64::X15)
+    if is_load then
+      a64_ldur(&mut ctx.text, dst, A64::X15, 0)
+    else
+      a64_stur(&mut ctx.text, dst, A64::X15, 0)
+    end
+  else
+    # Large positive offset: address = base + off, via X15.
+    a64_mov_ri(&mut ctx.text, A64::X15, off)
+    a64_add_rrr(&mut ctx.text, A64::X15, base, A64::X15)
+    if is_load then
+      a64_ldur(&mut ctx.text, dst, A64::X15, 0)
+    else
+      a64_stur(&mut ctx.text, dst, A64::X15, 0)
+    end
+  end
+end
+
+# Load the spill slot of `slot` into `dst`.
+def lir_emit_slot_load(inout ctx: CodegenCtx, dst: A64, slot: Int) -> Unit
+  lir_emit_mem8(ctx, dst, A64::FP, lir_slot_offset(slot), true)
+end
+
+# Store `src` into the spill slot of `slot`.
+def lir_emit_slot_store(inout ctx: CodegenCtx, src: A64, slot: Int) -> Unit
+  lir_emit_mem8(ctx, src, A64::FP, lir_slot_offset(slot), false)
+end
+
+# Compare a register against an arbitrary 64-bit immediate (the aarch64
+# cmp-immediate encodings only cover positive 12/24-bit patterns; every
+# other value is materialized into a reserved scratch register first).
+def lir_emit_cmp_imm(inout ctx: CodegenCtx, r: A64, imm: Int) -> Unit
+  if imm >= 0 && imm <= 4294967295 then
+    a64_cmp_ri(&mut ctx.text, r, imm as u32)
+  else
+    let scratch = if r == A64::X16 then A64::X17 else A64::X16 end
+    a64_mov_ri(&mut ctx.text, scratch, imm)
+    a64_cmp_rr(&mut ctx.text, r, scratch)
+  end
+end
+
+# The destination target of a def at position `pos`: either the segment
+# register or the X16 temp with a pending slot store.
+struct LirDefTarget
+  reg: A64
+  store_slot: Int   # >= 0: store reg to this slot after the def
+end
+
+def lir_def_target(alloc: LirAlloc, vreg: Int, pos: Int) -> LirDefTarget
+  if vreg < lir_first_alloc_vreg() then
+    # Fixed ABI vregs (argument moves): the register IS the target.
+    return LirDefTarget { reg: lir_reg_a64(vreg), store_slot: -1 }
+  end
+  match alloc.segs_of.get(vreg)
+  when Option::Some(segs) then
+    match lir_seg_at(segs, pos)
+    when Option::Some(s) then
+      if s.phys >= 0 then
+        LirDefTarget { reg: lir_reg_a64(s.phys), store_slot: -1 }
+      else
+        LirDefTarget { reg: A64::X16, store_slot: s.slot }
+      end
+    when Option::None then
+      panic("lir: def outside any interval for vreg " + vreg.to_string())
+    end
+  when Option::None then
+    # Never-occurring vreg (e.g. an unused parameter's bind still emits).
+    LirDefTarget { reg: A64::X16, store_slot: -1 }
+  end
+end
+
+# Materialize the value of `vreg` at position `pos` into a register,
+# choosing `pref` (normally X16) when a spill load is needed; a reload
+# record at (pos, vreg) loads the slot into the segment register first
+# (invariant I2). Returns the register holding the value.
+def lir_emit_use(inout ctx: CodegenCtx, alloc: LirAlloc, vreg: Int, pos: Int, pref: A64) -> A64
+  if vreg < lir_first_alloc_vreg() then
+    return lir_reg_a64(vreg)
+  end
+  match alloc.segs_of.get(vreg)
+  when Option::Some(segs) then
+    match lir_seg_at(segs, pos)
+    when Option::Some(s) then
+      if s.phys >= 0 then
+        if lir_reload_at(alloc.reloads, pos, vreg) then
+          lir_emit_slot_load(ctx, lir_reg_a64(s.phys), s.slot)
+        end
+        lir_reg_a64(s.phys)
+      else
+        lir_emit_slot_load(ctx, pref, s.slot)
+        pref
+      end
+    when Option::None then
+      panic("lir: use outside any interval for vreg " + vreg.to_string())
+    end
+  when Option::None then
+    panic("lir: use of vreg with no intervals: " + vreg.to_string())
+  end
+end
+
+# Emit a spill store for a register-resident pre-call segment whose end
+# precedes the call at `pos` (invariant I2).
+def lir_emit_call_spills(inout ctx: CodegenCtx, alloc: LirAlloc, pos: Int) -> Unit
+  var i = 0
+  while i < alloc.spills.len() do
+    if alloc.spills[i].0 == pos then
+      let vreg = alloc.spills[i].1
+      match alloc.segs_of.get(vreg)
+      when Option::Some(segs) then
+        match lir_seg_at(segs, pos - 1)
+        when Option::Some(s) then
+          if s.phys >= 0 && s.slot >= 0 then
+            lir_emit_slot_store(ctx, lir_reg_a64(s.phys), s.slot)
+          end
+        when Option::None then ()
+        end
+      when Option::None then ()
+      end
+    end
+    i = i + 1
+  end
+end
+
+# A register-register binop.
+def lir_emit_binop_rr(inout ctx: CodegenCtx, op: LirBinOp, d: A64, n: A64, m: A64) -> Unit
+  match op
+  when LirBinOp::LirAdd then a64_add_rrr(&mut ctx.text, d, n, m)
+  when LirBinOp::LirSub then a64_sub_rrr(&mut ctx.text, d, n, m)
+  when LirBinOp::LirMul then a64_mul_rrr(&mut ctx.text, d, n, m)
+  when LirBinOp::LirAnd then a64_and_rrr(&mut ctx.text, d, n, m)
+  when LirBinOp::LirOr then a64_orr_rrr(&mut ctx.text, d, n, m)
+  when LirBinOp::LirXor then a64_eor_rrr(&mut ctx.text, d, n, m)
+  when LirBinOp::LirShl then a64_lsl_rrr(&mut ctx.text, d, n, m)
+  when LirBinOp::LirAsr then a64_asr_rrr(&mut ctx.text, d, n, m)
+  when LirBinOp::LirLsr then a64_lsr_rrr(&mut ctx.text, d, n, m)
+  end
+end
+
+# Emit an add/sub of an immediate (the only aarch64 binop encodings with
+# a 12-bit immediate form); everything else materializes the immediate
+# into the reserved X16/X17 scratch first.
+def lir_emit_binop_imm(inout ctx: CodegenCtx, op: LirBinOp, d: A64, n: A64, imm: Int) -> Unit
+  match op
+  when LirBinOp::LirAdd then
+    if imm >= 0 && imm <= 4095 then
+      a64_add_rri(&mut ctx.text, d, n, imm as u32)
+    elsif imm < 0 && imm >= -4095 then
+      a64_sub_rri(&mut ctx.text, d, n, (-imm) as u32)
+    else
+      let scratch = if d == A64::X16 then A64::X17 else A64::X16 end
+      a64_mov_ri(&mut ctx.text, scratch, imm)
+      a64_add_rrr(&mut ctx.text, d, n, scratch)
+    end
+  when LirBinOp::LirSub then
+    if imm >= 0 && imm <= 4095 then
+      a64_sub_rri(&mut ctx.text, d, n, imm as u32)
+    elsif imm < 0 && imm >= -4095 then
+      a64_add_rri(&mut ctx.text, d, n, (-imm) as u32)
+    else
+      let scratch = if d == A64::X16 then A64::X17 else A64::X16 end
+      a64_mov_ri(&mut ctx.text, scratch, imm)
+      a64_sub_rrr(&mut ctx.text, d, n, scratch)
+    end
+  when LirBinOp::LirShl then
+    if imm >= 0 && imm <= 63 then
+      a64_lsl(&mut ctx.text, d, n, imm as u32)
+    else
+      let scratch = if d == A64::X16 then A64::X17 else A64::X16 end
+      a64_mov_ri(&mut ctx.text, scratch, imm)
+      a64_lsl_rrr(&mut ctx.text, d, n, scratch)
+    end
+  when LirBinOp::LirAsr then
+    if imm >= 0 && imm <= 63 then
+      a64_asr(&mut ctx.text, d, n, imm as u32)
+    else
+      let scratch = if d == A64::X16 then A64::X17 else A64::X16 end
+      a64_mov_ri(&mut ctx.text, scratch, imm)
+      a64_asr_rrr(&mut ctx.text, d, n, scratch)
+    end
+  when LirBinOp::LirLsr then
+    if imm >= 0 && imm <= 63 then
+      a64_lsr(&mut ctx.text, d, n, imm as u32)
+    else
+      let scratch = if d == A64::X16 then A64::X17 else A64::X16 end
+      a64_mov_ri(&mut ctx.text, scratch, imm)
+      a64_lsr_rrr(&mut ctx.text, d, n, scratch)
+    end
+  when _ then
+    let scratch = if d == A64::X16 then A64::X17 else A64::X16 end
+    a64_mov_ri(&mut ctx.text, scratch, imm)
+    lir_emit_binop_rr(ctx, op, d, n, scratch)
+  end
+end
+
+# Emit one statement at position `pos`.
+def lir_emit_stmt(inout ctx: CodegenCtx, alloc: LirAlloc, kind: LirStmtKind, pos: Int) -> Unit
+  match kind
+  when LirStmtKind::LirMove(dst, val) then
+    let dt = lir_def_target(alloc, dst, pos)
+    match val
+    when LirValue::LirImm(imm) then
+      a64_mov_ri(&mut ctx.text, dt.reg, imm)
+    when LirValue::LirReg(src) then
+      if src < lir_first_alloc_vreg() then
+        let sr = lir_reg_a64(src)
+        if dt.reg != sr then
+          a64_mov_rr(&mut ctx.text, dt.reg, sr)
+        end
+      else
+        let pref = if dt.reg == A64::X16 then A64::X17 else A64::X16 end
+        let sr = lir_emit_use(ctx, alloc, src, pos, pref)
+        if dt.reg != sr then
+          a64_mov_rr(&mut ctx.text, dt.reg, sr)
+        end
+      end
+    end
+    if dt.store_slot >= 0 then
+      lir_emit_slot_store(ctx, dt.reg, dt.store_slot)
+    end
+  when LirStmtKind::LirBinop(op, dst, left, right) then
+    let dt = lir_def_target(alloc, dst, pos)
+    let left_pref = if dt.reg == A64::X16 then A64::X17 else A64::X16 end
+    let left_reg = match left
+    when LirValue::LirReg(lv) then lir_emit_use(ctx, alloc, lv, pos, left_pref)
+    when LirValue::LirImm(_) then panic("lir: binop left operand must be a register (lowering invariant)")
+    end
+    match right
+    when LirValue::LirImm(imm) then
+      lir_emit_binop_imm(ctx, op, dt.reg, left_reg, imm)
+    when LirValue::LirReg(rv) then
+      # A register right operand: resolve it with a temp that avoids the
+      # left temp (they only collide when both spill-load; a single
+      # instruction reads both before writing dt, so a dst-temp reuse is
+      # safe by read-before-write).
+      let right_pref = if left_reg == A64::X16 then A64::X17 else A64::X16 end
+      let right_reg = lir_emit_use(ctx, alloc, rv, pos, right_pref)
+      lir_emit_binop_rr(ctx, op, dt.reg, left_reg, right_reg)
+    end
+    if dt.store_slot >= 0 then
+      lir_emit_slot_store(ctx, dt.reg, dt.store_slot)
+    end
+  when LirStmtKind::LirUnop(op, dst, src) then
+    let dt = lir_def_target(alloc, dst, pos)
+    let pref = if dt.reg == A64::X16 then A64::X17 else A64::X16 end
+    let sr = lir_emit_use(ctx, alloc, src, pos, pref)
+    match op
+    when LirUnOp::LirNeg then a64_neg(&mut ctx.text, dt.reg, sr)
+    when LirUnOp::LirBitNot then a64_mvn(&mut ctx.text, dt.reg, sr)
+    end
+    if dt.store_slot >= 0 then
+      lir_emit_slot_store(ctx, dt.reg, dt.store_slot)
+    end
+  when LirStmtKind::LirCmp(left, right) then
+    let left_reg = match left
+    when LirValue::LirReg(lv) then lir_emit_use(ctx, alloc, lv, pos, A64::X16)
+    when LirValue::LirImm(_) then panic("lir: cmp left operand must be a register (lowering invariant)")
+    end
+    match right
+    when LirValue::LirImm(imm) then
+      lir_emit_cmp_imm(ctx, left_reg, imm)
+    when LirValue::LirReg(rv) then
+      let right_pref = if left_reg == A64::X16 then A64::X17 else A64::X16 end
+      let right_reg = lir_emit_use(ctx, alloc, rv, pos, right_pref)
+      a64_cmp_rr(&mut ctx.text, left_reg, right_reg)
+    end
+  when LirStmtKind::LirCset(cond, dst) then
+    let dt = lir_def_target(alloc, dst, pos)
+    a64_cset(&mut ctx.text, dt.reg, lir_cond_code(cond))
+    if dt.store_slot >= 0 then
+      lir_emit_slot_store(ctx, dt.reg, dt.store_slot)
+    end
+  when LirStmtKind::LirLoadFrame(dst, off) then
+    let dt = lir_def_target(alloc, dst, pos)
+    lir_emit_mem8(ctx, dt.reg, A64::FP, off, true)
+    if dt.store_slot >= 0 then
+      lir_emit_slot_store(ctx, dt.reg, dt.store_slot)
+    end
+  when LirStmtKind::LirPushArg(vreg) then
+    let sr = lir_emit_use(ctx, alloc, vreg, pos, A64::X16)
+    # Reserve one 16-byte aligned caller slot below SP and store the
+    # value into it (the codegen.tg emit_push convention on aarch64).
+    a64_stur(&mut ctx.text, sr, A64::SP, -16)
+    a64_sub_rri(&mut ctx.text, A64::SP, A64::SP, 16)
+  end
+end
+
+# Emit the function epilogue (value already in x0): restore the frame
+# and return.
+def lir_emit_epilogue(inout ctx: CodegenCtx) -> Unit
+  a64_mov_rr(&mut ctx.text, A64::SP, A64::FP)
+  a64_ldp_post(&mut ctx.text, A64::FP, A64::LR, A64::SP, 16)
+  a64_ret(&mut ctx.text)
+end
+
+# Emit one terminator at position `pos`. The call terminator also runs
+# the pre-call spill stores, the stack-slot cleanup, the result capture
+# into the dest vreg and the jump to the success block (fixups are
+# resolved later, at the whole-buffer level).
+def lir_emit_term(inout ctx: CodegenCtx, alloc: LirAlloc, fn_name: String, kind: LirTermKind, pos: Int, externs: Set[String], defined: Set[String]) -> Unit
+  match kind
+  when LirTermKind::LirJump(target) then
+    let lbl = lir_block_label(fn_name, target)
+    a64_b(&mut ctx.text, lbl)
+  when LirTermKind::LirSwitch(vreg, arms, default_target) then
+    let operand = lir_emit_use(ctx, alloc, vreg, pos, A64::X16)
+    var ai = 0
+    while ai < arms.len() do
+      let arm = arms[ai]
+      if arm.value == 0 then
+        # Encoder-supported zero-test fusion (Slice 5): cbz equals
+        # cmp r, #0 + b.eq and is flag-neutral, so later arms' compares
+        # are unaffected.
+        let lbl = lir_block_label(fn_name, arm.target)
+        a64_cbz(&mut ctx.text, operand, lbl)
+      else
+        let lbl = lir_block_label(fn_name, arm.target)
+        lir_emit_cmp_imm(ctx, operand, arm.value)
+        a64_bcond(&mut ctx.text, lir_cond_code(LirCond::LirEq), lbl)
+      end
+      ai = ai + 1
+    end
+    let dlbl = lir_block_label(fn_name, default_target)
+    a64_b(&mut ctx.text, dlbl)
+  when LirTermKind::LirRet(rv) then
+    match rv
+    when Option::Some(vreg) then
+      # Uniform value resolution (reloads and memory segments are handled
+      # exactly like any other read at this position).
+      let sr = lir_emit_use(ctx, alloc, vreg, pos, A64::X16)
+      if sr != A64::X0 then
+        a64_mov_rr(&mut ctx.text, A64::X0, sr)
+      end
+    when Option::None then ()
+    end
+    lir_emit_epilogue(ctx)
+  when LirTermKind::LirTrap then
+    a64_udf(&mut ctx.text)
+  when LirTermKind::LirCall(target, args, stack_args, dest, success) then
+    # Pre-call spill stores (register-resident values crossing the call).
+    lir_emit_call_spills(ctx, alloc, pos)
+    # args is carried for the allocator's benefit (its fixed moves and
+    # pushes are ordinary statements); nothing else reads it here.
+    let is_extern = externs.contains(&target) || !defined.contains(&target)
+    if is_extern then
+      add_reloc(&mut ctx.text, RelocKind::R_AARCH64_CALL26, target.clone(), 0)
+      emit32_le(&mut ctx.text, 0x94000000)
+    else
+      a64_bl(&mut ctx.text, target.clone())
+    end
+    if stack_args > 0 then
+      a64_add_rri(&mut ctx.text, A64::SP, A64::SP, (16 * stack_args) as u32)
+    end
+    # Result capture: x0 -> dest (a fixed or ordinary vreg def at pos).
+    match dest
+    when Option::Some(dv) then
+      let dt = lir_def_target(alloc, dv, pos)
+      if dt.reg != A64::X0 then
+        a64_mov_rr(&mut ctx.text, dt.reg, A64::X0)
+      end
+      if dt.store_slot >= 0 then
+        lir_emit_slot_store(ctx, dt.reg, dt.store_slot)
+      end
+    when Option::None then ()
+    end
+    let lbl = lir_block_label(fn_name, success)
+    a64_b(&mut ctx.text, lbl)
+  end
+end
+
+# Emit an entire function: symbol, prologue, entry capture for
+# main/_start, blocks (statements then terminator), walking positions
+# exactly like lir_linearize (I3).
+def lir_emit_fn(inout ctx: CodegenCtx, f: LirFunction, alloc: LirAlloc, externs: Set[String], defined: Set[String]) -> Unit
+  # Symbol + entry label (block 0's label is defined by the block loop).
+  align_to(&mut ctx.text, 4, Arch::AArch64)
+  let fn_start = buf_pos(&ctx.text)
+  add_symbol(&mut ctx.text, AsmSymbol {
+    name: f.name.clone(),
+    section: Section::Text,
+    offset: fn_start,
+    size: 0,
+    binding: SymBinding::Global,
+    kind: SymKind::Func
+  })
+  def_label(&mut ctx.text, f.name.clone())
+
+  # Prologue.
+  a64_stp_pre(&mut ctx.text, A64::FP, A64::LR, A64::SP, -16)
+  a64_mov_rr(&mut ctx.text, A64::FP, A64::SP)
+  if alloc.frame_bytes > 0 then
+    if alloc.frame_bytes <= 4095 then
+      a64_sub_rri(&mut ctx.text, A64::SP, A64::SP, alloc.frame_bytes as u32)
+    else
+      a64_mov_ri(&mut ctx.text, A64::X15, alloc.frame_bytes)
+      a64_sub_sp_sp_r(&mut ctx.text, A64::X15)
+    end
+  end
+
+  # The entry capture for the OS entry points (argc/argv/envp) — shared
+  # codegen.tg ctx helper (TODO-runt: LIR-native capture).
+  if f.name == "main" || f.name == "_start" then
+    emit_save_argc_argv(ctx)
+  end
+
+  # Blocks, in order, with the SAME position walk the allocator used.
+  var pos = 0
+  var bi = 0
+  while bi < f.blocks.len() do
+    let b = f.blocks[bi]
+    def_label(&mut ctx.text, lir_block_label(f.name.clone(), b.id))
+    var si = 0
+    while si < b.stmts.len() do
+      lir_emit_stmt(ctx, alloc, b.stmts[si].kind, pos)
+      pos = pos + 1
+      si = si + 1
+    end
+    lir_emit_term(ctx, alloc, f.name.clone(), b.term.kind, pos, externs, defined)
+    pos = pos + 1
+    bi = bi + 1
+  end
+end
+# ———————————————————————————————————————————————————————————————
+# Whole-program route (Slice 4 wiring)
+# ———————————————————————————————————————————————————————————————
+# The route is invoked by driver.tg's compile_lir_route behind the
+# TANGERINE_LIR gate (default off). It lowers EVERY non-extern function
+# through the LIR pipeline (fail-closed: one unsupported construct fails
+# the whole compile with the rule-naming reason), emits the bodies into a
+# CodegenCtx text buffer, merges the standard runtime (reusing codegen's
+# emit_all_runtime merge and data-emission helpers), and assembles the
+# same object layout the direct emitter produces. Statics and aggregate
+# program shapes are rejected (TODO-agg).
+
+# The emission names of every program function (externs and bodies).
+def lir_collect_callees(f: LirFunction) -> Vec[String]
+  var out: Vec[String] = Vec::new()
+  var bi = 0
+  while bi < f.blocks.len() do
+    let b = f.blocks[bi]
+    match b.term.kind
+    when LirTermKind::LirCall(target, _, _, _, _) then
+      out.push(target.clone())
+    when _ then ()
+    end
+    bi = bi + 1
+  end
+  out
+end
+
+# Every call target must resolve to a body this route emits or to an
+# extern symbol (fail-closed: an unknown label would otherwise fall into
+# the direct emitter's RET-stub path — a silent miscompile).
+def lir_validate_callees(f: LirFunction, defined: Set[String], externs: Set[String]) -> Result[Unit, String]
+  let callees = lir_collect_callees(f)
+  var ci = 0
+  while ci < callees.len() do
+    let t = callees[ci]
+    if !defined.contains(&t) && !externs.contains(&t) then
+      return Result::Err("lir: function " + f.name + " calls unknown target `" + t + "` (not a program function, not an extern — fail-closed)")
+    end
+    ci = ci + 1
+  end
+  Result::Ok(())
+end
+
+# Convert the final text labels into local symbols and assemble the
+# ObjectFile (the generate_native/generate_executable layout: sorted
+# label-name iteration for deterministic symbol order).
+def lir_object_file(inout ctx: CodegenCtx, target: AsmTarget) -> ObjectFile
+  var all_symbols: Vec[AsmSymbol] = Vec::new()
+  var si = 0
+  while si < ctx.text.symbols.len() do
+    all_symbols.push(ctx.text.symbols[si].clone())
+    si = si + 1
+  end
+  var bi = 0
+  while bi < ctx.data.symbols.len() do
+    all_symbols.push(ctx.data.symbols[bi].clone())
+    bi = bi + 1
+  end
+  var ri = 0
+  while ri < ctx.rodata.symbols.len() do
+    all_symbols.push(ctx.rodata.symbols[ri].clone())
+    ri = ri + 1
+  end
+  var bss_i = 0
+  while bss_i < ctx.bss_symbols.len() do
+    all_symbols.push(ctx.bss_symbols[bss_i].clone())
+    bss_i = bss_i + 1
+  end
+  # Convert .rodata labels to symbols (deterministic order).
+  let rodata_labels = ctx.rodata.labels
+  var rodata_names: Vec[String] = Vec::new()
+  for (rname, _) in rodata_labels do
+    rodata_names.push(rname)
+  end
+  rodata_names.sort()
+  var rn = 0
+  while rn < rodata_names.len() do
+    match rodata_labels.get(rodata_names[rn])
+    when Option::Some(offset) then
+      all_symbols.push(AsmSymbol {
+        name: rodata_names[rn].clone(),
+        section: Section::Rodata,
+        offset: offset,
+        size: 0,
+        binding: SymBinding::Local,
+        kind: SymKind::Data
+      })
+    when Option::None then ()
+    end
+    rn = rn + 1
+  end
+  # Convert .L text labels (block labels and local runtime labels) to
+  # local function symbols.
+  let text_labels = ctx.text.labels
+  var text_names: Vec[String] = Vec::new()
+  for (tname, _) in text_labels do
+    text_names.push(tname)
+  end
+  text_names.sort()
+  var tn = 0
+  while tn < text_names.len() do
+    if text_names[tn].starts_with(".L") then
+      match text_labels.get(text_names[tn])
+      when Option::Some(offset) then
+        all_symbols.push(AsmSymbol {
+          name: text_names[tn].clone(),
+          section: Section::Text,
+          offset: offset,
+          size: 0,
+          binding: SymBinding::Local,
+          kind: SymKind::Func
+        })
+      when Option::None then ()
+      end
+    end
+    tn = tn + 1
+  end
+  let text_relocs = ctx.text.relocations
+  let data_relocs = ctx.data.relocations
+  ObjectFile {
+    target: target.clone(),
+    text: ctx.text.bytes,
+    data: ctx.data.bytes,
+    rodata: ctx.rodata.bytes,
+    bss_size: ctx.bss_size,
+    symbols: all_symbols,
+    relocations: text_relocs.clone(),
+    data_relocations: data_relocs.clone(),
+    string_table: Vec::new(),
+    strings: Map::new()
+  }
+end
+
+# Compile the whole program through LIR into an object file's bytes.
+# Only reachable through the driver's default-off gate — the direct
+# emitter is untouched.
+def lir_compile_object(program: MirProgram, target: AsmTarget) -> Result[Vec[u8], String]
+  if target.arch != Arch::AArch64 then
+    return Result::Err("lir: the LIR route is aarch64-only in this slice (machine legalization for x86-64 is TODO)")
+  end
+  if program.statics.len() > 0 then
+    return Result::Err("lir: programs with statics do not compile through the LIR route yet (static data emission needs TODO-agg; remove the TANGERINE_LIR gate to use the direct emitter)")
+  end
+  var ctx = codegen_new(target)
+  var externs: Set[String] = Set::new()
+  var defined: Set[String] = Set::new()
+  var fi = 0
+  while fi < program.functions.len() do
+    let f = program.functions[fi]
+    if f.is_extern then
+      externs.insert(f.name.clone())
+    else
+      defined.insert(f.name.clone())
+    end
+    fi = fi + 1
+  end
+  fi = 0
+  while fi < program.functions.len() do
+    let f = program.functions[fi]
+    if f.is_extern then
+      # Extern functions get no body — an undefined symbol entry so the
+      # linker resolves them (the direct emitter's extern convention).
+      add_symbol(&mut ctx.text, AsmSymbol {
+        name: f.name.clone(),
+        section: Section::Extern,
+        offset: 0,
+        size: 0,
+        binding: SymBinding::Global,
+        kind: SymKind::Func
+      })
+    else
+      let lir_fn = match lower_mir_fn_to_lir(f)
+      when Result::Err(e) then
+        return Result::Err(e)
+      when Result::Ok(lf) then lf
+      end
+      match lir_validate_callees(lir_fn, defined, externs)
+      when Result::Err(e) then return Result::Err(e)
+      when Result::Ok(_) then ()
+      end
+      let peeped = lir_peephole(lir_fn)
+      let alloc = lir_alloc_registers(peeped)
+      lir_emit_fn(&mut ctx, peeped, alloc, externs, defined)
+    end
+    fi = fi + 1
+  end
+
+  # Runtime helpers (mirror codegen_program's tail order: string helpers,
+  # the full runtime buffer merge, RET stubs for any leftover fixup
+  # label, then fixup resolution).
+  emit_runtime_str_concat(&mut ctx)
+  emit_runtime_str_chars(&mut ctx)
+  var runtime_ctx = runtime_ctx_new(target.clone())
+  emit_all_runtime(&mut runtime_ctx)
+  merge_code_buffer(&mut ctx.text, &runtime_ctx.text)
+  var fi2 = 0
+  while fi2 < ctx.text.fixups.len() do
+    let fix = ctx.text.fixups[fi2]
+    match ctx.text.labels.get(fix.label.clone())
+    when Option::None then
+      align_to(&mut ctx.text, 4, Arch::AArch64)
+      def_label(&mut ctx.text, fix.label.clone())
+      a64_ret(&mut ctx.text)
+    when Option::Some(_) then ()
+    end
+    fi2 = fi2 + 1
+  end
+  match resolve_fixups(&mut ctx.text)
+  when Result::Err(e) then
+    return Result::Err("lir: fixup resolution failed: " + e)
+  when Result::Ok(_) then ()
+  end
+
+  # Data sections (argc/argv/envp slots and the free-list allocator
+  # state) — the codegen.tg helpers keep the .data layout identical to
+  # the direct pipeline, so a LIR object links against the same runtime.
+  emit_argc_argv_data(&mut ctx)
+  emit_allocator_runtime_data(&mut ctx)
+
+  let obj = lir_object_file(&mut ctx, target)
+  let obj_bytes = build_object(&obj)
+  Result::Ok(obj_bytes)
+end
+
+# Compile the whole program through LIR and link an executable (the
+# entry selection mirrors generate_executable).
+def lir_compile_executable(program: MirProgram, target: AsmTarget, output_path: String) -> Result[Unit, String]
+  lir_link_object(program, target, output_path)
+end
+
+# The executable route shares lir_compile_object's emission and then
+# performs the link (entry by OS, mirroring generate_executable).
+def lir_link_object(program: MirProgram, target: AsmTarget, output_path: String) -> Result[Unit, String]
+  var ctx = codegen_new(target.clone())
+  var externs: Set[String] = Set::new()
+  var defined: Set[String] = Set::new()
+  var fi = 0
+  while fi < program.functions.len() do
+    let f = program.functions[fi]
+    if f.is_extern then
+      externs.insert(f.name.clone())
+    else
+      defined.insert(f.name.clone())
+    end
+    fi = fi + 1
+  end
+  fi = 0
+  while fi < program.functions.len() do
+    let f = program.functions[fi]
+    if f.is_extern then
+      add_symbol(&mut ctx.text, AsmSymbol {
+        name: f.name.clone(),
+        section: Section::Extern,
+        offset: 0,
+        size: 0,
+        binding: SymBinding::Global,
+        kind: SymKind::Func
+      })
+    else
+      let lir_fn = match lower_mir_fn_to_lir(f)
+      when Result::Err(e) then
+        return Result::Err(e)
+      when Result::Ok(lf) then lf
+      end
+      match lir_validate_callees(lir_fn, defined, externs)
+      when Result::Err(e) then return Result::Err(e)
+      when Result::Ok(_) then ()
+      end
+      let peeped = lir_peephole(lir_fn)
+      let alloc = lir_alloc_registers(peeped)
+      lir_emit_fn(&mut ctx, peeped, alloc, externs, defined)
+    end
+    fi = fi + 1
+  end
+  emit_runtime_str_concat(&mut ctx)
+  emit_runtime_str_chars(&mut ctx)
+  var runtime_ctx = runtime_ctx_new(target.clone())
+  emit_all_runtime(&mut runtime_ctx)
+  merge_code_buffer(&mut ctx.text, &runtime_ctx.text)
+  var fi2 = 0
+  while fi2 < ctx.text.fixups.len() do
+    let fix = ctx.text.fixups[fi2]
+    match ctx.text.labels.get(fix.label.clone())
+    when Option::None then
+      align_to(&mut ctx.text, 4, Arch::AArch64)
+      def_label(&mut ctx.text, fix.label.clone())
+      a64_ret(&mut ctx.text)
+    when Option::Some(_) then ()
+    end
+    fi2 = fi2 + 1
+  end
+  match resolve_fixups(&mut ctx.text)
+  when Result::Err(e) then
+    return Result::Err("lir: fixup resolution failed: " + e)
+  when Result::Ok(_) then ()
+  end
+  emit_argc_argv_data(&mut ctx)
+  emit_allocator_runtime_data(&mut ctx)
+
+  let obj = lir_object_file(&mut ctx, target.clone())
+  let entry = match target.os
+  when OsAbi::MacOS then "main"
+  when OsAbi::Linux then "_start"
+  when OsAbi::Windows then "mainCRTStartup"
+  end
+  var objects: Vec[ObjectFile] = Vec::new()
+  objects.push(obj)
+  let input = LinkerInput {
+    objects: objects,
+    entry: entry.to_string(),
+    entry_offset: -1,
+    output: output_path,
+    target: target.clone()
+  }
+  let link_result = link_executable(&input)
+  link_result
+end

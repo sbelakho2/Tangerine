@@ -1,8 +1,8 @@
 # Tangerine Memory Model (Normative)
 
-**Version:** 1.0.0
+**Version:** 1.1.0
 **Status:** normative
-**Last Updated:** August 2026
+**Last Updated:** September 2026
 
 This document is the normative specification of Tangerine's memory model.
 It describes the model the self-hosted compiler implements today
@@ -37,6 +37,7 @@ guidance is [`interop.md`](interop.md).
 13. [Monomorphization](#13-monomorphization)
 14. [The CFG/Cleanup Model](#14-the-cfgcleanup-model)
 15. [The Invariant Catalog](#15-the-invariant-catalog)
+16. [Atomics and the Language-Level Memory Model](#16-atomics-and-the-language-level-memory-model)
 
 ---
 
@@ -966,6 +967,9 @@ compiler-owned structural field cleanup — exactly once.
 | LangItems built once, structurally unique; the bundle covers option/result/vec/map/set/box/rc/array/slice + string/str_view/unique_ptr/arc_strong/weak_rc/weak_arc/ptr/ptr_mut + the trait ids; semantic identity by DefId/TypeId/TraitId — never strings | types.tg / ids.tg §8 |
 | THE SIMD VECTOR ROW: the std Vec2/Vec4/Vec8/Vec16 instantiations with a 16/32/64-byte width lay out as N lanes of the lane type with ALIGNMENT = the vector WIDTH (never the lane alignment), and the ABI classifier's vector cases cross the 16-byte vector THROUGH the registers (`Vector(16)` — never sret) while the 32/64-byte forms cross by address; a non-vector width (Vec2[f32] — 8 bytes) and an ordinary `[T; N]` fixed array keep the element-aligned inline layout | layout_engine.tg `compute_vector_layout` / `is_simd_vector_type` / `classify_value_category`; codegen.tg `AbiArg::Vector` / `category_uses_sret`; tests/simd/simd_layout_test.tg / simd_abi_probe.tg |
 | THE WASM32 LINEAR-MEMORY MODEL: the wasm32-unknown-unknown / wasm32-wasi target's address space is the wasm linear memory — pointers and handles are 32-bit linear addresses (i32), aggregates live in linear-memory images addressed by i32 handles, and the wasm stack holds the i32/i64/f32/f64 values; the type mapping (Bool/Char/I8/I16/I32/U8/U16/U32 → i32; Int/I64/U64/ISize/USize → i64; F32 → f32; Float/F64 → f64; Ptr/PtrMut/RefInternal/String/Adt/FnPtr/Dyn/Effect/Closure → i32 handles; Unit/Never → no value; I128/U128 fail closed; the SIMD vectors cross by address) is the single authority in wasm_target.tg, and the category-level classification maps the layout engine's value categories to the wasm32 slots | wasm_target.tg "THE WASM TYPE MAPPING TABLE" / `map_primitive_to_wasm` / `mir_type_to_wasm` / `classify_wasm_value_category`; tests/wasm/wasm_conformance_test.tg (the mapping-table case) |
+| THE PER-ORDERING ATOMIC DISCIPLINE: the atomics lower per order code — AArch64 relaxed load/store = plain LDR/STR (acquire/release/SeqCst = LDAR/STLR), AArch64 fence = DMB ISHLD for Acquire and DMB ISH for Release/AcqRel/SeqCst (nothing for Relaxed), x86-64 fence = MFENCE for SeqCst only (nothing for the weaker orders — TSO), x86-64 SeqCst store = the xchg store while weaker stores are plain MOVs; RMW/CAS serve the strongest form (correct for every ordering — stronger-than-requested is always legal) with the per-ordering A/L variants and the CAS failure-order dispatch as documented TODOs | codegen.tg `emit_atomic_intrinsic_a64` / `emit_atomic_intrinsic_x64` §16.8 |
+| THE AArch64 STLR ENCODINGS ARE ISA-VERIFIED: the STLR family bases (STLRB 0x089FFC00 / STLRH 0x489FFC00 / STLR(w) 0x889FFC00 / STLR(x) 0xC89FFC00) and the allocator unlock's `stlrb wzr, [x10]` were re-derived from assembled/disassembled encodings (the former `…1F7C00` words were not valid STLR instructions) | codegen.tg `a64_stlr_enc`; runtime.tg `emit_tg_alloc_unlock` §16.8 |
+| CAS ordering legality (failure ∉ {Release, AcqRel}; failure ≤ success) enforced at every std compare_exchange/compare_exchange_weak entry with the deterministic panic (the panic=abort stance) | std/atomic.tg `validate_cas_orderings` §16.3 |
 
 ### 15.2 Pending (documented targets, not assumptions)
 
@@ -977,3 +981,380 @@ compiler-owned structural field cleanup — exactly once.
 
 The pending list above is the authoritative one; `access_resource_migration.md`
 records the historical status of these items at audit time.
+
+---
+
+## 16. Atomics and the Language-Level Memory Model
+
+This section is the canonical, language-level memory model for atomic
+operations — independent of any CPU's behavior. It defines the five
+orderings and their formal guarantees, the legal ordering per operation
+kind, the data-race status of atomic and non-atomic accesses, the
+compiler-reordering restrictions, the compare-exchange success/failure
+rules, the fence semantics, and the volatile-versus-atomic distinction.
+The per-target instruction mapping in §16.8 is what codegen implements;
+the model is NOT "whatever ARM/x86 currently emits" — the tables are the
+implementation of this section, and any target (current or future) must
+implement at least the guarantees stated here.
+
+Normative authorities: the single atomic primitive layer is the
+`__intrinsic_atomic_*` extern family (`std/atomic.tg`, mirrored in
+`std/sync.tg`), lowered inline by `codegen.tg`
+(`try_emit_atomic_builtin` → `emit_atomic_intrinsic`). The user surface
+is `std::atomic` (`AtomicBool`, `AtomicInt`, `AtomicUInt`, `AtomicU8`,
+`AtomicU64`, `AtomicPtr[T]`, the `Ordering` enum, `fence`/
+`compiler_fence`, and the lock types built on them: `SpinLock`,
+`SeqLock`, `TicketLock`, `RcuPtr`). `std::sync` provides the
+SeqCst-defaulting convenience types (`AtomicBool`/`AtomicU32`/
+`AtomicU64`/`AtomicPtr[T]` with fixed-`SeqCst` load/store/swap/CAS
+surfaces — every call passes order code 5, so those APIs are the
+SeqCst-only subset). A fence never turns a non-atomic access into an
+atomic one: the inline instructions are the atomicity.
+
+### 16.1 Definitions
+
+| Term | Definition |
+|------|-----------|
+| **Atomic object** | a memory location of a type declared in `std::atomic` / `std::sync` (the `Atomic*` structs wrapping one width-exact scalar field of 1/2/4/8 bytes), accessed ONLY through the `__intrinsic_atomic_*` operations of that object's methods. The language has no per-access `atomic` keyword: atomicity comes from the type + the intrinsic layer. |
+| **Atomic access** | a load, store, exchange, read-modify-write (RMW), or compare-exchange performed by an atomic intrinsic on an atomic object. |
+| **Non-atomic access** | any other memory access (an ordinary load/store through a raw pointer, a `get_mut()` write, a `_tg_volatile_*` access, a smart-pointer field write). |
+| **Sequenced-before** | the program order of the abstract machine within one thread (the order the compiler emits: §16.5). |
+| **Happens-before (hb)** | the transitive closure of sequenced-before plus synchronizes-with (§16.2). |
+| **Data race** | two conflicting accesses (at least one a write) to the same memory location by different threads, not ordered by happens-before. |
+| **Ordering code** | the `c_int` ABI code of an ordering (`ordering_to_c`, std/atomic.tg): 0 = Relaxed, 2 = Acquire, 3 = Release, 4 = AcqRel, 5 = SeqCst. (Code 1 is unused and out of domain.) |
+
+Read-from and coherence are the standard per-location rules: every
+atomic load reads from some atomic store (or the initial value) to the
+same location; a load cannot read from a store that happens-after it;
+two atomic stores to one location have a total modification order; a
+load reads the last store before it in that modification order, or a
+store from its release sequence (a chain of RMWs from that store).
+
+### 16.2 The five orderings and their guarantees
+
+An ordering on an operation F is a **minimum** requirement: the
+implementation may serve any operation with a stronger ordering than
+requested, never a weaker one ("stronger" per the strength order of
+§16.3). All five orderings guarantee atomicity (a single, indivisible,
+width-exact access) and coherence (§16.1). They differ only in what they
+order around the operation:
+
+| Ordering | Guarantees (formal) | Typical role |
+|----------|--------------------|--------------|
+| **Relaxed** | atomicity + coherence only. No synchronizes-with; no reordering restrictions. | counters, statistics, `is_locked` probes |
+| **Acquire** | a load with this ordering that reads from a store X (or its release sequence) synchronizes-with X: every side effect sequenced-before X happens-before every operation sequenced-after the load. Subsequent reads and writes in this thread cannot be observed before the load. | lock acquisition, flag polling, RCU read |
+| **Release** | a store with this ordering synchronizes-with every acquire load that reads it: every side effect sequenced-before the store happens-before every operation sequenced-after such a load. The store cannot be observed before prior stores. | lock release, publishing, RCU update |
+| **AcqRel** | RMW only: the read half is an acquire, the write half is a release (for one operation, one location). | exchange/fetch/CAS in lock-free protocols |
+| **SeqCst** | all of the above, plus: the SeqCst operations of a program form a single total order S consistent with each thread's sequenced-before, and every non-SeqCst atomic access that is coherent with that order behaves as if placed somewhere in S. Every SeqCst load reads from the last SeqCst store to its location in S (or a store in its release sequence). | the default discipline of `std::sync`, event ordering across threads |
+
+Derived guarantees (the standard, target-independent facts):
+
+- **Store-store ordering**: a Release (or stronger) store is never
+  observed before an earlier store of the same thread.
+- **Load-load ordering**: an Acquire (or stronger) load never observes
+  a location as newer than a later load of the same thread does (later
+  reads happen after the acquire read's synchronize point).
+- **No load-store reordering across AcqRel/SeqCst RMWs**.
+- **Causality**: an hb-ordered chain of release/acquire pairs transmits
+  side effects transitively (T1 release-store → T2 acquire-load →
+  T2 release-store → T3 acquire-load makes T1's writes visible to T3).
+
+### 16.3 Ordering legality per operation kind
+
+| Operation kind | Legal orderings |
+|----------------|-----------------|
+| `load` | Relaxed, Acquire, SeqCst |
+| `store` | Relaxed, Release, SeqCst |
+| `exchange`, `fetch_*`, `*_fetch` (RMW) | all five (AcqRel is meaningful here) |
+| `compare_exchange` / `compare_exchange_weak` — success | all five |
+| `compare_exchange` / `compare_exchange_weak` — failure | Relaxed, Acquire, SeqCst ONLY |
+| `fence` | all five |
+
+**Strength order** (used by the CAS failure rule):
+Relaxed (0) < Release (1) < Acquire (2) < AcqRel (3) < SeqCst (4)
+(`ordering_strength`, std/atomic.tg).
+
+**Compare-exchange rules**:
+
+1. The failure ordering is the ordering of the READ performed when the
+   comparison fails. A failed CAS performs **no store**, so the failure
+   ordering can never be Release or AcqRel (a release is a write-side
+   guarantee). A failure ordering of Release/AcqRel is a hard program
+   error.
+2. The failure ordering must not be **stronger than the success
+   ordering** (linear strength order above); e.g. success=Release with
+   failure=Acquire is rejected.
+3. On failure the `expected` slot is updated with the current value of
+   the location (the intrinsic writes it back through the expected
+   pointer); `false` is returned. On success the location holds
+   `desired`; `true` is returned.
+4. `compare_exchange_weak` may fail spuriously (a permission, never an
+   obligation); the emitters use the single-attempt strong form, which
+   is always conformant.
+5. A successful CAS with success ordering O orders like an RMW with O;
+   the failed path orders like a load with the failure ordering
+   (read-from and coherence still apply).
+
+**Enforcement.** The CAS rules are enforced at the std boundary by
+`validate_cas_orderings` (std/atomic.tg): every
+`compare_exchange`/`compare_exchange_weak` validates before lowering
+and panics deterministically (the panic=abort stance of §4.3 — there is
+no unwind) on a Release/AcqRel failure ordering or a failure ordering
+stronger than the success ordering. Compile-time diagnosis is possible
+only where the ordering arguments are provable literals (no such
+diagnostic exists today; the runtime check is the general
+enforcement). For the operation-kind legality of the other operations
+(loads/stores/RMWs/fences), orderings are runtime values and the
+language defines deterministic out-of-domain behavior in the codegen
+tables (§16.8): an out-of-domain code is served by the instruction the
+branch structure assigns it (typically the strongest legal form; the
+tables are the authority) — never weaker than what the table promises.
+Such a call is nevertheless a program error (UB per §16.4), not a
+supported use.
+
+### 16.4 Data races
+
+- **Atomic vs atomic**: concurrent atomic accesses to the same atomic
+  object are always well-defined regardless of orderings; the ordering
+  arguments determine only the synchronization guarantees (§16.2).
+- **Any access involving a non-atomic access**: if two threads access
+  the same memory location, at least one access is a write, and at
+  least one of the accesses is not an atomic access, the program has a
+  **data race** — **undefined behavior** (the C/C++/Rust convention the
+  language adopts). This includes an atomic object reached through
+  `get_mut()` (a non-atomic access to what is otherwise an atomic
+  location): the moment the storage is touched by a non-atomic access
+  that races with another thread, the program is racing — `get_mut` is
+  the exclusive-access escape hatch and is subject to the caller
+  proving exclusivity.
+- **Atomic vs volatile (MMIO)**: a `_tg_volatile_*` access and an
+  atomic access to the same address race exactly like a non-atomic vs
+  atomic race — never valid (§16.9).
+- **Diagnosis stance**: the access checker already rejects statically
+  provable conflicting accesses within a call and within one thread
+  (§2.2, §11). Cross-thread races on non-atomic accesses cannot
+  generally be proven by this compiler; where provable they must be
+  diagnosed (future work — no such analysis exists today); otherwise
+  this document is the authority: the program is UB. There is no
+  "benign race" carve-out and no memory-model guarantee for racy
+  non-atomic access: the generated code may tear, reorder, or observe
+  stale values. This matches the deterministic stance of the rest of
+  the toolchain only in that the compiler itself never invents races
+  (§16.5): it never merges, splits, hoists, or sinks memory accesses.
+- **Races on atomics are not UB**: a lost update is a normal outcome of
+  the ordering, never a model violation.
+
+### 16.5 Compiler-reordering restrictions
+
+The model constrains the observable ordering of accesses; it is the
+compiler's duty never to violate it. The Tangerine compiler performs
+**no reordering at all**: MIR lowering and codegen emit memory
+operations strictly in program order, there is no instruction scheduler
+or reordering pass, and no optimization pass elides or merges memory
+accesses. Consequently:
+
+1. Atomic operations are never reordered with respect to each other,
+   to fences, or to non-atomic accesses (there is no pass that could).
+2. Atomic loads are never elided or duplicated; atomic stores are never
+   eliminated or coalesced (in particular, the as-if rule does not
+   apply to atomics).
+3. Non-atomic accesses are never hoisted, sunk, or fused across an
+   atomic operation or a fence.
+4. The `compiler_fence(order)` API (std/atomic.tg) exists for source
+   portability and for `asm volatile`-style compiler barriers; on this
+   compiler it is semantically identical to `fence(order)` minus the
+   CPU barrier, and its "compiler barrier" role is vacuous because of
+   (1)-(3).
+
+(If a future optimizer is added, these restrictions become its
+contract; the memory model does not depend on the optimizer's
+existence.)
+
+### 16.6 Fences
+
+`fence(order)` (std/atomic.tg) issues a thread fence with the ordering's
+guarantees, decoupled from any single operation. Formal semantics
+(standard): a Release fence synchronizes-with an Acquire fence (or
+Acquire load) when a store appears between them and the acquire side
+reads it (or its release sequence); a Release fence followed by a
+Relaxed store gives that store release semantics; a Relaxed load
+followed by an Acquire fence gives that load acquire semantics.
+AcqRel is both halves; SeqCst is a full fence and every SeqCst fence is
+in the single total order S with the SeqCst operations. A Relaxed fence
+orders nothing (compiler barrier only). A fence orders only atomic and
+ordinary accesses per §16.5; it never makes a non-atomic access atomic
+and never orders `volatile` accesses in the atomic model sense (§16.9).
+
+The per-target fence instructions are in the §16.8 tables.
+
+### 16.7 Volatile vs atomic
+
+Tangerine has **no `volatile` type qualifier** and no volatile access
+keyword: the C-style `volatile` concept is spelled as the explicit
+width-exact accessors `_tg_volatile_read8/16/32/64` and
+`_tg_volatile_write8/16/32/64` (std/embedded.tg, lowered to the
+dedicated runtime functions emitted by `runtime.tg`
+`emit_volatile_runtime` on both arches).
+
+| Property | Volatile (`_tg_volatile_*`) | Atomic (`__intrinsic_atomic_*`) |
+|----------|------------------------------|----------------------------------|
+| Access semantics | a single, width-exact, non-elidable load/store; each call performs exactly one access (the call boundary is opaque to any optimizer) | a single atomic load/store/RMW/CAS per intrinsic call |
+| Ordering guarantees | **none** — volatile accesses participate in NO ordering relation of this model; they are not ordered with atomics, fences, or each other (except by program order for the same single access) | the ordering argument's guarantees (§16.2, §16.8) |
+| Atomicity | **never atomic**: a volatile access racing any other access is a data race (UB, §16.4) | atomic |
+| Purpose | MMIO registers, device memory, interrupt-handler shared flags (audit P1-16: MMIO access is permitted in handlers) | lock-free shared memory between threads |
+| Elision/reordering | prevented per access (single-access contract); no cross-access ordering | the ordering model (§16.5, §16.8) |
+
+The two never mix: a fence around volatile accesses provides no atomic
+ordering for them, and a volatile access is never a substitute for an
+atomic one. A hardware register that must be touched once must use the
+volatile accessors; a counter shared between threads must use the
+atomic types.
+
+### 16.8 Per-target codegen tables (normative implementation)
+
+All encodings below were verified against the AArch64/x86-64 ISA
+(assembled + disassembled). Codegen reads the runtime order code from
+the ABI register and branches per ordering where the ISA distinguishes
+orders (AArch64 store/load/fence, x86-64 store/fence). Serving an
+ordering stronger than requested is always legal (§16.2); the tables
+show the minimum-strength instruction actually emitted for each code.
+The wasm32 target (wasm_target.tg) has no atomic emission: an atomic
+extern lowers to the trapping stub (a runtime trap — fail closed), so
+the tables below govern the native aarch64 and x86-64 targets only.
+
+#### 16.8.1 AArch64 (ARMv8.1 LSE-REQUIRED; the LDAR/STLR SC discipline assumes the ARMv8.3+ cumulative semantics of the pair — the LSE-required core baseline provides it)
+
+| Order code | load | store | RMW (fetch/exchange) | CAS | fence |
+|-----------|------|-------|----------------------|-----|-------|
+| 0 Relaxed | LDR (plain) | STR (plain) | LSE **-al** family (strongest; see TODO) | CASAL (strongest; see TODO) | (nothing) |
+| 2 Acquire | LDAR | STLR* | LDADDAL/CASAL/SWPAL… | CASAL | DMB ISHLD |
+| 3 Release | LDAR* | STLR | LSE -al | CASAL | DMB ISH |
+| 4 AcqRel | LDAR* | STLR* | LSE -al | CASAL | DMB ISH |
+| 5 SeqCst | LDAR | STLR | LSE -al | CASAL | DMB ISH |
+
+- LDAR = acquire load (the SeqCst load under the LDAR/STLR pair
+  discipline); STLR = release store (the SeqCst store under the same
+  discipline). The `*` marks out-of-domain codes for that operation
+  kind (UB — §16.3) served deterministically by the strongest legal
+  form.
+- LSE -al family: LDADDAL (add/sub), LDCLRAL (and), LDSETAL (or),
+  LDEORAL (xor), SWPAL (exchange), CASAL (compare-exchange), each
+  width 1/2/4/8 with the A/L bits: base | A(0x800000) | L(0x400000) —
+  e.g. `ldaddal x1, x9, [x0]` = 0xF8E10009.
+- Encodings verified: LDAR base per width 0x08DFFC00/0x48DFFC00/
+  0x88DFFC00/0xC8DFFC00; STLR base 0x089FFC00/0x489FFC00/0x889FFC00/
+  0xC89FFC00 (codegen `a64_stlr_enc`); DMB ISH 0xD5033BBF; DMB ISHLD
+  0xD50339BF; DMB ISHST 0xD5033ABF (store-store only — NOT the language
+  release fence: a release fence must also keep later loads from being
+  observed before the prior stores — a store->load crossing that DMB
+  ISHST does NOT prevent; DMB ISH is the ecosystem-standard release
+  fence, matching clang/gcc).
+
+**TODO (exact mapping, not a correctness gap — the -al forms serve
+every ordering):** per-ordering RMW variants. The A/L flag bits over
+each op's plain base are A = 0x800000, L = 0x400000; the plain bases
+are the `*_al_enc` tables minus 0xC00000. Dispatch on the order code in
+x2 like the store arm: Relaxed → plain (LDADD/…/SWP), Acquire → +A,
+Release → +L, AcqRel/SeqCst → +AL (today's emission). CAS success/
+failure dispatch (codes in x4/x5): the failure path is a read; an exact
+lowering requires the LL/SC fallback (the documented future portable
+mode): relaxed success/relaxed failure → LDXR/STXR loop (LDXR bases
+0x085F7C00/0x485F7C00/0x885F7C00/0xC85F7C00, STXR bases 0x08007C00/
+0x48007C00/0x88007C00/0xC8007C00), acquire reads → LDAXR (the LDXR
+base + 0x8000: 0x085FFC00/0x485FFC00/0x885FFC00/0xC85FFC00 — verified
+encodings), release success stores → STLXR (the STXR base + 0x8000:
+0x0800FC00/0x4800FC00/0x8800FC00/0xC800FC00).
+
+#### 16.8.2 x86-64 (TSO)
+
+| Order code | load | store | RMW (fetch/exchange) | CAS | fence |
+|-----------|------|-------|----------------------|-----|-------|
+| 0 Relaxed | MOV (plain) | MOV (plain) | LOCKed op (inherently full strength) | LOCK cmpxchg | (nothing) |
+| 2 Acquire | MOV | MOV* | LOCKed | LOCK cmpxchg | (nothing) |
+| 3 Release | MOV* | MOV | LOCKed | LOCK cmpxchg | (nothing) |
+| 4 AcqRel | MOV* | MOV* | LOCKed | LOCK cmpxchg | (nothing) |
+| 5 SeqCst | MOV | XCHG (the SeqCst store; implicitly locked) | LOCKed | LOCK cmpxchg | MFENCE |
+
+- TSO facts this table relies on: loads are never reordered with other
+  loads (every load ordering is the same plain MOV); stores are never
+  reordered with other stores (a plain MOV store has release
+  semantics); a LOCKed instruction is a full barrier (so a Relaxed
+  RMW/CAS is served at seq-cst strength — no weaker width-exact atomic
+  RMW exists on x86). SeqCst load = plain MOV under the xchg-store
+  discipline: the total order S is TSO plus every SeqCst store being an
+  xchg full barrier. The `*` marks out-of-domain codes (UB) served
+  deterministically.
+- Fences: SeqCst → MFENCE (0x0F 0xAE 0xF0); Relaxed/Acquire/Release/
+  AcqRel → no instruction (TSO already provides the ordering these
+  fences request; this matches clang/gcc `atomic_thread_fence`
+  lowering — the `##MEMBARRIER` compiler barrier is vacuous here per
+  §16.5). LFENCE/SFENCE are not used: the model covers only cacheable
+  regular memory; store-buffer/MMIO-class effects are outside the
+  atomic ordering model (§16.9).
+
+**TODO (exact mapping — no weaker instruction exists, so this is a
+documentation note rather than a gap):** there is no x86 encoding for a
+width-exact atomic RMW below full-barrier strength; per-ordering RMW
+lowering is therefore a no-op on x86 by construction.
+
+#### 16.8.3 Shared rules
+
+- The `expected` argument of compare_exchange is the ADDRESS of the
+  expected slot; on failure the slot receives the current value.
+- The `weak` flag is accepted for ABI compatibility; the emitters use
+  the strong single-attempt form (conformant — §16.3 rule 4).
+- The `__sync_*` builtins (the kernel/allocator path — Rc/Arc counts,
+  the allocator's per-class locks and accounting, the kernel spin
+  lock) are the **seq_cst-only kernel approximation**: every `__sync_*`
+  emission is the strongest form on both arches (`__sync_synchronize` =
+  DMB ISH / MFENCE; `__sync_fetch_and_add`/`sub` = LDADDAL / LOCK XADD;
+  `__sync_*_compare_and_swap*` = CASAL / LOCK CMPXCHG). They are NOT
+  the user atomic surface and never take an ordering; user code goes
+  through `std::atomic` / `std::sync`.
+
+### 16.9 Stage0 and seed approximations
+
+- **Stage0 (the OCaml seed VM, stage0_ocaml)**: the seed executes
+  single-threaded programs and its host binding table has **no atomic
+  bindings** — any `__intrinsic_atomic_*` call traps
+  ("host call … has no binding (fail-closed)", vm.ml `call_host`), and
+  `__sync_fetch_and_add`/`__sync_bool_compare_and_swap_1` are
+  deliberately unbound. The one seed semantic: `__sync_synchronize` is
+  bound as a **no-op** — the correct semantics on the single-threaded
+  host (host.ml). So no ordering behavior can be observed or validated
+  on the seed; programs that exercise atomics are full-compiler-only.
+  **TODO:** per-ordering VM semantics for the atomic intrinsics (the
+  seed's memory is the VM heap — implement load/store/exchange/CAS/
+  fetch/fence per the order code with the seed's deterministic trap
+  discipline for the out-of-domain codes), if the seed is ever required
+  to run atomic programs.
+- **The kernel `__sync_*` runtime fallback**: `__sync_fetch_and_add`
+  as a runtime FUNCTION (runtime.tg `emit_sync_fetch_and_add_runtime`)
+  is documented "single-threaded runtime … NOT an atomic RMW" — a
+  plain load/add/store; real atomics never route through it (codegen
+  inlines them first). It exists only as a link-time fallback for the
+  declared extern and must not be relied on for concurrency.
+- `std::sync`'s fixed-`SeqCst` convenience methods are the SeqCst
+  subset of this model (every call passes order code 5).
+
+### 16.10 Summary of the model's contract
+
+1. An atomic operation with ordering O provides at least O's
+   guarantees (§16.2) and is served by the §16.8 instruction for O
+   (stronger permitted).
+2. A program that races non-atomic accesses, or passes an out-of-domain
+   ordering, or violates the CAS failure rules, is in error — the CAS
+   rules panic deterministically at the std boundary; the out-of-domain
+   codes are served deterministically per the §16.8 tables.
+3. The compiler never reorders, elides, merges, hoists, or sinks
+   accesses (§16.5).
+4. Volatile and atomic are distinct (§16.7); fences order atomics and
+   ordinary accesses, never volatile accesses.
+5. Where this section and a codegen table disagree, the table above is
+   the implementation and this section is wrong (per the document
+   preface).
+
+(Anchors: §16.1 definitions; §16.2 orderings; §16.3 legality + CAS
+rules; §16.4 races; §16.5 compiler restrictions; §16.6 fences; §16.7
+volatile vs atomic; §16.8 per-target implementation tables; §16.9
+Stage0 approximations; §16.10 contract.)

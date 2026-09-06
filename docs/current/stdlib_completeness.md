@@ -17,10 +17,10 @@ NOT. A module's family is never stronger than its committed evidence,
 and the shipped-std claims are never stronger than the families.
 
 **The enumeration is the gate.** The module list is COMPUTED from the
-`std/*.tg` glob — never typed. This tree enumerates **133 modules**
+`std/*.tg` glob — never typed. This tree enumerates **134 modules**
 (the reviewer's table enumerated 133: `std/postgres.tg` was merged into
 `std/db.tg` and `std/hash_tests.tg` was removed in earlier waves). A
-**new** `std/*.tg` file (a 134th module) has no contract, and the
+**new** `std/*.tg` file (a 135th module) has no contract, and the
 completeness gate FAILS until it receives a contract + proof tests —
 adding a module to std/ without completing its verification is
 impossible by construction.
@@ -30,7 +30,7 @@ impossible by construction.
 | Family | Minimum proof (the contract) | Modules |
 |--------|-------------------------------|---------|
 | `kernel` | the bootstrap ladder compiles the module at every stage (bootstrap/compiler_kernel.manifest + run_bootstrap.sh); the E106 sweep keeps it parse-clean | 14 |
-| `native` | a committed native behavior suite (tests/unit/*_rigor.tg, tests/*_test.tg) exercises the module's public API via `tg test` | 49 |
+| `native` | a committed native behavior suite (tests/unit/*_rigor.tg, tests/*_test.tg) exercises the module's public API via `tg test` | 50 |
 | `lane` | a committed CI lane verifies check + object + link/import smoke and the module's own @test suites where declared | 7 |
 | `parse-clean` | the E106 sweep only: `tg check` zero-diagnostics + the forbidden-syntax backstop (tests/run_stdlib_e106_sweep.sh) | 45 |
 | `experimental` | parse-clean only; the module is flagged experimental (item 33 stable-subset policy) and is EXPLICITLY EXCLUDED from the shipped-std behavior claims | 18 |
@@ -55,6 +55,7 @@ impossible by construction.
 |--------|--------|----------------------------|
 | `accessibility` | native | `tests/unit/test_a11y_rigor.tg`; `tests/unit/test_a11y.tg` |
 | `alloc` | kernel | `bootstrap/compiler_kernel.manifest`; `tests/run_stdlib_e106_sweep.sh`; `tests/allocator_churn_test.tg`; `tests/allocator_large_test.tg`; `tests/allocator_oom_test.tg`; `tests/allocator_reuse_test.tg`; `tests/allocator_threaded_test.tg`; `tests/allocator_alignment_test.tg` |
+| `alloc_policy` | native | `tests/unit/test_alloc_policy.tg` — the allocator-policy contract (audit P1-12): the AllocPolicy markers (Heap/Arena/Slab/Fixed/None) with the hot-path mapping (matching loop = None/Fixed, per-batch = Arena, per-symbol = Slab, embedded = None+Fixed+with_buffer), the deterministic BumpArena (owned new / borrowed with_buffer backing, aligned bump, zero-overhead reset, null-on-exhaustion) and the SlabPool fixed-size typed pool (preallocated slots, free-list acquire/release index hand-off, full-pool Err(item) rejection, no-op double release, exact ascending teardown of live occupants at clear/Drop, no heap churn after init) — test_alloc_policy.tg also wires the slab-funded fixed-capacity ring consumer; allocator-parameterized Vec[T, A]/Map forms are documented future work (Vec growth is the __intrinsic_array_push intrinsic, kernel-side work) |
 | `android` | experimental | `tests/run_stdlib_e106_sweep.sh`; `tests/platform/platform_surface_smoke_test.tg` — the pure JNI surface (the version constants, the device-density no-op off-Android) is host-tested |
 | `anim` | parse-clean | `tests/run_stdlib_e106_sweep.sh` |
 | `app` | native | `tests/unit/test_app_rigor.tg`; `tests/unit/test_events.tg`; `tests/integration/test_pipelines.tg`; `tests/determinism/test_replay.tg` |
@@ -205,14 +206,14 @@ impossible by construction.
    feature rows, with the affected modules listed in `modules = [...]`),
    grouped here in the `experimental` family with the parse-clean minimum
    proof, and **explicitly excluded from the shipped-std-100%% claim**.
-   The claim covers the 115 non-experimental modules; the 18 experimental
+   The claim covers the 116 non-experimental modules; the 18 experimental
    modules remain in `std/` (parse-clean, never removed) but carry no
    behavior or target claim until their targets are served and their
    evidence lands.
 
 **The affected modules (18):** `android`, `cocoa`, `effects`, `embedded`, `gfx_gpu`, `gpu`, `gpu_metal`, `gpu_vulkan`, `gpu_webgpu`, `gui`, `hal`, `ios`, `kernel`, `simd`, `wasi`, `wasm`, `wasm_js`, `windows`.
 
-**The shipped-std-100% claim.** The claim is: every one of the 115
+**The shipped-std-100% claim.** The claim is: every one of the 116
 shipped (non-experimental) modules belongs to a family with a committed
 minimum proof, and every module — shipped or experimental — is
 parse-clean under the E106 sweep. The experimental modules are named

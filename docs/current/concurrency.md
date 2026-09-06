@@ -395,6 +395,14 @@ end
 
 ## Atomics
 
+**Normative reference:** the language-level memory model — the five
+orderings' formal guarantees, the legal ordering per operation kind,
+the data-race rules, the CAS success/failure constraints, the fence
+semantics, and the volatile-vs-atomic distinction — is
+`memory_model.md` §16 (Atomics and the Language-Level Memory Model),
+with the per-target instruction tables in §16.8. This section is the
+usage guide for that model.
+
 The atomics are the one lock-free primitive family. Every operation
 routes through the `__intrinsic_atomic_*` compiler authority (inline
 LDAR/STLR/LSE on AArch64, LOCKed xchg/xadd/cmpxchg on x86-64); a fence

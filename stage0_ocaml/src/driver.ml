@@ -2061,10 +2061,13 @@ let run_closure_pipeline_impl ~(repo_root : string) ~(manifest_path : string)
             v;
           Buffer.contents b
         in
-        Hashtbl.iter
-          (fun k n ->
+        (* audit P1-24: canonical kind order for the evidence rows —
+           never hash-table iteration order (mirrors the sorted
+           EVIDENCE_SUBSET_COUNT emission below) *)
+        List.iter
+          (fun (k, n) ->
             Printf.printf "EVIDENCE_PROFILE_COUNT kind=%s count=%d\n" (json_escape k) n)
-          kind_counts;
+          (List.sort compare (Hashtbl.fold (fun k n acc -> (k, n) :: acc) kind_counts []));
         (match profile_jsonl with
          | Some path ->
              let oc = open_out path in
@@ -3787,7 +3790,9 @@ let debug_mono_poison_names (ctx : closure_ctx) (prog : Seed_mir.program) : unit
         let c = Ids.Callable_id.to_int (Instance_id.callable inst) in
         (c, inst, count) :: acc)
       poison []
-    |> List.sort (fun (a, _, _) (b, _, _) -> compare a b)
+    |> List.sort (fun (a, ai, _) (b, bi, _) ->
+           let c = compare a b in
+           if c <> 0 then c else Instance_id.compare ai bi)
     |> List.iter (fun (c, inst, count) ->
            let nm =
              match Hashtbl.find_opt names c with
@@ -4327,9 +4332,10 @@ let oracle_of_ctx (ctx : closure_ctx) (stats : mir_stats option) : oracle_counts
   if Sys.getenv_opt "TANGERINE_DEBUG_ORACLE" <> None then begin
     Printf.printf "    ORACLE-DEBUG callable-name table (%d entries)\n"
       (Hashtbl.length names);
-    Hashtbl.iter
-      (fun c n -> Printf.printf "    ORACLE-DEBUG name callable#%d (%s)\n" c n)
-      names
+    (* audit P1-24: canonical callable-id row order — never hash order *)
+    List.iter
+      (fun (c, n) -> Printf.printf "    ORACLE-DEBUG name callable#%d (%s)\n" c n)
+      (List.sort compare (Hashtbl.fold (fun c n acc -> (c, n) :: acc) names []));
   end;
   {
     oc_typed_functions = List.length ctx.ctx_env.Typecheck.functions;
@@ -4799,13 +4805,18 @@ let cmd_bootstrap_check (args : string list) : int =
                       in
                       Hashtbl.replace tbl k (f.Seed_mir.name :: cur))
                     prog.Seed_mir.functions;
-                  Hashtbl.iter
-                    (fun inst names ->
+                  (* audit P1-24: canonical InstanceId row order (the
+                     structural-instance key, like the oracle's sorted
+                     instance sets) — never hash order *)
+                  List.iter
+                    (fun (inst, names) ->
                       if List.length names > 1 then
                         Printf.eprintf "GATE-DUP %s names=[%s]\n"
                           (Seed_mir.print_instance inst)
                           (String.concat " | " names))
-                    tbl);
+                    (List.sort
+                       (fun (a, _) (b, _) -> Instance_id.compare a b)
+                       (Hashtbl.fold (fun inst names acc -> (inst, names) :: acc) tbl [])));
                 (if Sys.getenv_opt "TANGERINE_DEBUG_GATE" <> None then
                   let gate_dump_names =
                     [ "record_block_exit_plan"; "block_exit_key"; "windows";

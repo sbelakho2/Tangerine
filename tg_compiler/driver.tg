@@ -45,6 +45,7 @@ use tg_compiler::access_check::{access_check}
 use tg_compiler::resource_check::{resource_check, build_typed_cfg, analysis_context_new, AnalyzedProgram}
 use tg_compiler::mir::{lower_to_mir, MirProgram, MirFunction, optimize_mir, pretty_print_mir, instrument_for_pgo, verify_mir}
 use tg_compiler::codegen::{generate_native, generate_executable, generate_object_file, detect_host_target}
+use tg_compiler::lir::{lir_compile_object, lir_compile_executable}
 use tg_compiler::asm::{AsmTarget, Arch, OsAbi, asm_target}
 use tg_compiler::trait_resolve::{monomorphize_program, mono_cache_new}
 use tg_compiler::mode::{Mode, ModeConfig, config_for_mode}
@@ -2751,6 +2752,109 @@ def root_program_imports_module(program: Program, module: String) -> Bool
   false
 end
 
+# ———————————————————————————————————————————————————————————————
+# THE LIR ROUTE — audit P1-7 slice (default-off, aarch64 host)
+# ———————————————————————————————————————————————————————————————
+# TANGERINE_LIR=1 routes native single-file compiles through
+# tg_compiler::lir — the standalone register-allocation pipeline
+# (MIR -> LIR -> linear scan -> aarch64 emission -> object/link; see
+# lir.tg's module doc for the legalization contract). The gate is an
+# env-var opt-in, so the working direct emitter is untouched; the LIR
+# route FAILS CLOSED on any construct outside the contract (it never
+# falls back per function silently). The route mirrors
+# compile_to_wasm_route's pipeline shape.
+
+def lir_route_enabled() -> Bool
+  match std::env::get_env("TANGERINE_LIR")
+  when Option::Some(v) then v == "1"
+  when Option::None then false
+  end
+end
+
+def compile_lir_route(opts: CompilerOptions, files: Vec[String], output_path: String) -> Result[Unit, String]
+  if files.len() != 1 then
+    return Result::Err("TANGERINE_LIR=1 requires exactly one input file (unset it to use the direct emitter)")
+  end
+  let file = files[0].clone()
+  let out_path = if output_path.len() > 0 then
+    output_path.clone()
+  else
+    match opts.emit
+    when EmitMode::Object then get_output_path(&opts, file.clone(), ".o")
+    when EmitMode::Executable then get_output_path(&opts, file.clone(), "")
+    when _ then "".to_string()
+    end
+  end
+  let source = match read_file(file.clone())
+  when Result::Ok(s) then s
+  when Result::Err(e) then return Result::Err("failed to read " + file.clone() + ": " + e)
+  end
+  var ast = match parse_source_program(source, file.clone())
+  when Result::Ok(p) then p
+  when Result::Err(diags) then return Result::Err(join_diagnostics(&diags))
+  end
+  ast = match merge_imported_deps(ast, false)
+  when Result::Ok(a) then a
+  when Result::Err(e) then return Result::Err(e)
+  end
+  var env = type_env_new()
+  let typed = match analyze_program(&mut env, &mut ast, opts.clone())
+  when Result::Ok(tp) then tp
+  when Result::Err(diags) then return Result::Err(join_diagnostics(&diags))
+  end
+  var mir = match driver_lower_to_mir(&ast, Option::Some(typed.clone()))
+  when Result::Ok(m) then m
+  when Result::Err(e) then return Result::Err("MIR lowering failed: " + e)
+  end
+  let pre_errs = verify_mir(&mir)
+  if !pre_errs.is_empty() then
+    return Result::Err("MIR verification failed before monomorphization (" + pre_errs.len().to_string() + " error(s))")
+  end
+  var mono_cache = mono_cache_new(&ast, &typed.resolutions)
+  match monomorphize_program(&mut mir, &mut mono_cache)
+  when Result::Ok(_) then ()
+  when Result::Err(me) then return Result::Err("monomorphization failed with " + me.len().to_string() + " error(s)")
+  end
+  optimize_mir(&mut mir, opts.opt_level)
+  let post_errs = verify_mir(&mir)
+  if !post_errs.is_empty() then
+    return Result::Err("MIR verification failed after optimization (" + post_errs.len().to_string() + " error(s))")
+  end
+  let target = detect_host_target()
+  if target.arch != Arch::AArch64 then
+    return Result::Err("the TANGERINE_LIR route emits aarch64 only in this slice; the host is " + host_arch_name(target.arch) + " — unset TANGERINE_LIR to use the direct emitter")
+  end
+  match opts.target_triple
+  when Option::Some(tt) then
+    return Result::Err("the TANGERINE_LIR route does not support --target overrides (" + tt + "); unset TANGERINE_LIR to use the direct emitter")
+  when Option::None then ()
+  end
+  match opts.emit
+  when EmitMode::Object then
+    let bytes = match lir_compile_object(mir, target.clone())
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(b) then b
+    end
+    match write_file_bytes(out_path.clone(), &bytes)
+    when Result::Ok(_) then ()
+    when Result::Err(e) then return Result::Err("failed to write " + out_path.clone() + ": " + e)
+    end
+    Result::Ok(())
+  when EmitMode::Executable then
+    lir_compile_executable(mir, target.clone(), out_path)
+  when _ then
+    Result::Err("the TANGERINE_LIR route supports --emit=obj and --emit=exe only (unset TANGERINE_LIR for other emit modes)")
+  end
+end
+
+def host_arch_name(arch: Arch) -> String
+  match arch
+  when Arch::AArch64 then "aarch64"
+  when Arch::X86_64 then "x86_64"
+  when _ then "other"
+  end
+end
+
 def cmd_compile(argv: Vec[String]) -> Int
   var stage2_probe = false
   var probe_i: UInt = 0
@@ -2868,6 +2972,20 @@ def cmd_compile(argv: Vec[String]) -> Int
   # entry and the libc-free link.
   if nostd_mode_requested(&argv, &files) then
     match compile_to_nostd_route(&opts, files, output_path, true)
+    when Result::Ok(_) then return 0
+    when Result::Err(e) then
+      eprintln(e)
+      return 1
+    end
+  end
+
+  # THE LIR ROUTE GATE (audit P1-7 slice; default-off): TANGERINE_LIR=1
+  # routes native single-file compiles through the standalone
+  # register-allocation pipeline in tg_compiler::lir. Fail-closed: any
+  # construct outside the LIR legalization contract fails the compile
+  # with a rule-naming error — never a silent per-function fallback.
+  if lir_route_enabled() then
+    match compile_lir_route(&opts, files, output_path)
     when Result::Ok(_) then return 0
     when Result::Err(e) then
       eprintln(e)
@@ -3004,6 +3122,19 @@ def cmd_compile_direct(skip_subcommand: Bool) -> Int
     var e = emitter_new()
     e.color_enabled = opts.color
     e
+  end
+
+  # THE LIR ROUTE GATE in raw compile mode (audit P1-7 slice; default-
+  # off) — same fail-closed semantics as cmd_compile's gate.
+  if lir_route_enabled() then
+    var lir_files = Vec::new()
+    lir_files.push(file.clone())
+    match compile_lir_route(&opts, lir_files, output_path)
+    when Result::Ok(_) then return 0
+    when Result::Err(e) then
+      eprintln(e)
+      return 1
+    end
   end
 
   match compile_file_core(file.clone(), &opts, &mut emitter)
