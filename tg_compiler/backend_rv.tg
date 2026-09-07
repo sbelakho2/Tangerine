@@ -52,6 +52,24 @@
 # (driver.tg) selects the route with TANGERINE_LIR_TARGET=riscv32 /
 # riscv64 (mirror of TANGERINE_LIR_TARGET=cortex-m).
 #
+# AUDIT P1-14, slice 5 — THE RISC-V ATOMIC SURFACE (COMPLETE on the
+# LIR route): the riscv route opens the pointer/atomic slice of
+# lir.tg (the rv_atomics lowering flag — see lir.tg's LirLowerCtx
+# doc) and this backend translates every marked LirPtrOp statement
+# into RISC-V A-extension code (see the pointer/atomic emission
+# section below): the plain deref forms (LirPtrLoad/LirPtrStore at
+# the route widths, LirPtrAddr, the frame-slot LirPtrLea) and the
+# per-ordering atomic forms — LirAtomLoad/LirAtomStore,
+# LirAtomRmw (the LR/SC loop with the in-register op; exchange
+# included) and LirAtomCas (the LR + compare + branch-mismatch exit
+# + SC loop) — over the rv_lr/rv_sc encoders (aq/rl ordering bits)
+# with the rv_fence_rw_rw barriers of the canonical RISC-V ordering
+# mapping (the per-ordering table is in that section), plus the
+# width encoders the forms need (lb/lh/lhu/lwu/sh join the pure
+# encoder set). rv_validate_fn relaxes the old marker rejections to
+# the per-xlen RISC-V surface and keeps the fail-closed rules for
+# the widths RISC-V cannot express (see rv_validate_ptr_stmt).
+#
 # REMAINING RULES (each names itself in its Err/panic when reached):
 #   - RV32 shamt narrowing (IMPLEMENTED — the xlen-aware gates in
 #     rv_validate_fn and the binop emitters): the route's immediate
@@ -66,10 +84,18 @@
 #     64-bit LIR shift semantics for counts >= 32, which no static
 #     check can exclude; the RV32 64-bit shift lowering over hi/lo
 #     words is a later slice).
-#   - atomics (the A extension: LR/SC, AMO): not implemented — the LIR
-#     slice carries no atomic statements, so nothing reaches this
-#     backend, and the A-extension encoders do not exist; a future
-#     atomic LIR statement would fail closed with a rule-naming Err.
+#   - atomics beyond the LR/SC slice (the A extension): the LR/SC
+#     RMW/CAS/exchange forms ARE implemented (slice 5 — this
+#     section), as are the atomic loads/stores at the route widths
+#     and the pointer-deref forms; what RISC-V cannot express fails
+#     closed with the concrete rule — the OTHER AMOs (amoswap/
+#     amoadd/amoxor/amoand/amoor/amomin/amomax/amominu/amomaxu)
+#     have no LIR form here, sub-word (1/2-byte) atomic RMW/CAS has
+#     no LR/SC encoding (the A extension's LR/SC are word and — on
+#     RV64 — doubleword only; the masked word-width emulation is a
+#     later slice), and RV32 has no 8-byte atomic width at all (a
+#     _u64 intrinsic fails closed at lowering with the riscv32
+#     reason and, defensively, in rv_validate_fn).
 #   - floats (RV32F/RV64F, RV32D/RV64D): not implemented — no LIR
 #     float statement exists in the slice, so none reaches this
 #     backend (fail-closed by absence); the descs report an empty
@@ -102,11 +128,13 @@
 
 use std::core::{Option, Result, panic}
 use std::collections::{Vec, Set, Map}
-use tg_compiler::mir::{MirProgram, MirStatic}
+use tg_compiler::mir::{MirProgram, MirStatic, MirFunction}
 use tg_compiler::lir::{
-  LirFunction, LirAlloc, LirBinOp, LirCond, LirStmtKind, LirTermKind,
+  LirFunction, LirAlloc, LirStmt, LirPtrOp, LirBinOp, LirCond,
+  LirStmtKind, LirTermKind,
   LirUnOp, LirValue,
-  lower_mir_fn_to_lir, lir_peephole, lir_alloc_registers,
+  lower_mir_fn_to_lir_rv32, lower_mir_fn_to_lir_rv64,
+  lir_peephole, lir_alloc_registers,
   lir_first_alloc_vreg, lir_seg_at, lir_reload_at, lir_block_label,
   lir_validate_callees,
   lir_static_scalar_ok, lir_static_init_word_value,
@@ -243,6 +271,51 @@ def rv_lbu(rd: Int, rs1: Int, imm: Int) -> u32
   (((imm & 0xFFF) as u32) << 20) | ((rs1 as u32) << 15) | ((4 as u32) << 12) | ((rd as u32) << 7) | 0x03
 end
 
+# lb rd, imm(rs1) — I-type load byte signed (sign-extended into the
+# word), opcode 0x03, funct3 = 0 (0b000). imm = the signed 12-bit byte
+# offset. The width-1 SIGNED deref load form (the atomic-slice
+# pointer/atomic section); lbu is its unsigned sibling.
+# verified-by-hand: lb x1, 100(x2) = 0x06410083.
+def rv_lb(rd: Int, rs1: Int, imm: Int) -> u32
+  if rd < 0 || rd > 31 || rs1 < 0 || rs1 > 31 then panic("rv_lb: registers must be x0..x31") end
+  if imm < -2048 || imm > 2047 then panic("rv_lb: imm must fit the signed 12-bit offset") end
+  (((imm & 0xFFF) as u32) << 20) | ((rs1 as u32) << 15) | ((0 as u32) << 12) | ((rd as u32) << 7) | 0x03
+end
+
+# lh rd, imm(rs1) — I-type load halfword signed (sign-extended into the
+# word), opcode 0x03, funct3 = 1 (0b001). imm = the signed 12-bit byte
+# offset. The width-2 SIGNED deref load form.
+# verified-by-hand: lh x1, 100(x2) = 0x06411083.
+def rv_lh(rd: Int, rs1: Int, imm: Int) -> u32
+  if rd < 0 || rd > 31 || rs1 < 0 || rs1 > 31 then panic("rv_lh: registers must be x0..x31") end
+  if imm < -2048 || imm > 2047 then panic("rv_lh: imm must fit the signed 12-bit offset") end
+  (((imm & 0xFFF) as u32) << 20) | ((rs1 as u32) << 15) | ((1 as u32) << 12) | ((rd as u32) << 7) | 0x03
+end
+
+# lhu rd, imm(rs1) — I-type load halfword unsigned (zero-extended into
+# the word), opcode 0x03, funct3 = 5 (0b101). imm = the signed 12-bit
+# byte offset. The width-2 UNSIGNED deref/atomic load form.
+# verified-by-hand: lhu x1, 100(x2) = 0x06415083.
+def rv_lhu(rd: Int, rs1: Int, imm: Int) -> u32
+  if rd < 0 || rd > 31 || rs1 < 0 || rs1 > 31 then panic("rv_lhu: registers must be x0..x31") end
+  if imm < -2048 || imm > 2047 then panic("rv_lhu: imm must fit the signed 12-bit offset") end
+  (((imm & 0xFFF) as u32) << 20) | ((rs1 as u32) << 15) | ((5 as u32) << 12) | ((rd as u32) << 7) | 0x03
+end
+
+# lwu rd, imm(rs1) — I-type load word UNSIGNED (zero-extended into the
+# 64-bit register), opcode 0x03, funct3 = 6 (0b110). imm = the signed
+# 12-bit byte offset. RV64-ONLY: the funct3 = 6 word is not an RV32
+# instruction (rv_lw's funct3 = 2 sign-extends; lwu is the width-4
+# ZERO-extension form the atomic slice needs — its LIR width-4 words
+# are zero-extended images, the same note as rv_ld). rv_validate_fn
+# gates every use to xlen 8.
+# verified-by-hand: lwu x1, 100(x2) = 0x06416083.
+def rv_lwu(rd: Int, rs1: Int, imm: Int) -> u32
+  if rd < 0 || rd > 31 || rs1 < 0 || rs1 > 31 then panic("rv_lwu: registers must be x0..x31") end
+  if imm < -2048 || imm > 2047 then panic("rv_lwu: imm must fit the signed 12-bit offset") end
+  (((imm & 0xFFF) as u32) << 20) | ((rs1 as u32) << 15) | ((6 as u32) << 12) | ((rd as u32) << 7) | 0x03
+end
+
 # jalr rd, rs1, imm — I-type jump-and-link register, funct3 = 0, opcode
 # 0x67. rv_ret is the x0/x1 special case. imm = the signed 12-bit byte
 # offset; the branch target is (rs1 + imm) with bit 0 cleared.
@@ -283,6 +356,17 @@ def rv_sb(rs2: Int, rs1: Int, imm: Int) -> u32
   if imm < -2048 || imm > 2047 then panic("rv_sb: imm must fit the signed 12-bit S-immediate") end
   let u = (imm & 0xFFF) as u32
   ((u >> 5) << 25) | ((rs2 as u32) << 20) | ((rs1 as u32) << 15) | ((u & 0x1F) << 7) | 0x23
+end
+
+# sh rs2, imm(rs1) — S-type store halfword, funct3 = 1 (0b001),
+# opcode 0x23. The width-2 store form (the atomic slice's sb/sh/sw/sd
+# family).
+# verified-by-hand: sh x3, 100(x2) = 0x06311223.
+def rv_sh(rs2: Int, rs1: Int, imm: Int) -> u32
+  if rs2 < 0 || rs2 > 31 || rs1 < 0 || rs1 > 31 then panic("rv_sh: registers must be x0..x31") end
+  if imm < -2048 || imm > 2047 then panic("rv_sh: imm must fit the signed 12-bit S-immediate") end
+  let u = (imm & 0xFFF) as u32
+  ((u >> 5) << 25) | ((rs2 as u32) << 20) | ((rs1 as u32) << 15) | ((1 as u32) << 12) | ((u & 0x1F) << 7) | 0x23
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -469,6 +553,99 @@ def rv_jal(rd: Int, rel: Int) -> u32
 end
 
 # ———————————————————————————————————————————————————————————————
+# AMO LR/SC (the A extension) and FENCE — opcodes 0x2F and 0x0F
+# LR/SC layout: [31:27] funct5 | [26] aq | [25] rl | [24:20] rs2 |
+#               [19:15] rs1 | [14:12] funct3 | [11:7] rd | [6:0] opcode
+# LR: funct5 = 00010, rs2 = 0; SC: funct5 = 00011, rs2 = the value to
+# store. funct3 is the access width: 2 (0b010) = word (LR.W/SC.W, both
+# xlens), 3 (0b011) = doubleword (LR.D/SC.D — RV64 only: the funct3=3
+# word is not an RV32 instruction, the same note as rv_slli's RV64
+# 6-bit shamt words; the marked atomic statements of the slice-5
+# pointer/atomic emission section gate every use through
+# rv_validate_ptr_stmt's per-xlen width surface before emission).
+# aq/rl are the acquire/release ordering bits (0 or 1 each). The
+# OTHER AMO instructions (amoswap/amoadd/amoxor/amoand/amoor/
+# amomin/amomax/amominu/amomaxu) have no encoder and no LIR form in
+# this slice.
+# verified-by-hand: lr.w t0, (t1) = 0x100322AF; lr.w.aq t0, (t1) =
+# 0x140322AF (aq = 1 << 26 = 0x04000000); lr.d.rl t0, (t1) =
+# 0x120332AF (funct3 3 = 0x3000, rl = 1 << 25 = 0x02000000);
+# sc.w t0, t1, (t2) = 0x1863A2AF; sc.w.rl t0, t1, (t2) = 0x1A63A2AF;
+# sc.d.aq t0, t1, (t2) = 0x1C63B2AF.
+# FENCE layout: [31:28] fm = 0 | [27:24] pred | [23:20] succ |
+#               [19:15] rs1 = 0 | [14:12] funct3 = 0 | [11:7] rd = 0 |
+#               [6:0] opcode 0x0F (0b0001111)
+# verified-by-hand: fence rw, rw = 0x0330000F (pred = succ = 3 =
+# 0b0011: 3 << 24 | 3 << 20 | 0x0F); fence iorw, iorw = 0x0FF0000F
+# (pred = succ = 15).
+# ———————————————————————————————————————————————————————————————
+
+# lr rd, (rs1) — A-extension load-reserved, opcode 0x2F: [31:27]
+# funct5 = 00010 | [26] aq | [25] rl | [24:20] rs2 = 0 | [19:15] rs1 |
+# [14:12] funct3 = width | [11:7] rd | [6:0] 0x2F. width 2 = word
+# (lr.w), 3 = doubleword (lr.d — RV64 only). aq/rl must be 0 or 1.
+def rv_lr(rd: Int, rs1: Int, width: Int, aq: Int, rl: Int) -> u32
+  if rd < 0 || rd > 31 || rs1 < 0 || rs1 > 31 then panic("rv_lr: registers must be x0..x31") end
+  if width != 2 && width != 3 then panic("rv_lr: width must be 2 (word) or 3 (doubleword — RV64 only)") end
+  if (aq != 0 && aq != 1) || (rl != 0 && rl != 1) then panic("rv_lr: aq and rl must be 0 or 1") end
+  ((0x02 as u32) << 27) | ((aq as u32) << 26) | ((rl as u32) << 25) | ((rs1 as u32) << 15) | ((width as u32) << 12) | ((rd as u32) << 7) | 0x2F
+end
+
+# lr.w rd, (rs1) — the word convenience of rv_lr (width 2, funct3 =
+# 0b010), plain (aq = rl = 0).
+def rv_lr_w(rd: Int, rs1: Int) -> u32
+  rv_lr(rd, rs1, 2, 0, 0)
+end
+
+# lr.d rd, (rs1) — the doubleword convenience of rv_lr (width 3,
+# funct3 = 0b011, RV64 only), plain (aq = rl = 0).
+def rv_lr_d(rd: Int, rs1: Int) -> u32
+  rv_lr(rd, rs1, 3, 0, 0)
+end
+
+# sc rd, rs2, (rs1) — A-extension store-conditional, opcode 0x2F:
+# [31:27] funct5 = 00011 | [26] aq | [25] rl | [24:20] rs2 (the value
+# to store) | [19:15] rs1 (the address) | [14:12] funct3 = width |
+# [11:7] rd (the reservation status: 0 = success, nonzero = lost) |
+# [6:0] 0x2F. width 2 = word (sc.w), 3 = doubleword (sc.d — RV64
+# only); aq/rl must be 0 or 1.
+def rv_sc(rd: Int, rs2: Int, rs1: Int, width: Int, aq: Int, rl: Int) -> u32
+  if rd < 0 || rd > 31 || rs2 < 0 || rs2 > 31 || rs1 < 0 || rs1 > 31 then panic("rv_sc: registers must be x0..x31") end
+  if width != 2 && width != 3 then panic("rv_sc: width must be 2 (word) or 3 (doubleword — RV64 only)") end
+  if (aq != 0 && aq != 1) || (rl != 0 && rl != 1) then panic("rv_sc: aq and rl must be 0 or 1") end
+  ((0x03 as u32) << 27) | ((aq as u32) << 26) | ((rl as u32) << 25) | ((rs2 as u32) << 20) | ((rs1 as u32) << 15) | ((width as u32) << 12) | ((rd as u32) << 7) | 0x2F
+end
+
+# sc.w rd, rs2, (rs1) — the word convenience of rv_sc (width 2,
+# funct3 = 0b010), plain (aq = rl = 0).
+def rv_sc_w(rd: Int, rs2: Int, rs1: Int) -> u32
+  rv_sc(rd, rs2, rs1, 2, 0, 0)
+end
+
+# sc.d rd, rs2, (rs1) — the doubleword convenience of rv_sc (width 3,
+# funct3 = 0b011, RV64 only), plain (aq = rl = 0).
+def rv_sc_d(rd: Int, rs2: Int, rs1: Int) -> u32
+  rv_sc(rd, rs2, rs1, 3, 0, 0)
+end
+
+# fence pred, succ — the memory fence (opcode 0x0F, fm = 0): word =
+# pred << 24 | succ << 20 | 0x0F with [19:7] zero (rs1 = funct3 = rd =
+# 0). pred/succ are the 4-bit predecessor/successor sets of the
+# standard fence device model, 0..15 each: bit 0 = w (write), bit 1 =
+# r (read), bit 2 = o (output), bit 3 = i (input) — `fence rw, rw` is
+# pred = succ = 0b0011 = 3.
+def rv_fence(pred: Int, succ: Int) -> u32
+  if pred < 0 || pred > 15 || succ < 0 || succ > 15 then panic("rv_fence: pred and succ must be 0..15 (the 4-bit i/o/r/w sets)") end
+  ((pred as u32) << 24) | ((succ as u32) << 20) | 0x0F
+end
+
+# fence rw, rw — the read-write ordering fence (pred = succ = 3 = r|w):
+# the barrier an LR/SC loop needs between its acquire and release ends.
+def rv_fence_rw_rw() -> u32
+  rv_fence(3, 3)
+end
+
+# ———————————————————————————————————————————————————————————————
 # Convenience encodings
 # verified-by-hand: ret = 0x00008067; nop = 0x00000013; ebreak =
 # 0x00100073; ecall = 0x00000073; mv x1, x2 = 0x00010093; li x1, 100
@@ -544,9 +721,16 @@ def rv_fp_reg() -> Int = 8
 def rv_ra_reg() -> Int = 1
 def rv_sp_reg() -> Int = 2
 
-# temp regs — t0 = x5, t1 = x6: caller-saved scratch for the emitter.
+# temp regs — t0 = x5, t1 = x6, t2 = x7: caller-saved scratch for the
+# emitter (t0/t1 are the statement temps of the ordinary arms; t2
+# joins them for the exclusive sequences of the atomic slice — see
+# the pointer/atomic emission section's statement-scratch pool,
+# which extends the family through t3..t6 = x28..x31, every one of
+# them caller-saved, outside the fixed vregs a0..a7 = x10..x17 and
+# outside the allocator pool s1..s6 = x9/x18..x22).
 def rv_t0_reg() -> Int = 5
 def rv_t1_reg() -> Int = 6
+def rv_t2_reg() -> Int = 7
 
 # callee_saved — the psABI s0..s11 x-numbers (x8, x9, x18..x27): a
 # callee preserves them. The allocator pool excludes s0/fp, thumb-style.
@@ -587,7 +771,13 @@ end
 # 5-bit 0..31 on xlen 4 — the implemented RV32 shamt narrowing below —
 # and RV32 additionally rejects register-form shift counts, whose
 # 5-bit machine masking no static check can reconcile with the 64-bit
-# LIR shift semantics.
+# LIR shift semantics. A marked LirPtrOp statement (LirStmt.ptr — the
+# pointer/atomic statements of the riscv atomic surface) validates
+# through rv_validate_ptr_stmt against the RISC-V surface FIRST (the
+# per-xlen widths, per-form order codes and vreg geometry — see that
+# helper above); its nominal kind's checks then walk as usual (every
+# carrier's nominal shape passes the arms, and the LirCmp arm is
+# marker-aware for the fence's two-immediate carrier).
 
 # An immediate payload rv_li can materialize: the signed-32-bit lui+addi
 # range [-2^31, 2^31 - 2049] (see rv_li); wider is a later slice.
@@ -638,6 +828,184 @@ def rv_shamt_imm_panic(xlen: Int, count: Int) -> String
   end
 end
 
+# ———————————————————————————————————————————————————————————————
+# The marked LirPtrOp surface (the riscv atomic/pointer slice —
+# fail-closed validation before any emission)
+# ———————————————————————————————————————————————————————————————
+# The marked statements of lir.tg's pointer/atomic slice (LirStmt.ptr
+# — produced once the riscv lowering entry opens the atomic surface)
+# validate against the RISC-V surface here, mirroring the cortex-m
+# validator (thumb_validate_ptr_stmt) with the RISC-V widths and
+# forms:
+#   - the PLAIN deref widths are the route's load/store widths: 1/2/4
+#     bytes on riscv32 and 1/2/4/8 bytes on riscv64 (the 8-byte ld/sd
+#     forms are RV64 instructions; the sub-word forms are lb/lbu/lh/
+#     lhu/sb/sh). Sign extension applies below the machine word (an
+#     I32-typed deref on riscv64 sign-extends through lw; on riscv32
+#     the 4-byte load is the FULL machine word and never carries the
+#     sign flag — lir.tg's lir_deref_word_io never produces it, so a
+#     sign@full-word marked load marks a foreign lowering, exactly
+#     the cortex-m validator's rule).
+#   - the ATOM load/store widths are the same route widths (the
+#     sub-word atomic loads/stores lower as their single-copy-atomic
+#     plain forms plus the ordering fences — RISC-V guarantees
+#     single-copy atomicity of naturally-aligned accesses at most
+#     XLEN bits wide); the atomic RMW/CAS widths are the A
+#     EXTENSION's exclusive widths only — the word (LR.W/SC.W) on
+#     both xlens and the doubleword (LR.D/SC.D) on riscv64. There is
+#     no byte/halfword LR/SC in the A extension, so every sub-word
+#     atomic RMW/CAS fails closed here with that rule (the masked
+#     word-width emulation is a later slice), and riscv32 rejects
+#     the 8-byte widths too.
+#   - every form's order codes and vreg geometry are checked per
+#     form; fixed (precolored) vregs never appear in a marked
+#     statement payload — the riscv lowering resolves atomic
+#     operands to ordinary vregs only (fixed vregs hold values only
+#     in the entry parameter binds and the pre-call argument moves) —
+#     so a fixed id marks a foreign lowering (fail-closed).
+
+# A fixed vreg id in a marked-statement payload: any precolored id
+# (0..15) is foreign on this route (the ABI argument registers are
+# never a marked operand — see the section note).
+def rv_fixed_ptr_bad(lir_reg: Int) -> Bool
+  lir_reg < lir_first_alloc_vreg()
+end
+
+# The plain deref / atomic load-store widths of the route: xlen 8
+# admits 1/2/4/8 (the lb/lh/lw/ld + unsigned families), xlen 4
+# admits 1/2/4 (no ld/lwu — the RV64-only funct3 forms); anything
+# else fails closed (never treated as 64-bit by default).
+def rv_ptr_width_ok(xlen: Int, w: Int) -> Bool
+  if xlen == 8 then
+    w >= 1 && w <= 8
+  elsif xlen == 4 then
+    w >= 1 && w <= 4
+  else
+    false
+  end
+end
+
+# The A-extension exclusive widths of the route (the LR/SC forms):
+# the word (4) on both xlens and the doubleword (8) on xlen 8 only —
+# the RISC-V A extension has no byte/halfword LR/SC encodings.
+def rv_lrsc_width_ok(xlen: Int, w: Int) -> Bool
+  if xlen == 8 then
+    w == 4 || w == 8
+  elsif xlen == 4 then
+    w == 4
+  else
+    false
+  end
+end
+
+# Validate one marked LirPtrOp statement against the RISC-V surface
+# (fail-closed, before any emission): the per-xlen widths above, the
+# per-form order codes and the vreg/offset geometry of each form.
+def rv_validate_ptr_stmt(fn_name: String, pop: LirPtrOp, xlen: Int) -> Result[Unit, String]
+  match pop
+  when LirPtrOp::LirPtrLea(dst, off) then
+    # dst = s0 + off — the frame-slot address (off = the machine byte
+    # offset mw*slot of the riscv lowering — 4*slot on riscv32,
+    # 8*slot on riscv64; non-negative, within the rv_li range the
+    # frame bound of rv_emit_fn keeps).
+    if rv_fixed_ptr_bad(dst) then
+      return Result::Err("rv: " + fn_name + ": pointer LEA into fixed vreg " + dst.to_string() + " does not lower (marked statements never touch the fixed ABI vregs — fail-closed)")
+    end
+    if off < 0 || !rv_imm_li_ok(off) then
+      return Result::Err("rv: " + fn_name + ": pointer LEA offset " + off.to_string() + " is outside the riscv frame-address model (0 .. the rv_li materialization range; the riscv lowering emits the machine slot offset mw*slot — fail-closed)")
+    end
+    Result::Ok(())
+  when LirPtrOp::LirPtrAddr(dst, base, off) then
+    if rv_fixed_ptr_bad(dst) || rv_fixed_ptr_bad(base) then
+      return Result::Err("rv: " + fn_name + ": pointer address arithmetic over fixed vregs does not lower (fail-closed)")
+    end
+    if off < 0 || !rv_imm_li_ok(off) then
+      return Result::Err("rv: " + fn_name + ": pointer address offset " + off.to_string() + " is outside the riscv address model (fail-closed)")
+    end
+    Result::Ok(())
+  when LirPtrOp::LirPtrLoad(dst, base, off, w, sign) then
+    if rv_fixed_ptr_bad(dst) || rv_fixed_ptr_bad(base) then
+      return Result::Err("rv: " + fn_name + ": pointer load over fixed vregs does not lower (fail-closed)")
+    end
+    if !rv_ptr_width_ok(xlen, w) then
+      return Result::Err("rv: " + fn_name + ": pointer deref load width " + w.to_string() + " does not lower on the riscv" + (if xlen == 8 then "64" else "32" end) + " route — only the 1/2/4" + (if xlen == 8 then "/8" else "" end) + "-byte widths exist (an 8-byte deref needs the RV64 doubleword forms — fail-closed)")
+    end
+    if sign && w == 8 then
+      return Result::Err("rv: " + fn_name + ": pointer deref load with sign extension at the full 8-byte word width does not lower (the lowering never emits it — fail-closed)")
+    end
+    if sign && w == 4 && xlen == 4 then
+      return Result::Err("rv: " + fn_name + ": pointer deref load with sign extension at the full 4-byte riscv32 word width does not lower (a 4-byte load is the whole machine word — never sign-extended; the riscv32 lowering never emits it — fail-closed)")
+    end
+    if off < -2048 || off > 2047 then
+      return Result::Err("rv: " + fn_name + ": pointer load offset " + off.to_string() + " is outside the signed 12-bit access field (the riscv lowering emits deref offsets 0 — fail-closed)")
+    end
+    Result::Ok(())
+  when LirPtrOp::LirPtrStore(base, off, src, w) then
+    if rv_fixed_ptr_bad(base) || rv_fixed_ptr_bad(src) then
+      return Result::Err("rv: " + fn_name + ": pointer store over fixed vregs does not lower (fail-closed)")
+    end
+    if !rv_ptr_width_ok(xlen, w) then
+      return Result::Err("rv: " + fn_name + ": pointer deref store width " + w.to_string() + " does not lower on the riscv" + (if xlen == 8 then "64" else "32" end) + " route (only the 1/2/4" + (if xlen == 8 then "/8" else "" end) + "-byte widths exist — fail-closed)")
+    end
+    if off < -2048 || off > 2047 then
+      return Result::Err("rv: " + fn_name + ": pointer store offset " + off.to_string() + " is outside the signed 12-bit access field (the riscv lowering emits deref offsets 0 — fail-closed)")
+    end
+    Result::Ok(())
+  when LirPtrOp::LirAtomLoad(form, w, dst, addr) then
+    if rv_fixed_ptr_bad(dst) || rv_fixed_ptr_bad(addr) then
+      return Result::Err("rv: " + fn_name + ": atomic load over fixed vregs does not lower (fail-closed)")
+    end
+    if !rv_ptr_width_ok(xlen, w) then
+      return Result::Err("rv: " + fn_name + ": atomic load width " + w.to_string() + " does not lower on the riscv" + (if xlen == 8 then "64" else "32" end) + " route (the atomic widths are the route's 1/2/4" + (if xlen == 8 then "/8" else "" end) + " — fail-closed)")
+    end
+    if form != 0 && form != 1 then
+      return Result::Err("rv: " + fn_name + ": atomic load ordering form " + form.to_string() + " does not lower (the riscv forms are 0 = relaxed and 1 = acquire/seq_cst — fail-closed)")
+    end
+    Result::Ok(())
+  when LirPtrOp::LirAtomStore(form, w, addr, val) then
+    if rv_fixed_ptr_bad(addr) || rv_fixed_ptr_bad(val) then
+      return Result::Err("rv: " + fn_name + ": atomic store over fixed vregs does not lower (fail-closed)")
+    end
+    if !rv_ptr_width_ok(xlen, w) then
+      return Result::Err("rv: " + fn_name + ": atomic store width " + w.to_string() + " does not lower on the riscv" + (if xlen == 8 then "64" else "32" end) + " route (the atomic widths are the route's 1/2/4" + (if xlen == 8 then "/8" else "" end) + " — fail-closed)")
+    end
+    if form != 0 && form != 1 then
+      return Result::Err("rv: " + fn_name + ": atomic store ordering form " + form.to_string() + " does not lower (the riscv forms are 0 = relaxed and 1 = release/seq_cst — fail-closed)")
+    end
+    Result::Ok(())
+  when LirPtrOp::LirAtomRmw(family, form, w, dst, addr, val) then
+    if rv_fixed_ptr_bad(dst) || rv_fixed_ptr_bad(addr) || rv_fixed_ptr_bad(val) then
+      return Result::Err("rv: " + fn_name + ": atomic RMW over fixed vregs does not lower (fail-closed)")
+    end
+    if !rv_lrsc_width_ok(xlen, w) then
+      return Result::Err("rv: " + fn_name + ": atomic RMW width " + w.to_string() + " does not lower on the riscv" + (if xlen == 8 then "64" else "32" end) + " route — the RISC-V A extension's LR/SC carry only the word (LR.W/SC.W) and" + (if xlen == 8 then " — on RV64 — the doubleword (LR.D/SC.D)" else " no other width on RV32" end) + "; there is no byte/halfword exclusive encoding, and the masked word-width emulation of sub-word RMWs is a later slice (fail-closed)")
+    end
+    if family < 0 || family > 4 then
+      return Result::Err("rv: " + fn_name + ": atomic RMW family " + family.to_string() + " does not lower (families 0 = add, 1 = and, 2 = or, 3 = xor, 4 = exchange — fail-closed)")
+    end
+    if form < 0 || form > 3 then
+      return Result::Err("rv: " + fn_name + ": atomic RMW ordering form " + form.to_string() + " does not lower (forms 0..3 — fail-closed)")
+    end
+    Result::Ok(())
+  when LirPtrOp::LirAtomCas(form, w, dst, exp, des, addr) then
+    if rv_fixed_ptr_bad(dst) || rv_fixed_ptr_bad(exp) || rv_fixed_ptr_bad(des) || rv_fixed_ptr_bad(addr) then
+      return Result::Err("rv: " + fn_name + ": atomic compare_exchange over fixed vregs does not lower (fail-closed)")
+    end
+    if !rv_lrsc_width_ok(xlen, w) then
+      return Result::Err("rv: " + fn_name + ": atomic compare_exchange width " + w.to_string() + " does not lower on the riscv" + (if xlen == 8 then "64" else "32" end) + " route — the RISC-V A extension's LR/SC carry only the word (LR.W/SC.W) and" + (if xlen == 8 then " — on RV64 — the doubleword (LR.D/SC.D)" else " no other width on RV32" end) + "; there is no byte/halfword exclusive encoding, and the masked word-width emulation of sub-word compare_exchange is a later slice (fail-closed)")
+    end
+    if form < 0 || form > 3 then
+      return Result::Err("rv: " + fn_name + ": atomic compare_exchange ordering form " + form.to_string() + " does not lower (forms 0..3 — fail-closed)")
+    end
+    Result::Ok(())
+  when LirPtrOp::LirPtrFence(form) then
+    if form != 0 && form != 1 then
+      return Result::Err("rv: " + fn_name + ": fence form " + form.to_string() + " does not lower (forms 0 = acquire and 1 = release — fail-closed)")
+    end
+    Result::Ok(())
+  end
+end
+
 def rv_validate_fn(f: LirFunction, xlen: Int) -> Result[Unit, String]
   if f.params.len() > 8 then
     return Result::Err("rv: stack args beyond a0-a7 not implemented")
@@ -648,6 +1016,29 @@ def rv_validate_fn(f: LirFunction, xlen: Int) -> Result[Unit, String]
     var si = 0
     while si < block.stmts.len() do
       let stmt = block.stmts[si]
+      # (riscv atomic/pointer slice): a marked LirPtrOp statement
+      # (LirStmt.ptr — the pointer/atomic statements the riscv
+      # lowering produces once the atomic surface is open) validates
+      # against the RISC-V exclusive/width surface FIRST — its
+      # nominal kind's semantics do not apply (the nominal kinds are
+      # arity-nearest carriers only). The width forms beyond the
+      # route's surface (the riscv32 8-byte forms, the sub-word
+      # RMW/CAS forms the A extension cannot express) fail closed
+      # HERE too, defensively: the lowering already rejects the
+      # riscv32 8-byte width with the target reason, so such a marked
+      # statement reaching this backend marks a lowering/backend
+      # divergence. The nominal-kind checks below still walk the
+      # marked statement (every carrier's nominal shape passes the
+      # arms, and the LirCmp arm is marker-aware for the fence's
+      # two-immediate carrier).
+      match stmt.ptr
+      when Option::Some(pop) then
+        match rv_validate_ptr_stmt(f.name, pop, xlen)
+        when Result::Err(e) then return Result::Err(e)
+        when Result::Ok(_) then ()
+        end
+      when Option::None then ()
+      end
       match stmt.kind
       when LirStmtKind::LirMove(_, val) then
         match val
@@ -688,7 +1079,17 @@ def rv_validate_fn(f: LirFunction, xlen: Int) -> Result[Unit, String]
         match left
         when LirValue::LirReg(_) then ()
         when LirValue::LirImm(_) then
-          return Result::Err("rv: " + f.name + ": compare left operand is an immediate — lowering never produces this (fail-closed)")
+          # A marked statement's nominal kind is an arity-nearest
+          # carrier: the LirPtrFence marker rides a compare of TWO
+          # immediates (the one marker whose payload references no
+          # vreg), so a left immediate is legal exactly when the
+          # statement is marked — its own surface validation above is
+          # authoritative.
+          match stmt.ptr
+          when Option::Some(_) then ()
+          when Option::None then
+            return Result::Err("rv: " + f.name + ": compare left operand is an immediate — lowering never produces this (fail-closed)")
+          end
         end
         match right
         when LirValue::LirReg(_) then ()
@@ -1203,12 +1604,28 @@ def rv_emit_binop_imm(inout re: RvEmit, op: LirBinOp, d: Int, n: Int, imm: Int, 
   end
 end
 
-# ———————————————————————————————————————————————————————————————
-# Statement emission (mirrors thumb_emit_stmt)
-# ———————————————————————————————————————————————————————————————
-# Every arm is explicit; constructs outside the validated subset return
-# Err naming the rule (rv_validate_fn already rejected them — the arms
-# are defense in depth and never silently emit).
+# Emit one LIR statement of a riscv function. A statement carrying a
+# marked LirPtrOp (LirStmt.ptr — the pointer/atomic statements of the
+# riscv atomic surface) emits through the pointer/atomic arms (the
+# RISC-V A-extension LR/SC + FENCE sequences of rv_emit_ptr_stmt,
+# below) — NEVER through its nominal kind's semantics (the nominal
+# kinds are arity-nearest carriers only; see LirStmt.ptr); every
+# other statement emits through the nominal-kind arms of
+# rv_emit_stmt_kind.
+def rv_emit_stmt(inout re: RvEmit, alloc: LirAlloc, mdl_pool: Vec[Int], fn_name: String, stmt: LirStmt, pos: Int, xlen: Int) -> Result[Unit, String]
+  match stmt.ptr
+  when Option::Some(pop) then
+    rv_emit_ptr_stmt(re, alloc, mdl_pool, fn_name, pop, pos, xlen)
+  when Option::None then
+    rv_emit_stmt_kind(re, alloc, mdl_pool, stmt.kind, pos, xlen)
+  end
+end
+
+# The nominal-kind statement emitter (see rv_emit_stmt for the marked
+# LirPtrOp dispatch). Every arm is explicit; constructs outside the
+# validated subset return Err naming the rule (rv_validate_fn already
+# rejected them — the arms are defense in depth and never silently
+# emit).
 #
 # CMP/CSET — the flagless lowering. RISC-V has no NZCV, so LirCmp
 # records its two resolved operand registers (resolved AT THE CMP
@@ -1235,7 +1652,7 @@ end
 # The emitter is otherwise stateless per statement; positions walk
 # EXACTLY like lir_linearize (invariant I3), as in thumb_emit_fn.
 
-def rv_emit_stmt(inout re: RvEmit, alloc: LirAlloc, mdl_pool: Vec[Int], kind: LirStmtKind, pos: Int, xlen: Int) -> Result[Unit, String]
+def rv_emit_stmt_kind(inout re: RvEmit, alloc: LirAlloc, mdl_pool: Vec[Int], kind: LirStmtKind, pos: Int, xlen: Int) -> Result[Unit, String]
   match kind
   when LirStmtKind::LirMove(dst, val) then
     let dt = rv_def_target(alloc, mdl_pool, dst, pos)
@@ -1423,6 +1840,644 @@ def rv_emit_stmt(inout re: RvEmit, alloc: LirAlloc, mdl_pool: Vec[Int], kind: Li
   when LirStmtKind::LirFcvt(_, _, _) then
     Result::Err("rv: float conversion statements do not lower on the riscv route (float types are aarch64-route-only — fail-closed)")
   end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Pointer/atomic statement emission (the riscv atomic slice)
+# ———————————————————————————————————————————————————————————————
+# The marked LirPtrOp statements of the pointer/atomic slice emit here
+# as RISC-V sequences. The atomic primitives of the A extension are
+# the exclusive monitor (LR/SC at the word width on both xlens and the
+# doubleword on RV64) plus the FENCE instruction for ordering; there
+# is no LSE family and no byte/halfword exclusive on RISC-V, so every
+# atomic RMW/CAS form of the LIR slice translates into its LR/SC loop
+# equivalent at the exclusive widths, and the atomic loads/stores
+# translate into their plain/annotated forms. The per-ordering
+# discipline mirrors the CANONICAL RISC-V mapping (the RVWMO
+# recommended mappings of the unprivileged spec's A chapter, which
+# the riscv gcc/clang backends implement — verified offline against
+# their emitted sequences):
+#   loads:  form 0 (Relaxed) = the plain zero-extending width load
+#           (lbu/lhu/lwu/ld; lbu/lhu/lw on riscv32) — the LIR atomic
+#           load images are ZERO-extended at the width (the a64 LSE
+#           register discipline), which fixes the width-4 form to lwu
+#           on riscv64 (rv_lw sign-extends) and to lw on riscv32 (the
+#           full machine word);
+#           form 1 (Acquire/SeqCst/out-of-domain) = fence rw,rw;
+#           lr.aq at the exclusive widths (the canonical seq_cst load
+#           fence rw,rw; lr.aq — the predecessor fence is what
+#           totalizes SC loads under RVWMO, where the cm slice's
+#           post-barrier shape does not; the aq annotation is the
+#           acquire side, the a64 LDAR mirror), with the width-4
+#           zero-extension pair (slli/srli 32) on riscv64 (lr.w
+#           sign-extends); the SUB-WORD form-1 loads (no sub-word LR
+#           exists in the A extension) use the plain width load with a
+#           full fence on EACH side (fence rw,rw; lbu/lhu; fence
+#           rw,rw — the annotation-less load needs the post fence for
+#           its acquire side and the pre fence for the SC strength the
+#           conflation serves);
+#   stores: form 0 (Relaxed) = the plain width store (sb/sh/sw/sd);
+#           form 1 (Release/SeqCst/out-of-domain) = fence rw,rw; then
+#           the plain width store — the canonical RISC-V seq_cst
+#           store (fence rw,rw; sd). A release/SC store CANNOT use
+#           sc.rl outside an LR/SC pair: the store-conditional grants
+#           only a held reservation, which no LR precedes here, so the
+#           store side of the canonical table is realized with the
+#           predecessor fence + plain store (what the riscv compilers
+#           emit). No trailing fence is needed: every SC-strength op
+#           of this slice carries the RVWMO canonical predecessor
+#           fence (or the aq annotation), which is what totalizes SC
+#           ops under RVWMO (the cm slice's trailing DMB is the
+#           ARMv7 classic-mapping idiom and has no counterpart here);
+#   RMW/exchange (LirAtomRmw, at the exclusive widths 4 and — riscv64
+#           — 8):
+#           form 0 (Relaxed) = the bare lr/sc loop;
+#           form 1 (Acquire) = lr.aq/sc (the aq annotation is the
+#           acquire side of the RMW's read);
+#           form 2 (Release) = lr/sc.rl (the rl annotation is the
+#           release side of the RMW's write);
+#           form 3 (AcqRel/SeqCst/out-of-domain) = fence rw,rw;
+#           lr.aq/sc.rl (the canonical seq_cst RMW — the predecessor
+#           fence totalizes; the aq/rl annotations carry the
+#           acquire/release of the acq_rel members);
+#   CAS (LirAtomCas, the same exclusive widths and per-form
+#           annotations): the loop compares the LR result against the
+#           expected word each iteration and EXITS on mismatch with
+#           dst holding the current word. There is NO CLREX analog on
+#           RISC-V: a failed CAS may leave its reservation armed, but
+#           every SC this slice emits immediately follows its own LR,
+#           so a stale reservation can never grant a later store-
+#           conditional (documented divergence from the cm slice's
+#           CLREX);
+#   fences (LirPtrFence): both forms = fence rw,rw — RISC-V's fence
+#           pred/succ sets have no acquire/release variant pair, so
+#           the a64 ISHLD/ISH split collapses into the full read-write
+#           fence exactly like the cm slice's DMB collapse.
+# The plain pointer statements (marked loads/stores/LEAs) emit as
+# register-indirect width loads/stores and frame-address arithmetic;
+# the LirPtrAddr/Lea forms ride the same 12-bit + materialize
+# addressing as the slot accesses.
+#
+# REGISTER DISCIPLINE: an exclusive sequence pins its operands in
+# registers across the loop and needs the SC status register and the
+# loop's data register besides them. The statement-scratch pool is the
+# caller-saved t-family {t0..t6} = {x5, x6, x7, x28..x31}: t0/t1 are
+# the statement temps of the ordinary arms, t2..t6 join them here —
+# every member is dead at every statement boundary (the emitter never
+# carries a value across statements in them; the fixed ABI vregs
+# a0..a7 = x10..x17 hold values only in the entry parameter binds and
+# in the LirMove argument moves that sit directly before a call
+# terminator — the marked statements never appear in those batches
+# and never read or write a fixed vreg, which rv_validate_ptr_stmt
+# enforces), and the allocator pool s1..s6 = {x9, x18..x22} holds the
+# register-resident operand values (distinct allocated registers for
+# distinct simultaneously-live vregs, so pins never alias pool
+# registers). SC keeps rd (status), rs2 (the stored value) and rs1
+# (the address) pairwise distinct — the A-extension constraint on the
+# store-conditional, which the exclusion set below guarantees (and a
+# defensive Err checks before every SC). Invariant I1 holds: RISC-V
+# has no flags, and the sequences' branches are the register compares
+# of rv_emit_b_cond.
+
+# Pick a statement scratch not in `excl` (the registers already pinned
+# by the sequence): the t-family {t0..t6}. Option::None only when all
+# seven are pinned — an internal planning failure the arms fail closed
+# on.
+def rv_pick_atom_scratch(excl: Set[Int]) -> Option[Int]
+  if !excl.contains(&5) then Option::Some(5)
+  elsif !excl.contains(&6) then Option::Some(6)
+  elsif !excl.contains(&7) then Option::Some(7)
+  elsif !excl.contains(&28) then Option::Some(28)
+  elsif !excl.contains(&29) then Option::Some(29)
+  elsif !excl.contains(&30) then Option::Some(30)
+  elsif !excl.contains(&31) then Option::Some(31)
+  else Option::None
+  end
+end
+
+# Is `reg` one of the statement-scratch t-family registers?
+def rv_atom_is_scratch(reg: Int) -> Bool
+  reg == 5 || reg == 6 || reg == 7 || reg == 28 || reg == 29 || reg == 30 || reg == 31
+end
+
+# Reserve `reg` for a sequence (the caller resolved an operand into
+# it): a t-family register is recorded so no later pick collides, and
+# a fixed ABI register (x10..x17 — never produced for these operands
+# by the riscv lowering; kept defensive) is recorded too. Pool
+# registers are distinct by the allocator and never re-picked, so
+# they need no record.
+def rv_atom_reserve(inout excl: Set[Int], reg: Int) -> Unit
+  if rv_atom_is_scratch(reg) || (reg >= 10 && reg <= 17) then
+    excl.insert(reg)
+  end
+end
+
+# The preferred spill-load temp of an operand given the registers
+# already pinned: any free t-family member (t0 first — the
+# established first temp). The fallback t0 is only ever USED when the
+# operand is register-resident (a spill load through a pinned pref is
+# caught by rv_atom_use's collision check below).
+def rv_atom_pref(excl: Set[Int]) -> Int
+  match rv_pick_atom_scratch(excl)
+  when Option::Some(r) then r
+  when Option::None then rv_t0_reg()
+  end
+end
+
+# Resolve one exclusive-sequence operand into a register: a
+# register-resident value keeps its pool register, a spill-resident
+# one loads through a free statement scratch; the resulting register
+# is reserved in `excl`. A spill load that would have to land in an
+# already-pinned scratch (the whole t-family pinned) fails closed.
+def rv_atom_use(inout re: RvEmit, alloc: LirAlloc, mdl_pool: Vec[Int], vreg: Int, pos: Int, xlen: Int, inout excl: Set[Int]) -> Result[Int, String]
+  let pref = rv_atom_pref(excl)
+  let r = rv_emit_use(re, alloc, mdl_pool, LirValue::LirReg(vreg), pos, pref, xlen)
+  if rv_atom_is_scratch(r) && excl.contains(&r) then
+    return Result::Err("rv: atomic sequence at position " + pos.to_string() + " exhausted the statement-scratch pool (internal planning failure — fail-closed)")
+  end
+  rv_atom_reserve(excl, r)
+  Result::Ok(r)
+end
+
+# A unique statement-internal label of fn `fn_name` at position `pos`
+# with tag `tag` (the label map is whole-program; fn names and
+# statement positions are unique).
+def rv_atom_label(fn_name: String, pos: Int, tag: String) -> String
+  ".La" + fn_name + "$" + pos.to_string() + "$" + tag
+end
+
+# The def target of a pointer/atomic statement's destination vreg.
+# Register-resident defs compute straight into the segment register; a
+# MEMORY-resident def is computed into a statement scratch and stored
+# to its slot by the arm (never through the generic t0-def-target
+# convention: the exclusive sequences need the t-family as possible
+# status/data scratches, so the arms pick their own final register).
+def rv_atom_def(alloc: LirAlloc, mdl_pool: Vec[Int], vreg: Int, pos: Int) -> RvDefTarget
+  rv_def_target(alloc, mdl_pool, vreg, pos)
+end
+
+# The register access [base + off] at width 1/2/4/8 of the pointer
+# statements (is_load with the signed forms at 1/2 and — riscv64 —
+# 4): the load encoders are lb/lh/lw (sign) or lbu/lhu/lwu/ld (zero),
+# the store encoders sb/sh/sw/sd. The signed width-4 form is riscv64's
+# lw (sign-extending; the riscv32 full-word load is never signed —
+# rv_validate_ptr_stmt rejects that form), and width 8 is riscv64
+# only. `off` is the signed 12-bit access field the validator bounds
+# (a defensive Err beyond it — the riscv lowering emits deref offsets
+# 0 only). `data` is the register the load lands in / the store reads
+# from.
+def rv_ptr_mem_access(inout re: RvEmit, w: Int, sign: Bool, is_load: Bool, data: Int, rn: Int, off: Int, xlen: Int) -> Result[Unit, String]
+  if off < -2048 || off > 2047 then
+    return Result::Err("rv: pointer/atomic access offset " + off.to_string() + " is outside the signed 12-bit field — rv_validate_ptr_stmt rejects it before emission (fail-closed)")
+  end
+  if is_load then
+    if w == 1 then
+      if sign then
+        rv_emit_word(re, rv_lb(data, rn, off))
+      else
+        rv_emit_word(re, rv_lbu(data, rn, off))
+      end
+    elsif w == 2 then
+      if sign then
+        rv_emit_word(re, rv_lh(data, rn, off))
+      else
+        rv_emit_word(re, rv_lhu(data, rn, off))
+      end
+    elsif w == 4 && xlen == 8 then
+      if sign then
+        rv_emit_word(re, rv_lw(data, rn, off))
+      else
+        rv_emit_word(re, rv_lwu(data, rn, off))
+      end
+    elsif w == 4 && xlen == 4 then
+      # The riscv32 full-word load — never the signed form (validation
+      # rejects a sign flag at the 4-byte machine word).
+      rv_emit_word(re, rv_lw(data, rn, off))
+    elsif w == 8 && xlen == 8 then
+      rv_emit_word(re, rv_ld(data, rn, off))
+    else
+      return Result::Err("rv: pointer/atomic load width " + w.to_string() + " on xlen " + xlen.to_string() + " does not lower (validation rejects it — fail-closed)")
+    end
+  else
+    if w == 1 then
+      rv_emit_word(re, rv_sb(data, rn, off))
+    elsif w == 2 then
+      rv_emit_word(re, rv_sh(data, rn, off))
+    elsif w == 4 then
+      rv_emit_word(re, rv_sw(data, rn, off))
+    elsif w == 8 && xlen == 8 then
+      rv_emit_word(re, rv_sd(data, rn, off))
+    else
+      return Result::Err("rv: pointer/atomic store width " + w.to_string() + " on xlen " + xlen.to_string() + " does not lower (validation rejects it — fail-closed)")
+    end
+  end
+  Result::Ok(())
+end
+
+# The zero-extension pair for a width-4 exclusive load on riscv64:
+# lr.w SIGN-extends into the 64-bit register (the same funct3 = 2
+# word as lw), and the LIR width-4 atomic images are zero-extended
+# (the a64 LSE discipline the CAS compares and the merge tails rely
+# on), so the loaded word is shifted up and logically down —
+# slli/srli by 32. Call sites gate this to xlen 8 (on riscv32 the
+# word is the full register).
+def rv_atom_zext_w(inout re: RvEmit, reg: Int) -> Unit
+  rv_emit_word(re, rv_slli(reg, reg, 32))
+  rv_emit_word(re, rv_srli(reg, reg, 32))
+end
+
+# The LR/SC funct3 width code of an exclusive width: 2 = word
+# (lr.w/sc.w), 3 = doubleword (lr.d/sc.d). Only the validated widths
+# reach it (4 on both xlens, 8 on riscv64) — anything else panics
+# defensively (rv_validate_ptr_stmt rejects it before emission).
+def rv_atom_lrsc_width(w: Int) -> Int
+  if w == 4 then
+    2
+  elsif w == 8 then
+    3
+  else
+    panic("rv: no LR/SC width code for width " + w.to_string() + " (validation rejects it)")
+  end
+end
+
+# The acquire/release annotation bits of an ordering form: aq rides
+# the LR of the exclusive forms (forms 1 and 3), rl rides the SC
+# (forms 2 and 3).
+def rv_atom_form_aq(form: Int) -> Int
+  if form == 1 || form == 3 then 1 else 0 end
+end
+
+def rv_atom_form_rl(form: Int) -> Int
+  if form == 2 || form == 3 then 1 else 0 end
+end
+
+# One marked pointer/atomic statement's emission (see the section
+# header for the per-form translation table). `pop` is the marker; its
+# carrier statement's nominal kind is NOT emitted — the arms below
+# define every def and use the marker payload declares.
+def rv_emit_ptr_stmt(inout re: RvEmit, alloc: LirAlloc, mdl_pool: Vec[Int], fn_name: String, pop: LirPtrOp, pos: Int, xlen: Int) -> Result[Unit, String]
+  match pop
+  when LirPtrOp::LirPtrLea(dst, off) then
+    # dst = s0 + off — the address of the fixed frame slot (the riscv
+    # lowering's LEA payload is the machine byte offset mw*slot — the
+    # route's word width times the slot).
+    let dt = rv_atom_def(alloc, mdl_pool, dst, pos)
+    let fp = rv_fp_reg()
+    if off >= -2048 && off <= 2047 then
+      rv_emit_word(re, rv_addi(dt.reg, fp, off))
+    else
+      # Build the offset in the temp that is not the def register
+      # (t0 for a memory-resident def), then add.
+      let t = if dt.reg == rv_t0_reg() then rv_t1_reg() else rv_t0_reg() end
+      rv_emit_li(re, t, off)
+      rv_emit_word(re, rv_add(dt.reg, fp, t))
+    end
+    if dt.store_slot >= 0 then
+      rv_slot_store(re, dt.reg, dt.store_slot, xlen)
+    end
+    Result::Ok(())
+  when LirPtrOp::LirPtrAddr(dst, base, off) then
+    # dst = base + off (an address inside a pointed-to image / a deref
+    # place's byte offset — the a64 route's base+off form; on the
+    # riscv slice the offset is 0 for whole-scalar derefs).
+    let dt = rv_atom_def(alloc, mdl_pool, dst, pos)
+    var excl: Set[Int] = Set::new()
+    let br = match rv_atom_use(re, alloc, mdl_pool, base, pos, xlen, excl)
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(r) then r
+    end
+    if off == 0 then
+      if dt.reg != br then
+        rv_emit_word(re, rv_mv(dt.reg, br))
+      end
+    elsif off >= -2048 && off <= 2047 then
+      rv_emit_word(re, rv_addi(dt.reg, br, off))
+    else
+      let t = if br == rv_t0_reg() then rv_t1_reg() else rv_t0_reg() end
+      rv_emit_li(re, t, off)
+      rv_emit_word(re, rv_add(dt.reg, br, t))
+    end
+    if dt.store_slot >= 0 then
+      rv_slot_store(re, dt.reg, dt.store_slot, xlen)
+    end
+    Result::Ok(())
+  when LirPtrOp::LirPtrLoad(dst, base, off, w, sign) then
+    # dst = load(base + off) at storage width w (sign-extended for the
+    # signed pointee kinds below the machine word; see
+    # rv_validate_ptr_stmt).
+    let dt = rv_atom_def(alloc, mdl_pool, dst, pos)
+    var excl: Set[Int] = Set::new()
+    let br = match rv_atom_use(re, alloc, mdl_pool, base, pos, xlen, excl)
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(r) then r
+    end
+    match rv_ptr_mem_access(re, w, sign, true, dt.reg, br, off, xlen)
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(_) then ()
+    end
+    if dt.store_slot >= 0 then
+      rv_slot_store(re, dt.reg, dt.store_slot, xlen)
+    end
+    Result::Ok(())
+  when LirPtrOp::LirPtrStore(base, off, src, w) then
+    # store(base + off) = src at storage width w (the value's low w
+    # bytes).
+    var excl: Set[Int] = Set::new()
+    let sv = match rv_atom_use(re, alloc, mdl_pool, src, pos, xlen, excl)
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(r) then r
+    end
+    let bv = match rv_atom_use(re, alloc, mdl_pool, base, pos, xlen, excl)
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(r) then r
+    end
+    match rv_ptr_mem_access(re, w, false, false, sv, bv, off, xlen)
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(_) then ()
+    end
+    Result::Ok(())
+  when LirPtrOp::LirAtomLoad(form, w, dst, addr) then
+    # dst = load(addr); form 0 = the plain zero-extending width load;
+    # form 1 = the acquire/seq_cst load of the canonical RISC-V
+    # mapping (see the section header): fence rw,rw; lr.aq at the
+    # exclusive widths (with the riscv64 width-4 zero-extension pair),
+    # and the doubly-fenced plain width load at the sub-word widths.
+    let dt = rv_atom_def(alloc, mdl_pool, dst, pos)
+    var excl: Set[Int] = Set::new()
+    let ar = match rv_atom_use(re, alloc, mdl_pool, addr, pos, xlen, excl)
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(r) then r
+    end
+    if form == 0 then
+      match rv_ptr_mem_access(re, w, false, true, dt.reg, ar, 0, xlen)
+      when Result::Err(e) then return Result::Err(e)
+      when Result::Ok(_) then ()
+      end
+    else
+      if w == 4 || w == 8 then
+        rv_emit_word(re, rv_fence_rw_rw())
+        rv_emit_word(re, rv_lr(dt.reg, ar, rv_atom_lrsc_width(w), 1, 0))
+        if w == 4 && xlen == 8 then
+          rv_atom_zext_w(re, dt.reg)
+        end
+      else
+        # The sub-word widths: no sub-word LR exists in the A
+        # extension, so the form-1 load is the plain width load with a
+        # full fence on each side (the post fence carries the acquire
+        # side the aq annotation would, and the pre fence the SC
+        # strength the form conflates — documented in the section
+        # header).
+        rv_emit_word(re, rv_fence_rw_rw())
+        match rv_ptr_mem_access(re, w, false, true, dt.reg, ar, 0, xlen)
+        when Result::Err(e) then return Result::Err(e)
+        when Result::Ok(_) then ()
+        end
+        rv_emit_word(re, rv_fence_rw_rw())
+      end
+    end
+    if dt.store_slot >= 0 then
+      rv_slot_store(re, dt.reg, dt.store_slot, xlen)
+    end
+    Result::Ok(())
+  when LirPtrOp::LirAtomStore(form, w, addr, val) then
+    # store(addr) = val; form 0 = the plain width store, form 1 = the
+    # release/seq_cst store — fence rw,rw; then the plain width store
+    # (the canonical RISC-V seq_cst store; sc.rl cannot serve a pure
+    # store — see the section header).
+    var excl: Set[Int] = Set::new()
+    let sv = match rv_atom_use(re, alloc, mdl_pool, val, pos, xlen, excl)
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(r) then r
+    end
+    let ar = match rv_atom_use(re, alloc, mdl_pool, addr, pos, xlen, excl)
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(r) then r
+    end
+    if form == 1 then
+      rv_emit_word(re, rv_fence_rw_rw())
+    end
+    match rv_ptr_mem_access(re, w, false, false, sv, ar, 0, xlen)
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(_) then ()
+    end
+    Result::Ok(())
+  when LirPtrOp::LirAtomRmw(family, form, w, dst, addr, val) then
+    rv_emit_atom_rmw(re, alloc, mdl_pool, fn_name, family, form, w, dst, addr, val, pos, xlen)
+  when LirPtrOp::LirAtomCas(form, w, dst, exp, des, addr) then
+    rv_emit_atom_cas(re, alloc, mdl_pool, fn_name, form, w, dst, exp, des, addr, pos, xlen)
+  when LirPtrOp::LirPtrFence(_) then
+    # The per-ordering fence: both the acquire (0) and the
+    # release/SeqCst (1) forms are the full fence rw,rw (see the
+    # section header — RISC-V's pred/succ sets have no acquire/
+    # release variant pair to serve the a64 ISHLD/ISH distinction,
+    # exactly the cm slice's DMB collapse).
+    rv_emit_word(re, rv_fence_rw_rw())
+    Result::Ok(())
+  end
+end
+
+# One LirAtomRmw arm: the LR/SC loop of the RMW/exchange family (0 =
+# add — fetch_sub's negation already lowered; 1 = and — the
+# fetch_and complement already lowered; 2 = or; 3 = xor; 4 =
+# exchange) at the ordering form's annotation/fence placement. dst
+# receives the OLD [addr] word (zero-extended at the width, like the
+# a64 LSE forms). When dst IS the value operand (MIR storage reuse),
+# the value is copied into a pin first — the loop's data register
+# would otherwise clobber it on the first LR.
+def rv_emit_atom_rmw(inout re: RvEmit, alloc: LirAlloc, mdl_pool: Vec[Int], fn_name: String, family: Int, form: Int, w: Int, dst: Int, addr: Int, val: Int, pos: Int, xlen: Int) -> Result[Unit, String]
+  # The canonical seq_cst RMW's predecessor fence (the form conflates
+  # AcqRel/SeqCst/out-of-domain — the strongest arm).
+  if form == 3 then
+    rv_emit_word(re, rv_fence_rw_rw())
+  end
+  var excl: Set[Int] = Set::new()
+  # The SC status register (S) is reserved FIRST from the t-family
+  # scratches (every member tests as cheaply as any other on RISC-V —
+  # bne sr, x0; the low-register rule of the cm slice has no
+  # counterpart).
+  let sr = match rv_pick_atom_scratch(excl)
+  when Option::Some(pp) then pp
+  when Option::None then
+    return Result::Err("rv: " + fn_name + ": atomic RMW at position " + pos.to_string() + " exhausted the statement-scratch pool (internal planning failure — fail-closed)")
+  end
+  excl.insert(sr)
+  # The address pin (A).
+  let ar = match rv_atom_use(re, alloc, mdl_pool, addr, pos, xlen, excl)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(r) then r
+  end
+  # The value pin (V): the exchange (family 4) data register at the
+  # SC or the ALU operand of the other families.
+  var vr = 0
+  if dst == val then
+    # Storage reuse: copy the value into a pin before any def write.
+    let r = match rv_atom_use(re, alloc, mdl_pool, val, pos, xlen, excl)
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(rr) then rr
+    end
+    let p = match rv_pick_atom_scratch(excl)
+    when Option::Some(pp) then pp
+    when Option::None then
+      return Result::Err("rv: " + fn_name + ": atomic RMW at position " + pos.to_string() + " exhausted the statement-scratch pool (internal planning failure — fail-closed)")
+    end
+    rv_emit_word(re, rv_mv(p, r))
+    excl.insert(p)
+    vr = p
+  else
+    match rv_atom_use(re, alloc, mdl_pool, val, pos, xlen, excl)
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(r) then vr = r
+    end
+  end
+  # The loop data register (D): the def segment register when the
+  # destination is register-resident, else a statement scratch that
+  # holds the OLD value at the loop end (the arm stores it to the
+  # def slot below).
+  let dt = rv_atom_def(alloc, mdl_pool, dst, pos)
+  var dr = dt.reg
+  if dt.store_slot >= 0 then
+    let p = match rv_pick_atom_scratch(excl)
+    when Option::Some(pp) then pp
+    when Option::None then
+      return Result::Err("rv: " + fn_name + ": atomic RMW at position " + pos.to_string() + " exhausted the statement-scratch pool (internal planning failure — fail-closed)")
+    end
+    excl.insert(p)
+    dr = p
+  else
+    rv_atom_reserve(excl, dr)
+  end
+  # The exclusive loop. Family 1 (the LDCLR mirror of fetch_and) has
+  # its AND-operand COMPLEMENTED in the value pin before the loop: the
+  # prepped val_p is ~v (the lowering's BitNot — see
+  # lir_atomic_rmw_prep) and the memory op must AND with its
+  # complement (old & ~~v == old & v). The pin is the prepped vreg's
+  # only reader (a fresh lowering temp; dead after this statement), so
+  # the in-place xori is safe. The other families use the pin as-is.
+  let lbl = rv_atom_label(fn_name, pos, "rmw")
+  if family == 1 then
+    rv_emit_word(re, rv_xori(vr, vr, -1))
+  end
+  def_label(&mut re.buf, lbl)
+  # lr with the form's acquire annotation; the riscv64 width-4
+  # zero-extension pair after it (lr.w sign-extends — see
+  # rv_atom_zext_w).
+  rv_emit_word(re, rv_lr(dr, ar, rv_atom_lrsc_width(w), rv_atom_form_aq(form), 0))
+  if w == 4 && xlen == 8 then
+    rv_atom_zext_w(re, dr)
+  end
+  match family
+  when 0 then rv_emit_word(re, rv_add(dr, dr, vr))
+  when 1 then rv_emit_word(re, rv_and(dr, dr, vr))
+  when 2 then rv_emit_word(re, rv_or(dr, dr, vr))
+  when 3 then rv_emit_word(re, rv_xor(dr, dr, vr))
+  when 4 then ()   # exchange: the SC writes the value pin directly
+  when _ then return Result::Err("rv: " + fn_name + ": atomic RMW family " + family.to_string() + " does not lower (fail-closed)")
+  end
+  # The SC: rd (status), rs2 (the stored value) and rs1 (the address)
+  # are pairwise distinct — the A-extension constraint the exclusion
+  # set guarantees; the check is defensive.
+  let sc_rs2 = if family == 4 then vr else dr end
+  if sr == sc_rs2 || sr == ar || sc_rs2 == ar then
+    return Result::Err("rv: " + fn_name + ": atomic RMW at position " + pos.to_string() + " would emit an SC with non-distinct rd/rs2/rs1 (internal planning failure — fail-closed)")
+  end
+  rv_emit_word(re, rv_sc(sr, sc_rs2, ar, rv_atom_lrsc_width(w), 0, rv_atom_form_rl(form)))
+  match rv_emit_b_cond(re, sr, 0, LirCond::LirNe, lbl)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(_) then ()
+  end
+  if dt.store_slot >= 0 then
+    rv_slot_store(re, dr, dt.store_slot, xlen)
+  end
+  Result::Ok(())
+end
+
+# One LirAtomCas arm: the LR/SC compare-exchange loop at the exclusive
+# widths. The expected word (exp — the zero-extended word the CAS
+# lowering loaded from the expected slot) is compared per iteration;
+# on mismatch the loop exits with dst holding the current [addr] word;
+# on success the SC grants and dst holds the expected word. RISC-V
+# has no CLREX: a failed compare may leave the reservation armed, but
+# every SC this emitter produces immediately follows its own LR, so a
+# stale reservation can never grant a later store-conditional (the
+# ARMv7 CLREX of the cm slice has no counterpart — documented). The
+# seq_cst form's predecessor fence sits before the loop, so the
+# failed path reads with the success order's strength too (the a64
+# CASA/CASAL mirror; the failure order is covered by the checker's
+# failure <= success rule).
+def rv_emit_atom_cas(inout re: RvEmit, alloc: LirAlloc, mdl_pool: Vec[Int], fn_name: String, form: Int, w: Int, dst: Int, exp: Int, des: Int, addr: Int, pos: Int, xlen: Int) -> Result[Unit, String]
+  if form == 3 then
+    rv_emit_word(re, rv_fence_rw_rw())
+  end
+  var excl: Set[Int] = Set::new()
+  # The SC status register (S) is reserved FIRST from the t-family
+  # scratches (every member tests as cheaply as any other on RISC-V —
+  # bne sr, x0; the low-register rule of the cm slice has no
+  # counterpart).
+  let sr = match rv_pick_atom_scratch(excl)
+  when Option::Some(pp) then pp
+  when Option::None then
+    return Result::Err("rv: " + fn_name + ": atomic CAS at position " + pos.to_string() + " exhausted the statement-scratch pool (internal planning failure — fail-closed)")
+  end
+  excl.insert(sr)
+  # The address pin (A) and the expected pin (E — compared every
+  # iteration).
+  let ar = match rv_atom_use(re, alloc, mdl_pool, addr, pos, xlen, excl)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(r) then r
+  end
+  let er = match rv_atom_use(re, alloc, mdl_pool, exp, pos, xlen, excl)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(r) then r
+  end
+  # The loop data register (D): the def segment register when the
+  # destination is register-resident, else a statement scratch holding
+  # the current word at the loop end.
+  let dt = rv_atom_def(alloc, mdl_pool, dst, pos)
+  var dr = dt.reg
+  if dt.store_slot >= 0 then
+    let p = match rv_pick_atom_scratch(excl)
+    when Option::Some(pp) then pp
+    when Option::None then
+      return Result::Err("rv: " + fn_name + ": atomic CAS at position " + pos.to_string() + " exhausted the statement-scratch pool (internal planning failure — fail-closed)")
+    end
+    excl.insert(p)
+    dr = p
+  else
+    rv_atom_reserve(excl, dr)
+  end
+  # The desired pin (T — the SC data register).
+  let tr = match rv_atom_use(re, alloc, mdl_pool, des, pos, xlen, excl)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(r) then r
+  end
+  # The compare-exchange loop: LR; compare; mismatch exits to the
+  # common tail (dst already holds the current word); SC failure (the
+  # reservation was lost or another agent wrote) retries the whole
+  # read-compare-store cycle.
+  let lp_lbl = rv_atom_label(fn_name, pos, "caslp")
+  let fail_lbl = rv_atom_label(fn_name, pos, "casfail")
+  def_label(&mut re.buf, lp_lbl)
+  rv_emit_word(re, rv_lr(dr, ar, rv_atom_lrsc_width(w), rv_atom_form_aq(form), 0))
+  if w == 4 && xlen == 8 then
+    rv_atom_zext_w(re, dr)
+  end
+  match rv_emit_b_cond(re, dr, er, LirCond::LirNe, fail_lbl)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(_) then ()
+  end
+  if sr == tr || sr == ar || tr == ar then
+    return Result::Err("rv: " + fn_name + ": atomic CAS at position " + pos.to_string() + " would emit an SC with non-distinct rd/rs2/rs1 (internal planning failure — fail-closed)")
+  end
+  rv_emit_word(re, rv_sc(sr, tr, ar, rv_atom_lrsc_width(w), 0, rv_atom_form_rl(form)))
+  match rv_emit_b_cond(re, sr, 0, LirCond::LirNe, lp_lbl)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(_) then ()
+  end
+  def_label(&mut re.buf, fail_lbl)
+  if dt.store_slot >= 0 then
+    rv_slot_store(re, dr, dt.store_slot, xlen)
+  end
+  Result::Ok(())
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -2053,7 +3108,9 @@ def rv_emit_fn(inout re: RvEmit, mdl_pool: Vec[Int], lir_fn: LirFunction, alloc:
     def_label(&mut re.buf, lir_block_label(lir_fn.name.clone(), b.id))
     var si = 0
     while si < b.stmts.len() do
-      match rv_emit_stmt(re, alloc, mdl_pool, b.stmts[si].kind, pos, xlen)
+      # A statement carrying a marked LirPtrOp dispatches through
+      # rv_emit_stmt to the pointer/atomic arms (see rv_emit_stmt).
+      match rv_emit_stmt(re, alloc, mdl_pool, lir_fn.name.clone(), b.stmts[si], pos, xlen)
       when Result::Err(e) then return Result::Err(e)
       when Result::Ok(_) then ()
       end
@@ -2765,6 +3822,20 @@ def rv_emit_program_statics(inout data: Vec[u8], inout syms: Vec[AsmSymbol], pro
   Result::Ok(())
 end
 
+# The riscv lowering entry for the route's xlen: the riscv64 (xlen 8)
+# entry opens the atomic surface at the 8-byte machine word
+# (lower_mir_fn_to_lir_rv64 — the _u64 widths admitted), and the
+# riscv32 (xlen 4) entry opens the same surface at the 4-byte machine
+# word (lower_mir_fn_to_lir_rv32 — the cortex-m width model; the _u64
+# widths fail closed at lowering). See the entries' docs in lir.tg.
+def rv_lower_mir_fn(xlen: Int, f: MirFunction, static_labels: Map[String, String]) -> Result[LirFunction, String]
+  if xlen == 8 then
+    lower_mir_fn_to_lir_rv64(f, static_labels)
+  else
+    lower_mir_fn_to_lir_rv32(f, static_labels)
+  end
+end
+
 # Compile the whole program to a RISC-V ELF relocatable object.
 # `xlen` selects the class: 8 -> ELF64 riscv64, 4 -> ELF32 riscv32
 # (rv_target_desc drives the register model of both). Program statics
@@ -2833,7 +3904,7 @@ def rv_compile_object(program: MirProgram, xlen: Int) -> Result[Vec[u8], String]
       # (Section::ColdText). Programs without @cold functions take the
       # cold pass as a zero-iteration no-op and the buffer is
       # byte-identical to the pre-@cold layout.
-      let lir_fn = match lower_mir_fn_to_lir(f, static_labels)
+      let lir_fn = match rv_lower_mir_fn(xlen, f, static_labels)
       when Result::Err(e) then return Result::Err(e)
       when Result::Ok(lf) then lf
       end
@@ -2875,7 +3946,7 @@ def rv_compile_object(program: MirProgram, xlen: Int) -> Result[Vec[u8], String]
     while fi < program.functions.len() do
       let f = program.functions[fi]
       if !f.is_extern && f.attr_cold then
-        let lir_fn = match lower_mir_fn_to_lir(f, static_labels)
+        let lir_fn = match rv_lower_mir_fn(xlen, f, static_labels)
         when Result::Err(e) then return Result::Err(e)
         when Result::Ok(lf) then lf
         end

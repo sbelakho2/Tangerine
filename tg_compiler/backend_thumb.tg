@@ -5,7 +5,7 @@
 # P1-7 LIR slice (lir.tg). The LIR's aarch64 slice (MIR -> LIR lowering,
 # linear-scan allocation, aarch64 emission in lir_emit_fn) is unchanged;
 # this module emits the cortex-m LIR function shapes (lower_mir_fn_to_lir_cm
-# / lir_peephole / lir_alloc_registers) as Thumb-2 machine code for the
+# / lir_peephole / lir_alloc_registers_cm) as Thumb-2 machine code for the
 # Cortex-M3/M4 class (ARMv7-M), driven by the data-driven description
 # target_desc::cortex_m_desc() (the canonical register classes/ABI data —
 # nothing is re-derived here).
@@ -129,15 +129,46 @@
 #     strings, pointers, aggregate/collection images — and static
 #     WRITES (the MirStaticAddr address-of forms) fail closed with
 #     their concrete rules in lir.tg's shared gates.
-#   - floats: the LIR slice has no float statements, so none reaches
-#     this backend (fail-closed by absence); atomics via LDREX/STREX
-#     are likewise not implemented — the desc reports has_atomics on
-#     [1,2,4] but the LIR slice carries no atomic statements and this
-#     backend has no exclusive-access encoders; the interrupt ABI
+#   - floats: the float slice IS implemented in its REGISTER-RESIDENT
+#     (F64 — F32 values are MEMORY-CLASS on this route, see below) and
+#     MEMORY-RESIDENT envelopes plus the float ABI CROSSINGS
+#     (float locals/statements lower since the float-body slice; the
+#     statement arms load spill-slot operands into the d14/d15
+#     statement scratches at the width — s28/s30 for F32 — and store
+#     memory-resident defs at the width, and since the float-ABI
+#     slice the float RETURN crossing — LirRet to the VFP d0/s0 return
+#     register —, the float CALL-RESULT capture from d0/s0 after a
+#     call, the float STACK-PARAMETER binds (LirLoadFrame at the
+#     width) and the call CROSSING of live float values (the width-
+#     aware pre-call spill stores and post-call reloads) all lower at
+#     the crossings; the cm allocator's width-aware slot geometry
+#     (LirAlloc.slot_words — an F64 image's home is TWO 4-byte words
+#     at an even base, an F32 image one word) makes the 8-byte F64
+#     slot images exact). F32 values are MEMORY-CLASS on this route:
+#     the cm allocator entry (lir_alloc_registers_cm) never places an
+#     F32 vreg in the FP pool (d16..d29 — no single-register alias
+#     above d15 on the cortex-m register model), so every F32
+#     statement lowers load-op-store through the d15/d14 statement
+#     scratches; atomics via the ARMv7-M
+#     LDREX/STREX exclusives ARE implemented on this route (the M3/M4
+#     class of cortex_m_desc — see the exclusive-access encoder section
+#     and the pointer/atomic statement-emission section): the cortex-m
+#     lowering entry (lower_mir_fn_to_lir_cm in lir.tg, cm_atomics)
+#     opens the pointer/atomic slice at the desc's atomic widths
+#     [1, 2, 4] — the width-1/2/4 atomic intrinsics lower to marked
+#     LirPtrOp statements, translated here into LDREX/STREX loops with
+#     the DMB SY ordering discipline (the per-ordering table is in the
+#     pointer/atomic emission section below, mirroring clang's
+#     ARMv7-M __atomic emission, verified offline) — while the _u64
+#     width fails closed at lowering (ARMv7-M has no 8-byte
+#     exclusive/doubleword atomic form) and the width-8 marked forms
+#     fail closed in thumb_validate_ptr_stmt; the interrupt ABI
 #     (NVIC entry/exit, IRQ masking — no desc field yet) is not
 #     implemented; and the Cortex-M0/M0+ variant (ARMv6-M is Thumb-1:
-#     no 32-bit encodings, different exclusives) has no slice of its
-#     own.
+#     no 32-bit Thumb-2 encodings and no byte/halfword exclusives —
+#     its word-only LDREX/STREX pair does not serve this route's
+#     widths, and no cortex_m_desc instance exists for it) has no
+#     slice of its own and stays fail-closed.
 #   - the OS entry capture (argc/argv for "main"/"_start", emitted by
 #     codegen.tg's emit_save_argc_argv on aarch64) is NOT emitted here:
 #     a cortex-m image has no host argc/argv contract, and the
@@ -173,10 +204,10 @@ use std::collections::{Vec, Set, Map}
 
 use tg_compiler::mir::{MirProgram, MirStatic}
 use tg_compiler::lir::{
-  LirFunction, LirAlloc, LirStmtKind, LirTermKind, LirValue,
-  LirBinOp, LirUnOp, LirCond, LirFpWidth, LirFpBinOp,
+  LirFunction, LirAlloc, LirStmt, LirStmtKind, LirTermKind, LirValue,
+  LirBinOp, LirUnOp, LirCond, LirFpWidth, LirFpBinOp, LirPtrOp,
   lir_fixed_fp_base, lir_is_fixed_fp_id,
-  lower_mir_fn_to_lir_cm, lir_peephole, lir_alloc_registers,
+  lower_mir_fn_to_lir_cm, lir_peephole, lir_alloc_registers_cm,
   lir_first_alloc_vreg, lir_seg_at, lir_reload_at,
   lir_block_label, lir_validate_callees,
   lir_static_scalar_ok, lir_static_init_word_value,
@@ -202,6 +233,13 @@ use tg_compiler::asm::{
 # intra-procedure-call scratch IP), r3 is the second temp (dead between
 # the entry binds and the call argument moves, so statements may borrow
 # it; fixed vregs never hold a live value at a statement boundary).
+# The exclusive-access sequences of the atomic slice additionally
+# borrow r0/r1/r2 as statement scratches (see the pointer/atomic
+# emission section): fixed vregs 0..3 hold live values ONLY in the
+# entry parameter binds and in the LirMove argument moves that sit
+# directly before a call terminator, so r0-r3 are dead at every
+# statement that is not itself one of those moves — the marked atomic
+# statements never are.
 
 def thumb_fp_reg() -> Int = 7
 def thumb_ip_reg() -> Int = 12
@@ -915,6 +953,234 @@ def t2_ite(inout b: CodeBuffer, cond: Int) -> Unit
   emit16_le(b, (0xBF00 | ((cond as u32) << 4) | mask) as u16)
 end
 
+# ———————————————————————————————————————————————————————————————
+# Exclusive-access / width-form encoders (the cortex-m atomic slice)
+# ———————————————————————————————————————————————————————————————
+# The ARMv7-M (Cortex-M3/M4, Thumb-2) exclusive-access primitives the
+# atomic slice emits: LDREX/STREX (word), LDREXB/STREXB (byte) and
+# LDREXH/STREXH (halfword) over the address in Rn, plus the width
+# load/store forms (the plain atomic load/store/pointer-deref widths)
+# and the DMB/CLREX barriers. EVERY WORD below was verified offline by
+# assembling the instruction with clang -target thumbv7em-none-eabi
+# and disassembling the object with llvm-objdump (the observed bytes
+# are cited per encoder). Field layout (from the observed words):
+#   LDREX.W: hw1 = 0xE850 | Rn, hw2 = Rt << 12 | 0xF00
+#   LDREXB:  hw1 = 0xE8D0 | Rn, hw2 = Rt << 12 | 0xF4F
+#   LDREXH:  hw1 = 0xE8D0 | Rn, hw2 = Rt << 12 | 0xF5F
+#   STREX.W: hw1 = 0xE840 | Rn, hw2 = Rt << 12 | Rd << 8
+#   STREXB:  hw1 = 0xE8C0 | Rn, hw2 = Rt << 12 | 0xF40 | Rd
+#   STREXH:  hw1 = 0xE8C0 | Rn, hw2 = Rt << 12 | 0xF50 | Rd
+# The emitter keeps the status register (Rd), the data register (Rt)
+# and the address register (Rn) pairwise distinct at every STREX, and
+# the data/address registers distinct at every LDREX (the AArch32
+# constraints the architecture prose attaches to these forms; the
+# register plans in the atomic arms below allocate from the
+# statement-scratch pool {r0..r3, r12} so distinctness is always
+# achievable). Every encoder is FLAGLESS except the CMP/Bcc pairs the
+# atomic arms emit explicitly between the exclusives (invariant I1:
+# those flags are consumed inside the statement, where no LirCmp
+# consumer can be live).
+
+# LDREX Rt, [Rn] — the word exclusive load (A7.7.103 LDREX T1).
+# Verified: ldrex r1, [r0] = 0xE850 0x1F00; ldrex r5, [r4] =
+# 0xE854 0x5F00; ldrex r8, [r9] = 0xE859 0x8F00.
+def t2_ldrex_w(inout b: CodeBuffer, rt: Int, rn: Int) -> Unit
+  if rt < 0 || rt > 12 || rn < 0 || rn > 12 then
+    panic("t2_ldrex_w: registers must be r0-r12")
+  end
+  t2_word(b, 0xE8500000 | ((rn as u32) << 16) | ((rt as u32) << 12) | 0xF00)
+end
+
+# LDREXB Rt, [Rn] — the byte exclusive load (A7.7.103 LDREXB T1),
+# zero-extending. Verified: ldrexb r1, [r0] = 0xE8D0 0x1F4F;
+# ldrexb r6, [r4] = 0xE8D4 0x6F4F; ldrexb r7, [r3] = 0xE8D3 0x7F4F.
+def t2_ldrexb(inout b: CodeBuffer, rt: Int, rn: Int) -> Unit
+  if rt < 0 || rt > 12 || rn < 0 || rn > 12 then
+    panic("t2_ldrexb: registers must be r0-r12")
+  end
+  t2_word(b, 0xE8D00000 | ((rn as u32) << 16) | ((rt as u32) << 12) | 0xF4F)
+end
+
+# LDREXH Rt, [Rn] — the halfword exclusive load (A7.7.103 LDREXH T1),
+# zero-extending. Verified: ldrexh r1, [r0] = 0xE8D0 0x1F5F;
+# ldrexh r6, [r4] = 0xE8D4 0x6F5F; ldrexh r9, [r10] = 0xE8DA 0x9F5F.
+def t2_ldrexh(inout b: CodeBuffer, rt: Int, rn: Int) -> Unit
+  if rt < 0 || rt > 12 || rn < 0 || rn > 12 then
+    panic("t2_ldrexh: registers must be r0-r12")
+  end
+  t2_word(b, 0xE8D00000 | ((rn as u32) << 16) | ((rt as u32) << 12) | 0xF5F)
+end
+
+# STREX Rd, Rt, [Rn] — the word exclusive store (A7.7.163 STREX T1):
+# writes [Rn] = Rt when the monitor grants access and returns the
+# status 0 (granted) / 1 (denied) in Rd. Verified: strex r1, r2,
+# [r0] = 0xE840 0x2100; strex r6, r2, [r4] = 0xE844 0x2600;
+# strex r3, r7, [r9] = 0xE849 0x7300.
+def t2_strex_w(inout b: CodeBuffer, rd: Int, rt: Int, rn: Int) -> Unit
+  if rd < 0 || rd > 12 || rt < 0 || rt > 12 || rn < 0 || rn > 12 then
+    panic("t2_strex_w: registers must be r0-r12")
+  end
+  t2_word(b, 0xE8400000 | ((rn as u32) << 16) | ((rt as u32) << 12) | ((rd as u32) << 8))
+end
+
+# STREXB Rd, Rt, [Rn] — the byte exclusive store (A7.7.163 STREXB T1).
+# Verified: strexb r1, r2, [r0] = 0xE8C0 0x2F41; strexb r5, r8, [r3] =
+# 0xE8C3 0x8F45.
+def t2_strexb(inout b: CodeBuffer, rd: Int, rt: Int, rn: Int) -> Unit
+  if rd < 0 || rd > 12 || rt < 0 || rt > 12 || rn < 0 || rn > 12 then
+    panic("t2_strexb: registers must be r0-r12")
+  end
+  t2_word(b, 0xE8C00000 | ((rn as u32) << 16) | ((rt as u32) << 12) | 0xF40 | (rd as u32))
+end
+
+# STREXH Rd, Rt, [Rn] — the halfword exclusive store (A7.7.163 STREXH
+# T1). Verified: strexh r3, r2, [r0] = 0xE8C0 0x2F53; strexh r8, r5,
+# [r7] = 0xE8C7 0x5F58.
+def t2_strexh(inout b: CodeBuffer, rd: Int, rt: Int, rn: Int) -> Unit
+  if rd < 0 || rd > 12 || rt < 0 || rt > 12 || rn < 0 || rn > 12 then
+    panic("t2_strexh: registers must be r0-r12")
+  end
+  t2_word(b, 0xE8C00000 | ((rn as u32) << 16) | ((rt as u32) << 12) | 0xF50 | (rd as u32))
+end
+
+# The LDREX/STREX width dispatch of the atomic arms: the exclusive
+# load/store pair at storage width 1/2/4 bytes. The arm's code keeps
+# the exclusive load and store at the SAME width (the monitor
+# granularity must match between the two).
+def t2_ldrex_wd(inout b: CodeBuffer, w: Int, rt: Int, rn: Int) -> Unit
+  match w
+  when 1 then t2_ldrexb(b, rt, rn)
+  when 2 then t2_ldrexh(b, rt, rn)
+  when 4 then t2_ldrex_w(b, rt, rn)
+  when _ then panic("t2_ldrex_wd: width must be 1/2/4")
+  end
+end
+
+def t2_strex_wd(inout b: CodeBuffer, w: Int, rd: Int, rt: Int, rn: Int) -> Unit
+  match w
+  when 1 then t2_strexb(b, rd, rt, rn)
+  when 2 then t2_strexh(b, rd, rt, rn)
+  when 4 then t2_strex_w(b, rd, rt, rn)
+  when _ then panic("t2_strex_wd: width must be 1/2/4")
+  end
+end
+
+# LDRB.W Rt, [Rn, #imm12] — the zero-extending byte load (A7.7.105
+# LDRB (immediate) T2), imm12 in 0..4095, ANY r0-r12 base (the 16-bit
+# LDRB form is low-register-only; the atomic/pointer arms may base off
+# r8-r12). Verified: ldrb.w r1, [r2, #0] = 0xF892 0x1000; ldrb.w r6,
+# [r7, #255] = 0xF897 0x60FF. FLAGLESS.
+def t2_ldrb_w_imm12(inout b: CodeBuffer, rd: Int, rn: Int, off: Int) -> Unit
+  if rd < 0 || rd > 12 || rn < 0 || rn > 12 then
+    panic("t2_ldrb_w_imm12: registers must be r0-r12")
+  end
+  if off < 0 || off > 4095 then panic("t2_ldrb_w_imm12: offset must be 0..4095") end
+  t2_word(b, 0xF8900000 | ((rn as u32) << 16) | ((rd as u32) << 12) | (off as u32))
+end
+
+# LDRH.W Rt, [Rn, #imm12] — the zero-extending halfword load
+# (A7.7.113 LDRH (immediate) T2). Verified: ldrh.w r1, [r2, #0] =
+# 0xF8B2 0x1000; ldrh.w r6, [r7, #2] = 0xF8B7 0x6002. FLAGLESS.
+def t2_ldrh_w_imm12(inout b: CodeBuffer, rd: Int, rn: Int, off: Int) -> Unit
+  if rd < 0 || rd > 12 || rn < 0 || rn > 12 then
+    panic("t2_ldrh_w_imm12: registers must be r0-r12")
+  end
+  if off < 0 || off > 4095 then panic("t2_ldrh_w_imm12: offset must be 0..4095") end
+  t2_word(b, 0xF8B00000 | ((rn as u32) << 16) | ((rd as u32) << 12) | (off as u32))
+end
+
+# STRB.W Rt, [Rn, #imm12] — the byte store (A7.7.183 STRB (immediate)
+# T2). Verified: strb.w r1, [r2, #0] = 0xF882 0x1000; strb.w r6,
+# [r7, #255] = 0xF887 0x60FF. FLAGLESS.
+def t2_strb_w_imm12(inout b: CodeBuffer, rd: Int, rn: Int, off: Int) -> Unit
+  if rd < 0 || rd > 12 || rn < 0 || rn > 12 then
+    panic("t2_strb_w_imm12: registers must be r0-r12")
+  end
+  if off < 0 || off > 4095 then panic("t2_strb_w_imm12: offset must be 0..4095") end
+  t2_word(b, 0xF8800000 | ((rn as u32) << 16) | ((rd as u32) << 12) | (off as u32))
+end
+
+# STRH.W Rt, [Rn, #imm12] — the halfword store (A7.7.186 STRH
+# (immediate) T2). Verified: strh.w r1, [r2, #0] = 0xF8A2 0x1000;
+# strh.w r6, [r7, #2] = 0xF8A7 0x6002. FLAGLESS.
+def t2_strh_w_imm12(inout b: CodeBuffer, rd: Int, rn: Int, off: Int) -> Unit
+  if rd < 0 || rd > 12 || rn < 0 || rn > 12 then
+    panic("t2_strh_w_imm12: registers must be r0-r12")
+  end
+  if off < 0 || off > 4095 then panic("t2_strh_w_imm12: offset must be 0..4095") end
+  t2_word(b, 0xF8A00000 | ((rn as u32) << 16) | ((rd as u32) << 12) | (off as u32))
+end
+
+# LDRSB.W Rt, [Rn, #imm12] — the sign-extending byte load (A7.7.111
+# LDRSB (immediate) T2). Verified: ldrsb.w r1, [r2, #0] = 0xF992
+# 0x1000; ldrsb.w r6, [r7, #255] = 0xF997 0x60FF. FLAGLESS.
+def t2_ldrsb_w_imm12(inout b: CodeBuffer, rd: Int, rn: Int, off: Int) -> Unit
+  if rd < 0 || rd > 12 || rn < 0 || rn > 12 then
+    panic("t2_ldrsb_w_imm12: registers must be r0-r12")
+  end
+  if off < 0 || off > 4095 then panic("t2_ldrsb_w_imm12: offset must be 0..4095") end
+  t2_word(b, 0xF9900000 | ((rn as u32) << 16) | ((rd as u32) << 12) | (off as u32))
+end
+
+# LDRSH.W Rt, [Rn, #imm12] — the sign-extending halfword load
+# (A7.7.119 LDRSH (immediate) T2). Verified: ldrsh.w r1, [r2, #0] =
+# 0xF9B2 0x1000; ldrsh.w r6, [r7, #2] = 0xF9B7 0x6002. FLAGLESS.
+def t2_ldrsh_w_imm12(inout b: CodeBuffer, rd: Int, rn: Int, off: Int) -> Unit
+  if rd < 0 || rd > 12 || rn < 0 || rn > 12 then
+    panic("t2_ldrsh_w_imm12: registers must be r0-r12")
+  end
+  if off < 0 || off > 4095 then panic("t2_ldrsh_w_imm12: offset must be 0..4095") end
+  t2_word(b, 0xF9B00000 | ((rn as u32) << 16) | ((rd as u32) << 12) | (off as u32))
+end
+
+# The width load dispatch of the atomic/pointer arms (a zero-extending
+# load of 1/2/4 bytes — the atomic data widths are unsigned); `sign`
+# selects the sign-extending byte/halfword form (never at width 4).
+def t2_ldr_wd(inout b: CodeBuffer, w: Int, sign: Bool, rd: Int, rn: Int, off: Int) -> Unit
+  match w
+  when 1 then
+    if sign then t2_ldrsb_w_imm12(b, rd, rn, off) else t2_ldrb_w_imm12(b, rd, rn, off) end
+  when 2 then
+    if sign then t2_ldrsh_w_imm12(b, rd, rn, off) else t2_ldrh_w_imm12(b, rd, rn, off) end
+  when 4 then t2_ldr_w_imm12(b, rd, rn, off)
+  when _ then panic("t2_ldr_wd: width must be 1/2/4")
+  end
+end
+
+# The width store dispatch of the atomic/pointer arms (the value's low
+# 1/2/4 bytes).
+def t2_str_wd(inout b: CodeBuffer, w: Int, rd: Int, rn: Int, off: Int) -> Unit
+  match w
+  when 1 then t2_strb_w_imm12(b, rd, rn, off)
+  when 2 then t2_strh_w_imm12(b, rd, rn, off)
+  when 4 then t2_str_w_imm12(b, rd, rn, off)
+  when _ then panic("t2_str_wd: width must be 1/2/4")
+  end
+end
+
+# DMB — the data memory barrier, SY option (A7.7.41 DMB; Thumb-2 word
+# 0xF3BF 0x8F5F). Verified: dmb sy = 0xF3BF 0x8F5F. ARMv7-M (the
+# M3/M4 class) is a single-core profile with no shareability domains to
+# distinguish: the SY (full system) barrier is the architecturally
+# clean form for every ordering need on this route (the aarch64
+# route's ISHLD/ISH option split has no domain meaning here; the
+# observed ecosystem emission for ARMv7-M atomics — clang's
+# __atomic_* sequences for thumbv7em — is `dmb sy` on every ordering
+# boundary, verified offline). FLAGLESS.
+def t2_dmb_sy(inout b: CodeBuffer) -> Unit
+  t2_word(b, 0xF3BF8F5F)
+end
+
+# CLREX — clear the local exclusive monitor (A7.7.39 CLREX; Thumb-2
+# word 0xF3BF 0x8F2F). Verified: clrex = 0xF3BF 0x8F2F. The CAS arms
+# emit it on the compare-mismatch exit (the failed compare leaves the
+# monitor armed; clang's ARMv7-M CAS sequences clear it there too —
+# verified offline). FLAGLESS.
+def t2_clrex(inout b: CodeBuffer) -> Unit
+  t2_word(b, 0xF3BF8F2F)
+end
+
+
 # ———————————————————————————————————————————
 # VFP (coprocessor 10/11) encodings — ARMv7-M A7.8 VFP
 # ———————————————————————————————————————————
@@ -1599,6 +1865,117 @@ def thumb_fixed_bad(lir_reg: Int) -> Bool
   lir_reg >= 4 && lir_reg < lir_first_alloc_vreg()
 end
 
+# A marked pointer/atomic statement's width is one of the cortex-m
+# atomic widths (1/2/4 bytes). Width 8 (the _u64 atomic family / an
+# 8-byte deref) is the ARMv7-M fail-closed case: M3/M4 have no
+# LDREXD/STREXD-class exclusives and no doubleword atomic form.
+def thumb_ptr_width_ok(w: Int) -> Bool
+  w >= 1 && w <= 4
+end
+
+# Validate one marked LirPtrOp statement against the cortex-m surface
+# (fail-closed, before any emission): the ARMv7-M widths (1/2/4), the
+# per-form ordering codes and the vreg/offset geometry of each form.
+def thumb_validate_ptr_stmt(fn_name: String, pop: LirPtrOp) -> Result[Unit, String]
+  match pop
+  when LirPtrOp::LirPtrLea(dst, off) then
+    # dst = r7 + off — the frame-slot address (off = 4*slot on the
+    # cortex-m route, 0..0xFFFF under the 16-bit frame model).
+    if thumb_fixed_bad(dst) then
+      return Result::Err("thumb: " + fn_name + ": pointer LEA into fixed vreg " + dst.to_string() + " does not lower (fixed vregs 4..7 are aarch64 x4..x7 — fail-closed)")
+    end
+    if off < 0 || off > 0xFFFF then
+      return Result::Err("thumb: " + fn_name + ": pointer LEA offset " + off.to_string() + " is outside the cortex-m frame-address model 0..65535 (fail-closed)")
+    end
+    Result::Ok(())
+  when LirPtrOp::LirPtrAddr(dst, base, off) then
+    if thumb_fixed_bad(dst) || thumb_fixed_bad(base) then
+      return Result::Err("thumb: " + fn_name + ": pointer address arithmetic over fixed vregs 4..7 does not lower (fail-closed)")
+    end
+    if off < 0 || off > 0xFFFF then
+      return Result::Err("thumb: " + fn_name + ": pointer address offset " + off.to_string() + " is outside the cortex-m 16-bit address model (fail-closed)")
+    end
+    Result::Ok(())
+  when LirPtrOp::LirPtrLoad(dst, base, off, w, sign) then
+    if thumb_fixed_bad(dst) || thumb_fixed_bad(base) then
+      return Result::Err("thumb: " + fn_name + ": pointer load over fixed vregs 4..7 does not lower (fail-closed)")
+    end
+    if !thumb_ptr_width_ok(w) then
+      return Result::Err("thumb: " + fn_name + ": pointer deref load width " + w.to_string() + " does not lower on the cortex-m route — only the 1/2/4-byte widths exist on ARMv7-M (an 8-byte deref needs the doubleword memory forms of a wider profile; the atomic widths of the target description are [1, 2, 4] — fail-closed)")
+    end
+    if sign && w == 4 then
+      return Result::Err("thumb: " + fn_name + ": pointer deref load with sign extension at the full 4-byte word width does not lower (the lowering never emits it — fail-closed)")
+    end
+    if off < 0 || off > 0xFFFF then
+      return Result::Err("thumb: " + fn_name + ": pointer load offset " + off.to_string() + " is outside the cortex-m 16-bit address model (fail-closed)")
+    end
+    Result::Ok(())
+  when LirPtrOp::LirPtrStore(base, off, src, w) then
+    if thumb_fixed_bad(base) || thumb_fixed_bad(src) then
+      return Result::Err("thumb: " + fn_name + ": pointer store over fixed vregs 4..7 does not lower (fail-closed)")
+    end
+    if !thumb_ptr_width_ok(w) then
+      return Result::Err("thumb: " + fn_name + ": pointer deref store width " + w.to_string() + " does not lower on the cortex-m route (only the 1/2/4-byte widths exist on ARMv7-M — fail-closed)")
+    end
+    if off < 0 || off > 0xFFFF then
+      return Result::Err("thumb: " + fn_name + ": pointer store offset " + off.to_string() + " is outside the cortex-m 16-bit address model (fail-closed)")
+    end
+    Result::Ok(())
+  when LirPtrOp::LirAtomLoad(form, w, dst, addr) then
+    if thumb_fixed_bad(dst) || thumb_fixed_bad(addr) then
+      return Result::Err("thumb: " + fn_name + ": atomic load over fixed vregs 4..7 does not lower (fail-closed)")
+    end
+    if !thumb_ptr_width_ok(w) then
+      return Result::Err("thumb: " + fn_name + ": atomic load width " + w.to_string() + " does not lower on the cortex-m route — ARMv7-M has no LDREXD/STREXD-class 8-byte exclusives and no doubleword atomic form; the target description's atomic widths are [1, 2, 4] (fail-closed)")
+    end
+    if form != 0 && form != 1 then
+      return Result::Err("thumb: " + fn_name + ": atomic load ordering form " + form.to_string() + " does not lower (the cortex-m forms are 0 = relaxed and 1 = acquire — fail-closed)")
+    end
+    Result::Ok(())
+  when LirPtrOp::LirAtomStore(form, w, addr, val) then
+    if thumb_fixed_bad(addr) || thumb_fixed_bad(val) then
+      return Result::Err("thumb: " + fn_name + ": atomic store over fixed vregs 4..7 does not lower (fail-closed)")
+    end
+    if !thumb_ptr_width_ok(w) then
+      return Result::Err("thumb: " + fn_name + ": atomic store width " + w.to_string() + " does not lower on the cortex-m route (ARMv7-M has no 8-byte atomic form; the atomic widths of the target description are [1, 2, 4] — fail-closed)")
+    end
+    if form != 0 && form != 1 then
+      return Result::Err("thumb: " + fn_name + ": atomic store ordering form " + form.to_string() + " does not lower (the cortex-m forms are 0 = relaxed and 1 = release — fail-closed)")
+    end
+    Result::Ok(())
+  when LirPtrOp::LirAtomRmw(family, form, w, dst, addr, val) then
+    if thumb_fixed_bad(dst) || thumb_fixed_bad(addr) || thumb_fixed_bad(val) then
+      return Result::Err("thumb: " + fn_name + ": atomic RMW over fixed vregs 4..7 does not lower (fail-closed)")
+    end
+    if !thumb_ptr_width_ok(w) then
+      return Result::Err("thumb: " + fn_name + ": atomic RMW width " + w.to_string() + " does not lower on the cortex-m route (ARMv7-M has no 8-byte exclusive form; the atomic widths of the target description are [1, 2, 4] — fail-closed)")
+    end
+    if family < 0 || family > 4 then
+      return Result::Err("thumb: " + fn_name + ": atomic RMW family " + family.to_string() + " does not lower (families 0 = add, 1 = and, 2 = or, 3 = xor, 4 = exchange — fail-closed)")
+    end
+    if form < 0 || form > 3 then
+      return Result::Err("thumb: " + fn_name + ": atomic RMW ordering form " + form.to_string() + " does not lower (forms 0..3 — fail-closed)")
+    end
+    Result::Ok(())
+  when LirPtrOp::LirAtomCas(form, w, dst, exp, des, addr) then
+    if thumb_fixed_bad(dst) || thumb_fixed_bad(exp) || thumb_fixed_bad(des) || thumb_fixed_bad(addr) then
+      return Result::Err("thumb: " + fn_name + ": atomic compare_exchange over fixed vregs 4..7 does not lower (fail-closed)")
+    end
+    if !thumb_ptr_width_ok(w) then
+      return Result::Err("thumb: " + fn_name + ": atomic compare_exchange width " + w.to_string() + " does not lower on the cortex-m route (ARMv7-M has no 8-byte exclusive form; the atomic widths of the target description are [1, 2, 4] — fail-closed)")
+    end
+    if form < 0 || form > 3 then
+      return Result::Err("thumb: " + fn_name + ": atomic compare_exchange ordering form " + form.to_string() + " does not lower (forms 0..3 — fail-closed)")
+    end
+    Result::Ok(())
+  when LirPtrOp::LirPtrFence(form) then
+    if form != 0 && form != 1 then
+      return Result::Err("thumb: " + fn_name + ": fence form " + form.to_string() + " does not lower (forms 0 = acquire and 1 = release — fail-closed)")
+    end
+    Result::Ok(())
+  end
+end
+
 def thumb_validate_fn(f: LirFunction) -> Result[Unit, String]
   var bi = 0
   while bi < f.blocks.len() do
@@ -1606,6 +1983,24 @@ def thumb_validate_fn(f: LirFunction) -> Result[Unit, String]
     var si = 0
     while si < block.stmts.len() do
       let stmt = block.stmts[si]
+      # (cortex-m atomic/pointer slice): a marked LirPtrOp statement
+      # (LirStmt.ptr — the pointer/atomic statements the cm lowering
+      # produces once the atomic surface is open) validates against the
+      # ARMv7-M exclusive/width surface FIRST — its nominal kind's
+      # semantics do not apply (the nominal kinds are only arity-
+      # nearest carriers). The width-8 forms (the _u64 atomic family
+      # and 8-byte pointer derefs) fail closed HERE too, defensively:
+      # the lowering already rejects them with the target reason, so a
+      # width-8 marked statement reaching this backend marks a
+      # lowering/backend divergence.
+      match stmt.ptr
+      when Option::Some(pop) then
+        match thumb_validate_ptr_stmt(f.name, pop)
+        when Result::Err(e) then return Result::Err(e)
+        when Result::Ok(_) then ()
+        end
+      when Option::None then ()
+      end
       match stmt.kind
       when LirStmtKind::LirMove(dst, val) then
         if thumb_fixed_bad(dst) then
@@ -1709,21 +2104,41 @@ def thumb_validate_fn(f: LirFunction) -> Result[Unit, String]
           return Result::Err("thumb: " + f.name + ": static-value load carries an empty symbol name (the shared lowering resolves static references to emission names — a lowering divergence; fail-closed)")
         end
       when LirStmtKind::LirFMove(_, _) then
-        return Result::Err("thumb: " + f.name + ": float statements do not lower on the cortex-m route (its shape gate keeps the word-only accept set; the float slice is an aarch64-route rule — fail-closed)")
-      when LirStmtKind::LirFBinop(_, _, _, _, _) then
-        return Result::Err("thumb: " + f.name + ": float statements do not lower on the cortex-m route (its shape gate keeps the word-only accept set; the float slice is an aarch64-route rule — fail-closed)")
-      when LirStmtKind::LirFNeg(_, _, _) then
-        return Result::Err("thumb: " + f.name + ": float statements do not lower on the cortex-m route (its shape gate keeps the word-only accept set; the float slice is an aarch64-route rule — fail-closed)")
-      when LirStmtKind::LirFCmp(_, _, _) then
-        return Result::Err("thumb: " + f.name + ": float statements do not lower on the cortex-m route (its shape gate keeps the word-only accept set; the float slice is an aarch64-route rule — fail-closed)")
-      when LirStmtKind::LirFConst(_, _, _) then
-        return Result::Err("thumb: " + f.name + ": float statements do not lower on the cortex-m route (its shape gate keeps the word-only accept set; the float slice is an aarch64-route rule — fail-closed)")
-      when LirStmtKind::LirIntToFloat(_, _, _, _) then
-        return Result::Err("thumb: " + f.name + ": float statements do not lower on the cortex-m route (its shape gate keeps the word-only accept set; the float slice is an aarch64-route rule — fail-closed)")
-      when LirStmtKind::LirFloatToInt(_, _, _) then
-        return Result::Err("thumb: " + f.name + ": float statements do not lower on the cortex-m route (its shape gate keeps the word-only accept set; the float slice is an aarch64-route rule — fail-closed)")
-      when LirStmtKind::LirFcvt(_, _, _) then
-        return Result::Err("thumb: " + f.name + ": float statements do not lower on the cortex-m route (its shape gate keeps the word-only accept set; the float slice is an aarch64-route rule — fail-closed)")
+        # FLOAT statements lower on the cortex-m route in their
+        # REGISTER-RESIDENT (F64) and MEMORY-RESIDENT envelopes: every FP
+        # operand's register index is resolved at emission through
+        # thumb_fp_def_target / thumb_fp_use_reg, which emit the width
+        # slot loads/stores of memory-resident operands (spill-slot
+        # segments and post-call reload records — invariant I2). An F32
+        # operand is always memory-resident here — the cm allocator
+        # keeps F32 out of the FP pool (d16..d29 — no single-register
+        # alias above d15; F32 is memory-class on this route) — so the
+        # register-resident F32 forms the resolution helpers still fail
+        # closed on are allocator-invariant checks (unproducible), and
+        # validation passes every float statement whose lowering shape
+        # is cortex-m-native. A fixed
+        # ABI FP id (8..15) in either operand is legal only at the
+        # float ABI edges the route does not produce yet — the emission
+        # resolves it to its d-register exactly like an allocated one.
+        ()
+      when LirStmtKind::LirFBinop(_, _, _, _, _) then ()
+      when LirStmtKind::LirFNeg(_, _, _) then ()
+      when LirStmtKind::LirFCmp(_, _, _) then ()
+      when LirStmtKind::LirFConst(_, _, _) then ()
+      when LirStmtKind::LirIntToFloat(_, _, src, _) then
+        # The integer source rides a general word: a fixed vreg 4..7
+        # operand marks an aarch64-convention LIR (the same fingerprint
+        # the general statement arms reject).
+        if thumb_fixed_bad(src) then
+          return Result::Err("thumb: " + f.name + ": int-to-float source from fixed vreg " + src.to_string() + " does not lower (fixed vregs 4..7 are aarch64 x4..x7; the cortex-m lowering never emits them — fail-closed)")
+        end
+      when LirStmtKind::LirFloatToInt(_, dst, _) then
+        # The integer destination rides a general word: a fixed vreg
+        # 4..7 destination marks an aarch64-convention LIR.
+        if thumb_fixed_bad(dst) then
+          return Result::Err("thumb: " + f.name + ": float-to-int into fixed vreg " + dst.to_string() + " does not lower (fixed vregs 4..7 are aarch64 x4..x7; the cortex-m lowering never emits them — fail-closed)")
+        end
+      when LirStmtKind::LirFcvt(_, _, _) then ()
       end
       si = si + 1
     end
@@ -2084,47 +2499,275 @@ end
 # are defense in depth and never silently emit).
 
 # ———————————————————————————————————————————————————————————————
-# Float statement resolution (the register-resident FP envelope)
+# Float statement resolution (register- and memory-resident operands)
 # ———————————————————————————————————————————————————————————————
-# The float arms below emit only REGISTER-RESIDENT operands
-# (memory-resident defs/uses fail closed, never emitted) — the envelope
-# of the LirFMove arm above. Every float arm resolves each FP operand's
-# physical d-index through thumb_fp_d_of: a fixed ABI FP id (8..15 —
-# lir_is_fixed_fp_id) IS its d-register (d-index = id -
-# lir_fixed_fp_base()), and an allocated FP vreg's physical id
-# (116..129 — the allocator's FP-pool namespace, lir_fp_pool_regs) is
-# d_{phys - 100}. An F32 value rides the LOW single of its d-index
-# (s = 2*d — the canonical single), and the FP pool (d16..d29) has no
-# single-register alias on the cortex-m register model (s0..s31 —
-# d0..d15 — only). `role` words the operand for the Err text ("binop
-# destination", "compare left operand", ...).
+# Every float arm below resolves each FP operand through the two
+# helpers of this section — thumb_fp_def_target on the def side,
+# thumb_fp_use_reg on the use side — over the FULL residency envelope
+# (the register-resident-only envelope of the former thumb_fp_d_of is
+# gone):
+#   - a fixed ABI FP id (8..15 — lir_is_fixed_fp_id) IS its d-register
+#     (d-index = id - lir_fixed_fp_base()); an allocated FP vreg's
+#     physical id (116..129 — the allocator's FP-pool namespace,
+#     lir_fp_pool_regs) is d_{phys - 100};
+#   - the helpers speak the statement width's REGISTER INDEX SPACE: a
+#     d-index under F64, a SINGLE index (s = 2*d — the canonical low
+#     single of the d-index) under F32. An F32 value rides the LOW
+#     single of its d-index. The FP pool (d16..d29) has no
+#     single-register alias on the cortex-m register model (s0..s31 —
+#     d0..d15 — only), so F32 values are MEMORY-CLASS on this route:
+#     the cm allocator (lir_alloc_registers_cm — f32_pool_ok = false)
+#     never assigns an F32 vreg a pool register — every F32 segment is
+#     phys = -1 with its width-correct one-word slot, and every F32
+#     statement lowers load-op-store through the scratch singles
+#     below. The register-resident F32 arms that remain fail closed as
+#     allocator-invariant checks (their state is now unproducible);
+#   - a memory-resident USE (a segment whose physical id is negative)
+#     emits its width load through thumb_slot_fp_load into one of the
+#     two statement scratches the caller picks (the aarch64 route's
+#     V30/V31 first/second-pref pattern — a statement needs the second
+#     scratch only when two of its operands are memory-resident at
+#     once); a REGISTER-resident segment whose first post-call read
+#     carries a reload record at (pos, vreg) (invariant I2) restores
+#     its OWN register from the slot at the width — the segment's
+#     later reload-free reads ride the register, exactly like the
+#     general-register thumb_emit_use;
+#   - a memory-resident DEF computes into the def scratch (d15 — its
+#     low single s30 under F32 — ThumbFpDefTarget.reg) and the arm
+#     stores the image to the def slot at the width (thumb_slot_fp_store)
+#     after the statement's op, mirroring the general def target's
+#     r12-temp pattern. The cm allocator's width-aware slot geometry
+#     (LirAlloc.slot_words: an F64 image's home is TWO 4-byte words at
+#     an even — 8-byte-aligned — base; F32/GP images one word) makes
+#     the 8-byte F64 load/store exact.
+# `role` words an operand for the Err text ("binop destination",
+# "compare left operand", ...), exactly as before.
 
-# Resolve the d-index of a register-resident FP vreg at `pos`, failing
-# closed (never emitting) for memory-resident operands: a segment whose
-# physical id is negative (a spill-slot def/use) or — on the use side —
-# a post-call reload record at (pos, vreg) (invariant I2). Mirrors the
-# LirFMove arm's resolution exactly, shared by the arms below.
-def thumb_fp_d_of(alloc: LirAlloc, vreg: Int, pos: Int, is_use: Bool, role: String) -> Result[Int, String]
+# The FP-file scratch registers of the float statement arms: d15 —
+# whose LOW single is s30 (s = 2*d, the canonical single, encodable by
+# every single-form VFP encoder) — and d14 — whose LOW single is s28.
+# Both are free at every statement position by construction of the
+# shared register model: the allocator's FP pool is d16..d29 (physical
+# ids 100+16..100+29 — lir_fp_pool_regs) and the fixed ABI FP ids are
+# d0..d7, so d8..d15 are NEVER allocated on any route (the aarch64
+# route's callee-saved d8..d15 are deliberately excluded from
+# lir_fp_pool_regs too — see its doc), which leaves d14/d15 — and
+# their singles s28..s31 — statement-local scratch on this route,
+# exactly like r12/r3 on the general side. The roles mirror the
+# aarch64 route's V30/V31 split (lir.tg's lir_fp_def_temp /
+# lir_fp_use_temp): d15 is the DEF scratch — the def temp of a
+# memory-resident def, the conversion register of the int<->float
+# statements (VCVT writes/reads single registers only) and the
+# double-materialization target of the F32 constant path (the fcvt
+# s, d rounding source) — and d14 is the SECOND scratch a second
+# memory-resident operand loads into.
+def thumb_fp_scratch_d() -> Int = 15
+def thumb_fp_scratch_s() -> Int = 30
+def thumb_fp_scratch2_d() -> Int = 14
+def thumb_fp_scratch2_s() -> Int = 28
+
+# The width's def scratch and second load scratch, in the width's
+# register index space: d15/s30 and d14/s28 respectively (a d-index
+# under F64, a single index under F32).
+def thumb_fp_def_scratch(w: LirFpWidth) -> Int
+  if w == LirFpWidth::LirF32 then thumb_fp_scratch_s() else thumb_fp_scratch_d() end
+end
+
+def thumb_fp_use_scratch(w: LirFpWidth) -> Int
+  if w == LirFpWidth::LirF32 then thumb_fp_scratch2_s() else thumb_fp_scratch2_d() end
+end
+
+# The load-scratch choice of a statement (mirrors lir.tg's
+# lir_fp_first_pref / lir_fp_second_pref): a statement's FIRST
+# memory-resident operand loads into the def scratch when the def
+# target does not occupy it, and into the second scratch otherwise; a
+# SECOND memory-resident operand loads into the OTHER scratch. Reads
+# always precede the def write within the single op, so a load may
+# reuse the def scratch exactly as the aarch64 route reuses V30.
+def thumb_fp_first_pref(dt_reg: Int, w: LirFpWidth) -> Int
+  if dt_reg == thumb_fp_def_scratch(w) then thumb_fp_use_scratch(w) else thumb_fp_def_scratch(w) end
+end
+
+def thumb_fp_second_pref(first: Int, w: LirFpWidth) -> Int
+  if first == thumb_fp_def_scratch(w) then thumb_fp_use_scratch(w) else thumb_fp_def_scratch(w) end
+end
+
+# The width-space register index of a fixed ABI FP id (8..15): the
+# d-index id - lir_fixed_fp_base() under F64, its canonical low single
+# (s = 2*d-index) under F32.
+def thumb_fp_idx_of_fixed(vreg: Int, w: LirFpWidth) -> Int
+  let d = vreg - lir_fixed_fp_base()
+  if w == LirFpWidth::LirF32 then 2 * d else d end
+end
+
+# The FP destination target of a def at position `pos` (the float
+# counterpart of ThumbDefTarget, in the statement width's register
+# index space): a fixed ABI FP id IS its register; an allocated
+# register-resident segment is its pool d-register (an F64 d-index —
+# an F32 never has one: the cm allocator keeps F32 values out of the
+# FP pool — memory-class — so a register-resident F32 here marks an
+# allocator-invariant violation and fails closed below); a
+# memory-resident segment is the width's def scratch (d15 — its low
+# single s30 under F32) with a pending width store to the def slot.
+struct ThumbFpDefTarget
+  reg: Int
+  store_slot: Int   # >= 0: store reg to this slot after the def
+end
+
+def thumb_fp_def_target(alloc: LirAlloc, w: LirFpWidth, vreg: Int, pos: Int, role: String) -> Result[ThumbFpDefTarget, String]
   if lir_is_fixed_fp_id(vreg) then
-    return Result::Ok(vreg - lir_fixed_fp_base())
+    return Result::Ok(ThumbFpDefTarget { reg: thumb_fp_idx_of_fixed(vreg, w), store_slot: -1 })
   end
   match alloc.segs_of.get(vreg)
   when Option::Some(segs) then
     match lir_seg_at(segs, pos)
     when Option::Some(s) then
-      if s.phys < 0 || (is_use && lir_reload_at(alloc.reloads, pos, vreg)) then
-        return Result::Err("thumb: float " + role + " vreg " + vreg.to_string() + " is memory-resident (memory-resident float " + role + "s are pending on the cortex-m route — fail-closed)")
+      if s.phys >= 0 then
+        if w == LirFpWidth::LirF32 then
+          return Result::Err("thumb: F32 " + role + " vreg " + vreg.to_string() + " in an allocated FP-pool register (d16..d29) does not lower on the cortex-m route (no single-register alias above d15); the cm allocator never assigns an F32 a pool register — F32 is memory-class on this route — so a pool-resident F32 marks an allocator-invariant violation (fail-closed)")
+        end
+        Result::Ok(ThumbFpDefTarget { reg: s.phys - 100, store_slot: -1 })
+      else
+        Result::Ok(ThumbFpDefTarget { reg: thumb_fp_def_scratch(w), store_slot: s.slot })
       end
-      Result::Ok(s.phys - 100)
     when Option::None then
-      Result::Err("thumb: float " + role + " vreg " + vreg.to_string() + " has no segment at position " + pos.to_string() + " (the cortex-m route emits register-resident float operands only; memory-resident float operands are pending — fail-closed)")
+      Result::Err("thumb: float " + role + " vreg " + vreg.to_string() + " has no segment at position " + pos.to_string() + " (fail-closed)")
     end
   when Option::None then
-    Result::Err("thumb: float " + role + " vreg " + vreg.to_string() + " has no intervals (the cortex-m route emits register-resident float operands only; memory-resident float operands are pending — fail-closed)")
+    Result::Err("thumb: float " + role + " vreg " + vreg.to_string() + " has no intervals (fail-closed)")
   end
 end
 
-def thumb_emit_stmt(inout te: ThumbEmit, alloc: LirAlloc, mdl_pool: Vec[Int], frame_bytes: Int, kind: LirStmtKind, pos: Int) -> Result[Unit, String]
+# Resolve the register index of an FP vreg USE at `pos` (width `w`),
+# emitting the width load a memory-resident value needs: a spill-slot
+# use loads through thumb_slot_fp_load into `pref` (a statement
+# scratch chosen by the caller — thumb_fp_first_pref /
+# thumb_fp_second_pref); a register-resident segment whose first post-
+# call read carries a reload record at (pos, vreg) (invariant I2)
+# restores its OWN register from the slot at the width (later reads
+# ride the register — the general-register thumb_emit_use pattern).
+# Fails closed — never emitting a partial load — for an F32 value
+# resident in the FP pool (d16..d29), whose register has no single-
+# register alias on the cortex-m register model (s0..s31 = d0..d15
+# only); the cm allocator never produces such a segment (F32 is
+# memory-class on this route), so the arm doubles as an
+# allocator-invariant check.
+def thumb_fp_use_reg(inout te: ThumbEmit, alloc: LirAlloc, w: LirFpWidth, vreg: Int, pos: Int, pref: Int, role: String) -> Result[Int, String]
+  if lir_is_fixed_fp_id(vreg) then
+    return Result::Ok(thumb_fp_idx_of_fixed(vreg, w))
+  end
+  match alloc.segs_of.get(vreg)
+  when Option::Some(segs) then
+    match lir_seg_at(segs, pos)
+    when Option::Some(s) then
+      if s.phys >= 0 then
+        if w == LirFpWidth::LirF32 then
+          return Result::Err("thumb: F32 " + role + " vreg " + vreg.to_string() + " in an allocated FP-pool register (d16..d29) does not lower on the cortex-m route (no single-register alias above d15); the cm allocator never assigns an F32 a pool register — F32 is memory-class on this route — so a pool-resident F32 marks an allocator-invariant violation (fail-closed)")
+        end
+        let dd = s.phys - 100
+        if lir_reload_at(alloc.reloads, pos, vreg) then
+          thumb_slot_fp_load(te, w, dd, s.slot)
+        end
+        Result::Ok(dd)
+      else
+        thumb_slot_fp_load(te, w, pref, s.slot)
+        Result::Ok(pref)
+      end
+    when Option::None then
+      Result::Err("thumb: float " + role + " vreg " + vreg.to_string() + " has no segment at position " + pos.to_string() + " (fail-closed)")
+    end
+  when Option::None then
+    Result::Err("thumb: float " + role + " vreg " + vreg.to_string() + " has no intervals (fail-closed)")
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Float ABI crossing memory forms (Ret / call-result / stack-parameter)
+# ———————————————————————————————————————————————————————————————
+# The float-return, float-call-result and float-stack-parameter arms
+# below are the width-aware memory forms of the cm float ABI crossings
+# (the aarch64 route's lir_emit_fp_mem8 counterparts): every one loads
+# or stores the value at its width — 8 bytes for an F64 (t2_vldr_f64 /
+# t2_vstr_f64), 4 bytes for an F32 canonical single (t2_vldr_f32 /
+# t2_vstr_f32). The address is [r7 + off] with off a 4-aligned
+# non-negative byte offset: a translated AAPCS stack-parameter offset
+# (off + frame_bytes + 24 — the incoming caller area sits above the
+# frame, see the LirLoadFrame arm) or a spill-slot offset (4*slot).
+# VLDR/VSTR's immediate range is -1020..1020; beyond it the address is
+# built in r12 (movw; add r12, r7 — the flagless 0x4400 form, the
+# thumb_slot_access address path). A VFP memory operand never collides
+# with the core address temp (the value rides the FP file), so r12 is
+# safe on both the load and the store path. Every form is FLAGLESS
+# (invariant I1).
+
+# The width-dispatched load/store of `reg` — a d-index under F64, an
+# s-index under F32 — at the machine offset `off` from the frame
+# pointer. `off` must be a 4-aligned 0..0xFFFF byte offset (callers
+# fail closed beyond the 16-bit address model, mirroring the GP arm).
+def thumb_fp_mem_r7(inout te: ThumbEmit, w: LirFpWidth, reg: Int, off: Int, is_load: Bool) -> Unit
+  let fp = thumb_fp_reg()
+  if off <= 1020 then
+    match w
+    when LirFpWidth::LirF32 then
+      if is_load then
+        t2_vldr_f32(&mut te.buf, reg, fp, off)
+      else
+        t2_vstr_f32(&mut te.buf, reg, fp, off)
+      end
+    when LirFpWidth::LirF64 then
+      if is_load then
+        t2_vldr_f64(&mut te.buf, reg, fp, off)
+      else
+        t2_vstr_f64(&mut te.buf, reg, fp, off)
+      end
+    end
+  else
+    t2_movw(&mut te.buf, thumb_ip_reg(), (off & 0xFFFF) as u16)
+    t2_add_rr(&mut te.buf, thumb_ip_reg(), fp)
+    match w
+    when LirFpWidth::LirF32 then
+      if is_load then
+        t2_vldr_f32(&mut te.buf, reg, thumb_ip_reg(), 0)
+      else
+        t2_vstr_f32(&mut te.buf, reg, thumb_ip_reg(), 0)
+      end
+    when LirFpWidth::LirF64 then
+      if is_load then
+        t2_vldr_f64(&mut te.buf, reg, thumb_ip_reg(), 0)
+      else
+        t2_vstr_f64(&mut te.buf, reg, thumb_ip_reg(), 0)
+      end
+    end
+  end
+end
+
+# Load the spill slot of `slot` into `reg` at width `w`.
+def thumb_slot_fp_load(inout te: ThumbEmit, w: LirFpWidth, reg: Int, slot: Int) -> Unit
+  thumb_fp_mem_r7(te, w, reg, thumb_slot_offset(slot), true)
+end
+
+# Store `reg` into the spill slot of `slot` at width `w`.
+def thumb_slot_fp_store(inout te: ThumbEmit, w: LirFpWidth, reg: Int, slot: Int) -> Unit
+  thumb_fp_mem_r7(te, w, reg, thumb_slot_offset(slot), false)
+end
+
+# Emit one LIR statement of a cortex-m function. A statement carrying a
+# marked LirPtrOp (LirStmt.ptr — the pointer/atomic statements of the
+# cortex-m atomic surface) emits through the pointer/atomic arms (the
+# ARMv7-M exclusive/barrier/width sequences of thumb_emit_ptr_stmt) —
+# NEVER through its nominal kind's semantics (the nominal kinds are
+# arity-nearest carriers only; see LirStmt.ptr); every other statement
+# emits through the nominal-kind arms of thumb_emit_stmt_kind.
+def thumb_emit_stmt(inout te: ThumbEmit, alloc: LirAlloc, mdl_pool: Vec[Int], frame_bytes: Int, fn_name: String, stmt: LirStmt, pos: Int) -> Result[Unit, String]
+  match stmt.ptr
+  when Option::Some(pop) then
+    thumb_emit_ptr_stmt(te, alloc, mdl_pool, fn_name, stmt, pop, pos)
+  when Option::None then
+    thumb_emit_stmt_kind(te, alloc, mdl_pool, frame_bytes, stmt.kind, pos)
+  end
+end
+
+def thumb_emit_stmt_kind(inout te: ThumbEmit, alloc: LirAlloc, mdl_pool: Vec[Int], frame_bytes: Int, kind: LirStmtKind, pos: Int) -> Result[Unit, String]
   match kind
   when LirStmtKind::LirMove(dst, val) then
     let dt = thumb_def_target(alloc, mdl_pool, dst, pos)
@@ -2234,28 +2877,96 @@ def thumb_emit_stmt(inout te: ThumbEmit, alloc: LirAlloc, mdl_pool: Vec[Int], fr
     # load is a plain word load through r7 (flagless, invariant I1);
     # only ever emitted at the top of the entry block, where the
     # prologue has already established r7.
-    let dt = thumb_def_target(alloc, mdl_pool, dst, pos)
-    let foff = off + frame_bytes + 24
-    if foff > 65535 then
-      return Result::Err("thumb: stack-parameter load at machine offset [r7 + " + foff.to_string() + "] exceeds the 16-bit frame-address model of the cortex-m backend (fail-closed)")
+    #
+    # Since the cm float-ABI slice (lir.tg's entry-binding walk under
+    # the AAPCS32 mode) a FLOAT stack parameter — a float parameter at
+    # FP position >= 8, beyond the d0..d7 file — binds through this
+    # same statement shape with an FP-class dst (the parameter's
+    # ordinary vreg in alloc.fp_widths, the width record): the caller
+    # laid the value down at its WIDTH on the shared caller-stack
+    # stream (VSTR.F32 = 4 bytes / VSTR.F64 = 8 bytes at the width-
+    # aware AAPCS32 float offset, 8 + 4*stk with an F64 unit padded to
+    # an even word index — so the translated machine offset is 8-byte
+    # aligned exactly when the load is 8 bytes wide), and the load
+    # reads that width. The FP-dst guard therefore precedes the
+    # general-word arm below and mirrors the aarch64 LirLoadFrame arm
+    # (lir.tg), defining the parameter vreg exactly like that arm: a
+    # register-resident dst loads straight into its d-register; a
+    # memory-resident dst loads at the width through the FP scratch
+    # (d15 — its low single s30 under F32 — free at the entry binds:
+    # never allocated on any route) and stores the image to its slot.
+    # The F32 single of a d-index is its low half (s = 2*d) — the same
+    # alias rule every F32 arm guards: the cm allocator keeps F32
+    # values OUT of the FP pool (d16..d29 has no single-register alias
+    # above d15 — F32 is memory-class on this route), so an F32
+    # register-resident destination below marks an allocator-invariant
+    # violation and fails closed.
+    match alloc.fp_widths.get(dst)
+    when Option::Some(w) then
+      let foff = off + frame_bytes + 24
+      if foff > 65535 then
+        return Result::Err("thumb: stack-parameter load at machine offset [r7 + " + foff.to_string() + "] exceeds the 16-bit frame-address model of the cortex-m backend (fail-closed)")
+      end
+      match alloc.segs_of.get(dst)
+      when Option::Some(segs) then
+        match lir_seg_at(segs, pos)
+        when Option::Some(s) then
+          if s.phys >= 0 then
+            match w
+            when LirFpWidth::LirF32 then
+              return Result::Err("thumb: F32 stack-parameter load into an allocated FP-pool register (d16..d29) does not lower on the cortex-m route (no single-register alias above d15); the cm allocator never assigns an F32 a pool register — F32 is memory-class on this route — so a pool-resident F32 destination marks an allocator-invariant violation (fail-closed)")
+            when LirFpWidth::LirF64 then
+              thumb_fp_mem_r7(te, w, s.phys - 100, foff, true)
+            end
+          else
+            # Memory-resident dst: load at the width into the FP
+            # scratch, then store the image to the def slot at the
+            # width. An F32's image is the canonical single's 4 bytes —
+            # the slot's exact word — so the single-form store is
+            # exact. An F64's 8-byte image rides the two-word
+            # 8-byte-aligned slot home the cm allocator reserves for
+            # F64-class vregs (LirAlloc.slot_words), so the double-form
+            # store is exact too.
+            match w
+            when LirFpWidth::LirF32 then
+              thumb_fp_mem_r7(te, w, thumb_fp_scratch_s(), foff, true)
+              thumb_slot_fp_store(te, w, thumb_fp_scratch_s(), s.slot)
+            when LirFpWidth::LirF64 then
+              thumb_fp_mem_r7(te, w, thumb_fp_scratch_d(), foff, true)
+              thumb_slot_fp_store(te, w, thumb_fp_scratch_d(), s.slot)
+            end
+          end
+        when Option::None then
+          return Result::Err("thumb: stack-parameter load destination vreg " + dst.to_string() + " has no segment at position " + pos.to_string() + " (the cortex-m route emits entry binds with a segment at every def position — fail-closed)")
+        end
+      when Option::None then
+        return Result::Err("thumb: stack-parameter load destination vreg " + dst.to_string() + " has no intervals (fail-closed)")
+      end
+      Result::Ok(())
+    when Option::None then
+      let dt = thumb_def_target(alloc, mdl_pool, dst, pos)
+      let foff = off + frame_bytes + 24
+      if foff > 65535 then
+        return Result::Err("thumb: stack-parameter load at machine offset [r7 + " + foff.to_string() + "] exceeds the 16-bit frame-address model of the cortex-m backend (fail-closed)")
+      end
+      let fp = thumb_fp_reg()
+      if dt.reg <= 7 && foff <= 124 then
+        t2_ldr_imm5(&mut te.buf, dt.reg, fp, foff)
+      elsif foff <= 4095 then
+        t2_ldr_w_imm12(&mut te.buf, dt.reg, fp, foff)
+      else
+        # Large offset: address = r7 + foff in r12 (the load temp). A
+        # memory-resident def target IS r12: the final load reads the
+        # address before overwriting the register, so the alias is safe.
+        t2_movw(&mut te.buf, thumb_ip_reg(), (foff & 0xFFFF) as u16)
+        t2_add_rr(&mut te.buf, thumb_ip_reg(), fp)
+        t2_ldr_w_imm12(&mut te.buf, dt.reg, thumb_ip_reg(), 0)
+      end
+      if dt.store_slot >= 0 then
+        thumb_slot_store(te, mdl_pool, dt.reg, dt.store_slot)
+      end
+      Result::Ok(())
     end
-    let fp = thumb_fp_reg()
-    if dt.reg <= 7 && foff <= 124 then
-      t2_ldr_imm5(&mut te.buf, dt.reg, fp, foff)
-    elsif foff <= 4095 then
-      t2_ldr_w_imm12(&mut te.buf, dt.reg, fp, foff)
-    else
-      # Large offset: address = r7 + foff in r12 (the load temp). A
-      # memory-resident def target IS r12: the final load reads the
-      # address before overwriting the register, so the alias is safe.
-      t2_movw(&mut te.buf, thumb_ip_reg(), (foff & 0xFFFF) as u16)
-      t2_add_rr(&mut te.buf, thumb_ip_reg(), fp)
-      t2_ldr_w_imm12(&mut te.buf, dt.reg, thumb_ip_reg(), 0)
-    end
-    if dt.store_slot >= 0 then
-      thumb_slot_store(te, mdl_pool, dt.reg, dt.store_slot)
-    end
-    Result::Ok(())
   when LirStmtKind::LirPushArg(vreg) then
     # AAPCS caller-word push: reserve the 4-byte word below SP
     # (sub sp, #4 — the 16-bit SP-relative form, flagless) and store
@@ -2306,16 +3017,23 @@ def thumb_emit_stmt(inout te: ThumbEmit, alloc: LirAlloc, mdl_pool: Vec[Int], fr
   when LirStmtKind::LirFMove(dst, src) then
     # FP register move dst <- src (same width on both sides) — the
     # cortex-m twin of the aarch64 LirFMove arm in lir.tg's
-    # lir_emit_stmt, restricted to REGISTER-resident operands: a fixed
-    # ABI FP id (8..15 — lir_is_fixed_fp_id) IS its d-register
-    # (d-index = id - lir_fixed_fp_base()), and an allocated FP vreg's
-    # physical id (116..129 — the allocator's FP-pool namespace,
-    # lir_fp_pool_regs) is d_{phys - 100}. The width resolves from the
+    # lir_emit_stmt, over the FULL residency envelope (see the float
+    # resolution section): a fixed ABI FP id (8..15 — lir_is_fixed_fp_id)
+    # IS its d-register (d-index = id - lir_fixed_fp_base()), and an
+    # allocated FP vreg's physical id (116..129 — the allocator's
+    # FP-pool namespace, lir_fp_pool_regs) is d_{phys - 100}; a
+    # memory-resident source loads its slot into a statement scratch at
+    # the width, and a memory-resident destination computes into the
+    # def scratch (d15 — its low single s30 under F32) and stores the
+    # image to its slot at the width. The width resolves from the
     # ordinary operand's FP class record (alloc.fp_widths — fixed ids
     # carry no record, and the lowering pairs a fixed id with an
-    # ordinary one, never two fixed ids). Memory-resident operands
-    # (spill-slot defs/uses, post-call reloads) do not lower on this
-    # route yet — fail closed below, never emit.
+    # ordinary one, never two fixed ids). F32 operands are always
+    # memory-resident on this route (the cm allocator's memory-class
+    # rule — see the float resolution section), so both sides lower
+    # through the scratch singles; the register-resident F32 form the
+    # resolution helpers still fail closed on is unproducible
+    # (allocator invariant).
     let w = match alloc.fp_widths.get(dst)
     when Option::Some(dw) then dw
     when Option::None then
@@ -2325,122 +3043,107 @@ def thumb_emit_stmt(inout te: ThumbEmit, alloc: LirAlloc, mdl_pool: Vec[Int], fr
         panic("thumb: LirFMove between two fixed FP vregs (lowering invariant)")
       end
     end
-    var dd = -1
-    if lir_is_fixed_fp_id(dst) then
-      dd = dst - lir_fixed_fp_base()
-    else
-      match alloc.segs_of.get(dst)
-      when Option::Some(segs) then
-        match lir_seg_at(segs, pos)
-        when Option::Some(s) then
-          if s.phys < 0 then
-            return Result::Err("thumb: float move destination vreg " + dst.to_string() + " is memory-resident (memory-resident float moves are pending on the cortex-m route — fail-closed)")
-          end
-          dd = s.phys - 100
-        when Option::None then
-          return Result::Err("thumb: float move destination vreg " + dst.to_string() + " has no segment at position " + pos.to_string() + " (the cortex-m route emits register-resident float moves only; memory-resident float moves are pending — fail-closed)")
-        end
-      when Option::None then
-        return Result::Err("thumb: float move destination vreg " + dst.to_string() + " has no intervals (the cortex-m route emits register-resident float moves only; memory-resident float moves are pending — fail-closed)")
-      end
+    let dt = match thumb_fp_def_target(alloc, w, dst, pos, "move destination")
+    when Result::Ok(t) then t
+    when Result::Err(e) then return Result::Err(e)
     end
-    var sm = -1
-    if lir_is_fixed_fp_id(src) then
-      sm = src - lir_fixed_fp_base()
-    else
-      match alloc.segs_of.get(src)
-      when Option::Some(segs) then
-        match lir_seg_at(segs, pos)
-        when Option::Some(s) then
-          if s.phys < 0 || lir_reload_at(alloc.reloads, pos, src) then
-            return Result::Err("thumb: float move source vreg " + src.to_string() + " is memory-resident (memory-resident float moves are pending on the cortex-m route — fail-closed)")
-          end
-          sm = s.phys - 100
-        when Option::None then
-          return Result::Err("thumb: float move source vreg " + src.to_string() + " has no segment at position " + pos.to_string() + " (the cortex-m route emits register-resident float moves only; memory-resident float moves are pending — fail-closed)")
-        end
-      when Option::None then
-        return Result::Err("thumb: float move source vreg " + src.to_string() + " has no intervals (the cortex-m route emits register-resident float moves only; memory-resident float moves are pending — fail-closed)")
-      end
+    let pref = thumb_fp_first_pref(dt.reg, w)
+    let sr = match thumb_fp_use_reg(te, alloc, w, src, pos, pref, "move source")
+    when Result::Ok(r) then r
+    when Result::Err(e) then return Result::Err(e)
     end
-    if dd != sm then
-      # F32 rides the d-register's LOW half (the canonical single), so
-      # its single-register index is 2*d-index. The FP pool (d16..d29)
-      # has no single alias on the cortex-m register model (s0..s31 —
-      # d0..d15 — only), so an F32 move through an allocated operand
-      # has no encodable registers yet: fail closed as pending.
+    if dt.reg != sr then
       match w
-      when LirFpWidth::LirF32 then
-        if dd >= 16 || sm >= 16 then
-          return Result::Err("thumb: F32 move through an allocated FP-pool register (d16..d29) does not lower on the cortex-m route (no single-register alias above d15; F32-pool moves are pending — fail-closed)")
-        end
-        t2_vmov_f32(&mut te.buf, 2 * dd, 2 * sm)
-      when LirFpWidth::LirF64 then
-        t2_vmov_f64(&mut te.buf, dd, sm)
+      when LirFpWidth::LirF32 then t2_vmov_f32(&mut te.buf, dt.reg, sr)
+      when LirFpWidth::LirF64 then t2_vmov_f64(&mut te.buf, dt.reg, sr)
       end
+    end
+    if dt.store_slot >= 0 then
+      thumb_slot_fp_store(te, w, dt.reg, dt.store_slot)
     end
     Result::Ok(())
   when LirStmtKind::LirFBinop(fop, w, dst, left, right) then
     # FP arithmetic dst = left op right (FADD/FSUB/FMUL/FDIV under the
     # statement's width) — the cortex-m twin of the aarch64 LirFBinop
     # arm (VADD/VSUB/VMUL/VDIV .F64 Dd, Dn, Dm / .F32 Sd, Sn, Sm),
-    # register-resident operands only (memory-resident defs/uses fail
-    # closed through thumb_fp_d_of, never emitted). An F32 binop
-    # through an allocated FP-pool register has no encodable single
-    # (no single-register alias above d15), so it fails closed as
-    # pending, exactly like the LirFMove arm.
-    let dd = match thumb_fp_d_of(alloc, dst, pos, false, "binop destination")
-    when Result::Ok(d) then d
+    # over the FULL residency envelope (see the float resolution
+    # section): each memory-resident operand loads into its statement
+    # scratch at the width before the op — two memory-resident
+    # operands use the two scratches (the aarch64 route's V30/V31
+    # first/second-pref pattern; an in-place op may then read the def
+    # scratch it also writes, exactly as the aarch64 route reuses V30)
+    # — and a memory-resident destination computes into the def
+    # scratch and stores to its slot after the op. F32 operands are
+    # always memory-resident on this route (the cm allocator's
+    # memory-class rule), so every F32 binop loads its operands
+    # through the scratch singles and stores its result from the def
+    # scratch; the register-resident F32 form the resolution helpers
+    # still fail closed on is unproducible (allocator invariant).
+    let dt = match thumb_fp_def_target(alloc, w, dst, pos, "binop destination")
+    when Result::Ok(t) then t
     when Result::Err(e) then return Result::Err(e)
     end
-    let ln = match thumb_fp_d_of(alloc, left, pos, true, "binop left operand")
-    when Result::Ok(d) then d
+    let left_pref = thumb_fp_first_pref(dt.reg, w)
+    let ln = match thumb_fp_use_reg(te, alloc, w, left, pos, left_pref, "binop left operand")
+    when Result::Ok(r) then r
     when Result::Err(e) then return Result::Err(e)
     end
-    let rm = match thumb_fp_d_of(alloc, right, pos, true, "binop right operand")
-    when Result::Ok(d) then d
+    let right_pref = thumb_fp_second_pref(ln, w)
+    let rm = match thumb_fp_use_reg(te, alloc, w, right, pos, right_pref, "binop right operand")
+    when Result::Ok(r) then r
     when Result::Err(e) then return Result::Err(e)
     end
     match w
     when LirFpWidth::LirF32 then
-      if dd >= 16 || ln >= 16 || rm >= 16 then
-        return Result::Err("thumb: F32 binop through an allocated FP-pool register (d16..d29) does not lower on the cortex-m route (no single-register alias above d15; F32-pool binops are pending — fail-closed)")
-      end
       match fop
-      when LirFpBinOp::LirFAdd then t2_vadd_f32(&mut te.buf, 2 * dd, 2 * ln, 2 * rm)
-      when LirFpBinOp::LirFSub then t2_vsub_f32(&mut te.buf, 2 * dd, 2 * ln, 2 * rm)
-      when LirFpBinOp::LirFMul then t2_vmul_f32(&mut te.buf, 2 * dd, 2 * ln, 2 * rm)
-      when LirFpBinOp::LirFDiv then t2_vdiv_f32(&mut te.buf, 2 * dd, 2 * ln, 2 * rm)
+      when LirFpBinOp::LirFAdd then t2_vadd_f32(&mut te.buf, dt.reg, ln, rm)
+      when LirFpBinOp::LirFSub then t2_vsub_f32(&mut te.buf, dt.reg, ln, rm)
+      when LirFpBinOp::LirFMul then t2_vmul_f32(&mut te.buf, dt.reg, ln, rm)
+      when LirFpBinOp::LirFDiv then t2_vdiv_f32(&mut te.buf, dt.reg, ln, rm)
       end
     when LirFpWidth::LirF64 then
       match fop
-      when LirFpBinOp::LirFAdd then t2_vadd_f64(&mut te.buf, dd, ln, rm)
-      when LirFpBinOp::LirFSub then t2_vsub_f64(&mut te.buf, dd, ln, rm)
-      when LirFpBinOp::LirFMul then t2_vmul_f64(&mut te.buf, dd, ln, rm)
-      when LirFpBinOp::LirFDiv then t2_vdiv_f64(&mut te.buf, dd, ln, rm)
+      when LirFpBinOp::LirFAdd then t2_vadd_f64(&mut te.buf, dt.reg, ln, rm)
+      when LirFpBinOp::LirFSub then t2_vsub_f64(&mut te.buf, dt.reg, ln, rm)
+      when LirFpBinOp::LirFMul then t2_vmul_f64(&mut te.buf, dt.reg, ln, rm)
+      when LirFpBinOp::LirFDiv then t2_vdiv_f64(&mut te.buf, dt.reg, ln, rm)
       end
+    end
+    if dt.store_slot >= 0 then
+      thumb_slot_fp_store(te, w, dt.reg, dt.store_slot)
     end
     Result::Ok(())
   when LirStmtKind::LirFNeg(w, dst, src) then
-    # FP negation dst = -src (FNEG under the statement's width) — the
-    # cortex-m twin of the aarch64 LirFNeg arm, register-resident
-    # operands only. F64 emits the verified VNEG.F64 (t2_vneg_f64 — a
-    # sign-bit flip: NaN payloads and signed zeros preserved). The VFP
-    # section has no verified VNEG.F32 encoder yet, so F32 negation
-    # fails closed naming the pending rule.
-    let dd = match thumb_fp_d_of(alloc, dst, pos, false, "negate destination")
-    when Result::Ok(d) then d
+    # FP negation dst = -src (VNEG under the statement's width) — the
+    # cortex-m twin of the aarch64 LirFNeg arm, over the FULL residency
+    # envelope: a memory-resident source loads into its statement
+    # scratch at the width and a memory-resident destination negates
+    # into the def scratch (d15 — its low single s30 under F32) and
+    # stores the image to its slot. VNEG is a sign-bit flip: NaN
+    # payloads and signed zeros are preserved. F64 emits the verified
+    # VNEG.F64 (t2_vneg_f64); F32 emits the verified VNEG.F32
+    # (t2_vneg_f32) over single indices — an F32 source is always
+    # memory-resident on this route (the cm allocator's memory-class
+    # rule), so the arm always loads through the scratch single (the
+    # register-resident F32 form the resolution helper fails closed on
+    # is unproducible — an allocator-invariant check).
+    let dt = match thumb_fp_def_target(alloc, w, dst, pos, "negate destination")
+    when Result::Ok(t) then t
     when Result::Err(e) then return Result::Err(e)
     end
-    let sm = match thumb_fp_d_of(alloc, src, pos, true, "negate source")
-    when Result::Ok(d) then d
+    let pref = thumb_fp_first_pref(dt.reg, w)
+    let sm = match thumb_fp_use_reg(te, alloc, w, src, pos, pref, "negate source")
+    when Result::Ok(r) then r
     when Result::Err(e) then return Result::Err(e)
     end
     match w
     when LirFpWidth::LirF32 then
-      return Result::Err("thumb: F32 negate does not lower on the cortex-m route (the VFP section has no verified VNEG.F32 encoder; F32 negation is pending — fail-closed)")
+      t2_vneg_f32(&mut te.buf, dt.reg, sm)
     when LirFpWidth::LirF64 then
-      t2_vneg_f64(&mut te.buf, dd, sm)
+      t2_vneg_f64(&mut te.buf, dt.reg, sm)
+    end
+    if dt.store_slot >= 0 then
+      thumb_slot_fp_store(te, w, dt.reg, dt.store_slot)
     end
     Result::Ok(())
   when LirStmtKind::LirFCmp(w, left, right) then
@@ -2452,109 +3155,239 @@ def thumb_emit_stmt(inout te: ThumbEmit, alloc: LirAlloc, mdl_pool: Vec[Int], fr
     # like LirCmp (invariant I1: the allocator inserts only flag-
     # neutral code between it and its LirCset consumer, and the
     # consumer reads the EQ/NE/LT/LE/GT/GE conditions of the shared
-    # thumb_cc table over the copied flags). F64 emits the verified
-    # VCMP.F64 (t2_vcmp_f64 — the quiet compare, mirroring the a64
-    # FCMP); the VFP section has no verified VCMP.F32 encoder yet, so
-    # F32 compares fail closed naming the pending rule.
-    let ld = match thumb_fp_d_of(alloc, left, pos, true, "compare left operand")
-    when Result::Ok(d) then d
+    # thumb_cc table over the copied flags). Memory-resident operands
+    # load into the two statement scratches at the width (left into
+    # the def scratch, right into the other one — a compare has no def
+    # to preserve) — every F32 operand is memory-resident on this
+    # route (the cm allocator's memory-class rule), so an F32 compare
+    # always loads its two singles through the scratches (the
+    # register-resident F32 form the resolution helper fails closed on
+    # is unproducible — an allocator-invariant check).
+    # F64 emits the verified VCMP.F64 (t2_vcmp_f64 — the quiet
+    # compare, mirroring the a64 FCMP); F32 emits the verified
+    # VCMP.F32 (t2_vcmp_f32) over the single-index scratch pair.
+    let ld = match thumb_fp_use_reg(te, alloc, w, left, pos, thumb_fp_def_scratch(w), "compare left operand")
+    when Result::Ok(r) then r
     when Result::Err(e) then return Result::Err(e)
     end
-    let rd = match thumb_fp_d_of(alloc, right, pos, true, "compare right operand")
-    when Result::Ok(d) then d
+    let right_pref = thumb_fp_second_pref(ld, w)
+    let rd = match thumb_fp_use_reg(te, alloc, w, right, pos, right_pref, "compare right operand")
+    when Result::Ok(r) then r
     when Result::Err(e) then return Result::Err(e)
     end
     match w
     when LirFpWidth::LirF32 then
-      return Result::Err("thumb: F32 compare does not lower on the cortex-m route (the VFP section has no verified VCMP.F32 encoder; F32 comparisons are pending — fail-closed)")
+      t2_vcmp_f32(&mut te.buf, ld, rd)
+      t2_vmrs_apsr_nzcv(&mut te.buf)
     when LirFpWidth::LirF64 then
       t2_vcmp_f64(&mut te.buf, ld, rd)
       t2_vmrs_apsr_nzcv(&mut te.buf)
     end
     Result::Ok(())
-  when LirStmtKind::LirFConst(_, dst, _) then
-    # Materialize the constant's 64-bit BITS into dst — the cortex-m
-    # twin of the aarch64 LirFConst arm (its GP-bit path: move the
-    # pattern into X16, fmov d, X16 — plus the fcvt s, d rounding for
-    # F32). Every route into the FP file needs an encoder this backend
-    # does not have yet: the VFP section carries no VFP-immediate
-    # encoder (VMOV.F64/F32 #imm), no ARM-core-to-VFP move (VMOV d,
-    # r0, r1 / VMOV s, r0), and this emitter has no literal pool for a
-    # VLDR path. A register-resident destination therefore fails
-    # closed below naming the pending materialization; a memory-
-    # resident one first trips thumb_fp_d_of's rule.
-    match thumb_fp_d_of(alloc, dst, pos, false, "constant destination")
-    when Result::Ok(_) then ()
+  when LirStmtKind::LirFConst(w, dst, bits) then
+    # Materialize the constant's bits into dst — the cortex-m twin of
+    # the aarch64 LirFConst arm, over the FULL residency envelope: a
+    # register-resident destination materializes into its register, a
+    # memory-resident one into the def scratch (d15 — its low single
+    # s30 under F32) and stores the image to its slot at the width.
+    # The statement payload is ALWAYS the constant's 64-bit HOST-DOUBLE
+    # pattern (MirFloat carries doubles — see the LirFConst statement
+    # doc), for F32 destinations exactly as for F64 ones.
+    #   F64: when the double's bit pattern is modified-immediate
+    #   encodable, VMOV.F64 Dd, #imm (t2_vmov_f64_const — its verified
+    #   accept test returns false for every non-encodable pattern,
+    #   including +0.0/-0.0, which the modified-immediate rule cannot
+    #   express: zero always carries a leading 1.mantissa). Otherwise
+    #   the GP transit: materialize the pattern's LOW word in r0 and
+    #   its HIGH word in r1 with the movw/movt pair
+    #   (thumb_emit_imm32 — the backend's 32-bit constant machinery),
+    #   then VMOV Dd, r0, r1 (t2_vmov_gp_pair_to_d). This covers the
+    #   zero patterns exactly (r0 = r1 = 0 for +0.0; r1 = 0x80000000
+    #   for -0.0). A register-clearing VSUB Dd, Dd, Dd self-subtract is
+    #   NOT used: the constant statement DEFINES dst, whose register may
+    #   hold anything (a dead vreg's stale bits, possibly a NaN), and
+    #   x - x is +0.0 only for non-NaN x — self-subtracting garbage is
+    #   not IEEE-safe. r0/r1 are the fixed ABI vregs, dead at every
+    #   statement boundary on this route (fixed-vreg traffic is the
+    #   entry binds, the call-argument moves and the return moves, all
+    #   adjacent to terminators/entry), so the transit is safe.
+    #   F32: the emission materializes the DOUBLE pattern into the FP
+    #   scratch d-register (d15 — the same imm8/GP-transit choice) and
+    #   rounds it to the canonical single with VCVT.F32.F64 s{dst},
+    #   d15 — the exact twin of the aarch64 arm's fmov d{V31}, x16 +
+    #   fcvt s, d, and the only rounding an F32 constant receives (the
+    #   VFP modified-immediate single form is never used directly: the
+    #   payload is a double pattern, not a single one). When the
+    #   destination is memory-resident the rounding writes the def
+    #   scratch s30 — the LOW single of the source d15 itself: VFP
+    #   data processing reads its operands before writing its result
+    #   (the canonical vcvt.f32.f64 s0, d0 narrowing), so the
+    #   read-after-rounding store sees the exact single image. An F32
+    #   destination is ALWAYS memory-resident on this route (the cm
+    #   allocator's memory-class rule), so the rounding always writes
+    #   the def scratch s30 and stores the slot; the register-resident
+    #   F32 form thumb_fp_def_target still fails closed on is
+    #   unproducible (allocator invariant).
+    let dt = match thumb_fp_def_target(alloc, w, dst, pos, "constant destination")
+    when Result::Ok(t) then t
     when Result::Err(e) then return Result::Err(e)
     end
-    Result::Err("thumb: float constant materialization does not lower on the cortex-m route (no verified GP-to-VFP VMOV or VFP-immediate encoder, and no literal-pool VLDR path; float constants are pending — fail-closed)")
-  when LirStmtKind::LirIntToFloat(_, dst, _, _) then
+    match w
+    when LirFpWidth::LirF32 then
+      if !t2_vmov_f64_const(&mut te.buf, thumb_fp_scratch_d(), bits as u64) then
+        thumb_emit_imm32(te, 0, bits & 0xFFFFFFFF)
+        thumb_emit_imm32(te, 1, (bits >> 32) & 0xFFFFFFFF)
+        t2_vmov_gp_pair_to_d(&mut te.buf, 0, 1, thumb_fp_scratch_d())
+      end
+      t2_vcvt_f32_f64(&mut te.buf, dt.reg, thumb_fp_scratch_d())
+    when LirFpWidth::LirF64 then
+      if !t2_vmov_f64_const(&mut te.buf, dt.reg, bits as u64) then
+        thumb_emit_imm32(te, 0, bits & 0xFFFFFFFF)
+        thumb_emit_imm32(te, 1, (bits >> 32) & 0xFFFFFFFF)
+        t2_vmov_gp_pair_to_d(&mut te.buf, 0, 1, dt.reg)
+      end
+    end
+    if dt.store_slot >= 0 then
+      thumb_slot_fp_store(te, w, dt.reg, dt.store_slot)
+    end
+    Result::Ok(())
+  when LirStmtKind::LirIntToFloat(w, dst, src, unsigned) then
     # Signed/unsigned integer word -> float — the cortex-m twin of the
     # aarch64 LirIntToFloat arm (SCVTF/UCVTF under the statement's
     # width). The VFP converters of this backend (t2_vcvt_f64_s32 /
-    # t2_vcvt_f64_u32 / t2_vcvt_f32_s32 / t2_vcvt_f32_u32) take their
-    # 32-bit integer from an S register of the VFP file, so the
-    # integer word must first cross from the ARM core into the FP file
-    # — and the VFP section has no verified core-to-VFP VMOV encoder
-    # (VMOV s, r / VMOV d, r0, r1). A register-resident float
-    # destination therefore fails closed below naming the pending
-    # rule; a memory-resident one first trips thumb_fp_d_of's rule.
-    match thumb_fp_d_of(alloc, dst, pos, false, "int-to-float destination")
-    when Result::Ok(_) then ()
+    # t2_vcvt_f64_u32 / t2_vcvt_f32_s32 / t2_vcvt_f32_u32) read their
+    # 32-bit integer from an S register of the VFP file, so the integer
+    # word first crosses from the ARM core into the FP file: the source
+    # word is materialized (thumb_emit_use — a spill load, when the
+    # source is memory-resident, lands in r0, the requested pref) and
+    # VMOV Sd, Rt (t2_vmov_gp_to_s) carries it into the scratch single
+    # s30 (d15's low single — never an allocated register), then the
+    # VCVT converts it at the statement's width. VFP's VCVT converts
+    # 32-bit integer sources only, which is exactly this route's word
+    # model: the cortex-m shape gate admits Int/UInt words whose machine
+    # image is the 32-bit cortex-m word ([-2^31, 2^32)), so no 64-bit-
+    # integer source can reach a validated function — the aarch64
+    # route's 64-bit-int SCVTF/UCVTF conversions (which no VFP VCVT
+    # mirrors) are excluded with the aarch64-convention LIR as a whole
+    # (the fixed-vreg 4..7 fingerprints and the word-only gates), and
+    # no rule-naming Err is reachable for them here. The destination
+    # resolves through thumb_fp_def_target: a register-resident
+    # destination is its pool d-register (an F64 — an F32 destination
+    # is always memory-resident on this route by the cm memory-class
+    # rule), a memory-resident one the
+    # def scratch (d15 — its low single s30 under F32) with a pending
+    # width store to its slot (an in-place VCVT may then read the
+    # scratch single it also writes — VFP data processing reads before
+    # it writes, and a widening vcvt.f64.s32 d15, s30 is the canonical
+    # shape).
+    let dt = match thumb_fp_def_target(alloc, w, dst, pos, "int-to-float destination")
+    when Result::Ok(t) then t
     when Result::Err(e) then return Result::Err(e)
     end
-    Result::Err("thumb: int-to-float does not lower on the cortex-m route (the VFP VCVT converters read their 32-bit integer from an S register, and the VFP section has no verified core-to-VFP VMOV encoder; int-to-float is pending — fail-closed)")
-  when LirStmtKind::LirFloatToInt(_, _, src) then
+    let sr = thumb_emit_use(te, alloc, mdl_pool, src, pos, thumb_ret_reg())
+    t2_vmov_gp_to_s(&mut te.buf, sr, thumb_fp_scratch_s())
+    match w
+    when LirFpWidth::LirF32 then
+      if unsigned then
+        t2_vcvt_f32_u32(&mut te.buf, dt.reg, thumb_fp_scratch_s())
+      else
+        t2_vcvt_f32_s32(&mut te.buf, dt.reg, thumb_fp_scratch_s())
+      end
+    when LirFpWidth::LirF64 then
+      if unsigned then
+        t2_vcvt_f64_u32(&mut te.buf, dt.reg, thumb_fp_scratch_s())
+      else
+        t2_vcvt_f64_s32(&mut te.buf, dt.reg, thumb_fp_scratch_s())
+      end
+    end
+    if dt.store_slot >= 0 then
+      thumb_slot_fp_store(te, w, dt.reg, dt.store_slot)
+    end
+    Result::Ok(())
+  when LirStmtKind::LirFloatToInt(w, dst, src) then
     # Float -> signed integer word (the strict spec's trap-free
     # truncation: toward zero, NaN -> 0, out-of-range saturates) — the
-    # cortex-m twin of the aarch64 LirFloatToInt arm (FCVTZS). The VFP
-    # converters of this backend (t2_vcvt_s32_f64 / t2_vcvt_s32_f32)
-    # produce their 32-bit integer in an S register of the VFP file,
-    # so the word must cross from the FP file into the ARM core — and
-    # the VFP section has no verified VFP-to-core VMOV encoder (VMOV
-    # r, s / VMOV r0, r1, d). A register-resident float source
-    # therefore fails closed below naming the pending rule; a memory-
-    # resident one first trips thumb_fp_d_of's rule.
-    match thumb_fp_d_of(alloc, src, pos, true, "float-to-int source")
-    when Result::Ok(_) then ()
+    # cortex-m twin of the aarch64 LirFloatToInt arm (FCVTZS; the VFP
+    # VCVT.S32 rule saturates exactly like FCVTZS and returns 0 for
+    # NaN, so the 32-bit cortex-m word destination gets the strict
+    # spec's rule at the route's word width). The VFP converters
+    # (t2_vcvt_s32_f64 / t2_vcvt_s32_f32) produce their 32-bit integer
+    # in an S register, so the word crosses back from the FP file into
+    # the ARM core: the VCVT writes the scratch single s30, then VMOV
+    # Rt, Sd (t2_vmov_s_to_gp) carries it into the integer destination
+    # vreg's def target (thumb_def_target — the pool register of a
+    # register-resident def, or the r12 temp with the pending spill-
+    # slot store of a memory-resident def, exactly like the general
+    # statement arms). A memory-resident float source loads into the
+    # SECOND scratch (d14 — its low single s28 under F32) so the
+    # conversion result in the def scratch single s30 never shares a
+    # d-register with the source image (a register-resident F64 source
+    # in the pool converts straight from its d-register; an F32 source
+    # is always memory-resident on this route by the cm memory-class
+    # rule). A 64-bit
+    # integer destination — the aarch64 route's FCVTZS-to-X form — has
+    # no VFP mirror and cannot reach a validated function (see the
+    # LirIntToFloat arm); no rule-naming Err is reachable for it here.
+    let dt = thumb_def_target(alloc, mdl_pool, dst, pos)
+    let sm = match thumb_fp_use_reg(te, alloc, w, src, pos, thumb_fp_use_scratch(w), "float-to-int source")
+    when Result::Ok(r) then r
     when Result::Err(e) then return Result::Err(e)
     end
-    Result::Err("thumb: float-to-int does not lower on the cortex-m route (the VFP VCVT converters produce their 32-bit integer in an S register, and the VFP section has no verified VFP-to-core VMOV encoder; float-to-int is pending — fail-closed)")
+    match w
+    when LirFpWidth::LirF32 then
+      t2_vcvt_s32_f32(&mut te.buf, thumb_fp_scratch_s(), sm)
+    when LirFpWidth::LirF64 then
+      t2_vcvt_s32_f64(&mut te.buf, thumb_fp_scratch_s(), sm)
+    end
+    t2_vmov_s_to_gp(&mut te.buf, dt.reg, thumb_fp_scratch_s())
+    if dt.store_slot >= 0 then
+      thumb_slot_store(te, mdl_pool, dt.reg, dt.store_slot)
+    end
+    Result::Ok(())
   when LirStmtKind::LirFcvt(src_w, dst, src) then
     # Float <-> float width cast: fdst = (dw) fsrc — the cortex-m twin
     # of the aarch64 LirFcvt arm (FCVT: single->double exact widening
     # via t2_vcvt_f64_f32, double->single exactly-once RNE rounding via
-    # t2_vcvt_f32_f64), register-resident operands only. dw is the dst
+    # t2_vcvt_f32_f64), over the FULL residency envelope: a
+    # memory-resident source loads into the def scratch of its own
+    # width at the width before the op, and a memory-resident
+    # destination converts into the def scratch of ITS width and
+    # stores the image to its slot. When both are memory-resident the
+    # widening/narrowing VCVT may read a scratch whose d-register the
+    # result also occupies (vcvt.f32.f64 s30, d15 narrows into the low
+    # single of its own source; vcvt.f64.f32 d15, s30 widens over its
+    # own source single) — VFP data processing reads its operands
+    # before writing its result, the same overlap the aarch64 route's
+    # fcvt s, d{dV31} / fcvt d, s patterns carry. dw is the dst
     # vreg's class-record width (the encoders implement the two cross-
     # width directions only; a same-width pair is a lowering
     # divergence). The F32 side rides the LOW single of its d-index
-    # (s = 2*d), so an F32 operand allocated to the FP pool (d16..d29
-    # — no single-register alias above d15) fails closed as pending,
-    # exactly like the LirFMove arm.
+    # (s = 2*d); an F32 operand is always memory-resident on this
+    # route (the cm allocator's memory-class rule), so both the source
+    # load and the destination store of an F32 side go through the
+    # scratch singles (the register-resident F32 form the resolution
+    # helpers fail closed on is unproducible — allocator invariant).
     let dw = match alloc.fp_widths.get(dst)
     when Option::Some(v) then v
     when Option::None then panic("lir: LirFcvt into a vreg with no FP class record (lowering invariant)")
     end
-    let dd = match thumb_fp_d_of(alloc, dst, pos, false, "fcvt destination")
-    when Result::Ok(d) then d
+    let dt = match thumb_fp_def_target(alloc, dw, dst, pos, "fcvt destination")
+    when Result::Ok(t) then t
     when Result::Err(e) then return Result::Err(e)
     end
-    let sm = match thumb_fp_d_of(alloc, src, pos, true, "fcvt source")
-    when Result::Ok(d) then d
+    let sm = match thumb_fp_use_reg(te, alloc, src_w, src, pos, thumb_fp_def_scratch(src_w), "fcvt source")
+    when Result::Ok(r) then r
     when Result::Err(e) then return Result::Err(e)
     end
     if dw == LirFpWidth::LirF32 && src_w == LirFpWidth::LirF64 then
-      if dd >= 16 then
-        return Result::Err("thumb: F32 fcvt destination through an allocated FP-pool register (d16..d29) does not lower on the cortex-m route (no single-register alias above d15; F32-pool fcvt destinations are pending — fail-closed)")
-      end
-      t2_vcvt_f32_f64(&mut te.buf, 2 * dd, sm)
+      t2_vcvt_f32_f64(&mut te.buf, dt.reg, sm)
     elsif dw == LirFpWidth::LirF64 && src_w == LirFpWidth::LirF32 then
-      if sm >= 16 then
-        return Result::Err("thumb: F32 fcvt source through an allocated FP-pool register (d16..d29) does not lower on the cortex-m route (no single-register alias above d15; F32-pool fcvt sources are pending — fail-closed)")
-      end
-      t2_vcvt_f64_f32(&mut te.buf, dd, 2 * sm)
+      t2_vcvt_f64_f32(&mut te.buf, dt.reg, sm)
     else
       panic("lir: LirFcvt between identical widths (lowering invariant; same-width casts lower as moves)")
+    end
+    if dt.store_slot >= 0 then
+      thumb_slot_fp_store(te, dw, dt.reg, dt.store_slot)
     end
     Result::Ok(())
   end
@@ -2562,8 +3395,22 @@ end
 
 # Emit the pre-call spill stores (register-resident pre-call segments
 # whose end precedes the call at `pos` — invariant I2; redundant for the
-# callee-saved pool but keeps the allocator target-agnostic).
-def thumb_emit_call_spills(inout te: ThumbEmit, alloc: LirAlloc, mdl_pool: Vec[Int], pos: Int) -> Unit
+# callee-saved pool but keeps the allocator target-agnostic). A spill
+# record whose vreg is a FLOAT-class vreg (alloc.fp_widths — the FP
+# pool d16..d29 is caller-saved, so an F64 value live across a call
+# always takes this path) stores its slot image at the width through
+# the VFP store machinery (thumb_slot_fp_store): an F64's 8-byte image
+# rides the width-sized slot home the cm allocator reserves (two
+# 4-byte words at an even base — LirAlloc.slot_words), so the
+# double-form VSTR is exact. An F32 value never reaches this arm's
+# F32 register-resident form — the cm allocator keeps F32 out of the
+# pool (memory-class), so an F32 crossing a call is already slot-
+# resident; the form below fails closed as an allocator-invariant
+# check (an F32 in the pool has no single-register alias on the
+# cortex-m register model — s0..s31 = d0..d15 only).
+# The crossing's post-call side is the reload record, which the
+# float-use resolution (thumb_fp_use_reg) emits at the width.
+def thumb_emit_call_spills(inout te: ThumbEmit, alloc: LirAlloc, mdl_pool: Vec[Int], pos: Int) -> Result[Unit, String]
   var i = 0
   while i < alloc.spills.len() do
     if alloc.spills[i].0 == pos then
@@ -2573,7 +3420,15 @@ def thumb_emit_call_spills(inout te: ThumbEmit, alloc: LirAlloc, mdl_pool: Vec[I
         match lir_seg_at(segs, pos - 1)
         when Option::Some(s) then
           if s.phys >= 0 && s.slot >= 0 then
-            thumb_slot_store(te, mdl_pool, thumb_phys_of(mdl_pool, s.phys), s.slot)
+            match alloc.fp_widths.get(vreg)
+            when Option::Some(w) then
+              if w == LirFpWidth::LirF32 then
+                return Result::Err("thumb: F32 value vreg " + vreg.to_string() + " is live across a call in an allocated FP-pool register (d16..d29) and would need a spill store at its call boundary — its 4-byte image has no single-register alias above d15 on the cortex-m register model; the cm allocator never assigns an F32 a pool register — F32 is memory-class on this route — so a pool-resident F32 marks an allocator-invariant violation (fail-closed)")
+              end
+              thumb_slot_fp_store(te, w, s.phys - 100, s.slot)
+            when Option::None then
+              thumb_slot_store(te, mdl_pool, thumb_phys_of(mdl_pool, s.phys), s.slot)
+            end
           end
         when Option::None then ()
         end
@@ -2582,6 +3437,448 @@ def thumb_emit_call_spills(inout te: ThumbEmit, alloc: LirAlloc, mdl_pool: Vec[I
     end
     i = i + 1
   end
+  Result::Ok(())
+end
+
+# ———————————————————————————————————————————————————————————————
+# Pointer/atomic statement emission (the cortex-m atomic slice)
+# ———————————————————————————————————————————————————————————————
+# The marked LirPtrOp statements of the pointer/atomic slice emit here
+# as ARMv7-M sequences. The atomic primitive of this profile is the
+# exclusive monitor (LDREX/STREX word/byte/half) with DMB for
+# ordering; there is NO LSE family on ARMv7-M, so every atomic form of
+# the LIR slice translates into its LDREX/STREX loop equivalent. The
+# per-ordering discipline mirrors memory_model.md §16.8.1's ARMv7
+# canonical form (clang/gcc's __atomic lowering for thumbv7em,
+# verified offline — the reference emission):
+#   loads:  form 0 (Relaxed) = plain width LDR;
+#           form 1 (Acquire/SeqCst/out-of-domain) = LDR + DMB SY
+#           (the load's acquire side orders every later access after
+#           it; SeqCst loads use the same pair — the classic ARMv7
+#           LDR;DMB SC-load mapping, and the STLR discipline of the
+#           a64 table has no single-instruction counterpart here);
+#   stores: form 0 (Relaxed) = plain width STR;
+#           form 1 (Release/SeqCst/out-of-domain) = DMB SY; STR; DMB SY
+#           — clang's seq_cst store sequence (the trailing DMB is what
+#           makes the SC store total under the classic ARMv7 mapping);
+#           the LIR form cannot distinguish Release from SeqCst, and
+#           serving the stronger form for both is legal;
+#   RMW/CAS/exchange (the LirAtomRmw/LirAtomCas families):
+#           form 0 (Relaxed) = the bare LDREX/STREX loop;
+#           form 1 (Acquire) = loop + DMB SY after the loop (all
+#           later accesses stay after the RMW's read);
+#           form 2 (Release) = DMB SY before the loop + loop (prior
+#           accesses stay before the RMW's write);
+#           form 3 (AcqRel/SeqCst/out-of-domain) = DMB SY; loop; DMB SY
+#           (the classic full-barrier SC RMW);
+#   CAS adds CLREX on the compare-mismatch exit (the failed compare
+#   leaves the monitor armed — clang clears it there, verified
+#   offline) and its post-loop DMB (forms 1/3) sits on the common
+#   exit, so the failed path of an acquire/seq-cst CAS reads with the
+#   success order's strength exactly like the a64 CASA/CASAL arm;
+#   fences (LirPtrFence): both forms = DMB SY — ARMv7-M is a
+#   single-core profile with no shareability-domain distinction, so
+#   the a64 route's ISHLD/ISH option split collapses into the full
+#   system barrier (the ecosystem reference emits `dmb sy` at every
+#   ordering boundary on thumbv7em — verified offline).
+# The plain pointer statements (marked loads/stores/LEAs) emit as
+# register-indirect width loads/stores and frame-address arithmetic.
+#
+# REGISTER DISCIPLINE: an exclusive sequence pins its operands in
+# registers across the loop and needs the STREX status register and
+# the loop's data register besides them. The statement-scratch pool
+# {r0, r1, r2, r3, r12} serves every pin: r0-r3 and r12 are dead at
+# every statement that is not itself an argument move (fixed vregs
+# 0..3 only ever hold values in the entry parameter binds and in the
+# LirMove argument moves that sit directly before a call terminator —
+# the marked statements never appear in those batches and never read
+# or write a fixed vreg — and r12 is the reserved instruction temp,
+# never allocated), while the pool registers (r4..r10) hold the
+# register-resident operand values. Allocated registers for distinct
+# simultaneously-live vregs are distinct by the allocator, so the
+# pins never alias pool registers. STREX keeps Rd (status), Rt (data)
+# and Rn (address) pairwise distinct, and LDREX keeps Rt distinct
+# from Rn (the AArch32 constraints on the exclusive forms), which the
+# exclusion set below guarantees. Invariant I1 is preserved: the only
+# flag writes inside a sequence are the CMPs that immediately precede
+# their own conditional branches; every path through a sequence ends
+# flag-neutral, and the LirCmp consumer following a marked CAS arm is
+# a real compare statement of its own.
+
+# Pick a statement scratch not in `excl` (the registers already pinned
+# by the sequence). Option::None only when all five are pinned — an
+# internal planning failure the arms fail closed on.
+def thumb_pick_atom_scratch(excl: Set[Int]) -> Option[Int]
+  if !excl.contains(&0) then Option::Some(0)
+  elsif !excl.contains(&1) then Option::Some(1)
+  elsif !excl.contains(&2) then Option::Some(2)
+  elsif !excl.contains(&3) then Option::Some(3)
+  elsif !excl.contains(&12) then Option::Some(12)
+  else Option::None
+  end
+end
+
+# Pick the STREX STATUS register of a loop: always one of r0..r3, so
+# the status test after every STREX is the 2-byte CMP rn, #0 (the
+# imm8 form takes rn <= 7) with NO temp materialization — a temp
+# would have to borrow a register the loop's pins hold (clobbering a
+# pin between a STREX and its retry would corrupt the loop). The arms
+# reserve the status FIRST (before any pin), and a loop never needs
+# more than four pins besides it, so a low status register always
+# exists. Option::None is unreachable (planning failure).
+def thumb_pick_atom_status(excl: Set[Int]) -> Option[Int]
+  if !excl.contains(&0) then Option::Some(0)
+  elsif !excl.contains(&1) then Option::Some(1)
+  elsif !excl.contains(&2) then Option::Some(2)
+  elsif !excl.contains(&3) then Option::Some(3)
+  else Option::None
+  end
+end
+
+# Reserve the fixed scratch `reg` for a sequence (the caller resolved
+# an operand into it).
+def thumb_atom_reserve(inout excl: Set[Int], reg: Int) -> Unit
+  if reg <= 3 || reg == 12 then
+    excl.insert(reg)
+  end
+end
+
+# Resolve one exclusive-sequence operand into a register: a
+# register-resident value keeps its pool register, a spill-resident
+# one loads through the preference `pref`; the resulting register is
+# reserved in `excl` when it is a statement scratch (a fixed vreg
+# 0..3 result is recorded too — never produced for these operands by
+# the lowering, kept defensive).
+def thumb_atom_use(inout te: ThumbEmit, alloc: LirAlloc, mdl_pool: Vec[Int], vreg: Int, pos: Int, pref: Int, inout excl: Set[Int]) -> Int
+  let r = thumb_emit_use(te, alloc, mdl_pool, vreg, pos, pref)
+  thumb_atom_reserve(excl, r)
+  r
+end
+
+# The preferred spill-load temp of an operand given the registers
+# already pinned: any free statement scratch (r12 first — the
+# established first temp).
+def thumb_atom_pref(excl: Set[Int]) -> Int
+  match thumb_pick_atom_scratch(excl)
+  when Option::Some(r) then r
+  when Option::None then 12
+  end
+end
+
+# A unique statement-internal label of fn `fn_name` at position `pos`
+# with tag `tag` (the label map is whole-program; fn names and
+# statement positions are unique).
+def thumb_atom_label(fn_name: String, pos: Int, tag: String) -> String
+  ".La" + fn_name + "$" + pos.to_string() + "$" + tag
+end
+
+# The def target of a pointer/atomic statement's destination vreg.
+# Register-resident defs compute straight into the segment register;
+# a MEMORY-resident def is computed into a statement scratch and
+# stored to its slot by the arm (never through the generic
+# r12-def-target convention: the exclusive sequences need r12 as a
+# possible status/data scratch, so the arms pick their own final
+# register).
+def thumb_atom_def(alloc: LirAlloc, mdl_pool: Vec[Int], vreg: Int, pos: Int) -> ThumbDefTarget
+  thumb_def_target(alloc, mdl_pool, vreg, pos)
+end
+
+# The width memory access [rn + off] at width 1/2/4 of the pointer
+# statements (is_load with optional sign extension at 1/2). Direct
+# imm12 forms for off <= 4095; beyond that the address is built in a
+# scratch that avoids the data register (movw; add — the 0x4400
+# flagless form) and the access goes through it, mirroring the frame
+# slot-access strategy. `data` is the register the load lands in /
+# the store reads from: the built address never aliases it.
+def thumb_ptr_mem_access(inout te: ThumbEmit, w: Int, sign: Bool, is_load: Bool, data: Int, rn: Int, off: Int) -> Unit
+  if off <= 4095 then
+    if is_load then
+      t2_ldr_wd(&mut te.buf, w, sign, data, rn, off)
+    else
+      t2_str_wd(&mut te.buf, w, data, rn, off)
+    end
+  else
+    let addr = if data == thumb_ip_reg() then thumb_ip2_reg() else thumb_ip_reg() end
+    if off > 0xFFFF then
+      panic("thumb: pointer access offset beyond the 16-bit cortex-m address model (validation must reject it)")
+    end
+    t2_movw(&mut te.buf, addr, (off & 0xFFFF) as u16)
+    t2_add_rr(&mut te.buf, addr, rn)
+    if is_load then
+      t2_ldr_wd(&mut te.buf, w, sign, data, addr, 0)
+    else
+      t2_str_wd(&mut te.buf, w, data, addr, 0)
+    end
+  end
+end
+
+# One marked pointer/atomic statement's emission (see the section
+# header for the per-form translation table). `stmt` is the carrier
+# statement (its nominal kind is NOT emitted — the arms below define
+# every def and use the marker payload declares); `pop` its marker.
+def thumb_emit_ptr_stmt(inout te: ThumbEmit, alloc: LirAlloc, mdl_pool: Vec[Int], fn_name: String, stmt: LirStmt, pop: LirPtrOp, pos: Int) -> Result[Unit, String]
+  let _ = stmt
+  match pop
+  when LirPtrOp::LirPtrLea(dst, off) then
+    # dst = r7 + off — the address of the fixed frame slot (the cm
+    # lowering's LEA payload is the machine byte offset 4*slot).
+    let dt = thumb_atom_def(alloc, mdl_pool, dst, pos)
+    if off <= 4095 then
+      t2_addw(&mut te.buf, dt.reg, thumb_fp_reg(), off)
+    else
+      t2_movw(&mut te.buf, dt.reg, (off & 0xFFFF) as u16)
+      t2_add_rr(&mut te.buf, dt.reg, thumb_fp_reg())
+    end
+    if dt.store_slot >= 0 then
+      thumb_slot_store(te, mdl_pool, dt.reg, dt.store_slot)
+    end
+    Result::Ok(())
+  when LirPtrOp::LirPtrAddr(dst, base, off) then
+    # dst = base + off (an address inside a pointed-to image / a deref
+    # place's byte offset — the a64 route's base+off form; on the
+    # cortex-m slice the offset is 0 for whole-scalar derefs).
+    let dt = thumb_atom_def(alloc, mdl_pool, dst, pos)
+    var excl: Set[Int] = Set::new()
+    let br = thumb_atom_use(te, alloc, mdl_pool, base, pos, thumb_atom_pref(excl), excl)
+    if off == 0 then
+      if dt.reg != br then
+        t2_mov_rr(&mut te.buf, dt.reg, br)
+      end
+    elsif off <= 4095 then
+      t2_addw(&mut te.buf, dt.reg, br, off)
+    else
+      let t = thumb_imm_temp_avoiding(te, off, br)
+      t2_add_w(&mut te.buf, dt.reg, br, t)
+    end
+    if dt.store_slot >= 0 then
+      thumb_slot_store(te, mdl_pool, dt.reg, dt.store_slot)
+    end
+    Result::Ok(())
+  when LirPtrOp::LirPtrLoad(dst, base, off, w, sign) then
+    # dst = load(base + off) at storage width w (sign-extended at 1/2
+    # for the signed pointee kinds).
+    let dt = thumb_atom_def(alloc, mdl_pool, dst, pos)
+    var excl: Set[Int] = Set::new()
+    let br = thumb_atom_use(te, alloc, mdl_pool, base, pos, thumb_atom_pref(excl), excl)
+    thumb_ptr_mem_access(te, w, sign, true, dt.reg, br, off)
+    if dt.store_slot >= 0 then
+      thumb_slot_store(te, mdl_pool, dt.reg, dt.store_slot)
+    end
+    Result::Ok(())
+  when LirPtrOp::LirPtrStore(base, off, src, w) then
+    # store(base + off) = src at storage width w (the value's low w
+    # bytes).
+    var excl: Set[Int] = Set::new()
+    let sv = thumb_atom_use(te, alloc, mdl_pool, src, pos, thumb_atom_pref(excl), excl)
+    let bv = thumb_atom_use(te, alloc, mdl_pool, base, pos, thumb_alt_pref(sv), excl)
+    thumb_ptr_mem_access(te, w, false, false, sv, bv, off)
+    Result::Ok(())
+  when LirPtrOp::LirAtomLoad(form, w, dst, addr) then
+    # dst = load(addr); form 0 = the plain width load, form 1 = the
+    # acquire/SeqCst load (LDR + DMB SY).
+    let dt = thumb_atom_def(alloc, mdl_pool, dst, pos)
+    var excl: Set[Int] = Set::new()
+    let ar = thumb_atom_use(te, alloc, mdl_pool, addr, pos, thumb_alt_pref(dt.reg), excl)
+    thumb_ptr_mem_access(te, w, false, true, dt.reg, ar, 0)
+    if form == 1 then
+      t2_dmb_sy(&mut te.buf)
+    end
+    if dt.store_slot >= 0 then
+      thumb_slot_store(te, mdl_pool, dt.reg, dt.store_slot)
+    end
+    Result::Ok(())
+  when LirPtrOp::LirAtomStore(form, w, addr, val) then
+    # store(addr) = val; form 0 = the plain width store, form 1 = the
+    # release/SeqCst store (DMB SY; STR; DMB SY — clang's ARMv7-M
+    # seq_cst store; the trailing barrier is what a SeqCst store needs
+    # beyond Release, and the form serves both).
+    var excl: Set[Int] = Set::new()
+    let sv = thumb_atom_use(te, alloc, mdl_pool, val, pos, thumb_atom_pref(excl), excl)
+    let ar = thumb_atom_use(te, alloc, mdl_pool, addr, pos, thumb_alt_pref(sv), excl)
+    if form == 1 then
+      t2_dmb_sy(&mut te.buf)
+    end
+    thumb_ptr_mem_access(te, w, false, false, sv, ar, 0)
+    if form == 1 then
+      t2_dmb_sy(&mut te.buf)
+    end
+    Result::Ok(())
+  when LirPtrOp::LirAtomRmw(family, form, w, dst, addr, val) then
+    thumb_emit_atom_rmw(te, alloc, mdl_pool, fn_name, family, form, w, dst, addr, val, pos)
+  when LirPtrOp::LirAtomCas(form, w, dst, exp, des, addr) then
+    thumb_emit_atom_cas(te, alloc, mdl_pool, fn_name, form, w, dst, exp, des, addr, pos)
+  when LirPtrOp::LirPtrFence(_) then
+    # The per-ordering fence: both the acquire (0) and the
+    # release/SeqCst (1) forms are the full DMB SY (see the section
+    # header — ARMv7-M has no domain split to serve the a64 ISHLD/ISH
+    # distinction).
+    t2_dmb_sy(&mut te.buf)
+    Result::Ok(())
+  end
+end
+
+# One LirAtomRmw arm: the LDREX/STREX loop of the RMW/exchange family
+# (0 = add — fetch_sub's negation already lowered; 1 = and — the
+# fetch_and complement already lowered; 2 = or; 3 = xor; 4 = exchange)
+# at the ordering form's barrier placement. dst receives the OLD
+# [addr] word (zero-extended at the width by the exclusive load, like
+# the a64 LSE forms). When dst IS the value operand (MIR storage
+# reuse), the value is copied into a pin first — the loop's data
+# register would otherwise clobber it on the first LDREX.
+def thumb_emit_atom_rmw(inout te: ThumbEmit, alloc: LirAlloc, mdl_pool: Vec[Int], fn_name: String, family: Int, form: Int, w: Int, dst: Int, addr: Int, val: Int, pos: Int) -> Result[Unit, String]
+  if form == 2 || form == 3 then
+    t2_dmb_sy(&mut te.buf)
+  end
+  var excl: Set[Int] = Set::new()
+  # The STREX status register (S) is reserved FIRST from the low
+  # scratches (r0..r3 — the status test then needs no temp; see
+  # thumb_pick_atom_status).
+  let sr = match thumb_pick_atom_status(excl)
+  when Option::Some(pp) then pp
+  when Option::None then
+    return Result::Err("thumb: " + fn_name + ": atomic RMW at position " + pos.to_string() + " has no low status register (internal planning failure — fail-closed)")
+  end
+  excl.insert(sr)
+  # The address pin (A).
+  let ar = thumb_atom_use(te, alloc, mdl_pool, addr, pos, thumb_atom_pref(excl), excl)
+  # The value pin (V): the exchange (family 4) data register at the
+  # STREX or the ALU operand of the other families.
+  var vr = 0
+  if dst == val then
+    # Storage reuse: copy the value into a pin before any def write.
+    let r = thumb_atom_use(te, alloc, mdl_pool, val, pos, thumb_atom_pref(excl), excl)
+    let p = match thumb_pick_atom_scratch(excl)
+    when Option::Some(pp) then pp
+    when Option::None then
+      return Result::Err("thumb: " + fn_name + ": atomic RMW at position " + pos.to_string() + " exhausted the statement-scratch pool (internal planning failure — fail-closed)")
+    end
+    t2_mov_rr(&mut te.buf, p, r)
+    excl.insert(p)
+    vr = p
+  else
+    vr = thumb_atom_use(te, alloc, mdl_pool, val, pos, thumb_atom_pref(excl), excl)
+  end
+  # The loop data register (D): the def segment register when the
+  # destination is register-resident, else a statement scratch that
+  # holds the OLD value at the loop end (the arm stores it to the
+  # def slot below).
+  let dt = thumb_atom_def(alloc, mdl_pool, dst, pos)
+  var dr = dt.reg
+  if dt.store_slot >= 0 then
+    let p = match thumb_pick_atom_scratch(excl)
+    when Option::Some(pp) then pp
+    when Option::None then
+      return Result::Err("thumb: " + fn_name + ": atomic RMW at position " + pos.to_string() + " exhausted the statement-scratch pool (internal planning failure — fail-closed)")
+    end
+    excl.insert(p)
+    dr = p
+  else
+    thumb_atom_reserve(excl, dr)
+  end
+  # The exclusive loop. Family 1 (the LDCLR mirror of fetch_and) has
+  # its AND-operand COMPLEMENTED in the value pin before the loop: the
+  # prepped val_p is ~v (the lowering's BitNot — see
+  # lir_atomic_rmw_prep) and the memory op must AND with its
+  # complement (old & ~~v == old & v). The pin is the prepped vreg's
+  # only reader (a fresh lowering temp; dead after this statement), so
+  # the in-place MVN is safe. The other families use the pin as-is.
+  let lbl = thumb_atom_label(fn_name, pos, "rmw")
+  if family == 1 then
+    t2_mvn_w(&mut te.buf, vr, vr)
+  end
+  def_label(&mut te.buf, lbl)
+  t2_ldrex_wd(&mut te.buf, w, dr, ar)
+  match family
+  when 0 then t2_add_w(&mut te.buf, dr, dr, vr)
+  when 1 then t2_and_w(&mut te.buf, dr, dr, vr)
+  when 2 then t2_orr_w(&mut te.buf, dr, dr, vr)
+  when 3 then t2_eor_w(&mut te.buf, dr, dr, vr)
+  when 4 then ()   # exchange: the STREX writes the value pin directly
+  when _ then return Result::Err("thumb: " + fn_name + ": atomic RMW family " + family.to_string() + " does not lower (fail-closed)")
+  end
+  if family == 4 then
+    t2_strex_wd(&mut te.buf, w, sr, vr, ar)
+  else
+    t2_strex_wd(&mut te.buf, w, sr, dr, ar)
+  end
+  t2_cmp_imm8(&mut te.buf, sr, 0)
+  thumb_emit_b_cond(te, thumb_cc(LirCond::LirNe), lbl)
+  if form == 1 || form == 3 then
+    t2_dmb_sy(&mut te.buf)
+  end
+  if dt.store_slot >= 0 then
+    thumb_slot_store(te, mdl_pool, dr, dt.store_slot)
+  end
+  Result::Ok(())
+end
+
+# One LirAtomCas arm: the LDREX/STREX compare-exchange loop. The
+# expected word (exp — the zero-extended word the CAS lowering loaded
+# from the expected slot) is compared per iteration; on mismatch the
+# loop exits through CLREX (the armed monitor is cleared — clang's
+# ARMv7-M CAS shape) with dst holding the current [addr] word; on
+# success the STREX grants and dst holds the expected word. The
+# post-loop DMB of the acquire/SeqCst forms sits on the COMMON exit,
+# so a failed CAS reads with the success order's strength (the a64
+# CASA/CASAL mirror; the failure order is covered by the checker's
+# failure <= success rule).
+def thumb_emit_atom_cas(inout te: ThumbEmit, alloc: LirAlloc, mdl_pool: Vec[Int], fn_name: String, form: Int, w: Int, dst: Int, exp: Int, des: Int, addr: Int, pos: Int) -> Result[Unit, String]
+  if form == 2 || form == 3 then
+    t2_dmb_sy(&mut te.buf)
+  end
+  var excl: Set[Int] = Set::new()
+  # The STREX status register (S) is reserved FIRST from the low
+  # scratches (r0..r3 — the status test then needs no temp; see
+  # thumb_pick_atom_status).
+  let sr = match thumb_pick_atom_status(excl)
+  when Option::Some(pp) then pp
+  when Option::None then
+    return Result::Err("thumb: " + fn_name + ": atomic CAS at position " + pos.to_string() + " has no low status register (internal planning failure — fail-closed)")
+  end
+  excl.insert(sr)
+  # The address pin (A) and the expected pin (E — compared every
+  # iteration).
+  let ar = thumb_atom_use(te, alloc, mdl_pool, addr, pos, thumb_atom_pref(excl), excl)
+  let er = thumb_atom_use(te, alloc, mdl_pool, exp, pos, thumb_atom_pref(excl), excl)
+  # The loop data register (D): the def segment register when the
+  # destination is register-resident, else a statement scratch holding
+  # the current word at the loop end.
+  let dt = thumb_atom_def(alloc, mdl_pool, dst, pos)
+  var dr = dt.reg
+  if dt.store_slot >= 0 then
+    let p = match thumb_pick_atom_scratch(excl)
+    when Option::Some(pp) then pp
+    when Option::None then
+      return Result::Err("thumb: " + fn_name + ": atomic CAS at position " + pos.to_string() + " exhausted the statement-scratch pool (internal planning failure — fail-closed)")
+    end
+    excl.insert(p)
+    dr = p
+  else
+    thumb_atom_reserve(excl, dr)
+  end
+  # The desired pin (T — the STREX data register).
+  let tr = thumb_atom_use(te, alloc, mdl_pool, des, pos, thumb_atom_pref(excl), excl)
+  # The compare-exchange loop: LDREX; compare; mismatch exits through
+  # CLREX to the common tail; STREX failure (the monitor was lost or
+  # another agent wrote) retries the whole read-compare-store cycle.
+  let lp_lbl = thumb_atom_label(fn_name, pos, "caslp")
+  let fail_lbl = thumb_atom_label(fn_name, pos, "casfail")
+  def_label(&mut te.buf, lp_lbl)
+  t2_ldrex_wd(&mut te.buf, w, dr, ar)
+  thumb_emit_cmp_rr(te, dr, er)
+  thumb_emit_b_cond(te, thumb_cc(LirCond::LirNe), fail_lbl)
+  t2_strex_wd(&mut te.buf, w, sr, tr, ar)
+  t2_cmp_imm8(&mut te.buf, sr, 0)
+  thumb_emit_b_cond(te, thumb_cc(LirCond::LirNe), lp_lbl)
+  def_label(&mut te.buf, fail_lbl)
+  t2_clrex(&mut te.buf)
+  if form == 1 || form == 3 then
+    t2_dmb_sy(&mut te.buf)
+  end
+  if dt.store_slot >= 0 then
+    thumb_slot_store(te, mdl_pool, dr, dt.store_slot)
+  end
+  Result::Ok(())
 end
 
 def thumb_emit_term(inout te: ThumbEmit, alloc: LirAlloc, mdl_pool: Vec[Int], fn_name: String, frame_bytes: Int, kind: LirTermKind, pos: Int, externs: Set[String], defined: Set[String]) -> Result[Unit, String]
@@ -2610,9 +3907,68 @@ def thumb_emit_term(inout te: ThumbEmit, alloc: LirAlloc, mdl_pool: Vec[Int], fn
   when LirTermKind::LirRet(rv) then
     match rv
     when Option::Some(vreg) then
-      let sr = thumb_emit_use(te, alloc, mdl_pool, vreg, pos, thumb_ip_reg())
-      if sr != thumb_ret_reg() then
-        t2_mov_rr(&mut te.buf, thumb_ret_reg(), sr)
+      # A float-class return operand — the return local's ordinary FP
+      # vreg (alloc.fp_widths is the class table) — is the float-return
+      # ABI shape of the cm float-ABI slice: the value crosses in the
+      # VFP return register d0 (fixed float vreg 8), its low single s0
+      # for an F32 — exactly the aarch64 route's V0 crossing (lir.tg's
+      # Ret arm). A fixed FP ABI id (8..15) in the operand marks a
+      # foreign lowering: the cortex-m lowering returns float values
+      # through the return local's ORDINARY FP vreg only, and a fixed
+      # id carries no width record — fail closed, never emit through
+      # the general-register load path (whose fixed-vreg resolution
+      # would read the id as a core register).
+      if lir_is_fixed_fp_id(vreg) then
+        return Result::Err("thumb: return of a float value from fixed FP vreg " + vreg.to_string() + " does not lower on the cortex-m route (the cortex-m lowering returns float values through the return local's ordinary FP vreg; a fixed FP id in a Ret marks a foreign lowering — fail-closed)")
+      end
+      match alloc.fp_widths.get(vreg)
+      when Option::Some(w) then
+        # Resolve the value at the terminator position: a register-
+        # resident segment moves its d-register into the return
+        # register at the width (VMOV d0, dd — skipped
+        # when the value already rides d0); a memory-resident segment
+        # (phys < 0, or a post-call reload record at the Ret —
+        # invariant I2) loads its slot at the width straight into
+        # d0/s0 (the return register is dead at the terminator, so the
+        # direct load needs no temp). An F32 slot image is the
+        # canonical single's 4 bytes in the vreg's 4-byte slot — the
+        # single-form load is exact; an F64 slot image is the 8-byte
+        # double in the two-word, 8-byte-aligned home the cm allocator
+        # reserves for F64-class vregs (LirAlloc.slot_words), so the
+        # double-form load into d0 is exact too. An F32 return is
+        # always memory-resident on this route (the cm allocator's
+        # memory-class rule — an F32 in the pool would have no
+        # single-register alias above d15), so the register-resident
+        # F32 form below marks an allocator-invariant violation and
+        # fails closed.
+        match alloc.segs_of.get(vreg)
+        when Option::Some(segs) then
+          match lir_seg_at(segs, pos)
+          when Option::Some(s) then
+            if s.phys >= 0 && !lir_reload_at(alloc.reloads, pos, vreg) then
+              let dd = s.phys - 100
+              match w
+              when LirFpWidth::LirF32 then
+                return Result::Err("thumb: F32 return through an allocated FP-pool register (d16..d29) does not lower on the cortex-m route (no single-register alias above d15); the cm allocator never assigns an F32 a pool register — F32 is memory-class on this route — so a pool-resident F32 return marks an allocator-invariant violation (fail-closed)")
+              when LirFpWidth::LirF64 then
+                if dd != 0 then
+                  t2_vmov_f64(&mut te.buf, 0, dd)
+                end
+              end
+            else
+              thumb_slot_fp_load(te, w, 0, s.slot)
+            end
+          when Option::None then
+            return Result::Err("thumb: return vreg " + vreg.to_string() + " has no segment at position " + pos.to_string() + " (fail-closed)")
+          end
+        when Option::None then
+          return Result::Err("thumb: return vreg " + vreg.to_string() + " has no intervals (fail-closed)")
+        end
+      when Option::None then
+        let sr = thumb_emit_use(te, alloc, mdl_pool, vreg, pos, thumb_ip_reg())
+        if sr != thumb_ret_reg() then
+          t2_mov_rr(&mut te.buf, thumb_ret_reg(), sr)
+        end
       end
     when Option::None then ()
     end
@@ -2623,7 +3979,10 @@ def thumb_emit_term(inout te: ThumbEmit, alloc: LirAlloc, mdl_pool: Vec[Int], fn
     Result::Ok(())
   when LirTermKind::LirCall(target, args, stack_args, dest, success) then
     # Pre-call spill stores (register-resident values crossing the call).
-    thumb_emit_call_spills(te, alloc, mdl_pool, pos)
+    match thumb_emit_call_spills(te, alloc, mdl_pool, pos)
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(_) then ()
+    end
     # AAPCS caller-word cleanup: the LirPushArg statements before this
     # terminator lowered stack_args 4-byte words below SP (descending
     # argument order, even count — the lir_lower_call padding rule
@@ -2641,14 +4000,68 @@ def thumb_emit_term(inout te: ThumbEmit, alloc: LirAlloc, mdl_pool: Vec[Int], fn
       end
     end
     # Result capture: r0 -> dest (a fixed or ordinary vreg def at pos).
+    # A FLOAT-class dest (the destination local's ordinary FP vreg in
+    # alloc.fp_widths) is the float-return-call ABI shape: the callee
+    # crossed its value in the VFP return register d0 (fixed float
+    # vreg 8; s0 for an F32), and this arm captures it at the width —
+    # mirroring lir.tg's aarch64 V0 capture — before the
+    # general-register def-target machinery can touch the FP namespace.
     match dest
     when Option::Some(dv) then
-      let dt = thumb_def_target(alloc, mdl_pool, dv, pos)
-      if dt.reg != thumb_ret_reg() then
-        t2_mov_rr(&mut te.buf, dt.reg, thumb_ret_reg())
+      # A fixed FP ABI id (8..15) destination marks a foreign lowering:
+      # the cortex-m lowering captures float call results into the
+      # destination local's ORDINARY FP vreg only, and a fixed id
+      # carries no width record — fail closed.
+      if lir_is_fixed_fp_id(dv) then
+        return Result::Err("thumb: call to `" + target + "` returns a float into fixed FP vreg " + dv.to_string() + ", which does not lower on the cortex-m route (the cortex-m lowering captures float call results into the destination local's ordinary FP vreg; a fixed FP id destination marks a foreign lowering — fail-closed)")
       end
-      if dt.store_slot >= 0 then
-        thumb_slot_store(te, mdl_pool, dt.reg, dt.store_slot)
+      match alloc.fp_widths.get(dv)
+      when Option::Some(w) then
+        # The destination vreg defs at the call position (pos). A
+        # register-resident def moves d0 into its d-register at the
+        # width (VMOV — skipped when the destination IS d0, the
+        # register the callee returned in); a memory-resident def
+        # (phys < 0) stores the return register's image to its slot at
+        # the width — the single-form VSTR lays the exact 4-byte image
+        # of an F32, the double-form VSTR the exact 8-byte image of an
+        # F64 (in the two-word, 8-byte-aligned home the cm allocator
+        # reserves for F64-class vregs — LirAlloc.slot_words). An F32
+        # destination is always memory-resident on this route (the cm
+        # allocator's memory-class rule — an F32 in the pool would
+        # have no single-register alias above d15), so the
+        # register-resident F32 form below marks an allocator-invariant
+        # violation and fails closed.
+        match alloc.segs_of.get(dv)
+        when Option::Some(segs) then
+          match lir_seg_at(segs, pos)
+          when Option::Some(s) then
+            if s.phys >= 0 then
+              let dd = s.phys - 100
+              match w
+              when LirFpWidth::LirF32 then
+                return Result::Err("thumb: call to `" + target + "` returns an F32 into an allocated FP-pool register (d16..d29), which does not lower on the cortex-m route (no single-register alias above d15); the cm allocator never assigns an F32 a pool register — F32 is memory-class on this route — so a pool-resident F32 result marks an allocator-invariant violation (fail-closed)")
+              when LirFpWidth::LirF64 then
+                if dd != 0 then
+                  t2_vmov_f64(&mut te.buf, dd, 0)
+                end
+              end
+            else
+              thumb_slot_fp_store(te, w, 0, s.slot)
+            end
+          when Option::None then
+            return Result::Err("thumb: call result destination vreg " + dv.to_string() + " has no segment at position " + pos.to_string() + " (fail-closed)")
+          end
+        when Option::None then
+          return Result::Err("thumb: call result destination vreg " + dv.to_string() + " has no intervals (fail-closed)")
+        end
+      when Option::None then
+        let dt = thumb_def_target(alloc, mdl_pool, dv, pos)
+        if dt.reg != thumb_ret_reg() then
+          t2_mov_rr(&mut te.buf, dt.reg, thumb_ret_reg())
+        end
+        if dt.store_slot >= 0 then
+          thumb_slot_store(te, mdl_pool, dt.reg, dt.store_slot)
+        end
       end
     when Option::None then ()
     end
@@ -2709,7 +4122,7 @@ def thumb_emit_fn(inout te: ThumbEmit, mdl_pool: Vec[Int], f: LirFunction, alloc
     def_label(&mut te.buf, lir_block_label(f.name.clone(), b.id))
     var si = 0
     while si < b.stmts.len() do
-      match thumb_emit_stmt(te, alloc, mdl_pool, frame_bytes, b.stmts[si].kind, pos)
+      match thumb_emit_stmt(te, alloc, mdl_pool, frame_bytes, f.name.clone(), b.stmts[si].clone(), pos)
       when Result::Err(e) then return Result::Err(e)
       when Result::Ok(_) then ()
       end
@@ -3461,7 +4874,12 @@ def thumb_compile_object(program: MirProgram) -> Result[Vec[u8], String]
       # entry (lower_mir_fn_to_lir_cm): params/args 0..3 ride r0..r3,
       # every index >= 4 crosses on the caller's stack in 4-byte words,
       # and the word-only accept set keeps div/mod, sized widths and
-      # aggregates fail-closed exactly as before. The whole-program
+      # aggregates fail-closed exactly as before. Allocation runs the
+      # cm entry (lir_alloc_registers_cm — the caller-saved-only
+      # contract with width-aware 4-byte-word spill slots: an F64
+      # vreg's image gets a two-word, 8-byte-aligned home, so the
+      # float slice's 8-byte images are geometrically sound). The
+      # whole-program
       # static label table rides along, so MirStaticRef reads lower to
       # LirStaticLoad against the .data symbols emitted above.
       let lir_fn = match lower_mir_fn_to_lir_cm(f, static_labels)
@@ -3473,7 +4891,7 @@ def thumb_compile_object(program: MirProgram) -> Result[Vec[u8], String]
       when Result::Ok(_) then ()
       end
       let peeped = lir_peephole(lir_fn)
-      let alloc = lir_alloc_registers(peeped)
+      let alloc = lir_alloc_registers_cm(peeped)
       match thumb_emit_fn(&mut te, mdl_pool, peeped, alloc, externs, defined)
       when Result::Err(e) then return Result::Err(e)
       when Result::Ok(_) then ()
@@ -3515,7 +4933,7 @@ def thumb_compile_object(program: MirProgram) -> Result[Vec[u8], String]
         when Result::Ok(_) then ()
         end
         let peeped = lir_peephole(lir_fn)
-        let alloc = lir_alloc_registers(peeped)
+        let alloc = lir_alloc_registers_cm(peeped)
         match thumb_emit_fn(&mut te, mdl_pool, peeped, alloc, externs, defined)
         when Result::Err(e) then return Result::Err(e)
         when Result::Ok(_) then ()
