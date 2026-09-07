@@ -142,6 +142,7 @@ end
 
 enum Section
   Text
+  ColdText  # @cold code: the .text.cold region of the emitted object
   Data
   Rodata
   Bss
@@ -1112,6 +1113,14 @@ def a64_mul_rrr(inout b: CodeBuffer, d: A64, n: A64, m: A64) -> Unit
   emit32_le(b, 0x9B007C00 | (a64_code(m) << 16) | (a64_code(n) << 5) | a64_code(d))
 end
 
+# MADD Xd, Xm, Xa, Xn (multiply-add: d = n + m*a) — the fused form of
+# MUL + ADD. Operand roles mirror a64_msub's below (m and a multiply, n
+# is the addend); MSUB is this instruction with the accumulate bit set
+# (0x9B008000). Field layout: Rm = a << 16, Ra = n << 10, Rn = m << 5.
+def a64_madd(inout b: CodeBuffer, d: A64, m: A64, a: A64, n: A64) -> Unit
+  emit32_le(b, 0x9B000000 | (a64_code(a) << 16) | (a64_code(n) << 10) | (a64_code(m) << 5) | a64_code(d))
+end
+
 # SDIV Xd, Xn, Xm
 def a64_sdiv_rrr(inout b: CodeBuffer, d: A64, n: A64, m: A64) -> Unit
   emit32_le(b, 0x9AC00C00 | (a64_code(m) << 16) | (a64_code(n) << 5) | a64_code(d))
@@ -1333,7 +1342,8 @@ def a64_nop(inout b: CodeBuffer) -> Unit
 end
 
 # ———————————————————————————————————————————————————————————————
-# ARM64 atomic intrinsics (ARMv8.1 LSE — supported on Apple Silicon)
+# ARM64 atomic intrinsics (ARMv8.1 LSE — supported on Apple Silicon —
+# plus the ARMv8.0 exclusive-access LDXR/STXR primitives)
 # ———————————————————————————————————————————————————————————————
 
 # DMB ISH  (data memory barrier, inner shareable — full barrier)
@@ -1384,6 +1394,211 @@ end
 # LDADDAL Xs, Xt, [Xn]  64-bit atomic add, acquire-release
 def a64_ldaddal_x(inout b: CodeBuffer, s: A64, t: A64, n: A64) -> Unit
   emit32_le(b, 0xF8E00000 | (a64_code(s) << 16) | (a64_code(n) << 5) | a64_code(t))
+end
+
+# LSE read-modify-write families: LDADD, LDCLR, LDEOR, LDSET, SWP
+# ----------------------------------------------------------------------
+# Shared word layout for the five families below, hand-verified: every
+# acquire-release base below reproduces the pre-existing verified encoders
+# a64_ldaddal_w/x (0xB8E00000/0xF8E00000) and codegen.tg's a64_ldaddal_enc
+# /a64_ldclral_enc/a64_ldeoral_enc/a64_ldsetal_enc/a64_swpal_enc tables
+# (e.g. LDCLRAL byte = 0x38E01000 = 0x38201000 | 0x800000 | 0x400000).
+#   [31:30] size field: 00 = byte, 01 = half, 10 = word, 11 = double (X)
+#   [23]    A (acquire), 0x800000      [22] L (release), 0x400000
+#   [21]    fixed 1                     [20] fixed 0
+#   [15:12] op code: LDADD 0x0, LDCLR 0x1, LDEOR 0x2, LDSET 0x3, SWP 0x8
+#   Rs << 16 (value operand), Rn << 5 (address), Rt (receives old [Rn])
+# Layout audit note: the op code is the nibble at [15:12], NOT bits
+# [21:22] — bits [22:21] of the base words are 0/1 fixed across the whole
+# family (only A/L ever change bit 22), and a 2-bit field could not hold
+# SWP = 4 anyway. The four orderings below are the A/L combinations.
+# Rs/Rt/Rn must not alias (CONSTRAINED UNPREDICTABLE per the ARM ARM).
+# `size` defaults to 3, i.e. the 64-bit (X) form; pass 0/1/2 for the
+# byte/half/word forms.
+
+# LDADD — relaxed atomic add: [Rn] += Rs; Rt = old [Rn]. Base 0x38200000.
+def a64_ldadd(inout b: CodeBuffer, s: A64, t: A64, n: A64, size: u32 = 3) -> Unit
+  emit32_le(b, 0x38200000 | (size << 30) | (a64_code(s) << 16) | (a64_code(n) << 5) | a64_code(t))
+end
+
+# LDADDA — acquire atomic add: base 0x38A00000 = 0x38200000 | A (bit 23).
+def a64_ldadda(inout b: CodeBuffer, s: A64, t: A64, n: A64, size: u32 = 3) -> Unit
+  emit32_le(b, 0x38A00000 | (size << 30) | (a64_code(s) << 16) | (a64_code(n) << 5) | a64_code(t))
+end
+
+# LDADDL — release atomic add: base 0x38600000 = 0x38200000 | L (bit 22).
+def a64_ldaddl(inout b: CodeBuffer, s: A64, t: A64, n: A64, size: u32 = 3) -> Unit
+  emit32_le(b, 0x38600000 | (size << 30) | (a64_code(s) << 16) | (a64_code(n) << 5) | a64_code(t))
+end
+
+# LDADDAL — acquire-release atomic add: base 0x38E00000 = 0x38200000 |
+# A | L. Word-for-word identical to a64_ldaddal_w at size 2 and
+# a64_ldaddal_x at size 3 (those pre-existing fixed-size defs are kept
+# for the codegen call sites).
+def a64_ldaddal(inout b: CodeBuffer, s: A64, t: A64, n: A64, size: u32 = 3) -> Unit
+  emit32_le(b, 0x38E00000 | (size << 30) | (a64_code(s) << 16) | (a64_code(n) << 5) | a64_code(t))
+end
+
+# LDCLR family — atomic bit-clear: [Rn] &= ~Rs; Rt = old [Rn]. Op code
+# 0x1 at [15:12]; bases below for plain/A/L/AL: 0x38201000 | (A?0x800000)
+# | (L?0x400000) → 0x38201000 / 0x38A01000 / 0x38601000 / 0x38E01000.
+def a64_ldclr(inout b: CodeBuffer, s: A64, t: A64, n: A64, size: u32 = 3) -> Unit
+  emit32_le(b, 0x38201000 | (size << 30) | (a64_code(s) << 16) | (a64_code(n) << 5) | a64_code(t))
+end
+
+# LDCLRA — acquire bit-clear.
+def a64_ldclra(inout b: CodeBuffer, s: A64, t: A64, n: A64, size: u32 = 3) -> Unit
+  emit32_le(b, 0x38A01000 | (size << 30) | (a64_code(s) << 16) | (a64_code(n) << 5) | a64_code(t))
+end
+
+# LDCLRL — release bit-clear.
+def a64_ldclrl(inout b: CodeBuffer, s: A64, t: A64, n: A64, size: u32 = 3) -> Unit
+  emit32_le(b, 0x38601000 | (size << 30) | (a64_code(s) << 16) | (a64_code(n) << 5) | a64_code(t))
+end
+
+# LDCLRAL — acquire-release bit-clear (matches a64_ldclral_enc tables).
+def a64_ldclral(inout b: CodeBuffer, s: A64, t: A64, n: A64, size: u32 = 3) -> Unit
+  emit32_le(b, 0x38E01000 | (size << 30) | (a64_code(s) << 16) | (a64_code(n) << 5) | a64_code(t))
+end
+
+# LDEOR family — atomic bitwise-xor: [Rn] ^= Rs; Rt = old [Rn]. Op code
+# 0x2 at [15:12]; bases: 0x38202000 / 0x38A02000 / 0x38602000 / 0x38E02000.
+def a64_ldeor(inout b: CodeBuffer, s: A64, t: A64, n: A64, size: u32 = 3) -> Unit
+  emit32_le(b, 0x38202000 | (size << 30) | (a64_code(s) << 16) | (a64_code(n) << 5) | a64_code(t))
+end
+
+# LDEORA — acquire bitwise-xor.
+def a64_ldeora(inout b: CodeBuffer, s: A64, t: A64, n: A64, size: u32 = 3) -> Unit
+  emit32_le(b, 0x38A02000 | (size << 30) | (a64_code(s) << 16) | (a64_code(n) << 5) | a64_code(t))
+end
+
+# LDEORL — release bitwise-xor.
+def a64_ldeorl(inout b: CodeBuffer, s: A64, t: A64, n: A64, size: u32 = 3) -> Unit
+  emit32_le(b, 0x38602000 | (size << 30) | (a64_code(s) << 16) | (a64_code(n) << 5) | a64_code(t))
+end
+
+# LDEORAL — acquire-release bitwise-xor (matches a64_ldeoral_enc tables).
+def a64_ldeoral(inout b: CodeBuffer, s: A64, t: A64, n: A64, size: u32 = 3) -> Unit
+  emit32_le(b, 0x38E02000 | (size << 30) | (a64_code(s) << 16) | (a64_code(n) << 5) | a64_code(t))
+end
+
+# LDSET family — atomic bit-set: [Rn] |= Rs; Rt = old [Rn]. Op code 0x3
+# at [15:12]; bases: 0x38203000 / 0x38A03000 / 0x38603000 / 0x38E03000.
+def a64_ldset(inout b: CodeBuffer, s: A64, t: A64, n: A64, size: u32 = 3) -> Unit
+  emit32_le(b, 0x38203000 | (size << 30) | (a64_code(s) << 16) | (a64_code(n) << 5) | a64_code(t))
+end
+
+# LDSETA — acquire bit-set.
+def a64_ldseta(inout b: CodeBuffer, s: A64, t: A64, n: A64, size: u32 = 3) -> Unit
+  emit32_le(b, 0x38A03000 | (size << 30) | (a64_code(s) << 16) | (a64_code(n) << 5) | a64_code(t))
+end
+
+# LDSETL — release bit-set.
+def a64_ldsetl(inout b: CodeBuffer, s: A64, t: A64, n: A64, size: u32 = 3) -> Unit
+  emit32_le(b, 0x38603000 | (size << 30) | (a64_code(s) << 16) | (a64_code(n) << 5) | a64_code(t))
+end
+
+# LDSETAL — acquire-release bit-set (matches a64_ldsetal_enc tables).
+def a64_ldsetal(inout b: CodeBuffer, s: A64, t: A64, n: A64, size: u32 = 3) -> Unit
+  emit32_le(b, 0x38E03000 | (size << 30) | (a64_code(s) << 16) | (a64_code(n) << 5) | a64_code(t))
+end
+
+# SWP family — atomic swap: [Rn] = Rs; Rt = old [Rn]. Op code 0x8 at
+# [15:12]. NOTE: bit 15 is SET by the SWP opcode itself in the base word
+# 0x38208000 — it is NOT the acquire bit (acquire stays at bit 23,
+# A = 0x800000, in this family). Bases: 0x38208000 / 0x38A08000 /
+# 0x38608000 / 0x38E08000.
+def a64_swp(inout b: CodeBuffer, s: A64, t: A64, n: A64, size: u32 = 3) -> Unit
+  emit32_le(b, 0x38208000 | (size << 30) | (a64_code(s) << 16) | (a64_code(n) << 5) | a64_code(t))
+end
+
+# SWPA — acquire swap.
+def a64_swpa(inout b: CodeBuffer, s: A64, t: A64, n: A64, size: u32 = 3) -> Unit
+  emit32_le(b, 0x38A08000 | (size << 30) | (a64_code(s) << 16) | (a64_code(n) << 5) | a64_code(t))
+end
+
+# SWPL — release swap.
+def a64_swpl(inout b: CodeBuffer, s: A64, t: A64, n: A64, size: u32 = 3) -> Unit
+  emit32_le(b, 0x38608000 | (size << 30) | (a64_code(s) << 16) | (a64_code(n) << 5) | a64_code(t))
+end
+
+# SWPAL — acquire-release swap (matches a64_swpal_enc tables).
+def a64_swpal(inout b: CodeBuffer, s: A64, t: A64, n: A64, size: u32 = 3) -> Unit
+  emit32_le(b, 0x38E08000 | (size << 30) | (a64_code(s) << 16) | (a64_code(n) << 5) | a64_code(t))
+end
+
+# LSE compare-and-swap: CAS, CASA, CASL, CASAL
+# ----------------------------------------------------------------------
+# Word layout (hand-verified against the ARM ARM pattern): base 0x08A07C00,
+# size at [31:30] (00 byte, 01 half, 10 word, 11 double), A (acquire) =
+# bit 15 = 0x8000, L (release) = bit 22 = 0x400000, bits [14:10] fixed
+# 11111. Register roles: Rs = expected value << 16, Rn = address << 5,
+# Rt = new value (low 5 bits). There is NO Rt2 field in the single-
+# register CAS (Rt2 is CASP's pair form): the ARM ARM returns the actual
+# memory value through the expected register Rs itself, so the mnemonic is
+# CAS Xs, Xt, [Xn]: if [Rn] == Xs then [Rn] = Xt; Xs is overwritten with
+# the original [Rn] either way. The acquire bit is 0x8000, NOT 0x800000:
+# bit 23 is already a fixed 1 in this class's base 0x08A07C00. Check:
+# CASAL = 0x08A07C00 | 0x400000 | 0x8000 | size<<30 reproduces the
+# pre-existing a64_casalb/_w/_x (0x08E0FC00 / 0x88E0FC00 / 0xC8E0FC00).
+# `size` defaults to 3 (the X form).
+
+# CAS — relaxed compare-and-swap. Base 0x08A07C00.
+def a64_cas(inout b: CodeBuffer, s: A64, t: A64, n: A64, size: u32 = 3) -> Unit
+  emit32_le(b, 0x08A07C00 | (size << 30) | (a64_code(s) << 16) | (a64_code(n) << 5) | a64_code(t))
+end
+
+# CASA — acquire compare-and-swap: base 0x08A0FC00 = 0x08A07C00 | A
+# (bit 15, 0x8000).
+def a64_casa(inout b: CodeBuffer, s: A64, t: A64, n: A64, size: u32 = 3) -> Unit
+  emit32_le(b, 0x08A0FC00 | (size << 30) | (a64_code(s) << 16) | (a64_code(n) << 5) | a64_code(t))
+end
+
+# CASL — release compare-and-swap: base 0x08E07C00 = 0x08A07C00 | L
+# (bit 22, 0x400000).
+def a64_casl(inout b: CodeBuffer, s: A64, t: A64, n: A64, size: u32 = 3) -> Unit
+  emit32_le(b, 0x08E07C00 | (size << 30) | (a64_code(s) << 16) | (a64_code(n) << 5) | a64_code(t))
+end
+
+# CASAL — acquire-release compare-and-swap: base 0x08E0FC00 = 0x08A07C00 |
+# A | L. Word-for-word identical to a64_casalb at size 0, a64_casal_w at
+# size 2 and a64_casal_x at size 3 (kept for the codegen call sites).
+def a64_casal(inout b: CodeBuffer, s: A64, t: A64, n: A64, size: u32 = 3) -> Unit
+  emit32_le(b, 0x08E0FC00 | (size << 30) | (a64_code(s) << 16) | (a64_code(n) << 5) | a64_code(t))
+end
+
+# Exclusive accesses (ARMv8.0 LL/SC primitives): LDXR, LDAXR, STXR, STLXR
+# ----------------------------------------------------------------------
+# Word layout (hand-verified): LDXR base 0x085F7C00, STXR base 0x08007C00,
+# size at [31:30] (00 byte, 01 half, 10 word, 11 double — e.g. LDXRB =
+# 0x085F7C00 has size bits 00), bits [14:10] fixed 11111, and the acquire
+# bit is bit 15 (0x8000): LDAXR = LDXR | 0x8000 → 0x085FFC00 (the exact
+# word the runtime LL/SC fallback hardcodes for LDXARB at runtime.tg),
+# STLXR = STXR | 0x8000 → 0x0800FC00. Register roles: LDXR Rt, [Rn] →
+# Rn << 5, Rt = loaded value; STXR Ws, Xt, [Rn] → Ws (status) << 16
+# (0 = success, 1 = failure), Rn << 5, Rt = data to store. `size` defaults
+# to 3 (the X form).
+
+# LDXR Rt, [Rn] — load-exclusive.
+def a64_ldxr(inout b: CodeBuffer, t: A64, n: A64, size: u32 = 3) -> Unit
+  emit32_le(b, 0x085F7C00 | (size << 30) | (a64_code(n) << 5) | a64_code(t))
+end
+
+# LDAXR Rt, [Rn] — load-acquire-exclusive: base 0x085FFC00 = 0x085F7C00 |
+# A (bit 15, 0x8000).
+def a64_ldaxr(inout b: CodeBuffer, t: A64, n: A64, size: u32 = 3) -> Unit
+  emit32_le(b, 0x085FFC00 | (size << 30) | (a64_code(n) << 5) | a64_code(t))
+end
+
+# STXR Ws, Xt, [Rn] — store-exclusive: Ws (status) << 16, Xt << 0.
+def a64_stxr(inout b: CodeBuffer, s: A64, t: A64, n: A64, size: u32 = 3) -> Unit
+  emit32_le(b, 0x08007C00 | (size << 30) | (a64_code(s) << 16) | (a64_code(n) << 5) | a64_code(t))
+end
+
+# STLXR Ws, Xt, [Rn] — store-release-exclusive: base 0x0800FC00 =
+# 0x08007C00 | A (bit 15, 0x8000).
+def a64_stlxr(inout b: CodeBuffer, s: A64, t: A64, n: A64, size: u32 = 3) -> Unit
+  emit32_le(b, 0x0800FC00 | (size << 30) | (a64_code(s) << 16) | (a64_code(n) << 5) | a64_code(t))
 end
 
 # CMP Wn, Wm   (SUBS WZR, Wn, Wm)
@@ -1625,6 +1840,116 @@ end
 # FSQRT Dd, Dn  (double square root)
 def a64_fsqrt_dd(inout b: CodeBuffer, d: A64V, n: A64V) -> Unit
   emit32_le(b, 0x1E61C000 | (a64v_code(n) << 5) | a64v_code(d))
+end
+
+# The S-form (32-bit single-precision) scalar floating-point encoders.
+# AArch64 SIMD&FP encodings: an S register is the low 32 bits of a V
+# register; the S-form instructions below read/write exactly that half,
+# leaving the upper bits of the V register untouched (a loaded S value
+# zeroes them — ldr s; the S-form arithmetic/compare/move results write
+# the low half only). The S/D forms differ ONLY in the size bit (bit 22)
+# and the opcode field; the D-form encoders above are the size=1 twins.
+#
+# Value semantics follow the P1-6 STRICT spec (types.tg): S-form ops
+# round exactly once to single precision under the default FPCR
+# (round-to-nearest-even); they never flush subnormals and never touch
+# FPCR, so the strict/fast function modes share the identical stream
+# until fp_fast-gated paths land (see codegen.tg's float-emission
+# notes).
+
+# FMOV Sd, Sn  (copy FP register to FP register, single precision)
+def a64_fmov_ss(inout b: CodeBuffer, d: A64V, n: A64V) -> Unit
+  emit32_le(b, 0x1E204000 | (a64v_code(n) << 5) | a64v_code(d))
+end
+
+# FADD Sd, Sn, Sm  (single-precision add)
+def a64_fadd_sss(inout b: CodeBuffer, d: A64V, n: A64V, m: A64V) -> Unit
+  emit32_le(b, 0x1E202800 | (a64v_code(m) << 16) | (a64v_code(n) << 5) | a64v_code(d))
+end
+
+# FSUB Sd, Sn, Sm  (single-precision subtract)
+def a64_fsub_sss(inout b: CodeBuffer, d: A64V, n: A64V, m: A64V) -> Unit
+  emit32_le(b, 0x1E203800 | (a64v_code(m) << 16) | (a64v_code(n) << 5) | a64v_code(d))
+end
+
+# FMUL Sd, Sn, Sm  (single-precision multiply)
+def a64_fmul_sss(inout b: CodeBuffer, d: A64V, n: A64V, m: A64V) -> Unit
+  emit32_le(b, 0x1E200800 | (a64v_code(m) << 16) | (a64v_code(n) << 5) | a64v_code(d))
+end
+
+# FDIV Sd, Sn, Sm  (single-precision divide)
+def a64_fdiv_sss(inout b: CodeBuffer, d: A64V, n: A64V, m: A64V) -> Unit
+  emit32_le(b, 0x1E201800 | (a64v_code(m) << 16) | (a64v_code(n) << 5) | a64v_code(d))
+end
+
+# FNEG Sd, Sn  (single-precision negate)
+def a64_fneg_ss(inout b: CodeBuffer, d: A64V, n: A64V) -> Unit
+  emit32_le(b, 0x1E214000 | (a64v_code(n) << 5) | a64v_code(d))
+end
+
+# FCMP Sn, Sm  (compare two singles, sets NZCV — the S-form twin of
+# a64_fcmp_dd). The condition-code semantics are identical to FCMP D:
+# EQ/NE/MI/LS/GT/GE give the ordered IEEE result (NaN compares set no
+# condition except NE).
+def a64_fcmp_ss(inout b: CodeBuffer, n: A64V, m: A64V) -> Unit
+  emit32_le(b, 0x1E202000 | (a64v_code(m) << 16) | (a64v_code(n) << 5))
+end
+
+# LDR St, [Xn, #imm12*4]  (load 32-bit FP from memory, scaled)
+def a64_ldr_s(inout b: CodeBuffer, d: A64V, base: A64, offset: u32) -> Unit
+  let imm12 = (offset / 4) & 0xFFF
+  emit32_le(b, 0xBD400000 | (imm12 << 10) | (a64_code(base) << 5) | a64v_code(d))
+end
+
+# STR St, [Xn, #imm12*4]  (store 32-bit FP to memory, scaled)
+def a64_str_s(inout b: CodeBuffer, src: A64V, base: A64, offset: u32) -> Unit
+  let imm12 = (offset / 4) & 0xFFF
+  emit32_le(b, 0xBD000000 | (imm12 << 10) | (a64_code(base) << 5) | a64v_code(src))
+end
+
+# LDUR St, [Xn, #simm9]  (unscaled offset load FP, single)
+def a64_ldur_s(inout b: CodeBuffer, d: A64V, base: A64, offset: i32) -> Unit
+  let imm9 = (offset & 0x1FF) as u32
+  emit32_le(b, 0xBC400000 | (imm9 << 12) | (a64_code(base) << 5) | a64v_code(d))
+end
+
+# STUR St, [Xn, #simm9]  (unscaled offset store FP, single)
+def a64_stur_s(inout b: CodeBuffer, src: A64V, base: A64, offset: i32) -> Unit
+  let imm9 = (offset & 0x1FF) as u32
+  emit32_le(b, 0xBC000000 | (imm9 << 12) | (a64_code(base) << 5) | a64v_code(src))
+end
+
+# FCVT Dd, Sn  (single to double — exact widening)
+def a64_fcvt_ds(inout b: CodeBuffer, d: A64V, n: A64V) -> Unit
+  emit32_le(b, 0x1E22C000 | (a64v_code(n) << 5) | a64v_code(d))
+end
+
+# FCVT Sd, Dn  (double to single — rounds once under the default FPCR,
+# round-to-nearest-even)
+def a64_fcvt_sd(inout b: CodeBuffer, d: A64V, n: A64V) -> Unit
+  emit32_le(b, 0x1E624000 | (a64v_code(n) << 5) | a64v_code(d))
+end
+
+# SCVTF Sd, Xn  (signed 64-bit integer to single)
+def a64_scvtf_sx(inout b: CodeBuffer, d: A64V, n: A64) -> Unit
+  emit32_le(b, 0x1E220000 | (a64_code(n) << 5) | a64v_code(d))
+end
+
+# UCVTF Dd, Xn  (unsigned 64-bit integer to double)
+def a64_ucvtf_dx(inout b: CodeBuffer, d: A64V, n: A64) -> Unit
+  emit32_le(b, 0x9E630000 | (a64_code(n) << 5) | a64v_code(d))
+end
+
+# UCVTF Sd, Xn  (unsigned 64-bit integer to single)
+def a64_ucvtf_sx(inout b: CodeBuffer, d: A64V, n: A64) -> Unit
+  emit32_le(b, 0x1E230000 | (a64_code(n) << 5) | a64v_code(d))
+end
+
+# FCVTZS Xd, Sn  (single to signed 64-bit integer, round toward zero —
+# the trap-free truncation rule of the P1-6 strict spec: NaN gives 0,
+# out-of-range values saturate)
+def a64_fcvtzs_xs(inout b: CodeBuffer, d: A64, n: A64V) -> Unit
+  emit32_le(b, 0x9E380000 | (a64v_code(n) << 5) | a64_code(d))
 end
 
 # ———————————————————————————————————————————————————————————————

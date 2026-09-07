@@ -1,0 +1,3543 @@
+# Tangerine Compiler — Cortex-M (Thumb-2) backend over the LIR
+# Self-hosting compiler written in Tangerine
+#
+# AUDIT P1-14, slice 2 — a minimal but REAL Cortex-M backend over the
+# P1-7 LIR slice (lir.tg). The LIR's aarch64 slice (MIR -> LIR lowering,
+# linear-scan allocation, aarch64 emission in lir_emit_fn) is unchanged;
+# this module emits the cortex-m LIR function shapes (lower_mir_fn_to_lir_cm
+# / lir_peephole / lir_alloc_registers) as Thumb-2 machine code for the
+# Cortex-M3/M4 class (ARMv7-M), driven by the data-driven description
+# target_desc::cortex_m_desc() (the canonical register classes/ABI data —
+# nothing is re-derived here).
+#
+# ── What this slice emits, and how ─────────────────────────────────
+#   The machine model is AAPCS32 on ARMv7-M (Thumb-2, 32-bit
+#   little-endian words, 8-byte stack alignment):
+#     - parameters 0..3 arrive in r0..r3; the LIR's parameter bindings
+#       (LirMove from fixed vregs 0..3) are the ONLY fixed-vreg traffic
+#       this backend accepts (fixed vregs 4..7 are the aarch64 ABI
+#       registers x4..x7 — the cortex-m lowering never produces them,
+#       see the fail-closed list below);
+#     - return value in r0; BX LR epilogue;
+#     - AAPCS STACK ARGUMENTS (this slice): every parameter index >= 4
+#       arrives on the caller's stack — the caller pushed argument
+#       words in order (argument 4 at the LOWEST address, [SP] at the
+#       branch), and the LIR's cortex-m lowering (lir.tg,
+#       lower_mir_fn_to_lir_cm) binds every parameter index >= 4 with a
+#       LirLoadFrame whose payload is the AAPCS-canonical offset
+#       [fp + 8 + 4*(i-4)] (fp = incoming SP minus the 8-byte {fp,lr}
+#       push of the AAPCS model). The real frame differs from that
+#       model by construction — this backend's prologue pushes
+#       {r4-r10, lr} (32 bytes) and points r7 at the BOTTOM of the
+#       local frame — so the emitter translates each payload to the
+#       machine offset [r7 + frame_bytes + 24 + payload] (derivation in
+#       the LirLoadFrame emitter arm below). Call sites with more than
+#       4 arguments push the overflow words themselves (see the caller
+#       stack-argument push slice below);
+#     - the allocator's fixed precolored vregs 0..3 are r0..r3; its pool
+#       ids 9..14 map onto SIX callee-saved registers derived from the
+#       desc's reg_callee_saved (r4..r11 minus the frame pointer r7, in
+#       desc order: r4, r5, r6, r8, r9, r10). Pool registers are
+#       saved/restored in the prologue/epilogue (PUSH/POP {r4-r10, lr}),
+#       so the AAPCS callee-saved contract holds for external callers.
+#       Parameter vregs 4..7 (the index-4..7 parameters of > 4-parameter
+#       functions) are ORDINARY vregs whose only def is the entry
+#       LirLoadFrame — the allocator gives them pool registers or
+#       spill slots exactly like every other non-precolored vreg;
+#     - the LIR allocator still treats pool registers as caller-saved
+#       (its store-before-call / reload-after-call records — invariant
+#       I2): those stores/reloads are redundant-but-correct for
+#       callee-saved registers and keep the machinery target-agnostic;
+#     - frame pointer r7 = SP after PUSH + SUB (prologue: PUSH {r4-r10,
+#       lr}; sub sp, #frame; mov r7, sp). Spill slot i is the 4-byte
+#       word at [r7 + 4*i] (positive offsets only — the 16-bit LDR/STR
+#       imm5*4 forms, then LDR.W/STR.W byte-offset imm12 forms, then a
+#       movw/add address path; frames up to 65532 bytes of slots);
+#     - flags: invariant I1 is preserved — the only flag-writing
+#       instructions this emitter produces are the LirCmp's CMP and the
+#       cset ITE block's two conditional MOVS (which execute after the
+#       Cmp's consumer has read the flags). ALL other arithmetic uses
+#       the flagless 32-bit Thumb-2 encodings (ADD.W/SUB.W/AND.W/ORR.W/
+#       EOR.W/MUL.W/RSB.W/MVN.W and the LSL/LSR/ASR.W forms); moves and
+#       loads/stores are flagless (MOV/MOVW/MOVT 0x4600/0xF240/0xF2C0).
+#     - CALLER STACK-ARGUMENT PUSHES (this slice): a call with more
+#       than 4 arguments emits one LirPushArg statement per overflow
+#       word, in DESCENDING index order (argument n-1 first ... argument
+#       4 LAST, so argument 4 sits at the lowest address, [SP], at the
+#       BL — the exact layout the callee's entry loads read). Each
+#       statement lowers to a 4-byte word push: sub sp, #4 then a
+#       word store at [SP]. AAPCS requires the caller's SP to be
+#       8-BYTE ALIGNED at the BL, so the lowering pads ODD word counts
+#       with one extra word at the TOP of the caller block (the first
+#       push — see lir.tg's lir_lower_call for the chosen padding), and
+#       every cortex-m LirCall therefore carries an EVEN stack_args
+#       (4-byte words, the padding included). The callee ignores the
+#       pad; the caller's SP cleanup after the BL (add sp,
+#       #4*stack_args) removes the whole block. SP returns to its
+#       frame value after every call, so the body never observes a
+#       lowered SP between calls.
+#     - BL clobbers LR and the caller-saved r0-r3/r12, matching the
+#       allocator's caller-saved contract for the values it spills
+#       around calls (invariant I2); the pool registers ride the call.
+#
+# ── THE 32-BIT WORD MODEL (why the LIR's 64-bit words compile) ─────
+#   cortex_m_desc() models ILP32 (target_desc.tg's contract: the integer
+#   word is exactly pointer_width). This backend therefore treats every
+#   LIR word as a 32-bit machine word and FAILS CLOSED on any payload a
+#   32-bit word cannot hold faithfully:
+#     - integer/constant payloads must fit [-2^31, 2^32) (a 64-bit
+#       constant like 2^40 has no 32-bit image and is rejected — the
+#       sized-width LIR rules lower on the aarch64 route only);
+#     - shift amounts must fit [0, 255]; register-count shifts use the
+#       machine's register-form semantics (count = Rm[7:0], saturating:
+#       LSL/LSR by >= 32 -> 0, ASR -> sign-fill — identical to the
+#       aarch64 64-bit results in the low 32 bits whenever the operand
+#       values themselves fit 32 bits).
+#
+# ── FAIL-CLOSED (each construct names its rule; never a wrong byte) ─
+#   - any use of fixed vregs 4..7: those are the aarch64 ABI registers
+#     x4..x7. The cortex-m lowering (lower_mir_fn_to_lir_cm) binds
+#     parameters/arguments 0..3 onto the fixed r0..r3 vregs and routes
+#     every index >= 4 through the AAPCS caller stack (LirLoadFrame /
+#     LirPushArg below), so a fixed vreg 4..7 in a statement marks a
+#     LIR function lowered with the aarch64 conventions — rejected
+#     rather than passed in r4..r7 (breaking AAPCS extern calls).
+#   - LirLoadFrame payloads outside the AAPCS stack-parameter geometry
+#     (4-aligned, >= 8): the cortex-m lowering emits payload
+#     8 + 4*(i-4) for parameter index i >= 4 only, so any other payload
+#     marks a foreign lowering — fail-closed. (This is a geometry
+#     sanity net, not the aarch64-convention guard: an aarch64-
+#     convention LIR function is caught by the fixed-vreg 4..7
+#     rejections above, which its parameter binds always trip before
+#     any LirLoadFrame can be evaluated.)
+#   - 64-bit payloads and shift counts outside the word model above are
+#     rejected: the width-aware LIR rules that lower sized widths exist
+#     only on the aarch64 route — this route keeps its word-only accept
+#     set, and any payload the 32-bit model cannot hold faithfully
+#     fails closed.
+#   - div/mod: lir.tg's lowering gates Div/Mod to the aarch64 route
+#     (div_ok true there); on this route the gate stays closed, so a
+#     Div/Mod fails closed at lowering with a rule-naming Err before
+#     any LIR reaches this backend. This backend's encoder set has no
+#     SDIV/UDIV either (the M3 has no hardware divide; the M4's
+#     SDIV/UDIV encoders are a later slice).
+#   - wide (64-bit) multiply results: MUL.W computes the low 32 bits —
+#     faithful for 32-bit-faithful operands (the word model above).
+#   - whole-program STATICS: the scalar-constant subset IS implemented
+#     (the .data emission + the MOVW/MOVT-address static loads — see
+#     the statics section below); statics beyond the subset — floats,
+#     strings, pointers, aggregate/collection images — and static
+#     WRITES (the MirStaticAddr address-of forms) fail closed with
+#     their concrete rules in lir.tg's shared gates.
+#   - floats: the LIR slice has no float statements, so none reaches
+#     this backend (fail-closed by absence); atomics via LDREX/STREX
+#     are likewise not implemented — the desc reports has_atomics on
+#     [1,2,4] but the LIR slice carries no atomic statements and this
+#     backend has no exclusive-access encoders; the interrupt ABI
+#     (NVIC entry/exit, IRQ masking — no desc field yet) is not
+#     implemented; and the Cortex-M0/M0+ variant (ARMv6-M is Thumb-1:
+#     no 32-bit encodings, different exclusives) has no slice of its
+#     own.
+#   - the OS entry capture (argc/argv for "main"/"_start", emitted by
+#     codegen.tg's emit_save_argc_argv on aarch64) is NOT emitted here:
+#     a cortex-m image has no host argc/argv contract, and the
+#     bare-metal startup/vector tables are not implemented in this
+#     slice; functions named main/_start are compiled as ordinary
+#     functions.
+#
+# ── ENCODING VERIFICATION (this is a hand-verified slice) ──────────
+#   Every encoding constant below was verified byte-for-byte by
+#   assembling the instruction with clang -target thumbv7em-none-eabi
+#   (LLVM's ARMv7-M assembler) and disassembling the object; the doc
+#   comment on each encoder cites the ARMv7-M ARM (DDI0406C) A6/A7
+#   instruction family and the observed bytes. Nothing here is
+#   guesswork: 16-bit encodings occupy 0x0000-0xE7FF, 32-bit Thumb-2
+#   encodings are pairs of halfwords 0xE800-0xFFFF (emitted low
+#   halfword first, little-endian).
+#
+# ── Route wiring ────────────────────────────────────────────────────
+#   The driver's LIR route (driver.tg compile_lir_route) selects this
+#   backend with TANGERINE_LIR_TARGET=cortex-m (default aarch64);
+#   thumb_compile_object lowers every body through lir.tg's AAPCS32
+#   parameter-fetch entry (lower_mir_fn_to_lir_cm), emits the program's
+#   static scalar images into a .data section and the bodies into a
+#   REAL ELF32 relocatable object (e_machine = 40 EM_ARM,
+#   EABI5, Thumb code, R_ARM_THM_CALL relocations for extern calls and
+#   R_ARM_THM_MOVW_ABS_NC / R_ARM_THM_MOVT_ABS pairs for static-value
+#   loads) — the object an arm-none-eabi linker can link.
+#   Executable/image linking and bare-metal startup are NOT in this
+#   slice (fail-closed).
+
+use std::core::{Option, Result, panic}
+use std::collections::{Vec, Set, Map}
+
+use tg_compiler::mir::{MirProgram, MirStatic}
+use tg_compiler::lir::{
+  LirFunction, LirAlloc, LirStmtKind, LirTermKind, LirValue,
+  LirBinOp, LirUnOp, LirCond, LirFpWidth, LirFpBinOp,
+  lir_fixed_fp_base, lir_is_fixed_fp_id,
+  lower_mir_fn_to_lir_cm, lir_peephole, lir_alloc_registers,
+  lir_first_alloc_vreg, lir_seg_at, lir_reload_at,
+  lir_block_label, lir_validate_callees,
+  lir_static_scalar_ok, lir_static_init_word_value,
+  lir_static_unsupported_type_rule
+}
+use tg_compiler::target_desc::{TargetDesc, cortex_m_desc}
+use tg_compiler::codegen::{build_static_label_table}
+use tg_compiler::asm::{
+  CodeBuffer, buf_new, emit16_le, emit32_le, def_label, buf_pos,
+  AsmSymbol, Section, SymBinding, SymKind
+}
+
+# ———————————————————————————————————————————————————————————————
+# Cortex-M register model (desc-driven)
+# ———————————————————————————————————————————————————————————————
+# AAPCS32 register numbers: r0-r12 general, r13 = SP, r14 = LR, r15 = PC.
+# Fixed (precolored) LIR vreg ids 0..3 ARE r0..r3 (the desc's arg_regs);
+# fixed vregs 4..7 (the aarch64 x4..x7) are never produced by the
+# cortex-m lowering and rejected here. Ordinary vregs are allocated onto
+# the pool ids 9..14, which map 1:1 to six callee-saved registers picked
+# from the desc's reg_callee_saved (r7 is excluded: it is the frame
+# pointer). r12 is the reserved instruction temp (the AAPCS
+# intra-procedure-call scratch IP), r3 is the second temp (dead between
+# the entry binds and the call argument moves, so statements may borrow
+# it; fixed vregs never hold a live value at a statement boundary).
+
+def thumb_fp_reg() -> Int = 7
+def thumb_ip_reg() -> Int = 12
+def thumb_ip2_reg() -> Int = 3
+def thumb_lr_reg() -> Int = 14
+def thumb_sp_reg() -> Int = 13
+def thumb_ret_reg() -> Int = 0
+
+# The register list pushed/popped by every prologue/epilogue:
+# {r4..r10, lr} = 8 words — even, so SP stays 8-aligned (AAPCS) through
+# the frame (entry SP 8-aligned; 32-byte push + 8-aligned frame).
+def thumb_saved_reg_list() -> Int = 0x47F0
+
+# The machine register number of an LIR register id: fixed vregs 0..7 are
+# r0..r7 (only 0..3 are reachable after thumb_validate_fn — fixed vregs
+# 4..7 mark an aarch64-convention LIR and are rejected before emission),
+# pool ids 9..14 are mdl_pool entries. Panics for anything else —
+# validation rejects fixed vregs 4..7 before emission, so a reachable
+# panic is an internal error.
+def thumb_phys_of(mdl_pool: Vec[Int], lir_reg: Int) -> Int
+  if lir_reg < lir_first_alloc_vreg() then
+    return lir_reg
+  end
+  let idx = lir_reg - lir_first_alloc_vreg()
+  if idx >= 0 && idx < mdl_pool.len() then
+    mdl_pool[idx]
+  else
+    panic("thumb: no cortex-m register for lir register " + lir_reg.to_string())
+  end
+end
+
+# Parse an AAPCS register name ("r0".."r15") into its number.
+def thumb_reg_num(name: String) -> Option[Int]
+  if name == "r0" then Option::Some(0)
+  elsif name == "r1" then Option::Some(1)
+  elsif name == "r2" then Option::Some(2)
+  elsif name == "r3" then Option::Some(3)
+  elsif name == "r4" then Option::Some(4)
+  elsif name == "r5" then Option::Some(5)
+  elsif name == "r6" then Option::Some(6)
+  elsif name == "r7" then Option::Some(7)
+  elsif name == "r8" then Option::Some(8)
+  elsif name == "r9" then Option::Some(9)
+  elsif name == "r10" then Option::Some(10)
+  elsif name == "r11" then Option::Some(11)
+  elsif name == "r12" then Option::Some(12)
+  elsif name == "r13" then Option::Some(13)
+  elsif name == "r14" then Option::Some(14)
+  elsif name == "r15" then Option::Some(15)
+  else Option::None
+  end
+end
+
+# The canonical cortex-m description of this backend (the driver's route
+# selector consults it at the gate, mirroring lir_target_desc).
+def thumb_target_desc() -> TargetDesc
+  cortex_m_desc()
+end
+
+# Build the register model from the desc — the desc is the single source
+# of the ABI data: the model must be exactly the desc's callee-saved
+# registers minus the frame pointer, first six, in desc order. Fail
+# closed when the desc shape is not what this slice consumes.
+def thumb_mdl_pool(desc: TargetDesc) -> Result[Vec[Int], String]
+  if desc.name != "cortex_m" then
+    return Result::Err("thumb: internal error: the cortex-m backend was given the `" + desc.name + "` description (expected `cortex_m`)")
+  end
+  if desc.pointer_width != 4 || desc.stack_alignment != 8 then
+    return Result::Err("thumb: the cortex-m description must model 4-byte pointers with 8-byte stack alignment (desc says " + desc.pointer_width.to_string() + "-byte, align " + desc.stack_alignment.to_string() + ")")
+  end
+  var pool: Vec[Int] = Vec::new()
+  var i = 0
+  while i < desc.reg_callee_saved.len() do
+    let r = desc.reg_callee_saved[i]
+    if r != "r7" then
+      match thumb_reg_num(r)
+      when Option::Some(n) then pool.push(n)
+      when Option::None then ()
+      end
+    end
+    i = i + 1
+  end
+  if pool.len() < 6 then
+    return Result::Err("thumb: cortex_m_desc().reg_callee_saved must provide at least six registers besides r7 for the allocator pool (desc provides " + pool.len().to_string() + ")")
+  end
+  var out: Vec[Int] = Vec::new()
+  var j = 0
+  while j < 6 do
+    out.push(pool[j])
+    j = j + 1
+  end
+  Result::Ok(out)
+end
+
+# ———————————————————————————————————————————————————————————————
+# Frame helpers (spill slots are 4-byte words above the frame pointer)
+# ———————————————————————————————————————————————————————————————
+# Frame layout (see the module header): prologue PUSH {r4-r10, lr}
+# (32 bytes), then sub sp, #frame, then r7 = sp. Slot i lives at
+# [r7 + 4*i], i in 0..alloc.slots. frame is 8-aligned.
+
+def thumb_slot_offset(slot: Int) -> Int
+  4 * slot
+end
+
+def thumb_frame_bytes(slots: Int) -> Int
+  let raw = slots * 4
+  let rem = raw % 8
+  if rem != 0 then
+    raw + (8 - rem)
+  else
+    raw
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Thumb-2 instruction encoders (hand-verified — see the module header)
+# ———————————————————————————————————————————————————————————————
+# Each encoder writes into the CodeBuffer like the asm.tg a64_* encoders.
+# 16-bit instructions are one little-endian halfword; 32-bit Thumb-2
+# instructions are two halfwords (first halfword = bits 31..16, emitted
+# first). Encoders panic on out-of-range arguments (asm.tg style); the
+# emitter validates everything a LIR function can carry BEFORE emission.
+
+# Emit a 32-bit Thumb-2 instruction as its two halfwords.
+def t2_word(inout b: CodeBuffer, word: u32) -> Unit
+  emit16_le(b, ((word >> 16) & 0xFFFF) as u16)
+  emit16_le(b, (word & 0xFFFF) as u16)
+end
+
+# MOVS Rd, #imm8 — 16-bit, 00100 Rd imm8 (0x2000). ARMv7-M A6.7.22.
+# Verified: movs r0, #42 = 0x202A; movs r3, #5 = 0x2305. WRITES NZCV
+# (only reachable inside the cset ITE block; see the flag discipline).
+def t2_movs_imm8(inout b: CodeBuffer, rd: Int, imm: Int) -> Unit
+  if rd < 0 || rd > 7 then panic("t2_movs_imm8: destination must be r0-r7") end
+  if imm < 0 || imm > 255 then panic("t2_movs_imm8: immediate must be 0..255") end
+  emit16_le(b, (0x2000 | ((rd as u32) << 8) | (imm as u32)) as u16)
+end
+
+# MOV Rd, Rm — 16-bit "MOV (register)" T2, 01000110 D Rm Rd (0x4600),
+# flagless, any registers r0-r14 (SP works; PC has special forms that
+# this backend never emits). ARMv7-M A6.7.28. Verified: mov r1, r2 =
+# 0x4611; mov r8, r0 = 0x4680; mov r0, r8 = 0x4640; mov r12, r3 =
+# 0x469C; mov r3, r12 = 0x4663; mov r7, sp = 0x466F; mov sp, r7 = 0x46BD.
+def t2_mov_rr(inout b: CodeBuffer, rd: Int, rm: Int) -> Unit
+  if rd < 0 || rd > 14 then panic("t2_mov_rr: destination must be r0-r14") end
+  if rm < 0 || rm > 14 then panic("t2_mov_rr: source must be r0-r14") end
+  emit16_le(b, (0x4600 | ((((rd as u32) >> 3) & 1) << 7) | ((rm as u32) << 3) | ((rd as u32) & 7)) as u16)
+end
+
+# ADDS Rd, Rn, Rm — 16-bit ADD (register) T1, 0001100 Rm Rn Rd (0x1800),
+# low registers only. ARMv7-M A6.7.5. Verified: adds r0, r1, r2 = 0x1888.
+# WRITES NZCV — the LIR emitter never uses this form (invariant I1);
+# provided for completeness alongside the flagless 32-bit form below.
+def t2_adds_rrr_lo(inout b: CodeBuffer, rd: Int, rn: Int, rm: Int) -> Unit
+  if rd < 0 || rd > 7 || rn < 0 || rn > 7 || rm < 0 || rm > 7 then
+    panic("t2_adds_rrr_lo: all registers must be r0-r7")
+  end
+  emit16_le(b, (0x1800 | ((rm as u32) << 6) | ((rn as u32) << 3) | (rd as u32)) as u16)
+end
+
+# SUBS Rd, Rn, Rm — 16-bit SUB (register) T1, 0001101 Rm Rn Rd (0x1A00),
+# low registers only. ARMv7-M A6.7.16. Verified: subs r0, r1, r2 = 0x1A88.
+# WRITES NZCV — see the invariant-I1 note on t2_adds_rrr_lo.
+def t2_subs_rrr_lo(inout b: CodeBuffer, rd: Int, rn: Int, rm: Int) -> Unit
+  if rd < 0 || rd > 7 || rn < 0 || rn > 7 || rm < 0 || rm > 7 then
+    panic("t2_subs_rrr_lo: all registers must be r0-r7")
+  end
+  emit16_le(b, (0x1A00 | ((rm as u32) << 6) | ((rn as u32) << 3) | (rd as u32)) as u16)
+end
+
+# ADD Rd, Rm (Rd = Rd + Rm) — 16-bit ADD (register) T2, 01000100 D Rm Rd
+# (0x4400), FLAGLESS, any registers. ARMv7-M A6.7.5. Verified:
+# add r4, r5 = 0x442C; add r8, r0 = 0x4480; add r0, r8 = 0x4440;
+# add r12, r7 = 0x44BC; add r7, r12 = 0x4467; add r4, r12 = 0x4464;
+# add r8, r12 = 0x44E0. (SP as Rm is a special form this backend never
+# emits.)
+def t2_add_rr(inout b: CodeBuffer, rd: Int, rm: Int) -> Unit
+  if rd < 0 || rd > 12 then panic("t2_add_rr: destination must be r0-r12") end
+  if rm < 0 || rm > 12 then panic("t2_add_rr: source must be r0-r12") end
+  emit16_le(b, (0x4400 | ((((rd as u32) >> 3) & 1) << 7) | ((rm as u32) << 3) | ((rd as u32) & 7)) as u16)
+end
+
+# CMP Rn, Rm — 16-bit low form T1, 0100001010 Rm Rn (0x4280). ARMv7-M
+# A6.7.20. Verified: cmp r0, r1 = 0x4288. Both low registers.
+def t2_cmp_rr_lo(inout b: CodeBuffer, rn: Int, rm: Int) -> Unit
+  if rn < 0 || rn > 7 || rm < 0 || rm > 7 then
+    panic("t2_cmp_rr_lo: both registers must be r0-r7")
+  end
+  emit16_le(b, (0x4280 | ((rm as u32) << 3) | (rn as u32)) as u16)
+end
+
+# CMP Rn, Rm — 16-bit ANY-register form T2, 01000101 Rm Rn (0x4500), with
+# Rn's bit 3 in bit 7. ARMv7-M A6.7.20. Verified: cmp r0, r8 = 0x4540;
+# cmp r8, r0 = 0x4580; cmp r8, r9 = 0x45C8; cmp r3, r12 = 0x4563;
+# cmp r12, r3 = 0x459C.
+def t2_cmp_rr_any(inout b: CodeBuffer, rn: Int, rm: Int) -> Unit
+  if rn < 0 || rn > 14 || rm < 0 || rm > 14 then
+    panic("t2_cmp_rr_any: both registers must be r0-r14")
+  end
+  emit16_le(b, (0x4500 | ((((rn as u32) >> 3) & 1) << 7) | ((rm as u32) << 3) | ((rn as u32) & 7)) as u16)
+end
+
+# CMP Rn, #imm8 — 16-bit, 00101 Rn imm8 (0x2800). ARMv7-M A6.7.21.
+# Verified: cmp r0, #7 = 0x2807; cmp r3, #5 = 0x2B05; cmp r0, #255 =
+# 0x28FF. Low Rn only.
+def t2_cmp_imm8(inout b: CodeBuffer, rn: Int, imm: Int) -> Unit
+  if rn < 0 || rn > 7 then panic("t2_cmp_imm8: register must be r0-r7") end
+  if imm < 0 || imm > 255 then panic("t2_cmp_imm8: immediate must be 0..255") end
+  emit16_le(b, (0x2800 | ((rn as u32) << 8) | (imm as u32)) as u16)
+end
+
+# LDR Rd, [Rn, #imm5*4] — 16-bit, 01101 imm5 Rn Rd (0x6800). ARMv7-M
+# A6.7.40. Verified: ldr r0, [r1, #4] = 0x6848. Low registers only;
+# offset = imm5*4, 0..124, word-aligned. Flagless.
+def t2_ldr_imm5(inout b: CodeBuffer, rd: Int, rn: Int, off: Int) -> Unit
+  if rd < 0 || rd > 7 || rn < 0 || rn > 7 then
+    panic("t2_ldr_imm5: both registers must be r0-r7")
+  end
+  if off < 0 || off > 124 || (off % 4) != 0 then
+    panic("t2_ldr_imm5: offset must be a word-aligned 0..124")
+  end
+  emit16_le(b, (0x6800 | ((((off / 4) as u32) & 0x1F) << 6) | ((rn as u32) << 3) | (rd as u32)) as u16)
+end
+
+# STR Rd, [Rn, #imm5*4] — 16-bit, 01100 imm5 Rn Rd (0x6000). ARMv7-M
+# A6.7.83. Verified: str r0, [r1, #4] = 0x6048. Flagless.
+def t2_str_imm5(inout b: CodeBuffer, rd: Int, rn: Int, off: Int) -> Unit
+  if rd < 0 || rd > 7 || rn < 0 || rn > 7 then
+    panic("t2_str_imm5: both registers must be r0-r7")
+  end
+  if off < 0 || off > 124 || (off % 4) != 0 then
+    panic("t2_str_imm5: offset must be a word-aligned 0..124")
+  end
+  emit16_le(b, (0x6000 | ((((off / 4) as u32) & 0x1F) << 6) | ((rn as u32) << 3) | (rd as u32)) as u16)
+end
+
+# STR Rd, [SP, #imm8*4] — 16-bit SP-relative STR, 1001 0 Rd imm8
+# (0x9000), imm8*4 in 0..1020, low Rd only. ARMv7-M A6.7.83 (the STR
+# (immediate) T2 encoding with the SP base — the 16-bit imm5 form has
+# no SP base, so SP-relative word stores use this encoding). Verified:
+# str r0, [sp, #0] = 0x9000; str r4, [sp, #8] = 0x9402; str r7,
+# [sp, #0x3FC] = 0x97FF. Flagless. Emitted by the LirPushArg arm (the
+# AAPCS caller-word push stores at [SP] after the sub sp, #4).
+def t2_str_sp_imm8(inout b: CodeBuffer, rd: Int, off: Int) -> Unit
+  if rd < 0 || rd > 7 then
+    panic("t2_str_sp_imm8: register must be r0-r7")
+  end
+  if off < 0 || off > 1020 || (off % 4) != 0 then
+    panic("t2_str_sp_imm8: offset must be a word-aligned 0..1020")
+  end
+  emit16_le(b, (0x9000 | ((rd as u32) << 8) | ((off / 4) as u32)) as u16)
+end
+
+# LDRB Rd, [Rn, #imm5] — 16-bit, 01111 imm5 Rn Rd (0x7800). ARMv7-M
+# A6.7.44. Verified: ldrb r0, [r1, #3] = 0x78C8. (The cortex-m route is
+# word-only — sized memory never lowers here — so this form is unused;
+# the encoder exists for the sized-field-memory backlog, which is not
+# implemented in any LIR route.)
+def t2_ldrb_imm5(inout b: CodeBuffer, rd: Int, rn: Int, off: Int) -> Unit
+  if rd < 0 || rd > 7 || rn < 0 || rn > 7 then
+    panic("t2_ldrb_imm5: both registers must be r0-r7")
+  end
+  if off < 0 || off > 31 then panic("t2_ldrb_imm5: offset must be 0..31") end
+  emit16_le(b, (0x7800 | ((off as u32) << 6) | ((rn as u32) << 3) | (rd as u32)) as u16)
+end
+
+# STRB Rd, [Rn, #imm5] — 16-bit, 01110 imm5 Rn Rd (0x7000). ARMv7-M
+# A6.7.88. Verified: strb r0, [r1, #3] = 0x70C8.
+def t2_strb_imm5(inout b: CodeBuffer, rd: Int, rn: Int, off: Int) -> Unit
+  if rd < 0 || rd > 7 || rn < 0 || rn > 7 then
+    panic("t2_strb_imm5: both registers must be r0-r7")
+  end
+  if off < 0 || off > 31 then panic("t2_strb_imm5: offset must be 0..31") end
+  emit16_le(b, (0x7000 | ((off as u32) << 6) | ((rn as u32) << 3) | (rd as u32)) as u16)
+end
+
+# B<cond> rel — 16-bit conditional branch, 1101 cond imm8 (0xD000).
+# ARMv7-M A6.7.6. Verified: beq +16 = 0xD008; bne = 0xD1xx; bge = 0xDaxx;
+# blt = 0xDbxx; bhi = 0xD8xx; bls = 0xD9xx; beq -6 = 0xD0FD. rel is the
+# signed byte distance from PC+4 (rel = target - (insn + 4)), even, in
+# [-256, 254]. The condition codes are the ARM 4-bit codes (EQ=0, NE=1,
+# CS=2, CC=3, HI=8, LS=9, GE=10, LT=11, GT=12, LE=13 — the same space
+# aarch64's a64_cc_* values come from). The inverse of a condition is
+# cond XOR 1.
+def t2_b_cond16(inout b: CodeBuffer, cond: Int, rel: Int) -> Unit
+  if cond < 0 || cond > 14 then panic("t2_b_cond16: bad condition code") end
+  if rel < -256 || rel > 254 || (rel % 2) != 0 then
+    panic("t2_b_cond16: relative offset must be even and in -256..254")
+  end
+  emit16_le(b, (0xD000 | ((cond as u32) << 8) | (((rel >> 1) as u32) & 0xFF)) as u16)
+end
+
+# B rel — 16-bit unconditional branch, 11100 imm11 (0xE000). ARMv7-M
+# A6.7.7. Verified: b +18 = 0xE009; b -2 = 0xE7FF. rel = target -
+# (insn + 4), even, in [-2048, 2046].
+def t2_b16(inout b: CodeBuffer, rel: Int) -> Unit
+  if rel < -2048 || rel > 2046 || (rel % 2) != 0 then
+    panic("t2_b16: relative offset must be even and in -2048..2046")
+  end
+  emit16_le(b, (0xE000 | (((rel >> 1) as u32) & 0x7FF)) as u16)
+end
+
+# CBZ Rn, rel — 16-bit compare-and-branch-if-zero, 1011 0op i imm5 Rn
+# (CBZ = 0xB100, CBNZ = 0xB900). ARMv7-M A6.7.9. Verified: cbz r0, +4 =
+# 0xB110; cbz r3, +2 = 0xB10B; cbz r7, +0 = 0xB107; cbnz r1, +2 =
+# 0xB909; cbnz r6, +0 = 0xB906. CRITICAL: the ARMv7-M CBZ/CBNZ branch
+# FORWARD ONLY, range 0..62 bytes (the assembler rejects a backward
+# target) — unlike aarch64's cbz, the LIR emitter cannot fuse zero-test
+# switch arms onto it without knowing the branch direction, so the
+# emitter compares and branches instead (cbz fusion where the direction
+# and range are provable is not implemented — it sits in the peephole
+# backlog); the encoders are provided verified for that backlog.
+def t2_cbz(inout b: CodeBuffer, rn: Int, rel: Int) -> Unit
+  if rn < 0 || rn > 7 then panic("t2_cbz: register must be r0-r7") end
+  if rel < 0 || rel > 62 || (rel % 2) != 0 then
+    panic("t2_cbz: offset must be a forward even 0..62")
+  end
+  emit16_le(b, (0xB100 | (((rel >> 1) as u32) << 3) | (rn as u32)) as u16)
+end
+
+def t2_cbnz(inout b: CodeBuffer, rn: Int, rel: Int) -> Unit
+  if rn < 0 || rn > 7 then panic("t2_cbnz: register must be r0-r7") end
+  if rel < 0 || rel > 62 || (rel % 2) != 0 then
+    panic("t2_cbnz: offset must be a forward even 0..62")
+  end
+  emit16_le(b, (0xB900 | (((rel >> 1) as u32) << 3) | (rn as u32)) as u16)
+end
+
+# PUSH {regs}, {lr?} — 16-bit, 1011 010 L list (0xB400); regs = an
+# r0..r7 bit mask (bit i = r_i), with_lr adds LR via the L bit.
+# ARMv7-M A6.7.66. Verified: push {r0, lr} = 0xB501. (The prologue uses
+# the 32-bit STMDB form below — the saved list contains r8..r10, which
+# the 16-bit form cannot hold.)
+def t2_push_16(inout b: CodeBuffer, regs: Int, with_lr: Bool) -> Unit
+  if (regs & 0xFF00) != 0 then
+    panic("t2_push_16: the 16-bit form holds r0-r7 plus LR only")
+  end
+  let l = (if with_lr then 0x100 else 0 end) as u32
+  emit16_le(b, (0xB400 | ((regs as u32) & 0xFF) | l) as u16)
+end
+
+# POP {regs}, {pc?} — 16-bit, 1011 110 P list (0xBC00); regs = an r0..r7
+# bit mask, with_pc adds PC via the P bit. ARMv7-M A6.7.67. Verified:
+# pop {r7, pc} = 0xBD80.
+def t2_pop_16(inout b: CodeBuffer, regs: Int, with_pc: Bool) -> Unit
+  if (regs & 0xFF00) != 0 then
+    panic("t2_pop_16: the 16-bit form holds r0-r7 plus PC only")
+  end
+  let p = (if with_pc then 0x100 else 0 end) as u32
+  emit16_le(b, (0xBC00 | ((regs as u32) & 0xFF) | p) as u16)
+end
+
+# SUB sp, #imm7*4 — 16-bit, 1011 0 0 imm7 (0xB080). ARMv7-M A6.7.16.
+# Verified: sub sp, #64 = 0xB090. Flagless. frame 4-aligned, 0..508.
+def t2_sub_sp_imm7(inout b: CodeBuffer, frame: Int) -> Unit
+  if frame < 0 || frame > 508 || (frame % 4) != 0 then
+    panic("t2_sub_sp_imm7: frame must be a 4-aligned 0..508")
+  end
+  emit16_le(b, (0xB080 | ((frame / 4) as u32)) as u16)
+end
+
+# ADD sp, #imm7*4 — 16-bit, 1011 0 1 imm7 (0xB000). ARMv7-M A6.7.4.
+# Verified: add sp, #64 = 0xB010.
+def t2_add_sp_imm7(inout b: CodeBuffer, frame: Int) -> Unit
+  if frame < 0 || frame > 508 || (frame % 4) != 0 then
+    panic("t2_add_sp_imm7: frame must be a 4-aligned 0..508")
+  end
+  emit16_le(b, (0xB000 | ((frame / 4) as u32)) as u16)
+end
+
+# BX LR — 16-bit, 010001 11 0 1110 0000 (0x4770). ARMv7-M A6.7.14.
+# Verified: bx lr = 0x4770.
+def t2_bx_lr(inout b: CodeBuffer) -> Unit
+  emit16_le(b, 0x4770)
+end
+
+# UDF #0 — 16-bit permanently-undefined, 1101 1110 imm8 (0xDE00).
+# ARMv7-M A6.7.77. Verified: udf #0 = 0xDE00. Emitted for LirTrap (the
+# aarch64 route's analogue of a64_udf).
+def t2_udf(inout b: CodeBuffer) -> Unit
+  emit16_le(b, 0xDE00)
+end
+
+# ———————————————————————————————————————————
+# 32-bit Thumb-2 encodings (halfword pairs 0xE800-0xFFFF)
+# ———————————————————————————————————————————
+
+# STMDB sp!, {list} — the 32-bit PUSH (ARMv7-M A7.7.86 STM): word
+# 0xE92D0000 | list (P=1 U=0 S=0 W=1 L=0, Rn = sp), list = r0..r12 bit i,
+# lr = bit 14. Verified: push {r4-r10, lr} = 0xE92D47F0 (list 0x47F0).
+def t2_push_w(inout b: CodeBuffer, list: Int) -> Unit
+  if (list & 0xA000) != 0 then
+    panic("t2_push_w: register list must be r0-r12 plus lr (bit 14)")
+  end
+  t2_word(b, 0xE92D0000 | ((list as u32) & 0x5FFF))
+end
+
+# LDMIA sp!, {list} — the 32-bit POP (A7.7.56 LDM): word 0xE8BD0000 |
+# list (P=0 U=1 S=0 W=1 L=1, Rn = sp). Verified: pop {r4-r10, lr} =
+# 0xE8BD47F0.
+def t2_pop_w(inout b: CodeBuffer, list: Int) -> Unit
+  if (list & 0xA000) != 0 then
+    panic("t2_pop_w: register list must be r0-r12 plus lr (bit 14)")
+  end
+  t2_word(b, 0xE8BD0000 | ((list as u32) & 0x5FFF))
+end
+
+# MOVW Rd, #imm16 — 32-bit MOV (immediate) T3 (A7.7.103): hw1 =
+# 11110 i 100100 imm4 (0xF240), hw2 = imm3 Rd imm8; imm16 =
+# i:imm4:imm3:imm8 (i = bit 11, imm4 = bits 15..12, imm3 = bits 10..8,
+# imm8 = bits 7..0 of the 16-bit value). Verified: movw r0, #0xABCD =
+# 0xF64A30CD; movw r5, #0x123 = 0xF2401523; movw r1, #0x800 = 0xF6400100;
+# movw r12, #0xFFFF = 0xF64F7CFF. FLAGLESS.
+def t2_movw(inout b: CodeBuffer, rd: Int, imm: u16) -> Unit
+  if rd < 0 || rd > 12 then panic("t2_movw: destination must be r0-r12") end
+  let v = imm as u32
+  let imm4 = (v >> 12) & 0xF
+  let i = (v >> 11) & 1
+  let imm3 = (v >> 8) & 7
+  let imm8 = v & 0xFF
+  t2_word(b, 0xF2400000 | (i << 26) | (imm4 << 16) | (imm3 << 12) | ((rd as u32) << 8) | imm8)
+end
+
+# MOVT Rd, #imm16 — 32-bit MOVT T1 (A7.7.104), prefix 0xF2C0, same
+# immediate split. Verified: movt r0, #0x1234 = 0xF2C12034; movt r2,
+# #0x800 = 0xF6C00200. FLAGLESS.
+def t2_movt(inout b: CodeBuffer, rd: Int, imm: u16) -> Unit
+  if rd < 0 || rd > 12 then panic("t2_movt: destination must be r0-r12") end
+  let v = imm as u32
+  let imm4 = (v >> 12) & 0xF
+  let i = (v >> 11) & 1
+  let imm3 = (v >> 8) & 7
+  let imm8 = v & 0xFF
+  t2_word(b, 0xF2C00000 | (i << 26) | (imm4 << 16) | (imm3 << 12) | ((rd as u32) << 8) | imm8)
+end
+
+# ADDW Rd, Rn, #imm12 — 32-bit ADD (immediate) T3 (A7.7.3): hw1 =
+# 11110 i 010000 0 Rn (0xF200), hw2 = imm3 Rd imm8 with imm12 =
+# i:imm3:imm8 (i = bit 11). Verified: addw r0, r1, #0x123 = 0xF2011023;
+# addw r5, r6, #0x800 = 0xF6060500; addw r9, r10, #0xFF = 0xF20A09FF.
+# FLAGLESS.
+def t2_addw(inout b: CodeBuffer, rd: Int, rn: Int, imm: Int) -> Unit
+  if rd < 0 || rd > 12 || rn < 0 || rn > 12 then
+    panic("t2_addw: registers must be r0-r12")
+  end
+  if imm < 0 || imm > 0xFFF then panic("t2_addw: immediate must be 0..4095") end
+  let i = ((imm as u32) >> 11) & 1
+  let imm3 = ((imm as u32) >> 8) & 7
+  let imm8 = (imm as u32) & 0xFF
+  t2_word(b, 0xF2000000 | (i << 26) | ((rn as u32) << 16) | (imm3 << 12) | ((rd as u32) << 8) | imm8)
+end
+
+# SUBW Rd, Rn, #imm12 — 32-bit SUB (immediate) T3 (A7.7.22), prefix
+# 0xF2A0, same field layout. Verified: subw r3, r4, #0x123 = 0xF2A41323;
+# subw r8, r9, #0x800 = 0xF6A90800; subw r2, r3, #0x7FF = 0xF2A372FF.
+# FLAGLESS.
+def t2_subw(inout b: CodeBuffer, rd: Int, rn: Int, imm: Int) -> Unit
+  if rd < 0 || rd > 12 || rn < 0 || rn > 12 then
+    panic("t2_subw: registers must be r0-r12")
+  end
+  if imm < 0 || imm > 0xFFF then panic("t2_subw: immediate must be 0..4095") end
+  let i = ((imm as u32) >> 11) & 1
+  let imm3 = ((imm as u32) >> 8) & 7
+  let imm8 = (imm as u32) & 0xFF
+  t2_word(b, 0xF2A00000 | (i << 26) | ((rn as u32) << 16) | (imm3 << 12) | ((rd as u32) << 8) | imm8)
+end
+
+# ADD.W Rd, Rn, Rm — 32-bit ADD (register) T2 (A7.7.4), word
+# 0xEB000000 | Rn<<16 | Rd<<8 | Rm. Verified: add.w r0, r1, r2 =
+# 0xEB010002; add.w r8, r9, r10 = 0xEB09080A. FLAGLESS (the LIR emitter
+# uses ONLY this form for Add — never the flag-writing 16-bit ADDS).
+def t2_add_w(inout b: CodeBuffer, rd: Int, rn: Int, rm: Int) -> Unit
+  if rd < 0 || rd > 12 || rn < 0 || rn > 12 || rm < 0 || rm > 12 then
+    panic("t2_add_w: registers must be r0-r12")
+  end
+  t2_word(b, 0xEB000000 | ((rn as u32) << 16) | ((rd as u32) << 8) | (rm as u32))
+end
+
+# SUB.W Rd, Rn, Rm — 32-bit SUB (register) T2 (A7.7.23), word
+# 0xEBA00000 | Rn<<16 | Rd<<8 | Rm. Verified: sub.w r0, r1, r2 =
+# 0xEBA10002; sub.w r7, r7, r12 = 0xEBA7070C. FLAGLESS.
+def t2_sub_w(inout b: CodeBuffer, rd: Int, rn: Int, rm: Int) -> Unit
+  if rd < 0 || rd > 12 || rn < 0 || rn > 12 || rm < 0 || rm > 12 then
+    panic("t2_sub_w: registers must be r0-r12")
+  end
+  t2_word(b, 0xEBA00000 | ((rn as u32) << 16) | ((rd as u32) << 8) | (rm as u32))
+end
+
+# AND.W Rd, Rn, Rm — 32-bit AND (register) T2 (A7.7.11), word
+# 0xEA000000 | Rn<<16 | Rd<<8 | Rm. Verified: and.w r0, r1, r2 =
+# 0xEA010002. FLAGLESS.
+def t2_and_w(inout b: CodeBuffer, rd: Int, rn: Int, rm: Int) -> Unit
+  if rd < 0 || rd > 12 || rn < 0 || rn > 12 || rm < 0 || rm > 12 then
+    panic("t2_and_w: registers must be r0-r12")
+  end
+  t2_word(b, 0xEA000000 | ((rn as u32) << 16) | ((rd as u32) << 8) | (rm as u32))
+end
+
+# ORR.W Rd, Rn, Rm — 32-bit ORR (register) T2 (A7.7.76), word
+# 0xEA400000 | Rn<<16 | Rd<<8 | Rm. Verified: orr.w r0, r1, r2 =
+# 0xEA410002. FLAGLESS.
+def t2_orr_w(inout b: CodeBuffer, rd: Int, rn: Int, rm: Int) -> Unit
+  if rd < 0 || rd > 12 || rn < 0 || rn > 12 || rm < 0 || rm > 12 then
+    panic("t2_orr_w: registers must be r0-r12")
+  end
+  t2_word(b, 0xEA400000 | ((rn as u32) << 16) | ((rd as u32) << 8) | (rm as u32))
+end
+
+# EOR.W Rd, Rn, Rm — 32-bit EOR (register) T2 (A7.7.52), word
+# 0xEA800000 | Rn<<16 | Rd<<8 | Rm. Verified: eor.w r0, r1, r2 =
+# 0xEA810002; eor.w r8, r8, r9 = 0xEA880809. FLAGLESS.
+def t2_eor_w(inout b: CodeBuffer, rd: Int, rn: Int, rm: Int) -> Unit
+  if rd < 0 || rd > 12 || rn < 0 || rn > 12 || rm < 0 || rm > 12 then
+    panic("t2_eor_w: registers must be r0-r12")
+  end
+  t2_word(b, 0xEA800000 | ((rn as u32) << 16) | ((rd as u32) << 8) | (rm as u32))
+end
+
+# MUL Rd, Rn, Rm — 32-bit MUL T2 (A7.7.130), word 0xFB00F000 | Rn<<16 |
+# Rd<<8 | Rm. Verified: mul r0, r1, r2 = 0xFB01F002. FLAGLESS; computes
+# the low 32 bits of the product (the word model).
+def t2_mul_w(inout b: CodeBuffer, rd: Int, rn: Int, rm: Int) -> Unit
+  if rd < 0 || rd > 12 || rn < 0 || rn > 12 || rm < 0 || rm > 12 then
+    panic("t2_mul_w: registers must be r0-r12")
+  end
+  t2_word(b, 0xFB00F000 | ((rn as u32) << 16) | ((rd as u32) << 8) | (rm as u32))
+end
+
+# MVN.W Rd, Rm — 32-bit MVN (register) T2 (A7.7.132), word 0xEA6F0000 |
+# Rd<<8 | Rm. Verified: mvn.w r0, r1 = 0xEA6F0001; mvn.w r3, r4 =
+# 0xEA6F0304; mvn.w r8, r9 = 0xEA6F0809. FLAGLESS (16-bit MVNS writes
+# flags; LirBitNot needs the flagless form).
+def t2_mvn_w(inout b: CodeBuffer, rd: Int, rm: Int) -> Unit
+  if rd < 0 || rd > 12 || rm < 0 || rm > 12 then
+    panic("t2_mvn_w: registers must be r0-r12")
+  end
+  t2_word(b, 0xEA6F0000 | ((rd as u32) << 8) | (rm as u32))
+end
+
+# NEG (RSB.W Rd, Rn, #0) — 32-bit RSB (immediate) T2 with imm12 = 0
+# (A7.7.166), word 0xF1C00000 | Rn<<16 | Rd<<8. Verified: rsb.w r0, r1,
+# #0 = 0xF1C10000; rsb.w r3, r4, #0 = 0xF1C40300; rsb.w r8, r9, #0 =
+# 0xF1C90800. FLAGLESS (16-bit RSBS writes flags; LirNeg needs the
+# flagless form).
+def t2_neg_w(inout b: CodeBuffer, rd: Int, rn: Int) -> Unit
+  if rd < 0 || rd > 12 || rn < 0 || rn > 12 then
+    panic("t2_neg_w: registers must be r0-r12")
+  end
+  t2_word(b, 0xF1C00000 | ((rn as u32) << 16) | ((rd as u32) << 8))
+end
+
+# LSL.W Rd, Rm, #s — 32-bit LSL (immediate) T2 (A7.7.67): hw1 = 0xEA4F;
+# hw2 = imm3 Rd <s&3><type> Rm with imm3 = s>>2 at bits 14..12, (s&3) at
+# bits 7..6, type = 0 at bits 5..4, Rm at bits 3..0. Verified across the
+# range: lsl.w r0, r1, #1 = 0xEA4F0041, #2 = 0xEA4F0081, #3 = 0xEA4F00C1,
+# #10 = 0xEA4F2081, #16 = 0xEA4F4001, #20 = 0xEA4F5001, #24 = 0xEA4F6001,
+# #30 = 0xEA4F7081, #31 = 0xEA4F70C1; lsl.w r3, r4, #5 = 0xEA4F1344;
+# lsl.w r8, r9, #31 = 0xEA4F78C9. FLAGLESS (16-bit LSLS writes flags).
+def t2_lsl_w_imm(inout b: CodeBuffer, rd: Int, rm: Int, s: Int) -> Unit
+  if rd < 0 || rd > 12 || rm < 0 || rm > 12 then
+    panic("t2_lsl_w_imm: registers must be r0-r12")
+  end
+  if s < 0 || s > 31 then panic("t2_lsl_w_imm: shift must be 0..31") end
+  t2_word(b, 0xEA4F0000 | (((s >> 2) as u32) << 12) | ((rd as u32) << 8) | (((s & 3) as u32) << 6) | (rm as u32))
+end
+
+# LSR.W Rd, Rm, #s — same family with type = 01 (A7.7.135). Verified:
+# lsr.w r0, r1, #16 = 0xEA4F4011. FLAGLESS.
+def t2_lsr_w_imm(inout b: CodeBuffer, rd: Int, rm: Int, s: Int) -> Unit
+  if rd < 0 || rd > 12 || rm < 0 || rm > 12 then
+    panic("t2_lsr_w_imm: registers must be r0-r12")
+  end
+  if s < 0 || s > 31 then panic("t2_lsr_w_imm: shift must be 0..31") end
+  t2_word(b, 0xEA4F0000 | (((s >> 2) as u32) << 12) | ((rd as u32) << 8) | (((s & 3) as u32) << 6) | 0x10 | (rm as u32))
+end
+
+# ASR.W Rd, Rm, #s — same family with type = 10 (A7.7.14). Verified:
+# asr.w r0, r1, #16 = 0xEA4F4021. FLAGLESS.
+def t2_asr_w_imm(inout b: CodeBuffer, rd: Int, rm: Int, s: Int) -> Unit
+  if rd < 0 || rd > 12 || rm < 0 || rm > 12 then
+    panic("t2_asr_w_imm: registers must be r0-r12")
+  end
+  if s < 0 || s > 31 then panic("t2_asr_w_imm: shift must be 0..31") end
+  t2_word(b, 0xEA4F0000 | (((s >> 2) as u32) << 12) | ((rd as u32) << 8) | (((s & 3) as u32) << 6) | 0x20 | (rm as u32))
+end
+
+# LSL.W Rd, Rn, Rm — 32-bit LSL (register) T2 (A7.7.68), word
+# 0xFA00F000 | Rn<<16 | Rd<<8 | Rm (Rn = the value shifted, Rm = count).
+# Verified: lsl.w r0, r1, r2 = 0xFA01F002. FLAGLESS. The count is
+# Rm[7:0] with saturation (>= 32: LSL/LSR -> 0, ASR -> sign-fill) — the
+# 32-bit word model's variable-shift rule.
+def t2_lsl_w_reg(inout b: CodeBuffer, rd: Int, rn: Int, rm: Int) -> Unit
+  if rd < 0 || rd > 12 || rn < 0 || rn > 12 || rm < 0 || rm > 12 then
+    panic("t2_lsl_w_reg: registers must be r0-r12")
+  end
+  t2_word(b, 0xFA00F000 | ((rn as u32) << 16) | ((rd as u32) << 8) | (rm as u32))
+end
+
+# LSR.W Rd, Rn, Rm — 32-bit LSR (register) T2 (A7.7.136), prefix
+# 0xFA20F000. Verified: lsr.w r0, r1, r2 = 0xFA21F002. FLAGLESS.
+def t2_lsr_w_reg(inout b: CodeBuffer, rd: Int, rn: Int, rm: Int) -> Unit
+  if rd < 0 || rd > 12 || rn < 0 || rn > 12 || rm < 0 || rm > 12 then
+    panic("t2_lsr_w_reg: registers must be r0-r12")
+  end
+  t2_word(b, 0xFA20F000 | ((rn as u32) << 16) | ((rd as u32) << 8) | (rm as u32))
+end
+
+# ASR.W Rd, Rn, Rm — 32-bit ASR (register) T2 (A7.7.15), prefix
+# 0xFA40F000. Verified: asr.w r0, r1, r2 = 0xFA41F002. FLAGLESS.
+def t2_asr_w_reg(inout b: CodeBuffer, rd: Int, rn: Int, rm: Int) -> Unit
+  if rd < 0 || rd > 12 || rn < 0 || rn > 12 || rm < 0 || rm > 12 then
+    panic("t2_asr_w_reg: registers must be r0-r12")
+  end
+  t2_word(b, 0xFA40F000 | ((rn as u32) << 16) | ((rd as u32) << 8) | (rm as u32))
+end
+
+# LDR.W Rd, [Rn, #imm12] — 32-bit LDR (immediate) T2 (A7.7.40), word
+# 0xF8D00000 | Rn<<16 | Rd<<12 | imm12 — imm12 is the RAW BYTE offset
+# 0..4095 (NOT scaled, unlike the 16-bit imm5*4 form). Verified:
+# ldr.w r0, [r1, #400] = 0xF8D10190; ldr.w r8, [r9, #8] = 0xF8D98008;
+# ldr.w r3, [r12] = 0xF8DC3000. FLAGLESS.
+def t2_ldr_w_imm12(inout b: CodeBuffer, rd: Int, rn: Int, off: Int) -> Unit
+  if rd < 0 || rd > 12 || rn < 0 || rn > 12 then
+    panic("t2_ldr_w_imm12: registers must be r0-r12")
+  end
+  if off < 0 || off > 4095 then panic("t2_ldr_w_imm12: offset must be 0..4095") end
+  t2_word(b, 0xF8D00000 | ((rn as u32) << 16) | ((rd as u32) << 12) | (off as u32))
+end
+
+# STR.W Rd, [Rn, #imm12] — 32-bit STR (immediate) T2 (A7.7.83), prefix
+# 0xF8C0. Verified: str.w r0, [r1, #400] = 0xF8C10190; str.w r8,
+# [r9, #8] = 0xF8C98008; str.w r0, [sp, #0] = 0xF8CD0000; str.w r12,
+# [sp, #0] = 0xF8CDC000. Rn may be SP (13) in this encoding — the
+# ARMv7-M STR (immediate) T2 base field takes r0-r13 — and the LirPushArg
+# arm uses the SP form for high-register (r8-r10) or temp (r12) values
+# the 16-bit t2_str_sp_imm8 cannot hold; Rd stays a data register
+# (r0-r12). FLAGLESS.
+def t2_str_w_imm12(inout b: CodeBuffer, rd: Int, rn: Int, off: Int) -> Unit
+  if rd < 0 || rd > 12 || rn < 0 || rn > 13 then
+    panic("t2_str_w_imm12: registers must be r0-r12 with an r0-r13 base")
+  end
+  if off < 0 || off > 4095 then panic("t2_str_w_imm12: offset must be 0..4095") end
+  t2_word(b, 0xF8C00000 | ((rn as u32) << 16) | ((rd as u32) << 12) | (off as u32))
+end
+
+# SUB.W SP, SP, Rm — 32-bit SUB (register) T2 with the SP form (Rn =
+# Rd = sp, A7.7.23), word 0xEBAD0D00 | Rm. Verified: sub.w sp, sp, r0 =
+# 0xEBAD0D00; sub.w sp, sp, r12 = 0xEBAD0D0C. FLAGLESS. The big-frame
+# prologue path (frames > 508 bytes).
+def t2_sub_sp_w_reg(inout b: CodeBuffer, rm: Int) -> Unit
+  if rm < 0 || rm > 12 then panic("t2_sub_sp_w_reg: register must be r0-r12") end
+  t2_word(b, 0xEBAD0D00 | (rm as u32))
+end
+
+# ADD.W SP, SP, Rm — 32-bit ADD (register) T2 SP form (A7.7.4), word
+# 0xEB0D0D00 | Rm. Verified: add.w sp, sp, r0 = 0xEB0D0D00; add.w sp,
+# sp, r12 = 0xEB0D0D0C. FLAGLESS. The big-frame epilogue path.
+def t2_add_sp_w_reg(inout b: CodeBuffer, rm: Int) -> Unit
+  if rm < 0 || rm > 12 then panic("t2_add_sp_w_reg: register must be r0-r12") end
+  t2_word(b, 0xEB0D0D00 | (rm as u32))
+end
+
+# B.W rel — 32-bit unconditional branch T4 (A7.7.7): hw1 = 11110 S imm10
+# (0xF000), hw2 = 10 J1 1 J2 imm11 (0x9000 base); the 24-bit offset
+# rel>>1 = S:imm10:I1:I2:imm11 with J1 = NOT(I1 XOR S), J2 = NOT(I2 XOR
+# S). Verified: b.w +4 = 0xF000B802; b.w -4 = 0xF7FFBFFE. rel =
+# target - (insn + 4), even, within +/-16 MiB.
+def t2_b_w(inout b: CodeBuffer, rel: Int) -> Unit
+  if rel < -16777216 || rel > 16777214 || (rel % 2) != 0 then
+    panic("t2_b_w: relative offset must be even and within +/-16 MiB")
+  end
+  t2_word(b, t2_branch24_word(rel, 0x9000))
+end
+
+# BL rel — 32-bit BL T1 (A7.7.10): hw2 base 0xF800 (11 J1 1 J2 imm11),
+# same offset encoding. Verified: bl +2 = 0xF000F801; bl 0 = 0xF000F800;
+# bl -20 = 0xF7FFFFF6. The extern-call placeholder (offset 0) is the
+# canonical 0xF000 0xF800 pair an R_ARM_THM_CALL relocation patches.
+def t2_bl(inout b: CodeBuffer, rel: Int) -> Unit
+  if rel < -16777216 || rel > 16777214 || (rel % 2) != 0 then
+    panic("t2_bl: relative offset must be even and within +/-16 MiB")
+  end
+  t2_word(b, t2_branch24_word(rel, 0xF800))
+end
+
+# The shared 24-bit branch-word builder (B.W hw2 base 0x9000, BL 0xF800).
+def t2_branch24_word(rel: Int, hw2_base: u32) -> u32
+  let imm24 = ((rel >> 1) & 0xFFFFFF) as u32
+  let s = (imm24 >> 23) & 1
+  let imm10 = (imm24 >> 13) & 0x3FF
+  let i1 = (imm24 >> 12) & 1
+  let i2 = (imm24 >> 11) & 1
+  let imm11 = imm24 & 0x7FF
+  let j1 = (if (i1 ^ s) == 0 then 1 else 0 end) as u32
+  let j2 = (if (i2 ^ s) == 0 then 1 else 0 end) as u32
+  0xF0000000 | (s << 26) | (imm10 << 16) | hw2_base | (j1 << 13) | (j2 << 11) | imm11
+end
+
+# ITE <cond> — the IT (if-then) block over the next TWO instructions:
+# the first executes on cond, the second on NOT cond (A7.7.59 IT, mask
+# pattern of the two-instruction then/else form). Verified bytes:
+# ite eq = 0xBF0C, ite ne = 0xBF14, ite hs = 0xBF2C, ite hi = 0xBF8C,
+# ite ge = 0xBFAC, ite lt = 0xBFB4 — the mask is 0xC for even condition
+# codes and 0x4 for odd codes (the else-condition bit interacts with the
+# condition LSB in the mask field). Emitted only for LirCset, whose two
+# conditional MOVS execute after the Cmp's flags were consumed.
+def t2_ite(inout b: CodeBuffer, cond: Int) -> Unit
+  if cond < 0 || cond > 13 then panic("t2_ite: bad condition code") end
+  let mask = (if (cond & 1) == 0 then 0xC else 0x4 end) as u32
+  emit16_le(b, (0xBF00 | ((cond as u32) << 4) | mask) as u16)
+end
+
+# ———————————————————————————————————————————
+# VFP (coprocessor 10/11) encodings — ARMv7-M A7.8 VFP
+# ———————————————————————————————————————————
+# Every VFP instruction is a 32-bit Thumb-2 instruction whose encoding is
+# the classic A32 VFP word with cond = 1110 (first halfword 0xE8xx-0xEFxx,
+# in this backend's region), emitted as its two halfwords by t2_word —
+# exactly like the 32-bit forms above. VERIFIED with an offline
+# assembler/disassembler (verification aid: clang -target
+# armv7-none-eabi -mcpu=cortex-a8 + llvm-objdump, ARM and Thumb-2 state —
+# the Thumb-2 disassembly echoes the A32 word split into the two
+# halfwords t2_word emits, first halfword = bits 31..16): each Verified
+# encoding below is the disassembler echo of the assembled instruction.
+# The VFP register fields split each 5-bit register number between a
+# 4-bit field and one extension bit (Vd's at insn bit 22, Vn's at insn
+# bit 7, Vm's at insn bit 5). The two operand types place the number
+# differently (verified: vadd.f64 d16,d0,d0 = 0xEE700B00 but vadd.f32
+# s16,s0,s0 = 0xEE308A00):
+#   - DOUBLE d0-d31 (Dd/Dn/Dm): field = n & 15, extension = n >> 4.
+#     vadd.f64 d17,d18,d19 = 0xEE721BA3 (Vd 1 + D, Vn 2 + N, Vm 3 + M).
+#   - SINGLE s0-s31 (Sd/Sn/Sm): the register sits in its double-pair
+#     slot: field = n >> 1, extension = parity n & 1.
+#     vadd.f32 s17,s18,s19 = 0xEE798A29 (Vd 8 + D, Vn 9, Vm 9 + M);
+#     vadd.f32 s0,s1,s2 = 0xEE300A81 (only Vn's parity bit 7 is set).
+# Mixed VCVT forms encode the single operand in the same double-slot
+# way (vcvt.f64.s32 d17,s17 = 0xEEF81BE8: Vm field 8 + M = s17).
+# FLAG note: VFP data processing never touches the core APSR NZCV
+# (invariant I1 is untouched); VCMP sets the FPSCR flags, which reach
+# APSR only through the VMRS APSR_nzcv encoder below.
+
+# VADD.F64 Dd, Dn, Dm — 32-bit VFP 3-register data processing (A7.8),
+# word 0xEE300B00 | (Dn&15)<<16 | (Dd&15)<<12 | (Dm&15) | (Dd>>4)<<22 |
+# (Dn>>4)<<7 | (Dm>>4)<<5. Verified: vadd.f64 d0, d0, d0 = 0xEE300B00;
+# vadd.f64 d13, d7, d5 = 0xEE37DB05; vadd.f64 d16, d0, d0 = 0xEE700B00;
+# vadd.f64 d17, d18, d19 = 0xEE721BA3; vadd.f64 d31, d30, d29 =
+# 0xEE7EFBAD.
+def t2_vadd_f64(inout b: CodeBuffer, dd: Int, dn: Int, dm: Int) -> Unit
+  if dd < 0 || dd > 31 then panic("t2_vadd_f64: destination must be d0-d31") end
+  if dn < 0 || dn > 31 then panic("t2_vadd_f64: first source must be d0-d31") end
+  if dm < 0 || dm > 31 then panic("t2_vadd_f64: second source must be d0-d31") end
+  t2_word(b, 0xEE300B00 | (((dn as u32) & 15) << 16) | (((dd as u32) & 15) << 12) | (((dm as u32) >> 4) & 1) << 5 | (((dn as u32) >> 4) & 1) << 7 | (((dd as u32) >> 4) & 1) << 22 | ((dm as u32) & 15))
+end
+
+# VSUB.F64 Dd, Dn, Dm — word 0xEE300B40 | same fields as t2_vadd_f64.
+# Verified: vsub.f64 d0, d0, d0 = 0xEE300B40; vsub.f64 d17, d18, d19 =
+# 0xEE721BE3; vsub.f64 d0, d0, d16 = 0xEE300B60.
+def t2_vsub_f64(inout b: CodeBuffer, dd: Int, dn: Int, dm: Int) -> Unit
+  if dd < 0 || dd > 31 then panic("t2_vsub_f64: destination must be d0-d31") end
+  if dn < 0 || dn > 31 then panic("t2_vsub_f64: first source must be d0-d31") end
+  if dm < 0 || dm > 31 then panic("t2_vsub_f64: second source must be d0-d31") end
+  t2_word(b, 0xEE300B40 | (((dn as u32) & 15) << 16) | (((dd as u32) & 15) << 12) | (((dm as u32) >> 4) & 1) << 5 | (((dn as u32) >> 4) & 1) << 7 | (((dd as u32) >> 4) & 1) << 22 | ((dm as u32) & 15))
+end
+
+# VMUL.F64 Dd, Dn, Dm — word 0xEE200B00 | same fields. Verified:
+# vmul.f64 d0, d0, d0 = 0xEE200B00; vmul.f64 d17, d18, d19 = 0xEE621BA3.
+def t2_vmul_f64(inout b: CodeBuffer, dd: Int, dn: Int, dm: Int) -> Unit
+  if dd < 0 || dd > 31 then panic("t2_vmul_f64: destination must be d0-d31") end
+  if dn < 0 || dn > 31 then panic("t2_vmul_f64: first source must be d0-d31") end
+  if dm < 0 || dm > 31 then panic("t2_vmul_f64: second source must be d0-d31") end
+  t2_word(b, 0xEE200B00 | (((dn as u32) & 15) << 16) | (((dd as u32) & 15) << 12) | (((dm as u32) >> 4) & 1) << 5 | (((dn as u32) >> 4) & 1) << 7 | (((dd as u32) >> 4) & 1) << 22 | ((dm as u32) & 15))
+end
+
+# VDIV.F64 Dd, Dn, Dm — word 0xEE800B00 | same fields. Verified:
+# vdiv.f64 d0, d0, d0 = 0xEE800B00; vdiv.f64 d17, d18, d19 = 0xEEC21BA3.
+def t2_vdiv_f64(inout b: CodeBuffer, dd: Int, dn: Int, dm: Int) -> Unit
+  if dd < 0 || dd > 31 then panic("t2_vdiv_f64: destination must be d0-d31") end
+  if dn < 0 || dn > 31 then panic("t2_vdiv_f64: first source must be d0-d31") end
+  if dm < 0 || dm > 31 then panic("t2_vdiv_f64: second source must be d0-d31") end
+  t2_word(b, 0xEE800B00 | (((dn as u32) & 15) << 16) | (((dd as u32) & 15) << 12) | (((dm as u32) >> 4) & 1) << 5 | (((dn as u32) >> 4) & 1) << 7 | (((dd as u32) >> 4) & 1) << 22 | ((dm as u32) & 15))
+end
+
+# VADD.F32 Sd, Sn, Sm — 32-bit VFP 3-register data processing, single
+# form (sz = 0: [11:8] = 1010), word 0xEE300A00 | (Sn>>1)<<16 |
+# (Sd>>1)<<12 | (Sm>>1) | (Sd&1)<<22 | (Sn&1)<<7 | (Sm&1)<<5 (the
+# double-slot encoding, see the banner). Verified: vadd.f32 s0, s0, s0 =
+# 0xEE300A00; vadd.f32 s0, s1, s2 = 0xEE300A81; vadd.f32 s13, s7, s5 =
+# 0xEE736AA2; vadd.f32 s16, s0, s0 = 0xEE308A00; vadd.f32 s17, s18, s19
+# = 0xEE798A29; vadd.f32 s31, s30, s29 = 0xEE7FFA2E.
+def t2_vadd_f32(inout b: CodeBuffer, sd: Int, sn: Int, sm: Int) -> Unit
+  if sd < 0 || sd > 31 then panic("t2_vadd_f32: destination must be s0-s31") end
+  if sn < 0 || sn > 31 then panic("t2_vadd_f32: first source must be s0-s31") end
+  if sm < 0 || sm > 31 then panic("t2_vadd_f32: second source must be s0-s31") end
+  t2_word(b, 0xEE300A00 | (((sn as u32) >> 1) << 16) | (((sd as u32) >> 1) << 12) | (((sm as u32) & 1) << 5) | (((sn as u32) & 1) << 7) | (((sd as u32) & 1) << 22) | ((sm as u32) >> 1))
+end
+
+# VSUB.F32 Sd, Sn, Sm — word 0xEE300A40 | same fields as t2_vadd_f32.
+# Verified: vsub.f32 s0, s0, s0 = 0xEE300A40; vsub.f32 s17, s18, s19 =
+# 0xEE798A69.
+def t2_vsub_f32(inout b: CodeBuffer, sd: Int, sn: Int, sm: Int) -> Unit
+  if sd < 0 || sd > 31 then panic("t2_vsub_f32: destination must be s0-s31") end
+  if sn < 0 || sn > 31 then panic("t2_vsub_f32: first source must be s0-s31") end
+  if sm < 0 || sm > 31 then panic("t2_vsub_f32: second source must be s0-s31") end
+  t2_word(b, 0xEE300A40 | (((sn as u32) >> 1) << 16) | (((sd as u32) >> 1) << 12) | (((sm as u32) & 1) << 5) | (((sn as u32) & 1) << 7) | (((sd as u32) & 1) << 22) | ((sm as u32) >> 1))
+end
+
+# VMUL.F32 Sd, Sn, Sm — word 0xEE200A00 | same fields. Verified:
+# vmul.f32 s0, s0, s0 = 0xEE200A00; vmul.f32 s17, s18, s19 = 0xEE698A29.
+def t2_vmul_f32(inout b: CodeBuffer, sd: Int, sn: Int, sm: Int) -> Unit
+  if sd < 0 || sd > 31 then panic("t2_vmul_f32: destination must be s0-s31") end
+  if sn < 0 || sn > 31 then panic("t2_vmul_f32: first source must be s0-s31") end
+  if sm < 0 || sm > 31 then panic("t2_vmul_f32: second source must be s0-s31") end
+  t2_word(b, 0xEE200A00 | (((sn as u32) >> 1) << 16) | (((sd as u32) >> 1) << 12) | (((sm as u32) & 1) << 5) | (((sn as u32) & 1) << 7) | (((sd as u32) & 1) << 22) | ((sm as u32) >> 1))
+end
+
+# VDIV.F32 Sd, Sn, Sm — word 0xEE800A00 | same fields. Verified:
+# vdiv.f32 s0, s0, s0 = 0xEE800A00; vdiv.f32 s17, s18, s19 = 0xEEC98A29.
+def t2_vdiv_f32(inout b: CodeBuffer, sd: Int, sn: Int, sm: Int) -> Unit
+  if sd < 0 || sd > 31 then panic("t2_vdiv_f32: destination must be s0-s31") end
+  if sn < 0 || sn > 31 then panic("t2_vdiv_f32: first source must be s0-s31") end
+  if sm < 0 || sm > 31 then panic("t2_vdiv_f32: second source must be s0-s31") end
+  t2_word(b, 0xEE800A00 | (((sn as u32) >> 1) << 16) | (((sd as u32) >> 1) << 12) | (((sm as u32) & 1) << 5) | (((sn as u32) & 1) << 7) | (((sd as u32) & 1) << 22) | ((sm as u32) >> 1))
+end
+
+# VNEG.F64 Dd, Dm — 32-bit VFP 2-register (monadic) data processing,
+# word 0xEEB10B40 | (Dd&15)<<12 | (Dm&15) | (Dd>>4)<<22 | (Dm>>4)<<5
+# (the [19:16] field holds the opcode 0001, not a register).
+# Verified: vneg.f64 d0, d0 = 0xEEB10B40; vneg.f64 d17, d18 = 0xEEF11B62;
+# vneg.f64 d0, d17 = 0xEEB10B61; vneg.f64 d8, d9 = 0xEEB18B49.
+def t2_vneg_f64(inout b: CodeBuffer, dd: Int, dm: Int) -> Unit
+  if dd < 0 || dd > 31 then panic("t2_vneg_f64: destination must be d0-d31") end
+  if dm < 0 || dm > 31 then panic("t2_vneg_f64: source must be d0-d31") end
+  t2_word(b, 0xEEB10B40 | (((dd as u32) & 15) << 12) | (((dm as u32) >> 4) & 1) << 5 | (((dd as u32) >> 4) & 1) << 22 | ((dm as u32) & 15))
+end
+
+# VABS.F64 Dd, Dm — monadic, word 0xEEB00BC0 | same fields as
+# t2_vneg_f64 (opcode [19:16] = 0000, [7:4] = 1100). Verified:
+# vabs.f64 d0, d0 = 0xEEB00BC0; vabs.f64 d17, d18 = 0xEEF01BE2;
+# vabs.f64 d0, d17 = 0xEEB00BE1.
+def t2_vabs_f64(inout b: CodeBuffer, dd: Int, dm: Int) -> Unit
+  if dd < 0 || dd > 31 then panic("t2_vabs_f64: destination must be d0-d31") end
+  if dm < 0 || dm > 31 then panic("t2_vabs_f64: source must be d0-d31") end
+  t2_word(b, 0xEEB00BC0 | (((dd as u32) & 15) << 12) | (((dm as u32) >> 4) & 1) << 5 | (((dd as u32) >> 4) & 1) << 22 | ((dm as u32) & 15))
+end
+
+# VMOV.F64 Dd, Dm (VMOV between two VFP double registers; the ARMv7
+# register-move form) — monadic, word 0xEEB00B40 | same fields as
+# t2_vneg_f64 (opcode [19:16] = 0000, [7:4] = 0100). Verified: vmov.f64
+# d0, d0 = 0xEEB00B40; vmov.f64 d0, d1 = 0xEEB00B41; vmov.f64 d17, d9 =
+# 0xEEF01B49; vmov.f64 d0, d17 = 0xEEB00B61.
+def t2_vmov_f64(inout b: CodeBuffer, dd: Int, dm: Int) -> Unit
+  if dd < 0 || dd > 31 then panic("t2_vmov_f64: destination must be d0-d31") end
+  if dm < 0 || dm > 31 then panic("t2_vmov_f64: source must be d0-d31") end
+  t2_word(b, 0xEEB00B40 | (((dd as u32) & 15) << 12) | (((dm as u32) >> 4) & 1) << 5 | (((dd as u32) >> 4) & 1) << 22 | ((dm as u32) & 15))
+end
+
+# VMOV.F32 Sd, Sm (VMOV between two VFP single registers) — monadic
+# single form, word 0xEEB00A40 | (Sd>>1)<<12 | (Sm>>1) | (Sd&1)<<22 |
+# (Sm&1)<<5 (double-slot encoding). Verified: vmov.f32 s0, s0 =
+# 0xEEB00A40; vmov.f32 s0, s1 = 0xEEB00A60; vmov.f32 s17, s18 =
+# 0xEEF08A49; vmov.f32 s8, s15 = 0xEEB04A67.
+def t2_vmov_f32(inout b: CodeBuffer, sd: Int, sm: Int) -> Unit
+  if sd < 0 || sd > 31 then panic("t2_vmov_f32: destination must be s0-s31") end
+  if sm < 0 || sm > 31 then panic("t2_vmov_f32: source must be s0-s31") end
+  t2_word(b, 0xEEB00A40 | (((sd as u32) >> 1) << 12) | (((sm as u32) & 1) << 5) | (((sd as u32) & 1) << 22) | ((sm as u32) >> 1))
+end
+
+# VCMP.F64 Dd, Dm — monadic compare, word 0xEEB40B40 | same fields as
+# t2_vneg_f64 (opcode [19:16] = 0100, [7:4] = 0100). Sets the FPSCR
+# comparison flags (they reach APSR only via t2_vmrs_apsr_nzcv).
+# Verified: vcmp.f64 d0, d0 = 0xEEB40B40; vcmp.f64 d17, d18 =
+# 0xEEF41B62.
+def t2_vcmp_f64(inout b: CodeBuffer, dd: Int, dm: Int) -> Unit
+  if dd < 0 || dd > 31 then panic("t2_vcmp_f64: destination must be d0-d31") end
+  if dm < 0 || dm > 31 then panic("t2_vcmp_f64: source must be d0-d31") end
+  t2_word(b, 0xEEB40B40 | (((dd as u32) & 15) << 12) | (((dm as u32) >> 4) & 1) << 5 | (((dd as u32) >> 4) & 1) << 22 | ((dm as u32) & 15))
+end
+
+# VCMP.F64 Dd, #0.0 — monadic compare against +0.0 (the ARM
+# "VCMP Dd, #0.0" form), word 0xEEB50B40 | (Dd&15)<<12 | (Dd>>4)<<22
+# (opcode [19:16] = 0101 — no Vm register field). Verified:
+# vcmp.f64 d0, #0.0 = 0xEEB50B40; vcmp.f64 d17, #0.0 = 0xEEF51B40.
+def t2_vcmp_f64_zero(inout b: CodeBuffer, dd: Int) -> Unit
+  if dd < 0 || dd > 31 then panic("t2_vcmp_f64_zero: register must be d0-d31") end
+  t2_word(b, 0xEEB50B40 | (((dd as u32) & 15) << 12) | (((dd as u32) >> 4) & 1) << 22)
+end
+
+# VCVT.F64.S32 Dd, Sm (s32 -> f64) — 32-bit VFP conversion, word
+# 0xEEB80BC0 | (Dd&15)<<12 | (Sm>>1) | (Dd>>4)<<22 | (Sm&1)<<5: the
+# single source sits in the double Vm slot (banner). Verified:
+# vcvt.f64.s32 d0, s0 = 0xEEB80BC0; vcvt.f64.s32 d17, s9 = 0xEEF81BE4;
+# vcvt.f64.s32 d17, s17 = 0xEEF81BE8.
+def t2_vcvt_f64_s32(inout b: CodeBuffer, dd: Int, sm: Int) -> Unit
+  if dd < 0 || dd > 31 then panic("t2_vcvt_f64_s32: destination must be d0-d31") end
+  if sm < 0 || sm > 31 then panic("t2_vcvt_f64_s32: source must be s0-s31") end
+  t2_word(b, 0xEEB80BC0 | (((dd as u32) & 15) << 12) | ((sm as u32) >> 1) | (((dd as u32) >> 4) & 1) << 22 | (((sm as u32) & 1) << 5))
+end
+
+# VCVT.S32.F64 Sd, Dm (f64 -> s32) — word 0xEEBD0BC0 | (Sd>>1)<<12 |
+# (Dm&15) | (Sd&1)<<22 | (Dm>>4)<<5: the single destination sits in the
+# double Vd slot. Verified: vcvt.s32.f64 s0, d0 = 0xEEBD0BC0;
+# vcvt.s32.f64 s17, d9 = 0xEEFD8BC9; vcvt.s32.f64 s9, d17 = 0xEEFD4BE1.
+def t2_vcvt_s32_f64(inout b: CodeBuffer, sd: Int, dm: Int) -> Unit
+  if sd < 0 || sd > 31 then panic("t2_vcvt_s32_f64: destination must be s0-s31") end
+  if dm < 0 || dm > 31 then panic("t2_vcvt_s32_f64: source must be d0-d31") end
+  t2_word(b, 0xEEBD0BC0 | (((sd as u32) >> 1) << 12) | (((dm as u32) >> 4) & 1) << 5 | (((sd as u32) & 1) << 22) | ((dm as u32) & 15))
+end
+
+# VCVT.F64.U32 Dd, Sm (u32 -> f64) — word 0xEEB80B40 | same fields as
+# t2_vcvt_f64_s32. Verified: vcvt.f64.u32 d0, s0 = 0xEEB80B40;
+# vcvt.f64.u32 d17, s17 = 0xEEF81B68.
+def t2_vcvt_f64_u32(inout b: CodeBuffer, dd: Int, sm: Int) -> Unit
+  if dd < 0 || dd > 31 then panic("t2_vcvt_f64_u32: destination must be d0-d31") end
+  if sm < 0 || sm > 31 then panic("t2_vcvt_f64_u32: source must be s0-s31") end
+  t2_word(b, 0xEEB80B40 | (((dd as u32) & 15) << 12) | ((sm as u32) >> 1) | (((dd as u32) >> 4) & 1) << 22 | (((sm as u32) & 1) << 5))
+end
+
+# VCVT.U32.F64 Sd, Dm (f64 -> u32) — word 0xEEBC0BC0 | same fields as
+# t2_vcvt_s32_f64. Verified: vcvt.u32.f64 s0, d0 = 0xEEBC0BC0;
+# vcvt.u32.f64 s17, d9 = 0xEEFC8BC9.
+def t2_vcvt_u32_f64(inout b: CodeBuffer, sd: Int, dm: Int) -> Unit
+  if sd < 0 || sd > 31 then panic("t2_vcvt_u32_f64: destination must be s0-s31") end
+  if dm < 0 || dm > 31 then panic("t2_vcvt_u32_f64: source must be d0-d31") end
+  t2_word(b, 0xEEBC0BC0 | (((sd as u32) >> 1) << 12) | (((dm as u32) >> 4) & 1) << 5 | (((sd as u32) & 1) << 22) | ((dm as u32) & 15))
+end
+
+# VCVT.F64.F32 Dd, Sm (f32 -> f64) — word 0xEEB70AC0 | same fields as
+# t2_vcvt_f64_s32. Verified: vcvt.f64.f32 d0, s0 = 0xEEB70AC0;
+# vcvt.f64.f32 d17, s9 = 0xEEF71AE4; vcvt.f64.f32 d9, s17 = 0xEEB79AE8.
+def t2_vcvt_f64_f32(inout b: CodeBuffer, dd: Int, sm: Int) -> Unit
+  if dd < 0 || dd > 31 then panic("t2_vcvt_f64_f32: destination must be d0-d31") end
+  if sm < 0 || sm > 31 then panic("t2_vcvt_f64_f32: source must be s0-s31") end
+  t2_word(b, 0xEEB70AC0 | (((dd as u32) & 15) << 12) | ((sm as u32) >> 1) | (((dd as u32) >> 4) & 1) << 22 | (((sm as u32) & 1) << 5))
+end
+
+# VCVT.F32.F64 Sd, Dm (f64 -> f32) — word 0xEEB70BC0 | same fields as
+# t2_vcvt_s32_f64. Verified: vcvt.f32.f64 s0, d0 = 0xEEB70BC0;
+# vcvt.f32.f64 s17, d9 = 0xEEF78BC9; vcvt.f32.f64 s9, d17 = 0xEEF74BE1.
+def t2_vcvt_f32_f64(inout b: CodeBuffer, sd: Int, dm: Int) -> Unit
+  if sd < 0 || sd > 31 then panic("t2_vcvt_f32_f64: destination must be s0-s31") end
+  if dm < 0 || dm > 31 then panic("t2_vcvt_f32_f64: source must be d0-d31") end
+  t2_word(b, 0xEEB70BC0 | (((sd as u32) >> 1) << 12) | (((dm as u32) >> 4) & 1) << 5 | (((sd as u32) & 1) << 22) | ((dm as u32) & 15))
+end
+
+# VCVT.S32.F32 Sd, Sm (f32 -> s32) — single-only conversion (sz = 0),
+# word 0xEEBD0AC0 | (Sd>>1)<<12 | (Sm>>1) | (Sd&1)<<22 | (Sm&1)<<5.
+# Verified: vcvt.s32.f32 s0, s0 = 0xEEBD0AC0; vcvt.s32.f32 s17, s18 =
+# 0xEEFD8AC9.
+def t2_vcvt_s32_f32(inout b: CodeBuffer, sd: Int, sm: Int) -> Unit
+  if sd < 0 || sd > 31 then panic("t2_vcvt_s32_f32: destination must be s0-s31") end
+  if sm < 0 || sm > 31 then panic("t2_vcvt_s32_f32: source must be s0-s31") end
+  t2_word(b, 0xEEBD0AC0 | (((sd as u32) >> 1) << 12) | (((sm as u32) & 1) << 5) | (((sd as u32) & 1) << 22) | ((sm as u32) >> 1))
+end
+
+# VCVT.F32.S32 Sd, Sm (s32 -> f32) — word 0xEEB80AC0 | same fields as
+# t2_vcvt_s32_f32. Verified: vcvt.f32.s32 s0, s0 = 0xEEB80AC0;
+# vcvt.f32.s32 s17, s18 = 0xEEF88AC9.
+def t2_vcvt_f32_s32(inout b: CodeBuffer, sd: Int, sm: Int) -> Unit
+  if sd < 0 || sd > 31 then panic("t2_vcvt_f32_s32: destination must be s0-s31") end
+  if sm < 0 || sm > 31 then panic("t2_vcvt_f32_s32: source must be s0-s31") end
+  t2_word(b, 0xEEB80AC0 | (((sd as u32) >> 1) << 12) | (((sm as u32) & 1) << 5) | (((sd as u32) & 1) << 22) | ((sm as u32) >> 1))
+end
+
+# VCVT.U32.F32 Sd, Sm (f32 -> u32) — word 0xEEBC0AC0 | same fields as
+# t2_vcvt_s32_f32. Verified: vcvt.u32.f32 s0, s0 = 0xEEBC0AC0;
+# vcvt.u32.f32 s17, s18 = 0xEEFC8AC9.
+def t2_vcvt_u32_f32(inout b: CodeBuffer, sd: Int, sm: Int) -> Unit
+  if sd < 0 || sd > 31 then panic("t2_vcvt_u32_f32: destination must be s0-s31") end
+  if sm < 0 || sm > 31 then panic("t2_vcvt_u32_f32: source must be s0-s31") end
+  t2_word(b, 0xEEBC0AC0 | (((sd as u32) >> 1) << 12) | (((sm as u32) & 1) << 5) | (((sd as u32) & 1) << 22) | ((sm as u32) >> 1))
+end
+
+# VCVT.F32.U32 Sd, Sm (u32 -> f32) — word 0xEEB80A40 | same fields as
+# t2_vcvt_s32_f32. Verified: vcvt.f32.u32 s0, s0 = 0xEEB80A40;
+# vcvt.f32.u32 s17, s18 = 0xEEF88A49.
+def t2_vcvt_f32_u32(inout b: CodeBuffer, sd: Int, sm: Int) -> Unit
+  if sd < 0 || sd > 31 then panic("t2_vcvt_f32_u32: destination must be s0-s31") end
+  if sm < 0 || sm > 31 then panic("t2_vcvt_f32_u32: source must be s0-s31") end
+  t2_word(b, 0xEEB80A40 | (((sd as u32) >> 1) << 12) | (((sm as u32) & 1) << 5) | (((sd as u32) & 1) << 22) | ((sm as u32) >> 1))
+end
+
+# VLDR.F64 Dd, [Rn, #off] — 32-bit VFP load (A7.8), word 0xED900B00 |
+# Rn<<16 | (Dd&15)<<12 | imm8 | (Dd>>4)<<22 for off >= 0 and
+# 0xED100B00 | ... for off < 0 (bit 23 = U: 1 adds, 0 subtracts); imm8 =
+# |off|/4, so off is a 4-aligned -1020..1020 byte offset; Rn = r0-r13
+# (SP allowed — the 16-bit LDR has no SP base, so this is the SP-relative
+# double load form). Verified: vldr.f64 d0, [r0, #0] = 0xED900B00;
+# vldr.f64 d17, [r3, #40] = 0xEDD31B0A; vldr.f64 d17, [r3, #-40] =
+# 0xED531B0A; vldr.f64 d9, [r12, #-1020] = 0xED1C9BFF. FLAGLESS.
+def t2_vldr_f64(inout b: CodeBuffer, dd: Int, rn: Int, off: Int) -> Unit
+  if dd < 0 || dd > 31 then panic("t2_vldr_f64: register must be d0-d31") end
+  if rn < 0 || rn > 13 then panic("t2_vldr_f64: base must be r0-r13") end
+  if off < -1020 || off > 1020 || (off % 4) != 0 then
+    panic("t2_vldr_f64: offset must be a 4-aligned -1020..1020")
+  end
+  let u = (if off >= 0 then 0x800000 else 0 end) as u32
+  let imm8 = ((if off < 0 then -off else off end) / 4) as u32
+  t2_word(b, 0xED100B00 | u | (((dd as u32) >> 4) & 1) << 22 | ((rn as u32) << 16) | (((dd as u32) & 15) << 12) | (imm8 & 0xFF))
+end
+
+# VSTR.F64 Dd, [Rn, #off] — 32-bit VFP store, word 0xED800B00 | ... for
+# off >= 0 and 0xED000B00 | ... for off < 0 (bit 20 = L is 0), fields as
+# t2_vldr_f64. Verified: vstr.f64 d0, [r0, #0] = 0xED800B00;
+# vstr.f64 d17, [r3, #40] = 0xEDC31B0A; vstr.f64 d17, [r3, #-40] =
+# 0xED431B0A; vstr.f64 d17, [r3, #1020] = 0xEDC31BFF. FLAGLESS.
+def t2_vstr_f64(inout b: CodeBuffer, dd: Int, rn: Int, off: Int) -> Unit
+  if dd < 0 || dd > 31 then panic("t2_vstr_f64: register must be d0-d31") end
+  if rn < 0 || rn > 13 then panic("t2_vstr_f64: base must be r0-r13") end
+  if off < -1020 || off > 1020 || (off % 4) != 0 then
+    panic("t2_vstr_f64: offset must be a 4-aligned -1020..1020")
+  end
+  let u = (if off >= 0 then 0x800000 else 0 end) as u32
+  let imm8 = ((if off < 0 then -off else off end) / 4) as u32
+  t2_word(b, 0xED000B00 | u | (((dd as u32) >> 4) & 1) << 22 | ((rn as u32) << 16) | (((dd as u32) & 15) << 12) | (imm8 & 0xFF))
+end
+
+# VLDR.F32 Sd, [Rn, #off] — single form, word 0xED900A00 | ... for
+# off >= 0 and 0xED100A00 | ... for off < 0 with (Sd>>1)<<12 | (Sd&1)<<22
+# (double-slot encoding; imm8/offset/base ranges as t2_vldr_f64).
+# Verified: vldr.f32 s0, [r0, #0] = 0xED900A00; vldr.f32 s17, [r3, #40] =
+# 0xEDD38A0A; vldr.f32 s17, [r3, #-40] = 0xED538A0A. FLAGLESS.
+def t2_vldr_f32(inout b: CodeBuffer, sd: Int, rn: Int, off: Int) -> Unit
+  if sd < 0 || sd > 31 then panic("t2_vldr_f32: register must be s0-s31") end
+  if rn < 0 || rn > 13 then panic("t2_vldr_f32: base must be r0-r13") end
+  if off < -1020 || off > 1020 || (off % 4) != 0 then
+    panic("t2_vldr_f32: offset must be a 4-aligned -1020..1020")
+  end
+  let u = (if off >= 0 then 0x800000 else 0 end) as u32
+  let imm8 = ((if off < 0 then -off else off end) / 4) as u32
+  t2_word(b, 0xED100A00 | u | (((sd as u32) & 1) << 22) | ((rn as u32) << 16) | (((sd as u32) >> 1) << 12) | (imm8 & 0xFF))
+end
+
+# VSTR.F32 Sd, [Rn, #off] — word 0xED800A00 | ... for off >= 0 and
+# 0xED000A00 | ... for off < 0, fields as t2_vldr_f32. Verified:
+# vstr.f32 s0, [r0, #0] = 0xED800A00; vstr.f32 s17, [r3, #40] =
+# 0xEDC38A0A; vstr.f32 s17, [r3, #-40] = 0xED438A0A. FLAGLESS.
+def t2_vstr_f32(inout b: CodeBuffer, sd: Int, rn: Int, off: Int) -> Unit
+  if sd < 0 || sd > 31 then panic("t2_vstr_f32: register must be s0-s31") end
+  if rn < 0 || rn > 13 then panic("t2_vstr_f32: base must be r0-r13") end
+  if off < -1020 || off > 1020 || (off % 4) != 0 then
+    panic("t2_vstr_f32: offset must be a 4-aligned -1020..1020")
+  end
+  let u = (if off >= 0 then 0x800000 else 0 end) as u32
+  let imm8 = ((if off < 0 then -off else off end) / 4) as u32
+  t2_word(b, 0xED000A00 | u | (((sd as u32) & 1) << 22) | ((rn as u32) << 16) | (((sd as u32) >> 1) << 12) | (imm8 & 0xFF))
+end
+
+# VMRS APSR_nzcv, FPSCR — 32-bit VFP system-register move to the APSR
+# flags (Rt = 15, the APSR_nzcv form), word 0xEEF1FA10. Copies the
+# FPSCR N/Z/C/V flags into APSR — the ONLY way floating comparisons
+# (t2_vcmp_f64) reach the core NZCV flags; WRITES NZCV. Verified:
+# vmrs APSR_nzcv, FPSCR = 0xEEF1FA10 (and vmrs r0, FPSCR = 0xEEF10A10,
+# vmrs r5, FPSCR = 0xEEF15A10 pin Rt at bits 15..12).
+def t2_vmrs_apsr_nzcv(inout b: CodeBuffer) -> Unit
+  t2_word(b, 0xEEF1FA10)
+end
+
+# VNEG.F32 Sd, Sm — monadic single negation, word 0xEEB10A40 |
+# (Sd>>1)<<12 | (Sm>>1) | (Sd&1)<<22 | (Sm&1)<<5: the sz = 0 sibling of
+# t2_vneg_f64 ([11:8] = 1010; [19:16] holds the monadic opcode 0001, not
+# a register), s-registers in the double-pair slot with the parity bits
+# D/M at 22/5 exactly like t2_vadd_f32. Verified: vneg.f32 s0, s0 =
+# 0xEEB10A40; vneg.f32 s0, s1 = 0xEEB10A60; vneg.f32 s1, s0 = 0xEEF10A40;
+# vneg.f32 s13, s7 = 0xEEF16A63; vneg.f32 s17, s18 = 0xEEF18A49;
+# vneg.f32 s31, s30 = 0xEEF1FA4F; vneg.f32 s16, s0 = 0xEEB18A40;
+# vneg.f32 s30, s31 = 0xEEB1FA6F; vneg.f32 s15, s8 = 0xEEF17A44.
+# FLAGLESS (VFP data processing never writes the core APSR).
+def t2_vneg_f32(inout b: CodeBuffer, sd: Int, sm: Int) -> Unit
+  if sd < 0 || sd > 31 then panic("t2_vneg_f32: destination must be s0-s31") end
+  if sm < 0 || sm > 31 then panic("t2_vneg_f32: source must be s0-s31") end
+  t2_word(b, 0xEEB10A40 | (((sd as u32) >> 1) << 12) | (((sm as u32) & 1) << 5) | (((sd as u32) & 1) << 22) | ((sm as u32) >> 1))
+end
+
+# VCMP.F32 Sd, Sm — monadic single compare, word 0xEEB40A40 | same fields
+# as t2_vneg_f32 (the f32 sibling of t2_vcmp_f64: opcode [19:16] = 0100,
+# [7:4] = 0100). Sets the FPSCR comparison flags (they reach APSR only
+# through t2_vmrs_apsr_nzcv). Verified: vcmp.f32 s0, s0 = 0xEEB40A40;
+# vcmp.f32 s0, s1 = 0xEEB40A60; vcmp.f32 s1, s0 = 0xEEF40A40;
+# vcmp.f32 s17, s18 = 0xEEF48A49; vcmp.f32 s31, s30 = 0xEEF4FA4F;
+# vcmp.f32 s13, s7 = 0xEEF46A63; vcmp.f32 s16, s0 = 0xEEB48A40;
+# vcmp.f32 s30, s31 = 0xEEB4FA6F.
+def t2_vcmp_f32(inout b: CodeBuffer, sd: Int, sm: Int) -> Unit
+  if sd < 0 || sd > 31 then panic("t2_vcmp_f32: register must be s0-s31") end
+  if sm < 0 || sm > 31 then panic("t2_vcmp_f32: source must be s0-s31") end
+  t2_word(b, 0xEEB40A40 | (((sd as u32) >> 1) << 12) | (((sm as u32) & 1) << 5) | (((sd as u32) & 1) << 22) | ((sm as u32) >> 1))
+end
+
+# VCMP.F32 Sd, #0.0 — compare against +0.0, word 0xEEB50A40 |
+# (Sd>>1)<<12 | (Sd&1)<<22 (opcode [19:16] = 0101; no Vm field), the f32
+# sibling of t2_vcmp_f64_zero. Sets the FPSCR comparison flags. Verified:
+# vcmp.f32 s0, #0.0 = 0xEEB50A40; vcmp.f32 s17, #0.0 = 0xEEF58A40;
+# vcmp.f32 s31, #0.0 = 0xEEF5FA40; vcmp.f32 s16, #0.0 = 0xEEB58A40;
+# vcmp.f32 s1, #0.0 = 0xEEF50A40; vcmp.f32 s9, #0.0 = 0xEEF54A40.
+def t2_vcmp_f32_zero(inout b: CodeBuffer, sd: Int) -> Unit
+  if sd < 0 || sd > 31 then panic("t2_vcmp_f32_zero: register must be s0-s31") end
+  t2_word(b, 0xEEB50A40 | (((sd as u32) >> 1) << 12) | (((sd as u32) & 1) << 22))
+end
+
+# VMOV Sd, Rt — VFP single register <- ARM core register (the MCR p10,
+# L = 0 form of the core<->VFP move), word 0xEE000A10 | (Sd>>1)<<16 |
+# (Sd&1)<<7 | Rt<<12. The s-register field is the MCR/MRC CRn form, NOT
+# the data-processing double slot: Sd>>1 at bits 19..16 and the parity
+# bit at bit 7 (verified against vmov s0, r1 = 0xEE001A10 and
+# vmov s1, r0 = 0xEE000A90 — parity at 7, not 22), Rt at bits 15..12.
+# Verified: vmov s0, r0 = 0xEE000A10; vmov s17, r3 = 0xEE083A90;
+# vmov s31, r12 = 0xEE0FCA90; vmov s13, r2 = 0xEE062A90; vmov s16, r9 =
+# 0xEE089A10; vmov s14, r3 = 0xEE073A10; vmov s30, r10 = 0xEE0FAA10.
+# Rt = r0-r14 (r15 is excluded: the MCR Rt = 15 form is architecturally
+# UNPREDICTABLE — the APSR variant belongs to VMRS). FLAGLESS.
+def t2_vmov_gp_to_s(inout b: CodeBuffer, rt: Int, sd: Int) -> Unit
+  if rt < 0 || rt > 14 then panic("t2_vmov_gp_to_s: register must be r0-r14") end
+  if sd < 0 || sd > 31 then panic("t2_vmov_gp_to_s: register must be s0-s31") end
+  t2_word(b, 0xEE000A10 | (((sd as u32) >> 1) << 16) | (((sd as u32) & 1) << 7) | ((rt as u32) << 12))
+end
+
+# VMOV Rt, Sd — ARM core register <- VFP single (the MRC p10, L = 1 form;
+# the ARM mnemonic is "VMOV <Rt>, <Sd>"), word 0xEE100A10 | same fields
+# as t2_vmov_gp_to_s (Sd>>1 at bits 19..16, Sd&1 at bit 7, Rt at bits
+# 15..12). Verified: vmov r0, s0 = 0xEE100A10; vmov r0, s1 = 0xEE100A90;
+# vmov r3, s17 = 0xEE183A90; vmov r12, s31 = 0xEE1FCA90; vmov r2, s13 =
+# 0xEE162A90; vmov r0, s31 = 0xEE1F0A90; vmov r13, s5 = 0xEE12DA90.
+# Rt = r0-r14 as above. FLAGLESS.
+def t2_vmov_s_to_gp(inout b: CodeBuffer, rt: Int, sd: Int) -> Unit
+  if rt < 0 || rt > 14 then panic("t2_vmov_s_to_gp: register must be r0-r14") end
+  if sd < 0 || sd > 31 then panic("t2_vmov_s_to_gp: register must be s0-s31") end
+  t2_word(b, 0xEE100A10 | (((sd as u32) >> 1) << 16) | (((sd as u32) & 1) << 7) | ((rt as u32) << 12))
+end
+
+# VMOV Dd, Rt, Rt2 — VFP double register <- ARM core register pair (the
+# MCRR p11, L = 0 form; ARM mnemonic "VMOV <Dd>, <Rt>, <Rt2>"), word
+# 0xEC400B10 | Rt2<<16 | Rt<<12 | (Dd>>4)<<5 | (Dd&15). The double
+# register splits across bits 3..0 (Dd&15) and the D parity at bit 5
+# (NOT 22): verified with vmov d1, r0, r1 = 0xEC410B11 (d1 = bit 0) and
+# vmov d16, r0, r1 = 0xEC410B30 (d16 = bit 5). The FIRST core operand of
+# the mnemonic sits at bits 15..12 and the SECOND at 19..16 (verified:
+# vmov d0, r1, r2 = 0xEC421B10; vmov d2, r1, r3 = 0xEC431B12). Verified:
+# vmov d0, r0, r1 = 0xEC410B10; vmov d17, r4, r5 = 0xEC454B31;
+# vmov d31, r10, r11 = 0xEC4BAB3F; vmov d13, r7, r8 = 0xEC487B1D;
+# vmov d6, r3, r12 = 0xEC4C3B16; vmov d8, r11, r9 = 0xEC49BB18.
+# Rt/Rt2 = r0-r14 (r15 is excluded: Rt2 = r15 is UNPREDICTABLE in the
+# MCRR form). FLAGLESS.
+def t2_vmov_gp_pair_to_d(inout b: CodeBuffer, rt: Int, rt2: Int, dd: Int) -> Unit
+  if rt < 0 || rt > 14 then panic("t2_vmov_gp_pair_to_d: register must be r0-r14") end
+  if rt2 < 0 || rt2 > 14 then panic("t2_vmov_gp_pair_to_d: second register must be r0-r14") end
+  if dd < 0 || dd > 31 then panic("t2_vmov_gp_pair_to_d: register must be d0-d31") end
+  t2_word(b, 0xEC400B10 | ((rt2 as u32) << 16) | ((rt as u32) << 12) | ((((dd as u32) >> 4) & 1) << 5) | ((dd as u32) & 15))
+end
+
+# VMOV Rt, Rt2, Dd — ARM core register pair <- VFP double (the MRRC p11,
+# L = 1 form; ARM mnemonic "VMOV <Rt>, <Rt2>, <Dd>"), word 0xEC500B10 |
+# same fields as t2_vmov_gp_pair_to_d. Verified: vmov r0, r1, d0 =
+# 0xEC510B10; vmov r1, r2, d1 = 0xEC521B11; vmov r2, r3, d0 = 0xEC532B10;
+# vmov r4, r5, d17 = 0xEC554B31; vmov r10, r11, d31 = 0xEC5BAB3F;
+# vmov r7, r8, d13 = 0xEC587B1D; vmov r0, r1, d16 = 0xEC510B30;
+# vmov r3, r12, d6 = 0xEC5C3B16; vmov r0, r1, d15 = 0xEC510B1F.
+# Rt/Rt2 = r0-r14 (Rt2 = r15 is UNPREDICTABLE in the MRRC form). FLAGLESS.
+def t2_vmov_d_to_gp_pair(inout b: CodeBuffer, rt: Int, rt2: Int, dd: Int) -> Unit
+  if rt < 0 || rt > 14 then panic("t2_vmov_d_to_gp_pair: register must be r0-r14") end
+  if rt2 < 0 || rt2 > 14 then panic("t2_vmov_d_to_gp_pair: second register must be r0-r14") end
+  if dd < 0 || dd > 31 then panic("t2_vmov_d_to_gp_pair: register must be d0-d31") end
+  t2_word(b, 0xEC500B10 | ((rt2 as u32) << 16) | ((rt as u32) << 12) | ((((dd as u32) >> 4) & 1) << 5) | ((dd as u32) & 15))
+end
+
+# VMOV.F64 Dd, #imm — VFP modified-immediate load into a double register
+# (A7.8 VMOVimmediate; cond 1110, [23:20] = 1011 with D at bit 22, sz =
+# 1 ([11:8] = 1011), [7:4] = 0000). The 8-bit immediate imm8 = abcdefgh
+# is SPLIT across the instruction: bits a:bcd (imm8's high nibble) at
+# bits 19..16 and bits e:fgh (imm8's low nibble) at bits 3..0 — [19:16]
+# carries immediate data, NOT an opcode, so the imm-independent base is
+# 0xEEB00B00. Word: 0xEEB00B00 | ((imm8 & 0xF0)<<12) | ((Dd&15)<<12) |
+# ((Dd>>4)<<22) | (imm8 & 15). Value semantics of imm8 (the VFP
+# modified-immediate rule, verified exhaustively — all 256 imm8 values
+# round-tripped through BOTH decoders below, 0/256 mismatches each):
+#   sign a = imm8 bit 7; fraction f = imm8 bits 3..0; exponent-field
+#   bits bcd = imm8 bits 6..4 give the power E = bcd+1 (bcd 0..3, E =
+#   1..4) or E = bcd-7 (bcd 4..7, E = -3..0); the value is
+#   (-1)^a * (1 + f/16) * 2^E. Equivalently the encodable bit patterns
+#   are the normal numbers with unbiased exponent E in [-3, 4] whose
+#   fraction is exactly f/16 (see t2_vmov_f64_const). Imm8 encodings of
+#   the common constants (each Verified by assembling the literal):
+#   #1.0 = 0x70 (vmov.f64 d0, #1.0 = 0xEEB70B00), #-1.0 = 0xF0
+#   (0xEEBF0B00), #0.5 = 0x60 (0xEEB60B00), #2.0 = 0x00 (0xEEB00B00),
+#   #0.25 = 0x50, #4.0 = 0x10, #8.0 = 0x20, #0.125 = 0x40 (0xEEB40B00),
+#   #16.0 = 0x30 (0xEEB30B00), #-0.5 = 0xE0, #-2.0 = 0x80, #0.75 = 0x68,
+#   #1.5 = 0x78, #3.0 = 0x08, #3.5 = 0x0C, #15.5 = 0x2F. ZERO IS NOT
+#   ENCODABLE: the assembler rejects vmov.f64 d0, #0.0 and #-0.0
+#   (modified immediates always carry a leading 1.mantissa), so
+#   t2_vmov_f64_const returns false for the 0.0 bit patterns. Register
+#   fields (double-slot Dd, D at bit 22) verified: vmov.f64 d17, #1.0 =
+#   0xEEF71B00; vmov.f64 d31, #0.5 = 0xEEF6FB00; vmov.f64 d16, #-1.0 =
+#   0xEEFF0B00; vmov.f64 d13, #2.0 = 0xEEB0DB00; vmov.f64 d1, #1.0 =
+#   0xEEB71B00; vmov.f64 d30, #0.5 = 0xEEF6EB00; vmov.f64 d9, #0.0 is
+#   rejected. FLAGLESS. (Verification aid for this encoder family: clang
+#   -target thumbv7em-none-eabi -mcpu=cortex-m7 -mfpu=vfpv3 assembling
+#   each literal, words echoed by llvm-objdump AND independently decoded
+#   by capstone Thumb-2; the imm8 rule above matches all 256 words in
+#   both decoders for the f64 AND f32 forms.)
+def t2_vmov_f64_imm(inout b: CodeBuffer, dd: Int, imm8: Int) -> Unit
+  if dd < 0 || dd > 31 then panic("t2_vmov_f64_imm: register must be d0-d31") end
+  if imm8 < 0 || imm8 > 255 then panic("t2_vmov_f64_imm: imm8 must be 0-255") end
+  t2_word(b, 0xEEB00B00 | (((imm8 as u32) & 0xF0) << 12) | (((dd as u32) & 15) << 12) | ((((dd as u32) >> 4) & 1) << 22) | ((imm8 as u32) & 15))
+end
+
+# VMOV.F32 Sd, #imm — the single-precision form of the modified-immediate
+# load: word 0xEEB00A00 | ((imm8 & 0xF0)<<12) | ((Sd>>1)<<12) |
+# ((Sd&1)<<22) | (imm8 & 15) (sz = 0, [11:8] = 1010; Sd in the
+# double-pair slot). imm8 and its value semantics are IDENTICAL to
+# t2_vmov_f64_imm (same 256-value table, verified in both decoders).
+# Verified: vmov.f32 s0, #1.0 = 0xEEB70A00; vmov.f32 s0, #-1.0 =
+# 0xEEBF0A00; vmov.f32 s0, #0.5 = 0xEEB60A00; vmov.f32 s0, #2.0 =
+# 0xEEB00A00; vmov.f32 s17, #1.0 = 0xEEF78A00; vmov.f32 s31, #0.5 =
+# 0xEEF6FA00; vmov.f32 s16, #-1.0 = 0xEEBF8A00; vmov.f32 s13, #2.0 =
+# 0xEEF06A00; vmov.f32 s1, #1.0 = 0xEEF70A00; vmov.f32 s30, #0.5 =
+# 0xEEB6FA00; vmov.f32 s9, #0.0 is rejected (zero is not encodable).
+# FLAGLESS.
+def t2_vmov_f32_imm(inout b: CodeBuffer, sd: Int, imm8: Int) -> Unit
+  if sd < 0 || sd > 31 then panic("t2_vmov_f32_imm: register must be s0-s31") end
+  if imm8 < 0 || imm8 > 255 then panic("t2_vmov_f32_imm: imm8 must be 0-255") end
+  t2_word(b, 0xEEB00A00 | (((imm8 as u32) & 0xF0) << 12) | (((sd as u32) >> 1) << 12) | (((sd as u32) & 1) << 22) | ((imm8 as u32) & 15))
+end
+
+# The exact accept test for t2_vmov_f64_const: an f64 bit pattern has a
+# modified-immediate encoding iff it is a normal number whose unbiased
+# exponent E = exp_field - 1023 lies in [-3, 4] and whose 52-bit
+# fraction is f<<48 for some 4-bit f (the low 48 fraction bits are
+# zero) — the value is then (-1)^sign * (1 + f/16) * 2^E, imm8 =
+# sign<<7 | ((E-1)&7)<<4 | f. The exponent field maps onto imm8's bcd
+# bits as (E-1)&7 = exp_field & 7 (1023 = 1024-1, so E-1 = exp_field -
+# 1024 and 1024 is 0 mod 8). Verified: the accept set above agrees with
+# the assembler on every boundary and reject probe — #0.125 (E = -3,
+# exp 1020) encodes, #0.0625 (E = -4) is rejected, #16.0 (E = 4, exp
+# 1027) encodes, #32.0 (E = 5) and #0.0/#-0.0 are rejected, and every
+# accepted value's word matches t2_vmov_f64_imm's output. Returns true
+# iff `bits` has an encoding (and emits the VMOV); false otherwise.
+def t2_vmov_f64_const(inout b: CodeBuffer, dd: Int, bits: u64) -> Bool
+  if dd < 0 || dd > 31 then panic("t2_vmov_f64_const: register must be d0-d31") end
+  let e = bits >> 52
+  if e < 1020 || e > 1027 then
+    return false
+  end
+  let m = (bits << 12) >> 12
+  let f = m >> 48
+  if (f << 48) != m then
+    return false
+  end
+  let imm8 = ((((bits >> 63) & 1) << 7) | ((e & 7) << 4) | f) as Int
+  t2_vmov_f64_imm(b, dd, imm8)
+  true
+end
+
+# The single-precision sibling of t2_vmov_f64_const: the SAME encodable
+# value set, tested on the f32 bit pattern (unbiased exponent E =
+# exp_field - 127 in [-3, 4], i.e. exp_field 124..131, fraction exactly
+# f<<19). Verified against the assembler on the same probes
+# (vmov.f32 s0, #0.5 = 0xEEB60A00 etc.), including the zero rejection.
+def t2_vmov_f32_const(inout b: CodeBuffer, sd: Int, bits: u32) -> Bool
+  if sd < 0 || sd > 31 then panic("t2_vmov_f32_const: register must be s0-s31") end
+  let e = (bits >> 23) & 0xFF
+  if e < 124 || e > 131 then
+    return false
+  end
+  let m = bits & 0x7FFFFF
+  let f = m >> 19
+  if (f << 19) != m then
+    return false
+  end
+  let imm8 = ((((bits >> 31) & 1) << 7) | ((e & 7) << 4) | f) as Int
+  t2_vmov_f32_imm(b, sd, imm8)
+  true
+end
+
+# ———————————————————————————————————————————————————————————————
+# Condition codes and the LirCond mapping
+# ———————————————————————————————————————————————————————————————
+# The ARM 4-bit condition codes (the shared A32/A64 space — aarch64's
+# a64_cc_* values are these exact codes): EQ=0, NE=1, CS=2, CC=3, HI=8,
+# LS=9, GE=10, LT=11, GT=12, LE=13. The inverse of a condition is
+# cond XOR 1.
+def thumb_cc(c: LirCond) -> Int
+  match c
+  when LirCond::LirEq then 0
+  when LirCond::LirNe then 1
+  when LirCond::LirLt then 11
+  when LirCond::LirLe then 13
+  when LirCond::LirGt then 12
+  when LirCond::LirGe then 10
+  when LirCond::LirUlt then 3   # unsigned lower = CC (LO)
+  when LirCond::LirUle then 9   # unsigned lower-or-same = LS
+  when LirCond::LirUgt then 8   # unsigned higher = HI
+  when LirCond::LirUge then 2   # unsigned higher-or-same = CS (HS)
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Emitter state and whole-function validation
+# ———————————————————————————————————————————————————————————————
+# The emission machinery mirrors lir.tg's emitter (Slice 4): allocation
+# decisions come from the precomputed LirAlloc, keyed by the linear
+# position of each statement/terminator in the SAME walk the allocator
+# used (invariant I3). Unlike the aarch64 emitter, control-flow targets
+# inside one function may not exist yet when a branch is emitted
+# (forward branches), so unconditional/call branches record deferred
+# patches resolved after the whole program is emitted; the block labels
+# live in the buffer's label map, exactly like the aarch64 route's.
+# Branch policy (relaxation-lite, always correct):
+#   - backward unconditional branches whose target is already defined
+#     and within the 16-bit range emit the 2-byte B; everything else
+#     emits the 4-byte B.W with a deferred patch (B.W covers +/-16 MiB,
+#     so no legitimate function can fail the range check);
+#   - backward conditional branches within the 2-byte B.cond range emit
+#     directly; every other conditional branch emits the invert-and-skip
+#     pattern (B<not cond> +2; B.W target) which never needs a range
+#     check on the conditional part.
+
+# A deferred branch patch: the 4 bytes at `offset` hold a B.W/BL with an
+# imm24 of 0; resolution rewrites them for the final offset.
+struct ThumbPatch
+  offset: Int
+  label: String
+  is_bl: Bool
+end
+
+# An extern-call site: R_ARM_THM_CALL relocation against `sym` at
+# `offset` (the BL placeholder F000 F800 sits there; the linker patches).
+# The record's `kind` carries the ELF ARM relocation type — 10
+# (R_ARM_THM_CALL) for calls, 47/48 (R_ARM_THM_MOVW_ABS_NC /
+# R_ARM_THM_MOVT_ABS) for the MOVW/MOVT absolute-address pairs of
+# static references (LirStaticLoad) — the writer serializes each entry
+# with its own type.
+struct ThumbReloc
+  offset: Int
+  sym: String
+  kind: Int
+end
+
+# The ELF ARM relocation types this backend emits (ARM IHI 0044F — ELF
+# for the ARM Architecture):
+#   R_ARM_THM_CALL      = 10  (BL to a function symbol)
+#   R_ARM_THM_MOVW_ABS_NC = 47 (MOVW imm16 <- S + A, no overflow check)
+#   R_ARM_THM_MOVT_ABS  = 48  (MOVT imm16 <- (S + A) >> 16)
+def thumb_reloc_call() -> Int = 10
+def thumb_reloc_movw_abs_nc() -> Int = 47
+def thumb_reloc_movt_abs() -> Int = 48
+
+# The whole-program emission state: the text buffer, the deferred branch
+# patches, the extern-call relocations and the symbol records (function
+# symbols + extern undefined symbols, in program order).
+struct ThumbEmit
+  buf: CodeBuffer
+  patches: Vec[ThumbPatch]
+  relocs: Vec[ThumbReloc]
+  syms: Vec[AsmSymbol]
+end
+
+def thumb_emit_new() -> ThumbEmit
+  ThumbEmit {
+    buf: buf_new(),
+    patches: Vec::new(),
+    relocs: Vec::new(),
+    syms: Vec::new()
+  }
+end
+
+# Append a machine function symbol (global) at the current buffer
+# position. The ELF writer adds the local "$t" mapping symbol beside it.
+# (P1-18 @cold): an attr_cold function's symbol is routed into the cold
+# section (Section::ColdText — the .text.cold region the writer splits
+# from the code stream's cold tail; see thumb_compile_object's deferred
+# cold pass).
+def thumb_emit_fn_symbol(inout te: ThumbEmit, name: String, is_cold: Bool) -> Unit
+  te.syms.push(AsmSymbol {
+    name: name,
+    section: if is_cold then Section::ColdText else Section::Text end,
+    offset: buf_pos(&te.buf),
+    size: 0,
+    binding: SymBinding::Global,
+    kind: SymKind::Func
+  })
+end
+
+# ———————————————————————————————————————————————————————————————
+# Whole-function shape validation (fail-closed, before any emission)
+# ———————————————————————————————————————————————————————————————
+# Mirrors lir.tg's fail-closed lowering contract: every construct this
+# backend cannot compile names its rule in the Err. Runs once per
+# function before thumb_emit_fn touches the buffer.
+
+# An immediate payload the 32-bit word model accepts: [-2^31, 2^32).
+def thumb_imm32_ok(imm: Int) -> Bool
+  imm >= -2147483648 && imm <= 4294967295
+end
+
+def thumb_fixed_bad(lir_reg: Int) -> Bool
+  lir_reg >= 4 && lir_reg < lir_first_alloc_vreg()
+end
+
+def thumb_validate_fn(f: LirFunction) -> Result[Unit, String]
+  var bi = 0
+  while bi < f.blocks.len() do
+    let block = f.blocks[bi]
+    var si = 0
+    while si < block.stmts.len() do
+      let stmt = block.stmts[si]
+      match stmt.kind
+      when LirStmtKind::LirMove(dst, val) then
+        if thumb_fixed_bad(dst) then
+          return Result::Err("thumb: " + f.name + ": move into fixed vreg " + dst.to_string() + " (x" + dst.to_string() + ") does not lower — fixed vregs 4..7 are the aarch64 ABI registers x4..x7, and the cortex-m lowering (lower_mir_fn_to_lir_cm) moves register-class arguments into fixed vregs 0..3 only; arguments >= 4 take the AAPCS caller stack (fail-closed)")
+        end
+        match val
+        when LirValue::LirReg(src) then
+          if thumb_fixed_bad(src) then
+            return Result::Err("thumb: " + f.name + ": move from fixed vreg " + src.to_string() + " (x" + src.to_string() + ") does not lower — fixed vregs 4..7 are the aarch64 ABI registers x4..x7; the cortex-m lowering binds parameters >= 4 from their AAPCS caller-stack words (LirLoadFrame), never from a fixed register (fail-closed)")
+          end
+        when LirValue::LirImm(imm) then
+          if !thumb_imm32_ok(imm) then
+            return Result::Err("thumb: " + f.name + ": constant " + imm.to_string() + " does not fit the 32-bit cortex-m word model [-2^31, 2^32) (this route is word-only — fail-closed)")
+          end
+        end
+      when LirStmtKind::LirBinop(op, dst, left, right) then
+        match left
+        when LirValue::LirReg(_) then ()
+        when LirValue::LirImm(_) then
+          return Result::Err("thumb: " + f.name + ": binop left operand is an immediate — lowering never produces this (fail-closed)")
+        end
+        match right
+        when LirValue::LirReg(rv) then
+          if thumb_fixed_bad(rv) then
+            return Result::Err("thumb: " + f.name + ": binop operand from fixed vreg " + rv.to_string() + " does not lower (fixed vregs 4..7 are aarch64 x4..x7; the cortex-m lowering never emits them — fail-closed)")
+          end
+        when LirValue::LirImm(imm) then
+          match op
+          when LirBinOp::LirShl then
+            if imm < 0 || imm > 255 then
+              return Result::Err("thumb: " + f.name + ": shift count " + imm.to_string() + " is outside the 32-bit cortex-m model 0..255 (this route is word-only — fail-closed)")
+            end
+          when LirBinOp::LirLsr then
+            if imm < 0 || imm > 255 then
+              return Result::Err("thumb: " + f.name + ": shift count " + imm.to_string() + " is outside the 32-bit cortex-m model 0..255 (this route is word-only — fail-closed)")
+            end
+          when LirBinOp::LirAsr then
+            if imm < 0 || imm > 255 then
+              return Result::Err("thumb: " + f.name + ": shift count " + imm.to_string() + " is outside the 32-bit cortex-m model 0..255 (this route is word-only — fail-closed)")
+            end
+          when _ then
+            if !thumb_imm32_ok(imm) then
+              return Result::Err("thumb: " + f.name + ": constant " + imm.to_string() + " does not fit the 32-bit cortex-m word model [-2^31, 2^32) (this route is word-only — fail-closed)")
+            end
+          end
+        end
+      when LirStmtKind::LirUnop(_, _, src) then
+        if thumb_fixed_bad(src) then
+          return Result::Err("thumb: " + f.name + ": unop operand from fixed vreg " + src.to_string() + " does not lower (fixed vregs 4..7 are aarch64 x4..x7; the cortex-m lowering never emits them — fail-closed)")
+        end
+      when LirStmtKind::LirCmp(left, right) then
+        match left
+        when LirValue::LirReg(_) then ()
+        when LirValue::LirImm(_) then
+          return Result::Err("thumb: " + f.name + ": compare left operand is an immediate — lowering never produces this (fail-closed)")
+        end
+        match right
+        when LirValue::LirReg(rv) then
+          if thumb_fixed_bad(rv) then
+            return Result::Err("thumb: " + f.name + ": compare operand from fixed vreg " + rv.to_string() + " does not lower (fixed vregs 4..7 are aarch64 x4..x7; the cortex-m lowering never emits them — fail-closed)")
+          end
+        when LirValue::LirImm(imm) then
+          if !thumb_imm32_ok(imm) then
+            return Result::Err("thumb: " + f.name + ": compare constant " + imm.to_string() + " does not fit the 32-bit cortex-m word model [-2^31, 2^32) (this route is word-only — fail-closed)")
+          end
+        end
+      when LirStmtKind::LirCset(_, _) then ()
+      when LirStmtKind::LirLoadFrame(dst, off) then
+        # The cortex-m lowering emits LirLoadFrame only at the top of
+        # the entry block to bind parameter indexes >= 4 from their
+        # AAPCS caller-stack words, with the canonical payload
+        # 8 + 4*(i-4) (lir.tg's lir_stack_arg_offset). A fixed-vreg
+        # destination or a payload outside that geometry (4-aligned,
+        # >= 8) marks a foreign lowering; an aarch64-convention
+        # function is in any case caught by the fixed-vreg 4..7
+        # rejections (its parameter binds always trip one before any
+        # LirLoadFrame is reached).
+        if dst < lir_first_alloc_vreg() then
+          return Result::Err("thumb: " + f.name + ": stack-parameter load into fixed vreg " + dst.to_string() + " does not lower (the cortex-m lowering loads AAPCS stack parameters into ordinary vregs only — fail-closed)")
+        end
+        if off < 8 || (off % 4) != 0 then
+          return Result::Err("thumb: " + f.name + ": stack-parameter load at canonical offset " + off.to_string() + " does not lower — the AAPCS stack-parameter payloads of the cortex-m lowering are 8 + 4*(i-4) for parameter index i >= 4 (fail-closed)")
+        end
+      when LirStmtKind::LirPushArg(vreg) then
+        if vreg < lir_first_alloc_vreg() then
+          return Result::Err("thumb: " + f.name + ": caller stack-argument push of fixed vreg " + vreg.to_string() + " does not lower (the cortex-m lowering pushes ordinary argument vregs only — fail-closed)")
+        end
+      when LirStmtKind::LirStaticLoad(dst, sym) then
+        # A static-value load (a whole-program static reference — the
+        # LirStaticLoad of lir.tg's MirStaticRef lowering): the 32-bit
+        # word at the static's .data symbol. The destination is an
+        # ordinary vreg (the shared lowering materializes loads into
+        # fresh vregs or the destination local's vreg — never a fixed
+        # ABI register), and the symbol must be the emission name of a
+        # program static (recorded by the route's data emission before
+        # function lowering).
+        if dst < lir_first_alloc_vreg() then
+          return Result::Err("thumb: " + f.name + ": static-value load into fixed vreg " + dst.to_string() + " does not lower (static loads define ordinary vregs only — fail-closed)")
+        end
+        if sym.len() == 0 then
+          return Result::Err("thumb: " + f.name + ": static-value load carries an empty symbol name (the shared lowering resolves static references to emission names — a lowering divergence; fail-closed)")
+        end
+      when LirStmtKind::LirFMove(_, _) then
+        return Result::Err("thumb: " + f.name + ": float statements do not lower on the cortex-m route (its shape gate keeps the word-only accept set; the float slice is an aarch64-route rule — fail-closed)")
+      when LirStmtKind::LirFBinop(_, _, _, _, _) then
+        return Result::Err("thumb: " + f.name + ": float statements do not lower on the cortex-m route (its shape gate keeps the word-only accept set; the float slice is an aarch64-route rule — fail-closed)")
+      when LirStmtKind::LirFNeg(_, _, _) then
+        return Result::Err("thumb: " + f.name + ": float statements do not lower on the cortex-m route (its shape gate keeps the word-only accept set; the float slice is an aarch64-route rule — fail-closed)")
+      when LirStmtKind::LirFCmp(_, _, _) then
+        return Result::Err("thumb: " + f.name + ": float statements do not lower on the cortex-m route (its shape gate keeps the word-only accept set; the float slice is an aarch64-route rule — fail-closed)")
+      when LirStmtKind::LirFConst(_, _, _) then
+        return Result::Err("thumb: " + f.name + ": float statements do not lower on the cortex-m route (its shape gate keeps the word-only accept set; the float slice is an aarch64-route rule — fail-closed)")
+      when LirStmtKind::LirIntToFloat(_, _, _, _) then
+        return Result::Err("thumb: " + f.name + ": float statements do not lower on the cortex-m route (its shape gate keeps the word-only accept set; the float slice is an aarch64-route rule — fail-closed)")
+      when LirStmtKind::LirFloatToInt(_, _, _) then
+        return Result::Err("thumb: " + f.name + ": float statements do not lower on the cortex-m route (its shape gate keeps the word-only accept set; the float slice is an aarch64-route rule — fail-closed)")
+      when LirStmtKind::LirFcvt(_, _, _) then
+        return Result::Err("thumb: " + f.name + ": float statements do not lower on the cortex-m route (its shape gate keeps the word-only accept set; the float slice is an aarch64-route rule — fail-closed)")
+      end
+      si = si + 1
+    end
+    match block.term.kind
+    when LirTermKind::LirCall(target, args, stack_args, _, _) then
+      # AAPCS caller-word pushes: stack_args counts the 4-byte words the
+      # lowering pushed for argument indexes >= 4, INCLUDING the
+      # alignment padding of lir_lower_call — so it is always EVEN (the
+      # pad rule keeps the caller's SP 8-byte aligned at the BL). An odd
+      # or out-of-range count therefore marks a foreign lowering (a
+      # call lowered with the aarch64 conventions would carry an odd
+      # 16-byte-slot count whenever its slot count is odd — fail-closed;
+      # such functions are in any case caught by the fixed-vreg 4..7
+      # rejections above).
+      if stack_args < 0 || stack_args > 32 || (stack_args % 2) != 0 then
+        return Result::Err("thumb: " + f.name + ": call to `" + target + "` carries " + stack_args.to_string() + " caller stack words — the cortex-m lowering pads odd AAPCS word counts to EVEN (lir_lower_call), so an odd or out-of-range count marks a foreign lowering (fail-closed)")
+      end
+      var ai = 0
+      while ai < args.len() do
+        if thumb_fixed_bad(args[ai]) then
+          return Result::Err("thumb: " + f.name + ": call to `" + target + "` passes fixed vreg " + args[ai].to_string() + " in its argument list — fixed vregs 4..7 are aarch64 x4..x7; the cortex-m lowering pushes arguments >= 4 onto the AAPCS caller stack instead (fail-closed)")
+        end
+        ai = ai + 1
+      end
+    when _ then ()
+    end
+    bi = bi + 1
+  end
+  Result::Ok(())
+end
+
+# ———————————————————————————————————————————————————————————————
+# Emission helpers (mirroring lir.tg's allocator-query helpers)
+# ———————————————————————————————————————————————————————————————
+
+# The destination of a def at position `pos`: either the segment's
+# register (via the desc-driven pool mapping) or the r12 temp with a
+# pending spill-slot store.
+struct ThumbDefTarget
+  reg: Int
+  store_slot: Int   # >= 0: store reg to this slot after the def
+end
+
+def thumb_def_target(alloc: LirAlloc, mdl_pool: Vec[Int], vreg: Int, pos: Int) -> ThumbDefTarget
+  if vreg < lir_first_alloc_vreg() then
+    # Fixed ABI vregs (argument moves): the register IS the target.
+    return ThumbDefTarget { reg: vreg, store_slot: -1 }
+  end
+  match alloc.segs_of.get(vreg)
+  when Option::Some(segs) then
+    match lir_seg_at(segs, pos)
+    when Option::Some(s) then
+      if s.phys >= 0 then
+        ThumbDefTarget { reg: thumb_phys_of(mdl_pool, s.phys), store_slot: -1 }
+      else
+        ThumbDefTarget { reg: thumb_ip_reg(), store_slot: s.slot }
+      end
+    when Option::None then
+      panic("thumb: def outside any interval for vreg " + vreg.to_string())
+    end
+  when Option::None then
+    # Never-occurring vreg (an unused parameter bind still emits).
+    ThumbDefTarget { reg: thumb_ip_reg(), store_slot: -1 }
+  end
+end
+
+# Materialize the value of `vreg` at position `pos` into a register,
+# choosing `pref` (normally r12; r3 avoids a collision) when a spill
+# load is needed; a reload record at (pos, vreg) loads the slot into the
+# segment register first (invariant I2). Returns the register holding
+# the value. Fixed vregs (0..3 only — 4..7 are rejected by validation)
+# resolve to their register directly.
+def thumb_emit_use(inout te: ThumbEmit, alloc: LirAlloc, mdl_pool: Vec[Int], vreg: Int, pos: Int, pref: Int) -> Int
+  if vreg < lir_first_alloc_vreg() then
+    return vreg
+  end
+  match alloc.segs_of.get(vreg)
+  when Option::Some(segs) then
+    match lir_seg_at(segs, pos)
+    when Option::Some(s) then
+      if s.phys >= 0 then
+        if lir_reload_at(alloc.reloads, pos, vreg) then
+          thumb_slot_load(te, mdl_pool, thumb_phys_of(mdl_pool, s.phys), s.slot)
+        end
+        thumb_phys_of(mdl_pool, s.phys)
+      else
+        thumb_slot_load(te, mdl_pool, pref, s.slot)
+        pref
+      end
+    when Option::None then
+      panic("thumb: use outside any interval for vreg " + vreg.to_string())
+    end
+  when Option::None then
+    panic("thumb: use of vreg with no intervals: " + vreg.to_string())
+  end
+end
+
+# Load spill slot `slot` ([r7 + 4*slot]) into `dst` (any r0-r12).
+def thumb_slot_load(inout te: ThumbEmit, mdl_pool: Vec[Int], dst: Int, slot: Int) -> Unit
+  thumb_slot_access(te, dst, slot, true)
+end
+
+# Store `src` (any r0-r12) into spill slot `slot`.
+def thumb_slot_store(inout te: ThumbEmit, mdl_pool: Vec[Int], src: Int, slot: Int) -> Unit
+  thumb_slot_access(te, src, slot, false)
+end
+
+# The shared slot access: the 4-byte word [r7 + 4*slot]. 16-bit LDR/STR
+# when both registers are low and the offset fits imm5*4; LDR.W/STR.W
+# for byte offsets 0..4095 (any register); beyond that the address is
+# built in a temp (movw; add temp, r7 — the flagless 0x4400 form) and
+# the word is accessed through it. The store path must not clobber the
+# value register: when the value sits in r12 (a memory-def temp), the
+# address is built in r3 instead. Frames can therefore reach 65532
+# bytes of slots; bigger frames fail closed in thumb_emit_fn.
+def thumb_slot_access(inout te: ThumbEmit, reg: Int, slot: Int, is_load: Bool) -> Unit
+  let off = thumb_slot_offset(slot)
+  let fp = thumb_fp_reg()
+  if is_load then
+    if reg <= 7 && off <= 124 then
+      t2_ldr_imm5(&mut te.buf, reg, fp, off)
+    elsif off <= 4095 then
+      t2_ldr_w_imm12(&mut te.buf, reg, fp, off)
+    else
+      t2_movw(&mut te.buf, thumb_ip_reg(), (off & 0xFFFF) as u16)
+      t2_add_rr(&mut te.buf, thumb_ip_reg(), fp)
+      t2_ldr_w_imm12(&mut te.buf, reg, thumb_ip_reg(), 0)
+    end
+  else
+    let addr = if reg == thumb_ip_reg() then thumb_ip2_reg() else thumb_ip_reg() end
+    if reg <= 7 && off <= 124 then
+      t2_str_imm5(&mut te.buf, reg, fp, off)
+    elsif off <= 4095 then
+      t2_str_w_imm12(&mut te.buf, reg, fp, off)
+    else
+      t2_movw(&mut te.buf, addr, (off & 0xFFFF) as u16)
+      t2_add_rr(&mut te.buf, addr, fp)
+      t2_str_w_imm12(&mut te.buf, reg, addr, 0)
+    end
+  end
+end
+
+# Materialize an in-model 32-bit immediate into `rd` (MOVW + optional
+# MOVT; both flagless).
+def thumb_emit_imm32(inout te: ThumbEmit, rd: Int, imm: Int) -> Unit
+  let low = imm & 0xFFFFFFFF
+  let lo16 = (low & 0xFFFF) as u16
+  let hi16 = ((low >> 16) & 0xFFFF) as u16
+  t2_movw(&mut te.buf, rd, lo16)
+  if hi16 != 0 then
+    t2_movt(&mut te.buf, rd, hi16)
+  end
+end
+
+# Load `imm` into a temp that does NOT collide with `avoid` (a resolved
+# operand register): when the operand itself sits in r12 (a spill load),
+# the immediate goes into r3 instead — r3 is the second statement-local
+# temp, dead at every statement boundary. Returns the temp chosen.
+def thumb_imm_temp_avoiding(inout te: ThumbEmit, imm: Int, avoid: Int) -> Int
+  let t = if avoid == thumb_ip_reg() then thumb_ip2_reg() else thumb_ip_reg() end
+  thumb_emit_imm32(te, t, imm)
+  t
+end
+
+# Emit the register-register compare of `rn` against `rm` (the LirCmp —
+# the ONLY flag-writing instruction outside the cset ITE blocks).
+def thumb_emit_cmp_rr(inout te: ThumbEmit, rn: Int, rm: Int) -> Unit
+  if rn <= 7 && rm <= 7 then
+    t2_cmp_rr_lo(&mut te.buf, rn, rm)
+  else
+    t2_cmp_rr_any(&mut te.buf, rn, rm)
+  end
+end
+
+# Compare `rn` against the immediate `imm` (validated in-model). The
+# materialized immediate must not clobber `rn` (which may itself be a
+# spill-loaded temp).
+def thumb_emit_cmp_imm(inout te: ThumbEmit, rn: Int, imm: Int) -> Unit
+  if imm >= 0 && imm <= 255 && rn <= 7 then
+    t2_cmp_imm8(&mut te.buf, rn, imm)
+  else
+    let t = thumb_imm_temp_avoiding(te, imm, rn)
+    thumb_emit_cmp_rr(te, rn, t)
+  end
+end
+
+# Emit a register-register binop (all forms flagless — invariant I1).
+def thumb_emit_binop_rr(inout te: ThumbEmit, op: LirBinOp, d: Int, n: Int, m: Int) -> Unit
+  match op
+  when LirBinOp::LirAdd then t2_add_w(&mut te.buf, d, n, m)
+  when LirBinOp::LirSub then t2_sub_w(&mut te.buf, d, n, m)
+  when LirBinOp::LirMul then t2_mul_w(&mut te.buf, d, n, m)
+  when LirBinOp::LirAnd then t2_and_w(&mut te.buf, d, n, m)
+  when LirBinOp::LirOr then t2_orr_w(&mut te.buf, d, n, m)
+  when LirBinOp::LirXor then t2_eor_w(&mut te.buf, d, n, m)
+  when LirBinOp::LirShl then t2_lsl_w_reg(&mut te.buf, d, n, m)
+  when LirBinOp::LirAsr then t2_asr_w_reg(&mut te.buf, d, n, m)
+  when LirBinOp::LirLsr then t2_lsr_w_reg(&mut te.buf, d, n, m)
+  end
+end
+
+# Emit a binop with an immediate right operand. Add/Sub use ADDW/SUBW
+# for 0..4095 (the flagless 32-bit immediate forms; a negative Add is a
+# SUBW of the negated amount, mirroring the aarch64 emitter's strategy);
+# everything else materializes the immediate into a temp that avoids the
+# resolved left operand (`n`) and uses the register form. Immediate
+# shift counts <= 31 use the single flagless LSL/LSR/ASR.W immediate
+# encodings; counts 32..255 go through the temp + register form (counts
+# >= 32 saturate by the architecture).
+def thumb_emit_binop_imm(inout te: ThumbEmit, op: LirBinOp, d: Int, n: Int, imm: Int) -> Unit
+  match op
+  when LirBinOp::LirAdd then
+    if imm >= 0 && imm <= 4095 then
+      t2_addw(&mut te.buf, d, n, imm)
+    elsif imm < 0 && imm >= -4095 then
+      t2_subw(&mut te.buf, d, n, -imm)
+    else
+      let t = thumb_imm_temp_avoiding(te, imm, n)
+      t2_add_w(&mut te.buf, d, n, t)
+    end
+  when LirBinOp::LirSub then
+    if imm >= 0 && imm <= 4095 then
+      t2_subw(&mut te.buf, d, n, imm)
+    elsif imm < 0 && imm >= -4095 then
+      t2_addw(&mut te.buf, d, n, -imm)
+    else
+      let t = thumb_imm_temp_avoiding(te, imm, n)
+      t2_sub_w(&mut te.buf, d, n, t)
+    end
+  when LirBinOp::LirShl then
+    if imm >= 0 && imm <= 31 then
+      t2_lsl_w_imm(&mut te.buf, d, n, imm)
+    else
+      let t = thumb_imm_temp_avoiding(te, imm, n)
+      t2_lsl_w_reg(&mut te.buf, d, n, t)
+    end
+  when LirBinOp::LirLsr then
+    if imm >= 0 && imm <= 31 then
+      t2_lsr_w_imm(&mut te.buf, d, n, imm)
+    else
+      let t = thumb_imm_temp_avoiding(te, imm, n)
+      t2_lsr_w_reg(&mut te.buf, d, n, t)
+    end
+  when LirBinOp::LirAsr then
+    if imm >= 0 && imm <= 31 then
+      t2_asr_w_imm(&mut te.buf, d, n, imm)
+    else
+      let t = thumb_imm_temp_avoiding(te, imm, n)
+      t2_asr_w_reg(&mut te.buf, d, n, t)
+    end
+  when _ then
+    let t = thumb_imm_temp_avoiding(te, imm, n)
+    thumb_emit_binop_rr(te, op, d, n, t)
+  end
+end
+
+# The prefer-register for a second operand given the register the first
+# operand landed in (avoid the r12/r3 temp collision).
+def thumb_alt_pref(used: Int) -> Int
+  if used == thumb_ip_reg() then thumb_ip2_reg() else thumb_ip_reg() end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Branch emission (relaxation-lite; see the emitter-state note)
+# ———————————————————————————————————————————————————————————————
+
+# The target label's offset, when the block has already been emitted
+# (backward branches only — resolution handles the rest).
+def thumb_label_off(te: ThumbEmit, label: String) -> Option[Int]
+  te.buf.labels.get(label)
+end
+
+# An unconditional branch to `label`. Backward targets that fit the
+# 16-bit B emit directly (2 bytes); everything else emits B.W with a
+# deferred patch (4 bytes, +/-16 MiB — no legitimate function overflows).
+def thumb_emit_b_uncond(inout te: ThumbEmit, label: String) -> Unit
+  let pos = buf_pos(&te.buf)
+  match thumb_label_off(te, label)
+  when Option::Some(target) then
+    let rel = target - (pos + 4)
+    if rel >= -2048 && rel <= 2046 then
+      t2_b16(&mut te.buf, rel)
+    else
+      let patch_pos = buf_pos(&te.buf)
+      t2_b_w(&mut te.buf, 0)
+      te.patches.push(ThumbPatch { offset: patch_pos, label: label, is_bl: false })
+    end
+  when Option::None then
+    let patch_pos = buf_pos(&te.buf)
+    t2_b_w(&mut te.buf, 0)
+    te.patches.push(ThumbPatch { offset: patch_pos, label: label, is_bl: false })
+  end
+end
+
+# A conditional branch (cond true) to `label`. Backward targets within
+# the 16-bit B.cond range emit directly; everything else emits the
+# invert-and-skip pattern: B<not cond> +2 (always in range) followed by
+# a patched B.W. The pattern never needs a conditional-range check.
+def thumb_emit_b_cond(inout te: ThumbEmit, cond: Int, label: String) -> Unit
+  let pos = buf_pos(&te.buf)
+  match thumb_label_off(te, label)
+  when Option::Some(target) then
+    let rel = target - (pos + 4)
+    if rel >= -256 && rel <= 254 then
+      t2_b_cond16(&mut te.buf, cond, rel)
+    else
+      thumb_emit_b_cond_far(te, cond, label)
+    end
+  when Option::None then
+    thumb_emit_b_cond_far(te, cond, label)
+  end
+end
+
+def thumb_emit_b_cond_far(inout te: ThumbEmit, cond: Int, label: String) -> Unit
+  t2_b_cond16(&mut te.buf, cond ^ 1, 2)
+  let patch_pos = buf_pos(&te.buf)
+  t2_b_w(&mut te.buf, 0)
+  te.patches.push(ThumbPatch { offset: patch_pos, label: label, is_bl: false })
+end
+
+# A direct call to `label`: patched B.W-style BL for program functions,
+# a relocation-carrying BL placeholder for externs (the object file's
+# R_ARM_THM_CALL record patches the same field).
+def thumb_emit_bl(inout te: ThumbEmit, label: String, is_extern: Bool) -> Unit
+  let patch_pos = buf_pos(&te.buf)
+  if is_extern then
+    t2_bl(&mut te.buf, 0)
+    te.relocs.push(ThumbReloc { offset: patch_pos, sym: label, kind: thumb_reloc_call() })
+  else
+    t2_bl(&mut te.buf, 0)
+    te.patches.push(ThumbPatch { offset: patch_pos, label: label, is_bl: true })
+  end
+end
+
+# The epilogue: release the frame and restore the callee-saved
+# registers, then return. SP equals the frame pointer's frame top
+# (r7 + frame_bytes) at every Ret — the AAPCS caller-word pushes of a
+# call site are undone by that call's own SP cleanup right after the
+# BL, so no push ever survives to a block boundary.
+def thumb_emit_epilogue(inout te: ThumbEmit, frame_bytes: Int) -> Unit
+  if frame_bytes > 0 then
+    if frame_bytes <= 508 then
+      t2_add_sp_imm7(&mut te.buf, frame_bytes)
+    else
+      t2_movw(&mut te.buf, thumb_ip_reg(), (frame_bytes & 0xFFFF) as u16)
+      t2_add_sp_w_reg(&mut te.buf, thumb_ip_reg())
+    end
+  end
+  t2_pop_w(&mut te.buf, thumb_saved_reg_list())
+  t2_bx_lr(&mut te.buf)
+end
+
+# ———————————————————————————————————————————————————————————————
+# Statement and terminator emission (mirrors lir_emit_stmt/term)
+# ———————————————————————————————————————————————————————————————
+# Every arm is explicit; constructs outside the validated subset return
+# Err naming the construct (validation already rejected them — the arms
+# are defense in depth and never silently emit).
+
+# ———————————————————————————————————————————————————————————————
+# Float statement resolution (the register-resident FP envelope)
+# ———————————————————————————————————————————————————————————————
+# The float arms below emit only REGISTER-RESIDENT operands
+# (memory-resident defs/uses fail closed, never emitted) — the envelope
+# of the LirFMove arm above. Every float arm resolves each FP operand's
+# physical d-index through thumb_fp_d_of: a fixed ABI FP id (8..15 —
+# lir_is_fixed_fp_id) IS its d-register (d-index = id -
+# lir_fixed_fp_base()), and an allocated FP vreg's physical id
+# (116..129 — the allocator's FP-pool namespace, lir_fp_pool_regs) is
+# d_{phys - 100}. An F32 value rides the LOW single of its d-index
+# (s = 2*d — the canonical single), and the FP pool (d16..d29) has no
+# single-register alias on the cortex-m register model (s0..s31 —
+# d0..d15 — only). `role` words the operand for the Err text ("binop
+# destination", "compare left operand", ...).
+
+# Resolve the d-index of a register-resident FP vreg at `pos`, failing
+# closed (never emitting) for memory-resident operands: a segment whose
+# physical id is negative (a spill-slot def/use) or — on the use side —
+# a post-call reload record at (pos, vreg) (invariant I2). Mirrors the
+# LirFMove arm's resolution exactly, shared by the arms below.
+def thumb_fp_d_of(alloc: LirAlloc, vreg: Int, pos: Int, is_use: Bool, role: String) -> Result[Int, String]
+  if lir_is_fixed_fp_id(vreg) then
+    return Result::Ok(vreg - lir_fixed_fp_base())
+  end
+  match alloc.segs_of.get(vreg)
+  when Option::Some(segs) then
+    match lir_seg_at(segs, pos)
+    when Option::Some(s) then
+      if s.phys < 0 || (is_use && lir_reload_at(alloc.reloads, pos, vreg)) then
+        return Result::Err("thumb: float " + role + " vreg " + vreg.to_string() + " is memory-resident (memory-resident float " + role + "s are pending on the cortex-m route — fail-closed)")
+      end
+      Result::Ok(s.phys - 100)
+    when Option::None then
+      Result::Err("thumb: float " + role + " vreg " + vreg.to_string() + " has no segment at position " + pos.to_string() + " (the cortex-m route emits register-resident float operands only; memory-resident float operands are pending — fail-closed)")
+    end
+  when Option::None then
+    Result::Err("thumb: float " + role + " vreg " + vreg.to_string() + " has no intervals (the cortex-m route emits register-resident float operands only; memory-resident float operands are pending — fail-closed)")
+  end
+end
+
+def thumb_emit_stmt(inout te: ThumbEmit, alloc: LirAlloc, mdl_pool: Vec[Int], frame_bytes: Int, kind: LirStmtKind, pos: Int) -> Result[Unit, String]
+  match kind
+  when LirStmtKind::LirMove(dst, val) then
+    let dt = thumb_def_target(alloc, mdl_pool, dst, pos)
+    match val
+    when LirValue::LirImm(imm) then
+      thumb_emit_imm32(te, dt.reg, imm)
+    when LirValue::LirReg(src) then
+      if src < lir_first_alloc_vreg() then
+        if dt.reg != src then
+          t2_mov_rr(&mut te.buf, dt.reg, src)
+        end
+      else
+        let pref = thumb_alt_pref(dt.reg)
+        let sr = thumb_emit_use(te, alloc, mdl_pool, src, pos, pref)
+        if dt.reg != sr then
+          t2_mov_rr(&mut te.buf, dt.reg, sr)
+        end
+      end
+    end
+    if dt.store_slot >= 0 then
+      thumb_slot_store(te, mdl_pool, dt.reg, dt.store_slot)
+    end
+    Result::Ok(())
+  when LirStmtKind::LirBinop(op, dst, left, right) then
+    let dt = thumb_def_target(alloc, mdl_pool, dst, pos)
+    let left_pref = thumb_alt_pref(dt.reg)
+    let left_reg = match left
+    when LirValue::LirReg(lv) then thumb_emit_use(te, alloc, mdl_pool, lv, pos, left_pref)
+    when LirValue::LirImm(_) then panic("thumb: binop left operand must be a register (lowering invariant)")
+    end
+    match right
+    when LirValue::LirImm(imm) then
+      thumb_emit_binop_imm(te, op, dt.reg, left_reg, imm)
+    when LirValue::LirReg(rv) then
+      # A register right operand: resolve it with a temp that avoids the
+      # left temp (they only collide when both spill-load; a single
+      # instruction reads both before writing dt, so a dst-temp reuse is
+      # safe by read-before-write).
+      let right_pref = thumb_alt_pref(left_reg)
+      let right_reg = thumb_emit_use(te, alloc, mdl_pool, rv, pos, right_pref)
+      thumb_emit_binop_rr(te, op, dt.reg, left_reg, right_reg)
+    end
+    if dt.store_slot >= 0 then
+      thumb_slot_store(te, mdl_pool, dt.reg, dt.store_slot)
+    end
+    Result::Ok(())
+  when LirStmtKind::LirUnop(op, dst, src) then
+    let dt = thumb_def_target(alloc, mdl_pool, dst, pos)
+    let pref = thumb_alt_pref(dt.reg)
+    let sr = thumb_emit_use(te, alloc, mdl_pool, src, pos, pref)
+    match op
+    when LirUnOp::LirNeg then t2_neg_w(&mut te.buf, dt.reg, sr)
+    when LirUnOp::LirBitNot then t2_mvn_w(&mut te.buf, dt.reg, sr)
+    end
+    if dt.store_slot >= 0 then
+      thumb_slot_store(te, mdl_pool, dt.reg, dt.store_slot)
+    end
+    Result::Ok(())
+  when LirStmtKind::LirCmp(left, right) then
+    let left_reg = match left
+    when LirValue::LirReg(lv) then thumb_emit_use(te, alloc, mdl_pool, lv, pos, thumb_ip_reg())
+    when LirValue::LirImm(_) then panic("thumb: cmp left operand must be a register (lowering invariant)")
+    end
+    match right
+    when LirValue::LirImm(imm) then
+      thumb_emit_cmp_imm(te, left_reg, imm)
+    when LirValue::LirReg(rv) then
+      let right_pref = thumb_alt_pref(left_reg)
+      let right_reg = thumb_emit_use(te, alloc, mdl_pool, rv, pos, right_pref)
+      thumb_emit_cmp_rr(te, left_reg, right_reg)
+    end
+    Result::Ok(())
+  when LirStmtKind::LirCset(cond, dst) then
+    let dt = thumb_def_target(alloc, mdl_pool, dst, pos)
+    let code = thumb_cc(cond)
+    # ITE <cond>: the next two instructions run on cond and NOT cond.
+    # The two MOVS are the only flag-writing instructions outside the
+    # LirCmp statements (invariant I1): they run AFTER the Cmp's
+    # consumer read the flags, and nothing may read flags again before
+    # the next LirCmp writes them.
+    t2_ite(&mut te.buf, code)
+    if dt.reg <= 7 then
+      t2_movs_imm8(&mut te.buf, dt.reg, 1)
+      t2_movs_imm8(&mut te.buf, dt.reg, 0)
+    else
+      # High registers have no 16-bit MOVS; the 32-bit MOVW is legal
+      # inside an IT block.
+      t2_movw(&mut te.buf, dt.reg, 1)
+      t2_movw(&mut te.buf, dt.reg, 0)
+    end
+    if dt.store_slot >= 0 then
+      thumb_slot_store(te, mdl_pool, dt.reg, dt.store_slot)
+    end
+    Result::Ok(())
+  when LirStmtKind::LirLoadFrame(dst, off) then
+    # AAPCS stack-parameter load (function entry binds of parameter
+    # indexes >= 4): the 4-byte word at the AAPCS-canonical offset
+    # [fp + off], fp = incoming SP minus the {fp,lr} 8-byte push — i.e.
+    # at incoming-SP + (off - 8). This backend's r7 sits at
+    # incoming-SP - 32 (the {r4-r10, lr} push) - frame_bytes (the local
+    # frame), so the machine offset from r7 is:
+    #     (incoming-SP + off - 8) - r7
+    #   = (incoming-SP + off - 8) - (incoming-SP - 32 - frame_bytes)
+    #   = off + frame_bytes + 24
+    # (checked against the layout: argument i sits at r7 + 32 +
+    # frame_bytes + 4*(i-4), and off - 8 = 4*(i-4) — identical). The
+    # load is a plain word load through r7 (flagless, invariant I1);
+    # only ever emitted at the top of the entry block, where the
+    # prologue has already established r7.
+    let dt = thumb_def_target(alloc, mdl_pool, dst, pos)
+    let foff = off + frame_bytes + 24
+    if foff > 65535 then
+      return Result::Err("thumb: stack-parameter load at machine offset [r7 + " + foff.to_string() + "] exceeds the 16-bit frame-address model of the cortex-m backend (fail-closed)")
+    end
+    let fp = thumb_fp_reg()
+    if dt.reg <= 7 && foff <= 124 then
+      t2_ldr_imm5(&mut te.buf, dt.reg, fp, foff)
+    elsif foff <= 4095 then
+      t2_ldr_w_imm12(&mut te.buf, dt.reg, fp, foff)
+    else
+      # Large offset: address = r7 + foff in r12 (the load temp). A
+      # memory-resident def target IS r12: the final load reads the
+      # address before overwriting the register, so the alias is safe.
+      t2_movw(&mut te.buf, thumb_ip_reg(), (foff & 0xFFFF) as u16)
+      t2_add_rr(&mut te.buf, thumb_ip_reg(), fp)
+      t2_ldr_w_imm12(&mut te.buf, dt.reg, thumb_ip_reg(), 0)
+    end
+    if dt.store_slot >= 0 then
+      thumb_slot_store(te, mdl_pool, dt.reg, dt.store_slot)
+    end
+    Result::Ok(())
+  when LirStmtKind::LirPushArg(vreg) then
+    # AAPCS caller-word push: reserve the 4-byte word below SP
+    # (sub sp, #4 — the 16-bit SP-relative form, flagless) and store
+    # the value at [SP]. Emission order is the LIR statement order —
+    # DESCENDING argument index (lir_lower_call), so the LAST push of a
+    # call site is argument 4 at the LOWEST address, [SP] at the BL.
+    # The lowering pads odd word counts, so the total decrement is
+    # always a multiple of 8 bytes and the caller's SP is 8-byte
+    # aligned at the BL (AAPCS). Spill-slot reads address through r7,
+    # never SP, so the lowered SP disturbs nothing between pushes.
+    let sr = thumb_emit_use(te, alloc, mdl_pool, vreg, pos, thumb_ip_reg())
+    t2_sub_sp_imm7(&mut te.buf, 4)
+    if sr <= 7 then
+      t2_str_sp_imm8(&mut te.buf, sr, 0)
+    else
+      t2_str_w_imm12(&mut te.buf, sr, 13, 0)
+    end
+    Result::Ok(())
+  when LirStmtKind::LirStaticLoad(dst, sym) then
+    # A static-value load (a whole-program static reference — see the
+    # statement doc in lir.tg): materialize the static's ABSOLUTE
+    # address with the MOVW+MOVT pair (the ELF ARM ABI's absolute-
+    # address form, R_ARM_THM_MOVW_ABS_NC + R_ARM_THM_MOVT_ABS — the
+    # pair GNU/LLVM emit for every symbol address this backend cannot
+    # prove, externs included), then load the 32-bit word at [reg].
+    # Both imm16 fields start at 0; the linker resolves each relocation
+    # against the static's .data symbol (imm16 <- S for the MOVW, <-
+    # S >> 16 for the MOVT). The def temp (r12 for memory-resident
+    # defs) is a legal MOVW/MOVT/LDR.W target, and the load reads [reg]
+    # only after the address is complete, so the def-target alias is
+    # safe. Both encoders are flagless (invariant I1).
+    let dt = thumb_def_target(alloc, mdl_pool, dst, pos)
+    let movw_pos = buf_pos(&te.buf)
+    t2_movw(&mut te.buf, dt.reg, 0)
+    te.relocs.push(ThumbReloc { offset: movw_pos, sym: sym.clone(), kind: thumb_reloc_movw_abs_nc() })
+    let movt_pos = buf_pos(&te.buf)
+    t2_movt(&mut te.buf, dt.reg, 0)
+    te.relocs.push(ThumbReloc { offset: movt_pos, sym: sym.clone(), kind: thumb_reloc_movt_abs() })
+    if dt.reg <= 7 then
+      t2_ldr_imm5(&mut te.buf, dt.reg, dt.reg, 0)
+    else
+      t2_ldr_w_imm12(&mut te.buf, dt.reg, dt.reg, 0)
+    end
+    if dt.store_slot >= 0 then
+      thumb_slot_store(te, mdl_pool, dt.reg, dt.store_slot)
+    end
+    Result::Ok(())
+  when LirStmtKind::LirFMove(dst, src) then
+    # FP register move dst <- src (same width on both sides) — the
+    # cortex-m twin of the aarch64 LirFMove arm in lir.tg's
+    # lir_emit_stmt, restricted to REGISTER-resident operands: a fixed
+    # ABI FP id (8..15 — lir_is_fixed_fp_id) IS its d-register
+    # (d-index = id - lir_fixed_fp_base()), and an allocated FP vreg's
+    # physical id (116..129 — the allocator's FP-pool namespace,
+    # lir_fp_pool_regs) is d_{phys - 100}. The width resolves from the
+    # ordinary operand's FP class record (alloc.fp_widths — fixed ids
+    # carry no record, and the lowering pairs a fixed id with an
+    # ordinary one, never two fixed ids). Memory-resident operands
+    # (spill-slot defs/uses, post-call reloads) do not lower on this
+    # route yet — fail closed below, never emit.
+    let w = match alloc.fp_widths.get(dst)
+    when Option::Some(dw) then dw
+    when Option::None then
+      match alloc.fp_widths.get(src)
+      when Option::Some(sw) then sw
+      when Option::None then
+        panic("thumb: LirFMove between two fixed FP vregs (lowering invariant)")
+      end
+    end
+    var dd = -1
+    if lir_is_fixed_fp_id(dst) then
+      dd = dst - lir_fixed_fp_base()
+    else
+      match alloc.segs_of.get(dst)
+      when Option::Some(segs) then
+        match lir_seg_at(segs, pos)
+        when Option::Some(s) then
+          if s.phys < 0 then
+            return Result::Err("thumb: float move destination vreg " + dst.to_string() + " is memory-resident (memory-resident float moves are pending on the cortex-m route — fail-closed)")
+          end
+          dd = s.phys - 100
+        when Option::None then
+          return Result::Err("thumb: float move destination vreg " + dst.to_string() + " has no segment at position " + pos.to_string() + " (the cortex-m route emits register-resident float moves only; memory-resident float moves are pending — fail-closed)")
+        end
+      when Option::None then
+        return Result::Err("thumb: float move destination vreg " + dst.to_string() + " has no intervals (the cortex-m route emits register-resident float moves only; memory-resident float moves are pending — fail-closed)")
+      end
+    end
+    var sm = -1
+    if lir_is_fixed_fp_id(src) then
+      sm = src - lir_fixed_fp_base()
+    else
+      match alloc.segs_of.get(src)
+      when Option::Some(segs) then
+        match lir_seg_at(segs, pos)
+        when Option::Some(s) then
+          if s.phys < 0 || lir_reload_at(alloc.reloads, pos, src) then
+            return Result::Err("thumb: float move source vreg " + src.to_string() + " is memory-resident (memory-resident float moves are pending on the cortex-m route — fail-closed)")
+          end
+          sm = s.phys - 100
+        when Option::None then
+          return Result::Err("thumb: float move source vreg " + src.to_string() + " has no segment at position " + pos.to_string() + " (the cortex-m route emits register-resident float moves only; memory-resident float moves are pending — fail-closed)")
+        end
+      when Option::None then
+        return Result::Err("thumb: float move source vreg " + src.to_string() + " has no intervals (the cortex-m route emits register-resident float moves only; memory-resident float moves are pending — fail-closed)")
+      end
+    end
+    if dd != sm then
+      # F32 rides the d-register's LOW half (the canonical single), so
+      # its single-register index is 2*d-index. The FP pool (d16..d29)
+      # has no single alias on the cortex-m register model (s0..s31 —
+      # d0..d15 — only), so an F32 move through an allocated operand
+      # has no encodable registers yet: fail closed as pending.
+      match w
+      when LirFpWidth::LirF32 then
+        if dd >= 16 || sm >= 16 then
+          return Result::Err("thumb: F32 move through an allocated FP-pool register (d16..d29) does not lower on the cortex-m route (no single-register alias above d15; F32-pool moves are pending — fail-closed)")
+        end
+        t2_vmov_f32(&mut te.buf, 2 * dd, 2 * sm)
+      when LirFpWidth::LirF64 then
+        t2_vmov_f64(&mut te.buf, dd, sm)
+      end
+    end
+    Result::Ok(())
+  when LirStmtKind::LirFBinop(fop, w, dst, left, right) then
+    # FP arithmetic dst = left op right (FADD/FSUB/FMUL/FDIV under the
+    # statement's width) — the cortex-m twin of the aarch64 LirFBinop
+    # arm (VADD/VSUB/VMUL/VDIV .F64 Dd, Dn, Dm / .F32 Sd, Sn, Sm),
+    # register-resident operands only (memory-resident defs/uses fail
+    # closed through thumb_fp_d_of, never emitted). An F32 binop
+    # through an allocated FP-pool register has no encodable single
+    # (no single-register alias above d15), so it fails closed as
+    # pending, exactly like the LirFMove arm.
+    let dd = match thumb_fp_d_of(alloc, dst, pos, false, "binop destination")
+    when Result::Ok(d) then d
+    when Result::Err(e) then return Result::Err(e)
+    end
+    let ln = match thumb_fp_d_of(alloc, left, pos, true, "binop left operand")
+    when Result::Ok(d) then d
+    when Result::Err(e) then return Result::Err(e)
+    end
+    let rm = match thumb_fp_d_of(alloc, right, pos, true, "binop right operand")
+    when Result::Ok(d) then d
+    when Result::Err(e) then return Result::Err(e)
+    end
+    match w
+    when LirFpWidth::LirF32 then
+      if dd >= 16 || ln >= 16 || rm >= 16 then
+        return Result::Err("thumb: F32 binop through an allocated FP-pool register (d16..d29) does not lower on the cortex-m route (no single-register alias above d15; F32-pool binops are pending — fail-closed)")
+      end
+      match fop
+      when LirFpBinOp::LirFAdd then t2_vadd_f32(&mut te.buf, 2 * dd, 2 * ln, 2 * rm)
+      when LirFpBinOp::LirFSub then t2_vsub_f32(&mut te.buf, 2 * dd, 2 * ln, 2 * rm)
+      when LirFpBinOp::LirFMul then t2_vmul_f32(&mut te.buf, 2 * dd, 2 * ln, 2 * rm)
+      when LirFpBinOp::LirFDiv then t2_vdiv_f32(&mut te.buf, 2 * dd, 2 * ln, 2 * rm)
+      end
+    when LirFpWidth::LirF64 then
+      match fop
+      when LirFpBinOp::LirFAdd then t2_vadd_f64(&mut te.buf, dd, ln, rm)
+      when LirFpBinOp::LirFSub then t2_vsub_f64(&mut te.buf, dd, ln, rm)
+      when LirFpBinOp::LirFMul then t2_vmul_f64(&mut te.buf, dd, ln, rm)
+      when LirFpBinOp::LirFDiv then t2_vdiv_f64(&mut te.buf, dd, ln, rm)
+      end
+    end
+    Result::Ok(())
+  when LirStmtKind::LirFNeg(w, dst, src) then
+    # FP negation dst = -src (FNEG under the statement's width) — the
+    # cortex-m twin of the aarch64 LirFNeg arm, register-resident
+    # operands only. F64 emits the verified VNEG.F64 (t2_vneg_f64 — a
+    # sign-bit flip: NaN payloads and signed zeros preserved). The VFP
+    # section has no verified VNEG.F32 encoder yet, so F32 negation
+    # fails closed naming the pending rule.
+    let dd = match thumb_fp_d_of(alloc, dst, pos, false, "negate destination")
+    when Result::Ok(d) then d
+    when Result::Err(e) then return Result::Err(e)
+    end
+    let sm = match thumb_fp_d_of(alloc, src, pos, true, "negate source")
+    when Result::Ok(d) then d
+    when Result::Err(e) then return Result::Err(e)
+    end
+    match w
+    when LirFpWidth::LirF32 then
+      return Result::Err("thumb: F32 negate does not lower on the cortex-m route (the VFP section has no verified VNEG.F32 encoder; F32 negation is pending — fail-closed)")
+    when LirFpWidth::LirF64 then
+      t2_vneg_f64(&mut te.buf, dd, sm)
+    end
+    Result::Ok(())
+  when LirStmtKind::LirFCmp(w, left, right) then
+    # Compare two float registers (VCMP under the statement's width) —
+    # the cortex-m twin of the aarch64 LirFCmp arm (a64 FCMP, whose
+    # NZCV write is mirrored here by the VCMP-to-FPSCR + VMRS-to-APSR
+    # pair: t2_vmrs_apsr_nzcv is the only way a VFP comparison reaches
+    # the core NZCV flags). The statement therefore writes NZCV exactly
+    # like LirCmp (invariant I1: the allocator inserts only flag-
+    # neutral code between it and its LirCset consumer, and the
+    # consumer reads the EQ/NE/LT/LE/GT/GE conditions of the shared
+    # thumb_cc table over the copied flags). F64 emits the verified
+    # VCMP.F64 (t2_vcmp_f64 — the quiet compare, mirroring the a64
+    # FCMP); the VFP section has no verified VCMP.F32 encoder yet, so
+    # F32 compares fail closed naming the pending rule.
+    let ld = match thumb_fp_d_of(alloc, left, pos, true, "compare left operand")
+    when Result::Ok(d) then d
+    when Result::Err(e) then return Result::Err(e)
+    end
+    let rd = match thumb_fp_d_of(alloc, right, pos, true, "compare right operand")
+    when Result::Ok(d) then d
+    when Result::Err(e) then return Result::Err(e)
+    end
+    match w
+    when LirFpWidth::LirF32 then
+      return Result::Err("thumb: F32 compare does not lower on the cortex-m route (the VFP section has no verified VCMP.F32 encoder; F32 comparisons are pending — fail-closed)")
+    when LirFpWidth::LirF64 then
+      t2_vcmp_f64(&mut te.buf, ld, rd)
+      t2_vmrs_apsr_nzcv(&mut te.buf)
+    end
+    Result::Ok(())
+  when LirStmtKind::LirFConst(_, dst, _) then
+    # Materialize the constant's 64-bit BITS into dst — the cortex-m
+    # twin of the aarch64 LirFConst arm (its GP-bit path: move the
+    # pattern into X16, fmov d, X16 — plus the fcvt s, d rounding for
+    # F32). Every route into the FP file needs an encoder this backend
+    # does not have yet: the VFP section carries no VFP-immediate
+    # encoder (VMOV.F64/F32 #imm), no ARM-core-to-VFP move (VMOV d,
+    # r0, r1 / VMOV s, r0), and this emitter has no literal pool for a
+    # VLDR path. A register-resident destination therefore fails
+    # closed below naming the pending materialization; a memory-
+    # resident one first trips thumb_fp_d_of's rule.
+    match thumb_fp_d_of(alloc, dst, pos, false, "constant destination")
+    when Result::Ok(_) then ()
+    when Result::Err(e) then return Result::Err(e)
+    end
+    Result::Err("thumb: float constant materialization does not lower on the cortex-m route (no verified GP-to-VFP VMOV or VFP-immediate encoder, and no literal-pool VLDR path; float constants are pending — fail-closed)")
+  when LirStmtKind::LirIntToFloat(_, dst, _, _) then
+    # Signed/unsigned integer word -> float — the cortex-m twin of the
+    # aarch64 LirIntToFloat arm (SCVTF/UCVTF under the statement's
+    # width). The VFP converters of this backend (t2_vcvt_f64_s32 /
+    # t2_vcvt_f64_u32 / t2_vcvt_f32_s32 / t2_vcvt_f32_u32) take their
+    # 32-bit integer from an S register of the VFP file, so the
+    # integer word must first cross from the ARM core into the FP file
+    # — and the VFP section has no verified core-to-VFP VMOV encoder
+    # (VMOV s, r / VMOV d, r0, r1). A register-resident float
+    # destination therefore fails closed below naming the pending
+    # rule; a memory-resident one first trips thumb_fp_d_of's rule.
+    match thumb_fp_d_of(alloc, dst, pos, false, "int-to-float destination")
+    when Result::Ok(_) then ()
+    when Result::Err(e) then return Result::Err(e)
+    end
+    Result::Err("thumb: int-to-float does not lower on the cortex-m route (the VFP VCVT converters read their 32-bit integer from an S register, and the VFP section has no verified core-to-VFP VMOV encoder; int-to-float is pending — fail-closed)")
+  when LirStmtKind::LirFloatToInt(_, _, src) then
+    # Float -> signed integer word (the strict spec's trap-free
+    # truncation: toward zero, NaN -> 0, out-of-range saturates) — the
+    # cortex-m twin of the aarch64 LirFloatToInt arm (FCVTZS). The VFP
+    # converters of this backend (t2_vcvt_s32_f64 / t2_vcvt_s32_f32)
+    # produce their 32-bit integer in an S register of the VFP file,
+    # so the word must cross from the FP file into the ARM core — and
+    # the VFP section has no verified VFP-to-core VMOV encoder (VMOV
+    # r, s / VMOV r0, r1, d). A register-resident float source
+    # therefore fails closed below naming the pending rule; a memory-
+    # resident one first trips thumb_fp_d_of's rule.
+    match thumb_fp_d_of(alloc, src, pos, true, "float-to-int source")
+    when Result::Ok(_) then ()
+    when Result::Err(e) then return Result::Err(e)
+    end
+    Result::Err("thumb: float-to-int does not lower on the cortex-m route (the VFP VCVT converters produce their 32-bit integer in an S register, and the VFP section has no verified VFP-to-core VMOV encoder; float-to-int is pending — fail-closed)")
+  when LirStmtKind::LirFcvt(src_w, dst, src) then
+    # Float <-> float width cast: fdst = (dw) fsrc — the cortex-m twin
+    # of the aarch64 LirFcvt arm (FCVT: single->double exact widening
+    # via t2_vcvt_f64_f32, double->single exactly-once RNE rounding via
+    # t2_vcvt_f32_f64), register-resident operands only. dw is the dst
+    # vreg's class-record width (the encoders implement the two cross-
+    # width directions only; a same-width pair is a lowering
+    # divergence). The F32 side rides the LOW single of its d-index
+    # (s = 2*d), so an F32 operand allocated to the FP pool (d16..d29
+    # — no single-register alias above d15) fails closed as pending,
+    # exactly like the LirFMove arm.
+    let dw = match alloc.fp_widths.get(dst)
+    when Option::Some(v) then v
+    when Option::None then panic("lir: LirFcvt into a vreg with no FP class record (lowering invariant)")
+    end
+    let dd = match thumb_fp_d_of(alloc, dst, pos, false, "fcvt destination")
+    when Result::Ok(d) then d
+    when Result::Err(e) then return Result::Err(e)
+    end
+    let sm = match thumb_fp_d_of(alloc, src, pos, true, "fcvt source")
+    when Result::Ok(d) then d
+    when Result::Err(e) then return Result::Err(e)
+    end
+    if dw == LirFpWidth::LirF32 && src_w == LirFpWidth::LirF64 then
+      if dd >= 16 then
+        return Result::Err("thumb: F32 fcvt destination through an allocated FP-pool register (d16..d29) does not lower on the cortex-m route (no single-register alias above d15; F32-pool fcvt destinations are pending — fail-closed)")
+      end
+      t2_vcvt_f32_f64(&mut te.buf, 2 * dd, sm)
+    elsif dw == LirFpWidth::LirF64 && src_w == LirFpWidth::LirF32 then
+      if sm >= 16 then
+        return Result::Err("thumb: F32 fcvt source through an allocated FP-pool register (d16..d29) does not lower on the cortex-m route (no single-register alias above d15; F32-pool fcvt sources are pending — fail-closed)")
+      end
+      t2_vcvt_f64_f32(&mut te.buf, dd, 2 * sm)
+    else
+      panic("lir: LirFcvt between identical widths (lowering invariant; same-width casts lower as moves)")
+    end
+    Result::Ok(())
+  end
+end
+
+# Emit the pre-call spill stores (register-resident pre-call segments
+# whose end precedes the call at `pos` — invariant I2; redundant for the
+# callee-saved pool but keeps the allocator target-agnostic).
+def thumb_emit_call_spills(inout te: ThumbEmit, alloc: LirAlloc, mdl_pool: Vec[Int], pos: Int) -> Unit
+  var i = 0
+  while i < alloc.spills.len() do
+    if alloc.spills[i].0 == pos then
+      let vreg = alloc.spills[i].1
+      match alloc.segs_of.get(vreg)
+      when Option::Some(segs) then
+        match lir_seg_at(segs, pos - 1)
+        when Option::Some(s) then
+          if s.phys >= 0 && s.slot >= 0 then
+            thumb_slot_store(te, mdl_pool, thumb_phys_of(mdl_pool, s.phys), s.slot)
+          end
+        when Option::None then ()
+        end
+      when Option::None then ()
+      end
+    end
+    i = i + 1
+  end
+end
+
+def thumb_emit_term(inout te: ThumbEmit, alloc: LirAlloc, mdl_pool: Vec[Int], fn_name: String, frame_bytes: Int, kind: LirTermKind, pos: Int, externs: Set[String], defined: Set[String]) -> Result[Unit, String]
+  match kind
+  when LirTermKind::LirJump(target) then
+    thumb_emit_b_uncond(te, lir_block_label(fn_name, target))
+    Result::Ok(())
+  when LirTermKind::LirSwitch(vreg, arms, default_target) then
+    let operand = thumb_emit_use(te, alloc, mdl_pool, vreg, pos, thumb_ip_reg())
+    var ai = 0
+    while ai < arms.len() do
+      let arm = arms[ai]
+      # Compare against the arm value and branch EQ to the arm block.
+      # (The aarch64 route fuses value-0 arms onto cbz; the ARMv7-M
+      # CBZ/CBNZ branch forward-only with a 62-byte range, so the
+      # emitter compares and branches — each compare immediately
+      # precedes its branch, and the next arm's compare overwrites the
+      # flags, so invariant I1 holds. cbz fusion where the
+      # direction and range are provable is not implemented.)
+      thumb_emit_cmp_imm(te, operand, arm.value)
+      thumb_emit_b_cond(te, thumb_cc(LirCond::LirEq), lir_block_label(fn_name, arm.target))
+      ai = ai + 1
+    end
+    thumb_emit_b_uncond(te, lir_block_label(fn_name, default_target))
+    Result::Ok(())
+  when LirTermKind::LirRet(rv) then
+    match rv
+    when Option::Some(vreg) then
+      let sr = thumb_emit_use(te, alloc, mdl_pool, vreg, pos, thumb_ip_reg())
+      if sr != thumb_ret_reg() then
+        t2_mov_rr(&mut te.buf, thumb_ret_reg(), sr)
+      end
+    when Option::None then ()
+    end
+    thumb_emit_epilogue(te, frame_bytes)
+    Result::Ok(())
+  when LirTermKind::LirTrap then
+    t2_udf(&mut te.buf)
+    Result::Ok(())
+  when LirTermKind::LirCall(target, args, stack_args, dest, success) then
+    # Pre-call spill stores (register-resident values crossing the call).
+    thumb_emit_call_spills(te, alloc, mdl_pool, pos)
+    # AAPCS caller-word cleanup: the LirPushArg statements before this
+    # terminator lowered stack_args 4-byte words below SP (descending
+    # argument order, even count — the lir_lower_call padding rule
+    # keeps SP 8-byte aligned at the BL); add them back right after the
+    # call so SP returns to the frame top for the success block.
+    let is_extern = externs.contains(&target) || !defined.contains(&target)
+    thumb_emit_bl(te, target, is_extern)
+    if stack_args > 0 then
+      let clean = 4 * stack_args
+      if clean <= 508 then
+        t2_add_sp_imm7(&mut te.buf, clean)
+      else
+        t2_movw(&mut te.buf, thumb_ip_reg(), (clean & 0xFFFF) as u16)
+        t2_add_sp_w_reg(&mut te.buf, thumb_ip_reg())
+      end
+    end
+    # Result capture: r0 -> dest (a fixed or ordinary vreg def at pos).
+    match dest
+    when Option::Some(dv) then
+      let dt = thumb_def_target(alloc, mdl_pool, dv, pos)
+      if dt.reg != thumb_ret_reg() then
+        t2_mov_rr(&mut te.buf, dt.reg, thumb_ret_reg())
+      end
+      if dt.store_slot >= 0 then
+        thumb_slot_store(te, mdl_pool, dt.reg, dt.store_slot)
+      end
+    when Option::None then ()
+    end
+    thumb_emit_b_uncond(te, lir_block_label(fn_name, success))
+    Result::Ok(())
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Function emission (mirrors lir_emit_fn)
+# ———————————————————————————————————————————————————————————————
+# Prologue: PUSH {r4-r10, lr} (32 bytes, even word count — SP stays
+# 8-aligned); sub sp, #frame (16-bit imm7 for small frames, movw +
+# SUB.W sp, sp, r12 beyond); mov r7, sp. Spill slot i is [r7 + 4*i].
+# The AAPCS stack parameters of a > 4-parameter function sit ABOVE the
+# push block (32 bytes) and the frame, so their machine offset from r7
+# is off + frame_bytes + 24 for the LIR's canonical payload `off` (see
+# the LirLoadFrame arm); frame_bytes threads through the statement
+# emitter for that translation.
+# Epilogue (at every Ret): add sp, #frame; POP {r4-r10, lr}; BX LR.
+def thumb_emit_fn(inout te: ThumbEmit, mdl_pool: Vec[Int], f: LirFunction, alloc: LirAlloc, externs: Set[String], defined: Set[String]) -> Result[Unit, String]
+  match thumb_validate_fn(f)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(_) then ()
+  end
+  # Frame bound: slot offsets are 4*slot; the frame is 8-aligned and the
+  # address path covers offsets up to 0xFFFF (movw) — 16382 slots max
+  # (4*16382 = 65528 bytes, the largest 8-aligned frame under 0x10000).
+  if alloc.slots > 16382 then
+    return Result::Err("thumb: function " + f.name + " needs " + alloc.slots.to_string() + " spill slots — larger than the 32-bit cortex-m frame model supports (fail-closed)")
+  end
+  let frame_bytes = thumb_frame_bytes(alloc.slots)
+
+  # Symbol + entry label. (P1-18 @cold): the declared hint rides the
+  # LIR record (LirFunction.attr_cold — stamped from MirFunction at
+  # lowering); the symbol routes into the cold section when set.
+  thumb_emit_fn_symbol(te, f.name.clone(), f.attr_cold)
+  def_label(&mut te.buf, f.name.clone())
+
+  # Prologue: PUSH {r4-r10, lr}; sub sp, #frame; mov r7, sp.
+  t2_push_w(&mut te.buf, thumb_saved_reg_list())
+  if frame_bytes > 0 then
+    if frame_bytes <= 508 then
+      t2_sub_sp_imm7(&mut te.buf, frame_bytes)
+    else
+      t2_movw(&mut te.buf, thumb_ip_reg(), (frame_bytes & 0xFFFF) as u16)
+      t2_sub_sp_w_reg(&mut te.buf, thumb_ip_reg())
+    end
+  end
+  t2_mov_rr(&mut te.buf, thumb_fp_reg(), thumb_sp_reg())
+
+  # Blocks, in order, with the SAME position walk the allocator used
+  # (invariant I3).
+  var pos = 0
+  var bi = 0
+  while bi < f.blocks.len() do
+    let b = f.blocks[bi]
+    def_label(&mut te.buf, lir_block_label(f.name.clone(), b.id))
+    var si = 0
+    while si < b.stmts.len() do
+      match thumb_emit_stmt(te, alloc, mdl_pool, frame_bytes, b.stmts[si].kind, pos)
+      when Result::Err(e) then return Result::Err(e)
+      when Result::Ok(_) then ()
+      end
+      pos = pos + 1
+      si = si + 1
+    end
+    match thumb_emit_term(te, alloc, mdl_pool, f.name.clone(), frame_bytes, b.term.kind, pos, externs, defined)
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(_) then ()
+    end
+    pos = pos + 1
+    bi = bi + 1
+  end
+  Result::Ok(())
+end
+
+# ———————————————————————————————————————————————————————————————
+# Deferred patch resolution
+# ———————————————————————————————————————————————————————————————
+# Runs after the whole program is emitted, when every function and block
+# label is defined. Every patch is a 32-bit B.W/BL whose imm24 was
+# emitted as 0; the final word is recomputed for the actual offset and
+# written back over the four bytes. Range overflow is fail-closed (a
+# +/-16 MiB branch cannot be reached by any realistic function, but a
+# wrong short branch would silently corrupt code).
+
+def thumb_patch_word(inout te: ThumbEmit, offset: Int, word: u32) -> Unit
+  let hw1 = (word >> 16) & 0xFFFF
+  let hw2 = word & 0xFFFF
+  te.buf.bytes[offset] = (hw1 & 0xFF) as u8
+  te.buf.bytes[offset + 1] = ((hw1 >> 8) & 0xFF) as u8
+  te.buf.bytes[offset + 2] = (hw2 & 0xFF) as u8
+  te.buf.bytes[offset + 3] = ((hw2 >> 8) & 0xFF) as u8
+end
+
+def thumb_resolve_patches(inout te: ThumbEmit) -> Result[Unit, String]
+  var pi = 0
+  while pi < te.patches.len() do
+    let p = te.patches[pi]
+    match te.buf.labels.get(p.label.clone())
+    when Option::Some(target) then
+      let rel = target - (p.offset + 4)
+      if rel < -16777216 || rel > 16777214 || (rel % 2) != 0 then
+        return Result::Err("thumb: branch to `" + p.label + "` is out of the +/-16 MiB Thumb-2 branch range (offset " + rel.to_string() + "); fail-closed")
+      end
+      let base = (if p.is_bl then 0xF800 else 0x9000 end) as u32
+      thumb_patch_word(te, p.offset, t2_branch24_word(rel, base))
+    when Option::None then
+      return Result::Err("thumb: internal error: branch target `" + p.label + "` was never defined (fail-closed)")
+    end
+    pi = pi + 1
+  end
+  Result::Ok(())
+end
+
+# ———————————————————————————————————————————————————————————————
+# ELF32 ARM (EM_ARM = 40) relocatable-object writer
+# ———————————————————————————————————————————————————————————————
+# Emits the machine code buffer as a REAL elf32-littlearm relocatable
+# object, mirroring the layout clang/LLVM produces (verified against
+# clang -target thumbv7em-none-eabi output):
+#   e_type ET_REL, e_machine EM_ARM (40), e_flags 0x05000000 (EABI5);
+#   one shared string table that carries BOTH the section names and the
+#   symbol names (e_shstrndx = its index — the clang convention, no
+#   separate .shstrtab);
+#   .text (PROGBITS, AX, align 4), .data (PROGBITS, AW, align 4 — the
+#   static scalar images, present only when the program has statics),
+#   .rel.text (SHT_REL — R_ARM_THM_CALL = 10 entries for extern calls
+#   and R_ARM_THM_MOVW_ABS_NC = 47 / R_ARM_THM_MOVT_ABS = 48 pairs for
+#   the static-value loads, align 4), .symtab (align 4, entsize 16),
+#   .strtab;
+#   "$t" mapping symbols mark the Thumb code regions so GNU/LLVM
+#   disassemblers and linkers see Thumb state;
+#   extern call targets are undefined global symbols resolved by the
+#   linker through the R_ARM_THM_CALL relocations, and the static
+#   images are global STT_OBJECT symbols in .data resolved by the
+#   MOVW/MOVT absolute-address relocation pairs.
+
+def thumb_w8(inout out: Vec[u8], v: u32) -> Unit
+  out.push((v & 0xFF) as u8)
+end
+
+def thumb_w16(inout out: Vec[u8], v: u32) -> Unit
+  out.push((v & 0xFF) as u8)
+  out.push(((v >> 8) & 0xFF) as u8)
+end
+
+def thumb_w32(inout out: Vec[u8], v: u32) -> Unit
+  out.push((v & 0xFF) as u8)
+  out.push(((v >> 8) & 0xFF) as u8)
+  out.push(((v >> 16) & 0xFF) as u8)
+  out.push(((v >> 24) & 0xFF) as u8)
+end
+
+def thumb_align4(inout out: Vec[u8]) -> Unit
+  while (out.len() % 4) != 0 do
+    out.push(0)
+  end
+end
+
+# An ELF32 string table appended to `out`; returns the offset of each
+# string so callers can fill sh_name/st_name fields. The first byte is
+# the mandatory NUL.
+def thumb_strtab_add(inout out: Vec[u8], names: Vec[String]) -> Vec[Int]
+  var offsets: Vec[Int] = Vec::new()
+  var oi = 0
+  while oi < names.len() do
+    let off = out.len()
+    offsets.push(off)
+    let name_bytes = names[oi].bytes()
+    var ci = 0
+    while ci < name_bytes.len() do
+      out.push(name_bytes[ci])
+      ci = ci + 1
+    end
+    out.push(0)
+    oi = oi + 1
+  end
+  offsets
+end
+
+# Build the object bytes. `fns` = (name, code offset) pairs in program
+# order; `datas` = (name, data offset, size) triples of the emitted
+# static images (program order); `exts` = extern names in program
+# order; `relocs` = the relocation sites (offset, symbol, ELF ARM type)
+# over the whole code buffer; `code` = the code bytes; `data` = the
+# .data bytes. `cold_base` = the code offset where the @cold region
+# begins (-1 when the program has no @cold functions — see
+# thumb_compile_object's deferred cold pass). The code stream is ONE
+# buffer; the writer splits it at cold_base into two real executable
+# sections — .text (the hot bytes) and .text.cold (the @cold tail,
+# PROGBITS AX, the same profile as .text), each with its own section
+# name, symbol-table entries (fn values rebased into the cold section)
+# and relocation section (.rel.text.cold for the sites inside the
+# tail). Objects without @cold code keep the exact pre-@cold layout.
+# The section layout (the clang-verified shape with the optional
+# sections inserted in index order):
+#   0 null, 1 strtab (shared name table, e_shstrndx), 2 .text,
+#   3 .text.cold (only when cold_base >= 0), then .data (only when
+#   statics emitted), .rel.text (only when hot relocations exist),
+#   .rel.text.cold (only when cold relocations exist), .symtab LAST.
+def thumb_elf32_obj(code: Vec[u8], fns: Vec[(String, Int)], datas: Vec[(String, Int, Int)], exts: Vec[String], relocs: Vec[ThumbReloc], data: Vec[u8], cold_base: Int) -> Vec[u8]
+  let has_cold = cold_base >= 0 && cold_base < code.len()
+  let hot_size = if has_cold then cold_base else code.len() end
+  let cold_size = code.len() - hot_size
+  # Partition the relocations by site: a site in the cold region
+  # ([cold_base, len) — an extern call or static reference from an
+  # @cold body) belongs to .rel.text.cold with its offset rebased into
+  # that section.
+  var rel_hot: Vec[ThumbReloc] = Vec::new()
+  var rel_cold: Vec[ThumbReloc] = Vec::new()
+  var rpi = 0
+  while rpi < relocs.len() do
+    let r = relocs[rpi]
+    if has_cold && r.offset >= cold_base then
+      rel_cold.push(ThumbReloc { offset: r.offset - cold_base, sym: r.sym.clone(), kind: r.kind })
+    else
+      rel_hot.push(ThumbReloc { offset: r.offset, sym: r.sym.clone(), kind: r.kind })
+    end
+    rpi = rpi + 1
+  end
+  let has_rel_hot = rel_hot.len() > 0
+  let has_rel_cold = rel_cold.len() > 0
+  let has_data = data.len() > 0
+  let n_sections = 4 + (if has_cold then 1 else 0 end) + (if has_data then 1 else 0 end) + (if has_rel_hot then 1 else 0 end) + (if has_rel_cold then 1 else 0 end)
+  # Section indexes: 0 null, 1 strtab, 2 .text, 3 .text.cold
+  # (optional), then .data (optional), .rel.text (optional),
+  # .rel.text.cold (optional), .symtab last.
+  let text_idx = 2
+  let text_cold_idx = if has_cold then 3 else -1 end
+  let data_idx = 3 + (if has_cold then 1 else 0 end)
+  let symtab_idx = n_sections - 1
+
+  # Symbol plan (ELF ordering: locals first, then globals — sh_info is
+  # the first global index): null; one "$t" local per function; the
+  # function globals, then the .data static globals, then the extern
+  # undefined globals.
+  var local_names: Vec[String] = Vec::new()   # "$t" per function
+  var global_names: Vec[String] = Vec::new()  # fns then datas then exts
+  var fi = 0
+  while fi < fns.len() do
+    local_names.push("$t".to_string())
+    global_names.push(fns[fi].0.clone())
+    fi = fi + 1
+  end
+  var di = 0
+  while di < datas.len() do
+    global_names.push(datas[di].0.clone())
+    di = di + 1
+  end
+  var ei = 0
+  while ei < exts.len() do
+    global_names.push(exts[ei].clone())
+    ei = ei + 1
+  end
+  let n_syms = 1 + local_names.len() + global_names.len()
+  let first_global = 1 + local_names.len()
+
+  # Section names (in the same string table): the table itself opens
+  # with a NUL, then the section names (in section-index order), then
+  # every symbol name. The sec_offs positions are captured per section
+  # by the append order.
+  var strtab: Vec[u8] = Vec::new()
+  strtab.push(0)
+  var sec_names: Vec[String] = Vec::new()
+  sec_names.push(".text".to_string())
+  if has_cold then
+    sec_names.push(".text.cold".to_string())
+  end
+  if has_data then
+    sec_names.push(".data".to_string())
+  end
+  if has_rel_hot then
+    sec_names.push(".rel.text".to_string())
+  end
+  if has_rel_cold then
+    sec_names.push(".rel.text.cold".to_string())
+  end
+  sec_names.push(".symtab".to_string())
+  sec_names.push(".strtab".to_string())
+  let sec_offs = thumb_strtab_add(strtab, sec_names)
+  let text_name_idx = 0
+  let text_cold_name_idx = if has_cold then 1 else -1 end
+  let data_name_idx = if has_data then (if has_cold then 2 else 1 end) else -1 end
+  let rel_name_idx = if has_rel_hot then (if has_cold then 1 else 0 end) + (if has_data then 1 else 0 end) + 1 else -1 end
+  let rel_cold_name_idx = if has_rel_cold then (if has_cold then 1 else 0 end) + (if has_data then 1 else 0 end) + (if has_rel_hot then 1 else 0 end) + 1 else -1 end
+  let symtab_name_idx = sec_names.len() - 2
+  let strtab_name_idx = sec_names.len() - 1
+  var sym_names: Vec[String] = Vec::new()
+  var si2 = 0
+  while si2 < local_names.len() do
+    sym_names.push(local_names[si2].clone())
+    si2 = si2 + 1
+  end
+  var gi2 = 0
+  while gi2 < global_names.len() do
+    sym_names.push(global_names[gi2].clone())
+    gi2 = gi2 + 1
+  end
+  let sym_offs = thumb_strtab_add(strtab, sym_names)
+  let strtab_size = strtab.len()
+
+  # File offsets (ehdr 52; sections 4-aligned) — .text, then
+  # .text.cold (directly after — the code stream's byte order is
+  # preserved in the file), then .data, then .rel.text, then
+  # .rel.text.cold, then .symtab, then the strtab, then the section
+  # headers.
+  let off_text = 52
+  let off_cold = off_text + hot_size
+  let off_data = thumb_align_4_of(off_cold + cold_size)
+  let data_size = data.len()
+  let off_rel = thumb_align_4_of(off_data + data_size)
+  let rel_size = rel_hot.len() * 8
+  let off_rel_cold = thumb_align_4_of(off_rel + rel_size)
+  let rel_cold_size = rel_cold.len() * 8
+  let off_sym = thumb_align_4_of(off_rel_cold + rel_cold_size)
+  let sym_size = n_syms * 16
+  let off_str = thumb_align_4_of(off_sym + sym_size)
+  let off_sh = thumb_align_4_of(off_str + strtab_size)
+
+  var out: Vec[u8] = Vec::new()
+  # ELF header (52 bytes).
+  out.push(0x7F); out.push(0x45); out.push(0x4C); out.push(0x46)
+  out.push(1)   # ELFCLASS32
+  out.push(1)   # ELFDATA2LSB
+  out.push(1)   # EV_CURRENT
+  var zi = 0
+  while zi < 9 do
+    out.push(0)
+    zi = zi + 1
+  end
+  thumb_w16(out, 1)          # e_type = ET_REL
+  thumb_w16(out, 40)         # e_machine = EM_ARM
+  thumb_w32(out, 1)          # e_version
+  thumb_w32(out, 0)          # e_entry
+  thumb_w32(out, 0)          # e_phoff
+  thumb_w32(out, off_sh as u32)  # e_shoff
+  thumb_w32(out, 0x05000000) # e_flags = EF_ARM_ABI_VER5 (EABI5)
+  thumb_w16(out, 52)         # e_ehsize
+  thumb_w16(out, 0)          # e_phentsize
+  thumb_w16(out, 0)          # e_phnum
+  thumb_w16(out, 40)         # e_shentsize
+  thumb_w16(out, n_sections as u32)  # e_shnum
+  thumb_w16(out, 1)          # e_shstrndx = the strtab section
+
+  # .text (pad to its offset, then the hot code) followed by .text.cold
+  # (the @cold tail — the code stream's bytes are emitted in order).
+  while out.len() < off_text do
+    out.push(0)
+  end
+  var ci = 0
+  while ci < hot_size do
+    out.push(code[ci])
+    ci = ci + 1
+  end
+  if has_cold then
+    while ci < code.len() do
+      out.push(code[ci])
+      ci = ci + 1
+    end
+  end
+
+  # .data (the static images).
+  if has_data then
+    while out.len() < off_data do
+      out.push(0)
+    end
+    var di2 = 0
+    while di2 < data_size do
+      out.push(data[di2])
+      di2 = di2 + 1
+    end
+  end
+
+  # .rel.text (the hot relocations).
+  if has_rel_hot then
+    while out.len() < off_rel do
+      out.push(0)
+    end
+    var ri = 0
+    while ri < rel_hot.len() do
+      # The symbol index of the relocation target: the global symbols
+      # sit after the leading "$t" locals (fns, then datas, then
+      # externs — the order of global_names).
+      var sym_idx = 0
+      var found = false
+      var gj = 0
+      while gj < global_names.len() do
+        if global_names[gj] == rel_hot[ri].sym then
+          sym_idx = first_global + gj
+          found = true
+          gj = global_names.len() + 1
+        else
+          gj = gj + 1
+        end
+      end
+      if !found then
+        # Defensive: a relocation whose target is not a global symbol
+        # of this object (a program function would mean the
+        # defined/extern classification drifted — guarded upstream in
+        # thumb_emit_bl / the LirStaticLoad arm; emitting a broken
+        # section is NOT acceptable) is written against the null symbol
+        # so the link errors visibly instead of silently mislinking.
+        sym_idx = 0
+      end
+      thumb_w32(out, rel_hot[ri].offset as u32)
+      thumb_w32(out, ((sym_idx as u32) << 8) | (rel_hot[ri].kind as u32))
+      ri = ri + 1
+    end
+  end
+
+  # .rel.text.cold (the @cold bodies' relocation sites — extern calls
+  # and static references inside the tail, rebased into .text.cold).
+  if has_rel_cold then
+    while out.len() < off_rel_cold do
+      out.push(0)
+    end
+    var ri2 = 0
+    while ri2 < rel_cold.len() do
+      var sym_idx = 0
+      var found = false
+      var gj = 0
+      while gj < global_names.len() do
+        if global_names[gj] == rel_cold[ri2].sym then
+          sym_idx = first_global + gj
+          found = true
+          gj = global_names.len() + 1
+        else
+          gj = gj + 1
+        end
+      end
+      if !found then
+        sym_idx = 0
+      end
+      thumb_w32(out, rel_cold[ri2].offset as u32)
+      thumb_w32(out, ((sym_idx as u32) << 8) | (rel_cold[ri2].kind as u32))
+      ri2 = ri2 + 1
+    end
+  end
+
+  # .symtab (16-byte entries).
+  while out.len() < off_sym do
+    out.push(0)
+  end
+  # Entry 0: null.
+  var si3 = 0
+  while si3 < 16 do
+    out.push(0)
+    si3 = si3 + 1
+  end
+  var li = 0
+  while li < local_names.len() do
+    # (P1-18 @cold): a function at a stream offset inside the cold
+    # region lives in .text.cold — its value is rebased into the
+    # section and its shndx names the cold section (the section's
+    # file/VM position restores the stream order).
+    let fn_off = fns[li].1
+    let in_cold = has_cold && fn_off >= cold_base
+    let fn_value = if in_cold then fn_off - cold_base else fn_off end
+    let fn_shndx = if in_cold then text_cold_idx else text_idx end
+    thumb_w32(out, sym_offs[li] as u32)
+    thumb_w32(out, fn_value as u32)   # $t value = function offset within its section
+    thumb_w32(out, 0)
+    out.push(0x00)   # STB_LOCAL | STT_NOTYPE
+    out.push(0)
+    thumb_w16(out, fn_shndx as u32)
+    li = li + 1
+  end
+  var gii = 0
+  while gii < fns.len() do
+    let gfn_off = fns[gii].1
+    let g_in_cold = has_cold && gfn_off >= cold_base
+    let gfn_value = if g_in_cold then gfn_off - cold_base else gfn_off end
+    let gfn_shndx = if g_in_cold then text_cold_idx else text_idx end
+    thumb_w32(out, sym_offs[local_names.len() + gii] as u32)
+    thumb_w32(out, gfn_value as u32)
+    thumb_w32(out, 0)
+    out.push(0x12)   # STB_GLOBAL | STT_FUNC
+    out.push(0)
+    thumb_w16(out, gfn_shndx as u32)
+    gii = gii + 1
+  end
+  if has_data then
+    var dd = 0
+    while dd < datas.len() do
+      thumb_w32(out, sym_offs[local_names.len() + fns.len() + dd] as u32)
+      thumb_w32(out, datas[dd].1 as u32)   # value = offset in .data
+      thumb_w32(out, datas[dd].2 as u32)   # size = the image size
+      out.push(0x11)   # STB_GLOBAL | STT_OBJECT
+      out.push(0)
+      thumb_w16(out, data_idx as u32)
+      dd = dd + 1
+    end
+  end
+  var exi = 0
+  while exi < exts.len() do
+    thumb_w32(out, sym_offs[local_names.len() + fns.len() + datas.len() + exi] as u32)
+    thumb_w32(out, 0)
+    thumb_w32(out, 0)
+    out.push(0x10)   # STB_GLOBAL | STT_NOTYPE
+    out.push(0)
+    thumb_w16(out, 0)  # SHN_UNDEF
+    exi = exi + 1
+  end
+
+  # .strtab.
+  while out.len() < off_str do
+    out.push(0)
+  end
+  var sti = 0
+  while sti < strtab_size do
+    out.push(strtab[sti])
+    sti = sti + 1
+  end
+
+  # Section headers (40 bytes each).
+  while out.len() < off_sh do
+    out.push(0)
+  end
+  # [0] null.
+  var zj = 0
+  while zj < 40 do
+    out.push(0)
+    zj = zj + 1
+  end
+  # [1] strtab (the name table: sh_name points at its own ".strtab").
+  thumb_w32(out, sec_offs[strtab_name_idx] as u32)
+  thumb_w32(out, 3)           # SHT_STRTAB
+  thumb_w32(out, 0)
+  thumb_w32(out, 0)
+  thumb_w32(out, off_str as u32)
+  thumb_w32(out, strtab_size as u32)
+  thumb_w32(out, 0)
+  thumb_w32(out, 0)
+  thumb_w32(out, 1)
+  thumb_w32(out, 0)
+  # [2] .text (the hot code — size hot_size when a cold region exists,
+  # the full code otherwise).
+  thumb_w32(out, sec_offs[text_name_idx] as u32)
+  thumb_w32(out, 1)           # SHT_PROGBITS
+  thumb_w32(out, 0x6)         # SHF_ALLOC | SHF_EXECINSTR
+  thumb_w32(out, 0)
+  thumb_w32(out, off_text as u32)
+  thumb_w32(out, hot_size as u32)
+  thumb_w32(out, 0)
+  thumb_w32(out, 0)
+  thumb_w32(out, 4)
+  thumb_w32(out, 0)
+  if has_cold then
+    # [3] .text.cold (the @cold bodies; Thumb instructions are
+    # halfword-aligned, so the section alignment is 2 — the section
+    # follows .text directly, preserving the code stream's byte order).
+    thumb_w32(out, sec_offs[text_cold_name_idx] as u32)
+    thumb_w32(out, 1)           # SHT_PROGBITS
+    thumb_w32(out, 0x6)         # SHF_ALLOC | SHF_EXECINSTR
+    thumb_w32(out, 0)
+    thumb_w32(out, off_cold as u32)
+    thumb_w32(out, cold_size as u32)
+    thumb_w32(out, 0)
+    thumb_w32(out, 0)
+    thumb_w32(out, 2)
+    thumb_w32(out, 0)
+  end
+  if has_data then
+    # [3/4] .data (the static images; every image is one 4-aligned
+    # 32-bit word, so the section alignment is 4).
+    thumb_w32(out, sec_offs[data_name_idx] as u32)
+    thumb_w32(out, 1)           # SHT_PROGBITS
+    thumb_w32(out, 0x3)         # SHF_ALLOC | SHF_WRITE
+    thumb_w32(out, 0)
+    thumb_w32(out, off_data as u32)
+    thumb_w32(out, data_size as u32)
+    thumb_w32(out, 0)
+    thumb_w32(out, 0)
+    thumb_w32(out, 4)
+    thumb_w32(out, 0)
+  end
+  if has_rel_hot then
+    thumb_w32(out, sec_offs[rel_name_idx] as u32)
+    thumb_w32(out, 9)         # SHT_REL
+    thumb_w32(out, 0)
+    thumb_w32(out, 0)
+    thumb_w32(out, off_rel as u32)
+    thumb_w32(out, rel_size as u32)
+    thumb_w32(out, symtab_idx as u32)
+    thumb_w32(out, text_idx as u32)
+    thumb_w32(out, 4)
+    thumb_w32(out, 8)
+  end
+  if has_rel_cold then
+    # .rel.text.cold — the relocation table of .text.cold (sh_info =
+    # the cold section's index).
+    thumb_w32(out, sec_offs[rel_cold_name_idx] as u32)
+    thumb_w32(out, 9)         # SHT_REL
+    thumb_w32(out, 0)
+    thumb_w32(out, 0)
+    thumb_w32(out, off_rel_cold as u32)
+    thumb_w32(out, rel_cold_size as u32)
+    thumb_w32(out, symtab_idx as u32)
+    thumb_w32(out, text_cold_idx as u32)
+    thumb_w32(out, 4)
+    thumb_w32(out, 8)
+  end
+  # The last section header is .symtab.
+  thumb_w32(out, sec_offs[symtab_name_idx] as u32)
+  thumb_w32(out, 2)           # SHT_SYMTAB
+  thumb_w32(out, 0)
+  thumb_w32(out, 0)
+  thumb_w32(out, off_sym as u32)
+  thumb_w32(out, sym_size as u32)
+  thumb_w32(out, 1)           # sh_link = strtab
+  thumb_w32(out, first_global as u32)
+  thumb_w32(out, 4)
+  thumb_w32(out, 16)
+
+  out
+end
+
+def thumb_align_4_of(n: Int) -> Int
+  let rem = n % 4
+  if rem != 0 then
+    n + (4 - rem)
+  else
+    n
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Whole-program route (mirrors lir_compile_object)
+# ———————————————————————————————————————————————————————————————
+# The driver's LIR gate (TANGERINE_LIR_TARGET=cortex-m) routes single
+# files here: the program's statics lower through the scalar-constant
+# subset into a .data image (see the statics section above), every
+# non-extern function goes through the LIR pipeline
+# (fail-closed: one unsupported construct fails the whole compile with a
+# rule-naming reason), the bodies are emitted into one text buffer with
+# the runtime-free conventions above, deferred branches are resolved and
+# the buffer is serialized as the ELF32 ARM object. No runtime merge:
+# the aarch64 runtime buffers in codegen.tg are aarch64 machine code
+# and cannot be mixed into a cortex-m object (a cortex-m runtime is a
+# separate slice; externs resolve through the object's undefined
+# symbols instead).
+
+# Collect the (name, offset) function symbols in program order from the
+# emit state's symbol records. (P1-18 @cold): a ColdText symbol (an
+# attr_cold function of the deferred cold pass) is a function of the
+# same code buffer — its tuple rides along and the ELF writer assigns
+# it to .text.cold by its offset (>= the cold_base it receives).
+def thumb_collect_fns(te: ThumbEmit) -> Vec[(String, Int)]
+  var fns: Vec[(String, Int)] = Vec::new()
+  var i = 0
+  while i < te.syms.len() do
+    let s = te.syms[i]
+    if s.section == Section::Text || s.section == Section::ColdText then
+      fns.push((s.name.clone(), s.offset))
+    end
+    i = i + 1
+  end
+  fns
+end
+
+# Collect the (name, offset, size) .data symbols in program order (the
+# static images the route's data emission registered).
+def thumb_collect_datas(te: ThumbEmit) -> Vec[(String, Int, Int)]
+  var datas: Vec[(String, Int, Int)] = Vec::new()
+  var i = 0
+  while i < te.syms.len() do
+    let s = te.syms[i]
+    if s.section == Section::Data then
+      datas.push((s.name.clone(), s.offset, s.size))
+    end
+    i = i + 1
+  end
+  datas
+end
+
+def thumb_collect_exts(te: ThumbEmit) -> Vec[String]
+  var exts: Vec[String] = Vec::new()
+  var i = 0
+  while i < te.syms.len() do
+    let s = te.syms[i]
+    if s.section == Section::Extern then
+      exts.push(s.name.clone())
+    end
+    i = i + 1
+  end
+  exts
+end
+
+# ———————————————————————————————————————————————————————————————
+# Whole-program static data emission (the scalar-constant subset)
+# ———————————————————————————————————————————————————————————————
+# thumb_compile_object emits the program's statics into a .data image
+# instead of failing closed (see lir.tg's statics section for the
+# shared admission model — lir_static_scalar_ok with the word-only
+# accept set: the 64-bit integer words plus Bool — and the
+# lir_static_init_word_value initializer subset). Each admitted static
+# becomes ONE 32-bit machine word at a 4-aligned .data offset: the
+# initializer's low word (Bool: the 0/1 byte in the low byte, zeros
+# above — the full-word load of the reference reads it back as the
+# canonical 0/1 or value word). Initializer values must fit the
+# route's 32-bit word model (thumb_imm32_ok — the LIR word model's
+# [-2^31, 2^32) faithful range). Uninitialized/extern statics emit the
+# zero word (semantically the direct route's zero-initialized .bss
+# slot; the ELF32 ARM writer of this slice has no .bss section, and a
+# zero .data word links identically). The data symbols are GLOBAL
+# SymKind::Data records (the reference relocations resolve against
+# them); the symbol size is the 4-byte image size.
+def thumb_emit_static_data(inout data: CodeBuffer, inout syms: Vec[AsmSymbol], st: MirStatic) -> Result[Unit, String]
+  let ty = st.ty.clone()
+  if !lir_static_scalar_ok(false, ty) then
+    return Result::Err("thumb: " + lir_static_unsupported_type_rule(st.name.clone()))
+  end
+  let word_o = match lir_static_init_word_value(st)
+  when Result::Err(e) then return Result::Err("thumb: " + e)
+  when Result::Ok(o) then o
+  end
+  let off = buf_pos(&data)
+  match word_o
+  when Option::Some(v) then
+    if !thumb_imm32_ok(v) then
+      return Result::Err("thumb: static '" + st.name + "' initializer " + v.to_string() + " does not fit the 32-bit cortex-m word model [-2^31, 2^32) — the value has no faithful 32-bit image (fail-closed)")
+    end
+    emit32_le(&mut data, (v & 0xFFFFFFFF) as u32)
+  when Option::None then
+    emit32_le(&mut data, 0)
+  end
+  syms.push(AsmSymbol {
+    name: st.name.clone(),
+    section: Section::Data,
+    offset: off,
+    size: 4,
+    binding: SymBinding::Global,
+    kind: SymKind::Data
+  })
+  Result::Ok(())
+end
+
+# Emit the whole program's statics into the .data buffer and its symbol
+# records (the route's mirror of lir_emit_program_statics_a64).
+def thumb_emit_program_statics(inout data: CodeBuffer, inout syms: Vec[AsmSymbol], program: MirProgram) -> Result[Unit, String]
+  var si = 0
+  while si < program.statics.len() do
+    match thumb_emit_static_data(&mut data, &mut syms, &program.statics[si])
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(_) then ()
+    end
+    si = si + 1
+  end
+  Result::Ok(())
+end
+
+def thumb_compile_object(program: MirProgram) -> Result[Vec[u8], String]
+  # The whole-program static label table (DefId-render -> emission name
+  # — the codegen.tg builder, the same table the direct emitter's
+  # codegen_program runs): the MirStaticRef lowering resolves static
+  # references through it (passed to the lowering entries below). The
+  # statics themselves are emitted into the .data image BEFORE any
+  # function body (mirroring codegen_program's ordering), so the
+  # symbols the reference relocations target exist up front.
+  var static_labels: Map[String, String] = Map::new()
+  build_static_label_table(program, &mut static_labels)
+  var data = buf_new()
+  var te = thumb_emit_new()
+  match thumb_emit_program_statics(&mut data, &mut te.syms, program)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(_) then ()
+  end
+  let mdl_pool = match thumb_mdl_pool(thumb_target_desc())
+  when Result::Ok(p) then p
+  when Result::Err(e) then return Result::Err(e)
+  end
+  var externs: Set[String] = Set::new()
+  var defined: Set[String] = Set::new()
+  var fi = 0
+  while fi < program.functions.len() do
+    let f = program.functions[fi]
+    if f.is_extern then
+      externs.insert(f.name.clone())
+    else
+      defined.insert(f.name.clone())
+    end
+    fi = fi + 1
+  end
+  fi = 0
+  while fi < program.functions.len() do
+    let f = program.functions[fi]
+    if f.is_extern then
+      # Extern functions get no body — an undefined symbol entry so the
+      # linker resolves them (the direct emitter's extern convention).
+      te.syms.push(AsmSymbol {
+        name: f.name.clone(),
+        section: Section::Extern,
+        offset: 0,
+        size: 0,
+        binding: SymBinding::Global,
+        kind: SymKind::Func
+      })
+    else if !f.attr_cold then
+      # (P1-18 @cold — the HOT pass): every non-@cold body lowers and
+      # emits here (program order). An attr_cold function is DEFERRED
+      # to the cold pass below, which emits the @cold bodies as a
+      # contiguous tail of the code buffer — the .text.cold region the
+      # symbol registration in thumb_emit_fn_symbol routes them into
+      # (Section::ColdText). Programs without @cold functions take the
+      # cold pass as a zero-iteration no-op and the buffer is
+      # byte-identical to the pre-@cold layout.
+      # The cortex-m route lowers through the AAPCS32 parameter-fetch
+      # entry (lower_mir_fn_to_lir_cm): params/args 0..3 ride r0..r3,
+      # every index >= 4 crosses on the caller's stack in 4-byte words,
+      # and the word-only accept set keeps div/mod, sized widths and
+      # aggregates fail-closed exactly as before. The whole-program
+      # static label table rides along, so MirStaticRef reads lower to
+      # LirStaticLoad against the .data symbols emitted above.
+      let lir_fn = match lower_mir_fn_to_lir_cm(f, static_labels)
+      when Result::Err(e) then return Result::Err(e)
+      when Result::Ok(lf) then lf
+      end
+      match lir_validate_callees(lir_fn, defined, externs)
+      when Result::Err(e) then return Result::Err(e)
+      when Result::Ok(_) then ()
+      end
+      let peeped = lir_peephole(lir_fn)
+      let alloc = lir_alloc_registers(peeped)
+      match thumb_emit_fn(&mut te, mdl_pool, peeped, alloc, externs, defined)
+      when Result::Err(e) then return Result::Err(e)
+      when Result::Ok(_) then ()
+      end
+    end
+    fi = fi + 1
+  end
+
+  # (P1-18 @cold — the deferred COLD pass): lower and emit the
+  # attr_cold function bodies HERE, at the end of the buffer, so they
+  # form the contiguous cold tail (the .text.cold region; cold_base
+  # records its start for the ELF writer, which splits the buffer and
+  # rebases the cold symbols/relocations). The deferred branches the
+  # cold bodies create are resolved by thumb_resolve_patches below
+  # against the final positions, exactly like the hot pass's. Programs
+  # without @cold functions take this pass as a zero-iteration no-op.
+  var has_cold_fn = false
+  fi = 0
+  while fi < program.functions.len() do
+    let f = program.functions[fi]
+    if !f.is_extern && f.attr_cold then
+      has_cold_fn = true
+    end
+    fi = fi + 1
+  end
+  var cold_base = -1
+  if has_cold_fn then
+    cold_base = buf_pos(&te.buf)
+    fi = 0
+    while fi < program.functions.len() do
+      let f = program.functions[fi]
+      if !f.is_extern && f.attr_cold then
+        let lir_fn = match lower_mir_fn_to_lir_cm(f, static_labels)
+        when Result::Err(e) then return Result::Err(e)
+        when Result::Ok(lf) then lf
+        end
+        match lir_validate_callees(lir_fn, defined, externs)
+        when Result::Err(e) then return Result::Err(e)
+        when Result::Ok(_) then ()
+        end
+        let peeped = lir_peephole(lir_fn)
+        let alloc = lir_alloc_registers(peeped)
+        match thumb_emit_fn(&mut te, mdl_pool, peeped, alloc, externs, defined)
+        when Result::Err(e) then return Result::Err(e)
+        when Result::Ok(_) then ()
+        end
+      end
+      fi = fi + 1
+    end
+  end
+  match thumb_resolve_patches(&mut te)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(_) then ()
+  end
+  let fns = thumb_collect_fns(te)
+  let datas = thumb_collect_datas(te)
+  let exts = thumb_collect_exts(te)
+  let rels = te.relocs.clone()
+  Result::Ok(thumb_elf32_obj(te.buf.bytes.clone(), fns, datas, exts, rels, data.bytes.clone(), cold_base))
+end
+
+# Executable/image emission for cortex-m is out of this slice (the
+# embedded route's ELF image + arm-none-eabi linker contract): fail
+# closed with the reason.
+def thumb_compile_executable(program: MirProgram, output_path: String) -> Result[Unit, String]
+  Result::Err("thumb: the cortex-m LIR route does not link executables in this slice — use --emit=obj and link the ELF32 ARM object with an arm-none-eabi linker (the embedded image/vector-table contract is a separate route)")
+end

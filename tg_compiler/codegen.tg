@@ -182,11 +182,27 @@ struct CodegenCtx
   # math. Stamped per function at codegen_function's fp-mode stamp site
   # (the debug_current_fn precedent — the stamp precedes every body
   # emission); the float emission sites consult it when the @fp(fast)
-  # fast paths land (TODO P1-6 markers there).
+  # fast paths land (the P1-6 not-implemented markers sit there).
   current_fp_fast: Bool = false
   # Track BSS size for uninitialized globals
   bss_size: Int
   bss_symbols: Vec[AsmSymbol]  # Symbols in .bss
+  # (P1-18 @cold) The byte offset in ctx.text where the @cold region
+  # begins — codegen_program emits every attr_cold function body into a
+  # CONTIGUOUS COLD TAIL of the single code stream (the two-phase
+  # function loop: the hot pass emits everything else first, so the
+  # cold bodies — plus the enum-eq helpers they request and the RET
+  # stubs that follow them — form the stream's final run), then records
+  # the region's start here. -1 means the program has no @cold
+  # functions (the label->symbol conversions and the object writers
+  # then emit exactly as before — the no-cold byte stream is
+  # unchanged). The symbol registrations of codegen_function route
+  # @cold functions into Section::ColdText (the @cold consumption
+  # point), and the object assembly in generate_native /
+  # generate_executable routes every label-derived symbol whose offset
+  # falls inside [cold_text_start, len) into Section::ColdText as well,
+  # so the object's cold section describes exactly the tail region.
+  cold_text_start: Int = -1
   string_pool: Map[String, String]  # literal -> label
   string_counter: Int
   fn_counter: Int
@@ -203,6 +219,16 @@ struct CodegenCtx
   type_defs: Vec[MirTypeDef]              # All type definitions for lookup
   type_def_index: Map[Int, Int]           # TypeId.id -> index in type_defs (O(1) lookup)
   extern_fns: Set[String]                 # Names of extern (FFI) functions
+  # (audit P1-13 — C variadic externs): the extern functions DECLARED
+  # with the trailing C variadic marker `...` (MirFunction.
+  # is_extern_variadic, recorded at codegen_program) and — for exactly
+  # those — their FIXED declared parameter count (MirFunction.params,
+  # the prefix the declaration's callable signature binds). codegen_call
+  # consults the pair to route a variadic extern call to the dedicated
+  # varargs emitter (fixed part as today; the EXTRA arguments per the
+  # platform rules) and to set the x86-64 SysV AL vector count.
+  extern_variadic_fns: Set[String]
+  extern_fixed_param_counts: Map[String, Int]
   reachable_fns: Set[String]               # Names of all reachable compiled functions
   fn_alias: Map[String, String]            # MIR reference name → actual compiled function label
  # base names of `$`-suffixed monomorphized instance names
@@ -1066,6 +1092,7 @@ def codegen_new(target: AsmTarget) -> CodegenCtx
     current_fp_fast: false,
     bss_size: 0,
     bss_symbols: Vec::new(),
+    cold_text_start: -1,
     string_pool: Map::new(),
     string_counter: 0,
     fn_counter: 0,
@@ -1077,6 +1104,8 @@ def codegen_new(target: AsmTarget) -> CodegenCtx
     type_defs: Vec::new(),
     type_def_index: Map::new(),
     extern_fns: Set::new(),
+    extern_variadic_fns: Set::new(),
+    extern_fixed_param_counts: Map::new(),
     reachable_fns: Set::new(),
     fn_alias: Map::new(),
     generic_instance_bases: Set::new(),
@@ -2469,28 +2498,39 @@ end
 # failure_order. Order codes (ordering_to_c in std::atomic): 0 = Relaxed
 # ... 5 = SeqCst.
 #
-# ORDERING DISCIPLINE (P1-20 — the per-ordering lowering, memory_model.md
-# §16.8): the emitters serve AT LEAST the requested ordering, exactly
-# where the ISA has a cheaper form, and the strongest form where it does
-# not:
+# ORDERING DISCIPLINE (the per-ordering lowering, memory_model.md §16.8):
+# the emitters serve AT LEAST the requested ordering, exactly where the
+# ISA has a cheaper form, and the strongest form where it does not:
 #   * AArch64 load: Relaxed = plain LDR; Acquire/SeqCst = LDAR (an
 #     acquire load; the LDAR/STLR pair is the SC-load/SC-store
 #     discipline on the supported ARMv8.3+ LSE-required cores).
 #   * AArch64 store: Relaxed = plain STR; Release/SeqCst = STLR.
-#   * x86-64 load: plain MOV for every ordering (TSO: loads are
-#     acquire; SC loads = plain MOV under the xchg-store discipline).
-#   * x86-64 store: SeqCst = the xchg-based store (the implicitly
-#     locked exchange); Relaxed/Release = plain MOVs (TSO gives a
-#     plain store the release semantics).
-#   * RMW/exchange both arches: the strongest form unconditionally
-#     (AArch64: the LSE-al family — LDADDAL/CASAL/SWPAL; x86: the
-#     LOCKed ops) — correct for every ordering, including Relaxed
-#     (stronger-than-requested is always legal). The per-ordering
-#     A/L variants (LDADD/LDADDA/LDADDL …) are the TODO in §16.8.1.
-#   * compare_exchange both arches: the strongest form for BOTH the
-#     success and the failure path (CASAL / lock cmpxchg), so every
-#     legal (success, failure) pair is served; failure-order dispatch
-#     is the TODO in §16.8.1.
+#   * AArch64 RMW/exchange: per-ordering LSE dispatch on the order
+#     code in x2 (0 = Relaxed → the plain LDADD/LDCLR/LDEOR/LDSET/SWP
+#     form; 2 = Acquire → +A; 3 = Release → +L; 4 = AcqRel and
+#     5 = SeqCst → +AL; an out-of-domain code deterministically takes
+#     the +AL arm — the strongest form). The sub ops atomically add
+#     -v (NEG first) and the and ops atomically AND v (MVN first:
+#     LDCLR clears the bits SET in its operand — the clang-identical
+#     operand prep).
+#   * AArch64 compare_exchange: per-ordering CAS dispatch on the
+#     success order code in x4 (0 = Relaxed → CAS, 2 = Acquire →
+#     CASA, 3 = Release → CASL, 4 = AcqRel and 5 = SeqCst → CASAL).
+#     The failure order in x5 needs no separate instruction: a failed
+#     LSE CAS performs no store, and §16.3's validation admits only
+#     Relaxed/Acquire/SeqCst failures no stronger than the success —
+#     an Acquire failure implies an Acquire-or-stronger success whose
+#     acquire read covers the failed-path read, and a SeqCst failure
+#     implies SeqCst success (CASAL — the SC read under the LDAR/STLR
+#     discipline). (memory_model.md §16.8.1.)
+#   * x86-64: plain MOV loads for every ordering (TSO: loads are
+#     acquire; SC loads = plain MOV under the xchg-store discipline);
+#     the SeqCst store is the xchg-based store (the implicitly locked
+#     exchange) while Relaxed/Release stores are plain MOVs (TSO
+#     gives a plain store the release semantics); every RMW/CAS is
+#     the LOCKed form — an x86 atomic RMW is inherently a full
+#     barrier, so no weaker width-exact instruction exists for any
+#     ordering.
 #   * fence: per-ordering — see the fence arms below (AArch64: DMB
 #     ISHLD for Acquire, DMB ISH for Release/AcqRel/SeqCst, nothing
 #     for Relaxed; x86-64: MFENCE only for SeqCst — TSO needs no
@@ -2502,14 +2542,16 @@ end
 # the single-attempt strong form (weak CAS is a PERMISSION to fail
 # spuriously, so the strong form is always conformant).
 #
-# LSE CONTRACT: the AArch64 RMWs (LDADDAL/CASAL/SWPAL — the LSE-al family
-# below) require the ARMv8.1 LSE extension; the aarch64 target's contract
-# is LSE-REQUIRED (see asm.tg's target feature table — the driver's
-# --target documentation). The ldaxr/stlxr LL/SC fallback is the future
-# portable mode, not the current emission. The SeqCst store/load
-# discipline (STLR/LDAR as the SC pair) additionally assumes the ARMv8.3+
-# cumulative semantics of the pair, which the LSE-required core baseline
-# (Apple Silicon / Neoverse class) provides (memory_model.md §16.8).
+# LSE CONTRACT: the AArch64 RMW/CAS instructions emitted below (the LSE
+# families — LDADD/LDCLR/LDEOR/LDSET/SWP/CAS with their per-ordering
+# A/L variants) require the ARMv8.1 LSE extension; the aarch64 target's
+# contract is LSE-REQUIRED (see asm.tg's target feature table — the
+# driver's --target documentation). The ldaxr/stlxr LL/SC fallback is
+# the future portable mode, not the current emission. The SeqCst store/
+# load discipline (STLR/LDAR as the SC pair) additionally assumes the
+# ARMv8.3+ cumulative semantics of the pair, which the LSE-required core
+# baseline (Apple Silicon / Neoverse class) provides (memory_model.md
+# §16.8).
 def emit_atomic_intrinsic(inout ctx: CodegenCtx, name: String) -> Bool
   let (op, width) = atomic_intrinsic_op_and_width(name)
   match ctx.target.arch
@@ -2545,7 +2587,12 @@ def atomic_intrinsic_op_and_width(name: String) -> (String, Int)
   end
 end
 
-# Size-scaled AArch64 atomic encodings (size in bits [31:30]).
+# Size-scaled AArch64 atomic encodings (size in bits [31:30]). The
+# LDAR/STLR tables below serve the load/store arms; the LSE tables
+# (LDADDAL/LDCLRAL/LDEORAL/LDSETAL/SWPAL/CASAL) are the word-level
+# reference the asm.tg LSE encoders (a64_ldadd … a64_cas with their A/L
+# variants) reproduce — the per-ordering RMW/CAS emission calls those
+# encoders.
 def a64_ldar_enc(width: Int) -> u32
   match width
   when 1 then 0x08DFFC00
@@ -2560,8 +2607,8 @@ def a64_stlr_enc(width: Int) -> u32
   # STLR bases verified against the AArch64 ISA (assembled + disassembled):
   # STLRB = 0x089FFC00 | Rn<<5 | Rt, STLRH = 0x489FFC00, STLR (w) =
   # 0x889FFC00, STLR (x) = 0xC89FFC00 (e.g. stlr x1,[x0] = 0xC89FFC01).
-  # The former constants (…1F7C00) were NOT valid STLR encodings (P1-20
-  # audit: an AArch64 atomic store emitted an unallocated instruction word).
+  # The former constants (…1F7C00) were NOT valid STLR encodings — the
+  # audit found an AArch64 atomic store emitting an unallocated word.
   match width
   when 1 then 0x089FFC00
   when 2 then 0x489FFC00
@@ -2642,6 +2689,143 @@ def a64_emit_mov_result(inout ctx: CodegenCtx, width: Int, src: A64) -> Unit
   end
 end
 
+# Map the intrinsic width (bytes 1/2/4/8) to the LSE/exclusive size
+# field ([31:30]: 0 = byte, 1 = halfword, 2 = word, 3 = doubleword).
+def a64_atomic_size_code(width: Int) -> u32
+  match width
+  when 1 then 0
+  when 2 then 1
+  when 4 then 2
+  when 8 then 3
+  when _ then 3
+  end
+end
+
+# Emit one LSE RMW instruction for the op family ("add" = LDADD,
+# "and" = LDCLR, "or" = LDSET, "xor" = LDEOR, "swap" = SWP) at the
+# ordering variant (0 = plain, 1 = acquire +A, 2 = release +L, 3 =
+# acq_rel/seq_cst +AL): the value operand is `s`, the address is x0,
+# and the OLD value lands in x9 (zero-extended into x9 for the byte/
+# halfword/word sizes). The encoders take the size field via their
+# `size` parameter and default to the X form.
+def emit_a64_lse_rmw_variant(inout ctx: CodegenCtx, family: String, variant: Int, s: A64, width: Int) -> Unit
+  let size = a64_atomic_size_code(width)
+  match family
+  when "add" then
+    match variant
+    when 0 then a64_ldadd(&mut ctx.text, s, A64::X9, A64::X0, size)
+    when 1 then a64_ldadda(&mut ctx.text, s, A64::X9, A64::X0, size)
+    when 2 then a64_ldaddl(&mut ctx.text, s, A64::X9, A64::X0, size)
+    when 3 then a64_ldaddal(&mut ctx.text, s, A64::X9, A64::X0, size)
+    end
+  when "and" then
+    match variant
+    when 0 then a64_ldclr(&mut ctx.text, s, A64::X9, A64::X0, size)
+    when 1 then a64_ldclra(&mut ctx.text, s, A64::X9, A64::X0, size)
+    when 2 then a64_ldclrl(&mut ctx.text, s, A64::X9, A64::X0, size)
+    when 3 then a64_ldclral(&mut ctx.text, s, A64::X9, A64::X0, size)
+    end
+  when "or" then
+    match variant
+    when 0 then a64_ldset(&mut ctx.text, s, A64::X9, A64::X0, size)
+    when 1 then a64_ldseta(&mut ctx.text, s, A64::X9, A64::X0, size)
+    when 2 then a64_ldsetl(&mut ctx.text, s, A64::X9, A64::X0, size)
+    when 3 then a64_ldsetal(&mut ctx.text, s, A64::X9, A64::X0, size)
+    end
+  when "xor" then
+    match variant
+    when 0 then a64_ldeor(&mut ctx.text, s, A64::X9, A64::X0, size)
+    when 1 then a64_ldeora(&mut ctx.text, s, A64::X9, A64::X0, size)
+    when 2 then a64_ldeorl(&mut ctx.text, s, A64::X9, A64::X0, size)
+    when 3 then a64_ldeoral(&mut ctx.text, s, A64::X9, A64::X0, size)
+    end
+  when "swap" then
+    match variant
+    when 0 then a64_swp(&mut ctx.text, s, A64::X9, A64::X0, size)
+    when 1 then a64_swpa(&mut ctx.text, s, A64::X9, A64::X0, size)
+    when 2 then a64_swpl(&mut ctx.text, s, A64::X9, A64::X0, size)
+    when 3 then a64_swpal(&mut ctx.text, s, A64::X9, A64::X0, size)
+    end
+  when _ then
+    ()
+  end
+end
+
+# Per-ordering AArch64 RMW/exchange emission (order code in x2: 0 =
+# Relaxed, 2 = Acquire, 3 = Release, 4 = AcqRel, 5 = SeqCst — the std
+# ordering_to_c codes). The dispatch branches 0/2/3 and serves Relaxed
+# with the plain LSE form, Acquire with +A, Release with +L, and
+# AcqRel/SeqCst (plus any out-of-domain code — UB per §16.3, served
+# deterministically) with +AL, today's unconditional emission.
+# fetch_sub/sub_fetch negate the value first (the subtraction is the
+# atomic add of -v); fetch_and/and_fetch complement it first (LDCLR
+# clears the bits SET in its operand, so the AND of v is the bit-clear
+# of ~v — the mvn+ldclr operand prep clang emits for fetch_and). The
+# OLD value lands in x9; the fetch_*/exchange forms return it and the
+# *_fetch forms return the NEW value computed from x9 and the original
+# value still in x1.
+def emit_a64_rmw_ordered(inout ctx: CodegenCtx, width: Int, op: String) -> Unit
+  var family = "add"
+  var src = A64::X1
+  if op == "exchange" then
+    family = "swap"
+  elsif op == "fetch_sub" || op == "sub_fetch" then
+    if width == 8 then
+      a64_neg(&mut ctx.text, A64::X8, A64::X1)
+    else
+      a64_neg_w(&mut ctx.text, A64::X8, A64::X1)
+    end
+    src = A64::X8
+  elsif op == "fetch_and" || op == "and_fetch" then
+    a64_mvn(&mut ctx.text, A64::X8, A64::X1)
+    src = A64::X8
+  elsif op == "fetch_or" || op == "or_fetch" then
+    family = "or"
+  elsif op == "fetch_xor" || op == "xor_fetch" then
+    family = "xor"
+  end
+  let cnt = ctx.fn_counter.to_string()
+  ctx.fn_counter = ctx.fn_counter + 1
+  let lbl_plain = ".Latomic_rmw_plain." + cnt
+  let lbl_acquire = ".Latomic_rmw_acquire." + cnt
+  let lbl_release = ".Latomic_rmw_release." + cnt
+  let lbl_done = ".Latomic_rmw_done." + cnt
+  a64_cmp_ri(&mut ctx.text, A64::X2, 0)
+  a64_bcond(&mut ctx.text, a64_cc_eq(), lbl_plain.clone())
+  a64_cmp_ri(&mut ctx.text, A64::X2, 2)
+  a64_bcond(&mut ctx.text, a64_cc_eq(), lbl_acquire.clone())
+  a64_cmp_ri(&mut ctx.text, A64::X2, 3)
+  a64_bcond(&mut ctx.text, a64_cc_eq(), lbl_release.clone())
+  emit_a64_lse_rmw_variant(ctx, &family, 3, src, width)
+  a64_b(&mut ctx.text, lbl_done.clone())
+  def_label(&mut ctx.text, lbl_release.clone())
+  emit_a64_lse_rmw_variant(ctx, &family, 2, src, width)
+  a64_b(&mut ctx.text, lbl_done.clone())
+  def_label(&mut ctx.text, lbl_acquire.clone())
+  emit_a64_lse_rmw_variant(ctx, &family, 1, src, width)
+  a64_b(&mut ctx.text, lbl_done.clone())
+  def_label(&mut ctx.text, lbl_plain.clone())
+  emit_a64_lse_rmw_variant(ctx, &family, 0, src, width)
+  def_label(&mut ctx.text, lbl_done.clone())
+  match op
+  when "exchange" | "fetch_add" | "fetch_sub" | "fetch_and" | "fetch_or" | "fetch_xor" then
+    a64_emit_mov_result(ctx, width, A64::X9)
+  when "add_fetch" then
+    # new = old + val (the destination store truncates to the width).
+    a64_add_rrr(&mut ctx.text, A64::X0, A64::X9, A64::X1)
+  when "sub_fetch" then
+    a64_sub_rrr(&mut ctx.text, A64::X0, A64::X9, A64::X1)
+  when "and_fetch" then
+    a64_and_rrr(&mut ctx.text, A64::X0, A64::X9, A64::X1)
+  when "or_fetch" then
+    a64_orr_rrr(&mut ctx.text, A64::X0, A64::X9, A64::X1)
+  when "xor_fetch" then
+    a64_eor_rrr(&mut ctx.text, A64::X0, A64::X9, A64::X1)
+  when _ then
+    ()
+  end
+end
+
 def emit_atomic_intrinsic_a64(inout ctx: CodegenCtx, op: String, width: Int) -> Unit
   match op
   when "fence" then
@@ -2713,55 +2897,28 @@ def emit_atomic_intrinsic_a64(inout ctx: CodegenCtx, op: String, width: Int) -> 
     when 8 then a64_str(&mut ctx.text, A64::X1, A64::X0, 0)
     end
     def_label(&mut ctx.text, lbl_st_done.clone())
-  when "exchange" then
-    # SWPAL w1, w9, [x0] — old value in w9.
-    emit32_le(&mut ctx.text, a64_swpal_enc(width) | (a64_code(A64::X1) << 16) | (a64_code(A64::X0) << 5) | a64_code(A64::X9))
-    a64_emit_mov_result(ctx, width, A64::X9)
-  when "fetch_add" then
-    emit32_le(&mut ctx.text, a64_ldaddal_enc(width) | (a64_code(A64::X1) << 16) | (a64_code(A64::X0) << 5) | a64_code(A64::X9))
-    a64_emit_mov_result(ctx, width, A64::X9)
-  when "fetch_sub" then
-    # The subtraction is the atomic add of -v.
-    if width == 8 then
-      a64_neg(&mut ctx.text, A64::X8, A64::X1)
-    else
-      a64_neg_w(&mut ctx.text, A64::X8, A64::X1)
-    end
-    emit32_le(&mut ctx.text, a64_ldaddal_enc(width) | (a64_code(A64::X8) << 16) | (a64_code(A64::X0) << 5) | a64_code(A64::X9))
-    a64_emit_mov_result(ctx, width, A64::X9)
-  when "fetch_and" then
-    emit32_le(&mut ctx.text, a64_ldclral_enc(width) | (a64_code(A64::X1) << 16) | (a64_code(A64::X0) << 5) | a64_code(A64::X9))
-    a64_emit_mov_result(ctx, width, A64::X9)
-  when "fetch_or" then
-    emit32_le(&mut ctx.text, a64_ldsetal_enc(width) | (a64_code(A64::X1) << 16) | (a64_code(A64::X0) << 5) | a64_code(A64::X9))
-    a64_emit_mov_result(ctx, width, A64::X9)
-  when "fetch_xor" then
-    emit32_le(&mut ctx.text, a64_ldeoral_enc(width) | (a64_code(A64::X1) << 16) | (a64_code(A64::X0) << 5) | a64_code(A64::X9))
-    a64_emit_mov_result(ctx, width, A64::X9)
-  when "add_fetch" then
-    emit32_le(&mut ctx.text, a64_ldaddal_enc(width) | (a64_code(A64::X1) << 16) | (a64_code(A64::X0) << 5) | a64_code(A64::X9))
-    # new = old + val (the dest store truncates to the width).
-    a64_add_rrr(&mut ctx.text, A64::X0, A64::X9, A64::X1)
-  when "sub_fetch" then
-    if width == 8 then
-      a64_neg(&mut ctx.text, A64::X8, A64::X1)
-    else
-      a64_neg_w(&mut ctx.text, A64::X8, A64::X1)
-    end
-    emit32_le(&mut ctx.text, a64_ldaddal_enc(width) | (a64_code(A64::X8) << 16) | (a64_code(A64::X0) << 5) | a64_code(A64::X9))
-    a64_sub_rrr(&mut ctx.text, A64::X0, A64::X9, A64::X1)
-  when "and_fetch" then
-    emit32_le(&mut ctx.text, a64_ldclral_enc(width) | (a64_code(A64::X1) << 16) | (a64_code(A64::X0) << 5) | a64_code(A64::X9))
-    a64_and_rrr(&mut ctx.text, A64::X0, A64::X9, A64::X1)
-  when "or_fetch" then
-    emit32_le(&mut ctx.text, a64_ldsetal_enc(width) | (a64_code(A64::X1) << 16) | (a64_code(A64::X0) << 5) | a64_code(A64::X9))
-    a64_orr_rrr(&mut ctx.text, A64::X0, A64::X9, A64::X1)
-  when "xor_fetch" then
-    emit32_le(&mut ctx.text, a64_ldeoral_enc(width) | (a64_code(A64::X1) << 16) | (a64_code(A64::X0) << 5) | a64_code(A64::X9))
-    a64_eor_rrr(&mut ctx.text, A64::X0, A64::X9, A64::X1)
+  when "exchange" | "fetch_add" | "fetch_sub" | "fetch_and" | "fetch_or" | "fetch_xor" | "add_fetch" | "sub_fetch" | "and_fetch" | "or_fetch" | "xor_fetch" then
+    # Per-ordering RMW/exchange — see emit_a64_rmw_ordered (the order
+    # code arrives in x2; the LSE family is picked per op: add → LDADD,
+    # and → LDCLR (the complemented operand), or → LDSET, xor → LDEOR,
+    # exchange → SWP; Relaxed = plain, Acquire = +A, Release = +L,
+    # AcqRel/SeqCst = +AL).
+    emit_a64_rmw_ordered(ctx, width, &op)
   when "compare_exchange" then
-    # x0 = ptr, x1 = &expected, x2 = desired. The expected VALUE is
-    # loaded from [x1]; on failure the current value is written back.
+    # x0 = ptr, x1 = &expected, x2 = desired, x3 = weak (ignored —
+    # the strong single-attempt form is always conformant), x4 =
+    # success order, x5 = failure order. The expected VALUE is loaded
+    # from [x1]; on failure the current value is written back.
+    # Success-order dispatch: 0 (Relaxed) → CAS, 2 (Acquire) → CASA,
+    # 3 (Release) → CASL, 4 (AcqRel) and 5 (SeqCst) → CASAL. The
+    # failure order needs no separate dispatch: a failed LSE CAS
+    # performs no store, and §16.3 admits only Relaxed/Acquire/SeqCst
+    # failures no stronger than the success order — an Acquire
+    # failure implies an Acquire-or-stronger success whose acquire
+    # read covers the failed-path read, and a SeqCst failure implies
+    # SeqCst success (CASAL — the SC read under the LDAR/STLR
+    # discipline). An out-of-domain success code deterministically
+    # takes the CASAL arm (strongest form).
     let lbl_fail = ".Latomic_cas_fail." + ctx.fn_counter.to_string()
     let lbl_done = ".Latomic_cas_done." + ctx.fn_counter.to_string()
     ctx.fn_counter = ctx.fn_counter + 1
@@ -2778,8 +2935,35 @@ def emit_atomic_intrinsic_a64(inout ctx: CodegenCtx, op: String, width: Int) -> 
       a64_mov_w_rr(&mut ctx.text, A64::X10, A64::X8)
       a64_mov_w_rr(&mut ctx.text, A64::X9, A64::X2)
     end
-    # casal Xs(w8 = expected), Xt(w9 = desired), [x0]; X8 <- original.
-    emit32_le(&mut ctx.text, a64_casal_enc(width) | (a64_code(A64::X8) << 16) | (a64_code(A64::X0) << 5) | a64_code(A64::X9))
+    let cnt = ctx.fn_counter.to_string()
+    ctx.fn_counter = ctx.fn_counter + 1
+    let size = a64_atomic_size_code(width)
+    let lbl_cas_plain = ".Latomic_cas_plain." + cnt
+    let lbl_cas_acquire = ".Latomic_cas_acquire." + cnt
+    let lbl_cas_release = ".Latomic_cas_release." + cnt
+    let lbl_cas_done = ".Latomic_cas_succ." + cnt
+    a64_cmp_ri(&mut ctx.text, A64::X4, 0)
+    a64_bcond(&mut ctx.text, a64_cc_eq(), lbl_cas_plain.clone())
+    a64_cmp_ri(&mut ctx.text, A64::X4, 2)
+    a64_bcond(&mut ctx.text, a64_cc_eq(), lbl_cas_acquire.clone())
+    a64_cmp_ri(&mut ctx.text, A64::X4, 3)
+    a64_bcond(&mut ctx.text, a64_cc_eq(), lbl_cas_release.clone())
+    # CASAL Xs(x8 = expected), Xt(x9 = desired), [x0]; X8 <- original.
+    a64_casal(&mut ctx.text, A64::X8, A64::X9, A64::X0, size)
+    a64_b(&mut ctx.text, lbl_cas_done.clone())
+    def_label(&mut ctx.text, lbl_cas_release.clone())
+    a64_casl(&mut ctx.text, A64::X8, A64::X9, A64::X0, size)
+    a64_b(&mut ctx.text, lbl_cas_done.clone())
+    def_label(&mut ctx.text, lbl_cas_acquire.clone())
+    a64_casa(&mut ctx.text, A64::X8, A64::X9, A64::X0, size)
+    a64_b(&mut ctx.text, lbl_cas_done.clone())
+    def_label(&mut ctx.text, lbl_cas_plain.clone())
+    a64_cas(&mut ctx.text, A64::X8, A64::X9, A64::X0, size)
+    def_label(&mut ctx.text, lbl_cas_done.clone())
+    # X8 holds the original [x0] (zero-extended for the byte/half/word
+    # sizes); X10 holds the expected copy: equal → the CAS succeeded
+    # (return 1); different → write the current value back through
+    # [x1] and return 0.
     if width == 8 then
       a64_cmp_rr(&mut ctx.text, A64::X8, A64::X10)
     else
@@ -2985,35 +3169,38 @@ def emit_x64_rmw_cas_loop(inout ctx: CodegenCtx, width: Int, op: String) -> Unit
 end
 
 # ———————————————————————————————————————————————————————————————
-# P1-20 TODO — per-ordering RMW and CAS failure-order dispatch
+# Per-ordering RMW/CAS dispatch — the implemented mapping
 # ———————————————————————————————————————————————————————————————
-# The RMW/exchange/CAS arms above serve the STRONGEST form for every
-# ordering. That is always correct (an implementation may serve any
-# ordering stronger than requested — memory_model.md §16.2), so there
-# is no correctness gap today; the exact instruction mapping for a
-# future weaker-than-strong emission:
+# The AArch64 RMW/exchange and compare_exchange arms above dispatch per
+# ordering (memory_model.md §16.8.1 — the normative table):
 #
-# AArch64 RMWs (LSE — order code arrives in x2; branch like the store
-# arm above on 0/2/3/4/5). The A/L flag bits are A = 0x800000,
-# L = 0x400000 over the plain base (verified): for the op base of the
-# width, emit base | (A/L) | (Rs<<16) | (Rn<<5) | Rt with
-#   Relaxed → plain base            (e.g. LDADD  x1,x9,[x0] = 0xF8210009)
-#   Acquire → base | 0x800000       (LDADDA — 0xF8A10009)
-#   Release → base | 0x400000       (LDADDL — 0xF8610009)
-#   AcqRel/SeqCst → base | 0xC00000 (LDADDAL — current emission)
-# Bases (per size bits[31:30]): the *_al_enc tables above minus
-# 0xC00000 give the plain base for the same op+width; for AND/OR/XOR/
-# SWP use their own tables (ldclr/ldeor/ldset/swp — same flag bits).
+# AArch64 RMWs (LSE — order code arrives in x2): emit_a64_rmw_ordered
+# branches 0/2/3 and serves
+#   Relaxed → plain base            (LDADD  x1, x9, [x0] = 0xF8210009)
+#   Acquire → +A                    (LDADDA — 0xF8A10009)
+#   Release → +L                    (LDADDL — 0xF8610009)
+#   AcqRel/SeqCst → +AL             (LDADDAL — 0xF8E10009)
+# over the family of the op — LDADD (add/sub), LDCLR (and — the
+# operand is complemented first: LDCLR clears the bits SET in its
+# operand), LDSET (or), LDEOR (xor), SWP (exchange) — via the asm.tg
+# encoders (a64_ldadd … a64_swpal, size field [31:30] from the
+# intrinsic width). The *_al_enc tables above remain as the verified
+# word-level reference (the encoders reproduce them).
 #
-# AArch64 CAS success/failure dispatch (order codes in x4 = success,
-# x5 = failure; the current CASAL serves both at acq_rel strength):
-# the failure path is a READ, so an exact lowering needs the LL/SC
-# fallback (the future portable mode): relaxed/relaxed →
-# LDXR/STXR loop (LDXR bases 0x085F7C00/0x485F7C00/0x885F7C00/
-# 0xC85F7C00; STXR bases 0x08007C00/0x48007C00/0x88007C00/0xC8007C00),
-# acquire failure reads → LDAXR (LDXR base + 0x8000), release success
-# stores → STLXR (STXR base + 0x8000); the ldaxr/stlxr LL/SC contract
-# is already the documented future mode (§16.8.1).
+# AArch64 CAS (success order in x4, failure order in x5): the arm
+# dispatches the success code 0 → CAS, 2 → CASA, 3 → CASL, 4/5 →
+# CASAL. The failure order needs no separate dispatch on the LSE form:
+# a failed CAS performs no store, and §16.3 admits only
+# Relaxed/Acquire/SeqCst failures no stronger than the success — an
+# Acquire failure implies an Acquire-or-stronger success whose acquire
+# read covers the failed-path read, and a SeqCst failure implies a
+# SeqCst success (CASAL — the SC read under the LDAR/STLR discipline).
+# The ldaxr/stlxr LL/SC loop form (LDXR bases 0x085F7C00/0x485F7C00/
+# 0x885F7C00/0xC85F7C00 with LDAXR = +0x8000; STXR bases 0x08007C00/
+# 0x48007C00/0x88007C00/0xC8007C00 with STLXR = +0x8000) is the
+# documented portable-mode fallback for a non-LSE baseline — the same
+# per-ordering rule then picks the loop's reads (LDXR/LDAXR) and
+# writes (STXR/STLXR) per the pair above.
 #
 # x86-64: an atomic RMW/CAS is inherently a LOCKed op (the atomicity
 # requires the lock prefix; xchg is implicitly locked), and a LOCKed
@@ -7416,6 +7603,52 @@ def codegen_call(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, dest: Place, c
     emit_push(ctx, rr)
   when Option::None then ()
   end
+  # (audit P1-13 — C variadic externs, implemented): a DIRECT call to
+  # a VARIADIC extern (declared `extern def f(fixed..., ...)` — its
+  # name is in ctx.extern_variadic_fns with the FIXED declared prefix
+  # count in ctx.extern_fixed_param_counts) is routed to the dedicated
+  # varargs emitter BEFORE the shared argument loop: the shared loop
+  # uses the INTERNAL slot discipline (16-byte stack slots on
+  # aarch64), which is not the C vararg layout for the extra
+  # arguments. The dedicated emitter marshals the fixed prefix as
+  # usual, then the extras per the platform rules (aarch64 AAPCS64:
+  # remaining x0-x7 then C-exact 8-byte memory slots; x86-64 SysV:
+  # remaining rdi-r9 then 8-byte pushes, AL = 0 — the uniform
+  # GP-slot model never uses vector registers), and emits the whole
+  # call; the shared loop and stack cleanup below are skipped via the
+  # return. A variadic extern whose FIXED prefix exceeds the register
+  # file falls through to the shared loop on x86-64 (its 8-byte push
+  # discipline IS the C layout — the extern dispatch arm below clears
+  # AL) and FAILS CLOSED on aarch64 (the shared 16-byte-slot pushes
+  # would corrupt the C stack area).
+  var variadic_extern_fixed: Int = -1
+  var variadic_extern_name = "".to_string()
+  match callee.kind
+  when MirOperandKind::MirConstant(v_cst) then
+    match v_cst.kind
+    when MirConstantKind::MirFnItem(v_fn_name) then
+      if ctx.extern_variadic_fns.contains(&v_fn_name) then
+        variadic_extern_name = v_fn_name.clone()
+        match ctx.extern_fixed_param_counts.get(&v_fn_name)
+        when Option::Some(v_fixed) then variadic_extern_fixed = v_fixed
+        when Option::None then ()
+        end
+      end
+    when _ then ()
+    end
+  when _ then ()
+  end
+  if variadic_extern_fixed >= 0 then
+    if variadic_extern_fixed <= max_ra then
+      codegen_call_variadic_extern(ctx, fctx, dest, variadic_extern_name, args, variadic_extern_fixed, dest_ty, rr)
+      return
+    end
+    match arch
+    when Arch::AArch64 then
+      panic("ICE: variadic extern '" + variadic_extern_name + "' declares " + variadic_extern_fixed.to_string() + " fixed parameters, more than the 8 argument registers — the aarch64 shared emitter's 16-byte stack-slot discipline cannot lay out the C vararg stack area; reduce the fixed prefix or wrap the callee in C")
+    when Arch::X86_64 then ()
+    end
+  end
   var arg_idx = total_args
   while arg_idx > 0 do
     arg_idx = arg_idx - 1
@@ -7585,6 +7818,26 @@ def codegen_call(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, dest: Place, c
           if fallback_clone_intrinsic then
             intrinsic_did_materialize = codegen_intrinsic(ctx, fctx, "clone", &arg_ops, args, resolved_fn_name, &dest_ty, dest)
           else if ctx.extern_fns.contains(&resolved_fn_name) then
+            # (audit P1-13 — C variadic externs): a VARIADIC extern call
+            # reaching this arm has more FIXED parameters than the
+            # register file (x86-64: the shared 8-byte-slot loop IS the C
+            # layout, so the fixed spill and the extra arguments ride the
+            # shared marshalling; the aarch64 shape of this case fails
+            # closed in the routing block above). The SysV rule still
+            # requires AL = the number of vector registers used for the
+            # call's arguments — 0 in the uniform GP-slot model — and
+            # every extra argument must pass the vararg scalar gate.
+            if ctx.extern_variadic_fns.contains(&resolved_fn_name) then
+              let v_fixed = match ctx.extern_fixed_param_counts.get(&resolved_fn_name)
+              when Option::Some(n) then n
+              when Option::None then 0
+              end
+              codegen_check_vararg_extras(ctx, fctx, args, v_fixed)
+              match arch
+              when Arch::X86_64 then emit_mov_ri(ctx, PhysReg::X64Reg(X64::RAX), 0)
+              when Arch::AArch64 then ()
+              end
+            end
             emit_call_extern(ctx, resolved_fn_name)
             # The extern ABI boundary: a C `int` return arrives in the low
             # 32 bits of the return register (eax/w0) with unspecified
@@ -7594,8 +7847,9 @@ def codegen_call(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, dest: Place, c
             # _Bool) are masked at the store or re-extended at each load
             # (storage widths/signedness), so no normalization is needed
             # for them.
-            # (audit P1-13 — C-ABI exactness TODO): the ARGUMENTS of this
-            # extern call were pushed by the shared classify_argument loop
+            # (audit P1-13 — C-ABI exactness, not implemented): the
+            # ARGUMENTS of this extern call were pushed by the shared
+            # classify_argument loop
             # above, which uses the compiler's UNIFORM internal
             # by-reference convention for every 9..16-byte aggregate
             # (ScalarPair) and >16-byte aggregate (ByAddress): the
@@ -11959,6 +12213,52 @@ def codegen_call(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, dest: Place, c
     emit_push(ctx, rr)
   when Option::None then ()
   end
+  # (audit P1-13 — C variadic externs, implemented): a DIRECT call to
+  # a VARIADIC extern (declared `extern def f(fixed..., ...)` — its
+  # name is in ctx.extern_variadic_fns with the FIXED declared prefix
+  # count in ctx.extern_fixed_param_counts) is routed to the dedicated
+  # varargs emitter BEFORE the shared argument loop: the shared loop
+  # uses the INTERNAL slot discipline (16-byte stack slots on
+  # aarch64), which is not the C vararg layout for the extra
+  # arguments. The dedicated emitter marshals the fixed prefix as
+  # usual, then the extras per the platform rules (aarch64 AAPCS64:
+  # remaining x0-x7 then C-exact 8-byte memory slots; x86-64 SysV:
+  # remaining rdi-r9 then 8-byte pushes, AL = 0 — the uniform
+  # GP-slot model never uses vector registers), and emits the whole
+  # call; the shared loop and stack cleanup below are skipped via the
+  # return. A variadic extern whose FIXED prefix exceeds the register
+  # file falls through to the shared loop on x86-64 (its 8-byte push
+  # discipline IS the C layout — the extern dispatch arm below clears
+  # AL) and FAILS CLOSED on aarch64 (the shared 16-byte-slot pushes
+  # would corrupt the C stack area).
+  var variadic_extern_fixed: Int = -1
+  var variadic_extern_name = "".to_string()
+  match callee.kind
+  when MirOperandKind::MirConstant(v_cst) then
+    match v_cst.kind
+    when MirConstantKind::MirFnItem(v_fn_name) then
+      if ctx.extern_variadic_fns.contains(&v_fn_name) then
+        variadic_extern_name = v_fn_name.clone()
+        match ctx.extern_fixed_param_counts.get(&v_fn_name)
+        when Option::Some(v_fixed) then variadic_extern_fixed = v_fixed
+        when Option::None then ()
+        end
+      end
+    when _ then ()
+    end
+  when _ then ()
+  end
+  if variadic_extern_fixed >= 0 then
+    if variadic_extern_fixed <= max_ra then
+      codegen_call_variadic_extern(ctx, fctx, dest, variadic_extern_name, args, variadic_extern_fixed, dest_ty, rr)
+      return
+    end
+    match arch
+    when Arch::AArch64 then
+      panic("ICE: variadic extern '" + variadic_extern_name + "' declares " + variadic_extern_fixed.to_string() + " fixed parameters, more than the 8 argument registers — the aarch64 shared emitter's 16-byte stack-slot discipline cannot lay out the C vararg stack area; reduce the fixed prefix or wrap the callee in C")
+    when Arch::X86_64 then ()
+    end
+  end
   var arg_idx = total_args
   while arg_idx > 0 do
     arg_idx = arg_idx - 1
@@ -12128,6 +12428,26 @@ def codegen_call(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, dest: Place, c
           if fallback_clone_intrinsic then
             intrinsic_did_materialize = codegen_intrinsic(ctx, fctx, "clone", &arg_ops, args, resolved_fn_name, &dest_ty, dest)
           else if ctx.extern_fns.contains(&resolved_fn_name) then
+            # (audit P1-13 — C variadic externs): a VARIADIC extern call
+            # reaching this arm has more FIXED parameters than the
+            # register file (x86-64: the shared 8-byte-slot loop IS the C
+            # layout, so the fixed spill and the extra arguments ride the
+            # shared marshalling; the aarch64 shape of this case fails
+            # closed in the routing block above). The SysV rule still
+            # requires AL = the number of vector registers used for the
+            # call's arguments — 0 in the uniform GP-slot model — and
+            # every extra argument must pass the vararg scalar gate.
+            if ctx.extern_variadic_fns.contains(&resolved_fn_name) then
+              let v_fixed = match ctx.extern_fixed_param_counts.get(&resolved_fn_name)
+              when Option::Some(n) then n
+              when Option::None then 0
+              end
+              codegen_check_vararg_extras(ctx, fctx, args, v_fixed)
+              match arch
+              when Arch::X86_64 then emit_mov_ri(ctx, PhysReg::X64Reg(X64::RAX), 0)
+              when Arch::AArch64 then ()
+              end
+            end
             emit_call_extern(ctx, resolved_fn_name)
             # The extern ABI boundary: a C `int` return arrives in the low
             # 32 bits of the return register (eax/w0) with unspecified
@@ -12137,8 +12457,9 @@ def codegen_call(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, dest: Place, c
             # _Bool) are masked at the store or re-extended at each load
             # (storage widths/signedness), so no normalization is needed
             # for them.
-            # (audit P1-13 — C-ABI exactness TODO): the ARGUMENTS of this
-            # extern call were pushed by the shared classify_argument loop
+            # (audit P1-13 — C-ABI exactness, not implemented): the
+            # ARGUMENTS of this extern call were pushed by the shared
+            # classify_argument loop
             # above, which uses the compiler's UNIFORM internal
             # by-reference convention for every 9..16-byte aggregate
             # (ScalarPair) and >16-byte aggregate (ByAddress): the
@@ -15032,6 +15353,182 @@ end
 # Function code generation
 # ———————————————————————————————————————————————————————————————
 
+# (audit P1-13 — C variadic externs, implemented): the FAIL-CLOSED
+# vararg-extra gate. Every EXTRA (anonymous) argument of a variadic
+# extern call — the call's arguments at indices >= fixed_count — must
+# be a value the uniform GP-slot model marshals C-exactly as one
+# 8-byte scalar slot: a float or an aggregate extra here would corrupt
+# the C vararg register/stack area (floats need the platform
+# float-vararg register state; aggregates cross by reference, never as
+# C scalars). The checker's vararg subset rule (types.tg
+# vararg_extra_type_allowed) already rejects those at the call site;
+# this is defense in depth for the direct emitters — a violation is an
+# internal error, never a silently mis-marshalled call.
+def codegen_check_vararg_extras(inout ctx: CodegenCtx, fctx: FnCodegenCtx, args: Vec[MirCallArg], fixed_count: Int) -> Unit
+  var ei = fixed_count
+  while ei < args.len() do
+    let ety = mir_call_arg_type(ctx, fctx, &args[ei])
+    match ety
+    when Type::Float then panic("ICE: variadic extern extra argument at index " + ei.to_string() + " is a Float — float varargs are not supported (the checker's vararg subset rule was violated)")
+    when Type::F32 then panic("ICE: variadic extern extra argument at index " + ei.to_string() + " is an F32 — float varargs are not supported (the checker's vararg subset rule was violated)")
+    when Type::F64 then panic("ICE: variadic extern extra argument at index " + ei.to_string() + " is an F64 — float varargs are not supported (the checker's vararg subset rule was violated)")
+    when _ then ()
+    end
+    match classify_argument(ctx, &ety, ei)
+    when AbiArg::Scalar(_, w) then
+      if w < 1 || w > 8 then
+        panic("ICE: variadic extern extra argument at index " + ei.to_string() + " classifies as a " + w.to_string() + "-byte scalar — the vararg subset is <= 64-bit integers/pointers (checker/codegen subset disagreement)")
+      end
+    when _ then
+      panic("ICE: variadic extern extra argument at index " + ei.to_string() + " is not an ABI scalar — the vararg subset rule (<= 64-bit integers, Bool/Char, raw pointers) was violated")
+    end
+    ei = ei + 1
+  end
+end
+
+# (audit P1-13 — C variadic externs, implemented): the DEDICATED
+# variadic-extern call emitter. A direct call to an extern declared
+# with the trailing C marker `...` marshals its FIXED prefix arguments
+# exactly like a non-variadic extern call (the uniform
+# classify_argument slot model), then the EXTRA (anonymous) arguments
+# continue the target's argument sequence per the platform C varargs
+# rules:
+#   aarch64 (AAPCS64): the extras take the remaining x0-x7 general
+#     registers in order, then MEMORY — 8-byte slots at [sp+0],
+#     [sp+8], ... (the caller keeps sp 16-byte aligned by rounding the
+#     allocated area up to 16 bytes; the C callee's va_arg reads the
+#     anonymous args at exactly those offsets). The v0-v7 FP/SIMD side
+#     of the AAPCS64 vararg register file is never used — the
+#     checker's subset rule admits only <= 64-bit integers, Bool/Char
+#     and raw pointers (float varargs rejected).
+#   x86-64 (SysV): the extras take rdi,rsi,rdx,rcx,r8,r9 in order,
+#     then 8-byte stack slots, and AL is set to the number of vector
+#     registers used for the call's arguments — 0, because the uniform
+#     GP-slot model never places an argument in an XMM register.
+# The whole call is emitted here (argument setup, the call, the stack
+# cleanup, the extern return normalization and the destination store)
+# and codegen_call returns: the SHARED argument loop uses the
+# INTERNAL slot discipline (16-byte stack slots on aarch64), which is
+# not the C vararg layout. Reached only from codegen_call's routing
+# block when the callee's FIXED prefix fits the register file (fixed
+# <= max_ra); a variadic extern with a longer prefix falls through to
+# the shared loop on x86-64 (its 8-byte push discipline IS the C
+# layout — the dispatch arm clears AL) and fails closed on aarch64.
+# INDIRECT calls never reach here: a variadic extern's FnPtr VALUE
+# keeps the fixed signature (the FnPtr type carries no ellipsis), so a
+# call through a function pointer is exact-arity and stays on the
+# shared path.
+def codegen_call_variadic_extern(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, dest: Place, callee_name: String, args: Vec[MirCallArg], fixed_count: Int, dest_ty: Type, rr: PhysReg) -> Unit
+  let arch = ctx.target.arch
+  let scratch = scratch2_reg(arch)
+  let sp = sp_reg(arch)
+  let max_ra = max_reg_args(arch)
+  let total_args = args.len()
+  # Defense in depth: every extra must be a C-exact 8-byte scalar (the
+  # checker enforces the subset rule at the call site).
+  codegen_check_vararg_extras(ctx, fctx, args, fixed_count)
+  # The extras beyond the register file (fixed_count <= max_ra here, so
+  # every spill index is an extra). aarch64: the spilled extras go into
+  # a PRE-ALLOCATED 16-byte-rounded area below sp, stored C-exactly at
+  # [sp + 8*k]; the area is restored after the call. x86-64: the
+  # spilled extras are pushed (8-byte slots, reverse order — the
+  # first stack extra ends up at [sp+0], exactly the SysV layout).
+  var stack_extras = 0
+  if total_args > max_ra then stack_extras = total_args - max_ra end
+  var a64_area = 0
+  match arch
+  when Arch::AArch64 then
+    # The area is restored with a single ADD immediate (12-bit range),
+    # so the cap keeps the allocation <= 4095: at most 510 extra slots.
+    if stack_extras > 510 then
+      panic("ICE: variadic extern '" + callee_name + "' call passes " + total_args.to_string() + " arguments (" + stack_extras.to_string() + " stack extras) — the aarch64 direct emitter supports at most 510 stack-vararg slots")
+    end
+    if stack_extras > 0 then
+      a64_area = ((stack_extras * 8 + 15) / 16) * 16
+      emit_add_ri(ctx, sp, (-a64_area) as i32)
+    end
+  when Arch::X86_64 then ()
+  end
+  var idx = total_args
+  while idx > 0 do
+    idx = idx - 1
+    let arg = args[idx]
+    if idx < fixed_count then
+      # The FIXED prefix — the same classification and slot discipline
+      # as a non-variadic extern call (fixed_count <= max_ra, so the
+      # prefix never spills; the register loads run in reverse order so
+      # a projected-operand load's scratch use never clobbers an
+      # already-loaded lower argument).
+      let fty = mir_call_arg_type(ctx, fctx, &arg)
+      match classify_argument(ctx, &fty, idx)
+      when AbiArg::Scalar(_, _) then
+        match arg_reg(arch, idx)
+        when Option::Some(abi_r) then load_call_arg_value(ctx, fctx, arg, abi_r)
+        when Option::None then
+          load_call_arg_value(ctx, fctx, arg, scratch)
+          emit_push(ctx, scratch)
+        end
+      when AbiArg::ScalarPair(_, _) then
+        match arg_reg(arch, idx)
+        when Option::Some(abi_r) then load_call_arg_value(ctx, fctx, arg, abi_r)
+        when Option::None then
+          load_call_arg_value(ctx, fctx, arg, scratch)
+          emit_push(ctx, scratch)
+        end
+      when AbiArg::Vector(_, _) then
+        match arg_reg(arch, idx)
+        when Option::Some(abi_r) then load_call_arg_value(ctx, fctx, arg, abi_r)
+        when Option::None then
+          load_call_arg_value(ctx, fctx, arg, scratch)
+          emit_push(ctx, scratch)
+        end
+      when AbiArg::ByAddress(_, _) then
+        match arg_reg(arch, idx)
+        when Option::Some(abi_r) then load_call_arg_value(ctx, fctx, arg, abi_r)
+        when Option::None then
+          load_call_arg_value(ctx, fctx, arg, scratch)
+          emit_push(ctx, scratch)
+        end
+      end
+    else
+      # An EXTRA (anonymous) argument — an 8-byte scalar (gated above).
+      match arg_reg(arch, idx)
+      when Option::Some(abi_r) then
+        load_call_arg_value(ctx, fctx, arg, abi_r)
+      when Option::None then
+        load_call_arg_value(ctx, fctx, arg, scratch)
+        match arch
+        when Arch::AArch64 then
+          emit_store_mem(ctx, sp, (8 * (idx - max_ra)) as i32, scratch)
+        when Arch::X86_64 then
+          emit_push(ctx, scratch)
+        end
+      end
+    end
+  end
+  # x86-64 SysV: AL must hold the number of vector registers used for
+  # the call's arguments — 0 in the uniform GP-slot model. Set AFTER
+  # the argument loads (a projected-operand load may use rax as
+  # scratch) and immediately before the call.
+  match arch
+  when Arch::X86_64 then emit_mov_ri(ctx, PhysReg::X64Reg(X64::RAX), 0)
+  when Arch::AArch64 then ()
+  end
+  emit_call_extern(ctx, callee_name)
+  # Restore the stack: x86-64 pops the pushed 8-byte slots; aarch64
+  # adds back the pre-allocated (16-byte-rounded) area.
+  if stack_extras > 0 then
+    match arch
+    when Arch::AArch64 then emit_add_ri(ctx, sp, a64_area as i32)
+    when Arch::X86_64 then emit_add_ri(ctx, sp, (stack_extras * 8) as i32)
+    end
+  end
+  # The extern return normalization and the destination store — the
+  # same tail the shared extern dispatch path uses.
+  normalize_extern_return(ctx, rr, &dest_ty)
+  store_place(ctx, fctx, dest, rr)
+end
+
 def codegen_function(inout ctx: CodegenCtx, func: MirFunction) -> Unit
   # Extern functions don't get a body — they are resolved at link time.
   # Emit an undefined symbol entry so the linker knows to resolve it.
@@ -15073,8 +15570,8 @@ def codegen_function(inout ctx: CodegenCtx, func: MirFunction) -> Unit
   # (P1-6 fp-mode stamp site): record the function's DECLARED floating-
   # point mode for the body emission below (the float emission sites —
   # codegen_float_binop's op/compare cases and the codegen_rvalue cast
-  # sites — read ctx.current_fp_fast once the TODO P1-6 fast paths
-  # land). The flag
+  # sites — read ctx.current_fp_fast once the P1-6 fast paths land;
+  # the fast paths are not implemented). The flag
   # is set EXCLUSIVELY from MirFunction.fp_fast, which lower_program's
   # PASS 2 stamps from the @fp(fast) item attribute — nothing else in
   # the compiler sets it (no optimizer pass reads it; opt_level never
@@ -15082,11 +15579,11 @@ def codegen_function(inout ctx: CodegenCtx, func: MirFunction) -> Unit
   # function under fast math: unannotated functions keep the STRICT
   # IEEE default — the CANONICAL SPEC in types.tg (the FP-mode module
   # doc above the Type enum). The mode is recorded per symbol here (the
-  # ELF writer exposes no per-function metadata section today — TODO
-  # P1-6: surface the mode in emitted function metadata when object
-  # emission gains attribute support); the emitted instructions are
-  # identical in both modes until the fast paths at the float emission
-  # sites land.
+  # ELF writer exposes no per-function metadata section today — not
+  # implemented (P1-6): surface the mode in emitted function metadata
+  # when object emission gains attribute support); the emitted
+  # instructions are identical in both modes until the fast paths at
+  # the float emission sites land.
   ctx.current_fp_fast = func.fp_fast
   let symbol_name = func.name.clone()
   let entry_label = match ctx.fn_alias.get(&symbol_name)
@@ -15097,19 +15594,23 @@ def codegen_function(inout ctx: CodegenCtx, func: MirFunction) -> Unit
   # (P1-18 @cold consumption point): the function's DECLARED @cold hint
   # (MirFunction.attr_cold — stamped from the item's attribute list at
   # MIR lowering, see mir.tg's lower_program PASS 2) is a code-LAYOUT
-  # request. The object emission has NO cold-section support today: the
-  # ELF writer (object.tg) fixes one code section (.text) and every
-  # function symbol is registered Section::Text here, so a @cold function
-  # still sits in .text (correctness never depends on the hint). TODO
-  # (P1-18): when the object emission gains per-function section support,
-  # route attr_cold functions into a cold section at this site (the
-  # symbol's section is the only wiring point; codegen_function emits the
-  # body into ctx.text either way).
+  # request. The object emission implements it as Section::ColdText —
+  # a REAL second code section (.text.cold in the ELF/Mach-O/COFF
+  # writers; object.tg emits its own section header, name and
+  # relocation table) — and codegen_program places @cold function
+  # bodies in a CONTIGUOUS cold tail of the code stream (see the
+  # two-phase function loop there), so the symbol registration below
+  # routes the function's symbol into the cold section while the body
+  # itself is emitted into ctx.text either way. Correctness never
+  # depends on the hint: the section tag is layout metadata, and the
+  # in-memory linkers treat a ColdText symbol exactly like a Text one
+  # (same code stream, same offset semantics).
   #
-  # Emit function symbol
+  # Emit function symbol — route @cold functions into the cold section
+  let fn_section = if func.attr_cold then Section::ColdText else Section::Text end
   add_symbol(&mut ctx.text, AsmSymbol {
     name: symbol_name.clone(),
-    section: Section::Text,
+    section: fn_section,
     offset: fn_start,
     size: 0,
     binding: SymBinding::Global,
@@ -19245,6 +19746,14 @@ def codegen_program(inout ctx: CodegenCtx, program: MirProgram) -> Result[Unit, 
     let func = functions[fi]
     if func.is_extern then
       ctx.extern_fns.insert(func.name.clone())
+      # (audit P1-13 — C variadic externs): record the C-variadic extern
+      # declarations (`extern def f(fixed..., ...)`) and their FIXED
+      # declared parameter counts — codegen_call's variadic-call routing
+      # and the x86-64 SysV AL vector count consult the pair.
+      if func.is_extern_variadic then
+        ctx.extern_variadic_fns.insert(func.name.clone())
+        ctx.extern_fixed_param_counts.insert(func.name.clone(), func.params.len())
+      end
     end
     fi = fi + 1
   end
@@ -19383,6 +19892,18 @@ def codegen_program(inout ctx: CodegenCtx, program: MirProgram) -> Result[Unit, 
     fi = fi + 1
   end
 
+  # (P1-18 @cold two-phase function loop — PASS 1, the HOT pass): emit
+  # every function whose body is NOT @cold — reachable functions, the
+  # OS entry, extern stubs and closures (closures are always emitted
+  # when present; they are IR-synthesized and never carry @cold). A
+  # @cold function (MirFunction.attr_cold — the DECLARED code-layout
+  # hint, see the codegen_function @cold consumption point) is DEFERRED
+  # to PASS 2 below, which emits the cold bodies as a CONTIGUOUS TAIL
+  # of ctx.text after the runtime merge: the code stream then ends with
+  # one pure cold run, the region the object writers split into
+  # .text.cold (Section::ColdText). Programs without @cold functions
+  # take PASS 2 as a zero-iteration no-op and the stream is
+  # byte-identical to the pre-@cold layout.
   fi = 0
   while fi < functions.len() do
     let func = functions[fi]
@@ -19390,7 +19911,7 @@ def codegen_program(inout ctx: CodegenCtx, program: MirProgram) -> Result[Unit, 
     let func_name = func.name.clone()
     let is_closure = func_name.starts_with("_closure")
     let should_emit = reachable.contains(&func_name) || func_name == "_start" || func.is_extern || is_closure
-    if should_emit then
+    if should_emit && !func.attr_cold then
       codegen_function(ctx, func)
     end
     fi = fi + 1
@@ -19409,6 +19930,49 @@ def codegen_program(inout ctx: CodegenCtx, program: MirProgram) -> Result[Unit, 
   var runtime_ctx = runtime_ctx_new(ctx.target.clone())
   emit_all_runtime(&mut runtime_ctx)
   merge_code_buffer(&mut ctx.text, &runtime_ctx.text)
+
+  # (P1-18 @cold two-phase function loop — PASS 2, the COLD pass):
+  # emit the deferred @cold function bodies HERE, after the runtime
+  # merge, so they form the contiguous cold tail of the code stream
+  # (the .text.cold region). PASS 2 runs only when the program has a
+  # @cold function (pre-scanned above so the no-cold path never even
+  # records a region start). The cold bodies' labels, fixups,
+  # relocations and symbols all ride ctx.text exactly like PASS 1's —
+  # the single-stream geometry is unchanged, only the position of the
+  # cold functions moves to the tail (branch deltas are recomputed at
+  # the final resolve_fixups below against the final positions), and
+  # the runtime labels they call were defined by the merge above. The
+  # enum-eq helpers the cold bodies request are drained right after
+  # them (they land inside the cold region — semantically cold), and
+  # the stub scan below then covers the cold bodies' fixups too (the
+  # stubs it emits close the cold tail, still inside the region).
+  var has_cold = false
+  fi = 0
+  while fi < functions.len() do
+    let func = functions[fi]
+    let func_name = func.name.clone()
+    let is_closure = func_name.starts_with("_closure")
+    let should_emit = reachable.contains(&func_name) || func_name == "_start" || func.is_extern || is_closure
+    if should_emit && func.attr_cold then
+      has_cold = true
+    end
+    fi = fi + 1
+  end
+  if has_cold then
+    ctx.cold_text_start = buf_pos(&ctx.text)
+    fi = 0
+    while fi < functions.len() do
+      let func = functions[fi]
+      let func_name = func.name.clone()
+      let is_closure = func_name.starts_with("_closure")
+      let should_emit = reachable.contains(&func_name) || func_name == "_start" || func.is_extern || is_closure
+      if should_emit && func.attr_cold then
+        codegen_function(ctx, func)
+      end
+      fi = fi + 1
+    end
+    emit_pending_enum_eq_helpers(ctx)
+  end
 
   # Emit stub function bodies for referenced-but-uncompiled labels.
   # These are intrinsics or unreachable functions whose addresses are taken
@@ -19844,9 +20408,14 @@ def generate_native(program: MirProgram, target: AsmTarget) -> Result[Vec[u8], S
     if name.starts_with(".L") then
       match text_labels.get(name)
       when Option::Some(offset) then
+        # (P1-18 @cold): a local label defined inside the cold tail
+        # ([ctx.cold_text_start, len) — the @cold function bodies and
+        # their enum-eq helpers) belongs to the cold section, exactly
+        # like the function symbols codegen_function routed there.
+        let label_section = if ctx.cold_text_start >= 0 && offset >= ctx.cold_text_start then Section::ColdText else Section::Text end
         all_symbols.push(AsmSymbol {
           name: name,
-          section: Section::Text,
+          section: label_section,
           offset: offset,
           size: 0,
           binding: SymBinding::Local,
@@ -19873,7 +20442,8 @@ def generate_native(program: MirProgram, target: AsmTarget) -> Result[Vec[u8], S
     relocations: text_relocs.clone(),
     data_relocations: data_relocs.clone(),
     string_table: Vec::new(),
-    strings: Map::new()
+    strings: Map::new(),
+    cold_start: ctx.cold_text_start
   }
 
   let obj_bytes = build_object(&obj)
@@ -19948,9 +20518,14 @@ def generate_executable(program: MirProgram, target: AsmTarget, output_path: Str
     if name.starts_with(".L") then
       match text_labels.get(name)
       when Option::Some(offset) then
+        # (P1-18 @cold): a local label defined inside the cold tail
+        # ([ctx.cold_text_start, len) — the @cold function bodies and
+        # their enum-eq helpers) belongs to the cold section, exactly
+        # like the function symbols codegen_function routed there.
+        let label_section = if ctx.cold_text_start >= 0 && offset >= ctx.cold_text_start then Section::ColdText else Section::Text end
         all_symbols.push(AsmSymbol {
           name: name,
-          section: Section::Text,
+          section: label_section,
           offset: offset,
           size: 0,
           binding: SymBinding::Local,
@@ -19976,7 +20551,8 @@ def generate_executable(program: MirProgram, target: AsmTarget, output_path: Str
     relocations: text_relocs2.clone(),
     data_relocations: data_relocs2.clone(),
     string_table: Vec::new(),
-    strings: Map::new()
+    strings: Map::new(),
+    cold_start: ctx.cold_text_start
   }
 
   # Determine entry point name

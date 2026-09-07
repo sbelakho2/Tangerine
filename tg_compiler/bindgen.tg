@@ -105,6 +105,11 @@ end
 pub struct CUnion
   pub name: String
   pub variants: Array[CField]
+  ## The C `__attribute__((packed))` union spelling (alignment 1). The C
+  ## header parser does not (yet) recognize the attribute syntax, so the
+  ## flag is the mirror of CStruct.packed: carried for the hand-built /
+  ## test configurations and kept false by every parse path.
+  pub packed: Bool
 end
 
 pub struct CEnum
@@ -375,15 +380,21 @@ impl Bindgen
     end
     match f.variadic
     when true then
-      # (audit P1-13 — variadics TODO): the `...` below documents the C
-      # variadic contract in the header, but the tg_compiler extern
-      # grammar has NO variadic form (parse_param_list accepts no
-      # ellipsis), so this generated declaration would not parse today.
-      # Rule to implement: represent a variadic extern as the FIXED
-      # prefix parameters plus an explicit variadic-argument access path
-      # (the runtime has no va_list type and no va_arg access machinery);
-      # until that exists, variadic C functions must be wrapped in C or
-      # declared with the fixed prefix only.
+      # (audit P1-13 — variadics, implemented): the `...` below is the C
+      # variadic contract of the header declaration. The tg_compiler
+      # extern grammar now HAS the variadic form (parse_extern_param_list
+      # accepts a trailing ellipsis on an extern parameter list), and the
+      # checker/codegen implement it end-to-end: the extern binds its
+      # FIXED prefix parameters, every call site may pass any number of
+      # EXTRA arguments, and the direct emitters marshal the extras per
+      # the platform C varargs rules (aarch64 AAPCS64: remaining x0-x7
+      # then 8-byte stack slots; x86-64 SysV: remaining rdi-r9 then
+      # 8-byte stack slots, AL = 0). The vararg SUBSET RULE (types.tg
+      # vararg_extra_type_allowed) rejects float/string/aggregate extra
+      # arguments at the call site — for a printf-family callee the
+      # format specifiers must match the integer/pointer arguments this
+      # rule admits (a %f vararg is not representable; pass the bits as
+      # an integer or wrap the callee in C).
       match f.params.is_empty()
       when false then out = out + ", "
       when true then ()
@@ -438,10 +449,15 @@ impl Bindgen
     ## so the layout matches the C declaration byte-for-byte — a field
     ## type whose width diverged from the C member (e.g. C int mapped to
     ## an 8-byte type) would silently shift every following offset.
-    mut out = "@repr(C)\n"
+    ## @repr(C) and @packed are MUTUALLY EXCLUSIVE layout strategies (the
+    ## parser's extract_layout_attrs rejects the combination — E109, a
+    ## declaration carries at most one layout strategy; see the @packed
+    ## specimens in tests/layout/packed_align_test.tg), so a packed C
+    ## struct is emitted with @packed alone.
+    mut out = String::new()
     match s.packed
     when true then out = out + "@packed\n"
-    when false then ()
+    when false then out = out + "@repr(C)\n"
     end
     out = out + "pub struct " + &s.name + "\n"
     for field in s.fields do
@@ -457,26 +473,110 @@ impl Bindgen
   end
 
   def emit_union(self, u: CUnion) -> String
-    ## (audit P1-13 — union representation TODO): the C union has no
-    ## semantic home in the full compiler — ast.tg has no union
+    ## (audit P1-13 — union representation, implemented): the C union has
+    ## no semantic home in the full compiler — ast.tg has no union
     ## declaration, the parser has no `union` grammar, and the layout
-    ## engine has no overlapping-storage layout — so this emitted
-    ## `pub union` text is documentation of the required shape, not
-    ## compilable Tangerine today. Representation rule to implement:
-    ## @repr(C) union — size = the largest member size, alignment = the
-    ## largest member alignment, every member at offset 0 (overlapping
-    ## storage); reads must go through the last-written member's type
-    ## (typed access to a union requires an active-member discipline; a
-    ## bit-cast read through a different member type is a raw reinter-
-    ## pretation). Until the semantic union exists, generated bindings
-    ## must represent a C union as a byte buffer of the union size (or a
-    ## per-variant tagged wrapper).
-    mut out = "@repr(C)\n"
-    out = out + "pub union " + &u.name + "\n"
-    for v in u.variants do
-      out = out + "  pub " + &v.name + ": " + &_ctype_to_tg(&v.ty, &self.config.type_mappings) + "\n"
+    ## engine has no overlapping-storage layout — so a C union is NOT
+    ## emitted as a `pub union` (that text was documentation of the
+    ## required shape, not compilable Tangerine). Representation rule
+    ## (implemented): emit a struct of EXACTLY the C union's storage — a
+    ## single byte-array field of the union SIZE — with the type's
+    ## alignment raised to the union ALIGNMENT via @align(N) (N = the
+    ## largest member alignment; N is a power of two, the dialect's
+    ## @align rule), or @packed for the alignment-1 packed spelling (the
+    ## layout strategy a packed C aggregate carries; @repr(C) and @packed
+    ## are mutually exclusive — E109). The C size/alignment rules: size =
+    ## the largest member size tail-aligned to the largest member
+    ## alignment (sizeof(union) is a multiple of the union's alignment),
+    ## alignment = the largest member alignment, and every C member sits
+    ## at offset 0 of the buffer. Per member, a typed accessor PAIR is
+    ## emitted: <union>_<member>_get reads and <union>_<member>_set
+    ## writes the member's bytes at offset 0 through a typed Ptr cast —
+    ## the raw-pointer path the FFI surface sanctions (a Ptr/PtrMut
+    ## pointer cast plus a *-dereference under an `unsafe "reason" do
+    ## ... end` block; see tests/canary/canary_ffi.tg and std/embedded.tg
+    ## volatile_*). The layout is computed over the CType model under the
+    ## same LP64 width authority as _ctype_to_tg (see _c_type_layout),
+    ## resolving named struct/union/enum/typedef references against the
+    ## parsed declarations.
+    ##
+    ## Soundness (safe by construction): every member access reads or
+    ## writes exactly size_of(member) bytes at offset 0 of a buffer whose
+    ## size is >= every member size, so a member-typed access through a
+    ## Ptr[<union>] can never leave the union's storage; and member
+    ## alignment <= union alignment, so a union pointer that meets the
+    ## union's own alignment is aligned for every member's typed deref
+    ## (no misaligned access). Reads follow the C active-member
+    ## discipline: reinterpret the stored bytes only through the type of
+    ## the member last written — a read through a different member type
+    ## is a raw reinterpretation, never a conversion. The byte buffer is
+    ## the ONLY storage the engine lays out, so embedded struct fields of
+    ## this type receive the exact C union size and alignment from the
+    ## layout record.
+    let (u_size, u_align) = _c_union_layout(&u.variants, u.packed, &self.declarations, 0)
+    mut out = String::new()
+    if self.config.generate_docs then
+      out = out + "## C `union " + &u.name + "` — overlapping storage: size " + &u_size.to_string() + ", alignment " + &u_align.to_string() + ".\n"
+      out = out + "## Representation: the language has no overlapping-storage union type, so this is the\n"
+      out = out + "## C union's storage as a byte buffer of the exact C size and alignment; the layout\n"
+      out = out + "## attributes below (@repr(C) + @align(N), or @packed) fix the buffer's alignment to\n"
+      out = out + "## the union's (the largest member alignment). Every C member overlaps at offset 0 of\n"
+      out = out + "## the buffer; typed access goes through the\n"
+      out = out + "## <union>_<member>_get / _set accessor pairs below, never by reading the buffer as a\n"
+      out = out + "## typed field. Reads follow the C active-member discipline: reinterpret the bytes only\n"
+      out = out + "## through the member type last written (a read through another member type is a raw\n"
+      out = out + "## reinterpretation, not a conversion).\n"
     end
+    if u.packed then
+      out = out + "@packed\n"
+    else
+      out = out + "@repr(C)\n"
+      if u_align > 1 then
+        out = out + "@align(" + &u_align.to_string() + ")\n"
+      end
+    end
+    out = out + "pub struct " + &u.name + "\n"
+    if self.config.generate_docs then
+      out = out + "  ## Raw union storage (" + &u_size.to_string() + " bytes). Members overlap at offset 0; use the accessors below.\n"
+    end
+    out = out + "  pub bytes: [u8; " + &u_size.to_string() + "]\n"
     out = out + "end\n\n"
+    ## Per-member typed accessor pairs. The accessor names carry the
+    ## union name so the C member identifiers can never collide with the
+    ## module's other items, and the get/set accessors take the union
+    ## through a pointer — the shape in which C code actually reaches
+    ## union storage (a Tangerine value's address is obtained with the
+    ## sanctioned `&mut x as Ptr[U]` cast).
+    let uname = u.name.clone()
+    for v in u.variants do
+      let tg_ty = _ctype_to_tg(&v.ty, &self.config.type_mappings)
+      if self.config.generate_docs then
+        out = out + "## C union `" + &uname + "` member `" + &v.name + "` — typed READ of the member bytes at\n"
+        out = out + "## offset 0, reinterpreted as " + &tg_ty + " (C " + &_c_type_doc_syn(&v.ty) + ").\n"
+        out = out + "## Active-member discipline: read only the member last written; a read through a\n"
+        out = out + "## different member type is a raw reinterpretation of the stored bytes.\n"
+        out = out + "## The access is bounds- and alignment-safe: the member (size <= union size) is read\n"
+        out = out + "## at offset 0, and the union's alignment meets every member's alignment.\n"
+      end
+      out = out + "pub def " + &uname + "_" + &v.name + "_get(p: Ptr[" + &uname + "]) -> " + &tg_ty + "\n"
+      out = out + "  unsafe \"C union " + &uname + "." + &v.name + ": typed read at offset 0\" do\n"
+      out = out + "    let q = p as Ptr[" + &tg_ty + "]\n"
+      out = out + "    *q\n"
+      out = out + "  end\n"
+      out = out + "end\n\n"
+      if self.config.generate_docs then
+        out = out + "## C union `" + &uname + "` member `" + &v.name + "` — typed WRITE of the member bytes at\n"
+        out = out + "## offset 0 as " + &tg_ty + " (C " + &_c_type_doc_syn(&v.ty) + "). This is the write that makes\n"
+        out = out + "## the member the union's ACTIVE member; subsequent reads must go through the same type.\n"
+      end
+      out = out + "pub def " + &uname + "_" + &v.name + "_set(p: PtrMut[" + &uname + "], v: " + &tg_ty + ") -> Unit\n"
+      out = out + "  unsafe \"C union " + &uname + "." + &v.name + ": typed write at offset 0\" do\n"
+      out = out + "    let q = p as Ptr[" + &tg_ty + "]\n"
+      out = out + "    *q = v\n"
+      out = out + "    ()\n"
+      out = out + "  end\n"
+      out = out + "end\n\n"
+    end
     out
   end
 
@@ -1143,7 +1243,7 @@ impl CHeaderParser
       when CToken::Semi then self.advance()
       when _ then ()
       end
-      Result::Ok(Option::Some(Declaration::Union(CUnion { name: name, variants: fields })))
+      Result::Ok(Option::Some(Declaration::Union(CUnion { name: name, variants: fields, packed: false })))
     when _ then
       self._skip_to_sync()
       Result::Ok(Option::None)
@@ -1445,7 +1545,7 @@ impl CHeaderParser
     when CToken::KwUnion then
       self.advance()
       let name = self._expect_ident()?
-      Result::Ok(CType::Union(CUnion { name: name, variants: Array::new() }))
+      Result::Ok(CType::Union(CUnion { name: name, variants: Array::new(), packed: false }))
     when CToken::KwEnum then
       self.advance()
       let name = self._expect_ident()?
@@ -1722,6 +1822,199 @@ def _ctype_to_tg_safe(ct: CType, mappings: Map[String, String]) -> String
   when CType::Pointer(inner) then "&mut " + &_ctype_to_tg_safe(inner, mappings)
   when CType::ConstPointer(inner) then "&" + &_ctype_to_tg_safe(inner, mappings)
   when _ then _ctype_to_tg(ct, mappings)
+  end
+end
+
+# ─── C layout authority for C-union emission ─────────────────────────
+# The C-union representation emitted by emit_union must carry the union's
+# EXACT C size and alignment (the enclosing @repr(C) structs place fields
+# from the emitted struct's layout record, so any drift silently shifts
+# the C offsets). These helpers compute the C size/alignment of a CType
+# under the same LP64 authority as _ctype_to_tg (the member width table
+# below mirrors the storage-width table there and std::ffi::c_type_size):
+#   1/2/4/8-byte members as C declares them, pointers 8 (one pointer
+#   word), arrays dense (n * element size), enums 4 (the @repr(i32)
+#   emission), structs under the C placement rules (declaration order,
+#   natural field alignment, tail padding to the struct's alignment —
+#   the layout compute_struct_layout performs for @repr(C) structs),
+#   unions under the C union rules (size = largest member size
+#   tail-aligned to the largest member alignment, every member at offset
+#   0). Named struct/union/enum/typedef references (the parser records
+#   them as field-less shells) are resolved against the parsed
+#   declarations; a reference that cannot be resolved falls back to the
+#   native word (8, 8) — the generated module cannot compile for it
+#   anyway (its type name resolves to nothing), and the fallback keeps
+#   the emitted buffer a sound upper bound. A recursion depth bound keeps
+#   degenerate/self-referential declarations from looping; layout depth
+#   beyond it also falls back to the native word.
+
+def _c_layout_align_up(n: Int, a: Int) -> Int
+  if a <= 1 then
+    n
+  else
+    ((n + a - 1) / a) * a
+  end
+end
+
+# The named declaration's type (the struct/union/enum body or the
+# typedef payload), when a declaration with that name was parsed.
+def _c_decl_ctype_named(decls: Array[Declaration], name: String) -> Option[CType]
+  for d in decls do
+    let found = match d
+    when Declaration::Struct(s) then
+      if s.name == name then Option::Some(CType::Struct(s.clone())) else Option::None end
+    when Declaration::Union(u) then
+      if u.name == name then Option::Some(CType::Union(u.clone())) else Option::None end
+    when Declaration::Enum(e) then
+      if e.name == name then Option::Some(CType::Enum(e.clone())) else Option::None end
+    when Declaration::Typedef(n, ty) then
+      if n == name then Option::Some(*ty.clone()) else Option::None end
+    when _ then Option::None
+    end
+    match found
+    when Option::Some(_) then return found
+    when Option::None then ()
+    end
+  end
+  Option::None
+end
+
+# The C struct layout — declaration order, natural field alignment, tail
+# padding to the struct's alignment (packed: per-field alignment 1, size
+# the exact byte span). Returns (size, align).
+def _c_struct_layout(s: CStruct, decls: Array[Declaration], depth: Int) -> (Int, Int)
+  mut cursor = 0
+  mut max_align = 1
+  for f in s.fields do
+    let (f_size, f_align) = _c_type_layout(&f.ty, decls, depth + 1)
+    let f_place_align = if s.packed then 1 else f_align end
+    if f_place_align > max_align then
+      max_align = f_place_align
+    end
+    cursor = _c_layout_align_up(cursor, f_place_align)
+    cursor = cursor + f_size
+  end
+  (_c_layout_align_up(cursor, max_align), max_align)
+end
+
+# The C union layout — every member at offset 0, size = the largest
+# member size tail-aligned to the largest member alignment, alignment =
+# the largest member alignment (packed: alignment 1, size the largest
+# member size). Returns (size, align).
+def _c_union_layout(variants: Array[CField], packed: Bool, decls: Array[Declaration], depth: Int) -> (Int, Int)
+  mut m_size = 0
+  mut m_align = 1
+  for v in variants do
+    let (v_size, v_align) = _c_type_layout(&v.ty, decls, depth + 1)
+    if v_size > m_size then
+      m_size = v_size
+    end
+    if v_align > m_align then
+      m_align = v_align
+    end
+  end
+  if packed then
+    (m_size, 1)
+  else
+    (_c_layout_align_up(m_size, m_align), m_align)
+  end
+end
+
+# The C size and alignment of a member type. Depth-bound fallback: the
+# native word (8 bytes, alignment 8).
+def _c_type_layout(ct: CType, decls: Array[Declaration], depth: Int) -> (Int, Int)
+  if depth > 64 then
+    return (8, 8)
+  end
+  match ct
+  when CType::Void then (0, 1)
+  when CType::Bool then (1, 1)
+  when CType::Char then (1, 1)
+  when CType::UChar then (1, 1)
+  when CType::Short then (2, 2)
+  when CType::UShort then (2, 2)
+  when CType::Int then (4, 4)
+  when CType::UInt then (4, 4)
+  when CType::Float then (4, 4)
+  when CType::Long then (8, 8)
+  when CType::ULong then (8, 8)
+  when CType::LongLong then (8, 8)
+  when CType::ULongLong then (8, 8)
+  when CType::Double then (8, 8)
+  when CType::SizeT then (8, 8)
+  when CType::Pointer(_) then (8, 8)
+  when CType::ConstPointer(_) then (8, 8)
+  when CType::FuncPointer(_, _) then (8, 8)
+  when CType::Array(inner, count) then
+    let (elem_size, elem_align) = _c_type_layout(inner, decls, depth + 1)
+    (elem_size * (count as Int), elem_align)
+  when CType::Struct(s) then
+    match s.fields.is_empty()
+    when true then
+      ## A named reference — resolve the full declaration.
+      match _c_decl_ctype_named(decls, s.name)
+      when Option::Some(resolved) then _c_type_layout(resolved, decls, depth + 1)
+      when Option::None then (8, 8)
+      end
+    when false then
+      _c_struct_layout(s, decls, depth + 1)
+    end
+  when CType::Union(u) then
+    match u.variants.is_empty()
+    when true then
+      ## A named reference — resolve the full declaration.
+      match _c_decl_ctype_named(decls, u.name)
+      when Option::Some(resolved) then _c_type_layout(resolved, decls, depth + 1)
+      when Option::None then (8, 8)
+      end
+    when false then
+      _c_union_layout(u.variants, u.packed, decls, depth + 1)
+    end
+  when CType::Enum(_) then
+    ## A C enum is emitted as @repr(i32) — 4 bytes, alignment 4 — whether
+    ## the body is inline or a named reference to a parsed declaration.
+    (4, 4)
+  when CType::Typedef(name, inner) then
+    ## Resolve by name first: the parser's member-position fallback
+    ## payload (CType::Int) is only a placeholder for unknown names, and
+    ## the declaration holds the real width (a struct/union/enum body or
+    ## a typedef chain).
+    match _c_decl_ctype_named(decls, name)
+    when Option::Some(resolved) then _c_type_layout(resolved, decls, depth + 1)
+    when Option::None then _c_type_layout(inner, decls, depth + 1)
+    end
+  when _ then (8, 8)
+  end
+end
+
+# A readable C spelling of a member type for the generated docs (the
+# reverse of _ctype_to_tg's storage mapping).
+def _c_type_doc_syn(ct: CType) -> String
+  match ct
+  when CType::Void then "void"
+  when CType::Bool then "_Bool"
+  when CType::Char then "char"
+  when CType::UChar then "unsigned char"
+  when CType::Short then "short"
+  when CType::UShort then "unsigned short"
+  when CType::Int then "int"
+  when CType::UInt then "unsigned int"
+  when CType::Long then "long"
+  when CType::ULong then "unsigned long"
+  when CType::LongLong then "long long"
+  when CType::ULongLong then "unsigned long long"
+  when CType::Float then "float"
+  when CType::Double then "double"
+  when CType::SizeT then "size_t"
+  when CType::Pointer(inner) then _c_type_doc_syn(inner) + " *"
+  when CType::ConstPointer(inner) then "const " + &_c_type_doc_syn(inner) + " *"
+  when CType::Array(inner, count) then _c_type_doc_syn(inner) + "[" + &count.to_string() + "]"
+  when CType::FuncPointer(_, _) then "function pointer"
+  when CType::Struct(s) then s.name.clone()
+  when CType::Union(u) then u.name.clone()
+  when CType::Enum(e) then e.name.clone()
+  when CType::Typedef(name, _) then name.clone()
+  when _ then "opaque"
   end
 end
 

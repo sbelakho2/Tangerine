@@ -967,7 +967,7 @@ compiler-owned structural field cleanup — exactly once.
 | LangItems built once, structurally unique; the bundle covers option/result/vec/map/set/box/rc/array/slice + string/str_view/unique_ptr/arc_strong/weak_rc/weak_arc/ptr/ptr_mut + the trait ids; semantic identity by DefId/TypeId/TraitId — never strings | types.tg / ids.tg §8 |
 | THE SIMD VECTOR ROW: the std Vec2/Vec4/Vec8/Vec16 instantiations with a 16/32/64-byte width lay out as N lanes of the lane type with ALIGNMENT = the vector WIDTH (never the lane alignment), and the ABI classifier's vector cases cross the 16-byte vector THROUGH the registers (`Vector(16)` — never sret) while the 32/64-byte forms cross by address; a non-vector width (Vec2[f32] — 8 bytes) and an ordinary `[T; N]` fixed array keep the element-aligned inline layout | layout_engine.tg `compute_vector_layout` / `is_simd_vector_type` / `classify_value_category`; codegen.tg `AbiArg::Vector` / `category_uses_sret`; tests/simd/simd_layout_test.tg / simd_abi_probe.tg |
 | THE WASM32 LINEAR-MEMORY MODEL: the wasm32-unknown-unknown / wasm32-wasi target's address space is the wasm linear memory — pointers and handles are 32-bit linear addresses (i32), aggregates live in linear-memory images addressed by i32 handles, and the wasm stack holds the i32/i64/f32/f64 values; the type mapping (Bool/Char/I8/I16/I32/U8/U16/U32 → i32; Int/I64/U64/ISize/USize → i64; F32 → f32; Float/F64 → f64; Ptr/PtrMut/RefInternal/String/Adt/FnPtr/Dyn/Effect/Closure → i32 handles; Unit/Never → no value; I128/U128 fail closed; the SIMD vectors cross by address) is the single authority in wasm_target.tg, and the category-level classification maps the layout engine's value categories to the wasm32 slots | wasm_target.tg "THE WASM TYPE MAPPING TABLE" / `map_primitive_to_wasm` / `mir_type_to_wasm` / `classify_wasm_value_category`; tests/wasm/wasm_conformance_test.tg (the mapping-table case) |
-| THE PER-ORDERING ATOMIC DISCIPLINE: the atomics lower per order code — AArch64 relaxed load/store = plain LDR/STR (acquire/release/SeqCst = LDAR/STLR), AArch64 fence = DMB ISHLD for Acquire and DMB ISH for Release/AcqRel/SeqCst (nothing for Relaxed), x86-64 fence = MFENCE for SeqCst only (nothing for the weaker orders — TSO), x86-64 SeqCst store = the xchg store while weaker stores are plain MOVs; RMW/CAS serve the strongest form (correct for every ordering — stronger-than-requested is always legal) with the per-ordering A/L variants and the CAS failure-order dispatch as documented TODOs | codegen.tg `emit_atomic_intrinsic_a64` / `emit_atomic_intrinsic_x64` §16.8 |
+| THE PER-ORDERING ATOMIC DISCIPLINE: the atomics lower per order code — AArch64 relaxed load/store = plain LDR/STR (acquire/release/SeqCst = LDAR/STLR), AArch64 RMW/exchange = the per-ordering LSE A/L dispatch (Relaxed plain, Acquire +A, Release +L, AcqRel/SeqCst +AL — sub ops NEG, and ops MVN first), AArch64 compare_exchange = the success-order CAS/CASA/CASL/CASAL dispatch (the failure order is covered: acquire failure ⇒ acquire-or-stronger success; seq-cst failure ⇒ CASAL), AArch64 fence = DMB ISHLD for Acquire and DMB ISH for Release/AcqRel/SeqCst (nothing for Relaxed), x86-64 fence = MFENCE for SeqCst only (nothing for the weaker orders — TSO), x86-64 SeqCst store = the xchg store while weaker stores are plain MOVs (x86 RMW/CAS are inherently LOCKed full-barrier ops — no weaker form exists) | codegen.tg `emit_atomic_intrinsic_a64` / `emit_atomic_intrinsic_x64` / `emit_a64_rmw_ordered` §16.8 |
 | THE AArch64 STLR ENCODINGS ARE ISA-VERIFIED: the STLR family bases (STLRB 0x089FFC00 / STLRH 0x489FFC00 / STLR(w) 0x889FFC00 / STLR(x) 0xC89FFC00) and the allocator unlock's `stlrb wzr, [x10]` were re-derived from assembled/disassembled encodings (the former `…1F7C00` words were not valid STLR instructions) | codegen.tg `a64_stlr_enc`; runtime.tg `emit_tg_alloc_unlock` §16.8 |
 | CAS ordering legality (failure ∉ {Release, AcqRel}; failure ≤ success) enforced at every std compare_exchange/compare_exchange_weak entry with the deterministic panic (the panic=abort stance) | std/atomic.tg `validate_cas_orderings` §16.3 |
 
@@ -1215,8 +1215,8 @@ atomic types.
 All encodings below were verified against the AArch64/x86-64 ISA
 (assembled + disassembled). Codegen reads the runtime order code from
 the ABI register and branches per ordering where the ISA distinguishes
-orders (AArch64 store/load/fence, x86-64 store/fence). Serving an
-ordering stronger than requested is always legal (§16.2); the tables
+orders (AArch64 load/store/fence/RMW/CAS, x86-64 store/fence). Serving
+an ordering stronger than requested is always legal (§16.2); the tables
 show the minimum-strength instruction actually emitted for each code.
 The wasm32 target (wasm_target.tg) has no atomic emission: an atomic
 extern lowers to the trapping stub (a runtime trap — fail closed), so
@@ -1226,21 +1226,54 @@ the tables below govern the native aarch64 and x86-64 targets only.
 
 | Order code | load | store | RMW (fetch/exchange) | CAS | fence |
 |-----------|------|-------|----------------------|-----|-------|
-| 0 Relaxed | LDR (plain) | STR (plain) | LSE **-al** family (strongest; see TODO) | CASAL (strongest; see TODO) | (nothing) |
-| 2 Acquire | LDAR | STLR* | LDADDAL/CASAL/SWPAL… | CASAL | DMB ISHLD |
-| 3 Release | LDAR* | STLR | LSE -al | CASAL | DMB ISH |
-| 4 AcqRel | LDAR* | STLR* | LSE -al | CASAL | DMB ISH |
-| 5 SeqCst | LDAR | STLR | LSE -al | CASAL | DMB ISH |
+| 0 Relaxed | LDR (plain) | STR (plain) | plain LSE family (LDADD/LDCLR/LDEOR/LDSET/SWP) | CAS | (nothing) |
+| 2 Acquire | LDAR | STLR* | +A (LDADDA/…/SWPA) | CASA | DMB ISHLD |
+| 3 Release | LDAR* | STLR | +L (LDADDL/…/SWPL) | CASL | DMB ISH |
+| 4 AcqRel | LDAR* | STLR* | +AL (LDADDAL/…/SWPAL) | CASAL | DMB ISH |
+| 5 SeqCst | LDAR | STLR | +AL (LDADDAL/…/SWPAL) | CASAL | DMB ISH |
 
 - LDAR = acquire load (the SeqCst load under the LDAR/STLR pair
   discipline); STLR = release store (the SeqCst store under the same
   discipline). The `*` marks out-of-domain codes for that operation
   kind (UB — §16.3) served deterministically by the strongest legal
   form.
-- LSE -al family: LDADDAL (add/sub), LDCLRAL (and), LDSETAL (or),
-  LDEORAL (xor), SWPAL (exchange), CASAL (compare-exchange), each
-  width 1/2/4/8 with the A/L bits: base | A(0x800000) | L(0x400000) —
-  e.g. `ldaddal x1, x9, [x0]` = 0xF8E10009.
+- RMW/exchange dispatch (the order code arrives in x2; the branch
+  structure compares 0/2/3): Relaxed → the op's plain LSE form,
+  Acquire → +A, Release → +L, AcqRel/SeqCst → +AL — an out-of-domain
+  code deterministically takes the +AL arm (the strongest form).
+  Per-op family: add/sub → LDADD (fetch_sub/sub_fetch atomically add
+  −v: NEG then LDADD), and → LDCLR, or → LDSET, xor → LDEOR,
+  exchange → SWP. The and ops complement the operand first (MVN then
+  LDCLR): LDCLR clears the bits SET in its operand — the memory word
+  is ANDed with ~Rs — so the AND of v is the bit-clear of ~v (the
+  mvn+ldclr sequence clang/gcc emit for `fetch_and`). Each family has
+  the A/L bits over its plain base (A = 0x800000, L = 0x400000 — e.g.
+  `ldaddal x1, x9, [x0]` = 0xF8E10009) and the size field [31:30]
+  (0 = byte, 1 = half, 2 = word, 3 = X); the encoders live in asm.tg
+  (a64_ldadd/ldadda/ldaddl/ldaddal … a64_swp/…/a64_swpal with the
+  `size` parameter), reproducing the verified `*_al_enc` words of
+  codegen.tg.
+- compare_exchange dispatch (success order in x4): CAS for Relaxed,
+  CASA for Acquire, CASL for Release, CASAL for AcqRel/SeqCst (an
+  out-of-domain success code deterministically takes the CASAL arm).
+  The failure order (x5) is served by the same instruction and needs
+  no separate dispatch on the LSE form: a failed LSE CAS performs no
+  store — its memory access is a read — and §16.3 admits only
+  Relaxed/Acquire/SeqCst failure orders no stronger than the success
+  order. An Acquire failure therefore implies an Acquire-or-stronger
+  success, whose acquire read covers the failed-path read (rule 5:
+  the failed path orders like a load with the failure ordering), and
+  a SeqCst failure implies SeqCst success (CASAL — the acquire read
+  that is the SC load under the LDAR/STLR discipline). There is no
+  LL/SC CAS loop in the current LSE-required emission. The exclusive
+  loop forms — LDXR bases 0x085F7C00/0x485F7C00/0x885F7C00/0xC85F7C00
+  with LDAXR = base + 0x8000 for an acquire read, STXR bases
+  0x08007C00/0x48007C00/0x88007C00/0xC8007C00 with STLXR = base +
+  0x8000 for a release write — remain the documented fallback for a
+  future non-LSE (portable-mode) baseline, where the same per-
+  ordering rule picks the loop's LDXR/LDAXR reads and STXR/STLXR
+  writes per the pair above (relaxed failure → LDXR/STXR, acquire
+  failure → LDAXR reads, release-or-stronger success → STLXR writes).
 - Encodings verified: LDAR base per width 0x08DFFC00/0x48DFFC00/
   0x88DFFC00/0xC8DFFC00; STLR base 0x089FFC00/0x489FFC00/0x889FFC00/
   0xC89FFC00 (codegen `a64_stlr_enc`); DMB ISH 0xD5033BBF; DMB ISHLD
@@ -1249,21 +1282,6 @@ the tables below govern the native aarch64 and x86-64 targets only.
   observed before the prior stores — a store->load crossing that DMB
   ISHST does NOT prevent; DMB ISH is the ecosystem-standard release
   fence, matching clang/gcc).
-
-**TODO (exact mapping, not a correctness gap — the -al forms serve
-every ordering):** per-ordering RMW variants. The A/L flag bits over
-each op's plain base are A = 0x800000, L = 0x400000; the plain bases
-are the `*_al_enc` tables minus 0xC00000. Dispatch on the order code in
-x2 like the store arm: Relaxed → plain (LDADD/…/SWP), Acquire → +A,
-Release → +L, AcqRel/SeqCst → +AL (today's emission). CAS success/
-failure dispatch (codes in x4/x5): the failure path is a read; an exact
-lowering requires the LL/SC fallback (the documented future portable
-mode): relaxed success/relaxed failure → LDXR/STXR loop (LDXR bases
-0x085F7C00/0x485F7C00/0x885F7C00/0xC85F7C00, STXR bases 0x08007C00/
-0x48007C00/0x88007C00/0xC8007C00), acquire reads → LDAXR (the LDXR
-base + 0x8000: 0x085FFC00/0x485FFC00/0x885FFC00/0xC85FFC00 — verified
-encodings), release success stores → STLXR (the STXR base + 0x8000:
-0x0800FC00/0x4800FC00/0x8800FC00/0xC800FC00).
 
 #### 16.8.2 x86-64 (TSO)
 
@@ -1292,10 +1310,13 @@ encodings), release success stores → STLXR (the STXR base + 0x8000:
   regular memory; store-buffer/MMIO-class effects are outside the
   atomic ordering model (§16.9).
 
-**TODO (exact mapping — no weaker instruction exists, so this is a
-documentation note rather than a gap):** there is no x86 encoding for a
-width-exact atomic RMW below full-barrier strength; per-ordering RMW
-lowering is therefore a no-op on x86 by construction.
+- x86-64 RMW/CAS need no per-ordering dispatch: there is no x86
+  encoding for a width-exact atomic RMW below full-barrier strength —
+  the LOCKed ops (and the implicitly locked xchg store) are the only
+  forms — so every ordering, Relaxed through SeqCst, is served by the
+  same LOCKed instruction at seq-cst strength. Per-ordering RMW/CAS
+  lowering is therefore a no-op on x86 by construction; only the
+  store (the SeqCst xchg store) and the fence distinguish orders.
 
 #### 16.8.3 Shared rules
 
@@ -1323,11 +1344,12 @@ lowering is therefore a no-op on x86 by construction.
   bound as a **no-op** — the correct semantics on the single-threaded
   host (host.ml). So no ordering behavior can be observed or validated
   on the seed; programs that exercise atomics are full-compiler-only.
-  **TODO:** per-ordering VM semantics for the atomic intrinsics (the
-  seed's memory is the VM heap — implement load/store/exchange/CAS/
-  fetch/fence per the order code with the seed's deterministic trap
-  discipline for the out-of-domain codes), if the seed is ever required
-  to run atomic programs.
+  **Documented limitation:** the seed has no per-ordering VM semantics
+  for the atomic intrinsics (the seed's memory is the VM heap — a
+  deterministic load/store/exchange/CAS/fetch/fence per the order code,
+  with the seed's deterministic trap discipline for the out-of-domain
+  codes, would only be needed if the seed is ever required to run
+  atomic programs).
 - **The kernel `__sync_*` runtime fallback**: `__sync_fetch_and_add`
   as a runtime FUNCTION (runtime.tg `emit_sync_fetch_and_add_runtime`)
   is documented "single-threaded runtime … NOT an atomic RMW" — a

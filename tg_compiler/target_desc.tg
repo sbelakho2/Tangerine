@@ -1,0 +1,232 @@
+# Tangerine Compiler — Target Descriptions
+# Self-hosting compiler written in Tangerine
+#
+# AUDIT P1-14, slice 1 — the DATA-DRIVEN TARGET DESCRIPTION.
+#
+# CONTRACT: every target property a backend can need — pointer width,
+# endianness, stack alignment, the atomic-width set, unaligned-access
+# behavior, hardware mul/atomic availability, the calling-convention
+# register classes (arg / caller-saved / callee-saved), the vector/FPU
+# set, and the flash/RAM-style address spaces — is DATA: one canonical
+# TargetDesc instance per target, defined in THIS module and consumed by
+# the backends (the LIR backend's accessor is lir_target_desc() in
+# lir.tg, which the driver's LIR route consults at its gate). Target
+# properties must NOT be re-derived as scattered arch conditionals inside
+# codegen: a backend that needs a target property reads it from the desc
+# it is given. Hardcoded ABI numbers that predate this module (e.g.
+# lir.tg's register-model constants — fixed x0-x7, pool x9-x14, scratch
+# x15/x16/x17) are LEGACY READS of the same data; they migrate onto desc
+# fields slice by slice, never with a behavior change in one slice.
+#
+# NOT YET MODELED (documented here, never silently assumed):
+#   - integer ABI: no separate field — for every canonical instance the
+#     integer word is exactly pointer_width (LP64 on aarch64/x86_64/
+#     riscv64, ILP32 on cortex_m/riscv32). A target that diverges (x32,
+#     ILP32 aarch64) will grow an int_abi field.
+#   - interrupt ABI: no field yet. cortex-m ISR entry/exit register
+#     rules and irq masking policy belong to a later slice.
+#   - vector/FPU granularity is per-INSTANCE: the instances document the
+#     exact assumed feature set (see each block below).
+#
+# The instances are plain functions returning FRESH records — the desc
+# is value data, never a shared mutable singleton, so two consumers (or
+# two phases of one compile) can never observe each other's mutations.
+
+use std::collections::{Vec}
+
+# ———————————————————————————————————————————————————————————————
+# Endianness
+# ———————————————————————————————————————————————————————————————
+
+enum Endianness
+  Little
+  Big
+end
+
+# ———————————————————————————————————————————————————————————————
+# TargetDesc — the canonical per-target ABI record
+# ———————————————————————————————————————————————————————————————
+
+struct TargetDesc
+  name: String                     # canonical instance name ("aarch64", ...)
+  pointer_width: Int               # bytes per pointer / address
+  endianness: Endianness           # Little | Big
+  stack_alignment: Int             # bytes the stack pointer stays aligned to
+  atomic_widths: Vec[Int]          # byte widths with native atomic support
+  unaligned_loads_ok: Bool         # normal (non-atomic) loads/stores may be unaligned
+  has_hardware_mul: Bool           # hardware multiply instruction
+  has_atomics: Bool                # native atomic instructions available
+  reg_caller_saved: Vec[String]    # registers a call may clobber
+  reg_callee_saved: Vec[String]    # registers a callee must preserve
+  arg_regs: Vec[String]            # integer/pointer argument registers, ABI order
+  vector_fpu: Vec[String]          # FPU/vector extension tokens (empty = none)
+  memory_spaces: Vec[String]       # address spaces ("flash", "ram", ...)
+end
+
+# ———————————————————————————————————————————————————————————————
+# aarch64 (AAPCS64) — Apple Silicon / Linux hosts; the LIR backend's
+# target for the audit's current slices (reg_caller_saved/reg_callee_
+# saved/arg_regs mirror lir.tg's register model: fixed precolored x0-x7
+# = arg_regs, allocatable caller-saved pool x9-x14, scratch x15-x17).
+# Atomically, the widths 1/2/4/8 follow asm.tg's target feature table:
+# the ARMv8.1 LSE RMW family (LDADDAL/CASAL/SWPAL) is REQUIRED on this
+# target — a bare ARMv8.0 core without LSE is not a supported target
+# (the LL/SC fallback is a future mode, per that table's note).
+# NOTE: unaligned_loads_ok covers NORMAL loads/stores (the kernel may
+# trap unaligned in privileged modes); atomic accesses must still be
+# naturally aligned on every architecture.
+# NOTE: x18 is platform-reserved and never in a register list; x16/x17
+# are the intra-procedure-call scratch registers and x8 is the indirect
+# result register — all caller-saved scratch, covered by x0-x17. x30
+# (LR) is neither caller- nor callee-saved (saved per-call in the
+# prologue); x29 (FP) is callee-saved and therefore listed.
+# vector_fpu: the base AArch64 FP + AdvSIMD set (the unified v0-v31
+# register file); SVE is a per-core extension and is NOT assumed here.
+# memory_spaces: this compiler's aarch64 hosts (darwin/linux) are flat
+# address spaces — "flash" applies to a future bare-metal instance.
+def aarch64_desc() -> TargetDesc
+  TargetDesc {
+    name: "aarch64",
+    pointer_width: 8,
+    endianness: Endianness::Little,
+    stack_alignment: 16,
+    atomic_widths: Vec::from([1, 2, 4, 8]),
+    unaligned_loads_ok: true,
+    has_hardware_mul: true,
+    has_atomics: true,
+    reg_caller_saved: Vec::from([
+      "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7",
+      "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
+      "x16", "x17"
+    ]),
+    reg_callee_saved: Vec::from([
+      "x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26",
+      "x27", "x28", "x29"
+    ]),
+    arg_regs: Vec::from(["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"]),
+    vector_fpu: Vec::from(["fp", "simd"]),
+    memory_spaces: Vec::from(["ram"])
+  }
+end
+
+# ———————————————————————————————————————————————————————————————
+# cortex_m — Thumb-2, the Cortex-M3/M4 class (AAPCS32), per the audit
+# data: 32-bit little-endian, stack align 8, atomics via LDREX/STREX on
+# word/halfword/byte, unaligned OK for word LDR/STR.
+# NOTE: this class has hardware MUL but NO hardware divide (SDIV/UDIV
+# are absent on M3; the M4 adds them plus an optional FPU). The M0/M0+
+# class differs (word-only exclusives, no unaligned word loads, 32-cycle
+# mul) and gets its OWN instance when a backend consumes it.
+# NOTE: the interrupt ABI (NVIC entry/exit) has no field this slice —
+# see the module contract.
+# vector_fpu: ["vfp"] per the audit data (vfpv3/vfpv4 depending on the
+# core; spelling of the tokens is decided HERE, single-sourced).
+# NOTE: atomics must still be naturally aligned even though normal word
+# loads/stores tolerate unaligned addresses.
+def cortex_m_desc() -> TargetDesc
+  TargetDesc {
+    name: "cortex_m",
+    pointer_width: 4,
+    endianness: Endianness::Little,
+    stack_alignment: 8,
+    atomic_widths: Vec::from([1, 2, 4]),
+    unaligned_loads_ok: true,
+    has_hardware_mul: true,
+    has_atomics: true,
+    reg_caller_saved: Vec::from(["r0", "r1", "r2", "r3", "r12"]),
+    reg_callee_saved: Vec::from([
+      "r4", "r5", "r6", "r7", "r8", "r9", "r10", "r11"
+    ]),
+    arg_regs: Vec::from(["r0", "r1", "r2", "r3"]),
+    vector_fpu: Vec::from(["vfp"]),
+    memory_spaces: Vec::from(["flash", "ram"])
+  }
+end
+
+# ———————————————————————————————————————————————————————————————
+# riscv32 — RV32IMA (integer + atomics + mul), embedded profile.
+# NOTE: mirrors riscv64's shape at 32-bit width; atomics (the A
+# extension) cover byte/half/word — 64-bit LR/SC/AMO exist only on RV64.
+# memory_spaces ["flash", "ram"] per the audit's riscv data.
+def riscv32_desc() -> TargetDesc
+  TargetDesc {
+    name: "riscv32",
+    pointer_width: 4,
+    endianness: Endianness::Little,
+    stack_alignment: 16,
+    atomic_widths: Vec::from([1, 2, 4]),
+    unaligned_loads_ok: false,
+    has_hardware_mul: true,
+    has_atomics: true,
+    reg_caller_saved: Vec::from([
+      "ra", "t0", "t1", "t2", "t3", "t4", "t5", "t6",
+      "a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7"
+    ]),
+    reg_callee_saved: Vec::from([
+      "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7",
+      "s8", "s9", "s10", "s11"
+    ]),
+    arg_regs: Vec::from(["a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7"]),
+    vector_fpu: Vec::new(),
+    memory_spaces: Vec::from(["flash", "ram"])
+  }
+end
+
+# ———————————————————————————————————————————————————————————————
+# riscv64 — RV64IMA, per the audit data: 64-bit little-endian, stack
+# align 16, atomics (the A extension) on 1/2/4/8 bytes, unaligned
+# access NOT supported (misaligned loads/stores raise an exception on
+# the base profile; software fixups are a per-core option, never
+# assumed here).
+# NOTE: s0 doubles as the frame pointer (fp); sp is in no list.
+def riscv64_desc() -> TargetDesc
+  TargetDesc {
+    name: "riscv64",
+    pointer_width: 8,
+    endianness: Endianness::Little,
+    stack_alignment: 16,
+    atomic_widths: Vec::from([1, 2, 4, 8]),
+    unaligned_loads_ok: false,
+    has_hardware_mul: true,
+    has_atomics: true,
+    reg_caller_saved: Vec::from([
+      "ra", "t0", "t1", "t2", "t3", "t4", "t5", "t6",
+      "a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7"
+    ]),
+    reg_callee_saved: Vec::from([
+      "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7",
+      "s8", "s9", "s10", "s11"
+    ]),
+    arg_regs: Vec::from(["a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7"]),
+    vector_fpu: Vec::new(),
+    memory_spaces: Vec::from(["flash", "ram"])
+  }
+end
+
+# ———————————————————————————————————————————————————————————————
+# x86_64 — System V AMD64 (the only x86-64 ABI this compiler targets;
+# a Windows-x64 profile differs in arg/callee-saved registers and would
+# be its own instance). Unaligned access is legal for all normal
+# operations; atomics (lock-prefixed RMW / XCHG) support 1/2/4/8 bytes.
+# vector_fpu: SSE2 is the x86-64 baseline (required by SysV); AVX is a
+# per-machine extension and is NOT assumed.
+def x86_64_desc() -> TargetDesc
+  TargetDesc {
+    name: "x86_64",
+    pointer_width: 8,
+    endianness: Endianness::Little,
+    stack_alignment: 16,
+    atomic_widths: Vec::from([1, 2, 4, 8]),
+    unaligned_loads_ok: true,
+    has_hardware_mul: true,
+    has_atomics: true,
+    reg_caller_saved: Vec::from([
+      "rax", "rcx", "rdx", "rsi", "rdi",
+      "r8", "r9", "r10", "r11"
+    ]),
+    reg_callee_saved: Vec::from(["rbx", "rbp", "r12", "r13", "r14", "r15"]),
+    arg_regs: Vec::from(["rdi", "rsi", "rdx", "rcx", "r8", "r9"]),
+    vector_fpu: Vec::from(["sse2"]),
+    memory_spaces: Vec::from(["ram"])
+  }
+end

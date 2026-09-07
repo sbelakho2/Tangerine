@@ -1,0 +1,2915 @@
+# Tangerine Compiler — RISC-V (RV64I + M, RV32I + M) backend over the LIR
+# Self-hosting compiler written in Tangerine
+#
+# AUDIT P1-14, slice 3a — the PURE RV64 ENCODER SET ONLY: every def below
+# returns ONE 32-bit machine word (u32) with its RV64 bit layout documented
+# in the comment. NO emitter, NO ELF/object writer, NO driver route wiring,
+# NO validation pass — those were later slices (the emitter has since
+# landed as slices 3b/3c/4 below — slice 4 adds the terminators, the
+# prologue/epilogue and the per-function driver, and slice 3d below adds
+# the whole-program route and the ELF32/ELF64 RISC-V object writer).
+#
+# AUDIT P1-14, slice 3b — backend DATA + VALIDATION over the unchanged 3a
+# encoders: rv_target_desc (xlen -> riscv32/64 desc), the psABI
+# register-map constants for the future emitter, and the fail-closed
+# rv_validate_fn (mirroring thumb_validate_fn).
+#
+# AUDIT P1-14, slice 3c — THE LIR STATEMENT EMITTER, the bounded first
+# half of the emitter mirroring backend_thumb.tg's statement emitter
+# def-for-def: rv_def_target / rv_emit_use / rv_slot_access / rv_emit_stmt
+# lower the Move / Binop / Unop / Cmp / Cset statement kinds (plus the
+# slice-3c rv_sltiu encoder, the LirCset equality is-zero test). RISC-V
+# has no flags, so a LirCmp records its resolved operand registers for the
+# ADJACENT LirCset, which emits the actual set sequences (see
+# rv_emit_stmt). LirLoadFrame / LirPushArg Err naming the rule —
+# rv_validate_fn already rejects them (defense in depth). COMPLETE —
+# see the slice-3d entry below.
+#
+# AUDIT P1-14, slice 3d — THE WHOLE-PROGRAM ROUTE + THE RV ELF WRITER
+# (COMPLETE): backend_thumb.tg's slice-2 wiring, mirrored for RISC-V.
+# rv_emit_fn was re-shaped to the thumb_emit_fn contract — it emits ONE
+# function into the SHARED program emit state (RvEmit: one text buffer,
+# every function's and block's label in it), so a call resolves by the
+# same rule thumb's did: a target that is a defined program function
+# (self-recursion included) is a deferred jal-ra patch resolved by
+# rv_resolve_patches once the whole program is emitted; a call to an
+# extern (or to a target that is neither defined nor declared extern —
+# thumb's defensive rule) emits `jal ra, 0` and records an R_RISCV_JAL
+# relocation for the ELF writer. rv_compile_object runs the shared
+# MIR->LIR->peephole->alloc->emit pipeline over every function of the
+# program (with the program's static label table, so MirStaticRef
+# reads lower to the LUI/ADDI-address static loads), emits the static
+# scalar images into a .data image, and hands the text buffer + the
+# (fn name, offset) symbols + the .data symbols + the extern symbols +
+# the relocations to rv_elf_obj, which emits a REAL
+# ELF32 (xlen 4) / ELF64 (xlen 8) riscv relocatable object — e_machine
+# 243 (EM_RISCV), e_flags 0, the thumb-shaped layout (null /
+# shared strtab / .text / .data / .rela.text / .symtab) with RELA
+# entries (RISC-V is RELA-only at every xlen): R_RISCV_JAL (17) text
+# relocations, addend 0, against undefined extern symbols, plus the
+# R_RISCV_HI20 (26) / R_RISCV_LO12_I (27) pairs of the static-value
+# loads against the .data symbols. The driver
+# (driver.tg) selects the route with TANGERINE_LIR_TARGET=riscv32 /
+# riscv64 (mirror of TANGERINE_LIR_TARGET=cortex-m).
+#
+# REMAINING RULES (each names itself in its Err/panic when reached):
+#   - RV32 shamt narrowing (IMPLEMENTED — the xlen-aware gates in
+#     rv_validate_fn and the binop emitters): the route's immediate
+#     shift counts are the RV64 6-bit field 0..63 on xlen 8 (unchanged)
+#     and the RV32I 5-bit field 0..31 on xlen 4. Counts 0..31 share a
+#     byte-for-byte encoding across the xlens, so RV32 emits the same
+#     slli/srli/srai words and fails closed — a rule-naming Err, never
+#     an illegal word — on every count the 5-bit field cannot hold
+#     (32..63: the RV64-format word is not an RV32 instruction) and on
+#     register-form shift counts (the RV32 machine masks rs2 to 5 bits
+#     — shift count mod 32 — a silently different result from the
+#     64-bit LIR shift semantics for counts >= 32, which no static
+#     check can exclude; the RV32 64-bit shift lowering over hi/lo
+#     words is a later slice).
+#   - atomics (the A extension: LR/SC, AMO): not implemented — the LIR
+#     slice carries no atomic statements, so nothing reaches this
+#     backend, and the A-extension encoders do not exist; a future
+#     atomic LIR statement would fail closed with a rule-naming Err.
+#   - floats (RV32F/RV64F, RV32D/RV64D): not implemented — no LIR
+#     float statement exists in the slice, so none reaches this
+#     backend (fail-closed by absence); the descs report an empty
+#     vector_fpu.
+#   - div/rem: the RV64M/32M div/divu/rem/remu encoders are not
+#     implemented. lir.tg's lowering gates Div/Mod to the aarch64
+#     route (div_ok true there); on this route the gate stays closed,
+#     so a Div/Mod fails closed at lowering with a rule-naming Err and
+#     no LirDiv ever arrives (fail-closed by absence).
+#   - statics/data emission: the scalar-constant subset IS implemented
+#     (the .data image + the LUI/ADDI-address static loads — see the
+#     statics section below); statics beyond the subset (floats,
+#     strings, pointers, aggregate/collection images) and static
+#     WRITES (the MirStaticAddr address-of forms) fail closed with
+#     their concrete rules in lir.tg's shared gates.
+#   - full-64-bit li materialization and long branches beyond the
+#     ±1 MiB jal range (linker-inserted veneers) fail closed with
+#     their rules (see the route and the emitter).
+#
+# ALL-NATIVE: this backend never invokes clang/llvm or any external
+# toolchain, in code or in the pipeline. External tools are allowed only
+# as offline verification aids; none was available on this host, so every
+# encoding below is marked verified-by-hand (bit layouts derived from the
+# RISC-V spec and cross-checked against the canonical encodings of the
+# standard riscv64 assembly listings).
+#
+# Registers are plain integer numbers x0..x31 (x0 = 0, x1 = ra, x2 = sp,
+# x8 = s0/fp). Every encoder fails closed with a panic on out-of-range
+# registers or immediates — never a silently wrong byte.
+
+use std::core::{Option, Result, panic}
+use std::collections::{Vec, Set, Map}
+use tg_compiler::mir::{MirProgram, MirStatic}
+use tg_compiler::lir::{
+  LirFunction, LirAlloc, LirBinOp, LirCond, LirStmtKind, LirTermKind,
+  LirUnOp, LirValue,
+  lower_mir_fn_to_lir, lir_peephole, lir_alloc_registers,
+  lir_first_alloc_vreg, lir_seg_at, lir_reload_at, lir_block_label,
+  lir_validate_callees,
+  lir_static_scalar_ok, lir_static_init_word_value,
+  lir_static_unsupported_type_rule
+}
+use tg_compiler::asm::{
+  CodeBuffer, buf_new, emit32_le, def_label, buf_pos, patch32_le,
+  AsmSymbol, Section, SymBinding, SymKind
+}
+use tg_compiler::target_desc::{TargetDesc, riscv32_desc, riscv64_desc}
+use tg_compiler::codegen::{build_static_label_table}
+
+# ———————————————————————————————————————————————————————————————
+# I-type — opcode 0x13 (register-immediate ALU), 0x03 (loads), 0x67 (jalr)
+# Layout: [31:20] imm12 | [19:15] rs1 | [14:12] funct3 | [11:7] rd |
+#         [6:0] opcode
+# verified-by-hand: addi x1, x2, 100 = 0x06410093; addi x1, x2, -1 =
+# 0xFFF10093; slti x1, x2, 100 = 0x06412093; xori = 0x06414093; ori =
+# 0x06416093; andi = 0x06417093; ld x5, 8(x6) = 0x00833283; lw x5, 8(x6) =
+# 0x00832283; lbu x5, 8(x6) = 0x00834283; jalr x1, 0(x1) = 0x000080E7.
+# ———————————————————————————————————————————————————————————————
+
+# addi rd, rs1, imm — I-type, funct3 = 0, opcode 0x13.
+def rv_addi(rd: Int, rs1: Int, imm: Int) -> u32
+  if rd < 0 || rd > 31 || rs1 < 0 || rs1 > 31 then panic("rv_addi: registers must be x0..x31") end
+  if imm < -2048 || imm > 2047 then panic("rv_addi: imm must fit the signed 12-bit I-immediate") end
+  (((imm & 0xFFF) as u32) << 20) | ((rs1 as u32) << 15) | ((rd as u32) << 7) | 0x13
+end
+
+# slti rd, rs1, imm — I-type, funct3 = 2 (0b010), opcode 0x13.
+# verified-by-hand: 0x13 | imm<<20 | rs1<<15 | 2<<12 | rd<<7.
+def rv_slti(rd: Int, rs1: Int, imm: Int) -> u32
+  if rd < 0 || rd > 31 || rs1 < 0 || rs1 > 31 then panic("rv_slti: registers must be x0..x31") end
+  if imm < -2048 || imm > 2047 then panic("rv_slti: imm must fit the signed 12-bit I-immediate") end
+  (((imm & 0xFFF) as u32) << 20) | ((rs1 as u32) << 15) | ((2 as u32) << 12) | ((rd as u32) << 7) | 0x13
+end
+
+# sltiu rd, rs1, imm — I-type, funct3 = 3 (0b011), opcode 0x13. Slice 3c
+# addition: the LirCset equality is-zero test (sltiu rd, rd, 1 after the
+# equality xor). The 12-bit imm is SIGN-EXTENDED by the machine before
+# the unsigned compare — the imm's 64-bit image equals its unsigned
+# payload for every value in [-2048, 2047], so the form is exact for the
+# full signed I-immediate range.
+# verified-by-hand: sltiu x1, x2, 100 = 0x06413093 (slti x1, x2, 100 =
+# 0x06412093; sltiu swaps the funct3 field from 2 to 3: 0x13 |
+# imm<<20 | rs1<<15 | 3<<12 | rd<<7).
+def rv_sltiu(rd: Int, rs1: Int, imm: Int) -> u32
+  if rd < 0 || rd > 31 || rs1 < 0 || rs1 > 31 then panic("rv_sltiu: registers must be x0..x31") end
+  if imm < -2048 || imm > 2047 then panic("rv_sltiu: imm must fit the signed 12-bit I-immediate") end
+  (((imm & 0xFFF) as u32) << 20) | ((rs1 as u32) << 15) | ((3 as u32) << 12) | ((rd as u32) << 7) | 0x13
+end
+
+# andi rd, rs1, imm — I-type, funct3 = 7 (0b111), opcode 0x13.
+def rv_andi(rd: Int, rs1: Int, imm: Int) -> u32
+  if rd < 0 || rd > 31 || rs1 < 0 || rs1 > 31 then panic("rv_andi: registers must be x0..x31") end
+  if imm < -2048 || imm > 2047 then panic("rv_andi: imm must fit the signed 12-bit I-immediate") end
+  (((imm & 0xFFF) as u32) << 20) | ((rs1 as u32) << 15) | ((7 as u32) << 12) | ((rd as u32) << 7) | 0x13
+end
+
+# ori rd, rs1, imm — I-type, funct3 = 6 (0b110), opcode 0x13.
+def rv_ori(rd: Int, rs1: Int, imm: Int) -> u32
+  if rd < 0 || rd > 31 || rs1 < 0 || rs1 > 31 then panic("rv_ori: registers must be x0..x31") end
+  if imm < -2048 || imm > 2047 then panic("rv_ori: imm must fit the signed 12-bit I-immediate") end
+  (((imm & 0xFFF) as u32) << 20) | ((rs1 as u32) << 15) | ((6 as u32) << 12) | ((rd as u32) << 7) | 0x13
+end
+
+# xori rd, rs1, imm — I-type, funct3 = 4 (0b100), opcode 0x13.
+def rv_xori(rd: Int, rs1: Int, imm: Int) -> u32
+  if rd < 0 || rd > 31 || rs1 < 0 || rs1 > 31 then panic("rv_xori: registers must be x0..x31") end
+  if imm < -2048 || imm > 2047 then panic("rv_xori: imm must fit the signed 12-bit I-immediate") end
+  (((imm & 0xFFF) as u32) << 20) | ((rs1 as u32) << 15) | ((4 as u32) << 12) | ((rd as u32) << 7) | 0x13
+end
+
+# slli rd, rs1, shamt — I-type shift, funct3 = 1, opcode 0x13. RV64 shamt
+# is the 6-bit field imm[5:0] at [24:20]; imm[11:6] = 0 (bits [31:25]).
+# For shamt 0..31 this word IS the RV32I instruction too (its 5-bit
+# shamt field imm[4:0] with the same imm[11:5] = 0), so the pure
+# encoder serves both xlens; the xlen-aware gates (rv_validate_fn, the
+# emission arms) bound RV32 counts to 0..31 — the implemented RV32
+# shamt narrowing (see the header) — while RV64 keeps 0..63.
+# verified-by-hand: slli x1, x2, 3 = 0x00311093 (0x13 | shamt 3<<20 |
+# 0x10000 | 0x1000 | 0x80).
+def rv_slli(rd: Int, rs1: Int, shamt: Int) -> u32
+  if rd < 0 || rd > 31 || rs1 < 0 || rs1 > 31 then panic("rv_slli: registers must be x0..x31") end
+  if shamt < 0 || shamt > 63 then panic("rv_slli: shamt must be 0..63 (the 6-bit shamt field; RV32 counts are gated to 0..31 upstream)") end
+  ((shamt as u32) << 20) | ((rs1 as u32) << 15) | ((1 as u32) << 12) | ((rd as u32) << 7) | 0x13
+end
+
+# srli rd, rs1, shamt — I-type shift, funct3 = 5, opcode 0x13; imm[11:6] =
+# 000000 (bits [31:25] clear). RV64 shamt = imm[5:0] at [24:20]. For
+# shamt 0..31 this word IS the RV32I instruction (see rv_slli); RV32
+# counts are gated to 0..31 upstream (the implemented shamt narrowing).
+# verified-by-hand: srli x1, x2, 3 = 0x00315093.
+def rv_srli(rd: Int, rs1: Int, shamt: Int) -> u32
+  if rd < 0 || rd > 31 || rs1 < 0 || rs1 > 31 then panic("rv_srli: registers must be x0..x31") end
+  if shamt < 0 || shamt > 63 then panic("rv_srli: shamt must be 0..63 (the 6-bit shamt field; RV32 counts are gated to 0..31 upstream)") end
+  ((shamt as u32) << 20) | ((rs1 as u32) << 15) | ((5 as u32) << 12) | ((rd as u32) << 7) | 0x13
+end
+
+# srai rd, rs1, shamt — I-type shift, funct3 = 5, opcode 0x13; imm[11:6] =
+# 010000 (the 12-bit imm carries 0x400, which lands on word bit 30, i.e.
+# the word adds 0x40000000). RV64 shamt = imm[5:0] at [24:20]. For
+# shamt 0..31 this word IS the RV32I instruction (its imm[11:5] =
+# 0100000; see rv_slli); RV32 counts are gated to 0..31 upstream (the
+# implemented shamt narrowing).
+# verified-by-hand: srai x1, x2, 3 = 0x40315093 = 0x00315093 | 0x40000000.
+def rv_srai(rd: Int, rs1: Int, shamt: Int) -> u32
+  if rd < 0 || rd > 31 || rs1 < 0 || rs1 > 31 then panic("rv_srai: registers must be x0..x31") end
+  if shamt < 0 || shamt > 63 then panic("rv_srai: shamt must be 0..63 (the 6-bit shamt field; RV32 counts are gated to 0..31 upstream)") end
+  ((shamt as u32) << 20) | ((rs1 as u32) << 15) | ((5 as u32) << 12) | ((rd as u32) << 7) | 0x40000000 | 0x13
+end
+
+# lw rd, imm(rs1) — I-type load word (sign-extended), opcode 0x03,
+# funct3 = 2 (0b010). imm = the signed 12-bit byte offset.
+def rv_lw(rd: Int, rs1: Int, imm: Int) -> u32
+  if rd < 0 || rd > 31 || rs1 < 0 || rs1 > 31 then panic("rv_lw: registers must be x0..x31") end
+  if imm < -2048 || imm > 2047 then panic("rv_lw: imm must fit the signed 12-bit offset") end
+  (((imm & 0xFFF) as u32) << 20) | ((rs1 as u32) << 15) | ((2 as u32) << 12) | ((rd as u32) << 7) | 0x03
+end
+
+# ld rd, imm(rs1) — I-type load doubleword, opcode 0x03, funct3 = 3
+# (0b011). imm = the signed 12-bit byte offset.
+def rv_ld(rd: Int, rs1: Int, imm: Int) -> u32
+  if rd < 0 || rd > 31 || rs1 < 0 || rs1 > 31 then panic("rv_ld: registers must be x0..x31") end
+  if imm < -2048 || imm > 2047 then panic("rv_ld: imm must fit the signed 12-bit offset") end
+  (((imm & 0xFFF) as u32) << 20) | ((rs1 as u32) << 15) | ((3 as u32) << 12) | ((rd as u32) << 7) | 0x03
+end
+
+# lbu rd, imm(rs1) — I-type load byte unsigned, opcode 0x03, funct3 = 4
+# (0b100). imm = the signed 12-bit byte offset.
+def rv_lbu(rd: Int, rs1: Int, imm: Int) -> u32
+  if rd < 0 || rd > 31 || rs1 < 0 || rs1 > 31 then panic("rv_lbu: registers must be x0..x31") end
+  if imm < -2048 || imm > 2047 then panic("rv_lbu: imm must fit the signed 12-bit offset") end
+  (((imm & 0xFFF) as u32) << 20) | ((rs1 as u32) << 15) | ((4 as u32) << 12) | ((rd as u32) << 7) | 0x03
+end
+
+# jalr rd, rs1, imm — I-type jump-and-link register, funct3 = 0, opcode
+# 0x67. rv_ret is the x0/x1 special case. imm = the signed 12-bit byte
+# offset; the branch target is (rs1 + imm) with bit 0 cleared.
+def rv_jalr(rd: Int, rs1: Int, imm: Int) -> u32
+  if rd < 0 || rd > 31 || rs1 < 0 || rs1 > 31 then panic("rv_jalr: registers must be x0..x31") end
+  if imm < -2048 || imm > 2047 then panic("rv_jalr: imm must fit the signed 12-bit offset") end
+  (((imm & 0xFFF) as u32) << 20) | ((rs1 as u32) << 15) | ((rd as u32) << 7) | 0x67
+end
+
+# ———————————————————————————————————————————————————————————————
+# S-type — opcode 0x23 (stores)
+# Layout: [31:25] imm[11:5] | [24:20] rs2 | [19:15] rs1 | [14:12] funct3 |
+#         [11:7] imm[4:0] | [6:0] opcode
+# verified-by-hand: sw x3, 100(x2) = 0x06312223; sw x3, -4(x2) =
+# 0xFE312E23; sd x3, 100(x2) = 0x06313223; sb x3, 100(x2) = 0x06310223.
+# ———————————————————————————————————————————————————————————————
+
+# sw rs2, imm(rs1) — S-type store word, funct3 = 2 (0b010), opcode 0x23.
+def rv_sw(rs2: Int, rs1: Int, imm: Int) -> u32
+  if rs2 < 0 || rs2 > 31 || rs1 < 0 || rs1 > 31 then panic("rv_sw: registers must be x0..x31") end
+  if imm < -2048 || imm > 2047 then panic("rv_sw: imm must fit the signed 12-bit S-immediate") end
+  let u = (imm & 0xFFF) as u32
+  ((u >> 5) << 25) | ((rs2 as u32) << 20) | ((rs1 as u32) << 15) | ((2 as u32) << 12) | ((u & 0x1F) << 7) | 0x23
+end
+
+# sd rs2, imm(rs1) — S-type store doubleword, funct3 = 3 (0b011),
+# opcode 0x23.
+def rv_sd(rs2: Int, rs1: Int, imm: Int) -> u32
+  if rs2 < 0 || rs2 > 31 || rs1 < 0 || rs1 > 31 then panic("rv_sd: registers must be x0..x31") end
+  if imm < -2048 || imm > 2047 then panic("rv_sd: imm must fit the signed 12-bit S-immediate") end
+  let u = (imm & 0xFFF) as u32
+  ((u >> 5) << 25) | ((rs2 as u32) << 20) | ((rs1 as u32) << 15) | ((3 as u32) << 12) | ((u & 0x1F) << 7) | 0x23
+end
+
+# sb rs2, imm(rs1) — S-type store byte, funct3 = 0 (0b000), opcode 0x23.
+def rv_sb(rs2: Int, rs1: Int, imm: Int) -> u32
+  if rs2 < 0 || rs2 > 31 || rs1 < 0 || rs1 > 31 then panic("rv_sb: registers must be x0..x31") end
+  if imm < -2048 || imm > 2047 then panic("rv_sb: imm must fit the signed 12-bit S-immediate") end
+  let u = (imm & 0xFFF) as u32
+  ((u >> 5) << 25) | ((rs2 as u32) << 20) | ((rs1 as u32) << 15) | ((u & 0x1F) << 7) | 0x23
+end
+
+# ———————————————————————————————————————————————————————————————
+# R-type — opcode 0x33 (register-register ALU; MUL is RV64M)
+# Layout: [31:25] funct7 | [24:20] rs2 | [19:15] rs1 | [14:12] funct3 |
+#         [11:7] rd | [6:0] opcode
+# verified-by-hand: add x1, x2, x3 = 0x003100B3; sub = 0x403100B3;
+# mul = 0x023100B3; and = 0x003170B3; or = 0x003160B3; xor = 0x003140B3;
+# sll = 0x003110B3; srl = 0x003150B3; sra = 0x403150B3; slt = 0x003120B3;
+# sltu = 0x003130B3.
+# ———————————————————————————————————————————————————————————————
+
+# add rd, rs1, rs2 — R-type, funct7 = 0x00, funct3 = 0, opcode 0x33.
+def rv_add(rd: Int, rs1: Int, rs2: Int) -> u32
+  if rd < 0 || rd > 31 || rs1 < 0 || rs1 > 31 || rs2 < 0 || rs2 > 31 then panic("rv_add: registers must be x0..x31") end
+  ((rs2 as u32) << 20) | ((rs1 as u32) << 15) | ((rd as u32) << 7) | 0x33
+end
+
+# sub rd, rs1, rs2 — R-type, funct7 = 0x20, funct3 = 0, opcode 0x33
+# (funct7 0x20 at [31:25] = 0x40000000).
+def rv_sub(rd: Int, rs1: Int, rs2: Int) -> u32
+  if rd < 0 || rd > 31 || rs1 < 0 || rs1 > 31 || rs2 < 0 || rs2 > 31 then panic("rv_sub: registers must be x0..x31") end
+  ((0x20 as u32) << 25) | ((rs2 as u32) << 20) | ((rs1 as u32) << 15) | ((rd as u32) << 7) | 0x33
+end
+
+# mul rd, rs1, rs2 — R-type (RV64M), funct7 = 0x01, funct3 = 0, opcode
+# 0x33 (funct7 0x01 at [31:25] = 0x02000000).
+def rv_mul(rd: Int, rs1: Int, rs2: Int) -> u32
+  if rd < 0 || rd > 31 || rs1 < 0 || rs1 > 31 || rs2 < 0 || rs2 > 31 then panic("rv_mul: registers must be x0..x31") end
+  ((0x01 as u32) << 25) | ((rs2 as u32) << 20) | ((rs1 as u32) << 15) | ((rd as u32) << 7) | 0x33
+end
+
+# and rd, rs1, rs2 — R-type, funct7 = 0x00, funct3 = 7 (0b111), 0x33.
+def rv_and(rd: Int, rs1: Int, rs2: Int) -> u32
+  if rd < 0 || rd > 31 || rs1 < 0 || rs1 > 31 || rs2 < 0 || rs2 > 31 then panic("rv_and: registers must be x0..x31") end
+  ((rs2 as u32) << 20) | ((rs1 as u32) << 15) | ((7 as u32) << 12) | ((rd as u32) << 7) | 0x33
+end
+
+# or rd, rs1, rs2 — R-type, funct7 = 0x00, funct3 = 6 (0b110), 0x33.
+def rv_or(rd: Int, rs1: Int, rs2: Int) -> u32
+  if rd < 0 || rd > 31 || rs1 < 0 || rs1 > 31 || rs2 < 0 || rs2 > 31 then panic("rv_or: registers must be x0..x31") end
+  ((rs2 as u32) << 20) | ((rs1 as u32) << 15) | ((6 as u32) << 12) | ((rd as u32) << 7) | 0x33
+end
+
+# xor rd, rs1, rs2 — R-type, funct7 = 0x00, funct3 = 4 (0b100), 0x33.
+def rv_xor(rd: Int, rs1: Int, rs2: Int) -> u32
+  if rd < 0 || rd > 31 || rs1 < 0 || rs1 > 31 || rs2 < 0 || rs2 > 31 then panic("rv_xor: registers must be x0..x31") end
+  ((rs2 as u32) << 20) | ((rs1 as u32) << 15) | ((4 as u32) << 12) | ((rd as u32) << 7) | 0x33
+end
+
+# sll rd, rs1, rs2 — R-type shift-left-logical by register, funct7 = 0x00,
+# funct3 = 1 (0b001), opcode 0x33.
+def rv_sll(rd: Int, rs1: Int, rs2: Int) -> u32
+  if rd < 0 || rd > 31 || rs1 < 0 || rs1 > 31 || rs2 < 0 || rs2 > 31 then panic("rv_sll: registers must be x0..x31") end
+  ((rs2 as u32) << 20) | ((rs1 as u32) << 15) | ((1 as u32) << 12) | ((rd as u32) << 7) | 0x33
+end
+
+# srl rd, rs1, rs2 — R-type shift-right-logical by register, funct7 = 0x00,
+# funct3 = 5 (0b101), opcode 0x33.
+def rv_srl(rd: Int, rs1: Int, rs2: Int) -> u32
+  if rd < 0 || rd > 31 || rs1 < 0 || rs1 > 31 || rs2 < 0 || rs2 > 31 then panic("rv_srl: registers must be x0..x31") end
+  ((rs2 as u32) << 20) | ((rs1 as u32) << 15) | ((5 as u32) << 12) | ((rd as u32) << 7) | 0x33
+end
+
+# sra rd, rs1, rs2 — R-type shift-right-arithmetic by register, funct7 =
+# 0x20, funct3 = 5 (0b101), opcode 0x33 (funct7 0x20 = 0x40000000).
+def rv_sra(rd: Int, rs1: Int, rs2: Int) -> u32
+  if rd < 0 || rd > 31 || rs1 < 0 || rs1 > 31 || rs2 < 0 || rs2 > 31 then panic("rv_sra: registers must be x0..x31") end
+  ((0x20 as u32) << 25) | ((rs2 as u32) << 20) | ((rs1 as u32) << 15) | ((5 as u32) << 12) | ((rd as u32) << 7) | 0x33
+end
+
+# slt rd, rs1, rs2 — R-type set-less-than (signed), funct7 = 0x00,
+# funct3 = 2 (0b010), opcode 0x33.
+def rv_slt(rd: Int, rs1: Int, rs2: Int) -> u32
+  if rd < 0 || rd > 31 || rs1 < 0 || rs1 > 31 || rs2 < 0 || rs2 > 31 then panic("rv_slt: registers must be x0..x31") end
+  ((rs2 as u32) << 20) | ((rs1 as u32) << 15) | ((2 as u32) << 12) | ((rd as u32) << 7) | 0x33
+end
+
+# sltu rd, rs1, rs2 — R-type set-less-than (unsigned), funct7 = 0x00,
+# funct3 = 3 (0b011), opcode 0x33.
+def rv_sltu(rd: Int, rs1: Int, rs2: Int) -> u32
+  if rd < 0 || rd > 31 || rs1 < 0 || rs1 > 31 || rs2 < 0 || rs2 > 31 then panic("rv_sltu: registers must be x0..x31") end
+  ((rs2 as u32) << 20) | ((rs1 as u32) << 15) | ((3 as u32) << 12) | ((rd as u32) << 7) | 0x33
+end
+
+# ———————————————————————————————————————————————————————————————
+# B-type — opcode 0x63 (conditional branches)
+# Layout: [31] imm[12] | [30:25] imm[10:5] | [24:20] rs2 | [19:15] rs1 |
+#         [14:12] funct3 | [11:8] imm[4:1] | [7] imm[11] | [6:0] 0x63
+# rel is the PC-relative BYTE offset of the branch target (imm bit 0 is
+# implied 0): even, in [-4096, 4094]. The 12 encoded bits imm[12:1] are
+# (rel >> 1) & 0xFFF.
+# verified-by-hand: beq x1, x2, 8 = 0x00208463; bne = 0x00209463;
+# blt = 0x0020C463; bge = 0x0020D463; bltu = 0x0020E463; bgeu =
+# 0x0020F463; beq x1, x2, -4 = 0xFE208EE3 (rel -4: imm[12] = 1 sets bit
+# 31, imm[11] = 1 sets bit 7).
+# ———————————————————————————————————————————————————————————————
+
+# beq rs1, rs2, rel — B-type, funct3 = 0 (0b000), opcode 0x63.
+def rv_beq(rs1: Int, rs2: Int, rel: Int) -> u32
+  if rs1 < 0 || rs1 > 31 || rs2 < 0 || rs2 > 31 then panic("rv_beq: registers must be x0..x31") end
+  if rel < -4096 || rel > 4094 || (rel % 2) != 0 then panic("rv_beq: rel must be even and in -4096..4094 bytes") end
+  let u = ((rel >> 1) & 0xFFF) as u32
+  (((u >> 11) & 1) << 31) | (((u >> 5) & 0x3F) << 25) | ((rs2 as u32) << 20) | ((rs1 as u32) << 15) | ((u & 0xF) << 8) | (((u >> 10) & 1) << 7) | 0x63
+end
+
+# bne rs1, rs2, rel — B-type, funct3 = 1 (0b001), opcode 0x63.
+def rv_bne(rs1: Int, rs2: Int, rel: Int) -> u32
+  if rs1 < 0 || rs1 > 31 || rs2 < 0 || rs2 > 31 then panic("rv_bne: registers must be x0..x31") end
+  if rel < -4096 || rel > 4094 || (rel % 2) != 0 then panic("rv_bne: rel must be even and in -4096..4094 bytes") end
+  let u = ((rel >> 1) & 0xFFF) as u32
+  (((u >> 11) & 1) << 31) | (((u >> 5) & 0x3F) << 25) | ((rs2 as u32) << 20) | ((rs1 as u32) << 15) | ((1 as u32) << 12) | ((u & 0xF) << 8) | (((u >> 10) & 1) << 7) | 0x63
+end
+
+# blt rs1, rs2, rel — B-type, funct3 = 4 (0b100), opcode 0x63.
+def rv_blt(rs1: Int, rs2: Int, rel: Int) -> u32
+  if rs1 < 0 || rs1 > 31 || rs2 < 0 || rs2 > 31 then panic("rv_blt: registers must be x0..x31") end
+  if rel < -4096 || rel > 4094 || (rel % 2) != 0 then panic("rv_blt: rel must be even and in -4096..4094 bytes") end
+  let u = ((rel >> 1) & 0xFFF) as u32
+  (((u >> 11) & 1) << 31) | (((u >> 5) & 0x3F) << 25) | ((rs2 as u32) << 20) | ((rs1 as u32) << 15) | ((4 as u32) << 12) | ((u & 0xF) << 8) | (((u >> 10) & 1) << 7) | 0x63
+end
+
+# bge rs1, rs2, rel — B-type, funct3 = 5 (0b101), opcode 0x63.
+def rv_bge(rs1: Int, rs2: Int, rel: Int) -> u32
+  if rs1 < 0 || rs1 > 31 || rs2 < 0 || rs2 > 31 then panic("rv_bge: registers must be x0..x31") end
+  if rel < -4096 || rel > 4094 || (rel % 2) != 0 then panic("rv_bge: rel must be even and in -4096..4094 bytes") end
+  let u = ((rel >> 1) & 0xFFF) as u32
+  (((u >> 11) & 1) << 31) | (((u >> 5) & 0x3F) << 25) | ((rs2 as u32) << 20) | ((rs1 as u32) << 15) | ((5 as u32) << 12) | ((u & 0xF) << 8) | (((u >> 10) & 1) << 7) | 0x63
+end
+
+# bltu rs1, rs2, rel — B-type, funct3 = 6 (0b110), opcode 0x63.
+def rv_bltu(rs1: Int, rs2: Int, rel: Int) -> u32
+  if rs1 < 0 || rs1 > 31 || rs2 < 0 || rs2 > 31 then panic("rv_bltu: registers must be x0..x31") end
+  if rel < -4096 || rel > 4094 || (rel % 2) != 0 then panic("rv_bltu: rel must be even and in -4096..4094 bytes") end
+  let u = ((rel >> 1) & 0xFFF) as u32
+  (((u >> 11) & 1) << 31) | (((u >> 5) & 0x3F) << 25) | ((rs2 as u32) << 20) | ((rs1 as u32) << 15) | ((6 as u32) << 12) | ((u & 0xF) << 8) | (((u >> 10) & 1) << 7) | 0x63
+end
+
+# bgeu rs1, rs2, rel — B-type, funct3 = 7 (0b111), opcode 0x63.
+def rv_bgeu(rs1: Int, rs2: Int, rel: Int) -> u32
+  if rs1 < 0 || rs1 > 31 || rs2 < 0 || rs2 > 31 then panic("rv_bgeu: registers must be x0..x31") end
+  if rel < -4096 || rel > 4094 || (rel % 2) != 0 then panic("rv_bgeu: rel must be even and in -4096..4094 bytes") end
+  let u = ((rel >> 1) & 0xFFF) as u32
+  (((u >> 11) & 1) << 31) | (((u >> 5) & 0x3F) << 25) | ((rs2 as u32) << 20) | ((rs1 as u32) << 15) | ((7 as u32) << 12) | ((u & 0xF) << 8) | (((u >> 10) & 1) << 7) | 0x63
+end
+
+# ———————————————————————————————————————————————————————————————
+# U-type and J-type — opcode 0x37 (lui), 0x17 (auipc), 0x6F (jal)
+# U-type layout: [31:12] imm20 | [11:7] rd | [6:0] opcode
+# J-type layout: [31] imm[20] | [30:21] imm[10:1] | [20] imm[11] |
+#                [19:12] imm[19:12] | [11:7] rd | [6:0] 0x6F
+# verified-by-hand: lui x1, 0x54321 = 0x543210B7; lui x1, -1 =
+# 0xFFFFF0B7; auipc x1, 0x54321 = 0x54321097; jal x1, 8 = 0x008000EF;
+# jal x0, 8 = 0x0080006F; jal x1, -8 = 0xFF9FF0EF (rel -8: imm[20] = 1
+# sets bit 31, imm[11] = 1 sets bit 20).
+# ———————————————————————————————————————————————————————————————
+
+# lui rd, imm20 — U-type, opcode 0x37. imm is the signed 20-bit field
+# value placed at [31:12] (the machine sign-extends it): [-524288, 524287]
+# = [-2^19, 2^19-1]. A value of -524288 encodes -2^31 after
+# sign-extension.
+def rv_lui(rd: Int, imm: Int) -> u32
+  if rd < 0 || rd > 31 then panic("rv_lui: rd must be x0..x31") end
+  if imm < -524288 || imm > 524287 then panic("rv_lui: imm must fit the signed 20-bit U-immediate") end
+  (((imm & 0xFFFFF) as u32) << 12) | ((rd as u32) << 7) | 0x37
+end
+
+# auipc rd, imm20 — U-type, opcode 0x17. imm is the signed 20-bit field
+# value at [31:12]; the result is the PC + (imm << 12).
+def rv_auipc(rd: Int, imm: Int) -> u32
+  if rd < 0 || rd > 31 then panic("rv_auipc: rd must be x0..x31") end
+  if imm < -524288 || imm > 524287 then panic("rv_auipc: imm must fit the signed 20-bit U-immediate") end
+  (((imm & 0xFFFFF) as u32) << 12) | ((rd as u32) << 7) | 0x17
+end
+
+# jal rd, rel — J-type, opcode 0x6F. rel is the PC-relative BYTE offset
+# (imm bit 0 implied 0): even, in [-1048576, 1048574]. The 20 encoded bits
+# imm[20:1] are (rel >> 1) & 0xFFFFF.
+def rv_jal(rd: Int, rel: Int) -> u32
+  if rd < 0 || rd > 31 then panic("rv_jal: rd must be x0..x31") end
+  if rel < -1048576 || rel > 1048574 || (rel % 2) != 0 then panic("rv_jal: rel must be even and in -1048576..1048574 bytes") end
+  let u = ((rel >> 1) & 0xFFFFF) as u32
+  (((u >> 19) & 1) << 31) | ((u & 0x3FF) << 21) | (((u >> 10) & 1) << 20) | (((u >> 11) & 0xFF) << 12) | ((rd as u32) << 7) | 0x6F
+end
+
+# ———————————————————————————————————————————————————————————————
+# Convenience encodings
+# verified-by-hand: ret = 0x00008067; nop = 0x00000013; ebreak =
+# 0x00100073; ecall = 0x00000073; mv x1, x2 = 0x00010093; li x1, 100
+# (single addi x1, x0, 100) = 0x06400093; li x1, 0x12345678 (lui+addi
+# pair) = (0x123450B7, 0x67808093); li x1, -100000 =
+# (0xFFFE80B7, 0x96008093).
+# ———————————————————————————————————————————————————————————————
+
+# ret — jalr x0, x1 (ra), 0.
+def rv_ret() -> u32
+  0x00008067
+end
+
+# nop — addi x0, x0, 0.
+def rv_nop() -> u32
+  0x00000013
+end
+
+# mv rd, rs — addi rd, rs, 0 (register move; the machine's addi copies the
+# sign-extended 12-bit immediate 0, i.e. rs, into rd).
+def rv_mv(rd: Int, rs: Int) -> u32
+  rv_addi(rd, rs, 0)
+end
+
+# li rd, imm — materialize a constant in rd. Returns the instruction pair
+# to emit in order (word1, word2). A signed 12-bit imm [-2048, 2047] is a
+# SINGLE addi rd, x0, imm and word2 is 0x00000000 (an illegal all-zero
+# encoding — never a real instruction — so the caller emits ONE word when
+# word2 == 0). Any other imm in the RV64 lui+addi range [-2^31,
+# 2^31 - 2049] is lui rd, hi + addi rd, rd, lo with
+# hi = (imm + 0x800) >> 12 and lo = imm - (hi << 12) (lo lands in
+# [-2048, 2047] by construction). Everything else (values whose
+# sign-extended 32-bit image cannot hold them, e.g. 0x7FFFF800..0x7FFFFFFF
+# and any full-64-bit constant) panics: full 64-bit materialization
+# (shift sequences) is a later slice.
+def rv_li(rd: Int, imm: Int) -> (u32, u32)
+  if imm >= -2048 && imm <= 2047 then
+    return (rv_addi(rd, 0, imm), 0)
+  end
+  let hi = (imm + 0x800) >> 12
+  if hi < -524288 || hi > 524287 then
+    panic("rv_li: imm is outside the RV64 lui+addi range [-2^31, 2^31 - 2049]; full 64-bit materialization is a later slice")
+  end
+  let lo = imm - (hi << 12)
+  (rv_lui(rd, hi), rv_addi(rd, rd, lo))
+end
+
+# ebreak — environment breakpoint (system opcode 0x73, imm 0x001).
+def rv_ebreak() -> u32
+  0x00100073
+end
+
+# ecall — environment call (system opcode 0x73, imm 0x000).
+def rv_ecall() -> u32
+  0x00000073
+end
+
+# ———————————————————————————————————————————————————————————————
+# Register map for the future emitter (slice 3b data)
+# ———————————————————————————————————————————————————————————————
+# RISC-V psABI x-numbers. LIR (lir.tg) precolors vregs 0..7 as aarch64's
+# x0..x7 argument set; here fixed LIR vreg i is a_i = x(10+i) (a0..a7),
+# so vreg 0 (the LIR return register) is a0 = x10.
+
+# The x-number of the ABI register of fixed LIR vreg i: x(10+i).
+def rv_fixed_phys(i: Int) -> Int
+  10 + i
+end
+
+# psABI fixed roles: fp_reg = s0 = x8 (frame pointer); ra_reg = x1
+# (return address); sp_reg = x2 (stack pointer, in no saved list).
+def rv_fp_reg() -> Int = 8
+def rv_ra_reg() -> Int = 1
+def rv_sp_reg() -> Int = 2
+
+# temp regs — t0 = x5, t1 = x6: caller-saved scratch for the emitter.
+def rv_t0_reg() -> Int = 5
+def rv_t1_reg() -> Int = 6
+
+# callee_saved — the psABI s0..s11 x-numbers (x8, x9, x18..x27): a
+# callee preserves them. The allocator pool excludes s0/fp, thumb-style.
+def rv_callee_saved_regs() -> Vec[Int]
+  Vec::from([8, 9, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27])
+end
+
+# caller_saved — psABI ra/t0..t6/a0..a7 x-numbers (x1, x5..x7, x10..x17,
+# x28..x31): a call may clobber them. gp/tp/sp (x3/x4/x2) are in no list.
+def rv_caller_saved_regs() -> Vec[Int]
+  Vec::from([1, 5, 6, 7, 10, 11, 12, 13, 14, 15, 16, 17, 28, 29, 30, 31])
+end
+
+# ———————————————————————————————————————————————————————————————
+# Target-desc accessor (slice 3b)
+# ———————————————————————————————————————————————————————————————
+# The canonical RISC-V description for a pointer width: xlen in BYTES —
+# 8 -> riscv64_desc(), 4 -> riscv32_desc(); anything else panics (the
+# lir_target_desc / thumb_target_desc mirrors).
+def rv_target_desc(xlen: Int) -> TargetDesc
+  if xlen == 8 then
+    return riscv64_desc()
+  end
+  if xlen == 4 then
+    return riscv32_desc()
+  end
+  panic("rv_target_desc: xlen must be 4 or 8 bytes (got " + xlen.to_string() + ")")
+end
+
+# ———————————————————————————————————————————————————————————————
+# Whole-function shape validation (fail-closed, before any emission)
+# ———————————————————————————————————————————————————————————————
+# Mirrors thumb_validate_fn (backend_thumb.tg): every construct this
+# backend cannot compile names its rule in the Err. Runs once per
+# function, before rv_emit_fn touches the buffer. `xlen` (bytes, 4 or
+# 8 — rv_emit_fn checks it first) drives the shift-count gates: the
+# route's shamt field is the RV64 6-bit 0..63 on xlen 8 and the RV32
+# 5-bit 0..31 on xlen 4 — the implemented RV32 shamt narrowing below —
+# and RV32 additionally rejects register-form shift counts, whose
+# 5-bit machine masking no static check can reconcile with the 64-bit
+# LIR shift semantics.
+
+# An immediate payload rv_li can materialize: the signed-32-bit lui+addi
+# range [-2^31, 2^31 - 2049] (see rv_li); wider is a later slice.
+def rv_imm_li_ok(imm: Int) -> Bool
+  imm >= -2147483648 && imm <= 2147481599
+end
+
+# The LIR shift ops — the binops whose RIGHT operand is a shift count,
+# the only binops with an xlen-aware acceptance here.
+def rv_shift_op(op: LirBinOp) -> Bool
+  match op
+  when LirBinOp::LirShl then true
+  when LirBinOp::LirLsr then true
+  when LirBinOp::LirAsr then true
+  when _ then false
+  end
+end
+
+# The implemented RV32 shamt narrowing — the immediate shift counts the
+# route accepts: xlen 8 keeps the 6-bit field 0..63 (RV64, unchanged);
+# xlen 4 narrows to the 5-bit field 0..31. A count 32..63 has NO RV32
+# encoding: the RV64-format word carries the 6-bit shamt's bit 5 on
+# word bit 25, which RV32 decodes as a reserved funct7/funct6 pattern
+# (never an RV32 instruction), so those counts fail closed at every
+# xlen-aware gate — never a silently emitted illegal word. Anything
+# other than xlen 4/8 fails closed too (never treated as 64-bit by
+# default).
+def rv_shamt_imm_ok(xlen: Int, count: Int) -> Bool
+  if xlen == 8 then
+    count >= 0 && count <= 63
+  elsif xlen == 4 then
+    count >= 0 && count <= 31
+  else
+    false
+  end
+end
+
+# The defensive-panic reason for an immediate shift count that reached
+# emission outside the route's field (xlen 8: the 6-bit 0..63 field,
+# the unchanged RV64 text; xlen 4: the implemented 5-bit 0..31
+# narrowing). rv_validate_fn rejects both cases before emission, so a
+# panic here means a gate break — never a silently wrong shamt word.
+def rv_shamt_imm_panic(xlen: Int, count: Int) -> String
+  if xlen == 4 then
+    "rv: RV32 (xlen 4) immediate shift count " + count.to_string() + " is outside the 5-bit shamt field 0..31 — rv_validate_fn rejects it before emission (fail-closed)"
+  else
+    "rv: immediate shift count " + count.to_string() + " is outside 0..63 — rv_validate_fn rejects it (fail-closed)"
+  end
+end
+
+def rv_validate_fn(f: LirFunction, xlen: Int) -> Result[Unit, String]
+  if f.params.len() > 8 then
+    return Result::Err("rv: stack args beyond a0-a7 not implemented")
+  end
+  var bi = 0
+  while bi < f.blocks.len() do
+    let block = f.blocks[bi]
+    var si = 0
+    while si < block.stmts.len() do
+      let stmt = block.stmts[si]
+      match stmt.kind
+      when LirStmtKind::LirMove(_, val) then
+        match val
+        when LirValue::LirReg(_) then ()
+        when LirValue::LirImm(imm) then
+          if !rv_imm_li_ok(imm) then
+            return Result::Err("rv: " + f.name + ": constant " + imm.to_string() + " is outside the rv_li range [-2^31, 2^31 - 2049] (full-width materialization is a later slice)")
+          end
+        end
+      when LirStmtKind::LirBinop(op, _, left, right) then
+        match left
+        when LirValue::LirReg(_) then ()
+        when LirValue::LirImm(_) then
+          return Result::Err("rv: " + f.name + ": binop left operand is an immediate — lowering never produces this (fail-closed)")
+        end
+        match right
+        when LirValue::LirReg(_) then
+          if xlen == 4 && rv_shift_op(op) then
+            return Result::Err("rv: " + f.name + ": register-form shift counts do not lower on RV32 (xlen 4) — the RV32 machine masks the count register to 5 bits (count mod 32), a silently different result from the 64-bit LIR shift semantics for every count >= 32, which no static check can exclude; only immediate counts 0..31 in the 5-bit shamt field lower (the RV32 64-bit shift lowering with hi/lo words is a later slice; fail-closed)")
+          end
+        when LirValue::LirImm(imm) then
+          if rv_shift_op(op) then
+            if xlen == 4 then
+              if imm < 0 || imm > 31 then
+                return Result::Err("rv: " + f.name + ": RV32 (xlen 4) shift count " + imm.to_string() + " is outside the 5-bit shamt field 0..31 — the 6-bit counts 32..63 have no RV32 encoding and no 64-bit shift rule (the RV32 64-bit shift lowering with hi/lo words is a later slice; fail-closed)")
+              end
+            else
+              if imm < 0 || imm > 63 then
+                return Result::Err("rv: " + f.name + ": shift count " + imm.to_string() + " is outside 0..63 (the RISC-V 6-bit shamt field)")
+              end
+            end
+          elsif !rv_imm_li_ok(imm) then
+            return Result::Err("rv: " + f.name + ": binop constant " + imm.to_string() + " is outside the rv_li range [-2^31, 2^31 - 2049] (full-width materialization is a later slice)")
+          end
+        end
+      when LirStmtKind::LirUnop(_, _, _) then ()
+      when LirStmtKind::LirCmp(left, right) then
+        match left
+        when LirValue::LirReg(_) then ()
+        when LirValue::LirImm(_) then
+          return Result::Err("rv: " + f.name + ": compare left operand is an immediate — lowering never produces this (fail-closed)")
+        end
+        match right
+        when LirValue::LirReg(_) then ()
+        when LirValue::LirImm(imm) then
+          if !rv_imm_li_ok(imm) then
+            return Result::Err("rv: " + f.name + ": compare constant " + imm.to_string() + " is outside the rv_li range [-2^31, 2^31 - 2049] (full-width materialization is a later slice)")
+          end
+        end
+      when LirStmtKind::LirCset(_, _) then ()
+      when LirStmtKind::LirStaticLoad(dst, sym) then
+        # A static-value load (a whole-program static reference — the
+        # LirStaticLoad of lir.tg's MirStaticRef lowering): the
+        # xlen-wide word at the static's .data symbol. The destination
+        # is an ordinary vreg (the shared lowering materializes loads
+        # into fresh vregs or the destination local's vreg — never a
+        # fixed ABI register), and the symbol must be the emission name
+        # of a program static (recorded by the route's data emission
+        # before function lowering).
+        if dst < lir_first_alloc_vreg() then
+          return Result::Err("rv: " + f.name + ": static-value load into fixed vreg " + dst.to_string() + " does not lower (static loads define ordinary vregs only — fail-closed)")
+        end
+        if sym.len() == 0 then
+          return Result::Err("rv: " + f.name + ": static-value load carries an empty symbol name (the shared lowering resolves static references to emission names — a lowering divergence; fail-closed)")
+        end
+      when LirStmtKind::LirLoadFrame(_, off) then
+        return Result::Err("rv: " + f.name + ": stack-parameter loads (LirLoadFrame at [FP+" + off.to_string() + "]) do not lower — stack args beyond a0-a7 are not implemented")
+      when LirStmtKind::LirPushArg(_) then
+        return Result::Err("rv: " + f.name + ": caller stack-argument pushes (LirPushArg) do not lower — stack args beyond a0-a7 are not implemented")
+      when LirStmtKind::LirFMove(_, _) then
+        return Result::Err("rv: " + f.name + ": float statements do not lower on the riscv route (its shape gate keeps the word-only accept set; the float slice is an aarch64-route rule — fail-closed)")
+      when LirStmtKind::LirFBinop(_, _, _, _, _) then
+        return Result::Err("rv: " + f.name + ": float statements do not lower on the riscv route (its shape gate keeps the word-only accept set; the float slice is an aarch64-route rule — fail-closed)")
+      when LirStmtKind::LirFNeg(_, _, _) then
+        return Result::Err("rv: " + f.name + ": float statements do not lower on the riscv route (its shape gate keeps the word-only accept set; the float slice is an aarch64-route rule — fail-closed)")
+      when LirStmtKind::LirFCmp(_, _, _) then
+        return Result::Err("rv: " + f.name + ": float statements do not lower on the riscv route (its shape gate keeps the word-only accept set; the float slice is an aarch64-route rule — fail-closed)")
+      when LirStmtKind::LirFConst(_, _, _) then
+        return Result::Err("rv: " + f.name + ": float statements do not lower on the riscv route (its shape gate keeps the word-only accept set; the float slice is an aarch64-route rule — fail-closed)")
+      when LirStmtKind::LirIntToFloat(_, _, _, _) then
+        return Result::Err("rv: " + f.name + ": float statements do not lower on the riscv route (its shape gate keeps the word-only accept set; the float slice is an aarch64-route rule — fail-closed)")
+      when LirStmtKind::LirFloatToInt(_, _, _) then
+        return Result::Err("rv: " + f.name + ": float statements do not lower on the riscv route (its shape gate keeps the word-only accept set; the float slice is an aarch64-route rule — fail-closed)")
+      when LirStmtKind::LirFcvt(_, _, _) then
+        return Result::Err("rv: " + f.name + ": float statements do not lower on the riscv route (its shape gate keeps the word-only accept set; the float slice is an aarch64-route rule — fail-closed)")
+      end
+      si = si + 1
+    end
+    match block.term.kind
+    when LirTermKind::LirSwitch(_, arms, _) then
+      # Switch arm values materialize through rv_emit_li at the term —
+      # the same immediate-range rule as the move/binop/cmp checks above.
+      var ai = 0
+      while ai < arms.len() do
+        if !rv_imm_li_ok(arms[ai].value) then
+          return Result::Err("rv: " + f.name + ": switch arm value " + arms[ai].value.to_string() + " is outside the rv_li range [-2^31, 2^31 - 2049] (full-width materialization is a later slice)")
+        end
+        ai = ai + 1
+      end
+    when LirTermKind::LirCall(target, args, stack_args, _, _) then
+      if args.len() > 8 then
+        return Result::Err("rv: stack args beyond a0-a7 not implemented")
+      end
+      if stack_args != 0 then
+        return Result::Err("rv: " + f.name + ": call to `" + target + "` pushes caller stack slots — stack args beyond a0-a7 are not implemented")
+      end
+    when _ then ()
+    end
+    bi = bi + 1
+  end
+  Result::Ok(())
+end
+
+# ———————————————————————————————————————————————————————————————
+# The statement emitter (slice 3c)
+# ———————————————————————————————————————————————————————————————
+# The 3a encoders are PURE word-returning defs (one u32 each; rv_li a
+# pair), so every emitter def below writes through rv_emit_word into a
+# CodeBuffer little-endian (emit32_le). Structure mirrors
+# backend_thumb.tg's statement emitter (thumb_def_target /
+# thumb_emit_use / thumb_slot_access / thumb_emit_stmt) def-for-def.
+#
+# RISC-V specifics carried over from the aarch64/thumb LIR slice:
+#   - NO FLAGS: a LirCmp cannot lower to a compare instruction — the
+#     condition is only known when the LirCset arrives. The Cmp arm
+#     resolves both operands into registers AT THE CMP'S POSITION
+#     (reload/spill decisions are position-keyed — invariants I2/I3)
+#     and records them in the RvEmit state; the LirCset — adjacent by
+#     construction (lir_lower_cmp appends the pair back-to-back and
+#     neither the peephole nor the allocator inserts between them) —
+#     emits the actual set sequences (documented per LirCond on the
+#     Cset arm). The rv_emit_fn driver (slice 4) resets the pending
+#     record at every block boundary; lowering never leaves one pending.
+#   - SPILL SLOTS are at POSITIVE [s0 + xlen*slot] offsets (the thumb
+#     convention; aarch64's negative [FP-8-8k] is not used here): ld/sd
+#     on xlen 8, lw/sw on xlen 4.
+#   - Fixed (precolored) LIR vregs 0..7 are a0..a7 = x10..x17
+#     (rv_fixed_phys), so call-argument moves and return traffic land on
+#     the psABI argument registers. The allocator's pool ids 9..14 map
+#     through `mdl_pool` (the desc-driven callee-saved vector the
+#     function driver builds — rv_mdl_pool, slice 4).
+#   - The emitter's statement-local temps are t0 = x5 and t1 = x6
+#     (rv_t0_reg / rv_t1_reg): both sit outside the fixed vregs and the
+#     pool, mirroring the thumb r12/r3 discipline. RISC-V ALU/load/store
+#     forms write no flags, so invariant I1 is vacuous here.
+#   - Word model: xlen 8 is exactly the LIR 64-bit semantics; xlen 4 is
+#     the desc's ILP32 model — shifts narrow to the RV32 5-bit shamt:
+#     immediate counts 0..31 lower (their encodings coincide with the
+#     RV64 forms), and every shift the 32-bit machine cannot honor
+#     (immediate counts 32..63, register-form counts) fails closed with
+#     a rule-naming Err (see the header's remaining-rules list and the
+#     shift arms' notes).
+# LirLoadFrame / LirPushArg Err naming the rule (rv_validate_fn already
+# rejected them — defense in depth, never a silent emission).
+#
+# Terminators, prologue/epilogue and the per-function driver land in
+# slice 4 below (rv_emit_term / rv_emit_prologue / rv_emit_epilogue /
+# rv_emit_fn); slice 3d (below) adds the whole-program route and the RV
+# ELF writer. Nothing in THIS section emits a label, a symbol, a branch
+# or a frame.
+
+# A deferred branch/call patch (slice 4): the 4 bytes at `offset` hold a
+# jal with a rel of 0; resolution rewrites them for the final offset once
+# every label of the program's text buffer is defined. Mirrors thumb's
+# ThumbPatch — a RISC-V jal carries its full 20-bit rel in ONE word, so
+# resolution recomputes the whole word (rv_jal) and writes it back
+# little-endian.
+struct RvPatch
+  offset: Int       # byte offset of the jal instruction in the buffer
+  label: String     # the target label (a block label, or a function
+                    # label — the target function of a program call)
+  is_call: Bool     # true: jal ra (the link register); false: jal x0
+end
+
+# A deferred remote-call site (slice 3d): the `jal ra, 0` at `offset` is
+# resolved by the LINKER through an R_RISCV_JAL relocation against `sym`
+# (an undefined extern symbol in the object — the RISC-V mirror of
+# thumb's R_ARM_THM_CALL extern records). The record's `kind` carries
+# the ELF RISC-V relocation type: 17 (R_RISCV_JAL) for remote calls, 26
+# (R_RISCV_HI20) / 27 (R_RISCV_LO12_I) for the LUI/ADDI absolute-
+# address pairs of static references (LirStaticLoad). The route never
+# patches these in-object: the instruction imm fields are 0 and the
+# RELA addend is 0, so the linker computes S - P (JAL) or the HI20/LO12
+# split of S (LUI/ADDI) and writes the fields.
+struct RvReloc
+  offset: Int       # byte offset of the instruction in the buffer
+  sym: String       # the extern function / static symbol
+  kind: Int         # the ELF RISC-V relocation type
+end
+
+# The ELF RISC-V relocation types this backend emits (the RV psABI):
+#   R_RISCV_JAL      = 17
+#   R_RISCV_HI20     = 26  (LUI imm20 <- the high 20 bits of S + A)
+#   R_RISCV_LO12_I   = 27  (ADDI imm12 <- the low 12 bits of S + A)
+def rv_reloc_jal() -> Int = 17
+def rv_reloc_hi20() -> Int = 26
+def rv_reloc_lo12_i() -> Int = 27
+
+struct RvEmit
+  buf: CodeBuffer
+  # The x-numbers of the resolved operand registers of the most recent
+  # LirCmp, both -1 when no compare is pending (see the Cmp/Cset arms).
+  cmp_left: Int
+  cmp_right: Int
+  # Deferred jal sites (forward/unknown branch targets, program-function
+  # calls and self-calls), resolved by rv_resolve_patches once the whole
+  # program is emitted (every block and function label is defined then).
+  patches: Vec[RvPatch]
+  # Extern-call sites: R_RISCV_JAL relocations for the ELF writer.
+  relocs: Vec[RvReloc]
+  # The program's symbol records, in program order: function symbols
+  # (Section::Text, the fn's text offset) and extern undefined symbols
+  # (Section::Extern) — the ELF writer's (name, offset) tables.
+  syms: Vec[AsmSymbol]
+end
+
+def rv_emit_new() -> RvEmit
+  RvEmit {
+    buf: buf_new(),
+    cmp_left: -1,
+    cmp_right: -1,
+    patches: Vec::new(),
+    relocs: Vec::new(),
+    syms: Vec::new()
+  }
+end
+
+# Append a machine function symbol (global) at the current buffer
+# position of the shared program text (mirrors thumb_emit_fn_symbol).
+# (P1-18 @cold): an attr_cold function's symbol is routed into the cold
+# section (Section::ColdText — the .text.cold region the ELF writer
+# splits from the code stream's cold tail; see rv_compile_object's
+# deferred cold pass).
+def rv_emit_fn_symbol(inout re: RvEmit, name: String, is_cold: Bool) -> Unit
+  re.syms.push(AsmSymbol {
+    name: name,
+    section: if is_cold then Section::ColdText else Section::Text end,
+    offset: buf_pos(&re.buf),
+    size: 0,
+    binding: SymBinding::Global,
+    kind: SymKind::Func
+  })
+end
+
+# Push one RISC-V machine word (every 3a encoder returns a single 32-bit
+# instruction; the wire format is little-endian).
+def rv_emit_word(inout re: RvEmit, word: u32) -> Unit
+  emit32_le(&mut re.buf, word)
+end
+
+# Materialize `imm` into `rd` under the rv_li pair contract: ONE word
+# when the single addi rd, x0, imm form covers the signed 12-bit range
+# (word2 == 0 — the sentinel is an illegal all-zero encoding, never a
+# real instruction), the lui + addi pair otherwise. Immediates outside
+# the rv_li range panic there (validation rejects them first).
+def rv_emit_li(inout re: RvEmit, rd: Int, imm: Int) -> Unit
+  let (w1, w2) = rv_li(rd, imm)
+  rv_emit_word(re, w1)
+  if w2 != 0 then
+    rv_emit_word(re, w2)
+  end
+end
+
+# The temp to prefer for a second resolved operand given the register
+# the first landed in: avoid the t0/t1 temp collision (the RV emitter's
+# two statement-local temps — the thumb_alt_pref r12/r3 discipline).
+def rv_alt_pref(used: Int) -> Int
+  if used == rv_t0_reg() then rv_t1_reg() else rv_t0_reg() end
+end
+
+# The x-number of the machine register holding LIR register id
+# `lir_reg`: fixed (precolored) vregs 0..7 are a0..a7 = x10..x17
+# (rv_fixed_phys — a LIR argument vreg IS its ABI register); allocator
+# pool ids 9..14 index `mdl_pool` (the desc-driven callee-saved vector
+# the function driver builds, thumb style). Panics for anything else —
+# an internal error after rv_validate_fn.
+def rv_phys_of(mdl_pool: Vec[Int], lir_reg: Int) -> Int
+  if lir_reg < lir_first_alloc_vreg() then
+    return rv_fixed_phys(lir_reg)
+  end
+  let idx = lir_reg - lir_first_alloc_vreg()
+  if idx >= 0 && idx < mdl_pool.len() then
+    mdl_pool[idx]
+  else
+    panic("rv: no RISC-V register for lir register " + lir_reg.to_string())
+  end
+end
+
+# The destination of a def at position `pos`: either the segment's
+# register (via the mdl_pool mapping) or the t0 temp with a pending
+# spill-slot store. Mirrors thumb_def_target.
+struct RvDefTarget
+  reg: Int          # x-number of the def's target register
+  store_slot: Int   # >= 0: store reg to this slot after the def
+end
+
+def rv_def_target(alloc: LirAlloc, mdl_pool: Vec[Int], vreg: Int, pos: Int) -> RvDefTarget
+  if vreg < lir_first_alloc_vreg() then
+    # Fixed ABI vregs (argument moves): the register IS the target.
+    return RvDefTarget { reg: rv_fixed_phys(vreg), store_slot: -1 }
+  end
+  match alloc.segs_of.get(vreg)
+  when Option::Some(segs) then
+    match lir_seg_at(segs, pos)
+    when Option::Some(s) then
+      if s.phys >= 0 then
+        RvDefTarget { reg: rv_phys_of(mdl_pool, s.phys), store_slot: -1 }
+      else
+        RvDefTarget { reg: rv_t0_reg(), store_slot: s.slot }
+      end
+    when Option::None then
+      panic("rv: def outside any interval for vreg " + vreg.to_string())
+    end
+  when Option::None then
+    # Never-occurring vreg (an unused parameter bind still emits).
+    RvDefTarget { reg: rv_t0_reg(), store_slot: -1 }
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Spill-slot access (mirrors thumb_slot_access)
+# ———————————————————————————————————————————————————————————————
+# Slot i is the xlen-wide word at [s0/fp + xlen*slot] — POSITIVE
+# offsets, the thumb frame convention: 8*slot with ld/sd on xlen 8,
+# 4*slot with lw/sw on xlen 4.
+
+def rv_slot_offset(slot: Int, xlen: Int) -> Int
+  if xlen != 8 && xlen != 4 then
+    panic("rv_slot_offset: xlen must be 4 or 8 bytes (got " + xlen.to_string() + ")")
+  end
+  xlen * slot
+end
+
+# Load spill slot `slot` into `dst` (any register; the slot access is
+# the shared arm below).
+def rv_slot_load(inout re: RvEmit, dst: Int, slot: Int, xlen: Int) -> Unit
+  rv_slot_access(re, dst, slot, xlen, true)
+end
+
+# Store `src` into spill slot `slot`.
+def rv_slot_store(inout re: RvEmit, src: Int, slot: Int, xlen: Int) -> Unit
+  rv_slot_access(re, src, slot, xlen, false)
+end
+
+# The shared slot access: ld/sd at [s0 + xlen*slot] (xlen 8) or lw/sw
+# (xlen 4) when the byte offset fits the signed 12-bit I/S-immediate
+# field [-2048, 2047]; beyond that the address is built in a temp
+# (rv_emit_li; add temp, s0, temp) and the word is accessed through it.
+# The store path must not clobber the value register: when the value
+# sits in t0 (a memory-def temp), the address is built in t1 instead.
+# Frame bounds are the function driver's check (a too-large offset
+# panics inside rv_li — never a silently truncated address).
+def rv_slot_access(inout re: RvEmit, reg: Int, slot: Int, xlen: Int, is_load: Bool) -> Unit
+  let off = rv_slot_offset(slot, xlen)
+  let fp = rv_fp_reg()
+  if is_load then
+    if off >= -2048 && off <= 2047 then
+      if xlen == 8 then
+        rv_emit_word(re, rv_ld(reg, fp, off))
+      else
+        rv_emit_word(re, rv_lw(reg, fp, off))
+      end
+    else
+      # A dst of t0 is fine here: the final load reads the address in t0
+      # before writing the same register (read-before-write).
+      rv_emit_li(re, rv_t0_reg(), off)
+      rv_emit_word(re, rv_add(rv_t0_reg(), fp, rv_t0_reg()))
+      if xlen == 8 then
+        rv_emit_word(re, rv_ld(reg, rv_t0_reg(), 0))
+      else
+        rv_emit_word(re, rv_lw(reg, rv_t0_reg(), 0))
+      end
+    end
+  else
+    if off >= -2048 && off <= 2047 then
+      if xlen == 8 then
+        rv_emit_word(re, rv_sd(reg, fp, off))
+      else
+        rv_emit_word(re, rv_sw(reg, fp, off))
+      end
+    else
+      let addr = if reg == rv_t0_reg() then rv_t1_reg() else rv_t0_reg() end
+      rv_emit_li(re, addr, off)
+      rv_emit_word(re, rv_add(addr, fp, addr))
+      if xlen == 8 then
+        rv_emit_word(re, rv_sd(reg, addr, 0))
+      else
+        rv_emit_word(re, rv_sw(reg, addr, 0))
+      end
+    end
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Value materialization (mirrors thumb_emit_use over LirValue)
+# ———————————————————————————————————————————————————————————————
+# Materialize the value of `val` at position `pos` into a register,
+# choosing `pref` (normally t0) when a spill load or an immediate
+# materialization is needed; a reload record at (pos, vreg) loads the
+# slot into the segment register first (invariant I2). Returns the
+# register holding the value:
+#   - LirReg of a fixed vreg: its ABI register (x10..x17) directly;
+#   - LirReg of an ordinary vreg: the segment register (register-
+#     resident) or `pref` (spill-loaded), exactly like thumb_emit_use;
+#   - LirImm: rv_emit_li into `pref` (immediates are materialized, never
+#     folded — the optimizer owns folding).
+def rv_emit_use(inout re: RvEmit, alloc: LirAlloc, mdl_pool: Vec[Int], val: LirValue, pos: Int, pref: Int, xlen: Int) -> Int
+  match val
+  when LirValue::LirImm(imm) then
+    rv_emit_li(re, pref, imm)
+    pref
+  when LirValue::LirReg(vreg) then
+    if vreg < lir_first_alloc_vreg() then
+      rv_fixed_phys(vreg)
+    else
+      match alloc.segs_of.get(vreg)
+      when Option::Some(segs) then
+        match lir_seg_at(segs, pos)
+        when Option::Some(s) then
+          if s.phys >= 0 then
+            if lir_reload_at(alloc.reloads, pos, vreg) then
+              rv_slot_load(re, rv_phys_of(mdl_pool, s.phys), s.slot, xlen)
+            end
+            rv_phys_of(mdl_pool, s.phys)
+          else
+            rv_slot_load(re, pref, s.slot, xlen)
+            pref
+          end
+        when Option::None then
+          panic("rv: use outside any interval for vreg " + vreg.to_string())
+        end
+      when Option::None then
+        panic("rv: use of vreg with no intervals: " + vreg.to_string())
+      end
+    end
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Binop emission (mirrors thumb_emit_binop_rr / thumb_emit_binop_imm)
+# ———————————————————————————————————————————————————————————————
+# Register-register forms map each LirBinOp to its RISC-V ALU
+# instruction; the signedness choice is carried by the LIR op itself
+# (LirAsr -> sra — the arithmetic shift — while LirLsr -> srl). RISC-V
+# register-form shift counts are masked by the machine (RV64: rs2[5:0]
+# — identical to the LIR 64-bit shift semantics). On RV32 (xlen 4) the
+# masking is rs2[4:0] — shift count mod 32 — NOT the 64-bit LIR
+# semantics for counts >= 32, which no static check can exclude, so
+# the shift ops panic here (rv_validate_fn rejects them first with the
+# rule — the implemented RV32 shamt narrowing, see the header); the
+# remaining register forms are xlen-agnostic words. All forms are
+# flagless (no NZCV to preserve — invariant I1 is vacuous on RISC-V).
+
+def rv_emit_binop_rr(inout re: RvEmit, op: LirBinOp, d: Int, n: Int, m: Int, xlen: Int) -> Unit
+  if xlen == 4 && rv_shift_op(op) then
+    panic("rv: RV32 (xlen 4) register-form shift does not lower — rv_validate_fn rejects it before emission (fail-closed)")
+  end
+  match op
+  when LirBinOp::LirAdd then rv_emit_word(re, rv_add(d, n, m))
+  when LirBinOp::LirSub then rv_emit_word(re, rv_sub(d, n, m))
+  when LirBinOp::LirMul then rv_emit_word(re, rv_mul(d, n, m))
+  when LirBinOp::LirAnd then rv_emit_word(re, rv_and(d, n, m))
+  when LirBinOp::LirOr then rv_emit_word(re, rv_or(d, n, m))
+  when LirBinOp::LirXor then rv_emit_word(re, rv_xor(d, n, m))
+  when LirBinOp::LirShl then rv_emit_word(re, rv_sll(d, n, m))
+  when LirBinOp::LirAsr then rv_emit_word(re, rv_sra(d, n, m))
+  when LirBinOp::LirLsr then rv_emit_word(re, rv_srl(d, n, m))
+  end
+end
+
+# A binop whose right operand is the immediate `imm`. The I-type
+# immediate forms are used when the payload fits: addi (and, for a Sub,
+# the addi of the negated amount — RISC-V has no subi) for the signed
+# 12-bit field, andi/ori/xori for And/Or/Xor, and slli/srli/srai for
+# the route's shamt field (srai is the SIGNED shift — LirAsr — srli
+# the unsigned — LirLsr): 0..63 on RV64 (xlen 8), narrowed to 0..31 on
+# RV32 (xlen 4) — the implemented RV32 shamt narrowing, whose accepted
+# encodings coincide byte-for-byte with the RV64 forms. Everything
+# else materializes the immediate into the alt temp (avoiding the
+# resolved left operand `n`) and uses the register form. Shift counts
+# outside the xlen-aware field panic: rv_validate_fn rejects them
+# before emission (fail-closed — never a silently masked count, and
+# never an RV64-format shamt word on RV32, where counts 32..63 have no
+# encoding at all).
+def rv_emit_binop_imm(inout re: RvEmit, op: LirBinOp, d: Int, n: Int, imm: Int, xlen: Int) -> Unit
+  match op
+  when LirBinOp::LirAdd then
+    if imm >= -2048 && imm <= 2047 then
+      rv_emit_word(re, rv_addi(d, n, imm))
+    else
+      let t = rv_alt_pref(n)
+      rv_emit_li(re, t, imm)
+      rv_emit_word(re, rv_add(d, n, t))
+    end
+  when LirBinOp::LirSub then
+    # sub of an immediate is the addi of its negation; -imm must fit the
+    # signed 12-bit field: imm in [-2047, 2048] (2048 -> addi -2048,
+    # -2047 -> addi 2047). imm = -2048 has no addi image (-imm = 2048)
+    # and materializes.
+    if imm >= -2047 && imm <= 2048 then
+      rv_emit_word(re, rv_addi(d, n, -imm))
+    else
+      let t = rv_alt_pref(n)
+      rv_emit_li(re, t, imm)
+      rv_emit_word(re, rv_sub(d, n, t))
+    end
+  when LirBinOp::LirMul then
+    let t = rv_alt_pref(n)
+    rv_emit_li(re, t, imm)
+    rv_emit_word(re, rv_mul(d, n, t))
+  when LirBinOp::LirAnd then
+    if imm >= -2048 && imm <= 2047 then
+      rv_emit_word(re, rv_andi(d, n, imm))
+    else
+      let t = rv_alt_pref(n)
+      rv_emit_li(re, t, imm)
+      rv_emit_word(re, rv_and(d, n, t))
+    end
+  when LirBinOp::LirOr then
+    if imm >= -2048 && imm <= 2047 then
+      rv_emit_word(re, rv_ori(d, n, imm))
+    else
+      let t = rv_alt_pref(n)
+      rv_emit_li(re, t, imm)
+      rv_emit_word(re, rv_or(d, n, t))
+    end
+  when LirBinOp::LirXor then
+    if imm >= -2048 && imm <= 2047 then
+      rv_emit_word(re, rv_xori(d, n, imm))
+    else
+      let t = rv_alt_pref(n)
+      rv_emit_li(re, t, imm)
+      rv_emit_word(re, rv_xor(d, n, t))
+    end
+  when LirBinOp::LirShl then
+    if rv_shamt_imm_ok(xlen, imm) then
+      rv_emit_word(re, rv_slli(d, n, imm))
+    else
+      panic(rv_shamt_imm_panic(xlen, imm))
+    end
+  when LirBinOp::LirLsr then
+    if rv_shamt_imm_ok(xlen, imm) then
+      rv_emit_word(re, rv_srli(d, n, imm))
+    else
+      panic(rv_shamt_imm_panic(xlen, imm))
+    end
+  when LirBinOp::LirAsr then
+    if rv_shamt_imm_ok(xlen, imm) then
+      rv_emit_word(re, rv_srai(d, n, imm))
+    else
+      panic(rv_shamt_imm_panic(xlen, imm))
+    end
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Statement emission (mirrors thumb_emit_stmt)
+# ———————————————————————————————————————————————————————————————
+# Every arm is explicit; constructs outside the validated subset return
+# Err naming the rule (rv_validate_fn already rejected them — the arms
+# are defense in depth and never silently emit).
+#
+# CMP/CSET — the flagless lowering. RISC-V has no NZCV, so LirCmp
+# records its two resolved operand registers (resolved AT THE CMP
+# POSITION, where the allocator's reload/use bookkeeping lives) in the
+# emitter state, and the immediately following LirCset emits the actual
+# comparison sequences. The Cset destination register may alias either
+# operand or the t0 def temp: every chosen sequence is written to be
+# safe under aliasing — each instruction reads its sources before
+# writing its destination, and multi-instruction sequences read back
+# only their own result. Sequences per LirCond (l = left, r = right,
+# d = the cset destination; slt/sltu results are exactly 0/1, so
+# xori d, d, 1 inverts them):
+#   LirEq:  xor d, l, r;  sltiu d, d, 1    # is-zero of the xor
+#   LirNe:  xor d, l, r;  sltu  d, x0, d   # (0 <u xor) == nonzero
+#   LirLt:  slt  d, l, r                   # signed less-than
+#   LirLe:  slt  d, r, l;  xori d, d, 1    # NOT (l > r)
+#   LirGt:  slt  d, r, l                   # l > r == r < l
+#   LirGe:  slt  d, l, r;  xori d, d, 1    # NOT (l < r)
+#   LirUlt: sltu d, l, r                   # unsigned less-than
+#   LirUle: sltu d, r, l;  xori d, d, 1    # NOT (l >u r)
+#   LirUgt: sltu d, r, l                   # l >u r == r <u l
+#   LirUge: sltu d, l, r;  xori d, d, 1    # NOT (l <u r)
+#
+# The emitter is otherwise stateless per statement; positions walk
+# EXACTLY like lir_linearize (invariant I3), as in thumb_emit_fn.
+
+def rv_emit_stmt(inout re: RvEmit, alloc: LirAlloc, mdl_pool: Vec[Int], kind: LirStmtKind, pos: Int, xlen: Int) -> Result[Unit, String]
+  match kind
+  when LirStmtKind::LirMove(dst, val) then
+    let dt = rv_def_target(alloc, mdl_pool, dst, pos)
+    match val
+    when LirValue::LirImm(imm) then
+      if imm == 0 then
+        # Constant zero: the single-word addi rd, x0, 0 form (the
+        # canonical x0-idiom — rv_li would emit the same word).
+        rv_emit_word(re, rv_addi(dt.reg, 0, 0))
+      else
+        rv_emit_li(re, dt.reg, imm)
+      end
+    when LirValue::LirReg(src) then
+      if src < lir_first_alloc_vreg() then
+        # Fixed (precolored) ABI vreg: its ABI register holds the value.
+        let sr = rv_fixed_phys(src)
+        if dt.reg != sr then
+          rv_emit_word(re, rv_mv(dt.reg, sr))
+        end
+      else
+        let pref = rv_alt_pref(dt.reg)
+        let sr = rv_emit_use(re, alloc, mdl_pool, LirValue::LirReg(src), pos, pref, xlen)
+        if dt.reg != sr then
+          rv_emit_word(re, rv_mv(dt.reg, sr))
+        end
+      end
+    end
+    if dt.store_slot >= 0 then
+      rv_slot_store(re, dt.reg, dt.store_slot, xlen)
+    end
+    Result::Ok(())
+  when LirStmtKind::LirBinop(op, dst, left, right) then
+    let dt = rv_def_target(alloc, mdl_pool, dst, pos)
+    let left_pref = rv_alt_pref(dt.reg)
+    let left_reg = match left
+    when LirValue::LirReg(lv) then rv_emit_use(re, alloc, mdl_pool, LirValue::LirReg(lv), pos, left_pref, xlen)
+    when LirValue::LirImm(_) then panic("rv: binop left operand must be a register (lowering invariant)")
+    end
+    match right
+    when LirValue::LirImm(imm) then
+      rv_emit_binop_imm(re, op, dt.reg, left_reg, imm, xlen)
+    when LirValue::LirReg(rv) then
+      # A register right operand: resolve it with a temp that avoids the
+      # left temp (they only collide when both spill-load; a single
+      # instruction reads both before writing dt, so a dt-temp reuse is
+      # safe by read-before-write).
+      let right_pref = rv_alt_pref(left_reg)
+      let right_reg = rv_emit_use(re, alloc, mdl_pool, LirValue::LirReg(rv), pos, right_pref, xlen)
+      rv_emit_binop_rr(re, op, dt.reg, left_reg, right_reg, xlen)
+    end
+    if dt.store_slot >= 0 then
+      rv_slot_store(re, dt.reg, dt.store_slot, xlen)
+    end
+    Result::Ok(())
+  when LirStmtKind::LirUnop(op, dst, src) then
+    let dt = rv_def_target(alloc, mdl_pool, dst, pos)
+    let pref = rv_alt_pref(dt.reg)
+    let sr = rv_emit_use(re, alloc, mdl_pool, LirValue::LirReg(src), pos, pref, xlen)
+    match op
+    when LirUnOp::LirNeg then
+      # neg rd, rs == sub rd, x0, rs.
+      rv_emit_word(re, rv_sub(dt.reg, 0, sr))
+    when LirUnOp::LirBitNot then
+      # Bitwise not == xori rd, rs, -1 (the -1 I-immediate is the
+      # all-ones mask).
+      rv_emit_word(re, rv_xori(dt.reg, sr, -1))
+    end
+    if dt.store_slot >= 0 then
+      rv_slot_store(re, dt.reg, dt.store_slot, xlen)
+    end
+    Result::Ok(())
+  when LirStmtKind::LirCmp(left, right) then
+    # Flagless lowering: resolve both operands into registers AT THIS
+    # POSITION (reload/spill decisions are position-keyed — I2/I3) and
+    # record them for the adjacent LirCset, which emits the comparison
+    # (see the note above). The left operand is always a register
+    # (validation); the right may be an immediate and materializes into
+    # the alt temp here.
+    if re.cmp_left >= 0 then
+      panic("rv: LirCmp with a previous compare still pending (lowering invariant I1: each LirCmp is consumed by the next LirCset)")
+    end
+    let left_reg = match left
+    when LirValue::LirReg(lv) then rv_emit_use(re, alloc, mdl_pool, LirValue::LirReg(lv), pos, rv_t0_reg(), xlen)
+    when LirValue::LirImm(_) then panic("rv: cmp left operand must be a register (lowering invariant)")
+    end
+    let right_reg = rv_emit_use(re, alloc, mdl_pool, right, pos, rv_alt_pref(left_reg), xlen)
+    re.cmp_left = left_reg
+    re.cmp_right = right_reg
+    Result::Ok(())
+  when LirStmtKind::LirCset(cond, dst) then
+    # Consume the pending LirCmp operands and materialize the 0/1
+    # comparison result into the destination. Sequences per LirCond are
+    # listed in the section note; each writes ONLY d (plus x0 reads), so
+    # d aliasing an operand register or the t0 def temp is always safe.
+    if re.cmp_left < 0 then
+      panic("rv: LirCset with no preceding LirCmp in program order (lowering invariant I1)")
+    end
+    let l = re.cmp_left
+    let r = re.cmp_right
+    re.cmp_left = -1
+    re.cmp_right = -1
+    let dt = rv_def_target(alloc, mdl_pool, dst, pos)
+    let d = dt.reg
+    match cond
+    when LirCond::LirEq then
+      rv_emit_word(re, rv_xor(d, l, r))
+      rv_emit_word(re, rv_sltiu(d, d, 1))
+    when LirCond::LirNe then
+      rv_emit_word(re, rv_xor(d, l, r))
+      rv_emit_word(re, rv_sltu(d, 0, d))
+    when LirCond::LirLt then
+      rv_emit_word(re, rv_slt(d, l, r))
+    when LirCond::LirLe then
+      rv_emit_word(re, rv_slt(d, r, l))
+      rv_emit_word(re, rv_xori(d, d, 1))
+    when LirCond::LirGt then
+      rv_emit_word(re, rv_slt(d, r, l))
+    when LirCond::LirGe then
+      rv_emit_word(re, rv_slt(d, l, r))
+      rv_emit_word(re, rv_xori(d, d, 1))
+    when LirCond::LirUlt then
+      rv_emit_word(re, rv_sltu(d, l, r))
+    when LirCond::LirUle then
+      rv_emit_word(re, rv_sltu(d, r, l))
+      rv_emit_word(re, rv_xori(d, d, 1))
+    when LirCond::LirUgt then
+      rv_emit_word(re, rv_sltu(d, r, l))
+    when LirCond::LirUge then
+      rv_emit_word(re, rv_sltu(d, l, r))
+      rv_emit_word(re, rv_xori(d, d, 1))
+    end
+    if dt.store_slot >= 0 then
+      rv_slot_store(re, dt.reg, dt.store_slot, xlen)
+    end
+    Result::Ok(())
+  when LirStmtKind::LirStaticLoad(dst, sym) then
+    # A static-value load (a whole-program static reference — see the
+    # statement doc in lir.tg): materialize the static's ABSOLUTE
+    # address with the LUI+ADDI pair (the RV psABI's medlow absolute
+    # form — R_RISCV_HI20 on the LUI and R_RISCV_LO12_I on the ADDI —
+    # the exact instruction shape rv_li emits for constants, now with
+    # the two halves resolved by the linker against the static's .data
+    # symbol), then load the xlen-wide word at [reg] (ld on xlen 8,
+    # lw on xlen 4). Both imm fields start at 0 — the linker computes
+    # hi20 = (S + A + 0x800) >> 12 and lo12 = (S + A) & 0xFFF (the
+    # ADDI sign-extends its 12-bit field, so the pair addresses the
+    # full ±2GiB medlow range). The def temp (t0 for memory-resident
+    # defs) is a legal LUI/ADDI/load target, and the load reads [reg]
+    # only after the address is complete, so the def-target alias is
+    # safe.
+    let dt = rv_def_target(alloc, mdl_pool, dst, pos)
+    let lui_pos = buf_pos(&re.buf)
+    rv_emit_word(re, rv_lui(dt.reg, 0))
+    re.relocs.push(RvReloc { offset: lui_pos, sym: sym.clone(), kind: rv_reloc_hi20() })
+    let addi_pos = buf_pos(&re.buf)
+    rv_emit_word(re, rv_addi(dt.reg, dt.reg, 0))
+    re.relocs.push(RvReloc { offset: addi_pos, sym: sym.clone(), kind: rv_reloc_lo12_i() })
+    if xlen == 8 then
+      rv_emit_word(re, rv_ld(dt.reg, dt.reg, 0))
+    else
+      rv_emit_word(re, rv_lw(dt.reg, dt.reg, 0))
+    end
+    if dt.store_slot >= 0 then
+      rv_slot_store(re, dt.reg, dt.store_slot, xlen)
+    end
+    Result::Ok(())
+  when LirStmtKind::LirLoadFrame(_, _) then
+    Result::Err("rv: LirLoadFrame does not lower in this slice — stack-parameter loads (arguments beyond a0-a7) have no RISC-V rule yet; rv_validate_fn rejects them (fail-closed)")
+  when LirStmtKind::LirPushArg(_) then
+    Result::Err("rv: LirPushArg does not lower in this slice — caller stack-argument pushes have no RISC-V rule yet; rv_validate_fn rejects them (fail-closed)")
+  when LirStmtKind::LirFMove(_, _) then
+    Result::Err("rv: float move statements do not lower on the riscv route (float types are aarch64-route-only — fail-closed)")
+  when LirStmtKind::LirFBinop(_, _, _, _, _) then
+    Result::Err("rv: float arithmetic statements do not lower on the riscv route (float types are aarch64-route-only — fail-closed)")
+  when LirStmtKind::LirFNeg(_, _, _) then
+    Result::Err("rv: float negate statements do not lower on the riscv route (float types are aarch64-route-only — fail-closed)")
+  when LirStmtKind::LirFCmp(_, _, _) then
+    Result::Err("rv: float compare statements do not lower on the riscv route (float types are aarch64-route-only — fail-closed)")
+  when LirStmtKind::LirFConst(_, _, _) then
+    Result::Err("rv: float constant statements do not lower on the riscv route (float types are aarch64-route-only — fail-closed)")
+  when LirStmtKind::LirIntToFloat(_, _, _, _) then
+    Result::Err("rv: float conversion statements do not lower on the riscv route (float types are aarch64-route-only — fail-closed)")
+  when LirStmtKind::LirFloatToInt(_, _, _) then
+    Result::Err("rv: float conversion statements do not lower on the riscv route (float types are aarch64-route-only — fail-closed)")
+  when LirStmtKind::LirFcvt(_, _, _) then
+    Result::Err("rv: float conversion statements do not lower on the riscv route (float types are aarch64-route-only — fail-closed)")
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# The terminator emitter, the prologue/epilogue and the function driver
+# (AUDIT P1-14, slice 4 — mirrors backend_thumb.tg's terminators
+# ~1479-1542, its function emitter ~1551-1604 and its branch machinery
+# ~1264-1343, def-for-def with rv_* names)
+# ———————————————————————————————————————————————————————————————
+# Branch model — RISC-V has NO flags, so the LIR's compare-and-branch
+# discipline (thumb's flags + B<cond>) becomes direct register compares:
+# every conditional branch is a single B-type instruction over the two
+# operand registers (mirroring the l/r register roles of the rv_emit_stmt
+# Cset table), and a LirSwitch chain re-tests its operand per arm exactly
+# like thumb's cmp+bcond chain re-set the flags per arm. The thumb
+# invert-and-skip pattern for out-of-B-range targets mirrors onto
+# b<not cond> rs1, rs2, +8 followed by a jal x0 (patched when the target
+# is not yet known); the branch range check is the B-type ±4 KiB field,
+# and the jal range check is ±1 MiB — farther targets Err naming the
+# veneer rule (RISC-V long-branch veneers are a linker/route slice; this
+# emitter never invents one).
+#
+# Frame model (mirrors the thumb frame def-for-def at 16-byte alignment,
+# the riscv stack_alignment): the prologue allocates
+#     total = frame_bytes + saved_bytes
+# where frame_bytes = rv_frame_bytes(alloc.slots) (16-aligned, the spill
+# area) and saved_bytes = 8 * xlen (ra, s0/fp and the six desc-driven
+# pool registers s1..s6 — 64 bytes on RV64, 32 on RV32, both 16-aligned,
+# so sp stays 16-aligned through the body). Spill slot i is
+# [s0 + xlen*i] (positive, the rv_slot_access convention); the saved
+# block sits ABOVE the slot area at [sp + frame_bytes + k*xlen] — the
+# thumb PUSH-above-frame layout. The epilogue reloads that block from
+# the same offsets (the body never moves sp — LirPushArg is rejected),
+# deallocates and rv_ret's; the return value travels in a0 = x10
+# (rv_fixed_phys(0) — the LIR fixed vreg 0).
+#
+# Call model: pre-call I2 spill stores (redundant for the callee-saved
+# pool but kept, mirroring thumb_emit_call_spills), then the direct call.
+# The lowering's ≤ 8 argument moves are ordinary statements into the
+# fixed vregs 0..7, which ARE a0..a7 (rv_fixed_phys) — the term reads
+# nothing from `args`, exactly like thumb. The resolution rule mirrors
+# thumb_emit_bl's def-for-def: rv_emit_fn emits every function into the
+# SHARED program text buffer (all function labels and block labels
+# defined in it), so a call to a DEFINED program function — itself
+# included — is `jal ra, <label>` as a deferred patch, resolved by
+# rv_resolve_patches after the whole program is emitted; a call whose
+# target is an extern (or is neither defined nor declared extern —
+# thumb's defensive rule) is `jal ra, 0` plus an R_RISCV_JAL relocation
+# record (rv_emit_call_remote), which the ELF writer serializes for the
+# linker. Slice 3d (rv_compile_object + rv_elf_obj, below) is the
+# whole-program owner of the function layout, the patch resolution and
+# the relocation table.
+#
+# Position walk, block order and the pending-compare record follow
+# thumb_emit_fn exactly (invariant I3); the driver resets the pending
+# Cmp record at every block boundary (lowering never leaves one pending —
+# a pending compare AT a terminator is a lowering-invariant break and
+# panics, mirroring the Cmp/Cset arms).
+
+# ———————————————————————————————————————————————————————————————
+# Desc-driven register model (mirrors thumb_mdl_pool)
+# ———————————————————————————————————————————————————————————————
+
+# Parse a psABI register name into its x-number (mirrors thumb_reg_num
+# over the riscv desc's name spellings).
+def rv_reg_num(name: String) -> Option[Int]
+  if name == "ra" then Option::Some(1)
+  elsif name == "sp" then Option::Some(2)
+  elsif name == "gp" then Option::Some(3)
+  elsif name == "tp" then Option::Some(4)
+  elsif name == "t0" then Option::Some(5)
+  elsif name == "t1" then Option::Some(6)
+  elsif name == "t2" then Option::Some(7)
+  elsif name == "s0" then Option::Some(8)
+  elsif name == "fp" then Option::Some(8)
+  elsif name == "s1" then Option::Some(9)
+  elsif name == "a0" then Option::Some(10)
+  elsif name == "a1" then Option::Some(11)
+  elsif name == "a2" then Option::Some(12)
+  elsif name == "a3" then Option::Some(13)
+  elsif name == "a4" then Option::Some(14)
+  elsif name == "a5" then Option::Some(15)
+  elsif name == "a6" then Option::Some(16)
+  elsif name == "a7" then Option::Some(17)
+  elsif name == "s2" then Option::Some(18)
+  elsif name == "s3" then Option::Some(19)
+  elsif name == "s4" then Option::Some(20)
+  elsif name == "s5" then Option::Some(21)
+  elsif name == "s6" then Option::Some(22)
+  elsif name == "s7" then Option::Some(23)
+  elsif name == "s8" then Option::Some(24)
+  elsif name == "s9" then Option::Some(25)
+  elsif name == "s10" then Option::Some(26)
+  elsif name == "s11" then Option::Some(27)
+  elsif name == "t3" then Option::Some(28)
+  elsif name == "t4" then Option::Some(29)
+  elsif name == "t5" then Option::Some(30)
+  elsif name == "t6" then Option::Some(31)
+  else Option::None
+  end
+end
+
+# Build the register model from the desc — the desc is the single source
+# of the ABI data: the pool is exactly the desc's callee-saved registers
+# minus the frame pointer (s0/fp), first six, in desc order (s1..s6 =
+# x9, x18..x22 for the riscv descs — matching rv_callee_saved_regs).
+# Fail closed when the desc shape is not what this slice consumes.
+def rv_mdl_pool(desc: TargetDesc, xlen: Int) -> Result[Vec[Int], String]
+  if desc.name != "riscv32" && desc.name != "riscv64" then
+    return Result::Err("rv: internal error: the riscv backend was given the `" + desc.name + "` description (expected `riscv32`/`riscv64`)")
+  end
+  if desc.pointer_width != xlen then
+    return Result::Err("rv: the `" + desc.name + "` description must model " + xlen.to_string() + "-byte pointers (desc says " + desc.pointer_width.to_string() + ")")
+  end
+  if desc.stack_alignment != 16 then
+    return Result::Err("rv: the riscv description must model 16-byte stack alignment (desc says " + desc.stack_alignment.to_string() + ")")
+  end
+  var pool: Vec[Int] = Vec::new()
+  var i = 0
+  while i < desc.reg_callee_saved.len() do
+    let r = desc.reg_callee_saved[i]
+    match rv_reg_num(r)
+    when Option::Some(n) then
+      if n != rv_fp_reg() then
+        pool.push(n)
+      end
+    when Option::None then ()
+    end
+    i = i + 1
+  end
+  if pool.len() < 6 then
+    return Result::Err("rv: the riscv description must provide at least six callee-saved registers besides s0/fp for the allocator pool (desc provides " + pool.len().to_string() + ")")
+  end
+  var out: Vec[Int] = Vec::new()
+  var j = 0
+  while j < 6 do
+    out.push(pool[j])
+    j = j + 1
+  end
+  Result::Ok(out)
+end
+
+# ———————————————————————————————————————————————————————————————
+# Frame helpers (spill slots are xlen-wide words above the frame pointer)
+# ———————————————————————————————————————————————————————————————
+
+# The 16-aligned spill-slot frame area (mirrors thumb_frame_bytes at the
+# riscv stack_alignment): slot i lives at [s0 + xlen*i], i in 0..slots.
+def rv_frame_bytes(slots: Int, xlen: Int) -> Int
+  if xlen != 8 && xlen != 4 then
+    panic("rv_frame_bytes: xlen must be 4 or 8 bytes (got " + xlen.to_string() + ")")
+  end
+  let raw = slots * xlen
+  let rem = raw % 16
+  if rem != 0 then
+    raw + (16 - rem)
+  else
+    raw
+  end
+end
+
+# The registers the prologue stores / the epilogue restores: ra, the
+# frame pointer s0/fp, then every pool register — the thumb saved-list
+# shape (its {r4..r10, lr} = pool + fp + lr) driven by mdl_pool. Eight
+# regs: 8*xlen bytes (64 on RV64, 32 on RV32) — 16-aligned, so the total
+# allocation keeps sp 16-aligned.
+def rv_saved_regs(mdl_pool: Vec[Int]) -> Vec[Int]
+  var out: Vec[Int] = Vec::new()
+  out.push(rv_ra_reg())
+  out.push(rv_fp_reg())
+  var i = 0
+  while i < mdl_pool.len() do
+    out.push(mdl_pool[i])
+    i = i + 1
+  end
+  out
+end
+
+# ———————————————————————————————————————————————————————————————
+# Branch emission (mirrors thumb's relaxation-lite helpers)
+# ———————————————————————————————————————————————————————————————
+# Block labels live in the buffer's label map; a label defined earlier in
+# the function (a BACKWARD target) is resolved at emission, everything
+# else is a deferred jal patch resolved by rv_resolve_patches after the
+# whole program is emitted, exactly like thumb's forward-branch patches. B-type rels measure from the
+# branch instruction's OWN address on RISC-V (no +4): rel = target - pos.
+# rv_emit_b_direct's register roles mirror the Cset table in rv_emit_stmt
+# (l = rs1, r = rs2; the GT/GE/LE/Ugt/Uge/Ule conds swap the pair onto
+# blt/bge/bltu/bgeu), so a branch is TAKEN exactly when the LirCond holds.
+
+# The target label's offset, when the block has already been emitted
+# (backward branches only — patches handle the rest).
+def rv_label_off(re: RvEmit, label: String) -> Option[Int]
+  re.buf.labels.get(label)
+end
+
+# The inverse of a LirCond (mirrors thumb's cond ^ 1 — the pairs differ
+# only in the B-type funct3's low bit, so the register order is shared by
+# both members of each pair).
+def rv_cond_inv(cond: LirCond) -> LirCond
+  match cond
+  when LirCond::LirEq then LirCond::LirNe
+  when LirCond::LirNe then LirCond::LirEq
+  when LirCond::LirLt then LirCond::LirGe
+  when LirCond::LirGe then LirCond::LirLt
+  when LirCond::LirGt then LirCond::LirLe
+  when LirCond::LirLe then LirCond::LirGt
+  when LirCond::LirUlt then LirCond::LirUge
+  when LirCond::LirUge then LirCond::LirUlt
+  when LirCond::LirUgt then LirCond::LirUle
+  when LirCond::LirUle then LirCond::LirUgt
+  end
+end
+
+# Emit the B-type branch for `cond` over the register pair (rs1, rs2) at
+# PC-relative `rel` (even, in the encoder's ±4 KiB field — callers check
+# the range before this runs). Signedness lives in the LirCond, exactly
+# as in the Cset table.
+def rv_emit_b_direct(inout re: RvEmit, rs1: Int, rs2: Int, cond: LirCond, rel: Int) -> Unit
+  match cond
+  when LirCond::LirEq then rv_emit_word(re, rv_beq(rs1, rs2, rel))
+  when LirCond::LirNe then rv_emit_word(re, rv_bne(rs1, rs2, rel))
+  when LirCond::LirLt then rv_emit_word(re, rv_blt(rs1, rs2, rel))
+  when LirCond::LirGe then rv_emit_word(re, rv_bge(rs1, rs2, rel))
+  when LirCond::LirGt then rv_emit_word(re, rv_blt(rs2, rs1, rel))
+  when LirCond::LirLe then rv_emit_word(re, rv_bge(rs2, rs1, rel))
+  when LirCond::LirUlt then rv_emit_word(re, rv_bltu(rs1, rs2, rel))
+  when LirCond::LirUge then rv_emit_word(re, rv_bgeu(rs1, rs2, rel))
+  when LirCond::LirUgt then rv_emit_word(re, rv_bltu(rs2, rs1, rel))
+  when LirCond::LirUle then rv_emit_word(re, rv_bgeu(rs2, rs1, rel))
+  end
+end
+
+# A conditional branch (cond true over rs1/rs2) to `label`. Backward
+# targets within the B-type ±4 KiB range emit directly; everything else
+# emits the invert-and-skip pattern (b<not cond> rs1, rs2, +8 over a
+# patched jal x0 — mirror of thumb's B<not cond> +2 over B.W).
+def rv_emit_b_cond(inout re: RvEmit, rs1: Int, rs2: Int, cond: LirCond, label: String) -> Result[Unit, String]
+  let pos = buf_pos(&re.buf)
+  match rv_label_off(re, label)
+  when Option::Some(target) then
+    let rel = target - pos
+    if rel >= -4096 && rel <= 4094 then
+      rv_emit_b_direct(re, rs1, rs2, cond, rel)
+      Result::Ok(())
+    else
+      rv_emit_b_cond_far(re, rs1, rs2, cond, label)
+    end
+  when Option::None then
+    rv_emit_b_cond_far(re, rs1, rs2, cond, label)
+  end
+end
+
+# The far conditional pattern: b<not cond> rs1, rs2, +8 skips the
+# 4-byte jal that follows (the skip rel is measured from the branch's own
+# address), then the patched jal x0 carries the target. The pattern never
+# needs a range check on the conditional part (mirror of thumb_emit_b_cond
+# _far); the jal's ±1 MiB range is enforced when patches resolve.
+def rv_emit_b_cond_far(inout re: RvEmit, rs1: Int, rs2: Int, cond: LirCond, label: String) -> Result[Unit, String]
+  rv_emit_b_direct(re, rs1, rs2, rv_cond_inv(cond), 8)
+  let patch_pos = buf_pos(&re.buf)
+  rv_emit_word(re, rv_jal(0, 0))
+  re.patches.push(RvPatch { offset: patch_pos, label: label, is_call: false })
+  Result::Ok(())
+end
+
+# An unconditional jump (jal x0) to `label`. Backward targets within the
+# ±1 MiB jal range emit directly; unknown (forward) targets emit the
+# placeholder jal and defer the ±1 MiB range check to patch resolution —
+# beyond it, or already-known beyond it, the Err names the veneer rule
+# (RISC-V long branches need linker-inserted veneers, which no slice here
+# fabricates; fail-closed).
+def rv_emit_jump(inout re: RvEmit, label: String) -> Result[Unit, String]
+  let pos = buf_pos(&re.buf)
+  match rv_label_off(re, label)
+  when Option::Some(target) then
+    let rel = target - pos
+    if rel >= -1048576 && rel <= 1048574 then
+      rv_emit_word(re, rv_jal(0, rel))
+      Result::Ok(())
+    else
+      Result::Err("rv: branch to `" + label + "` needs a " + rel.to_string() + "-byte offset — outside the ±1 MiB jal range; farther targets need linker-inserted veneers, and the RISC-V veneer rule is a later route slice (fail-closed)")
+    end
+  when Option::None then
+    let patch_pos = buf_pos(&re.buf)
+    rv_emit_word(re, rv_jal(0, 0))
+    re.patches.push(RvPatch { offset: patch_pos, label: label, is_call: false })
+    Result::Ok(())
+  end
+end
+
+# A direct call to `label` — jal ra, label (the jump-and-link with the
+# link register ra = x1, mirroring thumb's BL). The rel is deferred to a
+# patch exactly like thumb's BL-to-label patch; the target must be a
+# label of the shared program text buffer — a block label never reaches
+# this helper (calls target functions only), so the targets are defined
+# program functions (self-recursion included), whose labels rv_compile_
+# object defines when it emits them. Extern targets use
+# rv_emit_call_remote instead (the Call arm of rv_emit_term decides).
+def rv_emit_call(inout re: RvEmit, label: String) -> Unit
+  let patch_pos = buf_pos(&re.buf)
+  rv_emit_word(re, rv_jal(rv_ra_reg(), 0))
+  re.patches.push(RvPatch { offset: patch_pos, label: label, is_call: true })
+end
+
+# A deferred call to a target the program does NOT define: `jal ra, 0`
+# (the placeholder imm the R_RISCV_JAL RELA entry describes — addend 0)
+# plus a relocation record for the ELF writer (slice 3d). Never resolved
+# in-object; the linker computes S - P and patches the field. Mirrors
+# thumb_emit_bl's extern arm (t2_bl(0) + ThumbReloc).
+def rv_emit_call_remote(inout re: RvEmit, sym: String) -> Unit
+  let patch_pos = buf_pos(&re.buf)
+  rv_emit_word(re, rv_jal(rv_ra_reg(), 0))
+  re.relocs.push(RvReloc { offset: patch_pos, sym: sym, kind: rv_reloc_jal() })
+end
+
+# ———————————————————————————————————————————————————————————————
+# Deferred patch resolution (mirrors thumb_resolve_patches)
+# ———————————————————————————————————————————————————————————————
+# Runs once the whole program is emitted, when every block label and
+# every function label of the shared text buffer is defined. Every patch
+# is a 4-byte jal whose rel was emitted as 0; the final word is
+# recomputed for the actual offset and written back little-endian
+# (patch32_le). Range overflow is fail-closed — beyond ±1 MiB the veneer
+# rule Errs (never a silently truncated branch).
+
+def rv_resolve_patches(inout re: RvEmit) -> Result[Unit, String]
+  var pi = 0
+  while pi < re.patches.len() do
+    let p = re.patches[pi]
+    match re.buf.labels.get(p.label.clone())
+    when Option::Some(target) then
+      let rel = target - p.offset
+      if rel < -1048576 || rel > 1048574 || (rel % 2) != 0 then
+        return Result::Err("rv: branch to `" + p.label + "` is out of the ±1 MiB jal range (offset " + rel.to_string() + "); farther targets need linker-inserted veneers, and the RISC-V veneer rule is a later route slice (fail-closed)")
+      end
+      let rd = if p.is_call then rv_ra_reg() else 0 end
+      patch32_le(&mut re.buf, p.offset, rv_jal(rd, rel))
+    when Option::None then
+      return Result::Err("rv: internal error: branch target `" + p.label + "` was never defined (fail-closed)")
+    end
+    pi = pi + 1
+  end
+  Result::Ok(())
+end
+
+# ———————————————————————————————————————————————————————————————
+# The pre-call spill stores (mirrors thumb_emit_call_spills)
+# ———————————————————————————————————————————————————————————————
+# Register-resident pre-call segments whose end precedes the call at
+# `pos` store to their slots (invariant I2 — redundant for the
+# callee-saved pool but keeps the allocator target-agnostic, thumb's
+# note). The matching post-call reloads happen at each value's first
+# read after the call (rv_emit_use's alloc.reloads lookup) — nothing
+# further lives in the Call arm.
+def rv_emit_call_spills(inout re: RvEmit, alloc: LirAlloc, mdl_pool: Vec[Int], pos: Int, xlen: Int) -> Unit
+  var i = 0
+  while i < alloc.spills.len() do
+    if alloc.spills[i].0 == pos then
+      let vreg = alloc.spills[i].1
+      match alloc.segs_of.get(vreg)
+      when Option::Some(segs) then
+        match lir_seg_at(segs, pos - 1)
+        when Option::Some(s) then
+          if s.phys >= 0 && s.slot >= 0 then
+            rv_slot_store(re, rv_phys_of(mdl_pool, s.phys), s.slot, xlen)
+          end
+        when Option::None then ()
+        end
+      when Option::None then ()
+      end
+    end
+    i = i + 1
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# The saved-block access, prologue and epilogue
+# ———————————————————————————————————————————————————————————————
+# Saved register `idx` of rv_saved_regs(mdl_pool) sits at
+# [sp + frame_bytes + idx*xlen] — the block ABOVE the spill-slot area,
+# mirroring the thumb PUSH-above-frame layout. Direct ld/sd when the byte
+# offset fits the 12-bit field; beyond that the address base
+# sp + frame_bytes is built in t0 (a caller-saved temp — saved regs are
+# ra/s0/s1..s6, never t0) and the access uses [t0 + idx*xlen], whose
+# max of 7*xlen bytes always fits. The prologue runs the stores and the
+# epilogue the loads at the SAME offsets: the body never moves sp
+# (LirPushArg is rejected by rv_validate_fn), so sp still equals the
+# prologue's sp at every Ret.
+
+def rv_saved_access(inout re: RvEmit, reg: Int, frame_bytes: Int, idx: Int, xlen: Int, is_load: Bool) -> Unit
+  let off = frame_bytes + idx * xlen
+  let sp = rv_sp_reg()
+  if off >= -2048 && off <= 2047 then
+    if is_load then
+      if xlen == 8 then
+        rv_emit_word(re, rv_ld(reg, sp, off))
+      else
+        rv_emit_word(re, rv_lw(reg, sp, off))
+      end
+    else
+      if xlen == 8 then
+        rv_emit_word(re, rv_sd(reg, sp, off))
+      else
+        rv_emit_word(re, rv_sw(reg, sp, off))
+      end
+    end
+  else
+    if frame_bytes >= -2048 && frame_bytes <= 2047 then
+      rv_emit_word(re, rv_addi(rv_t0_reg(), sp, frame_bytes))
+    else
+      rv_emit_li(re, rv_t0_reg(), frame_bytes)
+      rv_emit_word(re, rv_add(rv_t0_reg(), sp, rv_t0_reg()))
+    end
+    if is_load then
+      if xlen == 8 then
+        rv_emit_word(re, rv_ld(reg, rv_t0_reg(), idx * xlen))
+      else
+        rv_emit_word(re, rv_lw(reg, rv_t0_reg(), idx * xlen))
+      end
+    else
+      if xlen == 8 then
+        rv_emit_word(re, rv_sd(reg, rv_t0_reg(), idx * xlen))
+      else
+        rv_emit_word(re, rv_sw(reg, rv_t0_reg(), idx * xlen))
+      end
+    end
+  end
+end
+
+# Prologue: allocate the total frame (addi sp, sp, -total for the 12-bit
+# range; li t0, total + sub sp, sp, t0 beyond — the thumb sub-imm7 /
+# movw+SUB.W split), store the saved registers above the slot area, then
+# s0 = sp (thumb's mov r7, sp). The driver bounds the frame before
+# emission, so every li here is in range (fail-closed).
+def rv_emit_prologue(inout re: RvEmit, mdl_pool: Vec[Int], frame_bytes: Int, xlen: Int) -> Unit
+  let saved = rv_saved_regs(mdl_pool)
+  let total = frame_bytes + saved.len() * xlen
+  if total <= 2047 then
+    rv_emit_word(re, rv_addi(rv_sp_reg(), rv_sp_reg(), -total))
+  else
+    rv_emit_li(re, rv_t0_reg(), total)
+    rv_emit_word(re, rv_sub(rv_sp_reg(), rv_sp_reg(), rv_t0_reg()))
+  end
+  var k = 0
+  while k < saved.len() do
+    rv_saved_access(re, saved[k], frame_bytes, k, xlen, false)
+    k = k + 1
+  end
+  rv_emit_word(re, rv_mv(rv_fp_reg(), rv_sp_reg()))
+end
+
+# Epilogue (at every Ret, the value already in a0): restore the saved
+# registers from [sp + frame_bytes + k*xlen], release the total frame
+# (addi sp, sp, total / li + add beyond), then ret. None of the saved
+# registers is a0, so the return value survives the restores.
+def rv_emit_epilogue(inout re: RvEmit, mdl_pool: Vec[Int], frame_bytes: Int, xlen: Int) -> Unit
+  let saved = rv_saved_regs(mdl_pool)
+  let total = frame_bytes + saved.len() * xlen
+  var k = 0
+  while k < saved.len() do
+    rv_saved_access(re, saved[k], frame_bytes, k, xlen, true)
+    k = k + 1
+  end
+  if total <= 2047 then
+    rv_emit_word(re, rv_addi(rv_sp_reg(), rv_sp_reg(), total))
+  else
+    rv_emit_li(re, rv_t0_reg(), total)
+    rv_emit_word(re, rv_add(rv_sp_reg(), rv_sp_reg(), rv_t0_reg()))
+  end
+  rv_emit_word(re, rv_ret())
+end
+
+# ———————————————————————————————————————————————————————————————
+# Terminator emission (mirrors thumb_emit_term)
+# ———————————————————————————————————————————————————————————————
+# Every arm is explicit; constructs outside the validated subset return
+# Err naming the rule (rv_validate_fn already rejected them — the arms
+# are defense in depth and never silently emit). A pending LirCmp at a
+# terminator is a lowering-invariant break (I1) and panics, mirroring the
+# Cmp/Cset arms' own discipline.
+
+def rv_emit_term(inout re: RvEmit, alloc: LirAlloc, mdl_pool: Vec[Int], fn_name: String, frame_bytes: Int, kind: LirTermKind, pos: Int, xlen: Int, externs: Set[String], defined: Set[String]) -> Result[Unit, String]
+  if re.cmp_left >= 0 then
+    panic("rv: terminator reached with a LirCmp still pending (lowering invariant I1: every LirCmp is consumed by the adjacent LirCset)")
+  end
+  match kind
+  when LirTermKind::LirJump(target) then
+    rv_emit_jump(re, lir_block_label(fn_name, target))
+  when LirTermKind::LirSwitch(vreg, arms, default_target) then
+    # Mirror thumb's per-arm compare chain. RISC-V branches compare their
+    # two registers directly (no flags), so each arm's equality test is
+    # its own register pair at the term position: the operand resolves
+    # once (position-keyed — the same use bookkeeping a LirCmp would
+    # run), arm value 0 compares against x0 (the thumb value-0 fusion
+    # note), any other value materializes into a temp avoiding the
+    # operand (rv_emit_li — rv_validate_fn bounds the arm values), then
+    # b<eq> to the arm block; the default is an unconditional jump.
+    let operand = rv_emit_use(re, alloc, mdl_pool, LirValue::LirReg(vreg), pos, rv_t0_reg(), xlen)
+    var ai = 0
+    while ai < arms.len() do
+      let arm = arms[ai]
+      if arm.value == 0 then
+        match rv_emit_b_cond(re, operand, 0, LirCond::LirEq, lir_block_label(fn_name, arm.target))
+        when Result::Err(e) then return Result::Err(e)
+        when Result::Ok(_) then ()
+        end
+      else
+        let scratch = rv_alt_pref(operand)
+        rv_emit_li(re, scratch, arm.value)
+        match rv_emit_b_cond(re, operand, scratch, LirCond::LirEq, lir_block_label(fn_name, arm.target))
+        when Result::Err(e) then return Result::Err(e)
+        when Result::Ok(_) then ()
+        end
+      end
+      ai = ai + 1
+    end
+    rv_emit_jump(re, lir_block_label(fn_name, default_target))
+  when LirTermKind::LirRet(rv) then
+    match rv
+    when Option::Some(vreg) then
+      let sr = rv_emit_use(re, alloc, mdl_pool, LirValue::LirReg(vreg), pos, rv_t0_reg(), xlen)
+      if sr != rv_fixed_phys(0) then
+        rv_emit_word(re, rv_mv(rv_fixed_phys(0), sr))
+      end
+    when Option::None then ()
+    end
+    rv_emit_epilogue(re, mdl_pool, frame_bytes, xlen)
+    Result::Ok(())
+  when LirTermKind::LirTrap then
+    rv_emit_word(re, rv_ebreak())
+    Result::Ok(())
+  when LirTermKind::LirCall(target, args, stack_args, dest, success) then
+    # Pre-call spill stores (register-resident values crossing the call).
+    rv_emit_call_spills(re, alloc, mdl_pool, pos, xlen)
+    # stack_args must be 0 here (rv_validate_fn rejects pushes).
+    if stack_args != 0 then
+      return Result::Err("rv: call to `" + target + "` carries caller stack slots — the a0-a7 register path has no stack-argument rule (rv_validate_fn rejects them; fail-closed)")
+    end
+    # args is carried for the allocator's benefit: its <= 8 fixed moves
+    # are ordinary statements (fixed LIR vreg i IS a_i = x(10+i) —
+    # rv_fixed_phys), so nothing reads args here. rv_validate_fn rejects
+    # args beyond a0-a7.
+    # The target model mirrors thumb_emit_bl exactly: a call to a DEFINED
+    # program function — itself included — is `jal ra, <label>` as a
+    # deferred patch (the label is a function label of the shared program
+    # text buffer; rv_resolve_patches resolves it after rv_compile_object
+    # emitted every function). A call whose target is declared extern, or
+    # is neither defined nor declared extern (thumb's defensive rule — a
+    # callee-validation break would have failed upstream), emits
+    # `jal ra, 0` and records an R_RISCV_JAL relocation for the ELF
+    # writer, so the linker resolves the extern.
+    if externs.contains(&target) || !defined.contains(&target) then
+      rv_emit_call_remote(re, target)
+    else
+      rv_emit_call(re, target)
+    end
+    # Result capture: a0 -> dest (a fixed or ordinary vreg def at pos).
+    match dest
+    when Option::Some(dv) then
+      let dt = rv_def_target(alloc, mdl_pool, dv, pos)
+      if dt.reg != rv_fixed_phys(0) then
+        rv_emit_word(re, rv_mv(dt.reg, rv_fixed_phys(0)))
+      end
+      if dt.store_slot >= 0 then
+        rv_slot_store(re, dt.reg, dt.store_slot, xlen)
+      end
+    when Option::None then ()
+    end
+    rv_emit_jump(re, lir_block_label(fn_name, success))
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Function emission (mirrors thumb_emit_fn)
+# ———————————————————————————————————————————————————————————————
+# Emits ONE LIR function into the SHARED program emit state `re` (the
+# route's single text buffer): the function symbol record (rv_emit_fn_
+# symbol), the entry label, the prologue (allocate the frame, store
+# ra + s0/fp + the pool registers above the spill area, s0 = sp), then
+# the blocks with the SAME position walk the allocator used (I3). The
+# pending LirCmp record resets at every block boundary (lowering never
+# leaves one pending). Calls resolve by the model documented on the Call
+# arm of rv_emit_term: defined program functions (self-recursion
+# included) defer a jal-ra patch whose label is the callee's function
+# label; extern targets record an R_RISCV_JAL relocation. rv_resolve_
+# patches runs ONCE in rv_compile_object, after every function is in the
+# buffer — every block label and function label is defined by then
+# (mirrors thumb_emit_fn + thumb_resolve_patches exactly).
+
+def rv_emit_fn(inout re: RvEmit, mdl_pool: Vec[Int], lir_fn: LirFunction, alloc: LirAlloc, externs: Set[String], defined: Set[String], xlen: Int) -> Result[Unit, String]
+  if xlen != 8 && xlen != 4 then
+    return Result::Err("rv: rv_emit_fn needs xlen 4 or 8 bytes (got " + xlen.to_string() + ")")
+  end
+  match rv_validate_fn(lir_fn, xlen)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(_) then ()
+  end
+  # Frame bound (fail-closed, before any emission — the thumb slots bound
+  # mirror): frame_bytes + the 8-register saved block must stay inside the
+  # rv_li materialization range the frame/address path uses (slot offsets
+  # beyond the 12-bit field are built with rv_emit_li; a too-large frame
+  # would panic there — never a silently truncated address).
+  let frame_bytes = rv_frame_bytes(alloc.slots, xlen)
+  let saved = rv_saved_regs(mdl_pool)
+  let total = frame_bytes + saved.len() * xlen
+  if !rv_imm_li_ok(total) then
+    return Result::Err("rv: function " + lir_fn.name + " needs a " + total.to_string() + "-byte frame (" + alloc.slots.to_string() + " spill slots) — larger than the rv_li address-materialization range [-2^31, 2^31 - 2049]; full 64-bit frame materialization is a later slice (fail-closed)")
+  end
+
+  # Symbol + entry label, then the prologue. (P1-18 @cold): the
+  # declared hint rides the LIR record (LirFunction.attr_cold — stamped
+  # from MirFunction at lowering); the symbol routes into the cold
+  # section when set.
+  rv_emit_fn_symbol(re, lir_fn.name.clone(), lir_fn.attr_cold)
+  def_label(&mut re.buf, lir_fn.name.clone())
+  rv_emit_prologue(re, mdl_pool, frame_bytes, xlen)
+
+  # Blocks, in order, with the SAME position walk the allocator used
+  # (invariant I3).
+  var pos = 0
+  var bi = 0
+  while bi < lir_fn.blocks.len() do
+    let b = lir_fn.blocks[bi]
+    # Pending-compare reset at the block boundary (lowering never leaves
+    # one pending — a LirCmp's Cset is adjacent in the same block).
+    re.cmp_left = -1
+    re.cmp_right = -1
+    def_label(&mut re.buf, lir_block_label(lir_fn.name.clone(), b.id))
+    var si = 0
+    while si < b.stmts.len() do
+      match rv_emit_stmt(re, alloc, mdl_pool, b.stmts[si].kind, pos, xlen)
+      when Result::Err(e) then return Result::Err(e)
+      when Result::Ok(_) then ()
+      end
+      pos = pos + 1
+      si = si + 1
+    end
+    match rv_emit_term(re, alloc, mdl_pool, lir_fn.name.clone(), frame_bytes, b.term.kind, pos, xlen, externs, defined)
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(_) then ()
+    end
+    pos = pos + 1
+    bi = bi + 1
+  end
+  Result::Ok(())
+end
+
+# ———————————————————————————————————————————————————————————————
+# ELF32/ELF64 RISC-V (EM_RISCV = 243) relocatable-object writer
+# (slice 3d — mirrors thumb_elf32_obj def-for-def)
+# ———————————————————————————————————————————————————————————————
+# Emits the machine-code buffer as a REAL elf32-little / elf64-little
+# RISC-V relocatable object, mirroring the layout clang/LLVM produces
+# (the same five-section shape thumb_elf32_obj emits):
+#   e_type ET_REL, e_machine EM_RISCV (243), e_flags 0 (the base RV32/
+#   RV64 profile: no EF_RISCV_RVC — this backend never emits compressed
+#   instructions — and no float-ABI bits);
+#   ONE shared string table that carries BOTH the section names and the
+#   symbol names (e_shstrndx = its index — the clang/thumb convention,
+#   no separate .shstrtab);
+#   .text (PROGBITS, AX, align 4), .rela.text (SHT_RELA — RISC-V is
+#   RELA-only at every xlen, so the RV mirror of thumb's SHT_REL carries
+#   R_RISCV_JAL = 17 entries with an explicit 0 addend), .symtab (align
+#   8 on ELF64 / 4 on ELF32), .strtab;
+#   extern call targets are undefined global symbols resolved by the
+#   linker through the R_RISCV_JAL relocations. RISC-V needs no ARM-style
+#   "$t" mapping symbols (there is no Thumb bit to mark), so the symbol
+#   table is null + the function globals + the .data static globals +
+#   the extern undefined globals and the first global index is 1.
+# .data (PROGBITS, AW, the static scalar images — present only when
+# the program has statics) sits between .text and .rela.text; the text
+# relocations serialize per record type: R_RISCV_JAL (17) for the
+# deferred extern calls and the R_RISCV_HI20 (26) / R_RISCV_LO12_I (27)
+# pair of the LUI/ADDI static-value loads. (No .rela.data exists: the
+# scalar-constant subset needs no data relocations — the images are
+# literal bytes.)
+# xlen is in BYTES: 8 -> ELF64 (64-byte ehdr/shdr, 24-byte symtab
+# entries, 64-bit r_info = (sym << 32) | type, 8-byte offsets/addends);
+# 4 -> ELF32 (52-byte ehdr, 40-byte shdr, 16-byte symtab entries,
+# 32-bit r_info = (sym << 8) | type, 4-byte fields). Both little-endian.
+
+# Write a 2-byte little-endian field.
+def rv_w16(inout out: Vec[u8], v: Int) -> Unit
+  out.push((v & 0xFF) as u8)
+  out.push(((v >> 8) & 0xFF) as u8)
+end
+
+# Write a 4-byte little-endian field.
+def rv_w32(inout out: Vec[u8], v: Int) -> Unit
+  out.push((v & 0xFF) as u8)
+  out.push(((v >> 8) & 0xFF) as u8)
+  out.push(((v >> 16) & 0xFF) as u8)
+  out.push(((v >> 24) & 0xFF) as u8)
+end
+
+# Write an 8-byte little-endian field from a non-negative Int (offsets,
+# sizes and r_info values never approach the sign bit here).
+def rv_w64(inout out: Vec[u8], v: Int) -> Unit
+  rv_w32(out, v & 0xFFFFFFFF)
+  rv_w32(out, (v >> 32) & 0xFFFFFFFF)
+end
+
+# Write a width-class field: 8 bytes on ELF64, 4 on ELF32 (the ehdr
+# entry/phoff/shoff, the shdr flags/addr/offset/size/align/entsize, the
+# symtab value/size and the rela offset/info/addend widths).
+def rv_w_field(inout out: Vec[u8], v: Int, is64: Bool) -> Unit
+  if is64 then
+    rv_w64(out, v)
+  else
+    rv_w32(out, v)
+  end
+end
+
+# Align n up to a (a power of two).
+def rv_align_of(n: Int, a: Int) -> Int
+  let rem = n % a
+  if rem != 0 then
+    n + (a - rem)
+  else
+    n
+  end
+end
+
+# An ELF string table appended to `out`; returns the offset of each
+# string so callers can fill sh_name/st_name fields. The first byte is
+# the mandatory NUL (mirrors thumb_strtab_add).
+def rv_strtab_add(inout out: Vec[u8], names: Vec[String]) -> Vec[Int]
+  var offsets: Vec[Int] = Vec::new()
+  var oi = 0
+  while oi < names.len() do
+    let off = out.len()
+    offsets.push(off)
+    let name_bytes = names[oi].bytes()
+    var ci = 0
+    while ci < name_bytes.len() do
+      out.push(name_bytes[ci])
+      ci = ci + 1
+    end
+    out.push(0)
+    oi = oi + 1
+  end
+  offsets
+end
+
+# Build the object bytes. `xlen` = 4 or 8 (bytes); `fns` = (name, code
+# offset) pairs in program order; `datas` = (name, data offset, size)
+# triples of the emitted static images (program order); `exts` = extern
+# names in program order; `relocs` = the relocation sites (offset,
+# symbol, ELF RISC-V type) over the whole code buffer; `code` = the
+# code bytes; `data` = the .data bytes. `cold_base` = the code offset
+# where the @cold region begins (-1 when the program has no @cold
+# functions — see rv_compile_object's deferred cold pass). The code
+# stream is ONE buffer; the writer splits it at cold_base into two real
+# executable sections — .text (the hot bytes) and .text.cold (the @cold
+# tail, PROGBITS AX), each with its own section name, symbol-table
+# entries (fn values rebased into the cold section) and relocation
+# section (.rela.text.cold for the sites inside the tail). Objects
+# without @cold code keep the exact pre-@cold layout. Section layout:
+# 0 null, 1 strtab (shared name table, e_shstrndx), 2 .text,
+# 3 .text.cold (only when cold_base >= 0), then .data (only when
+# statics emitted), .rela.text (only when hot relocations exist),
+# .rela.text.cold (only when cold relocations exist), then .symtab
+# LAST.
+def rv_elf_obj(xlen: Int, code: Vec[u8], fns: Vec[(String, Int)], datas: Vec[(String, Int, Int)], exts: Vec[String], relocs: Vec[RvReloc], data: Vec[u8], cold_base: Int) -> Vec[u8]
+  if xlen != 8 && xlen != 4 then
+    panic("rv_elf_obj: xlen must be 4 or 8 bytes (got " + xlen.to_string() + ")")
+  end
+  let is64 = xlen == 8
+  let ehsize = if is64 then 64 else 52 end
+  let shdr_w = if is64 then 64 else 40 end
+  let sym_w = if is64 then 24 else 16 end
+  let rela_w = if is64 then 24 else 12 end
+  let big_align = if is64 then 8 else 4 end
+  let has_cold = cold_base >= 0 && cold_base < code.len()
+  let hot_size = if has_cold then cold_base else code.len() end
+  let cold_size = code.len() - hot_size
+  # Partition the relocations by site: a site in the cold region
+  # ([cold_base, len) — an extern call or static reference from an
+  # @cold body) belongs to .rela.text.cold with its offset rebased into
+  # that section.
+  var rel_hot: Vec[RvReloc] = Vec::new()
+  var rel_cold: Vec[RvReloc] = Vec::new()
+  var rpi = 0
+  while rpi < relocs.len() do
+    let r = relocs[rpi]
+    if has_cold && r.offset >= cold_base then
+      rel_cold.push(RvReloc { offset: r.offset - cold_base, sym: r.sym.clone(), kind: r.kind })
+    else
+      rel_hot.push(RvReloc { offset: r.offset, sym: r.sym.clone(), kind: r.kind })
+    end
+    rpi = rpi + 1
+  end
+  let has_rel_hot = rel_hot.len() > 0
+  let has_rel_cold = rel_cold.len() > 0
+  let has_data = data.len() > 0
+  let n_sections = 4 + (if has_cold then 1 else 0 end) + (if has_data then 1 else 0 end) + (if has_rel_hot then 1 else 0 end) + (if has_rel_cold then 1 else 0 end)
+  # Section indexes: 0 null, 1 strtab, 2 .text, 3 .text.cold
+  # (optional), then .data (optional), .rela.text (optional),
+  # .rela.text.cold (optional), .symtab last.
+  let text_idx = 2
+  let text_cold_idx = if has_cold then 3 else -1 end
+  let data_idx = 3 + (if has_cold then 1 else 0 end)
+  let symtab_idx = n_sections - 1
+
+  # Symbol plan (ELF ordering: globals only — sh_info = 1): RISC-V uses
+  # no Thumb-style "$t" mapping symbols (there is no Thumb state to
+  # map), so there are NO locals — the function globals come first,
+  # then the .data static globals, then the extern undefined globals.
+  var global_names: Vec[String] = Vec::new()   # fns then datas then exts
+  var fi = 0
+  while fi < fns.len() do
+    global_names.push(fns[fi].0.clone())
+    fi = fi + 1
+  end
+  var di = 0
+  while di < datas.len() do
+    global_names.push(datas[di].0.clone())
+    di = di + 1
+  end
+  var ei = 0
+  while ei < exts.len() do
+    global_names.push(exts[ei].clone())
+    ei = ei + 1
+  end
+  let n_syms = 1 + global_names.len()
+  let first_global = 1
+
+  # Section names (in the same string table): the table itself opens
+  # with a NUL, then the section names (in section-index order), then
+  # every symbol name; the sec_offs positions are captured per section
+  # by the append order.
+  var strtab: Vec[u8] = Vec::new()
+  strtab.push(0)
+  var sec_names: Vec[String] = Vec::new()
+  sec_names.push(".text".to_string())
+  if has_cold then
+    sec_names.push(".text.cold".to_string())
+  end
+  if has_data then
+    sec_names.push(".data".to_string())
+  end
+  if has_rel_hot then
+    sec_names.push(".rela.text".to_string())
+  end
+  if has_rel_cold then
+    sec_names.push(".rela.text.cold".to_string())
+  end
+  sec_names.push(".symtab".to_string())
+  sec_names.push(".strtab".to_string())
+  let sec_offs = rv_strtab_add(strtab, sec_names)
+  let text_name_idx = 0
+  let text_cold_name_idx = if has_cold then 1 else -1 end
+  let data_name_idx = if has_data then (if has_cold then 2 else 1 end) else -1 end
+  let rel_name_idx = if has_rel_hot then (if has_cold then 1 else 0 end) + (if has_data then 1 else 0 end) + 1 else -1 end
+  let rel_cold_name_idx = if has_rel_cold then (if has_cold then 1 else 0 end) + (if has_data then 1 else 0 end) + (if has_rel_hot then 1 else 0 end) + 1 else -1 end
+  let symtab_name_idx = sec_names.len() - 2
+  let strtab_name_idx = sec_names.len() - 1
+  let sym_offs = rv_strtab_add(strtab, global_names)
+  let strtab_size = strtab.len()
+
+  # File offsets (ehdr first; ELF64 wide tables 8-aligned, ELF32
+  # 4-aligned — the symtab/rela entries carry wide fields) — .text,
+  # then .text.cold (directly after — the code stream's byte order is
+  # preserved in the file), then .data, then .rela.text, then
+  # .rela.text.cold, then .symtab, then the strtab, then the section
+  # headers.
+  let off_text = ehsize
+  let off_cold = off_text + hot_size
+  let off_data = rv_align_of(off_cold + cold_size, big_align)
+  let data_size = data.len()
+  let off_rel = rv_align_of(off_data + data_size, big_align)
+  let rel_size = rel_hot.len() * rela_w
+  let off_rel_cold = rv_align_of(off_rel + rel_size, big_align)
+  let rel_cold_size = rel_cold.len() * rela_w
+  let off_sym = rv_align_of(off_rel_cold + rel_cold_size, big_align)
+  let sym_size = n_syms * sym_w
+  let off_str = rv_align_of(off_sym + sym_size, 4)
+  let off_sh = rv_align_of(off_str + strtab_size, big_align)
+
+  var out: Vec[u8] = Vec::new()
+  # ELF header (52 bytes on ELF32, 64 on ELF64).
+  out.push(0x7F); out.push(0x45); out.push(0x4C); out.push(0x46)
+  let cls = if is64 then 2 else 1 end   # ELFCLASS64 / ELFCLASS32
+  out.push(cls as u8)
+  out.push(1)   # ELFDATA2LSB
+  out.push(1)   # EV_CURRENT
+  var zi = 0
+  while zi < 9 do
+    out.push(0)
+    zi = zi + 1
+  end
+  rv_w16(out, 1)                # e_type = ET_REL
+  rv_w16(out, 243)              # e_machine = EM_RISCV
+  rv_w32(out, 1)                # e_version
+  rv_w_field(out, 0, is64)      # e_entry
+  rv_w_field(out, 0, is64)      # e_phoff
+  rv_w_field(out, off_sh, is64) # e_shoff
+  rv_w32(out, 0)                # e_flags = 0 (base profile: no
+                                # EF_RISCV_RVC, no float-ABI bits)
+  rv_w16(out, ehsize)           # e_ehsize
+  rv_w16(out, 0)                # e_phentsize
+  rv_w16(out, 0)                # e_phnum
+  rv_w16(out, shdr_w)           # e_shentsize
+  rv_w16(out, n_sections)       # e_shnum
+  rv_w16(out, 1)                # e_shstrndx = the strtab section
+
+  # .text (pad to its offset, then the hot code) followed by .text.cold
+  # (the @cold tail — the code stream's bytes are emitted in order).
+  while out.len() < off_text do
+    out.push(0)
+  end
+  var ci = 0
+  while ci < hot_size do
+    out.push(code[ci])
+    ci = ci + 1
+  end
+  if has_cold then
+    while ci < code.len() do
+      out.push(code[ci])
+      ci = ci + 1
+    end
+  end
+
+  # .data (the static images).
+  if has_data then
+    while out.len() < off_data do
+      out.push(0)
+    end
+    var di2 = 0
+    while di2 < data_size do
+      out.push(data[di2])
+      di2 = di2 + 1
+    end
+  end
+
+  # .rela.text (the hot relocations).
+  if has_rel_hot then
+    while out.len() < off_rel do
+      out.push(0)
+    end
+    var ri = 0
+    while ri < rel_hot.len() do
+      # The symbol index of the relocation target: the global symbols
+      # (fns, then datas, then externs — the order of global_names).
+      var sym_idx = 0
+      var found = false
+      var gj = 0
+      while gj < global_names.len() do
+        if global_names[gj] == rel_hot[ri].sym then
+          sym_idx = first_global + gj
+          found = true
+          gj = global_names.len() + 1
+        else
+          gj = gj + 1
+        end
+      end
+      if !found then
+        # Defensive: a relocation whose target is not a global symbol
+        # of this object (a program function would mean the
+        # defined/extern classification drifted — guarded upstream in
+        # the rv_emit_term Call arm and the LirStaticLoad arm; emitting
+        # a broken section is NOT acceptable) is written against the
+        # null symbol so the link errors visibly instead of silently
+        # mislinking (the thumb writer's identical defense).
+        sym_idx = 0
+      end
+      # r_info: (sym << 32) | type on ELF64, (sym << 8) | type on
+      # ELF32 — the per-record type (17 = R_RISCV_JAL, 26 = HI20,
+      # 27 = LO12_I).
+      let info_bits = if is64 then ((sym_idx << 32) | rel_hot[ri].kind) else ((sym_idx << 8) | rel_hot[ri].kind) end
+      rv_w_field(out, rel_hot[ri].offset, is64)   # r_offset
+      rv_w_field(out, info_bits, is64)           # r_info
+      rv_w_field(out, 0, is64)                   # r_addend (imm fields are 0)
+      ri = ri + 1
+    end
+  end
+
+  # .rela.text.cold (the @cold bodies' relocation sites — extern calls
+  # and static references inside the tail, rebased into .text.cold).
+  if has_rel_cold then
+    while out.len() < off_rel_cold do
+      out.push(0)
+    end
+    var ri2 = 0
+    while ri2 < rel_cold.len() do
+      var sym_idx = 0
+      var found = false
+      var gj = 0
+      while gj < global_names.len() do
+        if global_names[gj] == rel_cold[ri2].sym then
+          sym_idx = first_global + gj
+          found = true
+          gj = global_names.len() + 1
+        else
+          gj = gj + 1
+        end
+      end
+      if !found then
+        sym_idx = 0
+      end
+      let info_bits2 = if is64 then ((sym_idx << 32) | rel_cold[ri2].kind) else ((sym_idx << 8) | rel_cold[ri2].kind) end
+      rv_w_field(out, rel_cold[ri2].offset, is64)  # r_offset (section-relative)
+      rv_w_field(out, info_bits2, is64)            # r_info
+      rv_w_field(out, 0, is64)                     # r_addend
+      ri2 = ri2 + 1
+    end
+  end
+
+  # .symtab.
+  while out.len() < off_sym do
+    out.push(0)
+  end
+  # Entry 0: null.
+  var si3 = 0
+  while si3 < sym_w do
+    out.push(0)
+    si3 = si3 + 1
+  end
+  # Function globals (STB_GLOBAL | STT_FUNC, value = fn offset within
+  # its section, shndx = .text or — for a function in the cold region —
+  # .text.cold with its value rebased into that section).
+  var fni = 0
+  while fni < fns.len() do
+    let rv_fn_off = fns[fni].1
+    let rv_in_cold = has_cold && rv_fn_off >= cold_base
+    let rv_fn_value = if rv_in_cold then rv_fn_off - cold_base else rv_fn_off end
+    let rv_fn_shndx = if rv_in_cold then text_cold_idx else text_idx end
+    if is64 then
+      rv_w32(out, sym_offs[fni])   # st_name
+      out.push(0x12)               # STB_GLOBAL | STT_FUNC
+      out.push(0)                  # st_other
+      rv_w16(out, rv_fn_shndx)     # st_shndx
+      rv_w_field(out, rv_fn_value, true)  # st_value
+      rv_w_field(out, 0, true)           # st_size
+    else
+      rv_w32(out, sym_offs[fni])   # st_name
+      rv_w32(out, rv_fn_value)     # st_value
+      rv_w32(out, 0)               # st_size
+      out.push(0x12)               # STB_GLOBAL | STT_FUNC
+      out.push(0)                  # st_other
+      rv_w16(out, rv_fn_shndx)     # st_shndx
+    end
+    fni = fni + 1
+  end
+  # The .data static globals (STB_GLOBAL | STT_OBJECT, .data, value =
+  # the image's data offset, size = the image size).
+  if has_data then
+    var dd = 0
+    while dd < datas.len() do
+      if is64 then
+        rv_w32(out, sym_offs[fns.len() + dd])
+        out.push(0x11)               # STB_GLOBAL | STT_OBJECT
+        out.push(0)
+        rv_w16(out, data_idx)        # st_shndx
+        rv_w_field(out, datas[dd].1, true)  # st_value
+        rv_w_field(out, datas[dd].2, true)  # st_size
+      else
+        rv_w32(out, sym_offs[fns.len() + dd])
+        rv_w32(out, datas[dd].1)     # st_value
+        rv_w32(out, datas[dd].2)     # st_size
+        out.push(0x11)               # STB_GLOBAL | STT_OBJECT
+        out.push(0)
+        rv_w16(out, data_idx)        # st_shndx
+      end
+      dd = dd + 1
+    end
+  end
+  # Extern undefined globals (STB_GLOBAL | STT_NOTYPE, SHN_UNDEF).
+  var exi = 0
+  while exi < exts.len() do
+    if is64 then
+      rv_w32(out, sym_offs[fns.len() + datas.len() + exi])
+      out.push(0x10)               # STB_GLOBAL | STT_NOTYPE
+      out.push(0)
+      rv_w16(out, 0)               # st_shndx = SHN_UNDEF
+      rv_w_field(out, 0, true)     # st_value
+      rv_w_field(out, 0, true)     # st_size
+    else
+      rv_w32(out, sym_offs[fns.len() + datas.len() + exi])
+      rv_w32(out, 0)               # st_value
+      rv_w32(out, 0)               # st_size
+      out.push(0x10)               # STB_GLOBAL | STT_NOTYPE
+      out.push(0)
+      rv_w16(out, 0)               # st_shndx = SHN_UNDEF
+    end
+    exi = exi + 1
+  end
+
+  # .strtab.
+  while out.len() < off_str do
+    out.push(0)
+  end
+  var sti = 0
+  while sti < strtab_size do
+    out.push(strtab[sti])
+    sti = sti + 1
+  end
+
+  # Section headers (64 bytes each on ELF64, 40 on ELF32). Each header
+  # is written name u32 / type u32 / then six width-class fields / link
+  # u32 / info u32 / then two width-class fields — the ELF32 layout is
+  # the same field sequence at 4 bytes each (the thumb shape).
+  while out.len() < off_sh do
+    out.push(0)
+  end
+  # [0] null.
+  var zj = 0
+  while zj < shdr_w do
+    out.push(0)
+    zj = zj + 1
+  end
+  # [1] strtab (the name table: sh_name points at its own ".strtab").
+  rv_w32(out, sec_offs[strtab_name_idx])
+  rv_w32(out, 3)                       # SHT_STRTAB
+  rv_w_field(out, 0, is64)             # sh_flags
+  rv_w_field(out, 0, is64)             # sh_addr
+  rv_w_field(out, off_str, is64)       # sh_offset
+  rv_w_field(out, strtab_size, is64)   # sh_size
+  rv_w32(out, 0)                       # sh_link
+  rv_w32(out, 0)                       # sh_info
+  rv_w_field(out, 1, is64)             # sh_addralign
+  rv_w_field(out, 0, is64)             # sh_entsize
+  # [2] .text (the hot code — size hot_size when a cold region exists,
+  # the full code otherwise).
+  rv_w32(out, sec_offs[text_name_idx])
+  rv_w32(out, 1)                       # SHT_PROGBITS
+  rv_w_field(out, 0x6, is64)           # SHF_ALLOC | SHF_EXECINSTR
+  rv_w_field(out, 0, is64)             # sh_addr
+  rv_w_field(out, off_text, is64)      # sh_offset
+  rv_w_field(out, hot_size, is64)      # sh_size
+  rv_w32(out, 0)                       # sh_link
+  rv_w32(out, 0)                       # sh_info
+  rv_w_field(out, 4, is64)             # sh_addralign
+  rv_w_field(out, 0, is64)             # sh_entsize
+  if has_cold then
+    # [3] .text.cold (the @cold bodies; RISC-V instructions are 4-byte
+    # aligned, so the section alignment is 4 — the section follows
+    # .text directly, preserving the code stream's byte order).
+    rv_w32(out, sec_offs[text_cold_name_idx])
+    rv_w32(out, 1)                       # SHT_PROGBITS
+    rv_w_field(out, 0x6, is64)           # SHF_ALLOC | SHF_EXECINSTR
+    rv_w_field(out, 0, is64)             # sh_addr
+    rv_w_field(out, off_cold, is64)      # sh_offset
+    rv_w_field(out, cold_size, is64)     # sh_size
+    rv_w32(out, 0)                       # sh_link
+    rv_w32(out, 0)                       # sh_info
+    rv_w_field(out, 4, is64)             # sh_addralign
+    rv_w_field(out, 0, is64)             # sh_entsize
+  end
+  if has_data then
+    # [3/4] .data (the static images; every image is one xlen-aligned
+    # word, so the section alignment is xlen).
+    rv_w32(out, sec_offs[data_name_idx])
+    rv_w32(out, 1)                     # SHT_PROGBITS
+    rv_w_field(out, 0x3, is64)         # SHF_ALLOC | SHF_WRITE
+    rv_w_field(out, 0, is64)           # sh_addr
+    rv_w_field(out, off_data, is64)    # sh_offset
+    rv_w_field(out, data_size, is64)   # sh_size
+    rv_w32(out, 0)                     # sh_link
+    rv_w32(out, 0)                     # sh_info
+    rv_w_field(out, big_align, is64)   # sh_addralign
+    rv_w_field(out, 0, is64)           # sh_entsize
+  end
+  if has_rel_hot then
+    rv_w32(out, sec_offs[rel_name_idx])
+    rv_w32(out, 4)                     # SHT_RELA
+    rv_w_field(out, 0, is64)           # sh_flags
+    rv_w_field(out, 0, is64)           # sh_addr
+    rv_w_field(out, off_rel, is64)     # sh_offset
+    rv_w_field(out, rel_size, is64)    # sh_size
+    rv_w32(out, symtab_idx)            # sh_link = the symtab
+    rv_w32(out, text_idx)              # sh_info = .text
+    rv_w_field(out, big_align, is64)   # sh_addralign
+    rv_w_field(out, rela_w, is64)      # sh_entsize
+  end
+  if has_rel_cold then
+    # .rela.text.cold — the relocation table of .text.cold (sh_info =
+    # the cold section's index).
+    rv_w32(out, sec_offs[rel_cold_name_idx])
+    rv_w32(out, 4)                     # SHT_RELA
+    rv_w_field(out, 0, is64)           # sh_flags
+    rv_w_field(out, 0, is64)           # sh_addr
+    rv_w_field(out, off_rel_cold, is64)  # sh_offset
+    rv_w_field(out, rel_cold_size, is64) # sh_size
+    rv_w32(out, symtab_idx)            # sh_link = the symtab
+    rv_w32(out, text_cold_idx)         # sh_info = .text.cold
+    rv_w_field(out, big_align, is64)   # sh_addralign
+    rv_w_field(out, rela_w, is64)      # sh_entsize
+  end
+  # The last section header is .symtab.
+  rv_w32(out, sec_offs[symtab_name_idx])
+  rv_w32(out, 2)                       # SHT_SYMTAB
+  rv_w_field(out, 0, is64)             # sh_flags
+  rv_w_field(out, 0, is64)             # sh_addr
+  rv_w_field(out, off_sym, is64)       # sh_offset
+  rv_w_field(out, sym_size, is64)      # sh_size
+  rv_w32(out, 1)                       # sh_link = strtab
+  rv_w32(out, first_global)            # sh_info = first global index
+  rv_w_field(out, big_align, is64)     # sh_addralign
+  rv_w_field(out, sym_w, is64)         # sh_entsize
+
+  out
+end
+
+# ———————————————————————————————————————————————————————————————
+# Whole-program route (mirrors lir_compile_object / thumb_compile_object)
+# ———————————————————————————————————————————————————————————————
+# The driver's LIR gate (TANGERINE_LIR_TARGET=riscv32 / riscv64) routes
+# single files here: the program's statics lower through the
+# scalar-constant subset into a .data image (see the statics section
+# above), every non-extern function goes through the LIR
+# pipeline (fail-closed: one unsupported construct fails the whole
+# compile with a rule-naming reason), the bodies are emitted into one
+# shared text buffer with the runtime-free conventions above, deferred
+# patches resolve once every function label is in the buffer, and the
+# buffer is serialized as the ELF32 (xlen 4) / ELF64 (xlen 8) RISC-V
+# relocatable object through rv_elf_obj. No runtime merge: the aarch64
+# runtime buffers in codegen.tg are aarch64 machine code and cannot be
+# mixed into a RISC-V object (a RISC-V runtime is a separate slice;
+# externs resolve through the object's undefined symbols instead).
+
+# Collect the (name, offset) function symbols in program order from the
+# emit state's symbol records (mirrors thumb_collect_fns). (P1-18
+# @cold): a ColdText symbol (an attr_cold function of the deferred cold
+# pass) is a function of the same code buffer — its tuple rides along
+# and the ELF writer assigns it to .text.cold by its offset (>= the
+# cold_base it receives).
+def rv_collect_fns(re: RvEmit) -> Vec[(String, Int)]
+  var fns: Vec[(String, Int)] = Vec::new()
+  var i = 0
+  while i < re.syms.len() do
+    let s = re.syms[i]
+    if s.section == Section::Text || s.section == Section::ColdText then
+      fns.push((s.name.clone(), s.offset))
+    end
+    i = i + 1
+  end
+  fns
+end
+
+# Collect the extern undefined symbol names in program order (mirrors
+# thumb_collect_exts).
+def rv_collect_exts(re: RvEmit) -> Vec[String]
+  var exts: Vec[String] = Vec::new()
+  var i = 0
+  while i < re.syms.len() do
+    let s = re.syms[i]
+    if s.section == Section::Extern then
+      exts.push(s.name.clone())
+    end
+    i = i + 1
+  end
+  exts
+end
+
+# Collect the (name, offset, size) .data symbols in program order (the
+# static images the route's data emission registered).
+def rv_collect_datas(re: RvEmit) -> Vec[(String, Int, Int)]
+  var datas: Vec[(String, Int, Int)] = Vec::new()
+  var i = 0
+  while i < re.syms.len() do
+    let s = re.syms[i]
+    if s.section == Section::Data then
+      datas.push((s.name.clone(), s.offset, s.size))
+    end
+    i = i + 1
+  end
+  datas
+end
+
+# ———————————————————————————————————————————————————————————————
+# Whole-program static data emission (the scalar-constant subset)
+# ———————————————————————————————————————————————————————————————
+# rv_compile_object emits the program's statics into a .data image
+# instead of failing closed (see lir.tg's statics section for the
+# shared admission model — lir_static_scalar_ok with the word-only
+# accept set: the 64-bit integer words plus Bool — and the
+# lir_static_init_word_value initializer subset). Each admitted static
+# becomes ONE xlen-wide machine word at an xlen-aligned .data offset:
+# the initializer's low word (Bool: the 0/1 byte in the low byte,
+# zeros above — the full-word load of the reference reads it back as
+# the canonical 0/1 or value word). On RV32 (xlen 4) initializer
+# values must have a faithful 32-bit image ([-2^31, 2^32) — the
+# register-image rule the LIR word model uses); on RV64 (xlen 8) the
+# full 64-bit value stores directly. Uninitialized/extern statics emit
+# the zero word (semantically the direct route's zero-initialized .bss
+# slot; the ELF writer of this slice has no .bss section, and a zero
+# .data word links identically). The data symbols are GLOBAL
+# SymKind::Data records (the reference relocations resolve against
+# them); the symbol size is the xlen-wide image size.
+def rv_emit_static_data(inout data: Vec[u8], inout syms: Vec[AsmSymbol], st: MirStatic, xlen: Int) -> Result[Unit, String]
+  let ty = st.ty.clone()
+  if !lir_static_scalar_ok(false, ty) then
+    return Result::Err("rv: " + lir_static_unsupported_type_rule(st.name.clone()))
+  end
+  let word_o = match lir_static_init_word_value(st)
+  when Result::Err(e) then return Result::Err("rv: " + e)
+  when Result::Ok(o) then o
+  end
+  let off = data.len()
+  match word_o
+  when Option::Some(v) then
+    if xlen == 4 then
+      if v < -2147483648 || v > 4294967295 then
+        return Result::Err("rv: static '" + st.name + "' initializer " + v.to_string() + " does not fit the 32-bit riscv word model [-2^31, 2^32) — the value has no faithful 32-bit image (fail-closed)")
+      end
+      rv_w32(data, v & 0xFFFFFFFF)
+    else
+      rv_w64(data, v & 0xFFFFFFFFFFFFFFFF)
+    end
+  when Option::None then
+    if xlen == 4 then
+      rv_w32(data, 0)
+    else
+      rv_w64(data, 0)
+    end
+  end
+  syms.push(AsmSymbol {
+    name: st.name.clone(),
+    section: Section::Data,
+    offset: off,
+    size: xlen,
+    binding: SymBinding::Global,
+    kind: SymKind::Data
+  })
+  Result::Ok(())
+end
+
+# Emit the whole program's statics into the .data byte buffer and its
+# symbol records (the route's mirror of lir_emit_program_statics_a64).
+def rv_emit_program_statics(inout data: Vec[u8], inout syms: Vec[AsmSymbol], program: MirProgram, xlen: Int) -> Result[Unit, String]
+  var si = 0
+  while si < program.statics.len() do
+    match rv_emit_static_data(&mut data, &mut syms, &program.statics[si], xlen)
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(_) then ()
+    end
+    si = si + 1
+  end
+  Result::Ok(())
+end
+
+# Compile the whole program to a RISC-V ELF relocatable object.
+# `xlen` selects the class: 8 -> ELF64 riscv64, 4 -> ELF32 riscv32
+# (rv_target_desc drives the register model of both). Program statics
+# lower through the scalar-constant subset (see the statics section
+# above): the .data image is emitted before the function bodies
+# (mirroring codegen_program's ordering), and the LUI/ADDI static-
+# value loads reference the emitted symbols through their HI20/LO12
+# relocation pair.
+def rv_compile_object(program: MirProgram, xlen: Int) -> Result[Vec[u8], String]
+  if xlen != 8 && xlen != 4 then
+    return Result::Err("rv: rv_compile_object needs xlen 4 or 8 bytes (got " + xlen.to_string() + ")")
+  end
+  # The whole-program static label table (DefId-render -> emission name
+  # — the codegen.tg builder, the same table the direct emitter's
+  # codegen_program runs): the MirStaticRef lowering resolves static
+  # references through it (passed to the lowering entries below).
+  var static_labels: Map[String, String] = Map::new()
+  build_static_label_table(program, &mut static_labels)
+  var data: Vec[u8] = Vec::new()
+  let desc = rv_target_desc(xlen)
+  let mdl_pool = match rv_mdl_pool(desc, xlen)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(p) then p
+  end
+  var externs: Set[String] = Set::new()
+  var defined: Set[String] = Set::new()
+  var fi = 0
+  while fi < program.functions.len() do
+    let f = program.functions[fi]
+    if f.is_extern then
+      externs.insert(f.name.clone())
+    else
+      defined.insert(f.name.clone())
+    end
+    fi = fi + 1
+  end
+  var re = rv_emit_new()
+  # Emit the program's static scalar images into the .data buffer and
+  # their symbol records BEFORE any function body (mirroring
+  # codegen_program's ordering), so the symbols the LirStaticLoad
+  # reference relocations target exist up front.
+  match rv_emit_program_statics(&mut data, &mut re.syms, program, xlen)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(_) then ()
+  end
+  fi = 0
+  while fi < program.functions.len() do
+    let f = program.functions[fi]
+    if f.is_extern then
+      # Extern functions get no body — an undefined symbol entry so the
+      # linker resolves them (the direct emitter's extern convention).
+      re.syms.push(AsmSymbol {
+        name: f.name.clone(),
+        section: Section::Extern,
+        offset: 0,
+        size: 0,
+        binding: SymBinding::Global,
+        kind: SymKind::Func
+      })
+    else if !f.attr_cold then
+      # (P1-18 @cold — the HOT pass): every non-@cold body lowers and
+      # emits here (program order). An attr_cold function is DEFERRED
+      # to the cold pass below, which emits the @cold bodies as a
+      # contiguous tail of the code buffer — the .text.cold region the
+      # symbol registration in rv_emit_fn_symbol routes them into
+      # (Section::ColdText). Programs without @cold functions take the
+      # cold pass as a zero-iteration no-op and the buffer is
+      # byte-identical to the pre-@cold layout.
+      let lir_fn = match lower_mir_fn_to_lir(f, static_labels)
+      when Result::Err(e) then return Result::Err(e)
+      when Result::Ok(lf) then lf
+      end
+      match lir_validate_callees(lir_fn, defined, externs)
+      when Result::Err(e) then return Result::Err(e)
+      when Result::Ok(_) then ()
+      end
+      let peeped = lir_peephole(lir_fn)
+      let alloc = lir_alloc_registers(peeped)
+      match rv_emit_fn(&mut re, mdl_pool, peeped, alloc, externs, defined, xlen)
+      when Result::Err(e) then return Result::Err(e)
+      when Result::Ok(_) then ()
+      end
+    end
+    fi = fi + 1
+  end
+
+  # (P1-18 @cold — the deferred COLD pass): lower and emit the
+  # attr_cold function bodies HERE, at the end of the buffer, so they
+  # form the contiguous cold tail (the .text.cold region; cold_base
+  # records its start for the ELF writer, which splits the buffer and
+  # rebases the cold symbols/relocations). The deferred jal patches the
+  # cold bodies create are resolved by rv_resolve_patches below against
+  # the final positions, exactly like the hot pass's. Programs without
+  # @cold functions take this pass as a zero-iteration no-op.
+  var has_cold_fn = false
+  fi = 0
+  while fi < program.functions.len() do
+    let f = program.functions[fi]
+    if !f.is_extern && f.attr_cold then
+      has_cold_fn = true
+    end
+    fi = fi + 1
+  end
+  var cold_base = -1
+  if has_cold_fn then
+    cold_base = buf_pos(&re.buf)
+    fi = 0
+    while fi < program.functions.len() do
+      let f = program.functions[fi]
+      if !f.is_extern && f.attr_cold then
+        let lir_fn = match lower_mir_fn_to_lir(f, static_labels)
+        when Result::Err(e) then return Result::Err(e)
+        when Result::Ok(lf) then lf
+        end
+        match lir_validate_callees(lir_fn, defined, externs)
+        when Result::Err(e) then return Result::Err(e)
+        when Result::Ok(_) then ()
+        end
+        let peeped = lir_peephole(lir_fn)
+        let alloc = lir_alloc_registers(peeped)
+        match rv_emit_fn(&mut re, mdl_pool, peeped, alloc, externs, defined, xlen)
+        when Result::Err(e) then return Result::Err(e)
+        when Result::Ok(_) then ()
+        end
+      end
+      fi = fi + 1
+    end
+  end
+  # Resolve every deferred jal patch once — every block label and every
+  # function label of the shared buffer is defined now.
+  match rv_resolve_patches(&mut re)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(_) then ()
+  end
+  let fns = rv_collect_fns(re)
+  let datas = rv_collect_datas(re)
+  let exts = rv_collect_exts(re)
+  let rels = re.relocs.clone()
+  Result::Ok(rv_elf_obj(xlen, re.buf.bytes.clone(), fns, datas, exts, rels, data, cold_base))
+end
+
+# Executable/image emission for RISC-V is out of this slice (the
+# embedded route's ELF image + linker contract): fail closed with the
+# reason (mirrors thumb_compile_executable).
+def rv_compile_executable(program: MirProgram, xlen: Int, output_path: String) -> Result[Unit, String]
+  let class_name = if xlen == 8 then "ELF64" elsif xlen == 4 then "ELF32" else "ELF??" end
+  Result::Err("rv: the riscv LIR route does not link executables in this slice — use --emit=obj and link the " + class_name + " RISC-V object with a RISC-V linker (the embedded image/startup contract is a separate route)")
+end

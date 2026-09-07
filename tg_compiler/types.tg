@@ -107,12 +107,12 @@ use tg_compiler::resource_check::{AnalyzedProgram, TypedCFG, analysis_context_ne
 #
 # @fp(fast) is the opt-in, PER-FUNCTION relaxation of the above
 # (reassociation, reciprocal approximations, contraction/FMA,
-# finite-only assumptions). The fast paths are listed as TODO P1-6
-# markers at the float-emission sites in codegen.tg, all gated on the
-# emitted function's mode; until they land, @fp(fast) functions emit
-# the identical strict instruction sequences — the mode is recorded
-# state (MirFunction.fp_fast -> codegen ctx.current_fp_fast), never
-# silently applied math.
+# finite-only assumptions). The fast paths are not implemented: the
+# float-emission sites in codegen.tg carry the P1-6 not-implemented
+# markers, all gated on the emitted function's mode. Until they land,
+# @fp(fast) functions emit the identical strict instruction sequences —
+# the mode is recorded state (MirFunction.fp_fast -> codegen
+# ctx.current_fp_fast), never silently applied math.
 
 enum Type
   # Primitive types
@@ -277,6 +277,19 @@ end
 struct FnSignature
   params: Vec[ParamType]
   ret_type: Type
+  # (audit P1-13 — C variadic externs, implemented): TRUE only for the
+  # signature of an EXTERN function declared with the trailing C
+  # variadic marker (`extern def f(fixed..., ...)`; the extern block
+  # parser records ExternFn.variadic). `params` then holds the FIXED
+  # prefix only, and a DIRECT call to the extern may supply any number
+  # of EXTRA arguments (the checker's vararg subset rule types them —
+  # <= 64-bit integers, Bool/Char, raw pointers; floats/strings/
+  # aggregates rejected). The MIR pre-pass carries the flag onto the
+  # extern's MirFunction (is_extern_variadic) for the direct emitters.
+  # Function/method signatures never set it (the ellipsis parses only
+  # in extern declarations). Default false keeps every existing
+  # record-building site unchanged.
+  variadic: Bool = false
   declared_effects: Vec[EffectId] = Vec::new()
   declared_budget: Option[TypedBudget] = Option::None
   effect_annotations: Vec[EffectAnnotation] = Vec::new()
@@ -2013,6 +2026,18 @@ struct TypeEnv
   scoped_access_stack: Vec[ScopedAccessBinding]
   resolutions: Option[ResolvedNames]
   typed_call_targets: Map[Int, DefId]
+  # (audit P1-13 — C variadic externs): def_id_numeric(DefId) of every
+  # extern function DECLARED with the trailing `...` (the C variadic
+  # marker; recorded at pass 3 from the extern block's ExternFn.variadic
+  # through the resolver's module_symbols entry). A DIRECT call whose
+  # typed target (typed_call_targets) is in this set may supply MORE
+  # arguments than the declaration's FIXED prefix — the extras are the
+  # call's varargs, typed by their own types under the vararg subset
+  # rule (vararg_extra_type_allowed). INDIRECT calls never relax: a
+  # variadic extern's FnPtr value keeps the fixed signature (the FnPtr
+  # type carries no ellipsis), so fn-pointer calls stay exact-arity.
+  # Default empty keeps every TypeEnv construction site unchanged.
+  variadic_extern_dids: Set[Int] = Set::new()
  # (final): call expr node id -> the type checker's SOLVED generic
   # substitution for a generic call (the callee's generic args in the
   # callee's parameter order). Populated at the generic-call sites ONLY
@@ -6230,6 +6255,50 @@ def is_integer_type(ty: Type) -> Bool
   end  end
 end
 
+# (audit P1-13 — C variadic externs): the VARARG SUBSET RULE — the
+# types an EXTRA (anonymous) argument of a variadic extern call may
+# have. The direct emitters marshal every extra as one raw 8-byte GP
+# slot continuing the argument sequence (aarch64 AAPCS64: x0-x7 then
+# 8-byte stack slots; x86-64 SysV: rdi-r9 then 8-byte stack slots,
+# AL = 0 — the uniform GP-slot model never uses a vector register),
+# which is C-exact ONLY for the <= 64-bit integer, Bool/Char and raw
+# pointer values below:
+#   - the machine Int/UInt (8 bytes) and every sized integer through
+#     64 bits (i8..i64/u8..u64, ISize/USize; the inference-only
+#     IntLiteral form of an unsuffixed integer literal is included — it
+#     defaults to Int); I128/U128 are excluded (two GP words / memory
+#     per the C ABI, not one slot);
+#   - Bool and Char — integer-like scalars (a C vararg would promote
+#     them to int; the slot carries the zero-extended value);
+#   - the raw pointer forms Ptr[T]/PtrMut[T] (the C pointer slot).
+# EVERYTHING ELSE is rejected with a rule — floats (the platform
+# float-vararg register state — AAPCS64 v0-v7, SysV XMM + the AL
+# vector count — is not drivable by the uniform model), Strings/
+# aggregates/enums (object handles or by-reference images, never C
+# scalars), references, type variables and generic parameters.
+def vararg_extra_type_allowed(ty: Type) -> Bool
+  match ty
+  when Type::Int then true
+  when Type::UInt then true
+  when Type::I8 then true
+  when Type::I16 then true
+  when Type::I32 then true
+  when Type::I64 then true
+  when Type::U8 then true
+  when Type::U16 then true
+  when Type::U32 then true
+  when Type::U64 then true
+  when Type::ISize then true
+  when Type::USize then true
+  when Type::Bool then true
+  when Type::Char then true
+  when Type::IntLiteral(_) then true
+  when Type::Ptr(_) then true
+  when Type::PtrMut(_) then true
+  when _ then false
+  end  end
+end
+
 # True for the Box type (the Adt form of the registered Box id).
 def is_box_type(env: TypeEnv, ty: Type) -> Bool
   match ty
@@ -7267,8 +7336,25 @@ def type_check_program_env(inout env: TypeEnv, program: Program) -> Unit
           # record no item_defs, so the DefId render is unreachable and both
           # sides use this name fallback). Externs are signature-only (never
           # pass-4 checked), so this pass-3 record is their only entry.
+          # (audit P1-13 — C variadic externs): a declaration spelled with
+          # the trailing `...` records FnSignature.variadic = true (its
+          # params are the FIXED prefix) AND its resolver DefId joins
+          # variadic_extern_dids — the call-site arity relaxation consults
+          # the set by typed target, so only DIRECT calls to this exact
+          # extern accept extra arguments.
           env.typed_fn_signatures.insert(module_qualified_fn_key(&owner_path, ef.name.clone()),
-            FnSignature { params: param_types.clone(), ret_type: ret_ty.clone() })
+            FnSignature { params: param_types.clone(), ret_type: ret_ty.clone(), variadic: ef.variadic })
+          if ef.variadic then
+            match env.resolutions
+            when Option::Some(res) then
+              let ef_qkey = module_qualified_key(&owner_path, &ef.name)
+              match res.module_symbols.get(&ef_qkey)
+              when Option::Some(ef_did) then env.variadic_extern_dids.insert(def_id_numeric(&ef_did))
+              when Option::None then ()
+              end
+            when Option::None then ()
+            end
+          end
           let ext_fn_ty = Type::FnPtr(param_types, ret_ty, Vec::new())
           bind_var(env, ef.name.clone(), ext_fn_ty.clone())
           record_module_callable(env, ef.name.clone(), ext_fn_ty, &owner_path, DefKind::Function)
@@ -8245,7 +8331,7 @@ end
 #     - sleep (sleep/usleep/nanosleep — Block, seeded below);
 #     - unbounded scheduling (sched_yield — Block, seeded below).
 #
-# Deliberately deferred (TODOs):
+# Deliberately deferred (not implemented in this slice):
 #   - the P1-16 handler-runtime/vector-table integration BEYOND the
 #     proof (the vector-table collection remains the embedded route's
 #     own pass — driver.tg's collect_interrupt_fns; the @interrupt and
@@ -11462,7 +11548,8 @@ def check_stmt(inout env: TypeEnv, stmt: Stmt) -> FlowResult
     # expressible: a closure parameter cannot carry the let/inout access
     # conventions in this language (closure parameters are plain patterns,
     # see parser.tg's parse_closure_params), so the closure forms stay
-    # pending at the syntax/convention level (TODO at the std accessors).
+    # pending at the syntax/convention level (documented as not
+    # expressible at the std accessors).
     # The resource-checker frame mirror for OWNING access values (the
     # bind_pattern registration of the access binding's source place and
     # the write-back copy's move discipline) is pending in resource_check's
@@ -16676,9 +16763,34 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
       # fn(Int) -> Int could be invoked with two arguments and vice versa.
       # (Default arguments are deprecated/unused in this codebase — no call
       # site omits a defaulted parameter — so exact equality is correct.)
-      if args.len() != inst_params.len() then
-        type_add_error(env, "wrong number of arguments: expected " +
-          inst_params.len().to_string() + ", found " + args.len().to_string(), expr.span)
+      # (audit P1-13 — C variadic externs): the ONE relaxation — a DIRECT
+      # call to an extern declared with the trailing `...` marker (its
+      # DefId is in variadic_extern_dids) may supply MORE arguments than
+      # the FIXED prefix (the declared params). The prefix stays exact
+      # (missing prefix arguments are still an error); the EXTRAS are the
+      # call's varargs, typed by their own types under the subset rule
+      # below. Indirect calls never relax (a variadic extern's FnPtr value
+      # carries the fixed signature — the FnPtr type has no ellipsis — so
+      # a call through a fn pointer stays exact-arity, and a variadic
+      # extern used as a VALUE keeps the fixed callable type).
+      var callee_is_varargs_extern = false
+      match env.typed_call_targets.get(expr.node_id)
+      when Option::Some(call_did) then
+        if env.variadic_extern_dids.contains(def_id_numeric(&call_did)) then
+          callee_is_varargs_extern = true
+        end
+      when Option::None then ()
+      end
+      if callee_is_varargs_extern then
+        if args.len() < inst_params.len() then
+          type_add_error(env, "wrong number of arguments: variadic extern expects at least " +
+            inst_params.len().to_string() + ", found " + args.len().to_string(), expr.span)
+        end
+      else
+        if args.len() != inst_params.len() then
+          type_add_error(env, "wrong number of arguments: expected " +
+            inst_params.len().to_string() + ", found " + args.len().to_string(), expr.span)
+        end
       end
       var pi = 0
       while pi < args.len() && pi < inst_params.len() do
@@ -16686,6 +16798,33 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
         unify(env, arg_types[pi], pt.ty, args[pi].span)
         record_arg_effect(env, &args[pi], pt.convention)
         pi = pi + 1
+      end
+      if callee_is_varargs_extern then
+        # (audit P1-13 — C variadic externs): the EXTRA arguments beyond
+        # the FIXED prefix. Each extra is already typed by check_expr
+        # (arg_types); there is no declared parameter to unify it against,
+        # so the vararg SUBSET RULE validates it instead: only values the
+        # direct emitters marshal C-exactly as varargs are accepted (<=
+        # 64-bit integers, Bool/Char, raw pointers). Everything else —
+        # floats above all — is rejected with the actionable rule; the
+        # extras are borrowed reads (AccessConvention::Let), which is what
+        # the access/resource checkers and the MIR's per-arg effect records
+        # expect for every call argument.
+        var vi = inst_params.len()
+        while vi < args.len() do
+          let extra_ty = resolve_type_var(env, arg_types[vi])
+          if !vararg_extra_type_allowed(&extra_ty) then
+            let kind = type_tag(env, &extra_ty)
+            match extra_ty
+            when Type::Float | Type::F32 | Type::F64 then
+              type_add_error(env, "variadic extern argument " + (vi + 1).to_string() + " is `" + kind + "`: float varargs are not supported (the uniform GP-slot ABI cannot drive the platform float-vararg register state — AAPCS64 v0-v7 / SysV XMM plus the AL vector count); pass the bits as an integer or declare a C helper that takes the float", args[vi].span)
+            when _ then
+              type_add_error(env, "variadic extern argument " + (vi + 1).to_string() + " has type `" + kind + "`: the vararg subset is integers (<= 64 bits), Bool, Char and raw pointers only — strings, floats and aggregates do not cross the C vararg ABI", args[vi].span)
+            end
+          end
+          record_arg_effect(env, &args[vi], AccessConvention::Let)
+          vi = vi + 1
+        end
       end
       unify(env, ret_type, inst_ret, expr.span)
       # FIX 1 verification: every generic parameter of the callee that
@@ -19065,7 +19204,8 @@ def resolve_method_type(inout env: TypeEnv, recv_type: Type, method: String, arg
   when _ then ()
   end
 
-  # 3. Check trait impls (by method name only — full trait resolution is TODO).
+  # 3. Check trait impls (by method name only — full trait resolution is
+  # not implemented).
   # Runs after built-in methods so a built-in (e.g. String.clone) wins over an
   # unrelated trait impl that happens to define the same method name.
   # The impl's for_type must match the receiver so `TaintSource.clone()` never
@@ -19933,7 +20073,7 @@ def resolve_pending_int_literals(inout env: TypeEnv) -> Unit
     for p in sig.params do
       new_params.push(ParamType { ty: default_int_literal_type(env, &p.ty), convention: p.convention })
     end
-    new_sigs.insert(key, FnSignature { params: new_params, ret_type: default_int_literal_type(env, &sig.ret_type), declared_effects: sig.declared_effects.clone(), declared_budget: sig.declared_budget.clone(), effect_annotations: sig.effect_annotations.clone() })
+    new_sigs.insert(key, FnSignature { params: new_params, ret_type: default_int_literal_type(env, &sig.ret_type), declared_effects: sig.declared_effects.clone(), declared_budget: sig.declared_budget.clone(), effect_annotations: sig.effect_annotations.clone(), variadic: sig.variadic })
   end
   env.typed_fn_signatures = new_sigs
   var new_statics = Map::new()
@@ -20935,7 +21075,7 @@ def type_check_typed(inout env: TypeEnv, program: Program, resolutions: Resolved
     for sp in sig_rec.params do
       chased_params.push(ParamType { ty: resolve_type_var(env, sp.ty), convention: sp.convention })
     end
-    typed_fn_sigs.insert(sig_key, FnSignature { params: chased_params, ret_type: resolve_type_var(env, sig_rec.ret_type), declared_effects: sig_rec.declared_effects.clone(), declared_budget: sig_rec.declared_budget.clone(), effect_annotations: sig_rec.effect_annotations.clone() })
+    typed_fn_sigs.insert(sig_key, FnSignature { params: chased_params, ret_type: resolve_type_var(env, sig_rec.ret_type), declared_effects: sig_rec.declared_effects.clone(), declared_budget: sig_rec.declared_budget.clone(), effect_annotations: sig_rec.effect_annotations.clone(), variadic: sig_rec.variadic })
   end
   var typed_static_tys = Map::new()
   for (st_key, st_ty) in env.typed_static_types do

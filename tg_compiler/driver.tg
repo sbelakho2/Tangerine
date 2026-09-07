@@ -45,7 +45,9 @@ use tg_compiler::access_check::{access_check}
 use tg_compiler::resource_check::{resource_check, build_typed_cfg, analysis_context_new, AnalyzedProgram}
 use tg_compiler::mir::{lower_to_mir, MirProgram, MirFunction, optimize_mir, pretty_print_mir, instrument_for_pgo, verify_mir}
 use tg_compiler::codegen::{generate_native, generate_executable, generate_object_file, detect_host_target}
-use tg_compiler::lir::{lir_compile_object, lir_compile_executable}
+use tg_compiler::lir::{lir_compile_object, lir_compile_executable, lir_target_desc}
+use tg_compiler::backend_thumb::{thumb_compile_object, thumb_compile_executable, thumb_target_desc}
+use tg_compiler::backend_rv::{rv_compile_object, rv_compile_executable, rv_target_desc}
 use tg_compiler::asm::{AsmTarget, Arch, OsAbi, asm_target}
 use tg_compiler::trait_resolve::{monomorphize_program, mono_cache_new}
 use tg_compiler::mode::{Mode, ModeConfig, config_for_mode}
@@ -2763,11 +2765,123 @@ end
 # route FAILS CLOSED on any construct outside the contract (it never
 # falls back per function silently). The route mirrors
 # compile_to_wasm_route's pipeline shape.
+# AUDIT P1-14, slices 2 and 3: TANGERINE_LIR_TARGET selects the backend
+# the same pipeline emits with (default "aarch64" — the P1-7 slice's
+# emission in lir.tg): "cortex-m" picks the Thumb-2 backend in
+# tg_compiler::backend_thumb, "riscv32"/"riscv64" pick the RISC-V
+# backend in tg_compiler::backend_rv (see lir_route_backend_name);
+# unknown values fail closed.
 
 def lir_route_enabled() -> Bool
   match std::env::get_env("TANGERINE_LIR")
   when Option::Some(v) then v == "1"
   when Option::None then false
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# THE LIR BACKEND SELECTOR — audit P1-14, slices 2 and 3
+# ———————————————————————————————————————————————————————————————
+# TANGERINE_LIR_TARGET selects which backend the LIR route emits with:
+# "aarch64" (the default — the P1-7 slice's emission in lir.tg),
+# "cortex-m" (the P1-14 slice 2 Thumb-2 backend in backend_thumb.tg,
+# which emits ELF32 ARM objects through thumb_compile_object), or
+# "riscv32"/"riscv64" (the P1-14 slice 3 backend in backend_rv.tg,
+# which emits ELF32/ELF64 RISC-V objects through rv_compile_object).
+# Unknown values fail closed with the accepted set — never a silent
+# fallback.
+def lir_route_backend_name() -> Result[String, String]
+  match std::env::get_env("TANGERINE_LIR_TARGET")
+  when Option::Some(v) then
+    if v == "aarch64" then
+      Result::Ok("aarch64")
+    elsif v == "cortex-m" then
+      Result::Ok("cortex-m")
+    elsif v == "riscv32" then
+      Result::Ok("riscv32")
+    elsif v == "riscv64" then
+      Result::Ok("riscv64")
+    else
+      Result::Err("TANGERINE_LIR_TARGET=" + v + " is not a LIR backend of this compiler (the P1-14 backends are \"aarch64\", \"cortex-m\", \"riscv32\" and \"riscv64\"; unset the variable for the default aarch64 route)")
+    end
+  when Option::None then
+    Result::Ok("aarch64")
+  end
+end
+
+# The cortex-m arm of compile_lir_route: emit-mode dispatch over the
+# Thumb-2 backend (object emission only in this slice; executable/image
+# linking fails closed inside thumb_compile_executable).
+def compile_lir_route_thumb(mir: MirProgram, opts: CompilerOptions, out_path: String) -> Result[Unit, String]
+  # P1-14 slice 2: the gate consults the CANONICAL cortex-m description —
+  # thumb_target_desc() -> target_desc::cortex_m_desc(), the single
+  # source of target data (the same fail-closed shape check the aarch64
+  # arm runs against lir_target_desc).
+  let tdesc = thumb_target_desc()
+  if tdesc.pointer_width != 4 || tdesc.stack_alignment != 8 then
+    return Result::Err("internal error: thumb_target_desc() describes `" + tdesc.name + "` (" + tdesc.pointer_width.to_string() + "-byte pointers, stack align " + tdesc.stack_alignment.to_string() + ") — the cortex-m LIR route compiles for 4-byte-pointer, 8-aligned cortex-m (unset TANGERINE_LIR_TARGET to use the aarch64 route)")
+  end
+  match opts.target_triple
+  when Option::Some(tt) then
+    return Result::Err("the cortex-m LIR route does not support --target overrides (" + tt + "); the backend target is the cortex_m description")
+  when Option::None then ()
+  end
+  match opts.emit
+  when EmitMode::Object then
+    let bytes = match thumb_compile_object(mir)
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(b) then b
+    end
+    match write_file_bytes(out_path.clone(), &bytes)
+    when Result::Ok(_) then ()
+    when Result::Err(e) then return Result::Err("failed to write " + out_path.clone() + ": " + e)
+    end
+    Result::Ok(())
+  when EmitMode::Executable then
+    thumb_compile_executable(mir, out_path)
+  when _ then
+    Result::Err("the cortex-m LIR route supports --emit=obj and --emit=exe only (unset TANGERINE_LIR_TARGET for other emit modes)")
+  end
+end
+
+# The RISC-V arm of compile_lir_route (P1-14 slice 3d): emit-mode
+# dispatch over the riscv backend, one shared shape for riscv32
+# (xlen = 4 -> ELF32 objects) and riscv64 (xlen = 8 -> ELF64 objects).
+# Object emission only in this slice; executable/image linking fails
+# closed inside rv_compile_executable.
+def compile_lir_route_rv(mir: MirProgram, opts: CompilerOptions, out_path: String, xlen: Int) -> Result[Unit, String]
+  if xlen != 4 && xlen != 8 then
+    return Result::Err("internal error: the riscv LIR route must compile for xlen 4 or 8 bytes (got " + xlen.to_string() + ")")
+  end
+  # The gate consults the CANONICAL riscv description —
+  # rv_target_desc(xlen) -> target_desc::riscv32_desc()/riscv64_desc(),
+  # the single source of target data (the same fail-closed shape check
+  # the cortex-m arm runs against thumb_target_desc).
+  let tdesc = rv_target_desc(xlen)
+  if tdesc.pointer_width != xlen || tdesc.stack_alignment != 16 then
+    let expected_name = if xlen == 4 then "riscv32" else "riscv64" end
+    return Result::Err("internal error: rv_target_desc() describes `" + tdesc.name + "` (" + tdesc.pointer_width.to_string() + "-byte pointers, stack align " + tdesc.stack_alignment.to_string() + ") — the " + expected_name + " LIR route compiles for " + xlen.to_string() + "-byte-pointer, 16-aligned " + expected_name + " (unset TANGERINE_LIR_TARGET to use the aarch64 route)")
+  end
+  match opts.target_triple
+  when Option::Some(tt) then
+    return Result::Err("the riscv LIR route does not support --target overrides (" + tt + "); the backend target is the riscv32/riscv64 description selected by TANGERINE_LIR_TARGET")
+  when Option::None then ()
+  end
+  match opts.emit
+  when EmitMode::Object then
+    let bytes = match rv_compile_object(mir, xlen)
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(b) then b
+    end
+    match write_file_bytes(out_path.clone(), &bytes)
+    when Result::Ok(_) then ()
+    when Result::Err(e) then return Result::Err("failed to write " + out_path.clone() + ": " + e)
+    end
+    Result::Ok(())
+  when EmitMode::Executable then
+    rv_compile_executable(mir, xlen, out_path)
+  when _ then
+    Result::Err("the riscv LIR route supports --emit=obj and --emit=exe only (unset TANGERINE_LIR_TARGET for other emit modes)")
   end
 end
 
@@ -2821,8 +2935,36 @@ def compile_lir_route(opts: CompilerOptions, files: Vec[String], output_path: St
     return Result::Err("MIR verification failed after optimization (" + post_errs.len().to_string() + " error(s))")
   end
   let target = detect_host_target()
+  # P1-14 slices 2/3: the LIR backend selector runs BEFORE the
+  # aarch64-only checks — TANGERINE_LIR_TARGET=cortex-m routes to the
+  # Thumb-2 backend (backend_thumb.tg), TANGERINE_LIR_TARGET=riscv32 /
+  # riscv64 route to the RISC-V backend (backend_rv.tg); both are
+  # host-arch independent. Any other value falls through to the default
+  # aarch64 slice below.
+  let lir_backend = match lir_route_backend_name()
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(b) then b
+  end
+  if lir_backend == "cortex-m" then
+    return compile_lir_route_thumb(mir, opts, out_path)
+  end
+  if lir_backend == "riscv32" then
+    return compile_lir_route_rv(mir, opts, out_path, 4)
+  end
+  if lir_backend == "riscv64" then
+    return compile_lir_route_rv(mir, opts, out_path, 8)
+  end
   if target.arch != Arch::AArch64 then
     return Result::Err("the TANGERINE_LIR route emits aarch64 only in this slice; the host is " + host_arch_name(target.arch) + " — unset TANGERINE_LIR to use the direct emitter")
+  end
+  # P1-14 slice 1: the route consults the canonical target description —
+  # lir_target_desc() -> target_desc::aarch64_desc(), the single source of
+  # target data (see the target_desc.tg audit contract). The fail-closed
+  # check ties this slice's assumptions to desc fields; it never fires for
+  # the current aarch64_desc, so no emission behavior changes here.
+  let tdesc = lir_target_desc()
+  if tdesc.pointer_width != 8 || tdesc.stack_alignment != 16 then
+    return Result::Err("internal error: lir_target_desc() describes `" + tdesc.name + "` (" + tdesc.pointer_width.to_string() + "-byte pointers, stack align " + tdesc.stack_alignment.to_string() + ") — the TANGERINE_LIR slice compiles for 8-byte-pointer, 16-aligned aarch64 (unset TANGERINE_LIR to use the direct emitter)")
   end
   match opts.target_triple
   when Option::Some(tt) then
