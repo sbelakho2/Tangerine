@@ -48,7 +48,7 @@ use tg_compiler::codegen::{generate_native, generate_executable, generate_object
 use tg_compiler::lir::{lir_compile_object, lir_compile_executable, lir_target_desc}
 use tg_compiler::backend_thumb::{thumb_compile_object, thumb_compile_executable, thumb_desc_of}
 use tg_compiler::backend_rv::{rv_compile_object, rv_compile_executable, rv_desc_of}
-use tg_compiler::target_desc::{TargetDesc}
+use tg_compiler::target_desc::{TargetDesc, aarch64_desc, x86_64_desc}
 use tg_compiler::asm::{AsmTarget, Arch, OsAbi, asm_target}
 use tg_compiler::trait_resolve::{monomorphize_program, mono_cache_new}
 use tg_compiler::mode::{Mode, ModeConfig, config_for_mode}
@@ -90,12 +90,20 @@ use tg_compiler::compiler_core::{
 # The §30 semantic snapshot route (audit §30; default-off): the driver
 # house of the env-gated artifact gates (with the LIR gates) — the
 # snapshot builder is full-library-only and the compiler kernel stays
-# closed.
+# closed. The §39 semantic-server construction (audit item 21) rides the
+# SAME route: at the successful final compiler boundary the route builds
+# the CompilerSession over the finalized state (compiler_session_from_
+# finalized — the snapshot route's own env / typed program / verified MIR
+# values) and serves the §39 request protocol when TANGERINE_SERVER=1
+# requests it (session_serve_loop); the snapshot file is written exactly
+# as before when the server env var is unset.
 use tg_compiler::semantic_snapshot::{
   semantic_snapshot_of_final_state, semantic_snapshot_finalize, semantic_snapshot_serialize,
-  semantic_target_id_of
+  SnapshotError
 }
 use tg_compiler::semantic_model::{semantic_digest_zero}
+use tg_compiler::semantic_index::{build_semantic_index}
+use tg_compiler::semantic_server::{compiler_session_from_finalized, session_serve_loop}
 
 # The WASM backend route — the driver's --target wasm32-unknown-unknown
 # dispatch (see compile_to_wasm_route below).
@@ -3074,15 +3082,52 @@ end
 # surface hashes ride the header and whose revision is the
 # content-addressed digest of its own canonical text.
 #
+# AUDIT ITEM 21 (the server carrying finalized state): this route is the
+# successful final compiler boundary. When TANGERINE_SERVER=1 is set
+# alongside TANGERINE_SNAPSHOT, the route additionally constructs the §39
+# CompilerSession over the FINALIZED pipeline values — the same env /
+# typed.typed / mir / target_desc in scope after the final verify_mir
+# (compiler_session_from_finalized, semantic_server.tg) — and serves the
+# §39 request protocol from stdin to stdout until EOF (session_serve_loop;
+# the snapshot file is written first, exactly as without the server var).
+# Unset TANGERINE_SERVER and this route's behavior is unchanged: the
+# snapshot artifact is written and the compile reports success.
+#
 # The gate lives HERE (the driver — the full-library build) rather than
 # in compiler_core.tg so the bootstrap compiler kernel stays closed
 # (kernel modules never import full-library modules); this mirrors the
 # env-gated LIR gates.
 
+def snapshot_error_text(e: SnapshotError) -> String
+  match e
+  when SnapshotError::UnstableTypeIdentity(tid) then "unstable type identity (type id " + tid + ")"
+  when SnapshotError::UnstableDefIdentity then "unstable def identity"
+  when SnapshotError::UnstableFieldIdentity then "unstable field identity"
+  when SnapshotError::UnstableVariantIdentity then "unstable variant identity"
+  when SnapshotError::UnstableLocalIdentity then "unstable local identity"
+  when SnapshotError::UnstableClosureIdentity then "unstable closure identity"
+  when SnapshotError::UnstableBlockIdentity then "unstable block identity"
+  when SnapshotError::UnstableInstanceDisplay then "unstable instance display"
+  when SnapshotError::UnstableTarget then "unstable target"
+  end
+end
+
 def snapshot_route_path() -> Option[String]
   match std::env::get_env("TANGERINE_SNAPSHOT")
   when Option::Some(p) then if p.len() > 0 then Option::Some(p) else Option::None end
   when Option::None then Option::None
+  end
+end
+
+# The §39 semantic-server gate (audit item 21; default-off): TANGERINE_SERVER=1
+# requests the CompilerSession serve loop at the snapshot route's
+# successful final boundary (see compile_snapshot_route below). The gate
+# mirrors the LIR / snapshot env-gate idiom: unset (or any value other
+# than "1") keeps the route's snapshot-file behavior exactly as before.
+def semantic_server_requested() -> Bool
+  match std::env::get_env("TANGERINE_SERVER")
+  when Option::Some(v) then v == "1"
+  when Option::None then false
   end
 end
 
@@ -3126,17 +3171,49 @@ def compile_snapshot_route(opts: CompilerOptions, files: Vec[String], snapshot_p
   if !post_errs.is_empty() then
     return Result::Err("MIR verification failed after optimization (" + post_errs.len().to_string() + " error(s))")
   end
-  # The ONE target resolution of the route (mirrors the LIR route's host
-  # target; the snapshot's target text rides the header).
-  let target = detect_host_target()
-  var snapshot = semantic_snapshot_of_final_state(
-    env, typed.typed, &mir, semantic_target_id_of(&target), VERSION, semantic_digest_zero())
+  # The ONE target resolution of the route: the host arch's canonical
+  # TargetDesc (mirrors the LIR route's host default); the builder stamps
+  # the snapshot's full StableTargetId from it (item 9).
+  var target_desc = match detect_host_target().arch
+  when Arch::AArch64 then aarch64_desc()
+  when Arch::X86_64 then x86_64_desc()
+  when _ then
+    return Result::Err("the TANGERINE_SNAPSHOT route has no TargetDesc for this host (aarch64/x86-64 only) — unset TANGERINE_SNAPSHOT to use the direct emitter")
+  end
+  var snapshot = match semantic_snapshot_of_final_state(
+    &env, &typed.typed, &mir, &target_desc, VERSION, semantic_digest_zero())
+  when Result::Err(e) then
+    return Result::Err("semantic snapshot build failed: " + snapshot_error_text(e))
+  when Result::Ok(s) then s
+  end
   semantic_snapshot_finalize(&mut snapshot)
   let snapshot_text = semantic_snapshot_serialize(&mut snapshot)
   match write_file_bytes(snapshot_path.clone(), &snapshot_text.bytes())
   when Result::Ok(_) then
     if !opts.quiet then
       println("Semantic snapshot: " + snapshot_path)
+    end
+    # THE SUCCESSFUL FINAL COMPILER BOUNDARY (audit item 21): after the
+    # final verify_mir (above), the snapshot of the finalized state is
+    # written — and when TANGERINE_SERVER=1 requests it, the §39
+    # CompilerSession is constructed HERE from the pipeline's real
+    # finalized values (env = the analyzer's TypeEnv, typed.typed = the
+    # typed program it returned, mir = the monomorphized + optimized +
+    # post-opt-verified MirProgram, target_desc = the route's canonical
+    # host descriptor, snapshot = the finalized §30 artifact, revision =
+    # its content-addressed digest) and the §39 request protocol is
+    # served from stdin to stdout until EOF. Unset TANGERINE_SERVER and
+    # the route behaves exactly as before (the file write above is the
+    # whole effect); the construction/serve block never runs and no
+    # pipeline value is consumed by it.
+    if semantic_server_requested() then
+      let index = build_semantic_index(&snapshot)
+      let session = compiler_session_from_finalized(
+        snapshot.revision, &target_desc, &env, &typed.typed, &mir, &snapshot, &index)
+      let served = session_serve_loop(&session)
+      if !opts.quiet then
+        println("Semantic server: served " + served.to_string() + " request(s)")
+      end
     end
     Result::Ok(())
   when Result::Err(e) then
@@ -3293,7 +3370,11 @@ def cmd_compile(argv: Vec[String]) -> Int
   # THE SEMANTIC SNAPSHOT ROUTE GATE (audit §30; default-off):
   # TANGERINE_SNAPSHOT=<path> runs the canonical pipeline to the final
   # verified MIR and writes the §30 SemanticSnapshot of the finalized
-  # semantic state to <path> (see compile_snapshot_route above).
+  # semantic state to <path> (see compile_snapshot_route above); with
+  # TANGERINE_SERVER=1 set as well, the route additionally constructs the
+  # §39 CompilerSession at the successful final compiler boundary and
+  # serves the §39 request protocol (audit item 21 — the route's own
+  # section above).
   match snapshot_route_path()
   when Option::Some(snapshot_path) then
     match compile_snapshot_route(&opts, files, snapshot_path)

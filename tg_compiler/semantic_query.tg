@@ -3,9 +3,18 @@
 #
 # The TYPED query facade over the semantic machinery: ONE QueryResults
 # record (kind word + sorted stable key texts — never prose, never spans,
-# never digest words) is the whole result protocol. Every op DELEGATES to
-# an existing accessor / row table — no new analyses: this module is the
-# dispatch surface the §32 index / §29 snapshot / §31 delta rows serve.
+# never digest words) is the result protocol, and (audit item 23) every
+# answer ALSO rides a TYPED SemanticResponsePayload (semantic_model.tg —
+# the per-kind payload variant: Callers/Callees/Capabilities/Ownership/
+# Contract/Abi rows, Type kind word, the Effects bits/caps split, the
+# MirFunction/MirSlice/Symbol/Delta typed lifts). kind stays the ENVELOPE
+# TAG only — never semantic content; keys stays the serialization/protocol
+# carrier; payload is the typed in-process answer (None for the ops whose
+# rows belong to no enumerated family: the type-member probes fields/
+# impls/properties/type_explain — kind+keys remain their whole answer).
+# Every op DELEGATES to an existing accessor / row table — no new
+# analyses: this module is the dispatch surface the §32 index / §29
+# snapshot / §31 delta rows serve.
 #
 # QUERY KINDS (dispatch vocabulary): callers/callees/types/effects/
 # capabilities/contracts/fields/impls/properties (the §32 index accessors
@@ -31,24 +40,31 @@ use std::collections::{Vec, Map}
 
 use tg_compiler::ast::{AstContractKind, AccessConvention}
 use tg_compiler::mir::{MirProgram}
-use tg_compiler::semantic_model::{SemanticSnapshot, MirSemanticSummary}
+use tg_compiler::semantic_model::{
+  SemanticSnapshot, MirSemanticSummary, SemanticResponsePayload, semantic_contract_expr_text
+}
 use tg_compiler::semantic_index::{
   SemanticIndex, index_callers_of, index_callees_of, index_types_of, index_effects_of,
   index_capabilities_of, index_contracts_of, index_fields_of, index_impls_of,
   index_properties_of, index_mir_payload
 }
-use tg_compiler::semantic_delta::{SemanticDelta}
+use tg_compiler::semantic_delta::{SemanticDelta, semantic_delta_rows_diff}
 
 # ———————————————————————————————————————————————————————————————
 # The §38 records — QueryResults + SemanticQuerySession
 # ———————————————————————————————————————————————————————————————
 # QueryResults.keys holds the query's stable key texts / canonical row
-# texts (sorted, no prose); kind is the vocabulary word above — the ONLY
-# discriminator a caller needs. The session pairs a snapshot with the
-# index built from it; neither side is ever mutated.
+# texts (sorted, no prose); kind is the envelope tag word of the
+# vocabulary above — the discriminator a protocol caller needs. payload
+# (audit item 23) is the TYPED semantic answer — the matching
+# SemanticResponsePayload variant per operation (semantic_model.tg's
+# mapping table); the ops whose rows belong to no enumerated family carry
+# Option::None (kind + keys are then the whole answer). The session pairs
+# a snapshot with the index built from it; neither side is ever mutated.
 struct QueryResults
   kind: String
   keys: Vec[String] = Vec::new()
+  payload: Option[SemanticResponsePayload] = Option::None
 end
 
 struct SemanticQuerySession
@@ -67,33 +83,121 @@ end
 # The typed accessors — O(1) delegates to the §32 index accessors
 # ———————————————————————————————————————————————————————————————
 # Each returns kind = its operation name; keys = the accessor's rows for
-# the arg key (callers/callees: stable keys; types/effects: 0-1 rows).
+# the arg key (callers/callees: stable keys; types/effects: 0-1 rows);
+# payload = the matching SemanticResponsePayload variant carrying those
+# SAME canonical rows, lifted into the variant's typed fields (None for
+# the type-member probes fields/impls/properties — no payload family is
+# enumerated for member-name / method-key row lists).
 
 def query_callers(index: SemanticIndex, key: String) -> QueryResults
-  QueryResults { kind: "callers", keys: index_callers_of(&index, key.clone()) }
+  let rows = index_callers_of(&index, key.clone())
+  QueryResults {
+    kind: "callers",
+    keys: rows.clone(),
+    payload: Option::Some(SemanticResponsePayload::Callers(rows))
+  }
 end
 
 def query_callees(index: SemanticIndex, key: String) -> QueryResults
-  QueryResults { kind: "callees", keys: index_callees_of(&index, key.clone()) }
+  let rows = index_callees_of(&index, key.clone())
+  QueryResults {
+    kind: "callees",
+    keys: rows.clone(),
+    payload: Option::Some(SemanticResponsePayload::Callees(rows))
+  }
 end
 
+# The "types" answer row IS the nominal kind word of a type-keyed def
+# ("Struct" | "Enum" | "Trait"; no row for defs that are not type
+# declarations) — the payload lifts it into kind_word and repeats it in
+# rows per the carrier doctrine (payload rows = the canonical rows).
 def query_types(index: SemanticIndex, key: String) -> QueryResults
-  QueryResults { kind: "types", keys: index_types_of(&index, key.clone()) }
+  let rows = index_types_of(&index, key.clone())
+  let kind_word = if rows.len() == 1 then rows[0].clone() else "".to_string() end
+  QueryResults {
+    kind: "types",
+    keys: rows.clone(),
+    payload: Option::Some(SemanticResponsePayload::Type(kind_word, rows))
+  }
 end
 
+# Split one canonical §32 effect row ("<dirty-word>;<cap-id>;...") into its
+# typed parts: bits = the dirty-class word (semantic_summary_dirty_word),
+# caps = the sorted capability-id texts after the first ';'. Absent cap
+# rows render a trailing ';' ("0;") — the empty segment is skipped; a
+# non-numeric word fails closed to bits 0.
+def query_effect_row_split(row: String) -> (Int, Vec[String])
+  var bits = 0
+  var caps: Vec[String] = Vec::new()
+  var segment = 0
+  var start = 0
+  var i = 0
+  while i <= row.len() do
+    let is_separator = if i == row.len() then true else row.slice(i, i + 1) == ";" end
+    if is_separator then
+      let text = row.slice(start, i)
+      if segment == 0 then
+        match text.parse_int()
+        when Result::Ok(n) then bits = n
+        when Result::Err(_) then bits = 0
+        end
+      elsif text.len() > 0 then
+        caps.push(text.clone())
+      end
+      segment = segment + 1
+      start = i + 1
+    end
+    i = i + 1
+  end
+  (bits, caps)
+end
+
+# The §11 effect answer (0-1 rows): the payload carries the row SPLIT into
+# its typed parts — bits = the dirty-class word, caps = the capability-id
+# texts (semantic_model.tg's Effects mapping). An absent effect row (no
+# def-keyed lowering / no §11 row for the key) renders the zero payload
+# Effects(0, []); the empty keys list stays the distinguishing protocol
+# signal.
 def query_effects(index: SemanticIndex, key: String) -> QueryResults
-  QueryResults { kind: "effects", keys: index_effects_of(&index, key.clone()) }
+  let rows = index_effects_of(&index, key.clone())
+  var bits = 0
+  var caps: Vec[String] = Vec::new()
+  if rows.len() == 1 then
+    let split = query_effect_row_split(&rows[0])
+    bits = split.0
+    caps = split.1
+  end
+  QueryResults {
+    kind: "effects",
+    keys: rows.clone(),
+    payload: Option::Some(SemanticResponsePayload::Effects(bits, caps))
+  }
 end
 
 def query_capabilities(index: SemanticIndex, key: String) -> QueryResults
-  QueryResults { kind: "capabilities", keys: index_capabilities_of(&index, key.clone()) }
+  let rows = index_capabilities_of(&index, key.clone())
+  QueryResults {
+    kind: "capabilities",
+    keys: rows.clone(),
+    payload: Option::Some(SemanticResponsePayload::Capabilities(rows))
+  }
 end
 
-# contracts rows are the index row form; the §31 row-key form rides contract_list.
+# contracts rows are the index row form; the §31 row-key form rides
+# contract_list — both are contract rows (payload Contract).
 def query_contracts(index: SemanticIndex, key: String) -> QueryResults
-  QueryResults { kind: "contracts", keys: index_contracts_of(&index, key.clone()) }
+  let rows = index_contracts_of(&index, key.clone())
+  QueryResults {
+    kind: "contracts",
+    keys: rows.clone(),
+    payload: Option::Some(SemanticResponsePayload::Contract(rows))
+  }
 end
 
+# The type-member probes (fields/impls/properties) answer member-name /
+# method-key row lists — no §23 payload family is enumerated for them
+# (documented in semantic_model.tg), so payload stays None and kind + keys
+# are the whole answer.
 def query_fields(index: SemanticIndex, key: String) -> QueryResults
   QueryResults { kind: "fields", keys: index_fields_of(&index, key.clone()) }
 end
@@ -192,17 +296,30 @@ def symbol_search(index: SemanticIndex, needle: String) -> Vec[String]
   out
 end
 
+# Presence probe + search: payload Symbol lifts the ONE matched row
+# ("" = absent — the probe's None); payload Symbols carries the matched
+# def-key rows of a search ([] = no match — a real answer of the op).
 def query_symbol_get(index: SemanticIndex, key: String) -> QueryResults
   var keys: Vec[String] = Vec::new()
   match symbol_get(&index, key.clone())
   when Option::Some(k) then keys.push(k)
   when Option::None then ()
   end
-  QueryResults { kind: "symbol_get", keys: keys }
+  let row_text = if keys.len() == 1 then keys[0].clone() else "".to_string() end
+  QueryResults {
+    kind: "symbol_get",
+    keys: keys,
+    payload: Option::Some(SemanticResponsePayload::Symbol(row_text))
+  }
 end
 
 def query_symbol_search(index: SemanticIndex, key: String) -> QueryResults
-  QueryResults { kind: "symbol_search", keys: symbol_search(&index, key.clone()) }
+  let rows = symbol_search(&index, key.clone())
+  QueryResults {
+    kind: "symbol_search",
+    keys: rows.clone(),
+    payload: Option::Some(SemanticResponsePayload::Symbols(rows))
+  }
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -224,7 +341,8 @@ def contract_obligations(snapshot: SemanticSnapshot, key: String) -> Vec[String]
   var rows: Vec[String] = Vec::new()
   for c in snapshot.contracts do
     if c.function.key == key then
-      rows.push(key.clone() + "|" + query_contract_kind_text(&c.kind) + "|" + c.clause_text.clone())
+      rows.push(key.clone() + "|" + query_contract_kind_text(&c.kind) + "|" +
+        semantic_contract_expr_text(&c.canonical_expression))
     end
   end
   rows.sort_by(|a, b| a < b)
@@ -242,9 +360,16 @@ def contract_has_rows(snapshot: SemanticSnapshot, key: String) -> Bool
   found
 end
 
-# The dispatchable form (kind "contract_list" — the recorded §31 row-key rows).
+# The dispatchable form (kind "contract_list" — the recorded §31 row-key
+# rows; payload Contract — the same family as the index-row "contracts"
+# op).
 def contract_list(snapshot: SemanticSnapshot, key: String) -> QueryResults
-  QueryResults { kind: "contract_list", keys: contract_obligations(&snapshot, key.clone()) }
+  let rows = contract_obligations(&snapshot, key.clone())
+  QueryResults {
+    kind: "contract_list",
+    keys: rows.clone(),
+    payload: Option::Some(SemanticResponsePayload::Contract(rows))
+  }
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -252,7 +377,10 @@ end
 # ———————————————————————————————————————————————————————————————
 
 # The type key's index surface: fields + impls + properties rows for the
-# key, deduped across the three index families and sorted.
+# key, deduped across the three index families and sorted. The rows are
+# type-MEMBER probes — no §23 payload family is enumerated for them
+# (documented in semantic_model.tg), so payload stays None and kind + keys
+# are the whole answer.
 def type_explain(index: SemanticIndex, key: String) -> QueryResults
   var rows: Vec[String] = Vec::new()
   for r in index_fields_of(&index, key.clone()) do
@@ -290,7 +418,11 @@ def ownership_explain(snapshot: SemanticSnapshot, key: String) -> QueryResults
     end
   end
   keys.sort_by(|a, b| a < b)
-  QueryResults { kind: "ownership", keys: keys }
+  QueryResults {
+    kind: "ownership",
+    keys: keys.clone(),
+    payload: Option::Some(SemanticResponsePayload::Ownership(keys))
+  }
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -301,7 +433,8 @@ end
 
 # One key: the def-keyed function's coarse summary render (the §32 index
 # payload text — the text the index digest emits for the summary); an
-# absent row falls back to the raw key text (no render exists).
+# absent row falls back to the raw key text (no render exists). The
+# payload MirFunction lifts that single canonical row into summary_text.
 def mir_function(snapshot: SemanticSnapshot, key: String) -> QueryResults
   var keys: Vec[String] = Vec::new()
   for m in snapshot.mir_functions do
@@ -312,15 +445,28 @@ def mir_function(snapshot: SemanticSnapshot, key: String) -> QueryResults
   if keys.is_empty() then
     keys.push(key.clone())
   end
-  QueryResults { kind: "mir_function", keys: keys }
+  let summary_text = keys[0].clone()
+  QueryResults {
+    kind: "mir_function",
+    keys: keys,
+    payload: Option::Some(SemanticResponsePayload::MirFunction(summary_text))
+  }
 end
 
 # The mir_slice query slot — §38 DOCUMENTED GAP: a real slice walks the
 # verified MirProgram through the §33 machinery; none rides the §29
 # snapshot, so the Option-like empty default keeps the slot callable and
-# the result is ALWAYS the empty "mir_slice_unavailable" row set.
+# the result is ALWAYS the empty "mir_slice_unavailable" row set. The
+# payload carries that EMPTY SLICE as MirSlice([], []) (the §33
+# slice_result_empty shape: no statement keys, no external anchors — a
+# real slice fills both from SliceResult.statements / SliceResult.external
+# once the §33 route lands).
 def mir_slice(key: String, mir_program: Option[MirProgram] = Option::None) -> QueryResults
-  QueryResults { kind: "mir_slice_unavailable", keys: Vec::new() }
+  QueryResults {
+    kind: "mir_slice_unavailable",
+    keys: Vec::new(),
+    payload: Option::Some(SemanticResponsePayload::MirSlice(Vec::new(), Vec::new()))
+  }
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -332,31 +478,46 @@ def change_affected(delta: SemanticDelta, key: String) -> Bool
   delta.affected.contains(&key)
 end
 
+# The delta's modified-entity rows (kind "semantic_diff"). The payload
+# Delta lifts the answer: changed = the modified stable ids (the same
+# sorted answer rows as keys) and rows = the delta's affected closure (the
+# invalidation unit — everything whose answer rows may have changed,
+# semantic_delta.tg).
 def change_semantic_diff(delta: SemanticDelta) -> QueryResults
   var keys: Vec[String] = Vec::new()
   for e in delta.modified do
     keys.push(e.stable_id.clone())
   end
   keys.sort_by(|a, b| a < b)
-  QueryResults { kind: "semantic_diff", keys: keys }
+  QueryResults {
+    kind: "semantic_diff",
+    keys: keys.clone(),
+    payload: Option::Some(SemanticResponsePayload::Delta(keys, delta.affected.clone()))
+  }
 end
 
-# The delta's ABI row keys (the b-side pub-Function stable keys of §31).
+# The delta's ABI row keys (the symmetric-difference rows of the typed
+# abi surface's before/after views — the b-side pub-Function stable keys
+# that changed between the two surfaces). Payload Abi carries the rows.
 def abi_inspect(delta: SemanticDelta) -> QueryResults
-  var keys: Vec[String] = Vec::new()
-  for k in delta.abi_delta.abi_rows do
-    keys.push(k.clone())
-  end
+  var keys = semantic_delta_rows_diff(&delta.abi_delta.before.rows,
+    &delta.abi_delta.after.rows)
   keys.sort_by(|a, b| a < b)
-  QueryResults { kind: "abi_inspect", keys: keys }
+  QueryResults {
+    kind: "abi_inspect",
+    keys: keys.clone(),
+    payload: Option::Some(SemanticResponsePayload::Abi(keys))
+  }
 end
 
 # ———————————————————————————————————————————————————————————————
 # The dispatch — one session-scoped query() per operation name
 # ———————————————————————————————————————————————————————————————
-# Routes the session-scoped ops by name; names outside the set — the
+# Routes the session-scoped ops by name; every routed op answers with the
+# payload its accessor built (the dispatcher never re-derives rows — the
+# accessors are the payload authority). Names outside the set — the
 # delta-scoped ops included (change_* / abi_inspect need a delta the
-# session does not hold) — return kind "unknown".
+# session does not hold) — return kind "unknown" with an empty payload.
 pub def query(session: SemanticQuerySession, operation: String, arg: String) -> QueryResults
   match operation
   when "callers" then query_callers(&session.index, arg.clone())

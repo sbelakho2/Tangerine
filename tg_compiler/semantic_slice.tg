@@ -77,6 +77,20 @@
 #     reads. A class reaching a function only through in-program callees
 #     is NOT re-listed: its sites live in the callee's own row.
 #
+# THE TYPED ENTRY (audit item 22): mir_slice(Option[MirProgram],
+# MirSliceRequest) routes ONE kind onto those engines (Failure onto the
+# node-anchored slice_failure machinery above) plus the two module-local
+# walks: ControlDependence (a bounded CFG-predecessor walk adding the
+# conditional terminators that decide the anchor block's reachability —
+# the CFG-only slice; the conditions' def chains stay the dataflow kinds'
+# business) and Ownership (the nodes whose operand/place keys touch the
+# anchor's local/place family — conservative). Request anchors are the §33
+# node key texts "<fn emission name>#B<block id>#S<stmt index>" / "#T",
+# the §27 local key texts (declared name or the "l<id>" locator), the §7
+# place key texts (root + projections over the MIR type table) or the
+# effect-class words "alloc" / "block" / "io" — the per-kind grammar and
+# the error mapping live at the entry's own doc below.
+#
 # SPAN MAP (how diagnostics map to statements): every lowered node
 # carries its source Span (synthesized nodes carry span_dummy). A
 # diagnostic's Option[Span] resolves deterministically over program order
@@ -110,8 +124,9 @@ use tg_compiler::semantic_model::{semantic_json_escape}
 use tg_compiler::mir::{
   MirProgram, MirFunction, MirStatement, MirStatementKind, MirRvalueKind, MirBinOp,
   MirOperand, MirOperandKind, MirConstantKind, MirTerminator, MirTerminatorKind,
-  MirCallArg, MirCallValue, AssertMessage, MirEffectState, mir_effect_scan_function,
-  mir_effect_classify_call, mir_effect_classify_deinit, mir_effect_place_type,
+  MirTypeDefKind, MirCallArg, MirCallValue, Place, Projection, AssertMessage,
+  MirEffectState, mir_effect_scan_function, mir_effect_classify_call,
+  mir_effect_classify_deinit, mir_effect_place_type,
   mir_effect_operand_is_string, mir_effect_type_is_string_like
 }
 
@@ -1176,48 +1191,53 @@ def slice_failure_map(mir: MirProgram, diag: Diagnostic) -> Option[(SliceFnCtx, 
   end
 end
 
+# The node-anchored FAILURE slice: the failing node's read operands' anchored
+# def chains UNION the failure trace (the enclosing block's statements from
+# its head through the node — the failing terminator included). Shared by
+# slice_failure (span-mapped anchors through slice_failure_map) and the typed
+# mir_slice Failure kind (direct node-key anchors).
+def slice_failure_node_slice(ctx: SliceFnCtx, v: Int, idx: Int) -> SliceResult
+  let block_len = ctx.f.blocks[v].statements.len()
+  var back = SliceBack { ctx: ctx.clone(), work: Vec::new(), seen: Set::new(), included: Map::new(), external: Set::new(), items: 0 }
+  # the failing node's read operands (the failing condition and its
+  # bounds, the switch scrutinee, the call's arguments...): the anchored
+  # def chains of each.
+  var reads: Vec[Int] = Vec::new()
+  if idx >= block_len then
+    let term = ctx.f.blocks[v].terminator
+    reads = slice_term_reads(&term)
+  else
+    let st = ctx.f.blocks[v].statements[idx]
+    reads = slice_stmt_reads(st)
+  end
+  for r in reads do
+    slice_backward_at(&mut back, v, idx, r)
+  end
+  # the failure trace: the enclosing block's statements from its head
+  # through the failing node (the failing terminator included).
+  var ti = 0
+  while ti <= idx && ti <= block_len do
+    var node_key = ""
+    var nspan = Span { file: "", start: 0, end_pos: 0 }
+    if ti >= block_len then
+      node_key = slice_term_key(&ctx.name, ctx.f.blocks[v].id.id)
+      nspan = slice_span_copy(ctx.f.blocks[v].terminator.span)
+    else
+      node_key = slice_stmt_key(&ctx.name, ctx.f.blocks[v].id.id, ti)
+      nspan = slice_span_copy(ctx.f.blocks[v].statements[ti].span)
+    end
+    if !back.included.contains_key(&node_key) then
+      let span_key = slice_span_key(&node_key, nspan)
+      back.included.insert(node_key, span_key)
+    end
+    ti = ti + 1
+  end
+  slice_result_build(&ctx, &back.included, &back.external)
+end
+
 pub def slice_failure(mir: MirProgram, diag: Diagnostic) -> SliceResult
   match slice_failure_map(mir, diag)
-  when Option::Some(triple) then
-    let ctx = triple.0
-    let v = triple.1
-    let idx = triple.2
-    let block_len = ctx.f.blocks[v].statements.len()
-    var back = SliceBack { ctx: ctx.clone(), work: Vec::new(), seen: Set::new(), included: Map::new(), external: Set::new(), items: 0 }
-    # the failing node's read operands (the failing condition and its
-    # bounds, the switch scrutinee, the call's arguments...): the anchored
-    # def chains of each.
-    var reads: Vec[Int] = Vec::new()
-    if idx >= block_len then
-      let term = ctx.f.blocks[v].terminator
-      reads = slice_term_reads(&term)
-    else
-      let st = ctx.f.blocks[v].statements[idx]
-      reads = slice_stmt_reads(st)
-    end
-    for r in reads do
-      slice_backward_at(&mut back, v, idx, r)
-    end
-    # the failure trace: the enclosing block's statements from its head
-    # through the failing node (the failing terminator included).
-    var ti = 0
-    while ti <= idx && ti <= block_len do
-      var node_key = ""
-      var nspan = Span { file: "", start: 0, end_pos: 0 }
-      if ti >= block_len then
-        node_key = slice_term_key(&ctx.name, ctx.f.blocks[v].id.id)
-        nspan = slice_span_copy(ctx.f.blocks[v].terminator.span)
-      else
-        node_key = slice_stmt_key(&ctx.name, ctx.f.blocks[v].id.id, ti)
-        nspan = slice_span_copy(ctx.f.blocks[v].statements[ti].span)
-      end
-      if !back.included.contains_key(&node_key) then
-        let span_key = slice_span_key(&node_key, nspan)
-        back.included.insert(node_key, span_key)
-      end
-      ti = ti + 1
-    end
-    slice_result_build(&ctx, &back.included, &back.external)
+  when Option::Some(triple) then slice_failure_node_slice(triple.0, triple.1, triple.2)
   when Option::None then slice_result_empty()
   end
 end
@@ -1398,4 +1418,878 @@ pub def slice_digest(results: Vec[SliceResult]) -> StableDigest
     text = text + l + "\n"
   end
   stable_digest_of(&text)
+end
+
+# ———————————————————————————————————————————————————————————————
+# THE TYPED §33 SLICE ENTRY (audit item 22) — mir_slice
+# ———————————————————————————————————————————————————————————————
+# mir_slice is the ONE typed slicing entry over an optional verified
+# MirProgram: a MirSliceRequest (function_key + kind + anchor) in, a typed
+# Result[MirSlice, MirSliceError] out. The four slices above stay the
+# engines; each MirSliceKind routes onto them (plus the module-local
+# ControlDependence / Ownership walks below):
+#
+#   BackwardDataflow   → slice_value-style backward def chains.
+#   ForwardDataflow    → slice_statement-style forward use chains.
+#   ControlDependence  → the bounded CFG-predecessor walk below.
+#   Ownership          → the place-family walk below.
+#   Effects            → slice_effect's §11 classifier row of the fn.
+#   Failure            → the node-anchored slice_failure machinery.
+#   ReturnValue        → the backward slice of the "_ret" local 0.
+#
+# REQUEST ANCHOR GRAMMAR (per kind):
+#   node anchors    — the §33 statement/terminator key texts
+#                     "<fn emission name>#B<block id>#S<stmt index>" and
+#                     "<fn emission name>#B<block id>#T" (BackwardDataflow,
+#                     ForwardDataflow, ControlDependence, Failure). The
+#                     key's function prefix must equal the request's
+#                     function_key (a foreign-prefixed key never resolves
+#                     inside this function: AnchorNotFound).
+#   local anchors   — the §27 local key text of ONE slot: the declared
+#                     name (name-first over ALL slots, first-wins) or the
+#                     "l<id>" locator of an unnamed slot; out-of-range ids
+#                     never resolve (BackwardDataflow, ForwardDataflow):
+#                     the slice of the LOCAL's value.
+#   place anchors   — the §7 place key text (local root + projection
+#                     segments: ".field"/".variant" names from the MIR
+#                     type table, ".digits" tuple indexes, "[name]"/"[n]"
+#                     element indexes, "*" derefs) whose root resolves to
+#                     a local (Ownership). A root-only anchor matches the
+#                     WHOLE place family of the local; a projected anchor
+#                     matches exactly the anchored place and its textual
+#                     descendants.
+#   class words     — "alloc" / "block" / "io", plus the claim spellings
+#                     "no_alloc" / "no_block" / "no_io" and the message
+#                     words "allocation" / "blocking" / "I/O" (Effects).
+#   ReturnValue     — the anchor text is ignored (pass "").
+#
+# ERROR MAPPING: Option::None → MirProgramUnavailable; a function_key
+# naming no emission name → FunctionNotFound; an anchor that is not a key
+# of its kind or whose key does not resolve (a missing block/statement, an
+# unresolvable local/place root, an unknown class word) → AnchorNotFound.
+# MirSliceError::UnsupportedKind is the RESERVED variant of the typed
+# surface: every kind routes today, so the error never leaves the module
+# (documented).
+#
+# The MirSlice payload carries the sorted statement key texts + sorted
+# external anchors; span_keys never cross this boundary (spans are
+# presentation-only per the module doc). Empty Ok slices are documented
+# per kind: a node-anchored BackwardDataflow whose node reads nothing, a
+# ForwardDataflow node whose defs nothing reads, an Effects request whose
+# function has no DIRECT class row (a class reaching it only through
+# in-program callees lives in the callee rows), a value with no use sites
+# (slice_value's rule) and the CFG walks with nothing to report.
+
+enum MirSliceKind
+  BackwardDataflow
+  ForwardDataflow
+  ControlDependence
+  Ownership
+  Effects
+  Failure
+  ReturnValue
+end
+
+# ONE typed slice request. Anchor texts follow the per-kind grammar above.
+struct MirSliceRequest
+  function_key: String
+  kind: MirSliceKind
+  anchor: String
+end
+
+# The typed error of a slice request. UnsupportedKind is reserved (never
+# produced: every MirSliceKind routes — documented above).
+enum MirSliceError
+  FunctionNotFound
+  AnchorNotFound
+  MirProgramUnavailable
+  UnsupportedKind
+end
+
+# ONE typed slice result: the sorted stable statement key texts, the
+# sorted external anchors and the kind that produced the row. span_keys do
+# not ride this record (presentation-only, never identity).
+struct MirSlice
+  function_key: String
+  statements: Vec[String] = Vec::new()
+  externals: Vec[String] = Vec::new()
+  kind: MirSliceKind
+end
+
+# ———————————————————————————————————————————————————————————————
+# Anchor parsers (the typed entry's key texts)
+# ———————————————————————————————————————————————————————————————
+
+# A node-key anchor resolved inside a function ctx: (block Vec index, node
+# index; the terminator's node index IS the block's statement count).
+# Option::None when the key does not parse or names a missing node.
+def slice_node_anchor_at(ctx: SliceFnCtx, anchor: String) -> Option[(Int, Int)]
+  match slice_key_parts(&ctx.name, &anchor)
+  when Option::Some(parts) then
+    let block_id = parts.0
+    let node_idx = parts.1
+    let is_term = parts.2
+    let v = slice_block_vec_index(&ctx, block_id)
+    if v < 0 || v >= ctx.f.blocks.len() then
+      return Option::None
+    end
+    let block_len = ctx.f.blocks[v].statements.len()
+    if is_term then
+      return Option::Some((v, block_len))
+    end
+    if node_idx >= 0 && node_idx < block_len then
+      return Option::Some((v, node_idx))
+    end
+    Option::None
+  when Option::None then Option::None
+  end
+end
+
+# The canonical local key text of one slot (snapshot_local_name's grammar:
+# the declared name when the slot has one, else the "l<id>" locator).
+def slice_local_canonical_text(f: MirFunction, local: Int) -> String
+  if local >= 0 && local < f.locals.len() then
+    let name = f.locals[local].name.clone()
+    if name.len() > 0 then
+      return name
+    end
+  end
+  "l" + local.to_string()
+end
+
+# A local/key anchor resolved inside a function ctx: the declared-name
+# match first (over ALL slots, first-wins — a local literally named "l7"
+# wins over the locator), then the "l<id>" locator of a slot in range.
+# Option::None when neither resolves.
+def slice_local_anchor_at(ctx: SliceFnCtx, anchor: String) -> Option[Int]
+  var i = 0
+  while i < ctx.f.locals.len() do
+    if ctx.f.locals[i].name == anchor then
+      return Option::Some(ctx.f.locals[i].id.id)
+    end
+    i = i + 1
+  end
+  if anchor.len() > 1 && anchor.slice(0, 1) == "l" then
+    let digits = anchor.slice(1, anchor.len())
+    if digits.len() <= 9 && slice_is_digits(&digits) then
+      let id = slice_text_to_int(&digits)
+      if id >= 0 && id < ctx.f.locals.len() then
+        return Option::Some(id)
+      end
+    end
+  end
+  Option::None
+end
+
+# The canonical spellings of an effect CLASS word (the claims' names, the
+# class message words and the class names themselves).
+def slice_effect_class_of_anchor(anchor: String) -> Option[EffectClass]
+  if anchor == "alloc" || anchor == "no_alloc" || anchor == "allocation" then
+    return Option::Some(EffectClass::Alloc)
+  end
+  if anchor == "block" || anchor == "no_block" || anchor == "blocking" then
+    return Option::Some(EffectClass::Block)
+  end
+  if anchor == "io" || anchor == "no_io" || anchor == "I/O" then
+    return Option::Some(EffectClass::Io)
+  end
+  Option::None
+end
+
+# Whether one rendered place text is AT or BELOW another (the anchored
+# place itself or a projection descendant — boundary-aware, so "x.f" never
+# matches "x.f2").
+def slice_place_text_touches(anchor_text: String, place_text: String) -> Bool
+  if place_text == anchor_text then
+    return true
+  end
+  if place_text.len() > anchor_text.len() then
+    if place_text.slice(0, anchor_text.len()) == anchor_text then
+      let nxt = place_text.slice(anchor_text.len(), anchor_text.len() + 1)
+      if nxt == "." || nxt == "[" || nxt == "*" then
+        return true
+      end
+    end
+  end
+  false
+end
+
+# ———————————————————————————————————————————————————————————————
+# Place collectors — the operand/place keys of one node (the Ownership
+# walk's atoms; place-payloaded mirrors of the reads collectors)
+# ———————————————————————————————————————————————————————————————
+
+# The place of a place-kind operand (None for constants).
+def slice_operand_place(op: MirOperand) -> Option[Place]
+  match op.kind
+  when MirOperandKind::MirCopy(p) then Option::Some(p)
+  when MirOperandKind::MirMovePlace(p) then Option::Some(p)
+  when MirOperandKind::MirRead(p) then Option::Some(p)
+  when MirOperandKind::MirConsume(p) then Option::Some(p)
+  when _ then Option::None
+  end
+end
+
+# The rvalue's place sources (the slice_rvalue_reads mirror with the full
+# places; MirPhi sources are VALUES — no places).
+def slice_rvalue_places(rv: MirRvalueKind, inout out: Vec[Place]) -> Unit
+  match rv
+  when MirRvalueKind::MirMove(op) then
+    match slice_operand_place(&op)
+    when Option::Some(p) then out.push(p)
+    when Option::None then ()
+    end
+  when MirRvalueKind::MirRef(place) then out.push(place)
+  when MirRvalueKind::MirAggregate(_, ops) then
+    for op in ops do
+      match slice_operand_place(&op)
+      when Option::Some(p2) then out.push(p2)
+      when Option::None then ()
+      end
+    end
+  when MirRvalueKind::MirBinOp(_, lhs, rhs) then
+    match slice_operand_place(&lhs)
+    when Option::Some(la) then out.push(la)
+    when Option::None then ()
+    end
+    match slice_operand_place(&rhs)
+    when Option::Some(ra) then out.push(ra)
+    when Option::None then ()
+    end
+  when MirRvalueKind::MirUnOp(_, op) then
+    match slice_operand_place(&op)
+    when Option::Some(u) then out.push(u)
+    when Option::None then ()
+    end
+  when MirRvalueKind::MirDiscriminant(place) then out.push(place)
+  when MirRvalueKind::MirLen(place) then out.push(place)
+  when MirRvalueKind::MirCast(_, op, _) then
+    match slice_operand_place(&op)
+    when Option::Some(c) then out.push(c)
+    when Option::None then ()
+    end
+  when MirRvalueKind::MirRepeat(op, _) then
+    match slice_operand_place(&op)
+    when Option::Some(r) then out.push(r)
+    when Option::None then ()
+    end
+  when _ then ()
+  end
+end
+
+# The place of a call argument (Place-valued args and place-kind operand
+# args; BARE write-args still touch their place — the ownership view keeps
+# the site even when the dataflow read rule drops it).
+def slice_call_arg_place(arg: MirCallArg) -> Option[Place]
+  match arg.value
+  when MirCallValue::Place(p) then Option::Some(p)
+  when MirCallValue::Value(op) then slice_operand_place(&op)
+  end
+end
+
+# The places one statement touches: the assignment DEST plus the rvalue's
+# place sources (contract checks, effect records/performs and effect frame
+# enters contribute their operand places).
+def slice_stmt_places(st: MirStatement) -> Vec[Place]
+  var out: Vec[Place] = Vec::new()
+  match st.kind
+  when MirStatementKind::MirAssign(dest, rvalue) then
+    out.push(dest)
+    slice_rvalue_places(rvalue.kind, &mut out)
+  when MirStatementKind::MirContractCheck(contract, operand) then
+    match slice_operand_place(&contract.condition)
+    when Option::Some(c) then out.push(c)
+    when Option::None then ()
+    end
+    match slice_operand_place(&operand)
+    when Option::Some(o) then out.push(o)
+    when Option::None then ()
+    end
+  when MirStatementKind::MirEffectRecord(_, operand) then
+    match slice_operand_place(&operand)
+    when Option::Some(e) then out.push(e)
+    when Option::None then ()
+    end
+  when MirStatementKind::MirEffectPerform(_, _, _, payload_ptr, result_ptr) then
+    match slice_operand_place(&payload_ptr)
+    when Option::Some(p) then out.push(p)
+    when Option::None then ()
+    end
+    match slice_operand_place(&result_ptr)
+    when Option::Some(r) then out.push(r)
+    when Option::None then ()
+    end
+  when MirStatementKind::MirEffectFrameEnter(_, _, _, _, env_ptr) then
+    match slice_operand_place(&env_ptr)
+    when Option::Some(e2) then out.push(e2)
+    when Option::None then ()
+    end
+  when _ then ()
+  end
+  out
+end
+
+# The places one terminator touches: the switch scrutinee, the call's
+# dest/func/arguments, the assert's condition (+ bounds operands), the
+# deinit's place (a destruction IS a place touch).
+def slice_term_places(term: MirTerminator) -> Vec[Place]
+  var out: Vec[Place] = Vec::new()
+  match term.kind
+  when MirTerminatorKind::MirSwitchInt { op, targets: _, default_target: _ } then
+    match slice_operand_place(&op)
+    when Option::Some(s) then out.push(s)
+    when Option::None then ()
+    end
+  when MirTerminatorKind::MirCall { dest, func, args, success: _, unwind: _, intrinsic: _ } then
+    out.push(dest)
+    match slice_operand_place(&func)
+    when Option::Some(c) then out.push(c)
+    when Option::None then ()
+    end
+    for arg in args do
+      match slice_call_arg_place(&arg)
+      when Option::Some(a) then out.push(a)
+      when Option::None then ()
+      end
+    end
+  when MirTerminatorKind::MirAssert { cond, expected: _, msg, target: _, unwind: _ } then
+    match slice_operand_place(&cond)
+    when Option::Some(cc) then out.push(cc)
+    when Option::None then ()
+    end
+    match msg
+    when AssertMessage::BoundsCheck(index_op, len_op) then
+      match slice_operand_place(&index_op)
+      when Option::Some(io) then out.push(io)
+      when Option::None then ()
+      end
+      match slice_operand_place(&len_op)
+      when Option::Some(lo) then out.push(lo)
+      when Option::None then ()
+      end
+    when _ then ()
+    end
+  when MirTerminatorKind::MirDeinit { place, deinit_fn: _, target: _, unwind: _ } then
+    out.push(place)
+  when _ then ()
+  end
+  out
+end
+
+# ———————————————————————————————————————————————————————————————
+# Place-text rendering — the §7 canonical place key over the MIR type
+# table (declaration names; a type the program table does not carry falls
+# back to the deterministic "f<index>" / "v<index>" render — documented;
+# the fallback never appears for verified programs whose types table is
+# complete).
+# ———————————————————————————————————————————————————————————————
+
+# The struct FIELD name of an owner TypeId (the deterministic "f<index>"
+# fallback when the owner is not a Struct of the program table).
+def slice_field_name_text(mir: MirProgram, owner_id: Int, index: Int) -> String
+  for td in mir.types do
+    if td.id.id == owner_id then
+      match td.kind
+      when MirTypeDefKind::Struct(fields) then
+        if index >= 0 && index < fields.len() then
+          return fields[index].name.clone()
+        end
+      when _ then ()
+      end
+      return "f" + index.to_string()
+    end
+  end
+  "f" + index.to_string()
+end
+
+# The enum VARIANT name of an owner TypeId (the deterministic "v<index>"
+# fallback, see slice_field_name_text).
+def slice_variant_name_text(mir: MirProgram, owner_id: Int, index: UInt) -> String
+  let vi = index as Int
+  for td in mir.types do
+    if td.id.id == owner_id then
+      match td.kind
+      when MirTypeDefKind::Enum(variants) then
+        if vi >= 0 && vi < variants.len() then
+          return variants[vi].name.clone()
+        end
+      when _ then ()
+      end
+      return "v" + vi.to_string()
+    end
+  end
+  "v" + vi.to_string()
+end
+
+# The canonical place key text of one place (the module doc's §7 grammar:
+# canonical root local text + ".field"/".variant" name segments from the
+# MIR type table, ".digits" tuple indexes, "[name]"/"[digits]" element
+# indexes, "*" derefs).
+def slice_render_place(mir: MirProgram, f: MirFunction, p: Place) -> String
+  var text = slice_local_canonical_text(&f, p.local.id)
+  for proj in p.projections do
+    match proj
+    when Projection::ProjDeref then text = text + "*"
+    when Projection::Field(fid) then
+      text = text + "." + slice_field_name_text(&mir, fid.owner.id, fid.index)
+    when Projection::Variant(vid) then
+      text = text + "." + slice_variant_name_text(&mir, vid.owner.id, vid.index)
+    when Projection::TupleIndex(idx) then text = text + "." + idx.to_string()
+    when Projection::ProjIndex(local_id) then
+      text = text + "[" + slice_local_canonical_text(&f, local_id.id) + "]"
+    when Projection::ProjConstantIndex(idx2) then text = text + "[" + idx2.to_string() + "]"
+    end
+  end
+  text
+end
+
+# ———————————————————————————————————————————————————————————————
+# The Ownership walk — nodes whose operand/place keys touch the anchor
+# ———————————————————————————————————————————————————————————————
+# A root-only anchor (tail == "") matches the WHOLE place family rooted at
+# the local (every node whose read/write/dest place has that root — the
+# conservative family). A projected anchor (tail != "") matches the nodes
+# whose rendered place key sits AT or BELOW the anchor's canonical text
+# (slice_place_text_touches). One deterministic single pass over the
+# function's nodes — no worklist, bounded by the function's size.
+
+# Whether any collected place touches (root, tail) — see the walk doc.
+def slice_places_touch(mir: MirProgram, f: MirFunction, places: Vec[Place], root: Int, tail: String) -> Bool
+  if tail.len() == 0 then
+    for p in places do
+      if p.local.id == root then
+        return true
+      end
+    end
+    return false
+  end
+  let canonical = slice_local_canonical_text(&f, root) + tail
+  for p in places do
+    if p.local.id == root then
+      let pkey = slice_render_place(&mir, &f, &p)
+      if slice_place_text_touches(&canonical, &pkey) then
+        return true
+      end
+    end
+  end
+  false
+end
+
+def slice_ownership_walk(mir: MirProgram, ctx: SliceFnCtx, root: Int, tail: String) -> SliceResult
+  var included: Map[String, String] = Map::new()
+  var bi = 0
+  while bi < ctx.f.blocks.len() do
+    let block_id = ctx.f.blocks[bi].id.id
+    let block_len = ctx.f.blocks[bi].statements.len()
+    var si = 0
+    while si < block_len do
+      let st = ctx.f.blocks[bi].statements[si]
+      if slice_places_touch(&mir, &ctx.f, slice_stmt_places(st), root, &tail) then
+        let node_key = slice_stmt_key(&ctx.name, block_id, si)
+        if !included.contains_key(&node_key) then
+          let nspan = slice_span_copy(st.span)
+          included.insert(node_key, slice_span_key(&node_key, nspan))
+        end
+      end
+      si = si + 1
+    end
+    if slice_places_touch(&mir, &ctx.f, slice_term_places(&ctx.f.blocks[bi].terminator), root, &tail) then
+      let node_key = slice_term_key(&ctx.name, block_id)
+      if !included.contains_key(&node_key) then
+        let nspan = slice_span_copy(ctx.f.blocks[bi].terminator.span)
+        included.insert(node_key, slice_span_key(&node_key, nspan))
+      end
+    end
+    bi = bi + 1
+  end
+  let empty_ext: Set[String] = Set::new()
+  slice_result_build(&ctx, &included, &empty_ext)
+end
+
+# ———————————————————————————————————————————————————————————————
+# The ControlDependence walk — conditional terminators deciding the anchor
+# block's reachability
+# ———————————————————————————————————————————————————————————————
+# A bounded FIFO walk over the module's predecessor map (slice_fn_find
+# builds it from the terminator targets; abort/unreachable/self edges are
+# not modeled — documented above): every predecessor chain of the anchor
+# block is visited once (deduped, capped at slice_max_items() popped
+# blocks), and the CONDITIONAL terminators along the way — the branch
+# sites that decide whether control reaches the anchor — are the slice's
+# statements. Conditional = a switch/assert (the assert's condition
+# decides target vs. abort) or a call/deinit WITH an unwind edge (the
+# success-vs-unwind split); goto/return/abort/unreachable and
+# unwind-free calls decide nothing in the modeled CFG. Pure CFG slice: the
+# conditions' own def chains stay the dataflow kinds' business
+# (documented); no external anchors.
+
+# Whether a terminator is a conditional decision site (see the walk doc).
+def slice_term_is_conditional(term: MirTerminator) -> Bool
+  match term.kind
+  when MirTerminatorKind::MirGoto(_) then false
+  when MirTerminatorKind::MirReturn then false
+  when MirTerminatorKind::MirUnreachable then false
+  when MirTerminatorKind::MirSwitchInt { op: _, targets: _, default_target: _ } then true
+  when MirTerminatorKind::MirCall { dest: _, func: _, args: _, success: _, unwind, intrinsic: _ } then
+    match unwind
+    when Option::Some(_) then true
+    when Option::None then false
+    end
+  when MirTerminatorKind::MirAssert { cond: _, expected: _, msg: _, target: _, unwind: _ } then true
+  when MirTerminatorKind::MirAbort then false
+  when MirTerminatorKind::MirDeinit { place: _, deinit_fn: _, target: _, unwind } then
+    match unwind
+    when Option::Some(_) then true
+    when Option::None then false
+    end
+  end
+end
+
+def slice_control_dependence_walk(ctx: SliceFnCtx, v: Int) -> SliceResult
+  var included: Map[String, String] = Map::new()
+  var seen: Set[Int] = Set::new()
+  var work: Vec[Int] = Vec::new()
+  var items = 0
+  # the seed: the anchor block's own predecessors.
+  var pred_rows: Vec[Int] = Vec::new()
+  match ctx.preds.get(v)
+  when Option::Some(rows) then pred_rows = rows.clone()
+  when Option::None then ()
+  end
+  for p in pred_rows do
+    if !seen.contains(&p) then
+      seen.insert(p)
+      work.push(p)
+    end
+  end
+  while work.len() > 0 && items < slice_max_items() do
+    items = items + 1
+    let b = work[0]
+    work.remove(0)
+    let term = ctx.f.blocks[b].terminator
+    if slice_term_is_conditional(&term) then
+      let node_key = slice_term_key(&ctx.name, ctx.f.blocks[b].id.id)
+      if !included.contains_key(&node_key) then
+        let nspan = slice_span_copy(term.span)
+        included.insert(node_key, slice_span_key(&node_key, nspan))
+      end
+    end
+    var b_preds: Vec[Int] = Vec::new()
+    match ctx.preds.get(b)
+    when Option::Some(rows2) then b_preds = rows2.clone()
+    when Option::None then ()
+    end
+    for q in b_preds do
+      if !seen.contains(&q) then
+        seen.insert(q)
+        work.push(q)
+      end
+    end
+  end
+  let empty_ext: Set[String] = Set::new()
+  slice_result_build(&ctx, &included, &empty_ext)
+end
+
+# ———————————————————————————————————————————————————————————————
+# The node-anchored BackwardDataflow slice
+# ———————————————————————————————————————————————————————————————
+# The anchor node + the anchored def chains of every value the node reads
+# (one shared SliceBack engine — the slice_value machinery seeded at the
+# anchor's use sites; a node reading nothing yields the anchor node alone;
+# a node with no defs below the reads stops at the parameters/externals
+# per the engine's rules).
+
+def slice_backward_node_slice(ctx: SliceFnCtx, v: Int, idx: Int) -> SliceResult
+  var back = SliceBack { ctx: ctx.clone(), work: Vec::new(), seen: Set::new(), included: Map::new(), external: Set::new(), items: 0 }
+  let block_len = back.ctx.f.blocks[v].statements.len()
+  var reads: Vec[Int] = Vec::new()
+  var span = Span { file: "", start: 0, end_pos: 0 }
+  if idx >= block_len then
+    let term = back.ctx.f.blocks[v].terminator
+    reads = slice_term_reads(&term)
+    span = slice_span_copy(term.span)
+  else
+    let st = back.ctx.f.blocks[v].statements[idx]
+    reads = slice_stmt_reads(st)
+    span = slice_span_copy(st.span)
+  end
+  # the anchor node itself, then one anchored def-chain walk per read.
+  slice_back_include(&mut back, v, idx, span)
+  for r in reads do
+    slice_backward_at(&mut back, v, idx, r)
+  end
+  slice_result_build(&back.ctx, &back.included, &back.external)
+end
+
+# ———————————————————————————————————————————————————————————————
+# The local-anchored ForwardDataflow slice
+# ———————————————————————————————————————————————————————————————
+# The forward use slice of ONE local's value: the entry-value chain (the
+# value as it enters the first block — a parameter's uses, for example)
+# UNION one chain per def site of the local (the def node itself is
+# included; the engine follows the def's uses forward until a later def
+# kills the chain). One shared SliceFwd engine = one 4096-item budget,
+# deterministic FIFO order.
+
+def slice_forward_value_slice(ctx: SliceFnCtx, local: Int) -> SliceResult
+  var fwd = SliceFwd { ctx: ctx.clone(), work: Vec::new(), seen: Set::new(), included: Map::new(), external: Set::new(), items: 0 }
+  # (a) the value as it enters the entry block.
+  let entry_v = slice_block_vec_index(&fwd.ctx, fwd.ctx.f.entry_block.id)
+  slice_fwd_push(&mut fwd, entry_v, 0, local)
+  # (b) one chain per def site (bare or partial) with the def node itself.
+  var bi = 0
+  while bi < fwd.ctx.f.blocks.len() do
+    let block_len = fwd.ctx.f.blocks[bi].statements.len()
+    var si = 0
+    while si < block_len do
+      let st = fwd.ctx.f.blocks[bi].statements[si]
+      let st_defs = slice_stmt_defs(st)
+      if st_defs.0 == local || st_defs.1 == local then
+        let span = slice_span_copy(st.span)
+        slice_fwd_include(&mut fwd, bi, si, span)
+        slice_fwd_push(&mut fwd, bi, si + 1, local)
+      end
+      si = si + 1
+    end
+    let term = fwd.ctx.f.blocks[bi].terminator
+    let term_defs = slice_term_defs(&term)
+    if term_defs.0 == local || term_defs.1 == local then
+      let tspan = slice_span_copy(term.span)
+      slice_fwd_include(&mut fwd, bi, block_len, tspan)
+      slice_fwd_push(&mut fwd, bi, block_len + 1, local)
+    end
+    bi = bi + 1
+  end
+  slice_fwd_run(&mut fwd)
+  slice_result_build(&fwd.ctx, &fwd.included, &fwd.external)
+end
+
+# ———————————————————————————————————————————————————————————————
+# The typed surface — conversion + per-kind routes
+# ———————————————————————————————————————————————————————————————
+
+# The MirSlice view of a slice result (span_keys never cross this
+# boundary — presentation-only per the module doc). A result carrying the
+# EMPTY marker function key (slice_result_empty — the documented "no
+# slice" marker of the four defs, e.g. a def-less ForwardDataflow node)
+# is normalized onto the request's function key: an empty Ok slice still
+# names its function.
+def slice_mir_of_result(fn_key: String, r: SliceResult, kind: MirSliceKind) -> MirSlice
+  var fk = r.function_key.clone()
+  if fk.len() == 0 then
+    fk = fn_key
+  end
+  MirSlice {
+    function_key: fk,
+    statements: r.statements.clone(),
+    externals: r.external.clone(),
+    kind: kind
+  }
+end
+
+# BackwardDataflow: node anchors slice the node + its reads' def chains;
+# local anchors delegate the whole slice_value walk of the local.
+def slice_mir_backward(mir: MirProgram, fn_key: String, anchor: String) -> Result[MirSlice, MirSliceError]
+  match slice_fn_find(mir, fn_key.clone())
+  when Option::None then
+    Result::Err(MirSliceError::FunctionNotFound)
+  when Option::Some(ctx) then
+    if slice_key_marker(&anchor) > 0 then
+      match slice_node_anchor_at(&ctx, &anchor)
+      when Option::Some(parts) then
+        return Result::Ok(slice_mir_of_result(fn_key.clone(), slice_backward_node_slice(&ctx, parts.0, parts.1), MirSliceKind::BackwardDataflow))
+      when Option::None then
+        return Result::Err(MirSliceError::AnchorNotFound)
+      end
+    else
+      match slice_local_anchor_at(&ctx, &anchor)
+      when Option::Some(local) then
+        return Result::Ok(slice_mir_of_result(fn_key.clone(), slice_value(mir, fn_key, local), MirSliceKind::BackwardDataflow))
+      when Option::None then
+        return Result::Err(MirSliceError::AnchorNotFound)
+      end
+    end
+    # unreachable: every path above returned.
+    Result::Err(MirSliceError::AnchorNotFound)
+  end
+end
+
+# ForwardDataflow: node anchors delegate slice_statement (a def-less node —
+# asserts, checks, switches — yields the documented empty slice); local
+# anchors delegate the forward value slice below.
+def slice_mir_forward(mir: MirProgram, fn_key: String, anchor: String) -> Result[MirSlice, MirSliceError]
+  match slice_fn_find(mir, fn_key.clone())
+  when Option::None then
+    Result::Err(MirSliceError::FunctionNotFound)
+  when Option::Some(ctx) then
+    if slice_key_marker(&anchor) > 0 then
+      # validated here (a def-less node — asserts, checks, switches —
+      # yields the documented empty slice through slice_statement).
+      match slice_node_anchor_at(&ctx, &anchor)
+      when Option::Some(_) then
+        return Result::Ok(slice_mir_of_result(fn_key.clone(), slice_statement(mir, fn_key, anchor), MirSliceKind::ForwardDataflow))
+      when Option::None then
+        return Result::Err(MirSliceError::AnchorNotFound)
+      end
+    else
+      match slice_local_anchor_at(&ctx, &anchor)
+      when Option::Some(local) then
+        return Result::Ok(slice_mir_of_result(fn_key.clone(), slice_forward_value_slice(&ctx, local), MirSliceKind::ForwardDataflow))
+      when Option::None then
+        return Result::Err(MirSliceError::AnchorNotFound)
+      end
+    end
+    # unreachable: every path above returned.
+    Result::Err(MirSliceError::AnchorNotFound)
+  end
+end
+
+# ControlDependence: a node-key anchor names the block whose reachability
+# the walk decides (its block Vec index + the conditional terminators on
+# its predecessor chains — see the walk doc).
+def slice_mir_control(mir: MirProgram, fn_key: String, anchor: String) -> Result[MirSlice, MirSliceError]
+  match slice_fn_find(mir, fn_key.clone())
+  when Option::None then
+    Result::Err(MirSliceError::FunctionNotFound)
+  when Option::Some(ctx) then
+    match slice_node_anchor_at(&ctx, &anchor)
+    when Option::Some(parts) then
+      return Result::Ok(slice_mir_of_result(fn_key.clone(), slice_control_dependence_walk(&ctx, parts.0), MirSliceKind::ControlDependence))
+    when Option::None then
+      return Result::Err(MirSliceError::AnchorNotFound)
+    end
+    # unreachable: every path above returned.
+    Result::Err(MirSliceError::AnchorNotFound)
+  end
+end
+
+# Ownership: the anchor is a §27 local key text (the whole family under
+# the local) or a §7 place key text rooted at a local (the anchored place
+# and its descendants) — see the walk doc.
+def slice_mir_ownership(mir: MirProgram, fn_key: String, anchor: String) -> Result[MirSlice, MirSliceError]
+  match slice_fn_find(mir, fn_key.clone())
+  when Option::None then
+    Result::Err(MirSliceError::FunctionNotFound)
+  when Option::Some(ctx) then
+    # the root segment: the text up to the first projection character.
+    var root_end = 0
+    while root_end < anchor.len() do
+      let ch = anchor.slice(root_end, root_end + 1)
+      if ch == "." || ch == "[" || ch == "*" then
+        break
+      end
+      root_end = root_end + 1
+    end
+    let root_text = anchor.slice(0, root_end)
+    match slice_local_anchor_at(&ctx, &root_text)
+    when Option::Some(root) then
+      let tail = anchor.slice(root_end, anchor.len())
+      return Result::Ok(slice_mir_of_result(fn_key.clone(), slice_ownership_walk(&mir, &ctx, root, &tail), MirSliceKind::Ownership))
+    when Option::None then
+      return Result::Err(MirSliceError::AnchorNotFound)
+    end
+    # unreachable: every path above returned.
+    Result::Err(MirSliceError::AnchorNotFound)
+  end
+end
+
+# Effects: the anchor is a class word; the result is the request function's
+# DIRECT §11 row (slice_effect's per-function rows — the class's direct
+# sites + their anchored def chains). A function whose summary reaches the
+# class only through in-program callees has no DIRECT row: the empty Ok
+# slice (the sites live in the callees' rows — documented).
+def slice_mir_effects(mir: MirProgram, fn_key: String, anchor: String) -> Result[MirSlice, MirSliceError]
+  match slice_fn_find(mir, fn_key.clone())
+  when Option::None then
+    Result::Err(MirSliceError::FunctionNotFound)
+  when Option::Some(ctx) then
+    match slice_effect_class_of_anchor(&anchor)
+    when Option::Some(class) then
+      let rows = slice_effect(mir, class)
+      var row: Option[SliceResult] = Option::None
+      for r in rows do
+        if r.function_key == ctx.name then
+          row = Option::Some(r.clone())
+          break
+        end
+      end
+      match row
+      when Option::Some(res) then
+        return Result::Ok(slice_mir_of_result(fn_key.clone(), res.clone(), MirSliceKind::Effects))
+      when Option::None then
+        return Result::Ok(MirSlice {
+          function_key: ctx.name.clone(),
+          statements: Vec::new(),
+          externals: Vec::new(),
+          kind: MirSliceKind::Effects
+        })
+      end
+    when Option::None then
+      return Result::Err(MirSliceError::AnchorNotFound)
+    end
+    # unreachable: every path above returned.
+    Result::Err(MirSliceError::AnchorNotFound)
+  end
+end
+
+# Failure: the anchor is the node key of the failing site; the result is
+# the failure trace + the anchored def chains of its reads — the exact
+# slice_failure machinery over the direct node anchor.
+def slice_mir_failure(mir: MirProgram, fn_key: String, anchor: String) -> Result[MirSlice, MirSliceError]
+  match slice_fn_find(mir, fn_key.clone())
+  when Option::None then
+    Result::Err(MirSliceError::FunctionNotFound)
+  when Option::Some(ctx) then
+    match slice_node_anchor_at(&ctx, &anchor)
+    when Option::Some(parts) then
+      return Result::Ok(slice_mir_of_result(fn_key.clone(), slice_failure_node_slice(&ctx, parts.0, parts.1), MirSliceKind::Failure))
+    when Option::None then
+      return Result::Err(MirSliceError::AnchorNotFound)
+    end
+    # unreachable: every path above returned.
+    Result::Err(MirSliceError::AnchorNotFound)
+  end
+end
+
+# ReturnValue: the backward slice of the return local — local 0, the "_ret"
+# place of start_function's convention (MirReturn terminators read it, so
+# slice_value resolves one def chain per return site). The anchor text is
+# ignored (documented). A bodyless function (no locals) yields the empty
+# Ok slice.
+def slice_mir_return(mir: MirProgram, fn_key: String) -> Result[MirSlice, MirSliceError]
+  match slice_fn_find(mir, fn_key.clone())
+  when Option::None then
+    Result::Err(MirSliceError::FunctionNotFound)
+  when Option::Some(ctx) then
+    if ctx.f.locals.len() <= 0 then
+      return Result::Ok(MirSlice {
+        function_key: ctx.name.clone(),
+        statements: Vec::new(),
+        externals: Vec::new(),
+        kind: MirSliceKind::ReturnValue
+      })
+    end
+    let r = slice_value(mir, fn_key, 0)
+    Result::Ok(slice_mir_of_result(fn_key.clone(), r, MirSliceKind::ReturnValue))
+  end
+end
+
+# The ONE typed slicing entry — routes the request per kind onto the
+# engines above; see the section doc for the anchor grammar and the error
+# mapping.
+pub def mir_slice(program: Option[MirProgram], request: MirSliceRequest) -> Result[MirSlice, MirSliceError]
+  match program
+  when Option::None then
+    Result::Err(MirSliceError::MirProgramUnavailable)
+  when Option::Some(mir) then
+    match request.kind
+    when MirSliceKind::BackwardDataflow then slice_mir_backward(mir, request.function_key.clone(), request.anchor.clone())
+    when MirSliceKind::ForwardDataflow then slice_mir_forward(mir, request.function_key.clone(), request.anchor.clone())
+    when MirSliceKind::ControlDependence then slice_mir_control(mir, request.function_key.clone(), request.anchor.clone())
+    when MirSliceKind::Ownership then slice_mir_ownership(mir, request.function_key.clone(), request.anchor.clone())
+    when MirSliceKind::Effects then slice_mir_effects(mir, request.function_key.clone(), request.anchor.clone())
+    when MirSliceKind::Failure then slice_mir_failure(mir, request.function_key.clone(), request.anchor.clone())
+    when MirSliceKind::ReturnValue then slice_mir_return(mir, request.function_key.clone())
+    end
+  end
 end

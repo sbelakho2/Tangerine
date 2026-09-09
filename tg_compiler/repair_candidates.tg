@@ -2,21 +2,37 @@
 # Self-hosting compiler written in Tangerine
 #
 # DETERMINISTIC repair-candidate derivation for the error classes the audit
-# names. This module reads ONLY the derivational fields of the ONE shared
+# names. This module reads the derivational fields of the ONE shared
 # Diagnostic record (parser.tg — the §34 fields: primary_symbol, semantic_site,
 # expected_type/actual_type, constraint_trace, trait_trace, ownership_trace,
 # effect_trace, capability_trace, related_symbols) and emits advisory
 # RepairCandidate records. It never guesses: every candidate is produced by a
-# text-grammar rule over the §34 row contracts, in a fixed deterministic order,
-# and every fact the trace rows cannot prove is carried as an Obligation the
-# higher-level reasoning layer must verify before applying the repair.
+# rule over typed facts or the §34 row contracts, in a fixed deterministic
+# order, and every fact the diagnostic cannot prove is carried as an
+# Obligation the higher-level reasoning layer must verify before applying the
+# repair.
+#
+# TWO RULE PATHS (audit item 24 — the TYPED-FACTS migration):
+#   - The TYPED path is the primary one: candidate_of_diagnostic
+#     pattern-matches diag.semantic_data FIRST and runs the per-record rules
+#     over parser.tg's typed payloads (OwnershipDiagnosticData /
+#     TypeMismatchData / TraitFailureData / EffectViolationData) — the REAL
+#     place/state words, type/obligation renders and evidence paths the
+#     emitters held, never prose. Affected-symbol texts come from those
+#     records' own renders only; no backtick/fragment scraping, no
+#     `fn::`-style key fabrication from message prose on this path.
+#   - The text-grammar path (the row parsers below) remains ONLY as the
+#     TRANSITIONAL fallback for diagnostics WITHOUT typed data (records the
+#     emitters do not yet populate, hand-built diagnostics, old callers) —
+#     behaviorally identical to the pre-item-24 engine. It is scheduled to
+#     disappear once every emitter populates semantic_data.
 #
 # LAYER CONTRACT
 #   - The compiler narrows LEGAL transformations (this module); intent
 #     (which candidate the user wants) is decided above.
 #   - A candidate's semantic_preconditions are the facts that must hold for
 #     the repair to be applicable. Obligation.ok is TRUE only when the
-#     diagnostic's own rows already prove the fact; ok = FALSE means the fact
+#     diagnostic's own facts already prove the fact; ok = FALSE means the fact
 #     is unverified at this layer (no env access) and must be confirmed by a
 #     consumer holding the TypeEnv / semantic index before the candidate is
 #     applied (e.g. "the moved local's type has Clone", "the consuming site
@@ -40,7 +56,8 @@
 #     produce NO candidates.
 #
 # ROW GRAMMARS PARSED (the §34 producer contracts — resource_check.tg /
-# types.tg / mir.tg):
+# types.tg / mir.tg) — the TRANSITIONAL text path only; the typed path
+# reads the semantic_data records instead:
 #   ownership_trace rows (ownership_site_rows + partial-move sites):
 #     "`NAME` state chain: live -> consumed at <file>:<start>"
 #     "`NAME` state chain: already in the consumed state"
@@ -68,8 +85,8 @@
 # CANDIDATE ORDER: within one diagnostic the classes run in the audit order —
 # ownership (use-after-move family), expected-vs-actual mismatch, trait-
 # resolution gaps, effect/contract rows; within a class the audit's listed
-# order. Each rule reads only its own derivational field, so the output is a
-# deterministic function of the diagnostic.
+# order. Each rule reads only its own derivational field / record, so the
+# output is a deterministic function of the diagnostic.
 #
 # TABLE OF RULES (audit §35 error class -> candidate kinds):
 #   use-after-move (whole value)            -> MoveUseLater; CloneBeforeMove
@@ -100,10 +117,45 @@
 #        otherwise.
 #   Transferable/Shareable capability rows, conditional-consume rows,
 #        uninitialized rows: NO candidates (not audit §35 classes).
+#
+# TYPED RULE MAPPING (audit item 24 — what the semantic_data records
+# trigger; the audit-order sets above are reproduced on the typed facts):
+#   Ownership(OwnershipDiagnosticData):
+#     operation "use"/"read"  + state_before "consumed"  -> the
+#       whole-use-after-move / partial-move sets (MoveUseLater,
+#       CloneBeforeMove, the sink->let convention change at consume_site;
+#       MakeFieldExplicit over diag.related_symbols[0] for the "read"
+#       class — the moved-out chain render is the record's typed symbol
+#       channel).
+#     operation "consume" + state_before "consumed"       -> the
+#       consumed-twice set (CloneBeforeMove, sink->let).
+#     operation "let-param" / "inout-param"               -> the convention
+#       changes (let->sink / inout->sink), no preconditions.
+#     everything else ("use"/"consume" on uninitialized or one-path-only
+#       states, "read" on one-path-only, "finalizer-subject", "outer-loop",
+#       "partial-whole") -> NO candidates (not audit §35 classes).
+#   TypeMismatch(TypeMismatchData)          -> the expected/actual wrapper
+#       rule over the record's two renders (the audit's money/int class).
+#   TraitFailure(TraitFailureData)          -> ResolveIntoImpl over the
+#       obligation's leaf (the "<trait> for <subject>" render; Copy is
+#       structural and foreign subjects are skipped).
+#   EffectViolation(EffectViolationData)    -> RemoveEffectAnnotation over
+#       the effect (annotation) word; RemoveViolatingCall over the path's
+#       leaf when the evidence path names one (path[0] is the claimed
+#       subject; a subject-only path cannot name a leaf).
+#
+# The typed path never fabricates strings from message prose: every text in
+# the emitted candidates (place/type/obligation/effect/path renders, site
+# locators) comes from the records' own fields, and the stable-symbol keys
+# are the documented local::/type::/fn:: digest vocabulary over those
+# renders.
 
 use std::core::{Option}
 use std::collections::{Vec}
-use tg_compiler::parser::{Diagnostic}
+use tg_compiler::parser::{
+  Diagnostic, DiagnosticSemanticData, OwnershipDiagnosticData, TypeMismatchData,
+  TraitFailureData, EffectViolationData
+}
 use tg_compiler::ids::{stable_digest_of}
 
 # ———————————————————————————————————————————————————————————————
@@ -667,6 +719,211 @@ def rc_effect_candidates(effect_rows: Vec[String]) -> Vec[RepairCandidate]
 end
 
 # ———————————————————————————————————————————————————————————————
+# (audit item 24) THE TYPED RULES — the semantic_data path
+# ———————————————————————————————————————————————————————————————
+# The typed-path rules pattern-match the emitters' payload records
+# (parser.tg). Every text they emit comes from the records' own fields —
+# the real place/state words, the type/obligation/effect renders, the
+# evidence-path names and the dense-locator sites — never from the message
+# or row prose (the text-grammar parsers above serve only the transitional
+# fallback). The candidate SETS reproduce the audit §35 table of rules
+# above for the classes the records express.
+
+# The typed ownership rule: (operation, state_before) select the audit
+# class (the mapping is documented in the module header). The local symbol
+# text is the record's place (falling back to primary_symbol — the §34
+# anchor — when the record carries none); `related` is the diagnostic's
+# typed related-symbol channel (the moved-out chain render the partial-move
+# emitters record) — the MakeFieldExplicit subject of the "read" class.
+def rc_ownership_typed_candidates(data: OwnershipDiagnosticData, primary: String, related: Vec[String]) -> Vec[RepairCandidate]
+  var out = Vec::new()
+  var name = primary.clone()
+  if name == "" then
+    name = data.place.clone()
+  end
+  if name == "" then
+    return out
+  end
+  match data.operation
+  when "use" then
+    match data.state_before
+    when "consumed" then
+      # use-after-move (whole value): move the use before the recorded
+      # consumption / clone / relax the consuming parameter.
+      out.push(RepairCandidate {
+        kind: RepairKind::MoveUseLater,
+        semantic_preconditions: Vec::new(),
+        affected_symbols: Vec::from([rc_stable_symbol(name.clone(), "local")]),
+        expected_delta: rc_delta_plain()
+      })
+      out.push(RepairCandidate {
+        kind: RepairKind::CloneBeforeMove,
+        semantic_preconditions: Vec::from([rc_ob("TraitBound", "Clone")]),
+        affected_symbols: Vec::from([rc_stable_symbol(name.clone(), "local")]),
+        expected_delta: rc_delta_plain()
+      })
+      out.push(RepairCandidate {
+        kind: RepairKind::ChangeParamConvention("sink", "let"),
+        semantic_preconditions: Vec::from([rc_ob("SinkParamTransfer", data.consume_site.clone())]),
+        affected_symbols: Vec::from([rc_stable_symbol(name.clone(), "local")]),
+        expected_delta: rc_delta_sig()
+      })
+    when _ then ()
+    end
+  when "read" then
+    match data.state_before
+    when "consumed" then
+      # use-after-move (partial: a moved-out field read later).
+      out.push(RepairCandidate {
+        kind: RepairKind::MoveUseLater,
+        semantic_preconditions: Vec::new(),
+        affected_symbols: Vec::from([rc_stable_symbol(name.clone(), "local")]),
+        expected_delta: rc_delta_plain()
+      })
+      out.push(RepairCandidate {
+        kind: RepairKind::CloneBeforeMove,
+        semantic_preconditions: Vec::from([rc_ob("TraitBound", "Clone")]),
+        affected_symbols: Vec::from([rc_stable_symbol(name.clone(), "local")]),
+        expected_delta: rc_delta_plain()
+      })
+      if related.len() > 0 then
+        out.push(RepairCandidate {
+          kind: RepairKind::MakeFieldExplicit(related[0].clone()),
+          semantic_preconditions: Vec::new(),
+          affected_symbols: Vec::from([rc_stable_symbol(name.clone(), "local")]),
+          expected_delta: rc_delta_plain()
+        })
+      end
+    when _ then ()
+    end
+  when "consume" then
+    match data.state_before
+    when "consumed" then
+      # consume-after-move (consumed twice).
+      out.push(RepairCandidate {
+        kind: RepairKind::CloneBeforeMove,
+        semantic_preconditions: Vec::from([rc_ob("TraitBound", "Clone")]),
+        affected_symbols: Vec::from([rc_stable_symbol(name.clone(), "local")]),
+        expected_delta: rc_delta_plain()
+      })
+      out.push(RepairCandidate {
+        kind: RepairKind::ChangeParamConvention("sink", "let"),
+        semantic_preconditions: Vec::from([rc_ob("SinkParamTransfer", data.consume_site.clone())]),
+        affected_symbols: Vec::from([rc_stable_symbol(name.clone(), "local")]),
+        expected_delta: rc_delta_sig()
+      })
+    when _ then ()
+    end
+  when "let-param" then
+    # convention error: consume of a read-only let parameter.
+    out.push(RepairCandidate {
+      kind: RepairKind::ChangeParamConvention("let", "sink"),
+      semantic_preconditions: Vec::new(),
+      affected_symbols: Vec::from([rc_stable_symbol(name.clone(), "local")]),
+      expected_delta: rc_delta_sig()
+    })
+  when "inout-param" then
+    # convention error: consume of an inout parameter.
+    out.push(RepairCandidate {
+      kind: RepairKind::ChangeParamConvention("inout", "sink"),
+      semantic_preconditions: Vec::new(),
+      affected_symbols: Vec::from([rc_stable_symbol(name.clone(), "local")]),
+      expected_delta: rc_delta_sig()
+    })
+  when _ then ()
+  end
+  out
+end
+
+# The typed expected-vs-actual rule ("TypeMismatchData wrapper rule"): the
+# same structural wrapper rule over the record's two renders (the record
+# fields ARE the renders the §34 expected_type/actual_type channel carries;
+# no text derivation is involved).
+def rc_mismatch_typed_candidates(data: TypeMismatchData) -> Vec[RepairCandidate]
+  rc_mismatch_candidates(data.expected.clone(), data.actual.clone())
+end
+
+# The typed trait-failure rule: ResolveIntoImpl over the obligation's leaf.
+# The obligation render is the "<trait> for <subject>" impl gap (the record
+# protocol — the subject is the part after the " for " separator, a marker
+# no type render contains). Copy is structural (never suggested as an
+# impl); subjects qualified with "::" are foreign (skipped — the
+# no-foreign-edits narrowing).
+def rc_trait_typed_candidates(data: TraitFailureData) -> Vec[RepairCandidate]
+  var out = Vec::new()
+  if data.obligation.len() == 0 then
+    return out
+  end
+  let obl = data.obligation.clone()
+  let sep = rc_index_of(obl.clone(), " for ", 0)
+  if sep < 0 then
+    return out
+  end
+  let trait_word = obl.slice(0, sep)
+  let subject = obl.slice(sep + 5, obl.len())
+  if trait_word == "Copy" then
+    return out
+  end
+  if subject.len() == 0 then
+    return out
+  end
+  if rc_index_of(subject.clone(), "::", 0) >= 0 then
+    return out
+  end
+  out.push(RepairCandidate {
+    kind: RepairKind::ResolveIntoImpl(obl.clone()),
+    semantic_preconditions: Vec::from([rc_ob("LocalNominal", subject.clone())]),
+    affected_symbols: Vec::from([rc_stable_symbol(subject.clone(), "type")]),
+    expected_delta: rc_delta_new_impls(Vec::from([obl]))
+  })
+  out
+end
+
+# The typed E0232 rule: RemoveEffectAnnotation over the effect (annotation)
+# word — the subject symbol is the path's first entry — and, when the
+# evidence path names a DIRECT leaf (path[1..]), RemoveViolatingCall over
+# that leaf (skipped for foreign fns — the no-foreign-edits narrowing; a
+# subject-only path cannot name a leaf).
+def rc_effect_typed_candidates(data: EffectViolationData) -> Vec[RepairCandidate]
+  var out = Vec::new()
+  if data.effect.len() == 0 then
+    return out
+  end
+  let effect_word = data.effect.clone()
+  var subject = ""
+  if data.path.len() > 0 then
+    subject = data.path[0].clone()
+  end
+  var ann_symbols = Vec::new()
+  if subject.len() > 0 then
+    ann_symbols.push(rc_stable_symbol(subject.clone(), "fn"))
+  end
+  out.push(RepairCandidate {
+    kind: RepairKind::RemoveEffectAnnotation(effect_word.clone()),
+    semantic_preconditions: Vec::new(),
+    affected_symbols: ann_symbols,
+    expected_delta: rc_delta_annotations(Vec::from(["@" + effect_word.clone()]))
+  })
+  if data.path.len() > 1 then
+    let leaf = data.path[data.path.len() - 1].clone()
+    if leaf != subject && !rc_is_foreign_name(leaf.clone()) then
+      var leaf_symbols = Vec::new()
+      if subject.len() > 0 then
+        leaf_symbols.push(rc_stable_symbol(subject.clone(), "fn"))
+      end
+      leaf_symbols.push(rc_stable_symbol(leaf.clone(), "fn"))
+      out.push(RepairCandidate {
+        kind: RepairKind::RemoveViolatingCall(leaf.clone()),
+        semantic_preconditions: Vec::from([rc_ob("LocalCallee", leaf.clone())]),
+        affected_symbols: leaf_symbols,
+        expected_delta: rc_delta_plain()
+      })
+    end
+  end
+  out
+end
+
+# ———————————————————————————————————————————————————————————————
 # THE RULES ENGINE
 # ———————————————————————————————————————————————————————————————
 # One Diagnostic in, the deterministic candidate list out. The classes run
@@ -681,48 +938,84 @@ pub def candidate_of_diagnostic(diag: Diagnostic) -> Vec[RepairCandidate]
   when Option::None then ()
   end
 
-  # 1. Ownership class (use-after-move / convention errors). Capability
-  #    diagnostics (linear values) are excluded — not an audit §35 class.
-  if rc_index_of(diag.message.clone(), "capability", 0) < 0 then
-    let facts = rc_ownership_scan(diag.ownership_trace, diag.message.clone())
-    let pass_class = facts.category != "none" && facts.category != "uninit" &&
-      facts.category != "conditional" && facts.category != "loop" &&
-      facts.category != "finalizer" && facts.category != "partial-whole"
-    if pass_class then
-      let own_cands = rc_ownership_candidates(facts, primary.clone())
+  # (audit item 24) THE TYPED PATH FIRST: a diagnostic carrying typed
+  # semantic data runs ONLY the per-record rules below (the records'
+  # classes are exhaustive — one payload per audit class). Diagnostics
+  # WITHOUT typed data fall through to the transitional text-grammar path
+  # in the Option::None arm.
+  match diag.semantic_data
+  when Option::Some(sd) then
+    match sd
+    when DiagnosticSemanticData::Ownership(od) then
+      let own_cands = rc_ownership_typed_candidates(od, primary.clone(), diag.related_symbols.clone())
       for c in own_cands do
         out.push(c)
       end
-    end
-  end
-
-  # 2. Expected-vs-actual mismatch class (the audit's money/int instance).
-  match diag.expected_type
-  when Option::Some(exp) then
-    match diag.actual_type
-    when Option::Some(act) then
-      let mm_cands = rc_mismatch_candidates(exp, act)
+    when DiagnosticSemanticData::TypeMismatch(tm) then
+      let mm_cands = rc_mismatch_typed_candidates(tm)
       for c in mm_cands do
         out.push(c)
       end
+    when DiagnosticSemanticData::TraitFailure(tf) then
+      let tr_cands = rc_trait_typed_candidates(tf)
+      for c in tr_cands do
+        out.push(c)
+      end
+    when DiagnosticSemanticData::EffectViolation(ev) then
+      let ef_cands = rc_effect_typed_candidates(ev)
+      for c in ef_cands do
+        out.push(c)
+      end
+    end
+  when Option::None then
+    # (audit item 24) TRANSITIONAL FALLBACK — the pre-item-24 text-grammar
+    # path, kept ONLY for diagnostics without typed data (records the
+    # emitters do not yet populate, hand-built diagnostics). Scheduled for
+    # removal once every emitter populates semantic_data.
+
+    # 1. Ownership class (use-after-move / convention errors). Capability
+    #    diagnostics (linear values) are excluded — not an audit §35 class.
+    if rc_index_of(diag.message.clone(), "capability", 0) < 0 then
+      let facts = rc_ownership_scan(diag.ownership_trace, diag.message.clone())
+      let pass_class = facts.category != "none" && facts.category != "uninit" &&
+        facts.category != "conditional" && facts.category != "loop" &&
+        facts.category != "finalizer" && facts.category != "partial-whole"
+      if pass_class then
+        let own_cands = rc_ownership_candidates(facts, primary.clone())
+        for c in own_cands do
+          out.push(c)
+        end
+      end
+    end
+
+    # 2. Expected-vs-actual mismatch class (the audit's money/int instance).
+    match diag.expected_type
+    when Option::Some(exp) then
+      match diag.actual_type
+      when Option::Some(act) then
+        let mm_cands = rc_mismatch_candidates(exp, act)
+        for c in mm_cands do
+          out.push(c)
+        end
+      when Option::None then ()
+      end
     when Option::None then ()
     end
-  when Option::None then ()
-  end
 
-  # 3. Trait-resolution-gap class (Clone/Copy/bound failures).
-  if diag.constraint_trace.len() > 0 || diag.trait_trace.len() > 0 then
-    let tr_cands = rc_trait_candidates(diag.constraint_trace, diag.trait_trace, primary.clone())
-    for c in tr_cands do
-      out.push(c)
+    # 3. Trait-resolution-gap class (Clone/Copy/bound failures).
+    if diag.constraint_trace.len() > 0 || diag.trait_trace.len() > 0 then
+      let tr_cands = rc_trait_candidates(diag.constraint_trace, diag.trait_trace, primary.clone())
+      for c in tr_cands do
+        out.push(c)
+      end
     end
-  end
 
-  # 4. Effect/contract class (E0232 rows).
-  if diag.effect_trace.len() > 0 then
-    let ef_cands = rc_effect_candidates(diag.effect_trace)
-    for c in ef_cands do
-      out.push(c)
+    # 4. Effect/contract class (E0232 rows).
+    if diag.effect_trace.len() > 0 then
+      let ef_cands = rc_effect_candidates(diag.effect_trace)
+      for c in ef_cands do
+        out.push(c)
+      end
     end
   end
 

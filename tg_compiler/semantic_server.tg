@@ -11,19 +11,31 @@
 # (Session/Request/Response records + §38 QueryResults); JSON exists only
 # as the *_to_debug_string log lines, never on the wire.
 #
-# SESSION STATE: revision = the snapshot's content-addressed digest (its
-# .revision words when the writer finalized it, else semantic_snapshot_digest
-# on construction); snapshot + index are the served tables (the §38 facade
-# is constructed ON DEMAND via session_query — never embedded). The
+# SESSION STATE: revision = the compile revision the session serves (the
+# snapshot's content-addressed digest — its .revision words when the
+# writer finalized it, else semantic_snapshot_digest on construction);
+# snapshot + index are the served tables (the §38 facade is constructed ON
+# DEMAND via session_query — never embedded). The target Option slot holds
+# the compilation's REAL TargetDesc record when the session was built at
+# the pipeline boundary (compiler_session_from_finalized); the
 # final_env / final_typed / final_mir Option slots carry the PIPELINE's
 # finalized state, typed with the real values the §30 builder receives
-# (TypeEnv / TypedProgram / verified MirProgram — types.tg / mir.tg records;
-# nothing below imports this module, so no kernel/cycle issue). DOCUMENTED
-# GAP: no pipeline hook fills them today (a driver-side hook in the
-# compile_snapshot_route shape would set Option::Some(...) after the final
-# verify_mir); the session queries only snapshot+index, so the slots are
-# advisory — a MirProgram-holding follow-up opens §33 slices, and §38's
-# mir_slice slot stays "mir_slice_unavailable" until then.
+# (TypeEnv / TypedProgram / verified MirProgram — types.tg / mir.tg
+# records; nothing below imports this module, so no kernel/cycle issue).
+# AUDIT ITEM 21: the DOCUMENTED HOOK GAP is closed — a driver-side hook
+# (driver.tg's compile_snapshot_route, TANGERINE_SERVER=1) constructs the
+# session at the successful final compiler boundary via
+# compiler_session_from_finalized, which fills the target + final_* slots
+# from the pipeline's real values after the final verify_mir; the
+# MirProgram-holding session carries the finalized state the §33-slice /
+# ABI / layout follow-ups consume (the §38 mir_slice op itself still
+# answers "mir_slice_unavailable" — no slice implementation exists yet,
+# documented in semantic_query.tg).
+#
+# SERVE LOOP: session_serve_loop(session) serves the request protocol
+# below from stdin to stdout (ONE request frame per iteration until EOF) —
+# the loop entry the driver route calls when the env gate requests a
+# server; it is documented in driver.tg's snapshot-route section.
 #
 # REQUEST PROTOCOL (versioned; framing binary, no length-prefix helper
 # exists outside the driver's LSP Content-Length TEXT framing — driver.tg
@@ -33,9 +45,32 @@
 #   UTF-8 fields ("4-byte BE length || text"): request: protocol_version,
 #   request_id, operation, payload; response: protocol_version, request_id,
 #   ok ("true"/"false"), kind, keys-count, keys..., error
-#   Parsers are strict and fail closed (prefix/length disagreement, truncated
-#   field or non-numeric int field -> None). keys are sorted stable key
-#   texts; request_id always echoes.
+#   Parsers are strict and fail closed (prefix/length disagreement,
+#   truncated field, non-numeric int field, trailing bytes inside a body
+#   or an over-limit length -> None). keys are sorted stable key texts;
+#   request_id always echoes. The TYPED SemanticResponsePayload (audit
+#   item 23) NEVER rides the wire: it is the in-process typed answer of
+#   the internal API — the framing above is unchanged, and a parsed
+#   response carries payload = None (the payload is filled by the server
+#   and consumed by in-process callers; the *_to_debug_string helpers
+#   render it for logs).
+#
+#   §39 FRAMING LIMITS (audit item 25) — the request/response parsers
+#   enforce the module constants below on EVERY frame, and every check
+#   runs BEFORE the untrusted bytes drive an allocation (a field length is
+#   validated against the remaining body before its text is sliced, the
+#   response keys-count is validated before the keys vector exists, and
+#   the serve loop refuses an over-limit length prefix before reading or
+#   allocating the body). A violation is a strict-parse failure like any
+#   other (None; the serve loop terminates, never desyncs).
+#
+#     limit            value   enforced on
+#     MAX_FRAME_BYTES  16 MiB  the whole wire frame (the 4-byte BE length
+#                              prefix + body): the parsers reject longer
+#                              inputs up front; the serve loop rejects the
+#                              length prefix before reading the body
+#     MAX_FIELD_BYTES   1 MiB  each length-prefixed text field
+#     MAX_KEYS         65536   the response keys-count (0 <= count)
 #
 # SESSION OPS: the sixteen §38 session ops (callers/callees/types/effects/
 # capabilities/contracts/fields/impls/properties/mir_function/symbol_get/
@@ -53,12 +88,14 @@
 # GRANULARITY = delta.affected; per-key memo caches live at that layer).
 
 use std::collections::{Vec}
+use std::fs
 
 use tg_compiler::ids::{StableDigest}
 use tg_compiler::types::{TypeEnv, TypedProgram}
 use tg_compiler::mir::{MirProgram}
+use tg_compiler::target_desc::{TargetDesc}
 use tg_compiler::semantic_model::{
-  SemanticSnapshot, semantic_digest_render, semantic_json_escape
+  SemanticSnapshot, SemanticResponsePayload, semantic_digest_render, semantic_json_escape
 }
 use tg_compiler::semantic_snapshot::{semantic_snapshot_digest}
 use tg_compiler::semantic_delta::{SemanticDelta, semantic_delta_of, semantic_delta_empty}
@@ -79,11 +116,28 @@ use tg_compiler::semantic_query::{
 
 pub const SEMANTIC_PROTOCOL_VERSION: Int = 1
 
-# The persistent-service session (final_* slots: see the module doc gap).
+# The §39 framing limits (audit item 25) — the module doc's table says
+# where each is enforced; every check precedes the allocation it caps,
+# and a violation fails closed (None) exactly like a truncated field.
+const MAX_FRAME_BYTES: Int = 16777216 # 16 MiB: 4-byte BE prefix + body
+const MAX_FIELD_BYTES: Int = 1048576  # 1 MiB per length-prefixed text
+const MAX_KEYS: Int = 65536           # response keys-count cap
+
+# The persistent-service session. revision / snapshot / index are the
+# served tables; target holds the compilation's REAL TargetDesc record
+# (Option: the pipeline constructors fill it — compiler_session_from_
+# finalized — while the offline-artifact forms leave it None: the §29
+# snapshot itself carries only the StableTargetId projection). The
+# final_env / final_typed / final_mir Option slots carry the PIPELINE's
+# finalized state (TypeEnv / TypedProgram / the FINAL verified MirProgram
+# — the values in scope at the successful final compiler boundary) for
+# the §33-slice / ABI / layout follow-ups; see the module doc's audit
+# item 21 note and compiler_session_from_finalized below.
 struct CompilerSession
   revision: StableDigest
   snapshot: SemanticSnapshot
   index: SemanticIndex
+  target: Option[TargetDesc] = Option::None
   final_env: Option[TypeEnv] = Option::None
   final_typed: Option[TypedProgram] = Option::None
   final_mir: Option[MirProgram] = Option::None
@@ -97,14 +151,19 @@ struct SemanticRequest
   payload: String
 end
 
-# One response: ok + kind + sorted keys carry the §38 answer; error carries
-# the fail-closed reason text (kind "protocol_error").
+# One response: ok + kind + sorted keys carry the §38 answer on the wire;
+# payload (audit item 23) is the TYPED semantic answer the server routes
+# from the §38 QueryResults — Option::None for error responses
+# (protocol_error), for parsed responses (never serialized — see the
+# module doc) and for the ops whose rows carry no payload family. error
+# carries the fail-closed reason text (kind "protocol_error").
 struct SemanticResponse
   protocol_version: Int
   request_id: Int
   ok: Bool
   kind: String
   keys: Vec[String] = Vec::new()
+  payload: Option[SemanticResponsePayload] = Option::None
   error: String = ""
 end
 
@@ -113,7 +172,12 @@ end
 # ———————————————————————————————————————————————————————————————
 
 # Build a session over one snapshot: index ONCE, revision = the snapshot's
-# digest (its own words when finalized).
+# digest (its own words when finalized). The OFFLINE-ARTIFACT form of the
+# session (see snapshot_only_session): it serves a serialized §30 artifact
+# and carries none of the pipeline's live state (target / final_* slots
+# stay None — the §33/ABI follow-ups that need the real TargetDesc or the
+# verified MirProgram require a session built at the compiler boundary via
+# compiler_session_from_finalized).
 pub def new_compiler_session(snapshot: SemanticSnapshot) -> CompilerSession
   var revision = semantic_snapshot_digest(&snapshot)
   if snapshot.revision.hi != 0 || snapshot.revision.lo != 0 then
@@ -123,6 +187,56 @@ pub def new_compiler_session(snapshot: SemanticSnapshot) -> CompilerSession
     revision: revision,
     snapshot: snapshot,
     index: build_semantic_index(&snapshot)
+  }
+end
+
+# The OFFLINE-ARTIFACT session constructor (audit item 21): the explicitly
+# documented artifact form of new_compiler_session — ONE finalized §30
+# SemanticSnapshot in (whatever the writer recorded: revision + the served
+# tables), a session out. It never pretends to hold pipeline state: the
+# target / final_env / final_typed / final_mir slots are None (documented
+# above), so a snapshot_only_session serves the §38 snapshot+index ops and
+# answers "mir_slice_unavailable"; it is the correct session for a
+# server fed from snapshot FILES rather than from a live compile.
+pub def snapshot_only_session(snapshot: SemanticSnapshot) -> CompilerSession
+  new_compiler_session(snapshot)
+end
+
+# The PIPELINE-BOUNDARY session constructor (audit item 21): the session
+# built at the successful final compiler boundary — the exact values the
+# compile pipeline has in scope after the FINAL verify (the driver's
+# compile_snapshot_route: env = the analyzer's TypeEnv, typed = the typed
+# program it returned, mir_program = the monomorphized + optimized +
+# verified MirProgram, snapshot = the §30 SemanticSnapshot of that
+# finalized state, index = the §32 index built from it). revision is the
+# compile revision the session serves (the snapshot's content-addressed
+# digest after semantic_snapshot_finalize — the driver passes
+# snapshot.revision); target_desc is the compilation's REAL TargetDesc
+# record (target_desc.tg — the desc the §30 builder stamped the
+# snapshot's StableTargetId from). Every field of the session is filled:
+# revision / snapshot / index, target := the descriptor, and the three
+# final_* slots := the pipeline values — the session then carries the
+# finalized state (the final verified MirProgram included) that the
+# §33-slice / ABI / layout follow-ups consume (the §38 mir_slice op
+# itself still answers "mir_slice_unavailable": no slice implementation
+# exists yet, documented in semantic_query.tg).
+pub def compiler_session_from_finalized(
+  revision: StableDigest,
+  target_desc: TargetDesc,
+  env: TypeEnv,
+  typed: TypedProgram,
+  mir_program: MirProgram,
+  snapshot: SemanticSnapshot,
+  index: SemanticIndex
+) -> CompilerSession
+  CompilerSession {
+    revision: revision,
+    snapshot: snapshot,
+    index: index,
+    target: Option::Some(target_desc),
+    final_env: Option::Some(env),
+    final_typed: Option::Some(typed),
+    final_mir: Option::Some(mir_program)
   }
 end
 
@@ -152,6 +266,10 @@ end
 # ———————————————————————————————————————————————————————————————
 # The op table mirrors §38's query() arm for arm (every arm delegates to a
 # §38 typed accessor); "revision" is the one §39 service op.
+# The "revision" service answer (the digest render — the client's
+# freshness probe). No §23 payload family is enumerated for the service
+# op's digest row (semantic_model.tg's mapping table), so payload stays
+# None and kind + keys are the whole answer.
 def session_revision_results(session: CompilerSession) -> QueryResults
   var keys: Vec[String] = Vec::new()
   keys.push(semantic_digest_render(&session.revision))
@@ -181,13 +299,22 @@ def session_query_results(session: CompilerSession, operation: String, arg: Stri
   end
 end
 
+# Route one §38 result into the response: kind + keys ride the wire
+# protocol; the typed payload (audit item 23) rides the response record
+# (the in-process channel — the framing in semantic_response_frame never
+# serializes it; a parse always yields None there).
 def session_results_response(req: SemanticRequest, results: QueryResults) -> SemanticResponse
+  let payload = match results.payload
+  when Option::Some(p) then Option::Some(p.clone())
+  when Option::None then Option::None
+  end
   SemanticResponse {
     protocol_version: SEMANTIC_PROTOCOL_VERSION,
     request_id: req.request_id,
     ok: true,
     kind: results.kind.clone(),
-    keys: results.keys.clone()
+    keys: results.keys.clone(),
+    payload: payload
   }
 end
 
@@ -244,7 +371,9 @@ def server_read_text(bytes: Vec[u8], inout at: Int) -> Option[String]
   match server_read_u32(&bytes, &mut at)
   when Option::None then Option::None
   when Option::Some(n) then
-    if n < 0 || at + n > bytes.len() then
+    # Audit item 25: the field length is checked against MAX_FIELD_BYTES
+    # and the remaining body BEFORE the text is sliced out.
+    if n < 0 || n > MAX_FIELD_BYTES || at + n > bytes.len() then
       Option::None
     else
       let text = String::from_bytes(bytes.slice(at, at + n))
@@ -308,19 +437,31 @@ def server_req_fields_1(bytes: Vec[u8], inout at: Int, protocol_version: Int) ->
   end
 end
 
-# Parse ONE complete request frame (strict — None on any framing/field error).
+# Parse ONE complete request frame (strict — None on any framing/field
+# error). Audit item 25: a frame must be at least the 4-byte BE length
+# header and at most MAX_FRAME_BYTES (checked before any field work), and
+# the fields must end EXACTLY at the body's end — trailing bytes inside a
+# frame fail closed.
 pub def semantic_request_parse(bytes: Vec[u8]) -> Option[SemanticRequest]
+  if bytes.len() < 4 || bytes.len() > MAX_FRAME_BYTES then
+    return Option::None
+  end
   var at = 0
   match server_read_u32(&bytes, &mut at)
   when Option::None then Option::None
   when Option::Some(body_len) then
-    if bytes.len() != at + body_len then
+    let end = at + body_len
+    if bytes.len() != end then
       Option::None
     else
       match server_read_int(&bytes, &mut at)
       when Option::None then Option::None
       when Option::Some(protocol_version) then
-        server_req_fields_1(&bytes, &mut at, protocol_version)
+        match server_req_fields_1(&bytes, &mut at, protocol_version)
+        when Option::None then Option::None
+        when Option::Some(req) then
+          if at != end then Option::None else Option::Some(req) end
+        end
       end
     end
   end
@@ -367,33 +508,45 @@ def server_resp_fields_1(
     match server_read_int(&bytes, &mut at)
     when Option::None then Option::None
     when Option::Some(count) then
-      match server_response_keys(&bytes, &mut at, count)
-      when Option::None then Option::None
-      when Option::Some(keys) then
-        match server_read_text(&bytes, &mut at)
+      # Audit item 25: the keys-count is range-checked (0 <= count <=
+      # MAX_KEYS) BEFORE server_response_keys allocates the keys vector;
+      # its own byte length was already bounded by server_read_text.
+      if count < 0 || count > MAX_KEYS then
+        Option::None
+      else
+        match server_response_keys(&bytes, &mut at, count)
         when Option::None then Option::None
-        when Option::Some(error) then
-          Option::Some(SemanticResponse {
-            protocol_version: protocol_version,
-            request_id: request_id,
-            ok: ok,
-            kind: kind,
-            keys: keys,
-            error: error
-          })
+        when Option::Some(keys) then
+          match server_read_text(&bytes, &mut at)
+          when Option::None then Option::None
+          when Option::Some(error) then
+            Option::Some(SemanticResponse {
+              protocol_version: protocol_version,
+              request_id: request_id,
+              ok: ok,
+              kind: kind,
+              keys: keys,
+              error: error
+            })
+          end
         end
       end
     end
   end
 end
 
-# Parse ONE complete response frame (strict like semantic_request_parse).
+# Parse ONE complete response frame (strict like semantic_request_parse;
+# audit item 25 applies the same frame cap and end-of-body check).
 pub def semantic_response_parse(bytes: Vec[u8]) -> Option[SemanticResponse]
+  if bytes.len() < 4 || bytes.len() > MAX_FRAME_BYTES then
+    return Option::None
+  end
   var at = 0
   match server_read_u32(&bytes, &mut at)
   when Option::None then Option::None
   when Option::Some(body_len) then
-    if bytes.len() != at + body_len then
+    let end = at + body_len
+    if bytes.len() != end then
       Option::None
     else
       match server_read_int(&bytes, &mut at)
@@ -408,7 +561,11 @@ pub def semantic_response_parse(bytes: Vec[u8]) -> Option[SemanticResponse]
             if ok_text != "true" && ok_text != "false" then
               Option::None
             else
-              server_resp_fields_1(&bytes, &mut at, protocol_version, request_id, ok_text == "true")
+              match server_resp_fields_1(&bytes, &mut at, protocol_version, request_id, ok_text == "true")
+              when Option::None then Option::None
+              when Option::Some(resp) then
+                if at != end then Option::None else Option::Some(resp) end
+              end
             end
           end
         end
@@ -433,6 +590,55 @@ def server_json_keys_text(keys: Vec[String]) -> String
   text + "]"
 end
 
+# The human debug render of ONE typed payload (audit item 23 — human
+# debug Strings only, never parsed, never on the wire): the JSON object
+# value the response log line embeds under its "payload" key, keyed by the
+# variant name. Rows render through server_json_keys_text (the same JSONL
+# list shape as the response's "keys").
+def payload_to_debug_text(p: SemanticResponsePayload) -> String
+  match p
+  when SemanticResponsePayload::Symbol(row_text) then
+    "{\"Symbol\":{\"row_text\":\"" + semantic_json_escape(&row_text.clone()) + "\"}}"
+  when SemanticResponsePayload::Symbols(rows) then
+    "{\"Symbols\":{\"rows\":" + server_json_keys_text(rows.clone()) + "}}"
+  when SemanticResponsePayload::Callers(rows) then
+    "{\"Callers\":{\"rows\":" + server_json_keys_text(rows.clone()) + "}}"
+  when SemanticResponsePayload::Callees(rows) then
+    "{\"Callees\":{\"rows\":" + server_json_keys_text(rows.clone()) + "}}"
+  when SemanticResponsePayload::Type(kind_word, rows) then
+    "{\"Type\":{\"kind_word\":\"" + semantic_json_escape(&kind_word.clone()) +
+      "\",\"rows\":" + server_json_keys_text(rows.clone()) + "}}"
+  when SemanticResponsePayload::Effects(bits, caps) then
+    "{\"Effects\":{\"bits\":" + bits.to_string() + ",\"caps\":" +
+      server_json_keys_text(caps.clone()) + "}}"
+  when SemanticResponsePayload::Capabilities(rows) then
+    "{\"Capabilities\":{\"rows\":" + server_json_keys_text(rows.clone()) + "}}"
+  when SemanticResponsePayload::Ownership(rows) then
+    "{\"Ownership\":{\"rows\":" + server_json_keys_text(rows.clone()) + "}}"
+  when SemanticResponsePayload::MirFunction(summary_text) then
+    "{\"MirFunction\":{\"summary_text\":\"" + semantic_json_escape(&summary_text.clone()) + "\"}}"
+  when SemanticResponsePayload::MirSlice(statements, externals) then
+    "{\"MirSlice\":{\"statements\":" + server_json_keys_text(statements.clone()) +
+      ",\"externals\":" + server_json_keys_text(externals.clone()) + "}}"
+  when SemanticResponsePayload::Contract(rows) then
+    "{\"Contract\":{\"rows\":" + server_json_keys_text(rows.clone()) + "}}"
+  when SemanticResponsePayload::Delta(changed, rows) then
+    "{\"Delta\":{\"changed\":" + server_json_keys_text(changed.clone()) +
+      ",\"rows\":" + server_json_keys_text(rows.clone()) + "}}"
+  when SemanticResponsePayload::Abi(rows) then
+    "{\"Abi\":{\"rows\":" + server_json_keys_text(rows.clone()) + "}}"
+  end
+end
+
+# The debug text of the response's Option payload slot: "null" when the
+# response carries none (error/unknown/parsed responses).
+def payload_option_debug_text(payload: Option[SemanticResponsePayload]) -> String
+  match payload
+  when Option::None then "null"
+  when Option::Some(p) then payload_to_debug_text(p)
+  end
+end
+
 pub def request_to_debug_string(req: SemanticRequest) -> String
   "{\"request\":{\"protocol_version\":" + req.protocol_version.to_string() +
     ",\"request_id\":" + req.request_id.to_string() +
@@ -446,5 +652,111 @@ pub def response_to_debug_string(resp: SemanticResponse) -> String
     ",\"ok\":" + (if resp.ok then "true" else "false" end) +
     ",\"kind\":\"" + semantic_json_escape(&resp.kind) +
     "\",\"keys\":" + server_json_keys_text(resp.keys.clone()) +
+    ",\"payload\":" + payload_option_debug_text(&resp.payload) +
     ",\"error\":\"" + semantic_json_escape(&resp.error) + "\"}}"
+end
+
+# ———————————————————————————————————————————————————————————————
+# The serve loop — the §39 stdin/stdout request loop
+# ———————————————————————————————————————————————————————————————
+# session_serve_loop serves the request protocol of the module doc from
+# stdin to stdout: ONE request frame per iteration (4-byte BIG-ENDIAN
+# body length || body — the module doc's framing), handled through
+# session_handle_request (the version gate + §38 routing), the response
+# written back with the same framing. The loop returns the number of
+# requests served. Termination is fail closed: EOF on stdin, a negative,
+# truncated or over-limit (MAX_FRAME_BYTES) frame length, a strict-parse
+# failure (semantic_request_parse -> None — the byte stream can no longer
+# be trusted) or an IO error on either side ends the loop; no partial
+# response is ever written. The loop is silent (no log lines on the
+# wire); the caller
+# (driver.tg's compile_snapshot_route under TANGERINE_SERVER=1) prints
+# its own status line AFTER the loop. The driver's LSP loop reads the
+# same stdin fd only in its own command route, never concurrently.
+pub def session_serve_loop(session: CompilerSession) -> Int
+  var served = 0
+  loop
+    match server_read_stdin_exact(4)
+    when Option::None then break
+    when Option::Some(prefix) then
+      let body_len = server_prefix_length(&prefix)
+      # Audit item 25: the body length is untrusted input — refuse any
+      # frame over MAX_FRAME_BYTES BEFORE server_read_stdin_exact
+      # allocates a buffer of that size (fail closed, no giant alloc).
+      if body_len < 0 || 4 + body_len > MAX_FRAME_BYTES then
+        break
+      end
+      match server_read_stdin_exact(body_len)
+      when Option::None then break
+      when Option::Some(body) then
+        var frame: Vec[u8] = Vec::new()
+        var fi = 0
+        while fi < prefix.len() do
+          frame.push(prefix[fi])
+          fi = fi + 1
+        end
+        var bi = 0
+        while bi < body.len() do
+          frame.push(body[bi])
+          bi = bi + 1
+        end
+        match semantic_request_parse(frame)
+        when Option::None then break
+        when Option::Some(req) then
+          let resp = session_handle_request(&session, req)
+          if !server_write_stdout(semantic_response_frame(&resp)) then
+            break
+          end
+          served = served + 1
+        end
+      end
+    end
+  end
+  served
+end
+
+# Read exactly n bytes from stdin (fd 0) into a fresh buffer; Option::None
+# on a negative length, an IO error or EOF before the extent is filled —
+# fail closed, never a partial frame. Reads loop over raw_read with
+# sub-views so a short pipe read never truncates a frame.
+def server_read_stdin_exact(n: Int) -> Option[Vec[u8]]
+  if n < 0 then
+    return Option::None
+  end
+  var bytes = Vec[u8]::new()
+  bytes.resize(n, 0)
+  var done = 0
+  while done < n do
+    var view = bytes.as_mut_slice().sub(done, (n - done) as UInt)
+    match std::fs::raw_read(0, view)
+    when Result::Err(_) then return Option::None
+    when Result::Ok(count) then
+      if count as Int <= 0 then
+        return Option::None
+      end
+      done = done + count as Int
+    end
+  end
+  Option::Some(bytes)
+end
+
+# The 4-byte BIG-ENDIAN body length of a frame prefix (-1 when the prefix
+# is not exactly 4 bytes — the caller fails closed).
+def server_prefix_length(prefix: Vec[u8]) -> Int
+  if prefix.len() != 4 then
+    return -1
+  end
+  ((prefix[0] as Int) << 24) | ((prefix[1] as Int) << 16) |
+    ((prefix[2] as Int) << 8) | (prefix[3] as Int)
+end
+
+# Write ONE complete frame to stdout (fd 1); false on an IO error or a
+# short write (raw_write reports the bytes actually written) — the caller
+# stops serving rather than desync the response stream.
+def server_write_stdout(bytes: Vec[u8]) -> Bool
+  let n = bytes.len() as UInt
+  match std::fs::raw_write(1, &bytes, n)
+  when Result::Ok(count) then count == n
+  when Result::Err(_) then false
+  end
 end

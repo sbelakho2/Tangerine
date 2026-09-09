@@ -1,12 +1,13 @@
 use std::core::{Option}
 use std::collections::{Vec, Map, Set}
 use tg_compiler::token::{Span, parsed_int_to_host}
+use tg_compiler::parser::{DiagnosticSemanticData, OwnershipDiagnosticData}
 use tg_compiler::ast::{
   Program, Item, ItemKind, FunctionDecl, FnBody, TraitMethod, ExternItem,
   Block, Stmt, StmtKind, Expr, ExprKind, Pattern, PatternKind, Param,
   AccessConvention, GuardElse, MatchExpr, IfStmt, ForStmt, ClosureParam
 }
-use tg_compiler::types::{Type, TypeKind, ParamType, AccessEffect, TypedProgram, TypeId, TypeEnv, type_properties_of, TypeDef, TypeDefKind, FieldInfo, VariantInfo, LangItems, ImplInfo, TraitRefTemplate, fn_owner_key, fn_owner_key_of_item, is_trivially_copyable, is_slice_view_type_of, is_shared_view_type_of, finalizer_kind_of_callable, FunctionCleanupTable, FunctionCleanup, ScopeId, DeferId, AssignExactDrop, function_cleanup_table_new, crate_module_path_of, def_id_kind_of, ProjectionKey, ProjectionChain, projection_chain_of, projection_key_eq, place_move_path_of, TypedExprKind, effect_handler_synth_key}
+use tg_compiler::types::{Type, TypeKind, ParamType, AccessEffect, TypedProgram, TypeId, TypeEnv, type_properties_of, type_display, TypeDef, TypeDefKind, FieldInfo, VariantInfo, LangItems, ImplInfo, TraitRefTemplate, fn_owner_key, fn_owner_key_of_item, is_trivially_copyable, is_slice_view_type_of, is_shared_view_type_of, finalizer_kind_of_callable, FunctionCleanupTable, FunctionCleanup, ScopeId, DeferId, AssignExactDrop, function_cleanup_table_new, crate_module_path_of, def_id_kind_of, ProjectionKey, ProjectionChain, projection_chain_of, projection_key_eq, place_move_path_of, TypedExprKind, effect_handler_synth_key}
 use tg_compiler::resolver::{module_path_of_item_resolver, def_kind_of, ResolvedNames}
 use tg_compiler::access_check::{AccessError}
 use tg_compiler::ids::{DefId, DefKind, LocalId, TraitId, FinalizerKind, generic_param_table_new, NodeId, AccessId, CfgEdgeId, CallableId, FieldId}
@@ -39,6 +40,14 @@ struct ResourceError
   related_symbols: Vec[String] = Vec::new()
   minimal_slice: Vec[String] = Vec::new()
   repair_candidates: Vec[String] = Vec::new()
+  # (audit item 24) semantic_data: the TYPED facts of the diagnostic (the
+  # OwnershipDiagnosticData record — parser.tg). Mirror of the Diagnostic
+  # field of the same name; populated at the ownership rejection sites
+  # (apply_consume / check_use / the partial-move chain reads) and copied
+  # through by compiler_core.tg's resource_error_to_diag. Defaulted —
+  # every existing ResourceError literal site stays unchanged. Capability
+  # locals (linear values — not an audit §35 class) carry no payload.
+  semantic_data: Option[DiagnosticSemanticData] = Option::None
 end
 
 # Availability states: whether a local currently holds a valid value.
@@ -4633,7 +4642,7 @@ def check_match(program: Program, typed: TypedProgram, inout env: TypeEnv, inout
  # boundary: the frame is LocalId-keyed; expr_root_id yields the
       # raw Int semantic id.
       if res_frame_has(frame, &tg_compiler::ids::LocalId { id: root }) then
-        apply_consume(typed, root, m.scrutinee.span, loop_outer, frame, errors)
+        apply_consume(env, typed, root, m.scrutinee.span, loop_outer, frame, errors)
       end
     when Option::None then ()
     end
@@ -6259,7 +6268,7 @@ def check_expr(program: Program, typed: TypedProgram, inout env: TypeEnv, inout 
     end
   when ExprKind::ExprIdent(_) then
     match typed.ident_resolutions.get(expr.node_id)
-    when Option::Some(l) then check_use(typed, l, expr.span, frame, errors)
+    when Option::Some(l) then check_use(env, typed, l, expr.span, frame, errors)
     when Option::None then ()
     end
   when ExprKind::ExprPath(_) then ()
@@ -6273,7 +6282,7 @@ def check_expr(program: Program, typed: TypedProgram, inout env: TypeEnv, inout 
     check_expr(program, typed, env, ctx, &base, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
     # (partial moves): the field READ is a CHAIN read — the root stays
     # live under a partial move, and a consumed chain is a use-after-move.
-    check_place_chain_read(typed, &expr, frame, errors)
+    check_place_chain_read(env, typed, &expr, frame, errors)
   when ExprKind::ExprMethodCall(recv, method, _, args) then
     check_expr_method_call(program, typed, env, ctx, &recv, &method, &args, expr.node_id, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
   when ExprKind::ExprIndex(base, index) then
@@ -6282,7 +6291,7 @@ def check_expr(program: Program, typed: TypedProgram, inout env: TypeEnv, inout 
     # (partial moves): the indexed READ is a chain read over the whole
     # value (the elements are the aggregate — the root-level check above
     # is the only per-index granularity the lattice has).
-    check_place_chain_read(typed, &expr, frame, errors)
+    check_place_chain_read(env, typed, &expr, frame, errors)
   when ExprKind::ExprCall(callee, args) then
     check_expr_call(program, typed, env, ctx, &callee, &args, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
   when ExprKind::ExprClosure(params, _, body) then
@@ -6321,21 +6330,21 @@ def check_expr(program: Program, typed: TypedProgram, inout env: TypeEnv, inout 
             match cap_effect
             when AccessEffect::Consume then
               if res_frame_has(frame, &cap_lid) then
-                apply_consume(typed, cap_id, expr.span, loop_outer, frame, errors)
+                apply_consume(env, typed, cap_id, expr.span, loop_outer, frame, errors)
               end
               res_frame_set(&mut cframe, cap_lid, ResourceState::Live)
               res_frame_set_span(&mut cframe, &cap_lid, expr.span)
               res_frame_set_origin(&mut cframe, &cap_lid, ParamOrigin::OwnedLocal)
             when AccessEffect::Read then
               if res_frame_has(frame, &cap_lid) then
-                apply_consume(typed, cap_id, expr.span, loop_outer, frame, errors)
+                apply_consume(env, typed, cap_id, expr.span, loop_outer, frame, errors)
               end
               res_frame_set(&mut cframe, cap_lid, ResourceState::Live)
               res_frame_set_span(&mut cframe, &cap_lid, expr.span)
               res_frame_set_origin(&mut cframe, &cap_lid, ParamOrigin::OwnedLocal)
             when AccessEffect::Modify then
               if res_frame_has(frame, &cap_lid) then
-                apply_consume(typed, cap_id, expr.span, loop_outer, frame, errors)
+                apply_consume(env, typed, cap_id, expr.span, loop_outer, frame, errors)
               end
               res_frame_set(&mut cframe, cap_lid, ResourceState::Live)
               res_frame_set_span(&mut cframe, &cap_lid, expr.span)
@@ -6644,7 +6653,7 @@ def check_assign_target(program: Program, typed: TypedProgram, inout env: TypeEn
             # The old value is live on one path only; a path-conditional
             # drop cannot be represented — check_use rejects it (the store
             # still commits Live afterwards).
-            check_use(typed, id, target.span, frame, errors)
+            check_use(env, typed, id, target.span, frame, errors)
             Option::Some(AssignmentTransition { lid: lid, prior: prior_state, next: ResourceState::Live, drops_old: false })
           when ResourceState::Live then
             # Replacement of a live value: an OWNING origin's old value must
@@ -6686,13 +6695,13 @@ def check_assign_target(program: Program, typed: TypedProgram, inout env: TypeEn
           #     no assign-drop and no chain transition.
           match prior_state
           when ResourceState::Consumed then
-            check_use(typed, id, target.span, frame, errors)
+            check_use(env, typed, id, target.span, frame, errors)
             Option::Some(AssignmentTransition { lid: lid, prior: prior_state, next: prior_state, drops_old: false })
           when ResourceState::Uninitialized then
-            check_use(typed, id, target.span, frame, errors)
+            check_use(env, typed, id, target.span, frame, errors)
             Option::Some(AssignmentTransition { lid: lid, prior: prior_state, next: prior_state, drops_old: false })
           when ResourceState::MaybeLive then
-            check_use(typed, id, target.span, frame, errors)
+            check_use(env, typed, id, target.span, frame, errors)
             Option::Some(AssignmentTransition { lid: lid, prior: prior_state, next: prior_state, drops_old: false })
           when ResourceState::Live then
             var chain = Vec::new()
@@ -6778,7 +6787,7 @@ def apply_arg_effect(program: Program, typed: TypedProgram, inout env: TypeEnv, 
     if res_frame_has(frame, &lid) then
       if expr_is_plain(arg) then
         match effect
-        when AccessEffect::Consume then apply_consume(typed, id, arg.span, loop_outer, frame, errors)
+        when AccessEffect::Consume then apply_consume(env, typed, id, arg.span, loop_outer, frame, errors)
         when AccessEffect::Initialize then apply_set(typed, frame, lid, arg.span, errors)
         when _ then
           # (partial moves — the whole-value boundary): a whole-value READ
@@ -6791,7 +6800,7 @@ def apply_arg_effect(program: Program, typed: TypedProgram, inout env: TypeEnv, 
               span: arg.span
             })
           else
-            check_use(typed, id, arg.span, frame, errors)
+            check_use(env, typed, id, arg.span, frame, errors)
           end
         end
       else
@@ -6827,7 +6836,7 @@ def apply_arg_effect(program: Program, typed: TypedProgram, inout env: TypeEnv, 
                 apply_whole_boundary_consume(env, typed, id, arg.span, loop_outer, frame, errors)
               end
             else
-              check_use(typed, id, arg.span, frame, errors)
+              check_use(env, typed, id, arg.span, frame, errors)
             end
           end
         elsif effect == AccessEffect::Initialize then
@@ -6868,7 +6877,7 @@ def apply_arg_effect(program: Program, typed: TypedProgram, inout env: TypeEnv, 
               })
             end
           else
-            check_use(typed, id, arg.span, frame, errors)
+            check_use(env, typed, id, arg.span, frame, errors)
           end
         else
           # A projected READ: the chain's state decides (the root stays
@@ -6891,7 +6900,8 @@ def apply_arg_effect(program: Program, typed: TypedProgram, inout env: TypeEnv, 
                 primary_symbol: Option::Some(ca_name.clone()),
                 semantic_site: Option::Some("ownership analysis (partial-move use)"),
                 ownership_trace: ca_rows,
-                related_symbols: Vec::from([ca_disp])
+                related_symbols: Vec::from([ca_disp]),
+                semantic_data: ownership_chain_read_data(typed, env, frame, id, ResourceState::Consumed, arg)
               })
             when ResourceState::MaybeLive then
               let mb_name = binding_name(typed, id)
@@ -6905,12 +6915,13 @@ def apply_arg_effect(program: Program, typed: TypedProgram, inout env: TypeEnv, 
                 primary_symbol: Option::Some(mb_name.clone()),
                 semantic_site: Option::Some("ownership analysis (partial-move use)"),
                 ownership_trace: mb_rows,
-                related_symbols: Vec::from([mb_disp])
+                related_symbols: Vec::from([mb_disp]),
+                semantic_data: ownership_chain_read_data(typed, env, frame, id, ResourceState::MaybeLive, arg)
               })
             when _ then ()
             end
           else
-            check_use(typed, id, arg.span, frame, errors)
+            check_use(env, typed, id, arg.span, frame, errors)
           end
         end
       end
@@ -6963,7 +6974,98 @@ def ownership_site_rows(frame: ResFrame, id: Int, name: String, site: Span, reje
   rows
 end
 
-def apply_consume(typed: TypedProgram, id: Int, span: Span, loop_outer: Vec[Int], inout frame: ResFrame, inout errors: Vec[ResourceError]) -> Unit
+# ———————————————————————————————————————————————————————————————
+# (audit item 24) Typed ownership payload helpers
+# ———————————————————————————————————————————————————————————————
+# The OwnershipDiagnosticData builders: the REAL state words, the local's
+# declared-type render and the dense-locator sites the payload records
+# carry (parser.tg documents the field semantics). Capability locals
+# (linear values — not an audit §35 class) return Option::None: their
+# rejections keep the prose rows only and the repair engine produces no
+# candidates for them (the same gate the text rules applied to the word
+# "capability" in the message).
+
+# The state word of a recorded availability (the same words the
+# ownership_site_rows state-chain rows render).
+def ownership_state_word(st: ResourceState) -> String
+  match st
+  when ResourceState::Live then "live"
+  when ResourceState::Consumed then "consumed"
+  when ResourceState::Uninitialized then "uninitialized"
+  when ResourceState::MaybeLive then "live on one path only"
+  end  end
+end
+
+# The declared-type render of a local ("" when the binding is absent).
+def binding_type_render(typed: TypedProgram, env: TypeEnv, id: Int) -> String
+  match typed.local_bindings.get(id)
+  when Option::Some(lb) then type_display(env, &lb.ty)
+  when Option::None then ""
+  end  end
+end
+
+# The type render of an expression the checker is rejecting (the typed
+# expression type when recorded — the FIELD/element type of a moved-out
+# chain read — falling back to the root local's declared type).
+def expr_type_render(typed: TypedProgram, env: TypeEnv, node_id: Int, id: Int) -> String
+  match typed.expr_types.get(node_id)
+  when Option::Some(t) then type_display(env, &t)
+  when Option::None then binding_type_render(typed, env, id)
+  end  end
+end
+
+# The whole-value rejection payload (apply_consume / check_use): the
+# local's recorded state word, the recorded first-consumption locator
+# ("" when none was recorded) and the rejected operation's dense locator.
+def ownership_site_data(typed: TypedProgram, env: TypeEnv, frame: ResFrame, id: Int, name: String, op: String, site: Span) -> Option[DiagnosticSemanticData]
+  match frame.locals.get(&tg_compiler::ids::LocalId { id: id })
+  when Option::Some(ls) then
+    if ls.is_capability then
+      Option::None
+    else
+      var csite = ""
+      match ls.consumed_at
+      when Option::Some(sp) then csite = span_site_label(sp)
+      when Option::None then ()
+      end
+      Option::Some(DiagnosticSemanticData::Ownership(OwnershipDiagnosticData {
+        place: name,
+        state_before: ownership_state_word(ls.availability),
+        operation: op,
+        consume_site: csite,
+        use_site: span_site_label(site),
+        type_id: binding_type_render(typed, env, id)
+      }))
+    end
+  when Option::None then Option::None
+  end  end
+end
+
+# The moved-out chain-read rejection payload (the partial-move sites): the
+# state word is the CHAIN's effective state (the root may still be live),
+# the read site is the rejected chain read's dense locator. The frame's
+# lattice does not record where the chain was moved out, so consume_site
+# stays "".
+def ownership_chain_read_data(typed: TypedProgram, env: TypeEnv, frame: ResFrame, id: Int, eff: ResourceState, expr: Expr) -> Option[DiagnosticSemanticData]
+  match frame.locals.get(&tg_compiler::ids::LocalId { id: id })
+  when Option::Some(ls) then
+    if ls.is_capability then
+      Option::None
+    else
+      Option::Some(DiagnosticSemanticData::Ownership(OwnershipDiagnosticData {
+        place: binding_name(typed, id),
+        state_before: ownership_state_word(eff),
+        operation: "read",
+        consume_site: "",
+        use_site: span_site_label(expr.span),
+        type_id: expr_type_render(typed, env, expr.node_id, id)
+      }))
+    end
+  when Option::None then Option::None
+  end  end
+end
+
+def apply_consume(inout env: TypeEnv, typed: TypedProgram, id: Int, span: Span, loop_outer: Vec[Int], inout frame: ResFrame, inout errors: Vec[ResourceError]) -> Unit
  # boundary: the id is the raw Int semantic id (loop_outer and
   # binding_name are Int-keyed); the frame is LocalId-keyed.
   let lid = tg_compiler::ids::LocalId { id: id }
@@ -6980,7 +7082,8 @@ def apply_consume(typed: TypedProgram, id: Int, span: Span, loop_outer: Vec[Int]
         span: span.clone(),
         primary_symbol: Option::Some(name.clone()),
         semantic_site: Option::Some("ownership analysis (whole-value consume)"),
-        ownership_trace: ownership_site_rows(frame, id, name.clone(), span.clone(), "consume rejected: a finalizer must not consume its own subject")
+        ownership_trace: ownership_site_rows(frame, id, name.clone(), span.clone(), "consume rejected: a finalizer must not consume its own subject"),
+        semantic_data: ownership_site_data(typed, env, frame, id, name.clone(), "finalizer-subject", span.clone())
       })
       return
     end
@@ -6990,7 +7093,8 @@ def apply_consume(typed: TypedProgram, id: Int, span: Span, loop_outer: Vec[Int]
         span: span.clone(),
         primary_symbol: Option::Some(name.clone()),
         semantic_site: Option::Some("ownership analysis (whole-value consume)"),
-        ownership_trace: ownership_site_rows(frame, id, name.clone(), span.clone(), "consume rejected: let parameter is read-only")
+        ownership_trace: ownership_site_rows(frame, id, name.clone(), span.clone(), "consume rejected: let parameter is read-only"),
+        semantic_data: ownership_site_data(typed, env, frame, id, name.clone(), "let-param", span.clone())
       })
       return
     end
@@ -7000,7 +7104,8 @@ def apply_consume(typed: TypedProgram, id: Int, span: Span, loop_outer: Vec[Int]
         span: span.clone(),
         primary_symbol: Option::Some(name.clone()),
         semantic_site: Option::Some("ownership analysis (whole-value consume)"),
-        ownership_trace: ownership_site_rows(frame, id, name.clone(), span.clone(), "consume rejected: inout parameter may be modified but not consumed")
+        ownership_trace: ownership_site_rows(frame, id, name.clone(), span.clone(), "consume rejected: inout parameter may be modified but not consumed"),
+        semantic_data: ownership_site_data(typed, env, frame, id, name.clone(), "inout-param", span.clone())
       })
       return
     end
@@ -7018,7 +7123,8 @@ def apply_consume(typed: TypedProgram, id: Int, span: Span, loop_outer: Vec[Int]
       span: span.clone(),
       primary_symbol: Option::Some(name.clone()),
       semantic_site: Option::Some("ownership analysis (whole-value consume)"),
-      ownership_trace: ownership_site_rows(frame, id, name.clone(), span.clone(), "consume rejected: fields of the resource were moved out (a partial move)")
+      ownership_trace: ownership_site_rows(frame, id, name.clone(), span.clone(), "consume rejected: fields of the resource were moved out (a partial move)"),
+      semantic_data: ownership_site_data(typed, env, frame, id, name.clone(), "partial-whole", span.clone())
     })
     return
   end
@@ -7028,7 +7134,8 @@ def apply_consume(typed: TypedProgram, id: Int, span: Span, loop_outer: Vec[Int]
       span: span.clone(),
       primary_symbol: Option::Some(name.clone()),
       semantic_site: Option::Some("ownership analysis (whole-value consume)"),
-      ownership_trace: ownership_site_rows(frame, id, name.clone(), span.clone(), "consume rejected: the local is an outer-loop resource (the consume would repeat)")
+      ownership_trace: ownership_site_rows(frame, id, name.clone(), span.clone(), "consume rejected: the local is an outer-loop resource (the consume would repeat)"),
+      semantic_data: ownership_site_data(typed, env, frame, id, name.clone(), "outer-loop", span.clone())
     })
   end
   match res_frame_get(frame, &lid)
@@ -7038,7 +7145,8 @@ def apply_consume(typed: TypedProgram, id: Int, span: Span, loop_outer: Vec[Int]
       span: span.clone(),
       primary_symbol: Option::Some(name.clone()),
       semantic_site: Option::Some("ownership analysis (whole-value consume)"),
-      ownership_trace: ownership_site_rows(frame, id, name.clone(), span.clone(), "consume rejected: the value is already consumed (consumed twice)")
+      ownership_trace: ownership_site_rows(frame, id, name.clone(), span.clone(), "consume rejected: the value is already consumed (consumed twice)"),
+      semantic_data: ownership_site_data(typed, env, frame, id, name.clone(), "consume", span.clone())
     })
   when Option::Some(ResourceState::Uninitialized) then
     errors.push(ResourceError {
@@ -7046,7 +7154,8 @@ def apply_consume(typed: TypedProgram, id: Int, span: Span, loop_outer: Vec[Int]
       span: span.clone(),
       primary_symbol: Option::Some(name.clone()),
       semantic_site: Option::Some("ownership analysis (whole-value consume)"),
-      ownership_trace: ownership_site_rows(frame, id, name.clone(), span.clone(), "consume rejected: the local is uninitialized")
+      ownership_trace: ownership_site_rows(frame, id, name.clone(), span.clone(), "consume rejected: the local is uninitialized"),
+      semantic_data: ownership_site_data(typed, env, frame, id, name.clone(), "consume", span.clone())
     })
   when Option::Some(ResourceState::MaybeLive) then
     errors.push(ResourceError {
@@ -7054,7 +7163,8 @@ def apply_consume(typed: TypedProgram, id: Int, span: Span, loop_outer: Vec[Int]
       span: span.clone(),
       primary_symbol: Option::Some(name.clone()),
       semantic_site: Option::Some("ownership analysis (whole-value consume)"),
-      ownership_trace: ownership_site_rows(frame, id, name.clone(), span.clone(), "consume rejected: the value is live on one path only (a conditional consume)")
+      ownership_trace: ownership_site_rows(frame, id, name.clone(), span.clone(), "consume rejected: the value is live on one path only (a conditional consume)"),
+      semantic_data: ownership_site_data(typed, env, frame, id, name.clone(), "consume", span.clone())
     })
   when _ then ()
   end
@@ -7112,7 +7222,7 @@ def apply_set(typed: TypedProgram, inout frame: ResFrame, id: tg_compiler::ids::
   res_frame_set(frame, id, ResourceState::Live)
 end
 
-def check_use(typed: TypedProgram, id: Int, span: Span, frame: ResFrame, inout errors: Vec[ResourceError]) -> Unit
+def check_use(inout env: TypeEnv, typed: TypedProgram, id: Int, span: Span, frame: ResFrame, inout errors: Vec[ResourceError]) -> Unit
   # boundary: check_use keeps the raw Int semantic id (callers derive it
   # from expr_root_id / ident_resolutions); the frame is LocalId-keyed.
   let use_name = binding_name(typed, id)
@@ -7123,7 +7233,8 @@ def check_use(typed: TypedProgram, id: Int, span: Span, frame: ResFrame, inout e
       span: span,
       primary_symbol: Option::Some(use_name.clone()),
       semantic_site: Option::Some("ownership analysis (whole-value use)"),
-      ownership_trace: ownership_site_rows(frame, id, use_name.clone(), span.clone(), "use rejected: the value was already consumed")
+      ownership_trace: ownership_site_rows(frame, id, use_name.clone(), span.clone(), "use rejected: the value was already consumed"),
+      semantic_data: ownership_site_data(typed, env, frame, id, use_name.clone(), "use", span.clone())
     })
   when Option::Some(ResourceState::Uninitialized) then
     errors.push(ResourceError {
@@ -7131,7 +7242,8 @@ def check_use(typed: TypedProgram, id: Int, span: Span, frame: ResFrame, inout e
       span: span,
       primary_symbol: Option::Some(use_name.clone()),
       semantic_site: Option::Some("ownership analysis (whole-value use)"),
-      ownership_trace: ownership_site_rows(frame, id, use_name.clone(), span.clone(), "use rejected: the local is uninitialized")
+      ownership_trace: ownership_site_rows(frame, id, use_name.clone(), span.clone(), "use rejected: the local is uninitialized"),
+      semantic_data: ownership_site_data(typed, env, frame, id, use_name.clone(), "use", span.clone())
     })
   when Option::Some(ResourceState::MaybeLive) then
     errors.push(ResourceError {
@@ -7139,7 +7251,8 @@ def check_use(typed: TypedProgram, id: Int, span: Span, frame: ResFrame, inout e
       span: span,
       primary_symbol: Option::Some(use_name.clone()),
       semantic_site: Option::Some("ownership analysis (whole-value use)"),
-      ownership_trace: ownership_site_rows(frame, id, use_name.clone(), span.clone(), "use rejected: the value is live on one path only")
+      ownership_trace: ownership_site_rows(frame, id, use_name.clone(), span.clone(), "use rejected: the value is live on one path only"),
+      semantic_data: ownership_site_data(typed, env, frame, id, use_name.clone(), "use", span.clone())
     })
   when _ then ()
   end
@@ -7150,7 +7263,7 @@ end
 # a partial move (the remaining fields are readable); a consumed chain (or
 # a consumed prefix) is a use-after-move. The root's own availability is
 # already validated by the base recursion (check_expr on the base).
-def check_place_chain_read(typed: TypedProgram, expr: Expr, frame: ResFrame, inout errors: Vec[ResourceError]) -> Unit
+def check_place_chain_read(inout env: TypeEnv, typed: TypedProgram, expr: Expr, frame: ResFrame, inout errors: Vec[ResourceError]) -> Unit
   match expr_root_id(typed, expr)
   when Option::Some(id) then
     let lid = tg_compiler::ids::LocalId { id: id }
@@ -7172,7 +7285,8 @@ def check_place_chain_read(typed: TypedProgram, expr: Expr, frame: ResFrame, ino
             primary_symbol: Option::Some(chain_name.clone()),
             semantic_site: Option::Some("ownership analysis (partial-move use)"),
             ownership_trace: cre_rows,
-            related_symbols: Vec::from([chain_disp])
+            related_symbols: Vec::from([chain_disp]),
+            semantic_data: ownership_chain_read_data(typed, env, frame, id, ResourceState::Consumed, expr)
           })
         when ResourceState::MaybeLive then
           var ml_rows = Vec::new()
@@ -7184,7 +7298,8 @@ def check_place_chain_read(typed: TypedProgram, expr: Expr, frame: ResFrame, ino
             primary_symbol: Option::Some(chain_name.clone()),
             semantic_site: Option::Some("ownership analysis (partial-move use)"),
             ownership_trace: ml_rows,
-            related_symbols: Vec::from([chain_disp])
+            related_symbols: Vec::from([chain_disp]),
+            semantic_data: ownership_chain_read_data(typed, env, frame, id, ResourceState::MaybeLive, expr)
           })
         when _ then ()
         end
@@ -8477,7 +8592,7 @@ def transfer_consume(inout env: TypeEnv, typed: TypedProgram, expr: Expr, loop_o
     when Option::Some(id) then
       # boundary: same as above — LocalId for the frame lookup.
       if res_frame_has(frame, &tg_compiler::ids::LocalId { id: id }) then
-        apply_consume(typed, id, expr.span, loop_outer, frame, errors)
+        apply_consume(env, typed, id, expr.span, loop_outer, frame, errors)
       end
     when Option::None then ()
     end
