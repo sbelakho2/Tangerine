@@ -24,16 +24,16 @@ Tangerine supports cross-compilation to multiple platforms and architectures fro
 | `aarch64-unknown-linux-gnu` | Linux | ARM64 | Servers, Raspberry Pi 4+ |
 | `wasm32-unknown-unknown` | WebAssembly | WASM32 | Browser targets |
 | `wasm32-wasi` | WASI | WASM32 | Server-side WASM |
-| `thumbv7em-none-eabihf` | Bare metal | ARM Cortex-M4/M7 | REJECTED by the embedded route — no Thumb code generator (the stable diagnostic, no artifact) |
-| `thumbv6m-none-eabi` | Bare metal | ARM Cortex-M0/M0+ | REJECTED by the embedded route — no Thumb code generator |
+| `thumbv7em-none-eabihf` | Bare metal | ARM Cortex-M4F/M7 | REJECTED by the embedded route (no triple generator there); ARMv7-M codegen = the LIR route's per-CPU descriptors (`TANGERINE_LIR_TARGET=cortex-m3/m4/m4f/m7`) |
+| `thumbv6m-none-eabi` | Bare metal | ARM Cortex-M0/M0+ | REJECTED by the embedded route; no ARMv6-M LIR-route instance this slice |
 
 ### Tier 3 — Community-Supported
 
 | Target Triple | OS | Architecture | Notes |
 |---|---|---|---|
 | `riscv64gc-unknown-linux-gnu` | Linux | RISC-V 64 | Emerging architecture |
-| `riscv32imac-unknown-none-elf` | Bare metal | RISC-V 32 | REJECTED by the embedded route — no RISC-V code generator (no artifact) |
-| `riscv32imc-unknown-none-elf` | Bare metal | RISC-V 32 | REJECTED by the embedded route — no RISC-V code generator |
+| `riscv32imac-unknown-none-elf` | Bare metal | RISC-V 32 | REJECTED by the embedded route (no triple generator there); RISC-V codegen = the LIR route's descriptors (`TANGERINE_LIR_TARGET=riscv32imac`/`riscv32imafc`/`riscv32imafdc`) |
+| `riscv32imc-unknown-none-elf` | Bare metal | RISC-V 32 | REJECTED by the embedded route; no LIR-route instance for the IMC profile (the imac descriptors require the A extension) |
 | `aarch64-linux-android` | Android | ARM64 | Android NDK required |
 | `x86_64-unknown-freebsd` | FreeBSD | x86-64 | Server deployments |
 | `aarch64-unknown-none` | Bare metal | ARM64 | AArch64 baremetal — the embedded route's REAL target (the aarch64 backend) |
@@ -143,9 +143,49 @@ tg objcopy -O binary \
 The Thumb (`thumbv6m-none-eabi` / `thumbv7em-none-eabi[f]` /
 `thumbv8m.main-none-eabihf`) and RISC-V (`riscv32imc|imac-unknown-none-elf`
 / `riscv64gc-unknown-none-elf`) embedded triples are HARD-REJECTED by the
-embedded route: the compiler has no Thumb/RISC-V code generator, so the
-route emits the stable rejection diagnostic and NO artifact — it never
+`--target` embedded route: that route has no generator for those triples,
+so it emits the stable rejection diagnostic and NO artifact — it never
 fabricates an aarch64 image under a foreign triple.
+
+### Any Host → ARMv7-M / RISC-V (the env-gated LIR route)
+
+The ARMv7-M and RISC-V code generators exist on the LIR route
+(`TANGERINE_LIR=1`, default off — driver.tg `compile_lir_route`), which
+compiles ONE native input file through the standalone LIR pipeline
+(MIR → LIR → linear-scan register allocation → per-backend emission).
+The backend is selected by `TANGERINE_LIR_TARGET` — never by `--target`
+(a `--target` override fails closed). Targets are per-CPU / per-profile
+DESCRIPTORS (target_desc.tg), not one generic core:
+
+- **ARMv7-M** (`cortex-m3` / `cortex-m4` / `cortex-m4f` / `cortex-m7`;
+  `cortex-m` is the legacy alias of `cortex-m4f`): the descriptors
+  carry `fpu` / `float_abi` as data — **cortex-m3 and cortex-m4 have NO
+  FPU** (`fpu: None`, `float_abi: Soft`; no VFP instruction may be
+  emitted for them), cortex-m4f carries FPv4SP and cortex-m7 FPv5D16
+  with the AAPCS32 hard-float crossings. Integer divide is Hardware
+  (SDIV/UDIV) on all four. Emission: ELF32 ARM relocatable objects
+  (backend_thumb.tg) with the LDREX/STREX atomic slice (widths 1/2/4),
+  the desc-gated float slice, the scalar-constant static subset and
+  the `.isr_vector` NVIC table for `@interrupt` functions.
+- **RISC-V** (`riscv32imac` / `riscv32imafc` / `riscv32imafdc` /
+  `riscv64imac` / `riscv64gc`; `riscv32`/`riscv64` are the legacy
+  aliases of the imac instances): the descriptors carry the atomic
+  width classes — native [4] on riscv32 and [4, 8] on riscv64 (the A
+  extension's LR/SC), the sub-word widths 1/2 emulated-class on every
+  instance (no Zabha instance is modeled), and mmio equal to native.
+  The imac instances have no FPU; the F/D instances (imafc/imafdc/gc)
+  model the psABI hard-float registers, while float emission on the rv
+  backend is the stage-2 slice (fail-closed). Emission: ELF32/ELF64
+  RISC-V relocatable objects (backend_rv.tg) with the LR/SC atomic
+  slice at the native widths and the scalar-constant static subset.
+
+Both arms fail closed on executable emission (object mode only — link
+with an arm-none-eabi / riscv-none-elf toolchain) and on any construct
+outside their legalization contract (aggregates, unsupported static
+images, sub-word atomics, and — per descriptor — float content on the
+no-FPU instances); unknown `TANGERINE_LIR_TARGET` values fail closed
+with the accepted set. The route is default-off and pending full-corpus
+parity with the direct emitter.
 
 ## Conditional Compilation
 

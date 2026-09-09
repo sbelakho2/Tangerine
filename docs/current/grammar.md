@@ -386,6 +386,9 @@ edition_decl    = 'edition' STRING_LITERAL
 
 extern_item     = 'extern' [ STRING_LITERAL ] 'def' IDENT [ type_params ]
                   '(' [ param_list ] ')' [ '->' type_expr ] [ 'end' ]
+                | 'extern' [ STRING_LITERAL ] 'def' IDENT [ type_params ]
+                  '(' [ param_list ] [ ',' ] '.' '.' '.' ')'
+                  [ '->' type_expr ] [ 'end' ]
                 | 'extern' [ STRING_LITERAL ] { 'def' IDENT ... 'end' }
                 | 'extern' [ STRING_LITERAL ] 'static' [ 'mut' ] IDENT ':' type_expr
 

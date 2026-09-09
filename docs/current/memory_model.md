@@ -288,21 +288,62 @@ the same conditioning. Match destructuring of resources (an
 capture of resources (the outer local is consumed exactly once into the
 closure frame) flow through this machinery.
 
-**Direct expression-level consumption of a projected resource place is
-still rejected** — the root-level frame cannot prove the field's
-storage is dead, so the consume/initialize rules fail closed at
-root-granularity:
+**Expression-level projected-place operations are implemented for static
+projections.** A projected consume/move-out (`let a = s.a`), a store
+into a projected place (`s.a = ...`), and a projected initialize (a
+`set`-convention write through a projection) run on the per-chain
+lattice in the checker's frame (`place_moves`: root `LocalId` → chain →
+`ResourceState`), under the prefix rule (`chain_effective_state`: a
+recorded Consumed prefix makes the rest of the chain dead; a recorded
+MaybeLive prefix makes the rest indeterminate; an absent chain is Live):
 
-```text
-cannot consume a projected place: partial moves are not yet supported
-cannot move out of a projected place: partial moves are not yet supported
-cannot assign over an owning projected place: exact-place replacement is
-not yet supported
-cannot initialize a projected place: exact-place state is not yet supported
-```
+- **consume / move-out** (`apply_projected_consume`, reached from
+  `transfer_consume`'s projected-move form): the chain becomes Consumed
+  while the root stays Live; the scope-exit cleanup drops the live
+  sibling fields through the masked partial-drop chain and skips the
+  dead chain. The permission rules mirror `apply_consume`: the
+  DeinitSelf rejection (a finalizer cannot move owned fields out of its
+  own subject — the structural cleanup would finalize them a second
+  time), the read-only let/inout origin rejections, and the
+  repeatable-loop rejection all apply to the chain.
+- **assign-over** (`check_assign_target`'s chain-effective-state
+  decision): a store into dead (moved-out) storage re-lives the field
+  without a drop (`canary_pos_resource_partial_reassign`). A store into
+  a LIVE depth-1 owning field of a fully-live root emits the whole-root
+  drop-before-store and marks the sibling direct fields Consumed (the
+  scope-exit drop skips them). A store into a LIVE NESTED target
+  (depth ≥ 2) emits the masked **exact-place** drop
+  (`assign_exact_drops` / `assign_exact_drop_paths` — the drop-before-
+  store destroys the chain's own state only, skipping the chain's
+  consumed extensions). The fail-closed cases stay: a depth-1 live
+  target over a root that carries moves (the masked depth-1
+  drop-before-store is not representable), a root whose direct field
+  shape is unknown (the siblings cannot be masked), and an RHS that
+  moves out of the same root as the drop-before-store target.
+- **initialize** (a projected `set` argument): the chain's own state
+  decides — dead storage is re-initialized and committed Live;
+  already-live storage and storage live on one path only are rejected.
 
-The registry + masked glue are the implemented base; the expression-level
-projected-place operations are the remaining pending item (§15.2).
+The **dynamic-index boundary stays fail-closed**: the container's
+elements are the ownership unit, so a consuming move of a `Vec[i]`/
+`Map[k]` owning element and an owning-typed indexed initialization stay
+rejected (whole-value-boundary consume — `apply_whole_boundary_consume`
+marks the root MaybeLive; element-level initialization is not tracked —
+types.tg rejects shared-container element extraction). The sanctioned
+extraction paths are the inout element APIs (Vec `pop` /
+`remove(index)`, Map `remove(key)`, the replaced-value results of
+`insert`) and the inout element bindings (`with v[i] as inout ...`).
+A CONSTANT index over a fixed-array base is a static chain: the finite
+indices are tracked individually, siblings stay live
+(`place_projection_keys` records the in-range `Index` key;
+`canary_pos_resource_partial_index`).
+
+The canary families `canary_pos_resource_partial_{extract,nested,
+reassign,index,both_paths}` and `canary_pos_cfg_loop_after_partial_move`
+exercise the implemented forms; stage0's chain-aware lattice implements
+parity (`resource_check.ml`'s chain rows / `mir_verify.ml`'s rule 19a
+`check_projected_move_transfer`, asserted by the `tg_placechain` self-
+check).
 
 ---
 
@@ -961,7 +1002,7 @@ compiler-owned structural field cleanup — exactly once.
 | Layout tables are CONCRETE-keyed: the layout/offsets/sizes tables are populated per concrete (TypeId, substs) identity (`collect_concrete_adt_types` + `mir_type_identity_key`), so `Wrapper[Int]` and `Wrapper[File]` never share a layout entry | codegen.tg layout tables; mir.tg `mir_type_identity_key` |
 | CFG edge model recorded and validated per function | resource_check.tg §14 |
 | Destruction names verified against registered deinit targets (fail-closed) | mir.tg §4.3 |
-| Partial moves: pattern-binding consumes record per-field state in the place registry; MIR emits the partial-drop chain — live fields dropped through their own masked glues, consumed fields skipped, whole-value ("*") records drop nothing | types.tg `record_place_moves` / `place_move_states` §4.4; mir.tg `mir_emit_partial_drop_chain` / `emit_cleanup_chain` (mask-carrying MirCall glue sites) |
+| Partial moves (pattern-binding AND expression-level STATIC projected operations): pattern-binding consumes record per-field state in the place registry; MIR emits the partial-drop chain — live fields dropped through their own masked glues, consumed fields skipped, whole-value ("*") records drop nothing. Expression-level consume/move-out/assign-over/initialize run the per-chain lattice (`place_moves` + the prefix rule): the projected store over a live nested target emits the masked exact-place drop (`assign_exact_drops`), dead moved-out storage re-lives without a drop, and a whole-value-boundary (dynamic-index/deref) owning operation is conservatively rejected | types.tg `record_place_moves` / `place_move_states` §4.4; mir.tg `mir_emit_partial_drop_chain` / `emit_cleanup_chain` (mask-carrying MirCall glue sites); resource_check.tg `check_assign_target` / `apply_projected_consume` / `apply_whole_boundary_consume` / `chain_effective_state` / `assign_exact_drop_paths` §4.4; stage0: mir_verify.ml rule 19a `check_projected_move_transfer` + resource_check.ml chain rows (`tg_placechain` self-check) |
 | Generated drop glue: every concrete non-trivial plan owns a memoized drop-glue function; recursive owning types are broken by symbol (the glue calls itself); PlanLimit remains only for missing registered deinit targets | mir.tg `mir_glue_instance_for_type` / `mir_build_all_drop_glues` / `DeinitPlan::Call` §14.3 |
 | Fixed-array const sizes: literal / const-reference / constant-arithmetic sizes evaluate before the FixedArray identity forms | types.tg `eval_const_size_expr` / `const_values` §9; `tests/canary/canary_pos_fixed_array_const_size.tg` |
 | LangItems built once, structurally unique; the bundle covers option/result/vec/map/set/box/rc/array/slice + string/str_view/unique_ptr/arc_strong/weak_rc/weak_arc/ptr/ptr_mut + the trait ids; semantic identity by DefId/TypeId/TraitId — never strings | types.tg / ids.tg §8 |
@@ -975,7 +1016,7 @@ compiler-owned structural field cleanup — exactly once.
 
 | Item | Current behavior | Target |
 |------|------------------|--------|
-| **Expression-level projected-place operations** | the place-level registry + masked glue exist (§4.4: pattern-binding partial moves, match destructuring, closure capture); DIRECT expression-level consume/move/assign/initialize of a projected resource place is still rejected at root-granularity ("cannot consume a projected place: partial moves are not yet supported" etc.) | per-place state at the expression-level operations (consume/assign through a projection) |
+| **Expression-level projected operations over DYNAMIC indexes (owning container elements)** | static projections (fields, tuple indexes, in-range constant indexes over fixed arrays) run the per-chain lattice with masked drops (§4.4); a `Vec[i]`/`Map[k]` consuming move or owning-typed indexed initialization stays rejected — the container's elements are the ownership unit, so whole-value-boundary consumes mark the root MaybeLive and element-level state is not tracked | per-index element state at subscript sites (the dynamic-index chains) |
 | **Consuming iteration** | snapshot iteration exists; sink-element iteration rejected | consuming iteration with per-iteration (backedge) cleanup |
 | **StrView name fallback** | the hash/eq dispatch selects StrView by the LangItems `str_view` TypeId; the name-selection fallback remains only for snapshots without the registration | drop the name fallback once every snapshot registers the id |
 

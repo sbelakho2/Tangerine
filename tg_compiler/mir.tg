@@ -801,8 +801,13 @@ enum MirRvalueKind
   # Cast
   MirCast(CastKind, MirOperand, Type)
   
-  # Repeat for array initialization
-  MirRepeat(MirOperand, Int)
+  # Repeat for array initialization: the [elem; count] fill. The count is
+  # a COUNT OPERAND — a constant the MIR carries symbolically while the
+  # body is generic: MirConstant MirInt(n) for a literal count, and the
+  # MirConstParamValue placeholder (the count expression's in-scope const
+  # generic parameter read) otherwise, which monomorphization substitutes
+  # to the per-instance MirInt before emission (codegen fails closed on
+  # any count operand that is not a MirInt constant). MirRepeat(MirOperand, MirOperand)
   
   # SSA Phi node: list of (predecessor_block, value) pairs
   MirPhi(Vec[(MirBlockId, MirLocalId)])
@@ -1034,7 +1039,7 @@ def duplicate_rvalue(rvalue: MirRvalue) -> MirRvalue
   when MirRvalueKind::MirCast(kind, operand, ty) then
     MirRvalue { kind: MirRvalueKind::MirCast(kind.clone(), duplicate_operand(operand), ty.clone()) }
   when MirRvalueKind::MirRepeat(operand, count) then
-    MirRvalue { kind: MirRvalueKind::MirRepeat(duplicate_operand(operand), count) }
+    MirRvalue { kind: MirRvalueKind::MirRepeat(duplicate_operand(operand), duplicate_operand(count)) }
   when MirRvalueKind::MirPhi(entries) then
     var duplicated_entries = Vec::new()
     var entry_idx = 0
@@ -7879,6 +7884,7 @@ def expr_kind_name(kind: ExprKind) -> String
   when ExprKind::ExprBoolLit(_) then "ExprBoolLit"
   when ExprKind::ExprNilLit then "ExprNilLit"
   when ExprKind::ExprArrayLit(_) then "ExprArrayLit"
+  when ExprKind::ExprArrayRepeat(_, _) then "ExprArrayRepeat"
   when ExprKind::ExprTupleLit(_) then "ExprTupleLit"
   when ExprKind::ExprStructLit(_, _) then "ExprStructLit"
   when ExprKind::ExprMapLit(_) then "ExprMapLit"
@@ -9627,6 +9633,87 @@ def lr_array_lit_typed(inout b: MirBuilder, arr_ty: Type, elems: Vec[Expr], span
   MirRvalue { kind: MirRvalueKind::MirAggregate(AggregateKind::MirArray(arr_ty.clone()), ops) }
 end
 
+# The [elem; count] repeat-array lowering. The count is lowered to a
+# CONSTANT count operand — a MirInt literal, or the symbolic
+# MirConstParamValue placeholder when the count names an in-scope const
+# generic parameter of the enclosing generic body (the checker's
+# RepeatCountForm::Literal / ConstParam split — the count forms the checker
+# accepts are exactly the forms this helper lowers; any other shape is an
+# internal error, never a guessed count). Monomorphization substitutes the
+# symbolic placeholder to the per-instance MirInt before codegen (codegen
+# fails closed on any count that is not a MirInt constant).
+def lr_repeat_count_operand(inout b: MirBuilder, count: Expr, span: Span) -> Result[MirOperand, String]
+  match count.kind
+  when ExprKind::ExprIntLit(n) then
+    Result::Ok(operand_int(parsed_int_to_host(&n)))
+  when ExprKind::ExprIdent(name) then
+    # (§20 const generics, slice 3): the checker recorded the count
+    # identifier's node -> GenericParamId identity (const_param_reads);
+    # the operand is the SYMBOLIC per-instance value placeholder — the same
+    # constant a value read of the parameter lowers to (lr_ident), so the
+    # ordinary substitution rewrites it to the concrete MirInt per
+    # instance.
+    match b.const_param_reads.get(count.node_id)
+    when Option::Some(gpid) then
+      Result::Ok(MirOperand {
+        kind: MirOperandKind::MirConstant(MirConstant {
+          kind: MirConstantKind::MirConstParamValue(gpid),
+          ty: mir_source_expr_ty(b, &count),
+          instance: Option::None
+        })
+      })
+    when Option::None then
+      Result::Err("internal error: array repeat count identifier `" + name + "` has no recorded const-parameter identity during MIR lowering")
+    end
+  when _ then
+    Result::Err("internal error: array repeat count does not lower to a constant count operand during MIR lowering (the checker accepts only literal and in-scope const-parameter counts)")
+  end  end
+end
+
+# Lower the [elem; count] repeat-array literal to MirRepeat(element, count).
+# The element operand is:
+#   - the TAG-IMAGE constant (MirConstant MirInt(discriminant), typed with
+#     the element's own type) for a qualified payload-less enum variant
+#     path (Option::None): the image written into every slot is the tag
+#     word — a None slot's payload is never read and its drop glue is
+#     tag-trivial, so the image is duplicatable under every element type,
+#     and the constant form keeps the verifier's no-bitwise-copy-of-owning-
+#     places rule happy (a place copy of an Option[T] image would not be
+#     trivially copyable once T is concrete);
+#   - the ordinary lowered operand (a scalar temp copy) otherwise — the
+#     checker gates every other element to scalar images.
+def lr_array_repeat(inout b: MirBuilder, elem: Expr, count: Expr, span: Span) -> Result[MirRvalue, String]
+  let elem_op_opt = match elem.kind
+  when ExprKind::ExprPath(path) then
+    if path.segments.len() >= 2 then
+      match resolve_enum_variant_discriminant(b, &path)
+      when Result::Ok(disc) then
+        let v_ty = mir_source_expr_ty(b, &elem)
+        Option::Some(MirOperand {
+          kind: MirOperandKind::MirConstant(MirConstant {
+            kind: MirConstantKind::MirInt(disc),
+            ty: v_ty,
+            instance: Option::None
+          })
+        })
+      when Result::Err(_) then Option::None
+      end
+    else
+      Option::None
+    end
+  when _ then Option::None
+  end
+  let elem_op = match elem_op_opt
+  when Option::Some(op) then op
+  when Option::None then lower_expr(b, &elem, span)
+  end
+  match lr_repeat_count_operand(b, &count, span)
+  when Result::Ok(count_op) then
+    Result::Ok(MirRvalue { kind: MirRvalueKind::MirRepeat(elem_op, count_op) })
+  when Result::Err(e) then Result::Err(e)
+  end  end
+end
+
 # Dest-aware array-literal rvalue lowering: when the destination's type is
 # the distinct Type::FixedArray variant, the literal lowers to the
 # FixedArray-typed aggregate (inline storage); every other destination keeps
@@ -11157,6 +11244,13 @@ def lower_expr_to_rvalue(inout b: MirBuilder, expr: Expr, span: Span) -> Result[
   elsif kind_name == "ExprArrayLit" then
     match expr.kind
     when ExprKind::ExprArrayLit(elems) then return Result::Ok(lr_array_lit(b, &elems, span))
+    when _ then
+      return Result::Err("internal error: expr_kind_name/ExprKind mismatch during MIR lowering")
+    end
+
+  elsif kind_name == "ExprArrayRepeat" then
+    match expr.kind
+    when ExprKind::ExprArrayRepeat(elem, count) then return lr_array_repeat(b, &elem, &count, span)
     when _ then
       return Result::Err("internal error: expr_kind_name/ExprKind mismatch during MIR lowering")
     end
@@ -12800,6 +12894,15 @@ def mir_collect_free_vars(expr: Expr, bound: Set[String]) -> Set[String]
       end
       elem_idx = elem_idx + 1
     end
+  when ExprKind::ExprArrayRepeat(elem, count) then
+    let elem_free = mir_collect_free_vars(&elem, bound)
+    for name in elem_free do
+      free.insert(name.clone())
+    end
+    let count_free = mir_collect_free_vars(&count, bound)
+    for name in count_free do
+      free.insert(name.clone())
+    end
   when ExprKind::ExprTupleLit(elems) then
     var elem_idx = 0
     while elem_idx < elems.len() do
@@ -13806,6 +13909,12 @@ def for_expr_uses_name(b: MirBuilder, name: String, expr: Expr) -> Bool
     when ExprKind::ExprArrayLit(elems) then for_exprs_uses_name(b, name, &elems)
     when _ then false
     end
+  elsif kind_name == "ExprArrayRepeat" then
+    match expr.kind
+    when ExprKind::ExprArrayRepeat(elem, count) then
+      if for_exprs_uses_name(b, name, &elem) then true else for_exprs_uses_name(b, name, &count) end
+    when _ then false
+    end
   elsif kind_name == "ExprTupleLit" then
     match expr.kind
     when ExprKind::ExprTupleLit(elems) then for_exprs_uses_name(b, name, &elems)
@@ -14072,6 +14181,12 @@ def for_expr_mentions_name(b: MirBuilder, name: String, expr: Expr) -> Bool
   elsif kind_name == "ExprArrayLit" then
     match expr.kind
     when ExprKind::ExprArrayLit(elems) then for_exprs_mention_name(b, name, &elems)
+    when _ then false
+    end
+  elsif kind_name == "ExprArrayRepeat" then
+    match expr.kind
+    when ExprKind::ExprArrayRepeat(elem, count) then
+      if for_expr_mentions_name(b, name, &elem) then true else for_expr_mentions_name(b, name, &count) end
     when _ then false
     end
   elsif kind_name == "ExprTupleLit" then
@@ -16066,7 +16181,7 @@ def format_rvalue(names: Map[Int, String], param_names: Map[Int, String], rv: Mi
   when MirRvalueKind::MirCast(kind, op, ty) then
     format_operand(names, param_names, &op) + " as " + format_mir_type(names, param_names, &ty) + " (" + format_cast_kind(kind) + ")"
   when MirRvalueKind::MirRepeat(op, count) then
-    "[" + format_operand(names, param_names, &op) + "; " + count.to_string() + "]"
+    "[" + format_operand(names, param_names, &op) + "; " + format_operand(names, param_names, &count) + "]"
   when MirRvalueKind::MirPhi(entries) then
     var out = "phi("
     var first = true
@@ -16869,7 +16984,7 @@ def remap_rvalue(rv: MirRvalue, local_map: Map[Int, Int]) -> MirRvalue
   when MirRvalueKind::MirCast(kind, op, ty) then
     MirRvalue { kind: MirRvalueKind::MirCast(kind.clone(), remap_operand(&op, local_map), ty.clone()) }
   when MirRvalueKind::MirRepeat(op, count) then
-    MirRvalue { kind: MirRvalueKind::MirRepeat(remap_operand(&op, local_map), count) }
+    MirRvalue { kind: MirRvalueKind::MirRepeat(remap_operand(&op, local_map), remap_operand(&count, local_map)) }
   when MirRvalueKind::MirPhi(args) then
     let remapped = Vec::new()
     for arg_entry in args do
@@ -23506,6 +23621,52 @@ def verifier_check_place_embedded_types(plans: Map[String, DeinitPlan], type_ind
   end
 end
 
+def verifier_check_repeat_count(type_index: Map[Int, MirTypeDef], func: MirFunction, count: MirOperand, ctx: String, inout errors: Vec[String]) -> Unit
+  match count.kind
+  when MirOperandKind::MirConstant(cst) then
+    match cst.kind
+    when MirConstantKind::MirInt(_) then ()
+    when MirConstantKind::MirConstParamValue(gpid) then
+      # The SYMBOLIC per-instance count placeholder: legal only while the
+      # body is still generic (the placeholder reaches a generic template's
+      # MIR exactly like any other const-parameter VALUE read and is
+      # substituted by monomorphization; a placeholder in a CONCRETE
+      # function is the symbolic-leak bug class the §20 gates reject).
+      if !mir_function_is_generic(func) then
+        errors.push(ctx.clone() + ": repeat count is an unsubstituted const generic parameter value (const_param(" + gpid.to_string() + ")) in a non-generic function — monomorphization must substitute the concrete per-instance count")
+      end
+    when _ then
+      errors.push(ctx.clone() + ": repeat count constant must be an integer constant (the [elem; count] count is a compile-time size, never a value of kind " + verifier_constant_kind_key(&cst.kind) + ")")
+    end
+  when _ then
+    errors.push(ctx.clone() + ": repeat count operand must be a constant (an integer literal or an in-scope const generic parameter value), never a runtime place operand")
+  end  end
+end
+
+def verifier_constant_kind_key(kind: MirConstantKind) -> String
+  match kind
+  when MirConstantKind::MirUnit then "unit"
+  when MirConstantKind::MirBool(_) then "bool"
+  when MirConstantKind::MirInt(_) then "int"
+  when MirConstantKind::MirConstParamValue(_) then "const_param"
+  when MirConstantKind::MirFloat(_) then "float"
+  when MirConstantKind::MirChar(_) then "char"
+  when MirConstantKind::MirString(_) then "string"
+  when MirConstantKind::MirFnItem(_) then "function"
+  when MirConstantKind::MirZeroSized then "zero_sized"
+  when MirConstantKind::MirStaticRef(_) then "static_ref"
+  when MirConstantKind::MirStaticAddr(_) then "static_addr"
+  end  end
+end
+
+# Whether a MIR function is a still-generic template — the pre-mono state
+# in which a symbolic MirConstParamValue repeat count is legal. The
+# lowered function's generic_params record (populated at lowering for the
+# template, cleared on the specialized instance) is the authority.
+def mir_function_is_generic(func: MirFunction) -> Bool
+  !func.generic_params.is_empty()
+end
+
 def verifier_check_rvalue_embedded_types(plans: Map[String, DeinitPlan], type_index: Map[Int, MirTypeDef], param_names: Map[Int, String], func: MirFunction, ctx: String, rvalue: MirRvalue, allow_param: Bool, inout errors: Vec[String]) -> Unit
   match rvalue.kind
   when MirRvalueKind::MirMove(operand) then
@@ -23525,8 +23686,12 @@ def verifier_check_rvalue_embedded_types(plans: Map[String, DeinitPlan], type_in
     verifier_check_operand_embedded_types(plans, type_index, param_names, func, ctx, &operand, allow_param, errors)
     let cast_what = ctx.clone() + " cast target"
     verifier_check_type_concreteness(plans, type_index, param_names, &cast_what, &ty, allow_param, errors)
-  when MirRvalueKind::MirRepeat(operand, _) then
+  when MirRvalueKind::MirRepeat(operand, count) then
     verifier_check_operand_embedded_types(plans, type_index, param_names, func, ctx, &operand, allow_param, errors)
+    # The count operand is a constant (a MirInt literal or the SYMBOLIC
+    # MirConstParamValue placeholder in a generic body) — its embedded type
+    # is the constant's scalar type, checked like any constant.
+    verifier_check_operand_embedded_types(plans, type_index, param_names, func, ctx, &count, allow_param, errors)
   when MirRvalueKind::MirAggregate(kind, operands) then
     match kind
     when AggregateKind::MirArray(arr_ty) then
@@ -23713,8 +23878,9 @@ def verifier_check_callees(func: MirFunction, fn_names: Set[String], deinit_inst
           verifier_check_fnitem_operand(&operand, fn_names, &bb_ctx, errors)
         when MirRvalueKind::MirCast(_, operand, _) then
           verifier_check_fnitem_operand(&operand, fn_names, &bb_ctx, errors)
-        when MirRvalueKind::MirRepeat(operand, _) then
+        when MirRvalueKind::MirRepeat(operand, count) then
           verifier_check_fnitem_operand(&operand, fn_names, &bb_ctx, errors)
+          verifier_check_fnitem_operand(&count, fn_names, &bb_ctx, errors)
         when MirRvalueKind::MirAggregate(_, operands) then
           for op in operands do
             verifier_check_fnitem_operand(&op, fn_names, &bb_ctx, errors)
@@ -23854,13 +24020,21 @@ def verifier_rvalue_type(inout engine_env: TypeEnv, type_index: Map[Int, MirType
     let cast_what = "cast operand"
     verifier_check_operand_ownership(engine_env, type_index, func, &operand, &cast_what, ctx, errors)
     Option::Some(ty)
-  when MirRvalueKind::MirRepeat(operand, _) then
+  when MirRvalueKind::MirRepeat(operand, count) then
     let _ = verifier_check_operand(type_index, func, &operand, running, &mut moved, ctx, errors)
     verifier_check_ref_operand(func, &operand_place(&operand), "repeat operand", ctx, errors)
- # value computation must never bitwise-copy a non-trivially-
+    # value computation must never bitwise-copy a non-trivially-
     # copyable value (the engine's is_trivially_copyable axis).
     let repeat_what = "repeat operand"
     verifier_check_operand_ownership(engine_env, type_index, func, &operand, &repeat_what, ctx, errors)
+    # The COUNT operand must be a constant count: a MirInt literal, or the
+    # SYMBOLIC MirConstParamValue placeholder (a generic body's in-scope
+    # const parameter count — the placeholder is substituted to the
+    # concrete MirInt by monomorphization, so emission only ever sees a
+    # MirInt count; codegen fails closed otherwise). A count that is not a
+    # constant — a runtime place read — could never size the fixed-array
+    # fill and is a lowering bug, never silently emitted.
+    verifier_check_repeat_count(type_index, func, &count, ctx, errors)
     Option::None
   when MirRvalueKind::MirPhi(entries) then
     var ei = 0

@@ -37,7 +37,7 @@ continues through MIR/mono/optimize/codegen.
 | 11 | MIR verification | `verify_mir(&mir)` | `mir.tg` | the verifier invariant set (the schema below) | verify_mir is the single authority over the MIR invariant set and runs at EVERY boundary: post-lower, post-mono (unconditional — the generic substitution is a transformative boundary every build re-proves), after EVERY transformative optimizer pass (the verify-everything policy: debug/CI), post-opt, and IMMEDIATELY BEFORE codegen (the final firewall re-proves the exact IR instance codegen receives) — a verified MIR that passes is the only MIR that continues | a gate, not a transform |
 | 12 | Monomorphization | `monomorphize_program(&mut mir, &mut mono_cache)` | `mono.tg` | MonoCache + InstanceId work queue; the item-8 MIR completeness oracle runs right after | monomorphize_program is the only authority for instance identity (InstanceId = CallableId wrapping the DefId + the concrete substitutions), the mangled emission name (instance_key / mangle_name), and the work queue. ZERO-INFERENCE: the instance payload is the ONLY source of type arguments — a call with a generic base and no solved instance FAILS CLOSED (error, never inference) | optimizer, codegen (emission names) |
 | 13 | MIR optimization | `optimize_mir(&mut mir, opt_level)` | `mir.tg` | MirProgram (transformed) | optimize_mir is the only authority for MIR transformations, gated by opt_level; it must never change observable semantics | codegen |
-| 14 | Code generation | `generate_object_file / generate_executable` | `codegen.tg` | layout/Repr table + IntrinsicId dispatch; preceded by the final firewall (verify_mir + run_mir_completeness_oracle) | generate_object_file/generate_executable are the only authorities for instruction selection, the register-targeted DIRECT EMISSION (the inline per-function register state RegAllocState — alloc_reg / free_reg / alloc_reg_or_spill — NOT a standalone register-allocation pass), the layout/Repr table (layout_engine.tg), and intrinsic dispatch (IntrinsicId in codegen.tg) | linker, runtime |
+| 14 | Code generation | `generate_object_file / generate_executable` | `codegen.tg` | layout/Repr table + IntrinsicId dispatch; preceded by the final firewall (verify_mir + run_mir_completeness_oracle) | generate_object_file/generate_executable are the only authorities for instruction selection on the DEFAULT route: the register-targeted DIRECT EMISSION (the inline per-function register state RegAllocState — alloc_reg / free_reg / alloc_reg_or_spill — NOT a standalone register-allocation pass), the layout/Repr table (layout_engine.tg), and intrinsic dispatch (IntrinsicId in codegen.tg). The env-gated LIR route (TANGERINE_LIR=1 — driver.tg compile_lir_route, default off, pending full-corpus parity) lowers MirProgram through tg_compiler/lir.tg's standalone linear-scan allocator (lir_alloc_registers_mode) before the per-backend emission | linker, runtime |
 
 ## The stopping points
 
@@ -91,13 +91,19 @@ error that aborts compilation.
 
 ## The register-allocation fact (the wording contradiction resolved)
 
-Stage 14 (codegen) performs DIRECT emission with the inline per-function
-register state (`RegAllocState` — `alloc_reg` / `free_reg` /
-`alloc_reg_or_spill`, codegen.tg). There is NO standalone
-register-allocation pass in the pipeline; "register allocation" in
-pipeline prose means this register-targeted emission inside stage 14 —
-matching invariants.md INV-OPT-006 ("no register allocator exists —
-codegen is direct stack-frame + register-targeted emission").
+Stage 14 (codegen) is the DEFAULT route's DIRECT emission with the
+inline per-function register state (`RegAllocState` — `alloc_reg` /
+`free_reg` / `alloc_reg_or_spill`, codegen.tg) — no standalone
+register-allocation pass on that route. A standalone LINEAR-SCAN
+register-allocation pipeline exists behind the env-gated LIR route
+(`TANGERINE_LIR=1`, default off — driver.tg `compile_lir_route`):
+MirProgram -> LIR -> linear scan (`lir.tg` `lir_alloc_registers_mode`
+/ `lir_linearize` — interval segments, pool registers, spill-slot
+assignment) -> per-backend emission. The LIR route is NOT the
+default: it is an env opt-in pending full-corpus parity with the
+direct emitter, and it fails closed on any construct outside its
+legalization contract. Un-gated pipeline prose means the direct
+route's register-targeted emission.
 
 ---
 

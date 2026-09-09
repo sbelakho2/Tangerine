@@ -181,7 +181,8 @@ Verifier returns `Vec[String]` of error messages. An empty vector means the MIR 
 | Consumer | What it reads | Source file |
 |----------|--------------|-------------|
 | Optimizer | MirProgram (transforms in place) | mir.tg |
-| Codegen | MirProgram → instruction selection + register-targeted direct emission (the inline per-function `RegAllocState` — `alloc_reg`/`free_reg`/`alloc_reg_or_spill`; there is NO standalone register-allocation pass) | codegen.tg |
+| Codegen | MirProgram → (default route) instruction selection + register-targeted direct emission (the inline per-function `RegAllocState` — `alloc_reg`/`free_reg`/`alloc_reg_or_spill`; no standalone allocation pass on this route) | codegen.tg |
+| LIR route (env-gated) | MirProgram → LIR → standalone linear-scan register allocation → per-backend emission (`TANGERINE_LIR=1`, default off — driver.tg `compile_lir_route`; lir.tg `lir_linearize` / `lir_alloc_registers_mode` with spill-slot assignment; pending full-corpus parity, fails closed outside its legalization contract) | lir.tg + backend_thumb.tg / backend_rv.tg |
 | Pretty-printer | MirProgram → human-readable text | mir.tg |
 | PGO instrumenter | MirProgram (adds counters) | mir.tg |
 | Async transformer | MirFunction (generates state machine) | mir.tg |
@@ -214,6 +215,7 @@ Verifier returns `Vec[String]` of error messages. An empty vector means the MIR 
 | AST (access/resource-checked) | Non-canonical | Verified at access/resource-check boundary |
 | MIR (lowered from AST) | **CANONICAL** | Verified by MIR verifier |
 | MIR (optimized) | **CANONICAL** | Re-verified post-opt AND immediately before codegen (the verify-everything policy + the final firewall) — the former "(Stage 5 work)" note is resolved |
+| LIR (env-gated LIR route) | Non-canonical (route-internal) | Lowered from the verified MirProgram by the `TANGERINE_LIR=1` route (driver.tg `compile_lir_route`, default off); consumed by the linear-scan allocator and the per-backend emitters (lir.tg / backend_thumb.tg / backend_rv.tg) |
 | CodeBuffer (from codegen) | Non-canonical | Not independently verified |
 
 All non-canonical IRs are consumed only by the immediately following stage.

@@ -10,27 +10,119 @@ module (the volatile/MMIO Register abstraction, the `@interrupt` /
 the allocator-free `ArrayVec` / `RingBuffer` collections) and the driver's
 embedded route (`compile_to_embedded_route`).
 
-> **THE ISA CODE-GEN TRUTH (P0.2).** The ONLY embedded target with real
-> code generation is **`aarch64-unknown-none`** (ARM64 bare-metal — the
-> aarch64 backend). The Thumb triples (`thumbv6m-none-eabi`,
-> `thumbv7em-none-eabi[f]`, `thumbv8m.main-none-eabihf`) and the RISC-V
-> triples (`riscv32imc|imac-unknown-none-elf`, `riscv64gc-unknown-none-elf`)
-> are **HARD-REJECTED** by the route: the compiler has no Thumb/RISC-V code
-> generator, so the route emits the stable rejection diagnostic and NO
-> artifact (it never fabricates an aarch64 image under a foreign triple).
-> There is **no QEMU execution lane** — hardware execution is not claimed.
+> **THE CODE-GEN TRUTH (P0.2, updated for the LIR routes).** Two code
+> generation routes exist. (1) The DEFAULT (un-gated) route is the
+> DIRECT emitter (codegen.tg) for the host targets (`aarch64-apple-
+> darwin`, `x86_64-unknown-linux-gnu`, plus the wasm32 route). (2) The
+> env-gated LIR route (`TANGERINE_LIR=1` + `TANGERINE_LIR_TARGET=...`,
+> default off — driver.tg `compile_lir_route`) compiles native single
+> files through the standalone LIR pipeline (lir.tg: MIR → LIR →
+> linear-scan allocation → per-backend emission) for aarch64 and for
+> the ARMv7-M and RISC-V backends below; it fails closed on any
+> construct outside its legalization contract.
+>
+> The `--target`-triple embedded route (`compile_to_embedded_route`) is
+> unchanged in scope: its only real code generation target remains
+> **`aarch64-unknown-none`** (ARM64 bare-metal — the aarch64 backend).
+> The Thumb triples (`thumbv6m-none-eabi`, `thumbv7em-none-eabi[f]`,
+> `thumbv8m.main-none-eabihf`) and the RISC-V triples
+> (`riscv32imc|imac-unknown-none-elf`, `riscv64gc-unknown-none-elf`)
+> are **HARD-REJECTED by that route**: it has no generator for those
+> triples, so it emits the stable rejection diagnostic and NO artifact
+> (it never fabricates an aarch64 image under a foreign triple). The
+> per-CPU ARMv7-M and RISC-V code generators live on the LIR route and
+> are selected by `TANGERINE_LIR_TARGET`, not by `--target`.
+> There is **no QEMU execution lane** — hardware execution is not
+> claimed.
 
 ## Target Platforms
 
-| Target Triple             | Architecture | Status   |
+| Target Triple / route name | Architecture | Status |
 |---------------------------|-------------|----------|
-| `aarch64-unknown-none`   | ARM64 (bare) | Supported — the real codegen (the aarch64 backend): the spec JSON + the linker script + the startup/vector artifacts + the bare-metal ELF image |
-| `thumbv7em-none-eabihf`  | ARM Cortex-M4/M7 | REJECTED — no Thumb code generator (the stable diagnostic; no artifact) |
-| `thumbv6m-none-eabi`     | ARM Cortex-M0/M0+ | REJECTED — no Thumb code generator |
-| `thumbv8m.main-none-eabihf` | ARM Cortex-M33 | REJECTED — no Thumb code generator |
-| `riscv32imac-unknown-none-elf` | RISC-V RV32 | REJECTED — no RISC-V code generator |
-| `riscv32imc-unknown-none-elf` | RISC-V RV32IMC | REJECTED — no RISC-V code generator |
-| `riscv64gc-unknown-none-elf` | RISC-V RV64 | REJECTED — no RISC-V code generator |
+| `aarch64-unknown-none` (embedded route) | ARM64 (bare) | Supported — the real codegen of the `--target` embedded route (the aarch64 backend): the spec JSON + the linker script + the startup/vector artifacts + the bare-metal ELF image |
+| `thumbv7em-none-eabihf` (embedded route) | ARM Cortex-M4F/M7 | REJECTED by the embedded route (no triple generator there); the ARMv7-M codegen is the LIR route's per-CPU backends (`TANGERINE_LIR_TARGET=cortex-m4f/cortex-m7`) |
+| `thumbv6m-none-eabi` (embedded route) | ARM Cortex-M0/M0+ | REJECTED by the embedded route; ARMv6-M has no LIR-route instance this slice (fail-closed — no backend consumes it) |
+| `thumbv8m.main-none-eabihf` (embedded route) | ARM Cortex-M33 | REJECTED by the embedded route; no LIR-route instance this slice |
+| `riscv32imac-unknown-none-elf` (embedded route) | RISC-V RV32 | REJECTED by the embedded route; the RISC-V codegen is the LIR route's descriptors (`TANGERINE_LIR_TARGET=riscv32imac`/`riscv32imafc`/`riscv32imafdc`) |
+| `riscv32imc-unknown-none-elf` (embedded route) | RISC-V RV32IMC | REJECTED by the embedded route; no LIR-route instance for the IMC profile (the imac descriptors require the A extension) |
+| `riscv64gc-unknown-none-elf` (embedded route) | RISC-V RV64 | REJECTED by the embedded route; the RISC-V codegen is the LIR route's descriptors (`TANGERINE_LIR_TARGET=riscv64imac`/`riscv64gc`) |
+
+## The LIR-route Thumb-2 and RISC-V backends
+
+The env-gated LIR route (driver.tg `compile_lir_route`,
+`TANGERINE_LIR=1`) emits REAL relocatable ELF objects through per-CPU /
+per-profile descriptors — the old single "cortex-m" blob is replaced by
+four per-CPU ARMv7-M instances and five RISC-V instances
+(`target_desc.tg` `thumbv7m_cortex_m3_desc` /
+`thumbv7em_cortex_m4_desc` / `thumbv7em_cortex_m4f_desc` /
+`thumbv7em_cortex_m7_desc` / `riscv32imac_desc` /
+`riscv32imafc_desc` / `riscv32imafdc_desc` / `riscv64imac_desc` /
+`riscv64gc_desc`; the legacy names `cortex-m` → cortex-m4f and
+`riscv32`/`riscv64` → the imac instances of their xlen). The route's
+thumb/rv arms emit relocatable OBJECTS only (the `-c` / `--emit-obj`
+object mode) — executable emission fails closed
+(the objects are for an external arm-none-eabi / riscv-none-elf
+linker); the aarch64 arm additionally links executables.
+
+- **Cortex-M (backend_thumb.tg, ELF32 EM_ARM objects):** every member
+  is AAPCS32, Thumb-2, 8-byte stack-aligned with the ARMv7-M
+  byte/halfword/word LDREX/STREX exclusives and hardware
+  SDIV/UDIV (`integer_div: Hardware` on the M3/M4/M4F/M7 descriptors).
+  The descriptors carry the FPU as DATA: **cortex-m3 and cortex-m4
+  have `fpu: None` / `float_abi: Soft` — no VFP instruction may be
+  emitted for them**, and float content fails closed at the desc-driven
+  FP gate; **cortex-m4f** carries `fpu: FPv4SP` (vfpv4-d16, the
+  single-precision data-processing set) and **cortex-m7** `fpu:
+  FPv5D16` (adds the double-precision VFP data processing), both
+  `float_abi: Hard` (AAPCS32 VFP crossings: s0..s15/d0..d7). The
+  implemented surface: the register-resident F64 float slice (F32 is
+  memory-class on this route — the cm register model has no
+  single-register F32 alias above d15), the atomic slice at the
+  [1,2,4]-byte widths (LDREX/STREX loops with the per-ordering DMB
+  discipline; `_u64` fails closed), the scalar-constant static subset
+  (`.data` + MOVW/MOVT-address loads), and the **NVIC handler slice**:
+  `@interrupt` functions are emitted with the EXC_RETURN prologue/
+  epilogue discipline and registered into the object's `.isr_vector`
+  section (declaration-order vector words, R_ARM_ABS32 over the
+  handler symbols). Fail-closed: 64-bit payloads and shift counts the
+  32-bit word model cannot hold, aarch64-convention LIR forms (fixed
+  vregs 4..7), div/mod (the lowering gate stays closed this slice),
+  static writes and non-scalar static images, aggregate returns/
+  parameters, float-class variadic extern calls (GP-only variadic
+  calls keep lowering — the base convention's word stream), and
+  bare-metal image/startup linking (`thumb_compile_executable` fails
+  closed — the route's objects are for an arm-none-eabi linker; the
+  embedded-route cortex-m linker script + startup artifacts are the
+  image contract).
+- **RISC-V (backend_rv.tg, ELF32/ELF64 EM_RISCV objects):** the
+  descriptors carry the atomic width classes as DATA:
+  `native_atomic_widths` [4] on riscv32 and [4, 8] on riscv64 (the A
+  extension's LR/SC widths), `emulated_atomic_widths` [1, 2] on every
+  instance — sub-word atomics have no LR/SC encoding and no Zabha
+  instance is modeled this slice — and `mmio_atomic_widths` equal to
+  the native set (an emulated word-width RMW could touch a neighbour-
+  ing MMIO register, so it is never MMIO-safe). The implemented
+  surface: the LR/SC atomic forms (loads/stores, RMW loops, CAS) at
+  the native widths with the per-ordering fences, and the
+  scalar-constant static subset (`.data` + LUI/ADDI-address loads).
+  The FPU split is descriptor data — `riscv32imac`/`riscv64imac` have
+  `fpu: None`; `riscv32imafc` carries `fpu: RVF` (FLEN 32) and
+  `riscv32imafdc`/`riscv64gc` `fpu: RVD` (FLEN 64), all with
+  `float_abi: Hard` (the psABI fa0..fa7 float argument file modeled as
+  data) — but the rv emitter's float arms are the
+  stage-2 slice, so float statements stay fail-closed. Fail-closed:
+  aggregate returns/parameters, sub-word (emulated-class) atomics,
+  RV32 64-bit atomics and 64-bit-int conversion forms, statics beyond
+  the scalar subset and static writes, div/rem encoders (the modeled
+  M extension names the target capability, not this slice's), and
+  float stack arguments beyond the eight fa0..fa7 registers.
+- The route accepts the standard object/executable emit modes only;
+  the thumb/rv arms fail closed on executable emission (objects only
+  — link externally), while the aarch64 LIR arm links executables. Neither backend ever
+  invokes an external toolchain — every encoding is emitted in-tree.
+  The route is default-off and pending full-corpus parity with the
+  DIRECT emitter; it fails closed on any construct outside its
+  legalization contract rather than falling back silently.
 
 ## Getting Started
 
@@ -375,9 +467,19 @@ end
 tg build --target aarch64-unknown-none --release
 
 # The Thumb (thumbv6m/thumbv7em/thumbv8m.main) and RISC-V
-# (riscv32imc/riscv32imac/riscv64gc) embedded triples are HARD-REJECTED:
-# the route emits the stable diagnostic and NO artifact (no code
-# generator exists for those ISAs — no fabricated image).
+# (riscv32imc/riscv32imac/riscv64gc) embedded triples are HARD-REJECTED
+# by the --target embedded route: the route emits the stable diagnostic
+# and NO artifact (no triple generator there — no fabricated image).
+
+# The ARMv7-M / RISC-V code generators live on the LIR route
+# (env-gated, default off): compile a single file to a relocatable ELF
+# object for a per-CPU descriptor
+TANGERINE_LIR=1 TANGERINE_LIR_TARGET=cortex-m4f tg build file.tg --emit-obj
+TANGERINE_LIR=1 TANGERINE_LIR_TARGET=riscv32imac tg build file.tg --emit-obj
+# Accepted targets: aarch64 (default), cortex-m3/cortex-m4/cortex-m4f/
+# cortex-m7 ("cortex-m" = the cortex-m4f legacy alias), riscv32imac/
+# riscv32imafc/riscv32imafdc/riscv64imac/riscv64gc ("riscv32"/"riscv64"
+# = the imac legacy aliases). Unknown values fail closed.
 ```
 
 ## Best Practices

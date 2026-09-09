@@ -2130,8 +2130,9 @@ end
 ### The embedded route (`--target <embedded-triple>`)
 
 The embedded route (`compile_to_embedded_route`) serves the bare-metal
-target **`aarch64-unknown-none`** — the ONLY embedded triple with real
-code generation (the aarch64 backend): the per-triple **target spec**
+target **`aarch64-unknown-none`** — the only embedded TRIPLE with real
+code generation on this route (the aarch64 backend): the per-triple
+**target spec**
 (arch / cpu / fpu / endianness / pointer width / max atomic width /
 linker / abort-only panic) emitted as the JSON artifact, the **linker
 script** (the flash/RAM `MEMORY` layout + the `.isr_vector`/`.text`/
@@ -2151,13 +2152,24 @@ reset-vector entry, structurally verified). `std::embedded` provides the
 `interrupt_vector_table` and the allocator-free `ArrayVec` / `RingBuffer`
 collections.
 
-**The ISA code-gen truth (P0.2):** the Thumb triples (`thumbv6m-none-eabi`
-/ `thumbv7em-none-eabi[f]` / `thumbv8m.main-none-eabihf`) and the RISC-V
-triples (`riscv32imc|imac-unknown-none-elf` / `riscv64gc-unknown-none-elf`)
-are **HARD-REJECTED** — the compiler has no Thumb/RISC-V code generator,
-so the route emits the stable rejection diagnostic and NO artifact (the
-old behavior forced the aarch64 backend under the foreign triple and
-fabricated the image). There is no QEMU execution lane; hardware
+**The code-gen routes (P0.2, updated for the LIR routes):** the DEFAULT
+(un-gated) route is the DIRECT emitter (codegen.tg) for the host
+targets (`aarch64-apple-darwin` / `x86_64-unknown-linux-gnu`) plus the
+wasm32 route. The env-gated LIR route (`TANGERINE_LIR=1` +
+`TANGERINE_LIR_TARGET=...`, default off — driver.tg `compile_lir_route`)
+adds the standalone LIR pipeline (lir.tg) with per-CPU ARMv7-M
+backends (`cortex-m3`/`cortex-m4`/`cortex-m4f`/`cortex-m7`) and
+RISC-V backends (`riscv32imac`/`riscv32imafc`/`riscv32imafdc`/
+`riscv64imac`/`riscv64gc`), emitting ELF relocatable objects (see
+cross_compilation_guide.md for the per-descriptor feature sets). The
+`--target` embedded route remains aarch64-only: the Thumb triples
+(`thumbv6m-none-eabi` / `thumbv7em-none-eabi[f]` /
+`thumbv8m.main-none-eabihf`) and the RISC-V triples
+(`riscv32imc|imac-unknown-none-elf` / `riscv64gc-unknown-none-elf`)
+are **HARD-REJECTED there** — that route has no generator for those
+triples, so it emits the stable rejection diagnostic and NO artifact
+(the old behavior forced the aarch64 backend under the foreign triple
+and fabricated the image). There is no QEMU execution lane; hardware
 execution is not claimed.
 
 ### WASI (preview1)

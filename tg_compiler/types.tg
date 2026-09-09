@@ -3483,6 +3483,12 @@ enum TypedExprKind
 
   # ——— aggregates ———
   ArrayLit(Vec[TypedExpr])
+  # The [elem; count] repeat-array literal: the element written `count`
+  # times. The node's `ty` is the FixedArray / FixedArraySym form of the
+  # array (the checker resolves the count); the count child is the typed
+  # count expression (a literal or an in-scope const generic parameter
+  # read).
+  ArrayRepeat(Box[TypedExpr], Box[TypedExpr])
   TupleLit(Vec[TypedExpr])
   StructLit { path: String, fields: Vec[(String, TypedExpr)] }
   MapLit(Vec[(TypedExpr, TypedExpr)])
@@ -4202,6 +4208,11 @@ def typed_kind_for(inout env: TypeEnv, expr: Expr) -> Option[TypedExprKind]
   when ExprKind::ExprArrayLit(elems) then
     match typed_children_of(env, &elems)
     when Option::Some(items) then Option::Some(TypedExprKind::ArrayLit(items))
+    when Option::None then missing_typed_hir_child(env, expr)
+    end
+  when ExprKind::ExprArrayRepeat(elem, count) then
+    match typed_children_2(env, &elem, &count)
+    when Option::Some((et, ct)) then Option::Some(TypedExprKind::ArrayRepeat(Box::new(et), Box::new(ct)))
     when Option::None then missing_typed_hir_child(env, expr)
     end
   when ExprKind::ExprTupleLit(elems) then
@@ -16882,6 +16893,9 @@ def scan_expr(env: TypeEnv, inout scan: CaptureScan, expr: Expr) -> Unit
       scan_expr(env, scan, &elems[i])
       i = i + 1
     end
+  when ExprKind::ExprArrayRepeat(elem, count) then
+    scan_expr(env, scan, &elem)
+    scan_expr(env, scan, &count)
   when ExprKind::ExprTupleLit(elems) then
     var i = 0
     while i < elems.len() do
@@ -18246,6 +18260,63 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
       # unifies with a [T; N] annotation (the distinct Type::FixedArray
       # variant).
       Type::Adt(TypeId { id: env.lang_items.array }, [elem_type])
+    end
+  when ExprKind::ExprArrayRepeat(elem, count) then
+    # The [elem; count] repeat-array literal — the VALUE-position mirror of
+    # the [T; N] fixed-array annotation: ONE element expression repeated
+    # `count` times. The element is checked on the ordinary expression path
+    # and typed ONCE; the repeat's own type is the FIXED-ARRAY form of the
+    # element × the count:
+    #   - a literal count folds to Type::FixedArray(elem, n) (the bounds
+    #     diagnostics mirror the [T; N] annotation);
+    #   - an in-scope const generic parameter count resolves to the
+    #     SYMBOLIC Type::FixedArraySym(elem, gpid) — the SAME form the
+    #     [T; N] body-field annotation produces — so a generic body can
+    #     write `[Option::None; N]` into a symbolic-size field and the two
+    #     unify by parameter identity (the §20 same-parameter rule).
+    # The count expression is a compile-time constant, never a runtime
+    # transfer: it is still type-checked (a const-parameter count must
+    # record its MirConstParamValue read for the MIR lowering), but it is
+    # not an owned aggregate child.
+    if expr.node_id != 0 then
+      env.typed_aggregate_ownership.insert(expr.node_id, Vec::from([true]))
+    end
+    let elem_type = check_expr(env, &elem)
+    # (partial moves): the owned element is a transfer into the array (the
+    # checker's transfer_consume mirror over the aggregate children).
+    check_scoped_access_value_escape(env, &elem, "store", elem.span)
+    record_projected_consume(env, &elem)
+    # (channel b): an array repeat whose element type is (or contains) the
+    # RAW Slice view (UnsafeSlice) stores the raw view in a container —
+    # rejected (the array-literal arm's rule).
+    check_no_escaping_slice(env, &elem_type, expr.span, "stored in a container (array repeat element)")
+    # Repeat-safety gate: the MIR writes the element's IMAGE into every
+    # slot — a payload-less enum variant image (a tag-only value such as
+    # Option::None, duplicatable under any element type) or a SCALAR copy.
+    # An image that can own resources (a String, an Option::Some of an
+    # owning payload, a container) can never be duplicated across slots.
+    if !repeat_elem_image_safe(env, &elem, &elem_type) then
+      type_add_error(env, "array repeat element must be a scalar (Int/UInt/Char/Bool/float) or a payload-less enum variant value such as Option::None (the element's image is written into every slot, so a value that can own resources cannot be repeated)", elem.span)
+    end
+    let _count_type = check_expr(env, &count)
+    # The count decides the array form (literal -> concrete; in-scope const
+    # parameter -> symbolic). The count is restricted to the two forms the
+    # MIR can lower as a constant count operand.
+    match repeat_count_form(env, &count)
+    when RepeatCountForm::Literal(n) then
+      if n < 0 then
+        type_add_error(env, "array repeat count must not be negative (got " + n.to_string() + ")", count.span)
+      elsif n > MAX_FIXED_ARRAY_ELEMS() then
+        type_add_error(env, "array repeat count " + n.to_string() + " exceeds the maximum supported length " + MAX_FIXED_ARRAY_ELEMS().to_string(), count.span)
+      end
+      Type::FixedArray(elem_type, n)
+    when RepeatCountForm::ConstParam(gpid) then
+      # (symbolic): the count names the enclosing declaration's own const
+      # parameter — the symbolic-size array type, the [T; N] body form.
+      Type::FixedArraySym(elem_type, gpid)
+    when RepeatCountForm::Other then
+      type_add_error(env, "array repeat count must be an integer literal or an in-scope const generic parameter (constant arithmetic and const references are not yet supported as repeat counts)", count.span)
+      Type::Error
     end
   when ExprKind::ExprTupleLit(elems) then
     var tup_owned = Vec::new()
@@ -21583,6 +21654,98 @@ def resolve_const_param_size(env: TypeEnv, expr: Expr) -> Option[GenericParamId]
   end  end
 end
 
+# The classification of a [elem; count] repeat-array literal's COUNT
+# expression — decided by the checker's array-repeat arm (types.tg
+# check_expr) and mirrored by the MIR lowering, which lowers the count to a
+# CONSTANT count operand (a MirInt literal or the symbolic
+# MirConstParamValue placeholder). The count is restricted to the two forms
+# that lower as a constant:
+#   - Literal(n): an integer literal (possibly negated — the caller applies
+#     the [T; N] bounds rules);
+#   - ConstParam(gpid): a bare reference to an IN-SCOPE const generic
+#     parameter of the enclosing declaration (the §20 symbolic count).
+# Everything else is Other and rejected at the repeat site (constant
+# arithmetic and module-const references are not yet supported as VALUE
+# counts — the type-annotation evaluator is not mirrored at lowering).
+enum RepeatCountForm
+  Literal(Int)
+  ConstParam(GenericParamId)
+  Other
+end
+
+def repeat_count_form(env: TypeEnv, count: Expr) -> RepeatCountForm
+  match count.kind
+  when ExprKind::ExprIntLit(n) then RepeatCountForm::Literal(parsed_int_to_host(&n))
+  when ExprKind::ExprUnaryOp(UnOp::Neg, operand) then
+    match operand.kind
+    when ExprKind::ExprIntLit(n) then RepeatCountForm::Literal(0 - parsed_int_to_host(&n))
+    when _ then RepeatCountForm::Other
+    end
+  when _ then
+    # (§20): a bare reference (ident or single-segment path) to a const
+    # generic parameter is the SYMBOLIC count. The parameter must be IN
+    # scope for this lowering unit (mirror of check_expr's ExprIdent rule:
+    # an out-of-scope read has no per-instance value and cannot lower).
+    match resolve_const_param_size(env, &count)
+    when Option::Some(gpid) then
+      if unit_const_param_in_scope(env, &gpid) then RepeatCountForm::ConstParam(gpid)
+      else RepeatCountForm::Other end
+    when Option::None then RepeatCountForm::Other
+    end
+  end  end
+end
+
+# The repeat-literal element gate: whether the element's IMAGE can be
+# duplicated into every slot of the [elem; count] array:
+#   - a scalar element type (engine-Immediate storage, at most 8 bytes):
+#     the image is a plain value — duplicated by copy;
+#   - a QUALIFIED payload-less enum variant value (Option::None): the MIR
+#     element image is the tag-only constant — a None slot's payload area is
+#     never read and the slot's drop glue is tag-trivial, so the image is
+#     duplicatable under ANY element type (the same invariant the
+#     concrete-family `[Option::None, ...]` aggregate fills rely on).
+# Every other element (a String, a Some carrying an owning payload, a
+# container, a bare payload-less variant identifier — whose value the
+# checker cannot tie to a constant image) is rejected at the repeat site.
+def repeat_elem_image_safe(env: TypeEnv, elem: Expr, elem_ty: Type) -> Bool
+  match elem_ty
+  when Type::Bool then true
+  when Type::Char then true
+  when Type::Int then true
+  when Type::UInt then true
+  when Type::ISize then true
+  when Type::USize then true
+  when Type::I8 then true
+  when Type::I16 then true
+  when Type::I32 then true
+  when Type::I64 then true
+  when Type::U8 then true
+  when Type::U16 then true
+  when Type::U32 then true
+  when Type::U64 then true
+  when Type::F32 then true
+  when Type::F64 then true
+  when Type::Float then true
+  when Type::IntLiteral(_) then true
+  when _ then
+    match elem.kind
+    when ExprKind::ExprPath(path) then
+      if path.segments.len() >= 2 then
+        let variant_name = path.segments[path.segments.len() - 1]
+        let enum_name = path.segments[path.segments.len() - 2]
+        match find_enum_variant(env, variant_name)
+        when Option::Some((enum_td, variant)) then
+          enum_td.name == enum_name && variant.fields.len() == 0
+        when Option::None then false
+        end
+      else
+        false
+      end
+    when _ then false
+    end
+  end  end
+end
+
 # Extract path segments from a TypeExpr in a separate function frame.
 # Going through a helper appears to give stage0 cleaner codegen for single-
 # struct enum payloads (Path(AstPath)) than a direct destructure in-place.
@@ -22623,6 +22786,9 @@ def oracle_walk_typed_expr(inout env: TypeEnv, typed: TypedProgram, te: TypedExp
     oracle_walk_typed_expr(env, typed, &value, findings)
   when TypedExprKind::ArrayLit(elems) then
     for e in elems do oracle_walk_typed_expr(env, typed, &e, findings) end
+  when TypedExprKind::ArrayRepeat(elem, count) then
+    oracle_walk_typed_expr(env, typed, &elem, findings)
+    oracle_walk_typed_expr(env, typed, &count, findings)
   when TypedExprKind::TupleLit(elems) then
     for e in elems do oracle_walk_typed_expr(env, typed, &e, findings) end
   when TypedExprKind::StructLit(_, fields) then
