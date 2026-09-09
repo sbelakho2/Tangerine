@@ -1,0 +1,803 @@
+# Tangerine Compiler — Repair Candidates (audit §35)
+# Self-hosting compiler written in Tangerine
+#
+# DETERMINISTIC repair-candidate derivation for the error classes the audit
+# names. This module reads ONLY the derivational fields of the ONE shared
+# Diagnostic record (parser.tg — the §34 fields: primary_symbol, semantic_site,
+# expected_type/actual_type, constraint_trace, trait_trace, ownership_trace,
+# effect_trace, capability_trace, related_symbols) and emits advisory
+# RepairCandidate records. It never guesses: every candidate is produced by a
+# text-grammar rule over the §34 row contracts, in a fixed deterministic order,
+# and every fact the trace rows cannot prove is carried as an Obligation the
+# higher-level reasoning layer must verify before applying the repair.
+#
+# LAYER CONTRACT
+#   - The compiler narrows LEGAL transformations (this module); intent
+#     (which candidate the user wants) is decided above.
+#   - A candidate's semantic_preconditions are the facts that must hold for
+#     the repair to be applicable. Obligation.ok is TRUE only when the
+#     diagnostic's own rows already prove the fact; ok = FALSE means the fact
+#     is unverified at this layer (no env access) and must be confirmed by a
+#     consumer holding the TypeEnv / semantic index before the candidate is
+#     applied (e.g. "the moved local's type has Clone", "the consuming site
+#     was a sink-parameter call", "the type is a local nominal").
+#   - affected_symbols reference the STABLE-symbol domain. Diagnostics carry
+#     only display texts (never module paths), so the engine synthesizes
+#     advisory keys in a documented per-domain vocabulary — "local::<name>",
+#     "type::<render>", "fn::<name>" — digesting the key with the ids.tg
+#     128-bit stable digest (the §29 digest model). A consumer with the
+#     resolver's stable table must remap them onto real StableDefId keys
+#     before they identify anything across compilations.
+#   - expected_delta is a SemanticDeltaConstraint (§31 vocabulary): the
+#     narrow set of semantic deltas the repair may legitimately introduce.
+#   - NARROWING (no foreign edits, no cross-file edits): candidates that
+#     would require editing a foreign (std:: / core:: / builtin::) definition
+#     are not emitted; candidates whose target file is not provable from the
+#     diagnostic carry a LocalCallee/LocalNominal obligation (ok = false).
+#   - Capability diagnostics (linear values) and classes the audit does not
+#     name (conditional-consume, uninitialized-use, outer-loop consume,
+#     finalizer-subject consume, whole-consume-of-a-partially-moved root)
+#     produce NO candidates.
+#
+# ROW GRAMMARS PARSED (the §34 producer contracts — resource_check.tg /
+# types.tg / mir.tg):
+#   ownership_trace rows (ownership_site_rows + partial-move sites):
+#     "`NAME` state chain: live -> consumed at <file>:<start>"
+#     "`NAME` state chain: already in the consumed state"
+#     "`NAME` state chain: live"  / "...: live on one path only (...)" /
+#       "...: uninitialized"
+#     "field `CHAIN` of resource `NAME` was moved out (a partial move)"
+#     "rejected at <site>: <reason>"  (reasons: "use rejected: the value was
+#       already consumed"; "consume rejected: ... consumed twice"; "consume
+#       rejected: let parameter is read-only"; "consume rejected: inout
+#       parameter may be modified but not consumed"; the conditional /
+#       uninitialized / outer-loop / finalizer / partial-whole variants)
+#   constraint_trace rows (bound_failure_chain_rows):
+#     "the `TRAIT` obligation on `ROOT` fails through the nested field chain:"
+#     "    `LEAF` is not Copy: not trivially copyable, and no registered
+#       Clone impl for it (...)"
+#     "    no registered impl of `TRAIT` for `LEAF`"
+#   trait_trace rows (resolve_method_type):
+#     "candidate impl `...`: method `M` present but the receiver does not
+#       satisfy the impl bound `P: TRAIT`"
+#   effect_trace rows (mir.tg E0232):
+#     "@no_alloc function `DISPLAY` forbids allocation"
+#     "`f` -> `g`"   (evidence-path hops)
+#     "... may occur through a call chain into `h`"
+#
+# CANDIDATE ORDER: within one diagnostic the classes run in the audit order —
+# ownership (use-after-move family), expected-vs-actual mismatch, trait-
+# resolution gaps, effect/contract rows; within a class the audit's listed
+# order. Each rule reads only its own derivational field, so the output is a
+# deterministic function of the diagnostic.
+#
+# TABLE OF RULES (audit §35 error class -> candidate kinds):
+#   use-after-move (whole value)            -> MoveUseLater; CloneBeforeMove
+#        [pre: TraitBound Clone]; ChangeParamConvention("sink", "let")
+#        [pre: SinkParamTransfer at the recorded consumption site]. The
+#        audit's "affected count" is the number of affected_symbols the
+#        VERIFYING layer completes (this layer sees one local + one consume).
+#   use-after-move (partial: a moved-out    -> MoveUseLater; CloneBeforeMove
+#        field read later)                     [pre: TraitBound Clone];
+#        MakeFieldExplicit(field) — re-initialize / bind the moved-out field
+#        explicitly before the read.
+#   consume-after-move (consumed twice)     -> CloneBeforeMove [pre:
+#        TraitBound Clone]; ChangeParamConvention("sink", "let") [pre:
+#        SinkParamTransfer].
+#   convention errors (consume of a         -> ChangeParamConvention("let",
+#        let / inout parameter)                "sink") / ("inout", "sink") —
+#        deterministic, no preconditions.
+#   expected Money[..], got Int             -> ConstructVia("Money::from_minor")
+#        [pres: OneFieldWrapper, ConstructorExists]; ResolveIntoImpl(
+#        "From<Int> for <expected>") [pre: IntoImplResolves] (the audit's
+#        "resolved Into impl" family; expected_delta allows that new impl).
+#   Clone/Copy / trait bound failures       -> ResolveIntoImpl("<TRAIT> for
+#        <leaf-or-receiver>") [pre: LocalNominal]; Copy is structural (never
+#        suggested); generic-parameter leaves and foreign types are skipped.
+#   E0232 effect-class violations           -> RemoveEffectAnnotation("<ann>");
+#        RemoveViolatingCall(<evidence-leaf>) only when the leaf is not a
+#        foreign fn (std:: / core:: / builtin::) — LocalCallee obligation
+#        otherwise.
+#   Transferable/Shareable capability rows, conditional-consume rows,
+#        uninitialized rows: NO candidates (not audit §35 classes).
+
+use std::core::{Option}
+use std::collections::{Vec}
+use tg_compiler::parser::{Diagnostic}
+use tg_compiler::ids::{stable_digest_of}
+
+# ———————————————————————————————————————————————————————————————
+# The §35 protocol records
+# ———————————————————————————————————————————————————————————————
+
+# The COMPACT repair-kind set of audit §35. The first six variants are the
+# audit's named set; RemoveEffectAnnotation / RemoveViolatingCall cover the
+# effect/contract class (the audit's "..." extension).
+enum RepairKind
+  # Reorder the code so the value is USED before the consuming move/transfer.
+  MoveUseLater
+  # Clone the value before the move (legal only when the type has Clone).
+  CloneBeforeMove
+  # Change an access convention of a parameter ("sink" -> "let" relaxes a
+  # consuming callee param; "let"/"inout" -> "sink" lets a callee consume).
+  ChangeParamConvention(from: String, to: String)
+  # Construct the expected value through a constructor ("Money::from_minor").
+  ConstructVia(kind: String)
+  # Resolve the gap through the impl "<trait> for <type>" (use or add it).
+  ResolveIntoImpl(impl_key: String)
+  # Make the moved-out field's recovery explicit (re-initialize / bind the
+  # named field instead of reading its dead storage).
+  MakeFieldExplicit(name: String)
+  # Remove an effect-class annotation (the E0232 "@<annotation>").
+  RemoveEffectAnnotation(annotation: String)
+  # Remove the violating call (the E0232 evidence leaf; local fns only).
+  RemoveViolatingCall(callee: String)
+end
+
+# One semantic precondition of a repair: kind = the fact vocabulary the
+# higher layer verifies ("TraitBound", "SinkParamTransfer", "OneFieldWrapper",
+# "ConstructorExists", "IntoImplResolves", "LocalNominal", "LocalCallee");
+# type_text = the type / subject text the fact concerns; ok = true only when
+# the diagnostic's own rows already prove the fact (see the module doc).
+struct Obligation
+  kind: String
+  type_text: String
+  ok: Bool
+end
+
+# An advisory stable-symbol reference (the audit's StableSymbolId). The
+# diagnostics carry display texts only, so the engine synthesizes the
+# canonical key in a per-domain vocabulary ("local::NAME", "type::RENDER",
+# "fn::NAME") and stores the 128-bit stable digest of that key (ids.tg
+# stable_digest_of) alongside — the §29 digest model. Consumers with the
+# resolver's stable table remap key/path onto real StableDefId records.
+struct StableSymbolId
+  key: String
+  path: String
+  digest_hi: UInt = 0
+  digest_lo: UInt = 0
+end
+
+# The narrow semantic-delta envelope a repair may introduce (§31 vocabulary:
+# signature changes, newly added impls, annotation changes). The three
+# dimensions are the ONLY deltas a repair candidate may claim.
+struct SemanticDeltaConstraint
+  allows_signature_change: Bool
+  allows_new_impls: Vec[String] = Vec::new()
+  allows_annotation_changes: Vec[String] = Vec::new()
+end
+
+# ONE advisory repair candidate: the kind, the obligations that must hold,
+# the symbols the repair touches (the audit's affected count is
+# affected_symbols.len() once the verifying layer completes the set), and
+# the expected delta envelope.
+struct RepairCandidate
+  kind: RepairKind
+  semantic_preconditions: Vec[Obligation] = Vec::new()
+  affected_symbols: Vec[StableSymbolId] = Vec::new()
+  expected_delta: SemanticDeltaConstraint
+end
+
+# ———— Builders ————
+
+def rc_ob(kind: String, type_text: String) -> Obligation
+  Obligation { kind: kind, type_text: type_text, ok: false }
+end
+
+def rc_delta_plain() -> SemanticDeltaConstraint
+  SemanticDeltaConstraint { allows_signature_change: false }
+end
+
+def rc_delta_sig() -> SemanticDeltaConstraint
+  SemanticDeltaConstraint { allows_signature_change: true }
+end
+
+def rc_delta_new_impls(impls: Vec[String]) -> SemanticDeltaConstraint
+  SemanticDeltaConstraint { allows_signature_change: false, allows_new_impls: impls }
+end
+
+def rc_delta_annotations(anns: Vec[String]) -> SemanticDeltaConstraint
+  SemanticDeltaConstraint { allows_signature_change: false, allows_annotation_changes: anns }
+end
+
+def rc_bool_text(b: Bool) -> String
+  if b then "true" else "false" end
+end
+
+# ———— Text primitives (byte-text scans; mirrors the semantic_delta idioms) ————
+
+def rc_char_index(s: String, needle: String, from: Int) -> Int
+  var i = from
+  while i < s.len() do
+    if s.slice(i, i + 1) == needle then
+      return i
+    end
+    i = i + 1
+  end
+  -1
+end
+
+def rc_index_of(s: String, sub: String, from: Int) -> Int
+  if sub.len() == 0 then
+    return -1
+  end
+  var i = from
+  while i + sub.len() <= s.len() do
+    if s.slice(i, i + sub.len()) == sub then
+      return i
+    end
+    i = i + 1
+  end
+  -1
+end
+
+# The text between the backtick pair whose opening tick is at or after from
+# ("" when the pair does not exist).
+def rc_tick_at(s: String, from: Int) -> String
+  let open = rc_char_index(s, "`", from)
+  if open < 0 then
+    return ""
+  end
+  let close = rc_char_index(s, "`", open + 1)
+  if close < 0 then
+    return ""
+  end
+  s.slice(open + 1, close)
+end
+
+# The text between the backtick pair that FOLLOWS a marker that does NOT end
+# with a backtick ("" when the marker or the pair is missing).
+def rc_tick_after(s: String, marker: String, from: Int) -> String
+  let mi = rc_index_of(s, marker, from)
+  if mi < 0 then
+    return ""
+  end
+  rc_tick_at(s, mi + marker.len())
+end
+
+# The text between the backtick pair whose OPENING tick is the marker's last
+# character (callers pass markers ending in "`", e.g. "impl bound `").
+def rc_tick_after_open(s: String, marker: String, from: Int) -> String
+  let mi = rc_index_of(s, marker, from)
+  if mi < 0 then
+    return ""
+  end
+  rc_tick_at(s, mi + marker.len() - 1)
+end
+
+# The type HEAD of a rendered type text: everything before the first '['
+# (the whole text for a non-generic render).
+def rc_type_head(t: String) -> String
+  let bi = rc_char_index(t, "[", 0)
+  if bi < 0 then
+    t
+  else
+    t.slice(0, bi)
+  end
+end
+
+# ———— Stable-symbol synthesis ————
+
+def rc_stable_symbol(text: String, domain: String) -> StableSymbolId
+  var key = domain + "::" + text
+  let d = stable_digest_of(&key)
+  StableSymbolId { key: key, path: text, digest_hi: d.hi, digest_lo: d.lo }
+end
+
+# ———— Ownership class detection (the §34 ownership_trace row grammar) ————
+
+# The parsed summary of one ownership diagnostic: the local name (from the
+# state-chain row), the consumption-site label ("live -> consumed at <site>"),
+# the moved-out field chain, and the classification word of the rejection.
+# Category words:
+#   "whole-uam"      use after a whole-value consumption
+#   "partial-uam"    read of a moved-out field (partial-move use)
+#   "double-consume" a second consume of an already-consumed value
+#   "let-param"      consume rejected: let parameter is read-only
+#   "inout-param"    consume rejected: inout parameter may be modified
+#   "uninit"         use/consume of an uninitialized local
+#   "conditional"    value live/consumed on one path only
+#   "loop"           outer-loop resource consume
+#   "finalizer"      finalizer-subject consume
+#   "partial-whole"  whole-value consume of a partially moved root
+#   "none"           no audit-named class (no candidates)
+struct OwnershipFacts
+  local: String
+  site: String
+  category: String
+  chain: String
+end
+
+def rc_category_of_text(text: String) -> String
+  if rc_index_of(text, "reading the moved-out field", 0) >= 0 then
+    "partial-uam"
+  elsif rc_index_of(text, "use rejected: the value was already consumed", 0) >= 0 then
+    "whole-uam"
+  elsif rc_index_of(text, "consume rejected: the value is already consumed (consumed twice)", 0) >= 0 then
+    "double-consume"
+  elsif rc_index_of(text, "let parameter is read-only", 0) >= 0 then
+    "let-param"
+  elsif rc_index_of(text, "inout parameter may be modified but not consumed", 0) >= 0 then
+    "inout-param"
+  elsif rc_index_of(text, "is live on one path only", 0) >= 0 then
+    "conditional"
+  elsif rc_index_of(text, "(a conditional consume)", 0) >= 0 then
+    "conditional"
+  elsif rc_index_of(text, "reading the conditionally-consumed field", 0) >= 0 then
+    "conditional"
+  elsif rc_index_of(text, "the local is uninitialized", 0) >= 0 then
+    "uninit"
+  elsif rc_index_of(text, "an outer-loop resource", 0) >= 0 then
+    "loop"
+  elsif rc_index_of(text, "a finalizer must not consume its own subject", 0) >= 0 then
+    "finalizer"
+  elsif rc_index_of(text, "fields of the resource were moved out", 0) >= 0 then
+    "partial-whole"
+  else
+    "none"
+  end
+end
+
+def rc_ownership_scan(rows: Vec[String], message: String) -> OwnershipFacts
+  var local = ""
+  var site = ""
+  var chain = ""
+  var category = "none"
+  var consumed_at = false
+  for row in rows do
+    if rc_index_of(row, "state chain:", 0) >= 0 then
+      if local == "" then
+        local = rc_tick_at(row, 0)
+      end
+      let ci = rc_index_of(row, "consumed at", 0)
+      if ci >= 0 then
+        consumed_at = true
+        site = row.slice(ci + 11, row.len())
+      elsif rc_index_of(row, "already in the consumed state", 0) >= 0 then
+        consumed_at = true
+      end
+    end
+    if rc_index_of(row, "was moved out (a partial move)", 0) >= 0 then
+      if chain == "" then
+        chain = rc_tick_at(row, 0)
+      end
+      if local == "" then
+        let t1 = rc_char_index(row, "`", 0)
+        if t1 >= 0 then
+          let t2 = rc_char_index(row, "`", t1 + 1)
+          if t2 >= 0 then
+            let t3 = rc_char_index(row, "`", t2 + 1)
+            if t3 >= 0 then
+              local = rc_tick_at(row, t3)
+            end
+          end
+        end
+      end
+    end
+    if category == "none" then
+      category = rc_category_of_text(row)
+    end
+  end
+  if category == "none" then
+    category = rc_category_of_text(message)
+  end
+  if consumed_at && category == "none" then
+    category = "whole-uam"
+  end
+  OwnershipFacts { local: local, site: site, category: category, chain: chain }
+end
+
+# ———— Ownership candidates (audit's use-after-move / convention classes) ————
+
+def rc_ownership_candidates(facts: OwnershipFacts, primary: String) -> Vec[RepairCandidate]
+  var out = Vec::new()
+  var name = primary.clone()
+  if name == "" then
+    name = facts.local.clone()
+  end
+  if name == "" then
+    return out
+  end
+  match facts.category
+  when "whole-uam" then
+    out.push(RepairCandidate {
+      kind: RepairKind::MoveUseLater,
+      semantic_preconditions: Vec::new(),
+      affected_symbols: Vec::from([rc_stable_symbol(name.clone(), "local")]),
+      expected_delta: rc_delta_plain()
+    })
+    out.push(RepairCandidate {
+      kind: RepairKind::CloneBeforeMove,
+      semantic_preconditions: Vec::from([rc_ob("TraitBound", "Clone")]),
+      affected_symbols: Vec::from([rc_stable_symbol(name.clone(), "local")]),
+      expected_delta: rc_delta_plain()
+    })
+    out.push(RepairCandidate {
+      kind: RepairKind::ChangeParamConvention("sink", "let"),
+      semantic_preconditions: Vec::from([rc_ob("SinkParamTransfer", facts.site.clone())]),
+      affected_symbols: Vec::from([rc_stable_symbol(name.clone(), "local")]),
+      expected_delta: rc_delta_sig()
+    })
+  when "partial-uam" then
+    out.push(RepairCandidate {
+      kind: RepairKind::MoveUseLater,
+      semantic_preconditions: Vec::new(),
+      affected_symbols: Vec::from([rc_stable_symbol(name.clone(), "local")]),
+      expected_delta: rc_delta_plain()
+    })
+    out.push(RepairCandidate {
+      kind: RepairKind::CloneBeforeMove,
+      semantic_preconditions: Vec::from([rc_ob("TraitBound", "Clone")]),
+      affected_symbols: Vec::from([rc_stable_symbol(name.clone(), "local")]),
+      expected_delta: rc_delta_plain()
+    })
+    out.push(RepairCandidate {
+      kind: RepairKind::MakeFieldExplicit(facts.chain.clone()),
+      semantic_preconditions: Vec::new(),
+      affected_symbols: Vec::from([rc_stable_symbol(name.clone(), "local")]),
+      expected_delta: rc_delta_plain()
+    })
+  when "double-consume" then
+    out.push(RepairCandidate {
+      kind: RepairKind::CloneBeforeMove,
+      semantic_preconditions: Vec::from([rc_ob("TraitBound", "Clone")]),
+      affected_symbols: Vec::from([rc_stable_symbol(name.clone(), "local")]),
+      expected_delta: rc_delta_plain()
+    })
+    out.push(RepairCandidate {
+      kind: RepairKind::ChangeParamConvention("sink", "let"),
+      semantic_preconditions: Vec::from([rc_ob("SinkParamTransfer", facts.site.clone())]),
+      affected_symbols: Vec::from([rc_stable_symbol(name.clone(), "local")]),
+      expected_delta: rc_delta_sig()
+    })
+  when "let-param" then
+    out.push(RepairCandidate {
+      kind: RepairKind::ChangeParamConvention("let", "sink"),
+      semantic_preconditions: Vec::new(),
+      affected_symbols: Vec::from([rc_stable_symbol(name.clone(), "local")]),
+      expected_delta: rc_delta_sig()
+    })
+  when "inout-param" then
+    out.push(RepairCandidate {
+      kind: RepairKind::ChangeParamConvention("inout", "sink"),
+      semantic_preconditions: Vec::new(),
+      affected_symbols: Vec::from([rc_stable_symbol(name.clone(), "local")]),
+      expected_delta: rc_delta_sig()
+    })
+  when _ then ()
+  end
+  out
+end
+
+# ———— Expected-vs-actual mismatch candidates (audit's money/int class) ————
+
+# The structural wrapper rule of audit §35, applied at the text layer: the
+# expected render's head is the wrapper nominal. The engine names a
+# constructor only for the audit's exemplar instance — the Money shape
+# (Money[C, SCALE] { unscaled: Int } with Money::from_minor(minor: Int)) —
+# and carries the one-field-wrapper / constructor facts as obligations for
+# the env-level verifier (the payload-layout knowledge lives above this
+# layer). Generic nominals without a named constructor produce nothing.
+def rc_mismatch_candidates(expected: String, actual: String) -> Vec[RepairCandidate]
+  var out = Vec::new()
+  let exp_head = rc_type_head(expected)
+  if exp_head == "Money" && actual == "Int" then
+    out.push(RepairCandidate {
+      kind: RepairKind::ConstructVia("Money::from_minor"),
+      semantic_preconditions: Vec::from([
+        rc_ob("OneFieldWrapper", expected.clone()),
+        rc_ob("ConstructorExists", "Money::from_minor(minor: Int)")
+      ]),
+      affected_symbols: Vec::from([rc_stable_symbol(expected.clone(), "type")]),
+      expected_delta: rc_delta_plain()
+    })
+    var impl_key = "From<Int> for " + expected
+    out.push(RepairCandidate {
+      kind: RepairKind::ResolveIntoImpl(impl_key.clone()),
+      semantic_preconditions: Vec::from([rc_ob("IntoImplResolves", impl_key.clone())]),
+      affected_symbols: Vec::from([rc_stable_symbol(expected.clone(), "type")]),
+      expected_delta: rc_delta_new_impls(Vec::from([impl_key]))
+    })
+  end
+  out
+end
+
+# ———— Trait-resolution-gap candidates (Clone/Copy/bound failure classes) ————
+
+# The failing obligations of the diagnostic: the (trait, subject) pairs the
+# constraint chain's leaf rows name ("no registered impl of `T` for `L`"),
+# the root row ("the `T` obligation on `R` fails through ..."), and the
+# receiver-side trait of the trait_trace candidate rows ("the receiver does
+# not satisfy the impl bound `P: T`"). Copy is a structural marker and is
+# never suggested as an impl; generic-parameter leaves (rows that carry no
+# concrete type) and foreign (::-qualified) types are skipped.
+def rc_trait_candidates(constraint_rows: Vec[String], trait_rows: Vec[String], primary: String) -> Vec[RepairCandidate]
+  var out = Vec::new()
+  var seen: Vec[String] = Vec::new()
+  var root_trait = ""
+  var root_ty = ""
+  let root_marker = " obligation on `"
+  for row in constraint_rows do
+    if rc_index_of(row, root_marker, 0) >= 0 then
+      if rc_index_of(row, "fails through the nested field chain", 0) >= 0 then
+        let oi = rc_index_of(row, root_marker, 0)
+        if oi > 4 then
+          root_trait = row.slice(4, oi)
+          root_ty = rc_tick_after_open(row, root_marker, 0)
+        end
+      end
+    elsif rc_index_of(row, "no registered impl of `", 0) >= 0 then
+      let leaf_trait = rc_tick_after_open(row, "no registered impl of `", 0)
+      let leaf_ty = rc_tick_after(row, " for ", 0)
+      if leaf_trait != "Copy" && leaf_ty != "" then
+        var key = leaf_trait + " for " + leaf_ty
+        if !seen.contains(&key) then
+          seen.push(key.clone())
+          out.push(RepairCandidate {
+            kind: RepairKind::ResolveIntoImpl(key.clone()),
+            semantic_preconditions: Vec::from([rc_ob("LocalNominal", leaf_ty.clone())]),
+            affected_symbols: Vec::from([rc_stable_symbol(leaf_ty.clone(), "type")]),
+            expected_delta: rc_delta_new_impls(Vec::from([key]))
+          })
+        end
+      end
+    end
+  end
+  for row in trait_rows do
+    if row.starts_with("candidate impl `") then
+      if rc_index_of(row, "does not satisfy the impl bound `", 0) >= 0 then
+        let bound = rc_tick_after_open(row, "does not satisfy the impl bound `", 0)
+        if bound != "" then
+          let sep = rc_index_of(bound, ": ", 0)
+          var bound_trait = bound
+          if sep >= 0 then
+            bound_trait = bound.slice(sep + 2, bound.len())
+          end
+          if bound_trait != "Copy" && primary != "" then
+            if rc_index_of(primary, "::", 0) < 0 then
+              var key = bound_trait + " for " + primary
+              if !seen.contains(&key) then
+                seen.push(key.clone())
+                out.push(RepairCandidate {
+                  kind: RepairKind::ResolveIntoImpl(key.clone()),
+                  semantic_preconditions: Vec::from([rc_ob("LocalNominal", primary.clone())]),
+                  affected_symbols: Vec::from([rc_stable_symbol(primary.clone(), "type")]),
+                  expected_delta: rc_delta_new_impls(Vec::from([key]))
+                })
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+  if root_trait != "" && root_trait != "Copy" && root_ty != "" then
+    if rc_index_of(root_ty, "::", 0) < 0 then
+      var any_leaf_for_root = false
+      for k in seen do
+        if k.starts_with(root_trait.clone() + " for ") then
+          any_leaf_for_root = true
+        end
+      end
+      if !any_leaf_for_root then
+        var key2 = root_trait + " for " + root_ty
+        if !seen.contains(&key2) then
+          seen.push(key2.clone())
+          out.push(RepairCandidate {
+            kind: RepairKind::ResolveIntoImpl(key2.clone()),
+            semantic_preconditions: Vec::from([rc_ob("LocalNominal", root_ty.clone())]),
+            affected_symbols: Vec::from([rc_stable_symbol(root_ty.clone(), "type")]),
+            expected_delta: rc_delta_new_impls(Vec::from([key2]))
+          })
+        end
+      end
+    end
+  end
+  out
+end
+
+# ———— Effect/contract candidates (the E0232 effect_trace rows) ————
+
+def rc_is_foreign_name(name: String) -> Bool
+  name.starts_with("std::") || name.starts_with("core::") || name.starts_with("builtin::")
+end
+
+# The E0232 class: remove the forbidding annotation, and — when the
+# evidence path names an evidence leaf that is not a foreign fn — remove the
+# violating call at that leaf.
+def rc_effect_candidates(effect_rows: Vec[String]) -> Vec[RepairCandidate]
+  var out = Vec::new()
+  var annotation = ""
+  var subject = ""
+  var hop_to = ""
+  var chain_into = ""
+  var row_no = 0
+  for row in effect_rows do
+    if row_no == 0 then
+      if row.starts_with("@") then
+        if rc_index_of(row, " forbids ", 0) >= 0 then
+          let at = rc_char_index(row, " ", 0)
+          if at > 1 then
+            annotation = row.slice(1, at)
+          end
+          if rc_index_of(row, " function `", 0) >= 0 then
+            subject = rc_tick_after_open(row, " function `", 0)
+          elsif rc_index_of(row, " handler `", 0) >= 0 then
+            subject = rc_tick_after_open(row, " handler `", 0)
+          end
+        end
+      end
+    else
+      if rc_index_of(row, " -> ", 0) >= 0 then
+        hop_to = rc_tick_after(row, " -> ", 0)
+      end
+      if rc_index_of(row, "through a call chain into `", 0) >= 0 then
+        chain_into = rc_tick_after_open(row, "through a call chain into `", 0)
+      end
+    end
+    row_no = row_no + 1
+  end
+  if annotation == "" then
+    return out
+  end
+  out.push(RepairCandidate {
+    kind: RepairKind::RemoveEffectAnnotation(annotation.clone()),
+    semantic_preconditions: Vec::new(),
+    affected_symbols: Vec::from([rc_stable_symbol(subject.clone(), "fn")]),
+    expected_delta: rc_delta_annotations(Vec::from(["@" + annotation]))
+  })
+  var leaf = hop_to
+  if leaf == "" then
+    leaf = chain_into
+  end
+  if leaf != "" && leaf != subject then
+    if !rc_is_foreign_name(leaf) then
+      out.push(RepairCandidate {
+        kind: RepairKind::RemoveViolatingCall(leaf.clone()),
+        semantic_preconditions: Vec::from([rc_ob("LocalCallee", leaf.clone())]),
+        affected_symbols: Vec::from([
+          rc_stable_symbol(subject.clone(), "fn"),
+          rc_stable_symbol(leaf.clone(), "fn")
+        ]),
+        expected_delta: rc_delta_plain()
+      })
+    end
+  end
+  out
+end
+
+# ———————————————————————————————————————————————————————————————
+# THE RULES ENGINE
+# ———————————————————————————————————————————————————————————————
+# One Diagnostic in, the deterministic candidate list out. The classes run
+# in the audit order; each rule reads only its own derivational field, so
+# the result is a pure function of the diagnostic.
+
+pub def candidate_of_diagnostic(diag: Diagnostic) -> Vec[RepairCandidate]
+  var out = Vec::new()
+  var primary = ""
+  match diag.primary_symbol
+  when Option::Some(p) then primary = p.clone()
+  when Option::None then ()
+  end
+
+  # 1. Ownership class (use-after-move / convention errors). Capability
+  #    diagnostics (linear values) are excluded — not an audit §35 class.
+  if rc_index_of(diag.message.clone(), "capability", 0) < 0 then
+    let facts = rc_ownership_scan(diag.ownership_trace, diag.message.clone())
+    let pass_class = facts.category != "none" && facts.category != "uninit" &&
+      facts.category != "conditional" && facts.category != "loop" &&
+      facts.category != "finalizer" && facts.category != "partial-whole"
+    if pass_class then
+      let own_cands = rc_ownership_candidates(facts, primary.clone())
+      for c in own_cands do
+        out.push(c)
+      end
+    end
+  end
+
+  # 2. Expected-vs-actual mismatch class (the audit's money/int instance).
+  match diag.expected_type
+  when Option::Some(exp) then
+    match diag.actual_type
+    when Option::Some(act) then
+      let mm_cands = rc_mismatch_candidates(exp, act)
+      for c in mm_cands do
+        out.push(c)
+      end
+    when Option::None then ()
+    end
+  when Option::None then ()
+  end
+
+  # 3. Trait-resolution-gap class (Clone/Copy/bound failures).
+  if diag.constraint_trace.len() > 0 || diag.trait_trace.len() > 0 then
+    let tr_cands = rc_trait_candidates(diag.constraint_trace, diag.trait_trace, primary.clone())
+    for c in tr_cands do
+      out.push(c)
+    end
+  end
+
+  # 4. Effect/contract class (E0232 rows).
+  if diag.effect_trace.len() > 0 then
+    let ef_cands = rc_effect_candidates(diag.effect_trace)
+    for c in ef_cands do
+      out.push(c)
+    end
+  end
+
+  out
+end
+
+# ———————————————————————————————————————————————————————————————
+# Canonical text renders (the Diagnostic.repair_candidates Vec[String]
+# channel's structured parallel; deterministic line per candidate)
+# ———————————————————————————————————————————————————————————————
+
+def rc_kind_text(kind: RepairKind) -> String
+  match kind
+  when RepairKind::MoveUseLater then "MoveUseLater"
+  when RepairKind::CloneBeforeMove then "CloneBeforeMove"
+  when RepairKind::ChangeParamConvention(f, t) then "ChangeParamConvention(" + f + " -> " + t + ")"
+  when RepairKind::ConstructVia(k) then "ConstructVia(" + k + ")"
+  when RepairKind::ResolveIntoImpl(key) then "ResolveIntoImpl(" + key + ")"
+  when RepairKind::MakeFieldExplicit(nm) then "MakeFieldExplicit(" + nm + ")"
+  when RepairKind::RemoveEffectAnnotation(ann) then "RemoveEffectAnnotation(@" + ann + ")"
+  when RepairKind::RemoveViolatingCall(callee) then "RemoveViolatingCall(" + callee + ")"
+  end
+end
+
+def rc_symbol_text(s: StableSymbolId) -> String
+  s.key.clone()
+end
+
+def rc_obligations_text(pre: Vec[Obligation]) -> String
+  if pre.len() == 0 then
+    return ""
+  end
+  var parts = Vec::new()
+  for o in pre do
+    var part = o.kind.clone() + ":" + o.type_text.clone() + ":"
+    if o.ok then
+      part = part + "true"
+    else
+      part = part + "false"
+    end
+    parts.push(part)
+  end
+  parts.join(";")
+end
+
+def rc_delta_text(d: SemanticDeltaConstraint) -> String
+  var out = "sig:" + rc_bool_text(d.allows_signature_change)
+  if d.allows_new_impls.len() > 0 then
+    out = out + ";impls:[" + d.allows_new_impls.join(",") + "]"
+  end
+  if d.allows_annotation_changes.len() > 0 then
+    out = out + ";anns:[" + d.allows_annotation_changes.join(",") + "]"
+  end
+  out
+end
+
+# One canonical line per candidate (kind; preconditions; affected symbols;
+# expected-delta envelope).
+pub def repair_candidate_rows(cands: Vec[RepairCandidate]) -> Vec[String]
+  var rows = Vec::new()
+  for c in cands do
+    var syms = Vec::new()
+    for s in c.affected_symbols do
+      syms.push(rc_symbol_text(s))
+    end
+    var line = "kind=" + rc_kind_text(c.kind)
+    let pre = rc_obligations_text(c.semantic_preconditions)
+    if pre != "" then
+      line = line + ";pre={" + pre + "}"
+    end
+    if syms.len() > 0 then
+      line = line + ";symbols=[" + syms.join(",") + "]"
+    end
+    line = line + ";delta={" + rc_delta_text(c.expected_delta) + "}"
+    rows.push(line)
+  end
+  rows
+end

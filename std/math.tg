@@ -1,8 +1,11 @@
 ## std::math — Mathematics library
 ## Provides trigonometric, logarithmic, exponential, rounding, and special functions,
 ## plus arbitrary-precision BigInt and BigDecimal types and the heap-free
-## fixed-point Fixed64/Fixed128 types (explicit rounding modes) for
-## finance/engineering.
+## fixed-point Fixed64/Fixed128 types (explicit rounding modes) and their
+## const-scale siblings Decimal64[SCALE] / Decimal128[SCALE] and the
+## phantom-dimension Money[Currency, Scale] / Price[Currency, Unit, Scale]
+## / Quantity[Unit, Scale] / Rate[RateUnit, Scale] const-scale decimal
+## types for finance/engineering (audit §23).
 ## Spec: §stdlib.math
 
 module std::math
@@ -864,6 +867,1210 @@ impl FixedError
     when FixedError::Overflow then SmallErrorCode::Overflow
     when FixedError::NotIntegral then SmallErrorCode::InvalidInput
     end
+  end
+end
+
+# ─── Decimal64 — const-scale 64-bit fixed-point decimal ──────────────
+
+## Decimal64[SCALE] is the const-scale sibling of Fixed64: the scale is a
+## COMPILE-TIME type parameter (a const generic over Int) instead of a
+## runtime field, so the struct carries only the signed unscaled word.
+## Every value of the type has exactly SCALE digits after the point, two
+## values of one instance are always aligned (add/sub need no runtime
+## scale checks and no rescale alignment), and a signature states its own
+## precision: Decimal64[2] and Decimal64[4] are distinct types, and
+## rescale[T] is the checked, explicitly-rounded bridge between
+## instances.  The unscaled word is a plain 64-bit two's-complement Int,
+## exactly as Fixed64's; magnitudes beyond 2^63 are not representable and
+## word overflow is an error result (FixedError::Overflow), never a
+## silent wrap — with the one documented exception of negating Int::MIN,
+## which wraps in two's complement (mirroring Fixed64::negate).
+pub struct Decimal64[const SCALE: Int]
+  ## Signed unscaled significand: the value is unscaled * 10^-SCALE.
+  unscaled: Int
+end
+
+impl[const SCALE: Int] Decimal64[SCALE]
+  ## The value zero at the type's const scale (0.00 for Decimal64[2]).
+  ## Unlike Fixed64::zero — which picks scale 0 — the zero of an
+  ## instance carries that instance's scale, because the scale IS the
+  ## type: an additive identity of Decimal64[SCALE] must be a
+  ## Decimal64[SCALE] value.
+  pub def zero() -> Decimal64[SCALE]
+    Decimal64[SCALE] { unscaled: 0 }
+  end
+
+  ## The integer `value` at scale zero — the Decimal64[0] instance
+  ## (Fixed64::from_int's scale-0 shape, made explicit in the type).
+  pub def from_int(value: Int) -> Decimal64[0]
+    Decimal64[0] { unscaled: value }
+  end
+
+  ## Construct directly from the unscaled digits.  The scale has no
+  ## runtime argument (unlike Fixed64::from_parts): it is the type
+  ## parameter, so a Decimal64[2] built with unscaled digits 12345 IS
+  ## 123.45 by construction.  The constructor is infallible — every Int
+  ## word is a valid unscaled digit string at any scale, mirroring
+  ## Fixed64::from_parts' unchecked shape (word overflow is a property
+  ## of arithmetic, parsing and rescale, not of raw construction).
+  pub def from_parts(unscaled: Int) -> Decimal64[SCALE]
+    Decimal64[SCALE] { unscaled: unscaled }
+  end
+
+  ## Parse a decimal literal exactly — the value must be representable
+  ## with the exact unscaled digits at the type's const scale SCALE.
+  ## Parsing never rounds, mirroring Fixed64::from_string's discipline:
+  ## a scale-up (more fraction digits demanded, e.g. "1.5" into
+  ## Decimal64[2]) pads exactly and reports Err when the scaled word
+  ## overflows; a scale-down divides the parsed digits exactly and
+  ## reports Err when the value has no exact unscaled spelling at SCALE
+  ## (e.g. "1.005" into Decimal64[2]).  Out-of-range words report Err.
+  pub def from_string(s: String) -> Result[Decimal64[SCALE], String]
+    let parsed = _fx_parse(s)?
+    var mag = parsed.mag
+    if parsed.scale != SCALE then
+      if parsed.scale < SCALE then
+        # Scale-up: exact when the scaled digits fit the word; the
+        # u128 probe reports the overflow (the digits are then far
+        # beyond the 2^63 word in every case).
+        match _fx_mul_pow10(mag, SCALE - parsed.scale)
+        when Ok(v) then mag = v
+        when Err(_) then return Err("out of range")
+        end
+      elsif mag != 0 then
+        # Scale-down: divide by the exact power of ten — a nonzero
+        # remainder means the value is not representable without
+        # rounding, which from_string never does.  A power beyond the
+        # u128 divisor probe (k >= 39) exceeds every parsed magnitude,
+        # so the probe's Err is the not-exact result too.
+        let p = match _fx_mul_pow10(1, parsed.scale - SCALE)
+          when Ok(v) then v
+          when Err(_) then return Err("not exactly representable at scale " + SCALE.to_string())
+          end
+        let r = mag % p
+        if r != 0 then return Err("not exactly representable at scale " + SCALE.to_string()) end
+        mag = mag / p
+      end
+    end
+    # P1-5: the negative word is spelled on the unsigned 64-bit view —
+    # mag == 2^63 is exactly MIN (representable) and the trapping
+    # default must never fire on the negation (mirror of the Fixed64
+    # from_string tail, with the scale fixed by the type).
+    let lim = ((~(0 as u64)) >> 1) as u128
+    if mag > lim + 1 then return Err("out of range") end
+    if !parsed.neg && mag > lim then return Err("out of range") end
+    var unscaled: Int = if mag == 0 then 0 else (if parsed.neg then ((0 as u64) - (mag as u64)) as Int else (mag as Int) end) end
+    Ok(Decimal64[SCALE] { unscaled: unscaled })
+  end
+
+  ## The type's const scale read as a runtime value — the compile-time
+  ## SCALE parameter of the instance (every Decimal64[S] reports S).
+  ## Fixed64::scale reads a runtime field; Decimal64's scale is its
+  ## type, so the accessor is the const-parameter value read.
+  pub def scale(self) -> Int
+    SCALE
+  end
+
+  pub def unscaled(self) -> Int
+    self.unscaled
+  end
+
+  ## Add.  The operands share the instance's const scale SCALE by
+  ## construction, so no runtime alignment is ever needed — the fixed
+  ## word is added and the result stays at scale SCALE.  Word overflow
+  ## is an error result, detected with the two's-complement SIGN rules
+  ## on the wrapping unsigned 64-bit view (the Fixed64 idiom): Int
+  ## arithmetic traps on overflow (P1-5), so no signed operation
+  ## appears in the body.
+  pub def add(self, other: Decimal64[SCALE]) -> Result[Decimal64[SCALE], FixedError]
+    let a = self.unscaled as u64
+    let b = other.unscaled as u64
+    let s = a + b
+    let lim = (~(0 as u64)) >> 1
+    let a_neg = a > lim
+    let b_neg = b > lim
+    let s_neg = s > lim
+    if (a_neg && b_neg && !s_neg) || (!a_neg && !b_neg && s_neg) then
+      return Err(FixedError::Overflow)
+    end
+    Ok(Decimal64[SCALE] { unscaled: s as Int })
+  end
+
+  ## Subtract.  Same-scale by construction, exactly as add(); word
+  ## overflow (the result falls below Int::MIN or above Int::MAX) is an
+  ## error result via the same two's-complement sign rules on the
+  ## wrapping unsigned view — no trapping signed operation in the body.
+  pub def sub(self, other: Decimal64[SCALE]) -> Result[Decimal64[SCALE], FixedError]
+    let a = self.unscaled as u64
+    let b = other.unscaled as u64
+    let r = a - b
+    let lim = (~(0 as u64)) >> 1
+    let a_neg = a > lim
+    let b_neg = b > lim
+    let r_neg = r > lim
+    if (!a_neg && b_neg && r_neg) || (a_neg && !b_neg && !r_neg) then
+      return Err(FixedError::Overflow)
+    end
+    Ok(Decimal64[SCALE] { unscaled: r as Int })
+  end
+
+  ## Negate.  The magnitude of the minimum word is not representable, so
+  ## negating it wraps (kernel two's-complement semantics).  P1-5: the
+  ## wrap is the explicit unsigned 64-bit view — the trapping default
+  ## never fires on the documented wrap (mirror of Fixed64::negate; the
+  ## scale is unchanged because it is the type).
+  pub def negate(self) -> Decimal64[SCALE]
+    Decimal64[SCALE] { unscaled: ((0 as u64) - (self.unscaled as u64)) as Int }
+  end
+
+  pub def abs(self) -> Decimal64[SCALE]
+    if self.unscaled < 0 then self.negate() else self end
+  end
+
+  ## Numerically compare.  Both values share the const scale SCALE, so
+  ## the word order IS the numeric order — Fixed64's compare needs a
+  ## scale-independent core because its scale is a runtime field; here
+  ## the scale is the type and no alignment branch exists.  Returns -1,
+  ## 0 or 1, and every other comparison/equality of the type derives
+  ## from it (numeric-canonical: two values are equal exactly when their
+  ## unscaled words are equal, so 1.50 can never differ from 1.5 — they
+  ## are the same type instance).
+  pub def compare(self, other: Decimal64[SCALE]) -> Int
+    if self.unscaled < other.unscaled then return -1 end
+    if self.unscaled > other.unscaled then return 1 end
+    0
+  end
+
+  ## Format with exactly SCALE fraction digits ("-12.50", "1234.56"),
+  ## mirroring Fixed64::to_string with the const SCALE read as a value
+  ## (a negative SCALE appends 10^-SCALE zeroes, scale 0 prints the
+  ## bare digits).
+  pub def to_string(self) -> String
+    let neg = self.unscaled < 0
+    let s = _fx_digits(_fx_mag64(self.unscaled))
+    if SCALE == 0 then
+      return if neg then "-" + s else s end
+    end
+    if SCALE < 0 then
+      var out = if neg then "-" + s else s end
+      var z = 0 - SCALE
+      while z > 0 do
+        out.push_str("0")
+        z = z - 1
+      end
+      return out
+    end
+    let pad_len = SCALE - (s.len() as Int) + 1
+    var padded = ""
+    if pad_len > 0 then
+      var z = pad_len
+      while z > 0 do
+        padded.push_str("0")
+        z = z - 1
+      end
+    end
+    padded.push_str(s)
+    let dot_pos = padded.len() - (SCALE as UInt)
+    let sign = if neg then "-" else "" end
+    sign + padded.substring(0, dot_pos as Int) + "." + padded.substring(dot_pos as Int, padded.len() as Int)
+  end
+
+  ## Re-express the value at the const scale T, rounding explicitly with
+  ## `rounding` when the scale decreases.  Scaling up (T > SCALE) is
+  ## exact and overflows when the word cannot hold the scaled
+  ## significand.  This is Fixed64::rescale's down/up machinery fed with
+  ## the two compile-time scales read as VALUES in the body — the same
+  ## const-parameter value reads the §20 wave enables — so the shared
+  ## _fx_div_shift/_fx_bump/_fx_mul_pow10 helpers are reused verbatim;
+  ## only the make step (the Int-word bounds of _fx_make64 applied
+  ## inline, since the target word type is Decimal64[T] here) differs
+  ## from the Fixed64 original.
+  pub def rescale[const T: Int](self, rounding: RoundingMode) -> Result[Decimal64[T], FixedError]
+    if T == SCALE then
+      return Ok(Decimal64[T] { unscaled: self.unscaled })
+    end
+    let diff = T - SCALE
+    let ma = _fx_mag64(self.unscaled)
+    if diff < 0 then
+      let out = _fx_div_shift(ma, 1, 0 - diff)?
+      let neg = self.unscaled < 0
+      let bump = _fx_bump(out.rmag, out.divisor, out.mag, neg, out.huge, rounding)
+      let qmag = if bump then out.mag + 1 else out.mag end
+      # Magnitude -> Decimal64[T] word: the _fx_make64 discipline — the
+      # negative limit (2^63) is representable as MIN, and the positive
+      # word stops at MAX.  P1-5: the negative word is spelled on the
+      # unsigned 64-bit view, so the trapping default never fires.
+      let lim_neg = (((~(0 as u64)) >> 1) as u128) + 1
+      if qmag > lim_neg then return Err(FixedError::Overflow) end
+      if !neg && qmag == lim_neg then return Err(FixedError::Overflow) end
+      var unscaled: Int = if qmag == 0 then 0 else (if neg then ((0 as u64) - (qmag as u64)) as Int else (qmag as Int) end) end
+      return Ok(Decimal64[T] { unscaled: unscaled })
+    end
+    if ma == 0 then return Ok(Decimal64[T] { unscaled: 0 }) end
+    let scaled = _fx_mul_pow10(ma, diff)?
+    let neg = self.unscaled < 0
+    let lim_neg = (((~(0 as u64)) >> 1) as u128) + 1
+    if scaled > lim_neg then return Err(FixedError::Overflow) end
+    if !neg && scaled == lim_neg then return Err(FixedError::Overflow) end
+    var unscaled: Int = if scaled == 0 then 0 else (if neg then ((0 as u64) - (scaled as u64)) as Int else (scaled as Int) end) end
+    Ok(Decimal64[T] { unscaled: unscaled })
+  end
+end
+
+# ─── Decimal128 — const-scale 128-bit fixed-point decimal ────────────
+
+## Decimal128[SCALE] is the 128-bit-word sibling of Decimal64[SCALE]
+## (audit §23): the const scale is a COMPILE-TIME type parameter, the
+## struct carries only the signed unscaled 128-bit word, and every value
+## of the instance has exactly SCALE digits after the point.  The word is
+## an i128 exactly as Fixed128's (magnitudes beyond 2^127 are not
+## representable; overflow is FixedError::Overflow, never a silent wrap —
+## with the one documented exception of negating the minimum word, which
+## wraps in two's complement, mirroring Fixed128::negate).  The i128
+## operations below are the file's Fixed128 conventions: the wide i128
+## domain does not trap on overflow (P1-5's trapping default targets the
+## host Int/UInt words), so word overflow is detected by the explicit
+## two's-complement SIGN rules after the operation, never by relying on a
+## trap.
+pub struct Decimal128[const SCALE: Int]
+  ## Signed unscaled significand: the value is unscaled * 10^-SCALE.
+  unscaled: i128
+end
+
+impl[const SCALE: Int] Decimal128[SCALE]
+  ## The value zero at the type's const scale (0.000000 for
+  ## Decimal128[6]); the additive identity of the instance.
+  pub def zero() -> Decimal128[SCALE]
+    Decimal128[SCALE] { unscaled: 0 }
+  end
+
+  ## The integer `value` at scale zero — the Decimal128[0] instance
+  ## (Fixed128::from_int's scale-0 shape, made explicit in the type).
+  pub def from_int(value: Int) -> Decimal128[0]
+    Decimal128[0] { unscaled: value as i128 }
+  end
+
+  ## Construct directly from the unscaled digits; the scale is the type
+  ## parameter, so a Decimal128[2] built with unscaled digits 12345 IS
+  ## 123.45 by construction.  Infallible — every i128 word is a valid
+  ## unscaled digit string at any scale (mirror of Decimal64::from_parts;
+  ## the word is 128-bit so from_int's Int argument does not reach it).
+  pub def from_parts(unscaled: i128) -> Decimal128[SCALE]
+    Decimal128[SCALE] { unscaled: unscaled }
+  end
+
+  ## Parse a decimal literal exactly — the value must be representable
+  ## with the exact unscaled digits at the type's const scale SCALE.
+  ## Parsing never rounds (mirror of Decimal64::from_string with the
+  ## i128 word): a scale-up pads exactly and reports Err on word
+  ## overflow; a scale-down divides the parsed digits exactly and reports
+  ## Err when the value has no exact unscaled spelling at SCALE.
+  ## Out-of-range words report Err; mag == 2^127 is exactly i128::MIN
+  ## (representable only with a negative sign).
+  pub def from_string(s: String) -> Result[Decimal128[SCALE], String]
+    let parsed = _fx_parse(s)?
+    var mag = parsed.mag
+    if parsed.scale != SCALE then
+      if parsed.scale < SCALE then
+        # Scale-up: exact when the scaled digits fit the u128 probe (the
+        # word check below applies the 2^127 bound).
+        match _fx_mul_pow10(mag, SCALE - parsed.scale)
+        when Ok(v) then mag = v
+        when Err(_) then return Err("out of range")
+        end
+      elsif mag != 0 then
+        # Scale-down: divide by the exact power of ten — a nonzero
+        # remainder means the value is not representable without
+        # rounding, which from_string never does.
+        let p = match _fx_mul_pow10(1, parsed.scale - SCALE)
+          when Ok(v) then v
+          when Err(_) then return Err("not exactly representable at scale " + SCALE.to_string())
+          end
+        let r = mag % p
+        if r != 0 then return Err("not exactly representable at scale " + SCALE.to_string()) end
+        mag = mag / p
+      end
+    end
+    # The negative word is spelled on the unsigned 128-bit view — mag ==
+    # 2^127 is exactly MIN (representable); the wide i128 negation wraps
+    # (Fixed128::from_string's tail verbatim, with the scale fixed by the
+    # type).
+    let lim = ((~(0 as u128)) >> 1)
+    if mag > lim + 1 then return Err("out of range") end
+    if !parsed.neg && mag > lim then return Err("out of range") end
+    var unscaled: i128 = if mag == 0 then 0 else (if parsed.neg then 0 - (mag as i128) else (mag as i128) end) end
+    Ok(Decimal128[SCALE] { unscaled: unscaled })
+  end
+
+  ## The type's const scale read as a runtime value — the compile-time
+  ## SCALE parameter of the instance.
+  pub def scale(self) -> Int
+    SCALE
+  end
+
+  pub def unscaled(self) -> i128
+    self.unscaled
+  end
+
+  ## Add.  The operands share the instance's const scale SCALE by
+  ## construction, so no runtime alignment is ever needed.  Word overflow
+  ## is an error result, detected with the two's-complement SIGN rules on
+  ## the wrapping wide i128 view (the Fixed128 idiom — i128 arithmetic
+  ## wraps, so no operation in the body can trap).
+  pub def add(self, other: Decimal128[SCALE]) -> Result[Decimal128[SCALE], FixedError]
+    let a = self.unscaled
+    let b = other.unscaled
+    let s = a + b
+    if a >= 0 && b >= 0 && s < 0 then
+      return Err(FixedError::Overflow)
+    end
+    if a < 0 && b < 0 && s >= 0 then
+      return Err(FixedError::Overflow)
+    end
+    Ok(Decimal128[SCALE] { unscaled: s })
+  end
+
+  ## Subtract.  Same-scale by construction, exactly as add(); word
+  ## overflow is an error result via the same two's-complement sign rules
+  ## on the wrapping i128 view.
+  pub def sub(self, other: Decimal128[SCALE]) -> Result[Decimal128[SCALE], FixedError]
+    let a = self.unscaled
+    let b = other.unscaled
+    let d = a - b
+    if a >= 0 && b < 0 && d < 0 then
+      return Err(FixedError::Overflow)
+    end
+    if a < 0 && b >= 0 && d >= 0 then
+      return Err(FixedError::Overflow)
+    end
+    Ok(Decimal128[SCALE] { unscaled: d })
+  end
+
+  ## Negate.  The magnitude of the minimum word is not representable, so
+  ## negating it wraps in two's complement (Fixed128::negate's
+  ## documented wrap; the scale is unchanged because it is the type).
+  pub def negate(self) -> Decimal128[SCALE]
+    Decimal128[SCALE] { unscaled: 0 - self.unscaled }
+  end
+
+  pub def abs(self) -> Decimal128[SCALE]
+    if self.unscaled < 0 then self.negate() else self end
+  end
+
+  ## Two's-complement wrapping add of the UNSCALED words (mod 2^128),
+  ## result at the instance scale — the Decimal128 word-level sibling of
+  ## Fixed128::wrapping_add (the scale is the type, so the equal-scales
+  ## precondition of the runtime type is a construction property here).
+  pub def wrapping_add(self, other: Decimal128[SCALE]) -> Decimal128[SCALE]
+    let unscaled = ((self.unscaled as u128) + (other.unscaled as u128)) as i128
+    Decimal128[SCALE] { unscaled: unscaled }
+  end
+
+  ## Two's-complement wrapping subtract of the UNSCALED words (mod 2^128).
+  pub def wrapping_sub(self, other: Decimal128[SCALE]) -> Decimal128[SCALE]
+    let unscaled = ((self.unscaled as u128) - (other.unscaled as u128)) as i128
+    Decimal128[SCALE] { unscaled: unscaled }
+  end
+
+  ## Saturating add at the instance scale: an overflowing word clamps to
+  ## i128::MAX (positive overflow) or i128::MIN (negative overflow).
+  ## Overflow is detected by the two's-complement sign rules on the
+  ## wrapping u128 view — no trapping operation in the body (the Fixed128
+  ## idiom).
+  pub def saturating_add(self, other: Decimal128[SCALE]) -> Decimal128[SCALE]
+    let a = self.unscaled as u128
+    let b = other.unscaled as u128
+    let s = a + b
+    let lim = (~(0 as u128)) >> 1
+    let a_neg = a > lim
+    let b_neg = b > lim
+    let s_neg = s > lim
+    if (a_neg && b_neg && !s_neg) || (!a_neg && !b_neg && s_neg) then
+      let unscaled: i128 = if a_neg then (lim + 1) as i128 else lim as i128 end
+      return Decimal128[SCALE] { unscaled: unscaled }
+    end
+    Decimal128[SCALE] { unscaled: s as i128 }
+  end
+
+  ## Saturating subtract at the instance scale: an overflowing word
+  ## clamps to i128::MAX (overflow upward) or i128::MIN (overflow
+  ## downward), following self's sign.  Sign-rule detection on the
+  ## wrapping u128 view — no trapping operation.
+  pub def saturating_sub(self, other: Decimal128[SCALE]) -> Decimal128[SCALE]
+    let a = self.unscaled as u128
+    let b = other.unscaled as u128
+    let r = a - b
+    let lim = (~(0 as u128)) >> 1
+    let a_neg = a > lim
+    let b_neg = b > lim
+    let r_neg = r > lim
+    if (!a_neg && b_neg && r_neg) || (a_neg && !b_neg && !r_neg) then
+      let unscaled: i128 = if a_neg then (lim + 1) as i128 else lim as i128 end
+      return Decimal128[SCALE] { unscaled: unscaled }
+    end
+    Decimal128[SCALE] { unscaled: r as i128 }
+  end
+
+  ## Numerically compare.  Both values share the const scale SCALE, so
+  ## the word order IS the numeric order (mirror of Decimal64::compare;
+  ## returns -1, 0 or 1).
+  pub def compare(self, other: Decimal128[SCALE]) -> Int
+    if self.unscaled < other.unscaled then return -1 end
+    if self.unscaled > other.unscaled then return 1 end
+    0
+  end
+
+  ## Format with exactly SCALE fraction digits, mirroring
+  ## Decimal64::to_string with the const SCALE read as a value and the
+  ## i128 magnitude fed to the shared digit machinery.
+  pub def to_string(self) -> String
+    let neg = self.unscaled < 0
+    let s = _fx_digits(_fx_mag128(self.unscaled))
+    if SCALE == 0 then
+      return if neg then "-" + s else s end
+    end
+    if SCALE < 0 then
+      var out = if neg then "-" + s else s end
+      var z = 0 - SCALE
+      while z > 0 do
+        out.push_str("0")
+        z = z - 1
+      end
+      return out
+    end
+    let pad_len = SCALE - (s.len() as Int) + 1
+    var padded = ""
+    if pad_len > 0 then
+      var z = pad_len
+      while z > 0 do
+        padded.push_str("0")
+        z = z - 1
+      end
+    end
+    padded.push_str(s)
+    let dot_pos = padded.len() - (SCALE as UInt)
+    let sign = if neg then "-" else "" end
+    sign + padded.substring(0, dot_pos as Int) + "." + padded.substring(dot_pos as Int, padded.len() as Int)
+  end
+
+  ## Re-express the value at the const scale T, rounding explicitly with
+  ## `rounding` when the scale decreases.  Scaling up (T > SCALE) is
+  ## exact and overflows when the word cannot hold the scaled
+  ## significand.  This is Decimal64::rescale's down/up machinery fed
+  ## with the i128 magnitude: the shared _fx_div_shift/_fx_bump/
+  ## _fx_mul_pow10 helpers handle the division (their u128 magnitude
+  ## domain covers the i128 word), and only the make step (the 2^127
+  ## word bounds, applied inline since the target word type is
+  ## Decimal128[T]) differs from the Fixed128 original.
+  pub def rescale[const T: Int](self, rounding: RoundingMode) -> Result[Decimal128[T], FixedError]
+    if T == SCALE then
+      return Ok(Decimal128[T] { unscaled: self.unscaled })
+    end
+    let diff = T - SCALE
+    let ma = _fx_mag128(self.unscaled)
+    if diff < 0 then
+      let out = _fx_div_shift(ma, 1, 0 - diff)?
+      let neg = self.unscaled < 0
+      let bump = _fx_bump(out.rmag, out.divisor, out.mag, neg, out.huge, rounding)
+      let qmag = if bump then out.mag + 1 else out.mag end
+      # Magnitude -> Decimal128[T] word: the 2^127 negative limit is
+      # representable as MIN, the positive word stops at 2^127 - 1; the
+      # wide i128 negation wraps on the MIN spelling (Fixed128::_fx_make128
+      # discipline).
+      match _fx_word128(neg, qmag)
+      when Ok(w) then return Ok(Decimal128[T] { unscaled: w })
+      when Err(e) then return Err(e)
+      end
+    end
+    if ma == 0 then return Ok(Decimal128[T] { unscaled: 0 }) end
+    let scaled = _fx_mul_pow10(ma, diff)?
+    let neg = self.unscaled < 0
+    match _fx_word128(neg, scaled)
+    when Ok(w) then Ok(Decimal128[T] { unscaled: w })
+    when Err(e) then Err(e)
+    end
+  end
+
+  ## Exact 256-bit product.  other is a Decimal128 at its own const scale
+  ## S2; the natural scale of the product is the type-level sum
+  ## SCALE + S2, and the product of the two magnitudes (each up to 2^127)
+  ## needs a full 256-bit image before the word bounds apply.  The result
+  ## unscaled (an i128 at scale SCALE + S2) equals the exact product
+  ## magnitude, which is representable exactly when |a * b| <= 2^127 — so
+  ## the checked form reports FixedError::Overflow when the magnitude
+  ## exceeds 2^127 (2^127 itself is representable only as the negative
+  ## MIN).  The 4-limb _fx256_* machinery computes the exact product and
+  ## the word extraction applies the 2^127 bound; nothing in the file's
+  ## u128 domain is ever asked to hold the intermediate.
+  pub def mul_exact[const S2: Int](self, other: Decimal128[S2]) -> Result[Decimal128[SCALE + S2], FixedError]
+    let ma = _fx_mag128(self.unscaled)
+    let mb = _fx_mag128(other.unscaled)
+    if ma == 0 || mb == 0 then
+      return Ok(Decimal128[SCALE + S2] { unscaled: 0 })
+    end
+    let mag = _fx256_mul(ma, mb)
+    let neg = (self.unscaled < 0) != (other.unscaled < 0)
+    match _fx256_word128(mag, neg)
+    when Ok(w) then Ok(Decimal128[SCALE + S2] { unscaled: w })
+    when Err(e) then Err(e)
+    end
+  end
+
+  ## Same-instance multiplication rounded to the const scale T (the
+  ## rounded sibling of mul_exact for two Decimal128[SCALE] operands:
+  ## the natural product scale is SCALE + SCALE, and mul_exact's S2 is
+  ## the receiver's own SCALE here).  The exact 256-bit product of the
+  ## two magnitudes is computed first, then re-expressed at scale T:
+  ##
+  ##   - T == SCALE + SCALE (k == 0): the product is exact — only the
+  ##     2^127 word bounds apply (this is mul_exact at the summed scale);
+  ##   - k = (SCALE + SCALE) - T > 0: drop k decimal digits — the 256-bit
+  ##     magnitude is divided by 10^k exactly, digit by digit, with the
+  ##     rounding decision taken from the discarded digit sequence
+  ##     (never by materializing 10^k, which exceeds u128 for k >= 39);
+  ##   - k < 0: append -k decimal digits — the 256-bit magnitude is
+  ##     multiplied by 10^(-k) with a per-step probe that reports
+  ##     FixedError::Overflow the moment a multiplication would cross the
+  ##     2^127 word bound.
+  ##
+  ## Rounding is the explicit RoundingMode table, applied to the exact
+  ## truncated quotient and remainder exactly as _fx_bump applies it to
+  ## the u128 division helpers (half comparisons against 10^k/2, the
+  ## parity of the truncated quotient for HalfEven).  The quotient must
+  ## then fit the i128 word (Err(FixedError::Overflow) otherwise); the
+  ## 256-bit intermediate itself never false-overflows, so results that
+  ## fit only after rounding (e.g. (2^120 - 1) * (2^120 - 1) rounded
+  ## down) are produced exactly.
+  pub def mul_to[const T: Int](self, other: Decimal128[SCALE], rounding: RoundingMode) -> Result[Decimal128[T], FixedError]
+    let ma = _fx_mag128(self.unscaled)
+    let mb = _fx_mag128(other.unscaled)
+    let neg = (self.unscaled < 0) != (other.unscaled < 0)
+    if ma == 0 || mb == 0 then
+      return Ok(Decimal128[T] { unscaled: 0 })
+    end
+    var mag = _fx256_mul(ma, mb)
+    let k = (SCALE + SCALE) - T
+    if k < 0 then
+      # Target scale larger than the natural product scale: multiply the
+      # 256-bit magnitude up by 10^(-k).  The magnitude only grows, so
+      # every intermediate must stay within the word bound; the probe
+      # compares against allowed/10 BEFORE each step (an intermediate
+      # beyond allowed/10 would cross the bound on the step).
+      var steps = 0 - k
+      let lim = ((~(0 as u128)) >> 1) + 1
+      let allowed = if neg then lim else lim - 1 end
+      let probe = allowed / 10
+      while steps > 0 do
+        if _fx256_gt(mag, probe) then return Err(FixedError::Overflow) end
+        mag = _fx256_mul10(mag)
+        steps = steps - 1
+      end
+    elsif k > 0 then
+      # Target scale smaller than the natural product scale: divide the
+      # 256-bit magnitude by 10^k exactly.  Repeated short division by 10
+      # (four 64-bit limbs per step) yields the truncated quotient and,
+      # digit by digit, the exact remainder's decimal image: after k
+      # steps the discarded remainder is r = sum d_i * 10^(i-1) with d_k
+      # its most significant digit, so r compares against the half bound
+      # 10^k / 2 = 5 * 10^(k-1) through d_k alone, and the lower digits
+      # only matter for the exact-half / nonzero tests (sticky).  This is
+      # exactly the remainder-vs-divisor relationship _fx_bump encodes,
+      # without ever holding 10^k or the remainder in a machine word.
+      var q = mag
+      var dk: u64 = 0
+      var sticky: Bool = false
+      var i: Int = 1
+      while i <= k && !(q.l0 == 0 && q.l1 == 0 && q.l2 == 0 && q.l3 == 0) do
+        let (nq, digit) = _fx256_div10(q)
+        let d = digit as u64
+        if i == k then
+          dk = d
+        else
+          sticky = sticky || d != 0
+        end
+        q = nq
+        i = i + 1
+      end
+      let r_zero = dk == 0 && !sticky
+      var bump: Bool = false
+      if !r_zero then
+        match rounding
+        when RoundingMode::HalfUp then bump = dk >= 5
+        when RoundingMode::HalfDown then bump = dk > 5 || (dk == 5 && sticky)
+        when RoundingMode::HalfEven then bump = dk > 5 || (dk == 5 && (sticky || (q.l0 & 1) == 1))
+        when RoundingMode::TowardZero then bump = false
+        when RoundingMode::AwayFromZero then bump = true
+        when RoundingMode::Floor then bump = neg
+        when RoundingMode::Ceiling then bump = !neg
+        end
+      end
+      if bump then q = _fx256_inc(q) end
+      mag = q
+    end
+    # (k == 0: the natural product scale is the target — the exact
+    # quotient above IS the product; no rounding decision exists.)
+    match _fx256_word128(mag, neg)
+    when Ok(w) then Ok(Decimal128[T] { unscaled: w })
+    when Err(e) then Err(e)
+    end
+  end
+end
+
+# ─── Phantom-dimension const-scale decimals — Money/Price/Quantity/Rate (audit §23 part C) ──
+
+## Money[Currency, SCALE], Price[Currency, Unit, SCALE],
+## Quantity[Unit, SCALE] and Rate[RateUnit, SCALE] are the
+## DIMENSION-TYPED siblings of Decimal64[SCALE] (audit §23 part C):
+## each wraps exactly ONE Decimal64[SCALE] register word and carries the
+## dimension's currency/unit in a PHANTOM type parameter — type-level
+## only, never a runtime field, never a drop-glue word (the shape of
+## std::embedded Register[T, Access], which stores the address alone).
+##
+## The phantom dimension makes currency/unit/rounding/overflow/precision
+## MACHINE-VISIBLE type facts.  Money[USD, 2] and Money[EUR, 2] are
+## different types, so `usd.add(eur)` fails to typecheck (no `add`
+## signature accepts a Money of another currency); Rate[BasisPoint, 0]
+## added to Rate[Percent, 0], Money added to Quantity, and Price added
+## to Rate all fail to typecheck the same way.  There is no runtime
+## unit check and no unit field — a mismatched program does not compile.
+## The const SCALE is part of the type exactly as in Decimal64[SCALE]:
+## Money[USD, 2] and Money[USD, 4] are different types and
+## rescale[T] is the checked, explicitly-rounded bridge between the
+## instances of one dimension (never a silent conversion).
+##
+## Layout: every instance is one word (its Decimal64[SCALE]), and all
+## four types are Copy, allocation-free and drop-free like the decimal
+## they wrap.  A dimension type names its REGISTER type in `amount()`;
+## the digit-precision, rounding-mode and overflow semantics are the
+## Decimal64 semantics the wrapper delegates to.
+##
+## The cross-dimension products below are exactly the products whose
+## math is EXACT and DIMENSION-CORRECT at the compile-time level: a
+## currency-per-unit price times the unit quantity is the currency
+## amount at the summed scale — Price[C, U, S2].mul_quantity(q) and
+## Quantity[U, S1].mul_price(p) both yield Money[C, S1 + S2] with
+## q's unit constrained to the price's own U by the signature — and a
+## Money amount times a DECIMAL rate is the Money amount at the summed
+## scale (Money[C, S].mul_rate(r) yields Money[C, S + RS]).
+##
+## mul_rate multiplies the rate's DECIMAL value unscaled * 10^-SCALE,
+## so the percent base (10^-2) and the basis-point base (10^-4) are
+## expressed through the const SCALE: Rate[Percent, 2]::from_parts(5)
+## IS the decimal 0.05 (five percent) and Rate[BasisPoint,
+## 4]::from_parts(500) IS the decimal 0.0500 (500 basis points), and
+## each multiplies exactly.  A RAW unit-base count at scale 0 (500
+## unscaled on Rate[BasisPoint, 0] is the number 500, NOT the decimal
+## 0.05) is not a decimal-rate value — the caller spells the decimal at
+## the base scale first; the type has no per-unit exponent slot, so
+## nothing here invents one.
+##
+## A product whose exact magnitude does not fit the 64-bit word reports
+## FixedError::Overflow — it never wraps and never rounds.  Products
+## with no dimension-correct interpretation at the type level (Money
+## times Money, Quantity times Quantity) are NOT defined: the audit's
+## rule is to reject rather than invent.
+
+pub struct Money[C, const SCALE: Int]
+  ## The register word: the const-scale decimal at the instance's
+  ## SCALE.  The currency `C` is phantom (no field, no layout, no
+  ## runtime value) — the type argument alone separates USD from EUR.
+  amount: Decimal64[SCALE]
+end
+
+## Price is a currency amount PER UNIT of `U` (e.g. dollars per share):
+## Price[USD, Share, 4] with unscaled 123456 is 12.3456 USD/share.  The
+## unit `U` is phantom; the quantity side of a product must be the same
+## unit by construction (Quantity[Share, ...] — a Quantity[Barrel, ...]
+## argument never typechecks against a Price[_, Share, _]).
+pub struct Price[C, U, const SCALE: Int]
+  ## The register word: the const-scale decimal at the instance's
+  ## SCALE.  `C` and `U` are phantom type-level facts.
+  amount: Decimal64[SCALE]
+end
+
+## Quantity counts of the unit `U` (e.g. shares): Quantity[Share, 0]
+## with unscaled 100 is 100 shares; Quantity[Share, 3] with unscaled
+## 100 is 0.100 shares (the const scale is the counting precision).
+## `U` is phantom.
+pub struct Quantity[U, const SCALE: Int]
+  ## The register word: the const-scale decimal at the instance's
+  ## SCALE.  `U` is a phantom type-level fact.
+  amount: Decimal64[SCALE]
+end
+
+## Rate is a rate expressed in the rate unit `RU` at the const scale
+## (e.g. Rate[BasisPoint, 0] with unscaled 500 is 500 basis points, and
+## Rate[Percent, 2] with unscaled 5 is the decimal 0.05 = five percent).
+## `RU` is phantom: bps rates and percent rates are different types,
+## and adding them is a compile-time rejection.
+pub struct Rate[RU, const SCALE: Int]
+  ## The register word: the const-scale decimal at the instance's
+  ## SCALE.  `RU` is a phantom type-level fact.
+  amount: Decimal64[SCALE]
+end
+
+impl[C, const SCALE: Int] Money[C, SCALE]
+  ## The zero amount at the instance's const scale (0.00 for
+  ## Money[USD, 2]) — the additive identity of the instance.
+  pub def zero() -> Money[C, SCALE]
+    Money[C, SCALE] { amount: Decimal64[SCALE] { unscaled: 0 } }
+  end
+
+  ## Construct from the MINOR units of the scale: the unscaled word at
+  ## SCALE, exactly Decimal64::from_parts' shape — Money[USD, 2] built
+  ## from_minor(1234) IS 12.34 dollars (1234 cents).  Infallible: every
+  ## Int word is a valid digit string at any scale.
+  pub def from_minor(minor: Int) -> Money[C, SCALE]
+    Money[C, SCALE] { amount: Decimal64[SCALE] { unscaled: minor } }
+  end
+
+  ## Lift a Decimal64[SCALE] into the dimension: the only bridge from a
+  ## bare decimal into a currency.  Infallible (the wrap adds no word).
+  pub def from_decimal(d: Decimal64[SCALE]) -> Money[C, SCALE]
+    Money[C, SCALE] { amount: d }
+  end
+
+  ## The register word as a Decimal64[SCALE] (formatting, arithmetic
+  ## and rescale all read through this one-word view).
+  pub def amount(self) -> Decimal64[SCALE]
+    self.amount
+  end
+
+  ## The unscaled word of the register amount.
+  pub def unscaled(self) -> Int
+    self.amount.unscaled()
+  end
+
+  ## The instance's const scale read as a runtime value (the compile-time
+  ## SCALE parameter of the type).
+  pub def scale(self) -> Int
+    SCALE
+  end
+
+  ## Add.  The operand is the SAME instance (same currency C, same const
+  ## scale SCALE) by construction — a different currency or scale is a
+  ## different type and never typechecks here.  Word overflow is an
+  ## error result, exactly as Decimal64::add.
+  pub def add(self, other: Money[C, SCALE]) -> Result[Money[C, SCALE], FixedError]
+    match self.amount.add(other.amount)
+    when Ok(d) then Ok(Money[C, SCALE] { amount: d })
+    when Err(e) then Err(e)
+    end
+  end
+
+  ## Subtract.  Same-dimension by construction; word overflow is an
+  ## error result, exactly as Decimal64::sub.
+  pub def sub(self, other: Money[C, SCALE]) -> Result[Money[C, SCALE], FixedError]
+    match self.amount.sub(other.amount)
+    when Ok(d) then Ok(Money[C, SCALE] { amount: d })
+    when Err(e) then Err(e)
+    end
+  end
+
+  ## Negate.  The scale is unchanged because it is the type; the minimum
+  ## word wraps in two's complement exactly as Decimal64::negate.
+  pub def negate(self) -> Money[C, SCALE]
+    Money[C, SCALE] { amount: self.amount.negate() }
+  end
+
+  pub def abs(self) -> Money[C, SCALE]
+    if self.amount.unscaled() < 0 then self.negate() else self end
+  end
+
+  ## Numerically compare (word order IS numeric order at one instance);
+  ## returns -1, 0 or 1 as Decimal64::compare.
+  pub def compare(self, other: Money[C, SCALE]) -> Int
+    self.amount.compare(other.amount)
+  end
+
+  ## Format with exactly SCALE fraction digits (the register amount's
+  ## spelling — no currency symbol exists at runtime: the currency is
+  ## the phantom type, so "12.34" is Money[USD, 2]'s string, never a
+  ## string the type must carry).
+  pub def to_string(self) -> String
+    self.amount.to_string()
+  end
+
+  ## Re-express the amount at the const scale T of the SAME currency,
+  ## rounding explicitly when the scale decreases — the checked bridge
+  ## between the Money[C, S] instances (Decimal64::rescale's word
+  ## machinery, re-applied to the wrapped word and lifted back into the
+  ## dimension).  Scale-up is exact and reports FixedError::Overflow
+  ## when the word cannot hold the scaled significand.
+  pub def rescale[const T: Int](self, rounding: RoundingMode) -> Result[Money[C, T], FixedError]
+    if T == SCALE then
+      return Ok(Money[C, T] { amount: Decimal64[T] { unscaled: self.amount.unscaled() } })
+    end
+    let diff = T - SCALE
+    let ma = _fx_mag64(self.amount.unscaled())
+    if diff < 0 then
+      let out = _fx_div_shift(ma, 1, 0 - diff)?
+      let neg = self.amount.unscaled() < 0
+      let bump = _fx_bump(out.rmag, out.divisor, out.mag, neg, out.huge, rounding)
+      let qmag = if bump then out.mag + 1 else out.mag end
+      let lim_neg = (((~(0 as u64)) >> 1) as u128) + 1
+      if qmag > lim_neg then return Err(FixedError::Overflow) end
+      if !neg && qmag == lim_neg then return Err(FixedError::Overflow) end
+      var unscaled: Int = if qmag == 0 then 0 else (if neg then ((0 as u64) - (qmag as u64)) as Int else (qmag as Int) end) end
+      return Ok(Money[C, T] { amount: Decimal64[T] { unscaled: unscaled } })
+    end
+    if ma == 0 then return Ok(Money[C, T] { amount: Decimal64[T] { unscaled: 0 } }) end
+    let scaled = _fx_mul_pow10(ma, diff)?
+    let neg = self.amount.unscaled() < 0
+    let lim_neg = (((~(0 as u64)) >> 1) as u128) + 1
+    if scaled > lim_neg then return Err(FixedError::Overflow) end
+    if !neg && scaled == lim_neg then return Err(FixedError::Overflow) end
+    var unscaled: Int = if scaled == 0 then 0 else (if neg then ((0 as u64) - (scaled as u64)) as Int else (scaled as Int) end) end
+    Ok(Money[C, T] { amount: Decimal64[T] { unscaled: unscaled } })
+  end
+
+  ## Money * DECIMAL rate -> Money at the summed scale (SCALE + RS).
+  ## The rate argument's unit is phantom (any Rate instance typechecks)
+  ## and its VALUE is the decimal unscaled * 10^-RS, so the product is
+  ## exact: Money[USD, 2] 12.34 times Rate[Percent, 2] 0.05 (unscaled 5)
+  ## is Money[USD, 4] 0.6170.  A product magnitude beyond the Int word
+  ## reports FixedError::Overflow — never a wrap, never a rounding.
+  pub def mul_rate[RU2, const RS: Int](self, rate: Rate[RU2, RS]) -> Result[Money[C, SCALE + RS], FixedError]
+    match _fx_mul64_word(self.amount.unscaled(), rate.amount.unscaled())
+    when Ok(w) then Ok(Money[C, SCALE + RS] { amount: Decimal64[SCALE + RS] { unscaled: w } })
+    when Err(e) then Err(e)
+    end
+  end
+end
+
+impl[C, U, const SCALE: Int] Price[C, U, SCALE]
+  ## The zero price at the instance's const scale.
+  pub def zero() -> Price[C, U, SCALE]
+    Price[C, U, SCALE] { amount: Decimal64[SCALE] { unscaled: 0 } }
+  end
+
+  ## Construct from the unscaled word at SCALE (Decimal64::from_parts'
+  ## shape): Price[USD, Share, 4]::from_parts(123456) IS 12.3456
+  ## USD/share.  Infallible.
+  pub def from_parts(unscaled: Int) -> Price[C, U, SCALE]
+    Price[C, U, SCALE] { amount: Decimal64[SCALE] { unscaled: unscaled } }
+  end
+
+  ## Lift a Decimal64[SCALE] into the dimension.  Infallible.
+  pub def from_decimal(d: Decimal64[SCALE]) -> Price[C, U, SCALE]
+    Price[C, U, SCALE] { amount: d }
+  end
+
+  ## The register word as a Decimal64[SCALE].
+  pub def amount(self) -> Decimal64[SCALE]
+    self.amount
+  end
+
+  ## The unscaled word of the register amount.
+  pub def unscaled(self) -> Int
+    self.amount.unscaled()
+  end
+
+  ## The instance's const scale read as a runtime value.
+  pub def scale(self) -> Int
+    SCALE
+  end
+
+  ## Add.  Same dimension (currency C, unit U, const scale SCALE) by
+  ## construction — Price[USD, Share, 4] + Price[EUR, Share, 4] or
+  ## Price[USD, Share, 4] + Rate[...] never typechecks.
+  pub def add(self, other: Price[C, U, SCALE]) -> Result[Price[C, U, SCALE], FixedError]
+    match self.amount.add(other.amount)
+    when Ok(d) then Ok(Price[C, U, SCALE] { amount: d })
+    when Err(e) then Err(e)
+    end
+  end
+
+  ## Subtract.  Same-dimension by construction; overflow is an error
+  ## result.
+  pub def sub(self, other: Price[C, U, SCALE]) -> Result[Price[C, U, SCALE], FixedError]
+    match self.amount.sub(other.amount)
+    when Ok(d) then Ok(Price[C, U, SCALE] { amount: d })
+    when Err(e) then Err(e)
+    end
+  end
+
+  ## Negate.  The scale is unchanged because it is the type.
+  pub def negate(self) -> Price[C, U, SCALE]
+    Price[C, U, SCALE] { amount: self.amount.negate() }
+  end
+
+  pub def abs(self) -> Price[C, U, SCALE]
+    if self.amount.unscaled() < 0 then self.negate() else self end
+  end
+
+  ## Numerically compare (returns -1, 0 or 1).
+  pub def compare(self, other: Price[C, U, SCALE]) -> Int
+    self.amount.compare(other.amount)
+  end
+
+  ## Format with exactly SCALE fraction digits (no symbol: the currency
+  ## and unit are phantom type-level facts).
+  pub def to_string(self) -> String
+    self.amount.to_string()
+  end
+
+  ## Re-express the price at the const scale T of the same (currency,
+  ## unit), rounding explicitly when the scale decreases; scale-up is
+  ## exact and overflow-checked.
+  pub def rescale[const T: Int](self, rounding: RoundingMode) -> Result[Price[C, U, T], FixedError]
+    if T == SCALE then
+      return Ok(Price[C, U, T] { amount: Decimal64[T] { unscaled: self.amount.unscaled() } })
+    end
+    let diff = T - SCALE
+    let ma = _fx_mag64(self.amount.unscaled())
+    if diff < 0 then
+      let out = _fx_div_shift(ma, 1, 0 - diff)?
+      let neg = self.amount.unscaled() < 0
+      let bump = _fx_bump(out.rmag, out.divisor, out.mag, neg, out.huge, rounding)
+      let qmag = if bump then out.mag + 1 else out.mag end
+      let lim_neg = (((~(0 as u64)) >> 1) as u128) + 1
+      if qmag > lim_neg then return Err(FixedError::Overflow) end
+      if !neg && qmag == lim_neg then return Err(FixedError::Overflow) end
+      var unscaled: Int = if qmag == 0 then 0 else (if neg then ((0 as u64) - (qmag as u64)) as Int else (qmag as Int) end) end
+      return Ok(Price[C, U, T] { amount: Decimal64[T] { unscaled: unscaled } })
+    end
+    if ma == 0 then return Ok(Price[C, U, T] { amount: Decimal64[T] { unscaled: 0 } }) end
+    let scaled = _fx_mul_pow10(ma, diff)?
+    let neg = self.amount.unscaled() < 0
+    let lim_neg = (((~(0 as u64)) >> 1) as u128) + 1
+    if scaled > lim_neg then return Err(FixedError::Overflow) end
+    if !neg && scaled == lim_neg then return Err(FixedError::Overflow) end
+    var unscaled: Int = if scaled == 0 then 0 else (if neg then ((0 as u64) - (scaled as u64)) as Int else (scaled as Int) end) end
+    Ok(Price[C, U, T] { amount: Decimal64[T] { unscaled: unscaled } })
+  end
+
+  ## Price * Quantity -> Money at the summed scale: the currency-per-unit
+  ## amount times the unit count is the currency amount.  The quantity's
+  ## unit is constrained to THIS price's unit U by the signature (a
+  ## Quantity[Barrel, ...] argument never typechecks against a
+  ## Price[_, Share, _]), and the result's currency is THIS price's C.
+  ## Exact; a product magnitude beyond the Int word reports
+  ## FixedError::Overflow.
+  pub def mul_quantity[const QS: Int](self, q: Quantity[U, QS]) -> Result[Money[C, SCALE + QS], FixedError]
+    match _fx_mul64_word(self.amount.unscaled(), q.amount.unscaled())
+    when Ok(w) then Ok(Money[C, SCALE + QS] { amount: Decimal64[SCALE + QS] { unscaled: w } })
+    when Err(e) then Err(e)
+    end
+  end
+end
+
+impl[U, const SCALE: Int] Quantity[U, SCALE]
+  ## The zero quantity at the instance's const scale.
+  pub def zero() -> Quantity[U, SCALE]
+    Quantity[U, SCALE] { amount: Decimal64[SCALE] { unscaled: 0 } }
+  end
+
+  ## Construct from the unscaled count at SCALE (Decimal64::from_parts'
+  ## shape): Quantity[Share, 0]::from_parts(100) IS 100 shares.
+  ## Infallible.
+  pub def from_parts(unscaled: Int) -> Quantity[U, SCALE]
+    Quantity[U, SCALE] { amount: Decimal64[SCALE] { unscaled: unscaled } }
+  end
+
+  ## Lift a Decimal64[SCALE] into the dimension.  Infallible.
+  pub def from_decimal(d: Decimal64[SCALE]) -> Quantity[U, SCALE]
+    Quantity[U, SCALE] { amount: d }
+  end
+
+  ## The register word as a Decimal64[SCALE].
+  pub def amount(self) -> Decimal64[SCALE]
+    self.amount
+  end
+
+  ## The unscaled word of the register amount.
+  pub def unscaled(self) -> Int
+    self.amount.unscaled()
+  end
+
+  ## The instance's const scale read as a runtime value.
+  pub def scale(self) -> Int
+    SCALE
+  end
+
+  ## Add.  Same dimension (unit U, const scale SCALE) by construction —
+  ## a Money argument never typechecks here.
+  pub def add(self, other: Quantity[U, SCALE]) -> Result[Quantity[U, SCALE], FixedError]
+    match self.amount.add(other.amount)
+    when Ok(d) then Ok(Quantity[U, SCALE] { amount: d })
+    when Err(e) then Err(e)
+    end
+  end
+
+  ## Subtract.  Same-dimension by construction; overflow is an error
+  ## result.
+  pub def sub(self, other: Quantity[U, SCALE]) -> Result[Quantity[U, SCALE], FixedError]
+    match self.amount.sub(other.amount)
+    when Ok(d) then Ok(Quantity[U, SCALE] { amount: d })
+    when Err(e) then Err(e)
+    end
+  end
+
+  ## Negate.  The scale is unchanged because it is the type.
+  pub def negate(self) -> Quantity[U, SCALE]
+    Quantity[U, SCALE] { amount: self.amount.negate() }
+  end
+
+  pub def abs(self) -> Quantity[U, SCALE]
+    if self.amount.unscaled() < 0 then self.negate() else self end
+  end
+
+  ## Numerically compare (returns -1, 0 or 1).
+  pub def compare(self, other: Quantity[U, SCALE]) -> Int
+    self.amount.compare(other.amount)
+  end
+
+  ## Format with exactly SCALE fraction digits (no unit symbol: the unit
+  ## is a phantom type-level fact).
+  pub def to_string(self) -> String
+    self.amount.to_string()
+  end
+
+  ## Re-express the quantity at the const scale T of the same unit,
+  ## rounding explicitly when the scale decreases; scale-up is exact
+  ## and overflow-checked.
+  pub def rescale[const T: Int](self, rounding: RoundingMode) -> Result[Quantity[U, T], FixedError]
+    if T == SCALE then
+      return Ok(Quantity[U, T] { amount: Decimal64[T] { unscaled: self.amount.unscaled() } })
+    end
+    let diff = T - SCALE
+    let ma = _fx_mag64(self.amount.unscaled())
+    if diff < 0 then
+      let out = _fx_div_shift(ma, 1, 0 - diff)?
+      let neg = self.amount.unscaled() < 0
+      let bump = _fx_bump(out.rmag, out.divisor, out.mag, neg, out.huge, rounding)
+      let qmag = if bump then out.mag + 1 else out.mag end
+      let lim_neg = (((~(0 as u64)) >> 1) as u128) + 1
+      if qmag > lim_neg then return Err(FixedError::Overflow) end
+      if !neg && qmag == lim_neg then return Err(FixedError::Overflow) end
+      var unscaled: Int = if qmag == 0 then 0 else (if neg then ((0 as u64) - (qmag as u64)) as Int else (qmag as Int) end) end
+      return Ok(Quantity[U, T] { amount: Decimal64[T] { unscaled: unscaled } })
+    end
+    if ma == 0 then return Ok(Quantity[U, T] { amount: Decimal64[T] { unscaled: 0 } }) end
+    let scaled = _fx_mul_pow10(ma, diff)?
+    let neg = self.amount.unscaled() < 0
+    let lim_neg = (((~(0 as u64)) >> 1) as u128) + 1
+    if scaled > lim_neg then return Err(FixedError::Overflow) end
+    if !neg && scaled == lim_neg then return Err(FixedError::Overflow) end
+    var unscaled: Int = if scaled == 0 then 0 else (if neg then ((0 as u64) - (scaled as u64)) as Int else (scaled as Int) end) end
+    Ok(Quantity[U, T] { amount: Decimal64[T] { unscaled: unscaled } })
+  end
+
+  ## Quantity * Price -> Money at the summed scale — the audit-canonical
+  ## product spelling.  The price's unit is constrained to THIS
+  ## quantity's unit U by the signature, and the result's currency is
+  ## the price's own C (a free method type parameter solved from the
+  ## price argument).  Exact; a product magnitude beyond the Int word
+  ## reports FixedError::Overflow.
+  pub def mul_price[C2, const PS: Int](self, price: Price[C2, U, PS]) -> Result[Money[C2, SCALE + PS], FixedError]
+    match _fx_mul64_word(self.amount.unscaled(), price.amount.unscaled())
+    when Ok(w) then Ok(Money[C2, SCALE + PS] { amount: Decimal64[SCALE + PS] { unscaled: w } })
+    when Err(e) then Err(e)
+    end
+  end
+end
+
+impl[RU, const SCALE: Int] Rate[RU, SCALE]
+  ## The zero rate at the instance's const scale.
+  pub def zero() -> Rate[RU, SCALE]
+    Rate[RU, SCALE] { amount: Decimal64[SCALE] { unscaled: 0 } }
+  end
+
+  ## Construct from the unscaled word at SCALE (Decimal64::from_parts'
+  ## shape): Rate[BasisPoint, 0]::from_parts(500) IS 500 basis points;
+  ## the DECIMAL five-percent rate is Rate[Percent, 2]::from_parts(5)
+  ## (0.05) or Rate[BasisPoint, 4]::from_parts(500) (0.0500).  Infallible.
+  pub def from_parts(unscaled: Int) -> Rate[RU, SCALE]
+    Rate[RU, SCALE] { amount: Decimal64[SCALE] { unscaled: unscaled } }
+  end
+
+  ## Lift a Decimal64[SCALE] into the dimension.  Infallible.
+  pub def from_decimal(d: Decimal64[SCALE]) -> Rate[RU, SCALE]
+    Rate[RU, SCALE] { amount: d }
+  end
+
+  ## The register word as a Decimal64[SCALE].
+  pub def amount(self) -> Decimal64[SCALE]
+    self.amount
+  end
+
+  ## The unscaled word of the register amount.
+  pub def unscaled(self) -> Int
+    self.amount.unscaled()
+  end
+
+  ## The instance's const scale read as a runtime value.
+  pub def scale(self) -> Int
+    SCALE
+  end
+
+  ## Add.  Same rate unit and const scale by construction —
+  ## Rate[BasisPoint, 0] + Rate[Percent, 0] (bps plus percent) never
+  ## typechecks: the base is part of the phantom unit type.
+  pub def add(self, other: Rate[RU, SCALE]) -> Result[Rate[RU, SCALE], FixedError]
+    match self.amount.add(other.amount)
+    when Ok(d) then Ok(Rate[RU, SCALE] { amount: d })
+    when Err(e) then Err(e)
+    end
+  end
+
+  ## Subtract.  Same rate unit and const scale by construction; overflow
+  ## is an error result.
+  pub def sub(self, other: Rate[RU, SCALE]) -> Result[Rate[RU, SCALE], FixedError]
+    match self.amount.sub(other.amount)
+    when Ok(d) then Ok(Rate[RU, SCALE] { amount: d })
+    when Err(e) then Err(e)
+    end
+  end
+
+  ## Negate.  The scale is unchanged because it is the type.
+  pub def negate(self) -> Rate[RU, SCALE]
+    Rate[RU, SCALE] { amount: self.amount.negate() }
+  end
+
+  pub def abs(self) -> Rate[RU, SCALE]
+    if self.amount.unscaled() < 0 then self.negate() else self end
+  end
+
+  ## Numerically compare (returns -1, 0 or 1).
+  pub def compare(self, other: Rate[RU, SCALE]) -> Int
+    self.amount.compare(other.amount)
+  end
+
+  ## Format with exactly SCALE fraction digits (no unit suffix: the rate
+  ## unit is a phantom type-level fact).
+  pub def to_string(self) -> String
+    self.amount.to_string()
+  end
+
+  ## Re-express the rate at the const scale T of the same rate unit,
+  ## rounding explicitly when the scale decreases; scale-up is exact and
+  ## overflow-checked.
+  pub def rescale[const T: Int](self, rounding: RoundingMode) -> Result[Rate[RU, T], FixedError]
+    if T == SCALE then
+      return Ok(Rate[RU, T] { amount: Decimal64[T] { unscaled: self.amount.unscaled() } })
+    end
+    let diff = T - SCALE
+    let ma = _fx_mag64(self.amount.unscaled())
+    if diff < 0 then
+      let out = _fx_div_shift(ma, 1, 0 - diff)?
+      let neg = self.amount.unscaled() < 0
+      let bump = _fx_bump(out.rmag, out.divisor, out.mag, neg, out.huge, rounding)
+      let qmag = if bump then out.mag + 1 else out.mag end
+      let lim_neg = (((~(0 as u64)) >> 1) as u128) + 1
+      if qmag > lim_neg then return Err(FixedError::Overflow) end
+      if !neg && qmag == lim_neg then return Err(FixedError::Overflow) end
+      var unscaled: Int = if qmag == 0 then 0 else (if neg then ((0 as u64) - (qmag as u64)) as Int else (qmag as Int) end) end
+      return Ok(Rate[RU, T] { amount: Decimal64[T] { unscaled: unscaled } })
+    end
+    if ma == 0 then return Ok(Rate[RU, T] { amount: Decimal64[T] { unscaled: 0 } }) end
+    let scaled = _fx_mul_pow10(ma, diff)?
+    let neg = self.amount.unscaled() < 0
+    let lim_neg = (((~(0 as u64)) >> 1) as u128) + 1
+    if scaled > lim_neg then return Err(FixedError::Overflow) end
+    if !neg && scaled == lim_neg then return Err(FixedError::Overflow) end
+    var unscaled: Int = if scaled == 0 then 0 else (if neg then ((0 as u64) - (scaled as u64)) as Int else (scaled as Int) end) end
+    Ok(Rate[RU, T] { amount: Decimal64[T] { unscaled: unscaled } })
   end
 end
 
@@ -1889,6 +3096,216 @@ def _fx_digits(mag: u128) -> String
     result = result + chars.get(i).unwrap_or("0")
   end
   result
+end
+
+# ─── 256-bit magnitude helpers (Decimal128 exact multiplication) ─────
+## The exact product of two i128 magnitudes needs up to 254 bits, beyond
+## the u128 domain of every helper above.  _F256 is the 256-bit unsigned
+## image: four 64-bit limbs (UInt), least significant first (l0 holds
+## bits 0-63).  All limb arithmetic goes through u128 intermediates
+## (every single-limb product (2^64-1)^2 and every carry-accumulated sum
+## below is proven < 2^128), so the schoolbook multiply and the short
+## division/multiplication by ten are exact; the only narrow writes are
+## in-range mod-2^64 extractions, so no wide-to-narrow cast ever carries
+## an out-of-range value.
+
+struct _F256
+  ## Bits 0-63 of the magnitude (least significant limb).
+  l0: UInt
+  ## Bits 64-127.
+  l1: UInt
+  ## Bits 128-191.
+  l2: UInt
+  ## Bits 192-255.
+  l3: UInt
+end
+
+## x mod 2^64 for a u128 x — the low-limb extraction.  Computed without
+## any wide-to-narrow cast (the result is proven < 2^64 before the narrow
+## write at the call sites).
+def _fx256_lo128(x: u128) -> u128
+  let bb = ((~(0 as u64)) as u128) + 1
+  x - (x >> 64) * bb
+end
+
+## A UInt limb widened to u128 through the u64 view.
+def _fx256_limb(x: UInt) -> u128
+  (x as u64) as u128
+end
+
+## Exact 256-bit product of two u128 magnitudes (each < 2^128, so the
+## product fits the four limbs exactly).  2x2 schoolbook with carry
+## accumulation ordered so every intermediate stays below 2^128:
+##   p00 + (p01 + p10) * 2^64 + p11 * 2^128 is accumulated as
+##   r0 = p00 mod B; then the B-position sum t1 = lo(p01) + lo(p10) +
+##   (p00 >> 64) < 3B, its carry joins the B^2-position sum
+##   t2 = hi(p01) + hi(p10) + carry < 2B + 2, and p11 + t2 < B^2 closes
+##   the top two limbs (B = 2^64; every bound is exact).
+def _fx256_mul(a: u128, b: u128) -> _F256
+  let bb = ((~(0 as u64)) as u128) + 1
+  let a0 = (a % bb) as UInt
+  let a1 = (a >> 64) as UInt
+  let b0 = (b % bb) as UInt
+  let b1 = (b >> 64) as UInt
+  let p00 = _fx256_limb(a0) * _fx256_limb(b0)
+  let p01 = _fx256_limb(a0) * _fx256_limb(b1)
+  let p10 = _fx256_limb(a1) * _fx256_limb(b0)
+  let p11 = _fx256_limb(a1) * _fx256_limb(b1)
+  let r0 = (_fx256_lo128(p00)) as UInt
+  let t1 = _fx256_lo128(p01) + _fx256_lo128(p10) + (p00 >> 64)
+  let r1 = (_fx256_lo128(t1)) as UInt
+  let t2 = (p01 >> 64) + (p10 >> 64) + (t1 >> 64)
+  let t3 = p11 + t2
+  let r2 = (_fx256_lo128(t3)) as UInt
+  let r3 = (t3 >> 64) as UInt
+  _F256 { l0: r0, l1: r1, l2: r2, l3: r3 }
+end
+
+## Divide a 256-bit magnitude by ten: short division across the four
+## limbs (most significant first), returning the truncated quotient and
+## the remainder digit.  Per limb, t = rem * 2^64 + limb <= 10 * 2^64 - 1
+## fits u128, the quotient limb t / 10 < 2^64 is in-range, and rem <= 9.
+def _fx256_div10(mag: _F256) -> (_F256, UInt)
+  let bb = ((~(0 as u64)) as u128) + 1
+  var rem: u128 = 0
+  let t3 = rem * bb + _fx256_limb(mag.l3)
+  let q3 = (t3 / 10) as UInt
+  rem = t3 % 10
+  let t2 = rem * bb + _fx256_limb(mag.l2)
+  let q2 = (t2 / 10) as UInt
+  rem = t2 % 10
+  let t1 = rem * bb + _fx256_limb(mag.l1)
+  let q1 = (t1 / 10) as UInt
+  rem = t1 % 10
+  let t0 = rem * bb + _fx256_limb(mag.l0)
+  let q0 = (t0 / 10) as UInt
+  rem = t0 % 10
+  (_F256 { l0: q0, l1: q1, l2: q2, l3: q3 }, rem as UInt)
+end
+
+## Multiply a 256-bit magnitude by ten (limb carry chain, low to high).
+## The callers probe the word bound before each step, so the magnitude
+## never exceeds 2^127 here and the final carry out of l3 is zero; the
+## 256-bit field itself could hold magnitudes up to 2^256 - 1 regardless.
+def _fx256_mul10(mag: _F256) -> _F256
+  let bb = ((~(0 as u64)) as u128) + 1
+  var carry: u128 = 0
+  let t0 = _fx256_limb(mag.l0) * 10 + carry
+  let n0 = (_fx256_lo128(t0)) as UInt
+  carry = t0 >> 64
+  let t1 = _fx256_limb(mag.l1) * 10 + carry
+  let n1 = (_fx256_lo128(t1)) as UInt
+  carry = t1 >> 64
+  let t2 = _fx256_limb(mag.l2) * 10 + carry
+  let n2 = (_fx256_lo128(t2)) as UInt
+  carry = t2 >> 64
+  let t3 = _fx256_limb(mag.l3) * 10 + carry
+  let n3 = (_fx256_lo128(t3)) as UInt
+  _F256 { l0: n0, l1: n1, l2: n2, l3: n3 }
+end
+
+## Increment a 256-bit magnitude (the rounding bump).  The bumped
+## quotient is at most 2^254, so the carry chain can never exhaust the
+## four limbs.
+def _fx256_inc(mag: _F256) -> _F256
+  let max = (0 as UInt) - 1
+  var l0: UInt = mag.l0
+  var l1: UInt = mag.l1
+  var l2: UInt = mag.l2
+  var l3: UInt = mag.l3
+  if l0 != max then
+    l0 = l0 + 1
+  elsif l1 != max then
+    l0 = 0 as UInt
+    l1 = l1 + 1
+  elsif l2 != max then
+    l0 = 0 as UInt
+    l1 = 0 as UInt
+    l2 = l2 + 1
+  else
+    l0 = 0 as UInt
+    l1 = 0 as UInt
+    l2 = 0 as UInt
+    l3 = l3 + 1
+  end
+  _F256 { l0: l0, l1: l1, l2: l2, l3: l3 }
+end
+
+## Whether a 256-bit magnitude exceeds a u128 bound (used for the
+## multiply-up probes, where the bound is at most 2^127).
+def _fx256_gt(mag: _F256, bound: u128) -> Bool
+  if mag.l2 != 0 || mag.l3 != 0 then return true end
+  let bb = ((~(0 as u64)) as u128) + 1
+  let w = _fx256_limb(mag.l1) * bb + _fx256_limb(mag.l0)
+  w > bound
+end
+
+## 256-bit magnitude -> i128 word with the sign, applying the word
+## bounds: a magnitude up to 2^127 is representable as the minimum word
+## (negative only); the positive word stops at 2^127 - 1.  The word is
+## spelled through the u128 view exactly as _fx_make128 spells it (the
+## wide negation wraps on the MIN bit pattern).
+def _fx256_word128(mag: _F256, neg: Bool) -> Result[i128, FixedError]
+  if mag.l2 != 0 || mag.l3 != 0 then
+    return Err(FixedError::Overflow)
+  end
+  let hi = mag.l1 as u64
+  let lo = mag.l0 as u64
+  let lim_hi = (~(0 as u64)) >> 1
+  if hi > lim_hi + 1 then return Err(FixedError::Overflow) end
+  if hi == lim_hi + 1 then
+    # hi == 2^63: the magnitude is >= 2^127 — exactly 2^127 (lo == 0) is
+    # representable as MIN only.
+    if lo != 0 then return Err(FixedError::Overflow) end
+    if !neg then return Err(FixedError::Overflow) end
+  end
+  let v = ((hi as u128) * (((~(0 as u64)) as u128) + 1)) + (lo as u128)
+  if v == 0 then return Ok(0) end
+  if neg then Ok(0 - (v as i128)) else Ok(v as i128) end
+end
+
+## u128 magnitude -> i128 word with the sign (the make128 bounds of the
+## Decimal128 rescale/mul tails): magnitudes up to the negative limit
+## 2^127 are representable as the minimum word; the exact spelling is
+## _fx_make128's, lifted from the Fixed128 struct to the bare word so
+## the const-generic Decimal128[T] construction can reuse it.
+def _fx_word128(neg: Bool, mag: u128) -> Result[i128, FixedError]
+  let lim_neg = ((~(0 as u128)) >> 1) + 1
+  if mag > lim_neg then return Err(FixedError::Overflow) end
+  if !neg && mag == lim_neg then return Err(FixedError::Overflow) end
+  if mag == 0 then return Ok(0) end
+  if neg then Ok(0 - (mag as i128)) else Ok(mag as i128) end
+end
+
+## u128 magnitude -> Int word with the sign (the make64 bounds of the
+## Decimal64 rescale tail, lifted to the bare word): magnitudes up to the
+## negative limit 2^63 are representable as the minimum word; the exact
+## spelling is the unsigned-64-bit view (P1-5 — the trapping default
+## never fires on the documented MIN spelling).  The audit §23-C
+## dimension products reuse it to make Money/Price/Quantity/Rate words.
+def _fx_word64(neg: Bool, mag: u128) -> Result[Int, FixedError]
+  let lim_neg = (((~(0 as u64)) >> 1) as u128) + 1
+  if mag > lim_neg then return Err(FixedError::Overflow) end
+  if !neg && mag == lim_neg then return Err(FixedError::Overflow) end
+  var unscaled: Int = if mag == 0 then 0 else (if neg then ((0 as u64) - (mag as u64)) as Int else (mag as Int) end) end
+  Ok(unscaled)
+end
+
+## Exact product of two Decimal64/Int unscaled words, checked against
+## the 64-bit word bound.  Each magnitude is at most 2^63 (Int::MIN's
+## magnitude), so the product is at most 2^126 and never wraps the u128
+## magnitude domain (the Fixed128::mul probe-free fast path); only the
+## _fx_word64 bound applies to the exact result.  The audit §23-C
+## cross-dimension products (price * quantity -> money, money * rate ->
+## money) share this single checked-word path: an out-of-word product is
+## FixedError::Overflow, never a wrap and never a rounding.
+def _fx_mul64_word(a: Int, b: Int) -> Result[Int, FixedError]
+  let ma = _fx_mag64(a)
+  let mb = _fx_mag64(b)
+  if ma == 0 || mb == 0 then return Ok(0) end
+  let p = ma * mb
+  let neg = (a < 0) != (b < 0)
+  _fx_word64(neg, p)
 end
 
 # ─── Numeric trait extensions ────────────────────────────────────────

@@ -1,0 +1,2005 @@
+# Tangerine Compiler — Semantic Snapshot Builder (audit §30)
+# Self-hosting compiler written in Tangerine
+#
+# The analysis slice that fills the semantic_model.tg records from the
+# FINALIZED semantic state of one compilation — never from source scanning:
+# the inputs are the finalized checker env (TypeEnv), the finalized typed
+# program (TypedProgram — the typed def tables, the resolver snapshots, the
+# merged program) and the VERIFIED MIR program (the instance the compile
+# phases guard with verify_mir / the completeness oracle — see the
+# TANGERINE_SNAPSHOT hook in compiler_core.tg's compile_file_core).
+#
+# TABLE ANCHORS (what each table is populated from):
+#   symbols    — the resolver's REGISTRATION tables of the typed program
+#                (ResolvedNames.module_symbols — the "path::name" -> DefId
+#                registry — plus def_kinds), one row per registered def.
+#                Pub marking / generic-ness / contracts come from a
+#                deterministic ITEM WALK over the merged program (the same
+#                shape the resolver's symbol-table construction uses:
+#                top-level items in Program.items order, inline-module
+#                recursion appending module segments; first-wins like the
+#                resolver). A declaration that lost a first-wins
+#                registration has no registry identity and never appears.
+#   types      — the CANONICAL TYPE TABLES of the finalized env
+#                (TypeEnv.type_list via the TypeId-to-declaration
+#                association): nominal TypeDefKind Struct / Enum / Trait
+#                declarations only (aliases and primitive/opaque rows are
+#                excluded — the SemanticTypeKind vocabulary has no row for
+#                them; aliases still ride the symbols table).
+#   calls      — the verified MIR's call terminators of def-keyed
+#                functions: the callee is the terminator's MirFnItem
+#                INSTANCE payload (the solved InstanceId the checker
+#                stamped — its DefId); name-only constants resolve through
+#                the def-keyed emission names; the synthesized intrinsic-
+#                name family classifies as Intrinsic edges. Indirect VALUE
+#                calls have no statically-known declaration and are
+#                excluded (documented; they fail closed in the effects
+#                table instead).
+#   effects    — the §11 EffectSummary records computed per function over
+#                the verified MIR (the mir.tg §11 machinery reused
+#                verbatim — mir_effect_scan_function), propagated to the
+#                transitive fixed point over the whole lowered program
+#                (the check_effect_class_annotations_mir union shape over
+#                every function, not only the claimed roots).
+#   capabilities — Requires edges = the §11 final summary's capability set
+#                (the CapabilityId domain). Provides edges are EMPTY: the
+#                MIR summaries model only what a body requires.
+#   ownership  — MIR move/consume/drop sites (MirMovePlace / MirConsume
+#                operands, MirDeinit terminators, the move/consume write
+#                destinations of MirAssign, MirRef sites) as per-place
+#                OwnershipFact rows: Sink = moved/consumed/dropped,
+#                Set = a move/consume write destination, Inout = a
+#                mutable-reference creation. Shared READ facts (Let) are
+#                elided: reads outnumber every other class by an order of
+#                magnitude and add no delta signal (documented).
+#   contracts  — the DEF TABLES: the ContractClause records on the
+#                function/method declarations of the typed item walk
+#                (clause_text = the declared clause message; a clause
+#                without a message renders its kind's canonical label).
+#   tests      — EMPTY (documented): the compiler tracks no test ->
+#                exercised-function relationship table; the driver's test
+#                runner is discovery/execution, not a semantic
+#                relationship. The rows stay for a future machinery.
+#   coverage   — EMPTY (documented): coverage.tg's branch/arm records are
+#                runtime signal records over the CQS typed-tree branch
+#                enumeration; no finalized-MIR branch enumeration fills
+#                these rows today.
+#   mir_functions — the per-definition semantic summaries of the def-keyed
+#                lowered functions (MirFunction.callable = Some) of the
+#                verified MIR: block/statement/local counts, reachability
+#                (the verified program IS the reachable program), the
+#                calls_unsafe / calls_unknown fail-closed markers and the
+#                transitive §11 effect summary. IR-synthesized bodies
+#                (drop glue, closures, monomorphized instances, externs)
+#                carry callable = None and get no rows — they DO
+#                participate in the effect propagation graph (documented).
+#   public_api_hash — digest of the sorted pub rows (symbols + types) with
+#                their canonical signature-carrying keys.
+#   abi_hash    — digest of the sorted ABI rows: pub top-level non-generic
+#                Function defs whose def-keyed lowered function is in the
+#                verified program, rendered with the mono.tg ABI
+#                classifier's canonical frame (type_canon_render
+#                CanonExternal + the stable-path map — the type encoding
+#                the TANGERINE_ABI mangling digests). Generic bases render
+#                a deterministic marker; a signature the External frame
+#                rejects renders the fail-closed marker. Pointer widths
+#                are target-desc data and ride the header target text.
+#   unsafe_hash — digest of the sorted unsafe rows: per def-keyed lowered
+#                function, the unsafe-surface markers of its verified
+#                body (the unsafe-fn marker, extern calls, transmutes,
+#                unknown calls, and the transitive may_unsafe class).
+#
+# STABLE IDENTITY: every def's StableDefId is built with ids.tg's
+# stable_def_id_digested over the canonical "path::name#signature" key
+# (the compute_stable_def_id convention of resolver.tg): path::name is the
+# resolver's module_symbols registration key; the signature is the
+# canonical text below (typed FnSignature / declared type / declaration
+# shape — never spans, never ephemeral TypeIds, never ClosureIds). A
+# whitespace/comment-only edit reproduces every table and every digest
+# byte-for-byte.
+#
+# DETERMINISM: every emission table is sorted through the semantic_model.tg
+# sorts (stable-digest order) before any rendering or hashing. All Map/Set
+# uses below are index construction, fixed-point joins or sorted-key
+# materializations — order-insensitive by construction; the only Map
+# iteration that reaches text is the module_symbols keys materialized into
+# a Vec and SORTED before any rendering.
+
+use std::collections::{Vec, Map, Set}
+
+use tg_compiler::ids::{
+  StableDigest, StableDefId, DefId, DefKind, ModuleId, TypeId, EffectId, InstanceId,
+  IntrinsicId, def_id_numeric, stable_digest_of, stable_def_id_digested
+}
+use tg_compiler::ast::{
+  Item, ItemKind, ModuleDecl, Visibility, ExternItem, ContractClause, AstContractKind,
+  AccessConvention
+}
+use tg_compiler::types::{
+  Type, TypeEnv, TypedProgram, TypeDefKind, EffectSummary, CapabilityId, FnSignature,
+  TypeCanonCtx, TypeCanonFrame, def_id_kind_of_recovery, effect_summary_merge,
+  effect_summary_of_intrinsic, type_canon_render
+}
+use tg_compiler::asm::{AsmTarget, Arch, OsAbi}
+use tg_compiler::mono::{mir_fn_abi_signature}
+use tg_compiler::mir::{
+  MirProgram, MirFunction, MirOperand, MirStatementKind, MirTerminatorKind, MirOperandKind,
+  MirConstantKind, MirRvalueKind, MirTypeDefKind, CastKind, Place, Projection,
+  MirEffectState, mir_effect_scan_function
+}
+use tg_compiler::semantic_model::{
+  SemanticSnapshot, TargetId, semantic_digest_zero, semantic_digest_render,
+  semantic_json_escape, SemanticSymbol, SemanticType, SemanticTypeKind, CallEdge,
+  CallEdgeKind, EffectEdge, CapabilityEdge, CapabilityEdgeKind, OwnershipFact, ContractFact,
+  MirSemanticSummary,
+  semantic_symbols_sort, semantic_types_sort, semantic_call_edges_sort,
+  semantic_effect_edges_sort, semantic_capability_edges_sort, semantic_ownership_facts_sort,
+  semantic_contract_facts_sort, semantic_mir_summaries_sort,
+  semantic_stable_def_id_digest, semantic_call_edge_kind_numeric,
+  semantic_access_convention_numeric, semantic_def_kind_text, semantic_summary_dirty_word
+}
+
+# ———————————————————————————————————————————————————————————————
+# Target identity
+# ———————————————————————————————————————————————————————————————
+
+# The TargetId of the compiler's ONE AsmTarget (the codegen target the
+# snapshot hook receives): the deterministic "<arch>-<os>" text of the
+# canonical target pair (TargetDesc.name-style names; pointer width and
+# the ABI-relevant policies are target-desc data that never ride the
+# snapshot tables — the target text rides the header).
+pub def semantic_target_id_of(target: AsmTarget) -> TargetId
+  var arch = match target.arch
+  when Arch::X86_64 then "x86_64"
+  when Arch::AArch64 then "aarch64"
+  end
+  var os = match target.os
+  when OsAbi::Linux then "linux"
+  when OsAbi::MacOS then "darwin"
+  when OsAbi::Windows then "windows"
+  end
+  TargetId { name: arch + "-" + os }
+end
+
+# ———————————————————————————————————————————————————————————————
+# Build context — the shared read-only finalized state
+# ———————————————————————————————————————————————————————————————
+
+struct SnapshotBuildCtx
+  env: TypeEnv
+  typed: TypedProgram
+  mir: MirProgram
+  # ModuleId.id -> module path text ("a::b"; "" for the root).
+  module_paths: Map[Int, String]
+  # numeric DefId (def_id_numeric) -> module_symbols registration key.
+  key_of_def: Map[Int, String]
+  # module_symbols key -> numeric DefId.
+  numeric_of_key: Map[String, Int]
+  # module_symbols key -> TypeId.id (the type-to-declaration association).
+  type_id_of_key: Map[String, Int]
+  # TypeId.id -> TypeEnv.type_list index.
+  type_list_index: Map[Int, Int]
+  # TypeId.id -> MirProgram.types index (field/variant names).
+  mir_type_index: Map[Int, Int]
+  # numeric DefId -> index of its def-keyed MirFunction (callable = Some).
+  mir_fn_of_numeric: Map[Int, Int]
+end
+
+def snapshot_build_ctx(env: TypeEnv, typed: TypedProgram, mir: MirProgram) -> SnapshotBuildCtx
+  var module_paths: Map[Int, String] = Map::new()
+  for entry in typed.ast.crate.modules.entries() do
+    module_paths.insert(entry.0.id, entry.1.path.join("::"))
+  end
+  var key_of_def: Map[Int, String] = Map::new()
+  var numeric_of_key: Map[String, Int] = Map::new()
+  for entry in typed.resolutions.module_symbols.entries() do
+    let numeric = def_id_numeric(&entry.1)
+    key_of_def.insert(numeric, entry.0.clone())
+    numeric_of_key.insert(entry.0.clone(), numeric)
+  end
+  var type_id_of_key: Map[String, Int] = Map::new()
+  for entry in typed.resolutions.type_def_ids.entries() do
+    match key_of_def.get(def_id_numeric(&entry.1))
+    when Option::Some(k) then type_id_of_key.insert(k.clone(), entry.0)
+    when Option::None then ()
+    end
+  end
+  var type_list_index: Map[Int, Int] = Map::new()
+  for entry in env.type_id_index.entries() do
+    type_list_index.insert(entry.0, entry.1)
+  end
+  var mir_type_index: Map[Int, Int] = Map::new()
+  var ti = 0
+  while ti < mir.types.len() do
+    mir_type_index.insert(mir.types[ti].id.id, ti)
+    ti = ti + 1
+  end
+  var mir_fn_of_numeric: Map[Int, Int] = Map::new()
+  var fi = 0
+  while fi < mir.functions.len() do
+    match mir.functions[fi].callable.clone()
+    when Option::Some(cid) then
+      let num = def_id_numeric(&cid.def)
+      if !mir_fn_of_numeric.contains_key(&num) then
+        mir_fn_of_numeric.insert(num, fi)
+      end
+    when Option::None then ()
+    end
+    fi = fi + 1
+  end
+  SnapshotBuildCtx {
+    env: env,
+    typed: typed,
+    mir: mir,
+    module_paths: module_paths,
+    key_of_def: key_of_def,
+    numeric_of_key: numeric_of_key,
+    type_id_of_key: type_id_of_key,
+    type_list_index: type_list_index,
+    mir_type_index: mir_type_index,
+    mir_fn_of_numeric: mir_fn_of_numeric
+  }
+end
+
+def snapshot_module_path_of(ctx: SnapshotBuildCtx, did: DefId) -> String
+  match ctx.module_paths.get(did.module.id)
+  when Option::Some(p) then p.clone()
+  when Option::None then ""
+  end
+end
+
+def snapshot_def_of_numeric(ctx: SnapshotBuildCtx, numeric: Int) -> DefId
+  # def_id_numeric packs (module.id << 32) + index (ids.tg); unpacked here
+  # ONLY for the def_kinds / typed-signature lookups — the numeric keys are
+  # unique per (module, index), so the recovered DefId is the resolver's.
+  let module_id = numeric >> 32
+  let index = (numeric - (module_id << 32)) as UInt
+  DefId { module: ModuleId { id: module_id }, index: index }
+end
+
+# The registered module-qualified name of a type ("path::Name"; the bare
+# registered name for an unregistered/builtin declaration).
+def snapshot_type_qualified_name(ctx: SnapshotBuildCtx, tid: TypeId) -> String
+  var ti_idx = -1
+  match ctx.type_list_index.get(tid.id)
+  when Option::Some(i) then ti_idx = i
+  when Option::None then ()
+  end
+  if ti_idx >= 0 && ti_idx < ctx.env.type_list.len() then
+    let td = ctx.env.type_list[ti_idx]
+    var qname = td.name.clone()
+    match td.def
+    when Option::Some(did) then
+      let path = snapshot_module_path_of(ctx, &did)
+      if path.len() > 0 then
+        qname = path + "::" + td.name
+      end
+    when Option::None then ()
+    end
+    return qname
+  end
+  "Named#" + tid.id.to_string()
+end
+
+# ———————————————————————————————————————————————————————————————
+# Canonical type text — the snapshot's deterministic type rendering
+# ———————————————————————————————————————————————————————————————
+# One deterministic text per Type variant (the canonical-key signature
+# component). Nominal Adts render by their module-qualified registered
+# name; generic parameters by their semantic GenericParamId (the ids.tg
+# identity); effects by their interned ids (sorted). Renderings never
+# embed a per-compilation TypeId / ClosureId / span, and composites are
+# bracket-delimited (unambiguous under concatenation).
+
+def snapshot_conv_text(c: AccessConvention) -> String
+  match c
+  when AccessConvention::Let then "let"
+  when AccessConvention::Inout then "inout"
+  when AccessConvention::Sink then "sink"
+  when AccessConvention::Set then "set"
+  end
+end
+
+def snapshot_effect_ids_sorted(effects: Vec[EffectId]) -> Vec[Int]
+  var ids: Vec[Int] = Vec::new()
+  for e in effects do
+    ids.push(e.id)
+  end
+  ids.sort()
+  ids
+end
+
+def snapshot_effect_ids_text(effects: Vec[EffectId]) -> String
+  var ids = snapshot_effect_ids_sorted(&effects)
+  if ids.len() == 0 then return "" end
+  var s = "effects("
+  var i = 0
+  while i < ids.len() do
+    if i > 0 then s = s + "," end
+    s = s + "e" + ids[i].to_string()
+    i = i + 1
+  end
+  s + ")"
+end
+
+def snapshot_effect_ids_joined(effects: Vec[EffectId]) -> String
+  var ids = snapshot_effect_ids_sorted(&effects)
+  var s = ""
+  var i = 0
+  while i < ids.len() do
+    if i > 0 then s = s + "," end
+    s = s + "e" + ids[i].to_string()
+    i = i + 1
+  end
+  s
+end
+
+def snapshot_type_text(ctx: SnapshotBuildCtx, ty: Type) -> String
+  match ty
+  when Type::Unit then "unit"
+  when Type::Bool then "bool"
+  when Type::Int then "int"
+  when Type::UInt then "uint"
+  when Type::Float then "float"
+  when Type::Char then "char"
+  when Type::String then "str"
+  when Type::StaticStrPtr then "staticstrptr"
+  when Type::Never then "never"
+  when Type::I8 then "i8"
+  when Type::I16 then "i16"
+  when Type::I32 then "i32"
+  when Type::I64 then "i64"
+  when Type::I128 then "i128"
+  when Type::U8 then "u8"
+  when Type::U16 then "u16"
+  when Type::U32 then "u32"
+  when Type::U64 then "u64"
+  when Type::U128 then "u128"
+  when Type::ISize then "isize"
+  when Type::USize then "usize"
+  when Type::F32 then "f32"
+  when Type::F64 then "f64"
+  when Type::IntLiteral(v) then "intlit(" + v.to_string() + ")"
+  when Type::Adt(tid, args) then
+    var s = "T[" + snapshot_type_qualified_name(ctx, &tid)
+    for a in args do
+      s = s + "[" + snapshot_type_text(ctx, &a) + "]"
+    end
+    s + "]"
+  when Type::FixedArray(elem, n) then
+    "A[" + snapshot_type_text(ctx, &elem) + ";" + n.to_string() + "]"
+  when Type::FixedArraySym(elem, gpid) then
+    "AS[" + snapshot_type_text(ctx, &elem) + ";c" + gpid.index.to_string() + "]"
+  when Type::FnPtr(params, ret, effects) then
+    var parts = Vec::new()
+    for p in params do
+      parts.push(snapshot_conv_text(&p.convention) + ":" + snapshot_type_text(ctx, &p.ty))
+    end
+    "F(" + parts.join(",") + ")->" + snapshot_type_text(ctx, &ret) + snapshot_effect_ids_text(&effects)
+  when Type::Closure(_, params, ret, captures, effects) then
+    var parts2 = Vec::new()
+    for p2 in params do
+      parts2.push(snapshot_conv_text(&p2.convention) + ":" + snapshot_type_text(ctx, &p2.ty))
+    end
+    "C(" + parts2.join(",") + ")->" + snapshot_type_text(ctx, &ret) + "{" +
+      snapshot_type_text(ctx, &captures) + "}" + snapshot_effect_ids_text(&effects)
+  when Type::RefInternal(inner, mutable) then
+    if mutable then "Rmut[" + snapshot_type_text(ctx, &inner) + "]" else "Rref[" + snapshot_type_text(ctx, &inner) + "]" end
+  when Type::Ptr(inner) then "P[" + snapshot_type_text(ctx, &inner) + "]"
+  when Type::PtrMut(inner) then "Q[" + snapshot_type_text(ctx, &inner) + "]"
+  when Type::Dyn(tid2) then "D[" + snapshot_type_qualified_name(ctx, &tid2) + "]"
+  when Type::Effect(effects2, inner2) then
+    "E{" + snapshot_effect_ids_joined(&effects2) + "|" + snapshot_type_text(ctx, &inner2) + "}"
+  when Type::Tuple(fields) then
+    var parts3 = Vec::new()
+    for f in fields do
+      parts3.push(snapshot_type_text(ctx, &f))
+    end
+    "(" + parts3.join(",") + ")"
+  when Type::Var(_) then "var"
+  when Type::Param(gpid) then "P" + gpid.index.to_string() + "o" + def_id_numeric(&gpid.owner).to_string()
+  when Type::Const(v) then "const(" + v.to_string() + ")"
+  when Type::ConstParam(gpid2) then "CP" + gpid2.index.to_string()
+  when Type::ConstSym(_) then "constsym"
+  when Type::Error then "err"
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Per-def canonical signature texts
+# ———————————————————————————————————————————————————————————————
+
+# The typed FnSignature of a def (the checker's typed def table keyed by
+# the DefId's fn-owner key — the same key the MIR reads).
+def snapshot_typed_fn_signature(ctx: SnapshotBuildCtx, did: DefId) -> Option[FnSignature]
+  let key = fn_owner_key_of_def(&ctx.typed.ast, &ctx.typed.resolutions, &did)
+  match ctx.typed.typed_fn_signatures.get(key)
+  when Option::Some(sig) then Option::Some(sig.clone())
+  when Option::None then Option::None
+  end
+end
+
+def snapshot_fn_sig_text(ctx: SnapshotBuildCtx, sig: FnSignature) -> String
+  var parts = Vec::new()
+  for p in sig.params do
+    parts.push(snapshot_conv_text(&p.convention) + ":" + snapshot_type_text(ctx, &p.ty))
+  end
+  var s = "fn(" + parts.join(",") + ")->" + snapshot_type_text(ctx, &sig.ret_type)
+  s + snapshot_effect_ids_text(&sig.declared_effects)
+end
+
+# The canonical signature text of a lowered def-keyed MirFunction (the
+# typed-record fallback): parameter conventions recovered from the
+# RefInternal wrap exactly like the mono ABI signature recovery.
+def snapshot_mir_fn_sig_text(ctx: SnapshotBuildCtx, f: MirFunction) -> String
+  var parts = Vec::new()
+  for p in f.params do
+    match p.ty
+    when Type::RefInternal(inner, mutable) then
+      if mutable then
+        parts.push("inout:" + snapshot_type_text(ctx, &inner))
+      else
+        parts.push("let:" + snapshot_type_text(ctx, &p.ty))
+      end
+    when _ then
+      parts.push("let:" + snapshot_type_text(ctx, &p.ty))
+    end
+  end
+  var s = "fn(" + parts.join(",") + ")->" + snapshot_type_text(ctx, &f.ret_type)
+  s + snapshot_effect_ids_text(&f.declared_effects)
+end
+
+# The signature text of a Function/Method def: the typed record first, the
+# def-keyed MIR lowering second, "" otherwise.
+def snapshot_callable_sig_text(ctx: SnapshotBuildCtx, numeric: Int) -> String
+  let did = snapshot_def_of_numeric(ctx, numeric)
+  match snapshot_typed_fn_signature(ctx, &did)
+  when Option::Some(sig) then snapshot_fn_sig_text(ctx, sig)
+  when Option::None then
+    match ctx.mir_fn_of_numeric.get(numeric)
+    when Option::Some(idx) then
+      if idx >= 0 && idx < ctx.mir.functions.len() then
+        snapshot_mir_fn_sig_text(ctx, &ctx.mir.functions[idx])
+      else
+        ""
+      end
+    when Option::None then ""
+    end
+  end
+end
+
+# The typed declared-type signature text of a static/const def (the typed
+# static/const table keyed by the module-qualified key).
+def snapshot_declared_type_sig_text(ctx: SnapshotBuildCtx, key: String) -> String
+  match ctx.typed.typed_static_types.get(key)
+  when Option::Some(ty) then snapshot_type_text(ctx, &ty)
+  when Option::None then ""
+  end
+end
+
+# The signature text of a registered nominal type declaration (the env
+# canonical type tables): struct field shapes / enum variant shapes /
+# trait method shapes — the declaration's CONTENT, never its TypeId.
+def snapshot_type_sig_text(ctx: SnapshotBuildCtx, tid: Int) -> String
+  if tid < 0 then return "type" end
+  match ctx.type_list_index.get(tid)
+  when Option::Some(idx) then
+    if idx >= 0 && idx < ctx.env.type_list.len() then
+      let td = ctx.env.type_list[idx]
+      match td.def_kind
+      when TypeDefKind::Struct(fields) then
+        var parts = Vec::new()
+        for fl in fields do
+          parts.push(fl.name.clone() + ":" + snapshot_type_text(ctx, &fl.ty))
+        end
+        "struct{" + parts.join(",") + "}"
+      when TypeDefKind::Enum(variants) then
+        var parts2 = Vec::new()
+        for vr in variants do
+          var vparts = Vec::new()
+          for vt in vr.fields do
+            vparts.push(snapshot_type_text(ctx, &vt))
+          end
+          parts2.push(vr.name.clone() + "(" + vparts.join(",") + ")")
+        end
+        "enum{" + parts2.join(",") + "}"
+      when TypeDefKind::Trait(methods) then
+        var parts3 = Vec::new()
+        for ms in methods do
+          var mparts = Vec::new()
+          for p in ms.params do
+            mparts.push(snapshot_conv_text(&p.convention) + ":" + snapshot_type_text(ctx, &p.ty))
+          end
+          parts3.push(ms.name.clone() + "(" + mparts.join(",") + ")->" + snapshot_type_text(ctx, &ms.ret_type))
+        end
+        "trait{" + parts3.join(",") + "}"
+      when TypeDefKind::Alias(inner) then "alias(" + snapshot_type_text(ctx, &inner) + ")"
+      when _ then "type"
+      end
+    else
+      "type"
+    end
+  when Option::None then "type"
+  end
+end
+
+def snapshot_type_kind_of(ctx: SnapshotBuildCtx, tid: Int) -> Option[SemanticTypeKind]
+  if tid < 0 then return Option::None end
+  match ctx.type_list_index.get(tid)
+  when Option::Some(idx) then
+    if idx >= 0 && idx < ctx.env.type_list.len() then
+      match ctx.env.type_list[idx].def_kind
+      when TypeDefKind::Struct(_) then Option::Some(SemanticTypeKind::Struct)
+      when TypeDefKind::Enum(_) then Option::Some(SemanticTypeKind::Enum)
+      when TypeDefKind::Trait(_) then Option::Some(SemanticTypeKind::Trait)
+      when _ then Option::None
+      end
+    else
+      Option::None
+    end
+  when Option::None then Option::None
+  end
+end
+
+def snapshot_type_generic_arity(ctx: SnapshotBuildCtx, tid: Int) -> Int
+  if tid < 0 then return 0 end
+  match ctx.type_list_index.get(tid)
+  when Option::Some(idx) then
+    if idx >= 0 && idx < ctx.env.type_list.len() then
+      ctx.env.type_list[idx].generic_params.len()
+    else
+      0
+    end
+  when Option::None then 0
+  end
+end
+
+# The signature text of an extern function (its lowered bodyless extern
+# MirFunction — same bare emission name) or "" when no lowering exists.
+def snapshot_extern_fn_sig_text(ctx: SnapshotBuildCtx, key: String) -> String
+  var name = snapshot_key_name(key)
+  for f in ctx.mir.functions do
+    if f.name == name && f.is_extern then
+      return snapshot_mir_fn_sig_text(ctx, f)
+    end
+  end
+  ""
+end
+
+def snapshot_key_name(key: String) -> String
+  var pos = key.len()
+  while pos >= 2 do
+    if key.slice(pos - 2, pos) == "::" then
+      return key.slice(pos, key.len())
+    end
+    pos = pos - 1
+  end
+  key.clone()
+end
+
+def snapshot_key_module(key: String) -> String
+  var pos = key.len()
+  while pos >= 2 do
+    if key.slice(pos - 2, pos) == "::" then
+      return key.slice(0, pos - 2)
+    end
+    pos = pos - 1
+  end
+  "".to_string()
+end
+
+# ———————————————————————————————————————————————————————————————
+# The deterministic item walk — the def metadata (pub / generic / clauses)
+# ———————————————————————————————————————————————————————————————
+# Mirrors the resolver's registration walk shape (top-level items in
+# Program.items order, inline-module recursion appending the module
+# segment); FIRST-WINS like the resolver. Only keys that actually
+# registered in module_symbols are recorded, so the metadata always lands
+# on the registered identity.
+
+struct SnapshotItemMeta
+  is_pub: Bool
+  is_generic: Bool
+end
+
+# Record the item-derived metadata of one registration attempt.
+def snapshot_record_meta(
+  inout metas: Map[String, SnapshotItemMeta],
+  inout clauses: Map[String, Vec[(AstContractKind, String)]],
+  ctx: SnapshotBuildCtx,
+  key: String,
+  is_pub: Bool,
+  is_generic: Bool,
+  decl_contracts: Vec[(AstContractKind, String)]
+) -> Unit
+  if metas.contains_key(&key) then return end
+  if ctx.numeric_of_key.contains_key(&key) then
+    metas.insert(key.clone(), SnapshotItemMeta { is_pub: is_pub, is_generic: is_generic })
+    if decl_contracts.len() > 0 then
+      clauses.insert(key.clone(), decl_contracts)
+    end
+  end
+end
+
+def snapshot_qualified_key(path: Vec[String], name: String) -> String
+  let joined = path.join("::")
+  if joined.is_empty() then name.clone() else joined + "::" + name.clone() end
+end
+
+def snapshot_decl_contracts(clauses: Vec[ContractClause]) -> Vec[(AstContractKind, String)]
+  var out: Vec[(AstContractKind, String)] = Vec::new()
+  for c in clauses do
+    var text = "".to_string()
+    match c.message
+    when Option::Some(m) then text = m.clone()
+    when Option::None then
+      match c.kind
+      when AstContractKind::AstPre then text = "precondition"
+      when AstContractKind::AstPost then text = "postcondition"
+      when AstContractKind::AstInvariant then text = "invariant"
+      end
+    end
+    out.push((c.kind, text))
+  end
+  out
+end
+
+def snapshot_item_owner_path(ctx: SnapshotBuildCtx, item_idx: Int) -> Vec[String]
+  var owner = ctx.typed.ast.items[item_idx].owner_module
+  var segs: Vec[String] = Vec::new()
+  match ctx.typed.ast.crate.modules.get(owner)
+  when Option::Some(info) then
+    for s in info.path do
+      segs.push(s.clone())
+    end
+  when Option::None then ()
+  end
+  segs
+end
+
+def snapshot_walk_metas(ctx: SnapshotBuildCtx) -> (Map[String, SnapshotItemMeta], Map[String, Vec[(AstContractKind, String)]])
+  var metas: Map[String, SnapshotItemMeta] = Map::new()
+  var clauses: Map[String, Vec[(AstContractKind, String)]] = Map::new()
+  var item_idx = 0
+  while item_idx < ctx.typed.ast.items.len() do
+    let path = snapshot_item_owner_path(ctx, item_idx)
+    snapshot_walk_decl_meta(ctx, &mut metas, &mut clauses, &ctx.typed.ast.items[item_idx], &path)
+    match ctx.typed.ast.items[item_idx].kind
+    when ItemKind::ItemModule(m) then
+      snapshot_walk_module_tree_meta(ctx, &mut metas, &mut clauses, m, &path)
+    when _ then ()
+    end
+    item_idx = item_idx + 1
+  end
+  (metas, clauses)
+end
+
+def snapshot_walk_module_tree_meta(
+  ctx: SnapshotBuildCtx,
+  inout metas: Map[String, SnapshotItemMeta],
+  inout clauses: Map[String, Vec[(AstContractKind, String)]],
+  m: ModuleDecl,
+  path: Vec[String]
+) -> Unit
+  var nested: Vec[String] = Vec::new()
+  for p in path do
+    nested.push(p.clone())
+  end
+  nested.push(m.name.clone())
+  for item in m.items do
+    snapshot_walk_decl_meta(ctx, &mut metas, &mut clauses, &item, &nested)
+    match item.kind
+    when ItemKind::ItemModule(m2) then
+      snapshot_walk_module_tree_meta(ctx, &mut metas, &mut clauses, m2, &nested)
+    when _ then ()
+    end
+  end
+end
+
+def snapshot_walk_decl_meta(
+  ctx: SnapshotBuildCtx,
+  inout metas: Map[String, SnapshotItemMeta],
+  inout clauses: Map[String, Vec[(AstContractKind, String)]],
+  item: Item,
+  path: Vec[String]
+) -> Unit
+  match item.kind
+  when ItemKind::ItemFunction(f) then
+    let key = snapshot_qualified_key(&path, f.name.clone())
+    snapshot_record_meta(&mut metas, &mut clauses, ctx, key, item.is_pub,
+      f.generic_params.len() > 0, snapshot_decl_contracts(&f.contracts))
+  when ItemKind::ItemStruct(s) then
+    let skey = snapshot_qualified_key(&path, s.name.clone())
+    snapshot_record_meta(&mut metas, &mut clauses, ctx, skey, item.is_pub,
+      s.generic_params.len() > 0, Vec::new())
+    for m in s.methods do
+      let mkey = snapshot_qualified_key(&path, s.name.clone() + "::" + m.name.clone())
+      snapshot_record_meta(&mut metas, &mut clauses, ctx, mkey, m.vis == Visibility::Public,
+        m.generic_params.len() > 0, snapshot_decl_contracts(&m.contracts))
+    end
+  when ItemKind::ItemEnum(e) then
+    let ekey = snapshot_qualified_key(&path, e.name.clone())
+    snapshot_record_meta(&mut metas, &mut clauses, ctx, ekey, item.is_pub,
+      e.generic_params.len() > 0, Vec::new())
+    for v in e.variants do
+      let vkey = snapshot_qualified_key(&path, v.name.clone())
+      snapshot_record_meta(&mut metas, &mut clauses, ctx, vkey, item.is_pub, false, Vec::new())
+    end
+  when ItemKind::ItemTrait(t) then
+    let tkey = snapshot_qualified_key(&path, t.name.clone())
+    snapshot_record_meta(&mut metas, &mut clauses, ctx, tkey, item.is_pub,
+      t.generic_params.len() > 0, Vec::new())
+  when ItemKind::ItemImpl(_) then
+    # Impl-method metadata is recovered by DefId identity (the item_defs
+    # pairing) in the second pass below — the registration key of an impl
+    # method is the type-EXPRESSION text of the impl, which this module
+    # never re-renders.
+    ()
+  when ItemKind::ItemConst(c) then
+    let ckey = snapshot_qualified_key(&path, c.name.clone())
+    snapshot_record_meta(&mut metas, &mut clauses, ctx, ckey, item.is_pub, false, Vec::new())
+  when ItemKind::ItemStatic(s2) then
+    let stkey = snapshot_qualified_key(&path, s2.name.clone())
+    snapshot_record_meta(&mut metas, &mut clauses, ctx, stkey, item.is_pub, false, Vec::new())
+  when ItemKind::ItemTypeAlias(a) then
+    let akey = snapshot_qualified_key(&path, a.name.clone())
+    snapshot_record_meta(&mut metas, &mut clauses, ctx, akey, item.is_pub,
+      a.generic_params.len() > 0, Vec::new())
+  when ItemKind::ItemExternBlock(ext) then
+    for ext_item in ext.items do
+      match ext_item
+      when ExternItem::Function(ef) then
+        let efkey = snapshot_qualified_key(&path, ef.name.clone())
+        snapshot_record_meta(&mut metas, &mut clauses, ctx, efkey, true, false, Vec::new())
+      when ExternItem::Static(es) then
+        let eskey = snapshot_qualified_key(&path, es.name.clone())
+        snapshot_record_meta(&mut metas, &mut clauses, ctx, eskey, true, false, Vec::new())
+      end
+    end
+  when _ then ()
+  end
+end
+
+# The second metadata pass: impl methods pair with the item_defs Vec[DefId]
+# (the resolver records impl-method DefIds in declaration order); their
+# registration keys are recovered from the DefId -> key table. Struct
+# methods are already covered textually (first pass). Only TOP-LEVEL impls
+# have item_defs entries (the resolver's loop is over Program.items).
+def snapshot_resolve_impl_metas(ctx: SnapshotBuildCtx, inout metas: Map[String, SnapshotItemMeta], inout clauses: Map[String, Vec[(AstContractKind, String)]]) -> Unit
+  var item_idx = 0
+  while item_idx < ctx.typed.ast.items.len() do
+    match ctx.typed.ast.items[item_idx].kind
+    when ItemKind::ItemImpl(imp) then
+      match ctx.typed.resolutions.item_defs.get(item_idx)
+      when Option::Some(dids) then
+        var mi = 0
+        while mi < dids.len() && mi < imp.methods.len() do
+          let numeric = def_id_numeric(&dids[mi])
+          match ctx.key_of_def.get(numeric)
+          when Option::Some(key) then
+            snapshot_record_meta(&mut metas, &mut clauses, ctx, key.clone(),
+              imp.methods[mi].vis == Visibility::Public,
+              imp.generic_params.len() > 0 || imp.methods[mi].generic_params.len() > 0,
+              snapshot_decl_contracts(&imp.methods[mi].contracts))
+          when Option::None then ()
+          end
+          mi = mi + 1
+        end
+      when Option::None then ()
+      end
+    when _ then ()
+    end
+    item_idx = item_idx + 1
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# The def universe — the module_symbols registry rows
+# ———————————————————————————————————————————————————————————————
+
+struct SnapshotDef
+  sid: StableDefId
+  kind: DefKind
+  key: String              # the registration key "path::name"
+  name: String
+  module_path: String
+  is_pub: Bool
+  is_generic: Bool
+  # The declared contracts of the def (fn/method declarations only):
+  # (kind, clause message-or-kind-label).
+  contracts: Vec[(AstContractKind, String)]
+end
+
+# The canonical signature text of a def (the "#" component of its stable
+# key) by DefKind:
+#   Function/Method — typed FnSignature render / def-keyed MIR render / ""
+#   Static/Constant — typed declared-type render / ""
+#   TypeName/Trait  — env canonical type-table shape render
+#   EnumVariant     — "variant"
+def snapshot_def_sig_text(ctx: SnapshotBuildCtx, key: String, kind: DefKind) -> String
+  match kind
+  when DefKind::Function then
+    match ctx.numeric_of_key.get(key.clone())
+    when Option::Some(numeric) then snapshot_callable_sig_text(ctx, numeric)
+    when Option::None then ""
+    end
+  when DefKind::Method then
+    match ctx.numeric_of_key.get(key.clone())
+    when Option::Some(numeric) then snapshot_callable_sig_text(ctx, numeric)
+    when Option::None then ""
+    end
+  when DefKind::Static then snapshot_declared_type_sig_text(ctx, &key)
+  when DefKind::Constant then snapshot_declared_type_sig_text(ctx, &key)
+  when DefKind::TypeName then
+    match ctx.type_id_of_key.get(key.clone())
+    when Option::Some(tid) then snapshot_type_sig_text(ctx, tid)
+    when Option::None then "type"
+    end
+  when DefKind::Trait then
+    match ctx.type_id_of_key.get(key.clone())
+    when Option::Some(tid) then snapshot_type_sig_text(ctx, tid)
+    when Option::None then "trait"
+    end
+  when DefKind::EnumVariant then "variant"
+  when _ then "decl"
+  end
+end
+
+def snapshot_walk_defs(ctx: SnapshotBuildCtx) -> Vec[SnapshotDef]
+  let metas_pair = snapshot_walk_metas(&ctx)
+  var metas = metas_pair.0
+  var clauses = metas_pair.1
+  snapshot_resolve_impl_metas(&ctx, &mut metas, &mut clauses)
+
+  # The registry keys, sorted — the ONLY Map iteration that reaches text.
+  var keys: Vec[String] = Vec::new()
+  for entry in ctx.typed.resolutions.module_symbols.entries() do
+    keys.push(entry.0.clone())
+  end
+  keys.sort_by(|a, b| a < b)
+
+  var defs: Vec[SnapshotDef] = Vec::new()
+  for key in keys do
+    match ctx.numeric_of_key.get(key.clone())
+    when Option::Some(numeric) then
+      let kind = def_id_kind_of_recovery(&ctx.typed.resolutions, &snapshot_def_of_numeric(&ctx, numeric))
+      let sig = snapshot_def_sig_text(&ctx, &key, &kind)
+      var is_pub = false
+      var is_generic = false
+      match metas.get(key.clone())
+      when Option::Some(meta) then
+        is_pub = meta.is_pub
+        is_generic = meta.is_generic
+      when Option::None then ()
+      end
+      var cons: Vec[(AstContractKind, String)] = Vec::new()
+      match clauses.get(key.clone())
+      when Option::Some(cs) then cons = cs.clone()
+      when Option::None then ()
+      end
+      defs.push(SnapshotDef {
+        sid: stable_def_id_digested(key.clone() + "#" + sig.clone(), key.clone()),
+        kind: kind,
+        key: key.clone(),
+        name: snapshot_key_name(&key),
+        module_path: snapshot_key_module(&key),
+        is_pub: is_pub,
+        is_generic: is_generic,
+        contracts: cons
+      })
+    when Option::None then ()
+    end
+  end
+  defs
+end
+
+def snapshot_numeric_of_def(ctx: SnapshotBuildCtx, d: SnapshotDef) -> Int
+  match ctx.numeric_of_key.get(d.key.clone())
+  when Option::Some(numeric) then numeric
+  when Option::None then -1
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# The MIR walks
+# ———————————————————————————————————————————————————————————————
+
+struct SnapshotCallSite
+  caller_key: String
+  callee_numeric: Int      # resolved def numeric; -2 = intrinsic-name
+  callee_name: String
+  kind: CallEdgeKind
+end
+
+struct SnapshotOwnership
+  function_key: String
+  place_key: String
+  convention: AccessConvention
+end
+
+struct SnapshotScan
+  statement_count: Int
+  direct_unsafe: Bool
+  direct_unknown: Bool
+  unsafe_ops: Vec[String]  # the unsafe-surface markers
+end
+
+def snapshot_local_name(f: MirFunction, id: Int) -> String
+  if id >= 0 && id < f.locals.len() then
+    let lname = f.locals[id].name.clone()
+    if lname.len() > 0 then lname else "l" + id.to_string() end
+  else
+    "l" + id.to_string()
+  end
+end
+
+# The canonical place-key text of a MIR place within a function
+# ("local.field[idx]..." — field/variant names from the finalized MIR type
+# table).
+def snapshot_place_key(ctx: SnapshotBuildCtx, f: MirFunction, p: Place) -> String
+  var text = snapshot_local_name(f, &p.local.id)
+  for proj in p.projections do
+    match proj
+    when Projection::ProjDeref then text = text + "*"
+    when Projection::Field(fid) then
+      text = text + "." + snapshot_field_name(ctx, &fid.owner, fid.index)
+    when Projection::Variant(vid) then
+      text = text + "." + snapshot_variant_name(ctx, &vid.owner, vid.index as Int)
+    when Projection::TupleIndex(idx) then text = text + "." + idx.to_string()
+    when Projection::ProjIndex(local_id) then
+      text = text + "[" + snapshot_local_name(f, &local_id.id) + "]"
+    when Projection::ProjConstantIndex(idx2) then text = text + "[" + idx2.to_string() + "]"
+    end
+  end
+  text
+end
+
+def snapshot_field_name(ctx: SnapshotBuildCtx, owner: TypeId, index: Int) -> String
+  match ctx.mir_type_index.get(owner.id)
+  when Option::Some(ti) then
+    if ti >= 0 && ti < ctx.mir.types.len() then
+      match ctx.mir.types[ti].kind
+      when MirTypeDefKind::Struct(fields) then
+        if index >= 0 && index < fields.len() then
+          return fields[index].name.clone()
+        end
+        return "f" + index.to_string()
+      when _ then ()
+      end
+    end
+    "f" + index.to_string()
+  when Option::None then "f" + index.to_string()
+  end
+end
+
+def snapshot_variant_name(ctx: SnapshotBuildCtx, owner: TypeId, index: Int) -> String
+  match ctx.mir_type_index.get(owner.id)
+  when Option::Some(ti) then
+    if ti >= 0 && ti < ctx.mir.types.len() then
+      match ctx.mir.types[ti].kind
+      when MirTypeDefKind::Enum(variants) then
+        if index >= 0 && index < variants.len() then
+          return variants[index].name.clone()
+        end
+        return "v" + index.to_string()
+      when _ then ()
+      end
+    end
+    "v" + index.to_string()
+  when Option::None then "v" + index.to_string()
+  end
+end
+
+# The owning-place key of a move/consume operand ("" for non-place ops).
+def snapshot_move_place_key(ctx: SnapshotBuildCtx, f: MirFunction, op: MirOperand) -> String
+  match op.kind
+  when MirOperandKind::MirMovePlace(p) then snapshot_place_key(ctx, f, &p)
+  when MirOperandKind::MirConsume(p) then snapshot_place_key(ctx, f, &p)
+  when _ then ""
+  end
+end
+
+def snapshot_name_is_extern_in_program(ctx: SnapshotBuildCtx, name: String) -> Bool
+  for f in ctx.mir.functions do
+    if f.name == name && f.is_extern then
+      return true
+    end
+  end
+  false
+end
+
+def snapshot_bodyless_intrinsic_name(name: String) -> Bool
+  if name.starts_with("__intrinsic_") then return true end
+  if name.starts_with("string_from_static") then return true end
+  false
+end
+
+def snapshot_intrinsic_is_unsafe(intrinsic: Option[IntrinsicId]) -> Bool
+  match intrinsic
+  when Option::Some(iid) then effect_summary_of_intrinsic(iid).may_unsafe
+  when Option::None then false
+  end
+end
+
+def snapshot_call_kind_of(intrinsic: Option[IntrinsicId], name: String) -> CallEdgeKind
+  if intrinsic.is_some() then
+    CallEdgeKind::Intrinsic
+  elsif name.starts_with("__intrinsic_") then
+    CallEdgeKind::Intrinsic
+  else
+    CallEdgeKind::Direct
+  end
+end
+
+# One MIR function's statement/terminator walk: the direct unsafe/unknown
+# markers, the statement count, the unsafe-surface markers and the
+# call/ownership sites.
+def snapshot_scan_function(
+  ctx: SnapshotBuildCtx,
+  f: MirFunction,
+  inout calls: Vec[SnapshotCallSite],
+  inout ownership: Vec[SnapshotOwnership],
+  inout scans: Map[String, SnapshotScan]
+) -> Unit
+  var stmt_count = 0
+  var d_unsafe = f.is_unsafe
+  var d_unknown = false
+  var unsafe_ops: Vec[String] = Vec::new()
+  if f.is_unsafe then
+    unsafe_ops.push("unsafe-fn".to_string())
+  end
+  for block in f.blocks do
+    for st in block.statements do
+      stmt_count = stmt_count + 1
+      match st.kind
+      when MirStatementKind::MirAssign(dest, rvalue) then
+        match rvalue.kind
+        when MirRvalueKind::MirMove(op) then
+          snapshot_ownership_of_dest(ctx, f, &dest, &mut ownership)
+          let place = snapshot_move_place_key(ctx, f, &op)
+          if place.len() > 0 then
+            ownership.push(SnapshotOwnership {
+              function_key: f.name.clone(),
+              place_key: place,
+              convention: AccessConvention::Sink
+            })
+          end
+        when MirRvalueKind::MirConsume(op2) then
+          snapshot_ownership_of_dest(ctx, f, &dest, &mut ownership)
+          let place2 = snapshot_move_place_key(ctx, f, &op2)
+          if place2.len() > 0 then
+            ownership.push(SnapshotOwnership {
+              function_key: f.name.clone(),
+              place_key: place2,
+              convention: AccessConvention::Sink
+            })
+          end
+        when MirRvalueKind::MirRef(place) then
+          ownership.push(SnapshotOwnership {
+            function_key: f.name.clone(),
+            place_key: snapshot_place_key(ctx, f, &place),
+            convention: AccessConvention::Inout
+          })
+        when MirRvalueKind::MirCast(CastKind::Transmute, _, _) then
+          d_unsafe = true
+          unsafe_ops.push("transmute".to_string())
+        when _ then ()
+        end
+      when MirStatementKind::MirEffectPerform(_, _, _, _, _) then
+        d_unknown = true
+      when _ then ()
+      end
+    end
+    match block.terminator.kind
+    when MirTerminatorKind::MirCall { dest, func, args, success, unwind, intrinsic } then
+      snapshot_scan_call(ctx, f, &func, intrinsic, &mut calls, &mut d_unsafe,
+        &mut d_unknown, &mut unsafe_ops)
+    when MirTerminatorKind::MirDeinit { place, deinit_fn, target, unwind } then
+      ownership.push(SnapshotOwnership {
+        function_key: f.name.clone(),
+        place_key: snapshot_place_key(ctx, f, &place),
+        convention: AccessConvention::Sink
+      })
+      if !snapshot_deinit_known(ctx, &deinit_fn) then
+        d_unknown = true
+      end
+    when _ then ()
+    end
+  end
+  scans.insert(f.name.clone(), SnapshotScan {
+    statement_count: stmt_count,
+    direct_unsafe: d_unsafe,
+    direct_unknown: d_unknown,
+    unsafe_ops: unsafe_ops
+  })
+end
+
+def snapshot_ownership_of_dest(ctx: SnapshotBuildCtx, f: MirFunction, dest: Place, inout ownership: Vec[SnapshotOwnership]) -> Unit
+  ownership.push(SnapshotOwnership {
+    function_key: f.name.clone(),
+    place_key: snapshot_place_key(ctx, f, dest),
+    convention: AccessConvention::Set
+  })
+end
+
+# Whether a MirDeinit payload resolves to in-program glue/finalizer.
+def snapshot_deinit_known(ctx: SnapshotBuildCtx, deinit_fn: InstanceId) -> Bool
+  let num = def_id_numeric(&deinit_fn.def.def)
+  var name = "".to_string()
+  match ctx.mir.drop_glue_fns.get(num)
+  when Option::Some(n) then name = n.clone()
+  when Option::None then ()
+  end
+  if name.len() == 0 then
+    match ctx.mir.method_names_by_def.get(num)
+    when Option::Some(n2) then name = n2.clone()
+    when Option::None then ()
+    end
+  end
+  if name.len() == 0 then return false end
+  for f in ctx.mir.functions do
+    if f.name == name && f.blocks.len() > 0 then
+      return true
+    end
+  end
+  false
+end
+
+# One MirCall terminator: the callee resolution and the unsafe/unknown
+# classification. The callee of a SOURCE call is the MirFnItem constant's
+# INSTANCE payload (the solved InstanceId — its DefId); a name-only
+# constant resolves through the def-keyed emission names, the synthesized
+# intrinsic-name family classifies as an Intrinsic edge, and an in-program
+# extern marks the site unsafe. An indirect VALUE call has no
+# statically-known declaration: it fails closed (unknown) and gets no call
+# row (documented).
+def snapshot_scan_call(
+  ctx: SnapshotBuildCtx,
+  f: MirFunction,
+  func: MirOperand,
+  intrinsic: Option[IntrinsicId],
+  inout calls: Vec[SnapshotCallSite],
+  inout d_unsafe: Bool,
+  inout d_unknown: Bool,
+  inout unsafe_ops: Vec[String]
+) -> Unit
+  match func.kind
+  when MirOperandKind::MirConstant(cv) then
+    match cv.kind
+    when MirConstantKind::MirFnItem(name) then
+      match cv.instance.clone()
+      when Option::Some(inst) then
+        calls.push(SnapshotCallSite {
+          caller_key: f.name.clone(),
+          callee_numeric: def_id_numeric(&inst.def.def),
+          callee_name: name.clone(),
+          kind: snapshot_call_kind_of(intrinsic, &name)
+        })
+        if snapshot_name_is_extern_in_program(ctx, &name) then
+          d_unsafe = true
+          unsafe_ops.push("extern-call:" + name.clone())
+        elsif snapshot_intrinsic_is_unsafe(intrinsic) then
+          d_unsafe = true
+        end
+      when Option::None then
+        if snapshot_name_is_def_keyed(ctx, &name) then
+          calls.push(SnapshotCallSite {
+            caller_key: f.name.clone(),
+            callee_numeric: -3,
+            callee_name: name.clone(),
+            kind: snapshot_call_kind_of(intrinsic, &name)
+          })
+        elsif snapshot_bodyless_intrinsic_name(&name) then
+          calls.push(SnapshotCallSite {
+            caller_key: f.name.clone(),
+            callee_numeric: -2,
+            callee_name: name.clone(),
+            kind: CallEdgeKind::Intrinsic
+          })
+        elsif snapshot_name_is_extern_in_program(ctx, &name) then
+          d_unsafe = true
+          unsafe_ops.push("extern-call:" + name.clone())
+        else
+          # A truly unknown bodyless callee — fail closed (the §11 rule).
+          d_unknown = true
+          d_unsafe = true
+          unsafe_ops.push("unknown-call:" + name.clone())
+        end
+      end
+    when _ then ()
+    end
+  when _ then
+    # A call through a closure or function-pointer VALUE.
+    d_unknown = true
+  end
+end
+
+# Whether the name names a def-keyed function of the verified program.
+def snapshot_name_is_def_keyed(ctx: SnapshotBuildCtx, name: String) -> Bool
+  for f in ctx.mir.functions do
+    if f.name == name then
+      match f.callable.clone()
+      when Option::Some(_) then return true
+      when Option::None then ()
+      end
+    end
+  end
+  false
+end
+
+# ———————————————————————————————————————————————————————————————
+# The transitive §11 effect fixed point
+# ———————————————————————————————————————————————————————————————
+# Runs the mir.tg §11 direct scan over every lowered function, then
+# propagates the summaries (may_* flags + capability sets) and the
+# unsafe/unknown markers to a fixed point over the whole call graph
+# (monotone joins — order-insensitive by construction).
+
+struct SnapshotEffectFinal
+  summary: EffectSummary
+  unsafe_: Bool
+  unknown: Bool
+end
+
+def snapshot_effect_caps_equal(a: EffectSummary, b: EffectSummary) -> Bool
+  for ca in a.capabilities do
+    if !b.capabilities.contains(&ca) then return false end
+  end
+  for cb in b.capabilities do
+    if !a.capabilities.contains(&cb) then return false end
+  end
+  true
+end
+
+def snapshot_effect_same(a: EffectSummary, b: EffectSummary) -> Bool
+  if a.may_allocate != b.may_allocate then return false end
+  if a.may_block != b.may_block then return false end
+  if a.may_io != b.may_io then return false end
+  if a.may_spawn != b.may_spawn then return false end
+  if a.may_sleep != b.may_sleep then return false end
+  if a.may_panic != b.may_panic then return false end
+  if a.may_unsafe != b.may_unsafe then return false end
+  snapshot_effect_caps_equal(a, b)
+end
+
+def snapshot_effect_finals(ctx: SnapshotBuildCtx, scans: Map[String, SnapshotScan]) -> Map[String, SnapshotEffectFinal]
+  var fn_index: Map[String, Int] = Map::new()
+  var fi = 0
+  while fi < ctx.mir.functions.len() do
+    let fname = ctx.mir.functions[fi].name.clone()
+    if !fn_index.contains_key(&fname) then
+      fn_index.insert(fname, fi)
+    end
+    fi = fi + 1
+  end
+  var type_index: Map[Int, String] = Map::new()
+  for td in ctx.mir.types do
+    type_index.insert(td.id.id, td.name.clone())
+  end
+
+  var state = MirEffectState {}
+  for f in ctx.mir.functions do
+    mir_effect_scan_function(&ctx.mir, &mut state, &type_index, &fn_index, &f)
+  end
+
+  var final_sum: Map[String, EffectSummary] = Map::new()
+  for entry in state.direct.entries() do
+    final_sum.insert(entry.0.clone(), entry.1.clone())
+  end
+  var final_unsafe: Map[String, Bool] = Map::new()
+  var final_unknown: Map[String, Bool] = Map::new()
+  for entry in scans.entries() do
+    final_unsafe.insert(entry.0.clone(), entry.1.direct_unsafe)
+    final_unknown.insert(entry.0.clone(), entry.1.direct_unknown)
+  end
+
+  var changed = true
+  while changed do
+    changed = false
+    for caller_entry in state.edges.entries() do
+      let caller = caller_entry.0.clone()
+      var cur_sum = EffectSummary {}
+      match final_sum.get(caller.clone())
+      when Option::Some(cs) then cur_sum = cs.clone()
+      when Option::None then ()
+      end
+      var cur_unsafe = false
+      match final_unsafe.get(caller.clone())
+      when Option::Some(u) then cur_unsafe = u
+      when Option::None then ()
+      end
+      var cur_unknown = false
+      match final_unknown.get(caller.clone())
+      when Option::Some(k2) then cur_unknown = k2
+      when Option::None then ()
+      end
+      for callee in caller_entry.1 do
+        var cal_sum = EffectSummary {}
+        match final_sum.get(callee.clone())
+        when Option::Some(cs2) then cal_sum = cs2.clone()
+        when Option::None then ()
+        end
+        let merged = effect_summary_merge(&cur_sum, &cal_sum)
+        var cal_unsafe = false
+        match final_unsafe.get(callee.clone())
+        when Option::Some(u2) then cal_unsafe = u2
+        when Option::None then ()
+        end
+        var cal_unknown = false
+        match final_unknown.get(callee.clone())
+        when Option::Some(k3) then cal_unknown = k3
+        when Option::None then ()
+        end
+        if !snapshot_effect_same(&cur_sum, &merged) then
+          final_sum.insert(caller.clone(), merged.clone())
+          changed = true
+        end
+        if !cur_unsafe && cal_unsafe then
+          final_unsafe.insert(caller.clone(), true)
+          changed = true
+        end
+        if !cur_unknown && cal_unknown then
+          final_unknown.insert(caller.clone(), true)
+          changed = true
+        end
+      end
+    end
+  end
+
+  var out: Map[String, SnapshotEffectFinal] = Map::new()
+  for entry in state.direct.entries() do
+    var s = EffectSummary {}
+    match final_sum.get(entry.0.clone())
+    when Option::Some(fs) then s = fs.clone()
+    when Option::None then ()
+    end
+    var fu = false
+    match final_unsafe.get(entry.0.clone())
+    when Option::Some(u3) then fu = u3
+    when Option::None then ()
+    end
+    var fk = false
+    match final_unknown.get(entry.0.clone())
+    when Option::Some(k4) then fk = k4
+    when Option::None then ()
+    end
+    out.insert(entry.0.clone(), SnapshotEffectFinal { summary: s, unsafe_: fu, unknown: fk })
+  end
+  out
+end
+
+# ———————————————————————————————————————————————————————————————
+# The builder
+# ———————————————————————————————————————————————————————————————
+
+# The one entry point: build the SemanticSnapshot of a finalized
+# compilation. compiler_version is the producing compiler's version.tg
+# VERSION text. revision is stored as given (pass semantic_digest_zero()
+# and run semantic_snapshot_finalize to self-address the artifact); the
+# three surface hashes are always computed.
+pub def semantic_snapshot_of_final_state(
+  env: TypeEnv,
+  typed: TypedProgram,
+  mir_program: MirProgram,
+  target: TargetId,
+  compiler_version: String,
+  revision: StableDigest
+) -> SemanticSnapshot
+  let ctx = snapshot_build_ctx(env, typed, mir_program)
+
+  # 1. The def universe.
+  let defs = snapshot_walk_defs(&ctx)
+  var def_row_of_numeric: Map[Int, Int] = Map::new()
+  var di = 0
+  while di < defs.len() do
+    match ctx.numeric_of_key.get(defs[di].key.clone())
+    when Option::Some(numeric) then def_row_of_numeric.insert(numeric, di)
+    when Option::None then ()
+    end
+    di = di + 1
+  end
+
+  # 2. The MIR walks (every lowered function — def-keyed and synthesized).
+  var calls: Vec[SnapshotCallSite] = Vec::new()
+  var ownership: Vec[SnapshotOwnership] = Vec::new()
+  var scans: Map[String, SnapshotScan] = Map::new()
+  for f in mir_program.functions do
+    snapshot_scan_function(&ctx, f, &mut calls, &mut ownership, &mut scans)
+  end
+  let finals = snapshot_effect_finals(&ctx, &scans)
+
+  # 3. The semantic tables.
+  var symbols: Vec[SemanticSymbol] = Vec::new()
+  var types: Vec[SemanticType] = Vec::new()
+  var call_rows: Vec[CallEdge] = Vec::new()
+  var effect_rows: Vec[EffectEdge] = Vec::new()
+  var capability_rows: Vec[CapabilityEdge] = Vec::new()
+  var ownership_rows: Vec[OwnershipFact] = Vec::new()
+  var contract_rows: Vec[ContractFact] = Vec::new()
+  var mir_rows: Vec[MirSemanticSummary] = Vec::new()
+
+  var di2 = 0
+  while di2 < defs.len() do
+    let d = defs[di2]
+    let sid = d.sid
+    symbols.push(SemanticSymbol {
+      stable_id: sid,
+      kind: d.kind,
+      name: d.name.clone(),
+      module_path: d.module_path.clone(),
+      is_pub: d.is_pub,
+      is_generic: d.is_generic
+    })
+    # The SemanticType rows: nominal Struct/Enum/Trait declarations only.
+    var is_nominal_kind = false
+    match d.kind
+    when DefKind::TypeName then is_nominal_kind = true
+    when DefKind::Trait then is_nominal_kind = true
+    when _ then ()
+    end
+    if is_nominal_kind then
+      match ctx.type_id_of_key.get(d.key.clone())
+      when Option::Some(tid) then
+        match snapshot_type_kind_of(&ctx, tid)
+        when Option::Some(tk) then
+          types.push(SemanticType {
+            stable_id: sid,
+            kind: tk,
+            name: d.name.clone(),
+            module_path: d.module_path.clone(),
+            generic_arity: snapshot_type_generic_arity(&ctx, tid),
+            is_pub: d.is_pub
+          })
+        when Option::None then ()
+        end
+      when Option::None then ()
+      end
+    end
+    # Contract facts (the def-table clauses — fn/method rows only).
+    for c in d.contracts do
+      contract_rows.push(ContractFact {
+        function: sid,
+        kind: c.0,
+        clause_text: c.1.clone()
+      })
+    end
+    # The def-keyed MIR rows (effects / capabilities / mir summaries).
+    match ctx.mir_fn_of_numeric.get(snapshot_numeric_of_def(&ctx, &d))
+    when Option::Some(fn_idx) then
+      if fn_idx >= 0 && fn_idx < mir_program.functions.len() then
+        let mf = mir_program.functions[fn_idx]
+        var fin = SnapshotEffectFinal { summary: EffectSummary {}, unsafe_: false, unknown: false }
+        match finals.get(mf.name.clone())
+        when Option::Some(fv) then
+          fin = SnapshotEffectFinal { summary: fv.summary.clone(), unsafe_: fv.unsafe_, unknown: fv.unknown }
+        when Option::None then ()
+        end
+        effect_rows.push(EffectEdge { function: sid, summary: fin.summary.clone() })
+        for cap in fin.summary.capabilities do
+          capability_rows.push(CapabilityEdge {
+            function: sid,
+            capability: cap,
+            kind: CapabilityEdgeKind::Requires
+          })
+        end
+        var scan = SnapshotScan { statement_count: 0, direct_unsafe: false, direct_unknown: false, unsafe_ops: Vec::new() }
+        match scans.get(mf.name.clone())
+        when Option::Some(sv) then
+          scan = SnapshotScan { statement_count: sv.statement_count, direct_unsafe: sv.direct_unsafe, direct_unknown: sv.direct_unknown, unsafe_ops: sv.unsafe_ops.clone() }
+        when Option::None then ()
+        end
+        mir_rows.push(MirSemanticSummary {
+          function: sid,
+          block_count: mf.blocks.len(),
+          statement_count: scan.statement_count,
+          local_count: mf.locals.len(),
+          reachable: mf.blocks.len() > 0,
+          calls_unsafe: fin.unsafe_,
+          calls_unknown: fin.unknown,
+          effect_summary: fin.summary
+        })
+      end
+    when Option::None then ()
+    end
+    di2 = di2 + 1
+  end
+
+  # Call rows: def-keyed callers only.
+  var seen_calls: Set[String] = Set::new()
+  var call_i = 0
+  while call_i < calls.len() do
+    let cs = calls[call_i]
+    var caller_numeric = -1
+    for f in mir_program.functions do
+      if f.name == cs.caller_key then
+        match f.callable.clone()
+        when Option::Some(cid) then caller_numeric = def_id_numeric(&cid.def)
+        when Option::None then ()
+        end
+        break
+      end
+    end
+    var caller_row = -1
+    match def_row_of_numeric.get(caller_numeric)
+    when Option::Some(cr) then caller_row = cr
+    when Option::None then ()
+    end
+    if caller_row >= 0 then
+      var callee_sid: Option[StableDefId] = Option::None
+      if cs.callee_numeric == -2 then
+        let skey = "intrinsic::" + cs.callee_name.clone()
+        callee_sid = Option::Some(stable_def_id_digested(skey.clone() + "#op", skey.clone()))
+      elsif cs.callee_numeric == -3 then
+        # An emission-name-resolved callee: find its def row.
+        for f2 in mir_program.functions do
+          if f2.name == cs.callee_name then
+            match f2.callable.clone()
+            when Option::Some(cid2) then
+              match def_row_of_numeric.get(def_id_numeric(&cid2.def))
+              when Option::Some(cal_row) then callee_sid = Option::Some(defs[cal_row].sid)
+              when Option::None then ()
+              end
+            when Option::None then ()
+            end
+            break
+          end
+        end
+      else
+        match def_row_of_numeric.get(cs.callee_numeric)
+        when Option::Some(cal_row) then callee_sid = Option::Some(defs[cal_row].sid)
+        when Option::None then ()
+        end
+      end
+      match callee_sid
+      when Option::Some(csid) then
+        let dedupe = cs.caller_key.clone() + "|" + cs.callee_name.clone() + "|" +
+          semantic_call_edge_kind_numeric(&cs.kind).to_string()
+        if !seen_calls.contains(&dedupe) then
+          seen_calls.insert(dedupe.clone())
+          call_rows.push(CallEdge {
+            caller: defs[caller_row].sid,
+            callee: csid,
+            kind: cs.kind
+          })
+        end
+      when Option::None then ()
+      end
+    end
+    call_i = call_i + 1
+  end
+
+  # Ownership rows: def-keyed functions; deduped per (function, place,
+  # convention).
+  var seen_ownership: Set[String] = Set::new()
+  var own_i = 0
+  while own_i < ownership.len() do
+    let ow = ownership[own_i]
+    var owner_numeric = -1
+    for f3 in mir_program.functions do
+      if f3.name == ow.function_key then
+        match f3.callable.clone()
+        when Option::Some(cid3) then owner_numeric = def_id_numeric(&cid3.def)
+        when Option::None then ()
+        end
+        break
+      end
+    end
+    match def_row_of_numeric.get(owner_numeric)
+    when Option::Some(fn_row) then
+      let d2 = defs[fn_row]
+      let dedupe2 = d2.key.clone() + "|" + ow.place_key.clone() + "|" +
+        semantic_access_convention_numeric(&ow.convention).to_string()
+      if !seen_ownership.contains(&dedupe2) then
+        seen_ownership.insert(dedupe2.clone())
+        ownership_rows.push(OwnershipFact {
+          function: d2.sid,
+          place_key: ow.place_key.clone(),
+          convention: ow.convention
+        })
+      end
+    when Option::None then ()
+    end
+    own_i = own_i + 1
+  end
+
+  # 4. Sort every table (the semantic_model sorts — stable-digest order),
+  #    compute the surface hashes over the sorted tables, and emit.
+  semantic_symbols_sort(&mut symbols)
+  semantic_types_sort(&mut types)
+  semantic_call_edges_sort(&mut call_rows)
+  semantic_effect_edges_sort(&mut effect_rows)
+  semantic_capability_edges_sort(&mut capability_rows)
+  semantic_ownership_facts_sort(&mut ownership_rows)
+  semantic_contract_facts_sort(&mut contract_rows)
+  semantic_mir_summaries_sort(&mut mir_rows)
+
+  var snapshot = SemanticSnapshot {
+    revision: revision,
+    compiler_version: compiler_version,
+    target: target,
+    public_api_hash: semantic_digest_zero(),
+    abi_hash: semantic_digest_zero(),
+    unsafe_hash: semantic_digest_zero()
+  }
+  snapshot.symbols = symbols
+  snapshot.types = types
+  snapshot.calls = call_rows
+  snapshot.effects = effect_rows
+  snapshot.capabilities = capability_rows
+  snapshot.ownership = ownership_rows
+  snapshot.contracts = contract_rows
+  snapshot.mir_functions = mir_rows
+  snapshot.public_api_hash = stable_digest_of(&snapshot_public_api_text(&snapshot))
+  snapshot.abi_hash = stable_digest_of(&snapshot_abi_text(&ctx, &defs))
+  snapshot.unsafe_hash = stable_digest_of(&snapshot_unsafe_text(&ctx, &defs, &finals, &scans))
+  snapshot
+end
+
+# ———————————————————————————————————————————————————————————————
+# The surface-hash domains (deterministic text over sorted tables)
+# ———————————————————————————————————————————————————————————————
+
+# public_api: every pub row's canonical key with its DefKind text.
+def snapshot_public_api_text(snapshot: SemanticSnapshot) -> String
+  var lines: Vec[String] = Vec::new()
+  for sym in snapshot.symbols do
+    if sym.is_pub then
+      lines.push(semantic_digest_render(&semantic_stable_def_id_digest(&sym.stable_id)) + " " +
+        semantic_def_kind_text(&sym.kind) + " " + sym.stable_id.key.clone())
+    end
+  end
+  for ty in snapshot.types do
+    if ty.is_pub then
+      lines.push(semantic_digest_render(&semantic_stable_def_id_digest(&ty.stable_id)) + " " +
+        "type " + ty.stable_id.key.clone())
+    end
+  end
+  lines.sort_by(|a, b| a < b)
+  var text = ""
+  for l in lines do
+    text = text + l + "\n"
+  end
+  text
+end
+
+# abi: the exported-function ABI rows — pub top-level non-generic Function
+# defs with a def-keyed lowering in the verified program, rendered through
+# the mono ABI classifier's canonical frame (CanonExternal + the
+# stable-path map — the type encoding the TANGERINE_ABI mangling digests).
+# A generic base has no single ABI surface (its instances do): the row
+# renders a deterministic marker. A signature the External frame rejects
+# renders the fail-closed marker. Pointer widths are target-desc data and
+# ride the header.
+def snapshot_abi_text(ctx: SnapshotBuildCtx, defs: Vec[SnapshotDef]) -> String
+  # The stable-path map of the ABI frame: TypeId -> "module::name".
+  var stable_paths: Map[Int, String] = Map::new()
+  for entry in ctx.typed.resolutions.type_def_ids.entries() do
+    match ctx.key_of_def.get(def_id_numeric(&entry.1))
+    when Option::Some(k) then stable_paths.insert(entry.0, k.clone())
+    when Option::None then ()
+    end
+  end
+  var lines: Vec[String] = Vec::new()
+  for d in defs do
+    var is_fn = false
+    match d.kind
+    when DefKind::Function then is_fn = true
+    when _ then ()
+    end
+    if d.is_pub && is_fn then
+      match ctx.mir_fn_of_numeric.get(snapshot_numeric_of_def(ctx, &d))
+      when Option::Some(fn_idx) then
+        if fn_idx >= 0 && fn_idx < ctx.mir.functions.len() then
+          let mf = ctx.mir.functions[fn_idx]
+          let digest_text = semantic_digest_render(&semantic_stable_def_id_digest(&d.sid))
+          if mf.generic_params.len() > 0 then
+            lines.push(digest_text + " " + d.key.clone() + " generic")
+          else
+            let sig = mir_fn_abi_signature(mf)
+            let ctx2 = TypeCanonCtx {
+              frame: TypeCanonFrame::CanonExternal,
+              type_names: stable_paths.clone(),
+              param_names: ctx.typed.generic_param_names.clone(),
+              lang_option: ctx.env.lang_items.option,
+              lang_result: ctx.env.lang_items.result,
+              lang_map: ctx.env.lang_items.map,
+              lang_set: ctx.env.lang_items.set,
+              lang_slice: ctx.env.lang_items.slice,
+              lang_array: ctx.env.lang_items.array,
+              lang_box: ctx.env.lang_items.box_,
+              lang_rc: ctx.env.lang_items.rc,
+              effects: ctx.env.effects
+            }
+            match type_canon_render(&ctx2, &sig)
+            when Result::Ok(text) then
+              lines.push(digest_text + " " + d.key.clone() + " " + text.clone())
+            when Result::Err(_) then
+              lines.push(digest_text + " " + d.key.clone() + " abi-fail-closed")
+            end
+          end
+        end
+      when Option::None then ()
+      end
+    end
+  end
+  lines.sort_by(|a, b| a < b)
+  var out = ""
+  for l in lines do
+    out = out + l + "\n"
+  end
+  out
+end
+
+# unsafe: per def-keyed lowered function, its unsafe-surface markers
+# (unsafe-fn / extern-call / transmute / unknown-call + the transitive
+# may_unsafe class).
+def snapshot_unsafe_text(
+  ctx: SnapshotBuildCtx,
+  defs: Vec[SnapshotDef],
+  finals: Map[String, SnapshotEffectFinal],
+  scans: Map[String, SnapshotScan]
+) -> String
+  var lines: Vec[String] = Vec::new()
+  for d in defs do
+    match ctx.mir_fn_of_numeric.get(snapshot_numeric_of_def(ctx, &d))
+    when Option::Some(fn_idx) then
+      if fn_idx >= 0 && fn_idx < ctx.mir.functions.len() then
+        let fname = ctx.mir.functions[fn_idx].name.clone()
+        let digest_text = semantic_digest_render(&semantic_stable_def_id_digest(&d.sid))
+        var ops: Vec[String] = Vec::new()
+        match scans.get(fname.clone())
+        when Option::Some(sv) then
+          for op in sv.unsafe_ops do
+            ops.push(op.clone())
+          end
+        when Option::None then ()
+        end
+        var may_unsafe = false
+        match finals.get(fname.clone())
+        when Option::Some(fv) then may_unsafe = fv.summary.may_unsafe
+        when Option::None then ()
+        end
+        ops.sort_by(|a, b| a < b)
+        for op2 in ops do
+          lines.push(digest_text.clone() + " " + op2)
+        end
+        if may_unsafe then
+          lines.push(digest_text + " transitive-unsafe")
+        end
+      end
+    when Option::None then ()
+    end
+  end
+  lines.sort_by(|a, b| a < b)
+  var out = ""
+  for l in lines do
+    out = out + l + "\n"
+  end
+  out
+end
+
+# ———————————————————————————————————————————————————————————————
+# Serialization + the content-addressed revision
+# ———————————————————————————————————————————————————————————————
+# The canonical text form is line-oriented JSON records (the coverage.tg
+# tgcov JSONL precedent) in the protocol's fixed table order; every table
+# is sorted through the semantic_model sorts before rendering (the
+# serializers re-sort defensively — idempotent on sorted input). Span
+# fields NEVER serialize: they are provenance metadata, and a
+# whitespace/comment-only edit must not move a byte of the canonical
+# text.
+#
+# semantic_snapshot_digest hashes the canonical text with the revision
+# header field rendered as 0-0: revision is the content-addressed
+# self-digest of the artifact — the digest never depends on the stored
+# revision words, so two compilations with identical semantic content
+# produce identical artifacts and identical digests.
+
+def snapshot_bool_text(b: Bool) -> String
+  if b then "true" else "false" end
+end
+
+def snapshot_caps_text(s: EffectSummary) -> String
+  var ids: Vec[Int] = Vec::new()
+  for c in s.capabilities do
+    ids.push(c.id)
+  end
+  ids.sort()
+  var t = ""
+  var i = 0
+  while i < ids.len() do
+    if i > 0 then t = t + ";" end
+    t = t + ids[i].to_string()
+    i = i + 1
+  end
+  t
+end
+
+def snapshot_header_line(snapshot: SemanticSnapshot, zero_revision: Bool) -> String
+  let rev = if zero_revision then semantic_digest_zero() else snapshot.revision end
+  "{\"s\":\"header\",\"v\":1,\"format\":\"tg-semantic-snapshot/v1\"," +
+    "\"compiler_version\":\"" + semantic_json_escape(&snapshot.compiler_version) + "\"," +
+    "\"target\":\"" + semantic_json_escape(&snapshot.target.name) + "\"," +
+    "\"revision\":\"" + semantic_digest_render(&rev) + "\"," +
+    "\"public_api_hash\":\"" + semantic_digest_render(&snapshot.public_api_hash) + "\"," +
+    "\"abi_hash\":\"" + semantic_digest_render(&snapshot.abi_hash) + "\"," +
+    "\"unsafe_hash\":\"" + semantic_digest_render(&snapshot.unsafe_hash) + "\"}"
+end
+
+def snapshot_symbol_line(s: SemanticSymbol) -> String
+  "{\"s\":\"symbol\",\"i\":\"" + semantic_digest_render(&semantic_stable_def_id_digest(&s.stable_id)) + "\"," +
+    "\"key\":\"" + semantic_json_escape(&s.stable_id.key) + "\"," +
+    "\"kind\":\"" + semantic_def_kind_text(&s.kind) + "\"," +
+    "\"name\":\"" + semantic_json_escape(&s.name) + "\"," +
+    "\"module\":\"" + semantic_json_escape(&s.module_path) + "\"," +
+    "\"pub\":" + snapshot_bool_text(s.is_pub) + "," +
+    "\"generic\":" + snapshot_bool_text(s.is_generic) + "}"
+end
+
+def snapshot_type_kind_text(k: SemanticTypeKind) -> String
+  match k
+  when SemanticTypeKind::Struct then "Struct"
+  when SemanticTypeKind::Enum then "Enum"
+  when SemanticTypeKind::Trait then "Trait"
+  end
+end
+
+def snapshot_type_line(t: SemanticType) -> String
+  "{\"s\":\"type\",\"i\":\"" + semantic_digest_render(&semantic_stable_def_id_digest(&t.stable_id)) + "\"," +
+    "\"key\":\"" + semantic_json_escape(&t.stable_id.key) + "\"," +
+    "\"tkind\":\"" + snapshot_type_kind_text(&t.kind) + "\"," +
+    "\"name\":\"" + semantic_json_escape(&t.name) + "\"," +
+    "\"module\":\"" + semantic_json_escape(&t.module_path) + "\"," +
+    "\"generic_arity\":" + t.generic_arity.to_string() + "," +
+    "\"pub\":" + snapshot_bool_text(t.is_pub) + "}"
+end
+
+def snapshot_call_kind_text(k: CallEdgeKind) -> String
+  match k
+  when CallEdgeKind::Direct then "Direct"
+  when CallEdgeKind::Indirect then "Indirect"
+  when CallEdgeKind::Intrinsic then "Intrinsic"
+  end
+end
+
+def snapshot_call_line(c: CallEdge) -> String
+  "{\"s\":\"call\",\"from\":\"" + semantic_digest_render(&semantic_stable_def_id_digest(&c.caller)) + "\"," +
+    "\"to\":\"" + semantic_digest_render(&semantic_stable_def_id_digest(&c.callee)) + "\"," +
+    "\"ekind\":\"" + snapshot_call_kind_text(&c.kind) + "\"}"
+end
+
+def snapshot_effect_line(e: EffectEdge) -> String
+  "{\"s\":\"effect\",\"f\":\"" + semantic_digest_render(&semantic_stable_def_id_digest(&e.function)) + "\"," +
+    "\"flags\":" + semantic_summary_dirty_word(&e.summary).to_string() + "," +
+    "\"caps\":\"" + snapshot_caps_text(&e.summary) + "\"}"
+end
+
+def snapshot_capability_kind_text(k: CapabilityEdgeKind) -> String
+  match k
+  when CapabilityEdgeKind::Requires then "Requires"
+  when CapabilityEdgeKind::Provides then "Provides"
+  end
+end
+
+def snapshot_capability_line(c: CapabilityEdge) -> String
+  "{\"s\":\"capability\",\"f\":\"" + semantic_digest_render(&semantic_stable_def_id_digest(&c.function)) + "\"," +
+    "\"cap\":" + c.capability.id.to_string() + "," +
+    "\"dir\":\"" + snapshot_capability_kind_text(&c.kind) + "\"}"
+end
+
+def snapshot_ownership_line(o: OwnershipFact) -> String
+  "{\"s\":\"ownership\",\"f\":\"" + semantic_digest_render(&semantic_stable_def_id_digest(&o.function)) + "\"," +
+    "\"place\":\"" + semantic_json_escape(&o.place_key) + "\"," +
+    "\"conv\":" + semantic_access_convention_numeric(&o.convention).to_string() + "}"
+end
+
+def snapshot_contract_kind_text(k: AstContractKind) -> String
+  match k
+  when AstContractKind::AstPre then "Pre"
+  when AstContractKind::AstPost then "Post"
+  when AstContractKind::AstInvariant then "Invariant"
+  end
+end
+
+def snapshot_contract_line(c: ContractFact) -> String
+  "{\"s\":\"contract\",\"f\":\"" + semantic_digest_render(&semantic_stable_def_id_digest(&c.function)) + "\"," +
+    "\"ckind\":\"" + snapshot_contract_kind_text(&c.kind) + "\"," +
+    "\"text\":\"" + semantic_json_escape(&c.clause_text) + "\"}"
+end
+
+def snapshot_mir_line(m: MirSemanticSummary) -> String
+  "{\"s\":\"mir\",\"f\":\"" + semantic_digest_render(&semantic_stable_def_id_digest(&m.function)) + "\"," +
+    "\"blocks\":" + m.block_count.to_string() + "," +
+    "\"statements\":" + m.statement_count.to_string() + "," +
+    "\"locals\":" + m.local_count.to_string() + "," +
+    "\"reachable\":" + snapshot_bool_text(m.reachable) + "," +
+    "\"unsafe\":" + snapshot_bool_text(m.calls_unsafe) + "," +
+    "\"unknown\":" + snapshot_bool_text(m.calls_unknown) + "," +
+    "\"flags\":" + semantic_summary_dirty_word(&m.effect_summary).to_string() + "," +
+    "\"caps\":\"" + snapshot_caps_text(&m.effect_summary) + "\"}"
+end
+
+# The canonical text form (the tables are sorted before rendering; the
+# serializer sorts in place — idempotent on already-sorted input).
+def semantic_snapshot_serialize(inout snapshot: SemanticSnapshot) -> String
+  semantic_symbols_sort(&mut snapshot.symbols)
+  semantic_types_sort(&mut snapshot.types)
+  semantic_call_edges_sort(&mut snapshot.calls)
+  semantic_effect_edges_sort(&mut snapshot.effects)
+  semantic_capability_edges_sort(&mut snapshot.capabilities)
+  semantic_ownership_facts_sort(&mut snapshot.ownership)
+  semantic_contract_facts_sort(&mut snapshot.contracts)
+  semantic_mir_summaries_sort(&mut snapshot.mir_functions)
+
+  var text = snapshot_header_line(&snapshot, false) + "\n"
+  for s in snapshot.symbols do
+    text = text + snapshot_symbol_line(&s) + "\n"
+  end
+  for t in snapshot.types do
+    text = text + snapshot_type_line(&t) + "\n"
+  end
+  for c in snapshot.calls do
+    text = text + snapshot_call_line(&c) + "\n"
+  end
+  for e in snapshot.effects do
+    text = text + snapshot_effect_line(&e) + "\n"
+  end
+  for c2 in snapshot.capabilities do
+    text = text + snapshot_capability_line(&c2) + "\n"
+  end
+  for o in snapshot.ownership do
+    text = text + snapshot_ownership_line(&o) + "\n"
+  end
+  for c3 in snapshot.contracts do
+    text = text + snapshot_contract_line(&c3) + "\n"
+  end
+  for m in snapshot.mir_functions do
+    text = text + snapshot_mir_line(&m) + "\n"
+  end
+  text
+end
+
+# The canonical text form with the revision header field zeroed — the
+# digest preimage (a pure function of the snapshot's semantic content).
+def semantic_snapshot_digest_text(snapshot: SemanticSnapshot) -> String
+  var snap2 = semantic_snapshot_empty()
+  snap2.compiler_version = snapshot.compiler_version.clone()
+  snap2.target = snapshot.target.clone()
+  snap2.public_api_hash = snapshot.public_api_hash
+  snap2.abi_hash = snapshot.abi_hash
+  snap2.unsafe_hash = snapshot.unsafe_hash
+  snap2.symbols = snapshot.symbols.clone()
+  snap2.types = snapshot.types.clone()
+  snap2.calls = snapshot.calls.clone()
+  snap2.effects = snapshot.effects.clone()
+  snap2.capabilities = snapshot.capabilities.clone()
+  snap2.ownership = snapshot.ownership.clone()
+  snap2.contracts = snapshot.contracts.clone()
+  snap2.mir_functions = snapshot.mir_functions.clone()
+  semantic_snapshot_serialize(&mut snap2)
+end
+
+# The content-addressed digest: stable_digest_of the canonical text with
+# the revision field zeroed.
+def semantic_snapshot_digest(snapshot: SemanticSnapshot) -> StableDigest
+  stable_digest_of(&semantic_snapshot_digest_text(&snapshot))
+end
+
+# Set the snapshot's revision to its content-addressed digest (the stored
+# words then ride the artifact's header).
+def semantic_snapshot_finalize(inout snapshot: SemanticSnapshot) -> Unit
+  snapshot.revision = semantic_snapshot_digest(&snapshot)
+  ()
+end
+
+# An empty snapshot seed (all digest words zero, no tables).
+def semantic_snapshot_empty() -> SemanticSnapshot
+  SemanticSnapshot {
+    revision: semantic_digest_zero(),
+    compiler_version: "".to_string(),
+    target: TargetId { name: "".to_string() },
+    public_api_hash: semantic_digest_zero(),
+    abi_hash: semantic_digest_zero(),
+    unsafe_hash: semantic_digest_zero()
+  }
+end

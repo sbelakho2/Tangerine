@@ -1,0 +1,1356 @@
+# Tangerine Compiler - Layered Equivalence Checking (audit §41)
+# Self-hosting compiler written in Tangerine
+#
+# equivalence_check compares TWO MIR versions of ONE function (the pre/post
+# forms a compile produces around the optimizer passes: snapshot a MirFunction
+# with mir.tg's duplicate_function, run optimize_mir, compare - or any two
+# lowered bodies) and proves equivalence within CHEAP-FIRST LAYERS. The module
+# reads ONLY MirFunction state (no AST/typed/program tables) and mirrors the
+# semantic_slice.tg / proof_patch.tg idioms.
+#
+# CLAIM DISCIPLINE - "Never turn Unknown into equivalent." Only two results
+# ever claim anything: ProvenWithin(domain) (the layer PROVED equal outputs
+# for every input of its domain) and Counterexample(input, old, new) (a layer
+# found concrete inputs on which the outputs differ). Unknown(reason) is
+# returned for EVERYTHING not proven - an impure body, a signature mismatch, a
+# missing evaluator, a scaffolded layer - always with the precise reason.
+# Digest inequality alone is never "different": renaming or reordering may
+# explain it, so it only falls through to the deeper layers.
+#
+# THE LAYERS:
+#   L1 normalized-mir - the normalized shape digest (grammar below): equal
+#     rows prove identical behavior - the digest is a lossless encoding of the
+#     body up to the LOCAL RENAMING below, and MIR behavior is determined by
+#     the renamed body.
+#   L2 symbolic-finite - for FINITE PURE bodies (ONE block ending in a direct
+#     MirReturn; no calls/loads/stores/drops/aggregates; read-only scalar ops
+#     only), a tiny symbolic evaluator folds every assignment into an
+#     expression tree per local (mirroring optimize_mir's const folding - FOLD
+#     RULES below) and compares the RETURN tree (local 0, the "_ret" place
+#     MirReturn reads; Unit returns compare the unit tree). Equal trees =>
+#     ProvenWithin("symbolic-finite"); trees differing with every leaf
+#     concrete => Counterexample (outputs disagree for EVERY input); trees
+#     differing at symbolic (parameter) leaves => Unknown.
+#   L3 bounded-domain - SCAFFOLDED: pure functions whose parameters are all
+#     Bool (the ONLY exhaustive finite domain; a bounded Int sample can never
+#     prove) qualify when 2^N fits the caller's depth cap (<= 2^16 = 65536
+#     states), then Unknown("bounded domain requires an evaluator: ..."):
+#     tg_compiler has no MIR interpreter (the REPL interpreter was removed -
+#     lib.tg) and implementing one is out of scope for this slice. The gate is
+#     real so a future evaluator plugs in unchanged; today the layer NEVER
+#     claims equivalence.
+#   L4 differential - SCAFFOLDED: differential generation needs a RUNNER
+#     executing both versions over a generated corpus; tg_compiler has none,
+#     so Unknown("differential requires a runner: ..."). Differential testing
+#     could only find counterexamples, never prove - Unknown regardless.
+#
+# L1 DIGEST GRAMMAR (exact): rows are single-line texts; equality is
+# row-for-row. Emission order: "equiv-normalized/v1"; "attr <w>[+<w>...]" only
+# when async/unsafe/fp:fast is set (fp_fast changes codegen float semantics
+# and must separate digests); "sig(<p0-ty>, ...) -> <ret>" (parameter TYPE
+# renders in declaration order + return type: the input/output domain
+# identity; fn NAME, param NAMES and mut markers never participate); "entry
+# b<i>" (entry block Vec index); per block in Vec order "bb<i>", statements in
+# index order as "s <row>", then "t <term-row>"; finally the SORTED local rows
+# "L<name>:<ty>" (one per MENTIONED local). Spans never render (§29: spans
+# are metadata). CANONICAL NAMES (the id-independent renaming): a parameter
+# local is "p<i>" with i its DECLARATION index in func.params (positional
+# input alignment - old/new are versions of one function); every other
+# mentioned local is "t<j>" with j its FIRST-MENTION order over the row
+# emission (one name per local in every row). Block targets render as
+# "b<vec index>"; an edge to an unknown id renders "b?<raw id>" (malformed
+# MIR - never silently equal). TYPE renders mirror format_mir_type's words;
+# Adt/generic NAMES need the program's name tables, which a MirFunction does
+# not carry, so nominal ids render numerically ("T<id>", "gp<numeric>") -
+# exact for two versions OF ONE PROGRAM (shared ids); unrelated programs can
+# spuriously differ (a false NEGATIVE, never a false equivalence). Rows use
+# the format_mir_* word shapes with canonical names and typed constants
+# ("<value>_<type>"); projections render ".f<owner>.<idx>", ".v<owner>.<idx>",
+# ".[<i>]", "[<name>]", deref "(* ... )".
+#
+# L2 SYMBOLIC RULES (exact): Tree = a leaf "p<i>" (parameter i's value), a
+# folded concrete leaf, or an op node "<word>(<child>, ...)". StorageLive/
+# Dead/Nop rows are ignored (no behavior). Each MirAssign to a bare
+# non-parameter local binds it to its rvalue tree; reads of parameters bind
+# leaves; a read with no preceding def in the block is an error (malformed
+# MIR -> Unknown). SIGNATURE GATE: parameter/return type renders must agree
+# (positional leaves are only sound over identical input domains - a U8 and a
+# U64 parameter are different domains). PURE OP SET (everything else is
+# impure -> Unknown, never a claim): statements = MirAssign only; rvalues =
+# MirMove of a MirCopy of a BARE local or of a Unit/Bool/Int/Float/Char
+# constant, MirBinOp (all 15), MirUnOp, MirCast(IntToInt/IntToFloat/FloatToInt/
+# FloatToFloat); operands = bare-local copies + scalar constants only. WIDTH-
+# DOMAIN GATE: every local and the return type must be a width-64 scalar
+# (Int/UInt/I64/U64/ISize/USize), Bool, Float, Char or Unit - narrower kinds
+# and aggregates have masking semantics the type-blind trees cannot represent
+# and are rejected (L1's typed rows and L3 cover them). Signed Int + - * never
+# reach single-block bodies (the P1-5 overflow-assert chains split blocks -
+# mir.tg), so the tree domain is unsigned/float/bool arithmetic, comparisons,
+# shifts, negation and widening casts. FOLD RULES (mirror
+# try_fold_binop/try_fold_unop exactly; the SAME evaluator folds both sides,
+# so folds are symmetric): Add/Sub/Mul/Div/Mod/BitAnd/BitOr/BitXor fold over
+# two folded Ints (Div/Mod rhs 0 never fold); Shl/Shr fold only for a folded
+# count in [0, 63] (lowering pre-masks counts; never folding is the safe
+# direction); Eq/Ne fold over two folded Bools (integer comparisons never
+# fold - mirror); Neg/Not/BitNot fold Int/Bool/Int; casts never fold. Trees
+# compare as canonical texts, so equal-valued but non-congruent shapes (x + y
+# vs y + x) fail CLOSED to Unknown - commutativity is never assumed.
+# Budgets: <= 512 assignments per fn and <= 8192 tree nodes, each fail-closed.
+#
+# DOMAIN CAP (L3): domain_depth selects the exhaustive cap 2^domain_depth for
+# depth in [1, 16], else 2^16 (the audit's "bit-width*depth <= 16 total
+# states": Bool carries 1 domain bit per parameter, the depth bounds the
+# exponent). A function is L3-eligible only when every parameter is Bool and
+# the parameter count fits the cap.
+#
+# ANCHORS: equivalence_check (the layered driver: shared gates, L1 -> L2 -> L3
+# -> L4; the first ProvenWithin/Counterexample wins, else ONE composed
+# Unknown audit trail), equivalence_normalized_rows, equivalence_normalized_
+# hash (stable_digest_of the joined rows), ProofDomain / EquivalenceResult,
+# proof_domain_text, equivalence_result_render, equivalence_proven,
+# equivalence_counterexample, equivalence_unknown. The scaffold texts are
+# exact: "bounded domain requires an evaluator" (L3) and "differential
+# requires a runner" (L4) - always Unknown, never equivalence.
+
+use std::collections::{Vec, Map}
+
+use tg_compiler::mir::{
+  MirFunction, MirStatement, MirStatementKind, MirRvalue, MirRvalueKind, MirBinOp, MirUnOp,
+  CastKind, MirOperand, MirOperandKind, MirConstant, MirConstantKind, MirTerminator,
+  MirTerminatorKind, Place, Projection, AggregateKind, AssertMessage, MirContractKind,
+  MirCallArg, MirCallValue
+}
+use tg_compiler::types::{Type, ConstExprT, AccessEffect}
+use tg_compiler::ids::{
+  generic_param_id_numeric, def_id_numeric, intrinsic_id_numeric, EffectId, StableDigest,
+  stable_digest_of
+}
+
+# The result vocabulary
+
+# The four proof layers (cheap first); the ProvenWithin payloads are the
+# proof_domain_text words.
+enum ProofDomain
+  NormalizedHash
+  SymbolicFinite
+  BoundedDomain
+  Differential
+end
+
+enum EquivalenceResult
+  ProvenWithin(String)
+  Counterexample(String, String, String)
+  Unknown(String)
+end
+
+# The canonical domain word of a ProofDomain (the ProvenWithin payload).
+pub def proof_domain_text(d: ProofDomain) -> String
+  match d
+  when ProofDomain::NormalizedHash then "normalized-mir"
+  when ProofDomain::SymbolicFinite then "symbolic-finite"
+  when ProofDomain::BoundedDomain then "bounded-domain"
+  when ProofDomain::Differential then "differential"
+  end
+end
+
+# Variant constructors (callers never hand-roll the enum payloads).
+pub def equivalence_proven(domain: String) -> EquivalenceResult
+  EquivalenceResult::ProvenWithin(domain)
+end
+
+pub def equivalence_counterexample(input: String, old_value: String, new_value: String) -> EquivalenceResult
+  EquivalenceResult::Counterexample(input, old_value, new_value)
+end
+
+pub def equivalence_unknown(reason: String) -> EquivalenceResult
+  EquivalenceResult::Unknown(reason)
+end
+
+# The human render of one result ("proven-within: ..." /
+# "counterexample: input ..." / "unknown: ...").
+pub def equivalence_result_render(r: EquivalenceResult) -> String
+  match r
+  when EquivalenceResult::ProvenWithin(domain) then "proven-within: " + domain
+  when EquivalenceResult::Counterexample(input, old_value, new_value) then
+    "counterexample: input " + input + " — old " + old_value + " vs new " + new_value
+  when EquivalenceResult::Unknown(reason) then "unknown: " + reason
+  end
+end
+
+# The Unknown reason of a result ("" for the other variants).
+def eq_result_reason(r: EquivalenceResult) -> String
+  match r
+  when EquivalenceResult::Unknown(reason) then reason.clone()
+  when _ then ""
+  end
+end
+
+# Variant discriminators over a copy (matches never consume the driver's
+# result values, so the composed trail can still read them).
+def eq_result_is_proven(r: EquivalenceResult) -> Bool
+  match r
+  when EquivalenceResult::ProvenWithin(_) then true
+  when _ then false
+  end
+end
+
+def eq_result_is_counterexample(r: EquivalenceResult) -> Bool
+  match r
+  when EquivalenceResult::Counterexample(_, _, _) then true
+  when _ then false
+  end
+end
+
+# Whether the byte at index is a UTF-8 continuation byte (the clip cut
+# must never split a multi-byte character).
+def eq_utf8_continuation_at(s: String, index: Int) -> Bool
+  if index < 0 || index >= s.len() then return false end
+  let bs = s.slice(index, index + 1).bytes()
+  bs.len() > 0 && ((bs[0] as Int) & 0xC0) == 0x80
+end
+
+# Clip a text for an Unknown reason so reasons stay readable.
+def eq_clip(s: String, cap: Int) -> String
+  if s.len() <= cap then
+    s.clone()
+  else
+    var cut = cap
+    while eq_utf8_continuation_at(&s, cut) do
+      cut = cut - 1
+    end
+    s.slice(0, cut) + "..."
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# eq_type_render - the canonical type text (format_mir_type's words;
+# Adt/generic ids render numerically - a MirFunction carries no tables)
+# ———————————————————————————————————————————————————————————————
+
+def eq_const_expr_render(tree: ConstExprT) -> String
+  match tree
+  when ConstExprT::ConstLit(v) then v.to_string()
+  when ConstExprT::ConstParamRef(gpid) then "gp" + generic_param_id_numeric(&gpid).to_string()
+  when ConstExprT::ConstAdd(l, r) then "((" + eq_const_expr_render(&l) + ")+(" + eq_const_expr_render(&r) + "))"
+  when ConstExprT::ConstSub(l, r) then "((" + eq_const_expr_render(&l) + ")-(" + eq_const_expr_render(&r) + "))"
+  when ConstExprT::ConstMul(l, r) then "((" + eq_const_expr_render(&l) + ")*(" + eq_const_expr_render(&r) + "))"
+  when ConstExprT::ConstDiv(l, r) then "((" + eq_const_expr_render(&l) + ")/(" + eq_const_expr_render(&r) + "))"
+  when ConstExprT::ConstMod(l, r) then "((" + eq_const_expr_render(&l) + ")%(" + eq_const_expr_render(&r) + "))"
+  when ConstExprT::ConstNeg(o) then "(-(" + eq_const_expr_render(&o) + "))"
+  end
+end
+
+def eq_effect_ids_text(ids: Vec[EffectId]) -> String
+  var out = ""
+  var first = true
+  for e in ids do
+    if !first then out = out + ";" end
+    out = out + e.id.to_string()
+    first = false
+  end
+  out
+end
+
+def eq_type_render(ty: Type) -> String
+  match ty
+  when Type::Unit then "Unit"
+  when Type::Bool then "Bool"
+  when Type::Int then "Int"
+  when Type::UInt then "UInt"
+  when Type::Float then "Float"
+  when Type::Char then "Char"
+  when Type::String then "String"
+  when Type::StaticStrPtr then "StaticStrPtr"
+  when Type::Never then "!"
+  when Type::I8 then "I8"
+  when Type::I16 then "I16"
+  when Type::I32 then "I32"
+  when Type::I64 then "I64"
+  when Type::I128 then "I128"
+  when Type::U8 then "U8"
+  when Type::U16 then "U16"
+  when Type::U32 then "U32"
+  when Type::U64 then "U64"
+  when Type::U128 then "U128"
+  when Type::ISize then "ISize"
+  when Type::USize then "USize"
+  when Type::F32 then "F32"
+  when Type::F64 then "F64"
+  when Type::IntLiteral(v) then "intlit(" + v.to_string() + ")"
+  when Type::Error then "<error>"
+  when Type::Var(v) then "_T" + v.id.to_string()
+  when Type::Param(gpid) then "gp" + generic_param_id_numeric(&gpid).to_string()
+  when Type::Const(v) then "const " + v.to_string()
+  when Type::ConstParam(gpid) then "const gp" + generic_param_id_numeric(&gpid).to_string()
+  when Type::ConstSym(tree) then "const (" + eq_const_expr_render(&tree) + ")"
+  when Type::Ptr(inner) then "*" + eq_type_render(&inner)
+  when Type::PtrMut(inner) then "*mut " + eq_type_render(&inner)
+  when Type::Dyn(id) then "dyn T" + id.id.to_string()
+  when Type::RefInternal(inner, mutable) then
+    if mutable then "&mut " + eq_type_render(&inner) else "&" + eq_type_render(&inner) end
+  when Type::Effect(effects, inner) then
+    "effect[" + eq_effect_ids_text(&effects) + "] " + eq_type_render(&inner)
+  when Type::Tuple(elems) then
+    var out = "("
+    var first = true
+    for e in elems do
+      if !first then out = out + ", " end
+      out = out + eq_type_render(&e)
+      first = false
+    end
+    out + ")"
+  when Type::FixedArray(elem, n) then
+    "[" + eq_type_render(&elem) + "; " + n.to_string() + "]"
+  when Type::FixedArraySym(elem, gpid) then
+    "[" + eq_type_render(&elem) + "; const gp" + generic_param_id_numeric(&gpid).to_string() + "]"
+  when Type::FnPtr(params, ret, effects) then
+    var out = "fnptr(effects[" + eq_effect_ids_text(&effects) + "])( "
+    var first = true
+    for p in params do
+      if !first then out = out + ", " end
+      out = out + eq_type_render(&p.ty)
+      first = false
+    end
+    out + ") -> " + eq_type_render(&ret)
+  when Type::Closure(cid, params, ret, captures, effects) then
+    var out = "closure" + cid.id.to_string() + "(effects[" + eq_effect_ids_text(&effects) + "])( "
+    var first = true
+    for p in params do
+      if !first then out = out + ", " end
+      out = out + eq_type_render(&p.ty)
+      first = false
+    end
+    out + ") -> " + eq_type_render(&ret) + " cap " + eq_type_render(&captures)
+  when Type::Adt(id, args) then
+    var out = "T" + id.id.to_string()
+    if !args.is_empty() then
+      out = out + "["
+      var first = true
+      for a in args do
+        if !first then out = out + ", " end
+        out = out + eq_type_render(&a)
+        first = false
+      end
+      out = out + "]"
+    end
+    out
+  end
+end
+# ———————————————————————————————————————————————————————————————
+# L1 - canonical naming and the normalized digest rows (single pass:
+# canonical names are assigned at first mention DURING row emission)
+# ———————————————————————————————————————————————————————————————
+# Row grammar in the module doc. Params pre-name "p<i>"; every other
+# mentioned local gets "t<j>" at its first mention in row order; the
+# block-target name is the target's Vec index ("b?<raw id>" on a missing
+# block - malformed MIR).
+
+struct EqCanon
+  names: Map[Int, String] = Map::new()
+  counter: Int = 0
+end
+
+def eq_canon_new(f: MirFunction) -> EqCanon
+  var c = EqCanon { names: Map::new(), counter: 0 }
+  var pi = 0
+  while pi < f.params.len() do
+    c.names.insert(f.params[pi].id.id, "p" + pi.to_string())
+    pi = pi + 1
+  end
+  c
+end
+
+# The canonical name of a local id (assigns "t<j>" on first mention).
+def eq_canon_name(inout c: EqCanon, id: Int) -> String
+  match c.names.get(id)
+  when Option::Some(n) then n.clone()
+  when Option::None then
+    let name = "t" + c.counter.to_string()
+    c.counter = c.counter + 1
+    c.names.insert(id, name.clone())
+    name
+  end
+end
+
+# block id -> Vec index.
+def eq_block_index(f: MirFunction) -> Map[Int, Int]
+  var out: Map[Int, Int] = Map::new()
+  var i = 0
+  while i < f.blocks.len() do
+    out.insert(f.blocks[i].id.id, i)
+    i = i + 1
+  end
+  out
+end
+
+def eq_block_name(bimap: Map[Int, Int], id: Int) -> String
+  match bimap.get(id)
+  when Option::Some(v) then "b" + v.to_string()
+  when Option::None then "b?" + id.to_string()
+  end
+end
+
+def eq_binop_word(op: MirBinOp) -> String
+  match op
+  when MirBinOp::Add then "+"
+  when MirBinOp::Sub then "-"
+  when MirBinOp::Mul then "*"
+  when MirBinOp::Div then "/"
+  when MirBinOp::Mod then "%"
+  when MirBinOp::BitAnd then "&"
+  when MirBinOp::BitOr then "|"
+  when MirBinOp::BitXor then "^"
+  when MirBinOp::Shl then "<<"
+  when MirBinOp::Shr then ">>"
+  when MirBinOp::Eq then "=="
+  when MirBinOp::Ne then "!="
+  when MirBinOp::Lt then "<"
+  when MirBinOp::Le then "<="
+  when MirBinOp::Gt then ">"
+  when MirBinOp::Ge then ">="
+  end
+end
+
+def eq_unop_word(op: MirUnOp) -> String
+  match op
+  when MirUnOp::Neg then "-"
+  when MirUnOp::Not then "!"
+  when MirUnOp::BitNot then "~"
+  end
+end
+
+def eq_cast_word(kind: CastKind) -> String
+  match kind
+  when CastKind::IntToInt then "IntToInt"
+  when CastKind::IntToFloat then "IntToFloat"
+  when CastKind::FloatToInt then "FloatToInt"
+  when CastKind::FloatToFloat then "FloatToFloat"
+  when CastKind::Pointer then "Pointer"
+  when CastKind::Transmute then "Transmute"
+  end
+end
+
+def eq_contract_word(kind: MirContractKind) -> String
+  match kind
+  when MirContractKind::Pre then "pre"
+  when MirContractKind::Post then "post"
+  when MirContractKind::Invariant then "invariant"
+  end
+end
+
+def eq_place_row(inout c: EqCanon, p: Place) -> String
+  var out = eq_canon_name(c, p.local.id)
+  for proj in p.projections do
+    match proj
+    when Projection::ProjDeref then out = "(*" + out + ")"
+    when Projection::Field(fid) then out = out + ".f" + fid.owner.id.to_string() + "." + fid.index.to_string()
+    when Projection::Variant(vid) then out = out + ".v" + vid.owner.id.to_string() + "." + vid.index.to_string()
+    when Projection::TupleIndex(idx) then out = out + ".[" + idx.to_string() + "]"
+    when Projection::ProjIndex(id) then out = out + "[" + eq_canon_name(c, id.id) + "]"
+    when Projection::ProjConstantIndex(i) then out = out + "[" + i.to_string() + "]"
+    end
+  end
+  out
+end
+
+def eq_const_row(c: MirConstant) -> String
+  match c.kind
+  when MirConstantKind::MirUnit then "()"
+  when MirConstantKind::MirBool(b) then if b then "true" else "false" end
+  when MirConstantKind::MirInt(n) then n.to_string() + "_" + eq_type_render(&c.ty)
+  when MirConstantKind::MirConstParamValue(gpid) then
+    "const_param(" + generic_param_id_numeric(&gpid).to_string() + ")"
+  when MirConstantKind::MirFloat(v) then v.to_string() + "_" + eq_type_render(&c.ty)
+  when MirConstantKind::MirChar(ch) then "'" + ch.to_string() + "'"
+  when MirConstantKind::MirString(s) then "\"" + s.clone() + "\""
+  when MirConstantKind::MirFnItem(name) then name.clone()
+  when MirConstantKind::MirZeroSized then "zero_sized"
+  when MirConstantKind::MirStaticRef(did) then "static_ref(" + def_id_numeric(&did).to_string() + ")"
+  when MirConstantKind::MirStaticAddr(did) then "static_addr(" + def_id_numeric(&did).to_string() + ")"
+  end
+end
+
+def eq_operand_row(inout c: EqCanon, op: MirOperand) -> String
+  match op.kind
+  when MirOperandKind::MirCopy(p) then "copy " + eq_place_row(c, &p)
+  when MirOperandKind::MirMovePlace(p) then "move " + eq_place_row(c, &p)
+  when MirOperandKind::MirRead(p) then "read " + eq_place_row(c, &p)
+  when MirOperandKind::MirConsume(p) then "consume " + eq_place_row(c, &p)
+  when MirOperandKind::MirConstant(cn) then eq_const_row(&cn)
+  end
+end
+
+def eq_rvalue_row(inout c: EqCanon, bimap: Map[Int, Int], rv: MirRvalue) -> String
+  match rv.kind
+  when MirRvalueKind::MirMove(op) then eq_operand_row(c, &op)
+  when MirRvalueKind::MirRef(p) then "&" + eq_place_row(c, &p)
+  when MirRvalueKind::MirAggregate(kind, ops) then
+    var out = match kind
+    when AggregateKind::MirArray(_) then "["
+    when AggregateKind::Tuple then "("
+    when AggregateKind::Struct(_, fields) then
+      if !fields.is_empty() then fields[0].clone() + " { " else "{ " end
+    when AggregateKind::Closure(cid) then "closure" + cid.id.to_string() + "("
+    when AggregateKind::Generator(gid) then "generator" + gid.id.to_string() + "("
+    end
+    var first = true
+    for o in ops do
+      if !first then out = out + ", " end
+      out = out + eq_operand_row(c, &o)
+      first = false
+    end
+    out + match kind
+    when AggregateKind::MirArray(_) then "]"
+    when AggregateKind::Tuple then ")"
+    when AggregateKind::Struct(_, _) then " }"
+    when AggregateKind::Closure(_) then ")"
+    when AggregateKind::Generator(_) then ")"
+    end
+  when MirRvalueKind::MirBinOp(op, l, r) then
+    eq_operand_row(c, &l) + " " + eq_binop_word(op) + " " + eq_operand_row(c, &r)
+  when MirRvalueKind::MirUnOp(op, o) then eq_unop_word(op) + eq_operand_row(c, &o)
+  when MirRvalueKind::MirDiscriminant(p) then "discriminant(" + eq_place_row(c, &p) + ")"
+  when MirRvalueKind::MirLen(p) then "len(" + eq_place_row(c, &p) + ")"
+  when MirRvalueKind::MirCast(kind, o, ty) then
+    eq_operand_row(c, &o) + " as " + eq_type_render(&ty) + " (" + eq_cast_word(kind) + ")"
+  when MirRvalueKind::MirRepeat(o, count) then
+    "[" + eq_operand_row(c, &o) + "; " + count.to_string() + "]"
+  when MirRvalueKind::MirPhi(entries) then
+    var out = "phi("
+    var first = true
+    for entry in entries do
+      if !first then out = out + ", " end
+      out = out + eq_block_name(bimap, entry.0.id) + ": " + eq_canon_name(c, entry.1.id)
+      first = false
+    end
+    out + ")"
+  end
+end
+
+def eq_assert_msg_row(inout c: EqCanon, msg: AssertMessage) -> String
+  match msg
+  when AssertMessage::BoundsCheck(i, l) then
+    "bounds(" + eq_operand_row(c, &i) + ", " + eq_operand_row(c, &l) + ")"
+  when AssertMessage::Overflow(op) then "overflow(" + eq_binop_word(op) + ")"
+  when AssertMessage::DivisionByZero then "division_by_zero"
+  when AssertMessage::RemainderByZero then "remainder_by_zero"
+  when AssertMessage::NullPointer then "null_pointer"
+  when AssertMessage::ContractViolation(m) then "contract(\"" + m.clone() + "\")"
+  end
+end
+
+def eq_stmt_row(inout c: EqCanon, bimap: Map[Int, Int], st: MirStatement) -> String
+  match st.kind
+  when MirStatementKind::MirAssign(p, rv) then
+    eq_place_row(c, &p) + " = " + eq_rvalue_row(c, bimap, &rv)
+  when MirStatementKind::MirStorageLive(id) then "storage_live(" + eq_canon_name(c, id.id) + ")"
+  when MirStatementKind::MirStorageDead(id) then "storage_dead(" + eq_canon_name(c, id.id) + ")"
+  when MirStatementKind::MirNop then "nop"
+  when MirStatementKind::MirContractCheck(contract, op) then
+    "contract_check(" + eq_contract_word(&contract.kind) + ", " + eq_operand_row(c, &op) +
+      ", \"" + contract.message.clone() + "\")"
+  when MirStatementKind::MirBudgetConsume(resource, amount) then
+    "budget_consume(\"" + resource.clone() + "\", " + amount.to_string() + ")"
+  when MirStatementKind::MirEffectRecord(name, op) then
+    "effect_record(\"" + name.clone() + "\", " + eq_operand_row(c, &op) + ")"
+  when MirStatementKind::MirEffectPerform(eid, op_index, op_name, payload, result) then
+    "effect_perform(" + eid.id.to_string() + ", " + op_index.to_string() + ", \"" + op_name.clone() +
+      "\", " + eq_operand_row(c, &payload) + ", " + eq_operand_row(c, &result) + ")"
+  when MirStatementKind::MirEffectFrameEnter(eid, op_count, bitmap, disp, env) then
+    "effect_frame_enter(" + eid.id.to_string() + ", " + op_count.to_string() + ", " +
+      bitmap.to_string() + ", \"" + disp.clone() + "\", " + eq_operand_row(c, &env) + ")"
+  when MirStatementKind::MirEffectFrameExit then "effect_frame_exit"
+  end
+end
+
+def eq_call_arg_row(inout c: EqCanon, a: MirCallArg) -> String
+  let effect_word = match a.effect
+  when AccessEffect::Read then "read"
+  when AccessEffect::Modify then "modify"
+  when AccessEffect::Consume then "consume"
+  when AccessEffect::Initialize then "init"
+  end
+  match a.value
+  when MirCallValue::Value(op) then effect_word + ":" + eq_operand_row(c, &op)
+  when MirCallValue::Place(p) then effect_word + ":" + eq_place_row(c, &p)
+  end
+end
+
+def eq_term_row(inout c: EqCanon, bimap: Map[Int, Int], term: MirTerminator) -> String
+  match term.kind
+  when MirTerminatorKind::MirGoto(target) then "goto " + eq_block_name(bimap, target.id)
+  when MirTerminatorKind::MirReturn then "return"
+  when MirTerminatorKind::MirUnreachable then "unreachable"
+  when MirTerminatorKind::MirAbort then "abort"
+  when MirTerminatorKind::MirSwitchInt { op: discr, targets, default_target: otherwise } then
+    var out = "switch_int(" + eq_operand_row(c, &discr) + ") -> ["
+    var first = true
+    for t in targets do
+      if !first then out = out + ", " end
+      out = out + t.value.to_string() + ": " + eq_block_name(bimap, t.target.id)
+      first = false
+    end
+    if !targets.is_empty() then out = out + ", " end
+    out + "otherwise: " + eq_block_name(bimap, otherwise.id) + "]"
+  when MirTerminatorKind::MirCall { dest, func: func_op, args, success: succ, unwind, intrinsic } then
+    var out = eq_place_row(c, &dest) + " = " + eq_operand_row(c, &func_op) + "("
+    var first = true
+    for a in args do
+      if !first then out = out + ", " end
+      out = out + eq_call_arg_row(c, &a)
+      first = false
+    end
+    out = out + ") -> [return: " + eq_block_name(bimap, succ.id)
+    match unwind
+    when Option::Some(ub) then out = out + ", unwind: " + eq_block_name(bimap, ub.id)
+    when Option::None then ()
+    end
+    match intrinsic
+    when Option::Some(i) then out = out + "] intrinsic " + intrinsic_id_numeric(&i).to_string()
+    when Option::None then out = out + "]"
+    end
+    out
+  when MirTerminatorKind::MirAssert { cond, expected, msg, target, unwind } then
+    var out = "assert(" + eq_operand_row(c, &cond) + ", " + (if expected then "true" else "false" end) +
+      ", " + eq_assert_msg_row(c, &msg) + ") -> [target: " + eq_block_name(bimap, target.id)
+    match unwind
+    when Option::Some(ub) then out = out + ", unwind: " + eq_block_name(bimap, ub.id)
+    when Option::None then ()
+    end
+    out + "]"
+  when MirTerminatorKind::MirDeinit { place, deinit_fn, target, unwind } then
+    var out = "deinit(" + eq_place_row(c, &place) + " via inst " +
+      def_id_numeric(&deinit_fn.def.def).to_string() + ") -> [target: " + eq_block_name(bimap, target.id)
+    match unwind
+    when Option::Some(ub) then out = out + ", unwind: " + eq_block_name(bimap, ub.id)
+    when Option::None then ()
+    end
+    out + "]"
+  end
+end
+
+# The signature text - the parameter TYPE renders in declaration order
+# plus the return type (the input/output domain identity).
+def eq_sig_text(f: MirFunction) -> String
+  var out = "("
+  var first = true
+  for p in f.params do
+    if !first then out = out + ", " end
+    out = out + eq_type_render(&p.ty)
+    first = false
+  end
+  out + ") -> " + eq_type_render(&f.ret_type)
+end
+
+def eq_param_count(f: MirFunction) -> Int
+  f.params.len()
+end
+
+# The normalized digest rows of one function (the module doc's grammar).
+pub def equivalence_normalized_rows(f: MirFunction) -> Vec[String]
+  var rows: Vec[String] = Vec::new()
+  rows.push("equiv-normalized/v1")
+  var attr = ""
+  if f.is_async then attr = "async" end
+  if f.is_unsafe then
+    if attr.len() == 0 then attr = "unsafe" else attr = attr + "+unsafe" end
+  end
+  if f.fp_fast then
+    if attr.len() == 0 then attr = "fp:fast" else attr = attr + "+fp:fast" end
+  end
+  if attr.len() > 0 then rows.push("attr " + attr) end
+  rows.push("sig" + eq_sig_text(&f))
+  let bimap = eq_block_index(&f)
+  rows.push("entry " + eq_block_name(&bimap, f.entry_block.id))
+  var canon = eq_canon_new(&f)
+  var bi = 0
+  while bi < f.blocks.len() do
+    rows.push("bb" + bi.to_string())
+    for st in f.blocks[bi].statements do
+      rows.push("s " + eq_stmt_row(&mut canon, &bimap, &st))
+    end
+    rows.push("t " + eq_term_row(&mut canon, &bimap, &f.blocks[bi].terminator))
+    bi = bi + 1
+  end
+  var local_rows: Vec[String] = Vec::new()
+  for local in f.locals do
+    if canon.names.contains_key(&local.id.id) then
+      match canon.names.get(local.id.id)
+      when Option::Some(n) then local_rows.push("L" + n.clone() + ":" + eq_type_render(&local.ty))
+      when Option::None then ()
+      end
+    end
+  end
+  local_rows.sort_by(|a, b| a < b)
+  for lr in local_rows do
+    rows.push(lr.clone())
+  end
+  rows
+end
+
+# The content hash of one fn's normalized rows (stable_digest_of the
+# joined row text) - L1's "hash equal" surface.
+pub def equivalence_normalized_hash(f: MirFunction) -> StableDigest
+  var text = ""
+  let rows = equivalence_normalized_rows(&f)
+  for r in rows do
+    text = text + r + "\n"
+  end
+  stable_digest_of(&text)
+end
+# The purity classifier - the L2/L3 eligibility vocabulary
+# "Some(reason)" = the first impure construct. All checks are structural
+# (the module doc's pure op set); the L2 gate applies them to the single
+# block's statements, the CFG gate (L3) additionally to every terminator.
+
+def eq_const_pure_reason(c: MirConstant) -> Option[String]
+  match c.kind
+  when MirConstantKind::MirUnit then Option::None
+  when MirConstantKind::MirBool(_) then Option::None
+  when MirConstantKind::MirInt(_) then Option::None
+  when MirConstantKind::MirFloat(_) then Option::None
+  when MirConstantKind::MirChar(_) then Option::None
+  when MirConstantKind::MirString(_) then Option::Some("a String constant")
+  when MirConstantKind::MirConstParamValue(_) then Option::Some("a const-generic parameter value")
+  when MirConstantKind::MirFnItem(_) then Option::Some("a function-item (callable) constant")
+  when MirConstantKind::MirZeroSized then Option::Some("a zero-sized constant")
+  when MirConstantKind::MirStaticRef(_) then Option::Some("a static reference (a load)")
+  when MirConstantKind::MirStaticAddr(_) then Option::Some("a static address (a store handle)")
+  end
+end
+
+def eq_operand_pure_reason(op: MirOperand) -> Option[String]
+  match op.kind
+  when MirOperandKind::MirCopy(p) then
+    if p.projections.is_empty() then Option::None else Option::Some("a projected-place copy (a memory/aggregate read)") end
+  when MirOperandKind::MirMovePlace(_) then Option::Some("a moved place (consumption semantics)")
+  when MirOperandKind::MirRead(_) then Option::Some("a read-through operand (borrow semantics)")
+  when MirOperandKind::MirConsume(_) then Option::Some("a consumed place (destruction semantics)")
+  when MirOperandKind::MirConstant(c) then eq_const_pure_reason(&c)
+  end
+end
+
+def eq_rvalue_pure_reason(rv: MirRvalue) -> Option[String]
+  match rv.kind
+  when MirRvalueKind::MirMove(op) then eq_operand_pure_reason(&op)
+  when MirRvalueKind::MirRef(_) then Option::Some("a reference creation")
+  when MirRvalueKind::MirAggregate(_, _) then Option::Some("an aggregate construction")
+  when MirRvalueKind::MirBinOp(_, l, r) then
+    match eq_operand_pure_reason(&l)
+    when Option::Some(x) then Option::Some(x)
+    when Option::None then eq_operand_pure_reason(&r)
+    end
+  when MirRvalueKind::MirUnOp(_, o) then eq_operand_pure_reason(&o)
+  when MirRvalueKind::MirDiscriminant(_) then Option::Some("an enum-discriminant read")
+  when MirRvalueKind::MirLen(_) then Option::Some("a length read")
+  when MirRvalueKind::MirCast(kind, o, _) then
+    match kind
+    when CastKind::Pointer then Option::Some("a Pointer cast")
+    when CastKind::Transmute then Option::Some("a Transmute cast")
+    when _ then eq_operand_pure_reason(&o)
+    end
+  when MirRvalueKind::MirRepeat(_, _) then Option::Some("an array-repeat literal")
+  when MirRvalueKind::MirPhi(_) then Option::Some("a phi node (control-flow merge)")
+  end
+end
+
+def eq_stmt_pure_reason(st: MirStatement) -> Option[String]
+  match st.kind
+  when MirStatementKind::MirAssign(p, rv) then
+    if !p.projections.is_empty() then
+      Option::Some("an assignment into a projected place (a memory store)")
+    else
+      eq_rvalue_pure_reason(&rv)
+    end
+  when MirStatementKind::MirStorageLive(_) then Option::None
+  when MirStatementKind::MirStorageDead(_) then Option::None
+  when MirStatementKind::MirNop then Option::None
+  when MirStatementKind::MirContractCheck(_, _) then Option::Some("a contract check")
+  when MirStatementKind::MirBudgetConsume(_, _) then Option::Some("a budget consume")
+  when MirStatementKind::MirEffectRecord(_, _) then Option::Some("an effect record")
+  when MirStatementKind::MirEffectPerform(_, _, _, _, _) then Option::Some("an algebraic-effects perform")
+  when MirStatementKind::MirEffectFrameEnter(_, _, _, _, _) then Option::Some("an effect-frame enter")
+  when MirStatementKind::MirEffectFrameExit then Option::Some("an effect-frame exit")
+  end
+end
+
+# The first impurity over a fn's WHOLE CFG (the L3 gate): statements must
+# be pure and no terminator may call or drop (Return/Goto/SwitchInt/
+# Assert/Abort/Unreachable are deterministic divergence/traps an
+# evaluator could decide). "None" = pure.
+def eq_cfg_pure_reason(f: MirFunction) -> Option[String]
+  if f.is_async then
+    return Option::Some("async lowering state machinery")
+  end
+  var bi = 0
+  while bi < f.blocks.len() do
+    var si = 0
+    while si < f.blocks[bi].statements.len() do
+      let st = f.blocks[bi].statements[si]
+      match eq_stmt_pure_reason(&st)
+      when Option::Some(x) then
+        return Option::Some(x + " at block " + f.blocks[bi].id.id.to_string() + " statement " + si.to_string())
+      when Option::None then ()
+      end
+      si = si + 1
+    end
+    match f.blocks[bi].terminator.kind
+    when MirTerminatorKind::MirCall { dest, func, args, success, unwind, intrinsic } then
+      return Option::Some("a call at block " + f.blocks[bi].id.id.to_string() + " (the terminator)")
+    when MirTerminatorKind::MirDeinit { place, deinit_fn, target, unwind } then
+      return Option::Some("a drop at block " + f.blocks[bi].id.id.to_string() + " (the terminator)")
+    when _ then ()
+    end
+    bi = bi + 1
+  end
+  Option::None
+end
+
+# L2 - the symbolic evaluator over the pure op set
+# Tree grammar: leaves "p<i>" (parameters) and folded concrete leaves;
+# op nodes "<word>(<child>, ...)"; rendered in an unambiguous prefix
+# text (leaves never contain "(", op words are fixed and always open a
+# parenthesized child list).
+
+enum EqTree
+  EqUnit
+  EqBool(Bool)
+  EqInt(Int)
+  EqFloat(Float)
+  EqChar(Char)
+  EqLeaf(String)
+  EqOp1(String, EqTree)
+  EqOp2(String, EqTree, EqTree)
+end
+
+def eq_tree_render(t: EqTree) -> String
+  match t
+  when EqTree::EqUnit then "unit"
+  when EqTree::EqBool(b) then if b then "bool:true" else "bool:false" end
+  when EqTree::EqInt(v) then "int:" + v.to_string()
+  when EqTree::EqFloat(v) then "float:" + v.to_string()
+  when EqTree::EqChar(ch) then "char:" + ch.to_string()
+  when EqTree::EqLeaf(name) then name.clone()
+  when EqTree::EqOp1(word, child) then word + "(" + eq_tree_render(&child) + ")"
+  when EqTree::EqOp2(word, l, r) then
+    word + "(" + eq_tree_render(&l) + ", " + eq_tree_render(&r) + ")"
+  end
+end
+
+# Whether a tree mentions any symbolic (parameter) leaf.
+def eq_tree_has_leaf(t: EqTree) -> Bool
+  match t
+  when EqTree::EqLeaf(_) then true
+  when EqTree::EqOp1(_, child) then eq_tree_has_leaf(&child)
+  when EqTree::EqOp2(_, l, r) then eq_tree_has_leaf(&l) || eq_tree_has_leaf(&r)
+  when _ then false
+  end
+end
+
+# Evaluation state: per-local trees, node/assignment budgets, error text.
+struct EqSym
+  env: Map[Int, EqTree] = Map::new()
+  nodes: Int = 0
+  assigns: Int = 0
+  err: String = ""
+end
+
+def eq_sym_err(inout s: EqSym, msg: String) -> Unit
+  if s.err.len() == 0 then
+    s.err = msg
+  end
+  ()
+end
+
+# The mirror of optimize_mir's folding: Add/Sub/Mul/Div/Mod/BitAnd/BitOr/
+# BitXor over two folded Ints (Div/Mod rhs 0 never fold); Shl/Shr over a
+# folded count in [0, 63] (lowering pre-masks counts; never folding is
+# the safe direction); Eq/Ne over two folded Bools; integer comparisons
+# never fold; nothing else folds.
+def eq_try_fold(op: MirBinOp, l: EqTree, r: EqTree) -> Option[EqTree]
+  match l
+  when EqTree::EqInt(lv) then
+    match r
+    when EqTree::EqInt(rv) then
+      match op
+      when MirBinOp::Add then Option::Some(EqTree::EqInt(lv + rv))
+      when MirBinOp::Sub then Option::Some(EqTree::EqInt(lv - rv))
+      when MirBinOp::Mul then Option::Some(EqTree::EqInt(lv * rv))
+      when MirBinOp::Div then
+        if rv != 0 then Option::Some(EqTree::EqInt(lv / rv)) else Option::None end
+      when MirBinOp::Mod then
+        if rv != 0 then Option::Some(EqTree::EqInt(lv % rv)) else Option::None end
+      when MirBinOp::BitAnd then Option::Some(EqTree::EqInt(lv & rv))
+      when MirBinOp::BitOr then Option::Some(EqTree::EqInt(lv | rv))
+      when MirBinOp::BitXor then Option::Some(EqTree::EqInt(lv ^ rv))
+      when MirBinOp::Shl then
+        if rv >= 0 && rv < 64 then Option::Some(EqTree::EqInt(lv << rv)) else Option::None end
+      when MirBinOp::Shr then
+        if rv >= 0 && rv < 64 then Option::Some(EqTree::EqInt(lv >> rv)) else Option::None end
+      when _ then Option::None
+      end
+    when _ then Option::None
+    end
+  when EqTree::EqBool(lb) then
+    match r
+    when EqTree::EqBool(rb) then
+      match op
+      when MirBinOp::Eq then Option::Some(EqTree::EqBool(lb == rb))
+      when MirBinOp::Ne then Option::Some(EqTree::EqBool(lb != rb))
+      when _ then Option::None
+      end
+    when _ then Option::None
+    end
+  when _ then Option::None
+  end
+end
+
+def eq_try_fold_unop(op: MirUnOp, o: EqTree) -> Option[EqTree]
+  match o
+  when EqTree::EqInt(v) then
+    match op
+    when MirUnOp::Neg then Option::Some(EqTree::EqInt(0 - v))
+    when MirUnOp::BitNot then Option::Some(EqTree::EqInt(~v))
+    when _ then Option::None
+    end
+  when EqTree::EqBool(b) then
+    match op
+    when MirUnOp::Not then Option::Some(EqTree::EqBool(!b))
+    when _ then Option::None
+    end
+  when _ then Option::None
+  end
+end
+
+# Compose an op node (charging the node budget; every pure op is unary
+# or binary).
+def eq_sym_op1(inout s: EqSym, word: String, child: EqTree) -> Option[EqTree]
+  s.nodes = s.nodes + 2
+  if s.nodes > 8192 then
+    eq_sym_err(&mut s, "the expression tree exceeds the 8192-node symbolic budget")
+    return Option::None
+  end
+  Option::Some(EqTree::EqOp1(word, child))
+end
+
+def eq_sym_op2(inout s: EqSym, word: String, l: EqTree, r: EqTree) -> Option[EqTree]
+  s.nodes = s.nodes + 3
+  if s.nodes > 8192 then
+    eq_sym_err(&mut s, "the expression tree exceeds the 8192-node symbolic budget")
+    return Option::None
+  end
+  Option::Some(EqTree::EqOp2(word, l, r))
+end
+
+def eq_tree_of_constant(c: MirConstant, inout s: EqSym) -> Option[EqTree]
+  match c.kind
+  when MirConstantKind::MirUnit then Option::Some(EqTree::EqUnit)
+  when MirConstantKind::MirBool(b) then Option::Some(EqTree::EqBool(b))
+  when MirConstantKind::MirInt(v) then Option::Some(EqTree::EqInt(v))
+  when MirConstantKind::MirFloat(v) then Option::Some(EqTree::EqFloat(v))
+  when MirConstantKind::MirChar(ch) then Option::Some(EqTree::EqChar(ch))
+  when _ then
+    eq_sym_err(&mut s, "a non-scalar constant reached the symbolic evaluator (classifier gap)")
+    Option::None
+  end
+end
+
+# The tree of one operand: a bare-place copy reads the local's tree (a
+# parameter binds its leaf); a scalar constant binds its leaf.
+def eq_sym_operand(f: MirFunction, inout s: EqSym, op: MirOperand) -> Option[EqTree]
+  match op.kind
+  when MirOperandKind::MirCopy(p) then
+    if !p.projections.is_empty() then
+      eq_sym_err(&mut s, "a projected-place copy reached the symbolic evaluator (classifier gap)")
+      return Option::None
+    end
+    let lid = p.local.id
+    var pi = 0
+    while pi < f.params.len() do
+      if f.params[pi].id.id == lid then
+        return Option::Some(EqTree::EqLeaf("p" + pi.to_string()))
+      end
+      pi = pi + 1
+    end
+    match s.env.get(lid)
+    when Option::Some(t) then Option::Some(t.clone())
+    when Option::None then
+      eq_sym_err(&mut s, "reads local " + lid.to_string() + " before its definition in the block (malformed MIR)")
+      Option::None
+    end
+  when MirOperandKind::MirConstant(c) then eq_tree_of_constant(&c, s)
+  when _ then
+    eq_sym_err(&mut s, "a non-copy operand reached the symbolic evaluator (classifier gap)")
+    Option::None
+  end
+end
+
+def eq_sym_rvalue(f: MirFunction, inout s: EqSym, rv: MirRvalue) -> Option[EqTree]
+  match rv.kind
+  when MirRvalueKind::MirMove(op) then eq_sym_operand(f, s, &op)
+  when MirRvalueKind::MirBinOp(op, l, r) then
+    match eq_sym_operand(f, s, &l)
+    when Option::Some(tl) then
+      match eq_sym_operand(f, s, &r)
+      when Option::Some(tr) then
+        match eq_try_fold(op, &tl, &tr)
+        when Option::Some(folded) then Option::Some(folded)
+        when Option::None then
+          eq_sym_op2(&mut s, eq_binop_word(op), tl, tr)
+        end
+      when Option::None then Option::None
+      end
+    when Option::None then Option::None
+    end
+  when MirRvalueKind::MirUnOp(op, o) then
+    match eq_sym_operand(f, s, &o)
+    when Option::Some(to) then
+      match eq_try_fold_unop(op, &to)
+      when Option::Some(folded) then Option::Some(folded)
+      when Option::None then
+        eq_sym_op1(&mut s, eq_unop_word(op), to)
+      end
+    when Option::None then Option::None
+    end
+  when MirRvalueKind::MirCast(kind, o, ty) then
+    match eq_sym_operand(f, s, &o)
+    when Option::Some(to) then
+      eq_sym_op1(&mut s, "as-" + eq_cast_word(kind) + "-" + eq_type_render(&ty), to)
+    when Option::None then Option::None
+    end
+  when _ then
+    eq_sym_err(&mut s, "a non-pure rvalue reached the symbolic evaluator (classifier gap)")
+    Option::None
+  end
+end
+# L2 layer - the single-block pure-body symbolic comparison
+# Gate (per fn): not async; exactly ONE block; the block is the entry and
+# ends in a direct MirReturn; every statement passes the purity
+# classifier. Then: sig equality (positional leaves are only sound over
+# identical input domains), the per-local tree walk, the return-tree
+# comparison.
+
+def eq_l2_gate_reason(f: MirFunction) -> Option[String]
+  if f.is_async then
+    return Option::Some("the function is async (async bodies lower through scheduler state)")
+  end
+  if f.blocks.len() != 1 then
+    return Option::Some("the body has " + f.blocks.len().to_string() +
+      " basic blocks (symbolic evaluation needs ONE straight-line block ending in a direct return)")
+  end
+  let block = f.blocks[0]
+  if block.id.id != f.entry_block.id then
+    return Option::Some("the entry block is not the single block (malformed MIR)")
+  end
+  match block.terminator.kind
+  when MirTerminatorKind::MirReturn then ()
+  when _ then
+    return Option::Some("the single block does not end in a direct MirReturn")
+  end
+  var si = 0
+  while si < block.statements.len() do
+    match eq_stmt_pure_reason(&block.statements[si])
+    when Option::Some(x) then
+      return Option::Some("statement " + si.to_string() + " is impure: " + x)
+    when Option::None then ()
+    end
+    si = si + 1
+  end
+  for local in f.locals do
+    if !eq_l2_ty_ok(&local.ty) then
+      return Option::Some("local " + local.id.id.to_string() + " has type " +
+        eq_type_render(&local.ty) + " - narrow-width and aggregate types are outside the L2 scalar " +
+        "domain (their masking semantics would need type-aware trees; L1 and L3 cover them)")
+    end
+  end
+  if !eq_l2_ty_ok(&f.ret_type) then
+    return Option::Some("the return type " + eq_type_render(&f.ret_type) +
+      " is outside the L2 scalar domain")
+  end
+  Option::None
+end
+
+# The width-domain gate of L2: only the width-64 scalar kinds (plus
+# Bool/Float/Char/Unit) are in the tree domain - narrower kinds have
+# masking semantics the type-blind trees cannot represent (a narrow
+# intermediate's value differs between two otherwise tree-equal bodies).
+def eq_l2_ty_ok(ty: Type) -> Bool
+  match ty
+  when Type::Int then true
+  when Type::UInt then true
+  when Type::I64 then true
+  when Type::U64 then true
+  when Type::ISize then true
+  when Type::USize then true
+  when Type::Bool then true
+  when Type::Float then true
+  when Type::Char then true
+  when Type::Unit then true
+  when _ then false
+  end
+end
+
+# The return-tree of one eligible fn: the tree of local 0 (the "_ret"
+# place) after the block's assignments; Unit returns compare the unit
+# tree. Option::None sets s.err (budgets, malformed reads).
+def eq_ret_tree(f: MirFunction, inout s: EqSym) -> Option[EqTree]
+  for st in f.blocks[0].statements do
+    match st.kind
+    when MirStatementKind::MirAssign(p, rv) then
+      s.assigns = s.assigns + 1
+      if s.assigns > 512 then
+        eq_sym_err(&mut s, "the body exceeds the 512-assignment symbolic budget")
+        return Option::None
+      end
+      if !p.projections.is_empty() then
+        eq_sym_err(&mut s, "a projected destination reached the symbolic walk (classifier gap)")
+        return Option::None
+      end
+      for pa in f.params do
+        if pa.id.id == p.local.id then
+          eq_sym_err(&mut s, "an assignment to a parameter reached the symbolic walk (malformed MIR)")
+          return Option::None
+        end
+      end
+      match eq_sym_rvalue(f, s, &rv)
+      when Option::Some(t) then s.env.insert(p.local.id, t)
+      when Option::None then return Option::None
+      end
+    when _ then ()
+    end
+  end
+  match f.ret_type
+  when Type::Unit then return Option::Some(EqTree::EqUnit)
+  when _ then ()
+  end
+  match s.env.get(0)
+  when Option::Some(t) then Option::Some(t.clone())
+  when Option::None then
+    eq_sym_err(&mut s, "the return place (local 0) is never assigned (malformed MIR)")
+    Option::None
+  end
+end
+
+# The input-vector text of a closed counterexample (the outputs disagree
+# for EVERY input - the parameters are unread, hence "p<i>=any").
+def eq_inputs_any_text(f: MirFunction) -> String
+  var out = "("
+  var first = true
+  var pi = 0
+  while pi < f.params.len() do
+    if !first then out = out + ", " end
+    out = out + "p" + pi.to_string() + "=any"
+    first = false
+    pi = pi + 1
+  end
+  out + ")"
+end
+
+def eq_layer_symbolic(old_fn: MirFunction, new_fn: MirFunction) -> EquivalenceResult
+  match eq_l2_gate_reason(&old_fn)
+  when Option::Some(r) then
+    return EquivalenceResult::Unknown("symbolic-finite: old fn '" + old_fn.name.clone() +
+      "' is out of the pure single-block domain: " + r)
+  when Option::None then ()
+  end
+  match eq_l2_gate_reason(&new_fn)
+  when Option::Some(r) then
+    return EquivalenceResult::Unknown("symbolic-finite: new fn '" + new_fn.name.clone() +
+      "' is out of the pure single-block domain: " + r)
+  when Option::None then ()
+  end
+  let old_sig = eq_sig_text(&old_fn)
+  let new_sig = eq_sig_text(&new_fn)
+  if old_sig != new_sig then
+    return EquivalenceResult::Unknown("symbolic-finite: signatures differ (old " + old_sig +
+      " vs new " + new_sig + ") - positional tree equality is only sound over identical input domains")
+  end
+  var s_old = EqSym { env: Map::new(), nodes: 0, assigns: 0, err: "" }
+  var s_new = EqSym { env: Map::new(), nodes: 0, assigns: 0, err: "" }
+  match eq_ret_tree(&old_fn, &mut s_old)
+  when Option::Some(to) then
+    match eq_ret_tree(&new_fn, &mut s_new)
+    when Option::Some(tn) then
+      let ro = eq_tree_render(&to)
+      let rn = eq_tree_render(&tn)
+      if ro == rn then
+        EquivalenceResult::ProvenWithin(proof_domain_text(ProofDomain::SymbolicFinite))
+      else
+        let closed = !eq_tree_has_leaf(&to) && !eq_tree_has_leaf(&tn)
+        if closed then
+          EquivalenceResult::Counterexample(
+            eq_inputs_any_text(&old_fn), eq_clip(&ro, 120), eq_clip(&rn, 120))
+        else
+          EquivalenceResult::Unknown("symbolic-finite: the output trees differ at symbolic leaves " +
+            "(old " + eq_clip(&ro, 120) + " vs new " + eq_clip(&rn, 120) +
+            ") - a concrete counterexample needs the bounded/differential layers")
+        end
+      end
+    when Option::None then
+      EquivalenceResult::Unknown("symbolic-finite: new fn '" + new_fn.name.clone() + "': " + s_new.err.clone())
+    end
+  when Option::None then
+    EquivalenceResult::Unknown("symbolic-finite: old fn '" + old_fn.name.clone() + "': " + s_old.err.clone())
+  end
+end
+
+# L3 layer - bounded exhaustive domain (SCAFFOLDED)
+# Domain gate: both fns pure over the whole CFG, signatures aligned, and
+# every parameter Bool with 2^N within the depth cap. Exhaustive
+# enumeration then needs a concrete evaluator, which tg_compiler does
+# not have - the layer returns the documented evaluator-gap Unknown. The
+# gate is real so a future evaluator plugs in unchanged; today no fn is
+# ever claimed equivalent here.
+
+# The exhaustive state-cap exponent for a caller's domain_depth (the
+# module doc's DOMAIN CAP rule).
+def eq_domain_cap(depth: Int) -> Int
+  if depth >= 1 && depth <= 16 then depth else 16 end
+end
+
+# Whether a fn's parameters form an exhaustively enumerable domain; the
+# reason names the first blocker.
+def eq_domain_reason(f: MirFunction, depth: Int) -> Option[String]
+  var pi = 0
+  while pi < f.params.len() do
+    match f.params[pi].ty
+    when Type::Bool then ()
+    when _ then
+      return Option::Some("parameter " + pi.to_string() + " ('" + f.params[pi].name.clone() +
+        "') has type " + eq_type_render(&f.params[pi].ty) +
+        " - only Bool (2-state) parameters admit EXHAUSTIVE enumeration; a bounded Int sample " +
+        "could only ever be differential, never a proof")
+    end
+    pi = pi + 1
+  end
+  let n = f.params.len()
+  let cap = eq_domain_cap(depth)
+  if n > cap then
+    return Option::Some("the " + n.to_string() + " Bool parameters exceed the exhaustive-state cap 2^" +
+      cap.to_string() + " (2^" + n.to_string() + " states would be required; domain_depth)")
+  end
+  Option::None
+end
+
+def eq_layer_bounded(old_fn: MirFunction, new_fn: MirFunction, domain_depth: Int) -> EquivalenceResult
+  match eq_cfg_pure_reason(&old_fn)
+  when Option::Some(r) then
+    return EquivalenceResult::Unknown("bounded exhaustive: old fn '" + old_fn.name.clone() +
+      "' is not pure: " + r)
+  when Option::None then ()
+  end
+  match eq_cfg_pure_reason(&new_fn)
+  when Option::Some(r) then
+    return EquivalenceResult::Unknown("bounded exhaustive: new fn '" + new_fn.name.clone() +
+      "' is not pure: " + r)
+  when Option::None then ()
+  end
+  let old_sig = eq_sig_text(&old_fn)
+  let new_sig = eq_sig_text(&new_fn)
+  if old_sig != new_sig then
+    return EquivalenceResult::Unknown("bounded exhaustive: signatures differ (old " + old_sig +
+      " vs new " + new_sig + ") - the enumerated input vectors would not align")
+  end
+  match eq_domain_reason(&old_fn, domain_depth)
+  when Option::Some(r) then
+    return EquivalenceResult::Unknown("bounded exhaustive: old fn '" + old_fn.name.clone() + "': " + r)
+  when Option::None then ()
+  end
+  let n = eq_param_count(&old_fn)
+  EquivalenceResult::Unknown("bounded domain requires an evaluator: the pair qualifies for exhaustive " +
+    "enumeration over its " + n.to_string() + " Bool parameters (" + (1 << n).to_string() +
+    " states, within the cap) but tg_compiler has no MIR interpreter to run the states - the §41 " +
+    "scaffold never claims equivalence (an evaluator is out of scope for this slice)")
+end
+
+# L4 layer - differential generation (SCAFFOLDED)
+# Differential testing runs both versions over a generated input corpus
+# and compares the outputs; it needs a RUNNER (interpreter), which
+# tg_compiler does not have, and it can only ever find counterexamples,
+# never prove. The gate (aligned signatures) is real; the outcome is
+# always the documented runner-gap Unknown.
+
+def eq_layer_differential(old_fn: MirFunction, new_fn: MirFunction) -> EquivalenceResult
+  let old_sig = eq_sig_text(&old_fn)
+  let new_sig = eq_sig_text(&new_fn)
+  if old_sig != new_sig then
+    return EquivalenceResult::Unknown("differential: signatures differ (old " + old_sig +
+      " vs new " + new_sig + ") - a shared generated input corpus cannot align")
+  end
+  EquivalenceResult::Unknown("differential requires a runner: tg_compiler has no MIR runner/" +
+    "interpreter to execute the old and new versions over a generated input corpus - the §41 " +
+    "scaffold never claims equivalence (a runner is out of scope for this slice; differential " +
+    "testing could only find counterexamples anyway, never a proof)")
+end
+
+# The driver - shared gates, then L1 -> L2 -> L3 -> L4
+# Shared gates fail closed (an extern declaration has no body; a fn with
+# no blocks or no entry block is malformed MIR - no digest is computed
+# from garbage). Every layer runs in order; the first ProvenWithin or
+# Counterexample returns. When every layer returns Unknown, the driver
+# returns ONE composed Unknown - the full audit trail (L1's first row
+# difference plus each layer's reason) - so a reviewer sees exactly why
+# nothing was proven. Unknown is never turned into equivalence.
+
+pub def equivalence_check(old_fn: MirFunction, new_fn: MirFunction, domain_depth: Int) -> EquivalenceResult
+  if old_fn.is_extern then
+    return EquivalenceResult::Unknown("old fn '" + old_fn.name.clone() +
+      "' is an extern declaration (no body to compare - behavioral equivalence cannot be established from MIR)")
+  end
+  if new_fn.is_extern then
+    return EquivalenceResult::Unknown("new fn '" + new_fn.name.clone() +
+      "' is an extern declaration (no body to compare - behavioral equivalence cannot be established from MIR)")
+  end
+  if old_fn.blocks.len() == 0 then
+    return EquivalenceResult::Unknown("old fn '" + old_fn.name.clone() + "' has no blocks (malformed MIR)")
+  end
+  if new_fn.blocks.len() == 0 then
+    return EquivalenceResult::Unknown("new fn '" + new_fn.name.clone() + "' has no blocks (malformed MIR)")
+  end
+  let old_bimap = eq_block_index(&old_fn)
+  let new_bimap = eq_block_index(&new_fn)
+  if !old_bimap.contains_key(&old_fn.entry_block.id) then
+    return EquivalenceResult::Unknown("old fn '" + old_fn.name.clone() + "' has no entry block (malformed MIR)")
+  end
+  if !new_bimap.contains_key(&new_fn.entry_block.id) then
+    return EquivalenceResult::Unknown("new fn '" + new_fn.name.clone() + "' has no entry block (malformed MIR)")
+  end
+  # L1 - the normalized digest.
+  let rows_old = equivalence_normalized_rows(&old_fn)
+  let rows_new = equivalence_normalized_rows(&new_fn)
+  var l1_diff = ""
+  if rows_old.len() == rows_new.len() then
+    var same = true
+    var di = 0
+    while di < rows_old.len() do
+      if rows_old[di] != rows_new[di] then
+        same = false
+        l1_diff = "L1 digests differ at row " + di.to_string() + " (old '" +
+          eq_clip(&rows_old[di], 120) + "' vs new '" + eq_clip(&rows_new[di], 120) + "')"
+        break
+      end
+      di = di + 1
+    end
+    if same then
+      return EquivalenceResult::ProvenWithin(proof_domain_text(ProofDomain::NormalizedHash))
+    end
+  else
+    l1_diff = "L1 digests differ in length (" + rows_old.len().to_string() + " vs " +
+      rows_new.len().to_string() + " rows)"
+  end
+  # L2 - symbolic evaluation of the pure straight-line bodies.
+  let r2 = eq_layer_symbolic(&old_fn, &new_fn)
+  if eq_result_is_proven(&r2) then return r2 end
+  if eq_result_is_counterexample(&r2) then return r2 end
+  # L3 - bounded exhaustive domain (scaffolded; needs an evaluator).
+  let r3 = eq_layer_bounded(&old_fn, &new_fn, domain_depth)
+  if eq_result_is_proven(&r3) then return r3 end
+  if eq_result_is_counterexample(&r3) then return r3 end
+  # L4 - differential generation (scaffolded; needs a runner).
+  let r4 = eq_layer_differential(&old_fn, &new_fn)
+  if eq_result_is_proven(&r4) then return r4 end
+  if eq_result_is_counterexample(&r4) then return r4 end
+  EquivalenceResult::Unknown("no layer proved equivalence (old '" + old_fn.name.clone() +
+    "' vs new '" + new_fn.name.clone() + "'): " + l1_diff + " | " + eq_result_reason(&r2) +
+    " | " + eq_result_reason(&r3) + " | " + eq_result_reason(&r4))
+end

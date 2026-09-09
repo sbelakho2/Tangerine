@@ -1,0 +1,596 @@
+# Tangerine Compiler - Replay / Divergence audit model (audit §42)
+# Self-hosting compiler written in Tangerine
+#
+# The §42 replay/divergence lane: a COMPACT event-level model for auditing
+# two runs against each other WITHOUT storing raw million-event traces.
+# One EventTrace holds per-event state deltas keyed to the compiler's
+# stable identity texts; the operations answer WHERE the runs diverged
+# (first_divergence), WHAT could have caused an event
+# (causal_predecessors), WHO wrote a place (writes_to), WHAT the value was
+# (value_at), and materialize only the MINIMAL CAUSAL SLICE of the
+# divergence (minimal_causal_slice) - never the full traces.
+#
+# PRIOR ART / LANE: the runtime replay lane is std/replay.tg (the
+# ReplayEvent enum of scheduling/time/io decisions) and std/snapshot.tg
+# (compare_replays / ReplayDiff.divergence_point - the same
+# first-divergence concept over runtime events). No compiler-lane replay
+# record exists in tg_compiler (mir.tg records carry no stable ids;
+# semantic_slice.tg §33 indexes MIR nodes by key text), so this audit
+# defines its OWN record types below, adapting the audit's model ids -
+# StableSymbolId, MirStmtId, Thread/TaskId, EffectId - to the stable TEXT
+# keys of the §29 defs and the §33 statement keys. The std lanes stay
+# runtime recording; this module is the analysis surface over
+# compiler-run event streams.
+#
+# RECORD MODEL:
+#   ReplayEventId { sequence, function_key, stmt_ordinal } - event
+#     identity. sequence = trace position (0-based; the builder invariant
+#     below makes it the Vec index). function_key = the event statement's
+#     function emission name (the §33 fn key text). stmt_ordinal = the
+#     event statement's ordinal: the trailing "#S<ordinal>" digits of the
+#     §33 stmt_key when it has that form, else -1 (a "#T" terminator or
+#     synthesized anchor - the documented "no ordinal" marker; ordering
+#     never depends on it).
+#   symbol_key - the StableSymbolId adaptation: the §29 stable def KEY
+#     TEXT ("path::name#signature") of the event's symbol (opaque;
+#     equality only - digest words never participate).
+#   stmt_key - the §33 statement key text "<fn>#B<block id>#S<stmt
+#     index>" (or "<fn>#B<block>#T" for a terminator site).
+#   thread_id - the Thread/TaskId adaptation: 0 = the main task; spawned
+#     tasks carry positive runtime task ids; -1 = unknown (never equal to
+#     a recorded task).
+#   effect_kind - the EffectId adaptation as a WORD: the §11 effect-class
+#     text of the site or one of the runtime state words "read"/"write"/
+#     "load"/"store"/"acquire"/"release"/"alloc"/"free"/"send"/"recv"/
+#     "spawn"/"join".
+#   StateDelta { place, old_value, new_value } - one place's observed
+#     state transition; values are rendered-value texts (strings;
+#     equality only); place is an opaque location text (the audit's Place
+#     adaptation).
+#
+# ORDERING DOMAIN: the builder stamps sequence == Vec index at append
+# time ("events[i].id.sequence == i" for every builder trace). Ops
+# anchor an event by EXACT id match (all three fields) and order by the
+# matched event's VEC POSITION (hand-built traces must keep sequence ==
+# position or fall back deterministically to Vec order); an id that
+# matches nothing yields the documented empty/None result.
+#
+# FIRST-DIVERGENCE TUPLE: first_divergence compares lock-step positions
+# on (symbol_key, stmt_key, effect_kind, delta-render) -
+# replay_divergence_row - NOT the id fields and NOT thread_id: runs
+# whose events coincide in content at every shared position do not
+# diverge even when scheduling moved events between threads. A tuple
+# mismatch at i returns the NEW side's event id (the audited run's first
+# divergent event; old is the baseline). When one side is a PREFIX of
+# the other, the first event past the shorter side is the divergence and
+# its OWN side's id is returned (new-side tail = behavior ADDED; old-side
+# tail = behavior LOST).
+#
+# CAUSALITY RULE (conservative superset - over-approximate so a real
+# cause is never missed within the cap, at the cost of possible false
+# causes): (1) every EARLIER event on the SAME thread (intra-thread
+# program order; the same-place same-thread writers the audit names are
+# a subset of this set); (2) when the target's effect_kind is a
+# dependency-class word (replay_dep_kind) AND its record carries a
+# StateDelta, the LAST EARLIER event on ANY OTHER thread whose
+# delta.place equals the target's delta place (the cross-thread last
+# writer - write/read, release/acquire, send/recv style edges; a
+# dependency-class event WITHOUT a delta cannot name a place, so its
+# cross-thread chase is skipped - documented approximation; its causes
+# are rule 1); (3) capped at replay_predecessor_cap (64), keeping the 64
+# MOST RECENT candidates, returned sorted by id.
+#
+# SLICE: minimal_causal_slice(old, new) = the divergence event plus its
+# TRANSITIVE causal predecessors, walked FIFO over the side that produced
+# the divergence event, capped at replay_slice_cap (512) total ids,
+# returned sorted and deduped. Only this slice is ever materialized (the
+# walk clones the matched side once - compact traces only).
+#
+# DIGEST: replay_trace_rows renders the canonical SEQUENCE-ORDERED row
+# set (header row first, then one row per event in Vec order - events
+# are ordered, so rows are never textually sorted); replay_trace_digest
+# content-addresses the joined rows with stable_digest_of. Rows are
+# text; nothing here is parsed back.
+#
+# DETERMINISM: every op is a pure function of its trace argument(s);
+# every returned Vec is sorted (replay_id_lt: sequence, function_key,
+# stmt_ordinal) and deduped where uniqueness is required.
+
+use std::core::{Option}
+use std::collections::{Vec}
+
+use tg_compiler::ids::{StableDigest, stable_digest_of}
+use tg_compiler::semantic_model::{semantic_json_escape}
+
+# -----------------------------------------------------------------------
+# §42.1 - The record model
+# -----------------------------------------------------------------------
+
+# The event identity: trace position + the MIR-site anchor of the event.
+struct ReplayEventId
+  sequence: Int
+  function_key: String
+  stmt_ordinal: Int
+end
+
+# One observed state transition of one place (rendered-value texts).
+struct StateDelta
+  place: String
+  old_value: String
+  new_value: String
+end
+
+# One replay event: the id + the audit model's stable keys + the delta.
+struct ReplayEvent
+  id: ReplayEventId
+  symbol_key: String
+  stmt_key: String
+  thread_id: Int
+  effect_kind: String
+  delta: Option[StateDelta]
+end
+
+# One run's compact trace: the revision text of the audited compile (a
+# §30 snapshot revision digest text or the caller's source revision) and
+# the sequence-ordered events. Never a raw trace: only these records.
+struct EventTrace
+  revision: String
+  events: Vec[ReplayEvent] = Vec::new()
+end
+
+# The append-only builder: appends stamp the sequence (sequence == Vec
+# index by construction), so ordering mistakes cannot enter a
+# builder-produced trace.
+struct ReplayTraceBuilder
+  revision: String
+  events: Vec[ReplayEvent] = Vec::new()
+end
+
+# Id equality on all three fields (the exact-match anchor of every op).
+def replay_id_eq(a: ReplayEventId, b: ReplayEventId) -> Bool
+  a.sequence == b.sequence && a.function_key == b.function_key &&
+    a.stmt_ordinal == b.stmt_ordinal
+end
+
+# The deterministic id order of every returned list.
+def replay_id_lt(a: ReplayEventId, b: ReplayEventId) -> Bool
+  if a.sequence != b.sequence then
+    a.sequence < b.sequence
+  elsif a.function_key != b.function_key then
+    a.function_key < b.function_key
+  else
+    a.stmt_ordinal < b.stmt_ordinal
+  end
+end
+
+# Whether an id list already holds the id (linear; lists stay small).
+def replay_id_list_contains(ids: Vec[ReplayEventId], id: ReplayEventId) -> Bool
+  var found = false
+  var i = 0
+  while i < ids.len() do
+    if replay_id_eq(&ids[i], &id) then
+      found = true
+      break
+    end
+    i = i + 1
+  end
+  found
+end
+
+# The Vec position of the event whose id matches exactly (-1 = no match -
+# the documented empty-result anchor of every op).
+def replay_event_index(trace: EventTrace, id: ReplayEventId) -> Int
+  var i = 0
+  while i < trace.events.len() do
+    if replay_id_eq(&trace.events[i].id, &id) then
+      return i
+    end
+    i = i + 1
+  end
+  -1
+end
+
+# The stmt_ordinal of a §33 stmt_key: the digits of the LAST trailing
+# "#S<digits>" run ("<fn>#B<id>#S<idx>" -> idx); -1 when the key has no
+# such run (a "#T" terminator key, a synthesized anchor, an empty key).
+# Byte-level scan: "#"/digits are ASCII, so it is safe on multi-byte
+# function names (UTF-8 continuation bytes are never 0x23 or 0x30-0x39).
+def replay_stmt_ordinal(stmt_key: String) -> Int
+  var best: Int = -1
+  var i = 0
+  while i + 1 < stmt_key.len() do
+    if stmt_key.slice(i, i + 1) == "#" && stmt_key.slice(i + 1, i + 2) == "S" then
+      var value = 0
+      var digits = false
+      var ok = true
+      var j = i + 2
+      while j < stmt_key.len() do
+        let bs = stmt_key.slice(j, j + 1).bytes()
+        if bs.len() == 0 then
+          ok = false
+          break
+        end
+        let b = bs[0] as Int
+        if b >= 48 && b <= 57 then
+          value = value * 10 + (b - 48)
+          digits = true
+          j = j + 1
+        else
+          ok = false
+          break
+        end
+      end
+      if ok && digits then
+        best = value
+      end
+    end
+    i = i + 1
+  end
+  best
+end
+
+# The delta-render text of the divergence tuple and the digest rows:
+#   Some(d) -> "<place>"="<old>"->"<new>"   (each component json-escaped)
+#   None    -> null
+# The quoted form keeps the render injective over the three components.
+def replay_delta_text(delta: Option[StateDelta]) -> String
+  match delta
+  when Option::Some(d) then
+    "\"" + semantic_json_escape(&d.place) + "\"=\"" +
+      semantic_json_escape(&d.old_value) + "\"->\"" +
+      semantic_json_escape(&d.new_value) + "\""
+  when Option::None then "null"
+  end
+end
+
+# The first-divergence tuple row: (symbol_key, stmt_key, effect_kind,
+# delta-render). Id fields and thread_id NEVER participate (module doc).
+def replay_divergence_row(e: ReplayEvent) -> String
+  "{\"sym\":\"" + semantic_json_escape(&e.symbol_key) + "\",\"st\":\"" +
+    semantic_json_escape(&e.stmt_key) + "\",\"eff\":\"" +
+    semantic_json_escape(&e.effect_kind) + "\",\"d\":" +
+    replay_delta_text(e.delta.clone()) + "}"
+end
+
+# The canonical digest row of one event (full record; pos = Vec position).
+def replay_event_row(pos: Int, e: ReplayEvent) -> String
+  "{\"r\":\"ev\",\"pos\":" + pos.to_string() + ",\"seq\":" +
+    e.id.sequence.to_string() + ",\"f\":\"" +
+    semantic_json_escape(&e.id.function_key) + "\",\"so\":" +
+    e.id.stmt_ordinal.to_string() + ",\"sym\":\"" +
+    semantic_json_escape(&e.symbol_key) + "\",\"st\":\"" +
+    semantic_json_escape(&e.stmt_key) + "\",\"tid\":" +
+    e.thread_id.to_string() + ",\"eff\":\"" +
+    semantic_json_escape(&e.effect_kind) + "\",\"d\":" +
+    replay_delta_text(e.delta.clone()) + "}"
+end
+
+# -----------------------------------------------------------------------
+# §42.2 - Builder and digest
+# -----------------------------------------------------------------------
+
+pub def replay_builder_new(revision: String) -> ReplayTraceBuilder
+  ReplayTraceBuilder {
+    revision: revision.clone(),
+    events: Vec::new()
+  }
+end
+
+# Append one event by parts: sequence is stamped (builder invariant),
+# function_key verbatim, stmt_ordinal derived from the stmt_key's
+# trailing "#S<digits>" run (replay_stmt_ordinal).
+pub def replay_builder_append(
+  inout b: ReplayTraceBuilder,
+  function_key: String,
+  symbol_key: String,
+  stmt_key: String,
+  thread_id: Int,
+  effect_kind: String,
+  delta: Option[StateDelta]
+) -> Unit
+  let record = ReplayEvent {
+    id: ReplayEventId {
+      sequence: b.events.len(),
+      function_key: function_key.clone(),
+      stmt_ordinal: replay_stmt_ordinal(stmt_key.clone())
+    },
+    symbol_key: symbol_key,
+    stmt_key: stmt_key,
+    thread_id: thread_id,
+    effect_kind: effect_kind,
+    delta: delta
+  }
+  b.events.push(record)
+  ()
+end
+
+# Append a pre-keyed record: the sequence is RE-STAMPED to the builder
+# position (a disagreeing caller sequence is overwritten - the
+# canonicalization that keeps builder traces valid).
+pub def replay_builder_append_record(
+  inout b: ReplayTraceBuilder,
+  event: ReplayEvent
+) -> Unit
+  let record = ReplayEvent {
+    id: ReplayEventId {
+      sequence: b.events.len(),
+      function_key: event.id.function_key.clone(),
+      stmt_ordinal: event.id.stmt_ordinal
+    },
+    symbol_key: event.symbol_key.clone(),
+    stmt_key: event.stmt_key.clone(),
+    thread_id: event.thread_id,
+    effect_kind: event.effect_kind.clone(),
+    delta: event.delta.clone()
+  }
+  b.events.push(record)
+  ()
+end
+
+# Finish the builder into the immutable trace value.
+pub def replay_builder_finish(b: ReplayTraceBuilder) -> EventTrace
+  EventTrace {
+    revision: b.revision.clone(),
+    events: b.events.clone()
+  }
+end
+
+# The canonical row set of one trace, SEQUENCE ORDER (header row first,
+# then one row per event in Vec order - events are ordered, so the rows
+# are never textually sorted).
+def replay_trace_lines(trace: EventTrace) -> Vec[String]
+  var lines: Vec[String] = Vec::new()
+  lines.push("{\"r\":\"header\",\"format\":\"tg-compiler-replay/v1\",\"revision\":\"" +
+    semantic_json_escape(&trace.revision) + "\"}")
+  var i = 0
+  while i < trace.events.len() do
+    lines.push(replay_event_row(i, &trace.events[i]))
+    i = i + 1
+  end
+  lines
+end
+
+pub def replay_trace_rows(trace: EventTrace) -> Vec[String]
+  replay_trace_lines(&trace)
+end
+
+# The content-addressed digest of the trace: stable_digest_of the joined
+# canonical sequence-ordered rows (revision rides the header row).
+pub def replay_trace_digest(trace: EventTrace) -> StableDigest
+  var text = ""
+  let lines = replay_trace_lines(&trace)
+  for l in lines do
+    text = text + l + "\n"
+  end
+  stable_digest_of(&text)
+end
+
+# -----------------------------------------------------------------------
+# §42.3 - first_divergence
+# -----------------------------------------------------------------------
+
+# The first sequence position where the (symbol, stmt, effect_kind,
+# delta-render) tuples differ, or where one side ends (module doc for the
+# side-selection rule): tuple mismatch -> the NEW side's id; identical
+# shared prefix with one side longer -> the longer side's event at the
+# first position past the shorter side; identical traces -> None.
+pub def first_divergence(old: EventTrace, new: EventTrace) -> Option[ReplayEventId]
+  var n = old.events.len()
+  if new.events.len() < n then
+    n = new.events.len()
+  end
+  var i = 0
+  while i < n do
+    if replay_divergence_row(&old.events[i]) != replay_divergence_row(&new.events[i]) then
+      return Option::Some(new.events[i].id.clone())
+    end
+    i = i + 1
+  end
+  if old.events.len() < new.events.len() then
+    return Option::Some(new.events[n].id.clone())
+  end
+  if new.events.len() < old.events.len() then
+    return Option::Some(old.events[n].id.clone())
+  end
+  Option::None
+end
+
+# -----------------------------------------------------------------------
+# §42.4 - Causality
+# -----------------------------------------------------------------------
+
+# The cap of causal_predecessors: at most the 64 most recent candidates.
+def replay_predecessor_cap() -> Int
+  64
+end
+
+# The dependency-class words: an event with one of these kinds CHASES the
+# last cross-thread writer of its place when it carries a delta (module
+# doc rule 2). Words outside the set (a pure log/observe word, a §11
+# class text) never chase.
+def replay_dep_kind(effect_kind: String) -> Bool
+  effect_kind == "read" || effect_kind == "write" || effect_kind == "load" ||
+    effect_kind == "store" || effect_kind == "acquire" || effect_kind == "release" ||
+    effect_kind == "alloc" || effect_kind == "free" || effect_kind == "send" ||
+    effect_kind == "recv" || effect_kind == "spawn" || effect_kind == "join"
+end
+
+# The events that could have caused the target (module doc causality
+# rule): every earlier event on the same thread, plus - for a
+# dependency-class event carrying a delta - the last earlier cross-thread
+# writer of the same delta place. Candidates collected in Vec order; the
+# cap keeps the replay_predecessor_cap most recent; sorted on return. An
+# id that matches no event yields [].
+pub def causal_predecessors(trace: EventTrace, event_id: ReplayEventId) -> Vec[ReplayEventId]
+  var out: Vec[ReplayEventId] = Vec::new()
+  let ti = replay_event_index(&trace, event_id)
+  if ti < 0 then
+    return out
+  end
+  let target = trace.events[ti]
+  let target_thread = target.thread_id
+  let target_kind = target.effect_kind.clone()
+  let chase = match target.delta.clone()
+    when Option::Some(d) then d.place.clone()
+    when Option::None then ""
+  end
+  var ci: Vec[Int] = Vec::new()
+  var cid: Vec[ReplayEventId] = Vec::new()
+  var cw: Int = -1
+  var i = 0
+  while i < ti do
+    let pe = trace.events[i]
+    if pe.thread_id == target_thread then
+      ci.push(i)
+      cid.push(pe.id.clone())
+    end
+    if replay_dep_kind(&target_kind) && chase.len() > 0 then
+      match pe.delta.clone()
+      when Option::Some(pd) then
+        if pd.place == chase && pe.thread_id != target_thread then
+          cw = i
+        end
+      when Option::None then ()
+      end
+    end
+    i = i + 1
+  end
+  # Merge the cross-thread writer into the ascending candidate list (the
+  # same-thread candidates were pushed in ascending order already).
+  var fi: Vec[Int] = Vec::new()
+  var fid: Vec[ReplayEventId] = Vec::new()
+  var k = 0
+  var merged = false
+  while k < ci.len() || (cw >= 0 && !merged) do
+    if cw >= 0 && !merged && (k >= ci.len() || cw < ci[k]) then
+      fi.push(cw)
+      fid.push(trace.events[cw].id.clone())
+      merged = true
+    end
+    if k < ci.len() then
+      fi.push(ci[k])
+      fid.push(cid[k].clone())
+      k = k + 1
+    end
+  end
+  # The cap keeps the MOST RECENT candidates (drop the earliest).
+  var drop = 0
+  if fi.len() > replay_predecessor_cap() then
+    drop = fi.len() - replay_predecessor_cap()
+  end
+  var j = drop
+  while j < fi.len() do
+    out.push(fid[j].clone())
+    j = j + 1
+  end
+  out.sort_by(|a, b| replay_id_lt(a, b))
+  out
+end
+
+# -----------------------------------------------------------------------
+# §42.5 - writes_to / value_at / minimal_causal_slice
+# -----------------------------------------------------------------------
+
+# The ids of every event whose delta.place equals the place, sorted by
+# replay_id_lt ([] when the place was never written in the trace).
+pub def writes_to(trace: EventTrace, place: String) -> Vec[ReplayEventId]
+  var out: Vec[ReplayEventId] = Vec::new()
+  var i = 0
+  while i < trace.events.len() do
+    let pe = trace.events[i]
+    match pe.delta.clone()
+    when Option::Some(pd) then
+      if pd.place == place then
+        out.push(pe.id.clone())
+      end
+    when Option::None then ()
+    end
+    i = i + 1
+  end
+  out.sort_by(|a, b| replay_id_lt(a, b))
+  out
+end
+
+# The value at the place as of the event: the NEWEST event at or before
+# the target's Vec position (ANY thread) whose delta.place equals the
+# place - the target itself counts when it writes the place - and its
+# new_value. None when the id matches no event or no event at or before
+# it wrote the place (the place is uninitialized at that point).
+pub def value_at(
+  trace: EventTrace,
+  event_id: ReplayEventId,
+  place: String
+) -> Option[String]
+  let ti = replay_event_index(&trace, event_id)
+  if ti < 0 then
+    return Option::None
+  end
+  var best: Int = -1
+  var i = 0
+  while i <= ti do
+    let pe = trace.events[i]
+    match pe.delta.clone()
+    when Option::Some(pd) then
+      if pd.place == place then
+        best = i
+      end
+    when Option::None then ()
+    end
+    i = i + 1
+  end
+  if best < 0 then
+    return Option::None
+  end
+  match trace.events[best].delta.clone()
+  when Option::Some(pd) then Option::Some(pd.new_value.clone())
+  when Option::None then Option::None
+  end
+end
+
+# The cap of the transitive causal walk (total ids in one slice).
+def replay_slice_cap() -> Int
+  512
+end
+
+# The minimal causal slice of a divergence: the first_divergence event
+# plus its transitive causal predecessors, walked FIFO over the side that
+# produced the divergence event, capped at replay_slice_cap ids and
+# returned sorted and deduped. Identical traces (no divergence) yield [].
+# Only this slice is ever materialized.
+pub def minimal_causal_slice(old: EventTrace, new: EventTrace) -> Vec[ReplayEventId]
+  var out: Vec[ReplayEventId] = Vec::new()
+  match first_divergence(&old, &new)
+  when Option::Some(root) then
+    var side = old.clone()
+    if replay_event_index(&new, root.clone()) >= 0 then
+      side = new.clone()
+    end
+    var visited: Vec[ReplayEventId] = Vec::new()
+    var work: Vec[ReplayEventId] = Vec::new()
+    work.push(root)
+    var head = 0
+    while head < work.len() do
+      let cur = work[head].clone()
+      head = head + 1
+      if !replay_id_list_contains(&visited, cur.clone()) then
+        visited.push(cur.clone())
+        if visited.len() < replay_slice_cap() then
+          let preds = causal_predecessors(&side, cur)
+          var p = 0
+          while p < preds.len() do
+            let pid = preds[p].clone()
+            if !replay_id_list_contains(&visited, pid.clone()) &&
+              !replay_id_list_contains(&work, pid.clone()) then
+              work.push(pid)
+            end
+            p = p + 1
+          end
+        end
+      end
+    end
+    out = visited.clone()
+    out.sort_by(|a, b| replay_id_lt(a, b))
+  when Option::None then ()
+  end
+  out
+end

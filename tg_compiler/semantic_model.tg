@@ -1,0 +1,719 @@
+# Tangerine Compiler — Semantic Model (Snapshot / Delta Protocol Data)
+# Self-hosting compiler written in Tangerine
+#
+# (audit §29 + §45) ARCHITECTURE CONTRACT — the snapshot/delta semantic
+# protocol:
+#   - SOURCE IS ONE VIEW: the snapshot is the compiler's semantic MODEL of a
+#     compilation, not a rendering of its text. The same semantics may be
+#     produced from differently-arranged source text (harmless textual
+#     movement — reformatting, comment edits, statement reordering within a
+#     block — must not change the semantic entities the snapshot records).
+#   - SPANS ARE METADATA, NEVER IDENTITY: every record's provenance is an
+#     Option[Span] carried for navigation/diagnostics only. No span, file
+#     offset or source-order ordinal participates in any identity or in any
+#     deterministic ordering below.
+#   - SEMANTIC ENTITIES SURVIVE: identity rides the compiler's existing
+#     stable-ID infrastructure (ids.tg — the initial stable-ID machinery:
+#     StableDigest, StableDefId and stable_def_id_digested), whose identity
+#     is the 128-bit digest of a canonical content key, never an ephemeral
+#     per-compilation id and never a name/position.
+#
+# SCOPE (this slice): DATA STRUCTURES ONLY — records, enums, ids and the
+# deterministic-ordering/serialization helpers the snapshot writer (a later
+# slice) composes. NO analysis passes live here: nothing in this module
+# walks the AST, the typed program or the MIR; every producer is a later
+# analysis slice that fills these records.
+#
+# §29 ADAPTATIONS TO WHAT EXISTS (the audit's Digest/TargetId/... mapped onto
+# the compiler's real primitives, never invented look-alikes):
+#   - Digest (revision / public_api_hash / abi_hash / unsafe_hash) is ids.tg's
+#     StableDigest — the 128-bit stable digest (hi/lo UInt words) the
+#     stable-ID model already digests canonical keys with.
+#   - TargetId is a strong newtype over the canonical target TRIPLE STRING
+#     (the codebase's only target identity is TargetDesc.name / the
+#     detect_host_target triple; no central TargetId domain exists yet — this
+#     record seeds that domain, name-only until a digest domain is wired).
+#   - symbols/types/callables reference the resolver's StableDefId records
+#     (canonical key + digest words + registered low-word id) — the existing
+#     stable identity for definitions.
+#   - effect facts reuse the §11 EffectSummary record (types.tg) VERBATIM —
+#     its may_allocate / may_block / may_io / may_spawn / may_sleep /
+#     may_panic / may_unsafe flags and Set[CapabilityId] capabilities — and
+#     the CapabilityId domain it carries.
+#   - ownership conventions reuse ast.tg's AccessConvention (Let / Inout /
+#     Sink / Set — the ONE access-convention vocabulary the semantic AST
+#     already uses); contract kinds reuse AstContractKind (AstPre / AstPost /
+#     AstInvariant); symbol kinds reuse DefKind (ids.tg).
+#   - domains the compiler has no id for (call edges, per-place ownership
+#     facts, branch points) order by the stable digest of their canonical
+#     CONTENT KEY (documented per record); the key text is stored where the
+#     domain is textual (place_key, branch_id) so collisions stay detectable.
+#
+# DETERMINISTIC ORDERING: every table below has a comparator + in-place sort
+# (cqs.tg sort_signals style) keyed on the stable digest (hi word, then lo
+# word) with canonical keys / semantic discriminants as total-order
+# tiebreaks. The snapshot writer MUST emit every Vec through its sort before
+# hashing, so byte-identical snapshots imply byte-identical tables.
+
+use std::core::{Option}
+use std::collections::{Vec}
+use tg_compiler::ids::{StableDigest, StableDefId, DefKind}
+use tg_compiler::ast::{AccessConvention, AstContractKind}
+use tg_compiler::token::{Span}
+use tg_compiler::types::{EffectSummary, CapabilityId}
+
+# ———————————————————————————————————————————————————————————————
+# Target identity
+# ———————————————————————————————————————————————————————————————
+# The target of the compilation the snapshot models. Strong newtype over the
+# canonical target triple/name — the ONLY target identity the codebase has
+# today (TargetDesc.name in target_desc.tg; the detect_host_target triple
+# strings). The snapshot's hash fields (abi_hash in particular) are
+# target-dependent, so the target rides the snapshot header.
+struct TargetId
+  name: String   # canonical target triple / TargetDesc.name ("aarch64-apple-darwin", "cortex-m4f", ...)
+end
+
+# ———————————————————————————————————————————————————————————————
+# SemanticSnapshot — the §29 top-level protocol record
+# ———————————————————————————————————————————————————————————————
+# One snapshot models one compilation's semantics: the per-definition
+# symbols/types, the cross-entity relationship tables (calls, effects,
+# capabilities, ownership, contracts, tests, coverage), the per-function
+# MIR-level semantic summaries, and the three surface hashes the delta
+# architecture compares across compilations. Field order is the protocol's
+# canonical record order (the writer's text form emits fields in this order).
+#
+#   revision        — digest of this snapshot's canonical serialized text
+#                     (computed by the writer slice after the tables are
+#                     sorted and rendered; zero until then).
+#   compiler_version — the producing compiler's version.tg VERSION text.
+#   target          — the compilation target (TargetId above).
+#   symbols         — declared definitions (the DefKind vocabulary).
+#   types           — nominal type declarations (struct/enum/trait).
+#   calls           — caller -> callee call edges.
+#   effects         — per-function/operation effect facts (the §11 record).
+#   capabilities    — function -> capability edges (the CapabilityId domain).
+#   ownership       — per-place ownership facts inside a function body.
+#   contracts       — per-function pre/post/invariant clause facts.
+#   tests           — test-function -> exercised-function relationships.
+#   coverage        — function -> branch/arm-point coverage relationships.
+#   mir_functions   — per-function semantic summaries of the lowered MIR.
+#   public_api_hash — digest of the public-API surface (writer-computed).
+#   abi_hash        — digest of the public ABI surface (writer-computed).
+#   unsafe_hash     — digest of the unsafe surface (writer-computed).
+#
+# The three hash fields are the DELTA KEYS of §29: two snapshots whose
+# public_api_hash / abi_hash / unsafe_hash agree are API/ABI/safety-surface
+# compatible by construction (the hashes digest canonical semantic text ONLY
+# — never spans, never ephemeral ids, never raw source text).
+struct SemanticSnapshot
+  revision: StableDigest
+  compiler_version: String
+  target: TargetId
+  symbols: Vec[SemanticSymbol] = Vec::new()
+  types: Vec[SemanticType] = Vec::new()
+  calls: Vec[CallEdge] = Vec::new()
+  effects: Vec[EffectEdge] = Vec::new()
+  capabilities: Vec[CapabilityEdge] = Vec::new()
+  ownership: Vec[OwnershipFact] = Vec::new()
+  contracts: Vec[ContractFact] = Vec::new()
+  tests: Vec[TestRelationship] = Vec::new()
+  coverage: Vec[CoverageRelationship] = Vec::new()
+  mir_functions: Vec[MirSemanticSummary] = Vec::new()
+  public_api_hash: StableDigest
+  abi_hash: StableDigest
+  unsafe_hash: StableDigest
+end
+
+# The zero digest — the "not yet computed" placeholder for revision and the
+# three surface hashes (stable_def_id_digested's collision-free zero word
+# pair; nothing digests to zero in practice — the FNV-1a passes never emit
+# the empty-word state).
+def semantic_digest_zero() -> StableDigest
+  StableDigest { hi: 0, lo: 0 }
+end
+
+# An EMPTY snapshot: no tables, zero digest words — the seed record the
+# writer slice fills (the writer then sorts every table, renders the
+# canonical text form and computes revision / the three surface hashes via
+# ids.tg's stable_digest_of).
+def semantic_snapshot_new(compiler_version: String, target: TargetId) -> SemanticSnapshot
+  SemanticSnapshot {
+    revision: semantic_digest_zero(),
+    compiler_version: compiler_version,
+    target: target,
+    public_api_hash: semantic_digest_zero(),
+    abi_hash: semantic_digest_zero(),
+    unsafe_hash: semantic_digest_zero()
+  }
+end
+
+# ———————————————————————————————————————————————————————————————
+# SemanticSymbol — one declared definition
+# ———————————————————————————————————————————————————————————————
+# Identity is the definition's StableDefId (ids.tg): the 128-bit digest of
+# the canonical "path::name#signature" key the resolver computes
+# (compute_stable_def_id) — content-derived and order-independent, verified
+# against key collisions by stable_digest_verify at registration. kind is
+# the resolver's DefKind metadata vocabulary (ids.tg); name / module_path
+# are the flat spellings of stable_id.path's two components (stable_id.key =
+# module_path + "::" + name + "#" + signature). is_pub marks the public
+# surface (the public_api_hash domain). span is provenance only.
+struct SemanticSymbol
+  stable_id: StableDefId   # stable identity: canonical key + 128-bit digest
+  kind: DefKind            # Function / Method / Static / Constant / EnumVariant / StructField / Intrinsic / TypeName / Trait / Other
+  name: String             # declaration name (the stable key's name component)
+  module_path: String      # module-qualified path ("a::b") of the declaration
+  is_pub: Bool             # public-surface membership
+  is_generic: Bool         # declaration declares generic parameters
+  span: Option[Span] = Option::None   # declaration span — provenance metadata ONLY, never identity
+end
+
+# ———————————————————————————————————————————————————————————————
+# SemanticType — one nominal type declaration
+# ———————————————————————————————————————————————————————————————
+# The stable identity is the type declaration's StableDefId (types register
+# through the same resolver machinery as the DefKind::TypeName / Trait
+# entries). kind splits the nominal family — struct vs enum vs trait is not
+# distinguished by any single existing id, so the snapshot carries its own
+# small vocabulary; the per-compilation TypeId/DefId associations are NOT
+# snapshot data (they are ephemeral; the mapping lives in the producing
+# compilation's resolver tables).
+struct SemanticType
+  stable_id: StableDefId   # stable identity: canonical key + 128-bit digest
+  kind: SemanticTypeKind   # Struct | Enum | Trait
+  name: String
+  module_path: String
+  generic_arity: Int       # declared generic-parameter count
+  is_pub: Bool
+  span: Option[Span] = Option::None   # declaration span — provenance metadata ONLY
+end
+
+enum SemanticTypeKind
+  Struct
+  Enum
+  Trait
+end
+
+# ———————————————————————————————————————————————————————————————
+# CallEdge — one caller -> callee call relationship
+# ———————————————————————————————————————————————————————————————
+# Both endpoints are stable definition ids (callers and callees are defs —
+# functions, methods, statics, intrinsics — so the StableDefId domain covers
+# them). kind classifies the call: Direct is a statically-resolved call,
+# Indirect a closure/function-pointer call recorded against the statically-
+# known declaration it routes through, Intrinsic a compiler-known intrinsic
+# operation (the IntrinsicId KIND classification is per-compilation and never
+# rides a snapshot). sites is the call-site span LIST (one entry per textual
+# site) — metadata only: a call edge exists once per (caller, callee, kind)
+# regardless of how many sites call it, so harmless textual movement never
+# forks an edge.
+struct CallEdge
+  caller: StableDefId
+  callee: StableDefId
+  kind: CallEdgeKind       # Direct | Indirect | Intrinsic
+  sites: Vec[Span] = Vec::new()   # call-site spans — provenance metadata ONLY
+end
+
+enum CallEdgeKind
+  Direct
+  Indirect
+  Intrinsic
+end
+
+# ———————————————————————————————————————————————————————————————
+# EffectEdge — one function/operation effect fact
+# ———————————————————————————————————————————————————————————————
+# Reuses the §11 canonical effect record (types.tg EffectSummary) VERBATIM —
+# the may_allocate / may_block / may_io / may_spawn / may_sleep / may_panic /
+# may_unsafe flags plus the Set[CapabilityId] capability set — so snapshot
+# effect data is byte-identical in shape to what the §11 MIR pass computes
+# (effect_summary_merge / effect_summary_unknown live there, not here). The
+# row's subject is the function whose body performs the summarized operation
+# set. span is the summarized operation's site — metadata only.
+struct EffectEdge
+  function: StableDefId    # the subject function (stable identity)
+  summary: EffectSummary   # the §11 semantic effect record — fields reused verbatim
+  span: Option[Span] = Option::None   # operation site — provenance metadata ONLY
+end
+
+# ———————————————————————————————————————————————————————————————
+# CapabilityEdge — one function <-> capability edge
+# ———————————————————————————————————————————————————————————————
+# capability is the existing CapabilityId domain (types.tg — fixed numeric
+# identities, never names: the arena / mmio behavioral capabilities of the
+# §11 record). kind is the edge direction: Requires = the function's body
+# requires the capability to run, Provides = the function provides/grants
+# the capability to its callers. span is the declaring/performing site —
+# metadata only.
+struct CapabilityEdge
+  function: StableDefId
+  capability: CapabilityId
+  kind: CapabilityEdgeKind # Requires | Provides
+  span: Option[Span] = Option::None   # declaring site — provenance metadata ONLY
+end
+
+enum CapabilityEdgeKind
+  Requires
+  Provides
+end
+
+# ———————————————————————————————————————————————————————————————
+# OwnershipFact — one per-place ownership fact in a function body
+# ———————————————————————————————————————————————————————————————
+# Ownership is a per-place property and the compiler has NO stable id for a
+# place (LocalId / MirLocalId are ephemeral per-compilation domains) — so the
+# fact's object is the canonical place-key TEXT within the subject function
+# (the delta identity digests that text), never an ephemeral local id and
+# never a span. convention is the existing AccessConvention vocabulary (Let =
+# shared read, Inout = mutable borrow, Sink = moved, Set = written). span is
+# the transfer site — metadata only.
+struct OwnershipFact
+  function: StableDefId    # the subject function (stable identity)
+  place_key: String        # canonical place path text within the function ("self.field", "x[i]")
+  convention: AccessConvention   # Let | Inout | Sink | Set — the ast.tg ownership vocabulary
+  span: Option[Span] = Option::None   # transfer site — provenance metadata ONLY
+end
+
+# ———————————————————————————————————————————————————————————————
+# ContractFact — one declared contract clause on a function
+# ———————————————————————————————————————————————————————————————
+# kind reuses AstContractKind (AstPre / AstPost / AstInvariant — the
+# parser's contract vocabulary). clause_text is the clause's SOURCE TEXT —
+# the content-delta domain for contract changes (a clause change is a
+# semantic change: it rides the clause text, never the span). span is the
+# clause's span — metadata only.
+struct ContractFact
+  function: StableDefId
+  kind: AstContractKind    # AstPre | AstPost | AstInvariant
+  clause_text: String      # the clause as written — the content-delta domain
+  span: Option[Span] = Option::None   # clause span — provenance metadata ONLY
+end
+
+# ———————————————————————————————————————————————————————————————
+# TestRelationship — one test-function -> exercised-function relationship
+# ———————————————————————————————————————————————————————————————
+# Both endpoints are stable definition ids: test is the test-carrying
+# function (a #[test]-annotated def), target is the function it exercises. A
+# test that exercises nothing (a compile-only test) never appears. span is
+# the test function's declaration span — metadata only.
+struct TestRelationship
+  test: StableDefId        # the test function (subject)
+  target: StableDefId      # the exercised function (object)
+  span: Option[Span] = Option::None   # test declaration span — provenance metadata ONLY
+end
+
+# ———————————————————————————————————————————————————————————————
+# CoverageRelationship — one function <-> branch-point coverage fact
+# ———————————————————————————————————————————————————————————————
+# Coverage structure is branch/arm-granular and the codebase's coverage
+# domain (coverage.tg §62) identifies points by stable STRING ids derived
+# from the owning symbol id + block/terminator ordinals — the compiler has no
+# digest domain for a branch point, so the fact's object is that canonical
+# branch-id TEXT (the row digests it for deltas). kind is the branch-point
+# classification text ("IfExpr", "MatchExpr", ...). arm_id is the
+# arm-granular id when the fact is arm-scoped. span is the branch point's
+# span — metadata only (the coverage ids themselves are span-free by
+# construction).
+struct CoverageRelationship
+  function: StableDefId    # the function owning the branch point
+  branch_id: String        # canonical coverage branch id text (the §62.2 stable scheme)
+  arm_id: Option[String] = Option::None   # canonical arm id when arm-granular
+  kind: String             # branch-point classification ("IfExpr", "MatchExpr", ...)
+  span: Option[Span] = Option::None   # branch-point span — provenance metadata ONLY
+end
+
+# ———————————————————————————————————————————————————————————————
+# MirSemanticSummary — one function's lowered-MIR semantic summary
+# ———————————————————————————————————————————————————————————————
+# The semantic face of a lowered function: structural counts (blocks /
+# statements / locals) plus the function's TRANSITIVE §11 effect summary
+# (the fixed-point union the §11 MIR pass computes over the lowered program
+# — EffectSummary reused verbatim) and the fail-closed markers: calls_unsafe
+# (an unsafe operation was reachable) and calls_unknown (an operation with
+# unbounded behavior was reachable — the effect_summary_unknown shape, never
+# silently clean). reachable = the function's entry was reached in the
+# lowered program's reachability walk.
+struct MirSemanticSummary
+  function: StableDefId
+  block_count: Int         # lowered basic-block count
+  statement_count: Int     # lowered statement count
+  local_count: Int         # lowered local-slot count
+  reachable: Bool          # entry reachable in the lowered program
+  calls_unsafe: Bool       # an unsafe operation is reachable
+  calls_unknown: Bool      # an unbounded-behavior operation is reachable (fail closed)
+  effect_summary: EffectSummary   # the §11 transitive semantic summary — fields reused verbatim
+end
+
+# ———————————————————————————————————————————————————————————————
+# Deterministic ordering — stable digest order + the table sorts
+# ———————————————————————————————————————————————————————————————
+# Total order over the identity digests: hi word first, then lo word (UInt
+# numeric order — no signed wrap), then the canonical key text. Tables sort
+# by the identity of their subject/endpoint defs with semantic-discriminant
+# tiebreaks, so the order is TOTAL and byte-deterministic: the snapshot
+# writer sorts every table through these functions before rendering/hashing
+# (the §29 snapshot-comparability contract).
+
+# StableDigest word order: (hi, lo).
+def semantic_digest_lt(a: StableDigest, b: StableDigest) -> Bool
+  if a.hi != b.hi then
+    a.hi < b.hi
+  else
+    a.lo < b.lo
+  end
+end
+
+# StableDefId order: the identity digest words (digest_hi, digest_lo), then
+# the canonical key text — the total-order tiebreak that keeps two distinct
+# keys with equal digest words (detectable collisions) deterministically
+# ordered instead of unstable.
+def semantic_stable_def_id_lt(a: StableDefId, b: StableDefId) -> Bool
+  if a.digest_hi != b.digest_hi then
+    a.digest_hi < b.digest_hi
+  elsif a.digest_lo != b.digest_lo then
+    a.digest_lo < b.digest_lo
+  else
+    a.key < b.key
+  end
+end
+
+# StableDigest of a StableDefId — the identity digest the table sorts ride
+# (the ids.tg stable_def_id_digest projection).
+def semantic_stable_def_id_digest(sid: StableDefId) -> StableDigest
+  StableDigest { hi: sid.digest_hi, lo: sid.digest_lo }
+end
+
+# — the semantic discriminant flattenings (the serialized numeric
+# projections the sort tiebreaks and the writer's text form use — the ids.tg
+# finalizer_kind_numeric / intrinsic_id_numeric precedent; values are
+# deterministic per enum DECLARATION order).
+
+def semantic_type_kind_numeric(k: SemanticTypeKind) -> Int
+  match k
+  when SemanticTypeKind::Struct then 0
+  when SemanticTypeKind::Enum then 1
+  when SemanticTypeKind::Trait then 2
+  end
+end
+
+def semantic_call_edge_kind_numeric(k: CallEdgeKind) -> Int
+  match k
+  when CallEdgeKind::Direct then 0
+  when CallEdgeKind::Indirect then 1
+  when CallEdgeKind::Intrinsic then 2
+  end
+end
+
+def semantic_capability_edge_kind_numeric(k: CapabilityEdgeKind) -> Int
+  match k
+  when CapabilityEdgeKind::Requires then 0
+  when CapabilityEdgeKind::Provides then 1
+  end
+end
+
+# AccessConvention (ast.tg) discriminant — declaration order Let / Inout /
+# Sink / Set.
+def semantic_access_convention_numeric(c: AccessConvention) -> Int
+  match c
+  when AccessConvention::Let then 0
+  when AccessConvention::Inout then 1
+  when AccessConvention::Sink then 2
+  when AccessConvention::Set then 3
+  end
+end
+
+# AstContractKind (ast.tg) discriminant — declaration order AstPre /
+# AstPost / AstInvariant.
+def semantic_contract_kind_numeric(k: AstContractKind) -> Int
+  match k
+  when AstContractKind::AstPre then 0
+  when AstContractKind::AstPost then 1
+  when AstContractKind::AstInvariant then 2
+  end
+end
+
+# The DefKind (ids.tg) discriminant text — the resolver's kind vocabulary
+# has no numeric flattening today; the text is deterministic and
+# self-documenting (used ONLY as the duplicate-identity tiebreak below; the
+# primary order is always the stable digest).
+def semantic_def_kind_text(k: DefKind) -> String
+  match k
+  when DefKind::Function then "Function"
+  when DefKind::Method then "Method"
+  when DefKind::Static then "Static"
+  when DefKind::Constant then "Constant"
+  when DefKind::EnumVariant then "EnumVariant"
+  when DefKind::StructField then "StructField"
+  when DefKind::Intrinsic then "Intrinsic"
+  when DefKind::TypeName then "TypeName"
+  when DefKind::Trait then "Trait"
+  when DefKind::Other then "Other"
+  end
+end
+
+# Option[String] order: None sorts before Some; Some compares textually.
+def semantic_option_string_cmp(a: Option[String], b: Option[String]) -> Int
+  match a
+  when Option::Some(av) then
+    match b
+    when Option::Some(bv) then
+      if av < bv then
+        -1
+      elsif bv < av then
+        1
+      else
+        0
+      end
+    when Option::None then 1
+    end
+  when Option::None then
+    match b
+    when Option::Some(_) then -1
+    when Option::None then 0
+    end
+  end
+end
+
+# SemanticSymbol order: the stable identity digest, then the canonical key
+# text (semantic_stable_def_id_lt covers both), then — for duplicate-key rows
+# only — the kind text and the name.
+def semantic_symbol_lt(a: SemanticSymbol, b: SemanticSymbol) -> Bool
+  if semantic_stable_def_id_lt(&a.stable_id, &b.stable_id) then
+    true
+  elsif semantic_stable_def_id_lt(&b.stable_id, &a.stable_id) then
+    false
+  elsif semantic_def_kind_text(&a.kind) != semantic_def_kind_text(&b.kind) then
+    semantic_def_kind_text(&a.kind) < semantic_def_kind_text(&b.kind)
+  else
+    a.name < b.name
+  end
+end
+
+# Sort the symbol table in place (the cqs.tg sort_signals convention).
+def semantic_symbols_sort(inout symbols: Vec[SemanticSymbol]) -> Unit
+  symbols.sort_by(|a, b| semantic_symbol_lt(a, b))
+end
+
+# SemanticType order: the identity digest, then the kind discriminant, then
+# the name (duplicate-key rows only).
+def semantic_type_lt(a: SemanticType, b: SemanticType) -> Bool
+  if semantic_stable_def_id_lt(&a.stable_id, &b.stable_id) then
+    true
+  elsif semantic_stable_def_id_lt(&b.stable_id, &a.stable_id) then
+    false
+  elsif semantic_type_kind_numeric(&a.kind) != semantic_type_kind_numeric(&b.kind) then
+    semantic_type_kind_numeric(&a.kind) < semantic_type_kind_numeric(&b.kind)
+  else
+    a.name < b.name
+  end
+end
+
+def semantic_types_sort(inout types: Vec[SemanticType]) -> Unit
+  types.sort_by(|a, b| semantic_type_lt(a, b))
+end
+
+# CallEdge order: caller digest, then callee digest, then the kind
+# discriminant.
+def semantic_call_edge_lt(a: CallEdge, b: CallEdge) -> Bool
+  if semantic_stable_def_id_lt(&a.caller, &b.caller) then
+    true
+  elsif semantic_stable_def_id_lt(&b.caller, &a.caller) then
+    false
+  elsif semantic_stable_def_id_lt(&a.callee, &b.callee) then
+    true
+  elsif semantic_stable_def_id_lt(&b.callee, &a.callee) then
+    false
+  elsif semantic_call_edge_kind_numeric(&a.kind) != semantic_call_edge_kind_numeric(&b.kind) then
+    semantic_call_edge_kind_numeric(&a.kind) < semantic_call_edge_kind_numeric(&b.kind)
+  else
+    false
+  end
+end
+
+def semantic_call_edges_sort(inout calls: Vec[CallEdge]) -> Unit
+  calls.sort_by(|a, b| semantic_call_edge_lt(a, b))
+end
+
+# EffectEdge order: subject-function digest, then the summary's dirty-class
+# projection (the may_* flags packed deterministically in the §11 field
+# order — the writer's text form carries the same projection). Identical
+# rows (same function, same flags) are textually identical whatever their
+# relative order, so the comparator ends at false.
+def semantic_effect_edge_lt(a: EffectEdge, b: EffectEdge) -> Bool
+  if semantic_stable_def_id_lt(&a.function, &b.function) then
+    true
+  elsif semantic_stable_def_id_lt(&b.function, &a.function) then
+    false
+  elsif semantic_summary_dirty_word(&a.summary) != semantic_summary_dirty_word(&b.summary) then
+    semantic_summary_dirty_word(&a.summary) < semantic_summary_dirty_word(&b.summary)
+  else
+    false
+  end
+end
+
+# The deterministic 7-bit dirty-class projection of an EffectSummary: the
+# may_* flags in the §11 declaration order (allocate=1, block=2, io=4,
+# spawn=8, sleep=16, panic=32, unsafe=64). A summary is never ordered by
+# span or by capability-set iteration order.
+def semantic_summary_dirty_word(s: EffectSummary) -> Int
+  var w = 0
+  if s.may_allocate then w = w + 1 end
+  if s.may_block then w = w + 2 end
+  if s.may_io then w = w + 4 end
+  if s.may_spawn then w = w + 8 end
+  if s.may_sleep then w = w + 16 end
+  if s.may_panic then w = w + 32 end
+  if s.may_unsafe then w = w + 64 end
+  w
+end
+
+def semantic_effect_edges_sort(inout effects: Vec[EffectEdge]) -> Unit
+  effects.sort_by(|a, b| semantic_effect_edge_lt(a, b))
+end
+
+# CapabilityEdge order: function digest, then the capability id, then the
+# edge-kind discriminant.
+def semantic_capability_edge_lt(a: CapabilityEdge, b: CapabilityEdge) -> Bool
+  if semantic_stable_def_id_lt(&a.function, &b.function) then
+    true
+  elsif semantic_stable_def_id_lt(&b.function, &a.function) then
+    false
+  elsif a.capability.id != b.capability.id then
+    a.capability.id < b.capability.id
+  elsif semantic_capability_edge_kind_numeric(&a.kind) != semantic_capability_edge_kind_numeric(&b.kind) then
+    semantic_capability_edge_kind_numeric(&a.kind) < semantic_capability_edge_kind_numeric(&b.kind)
+  else
+    false
+  end
+end
+
+def semantic_capability_edges_sort(inout capabilities: Vec[CapabilityEdge]) -> Unit
+  capabilities.sort_by(|a, b| semantic_capability_edge_lt(a, b))
+end
+
+# OwnershipFact order: function digest, then the canonical place-key text,
+# then the convention discriminant.
+def semantic_ownership_fact_lt(a: OwnershipFact, b: OwnershipFact) -> Bool
+  if semantic_stable_def_id_lt(&a.function, &b.function) then
+    true
+  elsif semantic_stable_def_id_lt(&b.function, &a.function) then
+    false
+  elsif a.place_key != b.place_key then
+    a.place_key < b.place_key
+  elsif semantic_access_convention_numeric(&a.convention) != semantic_access_convention_numeric(&b.convention) then
+    semantic_access_convention_numeric(&a.convention) < semantic_access_convention_numeric(&b.convention)
+  else
+    false
+  end
+end
+
+def semantic_ownership_facts_sort(inout ownership: Vec[OwnershipFact]) -> Unit
+  ownership.sort_by(|a, b| semantic_ownership_fact_lt(a, b))
+end
+
+# ContractFact order: function digest, then the kind discriminant, then the
+# clause text (the content-delta domain).
+def semantic_contract_fact_lt(a: ContractFact, b: ContractFact) -> Bool
+  if semantic_stable_def_id_lt(&a.function, &b.function) then
+    true
+  elsif semantic_stable_def_id_lt(&b.function, &a.function) then
+    false
+  elsif semantic_contract_kind_numeric(&a.kind) != semantic_contract_kind_numeric(&b.kind) then
+    semantic_contract_kind_numeric(&a.kind) < semantic_contract_kind_numeric(&b.kind)
+  else
+    a.clause_text < b.clause_text
+  end
+end
+
+def semantic_contract_facts_sort(inout contracts: Vec[ContractFact]) -> Unit
+  contracts.sort_by(|a, b| semantic_contract_fact_lt(a, b))
+end
+
+# TestRelationship order: the test digest, then the target digest.
+def semantic_test_relationship_lt(a: TestRelationship, b: TestRelationship) -> Bool
+  if semantic_stable_def_id_lt(&a.test, &b.test) then
+    true
+  elsif semantic_stable_def_id_lt(&b.test, &a.test) then
+    false
+  else
+    semantic_stable_def_id_lt(&a.target, &b.target)
+  end
+end
+
+def semantic_test_relationships_sort(inout tests: Vec[TestRelationship]) -> Unit
+  tests.sort_by(|a, b| semantic_test_relationship_lt(a, b))
+end
+
+# CoverageRelationship order: function digest, then the branch-id text, then
+# the arm id, then the kind text.
+def semantic_coverage_relationship_lt(a: CoverageRelationship, b: CoverageRelationship) -> Bool
+  if semantic_stable_def_id_lt(&a.function, &b.function) then
+    true
+  elsif semantic_stable_def_id_lt(&b.function, &a.function) then
+    false
+  elsif a.branch_id != b.branch_id then
+    a.branch_id < b.branch_id
+  elsif semantic_option_string_cmp(&a.arm_id, &b.arm_id) != 0 then
+    semantic_option_string_cmp(&a.arm_id, &b.arm_id) < 0
+  else
+    a.kind < b.kind
+  end
+end
+
+def semantic_coverage_relationships_sort(inout coverage: Vec[CoverageRelationship]) -> Unit
+  coverage.sort_by(|a, b| semantic_coverage_relationship_lt(a, b))
+end
+
+# MirSemanticSummary order: the function digest (one summary per function;
+# duplicate rows tiebreak by block count so the order stays total).
+def semantic_mir_summary_lt(a: MirSemanticSummary, b: MirSemanticSummary) -> Bool
+  if semantic_stable_def_id_lt(&a.function, &b.function) then
+    true
+  elsif semantic_stable_def_id_lt(&b.function, &a.function) then
+    false
+  else
+    a.block_count < b.block_count
+  end
+end
+
+def semantic_mir_summaries_sort(inout mir_functions: Vec[MirSemanticSummary]) -> Unit
+  mir_functions.sort_by(|a, b| semantic_mir_summary_lt(a, b))
+end
+
+# ———————————————————————————————————————————————————————————————
+# Serialization helpers (the writer's text-form primitives)
+# ———————————————————————————————————————————————————————————————
+# The snapshot's canonical text form is line-oriented JSON records (the
+# coverage.tg tgcov JSONL precedent — the compiler's real artifact format).
+# These helpers are the data-structure-side primitives ONLY: the writer
+# slice composes the rows, sorts every table through the functions above and
+# hashes the render with ids.tg's stable_digest_of. Escaped field text
+# round-trips through the same escaping on read.
+
+# The canonical text of a digest: "hi-lo" (the decimal UInt words, '-'
+# joined). Deterministic on every platform; two digests render
+# byte-identically iff their words are equal. (The writer emits every hash
+# field in this form.)
+def semantic_digest_render(d: StableDigest) -> String
+  d.hi.to_string() + "-" + d.lo.to_string()
+end
+
+# JSON field-text escaping — byte-for-byte the coverage.tg json_escape
+# shape (the compiler's artifact serializer; duplicated here so this
+# data-only module never imports the tooling modules that build on it).
+def semantic_json_escape(s: String) -> String
+  var result = String::new()
+  for c in s.chars() do
+    match c
+    when '"' then result.push_str("\\\"")
+    when '\\' then result.push_str("\\\\")
+    when '\n' then result.push_str("\\n")
+    when '\r' then result.push_str("\\r")
+    when '\t' then result.push_str("\\t")
+    when c then result.push(c)
+    end
+  end
+  result
+end

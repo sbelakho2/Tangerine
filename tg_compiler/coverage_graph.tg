@@ -1,0 +1,316 @@
+# Tangerine Compiler — Coverage graph (audit §40)
+# Self-hosting compiler written in Tangerine
+#
+# The §40 coverage index family — "which tests cover what" — over the §29
+# semantic snapshot rows, plus the §40 uncovered-edge query: after a patch
+# creates a new call/effect edge (a new MIR call terminator or a function's
+# new effect row) with NO covering test, return its PATH CONSTRAINT so a
+# test can be generated that drives exactly that path.
+#
+# AUDIT ANCHORS (the audit's index list -> the row shapes that serve them):
+#   SymbolId    -> TestId[]    — snapshot.tests rows (TestRelationship:
+#                   test function -> exercised function). The symbol index
+#                   below is the reverse edge: exercised-function stable
+#                   key -> test-function stable keys.
+#   MirBlockId  -> TestId[]    — DOCUMENTED GAP: the snapshot's coverage
+#   MirEdgeId   -> TestId[]      rows (CoverageRelationship: function +
+#                   branch_id + arm_id + kind) have NO test endpoint, so
+#                   no row can link a branch point (the §62.2 block/
+#                   terminator-derived branch id) to a test. Both indexes
+#                   stay empty until a row shape carries a test id.
+#   ContractId  -> TestId[]    — snapshot.contracts rows are keyed by the
+#                   OWNING function's stable key; a TestRelationship row
+#                   exercises the whole function, so the fn-granular
+#                   contract index below inherits the test rows of the
+#                   function key (documented approximation — see the
+#                   coverage_graph_of_snapshot note).
+#   EffectPath  -> TestId[]    — snapshot.effects rows are keyed by the
+#                   subject function's stable key (one row per function:
+#                   the §11 EffectSummary payload). The effect index below
+#                   inherits the test rows of that function key the same
+#                   way; the audit's per-site EffectPath granularity is a
+#                   documented gap — no row carries an effect SITE.
+#
+# TABLE ANCHORS (who fills what today): semantic_snapshot.tg documents
+# BOTH relationship tables EMPTY (its §30 header: tests — "the driver's
+# test runner is discovery/execution, not a semantic relationship. The
+# rows stay for a future machinery."; coverage — "no finalized-MIR branch
+# enumeration fills these rows today"). This module therefore builds the
+# graph over whatever rows exist — empty tables -> empty maps (the §40
+# machinery that POPULATES TestRelationship/CoverageRelationship rows does
+# not exist yet; this module is the read side that comes alive when it
+# lands, exactly like §32's semantic_index.tg).
+#
+# KEYS: every map keys on the stable KEY TEXT of the §29 defs (the one
+# per-def identity usable directly as a Map key — the same drop of the
+# digest-word/id pair semantic_index.tg and semantic_delta.tg make).
+# Values are test-function stable key texts. CoverageRelationship rows
+# contribute NOTHING to the graph: they enumerate branch points per
+# function without any test endpoint (see the MirBlockId/MirEdgeId note) —
+# consuming them would fabricate per-branch test coverage out of fn-level
+# rows, so they are excluded by design and documented here.
+#
+# THE UNCOVERED-EDGE QUERY (uncovered_paths): operates on the §31
+# SemanticDelta's call_delta / effect_delta lists, filtering rows with
+# kind = DeltaKind::Created (a row created in the b-side snapshot, i.e.
+# absent from the a-side one — the delta core's own key-membership diff).
+# For each created edge whose row is BACKED by the current snapshot's own
+# call/effect tables (guards against deltas built from a different
+# snapshot pair), a constraint line is emitted iff no test in the graph
+# covers the edge:
+#   call rows   — covered iff tests_covering_symbol(graph, from) non-empty
+#                 (from = the CALLER function key — the function whose MIR
+#                 body gained the new call terminator; a generated test
+#                 must drive the caller to reach the edge).
+#   effect rows — covered iff tests_covering_symbol(graph, from) non-empty
+#                 OR tests_covering_effect(graph, from) non-empty (from =
+#                 the effect's subject function key; the §11 class text of
+#                 the row rides the output's dst slot — the fn key is the
+#                 only effect-granular key today's rows can carry, so the
+#                 class lookup collapses to it; documented).
+# The emitted line format (sorted, deduped, deterministic):
+#   "uncovered:<edge kind>:<src>-><dst>:no covering test: constraint <fn-key>#B?<edge-key>"
+# with <edge kind> = "call" | "effect", <src> = the source symbol key
+# (caller / effect subject), <dst> = the callee key / the effect §11 class
+# payload text, and the CONSTRAINT = the source symbol key + "#B?" + the
+# edge key itself (the delta row key: "caller|callee|kind-numeric" for
+# call rows; the function key for effect rows). The "#B?" fragment is the
+# audit's "<fn-key>#B<..>" anchor with the block ordinal UNKNOWN: the
+# snapshot/delta row domains carry no block/terminator ordinals (they live
+# in the §33 MirProgram slice domain), so a generator resolves the block
+# containing the new edge against the b-side MIR — the constraint pins the
+# function and the exact row key meanwhile.
+#
+# DETERMINISM: builds are order-insensitive (Map insertion, row dedupe);
+# every accessor returns its rows SORTED; uncovered_paths returns its
+# lines sorted and deduped. Map reads use the kernel get-by-value/clone
+# idiom of the sibling modules; no Map mutation happens while a raw
+# entries() snapshot is live.
+
+use std::collections::{Vec, Map}
+
+use tg_compiler::semantic_model::{
+  SemanticSnapshot, CallEdge, semantic_call_edge_kind_numeric
+}
+use tg_compiler::semantic_delta::{SemanticDelta, DeltaKind}
+
+# ———————————————————————————————————————————————————————————————
+# CoverageGraph — the §40 test-coverage index of one snapshot
+# ———————————————————————————————————————————————————————————————
+# One graph is built from ONE SemanticSnapshot (coverage_graph_of_snapshot)
+# and is immutable in practice: accessors only read. All three maps key on
+# exercised-FUNCTION stable key texts and hold the test-function stable
+# keys exercising that function — a single §29 TestRelationship row
+# (test -> target) maps the target's function key into every index family:
+# the symbol domain (the exercised def itself), the contract domain (the
+# function's contract rows are keyed by the same key) and the effect
+# domain (the function's effect row is keyed by the same key). Finer
+# per-branch / per-site rows would populate distinct keys; none exist yet
+# (documented gaps above).
+struct CoverageGraph
+  # exercised function stable key -> test-function stable keys (the
+  # audit's SymbolId -> TestId[] reverse index).
+  symbol_to_tests: Map[String, Vec[String]] = Map::new()
+  # exercised function stable key -> test-function stable keys (the
+  # audit's ContractId -> TestId[] index at fn granularity — contract
+  # rows are keyed by their owning function's stable key).
+  contract_to_tests: Map[String, Vec[String]] = Map::new()
+  # exercised function stable key -> test-function stable keys (the
+  # audit's EffectPath -> TestId[] index at fn granularity — effect rows
+  # are keyed by their subject function's stable key).
+  effect_to_tests: Map[String, Vec[String]] = Map::new()
+end
+
+# ———————————————————————————————————————————————————————————————
+# Map-row helpers (the sibling index_map_push / index_map_rows idiom)
+# ———————————————————————————————————————————————————————————————
+# Append one test key under one exercised-function key, deduped (insert
+# when the key is new). Builds are order-insensitive; every reader sorts
+# before use.
+def coverage_map_push(inout m: Map[String, Vec[String]], key: String, val: String) -> Unit
+  match m.get(key.clone())
+  when Option::Some(rows) then
+    var new_rows = rows.clone()
+    if !new_rows.contains(&val) then
+      new_rows.push(val)
+      m.insert(key, new_rows)
+    end
+  when Option::None then
+    m.insert(key, Vec::from([val]))
+  end
+  ()
+end
+
+# The sorted test keys of an exercised-function key ([] when absent).
+def coverage_map_rows(m: Map[String, Vec[String]], key: String) -> Vec[String]
+  var out: Vec[String] = Vec::new()
+  match m.get(key)
+  when Option::Some(rows) then
+    for r in rows do
+      out.push(r.clone())
+    end
+  when Option::None then ()
+  end
+  out.sort_by(|a, b| a < b)
+  out
+end
+
+# ———————————————————————————————————————————————————————————————
+# The builder — one coverage graph per snapshot
+# ———————————————————————————————————————————————————————————————
+
+pub def coverage_graph_of_snapshot(snapshot: SemanticSnapshot) -> CoverageGraph
+  var symbol_to_tests: Map[String, Vec[String]] = Map::new()
+  var contract_to_tests: Map[String, Vec[String]] = Map::new()
+  var effect_to_tests: Map[String, Vec[String]] = Map::new()
+
+  # The §29 TestRelationship rows: test -> exercised function. Each row
+  # exercises the WHOLE target function, so its stable key is indexed in
+  # all three families at once (the symbol/contract/effect subject keys of
+  # that function are the same canonical key text — see the struct docs).
+  # Rows absent -> the maps stay empty (both tables are EMPTY today —
+  # documented in semantic_snapshot.tg; the read side comes alive when the
+  # §40 test-relationship machinery lands). CoverageRelationship rows are
+  # NOT consumed: they carry no test endpoint (MirBlockId/MirEdgeId gap).
+  for tr in snapshot.tests do
+    coverage_map_push(&mut symbol_to_tests, tr.target.key.clone(), tr.test.key.clone())
+    coverage_map_push(&mut contract_to_tests, tr.target.key.clone(), tr.test.key.clone())
+    coverage_map_push(&mut effect_to_tests, tr.target.key.clone(), tr.test.key.clone())
+  end
+
+  CoverageGraph {
+    symbol_to_tests: symbol_to_tests,
+    contract_to_tests: contract_to_tests,
+    effect_to_tests: effect_to_tests
+  }
+end
+
+# ———————————————————————————————————————————————————————————————
+# The typed accessors — the audit's TestId lookups, one family each
+# ———————————————————————————————————————————————————————————————
+# Each takes the exercised function's stable key text and returns the
+# sorted test-function stable keys covering it. key text, not digest words
+# (the map-key domain above); [] for unknown keys.
+
+# The tests exercising a symbol (function/def) key — the SymbolId index.
+pub def tests_covering_symbol(graph: CoverageGraph, key: String) -> Vec[String]
+  coverage_map_rows(&graph.symbol_to_tests, key.clone())
+end
+
+# The tests exercising a function's CONTRACT surface — the ContractId
+# index at fn granularity (contract rows key on the owning function).
+pub def tests_covering_contract(graph: CoverageGraph, key: String) -> Vec[String]
+  coverage_map_rows(&graph.contract_to_tests, key.clone())
+end
+
+# The tests exercising a function's EFFECT surface — the EffectPath index
+# at fn granularity (effect rows key on the subject function).
+pub def tests_covering_effect(graph: CoverageGraph, key: String) -> Vec[String]
+  coverage_map_rows(&graph.effect_to_tests, key.clone())
+end
+
+# ———————————————————————————————————————————————————————————————
+# The uncovered-edge query — created edges without a covering test
+# ———————————————————————————————————————————————————————————————
+
+# The delta call-row key text of a §29 CallEdge (the §31 delta protocol's
+# canonical call-row key — caller|callee|kind-numeric).
+def coverage_call_row_key(c: CallEdge) -> String
+  c.caller.key.clone() + "|" + c.callee.key.clone() + "|" +
+    semantic_call_edge_kind_numeric(&c.kind).to_string()
+end
+
+def coverage_delta_kind_created(k: DeltaKind) -> Bool
+  match k
+  when DeltaKind::Created then true
+  when _ then false
+  end
+end
+
+# The created call rows of the delta that the current snapshot BACKS: the
+# row key must exist among the snapshot's own call rows (a delta built
+# against a different snapshot pair never leaks rows into the output).
+def coverage_snapshot_has_call_row(snapshot: SemanticSnapshot, key: String) -> Bool
+  var found = false
+  for c in snapshot.calls do
+    if coverage_call_row_key(c) == key then
+      found = true
+      break
+    end
+  end
+  found
+end
+
+# The created effect rows of the delta backed by the snapshot's effect
+# table (effect rows key on the subject function's stable key).
+def coverage_snapshot_has_effect_row(snapshot: SemanticSnapshot, key: String) -> Bool
+  var found = false
+  for e in snapshot.effects do
+    if e.function.key == key then
+      found = true
+      break
+    end
+  end
+  found
+end
+
+# The coveredness predicates of the module doc: a call edge is covered when
+# a test covers its source (caller) symbol; an effect edge is covered when
+# a test covers the source symbol OR the source's effect class (both
+# lookups collapse to the source function key in today's row shape — the
+# class text itself is not an index key until rows carry per-site effect
+# or per-class test links).
+def coverage_symbol_covered(graph: CoverageGraph, key: String) -> Bool
+  tests_covering_symbol(&graph, key.clone()).len() > 0
+end
+
+def coverage_effect_covered(graph: CoverageGraph, key: String) -> Bool
+  tests_covering_effect(&graph, key.clone()).len() > 0
+end
+
+# The uncovered-edge query: every CREATED call/effect edge of the delta
+# (rows absent from the older snapshot — the delta's own key-membership
+# Created classification) that the current snapshot backs and that NO test
+# in the graph covers yields one path-constraint line (format in the
+# module doc): "<src>#B?<edge-key>" — the source symbol key + the audit's
+# "#B" block anchor (ordinal unknown in the row domain: "?") + the edge
+# key itself. Sorted, deduped output.
+pub def uncovered_paths(graph: CoverageGraph, snapshot: SemanticSnapshot, delta: SemanticDelta) -> Vec[String]
+  var out: Vec[String] = Vec::new()
+
+  # 1. Created CALL edges: a new call terminator in the caller's MIR body.
+  #    The constraint's source is the CALLER — a generated test must drive
+  #    the caller function so the new callee edge is reached.
+  for e in delta.call_delta do
+    if coverage_delta_kind_created(&e.kind) && e.from.len() > 0 &&
+      coverage_snapshot_has_call_row(&snapshot, e.key.clone()) then
+      if !coverage_symbol_covered(&graph, e.from.clone()) then
+        let line = "uncovered:call:" + e.from.clone() + "->" + e.to.clone() +
+          ":no covering test: constraint " + e.from.clone() + "#B?" + e.key.clone()
+        if !out.contains(&line) then
+          out.push(line)
+        end
+      end
+    end
+  end
+
+  # 2. Created EFFECT edges: the subject function gained an effect row (or
+  #    the function is new). The dst slot carries the row's §11 class
+  #    payload text; coveredness = source-symbol OR source-effect coverage.
+  for e in delta.effect_delta do
+    if coverage_delta_kind_created(&e.kind) && e.from.len() > 0 &&
+      coverage_snapshot_has_effect_row(&snapshot, e.from.clone()) then
+      if !coverage_symbol_covered(&graph, e.from.clone()) &&
+        !coverage_effect_covered(&graph, e.from.clone()) then
+        let line = "uncovered:effect:" + e.from.clone() + "->" + e.to.clone() +
+          ":no covering test: constraint " + e.from.clone() + "#B?effect:" + e.to.clone()
+        if !out.contains(&line) then
+          out.push(line)
+        end
+      end
+    end
+  end
+
+  out.sort_by(|a, b| a < b)
+  out
+end

@@ -1,0 +1,1401 @@
+# Tangerine Compiler — Semantic Slices over lowered MIR (audit §33)
+# Self-hosting compiler written in Tangerine
+#
+# Compiler-derived SLICES over the VERIFIED MIR program (the instance the
+# compile phases guard with verify_mir — every entry takes a lowered
+# MirProgram; no AST/typed/env state is read). A slice is a set of
+# statement-level MIR nodes + external anchors as stable key texts — never
+# MIR indices, never spans (SliceResult.span_keys are presentation-only
+# and never enter slice_digest — the §29 spans-are-metadata protocol).
+#
+# STATEMENT IDENTITY — MirStatement records carry NO stable id (the only
+# MIR ids are the per-function MirLocalId/MirBlockId domains), so nodes
+# are indexed DETERMINISTICALLY by (function key, block index, statement
+# index) as the audit prescribes:
+#   function key = the MirFunction EMISSION NAME (f.name — the only
+#     identity the lowered program carries; the snapshot walks use the
+#     same text). The stable DEF key text ("path::name#signature")
+#     resolves only through the typed program's resolver tables —
+#     MirProgram-only slices cannot build it — DOCUMENTED GAP (the §30
+#     boundary for IR-synthesized bodies).
+#   block index  = MirBlockId.id (deterministic at lowering; passes may
+#     DELETE blocks and leave gaps, so ids — never Vec positions).
+#   stmt index   = the index in MirBlock.statements; the block TERMINATOR
+#     is the block's final node.
+#   Statement key text "<fn emission name>#B<block id>#S<stmt index>",
+#   terminator key text "<fn emission name>#B<block id>#T". Deterministic
+#   per verified program; the digest form rides slice_digest.
+#
+# THE DEF-USE MODEL:
+#   - A VALUE is one local slot (MirLocalId.id — the §33 ValueId
+#     adaptation; the mir.tg optimizer's collect_operand_read /
+#     collect_rvalue_reads / collect_call_arg_read /
+#     collect_terminator_reads helpers all reason in local ids). Local 0
+#     is the "_ret" RETURN PLACE (start_function's convention): MirReturn
+#     terminators READ local 0 (no statement reads the slot).
+#   - READ of a value: operand reads (place roots), MirRef/MirDiscriminant/
+#     MirLen places, phi sources, call FUNC operands, and call ARGUMENTS —
+#     mirroring collect_call_arg_read VERBATIM: a BARE local passed with
+#     the Initialize (set) effect is a WRITE, not a read. A MirDeinit
+#     READS the destroyed place (its final use).
+#   - DEF of a value: a MirAssign/MirCall whose destination is the BARE
+#     local (the write that ENDS a def chain). A projected destination is
+#     a PARTIAL DEF: it affects a piece of the value, is included, feeds
+#     its operand reads into the chain, but does NOT end it (the aggregate
+#     base is defined earlier).
+#   - Def-use edge: a use U is fed by the nearest def of the same local
+#     scanning BACKWARD over the block's linear order (in-block exact); a
+#     use with no def in its block is fed from the PREDECESSOR blocks (a
+#     bounded worklist over the CFG — Goto/SwitchInt/Call/Assert/Deinit
+#     targets, never a full reaching-def fixed point). MIR is NOT
+#     single-assignment: def chains resolve per use, so slice_value seeds
+#     one backward walk per use site.
+#
+# THE FOUR SLICES:
+#   slice_value(fn_key, value_id) — the value's def chain (its def, the
+#     partial defs affecting it, the defs of every operand those defs read
+#     — recursively), resolved from every use site. A value with NO use
+#     sites yields the empty slice (documented).
+#   slice_statement(fn_key, stmt_key) — the forward use slice of the
+#     statement's defs: nodes transitively reading the defined value,
+#     forward per block and propagated to SUCCESSOR blocks (a bare
+#     redefinition KILLS the chain; partial defs pass through). A def
+#     escaping through a call edge records the external anchor
+#     "call:<callee emission name>:arg<n>"; a node with no defs yields
+#     the empty slice (documented).
+#   slice_failure(diag) — the statements contributing to a diagnostic:
+#     its primary site maps to a MIR node through the SPAN MAP (below);
+#     the result = the FAILURE TRACE (the enclosing block's statements
+#     from its head through the mapped node) UNION the anchored def chains
+#     of the failing node's read operands (an assert's condition+bounds).
+#   slice_effect(class) — one result per function whose DIRECT §11 summary
+#     has the class: the class's DIRECT sites (MirCall/MirDeinit
+#     terminators whose §11 classification dirties the class —
+#     mir_effect_classify_call/_deinit reused verbatim — plus the
+#     string-concat MirBinOp::Add assignment and the fail-closed algebraic
+#     perform) plus each site's anchored def chains of the values it
+#     reads. A class reaching a function only through in-program callees
+#     is NOT re-listed: its sites live in the callee's own row.
+#
+# SPAN MAP (how diagnostics map to statements): every lowered node
+# carries its source Span (synthesized nodes carry span_dummy). A
+# diagnostic's Option[Span] resolves deterministically over program order
+# (functions in MirProgram.functions order, blocks in Vec order,
+# statements in index order, then the terminator): tier 1 CONTAINS the
+# diagnostic start offset; tier 2 overlaps it; tier 3 the smallest |start
+# gap|; file texts compare only when both are non-empty. No
+# span-to-statement table exists (presentation-grade); an unmapped
+# diagnostic yields the empty result (documented).
+#
+# BOUNDEDNESS / APPROXIMATIONS (deterministic, documented): at most
+# slice_max_items work items per call; a wanted PARAMETER reaching the
+# ENTRY block's head records the "param:<index>:<name>" anchor; any other
+# never-defined wanted local drops silently; a walk exhausting its budget
+# stops adding (the deterministic FIFO-worklist prefix). Control
+# dependence is NOT modeled (the failure trace is the only control-flow
+# term); Goto/Abort/Unreachable carry no operands and are never reads.
+#
+# DETERMINISM: bounded worklists process FIFO; every result Vec sorts
+# (statements, span keys and externals textually) before leaving the
+# module; slice_digest hashes the SORTED canonical JSONL row set (spans
+# and digest words never serialize).
+
+use std::collections::{Vec, Map, Set}
+
+use tg_compiler::ids::{StableDigest, stable_digest_of}
+use tg_compiler::token::{Span}
+use tg_compiler::parser::{Diagnostic}
+use tg_compiler::types::{AccessEffect, EffectClass, EffectSummary, effect_class_slot_index, effect_summary_has_class}
+use tg_compiler::semantic_model::{semantic_json_escape}
+use tg_compiler::mir::{
+  MirProgram, MirFunction, MirStatement, MirStatementKind, MirRvalueKind, MirBinOp,
+  MirOperand, MirOperandKind, MirConstantKind, MirTerminator, MirTerminatorKind,
+  MirCallArg, MirCallValue, AssertMessage, MirEffectState, mir_effect_scan_function,
+  mir_effect_classify_call, mir_effect_classify_deinit, mir_effect_place_type,
+  mir_effect_operand_is_string, mir_effect_type_is_string_like
+}
+
+# ———————————————————————————————————————————————————————————————
+# Result record and budgets
+# ———————————————————————————————————————————————————————————————
+
+# One slice's result: sorted stable key texts of the included statements,
+# sorted external anchors (call edges the defs escape through; parameters
+# the def chains end at) and presentation-only span keys ("<stmt key>|<
+# file>:<start>-<end>", one per included node with a real span).
+struct SliceResult
+  function_key: String
+  statements: Vec[String] = Vec::new()
+  external: Vec[String] = Vec::new()
+  span_keys: Vec[String] = Vec::new()
+end
+
+# The empty result (an invalid key, an unmapped span, a no-def slice).
+def slice_result_empty() -> SliceResult
+  SliceResult {
+    function_key: "",
+    statements: Vec::new(),
+    external: Vec::new(),
+    span_keys: Vec::new()
+  }
+end
+
+# The deterministic cap of every engine below.
+def slice_max_items() -> Int
+  4096
+end
+
+# ———————————————————————————————————————————————————————————————
+# Statement-key text helpers (the §33 stable text domain)
+# ———————————————————————————————————————————————————————————————
+
+# Node keys: statements "#S<idx>"; the terminator "#T" (its index is
+# MirBlock.statements.len(), so the spellings never collide).
+def slice_stmt_key(name: String, block_id: Int, idx: Int) -> String
+  name + "#B" + block_id.to_string() + "#S" + idx.to_string()
+end
+
+def slice_term_key(name: String, block_id: Int) -> String
+  name + "#B" + block_id.to_string() + "#T"
+end
+
+# A fresh copy of a span (field-clone idiom).
+def slice_span_copy(sp: Span) -> Span
+  Span { file: sp.file.clone(), start: sp.start, end_pos: sp.end_pos }
+end
+
+# The presentation span key "<stmt key>|<file>:<start>-<end>" ("" when dummy).
+def slice_span_key(node_key: String, span: Span) -> String
+  if span.start == 0 && span.end_pos == 0 && span.file.len() == 0 then
+    return ""
+  end
+  node_key + "|" + span.file.clone() + ":" + span.start.to_string() + "-" + span.end_pos.to_string()
+end
+
+# Whether a text is all ASCII digits (the key-component validation).
+def slice_is_digits(text: String) -> Bool
+  if text.len() == 0 then return false end
+  var i = 0
+  while i < text.len() do
+    let ch = text.slice(i, i + 1)
+    if ch < "0" || ch > "9" then
+      return false
+    end
+    i = i + 1
+  end
+  true
+end
+
+# The deterministic Int parse of a non-empty digit text.
+def slice_text_to_int(text: String) -> Int
+  var value = 0
+  var i = 0
+  while i < text.len() do
+    let bs = text.slice(i, i + 1).bytes()
+    if bs.len() > 0 then
+      value = value * 10 + (bs[0] as Int - 48)
+    end
+    i = i + 1
+  end
+  value
+end
+
+# The LAST "#B" marker of a key (-1 when absent; emission names never
+# contain "#", so the last marker is the key's).
+def slice_key_marker(key: String) -> Int
+  var i = key.len() - 2
+  while i >= 0 do
+    if key.slice(i, i + 2) == "#B" then
+      return i
+    end
+    i = i - 1
+  end
+  -1
+end
+
+# Parse a node key into (block id, node index, is_terminator); the fn prefix
+# must equal name; Option::None when malformed.
+def slice_key_parts(name: String, key: String) -> Option[(Int, Int, Bool)]
+  let mark = slice_key_marker(&key)
+  if mark <= 0 then return Option::None end
+  if key.slice(0, mark) != name then return Option::None end
+  var i = mark + 2
+  var block_text = ""
+  while i < key.len() do
+    let ch = key.slice(i, i + 1)
+    if ch == "#" then
+      break
+    elsif ch < "0" || ch > "9" then
+      return Option::None
+    end
+    block_text = block_text + ch
+    i = i + 1
+  end
+  if block_text.len() == 0 || i >= key.len() then return Option::None end
+  if key.slice(i, key.len()) == "#T" then
+    return Option::Some((slice_text_to_int(&block_text), -1, true))
+  end
+  if key.slice(i, i + 2) != "#S" then return Option::None end
+  let idx_text = key.slice(i + 2, key.len())
+  if !slice_is_digits(&idx_text) then return Option::None end
+  Option::Some((slice_text_to_int(&block_text), slice_text_to_int(&idx_text), false))
+end
+
+# ———————————————————————————————————————————————————————————————
+# Per-function index — the program's node universe, built once per call
+# ———————————————————————————————————————————————————————————————
+
+struct SliceFnCtx
+  # the function's emission name (its slice function key).
+  name: String
+  # the function body.
+  f: MirFunction
+  # MirBlockId.id -> block Vec index.
+  block_of_id: Map[Int, Int]
+  # predecessor / successor blocks (their Vec indices) per block Vec idx.
+  preds: Map[Int, Vec[Int]]
+  succs: Map[Int, Vec[Int]]
+end
+
+# The FIRST function's ctx by emission name (first-wins on duplicates);
+# Option::None when absent.
+def slice_fn_find(mir: MirProgram, name: String) -> Option[SliceFnCtx]
+  var found = -1
+  var fi = 0
+  while fi < mir.functions.len() do
+    if mir.functions[fi].name == name then
+      found = fi
+      break
+    end
+    fi = fi + 1
+  end
+  if found < 0 then return Option::None end
+  let f = mir.functions[found]
+  var block_of_id: Map[Int, Int] = Map::new()
+  var preds: Map[Int, Vec[Int]] = Map::new()
+  var succs: Map[Int, Vec[Int]] = Map::new()
+  var bi = 0
+  while bi < f.blocks.len() do
+    block_of_id.insert(f.blocks[bi].id.id, bi)
+    preds.insert(bi, Vec::new())
+    succs.insert(bi, Vec::new())
+    bi = bi + 1
+  end
+  # The CFG edge maps (by Vec index), from the terminator targets (return,
+  # abort and unreachable end the flow).
+  var pi = 0
+  while pi < f.blocks.len() do
+    var out_targets: Vec[Int] = Vec::new()
+    match f.blocks[pi].terminator.kind
+    when MirTerminatorKind::MirGoto(target) then out_targets.push(target.id)
+    when MirTerminatorKind::MirSwitchInt { op, targets, default_target } then
+      for arm in targets do
+        out_targets.push(arm.target.id)
+      end
+      out_targets.push(default_target.id)
+    when MirTerminatorKind::MirCall { dest, func, args, success, unwind, intrinsic } then
+      out_targets.push(success.id)
+      match unwind
+      when Option::Some(u) then out_targets.push(u.id)
+      when Option::None then ()
+      end
+    when MirTerminatorKind::MirAssert { cond, expected, msg, target, unwind } then
+      out_targets.push(target.id)
+      match unwind
+      when Option::Some(u2) then out_targets.push(u2.id)
+      when Option::None then ()
+      end
+    when MirTerminatorKind::MirDeinit { place, deinit_fn, target, unwind } then
+      out_targets.push(target.id)
+      match unwind
+      when Option::Some(u3) then out_targets.push(u3.id)
+      when Option::None then ()
+      end
+    when _ then ()
+    end
+    var ti = 0
+    while ti < out_targets.len() do
+      var tv = -1
+      match block_of_id.get(out_targets[ti])
+      when Option::Some(v2) then tv = v2
+      when Option::None then ()
+      end
+      if tv >= 0 && tv != pi then
+        var pred_rows: Vec[Int] = Vec::new()
+        match preds.get(tv)
+        when Option::Some(rows) then pred_rows = rows.clone()
+        when Option::None then ()
+        end
+        if !pred_rows.contains(&pi) then
+          pred_rows.push(pi)
+          preds.insert(tv, pred_rows)
+        end
+        var succ_rows: Vec[Int] = Vec::new()
+        match succs.get(pi)
+        when Option::Some(srows) then succ_rows = srows.clone()
+        when Option::None then ()
+        end
+        if !succ_rows.contains(&tv) then
+          succ_rows.push(tv)
+          succs.insert(pi, succ_rows)
+        end
+      end
+      ti = ti + 1
+    end
+    pi = pi + 1
+  end
+  Option::Some(SliceFnCtx {
+    name: name.clone(),
+    f: f,
+    block_of_id: block_of_id,
+    preds: preds,
+    succs: succs
+  })
+end
+
+# The block Vec index of a block id (-1 when absent).
+def slice_block_vec_index(ctx: SliceFnCtx, block_id: Int) -> Int
+  match ctx.block_of_id.get(block_id)
+  when Option::Some(v) then v
+  when Option::None then -1
+  end
+end
+
+# The emission-name -> function index map (the §11 scan's fn index).
+def slice_fn_index(mir: MirProgram) -> Map[String, Int]
+  var out: Map[String, Int] = Map::new()
+  var i = 0
+  while i < mir.functions.len() do
+    let n = mir.functions[i].name.clone()
+    if !out.contains_key(&n) then
+      out.insert(n, i)
+    end
+    i = i + 1
+  end
+  out
+end
+
+# The §11 type name index: MirTypeDef id -> registered type name.
+def slice_type_index(mir: MirProgram) -> Map[Int, String]
+  var out: Map[Int, String] = Map::new()
+  for td in mir.types do
+    out.insert(td.id.id, td.name.clone())
+  end
+  out
+end
+
+# ———————————————————————————————————————————————————————————————
+# Node reads and defs — the def-use atoms (the mir.tg optimizer
+# vocabulary, self-contained)
+# ———————————————————————————————————————————————————————————————
+
+# The local read by a MirOperand (None for constants — collect_operand_read
+# shape).
+def slice_operand_read(op: MirOperand) -> Option[Int]
+  match op.kind
+  when MirOperandKind::MirCopy(place) then Option::Some(place.local.id)
+  when MirOperandKind::MirMovePlace(place) then Option::Some(place.local.id)
+  when MirOperandKind::MirRead(place) then Option::Some(place.local.id)
+  when MirOperandKind::MirConsume(place) then Option::Some(place.local.id)
+  when _ then Option::None
+  end
+end
+
+# The BARE root of a place-kind operand (mir.tg's mir_operand_bare_root):
+# Some(local) for a place with EMPTY projections; None for projected
+# places and constants.
+def slice_operand_bare_root(op: MirOperand) -> Option[Int]
+  match op.kind
+  when MirOperandKind::MirCopy(p) then
+    if p.projections.is_empty() then Option::Some(p.local.id) else Option::None end
+  when MirOperandKind::MirMovePlace(p) then
+    if p.projections.is_empty() then Option::Some(p.local.id) else Option::None end
+  when MirOperandKind::MirRead(p) then
+    if p.projections.is_empty() then Option::Some(p.local.id) else Option::None end
+  when MirOperandKind::MirConsume(p) then
+    if p.projections.is_empty() then Option::Some(p.local.id) else Option::None end
+  when _ then Option::None
+  end
+end
+
+# The rvalue reads (collect_rvalue_reads shape: every operand / place /
+# phi-source local).
+def slice_rvalue_reads(rv: MirRvalueKind, inout out: Vec[Int]) -> Unit
+  match rv
+  when MirRvalueKind::MirMove(op) then
+    match slice_operand_read(&op)
+    when Option::Some(l) then out.push(l)
+    when Option::None then ()
+    end
+  when MirRvalueKind::MirRef(place) then out.push(place.local.id)
+  when MirRvalueKind::MirAggregate(_, ops) then
+    for op in ops do
+      match slice_operand_read(&op)
+      when Option::Some(l2) then out.push(l2)
+      when Option::None then ()
+      end
+    end
+  when MirRvalueKind::MirBinOp(_, lhs, rhs) then
+    match slice_operand_read(&lhs)
+    when Option::Some(la) then out.push(la)
+    when Option::None then ()
+    end
+    match slice_operand_read(&rhs)
+    when Option::Some(ra) then out.push(ra)
+    when Option::None then ()
+    end
+  when MirRvalueKind::MirUnOp(_, op) then
+    match slice_operand_read(&op)
+    when Option::Some(u) then out.push(u)
+    when Option::None then ()
+    end
+  when MirRvalueKind::MirDiscriminant(place) then out.push(place.local.id)
+  when MirRvalueKind::MirLen(place) then out.push(place.local.id)
+  when MirRvalueKind::MirCast(_, op, _) then
+    match slice_operand_read(&op)
+    when Option::Some(c) then out.push(c)
+    when Option::None then ()
+    end
+  when MirRvalueKind::MirRepeat(op, _) then
+    match slice_operand_read(&op)
+    when Option::Some(r) then out.push(r)
+    when Option::None then ()
+    end
+  when MirRvalueKind::MirPhi(entries) then
+    for entry in entries do
+      out.push(entry.1.id)
+    end
+  end
+end
+
+# Whether a call argument observes its operand's value — collect_call_arg_read's
+# refinement: BARE Initialize args are writes, everything else reads.
+def slice_call_arg_read(arg: MirCallArg) -> Option[Int]
+  match arg.value
+  when MirCallValue::Place(p) then
+    match arg.effect
+    when AccessEffect::Initialize then
+      if p.projections.is_empty() then Option::None else Option::Some(p.local.id) end
+    when _ then Option::Some(p.local.id)
+    end
+  when MirCallValue::Value(op) then
+    match arg.effect
+    when AccessEffect::Initialize then
+      match slice_operand_bare_root(&op)
+      when Option::Some(_) then Option::None
+      when Option::None then slice_operand_read(&op)
+      end
+    when _ then slice_operand_read(&op)
+    end
+  end
+end
+
+# The reads of one MirStatement (its operands only — the DEST is a def).
+def slice_stmt_reads(st: MirStatement) -> Vec[Int]
+  var out: Vec[Int] = Vec::new()
+  match st.kind
+  when MirStatementKind::MirAssign(_, rvalue) then
+    slice_rvalue_reads(rvalue.kind, &mut out)
+  when MirStatementKind::MirContractCheck(contract, operand) then
+    match slice_operand_read(&contract.condition)
+    when Option::Some(c) then out.push(c)
+    when Option::None then ()
+    end
+    match slice_operand_read(&operand)
+    when Option::Some(o) then out.push(o)
+    when Option::None then ()
+    end
+  when MirStatementKind::MirEffectRecord(_, operand) then
+    match slice_operand_read(&operand)
+    when Option::Some(e) then out.push(e)
+    when Option::None then ()
+    end
+  when MirStatementKind::MirEffectPerform(_, _, _, payload_ptr, result_ptr) then
+    match slice_operand_read(&payload_ptr)
+    when Option::Some(p) then out.push(p)
+    when Option::None then ()
+    end
+    match slice_operand_read(&result_ptr)
+    when Option::Some(r) then out.push(r)
+    when Option::None then ()
+    end
+  when MirStatementKind::MirEffectFrameEnter(_, _, _, _, env_ptr) then
+    match slice_operand_read(&env_ptr)
+    when Option::Some(e2) then out.push(e2)
+    when Option::None then ()
+    end
+  when _ then ()
+  end
+  out
+end
+
+# The terminator reads — collect_terminator_reads shape plus MirDeinit-reads-its-place
+# and MirReturn-reads-local-0 ("_ret").
+def slice_term_reads(term: MirTerminator) -> Vec[Int]
+  var out: Vec[Int] = Vec::new()
+  match term.kind
+  when MirTerminatorKind::MirSwitchInt { op, targets, default_target } then
+    match slice_operand_read(&op)
+    when Option::Some(s) then out.push(s)
+    when Option::None then ()
+    end
+  when MirTerminatorKind::MirCall { dest, func, args, success, unwind, intrinsic } then
+    match slice_operand_read(&func)
+    when Option::Some(c) then out.push(c)
+    when Option::None then ()
+    end
+    for arg in args do
+      match slice_call_arg_read(&arg)
+      when Option::Some(a) then out.push(a)
+      when Option::None then ()
+      end
+    end
+  when MirTerminatorKind::MirAssert { cond, expected, msg, target, unwind } then
+    match slice_operand_read(&cond)
+    when Option::Some(cc) then out.push(cc)
+    when Option::None then ()
+    end
+    match msg
+    when AssertMessage::BoundsCheck(index_op, len_op) then
+      match slice_operand_read(&index_op)
+      when Option::Some(io) then out.push(io)
+      when Option::None then ()
+      end
+      match slice_operand_read(&len_op)
+      when Option::Some(lo) then out.push(lo)
+      when Option::None then ()
+      end
+    when _ then ()
+    end
+  when MirTerminatorKind::MirDeinit { place, deinit_fn, target, unwind } then
+    # a destruction reads the value's current content — its final use.
+    out.push(place.local.id)
+  when MirTerminatorKind::MirReturn then
+    # locals[0] is the function's return place ("_ret"): MirReturn leaves
+    # it behind and therefore reads it.
+    out.push(0)
+  when _ then ()
+  end
+  out
+end
+
+# Node defs as (bare local, partial root), -1 = none: a bare write ENDS a def
+# chain; a projected dest AFFECTS its root but does not end the chain.
+def slice_stmt_defs(st: MirStatement) -> (Int, Int)
+  match st.kind
+  when MirStatementKind::MirAssign(place, _) then
+    if place.projections.is_empty() then
+      (place.local.id, -1)
+    else
+      (-1, place.local.id)
+    end
+  when _ then (-1, -1)
+  end
+end
+
+def slice_term_defs(term: MirTerminator) -> (Int, Int)
+  match term.kind
+  when MirTerminatorKind::MirCall { dest, func, args, success, unwind, intrinsic } then
+    if dest.projections.is_empty() then
+      (dest.local.id, -1)
+    else
+      (-1, dest.local.id)
+    end
+  when _ then (-1, -1)
+  end
+end
+
+# The callee emission name of a named MirCall (the MirFnItem constant's
+# name); "" for value/indirect calls (no row identity — documented).
+def slice_call_callee_name(term: MirTerminator) -> String
+  match term.kind
+  when MirTerminatorKind::MirCall { dest, func, args, success, unwind, intrinsic } then
+    match func.kind
+    when MirOperandKind::MirConstant(c) then
+      match c.kind
+      when MirConstantKind::MirFnItem(name) then return name.clone()
+      when _ then return ""
+      end
+    when _ then return ""
+    end
+  when _ then ""
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# The backward engine — def chains of wanted locals
+# ———————————————————————————————————————————————————————————————
+# Work items (block, from, local) resolve def chains backward: the first BARE
+# def is included and its reads become new items; a PARTIAL def is included
+# but the local STAYS wanted (the aggregate base is defined earlier); a scan
+# ending at the block head propagates to the PREDECESSORS; a want reaching
+# the ENTRY head resolves as a parameter anchor or drops silently. Dedupe
+# texts + the item budget terminate cyclic pred graphs deterministically.
+
+struct SliceBack
+  ctx: SliceFnCtx
+  # work items: (block Vec index, from node index inclusive, local id).
+  work: Vec[(Int, Int, Int)] = Vec::new()
+  # processed-item dedupe texts ("<block>@<from>#<local>").
+  seen: Set[String] = Set::new()
+  # included nodes: stmt key -> presentation span key ("" when dummy).
+  included: Map[String, String] = Map::new()
+  # external anchors ("param:<index>:<name>").
+  external: Set[String] = Set::new()
+  # items popped so far (the budget).
+  items: Int = 0
+end
+
+def slice_back_item_text(v: Int, from: Int, local: Int) -> String
+  v.to_string() + "@" + from.to_string() + "#" + local.to_string()
+end
+
+def slice_back_push(inout back: SliceBack, v: Int, from: Int, local: Int) -> Unit
+  if v < 0 then return end
+  let key = slice_back_item_text(v, from, local)
+  if back.seen.contains(&key) then return end
+  back.seen.insert(key)
+  back.work.push((v, from, local))
+  ()
+end
+
+def slice_back_include(inout back: SliceBack, v: Int, idx: Int, span: Span) -> Unit
+  let block_id = back.ctx.f.blocks[v].id.id
+  let block_len = back.ctx.f.blocks[v].statements.len()
+  var node_key = ""
+  if idx >= block_len then
+    node_key = slice_term_key(&back.ctx.name, block_id)
+  else
+    node_key = slice_stmt_key(&back.ctx.name, block_id, idx)
+  end
+  if !back.included.contains_key(&node_key) then
+    let span_key = slice_span_key(&node_key, span)
+    back.included.insert(node_key, span_key)
+  end
+  ()
+end
+
+# Whether a local is a parameter of the ctx function (the def chain's
+# caller-side boundary).
+def slice_is_param(ctx: SliceFnCtx, local: Int) -> Bool
+  for p in ctx.f.params do
+    if p.id.id == local then
+      return true
+    end
+  end
+  false
+end
+
+def slice_back_external_param(inout back: SliceBack, local: Int) -> Unit
+  if local >= 0 && local < back.ctx.f.locals.len() then
+    let name = back.ctx.f.locals[local].name.clone()
+    back.external.insert("param:" + local.to_string() + ":" + name)
+  end
+  ()
+end
+
+# Run the worklist to the budget (FIFO, deterministic).
+def slice_back_run(inout back: SliceBack) -> Unit
+  while back.work.len() > 0 && back.items < slice_max_items() do
+    back.items = back.items + 1
+    let item = back.work[0]
+    back.work.remove(0)
+    let v = item.0
+    let from = item.1
+    let wanted = item.2
+    let block_len = back.ctx.f.blocks[v].statements.len()
+    var found = false
+    # the terminator is the first candidate when the scan starts at or
+    # after the block end (a def in the terminator feeds the entry of a
+    # SUCCESSOR block; it can never feed a use in this block).
+    if from >= block_len then
+      let term = back.ctx.f.blocks[v].terminator
+      let term_defs = slice_term_defs(&term)
+      let bare = term_defs.0
+      let partial = term_defs.1
+      if bare == wanted then
+        let span = slice_span_copy(term.span)
+        slice_back_include(&mut back, v, block_len, span)
+        found = true
+        let reads = slice_term_reads(&term)
+        for r in reads do
+          slice_back_push(&mut back, v, block_len - 1, r)
+        end
+      elsif partial == wanted then
+        # a projected terminator write affects the value but does not end
+        # the chain: include it, feed its operand reads, keep scanning.
+        let span = slice_span_copy(term.span)
+        slice_back_include(&mut back, v, block_len, span)
+        let reads = slice_term_reads(&term)
+        for r in reads do
+          slice_back_push(&mut back, v, block_len - 1, r)
+        end
+      end
+    end
+    # then the statements, from the scan start down to the block head.
+    var si = from
+    if si > block_len - 1 then
+      si = block_len - 1
+    end
+    while si >= 0 && !found do
+      let st = back.ctx.f.blocks[v].statements[si]
+      let st_defs = slice_stmt_defs(st)
+      let bare = st_defs.0
+      let partial = st_defs.1
+      if bare == wanted then
+        let span = slice_span_copy(st.span)
+        slice_back_include(&mut back, v, si, span)
+        found = true
+        let reads = slice_stmt_reads(st)
+        for r in reads do
+          slice_back_push(&mut back, v, si - 1, r)
+        end
+      elsif partial == wanted then
+        # a projected write affects the value but does not end the chain
+        # (the aggregate base is defined earlier): include it, feed its
+        # operand reads, keep scanning for the base def.
+        let span = slice_span_copy(st.span)
+        slice_back_include(&mut back, v, si, span)
+        let reads = slice_stmt_reads(st)
+        for r in reads do
+          slice_back_push(&mut back, v, si - 1, r)
+        end
+      end
+      si = si - 1
+    end
+    if !found then
+      if slice_is_param(back.ctx.clone(), wanted) then
+        slice_back_external_param(&mut back, wanted)
+      else
+        var pred_rows: Vec[Int] = Vec::new()
+        match back.ctx.preds.get(v)
+        when Option::Some(rows) then pred_rows = rows.clone()
+        when Option::None then ()
+        end
+        for p in pred_rows do
+          let p_len = back.ctx.f.blocks[p].statements.len()
+          slice_back_push(&mut back, p, p_len, wanted)
+        end
+      end
+    end
+  end
+  ()
+end
+
+# Seed one anchored def-chain walk: the defs of `local` that feed its use
+# at (block Vec index v, node index idx). The scan starts BELOW the use
+# node (a def AT the use node — a call reading and writing the same
+# local — feeds later uses, never this one).
+def slice_backward_at(inout back: SliceBack, v: Int, idx: Int, local: Int) -> Unit
+  slice_back_push(&mut back, v, idx - 1, local)
+  slice_back_run(&mut back)
+  ()
+end
+
+# ———————————————————————————————————————————————————————————————
+# The forward engine — transitive uses of a statement's defs
+# ———————————————————————————————————————————————————————————————
+# Work items (block, from, local) follow a def forward: every node READING
+# the local is included; a bare redefinition KILLS the chain (a partial
+# redefinition passes through); an included node's own defs become new items
+# (transitive uses). Chains surviving the terminator propagate to SUCCESSORS;
+# a def escaping as a named call argument records the "call:<callee>:arg<n>"
+# anchor. A MirDeinit consumes the local (the chain dies there).
+
+struct SliceFwd
+  ctx: SliceFnCtx
+  # work items: (block Vec index, from node index inclusive, local id).
+  work: Vec[(Int, Int, Int)] = Vec::new()
+  seen: Set[String] = Set::new()
+  included: Map[String, String] = Map::new()
+  external: Set[String] = Set::new()
+  items: Int = 0
+end
+
+def slice_fwd_push(inout fwd: SliceFwd, v: Int, from: Int, local: Int) -> Unit
+  if v < 0 then return end
+  let key = slice_back_item_text(v, from, local)
+  if fwd.seen.contains(&key) then return end
+  fwd.seen.insert(key)
+  fwd.work.push((v, from, local))
+  ()
+end
+
+def slice_fwd_include(inout fwd: SliceFwd, v: Int, idx: Int, span: Span) -> Unit
+  let block_id = fwd.ctx.f.blocks[v].id.id
+  let block_len = fwd.ctx.f.blocks[v].statements.len()
+  var node_key = ""
+  if idx >= block_len then
+    node_key = slice_term_key(&fwd.ctx.name, block_id)
+  else
+    node_key = slice_stmt_key(&fwd.ctx.name, block_id, idx)
+  end
+  if !fwd.included.contains_key(&node_key) then
+    let span_key = slice_span_key(&node_key, span)
+    fwd.included.insert(node_key, span_key)
+  end
+  ()
+end
+
+# "call:<callee>:arg<n>" anchors for every arg of a named call reading the
+# tracked local (the def's escape edges).
+def slice_fwd_call_anchors(term: MirTerminator, local: Int) -> Vec[String]
+  var out: Vec[String] = Vec::new()
+  let callee = slice_call_callee_name(term)
+  if callee.len() == 0 then return out end
+  match term.kind
+  when MirTerminatorKind::MirCall { dest, func, args, success, unwind, intrinsic } then
+    var ai = 0
+    while ai < args.len() do
+      match slice_call_arg_read(&args[ai])
+      when Option::Some(l) then
+        if l == local then
+          out.push("call:" + callee.clone() + ":arg" + ai.to_string())
+        end
+      when Option::None then ()
+      end
+      ai = ai + 1
+    end
+  when _ then ()
+  end
+  out
+end
+
+# Run the forward worklist to the budget (FIFO, deterministic).
+def slice_fwd_run(inout fwd: SliceFwd) -> Unit
+  while fwd.work.len() > 0 && fwd.items < slice_max_items() do
+    fwd.items = fwd.items + 1
+    let item = fwd.work[0]
+    fwd.work.remove(0)
+    let v = item.0
+    let from = item.1
+    let local = item.2
+    let block_len = fwd.ctx.f.blocks[v].statements.len()
+    var killed = false
+    var si = from
+    while si < block_len && !killed do
+      let st = fwd.ctx.f.blocks[v].statements[si]
+      let st_defs = slice_stmt_defs(st)
+      let bare = st_defs.0
+      let reads = slice_stmt_reads(st)
+      var uses = false
+      for r in reads do
+        if r == local then
+          uses = true
+        end
+      end
+      if uses then
+        let span = slice_span_copy(st.span)
+        slice_fwd_include(&mut fwd, v, si, span)
+        # the value flows through this node: its own def (when any) is a
+        # transitive carrier of the sliced def.
+        if bare >= 0 then
+          slice_fwd_push(&mut fwd, v, si + 1, bare)
+        end
+      end
+      if bare == local then
+        # the sliced def is overwritten here — its life ends at this node
+        # (a read at the same node was already counted above).
+        killed = true
+      end
+      si = si + 1
+    end
+    if !killed && from <= block_len then
+      # the block terminator is a candidate node of the chain.
+      let term = fwd.ctx.f.blocks[v].terminator
+      let term_defs = slice_term_defs(&term)
+      let bare = term_defs.0
+      let reads = slice_term_reads(&term)
+      var uses = false
+      for r in reads do
+        if r == local then
+          uses = true
+        end
+      end
+      if uses then
+        let span = slice_span_copy(term.span)
+        slice_fwd_include(&mut fwd, v, block_len, span)
+        # a def read as a named call argument escapes through the call
+        # edge: anchor the callee row even when the call's dest overwrites
+        # the tracked local.
+        let anchors = slice_fwd_call_anchors(&term, local)
+        for a in anchors do
+          fwd.external.insert(a.clone())
+        end
+        if bare >= 0 then
+          slice_fwd_push(&mut fwd, v, block_len + 1, bare)
+        end
+      end
+      if bare == local then
+        killed = true
+      end
+      match term.kind
+      when MirTerminatorKind::MirDeinit { place, deinit_fn, target, unwind } then
+        # a destruction consumes the value: the chain dies there (reads
+        # after a drop are invalid verified MIR).
+        if place.local.id == local then
+          killed = true
+        end
+      when _ then ()
+      end
+    end
+    if !killed then
+      # the chain survived the block: the value flows to the successors.
+      var succ_rows: Vec[Int] = Vec::new()
+      match fwd.ctx.succs.get(v)
+      when Option::Some(rows) then succ_rows = rows.clone()
+      when Option::None then ()
+      end
+      for s in succ_rows do
+        slice_fwd_push(&mut fwd, s, 0, local)
+      end
+    end
+  end
+  ()
+end
+
+# ———————————————————————————————————————————————————————————————
+# Result assembly — sorted stable ids + presentation span keys
+# ———————————————————————————————————————————————————————————————
+
+def slice_result_build(ctx: SliceFnCtx, included: Map[String, String], external: Set[String]) -> SliceResult
+  var keys: Vec[String] = Vec::new()
+  var entries: Vec[(String, String)] = included.entries()
+  for entry in entries do
+    keys.push(entry.0.clone())
+  end
+  keys.sort_by(|a, b| a < b)
+  var span_rows: Vec[String] = Vec::new()
+  for k in keys do
+    match included.get(k.clone())
+    when Option::Some(span_key) then
+      if span_key.len() > 0 then
+        span_rows.push(span_key.clone())
+      end
+    when Option::None then ()
+    end
+  end
+  var exts: Vec[String] = Vec::new()
+  for e in external do
+    exts.push(e.clone())
+  end
+  exts.sort_by(|a, b| a < b)
+  SliceResult {
+    function_key: ctx.name.clone(),
+    statements: keys,
+    external: exts,
+    span_keys: span_rows
+  }
+end
+
+# ———————————————————————————————————————————————————————————————
+# slice_value — the backward def chain of one value
+# ———————————————————————————————————————————————————————————————
+# Seeds one anchored walk per USE SITE of the value (a node reading the
+# local; a MirReturn reads the "_ret" local 0). A value with NO use sites
+# yields the empty slice (nothing later observes it — documented).
+
+pub def slice_value(mir: MirProgram, fn_key: String, value_id: Int) -> SliceResult
+  match slice_fn_find(mir, fn_key.clone())
+  when Option::Some(ctx) then
+    if value_id < 0 || value_id >= ctx.f.locals.len() then
+      return slice_result_empty()
+    end
+    var back = SliceBack { ctx: ctx, work: Vec::new(), seen: Set::new(), included: Map::new(), external: Set::new(), items: 0 }
+    # seed one anchored def-chain walk per USE SITE of the value (a node
+    # reading the local; a MirReturn reads the "_ret" local 0). A value
+    # with no use sites yields the empty slice (documented).
+    var bi = 0
+    while bi < back.ctx.f.blocks.len() do
+      let block_len = back.ctx.f.blocks[bi].statements.len()
+      var si = 0
+      while si < block_len do
+        let st = back.ctx.f.blocks[bi].statements[si]
+        let reads = slice_stmt_reads(st)
+        for r in reads do
+          if r == value_id then
+            slice_backward_at(&mut back, bi, si, value_id)
+          end
+        end
+        si = si + 1
+      end
+      let term = back.ctx.f.blocks[bi].terminator
+      let treads = slice_term_reads(&term)
+      for tr in treads do
+        if tr == value_id then
+          slice_backward_at(&mut back, bi, block_len, value_id)
+        end
+      end
+      bi = bi + 1
+    end
+    slice_result_build(&back.ctx, &back.included, &back.external)
+  when Option::None then slice_result_empty()
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# slice_statement — the forward use slice of one statement's defs
+# ———————————————————————————————————————————————————————————————
+
+pub def slice_statement(mir: MirProgram, fn_key: String, stmt_key: String) -> SliceResult
+  match slice_fn_find(mir, fn_key.clone())
+  when Option::Some(ctx) then
+    match slice_key_parts(&fn_key, &stmt_key)
+    when Option::Some(parts) then
+      let block_id = parts.0
+      let node_idx = parts.1
+      let is_term = parts.2
+      let v = slice_block_vec_index(&ctx, block_id)
+      if v < 0 || v >= ctx.f.blocks.len() then
+        return slice_result_empty()
+      end
+      let block_len = ctx.f.blocks[v].statements.len()
+      var defs = (-1, -1)
+      if is_term then
+        defs = slice_term_defs(&ctx.f.blocks[v].terminator)
+      elsif node_idx >= 0 && node_idx < block_len then
+        let st = ctx.f.blocks[v].statements[node_idx]
+        defs = slice_stmt_defs(st)
+      end
+      if defs.0 < 0 && defs.1 < 0 then
+        # a node with no defs defines nothing for later nodes to use
+        # (asserts, checks, switches...): the use slice is empty
+        # (documented).
+        return slice_result_empty()
+      end
+      var fwd = SliceFwd { ctx: ctx, work: Vec::new(), seen: Set::new(), included: Map::new(), external: Set::new(), items: 0 }
+      var seed = defs.0
+      if seed < 0 then
+        seed = defs.1
+      end
+      var from = node_idx + 1
+      if is_term then
+        from = block_len + 1
+      end
+      slice_fwd_push(&mut fwd, v, from, seed)
+      slice_fwd_run(&mut fwd)
+      slice_result_build(&fwd.ctx, &fwd.included, &fwd.external)
+    when Option::None then slice_result_empty()
+    end
+  when Option::None then slice_result_empty()
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# slice_failure — the statements contributing to one diagnostic
+# ———————————————————————————————————————————————————————————————
+# Trace + anchored condition slices of the mapped failing node (see the SPAN
+# MAP section of the module doc).
+
+# Whether a span textually contains the diagnostic start offset (empty
+# files compare equal; a dummy span contains nothing).
+def slice_span_contains(span: Span, d: Span) -> Bool
+  if span.start == 0 && span.end_pos == 0 && span.file.len() == 0 then
+    return false
+  end
+  if d.file.len() > 0 && span.file.len() > 0 && d.file != span.file then
+    return false
+  end
+  span.start <= d.start && d.start <= span.end_pos
+end
+
+# The strict better-than relation over mapping tiers (see above); the
+# walk replaces only on strictly-better, so ties keep the EARLIER node.
+def slice_span_better(a: Span, b: Span, d: Span) -> Bool
+  var a_contain = slice_span_contains(&a, &d)
+  var b_contain = slice_span_contains(&b, &d)
+  if a_contain != b_contain then
+    return a_contain
+  end
+  var a_overlap = (a.start <= d.end_pos) && (d.start <= a.end_pos)
+  var b_overlap = (b.start <= d.end_pos) && (d.start <= b.end_pos)
+  if a_overlap != b_overlap then
+    return a_overlap
+  end
+  var a_gap = a.start - d.start
+  if a_gap < 0 then a_gap = -a_gap end
+  var b_gap = b.start - d.start
+  if b_gap < 0 then b_gap = -b_gap end
+  if a_gap != b_gap then
+    return a_gap < b_gap
+  end
+  var a_egap = a.end_pos - d.end_pos
+  if a_egap < 0 then a_egap = -a_egap end
+  var b_egap = b.end_pos - d.end_pos
+  if b_egap < 0 then b_egap = -b_egap end
+  a_egap < b_egap
+end
+
+# The best-mapped (ctx, block Vec index, node index); None when nothing maps.
+def slice_failure_map(mir: MirProgram, diag: Diagnostic) -> Option[(SliceFnCtx, Int, Int)]
+  match diag.span.clone()
+  when Option::Some(dspan) then
+    var best_ctx: Option[SliceFnCtx] = Option::None
+    var best_v = -1
+    var best_idx = -1
+    var best_span = Span { file: "", start: 0, end_pos: 0 }
+    var best_set = false
+    for f in mir.functions do
+      match slice_fn_find(mir, f.name.clone())
+      when Option::Some(ctx) then
+        var bi = 0
+        while bi < ctx.f.blocks.len() do
+          let block_len = ctx.f.blocks[bi].statements.len()
+          var si = 0
+          while si < block_len do
+            let st = ctx.f.blocks[bi].statements[si]
+            let sp = slice_span_copy(st.span)
+            if !best_set || slice_span_better(&sp, &best_span, &dspan) then
+              best_set = true
+              best_span = sp
+              best_ctx = Option::Some(ctx.clone())
+              best_v = bi
+              best_idx = si
+            end
+            si = si + 1
+          end
+          let term = ctx.f.blocks[bi].terminator
+          let tsp = slice_span_copy(term.span)
+          if !best_set || slice_span_better(&tsp, &best_span, &dspan) then
+            best_set = true
+            best_span = tsp
+            best_ctx = Option::Some(ctx.clone())
+            best_v = bi
+            best_idx = block_len
+          end
+          bi = bi + 1
+        end
+      when Option::None then ()
+      end
+    end
+    match best_ctx
+    when Option::Some(bc) then Option::Some((bc, best_v, best_idx))
+    when Option::None then Option::None
+    end
+  when Option::None then Option::None
+  end
+end
+
+pub def slice_failure(mir: MirProgram, diag: Diagnostic) -> SliceResult
+  match slice_failure_map(mir, diag)
+  when Option::Some(triple) then
+    let ctx = triple.0
+    let v = triple.1
+    let idx = triple.2
+    let block_len = ctx.f.blocks[v].statements.len()
+    var back = SliceBack { ctx: ctx.clone(), work: Vec::new(), seen: Set::new(), included: Map::new(), external: Set::new(), items: 0 }
+    # the failing node's read operands (the failing condition and its
+    # bounds, the switch scrutinee, the call's arguments...): the anchored
+    # def chains of each.
+    var reads: Vec[Int] = Vec::new()
+    if idx >= block_len then
+      let term = ctx.f.blocks[v].terminator
+      reads = slice_term_reads(&term)
+    else
+      let st = ctx.f.blocks[v].statements[idx]
+      reads = slice_stmt_reads(st)
+    end
+    for r in reads do
+      slice_backward_at(&mut back, v, idx, r)
+    end
+    # the failure trace: the enclosing block's statements from its head
+    # through the failing node (the failing terminator included).
+    var ti = 0
+    while ti <= idx && ti <= block_len do
+      var node_key = ""
+      var nspan = Span { file: "", start: 0, end_pos: 0 }
+      if ti >= block_len then
+        node_key = slice_term_key(&ctx.name, ctx.f.blocks[v].id.id)
+        nspan = slice_span_copy(ctx.f.blocks[v].terminator.span)
+      else
+        node_key = slice_stmt_key(&ctx.name, ctx.f.blocks[v].id.id, ti)
+        nspan = slice_span_copy(ctx.f.blocks[v].statements[ti].span)
+      end
+      if !back.included.contains_key(&node_key) then
+        let span_key = slice_span_key(&node_key, nspan)
+        back.included.insert(node_key, span_key)
+      end
+      ti = ti + 1
+    end
+    slice_result_build(&ctx, &back.included, &back.external)
+  when Option::None then slice_result_empty()
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# slice_effect — the statements contributing one effect class
+# ———————————————————————————————————————————————————————————————
+# One row per function whose DIRECT §11 summary has the class: the class's
+# direct sites (per the §11 evidence — classify_call/_deinit reuse, the
+# string-concat MirBinOp::Add, the fail-closed perform) + each site's
+# anchored def chains of the values it reads (the module doc's model).
+
+# Per-statement class evidence (3 slots: Alloc/Block/Io per
+# effect_class_slot_index), mirroring mir_effect_scan_function's two arms.
+def slice_stmt_effect_evidence(f: MirFunction, st: MirStatement) -> Vec[String]
+  var ev: Vec[String] = Vec::from(["".to_string(), "".to_string(), "".to_string()])
+  match st.kind
+  when MirStatementKind::MirAssign(dest, rvalue) then
+    match rvalue.kind
+    when MirRvalueKind::MirBinOp(MirBinOp::Add, lhs, rhs) then
+      let dest_ty = mir_effect_place_type(&f, &dest)
+      let dest_str = mir_effect_type_is_string_like(&dest_ty)
+      let lhs_str = mir_effect_operand_is_string(&f, &lhs)
+      let rhs_str = mir_effect_operand_is_string(&f, &rhs)
+      if dest_str || lhs_str || rhs_str then
+        ev[0] = "the `+` String concatenation (the _tg_str_concat owned heap String wrap)"
+      end
+    when _ then ()
+    end
+  when MirStatementKind::MirEffectPerform(_, _, _, _, _) then
+    ev[0] = "an algebraic-effects perform whose handler's allocation behavior cannot be proven"
+    ev[1] = "an algebraic-effects perform whose handler's blocking behavior cannot be proven"
+    ev[2] = "an algebraic-effects perform whose handler's I/O behavior cannot be proven"
+  when _ then ()
+  end
+  ev
+end
+
+# Per-terminator class evidence (the §11 classifier's direct records;
+# assert/abort sites are panic-class only).
+def slice_term_effect_evidence(mir: MirProgram, f: MirFunction, term: MirTerminator, type_index: Map[Int, String], fn_index: Map[String, Int]) -> Vec[String]
+  var ev: Vec[String] = Vec::from(["".to_string(), "".to_string(), "".to_string()])
+  match term.kind
+  when MirTerminatorKind::MirCall { dest, func, args, success, unwind, intrinsic } then
+    let cc = mir_effect_classify_call(mir, &f, &type_index, &fn_index, &func, &args, intrinsic)
+    var i = 0
+    while i < 3 && i < cc.evidence.len() do
+      ev[i] = cc.evidence[i].clone()
+      i = i + 1
+    end
+  when MirTerminatorKind::MirDeinit { place, deinit_fn, target, unwind } then
+    let cd = mir_effect_classify_deinit(mir, &fn_index, &deinit_fn)
+    var i2 = 0
+    while i2 < 3 && i2 < cd.evidence.len() do
+      ev[i2] = cd.evidence[i2].clone()
+      i2 = i2 + 1
+    end
+  when _ then ()
+  end
+  ev
+end
+
+pub def slice_effect(mir: MirProgram, class: EffectClass) -> Vec[SliceResult]
+  let type_index = slice_type_index(&mir)
+  let fn_index = slice_fn_index(&mir)
+  var state = MirEffectState {}
+  for f in mir.functions do
+    mir_effect_scan_function(&mir, &mut state, &type_index, &fn_index, &f)
+  end
+  var slot = effect_class_slot_index(class)
+  var rows_by_name: Map[String, SliceResult] = Map::new()
+  var seen_fns: Set[String] = Set::new()
+  for f in mir.functions do
+    var summary = EffectSummary {}
+    match state.direct.get(f.name.clone())
+    when Option::Some(s) then summary = s.clone()
+    when Option::None then ()
+    end
+    if effect_summary_has_class(&summary, &class) then
+      if !seen_fns.contains(&f.name) then
+        seen_fns.insert(f.name.clone())
+        match slice_fn_find(&mir, f.name.clone())
+        when Option::Some(ctx) then
+          var back = SliceBack { ctx: ctx.clone(), work: Vec::new(), seen: Set::new(), included: Map::new(), external: Set::new(), items: 0 }
+          var bi = 0
+          while bi < ctx.f.blocks.len() do
+            let block_id = ctx.f.blocks[bi].id.id
+            let block_len = ctx.f.blocks[bi].statements.len()
+            var si = 0
+            while si < block_len do
+              let st = ctx.f.blocks[bi].statements[si]
+              let ev = slice_stmt_effect_evidence(&f, st)
+              if slot < ev.len() && ev[slot].len() > 0 then
+                let node_key = slice_stmt_key(&ctx.name, block_id, si)
+                if !back.included.contains_key(&node_key) then
+                  let nspan = slice_span_copy(st.span)
+                  let span_key = slice_span_key(&node_key, nspan)
+                  back.included.insert(node_key, span_key)
+                end
+                let reads = slice_stmt_reads(st)
+                for r in reads do
+                  slice_backward_at(&mut back, bi, si, r)
+                end
+              end
+              si = si + 1
+            end
+            let term = ctx.f.blocks[bi].terminator
+            let tev = slice_term_effect_evidence(&mir, &f, &term, &type_index, &fn_index)
+            if slot < tev.len() && tev[slot].len() > 0 then
+              let node_key = slice_term_key(&ctx.name, block_id)
+              if !back.included.contains_key(&node_key) then
+                let nspan = slice_span_copy(term.span)
+                let span_key = slice_span_key(&node_key, nspan)
+                back.included.insert(node_key, span_key)
+              end
+              let treads = slice_term_reads(&term)
+              for tr in treads do
+                slice_backward_at(&mut back, bi, block_len, tr)
+              end
+            end
+            bi = bi + 1
+          end
+          let row = slice_result_build(&ctx, &back.included, &back.external)
+          rows_by_name.insert(f.name.clone(), row)
+        when Option::None then ()
+        end
+      end
+    end
+  end
+  # rows sorted by function key (deterministic order).
+  var names: Vec[String] = Vec::new()
+  var entries: Vec[(String, SliceResult)] = rows_by_name.entries()
+  for entry in entries do
+    names.push(entry.0.clone())
+  end
+  names.sort_by(|a, b| a < b)
+  var sorted: Vec[SliceResult] = Vec::new()
+  for n in names do
+    match rows_by_name.get(n.clone())
+    when Option::Some(r2) then sorted.push(r2.clone())
+    when Option::None then ()
+    end
+  end
+  sorted
+end
+
+# ———————————————————————————————————————————————————————————————
+# slice_digest — the content-addressed digest of slice results
+# ———————————————————————————————————————————————————————————————
+# The digest preimage is the SORTED canonical JSONL row set of the
+# results (function / statement / external rows — the semantic_index.tg
+# line style). span_keys NEVER serialize (spans are presentation, never
+# identity).
+
+def slice_digest_lines(results: Vec[SliceResult]) -> Vec[String]
+  var lines: Vec[String] = Vec::new()
+  lines.push("{\"s\":\"header\",\"format\":\"tg-semantic-slice/v1\"}")
+  for r in results do
+    let fkey = r.function_key.clone()
+    if fkey.len() > 0 then
+      lines.push("{\"s\":\"slice\",\"f\":\"" + semantic_json_escape(&fkey) + "\"}")
+      for k in r.statements do
+        lines.push("{\"s\":\"stmt\",\"f\":\"" + semantic_json_escape(&fkey) + "\",\"k\":\"" + semantic_json_escape(&k) + "\"}")
+      end
+      for e in r.external do
+        lines.push("{\"s\":\"ext\",\"f\":\"" + semantic_json_escape(&fkey) + "\",\"k\":\"" + semantic_json_escape(&e) + "\"}")
+      end
+    end
+  end
+  lines.sort_by(|a, b| a < b)
+  lines
+end
+
+pub def slice_digest(results: Vec[SliceResult]) -> StableDigest
+  var text = ""
+  let lines = slice_digest_lines(results)
+  for l in lines do
+    text = text + l + "\n"
+  end
+  stable_digest_of(&text)
+end

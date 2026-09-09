@@ -20,7 +20,9 @@ use tg_compiler::ast::{Program, Item, ItemKind, AccessConvention}
 use tg_compiler::resolver::{ResolvedNames, def_kind_of}
 use tg_compiler::types::{
   Type, ParamType, fn_owner_key_of_def, crate_module_path_of, AccessEffect,
-  TypeCanonFrame, TypeCanonCtx, type_canon_render, effect_registry_new
+  TypeCanonFrame, TypeCanonCtx, type_canon_render, effect_registry_new,
+  const_sym_tree_has_param, const_sym_tree_uses_param, const_sym_tree_param_ids,
+  const_sym_tree_subst_consts, const_sym_tree_eq, const_sym_fold_type
 }
 use tg_compiler::mir::{
   MirProgram, MirFunction, MirLocal, MirBlock, MirStatement, MirStatementKind,
@@ -193,6 +195,7 @@ def type_has_params(ty: Type) -> Bool
   when Type::FixedArray(elem, _) then type_has_params(elem)
   when Type::FixedArraySym(elem, gpid) then true
   when Type::ConstParam(_) then true
+  when Type::ConstSym(tree) then const_sym_tree_has_param(&tree)
   when Type::RefInternal(inner, _) then type_has_params(inner)
   when Type::Ptr(inner) then type_has_params(inner)
   when Type::PtrMut(inner) then type_has_params(inner)
@@ -237,6 +240,7 @@ def type_uses_param_id(ty: Type, gpid: GenericParamId) -> Bool
       type_uses_param_id(elem, gpid)
     end
   when Type::ConstParam(n) then generic_param_id_eq(&n, gpid)
+  when Type::ConstSym(tree) then const_sym_tree_uses_param(&tree, gpid)
   when Type::RefInternal(inner, _) then type_uses_param_id(inner, gpid)
   when Type::Ptr(inner) then type_uses_param_id(inner, gpid)
   when Type::PtrMut(inner) then type_uses_param_id(inner, gpid)
@@ -366,7 +370,23 @@ pub def specialize_function_named(
   if type_param_ids.len() != type_args.len() then
     return Result::Err("monomorphization arity error for `" + original.name + "`: expected " + type_param_ids.len().to_string() + " type arguments (the declared type parameters), got " + type_args.len().to_string() + " — every instance carries exactly the declared type parameters")
   end
-  
+
+  # (§20 const generics, slice 3): FAIL-CLOSED symbolic-argument guard. A
+  # generic instance whose substitutions still carry ANY symbolic generic
+  # reference (Type::Param / Type::ConstParam / FixedArraySym — the
+  # param-carrying forms, see type_has_params) cannot specialize: a const
+  # parameter's VALUE inside the body substitutes from the instance's type
+  # argument (Type::Const(v) -> MirInt(v)), and a symbolic argument would
+  # leave the value placeholder unresolved in a body cached as concrete.
+  # The worklist defers such instances (the caller's own specialization
+  # substitutes the payload and the re-walk enqueues the now-concrete
+  # instance — zero inference); reaching this point with a symbolic
+  # argument is a compiler-internal gap or external-API misuse — rejected
+  # here, never a placeholder-carrying body.
+  if has_any_param_types(&type_args) then
+    return Result::Err("monomorphization of `" + original.name + "` rejected: the instance's substitutions still carry a generic parameter (a symbolic const argument cannot produce the concrete per-instance value of a const parameter read; the instance must be re-specialized under the caller's concrete substitutions)")
+  end
+
   let subst = type_subst_new(type_param_ids, type_args)
   
   # Create specialized function with substituted types. The instantiated
@@ -390,6 +410,7 @@ pub def specialize_function_named(
     attr_inline_always: original.attr_inline_always,
     attr_noinline: original.attr_noinline,
     attr_cold: original.attr_cold,
+    attr_interrupt: original.attr_interrupt,
     fp_fast: original.fp_fast,
     span: original.span.clone()
   }
@@ -574,6 +595,12 @@ def first_param_id_in_type(ty: Type) -> Option[GenericParamId]
     when Option::None then Option::Some(gpid)
     end
   when Type::ConstParam(gpid) then Option::Some(gpid)
+  when Type::ConstSym(tree) then
+    # (§20 slice 2): the first parameter of a symbolic const-expression
+    # argument is its FIRST parameter leaf in tree order (the leaves are
+    # the only parameter-carrying positions of the tree).
+    let leaf_ids = const_sym_tree_param_ids(&tree)
+    if leaf_ids.len() > 0 then Option::Some(leaf_ids[0].clone()) else Option::None end
   when Type::RefInternal(inner, _) then first_param_id_in_type(inner)
   when Type::Ptr(inner) then first_param_id_in_type(inner)
   when Type::PtrMut(inner) then first_param_id_in_type(inner)
@@ -651,6 +678,19 @@ def substitute_type(subst: TypeSubstMap, ty: Type) -> Type
     when Option::Some(concrete) then concrete.clone()
     when Option::None then ty.clone()
     end
+  when Type::ConstParam(gpid) then
+    # (§20 slice 2): a SYMBOLIC const parameter reference substitutes to its
+    # parameter's solved argument (Type::Const(v) — the value the instance
+    # was recorded at), so an Adt const slot or a nested signature position
+    # carrying the parameter (e.g. the `N` of `ArrayVec[T, N]` inside a
+    # generic function's signature) becomes concrete in the specialized
+    # body. A missing entry leaves the symbolic reference (the
+    # post-instantiation verification rejects the residual like any
+    # leftover Param — fail-closed, never a fabricated value).
+    match subst.params.get(generic_param_id_numeric(&gpid))
+    when Option::Some(concrete) then concrete.clone()
+    when Option::None then ty.clone()
+    end
   when Type::RefInternal(inner, mutable) then Type::RefInternal(Box::new(substitute_type(subst, inner)), mutable)
   when Type::Ptr(inner) then Type::Ptr(Box::new(substitute_type(subst, inner)))
   when Type::PtrMut(inner) then Type::PtrMut(Box::new(substitute_type(subst, inner)))
@@ -677,6 +717,22 @@ def substitute_type(subst: TypeSubstMap, ty: Type) -> Type
       end
     when Option::None then Type::FixedArraySym(sub_elem, gpid)
     end
+  when Type::ConstSym(tree) then
+    # (§20 slice 2): a SYMBOLIC CONST-EXPRESSION type argument under the
+    # mono substitution — the instance fold: every parameter LEAF whose
+    # parameter the instance solved becomes its concrete value
+    # (Type::Const(v) -> literal leaf; a Type::ConstParam(g2) solution —
+    # an enclosing generic's parameter — re-points the leaf at the outer
+    # id), then the tree FOLDS: a fully-literal tree becomes the CONCRETE
+    # Type::Const(v) in the specialized body (the return/signature slot
+    # `Decimal128[SCALE + S2]` of an instance at SCALE=10, S2=2 becomes
+    # Decimal128[12] — the value the layout engine and the caller's
+    # signature comparisons see). A tree whose leaves the instance does
+    # not cover stays symbolic (an enclosing generic's parameters — the
+    # post-instantiation verification rejects the residual ConstSym like a
+    # residual ConstParam/Param — fail-closed, never a fabricated value).
+    let t2 = const_sym_tree_subst_consts(&tree, subst.params)
+    const_sym_fold_type(&t2)
   when Type::Tuple(elems) then
     var subs = Vec::new()
     for e in elems do
@@ -828,6 +884,53 @@ def substitute_operand(subst: TypeSubstMap, op: MirOperand) -> MirOperand
   when MirOperandKind::MirConsume(place) then
     MirOperand { kind: MirOperandKind::MirConsume(substitute_place(subst, &place)) }
   when MirOperandKind::MirConstant(c) then
+    # (§20 const generics, slice 3): the SYMBOLIC per-instance value of a
+    # const generic parameter read (MirConstParamValue — the payload is
+    # the parameter's numeric GenericParamId) resolves through the SAME
+    # substitution map that substitutes its type:
+    #   - Type::Const(v)     -> the CONCRETE MirInt(v) (the normal
+    #     fully-solved case — the value of `N` at this instance);
+    #   - Type::ConstParam(g2) -> an OUTER const parameter's reference:
+    #     the placeholder FORWARDS with the outer id (the nested-generic
+    #     deferral form; such instances only reach the drain once their
+    #     substitutions are concrete, so this is the symbolic-argument
+    #     fail-closed path — the specialization guard rejects those);
+    #   - a missing/uncovered entry -> the placeholder survives (the
+    #     post-instantiation verification's symbolic-argument guard
+    #     rejects the body — never a fabricated value).
+    match c.kind
+    when MirConstantKind::MirConstParamValue(gpid_num) then
+      let sub_ty = substitute_type(subst, &c.ty)
+      match subst.params.get(gpid_num)
+      when Option::Some(concrete) then
+        match concrete
+        when Type::Const(v) then
+          MirOperand { kind: MirOperandKind::MirConstant(MirConstant {
+            kind: MirConstantKind::MirInt(v),
+            ty: sub_ty,
+            instance: Option::None
+          })}
+        when Type::ConstParam(g2) then
+          MirOperand { kind: MirOperandKind::MirConstant(MirConstant {
+            kind: MirConstantKind::MirConstParamValue(generic_param_id_numeric(&g2)),
+            ty: sub_ty,
+            instance: Option::None
+          })}
+        when _ then
+          MirOperand { kind: MirOperandKind::MirConstant(MirConstant {
+            kind: MirConstantKind::MirConstParamValue(gpid_num),
+            ty: sub_ty,
+            instance: Option::None
+          })}
+        end
+      when Option::None then
+        MirOperand { kind: MirOperandKind::MirConstant(MirConstant {
+          kind: MirConstantKind::MirConstParamValue(gpid_num),
+          ty: sub_ty,
+          instance: Option::None
+        })}
+      end
+    when _ then
     MirOperand { kind: MirOperandKind::MirConstant(MirConstant {
       kind: c.kind.clone(),
       ty: substitute_type(subst, &c.ty),
@@ -841,6 +944,7 @@ def substitute_operand(subst: TypeSubstMap, op: MirOperand) -> MirOperand
       when Option::None then Option::None
       end
     })}
+    end
   end  end
 end
 
@@ -2593,8 +2697,10 @@ def type_eq(a: Type, b: Type) -> Bool
   when Type::Const(v1) then
     # (§20 slice 1): const generic ARGUMENTS compare by VALUE — Const(4) ==
     # Const(4), Const(4) != Const(8) (the §20 canonical-identity
-    # requirement; folding of const EXPRESSIONS is slice 2 — the args are
-    # literals only). Const never equals a symbolic ConstParam.
+    # requirement; slice 2 folds const EXPRESSION and module-const
+    # SPELLINGS to the same Type::Const before identity comparisons ever
+    # run — the args carry values, never spellings). Const never equals a
+    # symbolic ConstParam.
     match b
     when Type::Const(v2) then v1 == v2
     when _ then false
@@ -2604,6 +2710,17 @@ def type_eq(a: Type, b: Type) -> Bool
     # its GenericParamId identity — (owner, index), never the name.
     match b
     when Type::ConstParam(gpid2) then generic_param_id_eq(&gpid1, &gpid2)
+    when _ then false
+    end
+  when Type::ConstSym(tree1) then
+    # (§20 slice 2): two SYMBOLIC const-EXPRESSION arguments compare by
+    # ORDER-SENSITIVE STRUCTURAL tree equality (const_sym_tree_eq —
+    # spelling-sensitive while symbolic, documented in the ConstExprT
+    # note); they never equal a folded Const or a bare ConstParam — after
+    # substitution a bound tree FOLDS to Type::Const BEFORE any identity
+    # comparison sees the slot, so the instance keys compare values.
+    match b
+    when Type::ConstSym(tree2) then const_sym_tree_eq(&tree1, &tree2)
     when _ then false
     end
   when Type::FixedArraySym(e1, gpid1) then

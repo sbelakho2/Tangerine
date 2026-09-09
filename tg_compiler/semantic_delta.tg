@@ -1,0 +1,844 @@
+# Tangerine Compiler — Semantic Delta Core (audit §31)
+# Self-hosting compiler written in Tangerine
+#
+# semantic_delta_of compares two SemanticSnapshot values table-by-table by
+# stable key and renders one SemanticDelta describing what changed between
+# two compilations. The module reads ONLY snapshot rows (never AST / typed /
+# MIR state) and mirrors the semantic_model.tg / semantic_snapshot.tg idioms.
+#
+# TABLE ANCHORS: symbols -> entity diff (created/removed/modified); calls /
+# effects / capabilities / ownership / contracts -> the *_delta rows;
+# mir_functions -> the mir_changed flag; the public_api_hash / abi_hash WORD
+# pairs -> public_api_delta / abi_delta. Their row texts are reconstructed
+# from the pub symbol+type rows (api — the snapshot writer's public_api text
+# domain) and the pub-Function keys (abi — the exact ABI row text needs the
+# builder-side mono classifier and is NOT in a snapshot). The types table is
+# read for those api rows only; tests/coverage/unsafe_hash carry no rows
+# today and no delta signal (documented).
+#
+# KEY IDENTITY SCHEME (report): model rows key on their StableDefId — the
+# canonical key TEXT (stable_id.key = "module_path::name#signature") with the
+# 128-bit digest words alongside. The diff keys on the key TEXT (the one
+# per-def identity usable directly as a Map key; the digest words ARE the
+# digest of that text). The audit's StableIdRef { id: Int; text: String } is
+# DROPPED per its own instruction: id = the numeric digest word is a second
+# key over the same identity — follow the model. Row keys are '|'-composites
+# of def keys ('|' never occurs in a stable key or place key; a contract
+# clause may contain '|' and is always the LAST key component):
+#   symbol stable_id.key | call caller.key|callee.key|kind-numeric
+#   effect/mir function.key | capability function.key|cap<id>|Requires|Provides
+#   ownership function.key|place|let|inout|sink|set
+#   contract function.key|Pre|Post|Invariant|clause
+#
+# ROW PAYLOADS (canonical renders; spans and digest words never participate —
+# identity is the key): symbol kind|pub|generic (name/module/signature ride
+# the key); call/capability/ownership/contract "" (content IS the key);
+# effect dirty-word";"sorted-capability-ids (the §11 projection); mir
+# blocks|statements|locals|reachable|unsafe|unknown|effect-payload. Same key
+# + identical payload = unchanged; same key + different payload = Modified;
+# key only in b = Created; only in a = Removed. Only effect/mir rows can be
+# Modified (their payload is not the key).
+#
+# PER-ENTITY FLAG DERIVATION:
+#   signature_changed — a removed key and a created key sharing the same
+#     name-part AND DefKind text describe ONE def whose signature (the key's
+#     "#" component) changed: they pair (only when each side contributes
+#     exactly one candidate) and report once as Modified, keyed by the b key.
+#   mir_changed / effects_changed — the fn-keyed mir/effect payloads differ.
+#   capabilities_changed / ownership_changed / contracts_changed — the
+#     per-fn row multiset ("<fn-key>|" suffix texts) differs.
+#   abi_changed — Function kind both sides, pub on either side, and the
+#     (pub, generic, mir-row presence) slice or the signature changed
+#     (approximation: layout-only ABI drift is visible only via the hash).
+# An entity gets an EntityDelta entry iff its symbol payload changed or any
+# flag fired (emit-nothing: a function with no domain change yields none).
+#
+# affected: seeds = created/removed/modified keys; closes over b's call rows
+# to a fixed point — a caller row whose callee (the row's `to`) is affected
+# becomes affected — capped at the b call-table size.
+#
+# public_api / abi deltas: hash words compared; rows (when changed) = the
+# symmetric difference of the reconstructed rows (api) / pub-Fn keys (abi).
+
+use std::collections::{Vec, Map}
+
+use tg_compiler::ids::{StableDigest, stable_digest_of}
+use tg_compiler::ast::{AccessConvention, AstContractKind}
+use tg_compiler::types::{EffectSummary}
+use tg_compiler::semantic_model::{
+  SemanticSnapshot, SemanticSymbol, CallEdge, EffectEdge, CapabilityEdge, CapabilityEdgeKind,
+  OwnershipFact, ContractFact, MirSemanticSummary,
+  semantic_digest_render, semantic_json_escape, semantic_summary_dirty_word,
+  semantic_def_kind_text, semantic_stable_def_id_digest, semantic_call_edge_kind_numeric
+}
+
+# ———— The §31 protocol records ————
+
+enum DeltaKind
+  Created
+  Removed
+  Modified
+end
+
+# One modified entity. stable_id is the current (b-side) stable key text;
+# the flags say which domain slice changed (see the module doc). kind is
+# DeltaKind::Modified for every entry (created/removed ride the key lists).
+struct EntityDelta
+  stable_id: String
+  signature_changed: Bool
+  mir_changed: Bool
+  effects_changed: Bool
+  capabilities_changed: Bool
+  ownership_changed: Bool
+  contracts_changed: Bool
+  abi_changed: Bool
+  kind: DeltaKind
+end
+
+# One changed relationship row (calls/effects/capabilities): key = the row's
+# composite key text; from/to = the subject/object endpoint texts (caller/
+# callee stable keys; function key + effect payload; function key + "cap<id>").
+struct EdgeDelta
+  key: String
+  kind: DeltaKind
+  from: String
+  to: String
+end
+
+# One changed ownership fact: key = subject function key, place = canonical
+# place-key text, convention = let|inout|sink|set.
+struct OwnershipDelta
+  key: String
+  kind: DeltaKind
+  place: String
+  convention: String
+end
+
+# One changed contract clause: key = subject function key; clause carries the
+# canonical kind word (Pre|Post|Invariant) + " " + the clause text.
+struct ContractDelta
+  key: String
+  kind: DeltaKind
+  clause: String
+end
+
+struct ApiDelta
+  public_api_changed: Bool
+  public_api_rows: Vec[String] = Vec::new()
+end
+
+struct AbiDelta
+  abi_changed: Bool
+  abi_rows: Vec[String] = Vec::new()
+end
+
+struct SemanticDelta
+  created: Vec[String] = Vec::new()
+  removed: Vec[String] = Vec::new()
+  modified: Vec[EntityDelta] = Vec::new()
+  call_delta: Vec[EdgeDelta] = Vec::new()
+  effect_delta: Vec[EdgeDelta] = Vec::new()
+  capability_delta: Vec[EdgeDelta] = Vec::new()
+  ownership_delta: Vec[OwnershipDelta] = Vec::new()
+  contract_delta: Vec[ContractDelta] = Vec::new()
+  public_api_delta: ApiDelta
+  abi_delta: AbiDelta
+  affected: Vec[String] = Vec::new()
+end
+
+# An EMPTY delta (the emit-nothing value: diffing identical snapshots
+# returns this record and digests to a constant).
+def semantic_delta_empty() -> SemanticDelta
+  SemanticDelta {
+    public_api_delta: ApiDelta { public_api_changed: false },
+    abi_delta: AbiDelta { abi_changed: false }
+  }
+end
+
+# ———— Text helpers ————
+
+def delta_digest_eq(a: StableDigest, b: StableDigest) -> Bool
+  a.hi == b.hi && a.lo == b.lo
+end
+
+def delta_bool_text(b: Bool) -> String
+  if b then "true" else "false" end
+end
+
+def delta_kind_text(k: DeltaKind) -> String
+  match k
+  when DeltaKind::Created then "Created"
+  when DeltaKind::Removed then "Removed"
+  when DeltaKind::Modified then "Modified"
+  end
+end
+
+# The index of the first needle occurrence at or after from (-1 if none).
+def delta_char_index(s: String, needle: String, from: Int) -> Int
+  var i = from
+  while i < s.len() do
+    if s.slice(i, i + 1) == needle then
+      return i
+    end
+    i = i + 1
+  end
+  -1
+end
+
+# The entity name-part of a stable key: everything before "#signature".
+def delta_key_name_part(key: String) -> String
+  let i = delta_char_index(key, "#", 0)
+  if i < 0 then key.clone() else key.slice(0, i) end
+end
+
+# Split a composite key at its first two '|' separators; the third part is
+# the remainder (a contract clause text may itself contain '|').
+def delta_key_parts(key: String) -> (String, String, String)
+  let i1 = delta_char_index(key, "|", 0)
+  let i2 = if i1 < 0 then -1 else delta_char_index(key, "|", i1 + 1) end
+  var p1 = if i1 < 0 then key.clone() else key.slice(0, i1) end
+  var p2 = if i1 < 0 || i2 < 0 then "".to_string() else key.slice(i1 + 1, i2) end
+  var p3 = if i2 < 0 then "".to_string() else key.slice(i2 + 1, key.len()) end
+  (p1, p2, p3)
+end
+
+# ———— Per-table canonical keys and payload texts ————
+
+# The §11 summary payload: the dirty-class word and the sorted capability
+# ids (the snapshot writer's canonical caps projection).
+def delta_summary_text(s: EffectSummary) -> String
+  var ids: Vec[Int] = Vec::new()
+  for c in s.capabilities do
+    ids.push(c.id)
+  end
+  ids.sort()
+  var caps_text = ""
+  var i = 0
+  while i < ids.len() do
+    if i > 0 then caps_text = caps_text + ";" end
+    caps_text = caps_text + ids[i].to_string()
+    i = i + 1
+  end
+  semantic_summary_dirty_word(&s).to_string() + ";" + caps_text
+end
+
+def delta_call_row_key(c: CallEdge) -> String
+  c.caller.key.clone() + "|" + c.callee.key.clone() + "|" +
+    semantic_call_edge_kind_numeric(&c.kind).to_string()
+end
+
+def delta_capability_row_key(e: CapabilityEdge) -> String
+  var dir_text = match e.kind
+  when CapabilityEdgeKind::Requires then "Requires"
+  when CapabilityEdgeKind::Provides then "Provides"
+  end
+  e.function.key.clone() + "|cap" + e.capability.id.to_string() + "|" + dir_text
+end
+
+def delta_ownership_row_key(o: OwnershipFact) -> String
+  var conv_text = match o.convention
+  when AccessConvention::Let then "let"
+  when AccessConvention::Inout then "inout"
+  when AccessConvention::Sink then "sink"
+  when AccessConvention::Set then "set"
+  end
+  o.function.key.clone() + "|" + o.place_key.clone() + "|" + conv_text
+end
+
+def delta_contract_row_key(c: ContractFact) -> String
+  var ckind_text = match c.kind
+  when AstContractKind::AstPre then "Pre"
+  when AstContractKind::AstPost then "Post"
+  when AstContractKind::AstInvariant then "Invariant"
+  end
+  c.function.key.clone() + "|" + ckind_text + "|" + c.clause_text.clone()
+end
+
+def delta_mir_row_payload(m: MirSemanticSummary) -> String
+  m.block_count.to_string() + "|" + m.statement_count.to_string() + "|" +
+    m.local_count.to_string() + "|" + delta_bool_text(m.reachable) + "|" +
+    delta_bool_text(m.calls_unsafe) + "|" + delta_bool_text(m.calls_unknown) + "|" +
+    delta_summary_text(&m.effect_summary)
+end
+
+# The symbol row payload: kind|is_pub|is_generic — the non-identity fields
+# (name/module_path/signature ride the key text).
+def delta_sym_payload(row: SemanticSymbol) -> String
+  semantic_def_kind_text(&row.kind) + "|" + delta_bool_text(row.is_pub) + "|" +
+    delta_bool_text(row.is_generic)
+end
+
+# ———— Row-map construction (one keyed map per table per snapshot) ————
+
+def delta_table_rows(
+  s: SemanticSnapshot,
+  inout syms: Map[String, String],
+  inout calls: Map[String, String],
+  inout effects: Map[String, String],
+  inout caps: Map[String, String],
+  inout ownership: Map[String, String],
+  inout contracts: Map[String, String],
+  inout mirs: Map[String, String]
+) -> Unit
+  for row in s.symbols do
+    syms.insert(row.stable_id.key.clone(), delta_sym_payload(&row))
+  end
+  for c in s.calls do
+    calls.insert(delta_call_row_key(c), "".to_string())
+  end
+  for e in s.effects do
+    effects.insert(e.function.key.clone(), delta_summary_text(&e.summary))
+  end
+  for ce in s.capabilities do
+    caps.insert(delta_capability_row_key(ce), "".to_string())
+  end
+  for o in s.ownership do
+    ownership.insert(delta_ownership_row_key(o), "".to_string())
+  end
+  for ct in s.contracts do
+    contracts.insert(delta_contract_row_key(ct), "".to_string())
+  end
+  for m in s.mir_functions do
+    mirs.insert(m.function.key.clone(), delta_mir_row_payload(m))
+  end
+  ()
+end
+
+def delta_map_text(m: Map[String, String], key: String) -> String
+  match m.get(key.clone())
+  when Option::Some(v) then v.clone()
+  when Option::None then "".to_string()
+  end
+end
+
+# The sorted deduped key union of two maps.
+def delta_union_keys(a: Map[String, String], b: Map[String, String]) -> Vec[String]
+  var keys: Vec[String] = Vec::new()
+  for entry in a.entries() do
+    keys.push(entry.0.clone())
+  end
+  for entry in b.entries() do
+    keys.push(entry.0.clone())
+  end
+  keys.sort_by(|x, y| x < y)
+  var out: Vec[String] = Vec::new()
+  var i = 0
+  while i < keys.len() do
+    let key = keys[i].clone()
+    if !(i > 0 && key == keys[i - 1]) then
+      out.push(key)
+    end
+    i = i + 1
+  end
+  out
+end
+
+# The sorted suffix texts of every row keyed under "<key>|" — the per-function
+# domain multiset projection (caps / ownership / contracts).
+def delta_key_rows_text(rows: Map[String, String], key: String) -> String
+  var parts: Vec[String] = Vec::new()
+  for entry in rows.entries() do
+    let rk = entry.0.clone()
+    if rk.starts_with(key.clone() + "|") then
+      parts.push(rk.slice(key.len() + 1, rk.len()))
+    end
+  end
+  parts.sort_by(|x, y| x < y)
+  parts.join("\n")
+end
+
+# ———— The generic row diff — sorted (key, current-side payload, kind) triples ————
+# Same key + identical payload = unchanged; same key + different payload =
+# Modified; key only in b = Created; only in a = Removed. The payload is the
+# b-side text for Created/Modified rows and the a-side text for Removed rows.
+
+def delta_pair_diff(a: Map[String, String], b: Map[String, String]) -> Vec[(String, String, DeltaKind)]
+  var out: Vec[(String, String, DeltaKind)] = Vec::new()
+  for key in delta_union_keys(a, b) do
+    let has_a = a.contains_key(&key)
+    let has_b = b.contains_key(&key)
+    let ta = delta_map_text(a, key)
+    let tb = delta_map_text(b, key)
+    if has_a && has_b then
+      if ta != tb then
+        out.push((key.clone(), tb, DeltaKind::Modified))
+      end
+    elsif has_b then
+      out.push((key.clone(), tb, DeltaKind::Created))
+    else
+      out.push((key.clone(), ta, DeltaKind::Removed))
+    end
+  end
+  out
+end
+
+# The sorted symmetric difference of two text lists.
+def delta_lines_diff(a: Vec[String], b: Vec[String]) -> Vec[String]
+  var out: Vec[String] = Vec::new()
+  for l in a do
+    if !b.contains(&l) then
+      out.push(l.clone())
+    end
+  end
+  for l in b do
+    if !a.contains(&l) then
+      out.push(l.clone())
+    end
+  end
+  out.sort_by(|x, y| x < y)
+  out
+end
+
+# The relationship-row emitters: triples -> delta records. parse_parts splits
+# the row key for from/to (call/capability rows); effect rows carry the
+# payload text as `to` instead.
+def delta_edge_rows(triples: Vec[(String, String, DeltaKind)], parse_parts: Bool) -> Vec[EdgeDelta]
+  var out: Vec[EdgeDelta] = Vec::new()
+  for t in triples do
+    if parse_parts then
+      let parts = delta_key_parts(t.0)
+      out.push(EdgeDelta { key: t.0.clone(), kind: t.2, from: parts.0.clone(), to: parts.1.clone() })
+    else
+      out.push(EdgeDelta { key: t.0.clone(), kind: t.2, from: t.0.clone(), to: t.1.clone() })
+    end
+  end
+  out
+end
+
+def delta_ownership_rows(triples: Vec[(String, String, DeltaKind)]) -> Vec[OwnershipDelta]
+  var out: Vec[OwnershipDelta] = Vec::new()
+  for t in triples do
+    let parts = delta_key_parts(t.0)
+    out.push(OwnershipDelta { key: parts.0.clone(), kind: t.2, place: parts.1.clone(), convention: parts.2.clone() })
+  end
+  out
+end
+
+def delta_contract_rows(triples: Vec[(String, String, DeltaKind)]) -> Vec[ContractDelta]
+  var out: Vec[ContractDelta] = Vec::new()
+  for t in triples do
+    let parts = delta_key_parts(t.0)
+    out.push(ContractDelta { key: parts.0.clone(), kind: t.2, clause: parts.1.clone() + " " + parts.2.clone() })
+  end
+  out
+end
+
+# ———————————————————————————————————————————————————————————————
+# The retarget pairing — removed/created keys sharing a name-part AND DefKind
+# text describe ONE def whose signature changed; pair only unambiguous cases.
+# ———————————————————————————————————————————————————————————————
+
+def delta_sym_pairs(
+  created: Vec[String],
+  removed: Vec[String],
+  a_syms: Map[String, String],
+  b_syms: Map[String, String]
+) -> Vec[(String, String)]
+  var rem_np: Map[String, String] = Map::new()
+  var rem_multi: Map[String, Bool] = Map::new()
+  for k in removed do
+    let np = delta_key_name_part(k)
+    if rem_np.contains_key(&np) then
+      rem_multi.insert(np, true)
+    else
+      rem_np.insert(np.clone(), k.clone())
+    end
+  end
+  var cre_np: Map[String, String] = Map::new()
+  var cre_multi: Map[String, Bool] = Map::new()
+  for k in created do
+    let np = delta_key_name_part(k)
+    if cre_np.contains_key(&np) then
+      cre_multi.insert(np, true)
+    else
+      cre_np.insert(np.clone(), k.clone())
+    end
+  end
+  var pairs: Vec[(String, String)] = Vec::new()
+  for k in created do
+    let np = delta_key_name_part(k)
+    if cre_multi.contains_key(&np) || rem_multi.contains_key(&np) then
+      ()
+    else
+      match rem_np.get(np.clone())
+      when Option::Some(old) then
+        let kind_a = delta_key_parts(delta_map_text(&a_syms, old))
+        let kind_b = delta_key_parts(delta_map_text(&b_syms, k))
+        if kind_a.0 == kind_b.0 && kind_a.0.len() > 0 then
+          pairs.push((old.clone(), k.clone()))
+        end
+      when Option::None then ()
+      end
+    end
+  end
+  pairs
+end
+
+def delta_pairs_has(pairs: Vec[(String, String)], key: String, old_side: Bool) -> Bool
+  for p in pairs do
+    if (if old_side then p.0 == key else p.1 == key end) then
+      return true
+    end
+  end
+  false
+end
+
+# ———— Per-entity flag derivations (the domain slices) ————
+
+# mir / effect rows are keyed by the function's stable key exactly.
+def delta_entity_map_changed(
+  a_map: Map[String, String],
+  b_map: Map[String, String],
+  a_key: String,
+  b_key: String
+) -> Bool
+  delta_map_text(&a_map, a_key) != delta_map_text(&b_map, b_key)
+end
+
+# The domain-row multiset projection (caps / ownership / contracts).
+def delta_entity_rows_changed(
+  a_rows: Map[String, String],
+  b_rows: Map[String, String],
+  a_key: String,
+  b_key: String
+) -> Bool
+  delta_key_rows_text(&a_rows, a_key) != delta_key_rows_text(&b_rows, b_key)
+end
+
+# The ABI-row slice: Function kind both sides, pub on either side, and the
+# (pub, generic, mir-row presence) slice or the signature changed.
+def delta_entity_abi_changed(
+  a_syms: Map[String, String],
+  b_syms: Map[String, String],
+  a_mirs: Map[String, String],
+  b_mirs: Map[String, String],
+  a_key: String,
+  b_key: String,
+  signature_changed: Bool
+) -> Bool
+  let pa = delta_key_parts(delta_map_text(&a_syms, a_key))
+  let pb = delta_key_parts(delta_map_text(&b_syms, b_key))
+  if pa.0 != "Function" || pb.0 != "Function" then
+    return false
+  end
+  if pa.1 != "true" && pb.1 != "true" then
+    return false
+  end
+  if signature_changed then
+    return true
+  end
+  var slice_a = pa.1.clone() + "|" + pa.2.clone() + "|" + delta_bool_text(a_mirs.contains_key(&a_key))
+  var slice_b = pb.1.clone() + "|" + pb.2.clone() + "|" + delta_bool_text(b_mirs.contains_key(&b_key))
+  slice_a != slice_b
+end
+
+# ———— The public-api / abi surface rows (hash-domain reconstructions) ————
+# api rows mirror the snapshot writer's public_api rows ("digest kind key" /
+# "digest type key" over pub symbol+type rows). abi rows: the snapshot lacks
+# the mono-classifier ABI row text, so the abi rows are the pub-Function keys.
+
+def delta_public_api_rows(s: SemanticSnapshot) -> Vec[String]
+  var lines: Vec[String] = Vec::new()
+  for row in s.symbols do
+    if row.is_pub then
+      lines.push(semantic_digest_render(&semantic_stable_def_id_digest(&row.stable_id)) + " " +
+        semantic_def_kind_text(&row.kind) + " " + row.stable_id.key.clone())
+    end
+  end
+  for trow in s.types do
+    if trow.is_pub then
+      lines.push(semantic_digest_render(&semantic_stable_def_id_digest(&trow.stable_id)) + " " +
+        "type " + trow.stable_id.key.clone())
+    end
+  end
+  lines.sort_by(|x, y| x < y)
+  lines
+end
+
+def delta_abi_keys(s: SemanticSnapshot) -> Vec[String]
+  var keys: Vec[String] = Vec::new()
+  for row in s.symbols do
+    if row.is_pub && semantic_def_kind_text(&row.kind) == "Function" then
+      keys.push(row.stable_id.key.clone())
+    end
+  end
+  keys.sort_by(|x, y| x < y)
+  keys
+end
+
+# ———— THE DIFF CORE ————
+
+pub def semantic_delta_of(a: SemanticSnapshot, b: SemanticSnapshot) -> SemanticDelta
+  var result = semantic_delta_empty()
+
+  # 1. The per-table keyed row maps of both snapshots.
+  var a_syms: Map[String, String] = Map::new()
+  var a_calls: Map[String, String] = Map::new()
+  var a_effects: Map[String, String] = Map::new()
+  var a_caps: Map[String, String] = Map::new()
+  var a_ownership: Map[String, String] = Map::new()
+  var a_contracts: Map[String, String] = Map::new()
+  var a_mirs: Map[String, String] = Map::new()
+  delta_table_rows(&a, &mut a_syms, &mut a_calls, &mut a_effects, &mut a_caps,
+    &mut a_ownership, &mut a_contracts, &mut a_mirs)
+  var b_syms: Map[String, String] = Map::new()
+  var b_calls: Map[String, String] = Map::new()
+  var b_effects: Map[String, String] = Map::new()
+  var b_caps: Map[String, String] = Map::new()
+  var b_ownership: Map[String, String] = Map::new()
+  var b_contracts: Map[String, String] = Map::new()
+  var b_mirs: Map[String, String] = Map::new()
+  delta_table_rows(&b, &mut b_syms, &mut b_calls, &mut b_effects, &mut b_caps,
+    &mut b_ownership, &mut b_contracts, &mut b_mirs)
+
+  # 2. The entity classification (symbols): raw created / removed / common.
+  var raw_created: Vec[String] = Vec::new()
+  var raw_removed: Vec[String] = Vec::new()
+  var common: Vec[String] = Vec::new()
+  for key in delta_union_keys(&a_syms, &b_syms) do
+    if a_syms.contains_key(&key) && b_syms.contains_key(&key) then
+      common.push(key.clone())
+    elsif a_syms.contains_key(&key) then
+      raw_removed.push(key.clone())
+    else
+      raw_created.push(key.clone())
+    end
+  end
+
+  # 3. Retarget pairing (signature_changed) — see the module doc. A pair
+  #    reports as one Modified entity; the rest stay created/removed.
+  let pairs = delta_sym_pairs(&raw_created, &raw_removed, &a_syms, &b_syms)
+  var created: Vec[String] = Vec::new()
+  for key in raw_created do
+    if !delta_pairs_has(&pairs, key, false) then
+      created.push(key.clone())
+    end
+  end
+  var removed: Vec[String] = Vec::new()
+  for key in raw_removed do
+    if !delta_pairs_has(&pairs, key, true) then
+      removed.push(key.clone())
+    end
+  end
+
+  # 4. The modified entities.
+  var modified: Vec[EntityDelta] = Vec::new()
+  for key in common do
+    let payload_changed = delta_map_text(&a_syms, key) != delta_map_text(&b_syms, key)
+    let mir_changed = delta_entity_map_changed(&a_mirs, &b_mirs, key, key)
+    let effects_changed = delta_entity_map_changed(&a_effects, &b_effects, key, key)
+    let caps_changed = delta_entity_rows_changed(&a_caps, &b_caps, key, key)
+    let ownership_changed = delta_entity_rows_changed(&a_ownership, &b_ownership, key, key)
+    let contracts_changed = delta_entity_rows_changed(&a_contracts, &b_contracts, key, key)
+    let abi_changed = delta_entity_abi_changed(&a_syms, &b_syms, &a_mirs, &b_mirs,
+      key, key, false)
+    if payload_changed || mir_changed || effects_changed || caps_changed ||
+      ownership_changed || contracts_changed || abi_changed then
+      modified.push(EntityDelta {
+        stable_id: key.clone(),
+        signature_changed: false,
+        mir_changed: mir_changed,
+        effects_changed: effects_changed,
+        capabilities_changed: caps_changed,
+        ownership_changed: ownership_changed,
+        contracts_changed: contracts_changed,
+        abi_changed: abi_changed,
+        kind: DeltaKind::Modified
+      })
+    end
+  end
+  for p in pairs do
+    modified.push(EntityDelta {
+      stable_id: p.1.clone(),
+      signature_changed: true,
+      mir_changed: delta_entity_map_changed(&a_mirs, &b_mirs, p.0, p.1),
+      effects_changed: delta_entity_map_changed(&a_effects, &b_effects, p.0, p.1),
+      capabilities_changed: delta_entity_rows_changed(&a_caps, &b_caps, p.0, p.1),
+      ownership_changed: delta_entity_rows_changed(&a_ownership, &b_ownership, p.0, p.1),
+      contracts_changed: delta_entity_rows_changed(&a_contracts, &b_contracts, p.0, p.1),
+      abi_changed: delta_entity_abi_changed(&a_syms, &b_syms, &a_mirs, &b_mirs,
+        p.0, p.1, true),
+      kind: DeltaKind::Modified
+    })
+  end
+  modified.sort_by(|x, y| x.stable_id < y.stable_id)
+
+  # 5. The row-level diffs of the relationship tables.
+  let call_rows = delta_edge_rows(delta_pair_diff(&a_calls, &b_calls), true)
+  let effect_rows = delta_edge_rows(delta_pair_diff(&a_effects, &b_effects), false)
+  let capability_rows = delta_edge_rows(delta_pair_diff(&a_caps, &b_caps), true)
+  let ownership_rows = delta_ownership_rows(delta_pair_diff(&a_ownership, &b_ownership))
+  let contract_rows = delta_contract_rows(delta_pair_diff(&a_contracts, &b_contracts))
+
+  # 6. The public-api / abi surface deltas.
+  var api_changed = !delta_digest_eq(&a.public_api_hash, &b.public_api_hash)
+  var api_rows: Vec[String] = Vec::new()
+  if api_changed then
+    api_rows = delta_lines_diff(&delta_public_api_rows(&a), &delta_public_api_rows(&b))
+  end
+  var abi_changed = !delta_digest_eq(&a.abi_hash, &b.abi_hash)
+  var abi_rows: Vec[String] = Vec::new()
+  if abi_changed then
+    abi_rows = delta_lines_diff(&delta_abi_keys(&a), &delta_abi_keys(&b))
+  end
+
+  # 7. The affected closure over b's call rows (callers of affected callees;
+  #    fixed point capped at the b call-table size).
+  var in_aff: Map[String, Bool] = Map::new()
+  var affected: Vec[String] = Vec::new()
+  for key in created do
+    if !in_aff.contains_key(&key) then
+      in_aff.insert(key.clone(), true)
+      affected.push(key.clone())
+    end
+  end
+  for key in removed do
+    if !in_aff.contains_key(&key) then
+      in_aff.insert(key.clone(), true)
+      affected.push(key.clone())
+    end
+  end
+  for entry in modified do
+    if !in_aff.contains_key(&entry.stable_id) then
+      in_aff.insert(entry.stable_id.clone(), true)
+      affected.push(entry.stable_id.clone())
+    end
+  end
+  var grew = true
+  var rounds = 0
+  while grew && rounds < b.calls.len() do
+    grew = false
+    for c in b.calls do
+      if in_aff.contains_key(&c.callee.key) then
+        if !in_aff.contains_key(&c.caller.key) then
+          in_aff.insert(c.caller.key.clone(), true)
+          affected.push(c.caller.key.clone())
+          grew = true
+        end
+      end
+    end
+    rounds = rounds + 1
+  end
+  affected.sort_by(|x, y| x < y)
+
+  result.created = created
+  result.removed = removed
+  result.modified = modified
+  result.call_delta = call_rows
+  result.effect_delta = effect_rows
+  result.capability_delta = capability_rows
+  result.ownership_delta = ownership_rows
+  result.contract_delta = contract_rows
+  result.public_api_delta = ApiDelta {
+    public_api_changed: api_changed,
+    public_api_rows: api_rows
+  }
+  result.abi_delta = AbiDelta {
+    abi_changed: abi_changed,
+    abi_rows: abi_rows
+  }
+  result.affected = affected
+  result
+end
+
+# ———— The canonical delta text + the content-addressed delta digest ————
+# The canonical text form mirrors the snapshot style: line-oriented JSON
+# records; every line sorted (the delta emitter already sorts each section;
+# the serializer re-sorts the whole row set — the digest is a pure function
+# of the delta's content).
+
+def delta_json_key_line(tag: String, key: String) -> String
+  "{\"s\":\"" + tag + "\",\"key\":\"" + semantic_json_escape(&key) + "\"}"
+end
+
+def delta_entity_line(e: EntityDelta) -> String
+  "{\"s\":\"modified\",\"key\":\"" + semantic_json_escape(&e.stable_id) + "\"," +
+    "\"sig\":" + delta_bool_text(e.signature_changed) + "," +
+    "\"mir\":" + delta_bool_text(e.mir_changed) + "," +
+    "\"effects\":" + delta_bool_text(e.effects_changed) + "," +
+    "\"caps\":" + delta_bool_text(e.capabilities_changed) + "," +
+    "\"ownership\":" + delta_bool_text(e.ownership_changed) + "," +
+    "\"contracts\":" + delta_bool_text(e.contracts_changed) + "," +
+    "\"abi\":" + delta_bool_text(e.abi_changed) + "}"
+end
+
+def delta_edge_line(tag: String, e: EdgeDelta) -> String
+  "{\"s\":\"" + tag + "\",\"key\":\"" + semantic_json_escape(&e.key) + "\"," +
+    "\"kind\":\"" + delta_kind_text(&e.kind) + "\"," +
+    "\"from\":\"" + semantic_json_escape(&e.from) + "\"," +
+    "\"to\":\"" + semantic_json_escape(&e.to) + "\"}"
+end
+
+def delta_ownership_line(o: OwnershipDelta) -> String
+  "{\"s\":\"ownership\",\"key\":\"" + semantic_json_escape(&o.key) + "\"," +
+    "\"kind\":\"" + delta_kind_text(&o.kind) + "\"," +
+    "\"place\":\"" + semantic_json_escape(&o.place) + "\"," +
+    "\"convention\":\"" + semantic_json_escape(&o.convention) + "\"}"
+end
+
+def delta_contract_line(c: ContractDelta) -> String
+  "{\"s\":\"contract\",\"key\":\"" + semantic_json_escape(&c.key) + "\"," +
+    "\"kind\":\"" + delta_kind_text(&c.kind) + "\"," +
+    "\"clause\":\"" + semantic_json_escape(&c.clause) + "\"}"
+end
+
+def delta_api_line(d: SemanticDelta, abi: Bool) -> String
+  if abi then
+    "{\"s\":\"abi\",\"changed\":" + delta_bool_text(d.abi_delta.abi_changed) + "}"
+  else
+    "{\"s\":\"api\",\"changed\":" + delta_bool_text(d.public_api_delta.public_api_changed) + "}"
+  end
+end
+
+# The canonical text form of a delta (sorted, line per record).
+def semantic_delta_digest_text(d: SemanticDelta) -> String
+  var lines: Vec[String] = Vec::new()
+  lines.push("{\"s\":\"header\",\"format\":\"tg-semantic-delta/v1\"}")
+  for key in d.created do
+    lines.push(delta_json_key_line("created", key))
+  end
+  for key in d.removed do
+    lines.push(delta_json_key_line("removed", key))
+  end
+  for e in d.modified do
+    lines.push(delta_entity_line(&e))
+  end
+  for e in d.call_delta do
+    lines.push(delta_edge_line("call", e))
+  end
+  for e in d.effect_delta do
+    lines.push(delta_edge_line("effect", e))
+  end
+  for e in d.capability_delta do
+    lines.push(delta_edge_line("capability", e))
+  end
+  for o in d.ownership_delta do
+    lines.push(delta_ownership_line(&o))
+  end
+  for c in d.contract_delta do
+    lines.push(delta_contract_line(&c))
+  end
+  lines.push(delta_api_line(&d, false))
+  for row in d.public_api_delta.public_api_rows do
+    lines.push("{\"s\":\"api\",\"row\":\"" + semantic_json_escape(&row) + "\"}")
+  end
+  lines.push(delta_api_line(&d, true))
+  for row in d.abi_delta.abi_rows do
+    lines.push("{\"s\":\"abi\",\"row\":\"" + semantic_json_escape(&row) + "\"}")
+  end
+  for key in d.affected do
+    lines.push(delta_json_key_line("affected", key))
+  end
+  lines.sort_by(|x, y| x < y)
+  var text = ""
+  for l in lines do
+    text = text + l + "\n"
+  end
+  text
+end
+
+# The content-addressed digest of a delta (mirror the snapshot digest: the
+# stable digest of the canonical sorted text form).
+def semantic_delta_digest(d: SemanticDelta) -> StableDigest
+  stable_digest_of(&semantic_delta_digest_text(&d))
+end

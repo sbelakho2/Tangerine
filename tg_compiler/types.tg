@@ -30,7 +30,7 @@ use tg_compiler::ast::{
   Program, Item, ItemKind, FunctionDecl, StructDecl, EnumDecl, TraitDecl, ImplDecl,
   UseDecl, AstPath, ExternItem, NominalKind, AccessConvention,
   Attribute,
-  TypeExpr, TypeExprKind, Param, GenericParam,
+  TypeExpr, TypeExprKind, Param, GenericParam, GenericParamKind,
   Block, Stmt, StmtKind, Expr, ExprKind, Pattern, PatternKind,
   BudgetAnnotation, BudgetConstraint, LayoutAttrs, layout_attrs_plain,
   expr_is_place_like
@@ -156,6 +156,61 @@ use tg_compiler::resource_check::{AnalyzedProgram, TypedCFG, analysis_context_ne
 # the mode is recorded state (MirFunction.fp_fast -> codegen
 # ctx.current_fp_fast), never silently applied math.
 
+# (§20 const generics, slice 2 — symbolic const-EXPRESSION type argument):
+# the SYMBOLIC arithmetic tree of a const-generic type-ARGUMENT expression
+# that combines IN-SCOPE const generic parameters (`Decimal128[SCALE + S2]`,
+# `Pair[A + B]`, `[T; N]`-style `2 * N + 1` — the TypeExprKind::ConstExpr
+# forms the parser preserves when the expression cannot fold to a module
+# constant). The tree is a CHECKER-ONLY type-argument form, used ONLY in
+# const-slot positions of generic signatures (generic-arg vectors, never a
+# value/field/param/local type position): its leaves are the literal
+# ConstLit(Int) (literals AND module consts — a module const is a concrete
+# value at resolve time) and ConstParamRef(GenericParamId) (an in-scope
+# const generic parameter — the (owner, index) identity, the SAME identity
+# Type::ConstParam carries); the interior nodes are the const arithmetic
+# operators of the [T; N] size grammar (Add/Sub/Mul/Div/Mod and unary Neg).
+#
+# Lifecycle:
+#   - resolve_type_expr builds a ConstSym tree when the const-ARGUMENT
+#     expression is not fully concrete (eval_const_arg_expr returned None)
+#     but every name resolves — an identifier in scope is a const
+#     parameter leaf, an identifier naming a module const folds to a
+#     literal leaf (module consts are values, so the tree keeps only
+#     parameters symbolic);
+#   - substitution folds the tree the moment every leaf is bound:
+#     subst_type_args (method instantiation), subst_type_const_map (the
+#     call-site const presolve) and mono's substitute_type each substitute
+#     the leaves and reduce a fully-literal tree to the canonical
+#     Type::Const(v) — SAME-instantiation spellings that fold to one value
+#     (`A + B` vs `B + A` after A/B := 4/2) then produce the IDENTICAL
+#     Const(6), so instance identity stays VALUE-based after binding;
+#   - a tree that survives substitution with parameter leaves is a
+#     forwarded symbolic form (an outer declaration's parameters), exactly
+#     like a residual ConstParam, and is flagged by the codegenability /
+#     post-instantiation scans.
+#
+# Identity while SYMBOLIC is ORDER-SENSITIVE STRUCTURAL equality (the tree
+# is never canonicalized/re-associated): `SCALE + S2` and `S2 + SCALE` are
+# DIFFERENT ConstSym trees until the parameters bind — canonical identity
+# is about VALUES, and the tree carries no value before binding. Unification
+# therefore compares trees exactly; two spellings can only become equal
+# after substitution folds them to the same Const. Range checks against the
+# const parameter's declared scalar type are DEFERRED to fold time — a
+# symbolic tree can never be range-checked before its leaves bind, and a
+# bound tree folds to Const BEFORE any instantiation-site validation sees
+# it (the range validation accepts ConstSym in const slots like ConstParam
+# and validates the folded Const at the outer instantiation).
+enum ConstExprT
+  ConstLit(Int)
+  ConstParamRef(GenericParamId)
+  ConstAdd(ConstExprT, ConstExprT)
+  ConstSub(ConstExprT, ConstExprT)
+  ConstMul(ConstExprT, ConstExprT)
+  ConstDiv(ConstExprT, ConstExprT)
+  ConstMod(ConstExprT, ConstExprT)
+  ConstNeg(ConstExprT)
+end
+
 enum Type
   # Primitive types
   Unit
@@ -244,10 +299,14 @@ enum Type
   # (subst_type_args) replaces it with a concrete Type::FixedArray when the
   # const parameter's argument is Type::Const(v), and with another
   # FixedArraySym when the argument is itself a const parameter of the
-  # enclosing scope. The layout engine must never see it (mono substitutes
-  # const-generic bodies before layout — slice 2 wires that; until then the
-  # layout query fails closed through the explicit Repr::Invalid guard and
-  # the codegenability scans flag it like a residual Type::Param).
+  # enclosing scope. The layout engine must never see it (slice 2 wires the
+  # instantiation end to end: instantiation-site argument validation, the
+  # const-parameter presolve at generic call sites and the mono
+  # substitution of const-generic bodies all convert the symbolic form to
+  # Type::FixedArray before a concrete body reaches the layout engine; the
+  # layout query still fails closed through the explicit Repr::Invalid
+  # guard and the codegenability scans flag it like a residual Type::Param
+  # if a symbolic form ever survives into a concrete function).
   FixedArraySym(Type, GenericParamId)
   
  # (FnPtr/Closure split): a FUNCTION POINTER — the signature (the
@@ -315,11 +374,15 @@ enum Type
   # type parameters AND its const parameters, each const position holding a
   # Type::Const — so the existing substitution/instantiation machinery
   # needs no GenericArg widening. Canonical identity is the VALUE:
-  # Const(4) == Const(4), Const(4) != Const(8) (folding of const
-  # EXPRESSIONS such as 2+2 into 4 is slice 2; until then a const argument
-  # is a literal only). Const is NOT a value type: it never appears in a
-  # field/param/local type position (layout guards it Invalid); it exists
-  # in generic-arg vectors, canonical keys and mono substitution lists.
+  # Const(4) == Const(4), Const(4) != Const(8) — and the VALUE is
+  # canonical across SPELLINGS (slice 2): a const EXPRESSION argument
+  # (`2 + 2`, `LIMIT * 2` — TypeExprKind::ConstExpr folded by
+  # eval_const_arg_expr), a MODULE CONST reference (`MY_SIZE` — the
+  # bare-name type-argument fallback through env.const_values) and the
+  # literal `4` all produce the SAME Type::Const(4). Const is NOT a value
+  # type: it never appears in a field/param/local type position (layout
+  # guards it Invalid); it exists in generic-arg vectors, canonical keys
+  # and mono substitution lists.
   Const(Int)
   
   # (§20 const generics, slice 1): the SYMBOLIC reference to a const generic
@@ -328,12 +391,40 @@ enum Type
   # const parameter (`impl[T, const N: UInt] Trait for ArrayVec[T, N]`
   # resolves the self-type's second argument to ConstParam(N)). Identity is
   # the GenericParamId ((owner, index) — ConstParam(a) alpha-equals
-  # ConstParam(b) exactly when a == b). Value-level references to a const
-  # parameter (arithmetic, `return N`) have no codegen while generic and
-  # are rejected where a concrete value is required (codegenability scans
-  # flag ConstParam like a residual Type::Param).
+  # ConstParam(b) exactly when a == b). Substitution maps a ConstParam to
+  # its positionally-aligned argument (subst_type_args — slice 2) so
+  # instantiated signatures carry the parameter's solved Const value.
+  # Value-level references to a const parameter (arithmetic, `return N`)
+  # have no codegen while generic (the MIR lowers every generic body once,
+  # before monomorphization) and are REJECTED AT THE CHECKER with the
+  # explicit rule (slice 2 — check_expr's ExprIdent arm reports "cannot be
+  # used as a runtime value"); type positions ([T; N] sizes, const
+  # argument slots) keep resolving through this form, and the codegenability
+  # scans still flag a residual ConstParam like a residual Type::Param.
   ConstParam(GenericParamId)
-  
+
+  # (§20 const generics, slice 2): the SYMBOLIC CONST-EXPRESSION type
+  # argument — a const-slot argument (a generic-signature argument position
+  # of `Decimal128[SCALE + S2]`, `Pair[A + B]`) whose expression ARITHMETICALLY
+  # COMBINES in-scope const generic parameters instead of naming one
+  # directly. The ConstExprT tree's parameter leaves are the SAME
+  # GenericParamId identities Type::ConstParam carries (substitution matches
+  # leaves by id); its literal leaves are the folded module-const / literal
+  # values. ConstSym is the type-level twin of the value-level const-param
+  # reads: a TYPE-ARGUMENT position has no expression node id, so the
+  # per-instance value cannot ride the MirConstParamValue records — the tree
+  # itself is substituted and folded (to the canonical Type::Const(v)) by
+  # subst_type_args / subst_type_const_map / mono's substitute_type the
+  # moment every leaf binds; a tree with unbound leaves survives as a
+  # forwarded symbolic form (mirroring ConstParam forwarding) and is flagged
+  # by the same codegenability scans. ConstSym is NOT a value type: it never
+  # appears in a field/param/local type position (layout guards it Invalid,
+  # like Const/ConstParam), and its identity is ORDER-SENSITIVE structural
+  # equality until folding (see the ConstExprT note — canonical identity is
+  # the folded VALUE, so after binding `SCALE + S2` at SCALE=10, S2=2 is
+  # Const(12) whatever the spelling).
+  ConstSym(ConstExprT)
+
   # Error type (for error recovery)
   Error
 end
@@ -364,15 +455,17 @@ end
 struct FnSignature
   params: Vec[ParamType]
   ret_type: Type
-  # (audit P1-13 — C variadic externs, implemented): TRUE only for the
-  # signature of an EXTERN function declared with the trailing C
+  # (audit P1-13/§26 — C variadic externs, implemented): TRUE only for
+  # the signature of an EXTERN function declared with the trailing C
   # variadic marker (`extern def f(fixed..., ...)`; the extern block
   # parser records ExternFn.variadic). `params` then holds the FIXED
   # prefix only, and a DIRECT call to the extern may supply any number
-  # of EXTRA arguments (the checker's vararg subset rule types them —
-  # <= 64-bit integers, Bool/Char, raw pointers; floats/strings/
-  # aggregates rejected). The MIR pre-pass carries the flag onto the
-  # extern's MirFunction (is_extern_variadic) for the direct emitters.
+  # of EXTRA arguments — the checker's vararg subset rule admits them
+  # by their C default argument promotion (vararg_extra_promoted_type:
+  # F32 -> F64, the small integers/Bool/Char -> the int width, the
+  # wider integers/pointers/doubles unchanged; strings/aggregates
+  # rejected). The MIR pre-pass carries the flag onto the extern's
+  # MirFunction (is_extern_variadic) for the direct emitters.
   # Function/method signatures never set it (the ellipsis parses only
   # in extern declarations). Default false keeps every existing
   # record-building site unchanged.
@@ -893,7 +986,7 @@ def effect_perform_callee_path(func: Expr) -> Bool
   match func.kind
   when ExprKind::ExprPath(p) then
     p.segments.len() == 3 && p.segments[0] == "std" && p.segments[1] == "effects" && p.segments[2] == "perform"
-  when ExprKind::ExprEnumVariant(p, _) then
+  when ExprKind::ExprEnumVariant(p, _, _) then
     # The 3-segment module-qualified call path parses as ExprEnumVariant
     # ("std::effects::perform(...)") — the checker recognizes the SAME
     # surface shape in both the ExprCall and ExprEnumVariant arms.
@@ -2054,13 +2147,49 @@ struct TypeEnv
   # (StrView/UniquePtr/ArcStrong/WeakRc/WeakArc) resolve their ids; the
   # rebuilt table is serialized into TypedProgram.lang_items.
   lang_items: LangItems
- # (FixedArray const sizes): module-qualified const key -> the
+  # (FixedArray const sizes): module-qualified const key -> the
   # EVALUATED integer value of an Int-typed `const` declaration. Collected
   # by the pass-2.5 const-value pass (type_check_program_env) and consumed
   # by the [T; N] annotation's size evaluator (eval_const_size_expr) so a
   # const reference (and constant arithmetic over consts/literals) resolves
   # to its value before FixedArray(Type, N) identity forms.
   const_values: Map[String, Int]
+
+  # (§20 const generics, slice 2): numeric GenericParamId -> the DECLARED
+  # scalar type of a const generic parameter (the `UInt` of
+  # `struct Foo[T, const N: UInt]`). Recorded by bind_generic_params
+  # whenever a declaration's generic parameters enter scope (the same
+  # registration points that bind the parameter NAMES), so the recorded id
+  # vector of any declaration (TypeDef.generic_params, the fn/impl
+  # signature walks) can be classified positionally at instantiation sites:
+  # an id present here is a CONST parameter with this declared type, an id
+  # absent here is a TYPE parameter. Consulted by the instantiation-site
+  # argument-kind/range validation (a type argument in a const slot and a
+  # constant out of the declared scalar range are diagnostics) and by the
+  # call-site const-parameter inference guards.
+  const_param_decl_types: Map[Int, Type] = Map::new()
+
+  # (§20 const generics, slice 3): expr node id -> the numeric
+  # GenericParamId of an IN-SCOPE const generic parameter read as a
+  # RUNTIME VALUE (the `N` of `def capacity(self) -> UInt = N` inside the
+  # declaring item's body). The checker types the read as the parameter's
+  # DECLARED scalar type (const_param_decl_types) and records the identity
+  # here; the MIR lowering resolves the record to the SYMBOLIC
+  # MirConstParamValue constant (the generic body lowers once), which
+  # monomorphization substitutes per instance.
+  const_param_reads: Map[Int, Int] = Map::new()
+
+  # (§20 const generics, slice 3): the LOWERING-UNIT const-parameter
+  # scope — a stack of numeric GenericParamIds, ONE frame per item whose
+  # BODY is being checked (a function body: the function's ids; an impl
+  # method body: the MERGED impl-level + method-level ids — the same
+  # merged list recorded under the method's owner key for the MIR; a
+  # closure body: an EMPTY frame — a closure lowers as its own non-generic
+  # function, so an enclosing item's const parameter is OUT of scope
+  # inside it). A value read of a const parameter (check_expr's ExprIdent
+  # arm) is substitutable per instance exactly when its id sits in the
+  # TOP frame.
+  unit_const_param_scopes: Vec[Vec[Int]] = Vec::new()
 
  # indices into env.impls whose for_type is a Type::Param — the
   # EXTENSION impls (`impl[T, I: Iterator[T]] I`). They have no receiver
@@ -2123,16 +2252,18 @@ struct TypeEnv
   scoped_access_stack: Vec[ScopedAccessBinding]
   resolutions: Option[ResolvedNames]
   typed_call_targets: Map[Int, DefId]
-  # (audit P1-13 — C variadic externs): def_id_numeric(DefId) of every
-  # extern function DECLARED with the trailing `...` (the C variadic
-  # marker; recorded at pass 3 from the extern block's ExternFn.variadic
-  # through the resolver's module_symbols entry). A DIRECT call whose
-  # typed target (typed_call_targets) is in this set may supply MORE
-  # arguments than the declaration's FIXED prefix — the extras are the
-  # call's varargs, typed by their own types under the vararg subset
-  # rule (vararg_extra_type_allowed). INDIRECT calls never relax: a
-  # variadic extern's FnPtr value keeps the fixed signature (the FnPtr
-  # type carries no ellipsis), so fn-pointer calls stay exact-arity.
+  # (audit P1-13/§26 — C variadic externs): def_id_numeric(DefId) of
+  # every extern function DECLARED with the trailing `...` (the C
+  # variadic marker; recorded at pass 3 from the extern block's
+  # ExternFn.variadic through the resolver's module_symbols entry). A
+  # DIRECT call whose typed target (typed_call_targets) is in this set
+  # may supply MORE arguments than the declaration's FIXED prefix — the
+  # extras are the call's varargs, typed by their own types and
+  # marshalled under their C default argument promotions (the vararg
+  # subset rule of vararg_extra_promoted_type / vararg_extra_type_allowed).
+  # INDIRECT calls never relax: a variadic extern's FnPtr value keeps
+  # the fixed signature (the FnPtr type carries no ellipsis), so
+  # fn-pointer calls stay exact-arity.
   # Default empty keeps every TypeEnv construction site unchanged.
   variadic_extern_dids: Set[Int] = Set::new()
  # (final): call expr node id -> the type checker's SOLVED generic
@@ -2538,6 +2669,27 @@ struct TypeError
   message: String
   span: Span
   code: Option[String]
+  # (audit §34) The derivational payload mirrors the ONE structured
+  # Diagnostic record (parser.tg) field-for-field: the checker's TypeError
+  # records are converted into Diagnostics at the phase boundary
+  # (compiler_core.tg type_error_to_diag), and the derivational fields
+  # ride the conversion so the structured derivation trees survive to the
+  # shared channel. Every field is defaulted — the ~hundreds of existing
+  # TypeError literal sites that fill only message/span/code are
+  # unchanged. See the Diagnostic record's field comments for the
+  # per-field semantics.
+  primary_symbol: Option[String] = Option::None
+  semantic_site: Option[String] = Option::None
+  expected_type: Option[String] = Option::None
+  actual_type: Option[String] = Option::None
+  constraint_trace: Vec[String] = Vec::new()
+  trait_trace: Vec[String] = Vec::new()
+  ownership_trace: Vec[String] = Vec::new()
+  effect_trace: Vec[String] = Vec::new()
+  capability_trace: Vec[String] = Vec::new()
+  related_symbols: Vec[String] = Vec::new()
+  minimal_slice: Vec[String] = Vec::new()
+  repair_candidates: Vec[String] = Vec::new()
 end
 
 # The pending literal-range record: the lossless literal form, the range
@@ -4145,7 +4297,7 @@ def typed_kind_for(inout env: TypeEnv, expr: Expr) -> Option[TypedExprKind]
       end
     when Option::None then missing_typed_hir_child(env, expr)
     end
-  when ExprKind::ExprEnumVariant(path, args) then
+  when ExprKind::ExprEnumVariant(path, _, args) then
     # The operation-call surface: a std::effects::perform(EFFECT.op, ...)
     # call parses as an ExprEnumVariant (the 3-segment module-qualified
     # call path — the same shape the check arm routes through
@@ -4393,6 +4545,11 @@ struct TypedProgram
   handler_captures: Map[Int, Vec[Map[Int, AccessEffect]]] = Map::new()
   local_bindings: Map[Int, LocalBinding]
   ident_resolutions: Map[Int, Int]
+  # (§20 const generics, slice 3): expr node id -> the numeric
+  # GenericParamId of every IN-SCOPE const generic parameter VALUE read
+  # (the checker's record the MIR lowering resolves to the symbolic
+  # MirConstParamValue constant, substituted per instance by mono).
+  const_param_reads: Map[Int, Int]
   # Parameter bindings are keyed by owner (function/method DefId via
   # fn_owner_key) with a positional Vec; pattern bindings are keyed by
   # pattern node id. The two domains never collide.
@@ -5892,19 +6049,65 @@ end
 # type position reports a mismatch downstream); their use as a VALUE is typed
 # ConstParam — codegenable only after instantiation (slice 2), and flagged
 # like a residual Param by the codegenability scans.
+#
+# (§20 const generics, slice 2): the binding ALSO records each const
+# parameter's DECLARED scalar type (env.const_param_decl_types, keyed by the
+# numeric GenericParamId) — the type the instantiation-site argument
+# validation range-checks constant arguments against and the inference
+# guards consult. The scalar type expression is resolved in the current
+# scope (the parser restricted it to the scalar integer types, so the
+# resolution is a primitive-name resolution that cannot fail or recurse).
 def bind_generic_params(inout env: TypeEnv, generic_params: Vec[GenericParam], param_ids: Vec[GenericParamId]) -> Unit
   var i = 0
   while i < generic_params.len() && i < param_ids.len() do
     let gp = generic_params[i]
     match gp.kind
-    when GenericParamKind::ConstParam(_) then
+    when GenericParamKind::ConstParam(ty_expr) then
       bind_var(env, gp.name.clone(), Type::ConstParam(param_ids[i].clone()))
+      env.const_param_decl_types.insert(generic_param_id_numeric(&param_ids[i]), resolve_type_expr(env, &ty_expr))
     when GenericParamKind::TypeParam then
       bind_var(env, gp.name.clone(), Type::Param(param_ids[i].clone()))
     end
     i = i + 1
   end
   ()
+end
+
+# (§20 const generics, slice 3): whether a const generic parameter's
+# VALUE read is in scope of the CURRENT lowering unit — its numeric id
+# appears in the TOP frame of unit_const_param_scopes (each frame holds
+# the merged generic ids of the item whose body is being checked; a
+# closure body's EMPTY top frame puts every enclosing item's parameter
+# out of scope, matching the closure's own non-generic lowering).
+def unit_const_param_in_scope(env: TypeEnv, gpid: GenericParamId) -> Bool
+  var found = false
+  if env.unit_const_param_scopes.len() > 0 then
+    let n = generic_param_id_numeric(&gpid)
+    let top = env.unit_const_param_scopes[env.unit_const_param_scopes.len() - 1]
+    var i = 0
+    while i < top.len() do
+      if top[i] == n then found = true end
+      i = i + 1
+    end
+  end
+  found
+end
+
+# Push one lowering-unit frame (the unit's merged generic parameter ids —
+# const and type ids alike; only the const ids ever match a ConstParam
+# value read).
+def push_unit_const_param_scope(inout env: TypeEnv, ids: Vec[GenericParamId]) -> Unit
+  var nums = Vec::new()
+  for g in ids do
+    nums.push(generic_param_id_numeric(&g))
+  end
+  env.unit_const_param_scopes.push(nums)
+end
+
+def pop_unit_const_param_scope(inout env: TypeEnv) -> Unit
+  if env.unit_const_param_scopes.len() > 0 then
+    env.unit_const_param_scopes.pop()
+  end
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -6190,6 +6393,36 @@ pub def subst_type_args(ty: Type, generic_params: Vec[GenericParamId], type_args
       i = i + 1
     end
     ty.clone()
+  when Type::ConstParam(gpid) then
+    # (§20 slice 2): a SYMBOLIC const parameter reference substitutes like a
+    # type parameter — the positionally-aligned argument is the parameter's
+    # VALUE (Type::Const(v) for a solved instantiation, a fresh inference
+    # variable during head unification — the unifier binds it to the
+    # concrete Const — or a nested ConstParam when forwarding an enclosing
+    # parameter). An id outside the substitution list stays symbolic (the
+    # reference is to an enclosing declaration's parameter).
+    var i = 0
+    while i < generic_params.len() do
+      if generic_param_id_eq(&generic_params[i], &gpid) then
+        return type_args[i].clone()
+      end
+      i = i + 1
+    end
+    ty.clone()
+  when Type::ConstSym(tree) then
+    # (§20 slice 2): a SYMBOLIC CONST-EXPRESSION type argument substitutes
+    # its parameter LEAVES positionally (const_sym_tree_subst_args: an
+    # aligned Type::Const(v) folds the leaf to its literal, a forwarded
+    # Type::ConstParam(g2) re-points the leaf, a nested Type::ConstSym
+    # splices its tree, an unaligned leaf stays symbolic — an enclosing
+    # declaration's parameter) and then FOLDS (const_sym_fold_type): a tree
+    # whose leaves are all bound is canonicalized to the VALUE
+    # Type::Const(v) — the method-instantiation fold (`Decimal128[SCALE +
+    # S2]` under SCALE := Const(10), S2 := Const(2) becomes Decimal128[12],
+    # spelling-independent); a tree with surviving parameter leaves stays
+    # the forwarded symbolic form.
+    let t2 = const_sym_tree_subst_args(&tree, generic_params, type_args)
+    const_sym_fold_type(&t2)
   when Type::Adt(tid, args) then
     var new_args = Vec::new()
     var i = 0
@@ -6391,6 +6624,7 @@ def type_tag(env: TypeEnv, t: Type) -> String
   when Type::Param(gpid) then "Param(" + generic_param_name_of(&env.generic_param_table, &gpid) + ")"
   when Type::Const(v) then "Const(" + v.to_string() + ")"
   when Type::ConstParam(gpid) then "ConstParam(" + generic_param_name_of(&env.generic_param_table, &gpid) + ")"
+  when Type::ConstSym(tree) then "ConstSym(" + const_sym_tree_render_named(env, &tree) + ")"
   when Type::FixedArraySym(elem, gpid) then "FixedArraySym[" + type_tag(env, &elem) + ";" + generic_param_name_of(&env.generic_param_table, &gpid) + "]"
   when Type::Error then "Error"
   end  end
@@ -6429,47 +6663,73 @@ def is_integer_type(ty: Type) -> Bool
   end  end
 end
 
-# (audit P1-13 — C variadic externs): the VARARG SUBSET RULE — the
-# types an EXTRA (anonymous) argument of a variadic extern call may
-# have. The direct emitters marshal every extra as one raw 8-byte GP
-# slot continuing the argument sequence (aarch64 AAPCS64: x0-x7 then
-# 8-byte stack slots; x86-64 SysV: rdi-r9 then 8-byte stack slots,
-# AL = 0 — the uniform GP-slot model never uses a vector register),
-# which is C-exact ONLY for the <= 64-bit integer, Bool/Char and raw
-# pointer values below:
-#   - the machine Int/UInt (8 bytes) and every sized integer through
-#     64 bits (i8..i64/u8..u64, ISize/USize; the inference-only
-#     IntLiteral form of an unsuffixed integer literal is included — it
-#     defaults to Int); I128/U128 are excluded (two GP words / memory
-#     per the C ABI, not one slot);
-#   - Bool and Char — integer-like scalars (a C vararg would promote
-#     them to int; the slot carries the zero-extended value);
-#   - the raw pointer forms Ptr[T]/PtrMut[T] (the C pointer slot).
-# EVERYTHING ELSE is rejected with a rule — floats (the platform
-# float-vararg register state — AAPCS64 v0-v7, SysV XMM + the AL
-# vector count — is not drivable by the uniform model), Strings/
-# aggregates/enums (object handles or by-reference images, never C
-# scalars), references, type variables and generic parameters.
-def vararg_extra_type_allowed(ty: Type) -> Bool
+# (audit §26 — C default argument promotions at the vararg boundary): the
+# PROMOTED TYPE every EXTRA (anonymous) argument of a variadic extern
+# call is marshalled as. The C default argument promotions are applied
+# to the extra BEFORE the platform vararg marshalling — a C variadic
+# callee NEVER receives an un-promoted float or a sub-int integer:
+#   - F32 -> F64 (the single image is widened to the double image at the
+#     call boundary — an inserted conversion in the marshalling);
+#   - I8/I16 -> the 32-bit int width (sign-extended), U8/U16 -> the
+#     same 32-bit int width (value-preserving zero extension — int can
+#     represent every u8/u16 value); Bool -> int (0/1, zero-extended);
+#     Char (the 32-bit Unicode scalar) travels as an int;
+#   - Int/UInt/I32/U32/I64/U64/ISize/USize and the 64-bit floating
+#     types (F64/Float) cross unchanged (the integer promotions never
+#     touch a 32+-bit type and double is already the promoted form);
+#   - the raw pointer forms Ptr[T]/PtrMut[T] pass as the C pointer slot.
+# The marshalling rule of the previous slice (every extra rides the
+# target's vararg stream as one 8-byte GP slot) continues to hold — the
+# promotions only fix the SLOT IMAGE (a promoted F64 fills the slot with
+# the double bits; a promoted narrow integer fills it with the
+# sign/zero-extended int image). Option::None = the type cannot reach a
+# C vararg extra (I128/U128 — two GP words per the C ABI, not one slot —
+# Strings, aggregates/enums — object handles or by-reference images,
+# never C scalars — references, type variables and generic parameters).
+def vararg_extra_promoted_type(ty: Type) -> Option[Type]
   match ty
-  when Type::Int then true
-  when Type::UInt then true
-  when Type::I8 then true
-  when Type::I16 then true
-  when Type::I32 then true
-  when Type::I64 then true
-  when Type::U8 then true
-  when Type::U16 then true
-  when Type::U32 then true
-  when Type::U64 then true
-  when Type::ISize then true
-  when Type::USize then true
-  when Type::Bool then true
-  when Type::Char then true
-  when Type::IntLiteral(_) then true
-  when Type::Ptr(_) then true
-  when Type::PtrMut(_) then true
-  when _ then false
+  when Type::F32 then Option::Some(Type::F64)
+  when Type::I8 then Option::Some(Type::I32)
+  when Type::I16 then Option::Some(Type::I32)
+  when Type::U8 then Option::Some(Type::I32)
+  when Type::U16 then Option::Some(Type::I32)
+  when Type::Bool then Option::Some(Type::I32)
+  when Type::Char then Option::Some(Type::I32)
+  when Type::Int then Option::Some(Type::Int)
+  when Type::UInt then Option::Some(Type::UInt)
+  when Type::I32 then Option::Some(Type::I32)
+  when Type::I64 then Option::Some(Type::I64)
+  when Type::U32 then Option::Some(Type::U32)
+  when Type::U64 then Option::Some(Type::U64)
+  when Type::ISize then Option::Some(Type::ISize)
+  when Type::USize then Option::Some(Type::USize)
+  when Type::F64 then Option::Some(Type::F64)
+  when Type::Float then Option::Some(Type::Float)
+  when Type::IntLiteral(_) then Option::Some(Type::Int)
+  when Type::Ptr(_) then Option::Some(ty.clone())
+  when Type::PtrMut(_) then Option::Some(ty.clone())
+  when _ then Option::None
+  end  end
+end
+
+# (audit P1-13/§26 — C variadic externs): the VARARG SUBSET RULE — the
+# types an EXTRA (anonymous) argument of a variadic extern call may
+# have. Since the C default argument promotions slice (audit §26) every
+# admitted type has a promoted form (vararg_extra_promoted_type — the
+# single authority); the subset is exactly the promotion table's
+# domain: F32 (auto-promoted to F64), F64/Float, the <= 64-bit integer
+# types (narrow ones auto-promote to the int width), Bool, Char and
+# the raw pointer forms. EVERYTHING ELSE is rejected with a rule —
+# floats beyond the promoted forms were the previous slice's gap (the
+# platform float-vararg register state is not drivable by the uniform
+# GP-slot model; the promoted DOUBLE crosses as the extra's 8-byte GP
+# slot image per the model's documented C-vararg contract),
+# Strings/aggregates/enums, references, type variables and generic
+# parameters stay rejected.
+def vararg_extra_type_allowed(ty: Type) -> Bool
+  match vararg_extra_promoted_type(ty)
+  when Option::Some(_) then true
+  when Option::None then false
   end  end
 end
 
@@ -6625,11 +6885,15 @@ def unify_named_fn_callable(inout env: TypeEnv, id1: TypeId, args1: Vec[Type], p
         end
       end
     else
-      type_add_error(env, "type mismatch: " + type_tag(env, &Type::Adt(id1.clone(), args1.clone())) + " vs " + type_tag(env, &Type::FnPtr(params2.clone(), Box::new(ret2.clone()), Vec::new())), span)
+      let mismatch_lhs = Type::Adt(id1.clone(), args1.clone())
+      let mismatch_rhs = Type::FnPtr(params2.clone(), Box::new(ret2.clone()), Vec::new())
+      type_mismatch_error(env, &mismatch_lhs, &mismatch_rhs, span)
       false
     end
   when Option::None then
-    type_add_error(env, "type mismatch: " + type_tag(env, &Type::Adt(id1.clone(), args1.clone())) + " vs " + type_tag(env, &Type::FnPtr(params2.clone(), Box::new(ret2.clone()), Vec::new())), span)
+    let mismatch_lhs2 = Type::Adt(id1.clone(), args1.clone())
+    let mismatch_rhs2 = Type::FnPtr(params2.clone(), Box::new(ret2.clone()), Vec::new())
+    type_mismatch_error(env, &mismatch_lhs2, &mismatch_rhs2, span)
     false
   end  end
 end
@@ -6663,6 +6927,28 @@ def unify_callable_sigs(inout env: TypeEnv, params1: Vec[ParamType], ret1: Type,
     end
     if ok then unify(env, ret1.clone(), ret2.clone(), span) else false end
   end
+end
+
+# (audit §34) The ONE type-mismatch emitter of the unifier. Every
+# "type mismatch: <a> vs <b>" diagnostic of unify flows through here so
+# the derivational fields accompany the message at the single site where
+# the two rendered types are known: expected_type holds the FIRST
+# rendered type and actual_type the SECOND (the message order is the
+# field order — unify's operands are not directionally labeled, so the
+# message order is the stable convention). The message text is
+# byte-identical to the inline form this helper replaces; only the
+# structured fields are added.
+def type_mismatch_error(inout env: TypeEnv, t1: Type, t2: Type, span: Span) -> Unit
+  let tag1 = type_tag(env, &t1)
+  let tag2 = type_tag(env, &t2)
+  env.errors.push(TypeError {
+    message: "type mismatch: " + tag1.clone() + " vs " + tag2.clone(),
+    span: span,
+    code: Option::None,
+    semantic_site: Option::Some("type unification"),
+    expected_type: Option::Some(tag1),
+    actual_type: Option::Some(tag2)
+  })
 end
 
 def unify(inout env: TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
@@ -6745,25 +7031,25 @@ def unify(inout env: TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
       end
     when _ then
       match a
-      when Type::Unit then match b when Type::Unit then true when _ then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false end
-      when Type::Bool then match b when Type::Bool then true when _ then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false end
-      when Type::Int then match b when Type::Int then true when _ then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false end
-      when Type::UInt then match b when Type::UInt then true when _ then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false end
-      when Type::Float then match b when Type::Float then true when _ then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false end
-      when Type::Char then match b when Type::Char then true when _ then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false end
-      when Type::String then match b when Type::String then true when _ then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false end
-        when Type::I8 then match b when Type::I8 then true when _ then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false end
-        when Type::I16 then match b when Type::I16 then true when _ then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false end
-        when Type::I32 then match b when Type::I32 then true when _ then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false end
-        when Type::I64 then match b when Type::I64 then true when _ then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false end
-        when Type::I128 then match b when Type::I128 then true when _ then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false end
-        when Type::U8 then match b when Type::U8 then true when _ then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false end
-        when Type::U16 then match b when Type::U16 then true when _ then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false end
-        when Type::U32 then match b when Type::U32 then true when _ then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false end
-        when Type::U64 then match b when Type::U64 then true when _ then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false end
-        when Type::U128 then match b when Type::U128 then true when _ then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false end
-        when Type::ISize then match b when Type::ISize then true when _ then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false end
-        when Type::USize then match b when Type::USize then true when _ then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false end
+      when Type::Unit then match b when Type::Unit then true when _ then type_mismatch_error(env, &a, &b, span); false end
+      when Type::Bool then match b when Type::Bool then true when _ then type_mismatch_error(env, &a, &b, span); false end
+      when Type::Int then match b when Type::Int then true when _ then type_mismatch_error(env, &a, &b, span); false end
+      when Type::UInt then match b when Type::UInt then true when _ then type_mismatch_error(env, &a, &b, span); false end
+      when Type::Float then match b when Type::Float then true when _ then type_mismatch_error(env, &a, &b, span); false end
+      when Type::Char then match b when Type::Char then true when _ then type_mismatch_error(env, &a, &b, span); false end
+      when Type::String then match b when Type::String then true when _ then type_mismatch_error(env, &a, &b, span); false end
+        when Type::I8 then match b when Type::I8 then true when _ then type_mismatch_error(env, &a, &b, span); false end
+        when Type::I16 then match b when Type::I16 then true when _ then type_mismatch_error(env, &a, &b, span); false end
+        when Type::I32 then match b when Type::I32 then true when _ then type_mismatch_error(env, &a, &b, span); false end
+        when Type::I64 then match b when Type::I64 then true when _ then type_mismatch_error(env, &a, &b, span); false end
+        when Type::I128 then match b when Type::I128 then true when _ then type_mismatch_error(env, &a, &b, span); false end
+        when Type::U8 then match b when Type::U8 then true when _ then type_mismatch_error(env, &a, &b, span); false end
+        when Type::U16 then match b when Type::U16 then true when _ then type_mismatch_error(env, &a, &b, span); false end
+        when Type::U32 then match b when Type::U32 then true when _ then type_mismatch_error(env, &a, &b, span); false end
+        when Type::U64 then match b when Type::U64 then true when _ then type_mismatch_error(env, &a, &b, span); false end
+        when Type::U128 then match b when Type::U128 then true when _ then type_mismatch_error(env, &a, &b, span); false end
+        when Type::ISize then match b when Type::ISize then true when _ then type_mismatch_error(env, &a, &b, span); false end
+        when Type::USize then match b when Type::USize then true when _ then type_mismatch_error(env, &a, &b, span); false end
       when Type::Never then true
       when Type::IntLiteral(_) then
  # two unconstrained integer literals unify (both are
@@ -6774,13 +7060,13 @@ def unify(inout env: TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
         match b
         when Type::IntLiteral(_) then true
         when Type::Error then true
-        when _ then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
+        when _ then type_mismatch_error(env, &a, &b, span); false
         end
       when Type::Adt(id1, args1) then
         match b
         when Type::Adt(id2, args2) then
           if id1.id != id2.id then
-            type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span)
+            type_mismatch_error(env, &a, &b, span)
             false
           elsif args1.len() != args2.len() then
  # (defect fix): SAME-constructor generic arity is EXACT —
@@ -6808,65 +7094,65 @@ def unify(inout env: TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
           match get_type_by_id_ref(env, &id1)
           when Option::Some(td) then
             if td.name == "Unit" && args1.len() == 0 then true
-            else type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
+            else type_mismatch_error(env, &a, &b, span); false
             end
-          when Option::None then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
+          when Option::None then type_mismatch_error(env, &a, &b, span); false
           end
         when Type::Bool then
           match get_type_by_id_ref(env, &id1)
           when Option::Some(td) then
             if td.name == "Bool" && args1.len() == 0 then true
-            else type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
+            else type_mismatch_error(env, &a, &b, span); false
             end
-          when Option::None then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
+          when Option::None then type_mismatch_error(env, &a, &b, span); false
           end
         when Type::Int then
           match get_type_by_id_ref(env, &id1)
           when Option::Some(td) then
             if (td.name == "Int" || td.name == "c_int") && args1.len() == 0 then true
-            else type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
+            else type_mismatch_error(env, &a, &b, span); false
             end
-          when Option::None then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
+          when Option::None then type_mismatch_error(env, &a, &b, span); false
           end
         when Type::UInt then
           match get_type_by_id_ref(env, &id1)
           when Option::Some(td) then
             if td.name == "UInt" && args1.len() == 0 then true
-            else type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
+            else type_mismatch_error(env, &a, &b, span); false
             end
-          when Option::None then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
+          when Option::None then type_mismatch_error(env, &a, &b, span); false
           end
         when Type::Float then
           match get_type_by_id_ref(env, &id1)
           when Option::Some(td) then
             if td.name == "Float" && args1.len() == 0 then true
-            else type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
+            else type_mismatch_error(env, &a, &b, span); false
             end
-          when Option::None then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
+          when Option::None then type_mismatch_error(env, &a, &b, span); false
           end
         when Type::Char then
           match get_type_by_id_ref(env, &id1)
           when Option::Some(td) then
             if td.name == "Char" && args1.len() == 0 then true
-            else type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
+            else type_mismatch_error(env, &a, &b, span); false
             end
-          when Option::None then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
+          when Option::None then type_mismatch_error(env, &a, &b, span); false
           end
         when Type::String then
           match get_type_by_id_ref(env, &id1)
           when Option::Some(td) then
             if (td.name == "String" || td.name == "str") && args1.len() == 0 then true
-            else type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
+            else type_mismatch_error(env, &a, &b, span); false
             end
-          when Option::None then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
+          when Option::None then type_mismatch_error(env, &a, &b, span); false
           end
         when Type::Never then
           match get_type_by_id_ref(env, &id1)
           when Option::Some(td) then
             if td.name == "Never" && args1.len() == 0 then true
-            else type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
+            else type_mismatch_error(env, &a, &b, span); false
             end
-          when Option::None then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
+          when Option::None then type_mismatch_error(env, &a, &b, span); false
           end
         when Type::FixedArray(elem2, n2) then
           # Literal-bridge: the heap-vector Adt Array form (the array
@@ -6875,127 +7161,127 @@ def unify(inout env: TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
           if id1.id == env.lang_items.array && args1.len() >= 1 then
             unify(env, args1[0], elem2, span)
           else
-            type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span)
+            type_mismatch_error(env, &a, &b, span)
             false
           end
         when Type::I8 then
           match get_type_by_id_ref(env, &id1)
           when Option::Some(td) then
             if (td.name == "I8" || td.name == "Int8" || td.name == "i8") && args1.len() == 0 then true
-            else type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
+            else type_mismatch_error(env, &a, &b, span); false
             end
-          when Option::None then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
+          when Option::None then type_mismatch_error(env, &a, &b, span); false
           end
         when Type::I16 then
           match get_type_by_id_ref(env, &id1)
           when Option::Some(td) then
             if (td.name == "I16" || td.name == "Int16" || td.name == "i16") && args1.len() == 0 then true
-            else type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
+            else type_mismatch_error(env, &a, &b, span); false
             end
-          when Option::None then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
+          when Option::None then type_mismatch_error(env, &a, &b, span); false
           end
         when Type::I32 then
           match get_type_by_id_ref(env, &id1)
           when Option::Some(td) then
             if (td.name == "I32" || td.name == "Int32" || td.name == "i32") && args1.len() == 0 then true
-            else type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
+            else type_mismatch_error(env, &a, &b, span); false
             end
-          when Option::None then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
+          when Option::None then type_mismatch_error(env, &a, &b, span); false
           end
         when Type::I64 then
           match get_type_by_id_ref(env, &id1)
           when Option::Some(td) then
             if (td.name == "I64" || td.name == "Int64" || td.name == "i64" || td.name == "c_long") && args1.len() == 0 then true
-            else type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
+            else type_mismatch_error(env, &a, &b, span); false
             end
-          when Option::None then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
+          when Option::None then type_mismatch_error(env, &a, &b, span); false
           end
         when Type::I128 then
           match get_type_by_id_ref(env, &id1)
           when Option::Some(td) then
             if (td.name == "I128" || td.name == "Int128" || td.name == "i128") && args1.len() == 0 then true
-            else type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
+            else type_mismatch_error(env, &a, &b, span); false
             end
-          when Option::None then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
+          when Option::None then type_mismatch_error(env, &a, &b, span); false
           end
         when Type::U8 then
           match get_type_by_id_ref(env, &id1)
           when Option::Some(td) then
             if (td.name == "U8" || td.name == "UInt8" || td.name == "u8" || td.name == "c_char") && args1.len() == 0 then true
-            else type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
+            else type_mismatch_error(env, &a, &b, span); false
             end
-          when Option::None then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
+          when Option::None then type_mismatch_error(env, &a, &b, span); false
           end
         when Type::U16 then
           match get_type_by_id_ref(env, &id1)
           when Option::Some(td) then
             if (td.name == "U16" || td.name == "UInt16" || td.name == "u16") && args1.len() == 0 then true
-            else type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
+            else type_mismatch_error(env, &a, &b, span); false
             end
-          when Option::None then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
+          when Option::None then type_mismatch_error(env, &a, &b, span); false
           end
         when Type::U32 then
           match get_type_by_id_ref(env, &id1)
           when Option::Some(td) then
             if (td.name == "U32" || td.name == "UInt32" || td.name == "u32") && args1.len() == 0 then true
-            else type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
+            else type_mismatch_error(env, &a, &b, span); false
             end
-          when Option::None then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
+          when Option::None then type_mismatch_error(env, &a, &b, span); false
           end
         when Type::U64 then
           match get_type_by_id_ref(env, &id1)
           when Option::Some(td) then
             if (td.name == "U64" || td.name == "UInt64" || td.name == "u64" || td.name == "c_ulong") && args1.len() == 0 then true
-            else type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
+            else type_mismatch_error(env, &a, &b, span); false
             end
-          when Option::None then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
+          when Option::None then type_mismatch_error(env, &a, &b, span); false
           end
         when Type::U128 then
           match get_type_by_id_ref(env, &id1)
           when Option::Some(td) then
             if (td.name == "U128" || td.name == "UInt128" || td.name == "u128") && args1.len() == 0 then true
-            else type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
+            else type_mismatch_error(env, &a, &b, span); false
             end
-          when Option::None then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
+          when Option::None then type_mismatch_error(env, &a, &b, span); false
           end
         when Type::ISize then
           match get_type_by_id_ref(env, &id1)
           when Option::Some(td) then
             if (td.name == "ISize" || td.name == "isize") && args1.len() == 0 then true
-            else type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
+            else type_mismatch_error(env, &a, &b, span); false
             end
-          when Option::None then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
+          when Option::None then type_mismatch_error(env, &a, &b, span); false
           end
         when Type::USize then
           match get_type_by_id_ref(env, &id1)
           when Option::Some(td) then
             if (td.name == "USize" || td.name == "usize") && args1.len() == 0 then true
-            else type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
+            else type_mismatch_error(env, &a, &b, span); false
             end
-          when Option::None then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
+          when Option::None then type_mismatch_error(env, &a, &b, span); false
           end
         when Type::F32 then
           match get_type_by_id_ref(env, &id1)
           when Option::Some(td) then
             if (td.name == "F32" || td.name == "f32" || td.name == "c_float") && args1.len() == 0 then true
-            else type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
+            else type_mismatch_error(env, &a, &b, span); false
             end
-          when Option::None then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
+          when Option::None then type_mismatch_error(env, &a, &b, span); false
           end
         when Type::F64 then
           match get_type_by_id_ref(env, &id1)
           when Option::Some(td) then
             if (td.name == "F64" || td.name == "f64" || td.name == "c_double") && args1.len() == 0 then true
-            else type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
+            else type_mismatch_error(env, &a, &b, span); false
             end
-          when Option::None then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
+          when Option::None then type_mismatch_error(env, &a, &b, span); false
           end
         # Handle Named(tid, args) unified with a callable type.
         when Type::FnPtr(params2, ret2, _) then
           unify_named_fn_callable(env, &id1, &args1, &params2, ret2, span)
         when Type::Closure(_, params2, ret2, _, _) then
           unify_named_fn_callable(env, &id1, &args1, &params2, ret2, span)
-        when _ then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
+        when _ then type_mismatch_error(env, &a, &b, span); false
         end
       when Type::FnPtr(params1, ret1, _) then
  # (FnPtr/Closure split): a function POINTER unifies with the
@@ -7008,9 +7294,9 @@ def unify(inout env: TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
           unify_callable_sigs(env, &params1, ret1, &params2, ret2, span)
         when Type::Error then true
         when Type::Param(_) then
-          type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span)
+          type_mismatch_error(env, &a, &b, span)
           false
-        when _ then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
+        when _ then type_mismatch_error(env, &a, &b, span); false
         end
       when Type::Closure(_, params1, ret1, _, _) then
  # a closure VALUE unifies with the callable signatures through
@@ -7023,9 +7309,9 @@ def unify(inout env: TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
           unify_callable_sigs(env, &params1, ret1, &params2, ret2, span)
         when Type::Error then true
         when Type::Param(_) then
-          type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span)
+          type_mismatch_error(env, &a, &b, span)
           false
-        when _ then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
+        when _ then type_mismatch_error(env, &a, &b, span); false
         end
       when Type::Tuple(elems1) then
         match b
@@ -7045,31 +7331,31 @@ def unify(inout env: TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
             ok
           end
         when Type::Error then true
-        when _ then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
+        when _ then type_mismatch_error(env, &a, &b, span); false
         end
       when Type::RefInternal(t_inner1, mut1) then
         match b
         when Type::RefInternal(t_inner2, mut2) then
           if !(mut1 == mut2) then
-            type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span)
+            type_mismatch_error(env, &a, &b, span)
             false
           else
             unify(env, t_inner1, t_inner2, span)
           end
         when Type::Error then true
-        when _ then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
+        when _ then type_mismatch_error(env, &a, &b, span); false
         end
       when Type::Ptr(t_inner1) then
         match b
         when Type::Ptr(t_inner2) then unify(env, t_inner1, t_inner2, span)
         when Type::Error then true
-        when _ then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
+        when _ then type_mismatch_error(env, &a, &b, span); false
         end
       when Type::PtrMut(t_inner1) then
         match b
         when Type::PtrMut(t_inner2) then unify(env, t_inner1, t_inner2, span)
         when Type::Error then true
-        when _ then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
+        when _ then type_mismatch_error(env, &a, &b, span); false
         end
       when Type::Dyn(id1) then
         match b
@@ -7080,7 +7366,7 @@ def unify(inout env: TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
             false
           end
         when Type::Error then true
-        when _ then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
+        when _ then type_mismatch_error(env, &a, &b, span); false
         end
       when Type::Effect(effs1, t_inner1) then
         match b
@@ -7108,7 +7394,7 @@ def unify(inout env: TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
             end
           end
         when Type::Error then true
-        when _ then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
+        when _ then type_mismatch_error(env, &a, &b, span); false
         end
       when Type::Param(gpid1) then
         match b
@@ -7166,11 +7452,11 @@ def unify(inout env: TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
           if array_id.id == env.lang_items.array && args.len() >= 1 then
             unify(env, elem1, args[0], span)
           else
-            type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span)
+            type_mismatch_error(env, &a, &b, span)
             false
           end
         when Type::Error then true
-        when _ then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
+        when _ then type_mismatch_error(env, &a, &b, span); false
         end
       when Type::Const(v1) then
         # (§20 slice 1): a const generic ARGUMENT unifies by its VALUE —
@@ -7186,7 +7472,7 @@ def unify(inout env: TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
             false
           end
         when Type::Error then true
-        when _ then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
+        when _ then type_mismatch_error(env, &a, &b, span); false
         end
       when Type::ConstParam(gpid1) then
         # (§20 slice 1): a SYMBOLIC const parameter reference unifies only
@@ -7208,12 +7494,42 @@ def unify(inout env: TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
           type_add_error(env, "const generic parameter `" + n1 + "` cannot unify with " + type_tag(env, &b), span)
           false
         end
+      when Type::ConstSym(tree1) then
+        # (§20 slice 2): two SYMBOLIC const-EXPRESSION arguments unify
+        # exactly when their trees are STRUCTURALLY EQUAL
+        # (const_sym_tree_eq — ORDER-SENSITIVE while symbolic: `SCALE + S2`
+        # and `S2 + SCALE` are different type arguments until substitution
+        # folds them to the same Const(v); a symbolic tree NEVER unifies
+        # with a concrete Const or a bare ConstParam — the concrete value
+        # can only land through substitution, which folds the bound tree to
+        # Const BEFORE any identity comparison sees the slot, so
+        # same-instance spellings that fold to one value always compare
+        # equal after binding).
+        match b
+        when Type::ConstSym(tree2) then
+          if !const_sym_tree_eq(&tree1, &tree2) then
+            type_add_error(env, "const generic argument expression mismatch: " + const_sym_tree_render_named(env, &tree1) + " vs " + const_sym_tree_render_named(env, &tree2), span)
+            false
+          else
+            true
+          end
+        when Type::Error then true
+        when _ then
+          type_add_error(env, "const generic argument expression cannot unify with " + type_tag(env, &b), span)
+          false
+        end
       when Type::FixedArraySym(elem1, gpid1) then
         # (§20 slice 1): two SYMBOLIC-size arrays unify exactly when the size
         # parameters are the same parameter and the elements unify. A
         # symbolic size NEVER unifies with a concrete count (the concrete
         # argument can only land through substitution, which converts
         # FixedArraySym to FixedArray before any identity comparison).
+        # (§20 slice 2): the one structural exception is the ARRAY-LITERAL
+        # bridge — a [x, y, z] literal (the heap-vector Adt form) may
+        # initialize a SYMBOLIC-size array field exactly like the concrete
+        # FixedArray arm below; the literal's count is enforced against the
+        # substituted concrete size at the literal's MIR destination (the
+        # same deferred-count rule as the concrete fixed-array bridge).
         match b
         when Type::FixedArraySym(elem2, gpid2) then
           if !generic_param_id_eq(&gpid1, &gpid2) then
@@ -7224,8 +7540,19 @@ def unify(inout env: TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
           else
             unify(env, elem1, elem2, span)
           end
+        when Type::Adt(array_id, args) then
+          # Literal-bridge: an array literal (the heap-vector Adt form) may
+          # initialize a SYMBOLIC-size array; the count is enforced at the
+          # literal's MIR destination against the substituted concrete
+          # size.
+          if array_id.id == env.lang_items.array && args.len() >= 1 then
+            unify(env, elem1, args[0], span)
+          else
+            type_mismatch_error(env, &a, &b, span)
+            false
+          end
         when Type::Error then true
-        when _ then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
+        when _ then type_mismatch_error(env, &a, &b, span); false
         end
       when Type::Error then true
       end
@@ -9706,7 +10033,7 @@ def check_function(inout env: TypeEnv, f: FunctionDecl, owner_key: String, f_own
   # owner key (the MIR builder reconstructs the lowered Type::Param ids
   # from this record, paired positionally with the lowered declaration's
   # generic list — the substs-order contract).
-  env.generic_param_ids.insert(owner_key, fn_param_ids)
+  env.generic_param_ids.insert(owner_key, fn_param_ids.clone())
   
   # Get expected return type
   let ret_type = match f.ret_type
@@ -9759,6 +10086,9 @@ def check_function(inout env: TypeEnv, f: FunctionDecl, owner_key: String, f_own
   # Check body (the body's call sites record into this function's computed
   # effect set — current_fn_key is the def-key registration used above).
   env.current_fn_key = decl_key.clone()
+  # (§20 slice 3): the body is the function's LOWERING UNIT — its own
+  # const generic parameters are the only ones substitutable per instance.
+  push_unit_const_param_scope(env, &fn_param_ids)
   match f.body
   when FnBody::FnBlock(block) then
     let body_flow = check_block(env, &block, true)
@@ -9781,6 +10111,7 @@ def check_function(inout env: TypeEnv, f: FunctionDecl, owner_key: String, f_own
   env.current_fn_key = ""
   env.expected_return = Option::None
   
+  pop_unit_const_param_scope(env)
   pop_scope(env)
 end
 
@@ -10087,7 +10418,17 @@ end
 def validate_impl_conformance(inout env: TypeEnv, contract: TraitContract, trait_name: String, self_type: Type, trait_args: Vec[Type], impl_methods: Vec[MethodInfo], impl_sig_records: Vec[FnSignature], imp: ImplDecl) -> Bool
   var valid = true
 
-  # (j) the FULL TraitRef: the trait-level generic arity is exact.
+  # (j) the FULL TraitRef: the trait-level generic arity is exact. The §23
+  # arity-0 case never reaches a mismatch: a trait declaring zero type
+  # parameters (Eq/Ord/Hash/Display/Clone-style core traits) takes no trait
+  # arguments, and check_impl's declaration-order derivation pushes NOTHING
+  # for it (the impl's declared parameters — const parameters included —
+  # are the SELF TYPE's arguments, so the derived trait reference of
+  # `impl[const SCALE: Int] Eq for Decimal64[SCALE]` is empty and the
+  # obligation instantiates through the impl HEAD, whose symbolic const
+  # slot unifies with the obligation's concrete Const). The rejection
+  # remains for traits that declare type parameters and for an EXPLICIT
+  # argument list of the wrong length.
   if contract.generic_params.len() != trait_args.len() then
     add_error_with_code(env, "trait argument count mismatch: trait `" + trait_name + "` takes " + contract.generic_params.len().to_string() + " type argument(s), this impl provides " + trait_args.len().to_string(), imp.span, "E0229")
     return false
@@ -10252,28 +10593,49 @@ def check_impl(inout env: TypeEnv, i: ImplDecl, method_keys: Vec[String]) -> Uni
         ta_expr = ta_expr + 1
       end
     else
-      # (§20 slice 1): the declaration-order derivation (the trait's type
-      # arguments ARE the impl's declared parameters — only valid while
-      # EVERY parameter is a type parameter; a const generic parameter in
-      # the impl list makes the derivation unsound (a const position is not
-      # a trait type argument), so it is rejected with a diagnostic instead
-      # of silently pushing Type::Param into a const parameter's slot).
-      var const_in_impl = false
-      var cpi = 0
-      while cpi < i.generic_params.len() do
-        match i.generic_params[cpi].kind
-        when GenericParamKind::ConstParam(_) then const_in_impl = true
-        when GenericParamKind::TypeParam then ()
+      # The declaration-order derivation runs ONLY for a trait that
+      # declares at least one type parameter. (§23): an ARITY-0 trait
+      # (Eq/Ord/Hash/Display/Clone-style core traits declare no type
+      # parameters) takes NO trait arguments — the impl's declared generic
+      # parameters, const parameters included, are the SELF TYPE's
+      # arguments only (`impl[const SCALE: Int] Eq for Decimal64[SCALE]`
+      # is expressible: Decimal64[SCALE] resolves against the impl-declared
+      # const parameter, and the trait reference stays argument-less), so
+      # the derivation pushes NOTHING into the trait reference. The
+      # exact-arity E0229 check then compares 0 declared against the empty
+      # reference and passes; the impl's head (whose const slot is the
+      # symbolic ConstParam) instantiates per obligation through head
+      # unification — an Eq obligation on Decimal64[4] matches this impl
+      # with SCALE bound to Const(4).
+      var trait_decl_arity = -1
+      match env.trait_contracts.get(trait_id.id)
+      when Option::Some(tcontract_arity) then trait_decl_arity = tcontract_arity.generic_params.len()
+      when Option::None then ()
+      end
+      if trait_decl_arity != 0 then
+        # (§20 slice 1): the declaration-order derivation (the trait's type
+        # arguments ARE the impl's declared parameters — only valid while
+        # EVERY parameter is a type parameter; a const generic parameter in
+        # the impl list makes the derivation unsound (a const position is not
+        # a trait type argument), so it is rejected with a diagnostic instead
+        # of silently pushing Type::Param into a const parameter's slot).
+        var const_in_impl = false
+        var cpi = 0
+        while cpi < i.generic_params.len() do
+          match i.generic_params[cpi].kind
+          when GenericParamKind::ConstParam(_) then const_in_impl = true
+          when GenericParamKind::TypeParam then ()
+          end
+          cpi = cpi + 1
         end
-        cpi = cpi + 1
-      end
-      if const_in_impl then
-        type_add_error(env, "an impl declaring a const generic parameter must state the trait's type arguments explicitly (`impl[T, const N: UInt] Trait[Args] for Type`)", i.span)
-      end
-      var ta_idx = 0
-      while ta_idx < impl_param_ids.len() do
-        imp_trait_args.push(Type::Param(impl_param_ids[ta_idx].clone()))
-        ta_idx = ta_idx + 1
+        if const_in_impl then
+          type_add_error(env, "an impl declaring a const generic parameter must state the trait's type arguments explicitly (`impl[T, const N: UInt] Trait[Args] for Type`)", i.span)
+        end
+        var ta_idx = 0
+        while ta_idx < impl_param_ids.len() do
+          imp_trait_args.push(Type::Param(impl_param_ids[ta_idx].clone()))
+          ta_idx = ta_idx + 1
+        end
       end
     end
   end
@@ -10589,7 +10951,7 @@ def check_impl(inout env: TypeEnv, i: ImplDecl, method_keys: Vec[String]) -> Uni
       merged_ids.push(generic_param_id_at(&m_owner, mgp_idx))
       mgp_idx = mgp_idx + 1
     end
-    env.generic_param_ids.insert(m_owner_key, merged_ids)
+    env.generic_param_ids.insert(m_owner_key, merged_ids.clone())
  # record the method's typed signature under the SAME owner key (the
     # MIR reads the method's parameter/return types from this record — the
     # typed table is the authority; TypeExpr is never interpreted after
@@ -10620,6 +10982,11 @@ def check_impl(inout env: TypeEnv, i: ImplDecl, method_keys: Vec[String]) -> Uni
     # effect set — the SAME def-key the signature pass registered the
     # declared set under).
     env.current_fn_key = fn_effect_def_key(env, &m_owner)
+    # (§20 slice 3): the method body is its own LOWERING UNIT — the merged
+    # impl-level + method-level generic parameters (the same merged list
+    # recorded for the MIR under m_owner_key) are the only const parameters
+    # substitutable per instance inside it.
+    push_unit_const_param_scope(env, &merged_ids)
     # Check body
     match m.body
     when FnBody::FnBlock(block) then
@@ -10641,6 +11008,7 @@ def check_impl(inout env: TypeEnv, i: ImplDecl, method_keys: Vec[String]) -> Uni
     env.current_fn_key = ""
     env.expected_return = Option::None
 
+    pop_unit_const_param_scope(env)
     pop_scope(env)
     method_index = method_index + 1
   end
@@ -11075,6 +11443,39 @@ def check_scoped_access_arg_effect(inout env: TypeEnv, arg: Expr, effect: Access
   end  end
 end
 
+# The const generic parameter (numeric id) whose VALUE a root expression
+# reads, when the root is (or is projected from) an ExprIdent recorded as
+# a const-parameter read (check_expr's ExprIdent arm). Option::None for
+# every other expression.
+def const_param_read_root(env: TypeEnv, expr: Expr) -> Option[Int]
+  match expr.kind
+  when ExprKind::ExprAccess(inner) then const_param_read_root(env, &inner)
+  when ExprKind::ExprFieldAccess(base, _) then const_param_read_root(env, &base)
+  when ExprKind::ExprIndex(base, _) then const_param_read_root(env, &base)
+  when ExprKind::ExprCast(inner, _) then const_param_read_root(env, &inner)
+  when ExprKind::ExprRawDeref(inner) then const_param_read_root(env, &inner)
+  when ExprKind::ExprIdent(_) then
+    match env.const_param_reads.get(expr.node_id)
+    when Option::Some(n) then Option::Some(n)
+    when Option::None then Option::None
+    end
+  when _ then Option::None
+  end  end
+end
+
+# (§20 const generics, slice 3): the assignment-target store gate — a
+# store whose target root is a const generic parameter's VALUE read is
+# rejected (the parameter has no storage; its value is fixed per
+# instantiation). Runs after check_expr recorded the target's read.
+def check_const_param_assign_target(inout env: TypeEnv, target: Expr, span: Span) -> Unit
+  match const_param_read_root(env, &target)
+  when Option::Some(_) then
+    let name = typed_ident_name_of(&target)
+    type_add_error(env, "cannot assign to const generic parameter `" + name + "`: the parameter's value is fixed per instantiation and has no storage", span)
+  when Option::None then ()
+  end  end
+end
+
 def check_stmt(inout env: TypeEnv, stmt: Stmt) -> FlowResult
   let result = match stmt.kind
   when StmtKind::StmtLet(pattern, ty_opt, value, is_mut) then
@@ -11120,6 +11521,12 @@ def check_stmt(inout env: TypeEnv, stmt: Stmt) -> FlowResult
     # rejected under `let`, the sanctioned form under `inout`). The target
     # has just been checked, so its root resolution is recorded.
     check_scoped_access_store_target(env, &target, stmt.span)
+    # (§20 const generics, slice 3): a store into a const generic
+    # parameter (a VALUE read of the parameter in assignment-target
+    # position) is rejected — the parameter's value is fixed per
+    # instantiation and has no storage to store into (the MIR would have
+    # no place for it).
+    check_const_param_assign_target(env, &target, stmt.span)
     let value_type = check_expr(env, &value)
     unify(env, target_type, value_type, stmt.span)
     # (audit §12): storing an OWNING with-scoped access value into any
@@ -12055,6 +12462,7 @@ def check_match(inout env: TypeEnv, m: MatchExpr, is_stmt: Bool) -> FlowResult
     when Type::FixedArraySym(_, _) then ()
     when Type::Const(_) then ()
     when Type::ConstParam(_) then ()
+    when Type::ConstSym(_) then ()
     end
   end
   
@@ -13935,6 +14343,12 @@ def is_trivially_copyable_walk(env: TypeEnv, ty: Type, inout visited: Set[String
   # (mirror Type::Param — only a substituted concrete value answers).
   when Type::Const(_) then true
   when Type::ConstParam(_) then false
+  # (§20 slice 2): a symbolic const-EXPRESSION argument is compile-time
+  # integer arithmetic over constants — bit-copyable exactly like Const
+  # (its leaves are the parameter values of the instantiation; the
+  # substituted slot is the folded Const). A tree with no parameter leaves
+  # would already have folded to Const at resolve.
+  when Type::ConstSym(_) then true
   # (§20 slice 1): the symbolic-size array is inline element storage with a
   # parameter count — bit-copyable exactly when the element is (mirror the
   # concrete FixedArray arm; substitution resolves the count before layout).
@@ -14149,6 +14563,24 @@ def collect_param_names_from_type(env: TypeEnv, ty: Type, inout out: Vec[Generic
       i = i + 1
     end
     if !found then out.push(gpid.clone()) end
+  when Type::ConstSym(tree) then
+    # (§20 slice 2): a SYMBOLIC const-EXPRESSION argument's parameters are
+    # its parameter LEAVES — collect each leaf id (dedupe by the numeric
+    # identity), so a const parameter that appears only inside an
+    # arithmetic type argument still registers for the solved-parameter
+    # verification and the positional substitution alignment.
+    let leaf_ids = const_sym_tree_param_ids(&tree)
+    var li = 0
+    while li < leaf_ids.len() do
+      var found = false
+      var i = 0
+      while i < out.len() do
+        if generic_param_id_numeric(&out[i]) == generic_param_id_numeric(&leaf_ids[li]) then found = true end
+        i = i + 1
+      end
+      if !found then out.push(leaf_ids[li].clone()) end
+      li = li + 1
+    end
   when Type::FixedArraySym(elem, gpid) then
     # (§20 slice 1): the symbolic-size array carries its size parameter —
     # collect it like the element's parameters.
@@ -14668,6 +15100,24 @@ pub def type_canon_render(ctx: TypeCanonCtx, ty: Type) -> Result[String, String]
     when TypeCanonFrame::CanonExternal then
       Result::Err("tangerine ABI: const generic parameter `" + generic_param_name_from(&ctx.param_names, &gpid) + "` cannot appear in a public ABI symbol (canonicalize the instance first)")
     end
+  when Type::ConstSym(tree) then
+    # (§20 slice 2): a SYMBOLIC const-EXPRESSION argument keys by its
+    # ORDER-SENSITIVE STRUCTURAL TREE — the tree rendered over the
+    # parameter identities (names in the semantic frame, numeric ids in the
+    # internal frame — the deterministic rendering of the structural tree,
+    # so equal trees render equal and different spellings render
+    # differently, mirroring the tree's identity discipline). FAILS CLOSED
+    # in the public ABI frame: a generic signature's symbolic tree is
+    # substituted and folded to the concrete Const before any public
+    # signature forms.
+    match ctx.frame
+    when TypeCanonFrame::CanonSemantic then
+      Result::Ok("ConstSym(" + const_sym_tree_render_names(&tree, &ctx.param_names) + ")")
+    when TypeCanonFrame::CanonInternal then
+      Result::Ok("constsym(" + const_sym_tree_render_numeric(&tree) + ")")
+    when TypeCanonFrame::CanonExternal then
+      Result::Err("tangerine ABI: a symbolic const-expression argument (ConstSym) cannot appear in a public ABI symbol (substitute the instance first)")
+    end
   when Type::FixedArraySym(elem, gpid) then
     # (§20 slice 1): the SYMBOLIC-size fixed array renders with the size
     # parameter's identity — canonical by (owner, index) — never by name.
@@ -15007,6 +15457,169 @@ def solve_obligation_depth(inout env: TypeEnv, obligation: Obligation, inout vis
   else
     false
   end
+end
+
+# ———————————————————————————————————————————————————————————————
+# (audit §34) The obligation-derivation trace — the structured rows that
+# accompany a bound-failure diagnostic. The rows spell out the audit's
+# derivation tree for a failed obligation ("the root type -> its field
+# (name) -> the field's type -> why it fails (not Copy, no registered
+# Clone)") so the message is no longer the only carrier.
+# ———————————————————————————————————————————————————————————————
+# The why-row of one leaf type that fails an obligation: the Copy class
+# names the structural bit-copy property (is_trivially_copyable), the
+# generic class names the missing registered impl.
+def obligation_leaf_why(env: TypeEnv, ty: Type, trait_id: Int, trait_name: String) -> String
+  let leaf = type_display(env, ty)
+  if trait_id == env.lang_items.copy_trait then
+    if is_trivially_copyable(env, &ty) then
+      "    `" + leaf + "` is raw-bit-copyable, but no Copy impl candidate solves the obligation (Copy is the marker for the structural property; the obligation still needs an impl)"
+    else
+      "    `" + leaf + "` is not Copy: not trivially copyable, and no registered Clone impl for it (ownership transfers by move only)"
+    end
+  else
+    "    no registered impl of `" + trait_name + "` for `" + leaf + "`"
+  end
+end
+
+# Probe one obligation WITHOUT leaving residue: the solve is
+# transactional by construction (the solver probes candidates from one
+# baseline and truncates), and the outer truncate additionally drops the
+# solver's resource-limit diagnostics — the derivation walk is a
+# DIAGNOSTIC walk, never an error producer.
+def trait_satisfied_probe(inout env: TypeEnv, ty: Type, trait_id: Int, trait_name: String) -> Bool
+  let errs_baseline = env.errors.len()
+  let obligation = Obligation {
+    trait_ref: TraitRef {
+      trait_id: TraitId { id: trait_id },
+      self_ty: ty,
+      args: Vec::new()
+    },
+    trait_name: trait_name
+  }
+  let ok = solve_obligation(env, &obligation)
+  errors_truncate(env, errs_baseline)
+  ok
+end
+
+# Descend from a failing type to the FIRST constituent that fails the
+# obligation and record the field chain rows. Returns true (with rows
+# filled) when the failure is found; the traversal stops at the first
+# failing field/argument and at indirection cycles (a revisited type id
+# is treated like the property engine's visited rule — the walk fails
+# OPEN there instead of descending forever).
+def obligation_chain_descend(inout env: TypeEnv, ty: Type, trait_id: Int, trait_name: String, depth: Int, inout visited: Set[Int], inout rows: Vec[String]) -> Bool
+  if trait_satisfied_probe(env, ty.clone(), trait_id, trait_name) then
+    return false
+  end
+  # The leaf fallback row is precomputed BEFORE the structural match (the
+  # scrutinee is consumed by the match; the fallback row names the failing
+  # type itself when no constituent carries the failure).
+  let leaf_row = obligation_leaf_why(env, ty.clone(), trait_id, trait_name)
+  if depth > 6 then
+    rows.push(leaf_row)
+    return true
+  end
+  match ty
+  when Type::Var(_) then
+    rows.push("    the type is still an unresolved inference variable — the obligation cannot be decided")
+    true
+  when Type::Param(gpid) then
+    rows.push("    generic parameter `" + generic_param_name_of(&env.generic_param_table, &gpid) + "` carries no `" + trait_name + "` bound in the caller's generic context")
+    true
+  when Type::Adt(tid, args) then
+    if visited.contains(&tid.id) then
+      return false
+    end
+    visited.insert(tid.id)
+    var found = false
+    match get_type_by_id_ref(env, tid)
+    when Option::Some(td) then
+      match td.def_kind
+      when TypeDefKind::Struct(fields) then
+        var fi = 0
+        while fi < fields.len() do
+          if !found then
+            let f_ty = subst_type_args(&fields[fi].ty, &td.generic_params, args)
+            var sub_rows = Vec::new()
+            if obligation_chain_descend(env, f_ty.clone(), trait_id, trait_name, depth + 1, visited, &mut sub_rows) then
+              rows.push("  field `" + fields[fi].name.clone() + "` (`" + type_display(env, &f_ty) + "`): " + trait_name + " fails")
+              for r in sub_rows do
+                rows.push(r)
+              end
+              found = true
+            end
+          end
+          fi = fi + 1
+        end
+      when _ then ()
+      end
+      if !found then
+        var ai = 0
+        while ai < args.len() do
+          if !found then
+            var sub_rows2 = Vec::new()
+            if obligation_chain_descend(env, args[ai].clone(), trait_id, trait_name, depth + 1, visited, &mut sub_rows2) then
+              rows.push("  type argument " + ai.to_string() + " (`" + type_display(env, &args[ai]) + "`): " + trait_name + " fails")
+              for r in sub_rows2 do
+                rows.push(r)
+              end
+              found = true
+            end
+          end
+          ai = ai + 1
+        end
+      end
+    when Option::None then ()
+    end
+    visited.remove(&tid.id)
+    if !found then
+      rows.push(leaf_row)
+    end
+    true
+  when Type::Tuple(elems) then
+    var found_t = false
+    var ei = 0
+    while ei < elems.len() do
+      if !found_t then
+        var sub_rows3 = Vec::new()
+        if obligation_chain_descend(env, elems[ei].clone(), trait_id, trait_name, depth + 1, visited, &mut sub_rows3) then
+          rows.push("  tuple element " + ei.to_string() + " (`" + type_display(env, &elems[ei]) + "`): " + trait_name + " fails")
+          for r in sub_rows3 do
+            rows.push(r)
+          end
+          found_t = true
+        end
+      end
+      ei = ei + 1
+    end
+    if !found_t then
+      rows.push(leaf_row)
+    end
+    true
+  when _ then
+    rows.push(leaf_row)
+    true
+  end  end
+end
+
+# The full constraint rows of a bound failure on a concrete receiver: the
+# root row names the type and the failing obligation, the following rows
+# are the nested field chain down to the leaf that fails. Empty when the
+# receiver itself satisfies the obligation (the caller then falls back to
+# its own site-specific rows).
+def bound_failure_chain_rows(inout env: TypeEnv, root: Type, trait_id: Int, trait_name: String) -> Vec[String]
+  var rows = Vec::new()
+  var visited: Set[Int] = Set::new()
+  let failed = obligation_chain_descend(env, root.clone(), trait_id, trait_name, 0, &mut visited, &mut rows)
+  var out = Vec::new()
+  if failed then
+    out.push("the " + trait_name + " obligation on `" + type_display(env, &root) + "` fails through the nested field chain:")
+    for r in rows do
+      out.push(r)
+    end
+  end
+  out
 end
 
 # Gate an impl's applicability for a concrete receiver by solving its
@@ -15362,6 +15975,14 @@ def type_props_walk(inout env: TypeEnv, ty: Type, inout visiting: Map[String, Ty
   when Type::Const(_) then ()
   when Type::ConstParam(_) then
     props.is_deferred = true
+  # (§20 slice 2): a symbolic const-EXPRESSION argument (ConstSym) is
+  # generic ownership polymorphism exactly like its leaves — a tree with
+  # parameter leaves defers (the concrete answer appears after
+  # substitution folds it to Const, exactly like ConstParam).
+  when Type::ConstSym(tree) then
+    if const_sym_tree_has_param(&tree) then
+      props.is_deferred = true
+    end
   when Type::FixedArraySym(elem, _) then
     let sp = type_props_walk(env, &elem, visiting, via_heap)
     if sp.owns_state then props.owns_state = true end
@@ -16342,7 +16963,7 @@ def scan_expr(env: TypeEnv, inout scan: CaptureScan, expr: Expr) -> Unit
   when ExprKind::ExprCast(inner, _) then scan_expr(env, scan, &inner)
   when ExprKind::ExprTypeCheck(inner, _) then scan_expr(env, scan, &inner)
   when ExprKind::ExprComptime(block) then scan_block(env, scan, &block)
-  when ExprKind::ExprEnumVariant(_, args) then
+  when ExprKind::ExprEnumVariant(_, _, args) then
     var i = 0
     while i < args.len() do
       scan_expr(env, scan, &args[i])
@@ -16794,9 +17415,46 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
   when ExprKind::ExprIdent(name) then
     match lookup_var(env, name)
     when Option::Some(ty) then
+      # (§20 const generics, slice 3): a const generic parameter NAME in a
+      # VALUE (expression) position is decided by the SCOPE of the current
+      # lowering unit (unit_const_param_scopes — one frame per item whose
+      # body is being checked, holding the numeric ids of the item's own
+      # generic parameters in the MIR's merged order):
+      #   - IN scope (the parameter belongs to the function/method whose
+      #     body is being checked): the read is a PER-INSTANCE compile-time
+      #     value — it types as the parameter's DECLARED scalar type
+      #     (const_param_decl_types, the `UInt` of `const N: UInt`) and
+      #     records the (node -> GenericParamId) identity in
+      #     const_param_reads; the MIR lowering emits the SYMBOLIC
+      #     MirConstParamValue constant for the read, and monomorphization
+      #     substitutes the concrete value per instance (the bodies lower
+      #     ONCE, so the value cannot be materialized before the instance's
+      #     argument is known).
+      #   - OUT of scope (the name resolves to an ENCLOSING item's
+      #     parameter — a closure body, which lowers as its own non-generic
+      #     function): the read fails closed with the explicit rule. Type
+      #     positions ([T; N] sizes, const argument slots) never pass
+      #     through check_expr and keep resolving through ConstParam.
+      match ty
+      when Type::ConstParam(gpid) then
+        let n1 = generic_param_name_of(&env.generic_param_table, &gpid)
+        if unit_const_param_in_scope(env, &gpid) then
+          let gpid_num = generic_param_id_numeric(&gpid)
+          env.const_param_reads.insert(expr.node_id, gpid_num)
+          match env.const_param_decl_types.get(gpid_num)
+          when Option::Some(decl_ty) then decl_ty.clone()
+          when Option::None then
+            type_add_error(env, "internal error: const generic parameter `" + n1 + "` has no recorded declared scalar type", expr.span)
+            Type::Error
+          end
+        else
+          type_add_error(env, "const generic parameter `" + n1 + "` cannot be used as a runtime value here: the parameter is out of scope for this body (the parameter's value exists only per instantiation of the item that declares it, and this body lowers as its own function, so it has no per-instance value for the parameter — closures and nested items cannot read it as a value)", expr.span)
+          Type::Error
+        end
+      when _ then
       let lid = local_id_of(env, name)
       env.typed_ident_resolutions.insert(expr.node_id, lid)
- # (final layer): a bare name resolved from the pass-3
+  # (final layer): a bare name resolved from the pass-3
       # program-level callable bindings (scope 0) goes through the
       # module-qualified identity check — the current module's own
       # definition wins when several modules define the name; otherwise an
@@ -16806,6 +17464,7 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
         resolve_bare_callable(env, name.clone(), expr.span, ty.clone())
       else
         ty
+      end
       end
     when Option::None then
       # Check if the name refers to a registered type (e.g., Vec in Vec::new(),
@@ -16947,8 +17606,59 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
         arg_param_names.push(snapshot_entries[sei].0)
         sei = sei + 1
       end
-      let inst_ret = instantiate_generic_type(env, &ret, &mut gvar_map)
+      mut inst_ret = instantiate_generic_type(env, &ret, &mut gvar_map)
       collect_param_names_from_type(env, &ret, &mut sig_param_names)
+      # (§20 const generics, slice 2): CONST-PARAMETER PRESOLVE — before
+      # the argument unification, walk each instantiated signature parameter
+      # against its concrete argument type and collect the callee's const
+      # parameters the argument fixes (a symbolic-size array [T; N] or a
+      # bare const-slot ConstParam against a concrete fixed-count /
+      # Type::Const argument). Each collected constant BINDS the parameter's
+      # shared inference variable (env.subst — the ordinary recording
+      # resolves it), and the surviving symbolic forms in the instantiated
+      # signature are REWRITTEN to their concrete fixed-array / Const
+      # forms, so the ordinary unification below compares fixed counts
+      # (FixedArraySym-vs-FixedArray never reaches the unifier at a call).
+      # The return type is rewritten the same way when the arguments fixed
+      # the parameter; a return-position-only const parameter (no argument
+      # carries it) stays symbolic and is reported by the existing
+      # unresolved-parameter machinery (fail-closed — "cannot infer").
+      # The presolve runs ONLY for a DIRECT call to a declared callee (its
+      # target is recorded in typed_call_targets): a call through a
+      # closure value carries no callee generic parameters of its own (the
+      # symbolic forms in a generic body's closure signature belong to the
+      # ENCLOSING declaration — binding them here would fabricate an
+      # instance for the enclosing function).
+      var const_binds: Map[Int, Type] = Map::new()
+      if env.typed_call_targets.contains_key(&expr.node_id) then
+        var cbi = 0
+        while cbi < inst_params.len() && cbi < arg_types.len() do
+          presolve_const_args_from_types(&inst_params[cbi].ty, &arg_types[cbi], &mut const_binds)
+          cbi = cbi + 1
+        end
+      end
+      if !const_binds.is_empty() then
+        var kb = 0
+        let bind_entries = const_binds.entries()
+        while kb < bind_entries.len() do
+          match gvar_map.get(bind_entries[kb].0)
+          when Option::Some(vty) then
+            match vty
+            when Type::Var(vid) then env.subst.insert(vid, bind_entries[kb].1.clone())
+            when _ then ()
+            end
+          when Option::None then ()
+          end
+          kb = kb + 1
+        end
+        var rwi = 0
+        while rwi < inst_params.len() do
+          let pt = inst_params[rwi]
+          inst_params.set(rwi, ParamType { ty: subst_type_const_map(&pt.ty, &const_binds), convention: pt.convention })
+          rwi = rwi + 1
+        end
+        inst_ret = subst_type_const_map(&inst_ret, &const_binds)
+      end
       # Enforce exact arity for non-variadic callables: every declared
       # parameter must have a supplied argument and every argument must
       # map to a declared parameter. Silently accepting extra arguments
@@ -16993,27 +17703,30 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
         pi = pi + 1
       end
       if callee_is_varargs_extern then
-        # (audit P1-13 — C variadic externs): the EXTRA arguments beyond
-        # the FIXED prefix. Each extra is already typed by check_expr
-        # (arg_types); there is no declared parameter to unify it against,
-        # so the vararg SUBSET RULE validates it instead: only values the
-        # direct emitters marshal C-exactly as varargs are accepted (<=
-        # 64-bit integers, Bool/Char, raw pointers). Everything else —
-        # floats above all — is rejected with the actionable rule; the
-        # extras are borrowed reads (AccessConvention::Let), which is what
-        # the access/resource checkers and the MIR's per-arg effect records
+        # (audit P1-13/§26 — C variadic externs): the EXTRA arguments
+        # beyond the FIXED prefix. Each extra is already typed by
+        # check_expr (arg_types); there is no declared parameter to
+        # unify it against, so the vararg SUBSET RULE validates it
+        # instead: only values with a C default argument promotion
+        # (vararg_extra_promoted_type — the single authority) are
+        # accepted — F32 (auto-promoted to F64 at the marshalling
+        # boundary), F64/Float, the <= 64-bit integers (I8/I16/U8/U16
+        # auto-promote to the 32-bit int width), Bool, Char and the raw
+        # pointers. Everything else — I128/U128, Strings, aggregates/
+        # enums (they cross by reference under the C ABI rules, which
+        # the language's vararg surface does not implement), references
+        # — is rejected with the actionable rule; the extras are
+        # borrowed reads (AccessConvention::Let), which is what the
+        # access/resource checkers and the MIR's per-arg effect records
         # expect for every call argument.
         var vi = inst_params.len()
         while vi < args.len() do
           let extra_ty = resolve_type_var(env, arg_types[vi])
-          if !vararg_extra_type_allowed(&extra_ty) then
+          match vararg_extra_promoted_type(&extra_ty)
+          when Option::Some(_) then ()
+          when Option::None then
             let kind = type_tag(env, &extra_ty)
-            match extra_ty
-            when Type::Float | Type::F32 | Type::F64 then
-              type_add_error(env, "variadic extern argument " + (vi + 1).to_string() + " is `" + kind + "`: float varargs are not supported (the uniform GP-slot ABI cannot drive the platform float-vararg register state — AAPCS64 v0-v7 / SysV XMM plus the AL vector count); pass the bits as an integer or declare a C helper that takes the float", args[vi].span)
-            when _ then
-              type_add_error(env, "variadic extern argument " + (vi + 1).to_string() + " has type `" + kind + "`: the vararg subset is integers (<= 64 bits), Bool, Char and raw pointers only — strings, floats and aggregates do not cross the C vararg ABI", args[vi].span)
-            end
+            type_add_error(env, "variadic extern argument " + (vi + 1).to_string() + " has type `" + kind + "`: the vararg subset is the C-promotable scalars — F32 (auto-promoted to F64), F64, the integer types through 64 bits (i8/u8/i16/u16 auto-promote to the int width), Bool, Char and raw pointers — strings, aggregates and enums do not cross the C vararg ABI (they cross by reference under the C rules, which the language's vararg surface does not implement)", args[vi].span)
           end
           record_arg_effect(env, &args[vi], AccessConvention::Let)
           vi = vi + 1
@@ -17037,7 +17750,15 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
             when Option::Some(n) then n.clone()
             when Option::None then "<param#" + arg_param_names[gi].to_string() + ">"
             end
-            type_add_error(env, "cannot infer type parameter `" + gname + "`", expr.span)
+            # (§20 slice 2): a CONST parameter that no argument fixed
+            # reports the const wording ("pass an argument whose size fixes
+            # it"); a type parameter keeps the historical wording.
+            match env.const_param_decl_types.get(arg_param_names[gi])
+            when Option::Some(_) then
+              type_add_error(env, "cannot infer const parameter `" + gname + "`: pass an argument whose type carries the parameter's value (e.g. a `[T; N]` argument)", expr.span)
+            when Option::None then
+              type_add_error(env, "cannot infer type parameter `" + gname + "`", expr.span)
+            end
           when _ then ()
           end
         when Option::None then ()
@@ -17677,6 +18398,12 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
     lit_result
   when ExprKind::ExprClosure(params, ret_ty, body) then
     push_scope(env)
+    # (§20 slice 3): a closure body is its own LOWERING UNIT — a closure
+    # lowers as its own non-generic synthesized function with NO
+    # per-instance const substitution, so the empty frame puts every
+    # enclosing item's const parameters OUT of scope for value reads
+    # inside it (check_expr's ExprIdent arm rejects them).
+    push_unit_const_param_scope(env, Vec::new())
     var param_types = Vec::new()
     var i = 0
     while i < params.len() do
@@ -17781,6 +18508,7 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
       end
       ni = ni + 1
     end
+    pop_unit_const_param_scope(env)
     pop_scope(env)
  # (FnPtr/Closure split): the closure EXPRESSION types as the
     # Closure form — ClosureId (the closure node's identity — node ids are
@@ -17998,7 +18726,7 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
         fresh_type_var(env)
       end
     end
-  when ExprKind::ExprEnumVariant(path, args) then
+  when ExprKind::ExprEnumVariant(path, path_type_args, args) then
     # The operation-call surface: a std::effects::perform(EFFECT.op, ...)
     # call parses as an ExprEnumVariant (the 3-segment module-qualified
     # call path) — typed against the declared effect's op table BEFORE the
@@ -18008,10 +18736,10 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
       var perform_callee = Expr { kind: ExprKind::ExprPath(path.clone()), span: expr.span, node_id: 0 }
       match check_effect_perform_call(env, expr, &perform_callee, &args)
       when Option::Some(perform_ty) then perform_ty
-      when Option::None then check_enum_variant_construct(env, expr, &path, &args)
+      when Option::None then check_enum_variant_construct(env, expr, &path, &path_type_args, &args)
       end
     else
-      check_enum_variant_construct(env, expr, &path, &args)
+      check_enum_variant_construct(env, expr, &path, &path_type_args, &args)
     end
   when ExprKind::ExprComptime(block) then
     # Rejected at check time with an explicit diagnostic: the MIR has no
@@ -18036,15 +18764,12 @@ end
 # an ExprEnumVariant) routes AROUND it: the perform arm short-circuits
 # through check_effect_perform_call and this helper handles every other
 # ExprEnumVariant form (enum variant construction, Vec::new() / Map::new()
-# static-path calls).
-# The enum-variant construction / static-path call check — the
-# ExprEnumVariant arm's body, extracted into a helper so the operation-
-# call surface (std::effects::perform(EFFECT.op, ...) — which parses as
-# an ExprEnumVariant) routes AROUND it: the perform arm short-circuits
-# through check_effect_perform_call and this helper handles every other
-# ExprEnumVariant form (enum variant construction, Vec::new() / Map::new()
-# static-path calls).
-def check_enum_variant_construct(inout env: TypeEnv, expr: Expr, path: AstPath, args: Vec[Expr]) -> Type
+# static-path calls, and the GENERIC-TYPED associated call
+# `Decimal64[2]::from_parts(...)` — whose path_type_args are the OWNER
+# TYPE's generic arguments, resolved into the owner Adt and unified
+# against the impl head at the static-path call site so the call's const
+# args bind the impl's const parameters directly).
+def check_enum_variant_construct(inout env: TypeEnv, expr: Expr, path: AstPath, path_type_args: Vec[TypeExpr], args: Vec[Expr]) -> Type
     let variant_name = if path.segments.len() > 0 then path.segments[path.segments.len() - 1] else "" end
     let enum_name = if path.segments.len() >= 2 then path.segments[path.segments.len() - 2] else "" end
     match find_enum_variant(env, variant_name.clone())
@@ -18140,10 +18865,30 @@ def check_enum_variant_construct(inout env: TypeEnv, expr: Expr, path: AstPath, 
         if owner_type_name == "Vec" then
           owner_candidates.push("Array".to_string())
         end
+        # (§23): a GENERIC-TYPED associated call (`Decimal64[2]::m`,
+        # `Vec[u8]::new`) resolves the path's OWNER TYPE arguments ONCE
+        # (the argument resolution is owner-name independent — const
+        # arguments fold to Type::Const; the Vec -> Array retry below
+        # reuses the same resolved list) and forms the concrete owner Adt
+        # the impl heads are matched against. A name whose registered
+        # arity the argument list cannot satisfy simply fails every head
+        # unification below.
+        var owner_args_resolved: Vec[Type] = Vec::new()
+        if path_type_args.len() > 0 then
+          var oat = 0
+          while oat < path_type_args.len() do
+            owner_args_resolved.push(resolve_type_expr(env, &path_type_args[oat]))
+            oat = oat + 1
+          end
+        end
         var oc = 0
         while oc < owner_candidates.len() && !static_ret.is_some() do
           match get_type_id_by_name(env, owner_candidates[oc].clone())
           when Option::Some(owner_tid) then
+            var owner_ty: Option[Type] = Option::None
+            if owner_args_resolved.len() > 0 then
+              owner_ty = Option::Some(Type::Adt(owner_tid, owner_args_resolved.clone()))
+            end
             match env.method_lookup.get(owner_tid.id)
             when Option::Some(mmap) then
               match mmap.get(variant_name.clone())
@@ -18184,89 +18929,114 @@ def check_enum_variant_construct(inout env: TypeEnv, expr: Expr, path: AstPath, 
                         sp_vars.push(sp_met_vars[sk2].clone())
                         sk2 = sk2 + 1
                       end
-                      var sp_inst_params = Vec::new()
-                      var spi = 0
-                      while spi < m.params.len() do
-                        sp_inst_params.push(ParamType { ty: subst_type_args(&m.params[spi].ty, &sp_names, &sp_vars), convention: m.params[spi].convention })
-                        spi = spi + 1
+                      # (§23): when the path carried OWNER TYPE arguments,
+                      # the candidate's impl HEAD must accept them — unify
+                      # the instantiated for_type against the concrete
+                      # owner Adt (`Decimal64[SCALE]` substituted with its
+                      # fresh variable unifies with
+                      # Decimal64[Type::Const(2)]), which BINDS the impl's
+                      # const parameters at the call site: the method
+                      # signature and the return type instantiate at the
+                      # path's instance (from_parts returns Decimal64[2])
+                      # and the recorded substitution carries the solved
+                      # Type::Const — the call no longer depends on an
+                      # annotated binding type. An impl whose head cannot
+                      # accept the path's args is not the callee the path
+                      # names; without owner args the historical behavior
+                      # is unchanged (the instance is solved by the caller
+                      # context).
+                      var sp_head_ok = true
+                      match owner_ty
+                      when Option::Some(oty) then
+                        let sp_head_inst = subst_type_args(&imp.for_type, &sp_names, &sp_vars)
+                        sp_head_ok = try_head_unify(env, sp_head_inst, oty)
+                      when Option::None then ()
                       end
-                      let sp_inst_ret = subst_type_args(&m.ret_type, &sp_names, &sp_vars)
-                      # Transactional payload unification: a head mismatch
-                      # rolls the whole attempt back and falls through.
-                      var sp_arg_ok = true
-                      var sai = 0
-                      while sai < args.len() do
-                        if sai < sp_inst_params.len() then
-                          let sp_snap = subst_snapshot(env)
-                          let sp_errs = env.errors.len()
-                          let sp_uok = try_head_unify(env, arg_tys[sai].clone(), sp_inst_params[sai].ty.clone())
-                          if sp_uok then
-                            ()
-                          else
-                            subst_restore(env, &sp_snap)
-                            errors_truncate(env, sp_errs)
-                            sp_arg_ok = false
-                            break
-                          end
+                      if sp_head_ok then
+                        var sp_inst_params = Vec::new()
+                        var spi = 0
+                        while spi < m.params.len() do
+                          sp_inst_params.push(ParamType { ty: subst_type_args(&m.params[spi].ty, &sp_names, &sp_vars), convention: m.params[spi].convention })
+                          spi = spi + 1
                         end
-                        sai = sai + 1
-                      end
-                      if sp_arg_ok then
-                        # The call target: the method's resolver DefId (the
-                        # identity the MIR's method_def_ids / call-site
-                        # instances carry) — through the SEMANTIC
-                        # registration (module_symbols' qualified
-                        # "path::Type::method" entries): the impl's
-                        # for_type key (reconstructed from the concrete
-                        # for_type) resolved at the owner type's
-                        # registration path, then the qualified scan.
-                        let imp_key = impl_method_key_from_type(env, &imp.for_type, &variant_name)
-                        if imp_key != "" then
-                          match imp.for_type
-                          when Type::Adt(imp_tid, _) then
-                            let imp_path = type_registration_module_path(env, &imp_tid)
-                            match qualified_method_def(env, &imp_path, &imp_key)
-                            when Option::Some(sp_mdid) then
-                              env.typed_call_targets.insert(expr.node_id, sp_mdid.clone())
-                              record_effect_call(env, Option::Some(sp_mdid))
-                            when Option::None then
+                        let sp_inst_ret = subst_type_args(&m.ret_type, &sp_names, &sp_vars)
+                        # Transactional payload unification: a head mismatch
+                        # rolls the whole attempt back and falls through.
+                        var sp_arg_ok = true
+                        var sai = 0
+                        while sai < args.len() do
+                          if sai < sp_inst_params.len() then
+                            let sp_snap = subst_snapshot(env)
+                            let sp_errs = env.errors.len()
+                            let sp_uok = try_head_unify(env, arg_tys[sai].clone(), sp_inst_params[sai].ty.clone())
+                            if sp_uok then
+                              ()
+                            else
+                              subst_restore(env, &sp_snap)
+                              errors_truncate(env, sp_errs)
+                              sp_arg_ok = false
+                              break
+                            end
+                          end
+                          sai = sai + 1
+                        end
+                        if sp_arg_ok then
+                          # The call target: the method's resolver DefId (the
+                          # identity the MIR's method_def_ids / call-site
+                          # instances carry) — through the SEMANTIC
+                          # registration (module_symbols' qualified
+                          # "path::Type::method" entries): the impl's
+                          # for_type key (reconstructed from the concrete
+                          # for_type) resolved at the owner type's
+                          # registration path, then the qualified scan.
+                          let imp_key = impl_method_key_from_type(env, &imp.for_type, &variant_name)
+                          if imp_key != "" then
+                            match imp.for_type
+                            when Type::Adt(imp_tid, _) then
+                              let imp_path = type_registration_module_path(env, &imp_tid)
+                              match qualified_method_def(env, &imp_path, &imp_key)
+                              when Option::Some(sp_mdid) then
+                                env.typed_call_targets.insert(expr.node_id, sp_mdid.clone())
+                                record_effect_call(env, Option::Some(sp_mdid))
+                              when Option::None then
+                                match scan_qualified_method_def(env, &imp_key)
+                                when Option::Some(sp_mdid2) then
+                                  env.typed_call_targets.insert(expr.node_id, sp_mdid2.clone())
+                                  record_effect_call(env, Option::Some(sp_mdid2))
+                                when Option::None then ()
+                                end
+                              end
+                            when _ then
                               match scan_qualified_method_def(env, &imp_key)
-                              when Option::Some(sp_mdid2) then
-                                env.typed_call_targets.insert(expr.node_id, sp_mdid2.clone())
-                                record_effect_call(env, Option::Some(sp_mdid2))
+                              when Option::Some(sp_mdid3) then
+                                env.typed_call_targets.insert(expr.node_id, sp_mdid3.clone())
+                                record_effect_call(env, Option::Some(sp_mdid3))
                               when Option::None then ()
                               end
                             end
-                          when _ then
-                            match scan_qualified_method_def(env, &imp_key)
-                            when Option::Some(sp_mdid3) then
-                              env.typed_call_targets.insert(expr.node_id, sp_mdid3.clone())
-                              record_effect_call(env, Option::Some(sp_mdid3))
-                            when Option::None then ()
+                          end
+                          # The solved substitution in the merged declaration
+                          # order; an unsolved parameter (a return-type-only
+                          # one solved by the caller's annotation context)
+                          # parks the call.
+                          var sp_all_solved = true
+                          var sp_solved = Vec::new()
+                          var sp_svi = 0
+                          while sp_svi < sp_vars.len() do
+                            let sp_rv = resolve_type_var(env, sp_vars[sp_svi].clone())
+                            match sp_rv
+                            when Type::Var(_) then sp_all_solved = false
+                            when _ then sp_solved.push(sp_rv)
                             end
+                            sp_svi = sp_svi + 1
                           end
-                        end
-                        # The solved substitution in the merged declaration
-                        # order; an unsolved parameter (a return-type-only
-                        # one solved by the caller's annotation context)
-                        # parks the call.
-                        var sp_all_solved = true
-                        var sp_solved = Vec::new()
-                        var sp_svi = 0
-                        while sp_svi < sp_vars.len() do
-                          let sp_rv = resolve_type_var(env, sp_vars[sp_svi].clone())
-                          match sp_rv
-                          when Type::Var(_) then sp_all_solved = false
-                          when _ then sp_solved.push(sp_rv)
+                          if sp_all_solved then
+                            env.typed_call_instances.insert(expr.node_id, sp_solved)
+                          elsif sp_names.len() > 0 then
+                            env.pending_call_instances.insert(expr.node_id, (sp_names.clone(), sp_vars, expr.span))
                           end
-                          sp_svi = sp_svi + 1
-                        end
-                        if sp_all_solved then
-                          env.typed_call_instances.insert(expr.node_id, sp_solved)
-                        elsif sp_names.len() > 0 then
-                          env.pending_call_instances.insert(expr.node_id, (sp_names.clone(), sp_vars, expr.span))
-                        end
-                        static_ret = Option::Some(resolve_type_var(env, sp_inst_ret))
+                          static_ret = Option::Some(resolve_type_var(env, sp_inst_ret))
+                      end
                       end
                     end
                     mj = mj + 1
@@ -18777,6 +19547,65 @@ def instantiate_generic_type(inout env: TypeEnv, ty: Type, inout var_map: Map[In
       var_map.insert(pkey, v.clone())
       v
     end
+  when Type::ConstParam(gpid) then
+    # (§20 slice 2): a SYMBOLIC const parameter reference in an
+    # instantiated signature gets ONE fresh inference variable for the whole
+    # call (shared between every occurrence, exactly like a type
+    # parameter). The variable unifies only with concrete Type::Const
+    # values (the const-slot unification and the call-site const-presolve);
+    # a recorded solved argument is the Type::Const the parameter was
+    # instantiated at.
+    let pkey = generic_param_id_numeric(&gpid)
+    match var_map.get(pkey)
+    when Option::Some(v) then v.clone()
+    when Option::None then
+      let v = fresh_type_var(env)
+      var_map.insert(pkey, v.clone())
+      v
+    end
+  when Type::FixedArraySym(elem, gpid) then
+    # (§20 slice 2): the symbolic-size array instantiates its ELEMENT like
+    # the concrete form; the SIZE parameter is registered for one shared
+    # inference variable (the const-presolve at the call binds it from a
+    # concrete fixed-array argument and the recorded argument is the
+    # Type::Const). The symbolic form survives the instantiation unchanged
+    # (the count slot cannot carry the variable); the call-site presolve
+    # REWRITES the surviving form to Type::FixedArray once the parameter is
+    # bound.
+    let elem2 = instantiate_generic_type(env, &elem, var_map)
+    let pkey = generic_param_id_numeric(&gpid)
+    match var_map.get(pkey)
+    when Option::Some(_) then ()
+    when Option::None then
+      let v = fresh_type_var(env)
+      var_map.insert(pkey, v.clone())
+    end
+    Type::FixedArraySym(elem2, gpid)
+  when Type::ConstSym(tree) then
+    # (§20 slice 2): a SYMBOLIC CONST-EXPRESSION argument in an
+    # instantiated signature: the TREE survives the instantiation unchanged
+    # (the const slot cannot carry an inference variable — a tree has no
+    # single value while its parameters are unresolved), and every
+    # parameter LEAF is registered for ONE shared inference variable for
+    # the whole call (exactly like FixedArraySym's size parameter), so the
+    # call-site const-presolve can bind the leaf's parameter and the
+    # surviving tree is REWRITTEN/FOLDED by subst_type_const_map once the
+    # parameter is bound. A leaf that belongs to an ENCLOSING declaration
+    # also registers (its enclosing instance substitutes it — the same
+    # forwarding the bare ConstParam form does at substitution).
+    let leaf_ids = const_sym_tree_param_ids(&tree)
+    var li = 0
+    while li < leaf_ids.len() do
+      let pkey = generic_param_id_numeric(&leaf_ids[li])
+      match var_map.get(pkey)
+      when Option::Some(_) then ()
+      when Option::None then
+        let v = fresh_type_var(env)
+        var_map.insert(pkey, v.clone())
+      end
+      li = li + 1
+    end
+    Type::ConstSym(tree)
   when Type::Adt(tid, args) then
     var new_args = Vec::new()
     var i = 0
@@ -18820,6 +19649,213 @@ def instantiate_generic_type(inout env: TypeEnv, ty: Type, inout var_map: Map[In
     # effect set of a generic signature's effect-typed parameter).
     Type::Effect(effects.clone(), instantiate_generic_type(env, inner, var_map))
   when _ then ty.clone()
+  end  end
+end
+
+# (§20 const generics, slice 2): rewrite the SYMBOLIC const forms of an
+# instantiated signature for which the call-site const-presolve collected a
+# constant: FixedArraySym(elem, gpid) with gpid -> Const(v) becomes the
+# CONCRETE Type::FixedArray(elem', v) (so the ordinary argument/return
+# unification compares fixed counts, and the callee's instantiated
+# signature carries the value); a bare ConstParam(gpid) becomes the
+# constant. Unbound symbolic forms and every other shape pass through (the
+# recursion mirrors subst_type_args).
+def subst_type_const_map(ty: Type, consts: Map[Int, Type]) -> Type
+  match ty
+  when Type::ConstParam(gpid) then
+    match consts.get(generic_param_id_numeric(&gpid))
+    when Option::Some(v) then v.clone()
+    when Option::None then ty.clone()
+    end
+  when Type::ConstSym(tree) then
+    # (§20 slice 2): a SYMBOLIC CONST-EXPRESSION argument under the
+    # call-site const bind map: the parameter leaves substitute through
+    # const_sym_tree_subst_consts (each leaf the presolve bound — or the
+    # ordinary unification solved into the bind map — folds to a literal)
+    # and the tree then FOLDS (const_sym_fold_type): a fully-bound tree is
+    # canonicalized to the VALUE Type::Const(v) in the instantiated
+    # signature / return type BEFORE the ordinary argument/return
+    # unification compares it (the signature-ConstSym folding half of the
+    # call-site const presolve — `Decimal128[SCALE + S2]` in a callee
+    # signature whose S2 the argument fixed folds to `Decimal128[12]` when
+    # SCALE was bound by the receiver/head); a tree with leaves the map
+    # does not bind stays the symbolic form (an enclosing declaration's
+    # parameters — forwarding — folded at the outer instance).
+    let t2 = const_sym_tree_subst_consts(&tree, consts)
+    const_sym_fold_type(&t2)
+  when Type::FixedArraySym(elem, gpid) then
+    let elem2 = subst_type_const_map(&elem, consts)
+    match consts.get(generic_param_id_numeric(&gpid))
+    when Option::Some(v) then
+      match v
+      when Type::Const(n) then Type::FixedArray(elem2, n)
+      when _ then Type::FixedArraySym(elem2, gpid)
+      end
+    when Option::None then Type::FixedArraySym(elem2, gpid)
+    end
+  when Type::Adt(tid, args) then
+    var new_args = Vec::new()
+    var i = 0
+    while i < args.len() do
+      new_args.push(subst_type_const_map(&args[i], consts))
+      i = i + 1
+    end
+    Type::Adt(tid, new_args)
+  when Type::RefInternal(inner, mutable) then Type::RefInternal(subst_type_const_map(&inner, consts), mutable)
+  when Type::Ptr(inner) then Type::Ptr(subst_type_const_map(&inner, consts))
+  when Type::PtrMut(inner) then Type::PtrMut(subst_type_const_map(&inner, consts))
+  when Type::Tuple(fields) then
+    var new_fields = Vec::new()
+    var i = 0
+    while i < fields.len() do
+      new_fields.push(subst_type_const_map(&fields[i], consts))
+      i = i + 1
+    end
+    Type::Tuple(new_fields)
+  when Type::FixedArray(elem, n) then Type::FixedArray(subst_type_const_map(&elem, consts), n)
+  when Type::FnPtr(params, ret, effects) then
+    var new_params = Vec::new()
+    var i = 0
+    while i < params.len() do
+      let pt = params[i]
+      new_params.push(ParamType { ty: subst_type_const_map(&pt.ty, consts), convention: pt.convention })
+      i = i + 1
+    end
+    Type::FnPtr(new_params, subst_type_const_map(&ret, consts), effects.clone())
+  when Type::Closure(cid, params, ret, captures, effects) then
+    var new_params = Vec::new()
+    var i = 0
+    while i < params.len() do
+      let pt = params[i]
+      new_params.push(ParamType { ty: subst_type_const_map(&pt.ty, consts), convention: pt.convention })
+      i = i + 1
+    end
+    Type::Closure(cid.clone(), new_params, subst_type_const_map(&ret, consts), subst_type_const_map(&captures, consts), effects.clone())
+  when Type::Effect(effects, inner) then
+    Type::Effect(effects.clone(), subst_type_const_map(&inner, consts))
+  when _ then ty.clone()
+  end  end
+end
+
+# (§20 const generics, slice 2): the call-site const-parameter PRESOLVE —
+# walk one instantiated callee signature type against its concrete argument
+# type and collect the callee const parameters the ARGUMENT fixes before the
+# ordinary argument unification runs:
+#   - FixedArraySym(elem, gpid) vs FixedArray(elem2, n) -> gpid := Const(n)
+#   - ConstParam(gpid)          vs Const(n)            -> gpid := Const(n)
+# Adt/Tuple/callable/container shapes recurse positionally. Only UNSET
+# const parameters bind (a second, conflicting source is left for the
+# ordinary unifier to report); Var/Param and non-const payloads contribute
+# nothing (the ordinary argument unification handles type parameters). The
+# presolve is what makes a const parameter INFERABLE from an argument whose
+# type contains the parameter's fixed size (`def arr_id[T, const N: UInt](
+# v: [T; N]) -> [T; N]` called with a [Int; 4] argument binds N := Const(4)
+# and instantiates the callee at N=4).
+def presolve_const_args_from_types(sig_ty: Type, arg_ty: Type, inout binds: Map[Int, Type]) -> Unit
+  match sig_ty
+  when Type::FixedArraySym(elem, gpid) then
+    match arg_ty
+    when Type::FixedArray(arg_elem, n) then
+      let pkey = generic_param_id_numeric(&gpid)
+      if !binds.contains_key(&pkey) then
+        binds.insert(pkey, Type::Const(n))
+      end
+      presolve_const_args_from_types(&elem, &arg_elem, binds)
+    when _ then ()
+    end
+  when Type::ConstParam(gpid) then
+    match arg_ty
+    when Type::Const(_) then
+      let pkey = generic_param_id_numeric(&gpid)
+      if !binds.contains_key(&pkey) then
+        binds.insert(pkey, arg_ty.clone())
+      end
+    when _ then ()
+    end
+  when Type::Adt(tid1, args1) then
+    match arg_ty
+    when Type::Adt(tid2, args2) then
+      if tid1.id == tid2.id then
+        var i = 0
+        while i < args1.len() && i < args2.len() do
+          presolve_const_args_from_types(&args1[i], &args2[i], binds)
+          i = i + 1
+        end
+      end
+    when _ then ()
+    end
+  when Type::Tuple(elems1) then
+    match arg_ty
+    when Type::Tuple(elems2) then
+      var i = 0
+      while i < elems1.len() && i < elems2.len() do
+        presolve_const_args_from_types(&elems1[i], &elems2[i], binds)
+        i = i + 1
+      end
+    when _ then ()
+    end
+  when Type::FixedArray(elem1, _) then
+    match arg_ty
+    when Type::FixedArray(elem2, _) then presolve_const_args_from_types(&elem1, &elem2, binds)
+    when _ then ()
+    end
+  when Type::FnPtr(params1, ret1, _) then
+    match arg_ty
+    when Type::FnPtr(params2, ret2, _) then
+      var i = 0
+      while i < params1.len() && i < params2.len() do
+        presolve_const_args_from_types(&params1[i].ty, &params2[i].ty, binds)
+        i = i + 1
+      end
+      presolve_const_args_from_types(&ret1, &ret2, binds)
+    when Type::Closure(_, params2, ret2, _, _) then
+      var i = 0
+      while i < params1.len() && i < params2.len() do
+        presolve_const_args_from_types(&params1[i].ty, &params2[i].ty, binds)
+        i = i + 1
+      end
+      presolve_const_args_from_types(&ret1, &ret2, binds)
+    when _ then ()
+    end
+  when Type::Closure(_, params1, ret1, _, _) then
+    match arg_ty
+    when Type::FnPtr(params2, ret2, _) then
+      var i = 0
+      while i < params1.len() && i < params2.len() do
+        presolve_const_args_from_types(&params1[i].ty, &params2[i].ty, binds)
+        i = i + 1
+      end
+      presolve_const_args_from_types(&ret1, &ret2, binds)
+    when Type::Closure(_, params2, ret2, _, _) then
+      var i = 0
+      while i < params1.len() && i < params2.len() do
+        presolve_const_args_from_types(&params1[i].ty, &params2[i].ty, binds)
+        i = i + 1
+      end
+      presolve_const_args_from_types(&ret1, &ret2, binds)
+    when _ then ()
+    end
+  when Type::RefInternal(inner1, _) then
+    match arg_ty
+    when Type::RefInternal(inner2, _) then presolve_const_args_from_types(&inner1, &inner2, binds)
+    when _ then ()
+    end
+  when Type::Ptr(inner1) then
+    match arg_ty
+    when Type::Ptr(inner2) then presolve_const_args_from_types(&inner1, &inner2, binds)
+    when _ then ()
+    end
+  when Type::PtrMut(inner1) then
+    match arg_ty
+    when Type::PtrMut(inner2) then presolve_const_args_from_types(&inner1, &inner2, binds)
+    when _ then ()
+    end
+  when Type::Effect(_, inner1) then
+    match arg_ty
+    when Type::Effect(_, inner2) then presolve_const_args_from_types(&inner1, &inner2, binds)
+    when _ then ()
+    end
+  when _ then ()
   end  end
 end
 
@@ -18886,14 +19922,29 @@ def instantiate_method_type(inout env: TypeEnv, imp: ImplInfo, m: MethodInfo, re
   end
   # Instantiate the method signature with the SAME variables used for the
   # head: one inference variable per generic parameter for the whole call.
+  # (§20 const generics, slice 2): each variable is CHASED through the
+  # unifier BEFORE the substitution — an impl-level parameter solved by the
+  # head unification (a const parameter's variable bound to Type::Const(4)
+  # by the receiver's const argument, a type parameter bound to the
+  # receiver's type argument) substitutes its SOLVED argument into the
+  # signature, so a symbolic-size array [T; N] / Adt const slot in the
+  # method's own parameters or return becomes the CONCRETE fixed-count /
+  # Const form. An unsolved variable resolves to itself (unchanged
+  # behavior — the argument unification below binds it).
+  var all_vars_resolved = Vec::new()
+  var avi = 0
+  while avi < all_vars.len() do
+    all_vars_resolved.push(resolve_type_var(env, all_vars[avi].clone()))
+    avi = avi + 1
+  end
   var inst_params = Vec::new()
   var pi = 0
   while pi < m.params.len() do
     let pt = m.params[pi]
-    inst_params.push(ParamType { ty: subst_type_args(&pt.ty, &all_names, &all_vars), convention: pt.convention })
+    inst_params.push(ParamType { ty: subst_type_args(&pt.ty, &all_names, &all_vars_resolved), convention: pt.convention })
     pi = pi + 1
   end
-  let inst_ret = subst_type_args(&m.ret_type, &all_names, &all_vars)
+  let inst_ret = subst_type_args(&m.ret_type, &all_names, &all_vars_resolved)
   # Unify the arguments against the instantiated signature (the receiver
   # self parameter excluded). This is what solves method-level inference
   # variables such as U in `map[U]`.
@@ -19090,6 +20141,12 @@ def resolve_method_type(inout env: TypeEnv, recv_type: Type, method: String, arg
   # parameter and the first unsolved bound ("method `peek_front` requires
   # `T: Copy`") instead of the generic no-method error.
   var blocked: Option[String] = Option::None
+  # (audit §34): the derivational payload of the bound failure — the
+  # first blocked bound's trait (for the constraint chain) and the
+  # per-candidate rows of every bounded candidate the receiver rejected
+  # (trait_trace).
+  var blocked_trait: Option[String] = Option::None
+  var cand_rows: Vec[String] = Vec::new()
   # Auto-deref through references
   let base = match recv_type
   when Type::RefInternal(inner, _) then inner
@@ -19166,14 +20223,23 @@ def resolve_method_type(inout env: TypeEnv, recv_type: Type, method: String, arg
                       return m.ret_type
                     end
                   else
-                    match blocked
-                    when Option::None then
-                      match impl_bounds_violation(env, &imp, &resolved_base)
-                      when Option::Some((bpname, btname)) then
+                    # (audit §34): every bounded candidate whose bounds the
+                    # receiver does not satisfy is probed for the SPECIFIC
+                    # violation (the probe is transactional — no
+                    # substitution or diagnostic residue); the FIRST
+                    # violation becomes the message (the historical
+                    # behavior), the rows of every violation become the
+                    # trait_trace.
+                    match impl_bounds_violation(env, &imp, &resolved_base)
+                    when Option::Some((bpname, btname)) then
+                      match blocked
+                      when Option::None then
                         blocked = Option::Some("method `" + method + "` requires `" + bpname + ": " + btname + "`")
-                      when Option::None then ()
+                        blocked_trait = Option::Some(btname)
+                      when Option::Some(_) then ()
                       end
-                    when Option::Some(_) then ()
+                      cand_rows.push("candidate impl `" + type_tag(env, &imp.for_type) + "`: method `" + method + "` present but the receiver does not satisfy the impl bound `" + bpname + ": " + btname + "`")
+                    when Option::None then ()
                     end
                   end
                 end
@@ -19541,8 +20607,55 @@ def resolve_method_type(inout env: TypeEnv, recv_type: Type, method: String, arg
   # receiver because the impl's bounds are unsatisfied.
   if env.strict_resolution then
     match blocked
-    when Option::Some(blocked_msg) then type_add_error(env, blocked_msg, span)
-    when Option::None then type_add_error(env, "no method `" + method + "` on receiver type", span)
+    when Option::Some(blocked_msg) then
+      # (audit §34): the derivational payload of the bound failure — the
+      # constraint_trace rows walk the receiver's nested field chain to
+      # the first constituent that fails the bound (root type -> field ->
+      # field's type -> why), the trait_trace rows list every bounded
+      # candidate impl that was rejected plus the remaining answer (the
+      # message). The message text itself is unchanged.
+      var chain_rows = Vec::new()
+      match blocked_trait
+      when Option::Some(btname2) then
+        let bt_id = trait_id_for(env, &btname2)
+        if bt_id.id >= 0 then
+          chain_rows = bound_failure_chain_rows(env, resolved_base.clone(), bt_id.id, btname2)
+        end
+      when Option::None then ()
+      end
+      let recv_render = type_display(env, &resolved_base)
+      let mut all_rows = Vec::new()
+      for cr in cand_rows do
+        all_rows.push(cr)
+      end
+      all_rows.push("no applicable method remains: " + blocked_msg)
+      env.errors.push(TypeError {
+        message: blocked_msg,
+        span: span,
+        code: Option::None,
+        primary_symbol: Option::Some(recv_render.clone()),
+        semantic_site: Option::Some("method call resolution"),
+        constraint_trace: chain_rows,
+        trait_trace: all_rows,
+        related_symbols: Vec::from([method.clone(), recv_render])
+      })
+    when Option::None then
+      # (audit §34): the generic no-method error carries the candidate rows
+      # recorded above (empty when no bounded candidate was rejected).
+      var all_rows2 = Vec::new()
+      for cr2 in cand_rows do
+        all_rows2.push(cr2)
+      end
+      all_rows2.push("no method `" + method + "` is applicable to the receiver")
+      env.errors.push(TypeError {
+        message: "no method `" + method + "` on receiver type",
+        span: span,
+        code: Option::None,
+        primary_symbol: Option::Some(type_display(env, &resolved_base)),
+        semantic_site: Option::Some("method call resolution"),
+        trait_trace: all_rows2,
+        related_symbols: Vec::from([method.clone()])
+      })
     end
     Type::Error
   else
@@ -19754,6 +20867,691 @@ def eval_const_size_expr(env: TypeEnv, expr: Expr) -> Option[Int]
   end  end
 end
 
+# (§20 const generics, slice 2): the const-ARGUMENT evaluator — fold a
+# type-argument const expression (`2 + 2`, `LIMIT * 2`, `-(A + B)`) to its
+# host integer value. The resolution discipline mirrors the [T; N] size
+# evaluator (eval_const_size_expr: literals, module-const references through
+# env.const_values under the current module's qualified key, qualified path
+# references under their own joined key, the integer arithmetic operators
+# Add/Sub/Mul/Div/Mod and unary negation) over the SIGNED value domain: a
+# const generic argument of a signed parameter type may be negative, so the
+# evaluator does NOT impose the size evaluator's non-negativity — only the
+# fail-closed arithmetic (an overflowing Add/Sub/Mul, a division by zero, a
+# non-integer operator) returns None. The caller folds to Type::Const(value)
+# — canonical identity is the VALUE, so Const(4) from `2 + 2` equals
+# Const(4) from `4` and from a `const FOUR: Int = 4` reference alike.
+def eval_const_arg_expr(env: TypeEnv, expr: Expr) -> Option[Int]
+  match expr.kind
+  when ExprKind::ExprIntLit(n) then Option::Some(parsed_int_to_host(&n))
+  when ExprKind::ExprIdent(name) then
+    match env.const_values.get(module_qualified_key(&env.current_module_path, &name))
+    when Option::Some(n) then Option::Some(n)
+    when Option::None then Option::None
+    end
+  when ExprKind::ExprPath(path) then
+    if path.segments.len() > 1 then
+      match env.const_values.get(path.segments.join("::"))
+      when Option::Some(n) then Option::Some(n)
+      when Option::None then Option::None
+      end
+    else
+      let name = if path.segments.len() > 0 then path.segments[0] else "" end
+      match env.const_values.get(module_qualified_key(&env.current_module_path, &name))
+      when Option::Some(n) then Option::Some(n)
+      when Option::None then Option::None
+      end
+    end
+  when ExprKind::ExprBinaryOp(op, lhs, rhs) then
+    match eval_const_arg_expr(env, &lhs)
+    when Option::Some(a) then
+      match eval_const_arg_expr(env, &rhs)
+      when Option::Some(b) then
+        match op
+        when BinOp::Add then
+          # Overflow-checked signed addition (the parser's literal domain is
+          # [-MAX, MAX], so a + b can only overflow past the host bounds).
+          if b >= 0 then
+            if a <= 9223372036854775807 - b then Option::Some(a + b) else Option::None end
+          else
+            if a >= -9223372036854775807 - b - 1 then Option::Some(a + b) else Option::None end
+          end
+        when BinOp::Sub then
+          if b >= 0 then
+            if a >= -9223372036854775808 + b then Option::Some(a - b) else Option::None end
+          else
+            if a <= 9223372036854775807 + b then Option::Some(a - b) else Option::None end
+          end
+        when BinOp::Mul then
+          # Overflow-checked multiplication over the parser's literal domain.
+          # The MIN edge (a host-MIN operand can only arise from nested
+          # subtraction) multiplies safely only by 0 (handled) or 1; any
+          # other factor overflows the host. For every other operand the
+          # magnitudes fit MAX, and the product fits iff |a| <= MAX / |b|.
+          if a == 0 || b == 0 then Option::Some(0)
+          elsif a == -9223372036854775808 then
+            if b == 1 then Option::Some(a) else Option::None end
+          elsif b == -9223372036854775808 then
+            if a == 1 then Option::Some(b) else Option::None end
+          else
+            let mag_a = if a < 0 then 0 - a else a end
+            let mag_b = if b < 0 then 0 - b else b end
+            if mag_a <= 9223372036854775807 / mag_b then Option::Some(a * b) else Option::None end
+          end
+        when BinOp::Div then
+          # The MIN / -1 division overflows the host — fail closed.
+          if b != 0 && !(a == -9223372036854775808 && b == -1) then Option::Some(a / b) else Option::None end
+        when BinOp::Mod then if b != 0 then Option::Some(a % b) else Option::None end
+        when _ then Option::None
+        end
+      when Option::None then Option::None
+      end
+    when Option::None then Option::None
+    end
+  when ExprKind::ExprUnaryOp(UnOp::Neg, operand) then
+    match eval_const_arg_expr(env, &operand)
+    when Option::Some(n) then
+      if n == -9223372036854775808 then Option::None else Option::Some(0 - n) end
+    when Option::None then Option::None
+    end
+  when _ then Option::None
+  end  end
+end
+
+# (§20 const generics, slice 2): build the SYMBOLIC const-expression tree of
+# a const-ARGUMENT expression (the TypeExprKind::ConstExpr forms) over
+# IN-SCOPE const generic parameters — the expression the value evaluator
+# (eval_const_arg_expr) could not fold because it references a const generic
+# parameter of the enclosing declaration (`Decimal128[SCALE + S2]` inside
+# the impl whose SCALE/S2 bind as Type::ConstParam). Resolution discipline
+# per identifier, matching the value evaluator's channels plus the scope:
+#   - a scope binding that is a CONST PARAMETER (lookup_var ->
+#     Type::ConstParam(gpid)) becomes a ConstParamRef leaf — the scope is
+#     consulted FIRST, so a const parameter SHADOWING a same-named module
+#     const reads as the parameter (a type-argument position is a type
+#     position: the in-scope binding is the closer authority);
+#   - a scope binding that is NOT a const parameter (a local, a TYPE
+#     parameter) is not a constant — the whole build fails (None) and the
+#     caller keeps the const-argument diagnostic;
+#   - an unbound name falls through to the module-const channels
+#     (env.const_values under the current module's qualified key; a
+#     qualified multi-segment path under its own joined key) — a module
+#     const is a CONCRETE value at resolve time and folds to a ConstLit
+#     leaf, so only parameters stay symbolic;
+#   - the integer arithmetic operators Add/Sub/Mul/Div/Mod and unary Neg
+#     build the tree; every other expression shape (calls, comparisons,
+#     non-integer operators, unresolved names) fails the whole build.
+# No overflow/range checking happens here — arithmetic is checked at FOLD
+# time (const_sym_tree_eval), when the leaves have values.
+def const_sym_tree_build(env: TypeEnv, expr: Expr) -> Option[ConstExprT]
+  match expr.kind
+  when ExprKind::ExprIntLit(n) then Option::Some(ConstExprT::ConstLit(parsed_int_to_host(&n)))
+  when ExprKind::ExprIdent(name) then
+    match lookup_var(env, name)
+    when Option::Some(ty) then
+      match ty
+      when Type::ConstParam(gpid) then Option::Some(ConstExprT::ConstParamRef(gpid.clone()))
+      when _ then Option::None
+      end
+    when Option::None then
+      match env.const_values.get(module_qualified_key(&env.current_module_path, &name))
+      when Option::Some(n) then Option::Some(ConstExprT::ConstLit(n))
+      when Option::None then Option::None
+      end
+    end
+  when ExprKind::ExprPath(path) then
+    if path.segments.len() > 1 then
+      match env.const_values.get(path.segments.join("::"))
+      when Option::Some(n) then Option::Some(ConstExprT::ConstLit(n))
+      when Option::None then Option::None
+      end
+    else
+      let name = if path.segments.len() > 0 then path.segments[0] else "" end
+      match lookup_var(env, name)
+      when Option::Some(ty) then
+        match ty
+        when Type::ConstParam(gpid) then Option::Some(ConstExprT::ConstParamRef(gpid.clone()))
+        when _ then Option::None
+        end
+      when Option::None then
+        match env.const_values.get(module_qualified_key(&env.current_module_path, &name))
+        when Option::Some(n) then Option::Some(ConstExprT::ConstLit(n))
+        when Option::None then Option::None
+        end
+      end
+    end
+  when ExprKind::ExprBinaryOp(op, lhs, rhs) then
+    match const_sym_tree_build(env, &lhs)
+    when Option::Some(l) then
+      match const_sym_tree_build(env, &rhs)
+      when Option::Some(r) then
+        # A division/modulo by a FULLY-CONCRETE zero divisor is rejected at
+        # resolve (the same fail-closed rule as the value evaluator — a
+        # literal/const zero divisor can never become non-zero at
+        # instantiation); a SYMBOLIC divisor that happens to fold to zero
+        # later is caught at fold time (the substitution keeps the tree
+        # symbolic and the residual scans report it).
+        if (op is BinOp::Div || op is BinOp::Mod) then
+          match const_sym_tree_eval(&r)
+          when Option::Some(z) then
+            if z == 0 then Option::None
+            else
+              match op
+              when BinOp::Div then Option::Some(ConstExprT::ConstDiv(l, r))
+              when BinOp::Mod then Option::Some(ConstExprT::ConstMod(l, r))
+              when _ then Option::None
+              end
+            end
+          when Option::None then
+            match op
+            when BinOp::Div then Option::Some(ConstExprT::ConstDiv(l, r))
+            when BinOp::Mod then Option::Some(ConstExprT::ConstMod(l, r))
+            when _ then Option::None
+            end
+          end
+        else
+          match op
+          when BinOp::Add then Option::Some(ConstExprT::ConstAdd(l, r))
+          when BinOp::Sub then Option::Some(ConstExprT::ConstSub(l, r))
+          when BinOp::Mul then Option::Some(ConstExprT::ConstMul(l, r))
+          when _ then Option::None
+          end
+        end
+      when Option::None then Option::None
+      end
+    when Option::None then Option::None
+    end
+  when ExprKind::ExprUnaryOp(UnOp::Neg, operand) then
+    match const_sym_tree_build(env, &operand)
+    when Option::Some(o) then Option::Some(ConstExprT::ConstNeg(o))
+    when Option::None then Option::None
+    end
+  when _ then Option::None
+  end  end
+end
+
+# (§20 const generics, slice 2): FOLD a symbolic const-expression tree to its
+# host integer value when EVERY leaf is a literal (no unbound const-parameter
+# leaves). The arithmetic is the value evaluator's EXACT fail-closed domain
+# (overflowing Add/Sub/Mul, MIN / -1 and MIN negation, division by zero all
+# return None) — the folded value must be as trustworthy as the direct
+# literal fold, because the caller turns it into the canonical Type::Const
+# identity. A tree with parameter leaves returns None (still symbolic).
+def const_sym_tree_eval(tree: ConstExprT) -> Option[Int]
+  match tree
+  when ConstExprT::ConstLit(v) then Option::Some(v)
+  when ConstExprT::ConstParamRef(_) then Option::None
+  when ConstExprT::ConstAdd(l, r) then
+    match const_sym_tree_eval(&l)
+    when Option::Some(a) then
+      match const_sym_tree_eval(&r)
+      when Option::Some(b) then
+        if b >= 0 then
+          if a <= 9223372036854775807 - b then Option::Some(a + b) else Option::None end
+        else
+          if a >= -9223372036854775807 - b - 1 then Option::Some(a + b) else Option::None end
+        end
+      when Option::None then Option::None
+      end
+    when Option::None then Option::None
+    end
+  when ConstExprT::ConstSub(l, r) then
+    match const_sym_tree_eval(&l)
+    when Option::Some(a) then
+      match const_sym_tree_eval(&r)
+      when Option::Some(b) then
+        if b >= 0 then
+          if a >= -9223372036854775808 + b then Option::Some(a - b) else Option::None end
+        else
+          if a <= 9223372036854775807 + b then Option::Some(a - b) else Option::None end
+        end
+      when Option::None then Option::None
+      end
+    when Option::None then Option::None
+    end
+  when ConstExprT::ConstMul(l, r) then
+    match const_sym_tree_eval(&l)
+    when Option::Some(a) then
+      match const_sym_tree_eval(&r)
+      when Option::Some(b) then
+        if a == 0 || b == 0 then Option::Some(0)
+        elsif a == -9223372036854775808 then
+          if b == 1 then Option::Some(a) else Option::None end
+        elsif b == -9223372036854775808 then
+          if a == 1 then Option::Some(b) else Option::None end
+        else
+          let mag_a = if a < 0 then 0 - a else a end
+          let mag_b = if b < 0 then 0 - b else b end
+          if mag_a <= 9223372036854775807 / mag_b then Option::Some(a * b) else Option::None end
+        end
+      when Option::None then Option::None
+      end
+    when Option::None then Option::None
+    end
+  when ConstExprT::ConstDiv(l, r) then
+    match const_sym_tree_eval(&l)
+    when Option::Some(a) then
+      match const_sym_tree_eval(&r)
+      when Option::Some(b) then
+        if b != 0 && !(a == -9223372036854775808 && b == -1) then Option::Some(a / b) else Option::None end
+      when Option::None then Option::None
+      end
+    when Option::None then Option::None
+    end
+  when ConstExprT::ConstMod(l, r) then
+    match const_sym_tree_eval(&l)
+    when Option::Some(a) then
+      match const_sym_tree_eval(&r)
+      when Option::Some(b) then
+        if b != 0 then Option::Some(a % b) else Option::None end
+      when Option::None then Option::None
+      end
+    when Option::None then Option::None
+    end
+  when ConstExprT::ConstNeg(o) then
+    match const_sym_tree_eval(&o)
+    when Option::Some(n) then
+      if n == -9223372036854775808 then Option::None else Option::Some(0 - n) end
+    when Option::None then Option::None
+    end
+  end  end
+end
+
+# (§20 slice 2): whether a symbolic const-expression tree references ANY
+# const generic parameter (a ConstParamRef leaf anywhere). A tree built from
+# a const-argument expression always does (fully-concrete expressions fold
+# to Type::Const at resolve and never become trees), but substitution can
+# leave a tree with only literal leaves in principle — the callers fold such
+# a tree eagerly, so this test is the residual-parameter scan's view.
+def const_sym_tree_has_param(tree: ConstExprT) -> Bool
+  match tree
+  when ConstExprT::ConstLit(_) then false
+  when ConstExprT::ConstParamRef(_) then true
+  when ConstExprT::ConstAdd(l, r) then const_sym_tree_has_param(&l) || const_sym_tree_has_param(&r)
+  when ConstExprT::ConstSub(l, r) then const_sym_tree_has_param(&l) || const_sym_tree_has_param(&r)
+  when ConstExprT::ConstMul(l, r) then const_sym_tree_has_param(&l) || const_sym_tree_has_param(&r)
+  when ConstExprT::ConstDiv(l, r) then const_sym_tree_has_param(&l) || const_sym_tree_has_param(&r)
+  when ConstExprT::ConstMod(l, r) then const_sym_tree_has_param(&l) || const_sym_tree_has_param(&r)
+  when ConstExprT::ConstNeg(o) then const_sym_tree_has_param(&o)
+  end  end
+end
+
+# (§20 slice 2): whether a symbolic const-expression tree references ONE
+# specific const generic parameter (leaf-id equality) — the tree view of
+# type_uses_param_id / type_uses_const_param (the residual-parameter scans).
+def const_sym_tree_uses_param(tree: ConstExprT, gpid: GenericParamId) -> Bool
+  match tree
+  when ConstExprT::ConstLit(_) then false
+  when ConstExprT::ConstParamRef(g) then generic_param_id_eq(&g, &gpid)
+  when ConstExprT::ConstAdd(l, r) then const_sym_tree_uses_param(&l, gpid) || const_sym_tree_uses_param(&r, gpid)
+  when ConstExprT::ConstSub(l, r) then const_sym_tree_uses_param(&l, gpid) || const_sym_tree_uses_param(&r, gpid)
+  when ConstExprT::ConstMul(l, r) then const_sym_tree_uses_param(&l, gpid) || const_sym_tree_uses_param(&r, gpid)
+  when ConstExprT::ConstDiv(l, r) then const_sym_tree_uses_param(&l, gpid) || const_sym_tree_uses_param(&r, gpid)
+  when ConstExprT::ConstMod(l, r) then const_sym_tree_uses_param(&l, gpid) || const_sym_tree_uses_param(&r, gpid)
+  when ConstExprT::ConstNeg(o) then const_sym_tree_uses_param(&o, gpid)
+  end  end
+end
+
+# (§20 slice 2): the GenericParamIds of every parameter LEAF of a symbolic
+# const-expression tree (duplicates possible — the SAME parameter may appear
+# twice in one expression). The registrars (instantiate_generic_type,
+# collect_param_names_from_type) dedupe by id.
+def const_sym_tree_param_ids(tree: ConstExprT) -> Vec[GenericParamId]
+  match tree
+  when ConstExprT::ConstLit(_) then Vec::new()
+  when ConstExprT::ConstParamRef(gpid) then Vec::from([gpid.clone()])
+  when ConstExprT::ConstAdd(l, r) then
+    let left = const_sym_tree_param_ids(&l)
+    let right = const_sym_tree_param_ids(&r)
+    var out = Vec::new()
+    var i = 0
+    while i < left.len() do
+      out.push(left[i].clone())
+      i = i + 1
+    end
+    var j = 0
+    while j < right.len() do
+      out.push(right[j].clone())
+      j = j + 1
+    end
+    out
+  when ConstExprT::ConstSub(l, r) then
+    let left = const_sym_tree_param_ids(&l)
+    let right = const_sym_tree_param_ids(&r)
+    var out = Vec::new()
+    var i = 0
+    while i < left.len() do
+      out.push(left[i].clone())
+      i = i + 1
+    end
+    var j = 0
+    while j < right.len() do
+      out.push(right[j].clone())
+      j = j + 1
+    end
+    out
+  when ConstExprT::ConstMul(l, r) then
+    let left = const_sym_tree_param_ids(&l)
+    let right = const_sym_tree_param_ids(&r)
+    var out = Vec::new()
+    var i = 0
+    while i < left.len() do
+      out.push(left[i].clone())
+      i = i + 1
+    end
+    var j = 0
+    while j < right.len() do
+      out.push(right[j].clone())
+      j = j + 1
+    end
+    out
+  when ConstExprT::ConstDiv(l, r) then
+    let left = const_sym_tree_param_ids(&l)
+    let right = const_sym_tree_param_ids(&r)
+    var out = Vec::new()
+    var i = 0
+    while i < left.len() do
+      out.push(left[i].clone())
+      i = i + 1
+    end
+    var j = 0
+    while j < right.len() do
+      out.push(right[j].clone())
+      j = j + 1
+    end
+    out
+  when ConstExprT::ConstMod(l, r) then
+    let left = const_sym_tree_param_ids(&l)
+    let right = const_sym_tree_param_ids(&r)
+    var out = Vec::new()
+    var i = 0
+    while i < left.len() do
+      out.push(left[i].clone())
+      i = i + 1
+    end
+    var j = 0
+    while j < right.len() do
+      out.push(right[j].clone())
+      j = j + 1
+    end
+    out
+  when ConstExprT::ConstNeg(o) then const_sym_tree_param_ids(&o)
+  end  end
+end
+
+# (§20 slice 2): ORDER-SENSITIVE STRUCTURAL tree equality — two ConstSym
+# trees are the same type argument exactly when they are the same tree over
+# the same parameter ids and literal values (`SCALE + S2` != `S2 + SCALE`
+# while symbolic; both fold to the same Const after binding — see the
+# ConstExprT lifecycle note). This is the tree identity used by unification
+# and the structural type equality paths.
+def const_sym_tree_eq(a: ConstExprT, b: ConstExprT) -> Bool
+  match a
+  when ConstExprT::ConstLit(v1) then
+    match b
+    when ConstExprT::ConstLit(v2) then v1 == v2
+    when _ then false
+    end
+  when ConstExprT::ConstParamRef(g1) then
+    match b
+    when ConstExprT::ConstParamRef(g2) then generic_param_id_eq(&g1, &g2)
+    when _ then false
+    end
+  when ConstExprT::ConstAdd(l1, r1) then
+    match b
+    when ConstExprT::ConstAdd(l2, r2) then const_sym_tree_eq(&l1, &l2) && const_sym_tree_eq(&r1, &r2)
+    when _ then false
+    end
+  when ConstExprT::ConstSub(l1, r1) then
+    match b
+    when ConstExprT::ConstSub(l2, r2) then const_sym_tree_eq(&l1, &l2) && const_sym_tree_eq(&r1, &r2)
+    when _ then false
+    end
+  when ConstExprT::ConstMul(l1, r1) then
+    match b
+    when ConstExprT::ConstMul(l2, r2) then const_sym_tree_eq(&l1, &l2) && const_sym_tree_eq(&r1, &r2)
+    when _ then false
+    end
+  when ConstExprT::ConstDiv(l1, r1) then
+    match b
+    when ConstExprT::ConstDiv(l2, r2) then const_sym_tree_eq(&l1, &l2) && const_sym_tree_eq(&r1, &r2)
+    when _ then false
+    end
+  when ConstExprT::ConstMod(l1, r1) then
+    match b
+    when ConstExprT::ConstMod(l2, r2) then const_sym_tree_eq(&l1, &l2) && const_sym_tree_eq(&r1, &r2)
+    when _ then false
+    end
+  when ConstExprT::ConstNeg(o1) then
+    match b
+    when ConstExprT::ConstNeg(o2) then const_sym_tree_eq(&o1, &o2)
+    when _ then false
+    end
+  end  end
+end
+
+# (§20 slice 2): the DETERMINISTIC NUMERIC rendering of a symbolic
+# const-expression tree (literal values verbatim, parameters as their
+# numeric GenericParamId) — the identity-key form used where no
+# param-name table is in scope (mir.tg's mir_type_identity_key /
+# format_mir_type, the mono instance scans). Two trees render equal exactly
+# when const_sym_tree_eq says they are equal.
+def const_sym_tree_render_numeric(tree: ConstExprT) -> String
+  match tree
+  when ConstExprT::ConstLit(v) then v.to_string()
+  when ConstExprT::ConstParamRef(gpid) then "param" + generic_param_id_numeric(&gpid).to_string()
+  when ConstExprT::ConstAdd(l, r) then "((" + const_sym_tree_render_numeric(&l) + ")+(" + const_sym_tree_render_numeric(&r) + "))"
+  when ConstExprT::ConstSub(l, r) then "((" + const_sym_tree_render_numeric(&l) + ")-(" + const_sym_tree_render_numeric(&r) + "))"
+  when ConstExprT::ConstMul(l, r) then "((" + const_sym_tree_render_numeric(&l) + ")*(" + const_sym_tree_render_numeric(&r) + "))"
+  when ConstExprT::ConstDiv(l, r) then "((" + const_sym_tree_render_numeric(&l) + ")/(" + const_sym_tree_render_numeric(&r) + "))"
+  when ConstExprT::ConstMod(l, r) then "((" + const_sym_tree_render_numeric(&l) + ")%(" + const_sym_tree_render_numeric(&r) + "))"
+  when ConstExprT::ConstNeg(o) then "(-(" + const_sym_tree_render_numeric(&o) + "))"
+  end  end
+end
+
+# (§20 slice 2): the NAME rendering of a symbolic const-expression tree
+# (literal values verbatim, parameters as their registered names) — the
+# diagnostics form (type_tag / type_display).
+def const_sym_tree_render_named(env: TypeEnv, tree: ConstExprT) -> String
+  match tree
+  when ConstExprT::ConstLit(v) then v.to_string()
+  when ConstExprT::ConstParamRef(gpid) then generic_param_name_of(&env.generic_param_table, &gpid)
+  when ConstExprT::ConstAdd(l, r) then "((" + const_sym_tree_render_named(env, &l) + ")+(" + const_sym_tree_render_named(env, &r) + "))"
+  when ConstExprT::ConstSub(l, r) then "((" + const_sym_tree_render_named(env, &l) + ")-(" + const_sym_tree_render_named(env, &r) + "))"
+  when ConstExprT::ConstMul(l, r) then "((" + const_sym_tree_render_named(env, &l) + ")*(" + const_sym_tree_render_named(env, &r) + "))"
+  when ConstExprT::ConstDiv(l, r) then "((" + const_sym_tree_render_named(env, &l) + ")/(" + const_sym_tree_render_named(env, &r) + "))"
+  when ConstExprT::ConstMod(l, r) then "((" + const_sym_tree_render_named(env, &l) + ")%(" + const_sym_tree_render_named(env, &r) + "))"
+  when ConstExprT::ConstNeg(o) then "(-(" + const_sym_tree_render_named(env, &o) + "))"
+  end  end
+end
+
+# (§20 slice 2): the NAME rendering of a symbolic const-expression tree
+# against a GenericParamId -> name TABLE (the canonical-identity form —
+# type_canon_render's param_names map; parameters render by their
+# registered names, exactly like the numeric form renders by id).
+def const_sym_tree_render_names(tree: ConstExprT, names: Map[Int, String]) -> String
+  match tree
+  when ConstExprT::ConstLit(v) then v.to_string()
+  when ConstExprT::ConstParamRef(gpid) then generic_param_name_from(&names, &gpid)
+  when ConstExprT::ConstAdd(l, r) then "((" + const_sym_tree_render_names(&l, names) + ")+(" + const_sym_tree_render_names(&r, names) + "))"
+  when ConstExprT::ConstSub(l, r) then "((" + const_sym_tree_render_names(&l, names) + ")-(" + const_sym_tree_render_names(&r, names) + "))"
+  when ConstExprT::ConstMul(l, r) then "((" + const_sym_tree_render_names(&l, names) + ")*(" + const_sym_tree_render_names(&r, names) + "))"
+  when ConstExprT::ConstDiv(l, r) then "((" + const_sym_tree_render_names(&l, names) + ")/(" + const_sym_tree_render_names(&r, names) + "))"
+  when ConstExprT::ConstMod(l, r) then "((" + const_sym_tree_render_names(&l, names) + ")%(" + const_sym_tree_render_names(&r, names) + "))"
+  when ConstExprT::ConstNeg(o) then "(-(" + const_sym_tree_render_names(&o, names) + "))"
+  end  end
+end
+
+# (§20 slice 2): the SUBSTITUTION of a symbolic const-expression tree under a
+# POSITIONAL generic-argument list (the tree view of subst_type_args — a
+# ConstParamRef leaf whose GenericParamId aligns with the list is replaced
+# by its argument: Type::Const(v) folds to a literal leaf, a forwarded
+# Type::ConstParam(g2) re-points the leaf at the outer parameter, a nested
+# Type::ConstSym argument splices its tree at the leaf; an unaligned or
+# non-value argument leaves the leaf symbolic). The caller folds the result
+# with const_sym_tree_eval — a tree whose leaves all became literals is
+# canonicalized to Type::Const(v) there.
+def const_sym_tree_subst_args(tree: ConstExprT, generic_params: Vec[GenericParamId], type_args: Vec[Type]) -> ConstExprT
+  match tree
+  when ConstExprT::ConstLit(_) then tree.clone()
+  when ConstExprT::ConstParamRef(gpid) then
+    mut result = tree.clone()
+    var i = 0
+    while i < generic_params.len() && i < type_args.len() do
+      if generic_param_id_eq(&generic_params[i], &gpid) then
+        match type_args[i]
+        when Type::Const(v) then result = ConstExprT::ConstLit(v)
+        when Type::ConstParam(g2) then result = ConstExprT::ConstParamRef(g2)
+        when Type::ConstSym(t2) then result = t2.clone()
+        when _ then ()
+        end
+      end
+      i = i + 1
+    end
+    result
+  when ConstExprT::ConstAdd(l, r) then
+    ConstExprT::ConstAdd(const_sym_tree_subst_args(&l, generic_params, type_args), const_sym_tree_subst_args(&r, generic_params, type_args))
+  when ConstExprT::ConstSub(l, r) then
+    ConstExprT::ConstSub(const_sym_tree_subst_args(&l, generic_params, type_args), const_sym_tree_subst_args(&r, generic_params, type_args))
+  when ConstExprT::ConstMul(l, r) then
+    ConstExprT::ConstMul(const_sym_tree_subst_args(&l, generic_params, type_args), const_sym_tree_subst_args(&r, generic_params, type_args))
+  when ConstExprT::ConstDiv(l, r) then
+    ConstExprT::ConstDiv(const_sym_tree_subst_args(&l, generic_params, type_args), const_sym_tree_subst_args(&r, generic_params, type_args))
+  when ConstExprT::ConstMod(l, r) then
+    ConstExprT::ConstMod(const_sym_tree_subst_args(&l, generic_params, type_args), const_sym_tree_subst_args(&r, generic_params, type_args))
+  when ConstExprT::ConstNeg(o) then
+    ConstExprT::ConstNeg(const_sym_tree_subst_args(&o, generic_params, type_args))
+  end  end
+end
+
+# (§20 slice 2): the SUBSTITUTION of a symbolic const-expression tree under
+# the call-site const BIND MAP (numeric GenericParamId -> solved Type — the
+# tree view of subst_type_const_map, shared by the call-site const presolve
+# and mono's substitute_type): a ConstParamRef leaf whose id has an entry
+# Type::Const(v) becomes a literal leaf, Type::ConstParam(g2) re-points the
+# leaf at the outer parameter, Type::ConstSym(t2) splices its tree; a leaf
+# without an entry stays symbolic (an enclosing declaration's parameter —
+# forwarding). The caller folds the result with const_sym_tree_eval.
+def const_sym_tree_subst_consts(tree: ConstExprT, consts: Map[Int, Type]) -> ConstExprT
+  match tree
+  when ConstExprT::ConstLit(_) then tree.clone()
+  when ConstExprT::ConstParamRef(gpid) then
+    match consts.get(generic_param_id_numeric(&gpid))
+    when Option::Some(v) then
+      match v
+      when Type::Const(n) then ConstExprT::ConstLit(n)
+      when Type::ConstParam(g2) then ConstExprT::ConstParamRef(g2)
+      when Type::ConstSym(t2) then t2.clone()
+      when _ then tree.clone()
+      end
+    when Option::None then tree.clone()
+    end
+  when ConstExprT::ConstAdd(l, r) then
+    ConstExprT::ConstAdd(const_sym_tree_subst_consts(&l, consts), const_sym_tree_subst_consts(&r, consts))
+  when ConstExprT::ConstSub(l, r) then
+    ConstExprT::ConstSub(const_sym_tree_subst_consts(&l, consts), const_sym_tree_subst_consts(&r, consts))
+  when ConstExprT::ConstMul(l, r) then
+    ConstExprT::ConstMul(const_sym_tree_subst_consts(&l, consts), const_sym_tree_subst_consts(&r, consts))
+  when ConstExprT::ConstDiv(l, r) then
+    ConstExprT::ConstDiv(const_sym_tree_subst_consts(&l, consts), const_sym_tree_subst_consts(&r, consts))
+  when ConstExprT::ConstMod(l, r) then
+    ConstExprT::ConstMod(const_sym_tree_subst_consts(&l, consts), const_sym_tree_subst_consts(&r, consts))
+  when ConstExprT::ConstNeg(o) then
+    ConstExprT::ConstNeg(const_sym_tree_subst_consts(&o, consts))
+  end  end
+end
+
+# (§20 slice 2): the symbolic-tree substitution RESULT of a Type::ConstSym
+# slot under one of the leaf-substituters above: substitute the leaves, then
+# fold — a fully-literal tree is CANONICALIZED to Type::Const(v) (the
+# instance's const-slot value; spelling-independent identity), a tree with
+# surviving parameter leaves stays Type::ConstSym (the forwarded symbolic
+# form — a nested declaration's parameters).
+def const_sym_fold_type(t2: ConstExprT) -> Type
+  match const_sym_tree_eval(&t2)
+  when Option::Some(v) then Type::Const(v)
+  when Option::None then Type::ConstSym(t2)
+  end  end
+end
+
+# (§20 const generics, slice 2): whether a host integer VALUE fits a const
+# parameter's declared scalar type (the exact range decision — the
+# integer_type_bounds decimal strings compared through the signed decimal
+# comparator, the SAME machinery the literal range checks use).
+def const_value_fits_declared_type(v: Int, decl_ty: Type) -> Bool
+  let (lo, hi) = integer_type_bounds(decl_ty)
+  let vs = v.to_string()
+  signed_decimal_cmp(vs, lo) >= 0 && signed_decimal_cmp(vs, hi) <= 0
+end
+
+# (§20 const generics, slice 2): argument-kind/range validation at a generic
+# INSTANTIATION SITE — each resolved source argument is checked against its
+# parameter's DECLARED kind, classified through env.const_param_decl_types
+# (an id recorded there is a CONST parameter of that declared scalar type;
+# an absent id is a TYPE parameter):
+#   - a constant argument (Type::Const / an unbound inference variable that
+#     will carry one) against a const parameter is RANGE-CHECKED against the
+#     declared scalar type (UInt/Int/USize/u8..u64/i8..i64 — signedness and
+#     bounds via the literal machinery); an out-of-range value is the ONE
+#     stable diagnostic;
+#   - a TYPE-like argument in a const parameter slot is a diagnostic ("a
+#     type argument cannot fill a const parameter") — the position needs an
+#     integer constant, a module const, or an enclosing const parameter
+#     reference;
+#   - a constant argument in a TYPE parameter slot is a diagnostic (the
+#     value was never a type);
+#   - a forwarded SYMBOLIC const parameter (Type::ConstParam — the
+#     enclosing-generic form `ArrayVec[T, N]` inside a generic body) is
+#     accepted in const slots (its own instantiation range-checks at the
+#     outer site); an inference variable is left to the solver; Type::Error
+#     is already fatal.
+# The arity checks stay as today (the exact-arity unifier reports a count
+# mismatch downstream) — this walk validates only the positions the source
+# actually supplied, and never pads.
+def validate_generic_instantiation_args(inout env: TypeEnv, decl_params: Vec[GenericParamId], args: Vec[Type], span: Span) -> Unit
+  var i = 0
+  while i < decl_params.len() && i < args.len() do
+    let gpid = decl_params[i]
+    match env.const_param_decl_types.get(generic_param_id_numeric(&gpid))
+    when Option::Some(decl_ty) then
+      match args[i]
+      when Type::Const(v) then
+        if !const_value_fits_declared_type(v, decl_ty) then
+          let pname = generic_param_name_of(&env.generic_param_table, &gpid)
+          type_add_error(env, "const generic argument " + v.to_string() + " is out of range for const parameter `" + pname + "` of type `" + integer_type_name(decl_ty) + "`", span)
+        end
+      when Type::ConstParam(_) then ()
+      when Type::ConstSym(_) then
+        # (§20 slice 2): a SYMBOLIC const-EXPRESSION argument in a const
+        # slot is accepted like a forwarded ConstParam — its range against
+        # the declared scalar type is DEFERRED to fold time (a tree has no
+        # value before its parameters bind; the folded Const is what the
+        # outer instantiation-site validation range-checks).
+        ()
+      when Type::Var(_) then ()
+      when Type::Error then ()
+      when _ then
+        let pname = generic_param_name_of(&env.generic_param_table, &gpid)
+        type_add_error(env, "argument for const generic parameter `" + pname + "` must be an integer constant (a literal, a module const reference, constant arithmetic, or an enclosing const parameter reference) — got " + type_tag(env, &args[i]), span)
+      end
+    when Option::None then
+      match args[i]
+      when Type::Const(v) then
+        let pname = generic_param_name_of(&env.generic_param_table, &gpid)
+        type_add_error(env, "constant argument " + v.to_string() + " cannot fill type parameter `" + pname + "` (the parameter expects a type, not a value)", span)
+      when Type::ConstParam(_) then
+        let pname = generic_param_name_of(&env.generic_param_table, &gpid)
+        type_add_error(env, "const generic parameter reference cannot fill type parameter `" + pname + "` (the parameter expects a type, not a value)", span)
+      when Type::ConstSym(_) then
+        let pname = generic_param_name_of(&env.generic_param_table, &gpid)
+        type_add_error(env, "const generic parameter expression cannot fill type parameter `" + pname + "` (the parameter expects a type, not a value)", span)
+      when _ then ()
+      end
+    end
+    i = i + 1
+  end
+  ()
+end
+
 # (§20 const generics, slice 1): the symbolic-size fallback of the [T; N]
 # annotation. When the size expression is NOT a module const (eval_const_size
 # _expr returned None), a bare reference — ExprIdent or a single-segment
@@ -19937,9 +21735,33 @@ def resolve_type_expr(inout env: TypeEnv, te: TypeExpr) -> Type
             else builtin_adt(env, "Set".to_string(), [fresh_type_var(env)])
             end
           else
+            # (§20 slice 2): argument-kind/range validation at the
+            # instantiation site — each resolved argument is checked against
+            # its parameter's DECLARED kind (a type argument in a const
+            # parameter slot is a diagnostic, a constant argument is
+            # range-checked against the const parameter's declared scalar
+            # type). The arity checks stay as today (the exact-arity
+            # unifier reports a count mismatch downstream).
+            validate_generic_instantiation_args(env, &type_def.generic_params, &resolved_args, te.span)
             Type::Adt(type_def.id, resolved_args)
           end
         when Option::None then
+          # (§20 slice 2): a bare identifier that is NOT a type (no
+          # in-scope parameter, no registered type name) may be a
+          # MODULE-LEVEL CONST — a type-argument position can carry a
+          # const reference (`ArrayVec[U8, MY_SIZE]`), mirroring how the
+          # [T; N] size evaluator resolves a const reference. Resolution
+          # through env.const_values runs BEFORE the auto-registration /
+          # strict unknown-type handling, so a name that is NEITHER a type
+          # NOR a const keeps the historical behavior (auto-registered
+          # opaque in the permissive mode, "unknown type" in the strict
+          # compilation mode).
+          if args.len() == 0 then
+            match env.const_values.get(module_qualified_key(&env.current_module_path, &name))
+            when Option::Some(n) then return Type::Const(n)
+            when Option::None then ()
+            end
+          end
           # Auto-register unknown types as opaque to prevent cascading errors.
           # This ensures all references to the same unknown type name resolve
           # to the same TypeId, preventing spurious "type mismatch" errors.
@@ -19982,6 +21804,53 @@ def resolve_type_expr(inout env: TypeEnv, te: TypeExpr) -> Type
     # position is caught downstream by identity mismatches and the
     # codegenability scans).
     Type::Const(n)
+  when TypeExprKind::ConstExpr(expr) then
+    # (§20 const generics, slice 2): a CONST-EXPRESSION argument (the
+    # compound const forms of a type-argument list — module-const
+    # references and constant arithmetic — preserved by the parser) FOLDS
+    # to Type::Const(value) through the const-argument evaluator
+    # (eval_const_arg_expr — the [T; N] size evaluator's resolution
+    # discipline over the SIGNED value domain: the evaluator allows
+    # negative results and the overflow/division checks fail closed). The
+    # fold makes the canonical identity VALUE-based — Const(4) from `2 + 2`
+    # is the same type argument as Const(4) from `4`.
+    # (§20 slice 2 — the SYMBOLIC fallback): an expression the evaluator
+    # cannot fold because it ARITHMETICALLY COMBINES an in-scope const
+    # generic parameter of the enclosing generic declaration (`SCALE + S2`,
+    # `2 * N + 1`, `T - 1` — the type-argument twin of the bare-parameter
+    # Type::ConstParam form) resolves to the SYMBOLIC
+    # Type::ConstSym(ConstExprT) tree (const_sym_tree_build — identifiers in
+    # scope as const parameters become parameter leaves, module consts fold
+    # to literal leaves, the const arithmetic operators build the tree).
+    # The tree substitutes and folds per instance (subst_type_args /
+    # subst_type_const_map / mono's substitute_type — a bound tree becomes
+    # the canonical Type::Const(v), so `Decimal128[SCALE + S2]` instantiated
+    # at SCALE=10, S2=2 is Decimal128[12] whatever the spelling). A
+    # NON-constant expression (a name that is neither a module const nor an
+    # in-scope parameter, a call, an overflowing operation, a division by
+    # zero) is the ONE const-argument diagnostic; Type::Const(0) keeps the
+    # argument list shape (the error already aborted the compilation).
+    match eval_const_arg_expr(env, &expr)
+    when Option::Some(v) then Type::Const(v)
+    when Option::None then
+      match const_sym_tree_build(env, &expr)
+      when Option::Some(tree) then
+        # A tree with NO parameter leaves means the expression is fully
+        # concrete but the value evaluator rejected it (overflow, division
+        # by zero) — folding it would reproduce the exact failure the
+        # evaluator fails closed on; keep the ONE const-argument
+        # diagnostic instead of fabricating an unevaluable literal tree.
+        if const_sym_tree_has_param(&tree) then
+          Type::ConstSym(tree)
+        else
+          type_add_error(env, "const generic argument must be a constant expression (an integer literal, a module const reference, an in-scope const parameter reference, or constant arithmetic over them)", expr.span)
+          Type::Const(0)
+        end
+      when Option::None then
+        type_add_error(env, "const generic argument must be a constant expression (an integer literal, a module const reference, an in-scope const parameter reference, or constant arithmetic over them)", expr.span)
+        Type::Const(0)
+      end
+    end
   when TypeExprKind::Unit then Type::Unit
   when TypeExprKind::Never then Type::Never
   when TypeExprKind::Tuple(elems) then
@@ -20124,6 +21993,23 @@ def resolve_type_expr(inout env: TypeEnv, te: TypeExpr) -> Type
             # Use canonical Type representation so unification works correctly
             type_def_to_canonical(env, &type_def)
           when Option::None then
+            # (§20 slice 2): a path that names no type may be a QUALIFIED
+            # module-const reference in a type-argument position
+            # (`mymod::LIMIT`), mirroring the [T; N] size evaluator's path
+            # resolution (a multi-segment path resolves under its own
+            # joined module-qualified key; a single-segment path under the
+            # current module's qualified key). A path that is NEITHER a
+            # type NOR a const keeps the historical opaque auto-registration.
+            match env.const_values.get(full_name.clone())
+            when Option::Some(n) then return Type::Const(n)
+            when Option::None then
+              if segs.len() == 1 then
+                match env.const_values.get(module_qualified_key(&env.current_module_path, &last))
+                when Option::Some(n) then return Type::Const(n)
+                when Option::None then ()
+                end
+              end
+            end
             # Auto-register unknown qualified type paths as opaque to prevent
             # cascading errors. This mirrors the opaque fallback in the Named
             # handler above and ensures all references to the same unknown
@@ -20391,6 +22277,12 @@ def scan_codegen_type(inout env: TypeEnv, ty: Type, inout has_error: Bool, inout
   when Type::Var(_) then has_var = true
   when Type::Param(_) then if !allow_param then has_param = true end
   when Type::ConstParam(_) then if !allow_param then has_param = true end
+  when Type::ConstSym(tree) then
+    # (§20 slice 2): a symbolic const-expression argument is residual
+    # generic state exactly like its leaves (a ConstParam leaf reaching a
+    # concrete channel is a leak; a literal-only tree cannot exist — resolve
+    # folds those to Const).
+    if !allow_param && const_sym_tree_has_param(&tree) then has_param = true end
   when Type::FixedArraySym(elem, _) then
     if !allow_param then has_param = true end
     scan_codegen_type(env, elem, has_error, has_var, has_param, allow_param)
@@ -21081,13 +22973,24 @@ def resolve_pending_call_instances(inout env: TypeEnv) -> Unit
     else
       # Genuinely unconstrained: no context (arguments, annotation, dest)
       # ever solved the parameter — record the annotation error per
- # parameter (the name comes from the param-name table).
+      # parameter (the name comes from the param-name table). (§20 slice 2):
+      # a CONST parameter reports the const wording — a return-position-only
+      # const parameter (e.g. `def zero_vec[const N: UInt]() -> [Int; N]`)
+      # needs an argument (or an enclosing const context) that fixes its
+      # value; the value-level annotation `let v: [Int; N] = zero_vec()` has
+      # no mechanism to bind N from a size-annotation while generic and
+      # fails closed here.
       var ni = 0
       while ni < rec_names.len() do
         match resolve_type_var(env, rec_vars[ni].clone())
         when Type::Var(_) then
           let pname = generic_param_name_of(&env.generic_param_table, &rec_names[ni])
-          type_add_error(env, "cannot infer type parameter `" + pname + "`: add an annotation", rec_span)
+          match env.const_param_decl_types.get(generic_param_id_numeric(&rec_names[ni]))
+          when Option::Some(_) then
+            type_add_error(env, "cannot infer const parameter `" + pname + "`: pass an argument whose type carries the parameter's value (e.g. a `[T; N]` argument), or fix the parameter at the call", rec_span)
+          when Option::None then
+            type_add_error(env, "cannot infer type parameter `" + pname + "`: add an annotation", rec_span)
+          end
         when _ then ()
         end
         ni = ni + 1
@@ -21401,6 +23304,7 @@ def type_check_typed(inout env: TypeEnv, program: Program, resolutions: Resolved
     handler_captures: env.handler_captures.clone(),
     local_bindings: env.typed_local_bindings.clone(),
     ident_resolutions: env.typed_ident_resolutions.clone(),
+    const_param_reads: env.const_param_reads.clone(),
     param_binding_resolutions: env.param_binding_resolutions.clone(),
     pattern_binding_resolutions: env.pattern_binding_resolutions.clone(),
     place_move_states: env.place_move_states.clone(),
@@ -21446,6 +23350,7 @@ def type_check_typed(inout env: TypeEnv, program: Program, resolutions: Resolved
     handler_captures: env.handler_captures.clone(),
     local_bindings: env.typed_local_bindings.clone(),
     ident_resolutions: env.typed_ident_resolutions.clone(),
+    const_param_reads: env.const_param_reads.clone(),
     param_binding_resolutions: env.param_binding_resolutions.clone(),
     pattern_binding_resolutions: env.pattern_binding_resolutions.clone(),
     place_move_states: env.place_move_states.clone(),
@@ -21649,6 +23554,7 @@ def derive_transferable(inout env: TypeEnv, ty: Type, inout visited: Set[Int]) -
   # nothing).
   when Type::Const(_) then true
   when Type::ConstParam(_) then true
+  when Type::ConstSym(_) then true  # (§20 slice 2): symbolic const-EXPRESSION argument: compile-time scalar arithmetic — Transferable like Const
   when Type::FixedArraySym(elem, _) then derive_transferable(env, &elem, visited)
  # (inference-only): an integer literal is a scalar value —
   # Transferable exactly like the concrete integer types.
@@ -21873,6 +23779,7 @@ def derive_syncable(inout env: TypeEnv, ty: Type, inout visited: Set[Int]) -> Bo
   # mirrors the concrete FixedArray arm (element governs).
   when Type::Const(_) then true
   when Type::ConstParam(_) then true
+  when Type::ConstSym(_) then true  # (§20 slice 2): symbolic const-EXPRESSION argument: compile-time scalar arithmetic — Shareable like Const
   when Type::FixedArraySym(elem, _) then derive_syncable(env, &elem, visited)
  # (inference-only): an integer literal is a scalar value —
   # Shareable exactly like the concrete integer types.
@@ -21938,11 +23845,22 @@ end
 # marker impl.
 def check_transferable_bound(inout env: TypeEnv, ty: Type, span: Span, context: String) -> Unit
   if !is_send(env, ty) then
+    let ty_render = type_display(env, &ty)
+    # (audit §34): the capability_trace rows of the structural rejection —
+    # the transfer is denied because the compiler-derived Transferable
+    # walk (derive_transferable) found no proof for the value.
+    var rows = Vec::new()
+    rows.push("the structural Transferable derivation failed for `" + ty_render.clone() + "`")
+    rows.push("`" + ty_render.clone() + "` cannot be transferred into another execution context")
     env.errors.push(TypeError {
-      message: context + ": type `" + type_display(env, ty) + "` does not satisfy `Transferable` bound — " +
+      message: context + ": type `" + ty_render.clone() + "` does not satisfy `Transferable` bound — " +
                "cannot be transferred into another execution context",
       span: span,
-      code: Option::Some("E0277")
+      code: Option::Some("E0277"),
+      primary_symbol: Option::Some(ty_render.clone()),
+      semantic_site: Option::Some("Transferable bound check"),
+      capability_trace: rows,
+      related_symbols: Vec::from([ty_render])
     })
   end
 end
@@ -21951,11 +23869,19 @@ end
 # access through a shared representation).
 def check_shareable_bound(inout env: TypeEnv, ty: Type, span: Span, context: String) -> Unit
   if !is_sync(env, ty) then
+    let ty_render2 = type_display(env, &ty)
+    var rows2 = Vec::new()
+    rows2.push("the structural Shareable derivation failed for `" + ty_render2.clone() + "`")
+    rows2.push("`" + ty_render2.clone() + "` cannot be safely shared across execution contexts")
     env.errors.push(TypeError {
-      message: context + ": type `" + type_display(env, ty) + "` does not satisfy `Shareable` bound — " +
+      message: context + ": type `" + ty_render2.clone() + "` does not satisfy `Shareable` bound — " +
                "cannot be safely shared across execution contexts (use Arc/Mutex/RwLock/atomics/channels)",
       span: span,
-      code: Option::Some("E0277")
+      code: Option::Some("E0277"),
+      primary_symbol: Option::Some(ty_render2.clone()),
+      semantic_site: Option::Some("Shareable bound check"),
+      capability_trace: rows2,
+      related_symbols: Vec::from([ty_render2])
     })
   end
 end
@@ -22065,6 +23991,7 @@ def type_display(env: TypeEnv, ty: Type) -> String
   when Type::Param(gpid) then generic_param_name_of(&env.generic_param_table, &gpid)
   when Type::Const(v) then "const " + v.to_string()
   when Type::ConstParam(gpid) then "const " + generic_param_name_of(&env.generic_param_table, &gpid)
+  when Type::ConstSym(tree) then "const (" + const_sym_tree_render_named(env, &tree) + ")"
   when Type::FixedArraySym(elem, gpid) then "[" + type_display(env, &elem) + "; " + generic_param_name_of(&env.generic_param_table, &gpid) + "]"
   when Type::Error then "<error>"
   end  end

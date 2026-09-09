@@ -1,0 +1,247 @@
+## tests/diag_derivation_test.tg - the audit §34 derivational-diagnostic
+## structure, asserted at the structured Vec[Diagnostic] boundary.
+##
+## Audit §34 extended the ONE Diagnostic record (tg_compiler/parser.tg)
+## with defaulted derivational fields (primary_symbol / semantic_site /
+## expected_type / actual_type / the *_trace row vectors / related_symbols
+## / minimal_slice / repair_candidates) and populated them at the
+## construction sites of the named error classes:
+##   1. type mismatches      -> expected_type / actual_type (the rendered
+##      types, message order) and semantic_site "type unification";
+##   2. bounded-method failures ("method `peek` requires `T: Copy`" — the
+##      Clone/Copy bound class) -> primary_symbol, constraint_trace (the
+##      root type -> field -> field's type -> why chain) and trait_trace
+##      (the per-candidate rows + remaining answer);
+##   3. ownership rejections -> ownership_trace state-chain rows
+##      ("live -> consumed at <site> ...");
+##   4. effect-class violations (E0232) -> effect_trace rows (the
+##      annotation row + the f->g->h evidence path).
+## The MESSAGE TEXTS are pinned unchanged (the canary_neg suite matches
+## substrings); this suite asserts the STRUCTURE that now accompanies the
+## messages.
+##
+## Run with: tg test tests/diag_derivation_test.tg
+
+use std::core::{Option, Result, String, Unit, Bool, Int, UInt, panic}
+use std::collections::{Vec}
+use std::test::*
+
+use tg_compiler::compiler_core::{default_options, parse_source_program, analyze_parsed, CompilerOptions}
+use tg_compiler::types::{type_env_new, TypeError}
+use tg_compiler::parser::{Diagnostic}
+use tg_compiler::mir::{lower_to_mir, check_effect_class_annotations_mir}
+use tg_compiler::mode::{Mode}
+
+def _opts() -> CompilerOptions
+  var opts = default_options()
+  opts.strict_resolution = true
+  opts.mode = Mode::Dev
+  opts
+end
+
+# Fixture 1: the generic body smuggling Unit under T - the unifier's
+# strict Param arm reports the type mismatch (the same fixture the
+# canary_neg_generic_body_unit_as_t canary pins).
+const FIX_MISMATCH: str =
+  "def f[T](x: T) -> T\n" +
+  "  ()\n" +
+  "end\n" +
+  "\n" +
+  "def main() -> Int\n" +
+  "  let v = f(5)\n" +
+  "  0\n" +
+  "end\n"
+
+# Fixture 2: a bounded method the receiver cannot use - Wrapper[String]
+# against `impl[T: Copy] Wrapper[T]` (peek returns the element BY VALUE;
+# String is not Copy). The method exists but its impl bounds fail, so
+# method resolution reports "method `peek` requires `T: Copy`" (the
+# Clone/Copy bound class of the audit) instead of the generic no-method
+# error.
+const FIX_BOUND: str =
+  "struct Wrapper[T]\n" +
+  "  inner: T\n" +
+  "end\n" +
+  "\n" +
+  "impl[T: Copy] Wrapper[T]\n" +
+  "  def peek(self: Self) -> T\n" +
+  "    self.inner\n" +
+  "  end\n" +
+  "end\n" +
+  "\n" +
+  "def probe(w: Wrapper[String]) -> Int\n" +
+  "  let x = w.peek()\n" +
+  "  0\n" +
+  "end\n" +
+  "\n" +
+  "def main() -> Int\n" +
+  "  0\n" +
+  "end\n"
+
+# Fixture 3: use-after-consume of an owned resource (the
+# canary_neg_resource_use_after_consume shape).
+const FIX_OWN: str =
+  "resource R\n" +
+  "  a: Int\n" +
+  "end\n" +
+  "\n" +
+  "def main() -> Int\n" +
+  "  let r = R { a: 1 }\n" +
+  "  let r2 = r\n" +
+  "  r.a\n" +
+  "  0\n" +
+  "end\n"
+
+# Fixture 4: an @no_alloc claim violated by an owned-String literal
+# materialization (the string_from_static lowering allocates - E0232).
+const FIX_EFFECT: str =
+  "def main() -> Int\n" +
+  "  0\n" +
+  "end\n" +
+  "\n" +
+  "@no_alloc\n" +
+  "def lit() -> String\n" +
+  "  let s = \"hello\"\n" +
+  "  s\n" +
+  "end\n"
+
+# Analyze a fixture and return the rejected diagnostics (asserts that the
+# fixture is rejected exactly at the analyze boundary).
+def _expect_rejected(source: String, file: String) -> Vec[Diagnostic]
+  var ast = assert_ok(parse_source_program(source, file))
+  var env = type_env_new()
+  match analyze_parsed(&mut env, &mut ast, _opts())
+  when Result::Err(diags) then
+    return diags
+  when Result::Ok(_) then
+    assert(false, file + ": the negative fixture must be rejected by analyze")
+    return Vec::new()
+  end
+end
+
+@test
+def t34_type_mismatch_fields() -> Unit
+  let diags = _expect_rejected(FIX_MISMATCH.to_string(), "diag34_mismatch.tg")
+  var found = 0
+  for d in diags do
+    match d.expected_type
+    when Option::Some(exp) then
+      match d.actual_type
+      when Option::Some(act) then
+        # The fields carry the same rendered types the message names, in
+        # message order: "type mismatch: <exp> vs <act>".
+        if d.message == "type mismatch: " + exp + " vs " + act then
+          found = found + 1
+          match d.semantic_site
+          when Option::Some(site) then
+            assert(site == "type unification",
+              "t34 mismatch: semantic_site must name the unification site")
+          when Option::None then
+            assert(false, "t34 mismatch: semantic_site missing on the type mismatch")
+          end
+        end
+      when Option::None then ()
+      end
+    when Option::None then ()
+    end
+  end
+  assert(found >= 1,
+    "t34 type mismatch: no diagnostic carried expected_type/actual_type (message order convention)")
+end
+
+@test
+def t34_bound_chain_fields() -> Unit
+  let diags = _expect_rejected(FIX_BOUND.to_string(), "diag34_bound.tg")
+  var found = 0
+  for d in diags do
+    if d.message.contains("method `peek` requires `T: Copy`") then
+      found = found + 1
+      match d.primary_symbol
+      when Option::Some(psym) then
+        assert(psym.len() > 0, "t34 bound: primary_symbol must name the receiver type")
+      when Option::None then
+        assert(false, "t34 bound: primary_symbol missing on the bound failure")
+      end
+      # The constraint chain: root -> field (name) -> the field's type ->
+      # why it fails (not Copy). The Wrapper fixture's chain must reach
+      # the `inner` field and name the not-Copy reason.
+      var saw_field = false
+      var saw_reason = false
+      for row in d.constraint_trace do
+        if row.contains("field `inner`") then saw_field = true end
+        if row.contains("not Copy") then saw_reason = true end
+      end
+      assert(saw_field, "t34 bound: constraint_trace must name the failing field (`inner`)")
+      assert(saw_reason, "t34 bound: constraint_trace must name why the leaf fails (not Copy)")
+      # The trait trace: every rejected candidate + the remaining answer.
+      var saw_candidate = false
+      var saw_answer = false
+      for trow in d.trait_trace do
+        if trow.contains("candidate impl") then saw_candidate = true end
+        if trow.contains("no applicable method") then saw_answer = true end
+      end
+      assert(saw_candidate, "t34 bound: trait_trace must list the rejected candidate impls")
+      assert(saw_answer, "t34 bound: trait_trace must carry the remaining answer")
+    end
+  end
+  assert(found >= 1, "t34 bound: the bounded-method diagnostic was not produced")
+end
+
+@test
+def t34_ownership_trace_fields() -> Unit
+  let diags = _expect_rejected(FIX_OWN.to_string(), "diag34_own.tg")
+  var found = 0
+  for d in diags do
+    if d.message.contains("consumed") then
+      found = found + 1
+      var saw_state = false
+      var saw_reject = false
+      for row in d.ownership_trace do
+        if row.contains("state chain") then saw_state = true end
+        if row.contains("rejected at") then saw_reject = true end
+      end
+      assert(saw_state,
+        "t34 ownership: ownership_trace must render the state chain (live -> consumed at <site>)")
+      assert(saw_reject,
+        "t34 ownership: ownership_trace must render the rejection site")
+    end
+  end
+  assert(found >= 1, "t34 ownership: the consumed-use diagnostic was not produced")
+end
+
+@test
+def t34_effect_trace_fields() -> Unit
+  # The effect-class proof runs on the LOWERED program; analyze must
+  # ACCEPT the fixture (the claim is proven at the MIR pass).
+  var ast = assert_ok(parse_source_program(FIX_EFFECT.to_string(), "diag34_effect.tg"))
+  var env = type_env_new()
+  let analyzed = assert_ok(analyze_parsed(&mut env, &mut ast, _opts()))
+  var mir = assert_ok(lower_to_mir(&ast, &analyzed))
+  # Re-attach the resolved symbol table the checker consumed (the mirror
+  # of the compile pipeline's effect-class enforcement precondition).
+  env.resolutions = Option::Some(analyzed.resolutions.clone())
+  let errs = check_effect_class_annotations_mir(&mir, env)
+  var found = 0
+  for e in errs do
+    match e.code
+    when Option::Some(code) then
+      if code == "E0232" then
+        found = found + 1
+        match e.primary_symbol
+        when Option::Some(psym) then
+          assert(psym == "lit", "t34 effect: primary_symbol must name the claimed function (lit)")
+        when Option::None then
+          assert(false, "t34 effect: primary_symbol missing on the E0232")
+        end
+        assert(e.effect_trace.len() >= 2,
+          "t34 effect: effect_trace must carry the annotation row and the evidence row")
+        assert(e.effect_trace[0].contains("@no_alloc") && e.effect_trace[0].contains("lit"),
+          "t34 effect: the first effect_trace row must echo the as-written claim")
+        assert(e.effect_trace[e.effect_trace.len() - 1].len() > 0,
+          "t34 effect: the last effect_trace row must carry the evidence text")
+      end
+    when Option::None then ()
+    end
+  end
+  assert(found >= 1, "t34 effect: no E0232 was produced for the @no_alloc violation")
+end

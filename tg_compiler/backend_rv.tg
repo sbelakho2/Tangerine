@@ -165,6 +165,7 @@ use tg_compiler::lir::{
   lir_peephole, lir_alloc_registers,
   lir_first_alloc_vreg, lir_seg_at, lir_reload_at, lir_block_label,
   lir_validate_callees,
+  lir_fixed_fp_base, lir_is_fixed_fp_id,
   lir_static_scalar_ok, lir_static_init_word_value,
   lir_static_unsupported_type_rule
 }
@@ -1553,6 +1554,55 @@ def rv_validate_ptr_stmt(fn_name: String, pop: LirPtrOp, xlen: Int, desc: Target
     end
     Result::Ok(())
   end
+end
+
+# AUDIT §26 — the RISC-V psABI VARIADIC integer-convention gate: the
+# psABI makes a VARIADIC extern call with the INTEGER calling
+# convention even under a hard-FP ABI — no fa0..fa7 argument register
+# is used for any of the call's arguments; an F64 extra (the §26
+# promoted image of an F32 extra) or a float fixed-prefix argument of
+# a variadic extern call would ride the integer stream (one 64-bit
+# GP slot on rv64, a pair of 32-bit GP words on rv32), while the
+# shared LIR lowering (lir.tg's lir_lower_call walk) has no variadic
+# marker and marshals every register-class float argument into the
+# fixed float vregs 8..15 (fa0..fa7 = f10..f17) as soon as the riscv
+# float route opens. The riscv route of THIS slice rejects float
+# statements entirely (rv_validate_fn below — the float slice is not
+# implemented), so this gate is the forward guard with the exact rule
+# (it fires the moment the future float slice makes the fp-vreg moves
+# reach this backend) and the precise diagnostic for a variadic
+# extern call today. A GP-only variadic extern call (the common
+# printf-family shape — after the §26 promotions the i8/u8/i16/u16/
+# Bool extras ride their int-promoted word images, which the integer
+# stream crosses unchanged) contains no fixed-fp marshaling and is
+# unaffected. The set is the program's is_extern_variadic functions
+# (the same table codegen.tg's direct emitter reads for its own
+# variadic route).
+def rv_validate_variadic_calls(f: LirFunction, variadic_externs: Set[String]) -> Result[Unit, String]
+  var bi = 0
+  while bi < f.blocks.len() do
+    let block = f.blocks[bi]
+    match block.term.kind
+    when LirTermKind::LirCall(target, _, _, _, _) then
+      if variadic_externs.contains(&target) then
+        var si = 0
+        while si < block.stmts.len() do
+          let stmt = block.stmts[si]
+          match stmt.kind
+          when LirStmtKind::LirFMove(dst, _) then
+            if lir_is_fixed_fp_id(dst) then
+              return Result::Err("rv: " + f.name + ": call to the variadic extern `" + target + "` marshals a float-class argument into the FP argument register file (a LirFMove into fixed FP vreg " + dst.to_string() + " = f" + (10 + (dst - lir_fixed_fp_base())).to_string() + " = fa" + (dst - lir_fixed_fp_base()).to_string() + "), which does not lower on the riscv route — the RISC-V psABI makes VARIADIC calls with the INTEGER calling convention even under a hard-FP ABI (float arguments — including the §26-promoted F64 image of an F32 extra — ride the GP registers/caller stack as integer words: one 64-bit slot per double on rv64, a pair of 32-bit words on rv32), and the shared LIR lowering's per-class marshaling has no integer-convention form this backend can emit (fail-closed; the integer-convention caller marshaling is a lowering-level later slice)")
+            end
+          when _ then ()
+          end
+          si = si + 1
+        end
+      end
+    when _ then ()
+    end
+    bi = bi + 1
+  end
+  Result::Ok(())
 end
 
 def rv_validate_fn(f: LirFunction, xlen: Int, desc: TargetDesc) -> Result[Unit, String]
@@ -3632,9 +3682,22 @@ end
 # buffer — every block label and function label is defined by then
 # (mirrors thumb_emit_fn + thumb_resolve_patches exactly).
 
-def rv_emit_fn(inout re: RvEmit, mdl_pool: Vec[Int], lir_fn: LirFunction, alloc: LirAlloc, externs: Set[String], defined: Set[String], xlen: Int, desc: TargetDesc) -> Result[Unit, String]
+def rv_emit_fn(inout re: RvEmit, mdl_pool: Vec[Int], lir_fn: LirFunction, alloc: LirAlloc, externs: Set[String], defined: Set[String], variadic_externs: Set[String], xlen: Int, desc: TargetDesc) -> Result[Unit, String]
   if xlen != 8 && xlen != 4 then
     return Result::Err("rv: rv_emit_fn needs xlen 4 or 8 bytes (got " + xlen.to_string() + ")")
+  end
+  # (audit §26 — the psABI variadic integer-convention gate): the
+  # RISC-V psABI makes a VARIADIC call with the INTEGER calling
+  # convention even under a hard-FP ABI (no fa0..fa7 argument
+  # registers for any of the call's arguments); the riscv route of
+  # this slice rejects float statements entirely (rv_validate_fn — the
+  # float slice is not implemented), so this gate is the forward guard
+  # with the exact rule, and the precise diagnostic for a variadic
+  # extern call whose §26-promoted F64 extra (or float fixed-prefix
+  # argument) would marshal into the FP argument registers.
+  match rv_validate_variadic_calls(lir_fn, variadic_externs)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(_) then ()
   end
   match rv_validate_fn(lir_fn, xlen, desc)
   when Result::Err(e) then return Result::Err(e)
@@ -4443,11 +4506,18 @@ def rv_compile_object(program: MirProgram, desc: TargetDesc) -> Result[Vec[u8], 
   end
   var externs: Set[String] = Set::new()
   var defined: Set[String] = Set::new()
+  # The program's VARIADIC extern names (MirFunction.is_extern_variadic
+  # — audit §26: the psABI integer-convention gate below consumes this
+  # set; see rv_validate_variadic_calls).
+  var variadic_externs: Set[String] = Set::new()
   var fi = 0
   while fi < program.functions.len() do
     let f = program.functions[fi]
     if f.is_extern then
       externs.insert(f.name.clone())
+      if f.is_extern_variadic then
+        variadic_externs.insert(f.name.clone())
+      end
     else
       defined.insert(f.name.clone())
     end
@@ -4495,7 +4565,7 @@ def rv_compile_object(program: MirProgram, desc: TargetDesc) -> Result[Vec[u8], 
       end
       let peeped = lir_peephole(lir_fn)
       let alloc = lir_alloc_registers(xlen, peeped)
-      match rv_emit_fn(&mut re, mdl_pool, peeped, alloc, externs, defined, xlen, desc)
+      match rv_emit_fn(&mut re, mdl_pool, peeped, alloc, externs, defined, variadic_externs, xlen, desc)
       when Result::Err(e) then return Result::Err(e)
       when Result::Ok(_) then ()
       end
@@ -4537,7 +4607,7 @@ def rv_compile_object(program: MirProgram, desc: TargetDesc) -> Result[Vec[u8], 
         end
         let peeped = lir_peephole(lir_fn)
         let alloc = lir_alloc_registers(xlen, peeped)
-        match rv_emit_fn(&mut re, mdl_pool, peeped, alloc, externs, defined, xlen, desc)
+        match rv_emit_fn(&mut re, mdl_pool, peeped, alloc, externs, defined, variadic_externs, xlen, desc)
         when Result::Err(e) then return Result::Err(e)
         when Result::Ok(_) then ()
         end

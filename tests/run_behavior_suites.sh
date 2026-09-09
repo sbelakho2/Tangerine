@@ -61,6 +61,7 @@ SUITES=(
   "tests/gpu/gpu_software_backend_test.tg"
   "tests/platform/platform_surface_smoke_test.tg"
   "tests/mir_int_arith_semantics_test.tg"
+  "tests/diag_derivation_test.tg"
   "tests/unit/test_int_overflow_behavior.tg"
 )
 

@@ -32,7 +32,9 @@ use tg_compiler::types::{
   effect_summary_merge, effect_summary_unknown, effect_summary_of_intrinsic,
   effect_summary_of_extern_name, effect_summary_has_class,
   effect_class_word, effect_class_phrase, effect_class_slot_index,
-  effect_class_forbidden_classes, effect_class_claim_spelling
+  effect_class_forbidden_classes, effect_class_claim_spelling,
+  ConstExprT,
+  const_sym_tree_has_param, const_sym_tree_param_ids, const_sym_tree_render_numeric
 }
 use tg_compiler::ids::{
   FieldId, VariantId, DefId, DefKind, CallableId, InstanceId, ModuleId,
@@ -185,6 +187,21 @@ struct MirFunction
   attr_inline_always: Bool = false
   attr_noinline: Bool = false
   attr_cold: Bool = false
+  # (audit §16 / §19-adjacent — the interrupt-handler marker): TRUE when
+  # the function ITEM carries the @interrupt attribute (stamped from
+  # item.attrs at lowering, exactly like the P1-18 hints above).
+  # @interrupt declares that the function IS an interrupt (ISR) entry
+  # point of the target's modeled interrupt ABI — on the ARMv7-M route
+  # (backend_thumb.tg) it selects the NVIC handler prologue/epilogue
+  # contract (the EXC_RETURN discipline over LR) and registers the
+  # function into the emitted .isr_vector table. Unlike the layout hints
+  # the flag is NOT advisory on a target whose TargetDesc models an
+  # interrupt ABI (interrupt_abi is Some): codegen must honor the
+  # handler entry/exit contract or fail closed (an @interrupt function
+  # compiled against a desc whose interrupt_abi is None is a
+  # fail-closed error on the cortex-m route — the handler convention
+  # must be modeled data, never silently assumed).
+  attr_interrupt: Bool = false
   # (P1-6) The function's DECLARED floating-point mode — @fp(fast) — the
   # ONLY spelling of the fp mode attribute (the strict form is the
   # DEFAULT; there is no @fp(strict) to record — its absence IS strict).
@@ -467,6 +484,20 @@ enum MirConstantKind
   MirUnit
   MirBool(Bool)
   MirInt(Int)
+  # (§20 const generics, slice 3): the SYMBOLIC per-instance value of a
+  # const generic parameter read as a RUNTIME VALUE inside the declaring
+  # item's generic body (the `N` of `def capacity(self) -> UInt = N`).
+  # The payload is the parameter's numeric GenericParamId (identity is the
+  # id — the ids.tg (owner, index) numeric). The generic body lowers ONCE
+  # with this placeholder in place of the read; monomorphization
+  # substitutes the concrete MirInt per instance (the instance's type
+  # argument for the parameter is Type::Const(v) — mono's
+  # substitute_operand rewrites the placeholder under the substitution
+  # map). Codegen never sees it: every emitted body is post-substitution
+  # (a placeholder that survives into a specialized body is the fail-
+  # closed residual error at mono). The constant's `ty` is the parameter's
+  # DECLARED scalar type (the `UInt` of `const N: UInt`).
+  MirConstParamValue(Int)
   MirFloat(Float)
   MirChar(Char)
   MirString(String)
@@ -596,6 +627,8 @@ def duplicate_constant(constant: MirConstant) -> MirConstant
   when MirConstantKind::MirUnit then constant_unit()
   when MirConstantKind::MirBool(value) then constant_bool(value)
   when MirConstantKind::MirInt(value) then constant_int(value)
+  when MirConstantKind::MirConstParamValue(gpid) then
+    MirConstant { kind: MirConstantKind::MirConstParamValue(gpid), ty: constant.ty.clone(), instance: Option::None }
   when MirConstantKind::MirFloat(value) then constant_float(value)
   when MirConstantKind::MirChar(value) then constant_char(value)
   when MirConstantKind::MirString(value) then constant_string(value.clone())
@@ -699,6 +732,7 @@ def duplicate_function(func: MirFunction) -> MirFunction
     attr_inline_always: func.attr_inline_always,
     attr_noinline: func.attr_noinline,
     attr_cold: func.attr_cold,
+    attr_interrupt: func.attr_interrupt,
     fp_fast: func.fp_fast,
     span: func.span.clone()
   }
@@ -1233,6 +1267,12 @@ struct MirBuilder
   pending_attr_inline_always: Bool = false
   pending_attr_noinline: Bool = false
   pending_attr_cold: Bool = false
+  # (audit §16) The DECLARED interrupt-handler marker of the function
+  # item currently being lowered — @interrupt — recorded from the
+  # item's attribute list in lower_program's PASS 2 (the same pending
+  # flow as the P1-18 hints) and stamped onto the lowered MirFunction
+  # at lower_function's hint write site.
+  pending_attr_interrupt: Bool = false
   # (P1-6) The DECLARED floating-point mode of the function item
   # currently being lowered — @fp(fast) (the strict default is the
   # absence of the attribute). Same pending-state flow as the P1-18
@@ -1445,6 +1485,12 @@ struct MirBuilder
   # source for lr_ident (name-based scope lookup is the
   # fallback).
   ident_resolutions: Map[Int, Int]
+  # (§20 const generics, slice 3): expr node id -> numeric GenericParamId
+  # of every IN-SCOPE const generic parameter VALUE read (the checker's
+  # const_param_reads record). lr_ident resolves a recorded node to the
+  # SYMBOLIC MirConstParamValue constant (the generic body lowers once;
+  # mono substitutes the concrete value per instance).
+  const_param_reads: Map[Int, Int]
   # MirReturn blocks created by return-EDGE cleanup chains: their locals were
   # already finalized on that edge, so the function-level finalization pass
   # must not re-finalize them (double-deinit of sink params).
@@ -1694,6 +1740,7 @@ def builder_new() -> MirBuilder
     call_instances: Map::new(),
     typed_intrinsics: Map::new(),
     ident_resolutions: Map::new(),
+    const_param_reads: Map::new(),
     closure_captures: Map::new(),
     typed_effects: Map::new(),
     effect_name_index: Map::new(),
@@ -2293,6 +2340,7 @@ def mir_type_identity_key(ty: Type) -> String
   when Type::Param(gpid) then "Param(" + generic_param_id_numeric(&gpid).to_string() + ")"
   when Type::Const(v) then "Const(" + v.to_string() + ")"
   when Type::ConstParam(gpid) then "ConstParam(" + generic_param_id_numeric(&gpid).to_string() + ")"
+  when Type::ConstSym(tree) then "ConstSym[" + const_sym_tree_render_numeric(&tree) + "]"
   when Type::FixedArraySym(elem, gpid) then "FixedArraySym[" + mir_type_identity_key(elem) + ";param" + generic_param_id_numeric(&gpid).to_string() + "]"
   when Type::Dyn(id) then "Dyn#" + id.id.to_string()
   when Type::Error then "Error"
@@ -2363,6 +2411,7 @@ def mir_type_has_deferred(ty: Type) -> Bool
   match ty
   when Type::Param(_) then true
   when Type::ConstParam(_) then true
+  when Type::ConstSym(tree) then const_sym_tree_has_param(&tree)
   when Type::FixedArraySym(_, _) then true
   when Type::Var(_) then true
   when Type::Adt(_, args) then
@@ -4556,6 +4605,7 @@ def lower_program(program: Program, analyzed: AnalyzedProgram) -> Result[MirProg
   # table stays empty and codegen falls back to the semantic router.
 
   b.ident_resolutions = analyzed.typed.ident_resolutions.clone()
+  b.const_param_reads = analyzed.typed.const_param_reads.clone()
   b.item_defs = analyzed.typed.resolutions.item_defs.clone()
   b.closure_captures = analyzed.typed.closure_captures.clone()
   b.typed_effects = analyzed.typed.typed_effects.clone()
@@ -5081,6 +5131,11 @@ def lower_program(program: Program, analyzed: AnalyzedProgram) -> Result[MirProg
       b.pending_attr_inline_always = false
       b.pending_attr_noinline = false
       b.pending_attr_cold = false
+      # (audit §16): clear the pending @interrupt marker with the hints —
+      # an impl method or IR-synthesized function must never inherit this
+      # item's marker (an @interrupt claim belongs to the annotated
+      # function record only).
+      b.pending_attr_interrupt = false
       b.pending_attr_fp_fast = false
       for fn_attr in item.attrs do
         if fn_attr.name == "inline" then
@@ -5095,6 +5150,8 @@ def lower_program(program: Program, analyzed: AnalyzedProgram) -> Result[MirProg
           b.pending_attr_noinline = true
         elsif fn_attr.name == "cold" then
           b.pending_attr_cold = true
+        elsif fn_attr.name == "interrupt" then
+          b.pending_attr_interrupt = true
         elsif fn_attr.name == "fp" then
           b.pending_attr_fp_fast = true
         end
@@ -5114,6 +5171,8 @@ def lower_program(program: Program, analyzed: AnalyzedProgram) -> Result[MirProg
       b.pending_attr_inline_always = false
       b.pending_attr_noinline = false
       b.pending_attr_cold = false
+      # (audit §16): clear the pending @interrupt marker with the hints.
+      b.pending_attr_interrupt = false
       # (P1-6): clear the pending fp mode with the hints — the strict
       # default must never leak into a neighbour's function.
       b.pending_attr_fp_fast = false
@@ -5586,18 +5645,23 @@ def lower_function(inout b: MirBuilder, f: FunctionDecl, emission_name: String) 
     fn_ref_c.callable = b.current_callable.clone()
   when Option::None then ()
   end
- # (the MirFunction attr-hint WRITE SITE): stamp the item's DECLARED
+  # (the MirFunction attr-hint WRITE SITE): stamp the item's DECLARED
   # @inline / @inline(always) / @noinline / @cold hints (the builder's
   # pending state — recorded from item.attrs at lower_program's PASS 2)
   # onto the lowered function. The hints are ADVISORY (see the MirFunction
   # field docs); codegen and the inliner read only these stamped fields —
   # the AST's item attributes are never interpreted after lowering.
+  # (audit §16): the @interrupt marker is stamped in the same write —
+  # unlike the hints it is a CONTRACT marker (a handler entry point),
+  # read by the ARMv7-M backend for the interrupt prologue/epilogue and
+  # the .isr_vector registration.
   match b.current_fn
   when Option::Some(fn_ref4) then
     fn_ref4.attr_inline_hint = b.pending_attr_inline_hint
     fn_ref4.attr_inline_always = b.pending_attr_inline_always
     fn_ref4.attr_noinline = b.pending_attr_noinline
     fn_ref4.attr_cold = b.pending_attr_cold
+    fn_ref4.attr_interrupt = b.pending_attr_interrupt
   when Option::None then ()
   end
   # (P1-6) (the MirFunction fp-mode WRITE SITE): stamp the item's
@@ -5863,7 +5927,7 @@ def expr_kind_tag(k: ExprKind) -> String
   when ExprKind::ExprStringLit(_) then "ExprStringLit"
   when ExprKind::ExprCall(_, _) then "ExprCall"
   when ExprKind::ExprIdent(name) then "ExprIdent(" + name + ")"
-  when ExprKind::ExprEnumVariant(_, _) then "ExprEnumVariant"
+  when ExprKind::ExprEnumVariant(_, _, _) then "ExprEnumVariant"
   when _ then "Other"
   end  end
 end
@@ -7841,7 +7905,7 @@ def expr_kind_name(kind: ExprKind) -> String
   when ExprKind::ExprCast(_, _) then "ExprCast"
   when ExprKind::ExprTypeCheck(_, _) then "ExprTypeCheck"
   when ExprKind::ExprComptime(_) then "ExprComptime"
-  when ExprKind::ExprEnumVariant(_, _) then "ExprEnumVariant"
+  when ExprKind::ExprEnumVariant(_, _, _) then "ExprEnumVariant"
   when ExprKind::ExprAssign(_, _) then "ExprAssign"
   when ExprKind::ExprPipe(_, _) then "ExprPipe"
   when ExprKind::ExprMacroCall(_, _) then "ExprMacroCall"
@@ -8681,7 +8745,7 @@ def effect_perform_callee_path_mir(callee_expr: Expr) -> Bool
   match callee_expr.kind
   when ExprKind::ExprPath(p) then
     p.segments.len() == 3 && p.segments[0] == "std" && p.segments[1] == "effects" && p.segments[2] == "perform"
-  when ExprKind::ExprEnumVariant(p, _) then
+  when ExprKind::ExprEnumVariant(p, _, _) then
     # The operation-call surface's parse shape: the 3-segment module-
     # qualified path `std::effects::perform(...)` parses as an
     # ExprEnumVariant (the primary parser consumes the call parens itself)
@@ -8970,8 +9034,26 @@ end
 # Lower an identifier to its place value. The typed ident_resolutions
 # (node id -> local id) are authoritative when available; the name-based
 # scope lookup is a fallback for synthetic/source-less code.
-def lr_ident(inout b: MirBuilder, name: String, node_id: Int) -> MirRvalue
+def lr_ident(inout b: MirBuilder, name: String, node_id: Int, ty: Type) -> MirRvalue
   if node_id != 0 then
+    # (§20 const generics, slice 3): an identifier the checker recorded as
+    # an IN-SCOPE const generic parameter VALUE read (node -> numeric
+    # GenericParamId) lowers to the SYMBOLIC MirConstParamValue constant —
+    # the per-instance placeholder monomorphization substitutes. The
+    # constant's type is the read's typed type (the parameter's declared
+    # scalar type). Such a node never has a local resolution (there is no
+    # local) and is not a static.
+    match b.const_param_reads.get(node_id)
+    when Option::Some(gpid) then
+      return move_rvalue(MirOperand {
+        kind: MirOperandKind::MirConstant(MirConstant {
+          kind: MirConstantKind::MirConstParamValue(gpid),
+          ty: ty,
+          instance: Option::None
+        })
+      })
+    when Option::None then ()
+    end
  # (phase 2): the typed node form's semantic local id
     # (TypedExprKind::Local — the same data the flat ident_resolutions
     # holds) is the PRIMARY local-resolution source; the flat
@@ -9655,7 +9737,7 @@ def lower_callee_expr(inout b: MirBuilder, callee_expr: Expr, span: Span) -> Mir
     end
   elsif ck == "ExprEnumVariant" then
     match callee_expr.kind
-    when ExprKind::ExprEnumVariant(path, _) then
+    when ExprKind::ExprEnumVariant(path, _, _) then
       return mir_fn_operand(b, resolve_static_path_callee_name(b, &path))
     when _ then ()
     end
@@ -9924,7 +10006,7 @@ def lr_call(inout b: MirBuilder, callee_expr: Expr, arg_exprs: Vec[Expr], span: 
       end
     when ExprKind::ExprFieldAccess(recv, field_name) then
       ret_type = mir_lookup_fn_ret_type(b, qualify_field_callee_name(&recv, field_name.clone()))
-    when ExprKind::ExprEnumVariant(path, _) then
+    when ExprKind::ExprEnumVariant(path, _, _) then
       ret_type = mir_lookup_fn_ret_type(b, resolve_static_path_callee_name(b, &path))
     when ExprKind::ExprPath(path) then
       ret_type = mir_lookup_fn_ret_type(b, resolve_static_path_callee_name(b, &path))
@@ -9941,7 +10023,7 @@ def lr_call(inout b: MirBuilder, callee_expr: Expr, arg_exprs: Vec[Expr], span: 
   let fc_name = match callee_expr.kind
   when ExprKind::ExprIdent(name) then Option::Some(name.clone())
   when ExprKind::ExprFieldAccess(_, field_name) then Option::Some(qualify_field_callee_name(&callee_expr, field_name.clone()))
-  when ExprKind::ExprEnumVariant(path, _) then Option::Some(resolve_static_path_callee_name(b, &path))
+  when ExprKind::ExprEnumVariant(path, _, _) then Option::Some(resolve_static_path_callee_name(b, &path))
   when ExprKind::ExprPath(path) then Option::Some(resolve_static_path_callee_name(b, &path))
   when _ then Option::None
   end
@@ -10177,7 +10259,7 @@ def lr_enum_variant(inout b: MirBuilder, path: AstPath, args: Vec[Expr], span: S
   # the op's declaration index + name; the payload args pack into the op's
   # parameter tuple), NEVER a static-path call to the resolution-seed
   # function in std/effects.tg.
-  let perform_callee_synth = Expr { kind: ExprKind::ExprEnumVariant(path.clone(), args.clone()), span: span, node_id: 0 }
+  let perform_callee_synth = Expr { kind: ExprKind::ExprEnumVariant(path.clone(), Vec::new(), args.clone()), span: span, node_id: 0 }
   if effect_perform_callee_path_mir(&perform_callee_synth) then
     return Result::Ok(lower_effect_perform_call(b, &perform_callee_synth, &args, span, node_id))
   end
@@ -10194,7 +10276,24 @@ def lower_receiver_place(inout b: MirBuilder, receiver: Expr, span: Span) -> Pla
   var recv_place = place_local(MirLocalId { id: 0 })
   if rk == "ExprIdent" then
     match receiver.kind
-    when ExprKind::ExprIdent(_) then recv_place = lower_place(b, &receiver)
+    when ExprKind::ExprIdent(_) then
+      # (§20 const generics, slice 3): a const generic parameter VALUE
+      # read has no place — a method-call receiver on the read spills the
+      # value into a fresh temp (the same materialization the non-place
+      # receiver forms use below) instead of lower_place (which has no
+      # storage for the parameter).
+      match b.const_param_reads.get(receiver.node_id)
+      when Option::Some(_) then
+        let recv_cp_tmp = add_temp(b, mir_source_expr_ty(b, &receiver), span)
+        match lower_expr_to_rvalue(b, &receiver, span)
+        when Result::Ok(cp_rv) then
+          push_assign(b, place_local(recv_cp_tmp), cp_rv, span)
+        when Result::Err(e) then
+          b.errors.push(e)
+        end
+        recv_place = place_local(recv_cp_tmp)
+      when Option::None then recv_place = lower_place(b, &receiver)
+      end
     when _ then ()
     end
   elsif rk == "ExprSelfRef" then
@@ -11024,7 +11123,7 @@ def lower_expr_to_rvalue(inout b: MirBuilder, expr: Expr, span: Span) -> Result[
     
   elsif kind_name == "ExprIdent" then
     match expr.kind
-    when ExprKind::ExprIdent(name) then return Result::Ok(lr_ident(b, name, expr.node_id))
+    when ExprKind::ExprIdent(name) then return Result::Ok(lr_ident(b, name, expr.node_id, mir_source_expr_ty(b, &expr)))
     when _ then
       return Result::Err("internal error: expr_kind_name/ExprKind mismatch during MIR lowering")
     end
@@ -11806,7 +11905,7 @@ def lower_expr_to_rvalue(inout b: MirBuilder, expr: Expr, span: Span) -> Result[
 
   elsif kind_name == "ExprEnumVariant" then
     match expr.kind
-    when ExprKind::ExprEnumVariant(path, args) then
+    when ExprKind::ExprEnumVariant(path, _, args) then
       return lr_enum_variant(b, &path, &args, span, expr.node_id)
     when _ then
       return Result::Err("internal error: expr_kind_name/ExprKind mismatch during MIR lowering")
@@ -12067,6 +12166,20 @@ def lower_place(inout b: MirBuilder, expr: Expr) -> Place
   if kind_name == "ExprIdent" then
     match expr.kind
     when ExprKind::ExprIdent(name) then
+    # (§20 const generics, slice 3): a const generic parameter VALUE read
+    # has no place (no storage exists for the parameter — its value is
+    # fixed per instantiation), so every place-demanding path (store
+    # targets, inout/sink/ref-marked call arguments) through a recorded
+    # read node is fail-closed. The checker rejects the direct store
+    # (StmtAssign targets); this guard covers any other place demand
+    # (mutation-marked arguments) — a silent fallthrough would corrupt
+    # local 0.
+    match b.const_param_reads.get(expr.node_id)
+    when Option::Some(_) then
+      b.errors.push("internal error: const generic parameter `" + name + "` used as a mutable place during MIR lowering (const-parameter values are per-instantiation compile-time values with no storage; the checker must reject every place demand)")
+      return place_local(MirLocalId { id: 0 })
+    when Option::None then ()
+    end
     match lookup_current_local_id_by_name(b, name.clone())
     when Option::Some(local_id) then
       return place_local(local_id)
@@ -12268,7 +12381,7 @@ def lower_call_callee(inout b: MirBuilder, expr: Expr, span: Span) -> MirOperand
   when ExprKind::ExprFieldAccess(recv, field) then
     # Preserve qualified static calls such as Module::func or Type::new.
     mir_fn_operand(b, qualify_field_callee_name(&recv, field.clone()))
-  when ExprKind::ExprEnumVariant(path, _) then
+  when ExprKind::ExprEnumVariant(path, _, _) then
     mir_fn_operand(b, resolve_static_path_callee_name(b, &path))
   when ExprKind::ExprPath(path) then
     # Preserve type-qualified static calls (Vec::new, Map::new, etc.) when
@@ -12429,6 +12542,7 @@ def mir_project_index_type(b: MirBuilder, ty: Type) -> Type
   match ty
   when Type::String then Type::Char
   when Type::FixedArray(elem, _) then elem.clone()
+  when Type::FixedArraySym(elem, _) then elem.clone()
   when Type::Adt(tid, args) then
  # Adt form of Slice/Box/Rc mirrors the canonical arms (element
  # via the Adt args / unwrap recurse).: the builtin container /
@@ -13873,7 +13987,7 @@ def for_expr_uses_name(b: MirBuilder, name: String, expr: Expr) -> Bool
     end
   elsif kind_name == "ExprEnumVariant" then
     match expr.kind
-    when ExprKind::ExprEnumVariant(_, args) then for_exprs_uses_name(b, name, &args)
+    when ExprKind::ExprEnumVariant(_, _, args) then for_exprs_uses_name(b, name, &args)
     when _ then false
     end
   elsif kind_name == "ExprAssign" then
@@ -14113,7 +14227,7 @@ def for_expr_mentions_name(b: MirBuilder, name: String, expr: Expr) -> Bool
     end
   elsif kind_name == "ExprEnumVariant" then
     match expr.kind
-    when ExprKind::ExprEnumVariant(_, args) then for_exprs_mention_name(b, name, &args)
+    when ExprKind::ExprEnumVariant(_, _, args) then for_exprs_mention_name(b, name, &args)
     when _ then false
     end
   elsif kind_name == "ExprAssign" then
@@ -15905,6 +16019,7 @@ def format_mir_constant(names: Map[Int, String], param_names: Map[Int, String], 
   when MirConstantKind::MirUnit then "()"
   when MirConstantKind::MirBool(b) then if b then "true" else "false" end
   when MirConstantKind::MirInt(n) then n.to_string() + "_" + format_mir_type(names, param_names, &c.ty)
+  when MirConstantKind::MirConstParamValue(gpid) then "const_param(" + gpid.to_string() + ")"
   when MirConstantKind::MirFloat(f) then f.to_string() + "_" + format_mir_type(names, param_names, &c.ty)
   when MirConstantKind::MirChar(ch) then "'" + ch.to_string() + "'"
   when MirConstantKind::MirString(s) then "\"" + s.clone() + "\""
@@ -16006,6 +16121,22 @@ def format_cast_kind(kind: CastKind) -> String
   end  end
 end
 
+# (format helper, §20 slice 2): render a symbolic const-expression tree
+# with parameter NAMES (the tree-view debug form — the ConstSym arm of
+# format_mir_type).
+def format_const_tree(tree: ConstExprT, param_names: Map[Int, String]) -> String
+  match tree
+  when ConstExprT::ConstLit(v) then v.to_string()
+  when ConstExprT::ConstParamRef(gpid) then generic_param_name_from(&param_names, &gpid)
+  when ConstExprT::ConstAdd(l, r) then "((" + format_const_tree(&l, param_names) + ")+(" + format_const_tree(&r, param_names) + "))"
+  when ConstExprT::ConstSub(l, r) then "((" + format_const_tree(&l, param_names) + ")-(" + format_const_tree(&r, param_names) + "))"
+  when ConstExprT::ConstMul(l, r) then "((" + format_const_tree(&l, param_names) + ")*(" + format_const_tree(&r, param_names) + "))"
+  when ConstExprT::ConstDiv(l, r) then "((" + format_const_tree(&l, param_names) + ")/(" + format_const_tree(&r, param_names) + "))"
+  when ConstExprT::ConstMod(l, r) then "((" + format_const_tree(&l, param_names) + ")%(" + format_const_tree(&r, param_names) + "))"
+  when ConstExprT::ConstNeg(o) then "(-(" + format_const_tree(&o, param_names) + "))"
+  end  end
+end
+
 # the registered builtin compounds (Option/Result/Box/Rc/Map/Set/
 # UnsafeSlice/Array/Vec) display like their canonical variants — the Adt form
 # renders the builtin syntax via the registered name. The name comes from
@@ -16037,6 +16168,9 @@ def format_mir_type(names: Map[Int, String], param_names: Map[Int, String], ty: 
   when Type::Error then "<error>"
   when Type::Var(v) then "_T" + v.id.to_string()
   when Type::Param(gpid) then generic_param_name_from(param_names, &gpid)
+  when Type::Const(v) then "const " + v.to_string()
+  when Type::ConstParam(gpid) then "const " + generic_param_name_from(param_names, &gpid)
+  when Type::ConstSym(tree) then "const (" + format_const_tree(tree, param_names) + ")"
   when Type::Ptr(inner) then "*" + format_mir_type(names, param_names, inner)
   when Type::PtrMut(inner) then "*mut " + format_mir_type(names, param_names, inner)
   when Type::Dyn(id) then "dyn T" + id.id.to_string()
@@ -16055,6 +16189,8 @@ def format_mir_type(names: Map[Int, String], param_names: Map[Int, String], ty: 
     out + ")"
   when Type::FixedArray(elem, n) then
     "[" + format_mir_type(names, param_names, &elem) + "; " + n.to_string() + "]"
+  when Type::FixedArraySym(elem, gpid) then
+    "[" + format_mir_type(names, param_names, &elem) + "; const " + generic_param_name_from(param_names, &gpid) + "]"
   when Type::FnPtr(params, ret, _) then
     var out2 = "fnptr("
     var first2 = true
@@ -19968,6 +20104,7 @@ def operand_to_vn(op: MirOperand, local_vn: Map[Int, String]) -> String
   when MirOperandKind::MirConstant(cst) then
     match cst.kind
     when MirConstantKind::MirInt(n) then "i" + n.to_string()
+    when MirConstantKind::MirConstParamValue(gpid) then "cp" + gpid.to_string()
     when MirConstantKind::MirFloat(f) then "f" + f.to_string()
     when MirConstantKind::MirBool(b) then if b then "true" else "false" end
     when MirConstantKind::MirString(s) then "s\"" + s + "\""
@@ -22398,6 +22535,8 @@ def verifier_type_key(type_index: Map[Int, MirTypeDef], ty: Type) -> String
     end
   when Type::FixedArray(elem, n) then
     "fixedarray(" + verifier_type_key(type_index, &elem) + ":" + n.to_string() + ")"
+  when Type::FixedArraySym(elem, gpid) then
+    "fixedarray_sym(" + verifier_type_key(type_index, &elem) + ":" + generic_param_id_numeric(&gpid).to_string() + ")"
   when Type::FnPtr(_, _, _) then "fnptr"
   when Type::Closure(cid, _, _, _, _) then "closure<" + cid.id.to_string() + ">"
   when Type::RefInternal(inner, mutable) then
@@ -22570,6 +22709,7 @@ def verifier_elem_type(type_index: Map[Int, MirTypeDef], ty: Type) -> Option[Typ
   match ty
   when Type::RefInternal(inner, _) then verifier_elem_type(type_index, &inner)
   when Type::FixedArray(elem, _) then Option::Some(elem.clone())
+  when Type::FixedArraySym(elem, _) then Option::Some(elem.clone())
   when Type::Adt(tid, args) then
  # (Type collapse): the canonical Array/Slice arms are gone — the
     # Adt form of Array/Slice is selected by the registered name (the
@@ -22750,6 +22890,7 @@ def verifier_constant_type(cst: MirConstant) -> Option[Type]
   when MirConstantKind::MirUnit then Option::Some(Type::Unit)
   when MirConstantKind::MirBool(_) then Option::Some(Type::Bool)
   when MirConstantKind::MirInt(_) then Option::Some(Type::Int)
+  when MirConstantKind::MirConstParamValue(_) then Option::Some(Type::Int)
   when MirConstantKind::MirFloat(_) then Option::Some(Type::Float)
   when MirConstantKind::MirChar(_) then Option::Some(Type::Char)
   when MirConstantKind::MirString(_) then Option::Some(Type::String)
@@ -23194,6 +23335,19 @@ def verifier_check_type_concreteness(plans: Map[String, DeinitPlan], type_index:
     if !allow_param then
       let pname = generic_param_name_from(param_names, &gpid)
       errors.push(what.clone() + ": Type::ConstParam(\"" + pname + "\") reaches concrete MIR (const generic parameter leaked into a non-generic function)")
+    end
+  when Type::ConstSym(tree) then
+    # (§20 slice 2): a SYMBOLIC const-EXPRESSION argument (ConstSym) is
+    # generic exactly like its leaves — legal inside a generic template's
+    # body (allow_param; monomorphization substitutes and folds the tree —
+    # substitute_type's ConstSym arm), an error when a tree with parameter
+    # leaves reaches a concrete function.
+    if !allow_param then
+      let leaf_ids = const_sym_tree_param_ids(&tree)
+      if leaf_ids.len() > 0 then
+        let pname0 = generic_param_name_from(param_names, &leaf_ids[0])
+        errors.push(what.clone() + ": Type::ConstSym (parameter \"" + pname0 + "\") reaches concrete MIR (const generic expression leaked into a non-generic function)")
+      end
     end
   when Type::FixedArraySym(elem, gpid) then
     # (§20 slice 1): a symbolic-size fixed array is generic like its
@@ -25378,6 +25532,7 @@ def verifier_type_has_param(ty: Type) -> Bool
   match ty
   when Type::Param(_) then true
   when Type::ConstParam(_) then true
+  when Type::ConstSym(tree) then const_sym_tree_has_param(&tree)
   when Type::FixedArraySym(_, _) then true
   when Type::Adt(_, args) then
     var ai = 0
@@ -25877,6 +26032,58 @@ def mir_effect_scan_function(mir: MirProgram, inout state: MirEffectState, type_
   state.direct.insert(f.name.clone(), summary)
 end
 
+# (audit §34) The evidence-path rows of one violated effect class: walk
+# the call graph from the claimed function toward the first function
+# whose DIRECT evidence dirtied the class (the evidence leaf), emitting
+# one hop row per edge ("`f` -> `g` -> `h`"); the final row is the
+# leaf's evidence text (fallback_evidence when the walk cannot reach a
+# direct leaf). The walk is a DIAGNOSTIC reconstruction over the same
+# maps the fixed point computed — it never mutates them.
+def mir_effect_path_rows(state: MirEffectState, final_ev: Map[String, Vec[String]], root: String, slot: Int, fallback_evidence: String) -> Vec[String]
+  var rows = Vec::new()
+  var cur = root.clone()
+  var guard = 0
+  var leaf_text = fallback_evidence
+  while guard < 64 do
+    guard = guard + 1
+    var direct = Vec::new()
+    match state.direct_evidence.get(cur.clone())
+    when Option::Some(d) then direct = d.clone()
+    when Option::None then ()
+    end
+    if slot < direct.len() && direct[slot].len() > 0 then
+      leaf_text = direct[slot].clone()
+      break
+    end
+    var next = "".to_string()
+    match state.edges.get(cur.clone())
+    when Option::Some(callees) then
+      var ci = 0
+      while ci < callees.len() do
+        if next == "" then
+          var cal_ev = mir_effect_ev_empty()
+          match final_ev.get(callees[ci].clone())
+          when Option::Some(evs) then cal_ev = evs.clone()
+          when Option::None then ()
+          end
+          if slot < cal_ev.len() && cal_ev[slot].len() > 0 then
+            next = callees[ci].clone()
+          end
+        end
+        ci = ci + 1
+      end
+    when Option::None then ()
+    end
+    if next == "" then
+      break
+    end
+    rows.push("`" + cur.clone() + "` -> `" + next.clone() + "`")
+    cur = next
+  end
+  rows.push(leaf_text)
+  rows
+end
+
 # The public enforcement pass — run by the front-end phases AFTER MIR
 # lowering (audit §11). Returns the E0232 TypeError records of every
 # violated claim (the callers convert and emit them like typecheck
@@ -26057,9 +26264,9 @@ pub def check_effect_class_annotations_mir(mir: MirProgram, env: TypeEnv) -> Vec
       for fc in forbidden do
         if effect_summary_has_class(&final_summary, &fc) then
           var evidence = "".to_string()
+          let slot = effect_class_slot_index(fc)
           match final_ev.get(r.name.clone())
           when Option::Some(evs) then
-            let slot = effect_class_slot_index(fc)
             if slot < evs.len() then evidence = evs[slot].clone() end
           when Option::None then ()
           end
@@ -26068,10 +26275,24 @@ pub def check_effect_class_annotations_mir(mir: MirProgram, env: TypeEnv) -> Vec
           when EffectAnnotation::Interrupt then "handler"
           when _ then "function"
           end
+          # (audit §34): the effect_trace rows of the E0232 — the
+          # annotation row followed by the f->g->h evidence path (the
+          # first-wins evidence leaf of the violated class). The message
+          # text is unchanged.
+          var ev_rows = Vec::new()
+          ev_rows.push("@" + effect_class_claim_spelling(claim) + " " + subject + " `" + r.display.clone() + "` forbids " + effect_class_word(fc))
+          let ev_path = mir_effect_path_rows(&state, &final_ev, r.name.clone(), slot, ev.clone())
+          for p in ev_path do
+            ev_rows.push(p)
+          end
           errors.push(TypeError {
             message: "@" + effect_class_claim_spelling(claim) + " " + subject + " `" + r.display.clone() + "` " + effect_class_phrase(fc) + ": " + ev,
             span: claim.span,
-            code: Option::Some("E0232".to_string())
+            code: Option::Some("E0232".to_string()),
+            primary_symbol: Option::Some(r.display.clone()),
+            semantic_site: Option::Some("effect class enforcement"),
+            effect_trace: ev_rows,
+            related_symbols: Vec::from([r.display.clone()])
           })
         end
       end

@@ -1,0 +1,450 @@
+# Tangerine Compiler — Semantic Server Session (audit §39)
+# Self-hosting compiler written in Tangerine
+#
+# The PERSISTENT semantic service: ONE CompilerSession holds the semantic
+# state of a compilation — its content-addressed revision digest, the §29
+# SemanticSnapshot and the §32 SemanticIndex built once from it — and
+# answers a versioned, length-prefixed, STRUCTURED request protocol by
+# routing through the §38 query ops. No second compiler model: the service
+# never re-parses, re-type-checks or re-lowers; the snapshot is the model,
+# the index is the O(1) read surface. The internal API stays typed
+# (Session/Request/Response records + §38 QueryResults); JSON exists only
+# as the *_to_debug_string log lines, never on the wire.
+#
+# SESSION STATE: revision = the snapshot's content-addressed digest (its
+# .revision words when the writer finalized it, else semantic_snapshot_digest
+# on construction); snapshot + index are the served tables (the §38 facade
+# is constructed ON DEMAND via session_query — never embedded). The
+# final_env / final_typed / final_mir Option slots carry the PIPELINE's
+# finalized state, typed with the real values the §30 builder receives
+# (TypeEnv / TypedProgram / verified MirProgram — types.tg / mir.tg records;
+# nothing below imports this module, so no kernel/cycle issue). DOCUMENTED
+# GAP: no pipeline hook fills them today (a driver-side hook in the
+# compile_snapshot_route shape would set Option::Some(...) after the final
+# verify_mir); the session queries only snapshot+index, so the slots are
+# advisory — a MirProgram-holding follow-up opens §33 slices, and §38's
+# mir_slice slot stays "mir_slice_unavailable" until then.
+#
+# REQUEST PROTOCOL (versioned; framing binary, no length-prefix helper
+# exists outside the driver's LSP Content-Length TEXT framing — driver.tg
+# read_lsp_body — so §39 owns the 4-byte big-endian prefix documented here,
+# in the backend_rv rv_w32 byte-order idiom):
+#   frame := 4-byte BIG-ENDIAN body length || body; body = length-prefixed
+#   UTF-8 fields ("4-byte BE length || text"): request: protocol_version,
+#   request_id, operation, payload; response: protocol_version, request_id,
+#   ok ("true"/"false"), kind, keys-count, keys..., error
+#   Parsers are strict and fail closed (prefix/length disagreement, truncated
+#   field or non-numeric int field -> None). keys are sorted stable key
+#   texts; request_id always echoes.
+#
+# SESSION OPS: the sixteen §38 session ops (callers/callees/types/effects/
+# capabilities/contracts/fields/impls/properties/mir_function/symbol_get/
+# symbol_search/contract_list/type_explain/ownership_explain/mir_slice)
+# route to the §38 accessors verbatim; unknown names return kind "unknown"
+# exactly like §38's query(). "revision" is the ONE §39 service op (the
+# revision digest render — the client's freshness probe); a version mismatch
+# fails closed with an ok=false "protocol_error" response.
+#
+# REVISION LIFE-CYCLE: a source revision reaches the session as a NEW
+# finalized snapshot; session_revise replaces it (full re-index is correct
+# and cheap next to a compile). The §31 delta of the old/new sessions IS the
+# invalidation unit: exactly delta.affected's keys may have changed answer
+# rows — the service layer drops only those cached rows (invalidation
+# GRANULARITY = delta.affected; per-key memo caches live at that layer).
+
+use std::collections::{Vec}
+
+use tg_compiler::ids::{StableDigest}
+use tg_compiler::types::{TypeEnv, TypedProgram}
+use tg_compiler::mir::{MirProgram}
+use tg_compiler::semantic_model::{
+  SemanticSnapshot, semantic_digest_render, semantic_json_escape
+}
+use tg_compiler::semantic_snapshot::{semantic_snapshot_digest}
+use tg_compiler::semantic_delta::{SemanticDelta, semantic_delta_of, semantic_delta_empty}
+use tg_compiler::semantic_index::{SemanticIndex, build_semantic_index}
+use tg_compiler::semantic_query::{
+  QueryResults, SemanticQuerySession, new_semantic_query_session,
+  query_callers, query_callees, query_types, query_effects, query_capabilities,
+  query_contracts, query_fields, query_impls, query_properties,
+  query_symbol_get, query_symbol_search, contract_list, type_explain,
+  ownership_explain, mir_function, mir_slice
+}
+
+# ———————————————————————————————————————————————————————————————
+# The §39 protocol records — version, session, request, response
+# ———————————————————————————————————————————————————————————————
+# Protocol_version 1 = the whole §39 grammar above; any other request
+# version gets the fail-closed "protocol_error" response.
+
+pub const SEMANTIC_PROTOCOL_VERSION: Int = 1
+
+# The persistent-service session (final_* slots: see the module doc gap).
+struct CompilerSession
+  revision: StableDigest
+  snapshot: SemanticSnapshot
+  index: SemanticIndex
+  final_env: Option[TypeEnv] = Option::None
+  final_typed: Option[TypedProgram] = Option::None
+  final_mir: Option[MirProgram] = Option::None
+end
+
+# One request: operation is a session-op name; payload = the arg key text.
+struct SemanticRequest
+  protocol_version: Int
+  request_id: Int
+  operation: String
+  payload: String
+end
+
+# One response: ok + kind + sorted keys carry the §38 answer; error carries
+# the fail-closed reason text (kind "protocol_error").
+struct SemanticResponse
+  protocol_version: Int
+  request_id: Int
+  ok: Bool
+  kind: String
+  keys: Vec[String] = Vec::new()
+  error: String = ""
+end
+
+# ———————————————————————————————————————————————————————————————
+# Session lifecycle — build, facade, revise, delta
+# ———————————————————————————————————————————————————————————————
+
+# Build a session over one snapshot: index ONCE, revision = the snapshot's
+# digest (its own words when finalized).
+pub def new_compiler_session(snapshot: SemanticSnapshot) -> CompilerSession
+  var revision = semantic_snapshot_digest(&snapshot)
+  if snapshot.revision.hi != 0 || snapshot.revision.lo != 0 then
+    revision = snapshot.revision
+  end
+  CompilerSession {
+    revision: revision,
+    snapshot: snapshot,
+    index: build_semantic_index(&snapshot)
+  }
+end
+
+# The §38 facade ON DEMAND — the same snapshot+index, never duplicated.
+pub def session_query(session: CompilerSession) -> SemanticQuerySession
+  new_semantic_query_session(session.snapshot, session.index)
+end
+
+# The §31 delta of two sessions — the INVALIDATION UNIT of a revision:
+# exactly delta.affected's def keys may have changed answer rows (equal
+# revision digests short-circuit to the empty delta).
+pub def session_delta(old: CompilerSession, new: CompilerSession) -> SemanticDelta
+  if old.revision.hi == new.revision.hi && old.revision.lo == new.revision.lo then
+    return semantic_delta_empty()
+  end
+  semantic_delta_of(&old.snapshot, &new.snapshot)
+end
+
+# Replace the session after a source revision (the layer diffs with
+# session_delta and drops cached rows for delta.affected keys).
+pub def session_revise(session: CompilerSession, new_snapshot: SemanticSnapshot) -> CompilerSession
+  new_compiler_session(new_snapshot)
+end
+
+# ———————————————————————————————————————————————————————————————
+# Request routing — the §38 session ops + the §39 service op
+# ———————————————————————————————————————————————————————————————
+# The op table mirrors §38's query() arm for arm (every arm delegates to a
+# §38 typed accessor); "revision" is the one §39 service op.
+def session_revision_results(session: CompilerSession) -> QueryResults
+  var keys: Vec[String] = Vec::new()
+  keys.push(semantic_digest_render(&session.revision))
+  QueryResults { kind: "revision", keys: keys }
+end
+
+def session_query_results(session: CompilerSession, operation: String, arg: String) -> QueryResults
+  match operation
+  when "callers" then query_callers(&session.index, arg.clone())
+  when "callees" then query_callees(&session.index, arg.clone())
+  when "types" then query_types(&session.index, arg.clone())
+  when "effects" then query_effects(&session.index, arg.clone())
+  when "capabilities" then query_capabilities(&session.index, arg.clone())
+  when "contracts" then query_contracts(&session.index, arg.clone())
+  when "fields" then query_fields(&session.index, arg.clone())
+  when "impls" then query_impls(&session.index, arg.clone())
+  when "properties" then query_properties(&session.index, arg.clone())
+  when "mir_function" then mir_function(&session.snapshot, arg.clone())
+  when "symbol_get" then query_symbol_get(&session.index, arg.clone())
+  when "symbol_search" then query_symbol_search(&session.index, arg.clone())
+  when "contract_list" then contract_list(&session.snapshot, arg.clone())
+  when "type_explain" then type_explain(&session.index, arg.clone())
+  when "ownership_explain" then ownership_explain(&session.snapshot, arg.clone())
+  when "mir_slice" then mir_slice(arg.clone())
+  when "revision" then session_revision_results(&session)
+  when _ then QueryResults { kind: "unknown", keys: Vec::new() }
+  end
+end
+
+def session_results_response(req: SemanticRequest, results: QueryResults) -> SemanticResponse
+  SemanticResponse {
+    protocol_version: SEMANTIC_PROTOCOL_VERSION,
+    request_id: req.request_id,
+    ok: true,
+    kind: results.kind.clone(),
+    keys: results.keys.clone()
+  }
+end
+
+def session_protocol_error_response(req: SemanticRequest) -> SemanticResponse
+  let message = "unsupported protocol_version " + req.protocol_version.to_string() +
+    " (this server speaks " + SEMANTIC_PROTOCOL_VERSION.to_string() + ")"
+  SemanticResponse {
+    protocol_version: SEMANTIC_PROTOCOL_VERSION,
+    request_id: req.request_id,
+    ok: false,
+    kind: "protocol_error".to_string(),
+    error: message
+  }
+end
+
+# Handle one typed request: the version gate (fail closed) + §38 routing.
+pub def session_handle_request(session: CompilerSession, req: SemanticRequest) -> SemanticResponse
+  if req.protocol_version != SEMANTIC_PROTOCOL_VERSION then
+    return session_protocol_error_response(&req)
+  end
+  let results = session_query_results(&session, req.operation.clone(), req.payload.clone())
+  session_results_response(&req, &results)
+end
+
+# ———————————————————————————————————————————————————————————————
+# Wire helpers — 4-byte big-endian length-prefixed fields
+# ———————————————————————————————————————————————————————————————
+
+def server_push_u32(inout out: Vec[u8], n: Int) -> Unit
+  out.push(((n >> 24) & 0xFF) as u8)
+  out.push(((n >> 16) & 0xFF) as u8)
+  out.push(((n >> 8) & 0xFF) as u8)
+  out.push((n & 0xFF) as u8)
+end
+
+def server_push_text(inout out: Vec[u8], text: String) -> Unit
+  server_push_u32(&mut out, text.len())
+  for b in text.bytes() do
+    out.push(b)
+  end
+end
+
+def server_read_u32(bytes: Vec[u8], inout at: Int) -> Option[Int]
+  if at < 0 || at + 4 > bytes.len() then
+    return Option::None
+  end
+  let n = ((bytes[at] as Int) << 24) | ((bytes[at + 1] as Int) << 16) |
+    ((bytes[at + 2] as Int) << 8) | (bytes[at + 3] as Int)
+  at = at + 4
+  Option::Some(n)
+end
+
+def server_read_text(bytes: Vec[u8], inout at: Int) -> Option[String]
+  match server_read_u32(&bytes, &mut at)
+  when Option::None then Option::None
+  when Option::Some(n) then
+    if n < 0 || at + n > bytes.len() then
+      Option::None
+    else
+      let text = String::from_bytes(bytes.slice(at, at + n))
+      at = at + n
+      Option::Some(text)
+    end
+  end
+end
+
+def server_read_int(bytes: Vec[u8], inout at: Int) -> Option[Int]
+  match server_read_text(&bytes, &mut at)
+  when Option::None then Option::None
+  when Option::Some(text) then
+    match text.parse_int()
+    when Result::Ok(n) then Option::Some(n)
+    when Result::Err(_) then Option::None
+    end
+  end
+end
+
+def server_frame_of(body: Vec[u8]) -> Vec[u8]
+  var out: Vec[u8] = Vec::new()
+  server_push_u32(&mut out, body.len())
+  for b in body do
+    out.push(b)
+  end
+  out
+end
+
+# ———————————————————————————————————————————————————————————————
+# Request framing — encode + strict parse
+# ———————————————————————————————————————————————————————————————
+
+pub def semantic_request_frame(req: SemanticRequest) -> Vec[u8]
+  var body: Vec[u8] = Vec::new()
+  server_push_text(&mut body, req.protocol_version.to_string())
+  server_push_text(&mut body, req.request_id.to_string())
+  server_push_text(&mut body, req.operation.clone())
+  server_push_text(&mut body, req.payload.clone())
+  server_frame_of(body)
+end
+
+def server_req_fields_1(bytes: Vec[u8], inout at: Int, protocol_version: Int) -> Option[SemanticRequest]
+  match server_read_int(&bytes, &mut at)
+  when Option::None then Option::None
+  when Option::Some(request_id) then
+    match server_read_text(&bytes, &mut at)
+    when Option::None then Option::None
+    when Option::Some(operation) then
+      match server_read_text(&bytes, &mut at)
+      when Option::None then Option::None
+      when Option::Some(payload) then
+        Option::Some(SemanticRequest {
+          protocol_version: protocol_version,
+          request_id: request_id,
+          operation: operation,
+          payload: payload
+        })
+      end
+    end
+  end
+end
+
+# Parse ONE complete request frame (strict — None on any framing/field error).
+pub def semantic_request_parse(bytes: Vec[u8]) -> Option[SemanticRequest]
+  var at = 0
+  match server_read_u32(&bytes, &mut at)
+  when Option::None then Option::None
+  when Option::Some(body_len) then
+    if bytes.len() != at + body_len then
+      Option::None
+    else
+      match server_read_int(&bytes, &mut at)
+      when Option::None then Option::None
+      when Option::Some(protocol_version) then
+        server_req_fields_1(&bytes, &mut at, protocol_version)
+      end
+    end
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Response framing — encode + strict parse
+# ———————————————————————————————————————————————————————————————
+
+pub def semantic_response_frame(resp: SemanticResponse) -> Vec[u8]
+  let error_text = resp.error.clone()
+  var body: Vec[u8] = Vec::new()
+  server_push_text(&mut body, resp.protocol_version.to_string())
+  server_push_text(&mut body, resp.request_id.to_string())
+  server_push_text(&mut body, if resp.ok then "true" else "false" end)
+  server_push_text(&mut body, resp.kind.clone())
+  server_push_text(&mut body, resp.keys.len().to_string())
+  for k in resp.keys do
+    server_push_text(&mut body, k.clone())
+  end
+  server_push_text(&mut body, error_text)
+  server_frame_of(body)
+end
+
+def server_response_keys(bytes: Vec[u8], inout at: Int, count: Int) -> Option[Vec[String]]
+  var keys: Vec[String] = Vec::new()
+  var i = 0
+  while i < count do
+    match server_read_text(&bytes, &mut at)
+    when Option::None then return Option::None
+    when Option::Some(k) then keys.push(k.clone())
+    end
+    i = i + 1
+  end
+  Option::Some(keys)
+end
+
+def server_resp_fields_1(
+  bytes: Vec[u8], inout at: Int, protocol_version: Int, request_id: Int, ok: Bool
+) -> Option[SemanticResponse]
+  match server_read_text(&bytes, &mut at)
+  when Option::None then Option::None
+  when Option::Some(kind) then
+    match server_read_int(&bytes, &mut at)
+    when Option::None then Option::None
+    when Option::Some(count) then
+      match server_response_keys(&bytes, &mut at, count)
+      when Option::None then Option::None
+      when Option::Some(keys) then
+        match server_read_text(&bytes, &mut at)
+        when Option::None then Option::None
+        when Option::Some(error) then
+          Option::Some(SemanticResponse {
+            protocol_version: protocol_version,
+            request_id: request_id,
+            ok: ok,
+            kind: kind,
+            keys: keys,
+            error: error
+          })
+        end
+      end
+    end
+  end
+end
+
+# Parse ONE complete response frame (strict like semantic_request_parse).
+pub def semantic_response_parse(bytes: Vec[u8]) -> Option[SemanticResponse]
+  var at = 0
+  match server_read_u32(&bytes, &mut at)
+  when Option::None then Option::None
+  when Option::Some(body_len) then
+    if bytes.len() != at + body_len then
+      Option::None
+    else
+      match server_read_int(&bytes, &mut at)
+      when Option::None then Option::None
+      when Option::Some(protocol_version) then
+        match server_read_int(&bytes, &mut at)
+        when Option::None then Option::None
+        when Option::Some(request_id) then
+          match server_read_text(&bytes, &mut at)
+          when Option::None then Option::None
+          when Option::Some(ok_text) then
+            if ok_text != "true" && ok_text != "false" then
+              Option::None
+            else
+              server_resp_fields_1(&bytes, &mut at, protocol_version, request_id, ok_text == "true")
+            end
+          end
+        end
+      end
+    end
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Debug helpers — JSONL for logs ONLY (never parsed); the json_escape
+# shape rides semantic_model's semantic_json_escape.
+# ———————————————————————————————————————————————————————————————
+
+def server_json_keys_text(keys: Vec[String]) -> String
+  var text = "[".to_string()
+  var i = 0
+  while i < keys.len() do
+    if i > 0 then text = text + "," end
+    text = text + "\"" + semantic_json_escape(&keys[i]) + "\""
+    i = i + 1
+  end
+  text + "]"
+end
+
+pub def request_to_debug_string(req: SemanticRequest) -> String
+  "{\"request\":{\"protocol_version\":" + req.protocol_version.to_string() +
+    ",\"request_id\":" + req.request_id.to_string() +
+    ",\"operation\":\"" + semantic_json_escape(&req.operation) +
+    "\",\"payload\":\"" + semantic_json_escape(&req.payload) + "\"}}"
+end
+
+pub def response_to_debug_string(resp: SemanticResponse) -> String
+  "{\"response\":{\"protocol_version\":" + resp.protocol_version.to_string() +
+    ",\"request_id\":" + resp.request_id.to_string() +
+    ",\"ok\":" + (if resp.ok then "true" else "false" end) +
+    ",\"kind\":\"" + semantic_json_escape(&resp.kind) +
+    "\",\"keys\":" + server_json_keys_text(resp.keys.clone()) +
+    ",\"error\":\"" + semantic_json_escape(&resp.error) + "\"}}"
+end

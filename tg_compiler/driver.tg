@@ -87,6 +87,15 @@ use tg_compiler::compiler_core::{
   Diagnostic, DiagLevel, json_escape, parse_source_program, join_diagnostics,
   emit_diagnostic, type_errors_to_diags, merge_imported_deps
 }
+# The §30 semantic snapshot route (audit §30; default-off): the driver
+# house of the env-gated artifact gates (with the LIR gates) — the
+# snapshot builder is full-library-only and the compiler kernel stays
+# closed.
+use tg_compiler::semantic_snapshot::{
+  semantic_snapshot_of_final_state, semantic_snapshot_finalize, semantic_snapshot_serialize,
+  semantic_target_id_of
+}
+use tg_compiler::semantic_model::{semantic_digest_zero}
 
 # The WASM backend route — the driver's --target wasm32-unknown-unknown
 # dispatch (see compile_to_wasm_route below).
@@ -2840,7 +2849,10 @@ end
 # Thumb-2 backend (object emission only in this slice; executable/image
 # linking fails closed inside thumb_compile_executable). The route's
 # descriptor was resolved from the TANGERINE_LIR_TARGET name by the
-# caller (thumb_desc_of — the audit §16 per-CPU instances).
+# caller (thumb_desc_of — the audit §16 per-CPU instances). Objects of
+# programs with @interrupt functions additionally carry the .isr_vector
+# vector-table section (the audit §16 NVIC handler slice — see
+# backend_thumb.tg's interrupt-ABI section).
 def compile_lir_route_thumb(mir: MirProgram, opts: CompilerOptions, out_path: String, tdesc: TargetDesc) -> Result[Unit, String]
   # P1-14 slice 2: the gate consults the route's CANONICAL ARMv7-M
   # description — the single source of target data (the same
@@ -3037,6 +3049,92 @@ def compile_lir_route(opts: CompilerOptions, files: Vec[String], output_path: St
   end
 end
 
+# ———————————————————————————————————————————————————————————————
+# THE SEMANTIC SNAPSHOT ROUTE — audit §30 (default-off)
+# ———————————————————————————————————————————————————————————————
+# TANGERINE_SNAPSHOT=<path> routes native single-file compiles through the
+# §30 semantic snapshot builder (semantic_snapshot.tg): the canonical
+# pipeline runs to the FINAL VERIFIED MIR (read -> parse -> merge ->
+# analyze_program -> lower -> verify_mir -> monomorphize -> optimize_mir
+# -> verify_mir — the same phase shape the LIR route above uses), and the
+# SemanticSnapshot of that FINALIZED state (env + typed program + verified
+# MIR) is written to <path>. The builder never scans source text — it
+# reads only the finalized tables (see the semantic_snapshot.tg module doc
+# for the per-table anchors). The route REPLACES the compile (like the
+# LIR gate): it exists to produce the snapshot artifact, whose three
+# surface hashes ride the header and whose revision is the
+# content-addressed digest of its own canonical text.
+#
+# The gate lives HERE (the driver — the full-library build) rather than
+# in compiler_core.tg so the bootstrap compiler kernel stays closed
+# (kernel modules never import full-library modules); this mirrors the
+# env-gated LIR gates.
+
+def snapshot_route_path() -> Option[String]
+  match std::env::get_env("TANGERINE_SNAPSHOT")
+  when Option::Some(p) then if p.len() > 0 then Option::Some(p) else Option::None end
+  when Option::None then Option::None
+  end
+end
+
+def compile_snapshot_route(opts: CompilerOptions, files: Vec[String], snapshot_path: String) -> Result[Unit, String]
+  if files.len() != 1 then
+    return Result::Err("TANGERINE_SNAPSHOT requires exactly one input file (unset it for a normal compile)")
+  end
+  let file = files[0].clone()
+  let source = match read_file(file.clone())
+  when Result::Ok(s) then s
+  when Result::Err(e) then return Result::Err("failed to read " + file.clone() + ": " + e)
+  end
+  var ast = match parse_source_program(source, file.clone())
+  when Result::Ok(p) then p
+  when Result::Err(diags) then return Result::Err(join_diagnostics(&diags))
+  end
+  ast = match merge_imported_deps(ast, false)
+  when Result::Ok(a) then a
+  when Result::Err(e) then return Result::Err(e)
+  end
+  var env = type_env_new()
+  let typed = match analyze_program(&mut env, &mut ast, opts.clone())
+  when Result::Ok(tp) then tp
+  when Result::Err(diags) then return Result::Err(join_diagnostics(&diags))
+  end
+  var mir = match driver_lower_to_mir(&ast, Option::Some(typed.clone()))
+  when Result::Ok(m) then m
+  when Result::Err(e) then return Result::Err("MIR lowering failed: " + e)
+  end
+  let pre_errs = verify_mir(&mir)
+  if !pre_errs.is_empty() then
+    return Result::Err("MIR verification failed before monomorphization (" + pre_errs.len().to_string() + " error(s))")
+  end
+  var mono_cache = mono_cache_new(&ast, &typed.resolutions)
+  match monomorphize_program(&mut mir, &mut mono_cache)
+  when Result::Ok(_) then ()
+  when Result::Err(me) then return Result::Err("monomorphization failed with " + me.len().to_string() + " error(s)")
+  end
+  optimize_mir(&mut mir, opts.opt_level)
+  let post_errs = verify_mir(&mir)
+  if !post_errs.is_empty() then
+    return Result::Err("MIR verification failed after optimization (" + post_errs.len().to_string() + " error(s))")
+  end
+  # The ONE target resolution of the route (mirrors the LIR route's host
+  # target; the snapshot's target text rides the header).
+  let target = detect_host_target()
+  var snapshot = semantic_snapshot_of_final_state(
+    env, typed.typed, &mir, semantic_target_id_of(&target), VERSION, semantic_digest_zero())
+  semantic_snapshot_finalize(&mut snapshot)
+  let snapshot_text = semantic_snapshot_serialize(&mut snapshot)
+  match write_file_bytes(snapshot_path.clone(), &snapshot_text.bytes())
+  when Result::Ok(_) then
+    if !opts.quiet then
+      println("Semantic snapshot: " + snapshot_path)
+    end
+    Result::Ok(())
+  when Result::Err(e) then
+    Result::Err("failed to write semantic snapshot '" + snapshot_path + "': " + e.message())
+  end
+end
+
 def host_arch_name(arch: Arch) -> String
   match arch
   when Arch::AArch64 then "aarch64"
@@ -3183,6 +3281,21 @@ def cmd_compile(argv: Vec[String]) -> Int
     end
   end
 
+  # THE SEMANTIC SNAPSHOT ROUTE GATE (audit §30; default-off):
+  # TANGERINE_SNAPSHOT=<path> runs the canonical pipeline to the final
+  # verified MIR and writes the §30 SemanticSnapshot of the finalized
+  # semantic state to <path> (see compile_snapshot_route above).
+  match snapshot_route_path()
+  when Option::Some(snapshot_path) then
+    match compile_snapshot_route(&opts, files, snapshot_path)
+    when Result::Ok(_) then return 0
+    when Result::Err(e) then
+      eprintln(e)
+      return 1
+    end
+  when Option::None then ()
+  end
+
   if files.len() == 1 then
     compile_startup_entry(&opts, files[0].clone(), output_path)
   else
@@ -3325,6 +3438,21 @@ def cmd_compile_direct(skip_subcommand: Bool) -> Int
       eprintln(e)
       return 1
     end
+  end
+
+  # THE SEMANTIC SNAPSHOT ROUTE GATE in raw compile mode (audit §30;
+  # default-off) — same semantics as cmd_compile's gate.
+  match snapshot_route_path()
+  when Option::Some(snapshot_path) then
+    var snap_files = Vec::new()
+    snap_files.push(file.clone())
+    match compile_snapshot_route(&opts, snap_files, snapshot_path)
+    when Result::Ok(_) then return 0
+    when Result::Err(e) then
+      eprintln(e)
+      return 1
+    end
+  when Option::None then ()
   end
 
   match compile_file_core(file.clone(), &opts, &mut emitter)

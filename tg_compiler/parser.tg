@@ -13,7 +13,7 @@ use tg_compiler::lexer::LexResult
 use tg_compiler::ids::{is_intrinsic_extern_name}
 use tg_compiler::ast::{
   Program, Item, ItemKind, Visibility, Attribute,
-  FunctionDecl, GenericParam, Param, AccessConvention, NominalKind, FnBody, FunctionSig,
+  FunctionDecl, GenericParam, GenericParamKind, Param, AccessConvention, NominalKind, FnBody, FunctionSig,
   StructDecl, FieldDecl, EnumDecl, VariantDecl, LayoutAttrs, layout_attrs_plain,
   TraitDecl, TraitMethod, AssocType, ImplDecl, WherePredicate, AssocTypeImpl,
   ModuleDecl, UseDecl, AstPath, TypeAliasDecl, ConstDecl, StaticDecl,
@@ -59,6 +59,17 @@ struct Suggestion
   span: Span
 end
 
+# The ONE structured diagnostic record of the front end (parser.tg).
+# Every phase error (parse, resolution, type, access, resource, the MIR
+# effect-class enforcement) converts into this record at its phase
+# boundary, so the passes share a single channel. The message/span/code
+# fields are the PRESENTATION spine; the derivational fields below (audit
+# §34) carry the structured derivation trees the message summarizes. All
+# of them are OPTIONAL (defaulted), so every existing construction site
+# that fills only the presentation spine stays legal and behaviorally
+# identical — the message text never changes, the extra fields merely
+# accompany it for the structured consumers (the LSP, the semantic-slice
+# layer, the JSON/lint tooling).
 struct Diagnostic
   level: DiagLevel
   message: String
@@ -66,6 +77,46 @@ struct Diagnostic
   notes: Vec[String]
   suggestions: Vec[Suggestion]
   code: Option[String]
+  # (audit §34) primary_symbol: the main symbol the diagnostic is about
+  # (the receiver type, the resource local, the claimed function) — the
+  # source-level anchor of the derivation tree.
+  primary_symbol: Option[String] = Option::None
+  # (audit §34) semantic_site: the checker construct the error occurred at
+  # (e.g. "type unification", "method call resolution", "effect class
+  # enforcement", "ownership analysis") — a stable site label.
+  semantic_site: Option[String] = Option::None
+  # (audit §34) expected_type / actual_type: the rendered types of a type
+  # mismatch, in the same order the message names them (the first rendered
+  # type is expected_type, the second actual_type).
+  expected_type: Option[String] = Option::None
+  actual_type: Option[String] = Option::None
+  # (audit §34) constraint_trace: the nested constraint-derivation rows of
+  # a failed obligation (root type -> field -> field's type -> why it
+  # fails).
+  constraint_trace: Vec[String] = Vec::new()
+  # (audit §34) trait_trace: the trait-solver rows of a failed resolution —
+  # the candidate list (each candidate + why it failed) and the remaining
+  # answer.
+  trait_trace: Vec[String] = Vec::new()
+  # (audit §34) ownership_trace: the ownership state-chain rows (live ->
+  # consumed at <site> by ...) of a resource rejection.
+  ownership_trace: Vec[String] = Vec::new()
+  # (audit §34) effect_trace: the E0232 evidence-path rows (the f->g->h
+  # derivation of the violated effect class).
+  effect_trace: Vec[String] = Vec::new()
+  # (audit §34) capability_trace: the capability state-chain rows of a
+  # capability rejection (delegation/discard/exit).
+  capability_trace: Vec[String] = Vec::new()
+  # (audit §34) related_symbols: the nested symbol chain the diagnostic
+  # spans (e.g. the field chain of a derived obligation, the callee chain
+  # of an effect violation).
+  related_symbols: Vec[String] = Vec::new()
+  # (audit §34) minimal_slice: the minimal semantic slice of the program
+  # that reproduces the diagnostic (the semantic_slice.tg consumers).
+  minimal_slice: Vec[String] = Vec::new()
+  # (audit §34) repair_candidates: the suggested repair candidates in
+  # structured form (parallel to the free-text suggestions).
+  repair_candidates: Vec[String] = Vec::new()
 end
 
 struct ParseOutput
@@ -583,6 +634,11 @@ def parse_attributes(inout p: TgcParser) -> Vec[Attribute]
       #     (the forced-inline request) / @inline(never) (the std spelling
       #     of the noinline hint — std/debug.tg);
       #   - @noinline and @cold take no arguments.
+      # (audit §16) @interrupt — the interrupt-handler marker — is
+      # arg-less too: the marker records the function as an ISR entry
+      # point, and a vector-slot number is not an attribute argument of
+      # this dialect (the ARMv7-M backend's .isr_vector table maps the
+      # handlers in declaration order — see backend_thumb.tg).
       # The names themselves parse generically (an item's attribute list
       # is the function-attribute registry — item.attrs); the recording on
       # the function definition and the consumption live at the MIR
@@ -598,6 +654,16 @@ def parse_attributes(inout p: TgcParser) -> Vec[Attribute]
         diag_error(&mut p.diag, ErrorCode::E110InvalidFunctionAttribute, "@noinline takes no arguments", start)
       elsif name == "cold" && args.len() > 0 then
         diag_error(&mut p.diag, ErrorCode::E110InvalidFunctionAttribute, "@cold takes no arguments", start)
+      elsif name == "interrupt" && args.len() > 0 then
+        # (audit §16 — the @interrupt handler marker): arg-less only. An
+        # interrupt function's vector-table slot is NOT expressible in the
+        # attribute dialect (an @interrupt(N) IRQ number has no argument
+        # form); the thumb backend emits the .isr_vector table with the
+        # documented declaration-order mapping instead (see
+        # backend_thumb.tg's vector-table section). Fail closed on the
+        # expressible argument shapes — a malformed marker must never
+        # silently parse as a bare @interrupt.
+        diag_error(&mut p.diag, ErrorCode::E110InvalidFunctionAttribute, "@interrupt takes no arguments (an interrupt's vector-slot number is not expressible in the attribute dialect — see the thumb backend's .isr_vector mapping)", start)
       elsif name == "fp" then
         # (P1-6 — the floating-point mode attribute): @fp(fast) is the
         # ONLY supported spelling (the strict IEEE mode is the DEFAULT —
@@ -3269,18 +3335,49 @@ end
 # parameter's declared scalar type and const-NAME arguments are slice 2).
 # The literal must fit the host Int (fail-closed: an out-of-range literal is
 # a parse diagnostic, never a wrapped value).
+#
+# (§20 const generics, slice 2): the argument parser also accepts the
+# COMPOUND CONST-EXPRESSION forms of a const argument — module-const
+# references and the integer arithmetic operators over
+# literals/consts (`LIMIT * 2`, `2 + 2`, `-(LIMIT + 1)`) — as
+# TypeExprKind::ConstExpr(expr), folded to Type::Const(value) by the
+# checker. The dispatch is ambiguity-free: an integer literal start, a
+# `-` start that is not a signed literal, and an identifier followed by a
+# const arithmetic operator can never begin an ordinary type expression,
+# so those forms parse as expressions; every other start parses as a type
+# (a BARE identifier is an ordinary Named type expression whose name the
+# checker resolves through the type/const-parameter/module-const channels).
 def parse_type_arg(inout p: TgcParser) -> Option[TypeExpr]
   match peek(p)
   when TokenKind::IntLit(n) then
     let start = peek_span(p)
+    # An integer literal followed by a const operator is the head of a const
+    # EXPRESSION (`2 + 2`) — parse the whole expression from the literal;
+    # a bare literal is the slice-1 ConstArg form.
+    if const_binop_ahead(p) then
+      match parse_expr(p)
+      when Option::Some(e) then return Option::Some(make_type_expr(TypeExprKind::ConstExpr(e), span_merge(start, e.span)))
+      when Option::None then return Option::None
+      end
+    end
     if !parsed_int_fits_host(n) then
       diag_error(&mut p.diag, ErrorCode::E100UnexpectedToken, "const generic argument literal is out of range (must fit the host Int)", start)
     end
     advance(p)
     return Option::Some(make_type_expr(TypeExprKind::ConstArg(parsed_int_to_host(n)), span_merge(start, peek_span(p))))
   when TokenKind::Minus then
+    # A negated literal followed by a const operator is the head of a const
+    # EXPRESSION (`-1 * 2`); a bare negated literal is the slice-1 ConstArg
+    # form; any other `-` start (no type expression can begin with `-`) is a
+    # const expression over const references (`-LIMIT`, `-(2 + 2)`).
     if lookahead_kind(p, 1) is TokenKind::IntLit(_) then
       let start = peek_span(p)
+      if const_binop_ahead_offset(p, 2) then
+        match parse_expr(p)
+        when Option::Some(e) then return Option::Some(make_type_expr(TypeExprKind::ConstExpr(e), span_merge(start, e.span)))
+        when Option::None then return Option::None
+        end
+      end
       advance(p)
       match peek(p)
       when TokenKind::IntLit(n) then
@@ -3292,11 +3389,80 @@ def parse_type_arg(inout p: TgcParser) -> Option[TypeExpr]
       when _ then return Option::None
       end
     end
-    # A bare `-` in an argument list is not a const argument: fall through to
-    # the ordinary type parse, which reports the expected-type diagnostic.
+    let start = peek_span(p)
+    match parse_expr(p)
+    when Option::Some(e) then return Option::Some(make_type_expr(TypeExprKind::ConstExpr(e), span_merge(start, e.span)))
+    when Option::None then return Option::None
+    end
+  when TokenKind::Ident(_) then
+    # An identifier followed by a const arithmetic operator can never be an
+    # ordinary type expression (no type operator follows a type name), so
+    # the argument is a const EXPRESSION over module consts / in-scope
+    # const references (`LIMIT * 2`). A BARE identifier parses as a type
+    # below (the checker resolves a type/const-parameter/module-const name).
+    if const_binop_ahead(p) then
+      let start = peek_span(p)
+      match parse_expr(p)
+      when Option::Some(e) then return Option::Some(make_type_expr(TypeExprKind::ConstExpr(e), span_merge(start, e.span)))
+      when Option::None then return Option::None
+      end
+    end
+    parse_type(p)
+  when TokenKind::LParen then
+    # A parenthesized CONST EXPRESSION (`(2 + 2)`, `-(... )` handled above)
+    # — the parenthesized-const forms of the [T; N] size grammar. A
+    # parenthesized TYPE (a tuple type `(A, B)`, a parenthesized fn type)
+    # keeps parsing as a type. The disambiguation looks inside the parens:
+    # an integer-literal/minus start is unambiguously an expression, as is
+    # an identifier followed by a const operator.
+    let paren_head = lookahead_kind(p, 1)
+    if paren_head is TokenKind::IntLit(_) || paren_head is TokenKind::Minus then
+      let start = peek_span(p)
+      match parse_expr(p)
+      when Option::Some(e) then return Option::Some(make_type_expr(TypeExprKind::ConstExpr(e), span_merge(start, e.span)))
+      when Option::None then return Option::None
+      end
+    elsif paren_head is TokenKind::Ident(_) then
+      let op_after = lookahead_kind(p, 2)
+      if op_after is TokenKind::Plus || op_after is TokenKind::Minus || op_after is TokenKind::Star || op_after is TokenKind::Slash || op_after is TokenKind::Percent then
+        let start = peek_span(p)
+        match parse_expr(p)
+        when Option::Some(e) then return Option::Some(make_type_expr(TypeExprKind::ConstExpr(e), span_merge(start, e.span)))
+        when Option::None then return Option::None
+        end
+      end
+    end
     parse_type(p)
   when _ then parse_type(p)
   end
+end
+
+# Whether the token after the current position is one of the const
+# arithmetic operators the const-expression grammar accepts (the [T; N]
+# size forms: Add/Sub/Mul/Div/Mod). The checker's const-argument evaluator
+# folds exactly this operator set.
+def const_binop_ahead(p: TgcParser) -> Bool
+  match lookahead_kind(p, 1)
+  when TokenKind::Plus then true
+  when TokenKind::Minus then true
+  when TokenKind::Star then true
+  when TokenKind::Slash then true
+  when TokenKind::Percent then true
+  when _ then false
+  end  end
+end
+
+# const_binop_ahead at an arbitrary lookahead offset (the signed-literal
+# head `- 1 op ...` — the operator sits TWO tokens ahead).
+def const_binop_ahead_offset(p: TgcParser, offset: Int) -> Bool
+  match lookahead_kind(p, offset)
+  when TokenKind::Plus then true
+  when TokenKind::Minus then true
+  when TokenKind::Star then true
+  when TokenKind::Slash then true
+  when TokenKind::Percent then true
+  when _ then false
+  end  end
 end
 
 # Parse a comma-separated list of type expressions: T, U, V
@@ -6121,7 +6287,7 @@ def parse_primary(inout p: TgcParser) -> Option[Expr]
           let call_span = span_merge(start, peek_span(p))
           let array_expr = make_expr(ExprKind::ExprArrayLit(args), call_span)
           let vec_path = make_path(["Vec", "from"], call_span)
-          return Option::Some(make_expr(ExprKind::ExprEnumVariant(vec_path, [array_expr]), call_span))
+          return Option::Some(make_expr(ExprKind::ExprEnumVariant(vec_path, Vec::new(), [array_expr]), call_span))
         end
         return Option::Some(make_expr(ExprKind::ExprMacroCall(name, args), span_merge(start, peek_span(p))))
       elsif at(p, TokenKind::LParen) then
@@ -6159,7 +6325,7 @@ def parse_primary(inout p: TgcParser) -> Option[Expr]
         advance(p)
         let args = parse_arg_list(p)
         expect(p, TokenKind::RParen)
-        return Option::Some(make_expr(ExprKind::ExprEnumVariant(path, args), span_merge(start, peek_span(p))))
+        return Option::Some(make_expr(ExprKind::ExprEnumVariant(path, Vec::new(), args), span_merge(start, peek_span(p))))
       elsif at(p, TokenKind::LBrace) then
         advance(p)
         let fields = parse_struct_literal_fields(p)
@@ -6182,6 +6348,9 @@ def parse_primary(inout p: TgcParser) -> Option[Expr]
       # Speculatively parse `[ Type (, Type)* ]` and require it be immediately
       # followed by `{ Ident :` to commit. Otherwise back off so that postfix
       # parsing can treat `[...]` as indexing.
+      # (§20 slice 2): the speculative argument list parses through
+      # parse_type_arg, so a CONST argument head (`Foo[U8, 4] {`, the const
+      # name/expression forms included) commits like a type argument.
       # Save diagnostic length so we can restore on backtrack — the speculative
       # parse may emit "expected type" errors when the `[...]` is actually an
       # index expression like `call_args[0]`.
@@ -6191,15 +6360,27 @@ def parse_primary(inout p: TgcParser) -> Option[Expr]
       skip_newlines(p)
       mut type_args_ok = true
       mut ta_count = 0
-      match parse_type(p)
-      when Option::Some(_t) then ta_count = ta_count + 1
+      # (§23): the speculative list is ALSO the OWNER TYPE's generic
+      # arguments of a generic-typed associated call (`Decimal64[2]::m`,
+      # `Vec[u8]::new` — type AND const arguments alike); the parse below
+      # keeps the resolved TypeExprs so the checker can build the concrete
+      # owner Adt and bind the impl's const parameters from the path
+      # directly (they are dropped today, which leaves the call's instance
+      # solvable only from an annotated binding type).
+      mut gtype_args: Vec[TypeExpr] = Vec::new()
+      match parse_type_arg(p)
+      when Option::Some(ta) then
+        ta_count = ta_count + 1
+        gtype_args.push(ta)
       when Option::None then type_args_ok = false
       end
       while type_args_ok && at(p, TokenKind::Comma) do
         advance(p)
         skip_newlines(p)
-        match parse_type(p)
-        when Option::Some(_t) then ta_count = ta_count + 1
+        match parse_type_arg(p)
+        when Option::Some(ta) then
+          ta_count = ta_count + 1
+          gtype_args.push(ta)
         when Option::None then type_args_ok = false
         end
       end
@@ -6230,7 +6411,7 @@ def parse_primary(inout p: TgcParser) -> Option[Expr]
             advance(p)
             let gargs = parse_arg_list(p)
             expect(p, TokenKind::RParen)
-            return Option::Some(make_expr(ExprKind::ExprEnumVariant(gpath, gargs), span_merge(start, peek_span(p))))
+            return Option::Some(make_expr(ExprKind::ExprEnumVariant(gpath, gtype_args, gargs), span_merge(start, peek_span(p))))
           else
             return Option::Some(make_expr(ExprKind::ExprPath(gpath), span_merge(start, peek_span(p))))
           end
