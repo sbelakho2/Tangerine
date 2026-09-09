@@ -154,7 +154,7 @@ The following modules are included in the standard library.
 | `std/secure_types` | Injection-safe types (SQL, HTML, URL, Path) | Unstable (pre-1.0) |
 | `std/taint` | FFI taint tracking and validators | Unstable (pre-1.0) |
 | `std/replay` | Deterministic replay | Unstable (pre-1.0) |
-| `std/semantic_diff` | Semantic code diffing | Unstable (pre-1.0) |
+| `std/semantic_diff` | Textual/heuristic source diff (presentation only, not a semantic authority) | Unstable (pre-1.0) |
 | `std/supply_chain` | Package signing, lockfile, trust | Unstable (pre-1.0) |
 
 ## Dependency Version Resolution

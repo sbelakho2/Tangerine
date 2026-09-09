@@ -156,7 +156,7 @@ forbidden-syntax grep backstop; the gate is a **required CI job**
 26. [Secure Types](#secure-types) - `std/secure_types`
 27. [Taint Tracking](#taint-tracking) - `std/taint`
 28. [Deterministic Replay](#deterministic-replay) - `std/replay`
-29. [Semantic Diff](#semantic-diff) - `std/semantic_diff`
+29. [Textual Source Diff](#textual-source-diff) - `std/semantic_diff` (heuristic)
 30. [Supply Chain Security](#supply-chain-security) - `std/supply_chain`
 31. [Mathematics](#mathematics) - `std/math`
 32. [Random Numbers](#random-numbers) - `std/random`, `std/rand`
@@ -2591,25 +2591,28 @@ let event = player.next()?   # ReplayEvent
 
 ---
 
-## Semantic Diff
+## Textual Source Diff
 
-**Module:** `std/semantic_diff`
+**Module:** `std/semantic_diff` — TEXTUAL / heuristic (NOT a semantic authority)
 
-Extracts code entities from source files and computes meaningful diffs with
-severity annotation.
+Line-based, string-recognized comparison of Tangerine source texts,
+intended for display and quick orientation. Per audit §28 + §45 this
+utility is presentation only: semantic identity and semantic diff are the
+compiler's — `tg_compiler/semantic_delta.tg` over the semantic snapshot
+architecture (`semantic_model.tg` / `semantic_snapshot.tg` / `semantic_query.tg`).
+Never use this module for claims about semantic equivalence, ABI,
+effects, or ownership.
 
 ```tangerine
-use std::semantic_diff::{extract_entities, compute_diff, SemanticDiff,
-                         AnnotatedChange, DiffSeverity}
+use std::semantic_diff::textual_diff_of_sources
 
-let old_entities = extract_entities(old_source)
-let new_entities = extract_entities(new_source)
-let diff = compute_diff(&old_entities, &new_entities)
+let old_src = "def foo() -> Int\n  42\nend\n"
+let new_src = "def bar() -> Int\n  42\nend\n"
+let diff = textual_diff_of_sources(old_src, new_src)
+# diff: TextualDiff { changes, added_count, removed_count, modified_count }
 
 for change in diff.changes do
-  let severity = classify_change_severity(&change)
-  puts(format("[{}] {} {} — {}", [severity, change.kind, change.entity_name,
-                                    change.description]))
+  puts(format("[{}] {} — {}", [change.kind, change.name, change.description]))
 end
 ```
 
@@ -2618,12 +2621,12 @@ end
 
 **Change Kinds:** `Added`, `Removed`, `Modified`, `Renamed`, `Moved`
 
-**Severity Levels:**
+**Severity Levels (heuristic labels, presentation only):**
 | Severity | Meaning |
 |----------|---------|
-| `Breaking` | Public API removed or signature changed |
-| `Compatible` | New API added, no existing API affected |
-| `Internal` | Private implementation changed |
+| `Breaking` | Top-level declaration surface changed |
+| `Compatible` | Additive change only |
+| `Internal` | Body-level text changed |
 | `Cosmetic` | Whitespace, comments, or formatting only |
 
 ---

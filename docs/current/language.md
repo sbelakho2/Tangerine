@@ -1891,16 +1891,20 @@ trace_save(&rec.to_trace(), "trace.replay")?
 let player = player_load("trace.replay")?
 ```
 
-### Semantic Diff (`std/semantic_diff`)
+### Textual Diff Utility (heuristic — `std/semantic_diff`)
 
 ```tangerine
-use std::semantic_diff::{extract_entities, compute_diff}
+use std::semantic_diff::textual_diff_of_sources
 
-let old_entities = extract_entities(old_source)
-let new_entities = extract_entities(new_source)
-let diff = compute_diff(&old_entities, &new_entities)
-# diff.changes: Vec[AnnotatedChange] with severity (Breaking/Compatible/Internal/Cosmetic)
+let diff = textual_diff_of_sources(old_source, new_source)
+# diff.changes: Vec[Change] — textual/heuristic diff for display only
 ```
+
+Line-based, string-recognized source comparison. This is NOT the
+compiler's semantic authority (audit §28 + §45): semantic identity and
+diff come from compiler state — `tg_compiler/semantic_delta.tg` over the
+semantic snapshot architecture. Never use this module for claims about
+semantic equivalence, ABI, effects, or ownership.
 
 ### Supply Chain (`std/supply_chain`)
 
