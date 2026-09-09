@@ -1,0 +1,512 @@
+# Tangerine Compiler — ABI / FFI report (audit §43)
+# Self-hosting compiler written in Tangerine
+#
+# The §43 FFI-report slice: ONE compact FfiReport per exported / extern
+# symbol of a SemanticSnapshot, plus abi_diff (the per-symbol ABI diff
+# between two reports) and the coarse abi_rows_of_snapshot fallback. The
+# module reads ONLY SemanticSnapshot rows (semantic_model.tg records —
+# never AST / typed / MIR state) and mirrors the semantic_index.tg /
+# semantic_delta.tg / replay.tg idioms.
+#
+# ROW ANCHORS (what a snapshot actually carries): symbol rows keyed by
+# the FULL stable key "path::name#signature" (the signature component is
+# the semantic_snapshot.tg writer's own canonical render, e.g.
+# "fn(let:Int,inout:Widget)->Unit"; extern declarations register as
+# Function-kind pub rows whose key may carry an EMPTY signature — the
+# writer has no typed record for them); mir_functions rows per def-keyed
+# lowered function (externs have no def-keyed lowering and never appear);
+# the §30 ABI rows THEMSELVES never ride the snapshot — abi_hash digests
+# snapshot_abi_text lines ("<digest> <key> <canonical text>" / "... generic"
+# / "... abi-fail-closed" — the mono CanonExternal frame over
+# mir_fn_abi_signature) but only the digest serializes (§31 documents
+# the same gap); per-arg ABI location rows and layout rows DO NOT EXIST
+# in the model (the §32 index layout family is documented EMPTY), no
+# nullability markers exist on Ptr params, and thread-safety / taint /
+# failure conventions are part of no signature record.
+#
+# REPORT ANCHORS — what ffi_report_of_symbol derives, field by field:
+#   DERIVED FROM SNAPSHOT ROWS:
+#     symbol_key          — the row's full stable key text; the lookup
+#                           accepts the full key OR the bare registration
+#                           key "path::name" (a key-path match).
+#     tangerine_signature — the "#signature" component of that key.
+#     abi_name            — from the symbol's §30 abi row, when one is
+#                           DEFINED (the §30 writer would emit one: pub
+#                           Function-kind row WITH a def-keyed lowering —
+#                           the mir_functions row presence; generic bases
+#                           render the deterministic "generic" marker):
+#                           the row's key word (the registration key per
+#                           the "<digest> <key> ..." grammar). No abi row
+#                           defined -> "internal" (an extern declaration
+#                           has no §30 row — no def-keyed lowering — and
+#                           the model records no link/export name for it;
+#                           never invented).
+#     external_signature — the §30 row's payload BEYOND the key when one
+#                           is present and is not a writer marker
+#                           ("generic" / "abi-fail-closed" never become
+#                           signatures). Snapshot-reconstructed rows never
+#                           carry the CanonExternal frame text (writer-
+#                           side, never serialized), so this stays empty
+#                           from a snapshot alone; the parse accepts the
+#                           full §30 grammar so a row-bearing artifact
+#                           feeds the same builder.
+#     nullability         — the documented heuristic over the canonical
+#                           signature text: params whose TYPE text (after
+#                           the "conv:" prefix) starts with "ptr" / "Ptr".
+#                           The canonical type grammar renders Ptr as
+#                           "P[...]" / "Q[...]" with no nullability marker
+#                           vocabulary, so the scan matches nothing today —
+#                           the slot for a future marker convention.
+#     ownership_transfer  — from the signature's AccessConvention words
+#                           (the "conv:" prefixes): one row per param
+#                           whose convention transfers ownership at the
+#                           FFI boundary — "sink" (callee takes the value)
+#                           and "set" (callee initializes caller storage),
+#                           per the ast.tg extern metadata mapping; let /
+#                           inout are borrows and never transfer.
+#   DOCUMENTED-UNMODELED (report only — never invented):
+#     arg_locations / return_location — no per-arg location row family
+#                           exists in the snapshot (ABI locations are
+#                           codegen/classifier knowledge); both stay empty.
+#     layouts / alignments — no layout row family rides the snapshot
+#                           (§32's type_layouts is documented EMPTY); both
+#                           stay empty — the lists exist so a layout-row-
+#                           bearing consumer fills and abi_diff diffs them.
+#     thread_safety / taint / failure_convention — absent from the model;
+#                           each is the constant "not modeled".
+#
+# abi_diff(old, new): the per-symbol ABI diff of TWO FfiReports. Identity:
+# the reports' key PATH parts ("module::name") must agree — a signature
+# change rewrites only the "#..." component; two different symbols diff
+# to NOTHING (created / removed is the §31 delta's report). Row classes
+# (sorted output), mapping the audit examples exactly:
+#   "layout <sym> <old-entry> -> <new-entry>" — ONE line per POSITIONALLY
+#     PAIRED, differing entry of the layouts / alignments lists (<sym> =
+#     the report's bare symbol name): entries "size 24" / "size 32" of
+#     the Widget report render "layout Widget size 24 -> 32"; entries
+#     "field payload offset 8" / "... 16" render "layout Widget field
+#     payload offset 8 -> 16".
+#   "arg<i> <old-entry> -> <new-entry>" — location diffs from the
+#     arg_locations lists (one entry per param position): "GPR" /
+#     "indirect" at position 2 render "arg2 GPR -> indirect".
+#   "return <old> -> <new>" — the return_location when BOTH sides carry
+#     one and they differ (an empty side is "no location data", never a
+#     location).
+#   "signature <old> -> <new>" / "external-signature <old> -> <new>" —
+#     the signature changes, appended; an empty side renders as the
+#     empty text (the external side appearing / disappearing IS the §30
+#     row membership change).
+#   Unpaired list tails (a position present on one side only) are NOT
+#   diffed — an entry created/removed is a structural row change (the
+#   §31 created/removed domain), never guessed here.
+#
+# DETERMINISM: pure functions of the snapshot rows; param scans follow
+# DECLARATION order, abi_rows_of_snapshot returns SORTED rows, abi_diff
+# sorts its output lines. Nothing here parses anything back.
+
+use std::core::{Option}
+use std::collections::{Vec}
+
+use tg_compiler::semantic_model::{
+  SemanticSnapshot, SemanticSymbol, semantic_def_kind_text,
+  semantic_digest_render, semantic_stable_def_id_digest
+}
+
+# ———————————————————————————————————————————————————————————————
+# The §43 record — ONE FfiReport per exported / extern symbol
+# ———————————————————————————————————————————————————————————————
+# Every Vec / String field is defaulted so sparse reports are
+# expressible: an empty report claims nothing. The three model-absent
+# convention surfaces default to the "not modeled" marker (report only —
+# no invention; the builder re-states them explicitly).
+
+struct FfiReport
+  symbol_key: String = ""
+  abi_name: String = ""
+  tangerine_signature: String = ""
+  external_signature: String = ""
+  arg_locations: Vec[String] = Vec::new()
+  return_location: String = ""
+  layouts: Vec[String] = Vec::new()
+  alignments: Vec[String] = Vec::new()
+  nullability: Vec[String] = Vec::new()
+  ownership_transfer: Vec[String] = Vec::new()
+  thread_safety: String = "not modeled"
+  taint: String = "not modeled"
+  failure_convention: String = "not modeled"
+end
+
+# ———————————————————————————————————————————————————————————————
+# Stable-key text helpers (the model's key domain)
+# ———————————————————————————————————————————————————————————————
+
+# The index of the first needle occurrence at or after from (-1 if none).
+def report_char_index(s: String, needle: String, from: Int) -> Int
+  var i = from
+  while i < s.len() do
+    if s.slice(i, i + 1) == needle then
+      return i
+    end
+    i = i + 1
+  end
+  -1
+end
+
+# The path/name component of a stable key: everything before the first
+# "#signature" (a key without '#' is its own path) — the registration key.
+def report_key_path(key: String) -> String
+  let i = report_char_index(&key, "#", 0)
+  if i < 0 then key.clone() else key.slice(0, i) end
+end
+
+# The signature component of a stable key: everything after the first
+# '#' ("" when the key carries none — the extern-declaration shape).
+def report_key_signature(key: String) -> String
+  let i = report_char_index(&key, "#", 0)
+  if i < 0 then "".to_string() else key.slice(i + 1, key.len()) end
+end
+
+# The bare name of a key: everything after the last "::" — the audit's
+# <sym> label.
+def report_key_name(key: String) -> String
+  var pos = key.len()
+  while pos >= 2 do
+    if key.slice(pos - 2, pos) == "::" then
+      return key.slice(pos, key.len())
+    end
+    pos = pos - 1
+  end
+  key.clone()
+end
+
+# Space-split a §30 abi row text into its words (the row grammar has no
+# spaces inside any word: digest, keys, frame text and markers).
+def report_row_words(row: String) -> Vec[String]
+  var words: Vec[String] = Vec::new()
+  var start = 0
+  var i = 0
+  while i < row.len() do
+    if row.slice(i, i + 1) == " " then
+      if start < i then
+        words.push(row.slice(start, i))
+      end
+      start = i + 1
+    end
+    i = i + 1
+  end
+  if start < row.len() then
+    words.push(row.slice(start, row.len()))
+  end
+  words
+end
+
+# ———————————————————————————————————————————————————————————————
+# The §30 ABI-surface derivation over the model rows
+# ———————————————————————————————————————————————————————————————
+
+# Whether the symbol has a def-keyed lowering: a mir_functions row whose
+# subject key equals the full stable key (externs never match).
+def report_symbol_has_lowering(snapshot: SemanticSnapshot, sym: SemanticSymbol) -> Bool
+  for m in snapshot.mir_functions do
+    if m.function.key == sym.stable_id.key then
+      return true
+    end
+  end
+  false
+end
+
+# Whether a §30 abi row is DEFINED: pub Function-kind WITH a def-keyed
+# lowering — the exact surface snapshot_abi_text renders. Everything else
+# (private defs, methods, statics, types, externs) never gets a row.
+def report_abi_row_defined(snapshot: SemanticSnapshot, sym: SemanticSymbol) -> Bool
+  if !sym.is_pub then
+    return false
+  end
+  if semantic_def_kind_text(&sym.kind) != "Function" then
+    return false
+  end
+  report_symbol_has_lowering(&snapshot, &sym)
+end
+
+# The §30-grammar row text, reconstructed as far as a snapshot allows:
+# "<digest> <registration key>" plus the " generic" marker for generic
+# bases. The CanonExternal frame text never rides a snapshot (documented
+# gap — the external side stays absent, like §31's reconstruction).
+def report_abi_row_text(snapshot: SemanticSnapshot, sym: SemanticSymbol) -> String
+  let digest_text = semantic_digest_render(&semantic_stable_def_id_digest(&sym.stable_id))
+  var row = digest_text + " " + report_key_path(&sym.stable_id.key)
+  if sym.is_generic then
+    row = row + " generic"
+  end
+  row
+end
+
+# The §30 row parse: word 1 is the abi name (the row's key word); word 2,
+# when present and not a writer marker, is the EXTERNAL side.
+def report_parse_abi_row(row: String) -> (String, String)
+  let words = report_row_words(&row)
+  var name = "internal".to_string()
+  var external = "".to_string()
+  if words.len() >= 2 then
+    name = words[1].clone()
+    if words.len() >= 3 then
+      let payload = words[2].clone()
+      if payload != "generic" && payload != "abi-fail-closed" then
+        external = payload
+      end
+    end
+  end
+  (name, external)
+end
+
+# ———————————————————————————————————————————————————————————————
+# Canonical-signature param scans (the writer's "fn(...)" render)
+# ———————————————————————————————————————————————————————————————
+
+# The text between "fn(" and its matching ")" ("" when the signature
+# does not open with "fn(" or has no balanced list) — the uniform-depth
+# counter idiom of semantic_index.tg (every bracket family stays
+# balanced in the render grammar).
+def report_fn_param_body(sig: String) -> String
+  if !sig.starts_with("fn(") then
+    return "".to_string()
+  end
+  var depth = 1
+  var i = 3
+  while i < sig.len() do
+    let ch = sig.slice(i, i + 1)
+    if ch == "(" || ch == "[" || ch == "{" then
+      depth = depth + 1
+    elsif ch == ")" || ch == "]" || ch == "}" then
+      depth = depth - 1
+      if depth == 0 then
+        return sig.slice(3, i)
+      end
+    end
+    i = i + 1
+  end
+  "".to_string()
+end
+
+# The top-level comma split of the param body (commas at depth 0).
+def report_top_level_parts(s: String) -> Vec[String]
+  var parts: Vec[String] = Vec::new()
+  var depth = 0
+  var start = 0
+  var i = 0
+  while i < s.len() do
+    let ch = s.slice(i, i + 1)
+    if ch == "(" || ch == "[" || ch == "{" then
+      depth = depth + 1
+    elsif ch == ")" || ch == "]" || ch == "}" then
+      depth = depth - 1
+    elsif ch == "," && depth == 0 then
+      if start < i then
+        parts.push(s.slice(start, i))
+      end
+      start = i + 1
+    end
+    i = i + 1
+  end
+  if start < s.len() then
+    parts.push(s.slice(start, s.len()))
+  end
+  parts
+end
+
+# One "conv:type" param segment -> (convention word, type text): the text
+# before the first ':' when it is an AccessConvention word (the canonical
+# render always prefixes params); else the whole segment (defensive).
+def report_param_parts(seg: String) -> (String, String)
+  var i = 0
+  while i < seg.len() do
+    if seg.slice(i, i + 1) == ":" then
+      let conv = seg.slice(0, i)
+      if conv == "let" || conv == "inout" || conv == "sink" || conv == "set" then
+        return (conv, seg.slice(i + 1, seg.len()))
+      end
+    end
+    i = i + 1
+  end
+  ("".to_string(), seg)
+end
+
+# The (convention, type) pairs of the canonical fn signature, in
+# declaration order (empty when the signature is absent or not "fn(").
+def report_sig_params(sig: String) -> Vec[(String, String)]
+  var params: Vec[(String, String)] = Vec::new()
+  for seg in report_top_level_parts(&report_fn_param_body(&sig)) do
+    params.push(report_param_parts(&seg))
+  end
+  params
+end
+
+# ———————————————————————————————————————————————————————————————
+# THE REPORT BUILDER — one FfiReport per exported / extern symbol
+# ———————————————————————————————————————————————————————————————
+# The symbol row lookup: the full stable key text first, then the bare
+# registration key "module::name" (a key whose path part matches). The
+# report exists for the FFI surface — pub Function-kind symbol rows
+# (regular exported defs AND extern declarations, which register as pub
+# Function rows). A row of any other kind, a non-pub function, or no
+# matching row yields Option::None (private defs and non-function defs
+# have no §43 FFI surface).
+
+pub def ffi_report_of_symbol(snapshot: SemanticSnapshot, symbol_key: String) -> Option[FfiReport]
+  var found: Option[SemanticSymbol] = Option::None
+  for sym in snapshot.symbols do
+    if sym.stable_id.key == symbol_key then
+      found = Option::Some(sym.clone())
+      break
+    end
+  end
+  match found
+  when Option::Some(_) then ()
+  when Option::None then
+    for sym2 in snapshot.symbols do
+      if report_key_path(&sym2.stable_id.key) == symbol_key then
+        found = Option::Some(sym2.clone())
+        break
+      end
+    end
+  end
+  var sym = match found
+  when Option::Some(s) then s
+  when Option::None then return Option::None
+  end
+  if semantic_def_kind_text(&sym.kind) != "Function" || !sym.is_pub then
+    return Option::None
+  end
+
+  let full_key = sym.stable_id.key.clone()
+  let sig = report_key_signature(&full_key)
+  var abi_name = "internal".to_string()
+  var external_sig = "".to_string()
+  if report_abi_row_defined(&snapshot, &sym) then
+    let parsed = report_parse_abi_row(&report_abi_row_text(&snapshot, &sym))
+    abi_name = parsed.0
+    external_sig = parsed.1
+  end
+
+  # The param scans (nullability heuristic / ownership-transfer
+  # conventions) over the canonical signature text; arg_locations,
+  # return_location, layouts and alignments stay EMPTY — no per-arg
+  # location row family and no layout row family ride the snapshot
+  # (documented gaps, see the module doc).
+  var nullability: Vec[String] = Vec::new()
+  var ownership_transfer: Vec[String] = Vec::new()
+  var pi = 0
+  for pp in report_sig_params(&sig) do
+    if pp.1.starts_with("ptr") || pp.1.starts_with("Ptr") then
+      nullability.push("arg" + pi.to_string() + " " + pp.1.clone())
+    end
+    if pp.0 == "sink" || pp.0 == "set" then
+      ownership_transfer.push("arg" + pi.to_string() + " " + pp.0.clone())
+    end
+    pi = pi + 1
+  end
+
+  Option::Some(FfiReport {
+    symbol_key: full_key,
+    abi_name: abi_name,
+    tangerine_signature: sig,
+    external_signature: external_sig,
+    arg_locations: Vec::new(),
+    return_location: "".to_string(),
+    layouts: Vec::new(),
+    alignments: Vec::new(),
+    nullability: nullability,
+    ownership_transfer: ownership_transfer,
+    thread_safety: "not modeled".to_string(),
+    taint: "not modeled".to_string(),
+    failure_convention: "not modeled".to_string()
+  })
+end
+
+# ———————————————————————————————————————————————————————————————
+# abi_diff — the per-symbol ABI diff of two reports
+# ———————————————————————————————————————————————————————————————
+# Identity rule: the reports' key PATH parts must agree (a signature
+# change only rewrites the "#..." component; two different symbols are
+# created/removed territory — the §31 delta's report — and diff to
+# nothing). Row classes per the module doc; the output is sorted.
+pub def abi_diff(old_report: FfiReport, new_report: FfiReport) -> Vec[String]
+  var lines: Vec[String] = Vec::new()
+  if report_key_path(&old_report.symbol_key) != report_key_path(&new_report.symbol_key) then
+    return lines
+  end
+  let sym = report_key_name(&old_report.symbol_key)
+
+  # Layout / alignment entries: positional pairs only — one line per
+  # differing position ("layout <sym> size 24 -> 32" style). Unpaired
+  # tails (a created/removed entry) are structural changes, never
+  # guessed here (documented).
+  var i = 0
+  while i < old_report.layouts.len() && i < new_report.layouts.len() do
+    if old_report.layouts[i] != new_report.layouts[i] then
+      lines.push("layout " + sym + " " + old_report.layouts[i] + " -> " + new_report.layouts[i])
+    end
+    i = i + 1
+  end
+  var j = 0
+  while j < old_report.alignments.len() && j < new_report.alignments.len() do
+    if old_report.alignments[j] != new_report.alignments[j] then
+      lines.push("layout " + sym + " " + old_report.alignments[j] + " -> " + new_report.alignments[j])
+    end
+    j = j + 1
+  end
+
+  # Arg-location entries: positional pairs, one entry per param position
+  # ("arg2 GPR -> indirect" style).
+  var k = 0
+  while k < old_report.arg_locations.len() && k < new_report.arg_locations.len() do
+    if old_report.arg_locations[k] != new_report.arg_locations[k] then
+      lines.push("arg" + k.to_string() + " " + old_report.arg_locations[k] + " -> " + new_report.arg_locations[k])
+    end
+    k = k + 1
+  end
+
+  # The return location: fires only between two MODELED locations (an
+  # empty side is "no location data", never a location).
+  if old_report.return_location.len() > 0 && new_report.return_location.len() > 0 &&
+    old_report.return_location != new_report.return_location then
+    lines.push("return " + old_report.return_location.clone() + " -> " + new_report.return_location.clone())
+  end
+
+  # The signature changes, appended. The tangerine signature fires on any
+  # difference; the external side fires on any difference where at least
+  # one side is present (an empty side renders as the empty text — a
+  # present/absent transition IS the §30 row membership change).
+  if old_report.tangerine_signature != new_report.tangerine_signature then
+    lines.push("signature " + old_report.tangerine_signature.clone() + " -> " + new_report.tangerine_signature.clone())
+  end
+  if old_report.external_signature != new_report.external_signature &&
+    (old_report.external_signature.len() > 0 || new_report.external_signature.len() > 0) then
+    lines.push("external-signature " + old_report.external_signature.clone() + " -> " + new_report.external_signature.clone())
+  end
+
+  lines.sort_by(|a, b| a < b)
+  lines
+end
+
+# ———————————————————————————————————————————————————————————————
+# The coarse fallback — the snapshot's §30 abi row texts
+# ———————————————————————————————————————————————————————————————
+# Every row the §30 writer's surface would render, in the row grammar a
+# snapshot alone supports: pub Function-kind symbol rows WITH a def-keyed
+# lowering, as "<digest> <registration key>" (plus the deterministic
+# " generic" marker for generic bases — the writer's own row text for
+# them). The CanonExternal frame text of non-generic members never rides
+# a snapshot (documented gap — the §31 delta core keys the same surface
+# by pub-Function stable keys instead). Sorted; row texts are parseable
+# by report_parse_abi_row.
+pub def abi_rows_of_snapshot(snapshot: SemanticSnapshot) -> Vec[String]
+  var rows: Vec[String] = Vec::new()
+  for sym in snapshot.symbols do
+    if report_abi_row_defined(&snapshot, &sym) then
+      rows.push(report_abi_row_text(&snapshot, &sym))
+    end
+  end
+  rows.sort_by(|a, b| a < b)
+  rows
+end
