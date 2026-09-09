@@ -658,8 +658,11 @@ and uchar_utf8_encode (c : Uchar.t) : string =
    The canonical per-concrete-TypeId drop plans (drop_plan.ml, built
    once per program) drive every destruction site where the type is
    known.  drop_value_typed consults the plan of the value's TYPE: a
-   materialized plan enumerates the def's components (declaration
-   order; the runtime enum tag selects the live variant), and each
+   materialized plan is a plan_node tree (audit P0-2) — Fields for a
+   struct value (per-field actions in declaration order), EnumVariants
+   for an enum value (the runtime tag selects the live variant),
+   Repeat for a fixed-array component (the element action repeats
+   `count` times — constant-size even for [T; 1_000_000]) — and each
    component's value is dropped recursively under its own type — the
    recursion is derived ONCE per type (the plan table), never re-derived
    per value.  A type with no materialized plan (String, the container/
@@ -672,27 +675,49 @@ and uchar_utf8_encode (c : Uchar.t) : string =
 let rec drop_value_typed (vm : t) (ty : Type_repr.t) (v : Vm_value.t) : unit =
   match Drop_plan.plan_of_type vm.drop_plans ty with
   | None -> Vm_value.drop_glue vm.memory v
-  | Some plan -> (
-      match v with
-      | Vm_value.Struct elems ->
-          List.iter
-            (fun (c : Drop_plan.component) ->
-              match c.Drop_plan.variant with
-              | Some _ -> ()
-              | None ->
-                  if c.Drop_plan.index >= 0 && c.Drop_plan.index < Array.length elems then
-                    drop_value_typed vm c.Drop_plan.ty elems.(c.Drop_plan.index))
-            plan.Drop_plan.components
-      | Vm_value.Enum (tag, payload) ->
-          List.iter
-            (fun (c : Drop_plan.component) ->
-              match c.Drop_plan.variant with
-              | Some t when t = tag ->
-                  if c.Drop_plan.index >= 0 && c.Drop_plan.index < Array.length payload then
-                    drop_value_typed vm c.Drop_plan.ty payload.(c.Drop_plan.index)
-              | _ -> ())
-            plan.Drop_plan.components
+  | Some plan -> drop_node vm ty plan.Drop_plan.node v
+
+(* Walk one plan_node over a runtime value.  DropLeaf drops the whole
+   component under its own type (its plan / glue); Fields walks a
+   struct/tuple value per position; EnumVariants walks the LIVE variant
+   (the runtime tag selects vp_tag); Repeat walks a fixed-array value's
+   elements (the element type comes from the component's fp_ty
+   Fixed_array shape — a defensive glue fallback covers any mismatch). *)
+and drop_node (vm : t) (ty : Type_repr.t) (node : Drop_plan.plan_node)
+    (v : Vm_value.t) : unit =
+  match node, v with
+  | Drop_plan.NoDrop, _ -> ()
+  | Drop_plan.DropLeaf, _ -> drop_value_typed vm ty v
+  | Drop_plan.Fields fps, (Vm_value.Struct elems | Vm_value.Tuple elems) ->
+      Array.iter
+        (fun (fp : Drop_plan.field_plan) ->
+          if fp.Drop_plan.fp_index >= 0 && fp.Drop_plan.fp_index < Array.length elems then
+            drop_node vm fp.Drop_plan.fp_ty fp.Drop_plan.fp_node elems.(fp.Drop_plan.fp_index))
+        fps
+  | Drop_plan.EnumVariants vps, Vm_value.Enum (tag, payload) ->
+      Array.iter
+        (fun (vp : Drop_plan.variant_plan) ->
+          if vp.Drop_plan.vp_tag = tag then
+            Array.iter
+              (fun (fp : Drop_plan.field_plan) ->
+                if fp.Drop_plan.fp_index >= 0 && fp.Drop_plan.fp_index < Array.length payload
+                then
+                  drop_node vm fp.Drop_plan.fp_ty fp.Drop_plan.fp_node
+                    payload.(fp.Drop_plan.fp_index))
+              vp.Drop_plan.vp_fields)
+        vps
+  | Drop_plan.Repeat { count; element = _ }, Vm_value.Array elems -> (
+      (* the element type of the repeated component: the node sits on a
+         Fixed_array-typed component; the element plan's DropLeaf
+         recursion re-enters drop_value_typed under the ELEMENT type *)
+      match ty with
+      | Type_repr.Fixed_array (elem_ty, _) ->
+          let n = min count (Array.length elems) in
+          for i = 0 to n - 1 do
+            drop_value_typed vm elem_ty elems.(i)
+          done
       | _ -> Vm_value.drop_glue vm.memory v)
+  | _ -> Vm_value.drop_glue vm.memory v
 
 (* re-audit P0-9 / P1-26: drop the old value at a place about to be
    OVERWRITTEN by an assignment — resolve the current component value
@@ -769,6 +794,33 @@ let do_drop (vm : t) (frame : frame) (local : int) : unit =
       frame.locals.(local) <- Vm_value.Dropped
   | Vm_value.Moved | Vm_value.Uninitialized -> ()
   | Vm_value.Dropped -> err_trap vm (Vm_value.slot_error_string Vm_value.DropDropped)
+
+(* re-audit P0-3: the static type of a place (its root local's
+   declared type walked through the projections) — used to resolve the
+   drop type of a host writeback's removed members. *)
+let place_type (vm : t) (frame : frame) (p : Seed_mir.place) : Type_repr.t =
+  let root_ty = type_of_local vm frame.fn (Seed_mir.root_key p.Seed_mir.root) in
+  List.fold_left (fun ty proj -> proj_type_of vm ty proj) root_ty p.Seed_mir.projections
+
+(* re-audit P0-3: the MEMBER type of a collection-typed writeback arg
+   (the type the removed values must drop under — never the container
+   type itself).  The runtime collection nominals carry their member
+   types as the Named type arguments (identified through the
+   compilation's LangItems record — the vec/set nominal's member is
+   the first type argument, the map nominal's member is its VALUE
+   type).  A non-collection arg type or an untyped defensive shape
+   yields None — the drop then falls back to the structural value
+   glue. *)
+let collection_member_type (vm : t) (ty : Type_repr.t) : Type_repr.t option =
+  match ty with
+  | Type_repr.Named (tid, args) when Array.length args > 0 ->
+      let li = vm.drop_plans.Drop_plan.lang_items in
+      if Lang_items.tid_eq li.Lang_items.vec tid then Some args.(0)
+      else if Lang_items.tid_eq li.Lang_items.set tid then Some args.(0)
+      else if Lang_items.tid_eq li.Lang_items.map tid then
+        Some args.(Array.length args - 1)
+      else None
+  | _ -> None
 
 (* Frame-shape invariant, enforced at frame creation (the VM boundary):
    the block array must be indexed by block id — blocks.(i).id = i for
@@ -1213,21 +1265,48 @@ let rec exec_terminator (vm : t) (frame : frame) (term : Seed_mir.terminator) : 
            vm.host_calls <- vm.host_calls + 1;
            if vm.host_calls > vm.limits.max_host_calls then
              err_trap vm "host call limit exceeded";
-           let hr = call_host vm host_callee arg_vals in
-           (* re-audit P0-B: the intrinsic's mutation writebacks are
-              explicit (arg index -> new value) — each writeback copies
-              into the argument's caller place *)
-           List.iter
-             (fun (i, v) ->
-               if i >= 0 && i < Array.length args then
-                 match args.(i).Seed_mir.value with
-                 | Seed_mir.Copy p | Seed_mir.Read p | Seed_mir.Move p ->
-                     write_place vm frame p v
-                 | _ -> ())
-             hr.Host.writebacks;
-           write_place vm frame dest hr.Host.value;
-           frame.block <- next;
-           frame.stmt <- 0)
+        let hr = call_host vm host_callee arg_vals in
+        (* re-audit P0-3: the writeback application runs the
+           ownership-explicit host_result in the audit's ORDER — (1)
+           the host call has already succeeded; (2) install each
+           writeback's REPLACEMENT into the argument's caller place
+           (copy-on-write: the replacement shares only the retained
+           members, so the old container value is dead the moment the
+           writeback lands and is never dropped as a whole — a whole
+           drop would double-destroy the shared retained members); (3)
+           drop every value the writeback's `removed` list names
+           exactly ONCE through the canonical per-type drop —
+           drop_value_typed under the collection's MEMBER type (vm's
+           collection_member_type), falling back to the structural
+           value glue when the arg is not a place or its type is not a
+           collection nominal; (4) write the language value into the
+           destination.  The ORDER matters: the replacement lands
+           BEFORE the removed drops run, so a removed member is in no
+           live value when it drops (drop logic that inspects the
+           container indirectly observes the post-call container), and
+           no removed value can ever be dropped twice. *)
+        List.iter
+          (fun (wb : Host.host_writeback) ->
+            let ai = wb.Host.arg_index in
+            if ai >= 0 && ai < Array.length args then begin
+              (match args.(ai).Seed_mir.value with
+               | Seed_mir.Copy p | Seed_mir.Read p | Seed_mir.Move p ->
+                   write_place vm frame p wb.Host.replacement
+               | _ -> ());
+              let drop_removed (v : Vm_value.t) : unit =
+                match args.(ai).Seed_mir.value with
+                | Seed_mir.Copy p | Seed_mir.Read p | Seed_mir.Move p -> (
+                    match collection_member_type vm (place_type vm frame p) with
+                    | Some ty -> drop_value_typed vm ty v
+                    | None -> Vm_value.drop_glue vm.memory v)
+                | _ -> Vm_value.drop_glue vm.memory v
+              in
+              List.iter drop_removed wb.Host.removed
+            end)
+          hr.Host.writebacks;
+        write_place vm frame dest hr.Host.value;
+        frame.block <- next;
+        frame.stmt <- 0)
   | Seed_mir.Drop (p, next, _) ->
       do_drop vm frame (Seed_mir.root_key p.Seed_mir.root);
       frame.block <- next;
@@ -1421,9 +1500,15 @@ let statics_initial_values (program : Seed_mir.program) : Vm_value.slot array =
           | Seed_mir.Set _ -> Vm_value.Live (Vm_value.Set [])))
     program.Seed_mir.statics
 
-(* Build an entry frame without running (inspection). *)
-let entry_frame_of ~(program : Seed_mir.program) ~(entry : Instance_id.t) ~(argv : string array) :
-    (t * frame, string) result =
+(* Build an entry frame without running (inspection).  The drop-plan
+   table is built under the compilation's LangItems record (audit P0-2)
+   so the owning LangItems classify by direct properties, never by their
+   field-less def shapes; the seed default carries the checker-minted
+   shared-LangItem ids.  (The optional arg is spelled as the _li variant
+   below — an all-labeled function cannot carry an erasable optional
+   argument, so the default is the non-_li entry point.) *)
+let entry_frame_of_li ~(lang_items : Lang_items.t) ~(program : Seed_mir.program)
+    ~(entry : Instance_id.t) ~(argv : string array) : (t * frame, string) result =
   let fn_index = Hashtbl.create 64 in
   Array.iteri (fun i fn -> Hashtbl.replace fn_index fn.Seed_mir.instance i) program.Seed_mir.functions;
   match Hashtbl.find_opt fn_index entry with
@@ -1435,7 +1520,7 @@ let entry_frame_of ~(program : Seed_mir.program) ~(entry : Instance_id.t) ~(argv
              program;
              fn_index;
              memory = Vm_memory.create ();
-             drop_plans = Drop_plan.of_program program;
+             drop_plans = Drop_plan.of_program ~lang_items program;
              host = Host.create ~repo_root:"." ~argv:[||];
              limits = default_limits;
              steps = 0;
@@ -1470,9 +1555,14 @@ let entry_frame_of ~(program : Seed_mir.program) ~(entry : Instance_id.t) ~(argv
        with
       | Failure msg -> Error msg)
 
-let run ~(program : Seed_mir.program) ~(entry : Instance_id.t) ~(argv : string array)
-    ~(host : Host.t) : (int, vm_error) result =
-  match entry_frame_of ~program ~entry ~argv with
+let entry_frame_of ~(program : Seed_mir.program) ~(entry : Instance_id.t)
+    ~(argv : string array) : (t * frame, string) result =
+  entry_frame_of_li ~lang_items:Lang_items.seed_defaults ~program ~entry ~argv
+
+let run_li ~(lang_items : Lang_items.t) ~(program : Seed_mir.program)
+    ~(entry : Instance_id.t) ~(argv : string array) ~(host : Host.t) :
+    (int, vm_error) result =
+  match entry_frame_of_li ~lang_items ~program ~entry ~argv with
   | Error m -> Error { kind = Trap "entry instance not found"; message = m; trace = [] }
   | Ok (vm, entry_frame) ->
       vm.host <- host;
@@ -1482,3 +1572,7 @@ let run ~(program : Seed_mir.program) ~(entry : Instance_id.t) ~(argv : string a
        with
       | Failure msg -> Error { kind = Trap msg; message = msg; trace = List.rev vm.trace }
       | Exit -> Ok 0)
+
+let run ~(program : Seed_mir.program) ~(entry : Instance_id.t) ~(argv : string array)
+    ~(host : Host.t) : (int, vm_error) result =
+  run_li ~lang_items:Lang_items.seed_defaults ~program ~entry ~argv ~host

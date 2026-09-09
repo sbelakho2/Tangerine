@@ -3016,6 +3016,361 @@ let nullary_variant_of_subject (env : env) (subject : Type_repr.t) (name : strin
       | None -> None)
   | _ -> None
 
+(* ────────────────────────────────────────────────────────────────
+   audit P0-4: the derived-Clone OBLIGATION authority.
+
+   Deriving Clone (the derived-mint channel of check_method_call) must
+   be TRAIT-SEMANTIC, never a structural Read duplication: the
+   synthesized body clones every component through that component's own
+   Clone, so the mint is accepted only when each component discharges
+   "Copy OR Clone".  These helpers are the ONE authority both the mint
+   (typecheck) and the synthesized bodies (mir_derive, via the same
+   functions) consult, so the body can never be emitted without the
+   obligation:
+
+     - the Clone side is a REGISTERED clone method for the component
+       type — the language's Clone surface (`impl ... { def clone }`
+       method entries under the type's names/aliases — String::clone,
+       Array/Vec::clone, Map::clone, a user impl Clone for a struct) —
+       never the body-less trait-contract entry.  A registered clone
+       DISCHARGES FIRST and governs the component's clone semantics
+       even when the component is structurally copyable: a nominal that
+       declares `impl Clone for C` (a counting wrapper over an Int)
+       must clone through the impl, never by value duplication;
+     - the Copy side (only when NO registered clone exists) is the
+       P0-2 copyability engine over the nominal DEFS with the
+       INSTANCE's arguments substituted through the def's generic
+       parameters (a generic nominal at different substitutions can
+       answer differently: Wrapper[Int] is Copy, Wrapper[String] is
+       not — never the conservative owned answer a bare def table gives
+       a template def);
+     - a generic carrier discharges through its DECLARED Clone bound;
+       the mint records exactly those carriers as where-clauses on the
+       derived signature, and the method-call path re-dispatches them
+       at the anchored call span (check_where_obligations on
+       ts_where), so `fn f[T](w: Wrapper[T])` without `T: Clone` fails
+       at the call site;
+     - inference-variable components defer (the sig is rewritten by
+       finalize_inference before any body is synthesized, and the
+       synthesized body re-validates on the final concrete types). *)
+
+(* The nominal (def) of a TypeId through the checker's name tables —
+   the mirror of mir_derive.nominal_of_tid (no module may import the
+   other's private walker; both resolve the same tables). *)
+let nominal_of_tid (env : env) (tid : Ids.Type_id.t) : nominal option =
+  List.find_map
+    (fun (name, nom) ->
+      match List.assoc_opt name env.type_ids with
+      | Some t when Ids.Type_id.compare t tid = 0 -> Some nom
+      | Some _ -> None
+      | None -> None)
+    env.nominals
+
+(* The instance-substituted Copy decision for a value type: the P0-2
+   property engine over the nominal defs, with the instance's type
+   arguments substituted for the def's generic parameters before the
+   recursion (so a template def never answers conservatively for a
+   concrete instance).  Owning LangItems and raw pointers answer by
+   their direct properties; Option/Result/structs/enums answer through
+   their defs. *)
+let rec tc_is_copy (env : env) (li : Lang_items.t) (ty : Type_repr.t) : bool =
+  match ty with
+  | Type_repr.Unit | Type_repr.Bool | Type_repr.Char | Type_repr.Int _ | Type_repr.Float _
+  | Type_repr.Never | Type_repr.Ref_internal _ | Type_repr.Raw_ptr _ ->
+      true
+  | Type_repr.String | Type_repr.Type_param _ | Type_repr.Infer_var _
+  | Type_repr.Int_literal _ | Type_repr.Error ->
+      false
+  | Type_repr.Tuple elems -> Array.for_all (tc_is_copy env li) elems
+  | Type_repr.Fixed_array (e, _) -> tc_is_copy env li e
+  | Type_repr.Function (ps, ret) -> (
+      match ret with
+      | Type_repr.Never ->
+          (* the def_repr'd ENUM encoding (payloads, Never) *)
+          Array.for_all (fun p -> tc_is_copy env li p.Type_repr.pt_type) ps
+      | _ -> (* a genuine function pointer is an immediate value *) true)
+  | Type_repr.Named (tid, args) ->
+      if Lang_items.is_raw_pointer li tid then true
+      else if Lang_items.is_owning_handle li tid then false
+      else (
+        match nominal_of_tid env tid with
+        | None -> false (* a def-less nominal: conservative owned *)
+        | Some nom ->
+            let subst =
+              let ps = List.map snd nom.nom_params in
+              if List.length ps = Array.length args then
+                List.map2
+                  (fun p a -> (Type_repr.KParam p, a))
+                  ps (Array.to_list args)
+              else []
+            in
+            (match nom.nom_kind with
+             | `Struct ->
+                 List.for_all
+                   (fun (_, fty) -> tc_is_copy env li (Type_repr.substitute subst fty))
+                   nom.nom_fields
+             | `Enum ->
+                 List.for_all
+                   (fun (_, pty) ->
+                     Array.for_all
+                       (fun p -> tc_is_copy env li (Type_repr.substitute subst p))
+                       pty)
+                   nom.nom_variants))
+
+(* The owner-name alias convention of the method dispatch (the same
+   candidate owners check_method_call's try_owners uses), so the clone
+   method lookup reaches an entry registered under any alias. *)
+let owner_aliases_of (o : string) : string list =
+  match o with
+  | "Vec" -> [ "Vec"; "Array" ]
+  | "Array" -> [ "Array"; "Vec" ]
+  | "Set" -> [ "Set"; "HashSet" ]
+  | "HashSet" -> [ "HashSet"; "Set" ]
+  | "Map" -> [ "Map"; "HashMap" ]
+  | "HashMap" -> [ "HashMap"; "Map" ]
+  | "String" -> [ "String"; "str" ]
+  | "str" -> [ "str"; "String" ]
+  | o -> [ o ]
+
+(* Every owner name a component type can dispatch a clone method under:
+   every registered name of its nominal (Vec AND Array AND List share
+   one tid), alias-expanded. *)
+let type_owner_candidates (env : env) (ty : Type_repr.t) : string list =
+  let base =
+    match ty with
+    | Type_repr.String -> [ "String" ]
+    | Type_repr.Named (tid, _) ->
+        List.filter_map
+          (fun (n, t) ->
+            match t with
+            | Type_repr.Named (t2, _) when Ids.Type_id.compare t2 tid = 0 -> Some n
+            | _ -> None)
+          env.types
+    | _ -> []
+  in
+  let rec expand acc = function
+    | [] -> List.rev acc
+    | o :: rest ->
+        let acc =
+          List.fold_left
+            (fun a x -> if List.mem x a then a else x :: a)
+            acc (owner_aliases_of o)
+        in
+        expand acc rest
+  in
+  expand [] base
+
+(* The REGISTERED clone method of a component type: the first
+   (owner, "clone") method entry under the type's owner candidates
+   whose receiver (self) unifies with the component type (binding the
+   method's declared parameters — Array::clone's [T] binds to the
+   element type of a Vec[..] component).  None when the component has
+   no registered Clone surface. *)
+let registered_clone_method (env : env) (ty : Type_repr.t) :
+    (string * typed_signature * (Type_repr.generic_key * Type_repr.t) list) option =
+  let rec go = function
+    | [] -> None
+    | o :: rest -> (
+        match List.assoc_opt (o, "clone") env.methods with
+        | Some ts when Array.length ts.ts_params >= 1 -> (
+            match
+              Trait_solver.unify_target []
+                ts.ts_params.(0).Type_repr.pt_type ty
+            with
+            | Some subst -> Some (o, ts, subst)
+            | None -> go rest)
+        | _ -> go rest)
+  in
+  go (type_owner_candidates env ty)
+
+(* Does the enclosing generic context declare a Clone bound for a rigid
+   carrier? *)
+let clone_bound_of (env : env) (pid : Ids.Generic_param_id.t) : bool =
+  match List.assoc_opt pid env.impls.Trait_solver.param_bounds with
+  | Some bs -> List.exists (fun (b, _) -> b = "Clone") bs
+  | None -> false
+
+(* The env-aware type renderer for the clone-obligation diagnostics
+   (type_to_string is pure and prints nominals as `T#id` — the anchored
+   obligation errors must name the component's source type). *)
+let rec display_type_name (env : env) (ty : Type_repr.t) : string =
+  match ty with
+  | Type_repr.Named (tid, args) ->
+      let name_of () =
+        List.find_map
+          (fun (n, t) ->
+            match t with
+            | Type_repr.Named (t2, _) when Ids.Type_id.compare t2 tid = 0 -> Some n
+            | _ -> None)
+          env.types
+      in
+      let name = match name_of () with Some n -> n | None -> type_to_string ty in
+      if Array.length args = 0 then name
+      else
+        name ^ "["
+        ^ String.concat ", " (Array.to_list (Array.map (display_type_name env) args))
+        ^ "]"
+  | Type_repr.Tuple elems ->
+      "(" ^ String.concat ", " (Array.to_list (Array.map (display_type_name env) elems)) ^ ")"
+  | Type_repr.Fixed_array (t, n) ->
+      Printf.sprintf "[%s; %d]" (display_type_name env t) n
+  | Type_repr.Raw_ptr (m, t) ->
+      (match m with Type_repr.Mutable -> "*mut " | _ -> "*") ^ display_type_name env t
+  | Type_repr.Ref_internal (m, t) ->
+      (match m with Type_repr.Mutable -> "&mut " | _ -> "&") ^ display_type_name env t
+  | t -> type_to_string t
+
+(* One cloned VALUE component (a field / a variant payload / a tuple or
+   array element / a where-bound of a registered clone) discharges as
+   Clone or Copy.  A REGISTERED clone method discharges FIRST and
+   governs the component's clone semantics (a structurally-copyable
+   nominal that declares `impl Clone for C` — a counting wrapper over
+   an Int — must clone through the impl, never by value Read: derived
+   Clone is trait-semantic); without a registered clone, the component
+   discharges as Copy only when trivially copyable; a generic carrier
+   discharges through its declared Clone bound (recorded in `needed`
+   so the minted signature carries the where-clause).  Tuple and
+   fixed-array components recurse elementwise (the compiler's
+   structural value shapes, which have no nominal owner to register a
+   clone under). *)
+let rec clone_value_obligation (env : env) (li : Lang_items.t)
+    (needed : Ids.Generic_param_id.t list ref) (what : string)
+    (ty : Type_repr.t) : (unit, string) result =
+   let bad () =
+     Error
+       (Printf.sprintf
+          "%s has type `%s`, which is neither Copy nor Clone (no registered Clone implementation)"
+          what (display_type_name env ty))
+   in
+  match registered_clone_method env ty with
+  | Some (_o, ts, subst) ->
+      (* discharge the callee's OWN Clone where-clauses under the
+         receiver substitution (Array::clone requires its element
+         Clone — a Vec[NoClone] component must not discharge) *)
+      let rec go_wps = function
+        | [] -> Ok ()
+        | (wt, bs) :: rest ->
+            let wt' = Type_repr.substitute subst wt in
+            if List.exists (fun (b, _) -> b = "Clone") bs then
+              let* () =
+                clone_value_obligation env li needed
+                  ("the Clone-bound value of `" ^ ts.ts_name ^ "`")
+                  wt'
+              in
+              go_wps rest
+            else go_wps rest
+      in
+      go_wps ts.ts_where
+  | None ->
+      if tc_is_copy env li ty then Ok ()
+      else
+        match ty with
+        | Type_repr.Tuple elems ->
+            let rec go i =
+              if i >= Array.length elems then Ok ()
+              else
+                let* () =
+                  clone_value_obligation env li needed
+                    (Printf.sprintf "%s element %d" what i)
+                    elems.(i)
+                in
+                go (i + 1)
+            in
+            go 0
+        | Type_repr.Fixed_array (e, _) ->
+            clone_value_obligation env li needed (what ^ " element") e
+        | Type_repr.Type_param pid ->
+            if clone_bound_of env pid then begin
+              if not (List.mem pid !needed) then needed := pid :: !needed;
+              Ok ()
+            end
+            else
+               Error
+                 (Printf.sprintf
+                    "%s is a generic parameter of type `%s` whose declared bounds do not include Clone (the derived Clone of a generic type is logically `impl[T: Clone]` unless T is statically Copy)"
+                    what (display_type_name env ty))
+        | Type_repr.Infer_var _ ->
+            (* an inference variable is solved before any body synthesizes
+               (finalize_inference rewrites the derived sig with the final
+               substitution); the synthesized body re-validates the final
+               type through the same obligation functions *)
+            Ok ()
+        | _ -> bad ()
+
+(* The RECEIVER's derived-clone obligations: the receiver's own nominal
+   shape (struct fields / enum variant payloads) is walked in the exact
+   structure the synthesized body clones; anything the body cannot
+   recurse into structurally is a component value and discharges
+   through clone_value_obligation.  Ok returns the where-clauses the
+   minted signature must carry (the Clone bounds of the rigid carriers
+   the receiver mentions); Error returns the anchored reason. *)
+let clone_receiver_obligation (env : env) (li : Lang_items.t)
+    (needed : Ids.Generic_param_id.t list ref) (ty : Type_repr.t) :
+    (unit, string) result =
+  match ty with
+  | Type_repr.Named (tid, args) -> (
+      match nominal_of_tid env tid with
+      | Some nom ->
+          let subst =
+            let ps = List.map snd nom.nom_params in
+            if List.length ps = Array.length args then
+              List.map2
+                (fun p a -> (Type_repr.KParam p, a))
+                ps (Array.to_list args)
+            else []
+          in
+          (match nom.nom_kind with
+           | `Struct ->
+               List.fold_left
+                 (fun acc (fname, fty) ->
+                   let* () = acc in
+                   clone_value_obligation env li needed
+                     ("field `" ^ fname ^ "`")
+                     (Type_repr.substitute subst fty))
+                 (Ok ()) nom.nom_fields
+           | `Enum ->
+               List.fold_left
+                 (fun acc (vname, pty) ->
+                   let* () = acc in
+                   let rec go i =
+                     if i >= Array.length pty then Ok ()
+                     else
+                       let* () =
+                         clone_value_obligation env li needed
+                           (Printf.sprintf "payload %d of variant `%s`" i vname)
+                           (Type_repr.substitute subst pty.(i))
+                       in
+                       go (i + 1)
+                   in
+                   go 0)
+                 (Ok ()) nom.nom_variants)
+      | None -> clone_value_obligation env li needed "the receiver" ty)
+  | Type_repr.Tuple _ | Type_repr.Fixed_array _ | Type_repr.String | Type_repr.Type_param _
+  | Type_repr.Infer_var _ | Type_repr.Raw_ptr _ | Type_repr.Ref_internal _
+  | Type_repr.Int _ | Type_repr.Bool | Type_repr.Char | Type_repr.Float _ ->
+      clone_value_obligation env li needed "the receiver" ty
+  | Type_repr.Unit | Type_repr.Never | Type_repr.Function _ | Type_repr.Int_literal _
+  | Type_repr.Error ->
+      Ok ()
+
+(* The public obligation check of a derived Clone for `ty`: Ok carries
+   the where-clauses (rigid-carrier Clone bounds) the minted signature
+   must declare; Error carries the rejection reason prefixed with the
+   receiver's name (anchored by the caller at the method-call span). *)
+let derived_clone_obligations (env : env) (ty : Type_repr.t) :
+    ((Type_repr.t * (string * Type_repr.t array) list) list, string) result =
+  let li = Lang_items.of_types env.types in
+  let needed = ref [] in
+  match clone_receiver_obligation env li needed ty with
+  | Error m ->
+      Error ("cannot derive Clone for `" ^ display_type_name env ty ^ "`: " ^ m)
+  | Ok () ->
+      Ok
+        (List.rev
+           (List.map
+              (fun pid -> (Type_repr.Type_param pid, [ ("Clone", [||]) ]))
+              !needed))
+
 let rec check_pattern (env : env) (scope : scope) (ty : Type_repr.t) (p : Ast.pattern) :
     (Typed_pattern.t * (string * Type_repr.t * bool) list, string) result =
   match p with
@@ -6984,6 +7339,7 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
      checks a real body, the mono specializes a real template and the
      VM executes a real function. *)
   let derived_mint (op : string)
+      ~(where : (Type_repr.t * (string * Type_repr.t array) list) list)
       ~(params : Type_repr.t -> (string * Access_effect.t * Type_repr.t) list)
       ~(ret : Type_repr.t -> Type_repr.t) : typed_signature option =
     match owner_ty with
@@ -7005,7 +7361,7 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
         let params_decl = List.mapi (fun i p -> ("T" ^ string_of_int i, p)) decl in
         let sig_ =
           mk_sig env.state ~name:("derived::" ^ oname ^ "::" ^ op)
-            ~params_decl ~params:(params owner_ty) ~ret:(ret owner_ty) ~where:[]
+            ~params_decl ~params:(params owner_ty) ~ret:(ret owner_ty) ~where
         in
         env.state.oracle.o_derived_callables <-
           sig_.ts_callable :: env.state.oracle.o_derived_callables;
@@ -7013,12 +7369,26 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
         Some sig_
     | _ -> None
   in
+  (* audit P0-4: the derived Clone mint is TRAIT-SEMANTIC — before the
+     mint the receiver's components must discharge "Copy OR Clone"
+     (derived_clone_obligations), otherwise the mint is refused with
+     the anchored reason.  A successful check returns the where-clauses
+     the minted signature carries: the Clone bounds of the receiver's
+     rigid generic carriers, re-dispatched by the method-call path at
+     the SAME anchored call span below (the ts_where obligation check).
+     The other derived ops carry no obligations (where = []). *)
+  let clone_obligation_error = ref None in
   let derived_clone () =
     if mname <> "clone" then None
     else
-      derived_mint "clone"
-        ~params:(fun ty -> [ ("self", Access_effect.Let, ty) ])
-        ~ret:(fun ty -> ty)
+      match derived_clone_obligations env owner_ty with
+      | Error m ->
+          clone_obligation_error := Some m;
+          None
+      | Ok where ->
+          derived_mint "clone" ~where
+            ~params:(fun ty -> [ ("self", Access_effect.Let, ty) ])
+            ~ret:(fun ty -> ty)
   in
   (* derived to_string: the kernel's universal `def to_string[T: Display]
      (val: T) -> String` (core.tg) serves every receiver — generic error
@@ -7032,7 +7402,7 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
   let derived_to_string () =
     if mname <> "to_string" then None
     else
-      derived_mint "to_string"
+      derived_mint "to_string" ~where:[]
         ~params:(fun ty -> [ ("self", Access_effect.Let, ty) ])
         ~ret:(fun _ -> Type_repr.String)
   in
@@ -7044,7 +7414,7 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
   let derived_eq () =
     if mname <> "eq" then None
     else
-      derived_mint "eq"
+      derived_mint "eq" ~where:[]
         ~params:(fun ty ->
           [ ("self", Access_effect.Let, ty); ("other", Access_effect.Let, ty) ])
         ~ret:(fun _ -> Type_repr.Bool)
@@ -7057,7 +7427,7 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
   let derived_scalar_hash () =
     match owner_ty with
     | Type_repr.Int _ when mname = "hash" ->
-        derived_mint "hash"
+        derived_mint "hash" ~where:[]
           ~params:(fun ty -> [ ("self", Access_effect.Let, ty) ])
           ~ret:(fun _ -> Type_repr.Int Type_repr.Int)
     | _ -> None
@@ -7078,13 +7448,24 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
             | None -> ()
         in
         try_mint (derived_clone ());
-        try_mint (derived_eq ());
-        try_mint (derived_to_string ());
-        try_mint (derived_scalar_hash ());
+        (match !clone_obligation_error with
+         | Some _ -> ()
+         | None ->
+             try_mint (derived_eq ());
+             try_mint (derived_to_string ());
+             try_mint (derived_scalar_hash ()));
         (None, !found)
   in
   match resolved_sig with
   | None -> (
+      (* audit P0-4: a refused derived-Clone mint surfaces its anchored
+         obligation reason here (the receiver had no registered clone
+         method, so the only Clone it could have was the derived one) *)
+      match !clone_obligation_error with
+      | Some m ->
+          env.state.oracle.o_unresolved_calls <- env.state.oracle.o_unresolved_calls + 1;
+          Error (err span m)
+      | None -> (
       (* a field of function type called on the receiver: `self.func(x)`
          where the struct's field `func` is itself a function value *)
       match check_field env scope span receiver mname with
@@ -7136,7 +7517,7 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
           env.state.oracle.o_unresolved_calls <- env.state.oracle.o_unresolved_calls + 1;
           Error
             (err span
-               (Printf.sprintf "type %s has no method `%s`" (type_to_string owner_ty) mname)))
+               (Printf.sprintf "type %s has no method `%s`" (type_to_string owner_ty) mname))))
       | Some sig_ -> (
           if Array.length sig_.ts_params = 0 then
             Error (err span "internal: method signature without a receiver")

@@ -1,0 +1,605 @@
+## tests/mir_int_arith_semantics_test.tg - the ordinary-integer
+## arithmetic semantics (audit §24) at the typed->MIR surface, over
+## EVERY optimization level (O0..O3).
+##
+## The compiler contract asserted here mirrors the §19 volatile-surface
+## harness (tests/embedded/embedded_volatile_surface_test.tg): each
+## fixture function is compiled through parse -> analyze -> lower ->
+## optimize_mir at the level under test and its lowered shape is
+## checked. Audit §24's rule: the ordinary integer semantics must NEVER
+## change with the optimization level -
+##   1. signed `+` `-` `*` (Int and i8/i16/i32/i64) carry the P1-5
+##      overflow trap: a MirAssert terminator whose message is
+##      AssertMessage::Overflow(op) guards the operation's result.
+##      NO optimization level may remove the guard on runtime-valued
+##      operands (the check cannot be proven unnecessary), and no level
+##      may turn the trap into silent wrap-around (the language rule is
+##      not the optimizer's to change).
+##   2. the wrapping view (`as u64` + `as` back - the std::core
+##      wrapping_* bodies' own idiom) and the unsigned kinds (u8..u64)
+##      are CHECK-FREE at every level: unsigned arithmetic is the
+##      mod-2^W domain by definition; an optimizer that inserted a trap
+##      here would change the language rule just as surely as one that
+##      deleted the signed trap.
+##   3. shifts (<< >>) are defined by the §24 count rule (count masked
+##      to the shifted width at lowering - see mir_emit_shift_rvalue in
+##      tg_compiler/mir.tg): a shift NEVER carries an assertion, and the
+##      count-masking BitAnd must survive every level so no backend can
+##      ever see an out-of-range count.
+##   4. unary negation (raw two's-complement) and the narrowing casts
+##      (canonical IntToInt truncation) are check-free and must stay
+##      check-free at every level.
+##   5. signed division MIN/-1 and /0 are the documented residual gap
+##      (no lowering guard exists today - the edge behavior follows the
+##      target instruction); the fixture records the CURRENT shape (a
+##      plain Div binop with no Overflow assertion) so an optimizer
+##      change at any level is still caught.
+##
+## Run with: tg test tests/mir_int_arith_semantics_test.tg
+
+use std::test::*
+use std::core::{Option, Result, Unit, Bool, Int, UInt, panic}
+
+use tg_compiler::compiler_core::{default_options, parse_source_program, analyze_parsed, CompilerOptions}
+use tg_compiler::types::{type_env_new}
+use tg_compiler::mir::{
+  MirProgram, MirFunction, MirStatementKind, MirRvalue, MirRvalueKind,
+  MirTerminatorKind, MirOperand, MirOperandKind, MirConstantKind, Place,
+  Projection, optimize_mir, lower_to_mir, AssertMessage, MirBinOp, MirUnOp,
+  CastKind
+}
+use tg_compiler::mode::{Mode}
+
+# The fixture: one function per row of the §24 matrix. Every operand of
+# every checked operation is a RUNTIME parameter - the optimizer can
+# never prove a check unnecessary - and the constant-edge rows (MAX+1,
+# MIN-1) put the edge value on the constant side with the other operand
+# runtime, exactly the shape a real program passes the edge values in.
+const FIXTURE: str =
+  "def tg24_add_i64(a: Int, b: Int) -> Int\n" +
+  "  a + b\n" +
+  "end\n" +
+  "\n" +
+  "def tg24_add_i64t(a: i64, b: i64) -> i64\n" +
+  "  a + b\n" +
+  "end\n" +
+  "\n" +
+  "def tg24_add_i32(a: i32, b: i32) -> i32\n" +
+  "  a + b\n" +
+  "end\n" +
+  "\n" +
+  "def tg24_add_i16(a: i16, b: i16) -> i16\n" +
+  "  a + b\n" +
+  "end\n" +
+  "\n" +
+  "def tg24_add_i8(a: i8, b: i8) -> i8\n" +
+  "  a + b\n" +
+  "end\n" +
+  "\n" +
+  "def tg24_sub_i64(a: Int, b: Int) -> Int\n" +
+  "  a - b\n" +
+  "end\n" +
+  "\n" +
+  "def tg24_mul_i64(a: Int, b: Int) -> Int\n" +
+  "  a * b\n" +
+  "end\n" +
+  "\n" +
+  "def tg24_mul_i8(a: i8, b: i8) -> i8\n" +
+  "  a * b\n" +
+  "end\n" +
+  "\n" +
+  "def tg24_max1_add(a: Int) -> Int\n" +
+  "  9223372036854775807 + a\n" +
+  "end\n" +
+  "\n" +
+  "def tg24_min1_sub(a: Int) -> Int\n" +
+  "  -9223372036854775807 - 1 - a\n" +
+  "end\n" +
+  "\n" +
+  "def tg24_wrap_add_i64(a: Int, b: Int) -> Int\n" +
+  "  ((a as u64) + (b as u64)) as Int\n" +
+  "end\n" +
+  "\n" +
+  "def tg24_u8_add(a: u8, b: u8) -> u8\n" +
+  "  a + b\n" +
+  "end\n" +
+  "\n" +
+  "def tg24_u16_add(a: u16, b: u16) -> u16\n" +
+  "  a + b\n" +
+  "end\n" +
+  "\n" +
+  "def tg24_u32_add(a: u32, b: u32) -> u32\n" +
+  "  a + b\n" +
+  "end\n" +
+  "\n" +
+  "def tg24_u64_add(a: u64, b: u64) -> u64\n" +
+  "  a + b\n" +
+  "end\n" +
+  "\n" +
+  "def tg24_shl_i64(a: Int, b: Int) -> Int\n" +
+  "  a << b\n" +
+  "end\n" +
+  "\n" +
+  "def tg24_shl_u8(a: u8, b: u8) -> u8\n" +
+  "  a << b\n" +
+  "end\n" +
+  "\n" +
+  "def tg24_shr_i64(a: Int, b: Int) -> Int\n" +
+  "  a >> b\n" +
+  "end\n" +
+  "\n" +
+  "def tg24_neg_i64(a: Int) -> Int\n" +
+  "  -a\n" +
+  "end\n" +
+  "\n" +
+  "def tg24_narrow_i8(a: Int) -> i8\n" +
+  "  a as i8\n" +
+  "end\n" +
+  "\n" +
+  "def tg24_narrow_u16(a: Int) -> u16\n" +
+  "  a as u16\n" +
+  "end\n" +
+  "\n" +
+  "def tg24_div_i64(a: Int, b: Int) -> Int\n" +
+  "  a / b\n" +
+  "end\n" +
+  "\n" +
+  "def main() -> Int\n" +
+  "  0\n" +
+  "end\n"
+
+def _opts() -> CompilerOptions
+  var opts = default_options()
+  opts.strict_resolution = true
+  opts.mode = Mode::Dev
+  opts
+end
+
+# Parse + analyze + lower + optimize at `opt_level` - the pipeline the
+# driver runs before codegen (driver.tg: parse -> analyze -> lower ->
+# monomorphize -> optimize).
+def _compile_fixture(opt_level: Int) -> MirProgram
+  var ast = assert_ok(parse_source_program(FIXTURE.to_string(), "mir_int_arith_semantics_fixture.tg"))
+  var env = type_env_new()
+  let analyzed = assert_ok(analyze_parsed(&mut env, &mut ast, _opts()))
+  var mir = assert_ok(lower_to_mir(&ast, &analyzed))
+  optimize_mir(&mut mir, opt_level)
+  mir
+end
+
+def _find_fn(program: MirProgram, suffix: str) -> MirFunction
+  for f in program.functions do
+    if f.name.ends_with(suffix) then
+      return f
+    end
+  end
+  panic("arith fixture: expected function missing from the lowered program: " + suffix.to_string())
+end
+
+# Any MirAssert terminator in `f`.
+def _mir_assert_total(f: MirFunction) -> Int
+  var total = 0
+  for block in f.blocks do
+    match block.terminator.kind
+    when MirTerminatorKind::MirAssert { cond, expected, msg, target, unwind } then
+      total = total + 1
+    when _ then ()
+    end
+  end
+  total
+end
+
+# MirAssert terminators whose message is the P1-5 signed-overflow trap
+# AssertMessage::Overflow(_).
+def _overflow_assert_total(f: MirFunction) -> Int
+  var total = 0
+  for block in f.blocks do
+    match block.terminator.kind
+    when MirTerminatorKind::MirAssert { cond, expected, msg, target, unwind } then
+      match msg
+      when AssertMessage::Overflow(_) then total = total + 1
+      when _ then ()
+      end
+    when _ then ()
+    end
+  end
+  total
+end
+
+# MirAssert terminators whose Overflow message names `want`.
+def _overflow_assert_for_op(f: MirFunction, want: MirBinOp) -> Int
+  var total = 0
+  for block in f.blocks do
+    match block.terminator.kind
+    when MirTerminatorKind::MirAssert { cond, expected, msg, target, unwind } then
+      match msg
+      when AssertMessage::Overflow(op) then
+        let same = match want
+          when MirBinOp::Add then
+            match op
+            when MirBinOp::Add then true
+            when _ then false
+            end
+          when MirBinOp::Sub then
+            match op
+            when MirBinOp::Sub then true
+            when _ then false
+            end
+          when MirBinOp::Mul then
+            match op
+            when MirBinOp::Mul then true
+            when _ then false
+            end
+          when _ then false
+        end
+        if same then
+          total = total + 1
+        end
+      when _ then ()
+      end
+    when _ then ()
+    end
+  end
+  total
+end
+
+# MirAssign statements whose rvalue is a MirBinOp named `want`.
+def _binop_stmt_total(f: MirFunction, want: MirBinOp) -> Int
+  var total = 0
+  for block in f.blocks do
+    for stmt in block.statements do
+      match stmt.kind
+      when MirStatementKind::MirAssign(_, rvalue) then
+        match rvalue.kind
+        when MirRvalueKind::MirBinOp(op, _, _) then
+          let same = match want
+            when MirBinOp::Add then
+              match op
+              when MirBinOp::Add then true
+              when _ then false
+              end
+            when MirBinOp::Sub then
+              match op
+              when MirBinOp::Sub then true
+              when _ then false
+              end
+            when MirBinOp::Mul then
+              match op
+              when MirBinOp::Mul then true
+              when _ then false
+              end
+            when MirBinOp::Div then
+              match op
+              when MirBinOp::Div then true
+              when _ then false
+              end
+            when MirBinOp::Shl then
+              match op
+              when MirBinOp::Shl then true
+              when _ then false
+              end
+            when MirBinOp::Shr then
+              match op
+              when MirBinOp::Shr then true
+              when _ then false
+              end
+            when MirBinOp::BitAnd then
+              match op
+              when MirBinOp::BitAnd then true
+              when _ then false
+              end
+            when _ then false
+          end
+          if same then
+            total = total + 1
+          end
+        when _ then ()
+        end
+      when _ then ()
+      end
+    end
+  end
+  total
+end
+
+# MirAssign statements whose rvalue is a MirCast of `kind`.
+def _cast_stmt_total(f: MirFunction, kind: CastKind) -> Int
+  var total = 0
+  for block in f.blocks do
+    for stmt in block.statements do
+      match stmt.kind
+      when MirStatementKind::MirAssign(_, rvalue) then
+        match rvalue.kind
+        when MirRvalueKind::MirCast(c, _, _) then
+          match c
+          when CastKind::IntToInt then
+            match kind
+            when CastKind::IntToInt then total = total + 1
+            when _ then ()
+            end
+          when _ then ()
+          end
+        when _ then ()
+        end
+      when _ then ()
+      end
+    end
+  end
+  total
+end
+
+# MirAssign statements whose rvalue is a MirUnOp named `want`.
+def _unop_stmt_total(f: MirFunction, want: MirUnOp) -> Int
+  var total = 0
+  for block in f.blocks do
+    for stmt in block.statements do
+      match stmt.kind
+      when MirStatementKind::MirAssign(_, rvalue) then
+        match rvalue.kind
+        when MirRvalueKind::MirUnOp(op, _) then
+          match op
+          when MirUnOp::Neg then
+            match want
+            when MirUnOp::Neg then total = total + 1
+            when _ then ()
+            end
+          when _ then ()
+          end
+        when _ then ()
+        end
+      when _ then ()
+      end
+    end
+  end
+  total
+end
+
+# The count-masking BitAnd statements of the §24 shift rule: a BitAnd
+# whose mask constant (either operand side) is `mask_value`.
+def _shift_mask_stmt_total(f: MirFunction, mask_value: Int) -> Int
+  var total = 0
+  for block in f.blocks do
+    for stmt in block.statements do
+      match stmt.kind
+      when MirStatementKind::MirAssign(_, rvalue) then
+        match rvalue.kind
+        when MirRvalueKind::MirBinOp(MirBinOp::BitAnd, lhs, rhs) then
+          let lhs_is_mask = match lhs.kind
+            when MirOperandKind::MirConstant(c) then
+              match c.kind
+              when MirConstantKind::MirInt(v) then v == mask_value
+              when _ then false
+              end
+            when _ then false
+          end
+          let rhs_is_mask = match rhs.kind
+            when MirOperandKind::MirConstant(c) then
+              match c.kind
+              when MirConstantKind::MirInt(v) then v == mask_value
+              when _ then false
+              end
+            when _ then false
+          end
+          if lhs_is_mask || rhs_is_mask then
+            total = total + 1
+          end
+        when _ then ()
+        end
+      when _ then ()
+      end
+    end
+  end
+  total
+end
+
+# ─── the semantic rows at ONE optimization level ────────────────────
+# (each @test compiles the fixture once and asserts every row of the
+# matrix; the identical-outcome test then runs all four levels)
+
+def _assert_rows_at(opt: Int) -> Unit
+  let program = _compile_fixture(opt)
+  let tag = "at -O" + opt.to_string() + ": "
+
+  # 1. the signed trap rows - the P1-5 Overflow assert must guard the
+  #    op at every level, named with the op's own message.
+  var f = _find_fn(program, "tg24_add_i64")
+  assert(_overflow_assert_for_op(&f, MirBinOp::Add) >= 1, tag + "Int + must keep its Overflow(Add) trap (O" + opt.to_string() + ")")
+  assert(_overflow_assert_total(&f) >= 1, tag + "Int + must keep an Overflow trap (O" + opt.to_string() + ")")
+  f = _find_fn(program, "tg24_add_i64t")
+  assert(_overflow_assert_for_op(&f, MirBinOp::Add) >= 1, tag + "i64 + must keep its Overflow(Add) trap")
+  f = _find_fn(program, "tg24_add_i32")
+  assert(_overflow_assert_for_op(&f, MirBinOp::Add) >= 1, tag + "i32 + must keep its Overflow(Add) trap")
+  f = _find_fn(program, "tg24_add_i16")
+  assert(_overflow_assert_for_op(&f, MirBinOp::Add) >= 1, tag + "i16 + must keep its Overflow(Add) trap")
+  f = _find_fn(program, "tg24_add_i8")
+  assert(_overflow_assert_for_op(&f, MirBinOp::Add) >= 1, tag + "i8 + must keep its Overflow(Add) trap")
+  f = _find_fn(program, "tg24_sub_i64")
+  assert(_overflow_assert_for_op(&f, MirBinOp::Sub) >= 1, tag + "Int - must keep its Overflow(Sub) trap")
+  f = _find_fn(program, "tg24_mul_i64")
+  assert(_overflow_assert_for_op(&f, MirBinOp::Mul) >= 1, tag + "Int * must keep its Overflow(Mul) trap")
+  f = _find_fn(program, "tg24_mul_i8")
+  assert(_overflow_assert_for_op(&f, MirBinOp::Mul) >= 1, tag + "i8 * must keep its Overflow(Mul) trap")
+
+  # 2. the constant-edge rows: MAX + a and MIN - a (a runtime) - the
+  #    MAX+1 / MIN-1 overflow cases stay guarded at every level; a fold
+  #    may rewrite the arithmetic, but the trap is the language rule and
+  #    never disappears.
+  f = _find_fn(program, "tg24_max1_add")
+  assert(_overflow_assert_for_op(&f, MirBinOp::Add) >= 1, tag + "MAX+1 must keep its Overflow(Add) trap")
+  f = _find_fn(program, "tg24_min1_sub")
+  assert(_overflow_assert_for_op(&f, MirBinOp::Sub) >= 1, tag + "MIN-1 must keep its Overflow(Sub) trap")
+
+  # 3. the wrapping/unsigned rows are CHECK-FREE at every level: no
+  #    optimizer may insert a trap where the language rule is wrap.
+  f = _find_fn(program, "tg24_wrap_add_i64")
+  assert(_mir_assert_total(&f) == 0, tag + "the wrapping view (as u64) must stay check-free")
+  assert(_binop_stmt_total(&f, MirBinOp::Add) >= 1, tag + "the wrapping view must keep its add")
+  f = _find_fn(program, "tg24_u8_add")
+  assert(_mir_assert_total(&f) == 0, tag + "u8 + (the unsigned mod-2^8 domain) must stay check-free")
+  assert(_binop_stmt_total(&f, MirBinOp::Add) >= 1, tag + "u8 + must keep its add")
+  f = _find_fn(program, "tg24_u16_add")
+  assert(_mir_assert_total(&f) == 0, tag + "u16 + (the unsigned mod-2^16 domain) must stay check-free")
+  assert(_binop_stmt_total(&f, MirBinOp::Add) >= 1, tag + "u16 + must keep its add")
+  f = _find_fn(program, "tg24_u32_add")
+  assert(_mir_assert_total(&f) == 0, tag + "u32 + (the unsigned mod-2^32 domain) must stay check-free")
+  assert(_binop_stmt_total(&f, MirBinOp::Add) >= 1, tag + "u32 + must keep its add")
+  f = _find_fn(program, "tg24_u64_add")
+  assert(_mir_assert_total(&f) == 0, tag + "u64 + (the unsigned mod-2^64 domain) must stay check-free")
+
+  # 4. the §24 shift rows: check-free by rule, and the count-masking
+  #    BitAnd (count & (W-1)) must survive every level.
+  f = _find_fn(program, "tg24_shl_i64")
+  assert(_mir_assert_total(&f) == 0, tag + "Int << must stay check-free (the count rule is a mask, never a trap)")
+  assert(_binop_stmt_total(&f, MirBinOp::Shl) >= 1, tag + "Int << must keep its shift")
+  assert(_shift_mask_stmt_total(&f, 63) >= 1, tag + "Int << must keep its count-mask BitAnd (count & 63)")
+  f = _find_fn(program, "tg24_shl_u8")
+  assert(_mir_assert_total(&f) == 0, tag + "u8 << must stay check-free")
+  assert(_binop_stmt_total(&f, MirBinOp::Shl) >= 1, tag + "u8 << must keep its shift")
+  assert(_shift_mask_stmt_total(&f, 7) >= 1, tag + "u8 << must keep its count-mask BitAnd (count & 7)")
+  f = _find_fn(program, "tg24_shr_i64")
+  assert(_mir_assert_total(&f) == 0, tag + "Int >> must stay check-free")
+  assert(_binop_stmt_total(&f, MirBinOp::Shr) >= 1, tag + "Int >> must keep its shift")
+  assert(_shift_mask_stmt_total(&f, 63) >= 1, tag + "Int >> must keep its count-mask BitAnd (count & 63)")
+
+  # 5. unary negation and the narrowing cast are check-free raw
+  #    two's-complement operations at every level.
+  f = _find_fn(program, "tg24_neg_i64")
+  assert(_mir_assert_total(&f) == 0, tag + "unary - must stay check-free (negating MIN wraps)")
+  assert(_unop_stmt_total(&f, MirUnOp::Neg) >= 1, tag + "unary - must keep its Neg")
+  f = _find_fn(program, "tg24_narrow_i8")
+  assert(_mir_assert_total(&f) == 0, tag + "the narrowing cast must stay check-free (truncation is the rule)")
+  assert(_cast_stmt_total(&f, CastKind::IntToInt) >= 1, tag + "the narrowing cast must keep its IntToInt cast")
+  f = _find_fn(program, "tg24_narrow_u16")
+  assert(_mir_assert_total(&f) == 0, tag + "the u16 narrowing cast must stay check-free (truncation is the rule)")
+  assert(_cast_stmt_total(&f, CastKind::IntToInt) >= 1, tag + "the u16 narrowing cast must keep its IntToInt cast")
+
+  # 6. the division row: the CURRENT shape of the documented residual
+  #    gap (no lowering guard exists for /0 or MIN/-1 yet) - a plain
+  #    Div with no Overflow assertion; an optimizer that altered this
+  #    shape at any level would still fail here.
+  f = _find_fn(program, "tg24_div_i64")
+  assert(_overflow_assert_total(&f) == 0, tag + "Int / must stay guard-free until the division-edge guard lands (documented residual)")
+  assert(_binop_stmt_total(&f, MirBinOp::Div) >= 1, tag + "Int / must keep its division")
+end
+
+@test
+def test_rows_at_o0() -> Unit
+  _assert_rows_at(0)
+end
+
+@test
+def test_rows_at_o1() -> Unit
+  _assert_rows_at(1)
+end
+
+@test
+def test_rows_at_o2() -> Unit
+  _assert_rows_at(2)
+end
+
+@test
+def test_rows_at_o3() -> Unit
+  _assert_rows_at(3)
+end
+
+# ─── the optimizer-invariance test ─────────────────────────────────
+# The audit headline: the SAME function through optimize_mir at O0..O3
+# must produce the SAME semantic outcome. The outcome measures: the
+# signed-overflow trap counts (guards may never appear or disappear on
+# runtime operands) and the check-free rows (wrap/shift/negate/narrow
+# must never gain a guard).
+
+@test
+def test_semantic_outcome_is_identical_across_all_levels() -> Unit
+  let program0 = _compile_fixture(0)
+  let program1 = _compile_fixture(1)
+  let program2 = _compile_fixture(2)
+  let program3 = _compile_fixture(3)
+
+  # The trap rows: identical guard counts at every level (>= 1).
+  var counts0 = _overflow_assert_for_op(_find_fn(program0, "tg24_add_i64"), MirBinOp::Add)
+  var counts1 = _overflow_assert_for_op(_find_fn(program1, "tg24_add_i64"), MirBinOp::Add)
+  var counts2 = _overflow_assert_for_op(_find_fn(program2, "tg24_add_i64"), MirBinOp::Add)
+  var counts3 = _overflow_assert_for_op(_find_fn(program3, "tg24_add_i64"), MirBinOp::Add)
+  assert(counts0 >= 1 && counts1 == counts0 && counts2 == counts0 && counts3 == counts0,
+    "tg24_add_i64: the Overflow(Add) trap count must be identical at O0..O3 (got " + counts0.to_string() + "/" + counts1.to_string() + "/" + counts2.to_string() + "/" + counts3.to_string() + ")")
+
+  counts0 = _overflow_assert_for_op(_find_fn(program0, "tg24_add_i8"), MirBinOp::Add)
+  counts1 = _overflow_assert_for_op(_find_fn(program1, "tg24_add_i8"), MirBinOp::Add)
+  counts2 = _overflow_assert_for_op(_find_fn(program2, "tg24_add_i8"), MirBinOp::Add)
+  counts3 = _overflow_assert_for_op(_find_fn(program3, "tg24_add_i8"), MirBinOp::Add)
+  assert(counts0 >= 1 && counts1 == counts0 && counts2 == counts0 && counts3 == counts0,
+    "tg24_add_i8: the Overflow(Add) trap count must be identical at O0..O3 (got " + counts0.to_string() + "/" + counts1.to_string() + "/" + counts2.to_string() + "/" + counts3.to_string() + ")")
+
+  counts0 = _overflow_assert_for_op(_find_fn(program0, "tg24_mul_i64"), MirBinOp::Mul)
+  counts1 = _overflow_assert_for_op(_find_fn(program1, "tg24_mul_i64"), MirBinOp::Mul)
+  counts2 = _overflow_assert_for_op(_find_fn(program2, "tg24_mul_i64"), MirBinOp::Mul)
+  counts3 = _overflow_assert_for_op(_find_fn(program3, "tg24_mul_i64"), MirBinOp::Mul)
+  assert(counts0 >= 1 && counts1 == counts0 && counts2 == counts0 && counts3 == counts0,
+    "tg24_mul_i64: the Overflow(Mul) trap count must be identical at O0..O3 (got " + counts0.to_string() + "/" + counts1.to_string() + "/" + counts2.to_string() + "/" + counts3.to_string() + ")")
+
+  counts0 = _overflow_assert_for_op(_find_fn(program0, "tg24_max1_add"), MirBinOp::Add)
+  counts1 = _overflow_assert_for_op(_find_fn(program1, "tg24_max1_add"), MirBinOp::Add)
+  counts2 = _overflow_assert_for_op(_find_fn(program2, "tg24_max1_add"), MirBinOp::Add)
+  counts3 = _overflow_assert_for_op(_find_fn(program3, "tg24_max1_add"), MirBinOp::Add)
+  assert(counts0 >= 1 && counts1 == counts0 && counts2 == counts0 && counts3 == counts0,
+    "tg24_max1_add (MAX+1): the Overflow(Add) trap count must be identical at O0..O3 (got " + counts0.to_string() + "/" + counts1.to_string() + "/" + counts2.to_string() + "/" + counts3.to_string() + ")")
+
+  counts0 = _overflow_assert_for_op(_find_fn(program0, "tg24_min1_sub"), MirBinOp::Sub)
+  counts1 = _overflow_assert_for_op(_find_fn(program1, "tg24_min1_sub"), MirBinOp::Sub)
+  counts2 = _overflow_assert_for_op(_find_fn(program2, "tg24_min1_sub"), MirBinOp::Sub)
+  counts3 = _overflow_assert_for_op(_find_fn(program3, "tg24_min1_sub"), MirBinOp::Sub)
+  assert(counts0 >= 1 && counts1 == counts0 && counts2 == counts0 && counts3 == counts0,
+    "tg24_min1_sub (MIN-1): the Overflow(Sub) trap count must be identical at O0..O3 (got " + counts0.to_string() + "/" + counts1.to_string() + "/" + counts2.to_string() + "/" + counts3.to_string() + ")")
+
+  # The check-free rows: ZERO assertions at every level.
+  var f0 = _find_fn(program0, "tg24_wrap_add_i64")
+  var f1 = _find_fn(program1, "tg24_wrap_add_i64")
+  var f2 = _find_fn(program2, "tg24_wrap_add_i64")
+  var f3 = _find_fn(program3, "tg24_wrap_add_i64")
+  var a0 = _mir_assert_total(&f0)
+  var a1 = _mir_assert_total(&f1)
+  var a2 = _mir_assert_total(&f2)
+  var a3 = _mir_assert_total(&f3)
+  assert(a0 == 0 && a1 == 0 && a2 == 0 && a3 == 0,
+    "tg24_wrap_add_i64: the wrapping view must be check-free at O0..O3 (got " + a0.to_string() + "/" + a1.to_string() + "/" + a2.to_string() + "/" + a3.to_string() + ")")
+
+  f0 = _find_fn(program0, "tg24_shl_i64")
+  f1 = _find_fn(program1, "tg24_shl_i64")
+  f2 = _find_fn(program2, "tg24_shl_i64")
+  f3 = _find_fn(program3, "tg24_shl_i64")
+  a0 = _mir_assert_total(&f0)
+  a1 = _mir_assert_total(&f1)
+  a2 = _mir_assert_total(&f2)
+  a3 = _mir_assert_total(&f3)
+  assert(a0 == 0 && a1 == 0 && a2 == 0 && a3 == 0,
+    "tg24_shl_i64: the shift must be check-free at O0..O3 (got " + a0.to_string() + "/" + a1.to_string() + "/" + a2.to_string() + "/" + a3.to_string() + ")")
+  var m0 = _shift_mask_stmt_total(&f0, 63)
+  var m1 = _shift_mask_stmt_total(&f1, 63)
+  var m2 = _shift_mask_stmt_total(&f2, 63)
+  var m3 = _shift_mask_stmt_total(&f3, 63)
+  assert(m0 >= 1 && m1 >= 1 && m2 >= 1 && m3 >= 1,
+    "tg24_shl_i64: the count-mask BitAnd must survive every level (got " + m0.to_string() + "/" + m1.to_string() + "/" + m2.to_string() + "/" + m3.to_string() + ")")
+
+  f0 = _find_fn(program0, "tg24_neg_i64")
+  f1 = _find_fn(program1, "tg24_neg_i64")
+  f2 = _find_fn(program2, "tg24_neg_i64")
+  f3 = _find_fn(program3, "tg24_neg_i64")
+  a0 = _mir_assert_total(&f0)
+  a1 = _mir_assert_total(&f1)
+  a2 = _mir_assert_total(&f2)
+  a3 = _mir_assert_total(&f3)
+  assert(a0 == 0 && a1 == 0 && a2 == 0 && a3 == 0,
+    "tg24_neg_i64: unary negation must be check-free at O0..O3 (got " + a0.to_string() + "/" + a1.to_string() + "/" + a2.to_string() + "/" + a3.to_string() + ")")
+
+  f0 = _find_fn(program0, "tg24_narrow_i8")
+  f1 = _find_fn(program1, "tg24_narrow_i8")
+  f2 = _find_fn(program2, "tg24_narrow_i8")
+  f3 = _find_fn(program3, "tg24_narrow_i8")
+  a0 = _mir_assert_total(&f0)
+  a1 = _mir_assert_total(&f1)
+  a2 = _mir_assert_total(&f2)
+  a3 = _mir_assert_total(&f3)
+  assert(a0 == 0 && a1 == 0 && a2 == 0 && a3 == 0,
+    "tg24_narrow_i8: the narrowing cast must be check-free at O0..O3 (got " + a0.to_string() + "/" + a1.to_string() + "/" + a2.to_string() + "/" + a3.to_string() + ")")
+end

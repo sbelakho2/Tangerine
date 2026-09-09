@@ -108,6 +108,7 @@ let () =
           struct_fields = [];
                 enum_payloads = [];
           copy_cache = Type_properties.create_cache ();
+          lang_items = Lang_items.seed_defaults;
         }
       in
       let mir_funcs =

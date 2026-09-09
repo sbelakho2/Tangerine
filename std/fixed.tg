@@ -124,42 +124,76 @@
 ## so the __sync family is the kernel's one atomic layer). Every access
 ## to a shared word is a __sync operation (no plain read or write of a
 ## shared word anywhere):
-##   - publication (producer): slot write, THEN __sync_fetch_and_add on
-##     the head counter — the full-barrier RMW publishes the element;
+##   - the head word is the producer's publication state: the published
+##     producer counter in bits [0, 63) AND the CLOSED bit at bit 63 —
+##     one word, so the publish decision and the close decision are one
+##     atomic compare-and-swap apart (the closed state cannot slip into
+##     the window between a close flag and a publish RMW);
+##   - publication (producer): slot write, THEN the full-barrier CAS
+##     (open, H) -> (open, H + 1) on the head word — the CAS success is
+##     the linearization point of the push and publishes the element;
 ##   - publication (consumer): slot take, THEN __sync_fetch_and_add on
 ##     the tail counter — the full-barrier RMW publishes the free slot;
 ##   - the far-side reads (head by rx, tail by tx) are
 ##     __sync_fetch_and_add(x, 0) loads.
 ## The __sync ops are sequentially consistent (strictly stronger than
 ## the Release/Acquire minimum the SPSC protocol needs) — the kernel's
-## __sync surface exposes no narrower ordering primitive, so the
-## publication boundaries carry the full-barrier form. The head and tail
-## counters are monotonic; the lead (head - tail) is the occupancy and
-## the slot index is (counter & (N - 1)) — every capacity here is a
-## power of two.
-##   - tx.push first reads the rx-alive word: once the receiver endpoint
-##     has been dropped the queue is closed and every push returns
-##     Result::Err(item) without touching the slots.  A push that passed
-##     the FIRST probe re-checks rx-alive immediately before publishing
-##     its head RMW: if the receiver dropped while the push was in
-##     flight, the written slot is reverted and the item returned as
-##     Err.  (The close flag and the publish RMW are not one atomic
-##     operation, so a push can still observe a cleared flag only AFTER
-##     its final probe but BEFORE its publish in a vanishingly small
-##     window; such an item is published into a closed queue, can never
-##     be observed, and is destroyed exactly once by the record glue at
-##     the last endpoint drop — memory-safe, and the residual
-##     Ok-after-close window is the documented price of the lock-free
-##     close.)
-##   - rx.pop reads the published head; when head == tail the queue is
-##     empty and pop returns None (pop NEVER blocks).
-## len() reads the far-side counter and is exact at the load instant
-## (the publication order makes a load either before or after the
-## far side's full-barrier publish).
+## __sync surface exposes no narrower ordering primitive (the UInt CAS
+## is __sync_val_compare_and_swap_uint), so the publication boundaries
+## carry the full-barrier form. The head counter (low 63 bits) and the
+## tail counter are monotonic; the lead (head - tail) is the occupancy
+## and the slot index is (counter & (N - 1)) — every capacity here is a
+## power of two, and the mask-derived index is untouched by the packed
+## CLOSED bit (bit 63 needs no realignment of the slot index).
+## COUNTER BOUND: the head counter can never reach bit 63 — the CLOSED
+## bit lives above 2^63 - 1 published items. Even at one push per
+## nanosecond the counter would need ~292 years of continuous pushing to
+## collide, and every push requires a slot that only a pop frees, so the
+## bound is unreachable in practice (2^63 - 1 is the documented cap).
+##   - tx.push probes the head word once: CLOSED set -> the receiver
+##     endpoint has been dropped and the queue accepts nothing;
+##     Result::Err(item) without touching a slot (the fast path for the
+##     closed queue). Open: the full check (head_state - tail >= N ->
+##     Err(item)), then the candidate slot write, then the publish CAS.
+##     A CAS failure is the SINGLE authority for "closed": only the
+##     receiver's close touches the head word beside this producer, so
+##     (open, H) can only have changed by the CLOSED bit — the just
+##     written slot never became observable, it is reclaimed (the value
+##     taken back) and the item returns as Err. The push therefore
+##     returns Ok IFF its item became observable before the close
+##     linearization — the close semantic is LINEARIZABLE, no residual
+##     Ok-after-close window exists. (The pre-probe is a pure fast path
+##     that keeps closed queues slot-free; the CAS failure covers the
+##     close that lands between the probe and the publish, and the probe
+##     is NOT re-checked — the CAS result is authoritative.)
+##   - receiver close (rx.drop): OR the CLOSED bit into the head word
+##     with a fetch_or-style CAS loop (load; if CLOSED already set the
+##     close is idempotent and done; else CAS (cur -> cur | CLOSED),
+##     retrying when a producer publish won the CAS in between). The
+##     successful CAS IS the linearization point of close: every
+##     producer CAS that succeeded before it published an observable
+##     item (Ok), every producer CAS after it fails and reclaims (Err).
+##   - rx.pop reads the head word and MASKS the CLOSED bit off (the
+##     word may carry it in every state the protocol can reach); when
+##     head == tail the queue is empty and pop returns None (pop NEVER
+##     blocks — a closed queue is drained by pop exactly like an open
+##     one, and rx.pop only runs while the receiver endpoint lives).
+## len() reads the far-side counter (masked on the rx side) and is
+## exact at the load instant (the publication order makes a load either
+## before or after the far side's full-barrier publish).
 ##
-## The endpoint Drop order is defined: rx.drop first clears rx-alive,
-## then decrements the count; tx.drop decrements the count. Whichever
-## endpoint drops last runs the record's drop_in_place and dealloc.
+## DROP DISCIPLINE under the packed scheme: rx.drop first ORs the
+## CLOSED bit into the head word, then decrements the count; tx.drop
+## decrements the count. Whichever endpoint drops last runs the
+## record's drop_in_place and dealloc. The glue can only run at the
+## count 1 -> 0 transition, which requires BOTH endpoint values to be
+## gone — no push is in flight then, so a candidate slot write can
+## never race the glue. Every item is destroyed exactly once: Ok items
+## were published and are destructed by the glue (or popped); Err items
+## return to the caller; a reclaimed slot is None again before any glue
+## can run. Producer pushes into a closed queue are safe because the
+## record is freed only by the last endpoint's drop, never while this
+## producer's push call is alive.
 
 # Module identity: std::fixed (the file-based module — same convention as
 # std/collections.tg: no `module` block; the file name is the module path).
@@ -977,18 +1011,20 @@ end
 # ═══════════════════════════════════════════════════════════════════════
 # SpscQueue — fixed-capacity lock-free SPSC queue (split endpoints)
 # ═══════════════════════════════════════════════════════════════════════
-# SpscQueueN[T] is the SHARED STATE record (head/tail publication
-# counters + the inline slot array), constructed ONLY by new(), which
-# returns the two unique endpoints: SpscTxN[T] (pushes only) and
-# SpscRxN[T] (pops only). See the module header for the full design
-# contract (state lifetime, __sync ordering surface, slot discipline).
+# SpscQueueN[T] is the SHARED STATE record (the head STATE word — the
+# published producer counter packed with the CLOSED bit — plus the tail
+# publication counter and the inline slot array), constructed ONLY by
+# new(), which returns the two unique endpoints: SpscTxN[T] (pushes
+# only) and SpscRxN[T] (pops only). See the module header for the full
+# design contract (state lifetime, __sync ordering surface, slot
+# discipline, the CLOSED-bit close linearization).
 
 ## Shared state + factory, 4 elements.
 struct SpscQueue4[T]
-  _head: UInt      # published producer counter (producer writes)
-  _tail: UInt      # published consumer counter (consumer writes)
-  _refs: UInt      # live endpoint count: 2 -> 1 -> 0 (drop protocol)
-  _rx_alive: UInt  # 1 while the receiver endpoint lives; 0 once dropped
+  _head: UInt  # head STATE word: published producer counter (bits
+               # [0, 63)) + the CLOSED bit at bit 63 — one atomic word
+  _tail: UInt  # published consumer counter (consumer writes)
+  _refs: UInt  # live endpoint count: 2 -> 1 -> 0 (drop protocol)
   _data: [Option[T]; 4]
 end
 
@@ -1014,7 +1050,6 @@ impl[T] SpscQueue4[T]
       _head: 0,
       _tail: 0,
       _refs: 2,
-      _rx_alive: 1,
       _data: [
         Option::None, Option::None, Option::None, Option::None
       ]
@@ -1029,32 +1064,39 @@ impl[T] SpscTx4[T]
   end
 
   # Ownership-taking publish. Rejected (Err(item), item NOT consumed)
-  # when the receiver endpoint has been dropped or the queue is full.
-  # Publication order: slot write, THEN the head counter's full-barrier
-  # RMW — the consumer's far-side head read observes the element.
+  # when the queue is closed or full. Publication order: slot write,
+  # THEN the full-barrier publish CAS (open, H) -> (open, H + 1) on the
+  # head word — the CAS success is this push's linearization point; a
+  # CAS failure means the receiver's close linearized first, so the
+  # just-written slot is reclaimed and the item returns as Err (no
+  # Ok-after-close window). The pre-probe below is a pure fast path for
+  # the closed queue — it is NOT re-checked after the slot write (the
+  # CAS result is the single authority).
   def push(inout self: Self, sink item: T) -> Result[Unit, T]
     let st = self._state.as_mut()
-    if __sync_fetch_and_add(&st._rx_alive, 0) == 0 then
+    let closed = (1 as UInt) << 63
+    let head_state = __sync_fetch_and_add(&st._head, 0)
+    if head_state >= closed then
       return Result::Err(item)
     end
     let tail = __sync_fetch_and_add(&st._tail, 0)
-    if self._head - tail >= 4 then
+    if head_state - tail >= 4 then
       return Result::Err(item)
     end
-    let slot_idx = self._head & 3
+    let slot_idx = head_state & 3
     st._data[slot_idx] = Option::Some(item)
-    self._head = self._head + 1
-    if __sync_fetch_and_add(&st._rx_alive, 0) == 0 then
-      ## the receiver endpoint dropped while this push was in
-      ## flight: the slot was written but never published —
-      ## revert it and return the item unconsumed (a closed
-      ## queue accepts nothing).
+    let old = __sync_val_compare_and_swap_uint(&st._head, head_state, head_state + 1)
+    if old != head_state then
+      ## the publish CAS failed: only the receiver's close writes the
+      ## head word beside this producer, so the state now carries
+      ## CLOSED — the slot was never observable; take the value back
+      ## and return it unconsumed.
       match st._data[slot_idx].take()
       when Option::Some(v) then return Result::Err(v)
-      when Option::None then panic("Spsc push revert: slot unexpectedly empty")
+      when Option::None then panic("Spsc push reclaim: slot unexpectedly empty")
       end
     end
-    __sync_fetch_and_add(&st._head, 1)
+    self._head = head_state + 1
     Result::Ok(())
   end
 
@@ -1070,8 +1112,8 @@ end
 impl[T] Drop for SpscTx4[T]
   def drop(inout self: SpscTx4[T]) -> Unit
     if !self._state.is_null() then
-      let old = __sync_fetch_and_sub(&self._state.as_mut()._refs, 1)
-      if old == 1 then
+      let old_refs = __sync_fetch_and_sub(&self._state.as_mut()._refs, 1)
+      if old_refs == 1 then
         # Last endpoint: destruct every occupied slot through the record's
         # structural glue and release the allocation.
         self._state.drop_in_place()
@@ -1095,13 +1137,16 @@ impl[T] SpscRx4[T]
   end
 
   # Ownership-transferring pop of the oldest published element. Empty
-  # (head == tail): None — pop never blocks. Consumption order: the slot
-  # take happens BEFORE the tail counter's full-barrier RMW — the
+  # (published head == tail): None — pop never blocks, and a closed
+  # queue drains exactly like an open one (the CLOSED bit is masked off
+  # the far-side head load below). Consumption order: the slot take
+  # happens BEFORE the tail counter's full-barrier RMW — the
   # producer's far-side tail read observes the freed slot.
   def pop(inout self: Self) -> Option[T]
     let st = self._state.as_mut()
+    let closed_mask = ((1 as UInt) << 63) - 1
     let head = __sync_fetch_and_add(&st._head, 0)
-    if head == self._tail then
+    if (head & closed_mask) == self._tail then
       return Option::None
     end
     let item = st._data[(self._tail & 3)].take()
@@ -1111,22 +1156,39 @@ impl[T] SpscRx4[T]
   end
 
   # Occupancy as published: the producer's published head minus the
-  # consumer's own tail (exact at the load instant).
+  # consumer's own tail (exact at the load instant; the far-side load
+  # is masked to drop the CLOSED bit).
   def len(self: Self) -> UInt
     let st = self._state.as_mut()
     let head = __sync_fetch_and_add(&st._head, 0)
-    head - self._tail
+    (head & (((1 as UInt) << 63) - 1)) - self._tail
   end
 end
 
 impl[T] Drop for SpscRx4[T]
   def drop(inout self: SpscRx4[T]) -> Unit
     if !self._state.is_null() then
-      # Close the receive side FIRST: every later push returns Err
-      # without touching the slots.
-      __sync_fetch_and_sub(&self._state.as_mut()._rx_alive, 1)
-      let old = __sync_fetch_and_sub(&self._state.as_mut()._refs, 1)
-      if old == 1 then
+      # Close the receive side FIRST: OR the CLOSED bit into the head
+      # word with a CAS loop — the successful CAS IS the linearization
+      # point of close (every publish CAS that won before it stays Ok;
+      # every later one fails and reclaims). A head word that already
+      # carries CLOSED is the idempotent case: close is done. The retry
+      # covers the producer publish that won the CAS in between.
+      let closed = (1 as UInt) << 63
+      loop do
+        let cur = __sync_fetch_and_add(&self._state.as_mut()._head, 0)
+        if cur >= closed then
+          break
+        end
+        let old = __sync_val_compare_and_swap_uint(
+          &self._state.as_mut()._head, cur, (cur | closed)
+        )
+        if old == cur then
+          break
+        end
+      end
+      let old_refs = __sync_fetch_and_sub(&self._state.as_mut()._refs, 1)
+      if old_refs == 1 then
         # Last endpoint: destruct every occupied slot through the record's
         # structural glue and release the allocation.
         self._state.drop_in_place()
@@ -1146,10 +1208,10 @@ end
 
 ## Shared state + factory, 8 elements.
 struct SpscQueue8[T]
-  _head: UInt      # published producer counter (producer writes)
-  _tail: UInt      # published consumer counter (consumer writes)
-  _refs: UInt      # live endpoint count: 2 -> 1 -> 0 (drop protocol)
-  _rx_alive: UInt  # 1 while the receiver endpoint lives; 0 once dropped
+  _head: UInt  # head STATE word: published producer counter (bits
+               # [0, 63)) + the CLOSED bit at bit 63 — one atomic word
+  _tail: UInt  # published consumer counter (consumer writes)
+  _refs: UInt  # live endpoint count: 2 -> 1 -> 0 (drop protocol)
   _data: [Option[T]; 8]
 end
 
@@ -1173,7 +1235,6 @@ impl[T] SpscQueue8[T]
       _head: 0,
       _tail: 0,
       _refs: 2,
-      _rx_alive: 1,
       _data: [
         Option::None, Option::None, Option::None, Option::None,
         Option::None, Option::None, Option::None, Option::None
@@ -1188,29 +1249,40 @@ impl[T] SpscTx8[T]
     8
   end
 
+  # Ownership-taking publish. Rejected (Err(item), item NOT consumed)
+  # when the queue is closed or full. Publication order: slot write,
+  # THEN the full-barrier publish CAS (open, H) -> (open, H + 1) on the
+  # head word — the CAS success is this push's linearization point; a
+  # CAS failure means the receiver's close linearized first, so the
+  # just-written slot is reclaimed and the item returns as Err (no
+  # Ok-after-close window). The pre-probe below is a pure fast path for
+  # the closed queue — it is NOT re-checked after the slot write (the
+  # CAS result is the single authority).
   def push(inout self: Self, sink item: T) -> Result[Unit, T]
     let st = self._state.as_mut()
-    if __sync_fetch_and_add(&st._rx_alive, 0) == 0 then
+    let closed = (1 as UInt) << 63
+    let head_state = __sync_fetch_and_add(&st._head, 0)
+    if head_state >= closed then
       return Result::Err(item)
     end
     let tail = __sync_fetch_and_add(&st._tail, 0)
-    if self._head - tail >= 8 then
+    if head_state - tail >= 8 then
       return Result::Err(item)
     end
-    let slot_idx = self._head & 7
+    let slot_idx = head_state & 7
     st._data[slot_idx] = Option::Some(item)
-    self._head = self._head + 1
-    if __sync_fetch_and_add(&st._rx_alive, 0) == 0 then
-      ## the receiver endpoint dropped while this push was in
-      ## flight: the slot was written but never published —
-      ## revert it and return the item unconsumed (a closed
-      ## queue accepts nothing).
+    let old = __sync_val_compare_and_swap_uint(&st._head, head_state, head_state + 1)
+    if old != head_state then
+      ## the publish CAS failed: only the receiver's close writes the
+      ## head word beside this producer, so the state now carries
+      ## CLOSED — the slot was never observable; take the value back
+      ## and return it unconsumed.
       match st._data[slot_idx].take()
       when Option::Some(v) then return Result::Err(v)
-      when Option::None then panic("Spsc push revert: slot unexpectedly empty")
+      when Option::None then panic("Spsc push reclaim: slot unexpectedly empty")
       end
     end
-    __sync_fetch_and_add(&st._head, 1)
+    self._head = head_state + 1
     Result::Ok(())
   end
 
@@ -1246,10 +1318,17 @@ impl[T] SpscRx8[T]
     8
   end
 
+  # Ownership-transferring pop of the oldest published element. Empty
+  # (published head == tail): None — pop never blocks, and a closed
+  # queue drains exactly like an open one (the CLOSED bit is masked off
+  # the far-side head load below). Consumption order: the slot take
+  # happens BEFORE the tail counter's full-barrier RMW — the
+  # producer's far-side tail read observes the freed slot.
   def pop(inout self: Self) -> Option[T]
     let st = self._state.as_mut()
+    let closed_mask = ((1 as UInt) << 63) - 1
     let head = __sync_fetch_and_add(&st._head, 0)
-    if head == self._tail then
+    if (head & closed_mask) == self._tail then
       return Option::None
     end
     let item = st._data[(self._tail & 7)].take()
@@ -1258,19 +1337,42 @@ impl[T] SpscRx8[T]
     item
   end
 
+  # Occupancy as published: the producer's published head minus the
+  # consumer's own tail (exact at the load instant; the far-side load
+  # is masked to drop the CLOSED bit).
   def len(self: Self) -> UInt
     let st = self._state.as_mut()
     let head = __sync_fetch_and_add(&st._head, 0)
-    head - self._tail
+    (head & (((1 as UInt) << 63) - 1)) - self._tail
   end
 end
 
 impl[T] Drop for SpscRx8[T]
   def drop(inout self: SpscRx8[T]) -> Unit
     if !self._state.is_null() then
-      __sync_fetch_and_sub(&self._state.as_mut()._rx_alive, 1)
-      let old = __sync_fetch_and_sub(&self._state.as_mut()._refs, 1)
-      if old == 1 then
+      # Close the receive side FIRST: OR the CLOSED bit into the head
+      # word with a CAS loop — the successful CAS IS the linearization
+      # point of close (every publish CAS that won before it stays Ok;
+      # every later one fails and reclaims). A head word that already
+      # carries CLOSED is the idempotent case: close is done. The retry
+      # covers the producer publish that won the CAS in between.
+      let closed = (1 as UInt) << 63
+      loop do
+        let cur = __sync_fetch_and_add(&self._state.as_mut()._head, 0)
+        if cur >= closed then
+          break
+        end
+        let old = __sync_val_compare_and_swap_uint(
+          &self._state.as_mut()._head, cur, (cur | closed)
+        )
+        if old == cur then
+          break
+        end
+      end
+      let old_refs = __sync_fetch_and_sub(&self._state.as_mut()._refs, 1)
+      if old_refs == 1 then
+        # Last endpoint: destruct every occupied slot through the record's
+        # structural glue and release the allocation.
         self._state.drop_in_place()
         dealloc(self._state)
       end
@@ -1288,10 +1390,10 @@ end
 
 ## Shared state + factory, 16 elements.
 struct SpscQueue16[T]
-  _head: UInt      # published producer counter (producer writes)
-  _tail: UInt      # published consumer counter (consumer writes)
-  _refs: UInt      # live endpoint count: 2 -> 1 -> 0 (drop protocol)
-  _rx_alive: UInt  # 1 while the receiver endpoint lives; 0 once dropped
+  _head: UInt  # head STATE word: published producer counter (bits
+               # [0, 63)) + the CLOSED bit at bit 63 — one atomic word
+  _tail: UInt  # published consumer counter (consumer writes)
+  _refs: UInt  # live endpoint count: 2 -> 1 -> 0 (drop protocol)
   _data: [Option[T]; 16]
 end
 
@@ -1315,7 +1417,6 @@ impl[T] SpscQueue16[T]
       _head: 0,
       _tail: 0,
       _refs: 2,
-      _rx_alive: 1,
       _data: [
         Option::None, Option::None, Option::None, Option::None,
         Option::None, Option::None, Option::None, Option::None,
@@ -1332,29 +1433,40 @@ impl[T] SpscTx16[T]
     16
   end
 
+  # Ownership-taking publish. Rejected (Err(item), item NOT consumed)
+  # when the queue is closed or full. Publication order: slot write,
+  # THEN the full-barrier publish CAS (open, H) -> (open, H + 1) on the
+  # head word — the CAS success is this push's linearization point; a
+  # CAS failure means the receiver's close linearized first, so the
+  # just-written slot is reclaimed and the item returns as Err (no
+  # Ok-after-close window). The pre-probe below is a pure fast path for
+  # the closed queue — it is NOT re-checked after the slot write (the
+  # CAS result is the single authority).
   def push(inout self: Self, sink item: T) -> Result[Unit, T]
     let st = self._state.as_mut()
-    if __sync_fetch_and_add(&st._rx_alive, 0) == 0 then
+    let closed = (1 as UInt) << 63
+    let head_state = __sync_fetch_and_add(&st._head, 0)
+    if head_state >= closed then
       return Result::Err(item)
     end
     let tail = __sync_fetch_and_add(&st._tail, 0)
-    if self._head - tail >= 16 then
+    if head_state - tail >= 16 then
       return Result::Err(item)
     end
-    let slot_idx = self._head & 15
+    let slot_idx = head_state & 15
     st._data[slot_idx] = Option::Some(item)
-    self._head = self._head + 1
-    if __sync_fetch_and_add(&st._rx_alive, 0) == 0 then
-      ## the receiver endpoint dropped while this push was in
-      ## flight: the slot was written but never published —
-      ## revert it and return the item unconsumed (a closed
-      ## queue accepts nothing).
+    let old = __sync_val_compare_and_swap_uint(&st._head, head_state, head_state + 1)
+    if old != head_state then
+      ## the publish CAS failed: only the receiver's close writes the
+      ## head word beside this producer, so the state now carries
+      ## CLOSED — the slot was never observable; take the value back
+      ## and return it unconsumed.
       match st._data[slot_idx].take()
       when Option::Some(v) then return Result::Err(v)
-      when Option::None then panic("Spsc push revert: slot unexpectedly empty")
+      when Option::None then panic("Spsc push reclaim: slot unexpectedly empty")
       end
     end
-    __sync_fetch_and_add(&st._head, 1)
+    self._head = head_state + 1
     Result::Ok(())
   end
 
@@ -1390,10 +1502,17 @@ impl[T] SpscRx16[T]
     16
   end
 
+  # Ownership-transferring pop of the oldest published element. Empty
+  # (published head == tail): None — pop never blocks, and a closed
+  # queue drains exactly like an open one (the CLOSED bit is masked off
+  # the far-side head load below). Consumption order: the slot take
+  # happens BEFORE the tail counter's full-barrier RMW — the
+  # producer's far-side tail read observes the freed slot.
   def pop(inout self: Self) -> Option[T]
     let st = self._state.as_mut()
+    let closed_mask = ((1 as UInt) << 63) - 1
     let head = __sync_fetch_and_add(&st._head, 0)
-    if head == self._tail then
+    if (head & closed_mask) == self._tail then
       return Option::None
     end
     let item = st._data[(self._tail & 15)].take()
@@ -1402,19 +1521,42 @@ impl[T] SpscRx16[T]
     item
   end
 
+  # Occupancy as published: the producer's published head minus the
+  # consumer's own tail (exact at the load instant; the far-side load
+  # is masked to drop the CLOSED bit).
   def len(self: Self) -> UInt
     let st = self._state.as_mut()
     let head = __sync_fetch_and_add(&st._head, 0)
-    head - self._tail
+    (head & (((1 as UInt) << 63) - 1)) - self._tail
   end
 end
 
 impl[T] Drop for SpscRx16[T]
   def drop(inout self: SpscRx16[T]) -> Unit
     if !self._state.is_null() then
-      __sync_fetch_and_sub(&self._state.as_mut()._rx_alive, 1)
-      let old = __sync_fetch_and_sub(&self._state.as_mut()._refs, 1)
-      if old == 1 then
+      # Close the receive side FIRST: OR the CLOSED bit into the head
+      # word with a CAS loop — the successful CAS IS the linearization
+      # point of close (every publish CAS that won before it stays Ok;
+      # every later one fails and reclaims). A head word that already
+      # carries CLOSED is the idempotent case: close is done. The retry
+      # covers the producer publish that won the CAS in between.
+      let closed = (1 as UInt) << 63
+      loop do
+        let cur = __sync_fetch_and_add(&self._state.as_mut()._head, 0)
+        if cur >= closed then
+          break
+        end
+        let old = __sync_val_compare_and_swap_uint(
+          &self._state.as_mut()._head, cur, (cur | closed)
+        )
+        if old == cur then
+          break
+        end
+      end
+      let old_refs = __sync_fetch_and_sub(&self._state.as_mut()._refs, 1)
+      if old_refs == 1 then
+        # Last endpoint: destruct every occupied slot through the record's
+        # structural glue and release the allocation.
         self._state.drop_in_place()
         dealloc(self._state)
       end
@@ -1432,10 +1574,10 @@ end
 
 ## Shared state + factory, 32 elements.
 struct SpscQueue32[T]
-  _head: UInt      # published producer counter (producer writes)
-  _tail: UInt      # published consumer counter (consumer writes)
-  _refs: UInt      # live endpoint count: 2 -> 1 -> 0 (drop protocol)
-  _rx_alive: UInt  # 1 while the receiver endpoint lives; 0 once dropped
+  _head: UInt  # head STATE word: published producer counter (bits
+               # [0, 63)) + the CLOSED bit at bit 63 — one atomic word
+  _tail: UInt  # published consumer counter (consumer writes)
+  _refs: UInt  # live endpoint count: 2 -> 1 -> 0 (drop protocol)
   _data: [Option[T]; 32]
 end
 
@@ -1459,7 +1601,6 @@ impl[T] SpscQueue32[T]
       _head: 0,
       _tail: 0,
       _refs: 2,
-      _rx_alive: 1,
       _data: [
         Option::None, Option::None, Option::None, Option::None,
         Option::None, Option::None, Option::None, Option::None,
@@ -1480,29 +1621,40 @@ impl[T] SpscTx32[T]
     32
   end
 
+  # Ownership-taking publish. Rejected (Err(item), item NOT consumed)
+  # when the queue is closed or full. Publication order: slot write,
+  # THEN the full-barrier publish CAS (open, H) -> (open, H + 1) on the
+  # head word — the CAS success is this push's linearization point; a
+  # CAS failure means the receiver's close linearized first, so the
+  # just-written slot is reclaimed and the item returns as Err (no
+  # Ok-after-close window). The pre-probe below is a pure fast path for
+  # the closed queue — it is NOT re-checked after the slot write (the
+  # CAS result is the single authority).
   def push(inout self: Self, sink item: T) -> Result[Unit, T]
     let st = self._state.as_mut()
-    if __sync_fetch_and_add(&st._rx_alive, 0) == 0 then
+    let closed = (1 as UInt) << 63
+    let head_state = __sync_fetch_and_add(&st._head, 0)
+    if head_state >= closed then
       return Result::Err(item)
     end
     let tail = __sync_fetch_and_add(&st._tail, 0)
-    if self._head - tail >= 32 then
+    if head_state - tail >= 32 then
       return Result::Err(item)
     end
-    let slot_idx = self._head & 31
+    let slot_idx = head_state & 31
     st._data[slot_idx] = Option::Some(item)
-    self._head = self._head + 1
-    if __sync_fetch_and_add(&st._rx_alive, 0) == 0 then
-      ## the receiver endpoint dropped while this push was in
-      ## flight: the slot was written but never published —
-      ## revert it and return the item unconsumed (a closed
-      ## queue accepts nothing).
+    let old = __sync_val_compare_and_swap_uint(&st._head, head_state, head_state + 1)
+    if old != head_state then
+      ## the publish CAS failed: only the receiver's close writes the
+      ## head word beside this producer, so the state now carries
+      ## CLOSED — the slot was never observable; take the value back
+      ## and return it unconsumed.
       match st._data[slot_idx].take()
       when Option::Some(v) then return Result::Err(v)
-      when Option::None then panic("Spsc push revert: slot unexpectedly empty")
+      when Option::None then panic("Spsc push reclaim: slot unexpectedly empty")
       end
     end
-    __sync_fetch_and_add(&st._head, 1)
+    self._head = head_state + 1
     Result::Ok(())
   end
 
@@ -1538,10 +1690,17 @@ impl[T] SpscRx32[T]
     32
   end
 
+  # Ownership-transferring pop of the oldest published element. Empty
+  # (published head == tail): None — pop never blocks, and a closed
+  # queue drains exactly like an open one (the CLOSED bit is masked off
+  # the far-side head load below). Consumption order: the slot take
+  # happens BEFORE the tail counter's full-barrier RMW — the
+  # producer's far-side tail read observes the freed slot.
   def pop(inout self: Self) -> Option[T]
     let st = self._state.as_mut()
+    let closed_mask = ((1 as UInt) << 63) - 1
     let head = __sync_fetch_and_add(&st._head, 0)
-    if head == self._tail then
+    if (head & closed_mask) == self._tail then
       return Option::None
     end
     let item = st._data[(self._tail & 31)].take()
@@ -1550,19 +1709,42 @@ impl[T] SpscRx32[T]
     item
   end
 
+  # Occupancy as published: the producer's published head minus the
+  # consumer's own tail (exact at the load instant; the far-side load
+  # is masked to drop the CLOSED bit).
   def len(self: Self) -> UInt
     let st = self._state.as_mut()
     let head = __sync_fetch_and_add(&st._head, 0)
-    head - self._tail
+    (head & (((1 as UInt) << 63) - 1)) - self._tail
   end
 end
 
 impl[T] Drop for SpscRx32[T]
   def drop(inout self: SpscRx32[T]) -> Unit
     if !self._state.is_null() then
-      __sync_fetch_and_sub(&self._state.as_mut()._rx_alive, 1)
-      let old = __sync_fetch_and_sub(&self._state.as_mut()._refs, 1)
-      if old == 1 then
+      # Close the receive side FIRST: OR the CLOSED bit into the head
+      # word with a CAS loop — the successful CAS IS the linearization
+      # point of close (every publish CAS that won before it stays Ok;
+      # every later one fails and reclaims). A head word that already
+      # carries CLOSED is the idempotent case: close is done. The retry
+      # covers the producer publish that won the CAS in between.
+      let closed = (1 as UInt) << 63
+      loop do
+        let cur = __sync_fetch_and_add(&self._state.as_mut()._head, 0)
+        if cur >= closed then
+          break
+        end
+        let old = __sync_val_compare_and_swap_uint(
+          &self._state.as_mut()._head, cur, (cur | closed)
+        )
+        if old == cur then
+          break
+        end
+      end
+      let old_refs = __sync_fetch_and_sub(&self._state.as_mut()._refs, 1)
+      if old_refs == 1 then
+        # Last endpoint: destruct every occupied slot through the record's
+        # structural glue and release the allocation.
         self._state.drop_in_place()
         dealloc(self._state)
       end
@@ -1604,3 +1786,7 @@ end
 #   let (tx, rx): (SpscTx8[Task], SpscRx8[Task]) = SpscQueue8::new()
 #   # tx.push(task)   -> Result[Unit, Task]   (Err returns the item)
 #   # rx.pop()        -> Option[Task]
+#   # Dropping rx CLOSES the queue at a linearization point: every push
+#   # that won its publish CAS before it stays Ok (observable), every
+#   # later push returns Err(task); buffered items are destructed by the
+#   # last endpoint's drop.

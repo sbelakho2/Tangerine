@@ -4283,27 +4283,77 @@ def check_stmt(program: Program, typed: TypedProgram, inout env: TypeEnv, inout 
       message: "exceptions are not supported — no throwing path may bypass teardown: try/catch/finally is rejected",
       span: stmt.span
     })
-  when StmtKind::StmtWith(expr, _, body) then
-    # (audit P1-1, first pass): the SCOPED-ACCESS statement — `with EXPR
-    # as let/inout NAME <block> end`. The with-expression is checked on
-    # the enclosing frame and the block is analyzed as a NESTED lexical
-    # block, exactly like StmtUnsafe: the body's own locals bind and drop
-    # through the block's Normal-edge cleanup, and the with-bound name
-    # needs no frame entry because the type checker rejects owning/
-    # resource access values in this first pass (a Copy value local is
-    # invisible to the ownership frame). The Map-entry accessor half
-    # (Map::get_read / get_modify over Copy keys AND values —
-    # std/collections.tg) is covered by the same rule: the accessor
-    # impl's V: Copy bound keeps the block-bound access value out of the
-    # ownership frame, and the by-key write-back the MIR synthesizes
-    # (mir_emit_accessor_writeback) re-lands in the Copy entry image, so
-    # this arm needs no frame mirror for it. When the OWNING access-value
-    # half lands (Map::with_value / with_value_mut closure forms, or
-    # non-Copy accessor values), this arm must mirror the bind_pattern
-    # registration of the access binding's source place and the write-back
-    # copy's move discipline.
+  when StmtKind::StmtWith(expr, pat, body) then
+    # (audit §12): the SCOPED-ACCESS statement — `with EXPR as let/inout
+    # NAME <block> end`. The with-expression is checked on the enclosing
+    # frame and the block is analyzed as a NESTED lexical block, exactly
+    # like StmtUnsafe: the body's own locals bind and drop through the
+    # block's Normal-edge cleanup. The with-bound name is a COMPILER-ONLY
+    # PLACE ACCESS, never an owned copied value: for an OWNING element
+    # type (String fields, structs — the lifted Copy-only restriction) the
+    # binding is registered in the frame as a BORROW of the accessed
+    # element — the mirror of a let/inout parameter (origin Let for the
+    # read form, Inout for the modify form): its availability is Live for
+    # the body's reads/writes, it can never be consumed or moved out (the
+    # type checker's value-escape gates reject the moves first; the origin
+    # permissions are the fail-closed backstop — "let parameter is
+    # read-only" / "inout parameter may be modified but not consumed"),
+    # and the drop/finalize filters (which fire only for Sink/OwnedLocal
+    # origins) never attach cleanup to it — the accessed place stays the
+    # single owner. Copy elements stay invisible to the frame (as in the
+    # first pass); the Map-entry accessor half stays Copy-bound
+    # (std/collections.tg) and needs no frame mirror (its write-back
+    # re-lands in the Copy entry image).
+    # (audit §12 — the container-mutation exclusion): when the access
+    # sources a CONTAINER ELEMENT (an index over a Vec/Array place), the
+    # body is scanned with the projected-iteration mutation machinery
+    # (plan_block_mutates_place) against the PARENT storage place:
+    # Vec::push/reserve/insert/remove/clear/... and any whole-container
+    # replacement inside the block may invalidate the accessed element's
+    # storage — rejected here, at the ownership layer, in addition to the
+    # type checker's with-site gates.
     check_expr(program, typed, env, ctx, &expr, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
+    mut with_is_inout = false
+    match pat.kind
+    when PatternKind::Ident(_, im) then with_is_inout = im
+    when _ then ()
+    end
+    match typed.pattern_binding_resolutions.get(pat.node_id)
+    when Option::Some(bid) then
+      match typed.local_bindings.get(bid)
+      when Option::Some(lb) then
+        if is_owning_typed(env, &lb.ty) then
+          let blid = tg_compiler::ids::LocalId { id: bid }
+          res_frame_set(frame, blid, ResourceState::Live)
+          res_frame_set_span(frame, &blid, pat.span)
+          let borrow_origin = if with_is_inout then ParamOrigin::Inout else ParamOrigin::Let end
+          res_frame_set_origin(frame, &blid, borrow_origin)
+        end
+      when Option::None then ()
+      end
+    when Option::None then ()
+    end
     check_block(program, typed, env, ctx, &body, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
+    match expr.kind
+    when ExprKind::ExprIndex(base, _) then
+      mut parent_root = -1
+      mut parent_fields = Vec::new()
+      match expr_root_id(typed, &base)
+      when Option::Some(rid) then
+        parent_root = rid
+        collect_place_field_chain(typed, &base, &mut parent_fields)
+      when Option::None then ()
+      end
+      if parent_root >= 0 then
+        if plan_block_mutates_place(typed, &body, parent_root, &parent_fields) then
+          errors.push(ResourceError {
+            message: "cannot mutate the container storage of a live with-scoped element access inside the with-block: Vec::push/reserve/insert/remove/clear/... and Map::insert/remove/rehash may invalidate the accessed element's storage (the container-mutation exclusion)",
+            span: stmt.span
+          })
+        end
+      end
+    when _ then ()
+    end
   when StmtKind::StmtHandleWith(expr, handlers) then
     # The effect-handler block (the algebraic-effects row): the handled
     # expression is checked normally; the handler ARMS run in the handler's

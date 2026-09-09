@@ -1743,6 +1743,107 @@ def emit_raw_bytes(inout ctx: CodegenCtx, b0: u8, b1: u8, b2: u8, b3: u8, b4: u8
   emit8(&mut ctx.text, b4)
 end
 
+# ———————————————————————————————————————————————————————————————
+# §25 float -> int SATURATION fixup — the ONE language rule on every
+# target (the canonical spec is in types.tg above the Type enum):
+#
+#   NaN (any payload/sign)          -> 0
+#   value >= 2^63 (incl. +inf)      -> INT64_MAX  (9223372036854775807)
+#   value <  -2^63 (incl. -inf)     -> INT64_MIN  (-9223372036854775808)
+#   exact -2^63 (in range, trunc.)  -> INT64_MIN
+#   everything else                 -> truncation toward zero
+#
+# The raw hardware conversions (AArch64 FCVTZS, x86-64 CVTTSD2SI) both
+# return the integer-indefinite INT64_MIN for NaN AND for every
+# out-of-range input, so the emitters below are appended right after
+# the raw conversion and turn the indefinite result into the saturated
+# one. Both helpers are flag-clobbering but register-scratch-clean:
+#
+#   a64: dst plus X15 (never an allocated register) are the only GPRs
+#        touched; fsrc is only read; fscratch (a free SIMD&FP register
+#        at the call sites: V1 in the direct emitter, V30 in the LIR
+#        slice) is written once with the -2^63 bound. is_single selects
+#        the S-form compares/bound (F32 canonical-single sources).
+#   x64: dst (RAX at every call site — the register the surrounding
+#        raw-byte conversion writes) plus R11 (scratch_reg — never an
+#        allocated register). The source double is expected to still
+#        live in XMM0 (the register the conversion read).
+#
+# a64 sequence: cmp dst, #INT64_MIN  -> ne: done (ordinary in-range
+#   truncation result).  fcmp fsrc,fsrc -> ne: NaN -> dst = 0.
+#   (ordered) fcmp fsrc, fscratch(-2^63) -> gt: dst = INT64_MAX
+#   (positive out of range).  else (v <= -2^63, including the in-range
+#   exact -2^63 whose indefinite result is its correct value) -> keep
+#   INT64_MIN.
+# x64 sequence: cmp rax, #INT64_MIN -> ne: done.  ucomisd xmm0,xmm0 ->
+#   b (CF set = unordered): NaN -> 0.  movq r11, xmm0; test r11,r11 ->
+#   ns (sign clear): v >= 2^63 -> rax = INT64_MAX.  else (sign set) ->
+#   keep INT64_MIN.
+# ———————————————————————————————————————————————————————————————
+def emit_ftoi_saturate_a64(inout ctx: CodegenCtx, dst: A64, fsrc: A64V, fscratch: A64V, is_single: Bool) -> Unit
+  let lbl_done = next_codegen_label(ctx, ".Lftoi_done.")
+  let lbl_nan = next_codegen_label(ctx, ".Lftoi_nan.")
+  let lbl_pos = next_codegen_label(ctx, ".Lftoi_pos.")
+  # The conversion result sits in dst; fsrc still holds the source value.
+  a64_mov_ri(&mut ctx.text, A64::X15, -9223372036854775808 as i64)
+  a64_cmp_rr(&mut ctx.text, dst, A64::X15)
+  a64_bcond(&mut ctx.text, a64_cc_ne(), lbl_done.clone())
+  # dst == INT64_MIN: NaN | >= 2^63 | < -2^63 | the in-range exact -2^63.
+  # The ordered self-compare is unordered iff the source is a NaN.
+  if is_single then
+    a64_fcmp_ss(&mut ctx.text, fsrc, fsrc)
+  else
+    a64_fcmp_dd(&mut ctx.text, fsrc, fsrc)
+  end
+  a64_bcond(&mut ctx.text, a64_cc_ne(), lbl_nan.clone())
+  # Ordered: clamp to the signed range by the source's side of -2^63.
+  if is_single then
+    a64_mov_ri(&mut ctx.text, A64::X15, 0xC3E00000 as i64)
+    a64_fmov_sw(&mut ctx.text, fscratch, A64::X15)
+    a64_fcmp_ss(&mut ctx.text, fsrc, fscratch)
+  else
+    a64_mov_ri(&mut ctx.text, A64::X15, 0xC3E0000000000000 as i64)
+    a64_fmov_dx(&mut ctx.text, fscratch, A64::X15)
+    a64_fcmp_dd(&mut ctx.text, fsrc, fscratch)
+  end
+  a64_bcond(&mut ctx.text, a64_cc_gt(), lbl_pos.clone())
+  a64_b(&mut ctx.text, lbl_done.clone())
+  # v > -2^63 with the indefinite result means v >= 2^63 (or +inf).
+  def_label(&mut ctx.text, lbl_pos)
+  a64_mov_ri(&mut ctx.text, dst, 9223372036854775807 as i64)
+  a64_b(&mut ctx.text, lbl_done.clone())
+  # NaN -> 0.
+  def_label(&mut ctx.text, lbl_nan)
+  a64_mov_rr(&mut ctx.text, dst, A64::XZR)
+  def_label(&mut ctx.text, lbl_done)
+end
+
+# The x86-64 twin (see the block above).
+def emit_ftoi_saturate_x64(inout ctx: CodegenCtx, dst: X64) -> Unit
+  let lbl_done = next_codegen_label(ctx, ".Lftoi_done.")
+  let lbl_nan = next_codegen_label(ctx, ".Lftoi_nan.")
+  let lbl_pos = next_codegen_label(ctx, ".Lftoi_pos.")
+  x64_mov_ri(&mut ctx.text, X64::R11, -9223372036854775808 as i64)
+  x64_cmp_rr(&mut ctx.text, dst, X64::R11)
+  x64_jcc(&mut ctx.text, CC::NE, lbl_done.clone())
+  # ucomisd xmm0, xmm0: unordered (NaN) sets CF (and ZF, PF).
+  x64_ucomisd(&mut ctx.text, 0, 0)
+  x64_jcc(&mut ctx.text, CC::B, lbl_nan.clone())
+  # Ordered: copy the source bits back out of XMM0 and test the sign bit.
+  emit_raw_bytes(ctx, 0x66, 0x49, 0x0F, 0x7E, 0xC3)  # movq r11, xmm0
+  x64_test_rr(&mut ctx.text, X64::R11, X64::R11)
+  x64_jcc(&mut ctx.text, CC::NS, lbl_pos.clone())
+  x64_jmp(&mut ctx.text, lbl_done.clone())
+  # v >= 2^63 (or +inf) -> INT64_MAX.
+  def_label(&mut ctx.text, lbl_pos)
+  x64_mov_ri(&mut ctx.text, dst, 9223372036854775807 as i64)
+  x64_jmp(&mut ctx.text, lbl_done.clone())
+  # NaN -> 0.
+  def_label(&mut ctx.text, lbl_nan)
+  x64_xor_rr(&mut ctx.text, dst, dst)
+  def_label(&mut ctx.text, lbl_done)
+end
+
 # Emit raw 32-bit value (for ARM64 instructions)
 def emit_raw_u32(inout ctx: CodegenCtx, val: u32) -> Unit
   emit32_le(&mut ctx.text, val)
@@ -2473,6 +2574,108 @@ def try_emit_atomic_builtin(inout ctx: CodegenCtx, name: String) -> Bool
       false
     end
   when _ then
+    false
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# The volatile/MMIO load/store intrinsics — the volatile authority
+# ———————————————————————————————————————————————————————————————
+# std::embedded's volatile surface (volatile_read8/16/32/64 and
+# volatile_write8/16/32/64 — the width-exact wrappers over the
+# `_tg_volatile_read<w>` / `_tg_volatile_write<w>` extern declarations,
+# §2 of std/embedded.tg) reaches codegen as ORDINARY OPAQUE extern
+# calls. That shape is the optimizer contract: a volatile MIR call has
+# unknown side effects, so no pass can elide, merge, fold, hoist or
+# sink it (see the pass-by-pass audit in mir.tg), while the ordinary
+# code around it keeps optimizing. At EMISSION the call is inlined to
+# the target's width-exact memory instruction — the same LDR/STR
+# family the runtime's emit_volatile_runtime helpers execute (aarch64:
+# ldrb/ldrh/ldr(w)/ldr + strb/strh/str(w)/str; x86-64: movzx/mov +
+# mov) — so the caller's machine text carries one real load/store per
+# volatile operation, with no call overhead and no dependency on the
+# runtime symbol. This mirrors the atomic family's name-routed inline
+# emission (try_emit_atomic_builtin above).
+#
+# ABI: the shared argument loop has already loaded the args into the
+# argument registers — x0/rdi = addr (the width-exact access address),
+# x1/rsi = the store value for the write forms. A read produces its
+# result in the return register (x0/rax) and the shared post-call
+# tail (store_place of the call destination) delivers it to the call's
+# destination place exactly like an extern return; the width-exact
+# loads zero-extend into the return register, so no
+# normalize_extern_return pass is needed for the unsigned volatile
+# widths. A write produces nothing (Unit destination).
+#
+# Returns true when the name is one of the volatile intrinsics and the
+# inline access was emitted; false otherwise (the ordinary extern path
+# stays the fallback — e.g. the LIR route's runtime-function calls).
+
+# Parse a volatile intrinsic name into (kind, width-bytes): kind 0 =
+# not a volatile intrinsic, 1 = _tg_volatile_read<w>, 2 =
+# _tg_volatile_write<w>.
+def volatile_intrinsic_shape(name: String) -> (Int, Int)
+  if !name.starts_with("_tg_volatile_") then
+    return (0, 0)
+  end
+  var rest = name.slice(13, name.len())
+  var kind = 0
+  var width_digits = "".to_string()
+  if rest.starts_with("read") then
+    kind = 1
+    width_digits = rest.slice(4, rest.len())
+  elsif rest.starts_with("write") then
+    kind = 2
+    width_digits = rest.slice(5, rest.len())
+  else
+    return (0, 0)
+  end
+  let width = match width_digits
+  when "8" then 1
+  when "16" then 2
+  when "32" then 4
+  when "64" then 8
+  when _ then 0
+  end
+  if width == 0 then
+    return (0, 0)
+  end
+  (kind, width)
+end
+
+def try_emit_volatile_builtin(inout ctx: CodegenCtx, name: String) -> Bool
+  let (kind, width) = volatile_intrinsic_shape(name)
+  if kind == 0 then
+    return false
+  end
+  let mw = match width
+  when 1 then MemWidth::W8
+  when 2 then MemWidth::W16
+  when 4 then MemWidth::W32
+  when 8 then MemWidth::W64
+  when _ then MemWidth::W64
+  end
+  let arch = ctx.target.arch
+  match arg_reg(arch, 0)
+  when Option::Some(addr_r) then
+    if kind == 2 then
+      match arg_reg(arch, 1)
+      when Option::Some(val_r) then
+        # Volatile store: [addr] = value at the access width (strb/strh/
+        # str w/str, mov [rdi], sil/... — the runtime write bodies).
+        emit_store_mem_sized(ctx, addr_r, 0, val_r, mw)
+        return true
+      when Option::None then ()
+      end
+      false
+    else
+      # Volatile load: result in the return register (ldrb/ldrh/ldr w/ldr
+      # zero-extended, movzx/mov — the runtime read bodies); the shared
+      # post-call tail stores it to the call destination.
+      emit_load_mem_sized(ctx, ret_reg(arch), addr_r, 0, mw, Extension::Zero)
+      return true
+    end
+  when Option::None then
     false
   end
 end
@@ -5568,6 +5771,9 @@ def codegen_rvalue(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, stmt: MirSta
         when Arch::X86_64 then
         emit_raw_bytes(ctx, 0x66, 0x48, 0x0F, 0x6E, 0xC0)  # movq xmm0, rax
         emit_raw_bytes(ctx, 0xF2, 0x48, 0x0F, 0x2C, 0xC0)  # cvttsd2si rax, xmm0
+        # §25 SATURATING float -> int (NaN -> 0; >= 2^63 -> INT64_MAX;
+        # < -2^63 -> INT64_MIN; else truncation — see types.tg).
+        emit_ftoi_saturate_x64(ctx, X64::RAX)
         when Arch::AArch64 then
         let gpr = match dst
         when PhysReg::A64Reg(r) then r
@@ -5577,6 +5783,9 @@ def codegen_rvalue(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, stmt: MirSta
         a64_fmov_dx(&mut ctx.text, A64V::V0, gpr)
         # FCVTZS Xdst, D0  — convert FP to int
         emit_raw_u32(ctx, 0x9E780000 as u32 | (0 << 5) | a64_code(gpr))
+        # §25 SATURATING float -> int (NaN -> 0; >= 2^63 -> INT64_MAX;
+        # < -2^63 -> INT64_MIN; else truncation — see types.tg).
+        emit_ftoi_saturate_a64(ctx, gpr, A64V::V0, A64V::V1, false)
         end
       when CastKind::IntToInt then
       # Narrowing integer casts need an explicit mask; widening is a register no-op here.
@@ -6881,6 +7090,9 @@ def codegen_statement(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, block: Mi
         when Arch::X86_64 then
           emit_raw_bytes(ctx, 0x66, 0x48, 0x0F, 0x6E, 0xC0)
           emit_raw_bytes(ctx, 0xF2, 0x48, 0x0F, 0x2C, 0xC0)
+          # §25 SATURATING float -> int (NaN -> 0; >= 2^63 -> INT64_MAX;
+          # < -2^63 -> INT64_MIN; else truncation — see types.tg).
+          emit_ftoi_saturate_x64(ctx, X64::RAX)
         when Arch::AArch64 then
           let gpr = match rr
           when PhysReg::A64Reg(r) then r
@@ -6888,6 +7100,9 @@ def codegen_statement(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, block: Mi
           end
           a64_fmov_dx(&mut ctx.text, A64V::V0, gpr)
           emit_raw_u32(ctx, 0x9E780000 as u32 | (0 << 5) | a64_code(gpr))
+          # §25 SATURATING float -> int (NaN -> 0; >= 2^63 -> INT64_MAX;
+          # < -2^63 -> INT64_MIN; else truncation — see types.tg).
+          emit_ftoi_saturate_a64(ctx, gpr, A64V::V0, A64V::V1, false)
         end
       when CastKind::IntToInt then
         let target_bits = layout_of_strict(&mut ctx.layout_engine, target_ty).size * 8
@@ -7769,12 +7984,21 @@ def codegen_call(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, dest: Place, c
         !has_real_body &&
         resolved_fn_name.len() >= 7 &&
         resolved_fn_name.slice(resolved_fn_name.len() - 7, resolved_fn_name.len()) == "__clone"
-      # The atomic builtins (try_emit_atomic_builtin) emit first; a
+      # The atomic builtins (try_emit_atomic_builtin) emit first; the
+      # volatile/MMIO builtins (try_emit_volatile_builtin — the
+      # _tg_volatile_read*/_write* extern calls) emit next; a
       # CLASSIFIED intrinsic name then inlines through the semantic
       # router's decision; everything else resolves against the compiled
       # namespace (extern/reachable/fn_alias) through the single authority
       # resolve_callee_label.
       if try_emit_atomic_builtin(ctx, &resolved_fn_name) then
+        ()
+      else if try_emit_volatile_builtin(ctx, &resolved_fn_name) then
+        # The volatile/MMIO access was inlined above: the width-exact
+        # load/store is already in the instruction stream (a read's
+        # result sits in the return register and the shared post-call
+        # tail below stores it to the destination; a write's Unit
+        # destination stores nothing).
         ()
       else
         match intr_opt
@@ -10178,6 +10402,9 @@ def codegen_rvalue(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, stmt: MirSta
         when Arch::X86_64 then
         emit_raw_bytes(ctx, 0x66, 0x48, 0x0F, 0x6E, 0xC0)  # movq xmm0, rax
         emit_raw_bytes(ctx, 0xF2, 0x48, 0x0F, 0x2C, 0xC0)  # cvttsd2si rax, xmm0
+        # §25 SATURATING float -> int (NaN -> 0; >= 2^63 -> INT64_MAX;
+        # < -2^63 -> INT64_MIN; else truncation — see types.tg).
+        emit_ftoi_saturate_x64(ctx, X64::RAX)
         when Arch::AArch64 then
         let gpr = match dst
         when PhysReg::A64Reg(r) then r
@@ -10187,6 +10414,9 @@ def codegen_rvalue(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, stmt: MirSta
         a64_fmov_dx(&mut ctx.text, A64V::V0, gpr)
         # FCVTZS Xdst, D0  — convert FP to int
         emit_raw_u32(ctx, 0x9E780000 as u32 | (0 << 5) | a64_code(gpr))
+        # §25 SATURATING float -> int (NaN -> 0; >= 2^63 -> INT64_MAX;
+        # < -2^63 -> INT64_MIN; else truncation — see types.tg).
+        emit_ftoi_saturate_a64(ctx, gpr, A64V::V0, A64V::V1, false)
         end
       when CastKind::IntToInt then
       # Narrowing integer casts need an explicit mask; widening is a register no-op here.
@@ -11491,6 +11721,9 @@ def codegen_statement(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, block: Mi
         when Arch::X86_64 then
           emit_raw_bytes(ctx, 0x66, 0x48, 0x0F, 0x6E, 0xC0)
           emit_raw_bytes(ctx, 0xF2, 0x48, 0x0F, 0x2C, 0xC0)
+          # §25 SATURATING float -> int (NaN -> 0; >= 2^63 -> INT64_MAX;
+          # < -2^63 -> INT64_MIN; else truncation — see types.tg).
+          emit_ftoi_saturate_x64(ctx, X64::RAX)
         when Arch::AArch64 then
           let gpr = match rr
           when PhysReg::A64Reg(r) then r
@@ -11498,6 +11731,9 @@ def codegen_statement(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, block: Mi
           end
           a64_fmov_dx(&mut ctx.text, A64V::V0, gpr)
           emit_raw_u32(ctx, 0x9E780000 as u32 | (0 << 5) | a64_code(gpr))
+          # §25 SATURATING float -> int (NaN -> 0; >= 2^63 -> INT64_MAX;
+          # < -2^63 -> INT64_MIN; else truncation — see types.tg).
+          emit_ftoi_saturate_a64(ctx, gpr, A64V::V0, A64V::V1, false)
         end
       when CastKind::IntToInt then
         let target_bits = layout_of_strict(&mut ctx.layout_engine, target_ty).size * 8
@@ -12379,12 +12615,21 @@ def codegen_call(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, dest: Place, c
         !has_real_body &&
         resolved_fn_name.len() >= 7 &&
         resolved_fn_name.slice(resolved_fn_name.len() - 7, resolved_fn_name.len()) == "__clone"
-      # The atomic builtins (try_emit_atomic_builtin) emit first; a
+      # The atomic builtins (try_emit_atomic_builtin) emit first; the
+      # volatile/MMIO builtins (try_emit_volatile_builtin — the
+      # _tg_volatile_read*/_write* extern calls) emit next; a
       # CLASSIFIED intrinsic name then inlines through the semantic
       # router's decision; everything else resolves against the compiled
       # namespace (extern/reachable/fn_alias) through the single authority
       # resolve_callee_label.
       if try_emit_atomic_builtin(ctx, &resolved_fn_name) then
+        ()
+      else if try_emit_volatile_builtin(ctx, &resolved_fn_name) then
+        # The volatile/MMIO access was inlined above: the width-exact
+        # load/store is already in the instruction stream (a read's
+        # result sits in the return register and the shared post-call
+        # tail below stores it to the destination; a write's Unit
+        # destination stores nothing).
         ()
       else
         match intr_opt
@@ -14945,6 +15190,70 @@ def emit_stack_probe(inout ctx: CodegenCtx, sp: PhysReg, frame_size: Int) -> Uni
   end
 end
 
+# ———————————————————————————————————————————————————————————————
+# §25 strict-FP environment detection: does the emitted function
+# perform floating-point math? The prologue establishes the strict
+# environment (RNE, no flush-to-zero) exactly for these functions, so
+# language results never depend on ambient FPCR/MXCSR state (host
+# process rounding/flush mutations, FFI calls that wrote the control
+# registers, ...). The test is conservative-complete for every
+# instruction that touches the FP register file:
+#   - a float-typed local/parameter (every float expression result and
+#     every float place read flows through one — float binops, float
+#     compares, float materializations);
+#   - an int<->float MirCast rvalue (a conversion of a constant, e.g.
+#     `2.5 as Int` / `5 as Float`, has no float-typed local).
+# A function that merely moves float BIT patterns in general registers
+# (transmutes, float call arguments crossing the ABI as words) emits no
+# FP instruction and needs no establishment.
+# ———————————————————————————————————————————————————————————————
+def mir_type_is_fp(ty: Type) -> Bool
+  match ty
+  when Type::Float then true
+  when Type::F32 then true
+  when Type::F64 then true
+  when _ then false
+  end  end
+end
+
+def mir_cast_is_float_cast(kind: CastKind) -> Bool
+  match kind
+  when CastKind::IntToFloat then true
+  when CastKind::FloatToInt then true
+  when CastKind::FloatToFloat then true
+  when _ then false
+  end  end
+end
+
+def mir_func_uses_fp(func: MirFunction) -> Bool
+  for local in func.locals do
+    if mir_type_is_fp(&local.ty) then
+      return true
+    end
+  end
+  for param in func.params do
+    if mir_type_is_fp(&param.ty) then
+      return true
+    end
+  end
+  for block in func.blocks do
+    for st in block.statements do
+      match st.kind
+      when MirStatementKind::MirAssign(_, rvalue) then
+        match rvalue.kind
+        when MirRvalueKind::MirCast(cast_kind, _, _) then
+          if mir_cast_is_float_cast(cast_kind) then
+            return true
+          end
+        when _ then ()
+        end
+      when _ then ()
+      end
+    end
+  end
+  false
+end
+
 # Bind one parameter from its ABI argument register into its assigned home
 # (register, stack slot, or spill slot). Used by the prologue for Scalar
 # params and ScalarPair/ByAddress by-reference aggregates (the caller
@@ -15047,6 +15356,40 @@ def codegen_prologue(inout ctx: CodegenCtx, fctx: FnCodegenCtx) -> Unit
       when _ then ()
       end
       si = si + 1
+    end
+  end
+
+  # §25 strict-FP environment establishment: a function whose body
+  # performs float math establishes the language's FP environment at
+  # entry, so strict results (RNE rounding, subnormals preserved — the
+  # canonical spec in types.tg above the Type enum) never depend on the
+  # AMBIENT FPCR/MXCSR state the process inherited or an FFI region
+  # left behind. AArch64: msr fpcr, xzr zeroes the control register
+  # (RMode = 00 round-to-nearest-even, FZ/FZ16 cleared, no exception
+  # trap enables). x86-64: ldmxcsr from a pushed 0x1F80 (RNE, FTZ and
+  # DAZ cleared, every exception masked) — the push/add form never
+  # writes below rsp without adjusting it, so an async signal between
+  # the store and the load cannot clobber the immediate. Neither
+  # instruction touches the exception flags (FPSR/MXCSR status bits)
+  # or sets NZCV.
+  if mir_func_uses_fp(fctx.func) then
+    match arch
+    when Arch::AArch64 then
+      emit32_le(&mut ctx.text, 0xD51B47E0 as u32)  # msr fpcr, xzr
+    when Arch::X86_64 then
+      emit8(&mut ctx.text, 0x68)  # push imm32 0x1F80
+      emit8(&mut ctx.text, 0x80)
+      emit8(&mut ctx.text, 0x1F)
+      emit8(&mut ctx.text, 0x00)
+      emit8(&mut ctx.text, 0x00)
+      emit8(&mut ctx.text, 0x0F)  # ldmxcsr [rsp]
+      emit8(&mut ctx.text, 0xAE)
+      emit8(&mut ctx.text, 0x14)
+      emit8(&mut ctx.text, 0x24)
+      emit8(&mut ctx.text, 0x48)  # add rsp, 4
+      emit8(&mut ctx.text, 0x83)
+      emit8(&mut ctx.text, 0xC4)
+      emit8(&mut ctx.text, 0x04)
     end
   end
 

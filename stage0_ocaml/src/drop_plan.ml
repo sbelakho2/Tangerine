@@ -1,53 +1,92 @@
-(* drop_plan.ml — Canonical concrete drop plans (audit P1-26).
+(* drop_plan.ml — Canonical concrete drop plans (audit P1-26 / P0-2).
 
    The self-hosted model is ConcreteTypeId -> DropPlanId with every
    destruction site referencing the plan.  The seed builds ONE canonical
    drop-plan table for the CONCRETE types (the program's type-definition
-   table, post-mono): per TypeId the plan is the ordered list of
-   (field/payload path, needs_drop) entries derived structurally ONCE
-   from the def — never re-derived recursively per value at a drop site.
+   table, post-mono): per TypeId the plan is a TREE of drop actions
+   derived structurally ONCE from the def — never re-derived recursively
+   per value at a drop site:
 
-   Plan shape: a struct's plan lists each field (declaration order) as
-   a component { variant = None; index = fd_index; ty; needs_drop }; an
-   enum's plan lists every variant's payload components as { variant =
-   Some tag; index = payload position; ... } — the runtime tag selects
-   the live variant at destruction time (the seed's Enum value carries
-   the declaration-order tag = vd_index).  Tuple/fixed-array values
-   have no TypeId in the table: the drop sites fall back to the
-   structural value glue for them (and for every type whose plan is not
-   materialized), exactly the sanctioned fallback.
+     type plan_node =
+       | NoDrop                                   (* nothing to drop *)
+       | DropLeaf                                 (* the whole value drops
+                                                     under its own type's
+                                                     plan / structural glue *)
+       | Fields of field_plan array               (* a tuple/struct value:
+                                                     per-position actions *)
+       | EnumVariants of variant_plan array       (* an enum value: the
+                                                     runtime tag selects
+                                                     the live variant *)
+       | Repeat of { count : int; element : plan_node }   (* a fixed-array
+                                                     value: the ELEMENT plan
+                                                     repeats `count` times *)
+
+   A struct's plan is a Fields node with one field_plan per field
+   (declaration order, fp_index = fd_index); an enum's plan is an
+   EnumVariants node with one variant_plan per variant (vp_tag = the
+   declaration-order runtime tag, payload positions in payload order);
+   a tuple/fixed-array type has no TypeId in the table — the drop sites
+   fall back to the structural value glue for them (and for every type
+   whose plan is not materialized), exactly the sanctioned fallback.
+
+   FIXED ARRAYS ARE CONSTANT-SIZE PLANS (audit P0-2): an owning fixed
+   array [T; n] inside a def becomes Repeat { count = n; element = ... }
+   — a [String; 1_000_000] field is ONE Repeat node, never a materialized
+   one-million-element list.  There is NO size cutoff in the plan: the
+   plan of any array — however large — is built in constant time and
+   space.  Only the VERIFIER's lattice-key expansion (owning_paths,
+   below) keeps its documented bound: the destroyed lattice only needs
+   exact per-index keys for drop emissions that can actually reach them
+   (today none reach arrays beyond the bound); the plan itself never
+   gives up.
 
    needs_drop per component comes from the ONE type-property engine
-   (Type_properties, P1-25) over the same def table — the drop plan and
-   the copyability answers can never disagree.  A needs_drop component
-   is a component whose type is not trivially copyable (String, an
-   owning nominal, an aggregate carrying one, ...); the verifier's drop
-   accounting consults the plan's owning paths when a whole-root drop
-   destroys a local, so the destroyed lattice records exactly the
-   components the type-level plan names.
+   (Type_properties, P1-25 / P0-2) over the same def table — the drop
+   plan and the copyability answers can never disagree.  The engine's
+   nominal resolver overlays the table's Lang_items record (lang_items.ml)
+   on the def-table lookup: an owning LangItem (Vec/Map/Set/Box/Rc/Arc/
+   ...) answers its DIRECT properties { copy = false; drop = true }
+   (never its field-less def shape), a raw pointer (Ptr/PtrMut) answers
+   { copy = true; drop = false }.  A needs_drop component is a component
+   whose type is not trivially copyable (String, an owning nominal, an
+   aggregate carrying one, ...); the verifier's drop accounting consults
+   the plan's owning paths when a whole-root drop destroys a local, so
+   the destroyed lattice records exactly the components the type-level
+   plan names.
 
    Ordering invariant: component order is declaration order (struct
-   fields by fd_index, enum variants by vd_index with payload
-   components in payload order) — the same order the recursive value
-   glue traverses, so a plan-driven drop frees in exactly the order the
+   fields by fd_index, enum variants by vd_index with payload components
+   in payload order) — the same order the recursive value glue
+   traverses, so a plan-driven drop frees in exactly the order the
    structural glue would. *)
 
-type component = {
-  variant : int option;      (* Some tag for an enum payload component;
-                                None for a struct field / tuple element *)
-  index : int;               (* fd_index / payload position / tuple index *)
-  ty : Type_repr.t;          (* the component's concrete type *)
-  needs_drop : bool;         (* the type engine's property of ty *)
+type plan_node =
+  | NoDrop
+  | DropLeaf
+  | Fields of field_plan array
+  | EnumVariants of variant_plan array
+  | Repeat of { count : int; element : plan_node }
+
+and field_plan = {
+  fp_index : int;           (* fd_index / payload position / tuple position *)
+  fp_ty : Type_repr.t;      (* the component's concrete type *)
+  fp_node : plan_node;      (* the component's drop action *)
+}
+
+and variant_plan = {
+  vp_tag : int;             (* declaration-order runtime tag (vd_index) *)
+  vp_fields : field_plan array;  (* payload positions, payload order *)
 }
 
 type plan = {
   type_id : Ids.Type_id.t;
-  components : component list;   (* declaration order *)
+  node : plan_node;
 }
 
 type table = {
   by_id : (Ids.Type_id.t, plan) Hashtbl.t;
   types : Seed_mir.type_def array; (* the def table the plans are derived from *)
+  lang_items : Lang_items.t;       (* the compilation's LangItems record *)
 }
 
 (* ── Plan construction (per program, once) ─────────────────────────
@@ -62,101 +101,117 @@ let find_def (tbl : table) (tid : Ids.Type_id.t) : Seed_mir.type_def option =
     tbl.types;
   !found
 
-let engine_resolve (tbl : table) (tid : Ids.Type_id.t) : Type_repr.t option =
-  match find_def tbl tid with
-  | Some d -> Some (Seed_mir.def_repr d)
-  | None -> (
-      (* the builtin runtime nominals' canonical def shapes — the same
-         fallback the pipeline's authoritative copy answers use
-         (mir_verify.is_copy): the handle nominals Vec/Map/Set (0/1/2)
-         and Ptr/PtrMut (5/6) never materialize (their runtime semantics
-         are keyed on the original ids), so their properties are their
-         canonical runtime shapes: the pointer-represented containers
-         and the address handles are Copy; the owning LangItems that DO
-         materialize (Option/Result/Box instances) always carry defs and
-         resolve above. *)
-      match Ids.Type_id.to_int tid with
-      | 0 | 1 | 2 -> Some (Type_repr.Tuple [||])
-      | 5 | 6 -> Some (Type_repr.Tuple [| Type_repr.Int Type_repr.UInt |])
-      | _ -> None)
+(* The engine's nominal resolver for THIS table: the LangItems overlay
+   (direct owning-handle / raw-pointer answers) over the def-table
+   resolver (a def resolves to its def_repr shape) — no numeric
+   builtin-id knowledge, no fake tuple shapes. *)
+let engine_resolve (tbl : table) : Type_properties.def_resolver =
+  Type_properties.with_lang_items (Some tbl.lang_items)
+    (Type_properties.structural_resolver (fun tid ->
+       Option.map Seed_mir.def_repr (find_def tbl tid)))
 
 let needs_drop_of (tbl : table) (cache : Type_properties.cache) (ty : Type_repr.t) : bool =
-  let p =
-    Type_properties.of_type_cached cache (Some (engine_resolve tbl)) ty
-  in
+  let p = Type_properties.of_type_cached cache (Some (engine_resolve tbl)) ty in
   p.Type_properties.needs_drop
 
-let components_of_def (tbl : table) (cache : Type_properties.cache)
-    (tid : Ids.Type_id.t) (d : Seed_mir.type_def) : plan =
+(* The drop node of one component TYPE: NoDrop when the type needs no
+   drop; a fixed array is a constant-size Repeat; a tuple is a Fields
+   node over its positions; every other owning type is a DropLeaf whose
+   own recursion runs under its type's plan/glue at the drop site. *)
+let rec node_of_type (tbl : table) (cache : Type_properties.cache) (ty : Type_repr.t) :
+    plan_node =
+  if not (needs_drop_of tbl cache ty) then NoDrop
+  else
+    match ty with
+    | Type_repr.Fixed_array (elem, n) ->
+        (* constant-size regardless of n — [Owned; 1_000_000] is ONE
+           Repeat (1_000_000, DropLeaf) node *)
+        Repeat { count = n; element = node_of_type tbl cache elem }
+    | Type_repr.Tuple elems ->
+        Fields
+          (Array.mapi
+             (fun i t ->
+               { fp_index = i; fp_ty = t; fp_node = node_of_type tbl cache t })
+             elems)
+    | _ -> DropLeaf
+
+let plan_of_def (tbl : table) (cache : Type_properties.cache) (tid : Ids.Type_id.t)
+    (d : Seed_mir.type_def) : plan =
   match d with
   | Seed_mir.StructDef { sd_fields; _ } ->
       let fields =
-        List.sort (fun a b -> Ids.Field_index.compare a.Seed_mir.fd_index b.Seed_mir.fd_index)
+        List.sort
+          (fun a b -> Ids.Field_index.compare a.Seed_mir.fd_index b.Seed_mir.fd_index)
           sd_fields
       in
-      let components =
-        List.map
-          (fun f ->
-            {
-              variant = None;
-              index = Ids.Field_index.to_int f.Seed_mir.fd_index;
-              ty = f.Seed_mir.fd_ty;
-              needs_drop = needs_drop_of tbl cache f.Seed_mir.fd_ty;
-            })
-          fields
-      in
-      { type_id = tid; components }
+      {
+        type_id = tid;
+        node =
+          Fields
+            (Array.of_list
+               (List.map
+                  (fun f ->
+                    let fty = f.Seed_mir.fd_ty in
+                    {
+                      fp_index = Ids.Field_index.to_int f.Seed_mir.fd_index;
+                      fp_ty = fty;
+                      fp_node = node_of_type tbl cache fty;
+                    })
+                  fields));
+      }
   | Seed_mir.EnumDef { ed_variants; _ } ->
       let variants =
         List.sort
           (fun a b -> Ids.Variant_index.compare a.Seed_mir.vd_index b.Seed_mir.vd_index)
           ed_variants
       in
-      let components =
-        List.concat_map
-          (fun v ->
-            let tag = Ids.Variant_index.to_int v.Seed_mir.vd_index in
-            match v.Seed_mir.vd_payload with
-            | Type_repr.Unit -> []
-            | Type_repr.Tuple payloads ->
-                Array.to_list
-                  (Array.mapi
-                     (fun j ty ->
-                       {
-                         variant = Some tag;
-                         index = j;
-                         ty;
-                         needs_drop = needs_drop_of tbl cache ty;
-                       })
-                     payloads)
-            | other ->
-                (* a single-component payload spelling (defensive: the
-                   materialized defs always wrap payloads in a Tuple) *)
-                [
-                  {
-                    variant = Some tag;
-                    index = 0;
-                    ty = other;
-                    needs_drop = needs_drop_of tbl cache other;
-                  };
-                ])
-          variants
-      in
-      { type_id = tid; components }
+      {
+        type_id = tid;
+        node =
+          EnumVariants
+            (Array.of_list
+               (List.map
+                  (fun v ->
+                    let tag = Ids.Variant_index.to_int v.Seed_mir.vd_index in
+                    let fields =
+                      match v.Seed_mir.vd_payload with
+                      | Type_repr.Unit -> [||]
+                      | Type_repr.Tuple payloads ->
+                          Array.mapi
+                            (fun j ty ->
+                              {
+                                fp_index = j;
+                                fp_ty = ty;
+                                fp_node = node_of_type tbl cache ty;
+                              })
+                            payloads
+                      | other ->
+                          (* a single-component payload spelling
+                             (defensive: the materialized defs always
+                             wrap payloads in a Tuple) *)
+                          [|
+                            {
+                              fp_index = 0;
+                              fp_ty = other;
+                              fp_node = node_of_type tbl cache other;
+                            };
+                          |]
+                    in
+                    { vp_tag = tag; vp_fields = fields })
+                  variants));
+      }
 
-let of_program (prog : Seed_mir.program) : table =
+let of_program ?(lang_items : Lang_items.t = Lang_items.seed_defaults)
+    (prog : Seed_mir.program) : table =
   let tbl =
-    {
-      by_id = Hashtbl.create 256;
-      types = prog.Seed_mir.types;
-    }
+    { by_id = Hashtbl.create 256; types = prog.Seed_mir.types; lang_items }
   in
   let cache = Type_properties.create_cache () in
   Array.iter
     (fun d ->
       let tid = Seed_mir.def_id d in
       if not (Hashtbl.mem tbl.by_id tid) then
-        Hashtbl.replace tbl.by_id tid (components_of_def tbl cache tid d))
+        Hashtbl.replace tbl.by_id tid (plan_of_def tbl cache tid d))
     prog.Seed_mir.types;
   tbl
 
@@ -185,35 +240,41 @@ let plan_of_type (tbl : table) (ty : Type_repr.t) : plan option =
    destroyed-lattice consult of a whole-root drop records owning
    sub-paths too (a later drop of any of them is a duplicate drop, the
    VM's do_drop traps on any second drop of the same root local).
-   Fixed arrays contribute per-index keys up to a bound (the lattice
-   only needs exact index keys; huge arrays stay approximate — no drop
-   emission reaches them today). *)
+
+   The walk mirrors the plan_node structure: a def plan's Fields node
+   contributes each owning field's segment then descends the field's
+   own node; an EnumVariants node contributes every owning payload
+   position of every variant (the runtime tag is invisible to the
+   lattice); a Repeat node contributes per-index keys up to
+   lattice_array_key_bound — the plan itself is CONSTANT-SIZE for any
+   count (audit P0-2), while the lattice only needs exact index keys
+   for drop emissions that reach them (huge arrays stay approximate —
+   no drop emission reaches them today). *)
+let lattice_array_key_bound = 1024
+
 let owning_paths (tbl : table) (ty : Type_repr.t) : string list =
   let cache = Type_properties.create_cache () in
   let acc = ref [] in
-  let seg_of (ty : Type_repr.t) (c : component) : string =
-    match c.variant with
-    | Some _ -> string_of_int c.index
-    | None -> (
-        match ty with
-        | Type_repr.Named (tid, _) -> (
-            match find_def tbl tid with
-            | Some (Seed_mir.StructDef { sd_fields; _ }) -> (
-                match
-                  List.find_opt
-                    (fun f ->
-                      Ids.Field_index.to_int f.Seed_mir.fd_index = c.index)
-                    sd_fields
-                with
-                | Some f -> Printf.sprintf "field#%d" (Ids.Field_id.to_int f.Seed_mir.fd_id)
-                | None -> string_of_int c.index)
-            | _ -> string_of_int c.index)
-        | _ -> string_of_int c.index)
-  in
   let add (prefix : string list) (seg : string) : unit =
     acc := String.concat "." (List.rev (seg :: prefix)) :: !acc
   in
-  let rec go (seen_tids : Ids.Type_id.t list) (prefix : string list) (ty : Type_repr.t) : unit =
+  let struct_field_seg (parent_ty : Type_repr.t) (index : int) : string =
+    match parent_ty with
+    | Type_repr.Named (tid, _) -> (
+        match find_def tbl tid with
+        | Some (Seed_mir.StructDef { sd_fields; _ }) -> (
+            match
+              List.find_opt
+                (fun f -> Ids.Field_index.to_int f.Seed_mir.fd_index = index)
+                sd_fields
+            with
+            | Some f -> Printf.sprintf "field#%d" (Ids.Field_id.to_int f.Seed_mir.fd_id)
+            | None -> string_of_int index)
+        | _ -> string_of_int index)
+    | _ -> string_of_int index
+  in
+  let rec walk_type (seen_tids : Ids.Type_id.t list) (prefix : string list)
+      (ty : Type_repr.t) : unit =
     match plan_of_type tbl ty with
     | Some plan ->
         if List.exists (fun t -> Ids.Type_id.compare t plan.type_id = 0) seen_tids then ()
@@ -222,16 +283,7 @@ let owning_paths (tbl : table) (ty : Type_repr.t) : string list =
              guard keeps the flattening total if one ever materializes *)
         else
           let seen_tids' = plan.type_id :: seen_tids in
-          List.iter
-            (fun (c : component) ->
-              if c.needs_drop then begin
-                let seg = seg_of ty c in
-                add prefix seg;
-                (* descend through the owning component: its own plan's
-                   owning components die with it *)
-                go seen_tids' (seg :: prefix) c.ty
-              end)
-            plan.components
+          walk_node seen_tids' prefix ty plan.node
     | None -> (
         match ty with
         | Type_repr.Tuple elems ->
@@ -239,15 +291,49 @@ let owning_paths (tbl : table) (ty : Type_repr.t) : string list =
               (fun j e ->
                 if needs_drop_of tbl cache e then begin
                   add prefix (string_of_int j);
-                  go seen_tids (string_of_int j :: prefix) e
+                  walk_type seen_tids (string_of_int j :: prefix) e
                 end)
               elems
         | Type_repr.Fixed_array (elem, n) ->
-            if n <= 1024 && needs_drop_of tbl cache elem then
+            if n <= lattice_array_key_bound && needs_drop_of tbl cache elem then
               for i = 0 to n - 1 do
                 add prefix (string_of_int i)
               done
         | _ -> ())
+  and walk_node (seen_tids : Ids.Type_id.t list) (prefix : string list)
+      (parent_ty : Type_repr.t) (node : plan_node) : unit =
+    match node with
+    | NoDrop -> ()
+    | DropLeaf ->
+        (* the component drops under its own type's plan/glue: descend
+           through the type (its def plan / structural fallback) *)
+        walk_type seen_tids prefix parent_ty
+    | Fields fps ->
+        Array.iter
+          (fun (fp : field_plan) ->
+            if fp.fp_node <> NoDrop then begin
+              let seg = struct_field_seg parent_ty fp.fp_index in
+              add prefix seg;
+              walk_node seen_tids (seg :: prefix) fp.fp_ty fp.fp_node
+            end)
+          fps
+    | Repeat { count; element } ->
+        if element <> NoDrop && count <= lattice_array_key_bound then
+          for i = 0 to count - 1 do
+            add prefix (string_of_int i)
+          done
+    | EnumVariants vps ->
+        Array.iter
+          (fun (vp : variant_plan) ->
+            Array.iter
+              (fun (fp : field_plan) ->
+                if fp.fp_node <> NoDrop then begin
+                  let seg = string_of_int fp.fp_index in
+                  add prefix seg;
+                  walk_node seen_tids (seg :: prefix) fp.fp_ty fp.fp_node
+                end)
+              vp.vp_fields)
+          vps
   in
-  go [] [] ty;
+  walk_type [] [] ty;
   List.sort_uniq String.compare !acc

@@ -1936,6 +1936,50 @@ map_insert(&mut map, "key", 1)
 let val = map_get(&map, "key")  # Option[Int] — Copy-gated accessor
 ```
 
+## Integer Arithmetic Semantics (P1-5 / §24)
+
+The semantics of the ordinary integer operators are a language rule —
+they never change with the optimization level (`-O0`..`-O3`) or with the
+compiling/target machine. The typed→MIR lowering (mir.tg) is the single
+authority that implements the rule, so every backend agrees.
+
+- Signed `+` `-` `*` on `Int`, `i8`, `i16`, `i32`, `i64` (and the
+  `isize` kinds) are **checked/trapping by default**: when the
+  two's-complement result does not fit the type's width, execution
+  traps at the operation (the same trap mechanism as bounds checks —
+  an assertion terminator; native codegen emits a UDF/UD2-style trap,
+  wasm emits `unreachable`). The optimizer may prove a particular
+  check unnecessary, but it may never change the rule into silent
+  wrap-around.
+- Unsigned arithmetic (`UInt`, `u8`..`u64`, `usize`) is defined to
+  **wrap modulo 2^W** and never traps.
+- The **explicit families** live in `std/core.tg` on `Int`/`UInt`:
+  `wrapping_add/sub/mul` (two's-complement wrap), `checked_add/sub/mul`
+  (returns `Option` — `None` on overflow), `saturating_add/sub/mul`
+  (clamps to the type bounds). These spell the semantics out so no
+  program ever depends on the default by accident.
+- **Shift counts** (`<<` `>>`) are defined as `count & (W-1)` where W
+  is the bit width of the shifted value: `1 << 64` on a 64-bit integer
+  equals `1 << 0` (i.e. 1), a count of 70 equals a count of 6, and a
+  negative count is taken in two's complement (`-1` equals `W-1`).
+  Counts below W behave exactly as before; every target (x86, AArch64,
+  wasm) and every optimization level computes the same result.
+- **Unary negation** (`-x`) is raw two's-complement: negating the
+  minimum value yields the minimum value (wrap), never a trap.
+- **Narrowing conversions** (`as` to a narrower integer type) truncate
+  to the destination width by the canonical mask rule: the result is
+  the source value modulo 2^W of the destination, in two's complement
+  (`300 as u8` is 44; `-1 as u8` is 255). Widening casts of a negative
+  signed value to a wider unsigned type reinterpret the bit pattern
+  (`-1 as u64` is 2^64-1).
+- The signed **division/remainder** edges (division by zero and
+  `MIN / -1`) are not yet unified by a lowering guard: on the x86 and
+  wasm targets the machine traps on both edges, while the AArch64
+  `sdiv` instruction defines them (zero → 0, MIN/-1 → MIN). Audit §24
+  records this as the one remaining cross-target gap in the ordinary
+  arithmetic surface; programs that need a guaranteed trap must guard
+  the edge themselves until the guard lands.
+
 ## Compiler Invocation
 
 ```bash
@@ -2092,8 +2136,10 @@ stack top), the **startup** (the `_reset_handler` contract — the `.bss`
 zeroing + the `.data` copy + the user `main` call), the **interrupt
 vector table** (every `@interrupt` function, in declaration order; an ISR
 takes no parameters — the signature gate), the **volatile/MMIO**
-load/store intrinsics (the runtime's `_tg_volatile_read*` /
-`_tg_volatile_write*` arms), the **atomicity availability** (64), the
+load/store intrinsics (the width-exact `_tg_volatile_read*` /
+`_tg_volatile_write*` arms — inlined by codegen.tg's
+`try_emit_volatile_builtin` to the target's LDR/STR instruction), the
+**atomicity availability** (64), the
 allocator-free core-only surface, and the **bare-metal binary** (the
 reset-vector entry, structurally verified). `std::embedded` provides the
 `Register` / `ReadOnly` / `WriteOnly` MMIO abstraction, the `@interrupt`

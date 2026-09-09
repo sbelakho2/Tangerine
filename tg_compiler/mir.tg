@@ -26,7 +26,13 @@ use tg_compiler::types::{
   FunctionCleanupTable, ScopeId, function_cleanup_table_new,
   TypedBudget, TypedBudgetConstraint,
   budget_metric_resource, budget_metric_enforced, budget_bound_value,
-  budget_time_limit_ns, typed_budget_limit, intrinsic_allocates
+  budget_time_limit_ns, typed_budget_limit, intrinsic_allocates,
+  TypeError, EffectSummary, EffectClass, EffectAnnotation, EffectClassClaim,
+  fn_effect_def_key, intrinsic_id_of_call,
+  effect_summary_merge, effect_summary_unknown, effect_summary_of_intrinsic,
+  effect_summary_of_extern_name, effect_summary_has_class,
+  effect_class_word, effect_class_phrase, effect_class_slot_index,
+  effect_class_forbidden_classes, effect_class_claim_spelling
 }
 use tg_compiler::ids::{
   FieldId, VariantId, DefId, DefKind, CallableId, InstanceId, ModuleId,
@@ -202,6 +208,16 @@ struct MirFunction
   # (contraction/reassociation) must be mode-aware per operation, not
   # per function (not implemented — P1-6).
   fp_fast: Bool = false
+  # (audit §11) The function's SEMANTIC CallableId — the resolver DefId
+  # wrapped (the same identity the resource checker's item_callable /
+  # item_method_callable use), stamped at lowering from the builder's
+  # current_callable (the declared_effects/declared_budget write sites'
+  # flow). IR-synthesized functions (drop glue, closures, extern
+  # declarations) lower with Option::None. The effect-class enforcement
+  # pass (check_effect_class_annotations_mir) reads this identity to
+  # resolve the checker's def-keyed @no_alloc/@irq_safe CLAIM records
+  # (TypeEnv.fn_class_claims) for the lowered function.
+  callable: Option[CallableId] = Option::None
   span: Span
 end
 
@@ -2275,6 +2291,9 @@ def mir_type_identity_key(ty: Type) -> String
   when Type::Effect(_, inner) then "Effect[" + mir_type_identity_key(inner) + "]"
   when Type::Var(id) then "Var#" + id.id.to_string()
   when Type::Param(gpid) then "Param(" + generic_param_id_numeric(&gpid).to_string() + ")"
+  when Type::Const(v) then "Const(" + v.to_string() + ")"
+  when Type::ConstParam(gpid) then "ConstParam(" + generic_param_id_numeric(&gpid).to_string() + ")"
+  when Type::FixedArraySym(elem, gpid) then "FixedArraySym[" + mir_type_identity_key(elem) + ";param" + generic_param_id_numeric(&gpid).to_string() + "]"
   when Type::Dyn(id) then "Dyn#" + id.id.to_string()
   when Type::Error then "Error"
   end  end
@@ -2336,9 +2355,15 @@ end
 
 # True when a type contains a generic-parameter reference anywhere (its
 # plan is deferred to the concrete drop glue after substitution).
+# (§20 slice 1): the const-generic forms defer exactly like Param — a
+# ConstParam reference or a FixedArraySym size parameter is generic state;
+# a concrete Const argument is NOT deferred (it is a concrete scalar
+# identity — the plan walkers treat it as a leaf).
 def mir_type_has_deferred(ty: Type) -> Bool
   match ty
   when Type::Param(_) then true
+  when Type::ConstParam(_) then true
+  when Type::FixedArraySym(_, _) then true
   when Type::Var(_) then true
   when Type::Adt(_, args) then
     var ai = 0
@@ -5548,6 +5573,19 @@ def lower_function(inout b: MirBuilder, f: FunctionDecl, emission_name: String) 
   when Option::None then ()
   end
   b.current_fn_budget = fn_sig.declared_budget.clone()
+ # (audit §11) (the MirFunction.callable WRITE SITE): stamp the
+  # SEMANTIC CallableId onto the lowered function — the builder's
+  # current_callable (the SAME identity the resource checker's
+  # item_callable / item_method_callable use, set by the callers before
+  # lower_function and cleared after). The effect-class enforcement pass
+  # resolves the function's def-keyed @no_alloc/@irq_safe claims through
+  # it. IR-synthesized functions lower with current_callable None and
+  # keep the default.
+  match b.current_fn
+  when Option::Some(fn_ref_c) then
+    fn_ref_c.callable = b.current_callable.clone()
+  when Option::None then ()
+  end
  # (the MirFunction attr-hint WRITE SITE): stamp the item's DECLARED
   # @inline / @inline(always) / @noinline / @cold hints (the builder's
   # pending state — recorded from item.attrs at lower_program's PASS 2)
@@ -8351,12 +8389,22 @@ def lower_stmt(inout b: MirBuilder, stmt: Stmt) -> Unit
   end
 end
 
-# (audit P1-1, first pass): lower the SCOPED-ACCESS statement —
-# `with EXPR as let NAME <block> end` (read-only) and
-# `with EXPR as inout NAME <block> end` (read/write). The access
-# materializes as ONE fresh local:
+# (audit P1-1, first pass + audit §12): lower the SCOPED-ACCESS
+# statement — `with EXPR as let NAME <block> end` (read-only) and
+# `with EXPR as inout NAME <block> end` (read/write). TWO materialization
+# shapes exist:
+#   A. (audit §12 — the ScopedPlaceAccess model): an OWNING element type
+#      over a PLACE-LIKE source binds ZERO-COPY as an ADDRESS-CARRYING
+#      ALIAS (ONE RefInternal(T, mut)-typed local holding EXPR's place
+#      address; no entry copy, no write-back, no runtime reference
+#      object, no clone/refcount traffic in the generated LIR — the body
+#      mutates the element in place through the address). See the body of
+#      lower_with_access_stmt for the full contract.
+#   B. (first pass — snapshot forms, unchanged): every other accepted
+#      shape (Copy-typed place/value sources and the Map-entry accessor
+#      calls) materializes as ONE fresh local:
 #   1. EXPR's value is copied into the local on entry (the checker only
-#      accepts Copy-type access values in this pass, so no drop/glue
+#      accepts Copy-type access values for this shape, so no drop/glue
 #      machinery is involved);
 #   2. the body is lowered as a nested lexical block (lower_block — the
 #      resource checker analyzed it under its own block key, so its scope
@@ -8366,8 +8414,9 @@ end
 #      no per-node rewriting: zero extra copies;
 #   3. the `inout` form writes the local back after the body's
 #      fallthrough (the type checker rejects return/break/continue that
-#      escape the inout body, so the fallthrough write-back is the only
-#      exit that needs it). The write-back has TWO shapes:
+#      escape the inout body for snapshot sources, so the fallthrough
+#      write-back is the only exit that needs it). The write-back has TWO
+#      shapes:
 #        - a simple-place EXPR (ident/field/index/deref) stores the local
 #          back into EXPR's place (lower_place materializes its address);
 #        - a MAP-ENTRY ACCESSOR EXPR (`map.get_modify(key)` — the
@@ -8392,6 +8441,36 @@ def lower_with_access_stmt(inout b: MirBuilder, expr: Expr, pat: Pattern, body: 
     bind_name = name.clone()
     is_inout = im
   when _ then ()
+  end
+  # (audit §12): the ScopedPlaceAccess model — an OWNING element type
+  # over a PLACE-LIKE source binds ZERO-COPY as an address-carrying
+  # ALIAS, never as a copied value: ONE local of RefInternal(T,
+  # is_inout) holds the SOURCE PLACE'S ADDRESS (a MirRef) for the whole
+  # block, and every body use of the name resolves to that local — the
+  # same address machinery the inout-parameter lowering uses (reads and
+  # projected stores auto-deref; method receivers and arguments cross as
+  # the address; at call boundaries the codegen deref-copies the pointee
+  # for by-value consumers). There is NO entry snapshot and NO
+  # write-back: the body mutates the element IN PLACE through the
+  # address, so no runtime reference object exists, no clone/refcount
+  # traffic is generated, and the block needs no exit glue — the access
+  # simply ends at the body's exits (an alias local carries no cleanup;
+  # the type checker rejects every whole-value escape, so no drop
+  # machinery ever sees the element). Copy-typed place/value sources and
+  # the Map-entry accessor calls keep the first-pass snapshot +
+  # write-back materialization below.
+  let alias_elt_ty = mir_source_expr_ty(b, &expr)
+  if expr_is_place_like(&expr) then
+    mut alias_vis = Set::new()
+    let alias_plan = deinit_plan_for_type(b, &alias_elt_ty, &mut alias_vis)
+    if !deinit_plan_is_trivial(&alias_plan) then
+      let alias_ref_ty = Type::RefInternal(alias_elt_ty.clone(), is_inout)
+      let alias_lid = add_local(b, bind_name, alias_ref_ty, false, span)
+      record_semantic_pattern_local(b, &pat, alias_lid, "with access binding")
+      push_assign(b, place_local(alias_lid), MirRvalue { kind: MirRvalueKind::MirRef(lower_place(b, &expr)) }, span)
+      lower_block(b, &body)
+      return
+    end
   end
   match lower_expr_to_rvalue(b, &expr, span)
   when Result::Ok(rvalue) then
@@ -9074,6 +9153,18 @@ end
 # The trap message is AssertMessage::Overflow(MirBinOp) — a
 # deterministic, op-specific diagnostic ("integer overflow: signed
 # addition/subtraction/multiplication", see format_assert_message).
+#
+# SHIFTS (audit §24): `<<` and `>>` are NOT in the checked set — they
+# are defined by the sibling §24 count-masking rule instead (a count is
+# b & (W-1), applied at lowering in mir_emit_shift_rvalue below): a
+# shift never traps and never depends on the target's shift-instruction
+# count handling. Unary negation (`-x`, MirUnOp::Neg) is likewise raw
+# two's-complement (negating MIN yields MIN) — no check exists for it
+# in the typed->MIR surface; the narrowing casts (`as i8`-style,
+# CastKind::IntToInt) truncate to the destination width by the
+# canonical mask rule (two's-complement modulo 2^W — see the cast
+# notes in lir.tg/codegen.tg), also check-free. Only `+` `-` `*` carry
+# the MirAssert Overflow trap, and only on the signed kinds.
 # ———————————————————————————————————————————————————————————————
 
 # The signed width of an integer TYPE in the checked set (0 = not in
@@ -9087,6 +9178,29 @@ def mir_signed_arith_width(ty: Type) -> Int
   when Type::I32 then 32
   when Type::I64 then 64
   when Type::ISize then 64
+  when _ then 0
+  end  end
+end
+
+# The bit width of EVERY integer kind the arithmetic rules cover
+# (8/16/32/64; 0 = not an integer kind — Float, Bool, Char, enums,
+# aggregates, i128/u128). The width-64 kinds are the host-word kinds.
+# The §24 shift-count rule (mir_emit_shift_rvalue below) reads the
+# SHIFTED value's width through this helper.
+def mir_int_type_width(ty: Type) -> Int
+  match ty
+  when Type::Int then 64
+  when Type::I8 then 8
+  when Type::I16 then 16
+  when Type::I32 then 32
+  when Type::I64 then 64
+  when Type::ISize then 64
+  when Type::UInt then 64
+  when Type::U8 then 8
+  when Type::U16 then 16
+  when Type::U32 then 32
+  when Type::U64 then 64
+  when Type::USize then 64
   when _ then 0
   end  end
 end
@@ -9281,11 +9395,91 @@ def mir_emit_checked_small_arith(inout b: MirBuilder, mir_op: MirBinOp, width: I
   MirRvalue { kind: MirRvalueKind::MirCast(CastKind::IntToInt, operand_copy_local(res_local), result_ty) }
 end
 
+# ———————————————————————————————————————————————————————————————
+# §24 — the shift-count rule (the P1-5 rule's sibling)
+# ———————————————————————————————————————————————————————————————
+# Language rule (audit §24 — ordinary integer arithmetic semantics must
+# never change with the optimization level or the target): `a << b` and
+# `a >> b` on an integer of width W are defined as `a << (b & (W-1))`
+# and `a >> (b & (W-1))` — the shift count is the two's-complement low
+# bits of the count operand, i.e. b mod 2^W (W is a power of two, so the
+# AND IS the modulo). A count is therefore ALWAYS in 0..W-1 when a
+# shift reaches codegen, on every target and at every optimization
+# level:
+#   - pre-rule, the count's fate was target-raw: x86's shl/shr mask the
+#     count mod 64, AArch64's register shifts define counts >= 64 to
+#     0/sign-fill, wasm masks mod the machine operand width, and the
+#     MIR constant folder computed the count with whatever the HOST
+#     compiler's shift did — the same source could fold and execute to
+#     three different answers (audit §24 found the divergence);
+#   - post-rule, the in-range count makes every backend instruction
+#     agree, and the constant folder can only ever see in-range counts,
+#     so a folded shift is host-independent;
+#   - counts in 0..W-1 — every previously defined program — are
+#     bit-identical to the pre-rule behavior (the mask is the identity
+#     on them). Negative counts are defined (the two's-complement low
+#     bits), never target-raw.
+# The mask is applied HERE at the typed->MIR choke point shared by the
+# source binary operator AND the compound `<<=`/`>>=` forms (both route
+# through mir_emit_arith_binop_rvalue), so synthesized IR (never routed
+# here) is untouched. The rule defines only the COUNT — result
+# narrowing stays the canonical IntToInt mask of the assignment
+# boundary.
+# ———————————————————————————————————————————————————————————————
+
+# An Int constant operand carrying an explicit type (mir constants fold
+# to Type::Int in the optimizer; the lowering-time constants here must
+# keep the typed tree's width so a small-width count operand and its
+# mask stay type-homogeneous through codegen).
+def mir_typed_int_operand(value: Int, ty: Type) -> MirOperand
+  MirOperand {
+    kind: MirOperandKind::MirConstant(MirConstant {
+      kind: MirConstantKind::MirInt(value),
+      ty: ty,
+      instance: Option::None
+    })
+  }
+end
+
+# The typed->MIR shift lowering (see the §24 banner above): constant
+# counts mask at lowering; every other count masks through one BitAnd
+# temp so the shift instruction NEVER sees a count outside 0..W-1.
+def mir_emit_shift_rvalue(inout b: MirBuilder, mir_op: MirBinOp, result_ty: Type, left_op: MirOperand, right_op: MirOperand, span: Span) -> MirRvalue
+  let width = mir_int_type_width(&result_ty)
+  if width == 0 then
+    # Not an integer the rule covers (a Float/Bool shift is a checker
+    # rejection; i128/u128 have no arithmetic lowering) — pass through.
+    MirRvalue { kind: MirRvalueKind::MirBinOp(mir_op, left_op, right_op) }
+  else
+    let mask = width - 1
+    var folded_count: Option[MirOperand] = Option::None
+    match right_op.kind
+    when MirOperandKind::MirConstant(cst) then
+      match cst.kind
+      when MirConstantKind::MirInt(v) then
+        folded_count = Option::Some(mir_typed_int_operand(v & mask, cst.ty.clone()))
+      when _ then ()
+      end
+    when _ then ()
+    end
+    match folded_count
+    when Option::Some(count_op) then
+      MirRvalue { kind: MirRvalueKind::MirBinOp(mir_op, left_op, count_op) }
+    when Option::None then
+      let mask_op = mir_typed_int_operand(mask, result_ty.clone())
+      let count_local = add_temp(b, result_ty, span)
+      push_assign(b, place_local(count_local), MirRvalue { kind: MirRvalueKind::MirBinOp(MirBinOp::BitAnd, right_op, mask_op) }, span)
+      MirRvalue { kind: MirRvalueKind::MirBinOp(mir_op, left_op, operand_copy_local(count_local)) }
+    end
+  end
+end
+
 # The single typed->MIR dispatch for source binary operations: plain
 # MirBinOp rvalue when the operation is outside the signed checked set
 # (comparisons, string concat, unsigned/Float arithmetic, synthesized
 # IR), the checked sequence + MirAssert overflow trap when the RESULT
-# type is a signed integer kind and the op is Add/Sub/Mul. The result
+# type is a signed integer kind and the op is Add/Sub/Mul. Shifts route
+# through mir_emit_shift_rvalue (the §24 count-masking rule). The result
 # type is the typed-tree authority (the checker unified the operands to
 # it), so the operand width is the result width.
 def mir_emit_arith_binop_rvalue(inout b: MirBuilder, mir_op: MirBinOp, result_ty: Type, left_op: MirOperand, right_op: MirOperand, span: Span) -> MirRvalue
@@ -9305,7 +9499,12 @@ def mir_emit_arith_binop_rvalue(inout b: MirBuilder, mir_op: MirBinOp, result_ty
       MirRvalue { kind: MirRvalueKind::MirBinOp(mir_op, left_op, right_op) }
     end
   else
-    MirRvalue { kind: MirRvalueKind::MirBinOp(mir_op, left_op, right_op) }
+    match mir_op
+    when MirBinOp::Shl then mir_emit_shift_rvalue(b, mir_op, &result_ty, &left_op, &right_op, span)
+    when MirBinOp::Shr then mir_emit_shift_rvalue(b, mir_op, &result_ty, &left_op, &right_op, span)
+    when _ then
+      MirRvalue { kind: MirRvalueKind::MirBinOp(mir_op, left_op, right_op) }
+    end
   end
 end
 
@@ -11617,12 +11816,32 @@ def lower_expr_to_rvalue(inout b: MirBuilder, expr: Expr, span: Span) -> Result[
     match expr.kind
     when ExprKind::ExprCast(inner, target_ty) then
       let inner_op = lower_expr(b, &inner, span)
- # the cast's TARGET type is the cast expression's typed-tree
+  # the cast's TARGET type is the cast expression's typed-tree
       # record (the checker's resolved cast result type — the typed table
       # is the authority; TypeExpr is never interpreted after checking).
       let target = mir_source_expr_ty(b, expr)
-      # Use Transmute as the generic cast kind - specific casts would require type inference
-      return Result::Ok(MirRvalue { kind: MirRvalueKind::MirCast(CastKind::Transmute, inner_op, target) })
+      # (§25 cast classification): the numeric int<->float conversions
+      # lower as their NAMED cast kinds (FloatToInt for `Float as Int`,
+      # IntToFloat for `Int as Float`) so every backend implements the ONE
+      # language rule (types.tg: float -> int is SATURATING — NaN -> 0,
+      # >= 2^63 -> INT64_MAX, < -2^63 -> INT64_MIN, else truncation toward
+      # zero; int -> float rounds once under the strict RNE environment).
+      # Everything else keeps the generic Transmute (bit-preserving)
+      # marker exactly as before.
+      let cast_kind = match mir_source_expr_ty(b, &inner)
+      when Type::Float then
+        match target
+        when Type::Int then CastKind::FloatToInt
+        when _ then CastKind::Transmute
+        end
+      when Type::Int then
+        match target
+        when Type::Float then CastKind::IntToFloat
+        when _ then CastKind::Transmute
+        end
+      when _ then CastKind::Transmute
+      end
+      return Result::Ok(MirRvalue { kind: MirRvalueKind::MirCast(cast_kind, inner_op, target) })
     when _ then
       return Result::Err("internal error: expr_kind_name/ExprKind mismatch during MIR lowering")
     end
@@ -19652,7 +19871,17 @@ def global_value_numbering(inout f: MirFunction) -> Unit
         # dedup target for a later one) would erase or duplicate the
         # invalidation. Side-effecting statements are kept in place and
         # are never recorded in the value table.
-        if place.projections.is_empty() && !rvalue_has_side_effect(&rvalue) then
+        # (volatile/observability audit): an rvalue that READS MEMORY
+        # (an operand whose place chain dereferences — *p loads) is also
+        # never CSE'd. This compiler has no alias model: the memory a
+        # deref reads may be changed by ANY intervening store or call —
+        # including the volatile/MMIO load/store intrinsics (the
+        # _tg_volatile_read*/_write* opaque hardware-effect barriers) —
+        # so two textually identical deref loads need not observe the
+        # same value, and merging them (across a block boundary or a
+        # call) is a miscompile. Memory-reading statements stay in place
+        # and are never recorded in the value table.
+        if place.projections.is_empty() && !rvalue_has_side_effect(&rvalue) && !rvalue_reads_memory(&rvalue) then
           # Compute the value number key for this rvalue
           var rv_key = rvalue_to_vn_key(&rvalue, &local_vn)
           if rv_key == "__unique__" then
@@ -20097,21 +20326,63 @@ def is_loop_invariant_rvalue(rv: MirRvalue, loop_defs: Set[Int]) -> Bool
   end  end
 end
 
+# Does the place read through MEMORY (a ProjDeref anywhere in the
+# projection chain)? A deref read observes memory that stores, calls
+# and the volatile/MMIO load/store intrinsics (the width-exact
+# _tg_volatile_read*/_write* accessors) may change inside a loop, so
+# code motion must never treat it as loop-invariant: this compiler has
+# no alias model, so every deref read is conservatively the volatile
+# address. LICM's invariant tests consult this so an ordinary load is
+# never hoisted across a hardware-effect barrier inside the loop.
+def place_reads_memory(place: Place) -> Bool
+  for proj in place.projections do
+    match proj
+    when Projection::ProjDeref then return true
+    when _ then ()
+    end
+  end
+  false
+end
+
+def operand_reads_memory(op: MirOperand) -> Bool
+  match op.kind
+  when MirOperandKind::MirCopy(place) then place_reads_memory(&place)
+  when MirOperandKind::MirMovePlace(place) then place_reads_memory(&place)
+  when MirOperandKind::MirRead(place) then place_reads_memory(&place)
+  when MirOperandKind::MirConsume(place) then place_reads_memory(&place)
+  when _ then false
+  end  end
+end
+
+def rvalue_reads_memory(rv: MirRvalue) -> Bool
+  match rv.kind
+  when MirRvalueKind::MirMove(op) then operand_reads_memory(&op)
+  when MirRvalueKind::MirBinOp(_, lhs, rhs) then
+    operand_reads_memory(&lhs) || operand_reads_memory(&rhs)
+  when MirRvalueKind::MirUnOp(_, op) then operand_reads_memory(&op)
+  when MirRvalueKind::MirCast(_, op, _) then operand_reads_memory(&op)
+  when _ then false
+  end  end
+end
+
 def is_loop_invariant_operand(op: MirOperand, loop_defs: Set[Int]) -> Bool
   match op.kind
   when MirOperandKind::MirConstant(_) then true  # Constants are always invariant
   when MirOperandKind::MirCopy(place) then
     let local_id = place.local.id
-    !loop_defs.contains(&local_id)  # Not defined inside loop
+    # Not defined inside the loop AND not a memory read (a deref read is
+    # never invariant: stores/calls/volatile accesses in the loop may
+    # observe it).
+    !loop_defs.contains(&local_id) && !place_reads_memory(&place)
   when MirOperandKind::MirMovePlace(place) then
     let local_id = place.local.id
-    !loop_defs.contains(&local_id)
+    !loop_defs.contains(&local_id) && !place_reads_memory(&place)
   when MirOperandKind::MirRead(place) then
     let local_id = place.local.id
-    !loop_defs.contains(&local_id)
+    !loop_defs.contains(&local_id) && !place_reads_memory(&place)
   when MirOperandKind::MirConsume(place) then
     let local_id = place.local.id
-    !loop_defs.contains(&local_id)
+    !loop_defs.contains(&local_id) && !place_reads_memory(&place)
   end  end
 end
 
@@ -22916,6 +23187,32 @@ def verifier_check_type_concreteness(plans: Map[String, DeinitPlan], type_index:
       let pname = generic_param_name_from(param_names, &gpid)
       errors.push(what.clone() + ": Type::Param(\"" + pname + "\") reaches concrete MIR (generic parameter leaked into a non-generic function)")
     end
+  when Type::ConstParam(gpid) then
+    # (§20 slice 1): a SYMBOLIC const parameter reference is generic like
+    # Type::Param — legal only inside a generic template's body
+    # (allow_param), an error when it leaks into a concrete function.
+    if !allow_param then
+      let pname = generic_param_name_from(param_names, &gpid)
+      errors.push(what.clone() + ": Type::ConstParam(\"" + pname + "\") reaches concrete MIR (const generic parameter leaked into a non-generic function)")
+    end
+  when Type::FixedArraySym(elem, gpid) then
+    # (§20 slice 1): a symbolic-size fixed array is generic like its
+    # element-bearing siblings — legal in a generic template's body
+    # (allow_param; monomorphization substitutes the size parameter to a
+    # concrete count before any concrete instance forms — the
+    # substitute_type FixedArraySym arm), an error when the residual
+    # symbolic form reaches a concrete function.
+    if !allow_param then
+      let pname = generic_param_name_from(param_names, &gpid)
+      errors.push(what.clone() + ": Type::FixedArraySym (size parameter \"" + pname + "\") reaches concrete MIR (const generic size leaked into a non-generic function)")
+    end
+    verifier_check_type_concreteness(plans, type_index, param_names, what, &elem, allow_param, errors)
+  when Type::Const(_) then
+    # (§20 slice 1): a const generic ARGUMENT (an integer constant in an
+    # Adt argument list) is a concrete scalar identity — no walk needed. A
+    # Const that ever reached a VALUE type position is caught by the layout
+    # engine's Invalid guard before codegen.
+    ()
   when Type::Error then
     errors.push(what.clone() + ": Type::Error reaches MIR (an error type must never lower — the compilation already rejected it)")
   when Type::Adt(tid, args) then
@@ -25080,6 +25377,8 @@ end
 def verifier_type_has_param(ty: Type) -> Bool
   match ty
   when Type::Param(_) then true
+  when Type::ConstParam(_) then true
+  when Type::FixedArraySym(_, _) then true
   when Type::Adt(_, args) then
     var ai = 0
     while ai < args.len() do
@@ -25115,4 +25414,668 @@ def verifier_type_has_param(ty: Type) -> Bool
     false
   when _ then false
   end  end
+end
+# ———————————————————————————————————————————————————————————————
+# (audit §11) Effect-class annotation enforcement over MIR — the
+# transitive SEMANTIC summaries (replaces the source-syntax scan)
+# ———————————————————————————————————————————————————————————————
+# The @no_alloc / @no_block / @no_io / @irq_safe / @interrupt claims
+# (the def-keyed claim records the checker registered in TypeEnv —
+# fn_class_claims / fn_class_names) are verified HERE, against the
+# lowered program's transitive semantic summaries:
+#
+#   1. DIRECT SUMMARY — every function's own operations carry the
+#      canonical effect record of what they DO (types.tg's
+#      EffectSummary): the STAMPED intrinsic calls (MirCall.intrinsic —
+#      classified through effect_summary_of_intrinsic), the
+#      compiler-SYNTHESIZED calls (the string_from_static literal
+#      materialization at owned-String demand sites, the concat/to-string
+#      forms — classified by the semantic intrinsic-name router
+#      intrinsic_id_of_call, the same router codegen uses for unstamped
+#      calls), the bodyless extern calls (effect_summary_of_extern_name —
+#      the _tg_* / libc_* / pthread_* seed records), the implicit
+#      destruction terminators (MirDeinit — resolved to the drop-glue /
+#      finalizer emission names so user Drop/deinit bodies classify), the
+#      MirAbort/MirAssert/MirContractCheck panic-class operations, and
+#      the fail-closed sites (an indirect call through a closure or
+#      function-pointer VALUE, an unknown extern name, an
+#      algebraic-effects perform — effect_summary_unknown: every may_*
+#      flag).
+#
+#   2. TRANSITIVE FIXED POINT — each function's final summary is the
+#      union of its direct summary and its callees' final summaries
+#      (the callees with BODIES in this compilation, reached through the
+#      MIR emission names), iterated over the reachable closure of the
+#      claimed functions to a fixed point.
+#
+#   3. ENFORCEMENT — one E0232 per violated forbidden class, at the
+#      claim's attribute span (the diagnostic echoes the as-written
+#      attribute form and the annotated function — under @interrupt the
+#      HANDLER), with the first-wins evidence phrase of the site that
+#      dirtied the class. Indirect/unknown calls FAIL CLOSED (they put
+#      every may_* flag into the summary). The pass is inert on the
+#      permissive (editor) path and when no function carries claims.
+#
+# The compiler-generated lowering sites the source syntax never shows
+# are MIR calls like any other, so the old source-scan blind spots are
+# closed: a string literal demanded as an owned String (a by-value
+# String return/parameter/assignment) lowers to the string_from_static
+# intrinsic call and allocates; a `+` concat lowers to the str_concat
+# intrinsic; a value destruction lowers to the drop-glue/finalizer
+# MirDeinit chain. Residual documented boundary: a destruction whose
+# drop glue is NOT part of this compilation (a deferred generic drop
+# awaiting monomorphization) classifies as unknown — fail closed.
+struct MirEffectRoot
+  name: String          # the function's MIR emission name
+  display: String       # the source display name (diagnostics)
+  claims: Vec[EffectClassClaim]
+end
+
+struct MirEffectState
+  # emission name -> the function's DIRECT summary (its own operations)
+  direct: Map[String, EffectSummary] = Map::new()
+  # emission name -> first-wins evidence per class slot
+  # ([0]=Alloc [1]=Block [2]=Io — effect_class_slot_index)
+  direct_evidence: Map[String, Vec[String]] = Map::new()
+  # emission name -> the in-program callees with bodies (emission names)
+  edges: Map[String, Vec[String]] = Map::new()
+end
+
+# One call site's classification: the DIRECT effect record of the call
+# itself (clean when the callee has a body in this compilation — its
+# summary flows through the transitive edge instead), the callee edge
+# ("" = none), and the per-class evidence phrases of the site (3 slots;
+# "" = the class was not dirtied AT THE SITE).
+struct MirEffectCallClass
+  summary: EffectSummary
+  callee: String
+  evidence: Vec[String]
+end
+
+# The evidence vector shape (3 empty class slots).
+def mir_effect_ev_empty() -> Vec[String]
+  Vec::from(["".to_string(), "".to_string(), "".to_string()])
+end
+
+# The three class slots' evidence set (first wins) for one function's
+# direct scan.
+def mir_effect_ev_set(inout state: MirEffectState, fn_name: String, c: EffectClass, text: String) -> Unit
+  var evs = Vec::new()
+  match state.direct_evidence.get(fn_name.clone())
+  when Option::Some(cur) then evs = cur.clone()
+  when Option::None then ()
+  end
+  while evs.len() < 3 do
+    evs.push("".to_string())
+  end
+  let slot = effect_class_slot_index(c)
+  if evs[slot].len() == 0 then
+    evs[slot] = text
+    state.direct_evidence.insert(fn_name.clone(), evs)
+  end
+end
+
+# Record one callee edge (deduped).
+def mir_effect_add_edge(inout state: MirEffectState, caller: String, callee: String) -> Unit
+  if caller == "" || callee == "" then return end
+  var cur = Vec::new()
+  match state.edges.get(caller.clone())
+  when Option::Some(existing) then cur = existing.clone()
+  when Option::None then ()
+  end
+  var present = false
+  for c in cur do
+    if c == callee then present = true end
+  end
+  if !present then
+    cur.push(callee)
+    state.edges.insert(caller.clone(), cur)
+  end
+end
+
+# Whether two summaries agree on every may_* flag (the fixed point's
+# convergence test; the capability sets only ever grow monotonically and
+# no claim consults them, so flag equality bounds the iteration).
+def mir_effect_summary_same(a: EffectSummary, b: EffectSummary) -> Bool
+  if a.may_allocate != b.may_allocate then return false end
+  if a.may_block != b.may_block then return false end
+  if a.may_io != b.may_io then return false end
+  if a.may_spawn != b.may_spawn then return false end
+  if a.may_sleep != b.may_sleep then return false end
+  if a.may_panic != b.may_panic then return false end
+  if a.may_unsafe != b.may_unsafe then return false end
+  true
+end
+
+# Fold one call site's classification into the function's running direct
+# summary (the merged summary is returned) and its evidence.
+def mir_effect_fold_call(inout state: MirEffectState, summary: EffectSummary, fn_name: String, cc: MirEffectCallClass) -> EffectSummary
+  var out = effect_summary_merge(&summary, &cc.summary)
+  if cc.callee.len() > 0 then
+    mir_effect_add_edge(state, fn_name.clone(), cc.callee.clone())
+  end
+  if cc.evidence.len() >= 3 then
+    if cc.evidence[0].len() > 0 then
+      mir_effect_ev_set(state, fn_name.clone(), EffectClass::Alloc, cc.evidence[0].clone())
+    end
+    if cc.evidence[1].len() > 0 then
+      mir_effect_ev_set(state, fn_name.clone(), EffectClass::Block, cc.evidence[1].clone())
+    end
+    if cc.evidence[2].len() > 0 then
+      mir_effect_ev_set(state, fn_name.clone(), EffectClass::Io, cc.evidence[2].clone())
+    end
+  end
+  out
+end
+
+# The evidence phrases of a directly-dirty call (an intrinsic record /
+# extern seed whose summary violates classes) — the per-class phrase
+# echoes the site's lead text.
+def mir_effect_dirty_evidence(summary: EffectSummary, lead: String) -> Vec[String]
+  var ev = mir_effect_ev_empty()
+  if effect_summary_has_class(&summary, &EffectClass::Alloc) then
+    ev[0] = lead.clone() + "allocate"
+  end
+  if effect_summary_has_class(&summary, &EffectClass::Block) then
+    ev[1] = lead.clone() + "block"
+  end
+  if effect_summary_has_class(&summary, &EffectClass::Io) then
+    ev[2] = lead.clone() + "perform I/O"
+  end
+  ev
+end
+
+# The FAIL-CLOSED evidence phrases of an unknown call, per class (the
+# lead text names the site; each phrase continues with the class word).
+def mir_effect_unknown_evidence(lead: String) -> Vec[String]
+  var ev = mir_effect_ev_empty()
+  ev[0] = lead.clone() + "allocation behavior cannot be proven"
+  ev[1] = lead.clone() + "blocking behavior cannot be proven"
+  ev[2] = lead.clone() + "I/O behavior cannot be proven"
+  ev
+end
+
+# The base type of a call argument value (the operand's type; a place
+# operand reads its base local's declared type).
+def mir_effect_arg_value_type(f: MirFunction, arg: MirCallArg) -> Type
+  match arg.value
+  when MirCallValue::Value(op) then
+    match op.kind
+    when MirOperandKind::MirConstant(c) then c.ty.clone()
+    when MirOperandKind::MirCopy(p) then mir_effect_place_type(f, &p)
+    when MirOperandKind::MirMovePlace(p) then mir_effect_place_type(f, &p)
+    when MirOperandKind::MirRead(p) then mir_effect_place_type(f, &p)
+    when MirOperandKind::MirConsume(p) then mir_effect_place_type(f, &p)
+    end
+  when MirCallValue::Place(p) then mir_effect_place_type(f, &p)
+  end
+end
+
+def mir_effect_place_type(f: MirFunction, p: Place) -> Type
+  if p.local.id >= 0 && p.local.id < f.locals.len() then
+    f.locals[p.local.id].ty.clone()
+  else
+    Type::Unit
+  end
+end
+
+# Strip one reference layer (the intrinsic router's receiver facts see
+# the referenced value's type).
+def mir_effect_strip_ref(ty: Type) -> Type
+  match ty
+  when Type::RefInternal(inner, _) then inner.clone()
+  when _ then ty.clone()
+  end
+end
+
+def mir_effect_type_is_string_like(ty: Type) -> Bool
+  let t = mir_effect_strip_ref(ty)
+  match t
+  when Type::String then true
+  when Type::StaticStrPtr then true
+  when _ then false
+  end
+end
+
+# Whether an operand holds the string form a `+` concat recognizes (a
+# String object / static raw string operand, possibly through a place).
+def mir_effect_operand_is_string(f: MirFunction, op: MirOperand) -> Bool
+  match op.kind
+  when MirOperandKind::MirConstant(c) then mir_effect_type_is_string_like(&c.ty)
+  when MirOperandKind::MirCopy(p) then mir_effect_type_is_string_like(&mir_effect_place_type(f, &p))
+  when MirOperandKind::MirMovePlace(p) then mir_effect_type_is_string_like(&mir_effect_place_type(f, &p))
+  when MirOperandKind::MirRead(p) then mir_effect_type_is_string_like(&mir_effect_place_type(f, &p))
+  when MirOperandKind::MirConsume(p) then mir_effect_type_is_string_like(&mir_effect_place_type(f, &p))
+  end
+end
+
+# The last path segment of a registered type name
+# ("std::collections::Vec" -> "Vec" — the intrinsic router's
+# receiver_named vocabulary).
+def mir_effect_bare_type_name(name: String) -> String
+  var i = name.len()
+  while i >= 2 do
+    if name.slice(i - 2, i) == "::" then
+      return name.slice(i, name.len())
+    end
+    i = i - 1
+  end
+  name.clone()
+end
+
+# The bare registered name of a Type::Adt ("" for non-Adt types).
+def mir_effect_adt_name(type_index: Map[Int, String], ty: Type) -> String
+  match ty
+  when Type::Adt(tid, _) then
+    match type_index.get(tid.id)
+    when Option::Some(n) then mir_effect_bare_type_name(&n)
+    when Option::None then ""
+    end
+  when _ then ""
+  end
+end
+
+# The type-directed router facts of a call's receiver/needle arguments.
+def mir_effect_router_facts(f: MirFunction, type_index: Map[Int, String], args: Vec[MirCallArg]) -> (Type, String, Type, String, Bool, Bool)
+  var recv_ty = Type::Unit
+  var recv_named = "".to_string()
+  var needle_ty = Type::Unit
+  var needle_named = "".to_string()
+  var recv_is_string = false
+  var needle_is_string = false
+  if args.len() > 0 then
+    recv_ty = mir_effect_strip_ref(mir_effect_arg_value_type(f, &args[0]))
+    recv_named = mir_effect_adt_name(&type_index, &recv_ty)
+    recv_is_string = mir_effect_type_is_string_like(&recv_ty)
+  end
+  if args.len() > 1 then
+    needle_ty = mir_effect_strip_ref(mir_effect_arg_value_type(f, &args[1]))
+    needle_named = mir_effect_adt_name(&type_index, &needle_ty)
+    needle_is_string = mir_effect_type_is_string_like(&needle_ty)
+  end
+  (recv_ty, recv_named, needle_ty, needle_named, recv_is_string, needle_is_string)
+end
+
+# Classify a BODYLESS callee (an extern declared in the program without
+# a body, or a MirFnItem name that names no function at all — the
+# synthesized intrinsic lowering sites): the semantic intrinsic-name
+# router first (intrinsic_id_of_call — the SAME router codegen uses for
+# the unstamped calls), then the extern-name seed records, then unknown
+# (fail closed).
+def mir_effect_classify_bodyless(mir: MirProgram, f: MirFunction, type_index: Map[Int, String], name: String, args: Vec[MirCallArg]) -> MirEffectCallClass
+  let facts = mir_effect_router_facts(f, &type_index, &args)
+  let ev = mir_effect_ev_empty()
+  match intrinsic_id_of_call(&name, &facts.0, &facts.1, &facts.2, &facts.3, "", facts.4, facts.5)
+  when Option::Some(iid) then
+    let summary = effect_summary_of_intrinsic(iid)
+    if !effect_summary_has_class(&summary, &EffectClass::Alloc) && !effect_summary_has_class(&summary, &EffectClass::Block) && !effect_summary_has_class(&summary, &EffectClass::Io) then
+      return MirEffectCallClass { summary: summary, callee: "", evidence: ev }
+    end
+    let evidence = mir_effect_dirty_evidence(&summary, "calls the intrinsic `" + name.clone() + "` — it may ")
+    return MirEffectCallClass { summary: summary, callee: "", evidence: evidence }
+  when Option::None then ()
+  end
+  match effect_summary_of_extern_name(&name)
+  when Option::Some(summary) then
+    if !effect_summary_has_class(&summary, &EffectClass::Alloc) && !effect_summary_has_class(&summary, &EffectClass::Block) && !effect_summary_has_class(&summary, &EffectClass::Io) then
+      return MirEffectCallClass { summary: summary, callee: "", evidence: ev }
+    end
+    let evidence = mir_effect_dirty_evidence(&summary, "calls `" + name.clone() + "` — a seeded extern that may ")
+    return MirEffectCallClass { summary: summary, callee: "", evidence: evidence }
+  when Option::None then ()
+  end
+  # Unknown bodyless callee — fail closed (every may_* flag).
+  let evidence = mir_effect_unknown_evidence("calls `" + name.clone() + "` — a function whose ")
+  MirEffectCallClass {
+    summary: effect_summary_unknown(),
+    callee: "",
+    evidence: evidence
+  }
+end
+
+# Classify one MirCall terminator (the function's direct operation
+# records and the transitive callee edge).
+def mir_effect_classify_call(mir: MirProgram, f: MirFunction, type_index: Map[Int, String], fn_index: Map[String, Int], func: MirOperand, args: Vec[MirCallArg], intrinsic: Option[IntrinsicId]) -> MirEffectCallClass
+  let ev = mir_effect_ev_empty()
+  match intrinsic
+  when Option::Some(iid) then
+    let summary = effect_summary_of_intrinsic(iid)
+    if effect_summary_has_class(&summary, &EffectClass::Alloc) || effect_summary_has_class(&summary, &EffectClass::Block) || effect_summary_has_class(&summary, &EffectClass::Io) then
+      let evidence = mir_effect_dirty_evidence(&summary, "the intrinsic operation may ")
+      return MirEffectCallClass { summary: summary, callee: "", evidence: evidence }
+    end
+    return MirEffectCallClass { summary: summary, callee: "", evidence: ev }
+  when Option::None then ()
+  end
+  match func.kind
+  when MirOperandKind::MirConstant(c) then
+    match c.kind
+    when MirConstantKind::MirFnItem(callee_name) then
+      match fn_index.get(callee_name.clone())
+      when Option::Some(idx) then
+        if idx >= 0 && idx < mir.functions.len() && mir.functions[idx].blocks.len() > 0 then
+          # A body in this compilation — the transitive edge carries the
+          # callee's summary.
+          return MirEffectCallClass { summary: EffectSummary {}, callee: callee_name.clone(), evidence: ev }
+        end
+        return mir_effect_classify_bodyless(mir, f, &type_index, callee_name.clone(), args)
+      when Option::None then
+        return mir_effect_classify_bodyless(mir, f, &type_index, callee_name.clone(), args)
+      end
+    when _ then ()
+    end
+  when _ then ()
+  end
+  # An indirect call through a closure or function-pointer VALUE — the
+  # callee's body is unknowable at the site; fail closed.
+  let evidence = mir_effect_unknown_evidence("a call through a closure or function-pointer value (the callee's ")
+  MirEffectCallClass {
+    summary: effect_summary_unknown(),
+    callee: "",
+    evidence: evidence
+  }
+end
+
+# Classify one MirDeinit terminator — the IMPLICIT destruction call:
+# resolve the payload instance to the drop-glue / finalizer emission
+# name (MirProgram.drop_glue_fns / method_names_by_def — the
+# def_id_numeric keyed tables); an in-program body callee becomes the
+# transitive edge (the user Drop/deinit body classifies); an instance
+# whose glue is not part of this compilation (a deferred generic drop)
+# fails closed.
+def mir_effect_classify_deinit(mir: MirProgram, fn_index: Map[String, Int], deinit_fn: InstanceId) -> MirEffectCallClass
+  let ev = mir_effect_ev_empty()
+  let num = def_id_numeric(&deinit_fn.def.def)
+  var name = "".to_string()
+  match mir.drop_glue_fns.get(num)
+  when Option::Some(n) then name = n.clone()
+  when Option::None then ()
+  end
+  if name.len() == 0 then
+    match mir.method_names_by_def.get(num)
+    when Option::Some(n2) then name = n2.clone()
+    when Option::None then ()
+    end
+  end
+  if name.len() > 0 then
+    match fn_index.get(name.clone())
+    when Option::Some(idx) then
+      if idx >= 0 && idx < mir.functions.len() && mir.functions[idx].blocks.len() > 0 then
+        return MirEffectCallClass { summary: EffectSummary {}, callee: name, evidence: ev }
+      end
+    when Option::None then ()
+    end
+  end
+  let evidence = mir_effect_unknown_evidence("an implicit value destruction whose drop glue is not part of this compilation (its ")
+  MirEffectCallClass {
+    summary: effect_summary_unknown(),
+    callee: "",
+    evidence: evidence
+  }
+end
+
+# The DIRECT summary of one function: every statement/terminator
+# operation record plus the in-program callee edges.
+def mir_effect_scan_function(mir: MirProgram, inout state: MirEffectState, type_index: Map[Int, String], fn_index: Map[String, Int], f: MirFunction) -> Unit
+  var summary = EffectSummary {}
+  for block in f.blocks do
+    for st in block.statements do
+      match st.kind
+      when MirStatementKind::MirAssign(dest, rvalue) then
+        match rvalue.kind
+        when MirRvalueKind::MirBinOp(MirBinOp::Add, lhs, rhs) then
+          # The `+` STRING CONCATENATION: the compiler keeps it as a
+          # MirBinOp::Add over String-typed operands and codegen lowers it
+          # to the _tg_str_concat runtime concat + the OWNED heap String
+          # wrap (the audit-§11 blind spot — the source scan saw a plain
+          # `+` expression). A concat is recognizable by its string-typed
+          # destination or operands (an integer/float Add carries none).
+          let dest_str = mir_effect_type_is_string_like(&mir_effect_place_type(f, &dest))
+          let lhs_str = mir_effect_operand_is_string(f, &lhs)
+          let rhs_str = mir_effect_operand_is_string(f, &rhs)
+          if dest_str || lhs_str || rhs_str then
+            let concat_sum = EffectSummary { may_allocate: true }
+            summary = effect_summary_merge(&summary, &concat_sum)
+            mir_effect_ev_set(state, f.name.clone(), EffectClass::Alloc, "the `+` String concatenation (the _tg_str_concat owned heap String wrap)")
+          end
+        when _ then ()
+        end
+      when MirStatementKind::MirEffectPerform(_, _, _, _, _) then
+        # An algebraic-effects perform: the handler that runs it is not
+        # statically bounded here — fail closed.
+        let unk = effect_summary_unknown()
+        summary = effect_summary_merge(&summary, &unk)
+        let cc_ev = mir_effect_unknown_evidence("an algebraic-effects perform whose handler's ")
+        summary = mir_effect_fold_call(state, summary, f.name.clone(), MirEffectCallClass {
+          summary: EffectSummary {},
+          callee: "",
+          evidence: cc_ev
+        })
+      when MirStatementKind::MirContractCheck(_, _) then
+        # A contract violation aborts the program (the panic class).
+        let panic_sum = EffectSummary { may_panic: true }
+        summary = effect_summary_merge(&summary, &panic_sum)
+      when _ then ()
+      end
+    end
+    match block.terminator.kind
+    when MirTerminatorKind::MirCall { dest, func, args, success, unwind, intrinsic } then
+      let cc = mir_effect_classify_call(mir, f, &type_index, &fn_index, &func, &args, intrinsic)
+      summary = mir_effect_fold_call(state, summary, f.name.clone(), cc)
+    when MirTerminatorKind::MirDeinit { place, deinit_fn, target, unwind } then
+      let cc2 = mir_effect_classify_deinit(mir, &fn_index, &deinit_fn)
+      summary = mir_effect_fold_call(state, summary, f.name.clone(), cc2)
+    when MirTerminatorKind::MirAssert { cond, expected, msg, target, unwind } then
+      let panic_sum2 = EffectSummary { may_panic: true }
+      summary = effect_summary_merge(&summary, &panic_sum2)
+    when MirTerminatorKind::MirAbort then
+      let panic_sum3 = EffectSummary { may_panic: true }
+      summary = effect_summary_merge(&summary, &panic_sum3)
+    when _ then ()
+    end
+  end
+  state.direct.insert(f.name.clone(), summary)
+end
+
+# The public enforcement pass — run by the front-end phases AFTER MIR
+# lowering (audit §11). Returns the E0232 TypeError records of every
+# violated claim (the callers convert and emit them like typecheck
+# diagnostics).
+pub def check_effect_class_annotations_mir(mir: MirProgram, env: TypeEnv) -> Vec[TypeError]
+  var errors = Vec::new()
+  # The permissive (editor) path records no claims — inert there.
+  match env.resolutions
+  when Option::Some(_) then ()
+  when Option::None then return errors
+  end
+  if env.fn_class_claims.len() == 0 then return errors end
+
+  # The function index (emission name -> index) and the registered type
+  # name index (the intrinsic router's receiver_named facts).
+  var fn_index: Map[String, Int] = Map::new()
+  var fi = 0
+  while fi < mir.functions.len() do
+    let fname = mir.functions[fi].name.clone()
+    if !fn_index.contains_key(&fname) then
+      fn_index.insert(fname, fi)
+    end
+    fi = fi + 1
+  end
+  var type_index: Map[Int, String] = Map::new()
+  for td in mir.types do
+    type_index.insert(td.id.id, td.name.clone())
+  end
+
+  # The claimed roots — every lowered function whose SEMANTIC CallableId
+  # (stamped at lowering) resolves a checker claim record.
+  var roots = Vec::new()
+  for f in mir.functions do
+    match f.callable
+    when Option::Some(cid) then
+      let dkey = fn_effect_def_key(env, &cid.def)
+      match env.fn_class_claims.get(&dkey)
+      when Option::Some(claims) then
+        if claims.len() > 0 then
+          var display = f.name.clone()
+          match env.fn_class_names.get(&dkey)
+          when Option::Some(n) then display = n.clone()
+          when Option::None then ()
+          end
+          roots.push(MirEffectRoot { name: f.name.clone(), display: display, claims: claims.clone() })
+        end
+      when Option::None then ()
+      end
+    when Option::None then ()
+    end
+  end
+  if roots.len() == 0 then return errors end
+
+  # 1. Direct summaries + edges of every lowered function.
+  var state = MirEffectState {}
+  for f in mir.functions do
+    mir_effect_scan_function(&mir, &mut state, &type_index, &fn_index, &f)
+  end
+
+  # 2. The reachable closure of the claimed roots (the fixed point's
+  #    domain).
+  var reachable: Set[String] = Set::new()
+  var todo = Vec::new()
+  for r in roots do
+    if !reachable.contains(&r.name) then
+      reachable.insert(r.name.clone())
+      todo.push(r.name.clone())
+    end
+  end
+  var ti = 0
+  while ti < todo.len() do
+    let cur = todo[ti].clone()
+    match state.edges.get(cur.clone())
+    when Option::Some(callees) then
+      for cname in callees do
+        if !reachable.contains(cname) then
+          reachable.insert(cname.clone())
+          todo.push(cname.clone())
+        end
+      end
+    when Option::None then ()
+    end
+    ti = ti + 1
+  end
+
+  # 3. Seed the final summaries/evidence from the direct records.
+  var final_sum: Map[String, EffectSummary] = Map::new()
+  var final_ev: Map[String, Vec[String]] = Map::new()
+  for n in reachable do
+    var seed_sum = EffectSummary {}
+    match state.direct.get(n.clone())
+    when Option::Some(s) then seed_sum = s.clone()
+    when Option::None then ()
+    end
+    final_sum.insert(n.clone(), seed_sum)
+    var seed_ev = mir_effect_ev_empty()
+    match state.direct_evidence.get(n.clone())
+    when Option::Some(evs) then seed_ev = evs.clone()
+    when Option::None then ()
+    end
+    final_ev.insert(n.clone(), seed_ev)
+  end
+
+  # 4. The transitive fixed point: each caller picks up each reachable
+  #    callee's final summary and the first-wins evidence.
+  var changed = true
+  while changed do
+    changed = false
+    for n in reachable do
+      match state.edges.get(n.clone())
+      when Option::Some(callees) then
+        for cname in callees do
+          if reachable.contains(cname) then
+            var cur_sum = EffectSummary {}
+            match final_sum.get(n.clone())
+            when Option::Some(cs) then cur_sum = cs.clone()
+            when Option::None then ()
+            end
+            var cal_sum = EffectSummary {}
+            match final_sum.get(cname.clone())
+            when Option::Some(cs2) then cal_sum = cs2.clone()
+            when Option::None then ()
+            end
+            let merged = effect_summary_merge(&cur_sum, &cal_sum)
+            if !mir_effect_summary_same(&cur_sum, &merged) then
+              final_sum.insert(n.clone(), merged.clone())
+              changed = true
+            end
+            var cur_ev = mir_effect_ev_empty()
+            match final_ev.get(n.clone())
+            when Option::Some(evs) then cur_ev = evs.clone()
+            when Option::None then ()
+            end
+            var cal_ev = mir_effect_ev_empty()
+            match final_ev.get(cname.clone())
+            when Option::Some(evs2) then cal_ev = evs2.clone()
+            when Option::None then ()
+            end
+            var ev_changed = false
+            var slot = 0
+            while slot < 3 do
+              if cur_ev[slot].len() == 0 then
+                if cal_ev[slot].len() > 0 then
+                  cur_ev[slot] = cal_ev[slot].clone()
+                  ev_changed = true
+                elsif (slot == 0 && merged.may_allocate) || (slot == 1 && (merged.may_block || merged.may_sleep)) || (slot == 2 && merged.may_io) then
+                  var cword = "".to_string()
+                  if slot == 0 then cword = "allocation" end
+                  if slot == 1 then cword = "blocking" end
+                  if slot == 2 then cword = "I/O" end
+                  cur_ev[slot] = "the " + cword + " may occur through a call chain into `" + cname.clone() + "`"
+                  ev_changed = true
+                end
+              end
+              slot = slot + 1
+            end
+            if ev_changed then
+              final_ev.insert(n.clone(), cur_ev)
+            end
+          end
+        end
+      when Option::None then ()
+      end
+    end
+  end
+
+  # 5. Enforcement — one E0232 diagnostic per violated forbidden class,
+  #    at the attribute's span (the message echoes the as-written form
+  #    and names the annotated function — under @interrupt, the handler).
+  for r in roots do
+    var final_summary = EffectSummary {}
+    match final_sum.get(r.name.clone())
+    when Option::Some(fs) then final_summary = fs.clone()
+    when Option::None then ()
+    end
+    for claim in r.claims do
+      let forbidden = effect_class_forbidden_classes(claim.anno)
+      for fc in forbidden do
+        if effect_summary_has_class(&final_summary, &fc) then
+          var evidence = "".to_string()
+          match final_ev.get(r.name.clone())
+          when Option::Some(evs) then
+            let slot = effect_class_slot_index(fc)
+            if slot < evs.len() then evidence = evs[slot].clone() end
+          when Option::None then ()
+          end
+          let ev = if evidence.len() > 0 then evidence else "the pass could not rule out " + effect_class_word(fc) + " on any path".to_string() end
+          let subject = match claim.anno
+          when EffectAnnotation::Interrupt then "handler"
+          when _ then "function"
+          end
+          errors.push(TypeError {
+            message: "@" + effect_class_claim_spelling(claim) + " " + subject + " `" + r.display.clone() + "` " + effect_class_phrase(fc) + ": " + ev,
+            span: claim.span,
+            code: Option::Some("E0232".to_string())
+          })
+        end
+      end
+    end
+  end
+  errors
 end

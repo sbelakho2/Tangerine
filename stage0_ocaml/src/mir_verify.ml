@@ -63,15 +63,36 @@
    16. no copy of a non-Copy value (bitwise copies only of Copy types);
    17. no read-before-initialize (definite-initialization dataflow);
    18. no read-after-consume (projection-aware moved-state dataflow);
-   19. no second consume (single use per place key);
-   19a. no projected Move/Consume anywhere (the seed VM has no partial-move
-       representation: `Move p`/`Consume p` transitions the WHOLE root
-       slot to Moved, ignoring p.projections, so the VM and the
-       projection-aware moved lattice would disagree about the meaning of
-       a projected transfer — every projected Move/Consume is rejected
-       categorically, in both modes and at every operand position, until
-       the VM executes projected moves);
-   20. no duplicate drop (destroyed-state dataflow);
+    19. no second consume (single use per place key);
+    19a. projected Move/Consume is the PARTIAL-MOVE form, executed by
+        the seed VM (re-audit P12): `Move p`/`Consume p` on a place
+        WITH projections reads the projected component and writes the
+        MovedOut hole marker INTO the component (the root slot stays
+        Live with the hole; the drop glue masks the holes).  The rule
+        mirrors the executor exactly, in both modes and at every
+        operand position:
+          - a projected transfer of a static projection is valid only
+            when its moved key is Live in the per-place lattice — a
+            transfer of the exact moved key, of a path under a moved
+            key, or of any path of a WHOLE-moved root (key "") is the
+            double-move / use-after-move rejection;
+          - the un-moved remainder of a partially-moved root stays
+            usable: reads/transfers of OTHER components are legal,
+            while every WHOLE-root read/use of a root any component of
+            which is moved is rejected;
+          - an assignment INTO the moved component re-initializes it
+            (the hole is replaced, the component's moved key clears,
+            and whole-root use is valid again); an assignment deeper
+            than a moved key writes THROUGH the hole (a rejection);
+          - a whole-root Drop/Deinit of a root with moved components
+            is the sanctioned partial-move exit (the drop glue masks
+            the holes — destroyed components drop exactly once), while
+            a Drop/Deinit of a moved component itself is the
+            double-destruction rejection.
+        Deref/dynamic-index chains (the "*" boundary) transfer the
+        memory/container domain, which the lattice never keys: only
+        the whole-root-moved state is comparable there;
+    20. no duplicate drop (destroyed-state dataflow);
    21. no reachable placeholder/unreachable used as a lowering fallback
        (a reachable block whose terminator is Unreachable is rejected;
        unreachable blocks may deliberately end in Unreachable).
@@ -132,6 +153,12 @@ type ctx = {
      exactly where the checker does; None when the compilation has no
      Box declaration) *)
   box_tid : Ids.Type_id.t option;
+  (* The compilation's LangItems record (audit P0-2): every builtin-
+     nominal identity decision (the owned-container direct properties,
+     the pointer class, the def-less Option/Result fallbacks, the Vec
+     runtime-base admissions) selects through this record — never
+     through numeric builtin-id knowledge. *)
+  lang_items : Lang_items.t;
   (* Concrete_mode post-mono: the driver's type-instance materializer
      interns every concrete generic-nominal instance through the ONE
      canonical cache (audit P0-13) — same (template, args) always
@@ -171,6 +198,28 @@ let is_box_tid (ctx : ctx) (tid : Ids.Type_id.t) : bool =
   List.exists
     (fun b -> Ids.Type_id.compare b tid = 0)
     (match ctx.box_tid with Some b -> b :: ctx.box_instances | None -> ctx.box_instances)
+
+(* ── LangItems selection helpers (audit P0-2) ──────────────────────
+   Every builtin-nominal identity decision routes through the ctx's
+   LangItems record — never numeric TypeId knowledge. *)
+
+let is_vec_langitem (ctx : ctx) (tid : Ids.Type_id.t) : bool =
+  Lang_items.tid_eq ctx.lang_items.Lang_items.vec tid
+
+let is_map_langitem (ctx : ctx) (tid : Ids.Type_id.t) : bool =
+  Lang_items.tid_eq ctx.lang_items.Lang_items.map tid
+
+let is_set_langitem (ctx : ctx) (tid : Ids.Type_id.t) : bool =
+  Lang_items.tid_eq ctx.lang_items.Lang_items.set tid
+
+let is_option_langitem (ctx : ctx) (tid : Ids.Type_id.t) : bool =
+  Lang_items.tid_eq ctx.lang_items.Lang_items.option tid
+
+let is_result_langitem (ctx : ctx) (tid : Ids.Type_id.t) : bool =
+  Lang_items.tid_eq ctx.lang_items.Lang_items.result tid
+
+let is_enum_langitem (ctx : ctx) (tid : Ids.Type_id.t) : bool =
+  is_option_langitem ctx tid || is_result_langitem ctx tid
 
 (* The checker's 64-bit alias pairs (the language model — abi_layout:
    "Int is the i64 alias", "UInt is the u64 alias"): Int and I64 are the
@@ -329,36 +378,37 @@ let resolve_or_self (ctx : ctx) (ty : Type_repr.t) : Type_repr.t =
   | Some t -> t
   | None -> ty
 
-(* Copy property authority (re-audit §36 / P1-25): the seed's property
-   engine (Type_properties) with the program's def table as the Named
-   resolver.  The engine's rules: scalars/String-owned/immutable refs
-   and genuine function pointers behave as before; a def_repr'd enum
+(* The nominal property resolver (P1-25 / P0-2): the LangItems overlay
+   (owning LangItems answer their DIRECT properties — an owning LangItem
+   (Vec/Map/Set/Box/...) is move + clone, never bit-Copy; Ptr/PtrMut are
+   the Copy address handles), then the transparent Box wrapper (the
+   original nominal AND its materialized instances own memory), then the
+   def table.  No fake tuple shapes. *)
+let nominal_resolver (ctx : ctx) : Type_properties.def_resolver =
+  Type_properties.with_lang_items (Some ctx.lang_items)
+    (fun tid ->
+      if is_box_tid ctx tid then
+        Type_properties.Direct_properties Type_properties.owning_handle
+      else Type_properties.structural_resolver (find_type ctx) tid)
+
+(* Copy property authority (re-audit §36 / P1-25 / P0-2): the seed's
+   property engine (Type_properties) with the program's def table as the
+   Named resolver, overlaid with the ctx's LangItems record.  The
+   engine's rules: scalars/String-owned/immutable refs and genuine
+   function pointers behave as before; a def_repr'd enum
    (Function(payloads, Never)) is Copy iff EVERY variant payload is Copy
    — an enum with an owning payload (Result[Int, String]) must be moved,
    consumed or passed by place, never bitwise-copied; a Named type's
    copyability resolves its def and applies the same recursive rule
-   (struct Copy iff all fields Copy).  The ctx-level cache memoizes the
+   (struct Copy iff all fields Copy).  The OWNED LangItems (Vec/Array/
+   Map/Set/Box/Rc/Arc/... — the driver's type-instance materializer
+   never remaps their instances, so they carry no def-table entry in
+   Concrete_mode) answer their DIRECT properties { copy = false; drop =
+   true } — move + clone, never bit-Copy — and Ptr/PtrMut answer
+   { copy = true; drop = false }.  The ctx-level cache memoizes the
    engine's answers per canonical (TypeId, args) instance (P1-25). *)
 let is_copy (ctx : ctx) (ty : Type_repr.t) : bool =
-  (* the builtin runtime nominals' canonical def shapes: the driver's
-     type-instance materializer never remaps Vec/Array/Map/Set/Ptr/PtrMut
-     instances (their runtime semantics are keyed on the original ids),
-     so in Concrete_mode they have no def-table entry; their
-     copyability is their canonical runtime shape — the handle nominals
-     (Vec/Map/Set values are pointer-represented containers; Ptr/PtrMut
-     are the address handles) are Copy, exactly as their registry
-     template defs resolved pre-mono (Vec/Map/Set declare no fields;
-     Ptr/PtrMut declare `address: UInt`) *)
-  Type_properties.of_type_cached ctx.copy_cache
-    (Some (fun tid ->
-      match find_type ctx tid with
-      | Some t -> Some t
-      | None -> (
-          match Ids.Type_id.to_int tid with
-          | 0 | 1 | 2 -> Some (Type_repr.Tuple [||])
-          | 5 | 6 -> Some (Type_repr.Tuple [| Type_repr.Int Type_repr.UInt |])
-          | _ -> None)))
-    ty
+  Type_properties.of_type_cached ctx.copy_cache (Some (nominal_resolver ctx)) ty
   |> fun p -> p.Type_properties.is_copy
 
 (* Type compatibility.  NOMINAL-vs-NOMINAL comparisons are identity
@@ -395,7 +445,7 @@ let rec types_compatible (ctx : ctx) (a : Type_repr.t) (b : Type_repr.t) : bool 
   | u, Type_repr.Named (ta, [| t |]) when is_box_tid ctx ta ->
       types_compatible ctx u t
   | Type_repr.Fixed_array (t, _), Type_repr.Named (id, [| e |])
-    when Ids.Type_id.compare id (Ids.Type_id.make 0) = 0 ->
+    when is_vec_langitem ctx id ->
       (* the checker's fixed-array→Vec element rule (typecheck's method
          dispatch unifies a [T; n]-typed receiver against a Vec[T]
          method's self by element — `let known = [...]` bound values
@@ -403,10 +453,11 @@ let rec types_compatible (ctx : ctx) (a : Type_repr.t) (b : Type_repr.t) : bool 
          the same runtime value (Vm_value.Array — the ArrayAgg fills
          both), so a Fixed-array actual is compatible with a Vec
          expectation exactly when their elements are; the Vec nominal
-         is matched on the concrete type#0 base, never a user nominal. *)
+         is matched on the LangItems vec identity, never a user
+         nominal. *)
       types_compatible ctx t e
   | Type_repr.Named (id, [| e |]), Type_repr.Fixed_array (t, _)
-    when Ids.Type_id.compare id (Ids.Type_id.make 0) = 0 ->
+    when is_vec_langitem ctx id ->
       (* the mirror direction (the expected/actual pair may arrive in
          either order at the call-arg/aggregate checks) *)
       types_compatible ctx t e
@@ -600,47 +651,26 @@ let enum_variant_payload (ctx : ctx) (ty : Type_repr.t) (vid : Ids.Variant_index
 
 (* re-audit P0-C: the intrinsic registry's declared types use its own
    placeholder id domain (option=1, vec=2, map=3, set=4) while the MIR
-   carries the checker-minted LangItem ids (array=0, map=1, set=2,
-   option=3).  The verifier maps the registry ids onto the checker ids
+   carries the checker-minted LangItem ids (Array=0, Map=1, Set=2,
+   Option=3).  The verifier maps the registry ids onto the checker ids
    before the compatibility comparison, so argument and destination
-   types are checked for every intrinsic exactly like User calls. *)
+   types are checked for every intrinsic exactly like User calls.  The
+   adoption table is the SHARED one (Signature_identity's
+   registry_type_to_checker — the checker-side canonical identity is
+   the Lang_items.vec/map/set/option ids; see the P0-1(a) comment). *)
 let registry_type_to_checker (ty : Type_repr.t) : Type_repr.t =
-  let rec go t =
-    match t with
-    | Type_repr.Named (tid, args) ->
-        let tid' =
-          if Ids.Type_id.compare tid (Intrinsic_registry.Type_id.option_) = 0 then
-            Ids.Type_id.make 3
-          else if Ids.Type_id.compare tid (Intrinsic_registry.Type_id.vec) = 0 then
-            Ids.Type_id.make 0
-          else if Ids.Type_id.compare tid (Intrinsic_registry.Type_id.map) = 0 then
-            Ids.Type_id.make 1
-          else if Ids.Type_id.compare tid (Intrinsic_registry.Type_id.set) = 0 then
-            Ids.Type_id.make 2
-          else tid
-        in
-        Type_repr.Named (tid', Array.map go args)
-    | Type_repr.Fixed_array (e, n) -> Type_repr.Fixed_array (go e, n)
-    | Type_repr.Tuple elems -> Type_repr.Tuple (Array.map go elems)
-    | t -> t
-  in
-  go ty
+  Signature_identity.registry_type_to_checker ty
 
 let rec intrinsic_type_compatible (ctx : ctx) (declared : Type_repr.t) (actual : Type_repr.t) : bool =
   match declared with
   | Type_repr.Type_param _ -> true
   | Type_repr.Unit -> true
   | Type_repr.Named (id1, a1) -> (
-      let id1' =
-        if Ids.Type_id.compare id1 (Intrinsic_registry.Type_id.option_) = 0 then
-          Ids.Type_id.make 3
-        else if Ids.Type_id.compare id1 (Intrinsic_registry.Type_id.vec) = 0 then
-          Ids.Type_id.make 0
-        else if Ids.Type_id.compare id1 (Intrinsic_registry.Type_id.map) = 0 then
-          Ids.Type_id.make 1
-        else if Ids.Type_id.compare id1 (Intrinsic_registry.Type_id.set) = 0 then
-          Ids.Type_id.make 2
-        else id1
+      (* the registry-placeholder nominal: mapped onto the checker
+         LangItem ids by the shared adoption table *)
+      let id1' = Signature_identity.registry_type_to_checker declared |> function
+        | Type_repr.Named (i, _) -> i
+        | _ -> id1
       in
       match actual with
       | Type_repr.Named (id2, a2)
@@ -649,8 +679,7 @@ let rec intrinsic_type_compatible (ctx : ctx) (declared : Type_repr.t) (actual :
       (* the entries cache is lowered as the Fixed_array form — the
          declared Vec[T] element matches the fixed array's element *)
       | Type_repr.Fixed_array (e2, _)
-        when Ids.Type_id.compare id1' (Ids.Type_id.make 0) = 0
-             && Array.length a1 = 1 ->
+        when is_vec_langitem ctx id1' && Array.length a1 = 1 ->
           intrinsic_type_compatible ctx a1.(0) e2
       | _ -> false)
   | Type_repr.Fixed_array (e1, n1) -> (
@@ -680,32 +709,28 @@ let enum_def_arity (ctx : ctx) (ty : Type_repr.t) : int option =
   (* the checker's Option/Result LangItem nominals are the canonical
      two-variant enums — the program's types table carries their defs
      only when the closure materialized them, so the verifier knows
-     the arity by the semantic id (the same id domain the checker
+     the arity by the LangItems record (the same id domain the checker
      mints for every use) *)
-  | Type_repr.Named (tid, _)
-    when Ids.Type_id.compare tid (Ids.Type_id.make 3) = 0
-         || Ids.Type_id.compare tid (Ids.Type_id.make 4) = 0 ->
-      Some 2
+  | Type_repr.Named (tid, _) when is_enum_langitem ctx tid -> Some 2
   | _ -> None
 
-(* The raw-pointer HANDLE nominals — the checker's builtin Ptr (id 5)
-   and PtrMut (id 6): the source `struct Ptr[T] { address: UInt }`
-   pointer class whose VALUES the seed VM represents as RawPtr (deref
-   reads/writes go through the simulated memory).  The Rc/Weak/Arc
-   stdlib impls deref THROUGH them — `self.ptr.as_mut().refcount`
-   (Ptr::as_mut's registered return type IS the PtrMut nominal, never
-   a Ref_internal) and the raw-deref PLACE form (deref of self.ptr
-   then a field) — so a Deref projection legally applies to the handle
-   nominal with pointee = its single type argument, exactly the deref
-   rule the checker applies at its field/place layer (typecheck.ml's
+(* The raw-pointer HANDLE nominals — the checker's builtin Ptr and
+   PtrMut (the LangItems ptr identities): the source `struct Ptr[T] {
+   address: UInt }` pointer class whose VALUES the seed VM represents as
+   RawPtr (deref reads/writes go through the simulated memory).  The
+   Rc/Weak/Arc stdlib impls deref THROUGH them — `self.ptr.as_mut().
+   refcount` (Ptr::as_mut's registered return type IS the PtrMut
+   nominal, never a Ref_internal) and the raw-deref PLACE form (deref of
+   self.ptr then a field) — so a Deref projection legally applies to the
+   handle nominal with pointee = its single type argument, exactly the
+   deref rule the checker applies at its field/place layer (typecheck.ml's
    b_ptr/b_ptrmut cases).  The check runs on the UNRESOLVED form: the
    handle's def (when materialized) is the address-UInt struct, whose
    structural resolution must not hide the pointer class. *)
-let ptr_handle_pointee (ty : Type_repr.t) : Type_repr.t option =
+let ptr_handle_pointee (li : Lang_items.t) (ty : Type_repr.t) : Type_repr.t option =
   match ty with
   | Type_repr.Named (id, [| t |])
-    when Ids.Type_id.compare id (Ids.Type_id.make 5) = 0
-         || Ids.Type_id.compare id (Ids.Type_id.make 6) = 0 ->
+    when Lang_items.is_raw_pointer li id ->
       Some t
   | _ -> None
 
@@ -722,7 +747,7 @@ let project_type (ctx : ctx) (ty : Type_repr.t) (proj : projection) : Type_repr.
          transparent Box nominal (its deref-on-field/place rule — the
          Box wrapper derefs to its single type argument, the kernel's
          `*expr` over a Box[Expr] binding) *)
-      match ptr_handle_pointee ty with
+      match ptr_handle_pointee ctx.lang_items ty with
       | Some t -> Some t
       | None -> (
           match ty with
@@ -736,16 +761,14 @@ let project_type (ctx : ctx) (ty : Type_repr.t) (proj : projection) : Type_repr.
       | Type_repr.Named (tid, args) -> struct_field_ty ctx tid args fid
       | _ -> None)
   | ConstantIndex i -> (
-      (* the runtime Vec/Array base (the named Array nominal, type-id
-         0) is admitted BEFORE def resolution — the same rule as the
-         dynamic Index: the Vec[T] def (a field-less declaration whose
-         runtime value is a heap header) must not collapse the base to
-         its empty structural form (the fs/time kernels' `buf[0] = ...`
-         byte-pack writers are the class) *)
+      (* the runtime Vec/Array base (the LangItems vec nominal) is
+         admitted BEFORE def resolution — the same rule as the dynamic
+         Index: the Vec[T] def (a field-less declaration whose runtime
+         value is a heap header) must not collapse the base to its empty
+         structural form (the fs/time kernels' `buf[0] = ...` byte-pack
+         writers are the class) *)
       match ty with
-      | Type_repr.Named (id, [| elem |])
-        when Ids.Type_id.compare id (Ids.Type_id.make 0) = 0 ->
-          Some elem
+      | Type_repr.Named (id, [| elem |]) when is_vec_langitem ctx id -> Some elem
       | Type_repr.Fixed_array (elem, n) when i >= 0 && i < n -> Some elem
       | _ -> (
           match resolve_or_self ctx ty with
@@ -762,17 +785,15 @@ let project_type (ctx : ctx) (ty : Type_repr.t) (proj : projection) : Type_repr.
          type; the index local's existence/initialization/type are
          checked in check_projection_owners and the runtime bounds are
          checked by the VM at execution.  The runtime Vec/Array base
-         (the named Array nominal, type-id 0) is admitted — the VM's
-         dynamic Index handles the Array value.  The nominal-by-id form
-         is matched BEFORE def resolution: the Vec[T] def (a field-less
-         declaration in std/collections.tg — the runtime value is a
-         heap header, never a struct value) must not collapse the
-         base to its empty structural form. *)
+         (the LangItems vec nominal) is admitted — the VM's dynamic
+         Index handles the Array value.  The nominal is matched BEFORE
+         def resolution: the Vec[T] def (a field-less declaration in
+         std/collections.tg — the runtime value is a heap header, never
+         a struct value) must not collapse the base to its empty
+         structural form. *)
       ignore li;
       match ty with
-      | Type_repr.Named (id, [| elem |])
-        when Ids.Type_id.compare id (Ids.Type_id.make 0) = 0 ->
-          Some elem
+      | Type_repr.Named (id, [| elem |]) when is_vec_langitem ctx id -> Some elem
       | _ -> (
           match resolve_or_self ctx ty with
           | Type_repr.Fixed_array (elem, _) -> Some elem
@@ -789,10 +810,8 @@ let project_type (ctx : ctx) (ty : Type_repr.t) (proj : projection) : Type_repr.
                  (Some/Ok) carries the payload argument; the program's
                  types table carries their defs only when the closure
                  materialized them, so the verifier resolves the payload
-                 by the semantic id *)
-              if (Ids.Type_id.compare tid (Ids.Type_id.make 3) = 0
-                  || Ids.Type_id.compare tid (Ids.Type_id.make 4) = 0)
-                 && Ids.Variant_id.to_int vid = 0
+                 by the LangItems record *)
+              if is_enum_langitem ctx tid && Ids.Variant_id.to_int vid = 0
                  && Array.length args > 0
               then Some args.(0)
               else None)
@@ -897,6 +916,47 @@ let key_clear (moved : StrSet.t IntMap.t) (root : int) (key : string) : StrSet.t
         in
         if StrSet.is_empty keep then IntMap.remove root moved
         else IntMap.add root keep moved
+
+(* ── Projected-move lattice queries (rule 19a / re-audit P12) ───────
+   key_moved answers the READ-side rule: a read/use of key k is
+   consumed when a moved key equals k, is a strict prefix of k, or is
+   the whole-root key "" — the root slot itself or an ancestor
+   component of the path left.  The assign and drop sites need the
+   finer distinction between the WHOLE SLOT leaving ("") and a
+   COMPONENT of it leaving: a slot that left is Moved — every later
+   component write or read-back traps in the VM, and only a whole-root
+   assign can revive it; a component that left is a MovedOut HOLE
+   inside the still-Live slot — the exact component may be
+   re-initialized by an assign (the hole is replaced in place) and the
+   un-moved remainder of the root stays readable and droppable. *)
+
+(* Whether the whole root SLOT itself moved out (the moved set carries
+   the "" key) — as opposed to only components of it. *)
+let root_slot_moved (moved : StrSet.t IntMap.t) (root : int) : bool =
+  match IntMap.find_opt root moved with
+  | None -> false
+  | Some set -> StrSet.mem "" set
+
+(* The moved key whose hole sits at or ABOVE key k: "" when the whole
+   slot moved, or the strict-prefix key m whose component is a single
+   hole (m ^ "." prefixes k).  A destination strictly below a moved key
+   writes THROUGH the hole — the VM traps on the write ("field write on
+   non-aggregate" over MovedOut) — and a destination at or below a ""
+   write into a Moved slot (the VM traps on the read-back).  An
+   exact-key match (m = k — the component itself moved) is NOT a
+   hole-above: the assign re-initializes the moved component. *)
+let moved_hole_above (moved : StrSet.t IntMap.t) (root : int) (k : string) : string option =
+  match IntMap.find_opt root moved with
+  | None -> None
+  | Some set ->
+      if StrSet.mem "" set then Some ""
+      else
+        StrSet.fold
+          (fun m acc ->
+            match acc with
+            | Some _ -> acc
+            | None -> if String.starts_with ~prefix:(m ^ ".") k then Some m else None)
+          set None
 
 (* Duplicate-drop detection: an exact destroyed key, or a destroyed
    strict prefix covering the key ("x.a" destroyed makes "x.a.b" a
@@ -1320,7 +1380,7 @@ let check_projection_owners (ctx : ctx) (fn : function_) (bb_ctx : string)
             (* deref over the reference/raw-pointer kinds, the Ptr/PtrMut
                handle nominals AND the transparent Box nominal (mirror
                of project_type) *)
-            match ptr_handle_pointee ty with
+            match ptr_handle_pointee ctx.lang_items ty with
             | Some t -> go t rest
             | None -> (
                 match ty with
@@ -1369,15 +1429,14 @@ let check_projection_owners (ctx : ctx) (fn : function_) (bb_ctx : string)
                   (Printf.sprintf "%s: field projection on non-struct type %s" bb_ctx
                      (Seed_mir.print_type ty)))
         | ConstantIndex i -> (
-            (* the runtime Vec/Array base (the named Array nominal,
-               type-id 0) is admitted BEFORE def resolution — the same
-               rule as the dynamic Index and project_type: the Vec[T]
-               def (a field-less declaration) must not collapse the
-               base to its empty structural form (the fs/time kernels'
-               `buf[0] = ...` byte-pack writers are the class) *)
+            (* the runtime Vec/Array base (the LangItems vec nominal) is
+               admitted BEFORE def resolution — the same rule as the
+               dynamic Index and project_type: the Vec[T] def (a
+               field-less declaration) must not collapse the base to its
+               empty structural form (the fs/time kernels' `buf[0] = ...`
+               byte-pack writers are the class) *)
             match ty with
-            | Type_repr.Named (id, [| elem |])
-              when Ids.Type_id.compare id (Ids.Type_id.make 0) = 0 ->
+            | Type_repr.Named (id, [| elem |]) when is_vec_langitem ctx id ->
                 go elem rest
             | Type_repr.Fixed_array (elem, n) ->
                 if i < 0 || i >= n then
@@ -1433,12 +1492,12 @@ let check_projection_owners (ctx : ctx) (fn : function_) (bb_ctx : string)
                       (Seed_mir.print_type fn.locals.(li)))
              end);
              (match ty with
-              | Type_repr.Named (id, [| elem |])
-                when Ids.Type_id.compare id (Ids.Type_id.make 0) = 0 ->
+              | Type_repr.Named (id, [| elem |]) when is_vec_langitem ctx id ->
                   (* the Vec/Array nominal base (the field-less source
-                     declaration): the dynamic Index admits it by id
-                     BEFORE def resolution (its def must not collapse
-                     the base to the empty structural form) *)
+                     declaration): the dynamic Index admits it by the
+                     LangItems identity BEFORE def resolution (its def
+                     must not collapse the base to the empty structural
+                     form) *)
                   go elem rest
               | _ -> (
                   match resolve_or_self ctx ty with
@@ -1552,10 +1611,10 @@ let check_ref_operand (ctx : ctx) (fn : function_) (bb_ctx : string) (op : opera
   | Copy p | Read p ->
       check p
   | Move p | Consume p ->
-      (* the projected-move rejection lives in
-         check_projected_move_transfer (a projected move is never a
-         legal transfer regardless of the root type); this ref rule
-         covers the bare form only *)
+      (* the projected-transfer rules live in
+         check_projected_move_transfer (a projected transfer is checked
+         there against the moved lattice — it is legal exactly when its
+         moved key is Live); this ref rule covers the bare form only *)
       (if p.projections = [] && not (root_is_static p.root)
           && (root_key p.root) >= 0 && (root_key p.root) < Array.length fn.locals
         then match fn.locals.(root_key p.root) with
@@ -1567,21 +1626,63 @@ let check_ref_operand (ctx : ctx) (fn : function_) (bb_ctx : string) (op : opera
   | Constant _ -> ()
 
 (* ── Projected Move/Consume (the partial-move representation) ────────
-   re-audit P12: the seed VM now EXECUTES projected moves — a
+   re-audit P12 / rule 19a: the seed VM EXECUTES projected moves — a
    Move/Consume of `root.field` reads the projected component and
-   writes the Moved hole marker INTO the component (the root slot
+   writes the MovedOut hole marker INTO the component (the root slot
    stays Live with the hole; the drop glue skips Moved components).
-   The verifier's moved lattice is projection-aware (place keys track
-   sub-place ownership), so the dataflow and the executor agree: the
-   moved path is consumed, the un-moved remainder of the root stays
-   readable, and a second consume of the same path is a use-after-move.
-   The categorical rejection is retired. *)
-let check_projected_move_transfer (ctx : ctx) (bb_ctx : string) (op : operand) : unit =
-  ignore ctx;
-  ignore bb_ctx;
+
+   check_projected_move_transfer is the REAL per-transfer gate, run at
+   every Move/Consume operand position whose place carries projections
+   (the statement-rvalue, aggregate/binary/unary operand and call-argument
+   positions all route through check_operand), over the may-moved
+   lattice AT THAT POINT of the block walk:
+     (a) the moved key must be Live in the lattice: a transfer of the
+         exact moved key, of a path UNDER a moved key (an ancestor
+         component already left — `Move p.f.g` after `Move p.f`, or
+         `Move p.f` after the whole root `Move p`), or of any path of
+         a WHOLE-moved root (the "" key covers every key) is the
+         double-move (second-consume) rejection;
+     (b) the transfer leaves the root usable for reads/transfers of
+         OTHER components (a sibling path is un-moved — nothing to
+         reject here) and the whole-root reads/uses of a partially
+         moved root are rejected by the whole-root ("" key) rule in
+         key_moved;
+     (c) a "*"-boundary chain (a Deref or dynamic-Index crossing)
+         transfers a memory/container-domain component: the lattice
+         never records "*" (operand_moved_targets), so only the
+         whole-root-moved state is comparable — a transfer out of a
+         wholly moved root is rejected and a transfer of a field path
+         after a memory-domain transfer stays legal, exactly like the
+         executor (the root slot keeps its Live value).
+
+   Whole-root (projection-less) transfers keep their own key_moved
+   check in check_operand; the projected forms are this hook's
+   authority — one finding per violation, never a double report. *)
+let check_projected_move_transfer (ctx : ctx) (bb_ctx : string) (op : operand)
+    (moved : StrSet.t IntMap.t) : unit =
   match op with
-  | Move p | Consume p -> ignore p
-  | Copy _ | Read _ | Constant _ -> ()
+  | Move p | Consume p when p.projections <> [] -> (
+      let r = root_key p.root in
+      let k = place_key p in
+      let kind = (match op with Move _ -> "move" | _ -> "consume") in
+      if key_moved moved r k then
+        let hole = moved_hole_above moved r k in
+        match hole with
+        | Some "" ->
+            add_err ctx
+              (Printf.sprintf
+                 "%s: projected %s of local _%d whose whole root was already moved out (key %S)"
+                 bb_ctx kind r k)
+        | Some m ->
+            add_err ctx
+              (Printf.sprintf
+                 "%s: use-after-move (second consume) of projected place _%d (key %S lies under the moved component %S)"
+                 bb_ctx r k m)
+        | None ->
+            add_err ctx
+              (Printf.sprintf
+                 "%s: use-after-move (second consume) of projected place _%d (key %S)" bb_ctx r k))
+  | Move _ | Consume _ | Copy _ | Read _ | Constant _ -> ()
 
 (* Callee-resolution result (see resolve_callee below). *)
 type callee_resolution =
@@ -1624,24 +1725,32 @@ let rec check_operand (ctx : ctx) (fn : function_) (bb_ctx : string) (op : opera
           (Printf.sprintf "%s: read of previously consumed local _%d (key %S)" bb_ctx (root_key p.root) k);
       place_type ctx fn p
   | Move p ->
-      check_projected_move_transfer ctx bb_ctx op;
       check_ref_operand ctx fn bb_ctx op ~as_call_arg;
       check_place_readable ctx fn bb_ctx p running;
-      let k = place_key p in
-      if key_moved moved (root_key p.root) k then
-        add_err ctx
-          (Printf.sprintf "%s: use-after-move (second consume) of local _%d (key %S)" bb_ctx
-             (root_key p.root) k);
+      (* the projected form is the hook's authority (rule 19a (a)-(c),
+         one finding); the projection-less whole-root form keeps its
+         own key_moved check (a whole-root move after a component move
+         or a whole-root double move) *)
+      if p.projections <> [] then check_projected_move_transfer ctx bb_ctx op moved
+      else begin
+        let k = place_key p in
+        if key_moved moved (root_key p.root) k then
+          add_err ctx
+            (Printf.sprintf "%s: use-after-move (second consume) of local _%d (key %S)" bb_ctx
+               (root_key p.root) k)
+      end;
       place_type ctx fn p
   | Consume p ->
-      check_projected_move_transfer ctx bb_ctx op;
       check_ref_operand ctx fn bb_ctx op ~as_call_arg;
       check_place_readable ctx fn bb_ctx p running;
-      let k = place_key p in
-      if key_moved moved (root_key p.root) k then
-        add_err ctx
-          (Printf.sprintf "%s: consume of previously consumed local _%d (key %S)" bb_ctx
-             (root_key p.root) k);
+      if p.projections <> [] then check_projected_move_transfer ctx bb_ctx op moved
+      else begin
+        let k = place_key p in
+        if key_moved moved (root_key p.root) k then
+          add_err ctx
+            (Printf.sprintf "%s: consume of previously consumed local _%d (key %S)" bb_ctx
+               (root_key p.root) k)
+      end;
       place_type ctx fn p
   | Constant c -> Some (constant_type ctx c)
 
@@ -1965,18 +2074,17 @@ let check_aggregate (ctx : ctx) (fn : function_) (bb_ctx : string) (kind : aggre
             (Printf.sprintf "%s: tuple aggregate into non-tuple type %s" bb_ctx
                (Seed_mir.print_type dest_ty)))
   | ArrayAgg -> (
-      (* the runtime Vec/Array nominal base (type-id 0) is admitted —
-         the checker records an array literal checked against a Vec
-         expectation as the Named Vec form and the lowering emits the
-         ArrayAgg into the Vec-typed local (the runtime value IS the
-         heap Vec — Vm_value.Array — built from an ArrayAgg, exactly
-         like the Fixed_array local's Vm_value.Array).  The nominal is
-         matched on the UNRESOLVED dest (its field-less def would
-         collapse the base to the empty structural form — the same rule
-         as the ConstantIndex/dynamic-Index projections). *)
+      (* the runtime Vec/Array nominal base (the LangItems vec nominal)
+         is admitted — the checker records an array literal checked
+         against a Vec expectation as the Named Vec form and the
+         lowering emits the ArrayAgg into the Vec-typed local (the
+         runtime value IS the heap Vec — Vm_value.Array — built from an
+         ArrayAgg, exactly like the Fixed_array local's Vm_value.Array).
+         The nominal is matched on the UNRESOLVED dest (its field-less
+         def would collapse the base to the empty structural form — the
+         same rule as the ConstantIndex/dynamic-Index projections). *)
       match dest_ty with
-      | Type_repr.Named (id, [| elem |])
-        when Ids.Type_id.compare id (Ids.Type_id.make 0) = 0 ->
+      | Type_repr.Named (id, [| elem |]) when is_vec_langitem ctx id ->
           check_count (List.length ops);
           List.iteri (fun i _ -> check_elem i elem) ops
       | _ -> (
@@ -2250,12 +2358,10 @@ let check_rvalue (ctx : ctx) (fn : function_) (bb_ctx : string) (declared : IntS
                            carrying its own def-less shape only when it is
                            a declared enum/struct of the registry in
                            template mode; conservatively admit the
-                           builtin Option/Result ids (their defs may be
-                           unmaterialized) *)
-                        Ids.Type_id.compare tid (Ids.Type_id.make 3) = 0
-                        || Ids.Type_id.compare tid (Ids.Type_id.make 4) = 0
-                        || Ids.Type_id.compare tid (Ids.Type_id.make 1) = 0
-                        || Ids.Type_id.compare tid (Ids.Type_id.make 2) = 0
+                           LangItems Option/Result/Map/Set nominals (their
+                           defs may be unmaterialized) *)
+                        is_enum_langitem ctx tid || is_map_langitem ctx tid
+                        || is_set_langitem ctx tid
                     | _ -> false
                 in
                 if same && aggregate_ok then Some Type_repr.Bool
@@ -2323,12 +2429,11 @@ let check_rvalue (ctx : ctx) (fn : function_) (bb_ctx : string) (declared : IntS
         add_err ctx (Printf.sprintf "%s: len of previously consumed local _%d" bb_ctx (root_key p.root));
       match place_type ctx fn p with
       | Some ty -> (
-          (* the Vec/Array nominal base is matched by id BEFORE def
-             resolution (its field-less def must not collapse the
-             base to the empty structural form) *)
+          (* the Vec/Array nominal base is matched by the LangItems vec
+             identity BEFORE def resolution (its field-less def must not
+             collapse the base to the empty structural form) *)
           match ty with
-          | Type_repr.Named (id, _)
-            when Ids.Type_id.compare id (Ids.Type_id.make 0) = 0 ->
+          | Type_repr.Named (id, _) when is_vec_langitem ctx id ->
               Some (Type_repr.Int Type_repr.UInt)
           | _ -> (
               match resolve_or_self ctx ty with
@@ -2599,27 +2704,22 @@ let check_call (ctx : ctx) (fn : function_) (bb_ctx : string) (dest : place)
                     match ctx.mode with
                     | Concrete_mode -> id1
                     | Template_mode -> (
-                        if
-                          Ids.Type_id.compare id1 (Intrinsic_registry.Type_id.option_) = 0
-                        then Ids.Type_id.make 3
-                        else if
-                          Ids.Type_id.compare id1 (Intrinsic_registry.Type_id.vec) = 0
-                        then Ids.Type_id.make 0
-                        else if
-                          Ids.Type_id.compare id1 (Intrinsic_registry.Type_id.map) = 0
-                        then Ids.Type_id.make 1
-                        else if
-                          Ids.Type_id.compare id1 (Intrinsic_registry.Type_id.set) = 0
-                        then Ids.Type_id.make 2
-                        else id1)
+                        (* the registry-placeholder nominal mapped onto
+                           the checker LangItem ids by the shared adoption
+                           table *)
+                        match
+                          Signature_identity.registry_type_to_checker
+                            (Type_repr.Named (id1, a1))
+                        with
+                        | Type_repr.Named (i, _) -> i
+                        | _ -> id1)
                   in
                   match actual with
                   | Type_repr.Named (id2, a2)
                     when Ids.Type_id.compare id1' id2 = 0 && Array.length a1 = Array.length a2 ->
                       Array.iter2 (fun d a -> bind d a) a1 a2
                   | Type_repr.Fixed_array (e2, _)
-                    when Ids.Type_id.compare id1' (Ids.Type_id.make 0) = 0
-                         && Array.length a1 = 1 ->
+                    when is_vec_langitem ctx id1' && Array.length a1 = 1 ->
                       bind a1.(0) e2
                   | _ ->
                       let dbg =
@@ -3071,7 +3171,22 @@ let check_terminator (ctx : ctx) (fn : function_) (bb_ctx : string) (t : termina
       Option.iter check_target unwind;
       check_place_readable ctx fn bb_ctx p running;
       let k = place_key p in
-      if key_moved moved (root_key p.root) k then
+      (* rule 19a(d): a whole-ROOT Drop/Deinit of a root with moved
+         COMPONENTS is the sanctioned partial-move exit — the VM's
+         drop glue masks the MovedOut holes (do_drop's typed drop and
+         the structural glue are no-ops over a hole), so the
+         destruction destroys exactly the still-owned remainder and
+         nothing that already left.  Only a Drop/Deinit of a
+         WHOLE-moved root (key "" in the moved set — the slot itself
+         left; the destruction would be empty) and a Drop/Deinit of a
+         moved component or of a path under a moved component
+         (key_moved — the destruction of a value that already
+         transferred = double destruction) stay findings. *)
+      let drop_of_moved =
+        if k = "" then root_slot_moved moved (root_key p.root)
+        else key_moved moved (root_key p.root) k
+      in
+      if drop_of_moved then
         add_err ctx
           (Printf.sprintf "%s: drop of previously moved/consumed local _%d (key %S)" bb_ctx
              (root_key p.root) k);
@@ -3294,11 +3409,33 @@ let verify_function (ctx : ctx) (fn : function_) : unit =
                 running := IntSet.add (root_key p.root) !running;
                 moved := rvalue_moved_targets !moved rv;
                 let akey = place_key p in
-                if p.projections <> [] && akey <> "*" && key_moved !moved (root_key p.root) "" then
-                  add_err ctx
-                    (Printf.sprintf
-                       "%s: assign into a field of consumed local _%d (the whole root was moved out)"
-                       bb_ctx (root_key p.root));
+                (* rule 19a(c): an assign into a partially-moved root is
+                   legal exactly when it does not write THROUGH a
+                   moved-out hole.  Writing INTO the moved component
+                   (dest key = the moved key) re-initializes it — the VM
+                   replaces the hole in place — and the key_clear below
+                   then revives whole-root use; an assign over an
+                   ANCESTOR of a moved key overwrites the whole subtree
+                   (the overwrite drop masks the hole); an assign into a
+                   sibling path is unrelated to the moved component.
+                   Only a destination strictly DEEPER than a moved key
+                   writes through the hole (the VM traps — "field write
+                   on non-aggregate" over MovedOut), and a destination
+                   under a WHOLE-moved root (key "") writes into a Moved
+                   slot (the VM traps on the read-back). *)
+                if p.projections <> [] && akey <> "*" then (
+                  match moved_hole_above !moved (root_key p.root) akey with
+                  | Some "" ->
+                      add_err ctx
+                        (Printf.sprintf
+                           "%s: assign into a field of consumed local _%d (the whole root was moved out)"
+                           bb_ctx (root_key p.root))
+                  | Some m ->
+                      add_err ctx
+                        (Printf.sprintf
+                           "%s: assign into local _%d at key %S writes through a moved-out component (moved key %S)"
+                           bb_ctx (root_key p.root) akey m)
+                  | None -> ());
                 moved := key_clear !moved (root_key p.root) akey;
                 destroyed := key_clear !destroyed (root_key p.root) akey
             | StorageLive l ->
@@ -3486,6 +3623,7 @@ let verify_all (ctx : ctx) (prog : program) : (unit, string list) result =
 
 let require_valid_template ?(generic_types : Mono.generic_def array = [||])
     ?(query_sigs : query_sig list = []) ?(box_tid : Ids.Type_id.t option = None)
+    ?(lang_items : Lang_items.t = Lang_items.seed_defaults)
     (prog : program) : (unit, string list) result =
   verify_all
     {
@@ -3495,10 +3633,11 @@ let require_valid_template ?(generic_types : Mono.generic_def array = [||])
       generic_types;
       query_sigs;
       box_tid;
+      lang_items;
       post_rewrite = (fun ty -> ty);
       box_instances = [];
       copy_cache = Type_properties.create_cache ();
-      drop_plans = Drop_plan.of_program prog;
+      drop_plans = Drop_plan.of_program ~lang_items prog;
     }
     prog
 
@@ -3506,6 +3645,7 @@ let require_valid_concrete ?(query_sigs : query_sig list = [])
     ?(post_rewrite : Type_repr.t -> Type_repr.t = fun ty -> ty)
     ?(box_instances : Ids.Type_id.t list = [])
     ?(box_tid : Ids.Type_id.t option = None)
+    ?(lang_items : Lang_items.t = Lang_items.seed_defaults)
     (prog : program) : (unit, string list) result =
   verify_all
     {
@@ -3515,10 +3655,11 @@ let require_valid_concrete ?(query_sigs : query_sig list = [])
       generic_types = [||];
       query_sigs;
       box_tid;
+      lang_items;
       post_rewrite;
       box_instances;
       copy_cache = Type_properties.create_cache ();
-      drop_plans = Drop_plan.of_program prog;
+      drop_plans = Drop_plan.of_program ~lang_items prog;
     }
     prog
 

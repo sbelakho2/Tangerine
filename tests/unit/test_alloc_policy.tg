@@ -1,16 +1,34 @@
 # tests/unit/test_alloc_policy.tg — behavior suite for std::alloc_policy
 # (the P1-12 allocator-policy contract): the AllocPolicy markers, the
 # deterministic BumpArena (owned + borrowed backing, bump determinism
-# across reset, exhaustion as a null return), and the SlabPool
+# across reset, exhaustion as a null return), the ALIGNMENT-HONORING
+# contract (every power-of-two align through the 64-byte anchor, the
+# Layout entry point, borrowed over-aligned backings), and the SlabPool
 # acquire/release index hand-off over the free list (full-pool
 # rejection, no-op double release, exact teardown of live occupants,
-# deterministic reuse), plus the consumer wiring that funds a
-# fixed-capacity ring from a slab — the no-allocator matching-loop
-# shape.
+# deterministic reuse), plus the ArenaVec arena-backed builder (the
+# audit's allocator-generic row: zero general-heap traffic after
+# construction) and the consumer wiring that funds a fixed-capacity
+# ring from a slab — the no-allocator matching-loop shape.
+#
+# Exact-drop and no-heap-after-init assertions observe the runtime
+# allocator's outstanding-bytes counter (allocated minus freed; freed
+# blocks count at the moment they rejoin the free list) through the
+# same extern the allocator_*_test.tg canaries use.
+#
+# The non-Copy classification of BumpArena / SlabPool / ArenaVec is a
+# COMPILE-TIME property (a registered Drop excludes a type from the
+# structural bit-copy set), so it is pinned by the module's negative
+# canaries — tests/canary_neg/canary_neg_copy_{bump_arena,slab_pool,
+# slab_pool_get_string}.tg — which must FAIL `tg check` (they would
+# compile if the engine classified the types Copy); this file pins the
+# runtime side of the same discipline (exact once-only release).
 
 use std::alloc_policy
 use std::fixed
 use std::core::{Option, Result, Unit}
+
+extern def tg_allocator_outstanding_bytes() -> Int
 
 test "Oracle: BumpArena deterministic bump, exhaustion, zero-overhead reset" do
   var arena = std::alloc_policy::BumpArena::new(64)
@@ -232,4 +250,288 @@ test "Oracle: AllocPolicy markers encode the audit contract" do
   when _ then false
   end
   assert is_fixed
+end
+
+# Probe: a pool's whole lifetime (four String occupants live at the
+# teardown) inside one frame — when the frame returns, the pool's Drop
+# destructs every live occupant exactly once and releases the three
+# init-time allocations. The caller reads the outstanding counter
+# around the call.
+def slab_pool_teardown_probe() -> Unit
+  var pool = std::alloc_policy::SlabPool[String].new(4)
+  match pool.acquire("alpha".to_string())
+  when Ok(_) then ()
+  when Err(_) then ()
+  end
+  match pool.acquire("beta".to_string())
+  when Ok(_) then ()
+  when Err(_) then ()
+  end
+  match pool.acquire("gamma".to_string())
+  when Ok(_) then ()
+  when Err(_) then ()
+  end
+  match pool.acquire("delta".to_string())
+  when Ok(_) then ()
+  when Err(_) then ()
+  end
+end
+
+# Probe: a builder's whole lifetime (constructed, filled, reset,
+# refilled) inside one frame — when the frame returns, the ArenaVec
+# field-glue drops the owned BumpArena, releasing the backing exactly
+# once.
+def arena_vec_teardown_probe() -> Unit
+  var v = std::alloc_policy::ArenaVec[Int].new(32)
+  mut i: UInt = 0
+  while i < 32 do
+    match v.push((i as Int) * 10)
+    when Ok(_) then ()
+    when Err(_) then ()
+    end
+    i = i + 1
+  end
+  v.reset()
+end
+
+test "Oracle: BumpArena honors every power-of-two alignment through 64" do
+  # An arena pre-aligned to the 64-byte anchor serves the whole
+  # power-of-two range: the backing request is padded and the base is
+  # shifted up at construction, so the returned address of every block
+  # is divisible by its requested alignment.
+  var arena = std::alloc_policy::BumpArena::new_aligned(4096, 64)
+  assert arena.capacity() == 4096
+  assert arena.max_align() == 64
+  assert arena.used() == 0
+  let base = arena.buffer()
+  assert ((base as Int) % 64) == 0
+  let p1 = arena.alloc(1, 1)
+  assert !p1.is_null()
+  assert ((p1 as Int) % 1) == 0
+  let p2 = arena.alloc(7, 2)
+  assert !p2.is_null()
+  assert ((p2 as Int) % 2) == 0
+  let p4 = arena.alloc(9, 4)
+  assert !p4.is_null()
+  assert ((p4 as Int) % 4) == 0
+  let p8 = arena.alloc(5, 8)
+  assert !p8.is_null()
+  assert ((p8 as Int) % 8) == 0
+  let p16 = arena.alloc(24, 16)
+  assert !p16.is_null()
+  assert ((p16 as Int) % 16) == 0
+  let p32 = arena.alloc(32, 32)
+  assert !p32.is_null()
+  assert ((p32 as Int) % 32) == 0
+  let p64 = arena.alloc(64, 64)
+  assert !p64.is_null()
+  assert ((p64 as Int) % 64) == 0
+  # The Layout entry point honors Layout { size, align } the same way.
+  match std::alloc::layout_new(64, 32)
+  when Result::Ok(l) then
+    let lp = arena.alloc_layout(l)
+    assert !lp.is_null()
+    assert ((lp as Int) % 32) == 0
+  when Result::Err(_) then
+    assert false
+  end
+  # reset determinism retained: the SAME sequence after a reset returns
+  # the SAME addresses (the base shift is fixed at construction), at
+  # the same aligned offsets.
+  arena.reset()
+  assert arena.used() == 0
+  assert arena.remaining() == 4096
+  let q1 = arena.alloc(1, 1)
+  assert (q1 as Int) == (p1 as Int)
+  let q2 = arena.alloc(7, 2)
+  assert (q2 as Int) == (p2 as Int)
+  let q4 = arena.alloc(9, 4)
+  assert (q4 as Int) == (p4 as Int)
+  assert arena.used() == 21
+end
+
+test "Oracle: BumpArena default new() keeps the 16-byte backing contract" do
+  # new(capacity) allocates the backing with NO alignment headroom (the
+  # std::alloc contract: power-of-two aligns <= 16); the base is the
+  # runtime's 16-aligned payload.
+  var arena = std::alloc_policy::BumpArena::new(256)
+  assert arena.capacity() == 256
+  assert arena.max_align() == 16
+  assert arena.used() == 0
+  let base = arena.buffer()
+  assert ((base as Int) % 16) == 0
+  let s1 = arena.alloc(24, 16)
+  assert !s1.is_null()
+  assert ((s1 as Int) % 16) == 0
+  let s2 = arena.alloc(8, 8)
+  assert ((s2 as Int) % 8) == 0
+  arena.reset()
+  assert arena.used() == 0
+end
+
+test "Oracle: BumpArena with_buffer_aligned serves an over-aligned borrowed backing" do
+  # The borrowed form over a caller-pre-aligned backing (a static
+  # over-aligned buffer in the embedded policy): the caller claims the
+  # base alignment at construction and alloc verifies every returned
+  # address. Here the backing is another arena's 64-aligned base.
+  var owner = std::alloc_policy::BumpArena::new_aligned(2048, 64)
+  let base = owner.buffer()
+  assert ((base as Int) % 64) == 0
+  var borrowed = std::alloc_policy::BumpArena::with_buffer_aligned(base, 2048, 64)
+  assert borrowed.capacity() == 2048
+  assert borrowed.max_align() == 64
+  let b1 = borrowed.alloc(40, 32)
+  assert !b1.is_null()
+  assert ((b1 as Int) % 32) == 0
+  let b2 = borrowed.alloc(64, 64)
+  assert !b2.is_null()
+  assert ((b2 as Int) % 64) == 0
+  borrowed.reset()
+  assert borrowed.used() == 0
+  let c1 = borrowed.alloc(64, 64)
+  assert !c1.is_null()
+  assert ((c1 as Int) % 64) == 0
+  assert (c1 as Int) == (base as Int)
+end
+
+test "Oracle: SlabPool acquire/release cycles drop occupants exactly" do
+  # Exact drop is observable through the allocator's outstanding-bytes
+  # counter: every String created for an acquire is destructed exactly
+  # once when its release's returned value is discarded, so after a
+  # full acquire/release cycle the counter returns EXACTLY to the
+  # after-init level (the pool's own arenas stay live throughout).
+  let before = tg_allocator_outstanding_bytes()
+  var pool = std::alloc_policy::SlabPool[String].new(4)
+  let after_init = tg_allocator_outstanding_bytes()
+  assert after_init > before
+  match pool.acquire("alpha".to_string())
+  when Ok(i) then assert i == 0
+  when Err(_) then assert false
+  end
+  match pool.acquire("beta".to_string())
+  when Ok(i) then assert i == 1
+  when Err(_) then assert false
+  end
+  match pool.acquire("gamma".to_string())
+  when Ok(i) then assert i == 2
+  when Err(_) then assert false
+  end
+  match pool.acquire("delta".to_string())
+  when Ok(i) then assert i == 3
+  when Err(_) then assert false
+  end
+  assert pool.len() == 4
+  let after_acquire = tg_allocator_outstanding_bytes()
+  assert after_acquire > after_init
+  match pool.release(0)
+  when Option::Some(s) then assert s == "alpha"
+  when Option::None then assert false
+  end
+  match pool.release(1)
+  when Option::Some(s) then assert s == "beta"
+  when Option::None then assert false
+  end
+  match pool.release(2)
+  when Option::Some(s) then assert s == "gamma"
+  when Option::None then assert false
+  end
+  match pool.release(3)
+  when Option::Some(s) then assert s == "delta"
+  when Option::None then assert false
+  end
+  assert pool.len() == 0
+  # Every occupant destructed exactly once: the counter is back at the
+  # after-init level — no leaked String object, no double drop.
+  assert tg_allocator_outstanding_bytes() == after_init
+end
+
+test "Oracle: SlabPool teardown drops live occupants and releases arenas exactly once" do
+  # The registered Drop's teardown scan destructs each live occupant
+  # (the Strings' own drops release their objects and data buffers) and
+  # then releases the slot arena + both metadata buffers — the
+  # outstanding counter returns EXACTLY to the pre-construction level.
+  let before = tg_allocator_outstanding_bytes()
+  slab_pool_teardown_probe()
+  assert tg_allocator_outstanding_bytes() == before
+end
+
+test "Oracle: ArenaVec builder - zero general-heap traffic after construction" do
+  # The audit's no-heap-after-init row: construction performs the
+  # builder's ONE allocator call; push/get/len/reset afterwards are
+  # bump-pointer and field work — the outstanding counter stays at the
+  # after-construction level through fill, full rejection, reads and a
+  # reset-refill cycle.
+  let before = tg_allocator_outstanding_bytes()
+  var v = std::alloc_policy::ArenaVec[Int].new(16)
+  assert v.capacity() == 16
+  assert v.len() == 0
+  assert v.is_empty()
+  let after_init = tg_allocator_outstanding_bytes()
+  assert after_init > before
+  mut i: UInt = 0
+  while i < 16 do
+    match v.push((i as Int) + 1)
+    when Ok(_) then ()
+    when Err(_) then assert false
+    end
+    i = i + 1
+  end
+  assert v.len() == 16
+  assert v.is_full()
+  match v.push(999)
+  when Ok(_) then assert false
+  when Err(x) then assert x == 999
+  end
+  match v.get(0)
+  when Option::Some(x) then assert x == 1
+  when Option::None then assert false
+  end
+  match v.get(7)
+  when Option::Some(x) then assert x == 8
+  when Option::None then assert false
+  end
+  match v.get(15)
+  when Option::Some(x) then assert x == 16
+  when Option::None then assert false
+  end
+  match v.get(16)
+  when Option::Some(_) then assert false
+  when Option::None then assert true
+  end
+  assert tg_allocator_outstanding_bytes() == after_init
+  v.reset()
+  assert v.is_empty()
+  assert v.len() == 0
+  match v.get(0)
+  when Option::Some(_) then assert false
+  when Option::None then assert true
+  end
+  i = 0
+  while i < 16 do
+    match v.push((i as Int) + 100)
+    when Ok(_) then ()
+    when Err(_) then assert false
+    end
+    i = i + 1
+  end
+  match v.get(3)
+  when Option::Some(x) then assert x == 103
+  when Option::None then assert false
+  end
+  match v.get(15)
+  when Option::Some(x) then assert x == 115
+  when Option::None then assert false
+  end
+  # Flat through the whole cycle: zero general-heap calls after init.
+  assert tg_allocator_outstanding_bytes() == after_init
+end
+
+test "Oracle: ArenaVec teardown releases the backing exactly once" do
+  # ArenaVec declares no registered Drop — the owned BumpArena field is
+  # released exactly once by the engine's field-drop glue when the
+  # builder goes out of scope: the outstanding counter returns to the
+  # pre-construction level.
+  let before = tg_allocator_outstanding_bytes()
+  arena_vec_teardown_probe()
+  assert tg_allocator_outstanding_bytes() == before
 end

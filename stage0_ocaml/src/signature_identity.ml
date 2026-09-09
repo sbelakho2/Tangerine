@@ -52,6 +52,10 @@
    the alpha rules — the driver uses it to keep the ref-bearing
    signatures fail-closed (their semantics are not implementable on the
    value-model host, so no rewrite may ever be invented for them).
+   The strict escape applies to the TYPE comparison only: every
+   parameter's convention is compared FIRST and unconditionally
+   (match_param, below), so strict_when can never mask a convention
+   drift — the boolean matcher and the first-disagreement report agree.
 
    This module is a leaf of the compiler's dependency graph (it depends
    only on Type_repr/Ids/Access_effect/Intrinsic_registry), so every
@@ -236,10 +240,40 @@ let rec types_agree (bm : BinderMaps.t) (a : Type_repr.t) (b : Type_repr.t) : bo
       m1 = m2 && types_agree bm t1 t2
   | a, b -> Type_repr.compare a b = 0
 
+(* The per-parameter verdict used by BOTH the boolean matcher
+   (match_signature) and the first-disagreement report (first_mismatch)
+   so the two can never disagree.  The convention is compared FIRST and
+   unconditionally (P0-4 — the {convention; type} key): strict_when is
+   an escape for the TYPE comparison only, never for the convention.
+   strict_when is a property of the RAW pair (the driver's ref-kind
+   rule); the strict comparison itself runs on the canonicalized types. *)
+type param_match =
+  | Param_match
+  | Convention_mismatch
+  | Type_mismatch
+
+let match_param ~bm ~(canon_left : Type_repr.t -> Type_repr.t)
+    ~(canon_right : Type_repr.t -> Type_repr.t)
+    ~(strict_when : Type_repr.t -> Type_repr.t -> bool)
+    (p1 : Type_repr.param_type) (p2 : Type_repr.param_type) : param_match =
+  if Access_effect.compare p1.Type_repr.pt_convention p2.Type_repr.pt_convention <> 0
+  then Convention_mismatch
+  else if strict_when p1.Type_repr.pt_type p2.Type_repr.pt_type then
+    if
+      Type_repr.compare (canon_left p1.Type_repr.pt_type) (canon_right p2.Type_repr.pt_type)
+      <> 0
+    then Type_mismatch
+    else Param_match
+  else if types_agree bm (canon_left p1.Type_repr.pt_type) (canon_right p2.Type_repr.pt_type)
+  then Param_match
+  else Type_mismatch
+
 (* ── The shared matcher, raw-piece API ──────────────────────────────
 
    match_signature ~params_left ~ret_left ~params_right ~ret_right:
-     - every parameter's convention must agree exactly (P0-4);
+     - every parameter's convention must agree exactly (P0-4); the
+       convention is compared FIRST and unconditionally (match_param —
+       strict_when never bypasses it);
      - arities must agree;
      - per-parameter types and the return agree under ONE binder
        bijection shared across the whole signature (P0-2), exact TypeId
@@ -267,30 +301,14 @@ let match_signature
   else begin
     let bm = BinderMaps.create () in
     let ok = ref true in
-    let pair (p1 : Type_repr.param_type) (p2 : Type_repr.param_type) =
-      if
-        Access_effect.compare p1.Type_repr.pt_convention p2.Type_repr.pt_convention <> 0
-        || not (types_agree bm (canon_left p1.Type_repr.pt_type) (canon_right p2.Type_repr.pt_type))
-      then ok := false
-    in
-    (* strict_when is a property of the RAW pair (the driver's
-       ref-kind rule); the strict comparison itself runs on the
-       canonicalized types *)
     Array.iteri
       (fun i (p : Type_repr.param_type) ->
         if !ok then
-          let a_raw = params_left.(i) in
-          if
-            strict_when a_raw.Type_repr.pt_type p.Type_repr.pt_type
-          then begin
-            if
-              Type_repr.compare
-                (canon_left a_raw.Type_repr.pt_type)
-                (canon_right p.Type_repr.pt_type)
-              <> 0
-            then ok := false
-          end
-          else pair a_raw p)
+          match
+            match_param ~bm ~canon_left ~canon_right ~strict_when params_left.(i) p
+          with
+          | Param_match -> ()
+          | Convention_mismatch | Type_mismatch -> ok := false)
       params_right;
     if not !ok then false
     else if strict_when ret_left ret_right then
@@ -337,31 +355,15 @@ let first_mismatch
   if na <> nb then Some (Mismatch_arity (na, nb))
   else begin
     let bm = BinderMaps.create () in
-    let param_pair i (p1 : Type_repr.param_type) (p2 : Type_repr.param_type) =
-      if Access_effect.compare p1.Type_repr.pt_convention p2.Type_repr.pt_convention <> 0
-      then Some (Mismatch_param i)
-      else if
-        strict_when p1.Type_repr.pt_type p2.Type_repr.pt_type
-      then
-        if
-          Type_repr.compare
-            (canon_left p1.Type_repr.pt_type)
-            (canon_right p2.Type_repr.pt_type)
-          <> 0
-        then Some (Mismatch_param i)
-        else None
-      else if
-        types_agree bm (canon_left p1.Type_repr.pt_type)
-          (canon_right p2.Type_repr.pt_type)
-      then None
-      else Some (Mismatch_param i)
-    in
     let rec go i =
       if i >= na then None
       else
-        match param_pair i a.sig_params.(i) b.sig_params.(i) with
-        | Some m -> Some m
-        | None -> go (i + 1)
+        match
+          match_param ~bm ~canon_left ~canon_right ~strict_when a.sig_params.(i)
+            b.sig_params.(i)
+        with
+        | Param_match -> go (i + 1)
+        | Convention_mismatch | Type_mismatch -> Some (Mismatch_param i)
     in
     match go 0 with
     | Some m -> Some m

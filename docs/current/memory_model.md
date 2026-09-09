@@ -1192,13 +1192,17 @@ The per-target fence instructions are in the §16.8 tables.
 Tangerine has **no `volatile` type qualifier** and no volatile access
 keyword: the C-style `volatile` concept is spelled as the explicit
 width-exact accessors `_tg_volatile_read8/16/32/64` and
-`_tg_volatile_write8/16/32/64` (std/embedded.tg, lowered to the
-dedicated runtime functions emitted by `runtime.tg`
-`emit_volatile_runtime` on both arches).
+`_tg_volatile_write8/16/32/64` (std/embedded.tg). Each call stays an
+opaque call through the MIR optimizer (no pass can elide, merge, fold,
+hoist or sink it) and codegen inlines it to the target's width-exact
+LDR/STR-family instruction (codegen.tg `try_emit_volatile_builtin`,
+mirroring the `__intrinsic_atomic_*` slice); the `emit_volatile_runtime`
+functions in runtime.tg remain the alternate-route fallback (the LIR
+route and pre-inline binaries).
 
 | Property | Volatile (`_tg_volatile_*`) | Atomic (`__intrinsic_atomic_*`) |
 |----------|------------------------------|----------------------------------|
-| Access semantics | a single, width-exact, non-elidable load/store; each call performs exactly one access (the call boundary is opaque to any optimizer) | a single atomic load/store/RMW/CAS per intrinsic call |
+| Access semantics | a single, width-exact, non-elidable load/store; each call performs exactly one access (the opaque call boundary no optimizer pass can cross or remove) | a single atomic load/store/RMW/CAS per intrinsic call |
 | Ordering guarantees | **none** — volatile accesses participate in NO ordering relation of this model; they are not ordered with atomics, fences, or each other (except by program order for the same single access) | the ordering argument's guarantees (§16.2, §16.8) |
 | Atomicity | **never atomic**: a volatile access racing any other access is a data race (UB, §16.4) | atomic |
 | Purpose | MMIO registers, device memory, interrupt-handler shared flags (audit P1-16: MMIO access is permitted in handlers) | lock-free shared memory between threads |

@@ -1,0 +1,164 @@
+# tests/unit/test_fixed_spsc_drop.tg — the SPSC close drop discipline
+# under the packed CLOSED scheme (audit §21): every item destroyed
+# EXACTLY once across the close transitions.
+#
+# The state machine the suite pins down:
+#   (a) rx drop (close) does not destroy buffered items — the CLOSED
+#       CAS is the close linearization point and only rejects later
+#       pushes;
+#   (b) a push rejected after close returns the item, and the caller's
+#       drop destroys it exactly once;
+#   (c) when the LAST endpoint drops, the record glue destructs every
+#       item still buffered exactly once (rx dropped first, or tx
+#       dropped first — both orders);
+#   (d) pops transfer ownership: the caller destroys the popped item
+#       exactly once, and the slot the pop vacated is never
+#       double-destroyed by the glue.
+#
+# Counting mechanism (the tests/thread_spawn_failure_test.tg
+# convention): a module-level drop counter incremented by the element
+# type's registered Drop. Each @test resets it and asserts the exact
+# per-phase totals.
+
+use std::fixed
+use std::core::{Option, Result, Unit, Int}
+use std::test::*
+
+mut drop_counter: Int = 0
+
+struct TrackedItem
+  id: Int
+end
+
+impl Drop for TrackedItem
+  def drop(inout self: TrackedItem) -> Unit
+    drop_counter = drop_counter + 1
+  end
+end
+
+@test
+def test_spsc_close_rx_first_destroys_buffered_exactly_once() -> Unit
+  drop_counter = 0
+  let pair = std::fixed::SpscQueue4[TrackedItem].new()
+  var tx = pair.0
+  let rx = pair.1
+  let _ = tx.push(TrackedItem { id: 1 })
+  let _ = tx.push(TrackedItem { id: 2 })
+  # Buffered items are live: nothing destroyed yet.
+  assert_eq(drop_counter, 0)
+  # CLOSE: the CLOSED CAS linearization — buffered items untouched.
+  drop(rx)
+  assert_eq(drop_counter, 0)
+  # A push after close is rejected with the item back; destroying the
+  # rejected payload is the caller's job (exactly once).
+  match tx.push(TrackedItem { id: 3 })
+  when Result::Ok(_) then assert_false(true)
+  when Result::Err(item) then drop(item)
+  end
+  assert_eq(drop_counter, 1)
+  # The two buffered items stay queued after close.
+  assert_eq(tx.len(), 2)
+  # The LAST endpoint drop runs the record glue: the two buffered
+  # items are destructed exactly once each.
+  drop(tx)
+  assert_eq(drop_counter, 3)
+end
+
+@test
+def test_spsc_rx_last_drop_closes_then_glues() -> Unit
+  drop_counter = 0
+  let pair = std::fixed::SpscQueue4[TrackedItem].new()
+  var tx = pair.0
+  var rx = pair.1
+  let _ = tx.push(TrackedItem { id: 1 })
+  let _ = tx.push(TrackedItem { id: 2 })
+  assert_eq(drop_counter, 0)
+  # tx drops FIRST: the queue stays open, rx keeps draining.
+  drop(tx)
+  match rx.pop()
+  when Option::Some(item) then drop(item)
+  when Option::None then assert_false(true)
+  end
+  # Popped item destroyed by its caller exactly once.
+  assert_eq(drop_counter, 1)
+  assert_eq(rx.len(), 1)
+  # rx drops LAST: close (the CLOSED CAS) runs, then the record glue
+  # destructs the remaining buffered item exactly once.
+  drop(rx)
+  assert_eq(drop_counter, 2)
+end
+
+@test
+def test_spsc_close_reject_loop_is_stable() -> Unit
+  drop_counter = 0
+  let pair = std::fixed::SpscQueue4[TrackedItem].new()
+  var tx = pair.0
+  let rx = pair.1
+  drop(rx)
+  # Repeated rejected pushes: every item returns to the caller and
+  # every caller-side drop is exactly one destruction; the closed
+  # queue never consumes a slot.
+  var i = 0
+  while i < 4 do
+    match tx.push(TrackedItem { id: 100 + i })
+    when Result::Ok(_) then assert_false(true)
+    when Result::Err(item) then drop(item)
+    end
+    i = i + 1
+  end
+  assert_eq(drop_counter, 4)
+  assert_eq(tx.len(), 0)
+  drop(tx)
+  assert_eq(drop_counter, 4)
+end
+
+@test
+def test_spsc8_close_after_ring_wrap_destroys_exactly_once() -> Unit
+  drop_counter = 0
+  let pair = std::fixed::SpscQueue8[TrackedItem].new()
+  var tx = pair.0
+  var rx = pair.1
+  # Fill the 8-slot ring, pop through the first three slots, then push
+  # again so the head counter wraps its mask (head reaches 11: the new
+  # items land in the vacated slots 0..2).
+  var i = 0
+  while i < 8 do
+    match tx.push(TrackedItem { id: i })
+    when Result::Ok(_) then ()
+    when Result::Err(_) then assert_false(true)
+    end
+    i = i + 1
+  end
+  var popped = 0
+  while popped < 3 do
+    match rx.pop()
+    when Option::Some(item) then
+      # FIFO across the wrap: the first three pops return 0, 1, 2.
+      assert_true(item.id == popped)
+      drop(item)
+    when Option::None then assert_false(true)
+    end
+    popped = popped + 1
+  end
+  assert_eq(drop_counter, 3)
+  assert_eq(rx.len(), 5)
+  i = 8
+  while i < 11 do
+    match tx.push(TrackedItem { id: i })
+    when Result::Ok(_) then ()
+    when Result::Err(_) then assert_false(true)
+    end
+    i = i + 1
+  end
+  assert_eq(tx.len(), 8)
+  assert_eq(drop_counter, 3)
+  # Close with the full wrapped buffer: the CLOSED CAS leaves the 8
+  # buffered items queued; the last endpoint's glue destructs each
+  # exactly once (3 popped + 8 glued == all 11 pushed items).
+  drop(rx)
+  assert_eq(drop_counter, 3)
+  assert_eq(tx.len(), 8)
+  drop(tx)
+  assert_eq(drop_counter, 11)
+end
+

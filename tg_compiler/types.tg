@@ -82,28 +82,70 @@ use tg_compiler::resource_check::{AnalyzedProgram, TypedCFG, analysis_context_ne
 #     +0.0 and (-0.0) + (-0.0) = -0.0); loads/stores/moves preserve
 #     the sign bit exactly. No emitted sequence canonicalizes or
 #     flushes zero.
-#   * float -> int conversion — the SPECIFIED (trap-free, fully
-#     defined) per-target rule, unchanged by @fp(fast):
-#       - AArch64: FCVTZS — truncation toward zero; a NaN operand
-#         gives 0; a value outside the signed 64-bit range SATURATES
-#         (a value >= 2^63 gives INT64_MAX, a value < -2^63 gives
-#         INT64_MIN);
-#       - x86-64: CVTTSD2SI — a NaN operand or any out-of-range value
-#         gives the integer indefinite 0x8000000000000000 (INT64_MIN).
+#   * float -> int conversion — the SPECIFIED (§25 audit) SATURATING,
+#     trap-free, fully defined rule — ONE language rule on EVERY target,
+#     unchanged by @fp(fast):
+#       - NaN (any payload/sign) -> 0;
+#       - a value >= 2^63 (including +inf) -> INT64_MAX;
+#       - a value < -2^63 (including -inf) -> INT64_MIN;
+#       - otherwise the value TRUNCATES toward zero (the exact value
+#         -2^63 is in range and converts to INT64_MIN).
+#     The hardware conversions are NOT this rule on either target — the
+#     raw AArch64 FCVTZS and x86-64 CVTTSD2SI both return the integer
+#     indefinite 0x8000000000000000 (INT64_MIN) for NaN AND for every
+#     out-of-range input (the a64 "NaN -> 0 / saturation" claim of the
+#     earlier P1-6 note describes the ARMv7 VFP VCVT, not FCVTZS) — so
+#     codegen.tg's emission (the codegen_float_binop/cast sites) and
+#     the LIR a64 slice (lir.tg's LirFloatToInt emitter) append the
+#     deterministic saturating fixup (emit_ftoi_saturate_a64 /
+#     emit_ftoi_saturate_x64): NaN is detected with an ordered
+#     self-compare and replaced by 0; the sign of the ordered source
+#     picks the clamped bound (INT64_MAX for >= 2^63, INT64_MIN
+#     otherwise — the exact -2^63 in-range case keeps its correct
+#     INT64_MIN). The wasm target emits the equivalent i*.trunc_sat_*
+#     opcodes (same table), and the cortex-m route's VFP VCVT.S32
+#     saturates natively at its 32-bit word width.
 #     @fp(fast)'s finite-only assumption never demotes an invalid
 #     conversion to undefined behavior — the cast rule above always
 #     holds.
+#   * The FP environment is LANGUAGE-ESTABLISHED — strict mode does not
+#     depend on ambient FPCR/MXCSR state: every emitted function whose
+#     body performs float math (any float-typed local/parameter or an
+#     int<->float cast — mir_func_uses_fp) ESTABLISHES the strict
+#     environment in its prologue (AArch64: msr fpcr, xzr — RMode=0
+#     (round-to-nearest-even), FZ/FZ16 cleared, no trap enables; x86-64:
+#     ldmxcsr with 0x1F80 — RNE, FTZ/DAZ cleared, all exceptions
+#     masked), so a host process that mutated its rounding/flush state
+#     can never change a strict function's language-defined results.
+#     Mutating the FP environment at runtime (std::float_control's
+#     set_rounding_mode / set_denormal_mode — a HARDWARE effect, see
+#     std/float_control.tg) is therefore an unsafe, FFI-scoped action:
+#     it must be restored around external code and never relied on to
+#     change ordinary language float operations (the next entry of any
+#     float-using Tangerine function re-establishes RNE/no-FTZ).
 #   * No contraction — every arithmetic operation rounds EXACTLY once:
 #     an a*b+c pattern compiles to a multiply and an add, each rounded
 #     separately; no fmadd/fmla fusion ever occurs in strict mode.
 #   * No reassociation — operand evaluation order and association are
 #     fixed by the source and the MIR; no pass reorders or
 #     re-associates float operations.
-#   * Subnormals preserved — no flush-to-zero anywhere: codegen never
-#     writes FPCR/MXCSR (or any FP control register) and no emitted
-#     instruction flushes subnormals.
-#   * Rounding — round-to-nearest-even, the target's default FPCR /
-#     MXCSR state (never modified by codegen).
+#   * Subnormals preserved — no flush-to-zero anywhere: the strict
+#     environment established at function entry (above) clears FPCR
+#     FZ / MXCSR FTZ+DAZ, and no emitted instruction flushes
+#     subnormals.
+#   * Rounding — round-to-nearest-even for every ordinary float
+#     operation, guaranteed by the environment establishment at the
+#     entry of every float-using function (above); conversions that are
+#     rounding-mode-independent by construction (FCVTZS/FCVTZS-style
+#     truncations, the fcvtzs digit extraction in runtime.tg) never
+#     depend on it.
+#
+# The rounding-mode-explicit surface (std::float_control's
+# RoundingMode/DenormalMode + guards) does NOT route ordinary language
+# ops: explicit modes are host-environment mutations that apply only to
+# the code between the mutation and the next established entry — i.e.
+# inline-asm regions and external (FFI) code. There is no language
+# construct that makes an ordinary + - * / round with a non-RNE mode.
 #
 # @fp(fast) is the opt-in, PER-FUNCTION relaxation of the above
 # (reassociation, reciprocal approximations, contraction/FMA,
@@ -191,6 +233,23 @@ enum Type
   # Array[T] Adt.
   FixedArray(Type, Int)
   
+  # (§20 const generics, slice 1): a fixed inline array whose count is a
+  # SYMBOLIC generic const parameter — the [T; N] annotation inside a
+  # generic body whose size expression is the const parameter `N` itself
+  # (`struct ArrayVec[T, const N: UInt] { data: [Option[T]; N] }`). The
+  # count's GenericParamId is the const parameter's identity (the symbolic
+  # size CANNOT be the parameter's index: substitution and canonical
+  # identity are id-keyed — (owner, index) — never the declaration index
+  # alone). The symbolic form is a CHECKER-ONLY type: substitution
+  # (subst_type_args) replaces it with a concrete Type::FixedArray when the
+  # const parameter's argument is Type::Const(v), and with another
+  # FixedArraySym when the argument is itself a const parameter of the
+  # enclosing scope. The layout engine must never see it (mono substitutes
+  # const-generic bodies before layout — slice 2 wires that; until then the
+  # layout query fails closed through the explicit Repr::Invalid guard and
+  # the codegenability scans flag it like a residual Type::Param).
+  FixedArraySym(Type, GenericParamId)
+  
  # (FnPtr/Closure split): a FUNCTION POINTER — the signature (the
   # parameter list with access conventions, the return type), the
   # EFFECT SET (Vec[EffectId]) and NO environment. Layout: a single code
@@ -248,6 +307,33 @@ enum Type
   # equality.
   Param(GenericParamId)
   
+  # (§20 const generics, slice 1): a compile-time VALUE — an integer
+  # constant — as a generic ARGUMENT (the argument of a const generic
+  # parameter position: `ArrayVec[U8, 16]` resolves its second argument to
+  # Type::Const(16)). Const args RIDE the ordinary instantiation vectors
+  # (Vec[Type]) positionally — the flat arity of a declaration counts its
+  # type parameters AND its const parameters, each const position holding a
+  # Type::Const — so the existing substitution/instantiation machinery
+  # needs no GenericArg widening. Canonical identity is the VALUE:
+  # Const(4) == Const(4), Const(4) != Const(8) (folding of const
+  # EXPRESSIONS such as 2+2 into 4 is slice 2; until then a const argument
+  # is a literal only). Const is NOT a value type: it never appears in a
+  # field/param/local type position (layout guards it Invalid); it exists
+  # in generic-arg vectors, canonical keys and mono substitution lists.
+  Const(Int)
+  
+  # (§20 const generics, slice 1): the SYMBOLIC reference to a const generic
+  # parameter — the checker's binding of the parameter NAME inside its own
+  # generic body and the value-level argument form of an enclosing-scope
+  # const parameter (`impl[T, const N: UInt] Trait for ArrayVec[T, N]`
+  # resolves the self-type's second argument to ConstParam(N)). Identity is
+  # the GenericParamId ((owner, index) — ConstParam(a) alpha-equals
+  # ConstParam(b) exactly when a == b). Value-level references to a const
+  # parameter (arithmetic, `return N`) have no codegen while generic and
+  # are rejected where a concrete value is required (codegenability scans
+  # flag ConstParam like a residual Type::Param).
+  ConstParam(GenericParamId)
+  
   # Error type (for error recovery)
   Error
 end
@@ -271,9 +357,10 @@ end
 # EFFECT-CLASS ANNOTATIONS (the recognized @no_alloc / @no_block / @no_io /
 # @irq_safe / @interrupt claims — the @effects(no_alloc, no_block, no_io)
 # list spelling included — parsed from the item's attributes — audit
-# P1-2/P1-16; the checker's classifier PROVES them, see
-# check_effect_class_annotations) so the effect/budget semantics survive
-# checking into the MIR.
+# P1-2/P1-16/§11; the MIR-side pass PROVES them
+# against the lowered program — see mir.tg's
+# check_effect_class_annotations_mir) so the effect/budget semantics
+# survive checking into the MIR.
 struct FnSignature
   params: Vec[ParamType]
   ret_type: Type
@@ -312,10 +399,16 @@ end
 # (audit P1-2 / P1-16) effect-class annotations — the typed annotation
 # domain
 # ———————————————————————————————————————————————————————————————
-# The declared per-function annotations the checker PROVES by classifying
-# the function's body into three behavioral classes (EffectClass) and
-# propagating the classes through the recorded call graph to a fixed point
-# (the pass at check_effect_class_annotations):
+# The declared per-function annotations the compiler PROVES (audit §11)
+# by computing each function's TRANSITIVE semantic effect summary over
+# the lowered MIR — the summary of what executes (the union of the
+# function's statement/terminator operation records — every intrinsic
+# and compiler-generated lowering step carries one — plus its callees'
+# summaries to a fixed point; the three behavioral classes are the class
+# view over the EffectSummary record: Alloc = may_allocate, Block =
+# may_block OR may_sleep, Io = may_io). The enforcement pass lives in
+# mir.tg (check_effect_class_annotations_mir), run by the front-end
+# phases on the lowered program:
 #   @no_alloc  — the function never heap-allocates (no Vec/String growth,
 #                no closure boxing, no heap-backed formatting, and every
 #                function it calls has known allocation behavior);
@@ -1501,6 +1594,10 @@ pub def build_deinit_plan(typed: TypedProgram, ty: Type, depth: Int, inout visit
     # The fixed array stores its elements INLINE: the drop glue walks the n
     # elements (no heap backing to release).
     DeinitPlan::Array(build_deinit_plan(typed, &elem, depth + 1, visited, errors))
+  when Type::FixedArraySym(elem, _) then
+    # (§20 slice 1): the symbolic-size array mirrors the concrete form — the
+    # drop glue walks the elements INLINE regardless of the (parameter) count.
+    DeinitPlan::Array(build_deinit_plan(typed, &elem, depth + 1, visited, errors))
   when Type::String then DeinitPlan::String
   when _ then DeinitPlan::Trivial
   end
@@ -2144,51 +2241,27 @@ struct TypeEnv
   # never checked against its own declarations.
   fn_effect_modules: Map[String, Vec[String]] = Map::new()
   # ———————————————————————————————————————————————
-  # (audit P1-2 / P1-16) the effect-CLASS tables — the @no_alloc /
-  # @no_block / @no_io / @irq_safe / @interrupt proof machinery (def-key
-  # domain — fn_effect_def_key, the SAME key the call-recording sites
-  # use)
+  # (audit P1-2 / P1-16 + §11) the effect-CLASS claim tables — the
+  # @no_alloc / @no_block / @no_io / @irq_safe / @interrupt proof
+  # records (def-key domain — fn_effect_def_key, the SAME key the
+  # registration sites use)
   # ———————————————————————————————————————————————
-  # The checker PROVES the declared annotations by classifying every
-  # body-bearing function into the behavioral classes (Alloc / Block /
-  # Io) and propagating the classes through the recorded call graph
-  # (fn_call_graph) to a fixed point (check_effect_class_annotations).
-  # The tables:
+  # The tables REGISTER the claims here (body checking); the PROOF runs
+  # on the lowered program (audit §11 — mir.tg's
+  # check_effect_class_annotations_mir computes the transitive semantic
+  # summaries over the MIR and verifies the claims against what
+  # executes — the source-syntax classifier that once consumed the
+  # direct/evidence/set tables is gone):
   #   fn_class_claims     — def-key -> the recognized annotation claims
   #                         (attribute spans and the as-written
   #                         attribute form ride along for the
   #                         diagnostics); registered only for functions
   #                         whose item carries the attributes;
-  #   fn_class_names      — def-key -> display name of every BODY-BEARING
-  #                         function/method in the compilation (the
-  #                         presence test: a callee whose key is absent
-  #                         has no body here and classifies foreign/
-  #                         unknown unless a seed/clean record covers it);
-  #   fn_class_direct     — def-key -> the classes the function's OWN
-  #                         body performs (heap constructors, closure
-  #                         boxing, growing String/container operations,
-  #                         heap-backed formatting, raw syscalls, calls
-  #                         into seeded externs);
-  #   fn_class_evidence   — def-key -> one evidence phrase per class slot
-  #                         ([0]=Alloc [1]=Block [2]=Io — the first site
-  #                         that dirtied the class; empty slot = no
-  #                         evidence yet; effect_class_slot_index);
-  #   fn_class_set        — def-key -> the FINAL computed class set (the
-  #                         fixed-point result: direct + transitive);
-  #   fn_class_clean      — the def-keys of router-classified benign
-  #                         intrinsic externs (bodyless callees known to
-  #                         never allocate/block/perform I/O);
-  #   fn_class_edge_names — caller key -> callee key -> the callee's
-  #                         source name at the call site (the extern-seed
-  #                         lookups and the diagnostics for bodyless
-  #                         callees).
+  #   fn_class_names      — def-key -> the source display name of every
+  #                         body-bearing function (the MIR pass echoes it
+  #                         in the E0232 diagnostics).
   fn_class_claims: Map[String, Vec[EffectClassClaim]] = Map::new()
   fn_class_names: Map[String, String] = Map::new()
-  fn_class_direct: Map[String, Vec[EffectClass]] = Map::new()
-  fn_class_evidence: Map[String, Vec[String]] = Map::new()
-  fn_class_set: Map[String, Vec[EffectClass]] = Map::new()
-  fn_class_clean: Set[String] = Set::new()
-  fn_class_edge_names: Map[String, Map[String, String]] = Map::new()
   # ———————————————————————————————————————————————
   # the algebraic-effects typed records
   # ———————————————————————————————————————————————
@@ -2531,17 +2604,47 @@ struct LocalBinding
   ty: Type
 end
 
-# (audit P1-1, first pass): one ACTIVE with-scoped access binding (the
+# (audit §12): one segment of a with-scoped access SOURCE PLACE chain —
+# the SEMANTIC identity of the accessed subplace. F(i) is a field access
+# whose typed FieldId index is i (the declaration-order identity the
+# projected move lattice uses); I(i) is an index projection with the
+# constant i, I(-1) a dynamic index (all dynamic indices of one container
+# collapse to one identity — the conservative lattice).
+enum ScopedPlaceSeg
+  F(Int)
+  I(Int)
+end
+
+# (audit §12): one ACTIVE with-scoped access binding (the
 # `with <expr> as let/inout <name>` statement). local_id is the semantic
 # local id the body's uses of <name> resolve to (the entry of the
 # scoped_access_stack in TypeEnv); effect is Read for the `let` form and
 # Modify for the `inout` form. The record exists ONLY while the with body
 # is checked; out-of-body uses of the name are unknown symbols (the name's
 # lexical scope is the body).
+#
+# The bound name is a COMPILER-ONLY PLACE ACCESS (audit §12), never an
+# owned copied value: src_root + src_segs are the semantic source place
+# the access aliases (the element's subplace); src_owns says the accessed
+# element type owns state (String/structs/containers — the Copy-only
+# first-pass restriction was lifted for these place sources, which bind
+# ZERO-COPY through the source address). For a Vec/Map element source,
+# parent_root + parent_segs identify the PARENT CONTAINER place whose
+# mutating operations (push/reserve/insert/remove/rehash...) may
+# invalidate the element's storage while the access is live. accessor is
+# the Map-entry accessor name ("", "get_read", "get_modify") when the
+# source is an accessor call (its binding keeps the Copy-value snapshot
+# semantics of the container half).
 struct ScopedAccessBinding
   local_id: Int
   name: String
   effect: AccessEffect
+  src_root: Int
+  src_segs: Vec[ScopedPlaceSeg]
+  src_owns: Bool
+  parent_root: Int
+  parent_segs: Vec[ScopedPlaceSeg]
+  accessor: String
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -4877,6 +4980,17 @@ def collect_builtin_param_ids(ty: Type, inout seen: Vec[GenericParamId]) -> Unit
       i = i + 1
     end
   when Type::FixedArray(elem, _) then collect_builtin_param_ids(elem, seen)
+  when Type::FixedArraySym(elem, gpid) then
+    # (§20 slice 1): the symbolic-size array references its size parameter —
+    # collect the id (dedupe by identity like the Param arm) plus the element's.
+    var i = 0
+    var dup = false
+    while i < seen.len() do
+      if generic_param_id_eq(&seen[i], &gpid) then dup = true end
+      i = i + 1
+    end
+    if !dup then seen.push(gpid) end
+    collect_builtin_param_ids(elem, seen)
   when Type::FnPtr(params, ret, _) then
     var i = 0
     while i < params.len() do
@@ -5108,6 +5222,7 @@ pub def type_kinds_contain_resource(kinds: Map[Int, TypeKind], ty: Type) -> Bool
   when Type::Tuple(fields) then
     type_fields_contain_resource(kinds, &fields)
   when Type::FixedArray(elem, _) then type_kinds_contain_resource(kinds, &elem)
+  when Type::FixedArraySym(elem, _) then type_kinds_contain_resource(kinds, &elem)
   when Type::FnPtr(_, _, _) then false
  # a closure's kind containment derives from its capture tuple.
   when Type::Closure(_, _, _, captures, _) then type_kinds_contain_resource(kinds, &captures)
@@ -5765,6 +5880,33 @@ def local_id_of(env: TypeEnv, name: String) -> Int
   NO_LOCAL_ID
 end
 
+# (§20 const generics, slice 1): bind a declaration's generic parameters in
+# scope — TYPE parameters bind to Type::Param(gpid) (the existing form), CONST
+# parameters bind to Type::ConstParam(gpid), the SYMBOLIC value reference.
+# The kind split lets the size resolver of the [T; N] annotation distinguish a
+# const-parameter size (lifted to Type::FixedArraySym) from a type parameter
+# (an error, as before) purely through the scope binding; `generic_params`
+# and `param_ids` are positionally aligned (the interning runs at
+# registration; the body passes reconstruct the same ids by (owner, index)).
+# Const parameter names bound here never resolve to a TYPE (their use in a
+# type position reports a mismatch downstream); their use as a VALUE is typed
+# ConstParam — codegenable only after instantiation (slice 2), and flagged
+# like a residual Param by the codegenability scans.
+def bind_generic_params(inout env: TypeEnv, generic_params: Vec[GenericParam], param_ids: Vec[GenericParamId]) -> Unit
+  var i = 0
+  while i < generic_params.len() && i < param_ids.len() do
+    let gp = generic_params[i]
+    match gp.kind
+    when GenericParamKind::ConstParam(_) then
+      bind_var(env, gp.name.clone(), Type::ConstParam(param_ids[i].clone()))
+    when GenericParamKind::TypeParam then
+      bind_var(env, gp.name.clone(), Type::Param(param_ids[i].clone()))
+    end
+    i = i + 1
+  end
+  ()
+end
+
 # ———————————————————————————————————————————————————————————————
 # Type Variable Operations
 # ———————————————————————————————————————————————————————————————
@@ -6068,6 +6210,34 @@ pub def subst_type_args(ty: Type, generic_params: Vec[GenericParamId], type_args
     end
     Type::Tuple(new_fields)
   when Type::FixedArray(elem, n) then Type::FixedArray(subst_type_args(&elem, generic_params, type_args), n)
+  when Type::FixedArraySym(elem, gpid) then
+    # (§20 slice 1): the symbolic-size array under substitution. The size
+    # parameter's argument decides the result:
+    #   - Type::Const(v)  -> the CONCRETE Type::FixedArray(elem', v) — the
+    #     slice-1 substitution support (this is what a later mono wave runs
+    #     before layout; until mono substitutes const-generic bodies the
+    #     concrete forms never reach the layout engine);
+    #   - Type::ConstParam(g2) -> a nested-generic body's reference to an
+    #     OUTER const parameter stays SYMBOLIC: FixedArraySym(elem', g2);
+    #   - anything else (a fresh inference variable, a missing id) -> the
+    #     symbolic form survives with the substituted element (the residual
+    #     FixedArraySym is then flagged by the codegenability scans exactly
+    #     like a residual Type::Param — fail-closed, never a fabricated
+    #     count).
+    let elem2 = subst_type_args(&elem, generic_params, type_args)
+    mut result = Type::FixedArraySym(elem2, gpid)
+    var i = 0
+    while i < generic_params.len() do
+      if generic_param_id_eq(&generic_params[i], &gpid) then
+        match type_args[i]
+        when Type::Const(v) then result = Type::FixedArray(elem2, v)
+        when Type::ConstParam(g2) then result = Type::FixedArraySym(elem2, g2)
+        when _ then ()
+        end
+      end
+      i = i + 1
+    end
+    result
   when Type::FnPtr(params, ret, effects) then
     var new_params = Vec::new()
     var i = 0
@@ -6143,6 +6313,7 @@ def resolve_type_var(env: TypeEnv, ty: Type) -> Type
     end
     Type::Adt(tid, resolved_args)
   when Type::FixedArray(elem, n) then Type::FixedArray(resolve_type_var(env, elem), n)
+  when Type::FixedArraySym(elem, gpid) then Type::FixedArraySym(resolve_type_var(env, elem), gpid)
   when _ then ty
   end  end
 end
@@ -6218,6 +6389,9 @@ def type_tag(env: TypeEnv, t: Type) -> String
   when Type::Tuple(_) then "Tuple"
   when Type::Var(_) then "Var"
   when Type::Param(gpid) then "Param(" + generic_param_name_of(&env.generic_param_table, &gpid) + ")"
+  when Type::Const(v) then "Const(" + v.to_string() + ")"
+  when Type::ConstParam(gpid) then "ConstParam(" + generic_param_name_of(&env.generic_param_table, &gpid) + ")"
+  when Type::FixedArraySym(elem, gpid) then "FixedArraySym[" + type_tag(env, &elem) + ";" + generic_param_name_of(&env.generic_param_table, &gpid) + "]"
   when Type::Error then "Error"
   end  end
 end
@@ -6998,6 +7172,61 @@ def unify(inout env: TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
         when Type::Error then true
         when _ then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
         end
+      when Type::Const(v1) then
+        # (§20 slice 1): a const generic ARGUMENT unifies by its VALUE —
+        # Const(4) == Const(4), Const(4) != Const(8). Const-vs-ConstParam
+        # (a literal argument against a symbolic enclosing parameter) never
+        # unifies while generic (folding/instantiation is slice 2).
+        match b
+        when Type::Const(v2) then
+          if v1 == v2 then
+            true
+          else
+            type_add_error(env, "const generic argument mismatch: " + v1.to_string() + " vs " + v2.to_string(), span)
+            false
+          end
+        when Type::Error then true
+        when _ then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
+        end
+      when Type::ConstParam(gpid1) then
+        # (§20 slice 1): a SYMBOLIC const parameter reference unifies only
+        # with the SAME parameter (identity is the GenericParamId — the
+        # (owner, index) pair, never the name).
+        match b
+        when Type::ConstParam(gpid2) then
+          if generic_param_id_eq(&gpid1, &gpid2) then
+            true
+          else
+            let n1 = generic_param_name_of(&env.generic_param_table, &gpid1)
+            let n2 = generic_param_name_of(&env.generic_param_table, &gpid2)
+            type_add_error(env, "const generic parameter mismatch: " + n1 + " vs " + n2, span)
+            false
+          end
+        when Type::Error then true
+        when _ then
+          let n1 = generic_param_name_of(&env.generic_param_table, &gpid1)
+          type_add_error(env, "const generic parameter `" + n1 + "` cannot unify with " + type_tag(env, &b), span)
+          false
+        end
+      when Type::FixedArraySym(elem1, gpid1) then
+        # (§20 slice 1): two SYMBOLIC-size arrays unify exactly when the size
+        # parameters are the same parameter and the elements unify. A
+        # symbolic size NEVER unifies with a concrete count (the concrete
+        # argument can only land through substitution, which converts
+        # FixedArraySym to FixedArray before any identity comparison).
+        match b
+        when Type::FixedArraySym(elem2, gpid2) then
+          if !generic_param_id_eq(&gpid1, &gpid2) then
+            let n1 = generic_param_name_of(&env.generic_param_table, &gpid1)
+            let n2 = generic_param_name_of(&env.generic_param_table, &gpid2)
+            type_add_error(env, "fixed array size parameter mismatch: " + n1 + " vs " + n2, span)
+            false
+          else
+            unify(env, elem1, elem2, span)
+          end
+        when Type::Error then true
+        when _ then type_add_error(env, "type mismatch: " + type_tag(env, &a) + " vs " + type_tag(env, &b), span); false
+        end
       when Type::Error then true
       end
     end
@@ -7078,6 +7307,7 @@ def occurs_check_with_depth(inout env: TypeEnv, id: TypeVarId, ty: Type, depth: 
     end
     found
   when Type::FixedArray(elem, _) then occurs_check_with_depth(env, id, elem, depth + 1, span)
+  when Type::FixedArraySym(elem, _) then occurs_check_with_depth(env, id, elem, depth + 1, span)
   when _ then false
   end
 end
@@ -7145,11 +7375,13 @@ end
 # (audit P1-2 / P1-16 — the effect-class annotations):
 #   E0232 — An effect-class annotation (@no_alloc / @no_block / @no_io /
 #           @irq_safe / @interrupt, or an @effects(no_alloc[, no_block
-#           [, no_io]]) claim list) does not hold: the checker's
-#           transitive classification over the call graph proved the
-#           forbidden class (a heap allocation, a blocking operation or
-#           an I/O operation on some path, including calls whose behavior
-#           is unknown)
+#           [, no_io]]) claim list) does not hold: the MIR-derived
+#           transitive summary (audit §11 — computed over the LOWERED
+#           program, so compiler-generated operations — owned-String
+#           literal materialization, concat, drop glue — classify) put
+#           the forbidden class (a heap allocation, a blocking operation
+#           or an I/O operation on some path, including operations whose
+#           behavior is unknown) into what executes
 #   E0233 — A malformed @effects(...) attribute — it names an
 #           unrecognized class (only no_alloc / no_block / no_io are
 #           supported) or names none at all (fail closed at the claim
@@ -7258,11 +7490,7 @@ def type_check_program_env(inout env: TypeEnv, program: Program) -> Unit
       push_scope(env)
       let f_owner = item_owner_def(env, i)
       let f_param_ids = intern_generic_params(env, &f_owner, &f.generic_params)
-      var gp_idx = 0
-      while gp_idx < f.generic_params.len() do
-        bind_var(env, f.generic_params[gp_idx].name.clone(), Type::Param(f_param_ids[gp_idx].clone()))
-        gp_idx = gp_idx + 1
-      end
+      bind_generic_params(env, &f.generic_params, &f_param_ids)
       var param_types = Vec::new()
       var j = 0
       while j < f.params.len() do
@@ -7304,11 +7532,7 @@ def type_check_program_env(inout env: TypeEnv, program: Program) -> Unit
           push_scope(env)
           let ef_owner = item_owner_def(env, i)
           let ef_param_ids = intern_generic_params(env, &ef_owner, &ef.generic_params)
-          var gp_idx = 0
-          while gp_idx < ef.generic_params.len() do
-            bind_var(env, ef.generic_params[gp_idx].name.clone(), Type::Param(ef_param_ids[gp_idx].clone()))
-            gp_idx = gp_idx + 1
-          end
+          bind_generic_params(env, &ef.generic_params, &ef_param_ids)
           var param_types = Vec::new()
           var k = 0
           while k < ef.params.len() do
@@ -7417,15 +7641,18 @@ def type_check_program_env(inout env: TypeEnv, program: Program) -> Unit
   env.check_ctx = "effect-set-check"
   check_effect_sets(env)
   
- # (audit P1-2 — the effect-class annotations): after every function
-  # body is checked and scanned, classify the annotated functions'
-  # behavior (alloc / block / io) over the recorded call graph and
-  # enforce the @no_alloc / @no_block / @no_io / @irq_safe claims —
-  # annotation = PROVEN-or-ERROR (see check_effect_class_annotations).
+  # (audit P1-2 + §11 — the effect-class annotations): the claim tables
+  # above (fn_class_claims / fn_class_names — the def-keyed annotation
+  # records with their attribute spans) are registered by the body
+  # checking; the PROOF is NOT run here anymore — the source-syntax
+  # class scan was replaced by the MIR-derived transitive semantic
+  # summaries (check_effect_class_annotations_mir, mir.tg), which the
+  # front-end phases run on the lowered program after MIR lowering so
+  # the compiler-generated lowering sites (string literal materialization,
+  # concat, drop glue, ...) are classified like any other operation.
   # Runs on the typed compilation path only (the permissive editor path
-  # records no call graph — the pass self-gates).
-  env.check_ctx = "effect-class-annotation-check"
-  check_effect_class_annotations(env)
+  # records no claims — the MIR pass self-gates).
+  env.check_ctx = "effect-class-claims-recorded"
   
  # (literal range authority): the end-of-check range decisions — every
   # integer literal against its target's exact bounds (the suffix type,
@@ -7605,11 +7832,7 @@ def collect_enum_type_def(inout env: TypeEnv, e: EnumDecl, module_path: Vec[Stri
   # payload types reference the interned ids.
   let owner = type_decl_owner_def(env, &e.name, module_path)
   let param_ids = intern_generic_params(env, &owner, &e.generic_params)
-  var gp_idx = 0
-  while gp_idx < e.generic_params.len() do
-    bind_var(env, e.generic_params[gp_idx].name.clone(), Type::Param(param_ids[gp_idx].clone()))
-    gp_idx = gp_idx + 1
-  end
+  bind_generic_params(env, &e.generic_params, &param_ids)
 
   let id = match get_type_id_by_qualified_name(env, e.name.clone(), module_path)
   when Option::Some(existing_id) then existing_id
@@ -7681,11 +7904,7 @@ def collect_type_def(inout env: TypeEnv, item: Item, module_path: Vec[String]) -
     # field types reference the interned ids.
     let s_owner = type_decl_owner_def(env, &s.name, module_path)
     let s_param_ids = intern_generic_params(env, &s_owner, &s.generic_params)
-    var gp_idx = 0
-    while gp_idx < s.generic_params.len() do
-      bind_var(env, s.generic_params[gp_idx].name.clone(), Type::Param(s_param_ids[gp_idx].clone()))
-      gp_idx = gp_idx + 1
-    end
+    bind_generic_params(env, &s.generic_params, &s_param_ids)
 
     # Reuse pre-registered ID if available
     let id = match get_type_id_by_qualified_name(env, s.name.clone(), module_path)
@@ -7754,11 +7973,7 @@ def collect_type_def(inout env: TypeEnv, item: Item, module_path: Vec[String]) -
     push_scope(env)
     let t_owner = type_decl_owner_def(env, &t.name, module_path)
     let t_param_ids = intern_generic_params(env, &t_owner, &t.generic_params)
-    var gp_idx = 0
-    while gp_idx < t.generic_params.len() do
-      bind_var(env, t.generic_params[gp_idx].name.clone(), Type::Param(t_param_ids[gp_idx].clone()))
-      gp_idx = gp_idx + 1
-    end
+    bind_generic_params(env, &t.generic_params, &t_param_ids)
 
     let id = match get_type_id_by_qualified_name(env, t.name.clone(), module_path)
     when Option::Some(existing_id) then existing_id
@@ -7922,11 +8137,7 @@ def collect_type_def(inout env: TypeEnv, item: Item, module_path: Vec[String]) -
     push_scope(env)
     let ta_owner = type_decl_owner_def(env, &ta.name, module_path)
     let ta_param_ids = intern_generic_params(env, &ta_owner, &ta.generic_params)
-    var gp_idx = 0
-    while gp_idx < ta.generic_params.len() do
-      bind_var(env, ta.generic_params[gp_idx].name.clone(), Type::Param(ta_param_ids[gp_idx].clone()))
-      gp_idx = gp_idx + 1
-    end
+    bind_generic_params(env, &ta.generic_params, &ta_param_ids)
 
     let id = match get_type_id_by_qualified_name(env, ta.name.clone(), module_path)
     when Option::Some(existing_id) then existing_id
@@ -8010,15 +8221,15 @@ def check_item(inout env: TypeEnv, program: Program, item: Item, item_idx: Int) 
       end
     when Option::None then ()
     end
-    # (audit P1-2 / P1-16): the effect-class annotation claims (@no_alloc
-    # / @no_block / @no_io / @irq_safe / @interrupt, plus the
+    # (audit P1-2 / P1-16 / §11): the effect-class annotation claims
+    # (@no_alloc / @no_block / @no_io / @irq_safe / @interrupt, plus the
     # @effects(no_alloc, no_block, no_io) list form) parsed from the
     # item's attributes through the EXISTING attribute mechanism. The
     # claims ride into the typed FnSignature record (effect_annotations)
-    # and the classifier's claim table (fn_class_claims) and are
-    # PROVEN-or-ERROR by the end-of-check pass
-    # (check_effect_class_annotations). Unknown attribute names are
-    # untouched (their existing behavior is unchanged).
+    # and the def-keyed claim table (fn_class_claims) and are PROVEN-or-
+    # ERROR by the MIR-side pass on the lowered program
+    # (check_effect_class_annotations_mir, mir.tg). Unknown attribute
+    # names are untouched (their existing behavior is unchanged).
     let effect_claims = effect_class_claims_of(env, &item.attrs)
     check_function(env, f, owner_key, &f_owner, &effect_claims)
   when ItemKind::ItemImpl(i) then
@@ -8249,39 +8460,24 @@ def check_effect_sets(inout env: TypeEnv) -> Unit
 end
 
 # ———————————————————————————————————————————————————————————————
-# (audit P1-2 / P1-16) Effect-class annotations — @no_alloc / @no_block
-# / @no_io / @irq_safe / @interrupt / @effects(no_alloc, no_block,
-# no_io) — the proven-or-error checker
+# (audit P1-2 / P1-16 / §11) Effect-class annotations — @no_alloc /
+# @no_block / @no_io / @irq_safe / @interrupt / @effects(no_alloc,
+# no_block, no_io) — the claim domain
 # ———————————————————————————————————————————————————————————————
-# The per-function annotations declare allocation/blocking/IO behavior;
-# this checker PROVES them by classifying every body-bearing function
-# into the behavioral classes (Alloc / Block / Io) and propagating the
-# classes through the recorded call graph (fn_call_graph — the SAME
-# def-key domain the effect discipline uses) to a fixed point, then
-# comparing each annotated function's final set against its claims.
-#
-# The classification (single-pass conservative):
-#   - the DIRECT set of a function comes from its own body's constructs
-#     (recorded by the pass-4 scans, effect_class_scan_fn_body): the
-#     heap-allocating intrinsic family (Vec/Array/Map/Set/String
-#     constructors and growth operations — through the checker's
-#     typed_intrinsics router), closure boxing, heap-backed formatting,
-#     String concatenation, the raw syscall intrinsics, and indirect
-#     calls through a closure/function-pointer VALUE (the callee's body
-#     is unknowable at the site);
-#   - a call to a callee whose BODY is in this compilation contributes
-#     the callee's own (transitive) set — fixed point over the module
-#     set;
-#   - a call to a BODYLESS callee (an extern/foreign declaration, a
-#     bodyless builtin) classifies through the maintained seed tables
-#     (the runtime's __intrinsic_* / _tg_* extern surface) or — when the
-#     name is NOT seeded — as ALL THREE classes: a function whose
-#     allocation/blocking/IO behavior is unknown is conservatively
-#     capable of everything, so "@no_alloc calling an unknown function
-#     MUST FAIL" (the audit's fail-closed rule);
-#   - the benign intrinsic family (read-only ops the router classifies
-#     and that never allocate/block/do I/O) records the callee as KNOWN
-#     CLEAN (fn_class_clean) — the mirror image of the dirty seeds.
+# The per-function annotations declare allocation/blocking/IO behavior.
+# This module defines the CLAIM domain (the parsing/spelling helpers and
+# the class vocabulary the diagnostics use); the PROOF lives in mir.tg
+# (check_effect_class_annotations_mir — audit §11): after MIR lowering,
+# each function's TRANSITIVE semantic summary (EffectSummary — the
+# union of its statements'/terminators' operation records plus its
+# callees' summaries, fixed point over the lowered program) is compared
+# against the claims. Every intrinsic/compiler-generated operation
+# carries its own EffectSummary record (effect_summary_of_intrinsic);
+# the bodyless callees classify through the extern-name records
+# (effect_summary_of_extern_name) or fail closed (effect_summary_unknown
+# — an operation whose allocation/blocking/IO behavior cannot be
+# bounded is conservatively capable of everything, so "@no_alloc
+# calling an unknown function MUST FAIL").
 #
 # Enforcement (annotation = proven-or-error):
 #   - @no_alloc forbids Alloc; @no_block forbids Block; @no_io forbids
@@ -8331,26 +8527,76 @@ end
 #     - sleep (sleep/usleep/nanosleep — Block, seeded below);
 #     - unbounded scheduling (sched_yield — Block, seeded below).
 #
+# Enforcement (annotation = proven-or-error, on the lowered program):
+#   - @no_alloc forbids Alloc; @no_block forbids Block; @no_io forbids
+#     Io; @irq_safe forbids all three; @interrupt forbids all three too
+#     (audit P1-16: an @interrupt marker IS the handler spelling of the
+#     irq-safe contract, so a handler must satisfy the same transitive
+#     proof as an @irq_safe function); the @effects(no_alloc, no_block,
+#     no_io) list forbids exactly the classes it names. A function whose
+#     final summary violates a forbidden class reports one E0232
+#     diagnostic per class at the ATTRIBUTE's span, with the evidence
+#     phrase of the first site that dirtied the class — a violation
+#     under @interrupt names the HANDLER (the annotated function), and a
+#     claim written as @effects(...) is echoed with its full as-written
+#     list.
+#   - a malformed @effects(...) list (an unrecognized class name, or no
+#     names at all) is an E0233 at the attribute — fail closed at the
+#     claim extraction, before any proof runs.
+#   - NO annotation = NO claims: unannotated functions are never checked
+#     and never report; their bodies still summarize, so an annotated
+#     function is proven THROUGH them.
+#   - std-module functions are NOT exempt here (unlike the effect-set
+#     discipline, which exempts the trusted base because it seeds every
+#     std function's declared effects): a class claim is a per-function
+#     proof, and the pass only evaluates functions that CARRY an
+#     annotation.
+#
+# Audit-§11 soundness note: because the summaries are computed over the
+# LOWERED program, the implicitly-executed code the source AST never
+# calls IS classified — the string_from_static coercion at the owned-
+# String demand sites (a string literal returning as an owned String
+# allocates), the implicit drop-glue/finalizer call chains at value
+# destruction sites, the concat/format intrinsic calls — the blind
+# spots of the old source-syntax scan. The documented residual: a
+# destruction whose drop glue is not part of this compilation (a
+# deferred generic drop) classifies as unknown — fail closed.
+#
+# The P1-16 interrupt-handler checklist (what the three-class proof
+# permits and forbids INSIDE an annotated handler):
+#   CLEAN (permitted — the summary classifies into no dirty class):
+#     - atomic operations — the __intrinsic_atomic_* load/store/RMW/CAS/
+#       fence extern family (pure CPU operations; seeded clean below);
+#     - fixed-capacity buffers — an in-place [T; N] local (the embedded
+#       RingBuffer's backing store), whose element access routes to no
+#       heap intrinsic at all;
+#     - volatile MMIO access — the _tg_volatile_read*/_write* externs
+#       (a width-exact volatile load/store; a memory access, not an I/O
+#       operation; recorded with the MMIO capability below, never the
+#       Io class).
+#   BLOCKED (a dirty class — E0232):
+#     - heap allocation and growth (Vec/String/Map/Set construction,
+#       owned-String literal materialization, heap-backed formatting);
+#     - blocking mutexes and the kernel wait primitives whose lock path
+#       yields to the scheduler (the pthread wait family seeds Block,
+#       and sched_yield seeds Block);
+#     - filesystem and networking (the libc_*/_tg_* read/write/open
+#       surface and the raw Syscall intrinsics — the seeded ones are
+#       Io/Block, the unseeded ones conservatively everything; either
+#       way the class proof fails);
+#     - sleep (sleep/usleep/nanosleep — Block: may_block + may_sleep);
+#     - unbounded scheduling (sched_yield — Block).
+#
 # Deliberately deferred (not implemented in this slice):
 #   - the P1-16 handler-runtime/vector-table integration BEYOND the
 #     proof (the vector-table collection remains the embedded route's
-#     own pass — driver.tg's collect_interrupt_fns; the @interrupt and
-#     @effects(...) claims themselves ARE enforced here);
-#   - cross-module effect-class summaries beyond the compilation
-#     closure: modules typecheck as ONE merged program (merge_imported_
-#     deps), so classification covers the whole closure and foreign
-#     functions are unknown unless seeded — a future module-at-a-time
-#     checker would treat foreign headers' annotations as their
-#     summaries;
+#     own pass — driver.tg's collect_interrupt_fns);
+#   - cross-module summaries beyond the compilation closure: modules
+#     typecheck and lower as ONE merged program (merge_imported_deps),
+#     so the summaries cover the whole closure and foreign functions are
+#     unknown unless seeded;
 #   - optimization/codegen uses of the proven classes (a @no_alloc
 #     function's body is a candidate for the allocator-free targets).
-#
-# Known soundness boundary (documented): implicitly-executed code that
-# the source AST never calls — implicit drop glue of values whose type
-# has a user Drop/deinit impl, and the MIR's string_from_static
-# coercions at String-promise sites — is not part of the recorded call
-# graph and is not classified. The proof covers what the body can CALL;
-# a future pass may lower drop sites into the graph.
 
 # The attribute spelling of an annotation (diagnostics and the
 # extraction's reverse mapping).
@@ -8500,8 +8746,8 @@ def effect_class_phrase(c: EffectClass) -> String
   end
 end
 
-# The evidence-slot index of a class (the fn_class_evidence vector is
-# positional: [0]=Alloc [1]=Block [2]=Io).
+# The evidence-slot index of a class (the MIR pass's per-function
+# evidence vectors are positional: [0]=Alloc [1]=Block [2]=Io).
 def effect_class_slot_index(c: EffectClass) -> Int
   match c
   when EffectClass::Alloc then 0
@@ -8518,234 +8764,349 @@ def effect_class_set_contains(set: Vec[EffectClass], c: EffectClass) -> Bool
   false
 end
 
-# The evidence phrase recorded for a (function, class) slot — the empty
-# string when the slot was never filled.
-def effect_class_evidence_of(env: TypeEnv, key: String, c: EffectClass) -> String
-  let slot = effect_class_slot_index(c)
-  match env.fn_class_evidence.get(key.clone())
-  when Option::Some(evs) then
-    if slot < evs.len() then evs[slot].clone() else "".to_string() end
-  when Option::None then "".to_string()
+# ———————————————————————————————————————————————————————————————
+# (audit §11) the SEMANTIC EFFECT SUMMARY — the canonical per-operation
+# effect record that REPLACES the source-syntax class scan
+# ———————————————————————————————————————————————————————————————
+# Every intrinsic/compiler-generated operation and every seeded extern
+# carries ONE EffectSummary — the effect record of what the operation
+# DOES when it executes (may_allocate / may_block / may_io / may_spawn /
+# may_sleep / may_panic / may_unsafe plus the capability set). The
+# MIR-side pass (mir.tg's check_effect_class_annotations_mir) computes
+# each function's TRANSITIVE summary as the union of its statements' and
+# terminators' operation records plus its callees' summaries, fixed
+# point over the lowered program, and verifies the @no_alloc /
+# @no_block / @no_io / @irq_safe / @interrupt claims against the summary
+# of what EXECUTES — including the implicit compiler-generated lowering
+# sites the source AST never calls (a string literal demanded as an
+# owned String lowers to a string_from_static intrinsic call; a value
+# destruction lowers to its drop glue / finalizer call chain).
+#
+# The class view over the record (what the claims forbid) is the
+# 3-class mapping above (effect_class_forbidden_classes): Alloc = the
+# may_allocate flag, Block = may_block OR may_sleep (a sleep is a
+# blocking wait — the sleep family's records set both), Io = may_io.
+# The remaining flags (may_spawn / may_panic / may_unsafe) and the
+# capabilities (Arena — a bounded bump-arena allocation, which is NOT a
+# heap allocation: BumpArena-style ops record may_allocate=false and the
+# arena capability; Mmio — a volatile memory-mapped hardware-register
+# access, which is a memory access, not an I/O operation: the volatile
+# family records may_io=false and the mmio capability, so the P1-16
+# interrupt-handler checklist's permitted MMIO register access stays
+# permitted) are recorded canonically on the summary for the checks and
+# consumers that consult them. A record is never silently clean: an
+# operation whose behavior cannot be bounded (an unknown extern, an
+# indirect closure/function-pointer call, an algebraic-effect perform)
+# carries effect_summary_unknown — every may_* flag, fail closed.
+
+# The capability identifier set of a summary. Each id names one
+# non-heap/non-OS behavioral capability an operation may exercise; ids
+# are fixed numeric identities (ids.tg-style), never names.
+struct CapabilityId
+  id: Int
+end
+
+impl Eq for CapabilityId
+  def eq(self: Self, other: Self) -> Bool
+    self.id == other.id
   end
 end
 
-# Record the evidence phrase for a (function, class) slot — the FIRST
-# site wins (the earliest dirtied the class; later sites only grow the
-# class set).
-def effect_class_evidence_set(inout env: TypeEnv, key: String, c: EffectClass, text: String) -> Unit
-  let slot = effect_class_slot_index(c)
-  var evs = Vec::new()
-  match env.fn_class_evidence.get(key.clone())
-  when Option::Some(cur) then evs = cur.clone()
-  when Option::None then ()
-  end
-  while evs.len() < 3 do
-    evs.push("".to_string())
-  end
-  if evs[slot].len() == 0 then
-    evs[slot] = text
-    env.fn_class_evidence.insert(key.clone(), evs)
+impl Hash for CapabilityId
+  def hash(self: Self) -> Int
+    self.id.hash()
   end
 end
 
-# Mark a class dirty on a function's DIRECT set with its evidence (the
-# pass-4 scans' recording helper). The class set is deduped; the
-# evidence slot is first-wins.
-def effect_class_mark_direct(inout env: TypeEnv, key: String, c: EffectClass, evidence: String) -> Unit
-  if key == "" then return end
-  var direct = Vec::new()
-  match env.fn_class_direct.get(key.clone())
-  when Option::Some(cur) then direct = cur.clone()
-  when Option::None then ()
-  end
-  if !effect_class_set_contains(&direct, &c) then
-    direct.push(c)
-    env.fn_class_direct.insert(key.clone(), direct)
-  end
-  effect_class_evidence_set(env, key, c, evidence)
+# The fixed capability ids.
+def capability_id_arena() -> CapabilityId
+  CapabilityId { id: 1 }
 end
 
-# The call-site edge name record (caller key -> callee key -> the
-# callee's source name) — the seed lookups and the diagnostics for the
-# bodyless callees read it.
-def effect_class_record_edge_name(inout env: TypeEnv, caller: String, callee: String, name: String) -> Unit
-  if caller == "" || callee == "" then return end
-  match env.fn_class_edge_names.get(caller.clone())
-  when Option::Some(inner) then
-    if !inner.contains_key(callee.clone()) then
-      var inner2 = inner.clone()
-      inner2.insert(callee.clone(), name.clone())
-      env.fn_class_edge_names.insert(caller.clone(), inner2)
-    end
-  when Option::None then
-    var inner = Map::new()
-    inner.insert(callee.clone(), name.clone())
-    env.fn_class_edge_names.insert(caller.clone(), inner)
-  end
+def capability_id_mmio() -> CapabilityId
+  CapabilityId { id: 2 }
 end
 
-def effect_class_edge_name_of(env: TypeEnv, caller: String, callee: String) -> Option[String]
-  match env.fn_class_edge_names.get(caller.clone())
-  when Option::Some(inner) then
-    match inner.get(callee.clone())
-    when Option::Some(n) then Option::Some(n.clone())
-    when Option::None then Option::None
-    end
-  when Option::None then Option::None
+# The display name of a capability id (diagnostics).
+def capability_id_name(cap: CapabilityId) -> String
+  if cap.id == 1 then return "arena" end
+  if cap.id == 2 then return "mmio" end
+  "unknown"
+end
+
+# The canonical semantic effect record of one intrinsic /
+# compiler-generated operation / seeded extern — see the module doc
+# above for the flag semantics.
+struct EffectSummary
+  may_allocate: Bool = false
+  may_block: Bool = false
+  may_io: Bool = false
+  may_spawn: Bool = false
+  may_sleep: Bool = false
+  may_panic: Bool = false
+  may_unsafe: Bool = false
+  capabilities: Set[CapabilityId] = Set::new()
+end
+
+# The merge of two summaries (the transitive-union step): every may_*
+# flag is the OR of the operands', the capability set is the union.
+def effect_summary_merge(a: EffectSummary, b: EffectSummary) -> EffectSummary
+  var caps = Set::new()
+  for c in a.capabilities do
+    caps.insert(c.clone())
+  end
+  for c in b.capabilities do
+    caps.insert(c.clone())
+  end
+  EffectSummary {
+    may_allocate: a.may_allocate || b.may_allocate,
+    may_block: a.may_block || b.may_block,
+    may_io: a.may_io || b.may_io,
+    may_spawn: a.may_spawn || b.may_spawn,
+    may_sleep: a.may_sleep || b.may_sleep,
+    may_panic: a.may_panic || b.may_panic,
+    may_unsafe: a.may_unsafe || b.may_unsafe,
+    capabilities: caps
+  }
+end
+
+# The summary carrying one extra capability.
+def effect_summary_with_capability(s: EffectSummary, cap: CapabilityId) -> EffectSummary
+  var caps = Set::new()
+  for c in s.capabilities do
+    caps.insert(c.clone())
+  end
+  caps.insert(cap)
+  EffectSummary {
+    may_allocate: s.may_allocate,
+    may_block: s.may_block,
+    may_io: s.may_io,
+    may_spawn: s.may_spawn,
+    may_sleep: s.may_sleep,
+    may_panic: s.may_panic,
+    may_unsafe: s.may_unsafe,
+    capabilities: caps
+  }
+end
+
+# The FAIL-CLOSED summary of an operation whose behavior cannot be
+# bounded (an unknown extern, an indirect call through a closure or
+# function-pointer value, an algebraic-effect perform whose handler is
+# not statically bounded, a destruction whose drop glue is not part of
+# this compilation) — every may_* flag, no capabilities.
+def effect_summary_unknown() -> EffectSummary
+  EffectSummary {
+    may_allocate: true,
+    may_block: true,
+    may_io: true,
+    may_spawn: true,
+    may_sleep: true,
+    may_panic: true,
+    may_unsafe: true
+  }
+end
+
+# Whether a summary violates a class claim — the class view over the
+# record: Alloc = may_allocate; Block = may_block OR may_sleep (a sleep
+# suspends the caller — the Block class of the annotation semantics);
+# Io = may_io.
+def effect_summary_has_class(summary: EffectSummary, c: EffectClass) -> Bool
+  match c
+  when EffectClass::Alloc then summary.may_allocate
+  when EffectClass::Block then summary.may_block || summary.may_sleep
+  when EffectClass::Io then summary.may_io
   end
 end
 
 # ———————————————————————————————————————————————————————————————
-# The intrinsic/extern class tables — the seeded bodyless callees
+# The intrinsic effect RECORDS — one EffectSummary per IntrinsicId
+# ———————————————————————————————————————————————————————————————
+# Every intrinsic/compiler-generated operation that allocates on the
+# heap, blocks, performs I/O (or carries another behavioral flag) is
+# listed here; an unlisted id is benign (the empty record). The records
+# are the MIR pass's classification table for the STAMPED calls (the
+# MirCall.intrinsic payload the checker's typed_intrinsics router
+# stamped at lowering) and for the name-routed intrinsic calls
+# (intrinsic_id_of_call — the synthesized lowering sites such as
+# string_from_static at the owned-String demand sites).
+def effect_summary_of_intrinsic(iid: IntrinsicId) -> EffectSummary
+  match iid
+  # The heap-constructing/growing Vec-Array family.
+  when IntrinsicId::ArrayNew then EffectSummary { may_allocate: true }
+  when IntrinsicId::ArrayWithCapacity then EffectSummary { may_allocate: true }
+  when IntrinsicId::ArrayFromList then EffectSummary { may_allocate: true }
+  when IntrinsicId::ArrayPush then EffectSummary { may_allocate: true }
+  when IntrinsicId::ArrayInsert then EffectSummary { may_allocate: true }
+  when IntrinsicId::ArrayExtend then EffectSummary { may_allocate: true }
+  when IntrinsicId::ArrayResize then EffectSummary { may_allocate: true }
+  when IntrinsicId::ArrayReplace then EffectSummary { may_allocate: true }
+  when IntrinsicId::ArraySlice then EffectSummary { may_allocate: true }
+  when IntrinsicId::ArrayJoin then EffectSummary { may_allocate: true }
+  # The heap-backed Map family.
+  when IntrinsicId::MapNew then EffectSummary { may_allocate: true }
+  when IntrinsicId::MapPush then EffectSummary { may_allocate: true }
+  when IntrinsicId::MapInsert then EffectSummary { may_allocate: true }
+  when IntrinsicId::MapClone then EffectSummary { may_allocate: true }
+  when IntrinsicId::MapKeys then EffectSummary { may_allocate: true }
+  when IntrinsicId::MapValues then EffectSummary { may_allocate: true }
+  when IntrinsicId::MapEntries then EffectSummary { may_allocate: true }
+  when IntrinsicId::MapJoinCollect then EffectSummary { may_allocate: true }
+  # The heap-backed Set family.
+  when IntrinsicId::SetNew then EffectSummary { may_allocate: true }
+  when IntrinsicId::SetInsert then EffectSummary { may_allocate: true }
+  when IntrinsicId::SetClone then EffectSummary { may_allocate: true }
+  when IntrinsicId::SetEntries then EffectSummary { may_allocate: true }
+  # The owned-String construction/growth family (String objects).
+  when IntrinsicId::StringNew then EffectSummary { may_allocate: true }
+  when IntrinsicId::StringPush then EffectSummary { may_allocate: true }
+  when IntrinsicId::StringPushStr then EffectSummary { may_allocate: true }
+  when IntrinsicId::StringReserve then EffectSummary { may_allocate: true }
+  when IntrinsicId::StringClone then EffectSummary { may_allocate: true }
+  when IntrinsicId::StringFromStatic then EffectSummary { may_allocate: true }
+  when IntrinsicId::StringFromBytes then EffectSummary { may_allocate: true }
+  # The owned heap-backed String transforms (trim/lower/replace/split/
+  # lines produce owned String objects).
+  when IntrinsicId::StringReplace then EffectSummary { may_allocate: true }
+  when IntrinsicId::StringSplit then EffectSummary { may_allocate: true }
+  when IntrinsicId::StringTrim then EffectSummary { may_allocate: true }
+  when IntrinsicId::StringToLowercase then EffectSummary { may_allocate: true }
+  when IntrinsicId::StringSplitLines then EffectSummary { may_allocate: true }
+  when IntrinsicId::SplitLinesTrim then EffectSummary { may_allocate: true }
+  when IntrinsicId::TrimMatches then EffectSummary { may_allocate: true }
+  when IntrinsicId::ToLowercase then EffectSummary { may_allocate: true }
+  # The raw-str / formatting conversions that produce owned String
+  # objects (concat and every to-string form).
+  when IntrinsicId::StrConcat then EffectSummary { may_allocate: true }
+  when IntrinsicId::StrCopy then EffectSummary { may_allocate: true }
+  when IntrinsicId::StrSlice then EffectSummary { may_allocate: true }
+  when IntrinsicId::StrToString then EffectSummary { may_allocate: true }
+  when IntrinsicId::IntToString then EffectSummary { may_allocate: true }
+  when IntrinsicId::FloatToString then EffectSummary { may_allocate: true }
+  when IntrinsicId::BoolToString then EffectSummary { may_allocate: true }
+  when IntrinsicId::CharToString then EffectSummary { may_allocate: true }
+  when IntrinsicId::IntToStr then EffectSummary { may_allocate: true }
+  when IntrinsicId::FloatToStr then EffectSummary { may_allocate: true }
+  when IntrinsicId::ToString then EffectSummary { may_allocate: true }
+  when IntrinsicId::AsBytes then EffectSummary { may_allocate: true }
+  when IntrinsicId::Bytes then EffectSummary { may_allocate: true }
+  # The C-string / raw allocation family.
+  when IntrinsicId::CStringNew then EffectSummary { may_allocate: true }
+  when IntrinsicId::MemAlloc then EffectSummary { may_allocate: true }
+  # Clone: the intrinsic cloning of a heap-backed value allocates the
+  # clone's backing.
+  when IntrinsicId::Clone then EffectSummary { may_allocate: true }
+  # The file read-to-String operation: allocation + I/O.
+  when IntrinsicId::ReadFileToStringNative then EffectSummary { may_allocate: true, may_io: true }
+  # The raw syscall surface: an arbitrary kernel call may do anything —
+  # allocate, block, sleep, spawn, perform I/O, panic, unsafe — the
+  # fail-closed record.
+  when IntrinsicId::Syscall1 then effect_summary_unknown()
+  when IntrinsicId::Syscall2 then effect_summary_unknown()
+  when IntrinsicId::Syscall3 then effect_summary_unknown()
+  when IntrinsicId::Syscall4 then effect_summary_unknown()
+  when IntrinsicId::Syscall5 then effect_summary_unknown()
+  when IntrinsicId::Syscall6 then effect_summary_unknown()
+  # The descriptor I/O family: reads/writes/opens may block on the
+  # descriptor; closes do not.
+  when IntrinsicId::SysWrite then EffectSummary { may_block: true, may_io: true }
+  when IntrinsicId::SysRead then EffectSummary { may_block: true, may_io: true }
+  when IntrinsicId::SysOpen then EffectSummary { may_block: true, may_io: true }
+  when IntrinsicId::SysClose then EffectSummary { may_io: true }
+  when IntrinsicId::SysExit then EffectSummary { may_io: true }
+  # The std output surfaces (println-family and process capture).
+  when IntrinsicId::StdoutString then EffectSummary { may_io: true }
+  when IntrinsicId::StderrString then EffectSummary { may_io: true }
+  when IntrinsicId::Output then EffectSummary { may_io: true }
+  when IntrinsicId::Status then EffectSummary { may_io: true }
+  when IntrinsicId::OpenWindows then EffectSummary { may_io: true }
+  when _ then EffectSummary {}
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# The extern-name effect RECORDS — the seeded bodyless callees
 # ———————————————————————————————————————————————————————————————
 # A call whose callee has no body in this compilation classifies:
-#   1. through the checker's typed_intrinsics router when the call node
-#      carries an IntrinsicId (effect_class_intrinsic_classes) — a dirty
-#      id marks its classes at the call site; a benign id records the
-#      callee as KNOWN CLEAN (fn_class_clean, the fixpoint's
-#      bodyless-callee exemption);
-#   2. through the extern-name seed table (effect_class_extern_seed) for
-#      the non-intrinsic runtime externs (_tg_* / libc_* families) and
-#      as a fallback for the intrinsic names;
-#   3. otherwise the callee is UNKNOWN — all three classes (the
-#      fail-closed rule: an unannotated/unknown function's behavior is
-#      conservatively everything).
-# The seed tables are an EXPLICITLY MAINTAINED list of the runtime's
+#   1. through the intrinsic records (effect_summary_of_intrinsic) when
+#      the MIR call carries the checker's stamped IntrinsicId;
+#   2. through the intrinsic-name router (intrinsic_id_of_call) for the
+#      synthesized/bodyless intrinsic-name calls (string_from_static and
+#      the str_*/string_* emission names);
+#   3. through THIS extern-name seed table for the non-intrinsic runtime
+#      externs (_tg_* / libc_* / pthread_* families);
+#   4. otherwise the callee is UNKNOWN — effect_summary_unknown (the
+#      fail-closed rule: an operation whose behavior cannot be bounded
+#      may do everything).
+# Option::Some(record) = the extern's known effect record (the empty
+# record = known benign — the pure runtime helpers); Option::None =
+# unknown (the MIR pass folds effect_summary_unknown at the call site).
+# The seed table is an EXPLICITLY MAINTAINED list of the runtime's
 # extern surface; a missing seed degrades to unknown (never to clean),
 # so the checker stays sound as the surface grows.
-
-# The intrinsic family's class table (empty = benign — the router
-# classified the op and it never allocates/blocks/does I/O). The dirty
-# set is the heap-constructing/growing/formatting family plus the raw
-# syscall and I/O surfaces.
-def effect_class_intrinsic_classes(iid: IntrinsicId) -> Vec[EffectClass]
-  match iid
-  when IntrinsicId::ArrayNew then Vec::from([EffectClass::Alloc])
-  when IntrinsicId::ArrayWithCapacity then Vec::from([EffectClass::Alloc])
-  when IntrinsicId::ArrayFromList then Vec::from([EffectClass::Alloc])
-  when IntrinsicId::ArrayPush then Vec::from([EffectClass::Alloc])
-  when IntrinsicId::ArrayInsert then Vec::from([EffectClass::Alloc])
-  when IntrinsicId::ArrayExtend then Vec::from([EffectClass::Alloc])
-  when IntrinsicId::ArrayResize then Vec::from([EffectClass::Alloc])
-  when IntrinsicId::ArrayReplace then Vec::from([EffectClass::Alloc])
-  when IntrinsicId::ArraySlice then Vec::from([EffectClass::Alloc])
-  when IntrinsicId::ArrayJoin then Vec::from([EffectClass::Alloc])
-  when IntrinsicId::MapNew then Vec::from([EffectClass::Alloc])
-  when IntrinsicId::MapPush then Vec::from([EffectClass::Alloc])
-  when IntrinsicId::MapInsert then Vec::from([EffectClass::Alloc])
-  when IntrinsicId::MapClone then Vec::from([EffectClass::Alloc])
-  when IntrinsicId::MapKeys then Vec::from([EffectClass::Alloc])
-  when IntrinsicId::MapValues then Vec::from([EffectClass::Alloc])
-  when IntrinsicId::MapEntries then Vec::from([EffectClass::Alloc])
-  when IntrinsicId::SetNew then Vec::from([EffectClass::Alloc])
-  when IntrinsicId::SetInsert then Vec::from([EffectClass::Alloc])
-  when IntrinsicId::SetClone then Vec::from([EffectClass::Alloc])
-  when IntrinsicId::SetEntries then Vec::from([EffectClass::Alloc])
-  when IntrinsicId::MapJoinCollect then Vec::from([EffectClass::Alloc])
-  when IntrinsicId::SplitLinesTrim then Vec::from([EffectClass::Alloc])
-  when IntrinsicId::TrimMatches then Vec::from([EffectClass::Alloc])
-  when IntrinsicId::ToLowercase then Vec::from([EffectClass::Alloc])
-  when IntrinsicId::StringReplace then Vec::from([EffectClass::Alloc])
-  when IntrinsicId::StringSplit then Vec::from([EffectClass::Alloc])
-  when IntrinsicId::StringTrim then Vec::from([EffectClass::Alloc])
-  when IntrinsicId::StringToLowercase then Vec::from([EffectClass::Alloc])
-  when IntrinsicId::StringSplitLines then Vec::from([EffectClass::Alloc])
-  when IntrinsicId::StringNew then Vec::from([EffectClass::Alloc])
-  when IntrinsicId::StringPush then Vec::from([EffectClass::Alloc])
-  when IntrinsicId::StringPushStr then Vec::from([EffectClass::Alloc])
-  when IntrinsicId::StringReserve then Vec::from([EffectClass::Alloc])
-  when IntrinsicId::StringClone then Vec::from([EffectClass::Alloc])
-  when IntrinsicId::StringFromStatic then Vec::from([EffectClass::Alloc])
-  when IntrinsicId::StringFromBytes then Vec::from([EffectClass::Alloc])
-  when IntrinsicId::StrConcat then Vec::from([EffectClass::Alloc])
-  when IntrinsicId::StrCopy then Vec::from([EffectClass::Alloc])
-  when IntrinsicId::StrSlice then Vec::from([EffectClass::Alloc])
-  when IntrinsicId::StrToString then Vec::from([EffectClass::Alloc])
-  when IntrinsicId::IntToString then Vec::from([EffectClass::Alloc])
-  when IntrinsicId::FloatToString then Vec::from([EffectClass::Alloc])
-  when IntrinsicId::BoolToString then Vec::from([EffectClass::Alloc])
-  when IntrinsicId::CharToString then Vec::from([EffectClass::Alloc])
-  when IntrinsicId::IntToStr then Vec::from([EffectClass::Alloc])
-  when IntrinsicId::FloatToStr then Vec::from([EffectClass::Alloc])
-  when IntrinsicId::ToString then Vec::from([EffectClass::Alloc])
-  when IntrinsicId::AsBytes then Vec::from([EffectClass::Alloc])
-  when IntrinsicId::Bytes then Vec::from([EffectClass::Alloc])
-  when IntrinsicId::CStringNew then Vec::from([EffectClass::Alloc])
-  when IntrinsicId::MemAlloc then Vec::from([EffectClass::Alloc])
-  when IntrinsicId::Clone then Vec::from([EffectClass::Alloc])
-  when IntrinsicId::ReadFileToStringNative then Vec::from([EffectClass::Alloc, EffectClass::Io])
-  when IntrinsicId::Syscall1 then Vec::from([EffectClass::Alloc, EffectClass::Block, EffectClass::Io])
-  when IntrinsicId::Syscall2 then Vec::from([EffectClass::Alloc, EffectClass::Block, EffectClass::Io])
-  when IntrinsicId::Syscall3 then Vec::from([EffectClass::Alloc, EffectClass::Block, EffectClass::Io])
-  when IntrinsicId::Syscall4 then Vec::from([EffectClass::Alloc, EffectClass::Block, EffectClass::Io])
-  when IntrinsicId::Syscall5 then Vec::from([EffectClass::Alloc, EffectClass::Block, EffectClass::Io])
-  when IntrinsicId::Syscall6 then Vec::from([EffectClass::Alloc, EffectClass::Block, EffectClass::Io])
-  when IntrinsicId::SysWrite then Vec::from([EffectClass::Io, EffectClass::Block])
-  when IntrinsicId::SysRead then Vec::from([EffectClass::Io, EffectClass::Block])
-  when IntrinsicId::SysOpen then Vec::from([EffectClass::Io, EffectClass::Block])
-  when IntrinsicId::SysClose then Vec::from([EffectClass::Io])
-  when IntrinsicId::SysExit then Vec::from([EffectClass::Io])
-  when IntrinsicId::StdoutString then Vec::from([EffectClass::Io])
-  when IntrinsicId::StderrString then Vec::from([EffectClass::Io])
-  when IntrinsicId::Output then Vec::from([EffectClass::Io])
-  when IntrinsicId::Status then Vec::from([EffectClass::Io])
-  when IntrinsicId::OpenWindows then Vec::from([EffectClass::Io])
-  when _ then Vec::new()
-  end
-end
-
-# The extern-NAME seed table (the bodyless non-intrinsic runtime
-# externs; the intrinsic names fall back here too when a call site never
-# routed). Option::Some(classes) — the classes the extern may perform
-# (Some(empty) = KNOWN BENIGN — the pure runtime helpers); Option::None
-# = unknown (all three classes).
-def effect_class_extern_seed(name: String) -> Option[Vec[EffectClass]]
+def effect_summary_of_extern_name(name: String) -> Option[EffectSummary]
   if name.starts_with("_tg_volatile") then
     # The volatile/MMIO load/store intrinsics (_tg_volatile_read* /
-    # _tg_volatile_write*) — a width-exact volatile memory access: a
-    # CPU load/store that the optimizer cannot elide or reorder, NEVER a
-    # heap allocation, a blocking wait or an I/O operation. The audit
-    # P1-16 interrupt-handler checklist permits MMIO register access in
-    # a handler, so this family classifies CLEAN.
-    return Option::Some(Vec::new())
+    # _tg_volatile_write*) — a width-exact volatile memory access: a CPU
+    # load/store the optimizer cannot elide or reorder, never a heap
+    # allocation, a blocking wait or an OS I/O operation. The record
+    # carries the MMIO (hardware register access) capability — a
+    # hardware effect permitted by the class claims (the audit P1-16
+    # interrupt-handler checklist permits MMIO register access in a
+    # handler).
+    return Option::Some(effect_summary_with_capability(EffectSummary {}, capability_id_mmio()))
   end
   if name.starts_with("_tg_hash") || name.starts_with("_tg_eq") then
     # Pure key hashing/equality helpers.
-    return Option::Some(Vec::new())
+    return Option::Some(EffectSummary {})
   end
   if name.starts_with("_tg_str_") then
     # Pure raw-string helpers (_tg_str_skip...).
-    return Option::Some(Vec::new())
+    return Option::Some(EffectSummary {})
   end
   if name == "_tg_read_vec_u8" || name == "_tg_write_vec_u8" || name == "libc_write" || name == "libc_read" then
-    return Option::Some(Vec::from([EffectClass::Io, EffectClass::Block]))
+    # The descriptor read/write surface: may block on the descriptor.
+    return Option::Some(EffectSummary { may_block: true, may_io: true })
   end
-  if name == "sleep" || name == "usleep" || name == "nanosleep" || name == "sched_yield" then
-    # The sleep/scheduling family (the libc externs std::time and
-    # std::thread declare): a call that suspends the caller (sleeps for
-    # a duration) or yields the scheduler quantum — the audit P1-16
-    # blocked list (sleep and unbounded scheduling) classifies Block.
-    return Option::Some(Vec::from([EffectClass::Block]))
+  if name == "sleep" || name == "usleep" || name == "nanosleep" then
+    # The sleep family (the libc externs std::time and std::thread
+    # declare): a call that suspends the caller — may_sleep AND
+    # may_block (the class view folds sleep into the Block class).
+    return Option::Some(EffectSummary { may_block: true, may_sleep: true })
+  end
+  if name == "sched_yield" then
+    # Yields the scheduler quantum — the caller blocks until it is
+    # rescheduled (the audit P1-16 blocked list).
+    return Option::Some(EffectSummary { may_block: true })
+  end
+  if name == "pthread_mutex_lock" || name == "pthread_cond_wait" || name == "sem_wait" || name == "pthread_join" then
+    # The blocking synchronization family — Mutex::lock-class operations
+    # (may wait indefinitely for another thread; never allocation or
+    # I/O).
+    return Option::Some(EffectSummary { may_block: true })
   end
   if name == "_tg_arg" || name == "_tg_arg_copy" || name == "_tg_env_entry" || name == "_tg_env_count" then
-    return Option::Some(Vec::from([EffectClass::Io]))
+    # The process argument/environment surface.
+    return Option::Some(EffectSummary { may_io: true })
   end
   if name.starts_with("__intrinsic_simd") then
     # The SIMD lane intrinsics are pure arithmetic.
-    return Option::Some(Vec::new())
+    return Option::Some(EffectSummary {})
   end
   if name.starts_with("__intrinsic_atomic_") then
     # The atomic load/store/exchange/CAS/fetch/RMW/fence extern family —
     # pure CPU operations (never allocation, blocking or I/O). The audit
-    # P1-16 interrupt-handler checklist permits atomic ops in a handler
-    # (the lock-free FIFO case), so this family classifies CLEAN.
-    return Option::Some(Vec::new())
+    # P1-16 interrupt-handler checklist permits atomic ops in a handler.
+    return Option::Some(EffectSummary {})
   end
   if name == "__intrinsic_mem_free" || name == "__intrinsic_mem_copy" || name == "__intrinsic_mem_set" || name == "__intrinsic_mem_zero" then
-    return Option::Some(Vec::new())
+    # The raw memory helpers — pure CPU operations (freeing is not an
+    # allocation).
+    return Option::Some(EffectSummary {})
   end
   if name == "__intrinsic_abort" || name == "__intrinsic_longjmp" then
-    return Option::Some(Vec::new())
+    # Abnormal termination — a panic-class operation (never alloc/block/
+    # io).
+    return Option::Some(EffectSummary { may_panic: true })
   end
   if name.starts_with("__intrinsic_") then
     # An intrinsic extern the call-site router did not classify (a gated
@@ -8755,631 +9116,18 @@ def effect_class_extern_seed(name: String) -> Option[Vec[EffectClass]]
   Option::None
 end
 
-# The backstop growth-method tables — the method calls on the BUILTIN
-# heap types (String / Vec-Array / Map / Set / the Box-Rc families)
-# whose names are growth-prone. Normally these calls resolve through the
-# std wrapper bodies (the call graph + the intrinsic router classify
-# them); the backstop fires only for the calls that record neither a
-# callee DefId nor an IntrinsicId, so a name alone must decide.
-def effect_class_string_growth_method(name: String) -> Bool
-  if name == "push" || name == "push_str" || name == "insert" || name == "extend" || name == "append" || name == "prepend" || name == "reserve" || name == "resize" || name == "clone" || name == "from_static" || name == "from_bytes" then
-    return true
-  end
-  false
-end
-
-def effect_class_container_growth_method(name: String) -> Bool
-  if name == "push" || name == "insert" || name == "extend" || name == "append" || name == "reserve" || name == "with_capacity" || name == "clone" then
-    return true
-  end
-  false
-end
-
-# Whether a receiver type is one of the builtin heap types the backstop
-# gates on (a user type's same-named method never classifies).
-def effect_class_receiver_is_builtin_heap(env: TypeEnv, ty: Type) -> Bool
-  match ty
-  when Type::String then true
-  when Type::Adt(tid, _) then
-    tid.id == env.lang_items.vec || tid.id == env.lang_items.array ||
-    tid.id == env.lang_items.map || tid.id == env.lang_items.set ||
-    tid.id == env.lang_items.box_ || tid.id == env.lang_items.rc ||
-    tid.id == env.lang_items.unique_ptr || tid.id == env.lang_items.arc_strong
-  when _ then false
-  end
-end
-
 # ———————————————————————————————————————————————————————————————
-# The direct-scan walkers — one body walk per body-bearing function,
-# run by the pass-4 hooks AFTER the body is fully checked (so the typed
-# per-node records exist)
+# The END-OF-TYPECHECK effect-class note: the @no_alloc / @no_block /
+# @no_io / @irq_safe / @interrupt claim PROOF no longer runs here. The
+# claim tables above and below (fn_class_claims — the def-keyed claims
+# with attribute spans — and fn_class_names) are registered during body
+# checking for the MIR-side enforcement pass
+# (check_effect_class_annotations_mir, mir.tg), which computes the
+# TRANSITIVE summaries over the lowered program (the MIR carries the
+# compiler-generated lowering sites the source syntax never shows) and
+# verifies each claim against the summary of what executes. The
+# check-item hooks below no longer call a source-syntax classifier.
 # ———————————————————————————————————————————————————————————————
-# The scan records the DIRECT class evidence into fn_class_direct /
-# fn_class_evidence under the function's def-key and the call-edge names
-# into fn_class_edge_names. The recursion mirrors the capture-scan
-# walkers (scan_block / scan_stmt / scan_expr); every sub-expression is
-# visited — including closure bodies and handler arms (conservative: a
-# closure created in the body may run within it).
-
-def effect_class_scan_fn_body(inout env: TypeEnv, key: String, body: FnBody) -> Unit
-  match body
-  when FnBody::FnBlock(block) then effect_class_scan_block(env, key, &block)
-  when FnBody::FnExpr(expr) then effect_class_scan_expr(env, key, &expr)
-  when _ then ()
-  end
-end
-
-def effect_class_scan_block(inout env: TypeEnv, key: String, block: Block) -> Unit
-  var i = 0
-  while i < block.stmts.len() do
-    effect_class_scan_stmt(env, key, &block.stmts[i])
-    i = i + 1
-  end
-end
-
-def effect_class_scan_pattern_literal(inout env: TypeEnv, key: String, pat: Pattern) -> Unit
-  match pat.kind
-  when PatternKind::Literal(e) then effect_class_scan_expr(env, key, &e)
-  when _ then ()
-  end
-end
-
-def effect_class_scan_stmt(inout env: TypeEnv, key: String, st: Stmt) -> Unit
-  match st.kind
-  when StmtKind::StmtLet(_, _, init, _) then effect_class_scan_expr(env, key, &init)
-  when StmtKind::StmtAssign(target, value) then
-    effect_class_scan_expr(env, key, &target)
-    effect_class_scan_expr(env, key, &value)
-  when StmtKind::StmtCompoundAssign(_, target, value) then
-    effect_class_scan_expr(env, key, &target)
-    effect_class_scan_expr(env, key, &value)
-  when StmtKind::StmtIf(if_stmt) then
-    effect_class_scan_if(env, key, &if_stmt)
-  when StmtKind::StmtMatch(m) then
-    effect_class_scan_expr(env, key, &m.scrutinee)
-    var ai = 0
-    while ai < m.arms.len() do
-      effect_class_scan_pattern_literal(env, key, &m.arms[ai].pattern)
-      match m.arms[ai].guard_expr
-      when Option::Some(g) then effect_class_scan_expr(env, key, &g)
-      when Option::None then ()
-      end
-      effect_class_scan_block(env, key, &m.arms[ai].body)
-      ai = ai + 1
-    end
-  when StmtKind::StmtWhile(cond, body) then
-    effect_class_scan_expr(env, key, &cond)
-    effect_class_scan_block(env, key, &body)
-  when StmtKind::StmtFor(fs) then
-    effect_class_scan_expr(env, key, &fs.iter)
-    effect_class_scan_block(env, key, &fs.body)
-  when StmtKind::StmtLoop(body) then effect_class_scan_block(env, key, &body)
-  when StmtKind::StmtReturn(val_opt) then
-    match val_opt
-    when Option::Some(v) then effect_class_scan_expr(env, key, &v)
-    when Option::None then ()
-    end
-  when StmtKind::StmtBreak(val_opt) then
-    match val_opt
-    when Option::Some(v) then effect_class_scan_expr(env, key, &v)
-    when Option::None then ()
-    end
-  when StmtKind::StmtContinue then ()
-  when StmtKind::StmtExpr(e) then effect_class_scan_expr(env, key, &e)
-  when StmtKind::StmtUnsafe(_, body) then effect_class_scan_block(env, key, &body)
-  when StmtKind::StmtDefer(body) then effect_class_scan_block(env, key, &body)
-  when StmtKind::StmtGuard(cond, else_action) then
-    effect_class_scan_expr(env, key, &cond)
-    match else_action
-    when GuardElse::Return(val_opt) then
-      match val_opt
-      when Option::Some(v) then effect_class_scan_expr(env, key, &v)
-      when Option::None then ()
-      end
-    when GuardElse::Panic(_) then ()
-    when GuardElse::Break(val_opt) then
-      match val_opt
-      when Option::Some(v) then effect_class_scan_expr(env, key, &v)
-      when Option::None then ()
-      end
-    when GuardElse::Continue then ()
-    end
-  when StmtKind::StmtTry(body, catches, finally_block) then
-    effect_class_scan_block(env, key, &body)
-    var ci = 0
-    while ci < catches.len() do
-      effect_class_scan_block(env, key, &catches[ci].body)
-      ci = ci + 1
-    end
-    match finally_block
-    when Option::Some(fb) then effect_class_scan_block(env, key, &fb)
-    when Option::None then ()
-    end
-  when StmtKind::StmtWith(expr, _, body) then
-    effect_class_scan_expr(env, key, &expr)
-    effect_class_scan_block(env, key, &body)
-  when StmtKind::StmtHandleWith(expr, handlers) then
-    effect_class_scan_expr(env, key, &expr)
-    var hi = 0
-    while hi < handlers.len() do
-      var hai = 0
-      while hai < handlers[hi].arms.len() do
-        effect_class_scan_block(env, key, &handlers[hi].arms[hai].body)
-        hai = hai + 1
-      end
-      hi = hi + 1
-    end
-  end
-end
-
-# The shared if/elsif/else walker (both StmtIf and the ExprIf form).
-def effect_class_scan_if(inout env: TypeEnv, key: String, if_stmt: IfStmt) -> Unit
-  effect_class_scan_expr(env, key, &if_stmt.cond)
-  effect_class_scan_block(env, key, &if_stmt.then_block)
-  var ei = 0
-  while ei < if_stmt.elsif_branches.len() do
-    effect_class_scan_expr(env, key, &if_stmt.elsif_branches[ei].0)
-    effect_class_scan_block(env, key, &if_stmt.elsif_branches[ei].1)
-    ei = ei + 1
-  end
-  match if_stmt.else_block
-  when Option::Some(b) then effect_class_scan_block(env, key, &b)
-  when Option::None then ()
-  end
-end
-
-def effect_class_scan_expr(inout env: TypeEnv, key: String, e: Expr) -> Unit
-  match e.kind
-  when ExprKind::ExprIntLit(_) then ()
-  when ExprKind::ExprFloatLit(_) then ()
-  when ExprKind::ExprStringLit(_) then ()
-  when ExprKind::ExprCharLit(_) then ()
-  when ExprKind::ExprBoolLit(_) then ()
-  when ExprKind::ExprNilLit then ()
-  when ExprKind::ExprIdent(_) then ()
-  when ExprKind::ExprSelfRef then ()
-  when ExprKind::ExprPath(_) then ()
-  when ExprKind::ExprArrayLit(elems) then
-    var i = 0
-    while i < elems.len() do
-      effect_class_scan_expr(env, key, &elems[i])
-      i = i + 1
-    end
-  when ExprKind::ExprTupleLit(elems) then
-    var i = 0
-    while i < elems.len() do
-      effect_class_scan_expr(env, key, &elems[i])
-      i = i + 1
-    end
-  when ExprKind::ExprStructLit(_, fields) then
-    var i = 0
-    while i < fields.len() do
-      effect_class_scan_expr(env, key, &fields[i].1)
-      i = i + 1
-    end
-  when ExprKind::ExprMapLit(entries) then
-    var i = 0
-    while i < entries.len() do
-      effect_class_scan_expr(env, key, &entries[i].0)
-      effect_class_scan_expr(env, key, &entries[i].1)
-      i = i + 1
-    end
-  when ExprKind::ExprBinaryOp(op, lhs, rhs) then
-    match op
-    when BinOp::Add then
-      # The `+` concatenation on an owned String is heap-backed — the
-      # direct site marks Alloc when either operand is typed String
-      # (the typed operand types were recorded by the body check).
-      var lhs_ty = Option::None
-      match env.typed_expr_types.get(lhs.node_id)
-      when Option::Some(t) then lhs_ty = Option::Some(resolve_type_var(env, t))
-      when Option::None then ()
-      end
-      var rhs_ty = Option::None
-      match env.typed_expr_types.get(rhs.node_id)
-      when Option::Some(t) then rhs_ty = Option::Some(resolve_type_var(env, t))
-      when Option::None then ()
-      end
-      var is_concat = false
-      match lhs_ty
-      when Option::Some(t) then if is_string_type(&t) then is_concat = true end
-      when Option::None then ()
-      end
-      if !is_concat then
-        match rhs_ty
-        when Option::Some(t) then if is_string_type(&t) then is_concat = true end
-        when Option::None then ()
-        end
-      end
-      if is_concat then
-        effect_class_mark_direct(env, key, EffectClass::Alloc, "string concatenation with `+` (heap-backed String result)".to_string())
-      end
-    when _ then ()
-    end
-    effect_class_scan_expr(env, key, &lhs)
-    effect_class_scan_expr(env, key, &rhs)
-  when ExprKind::ExprUnaryOp(_, inner) then effect_class_scan_expr(env, key, &inner)
-  when ExprKind::ExprFieldAccess(base, _) then effect_class_scan_expr(env, key, &base)
-  when ExprKind::ExprMethodCall(recv, method, _, args) then
-    effect_class_scan_expr(env, key, &recv)
-    var ai = 0
-    while ai < args.len() do
-      effect_class_scan_expr(env, key, &args[ai])
-      ai = ai + 1
-    end
-    effect_class_scan_call_site(env, key, e, &method)
-  when ExprKind::ExprIndex(base, idx) then
-    effect_class_scan_expr(env, key, &base)
-    effect_class_scan_expr(env, key, &idx)
-  when ExprKind::ExprCall(func, args) then
-    effect_class_scan_expr(env, key, &func)
-    var ai = 0
-    while ai < args.len() do
-      effect_class_scan_expr(env, key, &args[ai])
-      ai = ai + 1
-    end
-    let no_method = "".to_string()
-    effect_class_scan_call_site(env, key, e, &no_method)
-  when ExprKind::ExprClosure(_, _, body) then
-    # Boxing a closure is a heap allocation at creation; the body is
-    # scanned conservatively (the closure may run within this function).
-    effect_class_mark_direct(env, key, EffectClass::Alloc, "boxes a closure (a heap closure allocation)".to_string())
-    effect_class_scan_expr(env, key, &body)
-  when ExprKind::ExprAccess(inner) then effect_class_scan_expr(env, key, &inner)
-  when ExprKind::ExprRawDeref(inner) then effect_class_scan_expr(env, key, &inner)
-  when ExprKind::ExprIf(if_stmt) then effect_class_scan_if(env, key, &if_stmt)
-  when ExprKind::ExprMatch(m) then
-    effect_class_scan_expr(env, key, &m.scrutinee)
-    var ai = 0
-    while ai < m.arms.len() do
-      effect_class_scan_pattern_literal(env, key, &m.arms[ai].pattern)
-      match m.arms[ai].guard_expr
-      when Option::Some(g) then effect_class_scan_expr(env, key, &g)
-      when Option::None then ()
-      end
-      effect_class_scan_block(env, key, &m.arms[ai].body)
-      ai = ai + 1
-    end
-  when ExprKind::ExprBlock(block) then effect_class_scan_block(env, key, &block)
-  when ExprKind::ExprUnsafe(_, block) then effect_class_scan_block(env, key, &block)
-  when ExprKind::ExprAsync(block) then effect_class_scan_block(env, key, &block)
-  when ExprKind::ExprAwait(inner) then effect_class_scan_expr(env, key, &inner)
-  when ExprKind::ExprTry(inner) then effect_class_scan_expr(env, key, &inner)
-  when ExprKind::ExprRange(start, end_, _) then
-    match start
-    when Option::Some(s) then effect_class_scan_expr(env, key, &s)
-    when Option::None then ()
-    end
-    match end_
-    when Option::Some(e) then effect_class_scan_expr(env, key, &e)
-    when Option::None then ()
-    end
-  when ExprKind::ExprCast(inner, _) then effect_class_scan_expr(env, key, &inner)
-  when ExprKind::ExprTypeCheck(inner, _) then effect_class_scan_expr(env, key, &inner)
-  when ExprKind::ExprComptime(_) then
-    # A comptime block executes at COMPILE time — its constructs are not
-    # the runtime behavior of the enclosing function.
-    ()
-  when ExprKind::ExprEnumVariant(_, args) then
-    var ai = 0
-    while ai < args.len() do
-      effect_class_scan_expr(env, key, &args[ai])
-      ai = ai + 1
-    end
-  when ExprKind::ExprAssign(target, value) then
-    effect_class_scan_expr(env, key, &target)
-    effect_class_scan_expr(env, key, &value)
-  when ExprKind::ExprPipe(lhs, rhs) then
-    effect_class_scan_expr(env, key, &lhs)
-    effect_class_scan_expr(env, key, &rhs)
-  when ExprKind::ExprMacroCall(_, args) then
-    var ai = 0
-    while ai < args.len() do
-      effect_class_scan_expr(env, key, &args[ai])
-      ai = ai + 1
-    end
-  when ExprKind::ExprError(_) then ()
-  end
-end
-
-# The per-call-site classification (shared by ExprCall and
-# ExprMethodCall):
-#   1. the checker's typed_intrinsics attachment (the router) decides
-#      the intrinsic calls and the builtin-container/String method
-#      calls: a dirty id marks its classes here; a benign id records the
-#      callee as KNOWN CLEAN (fn_class_clean — the bodyless-callee
-#      exemption at the fixpoint);
-#   2. the growth-method backstop marks the builtin-heap method calls
-#      that routed neither an IntrinsicId nor a callee DefId;
-#   3. a resolved callee DefId records the call-edge name (the
-#      fixpoint's seed lookup and diagnostics); a call WITHOUT a
-#      resolved target (a closure/function-pointer VALUE, an unknown
-#      callee) is UNKNOWN — all three classes, fail closed.
-def effect_class_scan_call_site(inout env: TypeEnv, key: String, call_expr: Expr, method_name: String) -> Unit
-  var iid_opt = Option::None
-  match env.typed_intrinsics.get(call_expr.node_id)
-  when Option::Some(iid) then iid_opt = Option::Some(iid)
-  when Option::None then ()
-  end
-  var intrinsic_dirty = false
-  match iid_opt
-  when Option::Some(iid) then
-    let classes = effect_class_intrinsic_classes(iid)
-    if classes.len() > 0 then
-      intrinsic_dirty = true
-      for c in classes do
-        effect_class_mark_direct(env, key, c, "the intrinsic operation may " + effect_class_word(c) + " (a heap/growth/format/syscall op)".to_string())
-      end
-    end
-  when Option::None then ()
-  end
-  # The callee's DefId (the checker's typed target) and the call-edge
-  # name.
-  var callee_key = "".to_string()
-  var callee_name = "".to_string()
-  match env.typed_call_targets.get(call_expr.node_id)
-  when Option::Some(did) then
-    callee_key = fn_effect_def_key(env, &did)
-    callee_name = method_name.clone()
-    if callee_name.len() == 0 then
-      match callee_ident_name(&call_expr)
-      when Option::Some(n) then callee_name = n.clone()
-      when Option::None then ()
-      end
-    end
-    if callee_key.len() > 0 then
-      effect_class_record_edge_name(env, key.clone(), callee_key.clone(), callee_name.clone())
-      # A BENIGN router-classified intrinsic callee is known clean (the
-      # bodyless-callee fixpoint exemption).
-      match iid_opt
-      when Option::Some(iid) then
-        if !intrinsic_dirty then
-          env.fn_class_clean.insert(callee_key)
-        end
-      when Option::None then ()
-      end
-    end
-  when Option::None then ()
-  end
-  # The growth-method backstop: a method call on the builtin heap types
-  # that routed NO intrinsic and NO callee DefId (method_name is non-
-  # empty only for ExprMethodCall).
-  if !intrinsic_dirty && callee_key.len() == 0 && method_name.len() > 0 then
-    match call_expr.kind
-    when ExprKind::ExprMethodCall(recv, _, _, _) then
-      match env.typed_expr_types.get(recv.node_id)
-      when Option::Some(rt) then
-        let recv_ty = resolve_type_var(env, rt)
-        if effect_class_receiver_is_builtin_heap(env, &recv_ty) then
-          var is_growth = false
-          match recv_ty
-          when Type::String then
-            if effect_class_string_growth_method(method_name) then is_growth = true end
-          when _ then
-            if effect_class_container_growth_method(method_name) then is_growth = true end
-          end
-          if is_growth then
-            effect_class_mark_direct(env, key, EffectClass::Alloc, "the method `" + method_name + "` on a builtin heap type may allocate/reallocate".to_string())
-          end
-        end
-      when Option::None then ()
-      end
-    when _ then ()
-    end
-  end
-  # An UNRESOLVED direct call (a closure or function-pointer VALUE
-  # callee, an unknown computed callee) is UNKNOWN — all three classes
-  # may occur and no body or summary exists to rule any out.
-  if !intrinsic_dirty && callee_key.len() == 0 && method_name.len() == 0 then
-    let msg = "a call through a closure or function-pointer value (the callee's ".to_string()
-    effect_class_mark_direct(env, key, EffectClass::Alloc, msg + "allocation behavior cannot be proven)".to_string())
-    effect_class_mark_direct(env, key, EffectClass::Block, msg + "blocking behavior cannot be proven)".to_string())
-    effect_class_mark_direct(env, key, EffectClass::Io, msg + "I/O behavior cannot be proven)".to_string())
-  end
-end
-
-# ———————————————————————————————————————————————————————————————
-# The end-of-check pass — the fixed point and the enforcement
-# ———————————————————————————————————————————————————————————————
-
-# The bodyless-callee evidence phrase (per class), used when the callee
-# has no body and no seed (the unknown case).
-def effect_class_unknown_evidence(name: String, c: EffectClass) -> String
-  "calls `" + name + "` — a function whose " + effect_class_word(c) + " behavior is unknown (no body or class summary in this compilation)"
-end
-
-# The transitive propagation across ONE call edge, used by the fixed
-# point: caller picks up the callee's final classes and the first-wins
-# evidence. Returns true when the caller's set grew.
-def effect_class_propagate_edge(inout env: TypeEnv, caller: String, callee: String) -> Bool
-  var changed = false
-  var callee_name = "".to_string()
-  match env.fn_class_names.get(callee.clone())
-  when Option::Some(n) then callee_name = n.clone()
-  when Option::None then ()
-  end
-  if callee_name.len() == 0 then
-    match effect_class_edge_name_of(env, caller.clone(), callee.clone())
-    when Option::Some(n) then callee_name = n.clone()
-    when Option::None then ()
-    end
-  end
-  var caller_set = Vec::new()
-  match env.fn_class_set.get(caller.clone())
-  when Option::Some(cs) then caller_set = cs.clone()
-  when Option::None then ()
-  end
-  if env.fn_class_names.contains_key(callee.clone()) then
-    # The callee has a body in this compilation — its final set (the
-    # fixed point computes it in the same round sweep) is the callee's
-    # contribution.
-    var callee_set = Vec::new()
-    match env.fn_class_set.get(callee.clone())
-    when Option::Some(cs2) then callee_set = cs2.clone()
-    when Option::None then ()
-    end
-    for c in callee_set do
-      if !effect_class_set_contains(&caller_set, &c) then
-        caller_set.push(c)
-        changed = true
-        # The first-wins evidence: the caller's own evidence, else the
-        # callee's evidence, else the chain text.
-        if effect_class_evidence_of(env, caller.clone(), c).len() == 0 then
-          let cev = effect_class_evidence_of(env, callee.clone(), c)
-          if cev.len() > 0 then
-            effect_class_evidence_set(env, caller.clone(), c, cev)
-          else
-            effect_class_evidence_set(env, caller.clone(), c, "the " + effect_class_word(c) + " may occur through a call chain into `" + callee_name + "`")
-          end
-        end
-      end
-    end
-  elsif !env.fn_class_clean.contains(callee.clone()) then
-    # A BODYLESS callee (an extern/foreign declaration, a bodyless
-    # builtin): the extern-name seed decides, and an UNSEEDED name is
-    # UNKNOWN — all three classes (fail closed).
-    var seed_classes = Option::None
-    if callee_name.len() > 0 then
-      seed_classes = effect_class_extern_seed(&callee_name)
-    end
-    match seed_classes
-    when Option::Some(classes) then
-      if classes.len() == 0 then
-        # Known benign (the pure runtime helpers) — contributes nothing.
-        ()
-      else
-        for c in classes do
-          if !effect_class_set_contains(&caller_set, &c) then
-            caller_set.push(c)
-            changed = true
-            if effect_class_evidence_of(env, caller.clone(), c).len() == 0 then
-              effect_class_evidence_set(env, caller.clone(), c, "calls `" + callee_name + "` — a seeded " + effect_class_word(c) + " extern")
-            end
-          end
-        end
-      end
-    when Option::None then
-      # Unknown behavior — every class may occur.
-      for c in Vec::from([EffectClass::Alloc, EffectClass::Block, EffectClass::Io]) do
-        if !effect_class_set_contains(&caller_set, &c) then
-          caller_set.push(c)
-          changed = true
-          if effect_class_evidence_of(env, caller.clone(), c).len() == 0 then
-            let disp = if callee_name.len() > 0 then callee_name.clone() else callee.clone() end
-            effect_class_evidence_set(env, caller.clone(), c, effect_class_unknown_evidence(&disp, c))
-          end
-        end
-      end
-    end
-  end
-  if changed then
-    env.fn_class_set.insert(caller.clone(), caller_set)
-  end
-  changed
-end
-
-# The end-of-check enforcement pass: fixed point over the recorded call
-# graph (seeded from the direct scans), then the annotated functions'
-# claims vs their final class sets.
-def check_effect_class_annotations(inout env: TypeEnv) -> Unit
-  # The permissive (editor) path records no resolutions, no call graph
-  # and no typed targets — the proof machinery is inert there (the
-  # pass-4 hooks gate on the same condition).
-  match env.resolutions
-  when Option::Some(_) then ()
-  when Option::None then return
-  end
-  if env.fn_class_claims.len() == 0 then return end
-
-  # 1. The fixed point — the reachable closure from the claimed
-  #    functions, iterated to a fixed point (mirroring the effect-set
-  #    discipline's sweep).
-  #    The direct sets seed every body-bearing function; the round sweep
-  #    then folds every reachable callee's set into its callers until no
-  #    set changes.
-  var reachable = Set::new()
-  var todo = Vec::new()
-  for (ck, _) in env.fn_class_claims do
-    if !reachable.contains(&ck) then
-      reachable.insert(ck.clone())
-      todo.push(ck)
-    end
-  end
-  var ti = 0
-  while ti < todo.len() do
-    let cur = todo[ti].clone()
-    match env.fn_call_graph.get(cur.clone())
-    when Option::Some(callees) then
-      for ck in callees do
-        if !reachable.contains(ck) then
-          reachable.insert(ck.clone())
-          todo.push(ck.clone())
-        end
-      end
-    when Option::None then ()
-    end
-    ti = ti + 1
-  end
-  # Seed the final sets from the direct scans.
-  for ck in reachable do
-    var seed = Vec::new()
-    match env.fn_class_direct.get(ck.clone())
-    when Option::Some(d) then seed = d.clone()
-    when Option::None then ()
-    end
-    env.fn_class_set.insert(ck.clone(), seed)
-  end
-  var changed = true
-  while changed do
-    changed = false
-    for ck in reachable do
-      match env.fn_call_graph.get(ck.clone())
-      when Option::Some(callees) then
-        for ckey in callees do
-          if effect_class_propagate_edge(env, ck.clone(), ckey.clone()) then
-            changed = true
-          end
-        end
-      when Option::None then ()
-      end
-    end
-  end
-
-  # 2. Enforcement — one E0232 diagnostic per violated forbidden class,
-  #    at the attribute's span. The message echoes the claim's
-  #    as-written attribute form (effect_class_claim_spelling) and names
-  #    the annotated function — under @interrupt that function IS the
-  #    handler, and the diagnostic says so ("@interrupt handler `...`").
-  for (key, claims) in env.fn_class_claims do
-    let fname = match env.fn_class_names.get(key.clone())
-    when Option::Some(n) then n.clone()
-    when Option::None then key.clone()
-    end
-    var final_set = Vec::new()
-    match env.fn_class_set.get(key.clone())
-    when Option::Some(fs) then final_set = fs.clone()
-    when Option::None then ()
-    end
-    for claim in claims do
-      let forbidden = effect_class_forbidden_classes(claim.anno)
-      for fc in forbidden do
-        if effect_class_set_contains(&final_set, &fc) then
-          let evidence = effect_class_evidence_of(env, key.clone(), fc)
-          let ev = if evidence.len() > 0 then evidence else "the checker could not rule out " + effect_class_word(fc) + " on any path".to_string() end
-          let subject = match claim.anno
-          when EffectAnnotation::Interrupt then "handler"
-          when _ then "function"
-          end
-          add_error_with_code(env,
-            "@" + effect_class_claim_spelling(claim) + " " + subject + " `" + fname + "` " + effect_class_phrase(fc) + ": " + ev,
-            claim.span,
-            "E0232")
-        end
-      end
-    end
-  end
-end
-
 # ———————————————————————————————————————————————————————————————
 # Generic-parameter interning 
 # ———————————————————————————————————————————————————————————————
@@ -9633,11 +9381,18 @@ def record_param_bounds(inout env: TypeEnv, generic_params: Vec[GenericParam], p
   var i = 0
   while i < generic_params.len() do
     let gp = generic_params[i]
-    if i < param_ids.len() then
-      let pkey = generic_param_id_numeric(&param_ids[i])
-      env.param_bounds.remove(&pkey)
-      for b in gp.bounds do
-        record_param_trait_bound(env, &param_ids[i], &b)
+    # (§20 slice 1): const generic parameters carry no trait bounds (the
+    # parser rejects them) — skip their registration entirely so a
+    # positional pairing with the remaining TYPE parameters never shifts.
+    match gp.kind
+    when GenericParamKind::ConstParam(_) then ()
+    when GenericParamKind::TypeParam then
+      if i < param_ids.len() then
+        let pkey = generic_param_id_numeric(&param_ids[i])
+        env.param_bounds.remove(&pkey)
+        for b in gp.bounds do
+          record_param_trait_bound(env, &param_ids[i], &b)
+        end
       end
     end
     i = i + 1
@@ -9767,6 +9522,7 @@ def type_contains_slice_view(env: TypeEnv, ty: Type) -> Bool
       found
     end
   when Type::FixedArray(elem, _) then type_contains_slice_view(env, elem)
+  when Type::FixedArraySym(elem, _) then type_contains_slice_view(env, elem)
   when Type::Tuple(elems) then
     var found = false
     var ei = 0
@@ -9907,22 +9663,18 @@ def check_function(inout env: TypeEnv, f: FunctionDecl, owner_key: String, f_own
   push_scope(env)
   env.check_ctx = "fn:" + f.name
   
- # Register generic type parameters in scope. the ids were
+  # Register generic type parameters in scope. the ids were
   # interned in pass 3 under f_owner (item_owner_def — the item's DefId or
   # the deterministic module -2 fallback); this pass reconstructs the same
   # ids from (owner, declaration index) — never re-interns, so the
   # declaration-order indices stay stable.
-  var gp_idx = 0
-  while gp_idx < f.generic_params.len() do
-    bind_var(env, f.generic_params[gp_idx].name.clone(), Type::Param(generic_param_id_at(f_owner, gp_idx)))
-    gp_idx = gp_idx + 1
-  end
   var fn_param_ids = Vec::new()
-  gp_idx = 0
+  var gp_idx = 0
   while gp_idx < f.generic_params.len() do
     fn_param_ids.push(generic_param_id_at(f_owner, gp_idx))
     gp_idx = gp_idx + 1
   end
+  bind_generic_params(env, &f.generic_params, &fn_param_ids)
 
  # record the generic parameters' trait bounds (inline bounds +
   # where-clause) so bare Param receivers in the body resolve through them.
@@ -9983,14 +9735,14 @@ def check_function(inout env: TypeEnv, f: FunctionDecl, owner_key: String, f_own
   env.fn_declared_effect_spans.insert(decl_key.clone(), f.span)
   env.fn_effect_modules.insert(decl_key.clone(), env.current_module_path.clone())
   let declared_budget = typed_budget_of(&f.budget_val)
-  # (audit P1-2): register the function's effect-class presence under the
-  # same def-key — the body-bearing name (the classifier's body test and
-  # the diagnostics) and the recognized annotation claims (the checker's
-  # PROVEN-or-ERROR table). The same claims ride the typed signature
-  # record below (effect_annotations — the typed storage the MIR-side
-  # consumers read). Registration is gated on the resolution presence:
-  # the permissive editor path records no call graph, so the class proof
-  # machinery is inert there.
+  # (audit P1-2 + §11): register the function's effect-class presence
+  # under the same def-key — the body-bearing display name (the MIR
+  # pass's diagnostics) and the recognized annotation claims (the
+  # def-keyed PROVEN-or-ERROR table the MIR pass consumes). The same
+  # claims ride the typed signature record below (effect_annotations —
+  # the typed storage the MIR-side consumers read). Registration is
+  # gated on the resolution presence: the permissive editor path records
+  # no claims, so the MIR-side proof machinery is inert there.
   let effect_annotations = effect_class_annos_of_claims(&effect_claims)
   if env.resolutions.is_some() then
     env.fn_class_names.insert(decl_key.clone(), f.name.clone())
@@ -10025,16 +9777,6 @@ def check_function(inout env: TypeEnv, f: FunctionDecl, owner_key: String, f_own
     # transfer_consume mirror at the FnExpr body check).
     record_projected_consume(env, &expr)
   when _ then ()
-  end
-  # (audit P1-2): scan the function's OWN body for the direct
-  # effect-class evidence (heap constructors, closure boxing, growing
-  # String/container operations, formatting, raw syscalls, indirect
-  # calls). The scan runs after the body check so the typed per-node
-  # records (typed_expr_types / typed_intrinsics / typed_call_targets)
-  # are complete; the transitivity rides the recorded call graph at the
-  # end-of-check pass (check_effect_class_annotations).
-  if env.resolutions.is_some() then
-    effect_class_scan_fn_body(env, &decl_key, &f.body)
   end
   env.current_fn_key = ""
   env.expected_return = Option::None
@@ -10166,6 +9908,12 @@ def contract_ty_subst(env: TypeEnv, contract: TraitContract, trait_args: Vec[Typ
     end
     Type::Adt(tid, new_args)
   when Type::FixedArray(elem, n) then Type::FixedArray(contract_ty_subst(env, contract, trait_args, self_type, assoc_types, &elem), n)
+  when Type::FixedArraySym(elem, gpid) then
+    # (§20 slice 1): trait-contract substitution over a symbolic-size array —
+    # the element substitutes; the size parameter is a def-level const
+    # parameter and never a trait-contract parameter, so the symbolic id
+    # survives unchanged (contracts gain const parameters in slice 2+).
+    Type::FixedArraySym(contract_ty_subst(env, contract, trait_args, self_type, assoc_types, &elem), gpid)
   when Type::FnPtr(params, ret, effects) then
     var new_params = Vec::new()
     var i = 0
@@ -10457,11 +10205,7 @@ def check_impl(inout env: TypeEnv, i: ImplDecl, method_keys: Vec[String]) -> Uni
   let impl_idx = env.impls.len()
   let imp_owner = fresh_synthetic_owner(&mut env.generic_param_table)
   let impl_param_ids = intern_generic_params(env, &imp_owner, &i.generic_params)
-  var gp_idx = 0
-  while gp_idx < i.generic_params.len() do
-    bind_var(env, i.generic_params[gp_idx].name.clone(), Type::Param(impl_param_ids[gp_idx].clone()))
-    gp_idx = gp_idx + 1
-  end
+  bind_generic_params(env, &i.generic_params, &impl_param_ids)
 
  # record the impl's generic-parameter trait bounds (inline bounds +
   # where-clause) so bare Param receivers in the method bodies resolve
@@ -10508,6 +10252,24 @@ def check_impl(inout env: TypeEnv, i: ImplDecl, method_keys: Vec[String]) -> Uni
         ta_expr = ta_expr + 1
       end
     else
+      # (§20 slice 1): the declaration-order derivation (the trait's type
+      # arguments ARE the impl's declared parameters — only valid while
+      # EVERY parameter is a type parameter; a const generic parameter in
+      # the impl list makes the derivation unsound (a const position is not
+      # a trait type argument), so it is rejected with a diagnostic instead
+      # of silently pushing Type::Param into a const parameter's slot).
+      var const_in_impl = false
+      var cpi = 0
+      while cpi < i.generic_params.len() do
+        match i.generic_params[cpi].kind
+        when GenericParamKind::ConstParam(_) then const_in_impl = true
+        when GenericParamKind::TypeParam then ()
+        end
+        cpi = cpi + 1
+      end
+      if const_in_impl then
+        type_add_error(env, "an impl declaring a const generic parameter must state the trait's type arguments explicitly (`impl[T, const N: UInt] Trait[Args] for Type`)", i.span)
+      end
       var ta_idx = 0
       while ta_idx < impl_param_ids.len() do
         imp_trait_args.push(Type::Param(impl_param_ids[ta_idx].clone()))
@@ -10536,11 +10298,7 @@ def check_impl(inout env: TypeEnv, i: ImplDecl, method_keys: Vec[String]) -> Uni
     # body pass reconstructs the same ids from (owner, index).
     let m_owner = impl_method_owner_def(env, &i.for_type, &m, impl_idx, method_index)
     let method_param_ids = intern_generic_params(env, &m_owner, &m.generic_params)
-    var mgp_idx = 0
-    while mgp_idx < m.generic_params.len() do
-      bind_var(env, m.generic_params[mgp_idx].name.clone(), Type::Param(method_param_ids[mgp_idx].clone()))
-      mgp_idx = mgp_idx + 1
-    end
+    bind_generic_params(env, &m.generic_params, &method_param_ids)
 
     # Resolve parameter types
     var param_types = Vec::new()
@@ -10792,11 +10550,13 @@ def check_impl(inout env: TypeEnv, i: ImplDecl, method_keys: Vec[String]) -> Uni
     # (impl_method_owner_def — the same impl_idx captured at entry); this
     # pass reconstructs them from (owner, declaration index).
     let m_owner = impl_method_owner_def(env, &i.for_type, &m, impl_idx, method_index)
-    var mgp_idx = 0
-    while mgp_idx < m.generic_params.len() do
-      bind_var(env, m.generic_params[mgp_idx].name.clone(), Type::Param(generic_param_id_at(&m_owner, mgp_idx)))
-      mgp_idx = mgp_idx + 1
+    mut m_reconstructed_ids = Vec::new()
+    var m_gpidx = 0
+    while m_gpidx < m.generic_params.len() do
+      m_reconstructed_ids.push(generic_param_id_at(&m_owner, m_gpidx))
+      m_gpidx = m_gpidx + 1
     end
+    bind_generic_params(env, &m.generic_params, &m_reconstructed_ids)
 
     # Bind parameters — use self_type for any param named "self"
     # Recorded per-owner in declaration order in the dedicated parameter map
@@ -10877,18 +10637,6 @@ def check_impl(inout env: TypeEnv, i: ImplDecl, method_keys: Vec[String]) -> Uni
       # check_function's FnExpr arm).
       record_projected_consume(env, &expr)
     when _ then ()
-    end
-    # (audit P1-2): register the method as a BODY-BEARING callable and
-    # scan its body for the direct effect-class evidence (the same role
-    # check_function's scan plays for free functions). Methods carry no
-    # annotation channel today (the parser attaches item attributes only
-    # at top-level items), so no claims register here — the body scan is
-    # what lets an annotated free function be PROVEN through a method
-    # call chain.
-    if env.resolutions.is_some() then
-      let m_class_key = fn_effect_def_key(env, &m_owner)
-      env.fn_class_names.insert(m_class_key.clone(), m.name.clone())
-      effect_class_scan_fn_body(env, &m_class_key, &m.body)
     end
     env.current_fn_key = ""
     env.expected_return = Option::None
@@ -11018,7 +10766,13 @@ def scoped_access_binding_of(env: TypeEnv, expr: Expr) -> Option[ScopedAccessBin
         return Option::Some(ScopedAccessBinding {
           local_id: lid,
           name: env.scoped_access_stack[i].name.clone(),
-          effect: env.scoped_access_stack[i].effect
+          effect: env.scoped_access_stack[i].effect,
+          src_root: env.scoped_access_stack[i].src_root,
+          src_segs: env.scoped_access_stack[i].src_segs.clone(),
+          src_owns: env.scoped_access_stack[i].src_owns,
+          parent_root: env.scoped_access_stack[i].parent_root,
+          parent_segs: env.scoped_access_stack[i].parent_segs.clone(),
+          accessor: env.scoped_access_stack[i].accessor.clone()
         })
       end
     end
@@ -11087,6 +10841,236 @@ def check_scoped_access_store_target(inout env: TypeEnv, target: Expr, span: Spa
     elsif b.effect == AccessEffect::Read then
       type_add_error(env, "cannot mutate through the with-scoped access `" + b.name + "`: the `let` access is read-only (declare the access `as inout` for projected mutation)", span)
     end
+  when Option::None then
+    # (audit §12): a store whose target is a REAL place (not the access
+    # name) is checked against every live binding's source/parent domain:
+    # overwriting the accessed place (or an ancestor of it) while an
+    # OWNING element access is live destroys the storage the zero-copy
+    # access aliases, and overwriting the PARENT storage of a live
+    # container element access is rejected for every element kind (the
+    # container-mutation exclusion).
+    let (troot, tsegs) = scoped_access_chain_of(env, &target)
+    if troot >= 0 then
+      var i = env.scoped_access_stack.len()
+      while i > 0 do
+        i = i - 1
+        if env.scoped_access_stack[i].accessor == "" then
+          if env.scoped_access_stack[i].src_root == troot && env.scoped_access_stack[i].src_owns && scoped_access_chain_overlaps(&env.scoped_access_stack[i].src_segs, &tsegs) then
+            type_add_error(env, "cannot store to the place of the live with-scoped access `" + env.scoped_access_stack[i].name.clone() + "`: overwriting the accessed place would destroy the storage the zero-copy access aliases (mutate through the access name under `as inout` instead)", span)
+            i = 0
+          elsif env.scoped_access_stack[i].parent_root == troot && scoped_access_chain_eq(&env.scoped_access_stack[i].parent_segs, &tsegs) then
+            type_add_error(env, "cannot overwrite the container storage of the live with-scoped element access `" + env.scoped_access_stack[i].name.clone() + "`: replacing the container would invalidate the accessed element's storage (the container-mutation exclusion)", span)
+            i = 0
+          end
+        end
+      end
+    end
+  end  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# (audit §12) the SCOPED-PLACE-ACCESS gate helpers
+# ———————————————————————————————————————————————————————————————
+# The full scoped-access semantics (the Copy-only first pass is lifted):
+# the block-bound name is a COMPILER-ONLY PLACE ACCESS (source place,
+# effect, element type), never an owned copied value, so non-Copy
+# elements (String fields, structs) bind zero-copy. The helpers below
+# give the with-site and the uses the restriction layer:
+#   - scoped_access_chain_of / seg equality        — the semantic place key
+#   - scoped_access_domain_conflict                — the uniqueness matrix
+#   - check_scoped_access_value_escape             — no value may escape
+#   - check_scoped_access_arg_effect               — the parameter gate
+#     (a Read access passes only to let params; a Modify access may pass
+#     to let or a compatible inout while the access stays unique; sink/set
+#     and the container-mutating operations are rejected)
+
+# Semantic equality of one source-place chain segment.
+def scoped_access_seg_eq(a: ScopedPlaceSeg, b: ScopedPlaceSeg) -> Bool
+  match (a, b)
+  when (ScopedPlaceSeg::F(fa), ScopedPlaceSeg::F(fb)) then fa == fb
+  when (ScopedPlaceSeg::I(ia), ScopedPlaceSeg::I(ib)) then ia == ib
+  when _ then false
+  end  end
+end
+
+# Whether one chain is a prefix-or-equal of the other (the overlap test:
+# two accesses conflict only when their semantic chains share a prefix —
+# disjoint static fields never overlap).
+def scoped_access_chain_overlaps(segs_a: Vec[ScopedPlaceSeg], segs_b: Vec[ScopedPlaceSeg]) -> Bool
+  var n = segs_a.len()
+  if segs_b.len() < n then n = segs_b.len() end
+  var i = 0
+  while i < n do
+    if !scoped_access_seg_eq(segs_a[i], segs_b[i]) then
+      return false
+    end
+    i = i + 1
+  end
+  true
+end
+
+# Exact chain equality (same segment count, pairwise equal) — the
+# container-mutation test (the mutating receiver IS the accessed parent).
+def scoped_access_chain_eq(segs_a: Vec[ScopedPlaceSeg], segs_b: Vec[ScopedPlaceSeg]) -> Bool
+  if segs_a.len() != segs_b.len() then
+    false
+  else
+    scoped_access_chain_overlaps(segs_a, segs_b)
+  end
+end
+
+# The SEMANTIC source-place key of a with-scoped-access SOURCE
+# expression: (root local id, projection chain). The root is the
+# semantic local id of the place chain's identifier; every field segment
+# carries the TYPED FieldId index (typed_field_targets — the same
+# declaration-order identity the projected move lattice uses) and every
+# index segment the constant index (a dynamic index collapses to the
+# conservative I(-1)). Non-place expressions yield root -1.
+def scoped_access_chain_of(inout env: TypeEnv, expr: Expr) -> (Int, Vec[ScopedPlaceSeg])
+  match expr.kind
+  when ExprKind::ExprIdent(_) then
+    match expr_root_local_id(env, &expr)
+    when Option::Some(id) then (id, Vec::new())
+    when Option::None then (-1, Vec::new())
+    end
+  when ExprKind::ExprFieldAccess(base, _) then
+    let deeper = scoped_access_chain_of(env, &base)
+    let root = deeper.0
+    mut segs = deeper.1
+    var fseg = ScopedPlaceSeg::F(-1)
+    match env.typed_field_targets.get(expr.node_id)
+    when Option::Some(fid) then fseg = ScopedPlaceSeg::F(fid.index)
+    when Option::None then ()
+    end
+    segs.push(fseg)
+    (root, segs)
+  when ExprKind::ExprIndex(base, idx) then
+    let deeper2 = scoped_access_chain_of(env, &base)
+    let root2 = deeper2.0
+    mut segs2 = deeper2.1
+    var iseg = ScopedPlaceSeg::I(-1)
+    match idx.kind
+    when ExprKind::ExprIntLit(n) then iseg = ScopedPlaceSeg::I(parsed_int_to_host(&n))
+    when _ then ()
+    end
+    segs2.push(iseg)
+    (root2, segs2)
+  when ExprKind::ExprAccess(inner) then scoped_access_chain_of(env, &inner)
+  when ExprKind::ExprCast(inner, _) then scoped_access_chain_of(env, &inner)
+  when _ then (-1, Vec::new())
+  end  end
+end
+
+# The uniqueness matrix against every LIVE with-scoped access binding:
+# returns the name of the first binding whose access DOMAIN the place
+# (root + chain) under the given effect would violate, or "". Domains:
+#   - a binding over a plain place conflicts when the chains overlap and
+#     either side is a Modify (read+read of one place coexists; any
+#     read+modify or modify+modify on the same place is rejected);
+#   - a binding over a CONTAINER element additionally conflicts with a
+#     Modify over its PARENT storage (Vec.push/reserve/insert/remove and
+#     Map.insert/remove/rehash may invalidate the accessed element's
+#     address against the parent);
+#   - a Map-ACCESSOR binding conflicts by MAP ROOT (the entry key is
+#     dynamic, so two accessor accesses of one map root are distinguished
+#     only by their effects; two read accesses coexist, any modify
+#     conflicts).
+def scoped_access_domain_conflict(env: TypeEnv, root: Int, segs: Vec[ScopedPlaceSeg], effect: AccessEffect) -> String
+  var i = env.scoped_access_stack.len()
+  while i > 0 do
+    i = i - 1
+    if env.scoped_access_stack[i].accessor == "" then
+      if env.scoped_access_stack[i].src_root == root && scoped_access_chain_overlaps(&env.scoped_access_stack[i].src_segs, &segs) && (effect == AccessEffect::Modify || env.scoped_access_stack[i].effect == AccessEffect::Modify) then
+        return env.scoped_access_stack[i].name.clone()
+      end
+      if env.scoped_access_stack[i].parent_root == root && scoped_access_chain_eq(&env.scoped_access_stack[i].parent_segs, &segs) && (effect == AccessEffect::Modify || env.scoped_access_stack[i].effect == AccessEffect::Modify) then
+        return env.scoped_access_stack[i].name.clone()
+      end
+    else
+      if env.scoped_access_stack[i].src_root == root && (effect == AccessEffect::Modify || env.scoped_access_stack[i].effect == AccessEffect::Modify) then
+        return env.scoped_access_stack[i].name.clone()
+      end
+    end
+  end
+  ""
+end
+
+# The VALUE-ESCAPE gate: an owning element may never be moved out of its
+# place — returning/binding/storing the access value whole would hand the
+# storage's value to an owner while the access is live. Fires only for
+# src_owns bindings (Copy values may be read out freely).
+def check_scoped_access_value_escape(inout env: TypeEnv, expr: Expr, what: String, span: Span) -> Unit
+  match expr_root_local_id(env, &expr)
+  when Option::Some(lid) then
+    var i = env.scoped_access_stack.len()
+    while i > 0 do
+      i = i - 1
+      if env.scoped_access_stack[i].local_id == lid then
+        if env.scoped_access_stack[i].src_owns then
+          type_add_error(env, "cannot " + what + " the with-scoped access value `" + env.scoped_access_stack[i].name.clone() + "`: a block-bound place access is not an owned value and cannot outlive its with-block (an owning element may not be moved out of its place — read a Copy value or Copy fields out of the access instead)", span)
+        end
+        return
+      end
+    end
+  when Option::None then ()
+  end  end
+end
+
+# The ARGUMENT/RECEIVER gate (hooked at record_arg_effect — the single
+# choke point where every call's receiver and argument effects are
+# recorded):
+#   - an argument rooted at a live access NAME: sink (Consume) and set
+#     (Initialize) parameters are rejected for every element kind (a
+#     place access never satisfies a taking-ownership parameter — the
+#     mirror of the &-marker sink rule); an `inout` parameter is rejected
+#     for a READ access and accepted for a MODIFY access (the access
+#     stays unique — the with-site conflict matrix above already rejected
+#     nested overlapping bindings); a `let` parameter always reads;
+#   - an explicit `&` marker of the access name is rejected (the bound
+#     name already IS the access — reborrowing it is not a value);
+#   - a mutating argument/receiver over a REAL place runs the uniqueness
+#     matrix (domain conflicts) — this is also the container-mutation
+#     exclusion: Vec.push/reserve/... and Map.insert/remove/rehash over
+#     the PARENT storage of a live element access are rejected.
+def check_scoped_access_arg_effect(inout env: TypeEnv, arg: Expr, effect: AccessEffect, span: Span) -> Unit
+  match expr_root_local_id(env, &arg)
+  when Option::Some(lid) then
+    mut found_name = ""
+    mut found_effect = AccessEffect::Read
+    var i = env.scoped_access_stack.len()
+    while i > 0 do
+      i = i - 1
+      if env.scoped_access_stack[i].local_id == lid then
+        found_name = env.scoped_access_stack[i].name.clone()
+        found_effect = env.scoped_access_stack[i].effect
+        i = 0
+      end
+    end
+    if found_name != "" then
+      let is_marker = match arg.kind
+      when ExprKind::ExprAccess(_) then true
+      when _ then false
+      end
+      if is_marker then
+        type_add_error(env, "cannot take a `&` access of the with-scoped access value `" + found_name + "`: the bound name already IS the place access — pass it directly (reborrows of a scoped access are not values)", span)
+      elsif effect == AccessEffect::Consume then
+        type_add_error(env, "cannot pass the with-scoped access value `" + found_name + "` to a sink (takes-ownership) parameter: a block-bound place access is not an owned value and cannot be stored or transferred out of the block (only `let` read parameters — and, for an `as inout` access, `inout` parameters — may receive it)", span)
+      elsif effect == AccessEffect::Initialize then
+        type_add_error(env, "cannot pass the with-scoped access value `" + found_name + "` to a set (initialize) parameter: a block-bound place access may not be reinitialized in place", span)
+      elsif effect == AccessEffect::Modify && found_effect == AccessEffect::Read then
+        type_add_error(env, "cannot pass the read-only with-scoped access `" + found_name + "` to an `inout` parameter: an `as let` access grants reads only (declare the access `as inout` to flow it into mutating parameters)", span)
+      end
+    else
+      if effect != AccessEffect::Read then
+        let (aroot, asegs) = scoped_access_chain_of(env, &arg)
+        if aroot >= 0 then
+          let conflict = scoped_access_domain_conflict(env, aroot, &asegs, effect)
+          if conflict != "" then
+            type_add_error(env, "conflicting accesses to the place of the live with-scoped access `" + conflict + "` (a scoped place access stays unique while it is live: read+read of one place is allowed; read+modify and modify+modify on the same place, and mutations of a container whose element access is live, are rejected)", span)
+          end
+        end
+      end
+    end
   when Option::None then ()
   end  end
 end
@@ -11103,7 +11087,16 @@ def check_stmt(inout env: TypeEnv, stmt: Stmt) -> FlowResult
     when Option::None then
       value_type
     end
- # the pattern's binding plan (per-binding Read/Move actions) is
+    # (audit §12): a LET binding of an OWNING value sourced from a live
+    # with-scoped access is a move out of the accessed place — the access
+    # value may not be bound (read a Copy value out of the access, or read
+    # it through a `let` parameter, instead). The gate runs before
+    # check_pattern so the binding plan never records the Consume.
+    match type_properties_of(env, &var_type)
+    when TypeProperties { owns_state: true, .. } then check_scoped_access_value_escape(env, &value, "bind", stmt.span)
+    when _ then ()
+    end
+    # the pattern's binding plan (per-binding Read/Move actions) is
     # collected here; the block/match/for checking paths consume the plans.
     # The pattern's variant identity is resolved ONCE by
     # resolve_pattern_variants (the checker's pattern-resolution junction —
@@ -11129,6 +11122,12 @@ def check_stmt(inout env: TypeEnv, stmt: Stmt) -> FlowResult
     check_scoped_access_store_target(env, &target, stmt.span)
     let value_type = check_expr(env, &value)
     unify(env, target_type, value_type, stmt.span)
+    # (audit §12): storing an OWNING with-scoped access value into any
+    # target (a struct field, a Vec element, a static/global...) would
+    # duplicate the ownership of the accessed place's value — the access
+    # value may not be stored (read a Copy value out of the access, or
+    # pass it to `let` read parameters, instead).
+    check_scoped_access_value_escape(env, &value, "store", stmt.span)
     # (partial moves): the assignment's projected records — the store into
     # a projected target re-lives the target chain (clear it; the owning
     # fully-live depth-1 case marks the sibling fields Consumed — the
@@ -11222,7 +11221,13 @@ def check_stmt(inout env: TypeEnv, stmt: Stmt) -> FlowResult
     # (partial moves): a projected OWNING return value is moved out of its
     # root (the checker's transfer_consume mirror).
     match val_opt
-    when Option::Some(val) then record_projected_consume(env, &val)
+    when Option::Some(val) then
+      # (audit §12): an OWNING with-scoped access value cannot be the
+      # return value — the access may not outlive its with-block (the
+      # gate runs before the consume record so the partial-move registry
+      # never sees a move of the access binding).
+      check_scoped_access_value_escape(env, &val, "return", stmt.span)
+      record_projected_consume(env, &val)
     when Option::None then ()
     end
     # (b): every `return expr` unifies immediately with the declared
@@ -11291,6 +11296,9 @@ def check_stmt(inout env: TypeEnv, stmt: Stmt) -> FlowResult
       match ret_opt
       when Option::Some(ret_expr) then
         let ret_ty = check_expr(env, &ret_expr)
+        # (audit §12): the guard-else return's value is subject to the same
+        # owning-access escape gate as a plain return.
+        check_scoped_access_value_escape(env, &ret_expr, "return", ret_expr.span)
         # (partial moves): the guard-else return's projected OWNING value
         # is moved out on the else path (the checker's transfer_consume
         # mirror; the checker's divergence net rejects the fallthrough
@@ -11492,12 +11500,14 @@ def check_stmt(inout env: TypeEnv, stmt: Stmt) -> FlowResult
     }
   when StmtKind::StmtWith(expr, pat, body) then
     # ————————————————————————————————————————————————
-    # (audit P1-1, first pass): the SCOPED-ACCESS statement —
-    # `with EXPR as let NAME <block> end` (a block-bound READ access to
-    # EXPR) and `with EXPR as inout NAME <block> end` (a block-bound
-    # READ/WRITE access). The parser guarantees a bare Ident(name,
-    # is_mut) pattern with is_mut carrying the effect (false = let,
-    # true = inout).
+    # (audit §12): the SCOPED-ACCESS statement — the bound name is a
+    # COMPILER-ONLY PLACE ACCESS (ScopedPlaceAccess: source place +
+    # subplace + Read|Modify + element type + scope id), NEVER an owned
+    # copied value: `with EXPR as let NAME <block> end` (a block-bound
+    # READ access to EXPR) and `with EXPR as inout NAME <block> end` (a
+    # block-bound READ/WRITE access). The parser guarantees a bare
+    # Ident(name, is_mut) pattern with is_mut carrying the effect
+    # (false = let, true = inout).
     #
     # The NAME is a SCOPED LOCAL: it is bound in the body's own lexical
     # scope (push_scope/check_block/pop_scope), so a use outside the
@@ -11508,33 +11518,48 @@ def check_stmt(inout env: TypeEnv, stmt: Stmt) -> FlowResult
     # No new type form is introduced: the access value is EXPR's ordinary
     # type.
     #
-    # ENFORCED (first pass): (a) whole-value stores of the access value
-    # (a bare-name assignment target) are rejected for both effects;
-    # (b) projected stores through the name are rejected under `let`
-    # (read-only) and accepted under `inout` (the canonical
-    # `level.qty += delta` form — see check_scoped_access_store_target);
-    # (c) closure captures of the name are rejected (a block-bound access
-    # value must not escape its block — the capture gate in the
-    # ExprClosure arm); (d) `inout` requires EXPR to be a simple
-    #     place/accessor and rejects return/break/continue that ESCAPE the
-    #     body (the first-pass write-back lowering only runs on the
-    #     fallthrough exit); (e) owning/resource access values are rejected
-    #     (they need the resource-CFG/move mirror — the reason the
-    #     accessor half is Copy-bound).
+    # ENFORCED: (a) whole-value stores of the access value (a bare-name
+    # assignment target) are rejected for both effects; (b) projected
+    # stores through the name are rejected under `let` (read-only) and
+    # accepted under `inout` (the canonical `level.qty = ...` form — see
+    # check_scoped_access_store_target); (c) closure captures of the name
+    # are rejected (a block-bound access value must not escape its block —
+    # the capture gate in the ExprClosure arm); (d) the OWNING-state gate
+    # is LIFTED for place-like sources: an owning element (a String field,
+    # a struct...) binds ZERO-COPY through the source place's address
+    # (the ScopedPlaceAccess model; the resource checker's frame mirror
+    # registers the binding as a borrow and the MIR lowers the name as an
+    # address-carrying alias — no snapshot, no write-back), so an owning
+    # element can never be moved out (return/bind/aggregate/sink escapes
+    # are the value-escape and parameter gates below); owning VALUE
+    # sources stay rejected; (e) the uniqueness matrix runs at the
+    # with-site AND at every use: read+read of one place coexist, any
+    # read+modify or modify+modify on the same place is rejected, two
+    # disjoint struct fields coexist, and a modify over the PARENT storage
+    # of a live container element access (Vec.push/reserve/insert/remove,
+    # Map.insert/remove/rehash — see check_scoped_access_arg_effect and
+    # the store-target gate) is the container-mutation exclusion; (f)
+    # return/break/continue that escape an inout body are rejected only
+    # for SNAPSHOT sources (Copy place/value sources and Map-entry
+    # accessors — the fallthrough write-back would be skipped); an
+    # owning place source has no write-back, so its escaping exits are
+    # sound (the resource CFG's EndAccess precedes the exit cleanup).
     #
     # THE CONTAINER HALF (implemented — the Map entry accessor): EXPR may
     # be a MAP-ENTRY ACCESSOR call — `map.get_read(key)` (the read side)
     # or `map.get_modify(key)` (the modify side) — the std Map methods
     # declared in std/collections.tg, recognized here by
-    # map_accessor_name_of (name + Map receiver). The accessor's V: Copy
-    # impl bound keeps the access value Copy, so the owning gate (e)
-    # above never fires for an accessor. The block machinery consumes the
-    # accessor exactly like the value/place forms:
+    # map_accessor_name_of (name + Map receiver). The accessors' V: Copy
+    # impl bound keeps the accessor surface Copy-valued (an OWNING
+    # Map-entry element needs slot-ADDRESS intrinsics — the runtime
+    # visit/entry-address half — which are the documented remaining bit);
+    # the block machinery consumes the accessor as the first-pass
+    # snapshot:
     #   - the name binds V and the block-entry materialization is the
     #     ENTRY READ of the entry — a SNAPSHOT (the get_read/get_modify
     #     call lowers as an ordinary method read; a missing entry TRAPS
     #     inside the accessor body — the accessor contract has no absent
-    #     case in the first pass);
+    #     case);
     #   - under `as inout` the fallthrough WRITE-BACK of the MODIFY-side
     #     accessor lowers as the BY-KEY ENTRY STORE (mir.tg's
     #     lower_with_access_stmt re-lowers the accessor's receiver place
@@ -11550,13 +11575,6 @@ def check_stmt(inout env: TypeEnv, stmt: Stmt) -> FlowResult
     # see parser.tg's parse_closure_params), so the closure forms stay
     # pending at the syntax/convention level (documented as not
     # expressible at the std accessors).
-    # The resource-checker frame mirror for OWNING access values (the
-    # bind_pattern registration of the access binding's source place and
-    # the write-back copy's move discipline) is pending in resource_check's
-    # StmtWith arm; escape-taint for reads (a Copy value READ out of the
-    # access and returned/passed is sound under the first-pass snapshot
-    # semantics and is allowed, mirroring the parameter conventions, which
-    # have no store/escape gate for value types either).
     # ————————————————————————————————————————————————
     let access_ty = check_expr(env, &expr)
     mut bind_is_inout = false
@@ -11568,32 +11586,87 @@ def check_stmt(inout env: TypeEnv, stmt: Stmt) -> FlowResult
     when _ then
       type_add_error(env, "the with-scoped access requires a bare identifier binding after `as let`/`as inout`", pat.span)
     end
-    # (e): the owning-state gate. The first-pass lowering materializes
-    # the access as one Copy-typed local; an owning access value (String,
-    # Vec, Box, resource types...) needs the resource-CFG frame mirror and
-    # move/alias discipline (the Map-entry accessor half above is COPY-
-    # bound for this reason) — reject here, before the resource checker
-    # or MIR see it, with an explicit diagnostic.
+    # (audit §12): classify the with source and run the with-site gates.
+    # The bound name is a COMPILER-ONLY PLACE ACCESS (ScopedPlaceAccess
+    # model): for a place-like source — including OWNING elements (String
+    # fields, structs — the Copy-only first-pass restriction is lifted
+    # here) — the access aliases the source place ZERO-COPY; for a Map
+    # entry accessor call (Copy value bound by the std impl) and for
+    # non-place value sources the first-pass snapshot semantics stay.
+    let accessor_name = map_accessor_name_of(env, &expr)
+    let is_place = expr_is_place_like(&expr)
+    mut element_owns = false
     match type_properties_of(env, &access_ty)
-    when TypeProperties { owns_state: true, .. } then
-      type_add_error(env, "with-scoped access over an owning type is not supported in the first pass: the block-bound access value needs the resource-CFG/move mirror (use a Copy value type; the owning Map-entry accessor and Map::with_value forms arrive with that mirror)", stmt.span)
+    when TypeProperties { owns_state: true, .. } then element_owns = true
     when _ then ()
     end
-    # (d): the inout form binds the access value to a place whose address
-    # the write-back lowering can materialize — or to the MODIFY-SIDE
-    # Map-entry accessor (`map.get_modify(key)`), whose write-back the MIR
-    # lowers as the by-key entry store instead of a place store. The
+    # The owning gate (revised): an owning element type is accepted for
+    # PLACE-LIKE sources (the zero-copy address binding — the resource-CFG
+    # frame mirror and the MIR alias lowering consume it) and for Map
+    # accessor calls whose std impl keeps V: Copy (the accessor contract
+    # never reaches an owning V in this pass — the accessor methods are
+    # Copy-bound in std/collections.tg). Owning VALUE sources (a function
+    # call producing a fresh owning value) stay rejected: they would need
+    # owned-drop semantics at the block boundary, which is not a place
+    # access.
+    if element_owns && !is_place && accessor_name == "" then
+      type_add_error(env, "with-scoped access over an owning type requires a place-like expression: the owning value would need owned-drop semantics at the block boundary instead of the zero-copy place access (source a field/element place — `with obj.field as let/inout name` — or a Copy value)", stmt.span)
+    end
+    # (d): the inout form binds a place whose storage the body mutates —
+    # the MODIFY-side Map-entry accessor (`map.get_modify(key)`, whose
+    # write-back lowers as the by-key entry store) or a simple place. The
     # READ-side accessor (get_read) has a by-value receiver and therefore
     # no write-back target: under `as inout` it is rejected with its own
     # diagnostic.
-    if bind_is_inout && !expr_is_place_like(&expr) then
-      let accessor_name = map_accessor_name_of(env, &expr)
-      if accessor_name != "" then
-        if accessor_name == "get_read" then
-          type_add_error(env, "`as inout` with-scoped access cannot source from the read-side accessor `Map::get_read`: its by-value receiver leaves no map place for the write-back (use the modify-side accessor `Map::get_modify`, whose write-back lowers as the by-key entry store)", stmt.span)
+    if bind_is_inout && !is_place && accessor_name == "" then
+      type_add_error(env, "`as inout` with-scoped access requires the expression to be a simple place or a Map-entry accessor call (`Map::get_modify(key)`) (the write-back lowering materializes the place's address or emits the by-key entry store)", stmt.span)
+    end
+    if bind_is_inout && accessor_name == "get_read" then
+      type_add_error(env, "`as inout` with-scoped access cannot source from the read-side accessor `Map::get_read`: its by-value receiver leaves no map place for the write-back (use the modify-side accessor `Map::get_modify`, whose write-back lowers as the by-key entry store)", stmt.span)
+    end
+    # The SEMANTIC keys of the new access: the source place chain (for a
+    # place source), the receiver map root (for an accessor call), and —
+    # for a CONTAINER ELEMENT source (an index over a Vec/Array place) —
+    # the PARENT storage place whose mutating operations (push/reserve/
+    # insert/remove/rehash) may invalidate the element while the access is
+    # live (the container-mutation exclusion).
+    mut src_root = -1
+    mut src_segs = Vec::new()
+    mut parent_root = -1
+    mut parent_segs = Vec::new()
+    if is_place then
+      let chain = scoped_access_chain_of(env, &expr)
+      src_root = chain.0
+      src_segs = chain.1
+      match expr.kind
+      when ExprKind::ExprIndex(base, _) then
+        let pchain = scoped_access_chain_of(env, &base)
+        parent_root = pchain.0
+        parent_segs = pchain.1
+      when _ then ()
+      end
+    end
+    if accessor_name != "" then
+      match expr.kind
+      when ExprKind::ExprMethodCall(recv, _, _, _) then
+        match expr_root_local_id(env, &recv)
+        when Option::Some(mid) then src_root = mid
+        when Option::None then ()
         end
-      else
-        type_add_error(env, "`as inout` with-scoped access requires the expression to be a simple place or a Map-entry accessor call (`Map::get_modify(key)`) in the first pass (the write-back lowering materializes the place's address or emits the by-key entry store)", stmt.span)
+      when _ then ()
+      end
+    end
+    # The with-site uniqueness matrix (the audit conflict matrix): nested
+    # with-blocks whose access domains overlap are rejected while a
+    # binding is live — two read accesses to one place coexist; any
+    # read+modify or modify+modify on the same place, a modify over a live
+    # container element's parent, and a second modify-side accessor over
+    # one Map root are conflicts. Disjoint static struct fields coexist.
+    if bind_name != "" && src_root >= 0 then
+      let new_effect = if bind_is_inout then AccessEffect::Modify else AccessEffect::Read end
+      let conflict = scoped_access_domain_conflict(env, src_root, &src_segs, new_effect)
+      if conflict != "" then
+        type_add_error(env, "conflicting with-scoped accesses: the new access overlaps the live with-scoped access `" + conflict + "` on the same place (read+read of one place is allowed; read+modify and modify+modify on the same place, a modify over a live container element's parent storage, and a second modify-side access over one Map root are rejected; disjoint struct fields may be accessed together)", stmt.span)
       end
     end
     push_scope(env)
@@ -11604,8 +11677,9 @@ def check_stmt(inout env: TypeEnv, stmt: Stmt) -> FlowResult
     # registers the typed local. The source place of the binding is EXPR's
     # typed place (RawUnknown fallback for value expressions) — the
     # access is a READ of that source; no move/consumption semantics
-    # attach (owning types are rejected above, so the binding plan is
-    # never a Consume).
+    # attach (owning elements are place accesses — the value-escape and
+    # parameter gates reject every whole-value move BEFORE the binding
+    # plans are consumed, so the plan is never a Consume).
     resolve_pattern_variants(env, &pat, access_ty)
     check_pattern(env, &pat, access_ty, binding_source_place(env, &expr, "with access"))
     var access_lid = -1
@@ -11615,19 +11689,34 @@ def check_stmt(inout env: TypeEnv, stmt: Stmt) -> FlowResult
     end
     if bind_name != "" && access_lid >= 0 then
       let access_effect = if bind_is_inout then AccessEffect::Modify else AccessEffect::Read end
-      env.scoped_access_stack.push(ScopedAccessBinding { local_id: access_lid, name: bind_name.clone(), effect: access_effect })
+      env.scoped_access_stack.push(ScopedAccessBinding {
+        local_id: access_lid,
+        name: bind_name.clone(),
+        effect: access_effect,
+        src_root: src_root,
+        src_segs: src_segs.clone(),
+        src_owns: element_owns,
+        parent_root: parent_root,
+        parent_segs: parent_segs.clone(),
+        accessor: accessor_name.clone()
+      })
     end
     let body_flow = check_block(env, &body, false)
     if bind_name != "" && access_lid >= 0 then
       env.scoped_access_stack.pop()
     end
     pop_scope(env)
-    # (d): a return/break/continue that escapes the inout body would skip
-    # the fallthrough write-back — rejected in the first pass (breaks of
-    # loops NESTED inside the body are consumed by those loops and never
-    # surface here).
-    if bind_is_inout && (body_flow.may_return || body_flow.may_break || body_flow.may_continue) then
-      type_add_error(env, "return/break/continue that escape the `as inout` with-block are not supported in the first pass: the write-back of the scoped access would be skipped on the escaping exit", stmt.span)
+    # (d): a return/break/continue that escapes an inout body whose source
+    # is a SNAPSHOT binding (a Copy value place source, a value source or
+    # a Map-entry accessor — the materialization lowers a local image that
+    # only the fallthrough write-back stores back) would skip that
+    # write-back — rejected. A place source with an OWNING element binds
+    # ZERO-COPY through the source's address (audit §12): there is no
+    # local image and no write-back, so an escaping exit is sound — the
+    # access simply ends (the resource CFG's EndAccess precedes the exit
+    # edge's cleanup).
+    if bind_is_inout && !(element_owns && is_place) && (body_flow.may_return || body_flow.may_break || body_flow.may_continue) then
+      type_add_error(env, "return/break/continue that escape the `as inout` with-block are not supported for snapshot sources: the write-back of the scoped access would be skipped on the escaping exit (place sources over owning elements bind zero-copy and may exit early)", stmt.span)
     end
     # The with-block is NOT itself a break/continue/return target: the
     # body's divergence edges propagate to the enclosing loop/function
@@ -11963,6 +12052,9 @@ def check_match(inout env: TypeEnv, m: MatchExpr, is_stmt: Bool) -> FlowResult
     when Type::Error then ()
     when Type::RefInternal(_, _) then ()
     when Type::FixedArray(_, _) then ()
+    when Type::FixedArraySym(_, _) then ()
+    when Type::Const(_) then ()
+    when Type::ConstParam(_) then ()
     end
   end
   
@@ -12738,6 +12830,14 @@ def record_arg_effect(inout env: TypeEnv, arg: Expr, c: AccessConvention) -> Uni
   when ExprKind::ExprAccess(inner) then env.typed_access_effects.insert(inner.node_id, effect)
   when _ then ()
   end
+  # (audit §12): the with-scoped-access argument/receiver gate — a
+  # block-bound place access flows only into `let` parameters (a Read
+  # access), into `let`/compatible-`inout` parameters (a Modify access,
+  # unique while live), and never into sink/set parameters or out of the
+  # block; mutating arguments/receivers over a live access's place (or
+  # over the parent storage of a live container element access) are the
+  # conflicting-access rejections.
+  check_scoped_access_arg_effect(env, &arg, effect, arg.span)
   # (partial moves): a SINK argument over an owning PROJECTED place is an
   # expression-level move-out — the mirror of the resource checker's
   # apply_arg_effect Consume path. The projected chain is recorded in the
@@ -13829,6 +13929,16 @@ def is_trivially_copyable_walk(env: TypeEnv, ty: Type, inout visited: Set[String
   when Type::RefInternal(_, _) then false
   when Type::Var(_) then false
   when Type::Param(_) then false
+ # (§20 slice 1): a const generic argument is a compile-time integer
+  # constant — bit-copyable exactly like the concrete integer types; a
+  # SYMBOLIC const parameter reference is not codegenable while generic
+  # (mirror Type::Param — only a substituted concrete value answers).
+  when Type::Const(_) then true
+  when Type::ConstParam(_) then false
+  # (§20 slice 1): the symbolic-size array is inline element storage with a
+  # parameter count — bit-copyable exactly when the element is (mirror the
+  # concrete FixedArray arm; substitution resolves the count before layout).
+  when Type::FixedArraySym(elem, _) then is_trivially_copyable_walk(env, &elem, visited)
  # (inference-only): an integer literal is a scalar value — a
   # bit-copyable constant exactly like the concrete integer types.
   when Type::IntLiteral(_) then true
@@ -14027,6 +14137,29 @@ def collect_param_names_from_type(env: TypeEnv, ty: Type, inout out: Vec[Generic
       i = i + 1
     end
     if !found then out.push(gpid.clone()) end
+  when Type::ConstParam(gpid) then
+    # (§20 slice 1): a SYMBOLIC const parameter reference is a parameter
+    # occurrence exactly like Type::Param — collect its id (dedupe by the
+    # numeric identity) so the signature-walk substitution records align
+    # positionally with the declaration's merged parameter list.
+    var found = false
+    var i = 0
+    while i < out.len() do
+      if generic_param_id_numeric(&out[i]) == generic_param_id_numeric(&gpid) then found = true end
+      i = i + 1
+    end
+    if !found then out.push(gpid.clone()) end
+  when Type::FixedArraySym(elem, gpid) then
+    # (§20 slice 1): the symbolic-size array carries its size parameter —
+    # collect it like the element's parameters.
+    var found = false
+    var i = 0
+    while i < out.len() do
+      if generic_param_id_numeric(&out[i]) == generic_param_id_numeric(&gpid) then found = true end
+      i = i + 1
+    end
+    if !found then out.push(gpid.clone()) end
+    collect_param_names_from_type(env, &elem, out)
   when Type::Adt(_, args) then
     var i = 0
     while i < args.len() do
@@ -14507,6 +14640,46 @@ pub def type_canon_render(ctx: TypeCanonCtx, ty: Type) -> Result[String, String]
       Result::Ok("param" + generic_param_id_numeric(&gpid).to_string())
     when TypeCanonFrame::CanonExternal then
       Result::Err("tangerine ABI: type parameter `" + generic_param_name_from(&ctx.param_names, &gpid) + "` cannot appear in a public ABI symbol (canonicalize the instance first)")
+    end
+  when Type::Const(v) then
+    # (§20 slice 1): a const generic ARGUMENT keys by its VALUE (Const(4)
+    # == Const(4), Const(4) != Const(8)). The semantic frame renders the
+    # value spelling; the internal frame the packed internal key. FAILS
+    # CLOSED in the public ABI frame: a bare const argument is not a value
+    # type — a public signature is always the substituted concrete
+    # instance (the FixedArray count appears in the count slot, never as
+    # this form).
+    match ctx.frame
+    when TypeCanonFrame::CanonSemantic then Result::Ok("Const(" + v.to_string() + ")")
+    when TypeCanonFrame::CanonInternal then Result::Ok("c" + v.to_string())
+    when TypeCanonFrame::CanonExternal then
+      Result::Err("tangerine ABI: a const generic argument Type::Const(" + v.to_string() + ") cannot appear in a public ABI symbol (substitute the instance first)")
+    end
+  when Type::ConstParam(gpid) then
+    # (§20 slice 1): a SYMBOLIC const parameter reference keys by the
+    # GenericParamId identity — (owner, index), never the name — in every
+    # frame (ConstParam(a) alpha-equals ConstParam(b) exactly when a == b).
+    # FAILS CLOSED in the public ABI frame exactly like Type::Param.
+    match ctx.frame
+    when TypeCanonFrame::CanonSemantic then
+      Result::Ok("ConstParam(" + generic_param_name_from(&ctx.param_names, &gpid) + ")")
+    when TypeCanonFrame::CanonInternal then
+      Result::Ok("constparam" + generic_param_id_numeric(&gpid).to_string())
+    when TypeCanonFrame::CanonExternal then
+      Result::Err("tangerine ABI: const generic parameter `" + generic_param_name_from(&ctx.param_names, &gpid) + "` cannot appear in a public ABI symbol (canonicalize the instance first)")
+    end
+  when Type::FixedArraySym(elem, gpid) then
+    # (§20 slice 1): the SYMBOLIC-size fixed array renders with the size
+    # parameter's identity — canonical by (owner, index) — never by name.
+    # FAILS CLOSED in the public ABI frame: a generic body's symbolic size
+    # is substituted to a concrete count before any public signature forms.
+    match ctx.frame
+    when TypeCanonFrame::CanonSemantic then
+      Result::Ok("FixedArray[" + canon_render_unwrap(ctx, elem) + ";" + generic_param_name_from(&ctx.param_names, &gpid) + "]")
+    when TypeCanonFrame::CanonInternal then
+      Result::Ok("fa[" + canon_render_unwrap(ctx, elem) + ";param" + generic_param_id_numeric(&gpid).to_string() + "]")
+    when TypeCanonFrame::CanonExternal then
+      Result::Err("tangerine ABI: a symbolic-size fixed array (FixedArraySym, size parameter `" + generic_param_name_from(&ctx.param_names, &gpid) + "`) cannot appear in a public ABI symbol (substitute the instance first)")
     end
   when Type::Error then
     match ctx.frame
@@ -15177,6 +15350,25 @@ def type_props_walk(inout env: TypeEnv, ty: Type, inout visiting: Map[String, Ty
     # fields stay false but are NON-authoritative (is_deferred is set);
     # concrete answers appear only after substitution (the MIR/mono wave).
     props.is_deferred = true
+  # (§20 slice 1): a const generic argument (Type::Const) is a compile-time
+  # integer constant — plain scalar data (no drop, not linear, not a
+  # capability), exactly like the concrete integer arms. A SYMBOLIC const
+  # parameter reference (Type::ConstParam) is generic ownership
+  # polymorphism exactly like Type::Param (deferred; the concrete answer
+  # appears after substitution). The symbolic-size array
+  # (Type::FixedArraySym) is inline element storage — the element's
+  # ownership propagates exactly like the concrete FixedArray arm (the
+  # symbolic count contributes nothing).
+  when Type::Const(_) then ()
+  when Type::ConstParam(_) then
+    props.is_deferred = true
+  when Type::FixedArraySym(elem, _) then
+    let sp = type_props_walk(env, &elem, visiting, via_heap)
+    if sp.owns_state then props.owns_state = true end
+    if sp.requires_drop_glue then props.requires_drop_glue = true end
+    if sp.is_linear then props.is_linear = true end
+    if sp.contains_capability then props.contains_capability = true end
+    if sp.is_deferred then props.is_deferred = true end
   when Type::Error then ()
   end
  # is_trivially_copyable comes from FIX 1: the decided bit-copy set.
@@ -15479,6 +15671,7 @@ def container_element_type(env: TypeEnv, ty: Type) -> Option[Type]
     else Option::None
     end
   when Type::FixedArray(elem, _) then Option::Some(elem.clone())
+  when Type::FixedArraySym(elem, _) then Option::Some(elem.clone())
   when _ then Option::None
   end  end
 end
@@ -17167,6 +17360,15 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
       end
       unify(env, index_type, Type::Int, index.span)
       elem.clone()
+    when Type::FixedArraySym(elem, _) then
+      # (§20 slice 1): a symbolic-size array indexes exactly like the
+      # concrete form (Int index, element result; the size parameter
+      # contributes nothing to the INDEX type).
+      if type_has_resource_kind(env, &elem) then
+        type_add_error(env, "cannot extract resource element from shared container; use an inout/consuming access", expr.span)
+      end
+      unify(env, index_type, Type::Int, index.span)
+      elem.clone()
     when Type::Adt(tid, args) then
       # Map[K, V] indexing: key type K, result V. Array and the raw view
       # (UnsafeSlice) index like their element containers (element result,
@@ -17307,6 +17509,10 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
       # transfer_consume mirror over the aggregate children).
       var ai = 0
       while ai < elems.len() do
+        # (audit §12): an OWNING with-scoped access value can never be an
+        # aggregate element — the aggregate would own a duplicate of the
+        # accessed place's value.
+        check_scoped_access_value_escape(env, &elems[ai], "store", elems[ai].span)
         record_projected_consume(env, &elems[ai])
         ai = ai + 1
       end
@@ -17345,6 +17551,9 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
     # the array-literal arm).
     var ai = 0
     while ai < elems.len() do
+      # (audit §12): an OWNING with-scoped access value can never be a
+      # tuple element (the aggregate would own the accessed value).
+      check_scoped_access_value_escape(env, &elems[ai], "store", elems[ai].span)
       record_projected_consume(env, &elems[ai])
       ai = ai + 1
     end
@@ -17459,6 +17668,9 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
     # checker's transfer_consume mirror over the aggregate children).
     var fi3 = 0
     while fi3 < fields.len() do
+      # (audit §12): an OWNING with-scoped access value can never be a
+      # struct field value (the struct would own the accessed value).
+      check_scoped_access_value_escape(env, &fields[fi3].1, "store", fields[fi3].1.span)
       record_projected_consume(env, &fields[fi3].1)
       fi3 = fi3 + 1
     end
@@ -19185,6 +19397,13 @@ def resolve_method_type(inout env: TypeEnv, recv_type: Type, method: String, arg
     # carried in the type; codegen emits the constant, never a header read).
     if method == "len" then return Type::Int end
     if method == "is_empty" then return Type::Bool end
+  when Type::FixedArraySym(_, _) then
+    # (§20 slice 1): a symbolic-size array answers len/is_empty at the
+    # checker level like the concrete form (the count becomes concrete at
+    # instantiation — substitution converts the symbolic form to
+    # FixedArray before any len/is_empty lowering on a codegenable type).
+    if method == "len" then return Type::Int end
+    if method == "is_empty" then return Type::Bool end
   when Type::Ptr(inner) then
     if method == "is_null" then return Type::Bool end
     if method == "as_ref" then return inner end
@@ -19535,6 +19754,37 @@ def eval_const_size_expr(env: TypeEnv, expr: Expr) -> Option[Int]
   end  end
 end
 
+# (§20 const generics, slice 1): the symbolic-size fallback of the [T; N]
+# annotation. When the size expression is NOT a module const (eval_const_size
+# _expr returned None), a bare reference — ExprIdent or a single-segment
+# ExprPath — may name a CONST generic parameter of the enclosing generic
+# declaration: its scope binding is Type::ConstParam(gpid), and the
+# annotation becomes Type::FixedArraySym(elem, gpid) (the symbolic size; the
+# range checks apply to the CONCRETE value at instantiation, slice 2 — a
+# symbolic size is never negative-or-overflow by construction). Returns the
+# parameter id; Option::None for every other expression, and the caller
+# reports the pre-§20 non-constant-size error unchanged.
+def resolve_const_param_size(env: TypeEnv, expr: Expr) -> Option[GenericParamId]
+  let name = match expr.kind
+  when ExprKind::ExprIdent(n) then Option::Some(n.clone())
+  when ExprKind::ExprPath(path) then
+    if path.segments.len() == 1 then Option::Some(path.segments[0].clone()) else Option::None end
+  when _ then Option::None
+  end
+  match name
+  when Option::Some(n) then
+    match lookup_var(env, n)
+    when Option::Some(ty) then
+      match ty
+      when Type::ConstParam(gpid) then Option::Some(gpid)
+      when _ then Option::None
+      end
+    when Option::None then Option::None
+    end
+  when Option::None then Option::None
+  end  end
+end
+
 # Extract path segments from a TypeExpr in a separate function frame.
 # Going through a helper appears to give stage0 cleaner codegen for single-
 # struct enum payloads (Path(AstPath)) than a direct destructure in-place.
@@ -19722,6 +19972,16 @@ def resolve_type_expr(inout env: TypeEnv, te: TypeExpr) -> Type
         end
       end
     end
+  when TypeExprKind::ConstArg(n) then
+    # (§20 const generics, slice 1): a const-generic ARGUMENT — an integer
+    # literal supplied in a type-argument list — resolves to Type::Const.
+    # The literal's host value was range-checked at parse (must fit the host
+    # Int); checking the value against the const parameter's DECLARED scalar
+    # type (u8 vs UInt ranges) needs the instantiation context and is slice 2
+    # (a literal argument always carries its exact value, so a wrong-typed
+    # position is caught downstream by identity mismatches and the
+    # codegenability scans).
+    Type::Const(n)
   when TypeExprKind::Unit then Type::Unit
   when TypeExprKind::Never then Type::Never
   when TypeExprKind::Tuple(elems) then
@@ -19744,31 +20004,42 @@ def resolve_type_expr(inout env: TypeEnv, te: TypeExpr) -> Type
     # evaluate) BEFORE FixedArray(Type, N) identity forms, so the const
     # spelling and the literal spelling produce the SAME type identity. A
     # non-constant size is a TypeError (the fixed array size is part of the
-    # type identity).
+    # type identity) UNLESS it is a const generic parameter of the enclosing
+    # generic declaration (§20 slice 1: the [T; N] annotation inside a
+    # generic body whose size is the declaration's own `const N` — the
+    # scope binding is Type::ConstParam, and the type is the SYMBOLIC
+    # Type::FixedArraySym(elem, gpid); module-const resolution above runs
+    # FIRST, so a module const shadowing-free name still resolves to its
+    # value).
     let elem_type = resolve_type_expr(env, &elem)
-    let size_n = match size_opt
+    match size_opt
     when Option::Some(size_expr) then
       match eval_const_size_expr(env, &size_expr)
-      when Option::Some(n) then n
+      when Option::Some(n) then
+        # (item-12 audit): the fixed-array count is the ONE user-controlled
+        # magnitude that flows into the layout engine's size arithmetic. It is
+        # BOUNDED here with a stable diagnostic — a negative or out-of-range
+        # count is a user mistake, never a layout-engine overflow (the engine's
+        # own checked arithmetic remains as the internal fail-closed backstop).
+        if n < 0 then
+          type_add_error(env, "fixed array size must not be negative (got " + n.to_string() + ")", te.span)
+        elsif n > MAX_FIXED_ARRAY_ELEMS() then
+          type_add_error(env, "fixed array size " + n.to_string() + " exceeds the maximum supported length " + MAX_FIXED_ARRAY_ELEMS().to_string(), te.span)
+        end
+        Type::FixedArray(elem_type, n)
       when Option::None then
-        type_add_error(env, "fixed array size must be a constant (an integer literal, a const reference, or constant arithmetic)", size_expr.span)
-        0
+        match resolve_const_param_size(env, &size_expr)
+        when Option::Some(gpid) then
+          Type::FixedArraySym(elem_type, gpid)
+        when Option::None then
+          type_add_error(env, "fixed array size must be a constant (an integer literal, a const reference, or constant arithmetic)", size_expr.span)
+          Type::FixedArray(elem_type, 0)
+        end
       end
     when Option::None then
       type_add_error(env, "fixed array size must be a constant", te.span)
-      0
+      Type::FixedArray(elem_type, 0)
     end
-    # (item-12 audit): the fixed-array count is the ONE user-controlled
-    # magnitude that flows into the layout engine's size arithmetic. It is
-    # BOUNDED here with a stable diagnostic — a negative or out-of-range
-    # count is a user mistake, never a layout-engine overflow (the engine's
-    # own checked arithmetic remains as the internal fail-closed backstop).
-    if size_n < 0 then
-      type_add_error(env, "fixed array size must not be negative (got " + size_n.to_string() + ")", te.span)
-    elsif size_n > MAX_FIXED_ARRAY_ELEMS() then
-      type_add_error(env, "fixed array size " + size_n.to_string() + " exceeds the maximum supported length " + MAX_FIXED_ARRAY_ELEMS().to_string(), te.span)
-    end
-    Type::FixedArray(elem_type, size_n)
   when TypeExprKind::Slice(elem) then
     # The [T] type spelling IS the source-spelled Slice — the SAFE
     # SHARED/PINNED form: the name "Slice" resolves to the std-declared
@@ -20119,6 +20390,11 @@ def scan_codegen_type(inout env: TypeEnv, ty: Type, inout has_error: Bool, inout
   when Type::Error then has_error = true
   when Type::Var(_) then has_var = true
   when Type::Param(_) then if !allow_param then has_param = true end
+  when Type::ConstParam(_) then if !allow_param then has_param = true end
+  when Type::FixedArraySym(elem, _) then
+    if !allow_param then has_param = true end
+    scan_codegen_type(env, elem, has_error, has_var, has_param, allow_param)
+  when Type::Const(_) then ()
   when Type::Adt(tid, args) then
     var ai = 0
     while ai < args.len() do
@@ -21365,6 +21641,15 @@ def derive_transferable(inout env: TypeEnv, ty: Type, inout visited: Set[Int]) -
   when Type::Effect(_, inner) then derive_transferable(env, &inner, visited)
   when Type::Param(_) then true  # Assume generic params are Transferable (checked at instantiation)
   when Type::Var(_) then true  # Type variables: assume Transferable
+ # (§20 slice 1): a const generic argument is a scalar compile-time
+  # constant — Transferable exactly like the concrete integer types; a
+  # SYMBOLIC const parameter reference assumes Transferable like Type::Param
+  # (checked at instantiation); the symbolic-size array mirrors the concrete
+  # FixedArray arm (the element governs, the parameter count contributes
+  # nothing).
+  when Type::Const(_) then true
+  when Type::ConstParam(_) then true
+  when Type::FixedArraySym(elem, _) then derive_transferable(env, &elem, visited)
  # (inference-only): an integer literal is a scalar value —
   # Transferable exactly like the concrete integer types.
   when Type::IntLiteral(_) then true
@@ -21450,6 +21735,7 @@ def type_contains_affine_handle_walk(inout env: TypeEnv, ty: Type, inout visited
     end
     false
   when Type::FixedArray(elem, _) then type_contains_affine_handle_walk(env, &elem, visited)
+  when Type::FixedArraySym(elem, _) then type_contains_affine_handle_walk(env, &elem, visited)
   when Type::Closure(_, _, _, captures, _) then type_contains_affine_handle_walk(env, &captures, visited)
   when Type::Ptr(inner) then type_contains_affine_handle_walk(env, &inner, visited)
   when Type::PtrMut(inner) then type_contains_affine_handle_walk(env, &inner, visited)
@@ -21581,6 +21867,13 @@ def derive_syncable(inout env: TypeEnv, ty: Type, inout visited: Set[Int]) -> Bo
   when Type::Effect(_, inner) then derive_syncable(env, &inner, visited)
   when Type::Param(_) then true
   when Type::Var(_) then true
+ # (§20 slice 1): const-generic forms mirror the transferable walk — a
+  # const argument is scalar data (Shareable); a symbolic const parameter
+  # reference assumes Shareable like Type::Param; the symbolic-size array
+  # mirrors the concrete FixedArray arm (element governs).
+  when Type::Const(_) then true
+  when Type::ConstParam(_) then true
+  when Type::FixedArraySym(elem, _) then derive_syncable(env, &elem, visited)
  # (inference-only): an integer literal is a scalar value —
   # Shareable exactly like the concrete integer types.
   when Type::IntLiteral(_) then true
@@ -21770,6 +22063,9 @@ def type_display(env: TypeEnv, ty: Type) -> String
     s + ")"
   when Type::Var(vid) then "?T" + vid.id.to_string()
   when Type::Param(gpid) then generic_param_name_of(&env.generic_param_table, &gpid)
+  when Type::Const(v) then "const " + v.to_string()
+  when Type::ConstParam(gpid) then "const " + generic_param_name_of(&env.generic_param_table, &gpid)
+  when Type::FixedArraySym(elem, gpid) then "[" + type_display(env, &elem) + "; " + generic_param_name_of(&env.generic_param_table, &gpid) + "]"
   when Type::Error then "<error>"
   end  end
 end

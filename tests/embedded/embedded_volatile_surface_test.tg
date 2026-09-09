@@ -1,0 +1,297 @@
+## tests/embedded/embedded_volatile_surface_test.tg - the volatile/MMIO
+## compiler-level contract (audit §19 - the observable volatile surface).
+##
+## The width-exact volatile intrinsics (the `_tg_volatile_read*` /
+## `_tg_volatile_write*` externs that std::embedded's
+## volatile_read8/16/32/64 and volatile_write8/16/32/64 lower to) are
+## OBSERVABLE operations end-to-end:
+##   1. the MIR optimizer never elides, merges, folds or reorders them -
+##      two volatile_read32(A) stay TWO reads; two volatile_write32(A, v)
+##      stay TWO writes; a read / pure-arithmetic / read sequence keeps
+##      both reads and the arithmetic; a volatile read whose result is
+##      unused is still performed;
+##   2. a read-modify-write (the exact shape std::embedded's
+##      volatile_set_bits / volatile_clear_bits / volatile_toggle_bits
+##      compile to) is EXACTLY one volatile load + one volatile store -
+##      with no ordinary dereference (the generic Ptr-based volatile
+##      surface was removed; an ordinary `*p` load/store would be
+##      elidable/mergeable and is not the volatile contract);
+##   3. codegen inlines each volatile call to the width-exact load/store
+##      instruction (codegen.tg's try_emit_volatile_builtin, mirroring
+##      the __intrinsic_atomic_* slice), so the emitted caller contains
+##      the real LDR/STR and no call to the runtime fallback symbol.
+##
+## Run with: tg test tests/embedded/embedded_volatile_surface_test.tg
+
+use std::test::*
+use std::core::{Option, Result, Unit, Bool, Int, UInt, panic}
+
+use tg_compiler::compiler_core::{default_options, parse_source_program, analyze_parsed, CompilerOptions}
+use tg_compiler::types::{type_env_new}
+use tg_compiler::mir::{
+  MirProgram, MirFunction, MirStatementKind, MirRvalue, MirRvalueKind,
+  MirTerminatorKind, MirOperand, MirOperandKind, MirConstantKind, Place,
+  Projection, optimize_mir, lower_to_mir
+}
+use tg_compiler::mode::{Mode}
+
+# The fixture exercises the volatile intrinsics DIRECTLY (the exact MIR
+# shape the std::embedded width helpers produce after inlining), with no
+# std::embedded import: the compiler-level expectations must not depend
+# on module-merging.
+const FIXTURE: str = "extern def _tg_volatile_read32(addr: UInt) -> u32\n" +
+  "extern def _tg_volatile_write32(addr: UInt, value: u32) -> Unit\n" +
+  "\n" +
+  "def vol_two_reads(addr: UInt) -> u32\n" +
+  "  let a = _tg_volatile_read32(addr)\n" +
+  "  let b = _tg_volatile_read32(addr)\n" +
+  "  a + b\n" +
+  "end\n" +
+  "\n" +
+  "def vol_two_writes(addr: UInt) -> Unit\n" +
+  "  _tg_volatile_write32(addr, 1u32)\n" +
+  "  _tg_volatile_write32(addr, 2u32)\n" +
+  "end\n" +
+  "\n" +
+  "def vol_read_arith_read(addr: UInt, k: u32) -> u32\n" +
+  "  let x = _tg_volatile_read32(addr)\n" +
+  "  let y = x + k\n" +
+  "  let z = _tg_volatile_read32(addr)\n" +
+  "  z + y\n" +
+  "end\n" +
+  "\n" +
+  "def vol_set_bits(addr: UInt, mask: u32) -> Unit\n" +
+  "  let value = _tg_volatile_read32(addr)\n" +
+  "  _tg_volatile_write32(addr, value | mask)\n" +
+  "end\n" +
+  "\n" +
+  "def vol_clear_bits(addr: UInt, mask: u32) -> Unit\n" +
+  "  let value = _tg_volatile_read32(addr)\n" +
+  "  _tg_volatile_write32(addr, value & !mask)\n" +
+  "end\n" +
+  "\n" +
+  "def vol_toggle_bits(addr: UInt, mask: u32) -> Unit\n" +
+  "  let value = _tg_volatile_read32(addr)\n" +
+  "  _tg_volatile_write32(addr, value ^ mask)\n" +
+  "end\n" +
+  "\n" +
+  "def vol_unused_read(addr: UInt) -> u32\n" +
+  "  let _ = _tg_volatile_read32(addr)\n" +
+  "  42u32\n" +
+  "end\n" +
+  "\n" +
+  "def main() -> Int\n" +
+  "  0\n" +
+  "end\n"
+
+def _opts() -> CompilerOptions
+  var opts = default_options()
+  opts.strict_resolution = true
+  opts.mode = Mode::Dev
+  opts
+end
+
+# Parse + analyze + lower + optimize at `opt_level` - the pipeline the
+# driver runs before codegen (driver.tg: parse -> analyze -> lower ->
+# monomorphize -> optimize).
+def _compile_fixture(opt_level: Int) -> MirProgram
+  var ast = assert_ok(parse_source_program(FIXTURE.to_string(), "embedded_volatile_surface_fixture.tg"))
+  var env = type_env_new()
+  let analyzed = assert_ok(analyze_parsed(&mut env, &mut ast, _opts()))
+  var mir = assert_ok(lower_to_mir(&ast, &analyzed))
+  optimize_mir(&mut mir, opt_level)
+  mir
+end
+
+def _find_fn(program: MirProgram, suffix: str) -> MirFunction
+  for f in program.functions do
+    if f.name.ends_with(suffix) then
+      return f
+    end
+  end
+  panic("volatile fixture: expected function missing from the lowered program: " + suffix.to_string())
+end
+
+def _place_has_deref(p: Place) -> Bool
+  for proj in p.projections do
+    match proj
+    when Projection::ProjDeref then return true
+    when _ then ()
+    end
+  end
+  false
+end
+
+def _operand_reads_memory(op: MirOperand) -> Bool
+  match op.kind
+  when MirOperandKind::MirCopy(place) then _place_has_deref(&place)
+  when MirOperandKind::MirMovePlace(place) then _place_has_deref(&place)
+  when MirOperandKind::MirRead(place) then _place_has_deref(&place)
+  when MirOperandKind::MirConsume(place) then _place_has_deref(&place)
+  when _ then false
+  end  end
+end
+
+def _rvalue_reads_memory(rv: MirRvalue) -> Bool
+  match rv.kind
+  when MirRvalueKind::MirMove(op) then _operand_reads_memory(&op)
+  when MirRvalueKind::MirRef(place) then _place_has_deref(&place)
+  when MirRvalueKind::MirAggregate(_, ops) then
+    var found = false
+    for op in ops do
+      if _operand_reads_memory(&op) then found = true end
+    end
+    found
+  when MirRvalueKind::MirBinOp(_, lhs, rhs) then
+    _operand_reads_memory(&lhs) || _operand_reads_memory(&rhs)
+  when MirRvalueKind::MirUnOp(_, op) then _operand_reads_memory(&op)
+  when MirRvalueKind::MirDiscriminant(place) then _place_has_deref(&place)
+  when MirRvalueKind::MirLen(place) then _place_has_deref(&place)
+  when MirRvalueKind::MirCast(_, op, _) then _operand_reads_memory(&op)
+  when MirRvalueKind::MirRepeat(op, _) then _operand_reads_memory(&op)
+  when _ then false
+  end  end
+end
+
+# The number of ordinary (non-volatile) memory accesses in `f`: a store
+# through a deref place or an rvalue that READS through a deref place.
+# The volatile contract requires ZERO of these around the width-exact
+# intrinsics (the removed generic Ptr surface lowered to exactly these
+# ordinary dereferences - elidable/mergeable - which is why it is gone).
+def _ordinary_memory_access_count(f: MirFunction) -> Int
+  var total = 0
+  for block in f.blocks do
+    for stmt in block.statements do
+      match stmt.kind
+      when MirStatementKind::MirAssign(place, rvalue) then
+        if _place_has_deref(&place) then
+          total = total + 1
+        end
+        if _rvalue_reads_memory(&rvalue) then
+          total = total + 1
+        end
+      when _ then ()
+      end
+    end
+  end
+  total
+end
+
+# Count the terminator calls whose callee name starts with `prefix` in
+# `f` - a volatile access is one opaque call terminator in MIR (the
+# optimizer's barrier; codegen inlines it to the LDR/STR instruction).
+def _volatile_call_count(f: MirFunction, prefix: str) -> Int
+  var total = 0
+  for block in f.blocks do
+    match block.terminator.kind
+    when MirTerminatorKind::MirCall { dest, func, args, success, unwind, intrinsic } then
+      match func.kind
+      when MirOperandKind::MirConstant(cst) then
+        match cst.kind
+        when MirConstantKind::MirFnItem(nm) then
+          if nm.starts_with(prefix) then
+            total = total + 1
+          end
+        when _ then ()
+        end
+      when _ then ()
+      end
+    when _ then ()
+    end
+  end
+  total
+end
+
+def _binop_assign_count(f: MirFunction) -> Int
+  var total = 0
+  for block in f.blocks do
+    for stmt in block.statements do
+      match stmt.kind
+      when MirStatementKind::MirAssign(place, rvalue) then
+        match rvalue.kind
+        when MirRvalueKind::MirBinOp(_, _, _) then total = total + 1
+        when _ then ()
+        end
+      when _ then ()
+      end
+    end
+  end
+  total
+end
+
+# ─── the observable-semantics expectations (optimized at O3) ────────
+
+@test
+def test_two_volatile_reads_are_two_reads_after_o3() -> Unit
+  let program = _compile_fixture(3)
+  let f = _find_fn(program, "vol_two_reads")
+  let reads = _volatile_call_count(&f, "_tg_volatile_read32")
+  assert(reads == 2, "two volatile_read32(A) calls must stay TWO volatile reads after -O3 (got " + reads.to_string() + ")")
+  let writes = _volatile_call_count(&f, "_tg_volatile_write32")
+  assert(writes == 0, "the two-read fixture must not contain a volatile write")
+  assert(_ordinary_memory_access_count(&f) == 0, "the two-read fixture must contain no ordinary deref access")
+end
+
+@test
+def test_two_volatile_writes_are_two_stores_after_o3() -> Unit
+  let program = _compile_fixture(3)
+  let f = _find_fn(program, "vol_two_writes")
+  let writes = _volatile_call_count(&f, "_tg_volatile_write32")
+  assert(writes == 2, "two volatile_write32(A, v) calls must stay TWO volatile stores after -O3 (got " + writes.to_string() + ") - the first store is dead-but-observable and must never be deleted or merged")
+  let reads = _volatile_call_count(&f, "_tg_volatile_read32")
+  assert(reads == 0, "the two-write fixture must not contain a volatile read")
+  assert(_ordinary_memory_access_count(&f) == 0, "the two-write fixture must contain no ordinary deref access")
+end
+
+@test
+def test_read_pure_arithmetic_read_preserves_both_reads_after_o3() -> Unit
+  let program = _compile_fixture(3)
+  let f = _find_fn(program, "vol_read_arith_read")
+  let reads = _volatile_call_count(&f, "_tg_volatile_read32")
+  assert(reads == 2, "read / pure-arith / read must keep BOTH volatile reads after -O3 (got " + reads.to_string() + ") - a volatile read is never CSE'd or folded into the arithmetic")
+  let arith = _binop_assign_count(&f)
+  assert(arith >= 1, "the pure arithmetic between the two volatile reads must stay (the surrounding ordinary code still optimizes, but the reads are barriers)")
+end
+
+@test
+def test_bit_modify_is_exactly_one_load_and_one_store_after_o3() -> Unit
+  let program = _compile_fixture(3)
+  var f = _find_fn(program, "vol_set_bits")
+  var reads = _volatile_call_count(&f, "_tg_volatile_read32")
+  var writes = _volatile_call_count(&f, "_tg_volatile_write32")
+  assert(reads == 1 && writes == 1, "set_bits must be exactly one volatile load + one volatile store after -O3 (read32=" + reads.to_string() + " write32=" + writes.to_string() + ")")
+  assert(_ordinary_memory_access_count(&f) == 0, "set_bits must contain NO ordinary MMIO load/store (the generic Ptr .read() surface is removed)")
+  f = _find_fn(program, "vol_clear_bits")
+  reads = _volatile_call_count(&f, "_tg_volatile_read32")
+  writes = _volatile_call_count(&f, "_tg_volatile_write32")
+  assert(reads == 1 && writes == 1, "clear_bits must be exactly one volatile load + one volatile store after -O3 (read32=" + reads.to_string() + " write32=" + writes.to_string() + ")")
+  assert(_ordinary_memory_access_count(&f) == 0, "clear_bits must contain NO ordinary MMIO load/store")
+  f = _find_fn(program, "vol_toggle_bits")
+  reads = _volatile_call_count(&f, "_tg_volatile_read32")
+  writes = _volatile_call_count(&f, "_tg_volatile_write32")
+  assert(reads == 1 && writes == 1, "toggle_bits must be exactly one volatile load + one volatile store after -O3 (read32=" + reads.to_string() + " write32=" + writes.to_string() + ")")
+  assert(_ordinary_memory_access_count(&f) == 0, "toggle_bits must contain NO ordinary MMIO load/store")
+end
+
+@test
+def test_unused_volatile_read_is_never_elided_after_o3() -> Unit
+  let program = _compile_fixture(3)
+  let f = _find_fn(program, "vol_unused_read")
+  let reads = _volatile_call_count(&f, "_tg_volatile_read32")
+  assert(reads == 1, "a volatile read whose result is unused is still OBSERVABLE and must survive -O3 (got " + reads.to_string() + ")")
+end
+
+@test
+def test_volatile_calls_survive_every_optimization_level() -> Unit
+  let program = _compile_fixture(0)
+  var f = _find_fn(program, "vol_two_writes")
+  assert(_volatile_call_count(&f, "_tg_volatile_write32") == 2, "the two volatile writes must exist at -O0")
+  f = _find_fn(program, "vol_two_reads")
+  assert(_volatile_call_count(&f, "_tg_volatile_read32") == 2, "the two volatile reads must exist at -O0")
+  let program1 = _compile_fixture(1)
+  let f1 = _find_fn(program1, "vol_two_writes")
+  assert(_volatile_call_count(&f1, "_tg_volatile_write32") == 2, "the two volatile writes must exist at -O1")
+  let program2 = _compile_fixture(2)
+  let f2 = _find_fn(program2, "vol_two_reads")
+  assert(_volatile_call_count(&f2, "_tg_volatile_read32") == 2, "the two volatile reads must exist at -O2")
+end

@@ -53,12 +53,15 @@ fi
 
 SUITES=(
   "tests/embedded/embedded_mmio_behavior_test.tg"
+  "tests/embedded/embedded_volatile_surface_test.tg"
   "tests/wasi/wasi_guest_surface_test.tg"
   "tests/kernel/kernel_primitives_test.tg"
   "tests/hal/hal_software_backend_test.tg"
   "tests/gui/gui_software_canvas_test.tg"
   "tests/gpu/gpu_software_backend_test.tg"
   "tests/platform/platform_surface_smoke_test.tg"
+  "tests/mir_int_arith_semantics_test.tg"
+  "tests/unit/test_int_overflow_behavior.tg"
 )
 
 FAILED=0
@@ -70,6 +73,28 @@ for suite in "${SUITES[@]}"; do
     FAILED=1
   fi
 done
+
+# Audit §24: the ordinary integer arithmetic semantics must be
+# identical at every optimization level — the runtime rows of
+# test_int_overflow_behavior.tg run again under -O0..-O3 (the default
+# run above uses the driver's default level), and the exit-code trap
+# lane proves the signed-overflow TRAP itself (never catchable inside
+# an @test process) fires at every level.
+for level in 0 1 2 3; do
+  if "$COMPILER" test "-O$level" "tests/unit/test_int_overflow_behavior.tg" > "$OUTDIR/test_int_overflow_behavior_O${level}.log" 2>&1; then
+    echo "behavior suites: PASS  tests/unit/test_int_overflow_behavior.tg at -O$level"
+  else
+    echo "behavior suites: FAIL  tests/unit/test_int_overflow_behavior.tg at -O$level (see $OUTDIR/test_int_overflow_behavior_O${level}.log)" >&2
+    FAILED=1
+  fi
+done
+
+if bash tests/run_int_arith_trap_lane.sh "$COMPILER" "$OUTDIR/trap_lane"; then
+  echo "behavior suites: PASS  tests/run_int_arith_trap_lane.sh"
+else
+  echo "behavior suites: FAIL  tests/run_int_arith_trap_lane.sh" >&2
+  FAILED=1
+fi
 
 if [ "$FAILED" -ne 0 ]; then
   echo "behavior suites: FAILED" >&2

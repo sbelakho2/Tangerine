@@ -15,12 +15,17 @@
 #   - AllocPolicy — the policy MARKERS (enum): Heap / Arena / Slab /
 #     Fixed / None, with the audit's mapping spelled out on the enum;
 #   - BumpArena — the deterministic bump (arena) allocator: owned
-#     (new) or borrowed (with_buffer) backing, alloc/reset, no
-#     individual free, zero-overhead reset;
+#     (new / new_aligned) or borrowed (with_buffer /
+#     with_buffer_aligned) backing, alignment-honoring alloc /
+#     alloc_layout / reset, no individual free, zero-overhead reset;
 #   - SlabPool[T] — the fixed-size typed object pool: preallocated
 #     slots, acquire/release index hand-off over an intrusive free
 #     list, no heap churn after init, exact drop of live occupants
-#     with deterministic ascending teardown.
+#     with deterministic ascending teardown;
+#   - ArenaVec[T] — the arena-backed fixed builder (the audit's
+#     allocator-generic-collections row): a Vec-like push/get/len/
+#     reset surface over a BumpArena it owns; T: Copy; capacity fixed
+#     at construction; ZERO general-heap traffic after init.
 #
 # WHERE THE POLICIES LIVE IN THE KERNEL STD (the call surface this
 # module documents and marks):
@@ -30,7 +35,16 @@
 #     (policy: Arena), PoolAllocator (policy: Slab), the layout API and
 #     the global alloc functions. Its alignment contract (any
 #     power-of-two align <= 16; over-aligned requests are explicit
-#     errors) is inherited verbatim by every allocation in this module.
+#     errors) is the BACKING contract of this module: the kernel
+#     runtime payload is 16-aligned and cannot do better itself. The
+#     policy forms BELOW therefore carry the extra alignment in THEIR
+#     OWN backings — a BumpArena (new_aligned) or SlabPool slot base is
+#     pre-aligned up to the 64-byte anchor (the widest target vector
+#     alignment) at construction, so their alloc surface serves every
+#     power-of-two align through 64; the zero-headroom default
+#     (BumpArena::new, with_buffer) keeps the std::alloc <= 16
+#     contract (see the ALIGNMENT CONTRACT notes in the BumpArena/
+#     SlabPool sections).
 #   - std::collections::Vec growth is HEAP by construction: push lowers
 #     to the compiler intrinsic __intrinsic_array_push (the runtime
 #     allocator), so a general allocator parameter on Vec[T, A] is
@@ -42,13 +56,34 @@
 #     deterministic policy forms (BumpArena, SlabPool[T]) that the
 #     audit's hot paths call directly.
 #
-# DROP DISCIPLINE (deallocate exactly once): an owner of MEMORY holds a
-# raw pointer and declares the finalizer — the std::alloc Box/Arc and
-# std::fixed SpscQueue split-endpoint record pattern. Both BumpArena
-# and SlabPool are plain structs (raw Ptr + UInt fields) with a
-# registered `impl Drop`: the Drop releases exactly the init-time
-# allocations once and nulls every field, so a bit-copied owner cannot
-# double-free (the std::alloc ArenaAllocator/PoolAllocator convention).
+# DROP DISCIPLINE + THE NON-COPY PROPERTY (deallocate exactly once):
+# an owner of MEMORY holds a raw pointer and declares the finalizer —
+# the std::alloc Box/Arc and std::fixed SpscQueue split-endpoint record
+# pattern. Both BumpArena and SlabPool are plain structs (raw Ptr +
+# UInt fields) with a registered `impl Drop`: the Drop releases exactly
+# the init-time allocations once, then nulls every field so that an
+# EARLY or MANUAL release path is idempotent.
+#
+# IMPORTANT (audit correction): field nulling is NOT the double-free
+# defense. A bit-copied pair of an owning struct holds INDEPENDENT
+# field storage — nulling copy A's fields never reaches copy B, and B
+# still releases the shared backing, so a bit-copied owner double-frees
+# no matter how thoroughly Drop nulls its own fields. The REAL safety
+# property is the compiler's TYPE-PROPERTY ENGINE: a registered
+# `impl Drop` excludes a type from the structural bit-copy set (the
+# same mechanism that makes Vec/Box/Rc/String non-Copy —
+# tg_compiler/types.tg is_named_trivially_copyable: "a registered
+# Drop requires destruction: a raw bit-copy would duplicate the state
+# the drop glue releases"), so BumpArena and SlabPool[T] (and every
+# type embedding them, e.g. ArenaVec) are classified non-Copy and a
+# bit-copy of them is a COMPILE ERROR — ownership transfers by
+# move/sink only and Drop runs exactly once on the single live value.
+# The classification is pinned by the module's compile-fail canaries
+# (tests/canary_neg — the unit lane's negative convention for other
+# std types: SlabPool[String].get is rejected the same way
+# RingBuffer[String].peek_front is). The nulling itself stays as
+# defense-in-depth: Drop remains idempotent under any manual teardown
+# interleaving.
 # A struct that owns VALUES holds them structurally and declares no
 # finalizer — here the SlabPool occupant VALUES are owned by raw
 # memory, so their destruction is the pool's own Drop/clear duty (each
@@ -65,7 +100,7 @@
 # the file name is the module path).
 
 use std::core::{Option, Result, Unit, Bool, UInt, Int, panic}
-use std::alloc::{global_alloc, global_dealloc, size_of, align_of}
+use std::alloc::{global_alloc, global_dealloc, size_of, align_of, Layout}
 
 # [METADATA]
 # module: tg::alloc_policy
@@ -129,26 +164,67 @@ enum AllocPolicy
 end
 
 # ═══════════════════════════════════════════════════════════════════════
+# THE ALIGNMENT MODEL (the audit's Layout { size, align } contract)
+# ═══════════════════════════════════════════════════════════════════════
+#
+# Anchor: the supported maximum alignment of this module's policy
+# allocators is 64 bytes — the widest vector width the target
+# layout/ABI engine emits (the 64-byte SIMD forms of the vector
+# row). Every power-of-two align <= 64 is honored; an align above the
+# anchor is an EXPLICIT error, never a silently misaligned buffer.
+#
+# The kernel runtime allocator (std::alloc's SystemAllocator /
+# global_alloc) guarantees a 16-aligned payload and rejects >16
+# itself — so a backing obtained from it cannot serve 32/64-aligned
+# sub-allocations by offset math alone. The policy allocators carry
+# the extra alignment in THEIR OWN BACKING: the construction request
+# is padded by at most (max_align - 16) bytes and the base is aligned
+# up to max_align before the first alloc. The shift is fixed per
+# backing (deterministic: reset-then-realloc returns the SAME
+# addresses), the padded request is released with the raw base and
+# the exact request size (the runtime free reads the block header, so
+# the size argument is ABI-only), and the served capacity is the
+# requested capacity exactly.
+#
+# Borrowed backings (BumpArena::with_buffer / with_buffer_aligned)
+# cannot be pre-aligned by the arena; the caller must supply a buffer
+# aligned to every align it will request, and alloc() VERIFIES each
+# returned address — a misaligned borrowed base for the requested align
+# is an explicit error at the alloc site.
+def policy_max_align() -> UInt
+  64
+end
+
+# ═══════════════════════════════════════════════════════════════════════
 # BumpArena — deterministic bump (arena) allocator
 # ═══════════════════════════════════════════════════════════════════════
-# The policy form of std::alloc's ArenaAllocator: identical alignment
-# contract and identical bump math, plus the borrowed-buffer form
-# (with_buffer) that makes the arena usable over a static/owned buffer
-# with NO allocation of its own (embedded policy). BumpArena is
-# NOT thread-safe. reset() is a single store — zero-overhead free-all;
-# it never touches the buffer contents (no memset), so bump
-# determinism across resets is exact: after a reset the same alloc
-# sequence returns the same addresses.
+# The policy form of std::alloc's ArenaAllocator: identical bump math,
+# plus the borrowed-buffer form (with_buffer) that makes the arena
+# usable over a static/owned buffer with NO allocation of its own
+# (embedded policy). BumpArena is NOT thread-safe. reset() is a single
+# store — zero-overhead free-all; it never touches the buffer contents
+# (no memset), so bump determinism across resets is exact: after a
+# reset the same alloc sequence returns the same addresses.
 #
-# ALIGNMENT CONTRACT (inherited from std::alloc, the SAME policy as
-# SystemAllocator/ArenaAllocator): the owned backing buffer comes from
-# the global allocator, whose payload is 16-byte-aligned, so any
-# power-of-two align <= 16 is satisfied by the aligned-offset math; an
-# align 0, a non-power-of-two, or an align > 16 is an EXPLICIT error
-# (panic). For with_buffer the CALLER supplies the backing and must
-# provide a buffer aligned to the maximum align that will be requested
-# (16 for the full contract); the arena cannot verify a borrowed
-# buffer's alignment.
+# ALIGNMENT CONTRACT (Layout { size, align }-honoring): alloc(size,
+# align) serves every power-of-two align through the arena's
+# configured max (policy_max_align() = 64 — the widest target vector
+# alignment). The OWNED backing (new / new_aligned) comes from the
+# global allocator, whose payload is only 16-aligned; the arena
+# therefore pre-aligns its own base: the construction request carries
+# up to (max_align - 16) headroom bytes and the base is aligned up to
+# max_align at new() — new(capacity) arenas serve aligns <= 16 with no
+# headroom (the std::alloc contract, zero overhead), new_aligned(cap,
+# align) arenas serve through their declared max (the audit's ≥ 64
+# row). An align 0, a non-power-of-two, or an align above the arena's
+# configured max is an EXPLICIT error (panic) that names the fix.
+# For with_buffer the CALLER supplies the backing and must provide a
+# buffer aligned to every align it will request; the arena's contract
+# for the plain borrowed form is aligns <= 16 (with_buffer_aligned
+# raises the claim for caller-pre-aligned backings). alloc VERIFIES
+# each returned address and panics on a misaligned borrowed base (the
+# arena cannot re-align a borrowed buffer). alloc_layout(layout) is
+# the Layout entry point (std::alloc::Layout { size, align }).
 #
 # Exhaustion: alloc returns a null pointer (never a partial bump); the
 # caller observes it and resets or extends the arena — allocation
@@ -157,41 +233,109 @@ end
 # (the std::alloc zero-size contract).
 
 struct BumpArena
-  _buffer: Ptr[u8]    # the backing buffer (owned by new, borrowed by with_buffer)
-  _capacity: UInt     # total backing bytes
+  _buffer: Ptr[u8]    # the aligned bump base — the first byte alloc hands out
+  _alloc: Ptr[u8]     # the raw backing allocation base (== _buffer when borrowed)
+  _capacity: UInt     # served bytes (the requested capacity, exactly)
+  _raw_bytes: UInt    # owned: the exact global-allocator request (capacity + headroom)
   _offset: UInt       # the bump pointer (next allocation offset)
-  _owns: UInt         # 1 = new() owns the backing (Drop releases); 0 = borrowed
+  _owns: UInt         # 1 = owned backing (Drop releases); 0 = borrowed
+  _max_align: UInt    # this arena's supported-max alignment (16 or a power of two <= 64)
 end
 
 impl BumpArena
-  # Owned arena: allocates the backing ONCE from the global allocator
-  # (16-byte-aligned payload) and releases it exactly once at Drop.
-  # Allocation happens only here — every later operation (alloc/reset)
-  # is bump-pointer work with no allocator involvement.
+  # Owned arena, the std::alloc alignment contract (power-of-two
+  # aligns <= 16): the backing is allocated ONCE from the global
+  # allocator (16-aligned payload, NO headroom) and released exactly
+  # once at Drop. Allocation happens only here — every later operation
+  # (alloc/reset) is bump-pointer work with no allocator involvement.
   def new(capacity: UInt) -> BumpArena
-    let buffer = global_alloc(capacity, 16)
-    if capacity != 0 && buffer.is_null() then
-      panic("BumpArena::new: allocation failed - out of memory")
+    BumpArena::new_aligned(capacity, 16)
+  end
+
+  # Owned arena pre-aligned to `max_align` (a power of two in
+  # [16, policy_max_align()]): alloc() honors every power-of-two align
+  # through `max_align`. The construction request is padded by up to
+  # (max_align - 16) bytes so the base can be aligned up; the served
+  # capacity is `capacity` exactly and the release uses the raw base
+  # and the padded request.
+  def new_aligned(capacity: UInt, max_align: UInt) -> BumpArena
+    if max_align == 0 || (max_align & (max_align - 1)) != 0 then
+      panic("BumpArena::new_aligned: max_align must be a power of two")
+    end
+    if max_align < 16 then
+      panic("BumpArena::new_aligned: max_align below 16 is not supported (16 is the backing's guaranteed alignment)")
+    end
+    if max_align > policy_max_align() then
+      panic("BumpArena::new_aligned: max_align " + max_align.to_string() + " > " + policy_max_align().to_string() + " not supported (the alignment anchor is the target's widest 64-byte vector alignment)")
+    end
+    let request = if capacity == 0 then 0 else capacity + (max_align - 16) end
+    let raw = global_alloc(request, 16)
+    if request != 0 && raw.is_null() then
+      panic("BumpArena::new_aligned: allocation failed - out of memory")
+    end
+    # Align the base up to max_align (the raw payload is 16-aligned,
+    # so the shift is a multiple of 16 and at most max_align - 16).
+    mut aligned = raw
+    if request != 0 then
+      let mis = (raw as Int) & ((max_align as Int) - 1)
+      if mis != 0 then
+        aligned = (raw as Int + ((max_align as Int) - mis)) as Ptr[u8]
+      end
     end
     BumpArena {
-      _buffer: buffer,
+      _buffer: aligned,
+      _alloc: raw,
       _capacity: capacity,
+      _raw_bytes: request,
       _offset: 0,
-      _owns: 1
+      _owns: 1,
+      _max_align: max_align
     }
   end
 
   # Borrowed arena: bumps over a CALLER-OWNED buffer (static/global
   # memory for the embedded policy, a preallocated region, etc.). The
   # arena never frees it — Drop is a no-op on the backing — and the
-  # caller must keep the buffer alive (and aligned) for the arena's
-  # whole lifetime.
+  # caller must keep the buffer alive (and aligned to every align it
+  # will request, 16-byte multiples for the <= 16 contract) for the
+  # arena's whole lifetime. alloc() verifies each returned address.
   def with_buffer(buffer: Ptr[u8], capacity: UInt) -> BumpArena
     BumpArena {
       _buffer: buffer,
+      _alloc: buffer,
       _capacity: capacity,
+      _raw_bytes: 0,
       _offset: 0,
-      _owns: 0
+      _owns: 0,
+      _max_align: 16
+    }
+  end
+
+  # Borrowed arena over a backing the CALLER pre-aligned to `max_align`
+  # (a power of two in [16, policy_max_align()] — e.g. a static buffer
+  # placed at an over-aligned address for the embedded policy). The
+  # arena trusts the caller's claim (it cannot re-align a borrowed
+  # buffer) and alloc() VERIFIES every returned address — a base that
+  # cannot honor the requested align is an explicit error at the alloc
+  # site, never a silently misaligned buffer.
+  def with_buffer_aligned(buffer: Ptr[u8], capacity: UInt, max_align: UInt) -> BumpArena
+    if max_align == 0 || (max_align & (max_align - 1)) != 0 then
+      panic("BumpArena::with_buffer_aligned: max_align must be a power of two")
+    end
+    if max_align < 16 then
+      panic("BumpArena::with_buffer_aligned: max_align below 16 is not supported (16 is the backing's guaranteed alignment)")
+    end
+    if max_align > policy_max_align() then
+      panic("BumpArena::with_buffer_aligned: max_align " + max_align.to_string() + " > " + policy_max_align().to_string() + " not supported (the alignment anchor is the target's widest 64-byte vector alignment)")
+    end
+    BumpArena {
+      _buffer: buffer,
+      _alloc: buffer,
+      _capacity: capacity,
+      _raw_bytes: 0,
+      _offset: 0,
+      _owns: 0,
+      _max_align: max_align
     }
   end
 
@@ -208,24 +352,30 @@ impl BumpArena
     self._capacity - self._offset
   end
 
-  # The raw backing buffer (owned or borrowed). Read-only access to the
-  # arena's memory for the caller that needs to hand the batch out;
-  # writes to it must respect the bump discipline (bytes above _offset
-  # belong to the next alloc).
+  # The arena's configured supported-max alignment.
+  def max_align(self: Self) -> UInt
+    self._max_align
+  end
+
+  # The aligned backing base (owned or borrowed) — the first byte
+  # alloc hands out. Read-only access to the arena's memory for the
+  # caller that needs to hand the batch out; writes to it must respect
+  # the bump discipline (bytes above _offset belong to the next alloc).
   def buffer(self: Self) -> Ptr[u8]
     self._buffer
   end
 
-  # Allocate `size` bytes aligned to `align` (power of two <= 16).
-  # Returns null on exhaustion; panics on an out-of-contract align.
+  # Allocate `size` bytes aligned to `align` (a power of two <= the
+  # arena's configured max). Returns null on exhaustion; panics on an
+  # out-of-contract align or on a borrowed base that cannot honor it.
   # No individual free exists — the whole arena is reclaimed by
   # reset() or by Drop.
   def alloc(inout self: Self, size: UInt, align: UInt) -> Ptr[u8]
     if align == 0 || (align & (align - 1)) != 0 then
       panic("BumpArena::alloc: align must be a power of two")
     end
-    if align > 16 then
-      panic("BumpArena::alloc: align " + align.to_string() + " > 16 not supported - the backing buffer is 16-byte-aligned")
+    if align > self._max_align then
+      panic("BumpArena::alloc: align " + align.to_string() + " > this arena's max " + self._max_align.to_string() + " not supported (new() arenas serve aligns <= 16; construct with BumpArena::new_aligned(capacity, max_align) for aligns through " + policy_max_align().to_string() + ")")
     end
     if size == 0 then
       return Ptr::null()
@@ -253,13 +403,29 @@ impl BumpArena
     end
 
     let ptr = self._buffer.offset(aligned_offset as Int)
+    # Verify the returned address (only a borrowed base that the caller
+    # failed to align for this request can trip this — the owned bases
+    # are pre-aligned to the arena's max at construction).
+    if ((ptr as Int) & ((align as Int) - 1)) != 0 then
+      panic("BumpArena::alloc: the backing buffer is not aligned for align " + align.to_string() + " (with_buffer: supply a buffer aligned to every align you request — " + self._max_align.to_string() + " for the full contract)")
+    end
     self._offset = end_offset
     ptr
   end
 
+  # The Layout-honoring entry point (the audit's Layout { size, align }
+  # surface): serves the layout's size at the layout's align under the
+  # arena's contract — align must be a power of two within the arena's
+  # configured max. Bump allocations are not padded to the layout's
+  # stride; the requested size is served exactly.
+  def alloc_layout(inout self: Self, layout: Layout) -> Ptr[u8]
+    self.alloc(layout.size as UInt, layout.align as UInt)
+  end
+
   # Zero-overhead free-all: ONE store to the bump pointer. The buffer
   # contents are untouched, so a reset-then-realloc cycle returns the
-  # SAME addresses for the same sequence (deterministic bump).
+  # SAME addresses for the same sequence (deterministic bump —
+  # alignment included: the base shift is fixed at construction).
   def reset(inout self: Self) -> Unit
     self._offset = 0
   end
@@ -267,16 +433,22 @@ end
 
 impl Drop for BumpArena
   def drop(inout self: BumpArena) -> Unit
-    # Release the backing exactly once (owned arenas only) so a
-    # bit-copied arena cannot double-own (and double-free) the buffer;
-    # idempotent with the field nulling below.
-    if self._owns != 0 && !self._buffer.is_null() && self._capacity != 0 then
-      global_dealloc(self._buffer, self._capacity, 16)
+    # Release the backing exactly once (owned arenas only — the raw
+    # allocation base and its exact padded request). Field nulling
+    # keeps an early/manual release idempotent; the double-free
+    # defense is the type engine's non-Copy classification (a
+    # bit-copied second owner cannot be formed — see the DROP
+    # DISCIPLINE note in the module header).
+    if self._owns != 0 && !self._alloc.is_null() && self._raw_bytes != 0 then
+      global_dealloc(self._alloc, self._raw_bytes, 16)
     end
     self._buffer = Ptr::null()
+    self._alloc = Ptr::null()
     self._capacity = 0
+    self._raw_bytes = 0
     self._offset = 0
     self._owns = 0
+    self._max_align = 0
   end
 end
 
@@ -312,15 +484,25 @@ end
 # list is LIFO (release pushes onto the head), so a freshly released
 # slot is the next one acquire hands out — deterministic reuse.
 #
-# ALIGNMENT CONTRACT (inherited from std::alloc): the slot arena comes
-# from the global allocator (16-byte-aligned payload), so element types
-# with align_of <= 16 are served; an element alignment above 16 is an
-# EXPLICIT error at new() (the pool cannot honor over-aligned slots).
+# ALIGNMENT CONTRACT (typed slots keep their element alignment): the
+# slot arena comes from the global allocator (16-aligned payload) and
+# the pool pre-aligns its slot base up to the ELEMENT's alignment at
+# new() (headroom request, exactly like BumpArena::new_aligned), so
+# every power-of-two element alignment through the anchor
+# (policy_max_align() = 64) is served; an element alignment above the
+# anchor is an EXPLICIT error at new() (the pool cannot honor
+# over-aligned slots). Slot i lives at base + i * stride, where the
+# stride is size_of[T] ROUNDED UP to the element alignment — the ABI
+# does not guarantee size % align == 0 for every type (std::alloc's
+# layout_array rounds array strides for the same reason), and an
+# unrounded stride would misalign every slot after slot 0. The
+# metadata buffers (free-list + occupancy words) are 16-aligned.
 
 struct SlabPool[T]
-  _slots: Ptr[u8]      # the element arena: capacity * stride bytes
-  _stride: UInt        # element stride in bytes (size_of[T])
-  _slots_bytes: UInt   # capacity * stride — the exact release size
+  _slots: Ptr[u8]       # the aligned element arena base (capacity * stride bytes)
+  _slots_alloc: Ptr[u8] # the raw slot-arena allocation base (the release target)
+  _stride: UInt         # element stride: size_of[T] rounded up to align_of[T]
+  _slots_bytes: UInt   # the exact slot-arena request (stride * capacity + headroom)
   _free_next: Ptr[u8]  # free-list metadata: capacity UInt words (next[i])
   _live: Ptr[u8]       # occupancy metadata: capacity UInt words (0/1)
   _meta_bytes: UInt    # capacity * word — the exact release size
@@ -339,6 +521,7 @@ impl[T] SlabPool[T]
     if capacity == 0 then
       return SlabPool {
         _slots: Ptr::null(),
+        _slots_alloc: Ptr::null(),
         _stride: 0,
         _slots_bytes: 0,
         _free_next: Ptr::null(),
@@ -349,16 +532,23 @@ impl[T] SlabPool[T]
         _len: 0
       }
     end
-    let elem_stride = size_of[T]()
-    if elem_stride == 0 then
+    let elem_size = size_of[T]()
+    if elem_size == 0 then
       panic("SlabPool::new: zero-size element types are not supported")
     end
     let elem_align = align_of[T]()
     if elem_align == 0 || (elem_align & (elem_align - 1)) != 0 then
       panic("SlabPool::new: element alignment must be a power of two")
     end
-    if elem_align > 16 then
-      panic("SlabPool::new: element alignment " + elem_align.to_string() + " > 16 not supported - the backing buffer is 16-byte-aligned")
+    if elem_align > policy_max_align() then
+      panic("SlabPool::new: element alignment " + elem_align.to_string() + " > " + policy_max_align().to_string() + " not supported - slots are aligned through the 64-byte anchor (the widest vector alignment)")
+    end
+    # The element stride: size_of[T] rounded up to the element
+    # alignment, so EVERY slot address (not just slot 0) is aligned.
+    let stride_mask = elem_align - 1
+    let elem_stride = (elem_size + stride_mask) & ~stride_mask
+    if elem_stride < elem_size then
+      panic("SlabPool::new: element stride overflow")
     end
     let word = size_of[UInt]()
     let slots_bytes = elem_stride * capacity
@@ -369,11 +559,25 @@ impl[T] SlabPool[T]
     if meta_bytes / capacity != word then
       panic("SlabPool::new: metadata overflow")
     end
-    let slots = global_alloc(slots_bytes, 16)
+    # Slot-arena request with element-alignment headroom (a 16-aligned
+    # payload needs no shift for element aligns <= 16; aligning up to
+    # a 32/64 element alignment costs at most elem_align - 16 bytes).
+    let headroom = if elem_align > 16 then elem_align - 16 else 0 end
+    let slots_request = slots_bytes + headroom
+    let slots_alloc = global_alloc(slots_request, 16)
     let free_next = global_alloc(meta_bytes, 16)
     let live = global_alloc(meta_bytes, 16)
-    if (slots_bytes != 0 && slots.is_null()) || free_next.is_null() || live.is_null() then
+    if (slots_request != 0 && slots_alloc.is_null()) || free_next.is_null() || live.is_null() then
       panic("SlabPool::new: allocation failed - out of memory")
+    end
+    # Align the slot base up to the element alignment (fixed per pool —
+    # the release uses the raw base below).
+    mut slots = slots_alloc
+    if slots_request != 0 then
+      let mis = (slots_alloc as Int) & ((elem_align as Int) - 1)
+      if mis != 0 then
+        slots = (slots_alloc as Int + ((elem_align as Int) - mis)) as Ptr[u8]
+      end
     end
 
     # Wire the free list (next[i] = i + 1, the last slot links to the
@@ -389,8 +593,9 @@ impl[T] SlabPool[T]
 
     SlabPool {
       _slots: slots,
+      _slots_alloc: slots_alloc,
       _stride: elem_stride,
-      _slots_bytes: slots_bytes,
+      _slots_bytes: slots_request,
       _free_next: free_next,
       _live: live,
       _meta_bytes: meta_bytes,
@@ -514,9 +719,12 @@ impl[T] Drop for SlabPool[T]
     # Teardown: destruct every live occupant EXACTLY ONCE — the same
     # deterministic ascending scan as clear(), over the occupancy
     # flags (the drop authority) — then release the three init-time
-    # allocations and null every field, so a bit-copied pool cannot
-    # double-free (the std::alloc ArenaAllocator/PoolAllocator
-    # convention).
+    # allocations (the slot arena by its RAW base and exact padded
+    # request; the metadata buffers by their exact sizes) and null
+    # every field. Field nulling keeps an early/manual release
+    # idempotent; the double-free defense is the type engine's
+    # non-Copy classification (see the module header's DROP
+    # DISCIPLINE note).
     if !self._slots.is_null() && self._capacity != 0 then
       let word = size_of[UInt]() as Int
       mut i: UInt = 0
@@ -530,9 +738,10 @@ impl[T] Drop for SlabPool[T]
       end
       global_dealloc(self._free_next, self._meta_bytes, 16)
       global_dealloc(self._live, self._meta_bytes, 16)
-      global_dealloc(self._slots, self._slots_bytes, 16)
+      global_dealloc(self._slots_alloc, self._slots_bytes, 16)
     end
     self._slots = Ptr::null()
+    self._slots_alloc = Ptr::null()
     self._free_next = Ptr::null()
     self._live = Ptr::null()
     self._capacity = 0
@@ -544,6 +753,155 @@ impl[T] Drop for SlabPool[T]
 end
 
 # ═══════════════════════════════════════════════════════════════════════
+# ArenaVec[T] — the arena-backed fixed builder (the allocator-generic
+# collections row of the audit)
+# ═══════════════════════════════════════════════════════════════════════
+# The audit's minimum for the finance hot path is "Vec[T, A:
+# Allocator]/Map[K, V, H, A] OR an explicit builder so the hot path
+# establishes STATICALLY: general-heap calls = 0 after initialization".
+# A general allocator parameter on the growable containers is NOT
+# expressible in kernel std today (Vec is a compiler-registered shape
+# whose growth lowers to the __intrinsic_array_push intrinsic — the
+# runtime allocator — see FUTURE WORK below), so the kernel-expressible
+# alternative is the EXPLICIT BUILDER, implemented here.
+#
+# ArenaVec[T] is a Vec-like, fixed-capacity builder that OWNS a
+# BumpArena: construction performs the builder's ONE allocator call
+# (the arena backing); push bumps an element out of the arena, get
+# reads a slot by value, len/capacity/is_full are field reads, reset is
+# two stores — the general heap is never touched again (pinned by the
+# unit suite's outstanding-bytes test). Elements must be Copy
+# (`impl[T: Copy]` gates the whole surface): the arena reclaims raw
+# bytes and never destructs occupants, so owning elements have no home
+# here — their pool is SlabPool[T], which destructs them exactly once.
+# The capacity is fixed at construction; push on a full builder returns
+# the item unconsumed (Result::Err(item) — the sink-rejected-value
+# full policy of std::fixed/SlabPool).
+#
+# Ownership: ArenaVec declares NO registered Drop — the BumpArena field
+# is the owner and the engine's field-drop glue releases it exactly
+# once at ArenaVec's drop (the Slice-embeds-ArcStrong pattern of
+# std::collections). Because the field is a registered-Drop type, the
+# type-property engine classifies ArenaVec[T] non-Copy structurally
+# (same axis as BumpArena/SlabPool) — a bit-copy is a compile error.
+# reset() clears the builder logically (len 0 + arena bump reset); the
+# memory is reclaimed only at Drop. NOT thread-safe.
+
+struct ArenaVec[T]
+  _arena: BumpArena   # the owned backing arena (new() is the ONLY allocator call)
+  _stride: UInt       # element stride: size_of[T] rounded up to align_of[T]
+  _capacity: UInt     # element capacity (fixed at construction)
+  _len: UInt          # live element count (elements [0, _len) are occupied)
+end
+
+impl[T: Copy] ArenaVec[T]
+  # Creates a builder for `capacity` elements. The element alignment
+  # must be a power of two <= the module anchor (policy_max_align());
+  # the backing arena is pre-aligned to the element alignment when it
+  # exceeds 16, so every element lands aligned. Zero capacity creates
+  # an empty builder that rejects every push.
+  def new(capacity: UInt) -> ArenaVec[T]
+    let elem_size = size_of[T]()
+    if elem_size == 0 then
+      panic("ArenaVec::new: zero-size element types are not supported")
+    end
+    let elem_align = align_of[T]()
+    if elem_align == 0 || (elem_align & (elem_align - 1)) != 0 then
+      panic("ArenaVec::new: element alignment must be a power of two")
+    end
+    if elem_align > policy_max_align() then
+      panic("ArenaVec::new: element alignment " + elem_align.to_string() + " > " + policy_max_align().to_string() + " not supported - elements are aligned through the 64-byte anchor (the widest vector alignment)")
+    end
+    # Rounded element stride: size % align is not ABI-guaranteed, so
+    # the stride is size_of[T] rounded up — element i lives at
+    # base + i * stride and every element is aligned; the bump
+    # advances by exactly stride per push (no padding).
+    let stride_mask = elem_align - 1
+    let stride = (elem_size + stride_mask) & ~stride_mask
+    if stride < elem_size then
+      panic("ArenaVec::new: element stride overflow")
+    end
+    let bytes = stride * capacity
+    if capacity != 0 && bytes / capacity != stride then
+      panic("ArenaVec::new: backing overflow")
+    end
+    # Element aligns <= 16 ride the arena's 16-aligned base with zero
+    # headroom (BumpArena::new); 32/64-aligned elements need the
+    # pre-aligned base (BumpArena::new_aligned, which pads the request
+    # by the alignment headroom).
+    let backing = if elem_align <= 16 then
+      BumpArena::new(bytes)
+    else
+      BumpArena::new_aligned(bytes, elem_align)
+    end
+    ArenaVec {
+      _arena: backing,
+      _stride: stride,
+      _capacity: capacity,
+      _len: 0
+    }
+  end
+
+  def capacity(self: Self) -> UInt
+    self._capacity
+  end
+
+  def len(self: Self) -> UInt
+    self._len
+  end
+
+  def is_empty(self: Self) -> Bool
+    self._len == 0
+  end
+
+  def is_full(self: Self) -> Bool
+    self._len >= self._capacity
+  end
+
+  # Ownership-taking push (Vec::push shape): consumes the item into
+  # element [_len] of the arena. A full builder does NOT consume the
+  # item — it is returned to the caller as Err(item). The general heap
+  # is not involved: push bumps the arena (deterministic; the arena's
+  # exact capacity of capacity * stride bytes serves exactly
+  # `capacity` pushes).
+  def push(inout self: Self, sink item: T) -> Result[Unit, T]
+    if self._len >= self._capacity then
+      return Result::Err(item)
+    end
+    let slot = self._arena.alloc(self._stride, align_of[T]())
+    if slot.is_null() then
+      panic("ArenaVec::push: backing exhausted - the builder's capacity accounting is broken")
+    end
+    let element = (slot as Int) as Ptr[T]
+    element.write(item)
+    self._len = self._len + 1
+    Result::Ok(())
+  end
+
+  # By-value projected read of element `index` (Copy only — sound
+  # duplication: the element keeps its value). None for an
+  # out-of-range index. Allocation-free.
+  def get(self: Self, index: UInt) -> Option[T]
+    if index >= self._len then
+      return Option::None
+    end
+    let base = self._arena.buffer()
+    let element = (base as Int + (index as Int) * (self._stride as Int)) as Ptr[T]
+    Option::Some(element.read())
+  end
+
+  # Logical free-all (the arena's zero-overhead reset): ONE bump store
+  # plus the len store. The pushed elements become dead (len 0) — the
+  # bytes are not touched (no memset), so a reset-then-repush cycle
+  # writes the same element addresses. Elements are Copy: nothing to
+  # destruct.
+  def reset(inout self: Self) -> Unit
+    self._arena.reset()
+    self._len = 0
+  end
+end
+
+# ═══════════════════════════════════════════════════════════════════════
 # Usage notes
 # ═══════════════════════════════════════════════════════════════════════
 #
@@ -551,12 +909,20 @@ end
 #
 #   # Per-batch bump arena (the market-data-packet policy): the packet
 #   # decoder bumps its records out of one arena and free-alls at the
-#   # packet boundary — no per-record allocator traffic:
+#   # packet boundary — no per-record allocator traffic. Records whose
+#   # layout needs 32/64-byte alignment (SIMD batches) fund an aligned
+#   # arena once:
 #   var batch = std::alloc_policy::BumpArena::new(4096)
 #   let hdr = batch.alloc(64, 8)
 #   let body = batch.alloc(256, 16)
-#   # ... fill the packet from hdr/body ...
-#   batch.reset()   # one store reclaims the whole batch
+#   var simd_batch = std::alloc_policy::BumpArena::new_aligned(65536, 64)
+#   match std::alloc::layout_new(4096, 64)
+#   when Result::Ok(l) then let lanes = simd_batch.alloc_layout(l)
+#   when Result::Err(_) then ()
+#   end
+#   # ... fill the packet from hdr/body/lanes ...
+#   batch.reset()        # one store reclaims the whole batch
+#   simd_batch.reset()
 #
 #   # The per-symbol slab (orders/state records; preallocated once):
 #   var pool = std::alloc_policy::SlabPool[Int].new(1024)
@@ -579,6 +945,21 @@ end
 #   end
 #   # ... the matching loop pops ring / releases fund indices only ...
 #
+#   # The arena-backed builder (the finance hot path's static
+#   # no-heap-after-init row): the order book's bounded staging is
+#   # filled ONCE from the arena and the matching cycle only pushes/
+#   # gets/resets — zero general-heap calls after construction:
+#   var book = std::alloc_policy::ArenaVec[Int].new(4096)
+#   match book.push(100)     # the pre-init fill happens OUTSIDE the cycle
+#   when Result::Ok(_) then ()
+#   when Result::Err(item) then ()   # book full: the item returns
+#   end
+#   match book.get(0)
+#   when Option::Some(v) then ()
+#   when Option::None then ()
+#   end
+#   book.reset()   # free-all for the next cycle (one bump store)
+#
 #   # Embedded/static (policy: None): the arena borrows a static buffer
 #   # and the containers are std::fixed's inline forms — no heap at all.
 #
@@ -586,8 +967,13 @@ end
 #   - A general allocator parameter on the growable containers
 #     (Vec[T, A], Map[K, V, H, A]) needs kernel work: Vec growth lowers
 #     to the __intrinsic_array_push intrinsic (the runtime allocator),
-#     so an arena-provided Vec is not expressible from std today.
-#     Bounded hot paths use this module's policy forms instead.
+#     so an allocator-parameterized Vec is not expressible from std
+#     today (generic bounds ARE expressible — Map[K: Hash + Eq, V],
+#     impl[T: Copy], the const-generic ArrayVec of std::embedded — but
+#     the REGISTERED container shape itself is fixed-arity). The
+#     kernel-expressible row of the audit is ArenaVec[T], the explicit
+#     arena-backed builder above; bounded hot paths choose ArenaVec /
+#     SlabPool / BumpArena instead of the growable containers.
 #   - Const-generic capacity (ArrayVecN-style forms spelled
 #     ArrayVec[T, N]) is likewise kernel type-system work — see the
 #     std::fixed header's compile-time-capacity decision.

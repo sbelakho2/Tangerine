@@ -693,6 +693,7 @@ let lowering_env_of ?(items : Ast.item list = []) (env : Typecheck.env) : Mir_lo
     fn_ret = Type_repr.Unit;
     struct_fields = struct_fields_of ~items env;
     enum_payloads = enum_payloads_of env;
+    lang_items = Lang_items.of_types env.Typecheck.types;
     copy_cache = Type_properties.create_cache ();
   }
 
@@ -1007,6 +1008,7 @@ let lower_and_report (path : string) (env : Typecheck.env) (program : Ast.progra
   match
          Mir_verify.require_valid_template ~generic_types:(closure_generic_types env)
                ~box_tid:(env.Typecheck.state.box_tid)
+                    ~lang_items:(Lang_items.of_types env.Typecheck.types)
            ~query_sigs:(closure_query_sigs ~lowered:(Some prog) env) prog
        with
   | Error errs ->
@@ -1023,7 +1025,7 @@ let lower_and_report (path : string) (env : Typecheck.env) (program : Ast.progra
       | None -> 0
       | Some main ->
           let host = Host.create ~repo_root:"." ~argv:[||] in
-          (match Vm.run ~program:prog ~entry:main.Seed_mir.instance ~argv:[||] ~host with
+          (match Vm.run_li ~lang_items:(Lang_items.of_types env.Typecheck.types) ~program:prog ~entry:main.Seed_mir.instance ~argv:[||] ~host with
            | Ok _ -> Printf.printf "// VM: exit 0\n"; 0
            | Error e -> Printf.printf "// VM: %s\n" e.Vm.message; 1))
 
@@ -1137,6 +1139,7 @@ let cmd_interpret (args : string list) : int =
               (match
                  Mir_verify.require_valid_template
                      ~box_tid:(env.Typecheck.state.box_tid)
+                    ~lang_items:(Lang_items.of_types env.Typecheck.types)
                      ~generic_types:(closure_generic_types env)
                      ~query_sigs:(closure_query_sigs env)
                      prog
@@ -1151,7 +1154,7 @@ let cmd_interpret (args : string list) : int =
                    with
                    | None -> die "no `main` function to interpret"
                    | Some main -> (
-                       match Vm.entry_frame_of ~program:prog ~entry:main.Seed_mir.instance ~argv:[||] with
+                       match Vm.entry_frame_of_li ~lang_items:(Lang_items.of_types env.Typecheck.types) ~program:prog ~entry:main.Seed_mir.instance ~argv:[||] with
                        | Error m -> die "interpret: %s" m
                        | Ok (vm, entry_frame) -> (
                            match Vm.run_inspect vm entry_frame with
@@ -3966,6 +3969,7 @@ let assert_no_bodyless_user_calls (prog : Seed_mir.program) : string list =
 let run_mono_phase ~(entry_name : string) ~(entry : Instance_id.t)
     ?(generic_types : Mono.generic_def array = [||])
     ?(box_tid : Ids.Type_id.t option = None)
+    ?(lang_items : Lang_items.t = Lang_items.seed_defaults)
     ?(query_sigs : Mir_verify.query_sig list = [])
     (prog : Seed_mir.program) : (mono_outcome, string list) result =
   Printf.printf "  mono: entry '%s' (%s)\n" entry_name (Seed_mir.print_instance entry);
@@ -4066,7 +4070,7 @@ let run_mono_phase ~(entry_name : string) ~(entry : Instance_id.t)
                     mat_map
             in
             (match
-               Mir_verify.require_valid_concrete ~box_tid ~box_instances
+               Mir_verify.require_valid_concrete ~box_tid ~box_instances ~lang_items
                  ~post_rewrite:(rewrite_ty canonical) ~query_sigs final_prog
              with
             | Error errs ->
@@ -4602,6 +4606,7 @@ let run_bootstrap_closure ~(repo_root : string) ~(manifest_path : string)
           match
             Mir_verify.require_valid_template
                 ~box_tid:(ctx.ctx_env.Typecheck.state.box_tid)
+                          ~lang_items:(Lang_items.of_types ctx.ctx_env.Typecheck.types)
                 ~generic_types:(closure_generic_types ctx.ctx_env)
                 ~query_sigs:(closure_query_sigs ~lowered:(Some prog) ctx.ctx_env)
                 prog
@@ -4633,6 +4638,7 @@ let run_bootstrap_closure ~(repo_root : string) ~(manifest_path : string)
             match
               run_mono_phase ~entry_name ~entry:entry_id
                 ~box_tid:(ctx.ctx_env.Typecheck.state.box_tid)
+                          ~lang_items:(Lang_items.of_types ctx.ctx_env.Typecheck.types)
                 ~generic_types:(closure_generic_types ctx.ctx_env)
                 ~query_sigs:(closure_query_sigs ~lowered:(Some prog) ctx.ctx_env)
                 prog
@@ -4684,7 +4690,7 @@ let run_bootstrap_closure ~(repo_root : string) ~(manifest_path : string)
                           bs_oracle_incomplete = oracle_incomplete;
                         }
                   | Ok report -> (
-                      match Vm.run ~program:mo.mo_program ~entry:mo.mo_entry ~argv ~host with
+                      match Vm.run_li ~lang_items:(Lang_items.of_types ctx.ctx_env.Typecheck.types) ~program:mo.mo_program ~entry:mo.mo_entry ~argv ~host with
                       | Error _ ->
                           Ok
                             {
@@ -4776,6 +4782,7 @@ let cmd_bootstrap_check (args : string list) : int =
          (match
             Mir_verify.require_valid_template
                 ~box_tid:(ctx.ctx_env.Typecheck.state.box_tid)
+                          ~lang_items:(Lang_items.of_types ctx.ctx_env.Typecheck.types)
                 ~generic_types:(closure_generic_types ctx.ctx_env)
                 ~query_sigs:(closure_query_sigs ~lowered:(Some prog) ctx.ctx_env)
                 prog
@@ -4932,6 +4939,7 @@ let cmd_bootstrap_check (args : string list) : int =
                    match
                      run_mono_phase ~entry_name ~entry
                        ~box_tid:(ctx.ctx_env.Typecheck.state.box_tid)
+                          ~lang_items:(Lang_items.of_types ctx.ctx_env.Typecheck.types)
                        ~generic_types:(closure_generic_types ctx.ctx_env)
                        ~query_sigs:mono_query_sigs
                        prog
@@ -4951,6 +4959,7 @@ let cmd_bootstrap_check (args : string list) : int =
                          match
                            Mir_verify.require_valid_concrete
                              ~box_tid:(ctx.ctx_env.Typecheck.state.box_tid)
+                          ~lang_items:(Lang_items.of_types ctx.ctx_env.Typecheck.types)
                              ~query_sigs:mo.mo_query_sigs
                              ~post_rewrite:mo.mo_post_rewrite
                              ~box_instances:mo.mo_box_instances
@@ -5012,7 +5021,8 @@ let cmd_bootstrap_check (args : string list) : int =
                                 (List.length reachable) report.Host.declared report.Host.implemented;
                               Printf.printf "  BOOTSTRAP_EXECUTABLE_CLOSURE = PASS\n";
                               (match
-                                 Vm.run ~program:mo.mo_program ~entry:mo.mo_entry ~argv ~host
+                                 Vm.run_li ~lang_items:(Lang_items.of_types ctx.ctx_env.Typecheck.types)
+                                   ~program:mo.mo_program ~entry:mo.mo_entry ~argv ~host
                                with
                                | Error e ->
                                    let out = Host.stdout_contents host in
@@ -5105,6 +5115,7 @@ let cmd_compile (args : string list) : int =
          (match
             Mir_verify.require_valid_template
                 ~box_tid:(ctx.ctx_env.Typecheck.state.box_tid)
+                          ~lang_items:(Lang_items.of_types ctx.ctx_env.Typecheck.types)
                 ~generic_types:(closure_generic_types ctx.ctx_env)
                 ~query_sigs:(closure_query_sigs ~lowered:(Some prog) ctx.ctx_env)
                 prog
@@ -5123,6 +5134,7 @@ let cmd_compile (args : string list) : int =
                   match
                     run_mono_phase ~entry_name ~entry
                       ~box_tid:(ctx.ctx_env.Typecheck.state.box_tid)
+                          ~lang_items:(Lang_items.of_types ctx.ctx_env.Typecheck.types)
                       ~generic_types:(closure_generic_types ctx.ctx_env)
                       ~query_sigs:(closure_query_sigs ~lowered:(Some prog) ctx.ctx_env)
                       prog
@@ -5155,7 +5167,7 @@ let cmd_compile (args : string list) : int =
                         let argv = Array.of_list ("tg-bootstrap" :: kernel_args) in
                         Printf.printf "  compile: kernel argv: %s\n" (String.concat " " (Array.to_list argv));
                         let host = Host.create ~repo_root:opts.repo_root ~argv in
-                        (match Vm.run ~program:mo.mo_program ~entry:mo.mo_entry ~argv ~host with
+                        (match Vm.run_li ~lang_items:(Lang_items.of_types ctx.ctx_env.Typecheck.types) ~program:mo.mo_program ~entry:mo.mo_entry ~argv ~host with
                          | Error e ->
                              Printf.printf "compile: VM bootstrap run TRAPPED: %s\n" e.Vm.message;
                              let out = Host.stdout_contents host in

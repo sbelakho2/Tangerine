@@ -16,7 +16,11 @@
            signature: fn(T,T)->T vs fn(A,B)->A FAILS; fn(T,U)->T vs
            fn(A,A)->A FAILS; a consistent rename PASSES.
    P0-4  — conventions are part of identity: [let Set[T]] Bool vs
-           [inout Set[T]] Bool FAILS. *)
+            [inout Set[T]] Bool FAILS.  The convention check is
+            UNCONDITIONAL — it also runs on the strict_when (ref-kind)
+            escape, which makes only the TYPE comparison strict:
+            [let &mut Int] vs [inout &mut Int] FAILS there too, and the
+            boolean matcher always agrees with first_mismatch. *)
 
 let fail fmt = Printf.ksprintf (fun s -> Printf.printf "FAIL: %s\n" s; exit 1) fmt
 let pass (label : string) = Printf.printf "PASS: %s\n" label
@@ -77,6 +81,67 @@ let canonical =
 let reg_vs_checker (reg : Signature_identity.signature) (chk : Signature_identity.signature) :
     bool =
   Signature_identity.signatures_match ~canon_left:canonical reg chk
+
+(* ── the strict_when (ref-kind) escape, mirroring typecheck.ml's
+      registry-exact gate predicate: a pair is strict when either side
+      carries a ref kind, and the strict comparison is the plain
+      structural Type_repr.compare ────────────────────────────────── *)
+let rec ty_has_ref_kind (t : Type_repr.t) : bool =
+  match t with
+  | Type_repr.Ref_internal _ | Type_repr.Raw_ptr _ -> true
+  | Type_repr.Named (_, args) -> Array.exists ty_has_ref_kind args
+  | Type_repr.Fixed_array (e, _) -> ty_has_ref_kind e
+  | Type_repr.Tuple elems -> Array.exists ty_has_ref_kind elems
+  | Type_repr.Function (p, r) ->
+      Array.exists
+        (fun (p : Type_repr.param_type) -> ty_has_ref_kind p.Type_repr.pt_type)
+        p
+      || ty_has_ref_kind r
+  | _ -> false
+
+let strict_ref_pair (a : Type_repr.t) (b : Type_repr.t) : bool =
+  ty_has_ref_kind a || ty_has_ref_kind b
+
+let strict_match (a : Signature_identity.signature) (b : Signature_identity.signature) : bool =
+  Signature_identity.signatures_match ~strict_when:strict_ref_pair a b
+
+let strict_mismatch (a : Signature_identity.signature)
+    (b : Signature_identity.signature) : Signature_identity.mismatch option =
+  Signature_identity.first_mismatch ~strict_when:strict_ref_pair a b
+
+let mismatch_to_string = function
+  | Signature_identity.Mismatch_arity (d, o) -> Printf.sprintf "arity %d vs %d" d o
+  | Signature_identity.Mismatch_param i -> Printf.sprintf "param %d" i
+  | Signature_identity.Mismatch_return -> "return"
+
+(* strict-path expectations that also pin the boolean-matcher ↔
+   first_mismatch agreement: the matcher accepts iff the report finds
+   nothing, under the SAME strict_when *)
+let expect_strict_true (label : string) (a : Signature_identity.signature)
+    (b : Signature_identity.signature) : unit =
+  if not (strict_match a b) then
+    fail "%s: the strict matcher REJECTED two signatures that must match (%s vs %s)" label
+      (Signature_identity.to_string a) (Signature_identity.to_string b)
+  else
+    match strict_mismatch a b with
+    | None -> pass label
+    | Some m ->
+        fail "%s: first_mismatch reported %s on a matching pair (%s vs %s)" label
+          (mismatch_to_string m) (Signature_identity.to_string a)
+          (Signature_identity.to_string b)
+
+let expect_strict_false (label : string) (a : Signature_identity.signature)
+    (b : Signature_identity.signature) : unit =
+  if strict_match a b then
+    fail "%s: the strict matcher ACCEPTED two signatures that must differ (%s vs %s)" label
+      (Signature_identity.to_string a) (Signature_identity.to_string b)
+  else
+    match strict_mismatch a b with
+    | Some _ -> pass label
+    | None ->
+        fail
+          "%s: first_mismatch found no disagreement while the matcher rejected (%s vs %s)"
+          label (Signature_identity.to_string a) (Signature_identity.to_string b)
 
 (* ── P0-1: exact TypeId equality ─────────────────────────────────── *)
 
@@ -276,10 +341,123 @@ let check_p04 () =
   let ret_unit = letsig [ Type_repr.Bool ] Type_repr.Unit in
   expect_false "P0-4: return disagreement must NOT match" ret_bool ret_unit
 
+(* ── P0-4 strict path: the convention is compared FIRST and
+      unconditionally — strict_when escapes only the TYPE comparison,
+      so a convention drift on a ref-bearing parameter is never
+      accepted (the P0-1 audit regression: match_signature's strict
+      branch previously bypassed the convention check that
+      first_mismatch performed) ───────────────────────────────────── *)
+
+let check_p04_strict () =
+  let ref_mut_int =
+    Type_repr.Ref_internal (Type_repr.Mutable, Type_repr.Int Type_repr.Int)
+  in
+  let ref_sig (c : Access_effect.t) : Signature_identity.signature =
+    convsig [ (c, ref_mut_int) ] Type_repr.Bool
+  in
+  expect_strict_false "P0-4 strict ref: [let &mut Int] vs [inout &mut Int] must NOT match"
+    (ref_sig Access_effect.Let) (ref_sig Access_effect.Inout);
+  expect_strict_false "P0-4 strict ref: [sink &mut Int] vs [let &mut Int] must NOT match"
+    (ref_sig Access_effect.Sink) (ref_sig Access_effect.Let);
+  expect_strict_true
+    "P0-4 strict ref: [inout &mut Int] vs [inout &mut Int] matches (identical convention \
+     and ref type)"
+    (ref_sig Access_effect.Inout) (ref_sig Access_effect.Inout);
+  (* with the convention fixed, the strict TYPE comparison still runs: a
+     mutability drift on the ref itself must fail *)
+  expect_strict_false "P0-4 strict ref: [let &mut Int] vs [let &Int] must NOT match"
+    (ref_sig Access_effect.Let)
+    (convsig
+       [
+         ( Access_effect.Let,
+           Type_repr.Ref_internal (Type_repr.Immutable, Type_repr.Int Type_repr.Int) );
+       ]
+       Type_repr.Bool)
+
+(* ── the convention-identity property: for every ordered pair of
+      conventions (let/inout/sink/set) on the SAME type the matcher
+      accepts iff the conventions are equal — under the ordinary path,
+      the generic (binder) path and the strict ref path — and
+      match_signature always agrees with first_mismatch ───────────── *)
+
+let all_conventions = [ Access_effect.Let; Access_effect.Inout; Access_effect.Sink; Access_effect.Set ]
+
+let check_convention_identity (label : string)
+    (mk_left : Access_effect.t -> Signature_identity.signature)
+    (mk_right : Access_effect.t -> Signature_identity.signature)
+    (match_pair : Signature_identity.signature -> Signature_identity.signature -> bool)
+    (mismatch_pair :
+      Signature_identity.signature -> Signature_identity.signature ->
+      Signature_identity.mismatch option) : unit =
+  List.iter
+    (fun c1 ->
+      List.iter
+        (fun c2 ->
+          let a = mk_left c1 and b = mk_right c2 in
+          let expected = Access_effect.compare c1 c2 = 0 in
+          let matched = match_pair a b in
+          let reported = mismatch_pair a b in
+          let agrees =
+            match matched, reported with
+            | true, None -> true
+            | false, Some _ -> true
+            | true, Some _ | false, None -> false
+          in
+          if matched <> expected || not agrees then
+            fail
+              "%s: conventions %s vs %s must %s (matcher said %b, first_mismatch said %s; \
+               %s vs %s)"
+              label (Access_effect.to_string c1) (Access_effect.to_string c2)
+              (if expected then "match" else "not match")
+              matched
+              (match reported with
+              | None -> "no disagreement"
+              | Some m -> mismatch_to_string m)
+              (Signature_identity.to_string a) (Signature_identity.to_string b))
+        all_conventions)
+    all_conventions;
+  pass label
+
+let check_convention_property () =
+  let plain_match (a : Signature_identity.signature) (b : Signature_identity.signature) : bool =
+    Signature_identity.signatures_match a b
+  in
+  let plain_mismatch (a : Signature_identity.signature)
+      (b : Signature_identity.signature) : Signature_identity.mismatch option =
+    Signature_identity.first_mismatch a b
+  in
+  (* ordinary: a concrete non-ref parameter type *)
+  let ordinary (c : Access_effect.t) : Signature_identity.signature =
+    convsig [ (c, Type_repr.Int Type_repr.Int) ] Type_repr.Bool
+  in
+  check_convention_identity "P0-4 property: ordinary [Int] params match iff the conventions agree"
+    ordinary ordinary plain_match plain_mismatch;
+  (* generic: a binder parameter, alpha-renamed across the two sides *)
+  let generic_left (c : Access_effect.t) : Signature_identity.signature =
+    convsig [ (c, gp 0) ] Type_repr.Bool
+  in
+  let generic_right (c : Access_effect.t) : Signature_identity.signature =
+    convsig [ (c, gp 7) ] Type_repr.Bool
+  in
+  check_convention_identity "P0-4 property: generic [T] params match iff the conventions agree"
+    generic_left generic_right plain_match plain_mismatch;
+  (* strict ref: a Ref_internal parameter under the ref-kind strict_when
+     (the driver's registry-exact gate predicate) *)
+  let ref_int (c : Access_effect.t) : Signature_identity.signature =
+    convsig
+      [ (c, Type_repr.Ref_internal (Type_repr.Mutable, Type_repr.Int Type_repr.Int)) ]
+      Type_repr.Bool
+  in
+  check_convention_identity
+    "P0-4 property: strict [&mut Int] params match iff the conventions agree"
+    ref_int ref_int strict_match strict_mismatch
+
 let () =
   Printf.printf "signature identity self-check (P0-1..P0-4)\n";
   check_p01 ();
   check_p02 ();
   check_p04 ();
+  check_p04_strict ();
+  check_convention_property ();
   Printf.printf "OK: signature identity self-check passed\n";
   exit 0

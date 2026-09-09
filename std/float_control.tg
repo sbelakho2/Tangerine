@@ -13,6 +13,34 @@
 ##   - Compile-time and runtime mode selection
 ##
 ## Spec: §stdlib.float_control
+##
+## §25 (strict-FP audit) — THE FP ENVIRONMENT IS A HARDWARE EFFECT:
+##
+##   The ordinary language semantics never depend on the ambient
+##   rounding/flush state: the compiler emits the strict environment
+##   (round-to-nearest-even, flush-to-zero OFF) at the ENTRY of every
+##   Tangerine function that performs float math (AArch64: msr fpcr,
+##   xzr; x86-64: ldmxcsr with 0x1F80 — see tg_compiler/types.tg, the
+##   canonical FP spec, and tg_compiler/codegen.tg's prologue). The
+##   runtime mutators below (set_rounding_mode / set_denormal_mode and
+##   their guards) therefore write the raw FPCR/MXCSR control state —
+##   an UNSAFE, machine-global, per-thread hardware effect, NOT a
+##   language-mode switch:
+##     - it applies only to code between the mutation and the next
+##       entry of any float-using Tangerine function (which
+##       re-establishes the strict environment), i.e. inline-asm
+##       regions and EXTERNAL (FFI/C) code;
+##     - it must be RESTORED around external code — use the RAII
+##       RoundingModeGuard / DenormalModeGuard (or save the previous
+##       mode and restore it) exactly as you would fesetround(3);
+##     - ordinary `+ - * /` and casts of Tangerine programs are ALWAYS
+##       round-to-nearest-even with subnormals preserved — a mutation
+##       can never change a strict function's language-defined results
+##       (this is pinned by the §8 tests below).
+##
+##   There is no language construct that makes an ordinary float
+##   operation round with a non-RNE mode; the explicit
+##   RoundingMode/DenormalMode values are for FFI call-outs only.
 
 module std::float_control
 
@@ -528,6 +556,17 @@ end
 # §8  Tests
 # ═══════════════════════════════════════════════════════════════════════
 
+# §25 audit helpers: STRICT Tangerine float functions. Their prologues
+# establish the strict FP environment (RNE, no FTZ), so their results are
+# language-defined even when the host process's FPCR/MXCSR was mutated.
+def _strict_rne_add(x: Float, y: Float) -> Float
+  x + y
+end
+
+def _strict_subnormal_mul(x: Float) -> Float
+  x * 2.0
+end
+
 @test
 def test_rounding_mode_guard() -> Unit
   let original = get_rounding_mode()
@@ -537,6 +576,55 @@ def test_rounding_mode_guard() -> Unit
   }
   ## Guard dropped, mode should be restored
   assert get_rounding_mode() == original
+end
+
+@test
+def test_strict_rne_survives_host_rounding_mutation() -> Unit
+  # §25: a host FPCR/MXCSR rounding-mode mutation must NOT change the
+  # result of a strict Tangerine float function — the function's entry
+  # re-establishes round-to-nearest-even. (The float locals below make
+  # this test function itself float-using, so its own prologue pins the
+  # starting environment to RNE regardless of earlier tests.)
+  let x = 0.1
+  let y = 0.2
+  {
+    let _guard = RoundingModeGuard.new(RoundingMode.TowardZero)
+    # the mutation is live at the host level before the strict call
+    assert get_rounding_mode() == RoundingMode.TowardZero
+    # 0.1 + 0.2: the exact sum lies between two doubles; RNE rounds it
+    # UP to 0.30000000000000004 while round-toward-zero would give
+    # 0.29999999999999993 — the strict function must return the RNE
+    # value.
+    let sum = _strict_rne_add(x, y)
+    assert sum == 0.30000000000000004
+    # the strict entry establishment is observable on the host env: the
+    # callee's prologue wrote RNE, so the mutation no longer applies
+    assert get_rounding_mode() == RoundingMode.NearestEven
+  }
+  # the guard restored the original (RNE) mode on drop
+  assert get_rounding_mode() == RoundingMode.NearestEven
+end
+
+@test
+def test_strict_no_ftz_survives_host_flush_mutation() -> Unit
+  # §25: host flush-to-zero must not leak into strict Tangerine float
+  # code — subnormal results stay subnormal (the function entry clears
+  # FPCR FZ / MXCSR FTZ+DAZ).
+  let tiny = 1e-308
+  assert tiny != 0.0
+  {
+    let _guard = DenormalModeGuard.new(DenormalMode.FlushToZero)
+    assert get_denormal_mode() == DenormalMode.FlushToZero
+    let doubled = _strict_subnormal_mul(tiny)
+    # under FTZ the product would be flushed to 0.0; the strict
+    # function must preserve the subnormal product
+    assert doubled != 0.0
+    assert doubled > tiny
+    # the callee's entry establishment cleared FTZ on the host env
+    assert get_denormal_mode() == DenormalMode.Preserve
+  }
+  # the guard restored the original (Preserve) mode on drop
+  assert get_denormal_mode() == DenormalMode.Preserve
 end
 
 @test

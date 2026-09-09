@@ -1582,15 +1582,37 @@ def parse_generic_params(inout p: TgcParser) -> Vec[GenericParam]
   if at(p, TokenKind::LBracket) then
     advance(p)
     if !at(p, TokenKind::RBracket) then
+      # (§20 const generics, slice 1 ordering rule): const params may appear
+      # only AFTER every type parameter of the declaration (`[T, U, const N:
+      # UInt]`, never `[const N: UInt, T]`). The flat positional-arg model
+      # (const positions carry integer constants positionally) is
+      # order-agnostic, but the ordering rule keeps every kind-blind channel
+      # (impl-derived self args, bound registration, fresh-arg creation)
+      # coherent: the leading prefix of every generic-parameter vector is
+      # exactly its type parameters.
+      var saw_const_param = false
       match parse_single_generic_param(p)
-      when Option::Some(param) then params.push(param)
+      when Option::Some(param) then
+        match param.kind
+        when GenericParamKind::ConstParam(_) then saw_const_param = true
+        when GenericParamKind::TypeParam then ()
+        end
+        params.push(param)
       when Option::None then ()
       end
       
       while at(p, TokenKind::Comma) do
         advance(p)
         match parse_single_generic_param(p)
-        when Option::Some(param) then params.push(param)
+        when Option::Some(param) then
+          match param.kind
+          when GenericParamKind::TypeParam then
+            if saw_const_param then
+              diag_error(&mut p.diag, ErrorCode::E100UnexpectedToken, "type parameter `" + param.name + "` must not follow a const generic parameter (`const` parameters come after every type parameter of the declaration)", param.span)
+            end
+          when GenericParamKind::ConstParam(_) then saw_const_param = true
+          end
+          params.push(param)
         when Option::None then break
         end
       end
@@ -1607,7 +1629,60 @@ def parse_generic_params(inout p: TgcParser) -> Vec[GenericParam]
   params
 end
 
+# Whether the declared type annotation of a const generic parameter is one of
+# the supported scalar integer types (§20 slice 1: UInt/Int/USize + the sized
+# u8..u64/i8..i64 — the u128/i128 forms are excluded; range checking of const
+# ARGUMENTS against these types is slice 2, canonical folding in slice 2).
+def const_generic_param_type_ok(ty: TypeExpr) -> Bool
+  match ty.kind
+  when TypeExprKind::Named(name, args) then
+    if args.len() == 0 then
+      name == "UInt" || name == "Int" || name == "USize" ||
+        name == "u8" || name == "u16" || name == "u32" || name == "u64" ||
+        name == "i8" || name == "i16" || name == "i32" || name == "i64"
+    else
+      false
+    end
+  when _ then false
+  end
+end
+
 def parse_single_generic_param(inout p: TgcParser) -> Option[GenericParam]
+  # (§20 const generics, slice 1): `const NAME: SCALAR_TYPE` — a compile-time
+  # VALUE (const) generic parameter. The declared type is restricted to the
+  # scalar integer types (const_generic_param_type_ok); trait bounds and
+  # defaults on const params are rejected for now (the syntax
+  # `const N: UInt: Bound` cannot parse — the annotation is consumed as the
+  # type and the stray `:` reports at the enclosing `]`; the where-clause
+  # referencing a const param name is rejected in parse_where_clause).
+  if at(p, TokenKind::Const) then
+    let start = peek_span(p)
+    advance(p)
+    match expect_ident(p)
+    when Option::Some(name) then
+      if at(p, TokenKind::Colon) then
+        advance(p)
+        match parse_type(p)
+        when Option::Some(ty) then
+          if !const_generic_param_type_ok(ty) then
+            diag_error(&mut p.diag, ErrorCode::E100UnexpectedToken, "const generic parameter `" + name + "` must declare a scalar integer type (UInt, Int, USize, u8..u64, i8..i64)", ty.span)
+          end
+          return Option::Some(GenericParam {
+            name: name,
+            kind: GenericParamKind::ConstParam(ty),
+            bounds: Vec::new(),
+            default: Option::None,
+            span: span_merge(start, peek_span(p))
+          })
+        when Option::None then return Option::None
+        end
+      else
+        diag_error(&mut p.diag, ErrorCode::E100UnexpectedToken, "expected `:` and a scalar integer type after the const generic parameter name (`const NAME: UInt`)", peek_span(p))
+        return Option::None
+      end
+    when Option::None then return Option::None
+    end
+  end
   match expect_ident(p)
   when Option::Some(name) then
     mut bounds = Vec::new()
@@ -1654,10 +1729,18 @@ def parse_where_clause(inout p: TgcParser, inout params: Vec[GenericParam]) -> U
         mut found = false
         for param in params do
           if param.name == type_name then
-            # Shared iteration is projected: clone each bound into the
-            # param (consuming iteration is not supported yet).
-            for b in bounds do
-              param.bounds.push(b.clone())
+            # (§20 const generics, slice 1): const generic parameters carry no
+            # trait bounds — a where-clause naming one is rejected (bounds on
+            # const params are a slice-2+ surface).
+            match param.kind
+            when GenericParamKind::ConstParam(_) then
+              diag_error(&mut p.diag, ErrorCode::E100UnexpectedToken, "const generic parameter `" + type_name + "` cannot have trait bounds", peek_span(p))
+            when GenericParamKind::TypeParam then
+              # Shared iteration is projected: clone each bound into the
+              # param (consuming iteration is not supported yet).
+              for b in bounds do
+                param.bounds.push(b.clone())
+              end
             end
             found = true
           end
@@ -3177,17 +3260,58 @@ end
 # Types
 # ———————————————————————————————————————————————————————————————
 
+# (§20 const generics, slice 1): parse ONE element of a generic argument
+# list. Ordinary type expressions parse as before; additionally a CONST
+# ARGUMENT — a signed integer literal (`ArrayVec[U8, 16]`, `Trie[I8, -1]`,
+# a method turbofish `wrap::[U8, 4]`) — is accepted and represented
+# SYNTACTICALLY as TypeExprKind::ConstArg (the resolved host value), so the
+# type checker decides (Type::Const; range checking against the const
+# parameter's declared scalar type and const-NAME arguments are slice 2).
+# The literal must fit the host Int (fail-closed: an out-of-range literal is
+# a parse diagnostic, never a wrapped value).
+def parse_type_arg(inout p: TgcParser) -> Option[TypeExpr]
+  match peek(p)
+  when TokenKind::IntLit(n) then
+    let start = peek_span(p)
+    if !parsed_int_fits_host(n) then
+      diag_error(&mut p.diag, ErrorCode::E100UnexpectedToken, "const generic argument literal is out of range (must fit the host Int)", start)
+    end
+    advance(p)
+    return Option::Some(make_type_expr(TypeExprKind::ConstArg(parsed_int_to_host(n)), span_merge(start, peek_span(p))))
+  when TokenKind::Minus then
+    if lookahead_kind(p, 1) is TokenKind::IntLit(_) then
+      let start = peek_span(p)
+      advance(p)
+      match peek(p)
+      when TokenKind::IntLit(n) then
+        if !parsed_int_fits_host(n) then
+          diag_error(&mut p.diag, ErrorCode::E100UnexpectedToken, "const generic argument literal is out of range (must fit the host Int)", start)
+        end
+        advance(p)
+        return Option::Some(make_type_expr(TypeExprKind::ConstArg(0 - parsed_int_to_host(n)), span_merge(start, peek_span(p))))
+      when _ then return Option::None
+      end
+    end
+    # A bare `-` in an argument list is not a const argument: fall through to
+    # the ordinary type parse, which reports the expected-type diagnostic.
+    parse_type(p)
+  when _ then parse_type(p)
+  end
+end
+
 # Parse a comma-separated list of type expressions: T, U, V
 # Used for method call type arguments: expr.method[T, U](args)
+# (§20 slice 1: elements may also be const-generic arguments — signed
+# integer literals — via parse_type_arg.)
 def parse_type_arg_list(inout p: TgcParser) -> Vec[TypeExpr]
   mut types = Vec::new()
-  match parse_type(p)
+  match parse_type_arg(p)
   when Option::Some(ty) then types.push(ty)
   when Option::None then ()
   end
   while at(p, TokenKind::Comma) do
     advance(p)
-    match parse_type(p)
+    match parse_type_arg(p)
     when Option::Some(ty) then types.push(ty)
     when Option::None then break
     end
@@ -3532,13 +3656,15 @@ def parse_type(inout p: TgcParser) -> Option[TypeExpr]
     if at(p, TokenKind::LBracket) then
       advance(p)
       if !at(p, TokenKind::RBracket) then
-        match parse_type(p)
+        # (§20 slice 1: elements may be const-generic arguments — signed
+        # integer literals — via parse_type_arg.)
+        match parse_type_arg(p)
         when Option::Some(ty) then type_args.push(ty)
         when Option::None then ()
         end
         while at(p, TokenKind::Comma) do
           advance(p)
-          match parse_type(p)
+          match parse_type_arg(p)
           when Option::Some(ty) then type_args.push(ty)
           when Option::None then break
           end

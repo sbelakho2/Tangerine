@@ -48,15 +48,36 @@ type host_id =
    and the registry is a real, caught error, never a self-comparison. *)
 type signature = Signature_identity.signature
 
-(* re-audit P0-B: the host-call RESULT separates the language-visible
-   value from the mutation writebacks — an inout intrinsic mutates
-   through the writeback channel (arg index -> new value) and returns
-   the EXACT Tangerine contract (Set::insert -> Bool, Map::insert ->
-   Option[old V]) in the value slot.  The old collection-return-as-
-   mutation-transport convention is gone. *)
+(* re-audit P0-B / P0-3: the host-call RESULT separates the language-
+   visible value from the mutation writebacks — an inout intrinsic
+   mutates through the writeback channel and returns the EXACT
+   Tangerine contract (Set::insert -> Bool, Map::insert -> Option[old
+   V]) in the value slot.  The old collection-return-as-mutation-
+   transport convention is gone.
+
+   Audit P0-3 (the collection writeback OWNERSHIP model): a writeback
+   is an ownership-explicit record — the arg index whose caller value
+   is replaced, the replacement value, and the list of values that
+   LEFT the caller's container (the displaced/removed members).  The
+   copy-on-write collection adapters build the replacement as a fresh
+   collection SHARING only the retained members, so the old container
+   value is dead the moment the writeback lands and can never be
+   dropped as a whole (a whole drop would double-destroy the shared
+   retained members); the members that left (the array_set displaced
+   element, the clear/remove casualties, ...) are enumerated in
+   `removed`, and the VM's writeback application drops exactly those,
+   exactly once, with the canonical per-type drop (vm.ml).  A value
+   TRANSFERRED to the return (pop/remove/drain_one payloads,
+   map_insert's Option[old V]) is never in `removed`. *)
+type host_writeback = {
+  arg_index : int;
+  replacement : Vm_value.t;
+  removed : Vm_value.t list;
+}
+
 type host_result = {
   value : Vm_value.t;
-  writebacks : (int * Vm_value.t) list;
+  writebacks : host_writeback list;
 }
 
 let plain_result (v : Vm_value.t) : host_result = { value = v; writebacks = [] }
@@ -231,7 +252,8 @@ let adapter_raw (params : (Access_effect.t * Type_repr.t) list) (ret : Type_repr
   }
 
 (* the writeback-capable raw adapter: the invoke returns the language
-   value AND the (arg index -> new value) mutation writebacks *)
+   value AND the ownership-explicit mutation writebacks (replacement +
+   the removed members, audit P0-3) *)
 let adapter_raw_wb (params : (Access_effect.t * Type_repr.t) list) (ret : Type_repr.t)
     (invoke : t -> Vm_value.t array -> (host_result, string) result) : adapter =
   { signature = mk_sig params ret; invoke }
@@ -391,7 +413,7 @@ let extern_binding (name : string) (a : adapter) : binding =
   | None -> failwith (Printf.sprintf "host binding '%s': not a declared extern" name)
 
 (* ────────────────────────────────────────────────────────────────────
-   The collection surface's OWNERSHIP semantics (audit P0-11).
+   The collection surface's OWNERSHIP semantics (audit P0-11 / P0-3).
    Vm_value values are immutable trees, and the seed's only OWNED value
    shape is a region-backed reference (Ref (Region p) — the one shape
    the VM's drop glue frees; a live duplicate of an owned value would
@@ -404,23 +426,29 @@ let extern_binding (name : string) (a : adapter) : binding =
        caller's moved value BECOMES the stored element/key — it is
        placed into the writeback collection and never copied, and
        never appears anywhere else in a live value;
-     • the element-returning ops (pop, remove, drain_one) EXTRACT:
-       the element appears in the returned Option/value and NOT in the
-       writeback collection — ownership transfers exactly once;
-     • set(Array)/remove(Array)/insert(Array)/set-insert-REPLACE
-       RELINQUISH the displaced old element exactly once: after the
-       call the old element is in no live value (neither the writeback
-       nor the return) — the writeback is a fresh collection sharing
-       only the retained elements, and the caller's moved-in value is
-       the one stored;
+     • the element-returning ops (pop, remove, drain_one, map_insert)
+       EXTRACT: the element appears in the returned Option/value and
+       NOT in the writeback collection and NOT in the writeback's
+       `removed` — ownership transfers exactly once;
+     • the REPLACEMENT/clear ops (array_set, array_clear, set_clear,
+       set_remove's matched element, set-insert-REPLACE's displaced
+       element) enumerate the member that left the caller's container
+       in the writeback's `removed` list: the writeback is a fresh
+       collection sharing ONLY the retained members, and the VM's
+       writeback application drops exactly the `removed` values,
+       exactly once, after installing the replacement — the old
+       container value is dead the moment the writeback lands, and it
+       is NEVER dropped as a whole (its retained members are
+       structurally shared with the replacement — a whole drop would
+       double-destroy them);
      • a FAILED bounds check consumes NOTHING: the check runs before
        any mutation, the adapter returns an error, and no writeback is
        produced (the VM traps on the error);
      • the WRITEBACK channel never duplicates an aggregate: each
        element/key object of the old collection either stays (shared
        into the new collection — single live owner, the old collection
-       value is dead the moment its slot was moved) or leaves with the
-       returned value — never both;
+       value is dead the moment its slot was replaced) or leaves with
+       the returned value — never both;
      • containment decisions use lookup_eq (above), which never
        reports a resource-containing aggregate Eq.
 
@@ -461,23 +489,29 @@ let binding_manifest : binding list =
               (whether the element was present and removed) and the
               mutation travels through the explicit writeback channel.
               The item is a read-only key (Let — never consumed); the
-              REMOVED element is relinquished exactly once: it appears
-              in no live value after the call (not in the writeback,
-              not in the return).  An element is only ever removed when
-              lookup_eq matched it — no removal decision is made
-              through equality on resource carriers. *)
+              REMOVED element leaves the caller's container exactly
+              once — it appears in no live value after the call (not
+              in the writeback, not in the return) and is enumerated
+              in the writeback's `removed` list so the VM's writeback
+              application drops it exactly once (audit P0-3).  An
+              element is only ever removed when lookup_eq matched it —
+              no removal decision is made through equality on resource
+              carriers. *)
            match args with
            | [| Vm_value.Set elems; item |] ->
                let rec remove acc = function
-                 | [] -> (false, List.rev acc)
+                 | [] -> (None, List.rev acc)
                  | x :: rest when lookup_eq x item ->
-                     (true, List.rev_append acc rest)
+                     (Some x, List.rev_append acc rest)
                  | x :: rest -> remove (x :: acc) rest
                in
-               let removed, new_elems = remove [] elems in
+               let removed_el, new_elems = remove [] elems in
+               let removed = match removed_el with Some x -> [ x ] | None -> [] in
                Ok
-                 { value = Vm_value.Bool removed;
-                   writebacks = [ (0, Vm_value.Set new_elems) ] }
+                 { value = Vm_value.Bool (removed_el <> None);
+                   writebacks =
+                     [ { arg_index = 0; replacement = Vm_value.Set new_elems;
+                         removed } ] }
            | _ -> Error "argument mismatch: expected (Set, item)"));
     intrinsic_binding "__intrinsic_set_insert"
       (adapter_raw_wb
@@ -488,23 +522,29 @@ let binding_manifest : binding list =
               it — the adapter TAKES the exact value object and it
               BECOMES the stored element.  On the fresh path it is
               appended; on the found path the FIRST lookup_eq-equal
-              stored element is REPLACED by the incoming item (the
-              displaced old element is relinquished exactly once — it
-              is in no live value afterward, and the old set value is
-              dead).  The language value is the presence Bool: `true`
-              when the key already existed (its slot was replaced),
-              `false` when a fresh slot was created. *)
+              stored element is REPLACED by the incoming item — the
+              displaced old element leaves the caller's container
+              exactly once: it is in no live value afterward (not the
+              writeback, not the return) and is enumerated in the
+              writeback's `removed` list so the VM's writeback
+              application drops it exactly once (audit P0-3).  The
+              language value is the presence Bool: `true` when the key
+              already existed (its slot was replaced), `false` when a
+              fresh slot was created. *)
            match args with
            | [| Vm_value.Set elems; item |] ->
                let rec insert acc = function
-                 | [] -> (false, List.rev_append acc [ item ])
+                 | [] -> (false, [], List.rev_append acc [ item ])
                  | x :: rest when lookup_eq x item ->
-                     (true, List.rev_append acc (item :: rest))
+                     (true, [ x ], List.rev_append acc (item :: rest))
                  | x :: rest -> insert (x :: acc) rest
                in
-               let existed, new_elems = insert [] elems in
-               Ok { value = Vm_value.Bool existed;
-                    writebacks = [ (0, Vm_value.Set new_elems) ] }
+               let existed, displaced, new_elems = insert [] elems in
+               Ok
+                 { value = Vm_value.Bool existed;
+                   writebacks =
+                     [ { arg_index = 0; replacement = Vm_value.Set new_elems;
+                         removed = displaced } ] }
            | _ -> Error "argument mismatch: expected (Set, item)"));
     intrinsic_binding "__intrinsic_set_len"
       (adapter_raw (lets [ set_of p0 ]) ty_int (fun _ args ->
@@ -527,22 +567,41 @@ let binding_manifest : binding list =
            (* the drain contract: extract an arbitrary element as an
               owned Option[T] and shrink the set through the writeback
               channel (the seed set is unordered, so the head is the
-              deterministic pick) *)
+              deterministic pick).  Element ownership TRANSFERS to the
+              caller exactly once: the extracted element appears ONLY
+              in the returned Option — it is in neither the writeback
+              replacement nor the writeback's `removed` list (audit
+              P0-3). *)
            match args with
            | [| Vm_value.Set elems |] -> (
                match elems with
-               | [] -> Ok { value = Vm_value.Enum (1, [||]);
-                            writebacks = [ (0, Vm_value.Set []) ] }
+               | [] ->
+                   Ok
+                     { value = Vm_value.Enum (1, [||]);
+                       writebacks =
+                         [ { arg_index = 0; replacement = Vm_value.Set [];
+                             removed = [] } ] }
                | x :: rest ->
-                   Ok { value = Vm_value.Enum (0, [| x |]);
-                        writebacks = [ (0, Vm_value.Set rest) ] })
+                   Ok
+                     { value = Vm_value.Enum (0, [| x |]);
+                       writebacks =
+                         [ { arg_index = 0; replacement = Vm_value.Set rest;
+                             removed = [] } ] })
            | _ -> Error "argument mismatch: expected (Set)"));
     intrinsic_binding "__intrinsic_set_clear"
       (adapter_raw_wb [ (Access_effect.Inout, set_of p0) ] Type_repr.Unit (fun _ args ->
+           (* every prior member leaves the caller's container exactly
+              once: the writeback is empty and every old element is
+              enumerated in the writeback's `removed` list — the VM's
+              writeback application drops each exactly once (audit
+              P0-3) *)
            match args with
-           | [| Vm_value.Set _ |] ->
-               Ok { value = Vm_value.Unit;
-                    writebacks = [ (0, Vm_value.Set []) ] }
+           | [| Vm_value.Set elems |] ->
+               Ok
+                 { value = Vm_value.Unit;
+                   writebacks =
+                     [ { arg_index = 0; replacement = Vm_value.Set [];
+                         removed = elems } ] }
            | _ -> Error "argument mismatch: expected (Set)"));
     intrinsic_binding "__intrinsic_map_contains_key"
       (adapter_raw (lets [ map_of p0 p1; p0 ]) ty_bool (fun _ args ->
@@ -574,12 +633,12 @@ let binding_manifest : binding list =
            (Access_effect.Sink, p1);
          ]
          (option_of p1) (fun _ args ->
-          (* the exact Tangerine contract (audit P0-B / P0-11): the
-             language value is Option[old V] — the displaced old value,
-             returned OWNED (it appears in no live value but the
-             Option) — and the mutation travels through the explicit
-             writeback channel.  The sink key and sink value arrive
-             MOVED and are TAKEN by the adapter (never copied):
+          (* the exact Tangerine contract (audit P0-B / P0-11 /
+             P0-3): the language value is Option[old V] — the displaced
+             old value, returned OWNED (it appears in no live value but
+             the Option) — and the mutation travels through the
+             explicit writeback channel.  The sink key and sink value
+             arrive MOVED and are TAKEN by the adapter (never copied):
              • key ABSENT: both the incoming key and the incoming
                value become the stored pair;
              • key PRESENT (first lookup_eq match): the STORED key is
@@ -587,8 +646,17 @@ let binding_manifest : binding list =
                incoming sink key is consumed by the call and stored
                nowhere), the incoming sink VALUE becomes the stored
                value, and the OLD value is relinquished into the
-               returned Option exactly once.  The writeback is a fresh
-               pair list sharing only the retained pairs/keys. *)
+               returned Option exactly once — it is the language value
+               and is therefore NEVER in the writeback's `removed` list
+               (audit P0-3: a value transferred to the return must not
+               be dropped by the writeback application).  The writeback
+               is a fresh pair list sharing only the retained
+               pairs/keys; nothing left the caller's container except
+               the returned old value, so `removed` is empty on both
+               paths (a replacement can only match a key that
+               lookup_eq found equal, and lookup_eq refuses resource
+               carriers — the discarded sink key can never own a
+               drop). *)
           match args with
           | [| Vm_value.Map pairs; key; value |] -> (
               match List.find_opt (fun (k, _) -> lookup_eq k key) pairs with
@@ -600,11 +668,16 @@ let binding_manifest : binding list =
                   in
                   Ok
                     { value = Vm_value.Enum (0, [| old |]);
-                      writebacks = [ (0, Vm_value.Map new_pairs) ] }
+                      writebacks =
+                        [ { arg_index = 0; replacement = Vm_value.Map new_pairs;
+                            removed = [] } ] }
               | None ->
                   Ok
                     { value = Vm_value.Enum (1, [||]);
-                      writebacks = [ (0, Vm_value.Map (pairs @ [ (key, value) ])) ] })
+                      writebacks =
+                        [ { arg_index = 0;
+                            replacement = Vm_value.Map (pairs @ [ (key, value) ]);
+                            removed = [] } ] })
           | _ -> Error "argument mismatch: expected (Map, key, value)"));
     intrinsic_binding "__intrinsic_map_len"
       (adapter_raw (lets [ map_of p0 p1 ]) ty_int (fun _ args ->
@@ -636,12 +709,17 @@ let binding_manifest : binding list =
        contracts: pop -> Option[T] (Some payload / None on empty),
        get/remove are the CHECKED reads — out-of-range is the std's
        OOB panic, enforced as a deterministic host error (the VM
-       traps).  Ownership (audit P0-11): the sink item of push/set/
-       insert arrives MOVED and is TAKEN — the exact value object
-       becomes the stored element; the displaced element of set is
-       relinquished exactly once; pop/remove EXTRACT the element into
-       the return so it leaves the collection exactly once; a failed
-       bounds check consumes NOTHING (error before any writeback). *)
+       traps).  Ownership (audit P0-11 / P0-3): the sink item of
+       push/set/insert arrives MOVED and is TAKEN — the exact value
+       object becomes the stored element; the displaced element of set
+       and the cleared members are enumerated in the writeback's
+       `removed` list (the VM drops each exactly once — the old array
+       value itself is never dropped: its retained members are
+       structurally shared with the replacement, so a whole drop would
+       double-destroy them); pop/remove EXTRACT the element into the
+       return so it leaves the collection exactly once and is never in
+       `removed`; a failed bounds check consumes NOTHING (error before
+       any writeback). *)
     intrinsic_binding "__intrinsic_array_new"
       (adapter_raw [] (vec_of p0) (fun _ args ->
            match args with
@@ -684,12 +762,16 @@ let binding_manifest : binding list =
              array shares the retained elements with the (now dead)
              old array value, so no element is ever held by two live
              values.  Nothing here copies the item. *)
-          match args with
-          | [| Vm_value.Array elems; item |] ->
-              Ok
-                { value = Vm_value.Unit;
-                  writebacks = [ (0, Vm_value.Array (Array.append elems [| item |])) ] }
-          | _ -> Error "argument mismatch: expected (Array, item)"));
+           match args with
+           | [| Vm_value.Array elems; item |] ->
+               Ok
+                 { value = Vm_value.Unit;
+                   writebacks =
+                     [ { arg_index = 0;
+                         replacement =
+                           Vm_value.Array (Array.append elems [| item |]);
+                         removed = [] } ] }
+           | _ -> Error "argument mismatch: expected (Array, item)"));
     intrinsic_binding "__intrinsic_array_pop"
       (adapter_raw_wb [ (Access_effect.Inout, vec_of p0) ] (option_of p0)
          (fun _ args ->
@@ -699,18 +781,26 @@ let binding_manifest : binding list =
               Element ownership TRANSFERS to the caller exactly once:
               on the Some path the last element appears ONLY in the
               returned Option — the writeback array (a sub-array
-              sharing the remaining elements) never contains it. *)
+              sharing the remaining elements) never contains it and
+              the writeback's `removed` list never lists it (audit
+              P0-3). *)
            match args with
            | [| Vm_value.Array elems |] ->
                let n = Array.length elems in
                if n = 0 then
                  Ok
                    { value = Vm_value.Enum (1, [||]);
-                     writebacks = [ (0, Vm_value.Array elems) ] }
+                     writebacks =
+                       [ { arg_index = 0; replacement = Vm_value.Array elems;
+                           removed = [] } ] }
                else
                  Ok
                    { value = Vm_value.Enum (0, [| elems.(n - 1) |]);
-                     writebacks = [ (0, Vm_value.Array (Array.sub elems 0 (n - 1))) ] }
+                     writebacks =
+                       [ { arg_index = 0;
+                           replacement =
+                             Vm_value.Array (Array.sub elems 0 (n - 1));
+                           removed = [] } ] }
            | _ -> Error "argument mismatch: expected (Array)"));
     intrinsic_binding "__intrinsic_array_get"
       (adapter_raw (lets [ vec_of p0; ty_int ]) p0 (fun _ args ->
@@ -734,14 +824,19 @@ let binding_manifest : binding list =
          [ (Access_effect.Inout, vec_of p0); (Access_effect.Let, ty_int);
            (Access_effect.Sink, p0) ]
          Type_repr.Unit (fun _ args ->
-          (* ownership semantics: the bounds check runs FIRST — a
-             failed check consumes NOTHING (an error, no writeback).
-             On success the sink value arrives MOVED and is TAKEN —
-             the exact value object becomes the stored element at the
-             index — and the OLD element is relinquished exactly once
-             (it appears in no live value afterward: the writeback
-             array is a shallow copy sharing only the retained
-             elements, and the old array value is dead). *)
+          (* ownership semantics (audit P0-3): the bounds check runs
+             FIRST — a failed check consumes NOTHING (an error, no
+             writeback).  On success the sink value arrives MOVED and
+             is TAKEN — the exact value object becomes the stored
+             element at the index — and the OLD element is enumerated
+             in the writeback's `removed` list so the VM's writeback
+             application drops it exactly once.  The writeback array is
+             a shallow copy sharing ONLY the retained elements: the old
+             array value is dead the moment the writeback lands and is
+             never dropped as a whole — a whole drop would
+             double-destroy the retained elements it shares with the
+             replacement (the exact leak/double-drop the removed
+             channel closes). *)
           match args with
           | [| Vm_value.Array elems; Vm_value.Int i; value |] ->
               let idx = Int64.to_int (Int_value.to_int64 i) in
@@ -751,10 +846,14 @@ let binding_manifest : binding list =
                      "__intrinsic_array_set: index %d out of bounds (len %d)" idx
                      (Array.length elems))
               else begin
+                let old = elems.(idx) in
                 let new_elems = Array.copy elems in
                 new_elems.(idx) <- value;
-                Ok { value = Vm_value.Unit;
-                     writebacks = [ (0, Vm_value.Array new_elems) ] }
+                Ok
+                  { value = Vm_value.Unit;
+                    writebacks =
+                      [ { arg_index = 0; replacement = Vm_value.Array new_elems;
+                          removed = [ old ] } ] }
               end
           | _ -> Error "argument mismatch: expected (Array, Int, value)"));
     intrinsic_binding "__intrinsic_array_remove"
@@ -766,8 +865,9 @@ let binding_manifest : binding list =
               writeback channel.  Element ownership TRANSFERS to the
               caller exactly once: the removed element appears ONLY in
               the returned value — the writeback shares only the
-              retained prefix/suffix.  The bounds check runs FIRST — a
-              failed check consumes NOTHING. *)
+              retained prefix/suffix and the writeback's `removed`
+              list never lists it (audit P0-3).  The bounds check runs
+              FIRST — a failed check consumes NOTHING. *)
            match args with
            | [| Vm_value.Array elems; Vm_value.Int i |] ->
                let idx = Int64.to_int (Int_value.to_int64 i) in
@@ -780,10 +880,12 @@ let binding_manifest : binding list =
                  Ok
                    { value = elems.(idx);
                      writebacks =
-                       [ (0,
-                          Vm_value.Array
-                            (Array.append (Array.sub elems 0 idx)
-                               (Array.sub elems (idx + 1) (n - idx - 1)))) ] }
+                       [ { arg_index = 0;
+                           replacement =
+                             Vm_value.Array
+                               (Array.append (Array.sub elems 0 idx)
+                                  (Array.sub elems (idx + 1) (n - idx - 1)));
+                           removed = [] } ] }
            | _ -> Error "argument mismatch: expected (Array, Int)"));
     intrinsic_binding "__intrinsic_array_insert"
       (adapter_raw_wb
@@ -794,7 +896,8 @@ let binding_manifest : binding list =
              NOTHING (an error, no writeback).  On success the sink
              item arrives MOVED and is TAKEN: the exact value object
              is placed at the index and the writeback shares only the
-             retained elements. *)
+             retained elements (nothing left the container — the
+             writeback's `removed` list is empty). *)
           match args with
           | [| Vm_value.Array elems; Vm_value.Int i; item |] ->
               let idx = Int64.to_int (Int_value.to_int64 i) in
@@ -807,19 +910,28 @@ let binding_manifest : binding list =
                 Ok
                   { value = Vm_value.Unit;
                     writebacks =
-                      [ (0,
-                         Vm_value.Array
-                           (Array.append (Array.sub elems 0 idx)
-                              (Array.append [| item |] (Array.sub elems idx (n - idx))))) ] }
+                      [ { arg_index = 0;
+                          replacement =
+                            Vm_value.Array
+                              (Array.append (Array.sub elems 0 idx)
+                                 (Array.append [| item |]
+                                    (Array.sub elems idx (n - idx))));
+                          removed = [] } ] }
           | _ -> Error "argument mismatch: expected (Array, Int, item)"));
     intrinsic_binding "__intrinsic_array_clear"
       (adapter_raw_wb [ (Access_effect.Inout, vec_of p0) ] Type_repr.Unit (fun _ args ->
-           (* every element is relinquished: the writeback is empty and
-              none of the old elements appears in any live value *)
+           (* every prior member leaves the caller's container exactly
+              once: the writeback is empty and every old element is
+              enumerated in the writeback's `removed` list — the VM's
+              writeback application drops each exactly once (audit
+              P0-3) *)
            match args with
-           | [| Vm_value.Array _ |] ->
-               Ok { value = Vm_value.Unit;
-                    writebacks = [ (0, Vm_value.Array [||]) ] }
+           | [| Vm_value.Array elems |] ->
+               Ok
+                 { value = Vm_value.Unit;
+                   writebacks =
+                     [ { arg_index = 0; replacement = Vm_value.Array [||];
+                         removed = Array.to_list elems } ] }
            | _ -> Error "argument mismatch: expected (Array)"));
     intrinsic_binding "__intrinsic_array_contains"
       (adapter_raw (lets [ vec_of p0; p0 ]) ty_bool (fun _ args ->

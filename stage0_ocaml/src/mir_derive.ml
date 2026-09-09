@@ -16,39 +16,67 @@
 
    Body shapes (the checker's and lowering's conventions, mirrored):
 
-   - clone of a struct  — one Read per FIELD in declaration order (Field
-     projections carry the def's SEMANTIC FieldIds), rebuilt with a
-     StructCtor aggregate;
-   - clone of an enum   — Discriminant + SwitchInt over the declaration
-     tags, per-variant payload Reads through [Downcast vid; ConstantIndex
-     j], rebuilt with EnumCtor aggregates;
-   - clone of a tuple /
-     fixed array        — per-element Reads (ConstantIndex), rebuilt with
-     TupleAgg / ArrayAgg;
-   - clone of anything
-     else (scalars,
-     String-shaped,
-     bare generic
-     params, refs)      — the value Read.  The seed's runtime values are
-     immutable trees — every aggregate mutation rebuilds the spine and
-     never mutates a shared subtree — so the duplicated top-level value
-     is observationally the field-wise clone;
-   - eq                 — the whole-value structural BinaryOp Eq of self
-     and other (the checker's fundamental equality accepts the same
-     operand class and the VM compares tags + payloads structurally);
-   - hash (Int-kind
-     receivers only)    — the numeric identity (Int) / Cast to Int;
-   - to_string          — per-shape rendering: scalar receivers render
-     through the compiler's registered render intrinsics
-     (__intrinsic_int/bool/char/float_to_string — body-less registered
-     sigs the driver's host-channel normalization rewrites onto the
-     Intrinsic channel exactly like source calls), aggregates render
-     their fields/variants in declaration order ("Name { f: v, ... }" /
-     "Variant(...)" / "(...)" / "[...]" forms), and receivers without a
-     nominal shape (bare generic params, def-less nominals) delegate to
-     the kernel's universal `def to_string[T: Display](val: T)` — the
-     same Display contract the real language resolves such calls
-     through.
+    - clone of a struct  — one semantic clone per FIELD in declaration
+      order (Field projections carry the def's SEMANTIC FieldIds),
+      rebuilt with a StructCtor aggregate;
+    - clone of an enum   — Discriminant + SwitchInt over the declaration
+      tags, per-variant payload clones through [Downcast vid;
+      ConstantIndex j], rebuilt with EnumCtor aggregates;
+    - clone of a tuple /
+      fixed array        — per-element semantic clones (ConstantIndex),
+      rebuilt with TupleAgg / ArrayAgg;
+    - clone of a Copy
+      component         — the value Read (only trivially copyable
+                          components — scalars, tuples/arrays of Copy
+                          elements, defs whose fields are Copy — ever
+                          duplicate a value: their duplication IS the
+                          semantic clone);
+    - clone of a non-Copy
+      component (String,
+      Vec[T], Map[K,V],
+      Set[T], Box[T], a
+      custom non-Copy Clone
+      type, a rigid
+      generic carrier
+      discharged through
+      its declared Clone
+      bound)             — a REAL call of the component's own Clone
+                          (audit P0-4): the registered (owner, clone)
+                          method for the component type — String::clone,
+                          the container clones, `impl Clone for C`'s
+                          clone — under the same callable identity the
+                          source body lowers; a rigid carrier clones
+                          through the Clone trait contract exactly like
+                          the kernel's bound-generic `x.clone()` calls
+                          (`impl[T: Clone] ... { t.clone() }` lower the
+                          contract instance).  NO non-Copy component is
+                          ever duplicated by an ordinary Read: the
+                          checker's derived-Clone mint (typecheck.ml,
+                          audit P0-4) refuses the mint unless every
+                          component discharges Copy OR Clone, and the
+                          minted signature carries the rigid-carrier
+                          Clone bounds as where-clauses — this module
+                          re-checks the same obligations at synthesis
+                          (resolve_clone_impl over the SAME registered
+                          tables typecheck consulted), so a body without
+                          its obligation is an internal error, never a
+                          silent structural copy;
+    - eq                 — the whole-value structural BinaryOp Eq of self
+      and other (the checker's fundamental equality accepts the same
+      operand class and the VM compares tags + payloads structurally);
+    - hash (Int-kind
+      receivers only)    — the numeric identity (Int) / Cast to Int;
+    - to_string          — per-shape rendering: scalar receivers render
+      through the compiler's registered render intrinsics
+      (__intrinsic_int/bool/char/float_to_string — body-less registered
+      sigs the driver's host-channel normalization rewrites onto the
+      Intrinsic channel exactly like source calls), aggregates render
+      their fields/variants in declaration order ("Name { f: v, ... }" /
+      "Variant(...)" / "(...)" / "[...]" forms), and receivers without a
+      nominal shape (bare generic params, def-less nominals) delegate to
+      the kernel's universal `def to_string[T: Display](val: T)` — the
+      same Display contract the real language resolves such calls
+      through.
 
    The renderer/universal callees are looked up in the checker's
    REGISTERED function table (the same registered sigs source calls to
@@ -459,7 +487,194 @@ let rec render_into (env : Typecheck.env) (s : st) (dest : int)
       | Type_repr.Function _ -> assign (const_string "<fn>")
       | Type_repr.Int_literal _ -> assign (const_string "?"))
 
-(* ── synthesize ────────────────────────────────────────────────────
+(* ── audit P0-4: trait-semantic derived Clone ──────────────────────
+   The synthesized clone body is a SEMANTIC clone, never a structural
+   Read duplication of owning values.  The emission decision is the
+   SAME obligation authority the checker's mint used (typecheck.ml's
+   tc_is_copy / registered_clone_method — one engine, no drift): a
+   component is read only when it is trivially copyable; every other
+   component is duplicated through its own Clone call.  A component
+   that reaches emission without discharging the obligation is an
+   internal error — the checker's mint refused such receivers, so a
+   body here means the obligations were recorded. *)
+
+(* The registered clone method of a component type (mirror of the
+   checker's obligation authority — same tables, same alias
+   convention, same receiver-self unification). *)
+let resolve_clone_impl (env : Typecheck.env) (ty : Type_repr.t) :
+    (string * Typecheck.typed_signature * Type_repr.t array) option =
+  match Typecheck.registered_clone_method env ty with
+  | None -> None
+  | Some (owner, ts, subst) ->
+      let type_args =
+        Array.of_list
+          (List.map
+             (fun (_, pid) ->
+               match List.assoc_opt (Type_repr.KParam pid) subst with
+               | Some t -> Typecheck.substitute_fixpoint subst t
+               | None -> Type_repr.Type_param pid)
+             ts.Typecheck.ts_params_decl)
+      in
+      Some (owner, ts, type_args)
+
+(* One semantic Clone::clone call of a component (the receiver value is
+   passed by value — the derived clone's receiver convention — and the
+   callee is classified exactly like a source receiver-method call of
+   the registered clone: TC_user under the clone method's callable (the
+   real lowered body when the program declares the impl; a
+   registered-only callee otherwise, exactly like every other
+   body-less registration the template verifier admits).  The call
+   closes the current block; the continuation becomes current. *)
+let clone_call (s : st) (ts : Typecheck.typed_signature)
+    (owner : string) (type_args : Type_repr.t array) (ret_ty : Type_repr.t)
+    (arg : Seed_mir.operand) : Seed_mir.operand =
+  let dest = fresh_local s ret_ty in
+  let cont = new_block s in
+  let callee =
+    Mir_lower.callee_of_typed
+      (Typecheck.classify_method_callee ~owner:(Some owner) "clone" ts
+         ~argc:1 ~type_args)
+  in
+  close_with s
+    (Seed_mir.Call
+       ( place_of dest,
+         callee,
+         [| { Seed_mir.effect_ = Access_effect.Read; value = arg } |],
+         cont,
+         None ));
+  set_cur s cont;
+  Seed_mir.Read (place_of dest)
+
+(* The clone of ONE value component: `ty` at `place` -> an operand of a
+   fresh clone of it.  A REGISTERED clone method clones first and
+   governs the component's semantics (a nominal that declares
+   `impl Clone for C` clones through the impl even when it is
+   structurally copyable — derived Clone is trait-semantic, never a
+   value duplication that bypasses the impl); without a registered
+   clone, trivially copyable components read; aggregate VALUE shapes
+   with no nominal owner (tuples, fixed arrays) recurse elementwise; a
+   rigid generic carrier discharges through the Clone trait contract
+   (the kernel's bound-generic clone surface), which the minted
+   signature's where-clause recorded.  A component that reaches
+   emission without any discharge is an internal error (the checker's
+   mint obligation authority must have rejected the receiver). *)
+let rec emit_clone_value (env : Typecheck.env) (s : st)
+    (clone_bound : Ids.Generic_param_id.t list) (ty : Type_repr.t)
+    (place : Seed_mir.place) : Seed_mir.operand =
+  match resolve_clone_impl env ty with
+  | Some (owner, ts, type_args) ->
+      clone_call s ts owner type_args ty (read_op place)
+  | None ->
+      if Typecheck.tc_is_copy env (Lang_items.of_types env.types) ty then read_op place
+      else
+        match ty with
+        | Type_repr.Tuple elems ->
+            let ops =
+              List.mapi
+                (fun i et ->
+                  emit_clone_value env s clone_bound et
+                    (proj place (Seed_mir.ConstantIndex i)))
+                (Array.to_list elems)
+            in
+            let dl = fresh_local s ty in
+            emit s (Seed_mir.Assign (place_of dl, Seed_mir.Aggregate (Seed_mir.TupleAgg, ops)));
+            read_op (place_of dl)
+        | Type_repr.Fixed_array (et, n) ->
+            let ops =
+              List.init n (fun i ->
+                  emit_clone_value env s clone_bound et
+                    (proj place (Seed_mir.ConstantIndex i)))
+            in
+            let dl = fresh_local s ty in
+            emit s (Seed_mir.Assign (place_of dl, Seed_mir.Aggregate (Seed_mir.ArrayAgg, ops)));
+            read_op (place_of dl)
+        | Type_repr.Type_param pid ->
+            (* a rigid carrier: its Clone bound is a where-clause of the
+               minted signature — the clone goes through the Clone trait
+               contract exactly like the kernel's bound-generic clone calls *)
+            if not (List.mem pid clone_bound) then
+              failwith
+                (Printf.sprintf
+                   "mir_derive: internal error — derived Clone emitted for generic parameter #%d without a recorded Clone obligation"
+                   (Ids.Generic_param_id.to_int pid));
+            (match List.assoc_opt ("Clone", "clone") env.Typecheck.methods with
+             | Some ts when Array.length ts.Typecheck.ts_params >= 1 ->
+                 clone_call s ts "Clone" [| Type_repr.Type_param pid |] ty (read_op place)
+             | _ ->
+                 failwith
+                   "mir_derive: internal error — the Clone trait contract method is not registered")
+        | _ ->
+            failwith
+              (Printf.sprintf
+                 "mir_derive: internal error — derived Clone emitted without Clone obligation for type `%s` (the checker's mint obligation authority must have rejected this receiver)"
+                 (Seed_mir.print_type ty))
+
+(* The receiver-level clone: nominal receivers clone per their def
+   shape (struct fields / the discriminant-dispatched active variant's
+   payloads) through emit_clone_value; everything else — tuples, fixed
+   arrays, Copy scalars, String/container/LangItem receivers (whose
+   registered clone owns the duplication) — is one emit_clone_value. *)
+let emit_clone_receiver (env : Typecheck.env) (s : st)
+    (clone_bound : Ids.Generic_param_id.t list) (dest : int)
+    (ty : Type_repr.t) (place : Seed_mir.place) : unit =
+  match nominal_shape_of env ty with
+  | Some (_, nom, args) when nom.Typecheck.nom_kind = `Struct ->
+      let binds = nominal_arg_bindings nom args in
+      let fids = field_ids_of nom in
+      let fields =
+        List.map2
+          (fun (_, fty) fid -> (Type_repr.substitute binds fty, fid))
+          nom.Typecheck.nom_fields fids
+      in
+      let tid =
+        match ty with
+        | Type_repr.Named (tid, _) -> tid
+        | _ -> failwith "mir_derive: struct clone receiver identity"
+      in
+      let ops =
+        List.map
+          (fun (fty, fid) ->
+            emit_clone_value env s clone_bound fty (proj place (Seed_mir.Field fid)))
+          fields
+      in
+      emit s
+        (Seed_mir.Assign
+           ( place_of dest,
+             Seed_mir.Aggregate
+               ( Seed_mir.StructCtor
+                   ( tid,
+                     Array.init (List.length fields) (fun i ->
+                         Ids.Field_index.make i) ),
+                 ops ) ))
+  | Some (_, nom, _) when nom.Typecheck.nom_kind = `Enum ->
+      let tid =
+        match ty with
+        | Type_repr.Named (tid, _) -> tid
+        | _ -> failwith "mir_derive: enum clone receiver identity"
+      in
+      let variants = nom.Typecheck.nom_variants in
+      let vids = variant_ids_of nom in
+      let n = List.length variants in
+      build_variant_switch s place n (fun i ->
+          let _, flds = List.nth variants i in
+          let vid = List.nth vids i in
+          let payload_place = proj place (Seed_mir.Downcast vid) in
+          let ops =
+            List.init (Array.length flds) (fun j ->
+                emit_clone_value env s clone_bound flds.(j)
+                  (proj payload_place (Seed_mir.ConstantIndex j)))
+          in
+          emit s
+            (Seed_mir.Assign
+               ( place_of dest,
+                 Seed_mir.Aggregate
+                   (Seed_mir.EnumCtor (tid, Ids.Variant_index.make i), ops) )))
+  | Some _ | None ->
+      (* no nominal shape to recurse into: the whole value clones as
+         one component (tuple/array/scalar/String/LangItem receivers) *)
+      emit s (Seed_mir.Assign (place_of dest, Seed_mir.Use (emit_clone_value env s clone_bound ty place)))
+
+(* synthesize ────────────────────────────────────────────────────
    One derived signature -> the Seed MIR function carrying the SAME
    callable identity the call sites reference. *)
 
@@ -492,84 +707,28 @@ let synthesize (env : Typecheck.env) (ts : Typecheck.typed_signature) :
     emit s (Seed_mir.Assign (ret_slot, rv));
     close_with s Seed_mir.Ret
   in
-  (match op with
-   | "clone" -> (
-       match nominal_shape_of env self_ty with
-       | Some (_, nom, args) when nom.Typecheck.nom_kind = `Struct ->
-           let binds = nominal_arg_bindings nom args in
-           let fids = field_ids_of nom in
-           let fields =
-             List.map2
-               (fun (_, fty) fid -> (Type_repr.substitute binds fty, fid))
-               nom.Typecheck.nom_fields fids
-           in
-           let tid =
-             match self_ty with
-             | Type_repr.Named (tid, _) -> tid
-             | _ -> failwith "mir_derive: struct clone receiver identity"
-           in
-           let ops =
-             List.map
-               (fun (_, fid) ->
-                 read_op (proj (place_of 1) (Seed_mir.Field fid)))
-               fields
-           in
-           assign_ret
-             (Seed_mir.Aggregate
-                ( Seed_mir.StructCtor
-                    ( tid,
-                      Array.init (List.length fields) (fun i ->
-                          Ids.Field_index.make i) ),
-                  ops ))
-       | Some (_, nom, _) when nom.Typecheck.nom_kind = `Enum ->
-           let tid =
-             match self_ty with
-             | Type_repr.Named (tid, _) -> tid
-             | _ -> failwith "mir_derive: enum clone receiver identity"
-           in
-           let variants = nom.Typecheck.nom_variants in
-           let vids = variant_ids_of nom in
-           let n = List.length variants in
-           build_variant_switch s (place_of 1) n (fun i ->
-               let _, flds = List.nth variants i in
-               let vid = List.nth vids i in
-               let payload_place =
-                 proj (place_of 1) (Seed_mir.Downcast vid)
-               in
-               let ops =
-                 List.init (Array.length flds) (fun j ->
-                     read_op
-                       (proj payload_place (Seed_mir.ConstantIndex j)))
-               in
-               emit s
-                 (Seed_mir.Assign
-                    ( ret_slot,
-                      Seed_mir.Aggregate
-                        ( Seed_mir.EnumCtor (tid, Ids.Variant_index.make i),
-                          ops ) )));
-           close_with s Seed_mir.Ret
-       | _ -> (
-           match self_ty with
-           | Type_repr.Tuple elems ->
-               assign_ret
-                 (Seed_mir.Aggregate
-                    ( Seed_mir.TupleAgg,
-                      List.init (Array.length elems) (fun j ->
-                          read_op
-                            (proj (place_of 1) (Seed_mir.ConstantIndex j))) ))
-           | Type_repr.Fixed_array (_, n) ->
-               assign_ret
-                 (Seed_mir.Aggregate
-                    ( Seed_mir.ArrayAgg,
-                      List.init n (fun j ->
-                          read_op
-                            (proj (place_of 1) (Seed_mir.ConstantIndex j))) ))
-           | _ ->
-               (* scalars / String / bare params / refs / def-less
-                  nominals: the top-level value read (the seed's
-                  immutable value trees make the duplicated value the
-                  field-wise clone) *)
-               assign_ret (Seed_mir.Use (read_op (place_of 1)))))
+   (* audit P0-4: the rigid carriers whose Clone bound the minted
+      signature's where-clauses recorded — the receivers whose clone
+      the checker discharged through a declared `T: Clone` bound.  A
+      clone body that reaches one of these carriers without the bound
+      is an internal error (the mint refused it). *)
+   let clone_bound_params =
+     List.filter_map
+       (fun (wt, bs) ->
+         match wt with
+         | Type_repr.Type_param pid ->
+             if List.exists (fun (b, _) -> b = "Clone") bs then Some pid else None
+         | _ -> None)
+       ts.Typecheck.ts_where
+   in
+   (match op with
+    | "clone" ->
+        (* the semantic receiver clone: nominal receivers clone per
+           their def shape, every component through its own Clone (the
+           checker's obligation authority admitted this receiver; a
+           component that cannot discharge is an internal error) *)
+        emit_clone_receiver env s clone_bound_params 0 self_ty (place_of 1);
+        close_with s Seed_mir.Ret
    | "eq" ->
        assign_ret
          (Seed_mir.BinaryOp

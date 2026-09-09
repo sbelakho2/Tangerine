@@ -148,6 +148,14 @@ type func_env = {
      answer for the payload-less enum kinds (AccessEffect,
      AccessConvention, TokenKind-adjacent kinds). *)
   enum_payloads : (Ids.Type_id.t * (string * Type_repr.t list) list) list;
+  (* The compilation's LangItems record (audit P0-2): the OWNED LangItem
+     nominals (Vec/Map/Set/Box/Rc/Arc/...) and the raw-pointer nominals
+     (Ptr/PtrMut) classify by this record — the mirror of the
+     name-anchored owning list this file previously kept.  Built from
+     the checker env (Lang_items.of_types) — per-compilation: the
+     shared LangItem ids (0..6) plus every declared owning nominal's
+     tid. *)
+  lang_items : Lang_items.t;
   (* The P1-25 copyability cache: the Type_properties engine memoizes
      its answers per canonical (TypeId, args) instance; the cache is
      bound to this env's typed registries (one per closure), so answers
@@ -544,90 +552,116 @@ let materialize_place (st : lower_state) (op : Seed_mir.operand) : Seed_mir.plac
    (Vec/Array nominals) fail closed: the lowering env carries no
    type-substituted element lookup for them (their element reads lower
    to a dynamic Seed_mir.Index projection, which the verifier only
-   admits on Fixed_array bases). *)
-let element_type_of (t : Type_repr.t) : Type_repr.t =
+   admits on Fixed_array bases).  The nominal identities route through
+   the env's LangItems record (audit P0-2). *)
+(* The Box nominal's tid — the LangItems box identity of this
+   compilation (audit P0-2), built from the checker's declaration. *)
+let box_tid_of (env : func_env) : Ids.Type_id.t option =
+  env.lang_items.Lang_items.box_
+
+(* ── LangItems selection helpers (audit P0-2) ──────────────────────
+   Every builtin-nominal identity decision in lowering routes through
+   the env's LangItems record — never numeric TypeId knowledge. *)
+let is_vec_langitem (env : func_env) (tid : Ids.Type_id.t) : bool =
+  Lang_items.tid_eq env.lang_items.Lang_items.vec tid
+
+let is_map_langitem (env : func_env) (tid : Ids.Type_id.t) : bool =
+  Lang_items.tid_eq env.lang_items.Lang_items.map tid
+
+let is_set_langitem (env : func_env) (tid : Ids.Type_id.t) : bool =
+  Lang_items.tid_eq env.lang_items.Lang_items.set tid
+
+let is_option_langitem (env : func_env) (tid : Ids.Type_id.t) : bool =
+  Lang_items.tid_eq env.lang_items.Lang_items.option tid
+
+(* The transparent deref-on-field nominals (the checker's check_field
+   deref rule — typecheck's b_ptr/b_ptrmut transparency and the Box
+   wrapper's deref-on-field rule): the raw-pointer LangItems and the
+   Box nominal. *)
+let is_deref_transparent_nominal (env : func_env) (tid : Ids.Type_id.t) : bool =
+  Lang_items.is_raw_pointer env.lang_items tid
+  || Lang_items.tid_eq env.lang_items.Lang_items.box_ tid
+
+(* The display descriptor of a transparent nominal (diagnostics only —
+   the identity itself is the record membership above). *)
+let transparent_desc (env : func_env) (tid : Ids.Type_id.t) : string =
+  if Lang_items.tid_eq env.lang_items.Lang_items.box_ tid then "Box"
+  else if Lang_items.tid_eq env.lang_items.Lang_items.ptr tid then "Ptr"
+  else "PtrMut"
+
+
+let element_type_of (env : func_env) (t : Type_repr.t) : Type_repr.t =
   match t with
   | Type_repr.Fixed_array (e, _) -> e
-  | Type_repr.Named (id, [| e |]) when Ids.Type_id.compare id (Ids.Type_id.make 0) = 0 -> e
+  | Type_repr.Named (id, [| e |]) when is_vec_langitem env id -> e
   | Type_repr.Named (id, args)
-    when Ids.Type_id.compare id (Ids.Type_id.make 2) = 0
-         && Array.length args >= 1 ->
+    when is_set_langitem env id && Array.length args >= 1 ->
       (* the Set nominal: the element *)
       args.(0)
   | Type_repr.Named (id, args)
-    when Ids.Type_id.compare id (Ids.Type_id.make 1) = 0
-         && Array.length args >= 2 ->
+    when is_map_langitem env id && Array.length args >= 2 ->
       (* the Map nominal: the (K, V) entry tuple *)
       Type_repr.Tuple [| args.(0); args.(1) |]
   | Type_repr.String -> Type_repr.Char
   | Type_repr.Tuple _ -> Type_repr.Int Type_repr.Int
   | _ -> seed_bug "element access on a non-iterable type %s" (Seed_mir.print_type t)
 
-(* Copyability for payload binding (P1-25): the core decision is the
-   type-property engine's (Type_properties.is_trivially_copyable — the
-   verifier's recursive, def-resolved rule: a struct is Copy iff every
-   field is Copy, an enum iff every variant payload is Copy).  The
+(* Copyability for payload binding (P1-25 / P0-2): the core decision is
+   the type-property engine's (Type_properties.is_trivially_copyable —
+   the verifier's recursive, def-resolved rule: a struct is Copy iff
+   every field is Copy, an enum iff every variant payload is Copy).  The
    lowering has no def TABLE of its own, so this file's env/def inputs
-   are kept and routed through the engine as its field registry:
+   are kept and routed through the engine as its nominal resolver:
+   - the env's LangItems record classifies the OWNED LangItem nominals
+     (Vec/Array/List/Map/Set/Box/Rc/Arc/... — move + clone, never
+     bit-Copy) and the raw-pointer nominals (Ptr/PtrMut — Copy) by
+     DIRECT properties (audit P0-2) — no def faking, no name lists;
    - env.struct_fields (every STRUCT nominal of the closure, generic
      templates included, in the nominal's own parameter scope) restores
      the structural rule for the raw-pointer handles and scalar structs
      (Ptr[T] = {address: UInt} is Copy);
    - env.enum_payloads resolves the enum rule (a payload-less enum is
      Copy; an enum with an owning payload is not);
-   - the OWNED LangItem nominals (collections/Option/Result/Box/Rc/Arc —
-     the seed ownership model) and the compiler-only nominals with no
-     declared fields stay conservative non-copy (the name-anchored
-     pre-check below, exactly the pre-consolidation answers);
+   - compiler-only nominals with no declared fields stay conservative
+     non-copy (the engine's Unknown answer, exactly the pre-P0-2
+     no-def answers);
    - the leaf classes the engine answers conservatively but the
      lowering previously classified outright (function values, Error)
      are pre-classified below, so consolidation changes nothing the
      working pipeline lowers.
    The per-func_env cache memoizes the engine's answers per canonical
    (TypeId, args) instance. *)
-let owned_langitem_named : string list =
-  [ "Vec"; "Array"; "List"; "Map"; "HashMap"; "Set"; "HashSet";
-    "Option"; "Result"; "Box"; "Rc"; "WeakRc"; "UniquePtr";
-    "ArcStrong"; "WeakArc"; "RcInner"; "ArcInnerWeak" ]
-
-let is_owned_langitem (env : func_env) (tid : Ids.Type_id.t) : bool =
-  List.exists
-    (fun (n, ty) ->
-      match ty with
-      | Type_repr.Named (t2, _) ->
-          Ids.Type_id.compare t2 tid = 0 && List.mem n owned_langitem_named
-      | _ -> false)
-    env.types
-
-(* The env def hook: a struct nominal resolves to its field tuple, an
-   enum to its payload function (the def_repr convention the engine's
-   enum rule keys on).  Owned LangItems resolve to NO def — the engine's
-   conservative owned answer, exactly the pre-consolidation langitem
-   rule, at every nesting depth. *)
-let def_of_tid (env : func_env) (tid : Ids.Type_id.t) : Type_repr.t option =
-  if is_owned_langitem env tid then None
-  else
-    match List.assoc_opt tid env.struct_fields with
-    | Some fields ->
-        Some
-          (Type_repr.Tuple
-             (Array.of_list
-                (List.map (fun (_fname, _fid, fty, _default) -> fty) fields)))
-    | None -> (
-        match List.assoc_opt tid env.enum_payloads with
-        | None -> None
-        | Some variants ->
-            Some
-              (Type_repr.Function
-                 ( Array.of_list
-                     (List.map
-                        (fun (_vname, pty) ->
-                          {
-                            Type_repr.pt_convention = Access_effect.Let;
-                            pt_type = Type_repr.Tuple (Array.of_list pty);
-                          })
-                        variants),
-                   Type_repr.Never )))
+(* The env nominal resolver (audit P0-2): the LangItems direct
+   properties first (owning LangItems — the collections/owning handles —
+   resolve to their DIRECT owned answer at every nesting depth, exactly
+   the pre-P0-2 langitem rule; the raw pointers answer Copy), then a
+   struct nominal resolves to its field tuple, an enum to its payload
+   function (the def_repr convention the engine's enum rule keys on). *)
+let def_of_tid (env : func_env) (tid : Ids.Type_id.t) : Type_properties.resolved_nominal =
+  match Type_properties.direct_properties_of_langitem env.lang_items tid with
+  | Some p -> Type_properties.Direct_properties p
+  | None -> (
+      match List.assoc_opt tid env.struct_fields with
+      | Some fields ->
+          Type_properties.Structural_def
+            (Type_repr.Tuple
+               (Array.of_list
+                  (List.map (fun (_fname, _fid, fty, _default) -> fty) fields)))
+      | None -> (
+          match List.assoc_opt tid env.enum_payloads with
+          | None -> Type_properties.Unknown
+          | Some variants ->
+              Type_properties.Structural_def
+                (Type_repr.Function
+                   ( Array.of_list
+                       (List.map
+                          (fun (_vname, pty) ->
+                            {
+                              Type_repr.pt_convention = Access_effect.Let;
+                              pt_type = Type_repr.Tuple (Array.of_list pty);
+                            })
+                          variants),
+                     Type_repr.Never ))))
 
 let copyable_ty (env : func_env) (t : Type_repr.t) : bool =
   match t with
@@ -637,17 +671,16 @@ let copyable_ty (env : func_env) (t : Type_repr.t) : bool =
       true
   | Type_repr.String -> false
   | Type_repr.Type_param _ | Type_repr.Infer_var _ | Type_repr.Int_literal _ -> false
-  | Type_repr.Named (tid, _) when is_owned_langitem env tid -> false
   | Type_repr.Tuple _ | Type_repr.Fixed_array _ | Type_repr.Named _ ->
       Type_properties.is_trivially_copyable ~cache:env.copy_cache
-        ~resolve_def:(def_of_tid env) t
+        ~resolve:(def_of_tid env) t
 
 (* Whether a value type is DEFINITELY owned — never Copy under the
-   verifier's rule — WITHOUT a def table: the owned builtin nominals the
-   verifier classifies by name (the LangItem universe: the collections,
-   Option/Result, Box) and the owned scalars (String).  User structs are
-   deliberately EXCLUDED: the verifier resolves their defs (a struct of
-   scalars is Copy), so their value form keeps the Copy operand (the
+   verifier's rule — WITHOUT a def table: the LangItems universe (the
+   owned containers/Option/Result/Box/... handles — the record's
+   owning-handle class) and the owned scalars (String).  User structs
+   are deliberately EXCLUDED: the verifier resolves their defs (a struct
+   of scalars is Copy), so their value form keeps the Copy operand (the
    method-call surface's contract) — the Read conversion applies only
    where ownership is definite. *)
 let rec owned_ty (env : func_env) (t : Type_repr.t) : bool =
@@ -655,17 +688,14 @@ let rec owned_ty (env : func_env) (t : Type_repr.t) : bool =
   | Type_repr.String -> true
   | Type_repr.Type_param _ | Type_repr.Infer_var _ | Type_repr.Int_literal _ -> true
   | Type_repr.Named (tid, args) ->
+      (* the OWNED classes of the record plus the Option/Result enums
+         (whose def-less value form is the pre-P0-2 definitely-owned
+         answer — their copyability is payload-driven, so a def-less
+         Option/Result mention is owned conservatively) *)
       let owned_named =
-        List.exists
-          (fun (n, ty) ->
-            match ty with
-            | Type_repr.Named (t2, _) ->
-                Ids.Type_id.compare t2 tid = 0
-                && List.mem n
-                     [ "Vec"; "Array"; "List"; "Map"; "HashMap"; "Set"; "HashSet";
-                       "Option"; "Result"; "Box" ]
-            | _ -> false)
-          env.types
+        Lang_items.is_owning_handle env.lang_items tid
+        || Lang_items.is_option env.lang_items tid
+        || Lang_items.is_result env.lang_items tid
       in
       owned_named || Array.exists (owned_ty env) args
   | Type_repr.Tuple elems -> Array.exists (owned_ty env) elems
@@ -674,16 +704,6 @@ let rec owned_ty (env : func_env) (t : Type_repr.t) : bool =
   | Type_repr.Float _ | Type_repr.Raw_ptr _ | Type_repr.Ref_internal _
   | Type_repr.Function _ | Type_repr.Never | Type_repr.Error ->
       false
-
-(* The Box nominal's tid (identified by NAME through env.types — the
-   same name-anchored scheme the typechecker uses). *)
-let box_tid_of (env : func_env) : Ids.Type_id.t option =
-  List.find_map
-    (fun (name, r) ->
-      match r with
-      | Type_repr.Named (t, _) when name = "Box" -> Some t
-      | _ -> None)
-    env.types
 
 (* The arm-join store rule mirrors the VERIFIER's type compatibility
    (types_compatible's leading clauses), not a raw Type_repr.compare: a
@@ -1087,19 +1107,11 @@ let nominal_params_of (env : func_env) (tid : Ids.Type_id.t) : Type_repr.t array
   | None -> [||]
 
 (* The Box/Ptr/PtrMut transparency (the typechecker's check_field derefs
-   these nominals on field access): identified by NAME through env.types
-   — the same name-anchored scheme the typechecker uses (b_ptr/b_ptrmut
-   and the Box declaration's canonical tid). *)
+   these nominals on field access): the raw-pointer LangItems and the
+   Box wrapper, identified through the env's LangItems record (audit
+   P0-2). *)
 let transparent_nominal_name_of (env : func_env) (tid : Ids.Type_id.t) : string option =
-  List.find_map
-    (fun (name, r) ->
-      match r with
-      | Type_repr.Named (t, _)
-        when Ids.Type_id.compare t tid = 0
-             && (name = "Box" || name = "Ptr" || name = "PtrMut") ->
-          Some name
-      | _ -> None)
-    env.types
+  if is_deref_transparent_nominal env tid then Some (transparent_desc env tid) else None
 
 (* The own-field lookup: the registry entry of `tid` (present for every
    Struct/Enum nominal; enums' entries are empty).  The registry's
@@ -1132,16 +1144,16 @@ let rec default_operand_of (env : func_env) (st : lower_state)
   | Type_repr.Float Type_repr.F64 -> Seed_mir.Constant (Seed_mir.Float64 0L)
   | Type_repr.String -> Seed_mir.Constant (Seed_mir.String "")
   | Type_repr.Named (tid, args)
-    when Ids.Type_id.compare tid (Ids.Type_id.make 0) = 0 ->
+    when is_vec_langitem env tid ->
       Seed_mir.Constant (Seed_mir.Array (Type_repr.Named (tid, args)))
   | Type_repr.Named (tid, args)
-    when Ids.Type_id.compare tid (Ids.Type_id.make 1) = 0 ->
+    when is_map_langitem env tid ->
       Seed_mir.Constant (Seed_mir.Map (Type_repr.Named (tid, args)))
   | Type_repr.Named (tid, args)
-    when Ids.Type_id.compare tid (Ids.Type_id.make 2) = 0 ->
+    when is_set_langitem env tid ->
       Seed_mir.Constant (Seed_mir.Set (Type_repr.Named (tid, args)))
   | Type_repr.Named (tid, args)
-    when Ids.Type_id.compare tid (Ids.Type_id.make 3) = 0 ->
+    when is_option_langitem env tid ->
       Seed_mir.Constant (Seed_mir.Enum (Ids.Variant_index.make 0, Type_repr.Named (tid, args)))
   | Type_repr.Fixed_array (e, n) ->
       Seed_mir.Constant (Seed_mir.Array (Type_repr.Fixed_array (e, n)))
@@ -1506,12 +1518,12 @@ and lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
             match it with
             | Type_repr.Raw_ptr (_, t) | Type_repr.Ref_internal (_, t) -> t
             | Type_repr.Named (id, args)
-              when (Ids.Type_id.compare id (Ids.Type_id.make 5) = 0
-                    || Ids.Type_id.compare id (Ids.Type_id.make 6) = 0
+              when (Lang_items.is_raw_pointer env.lang_items id
                     || Option.is_some (transparent_nominal_name_of env id))
                    && Array.length args = 1 ->
-                (* the Ptr/PtrMut handle nominals AND the kernel's Box
-                   wrapper (transparent_nominal_name_of — the checker's
+                (* the Ptr/PtrMut handle nominals (the LangItems
+                   raw-pointer class) AND the kernel's Box wrapper
+                   (transparent_nominal_name_of — the checker's
                    deref-on-field/place transparency: Box[T] derefs to
                    its single type argument, so a `*box` read loads the
                    CONTENT, never the wrapper) *)
@@ -1536,8 +1548,7 @@ and lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
               | Type_repr.Named _ when
                     (match it with
                      | Type_repr.Named (id, _) ->
-                         Ids.Type_id.compare id (Ids.Type_id.make 5) = 0
-                         || Ids.Type_id.compare id (Ids.Type_id.make 6) = 0
+                         Lang_items.is_raw_pointer env.lang_items id
                          || Option.is_some (transparent_nominal_name_of env id)
                      | _ -> false) ->
                   p.Seed_mir.projections @ [ Seed_mir.Deref ]
@@ -1621,7 +1632,7 @@ and lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
         | Some node -> (
             match node.tn_type with
             | Type_repr.Named (id, [| e |])
-              when Ids.Type_id.compare id (Ids.Type_id.make 0) = 0 ->
+              when is_vec_langitem env id ->
                 Type_repr.Named (id, [| e |])
             | _ -> Type_repr.Fixed_array (elem_ty, List.length elems))
         | None -> Type_repr.Fixed_array (elem_ty, List.length elems)
@@ -1672,7 +1683,7 @@ and lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
             | Some node -> (
                 match node.tn_type with
                 | Type_repr.Named (id, [| e |])
-                  when Ids.Type_id.compare id (Ids.Type_id.make 0) = 0 ->
+              when is_vec_langitem env id ->
                     Type_repr.Named (id, [| e |])
                 | _ -> Type_repr.Fixed_array (elem_ty, List.length args))
             | None -> Type_repr.Fixed_array (elem_ty, List.length args)
@@ -1684,7 +1695,7 @@ and lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
   | Ast.Index (_, base, idx, _) -> (
       let base_op, base_ty = lower_expr env st base in
       let bp = materialize_place st base_op in
-      let elem_ty = element_type_of base_ty in
+      let elem_ty = element_type_of env base_ty in
       match idx with
       | Ast.IntLit (_, s, _) -> (
           match Literal.parse_integer ~span:Span.synthetic s with
@@ -1850,7 +1861,7 @@ and lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
               runtime index value at execution). *)
            let bop, bty = lower_expr env st base in
            let bp = materialize_place st bop in
-           let elem_ty = element_type_of bty in
+           let elem_ty = element_type_of env bty in
            ignore elem_ty;
            match idx with
            | Ast.IntLit (_, s, _) -> (
@@ -1890,8 +1901,7 @@ and lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
              match bty with
              | Type_repr.Raw_ptr _ | Type_repr.Ref_internal _ -> true
              | Type_repr.Named (tid, _) ->
-                 Ids.Type_id.compare tid (Ids.Type_id.make 5) = 0
-                 || Ids.Type_id.compare tid (Ids.Type_id.make 6) = 0
+                 Lang_items.is_raw_pointer env.lang_items tid
                  || Option.is_some (transparent_nominal_name_of env tid)
              | _ -> false
            in
@@ -2093,7 +2103,7 @@ and lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
               "break/next inside a literal-unrolled for loop (the unrolled seed form has no loop structure to target)";
           let arr_op, arr_ty = lower_expr env st f.Ast.for_iterable in
           let arr_id = materialize_place st arr_op in
-          let elem_ty = element_type_of arr_ty in
+          let elem_ty = element_type_of env arr_ty in
           let bindings =
             match typed_for_of st fid with
             | Some tf ->
@@ -2366,18 +2376,18 @@ and lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
               let is_set =
                 match arr_ty with
                 | Type_repr.Named (id, _)
-                  when Ids.Type_id.compare id (Ids.Type_id.make 2) = 0 ->
+                  when is_set_langitem env id ->
                     true
                 | _ -> false
               in
               let is_map =
                 match arr_ty with
                 | Type_repr.Named (id, _)
-                  when Ids.Type_id.compare id (Ids.Type_id.make 1) = 0 ->
+                  when is_map_langitem env id ->
                     true
                 | _ -> false
               in
-              let elem_ty = element_type_of arr_ty in
+              let elem_ty = element_type_of env arr_ty in
               (* the entries materialization: the Set/Map -> the entries
                  array, cached in a fresh local typed as the entries
                  array (the host's __intrinsic_set_entries returns the
@@ -2447,7 +2457,7 @@ and lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
                 (Seed_mir.SwitchInt
                    (copy_place st (cur_place st cnd_id), [ (1L, body_b) ], join_b));
               push_block st body_b;
-              let elem_ty = element_type_of arr_ty in
+              let elem_ty = element_type_of env arr_ty in
               let bindings =
                 match typed_for_of st fid with
                 | Some tf ->

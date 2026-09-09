@@ -2292,6 +2292,7 @@ end
           struct_fields = Driver.struct_fields_of tcheck_env;
           enum_payloads = Driver.enum_payloads_of tcheck_env;
           copy_cache = Type_properties.create_cache ();
+          lang_items = Lang_items.of_types (tcheck_env).Typecheck.types;
         }
       in
       let mir_funcs =
@@ -3237,6 +3238,7 @@ end
           struct_fields = Driver.struct_fields_of fenv;
           enum_payloads = Driver.enum_payloads_of fenv;
           copy_cache = Type_properties.create_cache ();
+          lang_items = Lang_items.of_types (fenv).Typecheck.types;
         }
       in
       let fmir_funcs =
@@ -3573,6 +3575,7 @@ end
           enum_payloads = Driver.enum_payloads_of wbenv;
 
                   copy_cache = Type_properties.create_cache ();
+          lang_items = Lang_items.of_types (wbenv).Typecheck.types;
 }
       in
       let wb_mir_funcs =
@@ -4399,6 +4402,7 @@ end
           enum_payloads = Driver.enum_payloads_of lenv;
 
                    copy_cache = Type_properties.create_cache ();
+          lang_items = Lang_items.of_types (lenv).Typecheck.types;
 }
        in
        let lmir_funcs =
@@ -4830,6 +4834,7 @@ end
           enum_payloads = Driver.enum_payloads_of menv;
 
                    copy_cache = Type_properties.create_cache ();
+          lang_items = Lang_items.of_types (menv).Typecheck.types;
 }
        in
        let mmir_funcs =
@@ -5105,6 +5110,7 @@ end
                   [ (fs_tid, [ ("a", l_fid_a, int_ty, None); ("b", l_fid_b, int_ty, None) ]) ];
                 enum_payloads = [];
               copy_cache = Type_properties.create_cache ();
+          lang_items = Lang_items.seed_defaults;
               }
             in
             let contains_sub s sub =
@@ -5270,6 +5276,7 @@ end
                 struct_fields = [];
                 enum_payloads = [];
               copy_cache = Type_properties.create_cache ();
+          lang_items = Lang_items.seed_defaults;
               }
             in
             (* (a) the lowerer fails closed with the precise seed_bug —
@@ -5589,6 +5596,7 @@ end
           enum_payloads = Driver.enum_payloads_of qenv;
 
                    copy_cache = Type_properties.create_cache ();
+          lang_items = Lang_items.of_types (qenv).Typecheck.types;
 }
        in
        let qmir_funcs =
@@ -5840,6 +5848,7 @@ end
            struct_fields = [ (va_tid, [ ("data", va_fid, int_ty, None) ]) ];
                 enum_payloads = [];
          copy_cache = Type_properties.create_cache ();
+          lang_items = Lang_items.seed_defaults;
          }
        in
        let va_span = Span.synthetic in
@@ -6103,6 +6112,7 @@ end
            struct_fields = [];
                 enum_payloads = [];
          copy_cache = Type_properties.create_cache ();
+          lang_items = Lang_items.seed_defaults;
          }
        in
        let sqmir_funcs =
@@ -6326,6 +6336,7 @@ end
           enum_payloads = Driver.enum_payloads_of qc_env;
 
                    copy_cache = Type_properties.create_cache ();
+          lang_items = Lang_items.of_types (qc_env).Typecheck.types;
 }
        in
        let qc_mir_funcs =
@@ -6547,6 +6558,7 @@ end
           enum_payloads = Driver.enum_payloads_of w_env;
 
                    copy_cache = Type_properties.create_cache ();
+          lang_items = Lang_items.of_types (w_env).Typecheck.types;
 }
        in
        let w_main_decl =
