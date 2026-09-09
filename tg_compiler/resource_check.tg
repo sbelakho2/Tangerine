@@ -6,7 +6,7 @@ use tg_compiler::ast::{
   Block, Stmt, StmtKind, Expr, ExprKind, Pattern, PatternKind, Param,
   AccessConvention, GuardElse, MatchExpr, IfStmt, ForStmt, ClosureParam
 }
-use tg_compiler::types::{Type, TypeKind, ParamType, AccessEffect, TypedProgram, TypeId, TypeEnv, type_properties_of, TypeDef, TypeDefKind, FieldInfo, VariantInfo, LangItems, ImplInfo, TraitRefTemplate, fn_owner_key, fn_owner_key_of_item, is_trivially_copyable, is_slice_view_type_of, is_shared_view_type_of, finalizer_kind_of_callable, FunctionCleanupTable, FunctionCleanup, ScopeId, DeferId, AssignExactDrop, function_cleanup_table_new, crate_module_path_of, def_id_kind_of, ProjectionKey, ProjectionChain, projection_chain_of, projection_key_eq, place_move_path_of, TypedExprKind, chain_contains_key, effect_handler_synth_key}
+use tg_compiler::types::{Type, TypeKind, ParamType, AccessEffect, TypedProgram, TypeId, TypeEnv, type_properties_of, TypeDef, TypeDefKind, FieldInfo, VariantInfo, LangItems, ImplInfo, TraitRefTemplate, fn_owner_key, fn_owner_key_of_item, is_trivially_copyable, is_slice_view_type_of, is_shared_view_type_of, finalizer_kind_of_callable, FunctionCleanupTable, FunctionCleanup, ScopeId, DeferId, AssignExactDrop, function_cleanup_table_new, crate_module_path_of, def_id_kind_of, ProjectionKey, ProjectionChain, projection_chain_of, projection_key_eq, place_move_path_of, TypedExprKind, effect_handler_synth_key}
 use tg_compiler::resolver::{module_path_of_item_resolver, def_kind_of, ResolvedNames}
 use tg_compiler::access_check::{AccessError}
 use tg_compiler::ids::{DefId, DefKind, LocalId, TraitId, FinalizerKind, generic_param_table_new, NodeId, AccessId, CfgEdgeId, CallableId, FieldId}
@@ -4078,38 +4078,39 @@ def check_stmt(program: Program, typed: TypedProgram, inout env: TypeEnv, inout 
       # the callee (a previous assignment), so overwriting it without a
       # drop leaks that value.
       if t.drops_old then
-        # (partial moves): the drop-before-store form — the WHOLE-root drop
-        # (depth-1) must not share storage with the value's source: the RHS
-        # rooting at the SAME local (a direct whole-root or projected move)
-        # would destroy the value's source (the drop-before-store and the
-        # source move cannot share the storage) — rejected. The NESTED
-        # exact-place drop destroys only the target chain's own state, so
-        # the same-root chain-move guard applies, but the root's OTHER
-        # chains (consumed or live) are untouched — the root_has_moves
-        # whole-root guard does not apply to the exact-place form.
+        # (partial moves — the exact-place replacement): the
+        # drop-before-store form for EVERY projected field target (any
+        # chain depth >= 1) is the EXACT-place drop — the old value of the
+        # target place itself is destroyed (the assign_exact_drops plan:
+        # the chain + its consumed-extension paths, which the MIR's
+        # assign-drop chain consumes) — the root's OTHER chains, the
+        # siblings, are NEVER destroyed. The same-root RHS guard: the
+        # exact drop runs before the RHS materializes (the assign-drop
+        # chain precedes the store), so an RHS operand rooted at the same
+        # local whose storage OVERLAPS the target chain (the operand IS
+        # the target chain, an extension of it, or an ancestor containing
+        # it) would be destroyed before its value is read or moved —
+        # rejected. A disjoint sibling-chain RHS is accepted — the exact
+        # drop never touches the sibling's storage.
         var target_chain = Vec::new()
         let target_is_field = if !expr_is_plain(target) then
           place_projection_keys(typed, &target, &mut target_chain)
         else
           false
         end
-        if !expr_is_plain(target) && target_is_field && target_chain.len() > 1 then
-          if expr_roots_at(typed, &value, t.lid.id) then
+        if !expr_is_plain(target) && target_is_field then
+          if rhs_reads_overlap_target(typed, &value, t.lid.id, &target_chain) then
             errors.push(ResourceError {
-              message: "cannot assign over an owning projected place: the value moves out of the same root (the drop-before-store would destroy its source)",
+              message: "cannot assign over an owning projected place: the value reads or moves out of the replaced value's own storage (the drop-before-store would destroy its source)",
               span: value.span
             })
           else
-            # The nested exact-place drop: the chain's own state is
-            # destroyed before the store (masked to the chain's consumed
-            # extensions — the assign_exact_drops plan the MIR's
-            # assign-drop chain consumes). the assign-drop chain is NOT a
-            # CFG edge — it is the drop-before-store chain inside one
-            # statement, with no CfgEdgeKind in the edge model (no
-            # transfer originates it). the chain is the SEMANTIC
-            # assign_exact_drops table (node id -> the exact-place drop
-            # records) — the "assign::<stmt id>" String-key protocol is
-            # not part of the model.
+            # the assign-drop chain is NOT a CFG edge — it is the
+            # drop-before-store chain inside one statement, with no
+            # CfgEdgeKind in the edge model (no transfer originates it).
+            # the chain is the SEMANTIC assign_exact_drops table (node id
+            # -> the exact-place drop records) — the "assign::<stmt id>"
+            # String-key protocol is not part of the model.
             var exact = Vec::new()
             exact.push(AssignExactDrop {
               local: t.lid.id,
@@ -4118,50 +4119,44 @@ def check_stmt(program: Program, typed: TypedProgram, inout env: TypeEnv, inout 
             })
             let _ = finalize_plan.assign_exact_drops.insert(stmt.node_id, exact)
           end
-        elsif !expr_is_plain(target) && root_has_moves(frame, t.lid) then
-          errors.push(ResourceError {
-            message: "cannot assign over an owning projected place: the value moves out of the same root (the drop-before-store would destroy its source)",
-            span: value.span
-          })
-        elsif !expr_is_plain(target) && expr_roots_at(typed, &value, t.lid.id) then
-          errors.push(ResourceError {
-            message: "cannot assign over an owning projected place: the value moves out of the same root (the drop-before-store would destroy its source)",
-            span: value.span
-          })
         else
-          # boundary: the assign_drops plan keeps the raw Int semantic id
-          # (the MIR's semantic_to_mir bridge maps it).
-          var assign_ids = Vec::new()
-          assign_ids.push(t.lid.id)
-          # the assign-drop chain is NOT a CFG edge — it is the
-          # drop-before-store chain inside one statement, with no CfgEdgeKind
-          # in the edge model (no transfer originates it). the chain is
-          # the SEMANTIC assign_drops table (node id -> local ids) — the
-          # "assign::<stmt id>" String-key protocol is not part of the model.
-          let _ = finalize_plan.assign_drops.insert(stmt.node_id, assign_ids)
+          # The whole-root replacement (a plain target) — the ONE remaining
+          # whole-value masked-drop form, applying ONLY to the whole-root
+          # replace (never to a child replacement): a root that still
+          # carries consumed chains drops exactly its LIVE children (the
+          # dead chains' storage is skipped — the masked whole-root drop,
+          # with the consumed paths recorded in the entry); a fully-live
+          # root is the plain whole-value drop. Both are recorded through
+          # the same exact-drop table with the empty chain; the MIR lowers
+          # the masked form through the partial-drop chain.
+          var empty_chain = Vec::new()
+          var exact2 = Vec::new()
+          exact2.push(AssignExactDrop {
+            local: t.lid.id,
+            chain: empty_chain,
+            paths: assign_exact_drop_paths(typed, env, frame, t.lid, &empty_chain)
+          })
+          let _ = finalize_plan.assign_exact_drops.insert(stmt.node_id, exact2)
         end
       end
       # The store commits AFTER the drop decision: next_state comes from
       # prior_state, never from a validation-time mutation.
       res_frame_set(frame, t.lid, t.next)
+      # A WHOLE-value store re-lives the root's every chain: the masked
+      # drop destroyed the live parts and the dead chains' storage is
+      # overwritten by the new value — no chain record survives the store.
+      if expr_is_plain(target) then
+        frame.place_moves.remove(t.lid)
+      end
       # (partial moves — the projected-target commit): the chain-level
-      # transition — the sibling DIRECT fields die with the whole-root
-      # drop chain (marked Consumed, so the scope-exit drop drops only the
-      # re-stored target), and the target chain re-lives (clear + Live).
+      # transition — the store re-lives the target chain and its
+      # extensions (clear + Live). The siblings are NEVER marked: the
+      # exact-place drop destroyed only the chain's own state, so every
+      # sibling — live or already consumed — keeps its record.
       if !expr_is_plain(target) then
         var chain = Vec::new()
         let field_chain = place_projection_keys(typed, &target, &mut chain)
         if field_chain then
-          if t.drops_old then
-            # The whole-root drop (the depth-1 owning target) destroys the
-            # sibling DIRECT fields — they are marked Consumed so the
-            # scope-exit drop skips them. The NESTED exact-place drop
-            # destroys only the chain's own state — the siblings stay
-            # live, no marking.
-            if chain.len() == 1 then
-              mark_frame_sibling_fields(typed, frame, t.lid, &chain)
-            end
-          end
           frame_place_clear(frame, t.lid, &chain)
           frame_place_mark(frame, t.lid, &chain, ResourceState::Live)
         end
@@ -6429,28 +6424,30 @@ def check_expr(program: Program, typed: TypedProgram, inout env: TypeEnv, inout 
       # (Uninitialized — the first store into a set parameter's caller
       # buffer; Consumed — a reinitialized moved-out slot) never drops.
       if t.drops_old then
-        # (partial moves): the same-root RHS guard (see StmtAssign). The
-        # NESTED exact-place drop destroys only the target chain's own
-        # state — the root_has_moves whole-root guard does not apply to the
-        # exact-place form.
+        # (partial moves — the exact-place replacement, see StmtAssign):
+        # EVERY projected field target (any chain depth >= 1) destroys
+        # exactly the old value of the target place; the siblings are
+        # never touched. The same-root RHS guard rejects an RHS operand
+        # whose storage OVERLAPS the target chain (it would be destroyed
+        # by the drop before the RHS materializes); a disjoint
+        # sibling-chain RHS is accepted.
         var target_chain = Vec::new()
         let target_is_field = if !expr_is_plain(target) then
           place_projection_keys(typed, &target, &mut target_chain)
         else
           false
         end
-        if !expr_is_plain(target) && target_is_field && target_chain.len() > 1 then
-          if expr_roots_at(typed, &value, t.lid.id) then
+        if !expr_is_plain(target) && target_is_field then
+          if rhs_reads_overlap_target(typed, &value, t.lid.id, &target_chain) then
             errors.push(ResourceError {
-              message: "cannot assign over an owning projected place: the value moves out of the same root (the drop-before-store would destroy its source)",
+              message: "cannot assign over an owning projected place: the value reads or moves out of the replaced value's own storage (the drop-before-store would destroy its source)",
               span: value.span
             })
           else
-            # The nested exact-place drop (see StmtAssign): the chain's own
-            # state is destroyed before the store, masked to the chain's
-            # consumed extensions. The ExprAssign's MIR lowering keys on
-            # the EXPRESSION's node id (unlike StmtAssign which keys on the
-            # statement's).
+            # the chain's own state is destroyed before the store, masked
+            # to the chain's consumed extensions. The ExprAssign's MIR
+            # lowering keys on the EXPRESSION's node id (unlike StmtAssign
+            # which keys on the statement's).
             var exact = Vec::new()
             exact.push(AssignExactDrop {
               local: t.lid.id,
@@ -6459,48 +6456,36 @@ def check_expr(program: Program, typed: TypedProgram, inout env: TypeEnv, inout 
             })
             let _ = finalize_plan.assign_exact_drops.insert(expr.node_id, exact)
           end
-        elsif !expr_is_plain(target) && root_has_moves(frame, t.lid) then
-          errors.push(ResourceError {
-            message: "cannot assign over an owning projected place: the value moves out of the same root (the drop-before-store would destroy its source)",
-            span: value.span
-          })
-        elsif !expr_is_plain(target) && expr_roots_at(typed, &value, t.lid.id) then
-          errors.push(ResourceError {
-            message: "cannot assign over an owning projected place: the value moves out of the same root (the drop-before-store would destroy its source)",
-            span: value.span
-          })
         else
-          var assign_ids = Vec::new()
-          assign_ids.push(t.lid.id)
-          # The ExprAssign's MIR lowering keys on the EXPRESSION's
-          # node id (unlike StmtAssign which keys on the statement's).
-          # the assign-drop chain is NOT a CFG edge — it is the
-          # drop-before-store chain inside one expression, with no
-          # CfgEdgeKind in the edge model (no transfer originates it).
-          # the chain is the SEMANTIC assign_drops table (node id ->
-          # local ids) — the "assign::<expr id>" String-key protocol is
-          # are not part of the model
-          let _ = finalize_plan.assign_drops.insert(expr.node_id, assign_ids)
+          # The whole-root replacement (a plain target) — see StmtAssign:
+          # the masked whole-root drop (the consumed paths recorded) for a
+          # root that still carries consumed chains; the plain whole-value
+          # drop for a fully-live root.
+          var empty_chain = Vec::new()
+          var exact2 = Vec::new()
+          exact2.push(AssignExactDrop {
+            local: t.lid.id,
+            chain: empty_chain,
+            paths: assign_exact_drop_paths(typed, env, frame, t.lid, &empty_chain)
+          })
+          let _ = finalize_plan.assign_exact_drops.insert(expr.node_id, exact2)
         end
       end
       # The store commits AFTER the drop decision: next_state comes from
       # prior_state, never from a validation-time mutation.
       res_frame_set(frame, t.lid, t.next)
-      # (partial moves — the projected-target commit, see StmtAssign).
+      # A WHOLE-value store re-lives the root's every chain (see
+      # StmtAssign): no chain record survives the store.
+      if expr_is_plain(target) then
+        frame.place_moves.remove(t.lid)
+      end
+      # (partial moves — the projected-target commit, see StmtAssign): the
+      # store re-lives the target chain and its extensions (clear + Live);
+      # the siblings are NEVER marked.
       if !expr_is_plain(target) then
         var chain = Vec::new()
         let field_chain = place_projection_keys(typed, &target, &mut chain)
         if field_chain then
-          if t.drops_old then
-            # The whole-root drop (the depth-1 owning target) destroys the
-            # sibling DIRECT fields — they are marked Consumed so the
-            # scope-exit drop skips them. The NESTED exact-place drop
-            # destroys only the chain's own state — the siblings stay
-            # live, no marking.
-            if chain.len() == 1 then
-              mark_frame_sibling_fields(typed, frame, t.lid, &chain)
-            end
-          end
           frame_place_clear(frame, t.lid, &chain)
           frame_place_mark(frame, t.lid, &chain, ResourceState::Live)
         end
@@ -6681,22 +6666,19 @@ def check_assign_target(program: Program, typed: TypedProgram, inout env: TypeEn
           # root's storage; the root's OWN state does not change (next =
           # prior for the root) but the TARGET CHAIN's prior state decides
           # the drop-before-store and the chain's next state (the
-          # AssignmentTransition carries the chain-level transition):
-          #   - dead storage (a moved-out chain): the store re-lives the
-          #     chain without a drop;
-          #   - a Live OWNING chain: the old value's drop-before-store. The
-          #     chain-effective-state PREFIX RULE decides the form:
-          #     * a DEPTH-1 target — the MIR's assign-drop chain can only
-          #       destroy the WHOLE root, so the whole-root drop is
-          #       representable only when the root is FULLY live (no
-          #       consumed chains — the drop would re-drop them), and the
-          #       root's direct-field shape is known (the destroyed sibling
-          #       fields must be marked for the scope-exit drop);
-          #     * a NESTED target (depth >= 2) whose chain's own state is
-          #       Live — the EXACT-PLACE replacement: the drop-before-store
-          #       destroys the chain's own state (x.a.b) only, masked to
-          #       skip the chain's consumed extensions — the root's other
-          #       chains (live or consumed) are untouched;
+          # AssignmentTransition carries the chain-level transition) — the
+          # EXACT-PLACE REPLACEMENT model (the canonical replacement
+          # semantics, every chain depth >= 1):
+          #   - dead storage (the target chain ITSELF was moved out): the
+          #     store re-lives the chain without a drop;
+          #   - a target chain under a CONSUMED proper prefix (a containing
+          #     field was moved out): the assignment would write through
+          #     the moved-out value — rejected;
+          #   - a Live OWNING chain: the EXACT drop-before-store — the
+          #     drop destroys the chain's OWN value (x.a / x.a.b — the
+          #     assign_exact_drops plan), masked to skip the chain's
+          #     consumed extensions — the root's other chains (live or
+          #     consumed — the siblings) are NEVER touched;
           #   - a Live non-owning chain: a plain store, no drop;
           #   - an INDEXED target (the whole-value boundary): the MIR's
           #     indexed-assign drop is the old-element drop authority (the
@@ -6719,9 +6701,22 @@ def check_assign_target(program: Program, typed: TypedProgram, inout env: TypeEn
               let eff = chain_effective_state(frame, lid, &chain)
               match eff
               when ResourceState::Consumed then
-                # Dead field storage: the store re-lives the field without
-                # a drop (the re-assignment of a moved-out field).
-                Option::Some(AssignmentTransition { lid: lid, prior: prior_state, next: prior_state, drops_old: false })
+                # The chain-effective state is Consumed either because the
+                # target chain ITSELF was moved out (dead field storage —
+                # the store re-lives the field without a drop — the
+                # re-assignment of a moved-out field) or because a CONSUMED
+                # PROPER PREFIX contains the target (the target storage
+                # lies inside a moved-out value — the assignment would
+                # write through it — rejected).
+                if chain_self_row_consumed(frame, lid, &chain) then
+                  Option::Some(AssignmentTransition { lid: lid, prior: prior_state, next: prior_state, drops_old: false })
+                else
+                  errors.push(ResourceError {
+                    message: "cannot assign into field `" + chain_display(typed, &chain) + "` of " + ownership_label(frame, id) + " `" + binding_name(typed, id) + "`: the containing field was moved out (the assignment would write through the moved-out value)",
+                    span: target.span
+                  })
+                  Option::Some(AssignmentTransition { lid: lid, prior: prior_state, next: prior_state, drops_old: false })
+                end
               when ResourceState::MaybeLive then
                 errors.push(ResourceError {
                   message: "field `" + chain_display(typed, &chain) + "` of " + ownership_label(frame, id) + " `" + binding_name(typed, id) + "` may be consumed on one path",
@@ -6732,37 +6727,17 @@ def check_assign_target(program: Program, typed: TypedProgram, inout env: TypeEn
                 match res_frame_get_origin(frame, &lid)
                 when Option::Some(origin) then
                   if origin == ParamOrigin::Sink || origin == ParamOrigin::OwnedLocal || origin == ParamOrigin::Set then
-                    # The old owning value's drop-before-store — the target
-                    # FIELD's type must own (a Copy-field store overwrites
-                    # without a drop). The representability is decided by
-                    # the chain-effective-state PREFIX RULE:
-                    #   - a DEPTH-1 target with the fully-live depth-1
-                    #     shape (see the note above) is the whole-root drop;
-                    #   - a NESTED target (depth >= 2) whose chain's own
-                    #     state is Live (the prefix rule — every prefix of
-                    #     the chain is live) is the EXACT-PLACE
-                    #     replacement: the drop-before-store destroys the
-                    #     chain's OWN state (the assign_exact_drops plan —
-                    #     the exact place x.a.b, masked to skip the
-                    #     chain's consumed extensions). The exact-place
-                    #     drop does not touch the root's other chains, so
-                    #     the depth-1 whole-root gates (root_has_moves /
-                    #     root_direct_shape_known) do not apply.
+                    # The old owning value's EXACT drop-before-store — the
+                    # target FIELD's type must own (a Copy-field store
+                    # overwrites without a drop). Every chain depth (>= 1)
+                    # is the exact-place replacement: the drop destroys the
+                    # chain's OWN state (the assign_exact_drops plan — the
+                    # exact place x.a / x.a.b, masked to skip the chain's
+                    # consumed extensions). The exact-place drop never
+                    # touches the root's other chains, so no whole-root
+                    # gate (root_has_moves / root_direct_shape_known)
+                    # applies at any depth.
                     if !expr_type_has_resource(env, typed, target) then
-                      Option::Some(AssignmentTransition { lid: lid, prior: prior_state, next: prior_state, drops_old: false })
-                    elsif chain.len() > 1 then
-                      Option::Some(AssignmentTransition { lid: lid, prior: prior_state, next: prior_state, drops_old: true })
-                    elsif root_has_moves(frame, lid) then
-                      errors.push(ResourceError {
-                        message: "cannot assign over an owning projected place: the root is partially moved out (the masked drop-before-store is not representable)",
-                        span: target.span
-                      })
-                      Option::Some(AssignmentTransition { lid: lid, prior: prior_state, next: prior_state, drops_old: false })
-                    elsif !root_direct_shape_known(typed, lid) then
-                      errors.push(ResourceError {
-                        message: "cannot assign over an owning projected place: the root's field shape is unknown (the sibling fields cannot be masked)",
-                        span: target.span
-                      })
                       Option::Some(AssignmentTransition { lid: lid, prior: prior_state, next: prior_state, drops_old: false })
                     else
                       Option::Some(AssignmentTransition { lid: lid, prior: prior_state, next: prior_state, drops_old: true })
@@ -6843,8 +6818,12 @@ def apply_arg_effect(program: Program, typed: TypedProgram, inout env: TypeEnv, 
               if field_chain then
                 apply_projected_consume(env, typed, id, &chain, arg.span, loop_outer, frame, errors)
               else
-                # The whole-value boundary (an indexed/deref place): the
-                # aggregate marking (see transfer_consume).
+                # The whole-value boundary (an indexed/deref place — the
+                # dynamic-container ownership boundary): the element-state
+                # rule rejects the consuming extraction (the diagnostic
+                # names the sanctioned container operations) and the
+                # aggregate marking follows (see apply_whole_boundary_
+                # consume / transfer_consume).
                 apply_whole_boundary_consume(env, typed, id, arg.span, loop_outer, frame, errors)
               end
             else
@@ -6881,9 +6860,10 @@ def apply_arg_effect(program: Program, typed: TypedProgram, inout env: TypeEnv, 
               # The whole-value boundary (an indexed place): the container
               # elements are the aggregate — the per-index storage state is
               # not tracked, so an owning-typed indexed set argument stays
-              # rejected (conservative).
+              # rejected (conservative; the diagnostic names the sanctioned
+              # element-initializing container operations).
               errors.push(ResourceError {
-                message: "cannot initialize a projected place: element-level state is not tracked (the container's elements are the ownership unit)",
+                message: "cannot initialize a projected place: element-level state is not tracked (the container's elements are the ownership unit); initialize element storage through the container's inout APIs instead — Vec push / insert(index, item), Map insert, the fixed containers' push — or a `with c[i] as inout` binding",
                 span: arg.span
               })
             end
@@ -7401,8 +7381,15 @@ end
 # The SEMANTIC chain of a place expression: the FieldId/TupleIndex
 # projections in access order (typed.field_targets / typed.typed_exprs —
 # the typed HIR's strong identities). Returns false when the chain passes
-# through a non-field/tuple projection (Index/Deref — the whole-value
-# lattice boundary).
+# through a non-static projection — a dynamic index or a deref (the
+# whole-value lattice boundary). The STATIC-PLACE rule (the split the
+# lattice enforces): a place is exact exactly when every projection is a
+# struct field, a tuple index, an enum-payload position, or a CONSTANT
+# index over a FIXED-ARRAY base (the finite indices — in-range records
+# the Index key and returns true; an out-of-range constant and any
+# non-fixed-array base stay the boundary). A runtime index (Vec[i] /
+# Map[k]) and a deref are NEVER static chains — the container's elements
+# are the ownership unit.
 # The constant integer index of an expression (the AST integer literal).
 def typed_const_index(typed: TypedProgram, expr: Expr) -> Option[Int]
   match expr.kind
@@ -7525,7 +7512,7 @@ def chain_effective_state(frame: ResFrame, lid: tg_compiler::ids::LocalId, chain
   ResourceState::Live  end
 end
 
-# (partial moves — the nested owning projected replacement): the CONSUMED
+# (partial moves — the exact-place replacement): the CONSUMED
 # EXTENSIONS of the target chain — the serialized relative paths (the
 # place_move_path_of key form — the shared key form of the checker's
 # ProjectionChain serialization) whose storage the MIR's exact-place
@@ -7658,65 +7645,373 @@ def place_move_path_matches_chain(typed: TypedProgram, path: String, chain: Vec[
   chain_display(typed, chain) == path
 end
 
-# The root's direct-field shape (the sibling-masking of the whole-root
-# assign-drop case needs the declaration-order field list).
-def root_direct_shape_known(typed: TypedProgram, lid: tg_compiler::ids::LocalId) -> Bool
-  match typed.local_bindings.get(lid.id)
-  when Option::Some(lb) then
-    match lb.ty
-    when Type::Adt(tid, _) then
-      match typed.type_fields.get(tid.id)
-      when Option::Some(fields) then fields.len() > 0
-      when Option::None then false
-      end
-    when Type::Tuple(fields) then fields.len() > 0
-    when _ then false
+# Is the TARGET CHAIN's own recorded row Consumed (the chain itself was
+# moved out — its storage is dead and a store re-lives it without a drop)?
+# A Consumed PROPER PREFIX (a containing field moved out) is the
+# write-through-the-moved-out-value case — chain_effective_state reports
+# Consumed for both, and the assign-target validation consults this exact
+# row to tell them apart.
+def chain_self_row_consumed(frame: ResFrame, lid: tg_compiler::ids::LocalId, chain: Vec[ProjectionKey]) -> Bool
+  match frame.place_moves.get(lid)
+  when Option::Some(chains) then
+    let pc = projection_chain_of(chain)
+    match chains.get(pc)
+    when Option::Some(st) then st == ResourceState::Consumed
+    when Option::None then false
     end
   when Option::None then false
   end  end
 end
 
-# (partial moves): mark the root's DIRECT fields other than the target
-# chain Consumed in the frame lattice — the whole-root assign-drop chain
-# destroys them; the scope-exit drop then drops only the re-stored target.
-def mark_frame_sibling_fields(typed: TypedProgram, inout frame: ResFrame, lid: tg_compiler::ids::LocalId, target: Vec[ProjectionKey]) -> Unit
-  match typed.local_bindings.get(lid.id)
-  when Option::Some(lb) then
-    match lb.ty
-    when Type::Adt(tid, _) then
-      match typed.type_fields.get(tid.id)
-      when Option::Some(fields) then
-        var fi = 0
-        while fi < fields.len() do
-          let sk = ProjectionKey::Field(FieldId { owner: tid, index: fi })
-          if !chain_contains_key(target, &sk) then
-            frame_place_mark(frame, lid, &Vec::from([sk]), ResourceState::Consumed)
-          end
-          fi = fi + 1
-        end
+# Do two static chains overlap — equal, or one a prefix of the other? The
+# exact-place drop of the target chain destroys the operand's storage when
+# the operand chain equals the target, extends it (a sub-value inside the
+# replaced value), or prefixes it (an ancestor value containing the
+# replaced place).
+def chains_overlap(a: Vec[ProjectionKey], b: Vec[ProjectionKey]) -> Bool
+  # equal chains or a prefix relation: the shorter chain must match the
+  # longer chain's leading segments.
+  var lim = a.len()
+  if b.len() < lim then lim = b.len() end
+  var i = 0
+  while i < lim do
+    if !projection_key_eq(&a[i], &b[i]) then
+      return false
+    end
+    i = i + 1
+  end
+  true
+end
+
+# Does the RHS of an exact-place assignment read or move storage that the
+# exact drop of `chain` (rooted at `lid`) destroys? The drop-before-store
+# runs BEFORE the RHS materializes (the MIR's assign-drop chain precedes
+# the store's rvalue), so an RHS operand that overlaps the destroyed
+# subtree would read or move a destroyed value — the same-root-RHS guard.
+# The walk classifies every place-shaped sub-expression in an OPERAND
+# position (the base of a projection spine is a chain continuation, never
+# an independent operand); an operand rooted at `lid` whose static chain
+# overlaps `chain` is the hazard; an operand rooted at `lid` that cannot
+# resolve to a static chain (an indexed/deref boundary) is conservatively
+# a hazard too; operands rooted at other locals are disjoint — the exact
+# drop destroys only `lid`'s storage, so a sibling chain RHS (a read or a
+# move of another field of the same root) is accepted.
+def rhs_reads_overlap_target(typed: TypedProgram, expr: Expr, lid: Int, chain: Vec[ProjectionKey]) -> Bool
+  var found = false
+  rhs_scan_expr(typed, expr, false, lid, &chain, &mut found)
+  found
+end
+
+# One expression node of the RHS scan (see rhs_reads_overlap_target).
+# `in_chain` marks a node that is a continuation of a place-projection
+# spine (its own chain was already reported by the spine's top).
+def rhs_scan_expr(typed: TypedProgram, expr: Expr, in_chain: Bool, lid: Int, chain: Vec[ProjectionKey], inout found: Bool) -> Unit
+  if found then return end
+  match expr.kind
+  when ExprKind::ExprIdent(_) then
+    # A bare root operand: the whole-root place of its local. The whole
+    # root contains every chain — an operand here is the hazard.
+    if !in_chain then
+      match expr_root_id(typed, expr)
+      when Option::Some(id) then
+        if id == lid then found = true end
       when Option::None then ()
       end
-    when Type::Tuple(fields) then
-      var ti = 0
-      while ti < fields.len() do
-        let sk = ProjectionKey::TupleIndex(ti)
-        if !chain_contains_key(target, &sk) then
-          frame_place_mark(frame, lid, &Vec::from([sk]), ResourceState::Consumed)
-        end
-        ti = ti + 1
-      end
-    when _ then ()
     end
-  when Option::None then ()
+  when ExprKind::ExprFieldAccess(base, _) then
+    # A projection-spine node. At an operand position the node itself is
+    # the read/move of the whole spine place — record its chain when it
+    # roots at `lid`; the base continues the spine (never an independent
+    # operand). A node over a COMPUTED base (no local root) carries its
+    # operand reads inside the base subtree — descend it as operands.
+    if !in_chain then
+      var op_chain = Vec::new()
+      let resolvable = place_projection_keys(typed, expr, &mut op_chain)
+      match expr_root_id(typed, expr)
+      when Option::Some(id) then
+        if id == lid then
+          if !resolvable then
+            found = true
+          elsif chains_overlap(op_chain, chain) then
+            found = true
+          end
+        end
+      when Option::None then
+        rhs_scan_expr(typed, &base, false, lid, chain, &mut found)
+      end
+    else
+      rhs_scan_expr(typed, &base, true, lid, chain, &mut found)
+    end
+  when ExprKind::ExprIndex(base, idx) then
+    # Same spine rule; the INDEX expression is an operand position of its
+    # own (its reads are independent of the spine).
+    if !in_chain then
+      var op_chain = Vec::new()
+      let resolvable = place_projection_keys(typed, expr, &mut op_chain)
+      match expr_root_id(typed, expr)
+      when Option::Some(id) then
+        if id == lid then
+          if !resolvable then
+            found = true
+          elsif chains_overlap(op_chain, chain) then
+            found = true
+          end
+        end
+      when Option::None then
+        rhs_scan_expr(typed, &base, false, lid, chain, &mut found)
+      end
+    else
+      rhs_scan_expr(typed, &base, true, lid, chain, &mut found)
+    end
+    rhs_scan_expr(typed, &idx, false, lid, chain, &mut found)
+  when ExprKind::ExprAccess(inner) then
+    rhs_scan_place_spine(typed, expr, &inner, in_chain, lid, chain, &mut found)
+  when ExprKind::ExprCast(inner, _) then
+    rhs_scan_place_spine(typed, expr, &inner, in_chain, lid, chain, &mut found)
+  when ExprKind::ExprRawDeref(inner) then
+    # A deref operand is the whole-value boundary: an operand rooted at
+    # `lid` cannot be proven disjoint from the destroyed chain — the
+    # conservative hazard. (A deref of a DIFFERENT root's pointer is not
+    # an operand of this root — the inner pointer's own read follows the
+    # spine rule below.)
+    if !in_chain then
+      match expr_root_id(typed, expr)
+      when Option::Some(id) then
+        if id == lid then found = true end
+      when Option::None then ()
+      end
+    end
+    rhs_scan_expr(typed, &inner, true, lid, chain, &mut found)
+  when ExprKind::ExprBinaryOp(_, lhs, rhs) then
+    rhs_scan_expr(typed, &lhs, false, lid, chain, &mut found)
+    rhs_scan_expr(typed, &rhs, false, lid, chain, &mut found)
+  when ExprKind::ExprUnaryOp(_, operand) then
+    rhs_scan_expr(typed, &operand, false, lid, chain, &mut found)
+  when ExprKind::ExprTypeCheck(inner, _) then
+    rhs_scan_expr(typed, &inner, false, lid, chain, &mut found)
+  when ExprKind::ExprArrayLit(elems) then
+    var ai = 0
+    while ai < elems.len() do
+      rhs_scan_expr(typed, &elems[ai], false, lid, chain, &mut found)
+      ai = ai + 1
+    end
+  when ExprKind::ExprArrayRepeat(elem, count) then
+    rhs_scan_expr(typed, &elem, false, lid, chain, &mut found)
+    rhs_scan_expr(typed, &count, false, lid, chain, &mut found)
+  when ExprKind::ExprTupleLit(elems) then
+    var ti = 0
+    while ti < elems.len() do
+      rhs_scan_expr(typed, &elems[ti], false, lid, chain, &mut found)
+      ti = ti + 1
+    end
+  when ExprKind::ExprStructLit(_, fields) then
+    var fi = 0
+    while fi < fields.len() do
+      rhs_scan_expr(typed, &fields[fi].1, false, lid, chain, &mut found)
+      fi = fi + 1
+    end
+  when ExprKind::ExprMapLit(pairs) then
+    var pi = 0
+    while pi < pairs.len() do
+      rhs_scan_expr(typed, &pairs[pi].0, false, lid, chain, &mut found)
+      rhs_scan_expr(typed, &pairs[pi].1, false, lid, chain, &mut found)
+      pi = pi + 1
+    end
+  when ExprKind::ExprCall(callee, args) then
+    rhs_scan_expr(typed, &callee, false, lid, chain, &mut found)
+    var ci2 = 0
+    while ci2 < args.len() do
+      rhs_scan_expr(typed, &args[ci2], false, lid, chain, &mut found)
+      ci2 = ci2 + 1
+    end
+  when ExprKind::ExprMethodCall(receiver, _, _, args) then
+    rhs_scan_expr(typed, &receiver, false, lid, chain, &mut found)
+    var mi = 0
+    while mi < args.len() do
+      rhs_scan_expr(typed, &args[mi], false, lid, chain, &mut found)
+      mi = mi + 1
+    end
+  when ExprKind::ExprEnumVariant(_, _, args) then
+    var ei = 0
+    while ei < args.len() do
+      rhs_scan_expr(typed, &args[ei], false, lid, chain, &mut found)
+      ei = ei + 1
+    end
+  when ExprKind::ExprMacroCall(_, args) then
+    var mi2 = 0
+    while mi2 < args.len() do
+      rhs_scan_expr(typed, &args[mi2], false, lid, chain, &mut found)
+      mi2 = mi2 + 1
+    end
+  when ExprKind::ExprClosure(_, _, body) then
+    rhs_scan_expr(typed, &body, false, lid, chain, &mut found)
+  when ExprKind::ExprIf(if_stmt) then
+    rhs_scan_expr(typed, &if_stmt.cond, false, lid, chain, &mut found)
+    rhs_scan_block(typed, &if_stmt.then_block, lid, chain, &mut found)
+    var bi = 0
+    while bi < if_stmt.elsif_branches.len() do
+      rhs_scan_expr(typed, &if_stmt.elsif_branches[bi].0, false, lid, chain, &mut found)
+      rhs_scan_block(typed, &if_stmt.elsif_branches[bi].1, lid, chain, &mut found)
+      bi = bi + 1
+    end
+    match if_stmt.else_block
+    when Option::Some(b) then rhs_scan_block(typed, &b, lid, chain, &mut found)
+    when Option::None then ()
+    end
+  when ExprKind::ExprMatch(m) then
+    rhs_scan_expr(typed, &m.scrutinee, false, lid, chain, &mut found)
+    var ai2 = 0
+    while ai2 < m.arms.len() do
+      match m.arms[ai2].guard_expr
+      when Option::Some(g) then rhs_scan_expr(typed, &g, false, lid, chain, &mut found)
+      when Option::None then ()
+      end
+      rhs_scan_block(typed, &m.arms[ai2].body, lid, chain, &mut found)
+      ai2 = ai2 + 1
+    end
+  when ExprKind::ExprBlock(block) then
+    rhs_scan_block(typed, &block, lid, chain, &mut found)
+  when ExprKind::ExprUnsafe(_, block) then
+    rhs_scan_block(typed, &block, lid, chain, &mut found)
+  when ExprKind::ExprAsync(block) then
+    rhs_scan_block(typed, &block, lid, chain, &mut found)
+  when ExprKind::ExprComptime(block) then
+    rhs_scan_block(typed, &block, lid, chain, &mut found)
+  when ExprKind::ExprAwait(inner) then
+    rhs_scan_expr(typed, &inner, false, lid, chain, &mut found)
+  when ExprKind::ExprTry(inner) then
+    rhs_scan_expr(typed, &inner, false, lid, chain, &mut found)
+  when ExprKind::ExprRange(start, end_, _) then
+    match start
+    when Option::Some(s) then rhs_scan_expr(typed, &s, false, lid, chain, &mut found)
+    when Option::None then ()
+    end
+    match end_
+    when Option::Some(e) then rhs_scan_expr(typed, &e, false, lid, chain, &mut found)
+    when Option::None then ()
+    end
+  when ExprKind::ExprAssign(target2, value2) then
+    rhs_scan_expr(typed, &target2, false, lid, chain, &mut found)
+    rhs_scan_expr(typed, &value2, false, lid, chain, &mut found)
+  when ExprKind::ExprPipe(lhs2, rhs2) then
+    rhs_scan_expr(typed, &lhs2, false, lid, chain, &mut found)
+    rhs_scan_expr(typed, &rhs2, false, lid, chain, &mut found)
+  when _ then ()
   end  end
 end
 
-# Does the expression root at the given semantic local?
-def expr_roots_at(typed: TypedProgram, expr: Expr, id: Int) -> Bool
-  match expr_root_id(typed, expr)
-  when Option::Some(rid) then rid == id
-  when Option::None then false
-  end  end
+# The Access/Cast place-preserving spine forms: the node at an operand
+# position is the read of the whole spine place — resolve the chain (a
+# cast/access over a place carries the place's chain; an unresolvable
+# spine roots the conservative boundary hazard); the inner continues the
+# spine. Over a computed inner the operand reads live inside it.
+def rhs_scan_place_spine(typed: TypedProgram, expr: Expr, inner: Expr, in_chain: Bool, lid: Int, chain: Vec[ProjectionKey], inout found: Bool) -> Unit
+  if found then return end
+  if !in_chain then
+    var op_chain = Vec::new()
+    let resolvable = place_projection_keys(typed, expr, &mut op_chain)
+    match expr_root_id(typed, expr)
+    when Option::Some(id) then
+      if id == lid then
+        if !resolvable then
+          found = true
+        elsif chains_overlap(op_chain, chain) then
+          found = true
+        end
+      end
+    when Option::None then
+      rhs_scan_expr(typed, &inner, false, lid, chain, &mut found)
+    end
+  else
+    rhs_scan_expr(typed, &inner, true, lid, chain, &mut found)
+  end
+end
+
+# The RHS scan over a block's statements (see rhs_reads_overlap_target):
+# every statement's expression positions are operand positions of the RHS
+# (the exact drop runs before the WHOLE RHS is evaluated — reads inside
+# nested blocks/control flow are equally after the drop).
+def rhs_scan_block(typed: TypedProgram, block: Block, lid: Int, chain: Vec[ProjectionKey], inout found: Bool) -> Unit
+  var si = 0
+  while si < block.stmts.len() do
+    if found then return end
+    match block.stmts[si].kind
+    when StmtKind::StmtLet(_, _, value, _) then
+      rhs_scan_expr(typed, &value, false, lid, chain, &mut found)
+    when StmtKind::StmtAssign(target, value) then
+      rhs_scan_expr(typed, &target, false, lid, chain, &mut found)
+      rhs_scan_expr(typed, &value, false, lid, chain, &mut found)
+    when StmtKind::StmtCompoundAssign(_, target, value) then
+      rhs_scan_expr(typed, &target, false, lid, chain, &mut found)
+      rhs_scan_expr(typed, &value, false, lid, chain, &mut found)
+    when StmtKind::StmtIf(if_stmt) then
+      rhs_scan_expr(typed, &if_stmt.cond, false, lid, chain, &mut found)
+      rhs_scan_block(typed, &if_stmt.then_block, lid, chain, &mut found)
+      var bi = 0
+      while bi < if_stmt.elsif_branches.len() do
+        rhs_scan_expr(typed, &if_stmt.elsif_branches[bi].0, false, lid, chain, &mut found)
+        rhs_scan_block(typed, &if_stmt.elsif_branches[bi].1, lid, chain, &mut found)
+        bi = bi + 1
+      end
+      match if_stmt.else_block
+      when Option::Some(b) then rhs_scan_block(typed, &b, lid, chain, &mut found)
+      when Option::None then ()
+      end
+    when StmtKind::StmtMatch(m) then
+      rhs_scan_expr(typed, &m.scrutinee, false, lid, chain, &mut found)
+      var ai2 = 0
+      while ai2 < m.arms.len() do
+        match m.arms[ai2].guard_expr
+        when Option::Some(g) then rhs_scan_expr(typed, &g, false, lid, chain, &mut found)
+        when Option::None then ()
+        end
+        rhs_scan_block(typed, &m.arms[ai2].body, lid, chain, &mut found)
+        ai2 = ai2 + 1
+      end
+    when StmtKind::StmtWhile(cond, body) then
+      rhs_scan_expr(typed, &cond, false, lid, chain, &mut found)
+      rhs_scan_block(typed, &body, lid, chain, &mut found)
+    when StmtKind::StmtFor(for_stmt) then
+      rhs_scan_expr(typed, &for_stmt.iter, false, lid, chain, &mut found)
+      rhs_scan_block(typed, &for_stmt.body, lid, chain, &mut found)
+    when StmtKind::StmtLoop(body) then
+      rhs_scan_block(typed, &body, lid, chain, &mut found)
+    when StmtKind::StmtReturn(val_opt) then
+      match val_opt
+      when Option::Some(v) then rhs_scan_expr(typed, &v, false, lid, chain, &mut found)
+      when Option::None then ()
+      end
+    when StmtKind::StmtBreak(val_opt) then
+      match val_opt
+      when Option::Some(v) then rhs_scan_expr(typed, &v, false, lid, chain, &mut found)
+      when Option::None then ()
+      end
+    when StmtKind::StmtContinue then ()
+    when StmtKind::StmtExpr(e) then
+      rhs_scan_expr(typed, &e, false, lid, chain, &mut found)
+    when StmtKind::StmtUnsafe(_, body) then
+      rhs_scan_block(typed, &body, lid, chain, &mut found)
+    when StmtKind::StmtDefer(body) then
+      rhs_scan_block(typed, &body, lid, chain, &mut found)
+    when StmtKind::StmtGuard(cond, else_action) then
+      rhs_scan_expr(typed, &cond, false, lid, chain, &mut found)
+      match else_action
+      when GuardElse::Return(val_opt) then
+        match val_opt
+        when Option::Some(v) then rhs_scan_expr(typed, &v, false, lid, chain, &mut found)
+        when Option::None then ()
+        end
+      when GuardElse::Break(val_opt) then
+        match val_opt
+        when Option::Some(v) then rhs_scan_expr(typed, &v, false, lid, chain, &mut found)
+        when Option::None then ()
+        end
+      when GuardElse::Panic(_) then ()
+      when GuardElse::Continue then ()
+      end
+    end
+    si = si + 1
+  end
 end
 
 # ONE destruction protocol: the compiler owns the subject's destruction.
@@ -8159,14 +8454,18 @@ def transfer_consume(inout env: TypeEnv, typed: TypedProgram, expr: Expr, loop_o
           if field_chain then
             apply_projected_consume(env, typed, id, &chain, expr.span, loop_outer, frame, errors)
           else
-            # The whole-value boundary (index/deref projections): the
-            # per-index tracking is not feasible — the container's elements
-            # are treated as the aggregate (the existing container-element
+            # The whole-value boundary (runtime index / deref projections —
+            # the dynamic-container ownership boundary): the per-index
+            # tracking is not feasible — the container's elements are
+            # treated as the aggregate (the existing container-element
             # semantics: a "*" whole-value record at the type-check sites).
-            # The frame marks the ROOT's own state MaybeLive — the
-            # elements' state is indeterminate, so every whole use rejects
-            # ("may be consumed on one path") and the scope-exit cleanup
-            # cannot be conditional — the conservative boundary.
+            # The boundary consume is REJECTED by the element-state rule
+            # (apply_whole_boundary_consume — the diagnostic names the
+            # sanctioned ownership-safe container operations) and the
+            # frame marks the ROOT's own state MaybeLive — the elements'
+            # state is indeterminate, so every whole use rejects ("may be
+            # consumed on one path") and the scope-exit cleanup cannot be
+            # conditional — the conservative boundary.
             apply_whole_boundary_consume(env, typed, id, expr.span, loop_outer, frame, errors)
           end
         end
@@ -8248,14 +8547,23 @@ def apply_projected_consume(inout env: TypeEnv, typed: TypedProgram, id: Int, ch
   frame_place_mark(frame, lid, chain, ResourceState::Consumed)
 end
 
-# (partial moves — the whole-value boundary): a consume over a NON-field
-# projection (an indexed/deref place). The per-index tracking is not
-# feasible: the container's elements are treated as the aggregate (the
-# existing container-element semantics — the "*" whole-value registry
-# record). The frame marks the ROOT's own state MaybeLive — the elements'
-# state is indeterminate ("may be consumed on one path" on every whole
-# use; the scope-exit cleanup cannot be conditional) — the conservative
-# boundary. The permission rules mirror apply_consume.
+# (partial moves — the whole-value boundary, THE DYNAMIC-CONTAINER
+# OWNERSHIP BOUNDARY): a consume over a NON-field projection (a runtime
+# index or a deref place). The static-place rule locks the split: a
+# constant index over a FIXED-ARRAY base is an exact static place (the
+# per-index lattice — place_projection_keys records the in-range Index
+# key), while every runtime index (Vec[i] / Map[k] / fixed-array[i] with
+# a dynamic index) and every deref is the ownership boundary — the
+# per-index tracking is not feasible and the container's elements are
+# treated as the aggregate (the existing container-element semantics —
+# the "*" whole-value registry record). Raw sink extraction through the
+# boundary is REJECTED here by the element-state rule (the diagnostic
+# names the sanctioned ownership-safe container operations); the frame
+# still marks the ROOT's own state MaybeLive — the elements' state is
+# indeterminate ("may be consumed on one path" on every whole use; the
+# scope-exit cleanup cannot be conditional) — the conservative boundary
+# commit, mirroring the stage0 lattice. The permission rules mirror
+# apply_consume.
 def apply_whole_boundary_consume(inout env: TypeEnv, typed: TypedProgram, id: Int, span: Span, loop_outer: Vec[Int], inout frame: ResFrame, inout errors: Vec[ResourceError]) -> Unit
   let lid = tg_compiler::ids::LocalId { id: id }
   match res_frame_get_origin(frame, &lid)
@@ -8302,6 +8610,16 @@ def apply_whole_boundary_consume(inout env: TypeEnv, typed: TypedProgram, id: In
     })
   when _ then ()
   end
+  # The element-state rule rejection (the ownership boundary): a
+  # consuming move through a dynamic index or deref place of an OWNED
+  # root cannot be tracked per slot — the diagnostic names the sanctioned
+  # extraction paths. The root still commits MaybeLive below (the
+  # conservative boundary; the stage0 lattice rejects identically and
+  # commits Maybe_live).
+  errors.push(ResourceError {
+    message: "cannot consume through a dynamic index or deref place: element-level state is not tracked (the container's elements are the ownership unit); extract through the ownership-safe container operations instead — Vec pop / remove(index), Map remove(key), the fixed containers' pop / pop_front, or a `with c[i] as inout` binding (a constant index over a fixed-array base is a static chain and is tracked exactly)",
+    span: span
+  })
   res_frame_set(frame, lid, ResourceState::MaybeLive)
 end
 

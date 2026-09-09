@@ -75,13 +75,16 @@ let places_conflict (a : access_path) (b : access_path) : bool =
    overlapping access to conflict with.
 
    Each element carries a third component: whether the argument's
-   recorded type is Copy (Resource_check.is_copy over the recorded
-   typed channel).  A Consume (Sink) of a Copy-typed value is a COPY
-   (the verifier's copy rule: scalars/references Copy, String owning,
-   ...), exactly as the state replay routes Copy-typed roots
-   read-only — so the effect-pair matrix must downgrade it to a Read
-   before deciding a conflict (`f(insert(m, entry, entry))` sinks the
-   same Copy local twice: two copies, never a double-move). *)
+   recorded type is Copy (the ONE type-property engine's answer —
+   Type_properties over the recorded typed channel, with the caller's
+   nominal resolver and the compilation's LangItems overlay; no
+   re-derived recursion lives here).  A Consume (Sink) of a Copy-typed
+   value is a COPY (the verifier's copy rule: scalars/references Copy,
+   String owning, an enum Copy iff every payload is Copy, ...), exactly
+   as the state replay routes Copy-typed roots read-only — so the
+   effect-pair matrix must downgrade it to a Read before deciding a
+   conflict (`f(insert(m, entry, entry))` sinks the same Copy local
+   twice: two copies, never a double-move). *)
 
 (* re-audit P11: the two-phase argument rule.  The native (and the
    seed VM) evaluate a call's arguments LEFT TO RIGHT as VALUES before
@@ -234,11 +237,12 @@ let effects_of_convention (c : Access_effect.t) : Access_effect.read_effect =
          state conflicts (double-move, use-after-consume,
          re-initialization of a live value) are findings.  The lattice
          tracks ONLY genuinely owned (non-Copy) roots — the root's
-         copyability comes from its recorded type via
-         Resource_check.is_copy (the verifier's rule: scalars and
-         references Copy, String owning, a nominal Copy iff every field
-         / payload Copy); Copy-typed roots are routed read-only (moving
-         them is a copy).  A first Initialize transitions
+         copyability comes from its recorded type via the ONE
+         type-property engine (Type_properties, audit item 3: scalars
+         and references Copy, String owning, an enum Copy iff every
+         payload is Copy, a def-less nominal conservative-owned);
+         Copy-typed roots are routed read-only (moving them is a
+         copy).  A first Initialize transitions
          Uninitialized -> Live without the re-initialization error (the
          first sight of a `set`-convention write is the initialization
          itself, so the pass cannot manufacture its own conflict).
@@ -304,12 +308,31 @@ let path_to_string (p : access_path) : string =
    closure's recorded typed access channel (accumulated per call
    argument by the typechecker; each record carries the argument's type)
    and returns the finding list.  `resolve` maps a nominal type id to
-   its definition shape so Resource_check.is_copy can decide which
-   tracked roots are genuinely owned (see resource_check.ml). *)
-let run_closure (resolve : Ids.Type_id.t -> Type_repr.t option) (accesses : access list) :
+   its definition shape so the copy authority can decide which tracked
+   roots are genuinely owned: the queries route through the ONE engine
+   (Type_properties — audit item 3), whose nominal resolver is this
+   def-shape resolver lifted with structural_resolver and overlaid with
+   the compilation's ?lang_items record (owning LangItems answer their
+   direct properties; no def-shape recursion is re-derived here).
+   ?lang_items is None when the caller has no LangItems record (raw
+   replay fixtures): def-less owning LangItem instances then answer
+   through the def shape or the engine's conservative Unknown. *)
+let run_closure ?(lang_items : Lang_items.t option = None)
+    (resolve : Ids.Type_id.t -> Type_repr.t option) (accesses : access list) :
     finding list =
   (* the channel is recorded by prepending: restore program order *)
   let accesses = List.rev accesses in
+  (* the ONE copy authority: a per-run instance cache (bound to the
+     caller's one def table — the typecheck env's registry) and the
+     engine's nominal resolver over the caller's def-shape resolver *)
+  let cache = Type_properties.create_cache () in
+  let prop_resolve =
+    Type_properties.with_lang_items lang_items
+      (Type_properties.structural_resolver resolve)
+  in
+  let is_copy (ty : Type_repr.t) : bool =
+    Type_properties.is_trivially_copyable ~cache ~resolve:prop_resolve ty
+  in
   (* one pass: group by statement group (item, call) and by item,
      preserving first-appearance order *)
   let call_buckets : (string * int, access list) Hashtbl.t = Hashtbl.create 256 in
@@ -346,7 +369,7 @@ let run_closure (resolve : Ids.Type_id.t -> Type_repr.t option) (accesses : acce
                  match a.a_path with
                  | Some p ->
                      Some
-                       (p, a.a_effect, Resource_check.is_copy resolve [] a.a_type)
+                       (p, a.a_effect, is_copy a.a_type)
                  | None -> None)
                bucket)
         in
@@ -386,7 +409,7 @@ let run_closure (resolve : Ids.Type_id.t -> Type_repr.t option) (accesses : acce
           accs;
         let owned_roots =
           List.filter
-            (fun (_, ty) -> not (Resource_check.is_copy resolve [] ty))
+            (fun (_, ty) -> not (is_copy ty))
             (List.rev !roots)
         in
         let env = Resource_check.create_env (List.map fst owned_roots) in

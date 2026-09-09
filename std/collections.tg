@@ -5,8 +5,8 @@ use std::core::{Option, Result, panic}
 use std::alloc::{ArcStrong, ArcInnerWeak, alloc, alloc_array, dealloc_array, ptr_copy}
 
 # ———————————————————————————————————————————————————————————————
-# THE SAFE VIEW MODEL (DECIDED — the reviewer's shared/pinned backing;
-# ONE representation, ONE semantic authority: the SOURCE-spelled Slice[T]
+# THE SAFE VIEW MODEL (the Slice-ownership split — audit item 1; ONE
+# representation, ONE semantic authority: the SOURCE-spelled Slice[T]
 # IS the shared/pinned form; the raw {ptr,len} view is ONLY the explicit
 # UnsafeSlice — unsafe/FFI-only)
 # ———————————————————————————————————————————————————————————————
@@ -58,6 +58,53 @@ use std::alloc::{ArcStrong, ArcInnerWeak, alloc, alloc_array, dealloc_array, ptr
 #     (chars/bytes/split/iter/keys/values — consumed by the enclosing
 #     for-loop, never storable) and the compiler-manufactured literal
 #     coercion behind vec!.
+#
+# CONSTRUCTION IS ELEMENT-OWNERSHIP-EXPLICIT (the audit's split):
+# the backing may hold ANY element type, but an owning element (String,
+# a registered-Drop resource, an aggregate) may NEVER be RAW-copied into
+# a pinned window — a raw byte copy of the window would manufacture a
+# second owner for every owning element image inside it, and the backing
+# deinit would then release state it does not own. Every constructor
+# states its element contract in its bound:
+#   - slice_pin[T: Copy](ptr, count, offset)        — the LOW-LEVEL raw
+#     pin (ptr_copy of the window): Copy elements only (the language's
+#     Copy law — raw duplication is valid exactly for bit-copyable
+#     elements; a non-Copy pin is rejected by the bound);
+#   - Array::as_slice (T: Copy impl)                — the whole-window raw
+#     pin of a collection's buffer (the u8/Int fast path);
+#   - copied_slice[T: Copy](src, start, len)        — the explicit raw
+#     window copy, Copy elements only;
+#   - cloned_slice[T: Clone](src, start, len)       — the OWNING window:
+#     every element is CLONED (the read-then-clone shape through the
+#     source slot — never a raw copy) into independently owned pinned
+#     storage. This is the ONLY way a non-Copy element reaches a Slice.
+#
+# DESTRUCTION IS PER-ELEMENT: SliceBacking::deinit runs every element's
+# drop glue over the pinned window (the registered destruction of each
+# element — a trivial no-op for Copy elements, the same teardown shape
+# as Box/SlabPool) BEFORE releasing the pinned allocation. A cloned
+# element is therefore destroyed exactly once, at the last view's drop,
+# and no element state leaks with the buffer.
+#
+# ZERO-COPY VIEWS OF LIVE STORAGE — the scoped-access lane (the audit's
+# view-types question, answered against the checker's StmtWith
+# machinery): `with` blocks bind PLACES (`with v[i] as let/inout e` over
+# a Vec/Array element binds the element's slot zero-copy — the
+# compiler-scoped access; see the canary_pos_scoped_access_vec_element
+# lane) and the two REGISTERED Map entry accessors (get_read /
+# get_modify). A std-declared view STRUCT (ScopedSlice-style {ptr,len})
+# returned by a slice() accessor does NOT fit either shape: it is not a
+# place, the checker's accessor recognition is Map-only, and the type
+# property engine would classify a bare {ptr,len} struct as bit-copyable
+# (no registered drop) — so no with-gate could keep the bound value from
+# being stored/returned/captured, and a raw window of a live collection
+# must never become a first-class value. Window views of live storage
+# are therefore NOT expressible in safe code; the zero-cost read of a
+# collection window goes through the compiler-scoped projected for-loop
+# (the UnsafeSlice iterable forms) or the per-element with access, and
+# every SURVIVING window is the explicit persistent Slice below (whose
+# backing owns a pinned copy — sub-views are Copy-gated, range-checked
+# Slice::sub).
 #
 # The safe APIs return the SHARED form (Vec::as_slice, String::as_str_view);
 # the FFI surfaces use the raw form (FfiSlice in std::ffi — mmap/embedded
@@ -158,20 +205,33 @@ end
 
 # The SHARED/PINNED VIEW — the Arc-class {ptr,len}: one Arc handle to the
 # pinned backing record (the 8-byte layout: { inner: Arc @ 0 }). This IS
-# the SOURCE-spelled Slice[T] — the one safe Slice representation.
+# the SOURCE-spelled Slice[T] — the one safe Slice representation. The
+# backing may hold ANY element type (see the ownership-explicit split in
+# the module header): Copy elements enter through the raw pin, owning
+# elements ONLY through cloned_slice's per-element clone.
 struct Slice[T]
   inner: ArcStrong[SliceBacking[T]]
 end
 
 # Pin the window [offset, offset + count) of the buffer at `ptr` into a
-# FRESH pinned allocation. The pin copies the window — the pinned record
-# is self-contained, so the view can never dangle (no lifetime inference:
-# the Arc is the backing's keep-alive, nothing else). The backing's ptr
-# IS the window's start (the pin copies exactly the window; element i of
-# the view lives at backing.ptr + i * stride). The offset records the
-# window's start within the SOURCE buffer at pin time — metadata for the
-# sub-view chaining (the backing's deinit releases the pinned window).
-def slice_pin[T](ptr: Ptr[T], count: UInt, offset: UInt) -> Slice[T]
+# FRESH pinned allocation. The pin copies the window RAW (ptr_copy) — the
+# pinned record is self-contained, so the view can never dangle (no
+# lifetime inference: the Arc is the backing's keep-alive, nothing else).
+# The backing's ptr IS the window's start (the pin copies exactly the
+# window; element i of the view lives at backing.ptr + i * stride). The
+# offset records the window's start within the SOURCE buffer at pin time —
+# metadata for the sub-view chaining (the backing's deinit releases the
+# pinned window).
+#
+# (audit item 1) The raw copy is legal ONLY for Copy elements — a raw
+# copy of an owning element image would manufacture a second owner
+# (String headers, registered-Drop resources) inside the pinned window,
+# and the per-element destruction at deinit would then release the
+# duplicated state. The `T: Copy` bound is the checker-enforced gate:
+# a pin over String/Vec/resource elements is rejected at the call site
+# (the canary_neg_slice_raw_copy_string lane); owning elements enter a
+# Slice ONLY through cloned_slice below.
+def slice_pin[T: Copy](ptr: Ptr[T], count: UInt, offset: UInt) -> Slice[T]
   var buf: Ptr[T] = Ptr::null()
   if count > 0 then
     let bytes = (count as Int * size_of[T]() as Int) as UInt
@@ -190,13 +250,108 @@ def slice_pin[T](ptr: Ptr[T], count: UInt, offset: UInt) -> Slice[T]
   Slice { inner: ArcStrong { ptr: inner } }
 end
 
+# The shared tail of every persistent-slice constructor: allocate the Arc
+# inner record, publish the backing {ptr, len, offset} and return the
+# Arc-class handle (the backing now owns the pinned window).
+def slice_arc_wrap[T](buf: Ptr[T], len: UInt, offset: UInt) -> Slice[T]
+  let inner = alloc[ArcInnerWeak[SliceBacking[T]]]()
+  if inner.is_null() then
+    panic("slice: out of memory")
+  end
+  inner.write(ArcInnerWeak {
+    refcount: 1,
+    weak_count: 0,
+    data: SliceBacking { ptr: buf, len: len, offset: offset }
+  })
+  Slice { inner: ArcStrong { ptr: inner } }
+end
+
+# The explicit COPY window — the raw-copy constructor of the split (the
+# named twin of slice_pin over a collection's buffer): the window
+# [start, start + len) of `src` is RAW-copied (ptr_copy) into a fresh
+# pinned backing, so the returned Slice is independent of `src` (later
+# mutation or drop of `src` never moves or destroys the pinned window).
+# Copy elements only — the same raw-duplication law slice_pin carries
+# (an owning element may never be byte-copied; use cloned_slice).
+# The recorded offset is the window's start within the SOURCE buffer.
+def copied_slice[T: Copy](src: Array[T], start: Int, len: UInt) -> Slice[T]
+  if start < 0 then
+    panic("copied_slice: negative start")
+  end
+  let src_len = src.len() as UInt
+  if len > src_len then
+    panic("copied_slice: length out of bounds")
+  end
+  if (start as UInt) > src_len - len then
+    panic("copied_slice: range out of bounds")
+  end
+  var buf: Ptr[T] = Ptr::null()
+  if len > 0 then
+    let elem = size_of[T]() as Int
+    let bytes = (len as Int * elem) as UInt
+    buf = alloc_array[u8](bytes).cast[T]()
+    let window = (src.as_ptr() as Int + start * elem) as Ptr[T]
+    ptr_copy(window.cast[u8](), buf.cast[u8](), bytes)
+  end
+  slice_arc_wrap(buf, len, start as UInt)
+end
+
+# The explicit OWNING window — the clone constructor of the split: every
+# element of [start, start + len) is CLONED (the read-then-clone shape
+# through the source slot — `src[i].clone()`, the same projected read
+# the clone-aware map/set surfaces use; NEVER a raw byte copy) into the
+# fresh pinned backing, so each element of the returned Slice is an
+# INDEPENDENTLY OWNED duplicate. This is the only way an owning element
+# (String, a registered-Drop resource, an aggregate) enters a Slice —
+# its destruction runs exactly once, at the last view's drop (the
+# per-element deinit below). `src` stays live and untouched.
+def cloned_slice[T: Clone](src: Array[T], start: Int, len: UInt) -> Slice[T]
+  if start < 0 then
+    panic("cloned_slice: negative start")
+  end
+  let src_len = src.len() as UInt
+  if len > src_len then
+    panic("cloned_slice: length out of bounds")
+  end
+  if (start as UInt) > src_len - len then
+    panic("cloned_slice: range out of bounds")
+  end
+  var buf: Ptr[T] = Ptr::null()
+  if len > 0 then
+    let elem = size_of[T]() as Int
+    let bytes = (len as Int * elem) as UInt
+    buf = alloc_array[u8](bytes).cast[T]()
+    var i: UInt = 0
+    while i < len do
+      let item = src[(start as UInt + i) as Int].clone()
+      let slot = (buf as Int + (i as Int) * elem) as Ptr[T]
+      slot.write(item)
+      i = i + 1
+    end
+  end
+  slice_arc_wrap(buf, len, start as UInt)
+end
+
 impl[T] SliceBacking[T]
-  # The backing owns the pinned allocation: when the LAST view's Arc
-  # drops, the deinit releases the pinned buffer (the compiler's single
-  # destruction protocol — the Arc's drop_in_place runs this hook first).
+  # The backing owns the pinned allocation AND every element image inside
+  # it: when the LAST view's Arc drops, the deinit (the compiler's single
+  # destruction protocol — the Arc's drop_in_place runs this hook first)
+  # destroys each element of the pinned window IN PLACE through its
+  # registered drop glue — exactly once per element — BEFORE releasing
+  # the allocation (the SlabPool/Box teardown shape: the concrete glue is
+  # a no-op for Copy elements, so the raw-pin windows pay nothing; for
+  # cloned_slice windows it runs each clone's destruction, so no element
+  # state leaks with the buffer and no element is destroyed twice).
   def deinit(sink self: Self) -> Unit
     if !self.ptr.is_null() then
-      let bytes = (self.len as Int * size_of[T]() as Int) as UInt
+      let elem = size_of[T]() as Int
+      var i: UInt = 0
+      while i < self.len do
+        let slot = (self.ptr as Int + (i as Int) * elem) as Ptr[T]
+        slot.drop_in_place()
+        i = i + 1
+      end
+      let bytes = (self.len as Int * elem) as UInt
       dealloc_array[u8](self.ptr.cast[u8](), bytes)
     end
   end
@@ -204,33 +359,51 @@ end
 
 impl[T] Slice[T]
   def len(self: Self) -> UInt
-    self.inner.ptr.as_mut().data.len
+    self.inner.ptr.as_ref().data.len
   end
 
   def is_empty(self: Self) -> Bool
     self.len() == 0
   end
+end
 
+impl[T: Copy] Slice[T]
   # The sub-view [start, start + len): a fresh pinned backing holds the
   # sub-window (the pin copies from the parent's pinned window at `start`;
   # the sub-view is self-contained and shares nothing with the parent
   # except the element values). The recorded offset is the sub-window's
   # start within the ORIGINAL source buffer (the metadata chaining rule).
+  #
+  # (audit item 1) The range is validated BEFORE any pointer arithmetic:
+  # a negative start, a length beyond the parent window, or a window
+  # starting past the parent's end all TRAP here — the address of the
+  # copy source is computed only after the window is proven inside
+  # [0, self.len()] (the pin would otherwise read out of the pinned
+  # allocation). Copy-gated like every raw window operation (Slice::sub
+  # over an owning Slice is not expressible — the owning window's
+  # sub-views are the cloned_slice constructor's windows).
   def sub(self: Self, start: Int, len: UInt) -> Slice[T]
-    let b = self.inner.ptr.as_mut().data
+    let b = self.inner.ptr.as_ref().data
+    if start < 0 then
+      panic("Slice::sub: negative start index")
+    end
+    if len > b.len then
+      panic("Slice::sub: length exceeds the slice length")
+    end
+    if (start as UInt) > b.len - len then
+      panic("Slice::sub: window starts past the slice end")
+    end
     let elem = size_of[T]() as Int
     slice_pin((b.ptr as Int + start * elem) as Ptr[T], len, (b.offset as Int + start) as UInt)
   end
-end
 
-impl[T: Copy] Slice[T]
   # The pinned element read — safe: the backing owns the pinned buffer,
   # so the view can never dangle. Out-of-range reads TRAP (the std OOB
   # policy, like Array::get). Element i of the view lives at
   # backing.ptr + i * stride — the backing.ptr IS the pinned window's
   # start (the offset is source metadata, never an element address).
   def get(self: Self, index: Int) -> T
-    let b = self.inner.ptr.as_mut().data
+    let b = self.inner.ptr.as_ref().data
     let elem = size_of[T]() as Int
     if index < 0 || index >= b.len as Int then
       panic("Slice::get: index out of bounds")
@@ -788,10 +961,14 @@ impl[T: Copy] Array[T]
   # returns the SHARED/PINNED Slice — the SOURCE-spelled Slice[T] (the
   # Arc-class view). The view survives
   # this array's drop and its capacity-changing mutations — the backing is
-  # the separate pinned allocation. The pin copies the window; the view is
-  # immutable and never dangles (no lifetime inference).
+  # the separate pinned allocation. The pin copies the window RAW
+  # (ptr_copy), so the impl is Copy-gated (the audit's ownership-explicit
+  # split: an owning element may never be byte-copied into the pinned
+  # window — Vec[String]-style windows are built with cloned_slice, whose
+  # per-element clones the backing deinit destroys exactly once); the view
+  # is immutable and never dangles (no lifetime inference).
   def as_slice(self: Self) -> Slice[T]
-    slice_pin(self.as_ptr(), self.len() as UInt, 0)
+    copied_slice(self, 0, self.len() as UInt)
   end
 
   # EXPLICITLY UNSAFE: constructs the raw-storage projection iterator

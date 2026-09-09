@@ -1411,13 +1411,19 @@ and exec_statement (vm : t) (frame : frame) (st : Seed_mir.statement) : unit =
   step_limit vm;
   match st with
   | Seed_mir.Assign (dest, rv) ->
-      (* re-audit P0-9: an assignment over a LIVE owning place drops the
-         old exact value FIRST (drop_glue frees region-backed refs;
-         scalars/strings/aggregates-without-regions and MovedOut holes
-         are no-ops), so an overwrite can never leak the replaced
-         value's resources.  The lowering still emits explicit Drop
-         terminators for the scope-end glue; this is the overwrite
-         boundary the verifier's destroyed-lattice models as
+      (* re-audit P0-9 / audit item (exact-place replacement): an
+         assignment over a LIVE owning place drops the old value of the
+         exact destination place FIRST (drop_old_value_at resolves the
+         projected leaf and runs the typed drop over it — the plan-driven
+         recursion / structural glue frees the leaf's region-backed refs;
+         MovedOut holes along the path are no-ops), so an overwrite can
+         never leak the replaced value's resources and never touches the
+         SIBLING components (their values stay live in the aggregate).
+         The resource checker admits only placements whose RHS is disjoint
+         from the replaced subtree, so this drop-before-eval ordering is
+         safe for every accepted program.  The lowering still emits
+         explicit Drop terminators for the scope-end glue; this is the
+         overwrite boundary the verifier's destroyed-lattice models as
          destroyed-by-assignment. *)
       drop_old_value_at vm frame dest;
       let v = eval_rvalue vm frame rv in

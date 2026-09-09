@@ -4382,11 +4382,13 @@ let oracle_of_ctx (ctx : closure_ctx) (stats : mir_stats option) : oracle_counts
    stage's findings.  Additive by construction: it reports findings
    and cannot change the typecheck debt. *)
 
-(* Nominal-definition lookup for the pass's copy query (mirror of
+(* Nominal-definition lookup for the copy-authority resolver (mirror of
    seed_mir.def_repr / mir_verify.find_type, read-only): a struct
-   resolves to its field tuple, an enum to its payload function, so
-   Resource_check.is_copy recurses over every field / payload.  A name
-   with no nominal (alias/builtin) falls back to the type registry. *)
+   resolves to its field tuple, an enum to its payload function, so the
+   type-property engine (Type_properties — the ONE property authority,
+   audit item 3) recurses over every field / payload through this def
+   shape.  A name with no nominal (alias/builtin) falls back to the
+   type registry. *)
 let nominal_def_of_tid (env : Typecheck.env) (tid : Ids.Type_id.t) : Type_repr.t option =
   match List.assoc_opt tid env.Typecheck.type_names with
   | None -> None
@@ -4409,11 +4411,17 @@ let nominal_def_of_tid (env : Typecheck.env) (tid : Ids.Type_id.t) : Type_repr.t
                                  else Type_repr.Tuple pty);
                             })
                           nom.Typecheck.nom_variants),
-                      Type_repr.Never ))
+                       Type_repr.Never ))
       | None -> List.assoc_opt name env.Typecheck.types)
 
 let run_access_resource_pass (ctx : closure_ctx) : Access_check.finding list =
-  Access_check.run_closure (nominal_def_of_tid ctx.ctx_env)
+  (* the compilation's LangItems record overlays the engine's resolver
+     (the access replay consumes the same owned answers as the
+     verifier/drop planner: owning LangItems answer their direct
+     properties, never their def shapes) *)
+  Access_check.run_closure
+    ~lang_items:(Some (Lang_items.of_types ctx.ctx_env.Typecheck.types))
+    (nominal_def_of_tid ctx.ctx_env)
     ctx.ctx_env.Typecheck.state.oracle.o_accesses
 
 let report_access_resource_pass (ctx : closure_ctx) : unit =
@@ -4432,11 +4440,17 @@ let report_access_resource_pass (ctx : closure_ctx) : unit =
      lattice over the MIR control flow (merge joins, loop fixpoints,
      conditional-initialization and use-after-consume per path) — the
      authoritative ownership stage; the linear replay remains an
-     additional diagnostic *)
+     additional diagnostic.  The pass consumes the compilation's
+     LangItems record so its owned answers (audit item 3: the ONE
+     Type_properties authority over the program's def table) match the
+     verifier/drop planner exactly. *)
   let cfg_findings =
     match ctx.ctx_cfg_program with
     | None -> []
-    | Some prog -> Resource_check.cfg_check_program prog
+    | Some prog ->
+        Resource_check.cfg_check_program
+          ~lang_items:(Some (Lang_items.of_types ctx.ctx_env.Typecheck.types))
+          prog
   in
   let cfg_status = if cfg_findings = [] then "PASS" else "FAIL" in
   Printf.printf "  CFG_RESOURCE_DATAFLOW = %s (%d finding(s))\n" cfg_status

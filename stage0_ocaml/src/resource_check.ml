@@ -10,6 +10,20 @@
    Seed MIR's SEMANTIC place projections.  A chain is the projection list
    of a place (Field ids, Downcast variant ids, ConstantIndex positions —
    NEVER a dynamic Index or Deref, which are the whole-value boundary).
+   THE STATIC-PLACE RULE (the native parity split): a place is exact
+   exactly when every projection is a struct field, an enum-payload
+   position or a CONSTANT index over a tuple / fixed-array base — the
+   lattice tracks those positions individually (an in-range ConstantIndex
+   over a Fixed_array is a chain key); a runtime index (Vec[i] / Map[k])
+   or a deref is the OWNERSHIP BOUNDARY — the container's elements are
+   the ownership unit, no per-slot state exists there, and a raw sink
+   extraction through the boundary is rejected by the element-state rule,
+   whose diagnostic names the sanctioned ownership-safe container
+   operations (Vec pop / remove(index), Map remove(key), the fixed
+   containers' pop / pop_front, `with c[i] as inout` bindings).  No
+   runtime ownership metadata ever backs the lattice: per-slot state is a
+   compile-time artifact (chain rows + masked drop glue), never a stored
+   tag or bitmap beside the data.
    The lattice records ONLY the deviations: an absent chain is Live; a
    chain recorded Consumed was moved out (the root stays Live and its
    cleanup excludes the dead chain); a chain recorded Maybe_live was
@@ -20,10 +34,19 @@
    storage).  Whole-value operations over a partially-moved root are
    rejected (the dead chains' storage cannot be masked); consuming moves
    through dynamic Index/Deref projections are rejected by the
-   element-state rule; assignment over a live owning field runs the
-   masked drop-before-store semantics (a depth-1 target of a fully-live
-   root destroys the sibling direct fields — marked Consumed; a nested
-   target is an exact-place replacement). *)
+   element-state rule; assignment over a live owning chain is the
+   EXACT-PLACE replacement (the audit's canonical model): the old value
+   of the TARGET PLACE itself is destroyed — masked to its own consumed
+   extensions — and the sibling chains (live or consumed) are NEVER
+   touched by a projected replacement.  A chain whose own row is Consumed
+   re-lives without a drop; a chain under a CONSUMED proper prefix (the
+   containing value was moved out) rejects the assignment (a write
+   through the moved-out value); the same-root RHS guard rejects only an
+   RHS operand whose storage OVERLAPS the target chain (the drop would
+   destroy the operand's source before it materializes) — a disjoint
+   sibling chain RHS is accepted.  The whole-root store is the one
+   remaining whole-value masked-drop form, applying only to the
+   whole-root replacement itself. *)
 
 module IntMap = Map.Make (Int)
 module IntSet = Set.Make (Int)
@@ -48,31 +71,20 @@ type plan = {
   final_states : (int * resource_state) list;
 }
 
-(* The Copy property (mirror of mir_verify.is_copy, read-only reference):
-   scalars, references and function values are Copy; String is owning; a
-   tuple/fixed-array is Copy iff every element is; a nominal is Copy iff
-   every field (struct) or every payload (enum) is.  `resolve` maps a
-   nominal type id to its definition shape (the caller supplies the
-   typecheck env's nominal registry); anything unknown or unresolvable is
-   CONSERVATIVELY non-Copy (an owned lattice root, moved not copied). *)
-let rec is_copy (resolve : Ids.Type_id.t -> Type_repr.t option) (seen : Ids.Type_id.t list)
-    (ty : Type_repr.t) : bool =
-  match ty with
-  | Type_repr.Unit | Type_repr.Bool | Type_repr.Char | Type_repr.Int _
-  | Type_repr.Float _ | Type_repr.Raw_ptr _ | Type_repr.Ref_internal _
-  | Type_repr.Function _ | Type_repr.Never ->
-      true
-  | Type_repr.String -> false
-  | Type_repr.Tuple elems -> Array.for_all (is_copy resolve seen) elems
-  | Type_repr.Fixed_array (elem, _) -> is_copy resolve seen elem
-  | Type_repr.Named (tid, _) ->
-      if List.mem tid seen then false
-      else (
-        match resolve tid with
-        | None -> false
-        | Some def -> is_copy resolve (tid :: seen) def)
-  | Type_repr.Type_param _ | Type_repr.Infer_var _ | Type_repr.Int_literal _ | Type_repr.Error ->
-      false
+(* ── THE ONE type-property authority (audit item 3) ────────────────
+   This pass never re-derives a type property recursion of its own:
+   every Copy/owned decision routes through the ONE engine
+   (Type_properties, P1-25 / P0-2 — the same authority the typechecker
+   mirrors pre-MIR, mir_verify.is_copy, mir_lower's copyability, the
+   Drop_plan construction and the VM consume).  The cfg entries below
+   receive the engine's nominal resolver for THIS program (the def
+   table's def_repr shapes with the compilation's LangItems overlay —
+   the mir_verify.nominal_resolver / Drop_plan.engine_resolve shape)
+   and the engine answers with a per-program cache (one cache per def
+   table, exactly like the verifier's per-ctx copy_cache).  A Named
+   type whose def cannot be resolved answers conservatively OWNED (the
+   engine's Unknown) — the same conservative non-Copy rule the
+   verifier and drop planner apply to an unresolvable nominal. *)
 
 type env = {
   owned : int list;             (* locals that own a needs_drop value *)
@@ -409,27 +421,33 @@ let classify_place (prog : Seed_mir.program) (root_ty : Type_repr.t)
   in
   match projs with [] -> PWhole | _ -> go root_ty [] projs
 
-(* The root's DIRECT-FIELD shape (the sibling-masking of the whole-root
-   assign-drop case needs the direct field keys).  A struct resolves
-   through its def to the semantic Field ids; a tuple / fixed array is
-   the positional ConstantIndex domain; anything else (an enum, an
-   unresolvable nominal) is unknown — the native root_direct_shape_known
-   gate. *)
-let root_direct_field_keys (prog : Seed_mir.program) (root_ty : Type_repr.t) :
-    Seed_mir.projection list option =
-  match root_ty with
-  | Type_repr.Tuple elems ->
-      Some (List.init (Array.length elems) (fun i -> Seed_mir.ConstantIndex i))
-  | Type_repr.Fixed_array (_, n) when n > 0 ->
-      Some (List.init n (fun i -> Seed_mir.ConstantIndex i))
-  | Type_repr.Named (tid, _) -> (
-      match type_def_of prog tid with
-      | Some (Seed_mir.StructDef { sd_fields; _ }) when sd_fields <> [] ->
-          Some (List.map (fun f -> Seed_mir.Field f.Seed_mir.fd_id) sd_fields)
-      | _ -> None)
-  | _ -> None
+(* Is the target CHAIN's own recorded row Consumed (the chain itself was
+   moved out — its storage is dead and a store re-lives it without a
+   drop)?  A Consumed PROPER PREFIX (a containing field moved out) is the
+   write-through case — chain_prefix_state reports Consumed for both, and
+   the assign-target validation consults this exact row to tell them
+   apart. *)
+let chain_self_consumed (rows : chain_row list) (l : int)
+    (ch : Seed_mir.projection list) : bool =
+  chain_row_find rows l ch = Some Consumed
 
-let cfg_check_function (prog : Seed_mir.program) (f : Seed_mir.function_) : string list =
+(* Do two static chains overlap — equal, or one a prefix of the other?
+   The exact-place drop of the target chain destroys an operand's storage
+   when the operand chain equals the target, extends it (a sub-value
+   inside the replaced value) or prefixes it (an ancestor value containing
+   the replaced place). *)
+let chains_overlap (a : Seed_mir.projection list) (b : Seed_mir.projection list) : bool =
+  chain_extends a b || chain_extends b a
+
+(* cfg_check_function — the path-sensitive lattice over one function.
+   `cache` is the Type_properties instance cache and `resolve` the
+   engine's nominal resolver, both bound to `prog`'s def table by the
+   entry point below (one cache per program — never shared across two
+   def tables).  Every owned-root and owning-chain decision in the
+   dataflow answers through this ONE engine. *)
+let cfg_check_function (cache : Type_properties.cache)
+    (resolve : Type_properties.def_resolver) (prog : Seed_mir.program)
+    (f : Seed_mir.function_) : string list =
   let nb = Array.length f.Seed_mir.blocks in
   if nb = 0 then [] else begin
     (* predecessors from the terminators *)
@@ -448,13 +466,16 @@ let cfg_check_function (prog : Seed_mir.program) (f : Seed_mir.function_) : stri
             add_pred i d
         | Seed_mir.Ret | Seed_mir.Unreachable | Seed_mir.Abort -> ())
       f.Seed_mir.blocks;
-    (* the owned locals (the non-Copy roots) — the root-ownedness rule of
-       the current pass is kept (conservative: a nominal that cannot be
-       resolved is owning), so the existing root-level behavior is
-       unchanged wherever chains do not apply *)
+    (* the owned locals (the non-Copy roots) — the ONE authority answers
+       each root's copyability through the threaded cache + resolver; a
+       nominal whose def cannot be resolved answers conservatively owned
+       (the engine's Unknown), exactly the verifier/drop-plan answer *)
     let owned =
       List.filter
-        (fun l -> not (is_copy (fun _ -> None) [] f.Seed_mir.locals.(l)))
+        (fun l ->
+          not
+            (Type_properties.is_trivially_copyable ~cache ~resolve
+               f.Seed_mir.locals.(l)))
         (List.init (Array.length f.Seed_mir.locals) (fun i -> i))
     in
     let owned_set = IntSet.of_list owned in
@@ -500,8 +521,12 @@ let cfg_check_function (prog : Seed_mir.program) (f : Seed_mir.function_) : stri
     let chain_of_place (l : int) (p : Seed_mir.place) : place_kind =
       classify_place prog f.Seed_mir.locals.(l) p.Seed_mir.projections
     in
+    (* a chain's value type owns when the authority says it is not
+       trivially copyable — the same answer (def-resolved, LangItems
+       direct properties, conservative Unknown) the verifier and drop
+       planner give the identical concrete type *)
     let chain_owning (cty : Type_repr.t) : bool =
-      not (is_copy (resolve_named prog) [] cty)
+      not (Type_properties.is_trivially_copyable ~cache ~resolve cty)
     in
 
     (* the rvalue operand list (the existing walk sites) *)
@@ -516,17 +541,33 @@ let cfg_check_function (prog : Seed_mir.program) (f : Seed_mir.function_) : stri
       | Seed_mir.Aggregate (_, ops) -> ops
       | Seed_mir.Len p -> [ Seed_mir.Copy p ]
     in
-    (* does any operand of the rvalue root at local l? (the same-root
-       drop-before-store guard) *)
-    let rv_roots_at (rv : Seed_mir.rvalue) (l : int) : bool =
+    (* Does any RHS operand place rooted at local l read or move storage
+       that the exact-place drop of the target chain `tgt` destroys?  The
+       exact drop destroys the target chain's own value (masked to its
+       already-consumed extensions) BEFORE the RHS materializes; an
+       operand whose static chain equals the target, extends it (a
+       sub-value of the replaced value) or prefixes it (an ancestor value
+       containing the replaced place) is destroyed before its source is
+       read or moved — the same-root overlap guard.  A disjoint chain (a
+       sibling) is untouched by the drop — accepted.  A whole-value
+       operand of the same root and a boundary (indexed / deref) operand
+       of the same root are unclassifiable — conservative overlap. *)
+    let rhs_overlaps (rv : Seed_mir.rvalue) (l : int) (tgt : Seed_mir.projection list) :
+        bool =
       List.exists
         (fun op ->
           match operand_place op with
-          | Some p -> p.Seed_mir.root = Seed_mir.Local l
-          | None -> false)
+          | None -> false
+          | Some p -> (
+              match root_local p with
+              | Some l' when l' = l -> (
+                  match chain_of_place l' p with
+                  | PWhole -> true
+                  | PBoundary -> true
+                  | PChain (op_ch, _) -> chains_overlap op_ch tgt)
+              | _ -> false))
         (rv_operands rv)
     in
-
     (* the root-level availability errors (the existing texts — a read /
        move of a Consumed/Uninitialized owned root). *)
     let check_root_available states l =
@@ -635,7 +676,7 @@ let cfg_check_function (prog : Seed_mir.program) (f : Seed_mir.function_) : stri
             end
         | PBoundary ->
             check_root_available !st l;
-            err "_%d: cannot consume through a dynamic index or deref place: element-level state is not tracked (the container's elements are the ownership unit)" l;
+            err "_%d: cannot consume through a dynamic index or deref place: element-level state is not tracked (the container's elements are the ownership unit); extract through the ownership-safe container operations instead — Vec pop / remove(index), Map remove(key), the fixed containers' pop / pop_front, or a `with c[i] as inout` binding (a constant index over a fixed-array base is a static chain and is tracked exactly)" l;
             st := set_state !st l Maybe_live;
             rows := chain_rows_clear_root !rows l
       in
@@ -661,7 +702,18 @@ let cfg_check_function (prog : Seed_mir.program) (f : Seed_mir.function_) : stri
               (* 1. the target validation against the PRE-assignment state
                  (never mutates; the drop decision reads the TRUE
                  pre-assignment state).  A non-owned destination is not
-                 tracked, but the RHS is still walked. *)
+                 tracked, but the RHS is still walked.
+
+                 ── the EXACT-PLACE replacement model (the canonical
+                 replacement semantics — a projected assignment destroys
+                 exactly the old value of the TARGET PLACE, never the
+                 whole root and never the siblings): the target chain's
+                 OWN row decides the dead-storage re-live form; a CONSUMED
+                 PROPER PREFIX of the target chain (a containing field was
+                 moved out) makes the assignment a write through the
+                 moved-out value — rejected; a Live owning chain accepts
+                 the exact replacement (the sibling chains — live or
+                 consumed — are untouched and stay usable). *)
               let target =
                 match root_local p with
                 | None -> None
@@ -682,51 +734,40 @@ let cfg_check_function (prog : Seed_mir.program) (f : Seed_mir.function_) : stri
                          | Live -> (
                              match chain_prefix_state pre_rows l ch with
                              | Consumed ->
-                                 (* dead field storage: the store re-lives
-                                    the field without a drop *)
-                                 ()
+                                 (* the chain's own row Consumed = dead
+                                    field storage: the store re-lives the
+                                    field without a drop (the
+                                    re-assignment of a moved-out field).  A
+                                    Consumed PROPER PREFIX = the target
+                                    storage lies inside a moved-out value —
+                                    the assignment would write through it
+                                    — rejected. *)
+                                 if chain_self_consumed pre_rows l ch then ()
+                                 else
+                                   err "_%d: cannot assign into owned field %s: the containing value was moved out (the assignment would write through the moved-out value)" l
+                                     (chain_to_string ch)
                              | Maybe_live ->
                                  err "_%d: owned field %s may be consumed on one path" l
                                    (chain_to_string ch)
                              | Live | Uninitialized ->
                                  if owning then begin
-                                   (* the old owning value's
-                                      drop-before-store — the PREFIX RULE
-                                      decides the representable form: a
-                                      depth-1 target of a fully-live root
-                                      is the whole-root masked drop (the
-                                      sibling fields must be markable); a
-                                      nested target is the exact-place
-                                      replacement. *)
-                                   if List.length ch = 1
-                                      && chain_root_has_moves pre_rows l then
-                                     err "_%d: cannot assign over owned field %s: the root is partially moved out (the masked drop-before-store is not representable)" l
-                                       (chain_to_string ch)
-                                   else if List.length ch = 1
-                                           && root_direct_field_keys prog
-                                                f.Seed_mir.locals.(l)
-                                              = None then
-                                     err "_%d: cannot assign over owned field %s: the root's field shape is unknown (the sibling fields cannot be masked)" l
-                                       (chain_to_string ch)
-                                   else if rv_roots_at rv l then
-                                     err "_%d: cannot assign over an owning projected place: the value moves out of the same root (the drop-before-store would destroy its source)" l
+                                   (* the old owning value's EXACT
+                                      drop-before-store (any chain depth —
+                                      there is no depth-1 whole-root form).
+                                      The same-root RHS guard rejects an
+                                      RHS operand whose storage OVERLAPS
+                                      the target chain (the operand is the
+                                      target chain itself, an extension of
+                                      it, or an ancestor containing it —
+                                      the exact drop destroys the
+                                      operand's source before it
+                                      materializes); a disjoint sibling
+                                      chain RHS is accepted — the exact
+                                      drop never touches the sibling. *)
+                                   if rhs_overlaps rv l ch then
+                                     err "_%d: cannot assign over an owning projected place: the value reads or moves out of the replaced value's own storage (the drop-before-store would destroy its source)" l
                                  end));
-                        (* the commit decision comes from the PRE-RHS rows
-                           (the RHS walk must not change the drop form) *)
-                        let drops_siblings =
-                          root_st = Live
-                          && chain_prefix_state pre_rows l ch = Live
-                          && List.length ch = 1
-                          && owning
-                          && not (chain_root_has_moves pre_rows l)
-                          && root_direct_field_keys prog f.Seed_mir.locals.(l) <> None
-                        in
-                        let sibling_keys =
-                          if drops_siblings
-                          then root_direct_field_keys prog f.Seed_mir.locals.(l)
-                          else None
-                        in
-                        Some (l, Some (ch, sibling_keys)))
+                        Some (l, Some ch))
               in
               (* 2. the RHS reads/moves *)
               List.iter step_op (rv_operands rv);
@@ -743,19 +784,14 @@ let cfg_check_function (prog : Seed_mir.program) (f : Seed_mir.function_) : stri
                            st := set_state !st l Live;
                            rows := chain_rows_clear_root !rows l
                        | PChain _ | PBoundary -> ())
-                   | Some (ch, sibling_keys) ->
-                       (* the sibling DIRECT fields die with the whole-root
-                          drop chain — marked Consumed so the cleanup skips
-                          them; the store re-lives the target chain and its
-                          extensions *)
-                       (match sibling_keys with
-                        | Some keys ->
-                            List.iter
-                              (fun sk ->
-                                if sk <> List.hd ch then
-                                  rows := chain_row_set !rows l [ sk ] Consumed)
-                              keys
-                        | None -> ());
+                   | Some ch ->
+                       (* the exact-place commit: the store re-lives the
+                          target chain and its extensions (the old value's
+                          drop destroyed exactly the chain's own state,
+                          masked to its consumed extensions).  The sibling
+                          chains were NEVER touched — each keeps its own
+                          record (a live sibling stays live; a consumed
+                          sibling stays dead). *)
                        rows := chain_rows_clear_at !rows l ch)))
           | Seed_mir.StorageLive _ | Seed_mir.StorageDead _ | Seed_mir.SetDiscriminant _
           | Seed_mir.Nop -> ())
@@ -782,7 +818,11 @@ let cfg_check_function (prog : Seed_mir.program) (f : Seed_mir.function_) : stri
                     (* a call into a projected destination: the CHAIN's
                        state decides — the store re-lives the chain (the
                        old value's drop authority is the caller's
-                       assign-drop chain) *)
+                       assign-drop chain).  The exact-place target rule
+                       mirrors the Assign arm: dead storage (the chain's
+                       own row Consumed) re-lives; a CONSUMED proper
+                       prefix (a containing value moved out) rejects the
+                       write-through. *)
                     (match state_of !st l with
                      | Uninitialized -> err "_%d: read of uninitialized owned local" l
                      | Consumed -> err "_%d: use-after-consume" l
@@ -793,7 +833,11 @@ let cfg_check_function (prog : Seed_mir.program) (f : Seed_mir.function_) : stri
                          | Maybe_live ->
                              err "_%d: owned field %s may be consumed on one path" l
                                (chain_to_string ch)
-                         | Consumed | Live | Uninitialized -> ()));
+                         | Consumed ->
+                             if not (chain_self_consumed !rows l ch) then
+                               err "_%d: cannot assign into owned field %s: the containing value was moved out (the assignment would write through the moved-out value)" l
+                                 (chain_to_string ch)
+                         | Live | Uninitialized -> ()));
                     rows := chain_rows_clear_at !rows l ch
                 | PBoundary -> ())
             | _ -> ())
@@ -829,8 +873,8 @@ let cfg_check_function (prog : Seed_mir.program) (f : Seed_mir.function_) : stri
                           | Live | Uninitialized -> ()));
                      rows := chain_row_set !rows l ch Consumed
                    end
-               | PBoundary ->
-                   err "_%d: cannot drop through a dynamic index or deref place: element-level state is not tracked (the container's elements are the ownership unit)" l))
+                | PBoundary ->
+                    err "_%d: cannot drop through a dynamic index or deref place: element-level state is not tracked (the container's elements are the ownership unit); destroy through the container's own ownership operations (clear / drain / remove) — never through an indexed place" l))
        | Seed_mir.SwitchInt (op, _, _) -> (
            match operand_place op with
            | Some p -> (
@@ -878,5 +922,21 @@ let cfg_check_function (prog : Seed_mir.program) (f : Seed_mir.function_) : stri
     List.rev !errors
   end
 
-let cfg_check_program (prog : Seed_mir.program) : string list =
-  List.concat_map (cfg_check_function prog) (Array.to_list prog.Seed_mir.functions)
+(* cfg_check_program — the CFG resource dataflow over a whole program.
+   ?lang_items is the compilation's LangItems record (optional: raw-MIR
+   fixtures may omit it — a def-less owning LangItem then answers
+   through the def table or the engine's conservative Unknown).  The
+   engine's nominal resolver is built HERE over THIS program's def
+   table (resolve_named — def_repr shapes, the same table
+   Drop_plan.engine_resolve and mir_verify's find_type resolve) with
+   the LangItems overlay, and the property cache is created per entry
+   — one cache per def table, never shared across two tables, exactly
+   like Mir_verify.require_valid_* / Drop_plan.of_program. *)
+let cfg_check_program ?(lang_items : Lang_items.t option = None)
+    (prog : Seed_mir.program) : string list =
+  let cache = Type_properties.create_cache () in
+  let resolve =
+    Type_properties.with_lang_items lang_items
+      (Type_properties.structural_resolver (resolve_named prog))
+  in
+  List.concat_map (cfg_check_function cache resolve prog) (Array.to_list prog.Seed_mir.functions)

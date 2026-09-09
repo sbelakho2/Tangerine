@@ -39,6 +39,16 @@
        drops as a no-op; a second drop of the DROPPED slot traps), and
        the plan-driven typed drop walks plan_node (struct def with a
        String field and a Vec field, enum defs with payload variants).
+   (g) RESOURCE-CHECK CONSUMER (audit item 3) — the CFG resource
+       dataflow (Resource_check.cfg_check_program) answers its
+       owned-root and owning-chain queries through this SAME engine
+       (its resolver is the program's def table + the LangItems
+       overlay): an all-Copy struct def root is untracked (moves are
+       copies); an owning enum (String payload) reached as a
+       struct-field chain answers through its def — a double move of
+       the chain is a double-move finding; a def-less Ptr[Int] root
+       answers Copy under the LangItems overlay and conservative-owned
+       without it.
 
    Prints PASS/FAIL per check and a final ALL PASS line. *)
 
@@ -721,6 +731,148 @@ let check_vm () =
        fail "double-drop VM trap message wrong: %s" e.Vm.message
    | Ok _ -> fail "double drop did not trap in the VM")
 
+(* ── (g) the RESOURCE-CHECK consumer (audit item 3) ──────────────────
+   The CFG resource dataflow consumes the ONE engine: its owned-root
+   and owning-chain queries run Type_properties with the program's def
+   table as the resolver and the optional LangItems overlay — the same
+   answers the verifier/drop planner give the identical concrete types.
+   The matrix rows are proven to REACH the ownership pass: *)
+
+(* two whole-value consumes of one root (a move of a Copy value is a
+   copy; of an owned value the second consume is a use-after-consume) *)
+let double_whole_move_prog (locals : Type_repr.t array)
+    (types : Seed_mir.type_def array) : Seed_mir.program =
+  fn_types locals types
+    [|
+      {
+        Seed_mir.id = 0;
+        statements =
+          [
+            Seed_mir.Assign
+              ( { Seed_mir.root = Seed_mir.Local 2; projections = [] },
+                Seed_mir.Use (Seed_mir.Move { root = Seed_mir.Local 1; projections = [] }) );
+            Seed_mir.Assign
+              ( { Seed_mir.root = Seed_mir.Local 3; projections = [] },
+                Seed_mir.Use (Seed_mir.Move { root = Seed_mir.Local 1; projections = [] }) );
+          ];
+        terminator = Seed_mir.Ret;
+      };
+    |]
+
+let check_cfg_all_copy_struct_root () =
+  (* g1: an all-Copy STRUCT def root (the def is in program.types) —
+     the engine resolves the def, answers Copy, and the pass does NOT
+     track the root: two whole-value consumes are two copies *)
+  let c_tid = Ids.Type_id.make 300 in
+  let c_fid = Ids.Field_id.make 30 in
+  let c_ty = Type_repr.Named (c_tid, [||]) in
+  let prog =
+    double_whole_move_prog [| i64; c_ty; c_ty; c_ty |]
+      [|
+        Seed_mir.StructDef
+          {
+            sd_id = c_tid;
+            sd_fields =
+              [ { Seed_mir.fd_id = c_fid; fd_index = Ids.Field_index.make 0; fd_ty = i64 } ];
+          };
+      |]
+  in
+  let errs = Resource_check.cfg_check_program prog in
+  if errs = [] then
+    pass "g1: all-Copy struct root is untracked by the cfg dataflow (double whole-value consume is two copies)"
+  else begin
+    List.iter (fun e -> Printf.printf "    %s\n" e) errs;
+    fail "g1: the cfg dataflow tracked an all-Copy struct root (%d finding(s))"
+      (List.length errs)
+  end
+
+let check_cfg_owning_enum_chain () =
+  (* g2: an OWNING enum (String payload) held as a struct field —
+     reaching the chain through the semantic Field projection, the
+     engine answers the enum NON-Copy through its def (the payload
+     rule), so the field chain is tracked and its double move is a
+     double-move finding *)
+  let h_tid = Ids.Type_id.make 301 in
+  let e_tid = Ids.Type_id.make 302 in
+  let h_fid = Ids.Field_id.make 31 in
+  let e_var = Ids.Variant_id.make 40 in
+  let h_ty = Type_repr.Named (h_tid, [||]) in
+  let e_ty = Type_repr.Named (e_tid, [||]) in
+  let prog =
+    fn_types [| i64; h_ty; e_ty |]
+      [|
+        Seed_mir.StructDef
+          {
+            sd_id = h_tid;
+            sd_fields =
+              [ { Seed_mir.fd_id = h_fid; fd_index = Ids.Field_index.make 0; fd_ty = e_ty } ];
+          };
+        Seed_mir.EnumDef
+          {
+            ed_id = e_tid;
+            ed_variants =
+              [
+                {
+                  Seed_mir.vd_id = e_var;
+                  vd_index = Ids.Variant_index.make 0;
+                  vd_payload = Type_repr.Tuple [| string_ty |];
+                };
+              ];
+          };
+      |]
+      [|
+        {
+          Seed_mir.id = 0;
+          statements =
+            [
+              Seed_mir.Assign
+                ( { Seed_mir.root = Seed_mir.Local 2; projections = [] },
+                  Seed_mir.Use
+                    (Seed_mir.Move
+                       { root = Seed_mir.Local 1; projections = [ Seed_mir.Field h_fid ] }) );
+              Seed_mir.Assign
+                ( { Seed_mir.root = Seed_mir.Local 2; projections = [] },
+                  Seed_mir.Use
+                    (Seed_mir.Move
+                       { root = Seed_mir.Local 1; projections = [ Seed_mir.Field h_fid ] }) );
+            ];
+          terminator = Seed_mir.Ret;
+        };
+      |]
+  in
+  let errs = Resource_check.cfg_check_program prog in
+  if List.length errs = 1 && List.exists (fun e -> contains_sub e "double-move of owned field") errs then
+    pass "g2: an owning enum (String payload) field chain is tracked — the double move is a double-move finding"
+  else begin
+    List.iter (fun e -> Printf.printf "    %s\n" e) errs;
+    fail "g2: the owning-enum chain answer is wrong (%d finding(s), expected exactly the double-move finding)"
+      (List.length errs)
+  end
+
+let check_cfg_langitems_overlay () =
+  (* g3: a def-less Ptr[Int] nominal root — the LangItems overlay's
+     raw-pointer answer (Copy) is threaded into the pass: WITH the
+     compilation record the root is untracked; WITHOUT it the same
+     def-less nominal answers the engine's conservative owned *)
+  let ptr_ty = Type_repr.Named (Ids.Type_id.make 5, [| i64 |]) in
+  let prog = double_whole_move_prog [| i64; ptr_ty; ptr_ty; ptr_ty |] [||] in
+  let errs_li = Resource_check.cfg_check_program ~lang_items:(Some Lang_items.seed_defaults) prog in
+  if errs_li = [] then
+    pass "g3: Ptr[Int] root answers Copy under the LangItems overlay (untracked)"
+  else begin
+    List.iter (fun e -> Printf.printf "    %s\n" e) errs_li;
+    fail "g3: Ptr[Int] root was tracked despite the LangItems overlay (%d finding(s))"
+      (List.length errs_li)
+  end;
+  let errs_none = Resource_check.cfg_check_program prog in
+  if List.length errs_none = 1 && List.exists (fun e -> contains_sub e "use-after-consume") errs_none then
+    pass "g3: the same def-less Ptr[Int] root answers conservative-owned without the overlay"
+  else begin
+    List.iter (fun e -> Printf.printf "    %s\n" e) errs_none;
+    fail "g3: the no-overlay Ptr[Int] answer is wrong (%d finding(s), expected the use-after-consume)"
+      (List.length errs_none)
+  end
+
 let () =
   check_property_matrix ();
   check_lang_items ();
@@ -728,6 +880,9 @@ let () =
   check_drop_plans ();
   check_verifier ();
   check_vm ();
+  check_cfg_all_copy_struct_root ();
+  check_cfg_owning_enum_chain ();
+  check_cfg_langitems_overlay ();
   if !failures = 0 then begin
     Printf.printf "tg_type_props: ALL PASS\n";
     exit 0

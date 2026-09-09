@@ -33,6 +33,11 @@
 #     (the codebase's only target identity is TargetDesc.name / the
 #     detect_host_target triple; no central TargetId domain exists yet — this
 #     record seeds that domain, name-only until a digest domain is wired).
+#     The SNAPSHOT header's target field carries StableTargetId instead —
+#     the digest-bearing full identity (triple/arch/cpu/width/endian/abi/
+#     float_abi/features/widths + the digest of the complete TargetDesc
+#     record) built by semantic_snapshot.tg's stable_target_id_of (audit
+#     item 9). TargetId itself stays for the asm-level AsmTarget consumers.
 #   - symbols/types/callables reference the resolver's StableDefId records
 #     (canonical key + digest words + registered low-word id) — the existing
 #     stable identity for definitions.
@@ -58,6 +63,7 @@
 use std::core::{Option}
 use std::collections::{Vec}
 use tg_compiler::ids::{StableDigest, StableDefId, DefKind}
+use tg_compiler::stable_ids::{StableContractId}
 use tg_compiler::ast::{AccessConvention, AstContractKind}
 use tg_compiler::token::{Span}
 use tg_compiler::types::{EffectSummary, CapabilityId}
@@ -69,9 +75,49 @@ use tg_compiler::types::{EffectSummary, CapabilityId}
 # canonical target triple/name — the ONLY target identity the codebase has
 # today (TargetDesc.name in target_desc.tg; the detect_host_target triple
 # strings). The snapshot's hash fields (abi_hash in particular) are
-# target-dependent, so the target rides the snapshot header.
+# target-dependent, so the target rides the snapshot header. This newtype
+# is retained for the pre-desc consumers (the asm-level AsmTarget renders);
+# the SNAPSHOT record carries the full StableTargetId below.
 struct TargetId
   name: String   # canonical target triple / TargetDesc.name ("aarch64-apple-darwin", "cortex-m4f", ...)
+end
+
+# The FULL target identity of a snapshot (audit item 9): the digest-bearing
+# record the SemanticSnapshot header carries instead of the name-only
+# TargetId. Built by semantic_snapshot.tg's stable_target_id_of from the
+# REAL TargetDesc record of the compilation (target_desc.tg — every field
+# below is a canonical render of desc data, never a guess). M4 vs M4F
+# snapshots differ: the cpu / float_abi fields and the digest words are
+# pure functions of the desc, so two descs that differ in ANY field produce
+# different digests.
+#   triple            — TargetDesc.name (the canonical instance name).
+#   arch / cpu        — the canonical target_desc Arch / Cpu words.
+#   pointer_width     — TargetDesc.pointer_width (bytes per pointer).
+#   endian            — "little" | "big" (TargetDesc.endianness).
+#   abi               — the integer-model word: pointer_width 8 -> "lp64",
+#                        pointer_width 4 -> "ilp32" (target_desc.tg's
+#                        documented integer-ABI rule: the integer word IS
+#                        the pointer width on every canonical instance).
+#   float_abi         — "soft" | "softfp" | "hard" (TargetDesc.float_abi).
+#   isa_features      — the desc's extension tokens, canonicalized (sorted).
+#   native_atomic_widths — the desc's native atomic widths, sorted.
+#   digest_hi / lo    — the 128-bit stable digest of the COMPLETE desc
+#                        record rendered canonically (every TargetDesc field
+#                        participates — stack alignment, isa, fpu, register
+#                        classes, memory spaces, ... — so any desc change
+#                        moves the digest).
+struct StableTargetId
+  triple: String
+  arch: String
+  cpu: String
+  pointer_width: Int
+  endian: String
+  abi: String
+  float_abi: String
+  isa_features: Vec[String]
+  native_atomic_widths: Vec[Int]
+  digest_hi: UInt = 0
+  digest_lo: UInt = 0
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -88,10 +134,17 @@ end
 #                     (computed by the writer slice after the tables are
 #                     sorted and rendered; zero until then).
 #   compiler_version — the producing compiler's version.tg VERSION text.
-#   target          — the compilation target (TargetId above).
+#   target          — the compilation target (the StableTargetId record —
+#                     the digest-bearing full target identity; TargetId
+#                     above stays for the asm-level consumers).
 #   symbols         — declared definitions (the DefKind vocabulary).
 #   types           — nominal type declarations (struct/enum/trait).
 #   calls           — caller -> callee call edges.
+#   indirect_calls  — explicit rows for the calls whose callee is NOT
+#                     statically known (audit item 13 — see IndirectCallEdge;
+#                     the row replaces a silent omission: every indirect
+#                     site is recorded, completeness "Unknown" unless
+#                     points-to info is available).
 #   effects         — per-function/operation effect facts (the §11 record).
 #   capabilities    — function -> capability edges (the CapabilityId domain).
 #   ownership       — per-place ownership facts inside a function body.
@@ -110,10 +163,11 @@ end
 struct SemanticSnapshot
   revision: StableDigest
   compiler_version: String
-  target: TargetId
+  target: StableTargetId
   symbols: Vec[SemanticSymbol] = Vec::new()
   types: Vec[SemanticType] = Vec::new()
   calls: Vec[CallEdge] = Vec::new()
+  indirect_calls: Vec[IndirectCallEdge] = Vec::new()
   effects: Vec[EffectEdge] = Vec::new()
   capabilities: Vec[CapabilityEdge] = Vec::new()
   ownership: Vec[OwnershipFact] = Vec::new()
@@ -138,7 +192,7 @@ end
 # writer slice fills (the writer then sorts every table, renders the
 # canonical text form and computes revision / the three surface hashes via
 # ids.tg's stable_digest_of).
-def semantic_snapshot_new(compiler_version: String, target: TargetId) -> SemanticSnapshot
+def semantic_snapshot_new(compiler_version: String, target: StableTargetId) -> SemanticSnapshot
   SemanticSnapshot {
     revision: semantic_digest_zero(),
     compiler_version: compiler_version,
@@ -223,6 +277,44 @@ enum CallEdgeKind
 end
 
 # ———————————————————————————————————————————————————————————————
+# IndirectCallEdge — one call whose callee is NOT statically known
+# ———————————————————————————————————————————————————————————————
+# (audit item 13 — the EXPLICIT row replacing the snapshot's silent
+# omission): the call graph records a direct edge only when the callee is
+# statically known; an indirect site (a call through a function-pointer /
+# closure / unknown VALUE) is recorded HERE instead, so no call site is
+# ever silently dropped from the snapshot. Fields:
+#   caller      — the caller function's row key text (the def digest key
+#                 for a def-keyed caller, the origin key text for a
+#                 synthesized caller — the SAME text the caller's
+#                 mir_functions row carries, so consumers can join).
+#   site        — the call-site locator text within the caller (the §33
+#                 grammar "<caller key>#B<block id>#T").
+#   signature   — the canonical type text of the indirect callee (the
+#                 FnPtr/Closure surface when the MIR carries it; the
+#                 canonical text of the best-resolved operand type).
+#   candidates  — the statically known candidate set (points-to results).
+#                 EMPTY unless the compiler has points-to info: the
+#                 snapshot's call builder carries none, so every row it
+#                 emits has an empty candidate set.
+#   completeness — "Unknown" unless points-to analysis completed the
+#                 candidate set ("Known" then). "Unknown" rows mean the
+#                 row's caller makes a call the delta/change machinery
+#                 cannot see through.
+# CONSERVATISM CONTRACT (change.affected): a change report MUST treat the
+# caller of an "Unknown" indirect row as potentially affected by ANY callee
+# change — an unknown indirect caller can reach anything, so excluding it
+# from an affected set is only sound when the caller's own key is the
+# change subject.
+struct IndirectCallEdge
+  caller: String
+  site: String
+  signature: String
+  candidates: Vec[String] = Vec::new()
+  completeness: String       # "Unknown" | "Known"
+end
+
+# ———————————————————————————————————————————————————————————————
 # EffectEdge — one function/operation effect fact
 # ———————————————————————————————————————————————————————————————
 # Reuses the §11 canonical effect record (types.tg EffectSummary) VERBATIM —
@@ -279,16 +371,50 @@ end
 # ———————————————————————————————————————————————————————————————
 # ContractFact — one declared contract clause on a function
 # ———————————————————————————————————————————————————————————————
-# kind reuses AstContractKind (AstPre / AstPost / AstInvariant — the
-# parser's contract vocabulary). clause_text is the clause's SOURCE TEXT —
-# the content-delta domain for contract changes (a clause change is a
-# semantic change: it rides the clause text, never the span). span is the
-# clause's span — metadata only.
+# The canonical contract clause row (audit item 11): the row IDENTITY is
+# the clause's StableContractId — the stable_ids.tg composite key
+# "<fn digest key>|Pre|Post|Invariant|<canonical clause text>" (the
+# stable_contract_row_key grammar — the canonical text component is the
+# flattened ContractExprIR, NEVER the message and never the source
+# spelling), so a formatting/whitespace/comment-only edit of a clause —
+# and a message-only edit — reproduce the SAME row. kind reuses
+# AstContractKind (AstPre / AstPost / AstInvariant). The clause CONTENT is
+# three fields:
+#   expression_fingerprint — the 128-bit stable digest of the canonical
+#                            clause text (the flattened canonical
+#                            expression — the delta compares the rows by
+#                            this fingerprint).
+#   canonical_expression   — the canonical typed-expression render
+#                            (ContractExprIR — op word + canonical argument
+#                            texts; resolved symbols ride as their stable
+#                            key texts where the compiler carries them,
+#                            constants by value, operators by kind; spans,
+#                            parens, whitespace and comments never
+#                            participate).
+#   message                — the clause's declared human message
+#                            (Option::None = the clause declared none).
+# span is the clause's span — metadata only.
+struct ContractExprIR
+  op: String          # the canonical operator/kind word of the expression
+  args: Vec[String]   # the canonical payload/child texts, in fixed order
+end
+
 struct ContractFact
-  function: StableDefId
-  kind: AstContractKind    # AstPre | AstPost | AstInvariant
-  clause_text: String      # the clause as written — the content-delta domain
+  id: StableContractId      # the stable clause identity (the row key record)
+  function: StableDefId     # the declaring function/method (stable identity)
+  kind: AstContractKind     # AstPre | AstPost | AstInvariant
+  expression_fingerprint: StableDigest   # digest of the canonical clause text
+  canonical_expression: ContractExprIR   # the canonical clause form
+  message: Option[String]   # the declared message (None = none declared)
   span: Option[Span] = Option::None   # clause span — provenance metadata ONLY
+end
+
+# The flattened canonical text of a ContractExprIR — the deterministic
+# "op(arg1,arg2,...)" form the row keys, fingerprints and sort tiebreaks
+# digest/compare (the identity text: two clauses are the SAME clause iff
+# these texts are equal after the function/kind components agree).
+def semantic_contract_expr_text(ce: ContractExprIR) -> String
+  ce.op + "(" + ce.args.join(",") + ")"
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -536,6 +662,27 @@ def semantic_call_edges_sort(inout calls: Vec[CallEdge]) -> Unit
   calls.sort_by(|a, b| semantic_call_edge_lt(a, b))
 end
 
+# IndirectCallEdge order: caller text, then the site text, then the
+# signature, then the completeness word, then the joined candidate text
+# (total order — the row is textual by design).
+def semantic_indirect_call_edge_lt(a: IndirectCallEdge, b: IndirectCallEdge) -> Bool
+  if a.caller != b.caller then
+    a.caller < b.caller
+  elsif a.site != b.site then
+    a.site < b.site
+  elsif a.signature != b.signature then
+    a.signature < b.signature
+  elsif a.completeness != b.completeness then
+    a.completeness < b.completeness
+  else
+    a.candidates.join(",") < b.candidates.join(",")
+  end
+end
+
+def semantic_indirect_call_edges_sort(inout indirect_calls: Vec[IndirectCallEdge]) -> Unit
+  indirect_calls.sort_by(|a, b| semantic_indirect_call_edge_lt(a, b))
+end
+
 # EffectEdge order: subject-function digest, then the summary's dirty-class
 # projection (the may_* flags packed deterministically in the §11 field
 # order — the writer's text form carries the same projection). Identical
@@ -614,7 +761,9 @@ def semantic_ownership_facts_sort(inout ownership: Vec[OwnershipFact]) -> Unit
 end
 
 # ContractFact order: function digest, then the kind discriminant, then the
-# clause text (the content-delta domain).
+# canonical clause text (the row's content-delta identity — the flattened
+# canonical expression; semantic text movement never moves a row), then the
+# declared message (identical-row tiebreak only).
 def semantic_contract_fact_lt(a: ContractFact, b: ContractFact) -> Bool
   if semantic_stable_def_id_lt(&a.function, &b.function) then
     true
@@ -623,7 +772,13 @@ def semantic_contract_fact_lt(a: ContractFact, b: ContractFact) -> Bool
   elsif semantic_contract_kind_numeric(&a.kind) != semantic_contract_kind_numeric(&b.kind) then
     semantic_contract_kind_numeric(&a.kind) < semantic_contract_kind_numeric(&b.kind)
   else
-    a.clause_text < b.clause_text
+    let atext = semantic_contract_expr_text(&a.canonical_expression)
+    let btext = semantic_contract_expr_text(&b.canonical_expression)
+    if atext != btext then
+      atext < btext
+    else
+      semantic_option_string_cmp(&a.message, &b.message) < 0
+    end
   end
 end
 

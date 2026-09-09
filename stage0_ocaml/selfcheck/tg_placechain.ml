@@ -23,16 +23,34 @@
          with the element-state rule (canary_neg_resource_index);
          a CONSTANT index over a fixed array tracks the single
          element, siblings stay live (canary_pos_resource_partial_index);
+         the ownership-safe container take call (Vec pop/remove,
+         Map remove — the inout intrinsic surface) extracts the owned
+         element cleanly with no per-index row (the take-style
+         positives canary_pos_resource_array_take / vec_remove /
+         map_remove); a boundary consume rejected by the element-state
+         rule is never healed by a later root store (the Maybe_live
+         commit rejects the store itself);
      (g) a conditional move joins the chain to Maybe_live and a
          later use of the chain rejects                        -> reject
          (canary_neg_resource_partial_conditional); consuming on
          BOTH paths joins to Consumed and the sibling stays live -> ok
          (canary_pos_resource_partial_both_paths);
-     (h) assignment over a LIVE owning field runs the masked
-         whole-root drop: the sibling DIRECT fields are destroyed
-         (marked Consumed) — the sibling read then rejects; the
-         depth-1 over a partially-moved root is rejected; the nested
-         exact-place replacement over a partially-moved root is ok;
+      (h) assignment over a live owning chain runs the EXACT-place
+          replacement: the old value of the target chain itself is
+          destroyed (masked to its own consumed extensions) and the
+          sibling chains stay live and usable — the depth-1 field, the
+          nested chain, the tuple / fixed-array element and the enum
+          payload position all follow the same rule (the canaries
+          canary_pos_replace_live_string_field_preserves_sibling /
+          replace_nested_owned_field / replace_tuple_owned_element /
+          replace_fixed_array_constant_element /
+          replace_enum_payload_field / replace_rhs_reads_sibling /
+          replace_rhs_moves_sibling / replace_live_field_drops_old_exactly_once);
+          the same-chain RHS overlaps (self / extension) reject
+          (replace_same_field_from_itself_rejected_or_staged_correctly —
+          the rejection arm) and a chain under a consumed proper prefix
+          rejects; the whole-root replace over a moved-out child is the
+          one remaining masked whole-value form (allowed);
      (i) a whole-root consume of a partially-moved root          -> reject
          (the whole-value boundary gate);
      (j) Field chains resolve through program.types (semantic
@@ -268,6 +286,66 @@ let test_const_index_array_extract () =
   check "f2: constant-index fixed-array extract + sibling read is clean"
     (n_errors errs = 0)
 
+(* ── (f3) the ownership-safe container take surface — the take-style
+   POSITIVE (canary_pos_resource_array_take / vec_remove / map_remove at
+   the MIR level): an inout container operation (Vec pop/remove(index),
+   Map remove(key) — the __intrinsic_array_pop/remove /
+   __intrinsic_map_remove family) reads the container ROOT by place and
+   returns the owned element into an ordinary owned local.  The checker
+   creates NO per-index chain row and rejects nothing: the container
+   stays Live (a whole-value read) and the extracted element is dropped
+   exactly once at its own site.  The owning container root is the
+   unresolvable Named type (the engine's conservative Owned answer). *)
+let vec_root_ty = Type_repr.Named (Ids.Type_id.make 200, [||])
+
+let test_take_style_container_call () =
+  let locals = [| vec_root_ty; str_ty |] in
+  let errs =
+    check_prog locals vec_root_ty [||]
+      [|
+        blk 0
+          []
+          (Seed_mir.Call
+             ( place 2 [],
+               Seed_mir.User (inst 7001),
+               [| { Seed_mir.effect_ = Access_effect.Modify; value = Seed_mir.Copy (place 1 []) } |],
+               1,
+               None ));
+        blk 1 [] (Seed_mir.Drop (place 2 [], 2, None));
+        blk 2 [] Seed_mir.Ret;
+      |]
+  in
+  check "f3: an ownership-safe container take call extracts the owned element cleanly"
+    (n_errors errs = 0)
+
+(* ── (f4) the boundary consume is an unconditional rule rejection: the
+   element-state error fires AT the dynamic-index consuming move and a
+   later whole-root store cannot erase it — the store re-lives the root
+   (the whole-store commit) but the rejection stands (the native
+   whole-boundary commit + rule error mirror this). *)
+let test_boundary_consume_then_relive () =
+  let locals = [| arr3_ty; str_ty |] in
+  let agg =
+    Seed_mir.Aggregate
+      ( Seed_mir.ArrayAgg,
+        [ Seed_mir.Constant (str_const "a");
+          Seed_mir.Constant (str_const "b");
+          Seed_mir.Constant (str_const "c") ] )
+  in
+  let errs =
+    check_prog locals arr3_ty [||]
+      [|
+        blk 0
+          [
+            Seed_mir.Assign (place 2 [], Seed_mir.Use (Seed_mir.Move (place 1 [ Seed_mir.Index 1 ])));
+            Seed_mir.Assign (place 1 [], agg);
+          ]
+          Seed_mir.Ret;
+      |]
+  in
+  check "f4: a boundary consume's rule rejection is unconditional (a later root store cannot heal it)"
+    (n_errors errs = 1 && any errs "element-level state is not tracked")
+
 (* ── (g) conditional move: join to Maybe_live ───────────────────────
    canary_neg_resource_partial_conditional: the chain consumed on one
    path only joins to Maybe_live; a later use of the chain rejects.
@@ -311,11 +389,12 @@ let test_conditional_both_paths () =
   check "g2: both-paths consume joins to Consumed; the sibling stays live"
     (n_errors errs = 0)
 
-(* ── (h) assignment over a live owning field — the masked drop ────── *)
-(* (h1) the fully-live depth-1 assign is the whole-root masked drop:
-   the sibling DIRECT fields are destroyed (marked Consumed) — the
-   sibling read then rejects like a moved-out field. *)
-let test_assign_over_live_sibling_destroyed () =
+(* ── (h) assignment over a live owning chain — the EXACT-PLACE
+   replacement (audit item: the canonical replacement model) ────────── *)
+(* (h1) replace_live_string_field_preserves_sibling: assigning a live
+   owning field destroys ONLY the field's old value — the sibling stays
+   live, readable afterwards and drops exactly once at the scope exit. *)
+let test_replace_live_field_sibling_live () =
   let locals = [| ss_ty; int_ty |] in
   let errs =
     check_prog locals ss_ty [||]
@@ -325,18 +404,22 @@ let test_assign_over_live_sibling_destroyed () =
             Seed_mir.Assign
               (place 1 [ ci 0 ], Seed_mir.Use (Seed_mir.Constant (str_const "x")));
             Seed_mir.Assign (place 2 [], Seed_mir.Use (Seed_mir.Read (place 1 [ ci 1 ])));
+            Seed_mir.Assign (place 2 [], Seed_mir.Use (Seed_mir.Read (place 1 [ ci 0 ])));
           ]
-          Seed_mir.Ret;
+          (Seed_mir.Goto 1);
+        blk 1 [] (Seed_mir.Drop (place 1 [], 2, None));
+        blk 2 [] Seed_mir.Ret;
       |]
   in
-  check "h1: assign over a live owning field marks the sibling destroyed"
-    (n_errors errs = 1 && any errs "read of moved-out owned field [1]")
+  check "h1: replace of a live owning field keeps the sibling live and readable"
+    (n_errors errs = 0)
 
-(* (h2) the depth-1 assign over a live owning field of a
-   PARTIALLY-MOVED root rejects (the masked whole-root drop is not
-   representable). *)
-let test_assign_over_live_partial_root () =
-  let locals = [| ss_ty; str_ty |] in
+(* (h2) replace_live_string_field_preserves_sibling over a PARTIALLY-MOVED
+   root: the depth-1 assign is the exact-place replacement — it is
+   allowed over a root that carries other consumed chains (the sibling
+   that was moved out stays dead, the replaced chain re-lives). *)
+let test_replace_live_field_partial_root () =
+  let locals = [| ss_ty; str_ty; int_ty |] in
   let errs =
     check_prog locals ss_ty [||]
       [|
@@ -345,16 +428,19 @@ let test_assign_over_live_partial_root () =
             Seed_mir.Assign (place 2 [], Seed_mir.Use (Seed_mir.Move (place 1 [ ci 0 ])));
             Seed_mir.Assign
               (place 1 [ ci 1 ], Seed_mir.Use (Seed_mir.Constant (str_const "z")));
+            Seed_mir.Assign (place 3 [], Seed_mir.Use (Seed_mir.Read (place 1 [ ci 1 ])));
           ]
-          Seed_mir.Ret;
+          (Seed_mir.Goto 1);
+        blk 1 [] (Seed_mir.Drop (place 2 [], 2, None));
+        blk 2 [] (Seed_mir.Drop (place 1 [], 3, None));
+        blk 3 [] Seed_mir.Ret;
       |]
   in
-  check "h2: assign over a live owning field of a partial root rejects"
-    (n_errors errs = 1
-    && any errs "root is partially moved out (the masked drop-before-store is not representable)")
+  check "h2: exact-place replace of a live owning field over a partial root is clean"
+    (n_errors errs = 0)
 
-(* (h3) the NESTED assign over a live owning chain is the exact-place
-   replacement: it is allowed even when the root has other dead chains. *)
+(* (h3) replace_nested_owned_field over a root with a consumed sibling
+   chain — the exact-place replacement (the nested form) is clean. *)
 let test_nested_assign_exact_place () =
   let locals = [| nested_ty; str_ty; int_ty |] in
   let errs =
@@ -367,10 +453,206 @@ let test_nested_assign_exact_place () =
               (place 1 [ ci 0; ci 1 ], Seed_mir.Use (Seed_mir.Constant (str_const "q")));
             Seed_mir.Assign (place 3 [], Seed_mir.Use (Seed_mir.Read (place 1 [ ci 0; ci 1 ])));
           ]
-          Seed_mir.Ret;
+          (Seed_mir.Goto 1);
+        blk 1 [] (Seed_mir.Drop (place 1 [], 2, None));
+        blk 2 [] Seed_mir.Ret;
       |]
   in
   check "h3: nested exact-place assign over a live chain is clean"
+    (n_errors errs = 0)
+
+(* (h4) replace_tuple_owned_element / replace_fixed_array_constant_element:
+   a live owning element of a tuple / fixed-array root is replaced
+   exactly — the other elements stay live and readable. *)
+let test_replace_tuple_element () =
+  let locals = [| ss_ty; int_ty |] in
+  let errs =
+    check_prog locals ss_ty [||]
+      [|
+        blk 0
+          [
+            Seed_mir.Assign
+              (place 1 [ ci 1 ], Seed_mir.Use (Seed_mir.Constant (str_const "y")));
+            Seed_mir.Assign (place 2 [], Seed_mir.Use (Seed_mir.Read (place 1 [ ci 0 ])));
+            Seed_mir.Assign (place 2 [], Seed_mir.Use (Seed_mir.Read (place 1 [ ci 1 ])));
+          ]
+          (Seed_mir.Goto 1);
+        blk 1 [] (Seed_mir.Drop (place 1 [], 2, None));
+        blk 2 [] Seed_mir.Ret;
+      |]
+  in
+  check "h4: replace of a live owning tuple element keeps the sibling live"
+    (n_errors errs = 0)
+
+let test_replace_fixed_array_element () =
+  let locals = [| arr3_ty; int_ty |] in
+  let errs =
+    check_prog locals arr3_ty [||]
+      [|
+        blk 0
+          [
+            Seed_mir.Assign
+              (place 1 [ ci 1 ], Seed_mir.Use (Seed_mir.Constant (str_const "x")));
+            Seed_mir.Assign (place 2 [], Seed_mir.Use (Seed_mir.Read (place 1 [ ci 2 ])));
+            Seed_mir.Assign (place 2 [], Seed_mir.Use (Seed_mir.Read (place 1 [ ci 1 ])));
+          ]
+          (Seed_mir.Goto 1);
+        blk 1 [] (Seed_mir.Drop (place 1 [], 2, None));
+        blk 2 [] Seed_mir.Ret;
+      |]
+  in
+  check "h5: replace of a live owning fixed-array element keeps the others live"
+    (n_errors errs = 0)
+
+(* (h6) replace_live_field_drops_old_exactly_once: after the exact
+   replacement the scope exit's whole-root drop is clean — the replaced
+   value (and the untouched sibling) drop exactly once, no double-drop. *)
+let test_replace_then_whole_drop () =
+  let locals = [| ss_ty; int_ty |] in
+  let errs =
+    check_prog locals ss_ty [||]
+      [|
+        blk 0
+          [
+            Seed_mir.Assign
+              (place 1 [ ci 0 ], Seed_mir.Use (Seed_mir.Constant (str_const "x")));
+            Seed_mir.Assign (place 2 [], Seed_mir.Use (Seed_mir.Read (place 1 [ ci 1 ])));
+          ]
+          (Seed_mir.Goto 1);
+        blk 1 [] (Seed_mir.Drop (place 1 [], 2, None));
+        blk 2 [] Seed_mir.Ret;
+      |]
+  in
+  check "h6: replace of a live owning field then the whole-root drop is clean"
+    (n_errors errs = 0)
+
+(* (h7) replace_rhs_reads_sibling: the RHS READING a disjoint sibling
+   chain of an exact-place replacement is accepted (the exact drop never
+   touches the sibling's storage). *)
+let test_replace_rhs_reads_sibling () =
+  let locals = [| ss_ty; int_ty |] in
+  let errs =
+    check_prog locals ss_ty [||]
+      [|
+        blk 0
+          [
+            Seed_mir.Assign
+              (place 1 [ ci 0 ], Seed_mir.Use (Seed_mir.Read (place 1 [ ci 1 ])));
+            Seed_mir.Assign (place 2 [], Seed_mir.Use (Seed_mir.Read (place 1 [ ci 0 ])));
+          ]
+          (Seed_mir.Goto 1);
+        blk 1 [] (Seed_mir.Drop (place 1 [], 2, None));
+        blk 2 [] Seed_mir.Ret;
+      |]
+  in
+  check "h7: exact-place replace with a sibling READ RHS is clean"
+    (n_errors errs = 0)
+
+(* (h8) replace_rhs_moves_sibling: the RHS MOVING a disjoint sibling
+   chain into the replaced field is accepted (canary
+   canary_pos_replace_rhs_moves_sibling): the old target value drops at
+   the replacement, the sibling's value moves into the target and drops
+   at the scope exit, every other sibling stays live. *)
+let test_replace_rhs_moves_sibling () =
+  let locals = [| ss_ty; int_ty |] in
+  let errs =
+    check_prog locals ss_ty [||]
+      [|
+        blk 0
+          [
+            Seed_mir.Assign
+              (place 1 [ ci 1 ], Seed_mir.Use (Seed_mir.Move (place 1 [ ci 0 ])));
+            Seed_mir.Assign (place 2 [], Seed_mir.Use (Seed_mir.Read (place 1 [ ci 1 ])));
+          ]
+          (Seed_mir.Goto 1);
+        blk 1 [] (Seed_mir.Drop (place 1 [], 2, None));
+        blk 2 [] Seed_mir.Ret;
+      |]
+  in
+  check "h8: exact-place replace with a sibling MOVE RHS is clean"
+    (n_errors errs = 0)
+
+(* (h9) replace_same_field_from_itself / a sub-value of the replaced
+   field: the RHS operand OVERLAPS the target chain (equal or an
+   extension of it) — the exact drop would destroy the operand's source
+   before it materializes — rejected (canary-neg rows). *)
+let test_replace_self_rhs_rejected () =
+  let locals = [| ss_ty |] in
+  let errs =
+    check_prog locals ss_ty [||]
+      [|
+        blk 0
+          [ Seed_mir.Assign (place 1 [ ci 0 ], Seed_mir.Use (Seed_mir.Move (place 1 [ ci 0 ]))) ]
+          Seed_mir.Ret;
+      |]
+  in
+  check "h9: replace of a field from ITSELF rejects (overlap)"
+    (n_errors errs = 1 && any errs "replaced value's own storage")
+
+let test_replace_extension_rhs_rejected () =
+  let locals = [| nested_ty |] in
+  let errs =
+    check_prog locals nested_ty [||]
+      [|
+        blk 0
+          [ Seed_mir.Assign (place 1 [ ci 0 ], Seed_mir.Use (Seed_mir.Move (place 1 [ ci 0; ci 0 ]))) ]
+          Seed_mir.Ret;
+      |]
+  in
+  check "h10: replace of a field from its own sub-value rejects (overlap)"
+    (n_errors errs = 1 && any errs "replaced value's own storage")
+
+(* (h11) a chain UNDER a CONSUMED proper prefix rejects the assignment
+   (the write would go through the moved-out containing value). *)
+let test_replace_under_consumed_prefix_rejected () =
+  let locals = [| nested_ty; str_ty |] in
+  let errs =
+    check_prog locals nested_ty [||]
+      [|
+        blk 0
+          [
+            Seed_mir.Assign (place 2 [], Seed_mir.Use (Seed_mir.Move (place 1 [ ci 0 ])));
+            Seed_mir.Assign
+              (place 1 [ ci 0; ci 1 ], Seed_mir.Use (Seed_mir.Constant (str_const "z")));
+          ]
+          Seed_mir.Ret;
+      |]
+  in
+  check "h11: assign into a field under a consumed prefix rejects"
+    (n_errors errs = 1 && any errs "containing value was moved out")
+
+(* (h12) replace_enum_payload_field: the live owning payload position of
+   an enum value is replaced exactly; the sibling payload position stays
+   live.  (Registered with the enum section at the file end — the enum
+   type-def fixtures live there.) *)
+
+(* (h13) the whole-root replacement of a root that carries a consumed
+   child is allowed — the masked whole-root drop destroys only the LIVE
+   children; the dead child's storage is skipped (the whole-root replace
+   is the one remaining whole-value masked-drop form). *)
+let test_whole_root_replace_with_moved_child () =
+  let locals = [| ss_ty; str_ty |] in
+  let errs =
+    check_prog locals ss_ty [||]
+      [|
+        blk 0
+          [
+            Seed_mir.Assign (place 2 [], Seed_mir.Use (Seed_mir.Move (place 1 [ ci 0 ])));
+            Seed_mir.Assign
+              (place 1 [],
+               Seed_mir.Aggregate
+                 ( Seed_mir.TupleAgg,
+                   [
+                     Seed_mir.Constant (str_const "a");
+                     Seed_mir.Constant (str_const "b");
+                   ] ));
+          ]
+          (Seed_mir.Goto 1);
+        blk 1 [] (Seed_mir.Drop (place 2 [], 2, None));
+        blk 2 [] Seed_mir.Ret;
+      |]
+  in
+  check "h13: whole-root replace over a moved-out child is clean"
     (n_errors errs = 0)
 
 (* ── (i) whole-root consume of a partially-moved root — reject ────── *)
@@ -475,6 +757,27 @@ let test_enum_payload_chains () =
   check "k: double move of the Downcast payload chain rejects"
     (n_errors errs = 1 && any errs "double-move of owned field")
 
+(* ── (m) replace_enum_payload_field (registered with the enum
+   fixtures): the live owning payload position of an enum value is
+   replaced exactly; the sibling payload position stays live. *)
+let test_replace_enum_payload_field () =
+  let root_ty = Type_repr.Named (enum_tid, [||]) in
+  let locals = [| root_ty; int_ty |] in
+  let errs =
+    check_prog locals root_ty [| enum_def |]
+      [|
+        blk 0
+          [
+            Seed_mir.Assign
+              (place 1 [ vid 20; ci 0 ], Seed_mir.Use (Seed_mir.Constant (str_const "q")));
+            Seed_mir.Assign (place 2 [], Seed_mir.Use (Seed_mir.Read (place 1 [ vid 20; ci 1 ])));
+          ]
+          Seed_mir.Ret;
+      |]
+  in
+  check "m: replace of a live owning enum-payload field is clean"
+    (n_errors errs = 0)
+
 (* ── (l) a loop after a partial move keeps the chain at the fixpoint ─
    canary_pos_cfg_loop_after_partial_move. *)
 let test_loop_after_partial_move () =
@@ -504,14 +807,26 @@ let () =
   test_deinit_with_moved_field ();
   test_dynamic_index_consume ();
   test_const_index_array_extract ();
+  test_take_style_container_call ();
+  test_boundary_consume_then_relive ();
   test_conditional_join_maybe ();
   test_conditional_both_paths ();
-  test_assign_over_live_sibling_destroyed ();
-  test_assign_over_live_partial_root ();
+  test_replace_live_field_sibling_live ();
+  test_replace_live_field_partial_root ();
   test_nested_assign_exact_place ();
+  test_replace_tuple_element ();
+  test_replace_fixed_array_element ();
+  test_replace_then_whole_drop ();
+  test_replace_rhs_reads_sibling ();
+  test_replace_rhs_moves_sibling ();
+  test_replace_self_rhs_rejected ();
+  test_replace_extension_rhs_rejected ();
+  test_replace_under_consumed_prefix_rejected ();
+  test_whole_root_replace_with_moved_child ();
   test_whole_consume_after_field_move ();
   test_struct_field_chains ();
   test_enum_payload_chains ();
+  test_replace_enum_payload_field ();
   test_loop_after_partial_move ();
   if !failures = 0 then begin
     Printf.printf "tg_placechain: ALL PASS\n";

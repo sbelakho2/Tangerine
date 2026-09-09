@@ -338,6 +338,38 @@ indices are tracked individually, siblings stay live
 (`place_projection_keys` records the in-range `Index` key;
 `canary_pos_resource_partial_index`).
 
+**The static-place vs dynamic-container ownership invariant.** A place
+is an EXACT STATIC PLACE exactly when every projection is a struct
+field, a tuple index, an enum-payload position, or a constant index over
+a fixed-array base: the per-chain lattice tracks those positions
+individually, and a consuming extraction moves exactly that slot (the
+siblings stay live and are dropped by the masked partial-drop chain).
+Every other place is the DYNAMIC-CONTAINER OWNERSHIP BOUNDARY: a runtime
+index into a `Vec`/`Map`/fixed-array (`vec[i]`, `map[k]`, `arr[i]` with
+a runtime `i`) or any deref. At the boundary the container's elements
+are the ownership unit — there is no per-slot lattice state at subscript
+sites — so raw sink extraction through a dynamic index is rejected by
+the element-state rule in both checkers (native
+`apply_whole_boundary_consume` / the type-checker's shared-extraction
+guard; stage0 `resource_check.ml`'s boundary arm), and the diagnostic
+names the sanctioned extraction paths: the ownership-safe container
+operations (Vec `pop` / `remove(index)`, Map `remove(key)`, the fixed
+containers' `pop`/`pop_front`) and the `with c[i] as inout` element
+bindings. Container mutation is owned by those operations (and by
+indexed assignment, whose old-element drop the MIR owns) — never by a
+checker-side per-index lattice over dynamic subscripts.
+
+The boundary is enforced with ZERO runtime ownership metadata on
+ordinary arrays: per-slot state exists only in the compiler's frame
+lattice and the compile-time drop masks — a `[T; N]` value is the inline
+element bytes and nothing else, and the Vec/Map headers carry length and
+capacity only, never per-element ownership tags. The runtime
+element-slot representations (a per-slot occupancy bitmap or an
+ownership tag word beside the data, maintained through every
+push/pop/remove) were evaluated and REJECTED: the compile-time chain
+lattice plus the masked drop glue covers every extraction the language
+admits, so the runtime layout never carries element-state metadata.
+
 The canary families `canary_pos_resource_partial_{extract,nested,
 reassign,index,both_paths}` and `canary_pos_cfg_loop_after_partial_move`
 exercise the implemented forms; stage0's chain-aware lattice implements
@@ -1016,12 +1048,19 @@ compiler-owned structural field cleanup — exactly once.
 
 | Item | Current behavior | Target |
 |------|------------------|--------|
-| **Expression-level projected operations over DYNAMIC indexes (owning container elements)** | static projections (fields, tuple indexes, in-range constant indexes over fixed arrays) run the per-chain lattice with masked drops (§4.4); a `Vec[i]`/`Map[k]` consuming move or owning-typed indexed initialization stays rejected — the container's elements are the ownership unit, so whole-value-boundary consumes mark the root MaybeLive and element-level state is not tracked | per-index element state at subscript sites (the dynamic-index chains) |
 | **Consuming iteration** | snapshot iteration exists; sink-element iteration rejected | consuming iteration with per-iteration (backedge) cleanup |
 | **StrView name fallback** | the hash/eq dispatch selects StrView by the LangItems `str_view` TypeId; the name-selection fallback remains only for snapshots without the registration | drop the name fallback once every snapshot registers the id |
 
+Dynamic-index element state is NOT a pending target: the per-index
+element-state-at-subscript-sites design was evaluated and REJECTED (the
+static-place vs dynamic-container invariant, §4.4 — the container's
+elements are the ownership unit, and extraction goes through the
+ownership-safe container operations).
+
 The pending list above is the authoritative one; `access_resource_migration.md`
-records the historical status of these items at audit time.
+records the historical status of these items at audit time. (The former
+dynamic-index element-state row was removed when its target was closed as a
+rejected design — §4.4 records the decision.)
 
 ---
 
