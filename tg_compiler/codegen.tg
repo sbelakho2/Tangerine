@@ -2103,7 +2103,56 @@ def emit_mul_rrr(inout ctx: CodegenCtx, d: PhysReg, n: PhysReg, m: PhysReg) -> U
   end  end
 end
 
-# SDIV: dst = n / m
+# Is `ty` an UNSIGNED integer kind? The division-edge MIN/-1 TRAP is a
+# SIGNED overflow only: unsigned division has no MIN/-1 edge (the
+# machine's signed sdiv/idiv edge is not the language edge), so unsigned
+# operands take only the zero-divisor guard. Bool/Char never reach a
+# division arm.
+def is_unsigned_int_kind(ty: Type) -> Bool
+  match ty
+  when Type::UInt then true
+  when Type::U8 then true
+  when Type::U16 then true
+  when Type::U32 then true
+  when Type::U64 then true
+  when Type::USize then true
+  when _ then false
+  end  end
+end
+
+# The language division guard (audit item 30): the raw `/` and `%` edges
+# TRAP deterministically on every target — the divisor is tested against
+# zero, and for the SIGNED kinds the INT64_MIN/-1 pair (the quotient step
+# the remainder sequence shares) is tested before the sdiv/idiv. Before
+# this guard the aarch64 direct route took the architectural sdiv
+# results (0 / MIN) while x86 #DE trapped; the inline trap is the same
+# UD2/UDF the MirAssert arm emits, so both targets now agree. `signed`
+# is the caller's operand-signedness decision (codegen_binop passes
+# `!is_unsigned_int_kind(left_ty) && !is_unsigned_int_kind(right_ty)`).
+# `n`/`m` are the handler's operand registers; the reserved scratch
+# (R11 / X15) materializes -1 and INT64_MIN — it is never allocatable
+# and holds nothing live across a binop.
+def emit_div_trap_guard(inout ctx: CodegenCtx, signed: Bool, n: PhysReg, m: PhysReg) -> Unit
+  let lbl_nz = next_codegen_label(ctx, ".Ldiv_nz.")
+  emit_test_rr(ctx, m, m)
+  emit_jcc(ctx, CondKind::Ne, lbl_nz)
+  emit_trap(ctx)
+  def_label(&mut ctx.text, lbl_nz)
+  if signed then
+    let lbl_edge = next_codegen_label(ctx, ".Ldiv_edge.")
+    let scratch = scratch_reg(ctx.target.arch)
+    emit_mov_ri(ctx, scratch, -1)
+    emit_cmp_rr(ctx, m, scratch)
+    emit_jcc(ctx, CondKind::Ne, lbl_edge)
+    emit_mov_ri(ctx, scratch, -9223372036854775808 as i64)
+    emit_cmp_rr(ctx, n, scratch)
+    emit_jcc(ctx, CondKind::Ne, lbl_edge)
+    emit_trap(ctx)
+    def_label(&mut ctx.text, lbl_edge)
+  end
+end
+
+# SDIV: dst = n / m (guarded — see emit_div_trap_guard)
 def emit_sdiv(inout ctx: CodegenCtx, d: PhysReg, n: PhysReg, m: PhysReg) -> Unit
   match d
   when PhysReg::X64Reg(xd) then
@@ -2133,7 +2182,7 @@ def emit_sdiv(inout ctx: CodegenCtx, d: PhysReg, n: PhysReg, m: PhysReg) -> Unit
   end  end
 end
 
-# MOD: dst = n % m
+# MOD: dst = n % m (guarded — see emit_div_trap_guard)
 def emit_smod(inout ctx: CodegenCtx, d: PhysReg, n: PhysReg, m: PhysReg) -> Unit
   match d
   when PhysReg::X64Reg(xd) then
@@ -6331,8 +6380,12 @@ def codegen_binop(inout ctx: CodegenCtx, fctx: FnCodegenCtx, op: MirBinOp, left:
     end
   when MirBinOp::Sub    then emit_sub_rrr(ctx, dst, dst, scratch)
   when MirBinOp::Mul    then emit_mul_rrr(ctx, dst, dst, scratch)
-  when MirBinOp::Div    then emit_sdiv(ctx, dst, dst, scratch)
-  when MirBinOp::Mod    then emit_smod(ctx, dst, dst, scratch)
+  when MirBinOp::Div then
+    emit_div_trap_guard(ctx, !is_unsigned_int_kind(&left_ty) && !is_unsigned_int_kind(&right_ty), dst, scratch)
+    emit_sdiv(ctx, dst, dst, scratch)
+  when MirBinOp::Mod then
+    emit_div_trap_guard(ctx, !is_unsigned_int_kind(&left_ty) && !is_unsigned_int_kind(&right_ty), dst, scratch)
+    emit_smod(ctx, dst, dst, scratch)
   when MirBinOp::BitAnd then emit_and_rrr(ctx, dst, dst, scratch)
   when MirBinOp::BitOr  then emit_or_rrr(ctx, dst, dst, scratch)
   when MirBinOp::BitXor then emit_xor_rrr(ctx, dst, dst, scratch)

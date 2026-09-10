@@ -1976,13 +1976,15 @@ authority that implements the rule, so every backend agrees.
   (`300 as u8` is 44; `-1 as u8` is 255). Widening casts of a negative
   signed value to a wider unsigned type reinterpret the bit pattern
   (`-1 as u64` is 2^64-1).
-- The signed **division/remainder** edges (division by zero and
-  `MIN / -1`) are not yet unified by a lowering guard: on the x86 and
-  wasm targets the machine traps on both edges, while the AArch64
-  `sdiv` instruction defines them (zero → 0, MIN/-1 → MIN). Audit §24
-  records this as the one remaining cross-target gap in the ordinary
-  arithmetic surface; programs that need a guaranteed trap must guard
-  the edge themselves until the guard lands.
+- The **division/remainder** edges TRAP deterministically on every
+  target and route: dividing by zero (signed or unsigned) and the
+  signed `MIN / -1` pair (both the quotient and the remainder, whose
+  quotient step divides through the same edge) fault at the operation.
+  The AArch64 and x86-64 emitters both carry the explicit guard,
+  matching the x86 `idiv` and wasm behaviour; the unsigned kinds have
+  no `MIN / -1` edge and trap only on a zero divisor. Programs that
+  need a defined result must guard the edge themselves (the
+  `Result`-returning `div` helpers in `std::math` do).
 
 ## Compiler Invocation
 

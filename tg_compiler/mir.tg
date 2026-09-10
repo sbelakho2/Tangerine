@@ -29,6 +29,7 @@ use tg_compiler::types::{
   budget_metric_resource, budget_metric_enforced, budget_bound_value,
   budget_time_limit_ns, typed_budget_limit, intrinsic_allocates,
   TypeError, EffectSummary, EffectClass, EffectAnnotation, EffectClassClaim,
+  HoleConstraints, hole_constraint_rows,
   fn_effect_def_key, intrinsic_id_of_call,
   effect_summary_merge, effect_summary_unknown, effect_summary_of_intrinsic,
   effect_summary_of_extern_name, effect_summary_has_class,
@@ -1560,6 +1561,11 @@ struct MirBuilder
   # recorded in the flat maps but NOT in the node form (the typed-call
   # assembly failure class — the recording site's ICE).
   typed_exprs: Map[Int, TypedExpr]
+  # (audit item 54) hole node id -> the checker's HoleConstraints, carried
+  # with the typed program so the unfilled-hole lowering error can report
+  # the hole's expected type / constraint counts instead of a bare node id.
+  # Empty for every program checked outside hole mode.
+  hole_constraints: Map[Int, HoleConstraints] = Map::new()
   static_names: Set[String]
   static_types: Map[String, Type]
  # static/const name -> the static's SEMANTIC DefId (the resolver's
@@ -4600,6 +4606,7 @@ def lower_program(program: Program, analyzed: AnalyzedProgram) -> Result[MirProg
   b.field_targets = analyzed.typed.field_targets.clone()
   b.expr_types = analyzed.typed.expr_types.clone()
   b.typed_exprs = analyzed.typed.typed_exprs.clone()
+  b.hole_constraints = analyzed.typed.hole_constraints.clone()
   # Wire the typed deinit/finalize/call identity data: MIR consumes the
   # semantic plans instead of guessing cleanup or callees from names.
   b.finalize_plan = analyzed.finalize_plan.clone()
@@ -7886,6 +7893,7 @@ def expr_kind_name(kind: ExprKind) -> String
   when ExprKind::ExprAssign(_, _) then "ExprAssign"
   when ExprKind::ExprPipe(_, _) then "ExprPipe"
   when ExprKind::ExprMacroCall(_, _) then "ExprMacroCall"
+  when ExprKind::ExprHole then "ExprHole"
   when ExprKind::ExprError(_) then "ExprError"
   when _ then "ExprKind(?)"
   end  end
@@ -12193,6 +12201,33 @@ def lower_expr_to_rvalue(inout b: MirBuilder, expr: Expr, span: Span) -> Result[
       return Result::Err("internal error: expr_kind_name/ExprKind mismatch during MIR lowering")
     end
 
+  elsif kind_name == "ExprHole" then
+    # (audit item 54) FAIL-CLOSED: an unfilled typed hole never lowers. In
+    # the non-hole compilation path the checker already rejected the hole
+    # before MIR; if a hole nevertheless reaches lowering (a hole-mode
+    # artifact compiled without FillHole), this Err aborts lowering — the
+    # error drain turns it into a compile failure and NO MIR is emitted
+    # (never a silently fabricated value). The hole's recorded constraints
+    # ride the message.
+    var hole_note = ""
+    match b.typed_exprs.get(expr.node_id)
+    when Option::Some(te) then
+      match te.kind
+      when TypedExprKind::Hole then
+        match b.hole_constraints.get(expr.node_id)
+        when Option::Some(hc) then
+          hole_note = " constraints: " + hole_constraint_rows(hc.clone()).join("; ")
+        when Option::None then ()
+        end
+      when _ then
+        hole_note = " (the TYPED node was replaced by FillHole, but the source expression is still `???`: MIR lowering is AST-driven in the transitional representation — complete the AST/HIR expression rewrite to compile)"
+      end
+    when Option::None then
+      hole_note = " (no typed node recorded for this hole)"
+    end
+    return Result::Err("typed hole `???` at node " + expr.node_id.to_string() +
+      " never lowers — fail-closed (no MIR is emitted); apply FillHole (and its AST/HIR rewrite) to replace it" + hole_note)
+
   else
     # Default fallback for unhandled variants: fail instead of silently
     # producing a Unit rvalue, so unsupported expression kinds surface as
@@ -12228,6 +12263,14 @@ end
 
 def lower_place(inout b: MirBuilder, expr: Expr) -> Place
   let kind_name = expr_kind_name(&expr.kind)
+  if kind_name == "ExprHole" then
+    # (audit item 54) fail-closed: a hole is never a place. The unfilled
+    # hole is rejected by lower_expr_to_rvalue on the value path; this guard
+    # covers direct place demands (stores / inout arguments) so a hole can
+    # never silently address local 0.
+    b.errors.push("unfilled typed hole `???` at node " + expr.node_id.to_string() + " used as a place — an unfilled hole is fail-closed")
+    return place_local(MirLocalId { id: 0 })
+  end
   if kind_name == "ExprIdent" then
     match expr.kind
     when ExprKind::ExprIdent(name) then

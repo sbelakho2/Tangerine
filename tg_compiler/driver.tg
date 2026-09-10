@@ -89,7 +89,8 @@ use tg_compiler::compiler_core::{
   get_output_path, explain_error_code, error_code_example,
   emitter_new, emitter_new_json, DiagnosticEmitter, driver_lower_to_mir, analyze_program,
   Diagnostic, DiagLevel, json_escape, parse_source_program, join_diagnostics,
-  emit_diagnostic, type_errors_to_diags, merge_imported_deps
+  emit_diagnostic, type_errors_to_diags, merge_imported_deps,
+  CodegenRoute, parse_codegen_route
 }
 # The §30 semantic snapshot route (audit §30; default-off): the driver
 # house of the env-gated artifact gates (with the LIR gates) — the
@@ -125,7 +126,7 @@ use tg_compiler::wasm_target::{
 use tg_compiler::cross_compile::{OptLevel as WasmOptLevel}
 
 pub use tg_compiler::compiler_core::{
-  CompilerOptions, compile_file, compile_startup_entry, compile_file_core,
+  CompilerOptions, CodegenRoute, compile_file, compile_startup_entry, compile_file_core,
   compile_multiple_files, DiagnosticEmitter, Diagnostic, DiagLevel
 }
 
@@ -171,12 +172,47 @@ def check_target_capabilities(opts: CompilerOptions) -> Vec[String]
   rejections
 end
 
+# The --codegen flag parser (audit item 31): accepts exactly
+# `--codegen=direct` / `--codegen=lir`; anything else fails closed with
+# the option's expected spelling. The driver-level wrapper around
+# compiler_core's parse_codegen_route keeps the three CLI parsers on ONE
+# extraction rule (including the no-value case).
+def parse_codegen_flag(arg: String) -> Result[CodegenRoute, String]
+  if !arg.starts_with("--codegen=") then
+    return Result::Err("Missing value for --codegen (expected --codegen=direct or --codegen=lir)")
+  end
+  let parts = arg.split("=")
+  if parts.len() != 2 then
+    return Result::Err("Malformed --codegen flag: " + arg + " (expected --codegen=direct or --codegen=lir)")
+  end
+  parse_codegen_route(parts[1].clone())
+end
+
+# The deprecated-alias fallback (audit item 31): TANGERINE_LIR=1 is the
+# legacy spelling of --codegen=lir and is consulted ONLY when the CLI
+# carried no explicit --codegen flag. TANGERINE_LIR_TARGET never enables
+# the route by itself — it is the legacy backend selector INSIDE the LIR
+# route (compile_lir_route), unchanged.
+def apply_codegen_env_alias(opts: CompilerOptions, codegen_explicit: Bool) -> CompilerOptions
+  if codegen_explicit then
+    return opts
+  end
+  if lir_route_enabled() then
+    var aliased = opts
+    aliased.codegen = CodegenRoute::Lir
+    aliased
+  else
+    opts
+  end
+end
+
 # 
 # Argument Parsing
 # 
 
 def parse_args(argv: Vec[String]) -> Result[CompilerOptions, String]
   var opts = default_options()
+  var codegen_explicit = false
   var i = 1  # Skip program name
   
   while i < argv.len() do
@@ -258,6 +294,17 @@ def parse_args(argv: Vec[String]) -> Result[CompilerOptions, String]
         return Result::Err("Missing argument for --target")
       end
       opts.target_triple = Option::Some(argv[i].clone())
+    elsif arg == "--codegen" || arg.starts_with("--codegen=") then
+      # (audit item 31) FUNDAMENTAL CODEGEN SELECTION: the option is the
+      # authority (fail-closed value parse); TANGERINE_LIR is applied as
+      # a deprecated alias at the end of this parser ONLY when the flag
+      # was absent.
+      let route = match parse_codegen_flag(arg.clone())
+      when Result::Ok(r) then r
+      when Result::Err(e) then return Result::Err(e)
+      end
+      opts.codegen = route
+      codegen_explicit = true
     elsif arg == "--panic-strategy" then
       # STATE A (abort-only): panic=abort is the ONLY stable panic
       # strategy. The unwind/catch machinery is experimental and carries
@@ -338,12 +385,15 @@ def parse_args(argv: Vec[String]) -> Result[CompilerOptions, String]
   if opts.input_files.is_empty() then
     return Result::Err("No input files")
   end
-  
-  Result::Ok(opts)
+
+  # (audit item 31) the deprecated TANGERINE_LIR alias maps onto the
+  # option only when no explicit --codegen flag was given.
+  Result::Ok(apply_codegen_env_alias(opts, codegen_explicit))
 end
 
 def parse_startup_compile_args(skip_subcommand: Bool) -> Result[CompilerOptions, String]
   var opts = default_options()
+  var codegen_explicit = false
   let argc = raw_arg_count()
   var i = if skip_subcommand then 2 else 1 end
 
@@ -410,6 +460,15 @@ def parse_startup_compile_args(skip_subcommand: Bool) -> Result[CompilerOptions,
         return Result::Err("Missing argument for --target")
       end
       opts.target_triple = Option::Some(raw_arg_copy(i))
+    elsif arg == "--codegen" || arg.starts_with("--codegen=") then
+      # (audit item 31) the same option surface as parse_args; the
+      # deprecated TANGERINE_LIR alias is applied before returning.
+      let route = match parse_codegen_flag(arg.clone())
+      when Result::Ok(r) then r
+      when Result::Err(e) then return Result::Err(e)
+      end
+      opts.codegen = route
+      codegen_explicit = true
     elsif arg == "--no-std" then
       # The no_std flag: accepted here (the compile route reads it from the
       # raw argv — CompilerOptions carries no dedicated field). A no_std
@@ -446,7 +505,9 @@ def parse_startup_compile_args(skip_subcommand: Bool) -> Result[CompilerOptions,
     i = i + 1
   end
 
-  Result::Ok(opts)
+  # (audit item 31) the deprecated TANGERINE_LIR alias maps onto the
+  # option only when no explicit --codegen flag was given.
+  Result::Ok(apply_codegen_env_alias(opts, codegen_explicit))
 end
 
 def print_help() -> Unit
@@ -492,6 +553,9 @@ def print_help() -> Unit
   println("                     aarch64 REQUIRES the ARMv8.1 LSE atomics (LDADDAL/CASAL/SWPAL —")
   println("                     Apple Silicon, Neoverse, Cortex-A75+; see asm.tg's target feature")
   println("                     table; the ldaxr/stlxr LL/SC fallback is the future portable mode)")
+  println("  --codegen=direct|lir  Codegen route (default direct; lir is the standalone")
+  println("                     LIR pipeline — experimental, host aarch64 + the desc'd")
+  println("                     embedded triples only; TANGERINE_LIR is a deprecated alias)")
   println("  --panic-strategy <S>  abort (the ONLY stable strategy; unwind is rejected —")
   println("                     the unwind/catch machinery is experimental and never selectable)")
   println("  --pgo-gen[=PATH]     Instrument binary for profile generation")
@@ -2423,8 +2487,10 @@ end
 #     target_desc.tg — the ARMv7-M backend of backend_thumb.tg and the
 #     RISC-V backend of backend_rv.tg). There is no direct emitter for
 #     those ISAs, so the embedded triples always use the LIR backends
-#     (TANGERINE_LIR is NOT required — it only gates "LIR vs direct"
-#     for the host); the LIR artifact contract applies (ELF32 ARM /
+#     (neither --codegen nor the deprecated TANGERINE_LIR alias is
+#     required — the option/env only gate "LIR vs direct" for the
+#     host; an explicit --codegen=direct on such a triple fails closed,
+#     audit item 31); the LIR artifact contract applies (ELF32 ARM /
 #     ELF32|ELF64 RISC-V relocatable objects — executable/image linking
 #     fails closed inside the backend, naming the object contract);
 #   - the spec'd triples with NO descriptor instance (thumbv6m-none-eabi
@@ -2745,14 +2811,23 @@ def compile_to_embedded_route(opts: CompilerOptions, files: Vec[String], output_
   # triple IS the backend identity — target_desc_of_triple) always routes
   # to the LIR pipeline for that descriptor: no direct emitter exists for
   # those ISAs, so the embedded triples always use the LIR backends
-  # (TANGERINE_LIR is NOT required for them — the env var only gates
-  # LIR-vs-direct for the host). The LIR artifact contract applies:
+  # (no --codegen flag or TANGERINE_LIR env is required for them — the
+  # option/env only gate LIR-vs-direct for the host). The LIR artifact
+  # contract applies:
   # ELF32 ARM / ELF32|ELF64 RISC-V relocatable objects; executable/image
   # linking fails closed inside the backend with the object contract (an
   # arm-none-eabi / riscv-none-elf linker consumes the object with the
   # embedded cortex-m/riscv linker scripts and startup artifacts).
   match embedded_lir_triple_desc(triple.clone())
   when Option::Some(desc) then
+    # (audit item 31) EXPLICIT-CODEGEN CONFLICT, fail closed: this triple
+    # has NO direct emitter — it always compiles through its LIR backend.
+    # An explicit `--codegen=direct` is rejected instead of silently
+    # ignored (the deprecated TANGERINE_LIR alias is never consulted
+    # here — embedded behavior is unchanged).
+    if opts.codegen_explicit && opts.codegen == CodegenRoute::Direct then
+      return Result::Err("--codegen=direct conflicts with --target " + triple + ": the `" + desc.name + "` embedded triple has no direct emitter — it always compiles through its LIR backend (use --codegen=lir or omit --codegen)")
+    end
     if files.len() != 1 then
       return Result::Err("embedded: the `" + triple + "` LIR-route triple compiles exactly one input file (the `" + desc.name + "` backend — got " + files.len().to_string() + ")")
     end
@@ -2789,6 +2864,14 @@ def compile_to_embedded_route(opts: CompilerOptions, files: Vec[String], output_
   # override is unreachable for every rejected ISA.
   if spec.family != "aarch64" then
     return Result::Err("embedded: the target triple `" + triple + "` is REJECTED — the " + spec.arch + " (" + spec.family + ") profile has no TargetDesc instance in target_desc.tg (the descriptor table serves the ARMv7-M cortex-m3/m4/m4f/m7 and RISC-V riscv32imac/imafc/imafdc/riscv64imac/riscv64gc instances; this route will not fabricate a " + spec.arch + " image under the triple). The desc'd thumb/riscv triples route to their LIR backends: --target thumbv7m-none-eabi, thumbv7em-none-eabi, thumbv7em-none-eabihf, riscv32imac-unknown-none-elf, riscv32imafc-unknown-none-elf, riscv32imafdc-unknown-none-elf, riscv64imac-unknown-none-elf or riscv64gc-unknown-none-elf")
+  end
+  # (audit item 31) EXPLICIT-CODEGEN CONFLICT, fail closed: this bare-
+  # metal route (aarch64-unknown-none) compiles through the DIRECT
+  # aarch64 backend (compile_startup_entry below) — the LIR pipeline has
+  # no bare-metal image/spec/startup artifact contract. An explicit
+  # `--codegen=lir` is rejected instead of silently ignored.
+  if opts.codegen_explicit && opts.codegen == CodegenRoute::Lir then
+    return Result::Err("--codegen=lir conflicts with --target " + triple + ": the `" + triple + "` bare-metal route compiles through the direct aarch64 backend (the spec/linker/startup + ELF image contract) — use --codegen=direct or omit --codegen")
   end
   let source = match read_file(files[0].clone())
   when Result::Ok(s) then s
@@ -2882,35 +2965,49 @@ def root_program_imports_module(program: Program, module: String) -> Bool
 end
 
 # ———————————————————————————————————————————————————————————————
-# THE LIR ROUTE — audit P1-7 slice + audit item 39 (default-off for
-# the HOST; the embedded desc'd triples always route here)
+# THE LIR ROUTE — audit P1-7 slice + audit items 31/39 (default-off for
+# the HOST via the compiler option; the embedded desc'd triples always
+# route here)
 # ———————————————————————————————————————————————————————————————
-# TANGERINE_LIR=1 routes HOST single-file compiles through
+# --codegen=lir routes HOST single-file compiles through
 # tg_compiler::lir — the standalone register-allocation pipeline
 # (MIR -> LIR -> linear scan -> aarch64 emission -> object/link; see
-# lir.tg's module doc for the legalization contract). The gate is an
-# env-var opt-in, so the working direct emitter is untouched; the LIR
-# route FAILS CLOSED on any construct outside the contract (it never
-# falls back per function silently). The route mirrors
-# compile_to_wasm_route's pipeline shape.
+# lir.tg's module doc for the legalization contract). The route FAILS
+# CLOSED on any construct outside the contract (it never falls back per
+# function silently). The route mirrors compile_to_wasm_route's pipeline
+# shape.
+# AUDIT ITEM 31 — THE OPTION IS THE AUTHORITY: the route is selected by
+# CompilerOptions.codegen (--codegen=direct|lir; default direct — the
+# codegen_default() one-line flip point in compiler_core.tg).
+# TANGERINE_LIR=1 is a DEPRECATED ALIAS: it is mapped onto the option at
+# the CLI parser boundaries (parse_args / parse_startup_compile_args /
+# cmd_compile_direct via apply_codegen_env_alias) ONLY when the compile
+# carried no explicit --codegen flag, so an explicit --codegen=direct
+# wins over the env var.
 # AUDIT ITEM 39 — THE BACKEND IDENTITY IS THE DESC, NOT AN ENV NAME:
 # the LIR pipeline is the code generator for the desc'd thumb/riscv
 # triples (compile_to_embedded_route above routes a --target
 # thumbv7m-none-eabi / thumbv7em-none-eabi[f] / riscv32* / riscv64*
 # compile here with the descriptor the triple names — route_desc), and
-# the env-gated host slice keeps "LIR vs direct" as a compiler
-# implementation detail for the aarch64 host. TANGERINE_LIR_TARGET is a
-# LEGACY ALIAS whose values are keys of the SAME target-desc table the
-# --target triples resolve through (target_desc_of_triple): "cortex-m3"/
+# the host slice keeps "LIR vs direct" as a compiler implementation
+# detail for the aarch64 host. TANGERINE_LIR_TARGET is a LEGACY ALIAS
+# whose values are keys of the SAME target-desc table the --target
+# triples resolve through (target_desc_of_triple): "cortex-m3"/
 # "cortex-m4"/"cortex-m4f"/"cortex-m7" (and the "cortex-m" alias of
 # cortex-m4f) pick the Thumb-2 backend in tg_compiler::backend_thumb,
 # "riscv32imac"/"riscv32imafc"/"riscv32imafdc"/"riscv64imac"/
 # "riscv64gc" (and the "riscv32"/"riscv64" aliases of the imac
 # instances) pick the RISC-V backend in tg_compiler::backend_rv, and
 # "aarch64" (or an unset variable) is the host slice; unknown values
-# fail closed with the table's keys. There is no environment-only
-# target universe.
+# fail closed with the table's keys. It NEVER enables the route by
+# itself — it only picks the backend INSIDE an LIR compile (an explicit
+# --codegen=lir or the deprecated TANGERINE_LIR=1 alias). There is no
+# environment-only target universe.
 
+# DEPRECATED ALIAS (audit item 31): TANGERINE_LIR=1 is the legacy
+# spelling of --codegen=lir. It is consulted ONLY by
+# apply_codegen_env_alias at the CLI parser boundary and ONLY when the
+# compile carried no explicit --codegen flag (codegen_explicit == false).
 def lir_route_enabled() -> Bool
   match std::env::get_env("TANGERINE_LIR")
   when Option::Some(v) then v == "1"
@@ -3088,9 +3185,10 @@ end
 # linking fails closed inside x86_64_compile_executable. The route's
 # descriptor is the desc of the --target triple (target_desc_of_triple)
 # or of the legacy env alias; the triple gate below checks the identity.
-# The route is reachable ONLY under the LIR gate (TANGERINE_LIR=1 plus
-# TANGERINE_LIR_TARGET=x86_64, or --target x86_64-* with TANGERINE_LIR=1)
-# — the default host route is unchanged.
+# The route is reachable ONLY when the LIR route is selected
+# (--codegen=lir, or the deprecated TANGERINE_LIR=1 alias) — with
+# TANGERINE_LIR_TARGET=x86_64 or --target x86_64-*. The default host
+# route is unchanged.
 def compile_lir_route_x86(mir: MirProgram, opts: CompilerOptions, out_path: String, tdesc: TargetDesc) -> Result[Unit, String]
   if tdesc.pointer_width != 8 || tdesc.stack_alignment != 16 || tdesc.arch != Arch::X86_64 then
     return Result::Err("internal error: the x86_64 LIR route was given the `" + tdesc.name + "` description (" + tdesc.pointer_width.to_string() + "-byte pointers, stack align " + tdesc.stack_alignment.to_string() + ") — the item-30 route compiles for the 8-byte-pointer, 16-aligned x86_64 System V description (the --target triple or the legacy alias must select an x86_64 desc)")
@@ -3127,7 +3225,7 @@ end
 
 def compile_lir_route(opts: CompilerOptions, files: Vec[String], output_path: String, route_desc: Option[TargetDesc]) -> Result[Unit, String]
   if files.len() != 1 then
-    return Result::Err("the LIR pipeline requires exactly one input file (unset TANGERINE_LIR to use the direct emitter)")
+    return Result::Err("the LIR pipeline requires exactly one input file (use --codegen=direct, or unset the deprecated TANGERINE_LIR alias, for the direct emitter)")
   end
   let file = files[0].clone()
   let out_path = if output_path.len() > 0 then
@@ -3238,13 +3336,13 @@ def compile_lir_route(opts: CompilerOptions, files: Vec[String], output_path: St
       end
       return Result::Err("internal error: the legacy LIR alias `" + lir_backend + "` resolved a desc the LIR route does not serve")
     end
-    # (audit item 30 stage 1) THE x86_64 HOST EXPERIMENT: a --target
-    # x86_64-* triple under the LIR gate (TANGERINE_LIR=1) with the
-    # legacy alias unset routes to the x86_64 LIR backend directly —
-    # the descriptor is the --target triple's own (target_desc_of_triple)
-    # and the default host slice below stays the aarch64 route. The
-    # gate for every other --target override is unchanged (the error
-    # below).
+    # (audit item 30 stage 1) THE x86_64 EXPERIMENT: a --target x86_64-*
+    # triple under the LIR route (--codegen=lir, or the deprecated
+    # TANGERINE_LIR=1 alias) with the legacy TANGERINE_LIR_TARGET alias
+    # unset routes to the x86_64 LIR backend directly — the descriptor
+    # is the --target triple's own (target_desc_of_triple) and the
+    # default host slice below stays the aarch64 route. The gate for
+    # every other --target override is unchanged (the error below).
     match opts.target_triple
     when Option::Some(tt) then
       match target_desc_of_triple(tt.clone())
@@ -3257,10 +3355,11 @@ def compile_lir_route(opts: CompilerOptions, files: Vec[String], output_path: St
     when Option::None then ()
     end
   end
-  # — the aarch64 host slice (TANGERINE_LIR=1 without a desc'd --target):
-  # the original P1-7 slice's emission below. —
+  # — the aarch64 host slice (--codegen=lir, or the deprecated
+  # TANGERINE_LIR=1 alias, without a desc'd --target): the original P1-7
+  # slice's emission below. —
   if target.arch != Arch::AArch64 then
-    return Result::Err("the TANGERINE_LIR route emits aarch64 only in this slice; the host is " + host_arch_name(target.arch) + " — unset TANGERINE_LIR to use the direct emitter")
+    return Result::Err("the LIR host route emits aarch64 only in this slice; the host is " + host_arch_name(target.arch) + " — use --codegen=direct (or unset the deprecated TANGERINE_LIR alias) for the direct emitter")
   end
   # P1-14 slice 1: the route consults the canonical target description —
   # lir_target_desc() -> target_desc::aarch64_desc(), the single source of
@@ -3269,11 +3368,11 @@ def compile_lir_route(opts: CompilerOptions, files: Vec[String], output_path: St
   # the current aarch64_desc, so no emission behavior changes here.
   let tdesc = lir_target_desc()
   if tdesc.pointer_width != 8 || tdesc.stack_alignment != 16 then
-    return Result::Err("internal error: lir_target_desc() describes `" + tdesc.name + "` (" + tdesc.pointer_width.to_string() + "-byte pointers, stack align " + tdesc.stack_alignment.to_string() + ") — the TANGERINE_LIR slice compiles for 8-byte-pointer, 16-aligned aarch64 (unset TANGERINE_LIR to use the direct emitter)")
+    return Result::Err("internal error: lir_target_desc() describes `" + tdesc.name + "` (" + tdesc.pointer_width.to_string() + "-byte pointers, stack align " + tdesc.stack_alignment.to_string() + ") — the LIR host slice compiles for 8-byte-pointer, 16-aligned aarch64 (use --codegen=direct for the direct emitter)")
   end
   match opts.target_triple
   when Option::Some(tt) then
-    return Result::Err("the TANGERINE_LIR route does not support --target overrides (" + tt + "); unset TANGERINE_LIR to use the direct emitter")
+    return Result::Err("the LIR host route does not support --target overrides (" + tt + "); use --codegen=direct for the direct emitter")
   when Option::None then ()
   end
   match opts.emit
@@ -3290,7 +3389,7 @@ def compile_lir_route(opts: CompilerOptions, files: Vec[String], output_path: St
   when EmitMode::Executable then
     lir_compile_executable(mir, target.clone(), out_path)
   when _ then
-    Result::Err("the TANGERINE_LIR route supports --emit=obj and --emit=exe only (unset TANGERINE_LIR for other emit modes)")
+    Result::Err("the LIR host route supports --emit=obj and --emit=exe only (use --codegen=direct for other emit modes)")
   end
 end
 
@@ -3598,6 +3697,14 @@ def cmd_compile(argv: Vec[String]) -> Int
   # compile dispatches to the wasm backend (the driver's target
   # dispatch — the native compile path never sees the wasm target).
   if is_wasm_target(&opts) then
+    # (audit item 31) EXPLICIT-CODEGEN CONFLICT, fail closed: the wasm
+    # backend is a separate code generator with no LIR pipeline, so an
+    # explicit --codegen=lir is rejected instead of silently ignored
+    # (the deprecated env alias never selected a route here).
+    if opts.codegen_explicit && opts.codegen == CodegenRoute::Lir then
+      eprintln("--codegen=lir conflicts with the wasm --target: the wasm backend is a separate code generator with no LIR pipeline — use --codegen=direct or omit --codegen")
+      return 1
+    end
     match compile_to_wasm_route(&opts, files, output_path)
     when Result::Ok(_) then return 0
     when Result::Err(e) then
@@ -3635,6 +3742,14 @@ def cmd_compile(argv: Vec[String]) -> Int
   # to the no_std contract — the core-only import surface, the _start bare
   # entry and the libc-free link.
   if nostd_mode_requested(&argv, &files) then
+    # (audit item 31) EXPLICIT-CODEGEN CONFLICT, fail closed: the no_std
+    # route compiles through the direct emitter (the _start/libc-free
+    # link contract) and has no LIR pipeline — an explicit --codegen=lir
+    # is rejected instead of silently ignored.
+    if opts.codegen_explicit && opts.codegen == CodegenRoute::Lir then
+      eprintln("--codegen=lir conflicts with --no-std: the no_std route compiles through the direct emitter (the _start/libc-free link contract) — use --codegen=direct or omit --codegen")
+      return 1
+    end
     match compile_to_nostd_route(&opts, files, output_path, true)
     when Result::Ok(_) then return 0
     when Result::Err(e) then
@@ -3643,14 +3758,17 @@ def cmd_compile(argv: Vec[String]) -> Int
     end
   end
 
-  # THE LIR ROUTE GATE (audit P1-7 slice; default-off): TANGERINE_LIR=1
-  # routes native single-file compiles through the standalone
-  # register-allocation pipeline in tg_compiler::lir — the "LIR vs
-  # direct" choice for the HOST (the embedded desc'd triples above always
-  # use the LIR pipeline, no env gate). Fail-closed: any construct
-  # outside the LIR legalization contract fails the compile with a
-  # rule-naming error — never a silent per-function fallback.
-  if lir_route_enabled() then
+  # THE LIR ROUTE GATE (audit P1-7 slice; audit item 31 — the OPTION is
+  # the authority, default direct): --codegen=lir routes native
+  # single-file compiles through the standalone register-allocation
+  # pipeline in tg_compiler::lir — the "LIR vs direct" choice for the
+  # HOST (the embedded desc'd triples above always use the LIR pipeline,
+  # no option needed). The deprecated TANGERINE_LIR=1 alias was already
+  # mapped onto opts.codegen by the parser when no explicit flag was
+  # given. Fail-closed: any construct outside the LIR legalization
+  # contract fails the compile with a rule-naming error — never a silent
+  # per-function fallback.
+  if opts.codegen == CodegenRoute::Lir then
     match compile_lir_route(&opts, files, output_path, Option::None)
     when Result::Ok(_) then return 0
     when Result::Err(e) then
@@ -3691,6 +3809,7 @@ def cmd_compile_direct(skip_subcommand: Bool) -> Int
   var opts = default_options()
   var primary_input = "".to_string()
   var input_count = 0
+  var codegen_explicit = false
   let argc = raw_arg_count()
   var i = if skip_subcommand then 2 else 1 end
 
@@ -3732,6 +3851,16 @@ def cmd_compile_direct(skip_subcommand: Bool) -> Int
         return 1
       end
       opts.target_triple = Option::Some(raw_arg_unchecked(i))
+    elsif arg == "--codegen" || arg.starts_with("--codegen=") then
+      # (audit item 31) the same option surface as the full CLI parsers.
+      let route = match parse_codegen_flag(arg.clone())
+      when Result::Ok(r) then r
+      when Result::Err(e) then
+        println(e)
+        return 1
+      end
+      opts.codegen = route
+      codegen_explicit = true
     elsif arg == "--no-std" then
       # Accepted in raw compile mode too (see cmd_compile's no_std route).
       ()
@@ -3765,6 +3894,10 @@ def cmd_compile_direct(skip_subcommand: Bool) -> Int
     println("Multiple input files are not supported in raw compile mode")
     return 1
   end
+
+  # (audit item 31) the deprecated TANGERINE_LIR alias maps onto the
+  # option only when no explicit --codegen flag was given.
+  opts = apply_codegen_env_alias(opts, codegen_explicit)
 
  # (target-capability gate): same policy as cmd_compile — the
   # compile-time rejection site for arch-gated operations (all map/set
@@ -3809,9 +3942,11 @@ def cmd_compile_direct(skip_subcommand: Bool) -> Int
     e
   end
 
-  # THE LIR ROUTE GATE in raw compile mode (audit P1-7 slice; default-
-  # off) — same fail-closed semantics as cmd_compile's gate.
-  if lir_route_enabled() then
+  # THE LIR ROUTE GATE in raw compile mode (audit P1-7 slice; audit item
+  # 31 — the option is the authority, default direct; the deprecated
+  # TANGERINE_LIR alias was mapped above when no explicit flag was
+  # given) — same fail-closed semantics as cmd_compile's gate.
+  if opts.codegen == CodegenRoute::Lir then
     var lir_files = Vec::new()
     lir_files.push(file.clone())
     match compile_lir_route(&opts, lir_files, output_path, Option::None)

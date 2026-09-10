@@ -2124,6 +2124,17 @@ struct TypeEnv
   # checked. `return` statements unify against it unconditionally (set in
   # check_function/check_impl around the body check, cleared afterwards).
   expected_return: Option[Type]
+ # (audit item 54) the TYPED-HOLE mode flag and constraint channel. A
+ # `???` hole records its HoleConstraints in hole_constraints keyed by the
+ # hole's AST node id (the same typed-node channel key space). When
+ # allow_holes is false (the default — every compilation entry), an
+ # ExprHole is REJECTED with a diagnostic naming the hole: an unfilled hole
+ # is never silently accepted. When true (the editor / hole-mode entry
+ # type_check_typed_holes, or a caller setting env.allow_holes), the hole
+ # type-checks against any expected type and only the accessor reports the
+ # constraints; the MIR lowering still fails closed on an unfilled hole.
+  allow_holes: Bool = false
+  hole_constraints: Map[Int, HoleConstraints] = Map::new()
   
  # per pattern node id — the BindingPlans collected while checking the
   # pattern (each plan describes one bound identifier's action on its source
@@ -3504,6 +3515,268 @@ enum TypedExprKind
   Unsafe { reason: Option[String], body: Vec[TypedStmt] }
   Async(Vec[TypedStmt])
   Comptime(Vec[TypedStmt])
+
+  # The typed-hole placeholder `???` (audit item 54): the typed node records
+  # only its identity; the hole's HoleConstraints ride the parallel
+  # hole_constraints channel keyed by this node id (types.tg TypeEnv /
+  # TypedProgram), read through hole_constraints_of /
+  # typed_hole_constraints_of. The node's `ty` is the checker's fresh
+  # inference variable unified against the expected type (resolve it to
+  # read the expected type back). FillHole (semantic_edit.tg) replaces THIS
+  # record with a checker-produced expression's typed form; an unfilled hole
+  # is fail-closed at MIR lowering.
+  Hole
+end
+
+# ———————————————————————————————————————————————————————————————
+# The typed-hole constraint record (audit item 54)
+# ———————————————————————————————————————————————————————————————
+# The constraints a `???` hole carries: what the hole must become. Recorded
+# per hole NODE id at the checker's ExprHole arm (the hole_constraints
+# channel, mirroring the typed-node channel — one entry per hole node, the
+# SAME key space as typed_exprs), and readable two ways:
+#   hole_constraints_of(env, node)          — the LIVE checker env (the
+#     expected_type is RESOLVED through the env's substitution at read time
+#     — the recorded value carries "" there, since the expected type is only
+#     known after the surrounding unification runs);
+#   typed_hole_constraints_of(program, node) — the codegenable artifact
+#     (expected_type resolved at TypedProgram assembly).
+# The field vocabulary (honest per-field provenance):
+#   expected_type      — the displayed type the hole unifies against ("" when
+#                        the hole is unconstrained / the var never resolves).
+#   in_scope_values    — "name: type" rows of every local binding visible at
+#                        the hole, sorted (the lexical scope stack).
+#   required_effects   — the enclosing function's DECLARED effect names,
+#                        sorted — the effects the fill may use.
+#   forbidden_effects  — the enclosing function's effect-class claims
+#                        (no_alloc / no_block / no_io / irq_safe / interrupt),
+#                        sorted — the classes the fill must not violate.
+#   trait_obligations  — RESERVED: the checker carries no per-node obligation
+#                        rows today, so this is empty (documented gap; a
+#                        future obligation-row family fills it).
+#   constructors       — the enum-variant constructors of every registered
+#                        enum type ("Type::Variant"), sorted.
+#   reachable_functions— the module-visible callable keys of the hole's
+#                        current module (env.module_callable_types prefix
+#                        match; the bare first-wins names at the root
+#                        module), sorted.
+struct HoleConstraints
+  expected_type: String = ""
+  in_scope_values: Vec[String] = Vec::new()
+  required_effects: Vec[String] = Vec::new()
+  forbidden_effects: Vec[String] = Vec::new()
+  trait_obligations: Vec[String] = Vec::new()
+  constructors: Vec[String] = Vec::new()
+  reachable_functions: Vec[String] = Vec::new()
+end
+
+# (Clone is derived structurally: the fields are String / Vec[String], the
+# same shape as ContractExprIR's derived clone.)
+
+# ———— The typed-hole recording / reading surface (audit item 54) ————
+
+# Sort + dedupe constraint rows (deterministic accessor output).
+def hole_sorted_unique(rows: Vec[String]) -> Vec[String]
+  var sorted: Vec[String] = Vec::new()
+  for r in rows do
+    sorted.push(r.clone())
+  end
+  sorted.sort_by(|a, b| a < b)
+  var out: Vec[String] = Vec::new()
+  for r in sorted do
+    if !out.contains(&r) then
+      out.push(r.clone())
+    end
+  end
+  out
+end
+
+# The effect-class word of a recognized annotation claim (the @effects(...)
+# vocabulary).
+def hole_effect_class_word(a: EffectAnnotation) -> String
+  match a
+  when EffectAnnotation::NoAlloc then "no_alloc"
+  when EffectAnnotation::NoBlock then "no_block"
+  when EffectAnnotation::NoIo then "no_io"
+  when EffectAnnotation::IrqSafe then "irq_safe"
+  when EffectAnnotation::Interrupt then "interrupt"
+  end
+end
+
+# The displayed EXPECTED type of a hole node: the recorded expression type
+# resolved through the live substitution; "" for a missing entry, an
+# unresolved variable whose display would be an internal id, or the
+# rejected (non-hole-mode) Type::Error result.
+def hole_expected_type_text(env: TypeEnv, node: Int) -> String
+  match env.typed_expr_types.get(node)
+  when Option::Some(ty) then
+    let resolved = resolve_type_var(env, ty.clone())
+    match resolved
+    when Type::Error then ""
+    when Type::Var(_) then ""
+    when _ then type_display(env, &resolved)
+    end
+  when Option::None then ""
+  end
+end
+
+# Record the constraints of one `???` hole into env.hole_constraints (keyed
+# by the hole's node id). Called BEFORE the mode decision, so both the
+# rejection diagnostic and the accessor read the same facts. The
+# expected_type is left "" here and filled by hole_constraints_of /
+# typed_hole_constraints_of once unification has run.
+def record_hole_constraints(inout env: TypeEnv, expr: Expr) -> Unit
+  var hc = HoleConstraints { expected_type: "" }
+  # in_scope_values — every local binding of every live lexical scope.
+  var scope_rows: Vec[String] = Vec::new()
+  var si = 0
+  while si < env.scopes.len() do
+    for entry in env.scopes[si].entries() do
+      let nm = entry.0.clone()
+      let ty = entry.1.clone()
+      let resolved_ty = resolve_type_var(env, ty)
+      scope_rows.push(nm + ": " + type_display(env, &resolved_ty))
+    end
+    si = si + 1
+  end
+  hc.in_scope_values = hole_sorted_unique(scope_rows)
+  # required_effects — the enclosing function's declared effects.
+  var req: Vec[String] = Vec::new()
+  match env.fn_declared_effects.get(env.current_fn_key.clone())
+  when Option::Some(effs) then
+    var ei = 0
+    while ei < effs.len() do
+      req.push(effect_display_name(env, effs[ei].clone()))
+      ei = ei + 1
+    end
+  when Option::None then ()
+  end
+  hc.required_effects = hole_sorted_unique(req)
+  # forbidden_effects — the enclosing function's effect-class claims.
+  var forb: Vec[String] = Vec::new()
+  match env.fn_class_claims.get(env.current_fn_key.clone())
+  when Option::Some(claims) then
+    var ci = 0
+    while ci < claims.len() do
+      forb.push(hole_effect_class_word(claims[ci].anno))
+      ci = ci + 1
+    end
+  when Option::None then ()
+  end
+  hc.forbidden_effects = hole_sorted_unique(forb)
+  # trait_obligations — RESERVED (the checker carries no per-node obligation
+  # rows today; documented gap — the field stays empty rather than
+  # fabricating obligation text).
+  # constructors — every registered enum variant constructor.
+  var ctors: Vec[String] = Vec::new()
+  var ti = 0
+  while ti < env.type_list.len() do
+    let td = env.type_list[ti]
+    let td_name = td.name.clone()
+    match td.def_kind
+    when TypeDefKind::Enum(variants) then
+      var vi = 0
+      while vi < variants.len() do
+        ctors.push(td_name.clone() + "::" + variants[vi].name.clone())
+        vi = vi + 1
+      end
+    when _ then ()
+    end
+    ti = ti + 1
+  end
+  hc.constructors = hole_sorted_unique(ctors)
+  # reachable_functions — the callables of the hole's current module (the
+  # qualified table when a module path is active, the bare first-wins names
+  # at the root module).
+  var fns: Vec[String] = Vec::new()
+  var prefix = "".to_string()
+  if env.current_module_path.len() > 0 then
+    prefix = env.current_module_path.join("::") + "::"
+  end
+  for entry in env.module_callable_types.entries() do
+    let k = entry.0.clone()
+    if prefix.len() == 0 || k.starts_with(prefix.clone()) then
+      fns.push(k)
+    end
+  end
+  if prefix.len() == 0 then
+    for entry in env.callable_first_wins.entries() do
+      fns.push(entry.0.clone())
+    end
+  end
+  hc.reachable_functions = hole_sorted_unique(fns)
+  env.hole_constraints.insert(expr.node_id, hc)
+end
+
+# The non-hole-mode rejection message: names the hole by node id and reports
+# the recorded constraint counts (the structured facts ride the accessor;
+# the diagnostic is the fail-closed gate).
+def hole_unfilled_message(env: TypeEnv, node: Int) -> String
+  var counts = ""
+  match env.hole_constraints.get(node)
+  when Option::Some(hc) then
+    counts = " (in-scope values: " + hc.in_scope_values.len().to_string() +
+      ", required effects: " + hc.required_effects.len().to_string() +
+      ", forbidden effect classes: " + hc.forbidden_effects.len().to_string() + ")"
+  when Option::None then ()
+  end
+  "unfilled typed hole `???` at node " + node.to_string() + counts +
+    ": fill the hole with a concrete expression (or check in hole mode via type_check_typed_holes to inspect its constraints); an unfilled hole is never silently accepted"
+end
+
+# THE public live-env accessor (audit item 54): the constraints of the hole
+# node with expected_type resolved through the CURRENT substitution — call
+# it after the surrounding check has unified the hole. Option::None for a
+# node that is not a recorded hole.
+pub def hole_constraints_of(env: TypeEnv, node: Int) -> Option[HoleConstraints]
+  match env.hole_constraints.get(node)
+  when Option::Some(hc) then
+    var resolved = hc.clone()
+    resolved.expected_type = hole_expected_type_text(env, node)
+    Option::Some(resolved)
+  when Option::None then Option::None
+  end
+end
+
+# The artifact accessor: the constraints carried by a TypedProgram (the
+# expected_type was resolved at assembly).
+pub def typed_hole_constraints_of(program: TypedProgram, node: Int) -> Option[HoleConstraints]
+  match program.hole_constraints.get(node)
+  when Option::Some(hc) then Option::Some(hc.clone())
+  when Option::None then Option::None
+  end
+end
+
+# The canonical constraint ROW texts of one constraints record — the §38
+# "hole.constraints" answer grammar: "expected:<type>", "in-scope:<name>: <t>",
+# "required-effect:<name>", "forbidden-effect:<class>",
+# "trait-obligation:<text>", "constructor:<Type>::<Variant>",
+# "reachable:<fn key>". Sorted.
+pub def hole_constraint_rows(hc: HoleConstraints) -> Vec[String]
+  var rows: Vec[String] = Vec::new()
+  if hc.expected_type.len() > 0 then
+    rows.push("expected:" + hc.expected_type.clone())
+  end
+  for v in hc.in_scope_values do
+    rows.push("in-scope:" + v.clone())
+  end
+  for e in hc.required_effects do
+    rows.push("required-effect:" + e.clone())
+  end
+  for e in hc.forbidden_effects do
+    rows.push("forbidden-effect:" + e.clone())
+  end
+  for o in hc.trait_obligations do
+    rows.push("trait-obligation:" + o.clone())
+  end
+  for c in hc.constructors do
+    rows.push("constructor:" + c.clone())
+  end
+  for f in hc.reachable_functions do
+    rows.push("reachable:" + f.clone())
+  end
+  rows.sort_by(|a, b| a < b)
+  rows
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -4400,6 +4673,13 @@ def typed_kind_for(inout env: TypeEnv, expr: Expr) -> Option[TypedExprKind]
     Option::Some(TypedExprKind::Async(typed_stmts_of(env, &block)))
   when ExprKind::ExprComptime(block) then
     Option::Some(TypedExprKind::Comptime(typed_stmts_of(env, &block)))
+  when ExprKind::ExprHole then
+    # The typed-hole node (audit item 54): the constraints ride the parallel
+    # hole_constraints channel keyed by this node id; the typed node records
+    # the Hole kind so FillHole can locate/verify the patch site. Recorded
+    # only when the checker did not reject the hole (record_typed_hir skips
+    # Type::Error results — the non-hole-mode rejection path).
+    Option::Some(TypedExprKind::Hole)
   when ExprKind::ExprError(_) then Option::None
   when _ then
     # Defensive: every checker-accepted construct has an arm above; a new
@@ -4531,6 +4811,12 @@ struct TypedProgram
   # (Batch-3): the tree is not yet the exclusive lowering input — see the
   # Typed HIR section note.
   typed_exprs: Map[Int, TypedExpr]
+  # (audit item 54) hole node id -> HoleConstraints — the typed-hole
+  # constraint channel, serialized with the expected_type RESOLVED at
+  # assembly (the substitution has run by then; the live-env accessor
+  # hole_constraints_of resolves lazily instead). Empty unless the program
+  # was checked in hole mode.
+  hole_constraints: Map[Int, HoleConstraints] = Map::new()
   closure_captures: Map[Int, Map[Int, AccessEffect]]
   # The algebraic-effects typed records (the semantic EffectId-keyed op
   # tables, the typed handle-with handlers per statement node and the
@@ -17086,6 +17372,7 @@ def scan_expr(env: TypeEnv, inout scan: CaptureScan, expr: Expr) -> Unit
       scan_expr(env, scan, &args[i])
       i = i + 1
     end
+  when ExprKind::ExprHole then ()
   when ExprKind::ExprError(_) then ()
   end  end
 end
@@ -18948,6 +19235,24 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
     check_block(env, &block, true)
     type_add_error(env, "comptime blocks are not supported", expr.span)
     Type::Error
+  when ExprKind::ExprHole then
+    # The typed hole `???` (audit item 54). The constraints are recorded
+    # FIRST (the diag / accessor payload is the same either way), then the
+    # mode decides:
+    #   hole mode (env.allow_holes) — the hole types as a FRESH inference
+    #   variable, so the surrounding unification binds it to the expected
+    #   type; the expected type is read back through hole_constraints_of
+    #   after unification. The node records TypedExprKind::Hole.
+    #   non-hole mode (every compilation entry) — the hole is REJECTED
+    #   with a diagnostic naming the hole and its constraints: an unfilled
+    #   hole is never silently accepted.
+    record_hole_constraints(env, expr)
+    if env.allow_holes then
+      fresh_type_var(env)
+    else
+      type_add_error(env, hole_unfilled_message(env, expr.node_id), expr.span)
+      Type::Error
+    end
   when _ then Type::Error
   end
   if expr.node_id != 0 then
@@ -23104,6 +23409,12 @@ def oracle_walk_typed_expr(inout env: TypeEnv, typed: TypedProgram, te: TypedExp
     for s in stmts do oracle_walk_typed_stmt(env, typed, s, findings) end
   when TypedExprKind::Comptime(stmts) then
     for s in stmts do oracle_walk_typed_stmt(env, typed, s, findings) end
+  when TypedExprKind::Hole then
+    # (audit item 54) a typed hole carries no children; it is admitted only
+    # in hole mode and fails closed at MIR lowering, so the completeness
+    # oracle records no finding here (the Unresolved-Var channel flags an
+    # unconstrained hole separately).
+    ()
   end  end
 end
 
@@ -23387,7 +23698,28 @@ def resolve_pending_call_instances(inout env: TypeEnv) -> Unit
   env.pending_call_instances.clear()
 end
 
-def type_check_typed(inout env: TypeEnv, program: Program, resolutions: ResolvedNames) -> TypeCheckResult
+# The compilation entry: typed checking with holes REJECTED. It delegates to
+# the mode body with allow_holes = false, so a reused env can never leak a
+# previous hole-mode session into a compilation (the mode is forced per
+# call, not read from the env).
+pub def type_check_typed(inout env: TypeEnv, program: Program, resolutions: ResolvedNames) -> TypeCheckResult
+  type_check_typed_mode(env, program, resolutions, false)
+end
+
+# The HOLE-MODE entry (audit item 54): identical checking except that `???`
+# holes are ACCEPTED (each types as a fresh inference variable unifying with
+# its expected type) and their HoleConstraints are recorded and carried into
+# the returned artifact's hole_constraints table for inspection
+# (typed_hole_constraints_of / the §38 hole.constraints op). This is the
+# editor / incremental surface — it is NOT the compilation entry: an
+# unfilled hole still fails closed at MIR lowering, so a program checked
+# here only compiles after FillHole replaces every hole.
+pub def type_check_typed_holes(inout env: TypeEnv, program: Program, resolutions: ResolvedNames) -> TypeCheckResult
+  type_check_typed_mode(env, program, resolutions, true)
+end
+
+def type_check_typed_mode(inout env: TypeEnv, program: Program, resolutions: ResolvedNames, allow_holes: Bool) -> TypeCheckResult
+  env.allow_holes = allow_holes
   env.local_id_counter = 0
   env.local_ids.clear()
   env.typed_call_targets.clear()
@@ -23399,6 +23731,7 @@ def type_check_typed(inout env: TypeEnv, program: Program, resolutions: Resolved
   env.pattern_binding_resolutions.clear()
   env.typed_access_effects.clear()
   env.typed_exprs.clear()
+  env.hole_constraints.clear()
   env.typed_stmts.clear()
   env.typed_patterns.clear()
   env.typed_aggregate_ownership.clear()
@@ -23674,6 +24007,17 @@ def type_check_typed(inout env: TypeEnv, program: Program, resolutions: Resolved
   when Option::Some(res_final) then res_final.clone()
   when Option::None then resolutions.clone()
   end
+  # (audit item 54): finalize the typed-hole constraint table — the expected
+  # type is resolved HERE, after the whole program's unification has run
+  # (the live-env accessor resolves lazily instead). Empty in non-hole mode
+  # (a hole was rejected and recorded Type::Error, whose expected_type
+  # renders "" — the row is still carried so a tool can name the hole).
+  var final_holes: Map[Int, HoleConstraints] = Map::new()
+  for hole_entry in env.hole_constraints.entries() do
+    var hole_rec = hole_entry.1.clone()
+    hole_rec.expected_type = hole_expected_type_text(env, hole_entry.0)
+    final_holes.insert(hole_entry.0, hole_rec)
+  end
   var plan_typed = TypedProgram {
     ast: program.clone(),
     resolutions: typed_resolutions.clone(),
@@ -23683,6 +24027,7 @@ def type_check_typed(inout env: TypeEnv, program: Program, resolutions: Resolved
     field_targets: env.typed_field_targets.clone(),
     access_effects: env.typed_access_effects.clone(),
     typed_exprs: env.typed_exprs.clone(),
+    hole_constraints: final_holes.clone(),
     closure_captures: env.closure_captures.clone(),
     typed_effects: env.typed_effects.clone(),
     effect_name_index: env.effect_name_index.clone(),
@@ -23729,6 +24074,7 @@ def type_check_typed(inout env: TypeEnv, program: Program, resolutions: Resolved
     field_targets: env.typed_field_targets.clone(),
     access_effects: env.typed_access_effects.clone(),
     typed_exprs: env.typed_exprs.clone(),
+    hole_constraints: final_holes,
     closure_captures: env.closure_captures.clone(),
     typed_effects: env.typed_effects.clone(),
     effect_name_index: env.effect_name_index.clone(),

@@ -49,35 +49,39 @@ const MAX_MONO_INSTANCES: Int = 8192
 #
 # (MonoKey deletion): specialization identity is the InstanceId — the
 # semantic (def, substs) payload — NEVER a source/emission name. The
-# cache holds the specialized bodies in ONE map keyed by the INSTANCE KEY
-# (instance_key — the canonical render of the InstanceId: the DefId
-# rendering + the mangled substitution suffix). The former MonoKey
-# { func_name, type_args } record and the name-derived dedup entry
-# (monomorphize) is not part of the model: dedup is `instances.contains_key(key)`, and
-# the emission symbol is derived from the instance at the mangling
-# boundary. The work queue (monomorphize_program) carries
-# (callee emission name, InstanceId) pairs — the NAME is only the
-# TEMPLATE-LOOKUP key into mir.functions (finding the generic definition
-# to specialize); the specialization itself is keyed exclusively by the
-# instance key.
+# cache holds the specialized bodies in ONE map keyed by the STRUCTURED
+# instance key (InstanceKey, stable_ids.tg section 9 — the digest-word
+# record of the same callable/args the emission text renders). The former
+# MonoKey { func_name, type_args } record and the name-derived dedup entry
+# (monomorphize) is not part of the model: dedup is
+# `instances.contains_key(key)` over the structured record, and the
+# emission symbol is derived from the instance at the mangling boundary.
+# The work queue (monomorphize_program) carries (callee emission name,
+# InstanceId) pairs — the NAME is only the TEMPLATE-LOOKUP key into
+# mir.functions (finding the generic definition to specialize); the
+# specialization itself is keyed exclusively by the structured instance
+# key.
 struct MonoCache
-  # Specialized MIR function bodies keyed by the INSTANCE KEY (the
-  # canonical render of the InstanceId — instance_key; never a source
-  # name). "InstanceId -> specialized MirFunction -> emission symbol":
-  # the key IS the emission symbol (the mangling boundary derives it from
-  # the instance), so the cache hit, the emission name and the call-site
-  # rewrite all agree on the instance identity.
-  instances: Map[String, MirFunction]
-  # (audit item 49): the STRUCTURED instance-identity records —
-  # emission text key -> InstanceKey (stable_ids.tg section 9) — computed
-  # ONCE per instantiation site at the SAME boundary that renders the text
-  # key (the work-queue drain pop, monomorphize_instance,
-  # mono_specialize_function), stored alongside the text-keyed bodies. The
-  # Map[String, ...] caches above keep their text keys in this slice;
-  # re-keying MonoCache.instances / the worklist seen-set / the rewrite
-  # lookups through the digest-word records is the migration inventory of
-  # stable_ids.tg section 5 (audit item 49).
-  structured_keys: Map[String, InstanceKey] = Map::new()
+  # Specialized MIR function bodies keyed by the STRUCTURED instance
+  # identity (InstanceKey — the digest-word record; never a source name
+  # and never the rendered "$"-text). "InstanceId -> structured
+  # InstanceKey -> specialized MirFunction": the map key is the identity
+  # authority, while the cached MirFunction's `name` field carries the
+  # mangled EMISSION text (the codegen label the mangling boundary derived
+  # from the same instance) — so the cache hit, the emission name and the
+  # call-site rewrite all agree on the instance identity. Every
+  # insert/lookup site derives the InstanceKey once from the instance it
+  # holds (the work-queue drain pop / rewrite lookups through
+  # structured_instance_key; the name-API path through
+  # structured_key_of_text_and_args); there is no text-keyed index.
+  # DETERMINISM (P1-24 discipline): no pass iterates this map — specialized
+  # bodies enter mir.functions in WORK-QUEUE POP ORDER (the FIFO VecDeque
+  # pending queue), so emission order is insertion-ordered and independent
+  # of the map's hash layout. Any future iteration over this map for
+  # emitted output MUST sort by the key's digest words (callable, then
+  # type/const rows — instance_key_eq's positional order), never by the
+  # map's native order.
+  instances: Map[InstanceKey, MirFunction]
   # Inference failures recorded during monomorphization (deduplicated)
   errors: Vec[String]
  # the typed program's Program and the resolver's
@@ -106,7 +110,6 @@ end
 pub def mono_cache_new(program: Program, res: ResolvedNames) -> MonoCache
   MonoCache {
     instances: Map::new(),
-    structured_keys: Map::new(),
     errors: Vec::new(),
     program: program.clone(),
     resolutions: res.clone(),
@@ -183,7 +186,8 @@ end
 # other render as a type row). Deterministic per (def, substs) exactly
 # like the text key — both faces walk the same canonical args
 # (type_to_mangled over instance.substs). Eq/Hash fold the record's
-# digest words (never a "$"-text).
+# digest words (never a "$"-text). THIS RECORD IS the MonoCache.instances
+# key (the map is never keyed by the emission text).
 pub def structured_instance_key(cache: MonoCache, instance: InstanceId) -> InstanceKey
   let base = fn_owner_key_of_def(&cache.program, &cache.resolutions, &instance.def.def)
   structured_key_of_text_and_args(base, &instance.substs)
@@ -191,7 +195,7 @@ end
 
 # The structured key over a callable text + concrete args — the shared
 # builder behind structured_instance_key and the name-API path
-# (mono_specialize_function, which holds the template's emission name and
+# (specialize_function_named, which holds the template's emission name and
 # explicit args but no InstanceId).
 def structured_key_of_text_and_args(callable_key_text: String, type_args: Vec[Type]) -> InstanceKey
   var renders: Vec[String] = Vec::new()
@@ -334,10 +338,11 @@ end
 # Given a generic MIR function and concrete type arguments, produce
 # a specialized copy with all type parameters substituted. The
 # specialization is keyed EXCLUSIVELY by the InstanceId (the cache key is
-# the instance's canonical render — instance_key); the name-derived dedup
-# entry (the former name-plus-args dedup record + monomorphize) is
-# are not part of the model — source/emission names never participate in specialization
-# identity.
+# the STRUCTURED instance key — InstanceKey, the digest-word record of the
+# same (def, substs) payload the emission text renders); the name-derived
+# dedup entry (the former name-plus-args dedup record + monomorphize) is
+# not part of the model — source/emission names never participate in
+# specialization identity.
 
 struct TypeSubstMap
  # Maps type parameter ids (numeric GenericParamId — identity is
@@ -350,7 +355,7 @@ end
 # loop below keeps the EQUAL-length semantics (each declared parameter
 # bound to its aligned argument); a length MISMATCH would silently
 # truncate to the shorter side, so the EXACT-ARITY invariant is enforced
-# by the sole caller (specialize_function_named — the arity guard there
+# by the sole caller (specialize_function_keyed — the arity guard there
 # fires BEFORE this map is ever built, catching BOTH the too-few and the
 # too-many direction).
 def type_subst_new(type_param_ids: Vec[GenericParamId], type_args: Vec[Type]) -> TypeSubstMap
@@ -363,14 +368,17 @@ def type_subst_new(type_param_ids: Vec[GenericParamId], type_args: Vec[Type]) ->
   TypeSubstMap { params: params }
 end
 
-# specialize a generic function under an EXPLICIT mangled name — the
-# solved-instance path's specialization. When a call's MirFnItem carries a
-# solved instance, the specialized body is named by the INSTANCE's key
-# (instance_key) so the emitted name and the cache key agree; the
-# name-derived path (specialize_function below, used only by
-# mono_specialize_function with EXPLICIT args) delegates here after
-# computing mangle_name. The specialization always proceeds from the given
-# solved type args — ZERO-INFERENCE: nothing is ever inferred here.
+# specialize a generic function under its STRUCTURED instance key — the
+# solved-instance path's specialization. The key is the cache identity
+# (MonoCache.instances: Map[InstanceKey, MirFunction]); `mangled` is the
+# emission label the same instance renders (the specialized body's name
+# field — the mangling boundary's symbol). A caller holding the solved
+# instance computes both faces from it (instance_key /
+# structured_instance_key — the work-queue drain and monomorphize_instance);
+# the name-API path holds no InstanceId and computes them from the
+# template's emission name + the concrete args (specialize_function_named
+# below). The specialization always proceeds from the given solved type
+# args — ZERO-INFERENCE: nothing is ever inferred here.
 #
 # FAIL-CLOSED RESULT INTERFACE: the specialization succeeds (Result::Ok)
 # and caches the body ONLY when the post-instantiation verification finds
@@ -381,15 +389,16 @@ end
 # (type_param_ids.len() != type_args.len() — too few or too many concrete
 # args) is the FIRST failure: it returns Result::Err BEFORE any
 # substitution map is built (see the arity guard below).
-pub def specialize_function_named(
+def specialize_function_keyed(
   inout cache: MonoCache,
   original: MirFunction,
   type_param_ids: Vec[GenericParamId],
   type_args: Vec[Type],
-  mangled: String
+  mangled: String,
+  key: InstanceKey
 ) -> Result[Unit, String]
   # If already specialized, return cached version
-  match cache.instances.get(&mangled)
+  match cache.instances.get(&key)
   when Option::Some(_) then return Result::Ok(())
   when Option::None then ()
   end
@@ -504,28 +513,40 @@ pub def specialize_function_named(
   when Option::Some(what) then
     Result::Err(what + " remains in instantiated types of `" + original.name + "`")
   when Option::None then
-    # Cache the specialized body
-    cache.instances.insert(mangled, specialized)
+    # Cache the specialized body under the STRUCTURED instance key; the
+    # body's `name` field carries the emission text (same instance, both
+    # faces).
+    cache.instances.insert(key, specialized)
     Result::Ok(())
   end
 end
 
-def specialize_function(
+# specialize_function_named (the PUBLIC name-API entry): specialize a
+# generic function under an EXPLICIT mangled name. This path is keyed by
+# the caller's EXPLICIT emission label `mangled`, so the structured key is
+# the structured face of that label: recover its callable base by
+# stripping the mangle suffix the concrete args render (mangle_name's
+# "$"-joined suffix — no canonical render contains "$", so the split is
+# unambiguous) and build the key from that base + the same args. A
+# mismatched label falls back to the whole text as the base (still
+# deterministic per label). Callers holding a semantic InstanceId (the
+# work-queue drain / monomorphize_instance) call specialize_function_keyed
+# with the key computed from the instance — the Map is never keyed by text
+# either way.
+pub def specialize_function_named(
   inout cache: MonoCache,
   original: MirFunction,
   type_param_ids: Vec[GenericParamId],
-  type_args: Vec[Type]
+  type_args: Vec[Type],
+  mangled: String
 ) -> Result[Unit, String]
- # the mangled emission symbol is derived at the mangling boundary
-  # (mangle_name over the template's emission name + the concrete args —
-  # this entry is used only by mono_specialize_function, whose caller
-  # supplies the concrete args — ZERO-INFERENCE; the worklist monomorphizer
-  # passes the instance's key directly to specialize_function_named). The
-  # SPECIALIZATION identity is the instance payload, never the name: the
-  # cache key is the mangled symbol, and the same instance always renders
-  # the same key (deterministic per (def, substs)).
-  let mangled = mangle_name(original.name.clone(), type_args.clone())
-  specialize_function_named(cache, original, type_param_ids, type_args, mangled)
+  let suffix = mangle_name("".to_string(), type_args.clone())
+  var base = mangled.clone()
+  if mangled.len() >= suffix.len() && mangled.slice(mangled.len() - suffix.len(), mangled.len()) == suffix then
+    base = mangled.slice(0, mangled.len() - suffix.len())
+  end
+  let key = structured_key_of_text_and_args(base, type_args.clone())
+  specialize_function_keyed(cache, original, type_param_ids, type_args, mangled, key)
 end
 
 # (final): the post-instantiation verification. A specialized body is
@@ -1114,12 +1135,13 @@ def rewrite_call_sites_in_program(inout mir: MirProgram, inout cache: MonoCache)
               # Look up the function definition in the program
               for candidate in mir.functions do
                 if candidate.name == callee_name then
- # (final): a SOLVED INSTANCE is the AUTHORITY. When
+                  # (final): a SOLVED INSTANCE is the AUTHORITY. When
                   # the call operand's MirConstant carries an instance with
                   # NON-EMPTY substs (the type checker solved this call's
                   # generic arguments), use inst.substs as the type args
                   # DIRECTLY — zero inference for this call; instance_key
-                  # produces the mangled name.
+                  # produces the mangled emission name and
+                  # structured_instance_key the cache identity.
                   # ZERO-INFERENCE (fail-closed): there is NO fallback here.
                   # A call whose instance is not usable yet (None/empty
                   # substs, or solved substs still carrying Params from a
@@ -1130,14 +1152,21 @@ def rewrite_call_sites_in_program(inout mir: MirProgram, inout cache: MonoCache)
                   # A genuinely instance-less generic call was already
                   # reported by Phase 1; the rewrite pass never infers.
                   var mangled = "".to_string()
+                  var specialized = false
                   match const_val.instance.clone()
                   when Option::Some(inst) then
                     if !inst.substs.is_empty() && !has_any_param_types(&inst.substs) then
                       mangled = instance_key(cache, &inst)
+                      # (audit item 49 migration): the rewrite site holds the
+                      # solved InstanceId, so the STRUCTURED key is computed
+                      # directly from it — the SAME derivation the cache
+                      # insert boundary uses. The map is never keyed by the
+                      # emission text.
+                      specialized = cache.instances.contains_key(&structured_instance_key(cache, &inst))
                     end
                   when Option::None then ()
                   end
-                  if cache.instances.contains_key(&mangled) then
+                  if specialized then
                     # Rewrite the call site to use the mangled name. The
  # rewritten MirFnItem KEEPS the constant's instance
                     # payload (the semantic callee identity survives the
@@ -1587,7 +1616,9 @@ end
 # the ONLY authority for type arguments — there is no call-site inference
 # over the program's call graph. Three shapes are handled without
 # inference:
-#   1. a call whose instance is already concrete enters under instance_key;
+#   1. a call whose instance is already concrete enters under its
+#      STRUCTURED instance key (the digest-word record; the emission text
+#      is only the label the drain derives for the body);
 #   2. a call whose SOLVED substs still carry the caller's generic
 #      parameters (a still-generic caller) DEFERS: the caller's own
 #      specialization substitutes the payload (substitute_operand carries
@@ -1608,7 +1639,7 @@ pub def monomorphize_program(inout mir: MirProgram, inout cache: MonoCache) -> R
   # the residual-param and ABI diagnostics render names from it.
   cache.generic_param_names = mir.generic_param_names.clone()
   var pending: VecDeque[(String, InstanceId)] = VecDeque::new()
-  var seen: Set[String] = Set::new()
+  var seen: Set[InstanceKey] = Set::new()
   var errors: Vec[String] = Vec::new()
   var specialized_count = 0
 
@@ -1617,10 +1648,10 @@ pub def monomorphize_program(inout mir: MirProgram, inout cache: MonoCache) -> R
   # identity — the key the generic definition is registered under in
   # mir.functions (top-level functions: the fn_owner_key_of_def rendering,
   # which IS the instance's base name; methods: the pre-mangled
- # "Type__method" name, per the exemption); the INSTANCE is the
+  # "Type__method" name, per the exemption); the INSTANCE is the
   # SOLVED (def, substs) payload — a call whose MirFnItem constant carries
-  # a solved, fully concrete instance enters under the INSTANCE's key
-  # (instance_key).
+  # a solved, fully concrete instance enters under the INSTANCE's
+  # STRUCTURED key (the seen-set is Set[InstanceKey]).
  # (final): the recorded instances cover every shape the checker
   # solves — the impl-registry generic methods, the builtin-method
   # generics (Option::map / Result::and_then /...), the extension-impl
@@ -1635,12 +1666,14 @@ pub def monomorphize_program(inout mir: MirProgram, inout cache: MonoCache) -> R
     scan_call_sites_in_function(func, mir, cache, &mut pending, &mut seen, &mut errors)
   end
 
-  # Phase 2: drain the queue. Each pop specializes ONE instance (cache key:
-  # the instance's key — the same name the rewrite pass will emit). The
-  # seen-set is checked at ENQUEUE time, so an instance is popped at most
-  # once; the specialized body's own call sites are re-walked immediately,
-  # discovering callee instances transitively (deferred instances become
-  # concrete under the caller's substitution and enter the queue here).
+  # Phase 2: drain the queue. Each pop specializes ONE instance (cache
+  # identity: the instance's STRUCTURED key; the emission text is only the
+  # label the same pop derives for the specialized body and the rewrite
+  # pass). The seen-set is checked at ENQUEUE time, so an instance is
+  # popped at most once; the specialized body's own call sites are
+  # re-walked immediately, discovering callee instances transitively
+  # (deferred instances become concrete under the caller's substitution
+  # and enter the queue here).
   mono_drain_worklist(mir, cache, &mut pending, &mut seen, &mut errors, &mut specialized_count)
 
  # Phase 2b: inject the map/set Hash/Eq dispatch calls. After the
@@ -1672,23 +1705,23 @@ def mono_drain_worklist(
   inout mir: MirProgram,
   inout cache: MonoCache,
   inout pending: VecDeque[(String, InstanceId)],
-  inout seen: Set[String],
+  inout seen: Set[InstanceKey],
   inout errors: Vec[String],
   inout specialized_count: Int
 ) -> Unit
   while !pending.is_empty() do
     match pending.pop_front()
     when Option::Some((callee_name, inst)) then
+      # (audit item 49 migration): the pop renders the emission text key
+      # (the specialized body's `name` and the rewrite pass's label) and
+      # computes the STRUCTURED instance key — the MonoCache.instances /
+      # worklist identity — once, from the same solved instance. The text
+      # is never a map key.
       let key = instance_key(cache, &inst)
-      # (audit item 49): the structured InstanceKey is computed once per
-      # instantiation site — right here, at the same pop that renders the
-      # text key — and stored alongside it in the cache's structured-keys
-      # table (the additive seam the Map[String, ...] re-key migration
-      # keys through; stable_ids.tg section 9).
-      cache.structured_keys.insert(key.clone(), structured_instance_key(cache, &inst))
+      let key_struct = structured_instance_key(cache, &inst)
       # Cache hit (specialized by an earlier pop or by the external APIs):
       # nothing to do — the body is already in the program.
-      if !cache.instances.contains_key(&key) then
+      if !cache.instances.contains_key(&key_struct) then
         var found: Option[MirFunction] = Option::None
         for f in mir.functions do
           if f.name == callee_name then
@@ -1711,11 +1744,11 @@ def mono_drain_worklist(
               errors.push(msg)
             end
           else
-            match specialize_function_named(cache, original, &type_param_names, &inst.substs, key.clone())
+            match specialize_function_keyed(cache, original, &type_param_names, &inst.substs, key.clone(), key_struct.clone())
             when Result::Ok(()) then
               # The specialized body is cached now; append it to the
               # program and re-walk its calls (the transitive discovery).
-              match cache.instances.get(&key)
+              match cache.instances.get(&key_struct)
               when Option::Some(body) then
                 mir.functions.push(body.clone())
                 scan_call_sites_in_function(body, mir, cache, pending, seen, errors)
@@ -1757,7 +1790,7 @@ def scan_call_sites_in_function(
   mir: MirProgram,
   cache: MonoCache,
   inout pending: VecDeque[(String, InstanceId)],
-  inout seen: Set[String],
+  inout seen: Set[InstanceKey],
   inout errors: Vec[String]
 ) -> Unit
   for block in func.blocks do
@@ -1771,9 +1804,10 @@ end
 
 # Enqueue ONE call-site callee: when the MirFnItem constant carries a
 # SOLVED instance whose substs are fully concrete, the instance enters the
-# queue under its instance key (deduplicated by the seen-set). A payload
-# whose substs still carry Params (a still-generic caller) DEFERS — the
-# caller's specialization substitutes it and the re-walk enqueues the
+# queue under its STRUCTURED key (deduplicated by the seen-set, itself
+# Set[InstanceKey] — the worklist identity is never the render text). A
+# payload whose substs still carry Params (a still-generic caller) DEFERS —
+# the caller's specialization substitutes it and the re-walk enqueues the
 # concrete instance. A payload that is absent or empty on a generic base is
 # a compiler-internal gap: the error is recorded (fail-closed — inference
 # is never performed).
@@ -1782,7 +1816,7 @@ def enqueue_call_instance(
   mir: MirProgram,
   cache: MonoCache,
   inout pending: VecDeque[(String, InstanceId)],
-  inout seen: Set[String],
+  inout seen: Set[InstanceKey],
   inout errors: Vec[String]
 ) -> Unit
   match callee.kind
@@ -1803,12 +1837,13 @@ def enqueue_call_instance(
           if !inst.substs.is_empty() then
  # (final): a SOLVED INSTANCE is the AUTHORITY. Only a
             # fully-concrete payload (no Params) is enqueueable — the
-            # mangled name comes from instance_key. A payload still
+            # emission label comes from instance_key, the queue/dedup
+            # identity from structured_instance_key. A payload still
             # carrying the caller's generic parameters DEFERS (the
             # caller's specialization substitutes it; the re-walk
             # enqueues the concrete instance later) — zero inference.
             if !has_any_param_types(&inst.substs) then
-              let key = instance_key(cache, &inst)
+              let key = structured_instance_key(cache, &inst)
               if !seen.contains(&key) then
                 seen.insert(key)
                 pending.push_back((callee_name.clone(), inst))
@@ -1883,17 +1918,19 @@ pub def mono_specialize_function(
       return Option::Some(func_name)
     end
 
-    # Specialize — specialize_function handles caching internally
+    # Specialize — specialize_function_keyed caches internally. Both
+    # faces of the instance are computed ONCE here from the template's
+    # emission-name text + the concrete args: `mangled` is the emission
+    # label, `key` the STRUCTURED cache identity (audit item 49 migration
+    # — there is no InstanceId on this name-API path, so the callable text
+    # is the emission base; the structured key derives from the same
+    # (callable, args) pair mangle_name renders).
     let mangled = mangle_name(func_name.clone(), &type_args)
-    # (audit item 49): the name-API path's structured key — computed from
-    # the template's emission-name text and the same concrete args once
-    # per specialization request (no InstanceId exists on this path; the
-    # callable text is the emission base the instance is keyed under).
-    cache.structured_keys.insert(mangled.clone(), structured_key_of_text_and_args(func_name.clone(), &type_args))
-    if !cache.instances.contains_key(&mangled) then
-      match specialize_function(cache, original, &type_param_names, &type_args)
+    let key = structured_key_of_text_and_args(func_name.clone(), &type_args)
+    if !cache.instances.contains_key(&key) then
+      match specialize_function_keyed(cache, original, &type_param_names, &type_args, mangled.clone(), key.clone())
       when Result::Ok(()) then
-        match cache.instances.get(&mangled)
+        match cache.instances.get(&key)
         when Option::Some(specialized) then
           mir.functions.push(specialized.clone())
 
@@ -1923,7 +1960,7 @@ end
 # Public API: monomorphize_instance — the specialize path keyed by a
 # semantic InstanceId instead of a name string. A caller that holds the
 # call site's (def, substs) requests the instance directly; the body is
-# produced through the SAME specialize_function path as the worklist
+# produced through the SAME specialize_function_keyed path as the worklist
 # monomorphizer, so cache identity and mangling stay single-sourced.
 #
 # NOTE (layer): the MIR call lowering records the DefId with EMPTY
@@ -1953,11 +1990,12 @@ pub def monomorphize_instance(
     return Result::Err("instance " + base + " has empty substitutions — every generic call carries its solved instance; inference is not performed on the program's call graph")
   end
   let mangled = mangle_name(base.clone(), &instance.substs)
-  # (audit item 49): the structured InstanceKey of the requested instance,
-  # computed once per request and stored alongside the text key (the
-  # additive seam of stable_ids.tg section 9).
-  cache.structured_keys.insert(mangled.clone(), structured_instance_key(cache, &instance))
-  if cache.instances.contains_key(&mangled) then
+  # (audit item 49 migration): the STRUCTURED key of the requested
+  # instance — computed once per request from the InstanceId, it IS the
+  # MonoCache.instances identity (the text `mangled` is only the emitted
+  # label the body carries).
+  let key = structured_instance_key(cache, &instance)
+  if cache.instances.contains_key(&key) then
     return Result::Ok(())
   end
   var found: Option[MirFunction] = Option::None
@@ -1973,9 +2011,9 @@ pub def monomorphize_instance(
     if type_param_names.is_empty() then
       return Result::Ok(())
     end
-    match specialize_function_named(cache, original, &type_param_names, &instance.substs, mangled.clone())
+    match specialize_function_keyed(cache, original, &type_param_names, &instance.substs, mangled.clone(), key.clone())
     when Result::Ok(()) then
-      match cache.instances.get(&mangled)
+      match cache.instances.get(&key)
       when Option::Some(specialized) then
         mir.functions.push(specialized.clone())
       when Option::None then ()

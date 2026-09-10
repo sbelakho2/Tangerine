@@ -222,6 +222,7 @@ ExprEnumVariant|source|^[ \t]*[A-Z][A-Za-z0-9_]*\(|::[A-Z][A-Za-z0-9_]*\(
 ExprAssign|unit|ExprKind::ExprAssign\(
 ExprPipe|source|\|>
 ExprMacroCall|source|[a-z_][a-z0-9_]*![ \t]*(\[|\()
+ExprHole|unit|ExprKind::ExprHole\b
 ExprError|unit|ExprKind::ExprError\(
 Named|source|:[ \t][A-Z][A-Za-z0-9_]*(\[|,|\)|[ \t]|$)|->[ \t][A-Z][A-Za-z0-9_]*
 Named|marker|# ast-variant: Named\b

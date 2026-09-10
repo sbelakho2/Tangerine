@@ -1,0 +1,1230 @@
+# Tangerine Compiler — Semantic Edit Protocol (audit item 53)
+# Self-hosting compiler written in Tangerine
+#
+# The typed SEMANTIC EDIT protocol: one SemanticEdit request is RESOLVED
+# against the §32 read-side index / §29 snapshot (the typed stable ids —
+# StableDeclId / StableRowKey / the canonical contract and call row keys —
+# are the resolution authority) and then APPLIED on the tractable surface
+# the representation actually exposes. The protocol never edits text: a
+# resolved edit carries the canonical target keys, the dependency-closure
+# affected set and the resolved preconditions; the apply step either
+# produces a real semantic artifact (the ChangeContract snapshot + §31
+# delta; the FillHole typed-node patch) or returns the typed
+# EditError::ApplyUnavailable with the exact remaining surface named by
+# semantic_edit_unavailable_reason — never a marker token, never a silent
+# no-op.
+#
+# MODEL MAPPING (what each edit resolves against, and what applies):
+#
+#   Rename(decl, new_name)
+#     resolve — the StableDeclId of `decl` through the snapshot's symbol
+#       rows (an exact full stable key, or a bare / qualified NAME that must
+#       be unique — two matches are EditError::AmbiguousTarget), then the
+#       direct callers via the §32 index (index_callers_of_decl over the
+#       re-derived StableDeclId) and the FULL affected set via the §31
+#       affected_closure over the default kinds.
+#     apply — ApplyUnavailable: the rename needs the AST/HIR rewrite surface
+#       (the declaration name lives in the AST, not in any stable row; every
+#       reference resolved through ident/type resolutions must be rewritten
+#       and re-checked, then the snapshot rows re-keyed). The reason text
+#       names that surface.
+#
+#   ChangeSignature(decl, new_signature_text)
+#     resolve — the same declaration resolution; the CALL SITES THAT MUST
+#       UPDATE are counted from the index's reverse call graph and ride the
+#       preconditions ("callsites-to-update:<n>") — the resolved fact the
+#       audit asks for.
+#     apply — ApplyUnavailable: the new signature text must be parsed,
+#       re-unified against every call site, and the symbol's
+#       StableSymbolId.full_key / SignatureFingerprint re-keyed (the
+#       declaration id stays the SAME — that half is the reason a
+#       signature edit is one Modified row, not a remove/create pair).
+#
+#   ChangeContract(contract_id, new_expression_text)
+#     resolve — the contract ROW by its StableContractId.stable_key (the
+#       canonical "<fn key>|Pre|Post|Invariant|<clause>" text) in the
+#       snapshot's contracts table; the function is the row's subject and
+#       the affected closure is seeded with it.
+#     apply — REAL: parse the new canonical "op(arg,...)" text, rebuild the
+#       ContractFact (canonical_expression + expression_fingerprint + the
+#       re-keyed StableContractId), copy the snapshot, and diff
+#       before/after with semantic_delta_of — the returned
+#       EditApplication carries the updated snapshot AND the actual §31
+#       delta (the Removed old-key + Created new-key contract_delta rows
+#       are the proof of application, exactly as the re-keyed identity
+#       demands). A malformed canonical text is
+#       EditError::PreconditionFailed.
+#
+#   ReplaceCall(call_site_key, callee)
+#     resolve — the call ROW by its canonical "caller|callee|kind" key
+#       (stable_row_key domain "call" + the table scan against CallEdge
+#       rows), the new callee key (must resolve), the caller and the
+#       affected closure seeded with the caller.
+#     apply — ApplyUnavailable: the call row is a DERIVED §29 fact; the
+#       authority is the AST call target + the typed call_targets
+#       recording, so the rewrite requires the AST/HIR surface and a
+#       re-check (then the call row and every effect/mir row re-derive).
+#
+#   InsertStatement(function_key, before_stmt_key, statement_text)
+#     resolve — the function's symbol row, the §33 statement key's prefix
+#       (it must belong to the function: "<fn key>#B..."), and the affected
+#       closure seeded with the function.
+#     apply — ApplyUnavailable: the statement text must be parsed and
+#       checked inside the function's scope, then lowered and joined into
+#       the MIR — the AST/HIR rewrite surface again (no statement table is
+#       patchable here).
+#
+#   FillHole(hole_key, expression_text)
+#     resolve — the canonical hole key "<fn stable key>#hole<node id>"
+#       (semantic_hole_key_of / semantic_hole_key_parts); the function
+#       prefix resolves through the symbol rows and the affected closure is
+#       seeded with it. The hole's TYPED constraints are read through
+#       types.tg's hole_constraints_of / typed_hole_constraints_of (the
+#       node id is part of the key).
+#     apply — REAL on the typed-program patch surface:
+#       apply_fill_hole(inout program: TypedProgram, resolved, replacement)
+#       verifies the node carries TypedExprKind::Hole and replaces it with
+#       the checker-produced TypedExpr. The expression TEXT cannot be
+#       parsed+checked here (the checker env is not part of the patch
+#       surface), so the edit carries the text and the caller supplies the
+#       typed form — that is the honest split the representation permits.
+#       apply_edit(snapshot, ...) answers ApplyUnavailable for FillHole with
+#       the pointer to apply_fill_hole.
+#
+# DEFAULT CLOSURE KINDS: the data-bearing DependencyEdgeKind classes (Call /
+# EffectPropagation / CapabilityPropagation / Implements / ContainsType /
+# AbiConsumer / ContractReferences / TestReferences). The no-row families
+# (GenericInstantiation / LayoutDependent / ConstEvalDependent /
+# DerivedImpl) are covered by the call closure anyway, so omitting them
+# loses no traversal (see affected_closure's per-kind data matrix).
+#
+# DETERMINISM: every resolved row set is sorted by the closure / accessor
+# that produced it; the apply result rows are canonical texts. No env
+# gates; no source rewriting.
+
+use std::core::{Option, Result}
+use std::collections::{Vec}
+
+use tg_compiler::ids::{StableDefId, stable_digest_of, stable_def_id_digested, DefKind}
+use tg_compiler::ast::{AstContractKind, assign_node_ids}
+use tg_compiler::lexer::{tokenize}
+use tg_compiler::parser::{parse}
+use tg_compiler::resolver::{resolve_names}
+use tg_compiler::types::{
+  Type, TypedProgram, TypedExpr, TypedExprKind, type_env_new,
+  type_check_typed, type_check_typed_holes, hole_constraints_of,
+  typed_hole_constraints_of
+}
+use tg_compiler::stable_ids::{
+  StableContractId, stable_key_eq, stable_contract_row_key, stable_row_key_of,
+  stable_decl_of_key
+}
+use tg_compiler::semantic_model::{
+  SemanticSnapshot, SemanticSymbol, StableTargetId, CallEdge, CallEdgeKind,
+  ContractFact, ContractExprIR, semantic_contract_expr_text,
+  semantic_call_edge_kind_numeric, semantic_snapshot_new, DependencyEdgeKind
+}
+use tg_compiler::semantic_index::{
+  SemanticIndex, build_semantic_index, index_callers_of_decl
+}
+use tg_compiler::semantic_delta::{
+  SemanticDelta, semantic_delta_empty, semantic_delta_of, affected_closure
+}
+
+# ———————————————————————————————————————————————————————————————
+# The edit vocabulary
+# ———————————————————————————————————————————————————————————————
+
+# One semantic edit request (audit item 53). Every payload is a CANONICAL
+# stable key / row text / source fragment — never a dense id:
+#   ReplaceCall      — the call ROW key ("caller|callee|kind") + the new
+#                      callee key text.
+#   InsertStatement  — the function stable key, the §33 statement key the
+#                      new statement is inserted BEFORE, and the statement
+#                      source text.
+#   ChangeContract   — the StableContractId.stable_key of the clause row +
+#                      the new canonical expression text ("op(arg,...)").
+#   Rename           — the declaration stable key (or a unique bare /
+#                      qualified name) + the new name.
+#   ChangeSignature  — the declaration stable key (or unique name) + the
+#                      new signature text.
+#   FillHole         — the canonical hole key ("<fn key>#hole<n>") + the
+#                      replacement expression source text.
+enum SemanticEdit
+  ReplaceCall(call_site_key: String, callee: String)
+  InsertStatement(function_key: String, before_stmt_key: String, statement_text: String)
+  ChangeContract(contract_id: String, new_expression_text: String)
+  Rename(decl: String, new_name: String)
+  ChangeSignature(decl: String, new_signature_text: String)
+  FillHole(hole_key: String, expression_text: String)
+end
+
+# The RESOLVED edit: the typed index resolution of the target(s), the
+# dependency-closure affected set, the resolved precondition facts and the
+# delta rows the apply is expected to produce. All key lists are canonical
+# texts (the protocol carrier domain).
+struct ResolvedEdit
+  edit: SemanticEdit
+  targets: Vec[String] = Vec::new()
+  affected: Vec[String] = Vec::new()
+  preconditions: Vec[String] = Vec::new()
+  expected_delta: Vec[String] = Vec::new()
+end
+
+# The typed edit failure (no prose payloads; the precise remaining surface
+# of an ApplyUnavailable rides semantic_edit_unavailable_reason):
+#   TargetNotFound      — the referenced key/name matches no row.
+#   AmbiguousTarget     — a bare/qualified NAME matches more than one row.
+#   UnsupportedEdit     — the apply entry does not serve this edit kind
+#                         (e.g. apply_fill_hole on a non-FillHole edit).
+#   PreconditionFailed  — a resolved precondition is violated at apply time
+#                         (a malformed canonical contract text; the patch
+#                         node is not a hole).
+#   ApplyUnavailable    — the edit resolves but has no apply surface in the
+#                         current representation (the AST/HIR rewrite is
+#                         named by semantic_edit_unavailable_reason).
+enum EditError
+  TargetNotFound
+  AmbiguousTarget
+  UnsupportedEdit
+  PreconditionFailed
+  ApplyUnavailable
+end
+
+# The result of an applied edit. `applied` carries the canonical rows the
+# apply actually produced; `snapshot` is the updated model for the
+# snapshot-level applies (ChangeContract) and `delta` the §31 delta of the
+# before/after pair (the real proof of application).
+struct EditApplication
+  edit: SemanticEdit
+  applied: Vec[String] = Vec::new()
+  snapshot: Option[SemanticSnapshot] = Option::None
+  delta: Option[SemanticDelta] = Option::None
+end
+
+# ———————————————————————————————————————————————————————————————
+# Resolution helpers over the typed index / snapshot
+# ———————————————————————————————————————————————————————————————
+
+# The name part of a stable def key (everything before "#signature").
+def edit_name_part(key: String) -> String
+  let i = edit_char_index(&key, "#", 0)
+  if i < 0 then key.clone() else key.slice(0, i) end
+end
+
+def edit_char_index(s: String, needle: String, from: Int) -> Int
+  var i = from
+  while i < s.len() do
+    if s.slice(i, i + 1) == needle then
+      return i
+    end
+    i = i + 1
+  end
+  -1
+end
+
+# Resolve a declaration reference to its canonical full stable key: an exact
+# full key (contains '#') must match a symbol row byte-for-byte; a bare /
+# qualified NAME must match exactly one row's name / name-part (two matches
+# are AmbiguousTarget, none TargetNotFound).
+pub def edit_resolve_symbol_key(snapshot: SemanticSnapshot, decl: String) -> Result[String, EditError]
+  if decl.contains("#") then
+    for row in snapshot.symbols do
+      if stable_key_eq(row.stable_id.key, decl) then
+        return Result::Ok(row.stable_id.key.clone())
+      end
+    end
+    return Result::Err(EditError::TargetNotFound)
+  end
+  var matches: Vec[String] = Vec::new()
+  for row in snapshot.symbols do
+    let name_part = edit_name_part(&row.stable_id.key)
+    if row.name == decl || name_part == decl then
+      if !matches.contains(&row.stable_id.key) then
+        matches.push(row.stable_id.key.clone())
+      end
+    end
+  end
+  if matches.len() == 0 then
+    return Result::Err(EditError::TargetNotFound)
+  end
+  if matches.len() > 1 then
+    return Result::Err(EditError::AmbiguousTarget)
+  end
+  Result::Ok(matches[0].clone())
+end
+
+# The contract row of a StableContractId.stable_key (Option::None = absent).
+def edit_find_contract(snapshot: SemanticSnapshot, contract_id: String) -> Option[ContractFact]
+  for c in snapshot.contracts do
+    if stable_key_eq(c.id.stable_key, contract_id) then
+      return Option::Some(c)
+    end
+  end
+  Option::None
+end
+
+# The canonical §31 call-row key of a CallEdge ("caller|callee|<digit>" —
+# the delta's delta_call_row_key grammar; the digit authority is
+# semantic_call_edge_kind_numeric).
+def edit_call_row_key(c: CallEdge) -> String
+  c.caller.key.clone() + "|" + c.callee.key.clone() + "|" +
+    semantic_call_edge_kind_numeric(&c.kind).to_string()
+end
+
+# The call row whose canonical key equals call_site_key: the key must parse
+# as a "call" StableRowKey AND a CallEdge row must reproduce it exactly.
+def edit_find_call(snapshot: SemanticSnapshot, call_site_key: String) -> Option[CallEdge]
+  match stable_row_key_of(call_site_key.clone())
+  when Option::Some(rk) then
+    if rk.domain != "call" then
+      return Option::None
+    end
+  when Option::None then
+    return Option::None
+  end
+  for c in snapshot.calls do
+    if stable_key_eq(edit_call_row_key(c.clone()), call_site_key) then
+      return Option::Some(c)
+    end
+  end
+  Option::None
+end
+
+# The contract kind word of the row key grammar.
+def edit_contract_kind_word(k: AstContractKind) -> String
+  match k
+  when AstContractKind::AstPre then "Pre"
+  when AstContractKind::AstPost then "Post"
+  when AstContractKind::AstInvariant then "Invariant"
+  end
+end
+
+# The default dependency-closure kinds (the data-bearing classes; the
+# no-row classes are covered by the call closure — see the module doc).
+pub def semantic_edit_default_kinds() -> Vec[DependencyEdgeKind]
+  var kinds: Vec[DependencyEdgeKind] = Vec::new()
+  kinds.push(DependencyEdgeKind::Call)
+  kinds.push(DependencyEdgeKind::EffectPropagation)
+  kinds.push(DependencyEdgeKind::CapabilityPropagation)
+  kinds.push(DependencyEdgeKind::Implements)
+  kinds.push(DependencyEdgeKind::ContainsType)
+  kinds.push(DependencyEdgeKind::AbiConsumer)
+  kinds.push(DependencyEdgeKind::ContractReferences)
+  kinds.push(DependencyEdgeKind::TestReferences)
+  kinds
+end
+
+# The affected closure of one seed key: a one-seed delta walked through
+# affected_closure over the default kinds. The seed itself is included (the
+# closure's own contract).
+pub def edit_seed_affected(snapshot: SemanticSnapshot, index: SemanticIndex, seed: String) -> Vec[String]
+  var d = semantic_delta_empty()
+  d.created = Vec::from([seed])
+  affected_closure(&d, &snapshot, &index, semantic_edit_default_kinds())
+end
+
+# The row whose text starts with prefix (helper for the lane rows).
+def edit_rows_with_prefix(rows: Vec[String], prefix: String) -> Vec[String]
+  var out: Vec[String] = Vec::new()
+  for r in rows do
+    if r.starts_with(prefix.clone()) then
+      out.push(r.clone())
+    end
+  end
+  out
+end
+
+# ———————————————————————————————————————————————————————————————
+# The canonical hole key (audit item 54 identity, audit item 53 target)
+# ———————————————————————————————————————————————————————————————
+# Grammar: "<fn stable def key>#hole<node id>" — the function's canonical
+# key, the "#hole" tag, the hole's AST node id in decimal. The key is a
+# pure function of (function key, node id); the typed constraints are read
+# back by node id through types.tg's accessors.
+
+pub def semantic_hole_key_of(function_key: String, hole_node: Int) -> String
+  function_key + "#hole" + hole_node.to_string()
+end
+
+# Parse a canonical hole key into (function key prefix, node id). The LAST
+# "#hole" separates (the function key itself carries '#'); the digits must
+# be a non-empty decimal run. Option::None for any text outside the
+# grammar.
+pub def semantic_hole_key_parts(key: String) -> Option[(String, Int)]
+  var found = -1
+  var i = 0
+  while i + 5 <= key.len() do
+    if key.slice(i, i + 5) == "#hole" then
+      found = i
+    end
+    i = i + 1
+  end
+  if found < 0 then
+    return Option::None
+  end
+  let digits = key.slice(found + 5, key.len())
+  if digits.len() == 0 then
+    return Option::None
+  end
+  match digits.parse_int()
+  when Result::Ok(node) then
+    Option::Some((key.slice(0, found), node))
+  when Result::Err(_) then
+    Option::None
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# resolve_edit — the typed resolution of one edit
+# ———————————————————————————————————————————————————————————————
+# The snapshot parameter is REQUIRED for the affected closure:
+# affected_closure reads the b-side rows (callers, contracts, type texts,
+# test rows — semantic_delta.tg), and the index alone carries no row
+# payloads for it. index MUST be built from snapshot (the §32 contract).
+pub def resolve_edit(
+  index: SemanticIndex,
+  snapshot: SemanticSnapshot,
+  edit: SemanticEdit
+) -> Result[ResolvedEdit, EditError]
+  match edit
+  when SemanticEdit::Rename(decl, new_name) then
+    edit_resolve_rename(&snapshot, &index, decl, new_name)
+  when SemanticEdit::ChangeSignature(decl, new_signature_text) then
+    edit_resolve_change_signature(&snapshot, &index, decl, new_signature_text)
+  when SemanticEdit::ChangeContract(contract_id, new_expression_text) then
+    edit_resolve_change_contract(&snapshot, &index, contract_id, new_expression_text)
+  when SemanticEdit::ReplaceCall(call_site_key, callee) then
+    edit_resolve_replace_call(&snapshot, &index, call_site_key, callee)
+  when SemanticEdit::InsertStatement(function_key, before_stmt_key, statement_text) then
+    edit_resolve_insert_statement(&snapshot, &index, function_key, before_stmt_key, statement_text)
+  when SemanticEdit::FillHole(hole_key, expression_text) then
+    edit_resolve_fill_hole(&snapshot, &index, hole_key, expression_text)
+  end
+end
+
+def edit_resolve_rename(
+  snapshot: SemanticSnapshot,
+  index: SemanticIndex,
+  decl: String,
+  new_name: String
+) -> Result[ResolvedEdit, EditError]
+  let target = match edit_resolve_symbol_key(&snapshot, decl.clone())
+  when Result::Ok(k) then k
+  when Result::Err(e) then return Result::Err(e)
+  end
+  # The resolved StableDeclId is the index's caller-map key (the typed id,
+  # not the raw text): stable_decl_of_key re-derives the exact record from
+  # the canonical key (the *_of_key accessor contract).
+  let decl_id = stable_decl_of_key(target.clone())
+  let callers = index_callers_of_decl(&index, decl_id)
+  let affected = edit_seed_affected(snapshot, index, target.clone())
+  var pre: Vec[String] = Vec::new()
+  pre.push("target:" + target.clone())
+  pre.push("new-name:" + new_name.clone())
+  pre.push("direct-callers:" + callers.len().to_string())
+  pre.push("affected-total:" + affected.len().to_string())
+  Result::Ok(ResolvedEdit {
+    edit: SemanticEdit::Rename(decl, new_name),
+    targets: Vec::from([target.clone()]),
+    affected: affected,
+    preconditions: pre,
+    expected_delta: Vec::from(["entity-modified:" + target])
+  })
+end
+
+def edit_resolve_change_signature(
+  snapshot: SemanticSnapshot,
+  index: SemanticIndex,
+  decl: String,
+  new_signature_text: String
+) -> Result[ResolvedEdit, EditError]
+  let target = match edit_resolve_symbol_key(&snapshot, decl.clone())
+  when Result::Ok(k) then k
+  when Result::Err(e) then return Result::Err(e)
+  end
+  # The callsites-that-must-update count comes from the typed index's
+  # reverse call map keyed by the resolved StableDeclId.
+  let decl_id = stable_decl_of_key(target.clone())
+  let callers = index_callers_of_decl(&index, decl_id)
+  let affected = edit_seed_affected(snapshot, index, target.clone())
+  var pre: Vec[String] = Vec::new()
+  pre.push("target:" + target.clone())
+  pre.push("new-signature:" + new_signature_text.clone())
+  pre.push("callsites-to-update:" + callers.len().to_string())
+  pre.push("affected-total:" + affected.len().to_string())
+  Result::Ok(ResolvedEdit {
+    edit: SemanticEdit::ChangeSignature(decl, new_signature_text),
+    targets: Vec::from([target.clone()]),
+    affected: affected,
+    preconditions: pre,
+    expected_delta: Vec::from(["entity-modified:" + target])
+  })
+end
+
+def edit_resolve_change_contract(
+  snapshot: SemanticSnapshot,
+  index: SemanticIndex,
+  contract_id: String,
+  new_expression_text: String
+) -> Result[ResolvedEdit, EditError]
+  let row = match edit_find_contract(&snapshot, contract_id.clone())
+  when Option::Some(c) then c
+  when Option::None then return Result::Err(EditError::TargetNotFound)
+  end
+  let fn_key = row.function.key.clone()
+  let clause = semantic_contract_expr_text(&row.canonical_expression)
+  let affected = edit_seed_affected(snapshot, index, fn_key.clone())
+  var pre: Vec[String] = Vec::new()
+  pre.push("contract-row:" + contract_id.clone())
+  pre.push("function:" + fn_key.clone())
+  pre.push("canonical-clause:" + clause.clone())
+  pre.push("new-clause:" + new_expression_text.clone())
+  pre.push("affected-total:" + affected.len().to_string())
+  # The clause TEXT is part of the StableContractId, so a canonical-content
+  # edit re-keys the row: the expected §31 delta is the Removed old key +
+  # Created new key pair. A text outside the canonical grammar is not
+  # resolved as a delta (the apply fails PreconditionFailed) — the expected
+  # row then names the malformed precondition instead of a fabricated key.
+  var expected: Vec[String] = Vec::new()
+  match edit_parse_canonical_expr(new_expression_text.clone())
+  when Option::Some(new_ir) then
+    let new_key = stable_contract_row_key(fn_key.clone(), edit_contract_kind_word(row.kind),
+      semantic_contract_expr_text(&new_ir))
+    expected.push("contract-created:" + new_key)
+    expected.push("contract-removed:" + contract_id.clone())
+  when Option::None then
+    expected.push("contract-precondition-failed:" + contract_id.clone())
+  end
+  Result::Ok(ResolvedEdit {
+    edit: SemanticEdit::ChangeContract(contract_id.clone(), new_expression_text),
+    targets: Vec::from([contract_id.clone(), fn_key]),
+    affected: affected,
+    preconditions: pre,
+    expected_delta: expected
+  })
+end
+
+def edit_resolve_replace_call(
+  snapshot: SemanticSnapshot,
+  index: SemanticIndex,
+  call_site_key: String,
+  callee: String
+) -> Result[ResolvedEdit, EditError]
+  let call = match edit_find_call(&snapshot, call_site_key.clone())
+  when Option::Some(c) then c
+  when Option::None then return Result::Err(EditError::TargetNotFound)
+  end
+  let new_callee = match edit_resolve_symbol_key(&snapshot, callee.clone())
+  when Result::Ok(k) then k
+  when Result::Err(e) then return Result::Err(e)
+  end
+  let caller_key = call.caller.key.clone()
+  let old_callee_key = call.callee.key.clone()
+  let affected = edit_seed_affected(snapshot, index, caller_key.clone())
+  var pre: Vec[String] = Vec::new()
+  pre.push("call-row:" + call_site_key.clone())
+  pre.push("caller:" + caller_key.clone())
+  pre.push("old-callee:" + old_callee_key.clone())
+  pre.push("new-callee:" + new_callee.clone())
+  pre.push("affected-total:" + affected.len().to_string())
+  Result::Ok(ResolvedEdit {
+    edit: SemanticEdit::ReplaceCall(call_site_key.clone(), callee),
+    targets: Vec::from([call_site_key.clone(), new_callee]),
+    affected: affected,
+    preconditions: pre,
+    expected_delta: Vec::from(["call-modified:" + call_site_key])
+  })
+end
+
+def edit_resolve_insert_statement(
+  snapshot: SemanticSnapshot,
+  index: SemanticIndex,
+  function_key: String,
+  before_stmt_key: String,
+  statement_text: String
+) -> Result[ResolvedEdit, EditError]
+  let target = match edit_resolve_symbol_key(&snapshot, function_key.clone())
+  when Result::Ok(k) then k
+  when Result::Err(e) then return Result::Err(e)
+  end
+  # The §33 statement key must belong to the resolved function: the node key
+  # grammar is "<fn key>#B<block>#S<idx>" (or "#T" for a terminator). The
+  # MIR statement table is not part of the index, so existence is verified
+  # at apply on the AST/MIR surface; the function membership is verified
+  # here.
+  if !before_stmt_key.starts_with(target.clone() + "#B") then
+    return Result::Err(EditError::TargetNotFound)
+  end
+  let affected = edit_seed_affected(snapshot, index, target.clone())
+  var pre: Vec[String] = Vec::new()
+  pre.push("function:" + target.clone())
+  pre.push("before-stmt:" + before_stmt_key.clone())
+  pre.push("statement:" + statement_text.clone())
+  pre.push("affected-total:" + affected.len().to_string())
+  Result::Ok(ResolvedEdit {
+    edit: SemanticEdit::InsertStatement(function_key, before_stmt_key.clone(), statement_text),
+    targets: Vec::from([target, before_stmt_key.clone()]),
+    affected: affected,
+    preconditions: pre,
+    expected_delta: Vec::from(["stmt-inserted:" + before_stmt_key])
+  })
+end
+
+def edit_resolve_fill_hole(
+  snapshot: SemanticSnapshot,
+  index: SemanticIndex,
+  hole_key: String,
+  expression_text: String
+) -> Result[ResolvedEdit, EditError]
+  let parts = match semantic_hole_key_parts(hole_key.clone())
+  when Option::Some(p) then p
+  when Option::None then return Result::Err(EditError::TargetNotFound)
+  end
+  let fn_prefix = parts.0.clone()
+  let node = parts.1
+  let target = match edit_resolve_symbol_key(&snapshot, fn_prefix.clone())
+  when Result::Ok(k) then k
+  when Result::Err(e) then return Result::Err(e)
+  end
+  let canonical_hole = semantic_hole_key_of(target.clone(), node)
+  let affected = edit_seed_affected(snapshot, index, target.clone())
+  var pre: Vec[String] = Vec::new()
+  pre.push("hole:" + canonical_hole.clone())
+  pre.push("function:" + target.clone())
+  pre.push("hole-node:" + node.to_string())
+  pre.push("constraints-accessor:types.hole_constraints_of")
+  pre.push("affected-total:" + affected.len().to_string())
+  Result::Ok(ResolvedEdit {
+    edit: SemanticEdit::FillHole(hole_key.clone(), expression_text),
+    targets: Vec::from([target, canonical_hole.clone()]),
+    affected: affected,
+    preconditions: pre,
+    expected_delta: Vec::from(["hole-filled:" + canonical_hole])
+  })
+end
+
+# ———————————————————————————————————————————————————————————————
+# apply_edit — the tractable apply surface
+# ———————————————————————————————————————————————————————————————
+# The snapshot-level apply entry. ChangeContract applies for real (the
+# updated snapshot + the semantic_delta_of proof); FillHole applies on the
+# typed-program surface via apply_fill_hole (this entry names it through
+# ApplyUnavailable); Rename / ChangeSignature / ReplaceCall /
+# InsertStatement have no apply surface and return ApplyUnavailable — the
+# precise remaining step rides semantic_edit_unavailable_reason.
+pub def apply_edit(snapshot: SemanticSnapshot, resolved: ResolvedEdit) -> Result[EditApplication, EditError]
+  match resolved.edit
+  when SemanticEdit::ChangeContract(contract_id, new_expression_text) then
+    edit_apply_change_contract(&snapshot, contract_id, new_expression_text)
+  when SemanticEdit::FillHole(_, _) then
+    Result::Err(EditError::ApplyUnavailable)
+  when SemanticEdit::Rename(_, _) then
+    Result::Err(EditError::ApplyUnavailable)
+  when SemanticEdit::ChangeSignature(_, _) then
+    Result::Err(EditError::ApplyUnavailable)
+  when SemanticEdit::ReplaceCall(_, _) then
+    Result::Err(EditError::ApplyUnavailable)
+  when SemanticEdit::InsertStatement(_, _, _) then
+    Result::Err(EditError::ApplyUnavailable)
+  end
+end
+
+# Parse a canonical contract expression text "op(arg,arg,...)" (the
+# semantic_contract_expr_text grammar; args split at depth-0 commas).
+# Option::None for any text outside the grammar (no '(' / no trailing ')' /
+# unbalanced brackets) — the caller reports PreconditionFailed.
+pub def edit_parse_canonical_expr(text: String) -> Option[ContractExprIR]
+  let open = edit_char_index(&text, "(", 0)
+  if open <= 0 then
+    return Option::None
+  end
+  if text.len() < open + 2 then
+    return Option::None
+  end
+  if text.slice(text.len() - 1, text.len()) != ")" then
+    return Option::None
+  end
+  let op = text.slice(0, open)
+  let body = text.slice(open + 1, text.len() - 1)
+  var args: Vec[String] = Vec::new()
+  if body.len() > 0 then
+    var depth = 0
+    var seg_start = 0
+    var i = 0
+    var ok = true
+    # Quote-aware: canonical string-literal args ("str(<text>)") carry raw
+    # text that may contain commas / brackets; a quote run keeps its inner
+    # bytes out of the depth/split scan (an unterminated quote is rejected).
+    var in_str = false
+    var quote = "".to_string()
+    while i < body.len() do
+      let ch = body.slice(i, i + 1)
+      if in_str then
+        if ch == "\\" then
+          i = i + 2
+        elsif ch == quote then
+          in_str = false
+          i = i + 1
+        else
+          i = i + 1
+        end
+      else
+        if ch == "\"" || ch == "'" then
+          in_str = true
+          quote = ch.clone()
+        elsif ch == "(" || ch == "[" || ch == "{" then
+          depth = depth + 1
+        elsif ch == ")" || ch == "]" || ch == "}" then
+          depth = depth - 1
+          if depth < 0 then
+            ok = false
+          end
+        elsif ch == "," && depth == 0 then
+          args.push(body.slice(seg_start, i))
+          seg_start = i + 1
+        end
+        i = i + 1
+      end
+    end
+    if !ok || depth != 0 || in_str then
+      return Option::None
+    end
+    args.push(body.slice(seg_start, body.len()))
+  end
+  Option::Some(ContractExprIR { op: op, args: args })
+end
+
+# The REAL snapshot apply: rebuild the contract row from the canonical text
+# (canonical_expression + fingerprint + the re-keyed StableContractId),
+# copy the snapshot, and diff before/after — the returned EditApplication
+# carries both the updated snapshot and the actual §31 delta.
+def edit_apply_change_contract(
+  snapshot: SemanticSnapshot,
+  contract_id: String,
+  new_expression_text: String
+) -> Result[EditApplication, EditError]
+  let new_ir = match edit_parse_canonical_expr(new_expression_text.clone())
+  when Option::Some(ir) then ir
+  when Option::None then return Result::Err(EditError::PreconditionFailed)
+  end
+  let new_clause = semantic_contract_expr_text(&new_ir)
+  var new_rows: Vec[ContractFact] = Vec::new()
+  var found = false
+  for c in snapshot.contracts do
+    if stable_key_eq(c.id.stable_key, contract_id.clone()) then
+      found = true
+      let fn_key = c.function.key.clone()
+      let new_key = stable_contract_row_key(fn_key, edit_contract_kind_word(c.kind), new_clause.clone())
+      let fp = stable_digest_of(&new_clause)
+      let key_words = stable_digest_of(&new_key)
+      new_rows.push(ContractFact {
+        id: StableContractId {
+          dense_id: c.id.dense_id,
+          stable_key: new_key.clone(),
+          digest_hi: key_words.hi,
+          digest_lo: key_words.lo
+        },
+        function: c.function.clone(),
+        kind: c.kind,
+        expression_fingerprint: fp,
+        canonical_expression: new_ir.clone(),
+        message: c.message.clone(),
+        span: c.span.clone()
+      })
+    else
+      new_rows.push(c)
+    end
+  end
+  if !found then
+    return Result::Err(EditError::TargetNotFound)
+  end
+  var after = snapshot
+  after.contracts = new_rows
+  let delta = semantic_delta_of(&snapshot, &after)
+  Result::Ok(EditApplication {
+    edit: SemanticEdit::ChangeContract(contract_id, new_expression_text),
+    applied: Vec::from(["contract-updated:" + new_clause]),
+    snapshot: Option::Some(after),
+    delta: Option::Some(delta)
+  })
+end
+
+# The typed-program patch surface for FillHole: verify the hole's node
+# carries TypedExprKind::Hole, then replace the recorded typed node with the
+# checker-produced replacement. `replacement` is the "provided expression's
+# typed form" — the source text rides the edit, but only the front end can
+# produce the typed node, so the caller supplies it (the honest split of
+# this representation; the alternative — type-checking text inside the
+# patch — needs the checker env, which the TypedProgram does not carry).
+# SCOPE: this replaces the SEMANTIC record; the transitional MIR lowering
+# is still AST-driven, so compiling the patched program additionally needs
+# the AST/HIR expression rewrite (the MIR hole arm reports exactly that
+# when it meets a filled typed node whose source is still `???`) — the
+# patch never pretends the hole vanished from the AST.
+pub def apply_fill_hole(
+  inout program: TypedProgram,
+  resolved: ResolvedEdit,
+  replacement: TypedExpr
+) -> Result[EditApplication, EditError]
+  match resolved.edit
+  when SemanticEdit::FillHole(hole_key, expression_text) then
+    let parts = match semantic_hole_key_parts(hole_key.clone())
+    when Option::Some(p) then p
+    when Option::None then return Result::Err(EditError::TargetNotFound)
+    end
+    let node = parts.1
+    match program.typed_exprs.get(node)
+    when Option::Some(te) then
+      match te.kind
+      when TypedExprKind::Hole then ()
+      when _ then return Result::Err(EditError::PreconditionFailed)
+      end
+    when Option::None then
+      return Result::Err(EditError::TargetNotFound)
+    end
+    program.typed_exprs.insert(node, replacement)
+    Result::Ok(EditApplication {
+      edit: SemanticEdit::FillHole(hole_key.clone(), expression_text),
+      applied: Vec::from([
+        "hole-filled:" + hole_key.clone(),
+        "typed-node-replaced:" + node.to_string()
+      ])
+    })
+  when _ then
+    Result::Err(EditError::UnsupportedEdit)
+  end
+end
+
+# The precise remaining-step text for an ApplyUnavailable result (the typed
+# error carries no payload; this companion names the exact surface, never a
+# marker token). For an edit that DOES apply, the text is the empty string.
+pub def semantic_edit_unavailable_reason(edit: SemanticEdit) -> String
+  match edit
+  when SemanticEdit::Rename(_, _) then
+    "AST/HIR rewrite surface: rewrite the declaration's AST name and every reference resolved through ident/type resolutions, re-check, then re-key the snapshot's symbol/call rows (the stable ids are derived, not editable in place)"
+  when SemanticEdit::ChangeSignature(_, _) then
+    "AST/HIR rewrite surface: parse the new signature, re-unify every call site, re-record StableSymbolId.full_key / SignatureFingerprint (the StableDeclId stays the same), re-lower the body, then rebuild the snapshot rows"
+  when SemanticEdit::ChangeContract(_, _) then
+    ""  # applies on the snapshot surface (edit_apply_change_contract)
+  when SemanticEdit::ReplaceCall(_, _) then
+    "AST/HIR rewrite surface: rewrite the call's AST callee, re-check the call target into typed call_targets, then re-derive the §29 call row and the effect/mir rows"
+  when SemanticEdit::InsertStatement(_, _, _) then
+    "AST/HIR rewrite surface: parse and check the statement inside the function's scope, lower it into the MIR, then re-key the function's statement/ownership/effect rows"
+  when SemanticEdit::FillHole(_, _) then
+    "typed-program patch surface: call apply_fill_hole(program, resolved, replacement) with the checker-produced replacement TypedExpr (the snapshot-only apply entry does not carry the typed program)"
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Lane rows (self-checking helpers a behavior lane can call)
+# ———————————————————————————————————————————————————————————————
+# The sibling style of semantic_delta.tg's affected_closure_lane_check: no
+# test-file lane exists for this module, so the rows are self-checking
+# helpers and each row records a mismatch string. Empty = all rows verify.
+
+def edit_lane_target() -> StableTargetId
+  StableTargetId {
+    triple: "lane".to_string(),
+    arch: "lane".to_string(),
+    cpu: "lane".to_string(),
+    pointer_width: 8,
+    endian: "little".to_string(),
+    abi: "lp64".to_string(),
+    float_abi: "soft".to_string(),
+    isa_features: Vec::new(),
+    native_atomic_widths: Vec::new()
+  }
+end
+
+def edit_lane_snapshot() -> SemanticSnapshot
+  semantic_snapshot_new("lane".to_string(), edit_lane_target())
+end
+
+def edit_lane_sid(key: String) -> StableDefId
+  stable_def_id_digested(key.clone(), edit_name_part(&key))
+end
+
+def edit_lane_fn_symbol(key: String, name: String, is_pub: Bool) -> SemanticSymbol
+  SemanticSymbol {
+    stable_id: edit_lane_sid(&key),
+    kind: DefKind::Function,
+    name: name,
+    module_path: "m".to_string(),
+    is_pub: is_pub,
+    is_generic: false
+  }
+end
+
+def edit_lane_lists_same(a: Vec[String], b: Vec[String]) -> Bool
+  if a.len() != b.len() then
+    return false
+  end
+  var i = 0
+  while i < a.len() do
+    if a[i] != b[i] then
+      return false
+    end
+    i = i + 1
+  end
+  true
+end
+
+def edit_lane_row(inout out: Vec[String], name: String, got: Vec[String], expected: Vec[String]) -> Unit
+  if !edit_lane_lists_same(got, expected) then
+    out.push(name + ": expected [" + expected.join(",") + "], got [" + got.join(",") + "]")
+  end
+  ()
+end
+
+def edit_lane_single_row(inout out: Vec[String], name: String, got: String, expected: String) -> Unit
+  if got != expected then
+    out.push(name + ": expected '" + expected + "', got '" + got + "'")
+  end
+  ()
+end
+
+pub def edit_error_word(e: EditError) -> String
+  match e
+  when EditError::TargetNotFound then "TargetNotFound"
+  when EditError::AmbiguousTarget then "AmbiguousTarget"
+  when EditError::UnsupportedEdit then "UnsupportedEdit"
+  when EditError::PreconditionFailed then "PreconditionFailed"
+  when EditError::ApplyUnavailable then "ApplyUnavailable"
+  end
+end
+
+# Run the resolve/apply lane rows over constructed index/snapshot fixtures.
+# Returns every mismatch row (empty = the whole lane verifies).
+pub def semantic_edit_lane_check() -> Vec[String]
+  var out: Vec[String] = Vec::new()
+
+  # ———— L1: Rename target resolution + affected callers ————
+  let k_a = "m::A#fn()->unit".to_string()
+  let k_b = "m::B#fn()->unit".to_string()
+  var s1 = edit_lane_snapshot()
+  var s1_syms: Vec[SemanticSymbol] = Vec::new()
+  s1_syms.push(edit_lane_fn_symbol(&k_a, "A".to_string(), false))
+  s1_syms.push(edit_lane_fn_symbol(&k_b, "B".to_string(), false))
+  s1.symbols = s1_syms
+  var s1_calls: Vec[CallEdge] = Vec::new()
+  s1_calls.push(CallEdge {
+    caller: edit_lane_sid(&k_a),
+    callee: edit_lane_sid(&k_b),
+    kind: CallEdgeKind::Direct
+  })
+  s1.calls = s1_calls
+  let idx1 = build_semantic_index(&s1)
+  match resolve_edit(&idx1, &s1, SemanticEdit::Rename(k_b.clone(), "C".to_string()))
+  when Result::Ok(r) then
+    edit_lane_row(&mut out, "rename-targets", r.targets.clone(), Vec::from([k_b.clone()]))
+    edit_lane_row(&mut out, "rename-affected", r.affected.clone(), Vec::from([k_a.clone(), k_b.clone()]))
+    edit_lane_row(&mut out, "rename-precondition-callers",
+      edit_rows_with_prefix(r.preconditions.clone(), "direct-callers:".to_string()),
+      Vec::from(["direct-callers:1".to_string()]))
+    edit_lane_row(&mut out, "rename-expected-delta", r.expected_delta.clone(),
+      Vec::from(["entity-modified:" + k_b.clone()]))
+    # A resolved Rename has no apply surface: typed ApplyUnavailable.
+    match apply_edit(&s1, r)
+    when Result::Ok(_) then out.push("rename-apply: expected ApplyUnavailable, got Ok")
+    when Result::Err(e) then edit_lane_single_row(&mut out, "rename-apply", edit_error_word(e), "ApplyUnavailable")
+    end
+  when Result::Err(e) then
+    out.push("rename-resolve: expected Ok, got " + edit_error_word(e))
+  end
+
+  # ———— L2: ambiguous bare name / unknown key ————
+  let k_dup1 = "m::Dup#fn()->unit".to_string()
+  let k_dup2 = "m2::Dup#fn()->unit".to_string()
+  var s2 = edit_lane_snapshot()
+  var s2_syms: Vec<SemanticSymbol> = Vec::new()
+  s2_syms.push(edit_lane_fn_symbol(&k_dup1, "Dup".to_string(), false))
+  s2_syms.push(edit_lane_fn_symbol(&k_dup2, "Dup".to_string(), false))
+  s2.symbols = s2_syms
+  let idx2 = build_semantic_index(&s2)
+  match resolve_edit(&idx2, &s2, SemanticEdit::Rename("Dup".to_string(), "Z".to_string()))
+  when Result::Ok(_) then out.push("rename-ambiguous: expected AmbiguousTarget, got Ok")
+  when Result::Err(e) then edit_lane_single_row(&mut out, "rename-ambiguous", edit_error_word(e), "AmbiguousTarget")
+  end
+  match resolve_edit(&idx2, &s2, SemanticEdit::Rename("m::Nope#fn()->unit".to_string(), "Z".to_string()))
+  when Result::Ok(_) then out.push("rename-missing: expected TargetNotFound, got Ok")
+  when Result::Err(e) then edit_lane_single_row(&mut out, "rename-missing", edit_error_word(e), "TargetNotFound")
+  end
+
+  # ———— L3: ChangeContract target + REAL apply (snapshot + delta) ————
+  let k_f = "m::F#fn()->unit".to_string()
+  let clause0 = "bingt(ident(amount),int(0))".to_string()
+  let clause1 = "bingt(ident(amount),int(10))".to_string()
+  let ckey0 = stable_contract_row_key(k_f.clone(), "Pre".to_string(), clause0.clone())
+  var s3 = edit_lane_snapshot()
+  var s3_syms: Vec[SemanticSymbol] = Vec::new()
+  s3_syms.push(edit_lane_fn_symbol(&k_f, "F".to_string(), false))
+  s3.symbols = s3_syms
+  var c_args0: Vec[String] = Vec::new()
+  c_args0.push("ident(amount)".to_string())
+  c_args0.push("int(0)".to_string())
+  var s3_contracts: Vec[ContractFact] = Vec::new()
+  s3_contracts.push(ContractFact {
+    id: StableContractId { dense_id: -1, stable_key: ckey0.clone() },
+    function: edit_lane_sid(&k_f),
+    kind: AstContractKind::AstPre,
+    expression_fingerprint: stable_digest_of(&clause0),
+    canonical_expression: ContractExprIR { op: "bingt".to_string(), args: c_args0 },
+    message: Option::None
+  })
+  s3.contracts = s3_contracts
+  let idx3 = build_semantic_index(&s3)
+  match resolve_edit(&idx3, &s3, SemanticEdit::ChangeContract(ckey0.clone(), clause1.clone()))
+  when Result::Ok(r) then
+    edit_lane_row(&mut out, "contract-targets", r.targets.clone(),
+      Vec::from([ckey0.clone(), k_f.clone()]))
+    let expected_new_key = stable_contract_row_key(k_f.clone(), "Pre".to_string(), clause1.clone())
+    edit_lane_row(&mut out, "contract-expected-delta", r.expected_delta.clone(),
+      Vec::from(["contract-created:" + expected_new_key, "contract-removed:" + ckey0.clone()]))
+    match apply_edit(&s3, r)
+    when Result::Ok(app) then
+      match app.snapshot
+      when Option::Some(s_after) then
+        if s_after.contracts.len() != 1 then
+          out.push("contract-apply-snapshot: expected 1 row, got " + s_after.contracts.len().to_string())
+        else
+          let row0 = s_after.contracts[0]
+          edit_lane_single_row(&mut out, "contract-apply-clause",
+            semantic_contract_expr_text(&row0.canonical_expression), clause1.clone())
+          edit_lane_single_row(&mut out, "contract-apply-key",
+            row0.id.stable_key.clone(),
+            stable_contract_row_key(k_f.clone(), "Pre".to_string(), clause1.clone()))
+        end
+      when Option::None then
+        out.push("contract-apply-snapshot: expected Some, got None")
+      end
+      match app.delta
+      when Option::Some(d) then
+        # The clause TEXT is part of the StableContractId key, so a canonical
+        # expression edit re-keys the row: the delta carries the Removed old
+        # key + Created new key pair (2 rows), not one Modified row.
+        if d.contract_delta.len() != 2 then
+          out.push("contract-apply-delta: expected 2 contract rows (Removed+Created), got " + d.contract_delta.len().to_string())
+        else
+          let new_key = stable_contract_row_key(k_f.clone(), "Pre".to_string(), clause1.clone())
+          var saw_new = false
+          var saw_old = false
+          for cd in d.contract_delta do
+            if cd.contract_id == new_key then
+              saw_new = true
+            end
+            if cd.contract_id == ckey0 then
+              saw_old = true
+            end
+          end
+          if !saw_new then
+            out.push("contract-apply-delta: missing the Created row for the new key")
+          end
+          if !saw_old then
+            out.push("contract-apply-delta: missing the Removed row for the old key")
+          end
+        end
+      when Option::None then
+        out.push("contract-apply-delta: expected Some, got None")
+      end
+    when Result::Err(e) then
+      out.push("contract-apply: expected Ok, got " + edit_error_word(e))
+    end
+  when Result::Err(e) then
+    out.push("contract-resolve: expected Ok, got " + edit_error_word(e))
+  end
+  # A malformed canonical text is PreconditionFailed at apply (the text
+  # resolves as a row edit, then fails the apply parse).
+  match resolve_edit(&idx3, &s3, SemanticEdit::ChangeContract(ckey0.clone(), "not-canonical".to_string()))
+  when Result::Ok(r2) then
+    match apply_edit(&s3, r2)
+    when Result::Ok(_) then out.push("contract-malformed: expected PreconditionFailed, got Ok")
+    when Result::Err(e) then edit_lane_single_row(&mut out, "contract-malformed", edit_error_word(e), "PreconditionFailed")
+    end
+  when Result::Err(e) then
+    out.push("contract-malformed-resolve: expected Ok, got " + edit_error_word(e))
+  end
+
+  # ———— L4: ReplaceCall target / InsertStatement prefix ————
+  let call_key = edit_call_row_key(CallEdge {
+    caller: edit_lane_sid(&k_a),
+    callee: edit_lane_sid(&k_b),
+    kind: CallEdgeKind::Direct
+  })
+  match resolve_edit(&idx1, &s1, SemanticEdit::ReplaceCall(call_key.clone(), k_b.clone()))
+  when Result::Ok(r) then
+    edit_lane_row(&mut out, "call-targets", r.targets.clone(), Vec::from([call_key.clone(), k_b.clone()]))
+    edit_lane_row(&mut out, "call-precondition-old-callee",
+      edit_rows_with_prefix(r.preconditions.clone(), "old-callee:".to_string()),
+      Vec::from(["old-callee:" + k_b.clone()]))
+  when Result::Err(e) then
+    out.push("call-resolve: expected Ok, got " + edit_error_word(e))
+  end
+  match resolve_edit(&idx1, &s1, SemanticEdit::ReplaceCall("m::A#fn()->unit|m::Z#fn()->unit|0".to_string(), k_b.clone()))
+  when Result::Ok(_) then out.push("call-missing: expected TargetNotFound, got Ok")
+  when Result::Err(e) then edit_lane_single_row(&mut out, "call-missing", edit_error_word(e), "TargetNotFound")
+  end
+  match resolve_edit(&idx1, &s1, SemanticEdit::ReplaceCall(call_key.clone(), "m::Z#fn()->unit".to_string()))
+  when Result::Ok(_) then out.push("call-newcallee-missing: expected TargetNotFound, got Ok")
+  when Result::Err(e) then edit_lane_single_row(&mut out, "call-newcallee-missing", edit_error_word(e), "TargetNotFound")
+  end
+  match resolve_edit(&idx1, &s1, SemanticEdit::InsertStatement(k_a.clone(), k_a.clone() + "#B0#S0", "let x = 1".to_string()))
+  when Result::Ok(r) then
+    edit_lane_row(&mut out, "insert-targets", r.targets.clone(),
+      Vec::from([k_a.clone(), k_a.clone() + "#B0#S0"]))
+  when Result::Err(e) then
+    out.push("insert-resolve: expected Ok, got " + edit_error_word(e))
+  end
+  match resolve_edit(&idx1, &s1, SemanticEdit::InsertStatement(k_a.clone(), k_b.clone() + "#B0#S0", "let x = 1".to_string()))
+  when Result::Ok(_) then out.push("insert-foreign-stmt: expected TargetNotFound, got Ok")
+  when Result::Err(e) then edit_lane_single_row(&mut out, "insert-foreign-stmt", edit_error_word(e), "TargetNotFound")
+  end
+
+  # ———— L5: FillHole target resolution ————
+  let hole_key = semantic_hole_key_of(k_a.clone(), 7)
+  match resolve_edit(&idx1, &s1, SemanticEdit::FillHole(hole_key.clone(), "42".to_string()))
+  when Result::Ok(r) then
+    edit_lane_row(&mut out, "hole-targets", r.targets.clone(), Vec::from([k_a.clone(), hole_key.clone()]))
+    edit_lane_row(&mut out, "hole-expected-delta", r.expected_delta.clone(),
+      Vec::from(["hole-filled:" + hole_key.clone()]))
+    match apply_edit(&s1, r)
+    when Result::Ok(_) then out.push("hole-apply: expected ApplyUnavailable, got Ok")
+    when Result::Err(e) then edit_lane_single_row(&mut out, "hole-apply", edit_error_word(e), "ApplyUnavailable")
+    end
+  when Result::Err(e) then
+    out.push("hole-resolve: expected Ok, got " + edit_error_word(e))
+  end
+  match resolve_edit(&idx1, &s1, SemanticEdit::FillHole("no-hole-tag".to_string(), "42".to_string()))
+  when Result::Ok(_) then out.push("hole-missing: expected TargetNotFound, got Ok")
+  when Result::Err(e) then edit_lane_single_row(&mut out, "hole-missing", edit_error_word(e), "TargetNotFound")
+  end
+
+  # ———— L6: canonical hole key round-trip ————
+  let hk = semantic_hole_key_of(k_b.clone(), 123)
+  edit_lane_single_row(&mut out, "hole-key-text", hk.clone(), k_b.clone() + "#hole123")
+  match semantic_hole_key_parts(hk.clone())
+  when Option::Some(p) then
+    edit_lane_single_row(&mut out, "hole-key-prefix", p.0, k_b.clone())
+    edit_lane_single_row(&mut out, "hole-key-node", p.1.to_string(), "123")
+  when Option::None then
+    out.push("hole-key-parse: expected Some, got None")
+  end
+
+  out
+end
+
+# ———————————————————————————————————————————————————————————————
+# The typed-hole lane (audit item 54): parser + checker end to end
+# ———————————————————————————————————————————————————————————————
+# Parses a tiny program whose body is `???`, then:
+#   hole mode — checks cleanly, records the constraints, the typed node is
+#     TypedExprKind::Hole, and typed_hole_constraints_of reads the resolved
+#     expected type back through the artifact;
+#   non-hole mode — the checker rejects the hole with a diagnostic naming
+#     it ("unfilled typed hole");
+#   apply_fill_hole — replaces the hole's recorded typed node.
+pub def typed_hole_lane_check() -> Vec[String]
+  var out: Vec[String] = Vec::new()
+  let src = "def f() -> Int do ??? end"
+  let tokens = tokenize(src, "hole_lane.tg")
+  let parsed = parse(tokens)
+  var program = parsed.program
+  assign_node_ids(&mut program)
+  let resolutions = match resolve_names(program.clone())
+  when Result::Ok(r) then r
+  when Result::Err(_) then
+    out.push("hole-lane: resolution failed on the lane program")
+    return out
+  end
+
+  # ———— hole mode: checks cleanly, constraints + typed node recorded ————
+  var env = type_env_new()
+  let r = type_check_typed_holes(&mut env, program.clone(), resolutions.clone())
+  if !r.errors.is_empty() then
+    out.push("hole-mode: expected no errors, got " + r.errors.len().to_string())
+  end
+  var hole_node = -1
+  var holes_seen = 0
+  for entry in env.hole_constraints.entries() do
+    holes_seen = holes_seen + 1
+    hole_node = entry.0
+    match hole_constraints_of(&env, entry.0)
+    when Option::Some(hc) then
+      edit_lane_single_row(&mut out, "hole-expected-type", hc.expected_type.clone(), "Int".to_string())
+    when Option::None then
+      out.push("hole-constraints-of: expected Some, got None")
+    end
+    match r.program.typed.typed_exprs.get(entry.0)
+    when Option::Some(te) then
+      match te.kind
+      when TypedExprKind::Hole then ()
+      when _ then out.push("hole-typed-node: expected Hole")
+      end
+    when Option::None then
+      out.push("hole-typed-node: expected a recorded typed node, got None")
+    end
+    match typed_hole_constraints_of(&r.program.typed, entry.0)
+    when Option::Some(hc2) then
+      edit_lane_single_row(&mut out, "hole-artifact-expected-type", hc2.expected_type.clone(), "Int".to_string())
+    when Option::None then
+      out.push("typed-hole-constraints-of: expected Some, got None")
+    end
+  end
+  if holes_seen != 1 then
+    out.push("hole-count: expected 1 constraint record, got " + holes_seen.to_string())
+  end
+
+  # ———— non-hole mode: the hole is rejected, naming itself ————
+  var env2 = type_env_new()
+  let r2 = type_check_typed(&mut env2, program.clone(), resolutions.clone())
+  if r2.errors.is_empty() then
+    out.push("hole-reject: expected at least one error, got none")
+  else
+    var named = false
+    var ei = 0
+    while ei < r2.errors.len() do
+      if r2.errors[ei].message.contains("hole") then
+        named = true
+      end
+      ei = ei + 1
+    end
+    if !named then
+      out.push("hole-reject: no error message names the hole")
+    end
+  end
+
+  # ———— apply_fill_hole replaces the recorded typed node ————
+  if hole_node >= 0 then
+    var typed = r.program.typed
+    let hole_key = semantic_hole_key_of("m::F#fn()->unit".to_string(), hole_node)
+    var pre: Vec[String] = Vec::new()
+    pre.push("hole:" + hole_key.clone())
+    let resolved_fill = ResolvedEdit {
+      edit: SemanticEdit::FillHole(hole_key.clone(), "42".to_string()),
+      targets: Vec::from([hole_key.clone()]),
+      affected: Vec::new(),
+      preconditions: pre,
+      expected_delta: Vec::from(["hole-filled:" + hole_key.clone()])
+    }
+    let replacement = TypedExpr {
+      id: hole_node,
+      ty: Type::Int,
+      kind: TypedExprKind::Literal(hole_node)
+    }
+    match apply_fill_hole(&mut typed, resolved_fill, replacement)
+    when Result::Ok(_) then
+      match typed.typed_exprs.get(hole_node)
+      when Option::Some(te2) then
+        match te2.kind
+        when TypedExprKind::Hole then out.push("fill-apply: typed node still Hole")
+        when _ then ()
+        end
+      when Option::None then out.push("fill-apply: typed node missing after apply")
+      end
+    when Result::Err(e) then
+      out.push("fill-apply: expected Ok, got " + edit_error_word(e))
+    end
+  end
+
+  out
+end

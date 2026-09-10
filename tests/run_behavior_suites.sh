@@ -62,7 +62,17 @@ SUITES=(
   "tests/platform/platform_surface_smoke_test.tg"
   "tests/mir_int_arith_semantics_test.tg"
   "tests/diag_derivation_test.tg"
+  # audit item 49: the structured generic-instance keys (InstanceKey /
+  # MonoCache.instances re-key + the documented const-fold model).
+  "tests/mono_instance_key_test.tg"
   "tests/unit/test_int_overflow_behavior.tg"
+  # audit item 1: the Slice ownership split (copied_slice / cloned_slice
+  # drop counts, sub-view range validation) + the fixed-decimal suite.
+  "tests/unit/test_slice_copy_resource_drop_count.tg"
+  "tests/unit/test_slice_noncopy_clone_drop.tg"
+  "tests/unit/test_slice_sub_oob.tg"
+  "tests/unit/test_slice_sub_overflow.tg"
+  "tests/unit/test_fixed_decimal.tg"
   # audit items 28 + 29: the ABI call-plan rows (classify_call_plan over
   # aarch64/x86-64/cortex-m/riscv64, internal + ExternC flavors).
   "tests/abi/abi_call_plan_rows_test.tg"
@@ -82,8 +92,8 @@ done
 # identical at every optimization level — the runtime rows of
 # test_int_overflow_behavior.tg run again under -O0..-O3 (the default
 # run above uses the driver's default level), and the exit-code trap
-# lane proves the signed-overflow TRAP itself (never catchable inside
-# an @test process) fires at every level.
+# lane proves the signed-overflow TRAP and the division-edge TRAP
+# (audit item 30: /0, %0 and signed MIN/-1) fire at every level.
 for level in 0 1 2 3; do
   if "$COMPILER" test "-O$level" "tests/unit/test_int_overflow_behavior.tg" > "$OUTDIR/test_int_overflow_behavior_O${level}.log" 2>&1; then
     echo "behavior suites: PASS  tests/unit/test_int_overflow_behavior.tg at -O$level"

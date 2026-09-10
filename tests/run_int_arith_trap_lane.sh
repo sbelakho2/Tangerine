@@ -12,6 +12,12 @@
 # optimizer that folded the overflow into silent wrap-around would make
 # the fixture exit 0 and this lane fails.
 #
+# The division-edge rule (audit item 30) is asserted here too: the raw
+# `/` and `%` edges — divisor zero on every kind, and the SIGNED
+# INT64_MIN/-1 quotient (the remainder divides through the same edge) —
+# TRAP on every target and both routes (the aarch64 UDF guard, the x86
+# UD2 guard). Four trap cases plus the near-edge controls below.
+#
 # The edge values are passed through typed locals (never literal
 # overflow expressions, which the checker rejects at compile time).
 #
@@ -160,6 +166,62 @@ def main() -> Int
   0
 end'
 
+# ── the division/remainder edges (audit item 30: each must trap) ────
+
+run_trap_case "div_int_by_zero" '
+def main() -> Int
+  let a: Int = 84
+  let b: Int = 0
+  let r = a / b
+  let _ = r
+  0
+end'
+
+run_trap_case "mod_int_by_zero" '
+def main() -> Int
+  let a: Int = 84
+  let b: Int = 0
+  let r = a % b
+  let _ = r
+  0
+end'
+
+run_trap_case "div_int_min_by_minus_one" '
+def main() -> Int
+  let a: Int = -9223372036854775807 - 1
+  let b: Int = -1
+  let r = a / b
+  let _ = r
+  0
+end'
+
+run_trap_case "mod_int_min_by_minus_one" '
+def main() -> Int
+  let a: Int = -9223372036854775807 - 1
+  let b: Int = -1
+  let r = a % b
+  let _ = r
+  0
+end'
+
+run_trap_case "div_i64_by_zero" '
+def main() -> Int
+  let a: i64 = 84
+  let b: i64 = 0
+  let r = a / b
+  let _ = r
+  0
+end'
+
+run_trap_case "div_i8_by_zero" '
+def main() -> Int
+  let a: i8 = 84
+  let b: i8 = 0
+  let r = a / b
+  let _ = r
+  0
+end'
+
 # ── the in-range control (must NOT trap at any level) ──────────────
 
 CONTROL_RUNS=0
@@ -201,6 +263,44 @@ control_case "mul_in_range" '
 def main() -> Int
   let a: Int = -9223372036854775807 - 1
   let r = a * 1
+  let _ = r
+  0
+end'
+
+# The division guard must not over-trap: MIN / 1 and MIN / 2 are in
+# range, and (MIN + 1) / -1 is the largest in-range negative quotient.
+control_case "div_min_by_one" '
+def main() -> Int
+  let a: Int = -9223372036854775807 - 1
+  let b: Int = 1
+  let r = a / b
+  let _ = r
+  0
+end'
+
+control_case "div_min_by_two" '
+def main() -> Int
+  let a: Int = -9223372036854775807 - 1
+  let b: Int = 2
+  let r = a / b
+  let _ = r
+  0
+end'
+
+control_case "div_near_min_by_minus_one" '
+def main() -> Int
+  let a: Int = -9223372036854775807
+  let b: Int = -1
+  let r = a / b
+  let _ = r
+  0
+end'
+
+control_case "mod_in_range" '
+def main() -> Int
+  let a: Int = 84
+  let b: Int = 12
+  let r = a % b
   let _ = r
   0
 end'

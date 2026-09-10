@@ -404,12 +404,12 @@
 #     the fail-closed rejection — see lower_mir_fn_to_lir_a64): quotient =
 #     sdiv/udiv by operand signedness, remainder = num - q*den emitted as
 #     a mul/sub pair the emitter fuses into MSUB (codegen's emit_smod
-#     shape). The front end emits NO division-by-zero/MIN/-1 guard for
-#     source `/` `%` (the signed checked set is Add/Sub/Mul), so a / 0 and
-#     MIN / -1 follow the direct emitter's aarch64 semantics (architectural
-#     sdiv results: quotient 0 / MIN — x86 idiv's trap is a host
-#     divergence this aarch64 slice does not reproduce); a MirAssert guard
-#     in the MIR, when present, traps BEFORE the division (see below).
+#     shape). The DIVISION-EDGE language rule (audit item 30) is the
+#     emitter's explicit guard (lir_emit_div_rr): a zero divisor and the
+#     signed MIN/-1 pair TRAP (UDF) instead of taking the architectural
+#     sdiv results (0 / MIN), so the aarch64 route, the x86 idiv route
+#     and the stage0 VM all agree on the trap. A MirAssert guard in the
+#     MIR, when present, still traps BEFORE the division (see below).
 #   Terminators: MirGoto, MirReturn, MirUnreachable/MirAbort (trap),
 #     MirSwitchInt over a scalar local, MirAssert (ALL AssertMessage
 #     variants — division-by-zero/remainder-by-zero guards, overflow and
@@ -658,9 +658,14 @@
 #     unsigned spelling this stage, so an operand class mismatch fails
 #     closed rather than reinterpreting lanes.
 #   - ops: add/sub/mul/and/or/xor binops, load, store and the byte-mask
-#     shuffle — the direct aarch64 arm's op set; the router's remaining
-#     classifications fail closed with a named rule (the direct arms
-#     carry no compare/lane-move/splat instrinsics).
+#     shuffle — the router's ENTIRE classified op set (types.tg's
+#     simd_intrinsic_kind_of has no other op spellings), and every one
+#     of them lowers for the desc-legal v128 lanes on the aarch64
+#     route. The fail-closed cases are the LANE/ROUTE ones: 512-bit
+#     lanes (no descriptor), v256 (below), non-aarch64 routes, a
+#     lane-class mismatch between an operand and the intrinsic, a
+#     projected or constant operand, and a shuffle mask that is not a
+#     whole vector-class image.
 #   - STRICT FP UNCHANGED: the f-lane binops emit exactly one NEON
 #     FADD/FSUB/FMUL group per lane set — one rounding per lane, no
 #     contraction, no reassociation, RNE, subnormals preserved; the
@@ -922,7 +927,23 @@
 #     rematerialization;
 #   - entry argc/argv capture for "main": not implemented as a
 #     self-contained LIR sequence — the route reuses codegen.tg's
-#     emit_save_argc_argv ctx helper (see lir_emit_function).
+#     emit_save_argc_argv ctx helper (see lir_emit_function);
+#   - the VECTOR slice's remaining layers (audit item 34 stage 1 is IN):
+#     (a) vector PARAMETERS/RETURNS and every vector ABI crossing
+#     (the direct pipeline's Vector(16)/ByAddress cases) fail closed at
+#     the shape gate — a later ABI slice; (b) the v256 LIR emission
+#     (the desc-legal AVX forms) is a later slice — the stage-1 arm is
+#     v128; the statement shape and the target authority already carry
+#     the width; (c) the x86 LIR vector arm (SSE2 emission) EXISTS since
+#     audit item 30 stage 2 — the x86_64 desc is LEGAL for v128 and the
+#     x86 route entry (lower_mir_fn_to_lir_prog_x86) passes vec_ok true,
+#     with the per-lane SSE2 gaps and the SSSE3 shuffle rule failing
+#     closed at emission with named errors;
+#     (d) AUTO-VECTORIZATION is not implemented and not this stage —
+#     it needs range analysis (trip counts/independence), alias
+#     analysis (no intervening aliasing stores) and SROA (promotable
+#     array images) first; until then the compiler invents no vector
+#     (explicit-only).
 #
 # ── aarch64 ABI conventions used (mirroring codegen.tg) ───────────────
 #   THE PER-CLASS ABI WALK (the mixed int/float rule — AAPCS64's
@@ -1060,8 +1081,7 @@ use std::collections::{Vec, Map, Set}
 use tg_compiler::types::{
   Type, DeinitPlan,
   SimdIntrinsicKind, SimdLane,
-  simd_intrinsic_kind_of, simd_intrinsic_lane_of,
-  simd_lane_width, simd_lane_elem_size, simd_lane_count, simd_lane_is_float
+  simd_intrinsic_kind_of, simd_intrinsic_lane_of
 }
 use tg_compiler::ids::{GenericParamId, TypeId, InstanceId, DefId, def_id_numeric}
 use tg_compiler::mir::{
@@ -1117,14 +1137,13 @@ use tg_compiler::runtime::{runtime_ctx_new, emit_all_runtime}
    build_static_label_table, static_def_id_key, storage_size_bytes,
    emit_scalar_constant_for_storage, emit_ftoi_saturate_a64,
    PhysReg,
-   simd_neon_base, simd_neon_size_field,
-   emit_neon_3same, emit_neon_ldr_q, emit_neon_str_q, emit_neon_tbl,
+   emit_neon_ldr_q, emit_neon_str_q, emit_neon_tbl,
    codegen_neon_128_binop
  }
 use tg_compiler::target_desc::{
   TargetDesc, AtomicSupport, atomic_support, VectorSupport, vector_support,
   aarch64_desc, thumbv7em_cortex_m4f_desc,
-  riscv32imac_desc, riscv64imac_desc
+  riscv32imac_desc, riscv64imac_desc, x86_64_desc
 }
 # (audit items 28 + 29): the ONE ABI call-plan authority.  LIR's
 # aggregate/enum image classes route through abi_internal_image_class and
@@ -2091,12 +2110,10 @@ end
 # one width and a total width of 16/32/64 bytes? Returns the canonical
 # lane descriptor of the VECTOR ROW (the layout engine's vector type —
 # the name gate is is_simd_vector_type_name, the lane widths are the
-# substituted fields' scalar sizes). Option::None for every other type
-# (including a family instantiation that is NOT a vector width — e.g.
-# Vec2[f32] at 8 bytes — which falls through to the ordinary aggregate
-# gate and fails closed there). Err only when an Adt type has no
-# MirTypeDef record (the program type-def table is required — the
-# same rule as the aggregate slices).
+# substituted fields' scalar sizes). Option::None for every other type:
+# a family instantiation that is NOT a vector width (e.g. Vec2[f32] at
+# 8 bytes) and an Adt with NO MirTypeDef record both fall through to
+# the ordinary aggregate gate, which owns their fail-closed errors.
 #
 # The lane kinds are the canonical kinds (including the unsigned
 # spellings); the descriptor's bits may be 128/256/512 — the class
@@ -2109,7 +2126,11 @@ def lir_vector_lane_of_type(type_defs: Map[Int, MirTypeDef], ty: Type) -> Result
     let td = match type_defs.get(tid.id)
     when Option::Some(t) then t
     when Option::None then
-      return Result::Err("aggregate type id " + tid.id.to_string() + " has no MirTypeDef record in this program (the vector-local model needs the program type-def table)")
+      # No record: the type's NAME is unknowable here, so this probe
+      # answers "not a vector" and the ordinary aggregate gate owns the
+      # missing-record error (keeping today's fail-closed message for
+      # table-less entries).
+      return Result::Ok(Option::None)
     end
     match td.kind
     when MirTypeDefKind::Struct(fields) then
@@ -3924,13 +3945,14 @@ struct LirLowerCtx
   # input (target_desc.vector_support) — and the route's VECTOR-ARM
   # gate. vec_desc is the canonical desc of the lowering entry (aarch64
   # on the a64 entries, the M-profile/riscv descs on their routes, the
-  # x86_64 desc on the legacy mode wrapper); vec_ok is true ONLY where
-  # the LIR vector emission arm exists (the aarch64 route — the stage-1
-  # machine arm). Legality (desc) and emission envelope (vec_ok) are
-  # SEPARATE questions: an x86_64 desc advertises V128 but the x86 LIR
-  # backend has no vector arm yet, so its vec_ok is false and vector
-  # locals/SIMD calls fail closed with the route rule before the desc
-  # is consulted.
+  # x86_64 desc on the x86 route entry AND the legacy mode wrapper);
+  # vec_ok is true where the LIR vector emission arm exists (the aarch64
+  # route and — since audit item 30 stage 2 — the x86 route over SSE2).
+  # Legality (desc) and emission envelope (vec_ok) are SEPARATE
+  # questions: the legacy two-flag x86 wrapper passes vec_ok false, so
+  # its vector locals/SIMD calls fail closed with the route rule before
+  # the desc is consulted, while lower_mir_fn_to_lir_prog_x86 passes
+  # true.
   vec_desc: TargetDesc
   vec_ok: Bool
   # Per-block statement accumulation, keyed by block id
@@ -7396,28 +7418,30 @@ end
 # Lower Div/Mod (aarch64 route; see LirDivOp/LirStmt.div for why the
 # division is a marked statement rather than a LirBinOp variant).
 #
-# DIVISION SEMANTICS (mirroring the direct emitter — codegen.tg emits
-# sdiv/msub with NO guard, and the MIR front end emits no division-by-zero
-# or MIN/-1 MirAssert today: the signed checked-op set is Add/Sub/Mul
-# only, so a plain `/` or `%` reaches codegen unguarded):
-#   quotient  = a64 SDIV (Int operands) / UDIV (UInt operands)
-#               — MIN/-1 yields the ARCHITECTURAL result MIN (aarch64
-#               sdiv does not trap; x86 idiv would — the divergence is
-#               pre-existing in the direct emitter, and this slice is
-#               aarch64-only, so the LIR route is bit-identical to it);
+# DIVISION SEMANTICS (audit item 30; the direct emitter's codegen.tg
+# division arms carry the SAME explicit guard): the raw `/`/`%` edges
+# TRAP deterministically, on both targets:
+#   quotient  = a64 SDIV (Int operands) / UDIV (UInt operands),
+#               preceded by lir_emit_div_rr's UDF guard — the divisor is
+#               tested against zero (both kinds), and for the SIGNED
+#               kind the MIN/-1 pair is tested before the sdiv. The
+#               architectural sdiv results (0 for /0, MIN for MIN/-1)
+#               would diverge from the x86 idiv #DE; the guard makes
+#               both targets, both routes and the stage0 VM agree on a
+#               deterministic trap. The front end emits no such guard
+#               itself (the P1-5 signed checked set is Add/Sub/Mul), so
+#               the guard lives in the emitters.
 #   remainder = num - q*den via a mul/sub pair the emitter fuses into one
 #               MSUB (the codegen emit_smod shape; q = the sdiv/udiv
-#               quotient above). Truncation is toward zero, so the
-#               remainder carries the dividend's sign, exactly like the
-#               aarch64 direct emitter's msub sequence.
-#   /0 and %0 do NOT trap in this slice: sdiv/udiv by zero are
-#               architectural (quotient 0; the msub remainder form yields
-#               the dividend), no MIR guard exists to lower, and the
-#               direct emitter behaves identically. When a MirAssert
-#               (DivisionByZero/RemainderByZero/Overflow/BoundsCheck —
-#               all uniform) DOES guard the division in MIR, its lowering
-#               (lir_lower_assert) branches to the function's trap block
-#               BEFORE this rvalue can execute.
+#               guarded quotient above). Truncation is toward zero, so
+#               the remainder carries the dividend's sign, exactly like
+#               the aarch64 direct emitter's msub sequence. The MIN/-1
+#               remainder edge (the quotient step divides there) traps
+#               with the quotient edge, matching x86 idiv and the VM.
+#   A MirAssert guard in the MIR (DivisionByZero/RemainderByZero/
+#               Overflow/BoundsCheck — all uniform), when present, still
+#               lowers through lir_lower_assert and branches to the
+#               function's trap block BEFORE this rvalue can execute.
 def lir_lower_divmod(inout ctx: LirLowerCtx, block_id: Int, dst_ty: Type, dst_v: Int, is_mod: Bool, left: MirOperand, right: MirOperand) -> Result[Unit, String]
   if !ctx.div_ok then
     return Result::Err("lir: " + ctx.fn_name + ": integer " + (if is_mod then "remainder" else "division") + " does not lower on this LIR route (sdiv/udiv lowering is aarch64-slice-only; the riscv/cortex-m LIR slices have no division encoders — fail-closed)")
@@ -9558,10 +9582,18 @@ def lir_lower_simd_call(inout ctx: LirLowerCtx, block_id: Int, callee_name: Stri
   when Option::None then
     return Result::Err("lir: " + ctx.fn_name + ": SIMD intrinsic " + callee_name + " names a 512-bit lane class; no descriptor models a 512-bit vector facility (target_desc.vector_support answers Unsupported for 512 bits and no LIR EVEX emission exists — fail-closed)")
   end
-  # THE ONE VECTOR AUTHORITY (audit item 34): the route's canonical desc
-  # decides. V128 proceeds (the stage-1 emission envelope); V256 and
-  # Unsupported fail closed with the named target reason.
-  let route_desc = lir_lower_route_desc(ctx)
+  # The route's emission envelope first: only the aarch64 LIR route
+  # carries the stage-1 vector arm (vec_ok). A route without it fails
+  # closed with the route rule even if its desc advertises a vector
+  # facility (the x86_64 SSE2 desc does; an x86 LIR vector arm is a
+  # later slice).
+  if !ctx.vec_ok then
+    return Result::Err("lir: " + ctx.fn_name + ": SIMD intrinsic " + callee_name + " has no LIR emission on this route (the stage-1 vector emission arm is the aarch64 route's; the route's LIR emitter rejects the vector class — fail-closed)")
+  end
+  # THE ONE VECTOR AUTHORITY (audit item 34): the route's desc decides.
+  # V128 proceeds (the stage-1 emission envelope); V256 and Unsupported
+  # fail closed with the named target reason.
+  let route_desc = ctx.vec_desc.clone()
   match vector_support(route_desc, lane.bits)
   when VectorSupport::V128 then ()
   when VectorSupport::V256 then
@@ -9569,7 +9601,6 @@ def lir_lower_simd_call(inout ctx: LirLowerCtx, block_id: Int, callee_name: Stri
   when VectorSupport::Unsupported then
     return Result::Err("lir: " + ctx.fn_name + ": SIMD intrinsic " + callee_name + " needs " + lane.bits.to_string() + "-bit vectors, which the target description " + route_desc.name + " does not model (target_desc.vector_support answers Unsupported — the desc's fpu/isa_features advertise no such vector facility; fail-closed)")
   end
-  # The stage-1 machine emission is the aarch64 LIR route's vector arm.
   if !(ctx.div_ok && !ctx.param_stack_mode) then
     return Result::Err("lir: " + ctx.fn_name + ": SIMD intrinsic " + callee_name + " has no LIR emission on this route (the stage-1 vector emission arm is the aarch64 route's; fail-closed)")
   end
@@ -10201,6 +10232,27 @@ def lower_mir_fn_to_lir_prog(f: MirFunction, type_defs: Map[Int, MirTypeDef], de
   lower_mir_fn_to_lir_mode_ty(f, true, true, false, false, false, false, false, false, aarch64_desc(), true, type_defs, deinit_plans, finalizer_names, glue_names, static_labels)
 end
 
+# The x86_64 route's program-level entry (backend_x86_64.tg, slice 2):
+# the SAME width model as the aarch64 program route (width_ok true — the
+# sized-integer word model, Bool, the pointer/ref words, the aggregate
+# locals/params/returns and the SIMD vector locals), the aarch64
+# register-fetch geometry (param_stack_mode false: the lowering binds
+# general parameters to the fixed vregs 0..5 and floats to 8..15; the
+# x86 emitter maps those to rdi..r9 / xmm0..7 and its validator fails
+# closed on any fixup id the SysV file cannot hold, i.e. 6/7 and the
+# stack stream), division open (the idiv/div arms), and the vector
+# admission open over the x86_64 description (vec_ok true — SSE2 covers
+# every desc-legal v128 width; the vector emitter's per-lane SSE2 gaps
+# and the SSSE3 shuffle rule fail closed with named errors). The deinit
+# tables stay empty: the MirDeinit slice is not wired on this route yet,
+# so programs with drops fail closed at the shape gate. `type_defs` is
+# the program's MirTypeDef table (aggregates resolve through it);
+# `static_labels` the whole-program static label table (MirStaticRef
+# resolves through it).
+def lower_mir_fn_to_lir_prog_x86(f: MirFunction, type_defs: Map[Int, MirTypeDef], static_labels: Map[String, String]) -> Result[LirFunction, String]
+  lower_mir_fn_to_lir_mode_ty(f, true, true, false, false, false, false, false, false, x86_64_desc(), true, type_defs, Map::new(), Map::new(), Set::new(), static_labels)
+end
+
 # The aarch64 route also opens the full width model (sized integer
 # locals/params/returns/casts — width_ok); the thumb/rv word-only
 # entries keep the
@@ -10247,11 +10299,15 @@ end
 # which the whole-program routes call with the MirProgram tables — see
 # the MirDeinit slice section).
 def lower_mir_fn_to_lir_mode(f: MirFunction, div_ok: Bool, width_ok: Bool) -> Result[LirFunction, String]
-  # The legacy mode wrapper's caller is the x86_64 LIR backend
-  # (backend_x86_64.tg): its desc advertises V128 (SSE2) but the x86
-  # LIR emitter carries NO vector arm this stage, so vec_ok is FALSE —
-  # vector locals/SIMD calls fail closed with the route rule before the
-  # desc authority is consulted (legality vs emission envelope).
+  # The legacy two-flag mode wrapper (kept for tests and any
+  # word-model caller). The x86_64 LIR route no longer enters here:
+  # since audit item 30 stage 2 it lowers through
+  # lower_mir_fn_to_lir_prog_x86 below (width model + aggregates +
+  # floats + vectors + the program type/static tables). This wrapper's
+  # desc is still the x86_64 desc but vec_ok stays FALSE and the width
+  # model stays the caller's choice, so vector locals/SIMD calls fail
+  # closed with the route rule before the desc authority is consulted
+  # (legality vs emission envelope).
   lower_mir_fn_to_lir_mode_ty(f, div_ok, width_ok, false, false, false, false, false, false, x86_64_desc(), false, Map::new(), Map::new(), Map::new(), Set::new(), Map::new())
 end
 
@@ -13188,6 +13244,7 @@ def lir_verify_fp_legal(route: LirVerifyRoute) -> Bool
   match route
   when LirVerifyRoute::LirVerifyA64 then true
   when LirVerifyRoute::LirVerifyCm then true
+  when LirVerifyRoute::LirVerifyX86_64 then true
   when _ then false
   end
 end
@@ -13209,8 +13266,9 @@ end
 # The vector class is memory-resident (every vector vreg carries a
 # preassigned fixed slot in agg_word_slots and never appears in
 # fp_widths), the class tables must agree with each other, and a
-# LirStmt.vec marker is legal only on the aarch64 route (the stage-1
-# vector emitter arm). The lane payloads must be the desc-legal v128
+# LirStmt.vec marker is legal on the routes whose emitters carry a
+# vector arm — the aarch64 route and (since audit item 30 stage 2) the
+# x86_64 route over SSE2. The lane payloads must be the desc-legal v128
 # intrinsic-family descriptors the lowering produces — a v256/v512 or
 # non-family descriptor reaching the verifier is a lowering divergence.
 
@@ -13307,7 +13365,7 @@ end
 # operand-class rules above. The def/use shape itself is
 # lir_vec_stmt_occ (the shared marker walk).
 def lir_verify_vec_stmt(f: LirFunction, route: LirVerifyRoute, block_id: Int, vop: LirVecOp, inout out: Vec[String]) -> Unit
-  if route != LirVerifyRoute::LirVerifyA64 then
+  if route != LirVerifyRoute::LirVerifyA64 && route != LirVerifyRoute::LirVerifyX86_64 then
     out.push("lir-verify: legal: block " + block_id.to_string() + " has a vector statement on the " + lir_verify_route_name(route) + " route, whose emitters carry no vector arm")
   end
   match vop
@@ -13538,6 +13596,12 @@ end
 # exists for the machine-bound parameter words, whose first read is
 # their first statement occurrence.)
 def lir_verify_is_agg_word(f: LirFunction, id: Int) -> Bool
+  # VECTOR-class vregs share the fixed-slot region but are NOT
+  # machine-bound entry words: their def must be an explicit vector
+  # statement in this function, so they never take the exemption.
+  if f.vector_widths.contains_key(&id) then
+    return false
+  end
   match f.agg_word_slots.get(id)
   when Option::Some(_) then true
   when Option::None then false
@@ -13994,7 +14058,7 @@ def lir_verify_stmt_rules(f: LirFunction, route: LirVerifyRoute, block_id: Int, 
         out.push("lir-verify: abi: block " + block_id.to_string() + " loads a stack parameter from the non-canonical frame offset " + off.to_string() + " (cortex-m stack words sit at 8 + 4*k)")
       end
     when LirVerifyRoute::LirVerifyX86_64 then
-      out.push("lir-verify: abi: block " + block_id.to_string() + " loads a stack parameter (LirLoadFrame at [FP + " + off.to_string() + "]) on the x86_64 route, whose stage-1 emitter has no SysV stack-argument stream (fail-closed)")
+      out.push("lir-verify: abi: block " + block_id.to_string() + " loads a stack parameter (LirLoadFrame at [FP + " + off.to_string() + "]) on the x86_64 route, whose emitter keeps the SysV stack-argument stream fail-closed (the lowering's 16-byte caller slots are not the SysV 8-byte stream)")
     when _ then
       out.push("lir-verify: abi: block " + block_id.to_string() + " loads a stack parameter (LirLoadFrame at [FP + " + off.to_string() + "]) on the riscv route, which has no caller stack stream")
     end
@@ -14011,7 +14075,7 @@ def lir_verify_stmt_rules(f: LirFunction, route: LirVerifyRoute, block_id: Int, 
     when LirVerifyRoute::LirVerifyRv64 then
       out.push("lir-verify: legal: block " + block_id.to_string() + " pushes a caller stack argument on the riscv64 route, which has no caller stack stream")
     when LirVerifyRoute::LirVerifyX86_64 then
-      out.push("lir-verify: legal: block " + block_id.to_string() + " pushes a caller stack argument on the x86_64 route, whose stage-1 emitter has no SysV stack-argument stream (fail-closed)")
+      out.push("lir-verify: legal: block " + block_id.to_string() + " pushes a caller stack argument on the x86_64 route, whose emitter keeps the SysV stack-argument stream fail-closed (only rdi/rsi/rdx/rcx/r8/r9 + xmm0..7 are served)")
     when _ then ()
     end
     if vreg < lir_first_alloc_vreg() then
@@ -14546,10 +14610,11 @@ def lir_verify_alloc(f: LirFunction, alloc: LirAlloc, route: LirVerifyRoute, ino
                 when LirVerifyRoute::LirVerifyRv64 then
                   if (s.phys >= 100 && s.phys <= 107) || s.phys == 128 || s.phys == 129 then ok_pool = true end
                 when LirVerifyRoute::LirVerifyX86_64 then
-                  # The stage-1 x86_64 route has no FP surface and no FP
-                  # pool: any FP-class register-resident segment is a
-                  # violation (ok_pool stays false).
-                  ()
+                  # The allocatable x86_64 FP pool is xmm8..xmm14
+                  # (phys 108..114 + code). xmm0..7 are the fixed ABI
+                  # file and xmm15 the emitter scratch — neither is
+                  # ever allocated.
+                  if s.phys >= 108 && s.phys <= 114 then ok_pool = true end
                 end
                 if !ok_pool then
                   out.push("lir-verify: class: FP-class vreg " + v.to_string() + " segment is register-resident in physical " + s.phys.to_string() + ", outside the " + lir_verify_route_name(route) + " FP pool")
@@ -14974,10 +15039,11 @@ pub def verify_lir(f: LirFunction, alloc: LirAlloc, route: LirVerifyRoute) -> Ve
         match stmt.bm
         when Option::Some(bmop) then
           match route
-          when LirVerifyRoute::LirVerifyA64 then
+          when LirVerifyRoute::LirVerifyA64 | LirVerifyRoute::LirVerifyX86_64 then
             # The bit-move marker rides the LirUnop shape (def dst, use
             # src): exactly one side is FP-class — the marker's own
-            # class rule.
+            # class rule. (The x86_64 emitter carries the MOVD/MOVQ
+            # crossing arms.)
             match stmt.kind
             when LirStmtKind::LirUnop(_, dst, src) then
               match bmop
@@ -15011,8 +15077,7 @@ pub def verify_lir(f: LirFunction, alloc: LirAlloc, route: LirVerifyRoute) -> Ve
             # the marker's own.
             match route
             when LirVerifyRoute::LirVerifyA64 then ()
-            when LirVerifyRoute::LirVerifyX86_64 then
-              out.push("lir-verify: legal: block " + b.id.to_string() + " has a pointer/atomic statement on the x86_64 route, whose stage-1 emitter has no pointer/atomic arms (fail-closed)")
+            when LirVerifyRoute::LirVerifyX86_64 then ()
             when _ then ()
             end
             lir_verify_ptr_stmt(f, route, b.id, pop, out)
@@ -15625,9 +15690,52 @@ def lir_emit_binop_imm(inout ctx: CodegenCtx, op: LirBinOp, d: A64, n: A64, imm:
   end
 end
 
-# An aarch64-slice division (a LirStmt.div marker): SDIV/UDIV d = n / m.
-# Never flag-setting, so invariant I1's flag discipline is untouched.
+# The aarch64 division guard's scratch register: X15/X16/X17 are the
+# emitter's reserved instruction temporaries (never allocatable, never
+# live across a statement), so one of them is always free of n, m and
+# the def target d — n and m are either the same register (x / x) or
+# two distinct operands, and d can alias at most one vreg, so at most
+# two of the three reserved temps are ever occupied. The movz/movk
+# materialization of -1 / INT64_MIN rides this temp (the plain
+# a64_cmp_ri has no negative-immediate form).
+def lir_div_guard_scratch(n: A64, m: A64, d: A64) -> A64
+  if n != A64::X15 && m != A64::X15 && d != A64::X15 then return A64::X15 end
+  if n != A64::X16 && m != A64::X16 && d != A64::X16 then return A64::X16 end
+  A64::X17
+end
+
+# An aarch64-slice division (a LirStmt.div marker): SDIV/UDIV d = n / m,
+# guarded by the language division rule (audit item 30) — the raw `/`
+# and `%` edges TRAP deterministically: a zero divisor (SDIV/UDIV would
+# return the architectural 0) and, for the SIGNED kind, the MIN/-1 pair
+# (SDIV would return MIN where x86 idiv raises #DE; the msub remainder
+# divides through the same edge, so `%` traps with `/`). The guard
+# branches over an inline UDF (the aarch64 trap instruction the direct
+# emitter's MirAssert arm uses), so the trap is a machine-level fault
+# exactly like the P1-5 overflow traps. Only CBZ + the reserved-temp
+# compares are used, so the guard is safe with any operand/def aliasing
+# and never touches a pool register.
 def lir_emit_div_rr(inout ctx: CodegenCtx, op: LirDivOp, d: A64, n: A64, m: A64) -> Unit
+  let tag = ctx.fn_counter
+  ctx.fn_counter = tag + 1
+  let lbl_trap = ".Ldiv_trap." + tag.to_string()
+  let lbl_ok = ".Ldiv_ok." + tag.to_string()
+  a64_cbz(&mut ctx.text, m, lbl_trap)
+  match op
+  when LirDivOp::LirUdiv then
+    a64_b(&mut ctx.text, lbl_ok)
+  when LirDivOp::LirSdiv then
+    let scratch = lir_div_guard_scratch(n, m, d)
+    a64_mov_ri(&mut ctx.text, scratch, -1)
+    a64_cmp_rr(&mut ctx.text, m, scratch)
+    a64_bcond(&mut ctx.text, a64_cc_ne(), lbl_ok)
+    a64_mov_ri(&mut ctx.text, scratch, -9223372036854775808 as i64)
+    a64_cmp_rr(&mut ctx.text, n, scratch)
+    a64_bcond(&mut ctx.text, a64_cc_ne(), lbl_ok)
+  end
+  def_label(&mut ctx.text, lbl_trap)
+  a64_udf(&mut ctx.text)
+  def_label(&mut ctx.text, lbl_ok)
   match op
   when LirDivOp::LirSdiv then a64_sdiv_rrr(&mut ctx.text, d, n, m)
   when LirDivOp::LirUdiv then a64_udiv(&mut ctx.text, d, n, m)
