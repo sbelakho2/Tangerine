@@ -1822,7 +1822,7 @@ end
 # below it, while discriminants of payload-less enums fit well under it.
 # This is the SINGLE place the boundary value exists; codegen reads it from
 # the EnumLayout and never contains it.
-def enum_inline_tag_threshold() -> Int = 256
+pub def enum_inline_tag_threshold() -> Int = 256
 
 # ———————————————————————————————————————————————————————————————
 # Niche analysis — the single unused-bit-pattern authority
@@ -3992,9 +3992,10 @@ end
 # only when the enum is payload-LESS (a payloaded enum's TaggedPtr
 # word is a compiler-private encoding, NOT an FFI value, so ExternC
 # classifies it fail-closed).  See classify_enum_crossing below for the
-# one per-enum crossing authority; lir.tg's LIR-internal inline-image
-# adaptation is declared against it (and its boundary conversion is the
-# documented remaining step there).
+# one per-enum crossing authority; the LIR route lowers/constructs/reads
+# the SAME canonical value word and consumes the SAME classify_call_plan
+# answer (fourth-audit P0-20 — the route-private inline-image adaptation
+# and its versioning were deleted).
 pub enum AbiFlavor
   InternalValue
   ExternC
@@ -4031,9 +4032,6 @@ end
 #   PairFloat(a, b) / MixedPair(a, b) — the AAPCS64/SysV HFA/SSE
 #                  aggregate classes (audit P1-13; the member-type scan
 #                  lands them)
-#   EnumInline(sz) — the LIR-internal inline-image enum crossing
-#                  (AbiEnumCrossing::InlineImage; LIR's own aggregate
-#                  machinery carries that crossing today)
 #
 # AbiLocation — WHERE it crosses: a typed kind (None / Register /
 # RegisterPairGpr / RegisterPairFp / StackOffset) plus the target's own
@@ -4057,7 +4055,6 @@ pub enum AbiValueClass
   Vector(width: Int)
   ByAddress(size: Int)
   TaggedPtr(width: Int)
-  EnumInline(size: Int)
 end
 
 pub enum AbiLocationKind
@@ -4114,19 +4111,21 @@ end
 
 # The crossing of ONE registered enum value: the item-29 authority.  Both
 # routes ask this question; neither contains the representation policy.
+# The payloaded-enum representation is UNIFIED (fourth-audit P0-20):
+# there is exactly ONE crossing form for every registered enum — the
+# canonical ONE-word TaggedPtr value — and no route-private inline-image
+# form exists anymore.
 pub enum AbiEnumCrossing
   # The canonical ONE-word TaggedPtr crossing (the EnumLayout's value
-  # representation) — what the direct route does and what any TRUE
-  # boundary between representations must use.
+  # representation) — what BOTH routes do (the direct emitter builds the
+  # word directly; the LIR route builds/reads the same word and crosses
+  # it in one Scalar-class slot).
   ValueWord
-  # The LIR-internal adaptation: the inline image crosses by reference
-  # (the sret x8 copy-out / the image address in the argument's slot)
-  # because the LIR route has no heap to build the TaggedPtr word.  NOT a
-  # canonical crossing; only LIR-compiled callees may receive it, and any
-  # extern/non-LIR counterpart must fail closed.
-  InlineImage
-  # The inline image IS the value word (a payload-less InlineTagged
-  # enum): the two routes already agree bit-for-bit.
+  # The legacy InlineTagged representation's one-word image (<= 8
+  # bytes): the image IS the value word, so the two routes agree
+  # bit-for-bit. No registered enum uses InlineTagged today (the
+  # canonical decision is TaggedPtr); a > 8-byte InlineTagged image has
+  # no canonical crossing and fails closed.
   InlineScalar
 end
 
@@ -4142,8 +4141,8 @@ end
 
 # The canonical class word: Zero -> "zero", the scalar/tagged-pointer
 # classes -> "scalar:<width>", the pair classes -> "pair:<a>:<b>",
-# Vector -> "vector:<width>", ByAddress/EnumInline ->
-# "by-address:<size>" — byte-identical to the old vocabulary.
+# Vector -> "vector:<width>", ByAddress -> "by-address:<size>" —
+# byte-identical to the old vocabulary.
 pub def abi_value_class_word(cls: AbiValueClass) -> String
   match cls
   when AbiValueClass::Zero then "zero"
@@ -4155,7 +4154,6 @@ pub def abi_value_class_word(cls: AbiValueClass) -> String
   when AbiValueClass::Vector(w) then "vector:" + w.to_string()
   when AbiValueClass::ByAddress(sz) then "by-address:" + sz.to_string()
   when AbiValueClass::TaggedPtr(w) then "scalar:" + w.to_string()
-  when AbiValueClass::EnumInline(sz) then "by-address:" + sz.to_string()
   end
 end
 
@@ -4410,16 +4408,18 @@ def abi_value_size_align(inout engine: LayoutEngine, ty: Type) -> (Int, Int)
   end
 end
 
-# THE enum crossing authority (audit item 29).  A registered enum's
-# crossing is decided by its EnumLayout representation, never by a size
-# test in a consumer:
+# THE enum crossing authority (audit item 29; fourth-audit P0-20).  A
+# registered enum's crossing is decided by its EnumLayout
+# representation, never by a size test in a consumer:
 #   TaggedPtr enum, InternalValue flavor -> ValueWord (the canonical ONE
 #     pointer-width word, payload or not);
 #   TaggedPtr enum, ExternC flavor -> ValueWord for a payload-less enum
 #     (its word IS the raw discriminant), fail-closed for a payloaded one
 #     (the heap-pointer encoding is compiler-private);
 #   InlineTagged enum -> InlineScalar when its whole image is one word
-#     (<= 8 bytes), else InlineImage (the by-reference inline image);
+#     (<= 8 bytes); a larger InlineTagged image has no canonical crossing
+#     and fails closed (the legacy representation is not used by any
+#     registered enum; the canonical decision is TaggedPtr);
 #   Niched enum, InternalValue flavor -> ValueWord: the niched value IS
 #     one payload word (the payload, or the payload type's niche pattern
 #     for the payload-less variant), the same one-word scalar crossing
@@ -4475,7 +4475,14 @@ pub def classify_enum_crossing(inout engine: LayoutEngine, desc: TargetDesc, fla
           if size <= 8 then
             Result::Ok(AbiEnumCrossing::InlineScalar)
           else
-            Result::Ok(AbiEnumCrossing::InlineImage)
+            Result::Err(LayoutError {
+              class: LayoutFailureClass::UNSUPPORTED_TYPE,
+              message: "A legacy InlineTagged enum image larger than one word has no canonical crossing: the canonical representation is the EnumLayout's TaggedPtr value word (raw discriminant below the 256-byte inline-tag threshold, heap pointer above), and the inline image cannot be converted to it without marshalling (fourth-audit P0-20 removed the route-private inline-image crossing)",
+              type_name: mir_type_identity_key(ty),
+              expected: 0,
+              actual: 0,
+              context: "classify_enum_crossing"
+            })
           end
         when Option::None then
           Result::Err(LayoutError {
@@ -4571,8 +4578,8 @@ end
 # ONLY place a location is formed for the plan; consumers read the typed
 # answer.  (third-audit item 41): the class/location/extension outputs
 # are structured values; the only strings formed here are the target's
-# own register names.  The reserved classes (PairFloat / MixedPair /
-# EnumInline) fail closed — no classifier path constructs them yet.
+# own register names.  The reserved classes (PairFloat / MixedPair)
+# fail closed — no classifier path constructs them yet.
 def abi_place_value(desc: TargetDesc, flavor: AbiFlavor, class: AbiValueClass, size: Int, align: Int, extension: AbiExtension, inout gp_pos: Int, inout fp_pos: Int, inout stack_bytes: Int) -> AbiParam
   let gpr_count = desc.arg_regs.len()
   let fpr_count = if abi_fpr_available(desc) then 8 else 0 end
@@ -4698,8 +4705,6 @@ def abi_place_value(desc: TargetDesc, flavor: AbiFlavor, class: AbiValueClass, s
       stack_bytes = stack_bytes + abi_stack_slot_size(desc, internal_convention, size)
       AbiParam { value_class: AbiValueClass::Vector(w), location: abi_location_stack(off), indirect: true, extension: AbiExtension::None, alignment: align, size: size }
     end
-  when AbiValueClass::EnumInline(_) then
-    panic("abi_place_value: the EnumInline class is the reserved structured form of the LIR-internal inline-image enum crossing (audit item 29): classify_call_plan never emits it — LIR's own aggregate machinery carries that crossing (fail-closed)")
   end
 end
 
@@ -4786,6 +4791,30 @@ pub def abi_return_text(ret: AbiReturn) -> String
   when AbiReturn::FprPairT(c) then "direct:" + abi_value_class_word(c)
   when AbiReturn::SRetT(c) then "sret:" + abi_value_class_word(c)
   end
+end
+
+# (fourth-audit P1-10) The CANONICAL signature of one AbiCallPlan: every
+# crossing-relevant field of every parameter (class word, location text,
+# indirect, extension, alignment, size) plus the return render, the
+# variadic flag and the stack-arg byte count. Two calls are ABI-ENTRY-
+# COMPATIBLE exactly when their plan signatures are equal; the tail-call
+# recognition compares THIS (the ONE classify_call_plan authority) instead
+# of emission names or partial trait probes.
+pub def abi_call_plan_signature(plan: AbiCallPlan) -> String
+  var text = "plan"
+  for p in plan.args do
+    let indirect_text = if p.indirect then "1" else "0" end
+    text = text + "|" + abi_value_class_word(p.value_class) +
+      "|" + abi_location_text(p.location) +
+      "|" + indirect_text +
+      "|" + abi_extension_word(p.extension) +
+      "|" + p.alignment.to_string() +
+      "|" + p.size.to_string()
+  end
+  let variadic_text = if plan.variadic then "1" else "0" end
+  text = text + "|ret:" + abi_return_text(plan.ret)
+  text = text + "|var:" + variadic_text
+  text + "|stack:" + plan.stack_arg_bytes.to_string()
 end
 
 # THE classification entry: one plan per (target, flavor, signature).

@@ -11,13 +11,16 @@ the allocator-free `ArrayVec` / `RingBuffer` collections) and the driver's
 embedded route (`compile_to_embedded_route`).
 
 > **THE CODE-GEN TRUTH (P0.2, updated for the LIR backends + audit item
-> 39).** The backend identity is the `--target` triple's descriptor —
+> 39; the canonical default flipped at fourth-audit P0-21).** The
+> backend identity is the `--target` triple's descriptor —
 > `target_desc.tg`'s ONE lookup `target_desc_of_triple` — never an
-> env-gated second target naming system. (1) The DEFAULT (un-gated)
-> route is the DIRECT emitter (codegen.tg) for the host targets
-> (`aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`, plus the wasm32
-> route). (2) The LIR pipeline (lir.tg: MIR → LIR → linear-scan
-> allocation → per-backend emission) is the code generator for the
+> env-gated second target naming system. (1) The DEFAULT route is the
+> LIR pipeline (lir.tg: MIR → LIR → linear-scan allocation →
+> per-backend emission) for the host targets
+> (`aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`); the DIRECT
+> emitter (codegen.tg) is the explicit debug/bootstrap fallback
+> (`--codegen=direct`). The wasm32 route keeps its own code generator.
+> (2) The LIR pipeline is the code generator for the
 > desc'd Thumb/RISC-V triples below: a `--target` compile of
 > `thumbv7m-none-eabi`, `thumbv7em-none-eabi[f]`, `riscv32imac|imafc|
 > imafdc-unknown-none-elf` or `riscv64imac|riscv64gc-unknown-none-elf`
@@ -26,9 +29,10 @@ embedded route (`compile_to_embedded_route`).
 > is no direct emitter for those ISAs). The LIR backends emit ELF
 > relocatable OBJECTS only (executable/image linking fails closed) and
 > fail closed on any construct outside their legalization contract.
-> `TANGERINE_LIR=1` + `TANGERINE_LIR_TARGET=...` remains the default-off
-> HOST opt-in for the aarch64 LIR slice, with the env value working
-> only as a legacy alias key of the same descriptor table.
+> `TANGERINE_LIR=1` + `TANGERINE_LIR_TARGET=...` remains the deprecated
+> HOST alias for the LIR route (now the default, so the alias selects
+> nothing new), with the env value working only as a legacy alias key of
+> the same descriptor table.
 >
 > The `--target` embedded route's artifact contract (the target spec
 > JSON, the linker script, the startup/vector artifacts and the
@@ -76,7 +80,8 @@ is replaced by four per-CPU ARMv7-M instances and five RISC-V instances
 `riscv64gc_desc`; the legacy names `cortex-m` → cortex-m4f and
 `riscv32`/`riscv64` → the imac instances of their xlen are alias keys
 of the same table). `TANGERINE_LIR=1` + `TANGERINE_LIR_TARGET=...` is
-the default-off HOST slice (and the legacy alias path); the embedded
+the deprecated HOST alias path (the LIR route is the default since
+fourth-audit P0-21, so the alias selects nothing new); the embedded
 desc'd triples need no env gate. The route's thumb/rv arms emit
 relocatable OBJECTS only (the `-c` / `--emit-obj` object mode) —
 executable emission fails closed (the objects are for an external
@@ -139,8 +144,9 @@ additionally links executables.
   the thumb/rv arms fail closed on executable emission (objects only
   — link externally), while the aarch64 LIR arm links executables. Neither backend ever
   invokes an external toolchain — every encoding is emitted in-tree.
-  The route is default-off and pending full-corpus parity with the
-  DIRECT emitter; it fails closed on any construct outside its
+  The route is the compiler default for the host (`--codegen=direct`
+  selects the direct debug/bootstrap emitter) and always serves the
+  desc'd embedded triples; it fails closed on any construct outside its
   legalization contract rather than falling back silently.
 
 ## Getting Started
@@ -493,8 +499,9 @@ tg build file.tg --target thumbv7em-none-eabihf --emit-obj
 tg build file.tg --target thumbv7m-none-eabi --emit-obj
 tg build file.tg --target riscv32imac-unknown-none-elf --emit-obj
 tg build file.tg --target riscv64gc-unknown-none-elf --emit-obj
-# The legacy env alias selects the SAME descriptors (default-off host
-# slice; TANGERINE_LIR=1 gates LIR-vs-direct for the host):
+# The legacy env alias selects the SAME descriptors (the LIR route is
+# the default host route since fourth-audit P0-21; the alias selects
+# nothing new):
 TANGERINE_LIR=1 TANGERINE_LIR_TARGET=cortex-m4f tg build file.tg --emit-obj
 TANGERINE_LIR=1 TANGERINE_LIR_TARGET=riscv32imac tg build file.tg --emit-obj
 # Accepted alias keys: aarch64 (default), cortex-m3/cortex-m4/cortex-m4f/

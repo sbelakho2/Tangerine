@@ -1,0 +1,220 @@
+# tests/replay_typed_events_test.tg — P1-9 (fourth audit): deterministic
+# record / run / compare over TYPED replay events.
+#
+# The model lives in tg_compiler/replay.tg:
+#   * ReplayChoice (Scheduler / Time / Random / ExternalRead) is the typed
+#     nondeterminism union; a typed event carries it beside its
+#     ReplayEventId (whose nondeterminism_token is the canonical choice
+#     render) and its typed §33 MIR site (StableMirStmtId, P0-7/8).
+#   * replay_record builds a trace from supplied typed choices.
+#   * replay_run / replay_run_choices / replay_run_digest produce the
+#     DETERMINISTIC CHOICE STREAM a re-execution consumes.
+#   * replay_compare is the semantic-only first divergence (the
+#     replay.diff entry); first_divergence stays token-inclusive.
+#   * SyncEdge (send-recv / lock-unlock / start-join) + the
+#     happens-before closure drive causal_predecessors_with_sync and
+#     replay_slice; the last-writer causal_predecessors stays the
+#     documented fallback when no edges are supplied.
+#
+# This suite drives the module's self-checking lane rows AND the direct
+# round trips: record -> run supplies exactly the recorded choices;
+# compare finds the first STABLE semantic divergence when one choice
+# differs; the sync-aware slice includes a send that only the explicit
+# edge reaches.
+#
+# Run with the repo root as the working directory:
+#   tg test tests/replay_typed_events_test.tg
+
+use std::core::{Option, Unit}
+use std::collections::{Vec}
+use std::test::*
+
+use tg_compiler::replay::{
+  ReplayChoice, ReplayChoiceSupply, ReplayEventId, StateDelta, EventTrace,
+  SyncEdge, replay_record, replay_run, replay_run_choices, replay_run_digest,
+  replay_trace_is_typed, replay_compare, first_divergence,
+  replay_choice_token, sync_edge_send_recv, sync_happens_before,
+  causal_predecessors, causal_predecessors_with_sync, replay_slice,
+  replay_typed_lane_check
+}
+
+# The two-thread fixture: main writes x then sends on chan:1; the worker
+# receives (recording the given scheduler decision) then writes y with
+# y_value. choice_value and y_value are the two knobs two revisions vary.
+def replay_test_fixture(revision: String, choice_value: Int, y_value: String) -> EventTrace
+  var supplies: Vec[ReplayChoiceSupply] = Vec::new()
+  supplies.push(ReplayChoiceSupply {
+    function_key: "main".to_string(),
+    symbol_key: "m::main#fn()->unit".to_string(),
+    stmt_key: "main#B0#S0".to_string(),
+    thread_id: 0,
+    effect_kind: "write".to_string(),
+    delta: Option::Some(StateDelta {
+      place: "x".to_string(),
+      old_value: "0".to_string(),
+      new_value: "1".to_string()
+    }),
+    choice: Option::None
+  })
+  supplies.push(ReplayChoiceSupply {
+    function_key: "main".to_string(),
+    symbol_key: "m::main#fn()->unit".to_string(),
+    stmt_key: "main#B0#S1".to_string(),
+    thread_id: 0,
+    effect_kind: "send".to_string(),
+    delta: Option::Some(StateDelta {
+      place: "chan:1".to_string(),
+      old_value: "".to_string(),
+      new_value: "1".to_string()
+    }),
+    choice: Option::None
+  })
+  supplies.push(ReplayChoiceSupply {
+    function_key: "worker".to_string(),
+    symbol_key: "m::worker#fn()->unit".to_string(),
+    stmt_key: "worker#B0#S0".to_string(),
+    thread_id: 1,
+    effect_kind: "recv".to_string(),
+    delta: Option::None,
+    choice: Option::Some(ReplayChoice::Scheduler(choice_value))
+  })
+  supplies.push(ReplayChoiceSupply {
+    function_key: "worker".to_string(),
+    symbol_key: "m::worker#fn()->unit".to_string(),
+    stmt_key: "worker#B0#S1".to_string(),
+    thread_id: 1,
+    effect_kind: "write".to_string(),
+    delta: Option::Some(StateDelta {
+      place: "y".to_string(),
+      old_value: "0".to_string(),
+      new_value: y_value.clone()
+    }),
+    choice: Option::None
+  })
+  replay_record(revision, supplies)
+end
+
+def replay_test_id_in(ids: Vec[ReplayEventId], id: ReplayEventId) -> Bool
+  var found = false
+  for cur in ids do
+    if cur.sequence == id.sequence && cur.function_key == id.function_key &&
+      cur.stmt_key == id.stmt_key && cur.thread_id == id.thread_id &&
+      cur.semantic_op_key == id.semantic_op_key &&
+      cur.nondeterminism_token == id.nondeterminism_token then
+      found = true
+    end
+  end
+  found
+end
+
+@test
+def test_replay_typed_lane() -> Unit
+  let rows = replay_typed_lane_check()
+  assert(rows.len() == 0, "typed replay lane mismatches: " + rows.join("; "))
+end
+
+@test
+def test_record_then_run_supplies_the_recorded_choices() -> Unit
+  let trace = replay_test_fixture("rev-a".to_string(), 1, "7".to_string())
+  assert(trace.events.len() == 4, "the fixture trace must carry four events")
+  assert(replay_trace_is_typed(&trace),
+    "a replay_record trace of typed supplies must be fully typed")
+
+  let steps = replay_run(&trace)
+  assert(steps.len() == 1, "one typed choice must yield one stream step")
+  assert(steps[0].site.stmt_key == "worker#B0#S0",
+    "the step must anchor at the consuming site")
+  assert(replay_choice_token(steps[0].choice.clone()) == "scheduler:1",
+    "the step must carry the recorded scheduler decision")
+
+  # The bare choice stream equals the recorded choices exactly.
+  let choices = replay_run_choices(&trace)
+  assert(choices.len() == 1, "the bare stream must carry the one choice")
+  assert(replay_choice_token(choices[0].clone()) ==
+    replay_choice_token(ReplayChoice::Scheduler(1)),
+    "the stream choice must equal the recorded choice")
+
+  # A re-recorded trace with the same choices yields the same stream digest.
+  let again = replay_test_fixture("rev-a".to_string(), 1, "7".to_string())
+  let d1 = replay_run_digest(&trace)
+  let d2 = replay_run_digest(&again)
+  assert(d1.hi == d2.hi && d1.lo == d2.lo,
+    "the same choices must content-address to the same stream digest")
+end
+
+@test
+def test_compare_choice_only_is_not_a_semantic_divergence() -> Unit
+  let a = replay_test_fixture("rev-a".to_string(), 1, "7".to_string())
+  let c = replay_test_fixture("rev-c".to_string(), 2, "7".to_string())
+
+  # The token-inclusive relation sees the differing choice...
+  match first_divergence(&a, &c)
+  when Option::Some(id) then
+    assert(id.sequence == 2, "first_divergence must flag the choice event")
+  when Option::None then
+    assert(false, "first_divergence must flag the differing choice token")
+  end
+
+  # ...but the semantic compare does not: nothing observed changed.
+  match replay_compare(&a, &c)
+  when Option::Some(id) then
+    assert(false,
+      "replay_compare must ignore a choice that changed nothing, got seq " +
+      id.sequence.to_string())
+  when Option::None then ()
+  end
+end
+
+@test
+def test_compare_semantic_divergence_and_sync_slice() -> Unit
+  let a = replay_test_fixture("rev-a".to_string(), 1, "7".to_string())
+  let b = replay_test_fixture("rev-b".to_string(), 2, "9".to_string())
+
+  # The differing choice changed the worker's observed write: the first
+  # STABLE semantic divergence is the write event.
+  match replay_compare(&a, &b)
+  when Option::Some(id) then
+    assert(id.sequence == 3,
+      "the semantic divergence must be the changed write, got seq " +
+      id.sequence.to_string())
+  when Option::None then
+    assert(false, "the changed write must diverge semantically")
+  end
+
+  let send_id = b.events[1].id.clone()
+  let recv_id = b.events[2].id.clone()
+  let div_id = b.events[3].id.clone()
+  let edge = sync_edge_send_recv("chan:1".to_string(), send_id.clone(), recv_id.clone())
+  let edges = Vec::from([edge.clone()])
+  var no_edges: Vec[SyncEdge] = Vec::new()
+
+  # The explicit edge (plus program order) establishes send -> divergence...
+  assert(sync_happens_before(&b, &edges, send_id.clone(), div_id.clone()),
+    "the send must happen-before the divergence through the recv")
+  assert(!sync_happens_before(&b, &no_edges, send_id.clone(), div_id.clone()),
+    "without edges the cross-thread send has no happens-before path")
+
+  # ...so the sync-aware slice materializes the sender; the fallback does not.
+  let sync_preds = causal_predecessors_with_sync(&b, div_id.clone(), edges.clone())
+  assert(replay_test_id_in(sync_preds, send_id.clone()),
+    "the sync-aware predecessors must include the sender")
+  let fallback_preds = causal_predecessors(&b, div_id.clone())
+  assert(!replay_test_id_in(fallback_preds, send_id.clone()),
+    "the last-writer fallback cannot reach a delta-less sender")
+
+  let sync_slice = replay_slice(&a, &b, edges.clone())
+  assert(sync_slice.len() == 4,
+    "the sync slice must carry the whole causal chain, got " +
+    sync_slice.len().to_string())
+  assert(replay_test_id_in(sync_slice, send_id.clone()),
+    "the sync slice must include the send edge endpoint")
+  assert(replay_test_id_in(sync_slice, div_id.clone()),
+    "the sync slice must include the divergence event")
+
+  let fallback_slice = replay_slice(&a, &b, no_edges.clone())
+  assert(fallback_slice.len() == 2,
+    "the fallback slice must stay at the worker's own events, got " +
+    fallback_slice.len().to_string())
+  assert(!replay_test_id_in(fallback_slice, send_id.clone()),
+    "the fallback slice must not include the sender")
+end

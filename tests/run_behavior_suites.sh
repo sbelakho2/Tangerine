@@ -73,9 +73,19 @@ SUITES=(
   # (byte-identity over a hand-built full snapshot), the malformed-row
   # fail-closed probes and the loaded-artifact session query.
   "tests/semantic_snapshot_parse_test.tg"
-  # audit item 49: the structured generic-instance keys (InstanceKey /
-  # MonoCache.instances re-key + the documented const-fold model).
+  # audit item 49: the structured generic-instance keys (StructuralInstanceId
+  # / MonoCache.instances re-key + the P0-5 cross-kind order + the P0-6
+  # insertion-stability lane + the documented const-fold model).
   "tests/mono_instance_key_test.tg"
+  # fourth-audit P0-4: the persistent member/binder/HIR-node lineages
+  # (insertion/rename stability, per-function binder numbering, the v2
+  # store's member/binder/HIR sections and their save-load round trip).
+  "tests/stable_member_lineage_test.tg"
+  # fourth-audit P0-7/P0-8/P1-10: the persistent MIR origins + the semantic
+  # re-key lane (origin stability across the O2 optimizer, PGO v3
+  # round-trip + fail-closed v2 conversion, structural tail eligibility,
+  # coverage control-origin ids carried by the LIR route's plan).
+  "tests/mir_origin_identity_lane_test.tg"
   "tests/unit/test_int_overflow_behavior.tg"
   # audit item 1: the Slice ownership split (copied_slice / cloned_slice
   # drop counts, sub-view range validation) + the fixed-decimal suite.
@@ -106,6 +116,10 @@ SUITES=(
   # + the dynamic semantic-tool discovery surface (the registry walk, the
   # audited enumeration and the requires_* filters).
   "tests/semantic_rationale_test.tg"
+  # fourth-audit P1-9: deterministic record/run/compare over typed replay
+  # events (the ReplayChoice union, the deterministic choice stream, the
+  # semantic-only replay_compare and the sync-edge happens-before slice).
+  "tests/replay_typed_events_test.tg"
 )
 
 FAILED=0

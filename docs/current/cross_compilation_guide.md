@@ -166,8 +166,9 @@ lookup (`target_desc_of_triple`) maps the canonical triples (and the
 legacy route names as alias keys of the SAME table) to the per-CPU /
 per-profile descriptors, and the driver routes a desc'd triple to the
 LIR pipeline for that descriptor — no environment-only target universe
-(`TANGERINE_LIR=1` still gates "LIR vs direct" for the aarch64 host
-slice; `TANGERINE_LIR_TARGET` works only as a legacy alias through the
+(`--codegen=direct` selects the direct debug/bootstrap emitter for the
+aarch64 host, whose default is the LIR route since fourth-audit P0-21;
+`TANGERINE_LIR_TARGET` works only as a legacy alias through the
 same table). The route compiles ONE native input file through the
 standalone LIR pipeline (MIR → LIR → linear-scan register allocation →
 per-backend emission), emitting ELF relocatable OBJECTS (`--emit=obj`;
@@ -211,10 +212,10 @@ any construct outside their legalization contract (aggregates,
 unsupported static images, sub-word atomics, and — per descriptor —
 float content on the no-FPU instances). A desc'd embedded triple ALWAYS
 uses its descriptor's LIR backend (`--target thumbv7m-none-eabi`, etc.;
-the env gate is not required); the `TANGERINE_LIR=1` host slice is
-still default-off and pending full-corpus parity with the direct
-emitter, and unknown `TANGERINE_LIR_TARGET` legacy alias values fail
-closed with the accepted set.
+the env gate is not required); the host default is the same LIR route
+since fourth-audit P0-21 (`--codegen=direct` selects the direct
+debug/bootstrap emitter), and unknown `TANGERINE_LIR_TARGET` legacy alias
+values fail closed with the accepted set.
 
 ## Conditional Compilation
 

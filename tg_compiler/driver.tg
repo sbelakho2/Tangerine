@@ -44,7 +44,7 @@ use tg_compiler::resolver::{resolve_names}
 use tg_compiler::access_check::{access_check}
 use tg_compiler::resource_check::{resource_check, build_typed_cfg, analysis_context_new, AnalyzedProgram}
 use tg_compiler::mir::{lower_to_mir, MirProgram, MirFunction, optimize_mir, opt_decisions_of_mir, pretty_print_mir, instrument_for_pgo, verify_mir, check_effect_class_annotations_mir, check_purity_annotations_mir, check_budget_annotations_mir}
-use tg_compiler::codegen::{generate_native, generate_executable, generate_object_file, detect_host_target}
+use tg_compiler::codegen::{generate_native, generate_executable, generate_object_file, detect_host_target, stamp_tail_abi_plans}
 use tg_compiler::lir::{
   lir_compile_object_cov, lir_compile_executable_cov, lir_target_desc
 }
@@ -92,7 +92,8 @@ use tg_compiler::compiler_core::{
   emitter_new, emitter_new_json, DiagnosticEmitter, driver_lower_to_mir, analyze_program,
   Diagnostic, DiagLevel, json_escape, parse_source_program, join_diagnostics,
   emit_diagnostic, type_errors_to_diags, merge_imported_deps,
-  CodegenRoute, parse_codegen_route, resolve_coverage_out
+  CodegenRoute, parse_codegen_route, resolve_coverage_out,
+  codegen_route_gap_hint
 }
 # (third-audit item 34 — the runtime producer): the coverage emission plan
 # the LIR route consumes (coverage_graph.tg section 2b). The driver builds
@@ -100,9 +101,10 @@ use tg_compiler::compiler_core::{
 # plan-aware LIR entries.
 use tg_compiler::coverage_graph::{coverage_emission_plan_of_functions, coverage_emission_plan_disabled}
 # The §30 semantic snapshot route (audit §30; default-off): the driver
-# house of the env-gated artifact gates (with the LIR gates) — the
-# snapshot builder is full-library-only and the compiler kernel stays
-# closed. The §39 semantic-server construction (audit item 21) rides the
+# house of the env-gated artifact gates (shared with the driver-level LIR
+# route gates) — the snapshot builder is full-library-only and the
+# compiler kernel stays closed. The §39 semantic-server construction
+# (audit item 21) rides the
 # SAME route: at the successful final compiler boundary the route builds
 # the CompilerSession over the finalized state (compiler_session_from_
 # finalized — the snapshot route's own env / typed program / verified MIR
@@ -111,15 +113,18 @@ use tg_compiler::coverage_graph::{coverage_emission_plan_of_functions, coverage_
 # as before when the server env var is unset.
 use tg_compiler::semantic_snapshot::{
   semantic_snapshot_of_final_state, semantic_snapshot_finalize, semantic_snapshot_serialize,
+  snapshot_feature_set_of, snapshot_semantic_options_of,
   SnapshotError
 }
-# The persistent declaration-lineage store (third-audit item 11): the
-# snapshot route's SIBLING artifact (<snapshot>.lineages) — loaded at build
-# start (empty when absent), threaded through the builder's def walk and
-# saved after a successful build so repeated route/server runs accumulate
-# lineage history.
+# The persistent declaration-lineage store (third-audit item 11;
+# fourth-audit P0-2): the snapshot route's SIBLING artifact
+# (<snapshot>.lineages) — loaded at build start (empty when absent),
+# threaded through the builder's def walk and published after a successful
+# build through the ATOMIC temp+rename save so repeated route/server runs
+# accumulate lineage history.
 use tg_compiler::stable_ids::{
-  DeclLineageStore, stable_lineage_store_new, stable_lineage_store_load, stable_lineage_store_save
+  DeclLineageStore, stable_lineage_store_new, stable_lineage_store_load,
+  stable_lineage_store_save_atomic
 }
 use tg_compiler::semantic_model::{semantic_digest_zero, semantic_digest_render}
 use tg_compiler::semantic_index::{build_semantic_index}
@@ -144,7 +149,10 @@ use tg_compiler::semantic_rationale::{
 # evidence slot for the §38/§39 consumers and the proof-patch follow-up
 # (session_proof_patch_between); imported here in the same type-import
 # idiom as the semantic modules above.
-use tg_compiler::proof_patch::{verified_compilation_evidence}
+use tg_compiler::proof_patch::{
+  verified_compilation_evidence, verified_compilation_evidence_stages,
+  verification_stage_names_driver_route
+}
 
 # The WASM backend route — the driver's --target wasm32-unknown-unknown
 # dispatch (see compile_to_wasm_route below).
@@ -233,7 +241,7 @@ def coverage_route_supported(opts: CompilerOptions) -> Bool
 end
 
 def coverage_route_message() -> String
-  "--coverage is implemented on the aarch64 host LIR route only: pass --codegen=lir with no cross --target to instrument a host build (the direct emitter and the desc'd/wasm backends have no counter emission); --coverage-out=<path> selects the dump path (default /tmp/tg.cov.trace, \"-\" = stdout)"
+  "--coverage is implemented on the aarch64 host LIR route only: use the host LIR route (the default; --codegen=lir also selects it) with no cross --target to instrument a host build (the direct emitter and the desc'd/wasm backends have no counter emission); --coverage-out=<path> selects the dump path (default /tmp/tg.cov.trace, \"-\" = stdout)"
 end
 
 # The --coverage-out=<path> value extraction (the --pgo-gen idiom): the
@@ -269,9 +277,12 @@ end
 
 # The deprecated-alias fallback (audit item 31): TANGERINE_LIR=1 is the
 # legacy spelling of --codegen=lir and is consulted ONLY when the CLI
-# carried no explicit --codegen flag. TANGERINE_LIR_TARGET never enables
-# the route by itself — it is the legacy backend selector INSIDE the LIR
-# route (compile_lir_route), unchanged.
+# carried no explicit --codegen flag. Since the fourth-audit P0-21 flip
+# the host default route IS Lir, so the alias no longer changes the
+# route; it stays accepted so existing scripts (and its
+# TANGERINE_LIR_TARGET companion) keep working. TANGERINE_LIR_TARGET
+# never enables the route by itself — it is the legacy backend selector
+# INSIDE the LIR route (compile_lir_route), unchanged.
 def apply_codegen_env_alias(opts: CompilerOptions, codegen_explicit: Bool) -> CompilerOptions
   if codegen_explicit then
     return opts
@@ -477,8 +488,11 @@ def parse_args(argv: Vec[String]) -> Result[CompilerOptions, String]
     return Result::Err("No input files")
   end
 
-  # (audit item 31) the deprecated TANGERINE_LIR alias maps onto the
-  # option only when no explicit --codegen flag was given.
+  # (audit item 31; fourth-audit P0-21) record the explicit --codegen
+  # flag on the option — the route gates distinguish an explicit flag
+  # from the default — then map the deprecated TANGERINE_LIR alias onto
+  # the route ONLY when no explicit --codegen flag was given.
+  opts.codegen_explicit = codegen_explicit
   Result::Ok(apply_codegen_env_alias(opts, codegen_explicit))
 end
 
@@ -607,8 +621,11 @@ def parse_startup_compile_args(skip_subcommand: Bool) -> Result[CompilerOptions,
     i = i + 1
   end
 
-  # (audit item 31) the deprecated TANGERINE_LIR alias maps onto the
-  # option only when no explicit --codegen flag was given.
+  # (audit item 31; fourth-audit P0-21) record the explicit --codegen
+  # flag on the option — the route gates distinguish an explicit flag
+  # from the default — then map the deprecated TANGERINE_LIR alias onto
+  # the route ONLY when no explicit --codegen flag was given.
+  opts.codegen_explicit = codegen_explicit
   Result::Ok(apply_codegen_env_alias(opts, codegen_explicit))
 end
 
@@ -659,11 +676,13 @@ def print_help() -> Unit
   println("                     aarch64 REQUIRES the ARMv8.1 LSE atomics (LDADDAL/CASAL/SWPAL —")
   println("                     Apple Silicon, Neoverse, Cortex-A75+; see asm.tg's target feature")
   println("                     table; the ldaxr/stlxr LL/SC fallback is the future portable mode)")
-  println("  --codegen=direct|lir  Codegen route (default direct; lir is the standalone")
-  println("                     LIR pipeline — experimental, host aarch64 + the desc'd")
-  println("                     embedded triples only; TANGERINE_LIR is a deprecated alias)")
+  println("  --codegen=direct|lir  Codegen route (default lir — the standalone LIR")
+  println("                     pipeline, host aarch64 + the desc'd embedded triples;")
+  println("                     --codegen=direct selects the direct debug/bootstrap")
+  println("                     emitter; TANGERINE_LIR is the deprecated alias)")
   println("  --coverage           Emit block/edge counters (aarch64 LIR route) and dump the")
-  println("                     tg.cov.trace.v1 trace at exit; requires --codegen=lir")
+  println("                     tg.cov.trace.v1 trace at exit; requires the LIR route")
+  println("                     (the default route; --codegen=lir also selects it)")
   println("  --coverage-out=PATH  Coverage dump path (default /tmp/tg.cov.trace; \"-\" = stdout)")
   println("  --panic-strategy <S>  abort (the ONLY stable strategy; unwind is rejected —")
   println("                     the unwind/catch machinery is experimental and never selectable)")
@@ -3135,11 +3154,11 @@ def root_program_imports_module(program: Program, module: String) -> Bool
 end
 
 # ———————————————————————————————————————————————————————————————
-# THE LIR ROUTE — audit P1-7 slice + audit items 31/39 (default-off for
-# the HOST via the compiler option; the embedded desc'd triples always
-# route here)
+# THE LIR ROUTE — audit P1-7 slice + audit items 31/39 (the canonical
+# HOST DEFAULT since fourth-audit P0-21; the embedded desc'd triples
+# always route here)
 # ———————————————————————————————————————————————————————————————
-# --codegen=lir routes HOST single-file compiles through
+# --codegen=lir (the default) routes HOST single-file compiles through
 # tg_compiler::lir — the standalone register-allocation pipeline
 # (MIR -> LIR -> linear scan -> aarch64 emission -> object/link; see
 # lir.tg's module doc for the legalization contract). The route FAILS
@@ -3147,13 +3166,16 @@ end
 # function silently). The route mirrors compile_to_wasm_route's pipeline
 # shape.
 # AUDIT ITEM 31 — THE OPTION IS THE AUTHORITY: the route is selected by
-# CompilerOptions.codegen (--codegen=direct|lir; default direct — the
-# codegen_default() one-line flip point in compiler_core.tg).
+# CompilerOptions.codegen (--codegen=direct|lir; DEFAULT LIR since
+# fourth-audit P0-21 — the codegen_default() flip point in
+# compiler_core.tg). --codegen=direct is the explicit debug/bootstrap
+# fallback.
 # TANGERINE_LIR=1 is a DEPRECATED ALIAS: it is mapped onto the option at
 # the CLI parser boundaries (parse_args / parse_startup_compile_args /
 # cmd_compile_direct via apply_codegen_env_alias) ONLY when the compile
 # carried no explicit --codegen flag, so an explicit --codegen=direct
-# wins over the env var.
+# wins over the env var (since the flip the alias maps Lir onto Lir —
+# it is kept for scripts, not required to select the route).
 # AUDIT ITEM 39 — THE BACKEND IDENTITY IS THE DESC, NOT AN ENV NAME:
 # the LIR pipeline is the code generator for the desc'd thumb/riscv
 # triples (compile_to_embedded_route above routes a --target
@@ -3364,10 +3386,9 @@ end
 # linking fails closed inside x86_64_compile_executable. The route's
 # descriptor is the desc of the --target triple (target_desc_of_triple)
 # or of the legacy env alias; the triple gate below checks the identity.
-# The route is reachable ONLY when the LIR route is selected
-# (--codegen=lir, or the deprecated TANGERINE_LIR=1 alias) — with
-# TANGERINE_LIR_TARGET=x86_64 or --target x86_64-*. The default host
-# route is unchanged.
+# The route is reachable whenever the LIR route is selected (the host
+# default since fourth-audit P0-21, or an explicit --codegen=lir) — with
+# TANGERINE_LIR_TARGET=x86_64 or --target x86_64-*.
 def compile_lir_route_x86(mir: MirProgram, opts: CompilerOptions, out_path: String, tdesc: TargetDesc) -> Result[Unit, String]
   # (third-audit item 34) no counter emission on the x86_64 backend.
   if opts.coverage then
@@ -3408,7 +3429,7 @@ end
 
 def compile_lir_route(opts: CompilerOptions, files: Vec[String], output_path: String, route_desc: Option[TargetDesc]) -> Result[Unit, String]
   if files.len() != 1 then
-    return Result::Err("the LIR pipeline requires exactly one input file (use --codegen=direct, or unset the deprecated TANGERINE_LIR alias, for the direct emitter)")
+    return Result::Err("the LIR pipeline requires exactly one input file (use --codegen=direct for the direct debug/bootstrap emitter)")
   end
   let file = files[0].clone()
   let out_path = if output_path.len() > 0 then
@@ -3479,6 +3500,9 @@ def compile_lir_route(opts: CompilerOptions, files: Vec[String], output_path: St
   when Result::Ok(_) then ()
   when Result::Err(me) then return Result::Err("monomorphization failed with " + me.len().to_string() + " error(s)")
   end
+  # (fourth-audit P1-10) the authoritative AbiCallPlan oracle (the host
+  # arch here; cross routes ignore the advisory marker) before the tail pass.
+  stamp_tail_abi_plans(&mut mir, detect_host_target().arch)
   optimize_mir(&mut mir, opts.opt_level)
   let post_errs = verify_mir(&mir)
   if !post_errs.is_empty() then
@@ -3558,11 +3582,11 @@ def compile_lir_route(opts: CompilerOptions, files: Vec[String], output_path: St
     when Option::None then ()
     end
   end
-  # — the aarch64 host slice (--codegen=lir, or the deprecated
-  # TANGERINE_LIR=1 alias, without a desc'd --target): the original P1-7
+  # — the aarch64 host slice (the default LIR route, or an explicit
+  # --codegen=lir, without a desc'd --target): the original P1-7
   # slice's emission below. —
   if target.arch != Arch::AArch64 then
-    return Result::Err("the LIR host route emits aarch64 only in this slice; the host is " + host_arch_name(target.arch) + " — use --codegen=direct (or unset the deprecated TANGERINE_LIR alias) for the direct emitter")
+    return Result::Err("the LIR host route emits aarch64 only in this slice; the host is " + host_arch_name(target.arch) + " — use --codegen=direct for the direct debug/bootstrap emitter")
   end
   # P1-14 slice 1: the route consults the canonical target description —
   # lir_target_desc() -> target_desc::aarch64_desc(), the single source of
@@ -3623,20 +3647,25 @@ end
 # surface hashes ride the header and whose revision is the
 # content-addressed digest of its own canonical text.
 #
-# THIRD-AUDIT ITEM 11 (the persistent declaration lineage): the route also
-# owns the store's SIBLING artifact, "<path>.lineages" (the canonical
-# "pkg|module|kind|name|lineage" text of stable_lineage_store_save). At
-# build start the file is loaded when present (stable_lineage_store_load)
-# and a fresh empty store is used otherwise; the store is threaded through
-# the snapshot builder's def walk (stable_decl_stamp — an existing name
-# keeps its number; stable_decl_stamp_renamed — a unique same-kind/
-# same-signature disappeared entry transfers its number) and written back
-# after a successful build. Repeated route (and TANGERINE_SERVER) runs thus
-# accumulate lineage history keyed by the snapshot path. FIDELITY
-# BOUNDARY (documented in stable_ids.tg): the store text carries no
-# signature digests, so a LOADED store's entries are re-signed by the next
-# build's walk — a rename is rebindable once the pre-rename entry has been
-# re-signed in-process; the numbers themselves always survive.
+# THIRD-AUDIT ITEM 11 + FOURTH-AUDIT P0-2 (the persistent declaration
+# lineage): the route also owns the store's SIBLING artifact,
+# "<path>.lineages" (the v2 "tg-lineage-store v2|<revision>|..." text of
+# stable_lineage_store_save; a v1 legacy body is still read). At build
+# start the file is loaded when present (stable_lineage_store_load) and a
+# fresh empty store is used otherwise; the store is threaded through the
+# snapshot builder's def walk (stable_decl_stamp — an existing name keeps
+# its number; the conservative rule transfers a number only for an
+# explicit continuation or a unique same-kind/same-signature candidate
+# seen in the immediately preceding revision) and written back after a
+# successful build through stable_lineage_store_save_atomic (write
+# "<path>.tmp" + rename — the linker's transactional publication pattern;
+# std::fs::rename is the atomic-replace primitive, so a failed write never
+# destroys the last good store). Repeated route (and TANGERINE_SERVER)
+# runs thus accumulate lineage history keyed by the snapshot path. The v2
+# format persists the signature digest words and the structural
+# fingerprint, so rename/move matching works after a restart exactly as
+# in-process; a loaded v1 store re-signs on its first build (sig digests
+# 0/0 = unknown) and matches from the next revision on.
 #
 # AUDIT ITEM 21 (the server carrying finalized state): this route is the
 # successful final compiler boundary. When TANGERINE_SERVER=1 is set
@@ -3665,7 +3694,8 @@ end
 # The gate lives HERE (the driver — the full-library build) rather than
 # in compiler_core.tg so the bootstrap compiler kernel stays closed
 # (kernel modules never import full-library modules); this mirrors the
-# env-gated LIR gates.
+# driver-level LIR route gates (the LIR route itself is the default
+# since fourth-audit P0-21; its gate remains driver-level).
 
 def snapshot_error_text(e: SnapshotError) -> String
   match e
@@ -3685,6 +3715,50 @@ def snapshot_route_path() -> Option[String]
   match std::env::get_env("TANGERINE_SNAPSHOT")
   when Option::Some(p) then if p.len() > 0 then Option::Some(p) else Option::None end
   when Option::None then Option::None
+  end
+end
+
+# THE HOST LIR-GATE PREDICATE (fourth-audit P0-21): true when the host
+# compile must run the LIR route gate (cmd_compile / cmd_compile_direct).
+# The route must be Lir, and — since Lir is now the DEFAULT — the §30
+# snapshot env route keeps its PRE-FLIP precedence when the LIR selection
+# came only from that default: the snapshot route REPLACES the compile
+# (an artifact producer, like the wasm/no-std routes), so a
+# TANGERINE_SNAPSHOT request falls through to its own gate below. An
+# explicit --codegen=lir or the deprecated TANGERINE_LIR=1 alias keeps
+# the exact pre-flip precedence: the LIR gate wins over the snapshot
+# route, as it always did when those selected it.
+# The driver's DIRECT-ONLY inspection surfaces (--print-ast /
+# --print-tokens / --emit-mir / --dump-* phase hooks and the --json
+# diagnostic emitter) are the debug/bootstrap arm: the LIR route
+# implements no phase hook and no JSON emitter, so a DEFAULT-selected
+# compile that asks for one stays on the direct pipeline exactly as
+# before the flip (the explicit selections above still take the LIR
+# gate, their old behavior).
+def lir_gate_applies(opts: CompilerOptions) -> Bool
+  if opts.codegen != CodegenRoute::Lir then
+    return false
+  end
+  if opts.codegen_explicit || lir_route_enabled() then
+    return true
+  end
+  if opts.print_ast || opts.print_tokens || opts.emit_mir || opts.json_diagnostics then
+    # --coverage is a LIR-route feature (the driver gate above already
+    # resolved the route): it wins over the inspection carve-out.
+    if !opts.coverage then
+      return false
+    end
+  end
+  match opts.dump_phase
+  when Option::Some(_) then
+    if !opts.coverage then
+      return false
+    end
+  when Option::None then ()
+  end
+  match snapshot_route_path()
+  when Option::Some(_) then false
+  when Option::None then true
   end
 end
 
@@ -4018,6 +4092,8 @@ def compile_snapshot_serve_route(
   when Result::Ok(_) then ()
   when Result::Err(me) then return Result::Err("monomorphization failed with " + me.len().to_string() + " error(s)")
   end
+  # (fourth-audit P1-10) the authoritative AbiCallPlan oracle before the tail pass.
+  stamp_tail_abi_plans(&mut mir, detect_host_target().arch)
   optimize_mir(&mut mir, opts.opt_level)
   let post_errs = verify_mir(&mir)
   if !post_errs.is_empty() then
@@ -4078,8 +4154,20 @@ def compile_snapshot_serve_route(
     when Result::Err(_) then rationale_store_new()
     end
   end
+  # (fourth-audit P1-5a) The header's semantically relevant feature set and
+  # option words, derived from the REAL options record + target descriptor
+  # (the same values every pass consumed); they ride the header row and the
+  # digest preimage.
+  let snapshot_features = snapshot_feature_set_of(opts.clone(), target_desc.clone())
+  let snapshot_options = snapshot_semantic_options_of(opts.clone(), target_desc.clone())
   var snapshot = match semantic_snapshot_of_final_state(
-    &env, &typed.typed, &mir, &target_desc, VERSION, semantic_digest_zero(), &mut lineage_store)
+    &env, &typed.typed, &mir, &target_desc, VERSION, semantic_digest_zero(), &mut lineage_store,
+    # (fourth-audit P0-17) the resource checker's emitted drop-plan facts ride
+    # the analysis artifact into the persisted snapshot table.
+    typed.drop_plan_facts.clone(),
+    # (fourth-audit P1-5a) the header payload.
+    snapshot_features,
+    snapshot_options)
   when Result::Err(e) then
     return Result::Err("semantic snapshot build failed: " + snapshot_error_text(e))
   when Result::Ok(s) then s
@@ -4101,10 +4189,13 @@ def compile_snapshot_serve_route(
   end
   # Persist the MUTATED store beside the artifact (the sibling
   # "<snapshot>.lineages" convention) or at the explicit --store path: the
-  # next run's walk reuses these numbers and rebinds renames among the
-  # entries it re-signs. Skipped when no store path was resolved.
+  # next run's walk reuses these numbers, re-signs the entries it sees and
+  # rebinds renames/moves among the entries the conservative rule proves.
+  # ATOMIC publication (fourth-audit P0-2): the v2 text is written to
+  # "<path>.tmp" and renamed over the store, so a failed write never
+  # destroys the last good store. Skipped when no store path was resolved.
   if lineage_path.len() > 0 then
-    match write_file_bytes(lineage_path.clone(), &stable_lineage_store_save(lineage_store).bytes())
+    match stable_lineage_store_save_atomic(lineage_path.clone(), lineage_store)
     when Result::Ok(_) then
       if !opts.quiet && have_snapshot_path then
         println("Semantic lineages: " + lineage_path.clone())
@@ -4179,7 +4270,12 @@ def compile_snapshot_serve_route(
   # ABI surface check.
   if serve then
     let index = build_semantic_index(&snapshot)
-    let route_evidence = verified_compilation_evidence(
+    # (fourth-audit P0-16) the captured-stages constructor: this route
+    # CAPTURES parse..effects + the capability/contract surface, and does
+    # NOT capture post-mono-mir / abi (no checkpoints exist) — the patch
+    # maps those to Unavailable and can never report complete verification,
+    # exactly mirroring this capture doc.
+    let route_evidence = verified_compilation_evidence_stages(
       semantic_digest_render(&snapshot.revision),
       true,   # parse_ok — parse_source_program succeeded
       true,   # resolution_ok — analyze_parsed's resolution succeeded
@@ -4190,7 +4286,9 @@ def compile_snapshot_serve_route(
       false,  # mono_verify_ok — no post-mono verifier checkpoint on this route
       true,   # post_opt_mir_verify_ok — the final post-opt verify
       true,   # effect_verify_ok — the §11 annotation check above
-      false)  # abi_verify_ok — no ABI-verify stage exists yet
+      false,  # abi_verify_ok — no ABI-verify stage exists yet
+      true,   # capability_contract_ok — the checker's contract + capability surface
+      verification_stage_names_driver_route())
     let session = compiler_session_from_finalized(
       snapshot.revision, &target_desc, &env, &typed.typed, &mir, &snapshot, &index,
       Option::Some(route_evidence))
@@ -4365,20 +4463,25 @@ def cmd_compile(argv: Vec[String]) -> Int
   end
 
   # THE LIR ROUTE GATE (audit P1-7 slice; audit item 31 — the OPTION is
-  # the authority, default direct): --codegen=lir routes native
-  # single-file compiles through the standalone register-allocation
-  # pipeline in tg_compiler::lir — the "LIR vs direct" choice for the
-  # HOST (the embedded desc'd triples above always use the LIR pipeline,
+  # the authority; fourth-audit P0-21 — Lir is the DEFAULT): the gate
+  # routes native single-file compiles through the standalone
+  # register-allocation pipeline in tg_compiler::lir — the canonical host
+  # route (the embedded desc'd triples above always use the LIR pipeline,
   # no option needed). The deprecated TANGERINE_LIR=1 alias was already
   # mapped onto opts.codegen by the parser when no explicit flag was
-  # given. Fail-closed: any construct outside the LIR legalization
+  # given. Fail-closed UX: any construct outside the LIR legalization
   # contract fails the compile with a rule-naming error — never a silent
-  # per-function fallback.
-  if opts.codegen == CodegenRoute::Lir then
+  # per-function fallback to the direct emitter; for the documented LIR
+  # gaps the refusal additionally names the explicit --codegen=direct
+  # fallback (codegen_route_gap_hint). lir_gate_applies keeps the §30
+  # snapshot env route's pre-flip precedence when LIR was selected only
+  # by the new default, and keeps the direct-only inspection surfaces
+  # (--print-*/--dump-*/--emit-mir/--json) on the direct pipeline.
+  if lir_gate_applies(opts) then
     match compile_lir_route(&opts, files, output_path, Option::None)
     when Result::Ok(_) then return 0
     when Result::Err(e) then
-      eprintln(e)
+      eprintln(codegen_route_gap_hint(e))
       return 1
     end
   end
@@ -4513,8 +4616,11 @@ def cmd_compile_direct(skip_subcommand: Bool) -> Int
     return 1
   end
 
-  # (audit item 31) the deprecated TANGERINE_LIR alias maps onto the
-  # option only when no explicit --codegen flag was given.
+  # (audit item 31; fourth-audit P0-21) record the explicit --codegen
+  # flag on the option (the route gates distinguish an explicit flag from
+  # the default), then map the deprecated TANGERINE_LIR alias ONLY when
+  # no explicit flag was given.
+  opts.codegen_explicit = codegen_explicit
   opts = apply_codegen_env_alias(opts, codegen_explicit)
 
  # (target-capability gate): same policy as cmd_compile — the
@@ -4569,16 +4675,18 @@ def cmd_compile_direct(skip_subcommand: Bool) -> Int
   end
 
   # THE LIR ROUTE GATE in raw compile mode (audit P1-7 slice; audit item
-  # 31 — the option is the authority, default direct; the deprecated
-  # TANGERINE_LIR alias was mapped above when no explicit flag was
-  # given) — same fail-closed semantics as cmd_compile's gate.
-  if opts.codegen == CodegenRoute::Lir then
+  # 31 — the option is the authority; fourth-audit P0-21 — Lir is the
+  # DEFAULT; the deprecated TANGERINE_LIR alias was mapped above when no
+  # explicit flag was given) — same fail-closed semantics as cmd_compile's
+  # gate: the refusal names the precise rule, never a silent fallback,
+  # with the --codegen=direct hint for the documented LIR gaps.
+  if lir_gate_applies(opts) then
     var lir_files = Vec::new()
     lir_files.push(file.clone())
     match compile_lir_route(&opts, lir_files, output_path, Option::None)
     when Result::Ok(_) then return 0
     when Result::Err(e) then
-      eprintln(e)
+      eprintln(codegen_route_gap_hint(e))
       return 1
     end
   end

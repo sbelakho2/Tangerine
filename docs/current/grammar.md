@@ -220,12 +220,23 @@ param          = [ 'inout' | 'sink' | 'set' ] IDENT [ ':' type_expr ] [ '=' expr
   spellings are REJECTED (E100) — write `self` (default `let`), `inout
   self`, or use the trailing `inout` receiver convention.
 - `fn` may be used in place of `def` as a defensive fallback.
-- Budget clauses accept the bare `budget` keyword or the `@budget`
-  attribute (`parser.tg:1363-1377`, `parse_budget_annotation`
-  `parser.tg:2505`); the bound is a STRING_LITERAL — a non-string bound is
-  silently dropped from the constraint list, not an error. The
-  `__tg_budget_*` data symbols have no definitions: enforcement is pending
-  (see language.md §Budgets).
+- Budget constraints use the `@budget` attribute — bare
+  (`@budget alloc: "8"`, `parser.tg:1681-1690`) or parenthesized
+  (`@budget(alloc = "8", ...)`); `parse_budget_annotation`
+  (`parser.tg:3082`) collects the metric/bound pairs. The bound is a
+  STRING_LITERAL (the EBNF's canonical form); the parser also accepts a
+  bare integer literal and canonicalizes it to decimal text, while any
+  other token form is silently dropped from the constraint list, not an
+  error. The EBNF's bare `budget` clause spelling also still parses at
+  statement position (`parser.tg:4184-4194`), but that arm consumes it as
+  a noop — it does NOT attach a typed budget, so only `@budget`
+  constraints are recorded. Recorded budgets ARE enforced: the MIR
+  guarantee pass (`check_budget_annotations_mir`, `mir.tg`) classifies
+  each recognized resource and fails the compile with E0235 when a
+  `static-proof` / `static-bound` derived value exceeds its declared
+  limit, and the `runtime-measured` resources carry generated
+  per-invocation frame counters / clock checks in native codegen and the
+  wasm backend (see language.md §Budgets).
 
 ### 2.3 Parameter Conventions and Legacy Rejection
 

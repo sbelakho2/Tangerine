@@ -20,13 +20,25 @@ use std::core::{Option, Result, Unit}
 use std::collections::{Vec}
 use std::test::*
 
-use tg_compiler::ids::{StableDigest}
-use tg_compiler::semantic_model::{SemanticSnapshot, StableTargetId}
+use tg_compiler::ids::{StableDigest, stable_digest_of, stable_def_id_digested}
+use tg_compiler::ast::{AstContractKind}
+use tg_compiler::stable_ids::{StableContractId, stable_decl_of_key}
+use tg_compiler::semantic_model::{
+  SemanticSnapshot, StableTargetId, ContractFact, ContractExprIR,
+  semantic_contract_expr_text, semantic_digest_render
+}
 use tg_compiler::semantic_server::{
-  SEMANTIC_PROTOCOL_VERSION, SemanticRequest, CallersResponse, SemanticWirePayload,
+  SEMANTIC_PROTOCOL_VERSION, SEMANTIC_PROTOCOL_VERSION_V2, SemanticRequest,
+  CallersResponse, SemanticWirePayload, ContractResponse, SemanticOperationId,
+  SemanticRequestV2, SemanticRequestV2Payload, SemanticTargetId,
+  SemanticResponseV2, SemanticResponseV2Payload,
   semantic_wire_payload_render, semantic_wire_payload_parse,
   semantic_wire_lane_check, new_compiler_session, session_handle_request,
-  semantic_response_frame, semantic_response_parse
+  semantic_response_frame, semantic_response_parse,
+  semantic_operation_id_of, semantic_operation_digest, semantic_operation_name_of,
+  semantic_request_v2_frame, semantic_response_v2_frame, semantic_response_v2_parse,
+  semantic_response_v2_eq,
+  session_handle_request_v2, session_handle_frame, semantic_v2_lane_check
 }
 use tg_compiler::driver::{parse_server_args}
 
@@ -265,5 +277,201 @@ def test_server_arg_parse_reject_forms() -> Unit
   match parse_server_args(Vec::from(["tg".to_string(), "--help".to_string()]))
   when Result::Ok(_) then assert(false, "--help must answer the help sentinel")
   when Result::Err(e) then assert(e == "help", "help sentinel: " + e)
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# fourth-audit P0-11 / P0-12 lanes — the v2 typed protocol + contract fix
+# ———————————————————————————————————————————————————————————————
+
+# A snapshot carrying ONE contract clause whose canonical expression text
+# contains the '|' delimiter (and "a || b"), with an explicit message: the
+# contract_list answer must build ContractResponse from the ContractFact.
+def server_contract_snapshot() -> SemanticSnapshot
+  var snapshot = server_test_snapshot()
+  let expression = ContractExprIR {
+    op: "binor".to_string(),
+    args: Vec::from(["a || b".to_string()])
+  }
+  let clause_text = semantic_contract_expr_text(&expression)
+  snapshot.contracts = Vec::from([
+    ContractFact {
+      id: StableContractId {
+        stable_key: "m::f#fn()->unit|Pre|" + clause_text
+      },
+      function: stable_def_id_digested("m::f#fn()->unit".to_string(), "m::f".to_string()),
+      kind: AstContractKind::AstPre,
+      expression_fingerprint: stable_digest_of(&clause_text),
+      canonical_expression: expression,
+      message: Option::Some("explicit message | with delimiter".to_string())
+    }
+  ])
+  snapshot
+end
+
+@test
+def test_semantic_v2_lane() -> Unit
+  let bad = semantic_v2_lane_check()
+  assert(bad.len() == 0, "semantic v2 lane mismatches: " + bad.join("; "))
+end
+
+@test
+def test_semantic_v2_operation_id_model() -> Unit
+  match semantic_operation_id_of("callers".to_string())
+  when Option::None then
+    assert(false, "callers must resolve to a typed operation id")
+  when Option::Some(id) then
+    assert(id.dense_id == 0, "callers is registry index 0")
+    let digest = semantic_operation_digest("callers".to_string())
+    assert(id.digest_hi == digest.hi && id.digest_lo == digest.lo,
+      "the typed id must carry the operation-name digest words")
+    match semantic_operation_name_of(id.clone())
+    when Option::Some(name) then assert(name == "callers", "the id must resolve to the name")
+    when Option::None then assert(false, "a valid id must resolve")
+    end
+    # A forged digest fails closed; a dense index outside the registry too.
+    let forged = SemanticOperationId {
+      dense_id: id.dense_id,
+      digest_hi: id.digest_hi ^ 1,
+      digest_lo: id.digest_lo
+    }
+    match semantic_operation_name_of(forged)
+    when Option::None then ()
+    when Option::Some(_) then assert(false, "a forged digest must fail closed")
+    end
+    let out_of_range = SemanticOperationId { dense_id: 100000, digest_hi: 0, digest_lo: 0 }
+    match semantic_operation_name_of(out_of_range)
+    when Option::None then ()
+    when Option::Some(_) then assert(false, "an out-of-range dense id must fail closed")
+    end
+  end
+end
+
+@test
+def test_semantic_v2_contract_delimiter_round_trip() -> Unit
+  # A: the typed record itself, with "a || b" as the canonical expression
+  # (the delimiter inside the expression) and an explicit message: every
+  # field must survive the bytes exactly and stay distinct.
+  let record = ContractResponse {
+    contract_id: "m::f#fn()->unit|Pre|a || b".to_string(),
+    kind: "Pre".to_string(),
+    canonical_expression: "a || b".to_string(),
+    fingerprint: "1234-5678".to_string(),
+    message: "explicit | message".to_string()
+  }
+  let response = SemanticResponseV2 {
+    protocol_version: SEMANTIC_PROTOCOL_VERSION_V2,
+    request_id: 41,
+    payload: SemanticResponseV2Payload::Contract(record.clone())
+  }
+  let frame = semantic_response_v2_frame(response.clone())
+  match semantic_response_v2_parse(frame.clone())
+  when Option::None then
+    assert(false, "the contract v2 frame must parse")
+  when Option::Some(back) then
+    assert(semantic_response_v2_eq(response.clone(), back.clone()),
+      "the contract record must round-trip through bytes")
+    match back.payload
+    when SemanticResponseV2Payload::Contract(got) then
+      assert(got.contract_id == record.contract_id, "contract id exact")
+      assert(got.kind == record.kind, "contract kind exact")
+      assert(got.canonical_expression == "a || b",
+        "canonical expression exact: " + got.canonical_expression.clone())
+      assert(got.fingerprint == record.fingerprint, "fingerprint exact")
+      assert(got.message == record.message, "message exact")
+      assert(got.canonical_expression != got.message, "canonical and message distinct")
+      assert(got.contract_id != got.canonical_expression, "id and canonical distinct")
+      assert(got.fingerprint != got.message, "fingerprint and message distinct")
+    when _ then
+      assert(false, "the parsed frame must carry the Contract family")
+    end
+  end
+
+  # B: the fact-backed contract_list answer (P0-12): the record fields come
+  # from the ContractFact, never from splitting the canonical row text.
+  let clause_text = "binor(a || b)".to_string()
+  let session = new_compiler_session(server_contract_snapshot())
+  match semantic_operation_id_of("contract_list".to_string())
+  when Option::None then
+    assert(false, "contract_list must be registered")
+  when Option::Some(operation) then
+    let request = SemanticRequestV2 {
+      protocol_version: SEMANTIC_PROTOCOL_VERSION_V2,
+      request_id: 42,
+      payload: SemanticRequestV2Payload::Target(operation,
+        "m::f#fn()->unit".to_string(),
+        SemanticTargetId::Decl(stable_decl_of_key("m::f#fn()->unit".to_string())))
+    }
+    let dispatched = session_handle_request_v2(&session, request)
+    match dispatched.payload
+    when SemanticResponseV2Payload::Contract(fact_record) then
+      assert(fact_record.contract_id == "m::f#fn()->unit|Pre|binor(a || b)",
+        "the id must be the stable clause key: " + fact_record.contract_id.clone())
+      assert(fact_record.kind == "Pre", "the kind must come from the fact")
+      assert(fact_record.canonical_expression == "binor(a || b)",
+        "the canonical expression must come from the fact: " + fact_record.canonical_expression.clone())
+      assert(fact_record.fingerprint == semantic_digest_render(&stable_digest_of(&clause_text)),
+        "the fingerprint must be the fact's expression digest: " + fact_record.fingerprint.clone())
+      assert(fact_record.message == "explicit message | with delimiter",
+        "the message must be the fact's declared message: " + fact_record.message.clone())
+    when _ then
+      assert(false, "the contract_list answer must be the fact-built Contract record")
+    end
+  end
+end
+
+@test
+def test_semantic_v2_v1_request_still_works() -> Unit
+  let session = new_compiler_session(server_test_snapshot())
+  let frame = semantic_request_frame(server_test_request(9, "revision".to_string(), "".to_string()))
+  match session_handle_frame(&session, frame)
+  when Option::None then
+    assert(false, "a v1 frame must negotiate through the v1 path")
+  when Option::Some(response_frame) then
+    match semantic_response_parse(response_frame)
+    when Option::None then
+      assert(false, "the v1 response frame must parse with the v1 parser")
+    when Option::Some(response) then
+      assert(response.ok, "the v1 revision answer must be ok")
+      assert(response.kind == "revision", "the v1 revision kind must be preserved")
+      assert(response.protocol_version == SEMANTIC_PROTOCOL_VERSION,
+        "the v1 answer must carry protocol_version 1")
+    end
+  end
+end
+
+@test
+def test_semantic_v2_unknown_tag_fails_closed() -> Unit
+  let session = new_compiler_session(server_test_snapshot())
+  match semantic_operation_id_of("revision".to_string())
+  when Option::None then
+    assert(false, "revision must be registered")
+  when Option::Some(operation) then
+    let request = SemanticRequestV2 {
+      protocol_version: SEMANTIC_PROTOCOL_VERSION_V2,
+      request_id: 55,
+      payload: SemanticRequestV2Payload::Service(operation)
+    }
+    # Frame offset 16..20 is the tagged payload word (4-byte body length,
+    # 4-byte version word and 8-byte request id precede it).
+    var request_frame = semantic_request_v2_frame(request.clone())
+    request_frame[16] = 0xDE as u8
+    request_frame[17] = 0xAD as u8
+    request_frame[18] = 0xBE as u8
+    request_frame[19] = 0xEF as u8
+    match semantic_request_v2_parse(request_frame)
+    when Option::None then ()
+    when Option::Some(_) then assert(false, "an unknown request tag must fail closed")
+    end
+    let response = session_handle_request_v2(&session, request)
+    var response_frame = semantic_response_v2_frame(response)
+    response_frame[16] = 0xDE as u8
+    response_frame[17] = 0xAD as u8
+    response_frame[18] = 0xBE as u8
+    response_frame[19] = 0xEF as u8
+    match semantic_response_v2_parse(response_frame)
+    when Option::None then ()
+    when Option::Some(_) then assert(false, "an unknown response tag must fail closed")
+    end
   end
 end

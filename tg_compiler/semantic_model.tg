@@ -61,9 +61,9 @@
 # hashing, so byte-identical snapshots imply byte-identical tables.
 
 use std::core::{Option}
-use std::collections::{Vec}
+use std::collections::{Vec, Map}
 use tg_compiler::ids::{StableDigest, StableDefId, DefKind}
-use tg_compiler::stable_ids::{StableContractId}
+use tg_compiler::stable_ids::{StableContractId, StableUnsafeSiteId}
 use tg_compiler::ast::{AccessConvention, AstContractKind}
 use tg_compiler::token::{Span}
 use tg_compiler::types::{EffectSummary, CapabilityId}
@@ -121,6 +121,73 @@ struct StableTargetId
 end
 
 # ———————————————————————————————————————————————————————————————
+# SnapshotHeader — the compilation's identity/environment carrier
+# (fourth-audit P1-5a)
+# ———————————————————————————————————————————————————————————————
+# The snapshot's HEADER payload: what produced this artifact and under
+# which semantically relevant settings. The record is a projection of the
+# SemanticSnapshot fields below (semantic_snapshot_header) — the writer
+# renders it into the snapshot header row and the parser rebuilds it from
+# that row, so the header JOINS THE DIGEST PREIMAGE (two builds differing
+# in feature_set / semantic_options produce different revisions).
+#
+#   compiler_version — the producing compiler's version.tg VERSION text.
+#   target           — the StableTargetId record (the digest-bearing full
+#                      target identity; TargetId above stays for asm-level
+#                      consumers).
+#   feature_set      — the SEMANTICALLY RELEVANT compiler features in
+#                      effect, canonical words sorted: the enable_* flags
+#                      (contracts / capabilities / effects / budgets, as
+#                      "<word>" when enabled and "no-<word>" when
+#                      disabled), strict-resolution, coverage,
+#                      verify-everything, and one "target-feature:<f>" row
+#                      per TargetDesc.isa_features entry (sorted). Two
+#                      builds differing in a feature here produce different
+#                      revisions by construction.
+#   semantic_options — the semantically relevant CompilerOptions values in
+#                      effect, canonical "name:value" words sorted:
+#                      opt-level / codegen route / emit mode / mode word /
+#                      stop-after / pgo-use / the target triple. Cosmetic
+#                      options (color, verbosity, warning flags, JSON
+#                      diagnostics, output paths, check-only) never ride
+#                      the header.
+struct SnapshotHeader
+  compiler_version: String
+  target: StableTargetId
+  feature_set: Vec[String] = Vec::new()
+  semantic_options: Vec[String] = Vec::new()
+end
+
+# The canonical identity text of the header's feature/option carrier —
+# "features=<comma-joined>;options=<comma-joined>" — the digest preimage
+# component the per-domain features digest hashes.
+def semantic_snapshot_header_features_text(h: SnapshotHeader) -> String
+  "features=" + h.feature_set.join(",") + ";options=" + h.semantic_options.join(",")
+end
+
+# ———————————————————————————————————————————————————————————————
+# SemanticDomainDigests — the per-table content digests (P1-5c)
+# ———————————————————————————————————————————————————————————————
+# The snapshot's per-DOMAIN digest record: one 128-bit stable digest per
+# semantically independent table family, persisted in the snapshot header.
+# public_api / abi / unsafe_ mirror the three surface hashes (their
+# authoritative computed values; kept here so one header record carries
+# the whole digest set); concrete_types / drop_plans / allocation_sites /
+# features digest each new table's canonical sorted row text (the
+# features digest covers feature_set + semantic_options). The writer's
+# finalizer recomputes the record before the revision digest, so a table
+# edit moves both its domain digest and the revision.
+struct SemanticDomainDigests
+  public_api: StableDigest = semantic_digest_zero()
+  abi: StableDigest = semantic_digest_zero()
+  unsafe_: StableDigest = semantic_digest_zero()
+  concrete_types: StableDigest = semantic_digest_zero()
+  drop_plans: StableDigest = semantic_digest_zero()
+  allocation_sites: StableDigest = semantic_digest_zero()
+  features: StableDigest = semantic_digest_zero()
+end
+
+# ———————————————————————————————————————————————————————————————
 # SemanticSnapshot — the §29 top-level protocol record
 # ———————————————————————————————————————————————————————————————
 # One snapshot models one compilation's semantics: the per-definition
@@ -137,6 +204,28 @@ end
 #   target          — the compilation target (the StableTargetId record —
 #                     the digest-bearing full target identity; TargetId
 #                     above stays for the asm-level consumers).
+#   feature_set / semantic_options — the P1-5 header payload (see
+#                     SnapshotHeader): the semantically relevant features
+#                     and options in effect; both ride the header row and
+#                     the digest preimage.
+#   fields / variants / callable_signatures / trait_methods — the P1-3
+#                     TYPED table family (see the records below): the
+#                     declared struct fields, enum variants (with payload
+#                     shapes), function/method signatures (typed params +
+#                     conventions + return + declared effects) and trait
+#                     methods, emitted from TYPED finalized state — never
+#                     parsed back out of a canonical key render. The
+#                     evolution planners consume these tables by typed
+#                     membership.
+#   concrete_types  — the P1-5b concrete type-instance table: one row per
+#                     concrete Type::Adt(tid, args) instance the canonical
+#                     instance sources reach, with the template declaration,
+#                     canonical args and layout summary.
+#   allocation_sites — the P1-5c allocation-site table: one row per
+#                     allocating MIR statement/terminator with its §33 node
+#                     site key and the budget classification's size kind.
+#   domain_digests  — the per-domain digest record (P1-5c; see
+#                     SemanticDomainDigests), persisted in the header row.
 #   symbols         — declared definitions (the DefKind vocabulary).
 #   types           — nominal type declarations (struct/enum/trait).
 #   calls           — caller -> callee call edges.
@@ -184,7 +273,15 @@ end
 #                     and the extended affected closure walks. Defaulted
 #                     empty (a compilation with no rows for a family stays
 #                     representable); the writer sorts every family and
-#                     emits the rows into the digest preimage.
+#                     emits the rows into the digest preimage. The graph
+#                     ALSO carries dependency_completeness — the
+#                     per-family producer-status table (fourth-audit
+#                     P0-9): one entry per RELATION FAMILY naming whether
+#                     the producer's data source covered the family
+#                     ("complete" = rows-or-known-empty, "partial" =
+#                     documented residual gaps, "unavailable" = the data
+#                     source was not reachable); the closure NEVER
+#                     substitutes call edges for an unavailable family.
 #   public_api_hash — digest of the public-API surface (writer-computed).
 #   abi_hash        — digest of the public ABI surface (writer-computed).
 #   unsafe_hash     — digest of the unsafe surface (writer-computed).
@@ -197,6 +294,12 @@ struct SemanticSnapshot
   revision: StableDigest
   compiler_version: String
   target: StableTargetId
+  # (fourth-audit P1-5a) The semantically relevant compiler features and
+  # options in effect (the SnapshotHeader carrier): sorted canonical words,
+  # rendered into the header row and digested with it (two builds differing
+  # in a feature produce different revisions).
+  feature_set: Vec[String] = Vec::new()
+  semantic_options: Vec[String] = Vec::new()
   symbols: Vec[SemanticSymbol] = Vec::new()
   types: Vec[SemanticType] = Vec::new()
   calls: Vec[CallEdge] = Vec::new()
@@ -210,6 +313,31 @@ struct SemanticSnapshot
   mir_functions: Vec[MirSemanticSummary] = Vec::new()
   unsafe_facts: Vec[UnsafeFact] = Vec::new()
   abi_surfaces: Vec[AbiSurfaceRow] = Vec::new()
+  # (fourth-audit P1-3) The TYPED member/signature tables: declared struct
+  # fields, enum variants (with payload shapes), callable signatures
+  # (typed params + conventions + return + declared effects) and trait
+  # methods. Populated at snapshot build from TYPED finalized state; the
+  # evolution planners consume them by typed membership — no
+  # struct{...}/enum{...}/signature render is parsed.
+  fields: Vec[SemanticField] = Vec::new()
+  variants: Vec[SemanticVariant] = Vec::new()
+  callable_signatures: Vec[SemanticCallableSignature] = Vec::new()
+  trait_methods: Vec[SemanticTraitMethod] = Vec::new()
+  # (fourth-audit P1-5b) One row per concrete type instance reachable from
+  # the canonical instance sources (defaulted empty so every pre-P1-5
+  # constructor stays valid).
+  concrete_types: Vec[SemanticConcreteType] = Vec::new()
+  # (fourth-audit P1-5c) One row per allocating MIR statement/terminator.
+  allocation_sites: Vec[SemanticAllocationSite] = Vec::new()
+  # (fourth-audit P0-17) The PERSISTED typed drop-plan facts: one row per
+  # materialized deinit site of the resource checker's finalize plan (the
+  # exact-place masked drops included), keyed by the stable place/drop-site
+  # texts. Defaulted empty so every pre-P0-17 snapshot constructor stays
+  # valid and an absent table parses as no recorded drop plan; the writer
+  # sorts through semantic_drop_plans_sort and emits the rows into the
+  # digest preimage; the §31 delta diffs the table into typed
+  # DropPlanDelta rows.
+  drop_plans: Vec[DropPlanFact] = Vec::new()
   # The PERSISTED typed dependency graph (third-audit item 18): the
   # per-family edge rows the builder emits from TYPED finalized state
   # (never from rendered canonical strings) and the extended affected
@@ -217,9 +345,24 @@ struct SemanticSnapshot
   # semantic_dependency_graph_sort and emits the rows into the digest
   # preimage.
   dependencies: SemanticDependencyGraph = SemanticDependencyGraph {}
+  # (fourth-audit P1-5c) The per-domain digest record (persisted in the
+  # header row; recomputed by semantic_snapshot_finalize before the
+  # revision digest).
+  domain_digests: SemanticDomainDigests = SemanticDomainDigests {}
   public_api_hash: StableDigest
   abi_hash: StableDigest
   unsafe_hash: StableDigest
+end
+
+# The projected header of a snapshot (the writer/parser carrier — see
+# SnapshotHeader above).
+def semantic_snapshot_header(snapshot: SemanticSnapshot) -> SnapshotHeader
+  SnapshotHeader {
+    compiler_version: snapshot.compiler_version.clone(),
+    target: snapshot.target.clone(),
+    feature_set: snapshot.feature_set.clone(),
+    semantic_options: snapshot.semantic_options.clone()
+  }
 end
 
 # The zero digest — the "not yet computed" placeholder for revision and the
@@ -337,14 +480,14 @@ end
 #                 "|"-joined renders of classify_enum_crossing over every
 #                 enum parameter/return, "n/a" when the signature mentions
 #                 no enum, "fail-closed:<word>" when the authority refuses.
-#                 This is the CANONICAL crossing (the direct pipeline's
-#                 TaggedPtr value word). The LIR route is a separate
-#                 whole-program compilation whose payloaded-enum crossing
-#                 is versioned internally (`inline-image-v1`): it carries
-#                 the version on its own artifacts (the per-function
-#                 marker and the `tg.abi.enumver` object note — see
-#                 lir.tg's versioned-enum-ABI section), never on this
-#                 route-independent row.
+#                 This is the ONE crossing BOTH routes use (fourth-audit
+#                 P0-20): the canonical TaggedPtr value word for a
+#                 registered enum (the LIR route constructs/reads/moves/
+#                 drops that same word and consumes the same call plan),
+#                 InlineScalar for the legacy one-word InlineTagged image.
+#                 The former LIR-private `inline-image-v1` representation,
+#                 its per-function version marker and the
+#                 `tg.abi.enumver` object note were deleted.
 struct AbiSurfaceRow
   surface_id: String
   symbol_key: String
@@ -752,6 +895,13 @@ struct UnsafeFact
   site: String
   digest_hi: UInt = 0
   digest_lo: UInt = 0
+  # (fourth-audit P0-19) The TYPED unsafe-site identity of the row: the
+  # owning declaration's StableDeclId, the kind word and the site text —
+  # the member the §36 ChangeBudget's typed allowed_unsafe set keys on
+  # (the budget never re-parses a rendered marker row). Defaulted None so
+  # every pre-P0-19 literal site stays valid; the snapshot builder
+  # populates it through stable_unsafe_site_id_of at fact construction.
+  site_id: Option[StableUnsafeSiteId] = Option::None
 end
 
 impl Eq for UnsafeFact
@@ -783,6 +933,39 @@ end
 struct UnsafeDelta
   created: Vec[UnsafeFact] = Vec::new()
   removed: Vec[UnsafeFact] = Vec::new()
+end
+
+# (fourth-audit P0-17) ONE TYPED drop-plan fact: a materialized deinit site
+# of one function's ownership cleanup, keyed by the stable place text and
+# the drop-site identity. The row is the PERSISTED form of the resource
+# checker's path-sensitive finalize plan (the cleanup edges' Drop actions
+# and the exact-place masked drops) as the MIR materializes them:
+#   function         — the owning function's stable key text (the same
+#                      emission key the mir_functions/ownership rows carry).
+#   place            — the canonical place key the value is destroyed at
+#                      (the snapshot_place_key grammar — "x", "self.field").
+#   drop_site        — the deinit site's stable text: the CFG edge's
+#                      structural identity "<function>|<edge-kind>|B<source>"
+#                      (the resource checker's CfgEdgeKind word + the
+#                      originating node id).
+#   conditional_paths — the path conditions the drop executes under: the
+#                      edge's branch word ("branch:true" / "branch:false" /
+#                      "loop-backedge" / ...) plus any consumed-extension
+#                      MASK rows of an exact-place partial drop ("mask:<path>").
+#                      Empty = the drop runs on every path through the site.
+#   kind             — the drop kind word: "fn-end" | "scope-exit" |
+#                      "branch-cleanup" | "loop-exit" | "iteration" |
+#                      "guard-else" | "assign-replace", derived from the
+#                      cleanup edge kind (the resource checker's own
+#                      classification), never invented.
+# The table is sorted through semantic_drop_plans_sort and the §31 delta
+# diffs it per (function, place) into typed DropPlanDelta rows.
+struct DropPlanFact
+  function: String
+  place: String
+  drop_site: String
+  conditional_paths: Vec[String] = Vec::new()
+  kind: String
 end
 
 # The canonical kind WORD of an UnsafeKind (the snapshot/unsafe_text
@@ -844,8 +1027,10 @@ end
 # data source and coverage status live in that function's doc matrix; the
 # classes the snapshot's typed dependency graph carries rows for
 # (snapshot.dependencies — the third-audit item 18 records below) are
-# walked over those REAL edges. A class whose family has no rows at all
-# still falls back to the caller closure (documented at the closure).
+# walked over those REAL edges. A class whose family is UNAVAILABLE is
+# reported by the closure (AffectedResult.missing_relations) and is NEVER
+# substituted by the caller closure (fourth-audit P0-9 — the status table
+# is SemanticDependencyGraph.dependency_completeness).
 #
 # Declaration order is the canonical kind order (the numeric flattening
 # below is the closure's deterministic kind selector). TypeUse is APPENDED
@@ -989,6 +1174,30 @@ end
 # above, all defaulted empty so an edge family a compilation produces no
 # rows for stays representable (and pre-graph serialized snapshots stay
 # loadable under the defaulted field).
+#
+# dependency_completeness (fourth-audit P0-9) is the graph's PER-FAMILY
+# producer-status table: family name -> status word. It is what lets the
+# affected closure distinguish "this family has no dependents" (the
+# producer POPULATED it and the rows are legitimately empty) from "this
+# family's dependents are UNKNOWN" (the producer lacked the data source).
+# The status vocabulary:
+#   "complete"    — the producer's data source covered the family: rows
+#                   may be empty because the program really has no
+#                   dependency of this family (Complete-no-dependents).
+#   "partial"     — rows were produced where the typed data was reachable
+#                   but the producer documents residual gaps (e.g. the
+#                   const-eval type-level folds, the trait-selection
+#                   resolution gaps); the rows that exist are real, the
+#                   absence of a row is not proof of no dependency.
+#   "unavailable" — the producer had no data source for the family; an
+#                   empty family carries NO information.
+# Family names are the closure's relation-family words (Call / TypeUse /
+# TraitImpl / TraitSelection / GenericInstantiation / LayoutDependency /
+# ConstEvalDependency / DerivedBody / ContractReference / AbiDependency /
+# TestReferences); see semantic_snapshot.tg's producer section for the
+# per-family status anchors and semantic_delta.tg's affected_closure for
+# the consumer rule. A family with NO entry fails closed as unavailable
+# (except Call / TestReferences, whose row tables predate the table).
 struct SemanticDependencyGraph
   type_uses: Vec[TypeUseEdge] = Vec::new()
   trait_impls: Vec[TraitImplEdge] = Vec::new()
@@ -999,6 +1208,7 @@ struct SemanticDependencyGraph
   derived_bodies: Vec[DerivedBodyEdge] = Vec::new()
   contract_references: Vec[ContractReferenceEdge] = Vec::new()
   abi_dependencies: Vec[AbiDependencyEdge] = Vec::new()
+  dependency_completeness: Map[String, String] = Map::new()
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -1468,6 +1678,324 @@ end
 def semantic_unsafe_facts_sort(inout unsafe_facts: Vec[UnsafeFact]) -> Unit
   unsafe_facts.sort_by(|a, b| semantic_unsafe_fact_lt(a, b))
 end
+
+# (fourth-audit P0-17) DropPlanFact order: the function key, the place
+# text, the drop-site text, the kind word, then the conditional paths —
+# the total order over the row (identical field tuples are the same row
+# and end in false), so the writer's render is byte-deterministic whatever
+# the producer's emission order.
+def semantic_drop_plan_fact_lt(a: DropPlanFact, b: DropPlanFact) -> Bool
+  if a.function != b.function then
+    a.function < b.function
+  elsif a.place != b.place then
+    a.place < b.place
+  elsif a.drop_site != b.drop_site then
+    a.drop_site < b.drop_site
+  elsif a.kind != b.kind then
+    a.kind < b.kind
+  else
+    a.conditional_paths.join(",") < b.conditional_paths.join(",")
+  end
+end
+
+def semantic_drop_plans_sort(inout drop_plans: Vec[DropPlanFact]) -> Unit
+  drop_plans.sort_by(|a, b| semantic_drop_plan_fact_lt(a, b))
+end
+
+# The (function, place) key of a drop-plan fact — the §31 diff's row key
+# (the typed identity the DropPlanDelta rows carry).
+def semantic_drop_plan_fact_key(f: DropPlanFact) -> String
+  f.function.clone() + "|" + f.place.clone()
+end
+
+# Whether two facts describe the SAME site record (site + conditions +
+# kind; the function/place key is compared separately by the diff). Used
+# by the snapshot round-trip and the delta's per-place site-set compare.
+def semantic_drop_plan_fact_sites_equal(a: DropPlanFact, b: DropPlanFact) -> Bool
+  a.drop_site == b.drop_site && a.kind == b.kind &&
+    a.conditional_paths.join(",") == b.conditional_paths.join(",")
+end
+
+# The canonical text of one drop-plan fact — the per-domain digest row
+# grammar: "<function>|<place>|<site>|<kind>|<paths>".
+def semantic_drop_plan_fact_text(f: DropPlanFact) -> String
+  f.function.clone() + "|" + f.place.clone() + "|" + f.drop_site.clone() +
+    "|" + f.kind.clone() + "|" + f.conditional_paths.join(",")
+end
+
+# ———————————————————————————————————————————————————————————————
+# The TYPED member/signature tables (fourth-audit P1-3)
+# ———————————————————————————————————————————————————————————————
+# The snapshot's typed projection of the program's declared MEMBERS and
+# SIGNATURES. Every record below is emitted at snapshot build from TYPED
+# finalized state (env.type_list fields/variants/methods, the checker's
+# typed FnSignature records) — a consumer decides by typed membership,
+# never by parsing a "struct{...}"/"enum{...}"/"fn(...)" render out of a
+# canonical key. The owner fields are the owning declaration's StableDefId
+# (the row identity domain of the symbols/types tables); member_id is the
+# member-lineage identity text of the durable member-lineage domain
+# (stable_ids.tg stable_member_synthetic_lineage +
+# stable_member_lineage_identity_text — the documented name-derived
+# fallback until the store-backed member stamping is threaded here).
+#
+# SemanticParam — one parameter/payload-position shape: the convention
+#                 (the ast.tg AccessConvention vocabulary), the canonical
+#                 typed type text and the declared name ("" where the
+#                 typed source carries none, e.g. FnSignature.params).
+struct SemanticParam
+  convention: AccessConvention = AccessConvention::Let
+  ty: String
+  name: String = ""
+end
+
+# SemanticField — one declared STRUCT field.
+struct SemanticField
+  owner: StableDefId       # the owning nominal type declaration
+  name: String             # declared name, verbatim (delimiters are content)
+  index: Int               # declaration position — a snapshot locator
+  ty: String               # canonical typed field-type text
+  member_id: String = ""   # member-lineage identity text
+  is_pub: Bool = false
+end
+
+# SemanticVariant — one ENUM variant with its payload shape (positional
+# SemanticParam rows; the convention is Let — enum payloads are moved).
+struct SemanticVariant
+  owner: StableDefId
+  name: String
+  index: Int               # declaration position — the discriminant order
+  payload: Vec[SemanticParam] = Vec::new()
+  member_id: String = ""
+end
+
+# SemanticCallableSignature — one function/method's typed signature:
+# params (typed conventions), the canonical return type text, the declared
+# effect-id texts (sorted; the "effects(...)" suffix's typed content) and
+# the C-variadic marker. The row is the signature plan's source of truth.
+struct SemanticCallableSignature
+  function: StableDefId
+  params: Vec[SemanticParam] = Vec::new()
+  ret_type: String = ""
+  declared_effects: Vec[String] = Vec::new()
+  variadic: Bool = false
+end
+
+# SemanticTraitMethod — one declared trait method: name, declaration
+# position, typed params/return and the member-lineage identity text.
+struct SemanticTraitMethod
+  owner: StableDefId       # the trait declaration
+  name: String
+  index: Int
+  params: Vec[SemanticParam] = Vec::new()
+  ret_type: String = ""
+  member_id: String = ""
+end
+
+# ———————————————————————————————————————————————————————————————
+# SemanticConcreteType — one concrete type instance (fourth-audit P1-5b)
+# ———————————————————————————————————————————————————————————————
+# One Type::Adt(tid, args) instance the canonical instance sources reach.
+#   instance_key  — the canonical concrete-instance identity text: the
+#                   template's full stable key + "<" + the canonical arg
+#                   texts (comma-joined) + ">" (deterministic and stable;
+#                   never a per-compilation TypeId).
+#   template      — the template type declaration's full stable key.
+#   args          — the canonical arg texts in declared order.
+#   size/alignment — the layout summary from layout_of_concrete (-1 when
+#                   the layout was unavailable; never a guess).
+#   fields        — the layout's "name offset size" field rows (empty on
+#                   failure).
+#   layout_status — "ok" | "layout-fail:<class-word>" | "unavailable"
+#                   (the documented reachability boundary).
+struct SemanticConcreteType
+  instance_key: String
+  template: String
+  args: Vec[String] = Vec::new()
+  size: Int = -1
+  alignment: Int = -1
+  fields: Vec[String] = Vec::new()
+  layout_status: String = "unavailable"
+end
+
+# ———————————————————————————————————————————————————————————————
+# SemanticAllocationSite — one allocating MIR node (fourth-audit P1-5c)
+# ———————————————————————————————————————————————————————————————
+# size_kind is the budget classification's size vocabulary:
+#   Exact      — a statically known byte count (size carries it)
+#   UpperBound — the documented conservative per-site cap (size carries it)
+#   Unbounded  — a runtime-sized allocation (string concat / effect perform;
+#                size is -1 — the size is not computable from the row)
+#   Unknown    — the site's behavior is fail-closed unknown (size is -1)
+enum SemanticAllocationSizeKind
+  Exact
+  UpperBound
+  Unbounded
+  Unknown
+end
+
+#   function — the owning lowered body's mir row key text (the SAME text
+#              the mir_functions/allocation-origin rows carry).
+#   site     — the §33 node key of the allocating node: a STATEMENT site
+#              "<fn key>#B<block>#S<idx>" or a TERMINATOR site
+#              "<fn key>#B<block>#T" (the stable_ids StableAllocationSiteId
+#              stable_key grammar).
+struct SemanticAllocationSite
+  function: String
+  site: String
+  size_kind: SemanticAllocationSizeKind
+  size: Int = -1
+end
+
+# The canonical word of an allocation size kind.
+def semantic_allocation_size_kind_text(k: SemanticAllocationSizeKind) -> String
+  match k
+  when SemanticAllocationSizeKind::Exact then "Exact"
+  when SemanticAllocationSizeKind::UpperBound then "UpperBound"
+  when SemanticAllocationSizeKind::Unbounded then "Unbounded"
+  when SemanticAllocationSizeKind::Unknown then "Unknown"
+  end
+end
+
+def semantic_allocation_size_kind_numeric(k: SemanticAllocationSizeKind) -> Int
+  match k
+  when SemanticAllocationSizeKind::Exact then 0
+  when SemanticAllocationSizeKind::UpperBound then 1
+  when SemanticAllocationSizeKind::Unbounded then 2
+  when SemanticAllocationSizeKind::Unknown then 3
+  end
+end
+
+# The canonical "conv:ty" render of a typed parameter — the output
+# projection the plans and deltas carry (decisions are typed membership;
+# this render is report text only).
+def semantic_param_text(p: SemanticParam) -> String
+  match p.convention
+  when AccessConvention::Let then "let:" + p.ty.clone()
+  when AccessConvention::Inout then "inout:" + p.ty.clone()
+  when AccessConvention::Sink then "sink:" + p.ty.clone()
+  when AccessConvention::Set then "set:" + p.ty.clone()
+  end
+end
+
+def semantic_params_text(params: Vec[SemanticParam]) -> Vec[String]
+  var out: Vec[String] = Vec::new()
+  for p in params do
+    out.push(semantic_param_text(&p))
+  end
+  out
+end
+
+# The canonical payload-shape text of a variant (the typed payload fields'
+# name/type rows joined deterministically) — the modified-variant signal.
+def semantic_variant_payload_text(v: SemanticVariant) -> String
+  var parts: Vec[String] = Vec::new()
+  for p in v.payload do
+    parts.push(p.name.clone() + ":" + p.ty.clone())
+  end
+  parts.join(",")
+end
+
+# ————— the table orders (stable-digest order, then canonical tiebreaks) —————
+
+def semantic_field_lt(a: SemanticField, b: SemanticField) -> Bool
+  if semantic_stable_def_id_lt(&a.owner, &b.owner) then
+    true
+  elsif semantic_stable_def_id_lt(&b.owner, &a.owner) then
+    false
+  elsif a.index != b.index then
+    a.index < b.index
+  else
+    a.name < b.name
+  end
+end
+
+def semantic_fields_sort(inout fields: Vec[SemanticField]) -> Unit
+  fields.sort_by(|a, b| semantic_field_lt(a, b))
+end
+
+def semantic_variant_lt(a: SemanticVariant, b: SemanticVariant) -> Bool
+  if semantic_stable_def_id_lt(&a.owner, &b.owner) then
+    true
+  elsif semantic_stable_def_id_lt(&b.owner, &a.owner) then
+    false
+  elsif a.index != b.index then
+    a.index < b.index
+  else
+    a.name < b.name
+  end
+end
+
+def semantic_variants_sort(inout variants: Vec[SemanticVariant]) -> Unit
+  variants.sort_by(|a, b| semantic_variant_lt(a, b))
+end
+
+def semantic_callable_signature_lt(a: SemanticCallableSignature, b: SemanticCallableSignature) -> Bool
+  semantic_stable_def_id_lt(&a.function, &b.function)
+end
+
+def semantic_callable_signatures_sort(inout signatures: Vec[SemanticCallableSignature]) -> Unit
+  signatures.sort_by(|a, b| semantic_callable_signature_lt(a, b))
+end
+
+def semantic_trait_method_lt(a: SemanticTraitMethod, b: SemanticTraitMethod) -> Bool
+  if semantic_stable_def_id_lt(&a.owner, &b.owner) then
+    true
+  elsif semantic_stable_def_id_lt(&b.owner, &a.owner) then
+    false
+  elsif a.index != b.index then
+    a.index < b.index
+  else
+    a.name < b.name
+  end
+end
+
+def semantic_trait_methods_sort(inout methods: Vec[SemanticTraitMethod]) -> Unit
+  methods.sort_by(|a, b| semantic_trait_method_lt(a, b))
+end
+
+def semantic_concrete_type_lt(a: SemanticConcreteType, b: SemanticConcreteType) -> Bool
+  if a.instance_key != b.instance_key then
+    a.instance_key < b.instance_key
+  else
+    a.template < b.template
+  end
+end
+
+def semantic_concrete_types_sort(inout types: Vec[SemanticConcreteType]) -> Unit
+  types.sort_by(|a, b| semantic_concrete_type_lt(a, b))
+end
+
+def semantic_allocation_site_lt(a: SemanticAllocationSite, b: SemanticAllocationSite) -> Bool
+  if a.function != b.function then
+    a.function < b.function
+  elsif a.site != b.site then
+    a.site < b.site
+  elsif semantic_allocation_size_kind_numeric(&a.size_kind) != semantic_allocation_size_kind_numeric(&b.size_kind) then
+    semantic_allocation_size_kind_numeric(&a.size_kind) < semantic_allocation_size_kind_numeric(&b.size_kind)
+  else
+    a.size < b.size
+  end
+end
+
+def semantic_allocation_sites_sort(inout sites: Vec[SemanticAllocationSite]) -> Unit
+  sites.sort_by(|a, b| semantic_allocation_site_lt(a, b))
+end
+
+# The canonical text of one allocation site — the per-domain digest row
+# grammar: "<function>|<site>|<kind-word>|<size>".
+def semantic_allocation_site_text(s: SemanticAllocationSite) -> String
+  s.function.clone() + "|" + s.site.clone() + "|" +
+    semantic_allocation_size_kind_text(&s.size_kind) + "|" + s.size.to_string()
+end
+
+# The canonical text of one concrete-type row — the per-domain digest row
+# grammar: "<instance-key>|<template>|<args>|<size>|<align>|<status>|<fields>".
+def semantic_concrete_type_text(c: SemanticConcreteType) -> String
+  c.instance_key.clone() + "|" + c.template.clone() + "|" +
+    c.args.join(",") + "|" + c.size.to_string() + "|" + c.alignment.to_string() +
+    "|" + c.layout_status.clone() + "|" + c.fields.join(";")
+end
+
 
 # AbiSurfaceRow order: the surface id (the delta join key — unique per row
 # by construction), then the kind word, then the symbol key text (the

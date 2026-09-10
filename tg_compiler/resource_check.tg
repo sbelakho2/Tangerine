@@ -378,7 +378,16 @@ end
 pub struct TypedCFG
   edges: Vec[CfgEdge]
   blocks: Vec[CfgBlock]
-  cleanup: Vec[CleanupEdge]
+  cleanup: Vec<CleanupEdge>
+  # (fourth-audit P0-17) The owner key of EVERY edge, parallel to `edges`:
+  # build_typed_cfg records the owning callable's owner key over each
+  # callable's contiguous edge range while it walks (the SAME owner-key
+  # derivation check_item uses — fn_owner_key_of_item for free functions /
+  # item_owner_key for methods / the trait-method key). The drop-plan fact
+  # emitter resolves an edge's function through THIS vector; defaulted
+  # empty so every pre-P0-17 TypedCFG literal stays valid (an absent owner
+  # means no fact for the edge, never a fabricated function).
+  edge_owners: Vec[String] = Vec::new()
 end
 
 # CLEANUP-EDGE ARCHITECTURE: the finalize_plan edge string keys
@@ -402,6 +411,35 @@ end
 # The CFG is built BEFORE the resource state runs (build_typed_cfg,
 # the structural pass over the whole program); the state computation walks
 # the blocks and attaches the cleanup actions to the pre-built edges.
+# (fourth-audit P0-17) ONE emitted drop-plan fact of the resource checker's
+# finalize plan: the function's stable owner key, the destroyed place's
+# binding text (the snapshot's place grammar root — projections ride the
+# mask rows), the drop site's structural identity and the path conditions.
+# The record is the KERNEL-side mirror of semantic_model.tg's DropPlanFact
+# (the snapshot builder maps it; the kernel closure cannot import
+# semantic_model). Emitted by resource_drop_plan_facts from the REAL
+# CleanupEdge table + the exact-place mask registry — never inferred from a
+# convention word.
+pub struct ResourceDropPlanFact
+  # The owning function's owner key (the same key binding_name resolves
+  # against — the function emission key the snapshot rows carry).
+  function: String
+  # The canonical place binding text the drop destroys ("x", "self", ...;
+  # "l<ordinal>" for an unnamed slot).
+  place: String
+  # The drop site's structural identity: "<function>|<edge-kind>|B<source>"
+  # (the CfgEdgeKind word + the originating node id).
+  drop_site: String
+  # The path conditions: the edge-kind branch word ("branch:true" /
+  # "branch:false" / "loop-backedge" / ...) plus the exact-place consumed
+  # extension mask rows ("mask:<path>") of a partially-moved root.
+  conditional_paths: Vec[String] = Vec::new()
+  # The drop kind word ("fn-end" | "scope-exit" | "branch-cleanup" |
+  # "loop-exit" | "iteration" | "guard-else"), derived from the cleanup
+  # edge kind.
+  kind: String
+end
+
 # Result of resource checking: the diagnostics plus the authoritative
 # per-function finalize plan (fn owner key -> local ids that must be
 # finalized at function end because they are live with Sink/OwnedLocal
@@ -417,6 +455,11 @@ struct ResourceCheckResult
   # end of the run from the edges' actions). The MIR consumes THIS table at
   # every cleanup-lookup site — the String-keyed serializations are is not part of the model.
   cfg: TypedCFG
+  # (fourth-audit P0-17) The emitted typed drop-plan facts: one row per
+  # CleanupEdge Drop action (function-resolved through the analysis
+  # context's edge->owner map) with the exact-place mask rows. The snapshot
+  # builder persists them; the §31 delta diffs them.
+  drop_plan_facts: Vec[ResourceDropPlanFact] = Vec::new()
  # the TYPED iteration plans, keyed by the for-statement's node id
   # (the same node id the MIR's loop_id uses). Produced in check_for;
   # consumed by the MIR (lower_for) for the projected-vs-consuming decision
@@ -620,6 +663,11 @@ pub struct AnalyzedProgram
   engine_snapshot: TypeEnv
   access_errors: Vec[AccessError]
   resource_errors: Vec[ResourceError]
+  # (fourth-audit P0-17) The typed drop-plan facts the resource checker
+  # emitted (resource_check's drop_plan_facts) — carried so the snapshot
+  # builder persists them without re-running the checker. Defaulted empty
+  # so the placeholder literals (types.tg) stay legal.
+  drop_plan_facts: Vec[ResourceDropPlanFact] = Vec::new()
 end
 
 # the checker-side iteration-plan accumulator is AnalysisContext
@@ -866,6 +914,142 @@ def access_registry_has(ctx: AnalysisContext, aid: AccessId) -> Bool
   found
 end
 
+# (fourth-audit P0-17) The structural edge word of a CfgEdgeKind (the
+# drop-site identity component — never a rendered source span).
+def resource_drop_edge_word(kind: CfgEdgeKind) -> String
+  match kind
+  when CfgEdgeKind::Normal then "normal"
+  when CfgEdgeKind::True then "true"
+  when CfgEdgeKind::False then "false"
+  when CfgEdgeKind::Break then "break"
+  when CfgEdgeKind::Continue then "continue"
+  when CfgEdgeKind::Return then "return"
+  when CfgEdgeKind::Backedge then "backedge"
+  when CfgEdgeKind::GuardElse then "guard-else"
+  end
+end
+
+# (fourth-audit P0-17) The path conditions an edge's cleanup executes
+# under: the edge-kind branch word (empty for an unconditional Normal
+# fallthrough). The exact-place consumed-extension MASK rows are appended
+# per place by resource_drop_plan_facts.
+def resource_drop_path_conditions(kind: CfgEdgeKind) -> Vec[String]
+  var out: Vec[String] = Vec::new()
+  match kind
+  when CfgEdgeKind::True then out.push("branch:true")
+  when CfgEdgeKind::False then out.push("branch:false")
+  when CfgEdgeKind::Break then out.push("break")
+  when CfgEdgeKind::Continue then out.push("continue")
+  when CfgEdgeKind::Return then out.push("return")
+  when CfgEdgeKind::Backedge then out.push("loop-backedge")
+  when CfgEdgeKind::GuardElse then out.push("guard-else")
+  when CfgEdgeKind::Normal then ()
+  end
+  out
+end
+
+# (fourth-audit P0-17) The drop KIND word of an edge's cleanup — the
+# resource checker's own edge classification (the same word the persisted
+# DropPlanFact rows carry; never invented).
+def resource_drop_kind_word(kind: CfgEdgeKind) -> String
+  match kind
+  when CfgEdgeKind::Normal then "scope-exit"
+  when CfgEdgeKind::True then "branch-cleanup"
+  when CfgEdgeKind::False then "branch-cleanup"
+  when CfgEdgeKind::Break then "loop-exit"
+  when CfgEdgeKind::Continue then "loop-exit"
+  when CfgEdgeKind::Return then "fn-end"
+  when CfgEdgeKind::Backedge then "iteration"
+  when CfgEdgeKind::GuardElse then "guard-else"
+  end
+end
+
+# (fourth-audit P0-17) THE drop-plan fact emitter: one fact per Drop action
+# of every cleanup edge, resolved to its owning function through the
+# TypedCFG's parallel owner vector (build_typed_cfg recorded each callable's
+# owner key over its contiguous edge range). The facts are the TYPED record
+# of the resource checker's REAL path-sensitive plan (the CleanupEdge table
+# the MIR consumes), never a reconstruction from rendered rows:
+#   - place  = the destroyed root's binding text (the "l<id>" locator
+#              fallback keeps an unnamed slot addressable);
+#   - drop_site = the edge's structural identity;
+#   - conditional_paths = the edge-kind branch word + one "mask:<path>" row
+#              per Consumed extension of an exact-place partial drop
+#              (typed.place_move_states, the same registry the MIR's
+#              partial-drop chain consumes), sorted for determinism;
+#   - kind   = the edge-kind cleanup word.
+# Edges with no owner (a synthesized region / item-level expression) emit
+# nothing: the fact's function key would be unknowable, and an empty key is
+# never a stable identity.
+pub def resource_drop_plan_facts(typed: TypedProgram, edges: Vec[CfgEdge], edge_owners: Vec[String]) -> Vec[ResourceDropPlanFact]
+  var out: Vec[ResourceDropPlanFact] = Vec::new()
+  var i = 0
+  while i < edges.len() do
+    let e = edges[i]
+    var fn_key = "".to_string()
+    if i < edge_owners.len() then
+      fn_key = edge_owners[i].clone()
+    end
+    if fn_key.len() > 0 then
+      let base_paths = resource_drop_path_conditions(e.kind)
+      for action in e.actions do
+        match action
+        when CleanupAction::Drop(lid) then
+          var place = binding_name(typed, lid.id)
+          if place.len() == 0 then
+            place = "l" + lid.id.to_string()
+          end
+          var cp = base_paths.clone()
+          match typed.place_move_states.get(lid.id)
+          when Option::Some(moves) then
+            for (path, state) in moves do
+              match state
+              when PlaceMoveState::Consumed then
+                let mask_row = "mask:" + path.clone()
+                if !cp.contains(&mask_row) then
+                  cp.push(mask_row)
+                end
+              when PlaceMoveState::Live then ()
+              end
+            end
+          when Option::None then ()
+          end
+          cp.sort_by(|a, b| a < b)
+          out.push(ResourceDropPlanFact {
+            function: fn_key.clone(),
+            place: place,
+            drop_site: fn_key.clone() + "|" + resource_drop_edge_word(e.kind) + "|B" + e.source.to_string(),
+            conditional_paths: cp,
+            kind: resource_drop_kind_word(e.kind)
+          })
+        when CleanupAction::RunDefer(_) then ()
+        when CleanupAction::EndAccess(_) then ()
+        end
+      end
+    end
+    i = i + 1
+  end
+  out
+end
+
+# (fourth-audit P0-17) The canonical fact order of the emitter: function,
+# place, drop site, kind, then the joined conditions. A total order over
+# the row (identical tuples compare false), so the snapshot writer's
+# render is byte-deterministic whatever the emission order.
+def resource_drop_plan_fact_lt(a: ResourceDropPlanFact, b: ResourceDropPlanFact) -> Bool
+  if a.function != b.function then
+    a.function < b.function
+  elsif a.place != b.place then
+    a.place < b.place
+  elsif a.drop_site != b.drop_site then
+    a.drop_site < b.drop_site
+  elsif a.kind != b.kind then
+    a.kind < b.kind
+  else
+    a.conditional_paths.join(",") < b.conditional_paths.join(",")
+  end
+end
+
 pub def resource_check(program: Program, typed: TypedProgram, cfg_in: TypedCFG, inout ctx: AnalysisContext, inout env_snapshot: TypeEnv) -> ResourceCheckResult
  # the accumulators (iteration plans, typed iterations, block
   # frames, slice views, the access registry) live in the AnalysisContext —
@@ -920,13 +1104,18 @@ pub def resource_check(program: Program, typed: TypedProgram, cfg_in: TypedCFG, 
  # serialize the edges' actions into the parallel CleanupEdge table
   # (cleanup[i] is edge i's CleanupEdge; the edge's index IS its CfgEdgeId).
   let cleanup_edges = cleanup_edges_serialize(&cfg.edges)
+  # (fourth-audit P0-17) Emit the typed drop-plan facts from the REAL
+  # cleanup edges + the pre-built parallel owner vector, in canonical order.
+  var drop_facts = resource_drop_plan_facts(&typed, &cfg.edges, &cfg.edge_owners)
+  drop_facts.sort_by(|a, b| resource_drop_plan_fact_lt(a, b))
   ResourceCheckResult {
     errors: errors,
     finalize_plan: finalize_plan,
-    cfg: TypedCFG { edges: cfg.edges, blocks: cfg.blocks, cleanup: cleanup_edges },
+    cfg: TypedCFG { edges: cfg.edges, blocks: cfg.blocks, cleanup: cleanup_edges, edge_owners: cfg.edge_owners },
     iteration_plans: iteration_plans_snapshot(ctx),
     typed_iterations: typed_iterations_snapshot(ctx),
-    block_frames: body_block_frames
+    block_frames: body_block_frames,
+    drop_plan_facts: drop_facts
   }
 end
 
@@ -972,6 +1161,9 @@ end
 pub def build_typed_cfg(program: Program, typed: TypedProgram) -> TypedCFG
   var edges = Vec::new()
   var blocks = Vec::new()
+  # (fourth-audit P0-17) the parallel owner vector: one owner key per edge,
+  # recorded per callable's contiguous edge range during THIS walk.
+  var owners: Vec[String] = Vec::new()
   # the ONE synthetic block-id counter of this run (cfg_synthetic_alloc).
   # The counter is PROGRAM-WIDE (one per build_typed_cfg call), not
   # per-function: the CfgBlock ids must be unique across the WHOLE CFG —
@@ -980,11 +1172,33 @@ pub def build_typed_cfg(program: Program, typed: TypedProgram) -> TypedCFG
   # let function A's for-join and function B's for-join share an id.
   mut synth = 0
   mut i = 0
+  let root_path: Vec[String] = Vec::new()
   while i < program.items.len() do
-    cfg_item(&program.items[i], &mut edges, &mut blocks, &mut synth)
+    cfg_item(&program, &typed, &program.items[i], i, &root_path, &mut edges, &mut blocks, &mut synth, &mut owners)
     i = i + 1
   end
-  TypedCFG { edges: edges, blocks: blocks, cleanup: Vec::new() }
+  TypedCFG { edges: edges, blocks: blocks, cleanup: Vec::new(), edge_owners: owners }
+end
+
+# (fourth-audit P0-17) Record one callable's owner key over its contiguous
+# edge range [base, top) in the parallel owner vector.
+def cfg_record_edge_owners(base: Int, top: Int, key: String, inout owners: Vec[String]) -> Unit
+  var i = base
+  while i < top do
+    owners.push(key.clone())
+    i = i + 1
+  end
+end
+
+# (fourth-audit P0-17) Align the owner vector with the edge vector after a
+# walk step: any edge produced outside a callable body (a struct field
+# default / enum discriminant / const value / macro body) gets the empty
+# owner — the fact emitter emits nothing for it (an empty owner is never a
+# stable identity).
+def cfg_align_edge_owners(inout owners: Vec[String], edge_count: Int) -> Unit
+  while owners.len() < edge_count do
+    owners.push("".to_string())
+  end
 end
 
 # the guaranteed-disjoint SYNTHETIC BLOCK-ID ALLOCATOR — the P0 fix.
@@ -1030,10 +1244,16 @@ end
 # macro bodies are expression-level walks with a fresh, item-local defer
 # chain (the state walk's item_defer_chain mirror). `synth` is the run's
 # synthetic block-id counter (cfg_synthetic_alloc).
-def cfg_item(item: Item, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock], inout synth: Int) -> Unit
+def cfg_item(program: Program, typed: TypedProgram, item: Item, item_idx: Int, module_path: Vec[String], inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock], inout synth: Int, inout owners: Vec[String]) -> Unit
   var item_chain = Vec::new()
   match item.kind
-  when ItemKind::ItemFunction(f) then cfg_function(&f, edges, blocks, synth)
+  when ItemKind::ItemFunction(f) then
+    # (fourth-audit P0-17) the SAME owner key derivation check_item uses —
+    # the owner vector's entry for every edge this body produces.
+    let fn_key = fn_owner_key_of_item(program, &typed.resolutions, item_idx, module_path.clone(), f.name.clone())
+    let owner_base = owners.len()
+    cfg_function(&f, edges, blocks, synth)
+    cfg_record_edge_owners(owner_base, owners.len(), fn_key, owners)
   when ItemKind::ItemStruct(s) then
     mut i = 0
     while i < s.fields.len() do
@@ -1044,8 +1264,15 @@ def cfg_item(item: Item, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock],
       i = i + 1
     end
     i = 0
+    # (fourth-audit P0-17) align the owner vector over the field-default
+    # edges before the methods' ranges are recorded, so owner index ==
+    # edge index for every subsequent callable.
+    cfg_align_edge_owners(owners, edges.len())
     while i < s.methods.len() do
+      let method_key = item_owner_key(typed, item_idx, i)
+      let owner_base = owners.len()
       cfg_function(&s.methods[i], edges, blocks, synth)
+      cfg_record_edge_owners(owner_base, owners.len(), method_key, owners)
       i = i + 1
     end
   when ItemKind::ItemEnum(e) then
@@ -1060,19 +1287,27 @@ def cfg_item(item: Item, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock],
   when ItemKind::ItemTrait(t) then
     mut i = 0
     while i < t.methods.len() do
+      let trait_method_key = "trait::" + t.name.clone() + "::" + i.to_string()
+      let owner_base = owners.len()
       cfg_trait_method(&t.methods[i], edges, blocks, synth)
+      cfg_record_edge_owners(owner_base, owners.len(), trait_method_key, owners)
       i = i + 1
     end
   when ItemKind::ItemImpl(im) then
     mut i = 0
     while i < im.methods.len() do
+      let method_key = item_owner_key(typed, item_idx, i)
+      let owner_base = owners.len()
       cfg_function(&im.methods[i], edges, blocks, synth)
+      cfg_record_edge_owners(owner_base, owners.len(), method_key, owners)
       i = i + 1
     end
   when ItemKind::ItemModule(m) then
+    var child_path = module_path.clone()
+    child_path.push(m.name.clone())
     mut i = 0
     while i < m.items.len() do
-      cfg_item(&m.items[i], edges, blocks, synth)
+      cfg_item(program, typed, m.items[i], -1, child_path.clone(), edges, blocks, synth, owners)
       i = i + 1
     end
   when ItemKind::ItemUse(_) then ()
@@ -1086,6 +1321,9 @@ def cfg_item(item: Item, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock],
   when ItemKind::ItemEditionDecl(_) then ()
   when ItemKind::ItemExternBlock(_) then ()
   end
+  # any edge produced outside a callable (defaults / discriminants / const
+  # values / macro bodies) is aligned with the empty owner.
+  cfg_align_edge_owners(owners, edges.len())
 end
 
 # a function's structural walk — contracts + body (the
@@ -2535,7 +2773,7 @@ def check_function(program: Program, typed: TypedProgram, inout env: TypeEnv, in
   # Contracts are checked at item level (never inside a loop), so their
   # expression checks use a fresh, function-local frontier.
   var fn_entry = Vec::new()
- # the function's CFG records (edges/blocks) are the PRE-BUILT
+  # the function's CFG records (edges/blocks) are the PRE-BUILT
   # global list (build_typed_cfg recorded them BEFORE the state runs); the
   # state computation below ATTACHES the cleanup actions to the pre-built
   # edges by (kind, source) identity.
@@ -2618,6 +2856,9 @@ def check_trait_method(program: Program, typed: TypedProgram, inout env: TypeEnv
     let is_self_param = if m.sig.params.len() > 0 then m.sig.params[0].name == "self" else false end
     mark_finalizer_self(&mut frame, &entry_ids[0], self_span, is_self_param)
   end
+  # (fourth-audit P0-17) The trait-default body's edges carry the same
+  # callable owner key the drop-plan facts use (recorded by build_typed_cfg
+  # in the parallel owner vector).
   check_fn_body(program, typed, env, ctx, &m.default_body, &mut frame, errors, finalize_plan, edges, blocks, current_loop_entry, &mut defer_chain)
  # the trait method's edge actions are serialized into the
   # CleanupEdge table once per program (see check_function).

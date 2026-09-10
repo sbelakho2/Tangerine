@@ -10,6 +10,18 @@
 # (value_at), and materialize only the MINIMAL CAUSAL SLICE of the
 # divergence (minimal_causal_slice) - never the full traces.
 #
+# P1-9 (deterministic record/run/compare over TYPED events): the lane now
+# ALSO records the nondeterminism decisions themselves as a typed union
+# (ReplayChoice: Scheduler / Time / Random / ExternalRead), builds a trace
+# from supplied choices (replay_record), extracts the DETERMINISTIC CHOICE
+# STREAM a re-execution consumes (replay_run / replay_run_digest), compares
+# two revisions over the SEMANTIC site ids only (replay_compare - the
+# replay.diff server entry), and roots a causal slice at that semantic
+# divergence with EXPLICIT synchronization edges (SyncEdge:
+# send-receive / lock-unlock / thread-start-join) whose happens-before
+# closure replaces the last-writer approximation whenever edges are
+# supplied (causal_predecessors_with_sync / replay_slice).
+#
 # PRIOR ART / LANE: the runtime replay lane is std/replay.tg (the
 # ReplayEvent enum of scheduling/time/io decisions) and std/snapshot.tg
 # (compare_replays / ReplayDiff.divergence_point - the same
@@ -52,13 +64,15 @@
 #       documented fallback identity of an event without an op word), else
 #       "". The builder derives it from the append parts; the pre-keyed
 #       record form keeps the record's own text.
-#     nondeterminism_token = the external-nondeterminism token: an OPAQUE
+#     nondeterminism_token = the external-nondeterminism token: the OPAQUE
 #       text naming the external source whose value decided the event.
 #       Deterministic events (the event's content is fully explained by
 #       its other fields) carry the default "". The token participates in
 #       event identity and in the first-divergence tuple, so a run whose
 #       nondeterministic choices differed NEVER compares equal to a run
-#       that recorded different external values.
+#       that recorded different external values. A TYPED choice (P1-9)
+#       derives this token canonically (replay_choice_token); the legacy
+#       text append keeps a caller-supplied opaque token.
 #   symbol_key - the StableSymbolId adaptation: the §29 stable def KEY
 #     TEXT ("path::name#signature") of the event's symbol (opaque;
 #     equality only - digest words never participate).
@@ -70,6 +84,47 @@
 #     state transition; values are rendered-value texts (strings;
 #     equality only); place is an opaque location text (the audit's Place
 #     adaptation).
+#   ReplayEvent adds two TYPED payloads beside its ReplayEventId:
+#     choice: Option[ReplayChoice] - the typed nondeterminism payload (the
+#       TYPED CHOICE UNION below); None for a deterministic event.
+#     site: Option[StableMirStmtId] - the event's typed semantic MIR site
+#       (P0-7/8 StableMirStmtId: dense statement index + canonical §33 key
+#       + digest words), derived from stmt_key with
+#       stable_mir_stmt_of_key when the text is a §33 node key; None when
+#       the site is not a §33 MIR node (the documented text-only fallback
+#       - the id TEXT remains the identity: ids.tg/stable_ids.tg's rule is
+#       that canonical key TEXT equality IS semantic identity, so the
+#       typed record is detection/derivation cargo, never a second
+#       equality).
+#
+# TYPED CHOICE UNION (P1-9): the nondeterminism sources the runtime/harness
+# must supply on re-execution, as a closed union:
+#   Scheduler(decision: Int)            - the picked runnable thread/task id
+#   Time(nanos: Int)                    - the monotonic clock value (ns)
+#   Random(value: Int)                  - the generator's returned value
+#   ExternalRead(source, value: String) - one external read: the source
+#                                         name ("file:fd3", "net:sock",
+#                                         "env:KEY", "fs:path", ...) and
+#                                         the rendered value text
+# An event that does not consult any of the four sources is deterministic
+# and carries choice = None (this is the compiler-lane projection of
+# std::replay's runtime ReplayEvent enum: ScheduleThread / TimeQuery /
+# RandomSeed / IoRead / NetRecv / EnvRead / FsStat - the four source
+# classes; std::replay stays the runtime recorder, this module the
+# compiler-lane analysis + record/run interface).
+#
+# RECORD / RUN INTERFACE (P1-9):
+#   replay_record(revision, supplies) builds an EventTrace from supplied
+#     ReplayChoiceSupply rows (the typed choice bound to its semantic site;
+#     choice = None builds a deterministic event).
+#   replay_run(trace) returns the DETERMINISTIC CHOICE STREAM: the
+#     ReplayChoiceStep rows (semantic site id + typed choice) of every
+#     typed event, in Vec order - the sequence a re-execution consumes
+#     (replay_run_choices is the bare choice list; replay_run_digest
+#     content-addresses the canonical stream rows). A trace whose
+#     nondeterministic events carry only opaque tokens is NOT typed
+#     (replay_trace_is_typed = false): the choice stream would be
+#     incomplete, so the harness rejects it instead of replaying a lie.
 #
 # ORDERING DOMAIN: the builder stamps sequence == Vec index at append
 # time ("events[i].id.sequence == i" for every builder trace). Ops
@@ -94,6 +149,18 @@
 # side's id is returned (new-side tail = behavior ADDED; old-side tail =
 # behavior LOST).
 #
+# SEMANTIC COMPARE (replay_compare - the replay.diff entry): the same
+# lock-step walk over the SEMANTIC-ONLY tuple (symbol_key, stmt_key,
+# effect_kind, semantic_op_key, delta-render) -
+# replay_semantic_row. It IGNORES the trace position sequence, the
+# executing thread_id and the nondeterminism token (therefore the typed
+# choice payload as such): two runs whose recorded CHOICES differ but
+# whose observed semantics are identical do NOT diverge, and a choice
+# that changes what executes shows up at the first downstream event whose
+# semantic row differs. first_divergence stays the token-inclusive
+# (stricter) relation; replay_compare is the stable revision comparison.
+# Side-selection and prefix rules are identical to first_divergence.
+#
 # CAUSALITY RULE (conservative superset - over-approximate so a real
 # cause is never missed within the cap, at the cost of possible false
 # causes): (1) every EARLIER event on the SAME thread (intra-thread
@@ -108,17 +175,46 @@
 # are rule 1); (3) capped at replay_predecessor_cap (64), keeping the 64
 # MOST RECENT candidates, returned sorted by id.
 #
+# SYNC MODEL (P1-9): the last-writer rule 2 is an APPROXIMATION. The
+# caller may supply EXPLICIT synchronization edges instead, as SyncEdge
+# records: kind + optional subject (channel/lock/task name) + the from/to
+# event ids. The closed kind set is:
+#   "send-recv"    - a channel/message send happens-before its receive
+#   "lock-unlock"  - a critical-section unlock happens-before a later lock
+#   "start-join"   - a thread/task start happens-before its join (and a
+#                    spawn happens-before the spawned thread's start)
+# Happens-before is the transitive closure of (explicit edges) UNION
+# (program order: same thread, earlier Vec position) over the trace
+# (sync_happens_before). causal_predecessors_with_sync returns the
+# happens-before predecessors of the target (same-thread earlier events
+# included through program order; the explicit edge sources included
+# transitively); the cap and sort are the causal_predecessors rules. When
+# `edges` is EMPTY the function DELEGATES to causal_predecessors - the
+# last-writer approximation is the DOCUMENTED FALLBACK for a caller with
+# no sync edges, and is never an additive extra rule when edges exist.
+# An edge endpoint that matches no event is skipped (the ids may come
+# from a prior revision).
+#
 # SLICE: minimal_causal_slice(old, new) = the divergence event plus its
 # TRANSITIVE causal predecessors, walked FIFO over the side that produced
 # the divergence event, capped at replay_slice_cap (512) total ids,
 # returned sorted and deduped. Only this slice is ever materialized (the
 # walk clones the matched side once - compact traces only).
+# replay_slice(old, new, edges) is the P1-9 sync-aware slice: it roots at
+# the SEMANTIC first divergence (replay_compare) and walks
+# causal_predecessors_with_sync over the supplied edges (empty edges =
+# the causal_predecessors fallback), so a send/lock/start on another
+# thread enters the slice through the explicit edge instead of the
+# place-based approximation.
 #
 # DIGEST: replay_trace_rows renders the canonical SEQUENCE-ORDERED row
 # set (header row first, then one row per event in Vec order - events
 # are ordered, so rows are never textually sorted); replay_trace_digest
 # content-addresses the joined rows with stable_digest_of. Rows are
-# text; nothing here is parsed back.
+# text; nothing here is parsed back. The P1-9 row format is
+# "tg-compiler-replay/v3": each event row carries the typed choice
+# ("choice") and the typed semantic site key ("site", null when the
+# site is not a §33 MIR node) beside the v2 fields.
 #
 # DETERMINISM: every op is a pure function of its trace argument(s);
 # every returned Vec is sorted (replay_id_lt: sequence, function_key,
@@ -130,6 +226,7 @@ use std::collections::{Vec}
 
 use tg_compiler::ids::{StableDigest, stable_digest_of}
 use tg_compiler::semantic_model::{semantic_json_escape}
+use tg_compiler::stable_ids::{StableMirStmtId, stable_mir_stmt_of_key}
 
 # -----------------------------------------------------------------------
 # §42.1 - The record model
@@ -156,7 +253,109 @@ struct StateDelta
   new_value: String
 end
 
-# One replay event: the id + the audit model's stable keys + the delta.
+# The typed nondeterminism choice union (P1-9): every event whose outcome
+# an external source decided carries exactly one of these payloads. The
+# four source classes are the compiler-lane projection of std::replay's
+# runtime ReplayEvent enum (the runtime recorder stays in std/replay; the
+# types here are the analysis/record/run identity):
+#   Scheduler(decision)     - the picked runnable thread/task id
+#   Time(nanos)             - the monotonic clock value in nanoseconds
+#   Random(value)           - the generator's returned value (the seed /
+#                             next-state value the run consumed)
+#   ExternalRead(source, value) - one external read: the source name
+#                             ("file:fd3", "net:sock", "env:KEY",
+#                             "fs:path", ...) plus the rendered value text
+# The canonical token text (replay_choice_token) is injective: two
+# distinct choices never render equal.
+enum ReplayChoice
+  Scheduler(decision: Int)
+  Time(nanos: Int)
+  Random(value: Int)
+  ExternalRead(source: String, value: String)
+end
+
+# The canonical choice kind word (the "choice" row kind / the source
+# class): "scheduler" / "time" / "random" / "external".
+pub def replay_choice_kind(c: ReplayChoice) -> String
+  match c
+  when ReplayChoice::Scheduler(_) then "scheduler"
+  when ReplayChoice::Time(_) then "time"
+  when ReplayChoice::Random(_) then "random"
+  when ReplayChoice::ExternalRead(_, _) then "external"
+  end
+end
+
+# The canonical identity TOKEN text of a typed choice - the text a typed
+# append stamps into ReplayEventId.nondeterminism_token. The render is
+# injective (each variant is a distinct prefix; the external source and
+# value are JSON-escaped and quoted):
+#   scheduler:<decision> / time:<nanos> / random:<value>
+#   external:"<escaped source>"="<escaped value>"
+pub def replay_choice_token(c: ReplayChoice) -> String
+  match c
+  when ReplayChoice::Scheduler(decision) then
+    "scheduler:" + decision.to_string()
+  when ReplayChoice::Time(nanos) then
+    "time:" + nanos.to_string()
+  when ReplayChoice::Random(value) then
+    "random:" + value.to_string()
+  when ReplayChoice::ExternalRead(source, value) then
+    "external:\"" + semantic_json_escape(&source) + "\"=\"" +
+      semantic_json_escape(&value) + "\""
+  end
+end
+
+# The canonical JSON row of a typed choice (the digest row form; exactly
+# one object per choice):
+#   {"kind":"scheduler","decision":<n>}
+#   {"kind":"time","nanos":<n>}
+#   {"kind":"random","value":<n>}
+#   {"kind":"external","source":"<esc>","value":"<esc>"}
+def replay_choice_row(c: ReplayChoice) -> String
+  match c
+  when ReplayChoice::Scheduler(decision) then
+    "{\"kind\":\"scheduler\",\"decision\":" + decision.to_string() + "}"
+  when ReplayChoice::Time(nanos) then
+    "{\"kind\":\"time\",\"nanos\":" + nanos.to_string() + "}"
+  when ReplayChoice::Random(value) then
+    "{\"kind\":\"random\",\"value\":" + value.to_string() + "}"
+  when ReplayChoice::ExternalRead(source, value) then
+    "{\"kind\":\"external\",\"source\":\"" + semantic_json_escape(&source) +
+      "\",\"value\":\"" + semantic_json_escape(&value) + "\"}"
+  end
+end
+
+# The choice column of an event/digest row: the canonical choice row, or
+# the JSON null for a deterministic event.
+pub def replay_choice_text(c: Option[ReplayChoice]) -> String
+  match c
+  when Option::Some(choice) then replay_choice_row(choice)
+  when Option::None then "null"
+  end
+end
+
+# One event's typed semantic MIR site text (P0-7/8 StableMirStmtId): the
+# canonical §33 node key of the site, or "null" when the site text is not
+# a §33 MIR node (the text-only fallback - see the module doc).
+pub def replay_site_text(site: Option[StableMirStmtId]) -> String
+  match site
+  when Option::Some(m) then "\"" + semantic_json_escape(&m.stable_key) + "\""
+  when Option::None then "null"
+  end
+end
+
+# The typed semantic MIR site of a §33 node key text (P0-7/8): the
+# builder calls stable_mir_stmt_of_key on every appended stmt_key; a key
+# that is not a §33 statement/terminator node key yields None (the event
+# keeps its text anchor only). This is the "where available" rule of the
+# audit: the typed id is derived when the site grammar admits one.
+def replay_site_of_key(stmt_key: String) -> Option[StableMirStmtId]
+  stable_mir_stmt_of_key(stmt_key)
+end
+
+# One replay event: the id + the audit model's stable keys + the delta +
+# the typed payloads (the nondeterminism choice and the semantic MIR
+# site).
 struct ReplayEvent
   id: ReplayEventId
   symbol_key: String
@@ -164,6 +363,29 @@ struct ReplayEvent
   thread_id: Int
   effect_kind: String
   delta: Option[StateDelta]
+  choice: Option[ReplayChoice] = Option::None
+  site: Option[StableMirStmtId] = Option::None
+end
+
+# One supplied choice bound to its semantic site (the replay_record
+# input row): the site parts the builder needs plus the typed choice.
+# choice = None builds a DETERMINISTIC event. The defaults make a supply
+# row declarable with only the fields the fixture cares about.
+struct ReplayChoiceSupply
+  function_key: String = ""
+  symbol_key: String = ""
+  stmt_key: String = ""
+  thread_id: Int = 0
+  effect_kind: String = ""
+  delta: Option[StateDelta] = Option::None
+  choice: Option[ReplayChoice] = Option::None
+end
+
+# One step of the deterministic choice stream replay_run produces: the
+# semantic site id the choice was consumed at plus the typed choice.
+struct ReplayChoiceStep
+  site: ReplayEventId
+  choice: ReplayChoice
 end
 
 # One run's compact trace: the revision text of the audited compile (a
@@ -291,9 +513,27 @@ def replay_divergence_row(e: ReplayEvent) -> String
     replay_delta_text(e.delta.clone()) + "}"
 end
 
+# The SEMANTIC-ONLY compare tuple row (replay_compare — the replay.diff
+# entry): (symbol_key, stmt_key, effect_kind, semantic_op_key,
+# delta-render). The trace position sequence, the executing thread_id and
+# the nondeterminism token (and therefore the typed choice payload as
+# such) NEVER participate: a differing recorded choice is a divergence
+# only when it changes what semantically happened (the first downstream
+# row that differs). See the module doc's semantic-compare paragraph.
+def replay_semantic_row(e: ReplayEvent) -> String
+  "{\"sym\":\"" + semantic_json_escape(&e.symbol_key) + "\",\"st\":\"" +
+    semantic_json_escape(&e.stmt_key) + "\",\"eff\":\"" +
+    semantic_json_escape(&e.effect_kind) + "\",\"sem\":\"" +
+    semantic_json_escape(&e.id.semantic_op_key) + "\",\"d\":" +
+    replay_delta_text(e.delta.clone()) + "}"
+end
+
 # The canonical digest row of one event (full record; pos = Vec position).
 # The stmt_key / thread_id render from the ID (the constructors keep the
-# event's own copies equal — see the record-model doc).
+# event's own copies equal — see the record-model doc). The v3 row adds
+# the typed payload columns: "choice" (the ReplayChoice row or null) and
+# "site" (the StableMirStmtId canonical key or null when the stmt_key is
+# not a §33 MIR node).
 def replay_event_row(pos: Int, e: ReplayEvent) -> String
   "{\"r\":\"ev\",\"pos\":" + pos.to_string() + ",\"seq\":" +
     e.id.sequence.to_string() + ",\"f\":\"" +
@@ -303,7 +543,9 @@ def replay_event_row(pos: Int, e: ReplayEvent) -> String
     semantic_json_escape(&e.id.semantic_op_key) + "\",\"nd\":\"" +
     semantic_json_escape(&e.id.nondeterminism_token) + "\",\"sym\":\"" +
     semantic_json_escape(&e.symbol_key) + "\",\"eff\":\"" +
-    semantic_json_escape(&e.effect_kind) + "\",\"d\":" +
+    semantic_json_escape(&e.effect_kind) + "\",\"choice\":" +
+    replay_choice_text(e.choice.clone()) + ",\"site\":" +
+    replay_site_text(e.site.clone()) + ",\"d\":" +
     replay_delta_text(e.delta.clone()) + "}"
 end
 
@@ -323,7 +565,10 @@ end
 # event's stmt_key stay equal by construction), thread_id verbatim,
 # semantic_op_key derived by replay_semantic_op_key (the §47 stable-node
 # text of function_key + the effect_kind op word, or the stmt locator
-# fallback), nondeterminism_token verbatim (default "" = deterministic).
+# fallback), nondeterminism_token verbatim (default "" = deterministic),
+# choice = None (the DETERMINISTIC append; a typed choice goes through
+# replay_builder_append_choice), site derived from stmt_key with the
+# §33-node-key grammar.
 pub def replay_builder_append(
   inout b: ReplayTraceBuilder,
   function_key: String,
@@ -345,10 +590,49 @@ pub def replay_builder_append(
       nondeterminism_token: nondeterminism_token
     },
     symbol_key: symbol_key,
-    stmt_key: stmt_key,
+    stmt_key: stmt_key.clone(),
     thread_id: thread_id,
     effect_kind: effect_kind,
-    delta: delta
+    delta: delta,
+    choice: Option::None,
+    site: replay_site_of_key(stmt_key.clone())
+  }
+  b.events.push(record)
+  ()
+end
+
+# Append one TYPED event by parts (P1-9): the typed choice rides the
+# record and its canonical token (replay_choice_token) is stamped into
+# the id, so two different choices at the same site are different event
+# identities. site is derived from stmt_key as in replay_builder_append.
+pub def replay_builder_append_choice(
+  inout b: ReplayTraceBuilder,
+  function_key: String,
+  symbol_key: String,
+  stmt_key: String,
+  thread_id: Int,
+  effect_kind: String,
+  delta: Option[StateDelta],
+  choice: ReplayChoice
+) -> Unit
+  let token = replay_choice_token(&choice)
+  let record = ReplayEvent {
+    id: ReplayEventId {
+      sequence: b.events.len(),
+      function_key: function_key.clone(),
+      stmt_key: stmt_key.clone(),
+      thread_id: thread_id,
+      semantic_op_key: replay_semantic_op_key(
+        function_key.clone(), stmt_key.clone(), effect_kind.clone()),
+      nondeterminism_token: token
+    },
+    symbol_key: symbol_key,
+    stmt_key: stmt_key.clone(),
+    thread_id: thread_id,
+    effect_kind: effect_kind,
+    delta: delta,
+    choice: Option::Some(choice.clone()),
+    site: replay_site_of_key(stmt_key.clone())
   }
   b.events.push(record)
   ()
@@ -359,11 +643,17 @@ end
 # canonicalization that keeps builder traces valid). The remaining id
 # fields (function_key / stmt_key / thread_id / semantic_op_key /
 # nondeterminism_token) ride the record verbatim - the caller keyed the
-# record's semantic identity, the builder only stamps the position.
+# record's semantic identity, the builder only stamps the position. The
+# typed payloads (choice / site) ride the record; the record's own stmt
+# site is kept (re-derived when the caller left it None).
 pub def replay_builder_append_record(
   inout b: ReplayTraceBuilder,
   event: ReplayEvent
 ) -> Unit
+  var site = event.site.clone()
+  if site.is_none() then
+    site = replay_site_of_key(event.id.stmt_key.clone())
+  end
   let record = ReplayEvent {
     id: ReplayEventId {
       sequence: b.events.len(),
@@ -377,7 +667,9 @@ pub def replay_builder_append_record(
     stmt_key: event.id.stmt_key.clone(),
     thread_id: event.id.thread_id,
     effect_kind: event.effect_kind.clone(),
-    delta: event.delta.clone()
+    delta: event.delta.clone(),
+    choice: event.choice.clone(),
+    site: site.clone()
   }
   b.events.push(record)
   ()
@@ -396,7 +688,7 @@ end
 # are never textually sorted).
 def replay_trace_lines(trace: EventTrace) -> Vec[String]
   var lines: Vec[String] = Vec::new()
-  lines.push("{\"r\":\"header\",\"format\":\"tg-compiler-replay/v2\",\"revision\":\"" +
+  lines.push("{\"r\":\"header\",\"format\":\"tg-compiler-replay/v3\",\"revision\":\"" +
     semantic_json_escape(&trace.revision) + "\"}")
   var i = 0
   while i < trace.events.len() do
@@ -415,6 +707,111 @@ end
 pub def replay_trace_digest(trace: EventTrace) -> StableDigest
   var text = ""
   let lines = replay_trace_lines(&trace)
+  for l in lines do
+    text = text + l + "\n"
+  end
+  stable_digest_of(&text)
+end
+
+# -----------------------------------------------------------------------
+# §42.2b - P1-9 record / run (typed choices)
+# -----------------------------------------------------------------------
+
+# Build an EventTrace from SUPPLIED typed choices (replay.record): one
+# ReplayChoiceSupply row per observed event, in trace order. A row with
+# choice = Some(c) appends a TYPED event (the choice rides the record and
+# its canonical token rides the id); choice = None appends a
+# deterministic event. The sequence is stamped by the builder, so the
+# returned trace satisfies the ordering-domain invariant.
+pub def replay_record(revision: String, supplies: Vec[ReplayChoiceSupply]) -> EventTrace
+  var b = replay_builder_new(revision)
+  for s in supplies do
+    match s.choice.clone()
+    when Option::Some(choice) then
+      replay_builder_append_choice(&mut b, s.function_key.clone(),
+        s.symbol_key.clone(), s.stmt_key.clone(), s.thread_id,
+        s.effect_kind.clone(), s.delta.clone(), choice.clone())
+    when Option::None then
+      replay_builder_append(&mut b, s.function_key.clone(),
+        s.symbol_key.clone(), s.stmt_key.clone(), s.thread_id,
+        s.effect_kind.clone(), s.delta.clone())
+    end
+  end
+  replay_builder_finish(b)
+end
+
+# Whether every event of the trace whose id carries a nondeterminism
+# token ALSO carries a typed choice (replay_trace_is_typed): true means
+# replay_run's stream is complete over the trace's nondeterminism,
+# false means the trace is legacy/token-only and the harness must REJECT
+# it instead of replaying a lie (the module doc's record/run paragraph).
+pub def replay_trace_is_typed(trace: EventTrace) -> Bool
+  var ok = true
+  for e in trace.events do
+    if e.id.nondeterminism_token.len() > 0 && e.choice.is_none() then
+      ok = false
+    end
+  end
+  ok
+end
+
+# The DETERMINISTIC CHOICE STREAM of a trace (replay.run): every typed
+# choice in Vec order, each bound to the semantic site id it was consumed
+# at — the sequence a re-execution supplies at its nondeterministic
+# sites. Deterministic events contribute nothing; a token-only legacy
+# event contributes nothing either (check replay_trace_is_typed first).
+pub def replay_run(trace: EventTrace) -> Vec[ReplayChoiceStep]
+  var out: Vec[ReplayChoiceStep] = Vec::new()
+  for e in trace.events do
+    match e.choice.clone()
+    when Option::Some(choice) then
+      out.push(ReplayChoiceStep {
+        site: e.id.clone(),
+        choice: choice.clone()
+      })
+    when Option::None then ()
+    end
+  end
+  out
+end
+
+# The bare choice list of the stream (what the harness feeds the runtime,
+# site associations dropped): replay_run's choices in order.
+pub def replay_run_choices(trace: EventTrace) -> Vec[ReplayChoice]
+  var out: Vec[ReplayChoice] = Vec::new()
+  let steps = replay_run(trace)
+  for step in steps do
+    out.push(step.choice.clone())
+  end
+  out
+end
+
+# The canonical rows of the choice stream (header + one row per step, in
+# stream order):
+#   {"r":"run","format":"tg-compiler-replay-run/v1","revision":"<rev>"}
+#   {"r":"step","seq":<n>,"st":"<site key>","choice":<choice row>}
+def replay_run_lines(trace: EventTrace) -> Vec[String]
+  var lines: Vec[String] = Vec::new()
+  lines.push("{\"r\":\"run\",\"format\":\"tg-compiler-replay-run/v1\",\"revision\":\"" +
+    semantic_json_escape(&trace.revision) + "\"}")
+  let steps = replay_run(trace)
+  for step in steps do
+    lines.push("{\"r\":\"step\",\"seq\":" + step.site.sequence.to_string() +
+      ",\"st\":\"" + semantic_json_escape(&step.site.stmt_key) + "\",\"choice\":" +
+      replay_choice_row(step.choice.clone()) + "}")
+  end
+  lines
+end
+
+pub def replay_run_rows(trace: EventTrace) -> Vec[String]
+  replay_run_lines(&trace)
+end
+
+# The content-addressed digest of the choice stream (the run/replay
+# identity a harness compares).
+pub def replay_run_digest(trace: EventTrace) -> StableDigest
+  var text = ""
+  let lines = replay_run_lines(&trace)
   for l in lines do
     text = text + l + "\n"
   end
@@ -441,6 +838,36 @@ pub def first_divergence(old: EventTrace, new: EventTrace) -> Option[ReplayEvent
   var i = 0
   while i < n do
     if replay_divergence_row(&old.events[i]) != replay_divergence_row(&new.events[i]) then
+      return Option::Some(new.events[i].id.clone())
+    end
+    i = i + 1
+  end
+  if old.events.len() < new.events.len() then
+    return Option::Some(new.events[n].id.clone())
+  end
+  if new.events.len() < old.events.len() then
+    return Option::Some(old.events[n].id.clone())
+  end
+  Option::None
+end
+
+# The SEMANTIC first divergence of two revisions (replay.compare - the
+# replay.diff server entry): the lock-step walk over replay_semantic_row
+# (symbol_key, stmt_key, effect_kind, semantic_op_key, delta-render) -
+# the trace position sequence, the executing thread_id and the
+# nondeterminism token (hence the bare choice payload) are IGNORED. A
+# differing recorded choice alone is therefore NOT a divergence: it
+# diverges only when it changed what semantically happened, and the
+# returned id is the first event whose semantic row differs (new side).
+# Side-selection and prefix rules are exactly first_divergence's.
+pub def replay_compare(old: EventTrace, new: EventTrace) -> Option[ReplayEventId]
+  var n = old.events.len()
+  if new.events.len() < n then
+    n = new.events.len()
+  end
+  var i = 0
+  while i < n do
+    if replay_semantic_row(&old.events[i]) != replay_semantic_row(&new.events[i]) then
       return Option::Some(new.events[i].id.clone())
     end
     i = i + 1
@@ -541,6 +968,243 @@ pub def causal_predecessors(trace: EventTrace, event_id: ReplayEventId) -> Vec[R
   while j < fi.len() do
     out.push(fid[j].clone())
     j = j + 1
+  end
+  out.sort_by(|a, b| replay_id_lt(a, b))
+  out
+end
+
+# -----------------------------------------------------------------------
+# §42.4b - P1-9 synchronization edges / happens-before
+# -----------------------------------------------------------------------
+
+# The closed sync-edge kind words.
+pub def sync_edge_kind_send_recv() -> String
+  "send-recv"
+end
+
+pub def sync_edge_kind_lock_unlock() -> String
+  "lock-unlock"
+end
+
+pub def sync_edge_kind_start_join() -> String
+  "start-join"
+end
+
+# Whether a word is one of the three sync-edge kinds.
+pub def sync_edge_kind_valid(kind: String) -> Bool
+  kind == "send-recv" || kind == "lock-unlock" || kind == "start-join"
+end
+
+# One EXPLICIT synchronization edge of a trace: the two event ids whose
+# pair establishes happens-before (from -> to) and the edge's kind word.
+# subject names the synchronized object the harness paired on
+# ("chan:7", "lock:3", "task:12" - opaque, "" when unnamed) and is row
+# cargo only: it never participates in the closure.
+pub struct SyncEdge
+  kind: String
+  from_id: ReplayEventId
+  to_id: ReplayEventId
+  subject: String = ""
+end
+
+# A send -> receive channel/message edge.
+pub def sync_edge_send_recv(subject: String, from_id: ReplayEventId, to_id: ReplayEventId) -> SyncEdge
+  SyncEdge {
+    kind: "send-recv".to_string(),
+    from_id: from_id.clone(),
+    to_id: to_id.clone(),
+    subject: subject.clone()
+  }
+end
+
+# An unlock -> lock critical-section edge.
+pub def sync_edge_lock_unlock(subject: String, from_id: ReplayEventId, to_id: ReplayEventId) -> SyncEdge
+  SyncEdge {
+    kind: "lock-unlock".to_string(),
+    from_id: from_id.clone(),
+    to_id: to_id.clone(),
+    subject: subject.clone()
+  }
+end
+
+# A thread/task start -> join edge (or a spawn -> spawned-thread start
+# edge; both are the start-join class).
+pub def sync_edge_start_join(subject: String, from_id: ReplayEventId, to_id: ReplayEventId) -> SyncEdge
+  SyncEdge {
+    kind: "start-join".to_string(),
+    from_id: from_id.clone(),
+    to_id: to_id.clone(),
+    subject: subject.clone()
+  }
+end
+
+# A well-formed edge: a recognized kind and two distinct endpoints.
+pub def sync_edge_valid(e: SyncEdge) -> Bool
+  sync_edge_kind_valid(&e.kind) && !replay_id_eq(&e.from_id, &e.to_id)
+end
+
+# The canonical JSON row of one event id (the sync-edge row endpoint):
+# every identity field renders json-escaped.
+pub def replay_id_row(id: ReplayEventId) -> String
+  "{\"seq\":" + id.sequence.to_string() + ",\"f\":\"" +
+    semantic_json_escape(&id.function_key) + "\",\"st\":\"" +
+    semantic_json_escape(&id.stmt_key) + "\",\"tid\":" +
+    id.thread_id.to_string() + ",\"sem\":\"" +
+    semantic_json_escape(&id.semantic_op_key) + "\",\"nd\":\"" +
+    semantic_json_escape(&id.nondeterminism_token) + "\"}"
+end
+
+# The canonical JSON row of one sync edge.
+pub def sync_edge_row(e: SyncEdge) -> String
+  "{\"kind\":\"" + semantic_json_escape(&e.kind) + "\",\"subject\":\"" +
+    semantic_json_escape(&e.subject) + "\",\"from\":" +
+    replay_id_row(e.from_id.clone()) + ",\"to\":" +
+    replay_id_row(e.to_id.clone()) + "}"
+end
+
+# Whether an Int list already holds the value (linear).
+def replay_int_list_contains(xs: Vec[Int], x: Int) -> Bool
+  var found = false
+  var i = 0
+  while i < xs.len() do
+    if xs[i] == x then
+      found = true
+      break
+    end
+    i = i + 1
+  end
+  found
+end
+
+# Whether E happens-before F over the trace: the reflexive-transitive
+# closure of (explicit edge) UNION (program order: same thread, earlier
+# Vec position). from_id == to_id is true (the reflexive seed); an id
+# that matches no event is false (nothing to stand on).
+pub def sync_happens_before(
+  trace: EventTrace,
+  edges: Vec[SyncEdge],
+  from_id: ReplayEventId,
+  to_id: ReplayEventId
+) -> Bool
+  let start = replay_event_index(&trace, from_id.clone())
+  if start < 0 then
+    return false
+  end
+  var visited: Vec[ReplayEventId] = Vec::new()
+  var work: Vec[ReplayEventId] = Vec::new()
+  visited.push(from_id.clone())
+  work.push(from_id.clone())
+  var head = 0
+  while head < work.len() do
+    let cur = work[head].clone()
+    head = head + 1
+    let ci = replay_event_index(&trace, cur.clone())
+    if ci >= 0 then
+      # program order: every later same-thread event
+      var i = 0
+      while i < trace.events.len() do
+        let e = trace.events[i]
+        if i > ci && e.thread_id == trace.events[ci].thread_id then
+          if !replay_id_list_contains(&visited, e.id.clone()) then
+            visited.push(e.id.clone())
+            work.push(e.id.clone())
+          end
+        end
+        i = i + 1
+      end
+      # explicit edges out of the current event
+      var j = 0
+      while j < edges.len() do
+        if replay_id_eq(&edges[j].from_id, &cur) then
+          if !replay_id_list_contains(&visited, edges[j].to_id.clone()) then
+            visited.push(edges[j].to_id.clone())
+            work.push(edges[j].to_id.clone())
+          end
+        end
+        j = j + 1
+      end
+    end
+  end
+  replay_id_list_contains(&visited, to_id)
+end
+
+# The happens-before predecessors of the target under the EXPLICIT sync
+# edges (the P1-9 causality rule): the transitive closure, backwards,
+# of (explicit edge) UNION (program order). Same-thread earlier events
+# are included through program order; a send/lock/start on another thread
+# enters through its edge and drags its own program-order history in.
+# When `edges` is EMPTY the function DELEGATES to causal_predecessors -
+# the documented last-writer fallback for a caller with no sync edges.
+# The cap keeps the replay_predecessor_cap most recent candidates;
+# returned sorted by id. An id that matches no event yields [], and an
+# edge endpoint that matches no event is skipped.
+pub def causal_predecessors_with_sync(
+  trace: EventTrace,
+  event_id: ReplayEventId,
+  edges: Vec[SyncEdge]
+) -> Vec[ReplayEventId]
+  if edges.len() == 0 then
+    return causal_predecessors(&trace, event_id)
+  end
+  var out: Vec[ReplayEventId] = Vec::new()
+  let ti = replay_event_index(&trace, event_id)
+  if ti < 0 then
+    return out
+  end
+  var visited: Vec[ReplayEventId] = Vec::new()
+  visited.push(event_id.clone())
+  var work: Vec[ReplayEventId] = Vec::new()
+  work.push(event_id.clone())
+  var cand: Vec[Int] = Vec::new()
+  var head = 0
+  while head < work.len() do
+    let cur = work[head].clone()
+    head = head + 1
+    let ci = replay_event_index(&trace, cur.clone())
+    if ci >= 0 then
+      # program order: every earlier same-thread event
+      var i = 0
+      while i < ci do
+        let pe = trace.events[i]
+        if pe.thread_id == trace.events[ci].thread_id then
+          if !replay_int_list_contains(&cand, i) then
+            cand.push(i)
+          end
+          if !replay_id_list_contains(&visited, pe.id.clone()) then
+            visited.push(pe.id.clone())
+            work.push(pe.id.clone())
+          end
+        end
+        i = i + 1
+      end
+      # explicit sync edge sources targeting the current event
+      var j = 0
+      while j < edges.len() do
+        if replay_id_eq(&edges[j].to_id, &cur) then
+          let fi = replay_event_index(&trace, edges[j].from_id.clone())
+          if fi >= 0 then
+            if !replay_int_list_contains(&cand, fi) then
+              cand.push(fi)
+            end
+            if !replay_id_list_contains(&visited, trace.events[fi].id.clone()) then
+              visited.push(trace.events[fi].id.clone())
+              work.push(trace.events[fi].id.clone())
+            end
+          end
+        end
+        j = j + 1
+      end
+    end
+  end
+  cand.sort()
+  var drop = 0
+  if cand.len() > replay_predecessor_cap() then
+    drop = cand.len() - replay_predecessor_cap()
+  end
+  var k = drop
+  while k < cand.len() do
+    out.push(trace.events[cand[k]].id.clone())
+    k = k + 1
   end
   out.sort_by(|a, b| replay_id_lt(a, b))
   out
@@ -652,4 +1316,305 @@ pub def minimal_causal_slice(old: EventTrace, new: EventTrace) -> Vec[ReplayEven
   when Option::None then ()
   end
   out
+end
+
+# The P1-9 SYNC-AWARE causal slice: rooted at the SEMANTIC first
+# divergence (replay_compare - not the token-inclusive first_divergence),
+# walked FIFO over the side that produced the divergence event with
+# causal_predecessors_with_sync, capped at replay_slice_cap ids and
+# returned sorted and deduped. With EMPTY edges the walk uses the
+# causal_predecessors last-writer fallback (and the root is still the
+# semantic divergence). No divergence yields [].
+pub def replay_slice(
+  old: EventTrace,
+  new: EventTrace,
+  edges: Vec[SyncEdge]
+) -> Vec[ReplayEventId]
+  var out: Vec[ReplayEventId] = Vec::new()
+  match replay_compare(&old, &new)
+  when Option::Some(root) then
+    var side = old.clone()
+    if replay_event_index(&new, root.clone()) >= 0 then
+      side = new.clone()
+    end
+    var visited: Vec[ReplayEventId] = Vec::new()
+    var work: Vec[ReplayEventId] = Vec::new()
+    work.push(root)
+    var head = 0
+    while head < work.len() do
+      let cur = work[head].clone()
+      head = head + 1
+      if !replay_id_list_contains(&visited, cur.clone()) then
+        visited.push(cur.clone())
+        if visited.len() < replay_slice_cap() then
+          let preds = causal_predecessors_with_sync(&side, cur, edges.clone())
+          var p = 0
+          while p < preds.len() do
+            let pid = preds[p].clone()
+            if !replay_id_list_contains(&visited, pid.clone()) &&
+              !replay_id_list_contains(&work, pid.clone()) then
+              work.push(pid)
+            end
+            p = p + 1
+          end
+        end
+      end
+    end
+    out = visited.clone()
+    out.sort_by(|a, b| replay_id_lt(a, b))
+  when Option::None then ()
+  end
+  out
+end
+
+# -----------------------------------------------------------------------
+# §42.6 - P1-9 self-checking lane rows
+# -----------------------------------------------------------------------
+
+# One four-event two-thread fixture for the lane rows: main writes x and
+# sends on channel "chan:1"; the worker receives (typing the given
+# scheduler decision), then writes y with the given value. The send and
+# the receive are the sync-edge endpoints; the worker's choice token is
+# what two revisions differ in for the semantic-compare rows.
+def replay_lane_fixture(revision: String, choice_value: Int, y_value: String) -> EventTrace
+  var supplies: Vec[ReplayChoiceSupply] = Vec::new()
+  supplies.push(ReplayChoiceSupply {
+    function_key: "main".to_string(),
+    symbol_key: "m::main#fn()->unit".to_string(),
+    stmt_key: "main#B0#S0".to_string(),
+    thread_id: 0,
+    effect_kind: "write".to_string(),
+    delta: Option::Some(StateDelta {
+      place: "x".to_string(),
+      old_value: "0".to_string(),
+      new_value: "1".to_string()
+    }),
+    choice: Option::None
+  })
+  supplies.push(ReplayChoiceSupply {
+    function_key: "main".to_string(),
+    symbol_key: "m::main#fn()->unit".to_string(),
+    stmt_key: "main#B0#S1".to_string(),
+    thread_id: 0,
+    effect_kind: "send".to_string(),
+    delta: Option::Some(StateDelta {
+      place: "chan:1".to_string(),
+      old_value: "".to_string(),
+      new_value: "1".to_string()
+    }),
+    choice: Option::None
+  })
+  supplies.push(ReplayChoiceSupply {
+    function_key: "worker".to_string(),
+    symbol_key: "m::worker#fn()->unit".to_string(),
+    stmt_key: "worker#B0#S0".to_string(),
+    thread_id: 1,
+    effect_kind: "recv".to_string(),
+    delta: Option::None,
+    choice: Option::Some(ReplayChoice::Scheduler(choice_value))
+  })
+  supplies.push(ReplayChoiceSupply {
+    function_key: "worker".to_string(),
+    symbol_key: "m::worker#fn()->unit".to_string(),
+    stmt_key: "worker#B0#S1".to_string(),
+    thread_id: 1,
+    effect_kind: "write".to_string(),
+    delta: Option::Some(StateDelta {
+      place: "y".to_string(),
+      old_value: "0".to_string(),
+      new_value: y_value.clone()
+    }),
+    choice: Option::None
+  })
+  replay_record(revision, supplies)
+end
+
+# The P1-9 lane: typed tokens/rows, record/run round trip, semantic
+# compare vs token-inclusive first_divergence, the sync-edge
+# happens-before closure and the sync-aware slice, the last-writer
+# fallback, and the untyped-legacy rejection. Empty = the lane verifies.
+pub def replay_typed_lane_check() -> Vec[String]
+  var out: Vec[String] = Vec::new()
+
+  # ———— T1: canonical tokens / kinds / rows ————
+  replay_lane_expect_word(&mut out, "T1-scheduler-token",
+    replay_choice_token(ReplayChoice::Scheduler(7)), "scheduler:7")
+  replay_lane_expect_word(&mut out, "T1-time-token",
+    replay_choice_token(ReplayChoice::Time(1000)), "time:1000")
+  replay_lane_expect_word(&mut out, "T1-random-token",
+    replay_choice_token(ReplayChoice::Random(42)), "random:42")
+  replay_lane_expect_word(&mut out, "T1-external-token",
+    replay_choice_token(ReplayChoice::ExternalRead(
+      "env:A".to_string(), "b".to_string())),
+    "external:\"env:A\"=\"b\"")
+  replay_lane_expect_word(&mut out, "T1-external-kind",
+    replay_choice_kind(ReplayChoice::ExternalRead(
+      "fs:p".to_string(), "v".to_string())), "external")
+  replay_lane_expect_word(&mut out, "T1-external-row",
+    replay_choice_row(ReplayChoice::ExternalRead(
+      "fs:p".to_string(), "v".to_string())),
+    "{\"kind\":\"external\",\"source\":\"fs:p\",\"value\":\"v\"}")
+
+  # ———— T2: record builds typed events and typed §33 sites ————
+  let a = replay_lane_fixture("rev-a".to_string(), 1, "7".to_string())
+  replay_lane_expect_int(&mut out, "T2-record-len", a.events.len(), 4)
+  replay_lane_expect_bool(&mut out, "T2-event0-deterministic",
+    a.events[0].choice.is_none())
+  replay_lane_expect_bool(&mut out, "T2-event2-typed",
+    a.events[2].choice.is_some())
+  replay_lane_expect_word(&mut out, "T2-event2-token",
+    a.events[2].id.nondeterminism_token.clone(), "scheduler:1")
+  replay_lane_expect_bool(&mut out, "T2-event2-site-typed",
+    a.events[2].site.is_some())
+  var site_key = ""
+  match a.events[2].site.clone()
+  when Option::Some(m) then site_key = m.stable_key.clone()
+  when Option::None then ()
+  end
+  replay_lane_expect_word(&mut out, "T2-event2-site-key", site_key, "worker#B0#S0")
+  var rows = replay_trace_rows(&a)
+  replay_lane_expect_bool(&mut out, "T2-header-v3",
+    rows[0].contains("tg-compiler-replay/v3"))
+  replay_lane_expect_bool(&mut out, "T2-row-choice-column",
+    rows[3].contains("\"choice\":{\"kind\":\"scheduler\",\"decision\":1}"))
+  replay_lane_expect_bool(&mut out, "T2-row-site-column",
+    rows[3].contains("\"site\":\"worker#B0#S0\""))
+
+  # ———— T3: the deterministic choice stream ————
+  let steps = replay_run(&a)
+  replay_lane_expect_int(&mut out, "T3-stream-len", steps.len(), 1)
+  replay_lane_expect_word(&mut out, "T3-step-site",
+    steps[0].site.stmt_key.clone(), "worker#B0#S0")
+  replay_lane_expect_word(&mut out, "T3-step-token",
+    replay_choice_token(steps[0].choice.clone()), "scheduler:1")
+  let choices = replay_run_choices(&a)
+  replay_lane_expect_int(&mut out, "T3-choices-len", choices.len(), 1)
+  replay_lane_expect_bool(&mut out, "T3-trace-typed", replay_trace_is_typed(&a))
+  let a2 = replay_lane_fixture("rev-a".to_string(), 1, "7".to_string())
+  let da = replay_run_digest(&a)
+  let da2 = replay_run_digest(&a2)
+  replay_lane_expect_bool(&mut out, "T3-run-digest-stable",
+    da.hi == da2.hi && da.lo == da2.lo)
+  let b_choice2 = replay_lane_fixture("rev-a".to_string(), 2, "7".to_string())
+  let db = replay_run_digest(&b_choice2)
+  replay_lane_expect_bool(&mut out, "T3-run-digest-choice-sensitive",
+    !(da.hi == db.hi && da.lo == db.lo))
+
+  # ———— T4: semantic compare vs token-inclusive first_divergence ————
+  let c = replay_lane_fixture("rev-c".to_string(), 2, "7".to_string())
+  let b = replay_lane_fixture("rev-b".to_string(), 2, "9".to_string())
+  match first_divergence(&a, &c)
+  when Option::Some(id) then
+    replay_lane_expect_int(&mut out, "T4-first-divergence-seq", id.sequence, 2)
+  when Option::None then
+    out.push("T4-first-divergence: expected Some, got None")
+  end
+  match replay_compare(&a, &c)
+  when Option::Some(id) then
+    out.push("T4-compare-choice-only: expected None, got seq " + id.sequence.to_string())
+  when Option::None then ()
+  end
+  match replay_compare(&a, &b)
+  when Option::Some(id) then
+    replay_lane_expect_int(&mut out, "T4-compare-semantic-seq", id.sequence, 3)
+  when Option::None then
+    out.push("T4-compare-semantic: expected Some, got None")
+  end
+
+  # ———— T5: explicit sync edges and the happens-before closure ————
+  let send_id = b.events[1].id.clone()
+  let recv_id = b.events[2].id.clone()
+  let div_id = b.events[3].id.clone()
+  let edge = sync_edge_send_recv("chan:1".to_string(), send_id.clone(), recv_id.clone())
+  replay_lane_expect_bool(&mut out, "T5-edge-valid", sync_edge_valid(edge.clone()))
+  replay_lane_expect_bool(&mut out, "T5-edge-row-subject",
+    sync_edge_row(edge.clone()).contains("\"subject\":\"chan:1\""))
+  replay_lane_expect_bool(&mut out, "T5-edge-row-kind",
+    sync_edge_row(edge.clone()).contains("\"kind\":\"send-recv\""))
+  let edges = Vec::from([edge.clone()])
+  var no_edges: Vec[SyncEdge] = Vec::new()
+  replay_lane_expect_bool(&mut out, "T5-hb-direct",
+    sync_happens_before(&b, &edges, send_id.clone(), recv_id.clone()))
+  replay_lane_expect_bool(&mut out, "T5-hb-transitive-program-order",
+    sync_happens_before(&b, &edges, send_id.clone(), div_id.clone()))
+  replay_lane_expect_bool(&mut out, "T5-hb-fallback-no-edges",
+    !sync_happens_before(&b, &no_edges, send_id.clone(), div_id.clone()))
+  replay_lane_expect_bool(&mut out, "T5-lock-kind-valid",
+    sync_edge_kind_valid(sync_edge_kind_lock_unlock()))
+  replay_lane_expect_bool(&mut out, "T5-start-kind-valid",
+    sync_edge_kind_valid(sync_edge_kind_start_join()))
+  replay_lane_expect_bool(&mut out, "T5-unknown-kind-invalid",
+    !sync_edge_kind_valid("barrier".to_string()))
+  let bad_edge = SyncEdge {
+    kind: "barrier".to_string(),
+    from_id: send_id.clone(),
+    to_id: recv_id.clone()
+  }
+  replay_lane_expect_bool(&mut out, "T5-invalid-edge-rejected",
+    !sync_edge_valid(bad_edge.clone()))
+
+  # ———— T6: sync-aware predecessors and slices vs the fallback ————
+  let preds_sync = causal_predecessors_with_sync(&b, div_id.clone(), edges.clone())
+  replay_lane_expect_int(&mut out, "T6-sync-preds-len", preds_sync.len(), 3)
+  replay_lane_expect_bool(&mut out, "T6-sync-preds-include-send",
+    replay_id_list_contains(&preds_sync, send_id.clone()))
+  let preds_fallback = causal_predecessors(&b, div_id.clone())
+  replay_lane_expect_int(&mut out, "T6-fallback-preds-len", preds_fallback.len(), 1)
+  replay_lane_expect_bool(&mut out, "T6-fallback-preds-exclude-send",
+    !replay_id_list_contains(&preds_fallback, send_id.clone()))
+  let slice_sync = replay_slice(&a, &b, edges.clone())
+  replay_lane_expect_int(&mut out, "T6-slice-sync-len", slice_sync.len(), 4)
+  replay_lane_expect_bool(&mut out, "T6-slice-sync-include-send",
+    replay_id_list_contains(&slice_sync, send_id.clone()))
+  let slice_fallback = replay_slice(&a, &b, no_edges.clone())
+  replay_lane_expect_int(&mut out, "T6-slice-fallback-len", slice_fallback.len(), 2)
+  replay_lane_expect_bool(&mut out, "T6-slice-fallback-exclude-send",
+    !replay_id_list_contains(&slice_fallback, send_id.clone()))
+  let slice_none = replay_slice(&a, &a2, edges.clone())
+  replay_lane_expect_int(&mut out, "T6-slice-no-divergence-empty", slice_none.len(), 0)
+
+  # ———— T7: the untyped-legacy rejection ————
+  var lb = replay_builder_new("rev-legacy".to_string())
+  replay_builder_append(&mut lb, "main".to_string(),
+    "m::main#fn()->unit".to_string(), "main#B0#S0".to_string(), 0,
+    "read".to_string(), Option::None, "external:opaque".to_string())
+  let legacy = replay_builder_finish(lb)
+  replay_lane_expect_bool(&mut out, "T7-legacy-untyped",
+    !replay_trace_is_typed(&legacy))
+  let legacy_run = replay_run(&legacy)
+  replay_lane_expect_int(&mut out, "T7-legacy-run-empty", legacy_run.len(), 0)
+  var nb = replay_builder_new("rev-nosite".to_string())
+  replay_builder_append(&mut nb, "main".to_string(),
+    "m::main#fn()->unit".to_string(), "op:side".to_string(), 0,
+    "read".to_string(), Option::None)
+  let nosite = replay_builder_finish(nb)
+  replay_lane_expect_bool(&mut out, "T7-non-mir-site-null",
+    nosite.events[0].site.is_none())
+
+  out
+end
+
+# One lane assertion over a String word (a mismatch row names the row, the
+# wanted and the got words).
+def replay_lane_expect_word(inout out: Vec[String], name: String, got: String, want: String) -> Unit
+  if got != want then
+    out.push(name + ": expected `" + want.clone() + "`, got `" + got.clone() + "`")
+  end
+  ()
+end
+
+# One lane assertion over an Int value.
+def replay_lane_expect_int(inout out: Vec[String], name: String, got: Int, want: Int) -> Unit
+  if got != want then
+    out.push(name + ": expected " + want.to_string() + ", got " + got.to_string())
+  end
+  ()
+end
+
+# One lane assertion over a Bool value.
+def replay_lane_expect_bool(inout out: Vec[String], name: String, got: Bool, want: Bool) -> Unit
+  if got != want then
+    out.push(name + ": expected " + want.to_string() + ", got " + got.to_string())
+  end
+  ()
 end

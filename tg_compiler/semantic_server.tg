@@ -76,6 +76,27 @@
 # the server's own tests and typed clients; the internal API is typed and
 # the rows are the record's canonical render — never free-form prose.
 #
+# PROTOCOL V2 (fourth-audit P0-11): the typed tagged protocol — a version
+# word + typed operation id + typed request record in, a typed response
+# record out, with NO operation-name / payload text and NO kind + row text
+# on the wire. The request enum (Target / MirGraph / Slice / Text /
+# Service) carries StableDeclId / StablePlaceId / StableMirStmtId ids and
+# the typed §33 MirSliceRequest; the response enum serializes every
+# existing record family (the twelve SemanticWirePayload records + the
+# MirSlice answer + the ExplainNode tree + a Rows record for the
+# row-list-only ops + the revision digest words + the fail-closed status).
+# The v2 section below documents the encoding, the limits it reuses
+# (MAX_FRAME_BYTES / MAX_FIELD_BYTES / MAX_KEYS), the operation-id model
+# (dense registry index + name digest; names stay debug strings) and the
+# version policy (unknown same-major tags fail closed, never skipped).
+# V1 remains available as the compatibility mode: the frame is shared and
+# byte-compatible, semantic_frame_protocol_version negotiates, and a
+# version-1 request keeps the old text-row request/response path.
+# (Fourth-audit P0-12) ContractResponse is built from the ContractFact
+# record — the id / kind / canonical expression / fingerprint / message
+# are distinct fields; the canonical clause text may contain '|' and is
+# never split.
+#
 #   §39 FRAMING LIMITS (audit item 25) — the request/response parsers
 #   enforce the module constants below on EVERY frame, and every check
 #   runs BEFORE the untrusted bytes drive an allocation (a field length is
@@ -133,26 +154,47 @@
 use std::collections::{Vec}
 use std::fs
 
-use tg_compiler::ids::{StableDigest}
+use tg_compiler::ids::{StableDigest, stable_digest_of}
+use tg_compiler::ast::{AstContractKind}
 use tg_compiler::types::{TypeEnv, TypedProgram}
 use tg_compiler::mir::{MirProgram}
 use tg_compiler::target_desc::{TargetDesc}
 use tg_compiler::parser::{Diagnostic}
 use tg_compiler::semantic_model::{
-  SemanticSnapshot, SemanticResponsePayload, semantic_digest_render, semantic_json_escape
+  SemanticSnapshot, SemanticResponsePayload, ContractFact, StableTargetId,
+  semantic_digest_render, semantic_json_escape, semantic_contract_expr_text
+}
+# (fourth-audit P0-11/P0-12) the typed stable identity records the v2
+# request protocol carries (StableDeclId / StablePlaceId / StableMirStmtId)
+# and the total builders the decoder verifies decoded ids with; the contract
+# response is built from the ContractFact record, never a text split.
+use tg_compiler::stable_ids::{
+  StablePackageId, StableModuleId, DeclLineageId, StableDeclId, StablePlaceId,
+  StableMirStmtId, stable_decl_of_key,
+  stable_decl_identity_text_of, stable_package_id_of, stable_module_id_of,
+  stable_decl_lineage_id_of, stable_mir_stmt_of_key, stable_place_of_text,
+  stable_place_text_of
 }
 use tg_compiler::semantic_snapshot::{semantic_snapshot_digest, semantic_snapshot_parse}
-use tg_compiler::semantic_delta::{SemanticDelta, semantic_delta_of, semantic_delta_empty}
+use tg_compiler::semantic_delta::{SemanticDelta, semantic_delta_of, semantic_delta_empty, DeltaStatus}
 use tg_compiler::semantic_index::{SemanticIndex, build_semantic_index}
 use tg_compiler::semantic_query::{
   QueryResults, SemanticQuerySession, new_semantic_query_session, query,
-  mir_slice, mir_graph_query
+  mir_slice, mir_graph_query, explain_tree
 }
+# (fourth-audit P0-11) the §33 typed slice request/kind the v2 Slice request
+# variant carries.
+use tg_compiler::semantic_slice::{MirSliceRequest, MirSliceKind}
 # (third-audit items 23/24) the persistent diagnostic store the session
 # retains + the stable diagnostic id the add surface returns.
+# (fourth-audit P0-11) the typed ExplainNode tree the v2 Explain response
+# variant serializes (the store-aware diagnostic.explain arm builds its
+# record node).
 use tg_compiler::semantic_diagnostics::{
   DiagnosticStore, StableDiagnosticId, new_diagnostic_store,
-  diagnostic_store_add, diagnostic_store_add_all
+  diagnostic_store_add, diagnostic_store_add_all,
+  ExplainNode, diagnostic_record_explain_node, store_match, store_len,
+  explain_text_node, explain_node_child
 }
 # The §37 verification evidence (proof_patch.tg — audit item 20): the
 # session's evidence slot carries the compilation's
@@ -237,9 +279,11 @@ end
 # related rows — the store's span / semantic-class spine rows stay
 # reachable through diagnostic.explain); ContractResponse carries ONE
 # clause, so the multi-row contract ops keep their §38 rows (the dispatch
-# maps only the single-clause answer); the purity.get status + ordered
-# evidence sequence and the explain tree lines belong to no record family
-# and keep their §38 rows.
+# maps only the single-clause answer), and the record is built from the
+# underlying ContractFact — never parsed out of the canonical clause text,
+# which may contain '|' (fourth-audit P0-12); the purity.get status +
+# ordered evidence sequence and the explain tree lines belong to no record
+# family and keep their §38 rows.
 
 pub struct CallersResponse
   target: String
@@ -276,9 +320,18 @@ pub struct OwnershipResponse
   rows: Vec[String] = Vec::new()
 end
 
+# (fourth-audit P0-12) ContractResponse carries the ContractFact's four
+# DISTINCT content fields: the stable clause id (the §31 row key text —
+# "fn|kind|canonical"), the kind word, the canonical expression render, the
+# expression fingerprint render and the declared message (Option::None
+# renders ""). The canonical expression may itself contain '|' and is NEVER
+# a field of contract_id after a text split; the record is built from the
+# ContractFact row (contract_response_of_fact) or from its own wire render
+# (wire_parse_contract) — never parsed out of a canonical row.
 pub struct ContractResponse
   contract_id: String
   kind: String
+  canonical_expression: String = ""
   fingerprint: String
   message: String
 end
@@ -496,6 +549,23 @@ pub def session_delta(old: CompilerSession, new: CompilerSession) -> SemanticDel
   semantic_delta_of(&old.snapshot, &new.snapshot)
 end
 
+# (fourth-audit P0-18) The session delta STATUS: a pair of live sessions
+# always carries two snapshots, so the status is Complete over the session
+# delta. The Option form treats a MISSING old session (no snapshot to diff
+# against) as Unavailable — never an empty delta that a budget could pass.
+pub def session_delta_status(old: CompilerSession, new: CompilerSession) -> DeltaStatus
+  DeltaStatus::Complete(session_delta(&old, &new))
+end
+
+pub def session_delta_status_of(old: Option[CompilerSession], new: CompilerSession) -> DeltaStatus
+  match old
+  when Option::None then
+    DeltaStatus::Unavailable("missing old session snapshot: the session delta cannot be computed")
+  when Option::Some(o) then
+    DeltaStatus::Complete(session_delta(&o, &new))
+  end
+end
+
 # Replace the session after a source revision (the layer diffs with
 # session_delta and drops cached rows for delta.affected keys).
 pub def session_revise(session: CompilerSession, new_snapshot: SemanticSnapshot) -> CompilerSession
@@ -667,6 +737,15 @@ pub def server_operations() -> Vec[ServerOperation]
     server_operation("replay.causal_predecessors".to_string(), "replay".to_string()),
     server_operation("replay.first_divergence".to_string(), "replay".to_string()),
     server_operation("replay.minimal_causal_slice".to_string(), "replay".to_string()),
+    # (P1-9) the typed record/run/compare entries: replay.record builds a
+    # trace from supplied typed choices, replay.run extracts the
+    # deterministic choice stream, replay.diff is the semantic-only
+    # first-divergence compare (semantic_query.tg's module-scope
+    # replay_query serves callers that hold a trace; a §38 session
+    # carries none).
+    server_operation("replay.record".to_string(), "replay".to_string()),
+    server_operation("replay.run".to_string(), "replay".to_string()),
+    server_operation("replay.diff".to_string(), "replay".to_string()),
     server_operation("revision".to_string(), "service".to_string())
   ])
 end
@@ -792,36 +871,82 @@ def server_wire_diagnostic_code_of_id(id_text: String) -> String
   end
 end
 
-# The single-clause §31 contract row ("<fn key>|<kind>|<canonical text>")
-# as the typed record; Option::None on a multi-row or non-canonical answer
-# (the record family is ONE clause — a row list keeps its §38 rows).
-def server_wire_contract_of_row(rows: Vec[String]) -> Option[ContractResponse]
+# (fourth-audit P0-12) The contract kind word of one ContractFact kind
+# (the same "Pre" / "Post" / "Invariant" render the §29/§31 row keys and the
+# index row form use — one vocabulary, mirrored locally so the server never
+# imports the query module's private renderer).
+def server_contract_kind_text(kind: AstContractKind) -> String
+  match kind
+  when AstContractKind::AstPre then "Pre"
+  when AstContractKind::AstPost then "Post"
+  when AstContractKind::AstInvariant then "Invariant"
+  end
+end
+
+# The typed ContractResponse of ONE ContractFact built DIRECTLY from the
+# record: id (the stable clause key), kind, canonical expression,
+# fingerprint and message ride as DISTINCT fields. The message Option::None
+# (no declared message) renders "". No row text is ever split — the
+# canonical expression may contain '|' (P0-12).
+pub def contract_response_of_fact(fact: ContractFact) -> ContractResponse
+  let message = match fact.message.clone()
+  when Option::Some(text) then text.clone()
+  when Option::None then "".to_string()
+  end
+  ContractResponse {
+    contract_id: fact.id.stable_key.clone(),
+    kind: server_contract_kind_text(fact.kind.clone()),
+    canonical_expression: semantic_contract_expr_text(&fact.canonical_expression),
+    fingerprint: semantic_digest_render(&fact.expression_fingerprint),
+    message: message
+  }
+end
+
+# The ContractFact a single-clause contract answer row names, located in
+# the session snapshot BY IDENTITY: the row must equal the fact's stable
+# clause key ("<fn>|<kind>|<canonical>") or the index row form
+# ("<kind>|<canonical>"), both DERIVED from the fact and compared — the
+# answer row is never split into components. Option::None on a multi-row /
+# unmatched answer (the record family is ONE clause; a row list keeps its
+# §38 rows).
+def server_wire_contract_fact(snapshot: SemanticSnapshot, rows: Vec[String]) -> Option[ContractFact]
   if rows.len() != 1 then
     return Option::None
   end
-  let parts = rows[0].clone().split("|")
-  if parts.len() != 3 then
-    return Option::None
+  var found: Option[ContractFact] = Option::None
+  for contract in snapshot.contracts do
+    let row_key = contract.id.stable_key.clone()
+    let index_row = server_contract_kind_text(contract.kind.clone()) + "|" +
+      semantic_contract_expr_text(&contract.canonical_expression)
+    if rows[0] == row_key || rows[0] == index_row then
+      found = Option::Some(contract.clone())
+      break
+    end
   end
-  Option::Some(ContractResponse {
-    contract_id: parts[0].clone(),
-    kind: parts[1].clone(),
-    fingerprint: "".to_string(),
-    message: parts[2].clone()
-  })
+  found
+end
+
+# The single-clause contract answer as the typed record, built from the
+# underlying ContractFact (P0-12: never a split of the canonical clause
+# text). Option::None when no fact in the snapshot owns the single row.
+def server_wire_contract_of_row(snapshot: SemanticSnapshot, rows: Vec[String]) -> Option[ContractResponse]
+  match server_wire_contract_fact(&snapshot, rows)
+  when Option::Some(fact) then Option::Some(contract_response_of_fact(fact))
+  when Option::None then Option::None
+  end
 end
 
 # The typed-wire form of the single-clause contract helper (the enum wrap
 # the dispatch mapping returns).
-def server_wire_contract_payload(rows: Vec[String]) -> Option[SemanticWirePayload]
-  match server_wire_contract_of_row(rows)
+def server_wire_contract_payload(snapshot: SemanticSnapshot, rows: Vec[String]) -> Option[SemanticWirePayload]
+  match server_wire_contract_of_row(&snapshot, rows)
   when Option::Some(record) then Option::Some(SemanticWirePayload::Contract(record))
   when Option::None then Option::None
   end
 end
 
 pub def semantic_wire_payload_of_results(
-  operation: String, arg: String, results: QueryResults
+  operation: String, arg: String, results: QueryResults, snapshot: SemanticSnapshot
 ) -> Option[SemanticWirePayload]
   let rows = results.keys.clone()
   match operation
@@ -909,9 +1034,9 @@ pub def semantic_wire_payload_of_results(
       surface_id: arg.clone(),
       rows: rows.clone()
     }))
-  when "contracts" then server_wire_contract_payload(rows.clone())
-  when "contract_list" then server_wire_contract_payload(rows.clone())
-  when "contract.obligations" then server_wire_contract_payload(rows.clone())
+  when "contracts" then server_wire_contract_payload(&snapshot, rows.clone())
+  when "contract_list" then server_wire_contract_payload(&snapshot, rows.clone())
+  when "contract.obligations" then server_wire_contract_payload(&snapshot, rows.clone())
   when "diagnostic.get" then
     if results.kind != "diagnostic.get" then
       Option::None
@@ -973,14 +1098,16 @@ end
 # serializes it; a parse always yields None there). (Third-audit item 22)
 # the typed WIRE record is built mechanically from the §38 rows and its
 # canonical render becomes the keys field — the wire rows are the record's
-# canonical render, never a second field.
-def session_results_response(req: SemanticRequest, results: QueryResults) -> SemanticResponse
+# canonical render, never a second field. (Fourth-audit P0-12) the contract
+# arm needs the session snapshot to locate the ContractFact the single-row
+# answer belongs to.
+def session_results_response(session: CompilerSession, req: SemanticRequest, results: QueryResults) -> SemanticResponse
   let payload = match results.payload
   when Option::Some(p) then Option::Some(p.clone())
   when Option::None then Option::None
   end
   let wire_payload = semantic_wire_payload_of_results(
-    req.operation.clone(), req.payload.clone(), &results)
+    req.operation.clone(), req.payload.clone(), &results, &session.snapshot)
   let keys = match wire_payload.clone()
   when Option::Some(p) then semantic_wire_payload_render(p)
   when Option::None then results.keys.clone()
@@ -1014,7 +1141,7 @@ pub def session_handle_request(session: CompilerSession, req: SemanticRequest) -
     return session_protocol_error_response(&req)
   end
   let results = session_query_results(&session, req.operation.clone(), req.payload.clone())
-  session_results_response(&req, &results)
+  session_results_response(&session, &req, &results)
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -1250,6 +1377,2609 @@ pub def semantic_response_parse(bytes: Vec[u8]) -> Option[SemanticResponse]
       end
     end
   end
+end
+
+# ———————————————————————————————————————————————————————————————
+# PROTOCOL V2 — the typed tagged wire protocol (fourth-audit P0-11)
+# ———————————————————————————————————————————————————————————————
+# The v2 wire carries TYPED RECORDS instead of operation-name + payload
+# text -> kind + row text. The §39 frame (4-byte BIG-ENDIAN body length ||
+# body) is unchanged and shared with v1; the body is:
+#
+#   request  := version-word u32 || request_id u64 || request-tag u32 ||
+#               <tagged request fields>
+#   response := version-word u32 || request_id u64 || response-tag u32 ||
+#               <tagged response fields>
+#
+# Field encodings (deterministic; no padding, no map iteration):
+#   text   = u32 BE byte length || UTF-8 bytes   (MAX_FIELD_BYTES enforced
+#            by the shared server_read_text BEFORE the slice is allocated)
+#   u64    = 8 bytes big-endian; i64 = the same bytes viewed two's
+#            complement; bool = 1 byte (0/1); option = presence byte || body
+#   count  = u32 BE element count (0 <= count <= MAX_KEYS) || elements
+# The version-word layout is `major << 16 | minor` (major 2, minor 0 today).
+# READER VERSION POLICY (documented choice):
+#   * a version-word with major != 2 is REJECTED (Option::None, fail closed
+#     — the parser never guesses a foreign grammar);
+#   * a same-major word (any minor) is parsed under this grammar; an
+#     UNKNOWN TAG is also REJECTED, never skipped: the parser returns
+#     Option::None and the serve loop terminates without a response, so an
+#     unreadable request is never answered from a guessed interpretation and
+#     the byte stream is never resynchronized onto a misparsed offset.
+#   * the minor number is informational today (zero minor releases exist);
+#     a future minor adds tags, and old readers fail closed on them by the
+#     rule above — the safe direction (skip would risk answering garbage).
+# The operation id is TYPED: a dense index into the §39 registry plus the
+# 128-bit digest of the canonical operation name (semantic_operation_digest).
+# The name text stays a DEBUG string; the wire carries the dense id and the
+# digest words, and the decoder re-derives the name through the registry and
+# verifies the digest (a forged dense id or digest fails closed).
+#
+# V1 COMPATIBILITY (negotiated): the v1 text-row protocol below is
+# untouched and byte-compatible. semantic_frame_protocol_version probes the
+# first body word (a v2 same-major word vs the v1 version-field length) and
+# session_handle_frame routes: a version-1 request takes the v1 parse +
+# session_handle_request + semantic_response_frame path, a version-2 request
+# the v2 path, each answering in the version it was asked in.
+#
+# The request enum variants group the operation families:
+#   Target  — the index / type / ownership / contract / symbol / explain
+#             families: a text key (the op's arg grammar) plus the TYPED
+#             subject id the key denotes (StableDeclId / StablePlaceId /
+#             StableMirStmtId).
+#   MirGraph— the mir graph ops: the function key + its StableDeclId, an
+#             anchor key (mir.block) or right key (mir.diff), or a typed
+#             StableMirStmtId node (mir.path / mir.reaching).
+#   Slice   — mir_slice: the typed §33 MirSliceRequest (function key,
+#             MirSliceKind, anchor).
+#   Text    — the snapshot / diagnostic / plan / replay / edit families
+#             (free-form payload grammar).
+#   Service — the revision service op.
+
+pub const SEMANTIC_PROTOCOL_VERSION_V2: Int = 2
+
+# The version-word layout and the v2 fixed bits.
+const SEMANTIC_V2_MAJOR: Int = 2
+const SEMANTIC_V2_MINOR: Int = 0
+const SEMANTIC_V2_HEADER: Int = 0x00020000
+
+# Request payload tags (never renumber — they are wire identity).
+const V2_REQ_TARGET: Int = 1
+const V2_REQ_MIR_GRAPH: Int = 2
+const V2_REQ_SLICE: Int = 3
+const V2_REQ_TEXT: Int = 4
+const V2_REQ_SERVICE: Int = 5
+
+# Response payload tags (never renumber).
+const V2_RESP_CALLERS: Int = 1
+const V2_RESP_CALLEES: Int = 2
+const V2_RESP_SYMBOLS: Int = 3
+const V2_RESP_TYPE: Int = 4
+const V2_RESP_EFFECTS: Int = 5
+const V2_RESP_OWNERSHIP: Int = 6
+const V2_RESP_CONTRACT: Int = 7
+const V2_RESP_MIR_FUNCTION: Int = 8
+const V2_RESP_ABI: Int = 9
+const V2_RESP_DIAGNOSTIC: Int = 10
+const V2_RESP_DELTA: Int = 11
+const V2_RESP_PLAN: Int = 12
+const V2_RESP_MIR_SLICE: Int = 13
+const V2_RESP_EXPLAIN: Int = 14
+const V2_RESP_ROWS: Int = 15
+const V2_RESP_REVISION: Int = 16
+const V2_RESP_STATUS: Int = 17
+
+# Typed id tags inside the Target id union / the MirGraph node option.
+const V2_ID_DECL: Int = 1
+const V2_ID_PLACE: Int = 2
+const V2_ID_MIR_STMT: Int = 3
+
+# ———— The typed operation id ————
+
+pub struct SemanticOperationId
+  dense_id: Int
+  digest_hi: UInt = 0
+  digest_lo: UInt = 0
+end
+
+def semantic_operation_id_text(id: SemanticOperationId) -> String
+  "op:" + id.dense_id.to_string() + ":" + id.digest_hi.to_string() + "-" + id.digest_lo.to_string()
+end
+
+# The 128-bit digest of the canonical operation name (domain-separated:
+# the "semantic-op|" prefix keeps the operation-id digest space disjoint
+# from every stable key digest).
+pub def semantic_operation_digest(name: String) -> StableDigest
+  let text = "semantic-op|" + name
+  stable_digest_of(&text)
+end
+
+# The typed id of a registered operation: the registry position (dense
+# index — the registry is the dispatch authority) + the name digest words.
+# Option::None for a name the registry does not declare.
+pub def semantic_operation_id_of(name: String) -> Option[SemanticOperationId]
+  var index = 0
+  for op in server_operations() do
+    if op.name == name then
+      let digest = semantic_operation_digest(name.clone())
+      return Option::Some(SemanticOperationId {
+        dense_id: index,
+        digest_hi: digest.hi,
+        digest_lo: digest.lo
+      })
+    end
+    index = index + 1
+  end
+  Option::None
+end
+
+# The registry name a typed id denotes: the dense index resolves the name
+# and the digest words are RE-DERIVED and compared — a forged index or
+# digest fails closed (Option::None). The name stays a debug string.
+pub def semantic_operation_name_of(id: SemanticOperationId) -> Option[String]
+  let operations = server_operations()
+  if id.dense_id < 0 || id.dense_id >= operations.len() then
+    return Option::None
+  end
+  let name = operations[id.dense_id].name.clone()
+  let digest = semantic_operation_digest(name.clone())
+  if digest.hi != id.digest_hi || digest.lo != id.digest_lo then
+    return Option::None
+  end
+  Option::Some(name)
+end
+
+# ———— The typed v2 records ————
+
+# The typed subject id a Target request names: a declaration identity, a
+# place identity (the digest-words carrier: canonical place text + digest
+# words) or a MIR statement identity.
+pub enum SemanticTargetId
+  Decl(decl: StableDeclId)
+  Place(place: StablePlaceId)
+  MirStmt(stmt: StableMirStmtId)
+end
+
+pub enum SemanticRequestV2Payload
+  Target(operation: SemanticOperationId, key: String, target: SemanticTargetId)
+  MirGraph(operation: SemanticOperationId, function_key: String, function: StableDeclId, anchor_key: String, right_key: String, node: Option[StableMirStmtId])
+  Slice(operation: SemanticOperationId, request: MirSliceRequest)
+  Text(operation: SemanticOperationId, arg: String)
+  Service(operation: SemanticOperationId)
+end
+
+pub struct SemanticRequestV2
+  protocol_version: Int
+  request_id: Int
+  payload: SemanticRequestV2Payload
+end
+
+# The typed MirSlice answer (the QueryResults §33 payload lifted, plus the
+# §38 kind word so the unavailable/error answers stay typed).
+pub struct MirSliceResponse
+  kind: String
+  statements: Vec[String] = Vec::new()
+  externals: Vec[String] = Vec::new()
+end
+
+# The typed row-list answer of the ops with no dedicated record family:
+# the §38 answer kind + the canonical rows. Every registry op is covered by
+# one of the v2 response variants.
+pub struct RowsResponse
+  kind: String
+  rows: Vec[String] = Vec::new()
+end
+
+# The typed revision service answer: the session's content-addressed
+# revision digest WORDS (not the rendered text).
+pub struct RevisionResponse
+  revision_hi: UInt = 0
+  revision_lo: UInt = 0
+end
+
+# The typed fail-closed / unavailable / unknown answer. ok=false only for a
+# protocol error (an unresolvable operation id, a version mismatch);
+# unavailable/unknown §38 kinds keep ok=true and their kind word, exactly
+# like the v1 envelope's ok field.
+pub struct StatusResponse
+  ok: Bool
+  kind: String
+  message: String = ""
+end
+
+pub enum SemanticResponseV2Payload
+  Callers(record: CallersResponse)
+  Callees(record: CalleesResponse)
+  Symbols(record: SymbolsResponse)
+  Type(record: TypeResponse)
+  Effects(record: EffectsResponse)
+  Ownership(record: OwnershipResponse)
+  Contract(record: ContractResponse)
+  MirFunction(record: MirFunctionResponse)
+  Abi(record: AbiResponse)
+  Diagnostic(record: DiagnosticResponse)
+  Delta(record: DeltaResponse)
+  Plan(record: PlanResponse)
+  MirSlice(record: MirSliceResponse)
+  Explain(record: ExplainNode)
+  Rows(record: RowsResponse)
+  Revision(record: RevisionResponse)
+  Status(record: StatusResponse)
+end
+
+pub struct SemanticResponseV2
+  protocol_version: Int
+  request_id: Int
+  payload: SemanticResponseV2Payload
+end
+
+# The MirSliceKind wire code (stable across revisions — never renumbered)
+# and the §33 request text grammar's kind word (the same vocabulary
+# semantic_query's mir_slice adapter parses).
+def v2_mir_slice_kind_code(kind: MirSliceKind) -> Int
+  match kind
+  when MirSliceKind::BackwardDataflow then 0
+  when MirSliceKind::ForwardDataflow then 1
+  when MirSliceKind::ControlDependence then 2
+  when MirSliceKind::Ownership then 3
+  when MirSliceKind::Effects then 4
+  when MirSliceKind::Failure then 5
+  when MirSliceKind::ReturnValue then 6
+  when MirSliceKind::Dominators then 7
+  when MirSliceKind::PostDominators then 8
+  when MirSliceKind::Loops then 9
+  when MirSliceKind::ReachingDefs then 10
+  when MirSliceKind::Path then 11
+  end
+end
+
+def v2_mir_slice_kind_of_code(code: Int) -> Option[MirSliceKind]
+  match code
+  when 0 then Option::Some(MirSliceKind::BackwardDataflow)
+  when 1 then Option::Some(MirSliceKind::ForwardDataflow)
+  when 2 then Option::Some(MirSliceKind::ControlDependence)
+  when 3 then Option::Some(MirSliceKind::Ownership)
+  when 4 then Option::Some(MirSliceKind::Effects)
+  when 5 then Option::Some(MirSliceKind::Failure)
+  when 6 then Option::Some(MirSliceKind::ReturnValue)
+  when 7 then Option::Some(MirSliceKind::Dominators)
+  when 8 then Option::Some(MirSliceKind::PostDominators)
+  when 9 then Option::Some(MirSliceKind::Loops)
+  when 10 then Option::Some(MirSliceKind::ReachingDefs)
+  when 11 then Option::Some(MirSliceKind::Path)
+  when _ then Option::None
+  end
+end
+
+def v2_mir_slice_kind_word(kind: MirSliceKind) -> String
+  match kind
+  when MirSliceKind::BackwardDataflow then "backward"
+  when MirSliceKind::ForwardDataflow then "forward"
+  when MirSliceKind::ControlDependence then "control"
+  when MirSliceKind::Ownership then "ownership"
+  when MirSliceKind::Effects then "effects"
+  when MirSliceKind::Failure then "failure"
+  when MirSliceKind::ReturnValue then "return"
+  when MirSliceKind::Dominators then "dominators"
+  when MirSliceKind::PostDominators then "postdominators"
+  when MirSliceKind::Loops then "loops"
+  when MirSliceKind::ReachingDefs then "reaching"
+  when MirSliceKind::Path then "path"
+  end
+end
+
+# ———— The v2 encoding primitives ———
+
+def v2_push_u64(inout out: Vec[u8], v: UInt) -> Unit
+  out.push(((v >> 56) & 0xFF) as u8)
+  out.push(((v >> 48) & 0xFF) as u8)
+  out.push(((v >> 40) & 0xFF) as u8)
+  out.push(((v >> 32) & 0xFF) as u8)
+  out.push(((v >> 24) & 0xFF) as u8)
+  out.push(((v >> 16) & 0xFF) as u8)
+  out.push(((v >> 8) & 0xFF) as u8)
+  out.push((v & 0xFF) as u8)
+end
+
+def v2_read_u64(bytes: Vec[u8], inout at: Int) -> Option[UInt]
+  if at < 0 || at + 8 > bytes.len() then
+    return Option::None
+  end
+  var value: UInt = 0
+  var i = 0
+  while i < 8 do
+    value = (value << 8) | (bytes[at + i] as UInt)
+    i = i + 1
+  end
+  at = at + 8
+  Option::Some(value)
+end
+
+def v2_push_i64(inout out: Vec[u8], v: Int) -> Unit
+  v2_push_u64(out, v as UInt)
+end
+
+def v2_read_i64(bytes: Vec[u8], inout at: Int) -> Option[Int]
+  match v2_read_u64(&bytes, &mut at)
+  when Option::None then Option::None
+  when Option::Some(value) then Option::Some(value as Int)
+  end
+end
+
+def v2_push_bool(inout out: Vec[u8], v: Bool) -> Unit
+  if v then
+    out.push(1 as u8)
+  else
+    out.push(0 as u8)
+  end
+end
+
+def v2_read_bool(bytes: Vec[u8], inout at: Int) -> Option[Bool]
+  if at < 0 || at >= bytes.len() then
+    return Option::None
+  end
+  let byte = bytes[at]
+  at = at + 1
+  if byte == 1 as u8 then
+    Option::Some(true)
+  elsif byte == 0 as u8 then
+    Option::Some(false)
+  else
+    Option::None
+  end
+end
+
+def v2_push_count(inout out: Vec[u8], n: Int) -> Unit
+  server_push_u32(out, n)
+end
+
+# A vector count is range-checked (0 <= n <= MAX_KEYS) BEFORE the loop
+# allocates elements — the v2 reading of the §39 MAX_KEYS limit.
+def v2_read_count(bytes: Vec[u8], inout at: Int) -> Option[Int]
+  match server_read_u32(&bytes, &mut at)
+  when Option::None then Option::None
+  when Option::Some(n) then
+    if n < 0 || n > MAX_KEYS then
+      Option::None
+    else
+      Option::Some(n)
+    end
+  end
+end
+
+def v2_push_texts(inout out: Vec[u8], texts: Vec[String]) -> Unit
+  v2_push_count(out, texts.len())
+  for text in texts do
+    server_push_text(out, text.clone())
+  end
+end
+
+def v2_read_texts(bytes: Vec[u8], inout at: Int) -> Option[Vec[String]]
+  match v2_read_count(&bytes, &mut at)
+  when Option::None then Option::None
+  when Option::Some(count) then
+    var out: Vec[String] = Vec::new()
+    var i = 0
+    while i < count do
+      match server_read_text(&bytes, &mut at)
+      when Option::None then return Option::None
+      when Option::Some(text) then out.push(text.clone())
+      end
+      i = i + 1
+    end
+    Option::Some(out)
+  end
+end
+
+def v2_bytes_eq(a: Vec[u8], b: Vec[u8]) -> Bool
+  if a.len() != b.len() then
+    return false
+  end
+  var i = 0
+  while i < a.len() do
+    if a[i] != b[i] then
+      return false
+    end
+    i = i + 1
+  end
+  true
+end
+
+# ———— The typed id codecs (StableDeclId / StablePlaceId / StableMirStmtId) ———
+
+# A StableDeclId rides structurally: every package / module / lineage /
+# kind / display-key field and the digest words. The decoder REBUILDS the
+# nested records and verifies every digest pair against the total builders
+# (stable_package_id_of / stable_module_id_of / stable_decl_lineage_id_of /
+# stable_decl_identity_text_of) — a forged word or mismatched lineage fails
+# closed.
+def v2_push_decl(inout out: Vec[u8], decl: StableDeclId) -> Unit
+  server_push_text(out, decl.package.key.clone())
+  v2_push_u64(out, decl.package.digest_hi)
+  v2_push_u64(out, decl.package.digest_lo)
+  server_push_text(out, decl.module.package.key.clone())
+  v2_push_u64(out, decl.module.package.digest_hi)
+  v2_push_u64(out, decl.module.package.digest_lo)
+  server_push_text(out, decl.module.path.clone())
+  v2_push_u64(out, decl.module.digest_hi)
+  v2_push_u64(out, decl.module.digest_lo)
+  server_push_text(out, decl.lineage.package.key.clone())
+  v2_push_u64(out, decl.lineage.package.digest_hi)
+  v2_push_u64(out, decl.lineage.package.digest_lo)
+  server_push_text(out, decl.lineage.module.package.key.clone())
+  v2_push_u64(out, decl.lineage.module.package.digest_hi)
+  v2_push_u64(out, decl.lineage.module.package.digest_lo)
+  server_push_text(out, decl.lineage.module.path.clone())
+  v2_push_u64(out, decl.lineage.module.digest_hi)
+  v2_push_u64(out, decl.lineage.module.digest_lo)
+  v2_push_i64(out, decl.lineage.lineage)
+  v2_push_u64(out, decl.lineage.digest_hi)
+  v2_push_u64(out, decl.lineage.digest_lo)
+  server_push_text(out, decl.kind.clone())
+  server_push_text(out, decl.display_key.clone())
+  v2_push_u64(out, decl.digest_hi)
+  v2_push_u64(out, decl.digest_lo)
+end
+
+def v2_decl_digests_ok(decl: StableDeclId) -> Bool
+  let package = stable_package_id_of(decl.package.key.clone())
+  if package.digest_hi != decl.package.digest_hi || package.digest_lo != decl.package.digest_lo then
+    return false
+  end
+  let module_package = stable_package_id_of(decl.module.package.key.clone())
+  if module_package.digest_hi != decl.module.package.digest_hi ||
+    module_package.digest_lo != decl.module.package.digest_lo then
+    return false
+  end
+  let module = stable_module_id_of(module_package.clone(), decl.module.path.clone())
+  if module.digest_hi != decl.module.digest_hi || module.digest_lo != decl.module.digest_lo then
+    return false
+  end
+  let lineage_package = stable_package_id_of(decl.lineage.package.key.clone())
+  if lineage_package.digest_hi != decl.lineage.package.digest_hi ||
+    lineage_package.digest_lo != decl.lineage.package.digest_lo then
+    return false
+  end
+  let lineage_module_package = stable_package_id_of(decl.lineage.module.package.key.clone())
+  if lineage_module_package.digest_hi != decl.lineage.module.package.digest_hi ||
+    lineage_module_package.digest_lo != decl.lineage.module.package.digest_lo then
+    return false
+  end
+  let lineage_module = stable_module_id_of(lineage_module_package.clone(), decl.lineage.module.path.clone())
+  if lineage_module.digest_hi != decl.lineage.module.digest_hi ||
+    lineage_module.digest_lo != decl.lineage.module.digest_lo then
+    return false
+  end
+  let lineage = stable_decl_lineage_id_of(lineage_package.clone(), lineage_module.clone(), decl.lineage.lineage)
+  if lineage.digest_hi != decl.lineage.digest_hi || lineage.digest_lo != decl.lineage.digest_lo then
+    return false
+  end
+  let identity = stable_digest_of(&stable_decl_identity_text_of(&decl))
+  identity.hi == decl.digest_hi && identity.lo == decl.digest_lo
+end
+
+def v2_read_decl(bytes: Vec[u8], inout at: Int) -> Option[StableDeclId]
+  match server_read_text(&bytes, &mut at)
+  when Option::None then Option::None
+  when Option::Some(package_key) then
+    match v2_read_u64(&bytes, &mut at)
+    when Option::None then Option::None
+    when Option::Some(package_hi) then
+      match v2_read_u64(&bytes, &mut at)
+      when Option::None then Option::None
+      when Option::Some(package_lo) then
+        match server_read_text(&bytes, &mut at)
+        when Option::None then Option::None
+        when Option::Some(module_package_key) then
+          match v2_read_u64(&bytes, &mut at)
+          when Option::None then Option::None
+          when Option::Some(module_package_hi) then
+            match v2_read_u64(&bytes, &mut at)
+            when Option::None then Option::None
+            when Option::Some(module_package_lo) then
+              match server_read_text(&bytes, &mut at)
+              when Option::None then Option::None
+              when Option::Some(module_path) then
+                match v2_read_u64(&bytes, &mut at)
+                when Option::None then Option::None
+                when Option::Some(module_hi) then
+                  match v2_read_u64(&bytes, &mut at)
+                  when Option::None then Option::None
+                  when Option::Some(module_lo) then
+                    match server_read_text(&bytes, &mut at)
+                    when Option::None then Option::None
+                    when Option::Some(lineage_package_key) then
+                      match v2_read_u64(&bytes, &mut at)
+                      when Option::None then Option::None
+                      when Option::Some(lineage_package_hi) then
+                        match v2_read_u64(&bytes, &mut at)
+                        when Option::None then Option::None
+                        when Option::Some(lineage_package_lo) then
+                          match server_read_text(&bytes, &mut at)
+                          when Option::None then Option::None
+                          when Option::Some(lineage_module_package_key) then
+                            match v2_read_u64(&bytes, &mut at)
+                            when Option::None then Option::None
+                            when Option::Some(lineage_module_package_hi) then
+                              match v2_read_u64(&bytes, &mut at)
+                              when Option::None then Option::None
+                              when Option::Some(lineage_module_package_lo) then
+                                match server_read_text(&bytes, &mut at)
+                                when Option::None then Option::None
+                                when Option::Some(lineage_module_path) then
+                                  match v2_read_u64(&bytes, &mut at)
+                                  when Option::None then Option::None
+                                  when Option::Some(lineage_module_hi) then
+                                    match v2_read_u64(&bytes, &mut at)
+                                    when Option::None then Option::None
+                                    when Option::Some(lineage_module_lo) then
+                                      match v2_read_i64(&bytes, &mut at)
+                                      when Option::None then Option::None
+                                      when Option::Some(lineage_number) then
+                                        match v2_read_u64(&bytes, &mut at)
+                                        when Option::None then Option::None
+                                        when Option::Some(lineage_hi) then
+                                          match v2_read_u64(&bytes, &mut at)
+                                          when Option::None then Option::None
+                                          when Option::Some(lineage_lo) then
+                                            match server_read_text(&bytes, &mut at)
+                                            when Option::None then Option::None
+                                            when Option::Some(kind) then
+                                              match server_read_text(&bytes, &mut at)
+                                              when Option::None then Option::None
+                                              when Option::Some(display_key) then
+                                                match v2_read_u64(&bytes, &mut at)
+                                                when Option::None then Option::None
+                                                when Option::Some(decl_hi) then
+                                                  match v2_read_u64(&bytes, &mut at)
+                                                  when Option::None then Option::None
+                                                  when Option::Some(decl_lo) then
+                                                    let package = StablePackageId {
+                                                      key: package_key,
+                                                      digest_hi: package_hi,
+                                                      digest_lo: package_lo
+                                                    }
+                                                    let module_package = StablePackageId {
+                                                      key: module_package_key,
+                                                      digest_hi: module_package_hi,
+                                                      digest_lo: module_package_lo
+                                                    }
+                                                    let module = StableModuleId {
+                                                      package: module_package,
+                                                      path: module_path,
+                                                      digest_hi: module_hi,
+                                                      digest_lo: module_lo
+                                                    }
+                                                    let lineage_package = StablePackageId {
+                                                      key: lineage_package_key,
+                                                      digest_hi: lineage_package_hi,
+                                                      digest_lo: lineage_package_lo
+                                                    }
+                                                    let lineage_module_package = StablePackageId {
+                                                      key: lineage_module_package_key,
+                                                      digest_hi: lineage_module_package_hi,
+                                                      digest_lo: lineage_module_package_lo
+                                                    }
+                                                    let lineage_module = StableModuleId {
+                                                      package: lineage_module_package,
+                                                      path: lineage_module_path,
+                                                      digest_hi: lineage_module_hi,
+                                                      digest_lo: lineage_module_lo
+                                                    }
+                                                    let lineage = DeclLineageId {
+                                                      package: lineage_package,
+                                                      module: lineage_module,
+                                                      lineage: lineage_number,
+                                                      digest_hi: lineage_hi,
+                                                      digest_lo: lineage_lo
+                                                    }
+                                                    let decl = StableDeclId {
+                                                      package: package,
+                                                      module: module,
+                                                      lineage: lineage,
+                                                      kind: kind,
+                                                      display_key: display_key,
+                                                      digest_hi: decl_hi,
+                                                      digest_lo: decl_lo
+                                                    }
+                                                    if v2_decl_digests_ok(decl.clone()) then
+                                                      Option::Some(decl)
+                                                    else
+                                                      Option::None
+                                                    end
+                                                  end
+                                                end
+                                              end
+                                            end
+                                          end
+                                        end
+                                      end
+                                    end
+                                  end
+                                end
+                              end
+                            end
+                          end
+                        end
+                      end
+                    end
+                  end
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+end
+
+# A StablePlaceId rides as its DIGEST WORDS + canonical text render (the
+# structural record needs a type table the wire does not carry); the
+# decoder re-parses the text with the total no-table parser and requires
+# the digest words to agree — a mismatch fails closed. The text render is
+# diagnostic-cargo, but here it is the canonical reconstruction input, and
+# the digest compare makes any ambiguity detectable.
+def v2_push_place(inout out: Vec[u8], place: StablePlaceId) -> Unit
+  server_push_text(out, stable_place_text_of(place.clone()))
+  v2_push_u64(out, place.digest_hi)
+  v2_push_u64(out, place.digest_lo)
+end
+
+def v2_read_place(bytes: Vec[u8], inout at: Int) -> Option[StablePlaceId]
+  match server_read_text(&bytes, &mut at)
+  when Option::None then Option::None
+  when Option::Some(text) then
+    match v2_read_u64(&bytes, &mut at)
+    when Option::None then Option::None
+    when Option::Some(digest_hi) then
+      match v2_read_u64(&bytes, &mut at)
+      when Option::None then Option::None
+      when Option::Some(digest_lo) then
+        match stable_place_of_text(&text)
+        when Option::None then Option::None
+        when Option::Some(place) then
+          if place.digest_hi == digest_hi && place.digest_lo == digest_lo then
+            Option::Some(place)
+          else
+            Option::None
+          end
+        end
+      end
+    end
+  end
+end
+
+# A StableMirStmtId rides structurally (dense id + canonical key + digest
+# words); the decoder rebuilds it through stable_mir_stmt_of_key and
+# requires every field to agree — a forged key or dense id fails closed.
+def v2_push_mir_stmt(inout out: Vec[u8], stmt: StableMirStmtId) -> Unit
+  v2_push_i64(out, stmt.dense_id)
+  server_push_text(out, stmt.stable_key.clone())
+  v2_push_u64(out, stmt.digest_hi)
+  v2_push_u64(out, stmt.digest_lo)
+end
+
+def v2_read_mir_stmt(bytes: Vec[u8], inout at: Int) -> Option[StableMirStmtId]
+  match v2_read_i64(&bytes, &mut at)
+  when Option::None then Option::None
+  when Option::Some(dense_id) then
+    match server_read_text(&bytes, &mut at)
+    when Option::None then Option::None
+    when Option::Some(key) then
+      match v2_read_u64(&bytes, &mut at)
+      when Option::None then Option::None
+      when Option::Some(digest_hi) then
+        match v2_read_u64(&bytes, &mut at)
+        when Option::None then Option::None
+        when Option::Some(digest_lo) then
+          match stable_mir_stmt_of_key(&key)
+          when Option::None then Option::None
+          when Option::Some(stmt) then
+            if stmt.dense_id == dense_id && stmt.digest_hi == digest_hi && stmt.digest_lo == digest_lo then
+              Option::Some(stmt)
+            else
+              Option::None
+            end
+          end
+        end
+      end
+    end
+  end
+end
+
+def v2_push_target(inout out: Vec[u8], target: SemanticTargetId) -> Unit
+  match target
+  when SemanticTargetId::Decl(decl) then
+    server_push_u32(out, V2_ID_DECL)
+    v2_push_decl(out, decl)
+  when SemanticTargetId::Place(place) then
+    server_push_u32(out, V2_ID_PLACE)
+    v2_push_place(out, place)
+  when SemanticTargetId::MirStmt(stmt) then
+    server_push_u32(out, V2_ID_MIR_STMT)
+    v2_push_mir_stmt(out, stmt)
+  end
+end
+
+def v2_read_target(bytes: Vec[u8], inout at: Int) -> Option[SemanticTargetId]
+  match server_read_u32(&bytes, &mut at)
+  when Option::None then Option::None
+  when Option::Some(tag) then
+    if tag == V2_ID_DECL then
+      match v2_read_decl(&bytes, &mut at)
+      when Option::None then Option::None
+      when Option::Some(decl) then Option::Some(SemanticTargetId::Decl(decl))
+      end
+    elsif tag == V2_ID_PLACE then
+      match v2_read_place(&bytes, &mut at)
+      when Option::None then Option::None
+      when Option::Some(place) then Option::Some(SemanticTargetId::Place(place))
+      end
+    elsif tag == V2_ID_MIR_STMT then
+      match v2_read_mir_stmt(&bytes, &mut at)
+      when Option::None then Option::None
+      when Option::Some(stmt) then Option::Some(SemanticTargetId::MirStmt(stmt))
+      end
+    else
+      Option::None
+    end
+  end
+end
+
+def v2_push_operation_id(inout out: Vec[u8], id: SemanticOperationId) -> Unit
+  v2_push_i64(out, id.dense_id)
+  v2_push_u64(out, id.digest_hi)
+  v2_push_u64(out, id.digest_lo)
+end
+
+def v2_read_operation_id(bytes: Vec[u8], inout at: Int) -> Option[SemanticOperationId]
+  match v2_read_i64(&bytes, &mut at)
+  when Option::None then Option::None
+  when Option::Some(dense_id) then
+    match v2_read_u64(&bytes, &mut at)
+    when Option::None then Option::None
+    when Option::Some(digest_hi) then
+      match v2_read_u64(&bytes, &mut at)
+      when Option::None then Option::None
+      when Option::Some(digest_lo) then
+        let id = SemanticOperationId {
+          dense_id: dense_id,
+          digest_hi: digest_hi,
+          digest_lo: digest_lo
+        }
+        match semantic_operation_name_of(id.clone())
+        when Option::None then Option::None
+        when Option::Some(_) then Option::Some(id)
+        end
+      end
+    end
+  end
+end
+
+# The typed §33 request fields, and its canonical text-grammar render (the
+# existing query adapter still consumes the text form).
+def v2_push_slice_request(inout out: Vec[u8], request: MirSliceRequest) -> Unit
+  server_push_text(out, request.function_key.clone())
+  server_push_u32(out, v2_mir_slice_kind_code(request.kind.clone()))
+  server_push_text(out, request.anchor.clone())
+end
+
+def v2_read_slice_request(bytes: Vec[u8], inout at: Int) -> Option[MirSliceRequest]
+  match server_read_text(&bytes, &mut at)
+  when Option::None then Option::None
+  when Option::Some(function_key) then
+    match server_read_u32(&bytes, &mut at)
+    when Option::None then Option::None
+    when Option::Some(kind_code) then
+      match v2_mir_slice_kind_of_code(kind_code)
+      when Option::None then Option::None
+      when Option::Some(kind) then
+        match server_read_text(&bytes, &mut at)
+        when Option::None then Option::None
+        when Option::Some(anchor) then
+          Option::Some(MirSliceRequest {
+            function_key: function_key,
+            kind: kind,
+            anchor: anchor
+          })
+        end
+      end
+    end
+  end
+end
+
+def v2_slice_request_text(request: MirSliceRequest) -> String
+  v2_mir_slice_kind_word(request.kind.clone()) + "|" + request.function_key + "|" + request.anchor
+end
+
+# ———— The typed record codecs (encode + strict decode, field order fixed) ———
+
+def v2_push_callers(inout out: Vec[u8], record: CallersResponse) -> Unit
+  server_push_text(out, record.target.clone())
+  v2_push_texts(out, record.callers.clone())
+end
+
+def v2_read_callers(bytes: Vec[u8], inout at: Int) -> Option[CallersResponse]
+  match server_read_text(&bytes, &mut at)
+  when Option::None then Option::None
+  when Option::Some(target) then
+    match v2_read_texts(&bytes, &mut at)
+    when Option::None then Option::None
+    when Option::Some(callers) then
+      Option::Some(CallersResponse { target: target, callers: callers })
+    end
+  end
+end
+
+def v2_push_callees(inout out: Vec[u8], record: CalleesResponse) -> Unit
+  server_push_text(out, record.function.clone())
+  v2_push_texts(out, record.callees.clone())
+end
+
+def v2_read_callees(bytes: Vec[u8], inout at: Int) -> Option[CalleesResponse]
+  match server_read_text(&bytes, &mut at)
+  when Option::None then Option::None
+  when Option::Some(function) then
+    match v2_read_texts(&bytes, &mut at)
+    when Option::None then Option::None
+    when Option::Some(callees) then
+      Option::Some(CalleesResponse { function: function, callees: callees })
+    end
+  end
+end
+
+def v2_push_symbols(inout out: Vec[u8], record: SymbolsResponse) -> Unit
+  server_push_text(out, record.query.clone())
+  v2_push_texts(out, record.symbols.clone())
+end
+
+def v2_read_symbols(bytes: Vec[u8], inout at: Int) -> Option[SymbolsResponse]
+  match server_read_text(&bytes, &mut at)
+  when Option::None then Option::None
+  when Option::Some(query) then
+    match v2_read_texts(&bytes, &mut at)
+    when Option::None then Option::None
+    when Option::Some(symbols) then
+      Option::Some(SymbolsResponse { query: query, symbols: symbols })
+    end
+  end
+end
+
+def v2_push_type(inout out: Vec[u8], record: TypeResponse) -> Unit
+  server_push_text(out, record.type_key.clone())
+  server_push_text(out, record.kind.clone())
+  v2_push_i64(out, record.size)
+  v2_push_i64(out, record.alignment)
+  v2_push_texts(out, record.fields.clone())
+end
+
+def v2_read_type(bytes: Vec[u8], inout at: Int) -> Option[TypeResponse]
+  match server_read_text(&bytes, &mut at)
+  when Option::None then Option::None
+  when Option::Some(type_key) then
+    match server_read_text(&bytes, &mut at)
+    when Option::None then Option::None
+    when Option::Some(kind) then
+      match v2_read_i64(&bytes, &mut at)
+      when Option::None then Option::None
+      when Option::Some(size) then
+        match v2_read_i64(&bytes, &mut at)
+        when Option::None then Option::None
+        when Option::Some(alignment) then
+          match v2_read_texts(&bytes, &mut at)
+          when Option::None then Option::None
+          when Option::Some(fields) then
+            Option::Some(TypeResponse {
+              type_key: type_key,
+              kind: kind,
+              size: size,
+              alignment: alignment,
+              fields: fields
+            })
+          end
+        end
+      end
+    end
+  end
+end
+
+def v2_push_effects(inout out: Vec[u8], record: EffectsResponse) -> Unit
+  server_push_text(out, record.function.clone())
+  v2_push_i64(out, record.bits)
+  v2_push_texts(out, record.capabilities.clone())
+  server_push_text(out, record.purity.clone())
+end
+
+def v2_read_effects(bytes: Vec[u8], inout at: Int) -> Option[EffectsResponse]
+  match server_read_text(&bytes, &mut at)
+  when Option::None then Option::None
+  when Option::Some(function) then
+    match v2_read_i64(&bytes, &mut at)
+    when Option::None then Option::None
+    when Option::Some(bits) then
+      match v2_read_texts(&bytes, &mut at)
+      when Option::None then Option::None
+      when Option::Some(capabilities) then
+        match server_read_text(&bytes, &mut at)
+        when Option::None then Option::None
+        when Option::Some(purity) then
+          Option::Some(EffectsResponse {
+            function: function,
+            bits: bits,
+            capabilities: capabilities,
+            purity: purity
+          })
+        end
+      end
+    end
+  end
+end
+
+def v2_push_ownership(inout out: Vec[u8], record: OwnershipResponse) -> Unit
+  server_push_text(out, record.function.clone())
+  v2_push_texts(out, record.rows.clone())
+end
+
+def v2_read_ownership(bytes: Vec[u8], inout at: Int) -> Option[OwnershipResponse]
+  match server_read_text(&bytes, &mut at)
+  when Option::None then Option::None
+  when Option::Some(function) then
+    match v2_read_texts(&bytes, &mut at)
+    when Option::None then Option::None
+    when Option::Some(rows) then
+      Option::Some(OwnershipResponse { function: function, rows: rows })
+    end
+  end
+end
+
+def v2_push_contract(inout out: Vec[u8], record: ContractResponse) -> Unit
+  server_push_text(out, record.contract_id.clone())
+  server_push_text(out, record.kind.clone())
+  server_push_text(out, record.canonical_expression.clone())
+  server_push_text(out, record.fingerprint.clone())
+  server_push_text(out, record.message.clone())
+end
+
+def v2_read_contract(bytes: Vec[u8], inout at: Int) -> Option[ContractResponse]
+  match server_read_text(&bytes, &mut at)
+  when Option::None then Option::None
+  when Option::Some(contract_id) then
+    match server_read_text(&bytes, &mut at)
+    when Option::None then Option::None
+    when Option::Some(kind) then
+      match server_read_text(&bytes, &mut at)
+      when Option::None then Option::None
+      when Option::Some(canonical_expression) then
+        match server_read_text(&bytes, &mut at)
+        when Option::None then Option::None
+        when Option::Some(fingerprint) then
+          match server_read_text(&bytes, &mut at)
+          when Option::None then Option::None
+          when Option::Some(message) then
+            Option::Some(ContractResponse {
+              contract_id: contract_id,
+              kind: kind,
+              canonical_expression: canonical_expression,
+              fingerprint: fingerprint,
+              message: message
+            })
+          end
+        end
+      end
+    end
+  end
+end
+
+def v2_push_mir_function(inout out: Vec[u8], record: MirFunctionResponse) -> Unit
+  server_push_text(out, record.function.clone())
+  server_push_text(out, record.summary.clone())
+end
+
+def v2_read_mir_function(bytes: Vec[u8], inout at: Int) -> Option[MirFunctionResponse]
+  match server_read_text(&bytes, &mut at)
+  when Option::None then Option::None
+  when Option::Some(function) then
+    match server_read_text(&bytes, &mut at)
+    when Option::None then Option::None
+    when Option::Some(summary) then
+      Option::Some(MirFunctionResponse { function: function, summary: summary })
+    end
+  end
+end
+
+def v2_push_abi(inout out: Vec[u8], record: AbiResponse) -> Unit
+  server_push_text(out, record.surface_id.clone())
+  v2_push_texts(out, record.rows.clone())
+end
+
+def v2_read_abi(bytes: Vec[u8], inout at: Int) -> Option[AbiResponse]
+  match server_read_text(&bytes, &mut at)
+  when Option::None then Option::None
+  when Option::Some(surface_id) then
+    match v2_read_texts(&bytes, &mut at)
+    when Option::None then Option::None
+    when Option::Some(rows) then
+      Option::Some(AbiResponse { surface_id: surface_id, rows: rows })
+    end
+  end
+end
+
+def v2_push_diagnostic(inout out: Vec[u8], record: DiagnosticResponse) -> Unit
+  server_push_text(out, record.diagnostic_id.clone())
+  server_push_text(out, record.code.clone())
+  server_push_text(out, record.message.clone())
+  v2_push_texts(out, record.related.clone())
+end
+
+def v2_read_diagnostic(bytes: Vec[u8], inout at: Int) -> Option[DiagnosticResponse]
+  match server_read_text(&bytes, &mut at)
+  when Option::None then Option::None
+  when Option::Some(diagnostic_id) then
+    match server_read_text(&bytes, &mut at)
+    when Option::None then Option::None
+    when Option::Some(code) then
+      match server_read_text(&bytes, &mut at)
+      when Option::None then Option::None
+      when Option::Some(message) then
+        match v2_read_texts(&bytes, &mut at)
+        when Option::None then Option::None
+        when Option::Some(related) then
+          Option::Some(DiagnosticResponse {
+            diagnostic_id: diagnostic_id,
+            code: code,
+            message: message,
+            related: related
+          })
+        end
+      end
+    end
+  end
+end
+
+def v2_push_delta(inout out: Vec[u8], record: DeltaResponse) -> Unit
+  v2_push_texts(out, record.rows.clone())
+end
+
+def v2_read_delta(bytes: Vec[u8], inout at: Int) -> Option[DeltaResponse]
+  match v2_read_texts(&bytes, &mut at)
+  when Option::None then Option::None
+  when Option::Some(rows) then Option::Some(DeltaResponse { rows: rows })
+  end
+end
+
+def v2_push_plan(inout out: Vec[u8], record: PlanResponse) -> Unit
+  v2_push_texts(out, record.rows.clone())
+end
+
+def v2_read_plan(bytes: Vec[u8], inout at: Int) -> Option[PlanResponse]
+  match v2_read_texts(&bytes, &mut at)
+  when Option::None then Option::None
+  when Option::Some(rows) then Option::Some(PlanResponse { rows: rows })
+  end
+end
+
+def v2_push_mir_slice(inout out: Vec[u8], record: MirSliceResponse) -> Unit
+  server_push_text(out, record.kind.clone())
+  v2_push_texts(out, record.statements.clone())
+  v2_push_texts(out, record.externals.clone())
+end
+
+def v2_read_mir_slice(bytes: Vec[u8], inout at: Int) -> Option[MirSliceResponse]
+  match server_read_text(&bytes, &mut at)
+  when Option::None then Option::None
+  when Option::Some(kind) then
+    match v2_read_texts(&bytes, &mut at)
+    when Option::None then Option::None
+    when Option::Some(statements) then
+      match v2_read_texts(&bytes, &mut at)
+      when Option::None then Option::None
+      when Option::Some(externals) then
+        Option::Some(MirSliceResponse {
+          kind: kind,
+          statements: statements,
+          externals: externals
+        })
+      end
+    end
+  end
+end
+
+def v2_push_rows(inout out: Vec[u8], record: RowsResponse) -> Unit
+  server_push_text(out, record.kind.clone())
+  v2_push_texts(out, record.rows.clone())
+end
+
+def v2_read_rows(bytes: Vec[u8], inout at: Int) -> Option[RowsResponse]
+  match server_read_text(&bytes, &mut at)
+  when Option::None then Option::None
+  when Option::Some(kind) then
+    match v2_read_texts(&bytes, &mut at)
+    when Option::None then Option::None
+    when Option::Some(rows) then
+      Option::Some(RowsResponse { kind: kind, rows: rows })
+    end
+  end
+end
+
+def v2_push_revision(inout out: Vec[u8], record: RevisionResponse) -> Unit
+  v2_push_u64(out, record.revision_hi)
+  v2_push_u64(out, record.revision_lo)
+end
+
+def v2_read_revision(bytes: Vec[u8], inout at: Int) -> Option[RevisionResponse]
+  match v2_read_u64(&bytes, &mut at)
+  when Option::None then Option::None
+  when Option::Some(revision_hi) then
+    match v2_read_u64(&bytes, &mut at)
+    when Option::None then Option::None
+    when Option::Some(revision_lo) then
+      Option::Some(RevisionResponse {
+        revision_hi: revision_hi,
+        revision_lo: revision_lo
+      })
+    end
+  end
+end
+
+def v2_push_status(inout out: Vec[u8], record: StatusResponse) -> Unit
+  v2_push_bool(out, record.ok)
+  server_push_text(out, record.kind.clone())
+  server_push_text(out, record.message.clone())
+end
+
+def v2_read_status(bytes: Vec[u8], inout at: Int) -> Option[StatusResponse]
+  match v2_read_bool(&bytes, &mut at)
+  when Option::None then Option::None
+  when Option::Some(ok) then
+    match server_read_text(&bytes, &mut at)
+    when Option::None then Option::None
+    when Option::Some(kind) then
+      match server_read_text(&bytes, &mut at)
+      when Option::None then Option::None
+      when Option::Some(message) then
+        Option::Some(StatusResponse { ok: ok, kind: kind, message: message })
+      end
+    end
+  end
+end
+
+def v2_push_explain(inout out: Vec[u8], node: ExplainNode) -> Unit
+  server_push_text(out, node.kind.clone())
+  server_push_text(out, node.subject.clone())
+  server_push_text(out, node.relation.clone())
+  server_push_text(out, node.fact.clone())
+  v2_push_count(out, node.children.len())
+  for child in node.children do
+    v2_push_explain(out, child.clone())
+  end
+end
+
+def v2_read_explain_children(bytes: Vec[u8], inout at: Int, count: Int) -> Option[Vec[ExplainNode]]
+  var children: Vec[ExplainNode] = Vec::new()
+  var i = 0
+  while i < count do
+    match v2_read_explain(&bytes, &mut at)
+    when Option::None then return Option::None
+    when Option::Some(child) then children.push(child.clone())
+    end
+    i = i + 1
+  end
+  Option::Some(children)
+end
+
+def v2_read_explain(bytes: Vec[u8], inout at: Int) -> Option[ExplainNode]
+  match server_read_text(&bytes, &mut at)
+  when Option::None then Option::None
+  when Option::Some(kind) then
+    match server_read_text(&bytes, &mut at)
+    when Option::None then Option::None
+    when Option::Some(subject) then
+      match server_read_text(&bytes, &mut at)
+      when Option::None then Option::None
+      when Option::Some(relation) then
+        match server_read_text(&bytes, &mut at)
+        when Option::None then Option::None
+        when Option::Some(fact) then
+          match v2_read_count(&bytes, &mut at)
+          when Option::None then Option::None
+          when Option::Some(count) then
+            match v2_read_explain_children(&bytes, &mut at, count)
+            when Option::None then Option::None
+            when Option::Some(children) then
+              Option::Some(ExplainNode {
+                kind: kind,
+                subject: subject,
+                relation: relation,
+                fact: fact,
+                children: children
+              })
+            end
+          end
+        end
+      end
+    end
+  end
+end
+
+# ———— The request payload codec ———
+
+def v2_push_request_payload(inout out: Vec[u8], payload: SemanticRequestV2Payload) -> Unit
+  match payload
+  when SemanticRequestV2Payload::Target(operation, key, target) then
+    server_push_u32(out, V2_REQ_TARGET)
+    v2_push_operation_id(out, operation)
+    server_push_text(out, key)
+    v2_push_target(out, target)
+  when SemanticRequestV2Payload::MirGraph(operation, function_key, function, anchor_key, right_key, node) then
+    server_push_u32(out, V2_REQ_MIR_GRAPH)
+    v2_push_operation_id(out, operation)
+    server_push_text(out, function_key)
+    v2_push_decl(out, function)
+    server_push_text(out, anchor_key)
+    server_push_text(out, right_key)
+    match node
+    when Option::Some(stmt) then
+      v2_push_bool(out, true)
+      v2_push_mir_stmt(out, stmt)
+    when Option::None then
+      v2_push_bool(out, false)
+    end
+  when SemanticRequestV2Payload::Slice(operation, request) then
+    server_push_u32(out, V2_REQ_SLICE)
+    v2_push_operation_id(out, operation)
+    v2_push_slice_request(out, request)
+  when SemanticRequestV2Payload::Text(operation, arg) then
+    server_push_u32(out, V2_REQ_TEXT)
+    v2_push_operation_id(out, operation)
+    server_push_text(out, arg)
+  when SemanticRequestV2Payload::Service(operation) then
+    server_push_u32(out, V2_REQ_SERVICE)
+    v2_push_operation_id(out, operation)
+  end
+end
+
+def v2_read_node_option(bytes: Vec[u8], inout at: Int) -> Option[Option[StableMirStmtId]]
+  match v2_read_bool(&bytes, &mut at)
+  when Option::None then Option::None
+  when Option::Some(present) then
+    if present then
+      match v2_read_mir_stmt(&bytes, &mut at)
+      when Option::None then Option::None
+      when Option::Some(stmt) then Option::Some(Option::Some(stmt))
+      end
+    else
+      Option::Some(Option::None)
+    end
+  end
+end
+
+def v2_read_request_payload(bytes: Vec[u8], inout at: Int) -> Option[SemanticRequestV2Payload]
+  match server_read_u32(&bytes, &mut at)
+  when Option::None then Option::None
+  when Option::Some(tag) then
+    if tag == V2_REQ_TARGET then
+      match v2_read_operation_id(&bytes, &mut at)
+      when Option::None then Option::None
+      when Option::Some(operation) then
+        match server_read_text(&bytes, &mut at)
+        when Option::None then Option::None
+        when Option::Some(key) then
+          match v2_read_target(&bytes, &mut at)
+          when Option::None then Option::None
+          when Option::Some(target) then
+            Option::Some(SemanticRequestV2Payload::Target(operation, key, target))
+          end
+        end
+      end
+    elsif tag == V2_REQ_MIR_GRAPH then
+      match v2_read_operation_id(&bytes, &mut at)
+      when Option::None then Option::None
+      when Option::Some(operation) then
+        match server_read_text(&bytes, &mut at)
+        when Option::None then Option::None
+        when Option::Some(function_key) then
+          match v2_read_decl(&bytes, &mut at)
+          when Option::None then Option::None
+          when Option::Some(function) then
+            match server_read_text(&bytes, &mut at)
+            when Option::None then Option::None
+            when Option::Some(anchor_key) then
+              match server_read_text(&bytes, &mut at)
+              when Option::None then Option::None
+              when Option::Some(right_key) then
+                match v2_read_node_option(&bytes, &mut at)
+                when Option::None then Option::None
+                when Option::Some(node) then
+                  Option::Some(SemanticRequestV2Payload::MirGraph(
+                    operation, function_key, function, anchor_key, right_key, node))
+                end
+              end
+            end
+          end
+        end
+      end
+    elsif tag == V2_REQ_SLICE then
+      match v2_read_operation_id(&bytes, &mut at)
+      when Option::None then Option::None
+      when Option::Some(operation) then
+        match v2_read_slice_request(&bytes, &mut at)
+        when Option::None then Option::None
+        when Option::Some(request) then
+          Option::Some(SemanticRequestV2Payload::Slice(operation, request))
+        end
+      end
+    elsif tag == V2_REQ_TEXT then
+      match v2_read_operation_id(&bytes, &mut at)
+      when Option::None then Option::None
+      when Option::Some(operation) then
+        match server_read_text(&bytes, &mut at)
+        when Option::None then Option::None
+        when Option::Some(arg) then
+          Option::Some(SemanticRequestV2Payload::Text(operation, arg))
+        end
+      end
+    elsif tag == V2_REQ_SERVICE then
+      match v2_read_operation_id(&bytes, &mut at)
+      when Option::None then Option::None
+      when Option::Some(operation) then
+        Option::Some(SemanticRequestV2Payload::Service(operation))
+      end
+    else
+      Option::None
+    end
+  end
+end
+
+# ———— The response payload codec ———
+
+def v2_push_response_payload(inout out: Vec[u8], payload: SemanticResponseV2Payload) -> Unit
+  match payload
+  when SemanticResponseV2Payload::Callers(record) then
+    server_push_u32(out, V2_RESP_CALLERS)
+    v2_push_callers(out, record)
+  when SemanticResponseV2Payload::Callees(record) then
+    server_push_u32(out, V2_RESP_CALLEES)
+    v2_push_callees(out, record)
+  when SemanticResponseV2Payload::Symbols(record) then
+    server_push_u32(out, V2_RESP_SYMBOLS)
+    v2_push_symbols(out, record)
+  when SemanticResponseV2Payload::Type(record) then
+    server_push_u32(out, V2_RESP_TYPE)
+    v2_push_type(out, record)
+  when SemanticResponseV2Payload::Effects(record) then
+    server_push_u32(out, V2_RESP_EFFECTS)
+    v2_push_effects(out, record)
+  when SemanticResponseV2Payload::Ownership(record) then
+    server_push_u32(out, V2_RESP_OWNERSHIP)
+    v2_push_ownership(out, record)
+  when SemanticResponseV2Payload::Contract(record) then
+    server_push_u32(out, V2_RESP_CONTRACT)
+    v2_push_contract(out, record)
+  when SemanticResponseV2Payload::MirFunction(record) then
+    server_push_u32(out, V2_RESP_MIR_FUNCTION)
+    v2_push_mir_function(out, record)
+  when SemanticResponseV2Payload::Abi(record) then
+    server_push_u32(out, V2_RESP_ABI)
+    v2_push_abi(out, record)
+  when SemanticResponseV2Payload::Diagnostic(record) then
+    server_push_u32(out, V2_RESP_DIAGNOSTIC)
+    v2_push_diagnostic(out, record)
+  when SemanticResponseV2Payload::Delta(record) then
+    server_push_u32(out, V2_RESP_DELTA)
+    v2_push_delta(out, record)
+  when SemanticResponseV2Payload::Plan(record) then
+    server_push_u32(out, V2_RESP_PLAN)
+    v2_push_plan(out, record)
+  when SemanticResponseV2Payload::MirSlice(record) then
+    server_push_u32(out, V2_RESP_MIR_SLICE)
+    v2_push_mir_slice(out, record)
+  when SemanticResponseV2Payload::Explain(record) then
+    server_push_u32(out, V2_RESP_EXPLAIN)
+    v2_push_explain(out, record)
+  when SemanticResponseV2Payload::Rows(record) then
+    server_push_u32(out, V2_RESP_ROWS)
+    v2_push_rows(out, record)
+  when SemanticResponseV2Payload::Revision(record) then
+    server_push_u32(out, V2_RESP_REVISION)
+    v2_push_revision(out, record)
+  when SemanticResponseV2Payload::Status(record) then
+    server_push_u32(out, V2_RESP_STATUS)
+    v2_push_status(out, record)
+  end
+end
+
+def v2_read_response_payload(bytes: Vec[u8], inout at: Int) -> Option[SemanticResponseV2Payload]
+  match server_read_u32(&bytes, &mut at)
+  when Option::None then Option::None
+  when Option::Some(tag) then
+    if tag == V2_RESP_CALLERS then
+      match v2_read_callers(&bytes, &mut at)
+      when Option::None then Option::None
+      when Option::Some(record) then Option::Some(SemanticResponseV2Payload::Callers(record))
+      end
+    elsif tag == V2_RESP_CALLEES then
+      match v2_read_callees(&bytes, &mut at)
+      when Option::None then Option::None
+      when Option::Some(record) then Option::Some(SemanticResponseV2Payload::Callees(record))
+      end
+    elsif tag == V2_RESP_SYMBOLS then
+      match v2_read_symbols(&bytes, &mut at)
+      when Option::None then Option::None
+      when Option::Some(record) then Option::Some(SemanticResponseV2Payload::Symbols(record))
+      end
+    elsif tag == V2_RESP_TYPE then
+      match v2_read_type(&bytes, &mut at)
+      when Option::None then Option::None
+      when Option::Some(record) then Option::Some(SemanticResponseV2Payload::Type(record))
+      end
+    elsif tag == V2_RESP_EFFECTS then
+      match v2_read_effects(&bytes, &mut at)
+      when Option::None then Option::None
+      when Option::Some(record) then Option::Some(SemanticResponseV2Payload::Effects(record))
+      end
+    elsif tag == V2_RESP_OWNERSHIP then
+      match v2_read_ownership(&bytes, &mut at)
+      when Option::None then Option::None
+      when Option::Some(record) then Option::Some(SemanticResponseV2Payload::Ownership(record))
+      end
+    elsif tag == V2_RESP_CONTRACT then
+      match v2_read_contract(&bytes, &mut at)
+      when Option::None then Option::None
+      when Option::Some(record) then Option::Some(SemanticResponseV2Payload::Contract(record))
+      end
+    elsif tag == V2_RESP_MIR_FUNCTION then
+      match v2_read_mir_function(&bytes, &mut at)
+      when Option::None then Option::None
+      when Option::Some(record) then Option::Some(SemanticResponseV2Payload::MirFunction(record))
+      end
+    elsif tag == V2_RESP_ABI then
+      match v2_read_abi(&bytes, &mut at)
+      when Option::None then Option::None
+      when Option::Some(record) then Option::Some(SemanticResponseV2Payload::Abi(record))
+      end
+    elsif tag == V2_RESP_DIAGNOSTIC then
+      match v2_read_diagnostic(&bytes, &mut at)
+      when Option::None then Option::None
+      when Option::Some(record) then Option::Some(SemanticResponseV2Payload::Diagnostic(record))
+      end
+    elsif tag == V2_RESP_DELTA then
+      match v2_read_delta(&bytes, &mut at)
+      when Option::None then Option::None
+      when Option::Some(record) then Option::Some(SemanticResponseV2Payload::Delta(record))
+      end
+    elsif tag == V2_RESP_PLAN then
+      match v2_read_plan(&bytes, &mut at)
+      when Option::None then Option::None
+      when Option::Some(record) then Option::Some(SemanticResponseV2Payload::Plan(record))
+      end
+    elsif tag == V2_RESP_MIR_SLICE then
+      match v2_read_mir_slice(&bytes, &mut at)
+      when Option::None then Option::None
+      when Option::Some(record) then Option::Some(SemanticResponseV2Payload::MirSlice(record))
+      end
+    elsif tag == V2_RESP_EXPLAIN then
+      match v2_read_explain(&bytes, &mut at)
+      when Option::None then Option::None
+      when Option::Some(record) then Option::Some(SemanticResponseV2Payload::Explain(record))
+      end
+    elsif tag == V2_RESP_ROWS then
+      match v2_read_rows(&bytes, &mut at)
+      when Option::None then Option::None
+      when Option::Some(record) then Option::Some(SemanticResponseV2Payload::Rows(record))
+      end
+    elsif tag == V2_RESP_REVISION then
+      match v2_read_revision(&bytes, &mut at)
+      when Option::None then Option::None
+      when Option::Some(record) then Option::Some(SemanticResponseV2Payload::Revision(record))
+      end
+    elsif tag == V2_RESP_STATUS then
+      match v2_read_status(&bytes, &mut at)
+      when Option::None then Option::None
+      when Option::Some(record) then Option::Some(SemanticResponseV2Payload::Status(record))
+      end
+    else
+      Option::None
+    end
+  end
+end
+
+# ———— The v2 frame codec ———
+
+pub def semantic_request_v2_frame(req: SemanticRequestV2) -> Vec[u8]
+  var body: Vec[u8] = Vec::new()
+  server_push_u32(&mut body, SEMANTIC_V2_HEADER)
+  v2_push_u64(&mut body, req.request_id as UInt)
+  v2_push_request_payload(&mut body, req.payload.clone())
+  server_frame_of(body)
+end
+
+# Parse ONE complete v2 request frame (strict — None on a framing/field/
+# version/tag error; the same MAX_FRAME_BYTES cap as v1; the fields must
+# end exactly at the body end).
+pub def semantic_request_v2_parse(bytes: Vec[u8]) -> Option[SemanticRequestV2]
+  if bytes.len() < 4 || bytes.len() > MAX_FRAME_BYTES then
+    return Option::None
+  end
+  var at = 0
+  match server_read_u32(&bytes, &mut at)
+  when Option::None then Option::None
+  when Option::Some(body_len) then
+    let body_end = at + body_len
+    if bytes.len() != body_end then
+      Option::None
+    else
+      match server_read_u32(&bytes, &mut at)
+      when Option::None then Option::None
+      when Option::Some(header) then
+        if (header >> 16) != SEMANTIC_V2_MAJOR then
+          Option::None
+        else
+          match v2_read_u64(&bytes, &mut at)
+          when Option::None then Option::None
+          when Option::Some(request_id_word) then
+            match v2_read_request_payload(&bytes, &mut at)
+            when Option::None then Option::None
+            when Option::Some(payload) then
+              var parsed: Option[SemanticRequestV2] = Option::None
+              if at == body_end then
+                parsed = Option::Some(SemanticRequestV2 {
+                  protocol_version: SEMANTIC_PROTOCOL_VERSION_V2,
+                  request_id: request_id_word as Int,
+                  payload: payload
+                })
+              end
+              parsed
+            end
+          end
+        end
+      end
+    end
+  end
+end
+
+pub def semantic_response_v2_frame(resp: SemanticResponseV2) -> Vec[u8]
+  var body: Vec[u8] = Vec::new()
+  server_push_u32(&mut body, SEMANTIC_V2_HEADER)
+  v2_push_u64(&mut body, resp.request_id as UInt)
+  v2_push_response_payload(&mut body, resp.payload.clone())
+  server_frame_of(body)
+end
+
+pub def semantic_response_v2_parse(bytes: Vec[u8]) -> Option[SemanticResponseV2]
+  if bytes.len() < 4 || bytes.len() > MAX_FRAME_BYTES then
+    return Option::None
+  end
+  var at = 0
+  match server_read_u32(&bytes, &mut at)
+  when Option::None then Option::None
+  when Option::Some(body_len) then
+    let body_end = at + body_len
+    if bytes.len() != body_end then
+      Option::None
+    else
+      match server_read_u32(&bytes, &mut at)
+      when Option::None then Option::None
+      when Option::Some(header) then
+        if (header >> 16) != SEMANTIC_V2_MAJOR then
+          Option::None
+        else
+          match v2_read_u64(&bytes, &mut at)
+          when Option::None then Option::None
+          when Option::Some(request_id_word) then
+            match v2_read_response_payload(&bytes, &mut at)
+            when Option::None then Option::None
+            when Option::Some(payload) then
+              var parsed: Option[SemanticResponseV2] = Option::None
+              if at == body_end then
+                parsed = Option::Some(SemanticResponseV2 {
+                  protocol_version: SEMANTIC_PROTOCOL_VERSION_V2,
+                  request_id: request_id_word as Int,
+                  payload: payload
+                })
+              end
+              parsed
+            end
+          end
+        end
+      end
+    end
+  end
+end
+
+# ———— The v2 dispatch, response builder and frame negotiation ———
+
+def server_v2_resolve(operation: SemanticOperationId) -> Option[ServerOperation]
+  match semantic_operation_name_of(operation)
+  when Option::None then Option::None
+  when Option::Some(name) then server_operation_resolve(&name)
+  end
+end
+
+def server_v2_target_family_ok(handler_kind: String) -> Bool
+  handler_kind == "index" || handler_kind == "type" || handler_kind == "ownership" ||
+  handler_kind == "contract" || handler_kind == "symbol" || handler_kind == "explain"
+end
+
+def server_v2_text_family_ok(handler_kind: String) -> Bool
+  handler_kind == "snapshot" || handler_kind == "diagnostic" || handler_kind == "plan" ||
+  handler_kind == "replay" || handler_kind == "edit"
+end
+
+# The v2 request -> (operation name, §38 arg) adapter. The operation id
+# resolves through the registry (never a name string on the wire) and the
+# VARIANT is checked against the resolved handler family: a target request
+# naming a service op (or a slice request naming an index op) fails closed
+# instead of dispatching a mismatched payload.
+pub def semantic_request_v2_dispatch(payload: SemanticRequestV2Payload) -> Option[(String, String)]
+  match payload
+  when SemanticRequestV2Payload::Target(operation, key, _target) then
+    match server_v2_resolve(operation)
+    when Option::None then Option::None
+    when Option::Some(op) then
+      if server_v2_target_family_ok(op.handler_kind.clone()) then
+        Option::Some((op.name.clone(), key))
+      else
+        Option::None
+      end
+    end
+  when SemanticRequestV2Payload::MirGraph(operation, function_key, _function, anchor_key, right_key, node) then
+    match server_v2_resolve(operation)
+    when Option::None then Option::None
+    when Option::Some(op) then
+      if op.handler_kind != "mir" then
+        Option::None
+      elsif right_key.len() > 0 then
+        Option::Some((op.name.clone(), function_key + "|" + right_key))
+      elsif anchor_key.len() > 0 then
+        Option::Some((op.name.clone(), anchor_key))
+      else
+        match node
+        when Option::Some(stmt) then
+          Option::Some((op.name.clone(), function_key + "|" + stmt.stable_key.clone()))
+        when Option::None then
+          Option::Some((op.name.clone(), function_key))
+        end
+      end
+    end
+  when SemanticRequestV2Payload::Slice(operation, request) then
+    match server_v2_resolve(operation)
+    when Option::None then Option::None
+    when Option::Some(op) then
+      if op.handler_kind == "mir" then
+        Option::Some((op.name.clone(), v2_slice_request_text(request)))
+      else
+        Option::None
+      end
+    end
+  when SemanticRequestV2Payload::Text(operation, arg) then
+    match server_v2_resolve(operation)
+    when Option::None then Option::None
+    when Option::Some(op) then
+      if server_v2_text_family_ok(op.handler_kind.clone()) then
+        Option::Some((op.name.clone(), arg))
+      else
+        Option::None
+      end
+    end
+  when SemanticRequestV2Payload::Service(operation) then
+    match server_v2_resolve(operation)
+    when Option::None then Option::None
+    when Option::Some(op) then
+      if op.handler_kind == "service" then
+        Option::Some((op.name.clone(), "".to_string()))
+      else
+        Option::None
+      end
+    end
+  end
+end
+
+def semantic_v2_payload_of_wire(payload: SemanticWirePayload) -> SemanticResponseV2Payload
+  match payload
+  when SemanticWirePayload::Callers(record) then SemanticResponseV2Payload::Callers(record)
+  when SemanticWirePayload::Callees(record) then SemanticResponseV2Payload::Callees(record)
+  when SemanticWirePayload::Symbols(record) then SemanticResponseV2Payload::Symbols(record)
+  when SemanticWirePayload::Type(record) then SemanticResponseV2Payload::Type(record)
+  when SemanticWirePayload::Effects(record) then SemanticResponseV2Payload::Effects(record)
+  when SemanticWirePayload::Ownership(record) then SemanticResponseV2Payload::Ownership(record)
+  when SemanticWirePayload::Contract(record) then SemanticResponseV2Payload::Contract(record)
+  when SemanticWirePayload::MirFunction(record) then SemanticResponseV2Payload::MirFunction(record)
+  when SemanticWirePayload::Abi(record) then SemanticResponseV2Payload::Abi(record)
+  when SemanticWirePayload::Diagnostic(record) then SemanticResponseV2Payload::Diagnostic(record)
+  when SemanticWirePayload::Delta(record) then SemanticResponseV2Payload::Delta(record)
+  when SemanticWirePayload::Plan(record) then SemanticResponseV2Payload::Plan(record)
+  end
+end
+
+def server_v2_is_explain_operation(operation: String) -> Bool
+  operation == "type.explain" || operation == "trait.explain" ||
+  operation == "ownership.explain" || operation == "effect.explain" ||
+  operation == "capability.explain" || operation == "layout.explain" ||
+  operation == "optimization.explain" || operation == "diagnostic.explain"
+end
+
+# The typed ExplainNode tree of one explain op. The non-diagnostic ops route
+# the SAME tree semantic_query.explain_tree builds for the §38 render (so
+# the v2 tree and the v1 render lines can never diverge); diagnostic.explain
+# mirrors the store-aware arm — an empty store keeps the absent leaf, a
+# match builds the record tree, a non-matching non-empty store the
+# "diagnostic-missing" leaf (the exact `diagnostic_explain_store` shapes).
+def session_explain_node(session: CompilerSession, operation: String, subject: String) -> ExplainNode
+  if operation == "diagnostic.explain" then
+    let count = store_len(session.diagnostics_store.clone())
+    if count == 0 then
+      return explain_tree(session_query(&session), operation.clone(), subject.clone(), Option::None)
+    end
+    match store_match(session.diagnostics_store.clone(), subject.clone())
+    when Option::Some(record) then
+      return diagnostic_record_explain_node(record)
+    when Option::None then
+      let root = explain_text_node("diagnostic.explain".to_string(), subject.clone())
+      return explain_node_child(root, explain_text_node("diagnostic-missing".to_string(), "no diagnostic matched".to_string()))
+    end
+  end
+  explain_tree(session_query(&session), operation, subject, Option::None)
+end
+
+# Build the typed v2 answer of one §38 result. Family precedence:
+#   1. the explain ops -> the typed tree (never the rendered rows);
+#   2. mir_slice / mir.path -> the typed MirSlice answer (the §33 payload
+#      when present, else the kind + empty lists);
+#   3. revision -> the session's digest WORDS;
+#   4. unknown / "*_unavailable" kinds -> the typed Status (ok=true, the
+#      §38 kind preserved);
+#   5. the typed record families (the SAME mechanical mapping v1 uses);
+#   6. every remaining registry op -> Rows(kind, rows) — a typed record.
+pub def semantic_response_v2_of_results(
+  session: CompilerSession, operation: String, arg: String, results: QueryResults
+) -> SemanticResponseV2Payload
+  if server_v2_is_explain_operation(operation.clone()) then
+    return SemanticResponseV2Payload::Explain(session_explain_node(&session, operation.clone(), arg.clone()))
+  end
+  if operation == "mir_slice" || operation == "mir.path" then
+    var statements = results.keys.clone()
+    var externals: Vec[String] = Vec::new()
+    match results.payload.clone()
+    when Option::Some(p) then
+      match p
+      when SemanticResponsePayload::MirSlice(st, ex) then
+        statements = st.clone()
+        externals = ex.clone()
+      when _ then ()
+      end
+    when Option::None then ()
+    end
+    return SemanticResponseV2Payload::MirSlice(MirSliceResponse {
+      kind: results.kind.clone(),
+      statements: statements,
+      externals: externals
+    })
+  end
+  if operation == "revision" then
+    return SemanticResponseV2Payload::Revision(RevisionResponse {
+      revision_hi: session.revision.hi,
+      revision_lo: session.revision.lo
+    })
+  end
+  if results.kind == "unknown" || results.kind.ends_with("_unavailable") then
+    return SemanticResponseV2Payload::Status(StatusResponse {
+      ok: true,
+      kind: results.kind.clone(),
+      message: "".to_string()
+    })
+  end
+  match semantic_wire_payload_of_results(operation.clone(), arg.clone(), &results, &session.snapshot)
+  when Option::Some(payload) then semantic_v2_payload_of_wire(payload)
+  when Option::None then
+    SemanticResponseV2Payload::Rows(RowsResponse {
+      kind: results.kind.clone(),
+      rows: results.keys.clone()
+    })
+  end
+end
+
+def session_protocol_error_v2(request_id: Int, message: String) -> SemanticResponseV2
+  SemanticResponseV2 {
+    protocol_version: SEMANTIC_PROTOCOL_VERSION_V2,
+    request_id: request_id,
+    payload: SemanticResponseV2Payload::Status(StatusResponse {
+      ok: false,
+      kind: "protocol_error".to_string(),
+      message: message
+    })
+  }
+end
+
+# Handle one typed v2 request: the version gate + the typed dispatch + the
+# §38 routing (the SAME session_query_results v1 uses — the two protocols
+# can never diverge on an operation's answer).
+pub def session_handle_request_v2(session: CompilerSession, req: SemanticRequestV2) -> SemanticResponseV2
+  if req.protocol_version != SEMANTIC_PROTOCOL_VERSION_V2 then
+    return session_protocol_error_v2(req.request_id,
+      "unsupported protocol_version " + req.protocol_version.to_string() +
+      " (this server speaks v" + SEMANTIC_PROTOCOL_VERSION_V2.to_string() + ")")
+  end
+  match semantic_request_v2_dispatch(req.payload.clone())
+  when Option::None then
+    session_protocol_error_v2(req.request_id,
+      "unresolvable v2 operation id or request-family mismatch")
+  when Option::Some(parts) then
+    let operation = parts.0.clone()
+    let arg = parts.1.clone()
+    let results = session_query_results(&session, operation.clone(), arg.clone())
+    SemanticResponseV2 {
+      protocol_version: SEMANTIC_PROTOCOL_VERSION_V2,
+      request_id: req.request_id,
+      payload: semantic_response_v2_of_results(&session, operation, arg, &results)
+    }
+  end
+end
+
+# The negotiated version probe: the first body word is a v2 version-word
+# (same major) or the v1 version-field length. A frame too short to carry
+# either fails closed.
+pub def semantic_frame_protocol_version(bytes: Vec[u8]) -> Option[Int]
+  if bytes.len() < 8 then
+    return Option::None
+  end
+  let header = ((bytes[4] as Int) << 24) | ((bytes[5] as Int) << 16) |
+    ((bytes[6] as Int) << 8) | (bytes[7] as Int)
+  if (header >> 16) == SEMANTIC_V2_MAJOR then
+    Option::Some(SEMANTIC_PROTOCOL_VERSION_V2)
+  else
+    Option::Some(1)
+  end
+end
+
+# One negotiated frame in, one wire frame out: v1 requests take the v1
+# parse/handle/frame path (byte-compatible with the existing protocol),
+# v2 requests the typed path; each answer rides the version that was asked.
+# Option::None on any strict-parse failure (the serve loop fails closed).
+pub def session_handle_frame(session: CompilerSession, bytes: Vec[u8]) -> Option[Vec[u8]]
+  match semantic_frame_protocol_version(bytes.clone())
+  when Option::None then Option::None
+  when Option::Some(2) then
+    match semantic_request_v2_parse(bytes.clone())
+    when Option::None then Option::None
+    when Option::Some(req) then
+      Option::Some(semantic_response_v2_frame(session_handle_request_v2(&session, req)))
+    end
+  when Option::Some(1) then
+    match semantic_request_parse(bytes.clone())
+    when Option::None then Option::None
+    when Option::Some(req) then
+      Option::Some(semantic_response_frame(session_handle_request(&session, req)))
+    end
+  when Option::Some(_) then Option::None
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# The v2 typed-record equality (the lane's round-trip comparator)
+# ———————————————————————————————————————————————————————————————
+# Field-by-field record equality — the lane's "decode == typed record"
+# check. Never a render comparison: every field of every variant is
+# compared.
+
+def semantic_operation_id_eq(a: SemanticOperationId, b: SemanticOperationId) -> Bool
+  a.dense_id == b.dense_id && a.digest_hi == b.digest_hi && a.digest_lo == b.digest_lo
+end
+
+def semantic_v2_package_eq(a: StablePackageId, b: StablePackageId) -> Bool
+  a.key == b.key && a.digest_hi == b.digest_hi && a.digest_lo == b.digest_lo
+end
+
+def semantic_v2_module_eq(a: StableModuleId, b: StableModuleId) -> Bool
+  a.path == b.path && a.digest_hi == b.digest_hi && a.digest_lo == b.digest_lo &&
+    semantic_v2_package_eq(a.package.clone(), b.package.clone())
+end
+
+def semantic_v2_lineage_eq(a: DeclLineageId, b: DeclLineageId) -> Bool
+  a.lineage == b.lineage && a.digest_hi == b.digest_hi && a.digest_lo == b.digest_lo &&
+    semantic_v2_package_eq(a.package.clone(), b.package.clone()) &&
+    semantic_v2_module_eq(a.module.clone(), b.module.clone())
+end
+
+def semantic_decl_id_eq(a: StableDeclId, b: StableDeclId) -> Bool
+  a.kind == b.kind && a.display_key == b.display_key &&
+    a.digest_hi == b.digest_hi && a.digest_lo == b.digest_lo &&
+    semantic_v2_package_eq(a.package.clone(), b.package.clone()) &&
+    semantic_v2_module_eq(a.module.clone(), b.module.clone()) &&
+    semantic_v2_lineage_eq(a.lineage.clone(), b.lineage.clone())
+end
+
+def semantic_place_id_eq(a: StablePlaceId, b: StablePlaceId) -> Bool
+  a.digest_hi == b.digest_hi && a.digest_lo == b.digest_lo &&
+    stable_place_text_of(a) == stable_place_text_of(b)
+end
+
+def semantic_mir_stmt_id_eq(a: StableMirStmtId, b: StableMirStmtId) -> Bool
+  a.dense_id == b.dense_id && a.stable_key == b.stable_key &&
+    a.digest_hi == b.digest_hi && a.digest_lo == b.digest_lo
+end
+
+def semantic_target_id_eq(a: SemanticTargetId, b: SemanticTargetId) -> Bool
+  match a
+  when SemanticTargetId::Decl(ad) then
+    match b
+    when SemanticTargetId::Decl(bd) then semantic_decl_id_eq(ad, bd)
+    when _ then false
+    end
+  when SemanticTargetId::Place(ap) then
+    match b
+    when SemanticTargetId::Place(bp) then semantic_place_id_eq(ap, bp)
+    when _ then false
+    end
+  when SemanticTargetId::MirStmt(ast) then
+    match b
+    when SemanticTargetId::MirStmt(bst) then semantic_mir_stmt_id_eq(ast, bst)
+    when _ then false
+    end
+  end
+end
+
+def semantic_v2_opt_stmt_eq(a: Option[StableMirStmtId], b: Option[StableMirStmtId]) -> Bool
+  match a
+  when Option::Some(ast) then
+    match b
+    when Option::Some(bst) then semantic_mir_stmt_id_eq(ast, bst)
+    when Option::None then false
+    end
+  when Option::None then
+    match b
+    when Option::None then true
+    when Option::Some(_) then false
+    end
+  end
+end
+
+def semantic_slice_request_eq(a: MirSliceRequest, b: MirSliceRequest) -> Bool
+  a.function_key == b.function_key && a.anchor == b.anchor &&
+    v2_mir_slice_kind_code(a.kind.clone()) == v2_mir_slice_kind_code(b.kind.clone())
+end
+
+def semantic_request_v2_payload_eq(a: SemanticRequestV2Payload, b: SemanticRequestV2Payload) -> Bool
+  match a
+  when SemanticRequestV2Payload::Target(ao, ak, at) then
+    match b
+    when SemanticRequestV2Payload::Target(bo, bk, bt) then
+      semantic_operation_id_eq(ao, bo) && ak == bk && semantic_target_id_eq(at, bt)
+    when _ then false
+    end
+  when SemanticRequestV2Payload::MirGraph(ao, af, ad, aa, ar, an) then
+    match b
+    when SemanticRequestV2Payload::MirGraph(bo, bf, bd, ba, br, bn) then
+      semantic_operation_id_eq(ao, bo) && af == bf && aa == ba && ar == br &&
+        semantic_decl_id_eq(ad, bd) && semantic_v2_opt_stmt_eq(an, bn)
+    when _ then false
+    end
+  when SemanticRequestV2Payload::Slice(ao, ar) then
+    match b
+    when SemanticRequestV2Payload::Slice(bo, br) then
+      semantic_operation_id_eq(ao, bo) && semantic_slice_request_eq(ar, br)
+    when _ then false
+    end
+  when SemanticRequestV2Payload::Text(ao, aa) then
+    match b
+    when SemanticRequestV2Payload::Text(bo, ba) then
+      semantic_operation_id_eq(ao, bo) && aa == ba
+    when _ then false
+    end
+  when SemanticRequestV2Payload::Service(ao) then
+    match b
+    when SemanticRequestV2Payload::Service(bo) then semantic_operation_id_eq(ao, bo)
+    when _ then false
+    end
+  end
+end
+
+pub def semantic_request_v2_eq(a: SemanticRequestV2, b: SemanticRequestV2) -> Bool
+  a.protocol_version == b.protocol_version && a.request_id == b.request_id &&
+    semantic_request_v2_payload_eq(a.payload.clone(), b.payload.clone())
+end
+
+def semantic_v2_strings_eq(a: Vec[String], b: Vec[String]) -> Bool
+  if a.len() != b.len() then
+    return false
+  end
+  var i = 0
+  while i < a.len() do
+    if a[i] != b[i] then
+      return false
+    end
+    i = i + 1
+  end
+  true
+end
+
+def semantic_v2_callers_eq(a: CallersResponse, b: CallersResponse) -> Bool
+  a.target == b.target && semantic_v2_strings_eq(a.callers.clone(), b.callers.clone())
+end
+
+def semantic_v2_callees_eq(a: CalleesResponse, b: CalleesResponse) -> Bool
+  a.function == b.function && semantic_v2_strings_eq(a.callees.clone(), b.callees.clone())
+end
+
+def semantic_v2_symbols_eq(a: SymbolsResponse, b: SymbolsResponse) -> Bool
+  a.query == b.query && semantic_v2_strings_eq(a.symbols.clone(), b.symbols.clone())
+end
+
+def semantic_v2_type_eq(a: TypeResponse, b: TypeResponse) -> Bool
+  a.type_key == b.type_key && a.kind == b.kind && a.size == b.size &&
+    a.alignment == b.alignment && semantic_v2_strings_eq(a.fields.clone(), b.fields.clone())
+end
+
+def semantic_v2_effects_eq(a: EffectsResponse, b: EffectsResponse) -> Bool
+  a.function == b.function && a.bits == b.bits && a.purity == b.purity &&
+    semantic_v2_strings_eq(a.capabilities.clone(), b.capabilities.clone())
+end
+
+def semantic_v2_ownership_eq(a: OwnershipResponse, b: OwnershipResponse) -> Bool
+  a.function == b.function && semantic_v2_strings_eq(a.rows.clone(), b.rows.clone())
+end
+
+def semantic_v2_contract_eq(a: ContractResponse, b: ContractResponse) -> Bool
+  a.contract_id == b.contract_id && a.kind == b.kind &&
+    a.canonical_expression == b.canonical_expression &&
+    a.fingerprint == b.fingerprint && a.message == b.message
+end
+
+def semantic_v2_mir_function_eq(a: MirFunctionResponse, b: MirFunctionResponse) -> Bool
+  a.function == b.function && a.summary == b.summary
+end
+
+def semantic_v2_abi_eq(a: AbiResponse, b: AbiResponse) -> Bool
+  a.surface_id == b.surface_id && semantic_v2_strings_eq(a.rows.clone(), b.rows.clone())
+end
+
+def semantic_v2_diagnostic_eq(a: DiagnosticResponse, b: DiagnosticResponse) -> Bool
+  a.diagnostic_id == b.diagnostic_id && a.code == b.code && a.message == b.message &&
+    semantic_v2_strings_eq(a.related.clone(), b.related.clone())
+end
+
+def semantic_v2_delta_eq(a: DeltaResponse, b: DeltaResponse) -> Bool
+  semantic_v2_strings_eq(a.rows.clone(), b.rows.clone())
+end
+
+def semantic_v2_plan_eq(a: PlanResponse, b: PlanResponse) -> Bool
+  semantic_v2_strings_eq(a.rows.clone(), b.rows.clone())
+end
+
+def semantic_v2_mir_slice_eq(a: MirSliceResponse, b: MirSliceResponse) -> Bool
+  a.kind == b.kind && semantic_v2_strings_eq(a.statements.clone(), b.statements.clone()) &&
+    semantic_v2_strings_eq(a.externals.clone(), b.externals.clone())
+end
+
+def semantic_v2_rows_eq(a: RowsResponse, b: RowsResponse) -> Bool
+  a.kind == b.kind && semantic_v2_strings_eq(a.rows.clone(), b.rows.clone())
+end
+
+def semantic_v2_revision_eq(a: RevisionResponse, b: RevisionResponse) -> Bool
+  a.revision_hi == b.revision_hi && a.revision_lo == b.revision_lo
+end
+
+def semantic_v2_status_eq(a: StatusResponse, b: StatusResponse) -> Bool
+  a.ok == b.ok && a.kind == b.kind && a.message == b.message
+end
+
+def semantic_v2_explain_eq(a: ExplainNode, b: ExplainNode) -> Bool
+  if a.kind != b.kind || a.subject != b.subject || a.relation != b.relation || a.fact != b.fact then
+    return false
+  end
+  if a.children.len() != b.children.len() then
+    return false
+  end
+  var i = 0
+  while i < a.children.len() do
+    if !semantic_v2_explain_eq(a.children[i].clone(), b.children[i].clone()) then
+      return false
+    end
+    i = i + 1
+  end
+  true
+end
+
+def semantic_response_v2_payload_eq(a: SemanticResponseV2Payload, b: SemanticResponseV2Payload) -> Bool
+  match a
+  when SemanticResponseV2Payload::Callers(x) then
+    match b
+    when SemanticResponseV2Payload::Callers(y) then semantic_v2_callers_eq(x, y)
+    when _ then false
+    end
+  when SemanticResponseV2Payload::Callees(x) then
+    match b
+    when SemanticResponseV2Payload::Callees(y) then semantic_v2_callees_eq(x, y)
+    when _ then false
+    end
+  when SemanticResponseV2Payload::Symbols(x) then
+    match b
+    when SemanticResponseV2Payload::Symbols(y) then semantic_v2_symbols_eq(x, y)
+    when _ then false
+    end
+  when SemanticResponseV2Payload::Type(x) then
+    match b
+    when SemanticResponseV2Payload::Type(y) then semantic_v2_type_eq(x, y)
+    when _ then false
+    end
+  when SemanticResponseV2Payload::Effects(x) then
+    match b
+    when SemanticResponseV2Payload::Effects(y) then semantic_v2_effects_eq(x, y)
+    when _ then false
+    end
+  when SemanticResponseV2Payload::Ownership(x) then
+    match b
+    when SemanticResponseV2Payload::Ownership(y) then semantic_v2_ownership_eq(x, y)
+    when _ then false
+    end
+  when SemanticResponseV2Payload::Contract(x) then
+    match b
+    when SemanticResponseV2Payload::Contract(y) then semantic_v2_contract_eq(x, y)
+    when _ then false
+    end
+  when SemanticResponseV2Payload::MirFunction(x) then
+    match b
+    when SemanticResponseV2Payload::MirFunction(y) then semantic_v2_mir_function_eq(x, y)
+    when _ then false
+    end
+  when SemanticResponseV2Payload::Abi(x) then
+    match b
+    when SemanticResponseV2Payload::Abi(y) then semantic_v2_abi_eq(x, y)
+    when _ then false
+    end
+  when SemanticResponseV2Payload::Diagnostic(x) then
+    match b
+    when SemanticResponseV2Payload::Diagnostic(y) then semantic_v2_diagnostic_eq(x, y)
+    when _ then false
+    end
+  when SemanticResponseV2Payload::Delta(x) then
+    match b
+    when SemanticResponseV2Payload::Delta(y) then semantic_v2_delta_eq(x, y)
+    when _ then false
+    end
+  when SemanticResponseV2Payload::Plan(x) then
+    match b
+    when SemanticResponseV2Payload::Plan(y) then semantic_v2_plan_eq(x, y)
+    when _ then false
+    end
+  when SemanticResponseV2Payload::MirSlice(x) then
+    match b
+    when SemanticResponseV2Payload::MirSlice(y) then semantic_v2_mir_slice_eq(x, y)
+    when _ then false
+    end
+  when SemanticResponseV2Payload::Explain(x) then
+    match b
+    when SemanticResponseV2Payload::Explain(y) then semantic_v2_explain_eq(x, y)
+    when _ then false
+    end
+  when SemanticResponseV2Payload::Rows(x) then
+    match b
+    when SemanticResponseV2Payload::Rows(y) then semantic_v2_rows_eq(x, y)
+    when _ then false
+    end
+  when SemanticResponseV2Payload::Revision(x) then
+    match b
+    when SemanticResponseV2Payload::Revision(y) then semantic_v2_revision_eq(x, y)
+    when _ then false
+    end
+  when SemanticResponseV2Payload::Status(x) then
+    match b
+    when SemanticResponseV2Payload::Status(y) then semantic_v2_status_eq(x, y)
+    when _ then false
+    end
+  end
+end
+
+pub def semantic_response_v2_eq(a: SemanticResponseV2, b: SemanticResponseV2) -> Bool
+  a.protocol_version == b.protocol_version && a.request_id == b.request_id &&
+    semantic_response_v2_payload_eq(a.payload.clone(), b.payload.clone())
+end
+
+# ———————————————————————————————————————————————————————————————
+# The v2 executable lane (fourth-audit P0-11)
+# ———————————————————————————————————————————————————————————————
+# V2-1: EVERY registry operation, with a representative typed request:
+# encode -> parse -> typed equality -> re-encode byte equality, then the
+# real dispatch -> response encode -> parse -> typed equality ->
+# re-encode, and the negotiated session_handle_frame entry produces the
+# same bytes. V2-2: a place-targeted request (the StablePlaceId carrier).
+# V2-3: unknown request AND response tags fail closed. V2-4: a v1 request
+# still takes the v1 path through the negotiated entry. Empty result = the
+# lane verifies.
+
+def semantic_v2_lane_target() -> StableTargetId
+  StableTargetId {
+    triple: "lane-none".to_string(),
+    arch: "lane".to_string(),
+    cpu: "lane".to_string(),
+    pointer_width: 64,
+    endian: "little".to_string(),
+    abi: "sysv".to_string(),
+    float_abi: "hard".to_string(),
+    isa_features: Vec::new(),
+    native_atomic_widths: Vec::new()
+  }
+end
+
+def semantic_v2_lane_snapshot() -> SemanticSnapshot
+  SemanticSnapshot {
+    revision: StableDigest { hi: 0, lo: 0 },
+    compiler_version: "v2-lane".to_string(),
+    target: semantic_v2_lane_target(),
+    public_api_hash: StableDigest { hi: 0, lo: 0 },
+    abi_hash: StableDigest { hi: 0, lo: 0 },
+    unsafe_hash: StableDigest { hi: 0, lo: 0 }
+  }
+end
+
+def semantic_v2_lane_key() -> String
+  "m::f#fn()->unit".to_string()
+end
+
+# ONE representative typed request per registry operation (the handler
+# family word drives the variant; the arg fixtures are the canonical key
+# spellings the ops document).
+def semantic_v2_request_for_operation(op: ServerOperation, request_id: Int) -> Option[SemanticRequestV2]
+  match semantic_operation_id_of(op.name.clone())
+  when Option::None then Option::None
+  when Option::Some(id) then
+    let key = semantic_v2_lane_key()
+    let decl = stable_decl_of_key(key.clone())
+    let stmt = stable_mir_stmt_of_key("f#B0#S0".to_string())
+    let payload = match op.handler_kind.clone()
+    when "index" then
+      SemanticRequestV2Payload::Target(id.clone(), key.clone(), SemanticTargetId::Decl(decl.clone()))
+    when "type" then
+      SemanticRequestV2Payload::Target(id.clone(), key.clone(), SemanticTargetId::Decl(decl.clone()))
+    when "symbol" then
+      SemanticRequestV2Payload::Target(id.clone(), key.clone(), SemanticTargetId::Decl(decl.clone()))
+    when "contract" then
+      SemanticRequestV2Payload::Target(id.clone(), key.clone(), SemanticTargetId::Decl(decl.clone()))
+    when "ownership" then
+      SemanticRequestV2Payload::Target(id.clone(), key.clone(), SemanticTargetId::Decl(decl.clone()))
+    when "explain" then
+      SemanticRequestV2Payload::Target(id.clone(), key.clone(), SemanticTargetId::Decl(decl.clone()))
+    when "mir" then
+      if op.name == "mir_slice" then
+        SemanticRequestV2Payload::Slice(id.clone(), MirSliceRequest {
+          function_key: "f".to_string(),
+          kind: MirSliceKind::BackwardDataflow,
+          anchor: "".to_string()
+        })
+      elsif op.name == "mir.path" || op.name == "mir.reaching" then
+        SemanticRequestV2Payload::MirGraph(id.clone(), "f".to_string(),
+          stable_decl_of_key("f".to_string()), "".to_string(), "".to_string(), stmt.clone())
+      elsif op.name == "mir.block" then
+        SemanticRequestV2Payload::MirGraph(id.clone(), "f".to_string(),
+          stable_decl_of_key("f".to_string()), "f#B0".to_string(), "".to_string(), Option::None)
+      elsif op.name == "mir.diff" then
+        SemanticRequestV2Payload::MirGraph(id.clone(), "f".to_string(),
+          stable_decl_of_key("f".to_string()), "".to_string(), "g".to_string(), Option::None)
+      else
+        SemanticRequestV2Payload::MirGraph(id.clone(), "f".to_string(),
+          stable_decl_of_key("f".to_string()), "".to_string(), "".to_string(), Option::None)
+      end
+    when "snapshot" then
+      SemanticRequestV2Payload::Text(id.clone(), "".to_string())
+    when "diagnostic" then
+      SemanticRequestV2Payload::Text(id.clone(), "d0".to_string())
+    when "plan" then
+      SemanticRequestV2Payload::Text(id.clone(), "".to_string())
+    when "replay" then
+      SemanticRequestV2Payload::Text(id.clone(), "seq:0".to_string())
+    when "edit" then
+      SemanticRequestV2Payload::Text(id.clone(), "rename\nold\nnew".to_string())
+    when "service" then
+      SemanticRequestV2Payload::Service(id.clone())
+    when _ then
+      SemanticRequestV2Payload::Text(id.clone(), "".to_string())
+    end
+    Option::Some(SemanticRequestV2 {
+      protocol_version: SEMANTIC_PROTOCOL_VERSION_V2,
+      request_id: request_id,
+      payload: payload
+    })
+  end
+end
+
+# Overwrite the tagged payload word of a v2 frame (frame offset 16..20:
+# the 4-byte body length, the 4-byte version word and the 8-byte request
+# id precede it). Used by the lane to inject an unknown tag.
+def v2_lane_patch_tag(inout frame: Vec[u8], tag: Int) -> Unit
+  frame[16] = ((tag >> 24) & 0xFF) as u8
+  frame[17] = ((tag >> 16) & 0xFF) as u8
+  frame[18] = ((tag >> 8) & 0xFF) as u8
+  frame[19] = (tag & 0xFF) as u8
+end
+
+# One direct request-variant byte round trip (encode -> parse -> typed
+# equality -> re-encode byte equality).
+def semantic_v2_request_case(label: String, payload: SemanticRequestV2Payload, inout bad: Vec[String]) -> Unit
+  let request = SemanticRequestV2 {
+    protocol_version: SEMANTIC_PROTOCOL_VERSION_V2,
+    request_id: 101,
+    payload: payload
+  }
+  let frame = semantic_request_v2_frame(request.clone())
+  match semantic_request_v2_parse(frame.clone())
+  when Option::None then
+    bad.push(label + ": v2 request parse failed")
+  when Option::Some(back) then
+    if !semantic_request_v2_eq(request.clone(), back.clone()) then
+      bad.push(label + ": v2 request typed mismatch")
+    end
+    if !v2_bytes_eq(semantic_request_v2_frame(back), frame.clone()) then
+      bad.push(label + ": v2 request re-encode mismatch")
+    end
+  end
+end
+
+# One direct response-variant byte round trip.
+def semantic_v2_response_case(label: String, payload: SemanticResponseV2Payload, inout bad: Vec[String]) -> Unit
+  let response = SemanticResponseV2 {
+    protocol_version: SEMANTIC_PROTOCOL_VERSION_V2,
+    request_id: 102,
+    payload: payload
+  }
+  let frame = semantic_response_v2_frame(response.clone())
+  match semantic_response_v2_parse(frame.clone())
+  when Option::None then
+    bad.push(label + ": v2 response parse failed")
+  when Option::Some(back) then
+    if !semantic_response_v2_eq(response.clone(), back.clone()) then
+      bad.push(label + ": v2 response typed mismatch")
+    end
+    if !v2_bytes_eq(semantic_response_v2_frame(back), frame.clone()) then
+      bad.push(label + ": v2 response re-encode mismatch")
+    end
+  end
+end
+
+pub def semantic_v2_lane_check() -> Vec[String]
+  var bad: Vec[String] = Vec::new()
+  let session = new_compiler_session(semantic_v2_lane_snapshot())
+  var index = 0
+  for op in server_operations() do
+    let label = op.name.clone()
+    match semantic_v2_request_for_operation(op.clone(), index + 1)
+    when Option::None then
+      bad.push(label + ": no typed operation id")
+    when Option::Some(request) then
+      let frame = semantic_request_v2_frame(request.clone())
+      match semantic_request_v2_parse(frame.clone())
+      when Option::None then
+        bad.push(label + ": v2 request parse failed")
+      when Option::Some(back) then
+        if !semantic_request_v2_eq(request.clone(), back.clone()) then
+          bad.push(label + ": v2 request typed mismatch")
+        end
+        if !v2_bytes_eq(semantic_request_v2_frame(back), frame.clone()) then
+          bad.push(label + ": v2 request re-encode mismatch")
+        end
+      end
+      let response = session_handle_request_v2(&session, request.clone())
+      match response.payload.clone()
+      when SemanticResponseV2Payload::Status(status) then
+        if status.kind == "protocol_error" then
+          bad.push(label + ": v2 dispatch rejected a registry op")
+        end
+      when _ then ()
+      end
+      let response_frame = semantic_response_v2_frame(response.clone())
+      match semantic_response_v2_parse(response_frame.clone())
+      when Option::None then
+        bad.push(label + ": v2 response parse failed")
+      when Option::Some(response_back) then
+        if !semantic_response_v2_eq(response.clone(), response_back.clone()) then
+          bad.push(label + ": v2 response typed mismatch")
+        end
+        if !v2_bytes_eq(semantic_response_v2_frame(response_back), response_frame.clone()) then
+          bad.push(label + ": v2 response re-encode mismatch")
+        end
+      end
+      match session_handle_frame(&session, semantic_request_v2_frame(request.clone()))
+      when Option::None then
+        bad.push(label + ": negotiated v2 frame failed")
+      when Option::Some(negotiated) then
+        if !v2_bytes_eq(negotiated, response_frame.clone()) then
+          bad.push(label + ": negotiated v2 bytes differ")
+        end
+      end
+    end
+    index = index + 1
+  end
+
+  # V2-2 — the StablePlaceId carrier rides a target request.
+  match stable_place_of_text("x.f".to_string())
+  when Option::Some(place) then
+    match semantic_operation_id_of("ownership.moves".to_string())
+    when Option::Some(operation) then
+      let request = SemanticRequestV2 {
+        protocol_version: SEMANTIC_PROTOCOL_VERSION_V2,
+        request_id: 91,
+        payload: SemanticRequestV2Payload::Target(
+          operation, semantic_v2_lane_key(), SemanticTargetId::Place(place))
+      }
+      let frame = semantic_request_v2_frame(request.clone())
+      match semantic_request_v2_parse(frame.clone())
+      when Option::None then
+        bad.push("place-target: v2 request parse failed")
+      when Option::Some(back) then
+        if !semantic_request_v2_eq(request.clone(), back.clone()) then
+          bad.push("place-target: v2 request typed mismatch")
+        end
+      end
+      let response = session_handle_request_v2(&session, request)
+      match response.payload.clone()
+      when SemanticResponseV2Payload::Ownership(_) then ()
+      when _ then bad.push("place-target: expected the Ownership family answer")
+      end
+    when Option::None then bad.push("place-target: ownership.moves is not registered")
+    end
+  when Option::None then bad.push("place-target: place fixture failed to parse")
+  end
+
+  # V2-3 — unknown tags fail closed (request and response).
+  match semantic_operation_id_of("revision".to_string())
+  when Option::Some(operation) then
+    let request = SemanticRequestV2 {
+      protocol_version: SEMANTIC_PROTOCOL_VERSION_V2,
+      request_id: 77,
+      payload: SemanticRequestV2Payload::Service(operation)
+    }
+    var request_frame = semantic_request_v2_frame(request.clone())
+    v2_lane_patch_tag(&mut request_frame, 0xDEAD)
+    match semantic_request_v2_parse(request_frame)
+    when Option::None then ()
+    when Option::Some(_) then bad.push("unknown request tag must fail closed")
+    end
+    let response = session_handle_request_v2(&session, request)
+    var response_frame = semantic_response_v2_frame(response)
+    v2_lane_patch_tag(&mut response_frame, 0xDEAD)
+    match semantic_response_v2_parse(response_frame)
+    when Option::None then ()
+    when Option::Some(_) then bad.push("unknown response tag must fail closed")
+    end
+  when Option::None then bad.push("unknown-tag: revision is not registered")
+  end
+
+  # V2-4 — a v1 request still takes the v1 path (direct + negotiated).
+  let v1_request = SemanticRequest {
+    protocol_version: SEMANTIC_PROTOCOL_VERSION,
+    request_id: 7,
+    operation: "revision".to_string(),
+    payload: "".to_string()
+  }
+  let v1_frame = semantic_request_frame(v1_request)
+  match semantic_request_parse(v1_frame.clone())
+  when Option::None then bad.push("v1 compat: v1 request parse failed")
+  when Option::Some(v1_request_back) then
+    let v1_response = session_handle_request(&session, v1_request_back)
+    if !v1_response.ok || v1_response.kind != "revision" then
+      bad.push("v1 compat: direct v1 answer changed")
+    end
+  end
+  match session_handle_frame(&session, v1_frame.clone())
+  when Option::None then bad.push("v1 compat: negotiated v1 frame failed")
+  when Option::Some(v1_response_frame) then
+    match semantic_response_parse(v1_response_frame)
+    when Option::None then bad.push("v1 compat: v1 response parse failed")
+    when Option::Some(v1_response) then
+      if !v1_response.ok || v1_response.kind != "revision" then
+        bad.push("v1 compat: negotiated v1 answer changed")
+      end
+    end
+  end
+
+  # V2-5 — EVERY response variant through actual bytes with adversarial
+  # fields (the empty lane session answers several families unavailable,
+  # so the record codecs are exercised directly as well) + the remaining
+  # request variants (Target MirStmt).
+  semantic_v2_request_case("request-target-mirstmt".to_string(),
+    SemanticRequestV2Payload::Target(
+      semantic_operation_id_of("symbol_get".to_string()).unwrap_or(
+        SemanticOperationId { dense_id: 11, digest_hi: 0, digest_lo: 0 }),
+      semantic_v2_lane_key(),
+      SemanticTargetId::MirStmt(stable_mir_stmt_of_key("f#B0#S0".to_string()).unwrap_or(
+        StableMirStmtId { dense_id: -1, stable_key: "f#B0#S0".to_string() }))),
+    &mut bad)
+
+  semantic_v2_response_case("callers".to_string(),
+    SemanticResponseV2Payload::Callers(CallersResponse {
+      target: "t|1".to_string(),
+      callers: Vec::from(["a:b".to_string(), "".to_string()])
+    }), &mut bad)
+  semantic_v2_response_case("callees".to_string(),
+    SemanticResponseV2Payload::Callees(CalleesResponse {
+      function: "".to_string(),
+      callees: Vec::from(["c1".to_string()])
+    }), &mut bad)
+  semantic_v2_response_case("symbols".to_string(),
+    SemanticResponseV2Payload::Symbols(SymbolsResponse {
+      query: "q:x".to_string(),
+      symbols: Vec::new()
+    }), &mut bad)
+  semantic_v2_response_case("type".to_string(),
+    SemanticResponseV2Payload::Type(TypeResponse {
+      type_key: "m::T".to_string(),
+      kind: "struct".to_string(),
+      size: -7,
+      alignment: 16,
+      fields: Vec::from(["f|g".to_string()])
+    }), &mut bad)
+  semantic_v2_response_case("effects".to_string(),
+    SemanticResponseV2Payload::Effects(EffectsResponse {
+      function: "f|x".to_string(),
+      bits: -1,
+      capabilities: Vec::from(["io".to_string()]),
+      purity: "".to_string()
+    }), &mut bad)
+  semantic_v2_response_case("ownership".to_string(),
+    SemanticResponseV2Payload::Ownership(OwnershipResponse {
+      function: "f|p".to_string(),
+      rows: Vec::from(["let:x|sink".to_string()])
+    }), &mut bad)
+  semantic_v2_response_case("contract".to_string(),
+    SemanticResponseV2Payload::Contract(ContractResponse {
+      contract_id: "f|Pre|a || b".to_string(),
+      kind: "Pre".to_string(),
+      canonical_expression: "a || b".to_string(),
+      fingerprint: "hi:lo".to_string(),
+      message: "m:1|2".to_string()
+    }), &mut bad)
+  semantic_v2_response_case("mir_function".to_string(),
+    SemanticResponseV2Payload::MirFunction(MirFunctionResponse {
+      function: "f".to_string(),
+      summary: "s|1".to_string()
+    }), &mut bad)
+  semantic_v2_response_case("abi".to_string(),
+    SemanticResponseV2Payload::Abi(AbiResponse {
+      surface_id: "abi:x".to_string(),
+      rows: Vec::from(["arg:0".to_string()])
+    }), &mut bad)
+  semantic_v2_response_case("diagnostic".to_string(),
+    SemanticResponseV2Payload::Diagnostic(DiagnosticResponse {
+      diagnostic_id: "f|diagnostic|E0201|place|3:x|#0".to_string(),
+      code: "E0201".to_string(),
+      message: "use: moved".to_string(),
+      related: Vec::from(["state_before:consumed".to_string()])
+    }), &mut bad)
+  semantic_v2_response_case("delta".to_string(),
+    SemanticResponseV2Payload::Delta(DeltaResponse {
+      rows: Vec::from(["created:a:b".to_string(), "modified:c".to_string()])
+    }), &mut bad)
+  semantic_v2_response_case("plan".to_string(),
+    SemanticResponseV2Payload::Plan(PlanResponse {
+      rows: Vec::from(["verify|1".to_string()])
+    }), &mut bad)
+  semantic_v2_response_case("mir_slice".to_string(),
+    SemanticResponseV2Payload::MirSlice(MirSliceResponse {
+      kind: "mir_slice_unavailable".to_string(),
+      statements: Vec::from(["a|b".to_string()]),
+      externals: Vec::new()
+    }), &mut bad)
+  semantic_v2_response_case("explain".to_string(),
+    SemanticResponseV2Payload::Explain(explain_node_child(
+      explain_text_node("k".to_string(), "s:1".to_string()),
+      explain_text_node("c".to_string(), "d|2".to_string()))), &mut bad)
+  semantic_v2_response_case("rows".to_string(),
+    SemanticResponseV2Payload::Rows(RowsResponse {
+      kind: "fields".to_string(),
+      rows: Vec::from(["x|y".to_string(), "".to_string()])
+    }), &mut bad)
+  semantic_v2_response_case("revision".to_string(),
+    SemanticResponseV2Payload::Revision(RevisionResponse {
+      revision_hi: 7,
+      revision_lo: 9
+    }), &mut bad)
+  semantic_v2_response_case("status".to_string(),
+    SemanticResponseV2Payload::Status(StatusResponse {
+      ok: false,
+      kind: "protocol_error".to_string(),
+      message: "m|1:2".to_string()
+    }), &mut bad)
+
+  bad
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -1540,6 +4270,7 @@ pub def wire_render_contract(record: ContractResponse) -> Vec[String]
   var rows: Vec[String] = Vec::new()
   rows.push("contract:" + record.contract_id.clone())
   rows.push("kind:" + record.kind.clone())
+  rows.push("canonical:" + record.canonical_expression.clone())
   rows.push("fingerprint:" + record.fingerprint.clone())
   rows.push("message:" + record.message.clone())
   rows
@@ -1550,6 +4281,8 @@ pub def wire_parse_contract(rows: Vec[String]) -> Option[ContractResponse]
   var have_contract = false
   var kind = ""
   var have_kind = false
+  var canonical_expression = ""
+  var have_canonical = false
   var fingerprint = ""
   var have_fingerprint = false
   var message = ""
@@ -1564,6 +4297,9 @@ pub def wire_parse_contract(rows: Vec[String]) -> Option[ContractResponse]
       elsif parts.0 == "kind" then
         kind = parts.1.clone()
         have_kind = true
+      elsif parts.0 == "canonical" then
+        canonical_expression = parts.1.clone()
+        have_canonical = true
       elsif parts.0 == "fingerprint" then
         fingerprint = parts.1.clone()
         have_fingerprint = true
@@ -1575,12 +4311,13 @@ pub def wire_parse_contract(rows: Vec[String]) -> Option[ContractResponse]
       end
     end
   end
-  if !have_contract || !have_kind || !have_fingerprint || !have_message then
+  if !have_contract || !have_kind || !have_canonical || !have_fingerprint || !have_message then
     return Option::None
   end
   Option::Some(ContractResponse {
     contract_id: contract_id,
     kind: kind,
+    canonical_expression: canonical_expression,
     fingerprint: fingerprint,
     message: message
   })
@@ -2144,12 +4881,15 @@ end
 # ———————————————————————————————————————————————————————————————
 # session_serve_loop serves the request protocol of the module doc from
 # stdin to stdout: ONE request frame per iteration (4-byte BIG-ENDIAN
-# body length || body — the module doc's framing), handled through
-# session_handle_request (the version gate + §38 routing), the response
-# written back with the same framing. The loop returns the number of
-# requests served. Termination is fail closed: EOF on stdin, a negative,
+# body length || body — the module doc's framing), handled through the
+# VERSION-NEGOTIATED session_handle_frame (fourth-audit P0-11: a version-1
+# body takes the v1 text-row parse + session_handle_request path, a
+# version-2 body the typed v2 parse + session_handle_request_v2 path; the
+# answer rides the version that was asked), the response written back with
+# the same framing. The loop returns the number of requests served.
+# Termination is fail closed: EOF on stdin, a negative,
 # truncated or over-limit (MAX_FRAME_BYTES) frame length, a strict-parse
-# failure (semantic_request_parse -> None — the byte stream can no longer
+# failure of either grammar (the byte stream can no longer
 # be trusted) or an IO error on either side ends the loop; no partial
 # response is ever written. The loop is silent (no log lines on the
 # wire); the caller (driver.tg's compile_snapshot_serve_route — the
@@ -2183,11 +4923,15 @@ pub def session_serve_loop(session: CompilerSession) -> Int
           frame.push(body[bi])
           bi = bi + 1
         end
-        match semantic_request_parse(frame)
+        # The negotiated entry (fourth-audit P0-11): a v1 request takes the
+        # v1 parse/handle/frame path, a v2 request the typed path; each
+        # answer rides the version that was asked. A strict-parse failure
+        # of either grammar breaks the loop (fail closed, no partial
+        # response, no resynchronization).
+        match session_handle_frame(&session, frame)
         when Option::None then break
-        when Option::Some(req) then
-          let resp = session_handle_request(&session, req)
-          if !server_write_stdout(semantic_response_frame(&resp)) then
+        when Option::Some(response_bytes) then
+          if !server_write_stdout(response_bytes) then
             break
           end
           served = served + 1

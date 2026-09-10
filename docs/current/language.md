@@ -544,12 +544,16 @@ Tangerine.toml). Each mode maps to a `ModeConfig` bit set
 
 > **Enforcement status.** `ModeConfig` carries **only** the behavior the
 > pipeline implements. The 2026-08 reduction deleted the configuration
-> bits that claimed semantics no pass implements (effects, budgets,
-> coverage, CQS, doc/test gates, the unsafe bans, the review /
-> memory-safety / dependency-audit policies, stubs, auto-escalation —
+> bits that claimed semantics no pass implements (effects, coverage, CQS,
+> doc/test gates, the unsafe bans, the review / memory-safety /
+> dependency-audit policies, stubs, auto-escalation —
 > `tg_compiler/mode.tg` carries `ModeConfig { mode, enforce_contracts,
 > enforce_capabilities }` only). The deleted behaviors themselves are
-> stated below as pending, not as features.
+> stated below as implemented-outside-the-bit or pending, never as
+> features of a config bit. Budgets are the main implemented-outside-the-
+> bit case: the deleted `enforce_budgets` bit's behavior now lives in the
+> pipeline (the MIR guarantee pass plus the generated runtime frame
+> counters / clock), unconditionally and without a config bit.
 
 ### ModeConfig bits — enforcing pass or pending
 
@@ -564,13 +568,15 @@ below) do not disable them today.
 
 Behaviors formerly claimed by deleted `ModeConfig` bits — each is pending
 except `gate_on_score` (the CQS gate row below is implemented — the
-deleted bit's behavior now lives in the pipeline, not in a config bit);
-no config bit claims any of them:
+deleted bit's behavior now lives in the pipeline, not in a config bit) and
+`enforce_budgets` (budget enforcement is implemented — the MIR guarantee
+pass plus the generated runtime frame counters / clock now live in the
+pipeline, not in a config bit); no config bit claims any of them:
 
-| Former bit (deleted) | Pending behavior |
+| Former bit (deleted) | Behavior (pending unless marked IMPLEMENTED) |
 |----------------------|------------------|
 | `enforce_effects` | effect lowering + effect-log runtime — `MirEffectRecord` is never constructed from source; the `__tg_effect_record` runtime body is a trap stub (runtime.tg) |
-| `enforce_budgets` | budget lowering + budget-table runtime — `MirBudgetConsume` is never constructed from source; the `__tg_budget_*` data symbols have no definitions (runtime.tg) and fail closed at link if emitted |
+| `enforce_budgets` | IMPLEMENTED OUTSIDE THE BIT — budget constraints are lowered (`MirBudgetConsume`) and enforced: `check_budget_annotations_mir` (mir.tg) classifies every recognized resource and fails the compile (E0235) when a `static-proof` / `static-bound` derivation exceeds its limit; the `runtime-measured` frame counters / clock (native codegen's budget slots and the wasm backend's budget locals) trap at run time. No config bit gates it |
 | `enforce_coverage` | a coverage gate in the pipeline — `coverage.tg` exists but is not invoked by any compile/check path |
 | `gate_on_score` | a CQS gate in the pipeline — the compiler-query-server IS invoked by the canonical pipeline: the driver's check path (driver_cqs_query_pass) and the library API (analyze_source_cqs) run the typed-info / symbols / diagnostics queries over the analyzed program + the lowered MIR, and the mode matrix's gated failures are reported as Error-level diagnostics and FAIL the check (Production/Hardened); the Dev matrix enforces nothing |
 | `require_docs_for_pub` / `require_tests_for_pub` | pub-API doc/test checks — no checker rejects |
@@ -606,7 +612,7 @@ deprecated when no pass consumes it.
 | `--no-contracts` | `enable_contracts` | **deprecated, inert** — no pass reads it; contract checks are unconditional (`lower_contract`, mir.tg) |
 | `--no-capabilities` | `enable_capabilities` | **deprecated, inert** — no pass reads it; capability enforcement is unconditional (resource_check.tg) |
 | `--no-effects` | `enable_effects` | **deprecated, inert** — no pass reads it; effects are not enforced at all (see the mode table) |
-| `--no-budgets` | `enable_budgets` | **deprecated, inert** — no pass reads it; budgets are not enforced at all (see the mode table) |
+| `--no-budgets` | `enable_budgets` | **deprecated, inert** — no pass reads it; budgets ARE enforced unconditionally (`check_budget_annotations_mir` E0235 in mir.tg + the generated frame counters / clock in codegen and the wasm backend) |
 | `-W` / `--warn-all` | `warn_all` | **deprecated, inert** — no pass reads it; `tg lint` uses its own `LintConfig` |
 | `-Werror` | `deny_warnings` | **deprecated, inert** — no pass reads it; the linter's `--deny` rules are the warning-policy application point |
 | `-g` | `debug_info` | **deprecated, inert** — no pass reads it |
@@ -777,19 +783,44 @@ end
 ### Budgets
 
 Budget constraints are declared as function clauses using `budget` entries.
-**Enforcement is not implemented:** `MirBudgetConsume` is never constructed
-from source, the `__tg_budget_*` data symbols have no definitions
-(runtime.tg), and the mode table's `enforce_budgets` bit (deleted in the
-2026-08 reduction — the budget lowering + budget-table runtime) is
-pending (see the ModeConfig table in §"Progressive Strictness"). The
-declared surface:
+They are **parsed AND enforced** (third-audit item 45): the MIR guarantee
+pass (`check_budget_annotations_mir`, `tg_compiler/mir.tg`) classifies
+every recognized resource and reports **E0235** when a `static-proof` /
+`static-bound` derivation exceeds the declared limit; the
+`runtime-measured` resources carry generated per-invocation frame counters
+and clock checks (the native codegen budget slots
+`budget_alloc_offset` / `budget_time_offset` / `budget_instr_offset` and
+the wasm backend's budget locals), which trap when the limit is exceeded.
+`--no-budgets` is inert: enforcement is unconditional and does not consult
+the deleted `enforce_budgets` mode bit (see the tables above).
+
+The recognized metric spellings and their CURRENT classification
+(`tg_compiler/types.tg` `budget_metric_resource` /
+`budget_guarantee_classification`):
+
+| Metric spellings | Resource | Classification | Derivation / enforcement |
+|------------------|----------|----------------|--------------------------|
+| `heap_allocations`, `alloc`, `allocation(s)`, `heap_allocs` | `alloc` | `runtime-measured` — the per-invocation allocation counter traps; `static-proof` only for limit `0` with the MIR-proven transitive no-allocation summary | allocation count at run time |
+| `heap_bytes`, `heap_size`, `heap` | `heap_bytes` | `static-bound` — allocation-site count × the documented 4096-byte conservative per-site cap; `static-proof` for the zero case above | static site count |
+| `stack_bytes`, `stack_size`, `stack` | `stack_bytes` | `static-proof` when the LIR route supplies the exact per-function `frame_bytes`, else `static-bound` from the MIR derivation | frame size |
+| `code_size_bytes`, `code_size`, `code_bytes` | `code_size` | `static-bound` from the MIR instruction estimate × 4; `static-proof` only with an emitter's exact word count | instruction estimate |
+| `time`, `time_us`, `time_ms`, `time_ns` | `time` | `runtime-measured` — the frame stamps the entry clock and every return compares the elapsed time (native + wasm frame slots); a `time_us` bare number is microseconds | frame clock |
+| `instructions`, `instruction_count`, `instrs` | `instructions` | `runtime-measured` at run time — the per-statement frame counter (native + wasm) checks at every return; the MIR estimate (2 × statements + 3 × terminators) additionally classifies `static-bound` when derivable | statement count |
+
+Every other metric identifier parses, rides the typed record and is
+classified `runtime-measured` (fail closed — the compiler never claims a
+static guarantee it cannot derive). Two refinements are explicitly NOT
+claimed by the current implementation: the heap derivations stay at the
+conservative site-count/cap model (the exact per-site heap proof is
+pending, tracked as P1-7) and `stack_bytes` is the function's OWN frame
+(the caller-chain max-transitive distinction is pending, tracked as
+P1-8). The declarations below illustrate the surface:
 
 ```tangerine
-# Budget clause (bounds are string literals; enforcement is NOT
-# implemented — see the note above)
-def expensive_operation() -> Result[Data, Error]
-  budget time_ms: "5000", alloc_bytes: "104857600"
-  
+# The enforced spelling is the @budget attribute (after the return type;
+# the parenthesized @budget(metric = "bound", ...) form is equivalent).
+# Bounds are string literals; a bare integer literal is also accepted.
+def expensive_operation() -> Result[Data, Error] @budget heap_allocations: "1000", time_us: "5000"
   # implementation with resource tracking
 end
 
@@ -1802,8 +1833,7 @@ def run_handled() -> Unit
   end
 end
 
-def expensive_op() -> Result[Data, Error]
-  budget time: "5s", memory: "100MB"
+def expensive_op() -> Result[Data, Error] @budget time_us: "5000", heap_bytes: "104857600"
   # implementation
 end
 ```
@@ -2029,7 +2059,8 @@ tg main.tg -W       # Enable warnings — accepted, no effect
 tg main.tg -Werror  # Treat warnings as errors — accepted, no effect
 
 # Disable agentic features selectively (DEPRECATED — inert: no pass reads
-# these flags; contract/capability enforcement is unconditional)
+# these flags; contract, capability and budget enforcement is
+# unconditional, effects are not enforced at all)
 tg main.tg --no-contracts
 tg main.tg --no-capabilities
 tg main.tg --no-effects
@@ -2155,10 +2186,14 @@ reset-vector entry, structurally verified). `std::embedded` provides the
 collections.
 
 **The code-gen routes (P0.2, updated for the LIR backends + audit item
-39):** the DEFAULT (un-gated) route is the DIRECT emitter (codegen.tg)
-for the host targets (`aarch64-apple-darwin` /
-`x86_64-unknown-linux-gnu`) plus the wasm32 route. The LIR pipeline
-(lir.tg) is the code generator for the embedded Thumb/RISC-V triples
+39; the canonical default flipped at fourth-audit P0-21):** the DEFAULT
+route is the LIR pipeline (lir.tg: MIR → LIR → linear-scan allocation →
+per-backend emission) for the host targets (`aarch64-apple-darwin` /
+`x86_64-unknown-linux-gnu`); `--codegen=direct` selects the DIRECT
+emitter (codegen.tg) — the debug/bootstrap fallback retained until the
+remaining fail-closed LIR shapes close and the differential corpus
+passes. The wasm32 route keeps its own code generator. The LIR pipeline
+is also the code generator for the embedded Thumb/RISC-V triples
 **selected by `--target`**: a `--target thumbv7m-none-eabi` /
 `thumbv7em-none-eabi[f]` / `riscv32imac|imafc|imafdc-unknown-none-elf` /
 `riscv64imac|riscv64gc-unknown-none-elf` compile resolves the
@@ -2170,10 +2205,11 @@ the standalone LIR pipeline for it, emitting ELF relocatable objects
 whose M3/M4 instances have `fpu: None`, and the RISC-V descriptors;
 object emission only — executable/image linking fails closed inside the
 backends). `TANGERINE_LIR=1` + `TANGERINE_LIR_TARGET=...` remains the
-default-off HOST opt-in that gates "LIR vs direct" for the aarch64 host
-slice, with the env value working only as a **legacy alias** key of the
-same descriptor table (see cross_compilation_guide.md for the
-per-descriptor feature sets). The `--target` embedded route's artifact
+deprecated HOST alias for the LIR route (now the default, so the alias
+selects nothing new), with the env value working only as a **legacy
+alias** key of the same descriptor table (see
+cross_compilation_guide.md for the per-descriptor feature sets). The
+`--target` embedded route's artifact
 contract (the target spec JSON + the linker script + the startup/vector
 artifacts + the bare-metal aarch64 ELF image) stays with its only image
 generator, **`aarch64-unknown-none`** (the aarch64 backend); the

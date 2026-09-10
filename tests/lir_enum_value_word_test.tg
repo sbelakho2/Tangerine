@@ -1,0 +1,546 @@
+# tests/lir_enum_value_word_test.tg — fourth-audit P0-20: the UNIFIED
+# canonical payloaded-enum representation.
+#
+# Both routes now use the ONE canonical TaggedPtr value word: a raw
+# discriminant for an all-payload-less enum, or a heap pointer to the
+# inline {tag @ 0, payload @ 8} image for an enum with payload variants
+# (every construction allocates through the SAME runtime allocator the
+# direct emitter calls). The LIR route constructs/reads/moves/drops that
+# word and consumes the SAME classify_call_plan / classify_enum_crossing
+# answer. The former route-private `inline-image-v1` crossing — the
+# by-reference inline image, its per-function version markers, the
+# program uniformity rule, the export refusal and the
+# `tg.abi.enumver` object note — is DELETED.
+#
+# This suite pins:
+#   - the shape rows: E { A, B(Int) } admits a 16-byte IMAGE but a
+#     ONE-word canonical value-word shape (Scalar-class);
+#   - the ABI parity rows: the crossing authority answers ValueWord and
+#     the call plan classifies E as TaggedPtr(8) / Scalar(8) — the same
+#     one-word answer the LIR gates consume;
+#   - the lowered signature rows: an E parameter/return is ONE word
+#     (no sret, no machine aggregate bind, no marker);
+#   - the construction/discriminant/downcast rows: the body calls
+#     _tg_bump_alloc, stores the tag at image byte 0 and the payload at
+#     byte 8, normalizes the word against the 256-byte inline-tag
+#     threshold, and reads the payload through the pointer;
+#   - the boundary rows: a payloaded-enum extern crossing still fails
+#     closed with the canonical reason, and the payloaded crossing keeps
+#     the Global binding (its value word IS the canonical crossing).
+#
+# Run with: tg test tests/lir_enum_value_word_test.tg
+
+use std::core::{Option, Result, UInt, panic}
+use std::collections::{Vec, Map, Set}
+use std::test::*
+use tg_compiler::asm::SymBinding
+use tg_compiler::ast::layout_attrs_plain
+use tg_compiler::ids::{TypeId, VariantId, FieldId}
+use tg_compiler::mir::{
+  MirFunction, MirLocal, MirLocalId, MirBlock, MirBlockId, MirStatement,
+  MirStatementKind, MirRvalue, MirRvalueKind, MirOperand, MirOperandKind,
+  MirConstant, MirConstantKind, MirTerminator, MirTerminatorKind,
+  MirTypeDef, MirTypeDefKind, MirVariantDef, MirCallArg, MirCallValue,
+  AggregateKind, Place, Projection, place_local
+}
+use tg_compiler::token::span_dummy
+use tg_compiler::types::{Type, AccessEffect}
+use tg_compiler::lir::{
+  LirFunction, LirVerifyRoute, LirAggShapeKind, LirStmtKind, LirTermKind,
+  LirValue, LirPtrOp,
+  lir_plain_struct_shape, lir_enum_image_shape, lir_agg_is_scalar_class,
+  lir_enum_shape_has_payload, lir_enum_shape_is_tagged,
+  lir_ty_is_payloaded_enum, lir_fn_has_payloaded_enum_crossing,
+  lir_enum_crossing_rule, lir_extern_enum_refusal,
+  lir_check_extern_enum_calls, lir_fn_export_binding,
+  lower_mir_fn_to_lir_prog, lir_peephole, lir_alloc_registers_a64,
+  verify_lir
+}
+use tg_compiler::layout_engine::{
+  LayoutEngine, aarch64_target, layout_engine_new, layout_engine_register_types,
+  classify_call_plan, classify_enum_crossing, classify_value_category,
+  AbiFlavor, AbiEnumCrossing, AbiValueClass, abi_value_class_word,
+  AbiReturn, ValueCategory
+}
+use tg_compiler::target_desc::aarch64_desc
+
+# ———————————————————————————————————————————————————————————————
+# Fixtures: E { A, B(Int) } (a payloaded tagged enum) and P { Only } (an
+# all-payload-less tagged enum; its word is the raw discriminant).
+# ———————————————————————————————————————————————————————————————
+
+def vw_payloaded_def() -> MirTypeDef
+  MirTypeDef {
+    id: TypeId { id: 300 },
+    name: "E".to_string(),
+    kind: MirTypeDefKind::Enum(Vec::from([
+      MirVariantDef { name: "A".to_string(), discriminant: 0, fields: Vec::new() },
+      MirVariantDef { name: "B".to_string(), discriminant: 1, fields: Vec::from([Type::Int]) }
+    ])),
+    generic_params: Vec::new(),
+    layout: layout_attrs_plain(span_dummy())
+  }
+end
+
+def vw_payloadless_def() -> MirTypeDef
+  MirTypeDef {
+    id: TypeId { id: 301 },
+    name: "P".to_string(),
+    kind: MirTypeDefKind::Enum(Vec::from([
+      MirVariantDef { name: "Only".to_string(), discriminant: 0, fields: Vec::new() }
+    ])),
+    generic_params: Vec::new(),
+    layout: layout_attrs_plain(span_dummy())
+  }
+end
+
+def vw_type_defs() -> Map[Int, MirTypeDef]
+  var defs: Map[Int, MirTypeDef] = Map::new()
+  defs.insert(300, vw_payloaded_def())
+  defs.insert(301, vw_payloadless_def())
+  defs
+end
+
+def vw_type_defs_vec() -> Vec[MirTypeDef]
+  Vec::from([vw_payloaded_def(), vw_payloadless_def()])
+end
+
+def vw_e_ty() -> Type
+  Type::Adt(TypeId { id: 300 }, Vec::new())
+end
+
+def vw_p_ty() -> Type
+  Type::Adt(TypeId { id: 301 }, Vec::new())
+end
+
+def vw_lower(f: MirFunction, type_defs: Map[Int, MirTypeDef]) -> LirFunction
+  match lower_mir_fn_to_lir_prog(f, type_defs, Map::new(), Map::new(), Set::new(), Map::new())
+  when Result::Err(e) then panic("enum value-word test lowering failed: " + e)
+  when Result::Ok(lf) then lf
+  end
+end
+
+def vw_verify_clean(f: LirFunction) -> Unit
+  let alloc = lir_alloc_registers_a64(f)
+  let violations = verify_lir(f, alloc, LirVerifyRoute::LirVerifyA64)
+  var first = ""
+  if violations.len() > 0 then first = violations[0] end
+  assert(violations.len() == 0, "a canonical value-word function must verify clean; first violation: " + first)
+end
+
+def vw_local(id: Int, name: String, ty: Type, is_mut: Bool) -> MirLocal
+  MirLocal { id: MirLocalId { id: id }, name: name, ty: ty, is_mut: is_mut, span: span_dummy() }
+end
+
+def vw_block(bid: Int, stmts: Vec[MirStatement], term: MirTerminator) -> MirBlock
+  MirBlock { id: MirBlockId { id: bid }, statements: stmts, terminator: term }
+end
+
+def vw_ret_term() -> MirTerminator
+  MirTerminator { kind: MirTerminatorKind::MirReturn, span: span_dummy() }
+end
+
+def vw_int_operand(v: Int) -> MirOperand
+  MirOperand {
+    kind: MirOperandKind::MirConstant(MirConstant {
+      kind: MirConstantKind::MirInt(v),
+      ty: Type::Int,
+      instance: Option::None
+    })
+  }
+end
+
+def vw_copy_operand(p: Place) -> MirOperand
+  MirOperand { kind: MirOperandKind::MirCopy(p) }
+end
+
+def vw_assign_stmt(dst: Place, rv: MirRvalue) -> MirStatement
+  MirStatement { kind: MirStatementKind::MirAssign(dst, rv), span: span_dummy() }
+end
+
+def vw_param_fn(name: String, param_ty: Type) -> MirFunction
+  MirFunction {
+    name: name,
+    params: Vec::from([vw_local(1, "v", param_ty, false)]),
+    ret_type: Type::Unit,
+    locals: Vec::from([
+      vw_local(0, "_ret", Type::Unit, true),
+      vw_local(1, "v", param_ty, false)
+    ]),
+    blocks: Vec::from([vw_block(0, Vec::new(), vw_ret_term())]),
+    entry_block: MirBlockId { id: 0 },
+    is_async: false,
+    is_unsafe: false,
+    is_extern: false,
+    extern_abi: "".to_string(),
+    contracts: Vec::new(),
+    span: span_dummy()
+  }
+end
+
+def vw_ret_fn(name: String, ret_ty: Type) -> MirFunction
+  MirFunction {
+    name: name,
+    params: Vec::new(),
+    ret_type: ret_ty.clone(),
+    locals: Vec::from([vw_local(0, "_ret", ret_ty, true)]),
+    blocks: Vec::from([vw_block(0, Vec::new(), vw_ret_term())]),
+    entry_block: MirBlockId { id: 0 },
+    is_async: false,
+    is_unsafe: false,
+    is_extern: false,
+    extern_abi: "".to_string(),
+    contracts: Vec::new(),
+    span: span_dummy()
+  }
+end
+
+# A no-parameter function whose body constructs E::B(7), reads the
+# discriminant and then downcast-reads the payload — the construction/
+# discriminant/downcast behavior rows.
+def vw_construct_fn() -> MirFunction
+  let e_place = place_local(MirLocalId { id: 1 })
+  let payload_place = place_local(MirLocalId { id: 2 })
+  let disc_place = place_local(MirLocalId { id: 3 })
+  let out_place = place_local(MirLocalId { id: 4 })
+  let payload_stmt = vw_assign_stmt(payload_place.clone(), MirRvalue { kind: MirRvalueKind::MirMove(vw_int_operand(7)) })
+  let construct_stmt = vw_assign_stmt(
+    e_place.clone(),
+    MirRvalue { kind: MirRvalueKind::MirAggregate(
+      AggregateKind::Struct(TypeId { id: 300 }, Vec::new()),
+      Vec::from([vw_int_operand(1), vw_copy_operand(payload_place.clone())])) }
+  )
+  let disc_stmt = vw_assign_stmt(disc_place.clone(), MirRvalue { kind: MirRvalueKind::MirDiscriminant(e_place.clone()) })
+  let downcast_place = Place {
+    local: MirLocalId { id: 1 },
+    projections: Vec::from([
+      Projection::Variant(VariantId { owner: TypeId { id: 300 }, index: 1 as UInt }),
+      Projection::Field(FieldId { owner: TypeId { id: 300 }, index: 0 })
+    ])
+  }
+  let downcast_stmt = vw_assign_stmt(out_place.clone(), MirRvalue { kind: MirRvalueKind::MirCopy(downcast_place) })
+  MirFunction {
+    name: "value_word_body".to_string(),
+    params: Vec::new(),
+    ret_type: Type::Unit,
+    locals: Vec::from([
+      vw_local(0, "_ret", Type::Unit, true),
+      vw_local(1, "e", vw_e_ty(), true),
+      vw_local(2, "payload", Type::Int, true),
+      vw_local(3, "disc", Type::Int, true),
+      vw_local(4, "out", Type::Int, true)
+    ]),
+    blocks: Vec::from([vw_block(0, Vec::from([
+      payload_stmt, construct_stmt, disc_stmt, downcast_stmt
+    ]), vw_ret_term())]),
+    entry_block: MirBlockId { id: 0 },
+    is_async: false,
+    is_unsafe: false,
+    is_extern: false,
+    extern_abi: "".to_string(),
+    contracts: Vec::new(),
+    span: span_dummy()
+  }
+end
+
+# f(v: E) { ext_fn(v); } — one extern call carrying the enum through a
+# whole local (the extern guard's operand rule).
+def vw_extern_call_fn(name: String, arg_ty: Type) -> MirFunction
+  let v_place = place_local(MirLocalId { id: 1 })
+  let call_term = MirTerminator {
+    kind: MirTerminatorKind::MirCall {
+      dest: place_local(MirLocalId { id: 0 }),
+      func: MirOperand { kind: MirOperandKind::MirConstant(MirConstant {
+        kind: MirConstantKind::MirFnItem("ext_fn".to_string()),
+        ty: Type::Unit,
+        instance: Option::None
+      }) },
+      args: Vec::from([MirCallArg {
+        effect: AccessEffect::Read,
+        value: MirCallValue::Value(vw_copy_operand(v_place))
+      }]),
+      success: MirBlockId { id: 1 },
+      unwind: Option::None,
+      intrinsic: Option::None,
+      tail: false
+    },
+    span: span_dummy()
+  }
+  MirFunction {
+    name: name.to_string(),
+    params: Vec::from([vw_local(1, "v", arg_ty.clone(), false)]),
+    ret_type: Type::Unit,
+    locals: Vec::from([
+      vw_local(0, "_ret", Type::Unit, true),
+      vw_local(1, "v", arg_ty, false)
+    ]),
+    blocks: Vec::from([
+      vw_block(0, Vec::new(), call_term),
+      vw_block(1, Vec::new(), vw_ret_term())
+    ]),
+    entry_block: MirBlockId { id: 0 },
+    is_async: false,
+    is_unsafe: false,
+    is_extern: false,
+    extern_abi: "".to_string(),
+    contracts: Vec::new(),
+    span: span_dummy()
+  }
+end
+
+def vw_has_alloc_call(f: LirFunction) -> Bool
+  var hit = false
+  for b in f.blocks do
+    match b.term.kind
+    when LirTermKind::LirCall(target, _, _, _, _) then
+      if target == "_tg_bump_alloc" then hit = true end
+    when _ then ()
+    end
+  end
+  hit
+end
+
+def vw_has_threshold_cmp(f: LirFunction) -> Bool
+  var hit = false
+  for b in f.blocks do
+    for s in b.stmts do
+      match s.kind
+      when LirStmtKind::LirCmp(_, rhs) then
+        match rhs
+        when LirValue::LirImm(v) then
+          if v == 256 then hit = true end
+        when _ then ()
+        end
+      when _ then ()
+      end
+    end
+  end
+  hit
+end
+
+def vw_has_payload_store(f: LirFunction) -> Bool
+  var hit = false
+  for b in f.blocks do
+    for s in b.stmts do
+      match s.ptr
+      when Option::Some(op) then
+        match op
+        when LirPtrOp::LirPtrStore(_, off, _, w) then
+          if off == 8 && w == 8 then hit = true end
+        when _ then ()
+        end
+      when Option::None then ()
+      end
+    end
+  end
+  hit
+end
+
+def vw_has_ret_word(f: LirFunction) -> Bool
+  var hit = false
+  for b in f.blocks do
+    match b.term.kind
+    when LirTermKind::LirRet(rv) then
+      match rv
+      when Option::Some(_) then hit = true
+      when Option::None then ()
+      end
+    when _ then ()
+    end
+  end
+  hit
+end
+
+# ———————————————————————————————————————————————————————————————
+# 1. the shape rows: a tagged payloaded enum has a 16-byte IMAGE but a
+#    ONE-word canonical value-word crossing
+# ———————————————————————————————————————————————————————————————
+
+@test
+def test_enum_value_word_shape_rows() -> Unit
+  let defs = vw_type_defs()
+  match lir_plain_struct_shape(defs, vw_e_ty())
+  when Result::Err(e) then panic("E must admit a shape: " + e)
+  when Result::Ok(o) then
+    match o
+    when Option::Some(kind) then
+      match kind
+      when LirAggShapeKind::LirAggEnum(eshape) then
+        assert(lir_enum_shape_is_tagged(eshape), "E must be a TAGGED enum (Int has no niche)")
+        assert(lir_enum_shape_has_payload(eshape), "E carries a payload variant")
+        assert(eshape.size == 16, "the E image is the 16-byte tag+payload image, got " + eshape.size.to_string())
+        let vshape = lir_enum_image_shape(eshape)
+        assert(vshape.words == 1 && vshape.size == 8, "the E VALUE WORD is ONE word")
+        assert(lir_agg_is_scalar_class(vshape), "the E value word is Scalar-class")
+      when LirAggShapeKind::LirAggStruct(_) then panic("E must not admit a struct shape")
+      end
+    when Option::None then panic("E must admit an enum shape")
+    end
+  end
+
+  match lir_plain_struct_shape(defs, vw_p_ty())
+  when Result::Err(e) then panic("P must admit a shape: " + e)
+  when Result::Ok(o) then
+    match o
+    when Option::Some(kind) then
+      match kind
+      when LirAggShapeKind::LirAggEnum(eshape) then
+        assert(!lir_enum_shape_has_payload(eshape), "P is all-payload-less")
+        assert(lir_agg_is_scalar_class(lir_enum_image_shape(eshape)), "P's raw-discriminant word is Scalar-class")
+      when LirAggShapeKind::LirAggStruct(_) then panic("P must not admit a struct shape")
+      end
+    when Option::None then panic("P must admit an enum shape")
+    end
+  end
+
+  assert(lir_ty_is_payloaded_enum(defs, vw_e_ty()), "E must classify as a payloaded enum")
+  assert(!lir_ty_is_payloaded_enum(defs, vw_p_ty()), "P must classify as payload-less")
+end
+
+# ———————————————————————————————————————————————————————————————
+# 2. the ABI parity rows: the canonical authority answers ONE word for
+#    both routes (ValueWord crossing, TaggedPtr/Scalar(8) plan class)
+# ———————————————————————————————————————————————————————————————
+
+@test
+def test_enum_value_word_abi_parity_rows() -> Unit
+  mut engine = layout_engine_new(aarch64_target())
+  let defs_vec = vw_type_defs_vec()
+  layout_engine_register_types(&mut engine, &defs_vec)
+
+  # The crossing authority: the ONE TaggedPtr value word.
+  match classify_enum_crossing(&mut engine, aarch64_desc(), AbiFlavor::InternalValue, vw_e_ty())
+  when Result::Ok(c) then
+    match c
+    when AbiEnumCrossing::ValueWord then ()
+    when AbiEnumCrossing::InlineScalar then panic("E must cross as the canonical ValueWord")
+    end
+  when Result::Err(e) then panic("E must admit a canonical crossing: " + e.message)
+  end
+
+  # classify_value_category: the canonical Scalar(8) answer the task's
+  # representation table names.
+  match classify_value_category(&mut engine, vw_e_ty())
+  when Result::Ok(cat) then
+    match cat
+    when ValueCategory::Scalar(w) then
+      assert(w == 8, "E's value category is the ONE pointer-size word, got " + w.to_string())
+    when _ then panic("E must classify as a scalar word")
+    end
+  when Result::Err(e) then panic("E must classify: " + e.message)
+  end
+
+  # The CALL PLAN both routes consume: ONE TaggedPtr(8) argument slot and
+  # ONE TaggedPtr(8) return class, byte-identically to the direct
+  # route's plan.
+  match classify_call_plan(&mut engine, aarch64_desc(), AbiFlavor::InternalValue, Vec::from([vw_e_ty()]), vw_e_ty(), false)
+  when Result::Ok(plan) then
+    assert(plan.args.len() == 1, "E's plan is one argument slot")
+    let arg_cls = plan.args[0].value_class.clone()
+    match arg_cls
+    when AbiValueClass::TaggedPtr(w) then
+      assert(w == 8, "the E argument is the one TaggedPtr word")
+    when _ then panic("the E argument must plan as TaggedPtr: " + abi_value_class_word(arg_cls))
+    end
+    assert(abi_value_class_word(arg_cls) == "scalar:8", "the persisted class word stays scalar:8")
+    match plan.ret
+    when AbiReturn::GprT(cls) then
+      match cls
+      when AbiValueClass::TaggedPtr(w) then
+        assert(w == 8, "the E return is the one TaggedPtr word")
+      when _ then panic("the E return must plan as TaggedPtr: " + abi_value_class_word(cls))
+      end
+    when _ then panic("the E return must cross in the general return register (GprT)")
+    end
+  when Result::Err(e) then panic("E's call plan must classify: " + e.message)
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# 3. the lowered signature rows: one word, no sret, no machine bind
+# ———————————————————————————————————————————————————————————————
+
+@test
+def test_enum_value_word_signature_rows() -> Unit
+  let defs = vw_type_defs()
+
+  # The declared-signature scan.
+  let param_f = vw_param_fn("value_word_param", vw_e_ty())
+  assert(lir_fn_has_payloaded_enum_crossing(defs, param_f), "an E parameter is a payloaded-tagged crossing")
+
+  # The lowered parameter: ONE ordinary word vreg, no sret protocol and
+  # no machine-level aggregate bind (the LIR route consumes the same
+  # one-slot plan the direct route's enum argument uses).
+  let lf = vw_lower(param_f, defs)
+  assert(lf.params.len() == 1, "an E parameter is ONE ordinary vreg")
+  assert(lf.sret_words == 0, "an E parameter must not open the sret protocol")
+  assert(lf.agg_params.len() == 0, "an E parameter crosses by VALUE (no machine aggregate bind)")
+  vw_verify_clean(lir_peephole(lf))
+
+  # An E return: the Ret carries the return local's ONE value word.
+  let ret_fn = vw_ret_fn("value_word_ret", vw_e_ty())
+  let lf_ret = vw_lower(ret_fn, defs)
+  assert(lf_ret.sret_words == 0, "an E return crosses as ONE word in x0 (no sret)")
+  assert(vw_has_ret_word(lf_ret), "the E Ret must carry the value word")
+  vw_verify_clean(lir_peephole(lf_ret))
+
+  # The payload-less control: the raw-discriminant word is the same ONE
+  # word crossing (and never opens an sret protocol either).
+  let p_f = vw_param_fn("payloadless_param", vw_p_ty())
+  assert(!lir_fn_has_payloaded_enum_crossing(defs, p_f), "P is not a payloaded crossing")
+  let lf_p = vw_lower(p_f, defs)
+  assert(lf_p.sret_words == 0 && lf_p.agg_params.len() == 0, "P crosses as its raw-discriminant word")
+  vw_verify_clean(lir_peephole(lf_p))
+end
+
+# ———————————————————————————————————————————————————————————————
+# 4. the construction/discriminant/downcast rows: allocate the image,
+#    store tag+payload, normalize the word, read the payload through the
+#    pointer
+# ———————————————————————————————————————————————————————————————
+
+@test
+def test_enum_value_word_behavior_rows() -> Unit
+  let lf = vw_lower(vw_construct_fn(), vw_type_defs())
+  assert(vw_has_alloc_call(lf), "a payloaded construction must call the runtime allocator")
+  assert(vw_has_threshold_cmp(lf), "the discriminant read must normalize against the 256-byte inline-tag threshold")
+  assert(vw_has_payload_store(lf), "the payload must be stored at image byte 8")
+  vw_verify_clean(lir_peephole(lf))
+end
+
+# ———————————————————————————————————————————————————————————————
+# 5. the boundary rows: the extern refusal (canonical reason) and the
+#    Global binding (the value word IS the canonical crossing)
+# ———————————————————————————————————————————————————————————————
+
+@test
+def test_enum_value_word_boundary_rows() -> Unit
+  let defs = vw_type_defs()
+
+  # The canonical extern refusal message names the TaggedPtr value word.
+  let msg = lir_extern_enum_refusal("caller", "ext_fn", "argument 0", "value-word")
+  assert(msg.contains("TaggedPtr"), "the extern refusal must name the canonical representation")
+  assert(msg.contains("fail"), "the extern refusal must fail closed")
+
+  # The extern guard: an E argument to an extern fails closed.
+  let extern_f = vw_extern_call_fn("extern_value_word", vw_e_ty())
+  var externs: Set[String] = Set::new()
+  externs.insert("ext_fn".to_string())
+  match lir_check_extern_enum_calls(extern_f, defs, externs)
+  when Result::Err(e) then
+    assert(e.contains("TaggedPtr") && e.contains("fail"), "the extern guard must refuse an E argument with the canonical reason; got: " + e)
+  when Result::Ok(_) then
+    panic("a payloaded-enum argument to an extern must fail closed")
+  end
+
+  # The writer binding: the payloaded crossing IS the canonical value
+  # word, so it keeps the public Global binding (fourth-audit P0-20
+  # deleted the Local containment for it).
+  let crosser = vw_lower(vw_param_fn("value_word_crosser", vw_e_ty()), defs)
+  assert(lir_fn_export_binding(crosser) == SymBinding::Global, "an E crossing function keeps the Global binding")
+
+  # The crossing rule names the shared allocator and the one-word plan.
+  let rule = lir_enum_crossing_rule()
+  assert(rule.contains("_tg_bump_alloc"), "the crossing rule must name the shared runtime allocator")
+  assert(rule.contains("ONE Scalar-class"), "the crossing rule must state the one-slot crossing")
+end
