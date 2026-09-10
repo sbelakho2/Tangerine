@@ -5,17 +5,23 @@
 # stable key and renders one SemanticDelta describing what changed between
 # two compilations. The module reads ONLY snapshot rows (never AST / typed /
 # MIR state) and mirrors the semantic_model.tg / semantic_snapshot.tg idioms.
+# The extended closure API (affected_closure — audit item 41) additionally
+# reads the §32 read-side index (semantic_index.tg — itself a pure fold of
+# snapshot rows) for the closure's edge lookups; it still never touches AST /
+# typed / MIR state.
 #
 # TABLE ANCHORS: symbols -> entity diff (created/removed/modified); calls /
 # effects / capabilities / ownership / contracts -> the *_delta rows;
 # mir_functions -> the mir_changed flag; the public_api_hash / abi_hash WORD
-# pairs -> public_api_delta / abi_delta. Their row texts are reconstructed
-# from the pub symbol+type rows (api — the snapshot writer's public_api text
-# domain) and the pub-Function keys (abi — the exact ABI row text needs the
-# builder-side mono classifier and is NOT in a snapshot). The types table is
-# read for those api rows only; tests/coverage carry no rows today and no
-# delta signal (documented); the unsafe_facts table feeds unsafe_delta
-# (audit item 16 — the created/removed UnsafeFact row lists).
+# pairs -> public_api_delta / abi_delta; the abi_surfaces table (audit
+# item 18) -> the abi view rows and the per-surface before/after row texts.
+# The api view rows are reconstructed from the pub symbol+type rows (the
+# snapshot writer's public_api text domain); the abi view rows are the
+# persisted canonical ABI/layout row texts, falling back to the
+# pub-Function keys for pre-item-18 snapshots. The types table is read for
+# those api rows only; tests/coverage carry no rows today and no delta
+# signal (documented); the unsafe_facts table feeds unsafe_delta (audit
+# item 16 — the created/removed UnsafeFact row lists).
 #
 # TYPED DELTAS (audit item 14): the effect/capability/ownership/contract
 # delta rows are TYPED before/after records — the diff core compares the
@@ -74,14 +80,22 @@
 #
 # affected: seeds = created/removed/modified keys; closes over b's call rows
 # to a fixed point — a caller row whose callee (the row's `to`) is affected
-# becomes affected — capped at the b call-table size.
+# becomes affected — capped at the b call-table size. This is the §31
+# call-closure core of audit item 41; the FULL semantic-dependency-graph
+# closure over every edge class the snapshot/index data supports is
+# affected_closure below (its doc carries the per-kind data matrix and the
+# documented residual gaps).
 #
 # public_api / abi deltas: the hash-word pairs of §29 become the typed
 # AbiDeltaView surfaces (audit item 14): one view per surface carrying the
 # FULL sorted before/after row sets (api = the reconstructed pub rows; abi =
-# the pub-Function keys). The digest text derives the changed flag and the
+# the persisted abi_surfaces canonical row texts, pub-Function keys for
+# pre-item-18 snapshots). The digest text derives the changed flag and the
 #   symmetric-difference rows from the views; consumers needing the surface
-#   delta use semantic_delta_rows_same / semantic_delta_rows_diff.
+#   delta use semantic_delta_rows_same / semantic_delta_rows_diff. The abi
+#   view ALSO carries surface_rows — the per-surface before/after row texts
+#   (audit item 18), keyed by the row's stable surface id, so a consumer
+#   can name the exact layout/class change without re-keying the view rows.
 #
 # CONTRACT RELATIONS (audit item 17): the module ALSO exposes the typed
 # strengthening/weakening comparison of contract clauses —
@@ -99,15 +113,21 @@
 
 use std::collections::{Vec, Map}
 
-use tg_compiler::ids::{StableDigest, stable_digest_of}
+use tg_compiler::ids::{StableDigest, stable_digest_of, DefKind, stable_def_id_digested}
 use tg_compiler::ast::{AccessConvention, AstContractKind}
 use tg_compiler::types::{EffectSummary}
+use tg_compiler::stable_ids::{StableContractId}
 use tg_compiler::semantic_model::{
-  SemanticSnapshot, SemanticSymbol, CallEdge, ContractFact, MirSemanticSummary,
-  UnsafeFact, UnsafeDelta,
+  SemanticSnapshot, SemanticSymbol, SemanticType, SemanticTypeKind, StableTargetId,
+  CallEdge, CallEdgeKind, ContractExprIR, ContractFact, MirSemanticSummary,
+  TestRelationship, UnsafeFact, UnsafeDelta, DependencyEdgeKind,
   semantic_digest_render, semantic_json_escape, semantic_summary_dirty_word,
   semantic_def_kind_text, semantic_stable_def_id_digest, semantic_call_edge_kind_numeric,
-  semantic_contract_expr_text, semantic_unsafe_kind_text, semantic_unsafe_fact_lt
+  semantic_contract_expr_text, semantic_unsafe_kind_text, semantic_unsafe_fact_lt,
+  semantic_abi_surface_row_text, semantic_dependency_edge_kind_numeric
+}
+use tg_compiler::semantic_index::{
+  SemanticIndex, build_semantic_index, index_callers_of, index_tests_for_symbol
 }
 
 # ———— The §31 protocol records ————
@@ -242,7 +262,8 @@ end
 # The typed BEFORE/AFTER surface of one hash domain (audit item 14): the
 # public-api and abi deltas carry no per-key data richer than the sorted
 # surface row texts (api = the reconstructed "<digest> <kind> <key>" pub
-# rows; abi = the pub-Function stable keys), so AbiSurfaceView { rows } IS
+# rows; abi = the persisted abi_surfaces canonical row texts when present,
+# the pub-Function stable keys otherwise), so AbiSurfaceView { rows } IS
 # the comparison payload and AbiDeltaView pairs the two sides under the
 # surface's id word ("api" | "abi" — the digest text domain's own tags). The hash pair of §29 is
 # derivable: the rows differ iff the surface changed.
@@ -250,10 +271,27 @@ struct AbiSurfaceView
   rows: Vec[String] = Vec::new()
 end
 
+# One ABI surface row's BEFORE/AFTER text (audit item 18): the canonical
+# semantic_abi_surface_row_text of the row under its surface id, None when
+# the surface id is absent from that side. Only CHANGED surfaces are
+# carried (an unchanged row is no delta row); the surface id is the row's
+# stable join key ("fn:<full stable key>" | "type:<full stable key>").
+struct AbiSurfaceRowDelta
+  surface_id: String
+  before: Option[String] = Option::None
+  after: Option[String] = Option::None
+end
+
 struct AbiDeltaView
   surface_id: String
   before: AbiSurfaceView
   after: AbiSurfaceView
+  # The per-surface before/after row texts of the persisted abi_surfaces
+  # table (item 18) — empty for pre-item-18 snapshots and for the api
+  # surface (whose rows are symbol-row reconstructions, not a persisted
+  # table). A convenience projection of the view rows' symmetric
+  # difference, never an independent payload.
+  surface_rows: Vec[AbiSurfaceRowDelta] = Vec::new()
 end
 
 struct SemanticDelta
@@ -1399,6 +1437,79 @@ def delta_abi_keys(s: SemanticSnapshot) -> Vec[String]
   keys
 end
 
+# The abi surface row texts of one snapshot (audit item 18): the canonical
+# semantic_abi_surface_row_text renders of the persisted abi_surfaces
+# table, sorted; the pub-Function key reconstruction is the fallback for
+# pre-item-18 snapshots whose table is empty.
+def delta_abi_row_texts(s: SemanticSnapshot) -> Vec[String]
+  if s.abi_surfaces.len() > 0 then
+    var rows: Vec[String] = Vec::new()
+    for r in s.abi_surfaces do
+      rows.push(semantic_abi_surface_row_text(&r))
+    end
+    rows.sort_by(|x, y| x < y)
+    rows
+  else
+    delta_abi_keys(s)
+  end
+end
+
+# The Option text of a per-surface side ("" when absent) — the comparison
+# projection used to emit only CHANGED surface rows.
+def delta_surface_side_text(o: Option[String]) -> String
+  match o
+  when Option::Some(t) then t
+  when Option::None then "".to_string()
+  end
+end
+
+# The per-surface before/after row deltas of two snapshots (audit item 18):
+# the union of both abi_surfaces surface ids, each changed id carrying its
+# canonical row text on each side (None = the surface id is absent from
+# that side). Unchanged ids are NOT emitted (the emit-nothing rule); the
+# list is sorted by surface id.
+def delta_abi_surface_row_deltas(a: SemanticSnapshot, b: SemanticSnapshot) -> Vec[AbiSurfaceRowDelta]
+  var a_map: Map[String, String] = Map::new()
+  var b_map: Map[String, String] = Map::new()
+  for r in a.abi_surfaces do
+    a_map.insert(r.surface_id.clone(), semantic_abi_surface_row_text(&r))
+  end
+  for r in b.abi_surfaces do
+    b_map.insert(r.surface_id.clone(), semantic_abi_surface_row_text(&r))
+  end
+  var ids: Vec[String] = Vec::new()
+  for r in a.abi_surfaces do
+    ids.push(r.surface_id.clone())
+  end
+  for r in b.abi_surfaces do
+    if !a_map.contains_key(&r.surface_id) then
+      ids.push(r.surface_id.clone())
+    end
+  end
+  ids.sort_by(|x, y| x < y)
+  var out: Vec[AbiSurfaceRowDelta] = Vec::new()
+  for id in ids do
+    var before: Option[String] = Option::None
+    var after: Option[String] = Option::None
+    match a_map.get(id.clone())
+    when Option::Some(t) then before = Option::Some(t.clone())
+    when Option::None then ()
+    end
+    match b_map.get(id.clone())
+    when Option::Some(t2) then after = Option::Some(t2.clone())
+    when Option::None then ()
+    end
+    if delta_surface_side_text(before.clone()) != delta_surface_side_text(after.clone()) then
+      out.push(AbiSurfaceRowDelta {
+        surface_id: id.clone(),
+        before: before,
+        after: after
+      })
+    end
+  end
+  out
+end
+
 # ———— THE DIFF CORE ————
 
 pub def semantic_delta_of(a: SemanticSnapshot, b: SemanticSnapshot) -> SemanticDelta
@@ -1518,11 +1629,14 @@ pub def semantic_delta_of(a: SemanticSnapshot, b: SemanticSnapshot) -> SemanticD
   let unsafe_rows = delta_unsafe_delta_of(&a, &b)
 
   # 6. The public-api / abi surface deltas (typed before/after views —
-  #    audit item 14: the full sorted row sets of both sides).
+  #    audit item 14: the full sorted row sets of both sides). The abi
+  #    side consumes the persisted abi_surfaces rows (audit item 18) and
+  #    additionally carries the per-surface before/after row texts.
   let api_rows_a = delta_public_api_rows(&a)
   let api_rows_b = delta_public_api_rows(&b)
-  let abi_keys_a = delta_abi_keys(&a)
-  let abi_keys_b = delta_abi_keys(&b)
+  let abi_rows_a = delta_abi_row_texts(&a)
+  let abi_rows_b = delta_abi_row_texts(&b)
+  let abi_surface_changes = delta_abi_surface_row_deltas(&a, &b)
 
   # 7. The affected closure over b's call rows (callers of affected callees;
   #    fixed point capped at the b call-table size).
@@ -1579,11 +1693,455 @@ pub def semantic_delta_of(a: SemanticSnapshot, b: SemanticSnapshot) -> SemanticD
   }
   result.abi_delta = AbiDeltaView {
     surface_id: "abi".to_string(),
-    before: AbiSurfaceView { rows: abi_keys_a },
-    after: AbiSurfaceView { rows: abi_keys_b }
+    before: AbiSurfaceView { rows: abi_rows_a },
+    after: AbiSurfaceView { rows: abi_rows_b },
+    surface_rows: abi_surface_changes
   }
   result.affected = affected
   result
+end
+
+# ———————————————————————————————————————————————————————————————
+# The affected closure over the FULL semantic dependency graph (audit item 41)
+# ———————————————————————————————————————————————————————————————
+# semantic_delta_of's affected closes over the CALL rows only. Audit item 41
+# requires the closure over the full semantic dependency graph; the extended
+# API below computes the fixed-point closure over EXACTLY the requested
+# DependencyEdgeKind classes (semantic_model.tg), from the changed keys (the
+# delta's created/removed/modified — the same seeds affected uses) to every
+# entity reachable through the requested classes' edges. snapshot MUST be the
+# delta's b-side snapshot and index MUST be built from it (the closure reads
+# the CURRENT side's edges exactly like affected reads b's call rows).
+#
+# PER-KIND DATA MATRIX (what each kind traverses, and why):
+#   Call — the snapshot's call rows, walked callee -> caller
+#     (index_callers_of): a changed callee affects its callers. FULL data.
+#   Implements — the index's impls_of rows over the type rows: a changed
+#     METHOD whose registration path is "<type>::<name>" affects the owner
+#     TYPE row (the type's impl surface changed). PARTIAL data: the audit's
+#     trait -> implementors direction needs an impl row family linking a
+#     self type to the implemented trait, and NO snapshot row carries it
+#     (the index documents the same gap for impls_of) — residual gap.
+#   ContainsType — the type rows' canonical signature texts (the "#..."
+#     component of SemanticType.stable_id.key — the writer's "struct{...}" /
+#     "enum{...}" / "trait{...}" render): a changed type affects every
+#     registered type whose row text references it as "T[<qualified name>"
+#     (field / variant / method-shape type texts). FULL data for declared
+#     types; primitives and unregistered (std) types never produce edges —
+#     they are never change keys of this snapshot.
+#   TestReferences — the snapshot's test rows, walked target -> test
+#     (index_tests_for_symbol): a changed exercised function affects its
+#     tests. FULL data when test rows exist.
+#   ContractReferences — the contract rows: a changed def affects every
+#     function whose clause canonical text references the def's
+#     module-qualified path in the canonical "path(...)" op form — a
+#     conservative textual match; references spelled as bare idents or as
+#     type texts are not matched (documented subset of the class).
+#   AbiConsumer — the pub surface: a changed pub Function affects its
+#     callers (call rows — the in-snapshot consumers of its ABI; consumers
+#     outside the snapshot are a documented gap); a changed pub TYPE affects
+#     every def whose stable-key signature text references it ("T[<qualified
+#     name>" inside fn / static / type signature renders). Non-pub defs add
+#     no ABI edges (their consumers ride Call / ContainsType).
+#   EffectPropagation — the §11 effect facts propagate to CALLERS through
+#     the call graph (the transitive summaries are fixed points over the
+#     lowered call graph); the edge data IS the call rows. The kind exists so
+#     a caller can request this propagation class alone.
+#   CapabilityPropagation — capability facts propagate to callers the same
+#     way; edge data = the call rows again.
+#   GenericInstantiation / LayoutDependent / ConstEvalDependent /
+#   DerivedImpl — NO row data exists for these classes in this slice (mono
+#     instances are not snapshot rows; the index's type_layouts is empty; no
+#     const-use or derive row family exists). Their dependencies are
+#     COVERED BY CALLS ONLY: the closure walks the call rows for them (the
+#     only representable cross-def edges), so their requested closure yields
+#     the call-closure answer; the audit's requirement beyond call coverage
+#     is the RESIDUAL GAP of this slice — listed here, never silently
+#     dropped, and to be closed by future row families (mono instance rows,
+#     layout rows, const-use rows, derive rows) that add dedicated edges.
+#
+# ALGORITHM: seeds = the delta's created + removed + modified stable keys.
+# The closure is the least fixed point over the UNION of the requested
+# kinds' edges, computed by a worklist WITHOUT per-key revisits: a key is
+# enqueued at most once; each processed key expands through every requested
+# kind exactly once. The iteration cap is the total row count of the
+# dependency tables (the sibling b-call-table cap of semantic_delta_of
+# generalized to every table the edges read) — BFS reaches every key in
+# fewer visits than the cap, so the cap only guards pathological key growth.
+# The result is the sorted reachable key list (deterministic whatever the
+# insertion order).
+
+def delta_kinds_has(kinds: Vec[DependencyEdgeKind], want: DependencyEdgeKind) -> Bool
+  let wn = semantic_dependency_edge_kind_numeric(&want)
+  for k in kinds do
+    if semantic_dependency_edge_kind_numeric(&k) == wn then
+      return true
+    end
+  end
+  false
+end
+
+# The multi-character needle find (delta_char_index is single-character):
+# the index of the first needle at or after from (-1 if none).
+def delta_string_find(text: String, needle: String, from: Int) -> Int
+  if needle.len() == 0 then
+    return -1
+  end
+  var i = from
+  while i + needle.len() <= text.len() do
+    if text.slice(i, i + needle.len()) == needle then
+      return i
+    end
+    i = i + 1
+  end
+  -1
+end
+
+# The qualified names referenced by a stable key's canonical signature
+# render: every "T[<qualified name>" marker of the writer's type grammar
+# (Type::Adt renders "T[" + qualified name + optional "[arg]" groups),
+# read up to the name terminator ('[' for an instantiation, ']' for a bare
+# reference). Deduped; the scan is position-driven, so nested references
+# (a reference inside an instantiation's argument list) are found too.
+def delta_key_type_reference_paths(key: String) -> Vec[String]
+  var out: Vec[String] = Vec::new()
+  var i = 0
+  while i < key.len() do
+    let marker = delta_string_find(&key, "T[", i)
+    if marker < 0 then
+      break
+    end
+    var j = marker + 2
+    var qname = ""
+    while j < key.len() do
+      let ch = key.slice(j, j + 1)
+      if ch == "]" || ch == "[" then
+        break
+      end
+      qname = qname + ch
+      j = j + 1
+    end
+    if qname.len() > 0 && !out.contains(&qname) then
+      out.push(qname)
+    end
+    i = marker + 2
+  end
+  out
+end
+
+# The def paths referenced by a canonical clause text: the args of every
+# canonical "path(<module::name>)" op occurrence (the canonical render's
+# resolved-def spelling), read to the first ')'. Deduped. A conservative
+# match: text that merely LOOKS like the op form (e.g. inside a string
+# literal argument) over-approximates the reference set, which is the safe
+# direction for invalidation; the miss direction is the documented subset.
+def delta_contract_referenced_paths(text: String) -> Vec[String]
+  var out: Vec[String] = Vec::new()
+  var i = 0
+  while i < text.len() do
+    let marker = delta_string_find(&text, "path(", i)
+    if marker < 0 then
+      break
+    end
+    var j = marker + 5
+    var p = ""
+    while j < text.len() do
+      let ch = text.slice(j, j + 1)
+      if ch == ")" then
+        break
+      end
+      p = p + ch
+      j = j + 1
+    end
+    if p.len() > 0 && !out.contains(&p) then
+      out.push(p)
+    end
+    i = marker + 5
+  end
+  out
+end
+
+# Append one dependent row under a key, deduped (the index's map-push idiom;
+# builds are order-insensitive, readers compare membership only).
+def delta_vec_map_push(inout m: Map[String, Vec[String]], key: String, val: String) -> Unit
+  match m.get(key.clone())
+  when Option::Some(rows) then
+    var new_rows = rows.clone()
+    if !new_rows.contains(&val) then
+      new_rows.push(val)
+      m.insert(key, new_rows)
+    end
+  when Option::None then
+    m.insert(key, Vec::from([val]))
+  end
+  ()
+end
+
+# The keyed rows of a string-list map ([] when the key is absent).
+def delta_closure_map_dependents(m: Map[String, Vec[String]], key: String) -> Vec[String]
+  var out: Vec[String] = Vec::new()
+  match m.get(key.clone())
+  when Option::Some(rows) then
+    for r in rows do
+      out.push(r.clone())
+    end
+  when Option::None then ()
+  end
+  out
+end
+
+# The ABI-consumer dependents of one changed key: a pub Function affects its
+# callers (the in-snapshot consumers of its ABI); a pub TYPE affects every
+# def whose stable-key signature text references it (abi_consumers_of, keyed
+# by the pub type's stable key). Both directions can fire for one key.
+def delta_closure_abi_dependents(
+  pub_fns: Map[String, Bool],
+  abi_consumers_of: Map[String, Vec[String]],
+  index: SemanticIndex,
+  key: String
+) -> Vec[String]
+  var out: Vec[String] = Vec::new()
+  if pub_fns.contains_key(&key) then
+    for caller in index_callers_of(&index, key.clone()) do
+      if !out.contains(&caller) then
+        out.push(caller.clone())
+      end
+    end
+  end
+  match abi_consumers_of.get(key.clone())
+  when Option::Some(consumers) then
+    for c in consumers do
+      if !out.contains(&c) then
+        out.push(c.clone())
+      end
+    end
+  when Option::None then ()
+  end
+  out
+end
+
+# Merge newly reached keys into the closure state (deduped; the queue only
+# grows — a key is enqueued at most once).
+def delta_closure_absorb(
+  inout in_aff: Map[String, Bool],
+  inout queue: Vec[String],
+  deps: Vec[String]
+) -> Unit
+  for dep in deps do
+    if !in_aff.contains_key(&dep) then
+      in_aff.insert(dep.clone(), true)
+      queue.push(dep)
+    end
+  end
+  ()
+end
+
+# The audit item-41 closure: the sorted keys reachable from the delta's
+# changed entities through EXACTLY the requested dependency edge kinds. See
+# the section doc for the per-kind data matrix and the residual gaps.
+pub def affected_closure(
+  delta: SemanticDelta,
+  snapshot: SemanticSnapshot,
+  index: SemanticIndex,
+  kinds: Vec[DependencyEdgeKind]
+) -> Vec[String]
+  # 1. Seeds: the delta's changed keys (the same seed set affected uses).
+  var in_aff: Map[String, Bool] = Map::new()
+  var queue: Vec[String] = Vec::new()
+  for key in delta.created do
+    if !in_aff.contains_key(&key) then
+      in_aff.insert(key.clone(), true)
+      queue.push(key.clone())
+    end
+  end
+  for key in delta.removed do
+    if !in_aff.contains_key(&key) then
+      in_aff.insert(key.clone(), true)
+      queue.push(key.clone())
+    end
+  end
+  for entry in delta.modified do
+    if !in_aff.contains_key(&entry.stable_id) then
+      in_aff.insert(entry.stable_id.clone(), true)
+      queue.push(entry.stable_id.clone())
+    end
+  end
+  if queue.len() == 0 then
+    return queue
+  end
+  if kinds.len() == 0 then
+    queue.sort_by(|x, y| x < y)
+    return queue
+  end
+
+  # 2. The per-kind edge maps, built once per requested class (the classes
+  #    that ride the call rows or the index's test maps need no precompute).
+  let want_impls = delta_kinds_has(&kinds, DependencyEdgeKind::Implements)
+  let want_contains = delta_kinds_has(&kinds, DependencyEdgeKind::ContainsType)
+  let want_contracts = delta_kinds_has(&kinds, DependencyEdgeKind::ContractReferences)
+  let want_abi = delta_kinds_has(&kinds, DependencyEdgeKind::AbiConsumer)
+
+  # The registered type path -> type stable key table (the join the
+  # ContainsType and AbiConsumer scans use).
+  var type_path_to_key: Map[String, String] = Map::new()
+  if want_impls || want_contains || want_abi then
+    for t in snapshot.types do
+      type_path_to_key.insert(delta_key_name_part(&t.stable_id.key), t.stable_id.key.clone())
+    end
+  end
+
+  # ContainsType: contained type key -> container type keys (the reverse of
+  # the "T[<qualified name>" references inside every type row's signature).
+  var containers_of: Map[String, Vec[String]] = Map::new()
+  if want_contains then
+    for t in snapshot.types do
+      let tkey = t.stable_id.key.clone()
+      for q in delta_key_type_reference_paths(&tkey) do
+        match type_path_to_key.get(q.clone())
+        when Option::Some(inner_key) then
+          delta_vec_map_push(&mut containers_of, inner_key, tkey.clone())
+        when Option::None then ()
+        end
+      end
+    end
+  end
+
+  # Implements: method key -> owner type key (a method's registration path
+  # "<type>::<name>" — the index's impls_of relation, reversed). The audit's
+  # trait -> implementors direction has no rows (see the section doc).
+  var owner_of: Map[String, String] = Map::new()
+  if want_impls then
+    for t in snapshot.types do
+      let pfx = delta_key_name_part(&t.stable_id.key) + "::"
+      for row in snapshot.symbols do
+        if semantic_def_kind_text(&row.kind) == "Method" then
+          let mpath = delta_key_name_part(&row.stable_id.key)
+          if mpath.starts_with(pfx.clone()) then
+            let rest = mpath.slice(pfx.len(), mpath.len())
+            if rest.len() > 0 && !rest.contains("::") then
+              owner_of.insert(row.stable_id.key.clone(), t.stable_id.key.clone())
+            end
+          end
+        end
+      end
+    end
+  end
+
+  # ContractReferences: referenced def path -> the function keys whose
+  # contract rows carry the canonical "path(<def>)" reference.
+  var contract_users_of: Map[String, Vec[String]] = Map::new()
+  if want_contracts then
+    var def_paths: Map[String, Bool] = Map::new()
+    for row in snapshot.symbols do
+      def_paths.insert(delta_key_name_part(&row.stable_id.key), true)
+    end
+    for cr in snapshot.contracts do
+      let fkey = cr.function.key.clone()
+      let text = semantic_contract_expr_text(&cr.canonical_expression)
+      for p in delta_contract_referenced_paths(&text) do
+        if def_paths.contains_key(&p) then
+          delta_vec_map_push(&mut contract_users_of, p, fkey.clone())
+        end
+      end
+    end
+  end
+
+  # AbiConsumer: the pub Function keys (call-row consumers) and the pub type
+  # key -> referencing def keys map (every symbol/type row whose stable-key
+  # signature text references a pub type).
+  var pub_fns: Map[String, Bool] = Map::new()
+  var abi_consumers_of: Map[String, Vec[String]] = Map::new()
+  if want_abi then
+    for row in snapshot.symbols do
+      if row.is_pub && semantic_def_kind_text(&row.kind) == "Function" then
+        pub_fns.insert(row.stable_id.key.clone(), true)
+      end
+    end
+    var pub_type_paths: Map[String, String] = Map::new()
+    for t in snapshot.types do
+      if t.is_pub then
+        pub_type_paths.insert(delta_key_name_part(&t.stable_id.key), t.stable_id.key.clone())
+      end
+    end
+    for row in snapshot.symbols do
+      for q in delta_key_type_reference_paths(&row.stable_id.key) do
+        match pub_type_paths.get(q.clone())
+        when Option::Some(tkey) then
+          delta_vec_map_push(&mut abi_consumers_of, tkey, row.stable_id.key.clone())
+        when Option::None then ()
+        end
+      end
+    end
+    for t in snapshot.types do
+      let tkey = t.stable_id.key.clone()
+      for q in delta_key_type_reference_paths(&tkey) do
+        match pub_type_paths.get(q.clone())
+        when Option::Some(tkey2) then
+          delta_vec_map_push(&mut abi_consumers_of, tkey2, tkey.clone())
+        when Option::None then ()
+        end
+      end
+    end
+  end
+
+  # 3. The worklist fixed point over the union of the requested kinds'
+  #    edges. Each processed key expands through every requested kind once;
+  #    the cap is the total dependency-table row count (the sibling
+  #    b-call-table cap generalized — see the section doc).
+  var cap = snapshot.calls.len() + snapshot.symbols.len() + snapshot.types.len() +
+    snapshot.contracts.len() + snapshot.tests.len() + 1
+  var head = 0
+  var rounds = 0
+  while head < queue.len() && rounds < cap do
+    let key = queue[head].clone()
+    head = head + 1
+    rounds = rounds + 1
+    for kind in kinds do
+      match kind
+      when DependencyEdgeKind::Call then
+        delta_closure_absorb(&mut in_aff, &mut queue,
+          index_callers_of(&index, key.clone()))
+      when DependencyEdgeKind::EffectPropagation then
+        delta_closure_absorb(&mut in_aff, &mut queue,
+          index_callers_of(&index, key.clone()))
+      when DependencyEdgeKind::CapabilityPropagation then
+        delta_closure_absorb(&mut in_aff, &mut queue,
+          index_callers_of(&index, key.clone()))
+      when DependencyEdgeKind::GenericInstantiation then
+        delta_closure_absorb(&mut in_aff, &mut queue,
+          index_callers_of(&index, key.clone()))
+      when DependencyEdgeKind::LayoutDependent then
+        delta_closure_absorb(&mut in_aff, &mut queue,
+          index_callers_of(&index, key.clone()))
+      when DependencyEdgeKind::ConstEvalDependent then
+        delta_closure_absorb(&mut in_aff, &mut queue,
+          index_callers_of(&index, key.clone()))
+      when DependencyEdgeKind::DerivedImpl then
+        delta_closure_absorb(&mut in_aff, &mut queue,
+          index_callers_of(&index, key.clone()))
+      when DependencyEdgeKind::Implements then
+        match owner_of.get(key.clone())
+        when Option::Some(owner) then
+          delta_closure_absorb(&mut in_aff, &mut queue, Vec::from([owner.clone()]))
+        when Option::None then ()
+        end
+      when DependencyEdgeKind::ContainsType then
+        delta_closure_absorb(&mut in_aff, &mut queue,
+          delta_closure_map_dependents(&containers_of, key.clone()))
+      when DependencyEdgeKind::AbiConsumer then
+        delta_closure_absorb(&mut in_aff, &mut queue,
+          delta_closure_abi_dependents(&pub_fns, &abi_consumers_of, &index, key.clone()))
+      when DependencyEdgeKind::ContractReferences then
+        delta_closure_absorb(&mut in_aff, &mut queue,
+          delta_closure_map_dependents(&contract_users_of, delta_key_name_part(&key)))
+      when DependencyEdgeKind::TestReferences then
+        delta_closure_absorb(&mut in_aff, &mut queue,
+          index_tests_for_symbol(&index, key.clone()))
+      end
+    end
+  end
+  queue.sort_by(|x, y| x < y)
+  queue
 end
 
 # ———— The canonical delta text + the content-addressed delta digest ————
@@ -1911,6 +2469,310 @@ pub def contract_relation_lane_check() -> Vec[String]
     "bingt(ident(amount),int(0))",
     "binand(bingt(ident(amount),int(0)),binlt(ident(amount),int(100)))",
     &no_message, &no_message, ContractRelation::Strengthened)
+
+  out
+end
+
+# ———————————————————————————————————————————————————————————————
+# The audit item-41 affected-closure lane rows
+# ———————————————————————————————————————————————————————————————
+# The sibling style (no test-file lane exists for the §31 module; the rows
+# are self-checking helpers a behavior lane can call). Each row builds a
+# minimal snapshot/delta fixture, runs affected_closure over one (or a
+# union of) DependencyEdgeKind class(es) and records a mismatch row when the
+# result differs from the documented expectation:
+#   L1 — fn A calls fn B (call rows) with a delta pair that modifies B: the
+#        KEPT §31 affected (semantic_delta_of's call closure) is {A, B}, and
+#        affected_closure over [Call] is identical. GenericInstantiation /
+#        LayoutDependent / ConstEvalDependent / DerivedImpl have NO snapshot
+#        row data: they are covered by the call graph only, so their
+#        requested closure yields the same CALL-CLOSURE ANSWER as [Call]
+#        (documented residual gap — see the section doc). EffectPropagation
+#        and CapabilityPropagation ride the call rows and yield it too.
+#   L2 — type T "struct{f:T[m::U]}" contains type U: a delta modifying U
+#        affects T under [ContainsType]; [Call] alone yields {U} (no call
+#        rows), and the [Call, ContainsType] union adds T — the closure is
+#        the union-of-edges fixed point.
+#   L3 — method m::T::f registered under type m::T: a delta modifying the
+#        method affects its owner type under [Implements] (the impls_of
+#        relation reversed; the trait -> implementor direction has no rows —
+#        documented gap).
+#   L4 — fn F's contract clause carries "path(m::G)": a delta modifying G
+#        affects F under [ContractReferences].
+#   L5 — a test row "TE exercises B": a delta modifying B affects TE under
+#        [TestReferences] (the target -> test walk).
+#   L6 — ABI consumers: a changed pub Function affects its callers; a
+#        changed pub TYPE affects every def whose signature key references
+#        it; a changed NON-pub type adds no ABI edges (the pub gating —
+#        private consumers ride Call / ContainsType).
+
+def delta_lane_target() -> StableTargetId
+  StableTargetId {
+    triple: "lane".to_string(),
+    arch: "lane".to_string(),
+    cpu: "lane".to_string(),
+    pointer_width: 8,
+    endian: "little".to_string(),
+    abi: "lp64".to_string(),
+    float_abi: "soft".to_string(),
+    isa_features: Vec::new(),
+    native_atomic_widths: Vec::new()
+  }
+end
+
+def delta_lane_snapshot() -> SemanticSnapshot
+  semantic_snapshot_new("lane".to_string(), delta_lane_target())
+end
+
+def delta_lane_sid(key: String) -> StableDefId
+  stable_def_id_digested(key.clone(), delta_key_name_part(&key))
+end
+
+def delta_lane_fn_symbol(key: String, name: String, is_pub: Bool) -> SemanticSymbol
+  SemanticSymbol {
+    stable_id: delta_lane_sid(&key),
+    kind: DefKind::Function,
+    name: name,
+    module_path: "m".to_string(),
+    is_pub: is_pub,
+    is_generic: false
+  }
+end
+
+def delta_lane_type_row(key: String, name: String, kind: SemanticTypeKind, is_pub: Bool) -> SemanticType
+  SemanticType {
+    stable_id: delta_lane_sid(&key),
+    kind: kind,
+    name: name,
+    module_path: "m".to_string(),
+    generic_arity: 0,
+    is_pub: is_pub
+  }
+end
+
+def delta_lane_seed_delta(seeds: Vec[String]) -> SemanticDelta
+  var d = semantic_delta_empty()
+  d.created = seeds
+  d
+end
+
+def delta_lane_closure(
+  snapshot: SemanticSnapshot,
+  index: SemanticIndex,
+  delta: SemanticDelta,
+  kind: DependencyEdgeKind
+) -> Vec[String]
+  var kinds: Vec[DependencyEdgeKind] = Vec::new()
+  kinds.push(kind)
+  affected_closure(&delta, &snapshot, &index, kinds)
+end
+
+def delta_lane_row(inout out: Vec[String], name: String, got: Vec[String], expected: Vec[String]) -> Unit
+  if !delta_text_lists_same(&got, &expected) then
+    out.push(name + ": expected [" + expected.join(",") + "], got [" + got.join(",") + "]")
+  end
+  ()
+end
+
+# Run the L1-L6 rows; the returned list names every mismatch (empty = the
+# whole lane verifies). Exported for a behavior lane: the rows are
+# documented above and this function is their executable form.
+pub def affected_closure_lane_check() -> Vec[String]
+  var out: Vec[String] = Vec::new()
+
+  # ———— L1: call fixture (A -> B), delta pair modifies B via a pub flip ————
+  let k_a = "m::A#fn()->unit".to_string()
+  let k_b = "m::B#fn()->unit".to_string()
+  var a1 = delta_lane_snapshot()
+  var a1_syms: Vec[SemanticSymbol] = Vec::new()
+  a1_syms.push(delta_lane_fn_symbol(&k_a, "A", true))
+  a1_syms.push(delta_lane_fn_symbol(&k_b, "B", true))
+  a1.symbols = a1_syms
+  var a1_calls: Vec[CallEdge] = Vec::new()
+  a1_calls.push(CallEdge {
+    caller: delta_lane_sid(&k_a),
+    callee: delta_lane_sid(&k_b),
+    kind: CallEdgeKind::Direct
+  })
+  a1.calls = a1_calls
+  var b1 = delta_lane_snapshot()
+  var b1_syms: Vec[SemanticSymbol] = Vec::new()
+  b1_syms.push(delta_lane_fn_symbol(&k_a, "A", true))
+  b1_syms.push(delta_lane_fn_symbol(&k_b, "B", false))
+  b1.symbols = b1_syms
+  var b1_calls: Vec[CallEdge] = Vec::new()
+  b1_calls.push(CallEdge {
+    caller: delta_lane_sid(&k_a),
+    callee: delta_lane_sid(&k_b),
+    kind: CallEdgeKind::Direct
+  })
+  b1.calls = b1_calls
+  let idx1 = build_semantic_index(&b1)
+  let d1 = semantic_delta_of(&a1, &b1)
+  let l1_call = Vec::from([k_a.clone(), k_b.clone()])
+
+  # The kept §31 semantics and the Call kind agree on the call closure.
+  delta_lane_row(&mut out, "affected-call-l1", d1.affected.clone(), l1_call.clone())
+  delta_lane_row(&mut out, "closure-call-l1",
+    delta_lane_closure(&b1, &idx1, &d1, DependencyEdgeKind::Call), l1_call.clone())
+
+  # The classes with no row data are covered by calls only: the call-closure
+  # answer (documented residual gap).
+  delta_lane_row(&mut out, "closure-nodata-generic-l1",
+    delta_lane_closure(&b1, &idx1, &d1, DependencyEdgeKind::GenericInstantiation), l1_call.clone())
+  delta_lane_row(&mut out, "closure-nodata-layout-l1",
+    delta_lane_closure(&b1, &idx1, &d1, DependencyEdgeKind::LayoutDependent), l1_call.clone())
+  delta_lane_row(&mut out, "closure-nodata-const-l1",
+    delta_lane_closure(&b1, &idx1, &d1, DependencyEdgeKind::ConstEvalDependent), l1_call.clone())
+  delta_lane_row(&mut out, "closure-nodata-derived-l1",
+    delta_lane_closure(&b1, &idx1, &d1, DependencyEdgeKind::DerivedImpl), l1_call.clone())
+
+  # The propagation classes ride the call rows.
+  delta_lane_row(&mut out, "closure-effect-prop-l1",
+    delta_lane_closure(&b1, &idx1, &d1, DependencyEdgeKind::EffectPropagation), l1_call.clone())
+  delta_lane_row(&mut out, "closure-cap-prop-l1",
+    delta_lane_closure(&b1, &idx1, &d1, DependencyEdgeKind::CapabilityPropagation), l1_call.clone())
+
+  # ———— L2: type T contains type U (ContainsType) ————
+  let k_t2 = "m::T#struct{f:T[m::U]}".to_string()
+  let k_u2 = "m::U#struct{v:int}".to_string()
+  var b2 = delta_lane_snapshot()
+  var b2_types: Vec[SemanticType] = Vec::new()
+  b2_types.push(delta_lane_type_row(&k_t2, "T", SemanticTypeKind::Struct, false))
+  b2_types.push(delta_lane_type_row(&k_u2, "U", SemanticTypeKind::Struct, false))
+  b2.types = b2_types
+  let idx2 = build_semantic_index(&b2)
+  let d2 = delta_lane_seed_delta(Vec::from([k_u2.clone()]))
+  delta_lane_row(&mut out, "closure-contains-l2",
+    delta_lane_closure(&b2, &idx2, &d2, DependencyEdgeKind::ContainsType),
+    Vec::from([k_t2.clone(), k_u2.clone()]))
+  delta_lane_row(&mut out, "closure-call-vs-contains-l2",
+    delta_lane_closure(&b2, &idx2, &d2, DependencyEdgeKind::Call),
+    Vec::from([k_u2.clone()]))
+  var kinds2: Vec[DependencyEdgeKind] = Vec::new()
+  kinds2.push(DependencyEdgeKind::Call)
+  kinds2.push(DependencyEdgeKind::ContainsType)
+  delta_lane_row(&mut out, "closure-union-l2",
+    affected_closure(&d2, &b2, &idx2, kinds2),
+    Vec::from([k_t2.clone(), k_u2.clone()]))
+
+  # ———— L3: method registered under type T (Implements) ————
+  let k_t3 = "m::T#struct{v:int}".to_string()
+  let k_m3 = "m::T::f#fn()->unit".to_string()
+  var b3 = delta_lane_snapshot()
+  var b3_types: Vec[SemanticType] = Vec::new()
+  b3_types.push(delta_lane_type_row(&k_t3, "T", SemanticTypeKind::Struct, false))
+  b3.types = b3_types
+  var b3_syms: Vec[SemanticSymbol] = Vec::new()
+  b3_syms.push(SemanticSymbol {
+    stable_id: delta_lane_sid(&k_m3),
+    kind: DefKind::Method,
+    name: "f".to_string(),
+    module_path: "m::T".to_string(),
+    is_pub: false,
+    is_generic: false
+  })
+  b3.symbols = b3_syms
+  let idx3 = build_semantic_index(&b3)
+  let d3 = delta_lane_seed_delta(Vec::from([k_m3.clone()]))
+  delta_lane_row(&mut out, "closure-impls-l3",
+    delta_lane_closure(&b3, &idx3, &d3, DependencyEdgeKind::Implements),
+    Vec::from([k_t3.clone(), k_m3.clone()]))
+
+  # ———— L4: fn F's contract clause references fn G (ContractReferences) ————
+  let k_f4 = "m::F#fn()->unit".to_string()
+  let k_g4 = "m::G#fn()->unit".to_string()
+  let clause4 = "bingt(path(m::G),int(0))".to_string()
+  var b4 = delta_lane_snapshot()
+  var b4_syms: Vec[SemanticSymbol] = Vec::new()
+  b4_syms.push(delta_lane_fn_symbol(&k_f4, "F", false))
+  b4_syms.push(delta_lane_fn_symbol(&k_g4, "G", false))
+  b4.symbols = b4_syms
+  var b4_contracts: Vec[ContractFact] = Vec::new()
+  var clause_args4: Vec[String] = Vec::new()
+  clause_args4.push("path(m::G)".to_string())
+  clause_args4.push("int(0)".to_string())
+  b4_contracts.push(ContractFact {
+    id: StableContractId {
+      stable_key: "m::F#fn()->unit|Pre|bingt(path(m::G),int(0))".to_string()
+    },
+    function: delta_lane_sid(&k_f4),
+    kind: AstContractKind::AstPre,
+    expression_fingerprint: stable_digest_of(&clause4),
+    canonical_expression: ContractExprIR { op: "bingt".to_string(), args: clause_args4 },
+    message: Option::None
+  })
+  b4.contracts = b4_contracts
+  let idx4 = build_semantic_index(&b4)
+  let d4 = delta_lane_seed_delta(Vec::from([k_g4.clone()]))
+  delta_lane_row(&mut out, "closure-contract-refs-l4",
+    delta_lane_closure(&b4, &idx4, &d4, DependencyEdgeKind::ContractReferences),
+    Vec::from([k_f4.clone(), k_g4.clone()]))
+
+  # ———— L5: test TE exercises fn B (TestReferences) ————
+  let k_te5 = "m::TE#fn()->unit".to_string()
+  let k_b5 = "m::B#fn()->unit".to_string()
+  var b5 = delta_lane_snapshot()
+  var b5_syms: Vec[SemanticSymbol] = Vec::new()
+  b5_syms.push(delta_lane_fn_symbol(&k_te5, "TE", false))
+  b5_syms.push(delta_lane_fn_symbol(&k_b5, "B", false))
+  b5.symbols = b5_syms
+  var b5_tests: Vec[TestRelationship] = Vec::new()
+  b5_tests.push(TestRelationship {
+    test: delta_lane_sid(&k_te5),
+    target: delta_lane_sid(&k_b5)
+  })
+  b5.tests = b5_tests
+  let idx5 = build_semantic_index(&b5)
+  let d5 = delta_lane_seed_delta(Vec::from([k_b5.clone()]))
+  delta_lane_row(&mut out, "closure-test-refs-l5",
+    delta_lane_closure(&b5, &idx5, &d5, DependencyEdgeKind::TestReferences),
+    Vec::from([k_b5.clone(), k_te5.clone()]))
+
+  # ———— L6a: a pub Function's ABI consumers are its callers ————
+  var b6 = delta_lane_snapshot()
+  var b6_syms: Vec[SemanticSymbol] = Vec::new()
+  b6_syms.push(delta_lane_fn_symbol(&k_a, "A", false))
+  b6_syms.push(delta_lane_fn_symbol(&k_b, "B", true))
+  b6.symbols = b6_syms
+  b6.calls = a1_calls.clone()
+  let idx6 = build_semantic_index(&b6)
+  let d6 = delta_lane_seed_delta(Vec::from([k_b.clone()]))
+  delta_lane_row(&mut out, "closure-abi-pubfn-l6",
+    delta_lane_closure(&b6, &idx6, &d6, DependencyEdgeKind::AbiConsumer),
+    Vec::from([k_a.clone(), k_b.clone()]))
+
+  # ———— L6b: a pub TYPE's ABI consumers include referencing fn sigs ————
+  let k_u6 = "m::U6#struct{v:int}".to_string()
+  let k_f6 = "m::F6#fn(let:T[m::U6])->unit".to_string()
+  var b7 = delta_lane_snapshot()
+  var b7_types: Vec[SemanticType] = Vec::new()
+  b7_types.push(delta_lane_type_row(&k_u6, "U6", SemanticTypeKind::Struct, true))
+  b7.types = b7_types
+  var b7_syms: Vec[SemanticSymbol] = Vec::new()
+  b7_syms.push(delta_lane_fn_symbol(&k_f6, "F6", false))
+  b7.symbols = b7_syms
+  let idx7 = build_semantic_index(&b7)
+  let d7 = delta_lane_seed_delta(Vec::from([k_u6.clone()]))
+  delta_lane_row(&mut out, "closure-abi-pubtype-l6",
+    delta_lane_closure(&b7, &idx7, &d7, DependencyEdgeKind::AbiConsumer),
+    Vec::from([k_f6.clone(), k_u6.clone()]))
+
+  # ———— L6c: a NON-pub type adds no ABI edges (pub gating) ————
+  let k_u7 = "m::U7#struct{v:int}".to_string()
+  let k_f7 = "m::F7#fn(let:T[m::U7])->unit".to_string()
+  var b8 = delta_lane_snapshot()
+  var b8_types: Vec[SemanticType] = Vec::new()
+  b8_types.push(delta_lane_type_row(&k_u7, "U7", SemanticTypeKind::Struct, false))
+  b8.types = b8_types
+  var b8_syms: Vec[SemanticSymbol] = Vec::new()
+  b8_syms.push(delta_lane_fn_symbol(&k_f7, "F7", false))
+  b8.symbols = b8_syms
+  let idx8 = build_semantic_index(&b8)
+  let d8 = delta_lane_seed_delta(Vec::from([k_u7.clone()]))
+  delta_lane_row(&mut out, "closure-abi-private-type-l6",
+    delta_lane_closure(&b8, &idx8, &d8, DependencyEdgeKind::AbiConsumer),
+    Vec::from([k_u7.clone()]))
 
   out
 end

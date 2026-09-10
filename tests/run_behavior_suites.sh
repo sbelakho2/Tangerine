@@ -63,6 +63,9 @@ SUITES=(
   "tests/mir_int_arith_semantics_test.tg"
   "tests/diag_derivation_test.tg"
   "tests/unit/test_int_overflow_behavior.tg"
+  # audit items 28 + 29: the ABI call-plan rows (classify_call_plan over
+  # aarch64/x86-64/cortex-m/riscv64, internal + ExternC flavors).
+  "tests/abi/abi_call_plan_rows_test.tg"
 )
 
 FAILED=0

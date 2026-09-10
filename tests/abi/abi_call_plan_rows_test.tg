@@ -1,0 +1,491 @@
+# tests/abi/abi_call_plan_rows_test.tg — audit items 28 + 29: the ABI
+# call-plan rows.
+#
+# ROW-BASED ASSERTIONS over layout_engine.classify_call_plan — the ONE
+# ABI classification authority shared by the direct emitter, LIR, the
+# extern dispatch, callbacks and bindgen.  Every row pins the plan's
+# decisions for one (target, flavor, signature) against the audit's case
+# list:
+#   - the 16-byte pair struct (ScalarPair: "pair", by-reference internal)
+#   - the 12-byte @packed struct (the C-ABI two-eightbyte case)
+#   - a payload-carrying registered enum (canonical TaggedPtr word —
+#     audit item 29)
+#   - a payload-less registered enum (both routes cross the same word)
+#   - a two-F64 aggregate and a two-F32 aggregate (the documented P1-13
+#     HFA gap: classified by size, so the C plan reports the GP class)
+#   - String (not FFI-safe under ExternC)
+#   - the raw UnsafeSlice view (the 16-byte ScalarPair image)
+#   - i128 (ScalarPair, sret return)
+# over the targets aarch64, x86-64, cortex-m4f and riscv64imac, in BOTH
+# plan flavors (InternalValue = the compiler's own convention, ExternC =
+# the platform C ABI).
+#
+# The mixed-backend ABI rows (a direct-compiled caller calling an
+# LIR-compiled callee) cannot run: every compilation is entirely direct
+# or entirely LIR (see lir.tg's audit item 29 note); these rows pin the
+# classification layer those routes share.
+#
+# Run with: tg test tests/abi/abi_call_plan_rows_test.tg
+
+use std::core::{Option, Result, Unit, Bool, Int, UInt}
+use std::test::*
+
+use tg_compiler::layout_engine::{
+  LayoutEngine, TargetDescriptor,
+  aarch64_target, x86_64_target, wasm32_target,
+  layout_engine_new, layout_engine_register_types, compute_all_layouts,
+  classify_call_plan, AbiCallPlan, AbiFlavor, AbiReturn, AbiEnumCrossing,
+  classify_enum_crossing, abi_internal_image_class, layout_error_to_string
+}
+use tg_compiler::target_desc::{
+  TargetDesc, aarch64_desc, x86_64_desc,
+  thumbv7em_cortex_m4f_desc, riscv64imac_desc
+}
+use tg_compiler::types::{Type, TypeId}
+use tg_compiler::mir::{MirTypeDef, MirTypeDefKind, MirFieldDef, MirVariantDef}
+use tg_compiler::ast::{layout_attrs_plain}
+use tg_compiler::token::{span_dummy}
+
+# ———————————————————————————————————————————————————————————————
+# Type-definition fixtures
+# ———————————————————————————————————————————————————————————————
+
+struct RowField
+  name: String
+  ty: Type
+end
+
+struct RowVariant
+  name: String
+  disc: Int
+  fields: Vec[Type]
+end
+
+def row_field(name: String, ty: Type) -> RowField
+  RowField { name: name.to_string(), ty: ty }
+end
+
+def row_variant(name: String, disc: Int, fields: Vec[Type]) -> RowVariant
+  RowVariant { name: name.to_string(), disc: disc, fields: fields }
+end
+
+def row_struct_def(tid: Int, name: String, fields: Vec[RowField], packed: Bool) -> MirTypeDef
+  var fds: Vec[MirFieldDef] = Vec::new()
+  for f in fields do
+    fds.push(MirFieldDef { name: f.name.clone(), ty: f.ty.clone() })
+  end
+  var attrs = layout_attrs_plain(span_dummy())
+  if packed then
+    attrs.is_packed = true
+  end
+  MirTypeDef {
+    id: TypeId { id: tid },
+    name: name.to_string(),
+    kind: MirTypeDefKind::Struct(fds),
+    generic_params: Vec::new(),
+    layout: attrs
+  }
+end
+
+def row_enum_def(tid: Int, name: String, variants: Vec[RowVariant]) -> MirTypeDef
+  var vds: Vec[MirVariantDef] = Vec::new()
+  for v in variants do
+    vds.push(MirVariantDef { name: v.name.clone(), discriminant: v.disc, fields: v.fields.clone() })
+  end
+  MirTypeDef {
+    id: TypeId { id: tid },
+    name: name.to_string(),
+    kind: MirTypeDefKind::Enum(vds),
+    generic_params: Vec::new(),
+    layout: layout_attrs_plain(span_dummy())
+  }
+end
+
+# ———————————————————————————————————————————————————————————————
+# The fixture type ids (one set for the whole file)
+# ———————————————————————————————————————————————————————————————
+# Pair16      — struct { a: Int, b: Int }                 (16 bytes)
+# Packed12    — @packed struct { a: U32, b: U64 }         (12 bytes, C class)
+# PayloadEnum — enum { None, Some(Int) }                  (TaggedPtr, payload)
+# UnitEnum    — enum { Off, On }                          (TaggedPtr, no payload)
+# TwoF64      — struct { a: F64, b: F64 }                 (16 bytes)
+# TwoF32      — struct { a: F32, b: F32 }                 (8 bytes)
+# SliceView   — the UnsafeSlice[u8] raw view              (16 bytes)
+def row_defs() -> Vec[MirTypeDef]
+  var defs: Vec[MirTypeDef] = Vec::new()
+  var pair_fields: Vec[RowField] = Vec::new()
+  pair_fields.push(row_field("a", Type::Int))
+  pair_fields.push(row_field("b", Type::Int))
+  defs.push(row_struct_def(1, "Pair16", pair_fields, false))
+
+  var packed_fields: Vec[RowField] = Vec::new()
+  packed_fields.push(row_field("a", Type::U32))
+  packed_fields.push(row_field("b", Type::U64))
+  defs.push(row_struct_def(2, "Packed12", packed_fields, true))
+
+  var payload_variants: Vec[RowVariant] = Vec::new()
+  payload_variants.push(row_variant("None", 0, Vec::new()))
+  payload_variants.push(row_variant("Some", 1, Vec::from([Type::Int])))
+  defs.push(row_enum_def(3, "PayloadEnum", payload_variants))
+
+  var unit_variants: Vec[RowVariant] = Vec::new()
+  unit_variants.push(row_variant("Off", 0, Vec::new()))
+  unit_variants.push(row_variant("On", 1, Vec::new()))
+  defs.push(row_enum_def(4, "UnitEnum", unit_variants))
+
+  var f64_fields: Vec[RowField] = Vec::new()
+  f64_fields.push(row_field("a", Type::F64))
+  f64_fields.push(row_field("b", Type::F64))
+  defs.push(row_struct_def(5, "TwoF64", f64_fields, false))
+
+  var f32_fields: Vec[RowField] = Vec::new()
+  f32_fields.push(row_field("a", Type::F32))
+  f32_fields.push(row_field("b", Type::F32))
+  defs.push(row_struct_def(6, "TwoF32", f32_fields, false))
+
+  # The UnsafeSlice raw view: a registered Opaque builtin with NO
+  # MirTypeDef in real compilations; the layout engine keys it by NAME.
+  # The fixture registers a placeholder def under that name.
+  defs.push(row_struct_def(7, "UnsafeSlice", Vec::new(), false))
+  defs
+end
+
+def pair16_ty() -> Type = Type::Adt(TypeId { id: 1 }, Vec::new())
+def packed12_ty() -> Type = Type::Adt(TypeId { id: 2 }, Vec::new())
+def payload_enum_ty() -> Type = Type::Adt(TypeId { id: 3 }, Vec::new())
+def unit_enum_ty() -> Type = Type::Adt(TypeId { id: 4 }, Vec::new())
+def two_f64_ty() -> Type = Type::Adt(TypeId { id: 5 }, Vec::new())
+def two_f32_ty() -> Type = Type::Adt(TypeId { id: 6 }, Vec::new())
+def unsafe_slice_ty() -> Type = Type::Adt(TypeId { id: 7 }, Vec::from([Type::U8]))
+
+# ———————————————————————————————————————————————————————————————
+# Plan invocation helpers
+# ———————————————————————————————————————————————————————————————
+
+def row_plan(desc: TargetDesc, layout_target: TargetDescriptor, flavor: AbiFlavor, params: Vec[Type], ret_ty: Type) -> AbiCallPlan
+  mut engine = layout_engine_new(layout_target)
+  let defs = row_defs()
+  layout_engine_register_types(&mut engine, &defs)
+  compute_all_layouts(&mut engine)
+  match classify_call_plan(&mut engine, desc, flavor, params, ret_ty.clone(), false)
+  when Result::Ok(plan) then plan
+  when Result::Err(e) then
+    panic("ABI row: classify_call_plan failed closed: " + layout_error_to_string(&e))
+  end
+end
+
+def row_plan_is_err(desc: TargetDesc, layout_target: TargetDescriptor, flavor: AbiFlavor, params: Vec[Type], ret_ty: Type) -> Bool
+  mut engine = layout_engine_new(layout_target)
+  let defs = row_defs()
+  layout_engine_register_types(&mut engine, &defs)
+  compute_all_layouts(&mut engine)
+  match classify_call_plan(&mut engine, desc, flavor, params, ret_ty.clone(), false)
+  when Result::Ok(_) then false
+  when Result::Err(_) then true
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Row assertions
+# ———————————————————————————————————————————————————————————————
+
+def expect_arg(plan: &AbiCallPlan, idx: Int, class_word: String, location: String, indirect: Bool, size: Int, what: String) -> Unit
+  let p = plan.args[idx]
+  assert(p.class_word == class_word, what + ": class_word expected `" + class_word + "`, got `" + p.class_word + "`")
+  assert(p.location == location, what + ": location expected `" + location + "`, got `" + p.location + "`")
+  assert(p.indirect == indirect, what + ": indirect expected " + indirect.to_string() + ", got " + p.indirect.to_string())
+  assert(p.size == size, what + ": size expected " + size.to_string() + ", got " + p.size.to_string())
+end
+
+def expect_ret(plan: &AbiCallPlan, ret: AbiReturn, what: String) -> Unit
+  assert(plan.ret == ret, what + ": return class mismatch")
+end
+
+# ———————————————————————————————————————————————————————————————
+# 1. the shared internal image-class rule (the LIR/direct agreement)
+# ———————————————————————————————————————————————————————————————
+
+@test
+def test_internal_image_class_rows() -> Unit
+  assert(abi_internal_image_class(0) == "zero", "image 0: zero")
+  assert(abi_internal_image_class(1) == "int", "image 1: int")
+  assert(abi_internal_image_class(4) == "int", "image 4: int")
+  assert(abi_internal_image_class(8) == "int", "image 8: int")
+  assert(abi_internal_image_class(12) == "pair", "image 12: pair")
+  assert(abi_internal_image_class(16) == "pair", "image 16: pair")
+  assert(abi_internal_image_class(24) == "memory", "image 24: memory")
+end
+
+# ———————————————————————————————————————————————————————————————
+# 2. aarch64 — internal flavor (the direct/LIR compiler convention)
+# ———————————————————————————————————————————————————————————————
+
+@test
+def test_aarch64_internal_rows() -> Unit
+  let desc = aarch64_desc()
+  let lt = aarch64_target()
+  let fl = AbiFlavor::InternalValue
+
+  # The 16-byte pair struct: ONE general slot carrying the image address,
+  # sret return.
+  let p_pair = row_plan(desc.clone(), lt.clone(), fl, Vec::from([pair16_ty()]), Type::Unit)
+  expect_arg(&p_pair, 0, "pair", "x0", true, 16, "aarch64 internal pair16 arg")
+  expect_ret(&p_pair, AbiReturn::SRetT, "aarch64 internal pair16 ret")
+
+  # The 12-byte @packed struct: the C-repr aggregate rule gives the
+  # two-slot image, still by reference internally.
+  let p_packed = row_plan(desc.clone(), lt.clone(), fl, Vec::from([packed12_ty()]), Type::Unit)
+  expect_arg(&p_packed, 0, "pair", "x0", true, 12, "aarch64 internal packed12 arg")
+
+  # The payloaded enum: the canonical ONE TaggedPtr word (item 29).
+  let p_payload = row_plan(desc.clone(), lt.clone(), fl, Vec::from([payload_enum_ty()]), Type::Unit)
+  expect_arg(&p_payload, 0, "int", "x0", false, 8, "aarch64 internal payload enum arg")
+  expect_ret(&p_payload, AbiReturn::GprT, "aarch64 internal payload enum ret")
+
+  # The payload-less enum: the same word BOTH routes use.
+  let p_unit = row_plan(desc.clone(), lt.clone(), fl, Vec::from([unit_enum_ty()]), Type::Unit)
+  expect_arg(&p_unit, 0, "int", "x0", false, 8, "aarch64 internal unit enum arg")
+
+  # The two-F64 aggregate: 16 bytes -> pair (the HFA gap is documented;
+  # the size rule is what both routes implement).
+  let p_f64 = row_plan(desc.clone(), lt.clone(), fl, Vec::from([two_f64_ty()]), Type::Unit)
+  expect_arg(&p_f64, 0, "pair", "x0", true, 16, "aarch64 internal two-F64 arg")
+
+  # The two-F32 aggregate: 8 bytes -> ONE word by value.
+  let p_f32 = row_plan(desc.clone(), lt.clone(), fl, Vec::from([two_f32_ty()]), Type::Unit)
+  expect_arg(&p_f32, 0, "int", "x0", false, 8, "aarch64 internal two-F32 arg")
+
+  # String: the one-pointer handle word.
+  let p_str = row_plan(desc.clone(), lt.clone(), fl, Vec::from([Type::String]), Type::Unit)
+  expect_arg(&p_str, 0, "int", "x0", false, 8, "aarch64 internal String arg")
+
+  # The UnsafeSlice raw view: the 16-byte image.
+  let p_slice = row_plan(desc.clone(), lt.clone(), fl, Vec::from([unsafe_slice_ty()]), Type::Unit)
+  expect_arg(&p_slice, 0, "pair", "x0", true, 16, "aarch64 internal UnsafeSlice arg")
+
+  # i128: ScalarPair, sret return.
+  let p_i128 = row_plan(desc.clone(), lt.clone(), fl, Vec::from([Type::I128]), Type::Unit)
+  expect_arg(&p_i128, 0, "pair", "x0", true, 16, "aarch64 internal i128 arg")
+  expect_ret(&p_i128, AbiReturn::SRetT, "aarch64 internal i128 ret")
+
+  # The ninth general-class argument overflows to the caller stack.
+  var nine: Vec[Type] = Vec::new()
+  var i = 0
+  while i < 9 do
+    nine.push(pair16_ty())
+    i = i + 1
+  end
+  let p_nine = row_plan(desc.clone(), lt.clone(), fl, nine, Type::Unit)
+  expect_arg(&p_nine, 8, "pair", "stack+0", true, 16, "aarch64 internal 9th pair arg")
+  assert(p_nine.stack_arg_bytes == 16, "aarch64 internal 9th pair: stack_arg_bytes expected 16, got " + p_nine.stack_arg_bytes.to_string())
+end
+
+# ———————————————————————————————————————————————————————————————
+# 3. x86-64 — internal flavor
+# ———————————————————————————————————————————————————————————————
+
+@test
+def test_x86_64_internal_rows() -> Unit
+  let desc = x86_64_desc()
+  let lt = x86_64_target()
+  let fl = AbiFlavor::InternalValue
+
+  let p_pair = row_plan(desc.clone(), lt.clone(), fl, Vec::from([pair16_ty()]), Type::Unit)
+  expect_arg(&p_pair, 0, "pair", "rdi", true, 16, "x86_64 internal pair16 arg")
+  # The plan's internal sret policy is target-independent (the x86-64
+  # direct emitter's no-hidden-pointer return is a documented gap).
+  expect_ret(&p_pair, AbiReturn::SRetT, "x86_64 internal pair16 ret")
+
+  let p_payload = row_plan(desc.clone(), lt.clone(), fl, Vec::from([payload_enum_ty()]), Type::Unit)
+  expect_arg(&p_payload, 0, "int", "rdi", false, 8, "x86_64 internal payload enum arg")
+end
+
+# ———————————————————————————————————————————————————————————————
+# 4. cortex-m4f — internal flavor (r0..r3, 4-byte word model)
+# ———————————————————————————————————————————————————————————————
+
+@test
+def test_cortex_m_internal_rows() -> Unit
+  let desc = thumbv7em_cortex_m4f_desc()
+  let lt = wasm32_target()
+  let fl = AbiFlavor::InternalValue
+
+  let p_pair = row_plan(desc.clone(), lt.clone(), fl, Vec::from([pair16_ty()]), Type::Unit)
+  expect_arg(&p_pair, 0, "pair", "r0", true, 16, "cortex-m internal pair16 arg")
+  expect_ret(&p_pair, AbiReturn::SRetT, "cortex-m internal pair16 ret")
+
+  let p_payload = row_plan(desc.clone(), lt.clone(), fl, Vec::from([payload_enum_ty()]), Type::Unit)
+  expect_arg(&p_payload, 0, "int", "r0", false, 4, "cortex-m internal payload enum arg")
+end
+
+# ———————————————————————————————————————————————————————————————
+# 5. riscv64imac — internal flavor (a0..a7)
+# ———————————————————————————————————————————————————————————————
+
+@test
+def test_riscv64_internal_rows() -> Unit
+  let desc = riscv64imac_desc()
+  let lt = x86_64_target()
+  let fl = AbiFlavor::InternalValue
+
+  let p_pair = row_plan(desc.clone(), lt.clone(), fl, Vec::from([pair16_ty()]), Type::Unit)
+  expect_arg(&p_pair, 0, "pair", "a0", true, 16, "riscv64 internal pair16 arg")
+  expect_ret(&p_pair, AbiReturn::SRetT, "riscv64 internal pair16 ret")
+
+  let p_payload = row_plan(desc.clone(), lt.clone(), fl, Vec::from([payload_enum_ty()]), Type::Unit)
+  expect_arg(&p_payload, 0, "int", "a0", false, 8, "riscv64 internal payload enum arg")
+end
+
+# ———————————————————————————————————————————————————————————————
+# 6. ExternC — aarch64 (AAPCS64)
+# ———————————————————————————————————————————————————————————————
+
+@test
+def test_aarch64_extern_c_rows() -> Unit
+  let desc = aarch64_desc()
+  let lt = aarch64_target()
+  let fl = AbiFlavor::ExternC
+
+  # A <=16-byte composite crosses in TWO integer registers, by value.
+  let p_pair = row_plan(desc.clone(), lt.clone(), fl, Vec::from([pair16_ty()]), Type::Unit)
+  expect_arg(&p_pair, 0, "int", "x0,x1", false, 16, "aarch64 ExternC pair16 arg")
+  expect_ret(&p_pair, AbiReturn::GprPairT, "aarch64 ExternC pair16 ret")
+
+  # The 12-byte @packed struct: the same two-eightbyte class.
+  let p_packed = row_plan(desc.clone(), lt.clone(), fl, Vec::from([packed12_ty()]), Type::Unit)
+  expect_arg(&p_packed, 0, "int", "x0,x1", false, 12, "aarch64 ExternC packed12 arg")
+
+  # A payloaded enum is not FFI-safe: fail closed.
+  assert(row_plan_is_err(desc.clone(), lt.clone(), fl, Vec::from([payload_enum_ty()]), Type::Unit), "aarch64 ExternC payload enum must fail closed")
+
+  # A payload-less enum crosses as its raw tag word.
+  let p_unit = row_plan(desc.clone(), lt.clone(), fl, Vec::from([unit_enum_ty()]), Type::Unit)
+  expect_arg(&p_unit, 0, "int", "x0", false, 8, "aarch64 ExternC unit enum arg")
+  expect_ret(&p_unit, AbiReturn::GprT, "aarch64 ExternC unit enum ret")
+
+  # HFA gap (audit P1-13): a two-F64 aggregate is classified by size,
+  # so the C plan reports the integer pair (the AAPCS64 HFA answer is
+  # d0,d1; the member-type scan is the documented remaining step).
+  let p_f64 = row_plan(desc.clone(), lt.clone(), fl, Vec::from([two_f64_ty()]), Type::Unit)
+  expect_arg(&p_f64, 0, "int", "x0,x1", false, 16, "aarch64 ExternC two-F64 arg (documented HFA gap)")
+
+  # A two-F32 aggregate fits ONE 8-byte eightbyte.
+  let p_f32 = row_plan(desc.clone(), lt.clone(), fl, Vec::from([two_f32_ty()]), Type::Unit)
+  expect_arg(&p_f32, 0, "int", "x0", false, 8, "aarch64 ExternC two-F32 arg (documented HFA gap)")
+
+  # String is not a C boundary value.
+  assert(row_plan_is_err(desc.clone(), lt.clone(), fl, Vec::from([Type::String]), Type::Unit), "aarch64 ExternC String must fail closed")
+
+  # The UnsafeSlice view: two integer registers.
+  let p_slice = row_plan(desc.clone(), lt.clone(), fl, Vec::from([unsafe_slice_ty()]), Type::Unit)
+  expect_arg(&p_slice, 0, "int", "x0,x1", false, 16, "aarch64 ExternC UnsafeSlice arg")
+
+  # i128: two integer registers.
+  let p_i128 = row_plan(desc.clone(), lt.clone(), fl, Vec::from([Type::I128]), Type::Unit)
+  expect_arg(&p_i128, 0, "int", "x0,x1", false, 16, "aarch64 ExternC i128 arg")
+  expect_ret(&p_i128, AbiReturn::GprPairT, "aarch64 ExternC i128 ret")
+
+  # Beyond the register pairs the composite goes to the stack by value,
+  # not by pointer: four pairs fill x0..x7, so arg index 4 is the first
+  # stacked one.
+  var nine: Vec[Type] = Vec::new()
+  var i = 0
+  while i < 9 do
+    nine.push(pair16_ty())
+    i = i + 1
+  end
+  let p_nine = row_plan(desc.clone(), lt.clone(), fl, nine, Type::Unit)
+  expect_arg(&p_nine, 4, "memory", "stack+0", false, 16, "aarch64 ExternC 5th pair arg")
+  expect_arg(&p_nine, 8, "memory", "stack+64", false, 16, "aarch64 ExternC 9th pair arg")
+end
+
+# ———————————————————————————————————————————————————————————————
+# 7. ExternC — x86-64 SysV
+# ———————————————————————————————————————————————————————————————
+
+@test
+def test_x86_64_extern_c_rows() -> Unit
+  let desc = x86_64_desc()
+  let lt = x86_64_target()
+  let fl = AbiFlavor::ExternC
+
+  let p_pair = row_plan(desc.clone(), lt.clone(), fl, Vec::from([pair16_ty()]), Type::Unit)
+  expect_arg(&p_pair, 0, "int", "rdi,rsi", false, 16, "x86_64 ExternC pair16 arg")
+  expect_ret(&p_pair, AbiReturn::GprPairT, "x86_64 ExternC pair16 ret")
+
+  let p_packed = row_plan(desc.clone(), lt.clone(), fl, Vec::from([packed12_ty()]), Type::Unit)
+  expect_arg(&p_packed, 0, "int", "rdi,rsi", false, 12, "x86_64 ExternC packed12 arg")
+
+  assert(row_plan_is_err(desc.clone(), lt.clone(), fl, Vec::from([payload_enum_ty()]), Type::Unit), "x86_64 ExternC payload enum must fail closed")
+end
+
+# ———————————————————————————————————————————————————————————————
+# 8. ExternC — cortex-m4f (AAPCS32)
+# ———————————————————————————————————————————————————————————————
+
+@test
+def test_cortex_m_extern_c_rows() -> Unit
+  let desc = thumbv7em_cortex_m4f_desc()
+  let lt = wasm32_target()
+  let fl = AbiFlavor::ExternC
+
+  let p_pair = row_plan(desc.clone(), lt.clone(), fl, Vec::from([pair16_ty()]), Type::Unit)
+  expect_arg(&p_pair, 0, "int", "r0,r1", false, 16, "cortex-m ExternC pair16 arg")
+  expect_ret(&p_pair, AbiReturn::GprPairT, "cortex-m ExternC pair16 ret")
+end
+
+# ———————————————————————————————————————————————————————————————
+# 9. ExternC — riscv64imac (the RISC-V psABI)
+# ———————————————————————————————————————————————————————————————
+
+@test
+def test_riscv64_extern_c_rows() -> Unit
+  let desc = riscv64imac_desc()
+  let lt = x86_64_target()
+  let fl = AbiFlavor::ExternC
+
+  let p_pair = row_plan(desc.clone(), lt.clone(), fl, Vec::from([pair16_ty()]), Type::Unit)
+  expect_arg(&p_pair, 0, "int", "a0,a1", false, 16, "riscv64 ExternC pair16 arg")
+  expect_ret(&p_pair, AbiReturn::GprPairT, "riscv64 ExternC pair16 ret")
+end
+
+# ———————————————————————————————————————————————————————————————
+# 10. the enum crossing authority (audit item 29)
+# ———————————————————————————————————————————————————————————————
+
+@test
+def test_enum_crossing_rows() -> Unit
+  mut engine = layout_engine_new(aarch64_target())
+  let defs = row_defs()
+  layout_engine_register_types(&mut engine, &defs)
+  compute_all_layouts(&mut engine)
+
+  # A payloaded TaggedPtr enum's canonical answer is the ONE value word.
+  match classify_enum_crossing(&mut engine, aarch64_desc(), AbiFlavor::InternalValue, payload_enum_ty())
+  when Result::Ok(c) then
+    assert(c == AbiEnumCrossing::ValueWord, "payload enum internal crossing must be the canonical ValueWord")
+  when Result::Err(e) then
+    panic("payload enum internal crossing failed closed: " + layout_error_to_string(&e))
+  end
+
+  # ExternC refuses the compiler-private word.
+  match classify_enum_crossing(&mut engine, aarch64_desc(), AbiFlavor::ExternC, payload_enum_ty())
+  when Result::Ok(_) then
+    panic("payload enum ExternC crossing must fail closed")
+  when Result::Err(_) then ()
+  end
+
+  # The payload-less enum is the same word in both flavors.
+  match classify_enum_crossing(&mut engine, aarch64_desc(), AbiFlavor::InternalValue, unit_enum_ty())
+  when Result::Ok(c) then
+    assert(c == AbiEnumCrossing::ValueWord, "unit enum internal crossing must be the canonical ValueWord")
+  when Result::Err(e) then
+    panic("unit enum internal crossing failed closed: " + layout_error_to_string(&e))
+  end
+  match classify_enum_crossing(&mut engine, aarch64_desc(), AbiFlavor::ExternC, unit_enum_ty())
+  when Result::Ok(c) then
+    assert(c == AbiEnumCrossing::ValueWord, "unit enum ExternC crossing must be the canonical ValueWord")
+  when Result::Err(e) then
+    panic("unit enum ExternC crossing failed closed: " + layout_error_to_string(&e))
+  end
+end

@@ -1,0 +1,203 @@
+# ———————————————————————————————————————————————————————————————
+# MIR verifier unit tests — the repeat-COUNT contract (audit item 51).
+#
+# A repeat count must NEVER be a runtime dynamic size. The pipeline rule,
+# enforced here at the concrete-MIR verifier
+# (verifier_check_repeat_count in tg_compiler/mir.tg):
+#   - TEMPLATE MIR allows the SYMBOLIC MirConstParamValue count (an
+#     in-scope const generic parameter of a still-generic body — the
+#     function's generic_params record is non-empty; the pre-mono
+#     verifier runs over the template MIR before monomorphization);
+#   - CONCRETE MIR allows ONLY integer constants that are >= 0 and fit
+#     the layout bounds — the SAME fixed-array bound the type system
+#     applies to [T; N] sizes (MAX_FIXED_ARRAY_ELEMS, types.tg);
+#   - a ConstParam placeholder surviving into a concrete function, a
+#     dynamic-local (place) count, a negative literal, or an over-max
+#     literal is rejected BEFORE codegen (the backends keep their own
+#     repeat_count_value checks as defense in depth).
+#
+# Every test builds a minimal MirProgram by hand (a one-block function
+# whose single statement assigns the repeat destination from
+# MirRepeat(7, count)) and asserts on verify_mir's error vector. The
+# destination is a PARAMETER (initialized and storage-live on entry), the
+# same noise-free shape verifier_projection_tests.tg uses. The repeat
+# ELEMENT is always the integer constant 7 (a trivially-copyable image —
+# the verifier's no-bitwise-copy rule for the repeat operand stays quiet).
+#
+# The reviewer's table, and where each case lives below:
+#   template body, const-parameter count            PASSES  (test 1)
+#   concrete body, in-range literal count           PASSES  (test 2)
+#   concrete body, dynamic-local (place) count      REJECTED (test 3)
+#   concrete body, negative literal count           REJECTED (test 4)
+#   concrete body, over-max literal count           REJECTED (test 5)
+#   concrete body, surviving ConstParam count       REJECTED (test 6 —
+#                                                    the symbolic-leak text
+#                                                    is asserted verbatim)
+# ———————————————————————————————————————————————————————————————
+
+use std::core
+use std::collections::Vec
+use std::test::assert
+
+use tg_compiler::mir::{
+  verify_mir, MirProgram, MirFunction, MirLocal, MirLocalId, MirBlock, MirBlockId,
+  MirStatement, MirStatementKind, MirRvalue, MirRvalueKind, MirOperand,
+  MirConstant, MirConstantKind, MirTerminator, MirTerminatorKind, place_local,
+  operand_constant, operand_copy
+}
+use tg_compiler::ids::{GenericParamId, DefId, ModuleId, generic_param_id_numeric}
+use tg_compiler::types::{Type, MAX_FIXED_ARRAY_ELEMS}
+use tg_compiler::token::span_dummy
+
+# A fresh generic-parameter identity (each call builds its own value — the
+# identity is only structural here: the verifier keys the symbolic-leak
+# rule on the function's generic_params record, never on this id).
+def test_gpid() -> GenericParamId
+  GenericParamId { owner: DefId { module: ModuleId { id: 0 }, index: 0 }, index: 0 }
+end
+
+# The repeat element image (a trivially-copyable scalar constant).
+def repeat_elem_int() -> MirOperand
+  operand_constant(MirConstant { kind: MirConstantKind::MirInt(7), ty: Type::Int, instance: Option::None })
+end
+
+# An integer count constant.
+def repeat_count_literal(n: Int) -> MirOperand
+  operand_constant(MirConstant { kind: MirConstantKind::MirInt(n), ty: Type::Int, instance: Option::None })
+end
+
+# The SYMBOLIC per-instance const-parameter count placeholder (numeric
+# GenericParamId payload, exactly the lowering's shape).
+def repeat_count_const_param() -> MirOperand
+  operand_constant(MirConstant { kind: MirConstantKind::MirConstParamValue(generic_param_id_numeric(test_gpid())), ty: Type::Int, instance: Option::None })
+end
+
+# Build a one-block function whose single statement is
+#   _0 = MirRepeat(7, count_op)
+# where _0 is the FIRST PARAM (typed dest_ty — a parameter is initialized
+# and storage-live on entry, so the definite-init / storage-liveness /
+# assign-over-live-storage checks cannot produce noise). extra_params are
+# additional initialized parameters the count operand may reference (the
+# dynamic-local count test copies _1); generic is the function's
+# generic_params record — non-empty marks a still-generic template.
+def verifier_repeat_fn(name: String, dest_ty: Type, count_op: MirOperand, extra_params: Vec[MirLocal], generic: Vec[GenericParamId]) -> MirFunction
+  let param0 = MirLocal { id: MirLocalId { id: 0 }, name: "_0".to_string(), ty: dest_ty, is_mut: false, span: span_dummy() }
+  var params = Vec::new()
+  params.push(param0)
+  for p in extra_params do
+    params.push(p)
+  end
+  let rvalue = MirRvalue {
+    kind: MirRvalueKind::MirRepeat(repeat_elem_int(), count_op),
+    span: span_dummy()
+  }
+  let assign = MirStatement {
+    kind: MirStatementKind::MirAssign(place_local(MirLocalId { id: 0 }), rvalue),
+    span: span_dummy()
+  }
+  let block0 = MirBlock {
+    id: MirBlockId { id: 0 },
+    statements: Vec::from([assign]),
+    terminator: MirTerminator { kind: MirTerminatorKind::MirReturn, span: span_dummy() }
+  }
+  MirFunction {
+    name: name,
+    params: params,
+    ret_type: Type::Unit,
+    generic_params: generic,
+    locals: Vec::new(),
+    blocks: Vec::from([block0]),
+    entry_block: MirBlockId { id: 0 },
+    is_async: false,
+    is_unsafe: false,
+    is_extern: false,
+    extern_abi: "",
+    contracts: Vec::new(),
+    span: span_dummy()
+  }
+end
+
+def verifier_verify(f: MirFunction) -> Vec[String]
+  let program = MirProgram { functions: Vec::from([f]), statics: Vec::new(), types: Vec::new() }
+  verify_mir(&program)
+end
+
+# Test 1 — a TEMPLATE body (generic_params non-empty) whose repeat count is
+# the SYMBOLIC MirConstParamValue placeholder of its own const parameter:
+# the template verification must ACCEPT the symbolic count (mono
+# substitutes the per-instance MirInt later; the dest is the symbolic
+# FixedArraySym form the template's own [T; N] annotation produces).
+@test
+def test_pos_template_const_param_count() -> Unit
+  let f = verifier_repeat_fn("pos_template_const_param_count".to_string(), Type::FixedArraySym(Type::Int, test_gpid()), repeat_count_const_param(), Vec::new(), Vec::from([test_gpid()]))
+  let errors = verifier_verify(f)
+  assert(errors.len() == 0, "test_pos_template_const_param_count: expected no errors, got " + errors.len().to_string() + (if errors.len() > 0 then ": " + errors[0] else "" end))
+end
+
+# Test 2 — a CONCRETE body with an in-range literal count (0 is legal — an
+# empty fixed array; the bounds are >= 0 and <= MAX_FIXED_ARRAY_ELEMS):
+# ACCEPTED.
+@test
+def test_pos_concrete_zero_literal_count() -> Unit
+  let f = verifier_repeat_fn("pos_concrete_zero_literal_count".to_string(), Type::FixedArray(Type::Int, 0), repeat_count_literal(0), Vec::new(), Vec::new())
+  let errors = verifier_verify(f)
+  assert(errors.len() == 0, "test_pos_concrete_zero_literal_count: expected no errors, got " + errors.len().to_string() + (if errors.len() > 0 then ": " + errors[0] else "" end))
+end
+
+# Test 2b — the upper BOUNDARY count (exactly MAX_FIXED_ARRAY_ELEMS) is
+# legal: the range is >= 0 and <= the [T; N] layout bound (only one PAST
+# the bound — test 5 — is rejected).
+@test
+def test_pos_concrete_max_boundary_literal_count() -> Unit
+  let max = MAX_FIXED_ARRAY_ELEMS()
+  let f = verifier_repeat_fn("pos_concrete_max_boundary_literal_count".to_string(), Type::FixedArray(Type::Int, max), repeat_count_literal(max), Vec::new(), Vec::new())
+  let errors = verifier_verify(f)
+  assert(errors.len() == 0, "test_pos_concrete_max_boundary_literal_count: expected no errors, got " + errors.len().to_string() + (if errors.len() > 0 then ": " + errors[0] else "" end))
+end
+
+# Test 3 — a CONCRETE body whose repeat count is a DYNAMIC local count
+# (MirCopy of a scalar place): a runtime count could never size the
+# fixed-array fill — REJECTED (fail-closed, before codegen).
+@test
+def test_neg_concrete_dynamic_local_count() -> Unit
+  let count_src = MirLocal { id: MirLocalId { id: 1 }, name: "_1".to_string(), ty: Type::Int, is_mut: false, span: span_dummy() }
+  let f = verifier_repeat_fn("neg_concrete_dynamic_local_count".to_string(), Type::FixedArray(Type::Int, 4), operand_copy(place_local(MirLocalId { id: 1 })), Vec::from([count_src]), Vec::new())
+  let errors = verifier_verify(f)
+  assert(errors.len() == 1, "test_neg_concrete_dynamic_local_count: expected exactly one error, got " + errors.len().to_string() + (if errors.len() > 0 then ": " + errors[0] else "" end))
+  assert(errors[0].contains("repeat count operand must be a constant"), "test_neg_concrete_dynamic_local_count: expected the non-constant count error, got: " + errors[0])
+end
+
+# Test 4 — a CONCRETE body with a NEGATIVE literal count (MirInt(-3)): the
+# fixed-array fill would underflow — REJECTED before codegen.
+@test
+def test_neg_concrete_negative_literal_count() -> Unit
+  let f = verifier_repeat_fn("neg_concrete_negative_literal_count".to_string(), Type::FixedArray(Type::Int, -3), repeat_count_literal(-3), Vec::new(), Vec::new())
+  let errors = verifier_verify(f)
+  assert(errors.len() == 1, "test_neg_concrete_negative_literal_count: expected exactly one error, got " + errors.len().to_string() + (if errors.len() > 0 then ": " + errors[0] else "" end))
+  assert(errors[0].contains("repeat count -3 is negative"), "test_neg_concrete_negative_literal_count: expected the negative-count error, got: " + errors[0])
+end
+
+# Test 5 — a CONCRETE body with an OVER-MAX literal count (one past
+# MAX_FIXED_ARRAY_ELEMS — the [T; N] layout bound): the count * stride
+# arithmetic would leave the layout domain — REJECTED before codegen.
+@test
+def test_neg_concrete_over_max_literal_count() -> Unit
+  let over = MAX_FIXED_ARRAY_ELEMS() + 1
+  let f = verifier_repeat_fn("neg_concrete_over_max_literal_count".to_string(), Type::FixedArray(Type::Int, over), repeat_count_literal(over), Vec::new(), Vec::new())
+  let errors = verifier_verify(f)
+  assert(errors.len() == 1, "test_neg_concrete_over_max_literal_count: expected exactly one error, got " + errors.len().to_string() + (if errors.len() > 0 then ": " + errors[0] else "" end))
+  assert(errors[0].contains("exceeds the maximum supported length"), "test_neg_concrete_over_max_literal_count: expected the over-max count error, got: " + errors[0])
+end
+
+# Test 6 — a CONCRETE body (generic_params EMPTY) whose repeat count is a
+# MirConstParamValue placeholder that survived monomorphization: the
+# symbolic-leak bug class — REJECTED, and the error text (the
+# ConstParam-surviving-in-concrete diagnostic) is asserted verbatim.
+@test
+def test_neg_concrete_surviving_const_param_count() -> Unit
+  let f = verifier_repeat_fn("neg_concrete_surviving_const_param_count".to_string(), Type::FixedArray(Type::Int, 4), repeat_count_const_param(), Vec::new(), Vec::new())
+  let errors = verifier_verify(f)
+  assert(errors.len() == 1, "test_neg_concrete_surviving_const_param_count: expected exactly one error, got " + errors.len().to_string() + (if errors.len() > 0 then ": " + errors[0] else "" end))
+  assert(errors[0].contains("repeat count is an unsubstituted const generic parameter value"), "test_neg_concrete_surviving_const_param_count: expected the unsubstituted-count error, got: " + errors[0])
+  assert(errors[0].contains("in a non-generic function"), "test_neg_concrete_surviving_const_param_count: expected the non-generic symbolic-leak text, got: " + errors[0])
+end

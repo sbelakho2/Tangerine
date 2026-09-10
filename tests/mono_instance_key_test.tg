@@ -1,0 +1,302 @@
+# tests/mono_instance_key_test.tg — the structured generic-instance keys
+# unit suite (audit item 49): tg_compiler/stable_ids.tg section 9
+# (CanonicalTypeKey / CanonicalConstValue / InstanceKey — digest-word
+# identity, never a "$"-joined text), the documented ConstSym
+# identity-normalization model in tg_compiler/types.tg
+# (const_sym_tree_fold_identities through const_sym_fold_type), and the
+# additive threading of the structured keys at the mono instance-identity
+# boundary (MonoCache.structured_keys).
+#
+# The normalization contract under test (the ONLY declared equivalences):
+#   N + 0 -> N    0 + N -> N    N * 1 -> N
+# Commutativity is NOT normalized: `2 * N` vs `N * 2` (and the
+# literal-left `1 * N`) stay DIFFERENT symbolic trees — the audit's
+# syntax==semantic-conflation warning: no algebraic rewrite exists beyond
+# the documented identity rules.
+#
+# Run with the repo root as the working directory:
+#   tg test tests/mono_instance_key_test.tg
+
+use std::core::{Option}
+use std::collections::{Vec, Map}
+use std::test::assert
+
+use tg_compiler::mono::{
+  mono_cache_new, mono_specialize_function, type_to_mangled, MonoCache
+}
+use tg_compiler::ast::{Program, Crate}
+use tg_compiler::resolver::{ResolvedNames, stable_id_map_new}
+use tg_compiler::mir::{MirFunction, MirBlockId, MirProgram}
+use tg_compiler::ids::{GenericParamId, DefId, ModuleId}
+use tg_compiler::types::{
+  Type, ConstExprT, const_sym_tree_fold_identities, const_sym_fold_type,
+  const_sym_tree_eq
+}
+use tg_compiler::stable_ids::{
+  instance_key_of, instance_key_of_renders, instance_key_to_text,
+  instance_key_eq, canonical_const_value_of, canonical_const_of_segment
+}
+use tg_compiler::token::span_dummy
+
+# The const-parameter leaf of THIS suite: one parameter (owner DefId
+# { module 0, index 0 }, parameter index 0 — the same hand-built identity
+# shape the mono_arity suite uses).
+def p0() -> ConstExprT
+  ConstExprT::ConstParamRef(GenericParamId { owner: DefId { module: ModuleId { id: 0 }, index: 0 }, index: 0 })
+end
+
+# The canonical fn-owner-style callable key text of the suite's instances.
+def callable_key() -> String
+  "audit49::3::fn".to_string()
+end
+
+# A one-element render list.
+def one_render(render: String) -> Vec[String]
+  Vec::from([render])
+end
+
+def fresh_cache() -> MonoCache
+  mono_cache_new(
+    Program { items: Vec::new(), crate: Crate { root: ModuleId { id: 0 }, modules: Map::new() }, span: span_dummy() },
+    ResolvedNames {
+      expr_resolutions: Map::new(),
+      type_resolutions: Map::new(),
+      pattern_resolutions: Map::new(),
+      call_targets: Map::new(),
+      type_def_ids: Map::new(),
+      intrinsic_ids: Map::new(),
+      item_defs: Map::new(),
+      module_symbols: Map::new(),
+      def_kinds: Map::new(),
+      stable_ids: stable_id_map_new()
+    }
+  )
+end
+
+# ———— The documented identity normalization (types.tg fold helpers) ————
+
+# N + 0 -> N and 0 + N -> N: both spellings fold to the bare parameter
+# tree.
+@test
+def test_fold_add_zero_right() -> Unit
+  let n = p0()
+  let expr = ConstExprT::ConstAdd(p0(), ConstExprT::ConstLit(0))
+  let folded = const_sym_tree_fold_identities(&expr)
+  assert(const_sym_tree_eq(&folded, &n), "N + 0 must fold to N (the documented identity rule)")
+end
+
+@test
+def test_fold_add_zero_left() -> Unit
+  let n = p0()
+  let expr = ConstExprT::ConstAdd(ConstExprT::ConstLit(0), p0())
+  let folded = const_sym_tree_fold_identities(&expr)
+  assert(const_sym_tree_eq(&folded, &n), "0 + N must fold to N (the documented identity rule)")
+end
+
+# N * 1 -> N (the documented multiplication identity).
+@test
+def test_fold_mul_one_right() -> Unit
+  let n = p0()
+  let expr = ConstExprT::ConstMul(p0(), ConstExprT::ConstLit(1))
+  let folded = const_sym_tree_fold_identities(&expr)
+  assert(const_sym_tree_eq(&folded, &n), "N * 1 must fold to N (the documented identity rule)")
+end
+
+# The literal-LEFT multiplication spelling `1 * N` is NOT folded
+# (commutativity is not normalized — the model is exactly N * 1).
+@test
+def test_fold_mul_one_left_not_normalized() -> Unit
+  let n = p0()
+  let expr = ConstExprT::ConstMul(ConstExprT::ConstLit(1), p0())
+  let folded = const_sym_tree_fold_identities(&expr)
+  assert(!const_sym_tree_eq(&folded, &n), "1 * N must NOT fold to N (commutativity is not normalized)")
+end
+
+# 2 * N vs N * 2 stay DIFFERENT trees (commutativity is not normalized).
+@test
+def test_fold_mul_commute_not_normalized() -> Unit
+  let expr_a = ConstExprT::ConstMul(ConstExprT::ConstLit(2), p0())
+  let expr_b = ConstExprT::ConstMul(p0(), ConstExprT::ConstLit(2))
+  let two_left = const_sym_tree_fold_identities(&expr_a)
+  let two_right = const_sym_tree_fold_identities(&expr_b)
+  assert(!const_sym_tree_eq(&two_left, &two_right), "2 * N and N * 2 must stay DIFFERENT symbolic trees (commutativity is not normalized)")
+end
+
+# The fold is value-preserving when the tree is fully bound: a bound
+# `4 + 0` folds to Const(4) through const_sym_fold_type exactly like `4`.
+@test
+def test_fold_type_bound_identity_value() -> Unit
+  let expr_a = ConstExprT::ConstAdd(ConstExprT::ConstLit(4), ConstExprT::ConstLit(0))
+  let expr_b = ConstExprT::ConstLit(4)
+  let a = const_sym_fold_type(&expr_a)
+  let b = const_sym_fold_type(&expr_b)
+  assert(type_to_mangled(a) == type_to_mangled(b), "a fully-bound N + 0 spelling must fold to the same Const(4) value as the bare literal")
+end
+
+# ———— Instance identity: N+0 vs N at call sites ————
+
+# Two call-site spellings the model equates (`N + 0` vs `N`) fold to the
+# SAME symbolic type argument (the fold applies at the symbolic-argument
+# record site), so the mangled renders agree and the structured instance
+# keys are EQUAL — one instance.
+@test
+def test_instance_key_spelling_add_zero_same_instance() -> Unit
+  let expr_a = ConstExprT::ConstAdd(p0(), ConstExprT::ConstLit(0))
+  let expr_b = p0()
+  let t_a = const_sym_fold_type(&expr_a)
+  let t_b = const_sym_fold_type(&expr_b)
+  let r_a = type_to_mangled(t_a)
+  let r_b = type_to_mangled(t_b)
+  assert(r_a == r_b, "the folded N + 0 spelling must render exactly like N")
+  let key_a = instance_key_of_renders(callable_key(), one_render(r_a))
+  let key_b = instance_key_of_renders(callable_key(), one_render(r_b))
+  let text_a = instance_key_to_text(key_a.clone())
+  let text_b = instance_key_to_text(key_b.clone())
+  assert(text_a == text_b, "the diagnostics texts of the equated spellings must agree, got: " + text_a + " vs " + text_b)
+  assert(instance_key_eq(key_a, key_b), "the N + 0 and N call-site spellings must yield the SAME structured instance key")
+end
+
+# The same-instance guarantee across the separate constructor paths: the
+# audit constructor (explicit split) and the total positional parse agree
+# on the same (callable, arg) input.
+@test
+def test_instance_key_constructors_agree() -> Unit
+  let renders_key = instance_key_of_renders(callable_key(), Vec::from(["int".to_string(), "c4".to_string()]))
+  let audit_key = instance_key_of(
+    callable_key(),
+    Vec::from(["int".to_string()]),
+    Vec::from([canonical_const_value_of("unsigned", 4)])
+  )
+  assert(instance_key_eq(renders_key, audit_key), "the audit constructor and the positional parse must build the SAME key for the same instance")
+end
+
+# ———— Spellings the model does NOT equate stay DIFFERENT ————
+
+# 2 * N vs N * 2: different symbolic trees, different renders, DIFFERENT
+# structured instance keys (documented — commutativity is not normalized).
+@test
+def test_instance_key_two_n_commute_stays_different() -> Unit
+  let expr_a = ConstExprT::ConstMul(ConstExprT::ConstLit(2), p0())
+  let expr_b = ConstExprT::ConstMul(p0(), ConstExprT::ConstLit(2))
+  let two_left = const_sym_fold_type(&expr_a)
+  let two_right = const_sym_fold_type(&expr_b)
+  let key_left = instance_key_of_renders(callable_key(), one_render(type_to_mangled(two_left)))
+  let key_right = instance_key_of_renders(callable_key(), one_render(type_to_mangled(two_right)))
+  assert(!instance_key_eq(key_left, key_right), "2 * N and N * 2 must stay DIFFERENT instance keys (commutativity is not normalized)")
+end
+
+# Concrete const arguments 4 vs 8: value-based const rows, DIFFERENT keys.
+@test
+def test_instance_key_const_values_4_vs_8_differ() -> Unit
+  let key_4 = instance_key_of_renders(callable_key(), Vec::from(["c4".to_string()]))
+  let key_8 = instance_key_of_renders(callable_key(), Vec::from(["c8".to_string()]))
+  assert(!instance_key_eq(key_4, key_8), "const args 4 and 8 must yield DIFFERENT instance keys")
+end
+
+# A negative const value round-trips through the segment grammar ("c-3").
+@test
+def test_instance_key_const_negative_value() -> Unit
+  let parsed_key = instance_key_of_renders(callable_key(), Vec::from(["c-3".to_string()]))
+  let built_key = instance_key_of(callable_key(), Vec::new(), Vec::from([canonical_const_value_of("signed", -3)]))
+  assert(instance_key_eq(parsed_key.clone(), built_key.clone()), "the c-3 segment and the signed -3 value row must build the SAME key")
+  let text = instance_key_to_text(built_key)
+  assert(text == callable_key() + "$c-3", "the diagnostics render must keep the const value text, got: " + text)
+end
+
+# A forwarded const-parameter row ("constparam5") parses and re-renders.
+@test
+def test_instance_key_constparam_segment() -> Unit
+  let key = instance_key_of_renders(callable_key(), Vec::from(["constparam5".to_string()]))
+  let text = instance_key_to_text(key)
+  assert(text == callable_key() + "$constparam5", "the diagnostics render must keep the forwarded-parameter text, got: " + text)
+  match canonical_const_of_segment("constparam5".to_string())
+  when Option::Some(row) then
+    assert(row.value == 5, "the constparam segment must parse its numeric parameter id")
+    assert(row.kind == "constparam", "the constparam segment must classify as the constparam symbolic marker")
+  when Option::None then
+    assert(false, "constparam5 must parse as a canonical const segment")
+  end
+end
+
+# A symbolic const-EXPRESSION segment ("constsym(...)") classifies as a
+# const row and a plain type render does not.
+@test
+def test_instance_key_segment_classification() -> Unit
+  match canonical_const_of_segment("constsym(((2)*(param0)))".to_string())
+  when Option::Some(row) then
+    assert(row.kind == "constsym", "a constsym segment must classify as the constsym symbolic marker")
+  when Option::None then
+    assert(false, "constsym(((2)*(param0))) must parse as a canonical const segment")
+  end
+  match canonical_const_of_segment("int".to_string())
+  when Option::Some(_) then
+    assert(false, "a plain type render must NOT classify as a const segment")
+  when Option::None then ()
+  end
+  let mixed = instance_key_of_renders(callable_key(), Vec::from(["int".to_string(), "c4".to_string(), "t3[int]".to_string()]))
+  let text = instance_key_to_text(mixed)
+  assert(text == callable_key() + "$int$t3[int]$c4", "type-arg texts and const texts must render in the grouped diagnostics order, got: " + text)
+end
+
+# Different callables never share a key: the callable key text digests.
+@test
+def test_instance_key_callable_differ() -> Unit
+  let key_a = instance_key_of_renders(callable_key(), Vec::from(["int".to_string()]))
+  let key_b = instance_key_of_renders("audit49::4::method".to_string(), Vec::from(["int".to_string()]))
+  assert(!instance_key_eq(key_a, key_b), "two instances of DIFFERENT callables must yield DIFFERENT keys")
+end
+
+# ———— The mono threading: MonoCache.structured_keys ————
+
+# A generic template with ONE declared type parameter and a concrete
+# (non-generic) body — the mono_arity suite's template shape, named for
+# the name-API path.
+def audit49_template() -> MirFunction
+  MirFunction {
+    name: "audit49_tpl".to_string(),
+    params: Vec::new(),
+    ret_type: Type::Int,
+    generic_params: Vec::from([
+      GenericParamId { owner: DefId { module: ModuleId { id: 0 }, index: 0 }, index: 0 }
+    ]),
+    locals: Vec::new(),
+    blocks: Vec::new(),
+    entry_block: MirBlockId { id: 0 },
+    is_async: false,
+    is_unsafe: false,
+    is_extern: false,
+    extern_abi: "".to_string(),
+    contracts: Vec::new(),
+    span: span_dummy()
+  }
+end
+
+# mono_specialize_function computes the structured InstanceKey ONCE per
+# specialization request and stores it alongside the text key in
+# MonoCache.structured_keys (the additive threading of audit item 49).
+@test
+def test_mono_cache_structured_key_threading() -> Unit
+  mut cache = fresh_cache()
+  mut program = MirProgram {
+    functions: Vec::from([audit49_template()]),
+    statics: Vec::new(),
+    types: Vec::new()
+  }
+  let name = mono_specialize_function(inout cache, inout program, "audit49_tpl".to_string(), Vec::from([Type::Int]))
+  match name
+  when Option::Some(mangled) then
+    assert(mangled == "audit49_tpl$int", "the name-API mangled emission key must be the template name + the mangle suffix")
+    let want_key = "audit49_tpl$int".to_string()
+    match cache.structured_keys.get(&want_key)
+    when Option::Some(key) then
+      let expected = instance_key_of_renders("audit49_tpl".to_string(), Vec::from(["int".to_string()]))
+      assert(instance_key_eq(key, expected), "the stored structured key must be the structured key of the specialized instance")
+      let text = instance_key_to_text(key.clone())
+      assert(text == "audit49_tpl$int", "the stored structured key's diagnostics text must keep the emission text, got: " + text)
+    when Option::None then
+      assert(false, "the structured key must be stored in MonoCache.structured_keys alongside the text key")
+    end
+  when Option::None then
+    assert(false, "the name-API specialization must succeed")
+  end
+end

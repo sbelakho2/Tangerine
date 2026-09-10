@@ -1,0 +1,2289 @@
+# Tangerine Compiler — x86-64 (System V AMD64) LIR backend
+# Self-hosting compiler written in Tangerine
+#
+# AUDIT ITEM 30, STAGE 1 — THE INTEGER CORE. This module is an x86-64
+# code generator over the SAME machine IR (LIR) every other backend
+# consumes: it takes a LirFunction + its LirAlloc (already verified by
+# verify_lir against the module's LirVerifyX86_64 route) and emits x86-64
+# machine code into the shared CodeBuffer, then serializes the whole
+# program as an ELF64 x86-64 relocatable object (e_machine 62,
+# EM_X86_64). It is NOT a second direct-emission path: every statement
+# and terminator arm below mirrors the aarch64 emitter's semantics
+# (lir.tg's lir_emit_fn family) and the RISC-V backend's structure
+# (backend_rv.tg — its emit-state / def-target / use / prologue /
+# patch-resolution shape, def-for-def with x86_64 names).
+#
+# ALL-NATIVE: this backend never invokes clang/llvm or any external
+# toolchain, in code or in the pipeline. External tools were used ONLY as
+# offline verification aids for the hand-derived byte layouts: every
+# encoding's bytes below were cross-checked against the output of
+# `clang -target x86_64-apple-darwin` + `objdump -d` (a subset of the
+# verified patterns is pinned by tests/x86_64_lir_rows_test.tg and every
+# encoder carries its layout + a hand-verified byte pattern in its
+# comment). The encoders return the raw instruction BYTES (x86-64 is
+# variable-length — the one structural difference from backend_rv.tg's
+# single-word rv_* encoders) and the emitter appends them through
+# x86_emit; every encoder fails closed with a panic on an out-of-range
+# displacement, never a silently truncated field.
+#
+# REGISTER MODEL (SysV AMD64 — target_desc.tg's x86_64_desc arg_regs):
+#   fixed LIR vregs 0..5 -> rdi, rsi, rdx, rcx, r8, r9 (the six SysV
+#     integer argument registers). Fixed ids 6 and 7 have NO SysV
+#     integer register (SysV passes arguments 7+ on the stack): the
+#     stage-1 route FAILS CLOSED on any function/statement that uses
+#     fixed ids 6/7 (see x86_validate_fn) — the lowering's eight-register
+#     aarch64 fetch mode is only ever consumed for indexes 0..5 here.
+#     Fixed float ids 8..15 and every FP statement also fail closed (the
+#     FP slice is a later stage; this file has no SSE arms).
+#   allocator general CALLER-saved pool ids 9..14 -> r10, r11, rbx,
+#     r12, r13, r14 (x86_pool_phys). The allocator treats them as its
+#     caller-saved class: a register-resident value crossing a call is
+#     stored to its slot before the call and reloaded at its first read
+#     after it (LirAlloc.spills/reloads), exactly like the x9..x14 class
+#     on aarch64. NOTE: rbx/r12/r13/r14 are CALLEE-saved in the SysV
+#     ABI, so the prologue saves every one of this pool that the
+#     allocation actually assigned (x86_saved_regs scans the segment
+#     records) — the allocator's caller-saved bookkeeping handles call
+#     crossings, the prologue handles the ABI preservation.
+#   allocator CALLEE-saved id 19 -> r15 (the one SysV callee-saved
+#     register left after the frame pointer and the pool above). The
+#     route passes cc_pool = [19] to lir_alloc_registers_mode, so a
+#     whole call-crossing hull may ride r15 with no spill record;
+#     alloc.cc_used names it and the prologue saves/restores it.
+#   rax = the statement TEMP and the return register. It is never
+#     allocated to a vreg. RSP/RBP are the frame machinery.
+#   The frame is the aarch64/LIR uniform model: spill slot i at
+#   [rbp - 8 - 8*i] (lir_slot_offset), plus ONE emitter scratch slot at
+#   index alloc.slots ([rbp - 8 - 8*alloc.slots]) for the rare forms
+#   that must park a 64-bit immediate or the divisor, plus the
+#   callee-saved save area at the bottom of the frame.
+#
+# FAIL-CLOSED STAGE-1 SURFACE (each construct names its rule in
+# x86_validate_fn/x86_emit_stmt; verify_lir's X86_64 route is the
+# mandatory second gate):
+#   - float statements / fixed float vregs (no SSE arms in stage 1);
+#   - pointer/atomic marked statements (LirStmt.ptr) and bit-move
+#     markers (LirStmt.bm);
+#   - aggregate locals/params/arguments and sret returns (the aggregate
+#     slice is an aarch64-route feature; stage 1 carries integer scalars
+#     only);
+#   - stack arguments (LirPushArg / LirLoadFrame / call stack_args):
+#     SysV stack slots are 8 bytes, not the LIR lowering's 16-byte
+#     aarch64 caller slots — the caller-stack stream slice is later;
+#   - static data (program statics / LirStaticLoad): the .data image and
+#     its address relocations are a later slice;
+#   - functions/statements using fixed vregs 6/7 (arguments 7..8);
+#   - extern calls DO lower: `call rel32` plus an R_X86_64_PLT32
+#     relocation (kind 4, addend -4) against the undefined symbol, so
+#     the linker resolves them. Intra-object calls to defined program
+#     functions are deferred rel32 patches resolved once every function
+#     label is in the shared buffer.
+#   DIVISION is in scope (unlike the riscv/cortex-m routes): the route
+#   lowers with div_ok true, and the marked LirBinop emits
+#   cqo+idiv (signed) / xor edx,edx+div (unsigned) with the quotient in
+#   rax. x86_validate_fn keeps the fail-closed rejections for everything
+#   else.
+#
+# Stage-1 scope decisions worth naming:
+#   - width_ok is CLOSED (lower_mir_fn_to_lir_mode(f, true, false)): the
+#     word-only integer accept set of the riscv64 route plus division.
+#     Sized integer types/Bool/pointer words are later slices.
+#   - @cold is ADVISORY and NOT specialized here: every body is emitted
+#     in program order into one .text (the hint changes nothing).
+#   - The LIR lowering's positional argument moves land in fixed vregs
+#     0..5 through the SysV order above, so a call's register arguments
+#     already sit in the ABI registers when the call term emits.
+
+use std::core::{Option, Result, panic}
+use std::collections::{Vec, Set}
+use tg_compiler::mir::{MirProgram}
+use tg_compiler::lir::{
+  LirFunction, LirAlloc, LirStmt, LirStmtKind, LirTermKind, LirValue,
+  LirCond, LirBinOp, LirUnOp, LirDivOp,
+  lower_mir_fn_to_lir_mode, lir_peephole, lir_alloc_registers_mode,
+  lir_validate_callees, lir_first_alloc_vreg,
+  lir_seg_at, lir_reload_at, lir_block_label, lir_slot_offset,
+  LirVerifyRoute, verify_lir, lir_verify_fail_err
+}
+use tg_compiler::asm::{
+  X64, x64_code,
+  CodeBuffer, buf_new, emit8, def_label,
+  buf_pos, patch32_le, AsmSymbol, Section, SymBinding, SymKind
+}
+use tg_compiler::target_desc::{TargetDesc, Arch}
+
+# ———————————————————————————————————————————————————————————————
+# x86-64 encoders (the LIR route's self-contained encoding surface)
+# ———————————————————————————————————————————————————————————————
+# Every encoder returns the instruction's raw bytes (REX-prefixed 64-bit
+# forms unless its comment says otherwise), documented with its layout
+# and a hand-verified byte pattern. The shared asm.tg module carries an
+# equivalent x64_* surface for the DIRECT emitter; the LIR route's
+# encoders live HERE so the route's byte surface is one self-contained,
+# hand-verified unit (the item-30 instruction).
+#
+# REX = 0100 WRXB (W = 64-bit operand, R = ModRM.reg extension,
+# X = SIB.index extension, B = ModRM.rm/SIB.base/opcode-reg extension).
+# ModRM = mm rrr mmm (mm 3 = register, 01 = [base+disp8], 10 =
+# [base+disp32]). A [rbp]/[r13] base is NEVER encoded with mm = 00 (that
+# form is RIP-relative on x86-64), and a [rsp]/[r12] base always carries
+# a SIB byte with index = 100 (none) — both rules are enforced by
+# x86_mem below.
+
+def x86_rex_bits(w: Bool, r: Bool, x: Bool, b: Bool) -> u8
+  var v = 0x40
+  if w then v = v | 0x08 end
+  if r then v = v | 0x04 end
+  if x then v = v | 0x02 end
+  if b then v = v | 0x01 end
+  v as u8
+end
+
+def x86_modrm(mod_: Int, reg: Int, rm: Int) -> u8
+  (((mod_ & 3) << 6) | ((reg & 7) << 3) | (rm & 7)) as u8
+end
+
+def x86_sib(scale: Int, index: Int, base: Int) -> u8
+  (((scale & 3) << 6) | ((index & 7) << 3) | (base & 7)) as u8
+end
+
+# Is `imm` representable as the sign-extended 32-bit immediate of the
+# 81 /ext, 69 /r and 6x imm32 instruction forms?
+def x86_imm32_ok(imm: Int) -> Bool
+  imm >= -2147483648 && imm <= 2147483647
+end
+
+# Push the little-endian bytes of a 32-bit / 64-bit payload.
+def x86_push_le32(inout out: Vec[u8], v: Int) -> Unit
+  out.push((v & 0xFF) as u8)
+  out.push(((v >> 8) & 0xFF) as u8)
+  out.push(((v >> 16) & 0xFF) as u8)
+  out.push(((v >> 24) & 0xFF) as u8)
+end
+
+def x86_push_le64(inout out: Vec[u8], v: Int) -> Unit
+  x86_push_le32(out, v & 0xFFFFFFFF)
+  x86_push_le32(out, (v >> 32) & 0xFFFFFFFF)
+end
+
+# The ModRM (+ optional SIB) (+ displacement) bytes of [base + disp].
+# `reg` is the /r or /ext field (0..7). mm = 01 when the disp fits a
+# signed byte (a zero disp on a non-rbp base takes the shorter mm = 00),
+# mm = 10 otherwise. Displacements are frame offsets: anything outside
+# the signed 32-bit field is a caller bug and panics here.
+def x86_mem(reg: Int, base: X64, disp: Int) -> Vec[u8]
+  if !x86_imm32_ok(disp) then
+    panic("x86_mem: displacement " + disp.to_string() + " does not fit the signed 32-bit field")
+  end
+  let b = (x64_code(base) as Int) & 7
+  var out: Vec[u8] = Vec::new()
+  var mod_ = 0
+  if disp == 0 && b != 5 then
+    mod_ = 0
+  elsif disp >= -128 && disp <= 127 then
+    mod_ = 1
+  else
+    mod_ = 2
+  end
+  out.push(x86_modrm(mod_, reg, b))
+  if b == 4 then
+    # rsp / r12: the base field 100 requires a SIB with index = 100 (no
+    # index) and base = 100.
+    out.push(x86_sib(0, 4, 4))
+  end
+  if mod_ == 1 then
+    out.push((disp & 0xFF) as u8)
+  elsif mod_ == 2 then
+    x86_push_le32(out, disp)
+  end
+  out
+end
+
+# Append one instruction's bytes to the buffer.
+def x86_emit(inout b: CodeBuffer, bytes: Vec[u8]) -> Unit
+  var i = 0
+  while i < bytes.len() do
+    emit8(b, bytes[i])
+    i = i + 1
+  end
+end
+
+# MOV r/m64, r64 — REX.W(+R,+B) 89 /r. Copies src into dst.
+# verified-by-hand: mov rcx -> rax = 48 89 C8; mov r9 -> r8 = 4D 89 C8.
+def x86_mov_rr(dst: X64, src: X64) -> Vec[u8]
+  var out: Vec[u8] = Vec::new()
+  out.push(x86_rex_bits(true, x64_hi(src), false, x64_hi(dst)))
+  out.push(0x89)
+  out.push(x86_modrm(3, x64_code(src) as Int, x64_code(dst) as Int))
+  out
+end
+
+# MOV r64, imm64 (movabs) — REX.W(+B) B8+rd io. Materializes ANY 64-bit
+# payload exactly (no sign extension involved).
+# verified-by-hand: movabs rax, 0x1122334455667788 = 48 B8 88 77 66 55
+# 44 33 22 11; movabs r10, ... = 49 BA 88 77 66 55 44 33 22 11.
+def x86_mov_ri64(dst: X64, imm: Int) -> Vec[u8]
+  var out: Vec[u8] = Vec::new()
+  out.push(x86_rex_bits(true, false, false, x64_hi(dst)))
+  out.push((0xB8 + ((x64_code(dst) as Int) & 7)) as u8)
+  x86_push_le64(out, imm)
+  out
+end
+
+# MOV r64, [base + disp] — REX.W(+R,+B) 8B /r.
+# verified-by-hand: mov rax, [rbp-8] = 48 8B 45 F8; mov r12, [rbp-16] =
+# 4C 8B 65 F0.
+def x86_mov_rm(dst: X64, base: X64, disp: Int) -> Vec[u8]
+  var out: Vec[u8] = Vec::new()
+  out.push(x86_rex_bits(true, x64_hi(dst), false, x64_hi(base)))
+  out.push(0x8B)
+  x86_append_mem(out, x64_code(dst) as Int, base, disp)
+  out
+end
+
+# MOV [base + disp], r64 — REX.W(+R,+B) 89 /r.
+# verified-by-hand: mov [rbp-8], rax = 48 89 45 F8; mov [rbp-16], r12 =
+# 4C 89 65 F0.
+def x86_mov_mr(base: X64, disp: Int, src: X64) -> Vec[u8]
+  var out: Vec[u8] = Vec::new()
+  out.push(x86_rex_bits(true, x64_hi(src), false, x64_hi(base)))
+  out.push(0x89)
+  x86_append_mem(out, x64_code(src) as Int, base, disp)
+  out
+end
+
+# Append x86_mem's bytes (factored so each instruction builds its REX +
+# opcode first and its operand last).
+def x86_append_mem(inout out: Vec[u8], reg: Int, base: X64, disp: Int) -> Unit
+  let m = x86_mem(reg, base, disp)
+  var i = 0
+  while i < m.len() do
+    out.push(m[i])
+    i = i + 1
+  end
+end
+
+# ALU r/m64, r64 forms — REX.W(+R,+B) <opcode> /r:
+#   add 01, or 09, and 21, sub 29, xor 31, cmp 39, test 85.
+# verified-by-hand: add rax, rcx = 48 01 C8; sub = 48 29 C8; and = 48 21
+# C8; or = 48 09 C8; xor = 48 31 C8; cmp rax, rcx = 48 39 C8; test = 48
+# 85 C8.
+def x86_alu_rr(opcode: Int, dst: X64, src: X64) -> Vec[u8]
+  var out: Vec[u8] = Vec::new()
+  out.push(x86_rex_bits(true, x64_hi(src), false, x64_hi(dst)))
+  out.push(opcode as u8)
+  out.push(x86_modrm(3, x64_code(src) as Int, x64_code(dst) as Int))
+  out
+end
+
+# ALU r64, [base + disp] forms — REX.W(+R,+B) <opcode> /r:
+#   add 03, or 0B, and 23, sub 2B, xor 33, cmp 3B, test 85.
+# verified-by-hand: add rax, [rbp-8] = 48 03 45 F8; sub = 48 2B 45 F8;
+# cmp rax, [rbp-8] = 48 3B 45 F8.
+def x86_alu_rm(opcode: Int, dst: X64, base: X64, disp: Int) -> Vec[u8]
+  var out: Vec[u8] = Vec::new()
+  out.push(x86_rex_bits(true, x64_hi(dst), false, x64_hi(base)))
+  out.push(opcode as u8)
+  x86_append_mem(out, x64_code(dst) as Int, base, disp)
+  out
+end
+
+# ALU r64, imm32 — REX.W(+B) 81 /ext id. The /ext field selects the
+# operation: add 0, or 1, and 4, sub 5, xor 6, cmp 7. The 32-bit
+# immediate is SIGN-EXTENDED to 64 bits by the machine, so callers use
+# this form only when x86_imm32_ok holds.
+# verified-by-hand: sub rsp, 100000 = 48 81 EC A0 86 01 00 (the
+# accumulator short forms 05/0D/25/2D/35/3D are not emitted).
+def x86_alu_ri(ext: Int, dst: X64, imm: Int) -> Vec[u8]
+  if !x86_imm32_ok(imm) then
+    panic("x86_alu_ri: immediate " + imm.to_string() + " does not fit the sign-extended 32-bit field")
+  end
+  var out: Vec[u8] = Vec::new()
+  out.push(x86_rex_bits(true, false, false, x64_hi(dst)))
+  out.push(0x81)
+  out.push(x86_modrm(3, ext, x64_code(dst) as Int))
+  x86_push_le32(out, imm)
+  out
+end
+
+# IMUL r64, r/m64 — REX.W 0F AF /r.
+# verified-by-hand: imul rax, rcx = 48 0F AF C1; imul rax, [rbp-8] =
+# 48 0F AF 45 F8.
+def x86_imul_rr(dst: X64, src: X64) -> Vec[u8]
+  var out: Vec[u8] = Vec::new()
+  out.push(x86_rex_bits(true, x64_hi(dst), false, x64_hi(src)))
+  out.push(0x0F)
+  out.push(0xAF)
+  out.push(x86_modrm(3, x64_code(dst) as Int, x64_code(src) as Int))
+  out
+end
+
+def x86_imul_rm(dst: X64, base: X64, disp: Int) -> Vec[u8]
+  var out: Vec[u8] = Vec::new()
+  out.push(x86_rex_bits(true, x64_hi(dst), false, x64_hi(base)))
+  out.push(0x0F)
+  out.push(0xAF)
+  x86_append_mem(out, x64_code(dst) as Int, base, disp)
+  out
+end
+
+# IMUL r64, r/m64, imm32 — REX.W(+R,+B) 69 /r id (the three-operand
+# form: dst = src * sign-extended(imm32)).
+# verified-by-hand: imul rax, rax, 0x12345678 = 48 69 C0 78 56 34 12.
+def x86_imul_rri(dst: X64, src: X64, imm: Int) -> Vec[u8]
+  if !x86_imm32_ok(imm) then
+    panic("x86_imul_rri: immediate " + imm.to_string() + " does not fit the sign-extended 32-bit field")
+  end
+  var out: Vec[u8] = Vec::new()
+  out.push(x86_rex_bits(true, x64_hi(dst), false, x64_hi(src)))
+  out.push(0x69)
+  out.push(x86_modrm(3, x64_code(dst) as Int, x64_code(src) as Int))
+  x86_push_le32(out, imm)
+  out
+end
+
+# CQO — REX.W 99: sign-extend RAX into RDX:RAX (the signed-division
+# setup). verified-by-hand: 48 99.
+def x86_cqo() -> Vec[u8]
+  Vec::from([0x48, 0x99])
+end
+
+# IDIV r/m64 — REX.W(+B) F7 /7: RDX:RAX / src -> RAX quotient (signed).
+# verified-by-hand: idiv rcx = 48 F7 F9; idiv [rbp-8] = 48 F7 7D F8.
+def x86_idiv_r(src: X64) -> Vec[u8]
+  var out: Vec[u8] = Vec::new()
+  out.push(x86_rex_bits(true, false, false, x64_hi(src)))
+  out.push(0xF7)
+  out.push(x86_modrm(3, 7, x64_code(src) as Int))
+  out
+end
+
+def x86_idiv_rm(base: X64, disp: Int) -> Vec[u8]
+  var out: Vec[u8] = Vec::new()
+  out.push(x86_rex_bits(true, false, false, x64_hi(base)))
+  out.push(0xF7)
+  x86_append_mem(out, 7, base, disp)
+  out
+end
+
+# DIV r/m64 — REX.W(+B) F7 /6: RDX:RAX / src -> RAX quotient (unsigned;
+# RDX must be zeroed first).
+# verified-by-hand: div rcx = 48 F7 F1; div [rbp-8] = 48 F7 75 F8.
+def x86_div_r(src: X64) -> Vec[u8]
+  var out: Vec[u8] = Vec::new()
+  out.push(x86_rex_bits(true, false, false, x64_hi(src)))
+  out.push(0xF7)
+  out.push(x86_modrm(3, 6, x64_code(src) as Int))
+  out
+end
+
+def x86_div_rm(base: X64, disp: Int) -> Vec[u8]
+  var out: Vec[u8] = Vec::new()
+  out.push(x86_rex_bits(true, false, false, x64_hi(base)))
+  out.push(0xF7)
+  x86_append_mem(out, 6, base, disp)
+  out
+end
+
+# Shift r/m64, imm8 — REX.W(+B) C1 /ext ib: ext 4 shl, 5 shr, 7 sar.
+# The machine uses count & 63 for 64-bit operands, exactly the LIR
+# 64-bit shift semantics. verified-by-hand: shl rax, 3 = 48 C1 E0 03;
+# shr = 48 C1 E8 03; sar = 48 C1 F8 03.
+def x86_shift_imm(ext: Int, dst: X64, count: Int) -> Vec[u8]
+  var out: Vec[u8] = Vec::new()
+  out.push(x86_rex_bits(true, false, false, x64_hi(dst)))
+  out.push(0xC1)
+  out.push(x86_modrm(3, ext, x64_code(dst) as Int))
+  out.push((count & 0x3F) as u8)
+  out
+end
+
+# Shift r/m64, CL — REX.W(+B) D3 /ext: the variable-count form (the
+# count register is architecturally CL).
+# verified-by-hand: shl rax, cl = 48 D3 E0; shr = 48 D3 E8; sar =
+# 48 D3 F8.
+def x86_shift_cl(ext: Int, dst: X64) -> Vec[u8]
+  var out: Vec[u8] = Vec::new()
+  out.push(x86_rex_bits(true, false, false, x64_hi(dst)))
+  out.push(0xD3)
+  out.push(x86_modrm(3, ext, x64_code(dst) as Int))
+  out
+end
+
+# NEG r/m64 — REX.W(+B) F7 /3; NOT r/m64 — /2.
+# verified-by-hand: neg rax = 48 F7 D8; not rax = 48 F7 D0.
+def x86_neg_r(r: X64) -> Vec[u8]
+  var out: Vec[u8] = Vec::new()
+  out.push(x86_rex_bits(true, false, false, x64_hi(r)))
+  out.push(0xF7)
+  out.push(x86_modrm(3, 3, x64_code(r) as Int))
+  out
+end
+
+def x86_not_r(r: X64) -> Vec[u8]
+  var out: Vec[u8] = Vec::new()
+  out.push(x86_rex_bits(true, false, false, x64_hi(r)))
+  out.push(0xF7)
+  out.push(x86_modrm(3, 2, x64_code(r) as Int))
+  out
+end
+
+# SETcc r/m8 — [REX] 0F 90+cc /0. The low byte only: the caller follows
+# with x86_movzx_r64_r8 to materialize the canonical 0/1 word (the LIR
+# Bool image). REX is required for the low-byte registers spl/bpl/sil/
+# dil (codes 4..7) and the extended r8b..r15b (codes >= 8), and is
+# emitted without W.
+# verified-by-hand: sete al = 0F 94 C0; sete r10b = 41 0F 94 C2.
+def x86_setcc(cc: Int, dst: X64) -> Vec[u8]
+  var out: Vec[u8] = Vec::new()
+  let dc = x64_code(dst) as Int
+  if dc >= 4 then
+    out.push(x86_rex_bits(false, false, false, x64_hi(dst)))
+  end
+  out.push(0x0F)
+  out.push((0x90 + (cc & 0x0F)) as u8)
+  out.push(x86_modrm(3, 0, dc))
+  out
+end
+
+# MOVZX r64, r/m8 — REX.W(+R,+B) 0F B6 /r.
+# verified-by-hand: movzx rax, al = 48 0F B6 C0.
+def x86_movzx_r64_r8(dst: X64, src: X64) -> Vec[u8]
+  var out: Vec[u8] = Vec::new()
+  out.push(x86_rex_bits(true, x64_hi(dst), false, x64_hi(src)))
+  out.push(0x0F)
+  out.push(0xB6)
+  out.push(x86_modrm(3, x64_code(dst) as Int, x64_code(src) as Int))
+  out
+end
+
+def x86_movzx_r64_m8(dst: X64, base: X64, disp: Int) -> Vec[u8]
+  var out: Vec[u8] = Vec::new()
+  out.push(x86_rex_bits(true, x64_hi(dst), false, x64_hi(base)))
+  out.push(0x0F)
+  out.push(0xB6)
+  x86_append_mem(out, x64_code(dst) as Int, base, disp)
+  out
+end
+
+# MOVSX r64, r/m8 — REX.W 0F BE /r (the sxtb form); MOVSX r64, r/m16 —
+# REX.W 0F BF /r (the sxth form); MOVSXD r64, r/m32 — REX.W 63 /r (the
+# sxtw form).
+# verified-by-hand: movsx rax, al = 48 0F BE C0; movsx rax, ax = 48 0F BF
+# C0; movsxd rax, eax = 48 63 C0.
+def x86_movsx_r64_r8(dst: X64, src: X64) -> Vec[u8]
+  var out: Vec[u8] = Vec::new()
+  out.push(x86_rex_bits(true, x64_hi(dst), false, x64_hi(src)))
+  out.push(0x0F)
+  out.push(0xBE)
+  out.push(x86_modrm(3, x64_code(dst) as Int, x64_code(src) as Int))
+  out
+end
+
+def x86_movsx_r64_r16(dst: X64, src: X64) -> Vec[u8]
+  var out: Vec[u8] = Vec::new()
+  out.push(x86_rex_bits(true, x64_hi(dst), false, x64_hi(src)))
+  out.push(0x0F)
+  out.push(0xBF)
+  out.push(x86_modrm(3, x64_code(dst) as Int, x64_code(src) as Int))
+  out
+end
+
+def x86_movsx_r64_m8(dst: X64, base: X64, disp: Int) -> Vec[u8]
+  var out: Vec[u8] = Vec::new()
+  out.push(x86_rex_bits(true, x64_hi(dst), false, x64_hi(base)))
+  out.push(0x0F)
+  out.push(0xBE)
+  x86_append_mem(out, x64_code(dst) as Int, base, disp)
+  out
+end
+
+def x86_movsx_r64_m16(dst: X64, base: X64, disp: Int) -> Vec[u8]
+  var out: Vec[u8] = Vec::new()
+  out.push(x86_rex_bits(true, x64_hi(dst), false, x64_hi(base)))
+  out.push(0x0F)
+  out.push(0xBF)
+  x86_append_mem(out, x64_code(dst) as Int, base, disp)
+  out
+end
+
+def x86_movsxd_rr(dst: X64, src: X64) -> Vec[u8]
+  var out: Vec[u8] = Vec::new()
+  out.push(x86_rex_bits(true, x64_hi(dst), false, x64_hi(src)))
+  out.push(0x63)
+  out.push(x86_modrm(3, x64_code(dst) as Int, x64_code(src) as Int))
+  out
+end
+
+def x86_movsxd_rm(dst: X64, base: X64, disp: Int) -> Vec[u8]
+  var out: Vec[u8] = Vec::new()
+  out.push(x86_rex_bits(true, x64_hi(dst), false, x64_hi(base)))
+  out.push(0x63)
+  x86_append_mem(out, x64_code(dst) as Int, base, disp)
+  out
+end
+
+# LEA r64, [base + disp] — REX.W(+R,+B) 8D /r (no memory access; the
+# frame-slot address form). verified-by-hand: lea rax, [rbp-40] =
+# 48 8D 45 D8.
+def x86_lea(dst: X64, base: X64, disp: Int) -> Vec[u8]
+  var out: Vec[u8] = Vec::new()
+  out.push(x86_rex_bits(true, x64_hi(dst), false, x64_hi(base)))
+  out.push(0x8D)
+  x86_append_mem(out, x64_code(dst) as Int, base, disp)
+  out
+end
+
+# PUSH r64 / POP r64 — [REX.B] 50+rd / 58+rd.
+# verified-by-hand: push rbp = 55; pop rbp = 5D.
+def x86_push_r(r: X64) -> Vec[u8]
+  var out: Vec[u8] = Vec::new()
+  if x64_hi(r) then
+    out.push(0x41)
+  end
+  out.push((0x50 + ((x64_code(r) as Int) & 7)) as u8)
+  out
+end
+
+def x86_pop_r(r: X64) -> Vec[u8]
+  var out: Vec[u8] = Vec::new()
+  if x64_hi(r) then
+    out.push(0x41)
+  end
+  out.push((0x58 + ((x64_code(r) as Int) & 7)) as u8)
+  out
+end
+
+# RET / LEAVE (mov rsp, rbp; pop rbp) / NOP / UD2.
+# verified-by-hand: ret = C3; leave = C9; nop = 90; ud2 = 0F 0B.
+def x86_ret() -> Vec[u8]
+  Vec::from([0xC3])
+end
+
+def x86_leave() -> Vec[u8]
+  Vec::from([0xC9])
+end
+
+def x86_nop() -> Vec[u8]
+  Vec::from([0x90])
+end
+
+def x86_ud2() -> Vec[u8]
+  Vec::from([0x0F, 0x0B])
+end
+
+# JMP rel32 = E9 id; Jcc rel32 = 0F 80+cc id; CALL rel32 = E8 id. The
+# four displacement bytes start as zero and are patched by
+# x86_resolve_patches (intra-object targets) or described by an
+# R_X86_64_PLT32 relocation (extern calls).
+# verified-by-hand: call rel32 = E8 xx xx xx xx.
+def x86_jmp_rel32() -> Vec[u8]
+  Vec::from([0xE9, 0x00, 0x00, 0x00, 0x00])
+end
+
+def x86_jcc_rel32(cc: Int) -> Vec[u8]
+  Vec::from([0x0F, (0x80 + (cc & 0x0F)) as u8, 0x00, 0x00, 0x00, 0x00])
+end
+
+def x86_call_rel32() -> Vec[u8]
+  Vec::from([0xE8, 0x00, 0x00, 0x00, 0x00])
+end
+
+# The SHORT forms (2 bytes): JMP rel8 = EB cb; Jcc rel8 = 70+cc cb. The
+# stage-1 emitter uses the rel32 forms uniformly (no relaxation), but the
+# shorts are provided and pinned here for the later relaxation/peephole
+# pass — and because the item-30 instruction list names them.
+# verified-by-hand: jmp +2 = EB 02; je +2 = 74 02; jne = 75.
+def x86_jmp_rel8(rel: Int) -> Vec[u8]
+  if rel < -128 || rel > 127 then
+    panic("x86_jmp_rel8: rel " + rel.to_string() + " does not fit the signed 8-bit field")
+  end
+  Vec::from([0xEB, (rel & 0xFF) as u8])
+end
+
+def x86_jcc_rel8(cc: Int, rel: Int) -> Vec[u8]
+  if rel < -128 || rel > 127 then
+    panic("x86_jcc_rel8: rel " + rel.to_string() + " does not fit the signed 8-bit field")
+  end
+  Vec::from([(0x70 + (cc & 0x0F)) as u8, (rel & 0xFF) as u8])
+end
+
+# The x86 condition-code nibble of a LIR condition (the SETcc/Jcc
+# opcode low nibble; the same table the compare and branch arms use):
+#   Eq 4 (E/Z), Ne 5 (NE/NZ), Lt C (L), Le E (LE), G F (G), Ge D (GE),
+#   Ult 2 (B/C), Ule 6 (BE), Ugt 7 (A), Uge 3 (AE/NC).
+def x86_cc_of(cond: LirCond) -> Int
+  match cond
+  when LirCond::LirEq then 0x4
+  when LirCond::LirNe then 0x5
+  when LirCond::LirLt then 0xC
+  when LirCond::LirLe then 0xE
+  when LirCond::LirGt then 0xF
+  when LirCond::LirGe then 0xD
+  when LirCond::LirUlt then 0x2
+  when LirCond::LirUle then 0x6
+  when LirCond::LirUgt then 0x7
+  when LirCond::LirUge then 0x3
+  end
+end
+
+# The inverse of a LIR condition (the far-branch / switch helpers):
+# the pairs differ only in the low opcode bit, exactly the CC table.
+def x86_cc_inv(cond: LirCond) -> LirCond
+  match cond
+  when LirCond::LirEq then LirCond::LirNe
+  when LirCond::LirNe then LirCond::LirEq
+  when LirCond::LirLt then LirCond::LirGe
+  when LirCond::LirGe then LirCond::LirLt
+  when LirCond::LirGt then LirCond::LirLe
+  when LirCond::LirLe then LirCond::LirGt
+  when LirCond::LirUlt then LirCond::LirUge
+  when LirCond::LirUge then LirCond::LirUlt
+  when LirCond::LirUgt then LirCond::LirUle
+  when LirCond::LirUle then LirCond::LirUgt
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Emit state, deferred patches and extern relocations
+# ———————————————————————————————————————————————————————————————
+# The route emits EVERY function into ONE shared CodeBuffer (the
+# backend_rv.tg / backend_thumb.tg whole-program model): block and
+# function labels coexist in buf.labels, intra-object branches/calls are
+# deferred rel32 patches resolved by x86_resolve_patches once the whole
+# program is emitted, and calls to undefined externs emit `call rel32`
+# plus an R_X86_64_PLT32 relocation record for the ELF writer.
+
+struct X86Patch
+  offset: Int     # byte offset of the rel32 displacement field
+  label: String   # target label (a block or function label)
+end
+
+struct X86Reloc
+  offset: Int     # byte offset of the rel32 displacement field
+  sym: String     # the undefined extern symbol
+  kind: Int       # ELF x86-64 relocation type
+end
+
+# ELF x86-64 relocation types this backend emits (the psABI):
+#   R_X86_64_PLT32 = 4 (the PC-relative 32-bit call displacement; the
+#   canonical addend is -4 — the relocation field is the 4-byte
+#   displacement and the PC basis is the END of the call instruction).
+def x86_reloc_plt32() -> Int = 4
+
+struct X86Emit
+  buf: CodeBuffer
+  patches: Vec[X86Patch]
+  relocs: Vec[X86Reloc]
+  syms: Vec[AsmSymbol]
+  # True between a LirCmp and its adjacent LirCset (invariant I1): the
+  # x86 flags carry the comparison, exactly like the aarch64 NZCV.
+  pending_cmp: Bool
+end
+
+def x86_emit_new() -> X86Emit
+  X86Emit {
+    buf: buf_new(),
+    patches: Vec::new(),
+    relocs: Vec::new(),
+    syms: Vec::new(),
+    pending_cmp: false
+  }
+end
+
+# Register a machine function symbol at the current buffer position.
+# Stage 1 emits every body into one .text (@cold is not specialized —
+# the hint is documented as ignored in the module header).
+def x86_emit_fn_symbol(inout xe: X86Emit, name: String) -> Unit
+  xe.syms.push(AsmSymbol {
+    name: name,
+    section: Section::Text,
+    offset: buf_pos(&xe.buf),
+    size: 0,
+    binding: SymBinding::Global,
+    kind: SymKind::Func
+  })
+end
+
+# JMP/Jcc/CALL to a label of the shared buffer: emit the rel32 form with
+# a zero displacement and record the deferred patch.
+def x86_emit_jmp_label(inout xe: X86Emit, label: String) -> Unit
+  let off = buf_pos(&xe.buf) + 1
+  x86_emit(&mut xe.buf, x86_jmp_rel32())
+  xe.patches.push(X86Patch { offset: off, label: label })
+end
+
+def x86_emit_jcc_label(inout xe: X86Emit, cond: LirCond, label: String) -> Unit
+  let off = buf_pos(&xe.buf) + 2
+  x86_emit(&mut xe.buf, x86_jcc_rel32(x86_cc_of(cond)))
+  xe.patches.push(X86Patch { offset: off, label: label })
+end
+
+def x86_emit_call_label(inout xe: X86Emit, label: String) -> Unit
+  let off = buf_pos(&xe.buf) + 1
+  x86_emit(&mut xe.buf, x86_call_rel32())
+  xe.patches.push(X86Patch { offset: off, label: label })
+end
+
+# A call to an undefined extern: `call rel32` with a zero displacement
+# plus an R_X86_64_PLT32 relocation (the linker computes S + A - P).
+def x86_emit_call_remote(inout xe: X86Emit, sym: String) -> Unit
+  let off = buf_pos(&xe.buf) + 1
+  x86_emit(&mut xe.buf, x86_call_rel32())
+  xe.relocs.push(X86Reloc { offset: off, sym: sym, kind: x86_reloc_plt32() })
+end
+
+# Resolve every deferred patch — runs once, after every function (and so
+# every block label and function label) of the shared buffer is defined.
+# rel32 = target - (offset + 4); an unresolved label fails the compile
+# closed, never a silently broken branch.
+def x86_resolve_patches(inout xe: X86Emit) -> Result[Unit, String]
+  var pi = 0
+  while pi < xe.patches.len() do
+    let p = xe.patches[pi]
+    match xe.buf.labels.get(p.label.clone())
+    when Option::Some(target) then
+      let rel = target - (p.offset + 4)
+      patch32_le(&mut xe.buf, p.offset, (rel & 0xFFFF_FFFF) as u32)
+    when Option::None then
+      return Result::Err("x86_64: internal error: branch target `" + p.label + "` was never defined (fail-closed)")
+    end
+    pi = pi + 1
+  end
+  Result::Ok(())
+end
+
+# ———————————————————————————————————————————————————————————————
+# The SysV register model
+# ———————————————————————————————————————————————————————————————
+
+# The physical register of a fixed (precolored) LIR general vreg:
+# 0..5 -> rdi, rsi, rdx, rcx, r8, r9 (target_desc.tg x86_64_desc
+# arg_regs). Fixed ids 6/7 (and the float ids 8..15) have no x86-64
+# stage-1 register: the validator rejects every use before emission, so
+# reaching this panic is a backend divergence.
+def x86_fixed_phys(id: Int) -> X64
+  match id
+  when 0 then X64::RDI
+  when 1 then X64::RSI
+  when 2 then X64::RDX
+  when 3 then X64::RCX
+  when 4 then X64::R8
+  when 5 then X64::R9
+  when _ then panic("x86_64: fixed LIR vreg " + id.to_string() + " has no SysV integer register (only 0..5 do; the validator rejects 6..15)")
+  end
+end
+
+# The physical register of an allocated general physical id:
+# caller-saved pool 9..14 -> r10, r11, rbx, r12, r13, r14;
+# callee-saved id 19 -> r15.
+def x86_phys_of(phys: Int) -> X64
+  match phys
+  when 9 then X64::R10
+  when 10 then X64::R11
+  when 11 then X64::RBX
+  when 12 then X64::R12
+  when 13 then X64::R13
+  when 14 then X64::R14
+  when 19 then X64::R15
+  when _ then panic("x86_64: physical id " + phys.to_string() + " is outside the route's general pools (9..14 caller-saved, 19 callee-saved)")
+  end
+end
+
+def x86_phys_name(phys: Int) -> String
+  match phys
+  when 9 then "r10"
+  when 10 then "r11"
+  when 11 then "rbx"
+  when 12 then "r12"
+  when 13 then "r13"
+  when 14 then "r14"
+  when 19 then "r15"
+  when _ then "phys" + phys.to_string()
+  end
+end
+
+# The allocator ids this route maps (the emitter's pools).
+def x86_pool_ids() -> Vec[Int]
+  Vec::from([9, 10, 11, 12, 13, 14])
+end
+
+def x86_cc_ids() -> Vec[Int]
+  Vec::from([19])
+end
+
+# Is the physical id one of the SysV callee-saved registers the pool map
+# can assign (rbx/r12/r13/r14 via the caller-saved pool's ids 11..14, and
+# r15 via the callee-saved id 19)?
+def x86_phys_is_callee_saved(phys: Int) -> Bool
+  phys == 11 || phys == 12 || phys == 13 || phys == 14 || phys == 19
+end
+
+# The callee-saved registers the function actually uses, ASCENDING by
+# machine code (rbx, r12, r13, r14, r15): every pool id whose segments
+# were assigned one of rbx/r12/r13/r14, plus the allocator's cc_used
+# (id 19 -> r15). The prologue saves exactly this list and the epilogue
+# restores it. Deterministic: the segment scan only builds a membership
+# set, the emitted order is the fixed ascending probe below.
+def x86_saved_regs(alloc: LirAlloc) -> Vec[X64]
+  var used: Set[Int] = Set::new()
+  let entries = alloc.segs_of.entries()
+  var ei = 0
+  while ei < entries.len() do
+    let segs = entries[ei].1
+    var si = 0
+    while si < segs.len() do
+      let p = segs[si].phys
+      if p >= 0 then
+        used.insert(p)
+      end
+      si = si + 1
+    end
+    ei = ei + 1
+  end
+  var ci = 0
+  while ci < alloc.cc_used.len() do
+    used.insert(alloc.cc_used[ci])
+    ci = ci + 1
+  end
+  var out: Vec[X64] = Vec::new()
+  if used.contains(11) then out.push(X64::RBX) end
+  if used.contains(12) then out.push(X64::R12) end
+  if used.contains(13) then out.push(X64::R13) end
+  if used.contains(14) then out.push(X64::R14) end
+  if used.contains(19) then out.push(X64::R15) end
+  out
+end
+
+# ———————————————————————————————————————————————————————————————
+# Frame model (spill slot i at [rbp - 8 - 8*i] — the LIR uniform model)
+# ———————————————————————————————————————————————————————————————
+# frame_total = 16-aligned(8*alloc.slots + 8*scratch + 8*save_count)
+# where scratch is the ONE emitter scratch slot at index alloc.slots
+# ([rbp - 8 - 8*alloc.slots]: the parked 64-bit immediate / divisor / a
+# switch operand) and save_count = x86_saved_regs(alloc).len(). Spill
+# slot i sits at [rbp - 8 - 8*i]; the saves sit at the frame bottom:
+# save k at [rbp - frame_total + 8*k]. The frame pointer is rbp and
+# frame_total % 16 == 0 keeps rsp 16-byte aligned at every call site
+# (into the function: rsp%16 == 8; push rbp: 0; sub frame_total: 0).
+
+def x86_align16(n: Int) -> Int
+  let rem = n % 16
+  if rem != 0 then
+    n + (16 - rem)
+  else
+    n
+  end
+end
+
+def x86_scratch_slot(alloc: LirAlloc) -> Int
+  alloc.slots
+end
+
+def x86_scratch_disp(alloc: LirAlloc) -> Int
+  lir_slot_offset(alloc.slots)
+end
+
+def x86_save_disp(frame_total: Int, k: Int) -> Int
+  -frame_total + 8 * k
+end
+
+def x86_frame_total(alloc: LirAlloc, save_count: Int) -> Int
+  x86_align16(8 * alloc.slots + 8 + 8 * save_count)
+end
+
+# ———————————————————————————————————————————————————————————————
+# The stage-1 allocation entry
+# ———————————————————————————————————————————————————————————————
+# The uniform 8-byte slot model (cm_word_slots false), the caller-saved
+# pool ids 9..14 mapped to r10/r11/rbx/r12/r13/r14, the callee-saved
+# class [19] mapped to r15, no FP pool (stage 1 has no FP surface) and
+# the pre-item-33 scan (cost_alloc false — the stage-1 route keeps the
+# byte-identical baseline allocation the emitter's assumptions were
+# validated against).
+def x86_alloc_registers(f: LirFunction) -> LirAlloc
+  lir_alloc_registers_mode(f, x86_cc_ids(), false, true, Vec::new(), false)
+end
+
+# ———————————————————————————————————————————————————————————————
+# Validation (fail-closed, mirroring backend_rv.tg's rv_validate_fn)
+# ———————————————————————————————————————————————————————————————
+# verify_lir's LirVerifyX86_64 route is the mandatory post-allocation
+# gate; this validator runs BEFORE the allocation (and again inside
+# x86_emit_fn) and names the stage-1 rule for every construct the
+# emitter cannot translate. Reaching an unimplemented arm of the emitter
+# after this is a backend divergence, never silent emission.
+
+# Does the fixed (precolored) id `id` have no register on this route?
+# Fixed general ids 0..5 map to the SysV argument registers; ids 6..7
+# (arguments 7..8) and the fixed float ids 8..15 (no FP arms in stage 1)
+# all fail closed.
+def x86_fixed_used_bad(id: Int) -> Bool
+  id >= 6 && id < lir_first_alloc_vreg()
+end
+
+def x86_validate_vreg(fn_name: String, id: Int, where: String) -> Result[Unit, String]
+  if x86_fixed_used_bad(id) then
+    return Result::Err("x86_64: " + fn_name + ": " + where + " uses fixed LIR vreg " + id.to_string() + ", which has no x86-64 stage-1 register (fixed 0..5 are rdi/rsi/rdx/rcx/r8/r9; fixed 6/7 are arguments 7/8 — SysV passes them on the stack — and fixed 8..15 are the float ABI file, a later stage) — fail-closed")
+  end
+  Result::Ok(())
+end
+
+# The non-move statement/terminator payloads must be ORDINARY vregs: the
+# fixed general ids 0..5 are ABI-defined at entry and are read/written
+# only by the entry binds and the pre-call argument moves (the LIR rule
+# the aarch64 rule 7 documents), so a fixed operand in an arithmetic,
+# compare, cset, switch, return or call position is a lowering
+# divergence — and on this route it would also collide with the shift
+# count register (rcx = fixed vreg 3) and the division accumulator.
+def x86_validate_ordinary(fn_name: String, id: Int, where: String) -> Result[Unit, String]
+  if id < lir_first_alloc_vreg() then
+    return Result::Err("x86_64: " + fn_name + ": " + where + " names precolored vreg " + id.to_string() + " — fixed general vregs appear only in entry binds and pre-call argument moves, never in arithmetic/compare/switch/return/call positions (fail-closed)")
+  end
+  Result::Ok(())
+end
+
+def x86_validate_fn(f: LirFunction) -> Result[Unit, String]
+  let fn_name = f.name.clone()
+  if f.params.len() > 6 then
+    return Result::Err("x86_64: " + fn_name + ": " + f.params.len().to_string() + " parameters — SysV passes only the first six in registers (rdi/rsi/rdx/rcx/r8/r9); the stack-argument stream is a later stage (fail-closed)")
+  end
+  if f.sret_words > 0 || f.sret_call_slots.len() > 0 then
+    return Result::Err("x86_64: " + fn_name + ": aggregate (sret) returns do not lower in stage 1 (the aggregate slice is an aarch64-route feature — fail-closed)")
+  end
+  if f.agg_slots > 0 || f.agg_word_slots.len() > 0 || f.agg_params.len() > 0 || f.agg_call_args.len() > 0 then
+    return Result::Err("x86_64: " + fn_name + ": aggregate locals/parameters/arguments do not lower in stage 1 (the aggregate slice is an aarch64-route feature — fail-closed)")
+  end
+  if f.fp_widths.len() > 0 then
+    return Result::Err("x86_64: " + fn_name + ": floating-point values do not lower in stage 1 (no SSE arms — fail-closed)")
+  end
+  var bi = 0
+  while bi < f.blocks.len() do
+    let block = f.blocks[bi]
+    var si = 0
+    while si < block.stmts.len() do
+      let stmt = block.stmts[si]
+      match stmt.ptr
+      when Option::Some(_) then
+        return Result::Err("x86_64: " + fn_name + ": pointer/atomic statements (LirStmt.ptr) do not lower in stage 1 (the pointer/atomic slice is a later stage — fail-closed)")
+      when Option::None then ()
+      end
+      match stmt.bm
+      when Option::Some(_) then
+        return Result::Err("x86_64: " + fn_name + ": register-class bit moves (LirStmt.bm) do not lower in stage 1 (no FP arms — fail-closed)")
+      when Option::None then ()
+      end
+      match stmt.vec
+      when Option::Some(_) then
+        return Result::Err("x86_64: " + fn_name + ": vector statements (LirStmt.vec) do not lower in stage 1 (no SSE/vector arms — fail-closed)")
+      when Option::None then ()
+      end
+      match stmt.kind
+      when LirStmtKind::LirMove(dst, val) then
+        match x86_validate_vreg(fn_name, dst, "a move destination") 
+        when Result::Err(e) then return Result::Err(e)
+        when Result::Ok(_) then ()
+        end
+        match val
+        when LirValue::LirReg(src) then
+          match x86_validate_vreg(fn_name, src, "a move source")
+          when Result::Err(e) then return Result::Err(e)
+          when Result::Ok(_) then ()
+          end
+        when LirValue::LirImm(_) then ()
+        end
+      when LirStmtKind::LirBinop(op, dst, left, right) then
+        match x86_validate_ordinary(fn_name, dst, "a binop destination")
+        when Result::Err(e) then return Result::Err(e)
+        when Result::Ok(_) then ()
+        end
+        match left
+        when LirValue::LirReg(lv) then
+          match x86_validate_ordinary(fn_name, lv, "a binop left operand")
+          when Result::Err(e) then return Result::Err(e)
+          when Result::Ok(_) then ()
+          end
+        when LirValue::LirImm(_) then
+          return Result::Err("x86_64: " + fn_name + ": binop left operand is an immediate — lowering never produces this (fail-closed)")
+        end
+        match right
+        when LirValue::LirReg(rv) then
+          match x86_validate_ordinary(fn_name, rv, "a binop right operand")
+          when Result::Err(e) then return Result::Err(e)
+          when Result::Ok(_) then ()
+          end
+        when LirValue::LirImm(_) then ()
+        end
+      when LirStmtKind::LirUnop(_, dst, src) then
+        match x86_validate_ordinary(fn_name, dst, "a unop destination")
+        when Result::Err(e) then return Result::Err(e)
+        when Result::Ok(_) then ()
+        end
+        match x86_validate_ordinary(fn_name, src, "a unop source")
+        when Result::Err(e) then return Result::Err(e)
+        when Result::Ok(_) then ()
+        end
+      when LirStmtKind::LirCmp(left, right) then
+        match left
+        when LirValue::LirReg(lv) then
+          match x86_validate_ordinary(fn_name, lv, "a compare left operand")
+          when Result::Err(e) then return Result::Err(e)
+          when Result::Ok(_) then ()
+          end
+        when LirValue::LirImm(_) then
+          return Result::Err("x86_64: " + fn_name + ": compare left operand is an immediate — lowering never produces this (fail-closed)")
+        end
+        match right
+        when LirValue::LirReg(rv) then
+          match x86_validate_ordinary(fn_name, rv, "a compare right operand")
+          when Result::Err(e) then return Result::Err(e)
+          when Result::Ok(_) then ()
+          end
+        when LirValue::LirImm(_) then ()
+        end
+      when LirStmtKind::LirCset(_, dst) then
+        match x86_validate_ordinary(fn_name, dst, "a cset destination")
+        when Result::Err(e) then return Result::Err(e)
+        when Result::Ok(_) then ()
+        end
+      when LirStmtKind::LirLoadFrame(_, off) then
+        return Result::Err("x86_64: " + fn_name + ": stack-parameter loads (LirLoadFrame at [FP+" + off.to_string() + "]) do not lower in stage 1 — SysV stack slots are 8 bytes, not the lowering's 16-byte aarch64 caller slots (fail-closed)")
+      when LirStmtKind::LirStaticLoad(_, _) then
+        return Result::Err("x86_64: " + fn_name + ": static-value loads (LirStaticLoad) do not lower in stage 1 — the .data image and its address relocations are a later stage (fail-closed)")
+      when LirStmtKind::LirPushArg(_) then
+        return Result::Err("x86_64: " + fn_name + ": caller stack-argument pushes (LirPushArg) do not lower in stage 1 — SysV stack slots are 8 bytes, not the lowering's 16-byte aarch64 caller slots (fail-closed)")
+      when LirStmtKind::LirFMove(_, _) then
+        return Result::Err("x86_64: " + fn_name + ": float statements do not lower in stage 1 (no SSE arms — fail-closed)")
+      when LirStmtKind::LirFBinop(_, _, _, _, _) then
+        return Result::Err("x86_64: " + fn_name + ": float statements do not lower in stage 1 (no SSE arms — fail-closed)")
+      when LirStmtKind::LirFNeg(_, _, _) then
+        return Result::Err("x86_64: " + fn_name + ": float statements do not lower in stage 1 (no SSE arms — fail-closed)")
+      when LirStmtKind::LirFCmp(_, _, _) then
+        return Result::Err("x86_64: " + fn_name + ": float statements do not lower in stage 1 (no SSE arms — fail-closed)")
+      when LirStmtKind::LirFConst(_, _, _) then
+        return Result::Err("x86_64: " + fn_name + ": float statements do not lower in stage 1 (no SSE arms — fail-closed)")
+      when LirStmtKind::LirIntToFloat(_, _, _, _) then
+        return Result::Err("x86_64: " + fn_name + ": float statements do not lower in stage 1 (no SSE arms — fail-closed)")
+      when LirStmtKind::LirFloatToInt(_, _, _) then
+        return Result::Err("x86_64: " + fn_name + ": float statements do not lower in stage 1 (no SSE arms — fail-closed)")
+      when LirStmtKind::LirFcvt(_, _, _) then
+        return Result::Err("x86_64: " + fn_name + ": float statements do not lower in stage 1 (no SSE arms — fail-closed)")
+      end
+      si = si + 1
+    end
+    match block.term.kind
+    when LirTermKind::LirSwitch(vreg, _, _) then
+      match x86_validate_ordinary(fn_name, vreg, "a switch operand")
+      when Result::Err(e) then return Result::Err(e)
+      when Result::Ok(_) then ()
+      end
+    when LirTermKind::LirRet(opt_v) then
+      match opt_v
+      when Option::Some(v) then
+        match x86_validate_ordinary(fn_name, v, "a return value")
+        when Result::Err(e) then return Result::Err(e)
+        when Result::Ok(_) then ()
+        end
+      when Option::None then ()
+      end
+    when LirTermKind::LirCall(target, args, stack_args, dest, _) then
+      if args.len() > 6 then
+        return Result::Err("x86_64: " + fn_name + ": call to `" + target + "` carries " + args.len().to_string() + " register arguments — SysV passes only six in registers (fail-closed)")
+      end
+      if stack_args != 0 then
+        return Result::Err("x86_64: " + fn_name + ": call to `" + target + "` carries caller stack slots — stage 1 has no SysV stack-argument stream (fail-closed)")
+      end
+      var ai = 0
+      while ai < args.len() do
+        match x86_validate_ordinary(fn_name, args[ai], "a call argument")
+        when Result::Err(e) then return Result::Err(e)
+        when Result::Ok(_) then ()
+        end
+        ai = ai + 1
+      end
+      match dest
+      when Option::Some(dv) then
+        match x86_validate_ordinary(fn_name, dv, "a call destination")
+        when Result::Err(e) then return Result::Err(e)
+        when Result::Ok(_) then ()
+        end
+      when Option::None then ()
+      end
+    when LirTermKind::LirJump(_) then ()
+    when LirTermKind::LirTrap then ()
+    end
+    bi = bi + 1
+  end
+  Result::Ok(())
+end
+
+# ———————————————————————————————————————————————————————————————
+# Value resolution (mirroring backend_rv.tg's rv_def_target/rv_emit_use)
+# ———————————————————————————————————————————————————————————————
+
+# The destination of a def at position `pos`: the segment's register
+# (through the pool map) or the RAX temp with a pending spill-slot store.
+struct X86DefTarget
+  reg: X64
+  store_slot: Int
+end
+
+def x86_def_target(alloc: LirAlloc, vreg: Int, pos: Int) -> X86DefTarget
+  if vreg < lir_first_alloc_vreg() then
+    return X86DefTarget { reg: x86_fixed_phys(vreg), store_slot: -1 }
+  end
+  match alloc.segs_of.get(vreg)
+  when Option::Some(segs) then
+    match lir_seg_at(segs, pos)
+    when Option::Some(s) then
+      if s.phys >= 0 then
+        X86DefTarget { reg: x86_phys_of(s.phys), store_slot: -1 }
+      else
+        if s.slot < 0 then
+          panic("x86_64: memory-resident def of vreg " + vreg.to_string() + " has no slot (a rematerialized/aggregate home this route does not allocate — x86_alloc_registers passes cost_alloc false) — fail-closed")
+        end
+        X86DefTarget { reg: X64::RAX, store_slot: s.slot }
+      end
+    when Option::None then
+      panic("x86_64: def outside any interval for vreg " + vreg.to_string())
+    end
+  when Option::None then
+    # Never-occurring vreg (an unused parameter bind still emits).
+    X86DefTarget { reg: X64::RAX, store_slot: -1 }
+  end
+end
+
+# Materialize the value of `val` at position `pos` into a register:
+#   - LirImm: x86_mov_ri64 into `pref` (always the full 64-bit movabs —
+#     exact for every Int payload, never a truncated sign-extended form);
+#   - a fixed vreg: its ABI register directly;
+#   - an ordinary vreg: its segment register (reloading the slot first
+#     when a reload record exists at (pos, vreg) — invariant I2) or
+#     `pref` for a memory-resident segment.
+# Internal invariant breaks (a def outside its hull) panic, exactly like
+# backend_rv.tg's rv_emit_use; every construct-level rejection happens in
+# x86_validate_fn / the statement arms.
+def x86_emit_use(inout xe: X86Emit, alloc: LirAlloc, val: LirValue, pos: Int, pref: X64) -> X64
+  match val
+  when LirValue::LirImm(imm) then
+    x86_emit(&mut xe.buf, x86_mov_ri64(pref, imm))
+    pref
+  when LirValue::LirReg(vreg) then
+    if vreg < lir_first_alloc_vreg() then
+      return x86_fixed_phys(vreg)
+    end
+    match alloc.segs_of.get(vreg)
+    when Option::Some(segs) then
+      match lir_seg_at(segs, pos)
+      when Option::Some(s) then
+        if s.phys >= 0 then
+          let pr = x86_phys_of(s.phys)
+          if lir_reload_at(alloc.reloads, pos, vreg) then
+            x86_emit(&mut xe.buf, x86_mov_rm(pr, X64::RBP, lir_slot_offset(s.slot)))
+          end
+          pr
+        else
+          if s.slot < 0 then
+            panic("x86_64: memory-resident use of vreg " + vreg.to_string() + " has no slot (a rematerialized/aggregate home this route does not allocate) — fail-closed")
+          end
+          x86_emit(&mut xe.buf, x86_mov_rm(pref, X64::RBP, lir_slot_offset(s.slot)))
+          pref
+        end
+      when Option::None then
+        panic("x86_64: use outside any interval for vreg " + vreg.to_string())
+      end
+    when Option::None then
+      panic("x86_64: use of vreg with no intervals: " + vreg.to_string())
+    end
+  end
+end
+
+# The spill-slot displacement of a MEMORY-RESIDENT ordinary vreg at
+# `pos` (the memory-operand shortcut: x86 ALU/idiv/imul forms read
+# [rbp + disp] directly, so the emitter never needs a second temp for a
+# spilled right operand). Option::None for fixed/register-resident
+# values and immediates.
+def x86_mem_disp_of(alloc: LirAlloc, val: LirValue, pos: Int) -> Option[Int]
+  match val
+  when LirValue::LirReg(vreg) then
+    if vreg < lir_first_alloc_vreg() then
+      return Option::None
+    end
+    match alloc.segs_of.get(vreg)
+    when Option::Some(segs) then
+      match lir_seg_at(segs, pos)
+      when Option::Some(s) then
+        if s.phys < 0 then
+          if s.slot < 0 then
+            panic("x86_64: memory-resident operand " + vreg.to_string() + " has no slot (a rematerialized/aggregate home this route does not allocate) — fail-closed")
+          end
+          Option::Some(lir_slot_offset(s.slot))
+        else
+          Option::None
+        end
+      when Option::None then
+        panic("x86_64: operand use outside any interval for vreg " + vreg.to_string())
+      end
+    when Option::None then
+      panic("x86_64: operand use of vreg with no intervals: " + vreg.to_string())
+    end
+  when LirValue::LirImm(_) then
+    Option::None
+  end
+end
+
+# Park `imm` in the emitter scratch slot so a memory operand can read it
+# later ([rbp - 8 - 8*alloc.slots]). This CLOBBERS RAX: callers invoke it
+# before resolving any left/dividend operand into RAX.
+def x86_emit_imm_to_scratch(inout xe: X86Emit, alloc: LirAlloc, imm: Int) -> Unit
+  x86_emit(&mut xe.buf, x86_mov_ri64(X64::RAX, imm))
+  x86_emit(&mut xe.buf, x86_mov_mr(X64::RBP, x86_scratch_disp(alloc), X64::RAX))
+end
+
+# Store a register-resident def back to its spill slot.
+def x86_store_def(inout xe: X86Emit, dt: X86DefTarget) -> Unit
+  if dt.store_slot >= 0 then
+    x86_emit(&mut xe.buf, x86_mov_mr(X64::RBP, lir_slot_offset(dt.store_slot), dt.reg))
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# The statement emitter
+# ———————————————————————————————————————————————————————————————
+# Every arm mirrors the aarch64 emitter's semantics over the SysV
+# register model. The x86 flags carry LirCmp (like the aarch64 NZCV), so
+# the Cmp/Cset pair emits cmp at the Cmp position and setcc+movzx at the
+# adjacent Cset — the pair is adjacent by invariant I1 and the emitter
+# panics if any other statement or terminator interleaves.
+
+def x86_alu_op_rr(op: LirBinOp) -> Int
+  match op
+  when LirBinOp::LirAdd then 0x01
+  when LirBinOp::LirOr then 0x09
+  when LirBinOp::LirAnd then 0x21
+  when LirBinOp::LirSub then 0x29
+  when LirBinOp::LirXor then 0x31
+  when _ then panic("x86_64: no two-operand ALU opcode for this binop")
+  end
+end
+
+def x86_alu_op_rm(op: LirBinOp) -> Int
+  match op
+  when LirBinOp::LirAdd then 0x03
+  when LirBinOp::LirOr then 0x0B
+  when LirBinOp::LirAnd then 0x23
+  when LirBinOp::LirSub then 0x2B
+  when LirBinOp::LirXor then 0x33
+  when _ then panic("x86_64: no register-memory ALU opcode for this binop")
+  end
+end
+
+def x86_alu_ext(op: LirBinOp) -> Int
+  match op
+  when LirBinOp::LirAdd then 0
+  when LirBinOp::LirOr then 1
+  when LirBinOp::LirAnd then 4
+  when LirBinOp::LirSub then 5
+  when LirBinOp::LirXor then 6
+  when _ then panic("x86_64: no immediate ALU extension for this binop")
+  end
+end
+
+def x86_shift_ext(op: LirBinOp) -> Int
+  match op
+  when LirBinOp::LirShl then 4
+  when LirBinOp::LirLsr then 5
+  when LirBinOp::LirAsr then 7
+  when _ then panic("x86_64: not a shift op")
+  end
+end
+
+# LirMove: dst <- imm (movabs) / dst <- register.
+def x86_emit_move(inout xe: X86Emit, alloc: LirAlloc, dst: Int, val: LirValue, pos: Int) -> Result[Unit, String]
+  let dt = x86_def_target(alloc, dst, pos)
+  match val
+  when LirValue::LirImm(imm) then
+    x86_emit(&mut xe.buf, x86_mov_ri64(dt.reg, imm))
+  when LirValue::LirReg(_) then
+    let sr = x86_emit_use(xe, alloc, val, pos, X64::RAX)
+    if sr != dt.reg then
+      x86_emit(&mut xe.buf, x86_mov_rr(dt.reg, sr))
+    end
+  end
+  x86_store_def(xe, dt)
+  Result::Ok(())
+end
+
+# LirBinop: dst = left op right. The left operand resolves into a
+# register (`lr`); the destination then receives left (unless it already
+# is the resolved register) and the operation runs register-register,
+# register-immediate (the sign-extended imm32 forms), or — for a
+# 64-bit immediate that does not fit imm32 and for a memory-resident
+# right operand — through the parked scratch slot or the [rbp+disp]
+# memory-operand forms. RAX is the only statement temp; the scratch
+# parking happens BEFORE the left operand is resolved so RAX is free.
+def x86_emit_binop(inout xe: X86Emit, alloc: LirAlloc, op: LirBinOp, dst: Int, left: LirValue, right: LirValue, pos: Int) -> Result[Unit, String]
+  let dt = x86_def_target(alloc, dst, pos)
+  var right_parked = false
+  match right
+  when LirValue::LirImm(imm) then
+    if !x86_imm32_ok(imm) then
+      x86_emit_imm_to_scratch(xe, alloc, imm)
+      right_parked = true
+    end
+  when _ then ()
+  end
+  var lr = X64::RAX
+  match left
+  when LirValue::LirImm(_) then
+    return Result::Err("x86_64: binop left operand is an immediate — lowering never produces this (fail-closed)")
+  when LirValue::LirReg(lv) then
+    match x86_mem_disp_of(alloc, left, pos)
+    when Option::Some(d) then
+      x86_emit(&mut xe.buf, x86_mov_rm(X64::RAX, X64::RBP, d))
+      lr = X64::RAX
+    when Option::None then
+      lr = x86_emit_use(xe, alloc, left, pos, X64::RAX)
+    end
+  end
+  if dt.reg != lr then
+    x86_emit(&mut xe.buf, x86_mov_rr(dt.reg, lr))
+  end
+  let dest = dt.reg
+  match right
+  when LirValue::LirImm(imm) then
+    if right_parked then
+      if op == LirBinOp::LirMul then
+        x86_emit(&mut xe.buf, x86_imul_rm(dest, X64::RBP, x86_scratch_disp(alloc)))
+      else
+        x86_emit(&mut xe.buf, x86_alu_rm(x86_alu_op_rm(op), dest, X64::RBP, x86_scratch_disp(alloc)))
+      end
+    else
+      if op == LirBinOp::LirMul then
+        x86_emit(&mut xe.buf, x86_imul_rri(dest, dest, imm))
+      else
+        x86_emit(&mut xe.buf, x86_alu_ri(x86_alu_ext(op), dest, imm))
+      end
+    end
+  when LirValue::LirReg(_) then
+    match x86_mem_disp_of(alloc, right, pos)
+    when Option::Some(d) then
+      if op == LirBinOp::LirMul then
+        x86_emit(&mut xe.buf, x86_imul_rm(dest, X64::RBP, d))
+      else
+        x86_emit(&mut xe.buf, x86_alu_rm(x86_alu_op_rm(op), dest, X64::RBP, d))
+      end
+    when Option::None then
+      let rr = x86_emit_use(xe, alloc, right, pos, X64::RAX)
+      if rr == dest then
+        panic("x86_64: allocator divergence: a binop destination and its right operand share one physical register (overlapping segments in one pool)")
+      end
+      if op == LirBinOp::LirMul then
+        x86_emit(&mut xe.buf, x86_imul_rr(dest, rr))
+      else
+        x86_emit(&mut xe.buf, x86_alu_rr(x86_alu_op_rr(op), dest, rr))
+      end
+    end
+  end
+  x86_store_def(xe, dt)
+  Result::Ok(())
+end
+
+# LirBinop shifts: the count crosses in the architectural CL register.
+# RCX is fixed LIR vreg 3 (the fourth argument register): its only LIR
+# live ranges are the entry binds and the pre-call argument moves, and
+# neither sequence contains a shift statement, so moving the count into
+# rcx at a shift position never destroys a live value.
+def x86_emit_shift(inout xe: X86Emit, alloc: LirAlloc, op: LirBinOp, dst: Int, left: LirValue, right: LirValue, pos: Int) -> Result[Unit, String]
+  let dt = x86_def_target(alloc, dst, pos)
+  # Count first (it uses only rcx / its own register).
+  match right
+  when LirValue::LirImm(_) then ()
+  when LirValue::LirReg(_) then
+    match x86_mem_disp_of(alloc, right, pos)
+    when Option::Some(d) then
+      x86_emit(&mut xe.buf, x86_mov_rm(X64::RCX, X64::RBP, d))
+    when Option::None then
+      let rr = x86_emit_use(xe, alloc, right, pos, X64::RAX)
+      if rr != X64::RCX then
+        x86_emit(&mut xe.buf, x86_mov_rr(X64::RCX, rr))
+      end
+    end
+  end
+  var lr = X64::RAX
+  match left
+  when LirValue::LirImm(_) then
+    return Result::Err("x86_64: shift left operand is an immediate — lowering never produces this (fail-closed)")
+  when LirValue::LirReg(_) then
+    match x86_mem_disp_of(alloc, left, pos)
+    when Option::Some(d) then
+      x86_emit(&mut xe.buf, x86_mov_rm(X64::RAX, X64::RBP, d))
+      lr = X64::RAX
+    when Option::None then
+      lr = x86_emit_use(xe, alloc, left, pos, X64::RAX)
+    end
+  end
+  if dt.reg != lr then
+    x86_emit(&mut xe.buf, x86_mov_rr(dt.reg, lr))
+  end
+  match right
+  when LirValue::LirImm(imm) then
+    x86_emit(&mut xe.buf, x86_shift_imm(x86_shift_ext(op), dt.reg, imm))
+  when LirValue::LirReg(_) then
+    x86_emit(&mut xe.buf, x86_shift_cl(x86_shift_ext(op), dt.reg))
+  end
+  x86_store_def(xe, dt)
+  Result::Ok(())
+end
+
+# LirUnop: neg / bit-not.
+def x86_emit_unop(inout xe: X86Emit, alloc: LirAlloc, op: LirUnOp, dst: Int, src: Int, pos: Int) -> Result[Unit, String]
+  let dt = x86_def_target(alloc, dst, pos)
+  var sr = X64::RAX
+  match x86_mem_disp_of(alloc, LirValue::LirReg(src), pos)
+  when Option::Some(d) then
+    x86_emit(&mut xe.buf, x86_mov_rm(X64::RAX, X64::RBP, d))
+    sr = X64::RAX
+  when Option::None then
+    sr = x86_emit_use(xe, alloc, LirValue::LirReg(src), pos, X64::RAX)
+  end
+  if dt.reg != sr then
+    x86_emit(&mut xe.buf, x86_mov_rr(dt.reg, sr))
+  end
+  match op
+  when LirUnOp::LirNeg then
+    x86_emit(&mut xe.buf, x86_neg_r(dt.reg))
+  when LirUnOp::LirBitNot then
+    x86_emit(&mut xe.buf, x86_not_r(dt.reg))
+  end
+  x86_store_def(xe, dt)
+  Result::Ok(())
+end
+
+# LirCmp: emit `cmp left, right`. The flags stay live until the adjacent
+# LirCset (invariant I1). A 64-bit immediate that does not fit imm32
+# parks in the scratch slot first.
+def x86_emit_cmp(inout xe: X86Emit, alloc: LirAlloc, left: LirValue, right: LirValue, pos: Int) -> Result[Unit, String]
+  var right_parked = false
+  match right
+  when LirValue::LirImm(imm) then
+    if !x86_imm32_ok(imm) then
+      x86_emit_imm_to_scratch(xe, alloc, imm)
+      right_parked = true
+    end
+  when _ then ()
+  end
+  var lr = X64::RAX
+  match left
+  when LirValue::LirImm(_) then
+    return Result::Err("x86_64: compare left operand is an immediate — lowering never produces this (fail-closed)")
+  when LirValue::LirReg(_) then
+    match x86_mem_disp_of(alloc, left, pos)
+    when Option::Some(d) then
+      x86_emit(&mut xe.buf, x86_mov_rm(X64::RAX, X64::RBP, d))
+      lr = X64::RAX
+    when Option::None then
+      lr = x86_emit_use(xe, alloc, left, pos, X64::RAX)
+    end
+  end
+  match right
+  when LirValue::LirImm(imm) then
+    if right_parked then
+      x86_emit(&mut xe.buf, x86_alu_rm(0x3B, lr, X64::RBP, x86_scratch_disp(alloc)))
+    else
+      x86_emit(&mut xe.buf, x86_alu_ri(7, lr, imm))
+    end
+  when LirValue::LirReg(_) then
+    match x86_mem_disp_of(alloc, right, pos)
+    when Option::Some(d) then
+      x86_emit(&mut xe.buf, x86_alu_rm(0x3B, lr, X64::RBP, d))
+    when Option::None then
+      let rr = x86_emit_use(xe, alloc, right, pos, X64::RAX)
+      x86_emit(&mut xe.buf, x86_alu_rr(0x39, lr, rr))
+    end
+  end
+  if xe.pending_cmp then
+    panic("x86_64: nested LirCmp (invariant I1: each LirCmp is consumed by the adjacent LirCset)")
+  end
+  xe.pending_cmp = true
+  Result::Ok(())
+end
+
+# LirCset: materialize the 0/1 comparison result from the live flags.
+def x86_emit_cset(inout xe: X86Emit, alloc: LirAlloc, cond: LirCond, dst: Int, pos: Int) -> Result[Unit, String]
+  if !xe.pending_cmp then
+    panic("x86_64: LirCset with no preceding LirCmp in program order (invariant I1)")
+  end
+  let dt = x86_def_target(alloc, dst, pos)
+  x86_emit(&mut xe.buf, x86_setcc(x86_cc_of(cond), dt.reg))
+  x86_emit(&mut xe.buf, x86_movzx_r64_r8(dt.reg, dt.reg))
+  x86_store_def(xe, dt)
+  xe.pending_cmp = false
+  Result::Ok(())
+end
+
+# LirBinop with the division marker: dst = num / den with the quotient
+# in RAX. Signed: cqo + idiv; unsigned: zero RDX + div. The divisor may
+# be a register, a memory-resident vreg ([rbp+disp]) or — when it sits
+# in RDX, which cqo / the RDX zeroing would destroy — the parked scratch
+# slot. The dividend is copied to RAX first, so a dividend in RDX also
+# survives the setup.
+def x86_emit_div(inout xe: X86Emit, alloc: LirAlloc, dop: LirDivOp, dst: Int, left: LirValue, right: LirValue, pos: Int) -> Result[Unit, String]
+  let dt = x86_def_target(alloc, dst, pos)
+  # Park an immediate divisor (lowering materializes constants — this is
+  # the defensive arm) before RAX is used.
+  var den_is_mem = false
+  var den_disp = 0
+  match right
+  when LirValue::LirImm(imm) then
+    x86_emit_imm_to_scratch(xe, alloc, imm)
+    den_is_mem = true
+    den_disp = x86_scratch_disp(alloc)
+  when LirValue::LirReg(_) then ()
+  end
+  # Dividend -> RAX (never RAX already: RAX is not an allocatable id).
+  match left
+  when LirValue::LirImm(_) then
+    return Result::Err("x86_64: division dividend is an immediate — lowering never produces this (fail-closed)")
+  when LirValue::LirReg(_) then
+    match x86_mem_disp_of(alloc, left, pos)
+    when Option::Some(d) then
+      x86_emit(&mut xe.buf, x86_mov_rm(X64::RAX, X64::RBP, d))
+    when Option::None then
+      let nr = x86_emit_use(xe, alloc, left, pos, X64::RAX)
+      if nr != X64::RAX then
+        x86_emit(&mut xe.buf, x86_mov_rr(X64::RAX, nr))
+      end
+    end
+  end
+  var den_reg = X64::RAX
+  match right
+  when LirValue::LirImm(_) then ()
+  when LirValue::LirReg(_) then
+    match x86_mem_disp_of(alloc, right, pos)
+    when Option::Some(d) then
+      den_is_mem = true
+      den_disp = d
+    when Option::None then
+      let dr = x86_emit_use(xe, alloc, right, pos, X64::RAX)
+      if dr == X64::RDX then
+        # cqo / the RDX zeroing would destroy an RDX divisor: park it.
+        x86_emit(&mut xe.buf, x86_mov_mr(X64::RBP, x86_scratch_disp(alloc), X64::RDX))
+        den_is_mem = true
+        den_disp = x86_scratch_disp(alloc)
+      else
+        den_reg = dr
+      end
+    end
+  end
+  match dop
+  when LirDivOp::LirUdiv then
+    x86_emit(&mut xe.buf, x86_alu_rr(0x31, X64::RDX, X64::RDX))
+  when LirDivOp::LirSdiv then
+    x86_emit(&mut xe.buf, x86_cqo())
+  end
+  if den_is_mem then
+    match dop
+    when LirDivOp::LirUdiv then
+      x86_emit(&mut xe.buf, x86_div_rm(X64::RBP, den_disp))
+    when LirDivOp::LirSdiv then
+      x86_emit(&mut xe.buf, x86_idiv_rm(X64::RBP, den_disp))
+    end
+  else
+    match dop
+    when LirDivOp::LirUdiv then
+      x86_emit(&mut xe.buf, x86_div_r(den_reg))
+    when LirDivOp::LirSdiv then
+      x86_emit(&mut xe.buf, x86_idiv_r(den_reg))
+    end
+  end
+  if dt.reg != X64::RAX then
+    x86_emit(&mut xe.buf, x86_mov_rr(dt.reg, X64::RAX))
+  end
+  x86_store_def(xe, dt)
+  Result::Ok(())
+end
+
+# The nominal-kind emitter. Every arm is explicit; the constructs outside
+# the stage-1 surface return Err naming the rule (x86_validate_fn already
+# rejected them — the arms are defense in depth and never silently emit).
+def x86_emit_kind(inout xe: X86Emit, alloc: LirAlloc, kind: LirStmtKind, pos: Int) -> Result[Unit, String]
+  match kind
+  when LirStmtKind::LirMove(dst, val) then
+    x86_emit_move(xe, alloc, dst, val, pos)
+  when LirStmtKind::LirBinop(op, dst, left, right) then
+    if op == LirBinOp::LirShl || op == LirBinOp::LirAsr || op == LirBinOp::LirLsr then
+      x86_emit_shift(xe, alloc, op, dst, left, right, pos)
+    else
+      x86_emit_binop(xe, alloc, op, dst, left, right, pos)
+    end
+  when LirStmtKind::LirUnop(op, dst, src) then
+    x86_emit_unop(xe, alloc, op, dst, src, pos)
+  when LirStmtKind::LirCmp(left, right) then
+    x86_emit_cmp(xe, alloc, left, right, pos)
+  when LirStmtKind::LirCset(cond, dst) then
+    x86_emit_cset(xe, alloc, cond, dst, pos)
+  when LirStmtKind::LirLoadFrame(_, _) then
+    Result::Err("x86_64: LirLoadFrame does not lower in stage 1 — SysV stack slots are 8 bytes, not the lowering's 16-byte aarch64 caller slots (fail-closed)")
+  when LirStmtKind::LirStaticLoad(_, _) then
+    Result::Err("x86_64: LirStaticLoad does not lower in stage 1 — the .data image and its address relocations are a later stage (fail-closed)")
+  when LirStmtKind::LirPushArg(_) then
+    Result::Err("x86_64: LirPushArg does not lower in stage 1 — the SysV stack-argument stream is a later stage (fail-closed)")
+  when LirStmtKind::LirFMove(_, _) then
+    Result::Err("x86_64: float statements do not lower in stage 1 (no SSE arms — fail-closed)")
+  when LirStmtKind::LirFBinop(_, _, _, _, _) then
+    Result::Err("x86_64: float statements do not lower in stage 1 (no SSE arms — fail-closed)")
+  when LirStmtKind::LirFNeg(_, _, _) then
+    Result::Err("x86_64: float statements do not lower in stage 1 (no SSE arms — fail-closed)")
+  when LirStmtKind::LirFCmp(_, _, _) then
+    Result::Err("x86_64: float statements do not lower in stage 1 (no SSE arms — fail-closed)")
+  when LirStmtKind::LirFConst(_, _, _) then
+    Result::Err("x86_64: float statements do not lower in stage 1 (no SSE arms — fail-closed)")
+  when LirStmtKind::LirIntToFloat(_, _, _, _) then
+    Result::Err("x86_64: float statements do not lower in stage 1 (no SSE arms — fail-closed)")
+  when LirStmtKind::LirFloatToInt(_, _, _) then
+    Result::Err("x86_64: float statements do not lower in stage 1 (no SSE arms — fail-closed)")
+  when LirStmtKind::LirFcvt(_, _, _) then
+    Result::Err("x86_64: float statements do not lower in stage 1 (no SSE arms — fail-closed)")
+  end
+end
+
+# Emit one LIR statement. Marker dispatch first: pointer/atomic (ptr)
+# and bit-move (bm) markers fail closed; a division-marked statement
+# routes to the idiv/div arm. Invariant I1 is checked here: a pending
+# compare must be consumed by the very next statement (the adjacent
+# LirCset).
+def x86_emit_stmt(inout xe: X86Emit, alloc: LirAlloc, stmt: LirStmt, pos: Int) -> Result[Unit, String]
+  match stmt.ptr
+  when Option::Some(_) then
+    return Result::Err("x86_64: pointer/atomic statements do not lower in stage 1 (fail-closed)")
+  when Option::None then ()
+  end
+  match stmt.bm
+  when Option::Some(_) then
+    return Result::Err("x86_64: register-class bit moves do not lower in stage 1 (fail-closed)")
+  when Option::None then ()
+  end
+  match stmt.vec
+  when Option::Some(_) then
+    return Result::Err("x86_64: vector statements do not lower in stage 1 (no SSE/vector arms — fail-closed)")
+  when Option::None then ()
+  end
+  match stmt.kind
+  when LirStmtKind::LirCset(_, _) then ()
+  when _ then
+    if xe.pending_cmp then
+      panic("x86_64: a statement between LirCmp and LirCset (invariant I1)")
+    end
+  end
+  match stmt.div
+  when Option::Some(dop) then
+    match stmt.kind
+    when LirStmtKind::LirBinop(_, dst, left, right) then
+      x86_emit_div(xe, alloc, dop, dst, left, right, pos)
+    when _ then
+      Result::Err("x86_64: division marker on a non-binop carrier (the marker rides the arity-exact LirBinop Mul shape)")
+    end
+  when Option::None then
+    x86_emit_kind(xe, alloc, stmt.kind, pos)
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Terminators, prologue/epilogue and the function driver
+# ———————————————————————————————————————————————————————————————
+
+# Pre-call spill stores (invariant I2): register-resident pre-call
+# segments whose end precedes the call at `pos` store to their slots.
+# The matching post-call reloads happen at each value's first read
+# (x86_emit_use's alloc.reloads lookup).
+def x86_emit_call_spills(inout xe: X86Emit, alloc: LirAlloc, pos: Int) -> Unit
+  var i = 0
+  while i < alloc.spills.len() do
+    if alloc.spills[i].0 == pos then
+      let vreg = alloc.spills[i].1
+      match alloc.segs_of.get(vreg)
+      when Option::Some(segs) then
+        match lir_seg_at(segs, pos - 1)
+        when Option::Some(s) then
+          if s.phys >= 0 && s.slot >= 0 then
+            x86_emit(&mut xe.buf, x86_mov_mr(X64::RBP, lir_slot_offset(s.slot), x86_phys_of(s.phys)))
+          end
+        when Option::None then ()
+        end
+      when Option::None then ()
+      end
+    end
+    i = i + 1
+  end
+end
+
+def x86_emit_term(inout xe: X86Emit, alloc: LirAlloc, fn_name: String, kind: LirTermKind, pos: Int, externs: Set[String], defined: Set[String]) -> Result[Unit, String]
+  if xe.pending_cmp then
+    panic("x86_64: terminator reached with a LirCmp still pending (invariant I1)")
+  end
+  match kind
+  when LirTermKind::LirJump(target) then
+    x86_emit_jmp_label(xe, lir_block_label(fn_name, target))
+    Result::Ok(())
+  when LirTermKind::LirSwitch(vreg, arms, default_target) then
+    # The per-arm compare chain: the operand resolves once at the term
+    # position, each arm compares against an imm32 / a movabs'd RAX /
+    # the parked scratch, and the default is an unconditional jump.
+    let operand = x86_emit_use(xe, alloc, LirValue::LirReg(vreg), pos, X64::RAX)
+    var ai = 0
+    while ai < arms.len() do
+      let arm = arms[ai]
+      if arm.value == 0 then
+        x86_emit(&mut xe.buf, x86_alu_ri(7, operand, 0))
+        x86_emit_jcc_label(xe, LirCond::LirEq, lir_block_label(fn_name, arm.target))
+      elsif x86_imm32_ok(arm.value) then
+        x86_emit(&mut xe.buf, x86_alu_ri(7, operand, arm.value))
+        x86_emit_jcc_label(xe, LirCond::LirEq, lir_block_label(fn_name, arm.target))
+      elsif operand != X64::RAX then
+        x86_emit(&mut xe.buf, x86_mov_ri64(X64::RAX, arm.value))
+        x86_emit(&mut xe.buf, x86_alu_rr(0x39, operand, X64::RAX))
+        x86_emit_jcc_label(xe, LirCond::LirEq, lir_block_label(fn_name, arm.target))
+      else
+        x86_emit(&mut xe.buf, x86_mov_mr(X64::RBP, x86_scratch_disp(alloc), X64::RAX))
+        x86_emit(&mut xe.buf, x86_mov_ri64(X64::RAX, arm.value))
+        x86_emit(&mut xe.buf, x86_alu_rm(0x3B, X64::RAX, X64::RBP, x86_scratch_disp(alloc)))
+        x86_emit_jcc_label(xe, LirCond::LirEq, lir_block_label(fn_name, arm.target))
+      end
+      ai = ai + 1
+    end
+    x86_emit_jmp_label(xe, lir_block_label(fn_name, default_target))
+    Result::Ok(())
+  when LirTermKind::LirRet(opt_v) then
+    match opt_v
+    when Option::Some(vreg) then
+      let sr = x86_emit_use(xe, alloc, LirValue::LirReg(vreg), pos, X64::RAX)
+      if sr != X64::RAX then
+        x86_emit(&mut xe.buf, x86_mov_rr(X64::RAX, sr))
+      end
+    when Option::None then ()
+    end
+    # The epilogue leaves RAX untouched (the saved registers are
+    # rbx/r12..r15), so the return value survives leave/ret.
+    x86_emit_epilogue(xe, alloc)
+    Result::Ok(())
+  when LirTermKind::LirTrap then
+    x86_emit(&mut xe.buf, x86_ud2())
+    Result::Ok(())
+  when LirTermKind::LirCall(target, args, stack_args, dest, success) then
+    if stack_args != 0 then
+      return Result::Err("x86_64: call to `" + target + "` carries caller stack slots — stage 1 has no SysV stack-argument stream (fail-closed)")
+    end
+    x86_emit_call_spills(xe, alloc, pos)
+    # The lowering's register argument moves are ordinary statements
+    # into the fixed vregs 0..5 (rdi/rsi/rdx/rcx/r8/r9), so `args`
+    # needs no read here. A target that is a defined program function
+    # (self-recursion included) defers a rel32 patch; an extern (or a
+    # target that is neither defined nor declared extern — the
+    # defensive rule backend_rv.tg also keeps) emits a PLT32 relocation.
+    if externs.contains(&target) || !defined.contains(&target) then
+      x86_emit_call_remote(xe, target)
+    else
+      x86_emit_call_label(xe, target)
+    end
+    match dest
+    when Option::Some(dv) then
+      let dt = x86_def_target(alloc, dv, pos)
+      if dt.reg != X64::RAX then
+        x86_emit(&mut xe.buf, x86_mov_rr(dt.reg, X64::RAX))
+      end
+      x86_store_def(xe, dt)
+    when Option::None then ()
+    end
+    x86_emit_jmp_label(xe, lir_block_label(fn_name, success))
+    Result::Ok(())
+  end
+end
+
+# Prologue: push rbp; mov rbp, rsp; sub rsp, frame_total; save the used
+# callee-saved registers at the frame bottom (save k at
+# [rbp - frame_total + 8*k]).
+def x86_emit_prologue(inout xe: X86Emit, frame_total: Int, saved: Vec[X64]) -> Unit
+  x86_emit(&mut xe.buf, x86_push_r(X64::RBP))
+  x86_emit(&mut xe.buf, x86_mov_rr(X64::RBP, X64::RSP))
+  if frame_total > 0 then
+    x86_emit(&mut xe.buf, x86_alu_ri(5, X64::RSP, frame_total))
+  end
+  var k = 0
+  while k < saved.len() do
+    x86_emit(&mut xe.buf, x86_mov_mr(X64::RBP, x86_save_disp(frame_total, k), saved[k]))
+    k = k + 1
+  end
+end
+
+# Epilogue: restore the callee-saved registers, leave (rsp = rbp; pop
+# rbp), ret. The return value travels in RAX and is not among the saved
+# registers.
+def x86_emit_epilogue(inout xe: X86Emit, alloc: LirAlloc) -> Unit
+  let saved = x86_saved_regs(alloc)
+  let frame_total = x86_frame_total(alloc, saved.len())
+  var k = saved.len() - 1
+  while k >= 0 do
+    x86_emit(&mut xe.buf, x86_mov_rm(saved[k], X64::RBP, x86_save_disp(frame_total, k)))
+    k = k - 1
+  end
+  x86_emit(&mut xe.buf, x86_leave())
+  x86_emit(&mut xe.buf, x86_ret())
+end
+
+# Emit ONE LIR function into the shared program emit state: the function
+# symbol + entry label, the prologue, then the blocks with the SAME
+# position walk the allocator used (invariant I3). The pending-compare
+# record resets at every block boundary (lowering never leaves one
+# pending).
+def x86_emit_fn(inout xe: X86Emit, lir_fn: LirFunction, alloc: LirAlloc, externs: Set[String], defined: Set[String]) -> Result[Unit, String]
+  match x86_validate_fn(lir_fn)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(_) then ()
+  end
+  let saved = x86_saved_regs(alloc)
+  let frame_total = x86_frame_total(alloc, saved.len())
+  if frame_total > 2147483647 then
+    return Result::Err("x86_64: function " + lir_fn.name + " needs a " + frame_total.to_string() + "-byte frame — larger than the signed 32-bit sub rsp immediate (fail-closed)")
+  end
+  x86_emit_fn_symbol(xe, lir_fn.name.clone())
+  def_label(&mut xe.buf, lir_fn.name.clone())
+  x86_emit_prologue(xe, frame_total, saved)
+  var pos = 0
+  var bi = 0
+  while bi < lir_fn.blocks.len() do
+    let b = lir_fn.blocks[bi]
+    xe.pending_cmp = false
+    def_label(&mut xe.buf, lir_block_label(lir_fn.name.clone(), b.id))
+    var si = 0
+    while si < b.stmts.len() do
+      match x86_emit_stmt(xe, alloc, b.stmts[si], pos)
+      when Result::Err(e) then return Result::Err(e)
+      when Result::Ok(_) then ()
+      end
+      pos = pos + 1
+      si = si + 1
+    end
+    match x86_emit_term(xe, alloc, lir_fn.name.clone(), b.term.kind, pos, externs, defined)
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(_) then ()
+    end
+    pos = pos + 1
+    bi = bi + 1
+  end
+  Result::Ok(())
+end
+
+# ———————————————————————————————————————————————————————————————
+# ELF64 x86-64 (EM_X86_64 = 62) relocatable-object writer
+# ———————————————————————————————————————————————————————————————
+# Mirrors backend_rv.tg's rv_elf_obj layout (the five-section shape) at
+# the x86-64 ELF64 widths:
+#   e_type ET_REL, e_machine 62, e_flags 0, ELFCLASS64 / ELFDATA2LSB;
+#   ONE shared string table carries the section names and the symbol
+#   names (e_shstrndx = its index);
+#   .text (PROGBITS, AX, align 16), .rela.text (SHT_RELA, present only
+#   when extern calls exist: R_X86_64_PLT32 = 4 entries with addend -4
+#   against the undefined extern symbols), .symtab last (align 8, 24-
+#   byte entries, sh_info = the first global index = 1);
+#   symbols: null + the function globals (STB_GLOBAL|STT_FUNC) + the
+#   extern undefined globals (STB_GLOBAL|STT_NOTYPE, SHN_UNDEF).
+# x86-64 needs no ARM-style "$t" mapping symbols, so there are no local
+# symbols and r_info = (sym << 32) | type.
+
+def x86_w16(inout out: Vec[u8], v: Int) -> Unit
+  out.push((v & 0xFF) as u8)
+  out.push(((v >> 8) & 0xFF) as u8)
+end
+
+def x86_w32(inout out: Vec[u8], v: Int) -> Unit
+  out.push((v & 0xFF) as u8)
+  out.push(((v >> 8) & 0xFF) as u8)
+  out.push(((v >> 16) & 0xFF) as u8)
+  out.push(((v >> 24) & 0xFF) as u8)
+end
+
+def x86_w64(inout out: Vec[u8], v: Int) -> Unit
+  x86_w32(out, v & 0xFFFFFFFF)
+  x86_w32(out, (v >> 32) & 0xFFFFFFFF)
+end
+
+def x86_align_up(n: Int, a: Int) -> Int
+  let rem = n % a
+  if rem != 0 then
+    n + (a - rem)
+  else
+    n
+  end
+end
+
+# Append an ELF string table and return each name's offset (the first
+# byte is the mandatory NUL).
+def x86_strtab_add(inout out: Vec[u8], names: Vec[String]) -> Vec[Int]
+  var offsets: Vec[Int] = Vec::new()
+  var i = 0
+  while i < names.len() do
+    let off = out.len()
+    offsets.push(off)
+    let name_bytes = names[i].bytes()
+    var ci = 0
+    while ci < name_bytes.len() do
+      out.push(name_bytes[ci])
+      ci = ci + 1
+    end
+    out.push(0)
+    i = i + 1
+  end
+  offsets
+end
+
+# The (name, code offset) function symbols in program order.
+def x86_collect_fns(xe: X86Emit) -> Vec[(String, Int)]
+  var fns: Vec[(String, Int)] = Vec::new()
+  var i = 0
+  while i < xe.syms.len() do
+    let s = xe.syms[i]
+    if s.section == Section::Text || s.section == Section::ColdText then
+      fns.push((s.name.clone(), s.offset))
+    end
+    i = i + 1
+  end
+  fns
+end
+
+# The extern undefined symbol names in program order.
+def x86_collect_exts(xe: X86Emit) -> Vec[String]
+  var exts: Vec[String] = Vec::new()
+  var i = 0
+  while i < xe.syms.len() do
+    let s = xe.syms[i]
+    if s.section == Section::Extern then
+      exts.push(s.name.clone())
+    end
+    i = i + 1
+  end
+  exts
+end
+
+# Build the ELF64 object bytes. `relocs` are the extern-call relocation
+# sites (the offset of the 4-byte displacement field, the symbol name,
+# the ELF type). A relocation whose symbol is not a global of this
+# object is written against the null symbol (the rv writer's defensive
+# rule — the link errors visibly instead of silently mislinking).
+def x86_elf64_obj(code: Vec[u8], fns: Vec[(String, Int)], exts: Vec[String], relocs: Vec[X86Reloc]) -> Vec[u8]
+  let ehsize = 64
+  let shdr_w = 64
+  let sym_w = 24
+  let rela_w = 24
+  let has_rel = relocs.len() > 0
+  let n_sections = 4 + (if has_rel then 1 else 0 end)
+  let text_idx = 2
+  let rel_idx = if has_rel then 3 else -1 end
+  let symtab_idx = n_sections - 1
+  var global_names: Vec[String] = Vec::new()
+  var fi = 0
+  while fi < fns.len() do
+    global_names.push(fns[fi].0.clone())
+    fi = fi + 1
+  end
+  var ei = 0
+  while ei < exts.len() do
+    global_names.push(exts[ei].clone())
+    ei = ei + 1
+  end
+  let n_syms = 1 + global_names.len()
+  let first_global = 1
+  # Shared string table: NUL, section names in section-index order, then
+  # every symbol name.
+  var strtab: Vec[u8] = Vec::new()
+  strtab.push(0)
+  var sec_names: Vec[String] = Vec::new()
+  sec_names.push(".text".to_string())
+  if has_rel then
+    sec_names.push(".rela.text".to_string())
+  end
+  sec_names.push(".symtab".to_string())
+  sec_names.push(".strtab".to_string())
+  let sec_offs = x86_strtab_add(strtab, sec_names)
+  let text_name_idx = 0
+  let rel_name_idx = if has_rel then 1 else -1 end
+  let symtab_name_idx = if has_rel then 2 else 1 end
+  let strtab_name_idx = sec_names.len() - 1
+  let sym_offs = x86_strtab_add(strtab, global_names)
+  let strtab_size = strtab.len()
+
+  # File offsets.
+  let off_text = ehsize
+  let off_rel = x86_align_up(off_text + code.len(), 8)
+  let rel_size = relocs.len() * rela_w
+  let off_sym = x86_align_up(off_rel + rel_size, 8)
+  let sym_size = n_syms * sym_w
+  let off_str = x86_align_up(off_sym + sym_size, 4)
+  let off_sh = x86_align_up(off_str + strtab_size, 8)
+
+  var out: Vec[u8] = Vec::new()
+  # ELF header.
+  out.push(0x7F); out.push(0x45); out.push(0x4C); out.push(0x46)
+  out.push(2)    # ELFCLASS64
+  out.push(1)    # ELFDATA2LSB
+  out.push(1)    # EV_CURRENT
+  var zi = 0
+  while zi < 9 do
+    out.push(0)
+    zi = zi + 1
+  end
+  x86_w16(out, 1)                 # e_type = ET_REL
+  x86_w16(out, 62)                # e_machine = EM_X86_64
+  x86_w32(out, 1)                 # e_version
+  x86_w64(out, 0)                 # e_entry
+  x86_w64(out, 0)                 # e_phoff
+  x86_w64(out, off_sh)            # e_shoff
+  x86_w32(out, 0)                 # e_flags
+  x86_w16(out, ehsize)            # e_ehsize
+  x86_w16(out, 0)                 # e_phentsize
+  x86_w16(out, 0)                 # e_phnum
+  x86_w16(out, shdr_w)            # e_shentsize
+  x86_w16(out, n_sections)        # e_shnum
+  x86_w16(out, 1)                 # e_shstrndx = the shared strtab
+  # .text.
+  while out.len() < off_text do
+    out.push(0)
+  end
+  var ci = 0
+  while ci < code.len() do
+    out.push(code[ci])
+    ci = ci + 1
+  end
+  # .rela.text.
+  if has_rel then
+    while out.len() < off_rel do
+      out.push(0)
+    end
+    var ri = 0
+    while ri < relocs.len() do
+      var sym_idx = 0
+      var found = false
+      var gj = 0
+      while gj < global_names.len() do
+        if global_names[gj] == relocs[ri].sym then
+          sym_idx = first_global + gj
+          found = true
+          gj = global_names.len() + 1
+        else
+          gj = gj + 1
+        end
+      end
+      if !found then
+        sym_idx = 0
+      end
+      let info_bits = (sym_idx << 32) | relocs[ri].kind
+      x86_w64(out, relocs[ri].offset)   # r_offset
+      x86_w64(out, info_bits)           # r_info = (sym << 32) | type
+      x86_w64(out, -4)                  # r_addend = -4 (PC basis = end of call)
+      ri = ri + 1
+    end
+  end
+  # .symtab.
+  while out.len() < off_sym do
+    out.push(0)
+  end
+  var zs = 0
+  while zs < sym_w do
+    out.push(0)
+    zs = zs + 1
+  end
+  var fni = 0
+  while fni < fns.len() do
+    x86_w32(out, sym_offs[fni])     # st_name
+    out.push(0x12)                  # STB_GLOBAL | STT_FUNC
+    out.push(0)                     # st_other
+    x86_w16(out, text_idx)          # st_shndx
+    x86_w64(out, fns[fni].1)        # st_value
+    x86_w64(out, 0)                 # st_size
+    fni = fni + 1
+  end
+  var exi = 0
+  while exi < exts.len() do
+    x86_w32(out, sym_offs[fns.len() + exi])   # st_name
+    out.push(0x10)                  # STB_GLOBAL | STT_NOTYPE
+    out.push(0)                     # st_other
+    x86_w16(out, 0)                 # st_shndx = SHN_UNDEF
+    x86_w64(out, 0)                 # st_value
+    x86_w64(out, 0)                 # st_size
+    exi = exi + 1
+  end
+  # .strtab.
+  while out.len() < off_str do
+    out.push(0)
+  end
+  var sti = 0
+  while sti < strtab_size do
+    out.push(strtab[sti])
+    sti = sti + 1
+  end
+  # Section headers.
+  while out.len() < off_sh do
+    out.push(0)
+  end
+  # [0] null.
+  var zj = 0
+  while zj < shdr_w do
+    out.push(0)
+    zj = zj + 1
+  end
+  # [1] the shared strtab.
+  x86_w32(out, sec_offs[strtab_name_idx])
+  x86_w32(out, 3)                   # SHT_STRTAB
+  x86_w64(out, 0)                   # sh_flags
+  x86_w64(out, 0)                   # sh_addr
+  x86_w64(out, off_str)             # sh_offset
+  x86_w64(out, strtab_size)         # sh_size
+  x86_w32(out, 0)                   # sh_link
+  x86_w32(out, 0)                   # sh_info
+  x86_w64(out, 1)                   # sh_addralign
+  x86_w64(out, 0)                   # sh_entsize
+  # [2] .text.
+  x86_w32(out, sec_offs[text_name_idx])
+  x86_w32(out, 1)                   # SHT_PROGBITS
+  x86_w64(out, 0x6)                 # SHF_ALLOC | SHF_EXECINSTR
+  x86_w64(out, 0)                   # sh_addr
+  x86_w64(out, off_text)            # sh_offset
+  x86_w64(out, code.len())          # sh_size
+  x86_w32(out, 0)                   # sh_link
+  x86_w32(out, 0)                   # sh_info
+  x86_w64(out, 16)                  # sh_addralign
+  x86_w64(out, 0)                   # sh_entsize
+  if has_rel then
+    # [3] .rela.text.
+    x86_w32(out, sec_offs[rel_name_idx])
+    x86_w32(out, 4)                 # SHT_RELA
+    x86_w64(out, 0)                 # sh_flags
+    x86_w64(out, 0)                 # sh_addr
+    x86_w64(out, off_rel)           # sh_offset
+    x86_w64(out, rel_size)          # sh_size
+    x86_w32(out, symtab_idx)        # sh_link = the symtab
+    x86_w32(out, text_idx)          # sh_info = .text
+    x86_w64(out, 8)                 # sh_addralign
+    x86_w64(out, rela_w)            # sh_entsize
+  end
+  # The last section header is .symtab.
+  x86_w32(out, sec_offs[symtab_name_idx])
+  x86_w32(out, 2)                   # SHT_SYMTAB
+  x86_w64(out, 0)                   # sh_flags
+  x86_w64(out, 0)                   # sh_addr
+  x86_w64(out, off_sym)             # sh_offset
+  x86_w64(out, sym_size)            # sh_size
+  x86_w32(out, 1)                   # sh_link = the strtab
+  x86_w32(out, first_global)        # sh_info = first global index
+  x86_w64(out, 8)                   # sh_addralign
+  x86_w64(out, sym_w)               # sh_entsize
+  out
+end
+
+# ———————————————————————————————————————————————————————————————
+# Whole-program route (mirrors backend_rv.tg's rv_compile_object)
+# ———————————————————————————————————————————————————————————————
+# The driver's LIR gate (the TANGERINE_LIR_TARGET=x86_64 alias, or a
+# --target x86_64 host triple, through target_desc_of_triple) routes
+# single files here: every non-extern function goes through the LIR
+# pipeline (fail-closed: one construct outside the stage-1 surface fails
+# the whole compile with a rule-naming reason), the bodies are emitted
+# into one shared text buffer, deferred rel32 patches resolve once every
+# function label is in the buffer, and the buffer is serialized as the
+# ELF64 x86-64 relocatable object through x86_elf64_obj. There is no
+# runtime merge: the aarch64 runtime buffers are aarch64 machine code;
+# externs resolve through the object's undefined symbols instead.
+
+# The stage-1 lowering entry: div_ok true (the x86-64 idiv/div arms),
+# width_ok false (the word-only Int/UInt accept set — the sized
+# integer/Bool/pointer forms are later slices). The mode entry carries
+# no program type-def table, so aggregates stay fail-closed at the shape
+# gate as well (x86_validate_fn names the rule again for defense).
+def x86_lower_mir_fn(f: MirFunction) -> Result[LirFunction, String]
+  lower_mir_fn_to_lir_mode(f, true, false)
+end
+
+# Compile the whole program to an ELF64 x86-64 relocatable object.
+def x86_64_compile_object(program: MirProgram, desc: TargetDesc) -> Result[Vec[u8], String]
+  if desc.arch != Arch::X86_64 then
+    return Result::Err("x86_64: the route was given the `" + desc.name + "` description (expected the x86_64 System V description — fail-closed)")
+  end
+  if desc.pointer_width != 8 || desc.stack_alignment != 16 then
+    return Result::Err("x86_64: the `" + desc.name + "` description must model 8-byte pointers and 16-byte stack alignment (says " + desc.pointer_width.to_string() + "-byte pointers, stack align " + desc.stack_alignment.to_string() + ")")
+  end
+  if program.statics.len() > 0 then
+    return Result::Err("x86_64: the program carries " + program.statics.len().to_string() + " static(s) — the .data image and its address relocations are a later stage (fail-closed)")
+  end
+  var externs: Set[String] = Set::new()
+  var defined: Set[String] = Set::new()
+  var fi = 0
+  while fi < program.functions.len() do
+    let f = program.functions[fi]
+    if f.is_extern then
+      externs.insert(f.name.clone())
+    else
+      defined.insert(f.name.clone())
+    end
+    fi = fi + 1
+  end
+  var xe = x86_emit_new()
+  fi = 0
+  while fi < program.functions.len() do
+    let f = program.functions[fi]
+    if f.is_extern then
+      # Extern functions get no body — an undefined symbol entry for the
+      # linker (the direct emitter's extern convention).
+      xe.syms.push(AsmSymbol {
+        name: f.name.clone(),
+        section: Section::Extern,
+        offset: 0,
+        size: 0,
+        binding: SymBinding::Global,
+        kind: SymKind::Func
+      })
+    else
+      let lir_fn = match x86_lower_mir_fn(f)
+      when Result::Err(e) then return Result::Err(e)
+      when Result::Ok(lf) then lf
+      end
+      match lir_validate_callees(lir_fn, defined, externs)
+      when Result::Err(e) then return Result::Err(e)
+      when Result::Ok(_) then ()
+      end
+      match x86_validate_fn(lir_fn)
+      when Result::Err(e) then return Result::Err(e)
+      when Result::Ok(_) then ()
+      end
+      let peeped = lir_peephole(lir_fn)
+      let alloc = x86_alloc_registers(peeped)
+      # Mandatory verification (audit item 26 — verify_lir): the
+      # post-allocation, pre-emission gate over the peeped function and
+      # its allocation. A non-empty violation list fails the route
+      # closed with the violations named.
+      let lir_violations = verify_lir(peeped, alloc, LirVerifyRoute::LirVerifyX86_64)
+      if lir_violations.len() > 0 then
+        return Result::Err(lir_verify_fail_err(peeped.name.clone(), lir_violations))
+      end
+      match x86_emit_fn(xe, peeped, alloc, externs, defined)
+      when Result::Err(e) then return Result::Err(e)
+      when Result::Ok(_) then ()
+      end
+    end
+    fi = fi + 1
+  end
+  match x86_resolve_patches(xe)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(_) then ()
+  end
+  let fns = x86_collect_fns(xe)
+  let exts = x86_collect_exts(xe)
+  let rels = xe.relocs.clone()
+  Result::Ok(x86_elf64_obj(xe.buf.bytes.clone(), fns, exts, rels))
+end
+
+# Executable/image emission is out of this stage: fail closed with the
+# reason (mirrors rv_compile_executable).
+def x86_64_compile_executable(program: MirProgram, output_path: String) -> Result[Unit, String]
+  Result::Err("x86_64: the x86-64 LIR route does not link executables in stage 1 — use --emit=obj and link the ELF64 x86-64 object with the system linker (the host image/startup contract is a separate route)")
+end
+

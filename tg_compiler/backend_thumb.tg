@@ -300,11 +300,14 @@
 #
 # ── Route wiring ────────────────────────────────────────────────────
 #   The driver's LIR route (driver.tg compile_lir_route) selects this
-#   backend with TANGERINE_LIR_TARGET=cortex-m3/cortex-m4/cortex-m4f/
-#   cortex-m7 (the legacy name cortex-m maps to the cortex-m4f
-#   descriptor — the least-breaking mapping, since the float route
-#   requires the FPU; default aarch64). The route resolves the
-#   descriptor by name (thumb_desc_of below) and hands it to
+#   backend from the --target triple's TargetDesc — target_desc.tg's ONE
+#   lookup target_desc_of_triple (audit item 39): --target
+#   thumbv7m-none-eabi -> cortex-m3, thumbv7em-none-eabi -> cortex-m4,
+#   thumbv7em-none-eabihf -> cortex-m4f — or from the LEGACY alias keys
+#   TANGERINE_LIR_TARGET=cortex-m3/cortex-m4/cortex-m4f/cortex-m7
+#   (cortex-m maps to the cortex-m4f descriptor — the least-breaking
+#   mapping, since the float route requires the FPU; default aarch64).
+#   The desc is handed unmodified to
 #   thumb_compile_object, which lowers every body through lir.tg's
 #   AAPCS32 parameter-fetch entry (lower_mir_fn_to_lir_cm), emits the
 #   program's static scalar images into a .data section and the bodies
@@ -333,10 +336,12 @@ use tg_compiler::lir::{
   lir_first_alloc_vreg, lir_seg_at, lir_reload_at,
   lir_block_label, lir_validate_callees,
   lir_static_scalar_ok, lir_static_init_word_value,
-  lir_static_unsupported_type_rule
+  lir_static_unsupported_type_rule,
+  LirVerifyRoute, verify_lir, lir_verify_fail_err
 }
 use tg_compiler::target_desc::{
   TargetDesc, InterruptAbi, Arch, FloatAbi, Fpu,
+  AtomicSupport, atomic_support,
   thumbv7m_cortex_m3_desc, thumbv7em_cortex_m4_desc,
   thumbv7em_cortex_m4f_desc, thumbv7em_cortex_m7_desc
 }
@@ -419,9 +424,12 @@ def thumb_reg_num(name: String) -> Option[Int]
   end
 end
 
-# Resolve a driver route name to the canonical ARMv7-M description of
-# this backend (the audit §16 name set; the driver's route selector
-# consults it at the gate, mirroring lir_target_desc). The legacy name
+# Resolve a legacy driver route name to the canonical ARMv7-M
+# description of this backend (the audit §16 name set; audit item 39
+# makes target_desc.tg's target_desc_of_triple the driver's ONE lookup,
+# of which these names are the legacy alias keys — this accessor
+# remains for backend consumers, mirroring lir_target_desc). The legacy
+# name
 # "cortex-m" maps to the cortex-m4f descriptor — the least-breaking
 # mapping: the pre-slice single cortex_m instance implied the VFP unit
 # (the float route requires it), and every program that compiled under
@@ -2260,20 +2268,27 @@ def thumb_fixed_bad(lir_reg: Int) -> Bool
   lir_reg >= 4 && lir_reg < lir_first_alloc_vreg()
 end
 
-# A marked pointer/atomic statement's width is one of the cortex-m
-# surface widths (1/2/4 bytes — the ARMv7-M descriptors' entire
-# native_atomic_widths class, shared by every family instance; there
-# is no emulated class on ARMv7-M). Width 8 (the _u64 atomic family /
-# an 8-byte deref) is the ARMv7-M fail-closed case: M3/M4/M4F/M7 have
-# no LDREXD/STREXD-class exclusives and no doubleword atomic form.
+# A marked NON-ATOMIC pointer statement's width is one of the cortex-m
+# machine-access widths (1/2/4 bytes — the ARMv7-M descriptors' entire
+# native_atomic_widths class, shared by every family instance; there is
+# no emulated class on ARMv7-M). Width 8 (a _u64 deref) is the
+# ARMv7-M fail-closed case: M3/M4/M4F/M7 have no 8-byte memory form
+# (and even the plain LDRD/STRD pair is not single-copy atomic). The
+# ATOMIC forms (LirAtomLoad/LirAtomStore/LirAtomRmw/LirAtomCas) ask THE
+# ONE atomic authority instead — thumb_validate_ptr_stmt consults
+# target_desc.atomic_support over the route's descriptor (audit item
+# 43); this plain-width rule remains the non-atomic deref surface (the
+# riscv backend's rv_ptr_width_ok mirror — derefs are not atomics).
 def thumb_ptr_width_ok(w: Int) -> Bool
   w >= 1 && w <= 4
 end
 
 # Validate one marked LirPtrOp statement against the cortex-m surface
-# (fail-closed, before any emission): the ARMv7-M widths (1/2/4), the
+# (fail-closed, before any emission): the ARMv7-M widths (1/2/4 — for
+# the ATOMIC forms the ONE atomic authority's answer over `desc`, audit
+# item 43; for the plain deref forms the machine-access rule), the
 # per-form ordering codes and the vreg/offset geometry of each form.
-def thumb_validate_ptr_stmt(fn_name: String, pop: LirPtrOp) -> Result[Unit, String]
+def thumb_validate_ptr_stmt(fn_name: String, pop: LirPtrOp, desc: TargetDesc) -> Result[Unit, String]
   match pop
   when LirPtrOp::LirPtrLea(dst, off) then
     # dst = r7 + off — the frame-slot address (off = 4*slot on the
@@ -2322,7 +2337,18 @@ def thumb_validate_ptr_stmt(fn_name: String, pop: LirPtrOp) -> Result[Unit, Stri
     if thumb_fixed_bad(dst) || thumb_fixed_bad(addr) then
       return Result::Err("thumb: " + fn_name + ": atomic load over fixed vregs 4..7 does not lower (fail-closed)")
     end
-    if !thumb_ptr_width_ok(w) then
+    # AUDIT ITEM 43 — the width decision is THE ONE atomic authority's
+    # answer over the route's descriptor (the strongest order word
+    # "seq_cst": the ARMv7-M width classes are order-uniform — an
+    # ordering-valid width never changes class per order): only the
+    # family's NATIVE class validates — an EMULATED answer is
+    # impossible on every ARMv7-M desc of this slice (the emulated
+    # class is empty) and would fail closed regardless (this backend
+    # has no emulated loop); Unsupported fails closed with the
+    # width-8 rule below.
+    match atomic_support(desc, w, "load", "seq_cst")
+    when AtomicSupport::Native then ()
+    when _ then
       return Result::Err("thumb: " + fn_name + ": atomic load width " + w.to_string() + " does not lower on the cortex-m route — ARMv7-M has no LDREXD/STREXD-class 8-byte exclusives and no doubleword atomic form; the ARMv7-M descriptors' native_atomic_widths are [1, 2, 4] (fail-closed)")
     end
     if form != 0 && form != 1 then
@@ -2333,7 +2359,10 @@ def thumb_validate_ptr_stmt(fn_name: String, pop: LirPtrOp) -> Result[Unit, Stri
     if thumb_fixed_bad(addr) || thumb_fixed_bad(val) then
       return Result::Err("thumb: " + fn_name + ": atomic store over fixed vregs 4..7 does not lower (fail-closed)")
     end
-    if !thumb_ptr_width_ok(w) then
+    # AUDIT ITEM 43 — the authority (see the atomic load arm above).
+    match atomic_support(desc, w, "store", "seq_cst")
+    when AtomicSupport::Native then ()
+    when _ then
       return Result::Err("thumb: " + fn_name + ": atomic store width " + w.to_string() + " does not lower on the cortex-m route (ARMv7-M has no 8-byte atomic form; the ARMv7-M descriptors' native_atomic_widths are [1, 2, 4] — fail-closed)")
     end
     if form != 0 && form != 1 then
@@ -2344,7 +2373,10 @@ def thumb_validate_ptr_stmt(fn_name: String, pop: LirPtrOp) -> Result[Unit, Stri
     if thumb_fixed_bad(dst) || thumb_fixed_bad(addr) || thumb_fixed_bad(val) then
       return Result::Err("thumb: " + fn_name + ": atomic RMW over fixed vregs 4..7 does not lower (fail-closed)")
     end
-    if !thumb_ptr_width_ok(w) then
+    # AUDIT ITEM 43 — the authority (see the atomic load arm above).
+    match atomic_support(desc, w, "rmw", "seq_cst")
+    when AtomicSupport::Native then ()
+    when _ then
       return Result::Err("thumb: " + fn_name + ": atomic RMW width " + w.to_string() + " does not lower on the cortex-m route (ARMv7-M has no 8-byte exclusive form; the ARMv7-M descriptors' native_atomic_widths are [1, 2, 4] — fail-closed)")
     end
     if family < 0 || family > 4 then
@@ -2358,7 +2390,10 @@ def thumb_validate_ptr_stmt(fn_name: String, pop: LirPtrOp) -> Result[Unit, Stri
     if thumb_fixed_bad(dst) || thumb_fixed_bad(exp) || thumb_fixed_bad(des) || thumb_fixed_bad(addr) then
       return Result::Err("thumb: " + fn_name + ": atomic compare_exchange over fixed vregs 4..7 does not lower (fail-closed)")
     end
-    if !thumb_ptr_width_ok(w) then
+    # AUDIT ITEM 43 — the authority (see the atomic load arm above).
+    match atomic_support(desc, w, "cas", "seq_cst")
+    when AtomicSupport::Native then ()
+    when _ then
       return Result::Err("thumb: " + fn_name + ": atomic compare_exchange width " + w.to_string() + " does not lower on the cortex-m route (ARMv7-M has no 8-byte exclusive form; the ARMv7-M descriptors' native_atomic_widths are [1, 2, 4] — fail-closed)")
     end
     if form < 0 || form > 3 then
@@ -2373,7 +2408,7 @@ def thumb_validate_ptr_stmt(fn_name: String, pop: LirPtrOp) -> Result[Unit, Stri
   end
 end
 
-def thumb_validate_fn(f: LirFunction) -> Result[Unit, String]
+def thumb_validate_fn(f: LirFunction, desc: TargetDesc) -> Result[Unit, String]
   var bi = 0
   while bi < f.blocks.len() do
     let block = f.blocks[bi]
@@ -2387,12 +2422,13 @@ def thumb_validate_fn(f: LirFunction) -> Result[Unit, String]
       # semantics do not apply (the nominal kinds are only arity-
       # nearest carriers). The width-8 forms (the _u64 atomic family
       # and 8-byte pointer derefs) fail closed HERE too, defensively:
-      # the lowering already rejects them with the target reason, so a
-      # width-8 marked statement reaching this backend marks a
-      # lowering/backend divergence.
+      # the lowering already rejects them with the target reason (the
+      # atomic forms through THE ONE atomic authority — audit item 43
+      # — over `desc`), so a width-8 marked statement reaching this
+      # backend marks a lowering/backend divergence.
       match stmt.ptr
       when Option::Some(pop) then
-        match thumb_validate_ptr_stmt(f.name, pop)
+        match thumb_validate_ptr_stmt(f.name, pop, desc)
         when Result::Err(e) then return Result::Err(e)
         when Result::Ok(_) then ()
         end
@@ -4553,7 +4589,7 @@ end
 # restores the EXC_RETURN holder (the pushed LR slot) into LR and BX
 # LR executes the desc's NVIC exit rule.)
 def thumb_emit_fn(inout te: ThumbEmit, mdl_pool: Vec[Int], desc: TargetDesc, f: LirFunction, alloc: LirAlloc, externs: Set[String], defined: Set[String], variadic_externs: Set[String]) -> Result[Unit, String]
-  match thumb_validate_fn(f)
+  match thumb_validate_fn(f, desc)
   when Result::Err(e) then return Result::Err(e)
   when Result::Ok(_) then ()
   end
@@ -5331,7 +5367,8 @@ end
 # ———————————————————————————————————————————————————————————————
 # Whole-program route (mirrors lir_compile_object)
 # ———————————————————————————————————————————————————————————————
-# The driver's LIR gate (TANGERINE_LIR_TARGET=cortex-m) routes single
+# The driver's LIR gate (a desc'd --target thumb triple, or the legacy
+# TANGERINE_LIR_TARGET=cortex-m alias) routes single
 # files here: the program's statics lower through the scalar-constant
 # subset into a .data image (see the statics section above), every
 # non-extern function goes through the LIR pipeline
@@ -5470,7 +5507,9 @@ def thumb_compile_object(program: MirProgram, desc: TargetDesc) -> Result[Vec[u8
   when Result::Ok(_) then ()
   end
   # The route's descriptor is the single source of the ABI data (the
-  # driver resolved it from the TANGERINE_LIR_TARGET name); the pool
+  # driver resolved it from the --target triple through
+  # target_desc_of_triple, or from the legacy TANGERINE_LIR_TARGET
+  # alias); the pool
   # shape check fails closed on a desc this slice does not consume.
   let mdl_pool = match thumb_mdl_pool(desc)
   when Result::Ok(p) then p
@@ -5575,6 +5614,15 @@ def thumb_compile_object(program: MirProgram, desc: TargetDesc) -> Result[Vec[u8
       end
       let peeped = lir_peephole(lir_fn)
       let alloc = lir_alloc_registers_cm(peeped)
+      # Mandatory verification (audit item 26 — verify_lir): the
+      # post-allocation, pre-emission gate over the peeped function
+      # and its allocation. A non-empty violation list fails the route
+      # closed with the first violations named (valid functions behave
+      # exactly as before — the gate is read-only).
+      let lir_violations = verify_lir(peeped, alloc, LirVerifyRoute::LirVerifyCm)
+      if lir_violations.len() > 0 then
+        return Result::Err(lir_verify_fail_err(peeped.name.clone(), lir_violations))
+      end
       match thumb_emit_fn(&mut te, mdl_pool, desc, peeped, alloc, externs, defined, variadic_externs)
       when Result::Err(e) then return Result::Err(e)
       when Result::Ok(_) then ()
@@ -5617,6 +5665,10 @@ def thumb_compile_object(program: MirProgram, desc: TargetDesc) -> Result[Vec[u8
         end
         let peeped = lir_peephole(lir_fn)
         let alloc = lir_alloc_registers_cm(peeped)
+        let lir_violations = verify_lir(peeped, alloc, LirVerifyRoute::LirVerifyCm)
+        if lir_violations.len() > 0 then
+          return Result::Err(lir_verify_fail_err(peeped.name.clone(), lir_violations))
+        end
         match thumb_emit_fn(&mut te, mdl_pool, desc, peeped, alloc, externs, defined, variadic_externs)
         when Result::Err(e) then return Result::Err(e)
         when Result::Ok(_) then ()

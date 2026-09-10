@@ -2152,25 +2152,35 @@ reset-vector entry, structurally verified). `std::embedded` provides the
 `interrupt_vector_table` and the allocator-free `ArrayVec` / `RingBuffer`
 collections.
 
-**The code-gen routes (P0.2, updated for the LIR routes):** the DEFAULT
-(un-gated) route is the DIRECT emitter (codegen.tg) for the host
-targets (`aarch64-apple-darwin` / `x86_64-unknown-linux-gnu`) plus the
-wasm32 route. The env-gated LIR route (`TANGERINE_LIR=1` +
-`TANGERINE_LIR_TARGET=...`, default off — driver.tg `compile_lir_route`)
-adds the standalone LIR pipeline (lir.tg) with per-CPU ARMv7-M
-backends (`cortex-m3`/`cortex-m4`/`cortex-m4f`/`cortex-m7`) and
-RISC-V backends (`riscv32imac`/`riscv32imafc`/`riscv32imafdc`/
-`riscv64imac`/`riscv64gc`), emitting ELF relocatable objects (see
-cross_compilation_guide.md for the per-descriptor feature sets). The
-`--target` embedded route remains aarch64-only: the Thumb triples
-(`thumbv6m-none-eabi` / `thumbv7em-none-eabi[f]` /
-`thumbv8m.main-none-eabihf`) and the RISC-V triples
-(`riscv32imc|imac-unknown-none-elf` / `riscv64gc-unknown-none-elf`)
-are **HARD-REJECTED there** — that route has no generator for those
-triples, so it emits the stable rejection diagnostic and NO artifact
-(the old behavior forced the aarch64 backend under the foreign triple
-and fabricated the image). There is no QEMU execution lane; hardware
-execution is not claimed.
+**The code-gen routes (P0.2, updated for the LIR backends + audit item
+39):** the DEFAULT (un-gated) route is the DIRECT emitter (codegen.tg)
+for the host targets (`aarch64-apple-darwin` /
+`x86_64-unknown-linux-gnu`) plus the wasm32 route. The LIR pipeline
+(lir.tg) is the code generator for the embedded Thumb/RISC-V triples
+**selected by `--target`**: a `--target thumbv7m-none-eabi` /
+`thumbv7em-none-eabi[f]` / `riscv32imac|imafc|imafdc-unknown-none-elf` /
+`riscv64imac|riscv64gc-unknown-none-elf` compile resolves the
+descriptor of the triple through the ONE `target_desc.tg` lookup
+(`target_desc_of_triple` — the backend identity is the triple's
+`TargetDesc`, never an env-gated second target naming system) and runs
+the standalone LIR pipeline for it, emitting ELF relocatable objects
+(the per-CPU ARMv7-M `cortex-m3`/`cortex-m4`/`cortex-m4f` descriptors,
+whose M3/M4 instances have `fpu: None`, and the RISC-V descriptors;
+object emission only — executable/image linking fails closed inside the
+backends). `TANGERINE_LIR=1` + `TANGERINE_LIR_TARGET=...` remains the
+default-off HOST opt-in that gates "LIR vs direct" for the aarch64 host
+slice, with the env value working only as a **legacy alias** key of the
+same descriptor table (see cross_compilation_guide.md for the
+per-descriptor feature sets). The `--target` embedded route's artifact
+contract (the target spec JSON + the linker script + the startup/vector
+artifacts + the bare-metal aarch64 ELF image) stays with its only image
+generator, **`aarch64-unknown-none`** (the aarch64 backend); the
+embedded triples with NO descriptor instance (`thumbv6m-none-eabi` /
+`thumbv8m.main-none-eabihf` / `riscv32imc-unknown-none-elf`) are
+**HARD-REJECTED** — no TargetDesc, no codegen, so the route emits the
+stable rejection diagnostic and NO artifact (it never fabricates an
+aarch64 image under a foreign triple). There is no QEMU execution lane;
+hardware execution is not claimed.
 
 ### WASI (preview1)
 

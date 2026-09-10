@@ -200,6 +200,20 @@ use tg_compiler::resource_check::{AnalyzedProgram, TypedCFG, analysis_context_ne
 # bound tree folds to Const BEFORE any instantiation-site validation sees
 # it (the range validation accepts ConstSym in const slots like ConstParam
 # and validates the folded Const at the outer instantiation).
+#
+# THE NORMALIZATION MODEL (audit item 49): the ONE exception to
+# never-canonicalizing is the DOCUMENTED identity folding applied at the
+# ConstSym FOLD helpers (const_sym_tree_fold_identities inside
+# const_sym_fold_type, and the symbolic-argument record site of
+# resolve_type_expr): `N + 0` -> `N`, `0 + N` -> `N`, `N * 1` -> `N`.
+# Those are the ONLY declared equivalences — commutativity is NOT
+# normalized (`SCALE + S2` vs `S2 + SCALE`, `2 * N` vs `N * 2` and the
+# literal-left `1 * N` stay DIFFERENT while symbolic; the audit warns
+# against syntax==semantic conflation without a defined model, and the
+# defined model is exactly the identity rules). Two spellings the model
+# equates are therefore the SAME instance identity from record time; two
+# spellings it does not equate keep distinct structural identities until
+# binding folds them to the same Const value.
 enum ConstExprT
   ConstLit(Int)
   ConstParamRef(GenericParamId)
@@ -497,9 +511,12 @@ end
 # the lowered MIR — the summary of what executes (the union of the
 # function's statement/terminator operation records — every intrinsic
 # and compiler-generated lowering step carries one — plus its callees'
-# summaries to a fixed point; the three behavioral classes are the class
+# summaries to a fixed point; the behavioral classes are the class
 # view over the EffectSummary record: Alloc = may_allocate, Block =
-# may_block OR may_sleep, Io = may_io). The enforcement pass lives in
+# may_block OR may_sleep, Io = may_io, and Spawn = may_spawn — the
+# interrupt-context class the @interrupt arm forbids in addition to the
+# three spellable classes (no attribute spells it; see the EffectClass
+# comment below). The enforcement pass lives in
 # mir.tg (check_effect_class_annotations_mir), run by the front-end
 # phases on the lowered program:
 #   @no_alloc  — the function never heap-allocates (no Vec/String growth,
@@ -509,23 +526,59 @@ end
 #   @no_io     — the function never performs I/O;
 #   @irq_safe  — @no_alloc + @no_block + @no_io (the single-attribute
 #                spelling of the interrupt-handler contract);
-#   @interrupt — the interrupt-handler marker (audit P1-16 completion):
-#                the marker CLAIMS the same irq-safe contract as
-#                @irq_safe — all three classes are forbidden inside a
-#                handler — and the companion
+#   @interrupt — the interrupt-handler marker (audit P1-16 completion;
+#                audit item 42 makes the marker a COMPILE-TIME semantic
+#                claim — the interrupt context — enforced against the
+#                lowered program, never codegen metadata alone): the
+#                marker CLAIMS the same irq-safe contract as
+#                @irq_safe — the three spellable classes are forbidden
+#                inside a handler — PLUS the interrupt-context rules:
+#                no blocking (the Mutex/wait paths and the sleep family
+#                classify Block through their seeds), no task/thread
+#                spawn (may_spawn=false — the Spawn class), no
+#                uncontrolled I/O (the MMIO/hardware capability is the
+#                only carve-out — the volatile/MMIO extern family
+#                records may_io=false with the MMIO capability, never
+#                the Io class), and no reentrancy (a handler must never
+#                reach itself through a call path — mir.tg's
+#                mir_effect_reentry_path; the no-allocation +
+#                no-reentrancy proof keeps the handler frame depth
+#                statically bounded, and a per-handler stack-BOUND
+#                argument is not expressible — the parser rejects
+#                @interrupt(...) args, E110 — so the bound knob is the
+#                documented follow-up). An UNSAFE operation (may_unsafe)
+#                stays permitted inside a handler under the language's
+#                existing unsafe rules only — never as an effect-class
+#                violation: the unsafe discipline is a memory-safety
+#                gate, not an interrupt-context effect, so @interrupt
+#                does not forbid it (documented with the summary
+#                record's class view below). The companion
 #                @effects(no_alloc, no_block, no_io) spelling (also
-#                supported by the checker below) names the same claims
-#                compositionally. The handler-runtime/vector-table
-#                integration beyond the proof stays the embedded route's
-#                own pass (driver.tg's collect_interrupt_fns).
+#                supported by the checker below) names the three-class
+#                claims compositionally. The handler-runtime/vector-
+#                table integration beyond the proof stays the embedded
+#                route's own pass (driver.tg's collect_interrupt_fns).
 # The annotations are parsed from the EXISTING item-attribute mechanism
 # (parse_attributes → Item.attrs — the @effects(...) argument list rides
 # the generic Attribute.args); unknown attribute names keep their existing
 # behavior untouched.
+#
+# The forbidden-class vocabulary. The three @effects(...) spellings are
+# the COMPOSITIONAL classes (each maps to one may_* flag or flag fold —
+# see effect_summary_has_class): Alloc = may_allocate, Block =
+# may_block OR may_sleep (the sleep family seeds both flags), Io =
+# may_io. Spawn (may_spawn — task/thread creation) is the
+# interrupt-context class: NO attribute or @effects(...) argument
+# spells it (the compositional claims stay the three @effects args),
+# and only the @interrupt enforcement arm forbids it — an interrupt
+# handler must never create or schedule tasks, so the class rides the
+# same class machinery (summary flags, fixed-point evidence slots,
+# E0232 with the effect_trace path) as the three spellable classes.
 enum EffectClass
   Alloc
   Block
   Io
+  Spawn
 end
 
 enum EffectAnnotation
@@ -8763,11 +8816,14 @@ end
 # Enforcement (annotation = proven-or-error):
 #   - @no_alloc forbids Alloc; @no_block forbids Block; @no_io forbids
 #     Io; @irq_safe forbids all three; @interrupt forbids all three too
-#     (audit P1-16: an @interrupt marker IS the handler spelling of the
-#     irq-safe contract, so a handler must satisfy the same transitive
-#     proof as an @irq_safe function); the @effects(no_alloc, no_block,
-#     no_io) list forbids exactly the classes it names. A function whose
-#     final set contains a forbidden class reports one E0232 diagnostic
+#     PLUS the interrupt-only Spawn class (audit P1-16 + audit item 42:
+#     an @interrupt marker IS the handler spelling of the irq-safe
+#     contract — a handler must satisfy the same transitive proof as an
+#     @irq_safe function — and the interrupt context additionally
+#     forbids task/thread spawn; no attribute spells Spawn); the
+#     @effects(no_alloc, no_block, no_io) list forbids exactly the
+#     classes it names. A function whose final set contains a forbidden
+#     class reports one E0232 diagnostic
 #     per class at the ATTRIBUTE's span, with the evidence phrase of the
 #     first site that dirtied the class — a violation under @interrupt
 #     names the HANDLER (the annotated function), and a claim written as
@@ -8799,21 +8855,26 @@ end
 #     - heap allocation and growth (Vec/String/Map/Set construction,
 #       closure boxing, heap-backed formatting);
 #     - blocking mutexes and the kernel wait primitives whose lock path
-#       yields to the scheduler (the pthread wait family is unseeded —
-#       ALL three classes, fail closed — and sched_yield seeds Block);
+#       yields to the scheduler (the pthread wait family seeds Block,
+#       and sched_yield seeds Block);
 #     - filesystem and networking (the libc_*/_tg_* read/write/open
 #       surface and the raw Syscall intrinsics — the seeded ones are
 #       Io/Block, the unseeded ones conservatively ALL three classes;
 #       either way the class proof fails);
 #     - sleep (sleep/usleep/nanosleep — Block, seeded below);
-#     - unbounded scheduling (sched_yield — Block, seeded below).
+#     - unbounded scheduling (sched_yield — Block, seeded below);
+#     - task/thread creation (audit item 42 — the no-spawn rule: the
+#       interrupt-only Spawn class; a spawn-capable call or a
+#       fail-closed site that cannot rule spawning out dirties it).
 #
 # Enforcement (annotation = proven-or-error, on the lowered program):
 #   - @no_alloc forbids Alloc; @no_block forbids Block; @no_io forbids
 #     Io; @irq_safe forbids all three; @interrupt forbids all three too
-#     (audit P1-16: an @interrupt marker IS the handler spelling of the
+#     plus the interrupt-only Spawn class (audit P1-16 + audit item 42:
+#     an @interrupt marker IS the handler spelling of the
 #     irq-safe contract, so a handler must satisfy the same transitive
-#     proof as an @irq_safe function); the @effects(no_alloc, no_block,
+#     proof as an @irq_safe function — and no task/thread spawn, the
+#     no-spawn interrupt-context rule); the @effects(no_alloc, no_block,
 #     no_io) list forbids exactly the classes it names. A function whose
 #     final summary violates a forbidden class reports one E0232
 #     diagnostic per class at the ATTRIBUTE's span, with the evidence
@@ -8868,6 +8929,54 @@ end
 #     - sleep (sleep/usleep/nanosleep — Block: may_block + may_sleep);
 #     - unbounded scheduling (sched_yield — Block).
 #
+# The INTERRUPT CONTEXT (audit item 42): @interrupt is a compile-time
+# semantic claim, enforced on the lowered program — never codegen
+# metadata alone. A handler must be provably irq-safe (the irq-safe
+# classes above, TRANSITIVELY — every callee the handler can reach must
+# satisfy the same restrictions, and an E0232 violation reports the
+# handler-to-violation call-chain path in its effect_trace rows) AND
+# satisfy the interrupt-context rules:
+#   - no heap allocation (may_allocate=false — the handler's frames
+#     never heap-grow);
+#   - no blocking (may_block=false — the Mutex/lock/wait paths classify
+#     through the seeded pthread_*/sched_yield Block records, so a
+#     normal Mutex::lock inside a handler is a violation, not a codegen
+#     concern);
+#   - no sleep (may_sleep=false — the sleep family seeds may_block AND
+#     may_sleep, and the Block class view folds either flag);
+#   - no spawn (may_spawn=false — the Spawn class: a handler must never
+#     create or schedule tasks/threads; every seeded/classified
+#     operation that could classify as spawn-only fails the class proof
+#     like any other class, and an unknown/indirect site fails closed —
+#     the summary cannot rule spawning out);
+#   - no uncontrolled I/O (may_io=false) EXCEPT the MMIO/hardware
+#     capability: the volatile/MMIO extern family records may_io=false
+#     plus the MMIO capability (capability_id_mmio below), so a
+#     volatile hardware-register access inside a handler is the
+#     permitted carve-out — exactly that capability, nothing else of
+#     the Io class;
+#   - no REENTRANCY — a handler must never reach itself through a call
+#     path of the lowered program (mir.tg's mir_effect_reentry_path):
+#     a reentrant ISR nests activations and its stack depth is
+#     unbounded. With no allocation and no reentrancy, the handler's
+#     own activation is entered once per interrupt and its frame depth
+#     is statically bounded; a per-handler stack-BOUND knob is NOT
+#     expressible — the parser rejects @interrupt(...) attribute
+#     arguments (E110) — so the bound knob is the documented follow-up
+#     (the deferred list below).
+# Unsafe is NOT an interrupt-context effect: may_unsafe stays permitted
+# inside a handler under the existing unsafe rules only (the language's
+# `unsafe` discipline governs where unsafe operations may appear; the
+# interrupt arm adds no unsafe gate of its own — an unsafe raw-register
+# write lowers to a plain store and dirties no forbidden class).
+# may_panic likewise has no class (panic-class operations record the
+# flag; a handler that panics is a separate correctness question from
+# the interrupt-context effect contract, so no E0232 follows from it).
+# The MIR-side pass implements this as the @interrupt enforcement arm
+# of check_effect_class_annotations_mir (mir.tg): the four classes via
+# effect_class_forbidden_classes (the irq-safe three plus Spawn) and
+# the reentrancy rule as its own E0232 naming the cycle path.
+#
 # Deliberately deferred (not implemented in this slice):
 #   - the P1-16 handler-runtime/vector-table integration BEYOND the
 #     proof (the vector-table collection remains the embedded route's
@@ -8877,7 +8986,13 @@ end
 #     so the summaries cover the whole closure and foreign functions are
 #     unknown unless seeded;
 #   - optimization/codegen uses of the proven classes (a @no_alloc
-#     function's body is a candidate for the allocator-free targets).
+#     function's body is a candidate for the allocator-free targets);
+#   - the per-handler stack-BOUND knob (an @interrupt(...) attribute
+#     argument): the parser rejects the argument form today (E110), so
+#     the bound is not expressible; the no-allocation + no-reentrancy
+#     interrupt-context rules above bound the handler stack without it
+#     (audit item 42 note — a follow-up only if a real handler needs a
+#     tighter bound than the static guarantee).
 
 # The attribute spelling of an annotation (diagnostics and the
 # extraction's reverse mapping).
@@ -8992,48 +9107,65 @@ def effect_class_annos_of_claims(claims: Vec[EffectClassClaim]) -> Vec[EffectAnn
   out
 end
 
-# The classes an annotation FORBIDS. @interrupt (audit P1-16) claims
-# the SAME classes as @irq_safe: an interrupt handler must be provably
-# irq-safe — no allocation, no blocking, no I/O — and the enforcement
-# step applies the identical transitive proof to both spellings (the
-# @effects(no_alloc, no_block, no_io) list forbids each class it names,
-# claim by claim).
+# The classes an annotation FORBIDS. @irq_safe claims the three
+# spellable classes (no allocation, no blocking, no I/O) and the
+# enforcement step applies the identical transitive proof to the
+# compositional @effects(no_alloc, no_block, no_io) spelling (each
+# named class forbids itself, claim by claim).
+# (audit item 42 — the interrupt context): the @interrupt arm forbids
+# the irq-safe three PLUS the Spawn class — the interrupt-context
+# rules: no allocation (Alloc = may_allocate), no blocking (Block =
+# may_block OR may_sleep — the sleep family seeds set both; the
+# Mutex/lock/wait paths set may_block through the pthread_*/sched_yield
+# seeds), no uncontrolled I/O (Io = may_io — the MMIO capability, a
+# volatile hardware-register access with may_io=false, is the carve-out
+# that stays permitted), and no task/thread spawn (Spawn = may_spawn —
+# a handler-only rule, not spellable by any attribute; @irq_safe keeps
+# the documented three-class composition). The MIR-side enforcement arm
+# (check_effect_class_annotations_mir, mir.tg) applies these classes
+# PLUS the handler-only no-reentrancy rule (mir_effect_reentry_path) to
+# every @interrupt claim.
 def effect_class_forbidden_classes(anno: EffectAnnotation) -> Vec[EffectClass]
   match anno
   when EffectAnnotation::NoAlloc then Vec::from([EffectClass::Alloc])
   when EffectAnnotation::NoBlock then Vec::from([EffectClass::Block])
   when EffectAnnotation::NoIo then Vec::from([EffectClass::Io])
   when EffectAnnotation::IrqSafe then Vec::from([EffectClass::Alloc, EffectClass::Block, EffectClass::Io])
-  when EffectAnnotation::Interrupt then Vec::from([EffectClass::Alloc, EffectClass::Block, EffectClass::Io])
+  when EffectAnnotation::Interrupt then Vec::from([EffectClass::Alloc, EffectClass::Block, EffectClass::Io, EffectClass::Spawn])
   end
 end
 
-# The class word for messages ("allocation" / "blocking" / "I/O").
+# The class word for messages ("allocation" / "blocking" / "I/O" /
+# "spawning").
 def effect_class_word(c: EffectClass) -> String
   match c
   when EffectClass::Alloc then "allocation"
   when EffectClass::Block then "blocking"
   when EffectClass::Io then "I/O"
+  when EffectClass::Spawn then "spawning"
   end
 end
 
 # The violation phrase ("may heap-allocate" / "may block" / "may
-# perform I/O").
+# perform I/O" / "may spawn").
 def effect_class_phrase(c: EffectClass) -> String
   match c
   when EffectClass::Alloc then "may heap-allocate"
   when EffectClass::Block then "may block"
   when EffectClass::Io then "may perform I/O"
+  when EffectClass::Spawn then "may spawn"
   end
 end
 
 # The evidence-slot index of a class (the MIR pass's per-function
-# evidence vectors are positional: [0]=Alloc [1]=Block [2]=Io).
+# evidence vectors are positional: [0]=Alloc [1]=Block [2]=Io
+# [3]=Spawn).
 def effect_class_slot_index(c: EffectClass) -> Int
   match c
   when EffectClass::Alloc then 0
   when EffectClass::Block then 1
   when EffectClass::Io then 2
+  when EffectClass::Spawn then 3
   end
 end
 
@@ -9064,18 +9196,25 @@ end
 # destruction lowers to its drop glue / finalizer call chain).
 #
 # The class view over the record (what the claims forbid) is the
-# 3-class mapping above (effect_class_forbidden_classes): Alloc = the
+# mapping above (effect_class_forbidden_classes): Alloc = the
 # may_allocate flag, Block = may_block OR may_sleep (a sleep is a
-# blocking wait — the sleep family's records set both), Io = may_io.
-# The remaining flags (may_spawn / may_panic / may_unsafe) and the
-# capabilities (Arena — a bounded bump-arena allocation, which is NOT a
+# blocking wait — the sleep family's records set both), Io = may_io,
+# Spawn = may_spawn (the interrupt-context class — @interrupt only).
+# The remaining flags (may_panic / may_unsafe) and the capabilities
+# (Arena — a bounded bump-arena allocation, which is NOT a
 # heap allocation: BumpArena-style ops record may_allocate=false and the
 # arena capability; Mmio — a volatile memory-mapped hardware-register
 # access, which is a memory access, not an I/O operation: the volatile
 # family records may_io=false and the mmio capability, so the P1-16
 # interrupt-handler checklist's permitted MMIO register access stays
 # permitted) are recorded canonically on the summary for the checks and
-# consumers that consult them. A record is never silently clean: an
+# consumers that consult them. The @interrupt decision on may_unsafe
+# (audit item 42): UNSAFE IS NOT FORBIDDEN — an unsafe operation in a
+# handler stays permitted under the existing unsafe rules only (the
+# language's own unsafe gate; the effect-class arm adds none), because
+# may_unsafe records a memory-safety discipline, never an
+# interrupt-context effect; it is recorded for the consumers that
+# consult it and produces no E0232. A record is never silently clean: an
 # operation whose behavior cannot be bounded (an unknown extern, an
 # indirect closure/function-pointer call, an algebraic-effect perform)
 # carries effect_summary_unknown — every may_* flag, fail closed.
@@ -9190,12 +9329,13 @@ end
 # Whether a summary violates a class claim — the class view over the
 # record: Alloc = may_allocate; Block = may_block OR may_sleep (a sleep
 # suspends the caller — the Block class of the annotation semantics);
-# Io = may_io.
+# Io = may_io; Spawn = may_spawn (the @interrupt-only class).
 def effect_summary_has_class(summary: EffectSummary, c: EffectClass) -> Bool
   match c
   when EffectClass::Alloc then summary.may_allocate
   when EffectClass::Block then summary.may_block || summary.may_sleep
   when EffectClass::Io then summary.may_io
+  when EffectClass::Spawn then summary.may_spawn
   end
 end
 
@@ -9333,7 +9473,11 @@ def effect_summary_of_extern_name(name: String) -> Option[EffectSummary]
     # carries the MMIO (hardware register access) capability — a
     # hardware effect permitted by the class claims (the audit P1-16
     # interrupt-handler checklist permits MMIO register access in a
-    # handler).
+    # handler). Audit item 42: this IS the interrupt-context
+    # no-uncontrolled-I/O carve-out — MMIO/volatile access classifies
+    # under the hardware capability (may_io=false, never the Io class),
+    # so the @interrupt / @irq_safe proofs permit exactly that
+    # capability and nothing else of the Io class.
     return Option::Some(effect_summary_with_capability(EffectSummary {}, capability_id_mmio()))
   end
   if name.starts_with("_tg_hash") || name.starts_with("_tg_eq") then
@@ -18233,18 +18377,43 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
     # RAW Slice view (UnsafeSlice) stores the raw view in a container —
     # rejected (the array-literal arm's rule).
     check_no_escaping_slice(env, &elem_type, expr.span, "stored in a container (array repeat element)")
-    # Repeat-safety gate: the MIR writes the element's IMAGE into every
-    # slot — a payload-less enum variant image (a tag-only value such as
-    # Option::None, duplicatable under any element type) or a SCALAR copy.
-    # An image that can own resources (a String, an Option::Some of an
-    # owning payload, a container) can never be duplicated across slots.
-    if !repeat_elem_image_safe(env, &elem, &elem_type) then
-      type_add_error(env, "array repeat element must be a scalar (Int/UInt/Char/Bool/float) or a payload-less enum variant value such as Option::None (the element's image is written into every slot, so a value that can own resources cannot be repeated)", elem.span)
-    end
     let _count_type = check_expr(env, &count)
+    # (audit item 50 — the repeat-array ownership semantics): the rule for
+    # [expr; count] is the Rust-style Copy rule — the element EXPRESSION's
+    # type must be Copy — except the compiler-recognized zero-payload
+    # qualified enum-variant values (Option::None), whose repeated image is
+    # the TAG WORD — Copy under any element type (a None slot's payload area
+    # is never read and its drop glue is tag-trivial, so the image is
+    # duplicatable even when the SLOT type owns resources). The MirRepeat
+    # lowering (mir.tg lr_array_repeat / codegen's MirRepeat fill) writes
+    # ONE element IMAGE (a register-sized scalar value or a tag word) into
+    # every slot:
+    #   (a) N > 1 — duplicating an owning/affine element N times would
+    #       duplicate owned state; the gate below requires the element
+    #       value to be Copy (a scalar type; multi-word Copy aggregates are
+    #       outside the expressible image class of the fill and stay
+    #       rejected by repeat_elem_image_safe);
+    #   (b) N == 1 — the single-element store. [elem; 1] of an OWNING value
+    #       would be a one-element MOVE (this arm records the element
+    #       consume). DECISION: the single-value path CANNOT be made
+    #       ownership-correct in this slice, so owning elements are
+    #       rejected at N == 1 too:
+    #         - the MirRepeat fill has no source-invalidation move path —
+    #           it loads the element's IMAGE and stores that image into the
+    #           slot, and codegen's per-slot store carries only
+    #           storage_width_of bytes (a multi-word owning image — a
+    #           String, a Box, an Option::Some payload — is never storable
+    #           that way);
+    #         - the MIR verifier's no-bitwise-copy rule
+    #           (verifier_check_operand_ownership, "repeat operand")
+    #           rejects a MirCopy of a non-trivially-copyable element.
+    #       The Copy gate below therefore applies uniformly to count 1 and
+    #       every larger count; the count only selects the diagnostic
+    #       wording (the N == 1 text states the single-store rule).
     # The count decides the array form (literal -> concrete; in-scope const
-    # parameter -> symbolic). The count is restricted to the two forms the
-    # MIR can lower as a constant count operand.
+    # parameter -> symbolic) and selects the element-gate wording below. The
+    # count is restricted to the two forms the MIR can lower as a constant
+    # count operand.
     match repeat_count_form(env, &count)
     when RepeatCountForm::Literal(n) then
       if n < 0 then
@@ -18252,10 +18421,26 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
       elsif n > MAX_FIXED_ARRAY_ELEMS() then
         type_add_error(env, "array repeat count " + n.to_string() + " exceeds the maximum supported length " + MAX_FIXED_ARRAY_ELEMS().to_string(), count.span)
       end
+      # (audit item 50(b) — the N == 1 single-element decision): a literal
+      # count of ONE is the single-element store. The Copy gate below is
+      # applied UNIFORMLY — the N == 1 wording states the concrete rule.
+      if !repeat_elem_image_safe(env, &elem, &elem_type) then
+        if n == 1 then
+          type_add_error(env, "array repeat requires Copy elements: [elem; 1] stores the element's image into the single slot, and an owning/affine element (a String, a Box, a container, a resource) would need an ownership-correct one-element MOVE — not expressible by the MirRepeat single-image store in this slice (no source-invalidation move path; the per-slot store carries only a register image) — so count 1 rejects owning elements exactly like every larger count (the accepted elements are scalar values and payload-less enum variant values such as Option::None)", elem.span)
+        else
+          type_add_error(env, "array repeat requires Copy elements: the element expression's value is duplicated into every slot (the MIR fill writes one element image per slot), so an owning/affine element (a String, a Box, a container, a resource — never Copy) cannot be repeated; the accepted elements are scalar values (a multi-word Copy aggregate — a struct, tuple, or fixed array wider than a machine word — is outside the expressible image class of the single-register fill) and payload-less enum variant values such as Option::None, whose repeated image is the tag word", elem.span)
+        end
+      end
       Type::FixedArray(elem_type, n)
     when RepeatCountForm::ConstParam(gpid) then
-      # (symbolic): the count names the enclosing declaration's own const
-      # parameter — the symbolic-size array type, the [T; N] body form.
+      # (symbolic count): the count names the enclosing declaration's own
+      # const parameter — the symbolic-size array type, the [T; N] body
+      # form. The template cannot know the instance count (it instantiates
+      # to any value >= 0, including 1), so the element gate is the SAME
+      # uniform Copy rule as the literal arms.
+      if !repeat_elem_image_safe(env, &elem, &elem_type) then
+        type_add_error(env, "array repeat requires Copy elements: the element expression's value is duplicated into every slot of the symbolic-size array (the MIR fill writes one element image per slot, and the instance count N is unknown at template time — it can be 1 or larger), so an owning/affine element (a String, a Box, a container, a resource — never Copy) cannot be repeated; the accepted elements are scalar values (a multi-word Copy aggregate is outside the expressible image class of the single-register fill) and payload-less enum variant values such as Option::None, whose repeated image is the tag word", elem.span)
+      end
       Type::FixedArraySym(elem_type, gpid)
     when RepeatCountForm::Other then
       type_add_error(env, "array repeat count must be an integer literal or an in-scope const generic parameter (constant arithmetic and const references are not yet supported as repeat counts)", count.span)
@@ -21489,16 +21674,72 @@ def const_sym_tree_subst_consts(tree: ConstExprT, consts: Map[Int, Type]) -> Con
   end  end
 end
 
+# (§20 const generics / audit item 49): the DOCUMENTED identity
+# normalization of a symbolic const-expression tree — the normalization
+# model applies ONLY where the language declares equivalence (the
+# identity-folding rules), recursively at every node:
+#   N + 0 -> N      0 + N -> N      N * 1 -> N
+# COMMUTATIVITY IS NOT NORMALIZED: `N + M` and `M + N` stay DIFFERENT
+# trees, and `2 * N` stays different from `N * 2` (the audit's
+# syntax==semantic-conflation warning: without a defined model, no
+# algebraic rewrite is applied — the defined model is exactly the three
+# identity rules above, nothing more; in particular `1 * N` is NOT
+# folded, so the literal-left multiplication spelling stays distinct
+# from `N` exactly like `2 * N` stays distinct from `N * 2`). The rules
+# are VALUE-PRESERVING (adding 0 / multiplying by 1 never overflows and
+# never changes the folded value), so normalizing BEFORE evaluation is
+# sound: a tree and its normalized form evaluate to the same Const or
+# stay symbolic together. Two call-site spellings that fold to the same
+# tree (`N + 0` vs `N`) are therefore the SAME symbolic type argument
+# from the moment the tree is folded, while spellings the model does not
+# equate keep their order-sensitive structural identity.
+def const_sym_tree_fold_identities(tree: ConstExprT) -> ConstExprT
+  match tree
+  when ConstExprT::ConstLit(_) then tree.clone()
+  when ConstExprT::ConstParamRef(_) then tree.clone()
+  when ConstExprT::ConstAdd(l, r) then
+    let l2 = const_sym_tree_fold_identities(&l)
+    let r2 = const_sym_tree_fold_identities(&r)
+    match r2
+    when ConstExprT::ConstLit(0) then l2
+    when _ then
+      match l2
+      when ConstExprT::ConstLit(0) then r2
+      when _ then ConstExprT::ConstAdd(l2, r2)
+      end
+    end
+  when ConstExprT::ConstMul(l, r) then
+    let l2 = const_sym_tree_fold_identities(&l)
+    let r2 = const_sym_tree_fold_identities(&r)
+    match r2
+    when ConstExprT::ConstLit(1) then l2
+    when _ then ConstExprT::ConstMul(l2, r2)
+    end
+  when ConstExprT::ConstSub(l, r) then
+    ConstExprT::ConstSub(const_sym_tree_fold_identities(&l), const_sym_tree_fold_identities(&r))
+  when ConstExprT::ConstDiv(l, r) then
+    ConstExprT::ConstDiv(const_sym_tree_fold_identities(&l), const_sym_tree_fold_identities(&r))
+  when ConstExprT::ConstMod(l, r) then
+    ConstExprT::ConstMod(const_sym_tree_fold_identities(&l), const_sym_tree_fold_identities(&r))
+  when ConstExprT::ConstNeg(o) then
+    ConstExprT::ConstNeg(const_sym_tree_fold_identities(&o))
+  end  end
+end
+
 # (§20 slice 2): the symbolic-tree substitution RESULT of a Type::ConstSym
-# slot under one of the leaf-substituters above: substitute the leaves, then
-# fold — a fully-literal tree is CANONICALIZED to Type::Const(v) (the
-# instance's const-slot value; spelling-independent identity), a tree with
-# surviving parameter leaves stays Type::ConstSym (the forwarded symbolic
-# form — a nested declaration's parameters).
+# slot under one of the leaf-substituters above: substitute the leaves,
+# normalize by the DOCUMENTED identity rules
+# (const_sym_tree_fold_identities — audit item 49: `N + 0` / `0 + N` /
+# `N * 1` collapse; commutativity is never normalized), then fold — a
+# fully-literal tree is CANONICALIZED to Type::Const(v) (the instance's
+# const-slot value; spelling-independent identity), a tree with surviving
+# parameter leaves stays Type::ConstSym (the forwarded symbolic form — a
+# nested declaration's parameters) in its normalized spelling.
 def const_sym_fold_type(t2: ConstExprT) -> Type
-  match const_sym_tree_eval(&t2)
+  let n2 = const_sym_tree_fold_identities(&t2)
+  match const_sym_tree_eval(&n2)
   when Option::Some(v) then Type::Const(v)
-  when Option::None then Type::ConstSym(t2)
+  when Option::None then Type::ConstSym(n2)
   end  end
 end
 
@@ -21654,17 +21895,30 @@ def repeat_count_form(env: TypeEnv, count: Expr) -> RepeatCountForm
 end
 
 # The repeat-literal element gate: whether the element's IMAGE can be
-# duplicated into every slot of the [elem; count] array:
-#   - a scalar element type (engine-Immediate storage, at most 8 bytes):
-#     the image is a plain value — duplicated by copy;
+# duplicated into every slot of the [elem; count] array (audit item 50 —
+# the Rust-style Copy rule, restricted to the images the MirRepeat fill can
+# express):
+#   - a scalar element type (engine-Immediate storage, at most 8 bytes): a
+#     scalar is Copy (is_trivially_copyable is structurally true) and the
+#     image is a plain value — duplicated by copy;
 #   - a QUALIFIED payload-less enum variant value (Option::None): the MIR
 #     element image is the tag-only constant — a None slot's payload area is
 #     never read and the slot's drop glue is tag-trivial, so the image is
 #     duplicatable under ANY element type (the same invariant the
-#     concrete-family `[Option::None, ...]` aggregate fills rely on).
-# Every other element (a String, a Some carrying an owning payload, a
-# container, a bare payload-less variant identifier — whose value the
-# checker cannot tie to a constant image) is rejected at the repeat site.
+#     concrete-family `[Option::None, ...]` aggregate fills rely on). The
+#     resulting image (the tag word) is itself Copy, which is the exception
+#     the Copy rule allows for a compiler-recognized zero-payload value.
+# Every other element — an owning or affine value (a String, a Some
+# carrying an owning payload, a container, a resource: is_trivially_copyable
+# false), a bare payload-less variant identifier (whose value the checker
+# cannot tie to a constant image), OR a Copy aggregate wider than the fill's
+# single-register image (a multi-word struct/tuple/fixed-array — the
+# per-slot store carries only storage_width_of bytes) — is rejected at the
+# repeat site. The gate is COUNT-INDEPENDENT: the N == 1 single-element
+# store rejects owning elements under the same rule (audit item 50(b) — the
+# ownership-correct one-element MOVE is not expressible by the MirRepeat
+# fill in this slice), so the count never weakens the gate; it only selects
+# the diagnostic wording at the call site.
 def repeat_elem_image_safe(env: TypeEnv, elem: Expr, elem_ty: Type) -> Bool
   match elem_ty
   when Type::Bool then true
@@ -21899,7 +22153,7 @@ def resolve_type_expr(inout env: TypeEnv, te: TypeExpr) -> Type
             name: name.clone(),
             def_kind: TypeDefKind::Opaque,
             generic_params: Vec::new(),
-            kind: TypeKind::Value
+            kind: TypeKind::Value,
             def: Option::None
           }
           env.type_name_index.insert(name.clone(), env.type_list.len())
@@ -21962,7 +22216,15 @@ def resolve_type_expr(inout env: TypeEnv, te: TypeExpr) -> Type
         # evaluator fails closed on; keep the ONE const-argument
         # diagnostic instead of fabricating an unevaluable literal tree.
         if const_sym_tree_has_param(&tree) then
-          Type::ConstSym(tree)
+          # (audit item 49): the recorded symbolic form is FOLDED through
+          # const_sym_fold_type — the identity normalization (N + 0 / 0 + N
+          # / N * 1 collapse to N; commutativity is NOT normalized) applies
+          # AT RECORD TIME, so two call-site spellings that the model
+          # equates (`N + 0` vs `N`) record the SAME ConstSym tree and the
+          # SAME instance identity from here on (the tree still carries a
+          # parameter leaf, so the fold stays symbolic — it never
+          # fabricates a value).
+          const_sym_fold_type(&tree)
         else
           type_add_error(env, "const generic argument must be a constant expression (an integer literal, a module const reference, an in-scope const parameter reference, or constant arithmetic over them)", expr.span)
           Type::Const(0)

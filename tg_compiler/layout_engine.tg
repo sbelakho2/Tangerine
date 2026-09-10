@@ -13,6 +13,13 @@ use tg_compiler::token::{span_dummy}
 use tg_compiler::ast::{LayoutAttrs, layout_attrs_plain}
 use tg_compiler::types::{Type, TypeId, subst_type_args}
 use tg_compiler::mir::{MirTypeDef, MirTypeDefKind, MirFieldDef, MirVariantDef, mir_type_identity_key}
+# The canonical per-target ABI record (audit items 28 + 29): the ABI call
+# plan below is driven by TargetDesc (arch / arg_regs / float_abi / fpu /
+# stack_alignment) — the target identity data lives in target_desc.tg, the
+# value classification lives here, and the plan is the one bridge between
+# them. Every per-target register list is read from the desc, never
+# re-derived as an arch conditional in a consumer.
+use tg_compiler::target_desc::{TargetDesc, Arch, FloatAbi}
 
 # ———————————————————————————————————————————————————————————————
 # Failure Class Categorization
@@ -3396,4 +3403,671 @@ def compute_all_layouts(inout engine: LayoutEngine) -> Unit
       engine.records.insert(mir_type_identity_key(&cty), rec)
     end
   end
+end
+
+# ———————————————————————————————————————————————————————————————
+# THE ABI CALL PLAN (audit items 28 + 29) — the ONE classification
+# authority shared by the direct emitter (codegen.tg), LIR (lir.tg), the
+# extern dispatch, callback/closure marshalling and bindgen validation.
+# ———————————————————————————————————————————————————————————————
+# WHAT THIS IS.  Every consumer that needs to know HOW a value crosses a
+# call boundary asks this module — never an ad-hoc size/register test.
+# The plan is built from the EXISTING value classification
+# (classify_value_category — the layout engine's single category
+# authority) plus the target's ABI data (TargetDesc: arch, arg_regs,
+# float_abi, fpu, stack_alignment), so the two layers that used to
+# re-derive locations independently (codegen.tg's per-arg AbiArg walk and
+# lir.tg's per-class gp/fp/stk walk) now derive them from ONE answer.
+#
+# THE PLAN RECORD (AbiCallPlan):
+#   args: Vec[AbiParam] — one entry per declared parameter, in
+#     declaration order.  An aggregate that occupies several physical
+#     registers is still ONE entry; its `location` carries every register
+#     it consumes, comma-separated, in ABI order ("x0,x1").
+#   ret: AbiReturn — the result crossing.  VoidT for a zero-sized result,
+#     GprT/GprPairT for the integer word(s), FprT/FprPairT for the
+#     floating-point/vector register file, SRetT for the indirect
+#     (caller-supplied buffer) crossing.
+#   variadic: Bool — the declaration is variadic ("extern def f(a, ...)").
+#   stack_arg_bytes: Int — the total caller-stack bytes the classified
+#     parameters occupy (0 when every parameter rode a register file).
+#
+# AbiParam.class_word vocabulary (the crossing class, not the value's
+# source-language type):
+#   "zero"    — no payload (zero-sized); consumes no slot.
+#   "int"     — the value itself travels in a general register/stack slot
+#                (integers, Bool, Char, pointers/handles, and the
+#                canonical ONE-word enum TaggedPtr value — see item 29).
+#   "float"   — the value travels in the floating-point register file
+#                when the target's float_abi is Hard, else in a general
+#                slot at its width (Soft targets).
+#   "vector"  — a SIMD vector slot (the 16-byte vector row).
+#   "pair"    — a 16-byte aggregate image in the INTERNAL convention: the
+#                slot carries the image ADDRESS (indirect = true), exactly
+#                the compiler's by-reference aggregate crossing.
+#   "memory"  — a >16-byte aggregate image in the INTERNAL convention:
+#                the slot carries the image ADDRESS (indirect = true).
+# AbiParam.location is the register/file name the target's own backend
+# consumes (desc.arg_regs entries: "x0"/"rdi"/"r0"/"a0"; the FP names
+# "d0"/"xmm0"/"fa0") or "stack+<byte-offset>" / "none".  The strings are
+# the SAME names the desc's register lists carry, so a backend consumes a
+# location without an arch conditional of its own.
+# AbiParam.indirect is true exactly when the location carries an ADDRESS
+# of the payload (the internal pair/memory aggregate convention, and the
+# 16-byte vector row's address-in-slot convention).  AbiParam.extension is
+# the boundary extension of a narrow integer ("none"/"sign"/"zero").
+# AbiParam.alignment and .size are the payload's byte alignment and size
+# (0/1 for the zero class) — consumers size their copies from these, never
+# from a rounded slot.
+#
+# FLAVORS (why the plan has a flavor at all):
+#   AbiFlavor::InternalValue — the compiler's OWN whole-program convention
+#     (what two functions compiled by the same route must agree on).  This
+#     is the flavor codegen.tg and lir.tg consume.
+#   AbiFlavor::ExternC — the platform C ABI (AAPCS64 / SysV AMD64 /
+#     AAPCS32 / the RISC-V psABI) that a REAL external callee follows.
+#     This is the flavor extern/callback/bindgen validation consumes.
+# A single plan function with an explicit flavor is still ONE authority:
+# no consumer re-derives a rule, and the two flavors can never drift
+# because the flavor is a parameter of the same table.
+#
+# AUDIT ITEM 29 — THE ENUM REPRESENTATION DECISION.  The canonical value
+# representation of a registered TaggedPtr-represented enum is ONE
+# pointer-width word (layout_engine's EnumValueRepresentation::TaggedPtr:
+# a raw discriminant below the 256-byte inline-tag threshold, or a heap
+# pointer to the inline {tag @ 0, payload @ 8} image).  The plan therefore
+# classifies EVERY TaggedPtr enum — payload-carrying or not — as
+# "int"/pointer in the InternalValue flavor, and as "int" in the ExternC
+# flavor only when the enum is payload-LESS (a payloaded enum's TaggedPtr
+# word is a compiler-private encoding, NOT an FFI value, so ExternC
+# classifies it fail-closed).  See classify_enum_crossing below for the
+# one per-enum crossing authority; lir.tg's LIR-internal inline-image
+# adaptation is declared against it (and its boundary conversion is the
+# documented remaining step there).
+pub enum AbiFlavor
+  InternalValue
+  ExternC
+end
+
+pub enum AbiReturn
+  VoidT
+  GprT
+  GprPairT
+  FprT
+  FprPairT
+  SRetT
+end
+
+pub struct AbiParam
+  class_word: String
+  location: String
+  indirect: Bool
+  extension: String
+  alignment: Int
+  # The payload byte size.  The audit's AbiParam shape carries the five
+  # fields before this one; `size` is the additive sixth because every
+  # consumer needs the payload length (the address-carried aggregates and
+  # the boundary copies are sized from it) and the plan is the only place
+  # that may know it.
+  size: Int
+end
+
+pub struct AbiCallPlan
+  args: Vec[AbiParam]
+  ret: AbiReturn
+  variadic: Bool
+  stack_arg_bytes: Int
+end
+
+# The crossing of ONE registered enum value: the item-29 authority.  Both
+# routes ask this question; neither contains the representation policy.
+pub enum AbiEnumCrossing
+  # The canonical ONE-word TaggedPtr crossing (the EnumLayout's value
+  # representation) — what the direct route does and what any TRUE
+  # boundary between representations must use.
+  ValueWord
+  # The LIR-internal adaptation: the inline image crosses by reference
+  # (the sret x8 copy-out / the image address in the argument's slot)
+  # because the LIR route has no heap to build the TaggedPtr word.  NOT a
+  # canonical crossing; only LIR-compiled callees may receive it, and any
+  # extern/non-LIR counterpart must fail closed.
+  InlineImage
+  # The inline image IS the value word (a payload-less InlineTagged
+  # enum): the two routes already agree bit-for-bit.
+  InlineScalar
+end
+
+# ———————————————————————————————————————————————————————————————
+# Plan helpers
+# ———————————————————————————————————————————————————————————————
+
+def abi_is_float_type(ty: Type) -> Bool
+  match ty
+  when Type::Float then true
+  when Type::F32 then true
+  when Type::F64 then true
+  when _ then false
+  end
+end
+
+def abi_float_width(ty: Type) -> Int
+  match ty
+  when Type::F32 then 4
+  when Type::Float then 8
+  when Type::F64 then 8
+  when _ then 8
+  end
+end
+
+# The boundary extension of a narrow integer value: signed narrows
+# sign-extend, unsigned narrows (and Bool/Char) zero-extend, the
+# full-word types are already canonical.
+def abi_extension_of(ty: Type) -> String
+  match ty
+  when Type::I8 then "sign"
+  when Type::I16 then "sign"
+  when Type::I32 then "sign"
+  when Type::U8 then "zero"
+  when Type::U16 then "zero"
+  when Type::U32 then "zero"
+  when Type::Bool then "zero"
+  when Type::Char then "zero"
+  when _ then "none"
+  end
+end
+
+# Is the target's FP register file in use for argument crossing?  Only
+# FloatAbi::Hard enables the FP ABI registers (an FPU-less target is
+# always Soft and crosses floats in the general file / on the stack).
+def abi_fpr_available(desc: TargetDesc) -> Bool
+  match desc.float_abi
+  when FloatAbi::Hard then true
+  when _ then false
+  end
+end
+
+# The target's integer argument-register name at position `index`, or the
+# caller-stack name the consumer uses beyond the register file.
+def abi_gpr_name(desc: TargetDesc, index: Int) -> String
+  if index >= 0 && index < desc.arg_regs.len() then
+    desc.arg_regs[index].clone()
+  else
+    "stack+" + index.to_string()
+  end
+end
+
+# The target's floating-point argument-register name at position `index`
+# (the register file's own numbering: d/xmm/fa).
+def abi_fpr_name(desc: TargetDesc, index: Int) -> String
+  match desc.arch
+  when Arch::AArch64 then "d" + index.to_string()
+  when Arch::X86_64 then "xmm" + index.to_string()
+  when Arch::Armv6M then "d" + index.to_string()
+  when Arch::Armv7M then "d" + index.to_string()
+  when Arch::RiscV32 then "fa" + index.to_string()
+  when Arch::RiscV64 then "fa" + index.to_string()
+  end
+end
+
+# The byte size of ONE caller-stack slot for a stacked value.  The
+# INTERNAL convention uses the compiler's caller-slot geometry: a uniform
+# 16-byte slot on aarch64, an 8-byte push on x86-64, and one machine word
+# on the 32-bit routes.  The ExternC convention uses the platform's
+# natural slot rounded up to its stack unit.
+def abi_stack_slot_size(desc: TargetDesc, internal_convention: Bool, size: Int) -> Int
+  let unit = match desc.arch
+  when Arch::Armv6M then 4
+  when Arch::Armv7M then 4
+  when Arch::RiscV32 then 4
+  when _ then 8
+  end
+  if internal_convention then
+    match desc.arch
+    when Arch::AArch64 then 16
+    when Arch::X86_64 then 8
+    when _ then unit
+    end
+  else
+    if size <= 0 then unit
+    elsif size % unit == 0 then size
+    else (size / unit + 1) * unit
+    end
+  end
+end
+
+# THE canonical image classification of the compiler's INTERNAL
+# convention, size-parameterized: this is the exact rule the LIR route's
+# aggregate machinery uses (lir_agg_is_scalar_class / lir_agg_sret_words
+# route through this function) and the direct emitter's
+# ValueCategory::Scalar/ScalarPair/ByAddress mapping mirrors:
+#   size 0       -> "zero"   (no payload)
+#   1..8         -> "int"    (one word crossing by value)
+#   9..16        -> "pair"   (the two-word image: by reference internally)
+#   >16          -> "memory" (the by-address image: by reference internally)
+pub def abi_internal_image_class(size: Int) -> String
+  if size == 0 then
+    "zero"
+  elsif size <= 8 then
+    "int"
+  elsif size <= 16 then
+    "pair"
+  else
+    "memory"
+  end
+end
+
+def abi_is_taggedptr_enum(inout engine: LayoutEngine, ty: Type) -> Bool
+  match ty
+  when Type::Adt(tid, _) then
+    if is_enum_type_def(engine, tid.id) then
+      match enum_layout_for_type(engine, ty)
+      when Option::Some(el) then
+        match el.representation
+        when EnumValueRepresentation::TaggedPtr(_) then true
+        when _ then false
+        end
+      when Option::None then false
+      end
+    else
+      false
+    end
+  when _ then false
+  end
+end
+
+# Does the enum's image carry payload words (any variant's payload is
+# non-empty)?  A TaggedPtr enum with payload crosses as a heap pointer in
+# the canonical representation and is never an FFI C value.
+def abi_enum_has_payload(inout engine: LayoutEngine, ty: Type) -> Bool
+  match enum_layout_for_type(engine, ty)
+  when Option::Some(el) then
+    var found = false
+    for v in el.variant_layouts do
+      if v.payload_size > 0 then
+        found = true
+      end
+    end
+    found
+  when Option::None then false
+  end
+end
+
+# The payload byte size/alignment of a value type, from the layout
+# authority (primitive fallback for the immediate types so the plan never
+# guesses a word for an unresolved type).
+def abi_value_size_align(inout engine: LayoutEngine, ty: Type) -> (Int, Int)
+  match layout_of_concrete(engine, ty)
+  when Result::Ok(l) then (l.size, l.align)
+  when Result::Err(_) then
+    let ps = primitive_size(engine, ty)
+    if ps >= 0 then (ps, primitive_align(engine, ty)) else (engine.target.pointer_size, engine.target.pointer_align) end
+  end
+end
+
+# THE enum crossing authority (audit item 29).  A registered enum's
+# crossing is decided by its EnumLayout representation, never by a size
+# test in a consumer:
+#   TaggedPtr enum, InternalValue flavor -> ValueWord (the canonical ONE
+#     pointer-width word, payload or not);
+#   TaggedPtr enum, ExternC flavor -> ValueWord for a payload-less enum
+#     (its word IS the raw discriminant), fail-closed for a payloaded one
+#     (the heap-pointer encoding is compiler-private);
+#   InlineTagged enum -> InlineScalar when its whole image is one word
+#     (<= 8 bytes), else InlineImage (the by-reference inline image).
+pub def classify_enum_crossing(inout engine: LayoutEngine, desc: TargetDesc, flavor: AbiFlavor, ty: Type) -> Result[AbiEnumCrossing, LayoutError]
+  let internal_convention = match flavor
+  when AbiFlavor::InternalValue then true
+  when AbiFlavor::ExternC then false
+  end
+  if abi_is_taggedptr_enum(engine, ty) then
+    if !internal_convention && abi_enum_has_payload(engine, ty) then
+      return Result::Err(LayoutError {
+        class: LayoutFailureClass::UNSUPPORTED_TYPE,
+        message: "A payloaded tagged enum is not an FFI-safe extern C value: the canonical representation is the compiler-internal TaggedPtr value word (raw discriminant below the 256-byte inline-tag threshold, heap pointer above). Marshal to a @repr(C) struct or pass an explicit pointer",
+        type_name: mir_type_identity_key(ty),
+        expected: 0,
+        actual: 0,
+        context: "classify_enum_crossing"
+      })
+    end
+    Result::Ok(AbiEnumCrossing::ValueWord)
+  else
+    match ty
+    when Type::Adt(tid, _) then
+      if is_enum_type_def(engine, tid.id) then
+        match enum_layout_for_type(engine, ty)
+        when Option::Some(el) then
+          let size = el.payload_offset + abi_enum_max_payload(engine, ty)
+          if size <= 8 then
+            Result::Ok(AbiEnumCrossing::InlineScalar)
+          else
+            Result::Ok(AbiEnumCrossing::InlineImage)
+          end
+        when Option::None then
+          Result::Err(LayoutError {
+            class: LayoutFailureClass::UNSUPPORTED_TYPE,
+            message: "Registered enum has no EnumLayout record — no crossing",
+            type_name: mir_type_identity_key(ty),
+            expected: 0,
+            actual: 0,
+            context: "classify_enum_crossing"
+          })
+        end
+      else
+        Result::Err(LayoutError {
+          class: LayoutFailureClass::UNSUPPORTED_TYPE,
+          message: "classify_enum_crossing asked about a non-enum type",
+          type_name: mir_type_identity_key(ty),
+          expected: 0,
+          actual: 0,
+          context: "classify_enum_crossing"
+        })
+      end
+    when _ then
+      Result::Err(LayoutError {
+        class: LayoutFailureClass::UNSUPPORTED_TYPE,
+        message: "classify_enum_crossing asked about a non-Adt type",
+        type_name: mir_type_identity_key(ty),
+        expected: 0,
+        actual: 0,
+        context: "classify_enum_crossing"
+      })
+    end
+  end
+end
+
+def abi_enum_max_payload(inout engine: LayoutEngine, ty: Type) -> Int
+  match enum_layout_for_type(engine, ty)
+  when Option::Some(el) then
+    var max_p = 0
+    for v in el.variant_layouts do
+      if v.payload_size > max_p then
+        max_p = v.payload_size
+      end
+    end
+    max_p
+  when Option::None then 0
+  end
+end
+
+# The generic image of a parameter type in the requested flavor:
+# (class_word, size, align, is_float).  For the InternalValue flavor the
+# aggregate classes keep the compiler's by-reference crossing; for the
+# ExternC flavor a <=16-byte composite maps to the two-integer-register
+# C class ("int" with size <= 16 and indirect = false — see
+# abi_place_value) and a larger one to the memory class.
+# (AUDIT P1-13 — HFA/HVA, documented gap): the classifier has no
+# float-member information, so a float-containing composite is classified
+# by its size like an all-integer one; the C plan therefore reports the
+# GP-register class for a two-F64/two-F32 aggregate where AAPCS64/SysV
+# would use FP/SSE registers.  The gap is closed by a member-type scan in
+# a later slice, never by a consumer-side rule.
+def abi_value_image(inout engine: LayoutEngine, cat: ValueCategory, ty: Type, flavor: AbiFlavor) -> Result[(String, Int, Int, Bool), LayoutError]
+  let internal_convention = match flavor
+  when AbiFlavor::InternalValue then true
+  when AbiFlavor::ExternC then false
+  end
+  match cat
+  when ValueCategory::ZeroSized then
+    Result::Ok(("zero", 0, 1, false))
+  when ValueCategory::Scalar(w) then
+    if abi_is_float_type(ty) then
+      Result::Ok(("float", w, w, true))
+    else
+      let sa = abi_value_size_align(engine, ty)
+      Result::Ok(("int", w, sa.1, false))
+    end
+  when ValueCategory::ScalarPair(_, _) then
+    let sa = abi_value_size_align(engine, ty)
+    if internal_convention then
+      Result::Ok(("pair", sa.0, sa.1, false))
+    else
+      Result::Ok(("int", sa.0, sa.1, false))
+    end
+  when ValueCategory::ByAddress(sz) then
+    if internal_convention then
+      Result::Ok(("memory", sz, engine.target.pointer_align, false))
+    else
+      Result::Ok(("memory", sz, engine.target.pointer_align, false))
+    end
+  when ValueCategory::Vector(w) then
+    Result::Ok(("vector", w, w, true))
+  end
+end
+
+# Place ONE classified value: consume the per-class register positions and
+# the shared caller-stack stream, and return the AbiParam.  This is the
+# ONLY place a location is formed for the plan; consumers read the answer.
+def abi_place_value(desc: TargetDesc, flavor: AbiFlavor, class_word: String, size: Int, align: Int, extension: String, inout gp_pos: Int, inout fp_pos: Int, inout stack_bytes: Int) -> AbiParam
+  let gpr_count = desc.arg_regs.len()
+  let fpr_count = if abi_fpr_available(desc) then 8 else 0 end
+  let internal_convention = match flavor
+  when AbiFlavor::InternalValue then true
+  when AbiFlavor::ExternC then false
+  end
+  match class_word
+  when "zero" then
+    AbiParam {
+      class_word: "zero",
+      location: "none",
+      indirect: false,
+      extension: "none",
+      alignment: 1,
+      size: 0
+    }
+  when "float" then
+    if fp_pos < fpr_count then
+      let loc = abi_fpr_name(desc, fp_pos)
+      fp_pos = fp_pos + 1
+      AbiParam { class_word: "float", location: loc, indirect: false, extension: "none", alignment: align, size: size }
+    elsif gp_pos < gpr_count then
+      # A Soft-float target: the float crosses in a general slot at its
+      # width (the plan says "float"; the location names the general
+      # register the backend consumes, so the emitter needs no extra
+      # arch rule).
+      let loc = abi_gpr_name(desc, gp_pos)
+      gp_pos = gp_pos + 1
+      AbiParam { class_word: "float", location: loc, indirect: false, extension: "none", alignment: align, size: size }
+    else
+      let off = stack_bytes
+      stack_bytes = stack_bytes + abi_stack_slot_size(desc, internal_convention, size)
+      AbiParam { class_word: "float", location: "stack+" + off.to_string(), indirect: false, extension: "none", alignment: align, size: size }
+    end
+  when "int" then
+    if gp_pos < gpr_count then
+      let loc = abi_gpr_name(desc, gp_pos)
+      gp_pos = gp_pos + 1
+      AbiParam { class_word: "int", location: loc, indirect: false, extension: extension, alignment: align, size: size }
+    else
+      let off = stack_bytes
+      stack_bytes = stack_bytes + abi_stack_slot_size(desc, internal_convention, size)
+      AbiParam { class_word: "int", location: "stack+" + off.to_string(), indirect: false, extension: "none", alignment: align, size: size }
+    end
+  when "pair" then
+    if internal_convention then
+      # The compiler's internal 16-byte aggregate: ONE general-class slot
+      # carries the image ADDRESS.
+      if gp_pos < gpr_count then
+        let loc = abi_gpr_name(desc, gp_pos)
+        gp_pos = gp_pos + 1
+        AbiParam { class_word: "pair", location: loc, indirect: true, extension: "none", alignment: align, size: size }
+      else
+        let off = stack_bytes
+        stack_bytes = stack_bytes + abi_stack_slot_size(desc, internal_convention, size)
+        AbiParam { class_word: "pair", location: "stack+" + off.to_string(), indirect: true, extension: "none", alignment: align, size: size }
+      end
+    else
+      # The C composite class: <=16 bytes crosses in TWO integer
+      # registers (both must exist; otherwise the whole composite goes to
+      # the stack).
+      if gp_pos + 1 < gpr_count then
+        let loc = abi_gpr_name(desc, gp_pos) + "," + abi_gpr_name(desc, gp_pos + 1)
+        gp_pos = gp_pos + 2
+        AbiParam { class_word: "int", location: loc, indirect: false, extension: "none", alignment: align, size: size }
+      else
+        let off = stack_bytes
+        stack_bytes = stack_bytes + abi_stack_slot_size(desc, internal_convention, size)
+        AbiParam { class_word: "memory", location: "stack+" + off.to_string(), indirect: false, extension: "none", alignment: align, size: size }
+      end
+    end
+  when "memory" then
+    if internal_convention then
+      if gp_pos < gpr_count then
+        let loc = abi_gpr_name(desc, gp_pos)
+        gp_pos = gp_pos + 1
+        AbiParam { class_word: "memory", location: loc, indirect: true, extension: "none", alignment: align, size: size }
+      else
+        let off = stack_bytes
+        stack_bytes = stack_bytes + abi_stack_slot_size(desc, internal_convention, size)
+        AbiParam { class_word: "memory", location: "stack+" + off.to_string(), indirect: true, extension: "none", alignment: align, size: size }
+      end
+    else
+      # C passes a >16-byte composite BY VALUE on the stack (the caller
+      # copies the bytes).  indirect = false: the location IS the payload,
+      # not a pointer to it.
+      let off = stack_bytes
+      let slot = abi_stack_slot_size(desc, internal_convention, size)
+      stack_bytes = stack_bytes + slot
+      AbiParam { class_word: "memory", location: "stack+" + off.to_string(), indirect: false, extension: "none", alignment: align, size: size }
+    end
+  when "vector" then
+    if !internal_convention && fp_pos < fpr_count then
+      let loc = abi_fpr_name(desc, fp_pos)
+      fp_pos = fp_pos + 1
+      AbiParam { class_word: "vector", location: loc, indirect: false, extension: "none", alignment: align, size: size }
+    elsif gp_pos < gpr_count then
+      # The internal vector row and the FPU-less C target both carry the
+      # address in a general slot.
+      let loc = abi_gpr_name(desc, gp_pos)
+      gp_pos = gp_pos + 1
+      AbiParam { class_word: "vector", location: loc, indirect: true, extension: "none", alignment: align, size: size }
+    else
+      let off = stack_bytes
+      stack_bytes = stack_bytes + abi_stack_slot_size(desc, internal_convention, size)
+      AbiParam { class_word: "vector", location: "stack+" + off.to_string(), indirect: true, extension: "none", alignment: align, size: size }
+    end
+  when _ then
+    panic("abi_place_value: unknown ABI class word '" + class_word + "' (the plan's class vocabulary is closed: zero/int/float/vector/pair/memory)")
+  end
+end
+
+# The result crossing.  InternalValue is the compiler's own convention
+# (16-byte and >16-byte images return through the caller-supplied buffer
+# on EVERY target — the category_uses_sret policy; a target whose emitter
+# has not implemented the indirect return yet keeps its existing guard and
+# is documented, never silently re-classified).  ExternC is the platform
+# C return class.
+def abi_classify_return(inout engine: LayoutEngine, desc: TargetDesc, flavor: AbiFlavor, ret_ty: Type) -> Result[AbiReturn, LayoutError]
+  let internal_convention = match flavor
+  when AbiFlavor::InternalValue then true
+  when AbiFlavor::ExternC then false
+  end
+  if abi_is_taggedptr_enum(engine, ret_ty) then
+    if !internal_convention && abi_enum_has_payload(engine, ret_ty) then
+      return Result::Err(LayoutError {
+        class: LayoutFailureClass::UNSUPPORTED_TYPE,
+        message: "A payloaded tagged enum return is not an FFI-safe extern C result (the canonical TaggedPtr word is compiler-private)",
+        type_name: mir_type_identity_key(ret_ty),
+        expected: 0,
+        actual: 0,
+        context: "abi_classify_return"
+      })
+    end
+    return Result::Ok(AbiReturn::GprT)
+  end
+  match classify_value_category(engine, ret_ty)
+  when Result::Err(e) then Result::Err(e)
+  when Result::Ok(cat) then
+    match cat
+    when ValueCategory::ZeroSized then
+      Result::Ok(AbiReturn::VoidT)
+    when ValueCategory::Scalar(_) then
+      if abi_is_float_type(ret_ty) && abi_fpr_available(desc) then
+        Result::Ok(AbiReturn::FprT)
+      else
+        Result::Ok(AbiReturn::GprT)
+      end
+    when ValueCategory::ScalarPair(_, _) then
+      if internal_convention then Result::Ok(AbiReturn::SRetT) else Result::Ok(AbiReturn::GprPairT) end
+    when ValueCategory::ByAddress(_) then
+      Result::Ok(AbiReturn::SRetT)
+    when ValueCategory::Vector(_) then
+      if abi_fpr_available(desc) then Result::Ok(AbiReturn::FprPairT) else Result::Ok(AbiReturn::GprT) end
+    end
+  end
+end
+
+# The sret predicate of a plan's result class (audit item 28): the ONE
+# question every sret consumer asks.  Consumers whose language-side enum is
+# also named AbiReturn (codegen.tg) call this helper instead of naming the
+# plan's variants, so the two AbiReturn vocabularies can never be confused.
+pub def abi_return_uses_sret(ret: AbiReturn) -> Bool
+  match ret
+  when AbiReturn::SRetT then true
+  when _ then false
+  end
+end
+
+# THE classification entry: one plan per (target, flavor, signature).
+# Fail-closed: an unresolved value type returns the classifier's
+# LayoutError; an FFI-unsafe value under the ExternC flavor returns a
+# names-the-reason LayoutError (never a silently assumed word).
+pub def classify_call_plan(inout engine: LayoutEngine, desc: TargetDesc, flavor: AbiFlavor, param_tys: Vec[Type], ret_ty: Type, variadic: Bool) -> Result[AbiCallPlan, LayoutError]
+  let internal_convention = match flavor
+  when AbiFlavor::InternalValue then true
+  when AbiFlavor::ExternC then false
+  end
+  var args: Vec[AbiParam] = Vec::new()
+  var gp_pos = 0
+  var fp_pos = 0
+  var stack_bytes = 0
+  var pi = 0
+  while pi < param_tys.len() do
+    let ty = param_tys[pi].clone()
+    # FFI-safety gates (ExternC only): String is not a C boundary value
+    # (use FfiStr) and a payloaded tagged enum's TaggedPtr word is
+    # compiler-private.  Both fail closed with the reason.
+    if !internal_convention then
+      match ty
+      when Type::String then
+        return Result::Err(LayoutError {
+          class: LayoutFailureClass::UNSUPPORTED_TYPE,
+          message: "String is not an FFI-safe extern C parameter (the owned String is a handle to its object header; use FfiStr at the boundary)",
+          type_name: "String",
+          expected: 0,
+          actual: 0,
+          context: "classify_call_plan"
+        })
+      when _ then ()
+      end
+    end
+    let cat = match classify_value_category(engine, ty)
+    when Result::Ok(c) then c
+    when Result::Err(e) then return Result::Err(e)
+    end
+    if !internal_convention && abi_is_taggedptr_enum(engine, ty) && abi_enum_has_payload(engine, ty) then
+      match classify_enum_crossing(engine, desc, flavor, ty)
+      when Result::Ok(_) then ()
+      when Result::Err(e) then return Result::Err(e)
+      end
+    end
+    let img = match abi_value_image(engine, cat, ty, flavor)
+    when Result::Ok(i) then i
+    when Result::Err(e) then return Result::Err(e)
+    end
+    let ext = abi_extension_of(ty)
+    let p = abi_place_value(desc, flavor, img.0, img.1, img.2, ext, &mut gp_pos, &mut fp_pos, &mut stack_bytes)
+    args.push(p)
+    pi = pi + 1
+  end
+  let ret = match abi_classify_return(engine, desc, flavor, ret_ty)
+  when Result::Ok(r) then r
+  when Result::Err(e) then return Result::Err(e)
+  end
+  Result::Ok(AbiCallPlan {
+    args: args,
+    ret: ret,
+    variadic: variadic,
+    stack_arg_bytes: stack_bytes
+  })
 end

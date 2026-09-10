@@ -16,6 +16,9 @@ use tg_compiler::ids::{
   InstanceId, CallableId, DefId, ModuleId, DefKind, GenericParamId, ClosureId,
   generic_param_id_numeric, generic_param_id_eq, generic_param_name_from
 effect_vec_eq, }
+use tg_compiler::stable_ids::{
+  InstanceKey, instance_key_of_renders
+}
 use tg_compiler::ast::{Program, Item, ItemKind, AccessConvention}
 use tg_compiler::resolver::{ResolvedNames, def_kind_of}
 use tg_compiler::types::{
@@ -65,6 +68,16 @@ struct MonoCache
   # the instance), so the cache hit, the emission name and the call-site
   # rewrite all agree on the instance identity.
   instances: Map[String, MirFunction]
+  # (audit item 49): the STRUCTURED instance-identity records —
+  # emission text key -> InstanceKey (stable_ids.tg section 9) — computed
+  # ONCE per instantiation site at the SAME boundary that renders the text
+  # key (the work-queue drain pop, monomorphize_instance,
+  # mono_specialize_function), stored alongside the text-keyed bodies. The
+  # Map[String, ...] caches above keep their text keys in this slice;
+  # re-keying MonoCache.instances / the worklist seen-set / the rewrite
+  # lookups through the digest-word records is the migration inventory of
+  # stable_ids.tg section 5 (audit item 49).
+  structured_keys: Map[String, InstanceKey] = Map::new()
   # Inference failures recorded during monomorphization (deduplicated)
   errors: Vec[String]
  # the typed program's Program and the resolver's
@@ -93,6 +106,7 @@ end
 pub def mono_cache_new(program: Program, res: ResolvedNames) -> MonoCache
   MonoCache {
     instances: Map::new(),
+    structured_keys: Map::new(),
     errors: Vec::new(),
     program: program.clone(),
     resolutions: res.clone(),
@@ -158,6 +172,33 @@ end
 pub def instance_key(cache: MonoCache, instance: InstanceId) -> String
   let base = fn_owner_key_of_def(&cache.program, &cache.resolutions, &instance.def.def)
   mangle_name(base, &instance.substs)
+end
+
+# (audit item 49): the STRUCTURED instance key of an InstanceId — the
+# structured-instance-identity face of instance_key (stable_ids.tg section
+# 9): the same fn-owner-key base and the SAME canonical CanonInternal arg
+# renders mangle_name "$"-joins into the text suffix, parsed into the
+# InstanceKey record by the segment grammar (const renders "c<v>" /
+# "constparam<n>" / "constsym(<tree>)" classify as const rows; every
+# other render as a type row). Deterministic per (def, substs) exactly
+# like the text key — both faces walk the same canonical args
+# (type_to_mangled over instance.substs). Eq/Hash fold the record's
+# digest words (never a "$"-text).
+pub def structured_instance_key(cache: MonoCache, instance: InstanceId) -> InstanceKey
+  let base = fn_owner_key_of_def(&cache.program, &cache.resolutions, &instance.def.def)
+  structured_key_of_text_and_args(base, &instance.substs)
+end
+
+# The structured key over a callable text + concrete args — the shared
+# builder behind structured_instance_key and the name-API path
+# (mono_specialize_function, which holds the template's emission name and
+# explicit args but no InstanceId).
+def structured_key_of_text_and_args(callable_key_text: String, type_args: Vec[Type]) -> InstanceKey
+  var renders: Vec[String] = Vec::new()
+  for s in type_args do
+    renders.push(type_to_mangled(s))
+  end
+  instance_key_of_renders(callable_key_text, renders)
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -1639,6 +1680,12 @@ def mono_drain_worklist(
     match pending.pop_front()
     when Option::Some((callee_name, inst)) then
       let key = instance_key(cache, &inst)
+      # (audit item 49): the structured InstanceKey is computed once per
+      # instantiation site — right here, at the same pop that renders the
+      # text key — and stored alongside it in the cache's structured-keys
+      # table (the additive seam the Map[String, ...] re-key migration
+      # keys through; stable_ids.tg section 9).
+      cache.structured_keys.insert(key.clone(), structured_instance_key(cache, &inst))
       # Cache hit (specialized by an earlier pop or by the external APIs):
       # nothing to do — the body is already in the program.
       if !cache.instances.contains_key(&key) then
@@ -1838,6 +1885,11 @@ pub def mono_specialize_function(
 
     # Specialize — specialize_function handles caching internally
     let mangled = mangle_name(func_name.clone(), &type_args)
+    # (audit item 49): the name-API path's structured key — computed from
+    # the template's emission-name text and the same concrete args once
+    # per specialization request (no InstanceId exists on this path; the
+    # callable text is the emission base the instance is keyed under).
+    cache.structured_keys.insert(mangled.clone(), structured_key_of_text_and_args(func_name.clone(), &type_args))
     if !cache.instances.contains_key(&mangled) then
       match specialize_function(cache, original, &type_param_names, &type_args)
       when Result::Ok(()) then
@@ -1901,6 +1953,10 @@ pub def monomorphize_instance(
     return Result::Err("instance " + base + " has empty substitutions — every generic call carries its solved instance; inference is not performed on the program's call graph")
   end
   let mangled = mangle_name(base.clone(), &instance.substs)
+  # (audit item 49): the structured InstanceKey of the requested instance,
+  # computed once per request and stored alongside the text key (the
+  # additive seam of stable_ids.tg section 9).
+  cache.structured_keys.insert(mangled.clone(), structured_instance_key(cache, &instance))
   if cache.instances.contains_key(&mangled) then
     return Result::Ok(())
   end

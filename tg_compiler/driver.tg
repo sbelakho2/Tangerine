@@ -46,9 +46,13 @@ use tg_compiler::resource_check::{resource_check, build_typed_cfg, analysis_cont
 use tg_compiler::mir::{lower_to_mir, MirProgram, MirFunction, optimize_mir, pretty_print_mir, instrument_for_pgo, verify_mir, check_effect_class_annotations_mir}
 use tg_compiler::codegen::{generate_native, generate_executable, generate_object_file, detect_host_target}
 use tg_compiler::lir::{lir_compile_object, lir_compile_executable, lir_target_desc}
-use tg_compiler::backend_thumb::{thumb_compile_object, thumb_compile_executable, thumb_desc_of}
-use tg_compiler::backend_rv::{rv_compile_object, rv_compile_executable, rv_desc_of}
-use tg_compiler::target_desc::{TargetDesc, aarch64_desc, x86_64_desc}
+use tg_compiler::backend_thumb::{thumb_compile_object, thumb_compile_executable}
+use tg_compiler::backend_rv::{rv_compile_object, rv_compile_executable}
+use tg_compiler::backend_x86_64::{x86_64_compile_object, x86_64_compile_executable}
+use tg_compiler::target_desc::{
+  TargetDesc, aarch64_desc, x86_64_desc, target_desc_of_triple,
+  target_desc_is_thumb_family, target_desc_is_riscv_family
+}
 use tg_compiler::asm::{AsmTarget, Arch, OsAbi, asm_target}
 use tg_compiler::trait_resolve::{monomorphize_program, mono_cache_new}
 use tg_compiler::mode::{Mode, ModeConfig, config_for_mode}
@@ -101,9 +105,17 @@ use tg_compiler::semantic_snapshot::{
   semantic_snapshot_of_final_state, semantic_snapshot_finalize, semantic_snapshot_serialize,
   SnapshotError
 }
-use tg_compiler::semantic_model::{semantic_digest_zero}
+use tg_compiler::semantic_model::{semantic_digest_zero, semantic_digest_render}
 use tg_compiler::semantic_index::{build_semantic_index}
 use tg_compiler::semantic_server::{compiler_session_from_finalized, session_serve_loop}
+# The §37 verification evidence (proof_patch.tg — audit item 20): the
+# snapshot route assembles ONE VerifiedCompilationEvidence per successful
+# compile (the stage flags the route's own pipeline established — see
+# compile_snapshot_route below) and rides the §39 CompilerSession's
+# evidence slot for the §38/§39 consumers and the proof-patch follow-up
+# (session_proof_patch_between); imported here in the same type-import
+# idiom as the semantic modules above.
+use tg_compiler::proof_patch::{verified_compilation_evidence}
 
 # The WASM backend route — the driver's --target wasm32-unknown-unknown
 # dispatch (see compile_to_wasm_route below).
@@ -398,7 +410,6 @@ def parse_startup_compile_args(skip_subcommand: Bool) -> Result[CompilerOptions,
         return Result::Err("Missing argument for --target")
       end
       opts.target_triple = Option::Some(raw_arg_copy(i))
-<<<<<<< Updated upstream
     elsif arg == "--no-std" then
       # The no_std flag: accepted here (the compile route reads it from the
       # raw argv — CompilerOptions carries no dedicated field). A no_std
@@ -420,14 +431,6 @@ def parse_startup_compile_args(skip_subcommand: Bool) -> Result[CompilerOptions,
       else
         return Result::Err("Unknown panic strategy: " + panic_strat2 + " (abort is the only stable strategy; unwind is rejected)")
       end
-=======
-    elsif arg == "--bootstrap-stage" then
-      # Explicit self-hosted bootstrap build: relax semantic checks (stage0 already
-      # type-checked the driver), pin the codegen target to the host, and silence
-      # parse diagnostics inside driver.tg. This is what `run_bootstrap.sh` calls
-      # for stage1→stage2 and stage2→stage3.
-      opts.bootstrap_stage = true
->>>>>>> Stashed changes
     elsif arg == "--json" then
       opts.json_diagnostics = true
     elsif arg == "-h" || arg == "--help" then
@@ -2403,18 +2406,38 @@ end
 # The allocator-free core: the same core-only surface check as no_std
 # (the program's imports are restricted to the no_std allowlist).
 #
-# THE ISA CODE-GEN TRUTH (P0.2): the ONLY embedded triple with REAL code
-# generation is aarch64-unknown-none — its machine code is produced by
-# the aarch64 backend (the same backend the host bootstrap uses). The
-# Thumb (thumbv6m / thumbv7em / thumbv8m.main) and RISC-V (riscv32imc /
-# riscv32imac / riscv64gc) triples have NO code generator in this
-# compiler. The route's old behavior FORCED the aarch64 backend for every
-# triple and claimed the result as the requested ISA's image — a
-# fabricated artifact. The honest contract is the HARD REJECTION: the
-# stable diagnostic, NO artifact directory, NO compile invocation, NO
-# "compiles" claim. There is also NO QEMU execution lane — the old lane
-# only PRINTED that it ran without invoking QEMU; hardware execution is
-# not claimed until a real invocation exists.
+# THE ISA CODE-GEN TRUTH (P0.2 + audit item 39): a --target triple is
+# served when a code generator exists for the ISA it names, and the
+# backend identity is ALWAYS the triple's descriptor — target_desc.tg's
+# target_desc_of_triple table — never an env-gated second target naming
+# system:
+#   - aarch64-unknown-none — REAL code generation on this route: the
+#     aarch64 backend produces the machine code, and the route emits
+#     the target spec / linker script / startup artifacts + the
+#     bare-metal ELF image (the artifact contract below);
+#   - the desc'd Thumb and RISC-V triples (thumbv7m-none-eabi /
+#     thumbv7em-none-eabi[f] / riscv32imac|imafc|imafdc-unknown-none-elf
+#     / riscv64imac|riscv64gc-unknown-none-elf) ROUTE to the LIR
+#     pipeline for the descriptor the triple names (the per-CPU
+#     cortex-m3/m4/m4f and the riscv32/riscv64 instances of
+#     target_desc.tg — the ARMv7-M backend of backend_thumb.tg and the
+#     RISC-V backend of backend_rv.tg). There is no direct emitter for
+#     those ISAs, so the embedded triples always use the LIR backends
+#     (TANGERINE_LIR is NOT required — it only gates "LIR vs direct"
+#     for the host); the LIR artifact contract applies (ELF32 ARM /
+#     ELF32|ELF64 RISC-V relocatable objects — executable/image linking
+#     fails closed inside the backend, naming the object contract);
+#   - the spec'd triples with NO descriptor instance (thumbv6m-none-eabi
+#     / thumbv8m.main-none-eabihf / riscv32imc-unknown-none-elf — the
+#     ARMv6-M and IMC profiles, which target_desc.tg does not model)
+#     are HARD-REJECTED: the stable diagnostic below, and NOTHING else —
+#     no artifact directory, no compile invocation, no "compiles" claim.
+# The old behavior FORCED the aarch64 backend for every foreign triple
+# and claimed the result as the requested ISA's image — a fabricated
+# artifact; that override is unreachable for every rejected ISA. There
+# is also NO QEMU execution lane — the old lane only PRINTED that it ran
+# without invoking QEMU; hardware execution is not claimed until a real
+# invocation exists.
 
 struct EmbeddedTargetSpec
   target: String
@@ -2505,6 +2528,37 @@ def is_embedded_target(triple: String) -> Bool
   when Option::Some(_) then true
   when Option::None then false
   end  end
+end
+
+# (audit item 39): the desc instance of an embedded --target triple that
+# names one of the LIR-route families (thumb/riscv). The target_desc.tg
+# table (target_desc_of_triple) is the ONE lookup — keyed by the --target
+# triples — so a triple like thumbv7m-none-eabi / riscv32imafc-unknown-
+# none-elf (which has a desc instance but no EmbeddedTargetSpec row here)
+# routes exactly like the spec'd desc triples.
+def embedded_lir_triple_desc(triple: String) -> Option[TargetDesc]
+  match target_desc_of_triple(triple)
+  when Option::Some(d) then
+    if target_desc_is_thumb_family(&d) || target_desc_is_riscv_family(&d) then
+      Option::Some(d)
+    else
+      Option::None
+    end
+  when Option::None then Option::None
+  end
+end
+
+# The embedded-route entry predicate: the spec'd bare-metal triples PLUS
+# the desc'd thumb/riscv triples of the LIR-route families (the triples
+# without a spec row are served through their descriptor).
+def is_embedded_route_triple(triple: String) -> Bool
+  if is_embedded_target(triple) then
+    return true
+  end
+  match embedded_lir_triple_desc(triple)
+  when Option::Some(_) then true
+  when Option::None then false
+  end
 end
 
 def embedded_cortex_m_linker_script(spec: EmbeddedTargetSpec) -> String
@@ -2686,21 +2740,55 @@ def compile_to_embedded_route(opts: CompilerOptions, files: Vec[String], output_
   when Option::Some(t) then t.clone()
   when Option::None then return Result::Err("embedded: no target triple (use --target <embedded-triple>)")
   end
+  # (audit item 39) THE DESC-ROUTED FAMILIES: a thumb/riscv triple with a
+  # TargetDesc instance in target_desc.tg's ONE lookup table (the --target
+  # triple IS the backend identity — target_desc_of_triple) always routes
+  # to the LIR pipeline for that descriptor: no direct emitter exists for
+  # those ISAs, so the embedded triples always use the LIR backends
+  # (TANGERINE_LIR is NOT required for them — the env var only gates
+  # LIR-vs-direct for the host). The LIR artifact contract applies:
+  # ELF32 ARM / ELF32|ELF64 RISC-V relocatable objects; executable/image
+  # linking fails closed inside the backend with the object contract (an
+  # arm-none-eabi / riscv-none-elf linker consumes the object with the
+  # embedded cortex-m/riscv linker scripts and startup artifacts).
+  match embedded_lir_triple_desc(triple.clone())
+  when Option::Some(desc) then
+    if files.len() != 1 then
+      return Result::Err("embedded: the `" + triple + "` LIR-route triple compiles exactly one input file (the `" + desc.name + "` backend — got " + files.len().to_string() + ")")
+    end
+    let art = match opts.emit
+    when EmitMode::Object then output_path.clone()
+    when EmitMode::Executable then output_path.clone() + ".elf"
+    when _ then
+      return Result::Err("embedded: the `" + triple + "` LIR-route triple supports --emit=obj and --emit=exe only (the LIR `" + desc.name + "` backend is its only generator)")
+    end
+    match compile_lir_route(&opts, files, art.clone(), Option::Some(desc))
+    when Result::Ok(_) then
+      if !opts.quiet then
+        println("Embedded LIR artifact (" + desc.name + " — " + triple + "): " + art)
+      end
+      return Result::Ok(())
+    when Result::Err(e) then return Result::Err(e)
+    end
+  when Option::None then ()
+  end
   let spec = match embedded_spec_for(triple.clone())
   when Option::Some(s) then s
-  when Option::None then return Result::Err("embedded: unknown embedded target triple: " + triple)
+  when Option::None then
+    return Result::Err("embedded: unknown embedded target triple: " + triple)
   end
-  # THE ISA CODE-GEN GATE (the P0.2 fix): the only embedded triple with
-  # a real code generator is aarch64-unknown-none (family "aarch64" — the
-  # aarch64 backend). Every Thumb (thumbv6m/thumbv7em/thumbv8m.main) and
-  # RISC-V (riscv32imc/riscv32imac/riscv64gc) triple is HARD-REJECTED
-  # HERE: the stable diagnostic below, and NOTHING else — no artifact
-  # directory, no linker script, no startup, no compile invocation, no
-  # "compiles" claim. The old route forced the aarch64 backend under the
-  # foreign triple and fabricated the image; that override is now
-  # unreachable for every rejected ISA.
+  # THE ISA-CODEGEN GATE (the P0.2 fix, kept for the spec'd triples that
+  # still have NO descriptor): a spec'd embedded triple whose family is
+  # not "aarch64" AND whose triple resolved no desc above (thumbv6m-none-
+  # eabi, thumbv8m.main-none-eabihf, riscv32imc-unknown-none-elf — the
+  # ARMv6-M and IMC profiles, which target_desc.tg does not model) is
+  # HARD-REJECTED HERE: the stable diagnostic below, and NOTHING else —
+  # no artifact directory, no linker script, no startup, no compile
+  # invocation, no "compiles" claim. The old route forced the aarch64
+  # backend under the foreign triple and fabricated the image; that
+  # override is unreachable for every rejected ISA.
   if spec.family != "aarch64" then
-    return Result::Err("embedded: the target triple `" + triple + "` is REJECTED — the " + spec.arch + " (" + spec.family + ") code generator does not exist (the bare-metal codegen is aarch64 only; this route will not fabricate a " + spec.arch + " image). Use --target aarch64-unknown-none (the real bare-metal target)")
+    return Result::Err("embedded: the target triple `" + triple + "` is REJECTED — the " + spec.arch + " (" + spec.family + ") profile has no TargetDesc instance in target_desc.tg (the descriptor table serves the ARMv7-M cortex-m3/m4/m4f/m7 and RISC-V riscv32imac/imafc/imafdc/riscv64imac/riscv64gc instances; this route will not fabricate a " + spec.arch + " image under the triple). The desc'd thumb/riscv triples route to their LIR backends: --target thumbv7m-none-eabi, thumbv7em-none-eabi, thumbv7em-none-eabihf, riscv32imac-unknown-none-elf, riscv32imafc-unknown-none-elf, riscv32imafdc-unknown-none-elf, riscv64imac-unknown-none-elf or riscv64gc-unknown-none-elf")
   end
   let source = match read_file(files[0].clone())
   when Result::Ok(s) then s
@@ -2794,9 +2882,10 @@ def root_program_imports_module(program: Program, module: String) -> Bool
 end
 
 # ———————————————————————————————————————————————————————————————
-# THE LIR ROUTE — audit P1-7 slice (default-off, aarch64 host)
+# THE LIR ROUTE — audit P1-7 slice + audit item 39 (default-off for
+# the HOST; the embedded desc'd triples always route here)
 # ———————————————————————————————————————————————————————————————
-# TANGERINE_LIR=1 routes native single-file compiles through
+# TANGERINE_LIR=1 routes HOST single-file compiles through
 # tg_compiler::lir — the standalone register-allocation pipeline
 # (MIR -> LIR -> linear scan -> aarch64 emission -> object/link; see
 # lir.tg's module doc for the legalization contract). The gate is an
@@ -2804,12 +2893,23 @@ end
 # route FAILS CLOSED on any construct outside the contract (it never
 # falls back per function silently). The route mirrors
 # compile_to_wasm_route's pipeline shape.
-# AUDIT P1-14, slices 2 and 3: TANGERINE_LIR_TARGET selects the backend
-# the same pipeline emits with (default "aarch64" — the P1-7 slice's
-# emission in lir.tg): "cortex-m" picks the Thumb-2 backend in
-# tg_compiler::backend_thumb, "riscv32"/"riscv64" pick the RISC-V
-# backend in tg_compiler::backend_rv (see lir_route_backend_name);
-# unknown values fail closed.
+# AUDIT ITEM 39 — THE BACKEND IDENTITY IS THE DESC, NOT AN ENV NAME:
+# the LIR pipeline is the code generator for the desc'd thumb/riscv
+# triples (compile_to_embedded_route above routes a --target
+# thumbv7m-none-eabi / thumbv7em-none-eabi[f] / riscv32* / riscv64*
+# compile here with the descriptor the triple names — route_desc), and
+# the env-gated host slice keeps "LIR vs direct" as a compiler
+# implementation detail for the aarch64 host. TANGERINE_LIR_TARGET is a
+# LEGACY ALIAS whose values are keys of the SAME target-desc table the
+# --target triples resolve through (target_desc_of_triple): "cortex-m3"/
+# "cortex-m4"/"cortex-m4f"/"cortex-m7" (and the "cortex-m" alias of
+# cortex-m4f) pick the Thumb-2 backend in tg_compiler::backend_thumb,
+# "riscv32imac"/"riscv32imafc"/"riscv32imafdc"/"riscv64imac"/
+# "riscv64gc" (and the "riscv32"/"riscv64" aliases of the imac
+# instances) pick the RISC-V backend in tg_compiler::backend_rv, and
+# "aarch64" (or an unset variable) is the host slice; unknown values
+# fail closed with the table's keys. There is no environment-only
+# target universe.
 
 def lir_route_enabled() -> Bool
   match std::env::get_env("TANGERINE_LIR")
@@ -2819,68 +2919,101 @@ def lir_route_enabled() -> Bool
 end
 
 # ———————————————————————————————————————————————————————————————
-# THE LIR BACKEND SELECTOR — audit P1-14, slices 2 and 3 + audit §16
+# THE LEGACY ENV ALIAS SELECTOR — audit item 39
 # ———————————————————————————————————————————————————————————————
-# The accepted ARMv7-M route names (the legacy "cortex-m" alias
-# included; the descriptor mapping lives in thumb_desc_of).
-def lir_route_is_thumb_name(name: String) -> Bool
-  name == "cortex-m" || name == "cortex-m3" || name == "cortex-m4" || name == "cortex-m4f" || name == "cortex-m7"
-end
-
-# The accepted RISC-V route names (the legacy "riscv32"/"riscv64"
-# aliases included; the descriptor mapping lives in rv_desc_of).
-def lir_route_is_rv_name(name: String) -> Bool
-  name == "riscv32" || name == "riscv32imac" || name == "riscv32imafc" || name == "riscv32imafdc" || name == "riscv64" || name == "riscv64imac" || name == "riscv64gc"
-end
-
-# TANGERINE_LIR_TARGET selects which backend the LIR route emits with:
-#   "aarch64" (the default — the P1-7 slice's emission in lir.tg),
-#   the ARMv7-M per-CPU names (audit §16) "cortex-m3"/"cortex-m4"/
-#   "cortex-m4f"/"cortex-m7" — the P1-14 slice 2 Thumb-2 backend in
-#   backend_thumb.tg, which emits ELF32 ARM objects through
-#   thumb_compile_object; the LEGACY name "cortex-m" maps to the
-#   cortex-m4f descriptor (the least-breaking mapping: the old single
-#   cortex_m instance implied the VFP unit, and the float route
-#   requires it), or
-#   the RISC-V names (audit §16) "riscv32imac"/"riscv32imafc"/
-#   "riscv32imafdc"/"riscv64imac"/"riscv64gc" — the P1-14 slice 3
-#   backend in backend_rv.tg, which emits ELF32/ELF64 RISC-V objects
-#   through rv_compile_object; the LEGACY names "riscv32"/"riscv64"
-#   map to the imac instances of their xlen.
-# Unknown values fail closed with the accepted set — never a silent
-# fallback.
+# TANGERINE_LIR_TARGET is a LEGACY ALIAS: every accepted value is a KEY
+# of target_desc.tg's ONE target-desc table (target_desc_of_triple) —
+# the same table the --target triples resolve through — restricted to
+# the keys whose desc the LIR route serves (the thumb/riscv families,
+# the x86_64 System V description of audit item 30 stage 1, and
+# "aarch64"): "cortex-m3"/"cortex-m4"/"cortex-m4f"/"cortex-m7"
+# (the "cortex-m" alias maps to the cortex-m4f descriptor — the
+# least-breaking mapping: the old single cortex_m instance implied the
+# VFP unit, and the float route requires it), the RISC-V names
+# "riscv32imac"/"riscv32imafc"/"riscv32imafdc"/"riscv64imac"/
+# "riscv64gc" (the "riscv32"/"riscv64" aliases map to the imac
+# instances of their xlen), the canonical thumb/riscv triples
+# themselves, "x86_64" (and the x86_64 triples/aliases of the same
+# table — the experimental item-30 LIR backend), and "aarch64" (the
+# host slice default, unchanged). Unknown values fail closed with the
+# accepted set — never a silent fallback.
 def lir_route_backend_name() -> Result[String, String]
   match std::env::get_env("TANGERINE_LIR_TARGET")
   when Option::Some(v) then
-    if lir_route_is_thumb_name(&v) || lir_route_is_rv_name(&v) || v == "aarch64" then
-      Result::Ok(v)
-    else
-      Result::Err("TANGERINE_LIR_TARGET=" + v + " is not a LIR backend of this compiler (the P1-14 backends are \"aarch64\", the ARMv7-M \"cortex-m3\"/\"cortex-m4\"/\"cortex-m4f\"/\"cortex-m7\" (\"cortex-m\" is the legacy alias of \"cortex-m4f\") and the RISC-V \"riscv32imac\"/\"riscv32imafc\"/\"riscv32imafdc\"/\"riscv64imac\"/\"riscv64gc\" (\"riscv32\"/\"riscv64\" are the legacy aliases of the imac instances); unset the variable for the default aarch64 route)")
+    if v == "aarch64" then
+      return Result::Ok(v)
+    end
+    match target_desc_of_triple(v.clone())
+    when Option::Some(d) then
+      if target_desc_is_thumb_family(&d) || target_desc_is_riscv_family(&d) || d.arch == Arch::X86_64 then
+        Result::Ok(v)
+      else
+        Result::Err(lir_route_env_name_err(&v))
+      end
+    when Option::None then
+      Result::Err(lir_route_env_name_err(&v))
     end
   when Option::None then
     Result::Ok("aarch64")
   end
 end
 
+# The fail-closed legacy-env diagnostic: the alias keys are the
+# desc-name/alias/triple keys of target_desc_of_triple whose instances
+# the LIR route serves.
+def lir_route_env_name_err(v: String) -> String
+  "TANGERINE_LIR_TARGET=" + v + " is not a legacy LIR alias of this compiler (the alias keys map through the ONE target-descriptor table — target_desc_of_triple: the ARMv7-M \"cortex-m3\"/\"cortex-m4\"/\"cortex-m4f\"/\"cortex-m7\" (\"cortex-m\" is the legacy alias of \"cortex-m4f\"), the RISC-V \"riscv32imac\"/\"riscv32imafc\"/\"riscv32imafdc\"/\"riscv64imac\"/\"riscv64gc\" (\"riscv32\"/\"riscv64\" are the legacy aliases of the imac instances), the x86_64 System V names/triples of audit item 30 stage 1 (\"x86_64\", \"x86_64-unknown-linux-gnu\", ...), or a canonical thumb/riscv/x86_64 --target triple of the table; unset the variable for the default aarch64 route)"
+end
+
+# (audit item 39): when the --target triple selected the route's desc
+# (the embedded desc'd triples), a SET TANGERINE_LIR_TARGET legacy
+# alias must name the SAME desc instance — the env value resolves
+# through the same table, and a different instance (or an unknown key)
+# fails closed: the backend is the --target triple's descriptor, never
+# a silently second env-picked target.
+def lir_route_env_alias_check(tt: String, tdesc: TargetDesc) -> Result[Unit, String]
+  match std::env::get_env("TANGERINE_LIR_TARGET")
+  when Option::Some(v) then
+    match target_desc_of_triple(v.clone())
+    when Option::Some(d) then
+      if d.name == tdesc.name then
+        Result::Ok(())
+      else
+        Result::Err("TANGERINE_LIR_TARGET=" + v + " (the `" + d.name + "` description) conflicts with --target " + tt + " (the `" + tdesc.name + "` description): the LIR backend is ALWAYS the --target triple's descriptor — unset the legacy env alias or align it with the triple")
+      end
+    when Option::None then
+      Result::Err(lir_route_env_name_err(&v))
+    end
+  when Option::None then Result::Ok(())
+  end
+end
+
 # The cortex-m arm of compile_lir_route: emit-mode dispatch over the
-# Thumb-2 backend (object emission only in this slice; executable/image
-# linking fails closed inside thumb_compile_executable). The route's
-# descriptor was resolved from the TANGERINE_LIR_TARGET name by the
-# caller (thumb_desc_of — the audit §16 per-CPU instances). Objects of
-# programs with @interrupt functions additionally carry the .isr_vector
-# vector-table section (the audit §16 NVIC handler slice — see
-# backend_thumb.tg's interrupt-ABI section).
+# Thumb-2 backend (object emission in this slice; executable/image
+# linking fails closed inside thumb_compile_executable with the object
+# contract). The route's descriptor is the desc of the --target triple
+# (audit item 39 — target_desc_of_triple) or of the legacy env alias;
+# the triple gate below checks the identity. Objects of programs with
+# @interrupt functions additionally carry the .isr_vector vector-table
+# section (the audit §16 NVIC handler slice — see backend_thumb.tg's
+# interrupt-ABI section).
 def compile_lir_route_thumb(mir: MirProgram, opts: CompilerOptions, out_path: String, tdesc: TargetDesc) -> Result[Unit, String]
-  # P1-14 slice 2: the gate consults the route's CANONICAL ARMv7-M
-  # description — the single source of target data (the same
-  # fail-closed shape check the aarch64 arm runs against
-  # lir_target_desc).
+  # The gate consults the route's CANONICAL ARMv7-M description — the
+  # single source of target data (the same fail-closed shape check the
+  # aarch64 arm runs against lir_target_desc).
   if tdesc.pointer_width != 4 || tdesc.stack_alignment != 8 then
-    return Result::Err("internal error: the cortex-m LIR route was given the `" + tdesc.name + "` description (" + tdesc.pointer_width.to_string() + "-byte pointers, stack align " + tdesc.stack_alignment.to_string() + ") — the ARMv7-M LIR route compiles for 4-byte-pointer, 8-aligned cortex-m (unset TANGERINE_LIR_TARGET to use the aarch64 route)")
+    return Result::Err("internal error: the cortex-m LIR route was given the `" + tdesc.name + "` description (" + tdesc.pointer_width.to_string() + "-byte pointers, stack align " + tdesc.stack_alignment.to_string() + ") — the ARMv7-M LIR route compiles for 4-byte-pointer, 8-aligned cortex-m (the --target triple or the legacy alias must select a cortex-m desc)")
   end
   match opts.target_triple
   when Option::Some(tt) then
-    return Result::Err("the cortex-m LIR route does not support --target overrides (" + tt + "); the backend target is the `" + tdesc.name + "` description selected by TANGERINE_LIR_TARGET")
+    match target_desc_of_triple(tt.clone())
+    when Option::Some(d2) then
+      if d2.name != tdesc.name then
+        return Result::Err("the `" + tdesc.name + "` cortex-m backend was resolved, but --target " + tt + " selects the `" + d2.name + "` description — the LIR backend is the --target triple's desc instance, and the TANGERINE_LIR_TARGET legacy alias must name the same one")
+      end
+    when Option::None then
+      return Result::Err("the `" + tdesc.name + "` cortex-m backend was resolved, but --target " + tt + " names no descriptor of this compiler (the thumb descs are reached by --target thumbv7m-none-eabi / thumbv7em-none-eabi / thumbv7em-none-eabihf or the legacy TANGERINE_LIR_TARGET cortex-m aliases)")
+    end
   when Option::None then ()
   end
   match opts.emit
@@ -2897,18 +3030,17 @@ def compile_lir_route_thumb(mir: MirProgram, opts: CompilerOptions, out_path: St
   when EmitMode::Executable then
     thumb_compile_executable(mir, out_path)
   when _ then
-    Result::Err("the cortex-m LIR route supports --emit=obj and --emit=exe only (unset TANGERINE_LIR_TARGET for other emit modes)")
+    Result::Err("the cortex-m LIR route supports --emit=obj and --emit=exe only (object emission is this route's artifact contract)")
   end
 end
 
-# The RISC-V arm of compile_lir_route (P1-14 slice 3d): emit-mode
-# dispatch over the riscv backend, one shared shape for the riscv32
-# instances (xlen = 4 -> ELF32 objects) and the riscv64 instances
-# (xlen = 8 -> ELF64 objects). Object emission only in this slice;
-# executable/image linking fails closed inside rv_compile_executable.
-# The route's descriptor was resolved from the TANGERINE_LIR_TARGET
-# name by the caller (rv_desc_of — the audit §16 instances); its
-# pointer width is the xlen.
+# The RISC-V arm of compile_lir_route: emit-mode dispatch over the
+# riscv backend, one shared shape for the riscv32 instances (xlen = 4
+# -> ELF32 objects) and the riscv64 instances (xlen = 8 -> ELF64
+# objects). Object emission in this slice; executable/image linking
+# fails closed inside rv_compile_executable. The route's descriptor is
+# the desc of the --target triple (audit item 39 — target_desc_of_triple)
+# or of the legacy env alias; its pointer width is the xlen.
 def compile_lir_route_rv(mir: MirProgram, opts: CompilerOptions, out_path: String, tdesc: TargetDesc) -> Result[Unit, String]
   let xlen = tdesc.pointer_width
   if xlen != 4 && xlen != 8 then
@@ -2918,11 +3050,18 @@ def compile_lir_route_rv(mir: MirProgram, opts: CompilerOptions, out_path: Strin
   # single source of target data (the same fail-closed shape check the
   # cortex-m arm runs against its desc).
   if tdesc.stack_alignment != 16 then
-    return Result::Err("internal error: the riscv LIR route was given the `" + tdesc.name + "` description (" + tdesc.pointer_width.to_string() + "-byte pointers, stack align " + tdesc.stack_alignment.to_string() + ") — the " + (if xlen == 4 then "riscv32" else "riscv64" end) + " LIR route compiles for " + xlen.to_string() + "-byte-pointer, 16-aligned riscv (unset TANGERINE_LIR_TARGET to use the aarch64 route)")
+    return Result::Err("internal error: the riscv LIR route was given the `" + tdesc.name + "` description (" + tdesc.pointer_width.to_string() + "-byte pointers, stack align " + tdesc.stack_alignment.to_string() + ") — the " + (if xlen == 4 then "riscv32" else "riscv64" end) + " LIR route compiles for " + xlen.to_string() + "-byte-pointer, 16-aligned riscv (the --target triple or the legacy alias must select a riscv desc)")
   end
   match opts.target_triple
   when Option::Some(tt) then
-    return Result::Err("the riscv LIR route does not support --target overrides (" + tt + "); the backend target is the `" + tdesc.name + "` description selected by TANGERINE_LIR_TARGET")
+    match target_desc_of_triple(tt.clone())
+    when Option::Some(d2) then
+      if d2.name != tdesc.name then
+        return Result::Err("the `" + tdesc.name + "` riscv backend was resolved, but --target " + tt + " selects the `" + d2.name + "` description — the LIR backend is the --target triple's desc instance, and the TANGERINE_LIR_TARGET legacy alias must name the same one")
+      end
+    when Option::None then
+      return Result::Err("the `" + tdesc.name + "` riscv backend was resolved, but --target " + tt + " names no descriptor of this compiler (the riscv descs are reached by the --target riscv32imac/riscv32imafc/riscv32imafdc/riscv64imac/riscv64gc-unknown-none-elf triples or the legacy TANGERINE_LIR_TARGET riscv aliases)")
+    end
   when Option::None then ()
   end
   match opts.emit
@@ -2939,13 +3078,56 @@ def compile_lir_route_rv(mir: MirProgram, opts: CompilerOptions, out_path: Strin
   when EmitMode::Executable then
     rv_compile_executable(mir, xlen, out_path)
   when _ then
-    Result::Err("the riscv LIR route supports --emit=obj and --emit=exe only (unset TANGERINE_LIR_TARGET for other emit modes)")
+    Result::Err("the riscv LIR route supports --emit=obj and --emit=exe only (object emission is this route's artifact contract)")
   end
 end
 
-def compile_lir_route(opts: CompilerOptions, files: Vec[String], output_path: String) -> Result[Unit, String]
+# The x86_64 arm of compile_lir_route (audit item 30 stage 1): emit-mode
+# dispatch over the x86-64 System V LIR backend. Object emission is the
+# stage-1 artifact (an ELF64 x86-64 relocatable object); executable/image
+# linking fails closed inside x86_64_compile_executable. The route's
+# descriptor is the desc of the --target triple (target_desc_of_triple)
+# or of the legacy env alias; the triple gate below checks the identity.
+# The route is reachable ONLY under the LIR gate (TANGERINE_LIR=1 plus
+# TANGERINE_LIR_TARGET=x86_64, or --target x86_64-* with TANGERINE_LIR=1)
+# — the default host route is unchanged.
+def compile_lir_route_x86(mir: MirProgram, opts: CompilerOptions, out_path: String, tdesc: TargetDesc) -> Result[Unit, String]
+  if tdesc.pointer_width != 8 || tdesc.stack_alignment != 16 || tdesc.arch != Arch::X86_64 then
+    return Result::Err("internal error: the x86_64 LIR route was given the `" + tdesc.name + "` description (" + tdesc.pointer_width.to_string() + "-byte pointers, stack align " + tdesc.stack_alignment.to_string() + ") — the item-30 route compiles for the 8-byte-pointer, 16-aligned x86_64 System V description (the --target triple or the legacy alias must select an x86_64 desc)")
+  end
+  match opts.target_triple
+  when Option::Some(tt) then
+    match target_desc_of_triple(tt.clone())
+    when Option::Some(d2) then
+      if d2.name != tdesc.name then
+        return Result::Err("the `" + tdesc.name + "` x86_64 backend was resolved, but --target " + tt + " selects the `" + d2.name + "` description — the LIR backend is the --target triple's desc instance, and the TANGERINE_LIR_TARGET legacy alias must name the same one")
+      end
+    when Option::None then
+      return Result::Err("the `" + tdesc.name + "` x86_64 backend was resolved, but --target " + tt + " names no descriptor of this compiler (the x86_64 descs are reached by --target x86_64-unknown-linux-gnu / x86_64-apple-darwin or the legacy TANGERINE_LIR_TARGET x86_64 aliases)")
+    end
+  when Option::None then ()
+  end
+  match opts.emit
+  when EmitMode::Object then
+    let bytes = match x86_64_compile_object(mir, tdesc)
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(b) then b
+    end
+    match write_file_bytes(out_path.clone(), &bytes)
+    when Result::Ok(_) then ()
+    when Result::Err(e) then return Result::Err("failed to write " + out_path.clone() + ": " + e)
+    end
+    Result::Ok(())
+  when EmitMode::Executable then
+    x86_64_compile_executable(mir, out_path)
+  when _ then
+    Result::Err("the x86_64 LIR route supports --emit=obj and --emit=exe only (object emission is this route's stage-1 artifact contract; the image/startup contract is a later slice)")
+  end
+end
+
+def compile_lir_route(opts: CompilerOptions, files: Vec[String], output_path: String, route_desc: Option[TargetDesc]) -> Result[Unit, String]
   if files.len() != 1 then
-    return Result::Err("TANGERINE_LIR=1 requires exactly one input file (unset it to use the direct emitter)")
+    return Result::Err("the LIR pipeline requires exactly one input file (unset TANGERINE_LIR to use the direct emitter)")
   end
   let file = files[0].clone()
   let out_path = if output_path.len() > 0 then
@@ -3002,35 +3184,81 @@ def compile_lir_route(opts: CompilerOptions, files: Vec[String], output_path: St
     return Result::Err("MIR verification failed after optimization (" + post_errs.len().to_string() + " error(s))")
   end
   let target = detect_host_target()
-  # P1-14 slices 2/3 (+ audit §16): the LIR backend selector runs
-  # BEFORE the aarch64-only checks — an ARMv7-M route name
-  # (cortex-m3/m4/m4f/m7 or the legacy cortex-m) routes to the Thumb-2
-  # backend (backend_thumb.tg) and a RISC-V route name
-  # (riscv32imac/riscv32imafc/riscv32imafdc/riscv64imac/riscv64gc or
-  # the legacy riscv32/riscv64) to the RISC-V backend (backend_rv.tg);
-  # both are host-arch independent. The descriptor instance is
-  # resolved from the name by the backend's resolver and threads the
-  # whole emission (the per-CPU/per-extension data — FPU admission on
-  # thumb, the atomic width classes on riscv). Any other value falls
-  # through to the default aarch64 slice below.
-  let lir_backend = match lir_route_backend_name()
-  when Result::Err(e) then return Result::Err(e)
-  when Result::Ok(b) then b
-  end
-  if lir_route_is_thumb_name(lir_backend) then
-    let tdesc = match thumb_desc_of(&lir_backend)
-    when Result::Err(e) then return Result::Err(e)
-    when Result::Ok(d) then d
+  # (audit item 39) THE DESC-DRIVEN SELECTOR: the backend is ONE
+  # TargetDesc — the route_desc the embedded route resolved from the
+  # --target triple through target_desc_of_triple (a desc'd thumb/riscv
+  # triple always uses its desc's LIR backend; a SET legacy env alias
+  # must name the SAME desc — fail closed on a conflict), otherwise the
+  # LEGACY TANGERINE_LIR_TARGET alias resolved through the SAME table
+  # ("aarch64" or unset = the host slice below). The family dispatch
+  # reads the desc's own family data; both embedded families are
+  # host-arch independent.
+  match route_desc
+  when Option::Some(d) then
+    match opts.target_triple
+    when Option::Some(tt) then
+      match lir_route_env_alias_check(tt.clone(), &d)
+      when Result::Err(e) then return Result::Err(e)
+      when Result::Ok(_) then ()
+      end
+    when Option::None then ()
     end
-    return compile_lir_route_thumb(mir, opts, out_path, tdesc)
-  end
-  if lir_route_is_rv_name(lir_backend) then
-    let tdesc = match rv_desc_of(&lir_backend)
-    when Result::Err(e) then return Result::Err(e)
-    when Result::Ok(d) then d
+    if target_desc_is_thumb_family(&d) then
+      return compile_lir_route_thumb(mir, opts, out_path, d)
     end
-    return compile_lir_route_rv(mir, opts, out_path, tdesc)
+    if target_desc_is_riscv_family(&d) then
+      return compile_lir_route_rv(mir, opts, out_path, d)
+    end
+    if d.arch == Arch::X86_64 then
+      return compile_lir_route_x86(mir, opts, out_path, d)
+    end
+    return Result::Err("internal error: the embedded LIR route resolved the `" + d.name + "` description — only the thumb/riscv families route here")
+  when Option::None then
+    let lir_backend = match lir_route_backend_name()
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(b) then b
+    end
+    if lir_backend != "aarch64" then
+      # The legacy env alias: a validated KEY of the same table
+      # (lir_route_backend_name); resolve the desc instance and route to
+      # its family's backend.
+      let tdesc = match target_desc_of_triple(lir_backend.clone())
+      when Option::Some(d) then d
+      when Option::None then
+        return Result::Err("internal error: the legacy LIR alias `" + lir_backend + "` passed the name check but names no target descriptor")
+      end
+      if target_desc_is_thumb_family(&tdesc) then
+        return compile_lir_route_thumb(mir, opts, out_path, tdesc)
+      end
+      if target_desc_is_riscv_family(&tdesc) then
+        return compile_lir_route_rv(mir, opts, out_path, tdesc)
+      end
+      if tdesc.arch == Arch::X86_64 then
+        return compile_lir_route_x86(mir, opts, out_path, tdesc)
+      end
+      return Result::Err("internal error: the legacy LIR alias `" + lir_backend + "` resolved a desc the LIR route does not serve")
+    end
+    # (audit item 30 stage 1) THE x86_64 HOST EXPERIMENT: a --target
+    # x86_64-* triple under the LIR gate (TANGERINE_LIR=1) with the
+    # legacy alias unset routes to the x86_64 LIR backend directly —
+    # the descriptor is the --target triple's own (target_desc_of_triple)
+    # and the default host slice below stays the aarch64 route. The
+    # gate for every other --target override is unchanged (the error
+    # below).
+    match opts.target_triple
+    when Option::Some(tt) then
+      match target_desc_of_triple(tt.clone())
+      when Option::Some(d2) then
+        if d2.arch == Arch::X86_64 then
+          return compile_lir_route_x86(mir, opts, out_path, d2)
+        end
+      when Option::None then ()
+      end
+    when Option::None then ()
+    end
   end
+  # — the aarch64 host slice (TANGERINE_LIR=1 without a desc'd --target):
+  # the original P1-7 slice's emission below. —
   if target.arch != Arch::AArch64 then
     return Result::Err("the TANGERINE_LIR route emits aarch64 only in this slice; the host is " + host_arch_name(target.arch) + " — unset TANGERINE_LIR to use the direct emitter")
   end
@@ -3072,10 +3300,11 @@ end
 # TANGERINE_SNAPSHOT=<path> routes native single-file compiles through the
 # §30 semantic snapshot builder (semantic_snapshot.tg): the canonical
 # pipeline runs to the FINAL VERIFIED MIR (read -> parse -> merge ->
-# analyze_program -> lower -> verify_mir -> monomorphize -> optimize_mir
-# -> verify_mir — the same phase shape the LIR route above uses), and the
-# SemanticSnapshot of that FINALIZED state (env + typed program + verified
-# MIR) is written to <path>. The builder never scans source text — it
+# analyze_program -> lower -> verify_mir -> check_effect_class_
+# annotations_mir -> monomorphize -> optimize_mir -> verify_mir — the
+# same phase shape the LIR route above uses), and the SemanticSnapshot of
+# that FINALIZED state (env + typed program + verified MIR) is written to
+# <path>. The builder never scans source text — it
 # reads only the finalized tables (see the semantic_snapshot.tg module doc
 # for the per-table anchors). The route REPLACES the compile (like the
 # LIR gate): it exists to produce the snapshot artifact, whose three
@@ -3090,6 +3319,12 @@ end
 # (compiler_session_from_finalized, semantic_server.tg) — and serves the
 # §39 request protocol from stdin to stdout until EOF (session_serve_loop;
 # the snapshot file is written first, exactly as without the server var).
+# AUDIT ITEM 20 (the verification-evidence capture): the boundary also
+# assembles ONE VerifiedCompilationEvidence of the compile (every stage
+# flag set where this route's pipeline ran the stage — the §11
+# effect-class annotation check included, see the route below) and rides
+# it on the session's evidence slot for the §37 proof-patch consumers
+# (session_proof_patch_between in semantic_server.tg).
 # Unset TANGERINE_SERVER and this route's behavior is unchanged: the
 # snapshot artifact is written and the compile reports success.
 #
@@ -3161,6 +3396,23 @@ def compile_snapshot_route(opts: CompilerOptions, files: Vec[String], snapshot_p
   if !pre_errs.is_empty() then
     return Result::Err("MIR verification failed before monomorphization (" + pre_errs.len().to_string() + " error(s))")
   end
+  # (audit §11 — the effect-class annotations): the @no_alloc /
+  # @no_block / @no_io / @irq_safe / @interrupt claims are PROVEN on the
+  # LOWERED program — the MIR-derived transitive semantic summaries
+  # (check_effect_class_annotations_mir) classify what EXECUTES,
+  # compiler-generated lowering sites included. Every other compile route
+  # (compile_file_core, the wasm and LIR routes) runs this check between
+  # the lowering verification and monomorphization — the snapshot route's
+  # documented "same phase shape as the LIR route" includes it, so a
+  # program that violates an effect-class annotation fails HERE exactly as
+  # it fails a normal compile (a snapshot of an uncompilable program would
+  # be a lie). A violation is a compile error (E0232) reported through the
+  # same structured diagnostic channel as the typecheck phase.
+  let mir_effect_errs = check_effect_class_annotations_mir(&mir, env)
+  if !mir_effect_errs.is_empty() then
+    let mir_effect_diags = type_errors_to_diags(&mir_effect_errs)
+    return Result::Err(join_diagnostics(&mir_effect_diags))
+  end
   var mono_cache = mono_cache_new(&ast, &typed.resolutions)
   match monomorphize_program(&mut mir, &mut mono_cache)
   when Result::Ok(_) then ()
@@ -3202,14 +3454,48 @@ def compile_snapshot_route(opts: CompilerOptions, files: Vec[String], snapshot_p
     # post-opt-verified MirProgram, target_desc = the route's canonical
     # host descriptor, snapshot = the finalized §30 artifact, revision =
     # its content-addressed digest) and the §39 request protocol is
-    # served from stdin to stdout until EOF. Unset TANGERINE_SERVER and
-    # the route behaves exactly as before (the file write above is the
-    # whole effect); the construction/serve block never runs and no
-    # pipeline value is consumed by it.
+    # served from stdin to stdout until EOF.
+    #
+    # THE EVIDENCE CAPTURE (audit item 20 — the item-20 leftover): the
+    # route also assembles ONE VerifiedCompilationEvidence of the compile
+    # and rides it on the session's evidence slot (compiler_session_from_
+    # finalized — see semantic_server.tg). Every stage flag is set ONLY
+    # where THIS route's pipeline actually ran the stage to success:
+    # parse_ok = the parse above; resolution_ok / type_ok / access_ok /
+    # resource_ok = analyze_program's canonical semantic pass (resolution
+    # + type checking + the access/ownership and resource convention
+    # checks all succeeded inside analyze_parsed); mir_verify_ok = the
+    # pre-mono verify_mir over the lowered program; effect_verify_ok = the
+    # §11 effect-class annotation check added above (the stage the route
+    # previously could not truthfully claim); post_opt_mir_verify_ok = the
+    # final post-opt verify_mir. mono_verify_ok stays false with this doc
+    # note: the route runs monomorphization but NO post-mono verifier
+    # checkpoint (its sibling routes run none either — the pre-mono and
+    # post-opt verifications bound the mono transform; compiler_core's
+    # compile flows run the unconditional post-mono checkpoint, so only
+    # their evidence may claim the flag). abi_verify_ok stays false with
+    # this doc note: NO ABI-verify stage exists anywhere yet — the flag is
+    # reserved for the future pub/extern ABI surface check.
+    # Unset TANGERINE_SERVER and the route behaves exactly as before (the
+    # file write above is the whole effect); the construction/serve block
+    # never runs and no pipeline value is consumed by it.
     if semantic_server_requested() then
       let index = build_semantic_index(&snapshot)
+      let route_evidence = verified_compilation_evidence(
+        semantic_digest_render(&snapshot.revision),
+        true,   # parse_ok — parse_source_program succeeded
+        true,   # resolution_ok — analyze_parsed's resolution succeeded
+        true,   # type_ok — type_check_typed succeeded
+        true,   # access_ok — access_check succeeded
+        true,   # resource_ok — resource_check succeeded
+        true,   # mir_verify_ok — the pre-mono verify over the lowered program
+        false,  # mono_verify_ok — no post-mono verifier checkpoint on this route
+        true,   # post_opt_mir_verify_ok — the final post-opt verify
+        true,   # effect_verify_ok — the §11 annotation check above
+        false)  # abi_verify_ok — no ABI-verify stage exists yet
       let session = compiler_session_from_finalized(
-        snapshot.revision, &target_desc, &env, &typed.typed, &mir, &snapshot, &index)
+        snapshot.revision, &target_desc, &env, &typed.typed, &mir, &snapshot, &index,
+        Option::Some(route_evidence))
       let served = session_serve_loop(&session)
       if !opts.quiet then
         println("Semantic server: served " + served.to_string() + " request(s)")
@@ -3320,17 +3606,21 @@ def cmd_compile(argv: Vec[String]) -> Int
     end
   end
 
-  # THE EMBEDDED ROUTE: a --target <embedded triple>
-  # (aarch64-unknown-none — the real bare-metal target) dispatches to the
-  # embedded contract — the target spec JSON, the linker script, the
-  # startup/vector artifacts and the bare-metal aarch64 ELF image (entry
-  # _reset_handler, the core-only surface, abort-only panic). The Thumb
-  # (thumbv6m/thumbv7em/thumbv8m.main) and RISC-V (riscv32*/riscv64gc)
-  # triples are HARD-REJECTED inside the route (no code generator — no
-  # fabricated artifact).
+  # THE EMBEDDED ROUTE: a --target <embedded triple> dispatches to the
+  # embedded contract. aarch64-unknown-none (the real bare-metal target)
+  # serves the target spec JSON, the linker script, the startup/vector
+  # artifacts and the bare-metal aarch64 ELF image (entry _reset_handler,
+  # the core-only surface, abort-only panic); the desc'd Thumb
+  # (thumbv7m/thumbv7em-none-eabi[f]) and RISC-V (riscv32imac|imafc|
+  # imafdc/riscv64imac|riscv64gc-unknown-none-elf) triples route to the
+  # LIR backends for the descriptor the triple names (audit item 39 — the
+  # backend identity is the triple's TargetDesc, resolved by the ONE
+  # target_desc_of_triple table); only the desc-less spec'd triples
+  # (thumbv6m/thumbv8m.main/riscv32imc) are rejected inside the route (no
+  # generator — no fabricated artifact).
   match opts.target_triple
   when Option::Some(et) then
-    if is_embedded_target(et) then
+    if is_embedded_route_triple(et) then
       match compile_to_embedded_route(&opts, files, output_path)
       when Result::Ok(_) then return 0
       when Result::Err(e) then
@@ -3355,11 +3645,13 @@ def cmd_compile(argv: Vec[String]) -> Int
 
   # THE LIR ROUTE GATE (audit P1-7 slice; default-off): TANGERINE_LIR=1
   # routes native single-file compiles through the standalone
-  # register-allocation pipeline in tg_compiler::lir. Fail-closed: any
-  # construct outside the LIR legalization contract fails the compile
-  # with a rule-naming error — never a silent per-function fallback.
+  # register-allocation pipeline in tg_compiler::lir — the "LIR vs
+  # direct" choice for the HOST (the embedded desc'd triples above always
+  # use the LIR pipeline, no env gate). Fail-closed: any construct
+  # outside the LIR legalization contract fails the compile with a
+  # rule-naming error — never a silent per-function fallback.
   if lir_route_enabled() then
-    match compile_lir_route(&opts, files, output_path)
+    match compile_lir_route(&opts, files, output_path, Option::None)
     when Result::Ok(_) then return 0
     when Result::Err(e) then
       eprintln(e)
@@ -3522,7 +3814,7 @@ def cmd_compile_direct(skip_subcommand: Bool) -> Int
   if lir_route_enabled() then
     var lir_files = Vec::new()
     lir_files.push(file.clone())
-    match compile_lir_route(&opts, lir_files, output_path)
+    match compile_lir_route(&opts, lir_files, output_path, Option::None)
     when Result::Ok(_) then return 0
     when Result::Err(e) then
       eprintln(e)

@@ -113,16 +113,14 @@
 #                function = the covered def's StableDefId, branch_id /
 #                arm_id = the §62.2 canonical id texts of coverage.tg,
 #                kind = the point's classification word ("IfExpr",
-#                "MatchExpr", ...), span = None (the §62 ids are
-#                span-free by construction). Evaluated-contract evidence
+#                "MatchExpr", ...), test_id = the exercising test
+#                function's stable key text (the model-side TEST ENDPOINT
+#                the item-19 follow-up added — the defaulted "" is the
+#                unbound form, for facts recorded outside a test run),
+#                span = None (the §62 ids are span-free by
+#                construction). Evaluated-contract evidence
 #                rides the snapshot's contracts table (keyed by
-#                StableContractId), NOT the coverage table. The
-#                CoverageRelationship RECORD has no test endpoint
-#                (function/branch_id/arm_id/kind/span only): scoping a
-#                coverage row to the exercising TEST (or carrying
-#                hit-count evidence) needs a semantic_model.tg record
-#                change that this module may not make — reported, and
-#                left to the model-side + execution-side follow-up.
+#                StableContractId), NOT the coverage table.
 #   mir_functions — one semantic summary row per LOWERED FUNCTION of the
 #                verified MIR — def-keyed AND synthesized (item 12; the
 #                rows replace the old def-only table): block/statement/
@@ -166,6 +164,18 @@
 #                families), digest words = the stable digest of the fact's
 #                canonical text. Deduped per (function, kind, site) and
 #                sorted through semantic_unsafe_facts_sort.
+#   abi_surfaces — the PERSISTED ABI/layout rows (audit item 18): one row
+#                per pub def-keyed function (per-param class words + return
+#                class, classified through layout_engine.tg's
+#                classify_value_category + the emitter's delivery rule) and
+#                per declared nominal type (layout size/alignment and the
+#                "name offset size" field rows from layout_of_concrete);
+#                unclassifiable surfaces persist an "abi-fail-closed" row
+#                with its reason, never fabricated values. Sorted through
+#                semantic_abi_surfaces_sort and serialized after the
+#                unsafe-fact rows; the table rides the snapshot digest
+#                preimage (revision), while abi_hash stays the §30
+#                CanonExternal text digest.
 #
 # STABLE IDENTITY: every def's StableDefId is built with ids.tg's
 # stable_def_id_digested over the canonical "path::name#signature" key
@@ -189,6 +199,29 @@
 # program's own slot identity, reproducible byte-for-byte from the same
 # source), and capability ids render as their fixed §11 band. None of
 # these is ever substituted for a missing stable identity.
+#
+# SITE-FIELD POLICY (audit item 47 — locators vs revision-stable node
+# identity): the §33 "<caller key>#B<block id>#T" site texts the rows
+# below carry (the INDIRECT-call rows' site — the only snapshot row
+# family whose site IS a MIR node) are DENSE WITHIN-SNAPSHOT LOCATORS
+# (SnapshotMirLocator, stable_ids.tg section 8): the block/statement
+# ordinals are positions in THIS compilation's lowering, so one unrelated
+# insertion mid-block renumbers the whole tail of the "#S"/"#T" node
+# domain of that block. They stay locators here BY DESIGN — a row's site
+# field is a reference INTO the same revision's own MIR, and the
+# statement-level node rows of the §33 slice domain (MirSlice /
+# SliceResult statement lists) use the same locator key texts. The
+# REVISION-STABLE identity of the node behind any of these locator texts
+# is CONTENT-derived — StableSemanticNodeId — by the SLICE LAYER
+# (semantic_slice.tg's stable_node_id_of / stable_node_ids_of_slice,
+# audit item 47), never re-derived inside this builder: no snapshot
+# change is needed while the site fields stay locators. The summary rows
+# (MirSemanticSummary) carry no site text at all (per-function structural
+# counts only); the call/ownership/effect/contract row spans are
+# presentation metadata and the ownership rows' place_key names a place,
+# never a node. The coverage rows' branch/arm keys embed block/terminator
+# ordinals — the §62 coverage domain's own dense grammar, outside the §33
+# statement-node domain — and stay unchanged here.
 #
 # DETERMINISM: every emission table is sorted through the semantic_model.tg
 # sorts (stable-digest order) before any rendering or hashing. All Map/Set
@@ -221,6 +254,12 @@ use tg_compiler::target_desc::{
 }
 use tg_compiler::token::{parsed_int_to_host}
 use tg_compiler::mono::{mir_fn_abi_signature}
+use tg_compiler::layout_engine::{
+  LayoutEngine, TargetDescriptor, LayoutFailureClass, ValueCategory,
+  layout_engine_new, layout_engine_register_types, compute_all_layouts,
+  layout_of_concrete, classify_value_category, enum_layout_for_type,
+  aarch64_target, x86_64_target
+}
 use tg_compiler::mir::{
   MirProgram, MirFunction, MirOperand, MirStatementKind, MirTerminatorKind, MirOperandKind,
   MirConstantKind, MirRvalueKind, MirTypeDefKind, CastKind, Place, Projection,
@@ -241,7 +280,8 @@ use tg_compiler::semantic_model::{
   semantic_test_relationships_sort, semantic_coverage_relationships_sort,
   semantic_stable_def_id_digest, semantic_call_edge_kind_numeric,
   semantic_access_convention_numeric, semantic_def_kind_text, semantic_summary_dirty_word,
-  semantic_contract_expr_text
+  semantic_contract_expr_text,
+  AbiSurfaceRow, semantic_abi_surfaces_sort
 }
 
 # ———————————————————————————————————————————————————————————————
@@ -2754,6 +2794,324 @@ def snapshot_mir_origin_of(
 end
 
 # ———————————————————————————————————————————————————————————————
+# The persisted ABI surface rows (audit item 18)
+# ———————————————————————————————————————————————————————————————
+# The abi_hash domain stays the §30 CanonExternal text digest
+# (snapshot_abi_text below); THIS section persists the canonical rows
+# behind the ABI surface so abi.diff can explain exact layout/class
+# changes. The rows are computed from the SAME finalized state the rest of
+# the builder reads (the MIR type table + the def-keyed lowerings) and the
+# layout engine is the SINGLE classification authority:
+#
+#   fn rows   — every pub Function def with a def-keyed lowering (the
+#               snapshot_abi_text domain): the signature's param types and
+#               return type classified through
+#               layout_engine.tg's classify_value_category. The class
+#               words are the ValueCategory renders ("zero" / "scalar:<w>"
+#               / "pair:<w1>:<w2>" / "vector:<w>" / "by-address:<size>");
+#               the return word carries the emitter's DELIVERY rule
+#               ("direct:" | "sret:") — codegen.tg's category_uses_sret,
+#               the paired authority on the return side. INTENDED
+#               AUTHORITY (audit item 28): when the full classify_call_plan
+#               exists it consumes the SAME ValueCategory categories and
+#               slot rules, so these words are its canonical projection
+#               (no call-plan authority exists in the tree yet — the
+#               category classifier + the emitter's location rule ARE the
+#               authority today, mirrored here, never invented).
+#   type rows — every declared nominal type of the def walk (the types
+#               table): layout size/alignment and the "name offset size"
+#               field rows from layout_of_concrete (struct fields in
+#               declaration order; enums additionally carry the "tag
+#               <offset> <size>" row and variant-qualified
+#               "<Variant>#<index>" payload field rows from the rich
+#               EnumLayout + the MirTypeDef variant names). A generic base
+#               has no single nominal layout — its instances do — so it
+#               fails closed exactly like snapshot_abi_text's "generic"
+#               marker.
+#
+# FAIL CLOSED (item 8 policy): a type/signature the classifier rejects, a
+# generic base, a trait, an unregistered/missing MirTypeDef and any
+# unclassifiable shape emit an "abi-fail-closed" row whose fields carry
+# "reason:<word>" (the layout failure class word, "generic-base",
+# "trait-no-layout", "unregistered-type", "no-mir-type-def",
+# "enum-layout-missing", "no-abi-signature", "arg<i>:<word>",
+# "ret:<word>"). No size/offset/class is ever fabricated.
+
+# The layout-engine target descriptor of a snapshot TargetDesc. The two
+# direct-emitter hosts have canonical engine descriptors (aarch64_target /
+# x86_64_target) and take them verbatim. Every other desc takes a
+# descriptor DERIVED FIELD BY FIELD from the desc (pointer width/alignment,
+# the integer model = pointer width per the LP64/ILP32 rule, the closure
+# {code,env} pointer pair, endianness, stack alignment) with the
+# compiler-wide constants the canonical descriptors share — the snapshot
+# route itself only runs on the two hosts, so this arm is the defensive
+# path and never claims a canonical descriptor it is not.
+def snapshot_abi_layout_target(target: TargetDesc) -> TargetDescriptor
+  match target.arch
+  when tg_compiler::target_desc::Arch::X86_64 then x86_64_target()
+  when tg_compiler::target_desc::Arch::AArch64 then aarch64_target()
+  when _ then
+    TargetDescriptor {
+      arch_name: snapshot_target_arch_text(target.arch),
+      pointer_size: target.pointer_width,
+      pointer_align: target.pointer_width,
+      max_align: if target.pointer_width >= 8 then 16 else 8 end,
+      int_size: target.pointer_width,
+      bool_size: 1,
+      char_size: 4,
+      fn_ptr_size: target.pointer_width * 2,
+      float_size: 8,
+      double_size: 8,
+      endianness: snapshot_target_endian_text(target.endianness),
+      stack_align: target.stack_alignment
+    }
+  end
+end
+
+# The layout engine of the snapshot's finalized MIR: the program's
+# MirTypeDef table registered on the target bridge above, with every
+# non-generic nominal layout precomputed (the codegen construction shape).
+def snapshot_abi_layout_engine(mir: MirProgram, target: TargetDesc) -> LayoutEngine
+  var engine = layout_engine_new(snapshot_abi_layout_target(&target))
+  layout_engine_register_types(&mut engine, mir.types)
+  compute_all_layouts(&mut engine)
+  engine
+end
+
+# The canonical class WORD of a value category (the row vocabulary above).
+def snapshot_abi_value_class_word(cat: ValueCategory) -> String
+  match cat
+  when ValueCategory::ZeroSized then "zero"
+  when ValueCategory::Scalar(w) then "scalar:" + w.to_string()
+  when ValueCategory::ScalarPair(w1, w2) then "pair:" + w1.to_string() + ":" + w2.to_string()
+  when ValueCategory::Vector(w) then "vector:" + w.to_string()
+  when ValueCategory::ByAddress(sz) then "by-address:" + sz.to_string()
+  end
+end
+
+# The return class word: the category render plus the emitter's delivery
+# rule (codegen.tg's category_uses_sret — ScalarPair / ByAddress returns
+# cross indirectly; ZeroSized / Scalar / Vector returns directly).
+def snapshot_abi_return_class_word(cat: ValueCategory) -> String
+  let inner = snapshot_abi_value_class_word(&cat)
+  match cat
+  when ValueCategory::ScalarPair(_, _) then "sret:" + inner
+  when ValueCategory::ByAddress(_) then "sret:" + inner
+  when _ then "direct:" + inner
+  end
+end
+
+# The failure-class word of a layout error (the fail-closed reason text).
+def snapshot_abi_layout_failure_word(c: LayoutFailureClass) -> String
+  match c
+  when LayoutFailureClass::LAYOUT_COMPUTATION_BUG then "layout-computation-bug"
+  when LayoutFailureClass::LAYOUT_CONSUMER_BUG then "layout-consumer-bug"
+  when LayoutFailureClass::HEADER_MODEL_BUG then "header-model-bug"
+  when LayoutFailureClass::ABI_BOUNDARY_BUG then "abi-boundary-bug"
+  when LayoutFailureClass::TARGET_DESCRIPTOR_BUG then "target-descriptor-bug"
+  when LayoutFailureClass::UNRESOLVED_TYPE then "unresolved-type"
+  when LayoutFailureClass::UNSUPPORTED_TYPE then "unsupported-type"
+  end
+end
+
+# A fail-closed row: no fabricated size/alignment/classes — the reason
+# text is the row's content (the snapshot_abi_text marker convention).
+def snapshot_abi_fail_row(surface_id: String, symbol_key: String, reason: String) -> AbiSurfaceRow
+  var fs: Vec[String] = Vec::new()
+  fs.push("reason:" + reason)
+  AbiSurfaceRow {
+    surface_id: surface_id,
+    symbol_key: symbol_key,
+    kind: "abi-fail-closed",
+    size: -1,
+    alignment: -1,
+    fields: fs
+  }
+end
+
+# The registration-key path of a full stable key (everything before the
+# first '#'; a key without one is its own path).
+def snapshot_key_path(key: String) -> String
+  var i = 0
+  while i < key.len() do
+    if key.slice(i, i + 1) == "#" then
+      return key.slice(0, i)
+    end
+    i = i + 1
+  end
+  key.clone()
+end
+
+# The ABI surface row of one pub def-keyed function (the snapshot_abi_text
+# domain: pub Function with a def-keyed lowering whose callable is stamped).
+def snapshot_abi_fn_row(
+  ctx: SnapshotBuildCtx,
+  inout engine: LayoutEngine,
+  d: SnapshotDef,
+  fn_idx: Int
+) -> AbiSurfaceRow
+  let surface_id = "fn:" + d.sid.key.clone()
+  if d.is_generic then
+    return snapshot_abi_fail_row(surface_id, d.sid.key.clone(), "generic-base")
+  end
+  let mf = ctx.mir.functions[fn_idx]
+  if mf.generic_params.len() > 0 then
+    return snapshot_abi_fail_row(surface_id, d.sid.key.clone(), "generic-base")
+  end
+  match mir_fn_abi_signature(mf)
+  when Type::FnPtr(params, ret, _) then
+    var args: Vec[String] = Vec::new()
+    var ai = 0
+    for p in params do
+      match classify_value_category(&mut engine, &p.ty)
+      when Result::Err(e) then
+        return snapshot_abi_fail_row(surface_id, d.sid.key.clone(),
+          "arg" + ai.to_string() + ":" + snapshot_abi_layout_failure_word(&e.class))
+      when Result::Ok(cat) then
+        args.push(snapshot_abi_value_class_word(&cat))
+      end
+      ai = ai + 1
+    end
+    match classify_value_category(&mut engine, ret)
+    when Result::Err(e2) then
+      return snapshot_abi_fail_row(surface_id, d.sid.key.clone(),
+        "ret:" + snapshot_abi_layout_failure_word(&e2.class))
+    when Result::Ok(rcat) then
+      AbiSurfaceRow {
+        surface_id: surface_id,
+        symbol_key: d.sid.key.clone(),
+        kind: "fn",
+        size: -1,
+        alignment: -1,
+        arg_classes: args,
+        ret_class: snapshot_abi_return_class_word(&rcat)
+      }
+    end
+  when _ then
+    snapshot_abi_fail_row(surface_id, d.sid.key.clone(), "no-abi-signature")
+  end
+end
+
+# The ABI surface row of one declared nominal type: layout size/alignment
+# and the field rows. Generic bases, traits and types with no registered
+# MirTypeDef fail closed (mirroring snapshot_abi_text's generic marker).
+def snapshot_abi_type_row(
+  ctx: SnapshotBuildCtx,
+  inout engine: LayoutEngine,
+  t: SemanticType
+) -> AbiSurfaceRow
+  let surface_id = "type:" + t.stable_id.key.clone()
+  let symbol = t.stable_id.key.clone()
+  if t.generic_arity > 0 then
+    return snapshot_abi_fail_row(surface_id, symbol, "generic-base")
+  end
+  match t.kind
+  when SemanticTypeKind::Trait then
+    return snapshot_abi_fail_row(surface_id, symbol, "trait-no-layout")
+  when _ then ()
+  end
+  var tid = -1
+  match ctx.type_id_of_key.get(snapshot_key_path(&symbol))
+  when Option::Some(x) then tid = x
+  when Option::None then
+    return snapshot_abi_fail_row(surface_id, symbol, "unregistered-type")
+  end
+  if !ctx.mir_type_index.contains_key(&tid) then
+    return snapshot_abi_fail_row(surface_id, symbol, "no-mir-type-def")
+  end
+  let cty = Type::Adt(TypeId { id: tid }, Vec::new())
+  match layout_of_concrete(&mut engine, &cty)
+  when Result::Err(e) then
+    snapshot_abi_fail_row(surface_id, symbol, snapshot_abi_layout_failure_word(&e.class))
+  when Result::Ok(layout) then
+    let lsize = layout.size
+    let lalign = layout.align
+    var fields: Vec[String] = Vec::new()
+    match t.kind
+    when SemanticTypeKind::Enum then
+      match enum_layout_for_type(&mut engine, &cty)
+      when Option::Some(el) then
+        fields.push("tag " + el.tag_layout.offset.to_string() + " " + el.tag_layout.size.to_string())
+        match ctx.mir_type_index.get(tid)
+        when Option::Some(ti) then
+          if ti >= 0 && ti < ctx.mir.types.len() then
+            match ctx.mir.types[ti].kind
+            when MirTypeDefKind::Enum(variants) then
+              var vi = 0
+              for v in variants do
+                if vi < el.variant_layouts.len() then
+                  let vl = el.variant_layouts[vi]
+                  var fi = 0
+                  for fl in vl.fields do
+                    fields.push(v.name.clone() + "#" + fi.to_string() + " " +
+                      fl.offset.to_string() + " " + fl.size.to_string())
+                    fi = fi + 1
+                  end
+                end
+                vi = vi + 1
+              end
+            when _ then ()
+            end
+          end
+        when Option::None then ()
+        end
+      when Option::None then
+        return snapshot_abi_fail_row(surface_id, symbol, "enum-layout-missing")
+      end
+    when _ then
+      for f in layout.fields do
+        fields.push(f.name.clone() + " " + f.offset.to_string() + " " + f.size.to_string())
+      end
+    end
+    AbiSurfaceRow {
+      surface_id: surface_id,
+      symbol_key: symbol,
+      kind: "type",
+      size: lsize,
+      alignment: lalign,
+      fields: fields
+    }
+  end
+end
+
+# All persisted ABI surface rows of the finalized state, canonically sorted
+# (semantic_abi_surfaces_sort). The layout engine is built ONCE here.
+def snapshot_abi_surface_rows(
+  ctx: SnapshotBuildCtx,
+  defs: Vec[SnapshotDef],
+  types: Vec[SemanticType],
+  target: TargetDesc
+) -> Vec[AbiSurfaceRow]
+  var rows: Vec[AbiSurfaceRow] = Vec::new()
+  var engine = snapshot_abi_layout_engine(&ctx.mir, &target)
+  for d in defs do
+    var is_fn = false
+    match d.kind
+    when DefKind::Function then is_fn = true
+    when _ then ()
+    end
+    if is_fn && d.is_pub then
+      match ctx.mir_fn_by_callable.get(snapshot_numeric_of_def(&ctx, &d))
+      when Option::Some(fn_idx) then
+        if fn_idx >= 0 && fn_idx < ctx.mir.functions.len() then
+          match ctx.mir.functions[fn_idx].callable.clone()
+          when Option::Some(_) then
+            rows.push(snapshot_abi_fn_row(&ctx, &mut engine, &d, fn_idx))
+          when Option::None then ()
+          end
+        end
+      when Option::None then ()
+      end
+    end
+  end
+  for t in types do
+    rows.push(snapshot_abi_type_row(&ctx, &mut engine, &t))
+  end
+  semantic_abi_surfaces_sort(&mut rows)
+  rows
+end
+
+# ———————————————————————————————————————————————————————————————
 # The builder
 # ———————————————————————————————————————————————————————————————
 
@@ -3160,6 +3518,9 @@ pub def semantic_snapshot_of_final_state(
   snapshot.coverage = Vec::new()
   snapshot.mir_functions = mir_rows
   snapshot.unsafe_facts = unsafe_facts
+  # The persisted ABI/layout rows (item 18) — the explanatory payload
+  # behind abi_hash (which stays the §30 CanonExternal text digest).
+  snapshot.abi_surfaces = snapshot_abi_surface_rows(&ctx, &defs, &snapshot.types, &target)
   snapshot.public_api_hash = stable_digest_of(&snapshot_public_api_text(&snapshot))
   match snapshot_abi_text(&ctx, &defs)
   when Result::Err(e) then return Result::Err(e)
@@ -3572,7 +3933,9 @@ end
 # The runtime coverage rows (empty today — the execution-side ingest
 # contract is documented in the module header): the covered def's digest,
 # the §62 branch-id text, the arm-id text ("" when the fact is not
-# arm-granular) and the point-kind word. Span NEVER serializes.
+# arm-granular), the point-kind word and the exercising test's stable key
+# text (test_id — the item-19 test endpoint; "" when unbound). Span NEVER
+# serializes.
 def snapshot_coverage_line(c: CoverageRelationship) -> String
   var arm = "".to_string()
   match c.arm_id
@@ -3582,7 +3945,8 @@ def snapshot_coverage_line(c: CoverageRelationship) -> String
   "{\"s\":\"coverage\",\"f\":\"" + semantic_digest_render(&semantic_stable_def_id_digest(&c.function)) + "\"," +
     "\"branch\":\"" + semantic_json_escape(&c.branch_id) + "\"," +
     "\"arm\":\"" + semantic_json_escape(&arm) + "\"," +
-    "\"kind\":\"" + semantic_json_escape(&c.kind) + "\"}"
+    "\"kind\":\"" + semantic_json_escape(&c.kind) + "\"," +
+    "\"test\":\"" + semantic_json_escape(&c.test_id) + "\"}"
 end
 
 def snapshot_indirect_line(ic: IndirectCallEdge) -> String
@@ -3613,6 +3977,23 @@ def snapshot_unsafe_fact_line(f: UnsafeFact) -> String
     "\"site\":\"" + semantic_json_escape(&f.site) + "\"}"
 end
 
+# The persisted ABI/layout rows (audit item 18): the surface id, the
+# underlying symbol key, the family word, the layout size/alignment (-1 on
+# fn / fail-closed rows), the per-param class words and return class
+# (';'-joined; empty runs on type rows) and the field/reason texts
+# (';'-joined). Vector fields are joined with ';' because field texts
+# contain spaces ("name offset size") and class words do not.
+def snapshot_abi_surface_line(r: AbiSurfaceRow) -> String
+  "{\"s\":\"abi-surface\",\"surface\":\"" + semantic_json_escape(&r.surface_id) + "\"," +
+    "\"symbol\":\"" + semantic_json_escape(&r.symbol_key) + "\"," +
+    "\"kind\":\"" + semantic_json_escape(&r.kind) + "\"," +
+    "\"size\":" + r.size.to_string() + "," +
+    "\"align\":" + r.alignment.to_string() + "," +
+    "\"args\":\"" + semantic_json_escape(&r.arg_classes.join(";")) + "\"," +
+    "\"ret\":\"" + semantic_json_escape(&r.ret_class) + "\"," +
+    "\"fields\":\"" + semantic_json_escape(&r.fields.join(";")) + "\"}"
+end
+
 # The canonical text form (the tables are sorted before rendering; the
 # serializer sorts in place — idempotent on already-sorted input). The
 # emission loops follow the protocol's fixed table order (tests between
@@ -3632,6 +4013,7 @@ def semantic_snapshot_serialize(inout snapshot: SemanticSnapshot) -> String
   semantic_coverage_relationships_sort(&mut snapshot.coverage)
   semantic_mir_summaries_sort(&mut snapshot.mir_functions)
   semantic_unsafe_facts_sort(&mut snapshot.unsafe_facts)
+  semantic_abi_surfaces_sort(&mut snapshot.abi_surfaces)
 
   var text = snapshot_header_line(&snapshot, false) + "\n"
   for s in snapshot.symbols do
@@ -3670,6 +4052,9 @@ def semantic_snapshot_serialize(inout snapshot: SemanticSnapshot) -> String
   for uf in snapshot.unsafe_facts do
     text = text + snapshot_unsafe_fact_line(&uf) + "\n"
   end
+  for ar in snapshot.abi_surfaces do
+    text = text + snapshot_abi_surface_line(&ar) + "\n"
+  end
   text
 end
 
@@ -3694,6 +4079,7 @@ def semantic_snapshot_digest_text(snapshot: SemanticSnapshot) -> String
   snap2.coverage = snapshot.coverage.clone()
   snap2.mir_functions = snapshot.mir_functions.clone()
   snap2.unsafe_facts = snapshot.unsafe_facts.clone()
+  snap2.abi_surfaces = snapshot.abi_surfaces.clone()
   semantic_snapshot_serialize(&mut snap2)
 end
 

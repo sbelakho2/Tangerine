@@ -3,10 +3,11 @@
 #
 # The §43 FFI-report slice: ONE compact FfiReport per exported / extern
 # symbol of a SemanticSnapshot, plus abi_diff (the per-symbol ABI diff
-# between two reports) and the coarse abi_rows_of_snapshot fallback. The
-# module reads ONLY SemanticSnapshot rows (semantic_model.tg records —
-# never AST / typed / MIR state) and mirrors the semantic_index.tg /
-# semantic_delta.tg / replay.tg idioms.
+# between two reports) and abi_rows_of_snapshot (the snapshot's persisted
+# ABI/layout rows, with the coarse §30 reconstruction as the pre-item-18
+# fallback). The module reads ONLY SemanticSnapshot rows (semantic_model.tg
+# records — never AST / typed / MIR state) and mirrors the
+# semantic_index.tg / semantic_delta.tg / replay.tg idioms.
 #
 # ROW ANCHORS (what a snapshot actually carries): symbol rows keyed by
 # the FULL stable key "path::name#signature" (the signature component is
@@ -15,14 +16,17 @@
 # Function-kind pub rows whose key may carry an EMPTY signature — the
 # writer has no typed record for them); mir_functions rows per def-keyed
 # lowered function (externs have no def-keyed lowering and never appear);
-# the §30 ABI rows THEMSELVES never ride the snapshot — abi_hash digests
-# snapshot_abi_text lines ("<digest> <key> <canonical text>" / "... generic"
-# / "... abi-fail-closed" — the mono CanonExternal frame over
-# mir_fn_abi_signature) but only the digest serializes (§31 documents
-# the same gap); per-arg ABI location rows and layout rows DO NOT EXIST
-# in the model (the §32 index layout family is documented EMPTY), no
-# nullability markers exist on Ptr params, and thread-safety / taint /
-# failure conventions are part of no signature record.
+# abi_surfaces rows (audit item 18) — the PERSISTED canonical ABI/layout
+# rows: "fn:<full key>" rows carry the per-param class words and the
+# return class, "type:<full key>" rows carry the layout size/alignment and
+# the "name offset size" field rows, "abi-fail-closed" rows carry their
+# reason only (never fabricated values). The §30 CanonExternal frame text
+# still never rides the snapshot (abi_hash digests snapshot_abi_text lines
+# — "<digest> <key> <canonical text>" / "... generic" / "... abi-fail-closed"
+# — but only the digest serializes), so external_signature stays
+# unreconstructable from rows alone; nullability markers still do not
+# exist on Ptr params, and thread-safety / taint / failure conventions
+# are part of no signature record.
 #
 # REPORT ANCHORS — what ffi_report_of_symbol derives, field by field:
 #   DERIVED FROM SNAPSHOT ROWS:
@@ -64,14 +68,25 @@
 #                           and "set" (callee initializes caller storage),
 #                           per the ast.tg extern metadata mapping; let /
 #                           inout are borrows and never transfer.
+#     arg_locations / return_location — from the symbol's abi_surfaces
+#                           "fn:" row when present: arg_locations = the
+#                           row's arg_classes (one entry per param
+#                           position, the ValueCategory word:
+#                           "zero"/"scalar:<w>"/"pair:<w1>:<w2>"/"vector:<w>"/
+#                           "by-address:<size>"); return_location = the
+#                           row's ret_class ("direct:"/"sret:" + word).
+#                           Reports whose row is absent or fail-closed stay
+#                           empty — never invented.
+#     layouts / alignments — from the symbol's abi_surfaces "type:" row
+#                           when present (type symbols with a persisted
+#                           layout row): layouts = "size <n>" plus one
+#                           "field <name> offset <n> size <n>" per field
+#                           (enum rows carry the tag and variant-qualified
+#                           payload entries); alignments = "align <n>".
+#                           A function report carries no layout row of its
+#                           own, so both stay empty there; fail-closed
+#                           rows contribute nothing.
 #   DOCUMENTED-UNMODELED (report only — never invented):
-#     arg_locations / return_location — no per-arg location row family
-#                           exists in the snapshot (ABI locations are
-#                           codegen/classifier knowledge); both stay empty.
-#     layouts / alignments — no layout row family rides the snapshot
-#                           (§32's type_layouts is documented EMPTY); both
-#                           stay empty — the lists exist so a layout-row-
-#                           bearing consumer fills and abi_diff diffs them.
 #     thread_safety / taint / failure_convention — absent from the model;
 #                           each is the constant "not modeled".
 #
@@ -108,8 +123,9 @@ use std::core::{Option}
 use std::collections::{Vec}
 
 use tg_compiler::semantic_model::{
-  SemanticSnapshot, SemanticSymbol, semantic_def_kind_text,
-  semantic_digest_render, semantic_stable_def_id_digest
+  SemanticSnapshot, SemanticSymbol, AbiSurfaceRow, semantic_def_kind_text,
+  semantic_digest_render, semantic_stable_def_id_digest,
+  semantic_abi_surface_row_text
 }
 
 # ———————————————————————————————————————————————————————————————
@@ -226,6 +242,45 @@ def report_abi_row_defined(snapshot: SemanticSnapshot, sym: SemanticSymbol) -> B
     return false
   end
   report_symbol_has_lowering(&snapshot, &sym)
+end
+
+# The persisted abi_surfaces row of a symbol (audit item 18): the exact
+# full-key match on the row's symbol_key (fn rows carry the function's
+# full stable key, type rows the type's full key; the report is always
+# looked up by the symbol's own full key). Option::None when the snapshot
+# carries no row for the symbol (pre-item-18 artifacts, externs, and
+# non-surface defs).
+def report_surface_row_of(snapshot: SemanticSnapshot, sym: SemanticSymbol) -> Option[AbiSurfaceRow]
+  for row in snapshot.abi_surfaces do
+    if row.symbol_key == sym.stable_id.key then
+      return Option::Some(row.clone())
+    end
+  end
+  Option::None
+end
+
+# The layout entries of a type surface row: "size <n>" plus one
+# "field <name> offset <n> size <n>" per "name offset size" field text
+# (the row grammar is produced by semantic_snapshot.tg's type row builder;
+# a text that does not split into the full triple degrades to the raw
+# field text rather than inventing offsets).
+def report_layout_entries_of(row: AbiSurfaceRow) -> Vec[String]
+  var out: Vec[String] = Vec::new()
+  if row.size >= 0 then
+    out.push("size " + row.size.to_string())
+  end
+  for f in row.fields do
+    let words = report_row_words(&f)
+    if words.len() >= 3 then
+      out.push("field " + words[0].clone() + " offset " + words[1].clone() +
+        " size " + words[2].clone())
+    elsif words.len() >= 2 then
+      out.push("field " + words[0].clone() + " offset " + words[1].clone())
+    else
+      out.push("field " + f.clone())
+    end
+  end
+  out
 end
 
 # The §30-grammar row text, reconstructed as far as a snapshot allows:
@@ -348,9 +403,11 @@ end
 # registration key "module::name" (a key whose path part matches). The
 # report exists for the FFI surface — pub Function-kind symbol rows
 # (regular exported defs AND extern declarations, which register as pub
-# Function rows). A row of any other kind, a non-pub function, or no
-# matching row yields Option::None (private defs and non-function defs
-# have no §43 FFI surface).
+# Function rows) AND pub TypeName rows for the persisted type-layout
+# surfaces (item 18: the type row is the only carrier of layouts /
+# alignments, so a type symbol must be reportable for those to be
+# diffable). Any other kind, a non-pub row, or no matching row yields
+# Option::None.
 
 pub def ffi_report_of_symbol(snapshot: SemanticSnapshot, symbol_key: String) -> Option[FfiReport]
   var found: Option[SemanticSymbol] = Option::None
@@ -374,7 +431,10 @@ pub def ffi_report_of_symbol(snapshot: SemanticSnapshot, symbol_key: String) -> 
   when Option::Some(s) then s
   when Option::None then return Option::None
   end
-  if semantic_def_kind_text(&sym.kind) != "Function" || !sym.is_pub then
+  let kind_word = semantic_def_kind_text(&sym.kind)
+  let is_fn = kind_word == "Function" && sym.is_pub
+  let is_type = kind_word == "TypeName" && sym.is_pub
+  if !is_fn && !is_type then
     return Option::None
   end
 
@@ -382,17 +442,18 @@ pub def ffi_report_of_symbol(snapshot: SemanticSnapshot, symbol_key: String) -> 
   let sig = report_key_signature(&full_key)
   var abi_name = "internal".to_string()
   var external_sig = "".to_string()
-  if report_abi_row_defined(&snapshot, &sym) then
+  if is_fn && report_abi_row_defined(&snapshot, &sym) then
     let parsed = report_parse_abi_row(&report_abi_row_text(&snapshot, &sym))
     abi_name = parsed.0
     external_sig = parsed.1
   end
 
   # The param scans (nullability heuristic / ownership-transfer
-  # conventions) over the canonical signature text; arg_locations,
-  # return_location, layouts and alignments stay EMPTY — no per-arg
-  # location row family and no layout row family ride the snapshot
-  # (documented gaps, see the module doc).
+  # conventions) over the canonical signature text; the typed location /
+  # layout surfaces come from the symbol's persisted abi_surfaces row
+  # (audit item 18) — fn rows fill arg_locations/return_location, type
+  # rows fill layouts/alignments; a missing or fail-closed row leaves the
+  # lists empty (never invented).
   var nullability: Vec[String] = Vec::new()
   var ownership_transfer: Vec[String] = Vec::new()
   var pi = 0
@@ -405,16 +466,38 @@ pub def ffi_report_of_symbol(snapshot: SemanticSnapshot, symbol_key: String) -> 
     end
     pi = pi + 1
   end
+  var arg_locations: Vec[String] = Vec::new()
+  var return_location = "".to_string()
+  var layouts: Vec[String] = Vec::new()
+  var alignments: Vec[String] = Vec::new()
+  match report_surface_row_of(&snapshot, &sym)
+  when Option::Some(row) then
+    if row.kind == "fn" then
+      for w in row.arg_classes do
+        arg_locations.push(w.clone())
+      end
+      return_location = row.ret_class.clone()
+    elsif row.kind == "type" then
+      layouts = report_layout_entries_of(&row)
+      if row.alignment >= 0 then
+        alignments.push("align " + row.alignment.to_string())
+      end
+    end
+    # "abi-fail-closed": no layout / class data exists on the row — the
+    # lists stay empty (the reason text is available through
+    # abi_rows_of_snapshot; nothing is fabricated here).
+  when Option::None then ()
+  end
 
   Option::Some(FfiReport {
     symbol_key: full_key,
     abi_name: abi_name,
     tangerine_signature: sig,
     external_signature: external_sig,
-    arg_locations: Vec::new(),
-    return_location: "".to_string(),
-    layouts: Vec::new(),
-    alignments: Vec::new(),
+    arg_locations: arg_locations,
+    return_location: return_location,
+    layouts: layouts,
+    alignments: alignments,
     nullability: nullability,
     ownership_transfer: ownership_transfer,
     thread_safety: "not modeled".to_string(),
@@ -490,17 +573,30 @@ pub def abi_diff(old_report: FfiReport, new_report: FfiReport) -> Vec[String]
 end
 
 # ———————————————————————————————————————————————————————————————
-# The coarse fallback — the snapshot's §30 abi row texts
+# The persisted ABI/layout row texts (audit item 18; the fallback below
+# serves pre-item-18 artifacts whose abi_surfaces table is empty).
 # ———————————————————————————————————————————————————————————————
-# Every row the §30 writer's surface would render, in the row grammar a
-# snapshot alone supports: pub Function-kind symbol rows WITH a def-keyed
-# lowering, as "<digest> <registration key>" (plus the deterministic
-# " generic" marker for generic bases — the writer's own row text for
-# them). The CanonExternal frame text of non-generic members never rides
-# a snapshot (documented gap — the §31 delta core keys the same surface
-# by pub-Function stable keys instead). Sorted; row texts are parseable
-# by report_parse_abi_row.
+# When the snapshot carries abi_surfaces rows, the function returns their
+# canonical texts (semantic_abi_surface_row_text — the SAME grammar the
+# delta's per-surface before/after texts use): one row per pub def-keyed
+# function and per declared nominal type, sorted, with classification
+# failures visible as "kind=abi-fail-closed" rows carrying reason:<word>.
+# When the table is empty (an artifact produced before item 18, or a
+# builder that persisted no rows) the coarse §30 fallback renders the rows
+# a snapshot alone supports: pub Function-kind symbol rows WITH a
+# def-keyed lowering, as "<digest> <registration key>" (plus the
+# deterministic " generic" marker for generic bases). The CanonExternal
+# frame text of non-generic members never rides a snapshot (documented
+# gap), so the fallback rows carry no external signature.
 pub def abi_rows_of_snapshot(snapshot: SemanticSnapshot) -> Vec[String]
+  if snapshot.abi_surfaces.len() > 0 then
+    var surface_rows: Vec[String] = Vec::new()
+    for r in snapshot.abi_surfaces do
+      surface_rows.push(semantic_abi_surface_row_text(&r))
+    end
+    surface_rows.sort_by(|a, b| a < b)
+    return surface_rows
+  end
   var rows: Vec[String] = Vec::new()
   for sym in snapshot.symbols do
     if report_abi_row_defined(&snapshot, &sym) then
